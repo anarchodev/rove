@@ -1,0 +1,7 @@
+.{
+    .name = .rove,
+    .version = "0.0.0",
+    .fingerprint = 0xe74470b1aa30c66d,
+    .minimum_zig_version = "0.15.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
