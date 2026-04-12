@@ -18,6 +18,20 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(rove_lib);
 
+    // ── rove2: experimental decentralized collections ──
+    const rove2_mod = b.addModule("rove2", .{
+        .root_source_file = b.path("src/rove2/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const rove2_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "rove2",
+        .root_module = rove2_mod,
+    });
+    b.installArtifact(rove2_lib);
+
     // ── rove-io: io_uring wrapper using rove entities ──
     const io_mod = b.addModule("rove-io", .{
         .root_source_file = b.path("src/io/root.zig"),
@@ -46,6 +60,10 @@ pub fn build(b: *std.Build) void {
     // rove tests
     const rove_tests = b.addTest(.{ .root_module = rove_mod });
     test_step.dependOn(&b.addRunArtifact(rove_tests).step);
+
+    // rove2 tests
+    const rove2_tests = b.addTest(.{ .root_module = rove2_mod });
+    test_step.dependOn(&b.addRunArtifact(rove2_tests).step);
 
     // rove-io tests
     const io_tests = b.addTest(.{ .root_module = io_mod });
@@ -171,6 +189,26 @@ pub fn build(b: *std.Build) void {
         .root_module = h2_client_mod,
     });
     b.installArtifact(h2_client_test);
+
+    // h2 client streaming test
+    const h2_client_stream_mod = b.addModule("h2-client-stream-test", .{
+        .root_source_file = b.path("examples/h2_client_stream_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    h2_client_stream_mod.addImport("rove", rove_mod);
+    h2_client_stream_mod.addImport("rove-io", io_mod);
+    h2_client_stream_mod.addImport("rove-h2", h2_mod);
+    h2_client_stream_mod.link_libc = true;
+    h2_client_stream_mod.linkSystemLibrary("nghttp2", .{});
+    h2_client_stream_mod.linkSystemLibrary("ssl", .{});
+    h2_client_stream_mod.linkSystemLibrary("crypto", .{});
+
+    const h2_client_stream_test = b.addExecutable(.{
+        .name = "h2-client-stream-test",
+        .root_module = h2_client_stream_mod,
+    });
+    b.installArtifact(h2_client_stream_test);
 
     const h2_limit_test = b.addExecutable(.{
         .name = "h2-limit-test",

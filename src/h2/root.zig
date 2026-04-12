@@ -160,6 +160,7 @@ const Stream = struct {
     emitted: bool = false,
     send_complete: bool = false,
     streaming: bool = false,
+    client_stream: bool = false,
     stream_eof: bool = false,
     ng_stream_id: i32 = 0,
     send_data: ?*BodyData = null,
@@ -383,6 +384,12 @@ fn H2OnlySpec(comptime opts: Options) type {
         rove.col("client_request_in", C(stream_row, .{})),
         rove.col("client_response_out", C(stream_row, .{})),
         rove.col("_client_request_sending", C(stream_row, .{})),
+        // Client streaming request collections
+        rove.col("client_stream_request_in", C(stream_row, .{})),
+        rove.col("client_stream_data_out", C(stream_row, .{})),
+        rove.col("client_stream_data_in", C(stream_row, .{})),
+        rove.col("client_stream_close_in", C(stream_row, .{})),
+        rove.col("_client_stream_data_sending", C(stream_row, .{})),
     } else .{};
 
     return rove.MakeCollections(&(base_fields ++ client_fields));
@@ -590,7 +597,15 @@ pub fn H2(comptime Ctx: type) type {
                         s.stream_chunk_offset = 0;
 
                         const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
-                        nctx.ctx.moveOneFrom(s.entity, ._stream_data_sending, .stream_data_out) catch {};
+                        if (comptime has_client) {
+                            if (s.client_stream) {
+                                nctx.ctx.moveOneFrom(s.entity, ._client_stream_data_sending, .client_stream_data_out) catch {};
+                            } else {
+                                nctx.ctx.moveOneFrom(s.entity, ._stream_data_sending, .stream_data_out) catch {};
+                            }
+                        } else {
+                            nctx.ctx.moveOneFrom(s.entity, ._stream_data_sending, .stream_data_out) catch {};
+                        }
                     }
                     return @intCast(to_copy);
                 }
@@ -888,6 +903,9 @@ pub fn H2(comptime Ctx: type) type {
             if (has_client) {
                 try self.consumeConnectRequests(ctx);
                 try self.consumeClientRequests(ctx);
+                try self.consumeClientStreamRequests(ctx);
+                try consumeClientStreamData(ctx);
+                try consumeClientStreamClose(ctx);
             }
             try ctx.flush();
 
@@ -1794,6 +1812,194 @@ pub fn H2(comptime Ctx: type) type {
 
                 try ctx.set(ent, StreamId, .{ .id = @intCast(stream_id) });
                 try ctx.moveOneFrom(ent, .client_request_in, ._client_request_sending);
+            }
+        }
+
+        // =============================================================
+        // Client streaming: consume client_stream_request_in
+        // =============================================================
+
+        fn consumeClientStreamRequests(self: *Self, ctx: *Ctx) !void {
+            if (!has_client) return;
+            const entities = ctx.entities(.client_stream_request_in);
+            const sessions = ctx.column(.client_stream_request_in, Session);
+            const req_hdrs = ctx.column(.client_stream_request_in, ReqHeaders);
+            const io_results = ctx.column(.client_stream_request_in, H2IoResult);
+
+            for (entities, sessions, req_hdrs, io_results) |ent, sess, rh, *io_res| {
+                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    continue;
+                };
+                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    continue;
+                }
+
+                const ng_session = conn_ptr.ng_session.?;
+
+                const nv_count: usize = @as(usize, rh.count);
+                if (nv_count == 0) {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    continue;
+                }
+
+                const nva_slice = self.allocator.alloc(c.nghttp2_nv, nv_count) catch {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    continue;
+                };
+                defer self.allocator.free(nva_slice);
+
+                if (rh.fields) |fields| {
+                    for (0..rh.count) |j| {
+                        nva_slice[j] = .{
+                            .name = @constCast(fields[j].name),
+                            .namelen = fields[j].name_len,
+                            .value = @constCast(fields[j].value),
+                            .valuelen = fields[j].value_len,
+                            .flags = c.NGHTTP2_NV_FLAG_NO_COPY_NAME | c.NGHTTP2_NV_FLAG_NO_COPY_VALUE,
+                        };
+                    }
+                }
+
+                // Deferred data provider — source.ptr NULL signals streaming path
+                var data_prd = c.nghttp2_data_provider{
+                    .source = .{ .ptr = null },
+                    .read_callback = &onDataSourceReadCb,
+                };
+
+                const stream_id = c.nghttp2_submit_request(
+                    ng_session,
+                    null,
+                    nva_slice.ptr,
+                    nv_count,
+                    &data_prd,
+                    null,
+                );
+
+                if (stream_id < 0) {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    continue;
+                }
+
+                const stream = Stream.create(sess.entity, self.allocator) orelse {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    continue;
+                };
+                stream.entity = ent;
+                stream.emitted = true;
+                stream.streaming = true;
+                stream.client_stream = true;
+                stream.send_complete = false;
+                stream.send_data = null;
+                _ = c.nghttp2_session_set_stream_user_data(ng_session, stream_id, @ptrCast(stream));
+
+                try ctx.set(ent, StreamId, .{ .id = @intCast(stream_id) });
+                try ctx.moveOneFrom(ent, .client_stream_request_in, .client_stream_data_out);
+            }
+        }
+
+        // =============================================================
+        // Client streaming: consume client_stream_data_in
+        // =============================================================
+
+        fn consumeClientStreamData(ctx: *Ctx) !void {
+            if (!has_client) return;
+            const entities = ctx.entities(.client_stream_data_in);
+            const sessions = ctx.column(.client_stream_data_in, Session);
+            const sids = ctx.column(.client_stream_data_in, StreamId);
+            const req_bodies = ctx.column(.client_stream_data_in, ReqBody);
+            const io_results = ctx.column(.client_stream_data_in, H2IoResult);
+
+            for (entities, sessions, sids, req_bodies, io_results) |ent, sess, sid, *rb, *io_res| {
+                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_data_in, .client_response_out);
+                    continue;
+                };
+                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_data_in, .client_response_out);
+                    continue;
+                }
+
+                // Skip empty chunks — move back to ready
+                if (rb.data == null or rb.len == 0) {
+                    try ctx.moveOneFrom(ent, .client_stream_data_in, .client_stream_data_out);
+                    continue;
+                }
+
+                const ng_session = conn_ptr.ng_session.?;
+                const stream: ?*Stream = @ptrCast(@alignCast(
+                    c.nghttp2_session_get_stream_user_data(ng_session, @intCast(sid.id)),
+                ));
+                if (stream == null) {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_data_in, .client_response_out);
+                    continue;
+                }
+
+                const s = stream.?;
+
+                // Transfer chunk ownership from component to stream struct
+                s.stream_chunk_data = rb.data;
+                s.stream_chunk_len = rb.len;
+                s.stream_chunk_offset = 0;
+                rb.data = null;
+                rb.len = 0;
+
+                // Un-defer so nghttp2 calls onDataSourceReadCb
+                _ = c.nghttp2_session_resume_data(ng_session, s.ng_stream_id);
+
+                try ctx.moveOneFrom(ent, .client_stream_data_in, ._client_stream_data_sending);
+            }
+        }
+
+        // =============================================================
+        // Client streaming: consume client_stream_close_in
+        // =============================================================
+
+        fn consumeClientStreamClose(ctx: *Ctx) !void {
+            if (!has_client) return;
+            const entities = ctx.entities(.client_stream_close_in);
+            const sessions = ctx.column(.client_stream_close_in, Session);
+            const sids = ctx.column(.client_stream_close_in, StreamId);
+            const io_results = ctx.column(.client_stream_close_in, H2IoResult);
+
+            for (entities, sessions, sids, io_results) |ent, sess, sid, *io_res| {
+                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_close_in, .client_response_out);
+                    continue;
+                };
+                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_close_in, .client_response_out);
+                    continue;
+                }
+
+                const ng_session = conn_ptr.ng_session.?;
+                const stream: ?*Stream = @ptrCast(@alignCast(
+                    c.nghttp2_session_get_stream_user_data(ng_session, @intCast(sid.id)),
+                ));
+                if (stream == null) {
+                    io_res.err = -1;
+                    try ctx.moveOneFrom(ent, .client_stream_close_in, .client_response_out);
+                    continue;
+                }
+
+                stream.?.stream_eof = true;
+
+                // Un-defer so onDataSourceReadCb sees EOF and sets NGHTTP2_DATA_FLAG_EOF
+                _ = c.nghttp2_session_resume_data(ng_session, stream.?.ng_stream_id);
+
+                try ctx.moveOneFrom(ent, .client_stream_close_in, ._client_stream_data_sending);
             }
         }
 
