@@ -45,6 +45,9 @@ pub const Registry = struct {
     collection_entries: [MAX_COLLECTIONS]CollectionEntry,
     collection_entry_count: u8,
 
+    // Per-collection destroy recipes — indexed by collection_id
+    destroy_recipes: [MAX_COLLECTIONS]DestroyEntry,
+
     allocator: std.mem.Allocator,
 
     const PENDING_MOVE: u8 = 1;
@@ -55,6 +58,11 @@ pub const Registry = struct {
         /// @typeName(T).ptr — unique, stable identifier for the component type
         type_name_ptr: [*]const u8,
         ctx_ptr: *anyopaque,
+    };
+
+    const DestroyEntry = struct {
+        recipe: *const fn (*Self, *anyopaque, *anyopaque, u32, u32) anyerror!void,
+        ptr: *anyopaque,
     };
 
     const CollectionEntry = struct {
@@ -119,6 +127,7 @@ pub const Registry = struct {
             .init_ctx_count = 0,
             .collection_entries = undefined,
             .collection_entry_count = 0,
+            .destroy_recipes = undefined,
             .allocator = allocator,
         };
     }
@@ -158,6 +167,12 @@ pub const Registry = struct {
             .apply_init_ctx = applyInitCtxErased(CollType),
         };
         self.collection_entry_count += 1;
+
+        // Register destroy recipe for this collection
+        self.destroy_recipes[coll.registry_id] = .{
+            .recipe = destroyRecipe(CollType),
+            .ptr = @ptrCast(coll),
+        };
     }
 
     /// Register a deinit context for a component type. Propagates to all
@@ -263,32 +278,34 @@ pub const Registry = struct {
     // Destroy — deferred
     // =============================================================
 
-    pub inline fn destroy(self: *Self, entity: Entity, src: anytype) !void {
-        const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
+    /// Destroy an entity (deferred). Source collection is looked up automatically.
+    pub fn destroy(self: *Self, entity: Entity) !void {
         const idx = entity.index;
         if (idx >= self.max_entities) return error.InvalidEntity;
         if (self.generations[idx] != entity.generation) return error.Stale;
         if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
-        if (self.collection_ids[idx] != src.registry_id) return error.WrongCollection;
+
+        const src_id = self.collection_ids[idx];
+        if (src_id == 0) return error.InvalidEntity;
 
         self.flags[idx] |= PENDING_MOVE;
 
-        const recipe = destroyRecipe(SrcColl);
+        const entry = self.destroy_recipes[src_id];
         try self.enqueueOp(.{
-            .src_collection_id = src.registry_id,
+            .src_collection_id = src_id,
             .src_offset = self.offsets[idx],
             .count = 1,
-            .execute = recipe,
-            .src_ptr = @ptrCast(src),
-            .dst_ptr = @ptrFromInt(1), // unused for destroy
+            .execute = entry.recipe,
+            .src_ptr = entry.ptr,
+            .dst_ptr = @ptrFromInt(1),
         });
     }
 
     // =============================================================
-    // moveFrom — the core primitive
+    // move — the core primitive
     // =============================================================
 
-    pub inline fn moveFrom(self: *Self, entity: Entity, src: anytype, dst: anytype) !void {
+    pub inline fn move(self: *Self, entity: Entity, src: anytype, dst: anytype) !void {
         const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
         const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
         const idx = entity.index;
@@ -300,7 +317,7 @@ pub const Registry = struct {
         // Comptime validation: src row must be subset of dst row
         comptime {
             if (!SrcColl.RowType.isSubsetOf(DstColl.RowType)) {
-                @compileError("moveFrom: source row is not a subset of destination row");
+                @compileError("move: source row is not a subset of destination row");
             }
         }
 
@@ -319,14 +336,151 @@ pub const Registry = struct {
     }
 
     // =============================================================
-    // moveAnyFrom — runtime source dispatch over a comptime set
+    // moveStrip — deferred move with explicit component drop
+    // =============================================================
+
+    /// Move an entity from src to dst, explicitly dropping components.
+    /// The strip list must exactly match the components lost in the move.
+    pub inline fn moveStrip(self: *Self, entity: Entity, src: anytype, dst: anytype, comptime strip: []const type) !void {
+        const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
+        const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
+        const idx = entity.index;
+        if (idx >= self.max_entities) return error.InvalidEntity;
+        if (self.generations[idx] != entity.generation) return error.Stale;
+        if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
+        if (self.collection_ids[idx] != src.registry_id) return error.WrongCollection;
+
+        comptime {
+            const lost = SrcColl.RowType.subtract(&DstColl.RowType.types);
+            if (!Row(strip).equal(lost)) {
+                @compileError("moveStrip: strip list does not match lost components");
+            }
+        }
+
+        self.flags[idx] |= PENDING_MOVE;
+
+        const recipe = moveRecipe(SrcColl, DstColl);
+        try self.enqueueOp(.{
+            .src_collection_id = src.registry_id,
+            .src_offset = self.offsets[idx],
+            .count = 1,
+            .execute = recipe,
+            .src_ptr = @ptrCast(src),
+            .dst_ptr = @ptrCast(dst),
+        });
+    }
+
+    // =============================================================
+    // Immediate operations — visible in the same tick
+    // =============================================================
+
+    /// Immediately move an entity from src to dst. No deferred queue.
+    /// Src row must be a subset of dst row.
+    pub inline fn moveImmediate(self: *Self, entity: Entity, src: anytype, dst: anytype) !void {
+        const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
+        const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
+
+        comptime {
+            if (!SrcColl.RowType.isSubsetOf(DstColl.RowType)) {
+                @compileError("moveImmediate: source row is not a subset of destination row");
+            }
+        }
+
+        try self.executeMoveImmediate(SrcColl, src, DstColl, dst, entity);
+    }
+
+    /// Immediately move an entity, explicitly stripping components.
+    pub inline fn moveStripImmediate(self: *Self, entity: Entity, src: anytype, dst: anytype, comptime strip: []const type) !void {
+        const SrcColl = @typeInfo(@TypeOf(src)).pointer.child;
+        const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
+
+        comptime {
+            const lost = SrcColl.RowType.subtract(&DstColl.RowType.types);
+            if (!Row(strip).equal(lost)) {
+                @compileError("moveStripImmediate: strip list does not match lost components");
+            }
+        }
+
+        try self.executeMoveImmediate(SrcColl, src, DstColl, dst, entity);
+    }
+
+    /// Immediately destroy an entity. Calls deinit, bumps generation.
+    /// Immediately destroy an entity. Source collection is looked up automatically.
+    pub fn destroyImmediate(self: *Self, entity: Entity) !void {
+        const idx = entity.index;
+        if (idx >= self.max_entities) return error.InvalidEntity;
+        if (self.generations[idx] != entity.generation) return error.Stale;
+        if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
+
+        const src_id = self.collection_ids[idx];
+        if (src_id == 0) return error.InvalidEntity;
+
+        const entry = self.destroy_recipes[src_id];
+        // Execute the destroy recipe directly (same fn as deferred, just not queued)
+        try entry.recipe(self, entry.ptr, @ptrFromInt(1), self.offsets[idx], 1);
+    }
+
+    fn executeMoveImmediate(self: *Self, comptime SrcColl: type, src: *SrcColl, comptime DstColl: type, dst: *DstColl, entity: Entity) !void {
+        const SrcRow = SrcColl.RowType;
+        const DstRow = DstColl.RowType;
+        const Shared = SrcRow.intersect(DstRow);
+        const New = DstRow.subtract(&SrcRow.types);
+        const Dropped = SrcRow.subtract(&DstRow.types);
+
+        const idx = entity.index;
+        if (idx >= self.max_entities) return error.InvalidEntity;
+        if (self.generations[idx] != entity.generation) return error.Stale;
+        if (self.flags[idx] & PENDING_MOVE != 0) return error.PendingMove;
+        if (self.collection_ids[idx] != src.registry_id) return error.WrongCollection;
+
+        const src_offset = self.offsets[idx];
+
+        // Reserve one slot — no init, no zero-init
+        const new_offset = try dst.reserveSlots(1);
+
+        // Copy entity handle
+        dst.entitySlice()[new_offset] = entity;
+
+        // Copy shared components
+        inline for (Shared.types) |T| {
+            dst.column(T)[new_offset] = src.column(T)[src_offset];
+        }
+
+        // Zero-init + init new components
+        inline for (New.types) |T| {
+            if (@sizeOf(T) > 0) {
+                dst.column(T)[new_offset] = std.mem.zeroes(T);
+            }
+        }
+        inline for (comptime New.initTypes()) |T| {
+            dst.callInit(T, dst.column(T)[new_offset .. new_offset + 1]);
+        }
+
+        // Deinit dropped components
+        inline for (comptime Dropped.deinitTypes()) |T| {
+            src.callDeinit(T, src.column(T)[src_offset .. src_offset + 1]);
+        }
+
+        // Remove from source
+        const moved = src.removeRun(src_offset, 1);
+        for (moved) |moved_entity| {
+            self.offsets[moved_entity.index] = src_offset;
+        }
+
+        // Update metadata
+        self.collection_ids[idx] = dst.registry_id;
+        self.offsets[idx] = new_offset;
+    }
+
+    // =============================================================
+    // moveAny — runtime source dispatch over a comptime set
     // =============================================================
 
     /// Move an entity to `dst` from whichever of `sources` it's currently in.
     /// `sources` is a tuple of collection pointers (e.g., `.{ &a, &b, &c }`).
     /// Only generates recipes for the (src, dst) pairs in the tuple — not N².
     /// Returns error.WrongCollection if the entity isn't in any of them.
-    pub inline fn moveAnyFrom(self: *Self, entity: Entity, sources: anytype, dst: anytype) !void {
+    pub inline fn moveAny(self: *Self, entity: Entity, sources: anytype, dst: anytype) !void {
         const idx = entity.index;
         if (idx >= self.max_entities) return error.InvalidEntity;
         if (self.generations[idx] != entity.generation) return error.Stale;
@@ -343,7 +497,7 @@ pub const Registry = struct {
             // Comptime validation per pair
             comptime {
                 if (!SrcColl.RowType.isSubsetOf(DstColl.RowType)) {
-                    @compileError("moveAnyFrom: source row is not a subset of destination row");
+                    @compileError("moveAny: source row is not a subset of destination row");
                 }
             }
 
@@ -409,12 +563,57 @@ pub const Registry = struct {
         return self.generations[entity.index] != entity.generation;
     }
 
+    pub fn isMoving(self: *const Self, entity: Entity) bool {
+        if (entity.index >= self.max_entities) return false;
+        if (self.generations[entity.index] != entity.generation) return false;
+        return self.flags[entity.index] & PENDING_MOVE != 0;
+    }
+
+    pub inline fn isInCollection(self: *const Self, entity: Entity, coll: anytype) bool {
+        if (entity.index >= self.max_entities) return false;
+        if (self.generations[entity.index] != entity.generation) return false;
+        return self.collection_ids[entity.index] == coll.registry_id;
+    }
+
     pub inline fn get(self: *Self, entity: Entity, coll: anytype, comptime T: type) !*T {
         const idx = entity.index;
         if (idx >= self.max_entities) return error.InvalidEntity;
         if (self.generations[idx] != entity.generation) return error.Stale;
         if (self.collection_ids[idx] != coll.registry_id) return error.WrongCollection;
         return &coll.column(T)[self.offsets[idx]];
+    }
+
+    pub inline fn set(self: *Self, entity: Entity, coll: anytype, comptime T: type, value: T) !void {
+        const ptr = try self.get(entity, coll, T);
+        ptr.* = value;
+    }
+
+    // =============================================================
+    // Batch create
+    // =============================================================
+
+    /// Create multiple entities at once in the given collection.
+    /// Returns a slice of entity handles (valid until the collection is modified).
+    pub inline fn createBatch(self: *Self, dst: anytype, count: u32) ![]const Entity {
+        if (self.null_count < count) return error.Full;
+
+        const DstColl = @typeInfo(@TypeOf(dst)).pointer.child;
+        const base = try dst.appendEntities(count);
+
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            self.null_count -= 1;
+            const entity = self.null_pool[self.null_count];
+
+            dst.entitySlice()[base + i] = entity;
+            self.collection_ids[entity.index] = dst.registry_id;
+            self.offsets[entity.index] = base + i;
+        }
+
+        // appendEntities already called zero-init + init for DstColl.RowType
+        _ = DstColl;
+
+        return dst.entitySlice()[base .. base + count];
     }
 
     // =============================================================
@@ -447,7 +646,7 @@ pub const Registry = struct {
     }
 
     /// Comptime-generated move recipe for (SrcColl, DstColl).
-    /// Only instantiated if a moveFrom call site references this pair.
+    /// Only instantiated if a move call site references this pair.
     fn moveRecipe(comptime SrcColl: type, comptime DstColl: type) *const fn (*Self, *anyopaque, *anyopaque, u32, u32) anyerror!void {
         const SrcRow = SrcColl.RowType;
         const DstRow = DstColl.RowType;
@@ -589,7 +788,7 @@ test "minimal app" {
     const e = try reg.create(&spawning);
     (try reg.get(e, &spawning, Position)).* = .{ .x = 1, .y = 2, .z = 0 };
 
-    try reg.moveFrom(e, &spawning, &active);
+    try reg.move(e, &spawning, &active);
     try reg.flush();
 
     try testing.expectEqual(@as(f32, 1), (try reg.get(e, &active, Position)).x);
@@ -610,7 +809,7 @@ test "create entity in standalone collection" {
     try testing.expectEqual(@as(u32, 1), active.count);
 }
 
-test "moveFrom between standalone collections" {
+test "move between standalone collections" {
     var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
     defer reg.deinit();
 
@@ -626,7 +825,7 @@ test "moveFrom between standalone collections" {
     const pos_ptr = try reg.get(e, &narrow, Position);
     pos_ptr.* = .{ .x = 42, .y = 0, .z = 0 };
 
-    try reg.moveFrom(e, &narrow, &wide);
+    try reg.move(e, &narrow, &wide);
     try reg.flush();
 
     try testing.expectEqual(@as(u32, 0), narrow.count);
@@ -645,7 +844,7 @@ test "destroy entity" {
     reg.registerCollection(&coll);
 
     const e = try reg.create(&coll);
-    try reg.destroy(e, &coll);
+    try reg.destroy(e);
     try reg.flush();
 
     try testing.expect(reg.isStale(e));
@@ -698,7 +897,7 @@ test "multiple moves then flush" {
     }
 
     for (entities) |e| {
-        try reg.moveFrom(e, &a, &b);
+        try reg.move(e, &a, &b);
     }
     try reg.flush();
 
@@ -710,7 +909,7 @@ test "multiple moves then flush" {
     }
 }
 
-test "moveAnyFrom — entity in one of several sources" {
+test "moveAny — entity in one of several sources" {
     var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
     defer reg.deinit();
 
@@ -739,9 +938,9 @@ test "moveAnyFrom — entity in one of several sources" {
     const e3 = try reg.create(&active);
     (try reg.get(e3, &active, Position)).x = 3;
 
-    try reg.moveAnyFrom(e1, .{ &init_coll, &pending, &active }, &done);
-    try reg.moveAnyFrom(e2, .{ &init_coll, &pending, &active }, &done);
-    try reg.moveAnyFrom(e3, .{ &init_coll, &pending, &active }, &done);
+    try reg.moveAny(e1, .{ &init_coll, &pending, &active }, &done);
+    try reg.moveAny(e2, .{ &init_coll, &pending, &active }, &done);
+    try reg.moveAny(e3, .{ &init_coll, &pending, &active }, &done);
     try reg.flush();
 
     try testing.expectEqual(@as(u32, 0), init_coll.count);
@@ -754,7 +953,7 @@ test "moveAnyFrom — entity in one of several sources" {
     try testing.expectEqual(@as(f32, 3), (try reg.get(e3, &done, Position)).x);
 }
 
-test "moveAnyFrom — wrong collection returns error" {
+test "moveAny — wrong collection returns error" {
     var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
     defer reg.deinit();
 
@@ -771,7 +970,7 @@ test "moveAnyFrom — wrong collection returns error" {
     reg.registerCollection(&dst);
 
     const e = try reg.create(&a);
-    try testing.expectError(error.WrongCollection, reg.moveAnyFrom(e, .{&b}, &dst));
+    try testing.expectError(error.WrongCollection, reg.moveAny(e, .{&b}, &dst));
 }
 
 // Component with side-effecting init/deinit for lifecycle verification
@@ -793,7 +992,7 @@ const Tracked = struct {
     }
 };
 
-test "moveFrom — deinit fires on dropped components" {
+test "move — deinit fires on dropped components" {
     init_counter = 0;
     deinit_counter = 0;
 
@@ -815,14 +1014,14 @@ test "moveFrom — deinit fires on dropped components" {
     init_counter = 0;
     deinit_counter = 0;
 
-    try reg.destroy(e, &wide);
+    try reg.destroy(e);
     try reg.flush();
 
     try testing.expectEqual(@as(u32, 1), deinit_counter);
     try testing.expect(reg.isStale(e));
 }
 
-test "moveFrom — init fires on new components, shared components copied" {
+test "move — init fires on new components, shared components copied" {
     init_counter = 0;
     deinit_counter = 0;
 
@@ -842,7 +1041,7 @@ test "moveFrom — init fires on new components, shared components copied" {
 
     init_counter = 0;
 
-    try reg.moveFrom(e, &narrow, &wide);
+    try reg.move(e, &narrow, &wide);
     try reg.flush();
 
     const pos = try reg.get(e, &wide, Position);
@@ -853,7 +1052,7 @@ test "moveFrom — init fires on new components, shared components copied" {
     try testing.expectEqual(@as(u32, 1), init_counter);
 }
 
-test "moveAnyFrom — lifecycle through multiple sources" {
+test "moveAny — lifecycle through multiple sources" {
     init_counter = 0;
     deinit_counter = 0;
 
@@ -880,8 +1079,8 @@ test "moveAnyFrom — lifecycle through multiple sources" {
 
     init_counter = 0;
 
-    try reg.moveAnyFrom(e1, .{ &src_a, &src_b }, &dst);
-    try reg.moveAnyFrom(e2, .{ &src_a, &src_b }, &dst);
+    try reg.moveAny(e1, .{ &src_a, &src_b }, &dst);
+    try reg.moveAny(e2, .{ &src_a, &src_b }, &dst);
     try reg.flush();
 
     try testing.expectEqual(@as(u32, 2), dst.count);
@@ -918,7 +1117,7 @@ test "setDeinitCtx — propagates to registered collections" {
     const e = try reg.create(&coll);
     (try reg.get(e, &coll, Resource)).handle = 42;
 
-    try reg.destroy(e, &coll);
+    try reg.destroy(e);
     try reg.flush();
 
     // DeinitCtx should have been called
@@ -949,8 +1148,230 @@ test "setDeinitCtx — retroactive propagation" {
     reg.setDeinitCtx(Resource, &counter);
 
     const e = try reg.create(&coll);
-    try reg.destroy(e, &coll);
+    try reg.destroy(e);
     try reg.flush();
 
     try testing.expectEqual(@as(u32, 1), counter);
+}
+
+test "moveStrip — explicit component drop" {
+    deinit_counter = 0;
+
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var wide = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
+    defer wide.deinit();
+    reg.registerCollection(&wide);
+
+    var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer narrow.deinit();
+    reg.registerCollection(&narrow);
+
+    const e = try reg.create(&wide);
+    (try reg.get(e, &wide, Position)).x = 55;
+
+    try reg.moveStrip(e, &wide, &narrow, &.{Tracked});
+    try reg.flush();
+
+    try testing.expectEqual(@as(u32, 0), wide.count);
+    try testing.expectEqual(@as(u32, 1), narrow.count);
+    try testing.expectEqual(@as(f32, 55), (try reg.get(e, &narrow, Position)).x);
+    try testing.expectEqual(@as(u32, 1), deinit_counter);
+}
+
+test "moveImmediate — visible before flush" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a);
+
+    var b = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
+    defer b.deinit();
+    reg.registerCollection(&b);
+
+    const e = try reg.create(&a);
+    (try reg.get(e, &a, Position)).x = 99;
+
+    try reg.moveImmediate(e, &a, &b);
+
+    try testing.expectEqual(@as(u32, 0), a.count);
+    try testing.expectEqual(@as(u32, 1), b.count);
+    try testing.expectEqual(@as(f32, 99), (try reg.get(e, &b, Position)).x);
+}
+
+test "moveStripImmediate — immediate with component drop" {
+    init_counter = 0;
+    deinit_counter = 0;
+
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var wide = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
+    defer wide.deinit();
+    reg.registerCollection(&wide);
+
+    var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer narrow.deinit();
+    reg.registerCollection(&narrow);
+
+    const e = try reg.create(&wide);
+    (try reg.get(e, &wide, Position)).x = 77;
+
+    init_counter = 0;
+    deinit_counter = 0;
+
+    try reg.moveStripImmediate(e, &wide, &narrow, &.{Tracked});
+
+    try testing.expectEqual(@as(u32, 0), wide.count);
+    try testing.expectEqual(@as(u32, 1), narrow.count);
+    try testing.expectEqual(@as(f32, 77), (try reg.get(e, &narrow, Position)).x);
+    try testing.expectEqual(@as(u32, 1), deinit_counter);
+}
+
+test "destroyImmediate — no flush needed" {
+    deinit_counter = 0;
+
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var coll = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
+    defer coll.deinit();
+    reg.registerCollection(&coll);
+
+    const e = try reg.create(&coll);
+    deinit_counter = 0;
+
+    try reg.destroyImmediate(e);
+
+    try testing.expect(reg.isStale(e));
+    try testing.expectEqual(@as(u32, 0), coll.count);
+    try testing.expectEqual(@as(u32, 1), deinit_counter);
+}
+
+test "moveImmediate — init fires on new components" {
+    init_counter = 0;
+
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var narrow = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer narrow.deinit();
+    reg.registerCollection(&narrow);
+
+    var wide = try Collection(Row(&.{ Position, Tracked }), .{}).init(testing.allocator);
+    defer wide.deinit();
+    reg.registerCollection(&wide);
+
+    const e = try reg.create(&narrow);
+    (try reg.get(e, &narrow, Position)).x = 42;
+    init_counter = 0;
+
+    try reg.moveImmediate(e, &narrow, &wide);
+
+    try testing.expectEqual(@as(f32, 42), (try reg.get(e, &wide, Position)).x);
+    try testing.expectEqual(@as(u32, 999), (try reg.get(e, &wide, Tracked)).value);
+    try testing.expectEqual(@as(u32, 1), init_counter);
+}
+
+test "set — convenience write" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var coll = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer coll.deinit();
+    reg.registerCollection(&coll);
+
+    const e = try reg.create(&coll);
+    try reg.set(e, &coll, Position, .{ .x = 5, .y = 10, .z = 15 });
+
+    const pos = try reg.get(e, &coll, Position);
+    try testing.expectEqual(@as(f32, 5), pos.x);
+    try testing.expectEqual(@as(f32, 10), pos.y);
+    try testing.expectEqual(@as(f32, 15), pos.z);
+}
+
+test "isInCollection" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a);
+
+    var b = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer b.deinit();
+    reg.registerCollection(&b);
+
+    const e = try reg.create(&a);
+    try testing.expect(reg.isInCollection(e, &a));
+    try testing.expect(!reg.isInCollection(e, &b));
+
+    // After move
+    try reg.moveImmediate(e, &a, &b);
+    try testing.expect(!reg.isInCollection(e, &a));
+    try testing.expect(reg.isInCollection(e, &b));
+
+    // Stale entity
+    try reg.destroyImmediate(e);
+    try testing.expect(!reg.isInCollection(e, &a));
+    try testing.expect(!reg.isInCollection(e, &b));
+}
+
+test "isMoving" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a);
+
+    var b = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
+    defer b.deinit();
+    reg.registerCollection(&b);
+
+    const e = try reg.create(&a);
+    try testing.expect(!reg.isMoving(e));
+
+    // After deferred move — pending
+    try reg.move(e, &a, &b);
+    try testing.expect(reg.isMoving(e));
+
+    // After flush — no longer pending
+    try reg.flush();
+    try testing.expect(!reg.isMoving(e));
+}
+
+test "createBatch — multiple entities" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
+
+    var coll = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
+    defer coll.deinit();
+    reg.registerCollection(&coll);
+
+    const entities = try reg.createBatch(&coll, 10);
+    try testing.expectEqual(@as(usize, 10), entities.len);
+    try testing.expectEqual(@as(u32, 10), coll.count);
+
+    // Each entity is valid and in the collection
+    for (entities) |e| {
+        try testing.expect(!reg.isStale(e));
+        try testing.expect(reg.isInCollection(e, &coll));
+    }
+
+    // Entities are distinct
+    for (entities, 0..) |e, i| {
+        for (entities[i + 1 ..]) |other| {
+            try testing.expect(!e.eql(other));
+        }
+    }
+
+    // Can write to them
+    for (entities, 0..) |e, i| {
+        try reg.set(e, &coll, Position, .{ .x = @floatFromInt(i), .y = 0, .z = 0 });
+    }
+    try testing.expectEqual(@as(f32, 5), coll.column(Position)[5].x);
 }
