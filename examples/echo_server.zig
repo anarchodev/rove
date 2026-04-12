@@ -1,5 +1,5 @@
 const std = @import("std");
-const rove = @import("rove2");
+const rove = @import("rove");
 const rio = @import("rove-io");
 
 const MyIo = rio.Io(.{});

@@ -18,27 +18,13 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(rove_lib);
 
-    // ── rove2: experimental decentralized collections ──
-    const rove2_mod = b.addModule("rove2", .{
-        .root_source_file = b.path("src/rove2/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const rove2_lib = b.addLibrary(.{
-        .linkage = .static,
-        .name = "rove2",
-        .root_module = rove2_mod,
-    });
-    b.installArtifact(rove2_lib);
-
     // ── rove-io: io_uring wrapper using rove entities ──
     const io_mod = b.addModule("rove-io", .{
         .root_source_file = b.path("src/io/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    io_mod.addImport("rove2", rove2_mod);
+    io_mod.addImport("rove", rove_mod);
     io_mod.link_libc = true;
 
     // ── rove-h2: HTTP/2 protocol on rove-io + nghttp2 ──
@@ -61,17 +47,13 @@ pub fn build(b: *std.Build) void {
     const rove_tests = b.addTest(.{ .root_module = rove_mod });
     test_step.dependOn(&b.addRunArtifact(rove_tests).step);
 
-    // rove2 tests
-    const rove2_tests = b.addTest(.{ .root_module = rove2_mod });
-    test_step.dependOn(&b.addRunArtifact(rove2_tests).step);
-
     // rove-io tests
     const io_tests = b.addTest(.{ .root_module = io_mod });
     test_step.dependOn(&b.addRunArtifact(io_tests).step);
 
-    // rove-h2 tests (disabled during rove2 port)
-    // const h2_tests = b.addTest(.{ .root_module = h2_mod });
-    // test_step.dependOn(&b.addRunArtifact(h2_tests).step);
+    // rove-h2 tests
+    const h2_tests = b.addTest(.{ .root_module = h2_mod });
+    test_step.dependOn(&b.addRunArtifact(h2_tests).step);
 
     // ── Examples ──
     const echo_mod = b.addModule("echo-server", .{
@@ -79,7 +61,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    echo_mod.addImport("rove2", rove2_mod);
+    echo_mod.addImport("rove", rove_mod);
     echo_mod.addImport("rove-io", io_mod);
 
     const echo_server = b.addExecutable(.{

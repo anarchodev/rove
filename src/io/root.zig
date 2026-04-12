@@ -1,5 +1,5 @@
 const std = @import("std");
-const rove = @import("rove2");
+const rove = @import("rove");
 const Row = rove.Row;
 const Collection = rove.Collection;
 const Registry = rove.Registry;
@@ -188,10 +188,33 @@ pub fn Io(comptime opts: Options) type {
 
         cleanup_ctx: IoCleanupCtx,
 
+        /// Optional FD resolver. If set, used to look up the Fd for a connection
+        /// entity — needed when a library (like rove-h2) moves connection entities
+        /// out of `self.connections` into its own collections. Defaults to looking
+        /// up in `self.connections`.
+        fd_resolver: ?*const fn (ctx: *anyopaque, entity: Entity) ?*Fd = null,
+        fd_resolver_ctx: ?*anyopaque = null,
+
         reg: *Registry,
         allocator: std.mem.Allocator,
 
         const BUF_GROUP_ID: u16 = 0;
+
+        /// Look up the Fd for a connection entity. Uses the custom resolver if
+        /// set, otherwise searches `self.connections` directly.
+        pub fn getFd(self: *Self, entity: Entity) ?*Fd {
+            if (self.fd_resolver) |resolver| {
+                return resolver(self.fd_resolver_ctx.?, entity);
+            }
+            return self.reg.get(entity, &self.connections, Fd) catch null;
+        }
+
+        /// Register an external FD resolver. Used by rove-h2 to search its own
+        /// connection collections (_conn_active, _conn_tls_handshake).
+        pub fn setFdResolver(self: *Self, ctx: *anyopaque, resolver: *const fn (*anyopaque, Entity) ?*Fd) void {
+            self.fd_resolver_ctx = ctx;
+            self.fd_resolver = resolver;
+        }
 
         pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: IoOptions) !*Self {
             var ring = if (io_opts.ring_params) |params|
@@ -350,7 +373,10 @@ pub fn Io(comptime opts: Options) type {
                     continue;
                 }
 
-                const conn_fd = try self.reg.get(conn_ent.entity, &self.connections, Fd);
+                const conn_fd = self.getFd(conn_ent.entity) orelse {
+                    try self.reg.destroy(ent);
+                    continue;
+                };
 
                 const sqe = try self.ring.get_sqe();
                 sqe.prep_send(conn_fd.fd, @constCast(wb.data)[wb.offset..wb.len], 0);
@@ -378,7 +404,14 @@ pub fn Io(comptime opts: Options) type {
                     continue;
                 }
 
-                const conn_fd = try self.reg.get(conn_ent.entity, &self.connections, Fd);
+                const conn_fd = self.getFd(conn_ent.entity) orelse {
+                    if (rr.data != null) {
+                        self.returnBufferToRing(rr.buf_id, mask, armed);
+                        armed += 1;
+                    }
+                    try self.reg.destroy(ent);
+                    continue;
+                };
 
                 if (rr.data != null) {
                     self.returnBufferToRing(rr.buf_id, mask, armed);
@@ -506,7 +539,7 @@ pub fn Io(comptime opts: Options) type {
                 try self.reg.set(entity, &self.write_results, IoResult, .{ .err = 0 });
             } else {
                 const conn_ent = try self.reg.get(entity, &self._write_pending, ConnEntity);
-                const conn_fd = try self.reg.get(conn_ent.entity, &self.connections, Fd);
+                const conn_fd = self.getFd(conn_ent.entity) orelse return error.InvalidEntity;
                 const sqe = try self.ring.get_sqe();
                 sqe.prep_send(conn_fd.fd, @constCast(wb.data)[wb.offset..wb.len], 0);
                 sqe.flags |= linux.IOSQE_FIXED_FILE;

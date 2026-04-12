@@ -583,6 +583,25 @@ pub const Registry = struct {
         return &coll.column(T)[self.offsets[idx]];
     }
 
+    /// Get a component from an entity whose collection isn't known at the call site,
+    /// but IS in a bounded comptime-known set. `colls` is a tuple of collection
+    /// pointers. Returns error.WrongCollection if the entity isn't in any of them.
+    /// Every collection in the tuple must contain component T at comptime.
+    pub inline fn getAny(self: *Self, entity: Entity, colls: anytype, comptime T: type) !*T {
+        const idx = entity.index;
+        if (idx >= self.max_entities) return error.InvalidEntity;
+        if (self.generations[idx] != entity.generation) return error.Stale;
+
+        const current_id = self.collection_ids[idx];
+        inline for (@typeInfo(@TypeOf(colls)).@"struct".fields) |field| {
+            const coll = @field(colls, field.name);
+            if (current_id == coll.registry_id) {
+                return &coll.column(T)[self.offsets[idx]];
+            }
+        }
+        return error.WrongCollection;
+    }
+
     pub inline fn set(self: *Self, entity: Entity, coll: anytype, comptime T: type, value: T) !void {
         const ptr = try self.get(entity, coll, T);
         ptr.* = value;
@@ -971,6 +990,46 @@ test "moveAny — wrong collection returns error" {
 
     const e = try reg.create(&a);
     try testing.expectError(error.WrongCollection, reg.moveAny(e, .{&b}, &dst));
+}
+
+test "getAny — entity in one of several collections" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a);
+
+    var b = try Collection(Row(&.{ Position, Velocity }), .{}).init(testing.allocator);
+    defer b.deinit();
+    reg.registerCollection(&b);
+
+    var c = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer c.deinit();
+    reg.registerCollection(&c);
+
+    // Entity in b, but we want Position (which all three collections have)
+    const e = try reg.create(&b);
+    (try reg.get(e, &b, Position)).* = .{ .x = 99, .y = 0, .z = 0 };
+
+    const pos = try reg.getAny(e, .{ &a, &b, &c }, Position);
+    try testing.expectEqual(@as(f32, 99), pos.x);
+}
+
+test "getAny — wrong collection returns error" {
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 16 });
+    defer reg.deinit();
+
+    var a = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer a.deinit();
+    reg.registerCollection(&a);
+
+    var b = try Collection(Row(&.{Position}), .{}).init(testing.allocator);
+    defer b.deinit();
+    reg.registerCollection(&b);
+
+    const e = try reg.create(&a);
+    try testing.expectError(error.WrongCollection, reg.getAny(e, .{&b}, Position));
 }
 
 // Component with side-effecting init/deinit for lifecycle verification

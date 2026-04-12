@@ -59,6 +59,9 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
         capacity: u32,
         allocator: std.mem.Allocator,
 
+        /// Registry-assigned collection ID. Set after init via registry.allocateCollectionId().
+        registry_id: u8 = 0,
+
         // Lifecycle context pointers (one per component slot, null if not needed)
         init_ctxs: [R.len]?*anyopaque,
         deinit_ctxs: [R.len]?*anyopaque,
@@ -66,6 +69,7 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
         /// Create a new collection. For fixed-capacity collections, this
         /// performs the single up-front allocation. For dynamic collections,
         /// no allocation occurs until the first append.
+        /// After init, call registry.registerCollection(&coll) to assign an ID.
         pub fn init(allocator: std.mem.Allocator) !Self {
             var self = Self{
                 .entities = null,
@@ -73,6 +77,7 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
                 .count = 0,
                 .capacity = 0,
                 .allocator = allocator,
+                .registry_id = 0,
                 .init_ctxs = [_]?*anyopaque{null} ** R.len,
                 .deinit_ctxs = [_]?*anyopaque{null} ** R.len,
             };
@@ -147,6 +152,25 @@ pub fn Collection(comptime R: type, comptime options: CollectionOptions) type {
             }
 
             try self.allocateStorage(nextPow2(min_capacity));
+        }
+
+        /// Reserve `count` slots at the end. Grows capacity if needed, bumps
+        /// count, but does NOT zero-init or call init. Caller is responsible
+        /// for writing all component data. Used by move recipes that selectively
+        /// copy shared components and init only new ones.
+        pub fn reserveSlots(self: *Self, count: u32) !u32 {
+            const needed = self.count + count;
+            if (needed > self.capacity) {
+                if (options.capacity != null) {
+                    return error.Full;
+                }
+                var new_cap = if (self.capacity == 0) @as(u32, 8) else self.capacity;
+                while (new_cap < needed) new_cap *= 2;
+                try self.allocateStorage(new_cap);
+            }
+            const offset = self.count;
+            self.count += count;
+            return offset;
         }
 
         /// Add a single entity. Convenience wrapper around appendEntities.

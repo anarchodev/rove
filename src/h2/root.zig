@@ -2,6 +2,8 @@ const std = @import("std");
 const rove = @import("rove");
 const rio = @import("rove-io");
 const Row = rove.Row;
+const Collection = rove.Collection;
+const Registry = rove.Registry;
 const Entity = rove.Entity;
 pub const tls = @import("tls.zig");
 pub const TlsConfig = tls.TlsConfig;
@@ -29,8 +31,6 @@ pub const Session = struct {
     entity: Entity = Entity.nil,
 };
 
-/// Request headers — owned by h2, freed on entity destroy.
-/// `_buf` is a single allocation: fields array followed by string data.
 pub const ReqHeaders = struct {
     fields: ?[*]HeaderField = null,
     count: u32 = 0,
@@ -48,7 +48,6 @@ pub const ReqHeaders = struct {
     }
 };
 
-/// Request body — owned by h2, freed on entity destroy.
 pub const ReqBody = struct {
     data: ?[*]u8 = null,
     len: u32 = 0,
@@ -62,7 +61,6 @@ pub const ReqBody = struct {
     }
 };
 
-/// Response headers — app-allocated fields array, freed on entity destroy.
 pub const RespHeaders = struct {
     fields: ?[*]HeaderField = null,
     count: u32 = 0,
@@ -80,7 +78,6 @@ pub const RespHeaders = struct {
     }
 };
 
-/// Response body — app-allocated, freed on entity destroy.
 pub const RespBody = struct {
     data: ?[*]u8 = null,
     len: u32 = 0,
@@ -102,8 +99,6 @@ pub const H2IoResult = struct {
     err: i32 = 0,
 };
 
-/// Internal per-connection state — carries the nghttp2 session.
-/// Registered as a connection component; deinit cleans up nghttp2.
 pub const Direction = enum(u8) { server = 0, client = 1 };
 
 pub const Conn = struct {
@@ -113,7 +108,7 @@ pub const Conn = struct {
     tls_conn: ?*tls.TlsConn = null,
     direction: Direction = .server,
     last_active_ns: u64 = 0,
-    /// For client connections: the user's connect entity parked in _connect_pending.
+    /// For client connections: the user's connect entity parked in _client_connect_pending.
     pending_connect_entity: Entity = Entity.nil,
 
     pub fn deinit(_: std.mem.Allocator, items: []Conn) void {
@@ -211,7 +206,6 @@ const Stream = struct {
         @memcpy(self.hdr_strbuf.?[value_off .. value_off + @as(u32, @intCast(value_len))], value[0..value_len]);
         self.hdr_strbuf_len += @intCast(value_len);
 
-        // Store offsets + 1 to avoid @ptrFromInt(0) which is UB.
         self.hdr_fields.?[self.hdr_count] = .{
             .name = @ptrFromInt(name_off + 1),
             .name_len = @intCast(name_len),
@@ -271,7 +265,6 @@ const Stream = struct {
     }
 };
 
-/// Body data provider for nghttp2 response sends.
 const BodyData = struct {
     data: []const u8,
     offset: u32 = 0,
@@ -306,10 +299,9 @@ fn monotonicNs() u64 {
 const StreamBaseRow = Row(&.{ StreamId, Session, ReqHeaders, ReqBody, RespHeaders, RespBody, Status, H2IoResult });
 
 // =============================================================================
-// Spec
+// Options
 // =============================================================================
 
-/// Target for outgoing client connections.
 pub const ConnectTarget = struct {
     addr: std.net.Address,
     hostname: ?[*]const u8 = null,
@@ -323,107 +315,199 @@ pub const Options = struct {
 };
 
 pub const H2Options = struct {
-    /// Maximum concurrent HTTP/2 streams per connection (SETTINGS_MAX_CONCURRENT_STREAMS).
     max_concurrent_streams: u32 = 128,
-    /// Initial flow-control window size per stream in bytes (SETTINGS_INITIAL_WINDOW_SIZE).
     initial_window_size: u32 = 65535,
-    /// Maximum frame size in bytes (SETTINGS_MAX_FRAME_SIZE).
     max_frame_size: u32 = 16384,
-    /// Maximum header list size in bytes (SETTINGS_MAX_HEADER_LIST_SIZE). 0 = nghttp2 default.
     max_header_list_size: u32 = 0,
-    /// Maximum concurrent h2 connections. 0 = unlimited (bounded only by rove-io's max_connections).
     max_h2_connections: u32 = 0,
-    /// Idle connection timeout in nanoseconds. 0 = no timeout.
     idle_timeout_ns: u64 = 0,
-    /// TLS config. null = h2c (plaintext). Set to enable TLS (h2 over TLS).
     tls_config: ?*TlsConfig = null,
 };
 
-pub fn Collections(comptime opts: Options) type {
-    const conn_row = Row(&.{Conn}).merge(opts.connection_row);
-    return rove.MergeCollections(.{
-        rio.Collections(.{ .connection_row = conn_row, .connect = opts.client }),
-        H2OnlySpec(opts),
-    });
-}
+// =============================================================================
+// H2 — HTTP/2 runtime
+// =============================================================================
 
-fn H2OnlySpec(comptime opts: Options) type {
-    const conn_row = rio.ConnectionBaseRow.merge(Row(&.{Conn})).merge(opts.connection_row);
+pub fn H2(comptime opts: Options) type {
     const stream_row = StreamBaseRow.merge(opts.request_row);
-    const connect_row = Row(&.{ ConnectTarget, Session, H2IoResult }).merge(opts.request_row);
-    const C = rove.Collection;
+    const connect_row_full = Row(&.{ ConnectTarget, Session, H2IoResult }).merge(opts.request_row);
+    const full_conn_row = rio.ConnectionBaseRow.merge(Row(&.{Conn})).merge(opts.connection_row);
 
-    const base_fields = .{
-        // Server request/response
-        rove.col("request_out", C(stream_row, .{})),
-        rove.col("response_in", C(stream_row, .{})),
-        rove.col("response_out", C(stream_row, .{})),
-        rove.col("_response_sending", C(stream_row, .{})),
-        // Streaming response collections
-        rove.col("stream_response_in", C(stream_row, .{})),
-        rove.col("stream_data_out", C(stream_row, .{})),
-        rove.col("stream_data_in", C(stream_row, .{})),
-        rove.col("stream_close_in", C(stream_row, .{})),
-        rove.col("_stream_data_sending", C(stream_row, .{})),
-        // Internal
-        rove.col("_read_errors", C(rio.ReadBaseRow, .{})),
-        rove.col("_read_init", C(rio.ReadBaseRow, .{})),
-        rove.col("_read_active", C(rio.ReadBaseRow, .{})),
-        rove.col("_conn_tls_handshake", C(conn_row, .{})),
-        rove.col("_conn_active", C(conn_row, .{})),
-        rove.col("_read_handshake", C(rio.ReadBaseRow, .{})),
-    };
+    const has_client = opts.client;
 
-    const client_fields = if (opts.client) .{
-        // Client connect lifecycle
-        rove.col("client_connect_in", C(connect_row, .{})),
-        rove.col("client_connect_out", C(connect_row, .{})),
-        rove.col("client_connect_errors", C(connect_row, .{})),
-        rove.col("_client_connect_pending", C(connect_row, .{})),
-        // Client request/response
-        rove.col("client_request_in", C(stream_row, .{})),
-        rove.col("client_response_out", C(stream_row, .{})),
-        rove.col("_client_request_sending", C(stream_row, .{})),
-        // Client streaming request collections
-        rove.col("client_stream_request_in", C(stream_row, .{})),
-        rove.col("client_stream_data_out", C(stream_row, .{})),
-        rove.col("client_stream_data_in", C(stream_row, .{})),
-        rove.col("client_stream_close_in", C(stream_row, .{})),
-        rove.col("_client_stream_data_sending", C(stream_row, .{})),
-    } else .{};
+    // Rove-io type for this h2 configuration
+    const IoType = rio.Io(.{
+        .connection_row = Row(&.{Conn}).merge(opts.connection_row),
+        .connect = has_client,
+    });
 
-    return rove.MakeCollections(&(base_fields ++ client_fields));
-}
+    // Collection types (for comptime)
+    const StreamColl = Collection(stream_row, .{});
+    const ReadColl = Collection(rio.ReadBaseRow, .{});
+    const ConnColl = Collection(full_conn_row, .{});
 
-// =============================================================================
-// H2 — HTTP/2 server runtime
-// =============================================================================
+    const ClientConnectColl = if (has_client) Collection(connect_row_full, .{}) else void;
+    const ClientStreamColl = if (has_client) Collection(stream_row, .{}) else void;
 
-pub fn H2(comptime Ctx: type) type {
     return struct {
         const Self = @This();
-        const has_client = @hasField(Ctx.CollectionId, "client_connect_in");
 
-        io: *rio.Io(Ctx),
+        // Public row types (for external access)
+        pub const StreamRow = stream_row;
+        pub const ConnectionRow = full_conn_row;
+
+        // The io instance (heap-allocated by rio.Io.create)
+        io: *IoType,
+
+        // H2-specific collections: server request/response
+        request_out: StreamColl,
+        response_in: StreamColl,
+        response_out: StreamColl,
+        _response_sending: StreamColl,
+
+        // Streaming response collections
+        stream_response_in: StreamColl,
+        stream_data_out: StreamColl,
+        stream_data_in: StreamColl,
+        stream_close_in: StreamColl,
+        _stream_data_sending: StreamColl,
+
+        // Read triage
+        _read_errors: ReadColl,
+        _read_init: ReadColl,
+        _read_active: ReadColl,
+        _read_handshake: ReadColl,
+
+        // Connection pipeline
+        _conn_tls_handshake: ConnColl,
+        _conn_active: ConnColl,
+
+        // Client connect lifecycle (conditional)
+        client_connect_in: ClientConnectColl,
+        client_connect_out: ClientConnectColl,
+        client_connect_errors: ClientConnectColl,
+        _client_connect_pending: ClientConnectColl,
+
+        // Client request/response (conditional)
+        client_request_in: ClientStreamColl,
+        client_response_out: ClientStreamColl,
+        _client_request_sending: ClientStreamColl,
+
+        // Client streaming (conditional)
+        client_stream_request_in: ClientStreamColl,
+        client_stream_data_out: ClientStreamColl,
+        client_stream_data_in: ClientStreamColl,
+        client_stream_close_in: ClientStreamColl,
+        _client_stream_data_sending: ClientStreamColl,
+
         h2_opts: H2Options,
+        reg: *Registry,
         allocator: std.mem.Allocator,
 
-        // Shared nghttp2 callbacks — one per H2(Ctx) instantiation.
+        // Shared nghttp2 callbacks — one per H2 instantiation
         var ng_callbacks: ?*c.nghttp2_session_callbacks = null;
+        var ng_client_callbacks: ?*c.nghttp2_session_callbacks = null;
 
         // =============================================================
-        // NgCtx — nghttp2 session user_data, lives inside H2(Ctx)
-        // so callbacks can access Ctx directly.
+        // NgCtx — nghttp2 session user_data, holds *Self for collection access
         // =============================================================
 
         const NgCtx = struct {
-            ctx: *Ctx,
+            h2: *Self,
             allocator: std.mem.Allocator,
             conn_entity: Entity = Entity.nil,
         };
 
         // =============================================================
-        // nghttp2 callbacks — inside H2(Ctx), full access to Ctx
+        // Helpers for entity dispatch across collections
+        // =============================================================
+
+        /// All collections a server stream entity can be in between request_out and response_out.
+        inline fn serverStreamColls(h2: *Self) [8]*StreamColl {
+            return .{
+                &h2.request_out,
+                &h2.response_in,
+                &h2._response_sending,
+                &h2.stream_response_in,
+                &h2.stream_data_out,
+                &h2.stream_data_in,
+                &h2.stream_close_in,
+                &h2._stream_data_sending,
+            };
+        }
+
+        /// All collections a client stream entity can be in between client_request_in and client_response_out.
+        inline fn clientStreamColls(h2: *Self) [7]*ClientStreamColl {
+            return .{
+                &h2.client_request_in,
+                &h2._client_request_sending,
+                &h2.client_stream_request_in,
+                &h2.client_stream_data_out,
+                &h2.client_stream_data_in,
+                &h2.client_stream_close_in,
+                &h2._client_stream_data_sending,
+            };
+        }
+
+        /// All collections a connection entity can be in (io's + h2's).
+        inline fn connColls(h2: *Self) struct { *@TypeOf(h2.io.connections), *ConnColl, *ConnColl } {
+            return .{ &h2.io.connections, &h2._conn_tls_handshake, &h2._conn_active };
+        }
+
+        /// Find the current collection of a server stream entity, set H2IoResult, and move to response_out.
+        fn serverStreamClose(h2: *Self, entity: Entity, err: i32) void {
+            for (h2.serverStreamColls()) |src| {
+                if (h2.reg.isInCollection(entity, src)) {
+                    h2.reg.set(entity, src, H2IoResult, .{ .err = err }) catch {};
+                    h2.reg.move(entity, src, &h2.response_out) catch {};
+                    return;
+                }
+            }
+        }
+
+        /// Find a stream entity's current collection and set a component (shared among stream collections).
+        fn streamSet(h2: *Self, entity: Entity, comptime T: type, value: T) void {
+            for (h2.serverStreamColls()) |src| {
+                if (h2.reg.isInCollection(entity, src)) {
+                    h2.reg.set(entity, src, T, value) catch {};
+                    return;
+                }
+            }
+            if (comptime has_client) {
+                for (h2.clientStreamColls()) |src| {
+                    if (h2.reg.isInCollection(entity, src)) {
+                        h2.reg.set(entity, src, T, value) catch {};
+                        return;
+                    }
+                }
+            }
+        }
+
+        /// Find the current collection of a client stream entity, set H2IoResult, and move to client_response_out.
+        fn clientStreamClose(h2: *Self, entity: Entity, err: i32) void {
+            if (!has_client) return;
+            for (h2.clientStreamColls()) |src| {
+                if (h2.reg.isInCollection(entity, src)) {
+                    h2.reg.set(entity, src, H2IoResult, .{ .err = err }) catch {};
+                    h2.reg.move(entity, src, &h2.client_response_out) catch {};
+                    return;
+                }
+            }
+        }
+
+        /// Get the Conn component for a connection entity (searches the three conn collections).
+        fn getConn(h2: *Self, entity: Entity) ?*Conn {
+            return h2.reg.getAny(entity, h2.connColls(), Conn) catch null;
+        }
+
+        /// FD resolver callback for io — searches h2's connection collections in addition to io's.
+        fn resolveFdThunk(ctx: *anyopaque, entity: Entity) ?*rio.Fd {
+            const h2: *Self = @ptrCast(@alignCast(ctx));
+            return h2.reg.getAny(entity, h2.connColls(), rio.Fd) catch null;
+        }
+
+        // =============================================================
+        // nghttp2 server callbacks
         // =============================================================
 
         fn onBeginHeadersCb(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
@@ -503,8 +587,10 @@ pub fn H2(comptime Ctx: type) type {
             s.emitted = true;
             s.ng_stream_id = frame.*.hd.stream_id;
 
-            // Create request entity inline — we have Ctx access
-            const req_entity = nctx.ctx.createOneImmediate(.request_out) catch
+            const h2 = nctx.h2;
+
+            // Create request entity in request_out
+            const req_entity = h2.reg.create(&h2.request_out) catch
                 return c.NGHTTP2_ERR_CALLBACK_FAILURE;
 
             var fields: ?[*]HeaderField = null;
@@ -512,10 +598,10 @@ pub fn H2(comptime Ctx: type) type {
             var buf_len: u32 = 0;
             const hdr_buf = s.hdrFinalize(&fields, &count, &buf_len);
 
-            nctx.ctx.set(req_entity, StreamId, .{ .id = @intCast(frame.*.hd.stream_id) }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-            nctx.ctx.set(req_entity, Session, .{ .entity = nctx.conn_entity }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-            nctx.ctx.set(req_entity, ReqHeaders, .{ .fields = fields, .count = count, ._buf = hdr_buf, ._buf_len = buf_len }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-            // Shrink body allocation to exact size for clean ownership transfer
+            h2.reg.set(req_entity, &h2.request_out, StreamId, .{ .id = @intCast(frame.*.hd.stream_id) }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            h2.reg.set(req_entity, &h2.request_out, Session, .{ .entity = nctx.conn_entity }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            h2.reg.set(req_entity, &h2.request_out, ReqHeaders, .{ .fields = fields, .count = count, ._buf = hdr_buf, ._buf_len = buf_len }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+
             const body_data = if (s.body_data) |p| blk: {
                 if (s.body_len < s.body_cap) {
                     const shrunk = s.allocator.realloc(p[0..s.body_cap], s.body_len) catch p[0..s.body_cap];
@@ -523,7 +609,7 @@ pub fn H2(comptime Ctx: type) type {
                 }
                 break :blk @as(?[*]u8, p);
             } else null;
-            nctx.ctx.set(req_entity, ReqBody, .{ .data = body_data, .len = s.body_len }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            h2.reg.set(req_entity, &h2.request_out, ReqBody, .{ .data = body_data, .len = s.body_len }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
 
             s.body_data = null;
             s.body_len = 0;
@@ -546,13 +632,12 @@ pub fn H2(comptime Ctx: type) type {
             const s = stream.?;
             const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
 
-            if (s.emitted and !s.entity.isNil() and !nctx.ctx.isStale(s.entity)) {
+            if (s.emitted and !s.entity.isNil() and !nctx.h2.reg.isStale(s.entity)) {
                 const err: i32 = if (s.send_complete and error_code == 0) 0 else -1;
-                nctx.ctx.set(s.entity, H2IoResult, .{ .err = err }) catch {};
-                nctx.ctx.moveOne(s.entity, .response_out) catch {};
+                serverStreamClose(nctx.h2, s.entity, err);
             }
 
-            s.send_data = null; // Stream.free() handles the rest
+            s.send_data = null;
             _ = c.nghttp2_session_set_stream_user_data(session, stream_id, null);
             s.free();
             return 0;
@@ -573,45 +658,42 @@ pub fn H2(comptime Ctx: type) type {
             ));
             if (stream) |s| {
                 if (s.streaming) {
-                    // EOF: app closed the stream
                     if (s.stream_eof and s.stream_chunk_data == null) {
                         data_flags[0] |= @intCast(c.NGHTTP2_DATA_FLAG_EOF);
                         s.send_complete = true;
                         return 0;
                     }
-                    // No chunk available — defer until resume_data
                     if (s.stream_chunk_data == null)
                         return c.NGHTTP2_ERR_DEFERRED;
 
-                    // Send chunk bytes
                     const remaining = s.stream_chunk_len - s.stream_chunk_offset;
                     const to_copy: u32 = if (remaining < @as(u32, @intCast(length))) remaining else @intCast(length);
                     @memcpy(buf[0..to_copy], s.stream_chunk_data.?[s.stream_chunk_offset .. s.stream_chunk_offset + to_copy]);
                     s.stream_chunk_offset += to_copy;
 
                     if (s.stream_chunk_offset >= s.stream_chunk_len) {
-                        // Chunk fully consumed — free, move entity back to ready
                         s.allocator.free(s.stream_chunk_data.?[0..s.stream_chunk_len]);
                         s.stream_chunk_data = null;
                         s.stream_chunk_len = 0;
                         s.stream_chunk_offset = 0;
 
                         const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
+                        const h2 = nctx.h2;
                         if (comptime has_client) {
                             if (s.client_stream) {
-                                nctx.ctx.moveOneFrom(s.entity, ._client_stream_data_sending, .client_stream_data_out) catch {};
+                                h2.reg.move(s.entity, &h2._client_stream_data_sending, &h2.client_stream_data_out) catch {};
                             } else {
-                                nctx.ctx.moveOneFrom(s.entity, ._stream_data_sending, .stream_data_out) catch {};
+                                h2.reg.move(s.entity, &h2._stream_data_sending, &h2.stream_data_out) catch {};
                             }
                         } else {
-                            nctx.ctx.moveOneFrom(s.entity, ._stream_data_sending, .stream_data_out) catch {};
+                            h2.reg.move(s.entity, &h2._stream_data_sending, &h2.stream_data_out) catch {};
                         }
                     }
                     return @intCast(to_copy);
                 }
             }
 
-            // --- Non-streaming path (complete body) ---
+            // --- Non-streaming path ---
             const rd: *BodyData = @ptrCast(@alignCast(source.*.ptr));
             const data_len: u32 = @intCast(rd.data.len);
             const remaining = data_len - rd.offset;
@@ -658,15 +740,15 @@ pub fn H2(comptime Ctx: type) type {
             }
         }
 
-        fn sessionCreate(ctx: *Ctx, allocator: std.mem.Allocator, conn: *Conn, conn_entity: Entity, opts: H2Options) !void {
+        fn sessionCreate(self: *Self, conn: *Conn, conn_entity: Entity) !void {
             try ensureCallbacks();
 
-            const nctx = try allocator.create(NgCtx);
-            nctx.* = .{ .ctx = ctx, .allocator = allocator, .conn_entity = conn_entity };
+            const nctx = try self.allocator.create(NgCtx);
+            nctx.* = .{ .h2 = self, .allocator = self.allocator, .conn_entity = conn_entity };
 
             var session: ?*c.nghttp2_session = null;
             if (c.nghttp2_session_server_new(&session, ng_callbacks, @ptrCast(nctx)) != 0) {
-                allocator.destroy(nctx);
+                self.allocator.destroy(nctx);
                 return error.Nghttp2SessionCreateFailed;
             }
 
@@ -677,37 +759,34 @@ pub fn H2(comptime Ctx: type) type {
             var settings_buf: [4]c.nghttp2_settings_entry = undefined;
             var settings_count: usize = 0;
 
-            settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, .value = opts.max_concurrent_streams };
+            settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, .value = self.h2_opts.max_concurrent_streams };
             settings_count += 1;
 
-            if (opts.initial_window_size != 65535) {
-                settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, .value = opts.initial_window_size };
+            if (self.h2_opts.initial_window_size != 65535) {
+                settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, .value = self.h2_opts.initial_window_size };
                 settings_count += 1;
             }
-            if (opts.max_frame_size != 16384) {
-                settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_FRAME_SIZE, .value = opts.max_frame_size };
+            if (self.h2_opts.max_frame_size != 16384) {
+                settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_FRAME_SIZE, .value = self.h2_opts.max_frame_size };
                 settings_count += 1;
             }
-            if (opts.max_header_list_size != 0) {
-                settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, .value = opts.max_header_list_size };
+            if (self.h2_opts.max_header_list_size != 0) {
+                settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, .value = self.h2_opts.max_header_list_size };
                 settings_count += 1;
             }
 
             if (c.nghttp2_submit_settings(session, c.NGHTTP2_FLAG_NONE, &settings_buf, settings_count) != 0) {
                 c.nghttp2_session_del(session);
-                allocator.destroy(nctx);
+                self.allocator.destroy(nctx);
                 conn.ng_session = null;
                 conn.ng_ctx = null;
                 return error.Nghttp2SettingsFailed;
             }
         }
 
-
         // =============================================================
         // Client: nghttp2 callbacks
         // =============================================================
-
-        var ng_client_callbacks: ?*c.nghttp2_session_callbacks = null;
 
         fn onHeaderClientCb(
             session: ?*c.nghttp2_session,
@@ -729,7 +808,6 @@ pub fn H2(comptime Ctx: type) type {
             if (stream == null) return 0;
             const s = stream.?;
 
-            // Parse :status pseudo-header
             if (name_len == 7 and std.mem.eql(u8, name[0..7], ":status")) {
                 var buf: [4]u8 = undefined;
                 const n = @min(value_len, 3);
@@ -761,20 +839,20 @@ pub fn H2(comptime Ctx: type) type {
 
             const s = stream.?;
             const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
+            const h2 = nctx.h2;
 
-            // Populate response components on the entity
-            if (!s.entity.isNil() and !nctx.ctx.isStale(s.entity)) {
+            if (!s.entity.isNil() and !h2.reg.isStale(s.entity)) {
                 var fields: ?[*]HeaderField = null;
                 var count: u32 = 0;
                 var buf_len: u32 = 0;
                 const hdr_buf = s.hdrFinalize(&fields, &count, &buf_len);
 
-                nctx.ctx.set(s.entity, RespHeaders, .{
+                streamSet(h2, s.entity, RespHeaders, .{
                     .fields = fields,
                     .count = count,
                     ._buf = hdr_buf,
                     ._buf_len = buf_len,
-                }) catch {};
+                });
 
                 const body_data = if (s.body_data) |p| blk: {
                     if (s.body_len < s.body_cap) {
@@ -783,8 +861,8 @@ pub fn H2(comptime Ctx: type) type {
                     }
                     break :blk @as(?[*]u8, p);
                 } else null;
-                nctx.ctx.set(s.entity, RespBody, .{ .data = body_data, .len = s.body_len }) catch {};
-                nctx.ctx.set(s.entity, Status, .{ .code = s.response_status }) catch {};
+                streamSet(h2, s.entity, RespBody, .{ .data = body_data, .len = s.body_len });
+                streamSet(h2, s.entity, Status, .{ .code = s.response_status });
 
                 s.body_data = null;
                 s.body_len = 0;
@@ -808,10 +886,9 @@ pub fn H2(comptime Ctx: type) type {
             const s = stream.?;
             const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
 
-            if (!s.entity.isNil() and !nctx.ctx.isStale(s.entity)) {
+            if (!s.entity.isNil() and !nctx.h2.reg.isStale(s.entity)) {
                 const err: i32 = if (error_code == 0) 0 else -1;
-                nctx.ctx.set(s.entity, H2IoResult, .{ .err = err }) catch {};
-                nctx.ctx.moveOne(s.entity, .client_response_out) catch {};
+                clientStreamClose(nctx.h2, s.entity, err);
             }
 
             s.send_data = null;
@@ -827,7 +904,6 @@ pub fn H2(comptime Ctx: type) type {
             if (c.nghttp2_session_callbacks_new(&cbs) != 0)
                 return error.OutOfMemory;
 
-            // Client uses same begin_headers (allocates stream if needed)
             c.nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, &onBeginHeadersCb);
             c.nghttp2_session_callbacks_set_on_header_callback(cbs, &onHeaderClientCb);
             c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, &onDataChunkRecvCb);
@@ -837,15 +913,15 @@ pub fn H2(comptime Ctx: type) type {
             ng_client_callbacks = cbs;
         }
 
-        fn clientSessionCreate(ctx: *Ctx, allocator: std.mem.Allocator, conn: *Conn, conn_entity: Entity, opts: H2Options) !void {
+        fn clientSessionCreate(self: *Self, conn: *Conn, conn_entity: Entity) !void {
             try ensureClientCallbacks();
 
-            const nctx = try allocator.create(NgCtx);
-            nctx.* = .{ .ctx = ctx, .allocator = allocator, .conn_entity = conn_entity };
+            const nctx = try self.allocator.create(NgCtx);
+            nctx.* = .{ .h2 = self, .allocator = self.allocator, .conn_entity = conn_entity };
 
             var session: ?*c.nghttp2_session = null;
             if (c.nghttp2_session_client_new(&session, ng_client_callbacks, @ptrCast(nctx)) != 0) {
-                allocator.destroy(nctx);
+                self.allocator.destroy(nctx);
                 return error.Nghttp2SessionCreateFailed;
             }
 
@@ -855,12 +931,12 @@ pub fn H2(comptime Ctx: type) type {
 
             var settings_buf: [2]c.nghttp2_settings_entry = undefined;
             var settings_count: usize = 0;
-            settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, .value = opts.max_concurrent_streams };
+            settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, .value = self.h2_opts.max_concurrent_streams };
             settings_count += 1;
 
             if (c.nghttp2_submit_settings(session, c.NGHTTP2_FLAG_NONE, &settings_buf, settings_count) != 0) {
                 c.nghttp2_session_del(session);
-                allocator.destroy(nctx);
+                self.allocator.destroy(nctx);
                 conn.ng_session = null;
                 conn.ng_ctx = null;
                 return error.Nghttp2SettingsFailed;
@@ -871,112 +947,204 @@ pub fn H2(comptime Ctx: type) type {
         // Public API
         // =============================================================
 
-        pub fn create(ctx: *Ctx, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: rio.IoOptions, h2_opts: H2Options) !*Self {
+        pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: rio.IoOptions, h2_opts: H2Options) !*Self {
             try ensureCallbacks();
 
-            const io = try rio.Io(Ctx).create(ctx, allocator, addr, io_opts);
+            const io = try IoType.create(reg, allocator, addr, io_opts);
             errdefer io.destroy();
 
             const self = try allocator.create(Self);
             self.* = .{
                 .io = io,
+                .request_out = try StreamColl.init(allocator),
+                .response_in = try StreamColl.init(allocator),
+                .response_out = try StreamColl.init(allocator),
+                ._response_sending = try StreamColl.init(allocator),
+                .stream_response_in = try StreamColl.init(allocator),
+                .stream_data_out = try StreamColl.init(allocator),
+                .stream_data_in = try StreamColl.init(allocator),
+                .stream_close_in = try StreamColl.init(allocator),
+                ._stream_data_sending = try StreamColl.init(allocator),
+                ._read_errors = try ReadColl.init(allocator),
+                ._read_init = try ReadColl.init(allocator),
+                ._read_active = try ReadColl.init(allocator),
+                ._read_handshake = try ReadColl.init(allocator),
+                ._conn_tls_handshake = try ConnColl.init(allocator),
+                ._conn_active = try ConnColl.init(allocator),
+                .client_connect_in = if (has_client) try ClientConnectColl.init(allocator) else {},
+                .client_connect_out = if (has_client) try ClientConnectColl.init(allocator) else {},
+                .client_connect_errors = if (has_client) try ClientConnectColl.init(allocator) else {},
+                ._client_connect_pending = if (has_client) try ClientConnectColl.init(allocator) else {},
+                .client_request_in = if (has_client) try ClientStreamColl.init(allocator) else {},
+                .client_response_out = if (has_client) try ClientStreamColl.init(allocator) else {},
+                ._client_request_sending = if (has_client) try ClientStreamColl.init(allocator) else {},
+                .client_stream_request_in = if (has_client) try ClientStreamColl.init(allocator) else {},
+                .client_stream_data_out = if (has_client) try ClientStreamColl.init(allocator) else {},
+                .client_stream_data_in = if (has_client) try ClientStreamColl.init(allocator) else {},
+                .client_stream_close_in = if (has_client) try ClientStreamColl.init(allocator) else {},
+                ._client_stream_data_sending = if (has_client) try ClientStreamColl.init(allocator) else {},
                 .h2_opts = h2_opts,
+                .reg = reg,
                 .allocator = allocator,
             };
+
+            // Register all collections
+            reg.registerCollection(&self.request_out);
+            reg.registerCollection(&self.response_in);
+            reg.registerCollection(&self.response_out);
+            reg.registerCollection(&self._response_sending);
+            reg.registerCollection(&self.stream_response_in);
+            reg.registerCollection(&self.stream_data_out);
+            reg.registerCollection(&self.stream_data_in);
+            reg.registerCollection(&self.stream_close_in);
+            reg.registerCollection(&self._stream_data_sending);
+            reg.registerCollection(&self._read_errors);
+            reg.registerCollection(&self._read_init);
+            reg.registerCollection(&self._read_active);
+            reg.registerCollection(&self._read_handshake);
+            reg.registerCollection(&self._conn_tls_handshake);
+            reg.registerCollection(&self._conn_active);
+            if (has_client) {
+                reg.registerCollection(&self.client_connect_in);
+                reg.registerCollection(&self.client_connect_out);
+                reg.registerCollection(&self.client_connect_errors);
+                reg.registerCollection(&self._client_connect_pending);
+                reg.registerCollection(&self.client_request_in);
+                reg.registerCollection(&self.client_response_out);
+                reg.registerCollection(&self._client_request_sending);
+                reg.registerCollection(&self.client_stream_request_in);
+                reg.registerCollection(&self.client_stream_data_out);
+                reg.registerCollection(&self.client_stream_data_in);
+                reg.registerCollection(&self.client_stream_close_in);
+                reg.registerCollection(&self._client_stream_data_sending);
+            }
+
+            // Register FD resolver with io so that processWriteIn/processReadIn
+            // can find connection Fds when h2 has moved them to _conn_active etc.
+            self.io.setFdResolver(@ptrCast(self), &resolveFdThunk);
+
             return self;
         }
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            self.request_out.deinit();
+            self.response_in.deinit();
+            self.response_out.deinit();
+            self._response_sending.deinit();
+            self.stream_response_in.deinit();
+            self.stream_data_out.deinit();
+            self.stream_data_in.deinit();
+            self.stream_close_in.deinit();
+            self._stream_data_sending.deinit();
+            self._read_errors.deinit();
+            self._read_init.deinit();
+            self._read_active.deinit();
+            self._read_handshake.deinit();
+            self._conn_tls_handshake.deinit();
+            self._conn_active.deinit();
+            if (has_client) {
+                self.client_connect_in.deinit();
+                self.client_connect_out.deinit();
+                self.client_connect_errors.deinit();
+                self._client_connect_pending.deinit();
+                self.client_request_in.deinit();
+                self.client_response_out.deinit();
+                self._client_request_sending.deinit();
+                self.client_stream_request_in.deinit();
+                self.client_stream_data_out.deinit();
+                self.client_stream_data_in.deinit();
+                self.client_stream_close_in.deinit();
+                self._client_stream_data_sending.deinit();
+            }
             self.io.destroy();
             allocator.destroy(self);
         }
 
-        pub fn poll(self: *Self, ctx: *Ctx, min_complete: u32) !void {
-            _ = try self.io.poll(ctx, min_complete);
-
-            // Consume user input (responses + streaming + client)
-            try consumeResponses(ctx, self.allocator);
-            try consumeStreamResponses(ctx, self.allocator);
-            try consumeStreamData(ctx);
-            try consumeStreamClose(ctx);
+        pub fn poll(self: *Self, min_complete: u32) !void {
+            // Phase 1: Consume user inputs queued between polls (responses, chunks).
+            // Must run before io.poll so the writes they generate can be submitted
+            // in the same iteration.
+            try self.consumeResponses();
+            try self.consumeStreamResponses();
+            try self.consumeStreamData();
+            try self.consumeStreamClose();
             if (has_client) {
-                try self.consumeConnectRequests(ctx);
-                try self.consumeClientRequests(ctx);
-                try self.consumeClientStreamRequests(ctx);
-                try consumeClientStreamData(ctx);
-                try consumeClientStreamClose(ctx);
+                try self.consumeConnectRequests();
+                try self.consumeClientRequests();
+                try self.consumeClientStreamRequests();
+                try self.consumeClientStreamData();
+                try self.consumeClientStreamClose();
             }
-            try ctx.flush();
+            try self.reg.flush();
 
-            // Read triage
-            try readsTriage(ctx);
-            try ctx.flush();
+            // Phase 2: Drive nghttp2 sends — converts queued responses/chunks into
+            // write_in entities that io.poll will submit below.
+            try self.driveAllSends();
+            try self.reg.flush();
 
-            // Handle read errors
-            try readsHandleErrors(ctx);
-            try ctx.flush();
+            // Phase 3: io.poll submits pending writes and (optionally) waits for CQEs.
+            _ = try self.io.poll(min_complete);
 
-            // Client: process connect results/errors
+            // Phase 4: Triage reads that just arrived.
+            try self.readsTriage();
+            try self.reg.flush();
+
+            try self.readsHandleErrors();
+            try self.reg.flush();
+
             if (has_client) {
-                try self.processConnectResults(ctx);
-                try self.processConnectErrors(ctx);
-                try ctx.flush();
+                try self.processConnectResults();
+                try self.processConnectErrors();
+                try self.reg.flush();
             }
 
-            // Init new connections (create TLS or nghttp2 sessions)
-            try self.readsInitConnections(ctx);
-            try ctx.flush();
+            try self.readsInitConnections();
+            try self.reg.flush();
 
-            // Transition connections → _conn_tls_handshake or _conn_active
-            try self.transitionNewConnections(ctx);
-            try ctx.flush();
+            try self.transitionNewConnections();
+            try self.reg.flush();
 
-            // TLS handshake
             if (self.h2_opts.tls_config != null) {
-                try self.readsTlsHandshake(ctx);
-                try ctx.flush();
+                try self.readsTlsHandshake();
+                try self.reg.flush();
 
-                try transitionHandshakeConnections(ctx);
-                try ctx.flush();
+                try self.transitionHandshakeConnections();
+                try self.reg.flush();
             }
 
-            // Feed data to nghttp2 (decrypt if TLS)
-            try self.readsFeedData(ctx);
-            try ctx.flush();
+            // Phase 5: Feed read data to nghttp2 — triggers callbacks that create
+            // request entities for the user to pick up.
+            try self.readsFeedData();
+            try self.reg.flush();
 
-            // Write accounting
-            try writesAccount(ctx);
-            try ctx.flush();
-
-            // Drive sends (encrypt if TLS)
-            try self.driveAllSends(ctx);
-            try ctx.flush();
+            try self.writesAccount();
+            try self.reg.flush();
         }
 
         // =============================================================
         // Phase 1: Consume user responses
         // =============================================================
 
-        fn consumeResponses(ctx: *Ctx, allocator: std.mem.Allocator) !void {
-            const entities = ctx.entities(.response_in);
-            const sessions = ctx.column(.response_in, Session);
-            const sids = ctx.column(.response_in, StreamId);
-            const statuses = ctx.column(.response_in, Status);
-            const resp_hdrs = ctx.column(.response_in, RespHeaders);
-            const resp_bodies = ctx.column(.response_in, RespBody);
-            const io_results = ctx.column(.response_in, H2IoResult);
+        fn consumeResponses(self: *Self) !void {
+            const entities = self.response_in.entitySlice();
+            const sessions = self.response_in.column(Session);
+            const sids = self.response_in.column(StreamId);
+            const statuses = self.response_in.column(Status);
+            const resp_hdrs = self.response_in.column(RespHeaders);
+            const resp_bodies = self.response_in.column(RespBody);
+            const io_results = self.response_in.column(H2IoResult);
 
             for (entities, sessions, sids, statuses, resp_hdrs, resp_bodies, io_results) |ent, sess, sid, status, rh, rb, *io_res| {
-                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .response_in, .response_out);
+                    try self.reg.move(ent, &self.response_in, &self.response_out);
                     continue;
                 };
 
-                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .response_in, .response_out);
+                    try self.reg.move(ent, &self.response_in, &self.response_out);
                     continue;
                 }
 
@@ -987,13 +1155,13 @@ pub fn H2(comptime Ctx: type) type {
                 const status_len = status_str.len;
 
                 const nv_count: usize = 1 + @as(usize, rh.count);
-                const nva_slice = allocator.alloc(c.nghttp2_nv, nv_count) catch {
+                const nva_slice = self.allocator.alloc(c.nghttp2_nv, nv_count) catch {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .response_in, .response_out);
+                    try self.reg.move(ent, &self.response_in, &self.response_out);
                     continue;
                 };
                 const nva: [*]c.nghttp2_nv = nva_slice.ptr;
-                defer allocator.free(nva_slice);
+                defer self.allocator.free(nva_slice);
 
                 nva[0] = .{
                     .name = @constCast(@ptrCast(":status")),
@@ -1018,9 +1186,9 @@ pub fn H2(comptime Ctx: type) type {
                 var data_prd: c.nghttp2_data_provider = std.mem.zeroes(c.nghttp2_data_provider);
                 var body_data_ptr: ?*BodyData = null;
                 if (rb.data != null and rb.len > 0) {
-                    body_data_ptr = BodyData.create(allocator, rb.data.?, rb.len) orelse {
+                    body_data_ptr = BodyData.create(self.allocator, rb.data.?, rb.len) orelse {
                         io_res.err = -1;
-                        try ctx.moveOneFrom(ent, .response_in, .response_out);
+                        try self.reg.move(ent, &self.response_in, &self.response_out);
                         continue;
                     };
                     data_prd.source = .{ .ptr = @ptrCast(body_data_ptr) };
@@ -1032,7 +1200,7 @@ pub fn H2(comptime Ctx: type) type {
                 if (rv < 0) {
                     if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .response_in, .response_out);
+                    try self.reg.move(ent, &self.response_in, &self.response_out);
                     continue;
                 }
 
@@ -1043,11 +1211,11 @@ pub fn H2(comptime Ctx: type) type {
                     s.entity = ent;
                     s.send_complete = (data_prd.read_callback == null);
                     s.send_data = body_data_ptr;
-                    try ctx.moveOneFrom(ent, .response_in, ._response_sending);
+                    try self.reg.move(ent, &self.response_in, &self._response_sending);
                 } else {
                     if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .response_in, .response_out);
+                    try self.reg.move(ent, &self.response_in, &self.response_out);
                 }
             }
         }
@@ -1056,23 +1224,23 @@ pub fn H2(comptime Ctx: type) type {
         // Streaming: consume stream_response_in
         // =============================================================
 
-        fn consumeStreamResponses(ctx: *Ctx, allocator: std.mem.Allocator) !void {
-            const entities = ctx.entities(.stream_response_in);
-            const sessions = ctx.column(.stream_response_in, Session);
-            const sids = ctx.column(.stream_response_in, StreamId);
-            const statuses = ctx.column(.stream_response_in, Status);
-            const resp_hdrs = ctx.column(.stream_response_in, RespHeaders);
-            const io_results = ctx.column(.stream_response_in, H2IoResult);
+        fn consumeStreamResponses(self: *Self) !void {
+            const entities = self.stream_response_in.entitySlice();
+            const sessions = self.stream_response_in.column(Session);
+            const sids = self.stream_response_in.column(StreamId);
+            const statuses = self.stream_response_in.column(Status);
+            const resp_hdrs = self.stream_response_in.column(RespHeaders);
+            const io_results = self.stream_response_in.column(H2IoResult);
 
             for (entities, sessions, sids, statuses, resp_hdrs, io_results) |ent, sess, sid, status, rh, *io_res| {
-                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_response_in, .response_out);
+                    try self.reg.move(ent, &self.stream_response_in, &self.response_out);
                     continue;
                 };
-                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_response_in, .response_out);
+                    try self.reg.move(ent, &self.stream_response_in, &self.response_out);
                     continue;
                 }
 
@@ -1082,13 +1250,13 @@ pub fn H2(comptime Ctx: type) type {
                 const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status.code}) catch "500";
 
                 const nv_count: usize = 1 + @as(usize, rh.count);
-                const nva_slice = allocator.alloc(c.nghttp2_nv, nv_count) catch {
+                const nva_slice = self.allocator.alloc(c.nghttp2_nv, nv_count) catch {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_response_in, .response_out);
+                    try self.reg.move(ent, &self.stream_response_in, &self.response_out);
                     continue;
                 };
                 const nva: [*]c.nghttp2_nv = nva_slice.ptr;
-                defer allocator.free(nva_slice);
+                defer self.allocator.free(nva_slice);
 
                 nva[0] = .{
                     .name = @constCast(@ptrCast(":status")),
@@ -1109,7 +1277,6 @@ pub fn H2(comptime Ctx: type) type {
                     }
                 }
 
-                // Deferred data provider — source.ptr NULL signals streaming path
                 var data_prd = c.nghttp2_data_provider{
                     .source = .{ .ptr = null },
                     .read_callback = &onDataSourceReadCb,
@@ -1118,7 +1285,7 @@ pub fn H2(comptime Ctx: type) type {
                 const rv = c.nghttp2_submit_response(ng_session, @intCast(sid.id), nva, nv_count, &data_prd);
                 if (rv < 0) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_response_in, .response_out);
+                    try self.reg.move(ent, &self.stream_response_in, &self.response_out);
                     continue;
                 }
 
@@ -1131,10 +1298,10 @@ pub fn H2(comptime Ctx: type) type {
                     s.streaming = true;
                     s.send_complete = false;
                     s.send_data = null;
-                    try ctx.moveOneFrom(ent, .stream_response_in, .stream_data_out);
+                    try self.reg.move(ent, &self.stream_response_in, &self.stream_data_out);
                 } else {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_response_in, .response_out);
+                    try self.reg.move(ent, &self.stream_response_in, &self.response_out);
                 }
             }
         }
@@ -1143,28 +1310,27 @@ pub fn H2(comptime Ctx: type) type {
         // Streaming: consume stream_data_in
         // =============================================================
 
-        fn consumeStreamData(ctx: *Ctx) !void {
-            const entities = ctx.entities(.stream_data_in);
-            const sessions = ctx.column(.stream_data_in, Session);
-            const sids = ctx.column(.stream_data_in, StreamId);
-            const resp_bodies = ctx.column(.stream_data_in, RespBody);
-            const io_results = ctx.column(.stream_data_in, H2IoResult);
+        fn consumeStreamData(self: *Self) !void {
+            const entities = self.stream_data_in.entitySlice();
+            const sessions = self.stream_data_in.column(Session);
+            const sids = self.stream_data_in.column(StreamId);
+            const resp_bodies = self.stream_data_in.column(RespBody);
+            const io_results = self.stream_data_in.column(H2IoResult);
 
             for (entities, sessions, sids, resp_bodies, io_results) |ent, sess, sid, *rb, *io_res| {
-                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_data_in, .response_out);
+                    try self.reg.move(ent, &self.stream_data_in, &self.response_out);
                     continue;
                 };
-                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_data_in, .response_out);
+                    try self.reg.move(ent, &self.stream_data_in, &self.response_out);
                     continue;
                 }
 
-                // Skip empty chunks — move back to ready
                 if (rb.data == null or rb.len == 0) {
-                    try ctx.moveOneFrom(ent, .stream_data_in, .stream_data_out);
+                    try self.reg.move(ent, &self.stream_data_in, &self.stream_data_out);
                     continue;
                 }
 
@@ -1174,23 +1340,21 @@ pub fn H2(comptime Ctx: type) type {
                 ));
                 if (stream == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_data_in, .response_out);
+                    try self.reg.move(ent, &self.stream_data_in, &self.response_out);
                     continue;
                 }
 
                 const s = stream.?;
 
-                // Transfer chunk ownership from component to stream struct
                 s.stream_chunk_data = rb.data;
                 s.stream_chunk_len = rb.len;
                 s.stream_chunk_offset = 0;
                 rb.data = null;
                 rb.len = 0;
 
-                // Un-defer so nghttp2 calls onDataSourceReadCb
                 _ = c.nghttp2_session_resume_data(ng_session, s.ng_stream_id);
 
-                try ctx.moveOneFrom(ent, .stream_data_in, ._stream_data_sending);
+                try self.reg.move(ent, &self.stream_data_in, &self._stream_data_sending);
             }
         }
 
@@ -1198,21 +1362,21 @@ pub fn H2(comptime Ctx: type) type {
         // Streaming: consume stream_close_in
         // =============================================================
 
-        fn consumeStreamClose(ctx: *Ctx) !void {
-            const entities = ctx.entities(.stream_close_in);
-            const sessions = ctx.column(.stream_close_in, Session);
-            const sids = ctx.column(.stream_close_in, StreamId);
-            const io_results = ctx.column(.stream_close_in, H2IoResult);
+        fn consumeStreamClose(self: *Self) !void {
+            const entities = self.stream_close_in.entitySlice();
+            const sessions = self.stream_close_in.column(Session);
+            const sids = self.stream_close_in.column(StreamId);
+            const io_results = self.stream_close_in.column(H2IoResult);
 
             for (entities, sessions, sids, io_results) |ent, sess, sid, *io_res| {
-                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_close_in, .response_out);
+                    try self.reg.move(ent, &self.stream_close_in, &self.response_out);
                     continue;
                 };
-                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_close_in, .response_out);
+                    try self.reg.move(ent, &self.stream_close_in, &self.response_out);
                     continue;
                 }
 
@@ -1222,16 +1386,14 @@ pub fn H2(comptime Ctx: type) type {
                 ));
                 if (stream == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .stream_close_in, .response_out);
+                    try self.reg.move(ent, &self.stream_close_in, &self.response_out);
                     continue;
                 }
 
                 stream.?.stream_eof = true;
-
-                // Un-defer so onDataSourceReadCb sees EOF and sets NGHTTP2_DATA_FLAG_EOF
                 _ = c.nghttp2_session_resume_data(ng_session, stream.?.ng_stream_id);
 
-                try ctx.moveOneFrom(ent, .stream_close_in, ._stream_data_sending);
+                try self.reg.move(ent, &self.stream_close_in, &self._stream_data_sending);
             }
         }
 
@@ -1239,33 +1401,33 @@ pub fn H2(comptime Ctx: type) type {
         // Phase 2: Read triage
         // =============================================================
 
-        fn readsTriage(ctx: *Ctx) !void {
-            const entities = ctx.entities(.read_results);
-            const conn_ents = ctx.column(.read_results, rio.ConnEntity);
-            const results = ctx.column(.read_results, rio.ReadResult);
+        fn readsTriage(self: *Self) !void {
+            const entities = self.io.read_results.entitySlice();
+            const conn_ents = self.io.read_results.column(rio.ConnEntity);
+            const results = self.io.read_results.column(rio.ReadResult);
 
             for (entities, conn_ents, results) |ent, conn_ent, rr| {
-                if (ctx.isStale(conn_ent.entity) or ctx.isMoving(conn_ent.entity)) {
-                    try ctx.moveOneFrom(ent, .read_results, ._read_errors);
+                if (self.reg.isStale(conn_ent.entity) or self.reg.isMoving(conn_ent.entity)) {
+                    try self.reg.move(ent, &self.io.read_results, &self._read_errors);
                     continue;
                 }
                 if (rr.result <= 0) {
-                    try ctx.moveOneFrom(ent, .read_results, ._read_errors);
+                    try self.reg.move(ent, &self.io.read_results, &self._read_errors);
                     continue;
                 }
-                if (ctx.isInCollection(conn_ent.entity, .connections)) {
-                    try ctx.moveOneFrom(ent, .read_results, ._read_init);
+                if (self.reg.isInCollection(conn_ent.entity, &self.io.connections)) {
+                    try self.reg.move(ent, &self.io.read_results, &self._read_init);
                     continue;
                 }
-                if (ctx.isInCollection(conn_ent.entity, ._conn_tls_handshake)) {
-                    try ctx.moveOneFrom(ent, .read_results, ._read_handshake);
+                if (self.reg.isInCollection(conn_ent.entity, &self._conn_tls_handshake)) {
+                    try self.reg.move(ent, &self.io.read_results, &self._read_handshake);
                     continue;
                 }
-                if (ctx.isInCollection(conn_ent.entity, ._conn_active)) {
-                    try ctx.moveOneFrom(ent, .read_results, ._read_active);
+                if (self.reg.isInCollection(conn_ent.entity, &self._conn_active)) {
+                    try self.reg.move(ent, &self.io.read_results, &self._read_active);
                     continue;
                 }
-                try ctx.moveOneFrom(ent, .read_results, ._read_errors);
+                try self.reg.move(ent, &self.io.read_results, &self._read_errors);
             }
         }
 
@@ -1273,16 +1435,15 @@ pub fn H2(comptime Ctx: type) type {
         // Phase 3: Handle read errors
         // =============================================================
 
-        fn readsHandleErrors(ctx: *Ctx) !void {
-            const entities = ctx.entities(._read_errors);
-            const conn_ents = ctx.column(._read_errors, rio.ConnEntity);
+        fn readsHandleErrors(self: *Self) !void {
+            const entities = self._read_errors.entitySlice();
+            const conn_ents = self._read_errors.column(rio.ConnEntity);
 
             for (entities, conn_ents) |ent, conn_ent| {
-                if (!ctx.isStale(conn_ent.entity)) {
-                    try ctx.destroyOne(conn_ent.entity);
+                if (!self.reg.isStale(conn_ent.entity)) {
+                    try self.reg.destroy(conn_ent.entity);
                 }
-                // Move to read_in — rove-io returns the buffer to the ring
-                try ctx.moveOneFrom(ent, ._read_errors, .read_in);
+                try self.reg.move(ent, &self._read_errors, &self.io.read_in);
             }
         }
 
@@ -1290,38 +1451,35 @@ pub fn H2(comptime Ctx: type) type {
         // Phase 4: Init new connections
         // =============================================================
 
-        fn readsInitConnections(self: *Self, ctx: *Ctx) !void {
-            const entities = ctx.entities(._read_init);
-            const conn_ents = ctx.column(._read_init, rio.ConnEntity);
+        fn readsInitConnections(self: *Self) !void {
+            const entities = self._read_init.entitySlice();
+            const conn_ents = self._read_init.column(rio.ConnEntity);
 
             for (entities, conn_ents) |ent, conn_ent| {
-                if (ctx.isStale(conn_ent.entity)) {
-                    try ctx.moveOneFrom(ent, ._read_init, .read_in);
+                if (self.reg.isStale(conn_ent.entity)) {
+                    try self.reg.move(ent, &self._read_init, &self.io.read_in);
                     continue;
                 }
 
-                const conn_ptr = ctx.get(conn_ent.entity, Conn) catch {
-                    try ctx.moveOneFrom(ent, ._read_init, .read_in);
+                const conn_ptr = self.reg.get(conn_ent.entity, &self.io.connections, Conn) catch {
+                    try self.reg.move(ent, &self._read_init, &self.io.read_in);
                     continue;
                 };
 
                 if (self.h2_opts.tls_config) |tls_cfg| {
-                    // TLS mode: create SSL connection, start handshake
                     conn_ptr.tls_conn = tls.TlsConn.create(tls_cfg, self.allocator) catch {
-                        try ctx.destroyOne(conn_ent.entity);
-                        try ctx.moveOneFrom(ent, ._read_init, .read_in);
+                        try self.reg.destroy(conn_ent.entity);
+                        try self.reg.move(ent, &self._read_init, &self.io.read_in);
                         continue;
                     };
-                    // Feed initial data to start handshake
-                    try ctx.moveOneFrom(ent, ._read_init, ._read_handshake);
+                    try self.reg.move(ent, &self._read_init, &self._read_handshake);
                 } else {
-                    // h2c mode: create nghttp2 session directly
-                    sessionCreate(ctx, self.allocator, conn_ptr, conn_ent.entity, self.h2_opts) catch {
-                        try ctx.destroyOne(conn_ent.entity);
-                        try ctx.moveOneFrom(ent, ._read_init, .read_in);
+                    self.sessionCreate(conn_ptr, conn_ent.entity) catch {
+                        try self.reg.destroy(conn_ent.entity);
+                        try self.reg.move(ent, &self._read_init, &self.io.read_in);
                         continue;
                     };
-                    try ctx.moveOneFrom(ent, ._read_init, ._read_active);
+                    try self.reg.move(ent, &self._read_init, &self._read_active);
                 }
             }
         }
@@ -1330,22 +1488,21 @@ pub fn H2(comptime Ctx: type) type {
         // Phase 5: Transition new connections → _conn_active
         // =============================================================
 
-        fn transitionNewConnections(self: *Self, ctx: *Ctx) !void {
-            const entities = ctx.entities(.connections);
+        fn transitionNewConnections(self: *Self) !void {
+            const entities = self.io.connections.entitySlice();
             const max = self.h2_opts.max_h2_connections;
-            var active_count: u32 = @intCast(ctx.entities(._conn_active).len);
+            var active_count: u32 = @intCast(self._conn_active.entitySlice().len);
 
             for (entities) |ent| {
-                const conn_ptr = ctx.get(ent, Conn) catch continue;
+                const conn_ptr = self.reg.get(ent, &self.io.connections, Conn) catch continue;
 
-                // TLS connections go to handshake first
                 if (conn_ptr.tls_conn != null and conn_ptr.ng_session == null) {
                     if (max > 0 and active_count >= max) {
-                        try ctx.destroyOne(ent);
+                        try self.reg.destroy(ent);
                         continue;
                     }
                     conn_ptr.last_active_ns = monotonicNs();
-                    try ctx.moveOneFrom(ent, .connections, ._conn_tls_handshake);
+                    try self.reg.move(ent, &self.io.connections, &self._conn_tls_handshake);
                     active_count += 1;
                     continue;
                 }
@@ -1353,74 +1510,65 @@ pub fn H2(comptime Ctx: type) type {
                 if (conn_ptr.ng_session == null) continue;
 
                 if (max > 0 and active_count >= max) {
-                    try ctx.destroyOne(ent);
+                    try self.reg.destroy(ent);
                     continue;
                 }
 
                 conn_ptr.last_active_ns = monotonicNs();
-                try ctx.moveOneFrom(ent, .connections, ._conn_active);
+                try self.reg.move(ent, &self.io.connections, &self._conn_active);
                 active_count += 1;
             }
         }
 
         // =============================================================
-        // Phase 6: Feed active data to nghttp2
-        // =============================================================
-
-        // =============================================================
         // TLS handshake
         // =============================================================
 
-        fn readsTlsHandshake(self: *Self, ctx: *Ctx) !void {
-            const entities = ctx.entities(._read_handshake);
-            const conn_ents = ctx.column(._read_handshake, rio.ConnEntity);
-            const results = ctx.column(._read_handshake, rio.ReadResult);
+        fn readsTlsHandshake(self: *Self) !void {
+            const entities = self._read_handshake.entitySlice();
+            const conn_ents = self._read_handshake.column(rio.ConnEntity);
+            const results = self._read_handshake.column(rio.ReadResult);
 
             for (entities, conn_ents, results) |ent, conn_ent, rr| {
-                if (ctx.isStale(conn_ent.entity)) {
-                    try ctx.moveOneFrom(ent, ._read_handshake, .read_in);
+                if (self.reg.isStale(conn_ent.entity)) {
+                    try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                     continue;
                 }
 
-                const conn_ptr = ctx.get(conn_ent.entity, Conn) catch {
-                    try ctx.moveOneFrom(ent, ._read_handshake, .read_in);
+                const conn_ptr = getConn(self, conn_ent.entity) orelse {
+                    try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                     continue;
                 };
 
                 const tc = conn_ptr.tls_conn orelse {
-                    try ctx.moveOneFrom(ent, ._read_handshake, .read_in);
+                    try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                     continue;
                 };
 
-                // Feed raw data to TLS
                 const raw = if (rr.data) |d| d[0..@intCast(rr.result)] else &[_]u8{};
                 var decrypt_buf: [16384]u8 = undefined;
                 const feed_result = tc.feed(raw, &decrypt_buf);
 
                 switch (feed_result.result) {
                     .need_more => {
-                        // Send handshake output, recycle read
                         if (tc.drainOutput(self.allocator) catch null) |output| {
-                            self.submitWrite(ctx, conn_ent.entity, output) catch {
+                            self.submitWrite(conn_ent.entity, output) catch {
                                 self.allocator.free(output);
                             };
                         }
-                        try ctx.moveOneFrom(ent, ._read_handshake, .read_in);
+                        try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                     },
                     .handshake_done => {
-                        // Send final handshake output
                         if (tc.drainOutput(self.allocator) catch null) |output| {
-                            self.submitWrite(ctx, conn_ent.entity, output) catch {
+                            self.submitWrite(conn_ent.entity, output) catch {
                                 self.allocator.free(output);
                             };
                         }
-                        // Create nghttp2 session now that TLS is done
-                        sessionCreate(ctx, self.allocator, conn_ptr, conn_ent.entity, self.h2_opts) catch {
-                            try ctx.destroyOne(conn_ent.entity);
-                            try ctx.moveOneFrom(ent, ._read_handshake, .read_in);
+                        self.sessionCreate(conn_ptr, conn_ent.entity) catch {
+                            try self.reg.destroy(conn_ent.entity);
+                            try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                             continue;
                         };
-                        // If there's decrypted app data, feed it to nghttp2
                         if (feed_result.out_len > 0 and conn_ptr.ng_session != null) {
                             _ = c.nghttp2_session_mem_recv(
                                 conn_ptr.ng_session.?,
@@ -1428,24 +1576,22 @@ pub fn H2(comptime Ctx: type) type {
                                 feed_result.out_len,
                             );
                         }
-                        try ctx.moveOneFrom(ent, ._read_handshake, .read_in);
+                        try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                     },
                     .data, .err => {
-                        // Error during handshake
-                        try ctx.destroyOne(conn_ent.entity);
-                        try ctx.moveOneFrom(ent, ._read_handshake, .read_in);
+                        try self.reg.destroy(conn_ent.entity);
+                        try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
                     },
                 }
             }
         }
 
-        fn transitionHandshakeConnections(ctx: *Ctx) !void {
-            const entities = ctx.entities(._conn_tls_handshake);
+        fn transitionHandshakeConnections(self: *Self) !void {
+            const entities = self._conn_tls_handshake.entitySlice();
             for (entities) |ent| {
-                const conn_ptr = ctx.get(ent, Conn) catch continue;
-                // Move to active once nghttp2 session is created (handshake complete)
+                const conn_ptr = self.reg.get(ent, &self._conn_tls_handshake, Conn) catch continue;
                 if (conn_ptr.ng_session != null) {
-                    try ctx.moveOneFrom(ent, ._conn_tls_handshake, ._conn_active);
+                    try self.reg.move(ent, &self._conn_tls_handshake, &self._conn_active);
                 }
             }
         }
@@ -1454,71 +1600,68 @@ pub fn H2(comptime Ctx: type) type {
         // Helper: submit a write entity
         // =============================================================
 
-        fn submitWrite(_: *Self, ctx: *Ctx, conn_entity: Entity, data: []u8) !void {
-            const we = try ctx.createOneImmediate(.write_in);
-            try ctx.set(we, rio.ConnEntity, .{ .entity = conn_entity });
-            try ctx.set(we, rio.WriteBuf, .{ .data = data.ptr, .len = @intCast(data.len) });
+        fn submitWrite(self: *Self, conn_entity: Entity, data: []u8) !void {
+            const we = try self.reg.create(&self.io.write_in);
+            try self.reg.set(we, &self.io.write_in, rio.ConnEntity, .{ .entity = conn_entity });
+            try self.reg.set(we, &self.io.write_in, rio.WriteBuf, .{ .data = data.ptr, .len = @intCast(data.len) });
         }
 
         // =============================================================
         // Feed active data to nghttp2
         // =============================================================
 
-        fn readsFeedData(_: *Self, ctx: *Ctx) !void {
-            const entities = ctx.entities(._read_active);
-            const conn_ents = ctx.column(._read_active, rio.ConnEntity);
-            const results = ctx.column(._read_active, rio.ReadResult);
+        fn readsFeedData(self: *Self) !void {
+            const entities = self._read_active.entitySlice();
+            const conn_ents = self._read_active.column(rio.ConnEntity);
+            const results = self._read_active.column(rio.ReadResult);
 
             for (entities, conn_ents, results) |ent, conn_ent, rr| {
-                if (ctx.isStale(conn_ent.entity)) {
-                    try ctx.moveOneFrom(ent, ._read_active, .read_in);
+                if (self.reg.isStale(conn_ent.entity)) {
+                    try self.reg.move(ent, &self._read_active, &self.io.read_in);
                     continue;
                 }
 
-                const conn_ptr = ctx.get(conn_ent.entity, Conn) catch {
-                    try ctx.moveOneFrom(ent, ._read_active, .read_in);
+                const conn_ptr = self.reg.get(conn_ent.entity, &self._conn_active, Conn) catch {
+                    try self.reg.move(ent, &self._read_active, &self.io.read_in);
                     continue;
                 };
 
                 if (conn_ptr.ng_session == null) {
-                    try ctx.moveOneFrom(ent, ._read_active, .read_in);
+                    try self.reg.move(ent, &self._read_active, &self.io.read_in);
                     continue;
                 }
 
-                // Feed data to nghttp2 — decrypt first if TLS.
                 if (rr.data) |data_ptr| {
                     const data_len: usize = @intCast(rr.result);
 
                     if (conn_ptr.tls_conn) |tc| {
-                        // TLS: decrypt then feed
                         var decrypt_buf: [65536]u8 = undefined;
                         const feed_result = tc.feed(data_ptr[0..data_len], &decrypt_buf);
                         if (feed_result.result == .err) {
-                            try ctx.destroyOne(conn_ent.entity);
-                            try ctx.moveOneFrom(ent, ._read_active, .read_in);
+                            try self.reg.destroy(conn_ent.entity);
+                            try self.reg.move(ent, &self._read_active, &self.io.read_in);
                             continue;
                         }
                         if (feed_result.out_len > 0) {
                             const rv = c.nghttp2_session_mem_recv(conn_ptr.ng_session.?, &decrypt_buf, feed_result.out_len);
                             if (rv < 0) {
-                                try ctx.destroyOne(conn_ent.entity);
-                                try ctx.moveOneFrom(ent, ._read_active, .read_in);
+                                try self.reg.destroy(conn_ent.entity);
+                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
                                 continue;
                             }
                         }
                     } else {
-                        // h2c: feed raw data directly
                         const rv = c.nghttp2_session_mem_recv(conn_ptr.ng_session.?, data_ptr, data_len);
                         if (rv < 0) {
-                            try ctx.destroyOne(conn_ent.entity);
-                            try ctx.moveOneFrom(ent, ._read_active, .read_in);
+                            try self.reg.destroy(conn_ent.entity);
+                            try self.reg.move(ent, &self._read_active, &self.io.read_in);
                             continue;
                         }
                     }
                     conn_ptr.last_active_ns = monotonicNs();
                 }
 
-                try ctx.moveOneFrom(ent, ._read_active, .read_in);
+                try self.reg.move(ent, &self._read_active, &self.io.read_in);
             }
         }
 
@@ -1526,19 +1669,16 @@ pub fn H2(comptime Ctx: type) type {
         // Phase 7: Write accounting
         // =============================================================
 
-        fn writesAccount(ctx: *Ctx) !void {
-            const entities = ctx.entities(.write_results);
-            const conn_ents = ctx.column(.write_results, rio.ConnEntity);
-            const io_results = ctx.column(.write_results, rio.IoResult);
+        fn writesAccount(self: *Self) !void {
+            const entities = self.io.write_results.entitySlice();
+            const conn_ents = self.io.write_results.column(rio.ConnEntity);
+            const io_results = self.io.write_results.column(rio.IoResult);
 
             for (entities, conn_ents, io_results) |ent, conn_ent, io_res| {
-                // Close connection on write error
-                if (!ctx.isStale(conn_ent.entity) and io_res.err != 0) {
-                    try ctx.destroyOne(conn_ent.entity);
+                if (!self.reg.isStale(conn_ent.entity) and io_res.err != 0) {
+                    try self.reg.destroy(conn_ent.entity);
                 }
-
-                // WriteBuf.deinit frees the frame data
-                try ctx.destroyOne(ent);
+                try self.reg.destroy(ent);
             }
         }
 
@@ -1546,21 +1686,20 @@ pub fn H2(comptime Ctx: type) type {
         // Phase 8: Drive all nghttp2 sends
         // =============================================================
 
-        fn driveAllSends(self: *Self, ctx: *Ctx) !void {
-            const entities = ctx.entities(._conn_active);
+        fn driveAllSends(self: *Self) !void {
+            const entities = self._conn_active.entitySlice();
             const now = monotonicNs();
 
             for (entities) |ent| {
-                if (ctx.isStale(ent)) continue;
+                if (self.reg.isStale(ent)) continue;
 
-                const conn_ptr = ctx.get(ent, Conn) catch continue;
+                const conn_ptr = self.reg.get(ent, &self._conn_active, Conn) catch continue;
                 if (conn_ptr.ng_session == null) continue;
 
-                // Evict idle connections
                 if (self.h2_opts.idle_timeout_ns > 0 and conn_ptr.last_active_ns > 0 and
                     now -| conn_ptr.last_active_ns > self.h2_opts.idle_timeout_ns)
                 {
-                    try ctx.destroyOne(ent);
+                    try self.reg.destroy(ent);
                     continue;
                 }
 
@@ -1569,25 +1708,27 @@ pub fn H2(comptime Ctx: type) type {
                 if (c.nghttp2_session_want_write(ng_session) == 0 and
                     c.nghttp2_session_want_read(ng_session) == 0)
                 {
-                    try ctx.destroyOne(ent);
+                    try self.reg.destroy(ent);
                     continue;
                 }
 
                 if (c.nghttp2_session_want_write(ng_session) == 0) continue;
 
                 if (conn_ptr.tls_conn) |tc| {
-                    // TLS: accumulate all output, encrypt, send as one chunk
                     var accum_buf: [65536]u8 = undefined;
                     var accum_len: usize = 0;
 
                     while (true) {
                         var frame_data: [*c]const u8 = undefined;
                         const len = c.nghttp2_session_mem_send(ng_session, &frame_data);
-                        if (len < 0) { try ctx.destroyOne(ent); break; }
+                        if (len < 0) {
+                            try self.reg.destroy(ent);
+                            break;
+                        }
                         if (len == 0) break;
                         const flen: usize = @intCast(len);
                         if (accum_len + flen > accum_buf.len) {
-                            try ctx.destroyOne(ent);
+                            try self.reg.destroy(ent);
                             break;
                         }
                         @memcpy(accum_buf[accum_len .. accum_len + flen], frame_data[0..flen]);
@@ -1596,33 +1737,35 @@ pub fn H2(comptime Ctx: type) type {
 
                     if (accum_len > 0) {
                         const cipher = tc.encrypt(accum_buf[0..accum_len], self.allocator) catch {
-                            try ctx.destroyOne(ent);
+                            try self.reg.destroy(ent);
                             continue;
                         };
-                        self.submitWrite(ctx, ent, cipher) catch {
+                        self.submitWrite(ent, cipher) catch {
                             self.allocator.free(cipher);
-                            try ctx.destroyOne(ent);
+                            try self.reg.destroy(ent);
                             continue;
                         };
                     }
                 } else {
-                    // h2c: send plaintext directly
                     while (true) {
                         var frame_data: [*c]const u8 = undefined;
                         const len = c.nghttp2_session_mem_send(ng_session, &frame_data);
-                        if (len < 0) { try ctx.destroyOne(ent); break; }
+                        if (len < 0) {
+                            try self.reg.destroy(ent);
+                            break;
+                        }
                         if (len == 0) break;
 
                         const copy_len: u32 = @intCast(len);
                         const copy = self.allocator.alloc(u8, copy_len) catch {
-                            try ctx.destroyOne(ent);
+                            try self.reg.destroy(ent);
                             break;
                         };
                         @memcpy(copy, frame_data[0..copy_len]);
 
-                        self.submitWrite(ctx, ent, copy) catch {
+                        self.submitWrite(ent, copy) catch {
                             self.allocator.free(copy);
-                            try ctx.destroyOne(ent);
+                            try self.reg.destroy(ent);
                             break;
                         };
                     }
@@ -1633,29 +1776,24 @@ pub fn H2(comptime Ctx: type) type {
         }
 
         // =============================================================
-        // =============================================================
         // Client: consume connect requests
         // =============================================================
 
-        fn consumeConnectRequests(self: *Self, ctx: *Ctx) !void {
+        fn consumeConnectRequests(self: *Self) !void {
             if (!has_client) return;
-            const entities = ctx.entities(.client_connect_in);
-            const targets = ctx.column(.client_connect_in, ConnectTarget);
+            const entities = self.client_connect_in.entitySlice();
+            const targets = self.client_connect_in.column(ConnectTarget);
 
             for (entities, targets) |ent, target| {
-                // Create rove-io connect entity
-                const ce = ctx.createOneImmediate(.connect_in) catch {
-                    try ctx.set(ent, H2IoResult, .{ .err = -1 });
-                    try ctx.moveOneFrom(ent, .client_connect_in, .client_connect_errors);
+                const ce = self.reg.create(&self.io.connect_in) catch {
+                    try self.reg.set(ent, &self.client_connect_in, H2IoResult, .{ .err = -1 });
+                    try self.reg.move(ent, &self.client_connect_in, &self.client_connect_errors);
                     continue;
                 };
-                try ctx.set(ce, rio.ConnectAddr, .{ .addr = target.addr });
-                // Mark as client direction on the connection component
-                try ctx.set(ce, Conn, .{ .direction = .client, .pending_connect_entity = ent });
+                try self.reg.set(ce, &self.io.connect_in, rio.ConnectAddr, .{ .addr = target.addr });
+                try self.reg.set(ce, &self.io.connect_in, Conn, .{ .direction = .client, .pending_connect_entity = ent });
 
-                // Park user entity
-                try ctx.moveOneFrom(ent, .client_connect_in, ._client_connect_pending);
-                _ = self;
+                try self.reg.move(ent, &self.client_connect_in, &self._client_connect_pending);
             }
         }
 
@@ -1663,33 +1801,31 @@ pub fn H2(comptime Ctx: type) type {
         // Client: process connect results
         // =============================================================
 
-        fn processConnectResults(self: *Self, ctx: *Ctx) !void {
+        fn processConnectResults(self: *Self) !void {
             if (!has_client) return;
-            const entities = ctx.entities(.connections);
+            const entities = self.io.connections.entitySlice();
 
             for (entities) |ent| {
-                const conn_ptr = ctx.get(ent, Conn) catch continue;
+                const conn_ptr = self.reg.get(ent, &self.io.connections, Conn) catch continue;
                 if (conn_ptr.direction != .client) continue;
                 if (conn_ptr.pending_connect_entity.isNil()) continue;
 
                 const user_ent = conn_ptr.pending_connect_entity;
-                if (ctx.isStale(user_ent)) {
+                if (self.reg.isStale(user_ent)) {
                     conn_ptr.pending_connect_entity = Entity.nil;
                     continue;
                 }
 
-                // Create client nghttp2 session
-                clientSessionCreate(ctx, self.allocator, conn_ptr, ent, self.h2_opts) catch {
-                    ctx.set(user_ent, H2IoResult, .{ .err = -1 }) catch {};
-                    ctx.moveOneFrom(user_ent, ._client_connect_pending, .client_connect_errors) catch {};
-                    ctx.destroyOne(ent) catch {};
+                self.clientSessionCreate(conn_ptr, ent) catch {
+                    self.reg.set(user_ent, &self._client_connect_pending, H2IoResult, .{ .err = -1 }) catch {};
+                    self.reg.move(user_ent, &self._client_connect_pending, &self.client_connect_errors) catch {};
+                    self.reg.destroy(ent) catch {};
                     continue;
                 };
 
-                // Set session handle on user entity
-                ctx.set(user_ent, Session, .{ .entity = ent }) catch {};
-                ctx.set(user_ent, H2IoResult, .{ .err = 0 }) catch {};
-                ctx.moveOneFrom(user_ent, ._client_connect_pending, .client_connect_out) catch {};
+                self.reg.set(user_ent, &self._client_connect_pending, Session, .{ .entity = ent }) catch {};
+                self.reg.set(user_ent, &self._client_connect_pending, H2IoResult, .{ .err = 0 }) catch {};
+                self.reg.move(user_ent, &self._client_connect_pending, &self.client_connect_out) catch {};
 
                 conn_ptr.pending_connect_entity = Entity.nil;
                 conn_ptr.last_active_ns = monotonicNs();
@@ -1700,19 +1836,18 @@ pub fn H2(comptime Ctx: type) type {
         // Client: process connect errors
         // =============================================================
 
-        fn processConnectErrors(self: *Self, ctx: *Ctx) !void {
+        fn processConnectErrors(self: *Self) !void {
             if (!has_client) return;
-            _ = self;
-            const entities = ctx.entities(.connect_errors);
-            const conns = ctx.column(.connect_errors, Conn);
+            const entities = self.io.connect_errors.entitySlice();
+            const conns = self.io.connect_errors.column(Conn);
 
             for (entities, conns) |ent, conn| {
                 const user_ent = conn.pending_connect_entity;
-                if (!user_ent.isNil() and !ctx.isStale(user_ent)) {
-                    ctx.set(user_ent, H2IoResult, .{ .err = -1 }) catch {};
-                    ctx.moveOneFrom(user_ent, ._client_connect_pending, .client_connect_errors) catch {};
+                if (!user_ent.isNil() and !self.reg.isStale(user_ent)) {
+                    self.reg.set(user_ent, &self._client_connect_pending, H2IoResult, .{ .err = -1 }) catch {};
+                    self.reg.move(user_ent, &self._client_connect_pending, &self.client_connect_errors) catch {};
                 }
-                try ctx.destroyOne(ent);
+                try self.reg.destroy(ent);
             }
         }
 
@@ -1720,39 +1855,38 @@ pub fn H2(comptime Ctx: type) type {
         // Client: consume client requests
         // =============================================================
 
-        fn consumeClientRequests(self: *Self, ctx: *Ctx) !void {
+        fn consumeClientRequests(self: *Self) !void {
             if (!has_client) return;
-            const entities = ctx.entities(.client_request_in);
-            const sessions = ctx.column(.client_request_in, Session);
-            const req_hdrs = ctx.column(.client_request_in, ReqHeaders);
-            const req_bodies = ctx.column(.client_request_in, ReqBody);
-            const io_results = ctx.column(.client_request_in, H2IoResult);
+            const entities = self.client_request_in.entitySlice();
+            const sessions = self.client_request_in.column(Session);
+            const req_hdrs = self.client_request_in.column(ReqHeaders);
+            const req_bodies = self.client_request_in.column(ReqBody);
+            const io_results = self.client_request_in.column(H2IoResult);
 
             for (entities, sessions, req_hdrs, req_bodies, io_results) |ent, sess, rh, rb, *io_res| {
-                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
                     continue;
                 };
-                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
                     continue;
                 }
 
                 const ng_session = conn_ptr.ng_session.?;
 
-                // Build nghttp2_nv from request headers
                 const nv_count: usize = @as(usize, rh.count);
                 if (nv_count == 0) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
                     continue;
                 }
 
                 const nva_slice = self.allocator.alloc(c.nghttp2_nv, nv_count) catch {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
                     continue;
                 };
                 defer self.allocator.free(nva_slice);
@@ -1769,13 +1903,12 @@ pub fn H2(comptime Ctx: type) type {
                     }
                 }
 
-                // Data provider for request body
                 var data_prd: c.nghttp2_data_provider = std.mem.zeroes(c.nghttp2_data_provider);
                 var body_data_ptr: ?*BodyData = null;
                 if (rb.data != null and rb.len > 0) {
                     body_data_ptr = BodyData.create(self.allocator, rb.data.?, rb.len) orelse {
                         io_res.err = -1;
-                        try ctx.moveOneFrom(ent, .client_request_in, .client_response_out);
+                        try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
                         continue;
                     };
                     data_prd.source = .{ .ptr = @ptrCast(body_data_ptr) };
@@ -1794,24 +1927,24 @@ pub fn H2(comptime Ctx: type) type {
                 if (stream_id < 0) {
                     if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
                     continue;
                 }
 
-                // Create stream and associate
                 const stream = Stream.create(sess.entity, self.allocator) orelse {
                     if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_request_in, &self.client_response_out);
                     continue;
                 };
                 stream.entity = ent;
                 stream.send_complete = (data_prd.read_callback == null);
                 stream.send_data = body_data_ptr;
+                stream.ng_stream_id = stream_id;
                 _ = c.nghttp2_session_set_stream_user_data(ng_session, stream_id, @ptrCast(stream));
 
-                try ctx.set(ent, StreamId, .{ .id = @intCast(stream_id) });
-                try ctx.moveOneFrom(ent, .client_request_in, ._client_request_sending);
+                try self.reg.set(ent, &self.client_request_in, StreamId, .{ .id = @intCast(stream_id) });
+                try self.reg.move(ent, &self.client_request_in, &self._client_request_sending);
             }
         }
 
@@ -1819,22 +1952,22 @@ pub fn H2(comptime Ctx: type) type {
         // Client streaming: consume client_stream_request_in
         // =============================================================
 
-        fn consumeClientStreamRequests(self: *Self, ctx: *Ctx) !void {
+        fn consumeClientStreamRequests(self: *Self) !void {
             if (!has_client) return;
-            const entities = ctx.entities(.client_stream_request_in);
-            const sessions = ctx.column(.client_stream_request_in, Session);
-            const req_hdrs = ctx.column(.client_stream_request_in, ReqHeaders);
-            const io_results = ctx.column(.client_stream_request_in, H2IoResult);
+            const entities = self.client_stream_request_in.entitySlice();
+            const sessions = self.client_stream_request_in.column(Session);
+            const req_hdrs = self.client_stream_request_in.column(ReqHeaders);
+            const io_results = self.client_stream_request_in.column(H2IoResult);
 
             for (entities, sessions, req_hdrs, io_results) |ent, sess, rh, *io_res| {
-                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
                     continue;
                 };
-                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
                     continue;
                 }
 
@@ -1843,13 +1976,13 @@ pub fn H2(comptime Ctx: type) type {
                 const nv_count: usize = @as(usize, rh.count);
                 if (nv_count == 0) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
                     continue;
                 }
 
                 const nva_slice = self.allocator.alloc(c.nghttp2_nv, nv_count) catch {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
                     continue;
                 };
                 defer self.allocator.free(nva_slice);
@@ -1866,7 +1999,6 @@ pub fn H2(comptime Ctx: type) type {
                     }
                 }
 
-                // Deferred data provider — source.ptr NULL signals streaming path
                 var data_prd = c.nghttp2_data_provider{
                     .source = .{ .ptr = null },
                     .read_callback = &onDataSourceReadCb,
@@ -1883,13 +2015,13 @@ pub fn H2(comptime Ctx: type) type {
 
                 if (stream_id < 0) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
                     continue;
                 }
 
                 const stream = Stream.create(sess.entity, self.allocator) orelse {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_request_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
                     continue;
                 };
                 stream.entity = ent;
@@ -1898,10 +2030,11 @@ pub fn H2(comptime Ctx: type) type {
                 stream.client_stream = true;
                 stream.send_complete = false;
                 stream.send_data = null;
+                stream.ng_stream_id = stream_id;
                 _ = c.nghttp2_session_set_stream_user_data(ng_session, stream_id, @ptrCast(stream));
 
-                try ctx.set(ent, StreamId, .{ .id = @intCast(stream_id) });
-                try ctx.moveOneFrom(ent, .client_stream_request_in, .client_stream_data_out);
+                try self.reg.set(ent, &self.client_stream_request_in, StreamId, .{ .id = @intCast(stream_id) });
+                try self.reg.move(ent, &self.client_stream_request_in, &self.client_stream_data_out);
             }
         }
 
@@ -1909,29 +2042,28 @@ pub fn H2(comptime Ctx: type) type {
         // Client streaming: consume client_stream_data_in
         // =============================================================
 
-        fn consumeClientStreamData(ctx: *Ctx) !void {
+        fn consumeClientStreamData(self: *Self) !void {
             if (!has_client) return;
-            const entities = ctx.entities(.client_stream_data_in);
-            const sessions = ctx.column(.client_stream_data_in, Session);
-            const sids = ctx.column(.client_stream_data_in, StreamId);
-            const req_bodies = ctx.column(.client_stream_data_in, ReqBody);
-            const io_results = ctx.column(.client_stream_data_in, H2IoResult);
+            const entities = self.client_stream_data_in.entitySlice();
+            const sessions = self.client_stream_data_in.column(Session);
+            const sids = self.client_stream_data_in.column(StreamId);
+            const req_bodies = self.client_stream_data_in.column(ReqBody);
+            const io_results = self.client_stream_data_in.column(H2IoResult);
 
             for (entities, sessions, sids, req_bodies, io_results) |ent, sess, sid, *rb, *io_res| {
-                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_data_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_data_in, &self.client_response_out);
                     continue;
                 };
-                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_data_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_data_in, &self.client_response_out);
                     continue;
                 }
 
-                // Skip empty chunks — move back to ready
                 if (rb.data == null or rb.len == 0) {
-                    try ctx.moveOneFrom(ent, .client_stream_data_in, .client_stream_data_out);
+                    try self.reg.move(ent, &self.client_stream_data_in, &self.client_stream_data_out);
                     continue;
                 }
 
@@ -1941,23 +2073,21 @@ pub fn H2(comptime Ctx: type) type {
                 ));
                 if (stream == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_data_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_data_in, &self.client_response_out);
                     continue;
                 }
 
                 const s = stream.?;
 
-                // Transfer chunk ownership from component to stream struct
                 s.stream_chunk_data = rb.data;
                 s.stream_chunk_len = rb.len;
                 s.stream_chunk_offset = 0;
                 rb.data = null;
                 rb.len = 0;
 
-                // Un-defer so nghttp2 calls onDataSourceReadCb
                 _ = c.nghttp2_session_resume_data(ng_session, s.ng_stream_id);
 
-                try ctx.moveOneFrom(ent, .client_stream_data_in, ._client_stream_data_sending);
+                try self.reg.move(ent, &self.client_stream_data_in, &self._client_stream_data_sending);
             }
         }
 
@@ -1965,22 +2095,22 @@ pub fn H2(comptime Ctx: type) type {
         // Client streaming: consume client_stream_close_in
         // =============================================================
 
-        fn consumeClientStreamClose(ctx: *Ctx) !void {
+        fn consumeClientStreamClose(self: *Self) !void {
             if (!has_client) return;
-            const entities = ctx.entities(.client_stream_close_in);
-            const sessions = ctx.column(.client_stream_close_in, Session);
-            const sids = ctx.column(.client_stream_close_in, StreamId);
-            const io_results = ctx.column(.client_stream_close_in, H2IoResult);
+            const entities = self.client_stream_close_in.entitySlice();
+            const sessions = self.client_stream_close_in.column(Session);
+            const sids = self.client_stream_close_in.column(StreamId);
+            const io_results = self.client_stream_close_in.column(H2IoResult);
 
             for (entities, sessions, sids, io_results) |ent, sess, sid, *io_res| {
-                const conn_ptr = ctx.get(sess.entity, Conn) catch {
+                const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_close_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_close_in, &self.client_response_out);
                     continue;
                 };
-                if (conn_ptr.ng_session == null or ctx.isStale(sess.entity)) {
+                if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_close_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_close_in, &self.client_response_out);
                     continue;
                 }
 
@@ -1990,19 +2120,16 @@ pub fn H2(comptime Ctx: type) type {
                 ));
                 if (stream == null) {
                     io_res.err = -1;
-                    try ctx.moveOneFrom(ent, .client_stream_close_in, .client_response_out);
+                    try self.reg.move(ent, &self.client_stream_close_in, &self.client_response_out);
                     continue;
                 }
 
                 stream.?.stream_eof = true;
-
-                // Un-defer so onDataSourceReadCb sees EOF and sets NGHTTP2_DATA_FLAG_EOF
                 _ = c.nghttp2_session_resume_data(ng_session, stream.?.ng_stream_id);
 
-                try ctx.moveOneFrom(ent, .client_stream_close_in, ._client_stream_data_sending);
+                try self.reg.move(ent, &self.client_stream_close_in, &self._client_stream_data_sending);
             }
         }
-
     };
 }
 
@@ -2012,88 +2139,46 @@ pub fn H2(comptime Ctx: type) type {
 
 const testing = std.testing;
 
-fn testRow(comptime S: type, comptime name: []const u8) type {
-    return rove.CollectionRow(S, name);
-}
-
-test "spec produces all expected collections" {
-    const S = Collections(.{});
-    try testing.expect(@hasField(S, "connections"));
-    try testing.expect(@hasField(S, "read_results"));
-    try testing.expect(@hasField(S, "write_results"));
-    try testing.expect(@hasField(S, "read_in"));
-    try testing.expect(@hasField(S, "write_in"));
-    try testing.expect(@hasField(S, "_read_pending"));
-    try testing.expect(@hasField(S, "_write_pending"));
-    try testing.expect(@hasField(S, "request_out"));
-    try testing.expect(@hasField(S, "response_in"));
-    try testing.expect(@hasField(S, "response_out"));
-    try testing.expect(@hasField(S, "_response_sending"));
-    try testing.expect(@hasField(S, "_read_errors"));
-    try testing.expect(@hasField(S, "_read_init"));
-    try testing.expect(@hasField(S, "_read_active"));
-    try testing.expect(@hasField(S, "_conn_active"));
-}
-
-test "stream collections share the same row" {
-    const S = Collections(.{});
-    try testing.expect(testRow(S, "request_out").equal(testRow(S, "response_in")));
-    try testing.expect(testRow(S, "response_in").equal(testRow(S, "response_out")));
-    try testing.expect(testRow(S, "response_out").equal(testRow(S, "_response_sending")));
-}
-
 test "stream row contains all h2 base components" {
-    const R = testRow(Collections(.{}), "request_out");
-    try testing.expect(R.contains(StreamId));
-    try testing.expect(R.contains(Session));
-    try testing.expect(R.contains(ReqHeaders));
-    try testing.expect(R.contains(ReqBody));
-    try testing.expect(R.contains(RespHeaders));
-    try testing.expect(R.contains(RespBody));
-    try testing.expect(R.contains(Status));
-    try testing.expect(R.contains(H2IoResult));
+    const H2Type = H2(.{});
+    try testing.expect(H2Type.StreamRow.contains(StreamId));
+    try testing.expect(H2Type.StreamRow.contains(Session));
+    try testing.expect(H2Type.StreamRow.contains(ReqHeaders));
+    try testing.expect(H2Type.StreamRow.contains(ReqBody));
+    try testing.expect(H2Type.StreamRow.contains(RespHeaders));
+    try testing.expect(H2Type.StreamRow.contains(RespBody));
+    try testing.expect(H2Type.StreamRow.contains(Status));
+    try testing.expect(H2Type.StreamRow.contains(H2IoResult));
 }
 
-test "connection rows" {
-    const S = Collections(.{});
-    try testing.expect(testRow(S, "connections").contains(Conn));
-    try testing.expect(testRow(S, "connections").contains(rio.Fd));
-    try testing.expect(testRow(S, "connections").contains(rio.ReadCycleEntity));
-    try testing.expect(testRow(S, "connections").isSubsetOf(testRow(S, "_conn_active")));
-}
-
-test "read triage collections match rove-io read row" {
-    const S = Collections(.{});
-    try testing.expect(testRow(S, "read_results").equal(testRow(S, "_read_errors")));
-    try testing.expect(testRow(S, "read_results").equal(testRow(S, "_read_init")));
-    try testing.expect(testRow(S, "read_results").equal(testRow(S, "_read_active")));
+test "connection row contains Conn" {
+    const H2Type = H2(.{});
+    try testing.expect(H2Type.ConnectionRow.contains(Conn));
+    try testing.expect(H2Type.ConnectionRow.contains(rio.Fd));
+    try testing.expect(H2Type.ConnectionRow.contains(rio.ReadCycleEntity));
 }
 
 test "user rows pass through" {
     const MyAppData = struct { tag: u64 };
     const MySession = struct { id: u64 };
-    const S = Collections(.{ .request_row = Row(&.{MyAppData}), .connection_row = Row(&.{MySession}) });
-    try testing.expect(testRow(S, "request_out").contains(MyAppData));
-    try testing.expect(testRow(S, "_response_sending").contains(MyAppData));
-    try testing.expect(testRow(S, "connections").contains(MySession));
-    try testing.expect(testRow(S, "_conn_active").contains(MySession));
+    const H2Type = H2(.{ .request_row = Row(&.{MyAppData}), .connection_row = Row(&.{MySession}) });
+    try testing.expect(H2Type.StreamRow.contains(MyAppData));
+    try testing.expect(H2Type.ConnectionRow.contains(MySession));
 }
 
-test "spec works with MergeCollections and Context" {
-    const MySession = struct { id: u64 };
-    const AppSpec = rove.MakeCollections(&.{
-        rove.col("app_state", rove.Collection(Row(&.{MySession}), .{})),
-    });
-    const Spec = rove.MergeCollections(.{ Collections(.{ .connection_row = Row(&.{MySession}) }), AppSpec });
-    const Ctx = rove.Context(Spec);
-    var ctx = try Ctx.init(testing.allocator, .{ .max_entities = 64 });
-    defer ctx.deinit();
+test "H2 type has expected collections" {
+    const H2Type = H2(.{});
+    try testing.expect(@hasField(H2Type, "request_out"));
+    try testing.expect(@hasField(H2Type, "response_in"));
+    try testing.expect(@hasField(H2Type, "response_out"));
+    try testing.expect(@hasField(H2Type, "_response_sending"));
+    try testing.expect(@hasField(H2Type, "_conn_active"));
+}
 
-    const conn = try ctx.createOne(.connections);
-    const req = try ctx.createOne(.request_out);
-    try ctx.flush();
-    try testing.expect(!ctx.isStale(conn));
-    try testing.expect(!ctx.isStale(req));
+test "H2 client has client collections" {
+    const H2Type = H2(.{ .client = true });
+    try testing.expect(@hasField(H2Type, "client_connect_in"));
+    try testing.expect(@hasField(H2Type, "client_response_out"));
 }
 
 test "nghttp2 linked and callable" {
