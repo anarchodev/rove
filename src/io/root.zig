@@ -1,6 +1,8 @@
 const std = @import("std");
-const rove = @import("rove");
+const rove = @import("rove2");
 const Row = rove.Row;
+const Collection = rove.Collection;
+const Registry = rove.Registry;
 const Entity = rove.Entity;
 const linux = std.os.linux;
 const posix = std.posix;
@@ -10,12 +12,11 @@ const posix = std.posix;
 // =============================================================================
 
 /// Cleanup context shared by Fd and ReadCycleEntity destructors.
-/// Stored on the Io struct, registered with collections via setDeinitCtx.
+/// Stored on the Io struct, registered with registry via setDeinitCtx.
 pub const IoCleanupCtx = struct {
     ring: *linux.IoUring,
     max_connections: u32,
-    rove_ctx: *anyopaque,
-    destroy_fn: *const fn (*anyopaque, Entity) void,
+    reg: *Registry,
 };
 
 pub const Fd = struct {
@@ -70,8 +71,8 @@ pub const ReadCycleEntity = struct {
 
     pub fn deinit(_: std.mem.Allocator, items: []ReadCycleEntity, ctx: *DeinitCtx) void {
         for (items) |item| {
-            if (!item.entity.isNil()) {
-                ctx.destroy_fn(ctx.rove_ctx, item.entity);
+            if (!item.entity.isNil() and !ctx.reg.isStale(item.entity)) {
+                ctx.reg.destroyImmediate(item.entity) catch {};
             }
         }
     }
@@ -87,53 +88,6 @@ pub const WriteInBaseRow = Row(&.{ ConnEntity, WriteBuf });
 pub const WriteResultBaseRow = Row(&.{ ConnEntity, WriteBuf, IoResult });
 const ConnectInBaseRow = Row(&.{ ConnectAddr, Fd, IoResult, ReadCycleEntity });
 const ConnectErrorBaseRow = Row(&.{ ConnectAddr, Fd, IoResult });
-
-// =============================================================================
-// Spec
-// =============================================================================
-
-pub const Options = struct {
-    connection_row: type = Row(&.{}),
-    read_row: type = Row(&.{}),
-    write_row: type = Row(&.{}),
-    connect: bool = false,
-};
-
-pub fn Collections(comptime opts: Options) type {
-    const conn_row = ConnectionBaseRow.merge(opts.connection_row);
-    const read_row = ReadBaseRow.merge(opts.read_row);
-    const write_in_row = WriteInBaseRow.merge(opts.write_row);
-    const write_result_row = WriteResultBaseRow.merge(opts.write_row);
-    const read_pending_row = read_row;
-    const write_pending_row = write_in_row;
-
-    // Connect pipeline rows (supersets of connection row so the entity
-    // can move from connect_in → ... → connections without data loss)
-    const connect_in_row = ConnectInBaseRow.merge(opts.connection_row);
-    const connect_error_row = ConnectErrorBaseRow.merge(opts.connection_row);
-    const connect_socket_pending_row = connect_in_row;
-    const connect_pending_row = connect_in_row;
-
-    const C = rove.Collection;
-    const base_fields = .{
-        rove.col("connections", C(conn_row, .{})),
-        rove.col("read_results", C(read_row, .{})),
-        rove.col("write_results", C(write_result_row, .{})),
-        rove.col("read_in", C(read_row, .{})),
-        rove.col("write_in", C(write_in_row, .{})),
-        rove.col("_read_pending", C(read_pending_row, .{})),
-        rove.col("_write_pending", C(write_pending_row, .{})),
-    };
-
-    const connect_fields = if (opts.connect) .{
-        rove.col("connect_in", C(connect_in_row, .{})),
-        rove.col("connect_errors", C(connect_error_row, .{})),
-        rove.col("_connect_socket_pending", C(connect_socket_pending_row, .{})),
-        rove.col("_connect_pending", C(connect_pending_row, .{})),
-    } else .{};
-
-    return rove.MakeCollections(&(base_fields ++ connect_fields));
-}
 
 // =============================================================================
 // CQE user_data encoding
@@ -157,82 +111,120 @@ fn decodeEntity(user_data: u64) Entity {
 // Io type
 // =============================================================================
 
+pub const Options = struct {
+    connection_row: type = Row(&.{}),
+    read_row: type = Row(&.{}),
+    write_row: type = Row(&.{}),
+    connect: bool = false,
+};
+
 pub const IoOptions = struct {
-    /// io_uring submission queue depth (must be power of two).
     ring_entries: u16 = 256,
-    /// Number of provided receive buffers (must be power of two).
     buf_count: u16 = 256,
-    /// Size of each receive buffer in bytes.
     buf_size: u32 = 4096,
-    /// Maximum concurrent connections (fixed-file table size).
     max_connections: u32 = 1024,
-    /// Optional io_uring params for advanced configuration (SQPOLL,
-    /// sq_thread_cpu, cq_entries, etc.). When non-null, used instead
-    /// of default ring initialization.
     ring_params: ?*linux.io_uring_params = null,
-    /// TCP listen backlog.
     listen_backlog: u31 = 128,
 };
 
-pub fn Io(comptime Ctx: type) type {
-    const has_connect = @hasField(Ctx.CollectionId, "connect_in");
+pub fn Io(comptime opts: Options) type {
+    const conn_row = ConnectionBaseRow.merge(opts.connection_row);
+    const read_row = ReadBaseRow.merge(opts.read_row);
+    const write_in_row = WriteInBaseRow.merge(opts.write_row);
+    const write_result_row = WriteResultBaseRow.merge(opts.write_row);
+    const read_pending_row = read_row;
+    const write_pending_row = write_in_row;
+
+    const connect_in_row = ConnectInBaseRow.merge(opts.connection_row);
+    const connect_error_row = ConnectErrorBaseRow.merge(opts.connection_row);
+    const connect_socket_pending_row = connect_in_row;
+    const connect_pending_row = connect_in_row;
+
+    const has_connect = opts.connect;
+
+    // Collection types
+    const ConnColl = Collection(conn_row, .{});
+    const ReadResultColl = Collection(read_row, .{});
+    const WriteResultColl = Collection(write_result_row, .{});
+    const ReadInColl = Collection(read_row, .{});
+    const WriteInColl = Collection(write_in_row, .{});
+    const ReadPendingColl = Collection(read_pending_row, .{});
+    const WritePendingColl = Collection(write_pending_row, .{});
+
+    const ConnectInColl = if (has_connect) Collection(connect_in_row, .{}) else void;
+    const ConnectErrorColl = if (has_connect) Collection(connect_error_row, .{}) else void;
+    const ConnectSocketPendingColl = if (has_connect) Collection(connect_socket_pending_row, .{}) else void;
+    const ConnectPendingColl = if (has_connect) Collection(connect_pending_row, .{}) else void;
 
     return struct {
         const Self = @This();
 
+        // Public collection types (for external access to row types)
+        pub const ConnectionRow = conn_row;
+        pub const ReadRow = read_row;
+
+        // Collections
+        connections: ConnColl,
+        read_results: ReadResultColl,
+        write_results: WriteResultColl,
+        read_in: ReadInColl,
+        write_in: WriteInColl,
+        _read_pending: ReadPendingColl,
+        _write_pending: WritePendingColl,
+
+        connect_in: ConnectInColl,
+        connect_errors: ConnectErrorColl,
+        _connect_socket_pending: ConnectSocketPendingColl,
+        _connect_pending: ConnectPendingColl,
+
+        // io_uring state
         ring: linux.IoUring,
         buf_ring: *align(std.heap.page_size_min) linux.io_uring_buf_ring,
         buf_base: []u8,
         buf_size: u32,
         buf_count: u16,
         listen_fd: posix.socket_t,
-        conn_slots: []ConnSlot,
         max_connections: u32,
 
-        // Cleanup context for component destructors — interior pointer
-        // is stable because Self is heap-allocated.
         cleanup_ctx: IoCleanupCtx,
 
+        reg: *Registry,
         allocator: std.mem.Allocator,
-
-        const ConnSlot = struct {
-            entity: Entity = Entity.nil,
-        };
 
         const BUF_GROUP_ID: u16 = 0;
 
-        pub fn create(ctx: *Ctx, allocator: std.mem.Allocator, addr: std.net.Address, opts: IoOptions) !*Self {
-            var ring = if (opts.ring_params) |params|
-                try linux.IoUring.init_params(opts.ring_entries, params)
+        pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: IoOptions) !*Self {
+            var ring = if (io_opts.ring_params) |params|
+                try linux.IoUring.init_params(io_opts.ring_entries, params)
             else
-                try linux.IoUring.init(opts.ring_entries, 0);
+                try linux.IoUring.init(io_opts.ring_entries, 0);
             errdefer ring.deinit();
 
             {
-                const empty_fds = try allocator.alloc(posix.fd_t, opts.max_connections);
+                const empty_fds = try allocator.alloc(posix.fd_t, io_opts.max_connections);
                 defer allocator.free(empty_fds);
                 @memset(empty_fds, -1);
                 try ring.register_files(empty_fds);
             }
 
-            const buf_base = try allocator.alloc(u8, @as(usize, opts.buf_count) * opts.buf_size);
+            const buf_base = try allocator.alloc(u8, @as(usize, io_opts.buf_count) * io_opts.buf_size);
             errdefer allocator.free(buf_base);
 
-            const br = try linux.IoUring.setup_buf_ring(ring.fd, opts.buf_count, BUF_GROUP_ID, .{ .inc = false });
+            const br = try linux.IoUring.setup_buf_ring(ring.fd, io_opts.buf_count, BUF_GROUP_ID, .{ .inc = false });
             linux.IoUring.buf_ring_init(br);
-            const mask = linux.IoUring.buf_ring_mask(opts.buf_count);
-            for (0..opts.buf_count) |i| {
-                const pos = @as(usize, opts.buf_size) * i;
-                linux.IoUring.buf_ring_add(br, buf_base[pos .. pos + opts.buf_size], @intCast(i), mask, @intCast(i));
+            const mask = linux.IoUring.buf_ring_mask(io_opts.buf_count);
+            for (0..io_opts.buf_count) |i| {
+                const pos = @as(usize, io_opts.buf_size) * i;
+                linux.IoUring.buf_ring_add(br, buf_base[pos .. pos + io_opts.buf_size], @intCast(i), mask, @intCast(i));
             }
-            linux.IoUring.buf_ring_advance(br, opts.buf_count);
+            linux.IoUring.buf_ring_advance(br, io_opts.buf_count);
 
             const listen_fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
             errdefer posix.close(listen_fd);
 
             try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
             try posix.bind(listen_fd, &addr.any, addr.getOsSockLen());
-            try posix.listen(listen_fd, opts.listen_backlog);
+            try posix.listen(listen_fd, io_opts.listen_backlog);
 
             {
                 const sqe = try ring.get_sqe();
@@ -240,55 +232,90 @@ pub fn Io(comptime Ctx: type) type {
                 sqe.user_data = ACCEPT_SENTINEL;
             }
 
-            const conn_slots = try allocator.alloc(ConnSlot, opts.max_connections);
-            @memset(conn_slots, ConnSlot{});
-
             const self = try allocator.create(Self);
             self.* = .{
+                .connections = try ConnColl.init(allocator),
+                .read_results = try ReadResultColl.init(allocator),
+                .write_results = try WriteResultColl.init(allocator),
+                .read_in = try ReadInColl.init(allocator),
+                .write_in = try WriteInColl.init(allocator),
+                ._read_pending = try ReadPendingColl.init(allocator),
+                ._write_pending = try WritePendingColl.init(allocator),
+                .connect_in = if (has_connect) try ConnectInColl.init(allocator) else {},
+                .connect_errors = if (has_connect) try ConnectErrorColl.init(allocator) else {},
+                ._connect_socket_pending = if (has_connect) try ConnectSocketPendingColl.init(allocator) else {},
+                ._connect_pending = if (has_connect) try ConnectPendingColl.init(allocator) else {},
                 .ring = ring,
                 .buf_ring = br,
                 .buf_base = buf_base,
-                .buf_size = opts.buf_size,
-                .buf_count = opts.buf_count,
+                .buf_size = io_opts.buf_size,
+                .buf_count = io_opts.buf_count,
                 .listen_fd = listen_fd,
-                .conn_slots = conn_slots,
-                .max_connections = opts.max_connections,
+                .max_connections = io_opts.max_connections,
                 .cleanup_ctx = .{
-                    .ring = undefined, // set below after self is allocated
-                    .max_connections = opts.max_connections,
-                    .rove_ctx = @ptrCast(ctx),
-                    .destroy_fn = &destroyEntityThunk,
+                    .ring = undefined, // set below
+                    .max_connections = io_opts.max_connections,
+                    .reg = reg,
                 },
+                .reg = reg,
                 .allocator = allocator,
             };
 
             // Set ring pointer now that self is at its final heap location
             self.cleanup_ctx.ring = &self.ring;
 
-            // Register deinit context — &self.cleanup_ctx is stable (self is heap-allocated)
-            self.registerDeinitCtxs(ctx);
+            // Register collections with registry
+            reg.registerCollection(&self.connections);
+            reg.registerCollection(&self.read_results);
+            reg.registerCollection(&self.write_results);
+            reg.registerCollection(&self.read_in);
+            reg.registerCollection(&self.write_in);
+            reg.registerCollection(&self._read_pending);
+            reg.registerCollection(&self._write_pending);
+            if (has_connect) {
+                reg.registerCollection(&self.connect_in);
+                reg.registerCollection(&self.connect_errors);
+                reg.registerCollection(&self._connect_socket_pending);
+                reg.registerCollection(&self._connect_pending);
+            }
+
+            // Register deinit contexts
+            reg.setDeinitCtx(Fd, &self.cleanup_ctx);
+            reg.setDeinitCtx(ReadCycleEntity, &self.cleanup_ctx);
 
             return self;
         }
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            self.connections.deinit();
+            self.read_results.deinit();
+            self.write_results.deinit();
+            self.read_in.deinit();
+            self.write_in.deinit();
+            self._read_pending.deinit();
+            self._write_pending.deinit();
+            if (has_connect) {
+                self.connect_in.deinit();
+                self.connect_errors.deinit();
+                self._connect_socket_pending.deinit();
+                self._connect_pending.deinit();
+            }
             linux.IoUring.free_buf_ring(self.ring.fd, self.buf_ring, self.buf_count, BUF_GROUP_ID);
             allocator.free(self.buf_base);
             posix.close(self.listen_fd);
-            allocator.free(self.conn_slots);
             self.ring.deinit();
             allocator.destroy(self);
         }
 
-        pub fn poll(self: *Self, ctx: *Ctx, min_complete: u32) !u32 {
+        pub fn poll(self: *Self, min_complete: u32) !u32 {
             // Phase 1: Process user inputs (deferred moves)
-            try self.processWriteIn(ctx);
-            try self.processReadIn(ctx);
-            if (has_connect) try self.processConnectIn(ctx);
+            try self.processWriteIn();
+            try self.processReadIn();
+            if (has_connect) try self.processConnectIn();
 
             // Phase 2: Flush deferred moves
-            try ctx.flush();
+            try self.reg.flush();
 
             // Phase 3: Submit and wait
             _ = try self.ring.submit_and_wait(min_complete);
@@ -300,7 +327,7 @@ pub fn Io(comptime Ctx: type) type {
                 const count = try self.ring.copy_cqes(&cqe_buf, 0);
                 if (count == 0) break;
                 for (cqe_buf[0..count]) |cqe| {
-                    try self.handleCqe(ctx, cqe);
+                    try self.handleCqe(cqe);
                     events += 1;
                 }
             }
@@ -309,64 +336,59 @@ pub fn Io(comptime Ctx: type) type {
         }
 
         // =============================================================
-        // Slot release
-        // =============================================================
-
-        // =============================================================
         // Input processing (deferred ops, forward iteration)
         // =============================================================
 
-        fn processWriteIn(self: *Self, ctx: *Ctx) !void {
-            const entities = ctx.entities(.write_in);
-            const conn_ents = ctx.column(.write_in, ConnEntity);
-            const wbufs = ctx.column(.write_in, WriteBuf);
+        fn processWriteIn(self: *Self) !void {
+            const entities = self.write_in.entitySlice();
+            const conn_ents = self.write_in.column(ConnEntity);
+            const wbufs = self.write_in.column(WriteBuf);
 
             for (entities, conn_ents, wbufs) |ent, conn_ent, wb| {
-                if (ctx.isStale(conn_ent.entity)) {
-                    try ctx.destroyOne(ent);
+                if (self.reg.isStale(conn_ent.entity)) {
+                    try self.reg.destroy(ent);
                     continue;
                 }
 
-                const conn_fd = try ctx.get(conn_ent.entity, Fd);
+                const conn_fd = try self.reg.get(conn_ent.entity, &self.connections, Fd);
 
                 const sqe = try self.ring.get_sqe();
                 sqe.prep_send(conn_fd.fd, @constCast(wb.data)[wb.offset..wb.len], 0);
                 sqe.flags |= linux.IOSQE_FIXED_FILE;
                 sqe.user_data = encodeEntity(ent);
 
-                try ctx.moveOneFrom(ent, .write_in, ._write_pending);
+                try self.reg.move(ent, &self.write_in, &self._write_pending);
             }
         }
 
-        fn processReadIn(self: *Self, ctx: *Ctx) !void {
-            const entities = ctx.entities(.read_in);
-            const conn_ents = ctx.column(.read_in, ConnEntity);
-            const results = ctx.column(.read_in, ReadResult);
+        fn processReadIn(self: *Self) !void {
+            const entities = self.read_in.entitySlice();
+            const conn_ents = self.read_in.column(ConnEntity);
+            const results = self.read_in.column(ReadResult);
             const mask = linux.IoUring.buf_ring_mask(self.buf_count);
             var armed: u16 = 0;
 
-            for (entities, conn_ents, results) |ent, conn_ent, rr| {
-                if (ctx.isStale(conn_ent.entity)) {
+            for (entities, conn_ents, results) |ent, conn_ent, *rr| {
+                if (self.reg.isStale(conn_ent.entity)) {
                     if (rr.data != null) {
                         self.returnBufferToRing(rr.buf_id, mask, armed);
                         armed += 1;
                     }
-                    try ctx.destroyOne(ent);
+                    try self.reg.destroy(ent);
                     continue;
                 }
 
-                const conn_fd = try ctx.get(conn_ent.entity, Fd);
+                const conn_fd = try self.reg.get(conn_ent.entity, &self.connections, Fd);
 
                 if (rr.data != null) {
                     self.returnBufferToRing(rr.buf_id, mask, armed);
                     armed += 1;
                 }
 
-                const rr_ptr = try ctx.get(ent, ReadResult);
-                rr_ptr.* = .{};
+                rr.* = .{};
 
                 try self.armRecv(ent, conn_fd.fd);
-                try ctx.moveOneFrom(ent, .read_in, ._read_pending);
+                try self.reg.move(ent, &self.read_in, &self._read_pending);
             }
 
             if (armed > 0) {
@@ -374,20 +396,17 @@ pub fn Io(comptime Ctx: type) type {
             }
         }
 
-        fn processConnectIn(self: *Self, ctx: *Ctx) !void {
+        fn processConnectIn(self: *Self) !void {
             if (!has_connect) return;
 
-            const entities = ctx.entities(.connect_in);
-            const addrs = ctx.column(.connect_in, ConnectAddr);
+            const entities = self.connect_in.entitySlice();
 
-            for (entities, addrs) |ent, addr| {
-                _ = addr;
-                // Submit socket_direct_alloc SQE
+            for (entities) |ent| {
                 const sqe = try self.ring.get_sqe();
                 sqe.prep_socket_direct_alloc(posix.AF.INET, posix.SOCK.STREAM, 0, 0);
                 sqe.user_data = encodeEntity(ent);
 
-                try ctx.moveOneFrom(ent, .connect_in, ._connect_socket_pending);
+                try self.reg.move(ent, &self.connect_in, &self._connect_socket_pending);
             }
         }
 
@@ -395,31 +414,25 @@ pub fn Io(comptime Ctx: type) type {
         // CQE handlers
         // =============================================================
 
-        fn handleCqe(self: *Self, ctx: *Ctx, cqe: linux.io_uring_cqe) !void {
+        fn handleCqe(self: *Self, cqe: linux.io_uring_cqe) !void {
             if (cqe.user_data == INTERNAL_SENTINEL) return;
             if (cqe.user_data == ACCEPT_SENTINEL) {
-                try self.handleAccept(ctx, cqe);
+                try self.handleAccept(cqe);
                 return;
             }
 
             const entity = decodeEntity(cqe.user_data);
-            if (ctx.isStale(entity)) return;
+            if (self.reg.isStale(entity)) return;
 
-            const col_id = ctx.collection_ids[entity.index];
-            const read_pending_id = comptime Ctx.internalIndex(._read_pending);
-            const write_pending_id = comptime Ctx.internalIndex(._write_pending);
-
-            if (col_id == read_pending_id) {
-                try self.handleRecv(ctx, entity, cqe);
-            } else if (col_id == write_pending_id) {
-                try self.handleSend(ctx, entity, cqe);
+            if (self.reg.isInCollection(entity, &self._read_pending)) {
+                try self.handleRecv(entity, cqe);
+            } else if (self.reg.isInCollection(entity, &self._write_pending)) {
+                try self.handleSend(entity, cqe);
             } else if (has_connect) {
-                const connect_socket_id = comptime Ctx.internalIndex(._connect_socket_pending);
-                const connect_pending_id = comptime Ctx.internalIndex(._connect_pending);
-                if (col_id == connect_socket_id) {
-                    try self.handleConnectSocket(ctx, entity, cqe);
-                } else if (col_id == connect_pending_id) {
-                    try self.handleConnect(ctx, entity, cqe);
+                if (self.reg.isInCollection(entity, &self._connect_socket_pending)) {
+                    try self.handleConnectSocket(entity, cqe);
+                } else if (self.reg.isInCollection(entity, &self._connect_pending)) {
+                    try self.handleConnect(entity, cqe);
                 } else {
                     return error.UnexpectedEntityCollection;
                 }
@@ -428,7 +441,7 @@ pub fn Io(comptime Ctx: type) type {
             }
         }
 
-        fn handleAccept(self: *Self, ctx: *Ctx, cqe: linux.io_uring_cqe) !void {
+        fn handleAccept(self: *Self, cqe: linux.io_uring_cqe) !void {
             if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
                 const sqe = try self.ring.get_sqe();
                 sqe.prep_multishot_accept_direct(self.listen_fd, null, null, 0);
@@ -449,52 +462,51 @@ pub fn Io(comptime Ctx: type) type {
             );
             nodelay_sqe.flags |= linux.IOSQE_FIXED_FILE;
 
-            const conn = try ctx.createOneImmediate(.connections);
-            try ctx.set(conn, Fd, .{ .fd = @intCast(file_slot) });
-            self.conn_slots[file_slot] = .{ .entity = conn };
+            const conn = try self.reg.create(&self.connections);
+            try self.reg.set(conn, &self.connections, Fd, .{ .fd = @intCast(file_slot) });
 
             // Create read-cycle entity and link to connection
-            const read_ent = try ctx.createOneImmediate(._read_pending);
-            try ctx.set(read_ent, ConnEntity, .{ .entity = conn });
-            try ctx.set(conn, ReadCycleEntity, .{ .entity = read_ent });
+            const read_ent = try self.reg.create(&self._read_pending);
+            try self.reg.set(read_ent, &self._read_pending, ConnEntity, .{ .entity = conn });
+            try self.reg.set(conn, &self.connections, ReadCycleEntity, .{ .entity = read_ent });
 
             try self.armRecv(read_ent, @intCast(file_slot));
         }
 
-        fn handleRecv(self: *Self, ctx: *Ctx, entity: Entity, cqe: linux.io_uring_cqe) !void {
+        fn handleRecv(self: *Self, entity: Entity, cqe: linux.io_uring_cqe) !void {
             if (cqe.res > 0) {
                 const buf_id = cqe.buffer_id() catch return error.MissingBufferId;
                 const pos = @as(usize, self.buf_size) * buf_id;
                 const buf_ptr: [*]u8 = @ptrCast(self.buf_base[pos..].ptr);
 
-                try ctx.set(entity, ReadResult, .{
+                try self.reg.set(entity, &self._read_pending, ReadResult, .{
                     .result = cqe.res,
                     .data = buf_ptr,
                     .buf_id = buf_id,
                 });
             } else {
-                try ctx.set(entity, ReadResult, .{ .result = cqe.res });
+                try self.reg.set(entity, &self._read_pending, ReadResult, .{ .result = cqe.res });
             }
 
-            try ctx.moveImmediateFrom(entity, ._read_pending, .read_results);
+            try self.reg.moveImmediate(entity, &self._read_pending, &self.read_results);
         }
 
-        fn handleSend(self: *Self, ctx: *Ctx, entity: Entity, cqe: linux.io_uring_cqe) !void {
+        fn handleSend(self: *Self, entity: Entity, cqe: linux.io_uring_cqe) !void {
             if (cqe.res < 0) {
-                try ctx.moveImmediateFrom(entity, ._write_pending, .write_results);
-                try ctx.set(entity, IoResult, .{ .err = cqe.res });
+                try self.reg.moveImmediate(entity, &self._write_pending, &self.write_results);
+                try self.reg.set(entity, &self.write_results, IoResult, .{ .err = cqe.res });
                 return;
             }
 
-            const wb = try ctx.get(entity, WriteBuf);
+            const wb = try self.reg.get(entity, &self._write_pending, WriteBuf);
             wb.offset += @intCast(cqe.res);
 
             if (wb.offset >= wb.len) {
-                try ctx.moveImmediateFrom(entity, ._write_pending, .write_results);
-                try ctx.set(entity, IoResult, .{ .err = 0 });
+                try self.reg.moveImmediate(entity, &self._write_pending, &self.write_results);
+                try self.reg.set(entity, &self.write_results, IoResult, .{ .err = 0 });
             } else {
-                const conn_ent = try ctx.get(entity, ConnEntity);
-                const conn_fd = try ctx.get(conn_ent.entity, Fd);
+                const conn_ent = try self.reg.get(entity, &self._write_pending, ConnEntity);
+                const conn_fd = try self.reg.get(conn_ent.entity, &self.connections, Fd);
                 const sqe = try self.ring.get_sqe();
                 sqe.prep_send(conn_fd.fd, @constCast(wb.data)[wb.offset..wb.len], 0);
                 sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -502,20 +514,18 @@ pub fn Io(comptime Ctx: type) type {
             }
         }
 
-        fn handleConnectSocket(self: *Self, ctx: *Ctx, entity: Entity, cqe: linux.io_uring_cqe) !void {
+        fn handleConnectSocket(self: *Self, entity: Entity, cqe: linux.io_uring_cqe) !void {
             if (!has_connect) unreachable;
 
             if (cqe.res < 0) {
-                // Socket creation failed
-                try ctx.set(entity, IoResult, .{ .err = cqe.res });
-                try ctx.moveStripImmediateFrom(entity, ._connect_socket_pending, .connect_errors, &.{ReadCycleEntity});
+                try self.reg.set(entity, &self._connect_socket_pending, IoResult, .{ .err = cqe.res });
+                try self.reg.moveStripImmediate(entity, &self._connect_socket_pending, &self.connect_errors, &.{ReadCycleEntity});
                 return;
             }
 
             const slot: i32 = cqe.res;
-            try ctx.set(entity, Fd, .{ .fd = slot });
+            try self.reg.set(entity, &self._connect_socket_pending, Fd, .{ .fd = slot });
 
-            // TCP_NODELAY
             const nodelay_sqe = try self.ring.setsockopt(
                 INTERNAL_SENTINEL,
                 slot,
@@ -525,61 +535,43 @@ pub fn Io(comptime Ctx: type) type {
             );
             nodelay_sqe.flags |= linux.IOSQE_FIXED_FILE;
 
-            // Submit connect SQE
-            const ca = try ctx.get(entity, ConnectAddr);
+            const ca = try self.reg.get(entity, &self._connect_socket_pending, ConnectAddr);
             const sqe = try self.ring.get_sqe();
             sqe.prep_connect(slot, &ca.addr.any, ca.addr.getOsSockLen());
             sqe.flags |= linux.IOSQE_FIXED_FILE;
             sqe.user_data = encodeEntity(entity);
 
-            try ctx.moveImmediateFrom(entity, ._connect_socket_pending, ._connect_pending);
+            try self.reg.moveImmediate(entity, &self._connect_socket_pending, &self._connect_pending);
         }
 
-        fn handleConnect(self: *Self, ctx: *Ctx, entity: Entity, cqe: linux.io_uring_cqe) !void {
+        fn handleConnect(self: *Self, entity: Entity, cqe: linux.io_uring_cqe) !void {
             if (!has_connect) unreachable;
 
-            const fd_ptr = try ctx.get(entity, Fd);
+            const fd_ptr = try self.reg.get(entity, &self._connect_pending, Fd);
             const slot = fd_ptr.fd;
 
             if (cqe.res < 0) {
-                // Connect failed — close slot directly, set fd=-1 so destructor skips
                 const close_sqe = try self.ring.get_sqe();
                 close_sqe.prep_close_direct(@intCast(slot));
                 close_sqe.user_data = INTERNAL_SENTINEL;
                 fd_ptr.fd = -1;
-                try ctx.set(entity, IoResult, .{ .err = cqe.res });
-                try ctx.moveStripImmediateFrom(entity, ._connect_pending, .connect_errors, &.{ReadCycleEntity});
+                try self.reg.set(entity, &self._connect_pending, IoResult, .{ .err = cqe.res });
+                try self.reg.moveStripImmediate(entity, &self._connect_pending, &self.connect_errors, &.{ReadCycleEntity});
                 return;
             }
 
-            // Success: create read-cycle entity, arm recv, move to connections
-            self.conn_slots[@intCast(slot)] = .{ .entity = entity };
-
-            const read_ent = try ctx.createOneImmediate(._read_pending);
-            try ctx.set(read_ent, ConnEntity, .{ .entity = entity });
-            try ctx.set(entity, ReadCycleEntity, .{ .entity = read_ent });
+            const read_ent = try self.reg.create(&self._read_pending);
+            try self.reg.set(read_ent, &self._read_pending, ConnEntity, .{ .entity = entity });
+            try self.reg.set(entity, &self._connect_pending, ReadCycleEntity, .{ .entity = read_ent });
 
             try self.armRecv(read_ent, slot);
 
-            // The connect entity becomes the connection
-            try ctx.moveStripImmediateFrom(entity, ._connect_pending, .connections, &.{ ConnectAddr, IoResult });
+            try self.reg.moveStripImmediate(entity, &self._connect_pending, &self.connections, &.{ ConnectAddr, IoResult });
         }
 
         // =============================================================
         // Helpers
         // =============================================================
-
-        fn destroyEntityThunk(ctx_ptr: *anyopaque, entity: Entity) void {
-            const rove_ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
-            if (!rove_ctx.isStale(entity)) {
-                rove_ctx.destroyImmediate(entity) catch {};
-            }
-        }
-
-        fn registerDeinitCtxs(self: *Self, ctx: *Ctx) void {
-            ctx.setDeinitCtx(Fd, &self.cleanup_ctx);
-            ctx.setDeinitCtx(ReadCycleEntity, &self.cleanup_ctx);
-        }
 
         fn armRecv(self: *Self, entity: Entity, file_slot: i32) !void {
             const sqe = try self.ring.get_sqe();
@@ -607,78 +599,66 @@ test "component types are valid rove components" {
     try testing.expectEqual(@as(usize, 7), R.len);
 }
 
-test "spec produces all expected collections" {
-    const S = Collections(.{});
-    try testing.expect(@hasField(S, "connections"));
-    try testing.expect(@hasField(S, "read_results"));
-    try testing.expect(@hasField(S, "write_results"));
-    try testing.expect(@hasField(S, "read_in"));
-    try testing.expect(@hasField(S, "write_in"));
-    try testing.expect(@hasField(S, "_read_pending"));
-    try testing.expect(@hasField(S, "_write_pending"));
+test "Io type has expected collections" {
+    const IoType = Io(.{});
+    try testing.expect(@hasField(IoType, "connections"));
+    try testing.expect(@hasField(IoType, "read_results"));
+    try testing.expect(@hasField(IoType, "write_results"));
+    try testing.expect(@hasField(IoType, "read_in"));
+    try testing.expect(@hasField(IoType, "write_in"));
+    try testing.expect(@hasField(IoType, "_read_pending"));
+    try testing.expect(@hasField(IoType, "_write_pending"));
 }
 
-test "spec with connect" {
-    const S = Collections(.{ .connect = true });
-    try testing.expect(@hasField(S, "connect_in"));
-    try testing.expect(@hasField(S, "connect_errors"));
-    try testing.expect(@hasField(S, "_connect_socket_pending"));
-    try testing.expect(@hasField(S, "_connect_pending"));
+test "Io with connect has connect collections" {
+    const IoType = Io(.{ .connect = true });
+    try testing.expect(@hasField(IoType, "connect_in"));
+    try testing.expect(@hasField(IoType, "connect_errors"));
+    try testing.expect(@hasField(IoType, "_connect_socket_pending"));
+    try testing.expect(@hasField(IoType, "_connect_pending"));
 }
 
-test "spec without connect has no connect collections" {
-    const S = Collections(.{});
-    try testing.expect(!@hasField(S, "connect_in"));
+test "connection row contains base components" {
+    const IoType = Io(.{});
+    try testing.expect(IoType.ConnectionRow.contains(ReadCycleEntity));
+    try testing.expect(IoType.ConnectionRow.contains(Fd));
 }
 
-test "connection row contains ReadCycleEntity" {
-    const S = Collections(.{});
-    try testing.expect(rove.CollectionRow(S, "connections").contains(ReadCycleEntity));
-    try testing.expect(rove.CollectionRow(S, "connections").contains(Fd));
-}
-
-test "spec — user components on connections" {
+test "user components widen connection row" {
     const MySession = struct { id: u64 };
-    const S = Collections(.{ .connection_row = Row(&.{MySession}) });
-    try testing.expect(rove.CollectionRow(S, "connections").contains(Fd));
-    try testing.expect(rove.CollectionRow(S, "connections").contains(ReadCycleEntity));
-    try testing.expect(rove.CollectionRow(S, "connections").contains(MySession));
+    const IoType = Io(.{ .connection_row = Row(&.{MySession}) });
+    try testing.expect(IoType.ConnectionRow.contains(Fd));
+    try testing.expect(IoType.ConnectionRow.contains(ReadCycleEntity));
+    try testing.expect(IoType.ConnectionRow.contains(MySession));
 }
 
-test "spec — internal rows are supersets" {
-    const S = Collections(.{});
-    try testing.expect(rove.CollectionRow(S, "read_results").isSubsetOf(rove.CollectionRow(S, "_read_pending")));
-    try testing.expect(rove.CollectionRow(S, "write_in").isSubsetOf(rove.CollectionRow(S, "_write_pending")));
-    try testing.expect(rove.CollectionRow(S, "_write_pending").isSubsetOf(rove.CollectionRow(S, "write_results")));
+test "internal rows are supersets" {
+    try testing.expect(ReadBaseRow.isSubsetOf(ReadBaseRow)); // read_results ⊆ _read_pending (same row)
+    try testing.expect(WriteInBaseRow.isSubsetOf(WriteResultBaseRow)); // write_in ⊆ write_results (result adds IoResult)
 }
 
-test "spec — connect entity can move to connections" {
-    const S = Collections(.{ .connect = true });
-    try testing.expect(rove.CollectionRow(S, "connections").isSubsetOf(rove.CollectionRow(S, "_connect_pending")));
+test "connect entity row is superset of connection row" {
+    const conn_row = ConnectionBaseRow;
+    const connect_pending_row = ConnectInBaseRow.merge(Row(&.{}));
+    try testing.expect(conn_row.isSubsetOf(connect_pending_row));
 }
 
-test "spec — merges with user collections and creates Context" {
+test "works with user collections on same registry" {
     const MySession = struct { id: u64 };
     const PlayerRow = Row(&.{MySession});
-    const AppSpec = rove.MakeCollections(&.{rove.col("players", rove.Collection(PlayerRow, .{}))});
-    const Spec = rove.MergeCollections(.{ Collections(.{ .connection_row = Row(&.{MySession}) }), AppSpec });
 
-    const Ctx = rove.Context(Spec);
-    var ctx = try Ctx.init(testing.allocator, .{ .max_entities = 64 });
-    defer ctx.deinit();
+    var reg = try Registry.init(testing.allocator, .{ .max_entities = 64 });
+    defer reg.deinit();
 
-    const conn = try ctx.createOne(.connections);
-    const player = try ctx.createOne(.players);
-    try ctx.flush();
+    // User collection on the same registry
+    var players = try Collection(PlayerRow, .{}).init(testing.allocator);
+    defer players.deinit();
+    reg.registerCollection(&players);
 
-    try testing.expect(!ctx.isStale(conn));
-    try testing.expect(!ctx.isStale(player));
-
-    try ctx.set(conn, Fd, .{ .fd = 42 });
-    try ctx.set(conn, MySession, .{ .id = 99 });
-    const fd = try ctx.get(conn, Fd);
-    const sess = try ctx.get(conn, MySession);
-    try testing.expectEqual(@as(i32, 42), fd.fd);
+    const player = try reg.create(&players);
+    try testing.expect(!reg.isStale(player));
+    try reg.set(player, &players, MySession, .{ .id = 99 });
+    const sess = try reg.get(player, &players, MySession);
     try testing.expectEqual(@as(u64, 99), sess.id);
 }
 

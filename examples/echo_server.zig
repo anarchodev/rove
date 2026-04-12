@@ -1,41 +1,38 @@
 const std = @import("std");
-const rove = @import("rove");
+const rove = @import("rove2");
 const rio = @import("rove-io");
 
-const Ctx = rove.Context(rio.Collections(.{}));
+const MyIo = rio.Io(.{});
 
-const MyIo = rio.Io(Ctx);
-
-fn processReads(ctx: *Ctx, alloc: std.mem.Allocator) !void {
+fn processReads(io: *MyIo, reg: *rove.Registry, alloc: std.mem.Allocator) !void {
     for (
-        ctx.entities(.read_results),
-        ctx.column(.read_results, rio.ConnEntity),
-        ctx.column(.read_results, rio.ReadResult),
+        io.read_results.entitySlice(),
+        io.read_results.column(rio.ConnEntity),
+        io.read_results.column(rio.ReadResult),
     ) |ent, conn_ent, result| {
         if (result.result > 0) {
             const data_len: u32 = @intCast(result.result);
             const copy = try alloc.alloc(u8, data_len);
             @memcpy(copy, result.data.?[0..data_len]);
 
-            const we = try ctx.createOneImmediate(.write_in);
-            try ctx.set(we, rio.ConnEntity, conn_ent);
-            try ctx.set(we, rio.WriteBuf, .{
+            const we = try reg.create(&io.write_in);
+            try reg.set(we, &io.write_in, rio.ConnEntity, conn_ent);
+            try reg.set(we, &io.write_in, rio.WriteBuf, .{
                 .data = copy.ptr,
                 .len = data_len,
             });
 
-            try ctx.moveOneFrom(ent, .read_results, .read_in);
+            try reg.move(ent, &io.read_results, &io.read_in);
         } else {
-            try ctx.destroyOne(conn_ent.entity);
-            try ctx.destroyOne(ent);
+            try reg.destroy(conn_ent.entity);
+            try reg.destroy(ent);
         }
     }
 }
 
-fn processWrites(ctx: *Ctx) !void {
-    for (ctx.entities(.write_results)) |ent| {
-        // WriteBuf.deinit frees the data on entity destroy
-        try ctx.destroyOne(ent);
+fn processWrites(io: *MyIo, reg: *rove.Registry) !void {
+    for (io.write_results.entitySlice()) |ent| {
+        try reg.destroy(ent);
     }
 }
 
@@ -44,14 +41,14 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var ctx = try Ctx.init(alloc, .{
+    var reg = try rove.Registry.init(alloc, .{
         .max_entities = 4096,
         .deferred_queue_capacity = 1024,
     });
-    defer ctx.deinit();
+    defer reg.deinit();
 
     const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080);
-    const io = try MyIo.create(&ctx, alloc, addr, .{
+    const io = try MyIo.create(&reg, alloc, addr, .{
         .max_connections = 256,
         .buf_count = 256,
         .buf_size = 4096,
@@ -61,10 +58,10 @@ pub fn main() !void {
     std.debug.print("Echo server listening on 127.0.0.1:8080\n", .{});
 
     while (true) {
-        _ = try io.poll(&ctx, 1);
-        try processReads(&ctx, alloc);
-        try ctx.flush();
-        try processWrites(&ctx);
-        try ctx.flush();
+        _ = try io.poll(1);
+        try processReads(io, &reg, alloc);
+        try reg.flush();
+        try processWrites(io, &reg);
+        try reg.flush();
     }
 }
