@@ -9,6 +9,7 @@ const std = @import("std");
 ///   comptime { assert(Subset.isSubsetOf(MyRow)); }
 ///
 pub fn Row(comptime input: []const type) type {
+    @setEvalBranchQuota(100_000);
     const sorted = comptime sortAndDedup(input);
     return struct {
         /// The canonical sorted, deduplicated component types.
@@ -45,6 +46,21 @@ pub fn Row(comptime input: []const type) type {
         /// Returns a new Row that is the union of this row and Other.
         pub fn merge(comptime Other: type) type {
             return Row(&(types ++ Other.types));
+        }
+
+        /// Returns a new Row containing only types present in both this row and Other.
+        pub fn intersect(comptime Other: type) type {
+            comptime {
+                var buf: [len]type = undefined;
+                var count: usize = 0;
+                for (types) |T| {
+                    if (Other.contains(T)) {
+                        buf[count] = T;
+                        count += 1;
+                    }
+                }
+                return Row(buf[0..count]);
+            }
         }
 
         /// Returns a new Row with the given types removed.
@@ -120,9 +136,12 @@ fn componentHasInit(comptime T: type) bool {
     const info = @typeInfo(@TypeOf(@field(T, "init")));
     if (info != .@"fn") return false;
     const f = info.@"fn";
-    if (f.params.len != 0) return false;
-    if (f.return_type != T) return false;
-    return true;
+    if (f.return_type != void) return false;
+    if (f.params.len == 1 and f.params[0].type == []T) return true;
+    if (f.params.len == 2 and f.params[0].type == []T and @hasDecl(T, "InitCtx")) {
+        return f.params[1].type == *T.InitCtx;
+    }
+    return false;
 }
 
 fn componentHasDeinit(comptime T: type) bool {
@@ -130,10 +149,25 @@ fn componentHasDeinit(comptime T: type) bool {
     const info = @typeInfo(@TypeOf(@field(T, "deinit")));
     if (info != .@"fn") return false;
     const f = info.@"fn";
-    if (f.params.len != 1) return false;
-    if (f.params[0].type != *T) return false;
     if (f.return_type != void) return false;
-    return true;
+    const Alloc = std.mem.Allocator;
+    // deinit(allocator, items)
+    if (f.params.len == 2 and f.params[0].type == Alloc and f.params[1].type == []T) return true;
+    // deinit(allocator, items, ctx)
+    if (f.params.len == 3 and f.params[0].type == Alloc and f.params[1].type == []T and @hasDecl(T, "DeinitCtx")) {
+        return f.params[2].type == *T.DeinitCtx;
+    }
+    return false;
+}
+
+/// Returns true if T.init requires a context parameter (*T.InitCtx).
+pub fn componentInitNeedsCtx(comptime T: type) bool {
+    return @hasDecl(T, "InitCtx") and componentHasInit(T);
+}
+
+/// Returns true if T.deinit requires a context parameter (*T.DeinitCtx).
+pub fn componentDeinitNeedsCtx(comptime T: type) bool {
+    return @hasDecl(T, "DeinitCtx") and componentHasDeinit(T);
 }
 
 fn typeNameLessThan(comptime a: type, comptime b: type) bool {
@@ -219,12 +253,14 @@ const Health = struct {
     current: i32,
     max: i32,
 
-    pub fn init() Health {
-        return .{ .current = 100, .max = 100 };
+    pub fn init(items: []Health) void {
+        for (items) |*item| {
+            item.* = .{ .current = 100, .max = 100 };
+        }
     }
 
-    pub fn deinit(self: *Health) void {
-        _ = self;
+    pub fn deinit(_: std.mem.Allocator, items: []Health) void {
+        _ = items;
     }
 };
 const Tag = struct {}; // zero-sized
@@ -362,6 +398,30 @@ test "chained operations" {
     try expect(Stripped.equal(Row(&.{ Position, Velocity })));
     try expect(Stripped.isSubsetOf(Full));
     try expect(!Full.isSubsetOf(Stripped));
+}
+
+test "intersect — overlapping" {
+    const A = Row(&.{ Position, Velocity, Health });
+    const B = Row(&.{ Velocity, Health, Tag });
+    try expect(A.intersect(B).equal(Row(&.{ Velocity, Health })));
+}
+
+test "intersect — disjoint" {
+    const A = Row(&.{ Position, Velocity });
+    const B = Row(&.{ Health, Tag });
+    try expectEqual(0, A.intersect(B).len);
+}
+
+test "intersect — identical" {
+    const A = Row(&.{ Position, Velocity });
+    try expect(A.intersect(A).equal(A));
+}
+
+test "intersect — empty" {
+    const A = Row(&.{ Position, Velocity });
+    const E = Row(&.{});
+    try expectEqual(0, A.intersect(E).len);
+    try expectEqual(0, E.intersect(A).len);
 }
 
 test "zero-sized component" {
