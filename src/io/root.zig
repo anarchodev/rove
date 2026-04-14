@@ -95,6 +95,7 @@ const ConnectErrorBaseRow = Row(&.{ ConnectAddr, Fd, IoResult });
 
 const ACCEPT_SENTINEL: u64 = std.math.maxInt(u64);
 const INTERNAL_SENTINEL: u64 = std.math.maxInt(u64) - 1;
+const TIMEOUT_SENTINEL: u64 = std.math.maxInt(u64) - 2;
 
 fn encodeEntity(entity: Entity) u64 {
     return @as(u64, entity.generation) << 32 | @as(u64, entity.index);
@@ -358,6 +359,52 @@ pub fn Io(comptime opts: Options) type {
             return events;
         }
 
+        /// Like `poll(1)` but with a wall-clock upper bound on how long
+        /// `submit_and_wait` will block. Submits a one-shot timeout SQE
+        /// that produces a CQE after `timeout_ns` nanoseconds; the
+        /// timeout CQE is recognized by `handleCqe` and discarded so it
+        /// doesn't leak into the user's event count.
+        ///
+        /// Use this from outer poll loops that have **external** state
+        /// needing periodic attention (parked entities waiting on a
+        /// raft commit, timers, work fed in from another thread).
+        /// Without a timeout you'd either block forever (`poll(1)`) or
+        /// burn CPU spinning (`poll(0)` + `sleep`). With a timeout you
+        /// get bounded latency on external state AND immediate wake on
+        /// real I/O. Per the rove-library "Poll Blocking Is the
+        /// Caller's Call" rule — the library still doesn't decide,
+        /// it just gives you a richer primitive to express the choice.
+        pub fn pollWithTimeout(self: *Self, timeout_ns: u64) !u32 {
+            try self.processWriteIn();
+            try self.processReadIn();
+            if (has_connect) try self.processConnectIn();
+            try self.reg.flush();
+
+            const ts: linux.kernel_timespec = .{
+                .sec = @intCast(timeout_ns / std.time.ns_per_s),
+                .nsec = @intCast(timeout_ns % std.time.ns_per_s),
+            };
+            // count=0 means "fire only on time expiration"; flags=0 is
+            // a relative timeout. The CQE arrives with res=-ETIME and
+            // user_data=TIMEOUT_SENTINEL, which handleCqe drops.
+            _ = try self.ring.timeout(TIMEOUT_SENTINEL, &ts, 0, 0);
+
+            _ = try self.ring.submit_and_wait(1);
+
+            var cqe_buf: [256]linux.io_uring_cqe = undefined;
+            var events: u32 = 0;
+            while (true) {
+                const count = try self.ring.copy_cqes(&cqe_buf, 0);
+                if (count == 0) break;
+                for (cqe_buf[0..count]) |cqe| {
+                    try self.handleCqe(cqe);
+                    if (cqe.user_data != TIMEOUT_SENTINEL) events += 1;
+                }
+            }
+
+            return events;
+        }
+
         // =============================================================
         // Input processing (deferred ops, forward iteration)
         // =============================================================
@@ -449,6 +496,7 @@ pub fn Io(comptime opts: Options) type {
 
         fn handleCqe(self: *Self, cqe: linux.io_uring_cqe) !void {
             if (cqe.user_data == INTERNAL_SENTINEL) return;
+            if (cqe.user_data == TIMEOUT_SENTINEL) return;
             if (cqe.user_data == ACCEPT_SENTINEL) {
                 try self.handleAccept(cqe);
                 return;

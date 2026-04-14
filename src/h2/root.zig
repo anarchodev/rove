@@ -1062,6 +1062,23 @@ pub fn H2(comptime opts: Options) type {
         }
 
         pub fn poll(self: *Self, min_complete: u32) !void {
+            try self.pollPrelude();
+            // Phase 3: io.poll submits pending writes and (optionally) waits for CQEs.
+            _ = try self.io.poll(min_complete);
+            try self.pollPostlude();
+        }
+
+        /// Like `poll(1)` but with a wall-clock upper bound. Used by
+        /// outer poll loops with external state needing periodic
+        /// attention — see rove-io's `pollWithTimeout` doc and
+        /// rove-library memory rule #13.
+        pub fn pollWithTimeout(self: *Self, timeout_ns: u64) !void {
+            try self.pollPrelude();
+            _ = try self.io.pollWithTimeout(timeout_ns);
+            try self.pollPostlude();
+        }
+
+        fn pollPrelude(self: *Self) !void {
             // Phase 1: Consume user inputs queued between polls (responses, chunks).
             // Must run before io.poll so the writes they generate can be submitted
             // in the same iteration.
@@ -1082,9 +1099,9 @@ pub fn H2(comptime opts: Options) type {
             // write_in entities that io.poll will submit below.
             try self.driveAllSends();
             try self.reg.flush();
+        }
 
-            // Phase 3: io.poll submits pending writes and (optionally) waits for CQEs.
-            _ = try self.io.poll(min_complete);
+        fn pollPostlude(self: *Self) !void {
 
             // Phase 4: Triage reads that just arrived.
             try self.readsTriage();
