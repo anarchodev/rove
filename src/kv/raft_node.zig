@@ -158,6 +158,27 @@ pub const Config = struct {
     /// write to the local KvStore AFTER committedSeq advances, i.e. the
     /// non-optimistic path). Must be ≤ MAX_WORKERS.
     worker_count: u32 = 0,
+    /// Maximum wall-clock time the raft thread will hold pending
+    /// proposals before packing them into a raft entry + fsync'ing.
+    /// Larger values amortize each fsync across more proposals, raising
+    /// the write-throughput ceiling in exchange for up to this much
+    /// added commit latency. 0 disables linger entirely (the default):
+    /// every tick submits whatever it finds, ~1000 fsync/sec max.
+    ///
+    /// Under heavy write load at multi-worker scale, the raft thread's
+    /// per-tick fsync becomes the hard ceiling — no amount of worker
+    /// parallelism helps because every writeset funnels through one
+    /// raft log. Setting this to a few hundred µs to a few ms trades
+    /// a small amount of p99 commit latency for 3–5× higher write
+    /// throughput. Suggested values: 500_000 (500 µs) for balanced,
+    /// 2_000_000 (2 ms) for max throughput.
+    propose_linger_ns: u64 = 0,
+    /// Cap on how big a linger-accumulated batch is allowed to get.
+    /// If the queue reaches this many items we submit immediately
+    /// regardless of how much of `propose_linger_ns` has elapsed —
+    /// preventing runaway queue growth under bursty load. Must be
+    /// > 0 if `propose_linger_ns` is non-zero.
+    propose_linger_max_batch: usize = 128,
 };
 
 /// Hard cap on worker_count. Matches shift-js's MAX_WORKERS.
@@ -408,6 +429,15 @@ pub const RaftNode = struct {
     /// `[8B seq][body]` allocations; freed on submit or on leadership loss.
     /// Raft-thread-only; no synchronization needed.
     drain_buf: std.ArrayList([]u8),
+
+    /// `std.time.nanoTimestamp()` at the moment `drain_buf` first became
+    /// non-empty in the current linger window. Used by
+    /// `drainAndSubmitProposals` to decide whether `propose_linger_ns`
+    /// has elapsed for the oldest pending proposal. 0 when `drain_buf`
+    /// is empty; set on the tick that pulls the first item off the MPSC
+    /// queue; cleared once the batch is fully submitted. Raft-thread-
+    /// only; no synchronization needed.
+    linger_start_ns: i128 = 0,
 
     /// Most recent WAL frame count reported by a passive checkpoint. Raft-
     /// thread-only; exposed via `walLogPages()` for observability. Zero
@@ -1048,11 +1078,39 @@ pub const RaftNode = struct {
     /// every entry with seq ≤ safe_seq into one or more batch envelopes,
     /// submit each as a single raft log entry, and leave the rest buffered
     /// for a future tick.
+    ///
+    /// If `config.propose_linger_ns > 0`, the submit step is delayed
+    /// until EITHER the oldest pending proposal has waited
+    /// `propose_linger_ns`, OR `drain_buf` has accumulated
+    /// `propose_linger_max_batch` items. This amortizes the per-tick
+    /// `raft_recv_entry` → SQLite `COMMIT` → `fsync` across more
+    /// proposals under write-heavy load, at the cost of up to
+    /// `propose_linger_ns` added commit latency.
     fn drainAndSubmitProposals(self: *RaftNode) !void {
+        const was_empty = self.drain_buf.items.len == 0;
         while (self.queue.pop()) |framed| {
             try self.drain_buf.append(self.allocator, framed);
         }
-        if (self.drain_buf.items.len == 0) return;
+        if (self.drain_buf.items.len == 0) {
+            self.linger_start_ns = 0;
+            return;
+        }
+
+        // Linger gate: hold small batches until either the time cap or
+        // the size cap fires. If linger is disabled (the default) this
+        // block is a no-op.
+        if (self.config.propose_linger_ns > 0) {
+            if (was_empty) {
+                self.linger_start_ns = std.time.nanoTimestamp();
+            }
+            const now = std.time.nanoTimestamp();
+            const waited_ns: i128 = now - self.linger_start_ns;
+            const batch_full = self.drain_buf.items.len >= self.config.propose_linger_max_batch;
+            const time_up = waited_ns >= @as(i128, @intCast(self.config.propose_linger_ns));
+            if (!batch_full and !time_up) {
+                return;
+            }
+        }
 
         const Helper = struct {
             fn lessThan(_: void, a: []u8, b: []u8) bool {
@@ -1109,6 +1167,11 @@ pub const RaftNode = struct {
             );
         }
         self.drain_buf.shrinkRetainingCapacity(remaining);
+        // If we emptied drain_buf the linger window is closed; a future
+        // non-empty pull will open a fresh window. If items remain
+        // (non-eligible leftovers blocked by safeSeq) we keep the
+        // existing window so they don't wait an extra linger cycle.
+        if (remaining == 0) self.linger_start_ns = 0;
     }
 
     /// Encode the given sorted queue entries as a batch envelope. Caller

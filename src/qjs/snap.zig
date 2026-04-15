@@ -274,10 +274,33 @@ pub const Snapshot = struct {
     old_base: [*]const u8,
     rt_offset: usize,
     ctx_offset: usize,
+    /// Pre-relocated image cache. Populated the first time `restore`
+    /// is called for a given target arena base, used by every
+    /// subsequent restore into the same base to skip the bitmap walk
+    /// (~1.7 µs/restore in Phase 0 benchmarks; ~4% of throughput on a
+    /// complex handler at 25k req/s). A second-time hit just memcpys
+    /// `reloc_cache.data` into the target and is otherwise identical
+    /// to the slow path.
+    ///
+    /// Null until the first restore. Dropped and rebuilt if `restore`
+    /// is ever called with a different target base (not expected in
+    /// normal use — the dispatcher binds one arena to one snapshot).
+    reloc_cache: ?RelocCache = null,
+
+    const RelocCache = struct {
+        data: []u8, // same length as self.data, bytes relocated for `base`
+        base: [*]const u8, // target.data.ptr this cache is valid for
+    };
+
+    pub const Restored = struct {
+        runtime: root.Runtime,
+        context: root.Context,
+    };
 
     pub fn deinit(self: *Snapshot) void {
         self.allocator.free(self.data);
         self.allocator.free(self.bitmap);
+        if (self.reloc_cache) |cache| self.allocator.free(cache.data);
         self.* = undefined;
     }
 
@@ -390,19 +413,39 @@ pub const Snapshot = struct {
     }
 
     /// Restore a snapshot into `target`. Memcpy's the frozen image,
-    /// relocates pointers via the bitmap, re-seeds volatile slots from
-    /// the current wall clock, and returns the rebuilt Runtime/Context.
+    /// relocates pointers (first call into a given arena only), re-
+    /// seeds volatile slots from the current wall clock, and returns
+    /// the rebuilt Runtime/Context.
+    ///
+    /// Fast path: if we already cached a pre-relocated image for this
+    /// exact target base, skip the bitmap walk entirely and memcpy
+    /// directly from the cache. Slow path runs the walk and populates
+    /// the cache so the next call hits the fast path.
     ///
     /// The returned `Runtime` wraps the reconstructed `JSRuntime*`. Do
     /// NOT call `Runtime.deinit` on it — the memory is owned by the
     /// arena, not by QuickJS's normal free path. Reset the arena instead
     /// (or restore a new snapshot over the top).
     pub fn restore(
-        self: *const Snapshot,
+        self: *Snapshot,
         target: *Arena,
-    ) Error!struct { runtime: root.Runtime, context: root.Context } {
-        // memcpy the full frozen image. Byte 0..8 holds the bump used
-        // counter, so target.used() is automatically restored too.
+    ) Error!Restored {
+        // Fast path: already-relocated cache valid for this target base.
+        if (self.reloc_cache) |cache| {
+            if (cache.base == target.data.ptr) {
+                @memcpy(target.data[0..cache.data.len], cache.data);
+                return self.finishRestore(target);
+            }
+            // Stale cache (caller switched target arenas). Drop it and
+            // fall through to the slow path, which will rebuild for
+            // the new base.
+            self.allocator.free(cache.data);
+            self.reloc_cache = null;
+        }
+
+        // Slow path: memcpy the frozen image, then walk the bitmap to
+        // relocate pointers into this target base. Byte 0..8 holds the
+        // bump used counter, so target.used() is automatically restored.
         @memcpy(target.data[0..self.data.len], self.data);
 
         const new_base: i64 = @intCast(@intFromPtr(target.data.ptr));
@@ -425,6 +468,21 @@ pub const Snapshot = struct {
             }
         }
 
+        // Populate the cache from the now-relocated bytes in the target
+        // arena. Best-effort — on OOM we keep running (every restore
+        // just stays on the slow path, no correctness impact).
+        if (self.allocator.alloc(u8, self.data.len)) |cache_buf| {
+            @memcpy(cache_buf, target.data[0..self.data.len]);
+            self.reloc_cache = .{ .data = cache_buf, .base = target.data.ptr };
+        } else |_| {}
+
+        return self.finishRestore(target);
+    }
+
+    fn finishRestore(
+        self: *const Snapshot,
+        target: *Arena,
+    ) Error!Restored {
         const rt_ptr: *c.JSRuntime = @ptrCast(@alignCast(target.data[self.rt_offset..].ptr));
         const ctx_ptr: *c.JSContext = @ptrCast(@alignCast(target.data[self.ctx_offset..].ptr));
 
