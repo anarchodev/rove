@@ -72,10 +72,10 @@ pub const drainRaftPending = worker.drainRaftPending;
 pub const refreshDeployments = worker.refreshDeployments;
 pub const cleanupResponses = worker.cleanupResponses;
 pub const flushLogs = worker.flushLogs;
-pub const connectCodeServer = worker.connectCodeServer;
-pub const ingestCodeConnects = worker.ingestCodeConnects;
-pub const flushCodeProxyPending = worker.flushCodeProxyPending;
-pub const drainCodeProxyResponses = worker.drainCodeProxyResponses;
+pub const connectProxies = worker.connectProxies;
+pub const ingestProxyConnects = worker.ingestProxyConnects;
+pub const flushProxyPending = worker.flushProxyPending;
+pub const drainProxyResponses = worker.drainProxyResponses;
 
 test {
     _ = dispatcher;

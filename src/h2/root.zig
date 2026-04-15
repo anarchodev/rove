@@ -252,8 +252,21 @@ const Stream = struct {
 
     fn bodyAppend(self: *Stream, data: [*]const u8, len: usize) bool {
         const need: u32 = @intCast(len);
-        if (self.body_len + need > self.body_cap) {
-            const new_cap = if (self.body_cap > 0) self.body_cap * 2 else 4096;
+        const required = self.body_len + need;
+        if (required > self.body_cap) {
+            // Grow to AT LEAST `required`, not just one doubling
+            // past the old capacity. A single inbound DATA frame can
+            // be larger than `body_cap * 2` — for example an empty
+            // stream (body_cap=0) receiving a 6 KB chunk on the
+            // first call. Only doubling once leaves `new_cap = 4096`
+            // while the memcpy below writes 6 KB, overrunning by 2 KB
+            // and corrupting whatever allocation sits next in the
+            // heap. The canary on that allocation then fails on its
+            // next free, and you get an "Invalid free" panic several
+            // code paths away from the actual bug. Loop until the
+            // new capacity actually covers `required`.
+            var new_cap: u32 = if (self.body_cap > 0) self.body_cap else 4096;
+            while (new_cap < required) new_cap *= 2;
             const old = if (self.body_data) |p| p[0..self.body_cap] else @as([]u8, &.{});
             const new_buf = self.allocator.realloc(old, new_cap) catch return false;
             self.body_data = new_buf.ptr;
@@ -1764,26 +1777,57 @@ pub fn H2(comptime opts: Options) type {
                         };
                     }
                 } else {
+                    // Accumulate ALL frames nghttp2 wants to send into a
+                    // single buffer + single write. Without this, HEADERS
+                    // + DATA for each response become separate `prep_send`
+                    // SQEs and therefore separate TCP segments, and the
+                    // client's delayed-ACK stalls every request-response
+                    // round trip by ~40 ms. Mirrors the TLS path above.
+                    var accum_buf: [65536]u8 = undefined;
+                    var accum_len: usize = 0;
+                    var broke = false;
+
                     while (true) {
                         var frame_data: [*c]const u8 = undefined;
                         const len = c.nghttp2_session_mem_send(ng_session, &frame_data);
                         if (len < 0) {
                             try self.reg.destroy(ent);
+                            broke = true;
                             break;
                         }
                         if (len == 0) break;
+                        const flen: usize = @intCast(len);
+                        if (accum_len + flen > accum_buf.len) {
+                            // Flush what we have so far, then continue
+                            // with a fresh buffer. Big responses can still
+                            // fan out into multiple segments — that's OK,
+                            // Nagle only bites on tiny trailing fragments.
+                            const copy = self.allocator.dupe(u8, accum_buf[0..accum_len]) catch {
+                                try self.reg.destroy(ent);
+                                broke = true;
+                                break;
+                            };
+                            self.submitWrite(ent, copy) catch {
+                                self.allocator.free(copy);
+                                try self.reg.destroy(ent);
+                                broke = true;
+                                break;
+                            };
+                            accum_len = 0;
+                        }
+                        @memcpy(accum_buf[accum_len .. accum_len + flen], frame_data[0..flen]);
+                        accum_len += flen;
+                    }
 
-                        const copy_len: u32 = @intCast(len);
-                        const copy = self.allocator.alloc(u8, copy_len) catch {
+                    if (!broke and accum_len > 0) {
+                        const copy = self.allocator.dupe(u8, accum_buf[0..accum_len]) catch {
                             try self.reg.destroy(ent);
-                            break;
+                            continue;
                         };
-                        @memcpy(copy, frame_data[0..copy_len]);
-
                         self.submitWrite(ent, copy) catch {
                             self.allocator.free(copy);
                             try self.reg.destroy(ent);
-                            break;
+                            continue;
                         };
                     }
                 }
@@ -1807,7 +1851,22 @@ pub fn H2(comptime opts: Options) type {
                     try self.reg.move(ent, &self.client_connect_in, &self.client_connect_errors);
                     continue;
                 };
-                try self.reg.set(ce, &self.io.connect_in, rio.ConnectAddr, .{ .addr = target.addr });
+
+                // Heap-allocate the target address so the pointer we
+                // hand io_uring is stable across swap-remove. Ownership
+                // transfers to the `ConnectAddr` component; its deinit
+                // frees the allocation when the entity is destroyed or
+                // the component is stripped during `moveStripImmediate`
+                // on connect success.
+                const addr_ptr = self.allocator.create(std.net.Address) catch {
+                    try self.reg.destroy(ce);
+                    try self.reg.set(ent, &self.client_connect_in, H2IoResult, .{ .err = -1 });
+                    try self.reg.move(ent, &self.client_connect_in, &self.client_connect_errors);
+                    continue;
+                };
+                addr_ptr.* = target.addr;
+
+                try self.reg.set(ce, &self.io.connect_in, rio.ConnectAddr, .{ .addr = addr_ptr });
                 try self.reg.set(ce, &self.io.connect_in, Conn, .{ .direction = .client, .pending_connect_entity = ent });
 
                 try self.reg.move(ent, &self.client_connect_in, &self._client_connect_pending);

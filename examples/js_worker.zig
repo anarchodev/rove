@@ -41,6 +41,7 @@ const kv = @import("rove-kv");
 const blob_mod = @import("rove-blob");
 const code_mod = @import("rove-code");
 const code_server = @import("rove-code-server");
+const log_server = @import("rove-log-server");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
 
@@ -258,16 +259,18 @@ pub fn main() !void {
 
     // ── Raft setup ─────────────────────────────────────────────────────
     //
-    // ApplyCtx is patched twice after construction:
-    //   - `raft` is filled once `RaftNode.init` returns
-    //   - `log_lookup` and `log_lookup_ctx` are filled once Worker.create
-    //     returns (the worker owns the per-tenant log map)
-    var apply_ctx = rjs.apply.ApplyCtx{
-        .tenant = &tenant,
-        .raft = undefined,
-        .log_lookup = null,
-        .log_lookup_ctx = null,
-    };
+    // ApplyCtx is raft-thread-local: it owns its own per-tenant sqlite
+    // connections, opened lazily on follower applies. These are
+    // DISTINCT from any worker's connections, so the raft thread and
+    // the worker thread never share a NOMUTEX sqlite connection.
+    //
+    // Chicken-and-egg: ApplyCtx needs a `*RaftNode`, RaftNode needs
+    // an apply ctx pointer. Workaround: construct RaftNode first with
+    // a sentinel ctx, then once init returns patch the real ctx's
+    // `raft` field and swap the callback pointer before spawning the
+    // raft thread. (Same pattern as before, just without the extra
+    // `log_lookup` patch.)
+    var apply_ctx: rjs.apply.ApplyCtx = undefined;
 
     const peers = try parsePeerList(allocator, cli.peers);
     defer {
@@ -298,17 +301,24 @@ pub fn main() !void {
         .worker_count = 0,
     });
     defer raft_node.deinit();
-    apply_ctx.raft = raft_node;
 
-    // ── Code-server thread ────────────────────────────────────────────
+    apply_ctx = rjs.apply.ApplyCtx.init(allocator, cli.data_dir, raft_node);
+    defer apply_ctx.deinit();
+
+    // ── Code-server + log-server threads ──────────────────────────────
     //
-    // Spawn the in-process rove-code-server thread BEFORE the worker
-    // so the worker can connect to it during startup. The thread owns
-    // its own registry + io_uring + h2 server; the worker talks to it
-    // as an HTTP/2 client over a loopback TCP port.
+    // Spawn both subsystem threads BEFORE the worker so the worker
+    // can open client connections to them during startup. Each owns
+    // its own rove context (registry + io_uring + h2 server) and
+    // binds to a loopback TCP ephemeral port. The worker talks to
+    // them as two independent HTTP/2 clients.
     const cs_handle = try code_server.thread.spawn(allocator, cli.data_dir);
     defer cs_handle.shutdown();
     const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
+
+    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir);
+    defer ls_handle.shutdown();
+    const log_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ls_handle.port);
 
     // ── HTTP/2 worker ──────────────────────────────────────────────────
 
@@ -320,15 +330,9 @@ pub fn main() !void {
         .addr = http_addr,
         .io_opts = .{ .max_connections = 256, .buf_count = 256, .buf_size = 16384 },
         .code_addr = code_addr,
+        .log_addr = log_addr,
     });
     defer worker.destroy();
-
-    // Patch the apply ctx so log batch envelopes can find the worker's
-    // per-tenant LogStores. Must happen BEFORE the raft thread is spawned
-    // — otherwise an early apply callback could see log_lookup=null and
-    // drop a batch.
-    apply_ctx.log_lookup = Worker.logLookup;
-    apply_ctx.log_lookup_ctx = worker;
 
     // Now spawn the raft thread.
     var raft_thread = try std.Thread.spawn(.{}, raftThreadMain, .{raft_node});
@@ -362,12 +366,12 @@ pub fn main() !void {
         // before flush (so a connection that just came up is usable
         // in the same tick), and drain after flush (so responses
         // that came back in the same tick flow onward).
-        try rjs.connectCodeServer(worker);
-        try rjs.ingestCodeConnects(worker);
+        try rjs.connectProxies(worker);
+        try rjs.ingestProxyConnects(worker);
         try reg.flush();
-        try rjs.flushCodeProxyPending(worker);
+        try rjs.flushProxyPending(worker);
         try reg.flush();
-        try rjs.drainCodeProxyResponses(worker);
+        try rjs.drainProxyResponses(worker);
         try reg.flush();
 
         try rjs.dispatchPending(worker);

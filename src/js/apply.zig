@@ -1,43 +1,54 @@
 //! Apply callback for the worker's raft state machine.
 //!
-//! ## Wire format (Phase 3 — type byte added)
+//! ## Wire format
 //!
 //! Every envelope the worker proposes is:
 //!
 //!   `[1B type][2B id_len BE][id bytes][payload]`
 //!
-//! `type=0` → writeset (existing path; payload is `WriteSet.encode` bytes)
-//! `type=1` → log batch (Phase 3; payload is `LogStore.drainBatch` bytes)
+//! `type=0` → writeset (payload is `WriteSet.encode` bytes)
+//! `type=1` → log batch (payload is `LogStore.drainBatch` bytes)
 //!
-//! The `id` is the tenant `instance_id`. `id_len` caps at 64KB (way
-//! more than `MAX_INSTANCE_ID_LEN`). The trailing `payload` is whatever
-//! the dispatch callback for that type knows how to decode.
+//! The `id` is the tenant `instance_id`. `id_len` caps at 64KB. The
+//! trailing `payload` is whatever the dispatch callback for that
+//! type knows how to decode.
 //!
 //! ## Dispatch by type
 //!
-//! `applyOne` reads the type byte first, then routes:
-//!
-//! - **type=0 writeset**: leader-skips (because the dispatcher's open
+//! - **type=0 writeset**: leader-skips (because the worker's open
 //!   `TrackedTxn` already wrote locally), follower replays through
-//!   `kv.applyEncodedWriteSet` against the resolved tenant store.
-//! - **type=1 log batch**: NOT leader-skipped (logs are not held in any
-//!   open transaction). Both leader and followers decode the batch and
-//!   write each record into the tenant's local `log.db`. The log
-//!   lookup is delegated to a caller-provided function pointer so this
-//!   file doesn't have to know about the worker's generic type.
+//!   `kv.applyEncodedWriteSet` against the apply context's own
+//!   per-tenant kv store.
+//! - **type=1 log batch**: ALSO leader-skips — the worker h2 thread
+//!   is the sole writer to its own log.db on the leader, and running
+//!   this apply there would race on the same NOMUTEX sqlite
+//!   connection. Followers see this as the only code path writing
+//!   log.db, so their raft thread is safely the sole writer.
 //!
-//! ## Threading
+//! ## Threading model — strict isolation from worker state
 //!
-//! `applyOne` is invoked by `RaftNode`'s apply callback, which runs on
-//! the raft thread. Tenant store handles are also read by the
-//! dispatcher from the main h2 thread. We rely on SQLite's default
-//! SERIALIZED threading mode (mutex inside the connection) for safety;
-//! if we ever drop to MULTI_THREAD mode this needs revisiting.
+//! `applyOne` runs on the raft thread. It must NOT reach into any
+//! worker's per-tenant state — doing so would share NOMUTEX sqlite
+//! connections between the raft thread and worker threads, which is
+//! undefined behavior per sqlite's threading docs.
+//!
+//! Instead, `ApplyCtx` owns ITS OWN per-tenant store map (`kv_stores`
+//! and `log_stores`), opened lazily on first apply for each tenant.
+//! These connections are raft-thread-local and never touched by any
+//! worker. They point at the same sqlite files the workers use, but
+//! via independent connections — WAL mode handles the coexistence.
+//!
+//! On the leader, both apply paths short-circuit via the leader-skip,
+//! so the raft-thread-owned connections stay idle. Cost of an idle
+//! cached connection is a pair of fds per tenant; acceptable.
+//!
+//! On followers, the raft thread is the only thread that writes
+//! tenant state, so there is no contention to coordinate with.
 
 const std = @import("std");
 const kv = @import("rove-kv");
 const log_mod = @import("rove-log");
-const tenant_mod = @import("rove-tenant");
+const blob_mod = @import("rove-blob");
 
 pub const Error = error{
     Truncated,
@@ -48,17 +59,27 @@ pub const Error = error{
 
 pub const MAX_ID_LEN: usize = 256;
 
+/// worker_id used for the raft-thread's own LogStore connections.
+/// Must not collide with any real worker's `worker_id` (which come
+/// from `raft.config.node_id`). We reserve the top bit — any worker
+/// using node_id >= 0x8000 would collide, but node ids that big are
+/// already out of range for a willemt cluster.
+pub const APPLY_WORKER_ID: u16 = 0xFFFF;
+
+/// Internal bundle of the three things needed to run a per-tenant
+/// log_store write on the raft thread: the sqlite connection, the
+/// blob backend, and the LogStore wrapping them. All three are
+/// allocated together, freed together.
+const RaftLogHandle = struct {
+    kv_store: *kv.KvStore,
+    blob_backend: blob_mod.FilesystemBlobStore,
+    store: log_mod.LogStore,
+};
+
 pub const EnvelopeType = enum(u8) {
     writeset = 0,
     log_batch = 1,
 };
-
-/// Function the worker provides so `applyOne` can resolve a tenant
-/// instance_id to the per-tenant `LogStore` without this file needing
-/// to know about the `Worker(Options)` generic. Returns null if the
-/// tenant doesn't have a log store yet (rare; treated as "drop the
-/// batch with a warning" rather than crash).
-pub const LogLookupFn = *const fn (ctx: ?*anyopaque, instance_id: []const u8) ?*log_mod.LogStore;
 
 /// Build a writeset envelope. `id_len` and `id` plus a leading type=0
 /// byte; payload is the writeset bytes.
@@ -117,16 +138,144 @@ pub fn decodeEnvelope(payload: []const u8) Error!Envelope {
     };
 }
 
-/// Apply callback context. Lives at least as long as the worker.
+/// Apply callback context — self-owning, raft-thread-local.
+///
+/// Holds lazy per-tenant sqlite connections that are opened on first
+/// apply for each instance and cached for subsequent applies. These
+/// are DISTINCT from any worker's connections; they exist solely for
+/// the raft thread's use.
+///
+/// On the leader path, both `applyWriteSet` and `applyLogBatch`
+/// short-circuit via `raft.isLeader()`, so the cached stores stay
+/// idle — workers wrote locally via their own connections, and the
+/// raft thread just advances `committed_seq`. The caches come alive
+/// on followers, where the raft thread is the sole writer.
+///
+/// Lifecycle: construct before starting the raft thread, `deinit`
+/// after the raft thread has stopped. The caches are grown only by
+/// the raft thread itself (via `applyOne`), so no locking is needed.
 pub const ApplyCtx = struct {
-    tenant: *tenant_mod.Tenant,
-    /// Used for the leader-skip check on writeset envelopes. Log
-    /// envelopes do NOT skip on the leader — see module doc.
+    allocator: std.mem.Allocator,
+    /// Root data dir. Per-tenant stores live at
+    /// `{data_dir}/{id}/{app,log}.db` + `log-blobs/`.
+    data_dir: []const u8,
+    /// Used for the leader-skip check on both envelope types.
     raft: *kv.RaftNode,
-    /// Optional log-store lookup. If null, log batch envelopes are
-    /// dropped with a warning. The worker sets this after `Worker.create`.
-    log_lookup: ?LogLookupFn = null,
-    log_lookup_ctx: ?*anyopaque = null,
+    /// Lazy per-tenant KvStore cache (instance_id → *KvStore). Keys
+    /// are owned copies of the instance id.
+    kv_stores: std.StringHashMapUnmanaged(*kv.KvStore),
+    /// Lazy per-tenant log handle cache (instance_id → *RaftLogHandle).
+    /// Keys are owned copies of the instance id.
+    log_stores: std.StringHashMapUnmanaged(*RaftLogHandle),
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        data_dir: []const u8,
+        raft: *kv.RaftNode,
+    ) ApplyCtx {
+        return .{
+            .allocator = allocator,
+            .data_dir = data_dir,
+            .raft = raft,
+            .kv_stores = .empty,
+            .log_stores = .empty,
+        };
+    }
+
+    pub fn deinit(self: *ApplyCtx) void {
+        var kv_it = self.kv_stores.iterator();
+        while (kv_it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            e.value_ptr.*.close();
+        }
+        self.kv_stores.deinit(self.allocator);
+
+        var log_it = self.log_stores.iterator();
+        while (log_it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            const h = e.value_ptr.*;
+            h.store.deinit();
+            h.blob_backend.deinit();
+            h.kv_store.close();
+            self.allocator.destroy(h);
+        }
+        self.log_stores.deinit(self.allocator);
+    }
+
+    /// Lazily open this tenant's app.db kv store. The returned
+    /// pointer is owned by the context and stable for the lifetime
+    /// of the context.
+    fn getKv(self: *ApplyCtx, instance_id: []const u8) !*kv.KvStore {
+        if (self.kv_stores.get(instance_id)) |existing| return existing;
+
+        const path = try std.fmt.allocPrintSentinel(
+            self.allocator,
+            "{s}/{s}/app.db",
+            .{ self.data_dir, instance_id },
+            0,
+        );
+        defer self.allocator.free(path);
+
+        const store = try kv.KvStore.open(self.allocator, path);
+        errdefer store.close();
+
+        const id_copy = try self.allocator.dupe(u8, instance_id);
+        errdefer self.allocator.free(id_copy);
+
+        try self.kv_stores.put(self.allocator, id_copy, store);
+        return store;
+    }
+
+    /// Lazily open this tenant's log.db + log-blobs/ and wrap them
+    /// in a LogStore. Pointer is owned by the context.
+    fn getLog(self: *ApplyCtx, instance_id: []const u8) !*log_mod.LogStore {
+        if (self.log_stores.get(instance_id)) |existing| return &existing.store;
+
+        const inst_dir = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ self.data_dir, instance_id },
+        );
+        defer self.allocator.free(inst_dir);
+        std.fs.cwd().makePath(inst_dir) catch {};
+
+        const log_db_path = try std.fmt.allocPrintSentinel(
+            self.allocator,
+            "{s}/log.db",
+            .{inst_dir},
+            0,
+        );
+        defer self.allocator.free(log_db_path);
+
+        const log_blob_dir = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/log-blobs",
+            .{inst_dir},
+        );
+        defer self.allocator.free(log_blob_dir);
+
+        const kv_store = try kv.KvStore.open(self.allocator, log_db_path);
+        errdefer kv_store.close();
+
+        const handle = try self.allocator.create(RaftLogHandle);
+        errdefer self.allocator.destroy(handle);
+        handle.kv_store = kv_store;
+        handle.blob_backend = try blob_mod.FilesystemBlobStore.open(self.allocator, log_blob_dir);
+        errdefer handle.blob_backend.deinit();
+        handle.store = try log_mod.LogStore.init(
+            self.allocator,
+            handle.kv_store,
+            handle.blob_backend.blobStore(),
+            APPLY_WORKER_ID,
+        );
+        errdefer handle.store.deinit();
+
+        const id_copy = try self.allocator.dupe(u8, instance_id);
+        errdefer self.allocator.free(id_copy);
+
+        try self.log_stores.put(self.allocator, id_copy, handle);
+        return &handle.store;
+    }
 };
 
 /// The function rove-kv's `RaftNode` calls for every committed entry
@@ -150,20 +299,20 @@ pub fn applyOne(
 }
 
 fn applyWriteSet(ctx: *ApplyCtx, env: Envelope) void {
-    // Leader-skip: the h2-side TrackedTxn already holds the writes
-    // and will commit them when `drainRaftPending` observes the seq
-    // advance. Running the apply here would deadlock on the write lock.
+    // Leader-skip: workers already wrote through their own
+    // connections before proposing. On the leader, apply is a no-op
+    // beyond advancing `committed_seq` (done by the caller).
     if (ctx.raft.isLeader()) return;
 
-    const inst = ctx.tenant.instances.get(env.instance_id) orelse {
+    const store = ctx.getKv(env.instance_id) catch |err| {
         std.log.warn(
-            "rove-js apply: unknown instance {s} (was it created before the raft thread started?)",
-            .{env.instance_id},
+            "rove-js apply: getKv({s}) failed: {s}",
+            .{ env.instance_id, @errorName(err) },
         );
         return;
     };
 
-    kv.applyEncodedWriteSet(inst.kv, 0, env.payload) catch |err| {
+    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| {
         std.log.warn(
             "rove-js apply: writeset failed for {s}: {s}",
             .{ env.instance_id, @errorName(err) },
@@ -172,31 +321,22 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope) void {
 }
 
 fn applyLogBatch(ctx: *ApplyCtx, env: Envelope) void {
-    // Leader-skip — same reason as `applyWriteSet`. The leader's h2
-    // thread is the only writer to its log.db (via captureLog +
-    // flushLogs's own local applyBatch call). Running the apply here
-    // on the raft thread would race against the h2 thread on the same
-    // SQLite connection (kvstore opens with SQLITE_OPEN_NOMUTEX), which
-    // is undefined behavior per SQLite's threading docs. Followers
-    // have no h2 dispatch touching log.db (the new leader-check in
-    // dispatchPending bounces them with 503 before any capture), so
-    // their raft thread is safely the sole writer.
+    // Leader-skip for the same reason as writesets: on the leader,
+    // the worker h2 thread is the sole writer to log.db via its own
+    // connection, and running apply on the raft thread would race
+    // two NOMUTEX sqlite connections on the same file. Followers
+    // don't serve requests, so the raft thread is the sole writer
+    // to log.db on followers.
     if (ctx.raft.isLeader()) return;
 
-    const lookup = ctx.log_lookup orelse {
+    const store = ctx.getLog(env.instance_id) catch |err| {
         std.log.warn(
-            "rove-js apply: log batch dropped — no log_lookup configured (instance={s})",
-            .{env.instance_id},
+            "rove-js apply: getLog({s}) failed: {s}",
+            .{ env.instance_id, @errorName(err) },
         );
         return;
     };
-    const store = lookup(ctx.log_lookup_ctx, env.instance_id) orelse {
-        std.log.warn(
-            "rove-js apply: log batch dropped — unknown instance {s}",
-            .{env.instance_id},
-        );
-        return;
-    };
+
     store.applyBatch(env.payload) catch |err| {
         std.log.warn(
             "rove-js apply: log batch apply failed for {s}: {s}",

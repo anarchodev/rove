@@ -119,4 +119,41 @@ code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     "http://$HTTP_ADDR/_system/foo/acme/x")
 expect "GET /_system/foo/.. (unimplemented)" 501 "$code"
 
+# Drive a couple of real requests so the tenant's log.db has
+# something to return, then exercise the /_system/log/* proxy.
+curl -s --http2-prior-knowledge -o /dev/null \
+    -H "Host: acme.test" "http://$HTTP_ADDR/" >/dev/null
+curl -s --http2-prior-knowledge -o /dev/null \
+    -H "Host: acme.test" "http://$HTTP_ADDR/" >/dev/null
+# Give the log buffer a moment to flush.
+sleep 1.2
+
+# GET /_system/log/acme/count — proxied through to log-server.
+body=$(curl -s --http2-prior-knowledge \
+    -H "Authorization: Bearer $ROVE_TOKEN" \
+    "http://$HTTP_ADDR/_system/log/acme/count" | tr -d '\n')
+case "$body" in
+    [1-9]*) echo "ok  proxy log count: $body" ;;
+    *) echo "FAIL log count: expected >=1, got '$body'" >&2; exit 1 ;;
+esac
+
+# GET /_system/log/acme/list?limit=5 — should return JSON with records.
+body=$(curl -s --http2-prior-knowledge \
+    -H "Authorization: Bearer $ROVE_TOKEN" \
+    "http://$HTTP_ADDR/_system/log/acme/list?limit=5")
+case "$body" in
+    *'"records":['*)
+        echo "ok  proxy log list: JSON returned"
+        ;;
+    *)
+        echo "FAIL log list: unexpected body '$body'" >&2
+        exit 1
+        ;;
+esac
+
+# Missing auth on log endpoint → 401.
+code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+    "http://$HTTP_ADDR/_system/log/acme/count")
+expect "proxy log count (no token)" 401 "$code"
+
 echo "PASS proxy smoke"

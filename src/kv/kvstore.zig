@@ -199,14 +199,27 @@ pub const KvStore = struct {
         }
         errdefer _ = c.sqlite3_close(db.?);
 
+        // Install the busy handler BEFORE the durability pragmas.
+        // `PRAGMA journal_mode=WAL;` briefly needs exclusive access
+        // on the initial switch; if another connection is racing to
+        // set it at the same instant (e.g. N workers all opening
+        // the same file at startup in the shift-js shared-nothing
+        // model), SQLite returns SQLITE_BUSY immediately unless a
+        // busy handler is installed. With a 5-second timeout, losing
+        // connections wait for the winner to finish transitioning
+        // and then see WAL already enabled — their own journal-mode
+        // pragma becomes a cheap confirmation read.
+        //
+        // busy_timeout works in both read-write and read-only modes
+        // so we set it unconditionally.
+        _ = c.sqlite3_exec(db, "PRAGMA busy_timeout=5000;", null, null, null);
+
         // Durability pragmas (journal_mode=WAL, synchronous=FULL) are
         // settings that mutate the database — only valid on a
-        // read-write connection. busy_timeout is read-side affecting
-        // and works in both modes.
+        // read-write connection.
         if (mode == .read_write) {
             try pinDurability(db.?);
         }
-        _ = c.sqlite3_exec(db, "PRAGMA busy_timeout=5000;", null, null, null);
 
         if (mode == .read_write) {
             if (c.sqlite3_exec(db, SQL_CREATE, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
@@ -574,27 +587,59 @@ pub const KvStore = struct {
         store: *KvStore,
         /// Caller-visible seq (matches kv_seq's autoincrement id). Also
         /// used as the row's `seq` column and as the propose() seq.
+        /// Zero until the underlying SQLite txn is actually opened —
+        /// see `ensureOpen`. Read-only handlers never allocate a seq
+        /// (and thus never fsync the WAL).
         txn_seq: u64,
+        kind: enum { normal, immediate },
+        opened: bool,
+
+        /// Open the underlying SQLite txn on first write. Idempotent —
+        /// subsequent writes on the same TrackedTxn skip it.
+        fn ensureOpen(self: *TrackedTxn) Error!void {
+            if (self.opened) return;
+            switch (self.kind) {
+                .normal => try self.store.begin(),
+                .immediate => {
+                    const st = self.store.stmt_begin_immediate;
+                    _ = c.sqlite3_reset(st);
+                    const rc = c.sqlite3_step(st);
+                    _ = c.sqlite3_reset(st);
+                    if (rc != c.SQLITE_DONE) return Error.Sqlite;
+                },
+            }
+            const seq = self.store.nextSeq();
+            if (seq == 0) {
+                self.store.rollback() catch {};
+                return Error.Sqlite;
+            }
+            self.txn_seq = seq;
+            self.opened = true;
+        }
 
         /// Insert-or-replace with undo tracking. If the key already exists
         /// and no undo row has been recorded for (txn_seq, key) yet, the
         /// current value is captured first. Must be called only between
         /// `beginTracked` and `commit`/`rollback`.
         pub fn put(self: *TrackedTxn, key: []const u8, value: []const u8) Error!void {
+            try self.ensureOpen();
             try self.captureUndo(key);
             try self.store.putSeq(key, value, self.txn_seq);
         }
 
         pub fn delete(self: *TrackedTxn, key: []const u8) Error!void {
+            try self.ensureOpen();
             try self.captureUndo(key);
             try self.store.delete(key);
         }
 
         pub fn commit(self: *TrackedTxn) Error!void {
+            if (!self.opened) return;
             try self.store.commit();
         }
 
         pub fn rollback(self: *TrackedTxn) Error!void {
+            if (!self.opened) return;
             // Rollback drops everything we did in this SQLite txn, including
             // the kv_undo INSERTs. No separate cleanup needed.
             try self.store.rollback();
@@ -638,34 +683,27 @@ pub const KvStore = struct {
         }
     };
 
-    /// Start a tracked transaction. Allocates a `txn_seq` from `kv_seq` and
-    /// opens a SQLite txn. Caller must eventually call `commit` or
-    /// `rollback` on the returned handle. The txn_seq should be used as the
-    /// seq passed to `RaftNode.propose*`.
+    /// Start a tracked transaction. Eagerly opens a SQLite txn and
+    /// allocates a `txn_seq` from `kv_seq`. Caller must eventually call
+    /// `commit` or `rollback`. Callers that want the hot-path no-fsync
+    /// behavior for pure reads should use `beginTrackedImmediate`
+    /// instead — it lazy-opens on first write.
     pub fn beginTracked(self: *KvStore) Error!TrackedTxn {
         try self.begin();
         errdefer self.rollback() catch {};
         const seq = self.nextSeq();
         if (seq == 0) return Error.Sqlite;
-        return .{ .store = self, .txn_seq = seq };
+        return .{ .store = self, .txn_seq = seq, .kind = .normal, .opened = true };
     }
 
-    /// Like `beginTracked` but the SQLite txn is opened with `BEGIN
-    /// IMMEDIATE`, acquiring RESERVED at begin time. Concurrent callers
-    /// serialize at the begin point (blocking inside SQLite's busy
-    /// retry loop up to `busy_timeout`), which is what rove-js wants
-    /// for per-tenant handler transactions so it doesn't have to
-    /// rewind halfway through a handler on SQLITE_BUSY.
+    /// Start a tracked transaction that lazily opens the underlying
+    /// SQLite txn with `BEGIN IMMEDIATE` on the first `put`/`delete` —
+    /// pure-reader handlers never allocate a seq, never INSERT into
+    /// `kv_seq`, and never fsync the WAL. First-write callers block in
+    /// SQLite's busy retry loop up to `busy_timeout` if another writer
+    /// holds RESERVED.
     pub fn beginTrackedImmediate(self: *KvStore) Error!TrackedTxn {
-        const st = self.stmt_begin_immediate;
-        _ = c.sqlite3_reset(st);
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
-        errdefer self.rollback() catch {};
-        const seq = self.nextSeq();
-        if (seq == 0) return Error.Sqlite;
-        return .{ .store = self, .txn_seq = seq };
+        return .{ .store = self, .txn_seq = 0, .kind = .immediate, .opened = false };
     }
 
     /// Compensating rollback: walks the `kv_undo` rows for a SINGLE txn_seq
@@ -905,7 +943,13 @@ fn pinDurability(db: *c.sqlite3) Error!void {
         const mode: []const u8 = @as([*]const u8, @ptrCast(text_ptr))[0..text_len];
         if (!std.ascii.eqlIgnoreCase(mode, "wal")) return Error.JournalMode;
     }
-    if (c.sqlite3_exec(db, "PRAGMA synchronous=FULL;", null, null, null) != c.SQLITE_OK) {
+    // synchronous=NORMAL is the right level for tenant kv + log kv:
+    // raft is the durability boundary, so an in-process fsync on every
+    // kv commit is redundant. raft_log.db stays FULL (it's the source
+    // of truth on restart). NORMAL still fsyncs at WAL checkpoints,
+    // which is what we want — each commit just gets written to the WAL
+    // page cache without blocking.
+    if (c.sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", null, null, null) != c.SQLITE_OK) {
         return Error.SynchronousMode;
     }
     {
@@ -913,7 +957,7 @@ fn pinDurability(db: *c.sqlite3) Error!void {
         if (c.sqlite3_prepare_v2(db, "PRAGMA synchronous;", -1, &st, null) != c.SQLITE_OK) return Error.Sqlite;
         defer _ = c.sqlite3_finalize(st);
         if (c.sqlite3_step(st) != c.SQLITE_ROW) return Error.SynchronousMode;
-        if (c.sqlite3_column_int(st, 0) != 2) return Error.SynchronousMode;
+        if (c.sqlite3_column_int(st, 0) != 1) return Error.SynchronousMode;
     }
 }
 
@@ -1105,7 +1149,7 @@ test "checkpoint and disable auto" {
     try kv.checkpoint();
 }
 
-test "open pins WAL + synchronous=FULL" {
+test "open pins WAL + synchronous=NORMAL" {
     var path_buf: [64]u8 = undefined;
     const path = tmpDbPath(&path_buf);
     defer cleanupDb(path);
@@ -1127,7 +1171,7 @@ test "open pins WAL + synchronous=FULL" {
     try testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(kv.db, "PRAGMA synchronous;", -1, &st2, null));
     defer _ = c.sqlite3_finalize(st2);
     try testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(st2));
-    try testing.expectEqual(@as(c_int, 2), c.sqlite3_column_int(st2, 0));
+    try testing.expectEqual(@as(c_int, 1), c.sqlite3_column_int(st2, 0));
 }
 
 test "tracked txn: undo recovers orphan key (scenario A)" {

@@ -304,15 +304,19 @@ fn jsConsoleLog(
 
 // ── Installation ──────────────────────────────────────────────────────
 
-/// Install the full global surface and attach `state` to `ctx`. Must be
-/// called before evaluating handler source.
-pub fn install(
-    ctx: *c.JSContext,
-    state: *DispatchState,
-    request: anytype,
-) void {
-    c.JS_SetContextOpaque(ctx, state);
-
+/// Install the pieces of the global surface that do NOT depend on a
+/// per-request `DispatchState` or `Request`. Safe to call from a
+/// snapshot init callback — pure, deterministic, no clocks, no
+/// allocation outside the arena. The bulk of the cost of setting up a
+/// JS handler context lives here (C-function bindings register atoms
+/// and shape transitions), so doing it once at snapshot creation time
+/// and then memcpy-restoring for each request is the whole point of
+/// rove-qjs.
+///
+/// Installs: `kv`, `console`, `crypto`, `Date.now`, `Math.random`.
+/// Does NOT install `request`, `response`, or the context opaque —
+/// see `installRequest`.
+pub fn installStatic(ctx: *c.JSContext) void {
     const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);
 
@@ -327,20 +331,6 @@ pub fn install(
     const console_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, console_obj, "log", c.JS_NewCFunction2(ctx, jsConsoleLog, "log", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, global, "console", console_obj);
-
-    // request = { method, path, body }
-    const req_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "method", c.JS_NewStringLen(ctx, request.method.ptr, request.method.len));
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "path", c.JS_NewStringLen(ctx, request.path.ptr, request.path.len));
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "body", c.JS_NewStringLen(ctx, request.body.ptr, request.body.len));
-    _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);
-
-    // response = { status: 200, body: "", headers: {} }
-    const resp_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, resp_obj, "status", c.JS_NewInt32(ctx, 200));
-    _ = c.JS_SetPropertyStr(ctx, resp_obj, "body", c.JS_NewStringLen(ctx, "", 0));
-    _ = c.JS_SetPropertyStr(ctx, resp_obj, "headers", c.JS_NewObject(ctx));
-    _ = c.JS_SetPropertyStr(ctx, global, "response", resp_obj);
 
     // Non-determinism overrides. Always installed (tape optional) so
     // the handler-visible API is stable whether we're capturing or not;
@@ -364,4 +354,47 @@ pub fn install(
     _ = c.JS_SetPropertyStr(ctx, crypto_obj, "getRandomValues", c.JS_NewCFunction2(ctx, jsCryptoGetRandomValues, "getRandomValues", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomUUID", c.JS_NewCFunction2(ctx, jsCryptoRandomUuid, "randomUUID", 0, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, global, "crypto", crypto_obj);
+}
+
+/// Install the per-request pieces of the global surface: attach
+/// `state` as the context opaque, and create `request`/`response`
+/// globals populated from the incoming request. Called AFTER
+/// `Snapshot.restore` on every request. Cheap — just a handful of
+/// `JS_SetPropertyStr` calls.
+pub fn installRequest(
+    ctx: *c.JSContext,
+    state: *DispatchState,
+    request: anytype,
+) void {
+    c.JS_SetContextOpaque(ctx, state);
+
+    const global = c.JS_GetGlobalObject(ctx);
+    defer c.JS_FreeValue(ctx, global);
+
+    // request = { method, path, body }
+    const req_obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "method", c.JS_NewStringLen(ctx, request.method.ptr, request.method.len));
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "path", c.JS_NewStringLen(ctx, request.path.ptr, request.path.len));
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "body", c.JS_NewStringLen(ctx, request.body.ptr, request.body.len));
+    _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);
+
+    // response = { status: 200, body: "", headers: {} }
+    const resp_obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, resp_obj, "status", c.JS_NewInt32(ctx, 200));
+    _ = c.JS_SetPropertyStr(ctx, resp_obj, "body", c.JS_NewStringLen(ctx, "", 0));
+    _ = c.JS_SetPropertyStr(ctx, resp_obj, "headers", c.JS_NewObject(ctx));
+    _ = c.JS_SetPropertyStr(ctx, global, "response", resp_obj);
+}
+
+/// Back-compat wrapper: install everything at once. Used by tests and
+/// by any caller that doesn't have a pre-built snapshot to restore
+/// from (e.g. the rove-code compile-on-upload path that just needs a
+/// throwaway context to compile JS to bytecode).
+pub fn install(
+    ctx: *c.JSContext,
+    state: *DispatchState,
+    request: anytype,
+) void {
+    installStatic(ctx);
+    installRequest(ctx, state, request);
 }

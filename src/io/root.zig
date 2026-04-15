@@ -7,6 +7,20 @@ const Entity = rove.Entity;
 const linux = std.os.linux;
 const posix = std.posix;
 
+/// Get an SQE from `ring`. If the submission queue is full, flush
+/// pending SQEs to the kernel and retry once. This is the hot path
+/// for every SQE-prep site in rove-io — under burst load (many
+/// writes/reads ready in one poll tick) a fixed-size SQ otherwise
+/// returns `SubmissionQueueFull` mid-loop and crashes the worker.
+fn getSqeOrSubmit(ring: *linux.IoUring) !*linux.io_uring_sqe {
+    return ring.get_sqe() catch |err| switch (err) {
+        error.SubmissionQueueFull => blk: {
+            _ = try ring.submit();
+            break :blk try ring.get_sqe();
+        },
+    };
+}
+
 // =============================================================================
 // Component types
 // =============================================================================
@@ -27,8 +41,8 @@ pub const Fd = struct {
     pub fn deinit(_: std.mem.Allocator, items: []Fd, ctx: *DeinitCtx) void {
         for (items) |item| {
             if (item.fd >= 0 and @as(u32, @intCast(item.fd)) < ctx.max_connections) {
-                const sqe = ctx.ring.get_sqe() catch
-                    @panic("SQ full during Fd.deinit — cannot close fixed-file slot");
+                const sqe = getSqeOrSubmit(ctx.ring) catch
+                    @panic("SQ full during Fd.deinit even after submit — ring too small");
                 sqe.prep_close_direct(@intCast(item.fd));
                 sqe.user_data = INTERNAL_SENTINEL;
             }
@@ -60,7 +74,33 @@ pub const WriteBuf = struct {
 };
 
 pub const IoResult = struct { err: i32 = 0 };
-pub const ConnectAddr = struct { addr: std.net.Address };
+
+/// Target address for an outgoing `prep_connect`. The address is
+/// **heap-owned** — stored via a pointer rather than inline — so
+/// that `&addr.any` can be handed directly to io_uring and survive
+/// any rove swap-remove that reshuffles the source collection's
+/// column storage.
+///
+/// This is the same shape as `WriteBuf` (whose `data` field is a
+/// pointer into heap memory): components that hold buffers the
+/// kernel reads asynchronously MUST store pointers, not values —
+/// see rove-library principle "Kernel-Visible Buffers Live Behind
+/// Pointers." Taking `&column_field` and handing it to io_uring
+/// would be invalidated by swap-remove the instant the owning
+/// entity moves collections.
+///
+/// `deinit` frees the allocation. Rove calls it when the entity is
+/// destroyed from a collection containing `ConnectAddr`, or when
+/// the component is stripped during a `moveStrip` transition (e.g.
+/// the `_connect_pending → connections` strip after a successful
+/// connect).
+pub const ConnectAddr = struct {
+    addr: *std.net.Address,
+
+    pub fn deinit(allocator: std.mem.Allocator, items: []ConnectAddr) void {
+        for (items) |it| allocator.destroy(it.addr);
+    }
+};
 
 /// Links a connection to its read-cycle entity. When the connection
 /// is destroyed, the read-cycle entity is also destroyed.
@@ -120,12 +160,19 @@ pub const Options = struct {
 };
 
 pub const IoOptions = struct {
-    ring_entries: u16 = 256,
+    ring_entries: u16 = 4096,
     buf_count: u16 = 256,
     buf_size: u32 = 4096,
     max_connections: u32 = 1024,
     ring_params: ?*linux.io_uring_params = null,
     listen_backlog: u31 = 128,
+    /// Set `SO_REUSEPORT` on the listen socket. Required for the
+    /// shift-js shared-nothing multi-worker model: N workers in one
+    /// process each call `Io.create` with the same bind address and
+    /// the kernel hashes incoming connections across their per-thread
+    /// listen sockets. Without this, the second `bind(2)` fails with
+    /// EADDRINUSE.
+    reuseport: bool = false,
 };
 
 pub fn Io(comptime opts: Options) type {
@@ -247,6 +294,18 @@ pub fn Io(comptime opts: Options) type {
             errdefer posix.close(listen_fd);
 
             try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+            if (io_opts.reuseport) {
+                try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
+            }
+            // Set TCP_NODELAY on the listen socket; Linux inherits it to
+            // accepted sockets. Doing it synchronously here removes a race
+            // with the async `setsockopt` SQE in `handleAccept`: with a
+            // fast allocator, the first send can land before the kernel
+            // has applied NODELAY, and Nagle + delayed-ACK stall every
+            // request-response round trip by ~40 ms. The SQE in
+            // `handleAccept` stays as belt-and-suspenders (and for the
+            // rare case where the listen socket's NODELAY didn't stick).
+            try posix.setsockopt(listen_fd, posix.IPPROTO.TCP, linux.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
             try posix.bind(listen_fd, &addr.any, addr.getOsSockLen());
             try posix.listen(listen_fd, io_opts.listen_backlog);
 
@@ -425,7 +484,7 @@ pub fn Io(comptime opts: Options) type {
                     continue;
                 };
 
-                const sqe = try self.ring.get_sqe();
+                const sqe = try getSqeOrSubmit(&self.ring);
                 sqe.prep_send(conn_fd.fd, @constCast(wb.data)[wb.offset..wb.len], 0);
                 sqe.flags |= linux.IOSQE_FIXED_FILE;
                 sqe.user_data = encodeEntity(ent);
@@ -482,7 +541,7 @@ pub fn Io(comptime opts: Options) type {
             const entities = self.connect_in.entitySlice();
 
             for (entities) |ent| {
-                const sqe = try self.ring.get_sqe();
+                const sqe = try getSqeOrSubmit(&self.ring);
                 sqe.prep_socket_direct_alloc(posix.AF.INET, posix.SOCK.STREAM, 0, 0);
                 sqe.user_data = encodeEntity(ent);
 
@@ -524,7 +583,7 @@ pub fn Io(comptime opts: Options) type {
 
         fn handleAccept(self: *Self, cqe: linux.io_uring_cqe) !void {
             if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
-                const sqe = try self.ring.get_sqe();
+                const sqe = try getSqeOrSubmit(&self.ring);
                 sqe.prep_multishot_accept_direct(self.listen_fd, null, null, 0);
                 sqe.user_data = ACCEPT_SENTINEL;
             }
@@ -588,7 +647,7 @@ pub fn Io(comptime opts: Options) type {
             } else {
                 const conn_ent = try self.reg.get(entity, &self._write_pending, ConnEntity);
                 const conn_fd = self.getFd(conn_ent.entity) orelse return error.InvalidEntity;
-                const sqe = try self.ring.get_sqe();
+                const sqe = try getSqeOrSubmit(&self.ring);
                 sqe.prep_send(conn_fd.fd, @constCast(wb.data)[wb.offset..wb.len], 0);
                 sqe.flags |= linux.IOSQE_FIXED_FILE;
                 sqe.user_data = encodeEntity(entity);
@@ -616,8 +675,14 @@ pub fn Io(comptime opts: Options) type {
             );
             nodelay_sqe.flags |= linux.IOSQE_FIXED_FILE;
 
+            // `ca.addr` is a heap pointer (see `ConnectAddr` docs),
+            // so `&ca.addr.any` points into a stable heap allocation
+            // that survives the `moveImmediate` swap-remove below.
+            // No `ring.submit()` dance required — the pointer stays
+            // valid until the connect CQE fires and the strip move
+            // frees the storage via `ConnectAddr.deinit`.
             const ca = try self.reg.get(entity, &self._connect_socket_pending, ConnectAddr);
-            const sqe = try self.ring.get_sqe();
+            const sqe = try getSqeOrSubmit(&self.ring);
             sqe.prep_connect(slot, &ca.addr.any, ca.addr.getOsSockLen());
             sqe.flags |= linux.IOSQE_FIXED_FILE;
             sqe.user_data = encodeEntity(entity);
@@ -632,7 +697,7 @@ pub fn Io(comptime opts: Options) type {
             const slot = fd_ptr.fd;
 
             if (cqe.res < 0) {
-                const close_sqe = try self.ring.get_sqe();
+                const close_sqe = try getSqeOrSubmit(&self.ring);
                 close_sqe.prep_close_direct(@intCast(slot));
                 close_sqe.user_data = INTERNAL_SENTINEL;
                 fd_ptr.fd = -1;
@@ -655,7 +720,7 @@ pub fn Io(comptime opts: Options) type {
         // =============================================================
 
         fn armRecv(self: *Self, entity: Entity, file_slot: i32) !void {
-            const sqe = try self.ring.get_sqe();
+            const sqe = try getSqeOrSubmit(&self.ring);
             sqe.prep_rw(.RECV, file_slot, 0, 0, 0);
             sqe.flags |= linux.IOSQE_BUFFER_SELECT | linux.IOSQE_FIXED_FILE;
             sqe.buf_index = BUF_GROUP_ID;

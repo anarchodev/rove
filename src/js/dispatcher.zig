@@ -1,10 +1,16 @@
 //! `Dispatcher` — runs one JS handler against a request.
 //!
-//! Construction takes a `KvStore`. `run(source, request)` spins up a
-//! fresh quickjs `Runtime`+`Context`, installs globals, evaluates the
-//! source, extracts the response, and tears the runtime down. No
-//! caching — that's the snapshot/restore optimization that lands in a
-//! later session.
+//! Each `Dispatcher` owns a `qjs.Arena` + `qjs.Snapshot` pair, built
+//! once at construction time. The snapshot captures a fully-initialized
+//! QuickJS runtime + context with all static rove-js globals installed
+//! (kv, console, crypto, Date.now override, Math.random override). Per
+//! request, `run` memcpy-restores the snapshot into the arena
+//! (~microseconds), installs the per-request `request`/`response`
+//! globals, and evaluates the handler bytecode. Nothing allocated by
+//! the handler needs to be freed — the next restore overwrites the
+//! whole arena. This is the whole point of the rove-qjs design and is
+//! worth ~50%+ of handler CPU over the old per-request
+//! `JS_NewRuntime` + `JS_NewContext` + `installStatic` path.
 
 const std = @import("std");
 const qjs = @import("rove-qjs");
@@ -106,12 +112,64 @@ pub const Response = struct {
 
 pub const Dispatcher = struct {
     allocator: std.mem.Allocator,
+    /// Per-dispatcher arena that holds the live QuickJS runtime+context
+    /// (plus any allocations they make during handler execution). The
+    /// snapshot memcpys its frozen image into this arena at the start
+    /// of every `run`, so anything the previous handler dirtied is
+    /// wiped in one shot.
+    arena: *qjs.Arena,
+    /// Frozen post-`installStatic` image of the runtime+context. Built
+    /// once in `init`, read-only thereafter.
+    snapshot: qjs.Snapshot,
     /// Last `kv.*` error surfaced from a JS call during the most recent
     /// `run`. Useful for tests and for the worker to log root causes.
     last_kv_error: ?anyerror = null,
 
-    pub fn init(allocator: std.mem.Allocator) Dispatcher {
-        return .{ .allocator = allocator };
+    fn snapshotInitFn(
+        arena: *qjs.Arena,
+        out_rt_offset: *usize,
+        out_ctx_offset: *usize,
+        _: ?*anyopaque,
+    ) qjs.snap.Error!void {
+        const rt = c.JS_NewRuntime2(&qjs.bump_mf, arena.qjsOpaque()) orelse
+            return qjs.snap.Error.RuntimeCreateFailed;
+        // Use JS_NewContextRaw + selective intrinsics so the snapshot
+        // only contains what handlers actually use. Every intrinsic we
+        // add grows the snapshot image and costs per-request memcpy
+        // bandwidth at restore. Skipping WeakRef / DOMException /
+        // Proxy saves 20-30 KB with essentially no loss — handlers
+        // that genuinely need them can be added back.
+        const ctx = c.JS_NewContextRaw(rt) orelse
+            return qjs.snap.Error.ContextCreateFailed;
+        _ = c.JS_AddIntrinsicBaseObjects(ctx);
+        _ = c.JS_AddIntrinsicDate(ctx);
+        _ = c.JS_AddIntrinsicEval(ctx);
+        _ = c.JS_AddIntrinsicRegExp(ctx);
+        _ = c.JS_AddIntrinsicJSON(ctx);
+        _ = c.JS_AddIntrinsicMapSet(ctx);
+        _ = c.JS_AddIntrinsicTypedArrays(ctx);
+        _ = c.JS_AddIntrinsicPromise(ctx);
+        _ = c.JS_AddIntrinsicBigInt(ctx);
+        globals.installStatic(ctx);
+        out_rt_offset.* = qjs.offsetOf(arena, rt);
+        out_ctx_offset.* = qjs.offsetOf(arena, ctx);
+    }
+
+    pub fn init(allocator: std.mem.Allocator) !Dispatcher {
+        const arena = try qjs.Arena.create(allocator);
+        errdefer arena.destroy();
+        const snapshot = try qjs.Snapshot.create(allocator, arena, snapshotInitFn, null);
+        return .{
+            .allocator = allocator,
+            .arena = arena,
+            .snapshot = snapshot,
+        };
+    }
+
+    pub fn deinit(self: *Dispatcher) void {
+        self.snapshot.deinit();
+        self.arena.destroy();
+        self.* = undefined;
     }
 
     /// Run pre-compiled `bytecode` as a handler against `request`.
@@ -154,15 +212,21 @@ pub const Dispatcher = struct {
             .prng = std.Random.DefaultPrng.init(request.prng_seed),
         };
 
-        var rt = qjs.Runtime.init() catch return DispatchError.RuntimeCreateFailed;
-        defer rt.deinit();
-        var ctx = rt.newContext() catch return DispatchError.ContextCreateFailed;
-        defer ctx.deinit();
+        // Memcpy-restore the frozen post-init image of
+        // runtime+context+static globals into our arena. Handler
+        // allocations from the previous request get overwritten in one
+        // shot; no per-request teardown needed. `restore` also
+        // re-seeds `time_origin` + `random_state` from the wall clock.
+        const restored = self.snapshot.restore(self.arena) catch
+            return DispatchError.RuntimeCreateFailed;
+        var rt: qjs.Runtime = restored.runtime;
+        var ctx: qjs.Context = restored.context;
 
         rt.setInterruptHandler(interruptHandler, budget);
-        defer rt.clearInterruptHandler();
+        // No `clearInterruptHandler` defer: the runtime lives inside
+        // the arena and gets discarded on the next restore.
 
-        globals.install(ctx.raw, &state, request);
+        globals.installRequest(ctx.raw, &state, request);
 
         var exception_msg: []u8 = &.{};
         errdefer self.allocator.free(exception_msg);
@@ -543,7 +607,7 @@ test "dispatch: simple response write-back" {
         cleanupTempKv(&buf);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -567,7 +631,7 @@ test "dispatch: kv.get on missing key returns null" {
         cleanupTempKv(&buf);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -619,7 +683,7 @@ test "dispatch: kv.set + kv.get round trip" {
         cleanupTempKv(&buf);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
     var r1 = try runOne(
         &d,
@@ -653,7 +717,7 @@ test "dispatch: kv.delete removes key" {
         cleanupTempKv(&buf);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
     try kv.put("k", "v");
 
@@ -683,7 +747,7 @@ test "dispatch: read-your-writes within one handler works via TrackedTxn" {
         cleanupTempKv(&buf);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -705,7 +769,7 @@ test "dispatch: console.log captured into response.console" {
         cleanupTempKv(&buf);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -734,7 +798,7 @@ test "dispatch: malformed bytecode surfaces in exception field" {
         cleanupTempKv(&buf);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var txn = try kv.beginTrackedImmediate();
     defer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(testing.allocator);
@@ -763,7 +827,7 @@ test "dispatch: runtime throw leaves exception + partial response" {
         cleanupTempKv(&buf);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -793,7 +857,7 @@ test "dispatch: per-store isolation by passing different kv per run" {
         cleanupTempKv(&buf_b);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
     var r1 = try runOne(
         &d,
@@ -858,7 +922,7 @@ test "dispatch: kv tape captures get/set/delete with outcomes" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var txn = try kv.beginTrackedImmediate();
     defer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(testing.allocator);
@@ -931,7 +995,7 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     {
         var txn = try kv.beginTrackedImmediate();
         defer txn.rollback() catch {};
@@ -1022,7 +1086,7 @@ test "dispatch: tight loop hits budget and returns Interrupted" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var txn = try kv.beginTrackedImmediate();
     defer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(testing.allocator);
@@ -1057,7 +1121,7 @@ test "dispatch: short handler does not trip budget" {
         cleanupTempKv(&buf);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,
@@ -1096,7 +1160,7 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
     // ?fn=greet → "hi /hello"
     {
@@ -1174,7 +1238,7 @@ test "dispatch: async module handler gets unwrapped" {
     );
     defer testing.allocator.free(bytecode);
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var txn = try kv.beginTrackedImmediate();
     defer txn.rollback() catch {};
     var ws = kv_mod.WriteSet.init(testing.allocator);
@@ -1198,7 +1262,7 @@ test "dispatch: request object fields populated" {
         cleanupTempKv(&buf);
     }
 
-    var d = Dispatcher.init(testing.allocator);
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var resp = try runOne(
         &d,
         kv,

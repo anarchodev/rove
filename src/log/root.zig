@@ -254,14 +254,31 @@ pub const LogStore = struct {
             for (records) |*r| r.deinit(self.allocator);
             self.allocator.free(records);
         }
-        for (records) |*r| try self.writeOne(r);
+
+        // Wrap the whole batch in ONE SQLite transaction. Without this,
+        // every record paid an individual `BEGIN`/`COMMIT` pair — at
+        // ~20k req/s that was ~80 flushes/sec × 256 commits each =
+        // ~20k WAL appends/sec, dominating CPU in walIndexAppend /
+        // walChecksumBytes. One batch → one commit → one WAL append.
+        self.kv.begin() catch return Error.Kv;
+        errdefer self.kv.rollback() catch {};
+        for (records) |*r| try self.writeOneInTxn(r);
+        self.kv.commit() catch return Error.Kv;
+    }
+
+    /// Build the storage key for a request id. The id is bitwise-
+    /// inverted so that ascending `kv.range` iteration over `req/`
+    /// walks newest-first naturally — giving us `list()` without a
+    /// secondary index. `get()` inverts once more before looking up.
+    fn reqKey(buf: *[4 + 16]u8, request_id: u64) []u8 {
+        return std.fmt.bufPrint(buf, "req/{x:0>16}", .{~request_id}) catch unreachable;
     }
 
     /// Single-record lookup by request_id. Returns null if not found.
     /// Caller must `deinit` the returned record.
     pub fn get(self: *LogStore, request_id: u64) Error!?LogRecord {
         var key_buf: [4 + 16]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "req/{x:0>16}", .{request_id}) catch unreachable;
+        const key = reqKey(&key_buf, request_id);
         const bytes = self.kv.get(key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return Error.Kv,
@@ -270,11 +287,11 @@ pub const LogStore = struct {
         return try parseRecord(self.allocator, bytes);
     }
 
-    /// List recent records (newest first). Walks the `req-desc/`
-    /// secondary index up to `opts.limit` entries. Caller must deinit
-    /// the returned `ListResult`.
+    /// List recent records (newest first). Because the primary key is
+    /// inverted (`req/{~id}`), ascending iteration returns newest
+    /// first — no secondary index needed. Caller must deinit.
     pub fn list(self: *LogStore, opts: ListOpts) Error!ListResult {
-        var range = self.kv.range("req-desc/", "req-desc0", opts.limit) catch
+        var range = self.kv.range("req/", "req0", opts.limit) catch
             return Error.Kv;
         defer range.deinit();
 
@@ -285,10 +302,7 @@ pub const LogStore = struct {
         }
 
         for (range.entries) |entry| {
-            // The req-desc value holds the original request_id as 16 hex chars.
-            if (entry.value.len != 16) continue;
-            const id = std.fmt.parseInt(u64, entry.value, 16) catch continue;
-            const rec = (try self.get(id)) orelse continue;
+            const rec = parseRecord(self.allocator, entry.value) catch continue;
             out.append(self.allocator, rec) catch return Error.OutOfMemory;
         }
 
@@ -298,37 +312,22 @@ pub const LogStore = struct {
 
     // ── Internals ─────────────────────────────────────────────────────
 
-    /// Write the primary `req/{id}` row AND the secondary
-    /// `req-desc/{~id}` row as a single SQLite transaction. Without
-    /// the transaction wrap, a crash between the two puts could leave
-    /// an unindexed record (visible to `get` but not to `list`) or
-    /// vice versa. SQLite handles the all-or-nothing guarantee.
-    /// Write the primary `req/{id}` row AND the secondary
-    /// `req-desc/{~id}` row as a single SQLite transaction. Without
-    /// the transaction wrap, a crash between the two puts could leave
-    /// an unindexed record (visible to `get` but not to `list`) or
-    /// vice versa. SQLite handles the all-or-nothing guarantee.
+    /// Write one `req/{~id}` row. Single INSERT — no secondary index.
+    /// Caller holds the SQLite txn (`applyBatch` opens one per batch).
     fn writeOne(self: *LogStore, record: *const LogRecord) Error!void {
+        self.kv.begin() catch return Error.Kv;
+        errdefer self.kv.rollback() catch {};
+        try self.writeOneInTxn(record);
+        self.kv.commit() catch return Error.Kv;
+    }
+
+    fn writeOneInTxn(self: *LogStore, record: *const LogRecord) Error!void {
         const bytes = serializeRecord(self.allocator, record) catch return Error.OutOfMemory;
         defer self.allocator.free(bytes);
 
-        self.kv.begin() catch return Error.Kv;
-        errdefer self.kv.rollback() catch {};
-
         var key_buf: [4 + 16]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "req/{x:0>16}", .{record.request_id}) catch unreachable;
+        const key = reqKey(&key_buf, record.request_id);
         self.kv.put(key, bytes) catch return Error.Kv;
-
-        // Secondary index for descending walks. Key uses bitwise-NOT
-        // so kv.range (ascending) returns newest first.
-        const inv = ~record.request_id;
-        var desc_key_buf: [9 + 16]u8 = undefined;
-        const desc_key = std.fmt.bufPrint(&desc_key_buf, "req-desc/{x:0>16}", .{inv}) catch unreachable;
-        var id_buf: [16]u8 = undefined;
-        const id_str = std.fmt.bufPrint(&id_buf, "{x:0>16}", .{record.request_id}) catch unreachable;
-        self.kv.put(desc_key, id_str) catch return Error.Kv;
-
-        self.kv.commit() catch return Error.Kv;
     }
 
     fn loadNextSeq(self: *LogStore) Error!u48 {

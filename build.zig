@@ -159,6 +159,28 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ── rove-log-server: per-instance log read operations (Phase 5) ──
+    //
+    // Mirror of rove-code-server for the observability side. Read-only
+    // SQLite connections per call so the worker's h2 thread remains
+    // the sole writer. Wrapped by a later thread subsystem + proxied
+    // via `/_system/log/*` on the worker.
+    const log_server_mod = b.addModule("rove-log-server", .{
+        .root_source_file = b.path("src/log_server/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    log_server_mod.link_libc = true;
+    log_server_mod.linkSystemLibrary("nghttp2", .{});
+    log_server_mod.linkSystemLibrary("ssl", .{});
+    log_server_mod.linkSystemLibrary("crypto", .{});
+    log_server_mod.addImport("rove", rove_mod);
+    log_server_mod.addImport("rove-io", io_mod);
+    log_server_mod.addImport("rove-h2", h2_mod);
+    log_server_mod.addImport("rove-kv", kv_mod);
+    log_server_mod.addImport("rove-blob", blob_mod);
+    log_server_mod.addImport("rove-log", log_mod);
+
     // ── rove-code-server: per-instance code operations (Phase 5) ──
     //
     // Compile + upload + deploy + source fetch, wrapping rove-code.
@@ -227,6 +249,10 @@ pub fn build(b: *std.Build) void {
     const code_server_tests = b.addTest(.{ .root_module = code_server_mod });
     test_step.dependOn(&b.addRunArtifact(code_server_tests).step);
 
+    // rove-log-server tests
+    const log_server_tests = b.addTest(.{ .root_module = log_server_mod });
+    test_step.dependOn(&b.addRunArtifact(log_server_tests).step);
+
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
     // M1 slice: just `Instance` + `Domain` with an in-memory cache and
@@ -283,6 +309,7 @@ pub fn build(b: *std.Build) void {
     js_worker_mod.addImport("rove-blob", blob_mod);
     js_worker_mod.addImport("rove-code", code_mod);
     js_worker_mod.addImport("rove-code-server", code_server_mod);
+    js_worker_mod.addImport("rove-log-server", log_server_mod);
     js_worker_mod.addImport("rove-qjs", qjs_mod);
     js_worker_mod.addImport("rove-tenant", tenant_mod);
     js_worker_mod.link_libc = true;
@@ -383,6 +410,34 @@ pub fn build(b: *std.Build) void {
         .root_module = cs_standalone_mod,
     });
     b.installArtifact(cs_standalone);
+
+    // dual-worker: shift-js shared-nothing spike. Two full rove-js
+    // worker instances in one process, both bound to the same port
+    // via SO_REUSEPORT, sharing one raft node + one apply ctx.
+    const dual_worker_mod = b.addModule("dual-worker", .{
+        .root_source_file = b.path("examples/dual_worker.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dual_worker_mod.addImport("rove", rove_mod);
+    dual_worker_mod.addImport("rove-io", io_mod);
+    dual_worker_mod.addImport("rove-js", js_mod);
+    dual_worker_mod.addImport("rove-kv", kv_mod);
+    dual_worker_mod.addImport("rove-blob", blob_mod);
+    dual_worker_mod.addImport("rove-code", code_mod);
+    dual_worker_mod.addImport("rove-code-server", code_server_mod);
+    dual_worker_mod.addImport("rove-log-server", log_server_mod);
+    dual_worker_mod.addImport("rove-qjs", qjs_mod);
+    dual_worker_mod.addImport("rove-tenant", tenant_mod);
+    dual_worker_mod.link_libc = true;
+    dual_worker_mod.linkSystemLibrary("nghttp2", .{});
+    dual_worker_mod.linkSystemLibrary("ssl", .{});
+    dual_worker_mod.linkSystemLibrary("crypto", .{});
+    const dual_worker_exe = b.addExecutable(.{
+        .name = "dual-worker",
+        .root_module = dual_worker_mod,
+    });
+    b.installArtifact(dual_worker_exe);
 
     // rove-js-ctl: admin CLI over the worker's /_system/* surface.
     const js_ctl_mod = b.addModule("rove-js-ctl", .{

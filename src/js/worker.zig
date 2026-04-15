@@ -216,24 +216,77 @@ pub const WorkerConfig = struct {
     /// to this address. When null, `/_system/code/*` requests return
     /// 503 (feature disabled).
     code_addr: ?std.net.Address = null,
+    /// Address of the in-process rove-log-server thread. Mirror of
+    /// `code_addr` for `/_system/log/*`.
+    log_addr: ?std.net.Address = null,
+    /// Upper 16 bits of every LogStore request_id this worker issues.
+    /// Must be unique per Worker instance within one process — if two
+    /// workers on the same node both use the same id, their captured
+    /// log records will collide on `nextRequestId`. When null, falls
+    /// back to `raft.config.node_id`, which is correct for the
+    /// single-worker-per-process case but wrong for multi-worker.
+    log_worker_id: ?u16 = null,
 };
 
-/// Cross-reference component used by the `/_system/code/*` proxy.
-/// Lives on server-side entities parked in `code_proxy_inflight`; the
-/// `client` field points at the client-side entity that was submitted
-/// into rove-h2's `client_request_in`. On each tick we scan
-/// `client_response_out`, match each client entity back to its server
-/// peer via this field, and copy the upstream response onto the
-/// server entity before delivering it to the downstream user.
+/// Cross-reference component used by the `/_system/*` proxy. Lives
+/// on server-side entities parked in each subsystem's `inflight`
+/// collection; the `client` field points at the client-side entity
+/// that was submitted into rove-h2's `client_request_in`. On each
+/// tick we scan `client_response_out`, match each client entity
+/// back to its server peer via this field, and copy the upstream
+/// response onto the server entity before delivering it to the
+/// downstream user.
 pub const ProxyPeer = struct { client: rove.Entity };
+
+/// Tag applied to every client-side entity the worker submits so
+/// `ingestProxyConnects` and `drainProxyResponses` can route each
+/// entity back to its originating subsystem without scanning.
+/// `.none` is the default for non-proxy client entities (tests /
+/// future uses) and is a no-op sentinel.
+pub const ProxyTag = struct {
+    kind: enum(u8) { none = 0, code = 1, log = 2 } = .none,
+};
+
+/// Per-subsystem proxy state. The worker holds one of these for
+/// `code` and one for `log`; the proxy systems below take a
+/// `*ProxySubsystem` argument instead of reaching into fields by
+/// name, so adding a third subsystem later is a matter of
+/// constructing a third instance and tagging its client entities.
+pub fn ProxySubsystem(comptime StreamCollT: type) type {
+    return struct {
+        const Self = @This();
+        pending: StreamCollT,
+        inflight: StreamCollT,
+        session: rove.Entity = rove.Entity.nil,
+        addr: ?std.net.Address = null,
+        connecting: bool = false,
+        tag: ProxyTag,
+
+        pub fn init(allocator: std.mem.Allocator, tag: ProxyTag, addr: ?std.net.Address) !Self {
+            return .{
+                .pending = try StreamCollT.init(allocator),
+                .inflight = try StreamCollT.init(allocator),
+                .addr = addr,
+                .tag = tag,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.inflight.deinit();
+            self.pending.deinit();
+        }
+    };
+}
 
 pub fn Worker(comptime opts: Options) type {
     // rove-js contributes `RaftWait` to every request entity so we can
     // park entities in `raft_pending` without allocating side state.
-    // Also `ProxyPeer` so `/_system/code/*` requests can carry the
-    // cross-reference to their in-flight upstream client entity
-    // through the parking collections.
-    const merged_request_row = rove.Row(&.{ RaftWait, ProxyPeer }).merge(opts.request_row);
+    // Also `ProxyPeer` so `/_system/*` requests can carry the cross-
+    // reference to their in-flight upstream client entity through
+    // the parking collections, and `ProxyTag` so the connect + drain
+    // systems can route each client entity back to its originating
+    // subsystem in O(1) instead of scanning every inflight collection.
+    const merged_request_row = rove.Row(&.{ RaftWait, ProxyPeer, ProxyTag }).merge(opts.request_row);
 
     const H2Type = h2.H2(.{
         .request_row = merged_request_row,
@@ -258,29 +311,12 @@ pub fn Worker(comptime opts: Options) type {
         /// Uses the same row as every other h2 stream collection so
         /// moves in and out preserve every component.
         raft_pending: StreamColl,
-        /// Server-side entities whose path started with `/_system/code/`
-        /// and which haven't yet been forwarded to the code thread.
-        /// Live here from dispatchPending exit until the proxy layer's
-        /// flush system submits the corresponding client request.
-        code_proxy_pending: StreamColl,
-        /// Forwarded to the code thread, waiting for the upstream
-        /// response to land in rove-h2's `client_response_out`. Each
-        /// entity here carries a valid `ProxyPeer.client` pointing at
-        /// the in-flight client-side entity.
-        code_proxy_inflight: StreamColl,
-        /// Session handle for the current connection to the code
-        /// thread. Nil until `_client_connect_out` fires for the
-        /// first time; then rewritten each reconnect. The proxy's
-        /// flush system checks `isStale` before forwarding so a
-        /// disconnected upstream doesn't send requests into the void.
-        code_session: rove.Entity = rove.Entity.nil,
-        /// Connect target for the code thread, held so the reconnect
-        /// system can re-issue a connect without needing the caller's
-        /// original address. Populated from `WorkerConfig.code_addr`.
-        code_addr: ?std.net.Address = null,
-        /// True while a connect entity is live in h2's connect
-        /// pipeline so we don't stack up redundant attempts.
-        code_connecting: bool = false,
+        /// `/_system/code/*` proxy state. Targets the in-process
+        /// rove-code-server thread.
+        code_proxy: ProxySubsystem(StreamColl),
+        /// `/_system/log/*` proxy state. Targets the in-process
+        /// rove-log-server thread.
+        log_proxy: ProxySubsystem(StreamColl),
         dispatcher: Dispatcher,
         tenant: *tenant_mod.Tenant,
         raft: *kv_mod.RaftNode,
@@ -334,10 +370,17 @@ pub fn Worker(comptime opts: Options) type {
                 .reg = reg,
                 .h2 = server,
                 .raft_pending = try StreamColl.init(allocator),
-                .code_proxy_pending = try StreamColl.init(allocator),
-                .code_proxy_inflight = try StreamColl.init(allocator),
-                .code_addr = config.code_addr,
-                .dispatcher = Dispatcher.init(allocator),
+                .code_proxy = try ProxySubsystem(StreamColl).init(
+                    allocator,
+                    .{ .kind = .code },
+                    config.code_addr,
+                ),
+                .log_proxy = try ProxySubsystem(StreamColl).init(
+                    allocator,
+                    .{ .kind = .log },
+                    config.log_addr,
+                ),
+                .dispatcher = try Dispatcher.init(allocator),
                 .tenant = config.tenant,
                 .raft = config.raft,
                 .tenant_codes = .empty,
@@ -347,20 +390,22 @@ pub fn Worker(comptime opts: Options) type {
                 .refresh_interval_ns = config.refresh_interval_ns,
             };
             errdefer self.raft_pending.deinit();
-            errdefer self.code_proxy_pending.deinit();
-            errdefer self.code_proxy_inflight.deinit();
+            errdefer self.code_proxy.deinit();
+            errdefer self.log_proxy.deinit();
             errdefer destroyAllTenantCodes(self);
             errdefer destroyAllTenantLogs(self);
 
             reg.registerCollection(&self.raft_pending);
-            reg.registerCollection(&self.code_proxy_pending);
-            reg.registerCollection(&self.code_proxy_inflight);
+            reg.registerCollection(&self.code_proxy.pending);
+            reg.registerCollection(&self.code_proxy.inflight);
+            reg.registerCollection(&self.log_proxy.pending);
+            reg.registerCollection(&self.log_proxy.inflight);
 
             // Eagerly open code AND log state for every known tenant.
             // The tenant registry's instances map was populated by
             // the caller before this create() call; we iterate it
             // once and open both per-tenant stores.
-            const worker_id: u16 = @intCast(config.raft.config.node_id);
+            const worker_id: u16 = config.log_worker_id orelse @intCast(config.raft.config.node_id);
             var it = config.tenant.instances.iterator();
             while (it.next()) |entry| {
                 const inst = entry.value_ptr.*;
@@ -380,9 +425,10 @@ pub fn Worker(comptime opts: Options) type {
             self.tenant_logs.deinit(allocator);
             destroyAllTenantCodes(self);
             self.tenant_codes.deinit(allocator);
-            self.code_proxy_inflight.deinit();
-            self.code_proxy_pending.deinit();
+            self.log_proxy.deinit();
+            self.code_proxy.deinit();
             self.raft_pending.deinit();
+            self.dispatcher.deinit();
             self.h2.destroy();
             allocator.destroy(self);
         }
@@ -401,18 +447,6 @@ pub fn Worker(comptime opts: Options) type {
             try self.h2.pollWithTimeout(timeout_ns);
         }
 
-        /// Function-pointer lookup that `apply.ApplyCtx.log_lookup`
-        /// can call back into. The caller passes a `*Self` as the
-        /// opaque ctx (set up via `apply_ctx.log_lookup_ctx = worker`).
-        /// We cast it back here and resolve the tenant id to the
-        /// per-tenant LogStore. Returns null if the tenant has no log
-        /// state — the apply callback then drops the batch with a
-        /// warning.
-        pub fn logLookup(ctx: ?*anyopaque, instance_id: []const u8) ?*log_mod.LogStore {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            const tl = self.tenant_logs.get(instance_id) orelse return null;
-            return &tl.store;
-        }
     };
 }
 
@@ -1032,19 +1066,26 @@ pub fn dispatchPending(worker: anytype) !void {
             }
 
             if (std.mem.eql(u8, subsystem, "code")) {
-                if (worker.code_addr == null) {
+                if (worker.code_proxy.addr == null) {
                     try setSimpleResponse(server, ent, sid, sess, 503, "code subsystem disabled\n", allocator);
                     continue;
                 }
                 try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
-                try server.reg.move(ent, &server.request_out, &worker.code_proxy_pending);
+                try server.reg.move(ent, &server.request_out, &worker.code_proxy.pending);
+                continue;
+            }
+            if (std.mem.eql(u8, subsystem, "log")) {
+                if (worker.log_proxy.addr == null) {
+                    try setSimpleResponse(server, ent, sid, sess, 503, "log subsystem disabled\n", allocator);
+                    continue;
+                }
+                try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
+                try server.reg.move(ent, &server.request_out, &worker.log_proxy.pending);
                 continue;
             }
 
-            // Reserved subsystem (e.g. `log`) — wired up in a later
-            // slice. Returning 501 tells the CLI the endpoint exists
-            // but isn't implemented yet, distinct from a 404 which
-            // would look like a URL typo.
+            // Unknown subsystem — 501 so the CLI can tell the endpoint
+            // exists-but-not-implemented from a typo'd URL.
             try setSimpleResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator);
             continue;
         }
@@ -1350,85 +1391,121 @@ pub fn dispatchPending(worker: anytype) !void {
 // disconnected window stays in `code_proxy_pending` until the new
 // session is up — clients observe this as latency, not failure.
 
-/// Ensure a live upstream session exists (or is being established).
-/// Called once per poll-loop tick before the other proxy systems.
-pub fn connectCodeServer(worker: anytype) !void {
-    const addr = worker.code_addr orelse return;
+/// Ensure each proxy subsystem has a live upstream session (or is
+/// establishing one). Called once per poll-loop tick before the
+/// other proxy systems.
+pub fn connectProxies(worker: anytype) !void {
+    try connectOne(worker, &worker.code_proxy, "code");
+    try connectOne(worker, &worker.log_proxy, "log");
+}
+
+fn connectOne(
+    worker: anytype,
+    ps: anytype,
+    name: []const u8,
+) !void {
+    const addr = ps.addr orelse return;
     const server = worker.h2;
     const reg = server.reg;
 
-    const session_live = !worker.reg.isStale(worker.code_session);
-    if (session_live or worker.code_connecting) return;
+    const session_live = !worker.reg.isStale(ps.session);
+    if (session_live or ps.connecting) return;
 
     const conn = try reg.create(&server.client_connect_in);
     try reg.set(conn, &server.client_connect_in, h2.ConnectTarget, .{ .addr = addr });
-    worker.code_connecting = true;
-    std.log.info("rove-js: connecting to code server at {any}", .{addr});
+    try reg.set(conn, &server.client_connect_in, ProxyTag, ps.tag);
+    ps.connecting = true;
+    std.log.info("rove-js: connecting to {s} server at {any}", .{ name, addr });
 }
 
-/// Drain `client_connect_out` + `client_connect_errors` — both flip
-/// the "connecting" flag back off. On success we remember the new
-/// session entity so `flushCodeProxyPending` can bind client
-/// requests to it; on failure we just log and wait for the next
-/// `connectCodeServer` tick to re-arm.
-pub fn ingestCodeConnects(worker: anytype) !void {
+/// Drain `client_connect_out` + `client_connect_errors`. Each
+/// entity carries a `ProxyTag` set at connect time, which we use
+/// to route the new session back to the right subsystem.
+pub fn ingestProxyConnects(worker: anytype) !void {
     const server = worker.h2;
     const reg = server.reg;
 
     {
         const ents = server.client_connect_out.entitySlice();
-        for (ents) |ent| {
+        // Snapshot because the loop destroys entities.
+        const snap = try worker.allocator.dupe(rove.Entity, ents);
+        defer worker.allocator.free(snap);
+
+        for (snap) |ent| {
             const sess = try reg.get(ent, &server.client_connect_out, h2.Session);
-            worker.code_session = sess.entity;
-            worker.code_connecting = false;
-            std.log.info("rove-js: code server connected (session={d})", .{sess.entity.index});
+            const tag = reg.get(ent, &server.client_connect_out, ProxyTag) catch null;
+            const kind = if (tag) |t| t.kind else .none;
+            switch (kind) {
+                .code => {
+                    worker.code_proxy.session = sess.entity;
+                    worker.code_proxy.connecting = false;
+                    std.log.info("rove-js: code server connected (session={d})", .{sess.entity.index});
+                },
+                .log => {
+                    worker.log_proxy.session = sess.entity;
+                    worker.log_proxy.connecting = false;
+                    std.log.info("rove-js: log server connected (session={d})", .{sess.entity.index});
+                },
+                .none => std.log.warn("rove-js: untagged proxy connect succeeded", .{}),
+            }
             try reg.destroy(ent);
         }
     }
     {
         const ents = server.client_connect_errors.entitySlice();
-        for (ents) |ent| {
-            worker.code_connecting = false;
+        const snap = try worker.allocator.dupe(rove.Entity, ents);
+        defer worker.allocator.free(snap);
+
+        for (snap) |ent| {
+            const tag = reg.get(ent, &server.client_connect_errors, ProxyTag) catch null;
+            const kind = if (tag) |t| t.kind else .none;
+            switch (kind) {
+                .code => worker.code_proxy.connecting = false,
+                .log => worker.log_proxy.connecting = false,
+                .none => {},
+            }
             const io = reg.get(ent, &server.client_connect_errors, h2.H2IoResult) catch null;
             const err_code: i32 = if (io) |i| i.err else -1;
-            std.log.warn("rove-js: code server connect failed: {d}", .{err_code});
+            std.log.warn("rove-js: {any} proxy connect failed: {d}", .{ kind, err_code });
             try reg.destroy(ent);
         }
     }
 }
 
-/// Forward any parked `/_system/code/*` requests to the code server.
-/// Each pending entity gets a fresh client-side entity built from its
-/// method/path/headers/body; the server entity gains a ProxyPeer
-/// back-reference and moves to `code_proxy_inflight`.
-pub fn flushCodeProxyPending(worker: anytype) !void {
+/// Forward parked proxy requests for every subsystem with a live
+/// upstream session.
+pub fn flushProxyPending(worker: anytype) !void {
+    try flushOne(worker, &worker.code_proxy);
+    try flushOne(worker, &worker.log_proxy);
+}
+
+fn flushOne(
+    worker: anytype,
+    ps: anytype,
+) !void {
     const server = worker.h2;
     const reg = server.reg;
     const allocator = worker.allocator;
 
-    if (worker.reg.isStale(worker.code_session)) return;
-    const upstream_session = worker.code_session;
+    if (worker.reg.isStale(ps.session)) return;
+    const upstream_session = ps.session;
 
-    const entities = worker.code_proxy_pending.entitySlice();
-    // Iterate a copy of the slice because `reg.move` mutates the
-    // pending collection and invalidates `entitySlice()` positions.
+    const entities = ps.pending.entitySlice();
     const snapshot = try allocator.dupe(rove.Entity, entities);
     defer allocator.free(snapshot);
 
     for (snapshot) |server_ent| {
-        const rh = try worker.reg.get(server_ent, &worker.code_proxy_pending, h2.ReqHeaders);
-        const rb = try worker.reg.get(server_ent, &worker.code_proxy_pending, h2.ReqBody);
+        const rh = try worker.reg.get(server_ent, &ps.pending, h2.ReqHeaders);
+        const rb = try worker.reg.get(server_ent, &ps.pending, h2.ReqBody);
 
-        // Build a fresh header array for the client request. The
-        // `:path` pseudo-header is rewritten from
-        // `/_system/code/...` to just `/...` so the code-server's
-        // routes (`/{instance_id}/upload`, etc.) match. All other
-        // fields pass through verbatim.
+        // Rewrite `:path` by stripping the `/_system/{subsystem}`
+        // prefix so the subsystem's routes match. `forwardHeaders`
+        // handles this for both subsystems — same rule applies.
         const header_fields = forwardHeaders(allocator, rh.*) catch |err| {
             std.log.warn("rove-js proxy: forwardHeaders failed: {s}", .{@errorName(err)});
             const body = try allocator.dupe(u8, "internal proxy error\n");
-            try setProxyFault(server, server_ent, &worker.code_proxy_pending, 500, body);
-            try worker.reg.move(server_ent, &worker.code_proxy_pending, &server.response_in);
+            try setProxyFault(server, server_ent, &ps.pending, 500, body);
+            try worker.reg.move(server_ent, &ps.pending, &server.response_in);
             continue;
         };
 
@@ -1443,6 +1520,7 @@ pub fn flushCodeProxyPending(worker: anytype) !void {
 
         const client_ent = try reg.create(&server.client_request_in);
         try reg.set(client_ent, &server.client_request_in, h2.Session, .{ .entity = upstream_session });
+        try reg.set(client_ent, &server.client_request_in, ProxyTag, ps.tag);
         try reg.set(client_ent, &server.client_request_in, h2.ReqHeaders, .{
             .fields = header_fields.ptr,
             .count = @intCast(header_fields.len),
@@ -1452,19 +1530,15 @@ pub fn flushCodeProxyPending(worker: anytype) !void {
             .len = body_len,
         });
 
-        // Cross-reference from the server entity → client entity.
-        try worker.reg.set(server_ent, &worker.code_proxy_pending, ProxyPeer, .{ .client = client_ent });
-        try worker.reg.move(server_ent, &worker.code_proxy_pending, &worker.code_proxy_inflight);
+        try worker.reg.set(server_ent, &ps.pending, ProxyPeer, .{ .client = client_ent });
+        try worker.reg.move(server_ent, &ps.pending, &ps.inflight);
     }
 }
 
-/// Map upstream responses back onto their server-side peers. Each
-/// client entity in `client_response_out` must have a matching server
-/// entity in `code_proxy_inflight` with `ProxyPeer.client == this`.
-/// Orphan client entities (no match) are logged + destroyed; they
-/// indicate a race where the server entity got timed out separately
-/// but should not happen in the current M1 code (no proxy timeout).
-pub fn drainCodeProxyResponses(worker: anytype) !void {
+/// Map upstream responses back onto server-side peers. Uses
+/// `ProxyTag` on the client entity to route to the right inflight
+/// collection in O(1).
+pub fn drainProxyResponses(worker: anytype) !void {
     const server = worker.h2;
     const reg = server.reg;
     const allocator = worker.allocator;
@@ -1472,77 +1546,87 @@ pub fn drainCodeProxyResponses(worker: anytype) !void {
     const client_ents = server.client_response_out.entitySlice();
     if (client_ents.len == 0) return;
 
-    const inflight_ents = worker.code_proxy_inflight.entitySlice();
-    const peers = worker.code_proxy_inflight.column(ProxyPeer);
-
-    // Snapshot the inflight slice so `reg.move` calls below don't
-    // invalidate index positions mid-loop.
     const client_snapshot = try allocator.dupe(rove.Entity, client_ents);
     defer allocator.free(client_snapshot);
 
     for (client_snapshot) |client_ent| {
-        var server_ent: rove.Entity = rove.Entity.nil;
-        for (inflight_ents, peers) |cand, p| {
-            if (p.client.index == client_ent.index and p.client.generation == client_ent.generation) {
-                server_ent = cand;
-                break;
-            }
+        const tag = reg.get(client_ent, &server.client_response_out, ProxyTag) catch null;
+        const kind = if (tag) |t| t.kind else .none;
+
+        switch (kind) {
+            .code => try mapOneResponse(worker, &worker.code_proxy, client_ent),
+            .log => try mapOneResponse(worker, &worker.log_proxy, client_ent),
+            .none => {
+                std.log.warn("rove-js proxy: untagged upstream response", .{});
+                try reg.destroy(client_ent);
+            },
         }
-        if (server_ent.index == 0 and server_ent.generation == 0) {
-            std.log.warn("rove-js proxy: orphan upstream response", .{});
-            try reg.destroy(client_ent);
-            continue;
-        }
-
-        const ust = try reg.get(client_ent, &server.client_response_out, h2.Status);
-        const urb = try reg.get(client_ent, &server.client_response_out, h2.RespBody);
-        const uio = try reg.get(client_ent, &server.client_response_out, h2.H2IoResult);
-
-        if (uio.err != 0) {
-            // Upstream error → 502. Mirrors shift-h2 proxy behavior.
-            std.log.warn("rove-js proxy: upstream error {d} → 502", .{uio.err});
-            const body = try allocator.dupe(u8, "bad gateway\n");
-            try setProxyFault(server, server_ent, &worker.code_proxy_inflight, 502, body);
-            try worker.reg.move(server_ent, &worker.code_proxy_inflight, &server.response_in);
-            try reg.destroy(client_ent);
-            continue;
-        }
-
-        // Copy upstream status.
-        try worker.reg.set(server_ent, &worker.code_proxy_inflight, h2.Status, .{ .code = ust.code });
-
-        // Copy upstream body. The bytes live in rove-h2's buffer pool
-        // on the client side — dup them so ownership transfer to the
-        // server-side RespBody component is clean and the h2 layer
-        // can reclaim its buffer.
-        var body_copy: ?[*]u8 = null;
-        var body_len: u32 = 0;
-        if (urb.data != null and urb.len > 0) {
-            const buf = try allocator.alloc(u8, urb.len);
-            @memcpy(buf, urb.data.?[0..urb.len]);
-            body_copy = buf.ptr;
-            body_len = urb.len;
-        }
-        try worker.reg.set(server_ent, &worker.code_proxy_inflight, h2.RespBody, .{ .data = body_copy, .len = body_len });
-        try worker.reg.set(server_ent, &worker.code_proxy_inflight, h2.RespHeaders, .{ .fields = null, .count = 0 });
-        try worker.reg.set(server_ent, &worker.code_proxy_inflight, h2.H2IoResult, .{ .err = 0 });
-
-        try worker.reg.move(server_ent, &worker.code_proxy_inflight, &server.response_in);
-        try reg.destroy(client_ent);
     }
 }
 
-/// Prefix stripped off every `/_system/code/` proxy forward before the
-/// request is handed to rove-h2's client side. The remainder
-/// (`{instance_id}/{op}[/{tail...}]`) matches the code-server thread's
-/// routing shape directly, so no further rewriting is needed.
-const SYSTEM_CODE_PREFIX: []const u8 = "/_system/code";
+fn mapOneResponse(
+    worker: anytype,
+    ps: anytype,
+    client_ent: rove.Entity,
+) !void {
+    const server = worker.h2;
+    const reg = server.reg;
+    const allocator = worker.allocator;
+
+    const inflight_ents = ps.inflight.entitySlice();
+    const peers = ps.inflight.column(ProxyPeer);
+    var server_ent: rove.Entity = rove.Entity.nil;
+    for (inflight_ents, peers) |cand, p| {
+        if (p.client.index == client_ent.index and p.client.generation == client_ent.generation) {
+            server_ent = cand;
+            break;
+        }
+    }
+    if (server_ent.index == 0 and server_ent.generation == 0) {
+        std.log.warn("rove-js proxy: orphan upstream response", .{});
+        try reg.destroy(client_ent);
+        return;
+    }
+
+    const ust = try reg.get(client_ent, &server.client_response_out, h2.Status);
+    const urb = try reg.get(client_ent, &server.client_response_out, h2.RespBody);
+    const uio = try reg.get(client_ent, &server.client_response_out, h2.H2IoResult);
+
+    if (uio.err != 0) {
+        std.log.warn("rove-js proxy: upstream error {d} → 502", .{uio.err});
+        const body = try allocator.dupe(u8, "bad gateway\n");
+        try setProxyFault(server, server_ent, &ps.inflight, 502, body);
+        try worker.reg.move(server_ent, &ps.inflight, &server.response_in);
+        try reg.destroy(client_ent);
+        return;
+    }
+
+    try worker.reg.set(server_ent, &ps.inflight, h2.Status, .{ .code = ust.code });
+
+    var body_copy: ?[*]u8 = null;
+    var body_len: u32 = 0;
+    if (urb.data != null and urb.len > 0) {
+        const buf = try allocator.alloc(u8, urb.len);
+        @memcpy(buf, urb.data.?[0..urb.len]);
+        body_copy = buf.ptr;
+        body_len = urb.len;
+    }
+    try worker.reg.set(server_ent, &ps.inflight, h2.RespBody, .{ .data = body_copy, .len = body_len });
+    try worker.reg.set(server_ent, &ps.inflight, h2.RespHeaders, .{ .fields = null, .count = 0 });
+    try worker.reg.set(server_ent, &ps.inflight, h2.H2IoResult, .{ .err = 0 });
+
+    try worker.reg.move(server_ent, &ps.inflight, &server.response_in);
+    try reg.destroy(client_ent);
+}
 
 /// Duplicate the request headers, rewriting `:path` to strip the
-/// `/_system/code` prefix. `:authority` is left alone — the code
-/// server doesn't care what host name the caller used. Fields are
-/// allocated on `allocator` and owned by the returned slice; rove-h2
-/// frees them when the request finishes.
+/// `/_system/{subsystem}` prefix so downstream subsystem routes
+/// (`/{instance_id}/upload`, `/{instance_id}/list`, etc.) match. The
+/// prefix is two segments: `/_system` + `/code` or `/log`. We walk
+/// past the first two `/`s. `:authority` is left alone — subsystems
+/// don't care what host name the caller used. Fields are allocated
+/// on `allocator` and owned by the returned slice; rove-h2 frees
+/// them when the request finishes.
 fn forwardHeaders(
     allocator: std.mem.Allocator,
     rh: h2.ReqHeaders,
@@ -1556,9 +1640,14 @@ fn forwardHeaders(
 
         var value_slice: []const u8 = f.value[0..f.value_len];
         if (f.name_len == 5 and std.mem.eql(u8, name, ":path")) {
-            if (std.mem.startsWith(u8, value_slice, SYSTEM_CODE_PREFIX)) {
-                value_slice = value_slice[SYSTEM_CODE_PREFIX.len..];
-                if (value_slice.len == 0) value_slice = "/";
+            if (std.mem.startsWith(u8, value_slice, "/_system/")) {
+                // Find the second '/' after "/_system/" to strip
+                // `/{subsystem}` as well.
+                const after_sys = value_slice["/_system/".len..];
+                if (std.mem.indexOfScalar(u8, after_sys, '/')) |slash| {
+                    value_slice = after_sys[slash..];
+                    if (value_slice.len == 0) value_slice = "/";
+                }
             }
         }
 

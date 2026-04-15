@@ -177,7 +177,32 @@ pub const ProposeError = error{
     OutOfMemory,
 };
 
-// ── Lock-free MPSC bounded queue of proposals ──────────────────────────
+// ── MPSC bounded queue of proposals ────────────────────────────────────
+//
+// Multiple producer threads (worker h2 threads in the shared-nothing
+// model) can call `RaftNode.propose` concurrently; one consumer (the
+// raft thread) drains via `pop`. The hot path needs to be correct
+// under concurrent producers, not necessarily wait-free — proposes
+// are rare relative to handler execution, and the queue reservation
+// itself is a handful of instructions.
+//
+// The implementation is a classic "CAS-reserve a tail slot, write it,
+// publish" MPSC ring. Producer semantics:
+//
+//   1. Load tail, load head. If the ring is full, return false.
+//   2. CAS tail → tail+1 to reserve the slot. On failure, retry.
+//   3. Write the slot's `len`, then its `framed` pointer.
+//   4. Publish by storing `ready_to = tail+1` with release ordering.
+//
+// Consumer (raft thread) pops by checking `ready_to > head` — that's
+// the only safe way to know whether the slot at `head` has been
+// written fully. `head`/`tail` alone can't distinguish "slot reserved
+// but not yet written" from "slot written and ready to read."
+//
+// This pattern wastes one index per push (head vs ready_to) but
+// removes the single-producer race the earlier "MPSC" comment lied
+// about. A mutex-protected push would also be correct; the CAS
+// version matches what the comment always claimed.
 
 const QUEUE_CAP: usize = 4096; // power of two
 
@@ -190,28 +215,64 @@ const Slot = struct {
 
 const ProposalQueue = struct {
     slots: [QUEUE_CAP]Slot,
+    /// Next index the consumer will read from. Advanced only by the
+    /// single consumer thread.
     head: std.atomic.Value(u64),
+    /// Next index to reserve for writing. Producers CAS this to claim
+    /// a slot, then publish by advancing `ready_to`.
     tail: std.atomic.Value(u64),
+    /// Every index < `ready_to` has been fully written by its producer
+    /// and is safe for the consumer to read. Producers advance this
+    /// one index at a time, but only in order — a producer with slot
+    /// `N` must spin until `ready_to == N` before publishing `N+1`.
+    /// This enforces that slots become visible in reservation order,
+    /// which is what the consumer's simple `head < ready_to` check
+    /// depends on.
+    ready_to: std.atomic.Value(u64),
 
     fn init(self: *ProposalQueue) void {
         for (&self.slots) |*s| s.* = .{ .framed = undefined, .len = 0 };
         self.head.store(0, .seq_cst);
         self.tail.store(0, .seq_cst);
+        self.ready_to.store(0, .seq_cst);
     }
 
     fn push(self: *ProposalQueue, framed: []u8) bool {
-        const tail = self.tail.load(.monotonic);
-        const head = self.head.load(.acquire);
-        if (tail -% head >= QUEUE_CAP) return false;
-        self.slots[tail & (QUEUE_CAP - 1)] = .{ .framed = framed.ptr, .len = framed.len };
-        self.tail.store(tail +% 1, .release);
+        // Reserve a slot by CAS'ing tail forward. Multiple producers
+        // race here; only one wins per iteration.
+        var my_tail: u64 = undefined;
+        while (true) {
+            const t = self.tail.load(.monotonic);
+            const h = self.head.load(.acquire);
+            if (t -% h >= QUEUE_CAP) return false;
+            if (self.tail.cmpxchgWeak(t, t +% 1, .acq_rel, .monotonic)) |_| {
+                // Lost the race; retry.
+                continue;
+            }
+            my_tail = t;
+            break;
+        }
+
+        // Write our slot. Only we own `my_tail` at this point.
+        self.slots[my_tail & (QUEUE_CAP - 1)] = .{
+            .framed = framed.ptr,
+            .len = framed.len,
+        };
+
+        // Publish in reservation order. Another producer holding a
+        // later slot must wait for us to advance `ready_to` first.
+        // Spin on the CAS rather than blocking — the window is a few
+        // instructions wide.
+        while (self.ready_to.cmpxchgWeak(my_tail, my_tail +% 1, .release, .monotonic)) |_| {
+            std.atomic.spinLoopHint();
+        }
         return true;
     }
 
     fn pop(self: *ProposalQueue) ?[]u8 {
         const head = self.head.load(.monotonic);
-        const tail = self.tail.load(.acquire);
-        if (head == tail) return null;
+        const ready = self.ready_to.load(.acquire);
+        if (head == ready) return null;
         const slot = &self.slots[head & (QUEUE_CAP - 1)];
         const out = slot.framed[0..slot.len];
         slot.len = 0;
@@ -220,7 +281,7 @@ const ProposalQueue = struct {
     }
 
     fn isEmpty(self: *const ProposalQueue) bool {
-        return self.head.load(.acquire) == self.tail.load(.acquire);
+        return self.head.load(.acquire) == self.ready_to.load(.acquire);
     }
 };
 
@@ -1896,6 +1957,156 @@ fn cleanupDb(path: [:0]const u8) void {
     const shm = std.fmt.bufPrint(&shm_buf, "{s}-shm", .{path}) catch return;
     std.fs.cwd().deleteFile(wal) catch {};
     std.fs.cwd().deleteFile(shm) catch {};
+}
+
+test "ProposalQueue: single-producer single-consumer round trip" {
+    var q: ProposalQueue = undefined;
+    q.init();
+
+    var buf_a = [_]u8{'a'} ** 16;
+    var buf_b = [_]u8{'b'} ** 16;
+
+    try testing.expect(q.isEmpty());
+    try testing.expect(q.push(&buf_a));
+    try testing.expect(q.push(&buf_b));
+    try testing.expect(!q.isEmpty());
+
+    const p1 = q.pop().?;
+    try testing.expectEqual(@as(usize, 16), p1.len);
+    try testing.expectEqual(@as(u8, 'a'), p1[0]);
+
+    const p2 = q.pop().?;
+    try testing.expectEqual(@as(u8, 'b'), p2[0]);
+    try testing.expect(q.pop() == null);
+    try testing.expect(q.isEmpty());
+}
+
+test "ProposalQueue: capacity bound is enforced" {
+    const allocator = testing.allocator;
+    var q: ProposalQueue = undefined;
+    q.init();
+
+    // Allocate a distinct 1-byte buffer per slot so we can verify
+    // every push wrote the correct pointer when we drain.
+    const bufs = try allocator.alloc([]u8, QUEUE_CAP);
+    defer {
+        for (bufs) |b| allocator.free(b);
+        allocator.free(bufs);
+    }
+    for (bufs, 0..) |*b, i| {
+        b.* = try allocator.alloc(u8, 1);
+        b.*[0] = @intCast(i & 0xff);
+    }
+
+    for (bufs) |b| try testing.expect(q.push(b));
+
+    // Queue is full — one more push must fail, not corrupt.
+    var overflow = [_]u8{0xff};
+    try testing.expect(!q.push(&overflow));
+
+    // Drain and verify every slot came back intact in order.
+    var i: usize = 0;
+    while (q.pop()) |out| : (i += 1) {
+        try testing.expectEqual(@as(usize, 1), out.len);
+        try testing.expectEqual(@as(u8, @intCast(i & 0xff)), out[0]);
+    }
+    try testing.expectEqual(QUEUE_CAP, i);
+}
+
+test "ProposalQueue: concurrent producers, single consumer" {
+    // Stress-test the MPSC path. Without this, the old single-
+    // producer-only push races silently under concurrent callers:
+    // two producers could read the same tail, write the same slot,
+    // and lose one writeset entirely. The test is precise — every
+    // push that returns `true` must appear exactly once on the
+    // consumer side, with its original byte pattern.
+
+    const allocator = testing.allocator;
+    const producer_count: usize = 4;
+    const per_producer: usize = 256;
+    const total: usize = producer_count * per_producer;
+
+    const queue = try allocator.create(ProposalQueue);
+    defer allocator.destroy(queue);
+    queue.init();
+
+    // Pre-allocate all buffers. Each slot carries its producer id in
+    // the high byte and its per-producer index in the next 3 bytes,
+    // so we can reconstruct who produced what.
+    const bufs = try allocator.alloc([]u8, total);
+    defer {
+        for (bufs) |b| allocator.free(b);
+        allocator.free(bufs);
+    }
+    for (bufs, 0..) |*b, i| {
+        b.* = try allocator.alloc(u8, 4);
+        b.*[0] = @intCast((i / per_producer) & 0xff); // producer id
+        std.mem.writeInt(u32, b.*[0..4], @intCast(i), .big);
+    }
+
+    const ProducerCtx = struct {
+        q: *ProposalQueue,
+        bufs: [][]u8,
+        start: usize,
+        count: usize,
+        pushed: std.atomic.Value(usize) = .{ .raw = 0 },
+
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.count) {
+                if (self.q.push(self.bufs[self.start + i])) {
+                    _ = self.pushed.fetchAdd(1, .monotonic);
+                    i += 1;
+                } else {
+                    std.Thread.yield() catch {};
+                }
+            }
+        }
+    };
+
+    const producers = try allocator.alloc(ProducerCtx, producer_count);
+    defer allocator.free(producers);
+    for (producers, 0..) |*p, i| {
+        p.* = .{
+            .q = queue,
+            .bufs = bufs,
+            .start = i * per_producer,
+            .count = per_producer,
+        };
+    }
+
+    const threads = try allocator.alloc(std.Thread, producer_count);
+    defer allocator.free(threads);
+    for (threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, ProducerCtx.run, .{&producers[i]});
+    }
+
+    // Drain on the main thread (the "consumer") while producers push.
+    // Track every unique buffer ptr we see so we can verify each was
+    // delivered exactly once with its original content.
+    var seen = try allocator.alloc(bool, total);
+    defer allocator.free(seen);
+    @memset(seen, false);
+
+    var drained: usize = 0;
+    while (drained < total) {
+        if (queue.pop()) |out| {
+            try testing.expectEqual(@as(usize, 4), out.len);
+            const id = std.mem.readInt(u32, out[0..4], .big);
+            try testing.expect(id < total);
+            try testing.expectEqual(false, seen[id]);
+            seen[id] = true;
+            drained += 1;
+        } else {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    for (threads) |t| t.join();
+
+    // Every buffer must have been delivered exactly once.
+    for (seen) |s| try testing.expect(s);
+    try testing.expect(queue.pop() == null);
 }
 
 test "raft_log replay across restart rehydrates log + state" {
