@@ -1,2 +1,214 @@
-/* rove admin — styles land in M2. */
-body { font: 14px/1.4 system-ui, sans-serif; margin: 0; }
+/* rove admin — dense internal tool styling. No framework, no build
+   step. Dark mode via `prefers-color-scheme`. */
+
+:root {
+  --bg: #fdfdfc;
+  --panel: #ffffff;
+  --border: #dcdad4;
+  --text: #1d1e1a;
+  --muted: #6c6a63;
+  --accent: #2a6df4;
+  --accent-hover: #1c56d0;
+  --danger: #b4292b;
+  --danger-hover: #8f1f21;
+  --error-bg: #fde8e7;
+  --error-fg: #8f1f21;
+  --input-bg: #ffffff;
+  --shadow: 0 1px 0 rgba(0, 0, 0, 0.02);
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181b;
+    --panel: #1f2125;
+    --border: #33363d;
+    --text: #e6e6e3;
+    --muted: #8e9099;
+    --accent: #5a8cff;
+    --accent-hover: #7ba1ff;
+    --danger: #e66a6c;
+    --danger-hover: #ff8285;
+    --error-bg: #3a1f20;
+    --error-fg: #ff9a9c;
+    --input-bg: #14151a;
+    --shadow: 0 1px 0 rgba(0, 0, 0, 0.3);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+#app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+
+h1 {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 0 0 4px;
+  letter-spacing: -0.01em;
+}
+
+h2 {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+
+p { margin: 0 0 12px; }
+
+button {
+  font: inherit;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+button[type="submit"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+button[type="submit"]:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: #fff;
+}
+
+.actions button {
+  padding: 4px 10px;
+  font-size: 13px;
+  color: var(--danger);
+  border-color: transparent;
+}
+.actions button:hover {
+  border-color: var(--danger);
+  color: var(--danger-hover);
+}
+
+input[type="text"], input[type="password"], input:not([type]), select {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--input-bg);
+  color: var(--text);
+  width: 100%;
+  min-width: 0;
+}
+input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.error {
+  background: var(--error-bg);
+  color: var(--error-fg);
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  margin: 0 0 16px;
+}
+
+/* ── Login ───────────────────────────────────────────────────────── */
+
+.login {
+  max-width: 420px;
+  margin: 64px auto 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 28px 28px 20px;
+  box-shadow: var(--shadow);
+}
+.login p { color: var(--muted); margin-bottom: 20px; }
+.login-form .error { margin-top: 12px; margin-bottom: 0; }
+.login-form button { width: 100%; padding: 8px; font-weight: 500; }
+
+/* ── Instances page ─────────────────────────────────────────────── */
+
+.page-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+.page-header .logout {
+  font-size: 13px;
+  padding: 4px 12px;
+}
+
+.forms {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  margin-bottom: 32px;
+}
+.forms form {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+  box-shadow: var(--shadow);
+}
+.forms form button { width: 100%; }
+
+@media (max-width: 600px) {
+  .forms { grid-template-columns: 1fr; }
+}
+
+.instance-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  box-shadow: var(--shadow);
+}
+.instance-table th {
+  text-align: left;
+  padding: 10px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.instance-table td {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.instance-table tr:last-child td { border-bottom: none; }
+.instance-table td em { color: var(--muted); font-style: normal; font-family: inherit; }
+.instance-table td.actions { text-align: right; width: 1%; white-space: nowrap; }

@@ -1,0 +1,31 @@
+# Caddyfile for the rove admin demo. Env-var-driven so the same file
+# works for local dev and for real-domain demos.
+#
+#   ROVE_ADMIN_DIR  — absolute path to web/admin/ (static root)
+#   ADMIN_HOST      — e.g. admin.loop46.com
+#   API_HOST        — e.g. api.loop46.com
+#   TLS_PORT        — non-standard HTTPS port, e.g. 8443
+#   WORKER_HTTP     — host:port where js-worker listens, e.g. 127.0.0.1:8082
+#
+# js-worker speaks h2c (plaintext HTTP/2) upstream; Caddy terminates
+# TLS from the browser and proxies as h2c inside the loopback hop.
+{
+	admin off
+	auto_https disable_redirects
+}
+
+{$ADMIN_HOST}:{$TLS_PORT} {
+	tls internal
+	root * {$ROVE_ADMIN_DIR}
+	file_server
+	encode gzip
+}
+
+{$API_HOST}:{$TLS_PORT} {
+	tls internal
+	reverse_proxy {$WORKER_HTTP} {
+		transport http {
+			versions h2c
+		}
+	}
+}

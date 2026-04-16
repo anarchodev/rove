@@ -5,6 +5,21 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>rove admin</title>
   <link rel="stylesheet" href="./app.css">
+  <script>
+    // Where to send /_system/* calls. Override via query string
+    // (?api=http://127.0.0.1:8082) or leave blank for same-origin
+    // production deployments. Saved into localStorage so it sticks
+    // across reloads.
+    (() => {
+      const qs = new URLSearchParams(location.search);
+      const override = qs.get("api");
+      if (override != null) {
+        if (override === "") localStorage.removeItem("rove.admin.api_base");
+        else localStorage.setItem("rove.admin.api_base", override);
+      }
+      window.__rove_api_base = localStorage.getItem("rove.admin.api_base") ?? "";
+    })();
+  </script>
 </head>
 <body>
   <div id="app"></div>
