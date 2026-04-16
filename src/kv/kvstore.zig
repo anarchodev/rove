@@ -84,6 +84,14 @@ const SQL_CREATE_SEQ =
     \\CREATE TABLE IF NOT EXISTS kv_seq (id INTEGER PRIMARY KEY AUTOINCREMENT);
 ;
 
+// Index on kv.seq so `MAX(seq)` at open is O(log n) and the delta
+// replication query (`WHERE seq > ? AND seq <= ?`) is a range scan
+// instead of a full table scan. Created lazily inside openInternal so
+// existing databases pick it up on next open without a migration step.
+const SQL_CREATE_SEQ_INDEX =
+    \\CREATE INDEX IF NOT EXISTS kv_seq_idx ON kv (seq);
+;
+
 // Undo log. See module doc comment for the full rationale. Briefly: a
 // `TrackedTxn` captures the pre-image of every key it touches so a crash
 // between local commit and raft commit can be rolled back on startup. A
@@ -100,7 +108,6 @@ const SQL_CREATE_UNDO =
 ;
 
 const SQL_GET = "SELECT value FROM kv WHERE key = ?;";
-const SQL_GET_WITH_SEQ = "SELECT value, seq FROM kv WHERE key = ?;";
 const SQL_PUT = "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?);";
 const SQL_PUT_SEQ = "INSERT OR REPLACE INTO kv (key, value, seq) VALUES (?, ?, ?);";
 const SQL_DEL = "DELETE FROM kv WHERE key = ?;";
@@ -115,14 +122,31 @@ const SQL_BEGIN = "BEGIN;";
 const SQL_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE;";
 const SQL_COMMIT = "COMMIT;";
 const SQL_ROLLBACK = "ROLLBACK;";
-const SQL_NEXT_SEQ = "INSERT INTO kv_seq DEFAULT VALUES;";
-const SQL_SEQ_TRUNC = "DELETE FROM kv_seq WHERE id <= ?;";
 const SQL_MAX_SEQ = "SELECT MAX(seq) FROM kv;";
+// Initial seq for a fresh store / for verifying migration from an older
+// schema. Reads the historical high-water mark from kv_seq's
+// `sqlite_sequence` row — AUTOINCREMENT tracks "max id ever used" even
+// after rows are deleted, so this is stable across restarts. Seq
+// allocation is now done in-memory (see `SeqCounter`), but we still
+// seed from max(kv_seq historical max, MAX(kv.seq)) so an upgrade from
+// the old per-write-INSERT scheme never reuses a value.
+const SQL_MAX_SEQ_SEQUENCE = "SELECT COALESCE(seq, 0) FROM sqlite_sequence WHERE name = 'kv_seq';";
 
 // Undo log statements.
-const SQL_UNDO_INSERT =
+//
+// `SQL_UNDO_CAPTURE` folds the "SELECT prev value, seq FROM kv / bind /
+// INSERT OR IGNORE INTO kv_undo" pair into a single statement. The
+// one-row literal subquery (`SELECT ?2 AS key`) guarantees we always
+// generate exactly one candidate undo row — the LEFT JOIN fills
+// prev_value/prev_seq with NULLs when the key did not exist. On the
+// second+ capture for the same (txn_seq, key) pair within one txn,
+// `INSERT OR IGNORE` no-ops, so only the first pre-image sticks —
+// same contract as the old two-statement path.
+const SQL_UNDO_CAPTURE =
     \\INSERT OR IGNORE INTO kv_undo (txn_seq, key, prev_value, prev_seq)
-    \\VALUES (?, ?, ?, ?);
+    \\SELECT ?1, lit.key, k.value, k.seq
+    \\FROM (SELECT ?2 AS key) AS lit
+    \\LEFT JOIN kv AS k ON k.key = lit.key;
 ;
 const SQL_UNDO_SELECT_UNCOMMITTED =
     \\SELECT txn_seq, key, prev_value, prev_seq FROM kv_undo
@@ -133,11 +157,118 @@ const SQL_UNDO_DELETE_COMMITTED = "DELETE FROM kv_undo WHERE txn_seq <= ?;";
 const SQL_UNDO_DELETE_UNCOMMITTED = "DELETE FROM kv_undo WHERE txn_seq > ?;";
 const SQL_UNDO_DELETE_TXN = "DELETE FROM kv_undo WHERE txn_seq = ?;";
 
+// Single reusable savepoint name. Handlers in a batched dispatch run
+// sequentially — each one SAVEPOINT+RELEASE (or ROLLBACK TO) before
+// the next starts — so there's never more than one savepoint live at
+// once, and reusing the name is safe. Using a fixed name lets us
+// prepare these statements once at open time instead of formatting a
+// new savepoint name per handler.
+const SQL_SAVEPOINT_H = "SAVEPOINT h;";
+const SQL_RELEASE_H = "RELEASE h;";
+const SQL_ROLLBACK_TO_H = "ROLLBACK TO h;";
+
+/// Monotonic counter for `nextSeq`. Replaces the per-write
+/// `INSERT INTO kv_seq` (and its WAL page write) with an atomic
+/// fetch-add. Owned by a single KvStore for test / CLI usage; shared
+/// across multiple KvStores that write to the same db file in
+/// production (the rove-js worker threads each open their own
+/// connection to a tenant's `app.db` — they all need to draw from one
+/// logical counter, or concurrent writers can allocate duplicate seqs
+/// and break `undoTxn`).
+///
+/// Seed from `max(SELECT seq FROM sqlite_sequence WHERE name='kv_seq',
+/// SELECT MAX(seq) FROM kv)` at open time — the `sqlite_sequence` row
+/// preserves the historical high-water mark across restarts even
+/// after we stop writing to `kv_seq`.
+pub const SeqCounter = struct {
+    value: std.atomic.Value(u64) align(std.atomic.cache_line),
+
+    pub fn init(initial: u64) SeqCounter {
+        return .{ .value = .init(initial) };
+    }
+
+    /// Allocate the next sequence value. Post-increment semantics:
+    /// if the counter is at N, the first call returns N+1.
+    pub fn next(self: *SeqCounter) u64 {
+        return self.value.fetchAdd(1, .monotonic) + 1;
+    }
+
+    /// Raise the counter to at least `floor`. Lock-free via CAS. Used
+    /// at open-time when an external counter is supplied — we never
+    /// lower the shared counter, but we do raise it if this store
+    /// happens to have committed writes beyond what the shared counter
+    /// has allocated (e.g. first opener primes it from disk).
+    pub fn raiseTo(self: *SeqCounter, floor: u64) void {
+        var cur = self.value.load(.monotonic);
+        while (cur < floor) {
+            cur = self.value.cmpxchgWeak(cur, floor, .monotonic, .monotonic) orelse return;
+        }
+    }
+
+    pub fn current(self: *const SeqCounter) u64 {
+        return self.value.load(.monotonic);
+    }
+};
+
+/// Thread-safe map from tenant id → owned `*SeqCounter`. The rove-js
+/// worker creates one registry on the main thread at bootstrap and
+/// passes it to every per-worker `Tenant`; each worker's
+/// `KvStore.openWithCounter` pulls the same counter for a given
+/// tenant, so seq allocations are globally unique across workers.
+///
+/// Counters are created lazily on first `getOrCreate` for an id. They
+/// start at 0 and are raised to disk-state floor by `KvStore` on open.
+pub const SeqCounterRegistry = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    counters: std.StringHashMapUnmanaged(*SeqCounter) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) SeqCounterRegistry {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *SeqCounterRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.counters.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.counters.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Return the counter for `id`, creating it if absent. Thread-safe.
+    /// The returned pointer is stable for the lifetime of the registry.
+    pub fn getOrCreate(self: *SeqCounterRegistry, id: []const u8) !*SeqCounter {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.counters.get(id)) |existing| return existing;
+
+        const counter = try self.allocator.create(SeqCounter);
+        errdefer self.allocator.destroy(counter);
+        counter.* = SeqCounter.init(0);
+
+        const id_copy = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_copy);
+
+        try self.counters.put(self.allocator, id_copy, counter);
+        return counter;
+    }
+};
+
 pub const KvStore = struct {
     allocator: std.mem.Allocator,
     db: *c.sqlite3,
+    /// Shared or owned sequence counter. When `owned_counter` is set,
+    /// `counter` points to it; otherwise `counter` points to an
+    /// externally-owned `SeqCounter` provided at open time (typical
+    /// for the rove-js worker path where multiple threads open the
+    /// same db).
+    counter: *SeqCounter,
+    owned_counter: ?SeqCounter,
     stmt_get: *c.sqlite3_stmt,
-    stmt_get_with_seq: *c.sqlite3_stmt,
     stmt_put: *c.sqlite3_stmt,
     stmt_put_seq: *c.sqlite3_stmt,
     stmt_del: *c.sqlite3_stmt,
@@ -147,13 +278,14 @@ pub const KvStore = struct {
     stmt_begin_immediate: *c.sqlite3_stmt,
     stmt_commit: *c.sqlite3_stmt,
     stmt_rollback: *c.sqlite3_stmt,
-    stmt_next_seq: *c.sqlite3_stmt,
-    stmt_seq_trunc: *c.sqlite3_stmt,
-    stmt_undo_insert: *c.sqlite3_stmt,
+    stmt_undo_capture: *c.sqlite3_stmt,
     stmt_undo_select_uncommitted: *c.sqlite3_stmt,
     stmt_undo_delete_committed: *c.sqlite3_stmt,
     stmt_undo_delete_uncommitted: *c.sqlite3_stmt,
     stmt_undo_delete_txn: *c.sqlite3_stmt,
+    stmt_savepoint: *c.sqlite3_stmt,
+    stmt_release: *c.sqlite3_stmt,
+    stmt_rollback_to: *c.sqlite3_stmt,
 
     /// Open mode for `openInternal`. Most callers use `open` for the
     /// read-write path; `openReadOnly` is for inspection tools (the
@@ -164,8 +296,34 @@ pub const KvStore = struct {
 
     /// Open or create a KV store backed by the given SQLite file.
     /// Each thread should call open() to get its own connection.
+    ///
+    /// The returned store owns its own `SeqCounter`. When multiple
+    /// connections to the same file need to share a seq space (the
+    /// rove-js worker path — multiple worker threads each open their
+    /// own `KvStore` to the same `app.db`), use `openWithCounter` and
+    /// pass a shared `SeqCounter` that lives at least as long as any
+    /// of the stores.
     pub fn open(allocator: std.mem.Allocator, path: [:0]const u8) Error!*KvStore {
-        return openInternal(allocator, path, .read_write);
+        return openInternal(allocator, path, .read_write, null);
+    }
+
+    /// Like `open`, but the returned store's `nextSeq` allocations
+    /// come from `shared_counter`. Multiple stores pointing at the
+    /// same file MUST share a counter — otherwise concurrent writers
+    /// can allocate the same seq, which breaks `undoTxn` (it groups
+    /// rollback by txn_seq).
+    ///
+    /// On open, the counter is raised to at least
+    /// `max(MAX(kv.seq), sqlite_sequence['kv_seq'])` to cover whatever
+    /// values the on-disk state already uses. The counter is never
+    /// lowered, so opening N stores in any order converges to the
+    /// same allocation horizon.
+    pub fn openWithCounter(
+        allocator: std.mem.Allocator,
+        path: [:0]const u8,
+        shared_counter: *SeqCounter,
+    ) Error!*KvStore {
+        return openInternal(allocator, path, .read_write, shared_counter);
     }
 
     /// Open an EXISTING KV store in read-only mode. The database file
@@ -177,13 +335,14 @@ pub const KvStore = struct {
     /// (`put`, `delete`, `begin`, ...) on a read-only KvStore returns
     /// SQLITE_READONLY at step time, which surfaces as `Error.Sqlite`.
     pub fn openReadOnly(allocator: std.mem.Allocator, path: [:0]const u8) Error!*KvStore {
-        return openInternal(allocator, path, .read_only);
+        return openInternal(allocator, path, .read_only, null);
     }
 
     fn openInternal(
         allocator: std.mem.Allocator,
         path: [:0]const u8,
         mode: OpenMode,
+        shared_counter: ?*SeqCounter,
     ) Error!*KvStore {
         const self = try allocator.create(KvStore);
         errdefer allocator.destroy(self);
@@ -224,6 +383,7 @@ pub const KvStore = struct {
         if (mode == .read_write) {
             if (c.sqlite3_exec(db, SQL_CREATE, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
             if (c.sqlite3_exec(db, SQL_CREATE_SEQ, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
+            if (c.sqlite3_exec(db, SQL_CREATE_SEQ_INDEX, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
             if (c.sqlite3_exec(db, SQL_CREATE_UNDO, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
         }
 
@@ -234,7 +394,6 @@ pub const KvStore = struct {
         var prepared: usize = 0;
         const stmts = [_]struct { sql: []const u8, field: []const u8 }{
             .{ .sql = SQL_GET, .field = "stmt_get" },
-            .{ .sql = SQL_GET_WITH_SEQ, .field = "stmt_get_with_seq" },
             .{ .sql = SQL_PUT, .field = "stmt_put" },
             .{ .sql = SQL_PUT_SEQ, .field = "stmt_put_seq" },
             .{ .sql = SQL_DEL, .field = "stmt_del" },
@@ -244,13 +403,14 @@ pub const KvStore = struct {
             .{ .sql = SQL_BEGIN_IMMEDIATE, .field = "stmt_begin_immediate" },
             .{ .sql = SQL_COMMIT, .field = "stmt_commit" },
             .{ .sql = SQL_ROLLBACK, .field = "stmt_rollback" },
-            .{ .sql = SQL_NEXT_SEQ, .field = "stmt_next_seq" },
-            .{ .sql = SQL_SEQ_TRUNC, .field = "stmt_seq_trunc" },
-            .{ .sql = SQL_UNDO_INSERT, .field = "stmt_undo_insert" },
+            .{ .sql = SQL_UNDO_CAPTURE, .field = "stmt_undo_capture" },
             .{ .sql = SQL_UNDO_SELECT_UNCOMMITTED, .field = "stmt_undo_select_uncommitted" },
             .{ .sql = SQL_UNDO_DELETE_COMMITTED, .field = "stmt_undo_delete_committed" },
             .{ .sql = SQL_UNDO_DELETE_UNCOMMITTED, .field = "stmt_undo_delete_uncommitted" },
             .{ .sql = SQL_UNDO_DELETE_TXN, .field = "stmt_undo_delete_txn" },
+            .{ .sql = SQL_SAVEPOINT_H, .field = "stmt_savepoint" },
+            .{ .sql = SQL_RELEASE_H, .field = "stmt_release" },
+            .{ .sql = SQL_ROLLBACK_TO_H, .field = "stmt_rollback_to" },
         };
 
         errdefer {
@@ -266,12 +426,27 @@ pub const KvStore = struct {
             prepared += 1;
         }
 
+        // Seed / raise the seq counter. Read both `MAX(kv.seq)` (fast
+        // via `kv_seq_idx`) and `sqlite_sequence['kv_seq']` (the
+        // AUTOINCREMENT historical max — stable across restarts even
+        // after we stopped inserting) and take the larger. This keeps
+        // existing databases migrating from the old SQL-allocated
+        // scheme from reusing seq values.
+        const disk_floor = readSeqFloor(self.db);
+        if (shared_counter) |sc| {
+            sc.raiseTo(disk_floor);
+            self.counter = sc;
+            self.owned_counter = null;
+        } else {
+            self.owned_counter = SeqCounter.init(disk_floor);
+            self.counter = &self.owned_counter.?;
+        }
+
         return self;
     }
 
     pub fn close(self: *KvStore) void {
         _ = c.sqlite3_finalize(self.stmt_get);
-        _ = c.sqlite3_finalize(self.stmt_get_with_seq);
         _ = c.sqlite3_finalize(self.stmt_put);
         _ = c.sqlite3_finalize(self.stmt_put_seq);
         _ = c.sqlite3_finalize(self.stmt_del);
@@ -281,13 +456,14 @@ pub const KvStore = struct {
         _ = c.sqlite3_finalize(self.stmt_begin_immediate);
         _ = c.sqlite3_finalize(self.stmt_commit);
         _ = c.sqlite3_finalize(self.stmt_rollback);
-        _ = c.sqlite3_finalize(self.stmt_next_seq);
-        _ = c.sqlite3_finalize(self.stmt_seq_trunc);
-        _ = c.sqlite3_finalize(self.stmt_undo_insert);
+        _ = c.sqlite3_finalize(self.stmt_undo_capture);
         _ = c.sqlite3_finalize(self.stmt_undo_select_uncommitted);
         _ = c.sqlite3_finalize(self.stmt_undo_delete_committed);
         _ = c.sqlite3_finalize(self.stmt_undo_delete_uncommitted);
         _ = c.sqlite3_finalize(self.stmt_undo_delete_txn);
+        _ = c.sqlite3_finalize(self.stmt_savepoint);
+        _ = c.sqlite3_finalize(self.stmt_release);
+        _ = c.sqlite3_finalize(self.stmt_rollback_to);
         _ = c.sqlite3_close(self.db);
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -424,25 +600,17 @@ pub const KvStore = struct {
 
     // ── Sequence / replication ────────────────────────────────────────
 
-    /// Allocate a monotonic sequence number inside the current transaction.
-    /// Must be called between begin() and commit(). Returns 0 on error.
+    /// Allocate a monotonic sequence number. Lock-free fetch-add on the
+    /// counter; no SQL, no page dirtied. Never returns 0 (counter is
+    /// seeded from on-disk state at open, and post-increment guarantees
+    /// the first allocation is `disk_floor + 1 ≥ 1`).
+    ///
+    /// Safe to call inside or outside a transaction. The old contract
+    /// (must be called between begin/commit) was an artefact of the
+    /// `INSERT INTO kv_seq` implementation; nothing in the atomic path
+    /// cares.
     pub fn nextSeq(self: *KvStore) u64 {
-        const st = self.stmt_next_seq;
-        _ = c.sqlite3_reset(st);
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return 0;
-        return @bitCast(c.sqlite3_last_insert_rowid(self.db));
-    }
-
-    /// Delete sequence entries up to and including `through_seq`.
-    pub fn seqTruncate(self: *KvStore, through_seq: u64) Error!void {
-        const st = self.stmt_seq_trunc;
-        _ = c.sqlite3_reset(st);
-        _ = c.sqlite3_bind_int64(st, 1, @bitCast(through_seq));
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
+        return self.counter.next();
     }
 
     /// Returns the maximum seq value in the kv table, or 0 if empty.
@@ -525,6 +693,22 @@ pub const KvStore = struct {
         _ = c.sqlite3_wal_autocheckpoint(self.db, 0);
     }
 
+    /// Set the SQLite busy-retry timeout on this connection, in
+    /// milliseconds. `0` disables the handler so any operation that
+    /// would have waited for a lock returns `SQLITE_BUSY` immediately.
+    /// The rove-js batched dispatcher flips this to 0 on each worker's
+    /// per-tenant `app.db` connection so a `BEGIN IMMEDIATE` against a
+    /// tenant held by another worker surfaces BUSY right away — the
+    /// dispatcher then skips that tenant and picks a different anchor,
+    /// rather than blocking this thread for up to 5s.
+    ///
+    /// The default (5s) is kept on root / code / log connections
+    /// because their write contention is rare and bursty, mostly at
+    /// startup, where waiting is the right thing.
+    pub fn setBusyTimeout(self: *KvStore, ms: c_int) void {
+        _ = c.sqlite3_busy_timeout(self.db, ms);
+    }
+
     /// Manually checkpoint the WAL (passive — doesn't block readers).
     pub fn checkpoint(self: *KvStore) Error!void {
         _ = try self.checkpointV2();
@@ -596,6 +780,16 @@ pub const KvStore = struct {
 
         /// Open the underlying SQLite txn on first write. Idempotent —
         /// subsequent writes on the same TrackedTxn skip it.
+        /// Force the underlying SQLite txn open right now, even
+        /// without any writes yet. The batched dispatcher uses this
+        /// to detect `SQLITE_BUSY` up front so it can skip the
+        /// current tenant and try a different anchor this tick,
+        /// instead of discovering the contention inside a later
+        /// `put` / `savepoint`.
+        pub fn open(self: *TrackedTxn) Error!void {
+            return self.ensureOpen();
+        }
+
         fn ensureOpen(self: *TrackedTxn) Error!void {
             if (self.opened) return;
             switch (self.kind) {
@@ -605,6 +799,7 @@ pub const KvStore = struct {
                     _ = c.sqlite3_reset(st);
                     const rc = c.sqlite3_step(st);
                     _ = c.sqlite3_reset(st);
+                    if (rc == c.SQLITE_BUSY) return Error.Conflict;
                     if (rc != c.SQLITE_DONE) return Error.Sqlite;
                 },
             }
@@ -633,6 +828,32 @@ pub const KvStore = struct {
             try self.store.delete(key);
         }
 
+        /// Open a savepoint within this tracked txn. Ensures the
+        /// underlying SQLite txn is live (opens with BEGIN IMMEDIATE
+        /// on first call) and stacks a single reusable savepoint
+        /// marker named `h`. Paired with `release` on handler success
+        /// or `rollbackTo` on handler failure. Used by the batched
+        /// dispatcher to isolate multiple handlers' writes within one
+        /// tenant-level transaction.
+        pub fn savepoint(self: *TrackedTxn) Error!void {
+            try self.ensureOpen();
+            try runVoid(self.store.stmt_savepoint);
+        }
+
+        /// Drop the current savepoint; any writes since `savepoint()`
+        /// are promoted into the enclosing txn and will COMMIT if the
+        /// txn commits. Cheap — no disk I/O.
+        pub fn release(self: *TrackedTxn) Error!void {
+            try runVoid(self.store.stmt_release);
+        }
+
+        /// Rewind to the savepoint; any writes since `savepoint()` —
+        /// including undo-log inserts — are discarded. The enclosing
+        /// txn remains open and can continue.
+        pub fn rollbackTo(self: *TrackedTxn) Error!void {
+            try runVoid(self.store.stmt_rollback_to);
+        }
+
         pub fn commit(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
             try self.store.commit();
@@ -646,40 +867,19 @@ pub const KvStore = struct {
         }
 
         fn captureUndo(self: *TrackedTxn, key: []const u8) Error!void {
-            // Read the current value+seq for this key, if any.
-            const st_get = self.store.stmt_get_with_seq;
-            _ = c.sqlite3_reset(st_get);
-            bindText(st_get, 1, key);
-            const rc = c.sqlite3_step(st_get);
-
-            // Prepare the undo insert.
-            const st_ins = self.store.stmt_undo_insert;
-            _ = c.sqlite3_reset(st_ins);
-            _ = c.sqlite3_bind_int64(st_ins, 1, @bitCast(self.txn_seq));
-            bindText(st_ins, 2, key);
-
-            if (rc == c.SQLITE_ROW) {
-                const blob = c.sqlite3_column_blob(st_get, 0);
-                const blen: usize = @intCast(c.sqlite3_column_bytes(st_get, 0));
-                const seq: i64 = c.sqlite3_column_int64(st_get, 1);
-                // Bind the current value as prev_value. SQLITE_STATIC is
-                // safe because we complete the step inline before stepping
-                // the get stmt again.
-                _ = c.sqlite3_bind_blob(st_ins, 3, blob, @intCast(blen), c.SQLITE_STATIC);
-                _ = c.sqlite3_bind_int64(st_ins, 4, seq);
-            } else if (rc == c.SQLITE_DONE) {
-                // Key didn't exist — prev_value is NULL.
-                _ = c.sqlite3_bind_null(st_ins, 3);
-                _ = c.sqlite3_bind_null(st_ins, 4);
-            } else {
-                _ = c.sqlite3_reset(st_get);
-                return Error.Sqlite;
-            }
-
-            const ins_rc = c.sqlite3_step(st_ins);
-            _ = c.sqlite3_reset(st_get);
-            _ = c.sqlite3_reset(st_ins);
-            if (ins_rc != c.SQLITE_DONE) return Error.Sqlite;
+            // Single-statement undo capture. The LEFT JOIN on a
+            // one-row literal always produces exactly one candidate
+            // row (with NULL prev_value/prev_seq when the key doesn't
+            // exist); `INSERT OR IGNORE` no-ops on subsequent writes
+            // to the same (txn_seq, key) pair within the txn. See
+            // `SQL_UNDO_CAPTURE`.
+            const st = self.store.stmt_undo_capture;
+            _ = c.sqlite3_reset(st);
+            _ = c.sqlite3_bind_int64(st, 1, @bitCast(self.txn_seq));
+            bindText(st, 2, key);
+            const rc = c.sqlite3_step(st);
+            _ = c.sqlite3_reset(st);
+            if (rc != c.SQLITE_DONE) return Error.Sqlite;
         }
     };
 
@@ -922,6 +1122,35 @@ fn freeUndoRows(allocator: std.mem.Allocator, rows: []const KvStore.UndoRow) voi
 
 // ── helpers ────────────────────────────────────────────────────────────
 
+/// Compute the seed value for `SeqCounter` at open time:
+/// `max(MAX(kv.seq), sqlite_sequence['kv_seq'])`. Both queries are
+/// O(log n) — kv.seq is indexed by `kv_seq_idx`, and sqlite_sequence
+/// is a single-row lookup. Returns 0 on empty/missing data (fresh db
+/// with no writes yet).
+fn readSeqFloor(db: *c.sqlite3) u64 {
+    var floor: u64 = 0;
+
+    var st1: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, SQL_MAX_SEQ, -1, &st1, null) == c.SQLITE_OK) {
+        defer _ = c.sqlite3_finalize(st1);
+        if (c.sqlite3_step(st1) == c.SQLITE_ROW) {
+            const v: u64 = @bitCast(c.sqlite3_column_int64(st1, 0));
+            if (v > floor) floor = v;
+        }
+    }
+
+    var st2: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, SQL_MAX_SEQ_SEQUENCE, -1, &st2, null) == c.SQLITE_OK) {
+        defer _ = c.sqlite3_finalize(st2);
+        if (c.sqlite3_step(st2) == c.SQLITE_ROW) {
+            const v: u64 = @bitCast(c.sqlite3_column_int64(st2, 0));
+            if (v > floor) floor = v;
+        }
+    }
+
+    return floor;
+}
+
 fn prepare(db: *c.sqlite3, sql: []const u8) Error!*c.sqlite3_stmt {
     var st: ?*c.sqlite3_stmt = null;
     const rc = c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &st, null);
@@ -1128,12 +1357,6 @@ test "delta query" {
     try testing.expectEqual(s2, d.entries[0].seq);
     try testing.expectEqualStrings("c", d.entries[1].key);
     try testing.expectEqual(s3, d.entries[1].seq);
-
-    try kv.seqTruncate(s2);
-    var d2 = try kv.delta(0, std.math.maxInt(u64));
-    defer d2.deinit();
-    // seqTruncate only removes from kv_seq, kv rows persist
-    try testing.expectEqual(@as(usize, 3), d2.entries.len);
 }
 
 test "checkpoint and disable auto" {

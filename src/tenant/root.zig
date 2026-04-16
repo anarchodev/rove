@@ -100,6 +100,12 @@ pub const Tenant = struct {
     root: *kv_mod.KvStore,
     /// Directory where per-instance SQLite files live. Owned.
     dir: []u8,
+    /// Optional shared seq-counter registry. When present,
+    /// per-instance `app.db` stores are opened with a shared
+    /// `SeqCounter`, so concurrent writers across multiple `Tenant`
+    /// instances (one per worker thread in rove-js) draw from a single
+    /// global monotonic seq space. Borrowed, not owned.
+    seq_counters: ?*kv_mod.SeqCounterRegistry = null,
     /// Canonical map: instance_id → *Instance. Values are heap-allocated
     /// and stay alive until `deinit` (or explicit delete).
     instances: std.StringHashMapUnmanaged(*Instance) = .empty,
@@ -113,13 +119,31 @@ pub const Tenant = struct {
         root: *kv_mod.KvStore,
         dir: []const u8,
     ) Error!Tenant {
+        return initWithCounters(allocator, root, dir, null);
+    }
+
+    /// Like `init`, but per-instance KvStores share `seq_counters` for
+    /// their seq allocations. Required for any multi-worker deployment
+    /// where several `Tenant` instances point at the same on-disk
+    /// tenant directory.
+    pub fn initWithCounters(
+        allocator: std.mem.Allocator,
+        root: *kv_mod.KvStore,
+        dir: []const u8,
+        seq_counters: ?*kv_mod.SeqCounterRegistry,
+    ) Error!Tenant {
         if (dir.len == 0) return Error.InvalidDir;
         std.fs.cwd().makePath(dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return Error.InvalidDir,
         };
         const dir_copy = allocator.dupe(u8, dir) catch return Error.OutOfMemory;
-        return .{ .allocator = allocator, .root = root, .dir = dir_copy };
+        return .{
+            .allocator = allocator,
+            .root = root,
+            .dir = dir_copy,
+            .seq_counters = seq_counters,
+        };
     }
 
     pub fn deinit(self: *Tenant) void {
@@ -265,7 +289,11 @@ pub const Tenant = struct {
         ) catch return Error.OutOfMemory;
         defer self.allocator.free(app_path);
 
-        const store = kv_mod.KvStore.open(self.allocator, app_path) catch
+        const store = if (self.seq_counters) |reg| blk: {
+            const counter = reg.getOrCreate(id) catch return Error.OutOfMemory;
+            break :blk kv_mod.KvStore.openWithCounter(self.allocator, app_path, counter) catch
+                return Error.OpenFailed;
+        } else kv_mod.KvStore.open(self.allocator, app_path) catch
             return Error.OpenFailed;
         errdefer store.close();
 

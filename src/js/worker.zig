@@ -106,10 +106,41 @@ pub const RaftWait = struct {
 /// point lives by default.
 pub const DEFAULT_HANDLER_PATH = "index.js";
 
+/// Tick-local scratch list of tenants that refused `BEGIN IMMEDIATE`
+/// with `SQLITE_BUSY` during the current tick. Owned by the caller
+/// (the worker main loop), cleared at the top of each tick, passed
+/// by-pointer into `dispatchOnce` so a blocked tenant doesn't get
+/// picked as anchor again until the tick ends and the list is
+/// cleared.
+///
+/// Bounded at 32 — far above the realistic handful-of-tenants-per-
+/// tick workloads we've measured. `append` returns `error.Overflow`
+/// if the cap is exceeded; `dispatchOnce` treats that as "stop for
+/// now, try again next tick".
+pub const BlockedTenants = struct {
+    items: [32]*const tenant_mod.Instance = undefined,
+    len: usize = 0,
+
+    pub fn clear(self: *BlockedTenants) void {
+        self.len = 0;
+    }
+
+    pub fn slice(self: *const BlockedTenants) []const *const tenant_mod.Instance {
+        return self.items[0..self.len];
+    }
+
+    pub fn append(self: *BlockedTenants, inst: *const tenant_mod.Instance) !void {
+        if (self.len >= self.items.len) return error.Overflow;
+        self.items[self.len] = inst;
+        self.len += 1;
+    }
+};
+
 /// Default interval between deployment refresh checks. Each tick the
 /// worker may check one tenant's `deployment/current` to see if it
 /// advanced and reload the handler bytecode if so.
 pub const DEFAULT_REFRESH_INTERVAL_NS: i64 = 2 * std.time.ns_per_s;
+
 
 /// Per-tenant code state held by the worker. Owns its own KvStore,
 /// BlobStore, and cached bytecode for the tenant's active handler.
@@ -975,18 +1006,59 @@ pub fn refreshDeployments(worker: anytype) !void {
 
 // ── Dispatch system ───────────────────────────────────────────────────
 //
-// `dispatchPending` is a plain function because systems in rove are
-// pure: they iterate one collection, queue deferred ops, and return.
-// The caller owns the flush boundary. This mirrors the shape of
-// `processRequests` in `examples/h2_echo_server.zig`.
+// `dispatchOnce` processes a SINGLE tenant's batch per call. The
+// caller (the worker poll loop) calls it in a loop, flushing between
+// iterations so the ECS removes processed entities from `request_out`.
+// Each call:
+//
+//   1. Walks `request_out.entitySlice()` once.
+//   2. Short-circuits (not-leader, `/_system/*`, unknown tenant,
+//      missing deployment, router / penalty failures) finalize inline
+//      — `setSimpleResponse` + move to `response_in` or a proxy
+//      queue.
+//   3. The first handler-bound entity establishes the anchor tenant;
+//      opens `beginTrackedImmediate` + a `WriteSet`. Subsequent
+//      handler entities are run under `SAVEPOINT h → dispatcher.run
+//      → RELEASE h` (or `ROLLBACK TO h` on error) if they match the
+//      anchor, and skipped this pass if they don't.
+//   4. After the walk, commits once and proposes a single merged
+//      writeset (if any writes). All successful entities land in
+//      `raft_pending` with the shared raft seq; read-only batches
+//      skip raft and land in `response_in`.
+//   5. Returns the number of entities moved out of `request_out`.
+//
+// This amortizes WAL fsync across multiple handlers per tick — the
+// dominant per-tenant bottleneck identified in the Stage 0 profile.
+// Per-handler isolation is preserved: a JS exception or CPU-budget
+// kill in handler #5 only rolls back its savepoint, the rest commit.
+//
+// Skipped entities (different tenant than this tick's anchor) stay in
+// `request_out`; the caller's next `dispatchOnce` call picks a fresh
+// anchor from whoever is still there. Stage 3 will add a
+// blocked-tenant set so a SQLITE_BUSY anchor doesn't block other
+// tenants within a single tick.
 
-/// Iterate `request_out`, run the handler for each pending request,
-/// stamp the response components onto the entity, and either (a) move
-/// it straight to `response_in` (no writes — nothing to replicate) or
-/// (b) propose the writeset through raft and park the entity in
-/// `raft_pending` with a `RaftWait` component. The caller must follow
-/// this with a `reg.flush()`. Per-tick companion: `drainRaftPending`.
-pub fn dispatchPending(worker: anytype) !void {
+/// Process one tenant's batch of requests from `request_out`. Returns
+/// the number of entities moved out of `request_out` (to
+/// `response_in`, `raft_pending`, or a proxy queue). Zero means the
+/// collection has no work the caller can make progress on — either
+/// `request_out` is empty, or all remaining handler entities target
+/// tenants in `blocked`.
+///
+/// The caller MUST flush between calls so the next call sees a
+/// drained `request_out`, and MUST clear `blocked` at the top of
+/// each tick so a tenant that happened to be BUSY this tick gets a
+/// fresh chance next tick.
+///
+/// `blocked` is any value with `.slice()` returning a slice of
+/// `*const tenant_mod.Instance` and a fallible `append(*const
+/// tenant_mod.Instance)` (e.g. `std.BoundedArray`). When
+/// `beginTrackedImmediate` surfaces `error.Conflict` (SQLite
+/// `SQLITE_BUSY` — set `busy_timeout=0` on app.db connections or you
+/// will wait instead), the current anchor candidate is appended; the
+/// linear walk then ignores that tenant's entities for the rest of
+/// this call and the calls that follow within the tick.
+pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     const server = worker.h2;
     const allocator = worker.allocator;
 
@@ -999,20 +1071,55 @@ pub fn dispatchPending(worker: anytype) !void {
     // Leader-only request handling. Followers serve no client traffic
     // — they just replicate the leader's raft entries. Any request
     // that lands on a follower is bounced with 503 + a hint so the
-    // client retries against the leader. This keeps logs clean
-    // (only the leader generates log records, and it can replicate
-    // them through raft to every node), avoids split-brain on reads,
-    // and matches the locked-in "no follower-originated logs" rule.
+    // client retries against the leader.
     const is_leader = worker.raft.isLeader();
+
+    // Batch state. Set lazily on the first handler-bound request we
+    // see; subsequent requests in the same walk that target a
+    // different tenant are left in request_out for a future
+    // dispatchOnce call to pick up.
+    var anchor: ?*const tenant_mod.Instance = null;
+    var txn: ?kv_mod.KvStore.TrackedTxn = null;
+    var writeset = kv_mod.WriteSet.init(allocator);
+    defer writeset.deinit();
+
+    // Successful handlers awaiting the shared commit + final move.
+    // Owns `console_owned` / `exception_owned` until they transfer
+    // into a log record after commit.
+    const SuccessRec = struct {
+        ent: rove.Entity,
+        sid: h2.StreamId,
+        sess: h2.Session,
+        status_code: u16,
+        body_ptr: ?[*]u8,
+        body_len: u32,
+        console_owned: []u8,
+        exception_owned: []u8,
+        method: []const u8,
+        path: []const u8,
+        host: []const u8,
+        deployment_id: u64,
+        received_ns: i64,
+        tape_refs: log_mod.TapeRefs,
+    };
+    var successes: std.ArrayList(SuccessRec) = .empty;
+    defer {
+        for (successes.items) |*s| {
+            if (s.console_owned.len > 0) allocator.free(s.console_owned);
+            if (s.exception_owned.len > 0) allocator.free(s.exception_owned);
+        }
+        successes.deinit(allocator);
+    }
+
+    var processed: usize = 0;
 
     for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
         if (!is_leader) {
             try setSimpleResponse(server, ent, sid, sess, 503, "not leader; retry against the cluster leader\n", allocator);
+            processed += 1;
             continue;
         }
 
-        // Captured at the top of the iteration so duration_ns reflects
-        // total time-in-worker, not just handler time.
         const received_ns: i64 = @intCast(std.time.nanoTimestamp());
 
         const method = findHeader(rh, ":method") orelse "GET";
@@ -1020,35 +1127,29 @@ pub fn dispatchPending(worker: anytype) !void {
         const authority = findHeader(rh, ":authority") orelse "";
         const body: []const u8 = if (rb.data) |p| p[0..rb.len] else "";
 
-        // `/_system/*` is reserved for the infrastructure plane.
-        // Neither tenant resolution nor the JS dispatcher ever sees
-        // these paths — they get parked for proxying to the
-        // appropriate in-process subsystem after auth passes.
-        // Handlers cannot emit `/_system/` URLs to the router,
-        // cannot resolve a domain to them, and cannot even observe
-        // that they exist.
+        // `/_system/*` — auth gate + proxy routing, unchanged.
         if (std.mem.startsWith(u8, path, "/_system/")) {
-            // Auth gate — required for every system endpoint.
             const token = extractBearerToken(rh) orelse {
                 try setSimpleResponse(server, ent, sid, sess, 401, "missing bearer token\n", allocator);
+                processed += 1;
                 continue;
             };
             const auth_ctx = worker.tenant.authenticate(token) catch |err| {
                 std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
                 try setSimpleResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator);
+                processed += 1;
                 continue;
             };
             if (auth_ctx == null) {
                 try setSimpleResponse(server, ent, sid, sess, 401, "invalid bearer token\n", allocator);
+                processed += 1;
                 continue;
             }
 
-            // Parse out the instance id from the path so we can check
-            // tenant-level access. All system paths share the shape
-            // `/_system/{subsystem}/{instance_id}/{rest}`.
             const sys_rest = path["/_system/".len..];
             const sub_slash = std.mem.indexOfScalar(u8, sys_rest, '/') orelse {
                 try setSimpleResponse(server, ent, sid, sess, 404, "malformed system path\n", allocator);
+                processed += 1;
                 continue;
             };
             const subsystem = sys_rest[0..sub_slash];
@@ -1057,79 +1158,77 @@ pub fn dispatchPending(worker: anytype) !void {
             const sys_instance_id = if (inst_slash) |s| after_sub[0..s] else after_sub;
             if (sys_instance_id.len == 0) {
                 try setSimpleResponse(server, ent, sid, sess, 404, "missing instance id\n", allocator);
+                processed += 1;
                 continue;
             }
             const allowed = worker.tenant.canAccessInstance(auth_ctx.?, sys_instance_id) catch false;
             if (!allowed) {
                 try setSimpleResponse(server, ent, sid, sess, 403, "forbidden\n", allocator);
+                processed += 1;
                 continue;
             }
 
             if (std.mem.eql(u8, subsystem, "code")) {
                 if (worker.code_proxy.addr == null) {
                     try setSimpleResponse(server, ent, sid, sess, 503, "code subsystem disabled\n", allocator);
+                    processed += 1;
                     continue;
                 }
                 try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
                 try server.reg.move(ent, &server.request_out, &worker.code_proxy.pending);
+                processed += 1;
                 continue;
             }
             if (std.mem.eql(u8, subsystem, "log")) {
                 if (worker.log_proxy.addr == null) {
                     try setSimpleResponse(server, ent, sid, sess, 503, "log subsystem disabled\n", allocator);
+                    processed += 1;
                     continue;
                 }
                 try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
                 try server.reg.move(ent, &server.request_out, &worker.log_proxy.pending);
+                processed += 1;
                 continue;
             }
 
-            // Unknown subsystem — 501 so the CLI can tell the endpoint
-            // exists-but-not-implemented from a typo'd URL.
             try setSimpleResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator);
+            processed += 1;
             continue;
         }
 
-        // Strip the optional ":port" suffix — Host headers carry it in
-        // dev (e.g. `localhost:8082`) but domain records are indexed by
-        // the bare hostname.
         const host = hostOnly(authority);
 
         const resolved = worker.tenant.resolveDomain(host) catch |err| {
             std.log.warn("rove-js: tenant.resolveDomain({s}) failed: {s}", .{ host, @errorName(err) });
             try setSimpleResponse(server, ent, sid, sess, 500, "tenant resolution failed\n", allocator);
-            // Pre-resolution failure: no tenant_id, can't append to
-            // any tenant's log. Documented gap; stderr captures it.
+            processed += 1;
             continue;
         };
         if (resolved == null) {
             try setSimpleResponse(server, ent, sid, sess, 404, "unknown domain\n", allocator);
-            // Same: unknown tenant, no log home.
+            processed += 1;
             continue;
         }
 
-        // Look up per-tenant code state. If the tenant has no deployment
-        // yet, return 503 with a clear "no deployment" message.
         const tc = worker.tenant_codes.get(resolved.?.id) orelse {
             std.log.warn("rove-js: tenant {s} has no code state", .{resolved.?.id});
             try setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
             captureLog(worker, resolved.?.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+            processed += 1;
             continue;
         };
         if (tc.bytecodes.count() == 0) {
             try setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
             captureLog(worker, resolved.?.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{});
+            processed += 1;
             continue;
         }
 
-        // Resolve URL path → deployment module base via the filesystem
-        // router, then look up the corresponding bytecode. Try `.mjs`
-        // first (the preferred shape; supports `?fn=` function dispatch),
-        // then `.js` (legacy global-script shape).
         var route = router_mod.resolveRoute(allocator, path) catch |err| {
             std.log.warn("rove-js router failed: {s}", .{@errorName(err)});
             try setErrorResponse(server, ent, sid, sess);
             captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+            processed += 1;
             continue;
         };
         defer route.deinit();
@@ -1141,18 +1240,74 @@ pub fn dispatchPending(worker: anytype) !void {
         const bytecode = tc.bytecodes.get(mjs_key) orelse tc.bytecodes.get(js_key) orelse {
             try setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
             captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 404, .handler_error, &.{}, &.{}, .{});
+            processed += 1;
             continue;
         };
 
-        // Circuit breaker: if this tenant has tripped the penalty
-        // box, short-circuit with 503 without touching qjs. Saves the
-        // wall-clock budget for well-behaved tenants.
         if (worker.penalty_box.isBoxed(resolved.?.id, tc.current_deployment_id, received_ns)) {
             try setSimpleResponse(server, ent, sid, sess, 503, "tenant temporarily disabled (cpu budget)\n", allocator);
             captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 503, .timeout, &.{}, &.{}, .{});
+            processed += 1;
             continue;
         }
 
+        // This is a handler-bound request. Either establish the
+        // tick's anchor tenant (open the batch txn) or — if an anchor
+        // already exists and this entity targets a different tenant
+        // (or the tenant was marked busy earlier this tick) — skip it,
+        // leaving it in request_out for a future dispatchOnce call.
+        if (anchor) |a| {
+            if (a != resolved.?) continue;
+        } else {
+            // Already proven BUSY earlier this tick? Skip.
+            var skip_blocked = false;
+            for (blocked.slice()) |b| {
+                if (b == resolved.?) {
+                    skip_blocked = true;
+                    break;
+                }
+            }
+            if (skip_blocked) continue;
+
+            var new_txn = resolved.?.kv.beginTrackedImmediate() catch |err| {
+                std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ resolved.?.id, @errorName(err) });
+                try setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
+                captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                processed += 1;
+                continue;
+            };
+            // Eagerly open the underlying SQLite txn so SQLITE_BUSY
+            // surfaces HERE — if another worker holds RESERVED on
+            // this tenant's app.db we note the tenant as blocked for
+            // the remainder of this tick and skip past it to try a
+            // different anchor (Stage 3: cross-tenant scheduling on
+            // contention).
+            new_txn.open() catch |err| {
+                if (err == kv_mod.KvError.Conflict) {
+                    blocked.append(resolved.?) catch {
+                        // blocked list is bounded; overflow means this
+                        // tick has already tried more tenants than we
+                        // budgeted for. Leave the entity in place and
+                        // return what we've processed so far — next
+                        // tick gets a fresh blocked list.
+                        return processed;
+                    };
+                    continue;
+                }
+                std.log.warn("rove-js open tracked txn ({s}) failed: {s}", .{ resolved.?.id, @errorName(err) });
+                try setSimpleResponse(server, ent, sid, sess, 500, "txn open failed\n", allocator);
+                captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                processed += 1;
+                continue;
+            };
+            txn = new_txn;
+            anchor = resolved.?;
+        }
+
+        // At this point `anchor` is set and equals `resolved.?`, and
+        // `txn` is open. Run the handler under its own savepoint so a
+        // JS exception or CPU-budget kill rolls back only this handler's
+        // writes without poisoning the rest of the batch.
         var tapes = RequestTapes.init(allocator);
         defer tapes.deinit();
 
@@ -1165,38 +1320,27 @@ pub fn dispatchPending(worker: anytype) !void {
             .date_tape = &tapes.date,
             .math_random_tape = &tapes.math_random,
             .crypto_random_tape = &tapes.crypto_random,
-            // Derive a per-request seed from the request_id space so
-            // the PRNG stream is deterministic under replay. `received_ns`
-            // alone is enough for now; Phase 5 can stamp the stable
-            // request_id in here once it's available pre-dispatch.
             .prng_seed = @bitCast(received_ns),
         };
 
-        // Open a tracked txn on the tenant store — `BEGIN IMMEDIATE`
-        // so concurrent writers on this tenant serialize cleanly.
-        // Every exit path from this block must either commit or
-        // rollback the txn.
-        var txn = resolved.?.kv.beginTrackedImmediate() catch |err| {
-            std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ resolved.?.id, @errorName(err) });
-            try setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
+        txn.?.savepoint() catch |err| {
+            std.log.warn("rove-js savepoint({s}) failed: {s}", .{ resolved.?.id, @errorName(err) });
+            try setSimpleResponse(server, ent, sid, sess, 500, "savepoint failed\n", allocator);
             captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            processed += 1;
             continue;
         };
-
-        var writeset = kv_mod.WriteSet.init(allocator);
-        defer writeset.deinit();
 
         var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
         var resp = worker.dispatcher.run(
             resolved.?.kv,
-            &txn,
+            &txn.?,
             &writeset,
             bytecode,
             request,
             &budget,
         ) catch |err| {
-            std.log.warn("rove-js dispatch failed: {s}", .{@errorName(err)});
-            txn.rollback() catch {};
+            txn.?.rollbackTo() catch {};
             const outcome: log_mod.Outcome = if (err == dispatcher_mod.DispatchError.Interrupted)
                 .timeout
             else
@@ -1213,153 +1357,161 @@ pub fn dispatchPending(worker: anytype) !void {
                 try setErrorResponse(server, ent, sid, sess);
             }
             captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, status, outcome, &.{}, &.{}, .{});
+            processed += 1;
             continue;
         };
-        // Defer is structured so that whatever's STILL in resp.console
-        // / resp.exception at end-of-iteration gets freed. The success
-        // path detaches them by clearing to `&.{}` after transferring
-        // ownership into a LogRecord.
+        // `resp.console` / `resp.exception` are freed here unless we
+        // transfer them into a SuccessRec below.
         defer {
             if (resp.console.len > 0) allocator.free(resp.console);
             if (resp.exception.len > 0) allocator.free(resp.exception);
         }
 
-        // Surfaced kv errors from inside the JS callbacks (e.g. SQLITE
-        // errors that couldn't throw cleanly out of a callconv(.c)
-        // function) mean the txn is in a bad state. Roll back and 500.
         if (worker.dispatcher.last_kv_error != null) {
             std.log.warn("rove-js handler kv error: {s}", .{@errorName(worker.dispatcher.last_kv_error.?)});
-            txn.rollback() catch {};
+            worker.dispatcher.last_kv_error = null;
+            txn.?.rollbackTo() catch {};
             try setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
             captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            processed += 1;
             continue;
         }
 
-        // Stamp response components onto the entity. These ride along
-        // through `raft_pending` → `response_in` without rewrites.
-        // RespBody owns the body pointer once set; the `resp.body = &.{}`
-        // below makes sure `resp.deinit` doesn't double-free.
+        txn.?.release() catch |err| {
+            std.log.warn("rove-js release savepoint failed: {s}", .{@errorName(err)});
+            try setSimpleResponse(server, ent, sid, sess, 500, "kv release failed\n", allocator);
+            captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            processed += 1;
+            continue;
+        };
+
+        // Stamp response components on the entity. They ride through
+        // `raft_pending` → `response_in` (or straight to `response_in`
+        // for pure-read batches) without rewrites. The entity stays
+        // in `request_out` until the shared commit completes below.
         const body_ptr: ?[*]u8 = if (resp.body.len > 0) resp.body.ptr else null;
         const body_len: u32 = @intCast(resp.body.len);
         resp.body = &.{};
-
         const status_code: u16 = @intCast(@max(@min(resp.status, 599), 100));
 
         try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
-        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{
-            .fields = null,
-            .count = 0,
-        });
-        try server.reg.set(ent, &server.request_out, h2.RespBody, .{
-            .data = body_ptr,
-            .len = body_len,
-        });
+        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = body_ptr, .len = body_len });
         try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
         try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
         try server.reg.set(ent, &server.request_out, h2.Session, sess);
 
-        // Read-only handlers never need to touch raft, and their commit
-        // releases the empty txn cheaply.
-        if (writeset.ops.items.len == 0) {
-            var ok = true;
-            txn.commit() catch |err| {
-                std.log.warn("rove-js commit (read-only) failed: {s}", .{@errorName(err)});
-                txn.rollback() catch {};
-                try overwriteWith503(server, ent, allocator, body_ptr, body_len);
-                ok = false;
-            };
-            try server.reg.move(ent, &server.request_out, &server.response_in);
+        // Upload tapes now — blob-addressed and idempotent, so storing
+        // them before commit is safe even if the batch later rolls
+        // back. The refs get carried into the log record after commit.
+        const tape_refs = uploadTapes(worker, resolved.?.id, &tapes);
 
-            // Transfer console + exception ownership into the log
-            // record; clear the slices so the defer doesn't double-free.
-            const console_owned = resp.console;
-            const exception_owned = resp.exception;
-            resp.console = &.{};
-            resp.exception = &.{};
-            const refs_ro = uploadTapes(worker, resolved.?.id, &tapes);
-            captureLog(
-                worker,
-                resolved.?.id,
-                method,
-                path,
-                host,
-                tc.current_deployment_id,
-                received_ns,
-                if (ok) status_code else 503,
-                if (ok) .ok else .kv_error,
-                console_owned,
-                exception_owned,
-                refs_ro,
-            );
-            continue;
-        }
-
-        // Writes present: commit locally FIRST (releasing the write
-        // lock so other concurrent requests on this tenant can
-        // proceed), then propose through raft and park. If raft
-        // commits, the parked entity just drains onward — writes are
-        // already durable. If raft faults or we time out, the undo
-        // log lets us compensating-rollback in `drainRaftPending` via
-        // `store.undoTxn(txn_seq)`. This is the pattern rove-kv's
-        // TrackedTxn + kv_undo was built for.
-        const txn_seq = txn.txn_seq;
-        txn.commit() catch |err| {
-            std.log.warn("rove-js txn commit failed: {s}", .{@errorName(err)});
-            // Commit failure is terminal for this request — the txn
-            // is already rolled back by SQLite on commit error, and
-            // we can't replay from the writeset since it's the same
-            // thing that just failed. Respond 500.
-            try overwriteWith503(server, ent, allocator, body_ptr, body_len);
-            try server.reg.move(ent, &server.request_out, &server.response_in);
-            const console_owned_a = resp.console;
-            const exception_owned_a = resp.exception;
-            resp.console = &.{};
-            resp.exception = &.{};
-            const refs_a = uploadTapes(worker, resolved.?.id, &tapes);
-            captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 503, .kv_error, console_owned_a, exception_owned_a, refs_a);
-            continue;
-        };
-
-        const seq = proposeWriteSet(worker, &writeset, resolved.?.id) catch |err| {
-            std.log.warn("rove-js raft propose failed: {s}", .{@errorName(err)});
-            // The writes are already committed locally; compensating
-            // rollback via undoTxn, then 503 so the client retries.
-            resolved.?.kv.undoTxn(txn_seq) catch |undo_err| {
-                std.log.err("rove-js undoTxn failed after propose error: {s}", .{@errorName(undo_err)});
-            };
-            try overwriteWith503(server, ent, allocator, body_ptr, body_len);
-            try server.reg.move(ent, &server.request_out, &server.response_in);
-            const console_owned_b = resp.console;
-            const exception_owned_b = resp.exception;
-            resp.console = &.{};
-            resp.exception = &.{};
-            const refs_b = uploadTapes(worker, resolved.?.id, &tapes);
-            captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 503, .fault, console_owned_b, exception_owned_b, refs_b);
-            continue;
-        };
-
-        const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
-        try server.reg.set(ent, &server.request_out, RaftWait, .{
-            .seq = seq,
-            .txn_seq = txn_seq,
-            .deadline_ns = deadline_ns,
-            .store = resolved.?.kv,
-        });
-
-        try server.reg.move(ent, &server.request_out, &worker.raft_pending);
-
-        // Write-success path: log at propose-time per the planning
-        // decision ("best-effort, log shows what we attempted"). If
-        // the parked request later faults in drainRaftPending, the
-        // mismatch between this `outcome=.ok` log entry and the actual
-        // 503 returned to the client is documented.
-        const console_owned_c = resp.console;
-        const exception_owned_c = resp.exception;
+        const console_owned = resp.console;
+        const exception_owned = resp.exception;
         resp.console = &.{};
         resp.exception = &.{};
-        const refs_c = uploadTapes(worker, resolved.?.id, &tapes);
-        captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, status_code, .ok, console_owned_c, exception_owned_c, refs_c);
+
+        try successes.append(allocator, .{
+            .ent = ent,
+            .sid = sid,
+            .sess = sess,
+            .status_code = status_code,
+            .body_ptr = body_ptr,
+            .body_len = body_len,
+            .console_owned = console_owned,
+            .exception_owned = exception_owned,
+            .method = method,
+            .path = path,
+            .host = host,
+            .deployment_id = tc.current_deployment_id,
+            .received_ns = received_ns,
+            .tape_refs = tape_refs,
+        });
     }
+
+    // End of walk. If no anchor was opened we're done — all processing
+    // was short-circuit (failed) paths.
+    if (anchor == null) return processed;
+
+    const anchor_id = anchor.?.id;
+    const store = anchor.?.kv;
+    const batch_seq = txn.?.txn_seq;
+    const has_writes = writeset.ops.items.len > 0;
+
+    // Commit the shared batch txn. A commit failure means SQLite has
+    // already rolled back everything — downgrade every success to 503.
+    txn.?.commit() catch |err| {
+        std.log.warn("rove-js txn commit (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
+        for (successes.items) |*s| {
+            overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch {};
+            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
+            const console_owned = s.console_owned;
+            const exception_owned = s.exception_owned;
+            s.console_owned = &.{};
+            s.exception_owned = &.{};
+            captureLog(worker, anchor_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .kv_error, console_owned, exception_owned, s.tape_refs);
+            processed += 1;
+        }
+        successes.clearRetainingCapacity();
+        return processed;
+    };
+
+    if (!has_writes) {
+        // Pure read-only batch: no raft hop.
+        for (successes.items) |*s| {
+            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
+            const console_owned = s.console_owned;
+            const exception_owned = s.exception_owned;
+            s.console_owned = &.{};
+            s.exception_owned = &.{};
+            captureLog(worker, anchor_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
+            processed += 1;
+        }
+        successes.clearRetainingCapacity();
+        return processed;
+    }
+
+    // Writes present: propose the merged writeset once for the whole
+    // batch. On propose failure, compensating-rollback via undoTxn and
+    // downgrade every success to 503.
+    const seq = proposeWriteSet(worker, &writeset, anchor_id) catch |err| {
+        std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
+        store.undoTxn(batch_seq) catch |undo_err| {
+            std.log.err("rove-js undoTxn failed after propose error: {s}", .{@errorName(undo_err)});
+        };
+        for (successes.items) |*s| {
+            overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch {};
+            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
+            const console_owned = s.console_owned;
+            const exception_owned = s.exception_owned;
+            s.console_owned = &.{};
+            s.exception_owned = &.{};
+            captureLog(worker, anchor_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .fault, console_owned, exception_owned, s.tape_refs);
+            processed += 1;
+        }
+        successes.clearRetainingCapacity();
+        return processed;
+    };
+
+    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
+    for (successes.items) |*s| {
+        try server.reg.set(s.ent, &server.request_out, RaftWait, .{
+            .seq = seq,
+            .txn_seq = batch_seq,
+            .deadline_ns = deadline_ns,
+            .store = store,
+        });
+        try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
+
+        const console_owned = s.console_owned;
+        const exception_owned = s.exception_owned;
+        s.console_owned = &.{};
+        s.exception_owned = &.{};
+        captureLog(worker, anchor_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
+        processed += 1;
+    }
+    successes.clearRetainingCapacity();
+    return processed;
 }
 
 // ── /_system/code/* proxy ─────────────────────────────────────────────

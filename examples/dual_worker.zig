@@ -160,6 +160,7 @@ fn workerMain(args: *WorkerCtx) !void {
     // can open their per-tenant stores eagerly.
     for (&[_][]const u8{ "acme", "globex" }) |id| {
         try tenant.createInstance(id);
+        if (tenant.instances.get(id)) |inst| inst.kv.setBusyTimeout(0);
     }
 
     const worker = try Worker.create(allocator, &reg, .{
@@ -181,6 +182,8 @@ fn workerMain(args: *WorkerCtx) !void {
     std.log.info("worker {d}: ready, listening on same port via SO_REUSEPORT", .{args.worker_idx});
     args.ready.set();
 
+    var blocked_tenants: rjs.BlockedTenants = .{};
+
     while (!args.stop.load(.acquire)) {
         try worker.pollWithTimeout(1 * std.time.ns_per_ms);
 
@@ -192,8 +195,12 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainProxyResponses(worker);
         try reg.flush();
 
-        try rjs.dispatchPending(worker);
-        try reg.flush();
+        blocked_tenants.clear();
+        while (true) {
+            const processed = try rjs.dispatchOnce(worker, &blocked_tenants);
+            try reg.flush();
+            if (processed == 0) break;
+        }
         try rjs.drainRaftPending(worker);
         try reg.flush();
         try rjs.cleanupResponses(worker);

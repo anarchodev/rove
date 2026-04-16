@@ -115,13 +115,45 @@ const READONLY_HANDLER =
 /// Write benchmark handler. Used by the `write0..write7` tenants to
 /// measure how the writer-lock ceiling on a single `app.db` scales
 /// when the same workload is sharded across independent tenants.
-/// Same shape as `ACME_INDEX` (kv.get + kv.set on `hits`), just with
-/// a different response body for observability.
+/// Matches HOT_BENCH_HANDLER exactly so cross-tenant sharded runs are
+/// directly comparable to single-tenant `hot.test` runs.
 const WRITE_BENCH_HANDLER =
-    \\const count = parseInt(kv.get("hits") ?? "0", 10) + 1;
-    \\kv.set("hits", String(count));
+    \\kv.set("k", "0123456789abcdef0123456789abcdef");
     \\response.status = 200;
-    \\response.body = "wbench: " + count + "\n";
+    \\response.body = "wbench\n";
+;
+
+/// Random-key write benchmark handler. Each request writes to a unique
+/// key (crypto.randomUUID), so there is zero row contention in SQLite.
+/// Compare against WRITE_BENCH_HANDLER (which always hits "hits") to
+/// see whether B-tree page contention is a bottleneck.
+const RANDWRITE_BENCH_HANDLER =
+    \\const key = crypto.randomUUID();
+    \\kv.set(key, "v");
+    \\response.status = 200;
+    \\response.body = "randwrite: " + key + "\n";
+;
+
+/// Fixed-payload, fixed-key contention benchmark. Writes a 32-byte
+/// value to a single hot key. Pair with SPREAD_BENCH_HANDLER (same
+/// payload, 1000-key keyspace) to isolate row-contention cost from
+/// B-tree growth and crypto-RNG overhead.
+const HOT_BENCH_HANDLER =
+    \\kv.set("k", "0123456789abcdef0123456789abcdef");
+    \\response.status = 200;
+    \\response.body = "hot\n";
+;
+
+/// Fair-comparison counterpart to HOT_BENCH_HANDLER. Each request picks
+/// one of 1000 keys at random and writes the same 32-byte value. Small
+/// bounded keyspace keeps the B-tree at a fixed size after a brief
+/// warmup, so the only difference vs HOT is whether concurrent writes
+/// land on the same row or different rows.
+const SPREAD_BENCH_HANDLER =
+    \\const i = Math.floor(Math.random() * 1000);
+    \\kv.set("k" + i, "0123456789abcdef0123456789abcdef");
+    \\response.status = 200;
+    \\response.body = "spread\n";
 ;
 
 /// Number of `writeN` benchmark tenants spun up at startup. Each has
@@ -134,6 +166,7 @@ const NUM_WRITE_TENANTS: usize = 8;
 
 const TENANT_IDS = [_][]const u8{
     "acme",     "globex",   "penalty",  "readonly",
+    "randwrite", "hot",     "spread",
     "write0",   "write1",   "write2",   "write3",
     "write4",   "write5",   "write6",   "write7",
 };
@@ -141,7 +174,7 @@ const TENANT_IDS = [_][]const u8{
 comptime {
     // Keep TENANT_IDS and NUM_WRITE_TENANTS in lockstep so bootstrap
     // and workerMain iterate the same set.
-    std.debug.assert(TENANT_IDS.len == 4 + NUM_WRITE_TENANTS);
+    std.debug.assert(TENANT_IDS.len == 7 + NUM_WRITE_TENANTS);
 }
 
 const Cli = struct {
@@ -164,9 +197,8 @@ const Cli = struct {
     bootstrap_root_token: ?[]const u8 = null,
     /// Number of worker threads. Each owns its own Registry/Io/H2/
     /// Tenant/Dispatcher and binds the same HTTP/2 port via
-    /// SO_REUSEPORT. Default 1 (backward-compatible with the smoke
-    /// scripts). Increase to scale dispatch throughput across cores.
-    workers: u16 = 1,
+    /// SO_REUSEPORT. Defaults to the number of online CPUs.
+    workers: u16 = 0,
     /// Raft proposal linger budget, in microseconds. Hold pending
     /// proposals up to this long so the raft thread can pack more
     /// into a single `raft_log.db` commit + fsync. Under heavy write
@@ -178,7 +210,7 @@ const Cli = struct {
     /// worth it. 0 disables linger (every tick commits whatever it
     /// has). Mapped directly to `RaftNodeConfig.propose_linger_ns`
     /// at init time.
-    propose_linger_us: u64 = 0,
+    propose_linger_us: u64 = 500,
 };
 
 fn parseCli(argv: [][:0]u8) !Cli {
@@ -216,7 +248,6 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.workers = try std.fmt.parseInt(u16, argv[i], 10);
-            if (out.workers == 0) return error.Usage;
         } else if (std.mem.eql(u8, a, "--propose-linger-us")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
@@ -295,6 +326,10 @@ const WorkerCtx = struct {
     raft: *kv.RaftNode,
     code_addr: std.net.Address,
     log_addr: std.net.Address,
+    /// Shared across all workers — every per-tenant `app.db` `KvStore`
+    /// opens with a counter from this registry so seq allocation
+    /// stays globally monotonic.
+    seq_counters: *kv.SeqCounterRegistry,
     /// Main thread blocks on these until every worker has bound its
     /// h2 listener — this is what `SO_REUSEPORT` needs before requests
     /// can hit any of them.
@@ -308,8 +343,8 @@ fn workerMain(args: *WorkerCtx) !void {
     // deferred-op queue is owned by this registry and only touched by
     // this thread.
     var reg = try rove.Registry.init(allocator, .{
-        .max_entities = 4096,
-        .deferred_queue_capacity = 1024,
+        .max_entities = 65536,
+        .deferred_queue_capacity = 4096,
     });
     defer reg.deinit();
 
@@ -327,15 +362,29 @@ fn workerMain(args: *WorkerCtx) !void {
     const root_kv = try kv.KvStore.open(allocator, root_path);
     defer root_kv.close();
 
-    var tenant = try tenant_mod.Tenant.init(allocator, root_kv, args.data_dir);
+    var tenant = try tenant_mod.Tenant.initWithCounters(
+        allocator,
+        root_kv,
+        args.data_dir,
+        args.seq_counters,
+    );
     defer tenant.deinit();
 
     // The main thread already created the instances + assigned domains
     // in the shared __root__.db before spawning us. We just need to
     // promote them into THIS worker's in-memory cache so `Worker.create`
     // can open their per-tenant stores eagerly.
+    //
+    // For the per-tenant `app.db` stores we also set `busy_timeout=0`
+    // so BEGIN IMMEDIATE returns SQLITE_BUSY immediately instead of
+    // blocking up to 5s. The batched dispatcher handles that: it
+    // records the tenant as blocked for this tick and moves on to
+    // pick a different anchor. The WAL-transition race startup
+    // happens via the main thread's `prewarmTenantDbs`, so worker
+    // opens never need the original 5s wait anymore.
     for (TENANT_IDS) |id| {
         try tenant.createInstance(id);
+        if (tenant.instances.get(id)) |inst| inst.kv.setBusyTimeout(0);
     }
 
     const worker = try Worker.create(allocator, &reg, .{
@@ -343,10 +392,16 @@ fn workerMain(args: *WorkerCtx) !void {
         .raft = args.raft,
         .addr = args.http_addr,
         .io_opts = .{
-            .max_connections = 128,
-            .buf_count = 128,
+            .max_connections = 4096,
+            .buf_count = 1024,
             .buf_size = 16384,
+            .listen_backlog = 4096,
             .reuseport = true,
+        },
+        .h2_opts = .{
+            .max_concurrent_streams = 512,
+            .initial_window_size = 1024 * 1024,
+            .max_frame_size = 16384,
         },
         .code_addr = args.code_addr,
         .log_addr = args.log_addr,
@@ -356,6 +411,13 @@ fn workerMain(args: *WorkerCtx) !void {
 
     std.log.info("worker {d}: ready, listening on same port via SO_REUSEPORT", .{args.worker_idx});
     args.ready.set();
+
+    // Scratch list of tenants that returned SQLITE_BUSY on BEGIN
+    // IMMEDIATE during THIS tick. Cleared at the top of each tick so
+    // a tenant temporarily held by another worker gets a fresh
+    // chance next tick. Bounded at 32 — well above the realistic
+    // handful-of-tenants-per-tick workloads we've measured.
+    var blocked_tenants: rjs.BlockedTenants = .{};
 
     while (!stop_flag.load(.acquire)) {
         // Bounded-wait poll. The worker has multiple pieces of
@@ -390,8 +452,18 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainProxyResponses(worker);
         try reg.flush();
 
-        try rjs.dispatchPending(worker);
-        try reg.flush();
+        // Drain request_out one tenant-batch at a time. Each call
+        // processes at most one tenant's requests; the flush between
+        // calls is what lets the next call see a smaller request_out
+        // and pick a fresh anchor tenant. A BUSY anchor this tick is
+        // remembered in `blocked_tenants` so subsequent calls skip it
+        // and try different tenants.
+        blocked_tenants.clear();
+        while (true) {
+            const processed = try rjs.dispatchOnce(worker, &blocked_tenants);
+            try reg.flush();
+            if (processed == 0) break;
+        }
         try rjs.drainRaftPending(worker);
         try reg.flush();
         try rjs.cleanupResponses(worker);
@@ -449,13 +521,19 @@ pub fn main() !void {
             \\  --data-dir <path>           per-node data dir (default /tmp/rove-js-data)
             \\  --fresh                     wipe data dir before start
             \\  --bootstrap-root-token HEX  seed the root auth token at startup
-            \\  --workers <n>               number of worker threads (default 1)
-            \\  --propose-linger-us <n>     raft proposal linger budget in µs (default 0 = off)
+            \\  --workers <n>               number of worker threads (default 0 = nCPU - 1)
+            \\  --propose-linger-us <n>     raft proposal linger budget in µs (default 500)
             \\
         );
         try sw.interface.flush();
         std.process.exit(2);
     };
+
+    // Resolve workers=0 → online CPU count (minus one for the raft thread).
+    const num_workers: u16 = if (cli.workers == 0) blk: {
+        const cpus = std.Thread.getCpuCount() catch 4;
+        break :blk @intCast(@max(1, cpus -| 1));
+    } else cli.workers;
 
     if (cli.fresh) {
         std.fs.cwd().deleteTree(cli.data_dir) catch {};
@@ -495,10 +573,16 @@ pub fn main() !void {
         try tenant.createInstance("globex");
         try tenant.createInstance("penalty");
         try tenant.createInstance("readonly");
+        try tenant.createInstance("randwrite");
+        try tenant.createInstance("hot");
+        try tenant.createInstance("spread");
         try tenant.assignDomain("acme.test", "acme");
         try tenant.assignDomain("globex.test", "globex");
         try tenant.assignDomain("penalty.test", "penalty");
         try tenant.assignDomain("readonly.test", "readonly");
+        try tenant.assignDomain("randwrite.test", "randwrite");
+        try tenant.assignDomain("hot.test", "hot");
+        try tenant.assignDomain("spread.test", "spread");
 
         // Write benchmark tenants — each one gets its own app.db and
         // therefore its own WAL writer lock, so parallel load across
@@ -530,6 +614,15 @@ pub fn main() !void {
         });
         try bootstrapHandler(allocator, cli.data_dir, "readonly", &.{
             .{ .path = "index.js", .source = READONLY_HANDLER },
+        });
+        try bootstrapHandler(allocator, cli.data_dir, "randwrite", &.{
+            .{ .path = "index.js", .source = RANDWRITE_BENCH_HANDLER },
+        });
+        try bootstrapHandler(allocator, cli.data_dir, "hot", &.{
+            .{ .path = "index.js", .source = HOT_BENCH_HANDLER },
+        });
+        try bootstrapHandler(allocator, cli.data_dir, "spread", &.{
+            .{ .path = "index.js", .source = SPREAD_BENCH_HANDLER },
         });
         wi = 0;
         while (wi < NUM_WRITE_TENANTS) : (wi += 1) {
@@ -616,16 +709,22 @@ pub fn main() !void {
     // ── Spawn worker threads ───────────────────────────────────────────
     const http_addr = try parseHostPort(allocator, cli.http);
 
-    const ctxs = try allocator.alloc(WorkerCtx, cli.workers);
+    const ctxs = try allocator.alloc(WorkerCtx, num_workers);
     defer allocator.free(ctxs);
-    const threads = try allocator.alloc(std.Thread, cli.workers);
+    const threads = try allocator.alloc(std.Thread, num_workers);
     defer allocator.free(threads);
-    const ready_events = try allocator.alloc(std.Thread.ResetEvent, cli.workers);
+    const ready_events = try allocator.alloc(std.Thread.ResetEvent, num_workers);
     defer allocator.free(ready_events);
     for (ready_events) |*ev| ev.* = .{};
 
+    // Shared seq-counter registry. Every per-tenant `app.db` KvStore
+    // opened by any worker draws from this, so concurrent worker
+    // threads allocating new seqs for the same tenant never collide.
+    var seq_counters = kv.SeqCounterRegistry.init(allocator);
+    defer seq_counters.deinit();
+
     var i: u16 = 0;
-    while (i < cli.workers) : (i += 1) {
+    while (i < num_workers) : (i += 1) {
         ctxs[i] = .{
             .allocator = allocator,
             .worker_idx = i,
@@ -634,6 +733,7 @@ pub fn main() !void {
             .raft = raft_node,
             .code_addr = code_addr,
             .log_addr = log_addr,
+            .seq_counters = &seq_counters,
             .ready = &ready_events[i],
         };
         threads[i] = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctxs[i]});
@@ -648,7 +748,7 @@ pub fn main() !void {
             "  peers:      {s}\n" ++
             "  instances:  acme (counter), globex (echo), penalty (while(true))\n" ++
             "  domains:    acme.test, globex.test, penalty.test\n",
-        .{ cli.node_id, cli.http, cli.workers, cli.data_dir, cli.node_id, peers.len, cli.listen, cli.peers },
+        .{ cli.node_id, cli.http, num_workers, cli.data_dir, cli.node_id, peers.len, cli.listen, cli.peers },
     );
 
     // Block until SIGINT/SIGTERM flips stop_flag, then join workers.
@@ -657,7 +757,7 @@ pub fn main() !void {
     while (!stop_flag.load(.acquire)) {
         std.Thread.sleep(50 * std.time.ns_per_ms);
     }
-    std.log.info("js-worker: shutdown requested, joining {d} worker(s)", .{cli.workers});
+    std.log.info("js-worker: shutdown requested, joining {d} worker(s)", .{num_workers});
     for (threads) |t| t.join();
     std.log.info("js-worker: bye", .{});
 

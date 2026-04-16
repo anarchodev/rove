@@ -1032,6 +1032,10 @@ pub const RaftNode = struct {
             if (stop) |s| if (s.load(.acquire)) break;
             try self.tick(@intCast(std.time.nanoTimestamp()));
             // Yield briefly so an idle cluster doesn't peg a core.
+            // Under load the 1ms floor is acceptable: proposals batch
+            // across ticks, and the raft thread's per-tick fsync is
+            // already amortized over the batch. For higher throughput,
+            // use `propose_linger_ns` to accumulate larger batches.
             std.Thread.sleep(std.time.ns_per_ms);
         }
 

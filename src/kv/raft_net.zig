@@ -13,9 +13,9 @@ const linux = std.os.linux;
 const posix = std.posix;
 const raft_rpc = @import("raft_rpc.zig");
 
-pub const RING_DEPTH: u16 = 64;
-pub const RECV_BUF_SIZE: u32 = 256 * 1024;
-pub const MAX_SEND_QUEUE: u32 = 256;
+pub const RING_DEPTH: u16 = 256;
+pub const RECV_BUF_SIZE: u32 = 512 * 1024;
+pub const MAX_SEND_QUEUE: u32 = 1024;
 pub const RECONNECT_INITIAL_NS: i64 = 100 * std.time.ns_per_ms;
 pub const RECONNECT_MAX_NS: i64 = 5 * std.time.ns_per_s;
 
