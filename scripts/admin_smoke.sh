@@ -161,5 +161,105 @@ echo "$headers" | grep -iq "access-control-allow-origin: $ORIGIN" || fail "CORS 
 echo "$headers" | grep -iq "content-type: application/json" || fail "content-type missing on GET: $headers"
 ok "real response carries CORS + content-type headers"
 
+# ── 16. Seed KV state via the acme hit-counter handler ────────────
+# The `acme` tenant ships with `kv.set("hits", ...)` as its handler,
+# so a few plain GETs populate a known key we can read back through
+# the admin KV endpoint. Host header picks the tenant.
+for _ in 1 2 3; do
+    "${CURL_BASE[@]}" -o /dev/null -H "Host: acme.test" "http://$HTTP_ADDR/"
+done
+ok "seeded acme KV via 3 handler requests"
+
+# ── 17. KV list returns the seeded key ────────────────────────────
+resp=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/kv/acme")
+echo "$resp" | grep -q '"key":"hits"' || fail "kv list missing hits key: $resp"
+echo "$resp" | grep -q '"value_b64":"Mw=="' || fail "kv list wrong value_b64 (want Mw== = base64 of \"3\"): $resp"
+ok "GET /_system/kv/{id} lists keys with base64 values"
+
+# ── 18. KV single-get returns raw bytes ───────────────────────────
+code=$("${CURL_BASE[@]}" -o /tmp/admin-smoke-kv.bin -w '%{http_code}' \
+    "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/kv/acme/value?key=hits")
+[[ "$code" == "200" ]] || fail "kv value (got $code)"
+val=$(cat /tmp/admin-smoke-kv.bin)
+[[ "$val" == "3" ]] || fail "kv value: expected '3', got '$val'"
+ok "GET /_system/kv/{id}/value?key=... returns raw bytes"
+
+# ── 19. KV single-get missing-key returns 404 ─────────────────────
+code=$("${CURL_BASE[@]}" -o /dev/null -w '%{http_code}' \
+    "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/kv/acme/value?key=neverset")
+[[ "$code" == "404" ]] || fail "kv unknown key (got $code)"
+ok "GET /_system/kv/{id}/value unknown key → 404"
+
+# ── 20. KV prefix filter ──────────────────────────────────────────
+resp=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/kv/acme?prefix=hi")
+echo "$resp" | grep -q '"key":"hits"' || fail "prefix=hi didn't include hits: $resp"
+resp=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/kv/acme?prefix=zz")
+echo "$resp" | grep -q '"entries":\[\]' || fail "prefix=zz should be empty: $resp"
+ok "kv prefix filter returns the matching subset"
+
+# ── 21. KV cursor pagination over randwrite (handler mints UUIDs) ─
+for _ in 1 2 3 4 5; do
+    "${CURL_BASE[@]}" -o /dev/null -H "Host: randwrite.test" "http://$HTTP_ADDR/"
+done
+page1=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/kv/randwrite?limit=2")
+count1=$(printf '%s' "$page1" | grep -oE '"key":' | wc -l | tr -d ' ')
+[[ "$count1" == "2" ]] || fail "page1 should have 2 entries, got $count1: $page1"
+printf '%s' "$page1" | grep -q '"next_cursor":' || fail "page1 missing next_cursor: $page1"
+# Extract cursor value (first-match sed, newline-free).
+cursor=$(printf '%s' "$page1" | sed -E 's/.*"next_cursor":"([^"]*)".*/\1/')
+page2=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" \
+    "http://$HTTP_ADDR/_system/kv/randwrite?limit=2&cursor=$cursor")
+count2=$(printf '%s' "$page2" | grep -oE '"key":' | wc -l | tr -d ' ')
+[[ "$count2" == "2" ]] || fail "page2 should have 2 entries, got $count2: $page2"
+# Page2's first key must be strictly greater than the cursor.
+printf '%s' "$page2" | grep -q "\"key\":\"$cursor\"" && fail "cursor was echoed as page2 entry"
+ok "kv cursor pagination advances past prior page's last key"
+
+# ── 22. KV on unknown instance → 404 ─────────────────────────────
+code=$("${CURL_BASE[@]}" -o /dev/null -w '%{http_code}' \
+    "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/kv/ghost")
+[[ "$code" == "404" ]] || fail "unknown instance (got $code)"
+ok "kv list for unknown instance → 404"
+
+# ── 23. Log count reflects the seeded requests ────────────────────
+# Log flushing is time-based (flush_interval_ns = 1s by default);
+# give the worker a tick to drain the in-memory batch.
+sleep 1.5
+resp=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/log/acme/count")
+# resp is plain "<N>\n"; expect at least 3 from the KV seed.
+count_n=$(printf '%s' "$resp" | tr -d '[:space:]')
+[[ "$count_n" -ge 3 ]] || fail "log count: expected >=3, got '$count_n'"
+ok "GET /_system/log/{id}/count returns a decimal"
+
+# ── 24. Log list returns records (proxied + CORS-wrapped) ─────────
+headers=$("${CURL_BASE[@]}" -D /tmp/admin-smoke-log-hdrs.txt -o /tmp/admin-smoke-log.json \
+    "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/log/acme/list?limit=50")
+grep -iq "access-control-allow-origin: $ORIGIN" /tmp/admin-smoke-log-hdrs.txt \
+    || fail "log list missing CORS header"
+rec_count=$(grep -oE '"request_id":' /tmp/admin-smoke-log.json | wc -l | tr -d ' ')
+[[ "$rec_count" -ge 3 ]] || fail "log list: expected >=3 records, got $rec_count"
+ok "GET /_system/log/{id}/list returns records with CORS headers"
+
+# ── 25. Log show returns full record for a known id ───────────────
+req_id=$(sed -E 's/.*"request_id":"([0-9a-f]+)".*/\1/' /tmp/admin-smoke-log.json | head -1)
+[[ ${#req_id} -eq 16 ]] || fail "couldn't parse request_id (got '$req_id')"
+resp=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/log/acme/show/$req_id")
+printf '%s' "$resp" | grep -q "\"request_id\":\"$req_id\"" \
+    || fail "log show: request_id mismatch: $resp"
+printf '%s' "$resp" | grep -q '"host":"acme.test"' \
+    || fail "log show: missing host field: $resp"
+ok "GET /_system/log/{id}/show/{hex} returns the full record"
+
+# ── 26. Log show with unknown id → 404 ────────────────────────────
+# ffffffffffffffff is the top of the u64 request-id space; real seqs
+# come from a counter that starts at 0 and increments, so ffff...f is
+# guaranteed unseen. (0000000000000000 WOULD have matched the first
+# acme request — the log-store's seq counter starts at 0, a pre-
+# existing quirk worth noting but not fixing here.)
+code=$("${CURL_BASE[@]}" -o /dev/null -w '%{http_code}' \
+    "${AUTH_HDR[@]}" "http://$HTTP_ADDR/_system/log/acme/show/ffffffffffffffff")
+[[ "$code" == "404" ]] || fail "unknown log id (got $code)"
+ok "log show with unknown id → 404"
+
 echo ""
 echo "all admin smoke tests passed"

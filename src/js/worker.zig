@@ -1191,7 +1191,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 continue;
             }
 
-            const sys_rest = path["/_system/".len..];
+            // Split `?query=string` off the path before any routing so
+            // subsystems can pull their own params without re-parsing.
+            const qmark = std.mem.indexOfScalar(u8, path, '?');
+            const path_no_q = if (qmark) |q| path[0..q] else path;
+            const query_str = if (qmark) |q| path[q + 1 ..] else "";
+
+            const sys_rest = path_no_q["/_system/".len..];
             const sub_slash = std.mem.indexOfScalar(u8, sys_rest, '/') orelse {
                 try setSystemResponse(server, ent, sid, sess, 404, "malformed system path\n", allocator, cors_origin, null);
                 processed += 1;
@@ -1225,6 +1231,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             const allowed = worker.tenant.canAccessInstance(auth_ctx.?, sys_instance_id) catch false;
             if (!allowed) {
                 try setSystemResponse(server, ent, sid, sess, 403, "forbidden\n", allocator, cors_origin, null);
+                processed += 1;
+                continue;
+            }
+
+            // `/_system/kv/{instance_id}[/value]?...` reads a tenant's
+            // app-state KV store. Same auth gate as code/log; handled
+            // in-process (no proxy) because reads don't touch raft.
+            if (std.mem.eql(u8, subsystem, "kv")) {
+                const sub_suffix = if (inst_slash) |s| after_sub[s + 1 ..] else "";
+                try handleKvRequest(worker, ent, sid, sess, method, sys_instance_id, sub_suffix, query_str, allocator, cors_origin);
                 processed += 1;
                 continue;
             }
@@ -2159,6 +2175,202 @@ fn writeJsonString(writer: anytype, s: []const u8) !void {
         }
     }
     try writer.writeByte('"');
+}
+
+/// Look up a single query parameter value from a raw query string.
+/// Returns the percent-encoded slice (still pointing into `query`);
+/// use `urlDecodeAlloc` to materialize the decoded bytes.
+fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
+            if (std.mem.eql(u8, pair, name)) return "";
+            continue;
+        };
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+/// Percent-decode `encoded` into a freshly allocated slice. `+` is
+/// left as-is (admin UI doesn't use the form-encoding convention of
+/// `+ → space`). Returns `error.BadEscape` on a malformed %XX.
+fn urlDecodeAlloc(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const buf = try allocator.alloc(u8, encoded.len);
+    errdefer allocator.free(buf);
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < encoded.len) {
+        const b = encoded[i];
+        if (b == '%' and i + 2 < encoded.len) {
+            const hi = std.fmt.charToDigit(encoded[i + 1], 16) catch return error.BadEscape;
+            const lo = std.fmt.charToDigit(encoded[i + 2], 16) catch return error.BadEscape;
+            buf[w] = (hi << 4) | lo;
+            w += 1;
+            i += 3;
+        } else {
+            buf[w] = b;
+            w += 1;
+            i += 1;
+        }
+    }
+    // Trim trailing slack so the caller's free matches the returned len.
+    return allocator.realloc(buf, w) catch buf[0..w];
+}
+
+/// Route `/_system/kv/{instance_id}[/value]` requests. Read-only —
+/// no raft, no writes. The caller has already validated auth and the
+/// instance id's canAccessInstance check.
+fn handleKvRequest(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    instance_id: []const u8,
+    suffix: []const u8,
+    query: []const u8,
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+) !void {
+    const server = worker.h2;
+
+    if (!std.mem.eql(u8, method, "GET")) {
+        try setSystemResponse(server, ent, sid, sess, 405, "method not allowed\n", allocator, cors_origin, null);
+        return;
+    }
+
+    const inst = worker.tenant.getInstance(instance_id) catch |err| switch (err) {
+        error.InvalidInstanceId => {
+            try setSystemResponse(server, ent, sid, sess, 400, "invalid instance id\n", allocator, cors_origin, null);
+            return;
+        },
+        else => {
+            std.log.warn("getInstance failed: {s}", .{@errorName(err)});
+            try setSystemResponse(server, ent, sid, sess, 500, "instance lookup failed\n", allocator, cors_origin, null);
+            return;
+        },
+    };
+    if (inst == null) {
+        try setSystemResponse(server, ent, sid, sess, 404, "instance not found\n", allocator, cors_origin, null);
+        return;
+    }
+    const kv = inst.?.kv;
+
+    if (suffix.len == 0) {
+        try handleKvList(server, ent, sid, sess, kv, query, allocator, cors_origin);
+        return;
+    }
+    if (std.mem.eql(u8, suffix, "value")) {
+        try handleKvGet(server, ent, sid, sess, kv, query, allocator, cors_origin);
+        return;
+    }
+    try setSystemResponse(server, ent, sid, sess, 404, "unknown kv resource\n", allocator, cors_origin, null);
+}
+
+fn handleKvList(
+    server: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    kv: *kv_mod.KvStore,
+    query: []const u8,
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+) !void {
+    // Parse + decode query params. Empty defaults mean "scan from the
+    // start of the whole keyspace."
+    const prefix_raw = queryParam(query, "prefix") orelse "";
+    const prefix = urlDecodeAlloc(allocator, prefix_raw) catch {
+        try setSystemResponse(server, ent, sid, sess, 400, "bad prefix encoding\n", allocator, cors_origin, null);
+        return;
+    };
+    defer allocator.free(prefix);
+
+    const cursor_raw = queryParam(query, "cursor") orelse "";
+    const cursor = urlDecodeAlloc(allocator, cursor_raw) catch {
+        try setSystemResponse(server, ent, sid, sess, 400, "bad cursor encoding\n", allocator, cors_origin, null);
+        return;
+    };
+    defer allocator.free(cursor);
+
+    const KV_LIST_MAX: u32 = 1000;
+    const KV_LIST_DEFAULT: u32 = 100;
+    const limit: u32 = if (queryParam(query, "limit")) |s| blk: {
+        const n = std.fmt.parseInt(u32, s, 10) catch break :blk KV_LIST_DEFAULT;
+        break :blk @min(n, KV_LIST_MAX);
+    } else KV_LIST_DEFAULT;
+
+    var scan = kv.prefix(prefix, cursor, limit) catch {
+        try setSystemResponse(server, ent, sid, sess, 500, "kv scan failed\n", allocator, cors_origin, null);
+        return;
+    };
+    defer scan.deinit();
+
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+    const writer = json.writer(allocator);
+
+    const base64 = std.base64.standard.Encoder;
+    try writer.writeAll("{\"entries\":[");
+    for (scan.entries, 0..) |e, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"key\":");
+        try writeJsonString(writer, e.key);
+        try writer.writeAll(",\"value_b64\":\"");
+        const encoded_len = base64.calcSize(e.value.len);
+        const buf = try allocator.alloc(u8, encoded_len);
+        defer allocator.free(buf);
+        const encoded = base64.encode(buf, e.value);
+        try writer.writeAll(encoded);
+        try writer.writeAll("\"}");
+    }
+    try writer.writeAll("]");
+
+    // Emit next_cursor only when we hit the limit — a short page means
+    // the caller has seen the last entry.
+    if (scan.entries.len == limit and scan.entries.len > 0) {
+        try writer.writeAll(",\"next_cursor\":");
+        try writeJsonString(writer, scan.entries[scan.entries.len - 1].key);
+    }
+    try writer.writeAll("}");
+
+    try setSystemResponse(server, ent, sid, sess, 200, json.items, allocator, cors_origin, "application/json");
+}
+
+fn handleKvGet(
+    server: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    kv: *kv_mod.KvStore,
+    query: []const u8,
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+) !void {
+    const key_raw = queryParam(query, "key") orelse {
+        try setSystemResponse(server, ent, sid, sess, 400, "missing key param\n", allocator, cors_origin, null);
+        return;
+    };
+    const key = urlDecodeAlloc(allocator, key_raw) catch {
+        try setSystemResponse(server, ent, sid, sess, 400, "bad key encoding\n", allocator, cors_origin, null);
+        return;
+    };
+    defer allocator.free(key);
+
+    const value = kv.get(key) catch |err| switch (err) {
+        error.NotFound => {
+            try setSystemResponse(server, ent, sid, sess, 404, "key not found\n", allocator, cors_origin, null);
+            return;
+        },
+        else => {
+            try setSystemResponse(server, ent, sid, sess, 500, "kv get failed\n", allocator, cors_origin, null);
+            return;
+        },
+    };
+    defer allocator.free(value);
+
+    try setSystemResponse(server, ent, sid, sess, 200, value, allocator, cors_origin, "application/octet-stream");
 }
 
 /// Route `/_system/tenant/*` requests to the instance or domain

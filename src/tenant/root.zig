@@ -309,6 +309,21 @@ pub const Tenant = struct {
         return self.instanceExistsInRoot(id);
     }
 
+    /// Resolve an instance by id, lazy-opening its per-tenant store if
+    /// it's not already in the in-memory map. Returns `null` if the
+    /// id has no existence marker in the root store (i.e. never
+    /// registered, or deleted). The returned pointer is stable for
+    /// the lifetime of the `Tenant`.
+    ///
+    /// Intended for admin surfaces that need to talk to an instance's
+    /// `KvStore` without going through a host → instance lookup.
+    pub fn getInstance(self: *Tenant, id: []const u8) Error!?*const Instance {
+        try validateInstanceId(id);
+        if (self.instances.get(id)) |inst| return inst;
+        if (!try self.instanceExistsInRoot(id)) return null;
+        return try self.ensureOpen(id);
+    }
+
     /// Enumerate every instance registered in the root store (up to
     /// `max`). Used by the admin UI to render the instance list.
     /// Ordering follows the root store's key order, which matches
@@ -846,6 +861,63 @@ test "canAccessInstance short-circuits for root" {
 
     const other_ctx: AuthContext = .{ .is_root = false };
     try testing.expectEqual(false, try fx.tenant.canAccessInstance(other_ctx, "acme"));
+}
+
+test "getInstance lazy-opens by id" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try fx.tenant.createInstance("acme");
+
+    // Known id: returns an open instance with a usable kv.
+    const acme = try fx.tenant.getInstance("acme");
+    try testing.expect(acme != null);
+    try testing.expectEqualStrings("acme", acme.?.id);
+    try acme.?.kv.put("k", "v");
+    const v = try acme.?.kv.get("k");
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("v", v);
+
+    // Unknown id: null, no error.
+    try testing.expectEqual(
+        @as(?*const Instance, null),
+        try fx.tenant.getInstance("nope"),
+    );
+}
+
+test "getInstance survives restart by lazy-opening from root store" {
+    const allocator = testing.allocator;
+    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-tenant-getinst-{x}", .{seed});
+    defer allocator.free(tmp_dir);
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const root_path = try std.fmt.allocPrintSentinel(allocator, "{s}/__root__.db", .{tmp_dir}, 0);
+    defer allocator.free(root_path);
+
+    // Session 1: create, write, tear down.
+    {
+        const root = try kv_mod.KvStore.open(allocator, root_path);
+        defer root.close();
+        var tenant = try Tenant.init(allocator, root, tmp_dir);
+        defer tenant.deinit();
+        try tenant.createInstance("persistent");
+        const inst = (try tenant.getInstance("persistent")).?;
+        try inst.kv.put("hello", "world");
+    }
+    // Session 2: nothing in memory yet; getInstance lazy-opens.
+    {
+        const root = try kv_mod.KvStore.open(allocator, root_path);
+        defer root.close();
+        var tenant = try Tenant.init(allocator, root, tmp_dir);
+        defer tenant.deinit();
+        const inst = (try tenant.getInstance("persistent")).?;
+        const v = try inst.kv.get("hello");
+        defer allocator.free(v);
+        try testing.expectEqualStrings("world", v);
+    }
 }
 
 test "listInstances returns every created instance" {
