@@ -44,6 +44,9 @@ pub const Handle = struct {
     thread: std.Thread,
     port: u16,
     data_dir: []const u8,
+    /// Max concurrent inbound h2c connections. Sized from the worker
+    /// count — one persistent client per worker.
+    max_connections: u32,
     stop: std.atomic.Value(bool),
     ready: std.Thread.ResetEvent,
     bind_err: ?anyerror,
@@ -55,7 +58,11 @@ pub const Handle = struct {
     }
 };
 
-pub fn spawn(allocator: std.mem.Allocator, data_dir: []const u8) !*Handle {
+pub fn spawn(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    max_connections: u32,
+) !*Handle {
     const h = try allocator.create(Handle);
     errdefer allocator.destroy(h);
 
@@ -64,6 +71,7 @@ pub fn spawn(allocator: std.mem.Allocator, data_dir: []const u8) !*Handle {
         .thread = undefined,
         .port = 0,
         .data_dir = data_dir,
+        .max_connections = max_connections,
         .stop = .{ .raw = false },
         .ready = .{},
         .bind_err = null,
@@ -101,7 +109,7 @@ fn runThread(h: *Handle) !void {
 
     const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
     const server = LogH2.create(&reg, allocator, bind_addr, .{
-        .max_connections = 16,
+        .max_connections = h.max_connections,
         .buf_count = 64,
         .buf_size = 64 * 1024,
     }, .{}) catch |err| {

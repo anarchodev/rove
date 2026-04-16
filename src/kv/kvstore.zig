@@ -111,7 +111,14 @@ const SQL_GET = "SELECT value FROM kv WHERE key = ?;";
 const SQL_PUT = "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?);";
 const SQL_PUT_SEQ = "INSERT OR REPLACE INTO kv (key, value, seq) VALUES (?, ?, ?);";
 const SQL_DEL = "DELETE FROM kv WHERE key = ?;";
-const SQL_RANGE = "SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key LIMIT ?;";
+const SQL_PREFIX = "SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key LIMIT ?;";
+
+// Sentinel used as the exclusive upper bound when a prefix scan has no
+// finite successor — empty prefix (scan everything), or a prefix that
+// is all-0xff bytes. 256 bytes of 0xff compares larger than any key
+// callers actually use in this codebase (instance ids are ASCII and
+// capped at 64, domain hosts at 253, log keys at ~40).
+const PREFIX_UPPER_SENTINEL = [_]u8{0xff} ** 256;
 const SQL_DELTA = "SELECT key, value, seq FROM kv WHERE seq > ? AND seq <= ? ORDER BY seq;";
 const SQL_BEGIN = "BEGIN;";
 // BEGIN IMMEDIATE acquires RESERVED at begin time, serializing
@@ -272,7 +279,7 @@ pub const KvStore = struct {
     stmt_put: *c.sqlite3_stmt,
     stmt_put_seq: *c.sqlite3_stmt,
     stmt_del: *c.sqlite3_stmt,
-    stmt_range: *c.sqlite3_stmt,
+    stmt_prefix: *c.sqlite3_stmt,
     stmt_delta: *c.sqlite3_stmt,
     stmt_begin: *c.sqlite3_stmt,
     stmt_begin_immediate: *c.sqlite3_stmt,
@@ -397,7 +404,7 @@ pub const KvStore = struct {
             .{ .sql = SQL_PUT, .field = "stmt_put" },
             .{ .sql = SQL_PUT_SEQ, .field = "stmt_put_seq" },
             .{ .sql = SQL_DEL, .field = "stmt_del" },
-            .{ .sql = SQL_RANGE, .field = "stmt_range" },
+            .{ .sql = SQL_PREFIX, .field = "stmt_prefix" },
             .{ .sql = SQL_DELTA, .field = "stmt_delta" },
             .{ .sql = SQL_BEGIN, .field = "stmt_begin" },
             .{ .sql = SQL_BEGIN_IMMEDIATE, .field = "stmt_begin_immediate" },
@@ -450,7 +457,7 @@ pub const KvStore = struct {
         _ = c.sqlite3_finalize(self.stmt_put);
         _ = c.sqlite3_finalize(self.stmt_put_seq);
         _ = c.sqlite3_finalize(self.stmt_del);
-        _ = c.sqlite3_finalize(self.stmt_range);
+        _ = c.sqlite3_finalize(self.stmt_prefix);
         _ = c.sqlite3_finalize(self.stmt_delta);
         _ = c.sqlite3_finalize(self.stmt_begin);
         _ = c.sqlite3_finalize(self.stmt_begin_immediate);
@@ -545,14 +552,67 @@ pub const KvStore = struct {
         if (rc != c.SQLITE_DONE) return Error.Sqlite;
     }
 
-    /// Range scan: keys where start <= key < end, up to `count` results.
-    pub fn range(
+    /// Prefix scan: keys whose bytes start with `prefix`, ordered
+    /// ascending, up to `count` entries.
+    ///
+    /// `cursor` is the last key returned by the previous page — keys
+    /// strictly greater than `cursor` are returned, so the caller can
+    /// paginate by passing back the final key it observed. Pass `""`
+    /// to start from the beginning of the prefix. A cursor that sorts
+    /// below `prefix` is treated as if it were `""` (i.e. start at
+    /// the prefix).
+    ///
+    /// An empty `prefix` scans every key. A prefix that is all-0xff
+    /// bytes has no finite successor and falls back to a large
+    /// sentinel upper bound; callers using sane ASCII-ish keys will
+    /// never hit this path.
+    pub fn prefix(
         self: *KvStore,
-        start: []const u8,
-        end: []const u8,
+        prefix_bytes: []const u8,
+        cursor: []const u8,
         count: u32,
     ) Error!RangeResult {
-        const st = self.stmt_range;
+        // Compute the inclusive lower bound. If no cursor, start at
+        // the prefix itself. If a cursor is given, advance one
+        // lexicographic step past it (cursor ++ 0x00), but never
+        // below the prefix.
+        var cursor_succ: ?[]u8 = null;
+        defer if (cursor_succ) |buf| self.allocator.free(buf);
+
+        const start: []const u8 = blk: {
+            if (cursor.len == 0) break :blk prefix_bytes;
+            if (std.mem.lessThan(u8, cursor, prefix_bytes)) break :blk prefix_bytes;
+            const buf = self.allocator.alloc(u8, cursor.len + 1) catch
+                return Error.OutOfMemory;
+            @memcpy(buf[0..cursor.len], cursor);
+            buf[cursor.len] = 0;
+            cursor_succ = buf;
+            break :blk buf;
+        };
+
+        // Compute the exclusive upper bound: the first byte string
+        // that is NOT under `prefix`. Walk back from the tail,
+        // incrementing the first byte < 0xff and truncating after it.
+        var end_alloc: ?[]u8 = null;
+        defer if (end_alloc) |buf| self.allocator.free(buf);
+
+        const end: []const u8 = blk: {
+            if (prefix_bytes.len == 0) break :blk &PREFIX_UPPER_SENTINEL;
+            const buf = self.allocator.alloc(u8, prefix_bytes.len) catch
+                return Error.OutOfMemory;
+            end_alloc = buf;
+            @memcpy(buf, prefix_bytes);
+            var i = buf.len;
+            while (i > 0) : (i -= 1) {
+                if (buf[i - 1] != 0xff) {
+                    buf[i - 1] += 1;
+                    break :blk buf[0..i];
+                }
+            }
+            break :blk &PREFIX_UPPER_SENTINEL;
+        };
+
+        const st = self.stmt_prefix;
         _ = c.sqlite3_reset(st);
         bindText(st, 1, start);
         bindText(st, 2, end);
@@ -1292,7 +1352,7 @@ test "transaction commit and rollback" {
     try testing.expectError(Error.NotFound, kv.get("c"));
 }
 
-test "range scan" {
+test "prefix scan returns only keys under the prefix" {
     var path_buf: [64]u8 = undefined;
     const path = tmpDbPath(&path_buf);
     defer cleanupDb(path);
@@ -1305,13 +1365,93 @@ test "range scan" {
     try kv.put("a/3", "z");
     try kv.put("b/1", "ignored");
 
-    var r = try kv.range("a/", "a/~", 100);
+    var r = try kv.prefix("a/", "", 100);
     defer r.deinit();
     try testing.expectEqual(@as(usize, 3), r.entries.len);
     try testing.expectEqualStrings("a/1", r.entries[0].key);
     try testing.expectEqualStrings("a/2", r.entries[1].key);
     try testing.expectEqualStrings("a/3", r.entries[2].key);
     try testing.expectEqualStrings("z", r.entries[2].value);
+}
+
+test "prefix scan honors count" {
+    var path_buf: [64]u8 = undefined;
+    const path = tmpDbPath(&path_buf);
+    defer cleanupDb(path);
+
+    var kv = try KvStore.open(testing.allocator, path);
+    defer kv.close();
+
+    try kv.put("k/1", "a");
+    try kv.put("k/2", "b");
+    try kv.put("k/3", "c");
+
+    var r = try kv.prefix("k/", "", 2);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 2), r.entries.len);
+    try testing.expectEqualStrings("k/1", r.entries[0].key);
+    try testing.expectEqualStrings("k/2", r.entries[1].key);
+}
+
+test "prefix scan resumes past cursor" {
+    var path_buf: [64]u8 = undefined;
+    const path = tmpDbPath(&path_buf);
+    defer cleanupDb(path);
+
+    var kv = try KvStore.open(testing.allocator, path);
+    defer kv.close();
+
+    try kv.put("k/a", "1");
+    try kv.put("k/b", "2");
+    try kv.put("k/c", "3");
+
+    var page1 = try kv.prefix("k/", "", 2);
+    defer page1.deinit();
+    try testing.expectEqual(@as(usize, 2), page1.entries.len);
+
+    // Resume from the last key of page 1.
+    var page2 = try kv.prefix("k/", page1.entries[1].key, 2);
+    defer page2.deinit();
+    try testing.expectEqual(@as(usize, 1), page2.entries.len);
+    try testing.expectEqualStrings("k/c", page2.entries[0].key);
+}
+
+test "prefix scan treats cursor below prefix as empty cursor" {
+    var path_buf: [64]u8 = undefined;
+    const path = tmpDbPath(&path_buf);
+    defer cleanupDb(path);
+
+    var kv = try KvStore.open(testing.allocator, path);
+    defer kv.close();
+
+    try kv.put("m/1", "a");
+    try kv.put("m/2", "b");
+
+    // Cursor "a" sorts below prefix "m/" — first page should still
+    // start at "m/1".
+    var r = try kv.prefix("m/", "a", 10);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 2), r.entries.len);
+    try testing.expectEqualStrings("m/1", r.entries[0].key);
+}
+
+test "prefix scan with empty prefix scans all keys" {
+    var path_buf: [64]u8 = undefined;
+    const path = tmpDbPath(&path_buf);
+    defer cleanupDb(path);
+
+    var kv = try KvStore.open(testing.allocator, path);
+    defer kv.close();
+
+    try kv.put("a", "1");
+    try kv.put("m", "2");
+    try kv.put("z", "3");
+
+    var r = try kv.prefix("", "", 100);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 3), r.entries.len);
+    try testing.expectEqualStrings("a", r.entries[0].key);
+    try testing.expectEqualStrings("z", r.entries[2].key);
 }
 
 test "seq allocation and putSeq" {

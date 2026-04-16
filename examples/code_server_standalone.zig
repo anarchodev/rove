@@ -49,7 +49,10 @@ pub fn main() !void {
 
     std.fs.cwd().makePath(cli.data_dir) catch {};
 
-    const handle = try cs.thread.spawn(allocator, cli.data_dir);
+    // Standalone: one process, a handful of clients at most. Default
+    // to 32 concurrent connections — plenty of headroom for smoke
+    // tests and manual pokes.
+    const handle = try cs.thread.spawn(allocator, cli.data_dir, 32);
     defer handle.shutdown();
 
     // Print the bound port on a predictable line so the smoke test

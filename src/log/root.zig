@@ -326,9 +326,9 @@ pub const LogStore = struct {
     /// inverted (`req/{~id}`), ascending iteration returns newest
     /// first — no secondary index needed. Caller must deinit.
     pub fn list(self: *LogStore, opts: ListOpts) Error!ListResult {
-        var range = self.kv.range("req/", "req0", opts.limit) catch
+        var scan = self.kv.prefix("req/", "", opts.limit) catch
             return Error.Kv;
-        defer range.deinit();
+        defer scan.deinit();
 
         var out = std.ArrayList(LogRecord).empty;
         errdefer {
@@ -336,7 +336,7 @@ pub const LogStore = struct {
             out.deinit(self.allocator);
         }
 
-        for (range.entries) |entry| {
+        for (scan.entries) |entry| {
             const rec = parseRecord(self.allocator, entry.value) catch continue;
             out.append(self.allocator, rec) catch return Error.OutOfMemory;
         }

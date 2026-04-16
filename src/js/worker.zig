@@ -250,6 +250,13 @@ pub const WorkerConfig = struct {
     /// Address of the in-process rove-log-server thread. Mirror of
     /// `code_addr` for `/_system/log/*`.
     log_addr: ?std.net.Address = null,
+    /// Origin allowed to call `/_system/*` with CORS. When set, the
+    /// worker answers browser preflight (OPTIONS) requests from this
+    /// origin and stamps `Access-Control-Allow-*` headers onto every
+    /// `/_system/*` response. Unset disables CORS entirely — admin UI
+    /// callers must then be same-origin. The string is borrowed; the
+    /// caller keeps it alive for the worker's lifetime.
+    admin_origin: ?[]const u8 = null,
     /// Upper 16 bits of every LogStore request_id this worker issues.
     /// Must be unique per Worker instance within one process — if two
     /// workers on the same node both use the same id, their captured
@@ -368,6 +375,9 @@ pub fn Worker(comptime opts: Options) type {
         penalty_box: penalty_mod.PenaltyBox,
         commit_wait_timeout_ns: u64,
         refresh_interval_ns: i64,
+        /// Borrowed from `WorkerConfig.admin_origin`. See the config
+        /// field for semantics. Null when CORS is disabled.
+        admin_origin: ?[]const u8,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -419,6 +429,7 @@ pub fn Worker(comptime opts: Options) type {
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
                 .refresh_interval_ns = config.refresh_interval_ns,
+                .admin_origin = config.admin_origin,
             };
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
@@ -1127,50 +1138,100 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const authority = findHeader(rh, ":authority") orelse "";
         const body: []const u8 = if (rb.data) |p| p[0..rb.len] else "";
 
-        // `/_system/*` — auth gate + proxy routing, unchanged.
+        // `/_system/*` — CORS gate, then auth + proxy routing.
         if (std.mem.startsWith(u8, path, "/_system/")) {
+            // Every /_system/* response carries CORS headers when the
+            // worker has an admin origin configured. Browsers enforce
+            // the origin match on their side against
+            // `Access-Control-Allow-Origin`, so stamping headers even
+            // on requests without an Origin is harmless and keeps the
+            // response path simple.
+            const cors_origin = worker.admin_origin;
+
+            // Preflight: browser sends OPTIONS before the real request
+            // to discover allowed methods/headers. Answer 204 with the
+            // preflight-specific CORS headers and never touch auth —
+            // preflights don't carry the bearer token.
+            if (std.mem.eql(u8, method, "OPTIONS")) {
+                if (cors_origin) |o| {
+                    const req_origin = findHeader(rh, "origin") orelse "";
+                    if (req_origin.len == 0 or !std.mem.eql(u8, req_origin, o)) {
+                        try setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
+                    } else {
+                        const hdrs = try buildSystemRespHeaders(allocator, o, true, null);
+                        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
+                        try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
+                        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
+                        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+                        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+                        try server.reg.set(ent, &server.request_out, h2.Session, sess);
+                        try server.reg.move(ent, &server.request_out, &server.response_in);
+                    }
+                } else {
+                    try setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
+                }
+                processed += 1;
+                continue;
+            }
+
             const token = extractBearerToken(rh) orelse {
-                try setSimpleResponse(server, ent, sid, sess, 401, "missing bearer token\n", allocator);
+                try setSystemResponse(server, ent, sid, sess, 401, "missing bearer token\n", allocator, cors_origin, null);
                 processed += 1;
                 continue;
             };
             const auth_ctx = worker.tenant.authenticate(token) catch |err| {
                 std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
-                try setSimpleResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator);
+                try setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
                 processed += 1;
                 continue;
             };
             if (auth_ctx == null) {
-                try setSimpleResponse(server, ent, sid, sess, 401, "invalid bearer token\n", allocator);
+                try setSystemResponse(server, ent, sid, sess, 401, "invalid bearer token\n", allocator, cors_origin, null);
                 processed += 1;
                 continue;
             }
 
             const sys_rest = path["/_system/".len..];
             const sub_slash = std.mem.indexOfScalar(u8, sys_rest, '/') orelse {
-                try setSimpleResponse(server, ent, sid, sess, 404, "malformed system path\n", allocator);
+                try setSystemResponse(server, ent, sid, sess, 404, "malformed system path\n", allocator, cors_origin, null);
                 processed += 1;
                 continue;
             };
             const subsystem = sys_rest[0..sub_slash];
             const after_sub = sys_rest[sub_slash + 1 ..];
+
+            // `/_system/tenant/*` is resource-scoped (no instance_id
+            // in the path) and root-only. Branch off before the
+            // instance-id parse below, which is specific to the
+            // code/log proxies.
+            if (std.mem.eql(u8, subsystem, "tenant")) {
+                if (!auth_ctx.?.is_root) {
+                    try setSystemResponse(server, ent, sid, sess, 403, "forbidden\n", allocator, cors_origin, null);
+                    processed += 1;
+                    continue;
+                }
+                try handleTenantRequest(worker, ent, sid, sess, method, after_sub, body, allocator, cors_origin);
+                processed += 1;
+                continue;
+            }
+
             const inst_slash = std.mem.indexOfScalar(u8, after_sub, '/');
             const sys_instance_id = if (inst_slash) |s| after_sub[0..s] else after_sub;
             if (sys_instance_id.len == 0) {
-                try setSimpleResponse(server, ent, sid, sess, 404, "missing instance id\n", allocator);
+                try setSystemResponse(server, ent, sid, sess, 404, "missing instance id\n", allocator, cors_origin, null);
                 processed += 1;
                 continue;
             }
             const allowed = worker.tenant.canAccessInstance(auth_ctx.?, sys_instance_id) catch false;
             if (!allowed) {
-                try setSimpleResponse(server, ent, sid, sess, 403, "forbidden\n", allocator);
+                try setSystemResponse(server, ent, sid, sess, 403, "forbidden\n", allocator, cors_origin, null);
                 processed += 1;
                 continue;
             }
 
             if (std.mem.eql(u8, subsystem, "code")) {
                 if (worker.code_proxy.addr == null) {
-                    try setSimpleResponse(server, ent, sid, sess, 503, "code subsystem disabled\n", allocator);
+                    try setSystemResponse(server, ent, sid, sess, 503, "code subsystem disabled\n", allocator, cors_origin, null);
                     processed += 1;
                     continue;
                 }
@@ -1181,7 +1242,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
             if (std.mem.eql(u8, subsystem, "log")) {
                 if (worker.log_proxy.addr == null) {
-                    try setSimpleResponse(server, ent, sid, sess, 503, "log subsystem disabled\n", allocator);
+                    try setSystemResponse(server, ent, sid, sess, 503, "log subsystem disabled\n", allocator, cors_origin, null);
                     processed += 1;
                     continue;
                 }
@@ -1191,7 +1252,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 continue;
             }
 
-            try setSimpleResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator);
+            try setSystemResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator, cors_origin, null);
             processed += 1;
             continue;
         }
@@ -1656,7 +1717,7 @@ fn flushOne(
         const header_fields = forwardHeaders(allocator, rh.*) catch |err| {
             std.log.warn("rove-js proxy: forwardHeaders failed: {s}", .{@errorName(err)});
             const body = try allocator.dupe(u8, "internal proxy error\n");
-            try setProxyFault(server, server_ent, &ps.pending, 500, body);
+            try setProxyFault(server, server_ent, &ps.pending, 500, body, allocator, worker.admin_origin);
             try worker.reg.move(server_ent, &ps.pending, &server.response_in);
             continue;
         };
@@ -1747,7 +1808,7 @@ fn mapOneResponse(
     if (uio.err != 0) {
         std.log.warn("rove-js proxy: upstream error {d} → 502", .{uio.err});
         const body = try allocator.dupe(u8, "bad gateway\n");
-        try setProxyFault(server, server_ent, &ps.inflight, 502, body);
+        try setProxyFault(server, server_ent, &ps.inflight, 502, body, allocator, worker.admin_origin);
         try worker.reg.move(server_ent, &ps.inflight, &server.response_in);
         try reg.destroy(client_ent);
         return;
@@ -1764,7 +1825,11 @@ fn mapOneResponse(
         body_len = urb.len;
     }
     try worker.reg.set(server_ent, &ps.inflight, h2.RespBody, .{ .data = body_copy, .len = body_len });
-    try worker.reg.set(server_ent, &ps.inflight, h2.RespHeaders, .{ .fields = null, .count = 0 });
+    const resp_hdrs: h2.RespHeaders = if (worker.admin_origin) |o|
+        try buildSystemRespHeaders(allocator, o, false, null)
+    else
+        .{ .fields = null, .count = 0 };
+    try worker.reg.set(server_ent, &ps.inflight, h2.RespHeaders, resp_hdrs);
     try worker.reg.set(server_ent, &ps.inflight, h2.H2IoResult, .{ .err = 0 });
 
     try worker.reg.move(server_ent, &ps.inflight, &server.response_in);
@@ -1821,9 +1886,15 @@ fn setProxyFault(
     src_coll: anytype,
     status: u16,
     body: []u8,
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
 ) !void {
     try server.reg.set(ent, src_coll, h2.Status, .{ .code = status });
-    try server.reg.set(ent, src_coll, h2.RespHeaders, .{ .fields = null, .count = 0 });
+    const resp_hdrs: h2.RespHeaders = if (cors_origin) |o|
+        try buildSystemRespHeaders(allocator, o, false, null)
+    else
+        .{ .fields = null, .count = 0 };
+    try server.reg.set(ent, src_coll, h2.RespHeaders, resp_hdrs);
     try server.reg.set(ent, src_coll, h2.RespBody, .{ .data = body.ptr, .len = @intCast(body.len) });
     try server.reg.set(ent, src_coll, h2.H2IoResult, .{ .err = 0 });
 }
@@ -1978,6 +2049,371 @@ fn setErrorResponse(
     try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 500 });
     try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
     try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// Build a `RespHeaders` from a mix of CORS + optional content-type,
+/// packed into a single allocation compatible with `RespHeaders.deinit`
+/// (fields array at the start, followed by name/value bytes — same
+/// layout `hdrFinalize` produces in rove-h2).
+///
+/// - `cors_origin`: when set, stamps `Access-Control-Allow-Origin`
+///   + `-Allow-Credentials` + `Vary: origin` + `-Expose-Headers`.
+/// - `preflight`: only meaningful with cors_origin; adds `-Allow-
+///   Methods`, `-Allow-Headers`, `-Max-Age` for a 204 preflight.
+/// - `content_type`: when set, adds a `Content-Type` header.
+///
+/// Returns an empty `RespHeaders` when everything is null.
+fn buildSystemRespHeaders(
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+    preflight: bool,
+    content_type: ?[]const u8,
+) !h2.RespHeaders {
+    const Pair = struct { name: []const u8, value: []const u8 };
+    var pairs_buf: [8]Pair = undefined;
+    var n: usize = 0;
+    if (cors_origin) |o| {
+        pairs_buf[n] = .{ .name = "access-control-allow-origin", .value = o };
+        n += 1;
+        pairs_buf[n] = .{ .name = "access-control-allow-credentials", .value = "true" };
+        n += 1;
+        pairs_buf[n] = .{ .name = "vary", .value = "origin" };
+        n += 1;
+        pairs_buf[n] = .{ .name = "access-control-expose-headers", .value = "content-type" };
+        n += 1;
+        if (preflight) {
+            pairs_buf[n] = .{ .name = "access-control-allow-methods", .value = "GET, POST, DELETE, OPTIONS" };
+            n += 1;
+            pairs_buf[n] = .{ .name = "access-control-allow-headers", .value = "authorization, content-type" };
+            n += 1;
+            pairs_buf[n] = .{ .name = "access-control-max-age", .value = "600" };
+            n += 1;
+        }
+    }
+    if (content_type) |ct| {
+        pairs_buf[n] = .{ .name = "content-type", .value = ct };
+        n += 1;
+    }
+
+    if (n == 0) return .{ .fields = null, .count = 0 };
+
+    const pairs = pairs_buf[0..n];
+    const fields_size = n * @sizeOf(h2.HeaderField);
+    var strbuf_size: usize = 0;
+    for (pairs) |p| strbuf_size += p.name.len + p.value.len;
+
+    const total = fields_size + strbuf_size;
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
+    var off: usize = fields_size;
+    for (pairs, 0..) |p, i| {
+        const name_start = off;
+        @memcpy(buf[off .. off + p.name.len], p.name);
+        off += p.name.len;
+        const value_start = off;
+        @memcpy(buf[off .. off + p.value.len], p.value);
+        off += p.value.len;
+        fields_ptr[i] = .{
+            .name = buf[name_start..].ptr,
+            .name_len = @intCast(p.name.len),
+            .value = buf[value_start..].ptr,
+            .value_len = @intCast(p.value.len),
+        };
+    }
+
+    return .{
+        .fields = fields_ptr,
+        .count = @intCast(n),
+        ._buf = buf.ptr,
+        ._buf_len = @intCast(buf.len),
+    };
+}
+
+/// Emit `s` as a JSON string literal into `writer`. Handles the
+/// minimal escape set (quote, backslash, and control chars < 0x20)
+/// so we don't depend on the new `std.Io.Writer` interface just for
+/// stringification.
+fn writeJsonString(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |b| {
+        switch (b) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0C => try writer.writeAll("\\f"),
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                var buf: [6]u8 = undefined;
+                const hex = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{b}) catch unreachable;
+                try writer.writeAll(hex);
+            },
+            else => try writer.writeByte(b),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+/// Route `/_system/tenant/*` requests to the instance or domain
+/// handler. `sub_path` is the portion after `/_system/tenant/` — e.g.
+/// `"instance"`, `"instance/acme"`, `"domain"`. The caller has
+/// already verified auth and extracted `cors_origin`.
+fn handleTenantRequest(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    sub_path: []const u8,
+    body: []const u8,
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+) !void {
+    const server = worker.h2;
+    const slash = std.mem.indexOfScalar(u8, sub_path, '/');
+    const resource = if (slash) |s| sub_path[0..s] else sub_path;
+    const resource_id = if (slash) |s| sub_path[s + 1 ..] else "";
+
+    if (std.mem.eql(u8, resource, "instance")) {
+        try handleTenantInstance(worker, ent, sid, sess, method, resource_id, body, allocator, cors_origin);
+        return;
+    }
+    if (std.mem.eql(u8, resource, "domain")) {
+        try handleTenantDomain(worker, ent, sid, sess, method, resource_id, body, allocator, cors_origin);
+        return;
+    }
+    try setSystemResponse(server, ent, sid, sess, 404, "unknown tenant resource\n", allocator, cors_origin, null);
+}
+
+fn handleTenantInstance(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    id: []const u8,
+    body: []const u8,
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+) !void {
+    const server = worker.h2;
+
+    if (id.len == 0) {
+        if (std.mem.eql(u8, method, "GET")) {
+            var list = worker.tenant.listInstances(10_000) catch |err| {
+                std.log.warn("listInstances failed: {s}", .{@errorName(err)});
+                try setSystemResponse(server, ent, sid, sess, 500, "list failed\n", allocator, cors_origin, null);
+                return;
+            };
+            defer list.deinit();
+
+            var json = std.ArrayList(u8).empty;
+            defer json.deinit(allocator);
+            const writer = json.writer(allocator);
+            try writer.writeAll("{\"instances\":[");
+            for (list.ids, 0..) |inst_id, i| {
+                if (i > 0) try writer.writeAll(",");
+                try writer.writeAll("{\"id\":");
+                try writeJsonString(writer, inst_id);
+                try writer.writeAll("}");
+            }
+            try writer.writeAll("]}");
+
+            try setSystemResponse(server, ent, sid, sess, 200, json.items, allocator, cors_origin, "application/json");
+            return;
+        }
+        if (std.mem.eql(u8, method, "POST")) {
+            const Req = struct { id: []const u8 };
+            const parsed = std.json.parseFromSlice(Req, allocator, body, .{}) catch {
+                try setSystemResponse(server, ent, sid, sess, 400, "invalid json body\n", allocator, cors_origin, null);
+                return;
+            };
+            defer parsed.deinit();
+
+            worker.tenant.createInstance(parsed.value.id) catch |err| switch (err) {
+                error.InvalidInstanceId => {
+                    try setSystemResponse(server, ent, sid, sess, 400, "invalid instance id\n", allocator, cors_origin, null);
+                    return;
+                },
+                else => {
+                    std.log.warn("createInstance failed: {s}", .{@errorName(err)});
+                    try setSystemResponse(server, ent, sid, sess, 500, "create failed\n", allocator, cors_origin, null);
+                    return;
+                },
+            };
+
+            var json = std.ArrayList(u8).empty;
+            defer json.deinit(allocator);
+            const writer = json.writer(allocator);
+            try writer.writeAll("{\"id\":");
+            try writeJsonString(writer, parsed.value.id);
+            try writer.writeAll("}");
+            try setSystemResponse(server, ent, sid, sess, 201, json.items, allocator, cors_origin, "application/json");
+            return;
+        }
+        try setSystemResponse(server, ent, sid, sess, 405, "method not allowed\n", allocator, cors_origin, null);
+        return;
+    }
+
+    // id is non-empty: operate on a single instance.
+    if (std.mem.eql(u8, method, "GET")) {
+        const exists = worker.tenant.instanceExists(id) catch |err| switch (err) {
+            error.InvalidInstanceId => {
+                try setSystemResponse(server, ent, sid, sess, 400, "invalid instance id\n", allocator, cors_origin, null);
+                return;
+            },
+            else => {
+                std.log.warn("instanceExists failed: {s}", .{@errorName(err)});
+                try setSystemResponse(server, ent, sid, sess, 500, "check failed\n", allocator, cors_origin, null);
+                return;
+            },
+        };
+        if (!exists) {
+            try setSystemResponse(server, ent, sid, sess, 404, "{\"error\":\"not found\"}", allocator, cors_origin, "application/json");
+            return;
+        }
+        var json = std.ArrayList(u8).empty;
+        defer json.deinit(allocator);
+        const writer = json.writer(allocator);
+        try writer.writeAll("{\"id\":");
+        try writeJsonString(writer, id);
+        try writer.writeAll("}");
+        try setSystemResponse(server, ent, sid, sess, 200, json.items, allocator, cors_origin, "application/json");
+        return;
+    }
+    if (std.mem.eql(u8, method, "DELETE")) {
+        worker.tenant.deleteInstance(id) catch |err| switch (err) {
+            error.InvalidInstanceId => {
+                try setSystemResponse(server, ent, sid, sess, 400, "invalid instance id\n", allocator, cors_origin, null);
+                return;
+            },
+            else => {
+                std.log.warn("deleteInstance failed: {s}", .{@errorName(err)});
+                try setSystemResponse(server, ent, sid, sess, 500, "delete failed\n", allocator, cors_origin, null);
+                return;
+            },
+        };
+        try setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
+        return;
+    }
+    try setSystemResponse(server, ent, sid, sess, 405, "method not allowed\n", allocator, cors_origin, null);
+}
+
+fn handleTenantDomain(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    resource_id: []const u8,
+    body: []const u8,
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+) !void {
+    const server = worker.h2;
+    if (resource_id.len != 0) {
+        // Single-domain endpoints aren't defined for the demo yet.
+        try setSystemResponse(server, ent, sid, sess, 404, "domain subpath not defined\n", allocator, cors_origin, null);
+        return;
+    }
+
+    if (std.mem.eql(u8, method, "GET")) {
+        var list = worker.tenant.listDomains(10_000) catch |err| {
+            std.log.warn("listDomains failed: {s}", .{@errorName(err)});
+            try setSystemResponse(server, ent, sid, sess, 500, "list failed\n", allocator, cors_origin, null);
+            return;
+        };
+        defer list.deinit();
+
+        var json = std.ArrayList(u8).empty;
+        defer json.deinit(allocator);
+        const writer = json.writer(allocator);
+        try writer.writeAll("{\"domains\":[");
+        for (list.entries, 0..) |e, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("{\"host\":");
+            try writeJsonString(writer, e.host);
+            try writer.writeAll(",\"instance_id\":");
+            try writeJsonString(writer, e.instance_id);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("]}");
+
+        try setSystemResponse(server, ent, sid, sess, 200, json.items, allocator, cors_origin, "application/json");
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST")) {
+        const Req = struct { host: []const u8, instance_id: []const u8 };
+        const parsed = std.json.parseFromSlice(Req, allocator, body, .{}) catch {
+            try setSystemResponse(server, ent, sid, sess, 400, "invalid json body\n", allocator, cors_origin, null);
+            return;
+        };
+        defer parsed.deinit();
+
+        worker.tenant.assignDomain(parsed.value.host, parsed.value.instance_id) catch |err| switch (err) {
+            error.InvalidHost => {
+                try setSystemResponse(server, ent, sid, sess, 400, "invalid host\n", allocator, cors_origin, null);
+                return;
+            },
+            error.InvalidInstanceId => {
+                try setSystemResponse(server, ent, sid, sess, 400, "invalid instance id\n", allocator, cors_origin, null);
+                return;
+            },
+            error.InstanceNotFound => {
+                try setSystemResponse(server, ent, sid, sess, 404, "instance not found\n", allocator, cors_origin, null);
+                return;
+            },
+            else => {
+                std.log.warn("assignDomain failed: {s}", .{@errorName(err)});
+                try setSystemResponse(server, ent, sid, sess, 500, "assign failed\n", allocator, cors_origin, null);
+                return;
+            },
+        };
+
+        var json = std.ArrayList(u8).empty;
+        defer json.deinit(allocator);
+        const writer = json.writer(allocator);
+        try writer.writeAll("{\"host\":");
+        try writeJsonString(writer, parsed.value.host);
+        try writer.writeAll(",\"instance_id\":");
+        try writeJsonString(writer, parsed.value.instance_id);
+        try writer.writeAll("}");
+        try setSystemResponse(server, ent, sid, sess, 201, json.items, allocator, cors_origin, "application/json");
+        return;
+    }
+    try setSystemResponse(server, ent, sid, sess, 405, "method not allowed\n", allocator, cors_origin, null);
+}
+
+/// Like `setSimpleResponse`, but stamps CORS response headers when
+/// `cors_origin` is non-null and an optional `Content-Type`. Use in
+/// the `/_system/*` branch so admin UI responses carry the right
+/// headers without the caller hand-assembling `RespHeaders`.
+fn setSystemResponse(
+    server: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    status_code: u16,
+    body: []const u8,
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+    content_type: ?[]const u8,
+) !void {
+    const copy = try allocator.dupe(u8, body);
+    const resp_hdrs = try buildSystemRespHeaders(allocator, cors_origin, false, content_type);
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, resp_hdrs);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = copy.ptr,
+        .len = @intCast(copy.len),
+    });
     try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
     try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
     try server.reg.set(ent, &server.request_out, h2.Session, sess);

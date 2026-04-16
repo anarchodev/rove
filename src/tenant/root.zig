@@ -78,6 +78,36 @@ pub const TOKEN_HEX_LEN: usize = 64; // 32 bytes of entropy, hex-encoded
 pub const MAX_INSTANCE_ID_LEN: usize = 64;
 pub const MAX_HOST_LEN: usize = 253; // RFC 1035
 
+pub const InstanceList = struct {
+    ids: [][]u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *InstanceList) void {
+        for (self.ids) |id| self.allocator.free(id);
+        self.allocator.free(self.ids);
+        self.* = undefined;
+    }
+};
+
+pub const DomainEntry = struct {
+    host: []u8,
+    instance_id: []u8,
+};
+
+pub const DomainList = struct {
+    entries: []DomainEntry,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DomainList) void {
+        for (self.entries) |e| {
+            self.allocator.free(e.host);
+            self.allocator.free(e.instance_id);
+        }
+        self.allocator.free(self.entries);
+        self.* = undefined;
+    }
+};
+
 /// Live instance. Owned by `Tenant`; callers hold read-only pointers.
 ///
 /// - `id`: the tenant's string id (owned).
@@ -180,6 +210,50 @@ pub const Tenant = struct {
         try self.writeInstanceMarker(id);
     }
 
+    /// Delete an instance. Closes its open `KvStore`, drops it from
+    /// the in-memory map, erases the existence marker, and sweeps any
+    /// domain aliases that pointed at it. The on-disk `{dir}/{id}/`
+    /// directory is NOT removed — demo-era simplification — so
+    /// re-creating an instance with the same id reuses its old files.
+    /// Idempotent: deleting a non-existent instance is a no-op.
+    pub fn deleteInstance(self: *Tenant, id: []const u8) Error!void {
+        try validateInstanceId(id);
+
+        if (self.instances.fetchRemove(id)) |entry| {
+            const inst = entry.value;
+            inst.kv.close();
+            self.allocator.free(inst.id);
+            self.allocator.free(inst.dir);
+            self.allocator.destroy(inst);
+        }
+
+        var marker_buf: [32 + MAX_INSTANCE_ID_LEN]u8 = undefined;
+        const marker_key = std.fmt.bufPrint(&marker_buf, "__root__/instance/{s}", .{id}) catch
+            return Error.InvalidInstanceId;
+        self.root.delete(marker_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return Error.Kv,
+        };
+
+        // Sweep dangling domain pointers. Pulls the full domain set
+        // up front so we can mutate during deletion without worrying
+        // about scan/delete interleaving. M1 scale (tens of domains)
+        // makes the maxInt page size fine.
+        var scan = self.root.prefix("__root__/domain/", "", std.math.maxInt(u32)) catch
+            return Error.Kv;
+        defer scan.deinit();
+        for (scan.entries) |e| {
+            if (std.mem.eql(u8, e.value, id)) {
+                self.root.delete(e.key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return Error.Kv,
+                };
+            }
+        }
+
+        self.invalidateHostCache();
+    }
+
     pub fn assignDomain(
         self: *Tenant,
         host: []const u8,
@@ -233,6 +307,74 @@ pub const Tenant = struct {
     pub fn instanceExists(self: *Tenant, id: []const u8) Error!bool {
         try validateInstanceId(id);
         return self.instanceExistsInRoot(id);
+    }
+
+    /// Enumerate every instance registered in the root store (up to
+    /// `max`). Used by the admin UI to render the instance list.
+    /// Ordering follows the root store's key order, which matches
+    /// ASCII lexical order of instance ids.
+    pub fn listInstances(self: *Tenant, max: u32) Error!InstanceList {
+        var scan = self.root.prefix("__root__/instance/", "", max) catch
+            return Error.Kv;
+        defer scan.deinit();
+
+        const ids = self.allocator.alloc([]u8, scan.entries.len) catch
+            return Error.OutOfMemory;
+        var filled: usize = 0;
+        errdefer {
+            for (ids[0..filled]) |id| self.allocator.free(id);
+            self.allocator.free(ids);
+        }
+
+        const prefix_len = "__root__/instance/".len;
+        for (scan.entries) |e| {
+            if (e.key.len <= prefix_len) continue;
+            const id_bytes = e.key[prefix_len..];
+            ids[filled] = self.allocator.dupe(u8, id_bytes) catch
+                return Error.OutOfMemory;
+            filled += 1;
+        }
+
+        // Shrink if any entries were skipped (malformed keys should
+        // never appear, but the guard keeps the slice tight).
+        const final = if (filled == ids.len) ids else ids[0..filled];
+        return .{ .ids = final, .allocator = self.allocator };
+    }
+
+    /// Enumerate domain → instance aliases (up to `max`). Values point
+    /// at instance ids; callers should treat unknown instance ids as
+    /// dangling aliases (we don't resolve them here).
+    pub fn listDomains(self: *Tenant, max: u32) Error!DomainList {
+        var scan = self.root.prefix("__root__/domain/", "", max) catch
+            return Error.Kv;
+        defer scan.deinit();
+
+        const entries = self.allocator.alloc(DomainEntry, scan.entries.len) catch
+            return Error.OutOfMemory;
+        var filled: usize = 0;
+        errdefer {
+            for (entries[0..filled]) |e| {
+                self.allocator.free(e.host);
+                self.allocator.free(e.instance_id);
+            }
+            self.allocator.free(entries);
+        }
+
+        const prefix_len = "__root__/domain/".len;
+        for (scan.entries) |e| {
+            if (e.key.len <= prefix_len) continue;
+            const host = e.key[prefix_len..];
+            const host_copy = self.allocator.dupe(u8, host) catch
+                return Error.OutOfMemory;
+            errdefer self.allocator.free(host_copy);
+            const id_copy = self.allocator.dupe(u8, e.value) catch
+                return Error.OutOfMemory;
+            entries[filled] = .{ .host = host_copy, .instance_id = id_copy };
+            filled += 1;
+        }
+
+        const final = if (filled == entries.len) entries else entries[0..filled];
+        return .{ .entries = final, .allocator = self.allocator };
     }
 
     // ── Internals ─────────────────────────────────────────────────────
@@ -704,6 +846,79 @@ test "canAccessInstance short-circuits for root" {
 
     const other_ctx: AuthContext = .{ .is_root = false };
     try testing.expectEqual(false, try fx.tenant.canAccessInstance(other_ctx, "acme"));
+}
+
+test "listInstances returns every created instance" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try fx.tenant.createInstance("alpha");
+    try fx.tenant.createInstance("beta");
+    try fx.tenant.createInstance("gamma");
+
+    var list = try fx.tenant.listInstances(100);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 3), list.ids.len);
+    // Scan is lex-ordered by id.
+    try testing.expectEqualStrings("alpha", list.ids[0]);
+    try testing.expectEqualStrings("beta", list.ids[1]);
+    try testing.expectEqualStrings("gamma", list.ids[2]);
+}
+
+test "listDomains returns host → instance mappings" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try fx.tenant.createInstance("acme");
+    try fx.tenant.createInstance("globex");
+    try fx.tenant.assignDomain("acme.test", "acme");
+    try fx.tenant.assignDomain("www.globex.test", "globex");
+
+    var list = try fx.tenant.listDomains(100);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 2), list.entries.len);
+    try testing.expectEqualStrings("acme.test", list.entries[0].host);
+    try testing.expectEqualStrings("acme", list.entries[0].instance_id);
+    try testing.expectEqualStrings("www.globex.test", list.entries[1].host);
+    try testing.expectEqualStrings("globex", list.entries[1].instance_id);
+}
+
+test "deleteInstance removes marker and dangling domains" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try fx.tenant.createInstance("acme");
+    try fx.tenant.createInstance("globex");
+    try fx.tenant.assignDomain("acme.test", "acme");
+    try fx.tenant.assignDomain("alias.test", "acme");
+    try fx.tenant.assignDomain("globex.test", "globex");
+
+    try fx.tenant.deleteInstance("acme");
+
+    try testing.expectEqual(false, try fx.tenant.instanceExists("acme"));
+    // The other instance is untouched.
+    try testing.expectEqual(true, try fx.tenant.instanceExists("globex"));
+
+    // Both aliases for acme were swept.
+    try testing.expectEqual(
+        @as(?*const Instance, null),
+        try fx.tenant.resolveDomain("acme.test"),
+    );
+    try testing.expectEqual(
+        @as(?*const Instance, null),
+        try fx.tenant.resolveDomain("alias.test"),
+    );
+    // globex's alias survives.
+    const inst = try fx.tenant.resolveDomain("globex.test");
+    try testing.expect(inst != null);
+    try testing.expectEqualStrings("globex", inst.?.id);
+}
+
+test "deleteInstance is idempotent for unknown ids" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+    try fx.tenant.deleteInstance("nonexistent");
+    try testing.expectEqual(false, try fx.tenant.instanceExists("nonexistent"));
 }
 
 test "validateHost rejects slashes and whitespace" {

@@ -254,12 +254,12 @@ pub const CodeStore = struct {
             entries.deinit(self.allocator);
         }
 
-        const range = self.kv.range("file/", "file0", std.math.maxInt(u32)) catch
+        const scan = self.kv.prefix("file/", "", std.math.maxInt(u32)) catch
             return Error.Kv;
-        var range_mut = range;
-        defer range_mut.deinit();
+        var scan_mut = scan;
+        defer scan_mut.deinit();
 
-        for (range.entries) |e| {
+        for (scan.entries) |e| {
             if (e.key.len <= "file/".len) continue;
             const path = e.key["file/".len..];
 

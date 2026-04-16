@@ -199,6 +199,14 @@ const Cli = struct {
     /// Tenant/Dispatcher and binds the same HTTP/2 port via
     /// SO_REUSEPORT. Defaults to the number of online CPUs.
     workers: u16 = 0,
+    /// Origin allowed to call `/_system/*` with CORS. When set, the
+    /// worker responds to preflight (OPTIONS) requests from this
+    /// origin and adds `Access-Control-Allow-*` headers to all
+    /// `/_system/*` responses. Required for the browser admin UI in
+    /// dev (typically `http://localhost:5173`) and prod (e.g.
+    /// `https://admin.example.com`). Unset = no CORS, and the admin
+    /// UI must be served same-origin or go through a proxy.
+    admin_origin: ?[]const u8 = null,
     /// Raft proposal linger budget, in microseconds. Hold pending
     /// proposals up to this long so the raft thread can pack more
     /// into a single `raft_log.db` commit + fsync. Under heavy write
@@ -248,6 +256,10 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.workers = try std.fmt.parseInt(u16, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--admin-origin")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.admin_origin = argv[i];
         } else if (std.mem.eql(u8, a, "--propose-linger-us")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
@@ -326,6 +338,7 @@ const WorkerCtx = struct {
     raft: *kv.RaftNode,
     code_addr: std.net.Address,
     log_addr: std.net.Address,
+    admin_origin: ?[]const u8,
     /// Shared across all workers — every per-tenant `app.db` `KvStore`
     /// opens with a counter from this registry so seq allocation
     /// stays globally monotonic.
@@ -405,6 +418,7 @@ fn workerMain(args: *WorkerCtx) !void {
         },
         .code_addr = args.code_addr,
         .log_addr = args.log_addr,
+        .admin_origin = args.admin_origin,
         .log_worker_id = args.worker_idx,
     });
     defer worker.destroy();
@@ -653,11 +667,17 @@ pub fn main() !void {
     // connections to them during startup. Each owns its own rove
     // context (registry + io_uring + h2 server) and binds to a
     // loopback TCP ephemeral port.
-    const cs_handle = try code_server.thread.spawn(allocator, cli.data_dir);
+    // Sized from the worker count: each worker holds one persistent
+    // h2 client to each subsystem, plus a small slack so a reconnect
+    // during churn doesn't collide with the old connection still in
+    // the fd table.
+    const subsystem_max_connections: u32 = @as(u32, num_workers) + 4;
+
+    const cs_handle = try code_server.thread.spawn(allocator, cli.data_dir, subsystem_max_connections);
     defer cs_handle.shutdown();
     const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
 
-    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir);
+    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir, subsystem_max_connections);
     defer ls_handle.shutdown();
     const log_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ls_handle.port);
 
@@ -733,6 +753,7 @@ pub fn main() !void {
             .raft = raft_node,
             .code_addr = code_addr,
             .log_addr = log_addr,
+            .admin_origin = cli.admin_origin,
             .seq_counters = &seq_counters,
             .ready = &ready_events[i],
         };

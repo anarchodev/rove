@@ -54,6 +54,11 @@ pub const Handle = struct {
     /// Absolute path to `{data_dir}`. Borrowed from the caller — must
     /// outlive the handle.
     data_dir: []const u8,
+    /// Max concurrent inbound h2c connections this server accepts.
+    /// Sized from the worker count at spawn time — each worker holds
+    /// one persistent client, so the cap must be `>= num_workers` or
+    /// later workers get ECONNREFUSED and spin in a reconnect loop.
+    max_connections: u32,
     /// Signalled by the main thread to request graceful shutdown.
     /// The thread's poll loop observes it between ticks.
     stop: std.atomic.Value(bool),
@@ -76,7 +81,11 @@ pub const Handle = struct {
 /// its listen socket (or failed trying). The returned `Handle.port`
 /// is the concrete port the caller should connect to — 0 is never
 /// returned (OS picks an ephemeral port for us).
-pub fn spawn(allocator: std.mem.Allocator, data_dir: []const u8) !*Handle {
+pub fn spawn(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    max_connections: u32,
+) !*Handle {
     const h = try allocator.create(Handle);
     errdefer allocator.destroy(h);
 
@@ -85,6 +94,7 @@ pub fn spawn(allocator: std.mem.Allocator, data_dir: []const u8) !*Handle {
         .thread = undefined,
         .port = 0,
         .data_dir = data_dir,
+        .max_connections = max_connections,
         .stop = .{ .raw = false },
         .ready = .{},
         .bind_err = null,
@@ -125,7 +135,7 @@ fn runThread(h: *Handle) !void {
     // most test servers use.
     const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
     const server = CodeH2.create(&reg, allocator, bind_addr, .{
-        .max_connections = 16,
+        .max_connections = h.max_connections,
         .buf_count = 64,
         .buf_size = 64 * 1024,
     }, .{}) catch |err| {

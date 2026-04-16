@@ -29,12 +29,15 @@ fi
 
 rm -rf "$DATA_DIR"
 
+# --workers 1: penalty-box state is per-worker, so SO_REUSEPORT spread
+# across N workers would dilute kill counts and never trip the box.
 "$WORKER_BIN" \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
     --data-dir "$DATA_DIR" \
+    --workers 1 \
     --fresh >/tmp/penalty-smoke.out 2>&1 &
 WORKER_PID=$!
 trap 'kill $WORKER_PID 2>/dev/null || true; wait $WORKER_PID 2>/dev/null || true' EXIT
