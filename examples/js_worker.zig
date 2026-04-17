@@ -60,36 +60,49 @@ const log_server = @import("rove-log-server");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
 
+// ── Demo handler sources (all .mjs, named-export RPC contract) ────
+//
+// Every export is called via `?fn=<name>` (GET) or `POST {fn, args}`.
+// Return value is the response body (strings emit as-is; objects are
+// `JSON.stringify`'d). Status/headers/cookies live on the `response`
+// global.
+//
+// Each handler here exports `handler()` as its default verb for
+// backward-compatible smoke coverage; a few (acme) add extra exports.
+
 const ACME_INDEX =
-    \\const count = parseInt(kv.get("hits") ?? "0", 10) + 1;
-    \\kv.set("hits", String(count));
-    \\response.status = 200;
-    \\response.body = "acme hit count: " + count + " (path=" + request.path + ")\n";
+    \\export function handler() {
+    \\    const count = parseInt(kv.get("hits") ?? "0", 10) + 1;
+    \\    kv.set("hits", String(count));
+    \\    return "acme hit count: " + count + " (path=" + request.path + ")\n";
+    \\}
 ;
 
 /// Second route under acme — proves the filesystem router picks a
-/// non-default file based on URL path. `/api` → `api/index.js`.
+/// non-default file based on URL path. `/api?fn=handler` → `api/index.mjs`.
 const ACME_API_INDEX =
-    \\response.status = 200;
-    \\response.body = "acme api: method=" + request.method + " path=" + request.path + "\n";
+    \\export function handler() {
+    \\    return "acme api: method=" + request.method + " path=" + request.path + "\n";
+    \\}
 ;
 
-/// Third route under acme — a real ES module with `?fn=` function
-/// dispatch. `/users?fn=greet` calls `greet(request)` and returns
-/// its result object as the HTTP response.
+/// Third route under acme — multiple exports under one module.
+/// `/users?fn=greet&args=["Claude"]` calls `greet("Claude")`.
 const ACME_USERS_MJS =
-    \\export function greet(req) {
-    \\    return { status: 200, body: "mjs greet: path=" + req.path + "\n" };
+    \\export function greet(name) {
+    \\    return "mjs greet: hello " + (name ?? "world") + " (path=" + request.path + ")\n";
     \\}
-    \\export async function slow(req) {
-    \\    const v = await Promise.resolve("async " + req.path);
-    \\    return { status: 202, body: v + "\n" };
+    \\export async function slow(delay_label) {
+    \\    const v = await Promise.resolve("async " + (delay_label ?? request.path));
+    \\    response.status = 202;
+    \\    return v + "\n";
     \\}
 ;
 
 const GLOBEX_HANDLER =
-    \\response.status = 200;
-    \\response.body = "globex: you hit " + request.path + " at " + Date.now() + "\n";
+    \\export function handler() {
+    \\    return "globex: you hit " + request.path + " at " + Date.now() + "\n";
+    \\}
 ;
 
 /// Intentionally runaway — used by scripts/penalty_smoke.sh to prove
@@ -99,7 +112,7 @@ const GLOBEX_HANDLER =
 /// tenant gets dropped into the penalty box and subsequent requests
 /// short-circuit to 503 without ever entering qjs.
 const PENALTY_HANDLER =
-    \\while (true) {}
+    \\export function handler() { while (true) {} }
 ;
 
 /// Read-only KV benchmark tenant. Reads a pre-seeded key on every
@@ -108,8 +121,9 @@ const PENALTY_HANDLER =
 /// bootstrap with `greeting = "hello"` so the read is a real hit, not
 /// a miss.
 const READONLY_HANDLER =
-    \\response.status = 200;
-    \\response.body = "readonly: " + (kv.get("greeting") ?? "(unset)") + "\n";
+    \\export function handler() {
+    \\    return "readonly: " + (kv.get("greeting") ?? "(unset)") + "\n";
+    \\}
 ;
 
 /// Write benchmark handler. Used by the `write0..write7` tenants to
@@ -118,9 +132,10 @@ const READONLY_HANDLER =
 /// Matches HOT_BENCH_HANDLER exactly so cross-tenant sharded runs are
 /// directly comparable to single-tenant `hot.test` runs.
 const WRITE_BENCH_HANDLER =
-    \\kv.set("k", "0123456789abcdef0123456789abcdef");
-    \\response.status = 200;
-    \\response.body = "wbench\n";
+    \\export function handler() {
+    \\    kv.set("k", "0123456789abcdef0123456789abcdef");
+    \\    return "wbench\n";
+    \\}
 ;
 
 /// Random-key write benchmark handler. Each request writes to a unique
@@ -128,10 +143,11 @@ const WRITE_BENCH_HANDLER =
 /// Compare against WRITE_BENCH_HANDLER (which always hits "hits") to
 /// see whether B-tree page contention is a bottleneck.
 const RANDWRITE_BENCH_HANDLER =
-    \\const key = crypto.randomUUID();
-    \\kv.set(key, "v");
-    \\response.status = 200;
-    \\response.body = "randwrite: " + key + "\n";
+    \\export function handler() {
+    \\    const key = crypto.randomUUID();
+    \\    kv.set(key, "v");
+    \\    return "randwrite: " + key + "\n";
+    \\}
 ;
 
 /// Fixed-payload, fixed-key contention benchmark. Writes a 32-byte
@@ -139,9 +155,10 @@ const RANDWRITE_BENCH_HANDLER =
 /// payload, 1000-key keyspace) to isolate row-contention cost from
 /// B-tree growth and crypto-RNG overhead.
 const HOT_BENCH_HANDLER =
-    \\kv.set("k", "0123456789abcdef0123456789abcdef");
-    \\response.status = 200;
-    \\response.body = "hot\n";
+    \\export function handler() {
+    \\    kv.set("k", "0123456789abcdef0123456789abcdef");
+    \\    return "hot\n";
+    \\}
 ;
 
 /// Fair-comparison counterpart to HOT_BENCH_HANDLER. Each request picks
@@ -150,10 +167,11 @@ const HOT_BENCH_HANDLER =
 /// warmup, so the only difference vs HOT is whether concurrent writes
 /// land on the same row or different rows.
 const SPREAD_BENCH_HANDLER =
-    \\const i = Math.floor(Math.random() * 1000);
-    \\kv.set("k" + i, "0123456789abcdef0123456789abcdef");
-    \\response.status = 200;
-    \\response.body = "spread\n";
+    \\export function handler() {
+    \\    const i = Math.floor(Math.random() * 1000);
+    \\    kv.set("k" + i, "0123456789abcdef0123456789abcdef");
+    \\    return "spread\n";
+    \\}
 ;
 
 /// Number of `writeN` benchmark tenants spun up at startup. Each has
@@ -173,167 +191,110 @@ const TENANT_IDS = [_][]const u8{
 };
 
 /// JS source for the admin handler. Deployed to `__admin__` at
-/// bootstrap. See `src/js/worker.zig`'s admin-subdomain dispatch for
-/// the routing model. This handler implements the JSON admin API:
+/// bootstrap. Each RPC function is a named export; the UI calls them
+/// by name (`?fn=listInstance` or `POST {fn:"listInstance",args:[...]}`).
 ///
-///   GET    /tenant/instance              → list instances
-///   GET    /tenant/instance?id=X         → exists check
-///   POST   /tenant/instance  {id: "X"}   → create
-///   DELETE /tenant/instance?id=X         → delete + sweep domains
-///   GET    /tenant/domain                → list host → id
-///   POST   /tenant/domain  {host, instance_id}
-///                                        → assign domain
-///   GET    /kv?prefix=&cursor=&limit=    → list keys (JSON values)
-///   GET    /kv/get?key=                  → single value (raw string)
+/// Tenant CRUD writes `__root__/instance/*` / `__root__/domain/*`
+/// keys, which only make sense when the dispatcher bound `kv` to the
+/// root store (i.e. the bare admin domain). The UI hits those RPCs
+/// on that host.
 ///
-/// Bound against whatever KV store the dispatcher selected for this
-/// request: root store for the bare admin domain; scope tenant's
-/// app.db for `{id}.api.loop46.com`. Tenant CRUD writes only make
-/// sense when the store IS root — the admin UI sends them to the
-/// bare admin subdomain.
+/// The KV RPCs operate on whatever store the dispatcher selected —
+/// root for the bare admin domain, the target tenant's app.db for
+/// `{id}.api.loop46.com`. Same handler, rebound scope.
+///
+/// Status on error flows through the ambient `response` global;
+/// non-200 return values use the `{ error }` shape as the body.
 const ADMIN_HANDLER_SRC =
-    \\"use strict";
-    \\(function () {
-    \\    const parsed = splitQuery(request.path);
-    \\    const path = parsed.path;
-    \\    const query = parsed.query;
-    \\    const method = request.method;
+    \\function validId(id) {
+    \\    return typeof id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(id);
+    \\}
     \\
-    \\    if (path === "/tenant/instance") return handleInstance(method, query);
-    \\    if (path === "/tenant/domain") return handleDomain(method, query);
-    \\    if (path === "/kv") return handleKvList(method, query);
-    \\    if (path === "/kv/get") return handleKvGet(method, query);
-    \\    return respondJson(404, { error: "unknown route", path: path, method: method });
+    \\export function listInstance() {
+    \\    const entries = kv.prefix("__root__/instance/", "", 1000);
+    \\    return {
+    \\        instances: entries.map((e) => ({
+    \\            id: e.key.slice("__root__/instance/".length),
+    \\        })),
+    \\    };
+    \\}
     \\
-    \\    function handleInstance(method, query) {
-    \\        if (method === "GET") {
-    \\            const id = query.get("id");
-    \\            if (id) {
-    \\                if (!validId(id)) return respondJson(400, { error: "invalid id" });
-    \\                const v = kv.get("__root__/instance/" + id);
-    \\                if (v === null) return respondJson(404, { error: "not found" });
-    \\                return respondJson(200, { id: id });
-    \\            }
-    \\            const entries = kv.prefix("__root__/instance/", "", 1000);
-    \\            const ids = entries.map(function (e) {
-    \\                return { id: e.key.slice("__root__/instance/".length) };
-    \\            });
-    \\            return respondJson(200, { instances: ids });
-    \\        }
-    \\        if (method === "POST") {
-    \\            const body = parseBody();
-    \\            if (body === null) return respondJson(400, { error: "invalid json body" });
-    \\            if (!validId(body.id)) return respondJson(400, { error: "invalid id" });
-    \\            kv.set("__root__/instance/" + body.id, "");
-    \\            return respondJson(201, { id: body.id });
-    \\        }
-    \\        if (method === "DELETE") {
-    \\            const id = query.get("id");
-    \\            if (!validId(id)) return respondJson(400, { error: "invalid id" });
-    \\            kv.delete("__root__/instance/" + id);
-    \\            const doms = kv.prefix("__root__/domain/", "", 1000);
-    \\            for (let i = 0; i < doms.length; i++) {
-    \\                if (doms[i].value === id) kv.delete(doms[i].key);
-    \\            }
-    \\            response.status = 204;
-    \\            response.body = "";
-    \\            return;
-    \\        }
-    \\        return respondText(405, "method not allowed");
+    \\export function getInstance(id) {
+    \\    if (!validId(id)) { response.status = 400; return { error: "invalid id" }; }
+    \\    const v = kv.get("__root__/instance/" + id);
+    \\    if (v === null) { response.status = 404; return { error: "not found" }; }
+    \\    return { id: id };
+    \\}
+    \\
+    \\export function createInstance(id) {
+    \\    if (!validId(id)) { response.status = 400; return { error: "invalid id" }; }
+    \\    kv.set("__root__/instance/" + id, "");
+    \\    response.status = 201;
+    \\    return { id: id };
+    \\}
+    \\
+    \\export function deleteInstance(id) {
+    \\    if (!validId(id)) { response.status = 400; return { error: "invalid id" }; }
+    \\    kv.delete("__root__/instance/" + id);
+    \\    const doms = kv.prefix("__root__/domain/", "", 1000);
+    \\    for (let i = 0; i < doms.length; i++) {
+    \\        if (doms[i].value === id) kv.delete(doms[i].key);
     \\    }
+    \\    response.status = 204;
+    \\    return null;
+    \\}
     \\
-    \\    function handleDomain(method, query) {
-    \\        if (method === "GET") {
-    \\            const entries = kv.prefix("__root__/domain/", "", 1000);
-    \\            const doms = entries.map(function (e) {
-    \\                return {
-    \\                    host: e.key.slice("__root__/domain/".length),
-    \\                    instance_id: e.value,
-    \\                };
-    \\            });
-    \\            return respondJson(200, { domains: doms });
-    \\        }
-    \\        if (method === "POST") {
-    \\            const body = parseBody();
-    \\            if (body === null) return respondJson(400, { error: "invalid json body" });
-    \\            if (!body.host || !body.instance_id) {
-    \\                return respondJson(400, { error: "host and instance_id required" });
-    \\            }
-    \\            const exists = kv.get("__root__/instance/" + body.instance_id);
-    \\            if (exists === null) return respondJson(404, { error: "instance not found" });
-    \\            kv.set("__root__/domain/" + body.host, body.instance_id);
-    \\            return respondJson(201, { host: body.host, instance_id: body.instance_id });
-    \\        }
-    \\        return respondText(405, "method not allowed");
-    \\    }
+    \\export function listDomain() {
+    \\    const entries = kv.prefix("__root__/domain/", "", 1000);
+    \\    return {
+    \\        domains: entries.map((e) => ({
+    \\            host: e.key.slice("__root__/domain/".length),
+    \\            instance_id: e.value,
+    \\        })),
+    \\    };
+    \\}
     \\
-    \\    function handleKvList(method, query) {
-    \\        if (method !== "GET") return respondText(405, "method not allowed");
-    \\        const prefix = query.get("prefix") || "";
-    \\        const cursor = query.get("cursor") || "";
-    \\        const limit_raw = parseInt(query.get("limit") || "100", 10) || 100;
-    \\        const limit = Math.max(1, Math.min(limit_raw, 1000));
-    \\        const entries = kv.prefix(prefix, cursor, limit);
-    \\        const out = entries.map(function (e) {
-    \\            return { key: e.key, value: e.value };
-    \\        });
-    \\        const body = { entries: out };
-    \\        if (entries.length === limit && entries.length > 0) {
-    \\            body.next_cursor = entries[entries.length - 1].key;
-    \\        }
-    \\        return respondJson(200, body);
+    \\export function assignDomain(host, instance_id) {
+    \\    if (!host || !instance_id) {
+    \\        response.status = 400;
+    \\        return { error: "host and instance_id required" };
     \\    }
+    \\    const exists = kv.get("__root__/instance/" + instance_id);
+    \\    if (exists === null) {
+    \\        response.status = 404;
+    \\        return { error: "instance not found" };
+    \\    }
+    \\    kv.set("__root__/domain/" + host, instance_id);
+    \\    response.status = 201;
+    \\    return { host: host, instance_id: instance_id };
+    \\}
     \\
-    \\    function handleKvGet(method, query) {
-    \\        if (method !== "GET") return respondText(405, "method not allowed");
-    \\        const key = query.get("key");
-    \\        if (!key) return respondJson(400, { error: "missing key param" });
-    \\        const v = kv.get(key);
-    \\        if (v === null) return respondJson(404, { error: "not found" });
-    \\        response.status = 200;
-    \\        response.body = v;
+    \\export function listKv(prefix, cursor, limit) {
+    \\    const p = prefix || "";
+    \\    const c = cursor || "";
+    \\    const l = Math.max(1, Math.min(parseInt(limit ?? 100, 10) || 100, 1000));
+    \\    const entries = kv.prefix(p, c, l);
+    \\    const body = {
+    \\        entries: entries.map((e) => ({ key: e.key, value: e.value })),
+    \\    };
+    \\    if (entries.length === l && entries.length > 0) {
+    \\        body.next_cursor = entries[entries.length - 1].key;
     \\    }
+    \\    return body;
+    \\}
     \\
-    \\    function respondJson(status, obj) {
-    \\        response.status = status;
-    \\        response.body = JSON.stringify(obj);
+    \\export function getKv(key) {
+    \\    if (!key) {
+    \\        response.status = 400;
+    \\        return { error: "missing key" };
     \\    }
-    \\
-    \\    function respondText(status, text) {
-    \\        response.status = status;
-    \\        response.body = text;
+    \\    const v = kv.get(key);
+    \\    if (v === null) {
+    \\        response.status = 404;
+    \\        return { error: "not found" };
     \\    }
-    \\
-    \\    function validId(id) {
-    \\        return typeof id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(id);
-    \\    }
-    \\
-    \\    function parseBody() {
-    \\        if (!request.body) return {};
-    \\        try { return JSON.parse(request.body); } catch (_) { return null; }
-    \\    }
-    \\
-    \\    function splitQuery(raw) {
-    \\        const q = raw.indexOf("?");
-    \\        const path = q < 0 ? raw : raw.slice(0, q);
-    \\        const map = new Map();
-    \\        if (q >= 0) {
-    \\            const rest = raw.slice(q + 1);
-    \\            if (rest.length > 0) {
-    \\                const pairs = rest.split("&");
-    \\                for (let i = 0; i < pairs.length; i++) {
-    \\                    const pair = pairs[i];
-    \\                    if (!pair) continue;
-    \\                    const eq = pair.indexOf("=");
-    \\                    const k = decodeURIComponent(eq < 0 ? pair : pair.slice(0, eq));
-    \\                    const v = eq < 0 ? "" : decodeURIComponent(pair.slice(eq + 1));
-    \\                    map.set(k, v);
-    \\                }
-    \\            }
-    \\        }
-    \\        return { path: path, query: map };
-    \\    }
-    \\})();
+    \\    return v;
+    \\}
 ;
 
 comptime {
@@ -577,6 +538,11 @@ fn workerMain(args: *WorkerCtx) !void {
     // opens never need the original 5s wait anymore.
     for (TENANT_IDS) |id| {
         try tenant.createInstance(id);
+        // Skip the busy_timeout=0 hack on __admin__ — its kv ALIASES
+        // to the root store, and root.db needs normal busy handling
+        // so concurrent bootstrap writes across workers (marker +
+        // domain updates) serialize instead of racing to SQLITE_BUSY.
+        if (std.mem.eql(u8, id, tenant_mod.ADMIN_INSTANCE_ID)) continue;
         if (tenant.instances.get(id)) |inst| inst.kv.setBusyTimeout(0);
     }
 
@@ -802,37 +768,37 @@ pub fn main() !void {
         // all nodes independently end up with the same hashes — no
         // replication needed for code in M1.
         try bootstrapHandler(allocator, cli.data_dir, "__admin__", &.{
-            .{ .path = "index.js", .source = ADMIN_HANDLER_SRC },
+            .{ .path = "index.mjs", .source = ADMIN_HANDLER_SRC },
         });
         try bootstrapHandler(allocator, cli.data_dir, "acme", &.{
-            .{ .path = "index.js", .source = ACME_INDEX },
-            .{ .path = "api/index.js", .source = ACME_API_INDEX },
+            .{ .path = "index.mjs", .source = ACME_INDEX },
+            .{ .path = "api/index.mjs", .source = ACME_API_INDEX },
             .{ .path = "users/index.mjs", .source = ACME_USERS_MJS },
         });
         try bootstrapHandler(allocator, cli.data_dir, "globex", &.{
-            .{ .path = "index.js", .source = GLOBEX_HANDLER },
+            .{ .path = "index.mjs", .source = GLOBEX_HANDLER },
         });
         try bootstrapHandler(allocator, cli.data_dir, "penalty", &.{
-            .{ .path = "index.js", .source = PENALTY_HANDLER },
+            .{ .path = "index.mjs", .source = PENALTY_HANDLER },
         });
         try bootstrapHandler(allocator, cli.data_dir, "readonly", &.{
-            .{ .path = "index.js", .source = READONLY_HANDLER },
+            .{ .path = "index.mjs", .source = READONLY_HANDLER },
         });
         try bootstrapHandler(allocator, cli.data_dir, "randwrite", &.{
-            .{ .path = "index.js", .source = RANDWRITE_BENCH_HANDLER },
+            .{ .path = "index.mjs", .source = RANDWRITE_BENCH_HANDLER },
         });
         try bootstrapHandler(allocator, cli.data_dir, "hot", &.{
-            .{ .path = "index.js", .source = HOT_BENCH_HANDLER },
+            .{ .path = "index.mjs", .source = HOT_BENCH_HANDLER },
         });
         try bootstrapHandler(allocator, cli.data_dir, "spread", &.{
-            .{ .path = "index.js", .source = SPREAD_BENCH_HANDLER },
+            .{ .path = "index.mjs", .source = SPREAD_BENCH_HANDLER },
         });
         wi = 0;
         while (wi < NUM_WRITE_TENANTS) : (wi += 1) {
             var id_buf: [16]u8 = undefined;
             const id = try std.fmt.bufPrint(&id_buf, "write{d}", .{wi});
             try bootstrapHandler(allocator, cli.data_dir, id, &.{
-                .{ .path = "index.js", .source = WRITE_BENCH_HANDLER },
+                .{ .path = "index.mjs", .source = WRITE_BENCH_HANDLER },
             });
         }
 

@@ -209,15 +209,19 @@ pub const Tenant = struct {
     /// it in the in-memory map, and write the existence marker to the
     /// root store. Errors during file open surface here rather than at
     /// first-request time.
+    ///
+    /// Idempotent: if the instance is already in this Tenant's memory
+    /// map, do nothing. If the marker already exists in the root store
+    /// (another worker or the main thread already created it), open
+    /// the instance into this map WITHOUT re-writing the marker —
+    /// that avoids N-way root.db write contention when every worker
+    /// in a multi-worker process bootstraps the same tenant set.
     pub fn createInstance(self: *Tenant, id: []const u8) Error!void {
         try validateInstanceId(id);
-        // Fast path: already open (idempotent create on re-bootstrap).
-        if (self.instances.get(id) != null) {
-            try self.writeInstanceMarker(id);
-            return;
-        }
+        if (self.instances.get(id) != null) return;
+        const already_exists = try self.instanceExistsInRoot(id);
         _ = try self.ensureOpen(id);
-        try self.writeInstanceMarker(id);
+        if (!already_exists) try self.writeInstanceMarker(id);
     }
 
     /// Delete an instance. Closes its open `KvStore`, drops it from

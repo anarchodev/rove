@@ -435,11 +435,17 @@ pub fn installRequest(
     _ = c.JS_SetPropertyStr(ctx, req_obj, "body", c.JS_NewStringLen(ctx, request.body.ptr, request.body.len));
     _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);
 
-    // response = { status: 200, body: "", headers: {} }
+    // response = { status: 200, headers: {}, cookies: [] }
+    //
+    // Response body comes from the exported function's return value —
+    // not from `response.body`. The `response` global is ONLY for
+    // metadata: status, custom headers, and Set-Cookie entries.
+    // Handlers mutate these freely; the dispatcher reads them after
+    // the call and merges with the JSON-serialized return value.
     const resp_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, resp_obj, "status", c.JS_NewInt32(ctx, 200));
-    _ = c.JS_SetPropertyStr(ctx, resp_obj, "body", c.JS_NewStringLen(ctx, "", 0));
     _ = c.JS_SetPropertyStr(ctx, resp_obj, "headers", c.JS_NewObject(ctx));
+    _ = c.JS_SetPropertyStr(ctx, resp_obj, "cookies", c.JS_NewArray(ctx));
     _ = c.JS_SetPropertyStr(ctx, global, "response", resp_obj);
 }
 

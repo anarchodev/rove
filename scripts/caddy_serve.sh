@@ -67,6 +67,7 @@ ADMIN_ORIGIN="https://${ADMIN_HOST}:${TLS_PORT}"
 	--data-dir "$DATA_DIR" \
 	--bootstrap-root-token "$TOKEN" \
 	--admin-origin "$ADMIN_ORIGIN" \
+	--admin-api-domain "$API_HOST" \
 	--workers "$WORKERS" \
 	--fresh &
 WPID=$!
@@ -88,7 +89,8 @@ cat <<EOF
 │ rove admin demo (Caddy + js-worker)                             │
 │                                                                 │
 │ admin ui : https://${ADMIN_HOST}:${TLS_PORT}
-│ api      : https://${API_HOST}:${TLS_PORT}
+│ admin api: https://${API_HOST}:${TLS_PORT}  (root scope)
+│ tenant   : https://{id}.${API_HOST}:${TLS_PORT}  (e.g. acme)
 │ token    : ${TOKEN}
 │                                                                 │
 │ First browser visit (sets the API base in localStorage):        │

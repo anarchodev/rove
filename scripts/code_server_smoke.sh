@@ -44,14 +44,14 @@ expect() {
     echo "ok  $label: $actual"
 }
 
-SOURCE='response.body = "hi from smoke";'
+SOURCE='export function handler() { return "hi from smoke"; }'
 
 # Upload a source file.
 code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
-    -X POST -H "X-Rove-Path: index.js" \
+    -X POST -H "X-Rove-Path: index.mjs" \
     --data-binary "$SOURCE" \
     "http://127.0.0.1:$PORT/acme/upload")
-expect "upload /acme index.js" 204 "$code"
+expect "upload /acme index.mjs" 204 "$code"
 
 # Missing header → 400.
 code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \

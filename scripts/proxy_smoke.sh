@@ -60,9 +60,9 @@ expect() {
 code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     -X POST \
     -H "Host: acme.test" \
-    -H "X-Rove-Path: smoke/index.js" \
+    -H "X-Rove-Path: smoke/index.mjs" \
     -H "Authorization: Bearer $ROVE_TOKEN" \
-    --data-binary 'response.body = "smoke";' \
+    --data-binary 'export function handler() { return "smoke"; }' \
     "http://$HTTP_ADDR/_system/code/acme/upload")
 expect "proxy upload /acme" 204 "$code"
 
@@ -70,8 +70,8 @@ expect "proxy upload /acme" 204 "$code"
 code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     -X POST \
     -H "Host: acme.test" \
-    -H "X-Rove-Path: smoke/index.js" \
-    --data-binary 'response.body = "smoke";' \
+    -H "X-Rove-Path: smoke/index.mjs" \
+    --data-binary 'export function handler() { return "smoke"; }' \
     "http://$HTTP_ADDR/_system/code/acme/upload")
 expect "proxy upload /acme (no token)" 401 "$code"
 
@@ -79,9 +79,9 @@ expect "proxy upload /acme (no token)" 401 "$code"
 code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     -X POST \
     -H "Host: acme.test" \
-    -H "X-Rove-Path: smoke/index.js" \
+    -H "X-Rove-Path: smoke/index.mjs" \
     -H "Authorization: Bearer bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
-    --data-binary 'response.body = "smoke";' \
+    --data-binary 'export function handler() { return "smoke"; }' \
     "http://$HTTP_ADDR/_system/code/acme/upload")
 expect "proxy upload /acme (wrong token)" 401 "$code"
 
@@ -105,7 +105,7 @@ esac
 # Unrelated user traffic still works — the JS handler at acme's
 # `index.js` should serve GET / and return its hit counter.
 code=$(curl -s --http2-prior-knowledge -o /tmp/proxy-home.out -w '%{http_code}' \
-    -H "Host: acme.test" "http://$HTTP_ADDR/")
+    -H "Host: acme.test" "http://$HTTP_ADDR/?fn=handler")
 expect "GET / (unrelated JS handler)" 200 "$code"
 if ! grep -q "acme hit count" /tmp/proxy-home.out; then
     echo "FAIL: unexpected body for GET /" >&2
@@ -122,9 +122,9 @@ expect "GET /_system/foo/.. (unimplemented)" 501 "$code"
 # Drive a couple of real requests so the tenant's log.db has
 # something to return, then exercise the /_system/log/* proxy.
 curl -s --http2-prior-knowledge -o /dev/null \
-    -H "Host: acme.test" "http://$HTTP_ADDR/" >/dev/null
+    -H "Host: acme.test" "http://$HTTP_ADDR/?fn=handler" >/dev/null
 curl -s --http2-prior-knowledge -o /dev/null \
-    -H "Host: acme.test" "http://$HTTP_ADDR/" >/dev/null
+    -H "Host: acme.test" "http://$HTTP_ADDR/?fn=handler" >/dev/null
 # Give the log buffer a moment to flush.
 sleep 1.2
 

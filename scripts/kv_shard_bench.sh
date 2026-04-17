@@ -42,7 +42,7 @@ extract_rps() {
 echo ""
 echo "── (1) Single tenant: all load on hot.test ──"
 single_out=$(h2load -n "$((REQUESTS * TENANTS))" -c "$CLIENTS" -m "$STREAMS" \
-  --header="host: hot.test" "http://$HOST:$PORT/" 2>&1)
+  --header="host: hot.test" "http://$HOST:$PORT/?fn=handler" 2>&1)
 echo "$single_out" | grep -E "finished in|req/s"
 single_rps=$(echo "$single_out" | extract_rps)
 
@@ -55,7 +55,7 @@ start_ts=$(date +%s.%N)
 for i in $(seq 0 $((TENANTS - 1))); do
   h2load -n "$REQUESTS" -c "$CLIENTS" -m "$STREAMS" \
     --header="host: write${i}.test" \
-    "http://$HOST:$PORT/" > "$tmpdir/w${i}.log" 2>&1 &
+    "http://$HOST:$PORT/?fn=handler" > "$tmpdir/w${i}.log" 2>&1 &
 done
 wait
 end_ts=$(date +%s.%N)

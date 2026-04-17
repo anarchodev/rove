@@ -177,20 +177,32 @@ pub const Dispatcher = struct {
     /// caller's `TrackedTxn` opened, so reads see the txn's own
     /// uncommitted writes. `kv.set`/`kv.delete` from the handler go
     /// through `txn` (local durability + undo) AND `writeset` (raft
-    /// replication). Each call uses a fresh `Runtime`+`Context`.
-    /// Returns an owned `Response`; caller frees with `Response.deinit`.
+    /// replication).
     ///
-    /// The bytecode is produced at deploy time by `rove-code-cli`'s
-    /// compile hook (which calls `Context.compileToBytecode`). The
-    /// filename baked into the bytecode is what shows up in stack
-    /// traces — no filename parameter here because it's part of the
-    /// bytecode blob itself.
+    /// The handler contract is shift-js-flavored RPC:
+    ///   - `bytecode` MUST be an ES module with named function exports.
+    ///     Non-module bytecode is a hard error (500).
+    ///   - The caller picks an export by name (`?fn=X` on GET, or
+    ///     `{fn:"X",args:[...]}` in the POST body).
+    ///   - `args` is a JSON array spread into positional arguments.
+    ///     Missing → `[]`. Malformed JSON → 400.
+    ///   - The handler's **return value** becomes the response body
+    ///     (strings emit as-is; everything else is `JSON.stringify`'d).
+    ///   - Status / headers / cookies flow through the ambient
+    ///     `response` global (`response.status = 404`, etc.). Body is
+    ///     NOT settable via `response` — it always comes from return.
+    ///
+    /// `bytecodes` is the per-deployment map of path → bytecode bytes
+    /// used by the module loader to resolve `import` statements the
+    /// entry module pulls in. `null` is valid if the entry has no
+    /// imports.
     pub fn run(
         self: *Dispatcher,
         kv: *kv_mod.KvStore,
         txn: *kv_mod.TrackedTxn,
         writeset: *kv_mod.WriteSet,
         bytecode: []const u8,
+        bytecodes: ?*const std.StringHashMapUnmanaged([]u8),
         request: Request,
         budget: *Budget,
     ) DispatchError!Response {
@@ -215,16 +227,28 @@ pub const Dispatcher = struct {
         // Memcpy-restore the frozen post-init image of
         // runtime+context+static globals into our arena. Handler
         // allocations from the previous request get overwritten in one
-        // shot; no per-request teardown needed. `restore` also
-        // re-seeds `time_origin` + `random_state` from the wall clock.
+        // shot; no per-request teardown needed.
         const restored = self.snapshot.restore(self.arena) catch
             return DispatchError.RuntimeCreateFailed;
         var rt: qjs.Runtime = restored.runtime;
         var ctx: qjs.Context = restored.context;
 
         rt.setInterruptHandler(interruptHandler, budget);
-        // No `clearInterruptHandler` defer: the runtime lives inside
-        // the arena and gets discarded on the next restore.
+
+        // Install the module loader for this request. Reads bytecode
+        // for any `import` the handler performs from the deployment's
+        // per-path map. Reinstalled per request so each request sees
+        // its own tenant's bytecodes.
+        var loader_ctx = module_loader.Ctx{
+            .allocator = self.allocator,
+            .bytecodes = bytecodes,
+        };
+        c.JS_SetModuleLoaderFunc(
+            rt.raw,
+            module_loader.normalize,
+            module_loader.load,
+            &loader_ctx,
+        );
 
         globals.installRequest(ctx.raw, &state, request);
 
@@ -234,9 +258,6 @@ pub const Dispatcher = struct {
         errdefer self.allocator.free(body_buf);
         var status: i32 = 200;
 
-        // Deserialize the bytecode. The returned value is either a
-        // JS_TAG_FUNCTION_BYTECODE (script) or a JS_TAG_MODULE (module),
-        // depending on which compile flag produced it.
         const fun_obj = c.JS_ReadObject(
             ctx.raw,
             bytecode.ptr,
@@ -249,44 +270,33 @@ pub const Dispatcher = struct {
             exception_msg = ctx.takeExceptionMessage(self.allocator) catch
                 return DispatchError.OutOfMemory;
             fun_val.deinit();
-            // Script fallthrough: no eval happened, no body to extract.
             return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf);
         }
 
-        const is_module = fun_val.raw.tag == c.JS_TAG_MODULE;
-
-        if (is_module) {
-            runModule(
-                self,
-                &rt,
-                &ctx,
-                &state,
-                fun_val,
-                request,
-                budget,
-                &status,
-                &body_buf,
-                &exception_msg,
-            ) catch |err| switch (err) {
-                error.Interrupted => return DispatchError.Interrupted,
-                error.OutOfMemory => return DispatchError.OutOfMemory,
-                error.JsException => {}, // exception_msg already populated
-            };
-        } else {
-            runScript(
-                self,
-                &ctx,
-                fun_val,
-                budget,
-                &status,
-                &body_buf,
-                &exception_msg,
-            ) catch |err| switch (err) {
-                error.Interrupted => return DispatchError.Interrupted,
-                error.OutOfMemory => return DispatchError.OutOfMemory,
-                error.JsException => {}, // exception_msg already populated
-            };
+        if (fun_val.raw.tag != c.JS_TAG_MODULE) {
+            fun_val.deinit();
+            status = 500;
+            body_buf = self.allocator.dupe(u8, "handler bytecode is not an ES module (.mjs)") catch
+                return DispatchError.OutOfMemory;
+            return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf);
         }
+
+        runModule(
+            self,
+            &rt,
+            &ctx,
+            &state,
+            fun_val,
+            request,
+            budget,
+            &status,
+            &body_buf,
+            &exception_msg,
+        ) catch |err| switch (err) {
+            error.Interrupted => return DispatchError.Interrupted,
+            error.OutOfMemory => return DispatchError.OutOfMemory,
+            error.JsException => {}, // exception_msg already populated
+        };
 
         return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf);
     }
@@ -294,47 +304,12 @@ pub const Dispatcher = struct {
 
 const RunError = error{ Interrupted, OutOfMemory, JsException };
 
-/// Script path: eval the top-level function, then pull `status` and
-/// `body` off the `response` global the way M1 has always done.
-fn runScript(
-    d: *Dispatcher,
-    ctx: *qjs.Context,
-    fun_val_in: qjs.Value,
-    budget: *Budget,
-    status_out: *i32,
-    body_out: *[]u8,
-    exception_out: *[]u8,
-) RunError!void {
-    // JS_EvalFunction consumes fun_val's reference.
-    var fun_val = fun_val_in;
-    const eval_result = c.JS_EvalFunction(ctx.raw, fun_val.raw);
-    fun_val = undefined;
-    var eval_val: qjs.Value = .{ .raw = eval_result, .ctx = ctx.raw };
-    defer eval_val.deinit();
-
-    if (eval_val.isException()) {
-        exception_out.* = ctx.takeExceptionMessage(d.allocator) catch
-            return error.OutOfMemory;
-        const now: i64 = @intCast(std.time.nanoTimestamp());
-        if (now >= budget.deadline_ns) return error.Interrupted;
-        // Fall through: scripts may have written partial state onto the
-        // `response` global before throwing — extract anyway.
-    }
-
-    extractResponseFromGlobal(d.allocator, ctx.raw, status_out, body_out) catch
-        return error.OutOfMemory;
-}
-
-/// Module path: eval the module (returns a promise for top-level
-/// eval), pump jobs, inspect the promise state, extract the namespace,
-/// look up the `?fn=<name>` export, call it with the request object,
-/// pump jobs again (async handlers), and extract the response from
-/// the return value.
-///
-/// Response convention: the exported function returns either an
-/// object with `{ status, body }` or a plain string (treated as body
-/// with status 200). No `response` global is touched — modules are
-/// clean, no ambient mutable state.
+/// Evaluate the module top-level, drain jobs, look up `exports[fn]`
+/// (fn picked via `?fn=X` on GET or `{fn,args}` JSON body on POST),
+/// and call it with positional `args` spread in. The return value
+/// becomes the response body; status/headers/cookies come from the
+/// ambient `response` global. See `Dispatcher.run` for the full
+/// contract.
 fn runModule(
     d: *Dispatcher,
     rt: *qjs.Runtime,
@@ -348,12 +323,8 @@ fn runModule(
     exception_out: *[]u8,
 ) RunError!void {
     _ = state;
-    // Extract JSModuleDef pointer BEFORE JS_EvalFunction consumes
-    // the value. `.u.ptr` works on the struct representation rove-qjs
-    // uses; shift-js does the same via JS_VALUE_GET_PTR.
     const mod_def_ptr: ?*c.JSModuleDef = @ptrCast(@alignCast(fun_val_in.raw.u.ptr));
 
-    // JS_EvalFunction consumes the module value's reference.
     var fun_val = fun_val_in;
     const eval_result = c.JS_EvalFunction(ctx.raw, fun_val.raw);
     fun_val = undefined;
@@ -367,13 +338,9 @@ fn runModule(
         return error.JsException;
     }
 
-    // Drain the microtask queue so the module's top-level evaluation
-    // (and any imports, once we support them) settles.
     rt.pumpJobs();
     if (budgetExpired(budget)) return error.Interrupted;
 
-    // The eval result is a promise for the module's evaluation. If it
-    // rejected, surface the rejection reason.
     if (c.JS_PromiseState(ctx.raw, eval_val.raw) == c.JS_PROMISE_REJECTED) {
         const reason = c.JS_PromiseResult(ctx.raw, eval_val.raw);
         defer c.JS_FreeValue(ctx.raw, reason);
@@ -382,7 +349,6 @@ fn runModule(
         return error.JsException;
     }
 
-    // Grab the namespace — the object holding all the module's exports.
     const ns = c.JS_GetModuleNamespace(ctx.raw, mod_def_ptr);
     defer c.JS_FreeValue(ctx.raw, ns);
     if (c.JS_IsException(ns)) {
@@ -391,10 +357,19 @@ fn runModule(
         return error.JsException;
     }
 
-    // Resolve the function name from `?fn=<name>` in the request query.
-    // Absent or empty → try `default` export.
-    const fn_name = fnNameFromQuery(request.query) orelse "default";
-    const fn_name_z = std.fmt.allocPrintSentinel(d.allocator, "{s}", .{fn_name}, 0) catch
+    // ── Resolve fn name + args JSON from the request. ─────────────
+    var dispatch = parseDispatch(d.allocator, request) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadRequest => {
+            status_out.* = 400;
+            body_out.* = std.fmt.allocPrint(d.allocator,
+                "missing or malformed `fn` / `args`\n", .{}) catch return error.OutOfMemory;
+            return;
+        },
+    };
+    defer dispatch.deinit(d.allocator);
+
+    const fn_name_z = std.fmt.allocPrintSentinel(d.allocator, "{s}", .{dispatch.fn_name}, 0) catch
         return error.OutOfMemory;
     defer d.allocator.free(fn_name_z);
 
@@ -405,21 +380,60 @@ fn runModule(
         body_out.* = std.fmt.allocPrint(
             d.allocator,
             "module export \"{s}\" not found or not a function\n",
-            .{fn_name},
+            .{dispatch.fn_name},
         ) catch return error.OutOfMemory;
         return;
     }
 
-    // Build the `request` arg object. We already installed `request`
-    // as a global via `globals.install`, so reuse that by reading it
-    // back — single source of truth for request shape.
-    const global = c.JS_GetGlobalObject(ctx.raw);
-    defer c.JS_FreeValue(ctx.raw, global);
-    const request_obj = c.JS_GetPropertyStr(ctx.raw, global, "request");
-    defer c.JS_FreeValue(ctx.raw, request_obj);
+    // Parse the args array as a single JSON value, then pull each
+    // element by index. Cheaper than re-parsing per element, and
+    // lets qjs handle all the nested-value construction in one pass.
+    //
+    // `JS_ParseJSON` (like `JS_Eval`) reads one byte past the
+    // declared length for UTF-8 validation, so the source MUST be
+    // NUL-terminated. Copy into an allocSentinel buffer.
+    const args_text = dispatch.args_json_text;
+    const args_text_z = d.allocator.allocSentinel(u8, args_text.len, 0) catch
+        return error.OutOfMemory;
+    defer d.allocator.free(args_text_z);
+    @memcpy(args_text_z, args_text);
+    const args_arr = c.JS_ParseJSON(
+        ctx.raw,
+        args_text_z.ptr,
+        args_text.len,
+        "<args>",
+    );
+    defer c.JS_FreeValue(ctx.raw, args_arr);
+    if (c.JS_IsException(args_arr)) {
+        status_out.* = 400;
+        body_out.* = std.fmt.allocPrint(d.allocator, "args JSON parse failed\n", .{}) catch
+            return error.OutOfMemory;
+        _ = ctx.takeException();
+        return;
+    }
+    const args_len_val = c.JS_GetPropertyStr(ctx.raw, args_arr, "length");
+    defer c.JS_FreeValue(ctx.raw, args_len_val);
+    var args_len: u32 = 0;
+    _ = c.JS_ToUint32(ctx.raw, &args_len, args_len_val);
 
-    var args = [_]c.JSValue{request_obj};
-    const ret = c.JS_Call(ctx.raw, handler, globals.js_undefined, 1, &args);
+    const args_js = d.allocator.alloc(c.JSValue, args_len) catch
+        return error.OutOfMemory;
+    defer {
+        for (args_js) |v| c.JS_FreeValue(ctx.raw, v);
+        d.allocator.free(args_js);
+    }
+    var idx: u32 = 0;
+    while (idx < args_len) : (idx += 1) {
+        args_js[idx] = c.JS_GetPropertyUint32(ctx.raw, args_arr, idx);
+    }
+
+    const ret = c.JS_Call(
+        ctx.raw,
+        handler,
+        globals.js_undefined,
+        @intCast(args_js.len),
+        if (args_js.len == 0) null else args_js.ptr,
+    );
     var ret_val: qjs.Value = .{ .raw = ret, .ctx = ctx.raw };
     defer ret_val.deinit();
 
@@ -430,8 +444,6 @@ fn runModule(
         return error.JsException;
     }
 
-    // Async handler support: if the return value is a promise, pump
-    // and unwrap once.
     rt.pumpJobs();
     if (budgetExpired(budget)) return error.Interrupted;
 
@@ -445,28 +457,225 @@ fn runModule(
     var final_val: qjs.Value = .{ .raw = final.val, .ctx = ctx.raw };
     defer if (final.owns) final_val.deinit();
 
-    extractResponseFromReturn(d.allocator, ctx.raw, final_val.raw, status_out, body_out) catch
+    // Body from return value. Status (and later: headers/cookies)
+    // from the ambient `response` global.
+    bodyFromReturn(d.allocator, ctx.raw, final_val.raw, body_out) catch
         return error.OutOfMemory;
+    extractResponseMetadata(ctx.raw, status_out);
+}
+
+/// Parsed `(fn, args)` from a request. `args_json_text` is a raw
+/// JSON array literal (e.g. `[]`, `["foo", 42]`); the caller does
+/// one `JS_ParseJSON` on it and spreads the elements into the
+/// handler call.
+const DispatchCall = struct {
+    fn_name: []u8,
+    args_json_text: []u8,
+
+    fn deinit(self: *DispatchCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.fn_name);
+        allocator.free(self.args_json_text);
+        self.* = undefined;
+    }
+};
+
+fn parseDispatch(
+    allocator: std.mem.Allocator,
+    request: Request,
+) (error{ OutOfMemory, BadRequest })!DispatchCall {
+    const has_body = request.body.len > 0 and looksLikeJson(request.body);
+
+    if (has_body) {
+        // POST body: `{fn: "...", args: [...]}`. Lightweight parse to
+        // pull `fn` string and `args` slice, then re-serialize `args`
+        // into compact JSON for the qjs side.
+        const parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            request.body,
+            .{},
+        ) catch return error.BadRequest;
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return error.BadRequest;
+        const obj = parsed.value.object;
+
+        const fn_val = obj.get("fn") orelse return error.BadRequest;
+        if (fn_val != .string) return error.BadRequest;
+        const fn_owned = try allocator.dupe(u8, fn_val.string);
+        errdefer allocator.free(fn_owned);
+
+        const args_text = if (obj.get("args")) |v| blk: {
+            if (v != .array) return error.BadRequest;
+            break :blk try jsonArrayToOwnedText(allocator, v.array.items);
+        } else try allocator.dupe(u8, "[]");
+
+        return .{ .fn_name = fn_owned, .args_json_text = args_text };
+    }
+
+    // Query-string path: ?fn=name[&args=<urlencoded-json-array>].
+    const query = request.query orelse "";
+    const fn_src = queryParam(query, "fn") orelse return error.BadRequest;
+    if (fn_src.len == 0) return error.BadRequest;
+    const fn_owned = try decodePercent(allocator, fn_src);
+    errdefer allocator.free(fn_owned);
+
+    const args_src_opt = queryParam(query, "args");
+    if (args_src_opt == null or args_src_opt.?.len == 0) {
+        return .{
+            .fn_name = fn_owned,
+            .args_json_text = try allocator.dupe(u8, "[]"),
+        };
+    }
+
+    const args_text = try decodePercent(allocator, args_src_opt.?);
+    return .{ .fn_name = fn_owned, .args_json_text = args_text };
+}
+
+fn looksLikeJson(body: []const u8) bool {
+    var i: usize = 0;
+    while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r')) i += 1;
+    return i < body.len and (body[i] == '{' or body[i] == '[');
+}
+
+/// Re-serialize a parsed `std.json.Value` array (POST body's `args`
+/// field) back into compact JSON text. The returned buffer is a full
+/// JSON array literal like `[1,"two",{"k":"v"}]` ready for one
+/// `JS_ParseJSON` on the qjs side.
+fn jsonArrayToOwnedText(
+    allocator: std.mem.Allocator,
+    items: []const std.json.Value,
+) error{OutOfMemory}![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+    for (items, 0..) |item, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try stringifyJson(allocator, &buf, item);
+    }
+    try buf.append(allocator, ']');
+    return buf.toOwnedSlice(allocator);
+}
+
+fn stringifyJson(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    v: std.json.Value,
+) error{OutOfMemory}!void {
+    switch (v) {
+        .null => try buf.appendSlice(allocator, "null"),
+        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
+        .integer => |i| {
+            var tmp: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{i}) catch unreachable;
+            try buf.appendSlice(allocator, s);
+        },
+        .float => |f| {
+            var tmp: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
+            try buf.appendSlice(allocator, s);
+        },
+        .number_string => |s| try buf.appendSlice(allocator, s),
+        .string => |s| try writeJsonEscaped(allocator, buf, s),
+        .array => |arr| {
+            try buf.append(allocator, '[');
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try buf.append(allocator, ',');
+                try stringifyJson(allocator, buf, item);
+            }
+            try buf.append(allocator, ']');
+        },
+        .object => |obj| {
+            try buf.append(allocator, '{');
+            var it = obj.iterator();
+            var first = true;
+            while (it.next()) |kv| {
+                if (!first) try buf.append(allocator, ',');
+                first = false;
+                try writeJsonEscaped(allocator, buf, kv.key_ptr.*);
+                try buf.append(allocator, ':');
+                try stringifyJson(allocator, buf, kv.value_ptr.*);
+            }
+            try buf.append(allocator, '}');
+        },
+    }
+}
+
+fn writeJsonEscaped(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    s: []const u8,
+) error{OutOfMemory}!void {
+    try buf.append(allocator, '"');
+    for (s) |b| switch (b) {
+        '"' => try buf.appendSlice(allocator, "\\\""),
+        '\\' => try buf.appendSlice(allocator, "\\\\"),
+        '\n' => try buf.appendSlice(allocator, "\\n"),
+        '\r' => try buf.appendSlice(allocator, "\\r"),
+        '\t' => try buf.appendSlice(allocator, "\\t"),
+        0x08 => try buf.appendSlice(allocator, "\\b"),
+        0x0C => try buf.appendSlice(allocator, "\\f"),
+        0x00...0x07, 0x0B, 0x0E...0x1F => {
+            var tmp: [6]u8 = undefined;
+            const hex = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{b}) catch unreachable;
+            try buf.appendSlice(allocator, hex);
+        },
+        else => try buf.append(allocator, b),
+    };
+    try buf.append(allocator, '"');
+}
+
+fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
+            if (std.mem.eql(u8, pair, name)) return "";
+            continue;
+        };
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+fn decodePercent(allocator: std.mem.Allocator, encoded: []const u8) error{OutOfMemory}![]u8 {
+    var buf = try allocator.alloc(u8, encoded.len);
+    errdefer allocator.free(buf);
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < encoded.len) {
+        const b = encoded[i];
+        if (b == '+') {
+            buf[w] = ' ';
+            w += 1;
+            i += 1;
+        } else if (b == '%' and i + 2 < encoded.len) {
+            const hi = std.fmt.charToDigit(encoded[i + 1], 16) catch {
+                buf[w] = b;
+                w += 1;
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(encoded[i + 2], 16) catch {
+                buf[w] = b;
+                w += 1;
+                i += 1;
+                continue;
+            };
+            buf[w] = (hi << 4) | lo;
+            w += 1;
+            i += 3;
+        } else {
+            buf[w] = b;
+            w += 1;
+            i += 1;
+        }
+    }
+    return allocator.realloc(buf, w) catch buf[0..w];
 }
 
 fn budgetExpired(budget: *Budget) bool {
     const now: i64 = @intCast(std.time.nanoTimestamp());
     return now >= budget.deadline_ns;
-}
-
-fn fnNameFromQuery(query: ?[]const u8) ?[]const u8 {
-    const q = query orelse return null;
-    // Look for `fn=...` as a top-level query param. Cheap hand-parse
-    // that avoids bringing in a full URL parser for the MVP.
-    var it = std.mem.splitScalar(u8, q, '&');
-    while (it.next()) |pair| {
-        if (std.mem.startsWith(u8, pair, "fn=")) {
-            const v = pair[3..];
-            if (v.len == 0) return null;
-            return v;
-        }
-    }
-    return null;
 }
 
 const Unwrapped = struct {
@@ -491,12 +700,32 @@ fn unwrapPromise(ctx: *c.JSContext, v: c.JSValue) Unwrapped {
     return .{ .val = v, .rejected = false, .owns = false };
 }
 
-fn extractResponseFromGlobal(
+/// Convert the handler's return value to bytes:
+///   - string       → raw string (no JSON quoting)
+///   - undefined/null → empty body
+///   - anything else → `JSON.stringify(ret)`
+fn bodyFromReturn(
     allocator: std.mem.Allocator,
     ctx: *c.JSContext,
-    status_out: *i32,
+    ret: c.JSValue,
     body_out: *[]u8,
 ) error{OutOfMemory}!void {
+    if (c.JS_IsUndefined(ret) or c.JS_IsNull(ret)) return;
+    if (c.JS_IsString(ret)) {
+        body_out.* = jsValueToOwned(allocator, ctx, ret) catch return error.OutOfMemory;
+        return;
+    }
+    // JSON.stringify via the C API.
+    const json = c.JS_JSONStringify(ctx, ret, globals.js_undefined, globals.js_undefined);
+    defer c.JS_FreeValue(ctx, json);
+    if (c.JS_IsException(json) or c.JS_IsUndefined(json)) return;
+    body_out.* = jsValueToOwned(allocator, ctx, json) catch return error.OutOfMemory;
+}
+
+/// Pull status (and in the future headers / cookies) off the ambient
+/// `response` global that the handler was free to mutate. Body is NOT
+/// read from here — it always comes from the return value.
+fn extractResponseMetadata(ctx: *c.JSContext, status_out: *i32) void {
     const global_obj = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global_obj);
     const resp_val = c.JS_GetPropertyStr(ctx, global_obj, "response");
@@ -505,42 +734,119 @@ fn extractResponseFromGlobal(
 
     const status_val = c.JS_GetPropertyStr(ctx, resp_val, "status");
     defer c.JS_FreeValue(ctx, status_val);
-    _ = c.JS_ToInt32(ctx, status_out, status_val);
-
-    const body_val = c.JS_GetPropertyStr(ctx, resp_val, "body");
-    defer c.JS_FreeValue(ctx, body_val);
-    body_out.* = jsValueToOwned(allocator, ctx, body_val) catch return error.OutOfMemory;
+    if (!c.JS_IsUndefined(status_val) and !c.JS_IsNull(status_val)) {
+        _ = c.JS_ToInt32(ctx, status_out, status_val);
+    }
 }
 
-fn extractResponseFromReturn(
-    allocator: std.mem.Allocator,
-    ctx: *c.JSContext,
-    ret: c.JSValue,
-    status_out: *i32,
-    body_out: *[]u8,
-) error{OutOfMemory}!void {
-    // Convention: string return → body (status 200). Object return →
-    // `{status, body}` plucked off. Anything else → stringify and use
-    // that as the body.
-    if (c.JS_IsString(ret)) {
-        body_out.* = jsValueToOwned(allocator, ctx, ret) catch return error.OutOfMemory;
-        return;
+// ── Module loader ──────────────────────────────────────────────────────
+
+/// Shared module loader infrastructure. Mounted onto the per-request
+/// runtime via `JS_SetModuleLoaderFunc` so `import { x } from "./y.mjs"`
+/// in handlers resolves against the deployment's bytecode map.
+pub const module_loader = struct {
+    pub const Ctx = struct {
+        allocator: std.mem.Allocator,
+        /// Path → compiled module bytecode. Null means the caller
+        /// opted out of imports (tests, trivial single-file handlers).
+        bytecodes: ?*const std.StringHashMapUnmanaged([]u8),
+    };
+
+    /// Normalize `specifier` (relative or bare) against the importing
+    /// module's `base_name` into a canonical path key. Returns a
+    /// js_malloc'd buffer — quickjs owns it after this call.
+    pub fn normalize(
+        ctx: ?*c.JSContext,
+        base: [*c]const u8,
+        name: [*c]const u8,
+        _: ?*anyopaque,
+    ) callconv(.c) [*c]u8 {
+        const base_s = if (base != null) std.mem.span(base) else "";
+        const name_s = if (name != null) std.mem.span(name) else "";
+        const resolved = resolveSpecifier(base_s, name_s, static_buf[0..]);
+
+        // Copy into a qjs-allocated buffer so quickjs can free it.
+        const out = c.js_malloc(ctx, resolved.len + 1) orelse return null;
+        @memcpy(@as([*]u8, @ptrCast(out))[0..resolved.len], resolved);
+        @as([*]u8, @ptrCast(out))[resolved.len] = 0;
+        return @ptrCast(out);
     }
-    if (c.JS_IsObject(ret) and !c.JS_IsNull(ret) and !c.JS_IsUndefined(ret)) {
-        const status_val = c.JS_GetPropertyStr(ctx, ret, "status");
-        defer c.JS_FreeValue(ctx, status_val);
-        if (!c.JS_IsUndefined(status_val)) {
-            _ = c.JS_ToInt32(ctx, status_out, status_val);
+
+    pub fn load(
+        ctx: ?*c.JSContext,
+        name: [*c]const u8,
+        opaque_ptr: ?*anyopaque,
+    ) callconv(.c) ?*c.JSModuleDef {
+        const self: *const Ctx = @ptrCast(@alignCast(opaque_ptr.?));
+        const map = self.bytecodes orelse return null;
+        const name_s = std.mem.span(name);
+        const bytes = map.get(name_s) orelse return null;
+        const obj = c.JS_ReadObject(ctx, bytes.ptr, bytes.len, c.JS_READ_OBJ_BYTECODE);
+        if (c.JS_IsException(obj)) return null;
+        if (obj.tag != c.JS_TAG_MODULE) {
+            c.JS_FreeValue(ctx, obj);
+            return null;
         }
-        const body_val = c.JS_GetPropertyStr(ctx, ret, "body");
-        defer c.JS_FreeValue(ctx, body_val);
-        if (!c.JS_IsUndefined(body_val) and !c.JS_IsNull(body_val)) {
-            body_out.* = jsValueToOwned(allocator, ctx, body_val) catch
-                return error.OutOfMemory;
-        }
-        return;
+        const mod_def: ?*c.JSModuleDef = @ptrCast(@alignCast(obj.u.ptr));
+        // `JS_ReadObject` returned a borrowed+held module value; qjs
+        // expects the loader to return the module def (which keeps
+        // its own reference). Drop the JSValue handle.
+        c.JS_FreeValue(ctx, obj);
+        return mod_def;
     }
-    // Null/undefined return: leave body empty.
+
+    /// Stack buffer for a normalized path. 512 bytes is generous — path
+    /// lengths are bounded by `MAX_PATH_LEN` in rove-code.
+    threadlocal var static_buf: [512]u8 = undefined;
+};
+
+/// Resolve `specifier` ("./helper.mjs", "../lib/util", or a bare path)
+/// against `base` ("_api/kv/index.mjs") into a canonical deployment
+/// path key. Writes into `scratch` and returns a subslice pointing
+/// into it.
+fn resolveSpecifier(base: []const u8, specifier: []const u8, scratch: []u8) []const u8 {
+    // Bare / absolute specifiers pass through unchanged.
+    if (!std.mem.startsWith(u8, specifier, "./") and !std.mem.startsWith(u8, specifier, "../")) {
+        const n = @min(specifier.len, scratch.len);
+        @memcpy(scratch[0..n], specifier[0..n]);
+        return scratch[0..n];
+    }
+
+    // Determine the importing module's directory (everything before
+    // the final '/'). Empty if the importer is at the root.
+    var dir_len: usize = 0;
+    if (std.mem.lastIndexOfScalar(u8, base, '/')) |slash| dir_len = slash;
+
+    // Walk `specifier` applying "./" (skip) and "../" (pop one dir).
+    var dir_end = dir_len;
+    var rest = specifier;
+    while (true) {
+        if (std.mem.startsWith(u8, rest, "./")) {
+            rest = rest[2..];
+        } else if (std.mem.startsWith(u8, rest, "../")) {
+            if (std.mem.lastIndexOfScalar(u8, base[0..dir_end], '/')) |prev_slash| {
+                dir_end = prev_slash;
+            } else {
+                dir_end = 0;
+            }
+            rest = rest[3..];
+        } else break;
+    }
+
+    var w: usize = 0;
+    if (dir_end > 0) {
+        const n = @min(dir_end, scratch.len);
+        @memcpy(scratch[0..n], base[0..n]);
+        w = n;
+        if (w < scratch.len) {
+            scratch[w] = '/';
+            w += 1;
+        }
+    }
+    const tail = @min(rest.len, scratch.len - w);
+    @memcpy(scratch[w .. w + tail], rest[0..tail]);
+    w += tail;
+    return scratch[0..w];
 }
 
 fn finishResponse(
@@ -612,7 +918,7 @@ test "dispatch: simple response write-back" {
         &d,
         kv,
         \\response.status = 201;
-        \\response.body = "hi " + request.path;
+        \\return "hi " + request.path;
     ,
         .{ .method = "GET", .path = "/hello" },
     );
@@ -636,7 +942,7 @@ test "dispatch: kv.get on missing key returns null" {
         &d,
         kv,
         \\const v = kv.get("nope");
-        \\response.body = String(v);
+        \\return String(v);
     ,
         .{ .method = "GET", .path = "/" },
     );
@@ -645,23 +951,24 @@ test "dispatch: kv.get on missing key returns null" {
     try testing.expectEqualStrings("null", resp.body);
 }
 
-/// Test harness that mirrors the worker's per-request flow: compile
-/// the source to bytecode once, open a tracked txn, run the dispatcher
-/// on the bytecode, commit (or rollback on handler error). Returns
-/// the Response; caller owns and deinits.
+/// Test harness: wrap a statement-level snippet in a named export
+/// named `go`, compile as .mjs, dispatch with `?fn=go`. Matches the
+/// production contract — named-export modules only, positional args.
 fn runOne(
     d: *Dispatcher,
     kv: *kv_mod.KvStore,
-    source: []const u8,
-    request: Request,
+    body: []const u8,
+    request_in: Request,
 ) !Response {
-    // Compile on a throwaway runtime. In production the bytecode comes
-    // from rove-code's compile-on-upload; tests compile inline.
+    const wrapped = try std.fmt.allocPrint(testing.allocator,
+        "export function go() {{ {s} }}\n", .{body});
+    defer testing.allocator.free(wrapped);
+
     var rt = try qjs.Runtime.init();
     defer rt.deinit();
     var ctx = try rt.newContext();
     defer ctx.deinit();
-    const bytecode = try ctx.compileToBytecode(source, "h.js", testing.allocator, .{});
+    const bytecode = try ctx.compileToBytecode(wrapped, "h.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(bytecode);
 
     var txn = try kv.beginTrackedImmediate();
@@ -669,8 +976,13 @@ fn runOne(
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
 
+    // If the caller didn't set a query, force `fn=go` so the
+    // dispatcher finds our wrapper export.
+    var request = request_in;
+    if (request.query == null) request.query = "fn=go";
+
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    const resp = try d.run(kv, &txn, &ws, bytecode, request, &budget);
+    const resp = try d.run(kv, &txn, &ws, bytecode, null, request, &budget);
     try txn.commit();
     return resp;
 }
@@ -689,7 +1001,7 @@ test "dispatch: kv.set + kv.get round trip" {
         &d,
         kv,
         \\kv.set("name", "rove");
-        \\response.body = "ok";
+        \\return "ok";
     ,
         .{ .method = "POST", .path = "/" },
     );
@@ -700,7 +1012,7 @@ test "dispatch: kv.set + kv.get round trip" {
     var r2 = try runOne(
         &d,
         kv,
-        \\response.body = kv.get("name");
+        \\return kv.get("name");
     ,
         .{ .method = "GET", .path = "/" },
     );
@@ -725,7 +1037,7 @@ test "dispatch: kv.delete removes key" {
         &d,
         kv,
         \\kv.delete("k");
-        \\response.body = "ok";
+        \\return "ok";
     ,
         .{ .method = "DELETE", .path = "/" },
     );
@@ -752,7 +1064,7 @@ test "dispatch: read-your-writes within one handler works via TrackedTxn" {
         &d,
         kv,
         \\kv.set("x", "fresh");
-        \\response.body = kv.get("x");
+        \\return kv.get("x");
     ,
         .{ .method = "POST", .path = "/" },
     );
@@ -775,7 +1087,7 @@ test "dispatch: console.log captured into response.console" {
         kv,
         \\console.log("hello", "world");
         \\console.log("line2");
-        \\response.body = "x";
+        \\return "x";
     ,
         .{ .method = "GET", .path = "/" },
     );
@@ -811,6 +1123,7 @@ test "dispatch: malformed bytecode surfaces in exception field" {
         &txn,
         &ws,
         &garbage,
+        null,
         .{ .method = "GET", .path = "/" },
         &budget,
     );
@@ -831,14 +1144,12 @@ test "dispatch: runtime throw leaves exception + partial response" {
     var resp = try runOne(
         &d,
         kv,
-        \\response.body = "before throw";
         \\throw new Error("boom");
     ,
         .{ .method = "GET", .path = "/" },
     );
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqualStrings("before throw", resp.body);
     try testing.expect(std.mem.indexOf(u8, resp.exception, "boom") != null);
 }
 
@@ -863,7 +1174,7 @@ test "dispatch: per-store isolation by passing different kv per run" {
         &d,
         kv_a,
         \\kv.set("name", "alice");
-        \\response.body = "ok";
+        \\return "ok";
     ,
         .{ .method = "POST", .path = "/" },
     );
@@ -873,7 +1184,7 @@ test "dispatch: per-store isolation by passing different kv per run" {
     var r2 = try runOne(
         &d,
         kv_b,
-        \\response.body = String(kv.get("name"));
+        \\return String(kv.get("name"));
     ,
         .{ .method = "GET", .path = "/" },
     );
@@ -883,7 +1194,7 @@ test "dispatch: per-store isolation by passing different kv per run" {
     var r3 = try runOne(
         &d,
         kv_a,
-        \\response.body = kv.get("name");
+        \\return kv.get("name");
     ,
         .{ .method = "GET", .path = "/" },
     );
@@ -910,15 +1221,17 @@ test "dispatch: kv tape captures get/set/delete with outcomes" {
     var ctx = try rt.newContext();
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
-        \\const v = kv.get("seeded");
-        \\const missing = kv.get("missing");
-        \\kv.set("new", v + "!");
-        \\kv.delete("seeded");
-        \\response.body = String(missing);
+        \\export function go() {
+        \\    const v = kv.get("seeded");
+        \\    const missing = kv.get("missing");
+        \\    kv.set("new", v + "!");
+        \\    kv.delete("seeded");
+        \\    return String(missing);
+        \\}
     ,
-        "h.js",
+        "h.mjs",
         testing.allocator,
-        .{},
+        .{ .kind = .module },
     );
     defer testing.allocator.free(bytecode);
 
@@ -929,9 +1242,10 @@ test "dispatch: kv tape captures get/set/delete with outcomes" {
     defer ws.deinit();
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
         .method = "POST",
         .path = "/",
+        .query = "fn=go",
         .kv_tape = &tape,
     }, &budget);
     defer resp.deinit(testing.allocator);
@@ -981,17 +1295,19 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
     var ctx = try rt.newContext();
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
-        \\const t = Date.now();
-        \\const r1 = Math.random();
-        \\const r2 = Math.random();
-        \\const buf = new Uint8Array(4);
-        \\crypto.getRandomValues(buf);
-        \\const id = crypto.randomUUID();
-        \\response.body = String(t) + "|" + r1 + "|" + r2 + "|" + id;
+        \\export function go() {
+        \\    const t = Date.now();
+        \\    const r1 = Math.random();
+        \\    const r2 = Math.random();
+        \\    const buf = new Uint8Array(4);
+        \\    crypto.getRandomValues(buf);
+        \\    const id = crypto.randomUUID();
+        \\    return String(t) + "|" + r1 + "|" + r2 + "|" + id;
+        \\}
     ,
-        "h.js",
+        "h.mjs",
         testing.allocator,
-        .{},
+        .{ .kind = .module },
     );
     defer testing.allocator.free(bytecode);
 
@@ -1003,9 +1319,10 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
         defer ws.deinit();
 
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
             .method = "GET",
             .path = "/",
+            .query = "fn=go",
             .date_tape = &date_tape,
             .math_random_tape = &math_tape,
             .crypto_random_tape = &crypto_tape,
@@ -1035,9 +1352,10 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
         var ws2 = kv_mod.WriteSet.init(testing.allocator);
         defer ws2.deinit();
         var budget2 = Budget.fromNow(Budget.default_duration_ns);
-        var resp2 = try d.run(kv, &txn2, &ws2, bytecode, .{
+        var resp2 = try d.run(kv, &txn2, &ws2, bytecode, null, .{
             .method = "GET",
             .path = "/",
+            .query = "fn=go",
             .math_random_tape = &math_tape2,
             .crypto_random_tape = &crypto_tape2,
             .prng_seed = 42,
@@ -1079,10 +1397,10 @@ test "dispatch: tight loop hits budget and returns Interrupted" {
     var ctx = try rt.newContext();
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
-        "while (true) {}",
-        "h.js",
+        "export function go() { while (true) {} }",
+        "h.mjs",
         testing.allocator,
-        .{},
+        .{ .kind = .module },
     );
     defer testing.allocator.free(bytecode);
 
@@ -1101,7 +1419,8 @@ test "dispatch: tight loop hits budget and returns Interrupted" {
         &txn,
         &ws,
         bytecode,
-        .{ .method = "GET", .path = "/" },
+        null,
+        .{ .method = "GET", .path = "/", .query = "fn=go" },
         &budget,
     );
     const elapsed_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) - started;
@@ -1125,7 +1444,7 @@ test "dispatch: short handler does not trip budget" {
     var resp = try runOne(
         &d,
         kv,
-        \\response.body = "fast";
+        \\return "fast";
     ,
         .{ .method = "GET", .path = "/" },
     );
@@ -1147,11 +1466,12 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
     var ctx = try rt.newContext();
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
-        \\export function greet(req) {
-        \\    return { status: 200, body: "hi " + req.path };
+        \\export function greet(path) {
+        \\    return "hi " + path;
         \\}
-        \\export function shout(req) {
-        \\    return { status: 201, body: ("HI " + req.path).toUpperCase() };
+        \\export function shout(path) {
+        \\    response.status = 201;
+        \\    return ("HI " + path).toUpperCase();
         \\}
     ,
         "h.mjs",
@@ -1162,34 +1482,34 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
 
     var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
-    // ?fn=greet → "hi /hello"
+    // ?fn=greet with args=["/hello"] → "hi /hello", status 200.
     {
         var txn = try kv.beginTrackedImmediate();
         defer txn.rollback() catch {};
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
             .method = "GET",
             .path = "/hello",
-            .query = "fn=greet",
+            .query = "fn=greet&args=%5B%22%2Fhello%22%5D",
         }, &budget);
         defer resp.deinit(testing.allocator);
         try testing.expectEqual(@as(i32, 200), resp.status);
         try testing.expectEqualStrings("hi /hello", resp.body);
     }
 
-    // ?fn=shout → "HI /HELLO", status 201
+    // ?fn=shout → "HI /HELLO", status 201 via response global.
     {
         var txn = try kv.beginTrackedImmediate();
         defer txn.rollback() catch {};
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
             .method = "GET",
             .path = "/hello",
-            .query = "fn=shout",
+            .query = "fn=shout&args=%5B%22%2Fhello%22%5D",
         }, &budget);
         defer resp.deinit(testing.allocator);
         try testing.expectEqual(@as(i32, 201), resp.status);
@@ -1203,7 +1523,7 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
             .method = "GET",
             .path = "/hello",
             .query = "fn=nope",
@@ -1227,9 +1547,10 @@ test "dispatch: async module handler gets unwrapped" {
     var ctx = try rt.newContext();
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
-        \\export async function fetchLike(req) {
-        \\    const v = await Promise.resolve("async " + req.path);
-        \\    return { status: 202, body: v };
+        \\export async function fetchLike(path) {
+        \\    const v = await Promise.resolve("async " + path);
+        \\    response.status = 202;
+        \\    return v;
         \\}
     ,
         "h.mjs",
@@ -1244,10 +1565,10 @@ test "dispatch: async module handler gets unwrapped" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
         .method = "GET",
         .path = "/x",
-        .query = "fn=fetchLike",
+        .query = "fn=fetchLike&args=%5B%22%2Fx%22%5D",
     }, &budget);
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(i32, 202), resp.status);
@@ -1266,7 +1587,7 @@ test "dispatch: request object fields populated" {
     var resp = try runOne(
         &d,
         kv,
-        \\response.body = request.method + " " + request.path + " " + request.body;
+        \\return request.method + " " + request.path + " " + request.body;
     ,
         .{ .method = "PUT", .path = "/x", .body = "payload" },
     );

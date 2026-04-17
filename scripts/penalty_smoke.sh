@@ -54,7 +54,7 @@ curl_status() {
          -s -o /dev/null \
          -w '%{http_code}' \
          -H "Host: $HOST_HEADER" \
-         "http://$HTTP_ADDR/"
+         "http://$HTTP_ADDR/?fn=handler"
 }
 
 expect() {
