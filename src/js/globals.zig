@@ -181,6 +181,62 @@ fn jsKvDelete(
     return js_undefined;
 }
 
+/// `kv.prefix(prefix, cursor?, limit?)` → `[ { key, value }, ... ]`
+///
+/// Prefix scan exposed to handlers. `cursor` is the last key from a
+/// previous page (pass "" to start). `limit` defaults to 100, capped
+/// at 1000 — this is an admin/introspection surface, not a hot read
+/// path, so we err on the side of small pages. Reads go directly
+/// through `state.kv`; writes from the same handler are visible here
+/// because the underlying SQLite connection sees its own uncommitted
+/// txn state.
+///
+/// NOT tape-captured in this slice — replay of prefix-scanning
+/// handlers will see live KV state, not the state at capture time.
+/// Deferred until the replay surface actually needs it.
+fn jsKvPrefix(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) return js_undefined;
+    const state = getState(ctx);
+
+    const prefix_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(prefix_str);
+
+    const cursor_str = if (argc >= 2 and !c.JS_IsUndefined(argv[1]) and !c.JS_IsNull(argv[1]))
+        valueToOwnedString(state, ctx, argv[1]) catch return js_exception
+    else
+        state.allocator.dupe(u8, "") catch return js_exception;
+    defer state.allocator.free(cursor_str);
+
+    const KV_PREFIX_MAX: u32 = 1000;
+    const KV_PREFIX_DEFAULT: u32 = 100;
+    const limit: u32 = if (argc >= 3 and !c.JS_IsUndefined(argv[2]) and !c.JS_IsNull(argv[2])) blk: {
+        var n: i32 = 0;
+        _ = c.JS_ToInt32(ctx, &n, argv[2]);
+        if (n <= 0) break :blk KV_PREFIX_DEFAULT;
+        break :blk @min(@as(u32, @intCast(n)), KV_PREFIX_MAX);
+    } else KV_PREFIX_DEFAULT;
+
+    var scan = state.kv.prefix(prefix_str, cursor_str, limit) catch |err| {
+        state.pending_kv_error = err;
+        return js_null;
+    };
+    defer scan.deinit();
+
+    const arr = c.JS_NewArray(ctx);
+    for (scan.entries, 0..) |e, i| {
+        const obj = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, obj, "key", c.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
+        _ = c.JS_SetPropertyStr(ctx, obj, "value", c.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
+        _ = c.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
+    }
+    return arr;
+}
+
 // ── Date.now / Math.random / crypto.* ─────────────────────────────────
 //
 // These are tape-backed non-determinism sources. The MVP shape is:
@@ -320,11 +376,12 @@ pub fn installStatic(ctx: *c.JSContext) void {
     const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);
 
-    // kv = { get, set, delete }
+    // kv = { get, set, delete, prefix }
     const kv_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, kv_obj, "get", c.JS_NewCFunction2(ctx, jsKvGet, "get", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, kv_obj, "set", c.JS_NewCFunction2(ctx, jsKvSet, "set", 2, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, kv_obj, "delete", c.JS_NewCFunction2(ctx, jsKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, kv_obj, "prefix", c.JS_NewCFunction2(ctx, jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, global, "kv", kv_obj);
 
     // console = { log }

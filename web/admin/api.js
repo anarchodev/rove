@@ -66,4 +66,19 @@ export const api = {
   assignDomain(host, instance_id) {
     return call("POST", "/_system/tenant/domain", { host, instance_id });
   },
+
+  // ── Logs ─────────────────────────────────────────────────────────
+  listLogs(instance_id, { limit = 100 } = {}) {
+    const qs = new URLSearchParams({ limit: String(limit) }).toString();
+    return call("GET", `/_system/log/${encodeURIComponent(instance_id)}/list?${qs}`);
+  },
+  showLog(instance_id, request_id_hex) {
+    return call(
+      "GET",
+      `/_system/log/${encodeURIComponent(instance_id)}/show/${encodeURIComponent(request_id_hex)}`,
+    );
+  },
+  countLogs(instance_id) {
+    return call("GET", `/_system/log/${encodeURIComponent(instance_id)}/count`);
+  },
 };

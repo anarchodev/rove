@@ -96,7 +96,10 @@ export function render(root, { goto, api }) {
       const tr = document.createElement("tr");
 
       const idCell = document.createElement("td");
-      idCell.textContent = id;
+      const idLink = document.createElement("a");
+      idLink.href = `#/instance/${encodeURIComponent(id)}`;
+      idLink.textContent = id;
+      idCell.appendChild(idLink);
       tr.appendChild(idCell);
 
       const domainCell = document.createElement("td");

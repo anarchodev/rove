@@ -165,16 +165,182 @@ const SPREAD_BENCH_HANDLER =
 const NUM_WRITE_TENANTS: usize = 8;
 
 const TENANT_IDS = [_][]const u8{
+    "__admin__",
     "acme",     "globex",   "penalty",  "readonly",
     "randwrite", "hot",     "spread",
     "write0",   "write1",   "write2",   "write3",
     "write4",   "write5",   "write6",   "write7",
 };
 
+/// JS source for the admin handler. Deployed to `__admin__` at
+/// bootstrap. See `src/js/worker.zig`'s admin-subdomain dispatch for
+/// the routing model. This handler implements the JSON admin API:
+///
+///   GET    /tenant/instance              → list instances
+///   GET    /tenant/instance?id=X         → exists check
+///   POST   /tenant/instance  {id: "X"}   → create
+///   DELETE /tenant/instance?id=X         → delete + sweep domains
+///   GET    /tenant/domain                → list host → id
+///   POST   /tenant/domain  {host, instance_id}
+///                                        → assign domain
+///   GET    /kv?prefix=&cursor=&limit=    → list keys (JSON values)
+///   GET    /kv/get?key=                  → single value (raw string)
+///
+/// Bound against whatever KV store the dispatcher selected for this
+/// request: root store for the bare admin domain; scope tenant's
+/// app.db for `{id}.api.loop46.com`. Tenant CRUD writes only make
+/// sense when the store IS root — the admin UI sends them to the
+/// bare admin subdomain.
+const ADMIN_HANDLER_SRC =
+    \\"use strict";
+    \\(function () {
+    \\    const parsed = splitQuery(request.path);
+    \\    const path = parsed.path;
+    \\    const query = parsed.query;
+    \\    const method = request.method;
+    \\
+    \\    if (path === "/tenant/instance") return handleInstance(method, query);
+    \\    if (path === "/tenant/domain") return handleDomain(method, query);
+    \\    if (path === "/kv") return handleKvList(method, query);
+    \\    if (path === "/kv/get") return handleKvGet(method, query);
+    \\    return respondJson(404, { error: "unknown route", path: path, method: method });
+    \\
+    \\    function handleInstance(method, query) {
+    \\        if (method === "GET") {
+    \\            const id = query.get("id");
+    \\            if (id) {
+    \\                if (!validId(id)) return respondJson(400, { error: "invalid id" });
+    \\                const v = kv.get("__root__/instance/" + id);
+    \\                if (v === null) return respondJson(404, { error: "not found" });
+    \\                return respondJson(200, { id: id });
+    \\            }
+    \\            const entries = kv.prefix("__root__/instance/", "", 1000);
+    \\            const ids = entries.map(function (e) {
+    \\                return { id: e.key.slice("__root__/instance/".length) };
+    \\            });
+    \\            return respondJson(200, { instances: ids });
+    \\        }
+    \\        if (method === "POST") {
+    \\            const body = parseBody();
+    \\            if (body === null) return respondJson(400, { error: "invalid json body" });
+    \\            if (!validId(body.id)) return respondJson(400, { error: "invalid id" });
+    \\            kv.set("__root__/instance/" + body.id, "");
+    \\            return respondJson(201, { id: body.id });
+    \\        }
+    \\        if (method === "DELETE") {
+    \\            const id = query.get("id");
+    \\            if (!validId(id)) return respondJson(400, { error: "invalid id" });
+    \\            kv.delete("__root__/instance/" + id);
+    \\            const doms = kv.prefix("__root__/domain/", "", 1000);
+    \\            for (let i = 0; i < doms.length; i++) {
+    \\                if (doms[i].value === id) kv.delete(doms[i].key);
+    \\            }
+    \\            response.status = 204;
+    \\            response.body = "";
+    \\            return;
+    \\        }
+    \\        return respondText(405, "method not allowed");
+    \\    }
+    \\
+    \\    function handleDomain(method, query) {
+    \\        if (method === "GET") {
+    \\            const entries = kv.prefix("__root__/domain/", "", 1000);
+    \\            const doms = entries.map(function (e) {
+    \\                return {
+    \\                    host: e.key.slice("__root__/domain/".length),
+    \\                    instance_id: e.value,
+    \\                };
+    \\            });
+    \\            return respondJson(200, { domains: doms });
+    \\        }
+    \\        if (method === "POST") {
+    \\            const body = parseBody();
+    \\            if (body === null) return respondJson(400, { error: "invalid json body" });
+    \\            if (!body.host || !body.instance_id) {
+    \\                return respondJson(400, { error: "host and instance_id required" });
+    \\            }
+    \\            const exists = kv.get("__root__/instance/" + body.instance_id);
+    \\            if (exists === null) return respondJson(404, { error: "instance not found" });
+    \\            kv.set("__root__/domain/" + body.host, body.instance_id);
+    \\            return respondJson(201, { host: body.host, instance_id: body.instance_id });
+    \\        }
+    \\        return respondText(405, "method not allowed");
+    \\    }
+    \\
+    \\    function handleKvList(method, query) {
+    \\        if (method !== "GET") return respondText(405, "method not allowed");
+    \\        const prefix = query.get("prefix") || "";
+    \\        const cursor = query.get("cursor") || "";
+    \\        const limit_raw = parseInt(query.get("limit") || "100", 10) || 100;
+    \\        const limit = Math.max(1, Math.min(limit_raw, 1000));
+    \\        const entries = kv.prefix(prefix, cursor, limit);
+    \\        const out = entries.map(function (e) {
+    \\            return { key: e.key, value: e.value };
+    \\        });
+    \\        const body = { entries: out };
+    \\        if (entries.length === limit && entries.length > 0) {
+    \\            body.next_cursor = entries[entries.length - 1].key;
+    \\        }
+    \\        return respondJson(200, body);
+    \\    }
+    \\
+    \\    function handleKvGet(method, query) {
+    \\        if (method !== "GET") return respondText(405, "method not allowed");
+    \\        const key = query.get("key");
+    \\        if (!key) return respondJson(400, { error: "missing key param" });
+    \\        const v = kv.get(key);
+    \\        if (v === null) return respondJson(404, { error: "not found" });
+    \\        response.status = 200;
+    \\        response.body = v;
+    \\    }
+    \\
+    \\    function respondJson(status, obj) {
+    \\        response.status = status;
+    \\        response.body = JSON.stringify(obj);
+    \\    }
+    \\
+    \\    function respondText(status, text) {
+    \\        response.status = status;
+    \\        response.body = text;
+    \\    }
+    \\
+    \\    function validId(id) {
+    \\        return typeof id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(id);
+    \\    }
+    \\
+    \\    function parseBody() {
+    \\        if (!request.body) return {};
+    \\        try { return JSON.parse(request.body); } catch (_) { return null; }
+    \\    }
+    \\
+    \\    function splitQuery(raw) {
+    \\        const q = raw.indexOf("?");
+    \\        const path = q < 0 ? raw : raw.slice(0, q);
+    \\        const map = new Map();
+    \\        if (q >= 0) {
+    \\            const rest = raw.slice(q + 1);
+    \\            if (rest.length > 0) {
+    \\                const pairs = rest.split("&");
+    \\                for (let i = 0; i < pairs.length; i++) {
+    \\                    const pair = pairs[i];
+    \\                    if (!pair) continue;
+    \\                    const eq = pair.indexOf("=");
+    \\                    const k = decodeURIComponent(eq < 0 ? pair : pair.slice(0, eq));
+    \\                    const v = eq < 0 ? "" : decodeURIComponent(pair.slice(eq + 1));
+    \\                    map.set(k, v);
+    \\                }
+    \\            }
+    \\        }
+    \\        return { path: path, query: map };
+    \\    }
+    \\})();
+;
+
 comptime {
     // Keep TENANT_IDS and NUM_WRITE_TENANTS in lockstep so bootstrap
-    // and workerMain iterate the same set.
-    std.debug.assert(TENANT_IDS.len == 7 + NUM_WRITE_TENANTS);
+    // and workerMain iterate the same set. 8 = __admin__ + acme +
+    // globex + penalty + readonly + randwrite + hot + spread.
+    std.debug.assert(TENANT_IDS.len == 8 + NUM_WRITE_TENANTS);
 }
 
 const Cli = struct {
@@ -207,6 +373,15 @@ const Cli = struct {
     /// `https://admin.example.com`). Unset = no CORS, and the admin
     /// UI must be served same-origin or go through a proxy.
     admin_origin: ?[]const u8 = null,
+    /// Base domain for the per-tenant admin API. When set, any
+    /// request whose Host matches `{id}.{admin_api_domain}` runs the
+    /// `__admin__` tenant's handler with `kv` rebound to `{id}`'s
+    /// store (or `__admin__`'s = root store when Host is exactly
+    /// `admin_api_domain`). Requires a root bearer token.
+    ///
+    /// Example: `api.loop46.com`. Then `acme.api.loop46.com/kv` reads
+    /// acme's KV; `api.loop46.com/tenant/instance` hits root.
+    admin_api_domain: ?[]const u8 = null,
     /// Raft proposal linger budget, in microseconds. Hold pending
     /// proposals up to this long so the raft thread can pack more
     /// into a single `raft_log.db` commit + fsync. Under heavy write
@@ -260,6 +435,10 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.admin_origin = argv[i];
+        } else if (std.mem.eql(u8, a, "--admin-api-domain")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.admin_api_domain = argv[i];
         } else if (std.mem.eql(u8, a, "--propose-linger-us")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
@@ -339,6 +518,7 @@ const WorkerCtx = struct {
     code_addr: std.net.Address,
     log_addr: std.net.Address,
     admin_origin: ?[]const u8,
+    admin_api_domain: ?[]const u8,
     /// Shared across all workers — every per-tenant `app.db` `KvStore`
     /// opens with a counter from this registry so seq allocation
     /// stays globally monotonic.
@@ -419,6 +599,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .code_addr = args.code_addr,
         .log_addr = args.log_addr,
         .admin_origin = args.admin_origin,
+        .admin_api_domain = args.admin_api_domain,
         .log_worker_id = args.worker_idx,
     });
     defer worker.destroy();
@@ -583,6 +764,11 @@ pub fn main() !void {
             std.debug.print("bootstrap: root token installed\n", .{});
         }
 
+        // __admin__ must be created before any other tenant because
+        // its `app.db` aliases to the root store — that aliasing is
+        // the whole reason admin handler JS can do plain `kv.set` on
+        // `__root__/*` keys. See `src/tenant/root.zig`.
+        try tenant.createInstance("__admin__");
         try tenant.createInstance("acme");
         try tenant.createInstance("globex");
         try tenant.createInstance("penalty");
@@ -615,6 +801,9 @@ pub fn main() !void {
         // content-addressed and the deploy is local-deterministic, so
         // all nodes independently end up with the same hashes — no
         // replication needed for code in M1.
+        try bootstrapHandler(allocator, cli.data_dir, "__admin__", &.{
+            .{ .path = "index.js", .source = ADMIN_HANDLER_SRC },
+        });
         try bootstrapHandler(allocator, cli.data_dir, "acme", &.{
             .{ .path = "index.js", .source = ACME_INDEX },
             .{ .path = "api/index.js", .source = ACME_API_INDEX },
@@ -754,6 +943,7 @@ pub fn main() !void {
             .code_addr = code_addr,
             .log_addr = log_addr,
             .admin_origin = cli.admin_origin,
+            .admin_api_domain = cli.admin_api_domain,
             .seq_counters = &seq_counters,
             .ready = &ready_events[i],
         };

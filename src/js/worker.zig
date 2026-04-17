@@ -257,6 +257,13 @@ pub const WorkerConfig = struct {
     /// callers must then be same-origin. The string is borrowed; the
     /// caller keeps it alive for the worker's lifetime.
     admin_origin: ?[]const u8 = null,
+    /// Base domain for the per-tenant admin API. When set, any
+    /// request whose Host is `admin_api_domain` exactly (scope =
+    /// `__admin__`) or `{id}.{admin_api_domain}` (scope = `{id}`)
+    /// runs the `__admin__` tenant's deployed handler with `kv`
+    /// rebound to the scope's store. Root bearer token required.
+    /// Borrowed; caller keeps it alive for the worker's lifetime.
+    admin_api_domain: ?[]const u8 = null,
     /// Upper 16 bits of every LogStore request_id this worker issues.
     /// Must be unique per Worker instance within one process — if two
     /// workers on the same node both use the same id, their captured
@@ -378,6 +385,9 @@ pub fn Worker(comptime opts: Options) type {
         /// Borrowed from `WorkerConfig.admin_origin`. See the config
         /// field for semantics. Null when CORS is disabled.
         admin_origin: ?[]const u8,
+        /// Borrowed from `WorkerConfig.admin_api_domain`. Null
+        /// disables admin subdomain routing entirely.
+        admin_api_domain: ?[]const u8,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -430,6 +440,7 @@ pub fn Worker(comptime opts: Options) type {
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
                 .refresh_interval_ns = config.refresh_interval_ns,
                 .admin_origin = config.admin_origin,
+                .admin_api_domain = config.admin_api_domain,
             };
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
@@ -1275,28 +1286,112 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
         const host = hostOnly(authority);
 
-        const resolved = worker.tenant.resolveDomain(host) catch |err| {
-            std.log.warn("rove-js: tenant.resolveDomain({s}) failed: {s}", .{ host, @errorName(err) });
-            try setSimpleResponse(server, ent, sid, sess, 500, "tenant resolution failed\n", allocator);
-            processed += 1;
-            continue;
-        };
-        if (resolved == null) {
-            try setSimpleResponse(server, ent, sid, sess, 404, "unknown domain\n", allocator);
-            processed += 1;
-            continue;
+        // Resolve (handler, scope) for this request. For normal user
+        // traffic both come from `resolveDomain(host)` — handler runs
+        // against its own KV. For admin requests
+        // (`{id}.{admin_api_domain}` or the bare admin_api_domain),
+        // the `__admin__` tenant's handler runs against the target
+        // scope's KV. Admin requests require a root bearer token.
+        const admin_scope_opt: ?[]const u8 =
+            if (worker.admin_api_domain) |pat| matchAdminSubdomain(host, pat) else null;
+        const is_admin_request = admin_scope_opt != null;
+
+        var handler_inst: *const tenant_mod.Instance = undefined;
+        var scope_inst: *const tenant_mod.Instance = undefined;
+
+        if (is_admin_request) {
+            // Preflight: browser sends OPTIONS before the real admin
+            // API call. Answer 204 with CORS preflight headers; skip
+            // auth (preflights don't carry the bearer token).
+            if (std.mem.eql(u8, method, "OPTIONS")) {
+                if (worker.admin_origin) |o| {
+                    const req_origin = findHeader(rh, "origin") orelse "";
+                    if (req_origin.len == 0 or !std.mem.eql(u8, req_origin, o)) {
+                        try setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
+                    } else {
+                        const hdrs = try buildSystemRespHeaders(allocator, o, true, null);
+                        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
+                        try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
+                        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
+                        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+                        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+                        try server.reg.set(ent, &server.request_out, h2.Session, sess);
+                        try server.reg.move(ent, &server.request_out, &server.response_in);
+                    }
+                } else {
+                    try setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
+                }
+                processed += 1;
+                continue;
+            }
+
+            const admin_cors = worker.admin_origin;
+            const token = extractBearerToken(rh) orelse {
+                try setSystemResponse(server, ent, sid, sess, 401, "missing bearer token\n", allocator, admin_cors, null);
+                processed += 1;
+                continue;
+            };
+            const ctx_opt = worker.tenant.authenticate(token) catch |err| blk: {
+                std.log.warn("rove-js: admin authenticate failed: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+            if (ctx_opt == null or !ctx_opt.?.is_root) {
+                try setSystemResponse(server, ent, sid, sess, 401, "invalid bearer token\n", allocator, admin_cors, null);
+                processed += 1;
+                continue;
+            }
+
+            const admin_opt = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+            if (admin_opt == null) {
+                try setSystemResponse(server, ent, sid, sess, 503, "admin tenant not provisioned\n", allocator, admin_cors, null);
+                processed += 1;
+                continue;
+            }
+            handler_inst = admin_opt.?;
+
+            const scope_id = admin_scope_opt.?;
+            if (scope_id.len == 0) {
+                // Bare admin domain: scope is the admin tenant itself
+                // (so `kv.*` reads/writes the root store directly).
+                scope_inst = handler_inst;
+            } else {
+                const s_opt = worker.tenant.getInstance(scope_id) catch |err| blk: {
+                    std.log.warn("rove-js: admin getInstance({s}) failed: {s}", .{ scope_id, @errorName(err) });
+                    break :blk null;
+                };
+                if (s_opt == null) {
+                    try setSystemResponse(server, ent, sid, sess, 404, "unknown instance\n", allocator, admin_cors, null);
+                    processed += 1;
+                    continue;
+                }
+                scope_inst = s_opt.?;
+            }
+        } else {
+            const r = worker.tenant.resolveDomain(host) catch |err| {
+                std.log.warn("rove-js: tenant.resolveDomain({s}) failed: {s}", .{ host, @errorName(err) });
+                try setSimpleResponse(server, ent, sid, sess, 500, "tenant resolution failed\n", allocator);
+                processed += 1;
+                continue;
+            };
+            if (r == null) {
+                try setSimpleResponse(server, ent, sid, sess, 404, "unknown domain\n", allocator);
+                processed += 1;
+                continue;
+            }
+            handler_inst = r.?;
+            scope_inst = r.?;
         }
 
-        const tc = worker.tenant_codes.get(resolved.?.id) orelse {
-            std.log.warn("rove-js: tenant {s} has no code state", .{resolved.?.id});
+        const tc = worker.tenant_codes.get(handler_inst.id) orelse {
+            std.log.warn("rove-js: tenant {s} has no code state", .{handler_inst.id});
             try setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
-            captureLog(worker, resolved.?.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+            captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
         if (tc.bytecodes.count() == 0) {
             try setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
-            captureLog(worker, resolved.?.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{});
+            captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1304,26 +1399,22 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var route = router_mod.resolveRoute(allocator, path) catch |err| {
             std.log.warn("rove-js router failed: {s}", .{@errorName(err)});
             try setErrorResponse(server, ent, sid, sess);
-            captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
         defer route.deinit();
 
-        const mjs_key = try std.fmt.allocPrint(allocator, "{s}.mjs", .{route.module_base});
-        defer allocator.free(mjs_key);
-        const js_key = try std.fmt.allocPrint(allocator, "{s}.js", .{route.module_base});
-        defer allocator.free(js_key);
-        const bytecode = tc.bytecodes.get(mjs_key) orelse tc.bytecodes.get(js_key) orelse {
+        const bytecode = (try findBytecode(tc, route.module_base, allocator)) orelse {
             try setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
-            captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 404, .handler_error, &.{}, &.{}, .{});
+            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 404, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
 
-        if (worker.penalty_box.isBoxed(resolved.?.id, tc.current_deployment_id, received_ns)) {
+        if (worker.penalty_box.isBoxed(handler_inst.id, tc.current_deployment_id, received_ns)) {
             try setSimpleResponse(server, ent, sid, sess, 503, "tenant temporarily disabled (cpu budget)\n", allocator);
-            captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 503, .timeout, &.{}, &.{}, .{});
+            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 503, .timeout, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1334,22 +1425,22 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // (or the tenant was marked busy earlier this tick) — skip it,
         // leaving it in request_out for a future dispatchOnce call.
         if (anchor) |a| {
-            if (a != resolved.?) continue;
+            if (a != scope_inst) continue;
         } else {
             // Already proven BUSY earlier this tick? Skip.
             var skip_blocked = false;
             for (blocked.slice()) |b| {
-                if (b == resolved.?) {
+                if (b == scope_inst) {
                     skip_blocked = true;
                     break;
                 }
             }
             if (skip_blocked) continue;
 
-            var new_txn = resolved.?.kv.beginTrackedImmediate() catch |err| {
-                std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ resolved.?.id, @errorName(err) });
+            var new_txn = scope_inst.kv.beginTrackedImmediate() catch |err| {
+                std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
-                captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
             };
@@ -1361,7 +1452,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // contention).
             new_txn.open() catch |err| {
                 if (err == kv_mod.KvError.Conflict) {
-                    blocked.append(resolved.?) catch {
+                    blocked.append(scope_inst) catch {
                         // blocked list is bounded; overflow means this
                         // tick has already tried more tenants than we
                         // budgeted for. Leave the entity in place and
@@ -1371,17 +1462,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     };
                     continue;
                 }
-                std.log.warn("rove-js open tracked txn ({s}) failed: {s}", .{ resolved.?.id, @errorName(err) });
+                std.log.warn("rove-js open tracked txn ({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try setSimpleResponse(server, ent, sid, sess, 500, "txn open failed\n", allocator);
-                captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
             };
             txn = new_txn;
-            anchor = resolved.?;
+            anchor = scope_inst;
         }
 
-        // At this point `anchor` is set and equals `resolved.?`, and
+        // At this point `anchor` is set and equals `scope_inst`, and
         // `txn` is open. Run the handler under its own savepoint so a
         // JS exception or CPU-budget kill rolls back only this handler's
         // writes without poisoning the rest of the batch.
@@ -1401,16 +1492,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
 
         txn.?.savepoint() catch |err| {
-            std.log.warn("rove-js savepoint({s}) failed: {s}", .{ resolved.?.id, @errorName(err) });
+            std.log.warn("rove-js savepoint({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
             try setSimpleResponse(server, ent, sid, sess, 500, "savepoint failed\n", allocator);
-            captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
 
         var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
         var resp = worker.dispatcher.run(
-            resolved.?.kv,
+            scope_inst.kv,
             &txn.?,
             &writeset,
             bytecode,
@@ -1426,14 +1517,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             if (err == dispatcher_mod.DispatchError.Interrupted) {
                 try setSimpleResponse(server, ent, sid, sess, 504, "handler exceeded cpu budget\n", allocator);
                 worker.penalty_box.recordKill(
-                    resolved.?.id,
+                    handler_inst.id,
                     tc.current_deployment_id,
                     received_ns,
                 ) catch |pe| std.log.warn("rove-js penalty recordKill failed: {s}", .{@errorName(pe)});
             } else {
                 try setErrorResponse(server, ent, sid, sess);
             }
-            captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, status, outcome, &.{}, &.{}, .{});
+            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, status, outcome, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
@@ -1449,7 +1540,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             worker.dispatcher.last_kv_error = null;
             txn.?.rollbackTo() catch {};
             try setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
-            captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1457,7 +1548,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         txn.?.release() catch |err| {
             std.log.warn("rove-js release savepoint failed: {s}", .{@errorName(err)});
             try setSimpleResponse(server, ent, sid, sess, 500, "kv release failed\n", allocator);
-            captureLog(worker, resolved.?.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
@@ -1471,8 +1562,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         resp.body = &.{};
         const status_code: u16 = @intCast(@max(@min(resp.status, 599), 100));
 
+        // Admin-subdomain responses carry CORS headers so the browser
+        // UI on a different origin can read them. Non-admin user
+        // traffic is same-origin (it's their tenant's own domain) and
+        // gets empty RespHeaders.
+        const handler_resp_hdrs: h2.RespHeaders = if (is_admin_request)
+            try buildSystemRespHeaders(allocator, worker.admin_origin, false, null)
+        else
+            .{ .fields = null, .count = 0 };
         try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
-        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, &server.request_out, h2.RespHeaders, handler_resp_hdrs);
         try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = body_ptr, .len = body_len });
         try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
         try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
@@ -1481,7 +1580,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // Upload tapes now — blob-addressed and idempotent, so storing
         // them before commit is safe even if the batch later rolls
         // back. The refs get carried into the log record after commit.
-        const tape_refs = uploadTapes(worker, resolved.?.id, &tapes);
+        const tape_refs = uploadTapes(worker, scope_inst.id, &tapes);
 
         const console_owned = resp.console;
         const exception_owned = resp.exception;
@@ -2672,6 +2771,75 @@ pub fn cleanupResponses(worker: anytype) !void {
 fn hostOnly(authority: []const u8) []const u8 {
     const colon = std.mem.lastIndexOfScalar(u8, authority, ':') orelse return authority;
     return authority[0..colon];
+}
+
+/// Look up handler bytecode for `module_base`, walking up the module
+/// tree if the exact path isn't deployed. So `tenant/instance/acme/index`
+/// falls back through `tenant/instance/index` → `tenant/index` →
+/// `index`, whichever exists first. This lets a single deployed file
+/// (`index.js` or `tenant/index.mjs`) catch every sub-path below it,
+/// which is exactly what the admin handler needs — one JS module
+/// does its own path-based dispatch.
+fn findBytecode(
+    tc: *const TenantCode,
+    module_base: []const u8,
+    allocator: std.mem.Allocator,
+) !?[]u8 {
+    var cur: []const u8 = module_base;
+    var cur_owned: ?[]u8 = null;
+    defer if (cur_owned) |o| allocator.free(o);
+
+    while (true) {
+        const mjs_key = try std.fmt.allocPrint(allocator, "{s}.mjs", .{cur});
+        defer allocator.free(mjs_key);
+        const js_key = try std.fmt.allocPrint(allocator, "{s}.js", .{cur});
+        defer allocator.free(js_key);
+        if (tc.bytecodes.get(mjs_key)) |bc| return bc;
+        if (tc.bytecodes.get(js_key)) |bc| return bc;
+
+        // At the root? Done — nothing matched.
+        if (std.mem.eql(u8, cur, "index")) return null;
+
+        // Walk up. cur is always of the form ".../X/index". Drop "X"
+        // to get the parent's index: ".../index".
+        const trailing_idx = std.mem.lastIndexOfScalar(u8, cur, '/') orelse return null;
+        const before_segment = std.mem.lastIndexOfScalar(u8, cur[0..trailing_idx], '/');
+        const new_cur = if (before_segment) |ps|
+            try std.fmt.allocPrint(allocator, "{s}/index", .{cur[0..ps]})
+        else
+            try allocator.dupe(u8, "index");
+        if (cur_owned) |o| allocator.free(o);
+        cur_owned = new_cur;
+        cur = new_cur;
+    }
+}
+
+/// Match `host` against the admin API domain pattern. Returns:
+///   - `null`            — host is not an admin request
+///   - `""`              — host is exactly `pattern` (bare admin API)
+///   - `"acme"`          — host is `acme.{pattern}` (scope = acme)
+/// `host` is the hostname without any port (see `hostOnly`). Matching
+/// is case-sensitive; Hosts on the wire are already lower-cased by
+/// HTTP/2 header rules.
+fn matchAdminSubdomain(host: []const u8, pattern: []const u8) ?[]const u8 {
+    if (pattern.len == 0) return null;
+    if (std.mem.eql(u8, host, pattern)) return "";
+    if (host.len <= pattern.len + 1) return null;
+    const dot_before = host.len - pattern.len - 1;
+    if (host[dot_before] != '.') return null;
+    if (!std.mem.eql(u8, host[dot_before + 1 ..], pattern)) return null;
+    return host[0..dot_before];
+}
+
+test "matchAdminSubdomain" {
+    try std.testing.expectEqual(@as(?[]const u8, null), matchAdminSubdomain("acme.test", "api.loop46.com"));
+    try std.testing.expectEqualStrings("", matchAdminSubdomain("api.loop46.com", "api.loop46.com").?);
+    try std.testing.expectEqualStrings("acme", matchAdminSubdomain("acme.api.loop46.com", "api.loop46.com").?);
+    try std.testing.expectEqualStrings("__admin__", matchAdminSubdomain("__admin__.api.loop46.com", "api.loop46.com").?);
+    // Non-match: wrong suffix.
+    try std.testing.expectEqual(@as(?[]const u8, null), matchAdminSubdomain("acme.api.other.com", "api.loop46.com"));
+    // Non-match: empty pattern guards.
+    try std.testing.expectEqual(@as(?[]const u8, null), matchAdminSubdomain("anything", ""));
 }
 
 fn findHeader(hdrs: h2.ReqHeaders, name: []const u8) ?[]const u8 {

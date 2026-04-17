@@ -78,6 +78,11 @@ pub const TOKEN_HEX_LEN: usize = 64; // 32 bytes of entropy, hex-encoded
 pub const MAX_INSTANCE_ID_LEN: usize = 64;
 pub const MAX_HOST_LEN: usize = 253; // RFC 1035
 
+/// Reserved instance id for the built-in admin handler. Its app-state
+/// KV aliases to the root store, so `kv.set("__root__/instance/{id}", "")`
+/// from an admin handler is literally a root-marker write.
+pub const ADMIN_INSTANCE_ID = "__admin__";
+
 pub const InstanceList = struct {
     ids: [][]u8,
     allocator: std.mem.Allocator,
@@ -120,6 +125,11 @@ pub const Instance = struct {
     id: []u8,
     dir: []u8,
     kv: *kv_mod.KvStore,
+    /// False for instances whose `kv` is borrowed from elsewhere
+    /// (currently only `__admin__`, which aliases to the root store).
+    /// `deinit` and `deleteInstance` skip `kv.close()` when this is
+    /// false to avoid a double-close on the shared handle.
+    owns_kv: bool = true,
 };
 
 pub const Tenant = struct {
@@ -183,7 +193,7 @@ pub const Tenant = struct {
         var it = self.instances.iterator();
         while (it.next()) |entry| {
             const inst = entry.value_ptr.*;
-            inst.kv.close();
+            if (inst.owns_kv) inst.kv.close();
             self.allocator.free(inst.id);
             self.allocator.free(inst.dir);
             self.allocator.destroy(inst);
@@ -221,7 +231,7 @@ pub const Tenant = struct {
 
         if (self.instances.fetchRemove(id)) |entry| {
             const inst = entry.value;
-            inst.kv.close();
+            if (inst.owns_kv) inst.kv.close();
             self.allocator.free(inst.id);
             self.allocator.free(inst.dir);
             self.allocator.destroy(inst);
@@ -438,28 +448,41 @@ pub const Tenant = struct {
             else => return Error.OpenFailed,
         };
 
-        const app_path = std.fmt.allocPrintSentinel(
-            self.allocator,
-            "{s}/app.db",
-            .{inst_dir},
-            0,
-        ) catch return Error.OutOfMemory;
-        defer self.allocator.free(app_path);
+        // __admin__ aliases its app-state KV to the root store. The
+        // admin handler's `kv.get/set` thus operates on root markers
+        // directly — no separate app.db file, no new bindings.
+        // The handle is borrowed; we flag it so deinit skips close().
+        const is_admin = std.mem.eql(u8, id, ADMIN_INSTANCE_ID);
+        const store = if (is_admin) self.root else blk: {
+            const app_path = std.fmt.allocPrintSentinel(
+                self.allocator,
+                "{s}/app.db",
+                .{inst_dir},
+                0,
+            ) catch return Error.OutOfMemory;
+            defer self.allocator.free(app_path);
 
-        const store = if (self.seq_counters) |reg| blk: {
-            const counter = reg.getOrCreate(id) catch return Error.OutOfMemory;
-            break :blk kv_mod.KvStore.openWithCounter(self.allocator, app_path, counter) catch
+            const opened = if (self.seq_counters) |reg| cblk: {
+                const counter = reg.getOrCreate(id) catch return Error.OutOfMemory;
+                break :cblk kv_mod.KvStore.openWithCounter(self.allocator, app_path, counter) catch
+                    return Error.OpenFailed;
+            } else kv_mod.KvStore.open(self.allocator, app_path) catch
                 return Error.OpenFailed;
-        } else kv_mod.KvStore.open(self.allocator, app_path) catch
-            return Error.OpenFailed;
-        errdefer store.close();
+            break :blk opened;
+        };
+        errdefer if (!is_admin) store.close();
 
         const id_copy = self.allocator.dupe(u8, id) catch return Error.OutOfMemory;
         errdefer self.allocator.free(id_copy);
 
         const inst = self.allocator.create(Instance) catch return Error.OutOfMemory;
         errdefer self.allocator.destroy(inst);
-        inst.* = .{ .id = id_copy, .dir = inst_dir, .kv = store };
+        inst.* = .{
+            .id = id_copy,
+            .dir = inst_dir,
+            .kv = store,
+            .owns_kv = !is_admin,
+        };
 
         self.instances.put(self.allocator, id_copy, inst) catch return Error.OutOfMemory;
         return inst;
@@ -861,6 +884,27 @@ test "canAccessInstance short-circuits for root" {
 
     const other_ctx: AuthContext = .{ .is_root = false };
     try testing.expectEqual(false, try fx.tenant.canAccessInstance(other_ctx, "acme"));
+}
+
+test "__admin__ tenant's kv aliases to the root store" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try fx.tenant.createInstance(ADMIN_INSTANCE_ID);
+    const admin = (try fx.tenant.getInstance(ADMIN_INSTANCE_ID)).?;
+    // The Instance.kv pointer IS the root store.
+    try testing.expectEqual(fx.root, admin.kv);
+
+    // A write through admin.kv is a write to root; visible via root.get
+    // and via resolveDomain's existence check.
+    try admin.kv.put("__root__/instance/via-admin", "");
+    try testing.expectEqual(true, try fx.tenant.instanceExists("via-admin"));
+
+    // Conversely, a write directly to root shows up through admin.kv.
+    try fx.root.put("direct-root-key", "value");
+    const v = try admin.kv.get("direct-root-key");
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("value", v);
 }
 
 test "getInstance lazy-opens by id" {

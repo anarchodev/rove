@@ -12,25 +12,33 @@
 import { api, ApiError } from "./api.js";
 import * as login from "./pages/login.js";
 import * as instances from "./pages/instances.js";
+import * as instance from "./pages/instance.js";
 
-const routes = {
-  "#/login": login,
-  "#/instances": instances,
-};
+// Route resolver. Static routes map exactly; `#/instance/:id` is a
+// parameterized route so we match its prefix.
+function resolveRoute(hash) {
+  if (hash === "#/login") return { page: login, params: {} };
+  if (hash === "#/instances") return { page: instances, params: {} };
+  if (hash.startsWith("#/instance/")) {
+    const id = decodeURIComponent(hash.slice("#/instance/".length));
+    if (id.length > 0) return { page: instance, params: { id } };
+  }
+  return { page: instances, params: {} };
+}
 
 let currentTeardown = null;
 
 function route() {
   const hash = location.hash || "#/instances";
-  const target = routes[hash] ?? routes["#/instances"];
+  const { page, params } = resolveRoute(hash);
 
   // Auth gate: any route except login requires a token.
-  if (target !== login && !api.hasToken()) {
+  if (page !== login && !api.hasToken()) {
     location.hash = "#/login";
     return;
   }
   // Already-logged-in users bounced off the login page land on instances.
-  if (target === login && api.hasToken()) {
+  if (page === login && api.hasToken()) {
     location.hash = "#/instances";
     return;
   }
@@ -44,7 +52,7 @@ function route() {
   root.replaceChildren();
 
   try {
-    const result = target.render(root, { goto, api, ApiError });
+    const result = page.render(root, { goto, api, ApiError, params });
     if (typeof result === "function") currentTeardown = result;
   } catch (err) {
     root.textContent = `render failed: ${err.message}`;
