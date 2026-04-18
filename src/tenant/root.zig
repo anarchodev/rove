@@ -73,7 +73,13 @@ pub const AuthContext = struct {
     is_root: bool,
 };
 
-pub const TOKEN_HEX_LEN: usize = 64; // 32 bytes of entropy, hex-encoded
+// Root-token shape. The store only retains sha256(token), so any
+// printable ASCII string of reasonable length works. 32 chars is the
+// floor (roughly 160 bits of entropy for alphanumeric, plenty); 128 is
+// the ceiling so an accidentally-pasted buffer can't explode the key
+// space.
+pub const TOKEN_MIN_LEN: usize = 32;
+pub const TOKEN_MAX_LEN: usize = 128;
 
 pub const MAX_INSTANCE_ID_LEN: usize = 64;
 pub const MAX_HOST_LEN: usize = 253; // RFC 1035
@@ -575,7 +581,7 @@ pub const Tenant = struct {
     /// token is a no-op; re-installing a different token replaces
     /// any existing one. The plaintext is SHA-256'd before storage.
     pub fn installRootToken(self: *Tenant, token_hex: []const u8) Error!void {
-        try validateTokenHex(token_hex);
+        try validateTokenShape(token_hex);
 
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(token_hex, &hash, .{});
@@ -603,7 +609,7 @@ pub const Tenant = struct {
     /// isn't needed because we hash-and-lookup rather than string-
     /// compare — the kv index returns `NotFound` without scanning.
     pub fn authenticate(self: *Tenant, token_hex: []const u8) Error!?AuthContext {
-        if (validateTokenHex(token_hex)) |_| {} else |_| return null;
+        if (validateTokenShape(token_hex)) |_| {} else |_| return null;
 
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(token_hex, &hash, .{});
@@ -760,11 +766,13 @@ pub const Tenant = struct {
     }
 };
 
-fn validateTokenHex(token_hex: []const u8) Error!void {
-    if (token_hex.len != TOKEN_HEX_LEN) return Error.InvalidToken;
-    for (token_hex) |b| {
-        const ok = (b >= '0' and b <= '9') or (b >= 'a' and b <= 'f') or (b >= 'A' and b <= 'F');
-        if (!ok) return Error.InvalidToken;
+fn validateTokenShape(token: []const u8) Error!void {
+    if (token.len < TOKEN_MIN_LEN or token.len > TOKEN_MAX_LEN) return Error.InvalidToken;
+    // Printable ASCII (0x21..0x7e). Reject anything with whitespace or
+    // control bytes so copy-paste accidents (trailing newline, tab)
+    // surface as a validation error rather than a silent mismatch.
+    for (token) |b| {
+        if (b < 0x21 or b > 0x7e) return Error.InvalidToken;
     }
 }
 

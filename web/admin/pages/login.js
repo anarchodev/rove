@@ -14,7 +14,7 @@ export function render(root, { goto, api }) {
     <form class="login-form">
       <label>
         <span>Token</span>
-        <input type="password" name="token" autocomplete="off" required minlength="64" maxlength="64" spellcheck="false">
+        <input type="password" name="token" autocomplete="off" required minlength="32" maxlength="128" spellcheck="false">
       </label>
       <button type="submit">Sign in</button>
       <p class="error" hidden></p>
@@ -36,8 +36,8 @@ export function render(root, { goto, api }) {
     ev.preventDefault();
     errorBox.hidden = true;
     const token = input.value.trim();
-    if (token.length !== 64) {
-      showError("Token must be 64 hex characters.");
+    if (token.length < 32 || token.length > 128) {
+      showError("Token must be 32–128 characters.");
       return;
     }
     submit.disabled = true;
