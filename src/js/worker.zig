@@ -1362,17 +1362,39 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
 
             const admin_cors = worker.admin_origin;
-            const token = extractBearerToken(rh) orelse {
-                try setSystemResponse(server, ent, sid, sess, 401, "missing bearer token\n", allocator, admin_cors, null);
+
+            // Strip query before path matching — login/logout/session
+            // are simple static paths.
+            const qmark = std.mem.indexOfScalar(u8, path, '?');
+            const path_no_q = if (qmark) |q| path[0..q] else path;
+
+            // Pre-auth native endpoints — `/v1/login` mints a session
+            // from a body token; `/v1/logout` clears the cookie.
+            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/login")) {
+                try handleAdminLogin(server, allocator, ent, sid, sess, worker, rb);
                 processed += 1;
                 continue;
-            };
-            const ctx_opt = worker.tenant.authenticate(token) catch |err| blk: {
-                std.log.warn("rove-js: admin authenticate failed: {s}", .{@errorName(err)});
+            }
+            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/logout")) {
+                try handleAdminLogout(server, allocator, ent, sid, sess, worker, rh);
+                processed += 1;
+                continue;
+            }
+
+            // Normal admin auth: try session cookie first, then bearer.
+            const ctx_opt = extractAdminAuth(worker.tenant, rh) catch |err| blk: {
+                std.log.warn("rove-js: admin auth resolution failed: {s}", .{@errorName(err)});
                 break :blk null;
             };
             if (ctx_opt == null or !ctx_opt.?.is_root) {
-                try setSystemResponse(server, ent, sid, sess, 401, "invalid bearer token\n", allocator, admin_cors, null);
+                try setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, admin_cors, null);
+                processed += 1;
+                continue;
+            }
+
+            // Post-auth whoami — lets the UI detect stale sessions.
+            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path_no_q, "/v1/session")) {
+                try handleAdminSession(server, allocator, ent, sid, sess, worker, ctx_opt.?);
                 processed += 1;
                 continue;
             }
@@ -2936,6 +2958,217 @@ fn extractBearerToken(hdrs: h2.ReqHeaders) ?[]const u8 {
     const token = value[prefix.len..];
     if (token.len == 0) return null;
     return token;
+}
+
+/// Name of the admin session cookie. Single hard-coded identifier —
+/// don't scatter the string elsewhere.
+pub const ADMIN_SESSION_COOKIE: []const u8 = "rove_session";
+
+/// Default admin session lifetime: 7 days. No sliding refresh yet —
+/// the cookie carries a Max-Age of the same value at issue time so the
+/// browser evicts it at the server-side expiry.
+pub const ADMIN_SESSION_TTL_NS: i64 = 7 * 24 * 3600 * std.time.ns_per_s;
+
+/// Find `name` inside the request's Cookie header. Returns the raw
+/// value (trimmed of surrounding whitespace) or null if missing.
+fn findCookie(hdrs: h2.ReqHeaders, name: []const u8) ?[]const u8 {
+    const value = findHeader(hdrs, "cookie") orelse return null;
+    var rest = value;
+    while (rest.len > 0) {
+        while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t' or rest[0] == ';')) {
+            rest = rest[1..];
+        }
+        if (rest.len == 0) break;
+        const end = std.mem.indexOfScalar(u8, rest, ';') orelse rest.len;
+        const segment = rest[0..end];
+        if (std.mem.indexOfScalar(u8, segment, '=')) |eq| {
+            const k = segment[0..eq];
+            const v = segment[eq + 1 ..];
+            if (std.mem.eql(u8, k, name)) {
+                // Cookies may be quoted — strip one pair if present.
+                if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') {
+                    return v[1 .. v.len - 1];
+                }
+                return v;
+            }
+        }
+        rest = rest[end..];
+    }
+    return null;
+}
+
+/// Try to authenticate an admin request using either a session cookie
+/// or an Authorization: Bearer header (in that order). Cookie wins if
+/// both are present. Returns the resolved AuthContext or null.
+fn extractAdminAuth(
+    tenant: *tenant_mod.Tenant,
+    hdrs: h2.ReqHeaders,
+) !?tenant_mod.AuthContext {
+    if (findCookie(hdrs, ADMIN_SESSION_COOKIE)) |cookie_val| {
+        if (try tenant.authenticateSession(cookie_val)) |ctx| return ctx;
+    }
+    if (extractBearerToken(hdrs)) |token| {
+        return try tenant.authenticate(token);
+    }
+    return null;
+}
+
+// ── Login / logout / whoami (cookie auth) ─────────────────────────────
+
+/// Body shape for POST /v1/login. Just one field.
+const LoginBody = struct { token: []const u8 };
+
+/// Write the session cookie header, setting a 7-day lifetime on mint
+/// or a max-age=0 + past Expires on clear. When `clearing` is true the
+/// cookie value is empty.
+fn formatSessionCookie(
+    allocator: std.mem.Allocator,
+    opaque_hex: []const u8,
+    clearing: bool,
+) ![]u8 {
+    // HttpOnly + Secure + SameSite=Lax are the required tripod for
+    // first-party admin sessions on `app.loop46.me`. HTTP/2 on the same
+    // origin is a secure context, so Secure is always set — the cookie
+    // won't flow on plain HTTP in dev without TLS, which is the point.
+    if (clearing) {
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0",
+            .{ADMIN_SESSION_COOKIE},
+        );
+    }
+    const max_age_s: i64 = @divTrunc(ADMIN_SESSION_TTL_NS, std.time.ns_per_s);
+    return try std.fmt.allocPrint(
+        allocator,
+        "{s}={s}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={d}",
+        .{ ADMIN_SESSION_COOKIE, opaque_hex, max_age_s },
+    );
+}
+
+/// Build admin response headers that carry one Set-Cookie plus the
+/// standard CORS envelope (on preflight-allowed origins). Used by
+/// /v1/login, /v1/logout. Reuses the handler-response shape so the
+/// CORS pack is consistent with normal admin replies.
+fn buildAuthRespHeaders(
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+    set_cookie: []const u8,
+) !h2.RespHeaders {
+    const cookies = [_][]const u8{set_cookie};
+    return try buildHandlerRespHeaders(allocator, cors_origin, &cookies);
+}
+
+/// POST /v1/login. Body: `{"token": "<64-hex>"}`. On match, mint a
+/// session record in root.db and emit the opaque in a Set-Cookie.
+fn handleAdminLogin(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    worker: anytype,
+    rb: h2.ReqBody,
+) !void {
+    const admin_cors = worker.admin_origin;
+    const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
+
+    const parsed = std.json.parseFromSlice(LoginBody, allocator, body, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        try setSystemResponse(server, ent, sid, sess, 400, "bad request body\n", allocator, admin_cors, null);
+        return;
+    };
+    defer parsed.deinit();
+
+    const ctx_opt = worker.tenant.authenticate(parsed.value.token) catch |err| blk: {
+        std.log.warn("rove-js: login authenticate failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    if (ctx_opt == null or !ctx_opt.?.is_root) {
+        try setSystemResponse(server, ent, sid, sess, 401, "invalid token\n", allocator, admin_cors, null);
+        return;
+    }
+
+    const opaque_hex = worker.tenant.createSession(ctx_opt.?, ADMIN_SESSION_TTL_NS) catch |err| {
+        std.log.warn("rove-js: createSession failed: {s}", .{@errorName(err)});
+        try setSystemResponse(server, ent, sid, sess, 500, "session create failed\n", allocator, admin_cors, null);
+        return;
+    };
+
+    const cookie = try formatSessionCookie(allocator, &opaque_hex, false);
+    defer allocator.free(cookie);
+    const hdrs = try buildAuthRespHeaders(allocator, admin_cors, cookie);
+
+    const body_out = try allocator.dupe(u8, "{\"ok\":true}\n");
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 200 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = body_out.ptr,
+        .len = @intCast(body_out.len),
+    });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// POST /v1/logout. Read the session cookie, revoke the matching
+/// record, and expire the cookie on the client. Always returns 200 —
+/// logout is idempotent and doesn't leak whether a session existed.
+fn handleAdminLogout(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    worker: anytype,
+    rh: h2.ReqHeaders,
+) !void {
+    const admin_cors = worker.admin_origin;
+    if (findCookie(rh, ADMIN_SESSION_COOKIE)) |opaque_hex| {
+        worker.tenant.revokeSession(opaque_hex) catch |err| {
+            std.log.warn("rove-js: revokeSession failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    const cookie = try formatSessionCookie(allocator, "", true);
+    defer allocator.free(cookie);
+    const hdrs = try buildAuthRespHeaders(allocator, admin_cors, cookie);
+
+    const body_out = try allocator.dupe(u8, "{\"ok\":true}\n");
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 200 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = body_out.ptr,
+        .len = @intCast(body_out.len),
+    });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// GET /v1/session. Whoami for the auth middleware — returns
+/// `{"is_root":true}` if the caller reached here (auth already
+/// succeeded), so callers can distinguish "cookie still valid" from
+/// "401 please log in again".
+fn handleAdminSession(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    worker: anytype,
+    ctx: tenant_mod.AuthContext,
+) !void {
+    const admin_cors = worker.admin_origin;
+    const body_out = try std.fmt.allocPrint(
+        allocator,
+        "{{\"is_root\":{s}}}\n",
+        .{if (ctx.is_root) "true" else "false"},
+    );
+    defer allocator.free(body_out);
+    try setSystemResponse(server, ent, sid, sess, 200, body_out, allocator, admin_cors, "application/json");
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
