@@ -1,28 +1,28 @@
-//! `rove-code-cli` — local driver for rove-code.
+//! `rove-files-cli` — local driver for rove-files.
 //!
-//! Phase 1b ships rove-code as a library + a local CLI; the HTTP/2
+//! Phase 1b ships rove-files as a library + a local CLI; the HTTP/2
 //! server wrapper is deferred to early Phase 2 where it gets designed
 //! alongside the worker's code-client (both ends of the wire at once).
 //! Until then, this binary is the integration harness: it exercises
 //! the full stack — rove-kv + rove-blob + rove-qjs compile hook +
-//! rove-code — against a local database and blob directory, so we can
+//! rove-files — against a local database and blob directory, so we can
 //! upload a source tree, deploy it, and read entries back.
 //!
 //! Usage:
-//!   rove-code-cli upload <dir> --db <path> --blob <dir>
-//!   rove-code-cli deploy --db <path> --blob <dir>
-//!   rove-code-cli show --db <path> --blob <dir>
-//!   rove-code-cli get <path> --db <path> --blob <dir>
+//!   rove-files-cli upload <dir> --db <path> --blob <dir>
+//!   rove-files-cli deploy --db <path> --blob <dir>
+//!   rove-files-cli show --db <path> --blob <dir>
+//!   rove-files-cli get <path> --db <path> --blob <dir>
 //!
 //! `upload` walks a directory, registers every regular file whose name
-//! ends in `.js` or `.mjs` as a source entry in the CodeStore. A
+//! ends in `.js` or `.mjs` as a source entry in the FileStore. A
 //! subsequent `deploy` freezes the working tree and assigns a deployment
 //! id. `show` prints the current deployment manifest. `get` fetches the
 //! current source bytes for a path.
 
 const std = @import("std");
 const qjs = @import("rove-qjs");
-const code = @import("rove-code");
+const code = @import("rove-files");
 const kv = @import("rove-kv");
 const blob_mod = @import("rove-blob");
 
@@ -121,15 +121,15 @@ fn parseArgs(argv: [][:0]u8) !Args {
 
 fn usage(w: *std.Io.Writer) !void {
     try w.writeAll(
-        \\usage: rove-code-cli <cmd> [args] --data-dir <path> --instance <id>
+        \\usage: rove-files-cli <cmd> [args] --data-dir <path> --instance <id>
         \\  upload <dir>  walk <dir>, register every .js/.mjs file
         \\  deploy        freeze the working tree, assign a deployment id
         \\  show          print the current deployment manifest
         \\  get <path>    print the current source bytes for <path>
         \\
         \\Code storage is per-tenant. Given --data-dir <root> --instance <id>,
-        \\the tenant's code index lives at <root>/<id>/code.db and source/
-        \\bytecode blobs at <root>/<id>/code-blobs/. The directory is created
+        \\the tenant's code index lives at <root>/<id>/files.db and source/
+        \\bytecode blobs at <root>/<id>/file-blobs/. The directory is created
         \\if missing.
         \\
     );
@@ -138,7 +138,7 @@ fn usage(w: *std.Io.Writer) !void {
 
 // ── Commands ──────────────────────────────────────────────────────────
 
-fn runUpload(allocator: std.mem.Allocator, store: *code.CodeStore, dir_path: []const u8) !void {
+fn runUpload(allocator: std.mem.Allocator, store: *code.FileStore, dir_path: []const u8) !void {
     var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
     defer dir.close();
 
@@ -172,7 +172,7 @@ fn runUpload(allocator: std.mem.Allocator, store: *code.CodeStore, dir_path: []c
     try sw.interface.flush();
 }
 
-fn runDeploy(store: *code.CodeStore) !void {
+fn runDeploy(store: *code.FileStore) !void {
     const id = try store.deploy();
     var stdout_buf: [64]u8 = undefined;
     var sw = std.fs.File.stdout().writer(&stdout_buf);
@@ -180,7 +180,7 @@ fn runDeploy(store: *code.CodeStore) !void {
     try sw.interface.flush();
 }
 
-fn runShow(store: *code.CodeStore) !void {
+fn runShow(store: *code.FileStore) !void {
     var m = try store.loadCurrentDeployment();
     defer m.deinit();
 
@@ -200,7 +200,7 @@ fn runShow(store: *code.CodeStore) !void {
 
 fn runGet(
     allocator: std.mem.Allocator,
-    store: *code.CodeStore,
+    store: *code.FileStore,
     path: []const u8,
 ) !void {
     const bytes = try store.getSource(path, allocator);
@@ -242,31 +242,31 @@ pub fn main() !void {
         else => return err,
     };
 
-    const code_db_path = try std.fmt.allocPrintSentinel(
+    const files_db_path = try std.fmt.allocPrintSentinel(
         allocator,
-        "{s}/code.db",
+        "{s}/files.db",
         .{inst_dir},
         0,
     );
-    defer allocator.free(code_db_path);
+    defer allocator.free(files_db_path);
 
-    const code_blob_dir = try std.fmt.allocPrint(
+    const files_blob_dir = try std.fmt.allocPrint(
         allocator,
-        "{s}/code-blobs",
+        "{s}/file-blobs",
         .{inst_dir},
     );
-    defer allocator.free(code_blob_dir);
+    defer allocator.free(files_blob_dir);
 
     var compiler = try QjsCompiler.init();
     defer compiler.deinit();
 
-    const kvs = try kv.KvStore.open(allocator, code_db_path);
+    const kvs = try kv.KvStore.open(allocator, files_db_path);
     defer kvs.close();
 
-    var fs_store = try blob_mod.FilesystemBlobStore.open(allocator, code_blob_dir);
+    var fs_store = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
     defer fs_store.deinit();
 
-    var store = code.CodeStore.init(
+    var store = code.FileStore.init(
         allocator,
         kvs,
         fs_store.blobStore(),
@@ -284,8 +284,8 @@ pub fn main() !void {
 
 // ── Integration tests ─────────────────────────────────────────────────
 //
-// These live here (not in src/code/) because they wire rove-qjs into
-// the compile hook, and I want the rove-code library itself to stay
+// These live here (not in src/files/) because they wire rove-qjs into
+// the compile hook, and I want the rove-files library itself to stay
 // qjs-agnostic. Running `zig build test` picks them up via the
 // `code-cli-tests` step wired in build.zig.
 
@@ -300,7 +300,7 @@ const IntegrationFixture = struct {
 
     fn init(allocator: std.mem.Allocator) !IntegrationFixture {
         const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-        const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/rove-code-int-{x}", .{seed});
+        const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/rove-files-int-{x}", .{seed});
         errdefer allocator.free(tmp_path);
         std.fs.cwd().deleteTree(tmp_path) catch {};
         try std.fs.cwd().makePath(tmp_path);
@@ -338,8 +338,8 @@ const IntegrationFixture = struct {
         self.allocator.free(self.tmp_path);
     }
 
-    fn codeStore(self: *IntegrationFixture) code.CodeStore {
-        return code.CodeStore.init(
+    fn fileStore(self: *IntegrationFixture) code.FileStore {
+        return code.FileStore.init(
             self.allocator,
             self.kv_store,
             self.blob_store.blobStore(),
@@ -352,7 +352,7 @@ const IntegrationFixture = struct {
 test "integration: real qjs compile round trip" {
     var fx = try IntegrationFixture.init(testing.allocator);
     defer fx.deinit();
-    var store = fx.codeStore();
+    var store = fx.fileStore();
 
     try store.putSource("handlers/math.js", "export const sum = (a, b) => a + b;");
 
@@ -371,7 +371,7 @@ test "integration: real qjs compile round trip" {
 test "integration: compiled bytecode executes in a fresh runtime" {
     var fx = try IntegrationFixture.init(testing.allocator);
     defer fx.deinit();
-    var store = fx.codeStore();
+    var store = fx.fileStore();
 
     try store.putSource(
         "h.js",
@@ -398,7 +398,7 @@ test "integration: compiled bytecode executes in a fresh runtime" {
 test "integration: deploy + loadCurrentDeployment + resolve blob via manifest" {
     var fx = try IntegrationFixture.init(testing.allocator);
     defer fx.deinit();
-    var store = fx.codeStore();
+    var store = fx.fileStore();
 
     try store.putSource("a.js", "export const a = 1;");
     try store.putSource("b/c.js", "export const c = 3;");
@@ -423,7 +423,7 @@ test "integration: deploy + loadCurrentDeployment + resolve blob via manifest" {
 test "integration: syntax error propagates as CompileFailed" {
     var fx = try IntegrationFixture.init(testing.allocator);
     defer fx.deinit();
-    var store = fx.codeStore();
+    var store = fx.fileStore();
 
     try testing.expectError(
         code.Error.CompileFailed,
@@ -434,7 +434,7 @@ test "integration: syntax error propagates as CompileFailed" {
 test "integration: upload walks a tree and registers .js files" {
     var fx = try IntegrationFixture.init(testing.allocator);
     defer fx.deinit();
-    var store = fx.codeStore();
+    var store = fx.fileStore();
 
     // Lay down a tiny source tree under fx.tmp_path/src.
     const src_dir = try std.fmt.allocPrint(testing.allocator, "{s}/src", .{fx.tmp_path});

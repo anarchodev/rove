@@ -16,7 +16,7 @@
 //! **Deferred to the next sessions:**
 //!
 //! - HTTP/2 wiring (`rove-h2` accept loop + router). Session 2.
-//! - HTTP/2 client to `rove-code-server` for on-demand bytecode fetch.
+//! - HTTP/2 client to `rove-files-server` for on-demand bytecode fetch.
 //!   Session 2 builds both ends of this wire.
 //! - Tenant resolution + per-instance KV prefixing. Session 2 adds
 //!   `rove-tenant` and plumbs it through the router.
@@ -64,7 +64,7 @@ pub const WorkerConfig = worker.WorkerConfig;
 pub const WorkerOptions = worker.Options;
 pub const RaftWait = worker.RaftWait;
 pub const ProxyPeer = worker.ProxyPeer;
-pub const TenantCode = worker.TenantCode;
+pub const TenantFiles = worker.TenantFiles;
 pub const TenantLog = worker.TenantLog;
 pub const DEFAULT_HANDLER_PATH = worker.DEFAULT_HANDLER_PATH;
 pub const BlockedTenants = worker.BlockedTenants;

@@ -1,6 +1,6 @@
 //! rove-log-server — per-instance log read operations.
 //!
-//! Mirror of `rove-code-server/root.zig` for the observability side.
+//! Mirror of `rove-files-server/root.zig` for the observability side.
 //! The worker forwards `/_system/log/{instance}/*` requests to the
 //! log-server thread, which services them against each tenant's
 //! `{data_dir}/{instance}/log.db` + `log-blobs/` using a fresh
@@ -33,7 +33,7 @@
 //!
 //! Bundle assembly (what `rove-log-cli bundle` does today) stays
 //! outside this module for now — it spans multiple subsystems
-//! (source blob lookup via rove-code, record fetch here) and will
+//! (source blob lookup via rove-files, record fetch here) and will
 //! become a ctl-side operation once the log-server also exposes the
 //! code-source route. Layering order: compose from the client side.
 
@@ -67,7 +67,7 @@ fn validateInstanceId(id: []const u8) Error!void {
     }
 }
 
-/// Stack-local instance context. Like `code_server.InstanceCtx`,
+/// Stack-local instance context. Like `files_server.InstanceCtx`,
 /// this MUST be constructed in place (not returned by value) because
 /// `log_mod.LogStore` holds a `BlobStore` vtable pointing at
 /// `&self.blob_backend` — moving the struct would leave that

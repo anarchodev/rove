@@ -16,7 +16,7 @@ const std = @import("std");
 const kv = @import("rove-kv");
 const blob_mod = @import("rove-blob");
 const log_mod = @import("rove-log");
-const code_mod = @import("rove-code");
+const files_mod = @import("rove-files");
 const tape_mod = @import("rove-tape");
 
 const Cmd = enum { list, show, count, bundle };
@@ -195,7 +195,7 @@ fn runCount(allocator: std.mem.Allocator, store: *log_mod.LogStore) !void {
 
 // No-op compile hook — the bundle reader never compiles anything; it
 // only calls `loadDeployment` on the code store. Providing a stub lets
-// us reuse `CodeStore.init` without pulling in the qjs build.
+// us reuse `FileStore.init` without pulling in the qjs build.
 fn noopCompile(
     _: ?*anyopaque,
     _: []const u8,
@@ -230,7 +230,7 @@ fn noopCompile(
 //
 // `entry_source_hash` is the content-addressed source blob the browser
 // must fetch to run the handler. For M1 that's the `DEFAULT_HANDLER_PATH`
-// entry of the deployment manifest in `code.db`; multi-module support
+// entry of the deployment manifest in `files.db`; multi-module support
 // will fill `modules` from the module tape later.
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
@@ -344,34 +344,34 @@ fn runBundle(
     };
     defer rec.deinit(allocator);
 
-    // Open the tenant's code.db read-only to resolve the deployment's
+    // Open the tenant's files.db read-only to resolve the deployment's
     // entry source hash. Optional — if it fails (tenant has no code
     // store yet, or deployment was GC'd) we emit null and let the
     // browser fall back to whatever source cache it has.
-    const code_db_path = try std.fmt.allocPrintSentinel(
+    const files_db_path = try std.fmt.allocPrintSentinel(
         allocator,
-        "{s}/{s}/code.db",
+        "{s}/{s}/files.db",
         .{ data_dir, instance },
         0,
     );
-    defer allocator.free(code_db_path);
-    const code_blob_dir = try std.fmt.allocPrint(
+    defer allocator.free(files_db_path);
+    const files_blob_dir = try std.fmt.allocPrint(
         allocator,
-        "{s}/{s}/code-blobs",
+        "{s}/{s}/file-blobs",
         .{ data_dir, instance },
     );
-    defer allocator.free(code_blob_dir);
+    defer allocator.free(files_blob_dir);
 
     var entry_source_hash_buf: [64]u8 = undefined;
     var entry_source_hash: ?[]const u8 = null;
-    const code_kv = kv.KvStore.openReadOnly(allocator, code_db_path) catch null;
-    defer if (code_kv) |ck| ck.close();
+    const files_kv = kv.KvStore.openReadOnly(allocator, files_db_path) catch null;
+    defer if (files_kv) |ck| ck.close();
 
-    if (code_kv) |ck| {
-        var code_blob = try blob_mod.FilesystemBlobStore.open(allocator, code_blob_dir);
-        defer code_blob.deinit();
-        var code_store = code_mod.CodeStore.init(allocator, ck, code_blob.blobStore(), noopCompile, null);
-        var manifest = code_store.loadDeployment(rec.deployment_id) catch null;
+    if (files_kv) |ck| {
+        var files_blob = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
+        defer files_blob.deinit();
+        var files_store = files_mod.FileStore.init(allocator, ck, files_blob.blobStore(), noopCompile, null);
+        var manifest = files_store.loadDeployment(rec.deployment_id) catch null;
         if (manifest) |*m| {
             defer m.deinit();
             for (m.entries) |e| {

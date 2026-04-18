@@ -1,5 +1,5 @@
-//! rove-code-server — per-instance code operations, designed to run
-//! off the worker's h2 thread.
+//! rove-files-server — per-instance file/deploy operations, designed
+//! to run off the worker's h2 thread.
 //!
 //! ## Why this module exists
 //!
@@ -12,16 +12,16 @@
 //!
 //! The solution is an "infrastructure plane" subsystem: a separate
 //! thread (later, possibly a separate process) that owns all the
-//! compile + code-store I/O, so the h2 thread only handles
+//! compile + file-store I/O, so the h2 thread only handles
 //! HTTP/2 framing + forwarding. In the MVP everything runs in the
 //! same process; the worker calls this module via a thin proxy layer
-//! whose wire contract is `/_system/code/{instance_id}/{op}`.
+//! whose wire contract is `/_system/files/{instance_id}/{op}`.
 //!
 //! ## What this module is (today)
 //!
 //! Just the operation functions. No thread, no h2, no socket. Each
 //! function opens its own per-instance `{data_dir}/{instance_id}/
-//! {code.db, code-blobs/}` pair, does one operation, and closes. This
+//! {files.db, file-blobs/}` pair, does one operation, and closes. This
 //! keeps the module trivially testable in isolation — later slices
 //! wrap these in a job queue + thread, then in an h2 server listening
 //! on a loopback socket.
@@ -29,8 +29,8 @@
 //! ## Interaction with running workers
 //!
 //! SQLite opens with NOMUTEX, meaning one connection per thread. The
-//! worker already holds long-running connections to `{code.db,
-//! code-blobs/}` via its `TenantCode` cache. When this module opens
+//! worker already holds long-running connections to `{files.db,
+//! file-blobs/}` via its `TenantFiles` cache. When this module opens
 //! a second connection on a different thread:
 //!
 //!   - Reads are always safe (WAL).
@@ -47,7 +47,7 @@
 const std = @import("std");
 const kv_mod = @import("rove-kv");
 const blob_mod = @import("rove-blob");
-const code_mod = @import("rove-code");
+const files_mod = @import("rove-files");
 const qjs = @import("rove-qjs");
 
 pub const thread = @import("thread.zig");
@@ -81,14 +81,14 @@ fn validateInstanceId(id: []const u8) Error!void {
 
 /// Helper context that owns per-call store handles. The CALLER must
 /// allocate this on its own stack (NOT via struct-return from a
-/// function), because `code_mod.CodeStore` stores a `BlobStore`
+/// function), because `files_mod.FileStore` stores a `BlobStore`
 /// vtable that points at `&self.blob_backend` — moving the struct
 /// would leave that pointer dangling.
 const InstanceCtx = struct {
     allocator: std.mem.Allocator,
-    code_kv: *kv_mod.KvStore,
+    files_kv: *kv_mod.KvStore,
     blob_backend: blob_mod.FilesystemBlobStore,
-    store: code_mod.CodeStore,
+    store: files_mod.FileStore,
 
     /// In-place construction. Must be called on a stack-local
     /// `InstanceCtx` — see struct doc for why.
@@ -97,7 +97,7 @@ const InstanceCtx = struct {
         allocator: std.mem.Allocator,
         data_dir: []const u8,
         instance_id: []const u8,
-        compile: code_mod.CompileFn,
+        compile: files_mod.CompileFn,
         compile_ctx: ?*anyopaque,
     ) Error!void {
         try validateInstanceId(instance_id);
@@ -114,36 +114,36 @@ const InstanceCtx = struct {
         defer allocator.free(inst_dir);
         std.fs.cwd().makePath(inst_dir) catch return Error.Io;
 
-        const code_db_path = std.fmt.allocPrintSentinel(
+        const files_db_path = std.fmt.allocPrintSentinel(
             allocator,
-            "{s}/{s}/code.db",
+            "{s}/{s}/files.db",
             .{ data_dir, instance_id },
             0,
         ) catch return Error.OutOfMemory;
-        defer allocator.free(code_db_path);
+        defer allocator.free(files_db_path);
 
-        const code_blob_dir = std.fmt.allocPrint(
+        const files_blob_dir = std.fmt.allocPrint(
             allocator,
-            "{s}/{s}/code-blobs",
+            "{s}/{s}/file-blobs",
             .{ data_dir, instance_id },
         ) catch return Error.OutOfMemory;
-        defer allocator.free(code_blob_dir);
+        defer allocator.free(files_blob_dir);
 
         self.allocator = allocator;
-        self.code_kv = kv_mod.KvStore.open(allocator, code_db_path) catch
+        self.files_kv = kv_mod.KvStore.open(allocator, files_db_path) catch
             return Error.Kv;
-        errdefer self.code_kv.close();
+        errdefer self.files_kv.close();
 
-        self.blob_backend = blob_mod.FilesystemBlobStore.open(allocator, code_blob_dir) catch
+        self.blob_backend = blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir) catch
             return Error.Blob;
         errdefer self.blob_backend.deinit();
 
         // Take the BlobStore vtable ONLY AFTER `self.blob_backend` is
         // at its final address (inside `self`). That's the whole reason
         // this struct uses in-place init instead of return-by-value.
-        self.store = code_mod.CodeStore.init(
+        self.store = files_mod.FileStore.init(
             allocator,
-            self.code_kv,
+            self.files_kv,
             self.blob_backend.blobStore(),
             compile,
             compile_ctx,
@@ -152,7 +152,7 @@ const InstanceCtx = struct {
 
     fn deinit(self: *InstanceCtx) void {
         self.blob_backend.deinit();
-        self.code_kv.close();
+        self.files_kv.close();
     }
 };
 
@@ -219,7 +219,7 @@ pub fn deploy(
     data_dir: []const u8,
     instance_id: []const u8,
 ) Error!u64 {
-    // Deploy doesn't actually compile, but CodeStore.init demands a
+    // Deploy doesn't actually compile, but FileStore.init demands a
     // non-null compile hook. Give it a stub that errors out — if it
     // ever gets called during deploy, something's wrong.
     var h: InstanceCtx = undefined;
@@ -240,14 +240,14 @@ pub fn getSourceByHash(
 ) Error![]u8 {
     try validateInstanceId(instance_id);
 
-    const code_blob_dir = std.fmt.allocPrint(
+    const files_blob_dir = std.fmt.allocPrint(
         allocator,
-        "{s}/{s}/code-blobs",
+        "{s}/{s}/file-blobs",
         .{ data_dir, instance_id },
     ) catch return Error.OutOfMemory;
-    defer allocator.free(code_blob_dir);
+    defer allocator.free(files_blob_dir);
 
-    var blob_backend = blob_mod.FilesystemBlobStore.open(allocator, code_blob_dir) catch
+    var blob_backend = blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir) catch
         return Error.Blob;
     defer blob_backend.deinit();
 
@@ -263,7 +263,7 @@ pub fn loadDeployment(
     data_dir: []const u8,
     instance_id: []const u8,
     deployment_id: u64,
-) Error!code_mod.CodeStore.Manifest {
+) Error!files_mod.FileStore.Manifest {
     var h: InstanceCtx = undefined;
     try h.init(allocator, data_dir, instance_id, stubCompile, null);
     defer h.deinit();

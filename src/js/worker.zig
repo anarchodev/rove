@@ -37,9 +37,9 @@
 //! exists.
 //!
 //! M1 scope: one hard-coded handler source per worker. Reading the
-//! source from a code-server, route tables, and per-route bytecode
+//! source from a files-server, route tables, and per-route bytecode
 //! caching land once the worker's code-client is designed alongside
-//! the code-server's HTTP/2 surface.
+//! the files-server's HTTP/2 surface.
 //!
 //! The dispatch systems are plain functions, not methods — they take
 //! `*Worker(...)` and are called by the user's poll loop between
@@ -54,7 +54,7 @@ const h2 = @import("rove-h2");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("rove-kv");
 const blob_mod = @import("rove-blob");
-const code_mod = @import("rove-code");
+const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
@@ -146,19 +146,19 @@ pub const DEFAULT_REFRESH_INTERVAL_NS: i64 = 2 * std.time.ns_per_s;
 /// BlobStore, and cached bytecode for the tenant's active handler.
 /// Refreshed periodically via `refreshDeployments` when the tenant's
 /// `deployment/current` advances.
-pub const TenantCode = struct {
+pub const TenantFiles = struct {
     allocator: std.mem.Allocator,
     /// Owned copy of the instance id. Used as the key in the worker's
-    /// `tenant_codes` map; owning it here keeps that map's lifetime
+    /// `tenant_files_map` map; owning it here keeps that map's lifetime
     /// self-contained.
     instance_id: []u8,
-    /// Owned tenant code index (SQLite at `{inst.dir}/code.db`).
-    code_kv: *kv_mod.KvStore,
-    /// Owned blob backend at `{inst.dir}/code-blobs/`.
+    /// Owned tenant code index (SQLite at `{inst.dir}/files.db`).
+    files_kv: *kv_mod.KvStore,
+    /// Owned blob backend at `{inst.dir}/file-blobs/`.
     blob_backend: blob_mod.FilesystemBlobStore,
-    /// rove-code wrapper over `code_kv` + `blob_backend`. Compile hook
+    /// rove-files wrapper over `files_kv` + `blob_backend`. Compile hook
     /// is a stub — the worker only reads, never uploads.
-    store: code_mod.CodeStore,
+    store: files_mod.FileStore,
     /// Deployment id we last loaded. `0` = no deployment observed yet.
     current_deployment_id: u64,
     /// All handler bytecodes from the active deployment, keyed by the
@@ -176,7 +176,7 @@ pub const TenantCode = struct {
 };
 
 /// Worker never uploads code, so the `CompileFn` it passes into
-/// `CodeStore.init` just errors out — making accidental put-source
+/// `FileStore.init` just errors out — making accidental put-source
 /// calls impossible to ignore.
 fn stubCompile(
     _: ?*anyopaque,
@@ -187,7 +187,7 @@ fn stubCompile(
     return error.CompileNotSupportedOnWorker;
 }
 
-/// Per-tenant log state held by the worker. Mirrors `TenantCode`'s
+/// Per-tenant log state held by the worker. Mirrors `TenantFiles`'s
 /// shape: owns its KvStore + BlobStore, wraps a rove-log `LogStore`,
 /// is opened eagerly in `Worker.create` and closed in `Worker.destroy`.
 ///
@@ -241,10 +241,10 @@ pub const WorkerConfig = struct {
     /// How often `refreshDeployments` re-reads `deployment/current`
     /// per tenant.
     refresh_interval_ns: i64 = DEFAULT_REFRESH_INTERVAL_NS,
-    /// Address of the in-process rove-code-server thread. When set,
+    /// Address of the in-process rove-files-server thread. When set,
     /// the worker opens an HTTP/2 client connection at startup and
-    /// proxies any request whose path starts with `/_system/code/`
-    /// to this address. When null, `/_system/code/*` requests return
+    /// proxies any request whose path starts with `/_system/files/`
+    /// to this address. When null, `/_system/files/*` requests return
     /// 503 (feature disabled).
     code_addr: ?std.net.Address = null,
     /// Address of the in-process rove-log-server thread. Mirror of
@@ -356,8 +356,8 @@ pub fn Worker(comptime opts: Options) type {
         /// Uses the same row as every other h2 stream collection so
         /// moves in and out preserve every component.
         raft_pending: StreamColl,
-        /// `/_system/code/*` proxy state. Targets the in-process
-        /// rove-code-server thread.
+        /// `/_system/files/*` proxy state. Targets the in-process
+        /// rove-files-server thread.
         code_proxy: ProxySubsystem(StreamColl),
         /// `/_system/log/*` proxy state. Targets the in-process
         /// rove-log-server thread.
@@ -366,11 +366,11 @@ pub fn Worker(comptime opts: Options) type {
         tenant: *tenant_mod.Tenant,
         raft: *kv_mod.RaftNode,
         /// Per-tenant code state. Keyed by instance id (the string the
-        /// `TenantCode` owns internally — the map slot's key points at
+        /// `TenantFiles` owns internally — the map slot's key points at
         /// that allocation, so lifetimes line up).
-        tenant_codes: std.StringHashMapUnmanaged(*TenantCode),
+        tenant_files_map: std.StringHashMapUnmanaged(*TenantFiles),
         /// Per-tenant log state. Same lifetime + key-stability story
-        /// as `tenant_codes`. Opened eagerly alongside it. The worker's
+        /// as `tenant_files_map`. Opened eagerly alongside it. The worker's
         /// dispatch path appends LogRecords into each tenant's
         /// `store.buffer`; `flushLogs` drains and proposes batches.
         tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
@@ -391,9 +391,9 @@ pub fn Worker(comptime opts: Options) type {
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
-        /// `TenantCode` for every instance currently registered with
+        /// `TenantFiles` for every instance currently registered with
         /// the tenant. Tenants that have no deployment yet get a
-        /// `TenantCode` with `handler_bytecode = null` — requests
+        /// `TenantFiles` with `handler_bytecode = null` — requests
         /// hitting them return 503 until a deploy lands.
         ///
         /// All tenants must exist BEFORE the raft thread starts, so
@@ -434,7 +434,7 @@ pub fn Worker(comptime opts: Options) type {
                 .dispatcher = try Dispatcher.init(allocator),
                 .tenant = config.tenant,
                 .raft = config.raft,
-                .tenant_codes = .empty,
+                .tenant_files_map = .empty,
                 .tenant_logs = .empty,
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
@@ -445,7 +445,7 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
             errdefer self.log_proxy.deinit();
-            errdefer destroyAllTenantCodes(self);
+            errdefer destroyAllTenantFiles(self);
             errdefer destroyAllTenantLogs(self);
 
             reg.registerCollection(&self.raft_pending);
@@ -462,8 +462,8 @@ pub fn Worker(comptime opts: Options) type {
             var it = config.tenant.instances.iterator();
             while (it.next()) |entry| {
                 const inst = entry.value_ptr.*;
-                const tc = try openTenantCode(self, inst);
-                try self.tenant_codes.put(self.allocator, tc.instance_id, tc);
+                const tc = try openTenantFiles(self, inst);
+                try self.tenant_files_map.put(self.allocator, tc.instance_id, tc);
                 const tl = try openTenantLog(self, inst, worker_id);
                 try self.tenant_logs.put(self.allocator, tl.instance_id, tl);
             }
@@ -476,8 +476,8 @@ pub fn Worker(comptime opts: Options) type {
             self.penalty_box.deinit();
             destroyAllTenantLogs(self);
             self.tenant_logs.deinit(allocator);
-            destroyAllTenantCodes(self);
-            self.tenant_codes.deinit(allocator);
+            destroyAllTenantFiles(self);
+            self.tenant_files_map.deinit(allocator);
             self.log_proxy.deinit();
             self.code_proxy.deinit();
             self.raft_pending.deinit();
@@ -505,13 +505,13 @@ pub fn Worker(comptime opts: Options) type {
 
 // ── Per-tenant code loading ───────────────────────────────────────────
 //
-// These helpers open a tenant's code store (`{inst.dir}/code.db` +
-// `{inst.dir}/code-blobs/`) and load the active handler bytecode.
+// These helpers open a tenant's code store (`{inst.dir}/files.db` +
+// `{inst.dir}/file-blobs/`) and load the active handler bytecode.
 // Called eagerly during `Worker.create` for every registered instance,
 // and by `refreshDeployments` when a tenant's `deployment/current`
 // advances.
 
-/// Open (or re-use) a tenant code state. Allocates a `*TenantCode`
+/// Open (or re-use) a tenant code state. Allocates a `*TenantFiles`
 /// and attempts to load the current deployment's handler bytecode.
 /// If the tenant has no deployment yet, the `handler_bytecode` stays
 /// `null` and requests against this tenant return 503.
@@ -523,13 +523,13 @@ pub fn Worker(comptime opts: Options) type {
 /// tenant to a pre-crash-consistent state before the worker starts
 /// serving requests. Safe on a clean restart: `kv_undo` is empty and
 /// `recoverOrphans` is a no-op.
-fn openTenantCode(worker: anytype, inst: *const tenant_mod.Instance) !*TenantCode {
+fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFiles {
     const allocator = worker.allocator;
 
     // Startup orphan sweep on the tenant's APP store. This belongs
     // here (not in rove-tenant) because it's specifically about the
     // raft-vs-local-commit durability pattern that rove-js drives —
-    // rove-tenant just opens the store. A future code-server or
+    // rove-tenant just opens the store. A future files-server or
     // log-server with its own durability layer would run its own
     // sweep against its own stores.
     inst.kv.recoverOrphans(0) catch |err| {
@@ -539,45 +539,45 @@ fn openTenantCode(worker: anytype, inst: *const tenant_mod.Instance) !*TenantCod
         );
     };
 
-    const code_db_path = try std.fmt.allocPrintSentinel(
+    const files_db_path = try std.fmt.allocPrintSentinel(
         allocator,
-        "{s}/code.db",
+        "{s}/files.db",
         .{inst.dir},
         0,
     );
-    defer allocator.free(code_db_path);
+    defer allocator.free(files_db_path);
 
-    const code_blob_dir = try std.fmt.allocPrint(
+    const files_blob_dir = try std.fmt.allocPrint(
         allocator,
-        "{s}/code-blobs",
+        "{s}/file-blobs",
         .{inst.dir},
     );
-    defer allocator.free(code_blob_dir);
+    defer allocator.free(files_blob_dir);
 
-    const code_kv = try kv_mod.KvStore.open(allocator, code_db_path);
-    errdefer code_kv.close();
+    const files_kv = try kv_mod.KvStore.open(allocator, files_db_path);
+    errdefer files_kv.close();
 
-    var blob_backend = try blob_mod.FilesystemBlobStore.open(allocator, code_blob_dir);
+    var blob_backend = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
     errdefer blob_backend.deinit();
 
     const id_copy = try allocator.dupe(u8, inst.id);
     errdefer allocator.free(id_copy);
 
-    const tc = try allocator.create(TenantCode);
+    const tc = try allocator.create(TenantFiles);
     errdefer allocator.destroy(tc);
     tc.* = .{
         .allocator = allocator,
         .instance_id = id_copy,
-        .code_kv = code_kv,
+        .files_kv = files_kv,
         .blob_backend = blob_backend,
         .store = undefined, // filled after we have a stable `tc` pointer
         .current_deployment_id = 0,
         .bytecodes = .empty,
         .next_refresh_ns = 0,
     };
-    tc.store = code_mod.CodeStore.init(
+    tc.store = files_mod.FileStore.init(
         allocator,
-        tc.code_kv,
+        tc.files_kv,
         tc.blob_backend.blobStore(),
         stubCompile,
         null,
@@ -600,23 +600,23 @@ fn openTenantCode(worker: anytype, inst: *const tenant_mod.Instance) !*TenantCod
     return tc;
 }
 
-fn freeTenantCode(allocator: std.mem.Allocator, tc: *TenantCode) void {
+fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
     freeBytecodes(tc);
     tc.blob_backend.deinit();
-    tc.code_kv.close();
+    tc.files_kv.close();
     allocator.free(tc.instance_id);
     allocator.destroy(tc);
 }
 
-fn destroyAllTenantCodes(worker: anytype) void {
-    var it = worker.tenant_codes.iterator();
-    while (it.next()) |entry| freeTenantCode(worker.allocator, entry.value_ptr.*);
-    worker.tenant_codes.clearRetainingCapacity();
+fn destroyAllTenantFiles(worker: anytype) void {
+    var it = worker.tenant_files_map.iterator();
+    while (it.next()) |entry| freeTenantFiles(worker.allocator, entry.value_ptr.*);
+    worker.tenant_files_map.clearRetainingCapacity();
 }
 
 // ── Per-tenant log loading ────────────────────────────────────────────
 //
-// Mirrors the TenantCode helpers above. Each tenant gets a `log.db` +
+// Mirrors the TenantFiles helpers above. Each tenant gets a `log.db` +
 // `log-blobs/` directory under its instance dir, and a LogStore that
 // wraps both. Opened eagerly during `Worker.create`; freed during
 // `Worker.destroy`. Per-record append happens during dispatchPending;
@@ -928,7 +928,7 @@ pub fn flushLogs(worker: anytype) !void {
 /// Free every key + bytecode value in `tc.bytecodes` and clear the map.
 /// Used both on teardown and before atomically swapping in a newly
 /// loaded deployment.
-fn freeBytecodes(tc: *TenantCode) void {
+fn freeBytecodes(tc: *TenantFiles) void {
     var it = tc.bytecodes.iterator();
     while (it.next()) |e| {
         tc.allocator.free(e.key_ptr.*);
@@ -942,7 +942,7 @@ fn freeBytecodes(tc: *TenantCode) void {
 /// bytecode blob, and atomically swap the tenant's `bytecodes` map.
 /// Returns `error.NoDeployment` if no deploy has been made yet — soft
 /// failure the caller treats as "leave the map empty".
-fn reloadAllBytecodes(tc: *TenantCode) !void {
+fn reloadAllBytecodes(tc: *TenantFiles) !void {
     var manifest = tc.store.loadCurrentDeployment() catch |err| switch (err) {
         error.NotFound => return error.NoDeployment,
         else => return err,
@@ -988,7 +988,7 @@ fn reloadAllBytecodes(tc: *TenantCode) !void {
 /// tick. Called from the main poll loop alongside `dispatchPending`.
 pub fn refreshDeployments(worker: anytype) !void {
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var it = worker.tenant_codes.iterator();
+    var it = worker.tenant_files_map.iterator();
     while (it.next()) |entry| {
         const tc = entry.value_ptr.*;
         if (now_ns < tc.next_refresh_ns) continue;
@@ -996,7 +996,7 @@ pub fn refreshDeployments(worker: anytype) !void {
 
         // Peek at deployment/current without loading the full manifest —
         // if the id hasn't changed we skip the work.
-        const cur_bytes = tc.code_kv.get("deployment/current") catch |err| switch (err) {
+        const cur_bytes = tc.files_kv.get("deployment/current") catch |err| switch (err) {
             error.NotFound => continue, // still no deployment
             else => {
                 std.log.warn(
@@ -1223,7 +1223,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // handler (see memory/project_admin_ui_plan.md). Callers
             // should now target `{id}.api.loop46.com/kv` etc.
             //
-            // `/_system/log/*` and `/_system/code/*` remain native:
+            // `/_system/log/*` and `/_system/files/*` remain native:
             //   - log queries poll frequently for live-tail and would
             //     meta-log themselves through the JS handler.
             //   - code uploads are byte-heavy and fit the existing
@@ -1369,7 +1369,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             scope_inst = r.?;
         }
 
-        const tc = worker.tenant_codes.get(handler_inst.id) orelse {
+        const tc = worker.tenant_files_map.get(handler_inst.id) orelse {
             std.log.warn("rove-js: tenant {s} has no code state", .{handler_inst.id});
             try setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
             captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
@@ -1681,10 +1681,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     return processed;
 }
 
-// ── /_system/code/* proxy ─────────────────────────────────────────────
+// ── /_system/files/* proxy ─────────────────────────────────────────────
 //
 // The worker runs both a server-side h2 (accepting user traffic) and
-// a client-side h2 (forwarding to the in-process code-server thread)
+// a client-side h2 (forwarding to the in-process files-server thread)
 // on the same `H2` instance — `H2(.{ .client = true })` makes both
 // sets of collections live together. The proxy systems below mirror
 // shift-h2's `examples/h2c_proxy.c`:
@@ -1758,7 +1758,7 @@ pub fn ingestProxyConnects(worker: anytype) !void {
                 .code => {
                     worker.code_proxy.session = sess.entity;
                     worker.code_proxy.connecting = false;
-                    std.log.info("rove-js: code server connected (session={d})", .{sess.entity.index});
+                    std.log.info("rove-js: files-server connected (session={d})", .{sess.entity.index});
                 },
                 .log => {
                     worker.log_proxy.session = sess.entity;
@@ -2398,7 +2398,7 @@ fn hostOnly(authority: []const u8) []const u8 {
 /// which is exactly what the admin handler needs — one JS module
 /// does its own path-based dispatch.
 fn findBytecode(
-    tc: *const TenantCode,
+    tc: *const TenantFiles,
     module_base: []const u8,
     allocator: std.mem.Allocator,
 ) !?[]u8 {
@@ -2493,13 +2493,13 @@ fn extractBearerToken(hdrs: h2.ReqHeaders) ?[]const u8 {
 
 const testing = std.testing;
 
-test "openTenantCode runs the orphan sweep on startup" {
+test "openTenantFiles runs the orphan sweep on startup" {
     // Simulates the crash recovery scenario:
     //   1. A previous worker run did `beginTrackedImmediate` + put + commit
     //      (the local SQLite txn is durable, the kv_undo row exists).
     //   2. The previous worker crashed before calling commitTxn — so the
     //      kv_undo row never got dropped.
-    //   3. New worker starts, openTenantCode runs, recoverOrphans(0)
+    //   3. New worker starts, openTenantFiles runs, recoverOrphans(0)
     //      walks kv_undo and rolls back the orphan write.
     //
     // This is the durability hole #34 was tracking. Without the sweep,
@@ -2539,11 +2539,11 @@ test "openTenantCode runs the orphan sweep on startup" {
     const before = try inst.kv.get("orphan-key");
     allocator.free(before);
 
-    // Simulate worker startup: openTenantCode runs the sweep.
+    // Simulate worker startup: openTenantFiles runs the sweep.
     const FakeWorker = struct { allocator: std.mem.Allocator };
     var fake = FakeWorker{ .allocator = allocator };
-    const tc = try openTenantCode(&fake, inst);
-    defer freeTenantCode(allocator, tc);
+    const tc = try openTenantFiles(&fake, inst);
+    defer freeTenantFiles(allocator, tc);
 
     // After the sweep, the orphan write is gone.
     try testing.expectError(error.NotFound, inst.kv.get("orphan-key"));
@@ -2551,7 +2551,7 @@ test "openTenantCode runs the orphan sweep on startup" {
 
 test "commitTxn drops the undo row so the next sweep is a no-op" {
     // Inverse of the first test: a write that DID get the commitTxn
-    // call should survive across a Worker.create / openTenantCode
+    // call should survive across a Worker.create / openTenantFiles
     // cycle. Proves the happy-path GC actually clears the undo row.
     const allocator = testing.allocator;
     const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
@@ -2582,8 +2582,8 @@ test "commitTxn drops the undo row so the next sweep is a no-op" {
     // Worker startup runs the sweep; should NOT touch durable-key.
     const FakeWorker = struct { allocator: std.mem.Allocator };
     var fake = FakeWorker{ .allocator = allocator };
-    const tc = try openTenantCode(&fake, inst);
-    defer freeTenantCode(allocator, tc);
+    const tc = try openTenantFiles(&fake, inst);
+    defer freeTenantFiles(allocator, tc);
 
     const v = try inst.kv.get("durable-key");
     defer allocator.free(v);

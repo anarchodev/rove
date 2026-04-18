@@ -451,7 +451,7 @@ pub fn installRequest(
 
 /// Back-compat wrapper: install everything at once. Used by tests and
 /// by any caller that doesn't have a pre-built snapshot to restore
-/// from (e.g. the rove-code compile-on-upload path that just needs a
+/// from (e.g. the rove-files compile-on-upload path that just needs a
 /// throwaway context to compile JS to bytecode).
 pub fn install(
     ctx: *c.JSContext,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for the rove-code-server background thread.
+# End-to-end smoke test for the rove-files-server background thread.
 #
-# Spawns the `code-server-standalone` binary, reads the bound port off
+# Spawns the `files-server-standalone` binary, reads the bound port off
 # stdout, then drives upload / deploy / source / error paths via curl.
 #
 # Exits non-zero on any mismatch.
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/tmp/rove-cs-smoke}"
-BIN="${BIN:-./zig-out/bin/code-server-standalone}"
+BIN="${BIN:-./zig-out/bin/files-server-standalone}"
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN not found — run 'zig build install' first" >&2
@@ -29,11 +29,11 @@ for _ in $(seq 1 20); do
 done
 PORT=$(grep -oE 'port [0-9]+' /tmp/cs-smoke.out | awk '{print $2}')
 if [[ -z "${PORT:-}" ]]; then
-    echo "FAIL: code-server did not bind a port" >&2
+    echo "FAIL: files-server did not bind a port" >&2
     cat /tmp/cs-smoke.out >&2
     exit 1
 fi
-echo "code-server listening on port $PORT"
+echo "files-server listening on port $PORT"
 
 expect() {
     local label="$1" expected="$2" actual="$3"
@@ -73,7 +73,7 @@ esac
 # blob dir holds both the source and the bytecode — only the source
 # matches plain-text grep.)
 SRC_BLOB=""
-for f in "$DATA_DIR"/acme/code-blobs/*; do
+for f in "$DATA_DIR"/acme/file-blobs/*; do
     if grep -q "hi from smoke" "$f" 2>/dev/null; then
         SRC_BLOB="$(basename "$f")"
         break
@@ -105,4 +105,4 @@ code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     "http://127.0.0.1:$PORT/unknown")
 expect "GET /unknown" 404 "$code"
 
-echo "PASS code-server smoke"
+echo "PASS files-server smoke"

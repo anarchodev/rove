@@ -83,7 +83,7 @@ pub const LogRecord = struct {
     /// Combined identifier: upper 16 bits = worker_id, lower 48 = seq.
     request_id: u64,
     /// The deployment that was active when this request ran.
-    /// Pulled from `TenantCode.current_deployment_id`. Replay needs
+    /// Pulled from `TenantFiles.current_deployment_id`. Replay needs
     /// this to load the exact bytecode the handler used.
     deployment_id: u64,
     received_ns: i64,

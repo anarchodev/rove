@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for the worker's `/_system/code/*` proxy.
+# End-to-end smoke test for the worker's `/_system/files/*` proxy.
 #
-# Starts a js-worker (which spawns the in-process rove-code-server
+# Starts a js-worker (which spawns the in-process rove-files-server
 # thread at startup), then drives:
-#   - POST /_system/code/acme/upload
-#   - POST /_system/code/acme/deploy
+#   - POST /_system/files/acme/upload
+#   - POST /_system/files/acme/deploy
 #   - GET /_system/foo         → 501 (reserved-but-unimplemented)
 #   - GET / (unrelated JS handler, proves normal traffic still works)
 #
-# Verifies that /_system/code/* requests are forwarded through the
+# Verifies that /_system/files/* requests are forwarded through the
 # rove-h2 client side of the worker to the code thread, the code
 # thread's response is mapped back onto the original server entity,
 # and the user observes the code-thread's status + body.
@@ -55,7 +55,7 @@ expect() {
 }
 
 # Upload a file under the existing `acme` tenant. The worker strips
-# the `/_system/code` prefix and proxies the rest (`/acme/upload`)
+# the `/_system/files` prefix and proxies the rest (`/acme/upload`)
 # to the code thread.
 code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     -X POST \
@@ -63,7 +63,7 @@ code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     -H "X-Rove-Path: smoke/index.mjs" \
     -H "Authorization: Bearer $ROVE_TOKEN" \
     --data-binary 'export function handler() { return "smoke"; }' \
-    "http://$HTTP_ADDR/_system/code/acme/upload")
+    "http://$HTTP_ADDR/_system/files/acme/upload")
 expect "proxy upload /acme" 204 "$code"
 
 # Missing token → 401 (auth gate).
@@ -72,7 +72,7 @@ code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     -H "Host: acme.test" \
     -H "X-Rove-Path: smoke/index.mjs" \
     --data-binary 'export function handler() { return "smoke"; }' \
-    "http://$HTTP_ADDR/_system/code/acme/upload")
+    "http://$HTTP_ADDR/_system/files/acme/upload")
 expect "proxy upload /acme (no token)" 401 "$code"
 
 # Wrong token → 401.
@@ -82,7 +82,7 @@ code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     -H "X-Rove-Path: smoke/index.mjs" \
     -H "Authorization: Bearer bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
     --data-binary 'export function handler() { return "smoke"; }' \
-    "http://$HTTP_ADDR/_system/code/acme/upload")
+    "http://$HTTP_ADDR/_system/files/acme/upload")
 expect "proxy upload /acme (wrong token)" 401 "$code"
 
 # Deploy. The body is the new deployment id — acme already had
@@ -91,7 +91,7 @@ body=$(curl -s --http2-prior-knowledge \
     -X POST \
     -H "Host: acme.test" \
     -H "Authorization: Bearer $ROVE_TOKEN" \
-    "http://$HTTP_ADDR/_system/code/acme/deploy" | tr -d '\n')
+    "http://$HTTP_ADDR/_system/files/acme/deploy" | tr -d '\n')
 case "$body" in
     [2-9]*|[1-9][0-9]*)
         echo "ok  proxy deploy /acme: id=$body"
@@ -113,7 +113,7 @@ if ! grep -q "acme hit count" /tmp/proxy-home.out; then
     exit 1
 fi
 
-# /_system/ path that isn't /_system/code/* → 501 stub.
+# /_system/ path that isn't /_system/files/* → 501 stub.
 code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $ROVE_TOKEN" \
     "http://$HTTP_ADDR/_system/foo/acme/x")

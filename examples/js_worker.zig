@@ -12,7 +12,7 @@
 //!     committedSeq/faultedSeq are atomics)
 //!   - the single raft-owned `ApplyCtx` (only the raft thread touches
 //!     its cached stores; workers never do)
-//!   - the code-server + log-server subsystem threads
+//!   - the files-server + log-server subsystem threads
 //!
 //! Per-worker (thread-local):
 //!   - rove `Registry`, rove-io `Io`, rove-h2 `H2`
@@ -29,8 +29,8 @@
 //!     raft.log.db                  shared raft log (node-scoped)
 //!     acme/
 //!       app.db                     acme's handler state
-//!       code.db                    acme's code index (deployments)
-//!       code-blobs/                acme's source + bytecode blobs
+//!       files.db                    acme's code index (deployments)
+//!       file-blobs/                acme's source + bytecode blobs
 //!       log.db                     acme's request log index
 //!       log-blobs/                 acme's request log blobs
 //!     globex/
@@ -54,8 +54,8 @@ const rove = @import("rove");
 const rjs = @import("rove-js");
 const kv = @import("rove-kv");
 const blob_mod = @import("rove-blob");
-const code_mod = @import("rove-code");
-const code_server = @import("rove-code-server");
+const files_mod = @import("rove-files");
+const files_server = @import("rove-files-server");
 const log_server = @import("rove-log-server");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
@@ -637,7 +637,7 @@ fn workerMain(args: *WorkerCtx) !void {
         };
 
         // Code-server proxy: maintain the upstream session, forward
-        // any parked /_system/code/* requests, map upstream responses
+        // any parked /_system/files/* requests, map upstream responses
         // back onto their server-side peers. Order matters — ingest
         // before flush (so a connection that just came up is usable
         // in the same tick), and drain after flush (so responses
@@ -865,7 +865,7 @@ pub fn main() !void {
     // the fd table.
     const subsystem_max_connections: u32 = @as(u32, num_workers) + 4;
 
-    const cs_handle = try code_server.thread.spawn(allocator, cli.data_dir, subsystem_max_connections);
+    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, subsystem_max_connections);
     defer cs_handle.shutdown();
     const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
 
@@ -1019,7 +1019,7 @@ pub fn main() !void {
 
     // Skip the teardown chain. The raft thread is detached and still
     // inside `node.run()`; running `raft_node.deinit()` out from under
-    // it would segfault. Subsystem threads (code-server, log-server)
+    // it would segfault. Subsystem threads (files-server, log-server)
     // would also need a join story before it's safe to free their
     // handles. The pragmatic answer is `_exit(0)` — same as nginx,
     // envoy, etc.: the kernel reclaims memory + fds + sockets in one
@@ -1030,7 +1030,7 @@ pub fn main() !void {
 
 /// Compile `source` for an instance and publish it as the current
 /// deployment through that tenant's code store. Mirrors what
-/// `rove-code-cli upload index.js && rove-code-cli deploy` would do
+/// `rove-files-cli upload index.js && rove-files-cli deploy` would do
 /// externally; kept inline so the smoke test is a single binary.
 const HandlerFile = struct { path: []const u8, source: []const u8 };
 
@@ -1044,24 +1044,24 @@ fn bootstrapHandler(
     defer allocator.free(inst_dir);
     try std.fs.cwd().makePath(inst_dir);
 
-    const code_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/code.db", .{inst_dir}, 0);
-    defer allocator.free(code_db_path);
+    const files_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/files.db", .{inst_dir}, 0);
+    defer allocator.free(files_db_path);
 
-    const code_blob_dir = try std.fmt.allocPrint(allocator, "{s}/code-blobs", .{inst_dir});
-    defer allocator.free(code_blob_dir);
+    const files_blob_dir = try std.fmt.allocPrint(allocator, "{s}/file-blobs", .{inst_dir});
+    defer allocator.free(files_blob_dir);
 
-    const code_kv = try kv.KvStore.open(allocator, code_db_path);
-    defer code_kv.close();
-    var fs_store = try blob_mod.FilesystemBlobStore.open(allocator, code_blob_dir);
+    const files_kv = try kv.KvStore.open(allocator, files_db_path);
+    defer files_kv.close();
+    var fs_store = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
     defer fs_store.deinit();
 
     // Real qjs compile so the stored bytecode is real.
     var compiler = try QjsCompiler.init();
     defer compiler.deinit();
 
-    var store = code_mod.CodeStore.init(
+    var store = files_mod.FileStore.init(
         allocator,
-        code_kv,
+        files_kv,
         fs_store.blobStore(),
         QjsCompiler.compile,
         &compiler,
@@ -1126,9 +1126,9 @@ fn prewarmTenantDbs(
     }
 }
 
-/// Inline qjs compile hook — identical to the one in code_cli.zig.
+/// Inline qjs compile hook — identical to the one in files_cli.zig.
 /// Duplicating it here keeps the smoke test self-contained; the
-/// production path reuses code_cli's helper.
+/// production path reuses files_cli's helper.
 const QjsCompiler = struct {
     runtime: qjs.Runtime,
     context: qjs.Context,
@@ -1154,7 +1154,7 @@ const QjsCompiler = struct {
         const self: *QjsCompiler = @ptrCast(@alignCast(ctx_opaque.?));
         // Treat `.mjs` files as ES modules; everything else compiles
         // as a plain script. Extension is the source of truth — the
-        // rove-code-cli rewrite will apply the same rule.
+        // rove-files-cli rewrite will apply the same rule.
         const kind: qjs.EvalFlags = if (std.mem.endsWith(u8, filename, ".mjs"))
             .{ .kind = .module }
         else

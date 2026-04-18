@@ -905,7 +905,7 @@ pub const module_loader = struct {
     }
 
     /// Stack buffer for a normalized path. 512 bytes is generous — path
-    /// lengths are bounded by `MAX_PATH_LEN` in rove-code.
+    /// lengths are bounded by `MAX_PATH_LEN` in rove-files.
     threadlocal var static_buf: [512]u8 = undefined;
 };
 
@@ -1297,7 +1297,7 @@ test "dispatch: response.cookies surface on Response.set_cookies, Domain strippe
 }
 
 test "dispatch: malformed bytecode surfaces in exception field" {
-    // Compile errors happen at upload time in production (rove-code-cli
+    // Compile errors happen at upload time in production (rove-files-cli
     // calls compileToBytecode, which returns JsException on bad source),
     // not in the dispatcher. The dispatcher's job is to gracefully
     // handle malformed bytecode at runtime — version skew, corruption,

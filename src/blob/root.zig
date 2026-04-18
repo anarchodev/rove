@@ -1,4 +1,4 @@
-//! rove-blob — pluggable blob storage for rove-code and rove-log.
+//! rove-blob — pluggable blob storage for rove-files and rove-log.
 //!
 //! Blobs are opaque byte sequences addressed by ASCII string keys.
 //! Phase 1a ships a filesystem backend only. Phase 6 adds an S3
@@ -6,7 +6,7 @@
 //! both backends slot in behind the same type without rebuilding the
 //! consumers.
 //!
-//! **What "blob" means here**: the content. rove-code hashes source
+//! **What "blob" means here**: the content. rove-files hashes source
 //! files to SHA-256 and passes `sha256_hex` as the key; rove-log uses
 //! request-id-derived keys. This module does not impose a key schema —
 //! any ASCII string that passes `validateKey` is accepted — but it

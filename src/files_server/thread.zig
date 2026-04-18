@@ -1,12 +1,12 @@
-//! `code_server.thread` — the background-thread host for the
-//! synchronous code-server operations in `root.zig`.
+//! `files_server.thread` — the background-thread host for the
+//! synchronous files-server operations in `root.zig`.
 //!
 //! The design goal is "compile does not block the worker's h2 event
 //! loop." The mechanism is standard: spawn a thread that owns its own
 //! rove registry + io_uring + rove-h2 server instance, binding to a
 //! loopback TCP port. The worker (on a separate thread) connects as
 //! an HTTP/2 client and forwards any request whose path starts with
-//! `/_system/code/` here.
+//! `/_system/files/` here.
 //!
 //! Unix domain sockets would be nicer (no port, filesystem perms as
 //! auth) but rove-io's connect path is currently hard-coded to
@@ -28,8 +28,8 @@
 //!                                  → 200, body = raw source bytes
 //!                                  → 404 if the blob isn't present
 //!
-//! The instance-id-first shape lets the worker's `/_system/code/*`
-//! proxy do a pure prefix strip — `/_system/code/acme/upload` maps
+//! The instance-id-first shape lets the worker's `/_system/files/*`
+//! proxy do a pure prefix strip — `/_system/files/acme/upload` maps
 //! directly to `/acme/upload` without reordering segments.
 //!
 //! The handler path intentionally avoids JSON — the only structured
@@ -41,7 +41,7 @@ const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 
-const code_server = @import("root.zig");
+const files_server = @import("root.zig");
 
 const CodeH2 = h2.H2(.{});
 
@@ -77,7 +77,7 @@ pub const Handle = struct {
     }
 };
 
-/// Launch the code-server thread. Returns once the thread has bound
+/// Launch the files-server thread. Returns once the thread has bound
 /// its listen socket (or failed trying). The returned `Handle.port`
 /// is the concrete port the caller should connect to — 0 is never
 /// returned (OS picks an ephemeral port for us).
@@ -113,7 +113,7 @@ pub fn spawn(
 
 fn threadMain(h: *Handle) void {
     runThread(h) catch |err| {
-        std.log.err("rove-code-server thread exited: {s}", .{@errorName(err)});
+        std.log.err("rove-files-server thread exited: {s}", .{@errorName(err)});
     };
 }
 
@@ -152,7 +152,7 @@ fn runThread(h: *Handle) !void {
     h.ready.set();
 
     std.log.info(
-        "rove-code-server thread listening on 127.0.0.1:{d} (h2c) data_dir={s}",
+        "rove-files-server thread listening on 127.0.0.1:{d} (h2c) data_dir={s}",
         .{ h.port, h.data_dir },
     );
 
@@ -188,7 +188,7 @@ fn processRequests(
 
     for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
         handleOne(server, allocator, data_dir, ent, sid, sess, rh, rb) catch |err| {
-            std.log.warn("code-server: handler error: {s}", .{@errorName(err)});
+            std.log.warn("files-server: handler error: {s}", .{@errorName(err)});
             setResponse(server, ent, sid, sess, 500, null, "internal error\n") catch {};
         };
     }
@@ -270,8 +270,8 @@ fn handleUpload(
     }
     const source: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
 
-    code_server.uploadFile(allocator, data_dir, instance_id, x_rove_path, source) catch |err| {
-        std.log.warn("code-server: uploadFile failed: {s}", .{@errorName(err)});
+    files_server.uploadFile(allocator, data_dir, instance_id, x_rove_path, source) catch |err| {
+        std.log.warn("files-server: uploadFile failed: {s}", .{@errorName(err)});
         const msg = try std.fmt.allocPrint(
             allocator,
             "upload failed: {s}\n",
@@ -292,7 +292,7 @@ fn handleDeploy(
     sess: h2.Session,
     instance_id: []const u8,
 ) !void {
-    const dep_id = code_server.deploy(allocator, data_dir, instance_id) catch |err| {
+    const dep_id = files_server.deploy(allocator, data_dir, instance_id) catch |err| {
         const msg = try std.fmt.allocPrint(
             allocator,
             "deploy failed: {s}\n",
@@ -320,8 +320,8 @@ fn handleSource(
         return;
     }
 
-    const bytes = code_server.getSourceByHash(allocator, data_dir, instance_id, hash) catch |err| {
-        const code: u16 = if (err == code_server.Error.NotFound) 404 else 500;
+    const bytes = files_server.getSourceByHash(allocator, data_dir, instance_id, hash) catch |err| {
+        const code: u16 = if (err == files_server.Error.NotFound) 404 else 500;
         const msg = try std.fmt.allocPrint(
             allocator,
             "source fetch failed: {s}\n",

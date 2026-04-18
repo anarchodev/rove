@@ -15,7 +15,7 @@
 //!   deserve its own session.
 //! - Per-request bump arena. Rides along with the snapshot work because
 //!   they share allocator plumbing.
-//! - Module loader integration (reading bytecode from rove-code).
+//! - Module loader integration (reading bytecode from rove-files).
 //!
 //! The QuickJS C API lives at `c.JS_*`. Everything user-facing goes
 //! through the Zig types defined here.
@@ -194,7 +194,7 @@ pub const Context = struct {
     /// Compile `source` to QuickJS bytecode without executing it. Returns
     /// an allocator-owned buffer; caller frees with `allocator.free`.
     /// Bytecode is portable across contexts/runtimes built from the same
-    /// quickjs-ng build — rove-code stores it as a content-addressed blob
+    /// quickjs-ng build — rove-files stores it as a content-addressed blob
     /// and any worker can read it back via `evalBytecode`.
     pub fn compileToBytecode(
         self: Context,
@@ -211,7 +211,7 @@ pub const Context = struct {
         // SyntaxErrors fire whenever the byte after the slice happens
         // to look like a UTF-8 continuation byte. Dup into a
         // guaranteed-NUL-terminated buffer here — this was a subtle
-        // bug from the rove-code-server thread path.
+        // bug from the rove-files-server thread path.
         const src_z = try allocator.allocSentinel(u8, source.len, 0);
         defer allocator.free(src_z);
         @memcpy(src_z, source);

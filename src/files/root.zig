@@ -1,11 +1,12 @@
-//! rove-code — content-addressed module store + deployment index.
+//! rove-files — content-addressed file store + deployment index.
 //!
-//! rove-code tracks JS source files and their compiled bytecode for a
-//! rove-js deployment. The raw bytes live in a `BlobStore` (rove-blob);
-//! the *index* lives in a `KvStore` (rove-kv) so it can be replicated
-//! via raft. This split matters: blobs are big and immutable, so they
-//! belong in object storage (S3 in production, fs in dev); the index is
-//! tiny and mutable, so it rides along in the raft group that owns it.
+//! rove-files tracks a tenant's deployable files — handler source + its
+//! compiled bytecode today, plus raw static assets once Phase 2 lands.
+//! The raw bytes live in a `BlobStore` (rove-blob); the *index* lives in
+//! a `KvStore` (rove-kv) so it can be replicated via raft. This split
+//! matters: blobs are big and immutable, so they belong in object storage
+//! (S3 in production, fs in dev); the index is tiny and mutable, so it
+//! rides along in the raft group that owns it.
 //!
 //! ## Data model
 //!
@@ -36,8 +37,8 @@
 //!
 //! ## Compile hook
 //!
-//! rove-code is quickjs-agnostic — it takes a `CompileFn` at construction
-//! time. `rove-code-server` wires in a function that owns a `rove-qjs`
+//! rove-files is quickjs-agnostic — it takes a `CompileFn` at construction
+//! time. `rove-files-server` wires in a function that owns a `rove-qjs`
 //! `Runtime` + `Context` and calls `compileToBytecode`. Tests use a
 //! pass-through hook that returns the source unchanged, which is enough
 //! to exercise the index + blob plumbing without pulling in quickjs.
@@ -62,7 +63,7 @@ pub const Error = error{
 
 /// A compile hook. Given source bytes, returns a fresh allocator-owned
 /// bytecode buffer. `ctx` is the opaque user pointer supplied at
-/// `CodeStore.init`. Implementations should return `error.CompileFailed`
+/// `FileStore.init`. Implementations should return `error.CompileFailed`
 /// for syntax errors; other errors propagate as-is.
 pub const CompileFn = *const fn (
     ctx: ?*anyopaque,
@@ -77,7 +78,7 @@ pub const HASH_HEX_LEN: usize = 64; // sha256 hex
 /// and matches blob-key invariants from rove-blob.
 pub const MAX_PATH_LEN: usize = 192;
 
-pub const CodeStore = struct {
+pub const FileStore = struct {
     allocator: std.mem.Allocator,
     kv: *KvStore,
     blob: BlobStore,
@@ -90,7 +91,7 @@ pub const CodeStore = struct {
         blob: BlobStore,
         compile: CompileFn,
         compile_ctx: ?*anyopaque,
-    ) CodeStore {
+    ) FileStore {
         return .{
             .allocator = allocator,
             .kv = kv_store,
@@ -110,7 +111,7 @@ pub const CodeStore = struct {
     /// Idempotent: uploading the same bytes under the same path is a
     /// no-op beyond re-stamping the index.
     pub fn putSource(
-        self: *CodeStore,
+        self: *FileStore,
         path: []const u8,
         source: []const u8,
     ) Error!void {
@@ -134,7 +135,7 @@ pub const CodeStore = struct {
     }
 
     fn ensureBytecode(
-        self: *CodeStore,
+        self: *FileStore,
         path: []const u8,
         source: []const u8,
         src_hex: *const [HASH_HEX_LEN]u8,
@@ -174,7 +175,7 @@ pub const CodeStore = struct {
 
     /// Fetch the current source blob for `path`. Returns owned bytes.
     pub fn getSource(
-        self: *CodeStore,
+        self: *FileStore,
         path: []const u8,
         allocator: std.mem.Allocator,
     ) Error![]u8 {
@@ -194,7 +195,7 @@ pub const CodeStore = struct {
     /// Fetch the bytecode blob for `path`'s current source. Returns owned
     /// bytes.
     pub fn getBytecode(
-        self: *CodeStore,
+        self: *FileStore,
         path: []const u8,
         allocator: std.mem.Allocator,
     ) Error![]u8 {
@@ -246,7 +247,7 @@ pub const CodeStore = struct {
     /// Assigns a monotonically increasing id (current + 1) and stores the
     /// manifest under `deployment/{id_hex}`, then updates
     /// `deployment/current`. Returns the new id.
-    pub fn deploy(self: *CodeStore) Error!u64 {
+    pub fn deploy(self: *FileStore) Error!u64 {
         // Collect all `file/*` entries.
         var entries: std.ArrayList(Entry) = .empty;
         defer {
@@ -319,7 +320,7 @@ pub const CodeStore = struct {
 
     /// Load the active deployment manifest. Caller must `deinit` the
     /// returned `Manifest`.
-    pub fn loadCurrentDeployment(self: *CodeStore) Error!Manifest {
+    pub fn loadCurrentDeployment(self: *FileStore) Error!Manifest {
         const cur = self.kv.get("deployment/current") catch |err| switch (err) {
             error.NotFound => return Error.NotFound,
             else => return Error.Kv,
@@ -329,7 +330,7 @@ pub const CodeStore = struct {
         return self.loadDeployment(id);
     }
 
-    pub fn loadDeployment(self: *CodeStore, id: u64) Error!Manifest {
+    pub fn loadDeployment(self: *FileStore, id: u64) Error!Manifest {
         var id_hex_buf: [16]u8 = undefined;
         const id_hex = std.fmt.bufPrint(&id_hex_buf, "{x:0>16}", .{id}) catch unreachable;
         var dep_key_buf: [11 + 16]u8 = undefined;
@@ -377,7 +378,7 @@ fn validatePath(path: []const u8) Error!void {
 // Little-endian. Unit-tested below.
 fn serializeManifest(
     allocator: std.mem.Allocator,
-    entries: []const CodeStore.Entry,
+    entries: []const FileStore.Entry,
 ) error{OutOfMemory}![]u8 {
     var total: usize = 4;
     for (entries) |e| total += 2 + e.path.len + HASH_HEX_LEN * 2;
@@ -402,13 +403,13 @@ fn serializeManifest(
 fn parseManifest(
     allocator: std.mem.Allocator,
     bytes: []const u8,
-) Error![]CodeStore.Entry {
+) Error![]FileStore.Entry {
     if (bytes.len < 4) return Error.InvalidManifest;
     var i: usize = 0;
     const count = std.mem.readInt(u32, bytes[i..][0..4], .little);
     i += 4;
 
-    const out = allocator.alloc(CodeStore.Entry, count) catch return Error.OutOfMemory;
+    const out = allocator.alloc(FileStore.Entry, count) catch return Error.OutOfMemory;
     var filled: usize = 0;
     errdefer {
         for (out[0..filled]) |e| allocator.free(e.path);
@@ -476,7 +477,7 @@ const TestFixture = struct {
 
     fn init(allocator: std.mem.Allocator) !TestFixture {
         const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-        const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/rove-code-test-{x}", .{seed});
+        const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/rove-files-test-{x}", .{seed});
         errdefer allocator.free(tmp_path);
 
         std.fs.cwd().deleteTree(tmp_path) catch {};
@@ -506,8 +507,8 @@ const TestFixture = struct {
         self.allocator.free(self.tmp_path);
     }
 
-    fn codeStore(self: *TestFixture) CodeStore {
-        return CodeStore.init(
+    fn fileStore(self: *TestFixture) FileStore {
+        return FileStore.init(
             self.allocator,
             self.kv,
             self.blob_store.blobStore(),
@@ -520,7 +521,7 @@ const TestFixture = struct {
 test "putSource writes blob + index and round-trips via getSource" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
-    var code = fx.codeStore();
+    var code = fx.fileStore();
 
     try code.putSource("handlers/index.js", "export default () => 42;");
 
@@ -532,7 +533,7 @@ test "putSource writes blob + index and round-trips via getSource" {
 test "getBytecode returns compiled blob for current file" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
-    var code = fx.codeStore();
+    var code = fx.fileStore();
 
     try code.putSource("a.js", "1 + 1");
     const bc = try code.getBytecode("a.js", testing.allocator);
@@ -560,7 +561,7 @@ test "bytecode cache is reused across identical source" {
         }
     };
 
-    var code = CodeStore.init(
+    var code = FileStore.init(
         testing.allocator,
         fx.kv,
         fx.blob_store.blobStore(),
@@ -578,7 +579,7 @@ test "bytecode cache is reused across identical source" {
 test "compile failure surfaces as CompileFailed" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
-    var code = CodeStore.init(
+    var code = FileStore.init(
         testing.allocator,
         fx.kv,
         fx.blob_store.blobStore(),
@@ -592,7 +593,7 @@ test "compile failure surfaces as CompileFailed" {
 test "putSource overwrites existing file with new hash" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
-    var code = fx.codeStore();
+    var code = fx.fileStore();
 
     try code.putSource("a.js", "v1");
     try code.putSource("a.js", "v2");
@@ -605,7 +606,7 @@ test "putSource overwrites existing file with new hash" {
 test "deploy snapshots current files and assigns id=1 then 2" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
-    var code = fx.codeStore();
+    var code = fx.fileStore();
 
     try code.putSource("a.js", "A");
     try code.putSource("b.js", "B");
@@ -621,7 +622,7 @@ test "deploy snapshots current files and assigns id=1 then 2" {
 test "loadCurrentDeployment returns manifest with all entries" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
-    var code = fx.codeStore();
+    var code = fx.fileStore();
 
     try code.putSource("a.js", "A");
     try code.putSource("sub/b.js", "BB");
@@ -641,7 +642,7 @@ test "loadCurrentDeployment returns manifest with all entries" {
 test "loadCurrentDeployment returns NotFound when no deploy yet" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
-    var code = fx.codeStore();
+    var code = fx.fileStore();
 
     try code.putSource("a.js", "A");
     try testing.expectError(Error.NotFound, code.loadCurrentDeployment());
@@ -650,7 +651,7 @@ test "loadCurrentDeployment returns NotFound when no deploy yet" {
 test "old deployments remain addressable by id after new deploy" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
-    var code = fx.codeStore();
+    var code = fx.fileStore();
 
     try code.putSource("a.js", "v1");
     _ = try code.deploy();
@@ -680,7 +681,7 @@ test "validatePath rejects traversal, absolute, empty, control chars" {
 }
 
 test "serialize + parse manifest round-trip" {
-    var entries = [_]CodeStore.Entry{
+    var entries = [_]FileStore.Entry{
         .{
             .path = @constCast("a.js"),
             .source_hex = [_]u8{'a'} ** HASH_HEX_LEN,

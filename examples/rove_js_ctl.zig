@@ -1,7 +1,7 @@
 //! `rove-js-ctl` — admin CLI for rove-js workers.
 //!
 //! Talks HTTP/2 (h2c) to a running js-worker over the
-//! `/_system/code/*` system surface. Every request carries an
+//! `/_system/files/*` system surface. Every request carries an
 //! `Authorization: Bearer <token>` header; the token comes from
 //! `--token`, `$ROVE_TOKEN`, or (last resort) a missing-token error.
 //!
@@ -15,7 +15,7 @@
 //!     rove-js-ctl [--url URL] [--token TOK] deploy <instance> <dir>
 //!         Walk `<dir>` recursively, upload every file under it as
 //!         a source entry keyed by its path relative to `<dir>`,
-//!         then call `/_system/code/<instance>/deploy` to swap
+//!         then call `/_system/files/<instance>/deploy` to swap
 //!         `deployment/current`. Prints the new deployment id.
 //!
 //! Defaults:
@@ -366,7 +366,7 @@ fn runPing(client: *Client, token: []const u8) !void {
         },
     };
 
-    var resp = try client.request("POST", "/_system/code/__ping__/deploy", &hdrs, "");
+    var resp = try client.request("POST", "/_system/files/__ping__/deploy", &hdrs, "");
     defer resp.deinit(client.allocator);
 
     std.debug.print("ping: worker reachable, status={d}\n", .{resp.status});
@@ -401,10 +401,10 @@ fn runDeploy(
         const source = try file.readToEndAlloc(allocator, 16 * 1024 * 1024);
         defer allocator.free(source);
 
-        // Build /_system/code/{instance}/upload path + headers.
+        // Build /_system/files/{instance}/upload path + headers.
         const upload_path = try std.fmt.allocPrint(
             allocator,
-            "/_system/code/{s}/upload",
+            "/_system/files/{s}/upload",
             .{instance},
         );
         defer allocator.free(upload_path);
@@ -446,7 +446,7 @@ fn runDeploy(
     // Call deploy.
     const deploy_path = try std.fmt.allocPrint(
         allocator,
-        "/_system/code/{s}/deploy",
+        "/_system/files/{s}/deploy",
         .{instance},
     );
     defer allocator.free(deploy_path);

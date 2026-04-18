@@ -1,6 +1,6 @@
 //! `log_server.thread` — h2 server host for the log read operations.
 //!
-//! Parallels `code_server/thread.zig` but on the observability side.
+//! Parallels `files_server/thread.zig` but on the observability side.
 //! The worker proxies `/_system/log/{instance}/*` requests here over
 //! loopback TCP; each request opens its own per-instance read-only
 //! SQLite connection and closes it on return. The worker's h2 thread
@@ -9,7 +9,7 @@
 //! ## Wire protocol
 //!
 //! Plain h2c, no TLS. Routes follow the same `/{instance}/{op}` shape
-//! the code-server uses so the worker proxy is a pure prefix strip:
+//! the files-server uses so the worker proxy is a pure prefix strip:
 //!
 //!   GET  /{instance_id}/list[?limit=N]
 //!        → 200 JSON: `{"records": [...]}` (newest first)

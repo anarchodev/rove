@@ -13,7 +13,7 @@
 #   - `{id}.api.test`               → kv = {id}'s app.db (KV browsing)
 #
 # Log + code stay as native Zig proxies under /_system/log/* and
-# /_system/code/* — tested separately.
+# /_system/files/* — tested separately.
 
 set -euo pipefail
 

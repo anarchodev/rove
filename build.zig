@@ -79,21 +79,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // ── rove-code: content-addressed module store + deploy index ──
+    // ── rove-files: content-addressed module store + deploy index ──
     //
-    // Library layer only in Phase 1b session 1. The `rove-code-server`
+    // Library layer only in Phase 1b session 1. The `rove-files-server`
     // binary (HTTP/2 wrapper + raft group) lands in a follow-up session.
-    const code_mod = b.addModule("rove-code", .{
-        .root_source_file = b.path("src/code/root.zig"),
+    const files_mod = b.addModule("rove-files", .{
+        .root_source_file = b.path("src/files/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    code_mod.addImport("rove-kv", kv_mod);
-    code_mod.addImport("rove-blob", blob_mod);
+    files_mod.addImport("rove-kv", kv_mod);
+    files_mod.addImport("rove-blob", blob_mod);
 
     // ── rove-log: per-tenant request log store ──
     //
-    // Phase 3. Mirrors rove-code's "per-tenant SQLite index + rove-blob
+    // Phase 3. Mirrors rove-files's "per-tenant SQLite index + rove-blob
     // bulk storage" shape. Records are batched in memory and shipped
     // through the worker's raft group as opaque-bytes envelopes; the
     // worker's apply callback decodes and persists per-node.
@@ -161,7 +161,7 @@ pub fn build(b: *std.Build) void {
 
     // ── rove-log-server: per-instance log read operations (Phase 5) ──
     //
-    // Mirror of rove-code-server for the observability side. Read-only
+    // Mirror of rove-files-server for the observability side. Read-only
     // SQLite connections per call so the worker's h2 thread remains
     // the sole writer. Wrapped by a later thread subsystem + proxied
     // via `/_system/log/*` on the worker.
@@ -181,30 +181,30 @@ pub fn build(b: *std.Build) void {
     log_server_mod.addImport("rove-blob", blob_mod);
     log_server_mod.addImport("rove-log", log_mod);
 
-    // ── rove-code-server: per-instance code operations (Phase 5) ──
+    // ── rove-files-server: per-instance code operations (Phase 5) ──
     //
-    // Compile + upload + deploy + source fetch, wrapping rove-code.
+    // Compile + upload + deploy + source fetch, wrapping rove-files.
     // Each operation opens its own per-instance SQLite connection so
     // it's safe to call off the worker's h2 thread — later slices add
-    // a thread pool and an h2 proxy endpoint for `/_system/code/*`.
+    // a thread pool and an h2 proxy endpoint for `/_system/files/*`.
     // Needs libc + nghttp2/ssl/crypto because it pulls in rove-qjs,
     // which transitively brings in the C runtime link requirements.
-    const code_server_mod = b.addModule("rove-code-server", .{
-        .root_source_file = b.path("src/code_server/root.zig"),
+    const files_server_mod = b.addModule("rove-files-server", .{
+        .root_source_file = b.path("src/files_server/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    code_server_mod.link_libc = true;
-    code_server_mod.linkSystemLibrary("nghttp2", .{});
-    code_server_mod.linkSystemLibrary("ssl", .{});
-    code_server_mod.linkSystemLibrary("crypto", .{});
-    code_server_mod.addImport("rove", rove_mod);
-    code_server_mod.addImport("rove-io", io_mod);
-    code_server_mod.addImport("rove-h2", h2_mod);
-    code_server_mod.addImport("rove-kv", kv_mod);
-    code_server_mod.addImport("rove-blob", blob_mod);
-    code_server_mod.addImport("rove-code", code_mod);
-    code_server_mod.addImport("rove-qjs", qjs_mod);
+    files_server_mod.link_libc = true;
+    files_server_mod.linkSystemLibrary("nghttp2", .{});
+    files_server_mod.linkSystemLibrary("ssl", .{});
+    files_server_mod.linkSystemLibrary("crypto", .{});
+    files_server_mod.addImport("rove", rove_mod);
+    files_server_mod.addImport("rove-io", io_mod);
+    files_server_mod.addImport("rove-h2", h2_mod);
+    files_server_mod.addImport("rove-kv", kv_mod);
+    files_server_mod.addImport("rove-blob", blob_mod);
+    files_server_mod.addImport("rove-files", files_mod);
+    files_server_mod.addImport("rove-qjs", qjs_mod);
 
     // ── Tests ──
     const test_step = b.step("test", "Run all unit tests");
@@ -233,9 +233,9 @@ pub fn build(b: *std.Build) void {
     const qjs_tests = b.addTest(.{ .root_module = qjs_mod });
     test_step.dependOn(&b.addRunArtifact(qjs_tests).step);
 
-    // rove-code tests
-    const code_tests = b.addTest(.{ .root_module = code_mod });
-    test_step.dependOn(&b.addRunArtifact(code_tests).step);
+    // rove-files tests
+    const files_tests = b.addTest(.{ .root_module = files_mod });
+    test_step.dependOn(&b.addRunArtifact(files_tests).step);
 
     // rove-log tests
     const log_tests = b.addTest(.{ .root_module = log_mod });
@@ -245,9 +245,9 @@ pub fn build(b: *std.Build) void {
     const tape_tests = b.addTest(.{ .root_module = tape_mod });
     test_step.dependOn(&b.addRunArtifact(tape_tests).step);
 
-    // rove-code-server tests
-    const code_server_tests = b.addTest(.{ .root_module = code_server_mod });
-    test_step.dependOn(&b.addRunArtifact(code_server_tests).step);
+    // rove-files-server tests
+    const files_server_tests = b.addTest(.{ .root_module = files_server_mod });
+    test_step.dependOn(&b.addRunArtifact(files_server_tests).step);
 
     // rove-log-server tests
     const log_server_tests = b.addTest(.{ .root_module = log_server_mod });
@@ -285,7 +285,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-qjs", qjs_mod);
     js_mod.addImport("rove-kv", kv_mod);
     js_mod.addImport("rove-blob", blob_mod);
-    js_mod.addImport("rove-code", code_mod);
+    js_mod.addImport("rove-files", files_mod);
     js_mod.addImport("rove-log", log_mod);
     js_mod.addImport("rove-tape", tape_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
@@ -307,8 +307,8 @@ pub fn build(b: *std.Build) void {
     js_worker_mod.addImport("rove-js", js_mod);
     js_worker_mod.addImport("rove-kv", kv_mod);
     js_worker_mod.addImport("rove-blob", blob_mod);
-    js_worker_mod.addImport("rove-code", code_mod);
-    js_worker_mod.addImport("rove-code-server", code_server_mod);
+    js_worker_mod.addImport("rove-files", files_mod);
+    js_worker_mod.addImport("rove-files-server", files_server_mod);
     js_worker_mod.addImport("rove-log-server", log_server_mod);
     js_worker_mod.addImport("rove-qjs", qjs_mod);
     js_worker_mod.addImport("rove-tenant", tenant_mod);
@@ -358,26 +358,26 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(qjs_bench);
 
-    // code-cli: local driver for rove-code. Wires rove-qjs in as the
+    // code-cli: local driver for rove-files. Wires rove-qjs in as the
     // compile hook and runs against a local KvStore + fs BlobStore.
-    // Also houses the rove-code × rove-qjs integration tests.
-    const code_cli_mod = b.addModule("rove-code-cli", .{
-        .root_source_file = b.path("examples/code_cli.zig"),
+    // Also houses the rove-files × rove-qjs integration tests.
+    const files_cli_mod = b.addModule("rove-files-cli", .{
+        .root_source_file = b.path("examples/files_cli.zig"),
         .target = target,
         .optimize = optimize,
     });
-    code_cli_mod.addImport("rove-qjs", qjs_mod);
-    code_cli_mod.addImport("rove-code", code_mod);
-    code_cli_mod.addImport("rove-kv", kv_mod);
-    code_cli_mod.addImport("rove-blob", blob_mod);
+    files_cli_mod.addImport("rove-qjs", qjs_mod);
+    files_cli_mod.addImport("rove-files", files_mod);
+    files_cli_mod.addImport("rove-kv", kv_mod);
+    files_cli_mod.addImport("rove-blob", blob_mod);
 
-    const code_cli = b.addExecutable(.{
-        .name = "rove-code-cli",
-        .root_module = code_cli_mod,
+    const files_cli = b.addExecutable(.{
+        .name = "rove-files-cli",
+        .root_module = files_cli_mod,
     });
-    b.installArtifact(code_cli);
+    b.installArtifact(files_cli);
 
-    const code_cli_tests = b.addTest(.{ .root_module = code_cli_mod });
+    const code_cli_tests = b.addTest(.{ .root_module = files_cli_mod });
     test_step.dependOn(&b.addRunArtifact(code_cli_tests).step);
 
     // log-cli: read-only query tool for the per-tenant log store.
@@ -389,7 +389,7 @@ pub fn build(b: *std.Build) void {
     log_cli_mod.addImport("rove-kv", kv_mod);
     log_cli_mod.addImport("rove-blob", blob_mod);
     log_cli_mod.addImport("rove-log", log_mod);
-    log_cli_mod.addImport("rove-code", code_mod);
+    log_cli_mod.addImport("rove-files", files_mod);
     log_cli_mod.addImport("rove-tape", tape_mod);
 
     const log_cli = b.addExecutable(.{
@@ -398,16 +398,16 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(log_cli);
 
-    // code-server-standalone: spawns the rove-code-server thread and
+    // files-server-standalone: spawns the rove-files-server thread and
     // idles. Exists so the smoke test can drive it from curl.
-    const cs_standalone_mod = b.addModule("code-server-standalone", .{
-        .root_source_file = b.path("examples/code_server_standalone.zig"),
+    const cs_standalone_mod = b.addModule("files-server-standalone", .{
+        .root_source_file = b.path("examples/files_server_standalone.zig"),
         .target = target,
         .optimize = optimize,
     });
-    cs_standalone_mod.addImport("rove-code-server", code_server_mod);
+    cs_standalone_mod.addImport("rove-files-server", files_server_mod);
     const cs_standalone = b.addExecutable(.{
-        .name = "code-server-standalone",
+        .name = "files-server-standalone",
         .root_module = cs_standalone_mod,
     });
     b.installArtifact(cs_standalone);
@@ -425,8 +425,8 @@ pub fn build(b: *std.Build) void {
     dual_worker_mod.addImport("rove-js", js_mod);
     dual_worker_mod.addImport("rove-kv", kv_mod);
     dual_worker_mod.addImport("rove-blob", blob_mod);
-    dual_worker_mod.addImport("rove-code", code_mod);
-    dual_worker_mod.addImport("rove-code-server", code_server_mod);
+    dual_worker_mod.addImport("rove-files", files_mod);
+    dual_worker_mod.addImport("rove-files-server", files_server_mod);
     dual_worker_mod.addImport("rove-log-server", log_server_mod);
     dual_worker_mod.addImport("rove-qjs", qjs_mod);
     dual_worker_mod.addImport("rove-tenant", tenant_mod);

@@ -1,15 +1,15 @@
-//! `code-server-standalone` — spawns the rove-code-server thread
+//! `files-server-standalone` — spawns the rove-files-server thread
 //! and idles until SIGINT. Exists so the end-to-end smoke test can
 //! drive it from curl without standing up a full js-worker.
 //!
 //! Usage:
-//!     code-server-standalone --data-dir <path>
+//!     files-server-standalone --data-dir <path>
 
 const std = @import("std");
-const cs = @import("rove-code-server");
+const cs = @import("rove-files-server");
 
 const Cli = struct {
-    data_dir: []const u8 = "/tmp/rove-code-thread",
+    data_dir: []const u8 = "/tmp/rove-files-thread",
 };
 
 fn parseCli(argv: [][:0]u8) !Cli {
@@ -40,7 +40,7 @@ pub fn main() !void {
         var stderr_buf: [256]u8 = undefined;
         var sw = std.fs.File.stderr().writer(&stderr_buf);
         try sw.interface.writeAll(
-            \\usage: code-server-standalone --data-dir <path>
+            \\usage: files-server-standalone --data-dir <path>
             \\
         );
         try sw.interface.flush();

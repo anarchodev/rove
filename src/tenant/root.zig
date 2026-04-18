@@ -3,9 +3,9 @@
 //! ## Store-per-instance model
 //!
 //! Each instance owns a directory at `{dir}/{id}/` and its app-state
-//! store lives at `{dir}/{id}/app.db`. Consumers (worker, code-server,
+//! store lives at `{dir}/{id}/app.db`. Consumers (worker, files-server,
 //! log-server) open additional stores under the same directory —
-//! `{dir}/{id}/code.db`, `{dir}/{id}/log.db`, plus blob dirs — so a
+//! `{dir}/{id}/files.db`, `{dir}/{id}/log.db`, plus blob dirs — so a
 //! tenant's entire state is one directory that can be copied, moved,
 //! or removed as a unit. rove-tenant itself only knows about the
 //! instance identity and the app-state store; other services reach
@@ -118,7 +118,7 @@ pub const DomainList = struct {
 /// - `id`: the tenant's string id (owned).
 /// - `dir`: absolute path to the tenant's directory (owned). Other
 ///   services open their per-tenant state inside this directory —
-///   `{dir}/code.db`, `{dir}/log.db`, `{dir}/code-blobs/`, etc.
+///   `{dir}/files.db`, `{dir}/log.db`, `{dir}/file-blobs/`, etc.
 /// - `kv`: the tenant's app-state store at `{dir}/app.db`. Handler
 ///   code's `kv.get("x")` hits raw key `"x"` in this file.
 pub const Instance = struct {

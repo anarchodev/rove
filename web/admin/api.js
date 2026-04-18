@@ -12,7 +12,7 @@
 //    Use for KV browsing scoped to one tenant.
 //
 // Out-of-band (still the native Zig proxies): logs + code via
-// `/_system/log/*` and `/_system/code/*`. Path-scoped; instance
+// `/_system/log/*` and `/_system/files/*`. Path-scoped; instance
 // always appears in the path.
 
 const TOKEN_KEY = "rove.admin.token";

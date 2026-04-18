@@ -9,7 +9,7 @@
 //!   - rove `Registry`
 //!   - rove-io `Io` / rove-h2 `H2` instance (its own io_uring ring + fds)
 //!   - `Tenant` (its own `__root__.db` sqlite connection)
-//!   - per-tenant `KvStore` + `LogStore` connections (via `TenantCode` /
+//!   - per-tenant `KvStore` + `LogStore` connections (via `TenantFiles` /
 //!     `TenantLog` caches — every worker opens its own to avoid
 //!     sharing NOMUTEX sqlite handles across threads)
 //!   - qjs runtime (via the `Dispatcher`)
@@ -21,7 +21,7 @@
 //!     committedSeq/faultedSeq are atomics)
 //!   - the single raft-owned `ApplyCtx` (only the raft thread touches
 //!     its cached stores; workers never do)
-//!   - the code-server + log-server subsystem threads (workers talk
+//!   - the files-server + log-server subsystem threads (workers talk
 //!     to them via their own h2 client sessions)
 //!
 //! The point of this binary: prove the "every worker isolated, one
@@ -44,8 +44,8 @@ const rio = @import("rove-io");
 const rjs = @import("rove-js");
 const kv = @import("rove-kv");
 const blob_mod = @import("rove-blob");
-const code_mod = @import("rove-code");
-const code_server = @import("rove-code-server");
+const files_mod = @import("rove-files");
+const files_server = @import("rove-files-server");
 const log_server = @import("rove-log-server");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
@@ -238,22 +238,22 @@ fn bootstrapHandler(
     defer allocator.free(inst_dir);
     try std.fs.cwd().makePath(inst_dir);
 
-    const code_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/code.db", .{inst_dir}, 0);
-    defer allocator.free(code_db_path);
-    const code_blob_dir = try std.fmt.allocPrint(allocator, "{s}/code-blobs", .{inst_dir});
-    defer allocator.free(code_blob_dir);
+    const files_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/files.db", .{inst_dir}, 0);
+    defer allocator.free(files_db_path);
+    const files_blob_dir = try std.fmt.allocPrint(allocator, "{s}/file-blobs", .{inst_dir});
+    defer allocator.free(files_blob_dir);
 
-    const code_kv = try kv.KvStore.open(allocator, code_db_path);
-    defer code_kv.close();
-    var fs_store = try blob_mod.FilesystemBlobStore.open(allocator, code_blob_dir);
+    const files_kv = try kv.KvStore.open(allocator, files_db_path);
+    defer files_kv.close();
+    var fs_store = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
     defer fs_store.deinit();
 
     var compiler = try QjsCompiler.init();
     defer compiler.deinit();
 
-    var store = code_mod.CodeStore.init(
+    var store = files_mod.FileStore.init(
         allocator,
-        code_kv,
+        files_kv,
         fs_store.blobStore(),
         QjsCompiler.compile,
         &compiler,
@@ -356,7 +356,7 @@ pub fn main() !void {
     // ── Subsystem threads (shared across workers) ──────────────────────
     // This example spawns exactly 2 workers below; 8 cap leaves room
     // for reconnect churn and any manual pokes from the outside.
-    const cs_handle = try code_server.thread.spawn(allocator, cli.data_dir, 8);
+    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, 8);
     defer cs_handle.shutdown();
     const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
 
