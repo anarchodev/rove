@@ -296,6 +296,29 @@ const ADMIN_HANDLER_SRC =
     \\    }
     \\    return v;
     \\}
+    \\
+    \\export function setKv(key, value) {
+    \\    if (!key) {
+    \\        response.status = 400;
+    \\        return { error: "missing key" };
+    \\    }
+    \\    if (typeof value !== "string") {
+    \\        response.status = 400;
+    \\        return { error: "value must be a string" };
+    \\    }
+    \\    kv.set(key, value);
+    \\    return { key: key };
+    \\}
+    \\
+    \\export function deleteKv(key) {
+    \\    if (!key) {
+    \\        response.status = 400;
+    \\        return { error: "missing key" };
+    \\    }
+    \\    kv.delete(key);
+    \\    response.status = 204;
+    \\    return null;
+    \\}
 ;
 
 comptime {

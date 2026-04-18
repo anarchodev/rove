@@ -620,3 +620,59 @@ label {
   background: var(--input-bg);
   color: var(--text);
 }
+
+.kv-panel .kv-create {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.kv-panel .kv-create input {
+  font-family: var(--mono);
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--input-bg);
+  color: var(--text);
+}
+
+.kv-panel .kv-create input[name="key"] { width: 18rem; }
+.kv-panel .kv-create input[name="value"] { flex: 1; }
+
+.kv-table .kv-value-input {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  width: 100%;
+  padding: 0.2rem 0.4rem;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+}
+
+.kv-table .kv-value-input:focus {
+  border-color: var(--border);
+  background: var(--input-bg);
+  outline: none;
+}
+
+.kv-table .kv-actions {
+  white-space: nowrap;
+  text-align: right;
+}
+
+.kv-table .kv-actions button {
+  margin-left: 0.3rem;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+.kv-table .kv-actions button.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.kv-table .kv-actions button.danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}

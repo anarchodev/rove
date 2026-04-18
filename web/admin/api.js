@@ -154,6 +154,12 @@ export const api = {
   getKv(instance_id, key) {
     return rpc("getKv", [key], { scope: instance_id });
   },
+  setKv(instance_id, key, value) {
+    return rpc("setKv", [key, value], { method: "POST", scope: instance_id });
+  },
+  deleteKv(instance_id, key) {
+    return rpc("deleteKv", [key], { method: "POST", scope: instance_id });
+  },
 
   // ── Out-of-band: files (native Zig proxy) ────────────────────────
   async listFiles(instance_id) {

@@ -278,10 +278,15 @@ function renderKv(root, { instanceId, api, showError, clearError }) {
       <button type="button" class="refresh">Refresh</button>
       <span class="count muted"></span>
     </div>
+    <form class="kv-create">
+      <input name="key" placeholder="key" autocomplete="off" required>
+      <input name="value" placeholder="value" autocomplete="off">
+      <button type="submit">Set</button>
+    </form>
     <div class="table-wrap">
       <table class="kv-table">
         <thead>
-          <tr><th>Key</th><th>Value</th></tr>
+          <tr><th>Key</th><th>Value</th><th></th></tr>
         </thead>
         <tbody></tbody>
       </table>
@@ -293,6 +298,7 @@ function renderKv(root, { instanceId, api, showError, clearError }) {
   const prefixInput = el.querySelector(".prefix-input");
   const refreshBtn = el.querySelector(".refresh");
   const countLabel = el.querySelector(".count");
+  const createForm = el.querySelector(".kv-create");
 
   async function load() {
     refreshBtn.disabled = true;
@@ -307,7 +313,7 @@ function renderKv(root, { instanceId, api, showError, clearError }) {
       if (entries.length === 0) {
         const tr = document.createElement("tr");
         tr.className = "empty";
-        tr.innerHTML = `<td colspan="2"><em>no matching keys</em></td>`;
+        tr.innerHTML = `<td colspan="3"><em>no matching keys</em></td>`;
         tbody.appendChild(tr);
       } else {
         for (const e of entries) tbody.appendChild(kvRow(e));
@@ -326,22 +332,83 @@ function renderKv(root, { instanceId, api, showError, clearError }) {
 
   function kvRow(entry) {
     const tr = document.createElement("tr");
+    tr.dataset.key = entry.key;
+
     const keyCell = document.createElement("td");
     keyCell.className = "kv-key";
     keyCell.textContent = entry.key;
+    tr.appendChild(keyCell);
+
     const valCell = document.createElement("td");
     valCell.className = "kv-value";
-    const truncated = entry.value.length > 200
-      ? entry.value.slice(0, 200) + "…"
-      : entry.value;
-    valCell.textContent = truncated;
-    valCell.title = entry.value;
-    tr.appendChild(keyCell);
+    const valInput = document.createElement("input");
+    valInput.type = "text";
+    valInput.className = "kv-value-input";
+    valInput.value = entry.value;
+    valInput.dataset.original = entry.value;
+    valCell.appendChild(valInput);
     tr.appendChild(valCell);
+
+    const actionCell = document.createElement("td");
+    actionCell.className = "kv-actions";
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.textContent = "Save";
+    saveBtn.disabled = true;
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "danger";
+    delBtn.textContent = "Delete";
+    actionCell.appendChild(saveBtn);
+    actionCell.appendChild(delBtn);
+    tr.appendChild(actionCell);
+
+    valInput.addEventListener("input", () => {
+      saveBtn.disabled = valInput.value === valInput.dataset.original;
+    });
+
+    saveBtn.addEventListener("click", async () => {
+      saveBtn.disabled = true;
+      try {
+        await api.setKv(instanceId, entry.key, valInput.value);
+        valInput.dataset.original = valInput.value;
+      } catch (err) {
+        showError(`Save failed: ${err.message}`);
+        saveBtn.disabled = false;
+      }
+    });
+
+    delBtn.addEventListener("click", async () => {
+      if (!confirm(`Delete "${entry.key}"?`)) return;
+      try {
+        await api.deleteKv(instanceId, entry.key);
+        tr.remove();
+      } catch (err) {
+        showError(`Delete failed: ${err.message}`);
+      }
+    });
+
     return tr;
   }
 
+  async function onCreate(ev) {
+    ev.preventDefault();
+    clearError();
+    const data = new FormData(createForm);
+    const key = String(data.get("key") ?? "").trim();
+    const value = String(data.get("value") ?? "");
+    if (!key) return;
+    try {
+      await api.setKv(instanceId, key, value);
+      createForm.reset();
+      await load();
+    } catch (err) {
+      showError(`Set failed: ${err.message}`);
+    }
+  }
+
   refreshBtn.addEventListener("click", load);
+  createForm.addEventListener("submit", onCreate);
   prefixInput.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {
       ev.preventDefault();
