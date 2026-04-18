@@ -631,6 +631,38 @@ pub const Tenant = struct {
         return .{ .is_root = true };
     }
 
+    // ── Platform secrets: Resend API key ──────────────────────────────
+    //
+    // Stored plaintext at `__root__/resend_key`. The JS `email.send`
+    // wrapper reads it via `getResendKey` when building the outbox
+    // envelope so the customer handler never sees the key. Installed
+    // once at bootstrap by `--bootstrap-resend-key`; rotated by
+    // re-running the worker with a new value on that flag.
+
+    pub const RESEND_KEY_MIN_LEN: usize = 8;
+    pub const RESEND_KEY_MAX_LEN: usize = 256;
+
+    pub fn installResendKey(self: *Tenant, key: []const u8) Error!void {
+        if (key.len < RESEND_KEY_MIN_LEN or key.len > RESEND_KEY_MAX_LEN) {
+            return Error.InvalidToken;
+        }
+        for (key) |b| {
+            if (b < 0x21 or b > 0x7e) return Error.InvalidToken;
+        }
+        self.root.put("__root__/resend_key", key) catch return Error.Kv;
+    }
+
+    /// Returns the stored Resend key or null if none installed. The
+    /// bytes are allocated by the root `KvStore`'s allocator; free
+    /// with the same allocator the tenant was constructed with.
+    pub fn getResendKey(self: *Tenant) Error!?[]u8 {
+        const v = self.root.get("__root__/resend_key") catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return Error.Kv,
+        };
+        return v;
+    }
+
     // ── Session cookies ───────────────────────────────────────────────
     //
     // A session is an opaque 64-hex token handed to the browser via
@@ -1352,4 +1384,38 @@ test "expired session is rejected and swept" {
     try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(&opaque_hex));
     // Second lookup also null — sweep removed it.
     try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(&opaque_hex));
+}
+
+test "installResendKey + getResendKey round-trip" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(?[]u8, null), try fx.tenant.getResendKey());
+
+    try fx.tenant.installResendKey("re_test_key_abc123");
+    const got = (try fx.tenant.getResendKey()).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("re_test_key_abc123", got);
+}
+
+test "installResendKey replaces prior value" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try fx.tenant.installResendKey("re_old_key_xxxxxx");
+    try fx.tenant.installResendKey("re_new_key_yyyyyy");
+
+    const got = (try fx.tenant.getResendKey()).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("re_new_key_yyyyyy", got);
+}
+
+test "installResendKey rejects empty / whitespace / out-of-range" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try testing.expectError(Error.InvalidToken, fx.tenant.installResendKey(""));
+    try testing.expectError(Error.InvalidToken, fx.tenant.installResendKey("short"));
+    try testing.expectError(Error.InvalidToken, fx.tenant.installResendKey("has space in it abc"));
+    try testing.expectError(Error.InvalidToken, fx.tenant.installResendKey("has\nnewline123456"));
 }

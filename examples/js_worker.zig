@@ -346,6 +346,11 @@ const Cli = struct {
     /// `/_system/*` request must carry this token in an
     /// `Authorization: Bearer <hex>` header.
     bootstrap_root_token: ?[]const u8 = null,
+    /// Platform-provided Resend API key. When set, the worker
+    /// installs it at `__root__/resend_key` so `email.send` can read
+    /// it when building its outbox envelope. Customer handlers never
+    /// see the plaintext. Rotate by re-running with a new value.
+    bootstrap_resend_key: ?[]const u8 = null,
     /// Number of worker threads. Each owns its own Registry/Io/H2/
     /// Tenant/Dispatcher and binds the same HTTP/2 port via
     /// SO_REUSEPORT. Defaults to the number of online CPUs.
@@ -434,6 +439,10 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.bootstrap_root_token = argv[i];
+        } else if (std.mem.eql(u8, a, "--bootstrap-resend-key")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.bootstrap_resend_key = argv[i];
         } else if (std.mem.eql(u8, a, "--workers")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
@@ -799,6 +808,14 @@ pub fn main() !void {
                 std.process.exit(2);
             };
             std.debug.print("bootstrap: root token installed\n", .{});
+        }
+
+        if (cli.bootstrap_resend_key) |k| {
+            tenant.installResendKey(k) catch |err| {
+                std.debug.print("bootstrap: installResendKey failed: {s}\n", .{@errorName(err)});
+                std.process.exit(2);
+            };
+            std.debug.print("bootstrap: resend key installed (platform default)\n", .{});
         }
 
         // __admin__ must be created before any other tenant because

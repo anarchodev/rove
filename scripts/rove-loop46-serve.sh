@@ -65,12 +65,16 @@ mkdir -p "$DATA_DIR"
 ADMIN_API_DOMAIN="app.${BASE_DOMAIN}"
 ADMIN_ORIGIN="https://${ADMIN_API_DOMAIN}"
 
-# Root token plumbing. Only passes `--bootstrap-root-token` if the
-# env var is set; otherwise boot uses the previously-installed token
-# from root.db.
+# Bootstrap plumbing. Flags only pass through when the matching env
+# var is set; otherwise boot reuses what's already in root.db.
+#   ROVE_TOKEN        → --bootstrap-root-token        (admin login)
+#   ROVE_RESEND_KEY   → --bootstrap-resend-key        (platform email default)
 BOOTSTRAP_ARGS=()
 if [[ -n "${ROVE_TOKEN:-}" ]]; then
-    BOOTSTRAP_ARGS=(--bootstrap-root-token "$ROVE_TOKEN")
+    BOOTSTRAP_ARGS+=(--bootstrap-root-token "$ROVE_TOKEN")
+fi
+if [[ -n "${ROVE_RESEND_KEY:-}" ]]; then
+    BOOTSTRAP_ARGS+=(--bootstrap-resend-key "$ROVE_RESEND_KEY")
 fi
 
 cat <<EOF
