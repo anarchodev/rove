@@ -142,6 +142,14 @@ pub const BlockedTenants = struct {
 pub const DEFAULT_REFRESH_INTERVAL_NS: i64 = 2 * std.time.ns_per_s;
 
 
+/// Metadata about a static file in the active deployment. Bytes are
+/// not cached — the dispatcher fetches them from the blob store on hit.
+/// `hash_hex` is both the content address and the strong ETag.
+pub const StaticEntry = struct {
+    content_type: []u8, // owned, may be empty
+    hash_hex: [files_mod.HASH_HEX_LEN]u8,
+};
+
 /// Per-tenant code state held by the worker. Owns its own KvStore,
 /// BlobStore, and cached bytecode for the tenant's active handler.
 /// Refreshed periodically via `refreshDeployments` when the tenant's
@@ -163,11 +171,13 @@ pub const TenantFiles = struct {
     current_deployment_id: u64,
     /// All handler bytecodes from the active deployment, keyed by the
     /// full deployment path (e.g. `"index.js"`, `"api/users/index.js"`).
-    /// Both keys and values are owned by `allocator`. The worker
-    /// request router picks which key to look up per request; an
-    /// empty map means no deployment has been loaded yet, and every
-    /// request hitting this tenant returns 503 until one lands.
+    /// Both keys and values are owned by `allocator`.
     bytecodes: std.StringHashMapUnmanaged([]u8),
+    /// Static files in the active deployment, keyed by the stored path
+    /// (e.g. `"_static/index.html"`). Keys and `StaticEntry.content_type`
+    /// are owned by `allocator`; bytes are fetched from `blob_backend`
+    /// on demand.
+    statics: std.StringHashMapUnmanaged(StaticEntry),
     /// When the next refresh check is allowed (absolute
     /// `std.time.nanoTimestamp()`). `refreshDeployments` skips tenants
     /// whose deadline hasn't passed yet so we don't hammer the code
@@ -573,6 +583,7 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
         .store = undefined, // filled after we have a stable `tc` pointer
         .current_deployment_id = 0,
         .bytecodes = .empty,
+        .statics = .empty,
         .next_refresh_ns = 0,
     };
     tc.store = files_mod.FileStore.init(
@@ -602,6 +613,7 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
 
 fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
     freeBytecodes(tc);
+    freeStatics(tc);
     tc.blob_backend.deinit();
     tc.files_kv.close();
     allocator.free(tc.instance_id);
@@ -938,10 +950,23 @@ fn freeBytecodes(tc: *TenantFiles) void {
     tc.bytecodes = .empty;
 }
 
-/// Read the tenant's current deployment manifest, fetch every entry's
-/// bytecode blob, and atomically swap the tenant's `bytecodes` map.
-/// Returns `error.NoDeployment` if no deploy has been made yet — soft
-/// failure the caller treats as "leave the map empty".
+/// Free every key + StaticEntry.content_type in `tc.statics` and clear
+/// the map. Paired with `freeBytecodes` for deployment teardown.
+fn freeStatics(tc: *TenantFiles) void {
+    var it = tc.statics.iterator();
+    while (it.next()) |e| {
+        tc.allocator.free(e.key_ptr.*);
+        tc.allocator.free(e.value_ptr.*.content_type);
+    }
+    tc.statics.deinit(tc.allocator);
+    tc.statics = .empty;
+}
+
+/// Read the tenant's current deployment manifest, fetch every handler
+/// entry's bytecode blob, stage every static entry's metadata, and
+/// atomically swap both maps on the tenant. Returns `error.NoDeployment`
+/// when no deploy has been made yet — soft failure the caller treats
+/// as "leave the maps empty".
 fn reloadAllBytecodes(tc: *TenantFiles) !void {
     var manifest = tc.store.loadCurrentDeployment() catch |err| switch (err) {
         error.NotFound => return error.NoDeployment,
@@ -951,35 +976,58 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
 
     const bs = tc.blob_backend.blobStore();
 
-    // Build the new map in a local before swapping, so if any fetch
+    // Build the new maps in locals before swapping, so if any fetch
     // fails mid-way the tenant keeps serving the old deployment.
-    var next: std.StringHashMapUnmanaged([]u8) = .empty;
+    var next_bc: std.StringHashMapUnmanaged([]u8) = .empty;
     errdefer {
-        var it = next.iterator();
+        var it = next_bc.iterator();
         while (it.next()) |e| {
             tc.allocator.free(e.key_ptr.*);
             tc.allocator.free(e.value_ptr.*);
         }
-        next.deinit(tc.allocator);
+        next_bc.deinit(tc.allocator);
+    }
+
+    var next_statics: std.StringHashMapUnmanaged(StaticEntry) = .empty;
+    errdefer {
+        var it = next_statics.iterator();
+        while (it.next()) |e| {
+            tc.allocator.free(e.key_ptr.*);
+            tc.allocator.free(e.value_ptr.*.content_type);
+        }
+        next_statics.deinit(tc.allocator);
     }
 
     for (manifest.entries) |entry| {
-        if (entry.kind != .handler) continue;
         const path_copy = try tc.allocator.dupe(u8, entry.path);
         errdefer tc.allocator.free(path_copy);
-        const bytecode = try bs.get(&entry.bytecode_hex, tc.allocator);
-        errdefer tc.allocator.free(bytecode);
-        try next.put(tc.allocator, path_copy, bytecode);
+        switch (entry.kind) {
+            .handler => {
+                const bytecode = try bs.get(&entry.bytecode_hex, tc.allocator);
+                errdefer tc.allocator.free(bytecode);
+                try next_bc.put(tc.allocator, path_copy, bytecode);
+            },
+            .static => {
+                const ct_copy = try tc.allocator.dupe(u8, entry.content_type);
+                errdefer tc.allocator.free(ct_copy);
+                try next_statics.put(tc.allocator, path_copy, .{
+                    .content_type = ct_copy,
+                    .hash_hex = entry.source_hex,
+                });
+            },
+        }
     }
 
     // Swap.
     freeBytecodes(tc);
-    tc.bytecodes = next;
+    freeStatics(tc);
+    tc.bytecodes = next_bc;
+    tc.statics = next_statics;
     tc.current_deployment_id = manifest.id;
 
     std.log.info(
-        "rove-js: tenant {s} loaded deployment {d} ({d} file(s))",
-        .{ tc.instance_id, manifest.id, manifest.entries.len },
+        "rove-js: tenant {s} loaded deployment {d} ({d} handler(s), {d} static(s))",
+        .{ tc.instance_id, manifest.id, tc.bytecodes.count(), tc.statics.count() },
     );
 }
 
@@ -1377,11 +1425,37 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             processed += 1;
             continue;
         };
-        if (tc.bytecodes.count() == 0) {
+        if (tc.current_deployment_id == 0) {
             try setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
             captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{});
             processed += 1;
             continue;
+        }
+
+        // Static-first dispatch: GET requests for paths that map onto a
+        // `_static/*` manifest entry get served natively here — no JS
+        // context, no budget, no tape capture. On a miss we fall
+        // through to handler resolution below. Admin requests also
+        // pass through so the admin UI is dogfooded via `_static/*`.
+        if (std.mem.eql(u8, method, "GET")) {
+            const static_outcome = try tryServeStatic(
+                server,
+                allocator,
+                ent,
+                sid,
+                sess,
+                tc,
+                path,
+                rh,
+            );
+            switch (static_outcome) {
+                .served => |status| {
+                    captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, status, .ok, &.{}, &.{}, .{});
+                    processed += 1;
+                    continue;
+                },
+                .miss => {},
+            }
         }
 
         var route = router_mod.resolveRoute(allocator, path) catch |err| {
@@ -2320,6 +2394,296 @@ fn buildHandlerRespHeaders(
     };
 }
 
+// ── Static dispatch ────────────────────────────────────────────────────
+
+/// Result of a static-file lookup/serve attempt. `miss` means the
+/// caller should fall through to handler routing.
+pub const StaticOutcome = union(enum) {
+    served: u16,
+    miss: void,
+};
+
+/// Try to serve `path` from the tenant's `_static/*` set. Returns the
+/// status code if we took the response (200, 304, or 301 for trailing-
+/// slash canonicalization) or `.miss` when nothing matched. Only called
+/// on `GET`; the caller enforces the method gate.
+fn tryServeStatic(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    tc: *TenantFiles,
+    path: []const u8,
+    rh: h2.ReqHeaders,
+) !StaticOutcome {
+    const qmark = std.mem.indexOfScalar(u8, path, '?');
+    const path_no_q = if (qmark) |q| path[0..q] else path;
+    if (path_no_q.len == 0 or path_no_q[0] != '/') return .miss;
+
+    // Trailing-slash canonicalization: redirect `/foo/` → `/foo` (not
+    // `/` itself). Only on GET, by design, so API clients using
+    // trailing-slash conventions on POST aren't surprised.
+    if (path_no_q.len > 1 and path_no_q[path_no_q.len - 1] == '/') {
+        var canon_buf: [files_mod.MAX_PATH_LEN + 16]u8 = undefined;
+        var stripped: []const u8 = path_no_q;
+        while (stripped.len > 1 and stripped[stripped.len - 1] == '/') {
+            stripped = stripped[0 .. stripped.len - 1];
+        }
+        // Preserve the original query string on the redirect target.
+        const loc = if (qmark) |q|
+            std.fmt.bufPrint(&canon_buf, "{s}?{s}", .{ stripped, path[q + 1 ..] }) catch return .miss
+        else
+            stripped;
+        try emitStaticRedirect(server, allocator, ent, sid, sess, loc);
+        return .{ .served = 301 };
+    }
+
+    const rel = path_no_q[1..];
+
+    var key_buf: [8 + files_mod.MAX_PATH_LEN + 16]u8 = undefined;
+    if (rel.len == 0) {
+        const key = std.fmt.bufPrint(&key_buf, "_static/index.html", .{}) catch return .miss;
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, key, rh)) |st| {
+            return .{ .served = st };
+        }
+        return .miss;
+    }
+
+    // Exact match: `_static/<rel>`.
+    if (std.fmt.bufPrint(&key_buf, "_static/{s}", .{rel})) |k| {
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh)) |st| {
+            return .{ .served = st };
+        }
+    } else |_| {}
+
+    // `.html` suffix: `_static/<rel>.html`.
+    if (std.fmt.bufPrint(&key_buf, "_static/{s}.html", .{rel})) |k| {
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh)) |st| {
+            return .{ .served = st };
+        }
+    } else |_| {}
+
+    // Directory index: `_static/<rel>/index.html`.
+    if (std.fmt.bufPrint(&key_buf, "_static/{s}/index.html", .{rel})) |k| {
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh)) |st| {
+            return .{ .served = st };
+        }
+    } else |_| {}
+
+    return .miss;
+}
+
+/// Return the status code if `key` is present and we wrote a response,
+/// or null if the key isn't in the static map.
+fn serveStaticByKey(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    tc: *TenantFiles,
+    key: []const u8,
+    rh: h2.ReqHeaders,
+) !?u16 {
+    const entry = tc.statics.get(key) orelse return null;
+
+    // Build the strong ETag value (`"<hex>"`) once; shared by 200 and 304.
+    var etag_buf: [files_mod.HASH_HEX_LEN + 2]u8 = undefined;
+    etag_buf[0] = '"';
+    @memcpy(etag_buf[1 .. 1 + files_mod.HASH_HEX_LEN], &entry.hash_hex);
+    etag_buf[1 + files_mod.HASH_HEX_LEN] = '"';
+    const etag = etag_buf[0..];
+
+    // If-None-Match: a comma-separated list of quoted tags (or `*`).
+    // Match = any one of them equals our etag.
+    const inm = findHeader(rh, "if-none-match");
+    if (inm != null and etagMatches(inm.?, etag)) {
+        try emitStaticResponse(
+            server,
+            allocator,
+            ent,
+            sid,
+            sess,
+            304,
+            "",
+            "",
+            etag,
+        );
+        return 304;
+    }
+
+    const bytes = tc.blob_backend.blobStore().get(&entry.hash_hex, allocator) catch |err| {
+        std.log.warn(
+            "rove-js: static blob fetch for {s} failed: {s}",
+            .{ key, @errorName(err) },
+        );
+        return err;
+    };
+    try emitStaticResponse(
+        server,
+        allocator,
+        ent,
+        sid,
+        sess,
+        200,
+        bytes,
+        entry.content_type,
+        etag,
+    );
+    return 200;
+}
+
+/// True if `inm` (If-None-Match header value) contains a tag equal to
+/// `etag`. Handles comma-separated lists and the `*` wildcard.
+fn etagMatches(inm: []const u8, etag: []const u8) bool {
+    var rest = inm;
+    while (rest.len > 0) {
+        while (rest.len > 0 and (rest[0] == ' ' or rest[0] == ',' or rest[0] == '\t')) {
+            rest = rest[1..];
+        }
+        if (rest.len == 0) break;
+        if (rest[0] == '*') return true;
+        // Find the next comma or end.
+        const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
+        var tag = rest[0..end];
+        // Trim trailing whitespace.
+        while (tag.len > 0 and (tag[tag.len - 1] == ' ' or tag[tag.len - 1] == '\t')) {
+            tag = tag[0 .. tag.len - 1];
+        }
+        // Strip a weak prefix (`W/`) if present — for static we only
+        // emit strong tags, but a client may be comparing weakly.
+        if (tag.len >= 2 and tag[0] == 'W' and tag[1] == '/') tag = tag[2..];
+        if (std.mem.eql(u8, tag, etag)) return true;
+        rest = rest[end..];
+        if (rest.len > 0) rest = rest[1..]; // skip the comma
+    }
+    return false;
+}
+
+/// Write a 200/304 static response. Body is duped into the response
+/// entity (so caller's `bytes` can be freed by its allocator immediately
+/// after). Passes an empty body for 304.
+fn emitStaticResponse(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    status_code: u16,
+    body: []const u8,
+    content_type: []const u8,
+    etag: []const u8,
+) !void {
+    const hdrs = try buildStaticRespHeaders(allocator, content_type, etag);
+    var body_ptr: ?[*]u8 = null;
+    var body_len: u32 = 0;
+    if (body.len > 0) {
+        const copy = try allocator.dupe(u8, body);
+        body_ptr = copy.ptr;
+        body_len = @intCast(copy.len);
+    }
+
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = body_ptr,
+        .len = body_len,
+    });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+fn buildStaticRespHeaders(
+    allocator: std.mem.Allocator,
+    content_type: []const u8,
+    etag: []const u8,
+) !h2.RespHeaders {
+    const Pair = struct { name: []const u8, value: []const u8 };
+    var pairs: [3]Pair = undefined;
+    var n: usize = 0;
+    if (content_type.len > 0) {
+        pairs[n] = .{ .name = "content-type", .value = content_type };
+        n += 1;
+    }
+    pairs[n] = .{ .name = "etag", .value = etag };
+    n += 1;
+    pairs[n] = .{ .name = "cache-control", .value = "public, max-age=0, must-revalidate" };
+    n += 1;
+
+    const fields_size = n * @sizeOf(h2.HeaderField);
+    var strbuf_size: usize = 0;
+    for (pairs[0..n]) |p| strbuf_size += p.name.len + p.value.len;
+
+    const buf = try allocator.alloc(u8, fields_size + strbuf_size);
+    errdefer allocator.free(buf);
+
+    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
+    var off: usize = fields_size;
+    for (pairs[0..n], 0..) |p, i| {
+        const name_start = off;
+        @memcpy(buf[off .. off + p.name.len], p.name);
+        off += p.name.len;
+        const value_start = off;
+        @memcpy(buf[off .. off + p.value.len], p.value);
+        off += p.value.len;
+        fields_ptr[i] = .{
+            .name = buf[name_start..].ptr,
+            .name_len = @intCast(p.name.len),
+            .value = buf[value_start..].ptr,
+            .value_len = @intCast(p.value.len),
+        };
+    }
+
+    return .{
+        .fields = fields_ptr,
+        .count = @intCast(n),
+        ._buf = buf.ptr,
+        ._buf_len = @intCast(buf.len),
+    };
+}
+
+/// Write a 301 redirect response. `location` is duped into the response
+/// header buffer so the caller doesn't need to keep it alive.
+fn emitStaticRedirect(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    location: []const u8,
+) !void {
+    const fields_size = @sizeOf(h2.HeaderField);
+    const name_len: usize = "location".len;
+    const buf = try allocator.alloc(u8, fields_size + name_len + location.len);
+    errdefer allocator.free(buf);
+
+    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
+    @memcpy(buf[fields_size .. fields_size + name_len], "location");
+    @memcpy(buf[fields_size + name_len ..][0..location.len], location);
+    fields_ptr[0] = .{
+        .name = buf[fields_size..].ptr,
+        .name_len = @intCast(name_len),
+        .value = buf[fields_size + name_len ..].ptr,
+        .value_len = @intCast(location.len),
+    };
+
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 301 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{
+        .fields = fields_ptr,
+        .count = 1,
+        ._buf = buf.ptr,
+        ._buf_len = @intCast(buf.len),
+    });
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
 /// Like `setSimpleResponse`, but stamps CORS response headers when
 /// `cors_origin` is non-null and an optional `Content-Type`. Use in
 /// the `/_system/*` branch so admin UI responses carry the right
@@ -2673,4 +3037,28 @@ test "captureLog appends a record to the tenant's LogStore" {
     try testing.expectEqualStrings("/test", result.records[0].path);
     try testing.expectEqual(@as(u64, 42), result.records[0].deployment_id);
     try testing.expectEqual(log_mod.Outcome.ok, result.records[0].outcome);
+}
+
+test "etagMatches: single tag" {
+    try std.testing.expect(etagMatches("\"abc\"", "\"abc\""));
+    try std.testing.expect(!etagMatches("\"abc\"", "\"xyz\""));
+}
+
+test "etagMatches: weak prefix stripped" {
+    try std.testing.expect(etagMatches("W/\"abc\"", "\"abc\""));
+}
+
+test "etagMatches: comma list" {
+    try std.testing.expect(etagMatches("\"xyz\", \"abc\", \"qqq\"", "\"abc\""));
+    try std.testing.expect(!etagMatches("\"xyz\", \"qqq\"", "\"abc\""));
+}
+
+test "etagMatches: wildcard" {
+    try std.testing.expect(etagMatches("*", "\"anything\""));
+    try std.testing.expect(etagMatches("\"a\", *", "\"b\""));
+}
+
+test "etagMatches: empty or whitespace only" {
+    try std.testing.expect(!etagMatches("", "\"abc\""));
+    try std.testing.expect(!etagMatches("   ", "\"abc\""));
 }
