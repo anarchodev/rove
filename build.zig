@@ -325,6 +325,7 @@ pub fn build(b: *std.Build) void {
     js_worker_mod.addImport("rove-qjs", qjs_mod);
     js_worker_mod.addImport("rove-tenant", tenant_mod);
     js_worker_mod.addImport("rove-h2", h2_mod);
+    js_worker_mod.addImport("rove-outbox", outbox_mod);
     // Admin UI bundle — embedded so js-worker ships with a working
     // dashboard at app.{BASE_DOMAIN}/ out of the box. Each file becomes
     // a `_static/<path>` entry in __admin__'s initial deployment.

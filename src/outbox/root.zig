@@ -18,8 +18,14 @@
 
 pub const ssrf = @import("ssrf.zig");
 pub const http_client = @import("http_client.zig");
+pub const drainer = @import("drainer.zig");
 
 pub const MAX_BODY_BYTES = http_client.MAX_BODY_BYTES;
+pub const Drainer = drainer.Handle;
+pub const spawnDrainer = drainer.spawn;
+pub const DrainerConfig = drainer.Config;
+pub const InstanceInfo = drainer.InstanceInfo;
+pub const InstanceProvider = drainer.InstanceProvider;
 
 test {
     @import("std").testing.refAllDecls(@This());

@@ -57,6 +57,7 @@ const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
 const files_server = @import("rove-files-server");
 const log_server = @import("rove-log-server");
+const outbox = @import("rove-outbox");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
 const h2_mod = @import("rove-h2");
@@ -967,6 +968,26 @@ pub fn main() !void {
     var raft_thread = try std.Thread.spawn(.{}, raftThreadMain, .{raft_node});
     raft_thread.detach();
 
+    // ── Outbox drainer ──
+    //
+    // One thread on the raft leader scans every tenant's `_outbox/*`
+    // and runs the HTTP side. At-least-once delivery; receivers dedup
+    // on X-Rove-Webhook-Id. The InstanceProvider here is a simple
+    // filesystem walk — cheap at our current scale; slice 3b replaces
+    // it with a root-marker index once the LRU matters.
+    var fs_provider_ctx = FsInstanceProvider{ .data_dir = cli.data_dir };
+    const drainer_handle = try outbox.spawnDrainer(.{
+        .allocator = allocator,
+        .raft = raft_node,
+        .instances = .{
+            .snapshot = FsInstanceProvider.snapshot,
+            .deinit = FsInstanceProvider.deinit,
+            .ctx = &fs_provider_ctx,
+        },
+    });
+    defer drainer_handle.join();
+    defer drainer_handle.signalStop();
+
     // ── Spawn worker threads ───────────────────────────────────────────
     const http_addr = try parseHostPort(allocator, cli.http);
 
@@ -1244,5 +1265,55 @@ const QjsCompiler = struct {
         else
             .{};
         return self.context.compileToBytecode(source, filename, allocator, kind);
+    }
+};
+
+/// InstanceProvider that walks `{data_dir}/*` on each scan and
+/// reports every subdir that has an `app.db` file. Cheap at our
+/// current scale (tens of tenants); slice 3b replaces it with a
+/// root-marker scan once the LRU cache lands.
+const FsInstanceProvider = struct {
+    data_dir: []const u8,
+
+    fn snapshot(ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror![]outbox.InstanceInfo {
+        const self: *FsInstanceProvider = @ptrCast(@alignCast(ctx.?));
+        var list: std.ArrayListUnmanaged(outbox.InstanceInfo) = .empty;
+        errdefer {
+            for (list.items) |info| {
+                allocator.free(info.id);
+                allocator.free(info.dir);
+            }
+            list.deinit(allocator);
+        }
+
+        var dir = std.fs.cwd().openDir(self.data_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return list.toOwnedSlice(allocator),
+            else => return err,
+        };
+        defer dir.close();
+
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            // Peek for an app.db to confirm this is a tenant dir.
+            const probe = try std.fmt.allocPrint(allocator, "{s}/{s}/app.db", .{ self.data_dir, entry.name });
+            defer allocator.free(probe);
+            std.fs.cwd().access(probe, .{}) catch continue;
+
+            const id_copy = try allocator.dupe(u8, entry.name);
+            errdefer allocator.free(id_copy);
+            const dir_copy = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.data_dir, entry.name });
+            errdefer allocator.free(dir_copy);
+            try list.append(allocator, .{ .id = id_copy, .dir = dir_copy });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    fn deinit(_: ?*anyopaque, allocator: std.mem.Allocator, slice: []outbox.InstanceInfo) void {
+        for (slice) |info| {
+            allocator.free(info.id);
+            allocator.free(info.dir);
+        }
+        allocator.free(slice);
     }
 };
