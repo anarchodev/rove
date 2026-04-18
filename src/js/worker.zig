@@ -1694,10 +1694,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // gets empty RespHeaders (plus any Set-Cookies the handler
         // pushed via `response.cookies`).
         const handler_cors = if (is_admin_request) worker.admin_origin else null;
+        const handler_ct: ?[]const u8 = if (resp.body_is_json) "application/json" else null;
         const handler_resp_hdrs: h2.RespHeaders = try buildHandlerRespHeaders(
             allocator,
             handler_cors,
             resp.set_cookies,
+            handler_ct,
         );
         try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
         try server.reg.set(ent, &server.request_out, h2.RespHeaders, handler_resp_hdrs);
@@ -2391,9 +2393,11 @@ fn buildHandlerRespHeaders(
     allocator: std.mem.Allocator,
     cors_origin: ?[]const u8,
     set_cookies: []const []const u8,
+    content_type: ?[]const u8,
 ) !h2.RespHeaders {
     const cors_fields: usize = if (cors_origin != null) 4 else 0;
-    const total_fields = cors_fields + set_cookies.len;
+    const ct_fields: usize = if (content_type != null) 1 else 0;
+    const total_fields = cors_fields + ct_fields + set_cookies.len;
     if (total_fields == 0) return .{ .fields = null, .count = 0 };
 
     const fields_size = total_fields * @sizeOf(h2.HeaderField);
@@ -2404,6 +2408,7 @@ fn buildHandlerRespHeaders(
         strbuf_size += "vary".len + "origin".len;
         strbuf_size += "access-control-expose-headers".len + "content-type".len;
     }
+    if (content_type) |ct| strbuf_size += "content-type".len + ct.len;
     for (set_cookies) |cookie| strbuf_size += "set-cookie".len + cookie.len;
 
     const total = fields_size + strbuf_size;
@@ -2444,6 +2449,9 @@ fn buildHandlerRespHeaders(
         writePair(buf, &off, fields_ptr, &i, "access-control-allow-credentials", "true");
         writePair(buf, &off, fields_ptr, &i, "vary", "origin");
         writePair(buf, &off, fields_ptr, &i, "access-control-expose-headers", "content-type");
+    }
+    if (content_type) |ct| {
+        writePair(buf, &off, fields_ptr, &i, "content-type", ct);
     }
     for (set_cookies) |cookie| {
         writePair(buf, &off, fields_ptr, &i, "set-cookie", cookie);
@@ -3078,7 +3086,7 @@ fn buildAuthRespHeaders(
     set_cookie: []const u8,
 ) !h2.RespHeaders {
     const cookies = [_][]const u8{set_cookie};
-    return try buildHandlerRespHeaders(allocator, cors_origin, &cookies);
+    return try buildHandlerRespHeaders(allocator, cors_origin, &cookies, "application/json");
 }
 
 /// POST /v1/login. Body: `{"token": "<64-hex>"}`. On match, mint a

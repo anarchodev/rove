@@ -106,6 +106,11 @@ pub const Response = struct {
     /// owned, filter-passed cookie with any `Domain=...` attribute
     /// stripped (see `sanitizeSetCookie`). Empty slice = no cookies.
     set_cookies: [][]u8 = &.{},
+    /// True when the body came from `JSON.stringify(ret)` (i.e. the
+    /// handler returned an object/array/number). The worker stamps
+    /// `content-type: application/json` on the response when true, so
+    /// browser clients can `res.json()` without guessing.
+    body_is_json: bool = false,
 
     pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
         allocator.free(self.body);
@@ -263,6 +268,7 @@ pub const Dispatcher = struct {
         errdefer self.allocator.free(exception_msg);
         var body_buf: []u8 = &.{};
         errdefer self.allocator.free(body_buf);
+        var body_is_json: bool = false;
         var status: i32 = 200;
         var cookies: std.ArrayList([]u8) = .empty;
         errdefer {
@@ -282,7 +288,7 @@ pub const Dispatcher = struct {
             exception_msg = ctx.takeExceptionMessage(self.allocator) catch
                 return DispatchError.OutOfMemory;
             fun_val.deinit();
-            return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf, &cookies);
+            return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies);
         }
 
         if (fun_val.raw.tag != c.JS_TAG_MODULE) {
@@ -290,7 +296,7 @@ pub const Dispatcher = struct {
             status = 500;
             body_buf = self.allocator.dupe(u8, "handler bytecode is not an ES module (.mjs)") catch
                 return DispatchError.OutOfMemory;
-            return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf, &cookies);
+            return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies);
         }
 
         runModule(
@@ -303,6 +309,7 @@ pub const Dispatcher = struct {
             budget,
             &status,
             &body_buf,
+            &body_is_json,
             &exception_msg,
             &cookies,
         ) catch |err| switch (err) {
@@ -311,7 +318,7 @@ pub const Dispatcher = struct {
             error.JsException => {}, // exception_msg already populated
         };
 
-        return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf, &cookies);
+        return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies);
     }
 };
 
@@ -333,6 +340,7 @@ fn runModule(
     budget: *Budget,
     status_out: *i32,
     body_out: *[]u8,
+    body_is_json_out: *bool,
     exception_out: *[]u8,
     cookies_out: *std.ArrayList([]u8),
 ) RunError!void {
@@ -473,7 +481,7 @@ fn runModule(
 
     // Body from return value. Status / cookies from the ambient
     // `response` global.
-    bodyFromReturn(d.allocator, ctx.raw, final_val.raw, body_out) catch
+    bodyFromReturn(d.allocator, ctx.raw, final_val.raw, body_out, body_is_json_out) catch
         return error.OutOfMemory;
     extractResponseMetadata(d.allocator, ctx.raw, status_out, cookies_out) catch
         return error.OutOfMemory;
@@ -716,15 +724,17 @@ fn unwrapPromise(ctx: *c.JSContext, v: c.JSValue) Unwrapped {
 }
 
 /// Convert the handler's return value to bytes:
-///   - string       → raw string (no JSON quoting)
-///   - undefined/null → empty body
-///   - anything else → `JSON.stringify(ret)`
+///   - string       → raw string (no JSON quoting); `is_json_out` = false
+///   - undefined/null → empty body; `is_json_out` = false
+///   - anything else → `JSON.stringify(ret)`; `is_json_out` = true
 fn bodyFromReturn(
     allocator: std.mem.Allocator,
     ctx: *c.JSContext,
     ret: c.JSValue,
     body_out: *[]u8,
+    is_json_out: *bool,
 ) error{OutOfMemory}!void {
+    is_json_out.* = false;
     if (c.JS_IsUndefined(ret) or c.JS_IsNull(ret)) return;
     if (c.JS_IsString(ret)) {
         body_out.* = jsValueToOwned(allocator, ctx, ret) catch return error.OutOfMemory;
@@ -735,6 +745,7 @@ fn bodyFromReturn(
     defer c.JS_FreeValue(ctx, json);
     if (c.JS_IsException(json) or c.JS_IsUndefined(json)) return;
     body_out.* = jsValueToOwned(allocator, ctx, json) catch return error.OutOfMemory;
+    is_json_out.* = true;
 }
 
 /// Pull status + cookies off the ambient `response` global the handler
@@ -963,6 +974,7 @@ fn finishResponse(
     state: *globals.DispatchState,
     status: i32,
     body_buf: []u8,
+    body_is_json: bool,
     exception_msg: []u8,
     console_buf: *std.ArrayList(u8),
     cookies: *std.ArrayList([]u8),
@@ -986,6 +998,7 @@ fn finishResponse(
     return .{
         .status = status,
         .body = body_buf,
+        .body_is_json = body_is_json,
         .console = console_bytes,
         .exception = exception_msg,
         .set_cookies = set_cookies,
