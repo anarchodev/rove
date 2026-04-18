@@ -91,6 +91,14 @@ pub fn build(b: *std.Build) void {
     files_mod.addImport("rove-kv", kv_mod);
     files_mod.addImport("rove-blob", blob_mod);
 
+    // ── rove-outbox: webhook delivery (SSRF + HTTP client + drainer) ──
+    const outbox_mod = b.addModule("rove-outbox", .{
+        .root_source_file = b.path("src/outbox/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    outbox_mod.addImport("rove-kv", kv_mod);
+
     // ── rove-log: per-tenant request log store ──
     //
     // Phase 3. Mirrors rove-files's "per-tenant SQLite index + rove-blob
@@ -236,6 +244,10 @@ pub fn build(b: *std.Build) void {
     // rove-files tests
     const files_tests = b.addTest(.{ .root_module = files_mod });
     test_step.dependOn(&b.addRunArtifact(files_tests).step);
+
+    // rove-outbox tests
+    const outbox_tests = b.addTest(.{ .root_module = outbox_mod });
+    test_step.dependOn(&b.addRunArtifact(outbox_tests).step);
 
     // rove-log tests
     const log_tests = b.addTest(.{ .root_module = log_mod });
