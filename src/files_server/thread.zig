@@ -42,6 +42,7 @@ const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 
 const files_server = @import("root.zig");
+const files_mod = @import("rove-files");
 
 const CodeH2 = h2.H2(.{});
 
@@ -250,6 +251,11 @@ fn handleOne(
     } else if (std.mem.startsWith(u8, remainder, "source/") and std.mem.eql(u8, method, "GET")) {
         const hash = remainder["source/".len..];
         try handleSource(server, allocator, data_dir, ent, sid, sess, instance_id, hash);
+    } else if (std.mem.eql(u8, remainder, "list") and std.mem.eql(u8, method, "GET")) {
+        try handleList(server, allocator, data_dir, ent, sid, sess, instance_id);
+    } else if (std.mem.startsWith(u8, remainder, "file/") and std.mem.eql(u8, method, "GET")) {
+        const file_path = remainder["file/".len..];
+        try handleGetFile(server, allocator, data_dir, ent, sid, sess, instance_id, file_path);
     } else if (std.mem.startsWith(u8, remainder, "file/") and std.mem.eql(u8, method, "PUT")) {
         const file_path = remainder["file/".len..];
         try handlePutFile(server, allocator, data_dir, ent, sid, sess, instance_id, file_path, content_type, rb);
@@ -307,6 +313,126 @@ fn handleDeploy(
         return;
     };
     const body = try std.fmt.allocPrint(allocator, "{d}\n", .{dep_id});
+    try setResponse(server, ent, sid, sess, 200, body.ptr, body);
+}
+
+fn handleList(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    instance_id: []const u8,
+) !void {
+    var manifest = files_server.loadCurrentManifest(allocator, data_dir, instance_id) catch |err| {
+        if (err == files_server.Error.NotFound) {
+            // No deployment yet — empty list, not an error.
+            const empty = try std.fmt.allocPrint(
+                allocator,
+                "{{\"deployment_id\":0,\"entries\":[]}}",
+                .{},
+            );
+            try setResponse(server, ent, sid, sess, 200, empty.ptr, empty);
+            return;
+        }
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "list failed: {s}\n",
+            .{@errorName(err)},
+        );
+        try setResponse(server, ent, sid, sess, 500, msg.ptr, msg);
+        return;
+    };
+    defer manifest.deinit();
+
+    const body = try encodeListJson(allocator, &manifest);
+    try setResponse(server, ent, sid, sess, 200, body.ptr, body);
+}
+
+fn encodeListJson(
+    allocator: std.mem.Allocator,
+    manifest: *const files_mod.FileStore.Manifest,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+    try w.print("{{\"deployment_id\":{d},\"entries\":[", .{manifest.id});
+    for (manifest.entries, 0..) |e, i| {
+        if (i > 0) try w.writeByte(',');
+        const kind_str: []const u8 = if (e.kind == .handler) "handler" else "static";
+        try w.writeAll("{\"path\":");
+        try writeJsonString(&w, e.path);
+        try w.print(",\"kind\":\"{s}\",\"content_type\":", .{kind_str});
+        try writeJsonString(&w, e.content_type);
+        try w.print(",\"hash\":\"{s}\"}}", .{e.source_hex});
+    }
+    try w.writeAll("]}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn writeJsonString(w: anytype, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |b| {
+        switch (b) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            0...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+                try w.print("\\u{x:0>4}", .{b});
+            },
+            else => try w.writeByte(b),
+        }
+    }
+    try w.writeByte('"');
+}
+
+fn handleGetFile(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    instance_id: []const u8,
+    file_path: []const u8,
+) !void {
+    if (file_path.len == 0) {
+        try setResponse(server, ent, sid, sess, 400, null, "empty file path\n");
+        return;
+    }
+
+    var content = files_server.readFileByPath(allocator, data_dir, instance_id, file_path) catch |err| {
+        const code: u16 = switch (err) {
+            files_server.Error.NotFound => 404,
+            files_server.Error.InvalidPath, files_server.Error.InvalidInstanceId => 400,
+            else => 500,
+        };
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "getFile failed: {s}\n",
+            .{@errorName(err)},
+        );
+        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        return;
+    };
+    defer content.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+    const kind_str: []const u8 = if (content.kind == .handler) "handler" else "static";
+    try w.print("{{\"path\":", .{});
+    try writeJsonString(&w, file_path);
+    try w.print(",\"kind\":\"{s}\",\"content_type\":", .{kind_str});
+    try writeJsonString(&w, content.content_type);
+    try w.writeAll(",\"content\":");
+    try writeJsonString(&w, content.bytes);
+    try w.writeByte('}');
+
+    const body = try buf.toOwnedSlice(allocator);
     try setResponse(server, ent, sid, sess, 200, body.ptr, body);
 }
 

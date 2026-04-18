@@ -101,6 +101,12 @@ async function rawGet(base, path) {
   return res;
 }
 
+/// URL-encode a file path that may contain `/` separators. Slashes are
+/// preserved; each segment gets `encodeURIComponent`'d.
+function encodePath(path) {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
 export const api = {
   // ── Auth ─────────────────────────────────────────────────────────
   login(token) {
@@ -151,6 +157,34 @@ export const api = {
   },
   getKv(instance_id, key) {
     return rpc(scopeBase(instance_id), "getKv", [key]);
+  },
+
+  // ── Out-of-band: files (native Zig proxy) ────────────────────────
+  async listFiles(instance_id) {
+    const res = await rawGet(adminBase(),
+      `/_system/files/${encodeURIComponent(instance_id)}/list`);
+    return res.json();
+  },
+  async getFile(instance_id, path) {
+    const res = await rawGet(adminBase(),
+      `/_system/files/${encodeURIComponent(instance_id)}/file/${encodePath(path)}`);
+    return res.json();
+  },
+  async putFile(instance_id, path, content, contentType) {
+    const res = await fetch(
+      adminBase() + `/_system/files/${encodeURIComponent(instance_id)}/file/${encodePath(path)}`,
+      {
+        method: "PUT",
+        credentials: "include",
+        headers: { "Content-Type": contentType || "application/octet-stream" },
+        body: content,
+      },
+    );
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new ApiError(res.status, res.statusText, txt);
+    }
+    return res.text();
   },
 
   // ── Out-of-band: logs (native Zig proxy) ────────────────────────

@@ -323,6 +323,58 @@ pub fn loadDeployment(
     return h.store.loadDeployment(deployment_id) catch |err| mapCodeError(err);
 }
 
+/// Load the currently-active deployment manifest.
+pub fn loadCurrentManifest(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    instance_id: []const u8,
+) Error!files_mod.FileStore.Manifest {
+    var h: InstanceCtx = undefined;
+    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    defer h.deinit();
+    return h.store.loadCurrentDeployment() catch |err| mapCodeError(err);
+}
+
+pub const FileContent = struct {
+    kind: files_mod.Kind,
+    content_type: []u8,
+    bytes: []u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *FileContent) void {
+        self.allocator.free(self.content_type);
+        self.allocator.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+/// Read a file from the tenant's working tree by path (i.e. whatever
+/// the last `putSource`/`putStatic` wrote, regardless of deployment).
+/// For handlers this returns the JS source bytes.
+pub fn readFileByPath(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    instance_id: []const u8,
+    path: []const u8,
+) Error!FileContent {
+    var h: InstanceCtx = undefined;
+    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    defer h.deinit();
+
+    var info = h.store.stat(path) catch |err| return mapCodeError(err);
+    defer info.deinit();
+
+    const bytes = h.store.getSource(path, allocator) catch |err| return mapCodeError(err);
+    errdefer allocator.free(bytes);
+    const ct = allocator.dupe(u8, info.content_type) catch return Error.OutOfMemory;
+    return .{
+        .kind = info.kind,
+        .content_type = ct,
+        .bytes = bytes,
+        .allocator = allocator,
+    };
+}
+
 fn stubCompile(
     _: ?*anyopaque,
     _: []const u8,
