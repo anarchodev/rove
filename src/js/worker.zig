@@ -626,6 +626,22 @@ fn destroyAllTenantFiles(worker: anytype) void {
     worker.tenant_files_map.clearRetainingCapacity();
 }
 
+/// Lookup-or-lazy-open: if the worker already has a TenantFiles for
+/// `inst`, return it. Otherwise open a fresh one, cache it, and return.
+/// Callers fall through to 500 on failure — propagates errors up.
+fn getOrOpenTenantFiles(
+    worker: anytype,
+    inst: *const tenant_mod.Instance,
+) !*TenantFiles {
+    if (worker.tenant_files_map.get(inst.id)) |tc| return tc;
+    const opened = try openTenantFiles(worker, inst);
+    worker.tenant_files_map.put(worker.allocator, opened.instance_id, opened) catch |err| {
+        freeTenantFiles(worker.allocator, opened);
+        return err;
+    };
+    return opened;
+}
+
 // ── Per-tenant log loading ────────────────────────────────────────────
 //
 // Mirrors the TenantFiles helpers above. Each tenant gets a `log.db` +
@@ -1368,6 +1384,25 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             const qmark = std.mem.indexOfScalar(u8, path, '?');
             const path_no_q = if (qmark) |q| path[0..q] else path;
 
+            // Public static bundle: the admin UI's HTML/JS/CSS must
+            // reach the browser before auth so the login page can
+            // render. Serves GET requests that hit __admin__'s
+            // `_static/*` manifest. API calls (POSTs, /v1/*) fall
+            // through to the auth gate below.
+            if (std.mem.eql(u8, method, "GET")) {
+                const admin_inst = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+                if (admin_inst) |ai| {
+                    const admin_tc = getOrOpenTenantFiles(worker, ai) catch null;
+                    if (admin_tc) |tc| {
+                        const outcome = try tryServeStatic(server, allocator, ent, sid, sess, tc, path, rh);
+                        if (outcome != .miss) {
+                            processed += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Pre-auth native endpoints — `/v1/login` mints a session
             // from a body token; `/v1/logout` clears the cookie.
             if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/login")) {
@@ -1441,25 +1476,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         }
 
         // Lazy-open: instances created at runtime aren't in the map yet.
-        // On first hit, open TenantFiles and cache. Failure here is a
-        // real error (corrupt store / disk) — 500.
-        const tc = worker.tenant_files_map.get(handler_inst.id) orelse blk: {
-            const opened = openTenantFiles(worker, handler_inst) catch |err| {
-                std.log.warn("rove-js: lazy openTenantFiles({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
-                try setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
-                captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
-                processed += 1;
-                continue;
-            };
-            worker.tenant_files_map.put(worker.allocator, opened.instance_id, opened) catch |err| {
-                std.log.warn("rove-js: lazy tenant_files_map.put failed: {s}", .{@errorName(err)});
-                freeTenantFiles(worker.allocator, opened);
-                try setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
-                captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
-                processed += 1;
-                continue;
-            };
-            break :blk opened;
+        const tc = getOrOpenTenantFiles(worker, handler_inst) catch |err| {
+            std.log.warn("rove-js: lazy openTenantFiles({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
+            try setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
+            captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+            processed += 1;
+            continue;
         };
         if (tc.current_deployment_id == 0) {
             try setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
