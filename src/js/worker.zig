@@ -398,6 +398,11 @@ pub fn Worker(comptime opts: Options) type {
         /// Borrowed from `WorkerConfig.admin_api_domain`. Null
         /// disables admin subdomain routing entirely.
         admin_api_domain: ?[]const u8,
+        /// Upper 16 bits every `LogStore.nextRequestId()` minted by this
+        /// worker stamps onto ids so they don't collide with other
+        /// workers' ids. Copied from `WorkerConfig.log_worker_id` (or the
+        /// raft node id as a fallback).
+        log_worker_id: u16,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -451,6 +456,7 @@ pub fn Worker(comptime opts: Options) type {
                 .refresh_interval_ns = config.refresh_interval_ns,
                 .admin_origin = config.admin_origin,
                 .admin_api_domain = config.admin_api_domain,
+                .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
             };
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
@@ -468,13 +474,12 @@ pub fn Worker(comptime opts: Options) type {
             // The tenant registry's instances map was populated by
             // the caller before this create() call; we iterate it
             // once and open both per-tenant stores.
-            const worker_id: u16 = config.log_worker_id orelse @intCast(config.raft.config.node_id);
             var it = config.tenant.instances.iterator();
             while (it.next()) |entry| {
                 const inst = entry.value_ptr.*;
                 const tc = try openTenantFiles(self, inst);
                 try self.tenant_files_map.put(self.allocator, tc.instance_id, tc);
-                const tl = try openTenantLog(self, inst, worker_id);
+                const tl = try openTenantLog(self, inst, self.log_worker_id);
                 try self.tenant_logs.put(self.allocator, tl.instance_id, tl);
             }
 
@@ -708,6 +713,22 @@ fn destroyAllTenantLogs(worker: anytype) void {
     worker.tenant_logs.clearRetainingCapacity();
 }
 
+/// Mirror of `getOrOpenTenantFiles` for the log store. Lazy-opens a
+/// TenantLog for instances created at runtime so pre-minted
+/// request_ids and webhook outbox rows get matching log records.
+fn getOrOpenTenantLog(
+    worker: anytype,
+    inst: *const tenant_mod.Instance,
+) !*TenantLog {
+    if (worker.tenant_logs.get(inst.id)) |tl| return tl;
+    const opened = try openTenantLog(worker, inst, worker.log_worker_id);
+    worker.tenant_logs.put(worker.allocator, opened.instance_id, opened) catch |err| {
+        freeTenantLog(worker.allocator, opened);
+        return err;
+    };
+    return opened;
+}
+
 /// Append a log record for a request that has finished its dispatch
 /// pass. Best-effort: any internal failure is logged to stderr and
 /// dropped (no propagation back to the caller — the request itself
@@ -811,9 +832,46 @@ fn captureLog(
     exception_owned: []u8,
     tape_refs: log_mod.TapeRefs,
 ) void {
+    captureLogWithId(
+        worker,
+        instance_id,
+        null,
+        method,
+        path,
+        host,
+        deployment_id,
+        received_ns,
+        status,
+        outcome,
+        console_owned,
+        exception_owned,
+        tape_refs,
+    );
+}
+
+/// Same as `captureLog`, but lets the caller supply a pre-minted
+/// `request_id` so the log record shares its id with the outbox rows
+/// a handler may have spawned via `webhook.send`. Pass `null` to mint
+/// fresh.
+fn captureLogWithId(
+    worker: anytype,
+    instance_id: []const u8,
+    request_id: ?u64,
+    method: []const u8,
+    path: []const u8,
+    host: []const u8,
+    deployment_id: u64,
+    received_ns: i64,
+    status: u16,
+    outcome: log_mod.Outcome,
+    console_owned: []u8,
+    exception_owned: []u8,
+    tape_refs: log_mod.TapeRefs,
+) void {
     captureLogInner(
         worker,
         instance_id,
+        request_id,
         method,
         path,
         host,
@@ -835,6 +893,7 @@ fn captureLog(
 fn captureLogInner(
     worker: anytype,
     instance_id: []const u8,
+    request_id: ?u64,
     method: []const u8,
     path: []const u8,
     host: []const u8,
@@ -858,7 +917,7 @@ fn captureLogInner(
     const a_host = try allocator.dupe(u8, host);
     errdefer allocator.free(a_host);
 
-    const id = try tl.store.nextRequestId();
+    const id = request_id orelse try tl.store.nextRequestId();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
     try tl.store.append(.{
@@ -1188,6 +1247,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         deployment_id: u64,
         received_ns: i64,
         tape_refs: log_mod.TapeRefs,
+        /// Pre-minted id, reused on commit-time log capture so the log
+        /// record shares its id with any outbox rows `webhook.send`
+        /// wrote during this request's handler.
+        request_id: u64,
     };
     var successes: std.ArrayList(SuccessRec) = .empty;
     defer {
@@ -1614,6 +1677,22 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var tapes = RequestTapes.init(allocator);
         defer tapes.deinit();
 
+        // Pre-mint the request id. webhook.send derives its outbox id
+        // from this (so replays produce matching ids), and captureLog
+        // at the end reuses it so the log record shares the id with
+        // every outbox row this request spawned. Lazy-opens the log
+        // store if the tenant was created at runtime.
+        const request_id: u64 = blk: {
+            const tl_opt = getOrOpenTenantLog(worker, scope_inst) catch |err| {
+                std.log.warn("rove-js: getOrOpenTenantLog({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
+                break :blk 0;
+            };
+            break :blk tl_opt.store.nextRequestId() catch |err| {
+                std.log.warn("rove-js: nextRequestId({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
+                break :blk 0;
+            };
+        };
+
         const request: Request = .{
             .method = method,
             .path = path,
@@ -1624,12 +1703,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .math_random_tape = &tapes.math_random,
             .crypto_random_tape = &tapes.crypto_random,
             .prng_seed = @bitCast(received_ns),
+            .request_id = request_id,
         };
 
         txn.?.savepoint() catch |err| {
             std.log.warn("rove-js savepoint({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
             try setSimpleResponse(server, ent, sid, sess, 500, "savepoint failed\n", allocator);
-            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
@@ -1660,7 +1740,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             } else {
                 try setErrorResponse(server, ent, sid, sess);
             }
-            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, status, outcome, &.{}, &.{}, .{});
+            captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, status, outcome, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
@@ -1676,7 +1756,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             worker.dispatcher.last_kv_error = null;
             txn.?.rollbackTo() catch {};
             try setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
-            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1684,7 +1764,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         txn.?.release() catch |err| {
             std.log.warn("rove-js release savepoint failed: {s}", .{@errorName(err)});
             try setSimpleResponse(server, ent, sid, sess, 500, "kv release failed\n", allocator);
-            captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
@@ -1743,6 +1823,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .deployment_id = tc.current_deployment_id,
             .received_ns = received_ns,
             .tape_refs = tape_refs,
+            .request_id = request_id,
         });
     }
 
@@ -1766,7 +1847,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             const exception_owned = s.exception_owned;
             s.console_owned = &.{};
             s.exception_owned = &.{};
-            captureLog(worker, anchor_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .kv_error, console_owned, exception_owned, s.tape_refs);
+            captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .kv_error, console_owned, exception_owned, s.tape_refs);
             processed += 1;
         }
         successes.clearRetainingCapacity();
@@ -1781,7 +1862,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             const exception_owned = s.exception_owned;
             s.console_owned = &.{};
             s.exception_owned = &.{};
-            captureLog(worker, anchor_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
+            captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
             processed += 1;
         }
         successes.clearRetainingCapacity();
@@ -1803,7 +1884,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             const exception_owned = s.exception_owned;
             s.console_owned = &.{};
             s.exception_owned = &.{};
-            captureLog(worker, anchor_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .fault, console_owned, exception_owned, s.tape_refs);
+            captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .fault, console_owned, exception_owned, s.tape_refs);
             processed += 1;
         }
         successes.clearRetainingCapacity();
@@ -1824,7 +1905,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const exception_owned = s.exception_owned;
         s.console_owned = &.{};
         s.exception_owned = &.{};
-        captureLog(worker, anchor_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
+        captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
         processed += 1;
     }
     successes.clearRetainingCapacity();

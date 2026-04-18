@@ -92,6 +92,12 @@ pub const Request = struct {
     /// seed is belt-and-suspenders for the "tape was dropped but seed
     /// survived" scenario).
     prng_seed: u64 = 0,
+    /// Pre-minted per-request identifier. The dispatcher copies it
+    /// onto `DispatchState` so `webhook.send` can derive a stable
+    /// outbox id (`sha256(request_id || call_index)`) that matches on
+    /// replay. Also used downstream so the log record and the outbox
+    /// rows spawned by the request share the same id.
+    request_id: u64 = 0,
 };
 
 pub const Response = struct {
@@ -234,6 +240,7 @@ pub const Dispatcher = struct {
             .math_random_tape = request.math_random_tape,
             .crypto_random_tape = request.crypto_random_tape,
             .prng = std.Random.DefaultPrng.init(request.prng_seed),
+            .request_id = request.request_id,
         };
 
         // Memcpy-restore the frozen post-init image of
@@ -1807,4 +1814,119 @@ test "dispatch: request object fields populated" {
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqualStrings("PUT /x payload", resp.body);
+}
+
+test "dispatch: webhook.send writes _outbox/{id} with the envelope" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Handler fires two webhooks; the second exercises call_index = 1.
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const id1 = webhook.send({
+        \\  url: "https://example.test/a",
+        \\  body: "one",
+        \\  onResult: "cb/a",
+        \\  context: { x: 1 },
+        \\});
+        \\const id2 = webhook.send({
+        \\  url: "https://example.test/b",
+        \\  method: "GET",
+        \\});
+        \\return id1 + "|" + id2;
+    ,
+        .{ .method = "GET", .path = "/hook", .request_id = 0xdeadbeef },
+    );
+    defer resp.deinit(testing.allocator);
+
+    // 64-hex id | 64-hex id → 129 chars total.
+    try testing.expectEqual(@as(usize, 64 * 2 + 1), resp.body.len);
+
+    // Commit has already fired inside runOne. Scan `_outbox/*`; expect
+    // two rows in insertion order, each with the envelope we fed in.
+    const scan = try kv.prefix("_outbox/", "", 10);
+    defer {
+        var m = scan;
+        m.deinit();
+    }
+    try testing.expectEqual(@as(usize, 2), scan.entries.len);
+
+    // Each value must be JSON with the url/body/context we passed.
+    const parsed_a = try std.json.parseFromSlice(std.json.Value, testing.allocator, scan.entries[0].value, .{});
+    defer parsed_a.deinit();
+    const url_a = parsed_a.value.object.get("url").?.string;
+    try testing.expect(std.mem.endsWith(u8, url_a, "/a") or std.mem.endsWith(u8, url_a, "/b"));
+
+    const attempts = parsed_a.value.object.get("attempts").?.integer;
+    try testing.expectEqual(@as(i64, 0), attempts);
+
+    const parent = parsed_a.value.object.get("parent_request_id").?.integer;
+    try testing.expectEqual(@as(i64, 0xdeadbeef), parent);
+}
+
+test "dispatch: webhook.send ids are deterministic under replay" {
+    var buf_a: [64]u8 = undefined;
+    const kv_a = try openTempKv(testing.allocator, &buf_a);
+    defer {
+        kv_a.close();
+        cleanupTempKv(&buf_a);
+    }
+    var buf_b: [64]u8 = undefined;
+    const kv_b = try openTempKv(testing.allocator, &buf_b);
+    defer {
+        kv_b.close();
+        cleanupTempKv(&buf_b);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Same request_id across two runs → same outbox ids returned.
+    var r1 = try runOne(&d, kv_a,
+        \\return webhook.send({ url: "https://x.test/" });
+    , .{ .method = "POST", .path = "/", .request_id = 42 });
+    defer r1.deinit(testing.allocator);
+
+    var r2 = try runOne(&d, kv_b,
+        \\return webhook.send({ url: "https://totally-different.example/" });
+    , .{ .method = "POST", .path = "/", .request_id = 42 });
+    defer r2.deinit(testing.allocator);
+
+    // Ids are derived from (request_id, call_index) only — the url
+    // doesn't factor in — so both handlers produce the same id.
+    try testing.expectEqualStrings(r1.body, r2.body);
+}
+
+test "dispatch: webhook.send rejects missing url" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try {
+        \\  webhook.send({ method: "POST" });
+        \\  return "ok";
+        \\} catch (e) {
+        \\  return "threw:" + e.message;
+        \\}
+    ,
+        .{ .method = "GET", .path = "/", .request_id = 1 },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
 }

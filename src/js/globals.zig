@@ -69,6 +69,14 @@ pub const DispatchState = struct {
     /// by the dispatcher per request. Installed only when a tape is
     /// present (so the normal path still uses qjs's built-in Math.random).
     prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
+    /// Per-request identifier, pre-minted by the worker. Combined with
+    /// `webhook_call_index` to derive a deterministic outbox id for
+    /// every `webhook.send` this handler invocation performs.
+    request_id: u64 = 0,
+    /// 0-based counter of `webhook.send` calls within this handler
+    /// invocation. Resets per request. Part of the outbox id derivation
+    /// so replays produce the same ids.
+    webhook_call_index: u32 = 0,
 };
 
 // ── C helpers ──────────────────────────────────────────────────────────
@@ -337,6 +345,155 @@ fn jsCryptoRandomUuid(
     return c.JS_NewStringLen(ctx, &out, 36);
 }
 
+// ── webhook.send ──────────────────────────────────────────────────────
+//
+// Writes a serialized delivery envelope to `_outbox/{id}` inside the
+// current handler transaction. The drainer (separate thread on the
+// raft leader) picks these up, makes the HTTP call, and enqueues a
+// callback. Id derivation: `sha256(request_id || call_index)` — both
+// pre-minted so the same handler run against the same inputs produces
+// the same ids, which is what replay determinism wants.
+//
+// We build the envelope as a JS object with a normalized shape
+// (defaults filled in, derived fields stamped), then `JS_JSONStringify`
+// it. Cheaper than hand-rolling the escaping for strings / headers /
+// context.
+
+fn computeOutboxId(request_id: u64, call_index: u32, out: *[64]u8) void {
+    var buf: [12]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], request_id, .big);
+    std.mem.writeInt(u32, buf[8..12], call_index, .big);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&buf, &digest, .{});
+    const hex_chars = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+}
+
+/// Transfer `src` to `dst[name]`. Ownership moves — don't free `src`
+/// after this.
+fn setOwned(ctx: ?*c.JSContext, dst: c.JSValue, name: [:0]const u8, src: c.JSValue) void {
+    _ = c.JS_SetPropertyStr(ctx, dst, name.ptr, src);
+}
+
+/// Copy `opts[name]` to `dst[name]` when present. If `default_val` is
+/// non-null, fall back to it (refcount consumed).
+fn copyField(
+    ctx: ?*c.JSContext,
+    opts: c.JSValue,
+    dst: c.JSValue,
+    name: [:0]const u8,
+    default_val: ?c.JSValue,
+) void {
+    const v = c.JS_GetPropertyStr(ctx, opts, name.ptr);
+    if (c.JS_IsUndefined(v)) {
+        c.JS_FreeValue(ctx, v);
+        if (default_val) |d| setOwned(ctx, dst, name, d);
+        return;
+    }
+    if (default_val) |d| c.JS_FreeValue(ctx, d);
+    setOwned(ctx, dst, name, v);
+}
+
+fn jsWebhookSend(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = getState(ctx);
+    if (argc < 1 or !c.JS_IsObject(argv[0])) {
+        _ = c.JS_ThrowTypeError(ctx, "webhook.send requires an options object");
+        return js_exception;
+    }
+    const opts = argv[0];
+
+    // url is required and must be a string.
+    const url_v = c.JS_GetPropertyStr(ctx, opts, "url");
+    if (!c.JS_IsString(url_v)) {
+        c.JS_FreeValue(ctx, url_v);
+        _ = c.JS_ThrowTypeError(ctx, "webhook.send: `url` must be a string");
+        return js_exception;
+    }
+
+    var id_hex: [64]u8 = undefined;
+    computeOutboxId(state.request_id, state.webhook_call_index, &id_hex);
+
+    // Build the canonical envelope. Users supply the interesting
+    // fields; we derive id / attempts / next_attempt_at / created_at /
+    // parent_request_id. Setting on env transfers ownership — don't
+    // free the `url_v` below.
+    const env = c.JS_NewObject(ctx);
+    setOwned(ctx, env, "v", c.JS_NewInt32(ctx, 1));
+    setOwned(ctx, env, "id", c.JS_NewStringLen(ctx, &id_hex, 64));
+    setOwned(ctx, env, "url", url_v);
+
+    // method: default "POST".
+    copyField(ctx, opts, env, "method", c.JS_NewString(ctx, "POST"));
+    // headers: default {}.
+    copyField(ctx, opts, env, "headers", c.JS_NewObject(ctx));
+    // body: default "".
+    copyField(ctx, opts, env, "body", c.JS_NewString(ctx, ""));
+    // onResult: default null (no callback).
+    copyField(ctx, opts, env, "on_result", js_null);
+    // context: default null.
+    copyField(ctx, opts, env, "context", js_null);
+    // max_attempts: default 10.
+    copyField(ctx, opts, env, "max_attempts", c.JS_NewInt32(ctx, 10));
+    // timeout_ms: default 30_000.
+    copyField(ctx, opts, env, "timeout_ms", c.JS_NewInt32(ctx, 30_000));
+    // retry_on: default the standard retryable status list + "network".
+    const default_retry = c.JS_NewArray(ctx);
+    const default_codes = [_]i32{ 408, 425, 429, 500, 502, 503, 504 };
+    for (default_codes, 0..) |code, i| {
+        _ = c.JS_SetPropertyUint32(ctx, default_retry, @intCast(i), c.JS_NewInt32(ctx, code));
+    }
+    _ = c.JS_SetPropertyUint32(ctx, default_retry, default_codes.len, c.JS_NewString(ctx, "network"));
+    copyField(ctx, opts, env, "retry_on", default_retry);
+
+    // Derived state. These advance as the drainer works through it.
+    setOwned(ctx, env, "attempts", c.JS_NewInt32(ctx, 0));
+    setOwned(ctx, env, "next_attempt_at_ms", c.JS_NewInt64(ctx, 0));
+    const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    setOwned(ctx, env, "created_at_ms", c.JS_NewInt64(ctx, now_ms));
+    setOwned(ctx, env, "parent_request_id", c.JS_NewInt64(ctx, @bitCast(state.request_id)));
+
+    // Serialize envelope → bytes.
+    const json = c.JS_JSONStringify(ctx, env, js_undefined, js_undefined);
+    c.JS_FreeValue(ctx, env);
+    if (c.JS_IsException(json) or c.JS_IsUndefined(json)) {
+        c.JS_FreeValue(ctx, json);
+        return js_exception;
+    }
+    defer c.JS_FreeValue(ctx, json);
+
+    var json_len: usize = 0;
+    const json_cstr = c.JS_ToCStringLen(ctx, &json_len, json);
+    if (json_cstr == null) return js_exception;
+    defer c.JS_FreeCString(ctx, json_cstr);
+    const json_slice = @as([*]const u8, @ptrCast(json_cstr))[0..json_len];
+
+    // Write `_outbox/{id}` through the handler's tx + writeset so the
+    // outbox entry commits (or rolls back) atomically with the rest of
+    // the handler's kv writes.
+    var key_buf: [8 + 64]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "_outbox/{s}", .{id_hex}) catch unreachable;
+
+    state.txn.put(key, json_slice) catch |err| {
+        state.pending_kv_error = err;
+        return js_exception;
+    };
+    state.writeset.addPut(key, json_slice) catch |err| {
+        state.pending_kv_error = err;
+        return js_exception;
+    };
+
+    state.webhook_call_index += 1;
+    return c.JS_NewStringLen(ctx, &id_hex, 64);
+}
+
 // ── console.log ───────────────────────────────────────────────────────
 
 fn jsConsoleLog(
@@ -411,6 +568,13 @@ pub fn installStatic(ctx: *c.JSContext) void {
     _ = c.JS_SetPropertyStr(ctx, crypto_obj, "getRandomValues", c.JS_NewCFunction2(ctx, jsCryptoGetRandomValues, "getRandomValues", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomUUID", c.JS_NewCFunction2(ctx, jsCryptoRandomUuid, "randomUUID", 0, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, global, "crypto", crypto_obj);
+
+    // webhook = { send }. Delivery is async — send() persists the
+    // envelope in the handler's transaction and returns an id; the
+    // drainer thread on the raft leader does the actual HTTP call.
+    const webhook_obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, webhook_obj, "send", c.JS_NewCFunction2(ctx, jsWebhookSend, "send", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, global, "webhook", webhook_obj);
 }
 
 /// Install the per-request pieces of the global surface: attach
