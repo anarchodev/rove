@@ -1930,3 +1930,145 @@ test "dispatch: webhook.send rejects missing url" {
     defer resp.deinit(testing.allocator);
     try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
 }
+
+test "dispatch: email.send wraps webhook.send with Resend shape" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return email.send({
+        \\  key: "re_test_abc",
+        \\  from: "noreply@loop46.me",
+        \\  to: "user@example.com",
+        \\  subject: "Verify",
+        \\  text: "Click me.",
+        \\  onResult: "signup/email_result",
+        \\  context: { user_id: 42 },
+        \\});
+    ,
+        .{ .method = "POST", .path = "/", .request_id = 7 },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 64), resp.body.len); // id hex
+
+    const scan = try kv.prefix("_outbox/", "", 10);
+    defer {
+        var m = scan;
+        m.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), scan.entries.len);
+
+    var env = try std.json.parseFromSlice(std.json.Value, testing.allocator, scan.entries[0].value, .{});
+    defer env.deinit();
+    const obj = env.value.object;
+
+    try testing.expectEqualStrings("https://api.resend.com/emails", obj.get("url").?.string);
+    try testing.expectEqualStrings("POST", obj.get("method").?.string);
+    try testing.expectEqualStrings(
+        "Bearer re_test_abc",
+        obj.get("headers").?.object.get("Authorization").?.string,
+    );
+    try testing.expectEqualStrings(
+        "application/json",
+        obj.get("headers").?.object.get("Content-Type").?.string,
+    );
+    try testing.expectEqualStrings("signup/email_result", obj.get("on_result").?.string);
+
+    // Body is a JSON string; parse to check shape.
+    var body_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, obj.get("body").?.string, .{});
+    defer body_parsed.deinit();
+    const body_obj = body_parsed.value.object;
+    try testing.expectEqualStrings("noreply@loop46.me", body_obj.get("from").?.string);
+    try testing.expectEqualStrings("Verify", body_obj.get("subject").?.string);
+    try testing.expectEqualStrings("Click me.", body_obj.get("text").?.string);
+    // `to` gets array-wrapped even when passed as a string.
+    try testing.expectEqual(@as(usize, 1), body_obj.get("to").?.array.items.len);
+    try testing.expectEqualStrings("user@example.com", body_obj.get("to").?.array.items[0].string);
+}
+
+test "dispatch: email.send rejects missing key/from/to/subject" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const cases = [_][]const u8{
+        // Missing key.
+        \\try { email.send({ from: "a@b.com", to: "c@d.com", subject: "s" }); return "ok"; }
+        \\catch (e) { return "threw:" + e.message; }
+        ,
+        // Missing from.
+        \\try { email.send({ key: "re_x", to: "c@d.com", subject: "s" }); return "ok"; }
+        \\catch (e) { return "threw:" + e.message; }
+        ,
+        // Missing to.
+        \\try { email.send({ key: "re_x", from: "a@b.com", subject: "s" }); return "ok"; }
+        \\catch (e) { return "threw:" + e.message; }
+        ,
+        // Missing subject.
+        \\try { email.send({ key: "re_x", from: "a@b.com", to: "c@d.com" }); return "ok"; }
+        \\catch (e) { return "threw:" + e.message; }
+        ,
+    };
+
+    for (cases) |src| {
+        var resp = try runOne(&d, kv, src, .{ .method = "POST", .path = "/", .request_id = 1 });
+        defer resp.deinit(testing.allocator);
+        try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
+    }
+}
+
+test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return email.send({
+        \\  key: "re_x",
+        \\  from: "a@b.com",
+        \\  to: ["c@d.com", "e@f.com"],
+        \\  cc: "g@h.com",
+        \\  bcc: ["i@j.com"],
+        \\  subject: "s",
+        \\  text: "t",
+        \\});
+    ,
+        .{ .method = "POST", .path = "/", .request_id = 2 },
+    );
+    defer resp.deinit(testing.allocator);
+
+    const scan = try kv.prefix("_outbox/", "", 10);
+    defer {
+        var m = scan;
+        m.deinit();
+    }
+    var env = try std.json.parseFromSlice(std.json.Value, testing.allocator, scan.entries[0].value, .{});
+    defer env.deinit();
+    var body = try std.json.parseFromSlice(std.json.Value, testing.allocator, env.value.object.get("body").?.string, .{});
+    defer body.deinit();
+
+    try testing.expectEqual(@as(usize, 2), body.value.object.get("to").?.array.items.len);
+    try testing.expectEqual(@as(usize, 1), body.value.object.get("cc").?.array.items.len);
+    try testing.expectEqual(@as(usize, 1), body.value.object.get("bcc").?.array.items.len);
+}

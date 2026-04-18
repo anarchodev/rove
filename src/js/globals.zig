@@ -397,6 +397,27 @@ fn copyField(
     setOwned(ctx, dst, name, v);
 }
 
+/// Copy `opts[src_name]` to `dst[dst_name]` when present. Used to map
+/// the camelCase public API (`onResult`, `maxAttempts`, ...) onto the
+/// snake_case envelope shape that tools on the delivery side read.
+fn copyFieldRenamed(
+    ctx: ?*c.JSContext,
+    opts: c.JSValue,
+    dst: c.JSValue,
+    src_name: [:0]const u8,
+    dst_name: [:0]const u8,
+    default_val: ?c.JSValue,
+) void {
+    const v = c.JS_GetPropertyStr(ctx, opts, src_name.ptr);
+    if (c.JS_IsUndefined(v)) {
+        c.JS_FreeValue(ctx, v);
+        if (default_val) |d| setOwned(ctx, dst, dst_name, d);
+        return;
+    }
+    if (default_val) |d| c.JS_FreeValue(ctx, d);
+    setOwned(ctx, dst, dst_name, v);
+}
+
 fn jsWebhookSend(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -430,28 +451,24 @@ fn jsWebhookSend(
     setOwned(ctx, env, "id", c.JS_NewStringLen(ctx, &id_hex, 64));
     setOwned(ctx, env, "url", url_v);
 
-    // method: default "POST".
+    // Public input shape uses camelCase (matches PLAN §2.6); envelope
+    // on disk uses snake_case so Zig-side tools + JSON tooling around
+    // the drainer don't have to transliterate.
     copyField(ctx, opts, env, "method", c.JS_NewString(ctx, "POST"));
-    // headers: default {}.
     copyField(ctx, opts, env, "headers", c.JS_NewObject(ctx));
-    // body: default "".
     copyField(ctx, opts, env, "body", c.JS_NewString(ctx, ""));
-    // onResult: default null (no callback).
-    copyField(ctx, opts, env, "on_result", js_null);
-    // context: default null.
     copyField(ctx, opts, env, "context", js_null);
-    // max_attempts: default 10.
-    copyField(ctx, opts, env, "max_attempts", c.JS_NewInt32(ctx, 10));
-    // timeout_ms: default 30_000.
-    copyField(ctx, opts, env, "timeout_ms", c.JS_NewInt32(ctx, 30_000));
-    // retry_on: default the standard retryable status list + "network".
+    copyFieldRenamed(ctx, opts, env, "onResult", "on_result", js_null);
+    copyFieldRenamed(ctx, opts, env, "maxAttempts", "max_attempts", c.JS_NewInt32(ctx, 10));
+    copyFieldRenamed(ctx, opts, env, "timeout", "timeout_ms", c.JS_NewInt32(ctx, 30_000));
+    // retryOn: default the standard retryable status list + "network".
     const default_retry = c.JS_NewArray(ctx);
     const default_codes = [_]i32{ 408, 425, 429, 500, 502, 503, 504 };
     for (default_codes, 0..) |code, i| {
         _ = c.JS_SetPropertyUint32(ctx, default_retry, @intCast(i), c.JS_NewInt32(ctx, code));
     }
     _ = c.JS_SetPropertyUint32(ctx, default_retry, default_codes.len, c.JS_NewString(ctx, "network"));
-    copyField(ctx, opts, env, "retry_on", default_retry);
+    copyFieldRenamed(ctx, opts, env, "retryOn", "retry_on", default_retry);
 
     // Derived state. These advance as the drainer works through it.
     setOwned(ctx, env, "attempts", c.JS_NewInt32(ctx, 0));
@@ -575,6 +592,66 @@ pub fn installStatic(ctx: *c.JSContext) void {
     const webhook_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, webhook_obj, "send", c.JS_NewCFunction2(ctx, jsWebhookSend, "send", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, global, "webhook", webhook_obj);
+
+    // email.send — thin wrapper around webhook.send that builds a
+    // Resend-shaped POST and takes the API key as a parameter rather
+    // than resolving it from platform config. Keeps key storage a
+    // customer concern (kv entry, inlined, fetched from elsewhere)
+    // and keeps the platform out of the abuse loop: a customer can
+    // only email.send using a Resend key they have.
+    //
+    // Our own magic-link / signup emails live in the `__admin__`
+    // handler, whose kv aliases to the root store, so they do
+    // `email.send({ key: kv.get("__root__/resend_key"), ... })` —
+    // zero special-case infrastructure.
+    const email_snippet =
+        \\globalThis.email = {
+        \\  send(opts) {
+        \\    if (!opts || typeof opts !== "object")
+        \\      throw new TypeError("email.send requires an options object");
+        \\    if (typeof opts.key !== "string" || opts.key.length === 0)
+        \\      throw new TypeError("email.send: `key` must be a non-empty string");
+        \\    if (typeof opts.from !== "string")
+        \\      throw new TypeError("email.send: `from` must be a string");
+        \\    if (typeof opts.subject !== "string")
+        \\      throw new TypeError("email.send: `subject` must be a string");
+        \\    if (!opts.to)
+        \\      throw new TypeError("email.send: `to` is required");
+        \\    const body = {
+        \\      from: opts.from,
+        \\      to: Array.isArray(opts.to) ? opts.to : [opts.to],
+        \\      subject: opts.subject,
+        \\    };
+        \\    if (opts.text) body.text = opts.text;
+        \\    if (opts.html) body.html = opts.html;
+        \\    if (opts.reply_to) body.reply_to = opts.reply_to;
+        \\    if (opts.cc) body.cc = Array.isArray(opts.cc) ? opts.cc : [opts.cc];
+        \\    if (opts.bcc) body.bcc = Array.isArray(opts.bcc) ? opts.bcc : [opts.bcc];
+        \\    const env = {
+        \\      url: "https://api.resend.com/emails",
+        \\      method: "POST",
+        \\      headers: {
+        \\        "Authorization": "Bearer " + opts.key,
+        \\        "Content-Type": "application/json",
+        \\      },
+        \\      body: JSON.stringify(body),
+        \\    };
+        \\    if (opts.onResult) env.onResult = opts.onResult;
+        \\    if (opts.context !== undefined) env.context = opts.context;
+        \\    if (opts.maxAttempts) env.maxAttempts = opts.maxAttempts;
+        \\    if (opts.timeout) env.timeout = opts.timeout;
+        \\    return webhook.send(env);
+        \\  },
+        \\};
+    ;
+    const email_result = c.JS_Eval(
+        ctx,
+        email_snippet.ptr,
+        email_snippet.len,
+        "email.js",
+        c.JS_EVAL_TYPE_GLOBAL,
+    );
+    c.JS_FreeValue(ctx, email_result);
 }
 
 /// Install the per-request pieces of the global surface: attach
