@@ -362,6 +362,7 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
     <div class="code-layout">
       <aside class="file-list">
         <div class="toolbar">
+          <button type="button" class="new-file">New</button>
           <button type="button" class="refresh">Refresh</button>
         </div>
         <ul></ul>
@@ -380,6 +381,7 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
 
   const list = el.querySelector(".file-list ul");
   const refreshBtn = el.querySelector(".refresh");
+  const newBtn = el.querySelector(".new-file");
   const pathLabel = el.querySelector(".current-path");
   const metaLabel = el.querySelector(".editor-meta");
   const saveBtn = el.querySelector(".save");
@@ -483,8 +485,68 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
 
   refreshBtn.addEventListener("click", loadList);
 
+  newBtn.addEventListener("click", async () => {
+    const raw = prompt(
+      "New file path. Must start with `_code/` (handler) or `_static/` (static asset).\n\nExamples:\n  _code/api/index.mjs\n  _static/about.html",
+      "_code/",
+    );
+    if (raw == null) return;
+    const path = raw.trim();
+    if (!path) return;
+
+    const kind =
+      path.startsWith("_code/") ? "handler"
+      : path.startsWith("_static/") ? "static"
+      : null;
+    if (!kind) {
+      showError("Path must start with `_code/` or `_static/`.");
+      return;
+    }
+
+    const contentType = kind === "handler"
+      ? "application/javascript"
+      : inferContentType(path);
+    const starter = kind === "handler"
+      ? `export default function (req) {\n  return "hello from ${path}\\n";\n}\n`
+      : "";
+
+    try {
+      await api.putFile(instanceId, path, starter, contentType);
+    } catch (err) {
+      showError(`Create failed: ${err.message}`);
+      return;
+    }
+    await loadList();
+    await openFile(path);
+  });
+
   loadList();
   return () => {};
+}
+
+/// Small extension → MIME table for new static files. Covers the
+/// obvious cases; falls back to octet-stream for unknowns.
+function inferContentType(path) {
+  const i = path.lastIndexOf(".");
+  const ext = i >= 0 ? path.slice(i + 1).toLowerCase() : "";
+  switch (ext) {
+    case "html": case "htm": return "text/html; charset=utf-8";
+    case "css":  return "text/css";
+    case "js":   case "mjs": return "application/javascript";
+    case "json": return "application/json";
+    case "svg":  return "image/svg+xml";
+    case "png":  return "image/png";
+    case "jpg":  case "jpeg": return "image/jpeg";
+    case "gif":  return "image/gif";
+    case "webp": return "image/webp";
+    case "ico":  return "image/x-icon";
+    case "txt":  case "md": return "text/plain; charset=utf-8";
+    case "xml":  return "application/xml";
+    case "wasm": return "application/wasm";
+    case "woff": return "font/woff";
+    case "woff2": return "font/woff2";
+    default:     return "application/octet-stream";
+  }
 }
 
 // ── Formatters ─────────────────────────────────────────────────────
