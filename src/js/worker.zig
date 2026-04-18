@@ -964,6 +964,7 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
     }
 
     for (manifest.entries) |entry| {
+        if (entry.kind != .handler) continue;
         const path_copy = try tc.allocator.dupe(u8, entry.path);
         errdefer tc.allocator.free(path_copy);
         const bytecode = try bs.get(&entry.bytecode_hex, tc.allocator);

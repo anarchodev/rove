@@ -78,6 +78,18 @@ pub const HASH_HEX_LEN: usize = 64; // sha256 hex
 /// and matches blob-key invariants from rove-blob.
 pub const MAX_PATH_LEN: usize = 192;
 
+/// Maximum content-type length stored on a file. MIME strings in the
+/// wild stay well under this.
+pub const MAX_CT_LEN: usize = 255;
+
+/// What a file slot holds. `handler` = JS source that also gets compiled
+/// to bytecode and served by dispatch. `static` = opaque bytes served
+/// verbatim with their stored content-type.
+pub const Kind = enum(u8) {
+    handler = 0,
+    static = 1,
+};
+
 pub const FileStore = struct {
     allocator: std.mem.Allocator,
     kv: *KvStore,
@@ -103,7 +115,7 @@ pub const FileStore = struct {
 
     // ── Source upload ─────────────────────────────────────────────────
 
-    /// Upload a source file at `path`. Writes the source blob, compiles
+    /// Upload a JS source file at `path`. Writes the source blob, compiles
     /// to bytecode (reusing the cache when the source hash matches an
     /// earlier compile), writes the bytecode blob, and updates the
     /// `file/{path}` and `bytecode/{source_hash}` index entries.
@@ -128,10 +140,42 @@ pub const FileStore = struct {
         try self.ensureBytecode(path, source, &src_hex, &bc_hex);
 
         // Index updates.
+        try self.writeFileEntry(path, .handler, "", &src_hex);
+    }
+
+    /// Upload a static file at `path`. Writes the raw bytes as a content-
+    /// addressed blob and stamps `file/{path}` with the supplied content-
+    /// type. Skips compile entirely — static entries carry no bytecode.
+    pub fn putStatic(
+        self: *FileStore,
+        path: []const u8,
+        bytes: []const u8,
+        content_type: []const u8,
+    ) Error!void {
+        try validatePath(path);
+        if (content_type.len > MAX_CT_LEN) return Error.InvalidPath;
+
+        var src_hex: [HASH_HEX_LEN]u8 = undefined;
+        hashHex(bytes, &src_hex);
+
+        self.blob.put(&src_hex, bytes) catch return Error.Blob;
+        try self.writeFileEntry(path, .static, content_type, &src_hex);
+    }
+
+    fn writeFileEntry(
+        self: *FileStore,
+        path: []const u8,
+        kind: Kind,
+        content_type: []const u8,
+        src_hex: *const [HASH_HEX_LEN]u8,
+    ) Error!void {
         var file_key_buf: [5 + MAX_PATH_LEN]u8 = undefined;
         const file_key = std.fmt.bufPrint(&file_key_buf, "file/{s}", .{path}) catch
             return Error.InvalidPath;
-        self.kv.put(file_key, &src_hex) catch return Error.Kv;
+
+        var val_buf: [2 + MAX_CT_LEN + HASH_HEX_LEN]u8 = undefined;
+        const val = encodeFileValue(&val_buf, kind, content_type, src_hex);
+        self.kv.put(file_key, val) catch return Error.Kv;
     }
 
     fn ensureBytecode(
@@ -174,44 +218,30 @@ pub const FileStore = struct {
     }
 
     /// Fetch the current source blob for `path`. Returns owned bytes.
+    /// Works for both `handler` (JS source) and `static` (raw bytes).
     pub fn getSource(
         self: *FileStore,
         path: []const u8,
         allocator: std.mem.Allocator,
     ) Error![]u8 {
-        try validatePath(path);
-        var file_key_buf: [5 + MAX_PATH_LEN]u8 = undefined;
-        const file_key = std.fmt.bufPrint(&file_key_buf, "file/{s}", .{path}) catch
-            return Error.InvalidPath;
-        const hex = self.kv.get(file_key) catch |err| switch (err) {
-            error.NotFound => return Error.NotFound,
-            else => return Error.Kv,
-        };
-        defer self.allocator.free(hex);
-        if (hex.len != HASH_HEX_LEN) return Error.InvalidManifest;
-        return self.blob.get(hex, allocator) catch Error.Blob;
+        var decoded = try self.loadFileEntry(path);
+        defer decoded.deinit();
+        return self.blob.get(&decoded.source_hex, allocator) catch Error.Blob;
     }
 
     /// Fetch the bytecode blob for `path`'s current source. Returns owned
-    /// bytes.
+    /// bytes. `Error.NotFound` when `path` doesn't exist or is static.
     pub fn getBytecode(
         self: *FileStore,
         path: []const u8,
         allocator: std.mem.Allocator,
     ) Error![]u8 {
-        try validatePath(path);
-        var file_key_buf: [5 + MAX_PATH_LEN]u8 = undefined;
-        const file_key = std.fmt.bufPrint(&file_key_buf, "file/{s}", .{path}) catch
-            return Error.InvalidPath;
-        const src_hex = self.kv.get(file_key) catch |err| switch (err) {
-            error.NotFound => return Error.NotFound,
-            else => return Error.Kv,
-        };
-        defer self.allocator.free(src_hex);
-        if (src_hex.len != HASH_HEX_LEN) return Error.InvalidManifest;
+        var decoded = try self.loadFileEntry(path);
+        defer decoded.deinit();
+        if (decoded.kind != .handler) return Error.NotFound;
 
         var bc_key_buf: [9 + HASH_HEX_LEN]u8 = undefined;
-        const bc_key = std.fmt.bufPrint(&bc_key_buf, "bytecode/{s}", .{src_hex}) catch
+        const bc_key = std.fmt.bufPrint(&bc_key_buf, "bytecode/{s}", .{decoded.source_hex}) catch
             unreachable;
         const bc_hex = self.kv.get(bc_key) catch |err| switch (err) {
             error.NotFound => return Error.NotFound,
@@ -223,11 +253,54 @@ pub const FileStore = struct {
         return self.blob.get(bc_hex, allocator) catch Error.Blob;
     }
 
+    /// Read-and-decode the `file/{path}` slot. The returned value borrows
+    /// nothing from the kv backing store (content_type is copied into the
+    /// heap-allocated `storage` field — caller must `freeFileEntry`).
+    pub const FileEntry = struct {
+        kind: Kind,
+        content_type: []u8,
+        source_hex: [HASH_HEX_LEN]u8,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *FileEntry) void {
+            self.allocator.free(self.content_type);
+            self.* = undefined;
+        }
+    };
+
+    pub fn stat(self: *FileStore, path: []const u8) Error!FileEntry {
+        return self.loadFileEntry(path);
+    }
+
+    fn loadFileEntry(self: *FileStore, path: []const u8) Error!FileEntry {
+        try validatePath(path);
+        var file_key_buf: [5 + MAX_PATH_LEN]u8 = undefined;
+        const file_key = std.fmt.bufPrint(&file_key_buf, "file/{s}", .{path}) catch
+            return Error.InvalidPath;
+        const raw = self.kv.get(file_key) catch |err| switch (err) {
+            error.NotFound => return Error.NotFound,
+            else => return Error.Kv,
+        };
+        defer self.allocator.free(raw);
+        const view = try decodeFileValue(raw);
+        const ct_copy = self.allocator.dupe(u8, view.content_type) catch
+            return Error.OutOfMemory;
+        return .{
+            .kind = view.kind,
+            .content_type = ct_copy,
+            .source_hex = view.source_hex,
+            .allocator = self.allocator,
+        };
+    }
+
     // ── Deployment ────────────────────────────────────────────────────
 
     pub const Entry = struct {
         path: []u8,
+        kind: Kind,
+        content_type: []u8,
         source_hex: [HASH_HEX_LEN]u8,
+        /// All-zero when `kind != .handler`.
         bytecode_hex: [HASH_HEX_LEN]u8,
     };
 
@@ -237,7 +310,10 @@ pub const FileStore = struct {
         allocator: std.mem.Allocator,
 
         pub fn deinit(self: *Manifest) void {
-            for (self.entries) |e| self.allocator.free(e.path);
+            for (self.entries) |e| {
+                self.allocator.free(e.path);
+                self.allocator.free(e.content_type);
+            }
             self.allocator.free(self.entries);
             self.* = undefined;
         }
@@ -251,7 +327,10 @@ pub const FileStore = struct {
         // Collect all `file/*` entries.
         var entries: std.ArrayList(Entry) = .empty;
         defer {
-            for (entries.items) |e| self.allocator.free(e.path);
+            for (entries.items) |e| {
+                self.allocator.free(e.path);
+                self.allocator.free(e.content_type);
+            }
             entries.deinit(self.allocator);
         }
 
@@ -264,28 +343,34 @@ pub const FileStore = struct {
             if (e.key.len <= "file/".len) continue;
             const path = e.key["file/".len..];
 
-            if (e.value.len != HASH_HEX_LEN) return Error.InvalidManifest;
-            var src_hex: [HASH_HEX_LEN]u8 = undefined;
-            @memcpy(&src_hex, e.value[0..HASH_HEX_LEN]);
+            const view = try decodeFileValue(e.value);
 
-            // Resolve bytecode hash via cache.
-            var bc_key_buf: [9 + HASH_HEX_LEN]u8 = undefined;
-            const bc_key = std.fmt.bufPrint(&bc_key_buf, "bytecode/{s}", .{src_hex}) catch
-                unreachable;
-            const bc_hex_bytes = self.kv.get(bc_key) catch |err| switch (err) {
-                error.NotFound => return Error.NotFound,
-                else => return Error.Kv,
-            };
-            defer self.allocator.free(bc_hex_bytes);
-            if (bc_hex_bytes.len != HASH_HEX_LEN) return Error.InvalidManifest;
-            var bc_hex: [HASH_HEX_LEN]u8 = undefined;
-            @memcpy(&bc_hex, bc_hex_bytes[0..HASH_HEX_LEN]);
+            // Resolve bytecode hash via cache for handlers; statics
+            // carry zero-bytes to keep the manifest entry shape uniform.
+            var bc_hex: [HASH_HEX_LEN]u8 = @splat(0);
+            if (view.kind == .handler) {
+                var bc_key_buf: [9 + HASH_HEX_LEN]u8 = undefined;
+                const bc_key = std.fmt.bufPrint(&bc_key_buf, "bytecode/{s}", .{view.source_hex}) catch
+                    unreachable;
+                const bc_hex_bytes = self.kv.get(bc_key) catch |err| switch (err) {
+                    error.NotFound => return Error.NotFound,
+                    else => return Error.Kv,
+                };
+                defer self.allocator.free(bc_hex_bytes);
+                if (bc_hex_bytes.len != HASH_HEX_LEN) return Error.InvalidManifest;
+                @memcpy(&bc_hex, bc_hex_bytes[0..HASH_HEX_LEN]);
+            }
 
             const path_copy = self.allocator.dupe(u8, path) catch return Error.OutOfMemory;
             errdefer self.allocator.free(path_copy);
+            const ct_copy = self.allocator.dupe(u8, view.content_type) catch
+                return Error.OutOfMemory;
+            errdefer self.allocator.free(ct_copy);
             entries.append(self.allocator, .{
                 .path = path_copy,
-                .source_hex = src_hex,
+                .kind = view.kind,
+                .content_type = ct_copy,
+                .source_hex = view.source_hex,
                 .bytecode_hex = bc_hex,
             }) catch return Error.OutOfMemory;
         }
@@ -358,33 +443,104 @@ fn hashHex(bytes: []const u8, out: *[HASH_HEX_LEN]u8) void {
     }
 }
 
-/// Reject paths that would collide with our own key prefixes, contain
-/// NULs, or are absurdly long. Paths are handler module paths like
-/// `handlers/index.js`; we allow `/` (unlike blob keys) but not `..`.
-fn validatePath(path: []const u8) Error!void {
+/// Canonical allowed path: lowercase letters, digits, and `-_./`. Reject
+/// traversal, empty segments, percent-encoded slashes, absolute paths,
+/// and control bytes. Matches §2.4 of the product plan.
+pub fn validatePath(path: []const u8) Error!void {
     if (path.len == 0 or path.len > MAX_PATH_LEN) return Error.InvalidPath;
-    if (std.mem.indexOf(u8, path, "..") != null) return Error.InvalidPath;
     if (path[0] == '/') return Error.InvalidPath;
-    for (path) |b| {
-        if (b < 0x20 or b > 0x7e) return Error.InvalidPath;
+    if (std.mem.indexOf(u8, path, "..") != null) return Error.InvalidPath;
+    if (std.mem.indexOf(u8, path, "//") != null) return Error.InvalidPath;
+
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) {
+        const b = path[i];
+        // Percent-encoded slash check: `%2f` / `%2F`.
+        if (b == '%' and i + 2 < path.len) {
+            const h2 = path[i + 2];
+            if (path[i + 1] == '2' and (h2 == 'f' or h2 == 'F')) {
+                return Error.InvalidPath;
+            }
+        }
+        const ok = (b >= 'a' and b <= 'z') or
+            (b >= '0' and b <= '9') or
+            b == '-' or b == '_' or b == '.' or b == '/';
+        if (!ok) return Error.InvalidPath;
     }
 }
 
-// Manifest binary format:
+// ── file/{path} value encoding ────────────────────────────────────────
+//
+// Layout:
+//   [u8 kind] [u8 ct_len] [ct_len bytes content-type] [64 source_hex]
+//
+// Min 66 bytes (no content-type), max 66 + MAX_CT_LEN.
+
+const FileValueView = struct {
+    kind: Kind,
+    content_type: []const u8, // borrowed from the input buffer
+    source_hex: [HASH_HEX_LEN]u8,
+};
+
+fn encodeFileValue(
+    buf: []u8,
+    kind: Kind,
+    content_type: []const u8,
+    src_hex: *const [HASH_HEX_LEN]u8,
+) []u8 {
+    std.debug.assert(content_type.len <= MAX_CT_LEN);
+    const total = 2 + content_type.len + HASH_HEX_LEN;
+    std.debug.assert(buf.len >= total);
+    buf[0] = @intFromEnum(kind);
+    buf[1] = @intCast(content_type.len);
+    @memcpy(buf[2 .. 2 + content_type.len], content_type);
+    @memcpy(buf[2 + content_type.len ..][0..HASH_HEX_LEN], src_hex);
+    return buf[0..total];
+}
+
+fn decodeFileValue(value: []const u8) Error!FileValueView {
+    if (value.len < 2 + HASH_HEX_LEN) return Error.InvalidManifest;
+    const kind: Kind = switch (value[0]) {
+        0 => .handler,
+        1 => .static,
+        else => return Error.InvalidManifest,
+    };
+    const ct_len = value[1];
+    if (value.len != 2 + ct_len + HASH_HEX_LEN) return Error.InvalidManifest;
+    var out: FileValueView = .{
+        .kind = kind,
+        .content_type = value[2 .. 2 + ct_len],
+        .source_hex = undefined,
+    };
+    @memcpy(&out.source_hex, value[2 + ct_len ..][0..HASH_HEX_LEN]);
+    return out;
+}
+
+// Manifest binary format (version 2):
+//   [u8 version=2]
 //   [u32 count]
 //   for each entry:
-//     [u16 path_len][path bytes][64 source_hex][64 bytecode_hex]
+//     [u16 path_len][path bytes]
+//     [u8 kind]
+//     [u8 ct_len][ct bytes]
+//     [64 source_hex][64 bytecode_hex]
 //
-// Little-endian. Unit-tested below.
+// Little-endian. `bytecode_hex` is all-zero for static entries.
+const MANIFEST_VERSION: u8 = 2;
+
 fn serializeManifest(
     allocator: std.mem.Allocator,
     entries: []const FileStore.Entry,
 ) error{OutOfMemory}![]u8 {
-    var total: usize = 4;
-    for (entries) |e| total += 2 + e.path.len + HASH_HEX_LEN * 2;
+    var total: usize = 1 + 4;
+    for (entries) |e| {
+        total += 2 + e.path.len + 1 + 1 + e.content_type.len + HASH_HEX_LEN * 2;
+    }
 
     const out = try allocator.alloc(u8, total);
     var i: usize = 0;
+    out[i] = MANIFEST_VERSION;
+    i += 1;
     std.mem.writeInt(u32, out[i..][0..4], @intCast(entries.len), .little);
     i += 4;
     for (entries) |e| {
@@ -392,6 +548,12 @@ fn serializeManifest(
         i += 2;
         @memcpy(out[i..][0..e.path.len], e.path);
         i += e.path.len;
+        out[i] = @intFromEnum(e.kind);
+        i += 1;
+        out[i] = @intCast(e.content_type.len);
+        i += 1;
+        @memcpy(out[i..][0..e.content_type.len], e.content_type);
+        i += e.content_type.len;
         @memcpy(out[i..][0..HASH_HEX_LEN], &e.source_hex);
         i += HASH_HEX_LEN;
         @memcpy(out[i..][0..HASH_HEX_LEN], &e.bytecode_hex);
@@ -404,15 +566,20 @@ fn parseManifest(
     allocator: std.mem.Allocator,
     bytes: []const u8,
 ) Error![]FileStore.Entry {
-    if (bytes.len < 4) return Error.InvalidManifest;
+    if (bytes.len < 5) return Error.InvalidManifest;
     var i: usize = 0;
+    if (bytes[i] != MANIFEST_VERSION) return Error.InvalidManifest;
+    i += 1;
     const count = std.mem.readInt(u32, bytes[i..][0..4], .little);
     i += 4;
 
     const out = allocator.alloc(FileStore.Entry, count) catch return Error.OutOfMemory;
     var filled: usize = 0;
     errdefer {
-        for (out[0..filled]) |e| allocator.free(e.path);
+        for (out[0..filled]) |e| {
+            allocator.free(e.path);
+            allocator.free(e.content_type);
+        }
         allocator.free(out);
     }
 
@@ -420,11 +587,25 @@ fn parseManifest(
         if (i + 2 > bytes.len) return Error.InvalidManifest;
         const path_len = std.mem.readInt(u16, bytes[i..][0..2], .little);
         i += 2;
-        if (i + path_len + HASH_HEX_LEN * 2 > bytes.len) return Error.InvalidManifest;
+        if (i + path_len + 2 > bytes.len) return Error.InvalidManifest;
 
         const path = allocator.dupe(u8, bytes[i .. i + path_len]) catch
             return Error.OutOfMemory;
+        errdefer allocator.free(path);
         i += path_len;
+
+        const kind: Kind = switch (bytes[i]) {
+            0 => .handler,
+            1 => .static,
+            else => return Error.InvalidManifest,
+        };
+        i += 1;
+        const ct_len = bytes[i];
+        i += 1;
+        if (i + ct_len + HASH_HEX_LEN * 2 > bytes.len) return Error.InvalidManifest;
+        const ct = allocator.dupe(u8, bytes[i .. i + ct_len]) catch
+            return Error.OutOfMemory;
+        i += ct_len;
 
         var src_hex: [HASH_HEX_LEN]u8 = undefined;
         @memcpy(&src_hex, bytes[i..][0..HASH_HEX_LEN]);
@@ -433,7 +614,13 @@ fn parseManifest(
         @memcpy(&bc_hex, bytes[i..][0..HASH_HEX_LEN]);
         i += HASH_HEX_LEN;
 
-        out[filled] = .{ .path = path, .source_hex = src_hex, .bytecode_hex = bc_hex };
+        out[filled] = .{
+            .path = path,
+            .kind = kind,
+            .content_type = ct,
+            .source_hex = src_hex,
+            .bytecode_hex = bc_hex,
+        };
     }
     return out;
 }
@@ -680,17 +867,81 @@ test "validatePath rejects traversal, absolute, empty, control chars" {
     try validatePath("deep/nested/path/file.js");
 }
 
+test "validatePath rejects uppercase, double-slash, percent-encoded slash" {
+    try testing.expectError(Error.InvalidPath, validatePath("Foo.js"));
+    try testing.expectError(Error.InvalidPath, validatePath("foo//bar"));
+    try testing.expectError(Error.InvalidPath, validatePath("foo/%2fbar"));
+    try testing.expectError(Error.InvalidPath, validatePath("foo/%2Fbar"));
+    try testing.expectError(Error.InvalidPath, validatePath("foo bar"));
+    try testing.expectError(Error.InvalidPath, validatePath("foo?bar"));
+    // Leading underscore is reserved by policy at a higher layer, but
+    // the core validator lets it through so it can form `_static/*` etc.
+    try validatePath("_static/index.html");
+    try validatePath("_code/_404/index.mjs");
+}
+
+test "putStatic stores raw bytes + content-type, no bytecode" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+    var fs = fx.fileStore();
+
+    const html = "<!doctype html><h1>hi</h1>";
+    try fs.putStatic("_static/index.html", html, "text/html");
+
+    const got = try fs.getSource("_static/index.html", testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(html, got);
+
+    try testing.expectError(Error.NotFound, fs.getBytecode("_static/index.html", testing.allocator));
+
+    var stat_e = try fs.stat("_static/index.html");
+    defer stat_e.deinit();
+    try testing.expectEqual(Kind.static, stat_e.kind);
+    try testing.expectEqualStrings("text/html", stat_e.content_type);
+}
+
+test "deploy produces mixed handler + static manifest with content-types" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+    var fs = fx.fileStore();
+
+    try fs.putSource("index.mjs", "export default () => 42;");
+    try fs.putStatic("_static/style.css", "body { color: red; }", "text/css");
+
+    _ = try fs.deploy();
+    var m = try fs.loadCurrentDeployment();
+    defer m.deinit();
+    try testing.expectEqual(@as(usize, 2), m.entries.len);
+
+    // Entries sorted by key → "_static/style.css" then "index.mjs"
+    // (underscore < lowercase letters in ASCII).
+    try testing.expectEqualStrings("_static/style.css", m.entries[0].path);
+    try testing.expectEqual(Kind.static, m.entries[0].kind);
+    try testing.expectEqualStrings("text/css", m.entries[0].content_type);
+    // Static bytecode hash is all-zero.
+    const zeros: [HASH_HEX_LEN]u8 = @splat(0);
+    try testing.expectEqualSlices(u8, &zeros, &m.entries[0].bytecode_hex);
+
+    try testing.expectEqualStrings("index.mjs", m.entries[1].path);
+    try testing.expectEqual(Kind.handler, m.entries[1].kind);
+    try testing.expectEqualStrings("", m.entries[1].content_type);
+}
+
 test "serialize + parse manifest round-trip" {
     var entries = [_]FileStore.Entry{
         .{
             .path = @constCast("a.js"),
+            .kind = .handler,
+            .content_type = @constCast(""),
             .source_hex = [_]u8{'a'} ** HASH_HEX_LEN,
             .bytecode_hex = [_]u8{'1'} ** HASH_HEX_LEN,
         },
         .{
-            .path = @constCast("deep/path/b.js"),
+            .path = @constCast("_static/b.css"),
+            .kind = .static,
+            .content_type = @constCast("text/css"),
             .source_hex = [_]u8{'b'} ** HASH_HEX_LEN,
-            .bytecode_hex = [_]u8{'2'} ** HASH_HEX_LEN,
+            .bytecode_hex = [_]u8{0} ** HASH_HEX_LEN,
         },
     };
 
@@ -699,22 +950,34 @@ test "serialize + parse manifest round-trip" {
 
     const parsed = try parseManifest(testing.allocator, bytes);
     defer {
-        for (parsed) |e| testing.allocator.free(e.path);
+        for (parsed) |e| {
+            testing.allocator.free(e.path);
+            testing.allocator.free(e.content_type);
+        }
         testing.allocator.free(parsed);
     }
 
     try testing.expectEqual(@as(usize, 2), parsed.len);
     try testing.expectEqualStrings("a.js", parsed[0].path);
-    try testing.expectEqualStrings("deep/path/b.js", parsed[1].path);
+    try testing.expectEqual(Kind.handler, parsed[0].kind);
+    try testing.expectEqualStrings("", parsed[0].content_type);
+    try testing.expectEqualStrings("_static/b.css", parsed[1].path);
+    try testing.expectEqual(Kind.static, parsed[1].kind);
+    try testing.expectEqualStrings("text/css", parsed[1].content_type);
     try testing.expectEqualSlices(u8, &entries[0].source_hex, &parsed[0].source_hex);
     try testing.expectEqualSlices(u8, &entries[1].bytecode_hex, &parsed[1].bytecode_hex);
 }
 
-test "parseManifest rejects truncated input" {
+test "parseManifest rejects wrong version + truncated input" {
     try testing.expectError(Error.InvalidManifest, parseManifest(testing.allocator, &[_]u8{}));
-    // count=5, but no entries follow
+    // Version 1 is no longer accepted.
     try testing.expectError(
         Error.InvalidManifest,
-        parseManifest(testing.allocator, &[_]u8{ 5, 0, 0, 0 }),
+        parseManifest(testing.allocator, &[_]u8{ 1, 0, 0, 0, 0 }),
+    );
+    // Version 2, count=5, but no entries follow.
+    try testing.expectError(
+        Error.InvalidManifest,
+        parseManifest(testing.allocator, &[_]u8{ MANIFEST_VERSION, 5, 0, 0, 0 }),
     );
 }
