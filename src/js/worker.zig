@@ -1443,14 +1443,25 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
             handler_inst = admin_opt.?;
 
-            const scope_id = admin_scope_opt.?;
-            if (scope_id.len == 0) {
-                // Bare admin domain: scope is the admin tenant itself
-                // (so `kv.*` reads/writes the root store directly).
+            // Scope resolution: subdomain wins when present (legacy /
+            // bearer-driven path). On the bare admin host, the
+            // dashboard JS scopes via `X-Rove-Scope: <id>` because a
+            // SameSite=Lax cookie on `app.loop46.me` can't flow to
+            // `{id}.app.loop46.me` without PSL coverage.
+            const subdomain_scope = admin_scope_opt.?;
+            const header_scope = findHeader(rh, "x-rove-scope") orelse "";
+            const effective_scope: []const u8 = if (subdomain_scope.len > 0)
+                subdomain_scope
+            else
+                header_scope;
+
+            if (effective_scope.len == 0) {
+                // Bare admin host, no scope header: scope is the admin
+                // tenant itself (kv.* operates on the root store).
                 scope_inst = handler_inst;
             } else {
-                const s_opt = worker.tenant.getInstance(scope_id) catch |err| blk: {
-                    std.log.warn("rove-js: admin getInstance({s}) failed: {s}", .{ scope_id, @errorName(err) });
+                const s_opt = worker.tenant.getInstance(effective_scope) catch |err| blk: {
+                    std.log.warn("rove-js: admin getInstance({s}) failed: {s}", .{ effective_scope, @errorName(err) });
                     break :blk null;
                 };
                 if (s_opt == null) {

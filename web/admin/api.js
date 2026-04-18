@@ -35,28 +35,24 @@ function adminBase() {
   return window.location.origin;
 }
 
-/// Per-tenant API base: `{id}.<admin host>`.
-function scopeBase(instance_id) {
-  const base = adminBase();
-  try {
-    const u = new URL(base);
-    u.hostname = `${instance_id}.${u.hostname}`;
-    return u.toString().replace(/\/+$/, "");
-  } catch {
-    return base;
-  }
-}
-
 /// Call a named export on the admin handler. `?fn=<name>&args=...` for
-/// GET, JSON body for POST. Sends cookies.
-async function rpc(base, fn, args, { method = "GET" } = {}) {
+/// GET, JSON body for POST. Sends cookies. `scope` sets the target
+/// tenant; the server rebinds `kv` to that tenant's store on handler
+/// dispatch. Uses an `X-Rove-Scope` header rather than a subdomain
+/// because SameSite=Lax cookies can't flow across subdomains without
+/// PSL coverage (see PLAN §2.1).
+async function rpc(fn, args, { method = "GET", scope = null } = {}) {
   const argsArr = args ?? [];
+  const base = adminBase();
+  const headers = {};
+  if (scope) headers["X-Rove-Scope"] = scope;
   let url, init;
   if (method === "POST") {
     url = base + "/";
+    headers["Content-Type"] = "application/json";
     init = {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       credentials: "include",
       body: JSON.stringify({ fn, args: argsArr }),
     };
@@ -64,7 +60,7 @@ async function rpc(base, fn, args, { method = "GET" } = {}) {
     const qs = new URLSearchParams({ fn });
     if (argsArr.length > 0) qs.set("args", JSON.stringify(argsArr));
     url = `${base}/?${qs.toString()}`;
-    init = { method: "GET", credentials: "include" };
+    init = { method: "GET", headers, credentials: "include" };
   }
   const res = await fetch(url, init);
   const ct = res.headers.get("content-type") ?? "";
@@ -133,30 +129,30 @@ export const api = {
 
   // ── Admin scope: tenant CRUD + domains (kv = root) ──────────────
   listInstances() {
-    return rpc(adminBase(), "listInstance");
+    return rpc("listInstance");
   },
   createInstance(id) {
-    return rpc(adminBase(), "createInstance", [id], { method: "POST" });
+    return rpc("createInstance", [id], { method: "POST" });
   },
   getInstance(id) {
-    return rpc(adminBase(), "getInstance", [id]);
+    return rpc("getInstance", [id]);
   },
   deleteInstance(id) {
-    return rpc(adminBase(), "deleteInstance", [id], { method: "POST" });
+    return rpc("deleteInstance", [id], { method: "POST" });
   },
   listDomains() {
-    return rpc(adminBase(), "listDomain");
+    return rpc("listDomain");
   },
   assignDomain(host, instance_id) {
-    return rpc(adminBase(), "assignDomain", [host, instance_id], { method: "POST" });
+    return rpc("assignDomain", [host, instance_id], { method: "POST" });
   },
 
   // ── Tenant scope: KV (kv={instance_id}.app.db) ───────────────────
   listKv(instance_id, { prefix = "", cursor = "", limit = 100 } = {}) {
-    return rpc(scopeBase(instance_id), "listKv", [prefix, cursor, limit]);
+    return rpc("listKv", [prefix, cursor, limit], { scope: instance_id });
   },
   getKv(instance_id, key) {
-    return rpc(scopeBase(instance_id), "getKv", [key]);
+    return rpc("getKv", [key], { scope: instance_id });
   },
 
   // ── Out-of-band: files (native Zig proxy) ────────────────────────
