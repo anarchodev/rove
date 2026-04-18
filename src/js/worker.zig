@@ -1386,10 +1386,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
             // Public static bundle: the admin UI's HTML/JS/CSS must
             // reach the browser before auth so the login page can
-            // render. Serves GET requests that hit __admin__'s
-            // `_static/*` manifest. API calls (POSTs, /v1/*) fall
-            // through to the auth gate below.
-            if (std.mem.eql(u8, method, "GET")) {
+            // render. Serves GET requests with no query string (bundle
+            // fetches never carry one; admin API reads use `?fn=` and
+            // must fall through to the handler). POSTs and /v1/* take
+            // the auth gate below.
+            const has_query = std.mem.indexOfScalar(u8, path, '?') != null;
+            if (std.mem.eql(u8, method, "GET") and !has_query) {
                 const admin_inst = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
                 if (admin_inst) |ai| {
                     const admin_tc = getOrOpenTenantFiles(worker, ai) catch null;
@@ -1490,12 +1492,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             continue;
         }
 
-        // Static-first dispatch: GET requests for paths that map onto a
-        // `_static/*` manifest entry get served natively here — no JS
-        // context, no budget, no tape capture. On a miss we fall
-        // through to handler resolution below. Admin requests also
-        // pass through so the admin UI is dogfooded via `_static/*`.
-        if (std.mem.eql(u8, method, "GET")) {
+        // Static-first dispatch for customer traffic only. Admin
+        // requests already ran their own pre-auth static check above —
+        // running it here again would shadow the admin JS handler with
+        // `_static/index.html` on `/?fn=...` API calls.
+        if (!is_admin_request and std.mem.eql(u8, method, "GET")) {
             const static_outcome = try tryServeStatic(
                 server,
                 allocator,

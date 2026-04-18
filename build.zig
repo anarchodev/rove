@@ -313,6 +313,23 @@ pub fn build(b: *std.Build) void {
     js_worker_mod.addImport("rove-qjs", qjs_mod);
     js_worker_mod.addImport("rove-tenant", tenant_mod);
     js_worker_mod.addImport("rove-h2", h2_mod);
+    // Admin UI bundle — embedded so js-worker ships with a working
+    // dashboard at app.{BASE_DOMAIN}/ out of the box. Each file becomes
+    // a `_static/<path>` entry in __admin__'s initial deployment.
+    const admin_ui_files: []const struct { name: []const u8, path: []const u8 } = &.{
+        .{ .name = "admin_ui_index_html", .path = "web/admin/index.html" },
+        .{ .name = "admin_ui_app_js", .path = "web/admin/app.js" },
+        .{ .name = "admin_ui_api_js", .path = "web/admin/api.js" },
+        .{ .name = "admin_ui_app_css", .path = "web/admin/app.css" },
+        .{ .name = "admin_ui_page_login", .path = "web/admin/pages/login.js" },
+        .{ .name = "admin_ui_page_instances", .path = "web/admin/pages/instances.js" },
+        .{ .name = "admin_ui_page_instance", .path = "web/admin/pages/instance.js" },
+    };
+    for (admin_ui_files) |f| {
+        js_worker_mod.addAnonymousImport(f.name, .{
+            .root_source_file = b.path(f.path),
+        });
+    }
     js_worker_mod.link_libc = true;
     js_worker_mod.linkSystemLibrary("nghttp2", .{});
     js_worker_mod.linkSystemLibrary("ssl", .{});

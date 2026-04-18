@@ -815,38 +815,36 @@ pub fn main() !void {
         // content-addressed and the deploy is local-deterministic, so
         // all nodes independently end up with the same hashes — no
         // replication needed for code in M1.
-        try bootstrapHandler(allocator, cli.data_dir, "__admin__", &.{
-            .{ .path = "index.mjs", .source = ADMIN_HANDLER_SRC },
-        });
+        try bootstrapHandler(allocator, cli.data_dir, "__admin__", &ADMIN_DEPLOY_FILES);
         try bootstrapHandler(allocator, cli.data_dir, "acme", &.{
-            .{ .path = "index.mjs", .source = ACME_INDEX },
-            .{ .path = "api/index.mjs", .source = ACME_API_INDEX },
-            .{ .path = "users/index.mjs", .source = ACME_USERS_MJS },
+            .{ .path = "index.mjs", .content = ACME_INDEX },
+            .{ .path = "api/index.mjs", .content = ACME_API_INDEX },
+            .{ .path = "users/index.mjs", .content = ACME_USERS_MJS },
         });
         try bootstrapHandler(allocator, cli.data_dir, "globex", &.{
-            .{ .path = "index.mjs", .source = GLOBEX_HANDLER },
+            .{ .path = "index.mjs", .content = GLOBEX_HANDLER },
         });
         try bootstrapHandler(allocator, cli.data_dir, "penalty", &.{
-            .{ .path = "index.mjs", .source = PENALTY_HANDLER },
+            .{ .path = "index.mjs", .content = PENALTY_HANDLER },
         });
         try bootstrapHandler(allocator, cli.data_dir, "readonly", &.{
-            .{ .path = "index.mjs", .source = READONLY_HANDLER },
+            .{ .path = "index.mjs", .content = READONLY_HANDLER },
         });
         try bootstrapHandler(allocator, cli.data_dir, "randwrite", &.{
-            .{ .path = "index.mjs", .source = RANDWRITE_BENCH_HANDLER },
+            .{ .path = "index.mjs", .content = RANDWRITE_BENCH_HANDLER },
         });
         try bootstrapHandler(allocator, cli.data_dir, "hot", &.{
-            .{ .path = "index.mjs", .source = HOT_BENCH_HANDLER },
+            .{ .path = "index.mjs", .content = HOT_BENCH_HANDLER },
         });
         try bootstrapHandler(allocator, cli.data_dir, "spread", &.{
-            .{ .path = "index.mjs", .source = SPREAD_BENCH_HANDLER },
+            .{ .path = "index.mjs", .content = SPREAD_BENCH_HANDLER },
         });
         wi = 0;
         while (wi < NUM_WRITE_TENANTS) : (wi += 1) {
             var id_buf: [16]u8 = undefined;
             const id = try std.fmt.bufPrint(&id_buf, "write{d}", .{wi});
             try bootstrapHandler(allocator, cli.data_dir, id, &.{
-                .{ .path = "index.mjs", .source = WRITE_BENCH_HANDLER },
+                .{ .path = "index.mjs", .content = WRITE_BENCH_HANDLER },
             });
         }
 
@@ -1040,17 +1038,23 @@ pub fn main() !void {
     std.process.exit(0);
 }
 
-/// Compile `source` for an instance and publish it as the current
-/// deployment through that tenant's code store. Mirrors what
-/// `rove-files-cli upload index.js && rove-files-cli deploy` would do
+/// Compile `source` (or pass-through for static) for an instance and
+/// publish it as the current deployment through that tenant's file
+/// store. Mirrors what `rove-files-cli upload + deploy` would do
 /// externally; kept inline so the smoke test is a single binary.
-const HandlerFile = struct { path: []const u8, source: []const u8 };
+const DeployFile = struct {
+    path: []const u8,
+    content: []const u8,
+    /// null → handler source (compile to bytecode). Non-null → static
+    /// file served verbatim with this content-type.
+    content_type: ?[]const u8 = null,
+};
 
 fn bootstrapHandler(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
     instance_id: []const u8,
-    files: []const HandlerFile,
+    files: []const DeployFile,
 ) !void {
     const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, instance_id });
     defer allocator.free(inst_dir);
@@ -1079,9 +1083,37 @@ fn bootstrapHandler(
         &compiler,
     );
 
-    for (files) |f| try store.putSource(f.path, f.source);
+    for (files) |f| {
+        if (f.content_type) |ct| {
+            try store.putStatic(f.path, f.content, ct);
+        } else {
+            try store.putSource(f.path, f.content);
+        }
+    }
     _ = try store.deploy();
 }
+
+// The admin UI bundle is embedded into the binary so a fresh start
+// ships with a functioning login page at app.loop46.me. Each file
+// becomes a `_static/<path>` entry in __admin__'s initial deployment.
+const ADMIN_UI_INDEX_HTML = @embedFile("admin_ui_index_html");
+const ADMIN_UI_APP_JS = @embedFile("admin_ui_app_js");
+const ADMIN_UI_API_JS = @embedFile("admin_ui_api_js");
+const ADMIN_UI_APP_CSS = @embedFile("admin_ui_app_css");
+const ADMIN_UI_PAGE_LOGIN = @embedFile("admin_ui_page_login");
+const ADMIN_UI_PAGE_INSTANCES = @embedFile("admin_ui_page_instances");
+const ADMIN_UI_PAGE_INSTANCE = @embedFile("admin_ui_page_instance");
+
+const ADMIN_DEPLOY_FILES = [_]DeployFile{
+    .{ .path = "index.mjs", .content = ADMIN_HANDLER_SRC },
+    .{ .path = "_static/index.html", .content = ADMIN_UI_INDEX_HTML, .content_type = "text/html; charset=utf-8" },
+    .{ .path = "_static/app.js", .content = ADMIN_UI_APP_JS, .content_type = "application/javascript" },
+    .{ .path = "_static/api.js", .content = ADMIN_UI_API_JS, .content_type = "application/javascript" },
+    .{ .path = "_static/app.css", .content = ADMIN_UI_APP_CSS, .content_type = "text/css" },
+    .{ .path = "_static/pages/login.js", .content = ADMIN_UI_PAGE_LOGIN, .content_type = "application/javascript" },
+    .{ .path = "_static/pages/instances.js", .content = ADMIN_UI_PAGE_INSTANCES, .content_type = "application/javascript" },
+    .{ .path = "_static/pages/instance.js", .content = ADMIN_UI_PAGE_INSTANCE, .content_type = "application/javascript" },
+};
 
 /// Pre-seed the readonly tenant's per-tenant `app.db` with a row the
 /// benchmark handler reads. Opens a throwaway direct kv connection,
