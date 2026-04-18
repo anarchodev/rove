@@ -61,8 +61,8 @@ export function render(root, { goto, api, params }) {
 
     const ctx = { instanceId, api, showError, clearError };
     if (tabId === "logs") activeTeardown = renderLogs(tabBody, ctx) || null;
-    else if (tabId === "kv") activeTeardown = renderPlaceholder(tabBody, "KV viewer lands in the next slice.") || null;
-    else if (tabId === "code") activeTeardown = renderPlaceholder(tabBody, "Code editor lands in a future slice.") || null;
+    else if (tabId === "kv") activeTeardown = renderKv(tabBody, ctx) || null;
+    else if (tabId === "code") activeTeardown = renderCode(tabBody, ctx) || null;
   }
 
   for (const t of TABS) {
@@ -264,13 +264,226 @@ function renderRecordDetail(r) {
   return wrap;
 }
 
-// ── Stubs for future panels ────────────────────────────────────────
+// ── KV panel ───────────────────────────────────────────────────────
 
-function renderPlaceholder(root, msg) {
+function renderKv(root, { instanceId, api, showError, clearError }) {
   const el = document.createElement("div");
-  el.className = "placeholder";
-  el.innerHTML = `<p class="muted">${escapeHtml(msg)}</p>`;
+  el.className = "kv-panel";
+  el.innerHTML = `
+    <div class="toolbar">
+      <label class="prefix-label">
+        <span>Prefix</span>
+        <input class="prefix-input" type="text" placeholder="(any)">
+      </label>
+      <button type="button" class="refresh">Refresh</button>
+      <span class="count muted"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="kv-table">
+        <thead>
+          <tr><th>Key</th><th>Value</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  `;
   root.appendChild(el);
+
+  const tbody = el.querySelector("tbody");
+  const prefixInput = el.querySelector(".prefix-input");
+  const refreshBtn = el.querySelector(".refresh");
+  const countLabel = el.querySelector(".count");
+
+  async function load() {
+    refreshBtn.disabled = true;
+    clearError();
+    try {
+      const res = await api.listKv(instanceId, {
+        prefix: prefixInput.value,
+        limit: 200,
+      });
+      const entries = res.entries ?? [];
+      tbody.replaceChildren();
+      if (entries.length === 0) {
+        const tr = document.createElement("tr");
+        tr.className = "empty";
+        tr.innerHTML = `<td colspan="2"><em>no matching keys</em></td>`;
+        tbody.appendChild(tr);
+      } else {
+        for (const e of entries) tbody.appendChild(kvRow(e));
+      }
+      countLabel.textContent = `${entries.length} entr${entries.length === 1 ? "y" : "ies"}`;
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        location.hash = "#/login";
+        return;
+      }
+      showError(`Load failed: ${err.message}`);
+    } finally {
+      refreshBtn.disabled = false;
+    }
+  }
+
+  function kvRow(entry) {
+    const tr = document.createElement("tr");
+    const keyCell = document.createElement("td");
+    keyCell.className = "kv-key";
+    keyCell.textContent = entry.key;
+    const valCell = document.createElement("td");
+    valCell.className = "kv-value";
+    const truncated = entry.value.length > 200
+      ? entry.value.slice(0, 200) + "…"
+      : entry.value;
+    valCell.textContent = truncated;
+    valCell.title = entry.value;
+    tr.appendChild(keyCell);
+    tr.appendChild(valCell);
+    return tr;
+  }
+
+  refreshBtn.addEventListener("click", load);
+  prefixInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      load();
+    }
+  });
+
+  load();
+  return () => {};
+}
+
+// ── Code panel ─────────────────────────────────────────────────────
+
+function renderCode(root, { instanceId, api, showError, clearError }) {
+  const el = document.createElement("div");
+  el.className = "code-panel";
+  el.innerHTML = `
+    <div class="code-layout">
+      <aside class="file-list">
+        <div class="toolbar">
+          <button type="button" class="refresh">Refresh</button>
+        </div>
+        <ul></ul>
+      </aside>
+      <section class="editor">
+        <div class="editor-header">
+          <span class="current-path muted">(no file selected)</span>
+          <span class="editor-meta muted"></span>
+          <button type="button" class="save" disabled>Save</button>
+        </div>
+        <textarea class="editor-body" spellcheck="false" disabled></textarea>
+      </section>
+    </div>
+  `;
+  root.appendChild(el);
+
+  const list = el.querySelector(".file-list ul");
+  const refreshBtn = el.querySelector(".refresh");
+  const pathLabel = el.querySelector(".current-path");
+  const metaLabel = el.querySelector(".editor-meta");
+  const saveBtn = el.querySelector(".save");
+  const textarea = el.querySelector(".editor-body");
+
+  let selected = null; // { path, kind, content_type, original }
+
+  async function loadList() {
+    refreshBtn.disabled = true;
+    clearError();
+    try {
+      const res = await api.listFiles(instanceId);
+      const entries = res.entries ?? [];
+      list.replaceChildren();
+      if (entries.length === 0) {
+        const li = document.createElement("li");
+        li.className = "empty";
+        li.innerHTML = `<em>no deployment</em>`;
+        list.appendChild(li);
+      } else {
+        for (const e of entries) list.appendChild(buildFileLi(e));
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        location.hash = "#/login";
+        return;
+      }
+      showError(`Load files failed: ${err.message}`);
+    } finally {
+      refreshBtn.disabled = false;
+    }
+  }
+
+  function buildFileLi(entry) {
+    const li = document.createElement("li");
+    li.className = `file file-${entry.kind}`;
+    li.dataset.path = entry.path;
+    li.innerHTML = `
+      <span class="file-kind">${entry.kind === "handler" ? "JS" : "—"}</span>
+      <span class="file-path">${escapeHtml(entry.path)}</span>
+    `;
+    li.addEventListener("click", () => openFile(entry.path));
+    return li;
+  }
+
+  async function openFile(path) {
+    clearError();
+    for (const node of list.querySelectorAll("li")) {
+      node.classList.toggle("active", node.dataset.path === path);
+    }
+    pathLabel.textContent = path;
+    metaLabel.textContent = "Loading…";
+    textarea.disabled = true;
+    saveBtn.disabled = true;
+    try {
+      const file = await api.getFile(instanceId, path);
+      selected = {
+        path,
+        kind: file.kind,
+        content_type: file.content_type,
+        original: file.content ?? "",
+      };
+      textarea.value = selected.original;
+      textarea.disabled = false;
+      metaLabel.textContent = `${file.kind} · ${file.content_type || "(no content-type)"} · ${selected.original.length} bytes`;
+      saveBtn.disabled = true; // enable only when dirty
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        location.hash = "#/login";
+        return;
+      }
+      showError(`Open failed: ${err.message}`);
+      metaLabel.textContent = "";
+    }
+  }
+
+  textarea.addEventListener("input", () => {
+    if (!selected) return;
+    saveBtn.disabled = textarea.value === selected.original;
+  });
+
+  saveBtn.addEventListener("click", async () => {
+    if (!selected) return;
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Saving…";
+    try {
+      const body = textarea.value;
+      const ct = selected.content_type && selected.content_type.length > 0
+        ? selected.content_type
+        : (selected.kind === "handler" ? "application/javascript" : "application/octet-stream");
+      await api.putFile(instanceId, selected.path, body, ct);
+      selected.original = body;
+      metaLabel.textContent = `${selected.kind} · ${ct} · ${body.length} bytes · saved`;
+    } catch (err) {
+      showError(`Save failed: ${err.message}`);
+      saveBtn.disabled = false;
+    } finally {
+      saveBtn.textContent = "Save";
+    }
+  });
+
+  refreshBtn.addEventListener("click", loadList);
+
+  loadList();
   return () => {};
 }
 

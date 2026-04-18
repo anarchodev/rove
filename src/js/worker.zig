@@ -1250,19 +1250,18 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 continue;
             }
 
-            const token = extractBearerToken(rh) orelse {
-                try setSystemResponse(server, ent, sid, sess, 401, "missing bearer token\n", allocator, cors_origin, null);
-                processed += 1;
-                continue;
-            };
-            const auth_ctx = worker.tenant.authenticate(token) catch |err| {
+            // Same auth shape as the admin branch: cookie first, then
+            // Authorization: Bearer. Lets the dashboard JS call
+            // /_system/files/* and /_system/log/* without juggling a
+            // bearer header.
+            const auth_ctx = extractAdminAuth(worker.tenant, rh) catch |err| {
                 std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
                 try setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
                 processed += 1;
                 continue;
             };
             if (auth_ctx == null) {
-                try setSystemResponse(server, ent, sid, sess, 401, "invalid bearer token\n", allocator, cors_origin, null);
+                try setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, cors_origin, null);
                 processed += 1;
                 continue;
             }

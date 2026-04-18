@@ -245,7 +245,28 @@ pub fn putFileAndDeploy(
     body: []const u8,
     content_type: []const u8,
 ) Error!u64 {
-    if (std.mem.startsWith(u8, path, "_code/")) {
+    // If the file already exists, preserve its kind so the Code tab
+    // can save edits to a handler that wasn't created under `_code/`
+    // (e.g. legacy `index.mjs` deployments) without a prefix rename.
+    var existing: ?files_mod.Kind = null;
+    {
+        var h: InstanceCtx = undefined;
+        try h.init(allocator, data_dir, instance_id, stubCompile, null);
+        defer h.deinit();
+        if (h.store.stat(path)) |info| {
+            var mut = info;
+            defer mut.deinit();
+            existing = mut.kind;
+        } else |_| {}
+    }
+
+    const kind = existing orelse blk: {
+        if (std.mem.startsWith(u8, path, "_code/")) break :blk files_mod.Kind.handler;
+        if (std.mem.startsWith(u8, path, "_static/")) break :blk files_mod.Kind.static;
+        return Error.InvalidPath;
+    };
+
+    if (kind == .handler) {
         var compiler = try InlineCompiler.init();
         defer compiler.deinit();
         var h: InstanceCtx = undefined;
@@ -253,14 +274,12 @@ pub fn putFileAndDeploy(
         defer h.deinit();
         h.store.putSource(path, body) catch |err| return mapCodeError(err);
         return h.store.deploy() catch |err| mapCodeError(err);
-    } else if (std.mem.startsWith(u8, path, "_static/")) {
+    } else {
         var h: InstanceCtx = undefined;
         try h.init(allocator, data_dir, instance_id, stubCompile, null);
         defer h.deinit();
         h.store.putStatic(path, body, content_type) catch |err| return mapCodeError(err);
         return h.store.deploy() catch |err| mapCodeError(err);
-    } else {
-        return Error.InvalidPath;
     }
 }
 
