@@ -625,6 +625,103 @@ pub const Tenant = struct {
         return .{ .is_root = true };
     }
 
+    // ── Session cookies ───────────────────────────────────────────────
+    //
+    // A session is an opaque 64-hex token handed to the browser via
+    // `Set-Cookie` after a successful login. We store sha256(opaque),
+    // NOT the opaque itself, so a leaked `__root__.db` can't impersonate
+    // live sessions. Value = `{expires_at_ns i64 little-endian}{is_root u8}`.
+    // TTL comes from the caller at mint time.
+
+    pub const SESSION_HEX_LEN: usize = 64;
+
+    /// Fresh opaque 64-hex session token. Returns the plaintext to hand
+    /// the caller (for a `Set-Cookie`); the store only retains its hash.
+    /// `ttl_ns` is the lifetime from now.
+    pub fn createSession(
+        self: *Tenant,
+        ctx: AuthContext,
+        ttl_ns: i64,
+    ) Error![SESSION_HEX_LEN]u8 {
+        var raw: [32]u8 = undefined;
+        std.crypto.random.bytes(&raw);
+
+        var opaque_hex: [SESSION_HEX_LEN]u8 = undefined;
+        bytesToHex(&raw, &opaque_hex);
+
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&opaque_hex, &hash, .{});
+        var hash_hex: [SESSION_HEX_LEN]u8 = undefined;
+        bytesToHex(&hash, &hash_hex);
+
+        var key_buf: [32 + SESSION_HEX_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "__root__/session/{s}", .{hash_hex}) catch
+            return Error.Kv;
+
+        var val_buf: [9]u8 = undefined;
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        const expires_at_ns: i64 = now_ns +| ttl_ns;
+        std.mem.writeInt(i64, val_buf[0..8], expires_at_ns, .little);
+        val_buf[8] = if (ctx.is_root) 1 else 0;
+
+        self.root.put(key, &val_buf) catch return Error.Kv;
+        return opaque_hex;
+    }
+
+    /// Validate an opaque session token. Returns `null` if the token is
+    /// malformed, unknown, or expired (expired entries are swept on
+    /// access). On hit, returns the `AuthContext` the session was minted
+    /// against.
+    pub fn authenticateSession(self: *Tenant, opaque_hex: []const u8) Error!?AuthContext {
+        if (opaque_hex.len != SESSION_HEX_LEN) return null;
+        for (opaque_hex) |b| {
+            const ok = (b >= '0' and b <= '9') or (b >= 'a' and b <= 'f') or (b >= 'A' and b <= 'F');
+            if (!ok) return null;
+        }
+
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(opaque_hex, &hash, .{});
+        var hash_hex: [SESSION_HEX_LEN]u8 = undefined;
+        bytesToHex(&hash, &hash_hex);
+
+        var key_buf: [32 + SESSION_HEX_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "__root__/session/{s}", .{hash_hex}) catch
+            return Error.Kv;
+
+        const v = self.root.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return Error.Kv,
+        };
+        defer self.allocator.free(v);
+        if (v.len != 9) return null;
+
+        const expires_at_ns = std.mem.readInt(i64, v[0..8], .little);
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        if (now_ns >= expires_at_ns) {
+            // Drop the stale record opportunistically.
+            self.root.delete(key) catch {};
+            return null;
+        }
+        return .{ .is_root = v[8] != 0 };
+    }
+
+    /// Revoke a session by its opaque token. No-op if the session
+    /// doesn't exist (idempotent logout).
+    pub fn revokeSession(self: *Tenant, opaque_hex: []const u8) Error!void {
+        if (opaque_hex.len != SESSION_HEX_LEN) return;
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(opaque_hex, &hash, .{});
+        var hash_hex: [SESSION_HEX_LEN]u8 = undefined;
+        bytesToHex(&hash, &hash_hex);
+        var key_buf: [32 + SESSION_HEX_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "__root__/session/{s}", .{hash_hex}) catch
+            return Error.Kv;
+        self.root.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return Error.Kv,
+        };
+    }
+
     /// Check whether the given auth context is allowed to operate on
     /// `instance_id`. In the single-account M1 shape the root token
     /// grants access to every instance, so this reduces to
@@ -668,6 +765,15 @@ fn validateTokenHex(token_hex: []const u8) Error!void {
     for (token_hex) |b| {
         const ok = (b >= '0' and b <= '9') or (b >= 'a' and b <= 'f') or (b >= 'A' and b <= 'F');
         if (!ok) return Error.InvalidToken;
+    }
+}
+
+fn bytesToHex(src: []const u8, dst: []u8) void {
+    std.debug.assert(dst.len >= src.len * 2);
+    const hex_chars = "0123456789abcdef";
+    for (src, 0..) |b, i| {
+        dst[i * 2] = hex_chars[b >> 4];
+        dst[i * 2 + 1] = hex_chars[b & 0x0f];
     }
 }
 
@@ -1186,4 +1292,56 @@ test "validateHost rejects slashes and whitespace" {
     try testing.expectError(Error.InvalidHost, validateHost("with/slash"));
     try validateHost("acme.test");
     try validateHost("api.v1.example.com:8443");
+}
+
+test "createSession + authenticateSession round-trip" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const ctx: AuthContext = .{ .is_root = true };
+    const opaque_hex = try fx.tenant.createSession(ctx, std.time.ns_per_s * 60);
+    try testing.expectEqual(@as(usize, 64), opaque_hex.len);
+
+    const resolved = try fx.tenant.authenticateSession(&opaque_hex);
+    try testing.expect(resolved != null);
+    try testing.expect(resolved.?.is_root);
+}
+
+test "authenticateSession rejects unknown tokens" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const bogus = "a" ** 64;
+    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(bogus));
+
+    // Wrong length / non-hex rejected as null too.
+    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession("too-short"));
+    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession("zz" ** 32));
+}
+
+test "revokeSession clears the record" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const ctx: AuthContext = .{ .is_root = true };
+    const opaque_hex = try fx.tenant.createSession(ctx, std.time.ns_per_s * 60);
+    try testing.expect(try fx.tenant.authenticateSession(&opaque_hex) != null);
+
+    try fx.tenant.revokeSession(&opaque_hex);
+    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(&opaque_hex));
+
+    // Idempotent revoke.
+    try fx.tenant.revokeSession(&opaque_hex);
+}
+
+test "expired session is rejected and swept" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const ctx: AuthContext = .{ .is_root = true };
+    // Negative TTL → already-expired session, exercises the sweep path.
+    const opaque_hex = try fx.tenant.createSession(ctx, -1);
+    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(&opaque_hex));
+    // Second lookup also null — sweep removed it.
+    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(&opaque_hex));
 }
