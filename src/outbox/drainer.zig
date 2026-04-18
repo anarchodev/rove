@@ -218,8 +218,14 @@ fn deliverOne(
                 "outbox drainer: {s}/{s}: delivered status={d} (truncated={})",
                 .{ inst.id, key, resp.status, resp.truncated },
             );
-            // TODO(slice 3a.5): enqueue the onResult callback with
-            // outcome=delivered, response, attempts.
+            try writeCallback(h.allocator, kv, env, .{
+                .outcome = "delivered",
+                .status = resp.status,
+                .body = resp.body,
+                .truncated = resp.truncated,
+                .attempts = env.attempts + 1,
+                .err = null,
+            });
             try kv.delete(key);
         },
         .retry => |err| {
@@ -229,9 +235,15 @@ fn deliverOne(
                     "outbox drainer: {s}/{s}: attempts exhausted ({d}), moving to _dlq ({s})",
                     .{ inst.id, key, attempts_next, @errorName(err) },
                 );
+                try writeCallback(h.allocator, kv, env, .{
+                    .outcome = "failed",
+                    .status = 0,
+                    .body = "",
+                    .truncated = false,
+                    .attempts = attempts_next,
+                    .err = @errorName(err),
+                });
                 try moveToDlq(h.allocator, kv, key, envelope_bytes, @errorName(err));
-                // TODO(slice 3a.5): enqueue onResult callback with
-                // outcome=failed.
                 return;
             }
             const delay = backoffDelayMs(h.config, attempts_next, rand);
@@ -247,11 +259,80 @@ fn deliverOne(
                 "outbox drainer: {s}/{s}: terminal ({s}), moving to _dlq",
                 .{ inst.id, key, @errorName(err) },
             );
+            try writeCallback(h.allocator, kv, env, .{
+                .outcome = "failed",
+                .status = 0,
+                .body = "",
+                .truncated = false,
+                .attempts = env.attempts + 1,
+                .err = @errorName(err),
+            });
             try moveToDlq(h.allocator, kv, key, envelope_bytes, @errorName(err));
-            // TODO(slice 3a.5): enqueue onResult callback with
-            // outcome=failed.
         },
     }
+}
+
+// ── Callback receipts ────────────────────────────────────────────────
+//
+// When a webhook finishes (delivered or terminally failed), the
+// drainer records an event envelope at `_callback/{id}` so a future
+// handler dispatcher can invoke the customer's `on_result` hook. This
+// commit only writes the receipt — the dispatcher that consumes them
+// lands in a follow-up.
+//
+// Schema:
+//   {
+//     "webhook_id": "<64-hex>",
+//     "on_result": "path/to/handler" | null,
+//     "outcome": "delivered" | "failed",
+//     "attempts": N,
+//     "context": <opaque user JSON>,
+//     "response": { "status": int, "body": string, "truncated": bool },  // delivered only
+//     "error": "ErrorName"   // failed only
+//   }
+
+const CallbackInput = struct {
+    outcome: []const u8,
+    status: u16,
+    body: []const u8,
+    truncated: bool,
+    attempts: i32,
+    err: ?[]const u8,
+};
+
+fn writeCallback(
+    allocator: std.mem.Allocator,
+    kv: *kv_mod.KvStore,
+    env: Envelope,
+    input: CallbackInput,
+) !void {
+    if (env.on_result == null) return; // customer didn't want a callback
+
+    var obj: std.json.ObjectMap = .init(allocator);
+    defer obj.deinit();
+    try obj.put("webhook_id", .{ .string = env.id });
+    try obj.put("on_result", .{ .string = env.on_result.? });
+    try obj.put("outcome", .{ .string = input.outcome });
+    try obj.put("attempts", .{ .integer = input.attempts });
+    try obj.put("context", env.context);
+
+    if (std.mem.eql(u8, input.outcome, "delivered")) {
+        var resp_obj: std.json.ObjectMap = .init(allocator);
+        // resp_obj is moved into the Value below — do NOT deinit here.
+        try resp_obj.put("status", .{ .integer = @as(i64, @intCast(input.status)) });
+        try resp_obj.put("body", .{ .string = input.body });
+        try resp_obj.put("truncated", .{ .bool = input.truncated });
+        try obj.put("response", .{ .object = resp_obj });
+    } else if (input.err) |e| {
+        try obj.put("error", .{ .string = e });
+    }
+
+    const body = try stringifyAlloc(allocator, .{ .object = obj });
+    defer allocator.free(body);
+
+    var key_buf: [10 + 64]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "_callback/{s}", .{env.id}) catch return error.InvalidKey;
+    try kv.put(key, body);
 }
 
 const Envelope = struct {
