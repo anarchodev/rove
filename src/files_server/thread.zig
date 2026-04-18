@@ -211,6 +211,7 @@ fn handleOne(
     var method: []const u8 = "";
     var path: []const u8 = "";
     var x_rove_path: []const u8 = "";
+    var content_type: []const u8 = "";
     if (rh.fields != null) {
         const fields = rh.fields.?[0..rh.count];
         for (fields) |f| {
@@ -219,6 +220,7 @@ fn handleOne(
             if (std.mem.eql(u8, name, ":method")) method = value;
             if (std.mem.eql(u8, name, ":path")) path = value;
             if (std.mem.eql(u8, name, "x-rove-path")) x_rove_path = value;
+            if (std.mem.eql(u8, name, "content-type")) content_type = value;
         }
     }
 
@@ -248,6 +250,9 @@ fn handleOne(
     } else if (std.mem.startsWith(u8, remainder, "source/") and std.mem.eql(u8, method, "GET")) {
         const hash = remainder["source/".len..];
         try handleSource(server, allocator, data_dir, ent, sid, sess, instance_id, hash);
+    } else if (std.mem.startsWith(u8, remainder, "file/") and std.mem.eql(u8, method, "PUT")) {
+        const file_path = remainder["file/".len..];
+        try handlePutFile(server, allocator, data_dir, ent, sid, sess, instance_id, file_path, content_type, rb);
     } else {
         try setResponse(server, ent, sid, sess, 404, null, "not found\n");
     }
@@ -303,6 +308,50 @@ fn handleDeploy(
     };
     const body = try std.fmt.allocPrint(allocator, "{d}\n", .{dep_id});
     try setResponse(server, ent, sid, sess, 200, body.ptr, body);
+}
+
+fn handlePutFile(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    instance_id: []const u8,
+    file_path: []const u8,
+    content_type: []const u8,
+    rb: h2.ReqBody,
+) !void {
+    if (file_path.len == 0) {
+        try setResponse(server, ent, sid, sess, 400, null, "empty file path\n");
+        return;
+    }
+    const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
+
+    const dep_id = files_server.putFileAndDeploy(
+        allocator,
+        data_dir,
+        instance_id,
+        file_path,
+        body,
+        content_type,
+    ) catch |err| {
+        const code: u16 = switch (err) {
+            files_server.Error.InvalidPath => 400,
+            files_server.Error.CompileFailed => 400,
+            files_server.Error.InvalidInstanceId => 400,
+            else => 500,
+        };
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "putFile failed: {s}\n",
+            .{@errorName(err)},
+        );
+        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        return;
+    };
+    const body_out = try std.fmt.allocPrint(allocator, "{d}\n", .{dep_id});
+    try setResponse(server, ent, sid, sess, 201, body_out.ptr, body_out);
 }
 
 fn handleSource(

@@ -212,6 +212,58 @@ pub fn uploadFile(
     h.store.putSource(path, source) catch |err| return mapCodeError(err);
 }
 
+/// Upload a static file — raw bytes at `path`, stored under its stored
+/// content-type. Unlike `uploadFile`, there's no compile step: static
+/// assets are served verbatim.
+pub fn uploadStatic(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    instance_id: []const u8,
+    path: []const u8,
+    bytes: []const u8,
+    content_type: []const u8,
+) Error!void {
+    var h: InstanceCtx = undefined;
+    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    defer h.deinit();
+
+    h.store.putStatic(path, bytes, content_type) catch |err| return mapCodeError(err);
+}
+
+/// Upload-and-deploy an admin single-file write. Infers kind from the
+/// path prefix (`_code/` → handler, `_static/` → static) and commits a
+/// fresh deployment in the same call. Returns the new deployment id.
+///
+/// Anything outside the `_code/` / `_static/` prefixes is rejected with
+/// `Error.InvalidPath`. Customers can't claim top-level `_`-prefixed
+/// paths — the policy lives at the edge (request handler or admin UI).
+pub fn putFileAndDeploy(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    instance_id: []const u8,
+    path: []const u8,
+    body: []const u8,
+    content_type: []const u8,
+) Error!u64 {
+    if (std.mem.startsWith(u8, path, "_code/")) {
+        var compiler = try InlineCompiler.init();
+        defer compiler.deinit();
+        var h: InstanceCtx = undefined;
+        try h.init(allocator, data_dir, instance_id, InlineCompiler.compile, &compiler);
+        defer h.deinit();
+        h.store.putSource(path, body) catch |err| return mapCodeError(err);
+        return h.store.deploy() catch |err| mapCodeError(err);
+    } else if (std.mem.startsWith(u8, path, "_static/")) {
+        var h: InstanceCtx = undefined;
+        try h.init(allocator, data_dir, instance_id, stubCompile, null);
+        defer h.deinit();
+        h.store.putStatic(path, body, content_type) catch |err| return mapCodeError(err);
+        return h.store.deploy() catch |err| mapCodeError(err);
+    } else {
+        return Error.InvalidPath;
+    }
+}
+
 /// Snapshot the current working tree into a new deployment and swap
 /// `deployment/current`. Returns the new deployment id.
 pub fn deploy(
