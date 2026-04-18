@@ -373,6 +373,11 @@ const Cli = struct {
     /// has). Mapped directly to `RaftNodeConfig.propose_linger_ns`
     /// at init time.
     propose_linger_us: u64 = 500,
+    /// How often each tenant's `deployment/current` is polled for
+    /// changes. Low values make new deploys visible fast (good for
+    /// tests); high values reduce per-tenant kv work. Mapped onto
+    /// `WorkerConfig.refresh_interval_ns`. 0 means "every tick".
+    refresh_interval_ms: u32 = 2000,
 };
 
 fn parseCli(argv: [][:0]u8) !Cli {
@@ -434,6 +439,10 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.propose_linger_us = try std.fmt.parseInt(u64, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--refresh-interval-ms")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.refresh_interval_ms = try std.fmt.parseInt(u32, argv[i], 10);
         } else {
             return error.Usage;
         }
@@ -511,6 +520,7 @@ const WorkerCtx = struct {
     admin_origin: ?[]const u8,
     admin_api_domain: ?[]const u8,
     public_suffix: ?[]const u8,
+    refresh_interval_ms: u32,
     /// Shared TlsConfig (or null for plaintext h2c). When present,
     /// all workers hand it to their h2 session on accept. Lives in
     /// the main thread; workers borrow.
@@ -604,6 +614,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .admin_origin = args.admin_origin,
         .admin_api_domain = args.admin_api_domain,
         .log_worker_id = args.worker_idx,
+        .refresh_interval_ns = @as(i64, args.refresh_interval_ms) * std.time.ns_per_ms,
     });
     defer worker.destroy();
 
@@ -973,6 +984,7 @@ pub fn main() !void {
             .admin_origin = cli.admin_origin,
             .admin_api_domain = cli.admin_api_domain,
             .public_suffix = cli.public_suffix,
+            .refresh_interval_ms = cli.refresh_interval_ms,
             .tls_config = tls_config,
             .seq_counters = &seq_counters,
             .ready = &ready_events[i],

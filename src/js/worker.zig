@@ -1292,9 +1292,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 continue;
             }
 
-            if (std.mem.eql(u8, subsystem, "code")) {
+            if (std.mem.eql(u8, subsystem, "files")) {
                 if (worker.code_proxy.addr == null) {
-                    try setSystemResponse(server, ent, sid, sess, 503, "code subsystem disabled\n", allocator, cors_origin, null);
+                    try setSystemResponse(server, ent, sid, sess, 503, "files subsystem disabled\n", allocator, cors_origin, null);
                     processed += 1;
                     continue;
                 }
@@ -1418,12 +1418,26 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             scope_inst = r.?;
         }
 
-        const tc = worker.tenant_files_map.get(handler_inst.id) orelse {
-            std.log.warn("rove-js: tenant {s} has no code state", .{handler_inst.id});
-            try setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
-            captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
-            processed += 1;
-            continue;
+        // Lazy-open: instances created at runtime aren't in the map yet.
+        // On first hit, open TenantFiles and cache. Failure here is a
+        // real error (corrupt store / disk) — 500.
+        const tc = worker.tenant_files_map.get(handler_inst.id) orelse blk: {
+            const opened = openTenantFiles(worker, handler_inst) catch |err| {
+                std.log.warn("rove-js: lazy openTenantFiles({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
+                try setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
+                captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+                processed += 1;
+                continue;
+            };
+            worker.tenant_files_map.put(worker.allocator, opened.instance_id, opened) catch |err| {
+                std.log.warn("rove-js: lazy tenant_files_map.put failed: {s}", .{@errorName(err)});
+                freeTenantFiles(worker.allocator, opened);
+                try setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
+                captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+                processed += 1;
+                continue;
+            };
+            break :blk opened;
         };
         if (tc.current_deployment_id == 0) {
             try setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
@@ -1468,7 +1482,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         defer route.deinit();
 
         const bytecode = (try findBytecode(tc, route.module_base, allocator)) orelse {
-            try setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
+            // Convention 404: serve `_static/_404.html` if the tenant
+            // has it. Otherwise fall back to the built-in text body.
+            if (!try serveConvention404(server, allocator, ent, sid, sess, tc)) {
+                try setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
+            }
             captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 404, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
@@ -2643,6 +2661,77 @@ fn buildStaticRespHeaders(
         ._buf = buf.ptr,
         ._buf_len = @intCast(buf.len),
     };
+}
+
+/// If the tenant has `_static/_404.html`, emit it as a 404 response
+/// with its stored content-type (no ETag — error bodies shouldn't be
+/// cached). Returns `true` when served, `false` when there's no such
+/// static so the caller can fall back to the built-in text body.
+fn serveConvention404(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    tc: *TenantFiles,
+) !bool {
+    const entry = tc.statics.get("_static/_404.html") orelse return false;
+    const bytes = tc.blob_backend.blobStore().get(&entry.hash_hex, allocator) catch |err| {
+        std.log.warn("rove-js: _404.html blob fetch failed: {s}", .{@errorName(err)});
+        return false;
+    };
+
+    // Minimal header set — just the content-type. No caching hints for
+    // error responses.
+    const Pair = struct { name: []const u8, value: []const u8 };
+    var pairs: [1]Pair = undefined;
+    var n: usize = 0;
+    if (entry.content_type.len > 0) {
+        pairs[n] = .{ .name = "content-type", .value = entry.content_type };
+        n += 1;
+    }
+    const hdrs: h2.RespHeaders = if (n == 0)
+        .{ .fields = null, .count = 0 }
+    else blk: {
+        const fields_size = n * @sizeOf(h2.HeaderField);
+        var strbuf_size: usize = 0;
+        for (pairs[0..n]) |p| strbuf_size += p.name.len + p.value.len;
+        const buf = try allocator.alloc(u8, fields_size + strbuf_size);
+        const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
+        var off: usize = fields_size;
+        for (pairs[0..n], 0..) |p, i| {
+            const name_start = off;
+            @memcpy(buf[off .. off + p.name.len], p.name);
+            off += p.name.len;
+            const value_start = off;
+            @memcpy(buf[off .. off + p.value.len], p.value);
+            off += p.value.len;
+            fields_ptr[i] = .{
+                .name = buf[name_start..].ptr,
+                .name_len = @intCast(p.name.len),
+                .value = buf[value_start..].ptr,
+                .value_len = @intCast(p.value.len),
+            };
+        }
+        break :blk .{
+            .fields = fields_ptr,
+            .count = @intCast(n),
+            ._buf = buf.ptr,
+            ._buf_len = @intCast(buf.len),
+        };
+    };
+
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 404 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = bytes.ptr,
+        .len = @intCast(bytes.len),
+    });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+    return true;
 }
 
 /// Write a 301 redirect response. `location` is duped into the response
