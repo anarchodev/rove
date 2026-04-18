@@ -3,11 +3,11 @@
 // Routes:
 //   #/login       → token entry
 //   #/instances   → list + create + delete + assign-domain
+//   #/instance/:id → per-instance dashboard
 //
-// Auth gate: every route except #/login bounces to #/login if
-// api.hasToken() is false. The individual pages also handle 401 by
-// clearing the token and calling goto("#/login"), which covers the
-// "token was valid yesterday but got revoked" case.
+// Auth: cookie-based. Every route except #/login calls `api.whoami()`
+// before rendering. On 401, we bounce to #/login. On success, the
+// cookie carries auth for every subsequent fetch in the session.
 
 import { api, ApiError } from "./api.js";
 import * as login from "./pages/login.js";
@@ -28,19 +28,25 @@ function resolveRoute(hash) {
 
 let currentTeardown = null;
 
-function route() {
+async function route() {
   const hash = location.hash || "#/instances";
   const { page, params } = resolveRoute(hash);
 
-  // Auth gate: any route except login requires a token.
-  if (page !== login && !api.hasToken()) {
-    location.hash = "#/login";
-    return;
-  }
-  // Already-logged-in users bounced off the login page land on instances.
-  if (page === login && api.hasToken()) {
-    location.hash = "#/instances";
-    return;
+  // Auth gate: every page except login requires a live session.
+  // /v1/session 401 → redirect to login; 200 → proceed.
+  if (page !== login) {
+    const who = await api.whoami();
+    if (!who) {
+      location.hash = "#/login";
+      return;
+    }
+  } else {
+    // Don't strand already-authed users on the login page.
+    const who = await api.whoami();
+    if (who) {
+      location.hash = "#/instances";
+      return;
+    }
   }
 
   if (typeof currentTeardown === "function") {

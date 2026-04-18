@@ -1,21 +1,21 @@
 // Typed wrapper around the rove admin API.
 //
-// Every admin call is an RPC against the `__admin__` handler. Named
-// function exports are invoked via `?fn=<name>` (GET, with any args
-// as a URL-encoded JSON array in `args=`) or POST body
-// `{fn:"name", args:[...]}`. The return value IS the response body.
+// Auth is cookie-based: the server mints a `rove_session` cookie after
+// POST /v1/login, and every subsequent fetch replays it automatically
+// (we send `credentials: "include"`). No tokens in localStorage.
+//
+// Every RPC call is still a named function on the `__admin__` handler:
+// `?fn=<name>` (GET, URL-encoded JSON args) or `POST {fn, args}`.
 //
 // Two scopes for the admin handler:
-// 1. Bare admin host (`api.loop46.com`)      → `kv` = root store.
-//    Use for tenant + domain CRUD.
-// 2. `{id}.api.loop46.com` subdomain         → `kv` = {id}'s app.db.
-//    Use for KV browsing scoped to one tenant.
+// 1. Bare admin host (`app.loop46.me`) → `kv` = root store (tenant /
+//    domain CRUD + session store).
+// 2. `{id}.app.loop46.me`              → `kv` = {id}'s app.db
+//    (per-tenant KV browsing).
 //
 // Out-of-band (still the native Zig proxies): logs + code via
-// `/_system/log/*` and `/_system/files/*`. Path-scoped; instance
-// always appears in the path.
+// `/_system/log/*` and `/_system/files/*`.
 
-const TOKEN_KEY = "rove.admin.token";
 const BASE_KEY = "rove.admin.api_base";
 
 export class ApiError extends Error {
@@ -26,18 +26,18 @@ export class ApiError extends Error {
   }
 }
 
-function getToken() { return localStorage.getItem(TOKEN_KEY) ?? ""; }
-
-/// The bare admin API base, e.g. `https://api.loop46.com:8443`.
+/// The admin API base. Defaults to this page's origin (prod shape:
+/// same-origin as the UI bundle). Override via `?api=` once and it
+/// sticks in localStorage — useful for dev against a remote worker.
 function adminBase() {
-  const v = window.__rove_api_base ?? localStorage.getItem(BASE_KEY) ?? "";
-  return v.replace(/\/+$/, "");
+  const override = window.__rove_api_base ?? localStorage.getItem(BASE_KEY);
+  if (override && override.length > 0) return override.replace(/\/+$/, "");
+  return window.location.origin;
 }
 
-/// The per-tenant API base: `https://{id}.api.loop46.com:8443`.
+/// Per-tenant API base: `{id}.<admin host>`.
 function scopeBase(instance_id) {
   const base = adminBase();
-  if (base === "") return "";
   try {
     const u = new URL(base);
     u.hostname = `${instance_id}.${u.hostname}`;
@@ -47,9 +47,8 @@ function scopeBase(instance_id) {
   }
 }
 
-/// Call a named export on the admin handler. GET with args as a
-/// URL-encoded JSON array; or, if `method === "POST"`, send
-/// `{fn, args}` as a JSON body. Returns the parsed response body.
+/// Call a named export on the admin handler. `?fn=<name>&args=...` for
+/// GET, JSON body for POST. Sends cookies.
 async function rpc(base, fn, args, { method = "GET" } = {}) {
   const argsArr = args ?? [];
   let url, init;
@@ -57,20 +56,15 @@ async function rpc(base, fn, args, { method = "GET" } = {}) {
     url = base + "/";
     init = {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${getToken()}`,
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
       body: JSON.stringify({ fn, args: argsArr }),
     };
   } else {
     const qs = new URLSearchParams({ fn });
     if (argsArr.length > 0) qs.set("args", JSON.stringify(argsArr));
     url = `${base}/?${qs.toString()}`;
-    init = {
-      method: "GET",
-      headers: { "Authorization": `Bearer ${getToken()}` },
-    };
+    init = { method: "GET", credentials: "include" };
   }
   const res = await fetch(url, init);
   const ct = res.headers.get("content-type") ?? "";
@@ -81,12 +75,25 @@ async function rpc(base, fn, args, { method = "GET" } = {}) {
   return parsed;
 }
 
-/// Raw GET for endpoints that return non-JSON bodies (mostly the
-/// out-of-band log/code proxies).
-async function rawGet(base, path) {
-  const res = await fetch(base + path, {
-    headers: { "Authorization": `Bearer ${getToken()}` },
+/// Minimal JSON POST used by /v1/login, /v1/logout. Returns the parsed
+/// body or throws on non-2xx.
+async function postJson(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(body),
   });
+  const ct = res.headers.get("content-type") ?? "";
+  const parsed = ct.includes("application/json")
+    ? await res.json().catch(() => null)
+    : await res.text();
+  if (!res.ok) throw new ApiError(res.status, res.statusText, parsed);
+  return parsed;
+}
+
+async function rawGet(base, path) {
+  const res = await fetch(base + path, { credentials: "include" });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     throw new ApiError(res.status, res.statusText, txt);
@@ -96,11 +103,29 @@ async function rawGet(base, path) {
 
 export const api = {
   // ── Auth ─────────────────────────────────────────────────────────
-  setToken(t) { localStorage.setItem(TOKEN_KEY, t); },
-  clearToken() { localStorage.removeItem(TOKEN_KEY); },
-  hasToken() { return getToken().length > 0; },
+  login(token) {
+    return postJson(adminBase() + "/v1/login", { token });
+  },
+  logout() {
+    return postJson(adminBase() + "/v1/logout", {});
+  },
+  /// Returns `{is_root}` on a valid session, null on 401.
+  async whoami() {
+    try {
+      const res = await fetch(adminBase() + "/v1/session", {
+        method: "GET",
+        credentials: "include",
+      });
+      if (res.status === 401) return null;
+      if (!res.ok) throw new ApiError(res.status, res.statusText, null);
+      return await res.json();
+    } catch (err) {
+      if (err instanceof ApiError) throw err;
+      return null;
+    }
+  },
 
-  // ── Admin scope: tenant CRUD + domains (kv=root) ────────────────
+  // ── Admin scope: tenant CRUD + domains (kv = root) ──────────────
   listInstances() {
     return rpc(adminBase(), "listInstance");
   },

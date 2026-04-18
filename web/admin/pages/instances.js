@@ -76,7 +76,6 @@ export function render(root, { goto, api }) {
       ]);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
-        api.clearToken();
         goto("#/login");
         return;
       }
@@ -178,8 +177,8 @@ export function render(root, { goto, api }) {
 
   createForm.addEventListener("submit", onCreate);
   assignForm.addEventListener("submit", onAssign);
-  logoutBtn.addEventListener("click", () => {
-    api.clearToken();
+  logoutBtn.addEventListener("click", async () => {
+    try { await api.logout(); } catch {}
     goto("#/login");
   });
 

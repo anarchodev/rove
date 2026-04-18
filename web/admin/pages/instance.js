@@ -75,8 +75,8 @@ export function render(root, { goto, api, params }) {
     tabButtons.set(t.id, btn);
   }
 
-  logoutBtn.addEventListener("click", () => {
-    api.clearToken();
+  logoutBtn.addEventListener("click", async () => {
+    try { await api.logout(); } catch {}
     goto("#/login");
   });
 
@@ -160,7 +160,6 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
       countLabel.textContent = `${records.length} record${records.length === 1 ? "" : "s"}`;
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
-        api.clearToken();
         location.hash = "#/login";
         return;
       }

@@ -1,6 +1,7 @@
-// Token-entry page. On submit, we store the token and ping a read-
-// only endpoint to validate — a bad token still reaches the server,
-// but a 401 reply tells us to wipe it before redirecting.
+// Token-entry page. POSTs to /v1/login; the server mints a session
+// cookie on success. If the token is wrong, surface the 401 so the
+// user can retry — we don't need to clean up any client-side state
+// because there is none to clean (no localStorage token anymore).
 
 import { ApiError } from "../api.js";
 
@@ -40,12 +41,10 @@ export function render(root, { goto, api }) {
       return;
     }
     submit.disabled = true;
-    api.setToken(token);
     try {
-      await api.listInstances();
+      await api.login(token);
       goto("#/instances");
     } catch (err) {
-      api.clearToken();
       if (err instanceof ApiError && err.status === 401) {
         showError("Server rejected the token.");
       } else {
