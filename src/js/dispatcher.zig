@@ -101,11 +101,18 @@ pub const Response = struct {
     console: []u8,
     /// Exception message if the script threw. Empty on success.
     exception: []u8,
+    /// Already-sanitized Set-Cookie header values, one per entry the
+    /// handler pushed onto `response.cookies`. Each string is an
+    /// owned, filter-passed cookie with any `Domain=...` attribute
+    /// stripped (see `sanitizeSetCookie`). Empty slice = no cookies.
+    set_cookies: [][]u8 = &.{},
 
     pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
         allocator.free(self.body);
         allocator.free(self.console);
         allocator.free(self.exception);
+        for (self.set_cookies) |cookie| allocator.free(cookie);
+        if (self.set_cookies.len > 0) allocator.free(self.set_cookies);
         self.* = undefined;
     }
 };
@@ -257,6 +264,11 @@ pub const Dispatcher = struct {
         var body_buf: []u8 = &.{};
         errdefer self.allocator.free(body_buf);
         var status: i32 = 200;
+        var cookies: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (cookies.items) |c2| self.allocator.free(c2);
+            cookies.deinit(self.allocator);
+        }
 
         const fun_obj = c.JS_ReadObject(
             ctx.raw,
@@ -270,7 +282,7 @@ pub const Dispatcher = struct {
             exception_msg = ctx.takeExceptionMessage(self.allocator) catch
                 return DispatchError.OutOfMemory;
             fun_val.deinit();
-            return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf);
+            return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf, &cookies);
         }
 
         if (fun_val.raw.tag != c.JS_TAG_MODULE) {
@@ -278,7 +290,7 @@ pub const Dispatcher = struct {
             status = 500;
             body_buf = self.allocator.dupe(u8, "handler bytecode is not an ES module (.mjs)") catch
                 return DispatchError.OutOfMemory;
-            return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf);
+            return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf, &cookies);
         }
 
         runModule(
@@ -292,13 +304,14 @@ pub const Dispatcher = struct {
             &status,
             &body_buf,
             &exception_msg,
+            &cookies,
         ) catch |err| switch (err) {
             error.Interrupted => return DispatchError.Interrupted,
             error.OutOfMemory => return DispatchError.OutOfMemory,
             error.JsException => {}, // exception_msg already populated
         };
 
-        return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf);
+        return finishResponse(self, &state, status, body_buf, exception_msg, &console_buf, &cookies);
     }
 };
 
@@ -321,6 +334,7 @@ fn runModule(
     status_out: *i32,
     body_out: *[]u8,
     exception_out: *[]u8,
+    cookies_out: *std.ArrayList([]u8),
 ) RunError!void {
     _ = state;
     const mod_def_ptr: ?*c.JSModuleDef = @ptrCast(@alignCast(fun_val_in.raw.u.ptr));
@@ -457,11 +471,12 @@ fn runModule(
     var final_val: qjs.Value = .{ .raw = final.val, .ctx = ctx.raw };
     defer if (final.owns) final_val.deinit();
 
-    // Body from return value. Status (and later: headers/cookies)
-    // from the ambient `response` global.
+    // Body from return value. Status / cookies from the ambient
+    // `response` global.
     bodyFromReturn(d.allocator, ctx.raw, final_val.raw, body_out) catch
         return error.OutOfMemory;
-    extractResponseMetadata(ctx.raw, status_out);
+    extractResponseMetadata(d.allocator, ctx.raw, status_out, cookies_out) catch
+        return error.OutOfMemory;
 }
 
 /// Parsed `(fn, args)` from a request. `args_json_text` is a raw
@@ -722,10 +737,21 @@ fn bodyFromReturn(
     body_out.* = jsValueToOwned(allocator, ctx, json) catch return error.OutOfMemory;
 }
 
-/// Pull status (and in the future headers / cookies) off the ambient
-/// `response` global that the handler was free to mutate. Body is NOT
-/// read from here — it always comes from the return value.
-fn extractResponseMetadata(ctx: *c.JSContext, status_out: *i32) void {
+/// Pull status + cookies off the ambient `response` global the handler
+/// was free to mutate. Body is NOT read from here — it always comes
+/// from the return value. Custom response headers are not plumbed yet.
+///
+/// `cookies_out` is populated with owned, sanitized Set-Cookie header
+/// values (see `sanitizeSetCookie`). Each entry on `response.cookies`
+/// is coerced to a string via `JS_ToCString`, run through the
+/// sanitizer, and pushed. Non-string entries and empty strings are
+/// silently dropped (handler bugs shouldn't 500 the request).
+fn extractResponseMetadata(
+    allocator: std.mem.Allocator,
+    ctx: *c.JSContext,
+    status_out: *i32,
+    cookies_out: *std.ArrayList([]u8),
+) error{OutOfMemory}!void {
     const global_obj = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global_obj);
     const resp_val = c.JS_GetPropertyStr(ctx, global_obj, "response");
@@ -737,6 +763,89 @@ fn extractResponseMetadata(ctx: *c.JSContext, status_out: *i32) void {
     if (!c.JS_IsUndefined(status_val) and !c.JS_IsNull(status_val)) {
         _ = c.JS_ToInt32(ctx, status_out, status_val);
     }
+
+    const cookies_val = c.JS_GetPropertyStr(ctx, resp_val, "cookies");
+    defer c.JS_FreeValue(ctx, cookies_val);
+    if (c.JS_IsUndefined(cookies_val) or c.JS_IsNull(cookies_val)) return;
+    if (!c.JS_IsArray(cookies_val)) return;
+
+    const len_val = c.JS_GetPropertyStr(ctx, cookies_val, "length");
+    defer c.JS_FreeValue(ctx, len_val);
+    var n: u32 = 0;
+    _ = c.JS_ToUint32(ctx, &n, len_val);
+    if (n == 0) return;
+    // Hard cap — a pathological handler pushing thousands of cookies
+    // would blow up the H2 HPACK table and amplify work on every
+    // proxy hop. 32 is already generous for real traffic.
+    const cap: u32 = @min(n, 32);
+
+    var i: u32 = 0;
+    while (i < cap) : (i += 1) {
+        const elem = c.JS_GetPropertyUint32(ctx, cookies_val, i);
+        defer c.JS_FreeValue(ctx, elem);
+        if (!c.JS_IsString(elem)) continue;
+        var raw_len: usize = 0;
+        const cstr = c.JS_ToCStringLen(ctx, &raw_len, elem);
+        if (cstr == null) continue;
+        defer c.JS_FreeCString(ctx, cstr);
+        if (raw_len == 0) continue;
+        const raw = @as([*]const u8, @ptrCast(cstr))[0..raw_len];
+        const sanitized = try sanitizeSetCookie(allocator, raw);
+        if (sanitized.len == 0) {
+            allocator.free(sanitized);
+            continue;
+        }
+        cookies_out.append(allocator, sanitized) catch |err| {
+            allocator.free(sanitized);
+            return err;
+        };
+    }
+}
+
+/// Return an owned copy of `raw` with any `Domain=...` attribute
+/// stripped. Attribute matching is case-insensitive on the name and
+/// tolerant of surrounding whitespace. Everything else (name=value,
+/// Path, HttpOnly, Secure, SameSite, Max-Age, Expires, ...) is
+/// preserved in order.
+///
+/// **Why**: a customer handler writing
+/// `Set-Cookie: foo=bar; Domain=loop46.me` would push the cookie
+/// onto the parent domain, where a different tenant's handler would
+/// read it. The PSL entry at the browser level blocks this too, but
+/// server-side stripping is the authoritative defense and the one
+/// thing we control (PSL propagation can lag by browser version).
+///
+/// If `raw` is already Domain-free, the output is byte-identical.
+pub fn sanitizeSetCookie(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) error{OutOfMemory}![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    // A Set-Cookie value is `name=value` followed by zero or more
+    // `; attr[=val]` segments. Split on `;`, keep the first segment
+    // verbatim, filter `Domain` from the rest.
+    var it = std.mem.splitScalar(u8, raw, ';');
+    var first = true;
+    while (it.next()) |raw_seg| {
+        const seg = std.mem.trim(u8, raw_seg, " \t");
+        if (first) {
+            // Preserve the cookie's name=value as-is (caller already
+            // built it); trim only leading/trailing whitespace.
+            try buf.appendSlice(allocator, seg);
+            first = false;
+            continue;
+        }
+        if (seg.len == 0) continue; // `foo=bar;;baz` → drop empty
+        const eq = std.mem.indexOfScalar(u8, seg, '=');
+        const attr_name = if (eq) |e| seg[0..e] else seg;
+        const attr_trim = std.mem.trim(u8, attr_name, " \t");
+        if (std.ascii.eqlIgnoreCase(attr_trim, "domain")) continue;
+        try buf.appendSlice(allocator, "; ");
+        try buf.appendSlice(allocator, seg);
+    }
+    return buf.toOwnedSlice(allocator);
 }
 
 // ── Module loader ──────────────────────────────────────────────────────
@@ -856,16 +965,22 @@ fn finishResponse(
     body_buf: []u8,
     exception_msg: []u8,
     console_buf: *std.ArrayList(u8),
+    cookies: *std.ArrayList([]u8),
 ) DispatchError!Response {
     if (state.pending_kv_error) |err| {
         d.last_kv_error = err;
         d.allocator.free(body_buf);
         d.allocator.free(exception_msg);
         console_buf.deinit(d.allocator);
+        // Cookies get cleaned up by the caller's errdefer when we
+        // return an error from here — don't double-free them.
         return DispatchError.KvFailed;
     }
 
     const console_bytes = console_buf.toOwnedSlice(d.allocator) catch
+        return DispatchError.OutOfMemory;
+
+    const set_cookies = cookies.toOwnedSlice(d.allocator) catch
         return DispatchError.OutOfMemory;
 
     return .{
@@ -873,6 +988,7 @@ fn finishResponse(
         .body = body_buf,
         .console = console_bytes,
         .exception = exception_msg,
+        .set_cookies = set_cookies,
     };
 }
 
@@ -893,6 +1009,64 @@ fn jsValueToOwned(
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "sanitizeSetCookie strips Domain attribute" {
+    const a = testing.allocator;
+
+    // Basic: Domain stripped, other attrs preserved.
+    {
+        const out = try sanitizeSetCookie(a, "foo=bar; Path=/; Domain=loop46.me; HttpOnly");
+        defer a.free(out);
+        try testing.expectEqualStrings("foo=bar; Path=/; HttpOnly", out);
+    }
+    // Case-insensitive attribute name.
+    {
+        const out = try sanitizeSetCookie(a, "sid=abc; domain=foo.com; SameSite=Lax");
+        defer a.free(out);
+        try testing.expectEqualStrings("sid=abc; SameSite=Lax", out);
+    }
+    {
+        const out = try sanitizeSetCookie(a, "sid=abc; DOMAIN=x.y.z; Secure");
+        defer a.free(out);
+        try testing.expectEqualStrings("sid=abc; Secure", out);
+    }
+    // No Domain = pass-through (only whitespace normalization).
+    {
+        const out = try sanitizeSetCookie(a, "a=b; Path=/; HttpOnly");
+        defer a.free(out);
+        try testing.expectEqualStrings("a=b; Path=/; HttpOnly", out);
+    }
+    // Leading/trailing spaces around attrs are trimmed on rewrite.
+    {
+        const out = try sanitizeSetCookie(a, "k=v;   Domain=foo  ;Path=/");
+        defer a.free(out);
+        try testing.expectEqualStrings("k=v; Path=/", out);
+    }
+    // Domain as the only attribute leaves only name=value.
+    {
+        const out = try sanitizeSetCookie(a, "k=v; Domain=loop46.me");
+        defer a.free(out);
+        try testing.expectEqualStrings("k=v", out);
+    }
+    // Flag-only attribute (no `=`) named "domain" still stripped.
+    {
+        const out = try sanitizeSetCookie(a, "k=v; Domain; HttpOnly");
+        defer a.free(out);
+        try testing.expectEqualStrings("k=v; HttpOnly", out);
+    }
+    // Value containing `=` (cookie value has embedded equals) preserved.
+    {
+        const out = try sanitizeSetCookie(a, "token=a=b=c; Domain=x; Secure");
+        defer a.free(out);
+        try testing.expectEqualStrings("token=a=b=c; Secure", out);
+    }
+    // Empty segment dropped without crashing.
+    {
+        const out = try sanitizeSetCookie(a, "k=v;;;Domain=x;;Path=/;;");
+        defer a.free(out);
+        try testing.expectEqualStrings("k=v; Path=/", out);
+    }
+}
 
 fn openTempKv(allocator: std.mem.Allocator, buf: *[64]u8) !*kv_mod.KvStore {
     const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
@@ -1094,6 +1268,32 @@ test "dispatch: console.log captured into response.console" {
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqualStrings("hello world\nline2\n", resp.console);
+}
+
+test "dispatch: response.cookies surface on Response.set_cookies, Domain stripped" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\response.cookies.push("session=abc; Path=/; Domain=loop46.me; HttpOnly");
+        \\response.cookies.push("flag=on; Secure");
+        \\return "ok";
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), resp.set_cookies.len);
+    try testing.expectEqualStrings("session=abc; Path=/; HttpOnly", resp.set_cookies[0]);
+    try testing.expectEqualStrings("flag=on; Secure", resp.set_cookies[1]);
 }
 
 test "dispatch: malformed bytecode surfaces in exception field" {

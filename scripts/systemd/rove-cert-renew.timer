@@ -1,0 +1,32 @@
+# Daily cadence for rove-cert-renew.service. lego no-ops if the cert
+# isn't within 30 days of expiry, so most invocations do nothing —
+# that's the point: keep the schedule simple, let the client decide.
+#
+# `RandomizedDelaySec` smears renewal attempts across a 1h window so
+# a fleet of hosts doesn't thunder-herd the LE endpoint.
+# `Persistent=true` catches up after a gap (missed timer runs fire on
+# next boot / on next user-manager start).
+#
+# Install (see scripts/systemd/rove-cert-renew.service for the full
+# recipe — runs under the user manager, not system-wide). After
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now rove-cert-renew.timer
+#
+# Inspect:
+#   systemctl --user list-timers rove-cert-renew.timer  # next run
+#   journalctl --user -u rove-cert-renew.service        # last run's log
+#
+# If you expect the timer to keep firing while you're logged out:
+#   loginctl enable-linger $USER
+
+[Unit]
+Description=Periodic Loop46 wildcard TLS cert renewal
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+Unit=rove-cert-renew.service
+
+[Install]
+WantedBy=timers.target

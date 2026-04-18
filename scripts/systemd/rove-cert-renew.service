@@ -1,0 +1,72 @@
+# User-scoped oneshot unit that obtains or renews the Loop46 wildcard
+# TLS cert. Idempotent — safe to trigger on any schedule; lego no-ops
+# when the cert isn't near expiry.
+#
+# Companion timer: rove-cert-renew.timer (daily with random jitter).
+# Runs under the invoking user's UID (no `rove` system user required),
+# which matches the home-directory install described below.
+#
+# ── Install (as your normal user, no sudo) ───────────────────────────
+# 1. Place the unit files:
+#      mkdir -p ~/.config/systemd/user
+#      install -m 0644 scripts/systemd/rove-cert-renew.service \
+#          ~/.config/systemd/user/
+#      install -m 0644 scripts/systemd/rove-cert-renew.timer \
+#          ~/.config/systemd/user/
+#
+# 2. Place the renewal script on PATH:
+#      install -D -m 0755 scripts/rove-lego-renew.sh \
+#          ~/.local/bin/rove-lego-renew.sh
+#
+# 3. Drop the env file with your provider credentials:
+#      mkdir -p ~/.config/rove
+#      cat > ~/.config/rove/cert-renew.env <<EOF
+#      BASE_DOMAIN=loop46.me
+#      ACME_EMAIL=you@example.com
+#      LEGO_PATH=%h/.rove/tls
+#      ROVE_CERT_DIR=%h/.rove/tls
+#      DNS_PROVIDER=cloudflare
+#      CLOUDFLARE_DNS_API_TOKEN=xxxxxxxx
+#      EOF
+#      chmod 0600 ~/.config/rove/cert-renew.env
+#
+#    Note: EnvironmentFile does NOT expand `%h` — systemd does that on
+#    the unit-file side only. In the env file itself, write the full
+#    absolute path (e.g. `LEGO_PATH=/home/you/.rove/tls`).
+#
+# 4. Reload + enable the timer:
+#      systemctl --user daemon-reload
+#      systemctl --user enable --now rove-cert-renew.timer
+#
+# 5. Force a first run to obtain the cert:
+#      systemctl --user start rove-cert-renew.service
+#      systemctl --user status rove-cert-renew.service
+#      ls -l ~/.rove/tls/                # cert.pem + key.pem symlinks
+#
+# ── Keeping it running when you're logged out ────────────────────────
+# User units stop when the user's last session ends. If this machine
+# is a long-running server, enable lingering once so the user manager
+# persists across logins:
+#   loginctl enable-linger $USER
+#
+# ── rove-js integration ──────────────────────────────────────────────
+# rove-js picks up cert/key changes by stat'ing mtime on each new TLS
+# handshake (once that code lands), so no post-hook / reload signal
+# is needed here.
+
+[Unit]
+Description=Renew Loop46 wildcard TLS cert via ACME DNS-01
+Documentation=https://go-acme.github.io/lego/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/rove/cert-renew.env
+ExecStart=%h/.local/bin/rove-lego-renew.sh
+
+# Hardening. Cert renewal needs network + writable state dirs in
+# $HOME; everything else can be read-only.
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true

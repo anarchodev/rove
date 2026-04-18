@@ -1553,11 +1553,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // Admin-subdomain responses carry CORS headers so the browser
         // UI on a different origin can read them. Non-admin user
         // traffic is same-origin (it's their tenant's own domain) and
-        // gets empty RespHeaders.
-        const handler_resp_hdrs: h2.RespHeaders = if (is_admin_request)
-            try buildSystemRespHeaders(allocator, worker.admin_origin, false, null)
-        else
-            .{ .fields = null, .count = 0 };
+        // gets empty RespHeaders (plus any Set-Cookies the handler
+        // pushed via `response.cookies`).
+        const handler_cors = if (is_admin_request) worker.admin_origin else null;
+        const handler_resp_hdrs: h2.RespHeaders = try buildHandlerRespHeaders(
+            allocator,
+            handler_cors,
+            resp.set_cookies,
+        );
         try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
         try server.reg.set(ent, &server.request_out, h2.RespHeaders, handler_resp_hdrs);
         try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = body_ptr, .len = body_len });
@@ -2233,6 +2236,84 @@ fn buildSystemRespHeaders(
     return .{
         .fields = fields_ptr,
         .count = @intCast(n),
+        ._buf = buf.ptr,
+        ._buf_len = @intCast(buf.len),
+    };
+}
+
+/// Assemble a handler-response `RespHeaders` carrying optional CORS
+/// (admin subdomains only) and a `set-cookie` header per entry in
+/// `set_cookies`. Each cookie has already been sanitized by the
+/// dispatcher — this function is purely a mechanical packer.
+///
+/// Returns an empty `RespHeaders` when there's nothing to emit (no
+/// CORS, no cookies), saving an allocation on the common
+/// same-origin user-traffic path.
+fn buildHandlerRespHeaders(
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+    set_cookies: []const []const u8,
+) !h2.RespHeaders {
+    const cors_fields: usize = if (cors_origin != null) 4 else 0;
+    const total_fields = cors_fields + set_cookies.len;
+    if (total_fields == 0) return .{ .fields = null, .count = 0 };
+
+    const fields_size = total_fields * @sizeOf(h2.HeaderField);
+    var strbuf_size: usize = 0;
+    if (cors_origin) |o| {
+        strbuf_size += "access-control-allow-origin".len + o.len;
+        strbuf_size += "access-control-allow-credentials".len + "true".len;
+        strbuf_size += "vary".len + "origin".len;
+        strbuf_size += "access-control-expose-headers".len + "content-type".len;
+    }
+    for (set_cookies) |cookie| strbuf_size += "set-cookie".len + cookie.len;
+
+    const total = fields_size + strbuf_size;
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
+    var off: usize = fields_size;
+    var i: usize = 0;
+
+    const writePair = struct {
+        fn call(
+            b: []u8,
+            off_p: *usize,
+            fp: [*]h2.HeaderField,
+            idx: *usize,
+            name: []const u8,
+            value: []const u8,
+        ) void {
+            const name_start = off_p.*;
+            @memcpy(b[off_p.* .. off_p.* + name.len], name);
+            off_p.* += name.len;
+            const value_start = off_p.*;
+            @memcpy(b[off_p.* .. off_p.* + value.len], value);
+            off_p.* += value.len;
+            fp[idx.*] = .{
+                .name = b[name_start..].ptr,
+                .name_len = @intCast(name.len),
+                .value = b[value_start..].ptr,
+                .value_len = @intCast(value.len),
+            };
+            idx.* += 1;
+        }
+    }.call;
+
+    if (cors_origin) |o| {
+        writePair(buf, &off, fields_ptr, &i, "access-control-allow-origin", o);
+        writePair(buf, &off, fields_ptr, &i, "access-control-allow-credentials", "true");
+        writePair(buf, &off, fields_ptr, &i, "vary", "origin");
+        writePair(buf, &off, fields_ptr, &i, "access-control-expose-headers", "content-type");
+    }
+    for (set_cookies) |cookie| {
+        writePair(buf, &off, fields_ptr, &i, "set-cookie", cookie);
+    }
+
+    return .{
+        .fields = fields_ptr,
+        .count = @intCast(total_fields),
         ._buf = buf.ptr,
         ._buf_len = @intCast(buf.len),
     };

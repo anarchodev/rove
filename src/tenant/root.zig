@@ -146,6 +146,13 @@ pub const Tenant = struct {
     /// instances (one per worker thread in rove-js) draw from a single
     /// global monotonic seq space. Borrowed, not owned.
     seq_counters: ?*kv_mod.SeqCounterRegistry = null,
+    /// Wildcard suffix for implicit subdomain → instance mapping.
+    /// When set to e.g. `"loop46.me"`, a request for
+    /// `{id}.loop46.me` resolves to instance `{id}` without needing
+    /// an explicit `assignDomain` entry, so long as `{id}` is a
+    /// registered instance. Explicit domain aliases still win — the
+    /// wildcard is a fallback. Owned (duped on `setPublicSuffix`).
+    public_suffix: ?[]u8 = null,
     /// Canonical map: instance_id → *Instance. Values are heap-allocated
     /// and stay alive until `deinit` (or explicit delete).
     instances: std.StringHashMapUnmanaged(*Instance) = .empty,
@@ -199,8 +206,26 @@ pub const Tenant = struct {
             self.allocator.destroy(inst);
         }
         self.instances.deinit(self.allocator);
+        if (self.public_suffix) |p| self.allocator.free(p);
         self.allocator.free(self.dir);
         self.* = undefined;
+    }
+
+    /// Set (or clear) the wildcard public suffix. Passing `null` or
+    /// an empty string disables wildcard resolution. Safe to call at
+    /// any time; invalidates the host cache so a previously-negative
+    /// lookup now falls into the wildcard path.
+    pub fn setPublicSuffix(self: *Tenant, suffix: ?[]const u8) Error!void {
+        if (self.public_suffix) |old| {
+            self.allocator.free(old);
+            self.public_suffix = null;
+        }
+        if (suffix) |s| {
+            if (s.len == 0) return;
+            try validateHost(s);
+            self.public_suffix = self.allocator.dupe(u8, s) catch return Error.OutOfMemory;
+        }
+        self.invalidateHostCache();
     }
 
     // ── Writes ────────────────────────────────────────────────────────
@@ -288,6 +313,12 @@ pub const Tenant = struct {
 
     /// Resolve `host` to its instance. Returns null if unknown.
     /// The returned pointer is stable for the lifetime of the `Tenant`.
+    ///
+    /// Resolution order:
+    ///   1. Explicit `__root__/domain/{host}` alias from `assignDomain`.
+    ///   2. Wildcard fallback: if `public_suffix` is set and `host`
+    ///      parses as `{id}.{public_suffix}`, look up `{id}` as an
+    ///      instance. Explicit aliases always win over the wildcard.
     pub fn resolveDomain(self: *Tenant, host: []const u8) Error!?*const Instance {
         try validateHost(host);
         if (self.host_cache.get(host)) |inst| return inst;
@@ -295,25 +326,53 @@ pub const Tenant = struct {
         var key_buf: [32 + MAX_HOST_LEN]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "__root__/domain/{s}", .{host}) catch
             return Error.InvalidHost;
-        const id_bytes = self.root.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return Error.Kv,
+        const id_bytes_opt: ?[]u8 = blk: {
+            const v = self.root.get(key) catch |err| switch (err) {
+                error.NotFound => break :blk null,
+                else => return Error.Kv,
+            };
+            break :blk v;
         };
-        defer self.allocator.free(id_bytes);
+        defer if (id_bytes_opt) |v| self.allocator.free(v);
 
-        if (!try self.instanceExistsInRoot(id_bytes)) {
-            // Dangling domain pointer — instance was deleted out from
-            // under the domain. Rare in M1.
-            return null;
+        const resolved_inst: ?*Instance = if (id_bytes_opt) |id_bytes| inner: {
+            if (!try self.instanceExistsInRoot(id_bytes)) break :inner null;
+            break :inner try self.ensureOpen(id_bytes);
+        } else if (self.wildcardInstanceId(host)) |sub_id| wild: {
+            // Wildcard hit: only resolve if the id is a registered
+            // instance AND valid (garbage subdomains like `-foo` or
+            // overlong labels short-circuit to a 404).
+            validateInstanceId(sub_id) catch break :wild null;
+            if (!try self.instanceExistsInRoot(sub_id)) break :wild null;
+            break :wild try self.ensureOpen(sub_id);
+        } else null;
+
+        if (resolved_inst) |inst| {
+            const host_copy = self.allocator.dupe(u8, host) catch return Error.OutOfMemory;
+            errdefer self.allocator.free(host_copy);
+            self.host_cache.put(self.allocator, host_copy, inst) catch
+                return Error.OutOfMemory;
+            return inst;
         }
+        return null;
+    }
 
-        const inst = try self.ensureOpen(id_bytes);
-
-        const host_copy = self.allocator.dupe(u8, host) catch return Error.OutOfMemory;
-        errdefer self.allocator.free(host_copy);
-        self.host_cache.put(self.allocator, host_copy, inst) catch
-            return Error.OutOfMemory;
-        return inst;
+    /// Return the implied instance id for `host` under the current
+    /// `public_suffix`, or null if the host doesn't match the wildcard
+    /// pattern `{id}.{public_suffix}`. Does NOT validate that the id
+    /// corresponds to a real instance — caller's job.
+    fn wildcardInstanceId(self: *const Tenant, host: []const u8) ?[]const u8 {
+        const suffix = self.public_suffix orelse return null;
+        if (host.len <= suffix.len + 1) return null;
+        const dot_before = host.len - suffix.len - 1;
+        if (host[dot_before] != '.') return null;
+        if (!std.mem.eql(u8, host[dot_before + 1 ..], suffix)) return null;
+        const sub = host[0..dot_before];
+        // Reject multi-label subdomains — wildcard is single-label
+        // only, matching how `{id}.loop46.me` is documented. Callers
+        // who want deeper nesting must still `assignDomain` explicitly.
+        if (std.mem.indexOfScalar(u8, sub, '.') != null) return null;
+        return sub;
     }
 
     /// True if `id` has a registered existence marker in the root store.
@@ -727,6 +786,86 @@ test "resolveDomain returns null for unknown host" {
     try testing.expectEqual(
         @as(?*const Instance, null),
         try fx.tenant.resolveDomain("nowhere.test"),
+    );
+}
+
+test "public_suffix wildcard resolves {id}.{suffix}" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try fx.tenant.setPublicSuffix("loop46.me");
+    try fx.tenant.createInstance("acme");
+
+    // No explicit `assignDomain`, but the wildcard picks it up.
+    const inst = (try fx.tenant.resolveDomain("acme.loop46.me")).?;
+    try testing.expectEqualStrings("acme", inst.id);
+
+    // Cache hit returns the same pointer.
+    const again = (try fx.tenant.resolveDomain("acme.loop46.me")).?;
+    try testing.expectEqual(inst, again);
+
+    // Unknown instance under the wildcard → null.
+    try testing.expectEqual(
+        @as(?*const Instance, null),
+        try fx.tenant.resolveDomain("nobody.loop46.me"),
+    );
+
+    // Bare suffix (no subdomain label) → null.
+    try testing.expectEqual(
+        @as(?*const Instance, null),
+        try fx.tenant.resolveDomain("loop46.me"),
+    );
+
+    // Multi-label subdomain (`foo.bar.loop46.me`) → null; wildcard
+    // is single-label only.
+    try fx.tenant.createInstance("bar");
+    try testing.expectEqual(
+        @as(?*const Instance, null),
+        try fx.tenant.resolveDomain("foo.bar.loop46.me"),
+    );
+
+    // Different TLD → null.
+    try testing.expectEqual(
+        @as(?*const Instance, null),
+        try fx.tenant.resolveDomain("acme.other.com"),
+    );
+
+    // Invalid id under the wildcard (`!` is legal in a host per
+    // validateHost but not in an instance id) → null, not an error.
+    try testing.expectEqual(
+        @as(?*const Instance, null),
+        try fx.tenant.resolveDomain("acme!.loop46.me"),
+    );
+}
+
+test "explicit assignDomain wins over wildcard" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try fx.tenant.setPublicSuffix("loop46.me");
+    try fx.tenant.createInstance("acme");
+    try fx.tenant.createInstance("other");
+
+    // Alias `acme.loop46.me` → `other`. Explicit mapping wins even
+    // though the host also matches the wildcard pattern.
+    try fx.tenant.assignDomain("acme.loop46.me", "other");
+    const inst = (try fx.tenant.resolveDomain("acme.loop46.me")).?;
+    try testing.expectEqualStrings("other", inst.id);
+}
+
+test "clearing public_suffix disables wildcard" {
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    try fx.tenant.setPublicSuffix("loop46.me");
+    try fx.tenant.createInstance("acme");
+    const first = (try fx.tenant.resolveDomain("acme.loop46.me")).?;
+    try testing.expectEqualStrings("acme", first.id);
+
+    try fx.tenant.setPublicSuffix(null);
+    try testing.expectEqual(
+        @as(?*const Instance, null),
+        try fx.tenant.resolveDomain("acme.loop46.me"),
     );
 }
 

@@ -59,6 +59,7 @@ const code_server = @import("rove-code-server");
 const log_server = @import("rove-log-server");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
+const h2_mod = @import("rove-h2");
 
 // ── Demo handler sources (all .mjs, named-export RPC contract) ────
 //
@@ -343,6 +344,23 @@ const Cli = struct {
     /// Example: `api.loop46.com`. Then `acme.api.loop46.com/kv` reads
     /// acme's KV; `api.loop46.com/tenant/instance` hits root.
     admin_api_domain: ?[]const u8 = null,
+    /// Wildcard customer-app suffix. Enables `{id}.{public_suffix}` →
+    /// instance `{id}` resolution without needing `assignDomain` per
+    /// tenant. Explicit domain aliases still win. Must NOT overlap with
+    /// `admin_api_domain` — admin check runs first, so
+    /// `api.loop46.me` as admin and `loop46.me` as public suffix is
+    /// fine; same-string collisions route to admin.
+    /// Example: `loop46.me`. Then `acme.loop46.me` → instance `acme`.
+    public_suffix: ?[]const u8 = null,
+    /// TLS certificate path (PEM, full chain). When both this and
+    /// `tls_key` are set, the `--http` listener speaks HTTPS (h2 over
+    /// TLS) instead of plaintext h2c. Changes to either file on disk
+    /// are picked up on a periodic mtime check, so cert renewal by a
+    /// sidecar (e.g. scripts/rove-lego-renew.sh) reloads in-process
+    /// without a restart.
+    tls_cert: ?[]const u8 = null,
+    /// TLS private key path (PEM). See `tls_cert`.
+    tls_key: ?[]const u8 = null,
     /// Raft proposal linger budget, in microseconds. Hold pending
     /// proposals up to this long so the raft thread can pack more
     /// into a single `raft_log.db` commit + fsync. Under heavy write
@@ -400,6 +418,18 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.admin_api_domain = argv[i];
+        } else if (std.mem.eql(u8, a, "--public-suffix")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.public_suffix = argv[i];
+        } else if (std.mem.eql(u8, a, "--tls-cert")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.tls_cert = argv[i];
+        } else if (std.mem.eql(u8, a, "--tls-key")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.tls_key = argv[i];
         } else if (std.mem.eql(u8, a, "--propose-linger-us")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
@@ -480,6 +510,11 @@ const WorkerCtx = struct {
     log_addr: std.net.Address,
     admin_origin: ?[]const u8,
     admin_api_domain: ?[]const u8,
+    public_suffix: ?[]const u8,
+    /// Shared TlsConfig (or null for plaintext h2c). When present,
+    /// all workers hand it to their h2 session on accept. Lives in
+    /// the main thread; workers borrow.
+    tls_config: ?*h2_mod.TlsConfig,
     /// Shared across all workers — every per-tenant `app.db` `KvStore`
     /// opens with a counter from this registry so seq allocation
     /// stays globally monotonic.
@@ -523,6 +558,7 @@ fn workerMain(args: *WorkerCtx) !void {
         args.seq_counters,
     );
     defer tenant.deinit();
+    try tenant.setPublicSuffix(args.public_suffix);
 
     // The main thread already created the instances + assigned domains
     // in the shared __root__.db before spawning us. We just need to
@@ -561,6 +597,7 @@ fn workerMain(args: *WorkerCtx) !void {
             .max_concurrent_streams = 512,
             .initial_window_size = 1024 * 1024,
             .max_frame_size = 16384,
+            .tls_config = args.tls_config,
         },
         .code_addr = args.code_addr,
         .log_addr = args.log_addr,
@@ -898,6 +935,31 @@ pub fn main() !void {
     var seq_counters = kv.SeqCounterRegistry.init(allocator);
     defer seq_counters.deinit();
 
+    // Optional TLS. Both flags must be set; either alone is a usage
+    // error (silent fall-through to plaintext would mask a config
+    // mistake in prod).
+    const tls_config: ?*h2_mod.TlsConfig = blk: {
+        const has_cert = cli.tls_cert != null;
+        const has_key = cli.tls_key != null;
+        if (!has_cert and !has_key) break :blk null;
+        if (has_cert != has_key) {
+            std.debug.print("error: --tls-cert and --tls-key must be set together\n", .{});
+            std.process.exit(2);
+        }
+        const cfg = h2_mod.TlsConfig.createFromFiles(
+            allocator,
+            cli.tls_cert.?,
+            cli.tls_key.?,
+        ) catch |err| {
+            std.debug.print("error: tls: {s} (cert={s}, key={s})\n", .{
+                @errorName(err), cli.tls_cert.?, cli.tls_key.?,
+            });
+            std.process.exit(2);
+        };
+        std.log.info("tls: loaded {s} + {s}", .{ cli.tls_cert.?, cli.tls_key.? });
+        break :blk cfg;
+    };
+
     var i: u16 = 0;
     while (i < num_workers) : (i += 1) {
         ctxs[i] = .{
@@ -910,6 +972,8 @@ pub fn main() !void {
             .log_addr = log_addr,
             .admin_origin = cli.admin_origin,
             .admin_api_domain = cli.admin_api_domain,
+            .public_suffix = cli.public_suffix,
+            .tls_config = tls_config,
             .seq_counters = &seq_counters,
             .ready = &ready_events[i],
         };
@@ -930,9 +994,24 @@ pub fn main() !void {
 
     // Block until SIGINT/SIGTERM flips stop_flag, then join workers.
     // 50ms poll granularity is invisible to shutdown perception and
-    // costs nothing.
+    // costs nothing. If TLS is on, the main thread also stat()s the
+    // PEM files once per second — the sidecar (scripts/rove-lego-
+    // renew.sh) rewrites these whenever lego renews, and workers pick
+    // up the new cert on the next TLS accept.
+    const reload_interval_ticks: u64 = 20; // 20 × 50ms = 1s
+    var tick: u64 = 0;
     while (!stop_flag.load(.acquire)) {
         std.Thread.sleep(50 * std.time.ns_per_ms);
+        tick += 1;
+        if (tls_config) |cfg| {
+            if (tick % reload_interval_ticks == 0) {
+                const changed = cfg.reloadIfChanged() catch |err| blk: {
+                    std.log.warn("tls: reloadIfChanged failed: {s}", .{@errorName(err)});
+                    break :blk false;
+                };
+                if (changed) std.log.info("tls: cert/key reloaded", .{});
+            }
+        }
     }
     std.log.info("js-worker: shutdown requested, joining {d} worker(s)", .{num_workers});
     for (threads) |t| t.join();

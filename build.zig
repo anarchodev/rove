@@ -312,6 +312,7 @@ pub fn build(b: *std.Build) void {
     js_worker_mod.addImport("rove-log-server", log_server_mod);
     js_worker_mod.addImport("rove-qjs", qjs_mod);
     js_worker_mod.addImport("rove-tenant", tenant_mod);
+    js_worker_mod.addImport("rove-h2", h2_mod);
     js_worker_mod.link_libc = true;
     js_worker_mod.linkSystemLibrary("nghttp2", .{});
     js_worker_mod.linkSystemLibrary("ssl", .{});
