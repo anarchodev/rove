@@ -281,6 +281,10 @@ pub const WorkerConfig = struct {
     /// back to `raft.config.node_id`, which is correct for the
     /// single-worker-per-process case but wrong for multi-worker.
     log_worker_id: ?u16 = null,
+    /// "From:" address used on platform-sent emails (magic-link
+    /// signup, future password-reset, etc.). Must be a domain Resend
+    /// is configured to send from. Borrowed; caller keeps alive.
+    platform_email_from: []const u8 = "noreply@loop46.me",
 };
 
 /// Cross-reference component used by the `/_system/*` proxy. Lives
@@ -403,6 +407,9 @@ pub fn Worker(comptime opts: Options) type {
         /// workers' ids. Copied from `WorkerConfig.log_worker_id` (or the
         /// raft node id as a fallback).
         log_worker_id: u16,
+        /// Platform From: address for magic-link emails. Copied from
+        /// `WorkerConfig.platform_email_from`. Borrowed.
+        platform_email_from: []const u8,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -457,6 +464,7 @@ pub fn Worker(comptime opts: Options) type {
                 .admin_origin = config.admin_origin,
                 .admin_api_domain = config.admin_api_domain,
                 .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
+                .platform_email_from = config.platform_email_from,
             };
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
@@ -3365,58 +3373,50 @@ fn handleAdminSignup(
     const name = parsed.value.name;
     const email = parsed.value.email;
 
+    // Validate shape + reserved/taken status BEFORE creating the
+    // instance — otherwise a bad-email signup still leaves its
+    // requested name claimed in the root store.
+    tenant_mod.validateEmailForSignup(email) catch {
+        try setSystemResponse(server, ent, sid, sess, 400, "{\"error\":\"invalid email\"}\n", allocator, admin_cors, "application/json");
+        return;
+    };
+    tenant_mod.validateInstanceIdForSignup(name) catch {
+        try setSystemResponse(server, ent, sid, sess, 400, "{\"error\":\"invalid name\"}\n", allocator, admin_cors, "application/json");
+        return;
+    };
     if (isReservedInstanceName(name)) {
         // Mirrors the "already taken" shape so an attacker can't
         // enumerate the reserved list vs. real registrations.
         try setSystemResponse(server, ent, sid, sess, 409, "{\"error\":\"name unavailable\"}\n", allocator, admin_cors, "application/json");
         return;
     }
-
-    // Name uniqueness: existing `__root__/instance/{name}` marker
-    // means somebody already owns it. Race with createInstance below
-    // is tolerated — createInstance is idempotent for already-existing
-    // ids (no-op), but we'd then be minting a magic for an instance
-    // we don't own. Pre-check narrows the race window enough for M1.
     if (worker.tenant.instanceExists(name) catch false) {
         try setSystemResponse(server, ent, sid, sess, 409, "{\"error\":\"name unavailable\"}\n", allocator, admin_cors, "application/json");
         return;
     }
 
-    // Create the instance. Validates the id shape; InvalidInstanceId
-    // surfaces as 400.
-    worker.tenant.createInstance(name) catch |err| switch (err) {
-        tenant_mod.Error.InvalidInstanceId => {
-            try setSystemResponse(server, ent, sid, sess, 400, "{\"error\":\"invalid name\"}\n", allocator, admin_cors, "application/json");
-            return;
-        },
-        else => {
-            std.log.warn("rove-js: signup createInstance({s}) failed: {s}", .{ name, @errorName(err) });
-            try setSystemResponse(server, ent, sid, sess, 500, "signup failed\n", allocator, admin_cors, null);
-            return;
-        },
+    // Everything pre-checked: now create the instance + mint the
+    // magic token. Failures past this point are genuinely internal
+    // (OOM, kv error) and surface as 500.
+    worker.tenant.createInstance(name) catch |err| {
+        std.log.warn("rove-js: signup createInstance({s}) failed: {s}", .{ name, @errorName(err) });
+        try setSystemResponse(server, ent, sid, sess, 500, "signup failed\n", allocator, admin_cors, null);
+        return;
     };
 
-    // Mint the magic link. PLAN §2.2 default TTL: 15 minutes.
+    // PLAN §2.2 default magic-link TTL: 15 minutes.
     const MAGIC_TTL_NS: i64 = 15 * 60 * std.time.ns_per_s;
-    const token = worker.tenant.mintMagic(email, name, MAGIC_TTL_NS) catch |err| switch (err) {
-        tenant_mod.Error.InvalidToken => {
-            try setSystemResponse(server, ent, sid, sess, 400, "{\"error\":\"invalid email\"}\n", allocator, admin_cors, "application/json");
-            return;
-        },
-        else => {
-            std.log.warn("rove-js: signup mintMagic failed: {s}", .{@errorName(err)});
-            try setSystemResponse(server, ent, sid, sess, 500, "signup failed\n", allocator, admin_cors, null);
-            return;
-        },
+    const token = worker.tenant.mintMagic(email, name, MAGIC_TTL_NS) catch |err| {
+        std.log.warn("rove-js: signup mintMagic failed: {s}", .{@errorName(err)});
+        try setSystemResponse(server, ent, sid, sess, 500, "signup failed\n", allocator, admin_cors, null);
+        return;
     };
 
     // Build the magic link URL using the request's Host header as the
     // base (so dev + prod both produce the right thing without extra
-    // config). Scheme is hard-coded `https` when in production and
-    // inferred as `http` when the request arrived on plaintext — the
-    // worker knows via tls_config, but we just go with `https` for
-    // now and document this as a follow-up once email-send lands
-    // (email URL building needs scheme awareness anyway).
+    // config). Scheme is hard-coded `https` — production is always
+    // TLS-terminated, and dev smokes read the link via the response
+    // body without ever following it.
     const host = findHeader(rh, ":authority") orelse "";
     const magic_link = try std.fmt.allocPrint(
         allocator,
@@ -3425,11 +3425,58 @@ fn handleAdminSignup(
     );
     defer allocator.free(magic_link);
 
-    const body_out = try std.fmt.allocPrint(
+    // Check for a Resend key: with one we queue a real email and
+    // drop the link from the response body (production path);
+    // without one we return the link in-band (dev / CI smoke path).
+    const resend_key_opt = worker.tenant.getResendKey() catch |err| blk: {
+        std.log.warn("rove-js: signup getResendKey failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (resend_key_opt) |k| allocator.free(k);
+
+    const body_out = if (resend_key_opt) |key| out: {
+        // Queue the email via the newly-created instance's outbox.
+        // The drainer (leader-gated, 250ms poll) picks up `_outbox/*`
+        // from every tenant's app.db on its next tick; the envelope
+        // carries the Resend API URL + auth header inline, so the
+        // drainer needs no special case for platform-sent emails.
+        const inst_opt = worker.tenant.getInstance(name) catch |err| blk: {
+            std.log.warn("rove-js: signup getInstance({s}) failed: {s}", .{ name, @errorName(err) });
+            break :blk null;
+        };
+        if (inst_opt == null) {
+            try setSystemResponse(server, ent, sid, sess, 500, "instance missing after create\n", allocator, admin_cors, null);
+            return;
+        }
+
+        const text = try buildSignupEmailText(allocator, magic_link, name);
+        defer allocator.free(text);
+
+        queueSignupEmail(
+            allocator,
+            inst_opt.?.kv,
+            key,
+            worker.platform_email_from,
+            email,
+            "Finish signing up for Loop46",
+            text,
+        ) catch |err| {
+            std.log.warn("rove-js: signup queue email failed: {s}", .{@errorName(err)});
+            try setSystemResponse(server, ent, sid, sess, 500, "email queue failed\n", allocator, admin_cors, null);
+            return;
+        };
+
+        break :out try std.fmt.allocPrint(
+            allocator,
+            "{{\"ok\":true,\"name\":\"{s}\"}}\n",
+            .{name},
+        );
+    } else try std.fmt.allocPrint(
         allocator,
         "{{\"ok\":true,\"name\":\"{s}\",\"magic_link\":\"{s}\"}}\n",
         .{ name, magic_link },
     );
+
     try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 202 });
     const hdrs = try buildSystemRespHeaders(allocator, admin_cors, false, "application/json");
     try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
@@ -3441,6 +3488,116 @@ fn handleAdminSignup(
     try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
     try server.reg.set(ent, &server.request_out, h2.Session, sess);
     try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// Plain-text body of the signup magic-link email. Kept simple — no
+/// HTML alt yet, no Loop46 branding image, just the link and a bit
+/// of context.
+fn buildSignupEmailText(
+    allocator: std.mem.Allocator,
+    magic_link: []const u8,
+    name: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(allocator,
+        \\Welcome to Loop46!
+        \\
+        \\Click the link below to finish signing up and land in your dashboard:
+        \\
+        \\{s}
+        \\
+        \\This link expires in 15 minutes and can only be used once.
+        \\
+        \\Your API will be live at:
+        \\  https://{s}.loop46.me
+        \\
+        \\— Loop46
+        \\
+    , .{ magic_link, name });
+}
+
+/// Write a JSON envelope to the given tenant's `_outbox/{id}` that,
+/// when picked up by the drainer, will POST a Resend `emails`
+/// request. The envelope matches the shape that `webhook.send`
+/// produces in `rove-js/globals.zig`, minus the `on_result` /
+/// `context` fields that signup doesn't need.
+///
+/// Id is a fresh 256-bit random — no replay-determinism need here
+/// (signup isn't a handler invocation), and a unique id keeps the
+/// outbox key-space collision-free.
+fn queueSignupEmail(
+    allocator: std.mem.Allocator,
+    kv: *kv_mod.KvStore,
+    resend_key: []const u8,
+    from: []const u8,
+    to: []const u8,
+    subject: []const u8,
+    text: []const u8,
+) !void {
+    var raw_id: [32]u8 = undefined;
+    std.crypto.random.bytes(&raw_id);
+    var id_hex: [64]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (raw_id, 0..) |b, i| {
+        id_hex[i * 2] = hex_chars[b >> 4];
+        id_hex[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+
+    // Build the Resend inner body (the JSON POSTed to
+    // api.resend.com) as a Value tree and stringify once — escapes
+    // are handled by std.json.Stringify so the subject/text fields
+    // can carry newlines, quotes, etc. safely.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var inner = std.json.ObjectMap.init(a);
+    try inner.put("from", .{ .string = from });
+    var to_arr = std.json.Array.init(a);
+    try to_arr.append(.{ .string = to });
+    try inner.put("to", .{ .array = to_arr });
+    try inner.put("subject", .{ .string = subject });
+    try inner.put("text", .{ .string = text });
+
+    const inner_body = try jsonStringify(a, .{ .object = inner });
+
+    const auth_header = try std.fmt.allocPrint(a, "Bearer {s}", .{resend_key});
+
+    var headers = std.json.ObjectMap.init(a);
+    try headers.put("Authorization", .{ .string = auth_header });
+    try headers.put("Content-Type", .{ .string = "application/json" });
+
+    var env = std.json.ObjectMap.init(a);
+    try env.put("v", .{ .integer = 1 });
+    try env.put("id", .{ .string = &id_hex });
+    try env.put("url", .{ .string = "https://api.resend.com/emails" });
+    try env.put("method", .{ .string = "POST" });
+    try env.put("headers", .{ .object = headers });
+    try env.put("body", .{ .string = inner_body });
+    try env.put("on_result", .null);
+    try env.put("context", .null);
+    try env.put("max_attempts", .{ .integer = 5 });
+    try env.put("timeout_ms", .{ .integer = 30_000 });
+    try env.put("retry_on", .null);
+    try env.put("attempts", .{ .integer = 0 });
+    try env.put("next_attempt_at_ms", .{ .integer = 0 });
+    const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    try env.put("created_at_ms", .{ .integer = now_ms });
+    try env.put("parent_request_id", .{ .integer = 0 });
+
+    const envelope_bytes = try jsonStringify(allocator, .{ .object = env });
+    defer allocator.free(envelope_bytes);
+
+    var key_buf: [8 + 64]u8 = undefined;
+    const outbox_key = try std.fmt.bufPrint(&key_buf, "_outbox/{s}", .{id_hex});
+    try kv.put(outbox_key, envelope_bytes);
+}
+
+fn jsonStringify(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    try std.json.Stringify.value(value, .{}, &aw.writer);
+    return try aw.toOwnedSlice();
 }
 
 /// GET /v1/auth?mt=<64-hex>. Redeem the magic link, mint a session,

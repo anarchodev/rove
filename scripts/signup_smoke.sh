@@ -140,5 +140,68 @@ list=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" "${ADMIN_ORIGIN}/?fn=listI
 echo "$list" | grep -q '"id":"alice"' || fail "listInstance missing alice: $list"
 ok "signup-created instance visible via listInstance"
 
+# ── 10. With ROVE_RESEND_KEY configured: signup queues an outbox email
+#        and drops magic_link from the response body. ───────────────────
+#
+# Stop the current worker and relaunch with --bootstrap-resend-key. The
+# data dir is reused so alice's instance stays visible, and we add a
+# fresh "bob" signup to exercise the email-queuing path.
+RESEND_KEY="re_smoke_${RANDOM}_${RANDOM}"
+kill $PID 2>/dev/null || true
+wait $PID 2>/dev/null || true
+
+"$BIN" \
+    --node-id 0 \
+    --peers "$RAFT_ADDR" \
+    --listen "$RAFT_ADDR" \
+    --http "$HTTP_ADDR" \
+    --data-dir "$DATA_DIR" \
+    --bootstrap-root-token "$TOKEN" \
+    --bootstrap-resend-key "$RESEND_KEY" \
+    --admin-origin "$ADMIN_ORIGIN" \
+    --admin-api-domain "$ADMIN_HOST" \
+    --platform-email-from "noreply@smoke.test" \
+    --workers 1 \
+    --refresh-interval-ms 100 \
+    >>/tmp/signup-smoke.out 2>&1 &
+PID=$!
+trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
+sleep 1.2
+
+body=$("${CURL[@]}" -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"name":"bob","email":"bob@example.com"}' \
+    "${ADMIN_ORIGIN}/v1/signup")
+echo "$body" | grep -q '"ok":true' || fail "resend-path signup not ok: $body"
+echo "$body" | grep -q '"name":"bob"' || fail "resend-path signup missing name: $body"
+if echo "$body" | grep -q '"magic_link"'; then
+    fail "resend-path signup leaked magic_link in response: $body"
+fi
+ok "signup with Resend key → 202, magic_link suppressed"
+
+# Inspect bob's outbox via the admin listKv RPC. The envelope body
+# should contain the Resend URL, the from/to addresses, and the
+# subject line.
+qs=$(python3 -c "
+import json, urllib.parse
+print(urllib.parse.quote(json.dumps(['_outbox/','',10])))
+")
+outbox=$("${CURL[@]}" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "X-Rove-Scope: bob" \
+    "${ADMIN_ORIGIN}/?fn=listKv&args=${qs}")
+# The envelope body is JSON-encoded inside the envelope's "body"
+# string, which in turn is JSON-encoded inside the listKv response,
+# so the dynamic fields appear with one layer of JSON escaping. We
+# grep for substrings (avoiding quote characters) rather than reach
+# through two levels of JSON.parse.
+echo "$outbox" | grep -q '"key":"_outbox/' || fail "no _outbox row in bob's kv: $outbox"
+echo "$outbox" | grep -q 'api.resend.com/emails' || fail "outbox envelope missing Resend URL"
+echo "$outbox" | grep -q 'bob@example.com' || fail "outbox envelope missing recipient"
+echo "$outbox" | grep -q 'noreply@smoke.test' || fail "outbox envelope missing from address"
+echo "$outbox" | grep -q 'Finish signing up' || fail "outbox envelope missing subject"
+echo "$outbox" | grep -q "$RESEND_KEY" || fail "outbox envelope missing Resend auth key"
+ok "outbox row carries Resend URL + from/to/subject + auth header"
+
 echo ""
 echo "all signup smoke checks passed"

@@ -994,6 +994,24 @@ fn bytesToHex(src: []const u8, dst: []u8) void {
 
 // ── Validation ─────────────────────────────────────────────────────────
 
+/// Public accessor for the instance-id shape check. Callers that
+/// need to validate before choosing between "create" and "error"
+/// paths use this; the existing `createInstance` runs the same
+/// check internally. Re-exported verbatim to avoid duplicating the
+/// shape rules.
+pub fn validateInstanceIdForSignup(id: []const u8) Error!void {
+    return validateInstanceId(id);
+}
+
+/// Public accessor for the email shape check used by
+/// `mintMagic`. Lets callers (e.g. the signup HTTP handler) reject
+/// bad input before any side effects — without this, the only way
+/// to probe email validity is to call `mintMagic`, which has
+/// already fired `std.crypto.random.bytes` and written KV state.
+pub fn validateEmailForSignup(email: []const u8) Error!void {
+    return validateEmail(email);
+}
+
 fn validateInstanceId(id: []const u8) Error!void {
     if (id.len == 0 or id.len > MAX_INSTANCE_ID_LEN) return Error.InvalidInstanceId;
     for (id) |b| {
