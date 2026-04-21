@@ -312,6 +312,82 @@ fn jsCryptoGetRandomValues(
     return c.JS_DupValue(ctx, argv[0]);
 }
 
+/// `crypto.hmacSha256(key, data)` → hex string (64 chars).
+///
+/// Both arguments accept either a JS string (UTF-8 bytes) or a
+/// Uint8Array. Deterministic — does NOT tape-capture (HMAC of known
+/// inputs is a pure function, so replay reproduces the same digest).
+///
+/// PLAN §2.6: we keep `webhook.send` vendor-neutral and expose this
+/// as the primitive customers compose into Stripe-Signature,
+/// Slack X-Slack-Signature, AWS SigV4 derivations, etc.
+fn jsCryptoHmacSha256(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 2) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.hmacSha256 requires (key, data)");
+        return js_exception;
+    }
+
+    var key_cstr: [*c]const u8 = null;
+    defer if (key_cstr != null) c.JS_FreeCString(ctx, key_cstr);
+    var data_cstr: [*c]const u8 = null;
+    defer if (data_cstr != null) c.JS_FreeCString(ctx, data_cstr);
+
+    const key_bytes = extractKeyOrDataBytes(ctx, argv[0], &key_cstr) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.hmacSha256: key must be a string or Uint8Array");
+        return js_exception;
+    };
+    const data_bytes = extractKeyOrDataBytes(ctx, argv[1], &data_cstr) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.hmacSha256: data must be a string or Uint8Array");
+        return js_exception;
+    };
+
+    var digest: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&digest, data_bytes, key_bytes);
+
+    var out: [64]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+    return c.JS_NewStringLen(ctx, &out, 64);
+}
+
+/// Read a JS value as a byte slice. Tries string first (common path
+/// for HMAC over request bodies), falls back to Uint8Array (for
+/// binary secrets / pre-hashed data). Returns null if neither.
+///
+/// When the string path is taken, `cstr_out` gets the JS_ToCStringLen
+/// pointer that the caller must free via `JS_FreeCString`.
+fn extractKeyOrDataBytes(
+    ctx: ?*c.JSContext,
+    val: c.JSValue,
+    cstr_out: *[*c]const u8,
+) ?[]const u8 {
+    if (c.JS_IsString(val)) {
+        var len: usize = 0;
+        const cstr = c.JS_ToCStringLen(ctx, &len, val);
+        if (cstr == null) return null;
+        cstr_out.* = cstr;
+        return @as([*]const u8, @ptrCast(cstr))[0..len];
+    }
+    var byte_len: usize = 0;
+    const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, val);
+    if (buf_ptr == null) {
+        // JS_GetUint8Array may have set a pending exception — clear
+        // it so we can throw our own message above.
+        const pending = c.JS_GetException(ctx);
+        c.JS_FreeValue(ctx, pending);
+        return null;
+    }
+    return buf_ptr[0..byte_len];
+}
+
 fn jsCryptoRandomUuid(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -579,11 +655,14 @@ pub fn installStatic(ctx: *c.JSContext) void {
         _ = c.JS_SetPropertyStr(ctx, math_obj, "random", c.JS_NewCFunction2(ctx, jsMathRandom, "random", 0, c.JS_CFUNC_generic, 0));
     }
 
-    // crypto = { getRandomValues, randomUUID }. No crypto global in
-    // qjs-ng by default, so we fabricate one.
+    // crypto = { getRandomValues, randomUUID, hmacSha256 }. No crypto
+    // global in qjs-ng by default, so we fabricate one. hmacSha256 is
+    // the vendor-neutral primitive for building Stripe / Slack / AWS
+    // style signatures in handler code (see PLAN §2.6).
     const crypto_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, crypto_obj, "getRandomValues", c.JS_NewCFunction2(ctx, jsCryptoGetRandomValues, "getRandomValues", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomUUID", c.JS_NewCFunction2(ctx, jsCryptoRandomUuid, "randomUUID", 0, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "hmacSha256", c.JS_NewCFunction2(ctx, jsCryptoHmacSha256, "hmacSha256", 2, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, global, "crypto", crypto_obj);
 
     // webhook = { send }. Delivery is async — send() persists the

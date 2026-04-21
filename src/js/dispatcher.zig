@@ -2031,6 +2031,91 @@ test "dispatch: email.send rejects missing key/from/to/subject" {
     }
 }
 
+test "dispatch: crypto.hmacSha256 matches RFC 4231 test vector (string inputs)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // RFC 4231 test case 1:
+    //   key  = 0x0b * 20  →  "" * 20
+    //   data = "Hi There"
+    //   expected = b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const key = "\x0b".repeat(20);
+        \\return crypto.hmacSha256(key, "Hi There");
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    try testing.expectEqualStrings(
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+        resp.body,
+    );
+}
+
+test "dispatch: crypto.hmacSha256 accepts Uint8Array inputs" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Same RFC 4231 test case 1, but both args as Uint8Array.
+    // (TextEncoder isn't in the snapshot — we build the ASCII bytes
+    // by hand with charCodeAt to keep the test self-contained.)
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const key = new Uint8Array(20).fill(0x0b);
+        \\const s = "Hi There";
+        \\const data = new Uint8Array(s.length);
+        \\for (let i = 0; i < s.length; i++) data[i] = s.charCodeAt(i);
+        \\return crypto.hmacSha256(key, data);
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings(
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+        resp.body,
+    );
+}
+
+test "dispatch: crypto.hmacSha256 throws on missing args" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { crypto.hmacSha256("one"); return "no throw"; }
+        \\catch (e) { return "threw: " + e.message; }
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
+}
+
 test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

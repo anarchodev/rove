@@ -58,6 +58,11 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get('content-length') or 0)
         body = self.rfile.read(n)
+        # Log metadata headers so the smoke script can assert on them.
+        sys.stderr.write("hdr X-Rove-Webhook-Id=%s\n"
+            % (self.headers.get('X-Rove-Webhook-Id') or ''))
+        sys.stderr.write("hdr X-Rove-Webhook-Attempt=%s\n"
+            % (self.headers.get('X-Rove-Webhook-Attempt') or ''))
         self.send_response(200)
         self.send_header('content-type', 'text/plain')
         self.send_header('content-length', str(len(body) + 5))
@@ -145,6 +150,13 @@ for _ in $(seq 1 30); do
 done
 [[ $FOUND_ECHO -eq 1 ]] || fail "drainer never delivered to echo server"
 ok "drainer delivered webhook to echo target"
+
+# ── 4a. Metadata headers stamped on outbound request ──────────────────
+grep -q "hdr X-Rove-Webhook-Id=${ID}" "$ECHO_LOG" \
+    || fail "X-Rove-Webhook-Id header missing or wrong"
+grep -q "hdr X-Rove-Webhook-Attempt=1" "$ECHO_LOG" \
+    || fail "X-Rove-Webhook-Attempt header missing or wrong"
+ok "drainer stamped X-Rove-Webhook-Id + X-Rove-Webhook-Attempt"
 
 # ── 5. Read the callback result via admin API ─────────────────────────
 #

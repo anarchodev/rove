@@ -267,7 +267,16 @@ fn deliverOne(
     defer h.allocator.free(inflight_key);
 
     // Delivery. Method/body/headers are owned by the parsed arena.
-    const headers = try renderHeaders(h.allocator, env.headers);
+    // We also stamp two vendor-neutral metadata headers so receivers
+    // can dedup (at-least-once semantics — PLAN §2.6).
+    var attempt_buf: [12]u8 = undefined;
+    const attempt_str = std.fmt.bufPrint(
+        &attempt_buf,
+        "{d}",
+        .{env.attempts + 1},
+    ) catch return error.InvalidEnvelope;
+
+    const headers = try renderHeadersWithMeta(h.allocator, env.headers, env.id, attempt_str);
     defer h.allocator.free(headers);
 
     const outcome = classifyAttempt(http_client.deliver(h.allocator, .{
@@ -424,25 +433,39 @@ const Envelope = struct {
 };
 
 /// Flatten a JSON-object `headers` into the std.http.Header slice the
-/// client wants. Non-object headers → empty.
-fn renderHeaders(
+/// client wants, then append the vendor-neutral metadata headers
+/// (`X-Rove-Webhook-Id` stable across retries; `X-Rove-Webhook-Attempt`
+/// = the attempt we're about to make, 1-based). Non-object `headers`
+/// is treated as empty. Customer headers with the same name come
+/// FIRST so the metadata headers win on duplicate lookups that read
+/// "last value wins" — a conservative choice given std.http doesn't
+/// de-duplicate on send.
+fn renderHeadersWithMeta(
     allocator: std.mem.Allocator,
     value: std.json.Value,
+    webhook_id: []const u8,
+    attempt_str: []const u8,
 ) ![]std.http.Header {
-    const obj = switch (value) {
-        .object => |o| o,
-        else => return try allocator.alloc(std.http.Header, 0),
-    };
     var list: std.ArrayListUnmanaged(std.http.Header) = .empty;
     errdefer list.deinit(allocator);
-    var it = obj.iterator();
-    while (it.next()) |kv| {
-        const val_str = switch (kv.value_ptr.*) {
-            .string => |s| s,
-            else => continue, // drop non-string header values
-        };
-        try list.append(allocator, .{ .name = kv.key_ptr.*, .value = val_str });
+
+    if (value == .object) {
+        var it = value.object.iterator();
+        while (it.next()) |kv| {
+            const val_str = switch (kv.value_ptr.*) {
+                .string => |s| s,
+                else => continue, // drop non-string header values
+            };
+            // Silently drop any customer attempt to set the reserved
+            // metadata header names — we control those.
+            if (std.ascii.eqlIgnoreCase(kv.key_ptr.*, "x-rove-webhook-id")) continue;
+            if (std.ascii.eqlIgnoreCase(kv.key_ptr.*, "x-rove-webhook-attempt")) continue;
+            try list.append(allocator, .{ .name = kv.key_ptr.*, .value = val_str });
+        }
     }
+
+    try list.append(allocator, .{ .name = "X-Rove-Webhook-Id", .value = webhook_id });
+    try list.append(allocator, .{ .name = "X-Rove-Webhook-Attempt", .value = attempt_str });
     return list.toOwnedSlice(allocator);
 }
 
@@ -927,6 +950,53 @@ fn openTempKv(allocator: std.mem.Allocator, buf: *[64]u8) !*kv_mod.KvStore {
 fn cleanupTempKv(buf: *[64]u8) void {
     const path_slice = std.mem.sliceTo(buf, 0);
     std.fs.cwd().deleteFile(path_slice) catch {};
+}
+
+test "renderHeadersWithMeta: stamps id + attempt, strips customer-set reserved names" {
+    const src =
+        \\{"X-Custom":"v1","X-Rove-Webhook-Id":"evil","x-rove-webhook-attempt":"99","Content-Type":"application/json"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, src, .{});
+    defer parsed.deinit();
+
+    const hdrs = try renderHeadersWithMeta(testing.allocator, parsed.value, "abc123", "2");
+    defer testing.allocator.free(hdrs);
+
+    // Expect: X-Custom, Content-Type, X-Rove-Webhook-Id=abc123, X-Rove-Webhook-Attempt=2.
+    // (Order among customer headers depends on std.json; order between
+    // customer block and metadata block is fixed — metadata goes last.)
+    var found_custom = false;
+    var found_ct = false;
+    var found_id: ?[]const u8 = null;
+    var found_attempt: ?[]const u8 = null;
+    var saw_customer_reserved = false;
+    for (hdrs) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "x-custom")) found_custom = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "content-type")) found_ct = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "x-rove-webhook-id")) {
+            if (found_id != null) saw_customer_reserved = true;
+            found_id = h.value;
+        }
+        if (std.ascii.eqlIgnoreCase(h.name, "x-rove-webhook-attempt")) {
+            if (found_attempt != null) saw_customer_reserved = true;
+            found_attempt = h.value;
+        }
+    }
+    try testing.expect(found_custom);
+    try testing.expect(found_ct);
+    try testing.expect(!saw_customer_reserved);
+    try testing.expectEqualStrings("abc123", found_id.?);
+    try testing.expectEqualStrings("2", found_attempt.?);
+}
+
+test "renderHeadersWithMeta: empty / non-object headers still gets metadata" {
+    const hdrs = try renderHeadersWithMeta(testing.allocator, .null, "id7", "5");
+    defer testing.allocator.free(hdrs);
+    try testing.expectEqual(@as(usize, 2), hdrs.len);
+    try testing.expectEqualStrings("X-Rove-Webhook-Id", hdrs[0].name);
+    try testing.expectEqualStrings("id7", hdrs[0].value);
+    try testing.expectEqualStrings("X-Rove-Webhook-Attempt", hdrs[1].name);
+    try testing.expectEqualStrings("5", hdrs[1].value);
 }
 
 test "appendLastError: stamps reason" {
