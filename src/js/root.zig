@@ -50,6 +50,7 @@ pub const worker = @import("worker.zig");
 pub const apply = @import("apply.zig");
 pub const penalty = @import("penalty.zig");
 pub const router = @import("router.zig");
+pub const callback_dispatch = @import("callback_dispatch.zig");
 
 pub const Budget = dispatcher.Budget;
 pub const PenaltyBox = penalty.PenaltyBox;
@@ -69,6 +70,8 @@ pub const TenantLog = worker.TenantLog;
 pub const DEFAULT_HANDLER_PATH = worker.DEFAULT_HANDLER_PATH;
 pub const BlockedTenants = worker.BlockedTenants;
 pub const dispatchOnce = worker.dispatchOnce;
+pub const dispatchCallbacks = callback_dispatch.dispatchCallbacks;
+pub const CALLBACK_DEFAULT_MAX_PER_TENANT = callback_dispatch.DEFAULT_MAX_PER_TENANT;
 pub const drainRaftPending = worker.drainRaftPending;
 pub const refreshDeployments = worker.refreshDeployments;
 pub const cleanupResponses = worker.cleanupResponses;
@@ -85,4 +88,5 @@ test {
     _ = apply;
     _ = penalty;
     _ = router;
+    _ = callback_dispatch;
 }

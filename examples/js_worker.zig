@@ -176,6 +176,45 @@ const SPREAD_BENCH_HANDLER =
     \\}
 ;
 
+/// Webhook smoke sender. Fires a webhook at a caller-supplied URL and
+/// records the returned outbox id so the smoke script can correlate it
+/// with the callback row. Deployed at `acme/cbfire/index.mjs` so the
+/// test can POST `/cbfire?fn=fire&args=["http://.../"]`.
+const ACME_CBFIRE =
+    \\export function fire(url, tag) {
+    \\    const id = webhook.send({
+    \\        url: url,
+    \\        method: "POST",
+    \\        body: "ping",
+    \\        headers: { "content-type": "text/plain" },
+    \\        onResult: "cbresult",
+    \\        context: { tag: tag },
+    \\        maxAttempts: 2,
+    \\    });
+    \\    kv.set("cb/last_fire", id);
+    \\    return { id: id };
+    \\}
+;
+
+/// Webhook smoke callback handler. Invoked by `dispatchCallbacks` when
+/// the drainer finishes delivery. Writes the full event under
+/// `cb/result/{webhookId}` so the smoke script can read it back via
+/// the admin `listKv` RPC. Deployed at `acme/cbresult.mjs` — direct
+/// path lookup from `onResult: "cbresult"`.
+const ACME_CBRESULT =
+    \\export default function (event) {
+    \\    const record = {
+    \\        outcome: event.outcome,
+    \\        attempts: event.attempts,
+    \\        context: event.context,
+    \\        status: event.response ? event.response.status : null,
+    \\        body: event.response ? event.response.body : null,
+    \\        error: event.error || null,
+    \\    };
+    \\    kv.set("cb/result/" + event.webhookId, JSON.stringify(record));
+    \\}
+;
+
 /// Number of `writeN` benchmark tenants spun up at startup. Each has
 /// its own `app.db` and therefore its own SQLite WAL writer lock —
 /// concurrent writes to different tenants do NOT serialize against
@@ -407,6 +446,13 @@ const Cli = struct {
     /// tests); high values reduce per-tenant kv work. Mapped onto
     /// `WorkerConfig.refresh_interval_ns`. 0 means "every tick".
     refresh_interval_ms: u32 = 2000,
+    /// **DEV-ONLY.** Relax the outbox drainer's SSRF block on
+    /// loopback (`127/8`, `::1`) and accept `http://` webhook URLs.
+    /// Intended for local smoke tests against an on-box HTTP echo
+    /// server. Never set this in production — it lets a malicious
+    /// customer handler probe localhost and leaks request bodies
+    /// over plaintext. Startup emits a loud warning when enabled.
+    dev_webhook_unsafe: bool = false,
 };
 
 fn parseCli(argv: [][:0]u8) !Cli {
@@ -476,6 +522,8 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.refresh_interval_ms = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--dev-webhook-unsafe")) {
+            out.dev_webhook_unsafe = true;
         } else {
             return error.Usage;
         }
@@ -711,6 +759,20 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.cleanupResponses(worker);
         try reg.flush();
         try rjs.refreshDeployments(worker);
+
+        // Webhook callback dispatch: on the raft leader, worker 0
+        // scans every tenant's `_callback/*` rows left by the outbox
+        // drainer and invokes the customer's `onResult` handler in
+        // its own transaction. Gated to worker 0 so two threads on
+        // the same node don't race on the same receipt — the inner
+        // SQLite txn would serialize them anyway via SQLITE_BUSY,
+        // but pinning avoids the wasted turnaround.
+        if (args.worker_idx == 0) {
+            _ = rjs.dispatchCallbacks(worker, rjs.CALLBACK_DEFAULT_MAX_PER_TENANT) catch |err| {
+                std.log.warn("worker {d}: dispatchCallbacks: {s}", .{ args.worker_idx, @errorName(err) });
+            };
+        }
+
         // Best-effort log batch flush: drains each tenant's in-memory
         // buffer if any threshold (count/bytes/time) has been crossed
         // and proposes through raft (leader) or writes locally
@@ -765,6 +827,7 @@ pub fn main() !void {
             \\  --bootstrap-root-token HEX  seed the root auth token at startup
             \\  --workers <n>               number of worker threads (default 0 = nCPU - 1)
             \\  --propose-linger-us <n>     raft proposal linger budget in µs (default 500)
+            \\  --dev-webhook-unsafe        DEV ONLY: allow http:// + loopback webhook targets
             \\
         );
         try sw.interface.flush();
@@ -781,6 +844,12 @@ pub fn main() !void {
         std.fs.cwd().deleteTree(cli.data_dir) catch {};
     }
     try std.fs.cwd().makePath(cli.data_dir);
+
+    if (cli.dev_webhook_unsafe) {
+        outbox.ssrf.dev_allow_loopback = true;
+        outbox.http_client.dev_allow_plaintext = true;
+        std.log.warn("*** --dev-webhook-unsafe enabled: webhook.send may target loopback over http:// — DEV ONLY ***", .{});
+    }
 
     try installSignalHandlers();
 
@@ -861,6 +930,8 @@ pub fn main() !void {
             .{ .path = "index.mjs", .content = ACME_INDEX },
             .{ .path = "api/index.mjs", .content = ACME_API_INDEX },
             .{ .path = "users/index.mjs", .content = ACME_USERS_MJS },
+            .{ .path = "cbfire/index.mjs", .content = ACME_CBFIRE },
+            .{ .path = "cbresult.mjs", .content = ACME_CBRESULT },
         });
         try bootstrapHandler(allocator, cli.data_dir, "globex", &.{
             .{ .path = "index.mjs", .content = GLOBEX_HANDLER },

@@ -22,6 +22,14 @@ const ssrf = @import("ssrf.zig");
 /// this gets dropped and the response is flagged `truncated=true`.
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
 
+/// **DEV-ONLY** escape hatch that accepts `http://` webhook URLs in
+/// addition to `https://`. **Never set in production** — plaintext
+/// delivery leaks request bodies on any intermediate hop. Paired
+/// with `ssrf.dev_allow_loopback` so a smoke test can hit a local
+/// echo server; both flip together under js-worker's
+/// `--dev-webhook-unsafe` CLI flag.
+pub var dev_allow_plaintext: bool = false;
+
 pub const DeliverError = error{
     BlockedAddress,
     UnresolvableHost,
@@ -63,12 +71,14 @@ pub const Response = struct {
 
 pub fn deliver(allocator: std.mem.Allocator, req: Request) DeliverError!Response {
     const uri = std.Uri.parse(req.url) catch return DeliverError.InvalidUrl;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return DeliverError.HttpsRequired;
+    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+    if (!is_https and !(is_http and dev_allow_plaintext)) return DeliverError.HttpsRequired;
     const host = switch (uri.host orelse return DeliverError.InvalidUrl) {
         .raw => |h| h,
         .percent_encoded => |h| h,
     };
-    const port: u16 = uri.port orelse 443;
+    const port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else @as(u16, 80));
 
     // Pre-resolve + SSRF check. This isn't strictly atomic with the
     // client's own resolution below, but catches the common case and

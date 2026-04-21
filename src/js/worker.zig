@@ -2322,7 +2322,7 @@ pub fn drainRaftPending(worker: anytype) !void {
 /// with a `RaftWait{seq}` component; `drainRaftPending` then observes
 /// `raft.committedSeq()` advancing past the stamp and releases the
 /// entity downstream. No spinning here — the h2 poll loop stays hot.
-fn proposeWriteSet(
+pub fn proposeWriteSet(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
     instance_id: []const u8,
