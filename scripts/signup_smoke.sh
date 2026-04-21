@@ -23,8 +23,10 @@ RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40298}"
 BIN="${BIN:-./zig-out/bin/js-worker}"
 TOKEN="${ROVE_TOKEN:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}"
 ADMIN_HOST="api.test"
+PUBLIC_SUFFIX="test"
 PORT="${HTTP_ADDR##*:}"
 ADMIN_ORIGIN="http://${ADMIN_HOST}:${PORT}"
+ALICE_ORIGIN="http://alice.${PUBLIC_SUFFIX}:${PORT}"
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
@@ -42,6 +44,7 @@ rm -rf "$DATA_DIR"
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
     --admin-api-domain "$ADMIN_HOST" \
+    --public-suffix "$PUBLIC_SUFFIX" \
     --workers 1 \
     --refresh-interval-ms 100 \
     --fresh >/tmp/signup-smoke.out 2>&1 &
@@ -50,7 +53,9 @@ trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
 
 sleep 1.2
 
-RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1")
+RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
+         --resolve "alice.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
+         --resolve "bob.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1")
 CURL=(curl --http2-prior-knowledge -sS "${RESOLVE[@]}")
 
 ok() { echo "ok  $1"; }
@@ -140,6 +145,24 @@ list=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" "${ADMIN_ORIGIN}/?fn=listI
 echo "$list" | grep -q '"id":"alice"' || fail "listInstance missing alice: $list"
 ok "signup-created instance visible via listInstance"
 
+# ── 9a. Starter content answers on the new instance ───────────────────
+# `/` should resolve via the wildcard public suffix to alice's static
+# index.html (starter bundle). Hit `/api?fn=default` to exercise the
+# handler too. Give refreshDeployments a tick to see the new deploy.
+sleep 0.3
+code=$("${CURL[@]}" -o /tmp/ss-alice-html.txt -w '%{http_code}' "${ALICE_ORIGIN}/")
+[[ "$code" == "200" ]] || fail "starter static /: got $code (body: $(cat /tmp/ss-alice-html.txt))"
+grep -q 'Your Loop46 app is live' /tmp/ss-alice-html.txt || fail "starter HTML body missing expected text"
+ok "starter content: GET ${ALICE_ORIGIN}/ → 200 with expected HTML"
+
+# The handler lives at index.mjs; hit a non-static path so static
+# resolution misses and routes to the handler. Default export fires
+# via `?fn=default`.
+code=$("${CURL[@]}" -o /tmp/ss-alice-api.txt -w '%{http_code}' "${ALICE_ORIGIN}/api?fn=default")
+[[ "$code" == "200" ]] || fail "starter handler /api: got $code (body: $(cat /tmp/ss-alice-api.txt))"
+grep -q 'Your Loop46 API is live' /tmp/ss-alice-api.txt || fail "starter handler body missing expected text"
+ok "starter content: GET ${ALICE_ORIGIN}/api?fn=default → 200 with expected JSON"
+
 # ── 10. With ROVE_RESEND_KEY configured: signup queues an outbox email
 #        and drops magic_link from the response body. ───────────────────
 #
@@ -160,6 +183,7 @@ wait $PID 2>/dev/null || true
     --bootstrap-resend-key "$RESEND_KEY" \
     --admin-origin "$ADMIN_ORIGIN" \
     --admin-api-domain "$ADMIN_HOST" \
+    --public-suffix "$PUBLIC_SUFFIX" \
     --platform-email-from "noreply@smoke.test" \
     --workers 1 \
     --refresh-interval-ms 100 \

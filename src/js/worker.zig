@@ -285,6 +285,17 @@ pub const WorkerConfig = struct {
     /// signup, future password-reset, etc.). Must be a domain Resend
     /// is configured to send from. Borrowed; caller keeps alive.
     platform_email_from: []const u8 = "noreply@loop46.me",
+    /// JS → bytecode compiler used by the signup path to deploy
+    /// starter content for a freshly-created instance. When null,
+    /// signup still creates the instance but skips the deploy, so
+    /// the tenant's `{id}.loop46.me` returns 503 until the customer
+    /// pushes their own code. The embedding binary is expected to
+    /// wire a real QuickJS compiler through here in production.
+    compile_fn: ?files_mod.CompileFn = null,
+    /// Opaque pointer handed back to `compile_fn`. Per-thread —
+    /// each worker thread typically gets its own compiler instance
+    /// because QuickJS runtimes aren't shareable across threads.
+    compile_ctx: ?*anyopaque = null,
 };
 
 /// Cross-reference component used by the `/_system/*` proxy. Lives
@@ -410,6 +421,10 @@ pub fn Worker(comptime opts: Options) type {
         /// Platform From: address for magic-link emails. Copied from
         /// `WorkerConfig.platform_email_from`. Borrowed.
         platform_email_from: []const u8,
+        /// Compile callback used by signup to deploy starter content.
+        /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
+        compile_fn: ?files_mod.CompileFn,
+        compile_ctx: ?*anyopaque,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -465,6 +480,8 @@ pub fn Worker(comptime opts: Options) type {
                 .admin_api_domain = config.admin_api_domain,
                 .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
                 .platform_email_from = config.platform_email_from,
+                .compile_fn = config.compile_fn,
+                .compile_ctx = config.compile_ctx,
             };
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
@@ -3404,6 +3421,22 @@ fn handleAdminSignup(
         return;
     };
 
+    // Deploy starter content so the new tenant's `{id}.loop46.me`
+    // answers 200 immediately instead of 503 "no deployment". Skipped
+    // when no compile callback is wired (library default) — the
+    // customer can push their own code via the files API.
+    if (worker.compile_fn) |compile_fn| {
+        const inst_opt = worker.tenant.getInstance(name) catch null;
+        if (inst_opt) |inst| {
+            deployStarterContent(allocator, inst.dir, compile_fn, worker.compile_ctx) catch |err| {
+                // Don't fail the signup — the customer still gets a
+                // usable account, they just see 503 until they push
+                // code. Log loudly so operators can investigate.
+                std.log.warn("rove-js: signup starter deploy({s}) failed: {s}", .{ name, @errorName(err) });
+            };
+        }
+    }
+
     // PLAN §2.2 default magic-link TTL: 15 minutes.
     const MAGIC_TTL_NS: i64 = 15 * 60 * std.time.ns_per_s;
     const token = worker.tenant.mintMagic(email, name, MAGIC_TTL_NS) catch |err| {
@@ -3488,6 +3521,109 @@ fn handleAdminSignup(
     try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
     try server.reg.set(ent, &server.request_out, h2.Session, sess);
     try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+// ── Starter content ────────────────────────────────────────────────
+//
+// Embedded in the binary so a freshly-created tenant answers 200 on
+// `/` the moment signup completes. Intentionally tiny — the point is
+// to prove the deploy pipeline works end-to-end, not to ship a
+// template. The customer replaces these as soon as they push their
+// own code through the files API.
+
+const STARTER_INDEX_MJS =
+    \\// This is your Loop46 handler. It runs as a pure function of
+    \\// (request, kv) — no fetch, no setTimeout, no async IO. All
+    \\// outbound effects go through webhook.send / email.send. See
+    \\// the docs at https://loop46.me/docs for the full story.
+    \\//
+    \\// The current request is available on the `request` global
+    \\// (request.method, request.path, request.body, request.query).
+    \\// Return a string (or an object — we'll JSON.stringify it).
+    \\export default function () {
+    \\  const count = parseInt(kv.get("_starter_hits") ?? "0", 10) + 1;
+    \\  kv.set("_starter_hits", String(count));
+    \\  return {
+    \\    message: "Your Loop46 API is live",
+    \\    path: request.path,
+    \\    hits: count,
+    \\  };
+    \\}
+;
+
+const STARTER_STATIC_INDEX_HTML =
+    \\<!doctype html>
+    \\<html lang="en">
+    \\<head>
+    \\<meta charset="utf-8">
+    \\<title>Your Loop46 app</title>
+    \\<meta name="viewport" content="width=device-width,initial-scale=1">
+    \\<style>
+    \\  body { font: 15px system-ui, sans-serif; max-width: 640px; margin: 4rem auto; padding: 0 1rem; color: #222; }
+    \\  h1 { margin-bottom: 0.25rem; }
+    \\  code { background: #f1f1f1; padding: 0.1em 0.3em; border-radius: 3px; }
+    \\  ul { padding-left: 1.25rem; }
+    \\</style>
+    \\</head>
+    \\<body>
+    \\<h1>Your Loop46 app is live 🎉</h1>
+    \\<p>This static page came from <code>_static/index.html</code>. Everything else routes through <code>index.mjs</code>.</p>
+    \\<h2>Next steps</h2>
+    \\<ul>
+    \\  <li>Visit your dashboard at <a href="https://app.loop46.me">app.loop46.me</a> to edit code and browse your KV</li>
+    \\  <li>Edit <code>index.mjs</code> to handle routes</li>
+    \\  <li>Drop static assets under <code>_static/</code> — images, CSS, SPAs, anything</li>
+    \\  <li>Use <code>webhook.send</code> and <code>email.send</code> for outbound effects</li>
+    \\</ul>
+    \\</body>
+    \\</html>
+;
+
+/// Write the initial deployment for a freshly-created instance. Opens
+/// its own short-lived kv + blob-store connections, pushes the two
+/// starter files through FileStore (which compiles + blob-addresses
+/// them), and commits a deployment row. Closes everything on the way
+/// out — the main worker and files-server lazy-open their own
+/// connections later, so we're not holding onto any state that would
+/// conflict.
+fn deployStarterContent(
+    allocator: std.mem.Allocator,
+    inst_dir: []const u8,
+    compile_fn: files_mod.CompileFn,
+    compile_ctx: ?*anyopaque,
+) !void {
+    const files_db_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/files.db",
+        .{inst_dir},
+        0,
+    );
+    defer allocator.free(files_db_path);
+
+    const files_blob_dir = try std.fmt.allocPrint(
+        allocator,
+        "{s}/file-blobs",
+        .{inst_dir},
+    );
+    defer allocator.free(files_blob_dir);
+
+    const files_kv = try kv_mod.KvStore.open(allocator, files_db_path);
+    defer files_kv.close();
+
+    var blob_backend = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
+    defer blob_backend.deinit();
+
+    var store = files_mod.FileStore.init(
+        allocator,
+        files_kv,
+        blob_backend.blobStore(),
+        compile_fn,
+        compile_ctx,
+    );
+
+    try store.putSource("index.mjs", STARTER_INDEX_MJS);
+    try store.putStatic("_static/index.html", STARTER_STATIC_INDEX_HTML, "text/html; charset=utf-8");
+    _ = try store.deploy();
 }
 
 /// Plain-text body of the signup magic-link email. Kept simple — no

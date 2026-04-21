@@ -610,6 +610,11 @@ const WorkerCtx = struct {
     admin_api_domain: ?[]const u8,
     public_suffix: ?[]const u8,
     platform_email_from: []const u8,
+    /// Per-worker QuickJS compiler used by the signup endpoint to
+    /// bytecode-compile starter handler content. Runtimes can't be
+    /// shared across threads, so each worker owns its own.
+    /// Initialized at the top of `workerMain` and destroyed at exit.
+    compiler: *QjsCompiler,
     refresh_interval_ms: u32,
     /// Shared TlsConfig (or null for plaintext h2c). When present,
     /// all workers hand it to their h2 session on accept. Lives in
@@ -627,6 +632,13 @@ const WorkerCtx = struct {
 
 fn workerMain(args: *WorkerCtx) !void {
     const allocator = args.allocator;
+
+    // Per-worker QuickJS compiler. Initialized on THIS thread so the
+    // runtime + context pointers are thread-local per QuickJS's own
+    // rules. Used by the signup endpoint to compile starter content.
+    var compiler = try QjsCompiler.init();
+    defer compiler.deinit();
+    args.compiler = &compiler;
 
     // Per-worker rove registry. Every entity, every collection, every
     // deferred-op queue is owned by this registry and only touched by
@@ -706,6 +718,8 @@ fn workerMain(args: *WorkerCtx) !void {
         .log_worker_id = args.worker_idx,
         .refresh_interval_ns = @as(i64, args.refresh_interval_ms) * std.time.ns_per_ms,
         .platform_email_from = args.platform_email_from,
+        .compile_fn = QjsCompiler.compile,
+        .compile_ctx = args.compiler,
     });
     defer worker.destroy();
 
@@ -1125,6 +1139,11 @@ pub fn main() !void {
             .admin_api_domain = cli.admin_api_domain,
             .public_suffix = cli.public_suffix,
             .platform_email_from = cli.platform_email_from,
+            // The worker thread allocates its QjsCompiler on its own
+            // stack (QuickJS runtime pointers have thread affinity)
+            // and fills this field before `Worker.create`. The main
+            // thread never dereferences it.
+            .compiler = undefined,
             .refresh_interval_ms = cli.refresh_interval_ms,
             .tls_config = tls_config,
             .seq_counters = &seq_counters,
