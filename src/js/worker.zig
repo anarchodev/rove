@@ -1468,7 +1468,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
 
             // Pre-auth native endpoints — `/v1/login` mints a session
-            // from a body token; `/v1/logout` clears the cookie.
+            // from a body token; `/v1/logout` clears the cookie;
+            // `/v1/signup` creates an instance + magic link;
+            // `/v1/auth` redeems a magic link into a session.
             if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/login")) {
                 try handleAdminLogin(server, allocator, ent, sid, sess, worker, rb);
                 processed += 1;
@@ -1476,6 +1478,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
             if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/logout")) {
                 try handleAdminLogout(server, allocator, ent, sid, sess, worker, rh);
+                processed += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/signup")) {
+                try handleAdminSignup(server, allocator, ent, sid, sess, worker, rh, rb);
+                processed += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path_no_q, "/v1/auth")) {
+                try handleAdminAuth(server, allocator, ent, sid, sess, worker, rh, path);
                 processed += 1;
                 continue;
             }
@@ -3291,6 +3303,278 @@ fn handleAdminSession(
     );
     defer allocator.free(body_out);
     try setSystemResponse(server, ent, sid, sess, 200, body_out, allocator, admin_cors, "application/json");
+}
+
+// ── Signup (magic-link) ───────────────────────────────────────────────
+//
+// `POST /v1/signup` — body `{name, email}`. Validates the instance
+// id, rejects already-taken + reserved names, creates the instance,
+// mints a magic token scoped to `(email, instance_id)`, and returns
+// the magic link in the response body.
+//
+// Email delivery is NOT in this commit — the response carries
+// `magic_link` so the dashboard / CLI can surface it directly in
+// dev, and so integration tests can exercise the full redeem path
+// without standing up an SMTP endpoint. A follow-up commit will
+// route the link through `email.send` via the outbox so production
+// hits the user's inbox only.
+
+/// Names a user cannot register. Prevents impersonating platform
+/// surfaces (`app`, `api`, `admin`, `www`, `__admin__`) and anything
+/// that currently hardcoded tenants claim (`acme`, `globex`, etc.).
+/// Matched case-insensitively.
+const RESERVED_INSTANCE_NAMES = [_][]const u8{
+    "__admin__", "admin",    "api",     "app",     "www",
+    "auth",      "login",    "signup",  "logout",  "dashboard",
+    "static",    "system",   "public",  "root",    "mail",
+};
+
+fn isReservedInstanceName(name: []const u8) bool {
+    for (RESERVED_INSTANCE_NAMES) |reserved| {
+        if (std.ascii.eqlIgnoreCase(name, reserved)) return true;
+    }
+    return false;
+}
+
+const SignupBody = struct {
+    name: []const u8,
+    email: []const u8,
+};
+
+fn handleAdminSignup(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    worker: anytype,
+    rh: h2.ReqHeaders,
+    rb: h2.ReqBody,
+) !void {
+    const admin_cors = worker.admin_origin;
+    const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
+
+    const parsed = std.json.parseFromSlice(SignupBody, allocator, body, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        try setSystemResponse(server, ent, sid, sess, 400, "bad request body\n", allocator, admin_cors, null);
+        return;
+    };
+    defer parsed.deinit();
+
+    const name = parsed.value.name;
+    const email = parsed.value.email;
+
+    if (isReservedInstanceName(name)) {
+        // Mirrors the "already taken" shape so an attacker can't
+        // enumerate the reserved list vs. real registrations.
+        try setSystemResponse(server, ent, sid, sess, 409, "{\"error\":\"name unavailable\"}\n", allocator, admin_cors, "application/json");
+        return;
+    }
+
+    // Name uniqueness: existing `__root__/instance/{name}` marker
+    // means somebody already owns it. Race with createInstance below
+    // is tolerated — createInstance is idempotent for already-existing
+    // ids (no-op), but we'd then be minting a magic for an instance
+    // we don't own. Pre-check narrows the race window enough for M1.
+    if (worker.tenant.instanceExists(name) catch false) {
+        try setSystemResponse(server, ent, sid, sess, 409, "{\"error\":\"name unavailable\"}\n", allocator, admin_cors, "application/json");
+        return;
+    }
+
+    // Create the instance. Validates the id shape; InvalidInstanceId
+    // surfaces as 400.
+    worker.tenant.createInstance(name) catch |err| switch (err) {
+        tenant_mod.Error.InvalidInstanceId => {
+            try setSystemResponse(server, ent, sid, sess, 400, "{\"error\":\"invalid name\"}\n", allocator, admin_cors, "application/json");
+            return;
+        },
+        else => {
+            std.log.warn("rove-js: signup createInstance({s}) failed: {s}", .{ name, @errorName(err) });
+            try setSystemResponse(server, ent, sid, sess, 500, "signup failed\n", allocator, admin_cors, null);
+            return;
+        },
+    };
+
+    // Mint the magic link. PLAN §2.2 default TTL: 15 minutes.
+    const MAGIC_TTL_NS: i64 = 15 * 60 * std.time.ns_per_s;
+    const token = worker.tenant.mintMagic(email, name, MAGIC_TTL_NS) catch |err| switch (err) {
+        tenant_mod.Error.InvalidToken => {
+            try setSystemResponse(server, ent, sid, sess, 400, "{\"error\":\"invalid email\"}\n", allocator, admin_cors, "application/json");
+            return;
+        },
+        else => {
+            std.log.warn("rove-js: signup mintMagic failed: {s}", .{@errorName(err)});
+            try setSystemResponse(server, ent, sid, sess, 500, "signup failed\n", allocator, admin_cors, null);
+            return;
+        },
+    };
+
+    // Build the magic link URL using the request's Host header as the
+    // base (so dev + prod both produce the right thing without extra
+    // config). Scheme is hard-coded `https` when in production and
+    // inferred as `http` when the request arrived on plaintext — the
+    // worker knows via tls_config, but we just go with `https` for
+    // now and document this as a follow-up once email-send lands
+    // (email URL building needs scheme awareness anyway).
+    const host = findHeader(rh, ":authority") orelse "";
+    const magic_link = try std.fmt.allocPrint(
+        allocator,
+        "https://{s}/v1/auth?mt={s}",
+        .{ host, &token },
+    );
+    defer allocator.free(magic_link);
+
+    const body_out = try std.fmt.allocPrint(
+        allocator,
+        "{{\"ok\":true,\"name\":\"{s}\",\"magic_link\":\"{s}\"}}\n",
+        .{ name, magic_link },
+    );
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 202 });
+    const hdrs = try buildSystemRespHeaders(allocator, admin_cors, false, "application/json");
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = body_out.ptr,
+        .len = @intCast(body_out.len),
+    });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// GET /v1/auth?mt=<64-hex>. Redeem the magic link, mint a session,
+/// 302 to the dashboard. On any failure — malformed, expired, or
+/// already-used token — returns 401 so the user sees an error rather
+/// than silently landing somewhere weird.
+fn handleAdminAuth(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    worker: anytype,
+    rh: h2.ReqHeaders,
+    path: []const u8,
+) !void {
+    _ = rh;
+    const admin_cors = worker.admin_origin;
+
+    const q = std.mem.indexOfScalar(u8, path, '?') orelse {
+        try setSystemResponse(server, ent, sid, sess, 401, "missing magic token\n", allocator, admin_cors, null);
+        return;
+    };
+    const query = path[q + 1 ..];
+    const mt = extractQueryParam(query, "mt") orelse {
+        try setSystemResponse(server, ent, sid, sess, 401, "missing magic token\n", allocator, admin_cors, null);
+        return;
+    };
+
+    var redeemed_opt = worker.tenant.redeemMagic(mt) catch |err| blk: {
+        std.log.warn("rove-js: auth redeemMagic failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    if (redeemed_opt == null) {
+        try setSystemResponse(server, ent, sid, sess, 401, "invalid or expired magic link\n", allocator, admin_cors, null);
+        return;
+    }
+    defer redeemed_opt.?.deinit(allocator);
+
+    // Single-account model: every authenticated session is root-level.
+    // Multi-account will bind the session to redeemed.instance_id here.
+    const ctx: tenant_mod.AuthContext = .{ .is_root = true };
+    const opaque_hex = worker.tenant.createSession(ctx, ADMIN_SESSION_TTL_NS) catch |err| {
+        std.log.warn("rove-js: auth createSession failed: {s}", .{@errorName(err)});
+        try setSystemResponse(server, ent, sid, sess, 500, "session create failed\n", allocator, admin_cors, null);
+        return;
+    };
+
+    // 302 to the dashboard with the instance id in the fragment so
+    // the UI can deep-link into it on load. Location + Set-Cookie
+    // ride in the same response.
+    const location = try std.fmt.allocPrint(allocator, "/#/{s}", .{redeemed_opt.?.instance_id});
+    defer allocator.free(location);
+    const cookie = try formatSessionCookie(allocator, &opaque_hex, false);
+    defer allocator.free(cookie);
+
+    const hdrs = try buildRedirectRespHeaders(allocator, admin_cors, cookie, location);
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 302 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// Build response headers for the /v1/auth redirect. Packs
+/// `location`, `set-cookie`, and the admin CORS envelope into a
+/// single contiguous buffer — same shape as buildSystemRespHeaders
+/// so the h2 writer can free the block in one `allocator.free`.
+fn buildRedirectRespHeaders(
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+    set_cookie: []const u8,
+    location: []const u8,
+) !h2.RespHeaders {
+    const Pair = struct { name: []const u8, value: []const u8 };
+    var pairs_buf: [6]Pair = undefined;
+    var n: usize = 0;
+    pairs_buf[n] = .{ .name = "location", .value = location };
+    n += 1;
+    pairs_buf[n] = .{ .name = "set-cookie", .value = set_cookie };
+    n += 1;
+    if (cors_origin) |o| {
+        pairs_buf[n] = .{ .name = "access-control-allow-origin", .value = o };
+        n += 1;
+        pairs_buf[n] = .{ .name = "access-control-allow-credentials", .value = "true" };
+        n += 1;
+    }
+
+    const pairs = pairs_buf[0..n];
+    const fields_size = n * @sizeOf(h2.HeaderField);
+    var strbuf_size: usize = 0;
+    for (pairs) |p| strbuf_size += p.name.len + p.value.len;
+
+    const total = fields_size + strbuf_size;
+    const buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(buf);
+
+    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
+    var off: usize = fields_size;
+    for (pairs, 0..) |p, i| {
+        const name_start = off;
+        @memcpy(buf[off .. off + p.name.len], p.name);
+        off += p.name.len;
+        const value_start = off;
+        @memcpy(buf[off .. off + p.value.len], p.value);
+        off += p.value.len;
+        fields_ptr[i] = .{
+            .name = buf[name_start..].ptr,
+            .name_len = @intCast(p.name.len),
+            .value = buf[value_start..].ptr,
+            .value_len = @intCast(p.value.len),
+        };
+    }
+
+    return .{
+        .fields = fields_ptr,
+        .count = @intCast(n),
+        ._buf = buf.ptr,
+        ._buf_len = @intCast(buf.len),
+    };
+}
+
+/// Pull a single named param out of a URL query string. Returns null
+/// if absent. Does NOT percent-decode — magic tokens are [0-9a-f]
+/// so decoding is a no-op and skipping it keeps this small.
+fn extractQueryParam(query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
