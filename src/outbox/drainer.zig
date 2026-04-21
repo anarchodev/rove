@@ -5,10 +5,17 @@
 //! the raft node is the leased leader so two leaders don't
 //! double-deliver.
 //!
-//! ## Design notes (slice 3a scope)
+//! ## Design notes (slice 3a + 3b scope)
 //!
-//! - **Single thread.** Multi-threaded drainer + inflight leases land
-//!   in slice 3c alongside real failover resilience.
+//! - **Single thread.** Multi-threaded drainer lands in slice 3c
+//!   alongside per-destination rate shaping.
+//! - **Inflight lease.** Before calling `http_client.deliver`, the
+//!   row moves `_outbox/{id}` → `_outbox_inflight/{id}` with a
+//!   `leased_at_ms` stamp. Success clears the lease; retry writes
+//!   the row back to `_outbox/{id}`; terminal failure moves it to
+//!   `_dlq/{id}`. Every pass sweeps leases older than
+//!   `lease_stale_after_ms` back into `_outbox/*` — the recovery
+//!   path for a drainer crash or leader failover mid-delivery.
 //! - **No raft propagation of drainer state changes.** A successful
 //!   delete / retry bump / DLQ move is a local SQLite write on the
 //!   leader's copy. Followers still have the original envelope from
@@ -20,9 +27,10 @@
 //!   tenant warm. Slice 3b adds a `__root__/outbox_pending/{instance}`
 //!   marker that the drainer consults first, opening tenants only
 //!   when they have work. Documented and planned.
-//! - **Callback dispatch is stubbed.** When a row finishes (success
-//!   or terminal), `deliveredResult` logs an info line; the actual
-//!   callback-invocation path lands in commit 5.
+//! - **Callback dispatch.** On delivery complete (success or
+//!   terminal), `writeCallback` persists `_callback/{id}`; the
+//!   tenant-side `dispatchCallbacks` phase in rove-js drains those
+//!   receipts and invokes the customer's `onResult` handler.
 
 const std = @import("std");
 const kv_mod = @import("rove-kv");
@@ -60,6 +68,15 @@ pub const Config = struct {
     /// `min(cap, base * 2^attempt)`.
     retry_base_ms: u32 = 1_000,
     retry_cap_ms: u32 = 5 * 60 * 1_000,
+    /// Lease records older than this get swept back into `_outbox/*`
+    /// on every drain pass. A running drainer's own leases are
+    /// cleared inline as each delivery completes, so the only rows a
+    /// sweep ever observes are prior-run orphans (drainer crash,
+    /// process restart, leader failover after local inflight write).
+    /// Default 2× the per-attempt HTTP timeout (default 30s) — big
+    /// enough to never race a slow-but-alive delivery, small enough
+    /// that a real crash recovers in under a minute.
+    lease_stale_after_ms: i64 = 60_000,
 };
 
 pub const Handle = struct {
@@ -154,9 +171,20 @@ fn drainTenant(h: *Handle, inst: InstanceInfo, rand: std.Random) !void {
 
     const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
 
-    // Prefix-scan for rows. Cap per-pass work so one busy tenant
-    // doesn't starve others. 64 is generous — at the 250ms tick that's
-    // ~250 deliveries/s per tenant if every row is ready at once.
+    // Phase 1: recover orphan leases first. Anything in `_outbox_inflight/*`
+    // older than `lease_stale_after_ms` is from a prior crash/restart —
+    // move it back to `_outbox/*` so the normal scan picks it up.
+    sweepStaleLeases(h, inst, kv, now_ms) catch |err| {
+        std.log.warn(
+            "outbox drainer: {s}: stale-lease sweep: {s}",
+            .{ inst.id, @errorName(err) },
+        );
+    };
+
+    // Phase 2: prefix-scan ready rows. Cap per-pass work so one busy
+    // tenant doesn't starve others. 64 is generous — at the 250ms
+    // tick that's ~250 deliveries/s per tenant if every row is ready
+    // at once.
     const MAX_PER_PASS = 64;
     var scan = try kv.prefix("_outbox/", "", MAX_PER_PASS);
     defer scan.deinit();
@@ -171,11 +199,44 @@ fn drainTenant(h: *Handle, inst: InstanceInfo, rand: std.Random) !void {
     }
 }
 
+/// Move every `_outbox_inflight/*` row whose `leased_at_ms` is older
+/// than `config.lease_stale_after_ms` back to `_outbox/{id}`. Called
+/// once per drain pass, before the main scan. See the module doc for
+/// the at-least-once reasoning.
+fn sweepStaleLeases(
+    h: *Handle,
+    inst: InstanceInfo,
+    kv: *kv_mod.KvStore,
+    now_ms: i64,
+) !void {
+    const MAX_PER_SWEEP = 64;
+    var scan = try kv.prefix("_outbox_inflight/", "", MAX_PER_SWEEP);
+    defer scan.deinit();
+    const threshold = h.config.lease_stale_after_ms;
+    for (scan.entries) |entry| {
+        const leased_at = extractLeasedAtMs(entry.value) orelse continue;
+        if (now_ms - leased_at < threshold) continue;
+        // Preserve attempts — we don't know if delivery happened;
+        // receivers dedup on `X-Rove-Webhook-Id` per PLAN §2.6.
+        returnLeaseToOutbox(h.allocator, kv, entry.key, entry.value) catch |err| {
+            std.log.warn(
+                "outbox drainer: {s}/{s}: recover lease: {s}",
+                .{ inst.id, entry.key, @errorName(err) },
+            );
+            continue;
+        };
+        std.log.info(
+            "outbox drainer: {s}/{s}: stale lease recovered ({d}ms old)",
+            .{ inst.id, entry.key, now_ms - leased_at },
+        );
+    }
+}
+
 fn deliverOne(
     h: *Handle,
     inst: InstanceInfo,
     kv: *kv_mod.KvStore,
-    key: []const u8,
+    outbox_key: []const u8,
     envelope_bytes: []const u8,
     now_ms: i64,
     rand: std.Random,
@@ -186,15 +247,24 @@ fn deliverOne(
     }) catch |err| {
         std.log.warn(
             "outbox drainer: {s}/{s}: malformed envelope ({s}), moving to _dlq",
-            .{ inst.id, key, @errorName(err) },
+            .{ inst.id, outbox_key, @errorName(err) },
         );
-        try moveToDlq(h.allocator, kv, key, envelope_bytes, "malformed envelope");
+        try moveToDlq(h.allocator, kv, outbox_key, envelope_bytes, "malformed envelope");
         return;
     };
     defer parsed.deinit();
     const env = parsed.value;
 
     if (env.next_attempt_at_ms > now_ms) return; // not ready yet
+
+    // Take out the lease BEFORE calling the network. If the drainer
+    // crashes inside `deliver`, the next pass's stale-lease sweep
+    // recovers the row; receivers dedup via `X-Rove-Webhook-Id`.
+    const leased_bytes = try leaseEnvelope(h.allocator, kv, outbox_key, envelope_bytes, now_ms);
+    defer h.allocator.free(leased_bytes);
+
+    const inflight_key = try formatKey(h.allocator, "_outbox_inflight/", env.id);
+    defer h.allocator.free(inflight_key);
 
     // Delivery. Method/body/headers are owned by the parsed arena.
     const headers = try renderHeaders(h.allocator, env.headers);
@@ -216,7 +286,7 @@ fn deliverOne(
             }
             std.log.info(
                 "outbox drainer: {s}/{s}: delivered status={d} (truncated={})",
-                .{ inst.id, key, resp.status, resp.truncated },
+                .{ inst.id, outbox_key, resp.status, resp.truncated },
             );
             try writeCallback(h.allocator, kv, env, .{
                 .outcome = "delivered",
@@ -226,14 +296,14 @@ fn deliverOne(
                 .attempts = env.attempts + 1,
                 .err = null,
             });
-            try kv.delete(key);
+            try kv.delete(inflight_key);
         },
         .retry => |err| {
             const attempts_next = env.attempts + 1;
             if (attempts_next >= env.max_attempts) {
                 std.log.warn(
                     "outbox drainer: {s}/{s}: attempts exhausted ({d}), moving to _dlq ({s})",
-                    .{ inst.id, key, attempts_next, @errorName(err) },
+                    .{ inst.id, outbox_key, attempts_next, @errorName(err) },
                 );
                 try writeCallback(h.allocator, kv, env, .{
                     .outcome = "failed",
@@ -243,21 +313,21 @@ fn deliverOne(
                     .attempts = attempts_next,
                     .err = @errorName(err),
                 });
-                try moveToDlq(h.allocator, kv, key, envelope_bytes, @errorName(err));
+                try moveInflightToDlq(h.allocator, kv, inflight_key, leased_bytes, @errorName(err));
                 return;
             }
             const delay = backoffDelayMs(h.config, attempts_next, rand);
             const next_at = now_ms + @as(i64, @intCast(delay));
             std.log.info(
                 "outbox drainer: {s}/{s}: retryable ({s}), attempt {d}/{d}, next in {d}ms",
-                .{ inst.id, key, @errorName(err), attempts_next, env.max_attempts, delay },
+                .{ inst.id, outbox_key, @errorName(err), attempts_next, env.max_attempts, delay },
             );
-            try rescheduleEnvelope(h.allocator, kv, key, envelope_bytes, attempts_next, next_at);
+            try returnLeaseToOutboxWithAttempts(h.allocator, kv, inflight_key, leased_bytes, attempts_next, next_at);
         },
         .terminal => |err| {
             std.log.warn(
                 "outbox drainer: {s}/{s}: terminal ({s}), moving to _dlq",
-                .{ inst.id, key, @errorName(err) },
+                .{ inst.id, outbox_key, @errorName(err) },
             );
             try writeCallback(h.allocator, kv, env, .{
                 .outcome = "failed",
@@ -267,7 +337,7 @@ fn deliverOne(
                 .attempts = env.attempts + 1,
                 .err = @errorName(err),
             });
-            try moveToDlq(h.allocator, kv, key, envelope_bytes, @errorName(err));
+            try moveInflightToDlq(h.allocator, kv, inflight_key, leased_bytes, @errorName(err));
         },
     }
 }
@@ -414,19 +484,6 @@ fn backoffDelayMs(config: Config, attempts: i32, rand: std.Random) u32 {
     return @intCast(rand.uintLessThan(u64, capped));
 }
 
-fn rescheduleEnvelope(
-    allocator: std.mem.Allocator,
-    kv: *kv_mod.KvStore,
-    key: []const u8,
-    envelope_bytes: []const u8,
-    attempts_next: i32,
-    next_attempt_at_ms: i64,
-) !void {
-    const rewritten = try rewriteAttempts(allocator, envelope_bytes, attempts_next, next_attempt_at_ms);
-    defer allocator.free(rewritten);
-    try kv.put(key, rewritten);
-}
-
 fn moveToDlq(
     allocator: std.mem.Allocator,
     kv: *kv_mod.KvStore,
@@ -446,11 +503,147 @@ fn moveToDlq(
     try kv.delete(outbox_key);
 }
 
-/// Parse `envelope_bytes`, patch attempts + next_attempt_at_ms, and
-/// return the re-serialized JSON. `std.json.stringify` preserves
-/// object shape — existing fields, including headers / context /
-/// retry_on, round-trip verbatim.
-fn rewriteAttempts(
+// ── Lease helpers ─────────────────────────────────────────────────
+//
+// Leases live at `_outbox_inflight/{id}` for the duration of a
+// delivery attempt. All four transitions (take / clear / return /
+// dlq) are two SQLite writes that are NOT txn-wrapped — on a crash
+// between them, the next pass's stale-lease sweep converges the
+// state. `_outbox/{id}` + `_outbox_inflight/{id}` simultaneously
+// present for the same id means "row in flight"; the stale-sweep
+// harmlessly re-queues the inflight clone if its lease has aged out,
+// and the live drainer clears it once delivery completes.
+
+/// Move `_outbox/{id}` → `_outbox_inflight/{id}`, stamping
+/// `leased_at_ms` onto the envelope so stale leases can be detected
+/// later. Returns the written (lease-stamped) envelope bytes — the
+/// caller uses them for the DLQ / retry branches without re-reading.
+fn leaseEnvelope(
+    allocator: std.mem.Allocator,
+    kv: *kv_mod.KvStore,
+    outbox_key: []const u8,
+    envelope_bytes: []const u8,
+    now_ms: i64,
+) ![]u8 {
+    std.debug.assert(std.mem.startsWith(u8, outbox_key, "_outbox/"));
+    const id = outbox_key["_outbox/".len..];
+    const inflight_key = try formatKey(allocator, "_outbox_inflight/", id);
+    defer allocator.free(inflight_key);
+
+    const stamped = try stampLeasedAt(allocator, envelope_bytes, now_ms);
+    errdefer allocator.free(stamped);
+    try kv.put(inflight_key, stamped);
+    try kv.delete(outbox_key);
+    return stamped;
+}
+
+/// Retry branch: rewrite attempts + next_attempt_at_ms, drop the
+/// `leased_at_ms` field, write back to `_outbox/{id}`, and delete
+/// the inflight row. Matches the original `rescheduleEnvelope`
+/// behavior once the in-flight model is threaded through.
+fn returnLeaseToOutboxWithAttempts(
+    allocator: std.mem.Allocator,
+    kv: *kv_mod.KvStore,
+    inflight_key: []const u8,
+    envelope_bytes: []const u8,
+    attempts_next: i32,
+    next_attempt_at_ms: i64,
+) !void {
+    std.debug.assert(std.mem.startsWith(u8, inflight_key, "_outbox_inflight/"));
+    const id = inflight_key["_outbox_inflight/".len..];
+    const outbox_key = try formatKey(allocator, "_outbox/", id);
+    defer allocator.free(outbox_key);
+
+    const rewritten = try rewriteAttemptsAndClearLease(allocator, envelope_bytes, attempts_next, next_attempt_at_ms);
+    defer allocator.free(rewritten);
+    try kv.put(outbox_key, rewritten);
+    try kv.delete(inflight_key);
+}
+
+/// Stale-sweep branch: the lease aged out before its owner came back
+/// to clear it. Write the envelope back to `_outbox/{id}` with
+/// attempts preserved (we don't know if delivery happened), and drop
+/// the inflight row.
+fn returnLeaseToOutbox(
+    allocator: std.mem.Allocator,
+    kv: *kv_mod.KvStore,
+    inflight_key: []const u8,
+    envelope_bytes: []const u8,
+) !void {
+    std.debug.assert(std.mem.startsWith(u8, inflight_key, "_outbox_inflight/"));
+    const id = inflight_key["_outbox_inflight/".len..];
+    const outbox_key = try formatKey(allocator, "_outbox/", id);
+    defer allocator.free(outbox_key);
+
+    const cleaned = try clearLeasedAt(allocator, envelope_bytes);
+    defer allocator.free(cleaned);
+    try kv.put(outbox_key, cleaned);
+    try kv.delete(inflight_key);
+}
+
+/// Terminal branch: write to `_dlq/{id}`, delete the inflight row.
+fn moveInflightToDlq(
+    allocator: std.mem.Allocator,
+    kv: *kv_mod.KvStore,
+    inflight_key: []const u8,
+    envelope_bytes: []const u8,
+    reason: []const u8,
+) !void {
+    std.debug.assert(std.mem.startsWith(u8, inflight_key, "_outbox_inflight/"));
+    const id = inflight_key["_outbox_inflight/".len..];
+    const dlq_key = try formatKey(allocator, "_dlq/", id);
+    defer allocator.free(dlq_key);
+
+    const with_error = try appendLastError(allocator, envelope_bytes, reason);
+    defer allocator.free(with_error);
+    try kv.put(dlq_key, with_error);
+    try kv.delete(inflight_key);
+}
+
+fn formatKey(allocator: std.mem.Allocator, prefix: []const u8, id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, id });
+}
+
+fn stampLeasedAt(
+    allocator: std.mem.Allocator,
+    envelope_bytes: []const u8,
+    leased_at_ms: i64,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        envelope_bytes,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |*o| o,
+        else => return error.InvalidEnvelope,
+    };
+    try obj.put("leased_at_ms", .{ .integer = leased_at_ms });
+    return try stringifyAlloc(allocator, parsed.value);
+}
+
+fn clearLeasedAt(
+    allocator: std.mem.Allocator,
+    envelope_bytes: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        envelope_bytes,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |*o| o,
+        else => return error.InvalidEnvelope,
+    };
+    _ = obj.orderedRemove("leased_at_ms");
+    return try stringifyAlloc(allocator, parsed.value);
+}
+
+fn rewriteAttemptsAndClearLease(
     allocator: std.mem.Allocator,
     envelope_bytes: []const u8,
     attempts: i32,
@@ -469,7 +662,31 @@ fn rewriteAttempts(
     };
     try obj.put("attempts", .{ .integer = attempts });
     try obj.put("next_attempt_at_ms", .{ .integer = next_attempt_at_ms });
+    _ = obj.orderedRemove("leased_at_ms");
     return try stringifyAlloc(allocator, parsed.value);
+}
+
+/// Quick leased-at extraction used by the stale-lease sweep. Returns
+/// null for envelopes without the field (shouldn't happen for rows
+/// the drainer itself wrote, but tolerate external writers / partial
+/// crashes gracefully).
+fn extractLeasedAtMs(envelope_bytes: []const u8) ?i64 {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        std.heap.page_allocator,
+        envelope_bytes,
+        .{ .allocate = .alloc_always },
+    ) catch return null;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const v = obj.get("leased_at_ms") orelse return null;
+    return switch (v) {
+        .integer => |i| i,
+        else => null,
+    };
 }
 
 fn appendLastError(
@@ -578,23 +795,138 @@ test "classifyAttempt: SSRF + invalid URL are terminal, network retries" {
     try testing.expect(classifyAttempt(http_client.DeliverError.Tls) == .retry);
 }
 
-test "rewriteAttempts: patches fields, preserves everything else" {
+test "rewriteAttemptsAndClearLease: patches fields + drops leased_at_ms, preserves everything else" {
     const original =
         \\{"v":1,"id":"abc","url":"https://x/","method":"POST","attempts":0,
-        \\ "next_attempt_at_ms":0,"context":{"charge":"c1"},"headers":{"X":"Y"}}
+        \\ "next_attempt_at_ms":0,"leased_at_ms":999999,
+        \\ "context":{"charge":"c1"},"headers":{"X":"Y"}}
     ;
-    const out = try rewriteAttempts(testing.allocator, original, 3, 12345);
+    const out = try rewriteAttemptsAndClearLease(testing.allocator, original, 3, 12345);
     defer testing.allocator.free(out);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(i64, 3), parsed.value.object.get("attempts").?.integer);
     try testing.expectEqual(@as(i64, 12345), parsed.value.object.get("next_attempt_at_ms").?.integer);
+    try testing.expect(parsed.value.object.get("leased_at_ms") == null);
     try testing.expectEqualStrings("abc", parsed.value.object.get("id").?.string);
     try testing.expectEqualStrings(
         "c1",
         parsed.value.object.get("context").?.object.get("charge").?.string,
     );
+}
+
+test "stampLeasedAt: adds leased_at_ms integer" {
+    const original = "{\"id\":\"abc\",\"url\":\"https://x/\",\"attempts\":0}";
+    const out = try stampLeasedAt(testing.allocator, original, 42);
+    defer testing.allocator.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 42), parsed.value.object.get("leased_at_ms").?.integer);
+}
+
+test "extractLeasedAtMs: present / missing / malformed" {
+    try testing.expectEqual(@as(?i64, 100), extractLeasedAtMs("{\"leased_at_ms\":100}"));
+    try testing.expectEqual(@as(?i64, null), extractLeasedAtMs("{\"id\":\"abc\"}"));
+    try testing.expectEqual(@as(?i64, null), extractLeasedAtMs("not json"));
+    try testing.expectEqual(@as(?i64, null), extractLeasedAtMs("{\"leased_at_ms\":\"str\"}"));
+}
+
+test "clearLeasedAt: removes field, preserves rest" {
+    const original =
+        \\{"id":"abc","url":"https://x/","leased_at_ms":999,"attempts":2}
+    ;
+    const out = try clearLeasedAt(testing.allocator, original);
+    defer testing.allocator.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("leased_at_ms") == null);
+    try testing.expectEqualStrings("abc", parsed.value.object.get("id").?.string);
+    try testing.expectEqual(@as(i64, 2), parsed.value.object.get("attempts").?.integer);
+}
+
+test "returnLeaseToOutbox: moves row, strips leased_at_ms" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    const id = "abc";
+    const original = "{\"id\":\"abc\",\"url\":\"https://x/\",\"attempts\":2,\"leased_at_ms\":111}";
+    try kv.put("_outbox_inflight/abc", original);
+
+    try returnLeaseToOutbox(testing.allocator, kv, "_outbox_inflight/abc", original);
+
+    // inflight row is gone
+    try testing.expectError(kv_mod.KvError.NotFound, kv.get("_outbox_inflight/abc"));
+
+    // outbox row exists without leased_at_ms, attempts preserved
+    const got = try kv.get("_outbox/abc");
+    defer testing.allocator.free(got);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, got, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("leased_at_ms") == null);
+    try testing.expectEqual(@as(i64, 2), parsed.value.object.get("attempts").?.integer);
+    try testing.expectEqualStrings(id, parsed.value.object.get("id").?.string);
+}
+
+test "returnLeaseToOutboxWithAttempts: bumps attempts + sets next_at_ms" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    const original = "{\"id\":\"xyz\",\"attempts\":0,\"leased_at_ms\":100}";
+    try kv.put("_outbox_inflight/xyz", original);
+
+    try returnLeaseToOutboxWithAttempts(testing.allocator, kv, "_outbox_inflight/xyz", original, 3, 55555);
+
+    const got = try kv.get("_outbox/xyz");
+    defer testing.allocator.free(got);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, got, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 3), parsed.value.object.get("attempts").?.integer);
+    try testing.expectEqual(@as(i64, 55555), parsed.value.object.get("next_attempt_at_ms").?.integer);
+    try testing.expect(parsed.value.object.get("leased_at_ms") == null);
+    try testing.expectError(kv_mod.KvError.NotFound, kv.get("_outbox_inflight/xyz"));
+}
+
+test "moveInflightToDlq: writes _dlq/{id} + deletes inflight + stamps last_error" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    const original = "{\"id\":\"dd\",\"leased_at_ms\":1}";
+    try kv.put("_outbox_inflight/dd", original);
+
+    try moveInflightToDlq(testing.allocator, kv, "_outbox_inflight/dd", original, "BlockedAddress");
+
+    const got = try kv.get("_dlq/dd");
+    defer testing.allocator.free(got);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, got, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("BlockedAddress", parsed.value.object.get("last_error").?.string);
+    try testing.expectError(kv_mod.KvError.NotFound, kv.get("_outbox_inflight/dd"));
+}
+
+fn openTempKv(allocator: std.mem.Allocator, buf: *[64]u8) !*kv_mod.KvStore {
+    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    const path = try std.fmt.bufPrintZ(buf, "/tmp/rove-drainer-{x}.db", .{seed});
+    return try kv_mod.KvStore.open(allocator, path);
+}
+
+fn cleanupTempKv(buf: *[64]u8) void {
+    const path_slice = std.mem.sliceTo(buf, 0);
+    std.fs.cwd().deleteFile(path_slice) catch {};
 }
 
 test "appendLastError: stamps reason" {
