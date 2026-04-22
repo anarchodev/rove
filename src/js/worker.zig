@@ -1229,6 +1229,444 @@ pub fn refreshDeployments(worker: anytype) !void {
 /// will wait instead), the current anchor candidate is appended; the
 /// linear walk then ignores that tenant's entities for the rest of
 /// this call and the calls that follow within the tick.
+/// Per-handler record carried through the batch walk, from a
+/// successful `dispatcher.run` to the shared commit + propose at
+/// end-of-walk. Owns `console_owned` / `exception_owned` until
+/// they transfer into a log record after commit.
+const SuccessRec = struct {
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    status_code: u16,
+    body_ptr: ?[*]u8,
+    body_len: u32,
+    console_owned: []u8,
+    exception_owned: []u8,
+    method: []const u8,
+    path: []const u8,
+    host: []const u8,
+    deployment_id: u64,
+    received_ns: i64,
+    tape_refs: log_mod.TapeRefs,
+    /// Pre-minted id reused on commit-time log capture so the log
+    /// record shares its id with any outbox rows `webhook.send`
+    /// wrote during this request's handler.
+    request_id: u64,
+};
+
+/// End-of-walk: commit the shared batch txn, propose the merged
+/// writeset through raft (unless read-only), then move each success
+/// onward. Three exit paths:
+///
+///  - **commit failure**: SQLite already rolled back; every success
+///    downgrades to 503 with `.kv_error` outcome in the log.
+///  - **read-only batch**: no writes → no raft hop → every success
+///    moves straight to `response_in` with its normal status.
+///  - **writes present**: propose the writeset; on success the
+///    entries park in `raft_pending` with a `RaftWait` stamp, and
+///    `drainRaftPending` moves them onward once `committedSeq`
+///    advances past them. On propose failure we `undoTxn` and
+///    downgrade each success to 503 `.fault`.
+///
+/// Returns the number of entries finalized.
+fn finalizeBatch(
+    worker: anytype,
+    anchor: *const tenant_mod.Instance,
+    txn: *kv_mod.KvStore.TrackedTxn,
+    writeset: *const kv_mod.WriteSet,
+    successes: *std.ArrayList(SuccessRec),
+) !usize {
+    const server = worker.h2;
+    const allocator = worker.allocator;
+    const anchor_id = anchor.id;
+    const store = anchor.kv;
+    const batch_seq = txn.txn_seq;
+    const has_writes = writeset.ops.items.len > 0;
+    var processed: usize = 0;
+
+    // Commit-fail downgrade path: SQLite has already rolled back, so
+    // every success-recorded handler gets its body replaced with 503
+    // and a `.kv_error` log outcome.
+    txn.commit() catch |err| {
+        std.log.warn("rove-js txn commit (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
+        for (successes.items) |*s| {
+            overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch {};
+            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
+            const console_owned = s.console_owned;
+            const exception_owned = s.exception_owned;
+            s.console_owned = &.{};
+            s.exception_owned = &.{};
+            captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .kv_error, console_owned, exception_owned, s.tape_refs);
+            processed += 1;
+        }
+        successes.clearRetainingCapacity();
+        return processed;
+    };
+
+    if (!has_writes) {
+        // Pure read-only batch: no raft hop.
+        for (successes.items) |*s| {
+            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
+            const console_owned = s.console_owned;
+            const exception_owned = s.exception_owned;
+            s.console_owned = &.{};
+            s.exception_owned = &.{};
+            captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
+            processed += 1;
+        }
+        successes.clearRetainingCapacity();
+        return processed;
+    }
+
+    // Writes present: propose the merged writeset once. On failure,
+    // compensating-rollback via undoTxn + downgrade every success.
+    const seq = proposeWriteSet(worker, writeset, anchor_id) catch |err| {
+        std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
+        store.undoTxn(batch_seq) catch |undo_err| {
+            std.log.err("rove-js undoTxn failed after propose error: {s}", .{@errorName(undo_err)});
+        };
+        for (successes.items) |*s| {
+            overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch {};
+            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
+            const console_owned = s.console_owned;
+            const exception_owned = s.exception_owned;
+            s.console_owned = &.{};
+            s.exception_owned = &.{};
+            captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .fault, console_owned, exception_owned, s.tape_refs);
+            processed += 1;
+        }
+        successes.clearRetainingCapacity();
+        return processed;
+    };
+
+    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
+    for (successes.items) |*s| {
+        try server.reg.set(s.ent, &server.request_out, RaftWait, .{
+            .seq = seq,
+            .txn_seq = batch_seq,
+            .deadline_ns = deadline_ns,
+            .store = store,
+        });
+        try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
+
+        const console_owned = s.console_owned;
+        const exception_owned = s.exception_owned;
+        s.console_owned = &.{};
+        s.exception_owned = &.{};
+        captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
+        processed += 1;
+    }
+    successes.clearRetainingCapacity();
+    return processed;
+}
+
+/// `/_system/*` proxy + preflight handler. Returns true iff the
+/// request matched and was finalized (response stamped + moved to
+/// `response_in` or forwarded to a subsystem `pending` queue).
+///
+/// Carved out of `dispatchOnce` so the hot handler-dispatch loop
+/// reads as a sequence of phase-branches rather than one giant
+/// nested conditional.
+fn tryHandleSystem(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+    rh: h2.ReqHeaders,
+) !bool {
+    if (!std.mem.startsWith(u8, path, "/_system/")) return false;
+
+    // Every /_system/* response carries CORS headers when the worker
+    // has an admin origin configured. Browsers enforce the origin
+    // match on their side against `Access-Control-Allow-Origin`, so
+    // stamping headers even on requests without an Origin is harmless.
+    const cors_origin = worker.admin_origin;
+
+    // Preflight: browser sends OPTIONS before the real request to
+    // discover allowed methods/headers. Answer 204 with the
+    // preflight-specific CORS headers and never touch auth —
+    // preflights don't carry the bearer token.
+    if (std.mem.eql(u8, method, "OPTIONS")) {
+        if (cors_origin) |o| {
+            const req_origin = findHeader(rh, "origin") orelse "";
+            if (req_origin.len == 0 or !std.mem.eql(u8, req_origin, o)) {
+                try setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
+            } else {
+                const hdrs = try buildSystemRespHeaders(allocator, o, true, null);
+                try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
+                try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
+                try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
+                try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+                try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+                try server.reg.set(ent, &server.request_out, h2.Session, sess);
+                try server.reg.move(ent, &server.request_out, &server.response_in);
+            }
+        } else {
+            try setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
+        }
+        return true;
+    }
+
+    // Auth shape: cookie first, then Authorization: Bearer. Lets the
+    // dashboard JS call /_system/files/* and /_system/log/* without
+    // juggling a bearer header.
+    const auth_ctx = extractAdminAuth(worker.tenant, rh) catch |err| {
+        std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
+        try setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
+        return true;
+    };
+    if (auth_ctx == null) {
+        try setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, cors_origin, null);
+        return true;
+    }
+
+    // Strip `?query=string` off the path before routing. Subsystems
+    // (log, code proxies) forward the whole `:path` downstream;
+    // query parsing happens in the subsystem thread, not here.
+    const qmark = std.mem.indexOfScalar(u8, path, '?');
+    const path_no_q = if (qmark) |q| path[0..q] else path;
+
+    const sys_rest = path_no_q["/_system/".len..];
+    const sub_slash = std.mem.indexOfScalar(u8, sys_rest, '/') orelse {
+        try setSystemResponse(server, ent, sid, sess, 404, "malformed system path\n", allocator, cors_origin, null);
+        return true;
+    };
+    const subsystem = sys_rest[0..sub_slash];
+    const after_sub = sys_rest[sub_slash + 1 ..];
+
+    // `/_system/tenant/*` and `/_system/kv/*` moved to the
+    // `__admin__` JS handler; callers target `{id}.api.loop46.com/kv`
+    // etc. `/_system/log/*` and `/_system/files/*` remain native —
+    // log queries poll frequently (would meta-log themselves through
+    // JS) and code uploads are byte-heavy (fit the subsystem thread).
+    const inst_slash = std.mem.indexOfScalar(u8, after_sub, '/');
+    const sys_instance_id = if (inst_slash) |s| after_sub[0..s] else after_sub;
+    if (sys_instance_id.len == 0) {
+        try setSystemResponse(server, ent, sid, sess, 404, "missing instance id\n", allocator, cors_origin, null);
+        return true;
+    }
+    const allowed = worker.tenant.canAccessInstance(auth_ctx.?, sys_instance_id) catch false;
+    if (!allowed) {
+        try setSystemResponse(server, ent, sid, sess, 403, "forbidden\n", allocator, cors_origin, null);
+        return true;
+    }
+
+    if (std.mem.eql(u8, subsystem, "files")) {
+        if (worker.code_proxy.addr == null) {
+            try setSystemResponse(server, ent, sid, sess, 503, "files subsystem disabled\n", allocator, cors_origin, null);
+            return true;
+        }
+        try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
+        try server.reg.move(ent, &server.request_out, &worker.code_proxy.pending);
+        return true;
+    }
+    if (std.mem.eql(u8, subsystem, "log")) {
+        if (worker.log_proxy.addr == null) {
+            try setSystemResponse(server, ent, sid, sess, 503, "log subsystem disabled\n", allocator, cors_origin, null);
+            return true;
+        }
+        try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
+        try server.reg.move(ent, &server.request_out, &worker.log_proxy.pending);
+        return true;
+    }
+
+    try setSystemResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator, cors_origin, null);
+    return true;
+}
+
+/// Outcome of `resolveRequest`: either the request was finalized
+/// inline (caller bumps `processed` and continues) or the caller
+/// should fall through to the shared handler-dispatch path with the
+/// resolved `(handler_inst, scope_inst)` pair plus an `is_admin`
+/// flag that gates CORS + static-first behavior.
+const ResolvedDispatch = struct {
+    handler_inst: *const tenant_mod.Instance,
+    scope_inst: *const tenant_mod.Instance,
+    is_admin: bool,
+};
+
+const ResolveResult = union(enum) {
+    handled,
+    dispatch: ResolvedDispatch,
+};
+
+/// Decide what to do with a single request pre-handler. Three shapes
+/// fall out of the call:
+///
+///  1. Admin subdomain (`{id}.{admin_api_domain}` or the bare domain)
+///     — run OPTIONS preflight, public static fallthrough, pre-auth
+///     routes (`/v1/login`, `/v1/logout`, `/v1/signup`, `/v1/auth`),
+///     auth gate, post-auth `/v1/session`, then scope resolution.
+///     Either finalizes (any of the above) or returns the admin
+///     tenant as `handler_inst` and the scoped tenant as `scope_inst`.
+///
+///  2. Customer subdomain — lookup via `resolveDomain`. Finalizes on
+///     unknown host or returns the tenant as both handler and scope.
+///
+///  3. Fall-through handler dispatch — the caller runs the same
+///     per-handler code for both shapes, branched on `is_admin` for
+///     CORS + static-first decisions.
+fn resolveRequest(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+    host: []const u8,
+    rh: h2.ReqHeaders,
+    rb: h2.ReqBody,
+) !ResolveResult {
+    const admin_scope_opt: ?[]const u8 =
+        if (worker.admin_api_domain) |pat| matchAdminSubdomain(host, pat) else null;
+
+    if (admin_scope_opt == null) {
+        const r = worker.tenant.resolveDomain(host) catch |err| {
+            std.log.warn("rove-js: tenant.resolveDomain({s}) failed: {s}", .{ host, @errorName(err) });
+            try setSimpleResponse(server, ent, sid, sess, 500, "tenant resolution failed\n", allocator);
+            return .handled;
+        };
+        if (r == null) {
+            try setSimpleResponse(server, ent, sid, sess, 404, "unknown domain\n", allocator);
+            return .handled;
+        }
+        return .{ .dispatch = .{
+            .handler_inst = r.?,
+            .scope_inst = r.?,
+            .is_admin = false,
+        } };
+    }
+
+    // ── Admin-subdomain branch ────────────────────────────────────
+    //
+    // CORS preflight + static bundle + /v1/* pre-auth + auth + scope.
+
+    // Preflight: browser sends OPTIONS before the real admin API
+    // call. 204 with CORS preflight headers; never touch auth.
+    if (std.mem.eql(u8, method, "OPTIONS")) {
+        if (worker.admin_origin) |o| {
+            const req_origin = findHeader(rh, "origin") orelse "";
+            if (req_origin.len == 0 or !std.mem.eql(u8, req_origin, o)) {
+                try setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
+            } else {
+                const hdrs = try buildSystemRespHeaders(allocator, o, true, null);
+                try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
+                try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
+                try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
+                try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+                try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+                try server.reg.set(ent, &server.request_out, h2.Session, sess);
+                try server.reg.move(ent, &server.request_out, &server.response_in);
+            }
+        } else {
+            try setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
+        }
+        return .handled;
+    }
+
+    const admin_cors = worker.admin_origin;
+
+    // Strip query before path matching — login/logout/session are
+    // simple static paths.
+    const qmark = std.mem.indexOfScalar(u8, path, '?');
+    const path_no_q = if (qmark) |q| path[0..q] else path;
+
+    // Public static bundle: the admin UI's HTML/JS/CSS must reach
+    // the browser before auth so the login page can render. Serves
+    // GET requests with no query string. POSTs and /v1/* take the
+    // auth gate below.
+    const has_query = std.mem.indexOfScalar(u8, path, '?') != null;
+    if (std.mem.eql(u8, method, "GET") and !has_query) {
+        const admin_inst = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+        if (admin_inst) |ai| {
+            const admin_tc = getOrOpenTenantFiles(worker, ai) catch null;
+            if (admin_tc) |tc| {
+                const outcome = try tryServeStatic(server, allocator, ent, sid, sess, tc, path, rh);
+                if (outcome != .miss) return .handled;
+            }
+        }
+    }
+
+    // Pre-auth native endpoints.
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/login")) {
+        try handleAdminLogin(server, allocator, ent, sid, sess, worker, rb);
+        return .handled;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/logout")) {
+        try handleAdminLogout(server, allocator, ent, sid, sess, worker, rh);
+        return .handled;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/signup")) {
+        try handleAdminSignup(server, allocator, ent, sid, sess, worker, rh, rb);
+        return .handled;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path_no_q, "/v1/auth")) {
+        try handleAdminAuth(server, allocator, ent, sid, sess, worker, rh, path);
+        return .handled;
+    }
+
+    // Normal admin auth: try session cookie first, then bearer.
+    const ctx_opt = extractAdminAuth(worker.tenant, rh) catch |err| blk: {
+        std.log.warn("rove-js: admin auth resolution failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    if (ctx_opt == null or !ctx_opt.?.is_root) {
+        try setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, admin_cors, null);
+        return .handled;
+    }
+
+    // Post-auth whoami.
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path_no_q, "/v1/session")) {
+        try handleAdminSession(server, allocator, ent, sid, sess, worker, ctx_opt.?);
+        return .handled;
+    }
+
+    const admin_opt = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+    if (admin_opt == null) {
+        try setSystemResponse(server, ent, sid, sess, 503, "admin tenant not provisioned\n", allocator, admin_cors, null);
+        return .handled;
+    }
+    const handler_inst = admin_opt.?;
+
+    // Scope resolution: subdomain wins when present (bearer-driven
+    // path). On the bare admin host, the dashboard JS scopes via
+    // `X-Rove-Scope: <id>` because a SameSite=Lax cookie on
+    // `app.loop46.me` can't flow to `{id}.app.loop46.me` without
+    // PSL coverage.
+    const subdomain_scope = admin_scope_opt.?;
+    const header_scope = findHeader(rh, "x-rove-scope") orelse "";
+    const effective_scope: []const u8 = if (subdomain_scope.len > 0)
+        subdomain_scope
+    else
+        header_scope;
+
+    const scope_inst: *const tenant_mod.Instance = if (effective_scope.len == 0)
+        handler_inst
+    else blk: {
+        const s_opt = worker.tenant.getInstance(effective_scope) catch |err| inner: {
+            std.log.warn("rove-js: admin getInstance({s}) failed: {s}", .{ effective_scope, @errorName(err) });
+            break :inner null;
+        };
+        if (s_opt == null) {
+            try setSystemResponse(server, ent, sid, sess, 404, "unknown instance\n", allocator, admin_cors, null);
+            return .handled;
+        }
+        break :blk s_opt.?;
+    };
+
+    return .{ .dispatch = .{
+        .handler_inst = handler_inst,
+        .scope_inst = scope_inst,
+        .is_admin = true,
+    } };
+}
+
 pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     const server = worker.h2;
     const allocator = worker.allocator;
@@ -1257,26 +1695,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // Successful handlers awaiting the shared commit + final move.
     // Owns `console_owned` / `exception_owned` until they transfer
     // into a log record after commit.
-    const SuccessRec = struct {
-        ent: rove.Entity,
-        sid: h2.StreamId,
-        sess: h2.Session,
-        status_code: u16,
-        body_ptr: ?[*]u8,
-        body_len: u32,
-        console_owned: []u8,
-        exception_owned: []u8,
-        method: []const u8,
-        path: []const u8,
-        host: []const u8,
-        deployment_id: u64,
-        received_ns: i64,
-        tape_refs: log_mod.TapeRefs,
-        /// Pre-minted id, reused on commit-time log capture so the log
-        /// record shares its id with any outbox rows `webhook.send`
-        /// wrote during this request's handler.
-        request_id: u64,
-    };
     var successes: std.ArrayList(SuccessRec) = .empty;
     defer {
         for (successes.items) |*s| {
@@ -1303,289 +1721,23 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const body: []const u8 = if (rb.data) |p| p[0..rb.len] else "";
 
         // `/_system/*` — CORS gate, then auth + proxy routing.
-        if (std.mem.startsWith(u8, path, "/_system/")) {
-            // Every /_system/* response carries CORS headers when the
-            // worker has an admin origin configured. Browsers enforce
-            // the origin match on their side against
-            // `Access-Control-Allow-Origin`, so stamping headers even
-            // on requests without an Origin is harmless and keeps the
-            // response path simple.
-            const cors_origin = worker.admin_origin;
-
-            // Preflight: browser sends OPTIONS before the real request
-            // to discover allowed methods/headers. Answer 204 with the
-            // preflight-specific CORS headers and never touch auth —
-            // preflights don't carry the bearer token.
-            if (std.mem.eql(u8, method, "OPTIONS")) {
-                if (cors_origin) |o| {
-                    const req_origin = findHeader(rh, "origin") orelse "";
-                    if (req_origin.len == 0 or !std.mem.eql(u8, req_origin, o)) {
-                        try setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
-                    } else {
-                        const hdrs = try buildSystemRespHeaders(allocator, o, true, null);
-                        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
-                        try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
-                        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
-                        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-                        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-                        try server.reg.set(ent, &server.request_out, h2.Session, sess);
-                        try server.reg.move(ent, &server.request_out, &server.response_in);
-                    }
-                } else {
-                    try setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
-                }
-                processed += 1;
-                continue;
-            }
-
-            // Same auth shape as the admin branch: cookie first, then
-            // Authorization: Bearer. Lets the dashboard JS call
-            // /_system/files/* and /_system/log/* without juggling a
-            // bearer header.
-            const auth_ctx = extractAdminAuth(worker.tenant, rh) catch |err| {
-                std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
-                try setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
-                processed += 1;
-                continue;
-            };
-            if (auth_ctx == null) {
-                try setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, cors_origin, null);
-                processed += 1;
-                continue;
-            }
-
-            // Strip `?query=string` off the path before routing. The
-            // remaining `/_system/*` subsystems (log, code proxies)
-            // forward the whole `:path` downstream; query parsing
-            // happens in the subsystem thread, not here.
-            const qmark = std.mem.indexOfScalar(u8, path, '?');
-            const path_no_q = if (qmark) |q| path[0..q] else path;
-
-            const sys_rest = path_no_q["/_system/".len..];
-            const sub_slash = std.mem.indexOfScalar(u8, sys_rest, '/') orelse {
-                try setSystemResponse(server, ent, sid, sess, 404, "malformed system path\n", allocator, cors_origin, null);
-                processed += 1;
-                continue;
-            };
-            const subsystem = sys_rest[0..sub_slash];
-            const after_sub = sys_rest[sub_slash + 1 ..];
-
-            // `/_system/tenant/*` and `/_system/kv/*` used to be
-            // Zig-native endpoints. They moved to the `__admin__` JS
-            // handler (see memory/project_admin_ui_plan.md). Callers
-            // should now target `{id}.api.loop46.com/kv` etc.
-            //
-            // `/_system/log/*` and `/_system/files/*` remain native:
-            //   - log queries poll frequently for live-tail and would
-            //     meta-log themselves through the JS handler.
-            //   - code uploads are byte-heavy and fit the existing
-            //     subsystem thread better.
-
-            const inst_slash = std.mem.indexOfScalar(u8, after_sub, '/');
-            const sys_instance_id = if (inst_slash) |s| after_sub[0..s] else after_sub;
-            if (sys_instance_id.len == 0) {
-                try setSystemResponse(server, ent, sid, sess, 404, "missing instance id\n", allocator, cors_origin, null);
-                processed += 1;
-                continue;
-            }
-            const allowed = worker.tenant.canAccessInstance(auth_ctx.?, sys_instance_id) catch false;
-            if (!allowed) {
-                try setSystemResponse(server, ent, sid, sess, 403, "forbidden\n", allocator, cors_origin, null);
-                processed += 1;
-                continue;
-            }
-
-            if (std.mem.eql(u8, subsystem, "files")) {
-                if (worker.code_proxy.addr == null) {
-                    try setSystemResponse(server, ent, sid, sess, 503, "files subsystem disabled\n", allocator, cors_origin, null);
-                    processed += 1;
-                    continue;
-                }
-                try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
-                try server.reg.move(ent, &server.request_out, &worker.code_proxy.pending);
-                processed += 1;
-                continue;
-            }
-            if (std.mem.eql(u8, subsystem, "log")) {
-                if (worker.log_proxy.addr == null) {
-                    try setSystemResponse(server, ent, sid, sess, 503, "log subsystem disabled\n", allocator, cors_origin, null);
-                    processed += 1;
-                    continue;
-                }
-                try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
-                try server.reg.move(ent, &server.request_out, &worker.log_proxy.pending);
-                processed += 1;
-                continue;
-            }
-
-            try setSystemResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator, cors_origin, null);
+        if (try tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh)) {
             processed += 1;
             continue;
         }
 
         const host = hostOnly(authority);
 
-        // Resolve (handler, scope) for this request. For normal user
-        // traffic both come from `resolveDomain(host)` — handler runs
-        // against its own KV. For admin requests
-        // (`{id}.{admin_api_domain}` or the bare admin_api_domain),
-        // the `__admin__` tenant's handler runs against the target
-        // scope's KV. Admin requests require a root bearer token.
-        const admin_scope_opt: ?[]const u8 =
-            if (worker.admin_api_domain) |pat| matchAdminSubdomain(host, pat) else null;
-        const is_admin_request = admin_scope_opt != null;
-
-        var handler_inst: *const tenant_mod.Instance = undefined;
-        var scope_inst: *const tenant_mod.Instance = undefined;
-
-        if (is_admin_request) {
-            // Preflight: browser sends OPTIONS before the real admin
-            // API call. Answer 204 with CORS preflight headers; skip
-            // auth (preflights don't carry the bearer token).
-            if (std.mem.eql(u8, method, "OPTIONS")) {
-                if (worker.admin_origin) |o| {
-                    const req_origin = findHeader(rh, "origin") orelse "";
-                    if (req_origin.len == 0 or !std.mem.eql(u8, req_origin, o)) {
-                        try setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
-                    } else {
-                        const hdrs = try buildSystemRespHeaders(allocator, o, true, null);
-                        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
-                        try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
-                        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
-                        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-                        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-                        try server.reg.set(ent, &server.request_out, h2.Session, sess);
-                        try server.reg.move(ent, &server.request_out, &server.response_in);
-                    }
-                } else {
-                    try setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
-                }
+        const resolved = switch (try resolveRequest(server, allocator, worker, ent, sid, sess, method, path, host, rh, rb)) {
+            .handled => {
                 processed += 1;
                 continue;
-            }
-
-            const admin_cors = worker.admin_origin;
-
-            // Strip query before path matching — login/logout/session
-            // are simple static paths.
-            const qmark = std.mem.indexOfScalar(u8, path, '?');
-            const path_no_q = if (qmark) |q| path[0..q] else path;
-
-            // Public static bundle: the admin UI's HTML/JS/CSS must
-            // reach the browser before auth so the login page can
-            // render. Serves GET requests with no query string (bundle
-            // fetches never carry one; admin API reads use `?fn=` and
-            // must fall through to the handler). POSTs and /v1/* take
-            // the auth gate below.
-            const has_query = std.mem.indexOfScalar(u8, path, '?') != null;
-            if (std.mem.eql(u8, method, "GET") and !has_query) {
-                const admin_inst = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
-                if (admin_inst) |ai| {
-                    const admin_tc = getOrOpenTenantFiles(worker, ai) catch null;
-                    if (admin_tc) |tc| {
-                        const outcome = try tryServeStatic(server, allocator, ent, sid, sess, tc, path, rh);
-                        if (outcome != .miss) {
-                            processed += 1;
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // Pre-auth native endpoints — `/v1/login` mints a session
-            // from a body token; `/v1/logout` clears the cookie;
-            // `/v1/signup` creates an instance + magic link;
-            // `/v1/auth` redeems a magic link into a session.
-            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/login")) {
-                try handleAdminLogin(server, allocator, ent, sid, sess, worker, rb);
-                processed += 1;
-                continue;
-            }
-            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/logout")) {
-                try handleAdminLogout(server, allocator, ent, sid, sess, worker, rh);
-                processed += 1;
-                continue;
-            }
-            if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path_no_q, "/v1/signup")) {
-                try handleAdminSignup(server, allocator, ent, sid, sess, worker, rh, rb);
-                processed += 1;
-                continue;
-            }
-            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path_no_q, "/v1/auth")) {
-                try handleAdminAuth(server, allocator, ent, sid, sess, worker, rh, path);
-                processed += 1;
-                continue;
-            }
-
-            // Normal admin auth: try session cookie first, then bearer.
-            const ctx_opt = extractAdminAuth(worker.tenant, rh) catch |err| blk: {
-                std.log.warn("rove-js: admin auth resolution failed: {s}", .{@errorName(err)});
-                break :blk null;
-            };
-            if (ctx_opt == null or !ctx_opt.?.is_root) {
-                try setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, admin_cors, null);
-                processed += 1;
-                continue;
-            }
-
-            // Post-auth whoami — lets the UI detect stale sessions.
-            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path_no_q, "/v1/session")) {
-                try handleAdminSession(server, allocator, ent, sid, sess, worker, ctx_opt.?);
-                processed += 1;
-                continue;
-            }
-
-            const admin_opt = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
-            if (admin_opt == null) {
-                try setSystemResponse(server, ent, sid, sess, 503, "admin tenant not provisioned\n", allocator, admin_cors, null);
-                processed += 1;
-                continue;
-            }
-            handler_inst = admin_opt.?;
-
-            // Scope resolution: subdomain wins when present (legacy /
-            // bearer-driven path). On the bare admin host, the
-            // dashboard JS scopes via `X-Rove-Scope: <id>` because a
-            // SameSite=Lax cookie on `app.loop46.me` can't flow to
-            // `{id}.app.loop46.me` without PSL coverage.
-            const subdomain_scope = admin_scope_opt.?;
-            const header_scope = findHeader(rh, "x-rove-scope") orelse "";
-            const effective_scope: []const u8 = if (subdomain_scope.len > 0)
-                subdomain_scope
-            else
-                header_scope;
-
-            if (effective_scope.len == 0) {
-                // Bare admin host, no scope header: scope is the admin
-                // tenant itself (kv.* operates on the root store).
-                scope_inst = handler_inst;
-            } else {
-                const s_opt = worker.tenant.getInstance(effective_scope) catch |err| blk: {
-                    std.log.warn("rove-js: admin getInstance({s}) failed: {s}", .{ effective_scope, @errorName(err) });
-                    break :blk null;
-                };
-                if (s_opt == null) {
-                    try setSystemResponse(server, ent, sid, sess, 404, "unknown instance\n", allocator, admin_cors, null);
-                    processed += 1;
-                    continue;
-                }
-                scope_inst = s_opt.?;
-            }
-        } else {
-            const r = worker.tenant.resolveDomain(host) catch |err| {
-                std.log.warn("rove-js: tenant.resolveDomain({s}) failed: {s}", .{ host, @errorName(err) });
-                try setSimpleResponse(server, ent, sid, sess, 500, "tenant resolution failed\n", allocator);
-                processed += 1;
-                continue;
-            };
-            if (r == null) {
-                try setSimpleResponse(server, ent, sid, sess, 404, "unknown domain\n", allocator);
-                processed += 1;
-                continue;
-            }
-            handler_inst = r.?;
-            scope_inst = r.?;
-        }
+            },
+            .dispatch => |d| d,
+        };
+        const handler_inst = resolved.handler_inst;
+        const scope_inst = resolved.scope_inst;
+        const is_admin_request = resolved.is_admin;
 
         // Lazy-open: instances created at runtime aren't in the map yet.
         const tc = getOrOpenTenantFiles(worker, handler_inst) catch |err| {
@@ -1900,85 +2052,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // End of walk. If no anchor was opened we're done — all processing
     // was short-circuit (failed) paths.
     if (anchor == null) return processed;
-
-    const anchor_id = anchor.?.id;
-    const store = anchor.?.kv;
-    const batch_seq = txn.?.txn_seq;
-    const has_writes = writeset.ops.items.len > 0;
-
-    // Commit the shared batch txn. A commit failure means SQLite has
-    // already rolled back everything — downgrade every success to 503.
-    txn.?.commit() catch |err| {
-        std.log.warn("rove-js txn commit (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
-        for (successes.items) |*s| {
-            overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch {};
-            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
-            const console_owned = s.console_owned;
-            const exception_owned = s.exception_owned;
-            s.console_owned = &.{};
-            s.exception_owned = &.{};
-            captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .kv_error, console_owned, exception_owned, s.tape_refs);
-            processed += 1;
-        }
-        successes.clearRetainingCapacity();
-        return processed;
-    };
-
-    if (!has_writes) {
-        // Pure read-only batch: no raft hop.
-        for (successes.items) |*s| {
-            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
-            const console_owned = s.console_owned;
-            const exception_owned = s.exception_owned;
-            s.console_owned = &.{};
-            s.exception_owned = &.{};
-            captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
-            processed += 1;
-        }
-        successes.clearRetainingCapacity();
-        return processed;
-    }
-
-    // Writes present: propose the merged writeset once for the whole
-    // batch. On propose failure, compensating-rollback via undoTxn and
-    // downgrade every success to 503.
-    const seq = proposeWriteSet(worker, &writeset, anchor_id) catch |err| {
-        std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
-        store.undoTxn(batch_seq) catch |undo_err| {
-            std.log.err("rove-js undoTxn failed after propose error: {s}", .{@errorName(undo_err)});
-        };
-        for (successes.items) |*s| {
-            overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch {};
-            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
-            const console_owned = s.console_owned;
-            const exception_owned = s.exception_owned;
-            s.console_owned = &.{};
-            s.exception_owned = &.{};
-            captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .fault, console_owned, exception_owned, s.tape_refs);
-            processed += 1;
-        }
-        successes.clearRetainingCapacity();
-        return processed;
-    };
-
-    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
-    for (successes.items) |*s| {
-        try server.reg.set(s.ent, &server.request_out, RaftWait, .{
-            .seq = seq,
-            .txn_seq = batch_seq,
-            .deadline_ns = deadline_ns,
-            .store = store,
-        });
-        try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
-
-        const console_owned = s.console_owned;
-        const exception_owned = s.exception_owned;
-        s.console_owned = &.{};
-        s.exception_owned = &.{};
-        captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
-        processed += 1;
-    }
-    successes.clearRetainingCapacity();
+    processed += try finalizeBatch(worker, anchor.?, &txn.?, &writeset, &successes);
     return processed;
 }
 
