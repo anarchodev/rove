@@ -1,8 +1,10 @@
 # Loop46 product plan
 
-> **Status**: canonical plan as of 2026-04-17. Supersedes any earlier admin-UI-only roadmap.
+> **Status**: canonical plan as of 2026-04-21. Supersedes any earlier admin-UI-only roadmap.
 >
 > **Purpose of this document**: capture the locked architecture decisions, the rationale behind them (including options considered and rejected), and the phased build plan. Future work sessions should read this end-to-end before making decisions that could contradict it.
+>
+> **Navigation**: §1–§8 are the original plan (2026-04-17). §9 onward was appended on 2026-04-21 and captures what's shipped, what we considered, audit findings against rove-library principles, and pre-release surprises customers may hit.
 
 ## 1. What Loop46 is
 
@@ -130,18 +132,23 @@ Extension → MIME table (browser-standard). Override via upload `Content-Type` 
 
 #### Handler signature
 
-Default export is the modern path. shift-js's named exports + `?fn=` stays as a power-user knob.
+Default export is the modern path; it's called with **no arguments** — handler reads from the ambient `request` global and writes to `response`. Named exports + `?fn=` stays as a power-user knob for RPC-shaped APIs.
 
 ```javascript
 // _code/index.mjs
-export default function (req) {
+export default function () {
   const items = JSON.parse(kv.get("items") || "[]");
-  return new Response(
-    `<ul>${items.map(i => `<li>${i.name}</li>`).join("")}</ul>`,
-    { headers: { "content-type": "text/html" } }
-  );
+  response.headers = { "content-type": "text/html" };
+  return `<ul>${items.map(i => `<li>${i.name}</li>`).join("")}</ul>`;
 }
 ```
+
+**Body comes from the return value**, not from `response.body`:
+- `string` → emitted as-is, no auto-content-type
+- `undefined` / `null` → empty body
+- anything else → `JSON.stringify(value)` with `content-type: application/json` auto-stamped (handler can override via `response.headers["content-type"]`)
+
+**No `new Response(...)` / `Headers` / `fetch` / `URL`.** The aspirational fetch-API shape was dropped 2026-04-21 — a return-value + `response.*` globals shape is shorter, avoids a class hierarchy we'd have to maintain, and keeps replay determinism obvious (the return value is the captured body). Customers reach for `response.status = 404`, `response.headers = {...}`, `response.cookies.push("foo=bar; HttpOnly")`.
 
 **No built-in EJS / Sucrase / TypeScript transforms.** Customers who want templating write template literals or `import` a library. Rationale: shift-js had built-in `.ejs` + `.ts` transforms; on a platform-not-framework, these become version-management liabilities and lock customers out of other choices. Keeping the platform small is more defensible than shipping a specific framework's idioms.
 
@@ -574,12 +581,12 @@ These are explicitly not in v1 so future sessions don't accidentally design arou
 
 ## 5. Items to confirm before their phase
 
-- **Phase 3 (webhooks)**: SMTP provider choice (SES / Postmark / Resend). Affects integration surface, pricing, bounce handling.
-- **Phase 3 (webhooks)**: confirm 256KB default response-body capture. User indicated "maybe lower than 1MB"; 256KB is the current proposal.
+Resolved items moved to §10. Open items:
+
 - **Phase 9 (encryption)**: commit to SQLCipher vs vendored VFS. Audit implications differ.
 - **Phase 10 (custom domains)**: ACME rate-limit strategy for a signup surge.
-- **Phase 2 (file API)**: confirm `rove-js` supports `new Response(uint8Array, {...})` bodies. Small surface addition if not.
 - **Phase 5 (admin UI hosting)**: Cloudflare Pages vs rove-hosted dogfood for the admin UI static bundle in production. Dogfood is more honest; Cloudflare is lower risk for launch.
+- **Blob backend for multi-node** (new, §10 detail): shared filesystem mount vs `S3BlobStore` + SigV4 signer. Single-node launch doesn't need either; multi-node launch needs one.
 
 ## 6. Relevant existing code
 
@@ -621,3 +628,220 @@ The uniqueness isn't any single feature — it's the coherence of the set:
 - **Magic-link signup → live API in under a minute.**
 
 Nobody is offering this combination. The marketing headline is the functional core + replay; the developer hook is the one-minute demo. The rest of the plan is making both of those true.
+
+## 9. Implementation status (2026-04-21)
+
+A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almost entirely and restructured a few architectural decisions (flagged in §10). Current status against the §3 phase list:
+
+### Phase 1 — Domain infrastructure
+- Wildcard DNS, Let's Encrypt, `rove-lego-renew.sh`, Cloudflare Full/Strict — **operator work, gated on domain registration**
+- `sanitizeSetCookie` + 9 inline tests — **done**
+- Wildcard tenant resolution — **done** (`--public-suffix` CLI flag → `tenant.resolveDomain`)
+- PSL submission — deferred to Phase 10 as planned
+
+### Phase 2 — File API + static serving — **done**
+- `_static/<path>` prefix, kind+content-type in manifest
+- Static-first dispatch with fallback order (see §2.4)
+- ETag + 304
+- Single-file `PUT /v1/instances/{id}/file/{path}` (upload-and-deploy)
+- Content-addressed two-phase deploy: `POST /blobs/check`, `PUT /blobs/{hash}`, `POST /deployments` with `parent_id` CAS — **done, FS backend**
+- Admin JS client helpers for the two-phase flow (`api.bulkDeploy`) — **done**
+- NOT yet: draft-with-CAS workflow, `POST /lint`, deploy history/diff UI, deploy-size caps, retention/GC. Deferred into Phase 5 finish.
+
+### Phase 3 — Webhooks + email — **done**
+- `_outbox/*`, `_outbox_inflight/*`, `_dlq/*`, lease-based drainer
+- SSRF blocklist + HTTP client + exponential backoff with full jitter
+- `webhook.send` JS global with deterministic outbox ids (`sha256(request_id || call_index)`)
+- `email.send` JS wrapper (key as explicit arg — vendor-neutral; see §10)
+- `crypto.hmacSha256(key, data)` primitive — customers roll vendor-specific signatures themselves
+- `X-Rove-Webhook-Id` + `X-Rove-Webhook-Attempt` headers stamped; the planned `X-Rove-Signature` was dropped per §10
+- Callback dispatch phase (`dispatchCallbacks`) invokes `onResult` handlers in their own tx
+- Inflight lease + stale-lease sweep covers drainer crash recovery
+- End-to-end smoke in `scripts/webhook_smoke.sh` against a Python echo target
+
+### Phase 4 — Signup + auth — **done**
+- `mintMagic` / `redeemMagic` primitive (15-min TTL, single-use, hashed-at-rest)
+- `POST /v1/signup`: validates name (reserved list + uniqueness) + email, creates instance via `tenant.createInstance`, mints magic, queues signup email via outbox
+- `GET /v1/auth?mt=...`: redeems, creates session, 302 to `/#/{name}` with HttpOnly+Secure+SameSite=Lax cookie
+- `POST /v1/login` (direct-token) + `POST /v1/logout` — cookie auth
+- Starter content (`index.mjs` + `_static/index.html`) deploys during signup through the files writeset
+- Smoke in `scripts/signup_smoke.sh` covers every branch including CAS, replay rejection, Resend-key vs dev-fallback paths
+
+### Phase 5 — Minimal admin UI — **partial**
+- Pages: login, dashboard home, instance detail with Code + KV tabs — **done**
+- Cookie-based auth, `X-Rove-Scope` header for cross-tenant admin access — **done**
+- Two-phase deploy client helpers (`api.bulkDeploy`) — **done**
+- NOT yet: Logs tab, Deploys tab with history + diff, CodeMirror 6 upgrade, draft workflow, signup form on the login page
+
+### Phases 6–10 — **not started**
+
+### Blob replication (multi-node prerequisite)
+- Raft envelopes now include `type=3` files_writeset replicating `{id}/files.db` across nodes — **done**
+- Blob bytes (`{id}/file-blobs/*`) **still local to the leader**. Multi-node setups need one of:
+  - Shared filesystem mount at `{data_dir}` (NFS/EFS/Ceph) — zero code, operator work
+  - Future `S3BlobStore` impl in `rove-blob` — not yet written
+- Single-node launch is unaffected; multi-node launch is gated on picking one.
+
+## 10. Architecture decisions post-2026-04-17
+
+Six architectural calls were made between 2026-04-17 and 2026-04-21. Captured here so future sessions don't re-derive them.
+
+### 10.1 Admin is a real instance with a `platform` capability
+
+**Change**: dropped the `__admin__.kv` aliases-to-root hack. The admin tenant now has its own `{data_dir}/__admin__/app.db` like every other tenant. `Instance.platform: ?*Tenant` points back at the `Tenant` on the singleton admin instance only; the JS dispatcher installs `platform.root.*` globals gated on that field.
+
+**Why**: the aliasing made admin-tenant outbox rows unreachable to the drainer (which scans per-tenant `app.db` files, never the root store) and leaked root-store key shapes into admin-handler JS code. Making admin "an instance like any other, plus a capability" solves both — drainer sees admin-fired email queues naturally, and platform-level operations become a well-typed JS surface instead of raw `__root__/…` key writes.
+
+**Side effects**:
+- Sessions, magic-link rows, resend key, admin-fired outbox rows all moved from root.db to `__admin__/app.db`.
+- `__root__/` key prefixes dropped — root.db holds only identity+routing tables (`instance/`, `domain/`, `root_token/`).
+- `Tenant.create` / `.destroy` replaced `init` / `deinit` (heap-allocated; the `platform` interior pointer requires stable address — rove-library principle 14).
+- Admin JS handler rewritten to use `platform.root.*` for root-kv reads/writes.
+
+### 10.2 Root replication via raft envelope type 2
+
+Envelopes now have four types:
+
+| Type | Target store | Producer |
+|---|---|---|
+| `0` writeset | `{id}/app.db` | Customer handler `kv.*` via TrackedTxn + writeset |
+| `1` log_batch | `{id}/log.db` | Worker `flushLogs` |
+| `2` root_writeset | `__root__.db` | Signup's `tenant.createInstance`; admin JS `platform.root.*` |
+| `3` files_writeset | `{id}/files.db` | Signup's `deployStarterContent`; files-server `putFileAndDeploy` |
+
+Type-2 writes come from two producers: the signup HTTP handler (mirrors `tenant.createInstance`'s local write into a root writeset) and the admin JS handler's `platform.root.set/delete` calls (collected into a per-request root writeset, proposed after commit). **Divergence on propose failure is logged, not compensated** — at-least-once semantics consistent with the outbox/callback layers. A future iteration wraps root writes in a TrackedTxn with undo semantics.
+
+### 10.3 Two-phase deploy protocol on FS backend
+
+Implemented PLAN §2.4's three-leg content-addressed protocol:
+
+- `POST /v1/instances/{id}/blobs/check` → `{missing, uploads}` with upload URLs + method + TTL
+- `PUT /v1/instances/{id}/blobs/{hash}` → server hashes on arrival, rejects mismatch
+- `POST /v1/instances/{id}/deployments` → full-replacement manifest commit, optional `parent_id` CAS
+
+The `uploads` object's URL is path-relative on the FS backend (client resolves against whichever origin it reached); when a future `S3BlobStore` lands it will return absolute pre-signed S3 URLs, client follows them verbatim. **Same client code, different backends.** Admin UI JS exposes `api.bulkDeploy(instance_id, files, {parent_id, comment})` that hashes client-side with `crypto.subtle.digest("SHA-256")`, checks, uploads missing in parallel, commits.
+
+### 10.4 `webhook.send` stays vendor-neutral; `email.send` takes key as parameter
+
+**Dropped from PLAN §2.6**: the planned `X-Rove-Signature` HMAC header with per-instance webhook secret. Each destination has its own signing format (Stripe `Stripe-Signature: t=...,v1=...`, Slack `X-Slack-Signature` with a different scheme, AWS SigV4, etc.); a one-size-fits-all HMAC is meaningless to every real destination.
+
+**What ships instead**:
+- `crypto.hmacSha256(key, data) → hex` JS global — primitive for customers to roll their own signing
+- `X-Rove-Webhook-Id` + `X-Rove-Webhook-Attempt` headers (vendor-neutral; receivers use the id for dedup)
+- `email.send({key, from, to, subject, text?, html?, …})` takes the Resend key as an explicit argument. Customer's abuse-control concern: they can only email using a Resend key they provide. Our own magic-link email reads the platform Resend key from `__admin__/app.db` and queues an outbox row; customer handlers never see that key.
+
+### 10.5 Replication-ready blob backend (path B: shared object store)
+
+Ruled out: "raft carries blob bytes." A 1MB static file per envelope would blow raft-log size and commit-fsync budget. Two options remain for multi-node:
+
+- **Shared filesystem mount** (NFS/EFS/Ceph) at `{data_dir}` on every node. Zero code — existing `FilesystemBlobStore` treats the mount like any other directory. Ops tradeoff: depends on reliable distributed FS.
+- **`S3BlobStore` + SigV4 signer** (~500-800 LOC, uses `std.http.Client`). Targets S3 the *protocol* — works against AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces, MinIO, etc. Credentials via env vars; no IAM metadata fetch in v1 (SSRF carve-out deferred).
+
+OVH setup notes (if that's the target host): use OVH Object Storage "Standard" tier (S3-compatible), pick region matching compute (EU: GRA/SBG; NA: BHS), endpoint `https://s3.{region}.io.cloud.ovh.net`, path-style URLs.
+
+Caching shape for followers: `CachedBlobStore` wrapper composing local-FS in front of S3. Content-addressed → no staleness. Not yet built.
+
+### 10.6 dispatchOnce refactored into phase-shaped helpers
+
+The 750-line `dispatchOnce` loop body was split into named helpers:
+- `tryHandleSystem` — `/_system/*` proxy routing + preflight
+- `resolveRequest` — admin/customer branch → either `.handled` or `.dispatch{handler_inst, scope_inst, is_admin}`
+- `finalizeBatch` — end-of-walk commit + propose + move
+
+`dispatchOnce` ended at 388 lines, reading as phase selection. The per-handler dispatch body (anchor → savepoint → run → release → success-record) stays inline — it's linear, context-heavy, and extracting it would threaten more parameters than readability gained.
+
+## 11. Rove-library principles audit (2026-04-21)
+
+Audited against `~/.claude/memory/rove-library.md`. Findings:
+
+### Fixed
+- **Admin-kv aliasing** (violated principle 1 "state is collection membership" — admin was a special case). Admin is now an instance with a capability component; see §10.1.
+- **`dispatchOnce` monolith** (violated principle 5 "small systems with flush boundaries"). Split into phases; see §10.6.
+- **Interior pointers on stack-allocated struct** (violated principle 14). `Tenant` now heap-allocates via `create`/`destroy`.
+- **Silent error swallowing on kv-undo** (violated fail-fast). Now logs `std.log.err` on undoTxn failure.
+
+### Outstanding (known bugs)
+These are not launch-blockers for single-node but should be tracked:
+
+- **Handler exceptions → 200 empty body**. `src/js/worker.zig` checks `dispatcher.last_kv_error` and savepoint release errors but not `resp.exception.len > 0`. Every customer handler that throws returns a 200 with whatever partial body was stamped (usually empty). Should be 500 with exception message in log + body. Fix is ~10 lines in the per-handler dispatch block.
+- **`tl.store.applyBatch(batch) catch {}`** in `src/js/worker.zig:~1016` silently drops log records on flush failure. Should at least `std.log.warn`.
+- **`setResponse(... 500 ...) catch {}`** in `src/files_server/thread.zig:~193` silently swallows errors on the already-failed-response path. Should propagate so the connection closes cleanly.
+
+### Outstanding (nice-to-fix)
+- **Header builder duplication**: `buildSystemRespHeaders`, `buildHandlerRespHeaders`, `buildAuthRespHeaders`, `buildRedirectRespHeaders` all pack pair-lists into one contiguous buffer. ~80 lines of boilerplate collapses to one builder taking a pair slice.
+- **Dev-mode escape hatches as `pub var`**: `ssrf.dev_allow_loopback` + `http_client.dev_allow_plaintext` are module-level mutable globals. Works but is ugly; should be plumbed as `DrainerConfig` fields.
+- **`handleAdminSignup` 170 lines** doing six things; could split into validate → provision → build-magic → maybe-queue-email → respond. Low-value cleanup.
+
+## 12. Pre-release surprises (customer-visible gotchas)
+
+What customers writing handlers against rove may not expect. Flag any that should get first-run documentation or UI affordances before we open signup.
+
+### Handler API shape
+
+- **Default export is called with NO arguments.** Read `request.method` / `request.path` / `request.body` / `request.query` from the ambient `request` global. The common "handler takes `req, res`" reflex doesn't apply.
+- **Return value = response body.** No `response.body = "..."`. String returns emit as-is; objects are `JSON.stringify`-ed with `content-type: application/json` auto-stamped.
+- **Handler exceptions silently return 200 empty body.** Pre-existing bug (§11). Until fixed, customers debugging should watch `console.log` output in request logs rather than HTTP status.
+- **10ms CPU budget** covers handler + every trigger fired + every cascade those triggers caused, *in aggregate*. Not a per-handler or per-trigger cap. Runaway `while(true)` trips the budget and returns 504.
+
+### Available / missing globals
+
+Shipped:
+- `kv.get/set/delete/prefix`
+- `webhook.send`, `email.send`
+- `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.hmacSha256(key, data) → hex`
+- `console.log`
+- `Date.now`, `Math.random` (seeded/deterministic; captured for tape replay)
+- `TextEncoder` / `TextDecoder` (UTF-8 only polyfill)
+- `platform.root.{get,set,delete,prefix}` (admin handler only; undefined elsewhere)
+- Standard intrinsics: `JSON`, `Date`, `RegExp`, `Map`/`Set`, `Promise`, `BigInt`, typed arrays
+
+Not available:
+- `fetch`, `setTimeout`, `setInterval`, `XMLHttpRequest` — use `webhook.send` for outbound
+- `URL`, `URLSearchParams` — parse `request.query` by hand (`split("&")` + percent-decode), or ship a polyfill later
+- `Response`, `Headers` — fetch-API class hierarchy intentionally dropped (§10 removed the aspirational `new Response(...)` shape)
+- `atob`, `btoa` — base64 helpers not there yet; if customers need them, add a polyfill
+- `console.error` / `console.warn` / `console.info` — only `console.log`
+- `WeakRef`, `Proxy`, `DOMException` — explicitly skipped in the snapshot init to save per-request memcpy bandwidth
+
+### File layout conventions
+
+- Handler source lives at top-level paths (`index.mjs`, `foo/index.mjs`, `api/users.mjs`) — PLAN §2.4 names a `_code/` prefix but the current implementation doesn't use it; this is a plan-vs-reality gap to resolve before v1.
+- `_static/<path>` is the only system-reserved prefix for raw bytes
+- `MAX_PATH_LEN = 192`; file-size caps of 1MB static / 64KB handler (plan; not yet enforced)
+- Bulk deploy is **full-replacement** — client sends the entire manifest. Single-file save endpoint exists for the "edit one file" UX; bulk deploy replaces everything not in the request.
+
+### Webhook / email semantics
+
+- **At-least-once delivery.** Receivers must dedup on `X-Rove-Webhook-Id`.
+- **No ordering guarantees.** Chain via callbacks if ordering matters.
+- **`webhook.send` is vendor-neutral** (§10.4). No default signing header; use `crypto.hmacSha256` to build vendor-specific signatures in the handler before `webhook.send`.
+- **`email.send` takes `key` as an explicit argument.** Customer's abuse-control concern; keep the Resend key in KV and pass it at call site.
+- **Response body captured at 256KB max.** Anything larger is truncated with `truncated: true` on the callback event.
+- **Dev-only flag `--dev-webhook-unsafe`** relaxes SSRF + HTTPS-only for local smokes. NEVER set in production — a malicious customer handler could probe localhost and leak bodies over plaintext.
+
+### Auth / signup
+
+- **Magic link TTL 15 min, single-use.** A redeemed link 401s on replay.
+- **Session cookie is `HttpOnly + Secure + SameSite=Lax`.** `Secure` requires HTTPS; localhost is treated as a secure context by modern browsers, but plain-HTTP non-localhost dev won't get the cookie. Use `curl -H 'Cookie: rove_session=...'` manually for HTTP-only dev.
+- **Signup without Resend key configured** → response body carries `magic_link` in-band so dev + CI smoke tests still work. When a key IS configured, `magic_link` is suppressed and the email is queued via outbox.
+- **Reserved instance names** rejected with 409: `admin`, `api`, `app`, `www`, `__admin__`, `auth`, `login`, `signup`, `logout`, `dashboard`, `static`, `system`, `public`, `root`, `mail`. Collisions on real signups also return 409 with the same body (no enumeration).
+
+### Admin scope + platform capability
+
+- `platform.*` JS globals exist only on the `__admin__` handler. Other tenants' handlers see `platform === undefined` and get a `TypeError` if they try to call `platform.root.*`.
+- **`X-Rove-Scope: <instance_id>` header** rebinds the admin handler's `kv` to the target tenant's `app.db`. Without it, `kv.*` on the admin handler operates on admin's own `app.db` (NOT root — that's the §10.1 change).
+- **Admin JS writes to `platform.root.*` are replicated via type-2 root writeset**, but they land locally on the leader first and propose-on-commit. A propose failure leaves leader/follower divergence (logged, not compensated).
+
+### Multi-node setup
+
+- Customer KV writes, request logs, root metadata, and files.db manifests all replicate via raft. **Blob bytes do not.**
+- Running more than one node requires either a shared filesystem mount at `{data_dir}` (NFS/EFS/Ceph) or a future `S3BlobStore` backend.
+- On leader failover, the new leader has full manifests but may 503 on any blob not yet cached locally until either (a) the shared backend serves them or (b) the leader pushes them to S3.
+
+### Operational
+
+- `--bootstrap-root-token <hex>` seeds the operator bearer token at startup. Token can be any 32–128 printable ASCII chars; hex is convention not requirement.
+- `--bootstrap-resend-key <key>` seeds the platform Resend key into `__admin__/app.db`.
+- `--public-suffix <domain>` enables wildcard `{id}.<domain>` → instance routing. Without it, every host needs an explicit `assignDomain` entry.
+- `--admin-api-domain <domain>` routes that host's traffic through the `__admin__` handler with auth. Separate from `--public-suffix`.
+- `--dev-webhook-unsafe` enables loopback + plaintext webhook targets for local smoke tests.
