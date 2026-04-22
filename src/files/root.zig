@@ -96,6 +96,20 @@ pub const FileStore = struct {
     blob: BlobStore,
     compile: CompileFn,
     compile_ctx: ?*anyopaque,
+    /// Optional raft-replication target. When non-null, every kv
+    /// put/delete this FileStore performs is mirrored into the
+    /// writeset so the caller can propose it through raft — the
+    /// follower applies the same ops against its own copy of
+    /// `{instance}/files.db`. Blob bytes are NOT replicated this
+    /// way (they'd blow the raft entry size for large static
+    /// assets); multi-node deployments rely on a shared BlobStore
+    /// backend (path B — shared filesystem or S3).
+    ///
+    /// Null for: bootstrap deploys (each node runs the same
+    /// deterministic sequence independently) and tests. Non-null
+    /// for: signup's `deployStarterContent`, the files-server's
+    /// single-file PUT + bulk deploy endpoints.
+    replicate: ?*kv.WriteSet = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -111,6 +125,30 @@ pub const FileStore = struct {
             .compile = compile,
             .compile_ctx = compile_ctx,
         };
+    }
+
+    /// Attach a writeset that mirrors every kv put/delete for the
+    /// remaining lifetime of this FileStore. Callers that need raft
+    /// replication construct the writeset, call this, drive their
+    /// deploy, and then propose the writeset. Pass null to detach.
+    pub fn setReplicate(self: *FileStore, ws: ?*kv.WriteSet) void {
+        self.replicate = ws;
+    }
+
+    /// Internal put that tees through to the replicate writeset when
+    /// one is attached. Every FileStore put/delete must go through
+    /// these helpers (not self.kv directly) for follower correctness.
+    fn kvPut(self: *FileStore, key: []const u8, value: []const u8) Error!void {
+        self.kv.put(key, value) catch return Error.Kv;
+        if (self.replicate) |ws| ws.addPut(key, value) catch return Error.OutOfMemory;
+    }
+
+    fn kvDelete(self: *FileStore, key: []const u8) Error!void {
+        self.kv.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return Error.Kv,
+        };
+        if (self.replicate) |ws| ws.addDelete(key) catch return Error.OutOfMemory;
     }
 
     // ── Source upload ─────────────────────────────────────────────────
@@ -175,7 +213,7 @@ pub const FileStore = struct {
 
         var val_buf: [2 + MAX_CT_LEN + HASH_HEX_LEN]u8 = undefined;
         const val = encodeFileValue(&val_buf, kind, content_type, src_hex);
-        self.kv.put(file_key, val) catch return Error.Kv;
+        try self.kvPut(file_key, val);
     }
 
     fn ensureBytecode(
@@ -214,7 +252,7 @@ pub const FileStore = struct {
 
         hashHex(bytecode, out_bc_hex);
         self.blob.put(out_bc_hex, bytecode) catch return Error.Blob;
-        self.kv.put(bc_key, out_bc_hex) catch return Error.Kv;
+        try self.kvPut(bc_key, out_bc_hex);
     }
 
     /// Fetch the current source blob for `path`. Returns owned bytes.
@@ -398,8 +436,8 @@ pub const FileStore = struct {
         const dep_key = std.fmt.bufPrint(&dep_key_buf, "deployment/{s}", .{id_hex}) catch
             unreachable;
 
-        self.kv.put(dep_key, bytes) catch return Error.Kv;
-        self.kv.put("deployment/current", id_hex) catch return Error.Kv;
+        try self.kvPut(dep_key, bytes);
+        try self.kvPut("deployment/current", id_hex);
         return next_id;
     }
 

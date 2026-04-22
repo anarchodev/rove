@@ -13,6 +13,11 @@
 //! `type=2` → ROOT writeset (payload is `WriteSet.encode` bytes,
 //!           target store = `{data_dir}/__root__.db`, id_len must
 //!           be 0 — the envelope carries no per-tenant id)
+//! `type=3` → per-tenant FILES writeset (payload is `WriteSet.encode`
+//!           bytes, target store = `{data_dir}/{id}/files.db`). Used
+//!           for code manifests + deployment-pointer updates.
+//!           Blob bytes are NOT in this envelope — they live in a
+//!           shared BlobStore backend (path B: shared FS or S3).
 //!
 //! The `id` is the tenant `instance_id`. `id_len` caps at 64KB. The
 //! trailing `payload` is whatever the dispatch callback for that
@@ -85,6 +90,7 @@ pub const EnvelopeType = enum(u8) {
     writeset = 0,
     log_batch = 1,
     root_writeset = 2,
+    files_writeset = 3,
 };
 
 /// Build a writeset envelope. `id_len` and `id` plus a leading type=0
@@ -116,6 +122,18 @@ pub fn encodeRootWriteSetEnvelope(
     ws_bytes: []const u8,
 ) ![]u8 {
     return encodeTyped(allocator, .root_writeset, "", ws_bytes);
+}
+
+/// Build a per-tenant files writeset envelope. type=3; target is
+/// `{data_dir}/{id}/files.db` on followers. Carries manifest +
+/// deployment-pointer updates; blob bytes ride separately through a
+/// shared BlobStore backend.
+pub fn encodeFilesWriteSetEnvelope(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    ws_bytes: []const u8,
+) ![]u8 {
+    return encodeTyped(allocator, .files_writeset, id, ws_bytes);
 }
 
 fn encodeTyped(
@@ -185,6 +203,9 @@ pub const ApplyCtx = struct {
     /// Lazy per-tenant log handle cache (instance_id → *RaftLogHandle).
     /// Keys are owned copies of the instance id.
     log_stores: std.StringHashMapUnmanaged(*RaftLogHandle),
+    /// Lazy per-tenant files.db cache (instance_id → *KvStore). Parallel
+    /// to `kv_stores` but keyed at `{data_dir}/{id}/files.db`.
+    files_stores: std.StringHashMapUnmanaged(*kv.KvStore) = .empty,
     /// Lazy root-store handle for `type=2 root_writeset` applies.
     /// Opens `{data_dir}/__root__.db` on first follower-side root
     /// apply. Null on the leader path (leader-skip fires before we'd
@@ -224,6 +245,13 @@ pub const ApplyCtx = struct {
         }
         self.log_stores.deinit(self.allocator);
 
+        var files_it = self.files_stores.iterator();
+        while (files_it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            e.value_ptr.*.close();
+        }
+        self.files_stores.deinit(self.allocator);
+
         if (self.root_store) |s| s.close();
     }
 
@@ -242,6 +270,43 @@ pub const ApplyCtx = struct {
         defer self.allocator.free(path);
         const store = try kv.KvStore.open(self.allocator, path);
         self.root_store = store;
+        return store;
+    }
+
+    /// Lazily open this tenant's files.db. Used by follower-side
+    /// apply of `type=3 files_writeset` entries. Creates the tenant
+    /// directory if it doesn't exist yet (signup-on-leader → apply-
+    /// on-follower often reaches the follower before any other
+    /// traffic has touched that tenant).
+    fn getFilesKv(self: *ApplyCtx, instance_id: []const u8) !*kv.KvStore {
+        if (self.files_stores.get(instance_id)) |existing| return existing;
+
+        const inst_dir = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ self.data_dir, instance_id },
+        );
+        defer self.allocator.free(inst_dir);
+        std.fs.cwd().makePath(inst_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const path = try std.fmt.allocPrintSentinel(
+            self.allocator,
+            "{s}/files.db",
+            .{inst_dir},
+            0,
+        );
+        defer self.allocator.free(path);
+
+        const store = try kv.KvStore.open(self.allocator, path);
+        errdefer store.close();
+
+        const id_copy = try self.allocator.dupe(u8, instance_id);
+        errdefer self.allocator.free(id_copy);
+
+        try self.files_stores.put(self.allocator, id_copy, store);
         return store;
     }
 
@@ -339,6 +404,7 @@ pub fn applyOne(
         .writeset => applyWriteSet(ctx, env),
         .log_batch => applyLogBatch(ctx, env),
         .root_writeset => applyRootWriteSet(ctx, env),
+        .files_writeset => applyFilesWriteSet(ctx, env),
     }
 }
 
@@ -359,6 +425,30 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope) void {
     kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| {
         std.log.warn(
             "rove-js apply: writeset failed for {s}: {s}",
+            .{ env.instance_id, @errorName(err) },
+        );
+    };
+}
+
+/// Follower-only: decode the per-tenant files writeset and apply
+/// it to this node's copy of `{data_dir}/{id}/files.db`. Mirrors
+/// the per-tenant app.db path — leader-skip, then replay against
+/// the follower's files.db. Blob bytes referenced by these ops
+/// must be resolvable through the shared BlobStore backend.
+fn applyFilesWriteSet(ctx: *ApplyCtx, env: Envelope) void {
+    if (ctx.raft.isLeader()) return;
+
+    const store = ctx.getFilesKv(env.instance_id) catch |err| {
+        std.log.warn(
+            "rove-js apply: getFilesKv({s}) failed: {s}",
+            .{ env.instance_id, @errorName(err) },
+        );
+        return;
+    };
+
+    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| {
+        std.log.warn(
+            "rove-js apply: files writeset failed for {s}: {s}",
             .{ env.instance_id, @errorName(err) },
         );
     };
@@ -437,6 +527,18 @@ test "root writeset envelope encode/decode round trip" {
     const dec = try decodeEnvelope(enc);
     try testing.expectEqual(EnvelopeType.root_writeset, dec.type);
     try testing.expectEqualStrings("", dec.instance_id);
+    try testing.expectEqualStrings(ws, dec.payload);
+}
+
+test "files writeset envelope encode/decode round trip" {
+    const id = "acme";
+    const ws = "files ws bytes";
+    const enc = try encodeFilesWriteSetEnvelope(testing.allocator, id, ws);
+    defer testing.allocator.free(enc);
+
+    const dec = try decodeEnvelope(enc);
+    try testing.expectEqual(EnvelopeType.files_writeset, dec.type);
+    try testing.expectEqualStrings(id, dec.instance_id);
     try testing.expectEqualStrings(ws, dec.payload);
 }
 

@@ -77,6 +77,26 @@ Each JS request gets a fresh QuickJS context. Snapshot/restore (memcpy of a pre-
 
 Local KV writes commit immediately (releasing the lock fast), then a parallel Raft propose handles replication. On fault/timeout, a compensating rollback via undo log fires.
 
+### What replicates through raft
+
+Envelopes are typed byte blobs (`src/js/apply.zig`):
+
+| Type | Target store | Producer |
+|---|---|---|
+| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset |
+| `1` log_batch | `{data_dir}/{id}/log.db` | Worker `flushLogs` |
+| `2` root_writeset | `{data_dir}/__root__.db` | Signup's `tenant.createInstance`; admin JS `platform.root.*` |
+| `3` files_writeset | `{data_dir}/{id}/files.db` | Signup's `deployStarterContent`; files-server `putFileAndDeploy` |
+
+### Blob replication (multi-node)
+
+Blob bytes (source, bytecode, static assets) live in `{data_dir}/{id}/file-blobs/` and are **not** carried through raft envelopes — a 1MB static blob per envelope would blow the raft log size/latency budget. Single-node: `FilesystemBlobStore` works as-is. **Multi-node requires a shared `BlobStore` backend** — all nodes read the same content-addressed store. Two options:
+
+1. **Shared filesystem mount** (NFS, EFS, Ceph) at `{data_dir}` on every node. Zero new code — `FilesystemBlobStore` treats the mount point like any other directory.
+2. **S3 / object store** — a future `S3BlobStore` impl in `rove-blob` (not yet written). Cleaner ops story, more setup.
+
+Raft replicates the manifest (the `file/{path}` key → `{hash, kind, content_type}` pointer); the shared backend serves the bytes referenced by those hashes. Followers apply the manifest ops; readers fetch the blob bytes from whichever backend `rove-blob` is configured with.
+
 ### Vendored C code
 
 See `vendor/README.md` for upstream revisions, patches, and maintenance procedures:

@@ -1002,25 +1002,7 @@ pub fn main() !void {
         try prewarmTenantDbs(allocator, cli.data_dir);
     }
 
-    // ── Subsystem threads (shared across workers) ──────────────────────
-    //
-    // Spawn BEFORE the workers so the workers can open client
-    // connections to them during startup. Each owns its own rove
-    // context (registry + io_uring + h2 server) and binds to a
-    // loopback TCP ephemeral port.
-    // Sized from the worker count: each worker holds one persistent
-    // h2 client to each subsystem, plus a small slack so a reconnect
-    // during churn doesn't collide with the old connection still in
-    // the fd table.
     const subsystem_max_connections: u32 = @as(u32, num_workers) + 4;
-
-    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, subsystem_max_connections);
-    defer cs_handle.shutdown();
-    const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
-
-    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir, subsystem_max_connections);
-    defer ls_handle.shutdown();
-    const log_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ls_handle.port);
 
     // ── Raft setup ─────────────────────────────────────────────────────
     //
@@ -1066,6 +1048,21 @@ pub fn main() !void {
 
     var raft_thread = try std.Thread.spawn(.{}, raftThreadMain, .{raft_node});
     raft_thread.detach();
+
+    // ── Subsystem threads (shared across workers) ──────────────────────
+    //
+    // Spawn BEFORE the workers so the workers can open client
+    // connections to them during startup. Spawn AFTER raft so the
+    // files-server can propose files.db writesets through it. Each
+    // subsystem owns its own rove context (registry + io_uring +
+    // h2 server) and binds to a loopback TCP ephemeral port.
+    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, subsystem_max_connections, raft_node);
+    defer cs_handle.shutdown();
+    const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
+
+    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir, subsystem_max_connections);
+    defer ls_handle.shutdown();
+    const log_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ls_handle.port);
 
     // ── Outbox drainer ──
     //

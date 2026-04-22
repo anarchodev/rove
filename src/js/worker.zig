@@ -2410,6 +2410,32 @@ pub fn proposeWriteSet(
     return seq;
 }
 
+/// Propose a per-tenant files writeset (envelope type=3) through
+/// raft. Followers apply the encoded ops to their copy of
+/// `{data_dir}/{id}/files.db` so manifests + deployment pointers
+/// stay in sync. Used by `deployStarterContent` and the files-
+/// server's upload + deploy endpoints. Blob bytes are NOT carried
+/// in the envelope — multi-node setups need a shared BlobStore
+/// backend.
+pub fn proposeFilesWriteSet(
+    worker: anytype,
+    writeset: *const kv_mod.WriteSet,
+    instance_id: []const u8,
+) !u64 {
+    const allocator = worker.allocator;
+    if (writeset.ops.items.len == 0) return 0;
+
+    const ws_bytes = try writeset.encode(allocator);
+    defer allocator.free(ws_bytes);
+
+    const envelope = try apply_mod.encodeFilesWriteSetEnvelope(allocator, instance_id, ws_bytes);
+    defer allocator.free(envelope);
+
+    const seq = worker.raft.highWatermark() + 1;
+    try worker.raft.propose(seq, envelope);
+    return seq;
+}
+
 /// Propose a root writeset (envelope type=2) through raft. Followers
 /// apply the encoded ops to their own `__root__.db` in
 /// `applyRootWriteSet`. Used by signup (instance marker + domain
@@ -3509,15 +3535,27 @@ fn handleAdminSignup(
     // Deploy starter content so the new tenant's `{id}.loop46.me`
     // answers 200 immediately instead of 503 "no deployment". Skipped
     // when no compile callback is wired (library default) — the
-    // customer can push their own code via the files API.
+    // customer can push their own code via the files API. Manifest
+    // writes are collected into a files_ws + proposed through raft
+    // so followers see the same deployment. Blob bytes land only
+    // on the leader's local disk here; multi-node correctness
+    // requires a shared BlobStore backend.
     if (worker.compile_fn) |compile_fn| {
         const inst_opt = worker.tenant.getInstance(name) catch null;
         if (inst_opt) |inst| {
-            deployStarterContent(allocator, inst.dir, compile_fn, worker.compile_ctx) catch |err| {
+            var files_ws = kv_mod.WriteSet.init(allocator);
+            defer files_ws.deinit();
+            deployStarterContent(allocator, inst.dir, compile_fn, worker.compile_ctx, &files_ws) catch |err| {
                 // Don't fail the signup — the customer still gets a
                 // usable account, they just see 503 until they push
                 // code. Log loudly so operators can investigate.
                 std.log.warn("rove-js: signup starter deploy({s}) failed: {s}", .{ name, @errorName(err) });
+            };
+            _ = proposeFilesWriteSet(worker, &files_ws, name) catch |err| {
+                std.log.warn(
+                    "rove-js: signup starter files propose({s}) failed: {s} (leader deployed, followers may diverge)",
+                    .{ name, @errorName(err) },
+                );
             };
         }
     }
@@ -3671,11 +3709,22 @@ const STARTER_STATIC_INDEX_HTML =
 /// out — the main worker and files-server lazy-open their own
 /// connections later, so we're not holding onto any state that would
 /// conflict.
+/// Deploy the embedded starter bundle into a freshly-created
+/// instance. Writes source + static blobs to the instance's
+/// file-blobs/, stamps manifest entries in files.db, and
+/// commits a deployment row pointing at them.
+///
+/// When `replicate` is non-null, every files.db write is mirrored
+/// into the writeset so the caller can propose it through raft
+/// (see `proposeFilesWriteSet`). Blob bytes are written to disk
+/// locally on the leader and are expected to live in a shared
+/// BlobStore backend for multi-node visibility.
 fn deployStarterContent(
     allocator: std.mem.Allocator,
     inst_dir: []const u8,
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
+    replicate: ?*kv_mod.WriteSet,
 ) !void {
     const files_db_path = try std.fmt.allocPrintSentinel(
         allocator,
@@ -3705,6 +3754,7 @@ fn deployStarterContent(
         compile_fn,
         compile_ctx,
     );
+    store.setReplicate(replicate);
 
     try store.putSource("index.mjs", STARTER_INDEX_MJS);
     try store.putStatic("_static/index.html", STARTER_STATIC_INDEX_HTML, "text/html; charset=utf-8");

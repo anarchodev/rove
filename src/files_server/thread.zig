@@ -40,9 +40,34 @@ const std = @import("std");
 const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
+const kv = @import("rove-kv");
 
 const files_server = @import("root.zig");
 const files_mod = @import("rove-files");
+
+/// Raft envelope type byte matching `rove-js/apply.zig`
+/// `EnvelopeType.files_writeset = 3`. Duplicated here (tiny,
+/// stable wire-format constant) to avoid a files-server → rove-js
+/// import cycle — rove-js already depends on rove-files-server for
+/// its `/_system/files/*` proxy. Keep the two in sync; the apply
+/// side is the authority.
+const ENVELOPE_TYPE_FILES_WRITESET: u8 = 3;
+const ENVELOPE_MAX_ID_LEN: usize = 256;
+
+fn encodeFilesWriteSetEnvelope(
+    allocator: std.mem.Allocator,
+    instance_id: []const u8,
+    ws_bytes: []const u8,
+) ![]u8 {
+    if (instance_id.len > ENVELOPE_MAX_ID_LEN) return error.OutOfMemory;
+    const total = 1 + 2 + instance_id.len + ws_bytes.len;
+    const out = try allocator.alloc(u8, total);
+    out[0] = ENVELOPE_TYPE_FILES_WRITESET;
+    std.mem.writeInt(u16, out[1..3], @intCast(instance_id.len), .big);
+    @memcpy(out[3 .. 3 + instance_id.len], instance_id);
+    @memcpy(out[3 + instance_id.len ..], ws_bytes);
+    return out;
+}
 
 const CodeH2 = h2.H2(.{});
 
@@ -55,6 +80,10 @@ pub const Handle = struct {
     /// Absolute path to `{data_dir}`. Borrowed from the caller — must
     /// outlive the handle.
     data_dir: []const u8,
+    /// Raft node to propose files.db writesets through. When null,
+    /// writes apply locally only — fine for single-node dev smoke
+    /// tests, broken for multi-node correctness. Borrowed.
+    raft: ?*kv.RaftNode,
     /// Max concurrent inbound h2c connections this server accepts.
     /// Sized from the worker count at spawn time — each worker holds
     /// one persistent client, so the cap must be `>= num_workers` or
@@ -86,6 +115,7 @@ pub fn spawn(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
     max_connections: u32,
+    raft: ?*kv.RaftNode,
 ) !*Handle {
     const h = try allocator.create(Handle);
     errdefer allocator.destroy(h);
@@ -99,6 +129,7 @@ pub fn spawn(
         .stop = .{ .raw = false },
         .ready = .{},
         .bind_err = null,
+        .raft = raft,
     };
 
     h.thread = try std.Thread.spawn(.{}, threadMain, .{h});
@@ -159,7 +190,7 @@ fn runThread(h: *Handle) !void {
 
     while (!h.stop.load(.acquire)) {
         try server.pollWithTimeout(100 * std.time.ns_per_ms);
-        try processRequests(server, allocator, h.data_dir);
+        try processRequests(server, allocator, h.data_dir, h.raft);
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
@@ -180,6 +211,7 @@ fn processRequests(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    raft: ?*kv.RaftNode,
 ) !void {
     const entities = server.request_out.entitySlice();
     const sids = server.request_out.column(h2.StreamId);
@@ -188,7 +220,7 @@ fn processRequests(
     const req_bodies = server.request_out.column(h2.ReqBody);
 
     for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
-        handleOne(server, allocator, data_dir, ent, sid, sess, rh, rb) catch |err| {
+        handleOne(server, allocator, data_dir, raft, ent, sid, sess, rh, rb) catch |err| {
             std.log.warn("files-server: handler error: {s}", .{@errorName(err)});
             setResponse(server, ent, sid, sess, 500, null, "internal error\n") catch {};
         };
@@ -199,6 +231,7 @@ fn handleOne(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    raft: ?*kv.RaftNode,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -258,7 +291,7 @@ fn handleOne(
         try handleGetFile(server, allocator, data_dir, ent, sid, sess, instance_id, file_path);
     } else if (std.mem.startsWith(u8, remainder, "file/") and std.mem.eql(u8, method, "PUT")) {
         const file_path = remainder["file/".len..];
-        try handlePutFile(server, allocator, data_dir, ent, sid, sess, instance_id, file_path, content_type, rb);
+        try handlePutFile(server, allocator, data_dir, raft, ent, sid, sess, instance_id, file_path, content_type, rb);
     } else {
         try setResponse(server, ent, sid, sess, 404, null, "not found\n");
     }
@@ -440,6 +473,7 @@ fn handlePutFile(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    raft: ?*kv.RaftNode,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -454,6 +488,9 @@ fn handlePutFile(
     }
     const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
 
+    var files_ws = kv.WriteSet.init(allocator);
+    defer files_ws.deinit();
+
     const dep_id = files_server.putFileAndDeploy(
         allocator,
         data_dir,
@@ -461,6 +498,7 @@ fn handlePutFile(
         file_path,
         body,
         content_type,
+        &files_ws,
     ) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.InvalidPath => 400,
@@ -476,6 +514,29 @@ fn handlePutFile(
         try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
+
+    // Replicate the files.db writes to followers so their copy of
+    // `{id}/files.db` lines up with this deployment. Blob bytes live
+    // in the shared BlobStore backend; only the manifest rows need
+    // the raft hop. On propose failure the leader's files.db still
+    // has the deployment locally — at-least-once semantics match
+    // the outbox + root paths.
+    if (raft) |r| {
+        if (files_ws.ops.items.len > 0) {
+            const ws_bytes = try files_ws.encode(allocator);
+            defer allocator.free(ws_bytes);
+            const envelope = try encodeFilesWriteSetEnvelope(allocator, instance_id, ws_bytes);
+            defer allocator.free(envelope);
+            const seq = r.highWatermark() + 1;
+            r.propose(seq, envelope) catch |err| {
+                std.log.warn(
+                    "rove-files-server: propose files writeset for {s} failed: {s} (leader has the deploy, followers may diverge)",
+                    .{ instance_id, @errorName(err) },
+                );
+            };
+        }
+    }
+
     const body_out = try std.fmt.allocPrint(allocator, "{d}\n", .{dep_id});
     try setResponse(server, ent, sid, sess, 201, body_out.ptr, body_out);
 }

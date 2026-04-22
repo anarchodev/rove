@@ -356,7 +356,9 @@ pub fn main() !void {
     // ── Subsystem threads (shared across workers) ──────────────────────
     // This example spawns exactly 2 workers below; 8 cap leaves room
     // for reconnect churn and any manual pokes from the outside.
-    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, 8);
+    // Benchmark spike runs single-node; leader-local files.db
+    // writes are fine. Passing null skips the raft propose path.
+    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, 8, null);
     defer cs_handle.shutdown();
     const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
 

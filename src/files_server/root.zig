@@ -244,6 +244,11 @@ pub fn putFileAndDeploy(
     path: []const u8,
     body: []const u8,
     content_type: []const u8,
+    /// When non-null, every files.db write this call performs is
+    /// mirrored into the writeset so the caller can propose it
+    /// through raft. Null = single-node / test mode, leader-local
+    /// writes only.
+    replicate: ?*kv_mod.WriteSet,
 ) Error!u64 {
     // If the file already exists, preserve its kind so the Code tab
     // can save edits to a handler that wasn't created under `_code/`
@@ -272,12 +277,14 @@ pub fn putFileAndDeploy(
         var h: InstanceCtx = undefined;
         try h.init(allocator, data_dir, instance_id, InlineCompiler.compile, &compiler);
         defer h.deinit();
+        h.store.setReplicate(replicate);
         h.store.putSource(path, body) catch |err| return mapCodeError(err);
         return h.store.deploy() catch |err| mapCodeError(err);
     } else {
         var h: InstanceCtx = undefined;
         try h.init(allocator, data_dir, instance_id, stubCompile, null);
         defer h.deinit();
+        h.store.setReplicate(replicate);
         h.store.putStatic(path, body, content_type) catch |err| return mapCodeError(err);
         return h.store.deploy() catch |err| mapCodeError(err);
     }
