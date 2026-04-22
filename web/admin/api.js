@@ -103,6 +103,30 @@ function encodePath(path) {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
+/// SHA-256(bytes) → 64-char lowercase hex string. Used by the
+/// two-phase deploy to address each file by its content hash before
+/// asking the server which blobs it already has.
+///
+/// `bytes` can be a Uint8Array, ArrayBuffer, or a string (encoded
+/// UTF-8 via TextEncoder). Returns a Promise.
+export async function hashBytes(bytes) {
+  let buffer;
+  if (typeof bytes === "string") {
+    buffer = new TextEncoder().encode(bytes);
+  } else if (bytes instanceof ArrayBuffer) {
+    buffer = bytes;
+  } else if (bytes && bytes.buffer instanceof ArrayBuffer) {
+    buffer = bytes;
+  } else {
+    throw new TypeError("hashBytes: expected Uint8Array, ArrayBuffer, or string");
+  }
+  const digest = await crypto.subtle.digest("SHA-256", buffer);
+  const view = new Uint8Array(digest);
+  let out = "";
+  for (const b of view) out += b.toString(16).padStart(2, "0");
+  return out;
+}
+
 export const api = {
   // ── Auth ─────────────────────────────────────────────────────────
   login(token) {
@@ -187,6 +211,119 @@ export const api = {
       throw new ApiError(res.status, res.statusText, txt);
     }
     return res.text();
+  },
+
+  // ── Two-phase deploy: check → upload blobs → commit manifest ─────
+  //
+  // The protocol mirrors PLAN §2.4 and swaps in cleanly for presigned
+  // S3 uploads later: the client always follows whatever URL the
+  // server hands back in `/blobs/check`, so an FS backend returns
+  // our-own-server URLs and a future S3 backend returns presigned
+  // S3 URLs — same client flow. Hash files client-side with
+  // SHA-256 (`hashBytes` below); 64 lowercase hex chars.
+
+  async checkBlobs(instance_id, hashes) {
+    const url = adminBase()
+      + `/_system/files/${encodeURIComponent(instance_id)}/blobs/check`;
+    const res = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hashes }),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new ApiError(res.status, res.statusText, txt);
+    }
+    return res.json(); // { missing: [...], uploads: {hash: {url, method, expires_in}} }
+  },
+
+  /// Upload one blob. `uploadInfo` comes from `checkBlobs`' `uploads`
+  /// object (or is manufactured for the single-blob case). We pass
+  /// credentials + let the browser follow the URL verbatim, so the
+  /// same code path works against our FS backend (URL points at our
+  /// own server) and a future S3 backend (URL is presigned S3).
+  async uploadBlob(uploadInfo, bytes) {
+    // For FS-backend upload-URLs we resolve against the admin base;
+    // for absolute URLs (future S3 presign) the fetch takes them
+    // as-is.
+    const url = uploadInfo.url.startsWith("http")
+      ? uploadInfo.url
+      : adminBase() + uploadInfo.url;
+    const headers = { ...(uploadInfo.headers || {}) };
+    // FS-backend accepts any content-type; S3 presigns demand the
+    // signed one. Only set if the server told us to.
+    const init = {
+      method: uploadInfo.method || "PUT",
+      headers,
+      body: bytes,
+    };
+    // Only include credentials for our own origin — presigned S3
+    // URLs must not carry the session cookie.
+    if (!uploadInfo.url.startsWith("http")) init.credentials = "include";
+    const res = await fetch(url, init);
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new ApiError(res.status, res.statusText, txt);
+    }
+  },
+
+  async deployManifest(instance_id, files, { parent_id = null, comment = null } = {}) {
+    const body = { files };
+    if (parent_id !== null) body.parent_id = parent_id;
+    if (comment !== null) body.comment = comment;
+    const res = await fetch(
+      adminBase() + `/_system/files/${encodeURIComponent(instance_id)}/deployments`,
+      {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new ApiError(res.status, res.statusText, txt);
+    }
+    return res.json(); // { id, parent_id }
+  },
+
+  /// High-level helper: takes a map `{path: {bytes, kind, content_type?}}`,
+  /// hashes each, uploads missing blobs in parallel, and commits the
+  /// manifest. Returns the deploy result `{id, parent_id}`.
+  ///
+  /// `bytes` must be a Uint8Array or ArrayBuffer. `kind` is
+  /// "handler" or "static". Pass `parent_id` (hex string) to CAS
+  /// against `deployment/current`; omit to skip the check.
+  async bulkDeploy(instance_id, files, { parent_id = null, comment = null } = {}) {
+    // Hash each file client-side. crypto.subtle.digest is async but
+    // runs in parallel if we Promise.all them.
+    const entries = await Promise.all(Object.entries(files).map(async ([path, f]) => {
+      const hash = await hashBytes(f.bytes);
+      return { path, hash, bytes: f.bytes, kind: f.kind, content_type: f.content_type };
+    }));
+
+    const hashes = entries.map((e) => e.hash);
+    const check = await this.checkBlobs(instance_id, hashes);
+
+    // Upload missing blobs in parallel (the browser caps per-host
+    // concurrency automatically; no need to throttle by hand).
+    const byHash = new Map(entries.map((e) => [e.hash, e]));
+    await Promise.all(
+      check.missing.map((hash) => {
+        const info = check.uploads[hash];
+        const entry = byHash.get(hash);
+        return this.uploadBlob(info, entry.bytes);
+      })
+    );
+
+    // Commit the manifest.
+    const manifest = {};
+    for (const e of entries) {
+      manifest[e.path] = { hash: e.hash, kind: e.kind };
+      if (e.content_type) manifest[e.path].content_type = e.content_type;
+    }
+    return this.deployManifest(instance_id, manifest, { parent_id, comment });
   },
 
   // ── Out-of-band: logs (native Zig proxy) ────────────────────────
