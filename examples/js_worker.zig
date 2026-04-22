@@ -908,6 +908,11 @@ pub fn main() !void {
             std.debug.print("bootstrap: root token installed\n", .{});
         }
 
+        // __admin__ is created first so session / magic / resend-key
+        // operations (which live in its app.db) have a place to land
+        // before any other bootstrap step runs. See `src/tenant/root.zig`.
+        try tenant.createInstance("__admin__");
+
         if (cli.bootstrap_resend_key) |k| {
             tenant.installResendKey(k) catch |err| {
                 std.debug.print("bootstrap: installResendKey failed: {s}\n", .{@errorName(err)});
@@ -916,10 +921,6 @@ pub fn main() !void {
             std.debug.print("bootstrap: resend key installed (platform default)\n", .{});
         }
 
-        // __admin__ is created first so session / magic operations
-        // (which live in its app.db) have a place to land before any
-        // other bootstrap step runs. See `src/tenant/root.zig`.
-        try tenant.createInstance("__admin__");
         try tenant.createInstance("acme");
         try tenant.createInstance("globex");
         try tenant.createInstance("penalty");

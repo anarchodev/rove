@@ -662,11 +662,13 @@ pub const Tenant = struct {
 
     // ── Platform secrets: Resend API key ──────────────────────────────
     //
-    // Platform-owned config, stored in root.db under the well-known
-    // key `resend_key`. Installed once at bootstrap by
-    // `--bootstrap-resend-key`; rotated by re-running the worker with
-    // a new value on that flag. The signup flow reads it via
-    // `getResendKey` when building a magic-link email outbox row.
+    // Admin-surface config, stored in the admin tenant's app.db
+    // under the well-known key `resend_key`. Installed once at
+    // bootstrap by `--bootstrap-resend-key`; rotated by re-running
+    // the worker with a new value on that flag. The signup flow
+    // reads it via `getResendKey` when building a magic-link email
+    // outbox row. Lives in admin/app.db (not root.db) to keep
+    // root.db minimal — it holds only identity + routing tables.
 
     pub const RESEND_KEY_MIN_LEN: usize = 8;
     pub const RESEND_KEY_MAX_LEN: usize = 256;
@@ -678,14 +680,17 @@ pub const Tenant = struct {
         for (key) |b| {
             if (b < 0x21 or b > 0x7e) return Error.InvalidToken;
         }
-        self.root.put("resend_key", key) catch return Error.Kv;
+        const kv = try self.adminKv();
+        kv.put("resend_key", key) catch return Error.Kv;
     }
 
     /// Returns the stored Resend key or null if none installed. The
-    /// bytes are allocated by the root `KvStore`'s allocator; free
-    /// with the same allocator the tenant was constructed with.
+    /// bytes are allocated by the admin tenant's `KvStore`'s
+    /// allocator; free with the same allocator the tenant was
+    /// constructed with.
     pub fn getResendKey(self: *Tenant) Error!?[]u8 {
-        const v = self.root.get("resend_key") catch |err| switch (err) {
+        const kv = try self.adminKv();
+        const v = kv.get("resend_key") catch |err| switch (err) {
             error.NotFound => return null,
             else => return Error.Kv,
         };
