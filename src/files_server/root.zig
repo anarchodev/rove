@@ -191,6 +191,105 @@ const InlineCompiler = struct {
     }
 };
 
+/// Hex string length for a SHA-256 digest. Callers of `putBlobByHash`
+/// and `checkBlobs` must present claimed hashes as exactly this many
+/// lowercase hex characters.
+pub const HASH_HEX_LEN: usize = files_mod.HASH_HEX_LEN;
+
+/// Returned by `checkBlobs`. For each input hash we report whether
+/// the store already has it; `missing` is the subset the caller still
+/// needs to upload. Owned by `allocator` passed in; free via `deinit`.
+pub const CheckResult = struct {
+    missing: [][]u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *CheckResult) void {
+        for (self.missing) |h| self.allocator.free(h);
+        self.allocator.free(self.missing);
+        self.* = undefined;
+    }
+};
+
+/// First leg of the content-addressed deploy protocol: given a list
+/// of claimed hashes, tell the client which ones the blob store
+/// doesn't have yet so it knows what to upload. Empty `missing` means
+/// the client can skip straight to committing the manifest.
+///
+/// No files.db writes, so no raft propagation needed.
+pub fn checkBlobs(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    instance_id: []const u8,
+    hashes: []const []const u8,
+) Error!CheckResult {
+    var h: InstanceCtx = undefined;
+    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    defer h.deinit();
+
+    var list: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (list.items) |s| allocator.free(s);
+        list.deinit(allocator);
+    }
+
+    for (hashes) |hash| {
+        if (!isSha256Hex(hash)) return Error.InvalidManifest;
+        const present = h.blob_backend.blobStore().exists(hash) catch return Error.Blob;
+        if (present) continue;
+        const copy = allocator.dupe(u8, hash) catch return Error.OutOfMemory;
+        errdefer allocator.free(copy);
+        list.append(allocator, copy) catch return Error.OutOfMemory;
+    }
+
+    const owned = list.toOwnedSlice(allocator) catch return Error.OutOfMemory;
+    return .{ .missing = owned, .allocator = allocator };
+}
+
+/// Second leg: the client PUTs raw bytes keyed by their SHA-256.
+/// We hash the incoming bytes server-side and reject mismatch. This
+/// is the trust boundary — once we've verified, the blob is
+/// content-addressed and immutable; re-uploading identical bytes is a
+/// no-op. No files.db writes; no raft hop.
+pub fn putBlobByHash(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    instance_id: []const u8,
+    claimed_hash: []const u8,
+    bytes: []const u8,
+) Error!void {
+    if (!isSha256Hex(claimed_hash)) return Error.InvalidManifest;
+
+    var actual: [HASH_HEX_LEN]u8 = undefined;
+    sha256Hex(bytes, &actual);
+    if (!std.mem.eql(u8, claimed_hash, &actual)) return Error.InvalidManifest;
+
+    var h: InstanceCtx = undefined;
+    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    defer h.deinit();
+
+    h.blob_backend.blobStore().put(claimed_hash, bytes) catch return Error.Blob;
+}
+
+/// Lowercase-hex SHA-256 of `bytes`, into a 64-char buffer.
+fn sha256Hex(bytes: []const u8, out: *[HASH_HEX_LEN]u8) void {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex_chars = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+}
+
+fn isSha256Hex(s: []const u8) bool {
+    if (s.len != HASH_HEX_LEN) return false;
+    for (s) |b| {
+        const ok = (b >= '0' and b <= '9') or (b >= 'a' and b <= 'f');
+        if (!ok) return false;
+    }
+    return true;
+}
+
 /// Upload a single source file into the tenant's working tree.
 /// Compiles the source, stores the source+bytecode blobs, updates the
 /// `file/{path}` index entry. Idempotent — re-uploading identical

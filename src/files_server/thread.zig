@@ -292,9 +292,124 @@ fn handleOne(
     } else if (std.mem.startsWith(u8, remainder, "file/") and std.mem.eql(u8, method, "PUT")) {
         const file_path = remainder["file/".len..];
         try handlePutFile(server, allocator, data_dir, raft, ent, sid, sess, instance_id, file_path, content_type, rb);
+    } else if (std.mem.eql(u8, remainder, "blobs/check") and std.mem.eql(u8, method, "POST")) {
+        try handleBlobsCheck(server, allocator, data_dir, ent, sid, sess, instance_id, rb);
+    } else if (std.mem.startsWith(u8, remainder, "blobs/") and std.mem.eql(u8, method, "PUT")) {
+        const hash = remainder["blobs/".len..];
+        try handlePutBlob(server, allocator, data_dir, ent, sid, sess, instance_id, hash, rb);
     } else {
         try setResponse(server, ent, sid, sess, 404, null, "not found\n");
     }
+}
+
+/// POST /{instance}/blobs/check — body is JSON `{"hashes":[...]}`,
+/// response is JSON `{"missing":[...], "uploads": {hash: {url,method,
+/// expires_in}}}`. `uploads.{hash}.url` points back at the
+/// `PUT /{instance}/blobs/{hash}` route on this same files-server —
+/// the client follows whatever URL we hand it, which keeps the FS
+/// backend and (eventually) the S3 backend behind the same client
+/// flow.
+///
+/// URLs are path-only; the client resolves against whichever origin
+/// it reached us on (directly or via the worker's `/_system/files/*`
+/// proxy). We never emit a host, so the admin UI and a direct-to-
+/// files-server CLI both work.
+fn handleBlobsCheck(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    instance_id: []const u8,
+    rb: h2.ReqBody,
+) !void {
+    const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
+    const BodyShape = struct { hashes: [][]const u8 };
+
+    var parsed = std.json.parseFromSlice(BodyShape, allocator, body, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        try setResponse(server, ent, sid, sess, 400, null, "bad request body\n");
+        return;
+    };
+    defer parsed.deinit();
+
+    var check = files_server.checkBlobs(
+        allocator,
+        data_dir,
+        instance_id,
+        parsed.value.hashes,
+    ) catch |err| {
+        const code: u16 = switch (err) {
+            files_server.Error.InvalidInstanceId, files_server.Error.InvalidManifest => 400,
+            else => 500,
+        };
+        const msg = try std.fmt.allocPrint(allocator, "check failed: {s}\n", .{@errorName(err)});
+        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        return;
+    };
+    defer check.deinit();
+
+    // Build response JSON. Owned allocation — `setResponse` takes
+    // ownership of the backing bytes via `body_ptr` + `body`.
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+
+    try w.writeAll("{\"missing\":[");
+    for (check.missing, 0..) |h, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeByte('"');
+        try w.writeAll(h);
+        try w.writeByte('"');
+    }
+    try w.writeAll("],\"uploads\":{");
+    // The uploads object carries a URL the client PUTs to, the
+    // method, and a TTL hint (S3-parity — locally unused but nice
+    // for the client to have a consistent contract).
+    for (check.missing, 0..) |h, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeByte('"');
+        try w.writeAll(h);
+        try w.writeAll("\":{\"url\":\"/v1/instances/");
+        try w.writeAll(instance_id);
+        try w.writeAll("/blobs/");
+        try w.writeAll(h);
+        try w.writeAll("\",\"method\":\"PUT\",\"expires_in\":300}");
+    }
+    try w.writeAll("}}");
+
+    const out = try buf.toOwnedSlice(allocator);
+    try setResponse(server, ent, sid, sess, 200, out.ptr, out);
+}
+
+/// PUT /{instance}/blobs/{hash} — body is the raw bytes. Server
+/// hashes on arrival; rejects 400 if the claimed hash doesn't
+/// match what we computed.
+fn handlePutBlob(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    instance_id: []const u8,
+    hash: []const u8,
+    rb: h2.ReqBody,
+) !void {
+    const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
+
+    files_server.putBlobByHash(allocator, data_dir, instance_id, hash, body) catch |err| {
+        const code: u16 = switch (err) {
+            files_server.Error.InvalidInstanceId, files_server.Error.InvalidManifest => 400,
+            else => 500,
+        };
+        const msg = try std.fmt.allocPrint(allocator, "putBlob failed: {s}\n", .{@errorName(err)});
+        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        return;
+    };
+    try setResponse(server, ent, sid, sess, 204, null, "");
 }
 
 fn handleUpload(

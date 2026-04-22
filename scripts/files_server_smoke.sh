@@ -105,4 +105,52 @@ code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     "http://127.0.0.1:$PORT/unknown")
 expect "GET /unknown" 404 "$code"
 
+# ── Content-addressed two-phase flow ──────────────────────────────────
+# Stage 1 of the new upload protocol: /blobs/check + PUT /blobs/{hash}.
+# Stage 2 (/deployments) lands in a follow-up commit; this smoke just
+# proves the upload half round-trips and hash verification fires on
+# mismatch.
+
+BYTES='hello blob storage'
+HASH=$(printf '%s' "$BYTES" | sha256sum | awk '{print $1}')
+
+# /blobs/check says the hash is missing + hands us an upload URL.
+check=$(curl -s --http2-prior-knowledge \
+    -X POST -H "Content-Type: application/json" \
+    --data-raw "{\"hashes\":[\"$HASH\"]}" \
+    "http://127.0.0.1:$PORT/acme/blobs/check")
+echo "$check" | grep -q "\"missing\":\[\"$HASH\"\]" \
+    || { echo "FAIL blobs/check missing: $check" >&2; exit 1; }
+echo "$check" | grep -q "\"url\":\"/v1/instances/acme/blobs/$HASH\"" \
+    || { echo "FAIL blobs/check upload url: $check" >&2; exit 1; }
+echo "ok  /blobs/check reports missing hash with upload url"
+
+# Upload with correct hash → 204, blob lands.
+code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+    -X PUT --data-raw "$BYTES" \
+    "http://127.0.0.1:$PORT/acme/blobs/$HASH")
+expect "PUT /blobs/{hash} correct bytes" 204 "$code"
+
+# /blobs/check now reports the hash as present (empty missing, empty uploads).
+check=$(curl -s --http2-prior-knowledge \
+    -X POST -H "Content-Type: application/json" \
+    --data-raw "{\"hashes\":[\"$HASH\"]}" \
+    "http://127.0.0.1:$PORT/acme/blobs/check")
+echo "$check" | grep -q "\"missing\":\[\]" \
+    || { echo "FAIL blobs/check after upload: $check" >&2; exit 1; }
+echo "ok  /blobs/check reports present hash after upload"
+
+# Upload with mismatched hash → 400. Claim the hash of different bytes.
+BAD_HASH=$(printf 'xxx' | sha256sum | awk '{print $1}')
+code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+    -X PUT --data-raw "$BYTES" \
+    "http://127.0.0.1:$PORT/acme/blobs/$BAD_HASH")
+expect "PUT /blobs/{hash} hash mismatch" 400 "$code"
+
+# Upload with invalid hash shape (not 64 hex chars) → 400.
+code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+    -X PUT --data-raw "$BYTES" \
+    "http://127.0.0.1:$PORT/acme/blobs/notahash")
+expect "PUT /blobs/{hash} malformed hash" 400 "$code"
+
 echo "PASS files-server smoke"
