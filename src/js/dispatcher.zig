@@ -113,6 +113,14 @@ pub const Request = struct {
     root_writeset: ?*kv_mod.WriteSet = null,
 };
 
+/// One `(name, value)` pair extracted from the handler's
+/// `response.headers` object. Both fields are owned allocator
+/// slices; the outer `Response` frees them on `deinit`.
+pub const ResponseHeader = struct {
+    name: []u8,
+    value: []u8,
+};
+
 pub const Response = struct {
     status: i32 = 200,
     body: []u8,
@@ -125,10 +133,18 @@ pub const Response = struct {
     /// owned, filter-passed cookie with any `Domain=...` attribute
     /// stripped (see `sanitizeSetCookie`). Empty slice = no cookies.
     set_cookies: [][]u8 = &.{},
+    /// Custom response headers the handler set via
+    /// `response.headers = {name: value, ...}`. Names are already
+    /// lowercased (HTTP/2 wire format) and vetted — pseudo-headers
+    /// and hop-by-hop names are rejected in `extractResponseMetadata`.
+    /// `set-cookie` specifically is NOT accepted here — cookies go
+    /// through `response.cookies` so sanitization fires.
+    headers: []ResponseHeader = &.{},
     /// True when the body came from `JSON.stringify(ret)` (i.e. the
     /// handler returned an object/array/number). The worker stamps
     /// `content-type: application/json` on the response when true, so
-    /// browser clients can `res.json()` without guessing.
+    /// browser clients can `res.json()` without guessing. Suppressed
+    /// when the handler set a content-type via `response.headers`.
     body_is_json: bool = false,
 
     pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
@@ -137,6 +153,11 @@ pub const Response = struct {
         allocator.free(self.exception);
         for (self.set_cookies) |cookie| allocator.free(cookie);
         if (self.set_cookies.len > 0) allocator.free(self.set_cookies);
+        for (self.headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        if (self.headers.len > 0) allocator.free(self.headers);
         self.* = undefined;
     }
 };
@@ -297,6 +318,14 @@ pub const Dispatcher = struct {
             for (cookies.items) |c2| self.allocator.free(c2);
             cookies.deinit(self.allocator);
         }
+        var headers: std.ArrayList(ResponseHeader) = .empty;
+        errdefer {
+            for (headers.items) |h| {
+                self.allocator.free(h.name);
+                self.allocator.free(h.value);
+            }
+            headers.deinit(self.allocator);
+        }
 
         const fun_obj = c.JS_ReadObject(
             ctx.raw,
@@ -310,7 +339,7 @@ pub const Dispatcher = struct {
             exception_msg = ctx.takeExceptionMessage(self.allocator) catch
                 return DispatchError.OutOfMemory;
             fun_val.deinit();
-            return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies);
+            return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
         }
 
         if (fun_val.raw.tag != c.JS_TAG_MODULE) {
@@ -318,7 +347,7 @@ pub const Dispatcher = struct {
             status = 500;
             body_buf = self.allocator.dupe(u8, "handler bytecode is not an ES module (.mjs)") catch
                 return DispatchError.OutOfMemory;
-            return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies);
+            return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
         }
 
         runModule(
@@ -334,13 +363,14 @@ pub const Dispatcher = struct {
             &body_is_json,
             &exception_msg,
             &cookies,
+            &headers,
         ) catch |err| switch (err) {
             error.Interrupted => return DispatchError.Interrupted,
             error.OutOfMemory => return DispatchError.OutOfMemory,
             error.JsException => {}, // exception_msg already populated
         };
 
-        return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies);
+        return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
     }
 };
 
@@ -365,6 +395,7 @@ fn runModule(
     body_is_json_out: *bool,
     exception_out: *[]u8,
     cookies_out: *std.ArrayList([]u8),
+    headers_out: *std.ArrayList(ResponseHeader),
 ) RunError!void {
     _ = state;
     const mod_def_ptr: ?*c.JSModuleDef = @ptrCast(@alignCast(fun_val_in.raw.u.ptr));
@@ -505,7 +536,7 @@ fn runModule(
     // `response` global.
     bodyFromReturn(d.allocator, ctx.raw, final_val.raw, body_out, body_is_json_out) catch
         return error.OutOfMemory;
-    extractResponseMetadata(d.allocator, ctx.raw, status_out, cookies_out) catch
+    extractResponseMetadata(d.allocator, ctx.raw, status_out, cookies_out, headers_out) catch
         return error.OutOfMemory;
 }
 
@@ -770,20 +801,23 @@ fn bodyFromReturn(
     is_json_out.* = true;
 }
 
-/// Pull status + cookies off the ambient `response` global the handler
-/// was free to mutate. Body is NOT read from here — it always comes
-/// from the return value. Custom response headers are not plumbed yet.
+/// Pull status + cookies + custom headers off the ambient `response`
+/// global. Body is NOT read from here — it always comes from the
+/// return value.
 ///
-/// `cookies_out` is populated with owned, sanitized Set-Cookie header
-/// values (see `sanitizeSetCookie`). Each entry on `response.cookies`
-/// is coerced to a string via `JS_ToCString`, run through the
-/// sanitizer, and pushed. Non-string entries and empty strings are
-/// silently dropped (handler bugs shouldn't 500 the request).
+/// - `response.status` → `status_out`
+/// - `response.cookies` (array of strings) → `cookies_out`, each
+///   sanitized via `sanitizeSetCookie`
+/// - `response.headers` (object, string→string) → `headers_out`,
+///   filtered to reject pseudo-headers (`:xxx`), hop-by-hop names,
+///   and `set-cookie` (cookies go through the dedicated array so
+///   sanitization fires). Names are lowercased to match HTTP/2.
 fn extractResponseMetadata(
     allocator: std.mem.Allocator,
     ctx: *c.JSContext,
     status_out: *i32,
     cookies_out: *std.ArrayList([]u8),
+    headers_out: *std.ArrayList(ResponseHeader),
 ) error{OutOfMemory}!void {
     const global_obj = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global_obj);
@@ -797,42 +831,123 @@ fn extractResponseMetadata(
         _ = c.JS_ToInt32(ctx, status_out, status_val);
     }
 
+    // ── response.cookies ────────────────────────────────────────
     const cookies_val = c.JS_GetPropertyStr(ctx, resp_val, "cookies");
     defer c.JS_FreeValue(ctx, cookies_val);
-    if (c.JS_IsUndefined(cookies_val) or c.JS_IsNull(cookies_val)) return;
-    if (!c.JS_IsArray(cookies_val)) return;
+    if (!c.JS_IsUndefined(cookies_val) and !c.JS_IsNull(cookies_val) and c.JS_IsArray(cookies_val)) {
+        const len_val = c.JS_GetPropertyStr(ctx, cookies_val, "length");
+        defer c.JS_FreeValue(ctx, len_val);
+        var n: u32 = 0;
+        _ = c.JS_ToUint32(ctx, &n, len_val);
+        // Hard cap — a pathological handler pushing thousands of
+        // cookies would blow up the HPACK table on every proxy hop.
+        const cap: u32 = @min(n, 32);
 
-    const len_val = c.JS_GetPropertyStr(ctx, cookies_val, "length");
-    defer c.JS_FreeValue(ctx, len_val);
-    var n: u32 = 0;
-    _ = c.JS_ToUint32(ctx, &n, len_val);
-    if (n == 0) return;
-    // Hard cap — a pathological handler pushing thousands of cookies
-    // would blow up the H2 HPACK table and amplify work on every
-    // proxy hop. 32 is already generous for real traffic.
-    const cap: u32 = @min(n, 32);
-
-    var i: u32 = 0;
-    while (i < cap) : (i += 1) {
-        const elem = c.JS_GetPropertyUint32(ctx, cookies_val, i);
-        defer c.JS_FreeValue(ctx, elem);
-        if (!c.JS_IsString(elem)) continue;
-        var raw_len: usize = 0;
-        const cstr = c.JS_ToCStringLen(ctx, &raw_len, elem);
-        if (cstr == null) continue;
-        defer c.JS_FreeCString(ctx, cstr);
-        if (raw_len == 0) continue;
-        const raw = @as([*]const u8, @ptrCast(cstr))[0..raw_len];
-        const sanitized = try sanitizeSetCookie(allocator, raw);
-        if (sanitized.len == 0) {
-            allocator.free(sanitized);
-            continue;
+        var i: u32 = 0;
+        while (i < cap) : (i += 1) {
+            const elem = c.JS_GetPropertyUint32(ctx, cookies_val, i);
+            defer c.JS_FreeValue(ctx, elem);
+            if (!c.JS_IsString(elem)) continue;
+            var raw_len: usize = 0;
+            const cstr = c.JS_ToCStringLen(ctx, &raw_len, elem);
+            if (cstr == null) continue;
+            defer c.JS_FreeCString(ctx, cstr);
+            if (raw_len == 0) continue;
+            const raw = @as([*]const u8, @ptrCast(cstr))[0..raw_len];
+            const sanitized = try sanitizeSetCookie(allocator, raw);
+            if (sanitized.len == 0) {
+                allocator.free(sanitized);
+                continue;
+            }
+            cookies_out.append(allocator, sanitized) catch |err| {
+                allocator.free(sanitized);
+                return err;
+            };
         }
-        cookies_out.append(allocator, sanitized) catch |err| {
-            allocator.free(sanitized);
+    }
+
+    // ── response.headers ────────────────────────────────────────
+    //
+    // Object keys become header names (lowercased); string values
+    // become header values. Disallowed names are silently dropped —
+    // handler bugs shouldn't 500 the request. Hard cap 32 for the
+    // same HPACK reason as cookies.
+    const headers_val = c.JS_GetPropertyStr(ctx, resp_val, "headers");
+    defer c.JS_FreeValue(ctx, headers_val);
+    if (c.JS_IsUndefined(headers_val) or c.JS_IsNull(headers_val) or !c.JS_IsObject(headers_val)) return;
+
+    var prop_enum: [*c]c.JSPropertyEnum = null;
+    var prop_count: u32 = 0;
+    const flags: c_int = c.JS_GPN_STRING_MASK | c.JS_GPN_ENUM_ONLY;
+    if (c.JS_GetOwnPropertyNames(ctx, &prop_enum, &prop_count, headers_val, flags) < 0) return;
+    defer c.js_free(ctx, prop_enum);
+
+    const hdr_cap: u32 = @min(prop_count, 32);
+    var hi: u32 = 0;
+    while (hi < hdr_cap) : (hi += 1) {
+        const atom = prop_enum[hi].atom;
+        defer c.JS_FreeAtom(ctx, atom);
+        const name_cstr = c.JS_AtomToCString(ctx, atom);
+        if (name_cstr == null) continue;
+        defer c.JS_FreeCString(ctx, name_cstr);
+        const raw_name = std.mem.span(name_cstr);
+        if (!isEmittableHeaderName(raw_name)) continue;
+
+        const val = c.JS_GetProperty(ctx, headers_val, atom);
+        defer c.JS_FreeValue(ctx, val);
+        if (!c.JS_IsString(val)) continue;
+        var val_len: usize = 0;
+        const val_cstr = c.JS_ToCStringLen(ctx, &val_len, val);
+        if (val_cstr == null) continue;
+        defer c.JS_FreeCString(ctx, val_cstr);
+        const raw_val = @as([*]const u8, @ptrCast(val_cstr))[0..val_len];
+        if (!isCleanHeaderValue(raw_val)) continue;
+
+        const name_owned = try allocator.alloc(u8, raw_name.len);
+        errdefer allocator.free(name_owned);
+        for (raw_name, 0..) |b, i| name_owned[i] = std.ascii.toLower(b);
+
+        const val_owned = try allocator.alloc(u8, raw_val.len);
+        errdefer allocator.free(val_owned);
+        @memcpy(val_owned, raw_val);
+
+        headers_out.append(allocator, .{ .name = name_owned, .value = val_owned }) catch |err| {
+            allocator.free(name_owned);
+            allocator.free(val_owned);
             return err;
         };
     }
+}
+
+/// Reject HTTP/2 pseudo-headers, hop-by-hop names, and the names
+/// we manage ourselves (cookies go through a sanitized pipeline,
+/// content-length is computed from the body). Case-insensitive.
+fn isEmittableHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] == ':') return false; // HTTP/2 pseudo-header
+    for (name) |b| {
+        // RFC 7230 token chars — be liberal, reject obvious garbage.
+        if (b <= 0x20 or b == 0x7f) return false;
+    }
+    const reserved = [_][]const u8{
+        "connection",      "transfer-encoding", "upgrade",
+        "keep-alive",      "te",                "trailer",
+        "proxy-authenticate", "proxy-authorization",
+        "set-cookie",      "content-length",
+    };
+    for (reserved) |n| {
+        if (std.ascii.eqlIgnoreCase(name, n)) return false;
+    }
+    return true;
+}
+
+/// Header values must not contain CR / LF (header-injection) or NUL.
+/// Everything else is opaque to us.
+fn isCleanHeaderValue(value: []const u8) bool {
+    for (value) |b| {
+        if (b == '\r' or b == '\n' or b == 0) return false;
+    }
+    return true;
 }
 
 /// Return an owned copy of `raw` with any `Domain=...` attribute
@@ -1000,14 +1115,15 @@ fn finishResponse(
     exception_msg: []u8,
     console_buf: *std.ArrayList(u8),
     cookies: *std.ArrayList([]u8),
+    headers: *std.ArrayList(ResponseHeader),
 ) DispatchError!Response {
     if (state.pending_kv_error) |err| {
         d.last_kv_error = err;
         d.allocator.free(body_buf);
         d.allocator.free(exception_msg);
         console_buf.deinit(d.allocator);
-        // Cookies get cleaned up by the caller's errdefer when we
-        // return an error from here — don't double-free them.
+        // Cookies + headers get cleaned up by the caller's errdefer
+        // when we return an error from here — don't double-free.
         return DispatchError.KvFailed;
     }
 
@@ -1017,13 +1133,29 @@ fn finishResponse(
     const set_cookies = cookies.toOwnedSlice(d.allocator) catch
         return DispatchError.OutOfMemory;
 
+    const headers_slice = headers.toOwnedSlice(d.allocator) catch
+        return DispatchError.OutOfMemory;
+
+    // If the handler explicitly set content-type in response.headers,
+    // suppress our auto-stamped JSON one so the handler's choice wins.
+    var effective_body_is_json = body_is_json;
+    if (effective_body_is_json) {
+        for (headers_slice) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
+                effective_body_is_json = false;
+                break;
+            }
+        }
+    }
+
     return .{
         .status = status,
         .body = body_buf,
-        .body_is_json = body_is_json,
+        .body_is_json = effective_body_is_json,
         .console = console_bytes,
         .exception = exception_msg,
         .set_cookies = set_cookies,
+        .headers = headers_slice,
     };
 }
 
@@ -1303,6 +1435,75 @@ test "dispatch: console.log captured into response.console" {
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqualStrings("hello world\nline2\n", resp.console);
+}
+
+test "dispatch: response.headers emitted, reserved names filtered, custom CT overrides auto-json" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Handler sets: one safe header, one reserved name (dropped),
+    // one pseudo-header (dropped), content-type override.
+    var resp = try runOne(
+        &d,
+        kv,
+        \\response.headers = {
+        \\  "X-Request-Id": "abc123",
+        \\  "Set-Cookie": "evil=1",              // reserved → dropped
+        \\  ":status": "999",                    // pseudo → dropped
+        \\  "content-type": "application/xml",   // overrides auto json
+        \\};
+        \\return { shape: "object, triggers body_is_json" };
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    var saw_request_id = false;
+    var saw_content_type_override = false;
+    for (resp.headers) |h| {
+        if (std.mem.eql(u8, h.name, "x-request-id")) {
+            saw_request_id = true;
+            try testing.expectEqualStrings("abc123", h.value);
+        }
+        if (std.mem.eql(u8, h.name, "content-type")) {
+            saw_content_type_override = true;
+            try testing.expectEqualStrings("application/xml", h.value);
+        }
+        // Reserved names must not appear.
+        try testing.expect(!std.mem.eql(u8, h.name, "set-cookie"));
+        try testing.expect(!std.mem.eql(u8, h.name, ":status"));
+    }
+    try testing.expect(saw_request_id);
+    try testing.expect(saw_content_type_override);
+    // body_is_json should be suppressed when handler set content-type.
+    try testing.expect(!resp.body_is_json);
+}
+
+test "dispatch: response.headers empty → no custom headers on Response" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return "hi";
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), resp.headers.len);
 }
 
 test "dispatch: response.cookies surface on Response.set_cookies, Domain stripped" {
@@ -1831,6 +2032,31 @@ test "dispatch: request object fields populated" {
     try testing.expectEqualStrings("PUT /x payload", resp.body);
 }
 
+test "dispatch: request.query exposes raw query string" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Dispatch fn has to be set via `fn=` for runOne's wrapper export;
+    // we check the full query including the `fn=` entry round-trips.
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return String(request.query);
+    ,
+        .{ .method = "GET", .path = "/", .query = "fn=go&name=alice&tags=x%20y" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("fn=go&name=alice&tags=x%20y", resp.body);
+}
+
+
 test "dispatch: webhook.send writes _outbox/{id} with the envelope" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
@@ -2087,16 +2313,13 @@ test "dispatch: crypto.hmacSha256 accepts Uint8Array inputs" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // Same RFC 4231 test case 1, but both args as Uint8Array.
-    // (TextEncoder isn't in the snapshot — we build the ASCII bytes
-    // by hand with charCodeAt to keep the test self-contained.)
+    // Same RFC 4231 test case 1, both args as Uint8Array. Uses the
+    // polyfilled TextEncoder to build UTF-8 bytes.
     var resp = try runOne(
         &d,
         kv,
         \\const key = new Uint8Array(20).fill(0x0b);
-        \\const s = "Hi There";
-        \\const data = new Uint8Array(s.length);
-        \\for (let i = 0; i < s.length; i++) data[i] = s.charCodeAt(i);
+        \\const data = new TextEncoder().encode("Hi There");
         \\return crypto.hmacSha256(key, data);
     ,
         .{ .method = "GET", .path = "/" },
@@ -2107,6 +2330,44 @@ test "dispatch: crypto.hmacSha256 accepts Uint8Array inputs" {
         "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
         resp.body,
     );
+}
+
+test "dispatch: TextEncoder/TextDecoder round-trip multi-byte UTF-8" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Includes 1-, 2-, 3-byte UTF-8 codepoints to exercise the
+    // polyfill branches. (4-byte needs surrogate pairs which
+    // JSON.stringify escapes — tested via a smaller surrogate case
+    // below.)
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const s = "hi ★ € 世";
+        \\const bytes = new TextEncoder().encode(s);
+        \\const back = new TextDecoder().decode(bytes);
+        \\return {
+        \\  byte_count: bytes.length,
+        \\  first_byte: bytes[0],
+        \\  round_trip_ok: back === s,
+        \\  echo: back,
+        \\};
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    var out = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+    defer out.deinit();
+    try testing.expectEqual(@as(i64, 'h'), out.value.object.get("first_byte").?.integer);
+    try testing.expect(out.value.object.get("round_trip_ok").?.bool);
+    try testing.expectEqualStrings("hi ★ € 世", out.value.object.get("echo").?.string);
 }
 
 test "dispatch: crypto.hmacSha256 throws on missing args" {

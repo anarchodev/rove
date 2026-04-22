@@ -902,6 +902,108 @@ pub fn installStatic(ctx: *c.JSContext) void {
     );
     c.JS_FreeValue(ctx, email_result);
 
+    // TextEncoder / TextDecoder — UTF-8 only. QuickJS-ng doesn't
+    // expose a native intrinsic for these, so we install a minimal
+    // JS polyfill. Sufficient for the common use cases: hashing a
+    // UTF-8 string, building a Uint8Array body for webhook.send,
+    // decoding a webhook response back to a string. NOT feature-
+    // complete — doesn't handle streaming or the replacement
+    // character on malformed input; handlers that need fidelity
+    // against adversarial input should check their bytes.
+    const textcodec_snippet =
+        \\(function () {
+        \\  class TextEncoder {
+        \\    get encoding() { return "utf-8"; }
+        \\    encode(input) {
+        \\      const s = String(input ?? "");
+        \\      const out = [];
+        \\      for (let i = 0; i < s.length; i++) {
+        \\        let cp = s.charCodeAt(i);
+        \\        if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < s.length) {
+        \\          const low = s.charCodeAt(i + 1);
+        \\          if (low >= 0xdc00 && low <= 0xdfff) {
+        \\            cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+        \\            i++;
+        \\          }
+        \\        }
+        \\        if (cp < 0x80) {
+        \\          out.push(cp);
+        \\        } else if (cp < 0x800) {
+        \\          out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+        \\        } else if (cp < 0x10000) {
+        \\          out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+        \\        } else {
+        \\          out.push(
+        \\            0xf0 | (cp >> 18),
+        \\            0x80 | ((cp >> 12) & 0x3f),
+        \\            0x80 | ((cp >> 6) & 0x3f),
+        \\            0x80 | (cp & 0x3f),
+        \\          );
+        \\        }
+        \\      }
+        \\      return new Uint8Array(out);
+        \\    }
+        \\  }
+        \\  class TextDecoder {
+        \\    constructor(label, options) {
+        \\      const enc = String(label ?? "utf-8").toLowerCase();
+        \\      if (enc !== "utf-8" && enc !== "utf8") {
+        \\        throw new RangeError("TextDecoder: only utf-8 is supported");
+        \\      }
+        \\      this._fatal = !!(options && options.fatal);
+        \\    }
+        \\    get encoding() { return "utf-8"; }
+        \\    decode(buffer) {
+        \\      if (buffer === undefined || buffer === null) return "";
+        \\      let bytes;
+        \\      if (buffer instanceof Uint8Array) {
+        \\        bytes = buffer;
+        \\      } else if (ArrayBuffer.isView(buffer)) {
+        \\        bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+        \\      } else if (buffer instanceof ArrayBuffer) {
+        \\        bytes = new Uint8Array(buffer);
+        \\      } else {
+        \\        throw new TypeError("TextDecoder.decode: expected BufferSource");
+        \\      }
+        \\      let s = "";
+        \\      let i = 0;
+        \\      while (i < bytes.length) {
+        \\        const b = bytes[i++];
+        \\        if (b < 0x80) {
+        \\          s += String.fromCharCode(b);
+        \\        } else if ((b & 0xe0) === 0xc0 && i < bytes.length) {
+        \\          const b2 = bytes[i++];
+        \\          s += String.fromCharCode(((b & 0x1f) << 6) | (b2 & 0x3f));
+        \\        } else if ((b & 0xf0) === 0xe0 && i + 1 < bytes.length) {
+        \\          const b2 = bytes[i++], b3 = bytes[i++];
+        \\          s += String.fromCharCode(((b & 0x0f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f));
+        \\        } else if ((b & 0xf8) === 0xf0 && i + 2 < bytes.length) {
+        \\          const b2 = bytes[i++], b3 = bytes[i++], b4 = bytes[i++];
+        \\          let cp = ((b & 0x07) << 18) | ((b2 & 0x3f) << 12) | ((b3 & 0x3f) << 6) | (b4 & 0x3f);
+        \\          cp -= 0x10000;
+        \\          s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+        \\        } else if (this._fatal) {
+        \\          throw new TypeError("TextDecoder: malformed utf-8");
+        \\        } else {
+        \\          s += "�";
+        \\        }
+        \\      }
+        \\      return s;
+        \\    }
+        \\  }
+        \\  globalThis.TextEncoder = TextEncoder;
+        \\  globalThis.TextDecoder = TextDecoder;
+        \\})();
+    ;
+    const textcodec_result = c.JS_Eval(
+        ctx,
+        textcodec_snippet.ptr,
+        textcodec_snippet.len,
+        "textcodec.js",
+        c.JS_EVAL_TYPE_GLOBAL,
+    );
+    c.JS_FreeValue(ctx, textcodec_result);
+
     // platform = { root: { get, set, delete, prefix } }. Installed
     // on every context; the C callbacks check `state.platform` and
     // throw for non-admin handlers. See `jsPlatformRoot*`.
@@ -930,11 +1032,23 @@ pub fn installRequest(
     const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);
 
-    // request = { method, path, body }
+    // request = { method, path, body, query }
+    //
+    // `query` is the raw URL query string (everything after `?`) or
+    // null when the URL had none. Parsing is the handler's job —
+    // QuickJS-ng doesn't ship `URL` / `URLSearchParams`, and a
+    // manual `split("&").reduce(...)` is a few lines in the
+    // handler. If customer demand for `URLSearchParams` shows up,
+    // it can land as another polyfill alongside TextEncoder.
     const req_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, req_obj, "method", c.JS_NewStringLen(ctx, request.method.ptr, request.method.len));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "path", c.JS_NewStringLen(ctx, request.path.ptr, request.path.len));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "body", c.JS_NewStringLen(ctx, request.body.ptr, request.body.len));
+    if (request.query) |q| {
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "query", c.JS_NewStringLen(ctx, q.ptr, q.len));
+    } else {
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "query", js_null);
+    }
     _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);
 
     // response = { status: 200, headers: {}, cookies: [] }
