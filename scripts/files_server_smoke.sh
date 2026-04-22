@@ -153,4 +153,87 @@ code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
     "http://127.0.0.1:$PORT/acme/blobs/notahash")
 expect "PUT /blobs/{hash} malformed hash" 400 "$code"
 
+# ── Full two-phase deploy: check → PUT blobs → POST /deployments ─────
+# Stage 2 of the new upload protocol. Build a manifest with one
+# static file + one handler, upload both blobs, stamp the deployment.
+
+STATIC_BYTES='<!doctype html><title>two-phase</title>'
+STATIC_HASH=$(printf '%s' "$STATIC_BYTES" | sha256sum | awk '{print $1}')
+HANDLER_BYTES='export function handler() { return "two-phase!"; }'
+HANDLER_HASH=$(printf '%s' "$HANDLER_BYTES" | sha256sum | awk '{print $1}')
+
+# /blobs/check on both: both missing.
+check=$(curl -s --http2-prior-knowledge \
+    -X POST -H "Content-Type: application/json" \
+    --data-raw "{\"hashes\":[\"$STATIC_HASH\",\"$HANDLER_HASH\"]}" \
+    "http://127.0.0.1:$PORT/twophase/blobs/check")
+echo "$check" | grep -q "$STATIC_HASH" \
+    || { echo "FAIL expected static hash missing: $check" >&2; exit 1; }
+echo "$check" | grep -q "$HANDLER_HASH" \
+    || { echo "FAIL expected handler hash missing: $check" >&2; exit 1; }
+echo "ok  /blobs/check on two new hashes → both missing"
+
+# Upload both.
+code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+    -X PUT --data-raw "$STATIC_BYTES" \
+    "http://127.0.0.1:$PORT/twophase/blobs/$STATIC_HASH")
+expect "PUT static blob" 204 "$code"
+
+code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+    -X PUT --data-raw "$HANDLER_BYTES" \
+    "http://127.0.0.1:$PORT/twophase/blobs/$HANDLER_HASH")
+expect "PUT handler blob" 204 "$code"
+
+# Commit the manifest. First deploy: no parent_id means "don't CAS".
+body=$(curl -s --http2-prior-knowledge \
+    -X POST -H "Content-Type: application/json" \
+    --data-raw "{
+        \"files\": {
+            \"_static/index.html\": {\"hash\":\"$STATIC_HASH\",\"kind\":\"static\",\"content_type\":\"text/html\"},
+            \"index.mjs\":          {\"hash\":\"$HANDLER_HASH\",\"kind\":\"handler\"}
+        }
+    }" \
+    "http://127.0.0.1:$PORT/twophase/deployments")
+echo "$body" | grep -q '"id":"' \
+    || { echo "FAIL /deployments missing id: $body" >&2; exit 1; }
+echo "ok  POST /deployments commits manifest: $body"
+
+# Fetch the bundle metadata to confirm the manifest landed.
+list=$(curl -s --http2-prior-knowledge "http://127.0.0.1:$PORT/twophase/list")
+echo "$list" | grep -q '"_static/index.html"' \
+    || { echo "FAIL /list missing static: $list" >&2; exit 1; }
+echo "$list" | grep -q '"index.mjs"' \
+    || { echo "FAIL /list missing handler: $list" >&2; exit 1; }
+echo "ok  /list shows both files after deploy"
+
+# CAS: a second deploy with parent_id=0 (wrong — current is 1) → 409.
+code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+    -X POST -H "Content-Type: application/json" \
+    --data-raw "{
+        \"parent_id\":\"0000000000000000\",
+        \"files\": {\"index.mjs\":{\"hash\":\"$HANDLER_HASH\",\"kind\":\"handler\"}}
+    }" \
+    "http://127.0.0.1:$PORT/twophase/deployments")
+expect "POST /deployments stale parent_id" 409 "$code"
+
+# CAS with the correct parent_id → 201.
+body=$(curl -s --http2-prior-knowledge \
+    -X POST -H "Content-Type: application/json" \
+    --data-raw "{
+        \"parent_id\":\"0000000000000001\",
+        \"files\": {\"index.mjs\":{\"hash\":\"$HANDLER_HASH\",\"kind\":\"handler\"}}
+    }" \
+    "http://127.0.0.1:$PORT/twophase/deployments")
+echo "$body" | grep -q '"id":"0000000000000002"' \
+    || { echo "FAIL expected deployment id 2: $body" >&2; exit 1; }
+echo "ok  POST /deployments with matching parent_id → id=2"
+
+# Deploy referencing a hash we never uploaded → 400.
+NEVER_HASH=$(printf 'never uploaded' | sha256sum | awk '{print $1}')
+code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+    -X POST -H "Content-Type: application/json" \
+    --data-raw "{\"files\":{\"ghost.mjs\":{\"hash\":\"$NEVER_HASH\",\"kind\":\"handler\"}}}" \
+    "http://127.0.0.1:$PORT/twophase/deployments")
+expect "POST /deployments missing blob" 400 "$code"
+
 echo "PASS files-server smoke"

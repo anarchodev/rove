@@ -62,6 +62,7 @@ pub const Error = error{
     Blob,
     NotFound,
     InvalidManifest,
+    CasConflict,
 };
 
 /// Maximum length for an instance id. Matches what the worker enforces
@@ -288,6 +289,105 @@ fn isSha256Hex(s: []const u8) bool {
         if (!ok) return false;
     }
     return true;
+}
+
+/// Entry for `deployManifest`: one row in the incoming manifest,
+/// referencing a blob by its content hash. `content_type` is
+/// ignored for handlers (they always compile) and falls back to
+/// the empty string when absent for statics.
+pub const DeployEntry = struct {
+    path: []const u8,
+    hash: []const u8,
+    kind: files_mod.Kind,
+    content_type: []const u8 = "",
+};
+
+/// Returned by `deployManifest`. Carries the new deployment id and
+/// the parent id it was based on (0 if this is the first). The
+/// caller builds the HTTP response from these.
+pub const DeployResult = struct {
+    id: u64,
+    parent_id: u64,
+};
+
+/// Third leg of the content-addressed deploy protocol: stamp a
+/// manifest from client-provided (path, hash, kind, content_type)
+/// entries. Blobs must already be in the BlobStore (uploaded via
+/// `PUT /blobs/{hash}` in leg 2). Handlers get compiled server-side
+/// — we fetch the source from the BlobStore, compile, and stamp
+/// `bytecode/{src_hash}` alongside `file/{path}`.
+///
+/// Bulk deploys are always a full replacement of the working tree.
+/// Old `file/*` entries not in the request are dropped. If you
+/// want to update one file, send the full manifest with that file
+/// changed — or use the single-file `putFileAndDeploy` convenience.
+///
+/// `expected_parent_id`:
+///   - non-null  → CAS: require `deployment/current` to equal this
+///     value (0 means "no deployment yet"). Rejects with
+///     `Error.CasConflict` if the tree has moved.
+///   - null      → skip the check (client doesn't care about
+///     concurrent deploys).
+///
+/// All index writes go through `replicate` if provided so the
+/// follower's files.db converges.
+pub fn deployManifest(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    instance_id: []const u8,
+    entries: []const DeployEntry,
+    expected_parent_id: ?u64,
+    replicate: ?*kv_mod.WriteSet,
+) Error!DeployResult {
+    var compiler = try InlineCompiler.init();
+    defer compiler.deinit();
+
+    var h: InstanceCtx = undefined;
+    try h.init(allocator, data_dir, instance_id, InlineCompiler.compile, &compiler);
+    defer h.deinit();
+
+    // ── CAS check: read current deployment pointer BEFORE any write.
+    //
+    // `deployment/current` is the hex-encoded u64 id of the active
+    // deploy, or missing when nothing has shipped yet. If the caller
+    // passed a non-null parent_id, we demand equality.
+    const current_parsed: u64 = blk: {
+        const cur_bytes = h.files_kv.get("deployment/current") catch |err| switch (err) {
+            error.NotFound => break :blk 0,
+            else => return Error.Kv,
+        };
+        defer allocator.free(cur_bytes);
+        break :blk std.fmt.parseInt(u64, cur_bytes, 16) catch return Error.InvalidManifest;
+    };
+    if (expected_parent_id) |want| {
+        if (want != current_parsed) return Error.CasConflict;
+    }
+
+    // ── Attach the replication writeset AFTER CAS so a rejected
+    // deploy doesn't leave partial entries in the writeset.
+    h.store.setReplicate(replicate);
+
+    // ── Full-replace: drop any existing file/* entries so paths
+    // removed from the manifest actually disappear from the new
+    // deployment. Bytecode cache entries stay — they're
+    // content-addressed and may be reused by a later deploy.
+    h.store.clearFileEntries() catch |err| return mapCodeError(err);
+
+    // ── Stamp each entry. putSourceByHash fetches the source blob
+    // and compiles; putStaticByHash just verifies the blob is
+    // present and stamps the index.
+    for (entries) |entry| {
+        switch (entry.kind) {
+            .handler => h.store.putSourceByHash(entry.path, entry.hash) catch |err|
+                return mapCodeError(err),
+            .static => h.store.putStaticByHash(entry.path, entry.hash, entry.content_type) catch |err|
+                return mapCodeError(err),
+        }
+    }
+
+    // ── Stamp deployment/{next} + update current.
+    const next_id = h.store.deploy() catch |err| return mapCodeError(err);
+    return .{ .id = next_id, .parent_id = current_parsed };
 }
 
 /// Upload a single source file into the tenant's working tree.

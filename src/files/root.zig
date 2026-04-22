@@ -200,6 +200,69 @@ pub const FileStore = struct {
         try self.writeFileEntry(path, .static, content_type, &src_hex);
     }
 
+    /// Hash-addressed variant of `putSource`: the source blob is
+    /// already in the BlobStore (uploaded by the client via
+    /// `PUT /blobs/{hash}`). We fetch it, compile to bytecode, and
+    /// stamp the index. Returns `Error.NotFound` if the blob isn't
+    /// in the store — the caller should have verified hashes via
+    /// `/blobs/check` first.
+    pub fn putSourceByHash(
+        self: *FileStore,
+        path: []const u8,
+        src_hex: []const u8,
+    ) Error!void {
+        try validatePath(path);
+        if (src_hex.len != HASH_HEX_LEN) return Error.InvalidManifest;
+
+        const source = self.blob.get(src_hex, self.allocator) catch |err| switch (err) {
+            error.NotFound => return Error.NotFound,
+            else => return Error.Blob,
+        };
+        defer self.allocator.free(source);
+
+        var src_hex_fixed: [HASH_HEX_LEN]u8 = undefined;
+        @memcpy(&src_hex_fixed, src_hex);
+
+        var bc_hex: [HASH_HEX_LEN]u8 = undefined;
+        try self.ensureBytecode(path, source, &src_hex_fixed, &bc_hex);
+        try self.writeFileEntry(path, .handler, "", &src_hex_fixed);
+    }
+
+    /// Hash-addressed variant of `putStatic`: the blob is already
+    /// uploaded, so we just stamp the index. No compile, no blob
+    /// write. Returns `Error.NotFound` if the blob is missing.
+    pub fn putStaticByHash(
+        self: *FileStore,
+        path: []const u8,
+        src_hex: []const u8,
+        content_type: []const u8,
+    ) Error!void {
+        try validatePath(path);
+        if (src_hex.len != HASH_HEX_LEN) return Error.InvalidManifest;
+        if (content_type.len > MAX_CT_LEN) return Error.InvalidPath;
+
+        const present = self.blob.exists(src_hex) catch return Error.Blob;
+        if (!present) return Error.NotFound;
+
+        var src_hex_fixed: [HASH_HEX_LEN]u8 = undefined;
+        @memcpy(&src_hex_fixed, src_hex);
+        try self.writeFileEntry(path, .static, content_type, &src_hex_fixed);
+    }
+
+    /// Drop every `file/*` entry from the working tree. Used by the
+    /// bulk deploy path to clear stale paths before stamping the
+    /// new manifest — the deploy is always a full-replace, never a
+    /// merge. Mirrored through the replicate writeset if attached.
+    pub fn clearFileEntries(self: *FileStore) Error!void {
+        const scan = self.kv.prefix("file/", "", std.math.maxInt(u32)) catch
+            return Error.Kv;
+        var scan_mut = scan;
+        defer scan_mut.deinit();
+        for (scan.entries) |e| {
+            try self.kvDelete(e.key);
+        }
+    }
+
     fn writeFileEntry(
         self: *FileStore,
         path: []const u8,

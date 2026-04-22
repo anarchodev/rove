@@ -297,6 +297,8 @@ fn handleOne(
     } else if (std.mem.startsWith(u8, remainder, "blobs/") and std.mem.eql(u8, method, "PUT")) {
         const hash = remainder["blobs/".len..];
         try handlePutBlob(server, allocator, data_dir, ent, sid, sess, instance_id, hash, rb);
+    } else if (std.mem.eql(u8, remainder, "deployments") and std.mem.eql(u8, method, "POST")) {
+        try handleDeployments(server, allocator, data_dir, raft, ent, sid, sess, instance_id, rb);
     } else {
         try setResponse(server, ent, sid, sess, 404, null, "not found\n");
     }
@@ -382,6 +384,182 @@ fn handleBlobsCheck(
 
     const out = try buf.toOwnedSlice(allocator);
     try setResponse(server, ent, sid, sess, 200, out.ptr, out);
+}
+
+/// POST /{instance}/deployments — body JSON:
+///   { "files": {"path": {"hash": "...", "kind": "handler"|"static",
+///                         "content_type": "..."}}, ...},
+///     "parent_id": "000000000000000N",   // optional hex, CAS
+///     "comment": "..." }                  // optional, not stored yet
+///
+/// Stamps the manifest from the file map: every path gets a
+/// `file/{path}` entry pointing at the referenced blob's hash;
+/// handlers are compiled server-side from their source blobs. All
+/// index writes collect into a files writeset and propose through
+/// raft so followers' files.db converges.
+fn handleDeployments(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    raft: ?*kv.RaftNode,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    instance_id: []const u8,
+    rb: h2.ReqBody,
+) !void {
+    const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
+
+    // Parse the body as a generic json.Value so we can iterate the
+    // string-keyed `files` object without pre-declaring a Zig struct
+    // for it (a `std.StringHashMap`-flavored Zig type for parseInto
+    // doesn't work ergonomically with arbitrary per-entry shapes).
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
+        .allocate = .alloc_always,
+    }) catch {
+        try setResponse(server, ent, sid, sess, 400, null, "bad request body\n");
+        return;
+    };
+    defer parsed.deinit();
+
+    const root_obj = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            try setResponse(server, ent, sid, sess, 400, null, "body must be a JSON object\n");
+            return;
+        },
+    };
+
+    // Parse `parent_id` if present. Absent = skip CAS.
+    var expected_parent: ?u64 = null;
+    if (root_obj.get("parent_id")) |pid_val| switch (pid_val) {
+        .string => |s| expected_parent = std.fmt.parseInt(u64, s, 16) catch {
+            try setResponse(server, ent, sid, sess, 400, null, "invalid parent_id hex\n");
+            return;
+        },
+        .null => {},
+        else => {
+            try setResponse(server, ent, sid, sess, 400, null, "parent_id must be a hex string\n");
+            return;
+        },
+    };
+
+    const files_obj = switch (root_obj.get("files") orelse .null) {
+        .object => |o| o,
+        else => {
+            try setResponse(server, ent, sid, sess, 400, null, "`files` must be a JSON object\n");
+            return;
+        },
+    };
+
+    // Flatten `files` into a DeployEntry slice. We validate kind
+    // strings here so `deployManifest` only sees well-formed input.
+    var entries: std.ArrayList(files_server.DeployEntry) = .empty;
+    defer entries.deinit(allocator);
+    var it = files_obj.iterator();
+    while (it.next()) |kv_pair| {
+        const entry_obj = switch (kv_pair.value_ptr.*) {
+            .object => |o| o,
+            else => {
+                try setResponse(server, ent, sid, sess, 400, null, "file entry must be a JSON object\n");
+                return;
+            },
+        };
+        const hash = switch (entry_obj.get("hash") orelse .null) {
+            .string => |s| s,
+            else => {
+                try setResponse(server, ent, sid, sess, 400, null, "file entry missing hash\n");
+                return;
+            },
+        };
+        const kind_str = switch (entry_obj.get("kind") orelse .null) {
+            .string => |s| s,
+            else => {
+                try setResponse(server, ent, sid, sess, 400, null, "file entry missing kind\n");
+                return;
+            },
+        };
+        const kind: files_mod.Kind = if (std.mem.eql(u8, kind_str, "handler"))
+            .handler
+        else if (std.mem.eql(u8, kind_str, "static"))
+            .static
+        else {
+            try setResponse(server, ent, sid, sess, 400, null, "kind must be \"handler\" or \"static\"\n");
+            return;
+        };
+        const content_type: []const u8 = switch (entry_obj.get("content_type") orelse .null) {
+            .string => |s| s,
+            .null => "",
+            else => {
+                try setResponse(server, ent, sid, sess, 400, null, "content_type must be a string\n");
+                return;
+            },
+        };
+
+        entries.append(allocator, .{
+            .path = kv_pair.key_ptr.*,
+            .hash = hash,
+            .kind = kind,
+            .content_type = content_type,
+        }) catch {
+            try setResponse(server, ent, sid, sess, 500, null, "oom\n");
+            return;
+        };
+    }
+
+    // Collect writes into a files writeset; propose through raft if
+    // the caller wired one. Deploy failures never propose (we clean
+    // up the writeset on any early return).
+    var files_ws = kv.WriteSet.init(allocator);
+    defer files_ws.deinit();
+
+    const result = files_server.deployManifest(
+        allocator,
+        data_dir,
+        instance_id,
+        entries.items,
+        expected_parent,
+        &files_ws,
+    ) catch |err| {
+        const code: u16 = switch (err) {
+            files_server.Error.InvalidInstanceId,
+            files_server.Error.InvalidManifest,
+            files_server.Error.InvalidPath,
+            files_server.Error.CompileFailed,
+            => 400,
+            files_server.Error.NotFound => 400, // client referenced a blob they didn't upload
+            files_server.Error.CasConflict => 409,
+            else => 500,
+        };
+        const msg = try std.fmt.allocPrint(allocator, "deploy failed: {s}\n", .{@errorName(err)});
+        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        return;
+    };
+
+    // Replicate to followers. Leader-local writes are already in
+    // files.db; this is the raft-side of the same thing.
+    if (raft) |r| {
+        if (files_ws.ops.items.len > 0) {
+            const ws_bytes = try files_ws.encode(allocator);
+            defer allocator.free(ws_bytes);
+            const envelope = try encodeFilesWriteSetEnvelope(allocator, instance_id, ws_bytes);
+            defer allocator.free(envelope);
+            const seq = r.highWatermark() + 1;
+            r.propose(seq, envelope) catch |err| {
+                std.log.warn(
+                    "rove-files-server: propose files writeset for {s} failed: {s} (leader deployed, followers may diverge)",
+                    .{ instance_id, @errorName(err) },
+                );
+            };
+        }
+    }
+
+    const body_out = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"{x:0>16}\",\"parent_id\":\"{x:0>16}\"}}\n",
+        .{ result.id, result.parent_id },
+    );
+    try setResponse(server, ent, sid, sess, 201, body_out.ptr, body_out);
 }
 
 /// PUT /{instance}/blobs/{hash} — body is the raw bytes. Server
