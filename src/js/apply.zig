@@ -6,8 +6,13 @@
 //!
 //!   `[1B type][2B id_len BE][id bytes][payload]`
 //!
-//! `type=0` → writeset (payload is `WriteSet.encode` bytes)
-//! `type=1` → log batch (payload is `LogStore.drainBatch` bytes)
+//! `type=0` → per-tenant writeset (payload is `WriteSet.encode` bytes,
+//!           target store = `{data_dir}/{id}/app.db`)
+//! `type=1` → per-tenant log batch (payload is `LogStore.drainBatch`
+//!           bytes, target store = `{data_dir}/{id}/log.db`)
+//! `type=2` → ROOT writeset (payload is `WriteSet.encode` bytes,
+//!           target store = `{data_dir}/__root__.db`, id_len must
+//!           be 0 — the envelope carries no per-tenant id)
 //!
 //! The `id` is the tenant `instance_id`. `id_len` caps at 64KB. The
 //! trailing `payload` is whatever the dispatch callback for that
@@ -79,6 +84,7 @@ const RaftLogHandle = struct {
 pub const EnvelopeType = enum(u8) {
     writeset = 0,
     log_batch = 1,
+    root_writeset = 2,
 };
 
 /// Build a writeset envelope. `id_len` and `id` plus a leading type=0
@@ -98,6 +104,18 @@ pub fn encodeLogBatchEnvelope(
     batch_bytes: []const u8,
 ) ![]u8 {
     return encodeTyped(allocator, .log_batch, id, batch_bytes);
+}
+
+/// Build a root writeset envelope. type=2, no per-tenant id (id_len=0).
+/// Applied to `{data_dir}/__root__.db` on followers. Used for writes
+/// that update platform-level tables (tenant registry, domain
+/// mappings) — signup's `tenant.createInstance` and the admin JS
+/// handler's `platform.root.set/delete` collect their ops here.
+pub fn encodeRootWriteSetEnvelope(
+    allocator: std.mem.Allocator,
+    ws_bytes: []const u8,
+) ![]u8 {
+    return encodeTyped(allocator, .root_writeset, "", ws_bytes);
 }
 
 fn encodeTyped(
@@ -159,7 +177,7 @@ pub const ApplyCtx = struct {
     /// Root data dir. Per-tenant stores live at
     /// `{data_dir}/{id}/{app,log}.db` + `log-blobs/`.
     data_dir: []const u8,
-    /// Used for the leader-skip check on both envelope types.
+    /// Used for the leader-skip check on every envelope type.
     raft: *kv.RaftNode,
     /// Lazy per-tenant KvStore cache (instance_id → *KvStore). Keys
     /// are owned copies of the instance id.
@@ -167,6 +185,11 @@ pub const ApplyCtx = struct {
     /// Lazy per-tenant log handle cache (instance_id → *RaftLogHandle).
     /// Keys are owned copies of the instance id.
     log_stores: std.StringHashMapUnmanaged(*RaftLogHandle),
+    /// Lazy root-store handle for `type=2 root_writeset` applies.
+    /// Opens `{data_dir}/__root__.db` on first follower-side root
+    /// apply. Null on the leader path (leader-skip fires before we'd
+    /// open it) and on nodes that never see a root writeset.
+    root_store: ?*kv.KvStore = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -200,6 +223,26 @@ pub const ApplyCtx = struct {
             self.allocator.destroy(h);
         }
         self.log_stores.deinit(self.allocator);
+
+        if (self.root_store) |s| s.close();
+    }
+
+    /// Lazily open the follower's local copy of `__root__.db`. Returns
+    /// the cached handle on subsequent calls. Only ever reached on
+    /// the follower path (`applyRootWriteSet` leader-skips before
+    /// opening).
+    fn getRootKv(self: *ApplyCtx) !*kv.KvStore {
+        if (self.root_store) |existing| return existing;
+        const path = try std.fmt.allocPrintSentinel(
+            self.allocator,
+            "{s}/__root__.db",
+            .{self.data_dir},
+            0,
+        );
+        defer self.allocator.free(path);
+        const store = try kv.KvStore.open(self.allocator, path);
+        self.root_store = store;
+        return store;
     }
 
     /// Lazily open this tenant's app.db kv store. The returned
@@ -295,6 +338,7 @@ pub fn applyOne(
     switch (env.type) {
         .writeset => applyWriteSet(ctx, env),
         .log_batch => applyLogBatch(ctx, env),
+        .root_writeset => applyRootWriteSet(ctx, env),
     }
 }
 
@@ -316,6 +360,30 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope) void {
         std.log.warn(
             "rove-js apply: writeset failed for {s}: {s}",
             .{ env.instance_id, @errorName(err) },
+        );
+    };
+}
+
+/// Follower-only: decode the root writeset and apply it to this
+/// node's copy of `__root__.db`. Leader-skip matches the per-tenant
+/// path — the proposer already wrote locally before proposing, so
+/// the leader's own raft-thread apply is a no-op.
+fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope) void {
+    if (ctx.raft.isLeader()) return;
+    std.debug.assert(env.instance_id.len == 0);
+
+    const store = ctx.getRootKv() catch |err| {
+        std.log.warn(
+            "rove-js apply: getRootKv failed: {s}",
+            .{@errorName(err)},
+        );
+        return;
+    };
+
+    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| {
+        std.log.warn(
+            "rove-js apply: root writeset failed: {s}",
+            .{@errorName(err)},
         );
     };
 }
@@ -358,6 +426,17 @@ test "writeset envelope encode/decode round trip" {
     const dec = try decodeEnvelope(enc);
     try testing.expectEqual(EnvelopeType.writeset, dec.type);
     try testing.expectEqualStrings(id, dec.instance_id);
+    try testing.expectEqualStrings(ws, dec.payload);
+}
+
+test "root writeset envelope encode/decode round trip" {
+    const ws = "root ws bytes";
+    const enc = try encodeRootWriteSetEnvelope(testing.allocator, ws);
+    defer testing.allocator.free(enc);
+
+    const dec = try decodeEnvelope(enc);
+    try testing.expectEqual(EnvelopeType.root_writeset, dec.type);
+    try testing.expectEqualStrings("", dec.instance_id);
     try testing.expectEqualStrings(ws, dec.payload);
 }
 

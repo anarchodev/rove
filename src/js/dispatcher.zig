@@ -104,6 +104,13 @@ pub const Request = struct {
     /// the admin handler. Every other tenant's request passes null
     /// and the callbacks reject.
     platform: ?*tenant_mod.Tenant = null,
+    /// Collects `platform.root.*` writes made during this request.
+    /// When non-null the admin handler's root writes go into both
+    /// (a) root.db directly (for immediate read-your-writes) AND
+    /// (b) this writeset (for the worker to propose through raft).
+    /// Null means writes land locally only — fine for tests and
+    /// single-node setups, not for multi-node correctness.
+    root_writeset: ?*kv_mod.WriteSet = null,
 };
 
 pub const Response = struct {
@@ -248,6 +255,7 @@ pub const Dispatcher = struct {
             .prng = std.Random.DefaultPrng.init(request.prng_seed),
             .request_id = request.request_id,
             .platform = request.platform,
+            .root_writeset = request.root_writeset,
         };
 
         // Memcpy-restore the frozen post-init image of

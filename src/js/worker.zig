@@ -1730,6 +1730,18 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             };
         };
 
+        // Admin-handler requests get a root writeset allocated for
+        // them so any `platform.root.set/delete` the handler issues
+        // can be proposed through raft after commit. Customer-tenant
+        // requests never have `platform` set, so they skip this.
+        var root_ws_storage: kv_mod.WriteSet = undefined;
+        var root_ws_ptr: ?*kv_mod.WriteSet = null;
+        if (handler_inst.platform != null) {
+            root_ws_storage = kv_mod.WriteSet.init(allocator);
+            root_ws_ptr = &root_ws_storage;
+        }
+        defer if (root_ws_ptr) |ws| ws.deinit();
+
         const request: Request = .{
             .method = method,
             .path = path,
@@ -1744,6 +1756,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // Non-null only when the handler-tenant is the admin
             // singleton — gates installation of `platform.root.*`.
             .platform = handler_inst.platform,
+            .root_writeset = root_ws_ptr,
         };
 
         txn.?.savepoint() catch |err| {
@@ -1808,6 +1821,23 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             processed += 1;
             continue;
         };
+
+        // Propose the root writeset (if the admin handler made any
+        // `platform.root.*` writes). The local writes already landed
+        // on `root.db` inside the callbacks; this step just replicates
+        // them to followers. Proposed per-handler rather than batched
+        // because there's only one admin-tenant anchor at a time —
+        // batching wouldn't save anything.
+        if (root_ws_ptr) |root_ws| {
+            if (root_ws.ops.items.len > 0) {
+                _ = proposeRootWriteSet(worker, root_ws) catch |err| {
+                    std.log.warn(
+                        "rove-js: platform.root writeset propose failed: {s} (leader wrote, followers may diverge)",
+                        .{@errorName(err)},
+                    );
+                };
+            }
+        }
 
         // Stamp response components on the entity. They ride through
         // `raft_pending` → `response_in` (or straight to `response_in`
@@ -2373,6 +2403,39 @@ pub fn proposeWriteSet(
     defer allocator.free(ws_bytes);
 
     const envelope = try apply_mod.encodeWriteSetEnvelope(allocator, instance_id, ws_bytes);
+    defer allocator.free(envelope);
+
+    const seq = worker.raft.highWatermark() + 1;
+    try worker.raft.propose(seq, envelope);
+    return seq;
+}
+
+/// Propose a root writeset (envelope type=2) through raft. Followers
+/// apply the encoded ops to their own `__root__.db` in
+/// `applyRootWriteSet`. Used by signup (instance marker + domain
+/// assignment) and by the admin JS handler's `platform.root.*`
+/// writes.
+///
+/// No-op fast path for empty writesets — saves a raft entry for
+/// admin requests that only read platform state.
+///
+/// **Divergence note**: if the caller already wrote to root locally
+/// and this propose fails, the leader's root.db has state that
+/// followers don't. Current code logs and moves on (at-least-once
+/// semantics consistent with the outbox / callback layers). A
+/// future iteration can wrap root writes in a TrackedTxn with undo
+/// semantics so propose failure triggers a compensating rollback.
+pub fn proposeRootWriteSet(
+    worker: anytype,
+    writeset: *const kv_mod.WriteSet,
+) !u64 {
+    const allocator = worker.allocator;
+    if (writeset.ops.items.len == 0) return 0;
+
+    const ws_bytes = try writeset.encode(allocator);
+    defer allocator.free(ws_bytes);
+
+    const envelope = try apply_mod.encodeRootWriteSetEnvelope(allocator, ws_bytes);
     defer allocator.free(envelope);
 
     const seq = worker.raft.highWatermark() + 1;
@@ -3423,6 +3486,25 @@ fn handleAdminSignup(
         try setSystemResponse(server, ent, sid, sess, 500, "signup failed\n", allocator, admin_cors, null);
         return;
     };
+
+    // Replicate the instance marker to followers so `{name}.loop46.me`
+    // routes correctly on any node, not just the leader that handled
+    // signup. `createInstance` already wrote to root.db locally — we
+    // mirror that write into a root writeset and propose it through
+    // raft. See `applyRootWriteSet` for the follower side.
+    {
+        var root_ws = kv_mod.WriteSet.init(allocator);
+        defer root_ws.deinit();
+        const marker_key = try std.fmt.allocPrint(allocator, "instance/{s}", .{name});
+        defer allocator.free(marker_key);
+        try root_ws.addPut(marker_key, "");
+        _ = proposeRootWriteSet(worker, &root_ws) catch |err| {
+            std.log.warn(
+                "rove-js: signup proposeRootWriteSet({s}) failed: {s} (leader has the marker, followers may not)",
+                .{ name, @errorName(err) },
+            );
+        };
+    }
 
     // Deploy starter content so the new tenant's `{id}.loop46.me`
     // answers 200 immediately instead of 503 "no deployment". Skipped

@@ -84,6 +84,13 @@ pub const DispatchState = struct {
     /// iff this field is set. Regular tenants' handlers see
     /// `platform === undefined` in their runtime.
     platform: ?*tenant_mod.Tenant = null,
+    /// Raft writeset accumulating root-store writes the admin
+    /// handler makes via `platform.root.set` / `platform.root.delete`.
+    /// Dispatcher creates this alongside the per-tenant writeset
+    /// when `platform != null`; worker proposes it through raft as
+    /// a type=2 envelope after commit so followers' copies of
+    /// `__root__.db` stay in sync.
+    root_writeset: ?*kv_mod.WriteSet = null,
 };
 
 // ── C helpers ──────────────────────────────────────────────────────────
@@ -674,6 +681,15 @@ fn jsPlatformRootSet(
     tenant.root.put(key, val) catch |err| {
         state.pending_kv_error = err;
     };
+    // Mirror the write into the root writeset so the worker can
+    // propose it through raft. Admin handlers ALWAYS have this
+    // set (dispatcher init checks `platform != null`), so an unset
+    // field here means someone built a DispatchState by hand.
+    if (state.root_writeset) |ws| {
+        ws.addPut(key, val) catch |err| {
+            state.pending_kv_error = err;
+        };
+    }
     return js_undefined;
 }
 
@@ -694,12 +710,22 @@ fn jsPlatformRootDelete(
     defer state.allocator.free(key);
 
     tenant.root.delete(key) catch |err| switch (err) {
-        error.NotFound => return js_undefined,
+        error.NotFound => {
+            // Still propagate the delete to followers so their state
+            // converges — a key that's missing locally might exist
+            // on other nodes if propose ordering skewed. The follower
+            // `applyEncodedWriteSet` treats NotFound as a no-op.
+        },
         else => {
             state.pending_kv_error = err;
             return js_undefined;
         },
     };
+    if (state.root_writeset) |ws| {
+        ws.addDelete(key) catch |err| {
+            state.pending_kv_error = err;
+        };
+    }
     return js_undefined;
 }
 
