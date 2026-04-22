@@ -84,9 +84,13 @@ pub const TOKEN_MAX_LEN: usize = 128;
 pub const MAX_INSTANCE_ID_LEN: usize = 64;
 pub const MAX_HOST_LEN: usize = 253; // RFC 1035
 
-/// Reserved instance id for the built-in admin handler. Its app-state
-/// KV aliases to the root store, so `kv.set("__root__/instance/{id}", "")`
-/// from an admin handler is literally a root-marker write.
+/// Reserved instance id for the built-in admin handler. The admin
+/// tenant is an instance like any other — its own `{dir}/app.db`,
+/// its own outbox, its own per-request logs — plus one singleton
+/// capability: `Instance.platform` points back at the `Tenant`, so
+/// the admin JS handler can issue platform operations (instance
+/// CRUD, domain CRUD, root kv reads) via the `platform.*` globals.
+/// Every other instance has `platform = null`.
 pub const ADMIN_INSTANCE_ID = "__admin__";
 
 pub const InstanceList = struct {
@@ -127,15 +131,17 @@ pub const DomainList = struct {
 ///   `{dir}/files.db`, `{dir}/log.db`, `{dir}/file-blobs/`, etc.
 /// - `kv`: the tenant's app-state store at `{dir}/app.db`. Handler
 ///   code's `kv.get("x")` hits raw key `"x"` in this file.
+/// - `platform`: non-null only on the singleton admin instance
+///   (`id == ADMIN_INSTANCE_ID`). When set, points back at the
+///   owning `Tenant` — the JS dispatcher uses its presence to gate
+///   installation of the `platform.*` globals (instance CRUD, root
+///   kv, etc.). Regular instances see `platform === undefined` in
+///   their handlers.
 pub const Instance = struct {
     id: []u8,
     dir: []u8,
     kv: *kv_mod.KvStore,
-    /// False for instances whose `kv` is borrowed from elsewhere
-    /// (currently only `__admin__`, which aliases to the root store).
-    /// `deinit` and `deleteInstance` skip `kv.close()` when this is
-    /// false to avoid a double-close on the shared handle.
-    owns_kv: bool = true,
+    platform: ?*Tenant = null,
 };
 
 pub const Tenant = struct {
@@ -167,54 +173,65 @@ pub const Tenant = struct {
     /// are rare bootstrap ops in M1).
     host_cache: std.StringHashMapUnmanaged(*Instance) = .empty,
 
-    pub fn init(
+    /// Heap-allocate a `Tenant`. The admin instance's `platform`
+    /// capability field stores a pointer BACK at this Tenant (see
+    /// `ensureOpen` + rove-library principle 14 "Heap-Allocate
+    /// Structs with Interior Pointers"), so the Tenant must live at
+    /// a stable address for its entire lifetime — copying or moving
+    /// it after `createInstance(ADMIN_INSTANCE_ID)` would leave the
+    /// pointer dangling. Pair with `destroy`.
+    pub fn create(
         allocator: std.mem.Allocator,
         root: *kv_mod.KvStore,
         dir: []const u8,
-    ) Error!Tenant {
-        return initWithCounters(allocator, root, dir, null);
+    ) Error!*Tenant {
+        return createWithCounters(allocator, root, dir, null);
     }
 
-    /// Like `init`, but per-instance KvStores share `seq_counters` for
-    /// their seq allocations. Required for any multi-worker deployment
-    /// where several `Tenant` instances point at the same on-disk
-    /// tenant directory.
-    pub fn initWithCounters(
+    /// Like `create`, but per-instance KvStores share `seq_counters`
+    /// for their seq allocations. Required for any multi-worker
+    /// deployment where several `Tenant` instances point at the same
+    /// on-disk tenant directory.
+    pub fn createWithCounters(
         allocator: std.mem.Allocator,
         root: *kv_mod.KvStore,
         dir: []const u8,
         seq_counters: ?*kv_mod.SeqCounterRegistry,
-    ) Error!Tenant {
+    ) Error!*Tenant {
         if (dir.len == 0) return Error.InvalidDir;
         std.fs.cwd().makePath(dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return Error.InvalidDir,
         };
         const dir_copy = allocator.dupe(u8, dir) catch return Error.OutOfMemory;
-        return .{
+        errdefer allocator.free(dir_copy);
+        const self = allocator.create(Tenant) catch return Error.OutOfMemory;
+        self.* = .{
             .allocator = allocator,
             .root = root,
             .dir = dir_copy,
             .seq_counters = seq_counters,
         };
+        return self;
     }
 
-    pub fn deinit(self: *Tenant) void {
+    pub fn destroy(self: *Tenant) void {
+        const allocator = self.allocator;
         self.invalidateHostCache();
         self.host_cache.deinit(self.allocator);
 
         var it = self.instances.iterator();
         while (it.next()) |entry| {
             const inst = entry.value_ptr.*;
-            if (inst.owns_kv) inst.kv.close();
-            self.allocator.free(inst.id);
-            self.allocator.free(inst.dir);
-            self.allocator.destroy(inst);
+            inst.kv.close();
+            allocator.free(inst.id);
+            allocator.free(inst.dir);
+            allocator.destroy(inst);
         }
-        self.instances.deinit(self.allocator);
-        if (self.public_suffix) |p| self.allocator.free(p);
-        self.allocator.free(self.dir);
-        self.* = undefined;
+        self.instances.deinit(allocator);
+        if (self.public_suffix) |p| allocator.free(p);
+        allocator.free(self.dir);
+        allocator.destroy(self);
     }
 
     /// Set (or clear) the wildcard public suffix. Passing `null` or
@@ -266,14 +283,14 @@ pub const Tenant = struct {
 
         if (self.instances.fetchRemove(id)) |entry| {
             const inst = entry.value;
-            if (inst.owns_kv) inst.kv.close();
+            inst.kv.close();
             self.allocator.free(inst.id);
             self.allocator.free(inst.dir);
             self.allocator.destroy(inst);
         }
 
-        var marker_buf: [32 + MAX_INSTANCE_ID_LEN]u8 = undefined;
-        const marker_key = std.fmt.bufPrint(&marker_buf, "__root__/instance/{s}", .{id}) catch
+        var marker_buf: [16 + MAX_INSTANCE_ID_LEN]u8 = undefined;
+        const marker_key = std.fmt.bufPrint(&marker_buf, "instance/{s}", .{id}) catch
             return Error.InvalidInstanceId;
         self.root.delete(marker_key) catch |err| switch (err) {
             error.NotFound => {},
@@ -284,7 +301,7 @@ pub const Tenant = struct {
         // up front so we can mutate during deletion without worrying
         // about scan/delete interleaving. M1 scale (tens of domains)
         // makes the maxInt page size fine.
-        var scan = self.root.prefix("__root__/domain/", "", std.math.maxInt(u32)) catch
+        var scan = self.root.prefix("domain/", "", std.math.maxInt(u32)) catch
             return Error.Kv;
         defer scan.deinit();
         for (scan.entries) |e| {
@@ -308,8 +325,8 @@ pub const Tenant = struct {
         try validateInstanceId(instance_id);
         if (!try self.instanceExistsInRoot(instance_id)) return Error.InstanceNotFound;
 
-        var key_buf: [32 + MAX_HOST_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/domain/{s}", .{host}) catch
+        var key_buf: [16 + MAX_HOST_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "domain/{s}", .{host}) catch
             return Error.InvalidHost;
         self.root.put(key, instance_id) catch return Error.Kv;
         self.invalidateHostCache();
@@ -321,7 +338,7 @@ pub const Tenant = struct {
     /// The returned pointer is stable for the lifetime of the `Tenant`.
     ///
     /// Resolution order:
-    ///   1. Explicit `__root__/domain/{host}` alias from `assignDomain`.
+    ///   1. Explicit `domain/{host}` alias from `assignDomain`.
     ///   2. Wildcard fallback: if `public_suffix` is set and `host`
     ///      parses as `{id}.{public_suffix}`, look up `{id}` as an
     ///      instance. Explicit aliases always win over the wildcard.
@@ -329,8 +346,8 @@ pub const Tenant = struct {
         try validateHost(host);
         if (self.host_cache.get(host)) |inst| return inst;
 
-        var key_buf: [32 + MAX_HOST_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/domain/{s}", .{host}) catch
+        var key_buf: [16 + MAX_HOST_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "domain/{s}", .{host}) catch
             return Error.InvalidHost;
         const id_bytes_opt: ?[]u8 = blk: {
             const v = self.root.get(key) catch |err| switch (err) {
@@ -408,7 +425,7 @@ pub const Tenant = struct {
     /// Ordering follows the root store's key order, which matches
     /// ASCII lexical order of instance ids.
     pub fn listInstances(self: *Tenant, max: u32) Error!InstanceList {
-        var scan = self.root.prefix("__root__/instance/", "", max) catch
+        var scan = self.root.prefix("instance/", "", max) catch
             return Error.Kv;
         defer scan.deinit();
 
@@ -420,7 +437,7 @@ pub const Tenant = struct {
             self.allocator.free(ids);
         }
 
-        const prefix_len = "__root__/instance/".len;
+        const prefix_len = "instance/".len;
         for (scan.entries) |e| {
             if (e.key.len <= prefix_len) continue;
             const id_bytes = e.key[prefix_len..];
@@ -439,7 +456,7 @@ pub const Tenant = struct {
     /// at instance ids; callers should treat unknown instance ids as
     /// dangling aliases (we don't resolve them here).
     pub fn listDomains(self: *Tenant, max: u32) Error!DomainList {
-        var scan = self.root.prefix("__root__/domain/", "", max) catch
+        var scan = self.root.prefix("domain/", "", max) catch
             return Error.Kv;
         defer scan.deinit();
 
@@ -454,7 +471,7 @@ pub const Tenant = struct {
             self.allocator.free(entries);
         }
 
-        const prefix_len = "__root__/domain/".len;
+        const prefix_len = "domain/".len;
         for (scan.entries) |e| {
             if (e.key.len <= prefix_len) continue;
             const host = e.key[prefix_len..];
@@ -474,8 +491,8 @@ pub const Tenant = struct {
     // ── Internals ─────────────────────────────────────────────────────
 
     fn instanceExistsInRoot(self: *Tenant, id: []const u8) Error!bool {
-        var key_buf: [32 + MAX_INSTANCE_ID_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/instance/{s}", .{id}) catch
+        var key_buf: [16 + MAX_INSTANCE_ID_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{id}) catch
             return Error.InvalidInstanceId;
         const v = self.root.get(key) catch |err| switch (err) {
             error.NotFound => return false,
@@ -486,8 +503,8 @@ pub const Tenant = struct {
     }
 
     fn writeInstanceMarker(self: *Tenant, id: []const u8) Error!void {
-        var key_buf: [32 + MAX_INSTANCE_ID_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/instance/{s}", .{id}) catch
+        var key_buf: [16 + MAX_INSTANCE_ID_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{id}) catch
             return Error.InvalidInstanceId;
         self.root.put(key, "") catch return Error.Kv;
         self.invalidateHostCache();
@@ -501,7 +518,11 @@ pub const Tenant = struct {
     /// Creates the instance directory `{dir}/{id}/` if it doesn't
     /// already exist, then opens `{dir}/{id}/app.db` as the app-state
     /// store. Other services layer their own per-tenant state inside
-    /// the same directory.
+    /// the same directory. The singleton `__admin__` is treated
+    /// identically on disk — its own app.db, file-blobs/, log.db —
+    /// and picks up the `platform` capability pointer so the admin
+    /// JS handler can call platform operations via the `platform.*`
+    /// globals.
     fn ensureOpen(self: *Tenant, id: []const u8) Error!*Instance {
         if (self.instances.get(id)) |inst| return inst;
 
@@ -517,29 +538,21 @@ pub const Tenant = struct {
             else => return Error.OpenFailed,
         };
 
-        // __admin__ aliases its app-state KV to the root store. The
-        // admin handler's `kv.get/set` thus operates on root markers
-        // directly — no separate app.db file, no new bindings.
-        // The handle is borrowed; we flag it so deinit skips close().
-        const is_admin = std.mem.eql(u8, id, ADMIN_INSTANCE_ID);
-        const store = if (is_admin) self.root else blk: {
-            const app_path = std.fmt.allocPrintSentinel(
-                self.allocator,
-                "{s}/app.db",
-                .{inst_dir},
-                0,
-            ) catch return Error.OutOfMemory;
-            defer self.allocator.free(app_path);
+        const app_path = std.fmt.allocPrintSentinel(
+            self.allocator,
+            "{s}/app.db",
+            .{inst_dir},
+            0,
+        ) catch return Error.OutOfMemory;
+        defer self.allocator.free(app_path);
 
-            const opened = if (self.seq_counters) |reg| cblk: {
-                const counter = reg.getOrCreate(id) catch return Error.OutOfMemory;
-                break :cblk kv_mod.KvStore.openWithCounter(self.allocator, app_path, counter) catch
-                    return Error.OpenFailed;
-            } else kv_mod.KvStore.open(self.allocator, app_path) catch
+        const store = if (self.seq_counters) |reg| cblk: {
+            const counter = reg.getOrCreate(id) catch return Error.OutOfMemory;
+            break :cblk kv_mod.KvStore.openWithCounter(self.allocator, app_path, counter) catch
                 return Error.OpenFailed;
-            break :blk opened;
-        };
-        errdefer if (!is_admin) store.close();
+        } else kv_mod.KvStore.open(self.allocator, app_path) catch
+            return Error.OpenFailed;
+        errdefer store.close();
 
         const id_copy = self.allocator.dupe(u8, id) catch return Error.OutOfMemory;
         errdefer self.allocator.free(id_copy);
@@ -550,7 +563,10 @@ pub const Tenant = struct {
             .id = id_copy,
             .dir = inst_dir,
             .kv = store,
-            .owns_kv = !is_admin,
+            // The singleton admin tenant gets a back-pointer to the
+            // Tenant so its JS handler can issue platform ops. Every
+            // other instance leaves `platform = null`.
+            .platform = if (std.mem.eql(u8, id, ADMIN_INSTANCE_ID)) self else null,
         };
 
         self.instances.put(self.allocator, id_copy, inst) catch return Error.OutOfMemory;
@@ -563,19 +579,18 @@ pub const Tenant = struct {
         self.host_cache.clearRetainingCapacity();
     }
 
-    // ── Auth (Phase 5) ────────────────────────────────────────────────
+    // ── Auth ──────────────────────────────────────────────────────────
     //
-    // M1 shape: one root token, stored as its SHA-256 hash under
-    // `__root__/root_token/{sha256_hex}`. A caller presenting the
-    // matching plaintext authenticates as root and can operate on any
-    // instance. Multi-account auth (per-account tokens + per-instance
-    // membership) slots in by widening `AuthContext` and adding
-    // `__root__/account/*` records — no API break for callers.
+    // M1 shape: one platform root token, stored as its SHA-256 hash
+    // under `root_token/{sha256_hex}` in root.db. Presenting the
+    // matching plaintext authenticates as platform operator. Admin
+    // sessions + magic links live in `__admin__`'s app.db (see the
+    // session + magic sections below).
     //
     // The plaintext token is never stored; only its hash lives in the
-    // root store. An attacker who reads `__root__.db` cannot forge a
-    // token, and the bootstrap flag that installs the token is the
-    // only place the plaintext ever appears.
+    // root store. An attacker who reads root.db cannot forge a token,
+    // and the bootstrap flag that installs it is the only place the
+    // plaintext ever appears.
 
     /// Install a root token. Idempotent — re-installing the same
     /// token is a no-op; re-installing a different token replaces
@@ -597,8 +612,8 @@ pub const Tenant = struct {
         // from accumulating stale entries on token rotation.
         try self.clearRootTokens();
 
-        var key_buf: [32 + 64]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/root_token/{s}", .{hash_hex}) catch
+        var key_buf: [12 + 64]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "root_token/{s}", .{hash_hex}) catch
             return Error.Kv;
         self.root.put(key, "") catch return Error.Kv;
     }
@@ -620,8 +635,8 @@ pub const Tenant = struct {
             hash_hex[i * 2 + 1] = hex_chars[b & 0x0f];
         }
 
-        var key_buf: [32 + 64]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/root_token/{s}", .{hash_hex}) catch
+        var key_buf: [12 + 64]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "root_token/{s}", .{hash_hex}) catch
             return Error.Kv;
         const v = self.root.get(key) catch |err| switch (err) {
             error.NotFound => return null,
@@ -631,13 +646,27 @@ pub const Tenant = struct {
         return .{ .is_root = true };
     }
 
+    // ── adminKv: storage handle for admin-surface state ──────────────
+    //
+    // Sessions and magic-link rows live in the singleton admin tenant's
+    // own app.db now, not the root store. Callers reach them via this
+    // helper rather than hard-coding `instances.get(ADMIN_INSTANCE_ID)`.
+    // Requires `__admin__` to be registered first — callers are
+    // expected to `createInstance(ADMIN_INSTANCE_ID)` during bootstrap
+    // before any session / magic operation fires.
+    fn adminKv(self: *Tenant) Error!*kv_mod.KvStore {
+        const inst = self.instances.get(ADMIN_INSTANCE_ID) orelse
+            return Error.InstanceNotFound;
+        return inst.kv;
+    }
+
     // ── Platform secrets: Resend API key ──────────────────────────────
     //
-    // Stored plaintext at `__root__/resend_key`. The JS `email.send`
-    // wrapper reads it via `getResendKey` when building the outbox
-    // envelope so the customer handler never sees the key. Installed
-    // once at bootstrap by `--bootstrap-resend-key`; rotated by
-    // re-running the worker with a new value on that flag.
+    // Platform-owned config, stored in root.db under the well-known
+    // key `resend_key`. Installed once at bootstrap by
+    // `--bootstrap-resend-key`; rotated by re-running the worker with
+    // a new value on that flag. The signup flow reads it via
+    // `getResendKey` when building a magic-link email outbox row.
 
     pub const RESEND_KEY_MIN_LEN: usize = 8;
     pub const RESEND_KEY_MAX_LEN: usize = 256;
@@ -649,14 +678,14 @@ pub const Tenant = struct {
         for (key) |b| {
             if (b < 0x21 or b > 0x7e) return Error.InvalidToken;
         }
-        self.root.put("__root__/resend_key", key) catch return Error.Kv;
+        self.root.put("resend_key", key) catch return Error.Kv;
     }
 
     /// Returns the stored Resend key or null if none installed. The
     /// bytes are allocated by the root `KvStore`'s allocator; free
     /// with the same allocator the tenant was constructed with.
     pub fn getResendKey(self: *Tenant) Error!?[]u8 {
-        const v = self.root.get("__root__/resend_key") catch |err| switch (err) {
+        const v = self.root.get("resend_key") catch |err| switch (err) {
             error.NotFound => return null,
             else => return Error.Kv,
         };
@@ -666,8 +695,9 @@ pub const Tenant = struct {
     // ── Session cookies ───────────────────────────────────────────────
     //
     // A session is an opaque 64-hex token handed to the browser via
-    // `Set-Cookie` after a successful login. We store sha256(opaque),
-    // NOT the opaque itself, so a leaked `__root__.db` can't impersonate
+    // `Set-Cookie` after a successful login. Stored in the admin
+    // tenant's app.db under `session/{sha256(opaque)}` — the store
+    // only retains the hash, so a leaked app.db can't impersonate
     // live sessions. Value = `{expires_at_ns i64 little-endian}{is_root u8}`.
     // TTL comes from the caller at mint time.
 
@@ -681,6 +711,8 @@ pub const Tenant = struct {
         ctx: AuthContext,
         ttl_ns: i64,
     ) Error![SESSION_HEX_LEN]u8 {
+        const kv = try self.adminKv();
+
         var raw: [32]u8 = undefined;
         std.crypto.random.bytes(&raw);
 
@@ -692,8 +724,8 @@ pub const Tenant = struct {
         var hash_hex: [SESSION_HEX_LEN]u8 = undefined;
         bytesToHex(&hash, &hash_hex);
 
-        var key_buf: [32 + SESSION_HEX_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/session/{s}", .{hash_hex}) catch
+        var key_buf: [8 + SESSION_HEX_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "session/{s}", .{hash_hex}) catch
             return Error.Kv;
 
         var val_buf: [9]u8 = undefined;
@@ -702,7 +734,7 @@ pub const Tenant = struct {
         std.mem.writeInt(i64, val_buf[0..8], expires_at_ns, .little);
         val_buf[8] = if (ctx.is_root) 1 else 0;
 
-        self.root.put(key, &val_buf) catch return Error.Kv;
+        kv.put(key, &val_buf) catch return Error.Kv;
         return opaque_hex;
     }
 
@@ -716,17 +748,18 @@ pub const Tenant = struct {
             const ok = (b >= '0' and b <= '9') or (b >= 'a' and b <= 'f') or (b >= 'A' and b <= 'F');
             if (!ok) return null;
         }
+        const kv = try self.adminKv();
 
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(opaque_hex, &hash, .{});
         var hash_hex: [SESSION_HEX_LEN]u8 = undefined;
         bytesToHex(&hash, &hash_hex);
 
-        var key_buf: [32 + SESSION_HEX_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/session/{s}", .{hash_hex}) catch
+        var key_buf: [8 + SESSION_HEX_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "session/{s}", .{hash_hex}) catch
             return Error.Kv;
 
-        const v = self.root.get(key) catch |err| switch (err) {
+        const v = kv.get(key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return Error.Kv,
         };
@@ -737,7 +770,7 @@ pub const Tenant = struct {
         const now_ns: i64 = @intCast(std.time.nanoTimestamp());
         if (now_ns >= expires_at_ns) {
             // Drop the stale record opportunistically.
-            self.root.delete(key) catch {};
+            kv.delete(key) catch {};
             return null;
         }
         return .{ .is_root = v[8] != 0 };
@@ -747,14 +780,15 @@ pub const Tenant = struct {
     /// doesn't exist (idempotent logout).
     pub fn revokeSession(self: *Tenant, opaque_hex: []const u8) Error!void {
         if (opaque_hex.len != SESSION_HEX_LEN) return;
+        const kv = try self.adminKv();
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(opaque_hex, &hash, .{});
         var hash_hex: [SESSION_HEX_LEN]u8 = undefined;
         bytesToHex(&hash, &hash_hex);
-        var key_buf: [32 + SESSION_HEX_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/session/{s}", .{hash_hex}) catch
+        var key_buf: [8 + SESSION_HEX_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "session/{s}", .{hash_hex}) catch
             return Error.Kv;
-        self.root.delete(key) catch |err| switch (err) {
+        kv.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return Error.Kv,
         };
@@ -764,14 +798,14 @@ pub const Tenant = struct {
     //
     // Signup / email-login flow. `mintMagic` generates a fresh opaque
     // 64-hex token, hashes it with SHA-256, and stores
-    // `__root__/magic/{hash_hex}` →
+    // `magic/{hash_hex}` in the admin tenant's app.db →
     //   `{"email":"...","instance_id":"...","expires_at_ns":<i64>}`.
     // The caller emails the plaintext token; `redeemMagic` hashes the
     // submitted token, looks up the row, enforces TTL, and
     // **deletes the row before returning** — single-use, so a replayed
     // link never validates twice.
     //
-    // Why hash-at-rest: a leaked `__root__.db` (backup, support dump,
+    // Why hash-at-rest: a leaked admin app.db (backup, support dump,
     // dev clone) must not let an attacker impersonate pending signups.
     // The hash stores nothing redeemable; the pre-image (the link in
     // the user's inbox) is what redeems. Same pattern as
@@ -815,6 +849,7 @@ pub const Tenant = struct {
     ) Error![MAGIC_HEX_LEN]u8 {
         try validateEmail(email);
         try validateInstanceId(instance_id);
+        const kv = try self.adminKv();
 
         var raw: [32]u8 = undefined;
         std.crypto.random.bytes(&raw);
@@ -839,10 +874,10 @@ pub const Tenant = struct {
         ) catch return Error.OutOfMemory;
         defer self.allocator.free(body);
 
-        var key_buf: [32 + MAGIC_HEX_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/magic/{s}", .{hash_hex}) catch
+        var key_buf: [6 + MAGIC_HEX_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "magic/{s}", .{hash_hex}) catch
             return Error.Kv;
-        self.root.put(key, body) catch return Error.Kv;
+        kv.put(key, body) catch return Error.Kv;
 
         return opaque_hex;
     }
@@ -862,17 +897,18 @@ pub const Tenant = struct {
                 (b >= 'A' and b <= 'F');
             if (!ok) return null;
         }
+        const kv = try self.adminKv();
 
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(token_hex, &hash, .{});
         var hash_hex: [MAGIC_HEX_LEN]u8 = undefined;
         bytesToHex(&hash, &hash_hex);
 
-        var key_buf: [32 + MAGIC_HEX_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/magic/{s}", .{hash_hex}) catch
+        var key_buf: [6 + MAGIC_HEX_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "magic/{s}", .{hash_hex}) catch
             return Error.Kv;
 
-        const v = self.root.get(key) catch |err| switch (err) {
+        const v = kv.get(key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return Error.Kv,
         };
@@ -883,14 +919,14 @@ pub const Tenant = struct {
         }) catch {
             // Corrupted row — drop it and treat as a miss. Better
             // than leaking parser state up through an auth path.
-            self.root.delete(key) catch {};
+            kv.delete(key) catch {};
             return null;
         };
         defer parsed.deinit();
         const obj = switch (parsed.value) {
             .object => |o| o,
             else => {
-                self.root.delete(key) catch {};
+                kv.delete(key) catch {};
                 return null;
             },
         };
@@ -898,27 +934,27 @@ pub const Tenant = struct {
         const expires_at_ns = switch (obj.get("expires_at_ns") orelse .null) {
             .integer => |i| i,
             else => {
-                self.root.delete(key) catch {};
+                kv.delete(key) catch {};
                 return null;
             },
         };
         const now_ns: i64 = @intCast(std.time.nanoTimestamp());
         if (now_ns >= expires_at_ns) {
-            self.root.delete(key) catch {};
+            kv.delete(key) catch {};
             return null;
         }
 
         const email_str = switch (obj.get("email") orelse .null) {
             .string => |s| s,
             else => {
-                self.root.delete(key) catch {};
+                kv.delete(key) catch {};
                 return null;
             },
         };
         const inst_str = switch (obj.get("instance_id") orelse .null) {
             .string => |s| s,
             else => {
-                self.root.delete(key) catch {};
+                kv.delete(key) catch {};
                 return null;
             },
         };
@@ -930,7 +966,7 @@ pub const Tenant = struct {
 
         // Single-use: burn the record before returning. A second
         // redeem racing the first sees NotFound.
-        self.root.delete(key) catch return Error.Kv;
+        kv.delete(key) catch return Error.Kv;
 
         return .{ .email = email_copy, .instance_id = inst_copy };
     }
@@ -939,7 +975,8 @@ pub const Tenant = struct {
     /// `instance_id`. In the single-account M1 shape the root token
     /// grants access to every instance, so this reduces to
     /// `ctx.is_root`. Multi-account will consult
-    /// `__root__/account/{id}/instance/{inst}` markers here.
+    /// `account_member/{account_id}/{user_id}` markers here once the
+    /// user+account model lands.
     pub fn canAccessInstance(
         self: *Tenant,
         ctx: AuthContext,
@@ -951,20 +988,18 @@ pub const Tenant = struct {
     }
 
     fn clearRootTokens(self: *Tenant) Error!void {
-        // The root store has no range-scan API exposed here, so the
-        // cheapest correct thing is to track token hashes via the
-        // root kv itself: one well-known key `__root__/root_token_hash`
-        // always points at the currently-active hash (if any).
-        // Deleting THAT key's referent is what clears the prior token.
-        const current_key = "__root__/root_token_hash";
+        // Track the currently-active token hash via a single
+        // well-known key so rotation can find and delete the prior
+        // entry. Deleting THAT key's referent clears the old token.
+        const current_key = "root_token_hash";
         const prior_hash = self.root.get(current_key) catch |err| switch (err) {
             error.NotFound => return,
             else => return Error.Kv,
         };
         defer self.allocator.free(prior_hash);
 
-        var key_buf: [32 + 64]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "__root__/root_token/{s}", .{prior_hash}) catch
+        var key_buf: [12 + 64]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "root_token/{s}", .{prior_hash}) catch
             return Error.Kv;
         self.root.delete(key) catch |err| switch (err) {
             error.NotFound => {},
@@ -1057,7 +1092,7 @@ const TestFixture = struct {
     allocator: std.mem.Allocator,
     tmp_dir: []u8,
     root: *kv_mod.KvStore,
-    tenant: Tenant,
+    tenant: *Tenant,
 
     fn init(allocator: std.mem.Allocator) !TestFixture {
         const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
@@ -1071,12 +1106,18 @@ const TestFixture = struct {
         const root = try kv_mod.KvStore.open(allocator, root_path);
         errdefer root.close();
 
-        const tenant = try Tenant.init(allocator, root, tmp_dir);
+        const tenant = try Tenant.create(allocator, root, tmp_dir);
+        errdefer tenant.destroy();
+        // Register the singleton admin tenant — sessions and magic
+        // links live in its app.db, so most tests implicitly depend
+        // on it existing. Tests that need the "admin not registered"
+        // path can delete it before asserting.
+        try tenant.createInstance(ADMIN_INSTANCE_ID);
         return .{ .allocator = allocator, .tmp_dir = tmp_dir, .root = root, .tenant = tenant };
     }
 
     fn deinit(self: *TestFixture) void {
-        self.tenant.deinit();
+        self.tenant.destroy();
         self.root.close();
         std.fs.cwd().deleteTree(self.tmp_dir) catch {};
         self.allocator.free(self.tmp_dir);
@@ -1293,8 +1334,8 @@ test "reopening a tenant finds existing instances on lazy resolve" {
     {
         const root = try kv_mod.KvStore.open(allocator, root_path);
         defer root.close();
-        var tenant = try Tenant.init(allocator, root, tmp_dir);
-        defer tenant.deinit();
+        const tenant = try Tenant.create(allocator, root, tmp_dir);
+        defer tenant.destroy();
 
         try tenant.createInstance("acme");
         try tenant.assignDomain("acme.test", "acme");
@@ -1307,8 +1348,8 @@ test "reopening a tenant finds existing instances on lazy resolve" {
     {
         const root = try kv_mod.KvStore.open(allocator, root_path);
         defer root.close();
-        var tenant = try Tenant.init(allocator, root, tmp_dir);
-        defer tenant.deinit();
+        const tenant = try Tenant.create(allocator, root, tmp_dir);
+        defer tenant.destroy();
 
         const inst = (try tenant.resolveDomain("acme.test")).?;
         const got = try inst.kv.get("persisted");
@@ -1386,25 +1427,28 @@ test "canAccessInstance short-circuits for root" {
     try testing.expectEqual(false, try fx.tenant.canAccessInstance(other_ctx, "acme"));
 }
 
-test "__admin__ tenant's kv aliases to the root store" {
+test "__admin__ tenant is an instance like any other, with platform capability" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
 
-    try fx.tenant.createInstance(ADMIN_INSTANCE_ID);
+    // TestFixture already calls createInstance(ADMIN_INSTANCE_ID).
     const admin = (try fx.tenant.getInstance(ADMIN_INSTANCE_ID)).?;
-    // The Instance.kv pointer IS the root store.
-    try testing.expectEqual(fx.root, admin.kv);
 
-    // A write through admin.kv is a write to root; visible via root.get
-    // and via resolveDomain's existence check.
-    try admin.kv.put("__root__/instance/via-admin", "");
-    try testing.expectEqual(true, try fx.tenant.instanceExists("via-admin"));
+    // Admin has its OWN app.db — not aliased to root.
+    try testing.expect(admin.kv != fx.root);
 
-    // Conversely, a write directly to root shows up through admin.kv.
-    try fx.root.put("direct-root-key", "value");
-    const v = try admin.kv.get("direct-root-key");
-    defer testing.allocator.free(v);
-    try testing.expectEqualStrings("value", v);
+    // The singleton gets a back-pointer to the Tenant; regular
+    // instances do not.
+    try testing.expect(admin.platform != null);
+    try testing.expectEqual(fx.tenant, admin.platform.?);
+
+    try fx.tenant.createInstance("acme");
+    const acme = (try fx.tenant.getInstance("acme")).?;
+    try testing.expect(acme.platform == null);
+
+    // A write through admin.kv goes to admin's app.db, NOT root.
+    try admin.kv.put("mykey", "myvalue");
+    try testing.expectError(error.NotFound, fx.root.get("mykey"));
 }
 
 test "getInstance lazy-opens by id" {
@@ -1445,8 +1489,8 @@ test "getInstance survives restart by lazy-opening from root store" {
     {
         const root = try kv_mod.KvStore.open(allocator, root_path);
         defer root.close();
-        var tenant = try Tenant.init(allocator, root, tmp_dir);
-        defer tenant.deinit();
+        const tenant = try Tenant.create(allocator, root, tmp_dir);
+        defer tenant.destroy();
         try tenant.createInstance("persistent");
         const inst = (try tenant.getInstance("persistent")).?;
         try inst.kv.put("hello", "world");
@@ -1455,8 +1499,8 @@ test "getInstance survives restart by lazy-opening from root store" {
     {
         const root = try kv_mod.KvStore.open(allocator, root_path);
         defer root.close();
-        var tenant = try Tenant.init(allocator, root, tmp_dir);
-        defer tenant.deinit();
+        const tenant = try Tenant.create(allocator, root, tmp_dir);
+        defer tenant.destroy();
         const inst = (try tenant.getInstance("persistent")).?;
         const v = try inst.kv.get("hello");
         defer allocator.free(v);
@@ -1474,11 +1518,13 @@ test "listInstances returns every created instance" {
 
     var list = try fx.tenant.listInstances(100);
     defer list.deinit();
-    try testing.expectEqual(@as(usize, 3), list.ids.len);
-    // Scan is lex-ordered by id.
-    try testing.expectEqualStrings("alpha", list.ids[0]);
-    try testing.expectEqualStrings("beta", list.ids[1]);
-    try testing.expectEqualStrings("gamma", list.ids[2]);
+    // The fixture auto-registers `__admin__`; it sorts FIRST under
+    // ASCII lex order (double-underscore is 0x5f, before 'a' = 0x61).
+    try testing.expectEqual(@as(usize, 4), list.ids.len);
+    try testing.expectEqualStrings(ADMIN_INSTANCE_ID, list.ids[0]);
+    try testing.expectEqualStrings("alpha", list.ids[1]);
+    try testing.expectEqualStrings("beta", list.ids[2]);
+    try testing.expectEqualStrings("gamma", list.ids[3]);
 }
 
 test "listDomains returns host → instance mappings" {

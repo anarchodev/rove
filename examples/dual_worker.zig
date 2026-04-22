@@ -151,8 +151,8 @@ fn workerMain(args: *WorkerCtx) !void {
     const root_kv = try kv.KvStore.open(allocator, root_path);
     defer root_kv.close();
 
-    var tenant = try tenant_mod.Tenant.init(allocator, root_kv, args.data_dir);
-    defer tenant.deinit();
+    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, args.data_dir);
+    defer tenant.destroy();
 
     // The main thread already created the instances + assigned domains
     // in the shared __root__.db before spawning us. We just need to
@@ -164,7 +164,7 @@ fn workerMain(args: *WorkerCtx) !void {
     }
 
     const worker = try Worker.create(allocator, &reg, .{
-        .tenant = &tenant,
+        .tenant = tenant,
         .raft = args.raft,
         .addr = args.http_addr,
         .io_opts = .{
@@ -336,8 +336,8 @@ pub fn main() !void {
         const root_kv = try kv.KvStore.open(allocator, root_path);
         defer root_kv.close();
 
-        var tenant = try tenant_mod.Tenant.init(allocator, root_kv, cli.data_dir);
-        defer tenant.deinit();
+        const tenant = try tenant_mod.Tenant.create(allocator, root_kv, cli.data_dir);
+        defer tenant.destroy();
 
         if (cli.bootstrap_root_token) |t| {
             try tenant.installRootToken(t);

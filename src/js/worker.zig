@@ -1741,6 +1741,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .crypto_random_tape = &tapes.crypto_random,
             .prng_seed = @bitCast(received_ns),
             .request_id = request_id,
+            // Non-null only when the handler-tenant is the admin
+            // singleton — gates installation of `platform.root.*`.
+            .platform = handler_inst.platform,
         };
 
         txn.?.savepoint() catch |err| {
@@ -3905,8 +3908,8 @@ test "openTenantFiles runs the orphan sweep on startup" {
     const root_kv = try kv_mod.KvStore.open(allocator, root_path);
     defer root_kv.close();
 
-    var tenant = try tenant_mod.Tenant.init(allocator, root_kv, tmp_dir);
-    defer tenant.deinit();
+    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, tmp_dir);
+    defer tenant.destroy();
 
     try tenant.createInstance("acme");
     const inst = tenant.instances.get("acme").?;
@@ -3952,8 +3955,8 @@ test "commitTxn drops the undo row so the next sweep is a no-op" {
     const root_kv = try kv_mod.KvStore.open(allocator, root_path);
     defer root_kv.close();
 
-    var tenant = try tenant_mod.Tenant.init(allocator, root_kv, tmp_dir);
-    defer tenant.deinit();
+    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, tmp_dir);
+    defer tenant.destroy();
 
     try tenant.createInstance("acme");
     const inst = tenant.instances.get("acme").?;
@@ -3994,8 +3997,8 @@ test "captureLog appends a record to the tenant's LogStore" {
     const root_kv = try kv_mod.KvStore.open(allocator, root_path);
     defer root_kv.close();
 
-    var tenant = try tenant_mod.Tenant.init(allocator, root_kv, tmp_dir);
-    defer tenant.deinit();
+    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, tmp_dir);
+    defer tenant.destroy();
 
     try tenant.createInstance("acme");
     const inst = tenant.instances.get("acme").?;

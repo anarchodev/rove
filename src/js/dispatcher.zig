@@ -16,6 +16,7 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
+const tenant_mod = @import("rove-tenant");
 
 const globals = @import("globals.zig");
 const c = qjs.c;
@@ -98,6 +99,11 @@ pub const Request = struct {
     /// replay. Also used downstream so the log record and the outbox
     /// rows spawned by the request share the same id.
     request_id: u64 = 0,
+    /// Non-null on admin-tenant requests — points back at the
+    /// `Tenant` so the JS globals can install `platform.root.*` for
+    /// the admin handler. Every other tenant's request passes null
+    /// and the callbacks reject.
+    platform: ?*tenant_mod.Tenant = null,
 };
 
 pub const Response = struct {
@@ -241,6 +247,7 @@ pub const Dispatcher = struct {
             .crypto_random_tape = request.crypto_random_tape,
             .prng = std.Random.DefaultPrng.init(request.prng_seed),
             .request_id = request.request_id,
+            .platform = request.platform,
         };
 
         // Memcpy-restore the frozen post-init image of

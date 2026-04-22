@@ -18,6 +18,7 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
+const tenant_mod = @import("rove-tenant");
 
 const c = qjs.c;
 
@@ -77,6 +78,12 @@ pub const DispatchState = struct {
     /// invocation. Resets per request. Part of the outbox id derivation
     /// so replays produce the same ids.
     webhook_call_index: u32 = 0,
+    /// Singleton admin-capability pointer. Non-null only when the
+    /// handler-tenant is `__admin__`; the dispatcher installs the
+    /// `platform.*` JS globals (instance / domain / root kv access)
+    /// iff this field is set. Regular tenants' handlers see
+    /// `platform === undefined` in their runtime.
+    platform: ?*tenant_mod.Tenant = null,
 };
 
 // ── C helpers ──────────────────────────────────────────────────────────
@@ -608,6 +615,141 @@ fn jsConsoleLog(
     return js_undefined;
 }
 
+// ── platform.root.* (admin singleton only) ────────────────────────
+//
+// Only installed when the handler-tenant is `__admin__` — gated on
+// `state.platform` being non-null in `installRequest`. Provides raw
+// access to the platform root store for the admin JS handler's
+// instance / domain / user / account reads. Writes currently land
+// locally on the leader only (no raft propagation of root writes
+// from JS handlers yet); multi-node correctness for admin-handler
+// writes is follow-up work. Signup + other platform-level writes
+// go through the Zig-native HTTP endpoints, which DO replicate.
+
+fn jsPlatformRootGet(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) return js_undefined;
+    const state = getState(ctx);
+    const tenant = state.platform orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    };
+
+    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(key);
+
+    const value = tenant.root.get(key) catch |err| switch (err) {
+        error.NotFound => return js_null,
+        else => {
+            state.pending_kv_error = err;
+            return js_null;
+        },
+    };
+    defer state.allocator.free(value);
+    return c.JS_NewStringLen(ctx, value.ptr, value.len);
+}
+
+fn jsPlatformRootSet(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 2) return js_undefined;
+    const state = getState(ctx);
+    const tenant = state.platform orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    };
+
+    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(key);
+    const val = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
+    defer state.allocator.free(val);
+
+    tenant.root.put(key, val) catch |err| {
+        state.pending_kv_error = err;
+    };
+    return js_undefined;
+}
+
+fn jsPlatformRootDelete(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) return js_undefined;
+    const state = getState(ctx);
+    const tenant = state.platform orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    };
+
+    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(key);
+
+    tenant.root.delete(key) catch |err| switch (err) {
+        error.NotFound => return js_undefined,
+        else => {
+            state.pending_kv_error = err;
+            return js_undefined;
+        },
+    };
+    return js_undefined;
+}
+
+fn jsPlatformRootPrefix(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) return js_undefined;
+    const state = getState(ctx);
+    const tenant = state.platform orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    };
+
+    const prefix_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(prefix_str);
+
+    const cursor_str = if (argc >= 2 and !c.JS_IsUndefined(argv[1]) and !c.JS_IsNull(argv[1]))
+        valueToOwnedString(state, ctx, argv[1]) catch return js_exception
+    else
+        state.allocator.dupe(u8, "") catch return js_exception;
+    defer state.allocator.free(cursor_str);
+
+    const ROOT_PREFIX_MAX: u32 = 1000;
+    const ROOT_PREFIX_DEFAULT: u32 = 100;
+    const limit: u32 = if (argc >= 3 and !c.JS_IsUndefined(argv[2]) and !c.JS_IsNull(argv[2])) blk: {
+        var n: i32 = 0;
+        _ = c.JS_ToInt32(ctx, &n, argv[2]);
+        if (n <= 0) break :blk ROOT_PREFIX_DEFAULT;
+        break :blk @min(@as(u32, @intCast(n)), ROOT_PREFIX_MAX);
+    } else ROOT_PREFIX_DEFAULT;
+
+    var scan = tenant.root.prefix(prefix_str, cursor_str, limit) catch |err| {
+        state.pending_kv_error = err;
+        return js_null;
+    };
+    defer scan.deinit();
+
+    const arr = c.JS_NewArray(ctx);
+    for (scan.entries, 0..) |e, i| {
+        const obj = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, obj, "key", c.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
+        _ = c.JS_SetPropertyStr(ctx, obj, "value", c.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
+        _ = c.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
+    }
+    return arr;
+}
+
 // ── Installation ──────────────────────────────────────────────────────
 
 /// Install the pieces of the global surface that do NOT depend on a
@@ -619,7 +761,10 @@ fn jsConsoleLog(
 /// and then memcpy-restoring for each request is the whole point of
 /// rove-qjs.
 ///
-/// Installs: `kv`, `console`, `crypto`, `Date.now`, `Math.random`.
+/// Installs: `kv`, `console`, `crypto`, `Date.now`, `Math.random`,
+/// `webhook`, `email`. Installs `platform` on every context too —
+/// the per-request `installRequest` gates it on `state.platform` so
+/// callbacks reject non-admin handlers at call time.
 /// Does NOT install `request`, `response`, or the context opaque —
 /// see `installRequest`.
 pub fn installStatic(ctx: *c.JSContext) void {
@@ -679,10 +824,9 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // and keeps the platform out of the abuse loop: a customer can
     // only email.send using a Resend key they have.
     //
-    // Our own magic-link / signup emails live in the `__admin__`
-    // handler, whose kv aliases to the root store, so they do
-    // `email.send({ key: kv.get("__root__/resend_key"), ... })` —
-    // zero special-case infrastructure.
+    // Our own magic-link / signup emails are queued by the Zig-
+    // native signup handler, which reads the platform Resend key
+    // off root.db and writes the outbox row into __admin__'s app.db.
     const email_snippet =
         \\globalThis.email = {
         \\  send(opts) {
@@ -731,6 +875,18 @@ pub fn installStatic(ctx: *c.JSContext) void {
         c.JS_EVAL_TYPE_GLOBAL,
     );
     c.JS_FreeValue(ctx, email_result);
+
+    // platform = { root: { get, set, delete, prefix } }. Installed
+    // on every context; the C callbacks check `state.platform` and
+    // throw for non-admin handlers. See `jsPlatformRoot*`.
+    const platform_obj = c.JS_NewObject(ctx);
+    const root_obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, root_obj, "get", c.JS_NewCFunction2(ctx, jsPlatformRootGet, "get", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, root_obj, "set", c.JS_NewCFunction2(ctx, jsPlatformRootSet, "set", 2, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, root_obj, "delete", c.JS_NewCFunction2(ctx, jsPlatformRootDelete, "delete", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, root_obj, "prefix", c.JS_NewCFunction2(ctx, jsPlatformRootPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, platform_obj, "root", root_obj);
+    _ = c.JS_SetPropertyStr(ctx, global, "platform", platform_obj);
 }
 
 /// Install the per-request pieces of the global surface: attach

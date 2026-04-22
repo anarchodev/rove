@@ -235,14 +235,17 @@ const TENANT_IDS = [_][]const u8{
 /// bootstrap. Each RPC function is a named export; the UI calls them
 /// by name (`?fn=listInstance` or `POST {fn:"listInstance",args:[...]}`).
 ///
-/// Tenant CRUD writes `__root__/instance/*` / `__root__/domain/*`
-/// keys, which only make sense when the dispatcher bound `kv` to the
-/// root store (i.e. the bare admin domain). The UI hits those RPCs
-/// on that host.
+/// Reads platform-level state (instances, domains) via the
+/// `platform.root.*` globals, which are only installed on the admin
+/// handler (gated by `Instance.platform` being non-null). Writes go
+/// through the same primitives but aren't replicated through raft
+/// yet (single-node admin writes only) — multi-node correctness for
+/// admin-handler writes is a follow-up; signup-driven instance
+/// creation already goes through the replicated Zig-native path.
 ///
-/// The KV RPCs operate on whatever store the dispatcher selected —
-/// root for the bare admin domain, the target tenant's app.db for
-/// `{id}.api.loop46.com`. Same handler, rebound scope.
+/// The KV RPCs (`listKv`, `setKv`, etc.) still operate on whatever
+/// store the dispatcher selected — admin's own app.db by default,
+/// the target tenant's app.db under `X-Rove-Scope: <id>`.
 ///
 /// Status on error flows through the ambient `response` global;
 /// non-200 return values use the `{ error }` shape as the body.
@@ -252,44 +255,44 @@ const ADMIN_HANDLER_SRC =
     \\}
     \\
     \\export function listInstance() {
-    \\    const entries = kv.prefix("__root__/instance/", "", 1000);
+    \\    const entries = platform.root.prefix("instance/", "", 1000);
     \\    return {
     \\        instances: entries.map((e) => ({
-    \\            id: e.key.slice("__root__/instance/".length),
+    \\            id: e.key.slice("instance/".length),
     \\        })),
     \\    };
     \\}
     \\
     \\export function getInstance(id) {
     \\    if (!validId(id)) { response.status = 400; return { error: "invalid id" }; }
-    \\    const v = kv.get("__root__/instance/" + id);
+    \\    const v = platform.root.get("instance/" + id);
     \\    if (v === null) { response.status = 404; return { error: "not found" }; }
     \\    return { id: id };
     \\}
     \\
     \\export function createInstance(id) {
     \\    if (!validId(id)) { response.status = 400; return { error: "invalid id" }; }
-    \\    kv.set("__root__/instance/" + id, "");
+    \\    platform.root.set("instance/" + id, "");
     \\    response.status = 201;
     \\    return { id: id };
     \\}
     \\
     \\export function deleteInstance(id) {
     \\    if (!validId(id)) { response.status = 400; return { error: "invalid id" }; }
-    \\    kv.delete("__root__/instance/" + id);
-    \\    const doms = kv.prefix("__root__/domain/", "", 1000);
+    \\    platform.root.delete("instance/" + id);
+    \\    const doms = platform.root.prefix("domain/", "", 1000);
     \\    for (let i = 0; i < doms.length; i++) {
-    \\        if (doms[i].value === id) kv.delete(doms[i].key);
+    \\        if (doms[i].value === id) platform.root.delete(doms[i].key);
     \\    }
     \\    response.status = 204;
     \\    return null;
     \\}
     \\
     \\export function listDomain() {
-    \\    const entries = kv.prefix("__root__/domain/", "", 1000);
+    \\    const entries = platform.root.prefix("domain/", "", 1000);
     \\    return {
     \\        domains: entries.map((e) => ({
-    \\            host: e.key.slice("__root__/domain/".length),
+    \\            host: e.key.slice("domain/".length),
     \\            instance_id: e.value,
     \\        })),
     \\    };
@@ -300,12 +303,12 @@ const ADMIN_HANDLER_SRC =
     \\        response.status = 400;
     \\        return { error: "host and instance_id required" };
     \\    }
-    \\    const exists = kv.get("__root__/instance/" + instance_id);
+    \\    const exists = platform.root.get("instance/" + instance_id);
     \\    if (exists === null) {
     \\        response.status = 404;
     \\        return { error: "instance not found" };
     \\    }
-    \\    kv.set("__root__/domain/" + host, instance_id);
+    \\    platform.root.set("domain/" + host, instance_id);
     \\    response.status = 201;
     \\    return { host: host, instance_id: instance_id };
     \\}
@@ -387,9 +390,10 @@ const Cli = struct {
     /// `Authorization: Bearer <hex>` header.
     bootstrap_root_token: ?[]const u8 = null,
     /// Platform-provided Resend API key. When set, the worker
-    /// installs it at `__root__/resend_key` so `email.send` can read
-    /// it when building its outbox envelope. Customer handlers never
-    /// see the plaintext. Rotate by re-running with a new value.
+    /// installs it in root.db under `resend_key` so the Zig-native
+    /// signup handler can read it when building a magic-link email
+    /// outbox envelope. Customer handlers never see the plaintext.
+    /// Rotate by re-running with a new value.
     bootstrap_resend_key: ?[]const u8 = null,
     /// Number of worker threads. Each owns its own Registry/Io/H2/
     /// Tenant/Dispatcher and binds the same HTTP/2 port via
@@ -663,13 +667,13 @@ fn workerMain(args: *WorkerCtx) !void {
     const root_kv = try kv.KvStore.open(allocator, root_path);
     defer root_kv.close();
 
-    var tenant = try tenant_mod.Tenant.initWithCounters(
+    const tenant = try tenant_mod.Tenant.createWithCounters(
         allocator,
         root_kv,
         args.data_dir,
         args.seq_counters,
     );
-    defer tenant.deinit();
+    defer tenant.destroy();
     try tenant.setPublicSuffix(args.public_suffix);
 
     // The main thread already created the instances + assigned domains
@@ -695,7 +699,7 @@ fn workerMain(args: *WorkerCtx) !void {
     }
 
     const worker = try Worker.create(allocator, &reg, .{
-        .tenant = &tenant,
+        .tenant = tenant,
         .raft = args.raft,
         .addr = args.http_addr,
         .io_opts = .{
@@ -893,8 +897,8 @@ pub fn main() !void {
         const root_kv = try kv.KvStore.open(allocator, root_path);
         defer root_kv.close();
 
-        var tenant = try tenant_mod.Tenant.init(allocator, root_kv, cli.data_dir);
-        defer tenant.deinit();
+        const tenant = try tenant_mod.Tenant.create(allocator, root_kv, cli.data_dir);
+        defer tenant.destroy();
 
         if (cli.bootstrap_root_token) |t| {
             tenant.installRootToken(t) catch |err| {
@@ -912,10 +916,9 @@ pub fn main() !void {
             std.debug.print("bootstrap: resend key installed (platform default)\n", .{});
         }
 
-        // __admin__ must be created before any other tenant because
-        // its `app.db` aliases to the root store — that aliasing is
-        // the whole reason admin handler JS can do plain `kv.set` on
-        // `__root__/*` keys. See `src/tenant/root.zig`.
+        // __admin__ is created first so session / magic operations
+        // (which live in its app.db) have a place to land before any
+        // other bootstrap step runs. See `src/tenant/root.zig`.
         try tenant.createInstance("__admin__");
         try tenant.createInstance("acme");
         try tenant.createInstance("globex");

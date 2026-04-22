@@ -277,6 +277,7 @@ fn runOneCallback(
         .crypto_random_tape = &tapes.crypto_random,
         .prng_seed = @bitCast(received_ns),
         .request_id = request_id,
+        .platform = inst.platform,
     };
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
