@@ -759,13 +759,10 @@ Audited against `~/.claude/memory/rove-library.md`. Findings:
 - **`dispatchOnce` monolith** (violated principle 5 "small systems with flush boundaries"). Split into phases; see §10.6.
 - **Interior pointers on stack-allocated struct** (violated principle 14). `Tenant` now heap-allocates via `create`/`destroy`.
 - **Silent error swallowing on kv-undo** (violated fail-fast). Now logs `std.log.err` on undoTxn failure.
-
-### Outstanding (known bugs)
-These are not launch-blockers for single-node but should be tracked:
-
-- **Handler exceptions → 200 empty body**. `src/js/worker.zig` checks `dispatcher.last_kv_error` and savepoint release errors but not `resp.exception.len > 0`. Every customer handler that throws returns a 200 with whatever partial body was stamped (usually empty). Should be 500 with exception message in log + body. Fix is ~10 lines in the per-handler dispatch block.
-- **`tl.store.applyBatch(batch) catch {}`** in `src/js/worker.zig:~1016` silently drops log records on flush failure. Should at least `std.log.warn`.
-- **`setResponse(... 500 ...) catch {}`** in `src/files_server/thread.zig:~193` silently swallows errors on the already-failed-response path. Should propagate so the connection closes cleanly.
+- **Handler exceptions → 200 empty body** (2026-04-27). The dispatcher captured the throw into `resp.exception` but the worker only checked `last_kv_error` and savepoint-release errors. Now translates `resp.exception.len > 0` into a 500 with `handler threw: <msg>` in body + log, after rolling back the savepoint. Fix in `src/js/worker.zig` per-handler dispatch; covered by `signup_smoke.sh` section 9b.
+- **Silent error swallowing on log-batch fallback** (2026-04-27, fail-fast). `tl.store.applyBatch(batch) catch {}` in `src/js/worker.zig` flushLogs envelope-encode-failure path now logs `std.log.warn` with batch size and tenant.
+- **Silent error swallowing on failed-response** (2026-04-27, fail-fast). The `setResponse(... 500 ...) catch {}` instances in `src/files_server/thread.zig` and `src/log_server/thread.zig` per-request error paths now log `std.log.err` with the inner error name. Did NOT propagate (would kill the whole server thread on a single bad response — see runThread loop) but the entity-stuck-in-request_out condition is now visible.
+- **Silent error swallowing on `txn.rollbackTo` after handler failure** (2026-04-27, fail-fast). Three sites in `src/js/worker.zig` per-handler dispatch (dispatcher.run catch, handler exception, kv error) now log `std.log.err` with the tenant id and rollback error name. Rollback failure here indicates kv state inconsistency worth surfacing.
 
 ### Outstanding (nice-to-fix)
 - **Header builder duplication**: `buildSystemRespHeaders`, `buildHandlerRespHeaders`, `buildAuthRespHeaders`, `buildRedirectRespHeaders` all pack pair-lists into one contiguous buffer. ~80 lines of boilerplate collapses to one builder taking a pair slice.
@@ -780,7 +777,7 @@ What customers writing handlers against rove may not expect. Flag any that shoul
 
 - **Default export is called with NO arguments.** Read `request.method` / `request.path` / `request.body` / `request.query` from the ambient `request` global. The common "handler takes `req, res`" reflex doesn't apply.
 - **Return value = response body.** No `response.body = "..."`. String returns emit as-is; objects are `JSON.stringify`-ed with `content-type: application/json` auto-stamped.
-- **Handler exceptions silently return 200 empty body.** Pre-existing bug (§11). Until fixed, customers debugging should watch `console.log` output in request logs rather than HTTP status.
+- **Handler exceptions return 500 with `handler threw: <message>` in the body.** Customers debugging should look at the response body for the JS exception text; the same text is also captured into the request log's `exception` field.
 - **10ms CPU budget** covers handler + every trigger fired + every cascade those triggers caused, *in aggregate*. Not a per-handler or per-trigger cap. Runaway `while(true)` trips the budget and returns 504.
 
 ### Available / missing globals

@@ -1013,7 +1013,10 @@ pub fn flushLogs(worker: anytype) !void {
         const envelope = apply_mod.encodeLogBatchEnvelope(allocator, tl.instance_id, batch) catch |err| {
             std.log.warn("rove-js flushLogs: envelope encode failed: {s}", .{@errorName(err)});
             // Local write still useful even if envelope fails.
-            tl.store.applyBatch(batch) catch {};
+            tl.store.applyBatch(batch) catch |le| std.log.warn(
+                "rove-js flushLogs: local applyBatch fallback for {s} also failed: {s} ({d} log records dropped)",
+                .{ tl.instance_id, @errorName(le), batch.len },
+            );
             continue;
         };
         defer allocator.free(envelope);
@@ -1929,7 +1932,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             request,
             &budget,
         ) catch |err| {
-            txn.?.rollbackTo() catch {};
+            txn.?.rollbackTo() catch |re| std.log.err(
+                "rove-js: rollbackTo after dispatch error failed for {s}: {s} (kv state may be inconsistent)",
+                .{ scope_inst.id, @errorName(re) },
+            );
             const outcome: log_mod.Outcome = if (err == dispatcher_mod.DispatchError.Interrupted)
                 .timeout
             else
@@ -1961,7 +1967,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // leaving status at the default 200 and body empty, so without
         // this check we'd ship a 200 empty body.
         if (resp.exception.len > 0) {
-            txn.?.rollbackTo() catch {};
+            txn.?.rollbackTo() catch |re| std.log.err(
+                "rove-js: rollbackTo after handler exception failed for {s}: {s} (kv state may be inconsistent)",
+                .{ scope_inst.id, @errorName(re) },
+            );
             const console_owned = resp.console;
             const exception_owned = resp.exception;
             resp.console = &.{};
@@ -1978,7 +1987,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (worker.dispatcher.last_kv_error != null) {
             std.log.warn("rove-js handler kv error: {s}", .{@errorName(worker.dispatcher.last_kv_error.?)});
             worker.dispatcher.last_kv_error = null;
-            txn.?.rollbackTo() catch {};
+            txn.?.rollbackTo() catch |re| std.log.err(
+                "rove-js: rollbackTo after kv error failed for {s}: {s} (kv state may be inconsistent)",
+                .{ scope_inst.id, @errorName(re) },
+            );
             try setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
             captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
             processed += 1;

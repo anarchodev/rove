@@ -222,7 +222,10 @@ fn processRequests(
     for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
         handleOne(server, allocator, data_dir, raft, ent, sid, sess, rh, rb) catch |err| {
             std.log.warn("files-server: handler error: {s}", .{@errorName(err)});
-            setResponse(server, ent, sid, sess, 500, null, "internal error\n") catch {};
+            setResponse(server, ent, sid, sess, 500, null, "internal error\n") catch |se| std.log.err(
+                "files-server: failed to write 500 response after handler error: {s} (entity may be stuck in request_out)",
+                .{@errorName(se)},
+            );
         };
     }
 }
