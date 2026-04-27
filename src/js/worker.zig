@@ -152,6 +152,76 @@ pub const StaticEntry = struct {
 
 /// Per-tenant code state held by the worker. Owns its own KvStore,
 /// BlobStore, and cached bytecode for the tenant's active handler.
+/// One row in a tenant's trigger registry. Built at deploy-load time
+/// from manifest paths matching `_triggers/.../index.{mjs,js}`.
+/// `prefix` is what we match kv keys against; `module_path` is the
+/// bytecode lookup key and the identity surfaced in error messages
+/// (e.g. `"_triggers/users/sessions/index.mjs"`).
+pub const TriggerEntry = struct {
+    prefix: []u8,
+    module_path: []u8,
+};
+
+/// Reserved key prefixes that customer triggers can't fire on.
+/// See PLAN §2.5 (Implementation notes / Platform-prefix guard).
+/// Both directions are checked at deploy-load: a derived prefix that
+/// starts with one of these is rejected; a derived prefix that one of
+/// these starts with is also rejected (since it would otherwise catch
+/// system writes via the platform's own prefix). Catch-all (prefix="")
+/// is allowed; the fire-time guard skips dispatch on platform keys.
+const PLATFORM_KV_PREFIXES = [_][]const u8{
+    "_audit/",
+    "_deploy/",
+    "_outbox/",
+    "_outbox_inflight/",
+    "_dlq/",
+    "_callback/",
+    "_magic/",
+    "_triggers/",
+    "_events/",
+    "_sessions/",
+};
+
+/// Returns the kv key prefix this manifest path registers as a trigger
+/// for, or null if the path isn't a trigger module entry. The path IS
+/// the prefix (PLAN §2.5):
+///   `_triggers/index.mjs`               → `""`        (catch-all)
+///   `_triggers/users/index.mjs`         → `"users/"`
+///   `_triggers/users/sessions/index.mjs` → `"users/sessions/"`
+/// `.js` is accepted alongside `.mjs` for symmetry with handler routing.
+fn triggerPathToPrefix(path: []const u8) ?[]const u8 {
+    const TR = "_triggers/";
+    if (!std.mem.startsWith(u8, path, TR)) return null;
+    const rest = path[TR.len..];
+
+    // `_triggers/index.mjs` / `_triggers/index.js` → catch-all.
+    if (std.mem.eql(u8, rest, "index.mjs")) return "";
+    if (std.mem.eql(u8, rest, "index.js")) return "";
+
+    // `<prefix>/index.mjs` → `<prefix>/`.
+    if (std.mem.endsWith(u8, rest, "/index.mjs")) {
+        return rest[0 .. rest.len - "index.mjs".len];
+    }
+    if (std.mem.endsWith(u8, rest, "/index.js")) {
+        return rest[0 .. rest.len - "index.js".len];
+    }
+    // Anything else under `_triggers/` (helper modules, non-index files)
+    // isn't itself a trigger entry point — it's just bytecode the
+    // trigger module may import.
+    return null;
+}
+
+/// Customer trigger registration prefix collides with a platform
+/// namespace (either direction). See `PLATFORM_KV_PREFIXES`.
+fn isReservedTriggerPrefix(prefix: []const u8) bool {
+    if (prefix.len == 0) return false; // catch-all is allowed
+    for (PLATFORM_KV_PREFIXES) |p| {
+        if (std.mem.startsWith(u8, prefix, p)) return true;
+        if (std.mem.startsWith(u8, p, prefix)) return true;
+    }
+    return false;
+}
+
 /// Refreshed periodically via `refreshDeployments` when the tenant's
 /// `deployment/current` advances.
 pub const TenantFiles = struct {
@@ -178,6 +248,13 @@ pub const TenantFiles = struct {
     /// are owned by `allocator`; bytes are fetched from `blob_backend`
     /// on demand.
     statics: std.StringHashMapUnmanaged(StaticEntry),
+    /// Trigger registry derived from manifest entries matching
+    /// `_triggers/.../index.{mjs,js}`. Sorted by prefix length
+    /// **descending** so a forward scan visits innermost (most-specific)
+    /// triggers first — natural for AFTER chain (innermost-first); the
+    /// BEFORE chain reverses (outermost-first). See PLAN §2.5 for the
+    /// tree-traversal-order rationale.
+    triggers: []TriggerEntry,
     /// When the next refresh check is allowed (absolute
     /// `std.time.nanoTimestamp()`). `refreshDeployments` skips tenants
     /// whose deadline hasn't passed yet so we don't hammer the code
@@ -614,6 +691,7 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
         .current_deployment_id = 0,
         .bytecodes = .empty,
         .statics = .empty,
+        .triggers = &.{},
         .next_refresh_ns = 0,
     };
     tc.store = files_mod.FileStore.init(
@@ -644,6 +722,7 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
 fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
     freeBytecodes(tc);
     freeStatics(tc);
+    freeTriggers(tc);
     tc.blob_backend.deinit();
     tc.files_kv.close();
     allocator.free(tc.instance_id);
@@ -1065,6 +1144,17 @@ fn freeStatics(tc: *TenantFiles) void {
     tc.statics = .empty;
 }
 
+/// Free every owned slice in `tc.triggers` and clear the array.
+/// Paired with `freeBytecodes` / `freeStatics` for deployment teardown.
+fn freeTriggers(tc: *TenantFiles) void {
+    for (tc.triggers) |*e| {
+        tc.allocator.free(e.prefix);
+        tc.allocator.free(e.module_path);
+    }
+    tc.allocator.free(tc.triggers);
+    tc.triggers = &.{};
+}
+
 /// Read the tenant's current deployment manifest, fetch every handler
 /// entry's bytecode blob, stage every static entry's metadata, and
 /// atomically swap both maps on the tenant. Returns `error.NoDeployment`
@@ -1101,6 +1191,15 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
         next_statics.deinit(tc.allocator);
     }
 
+    var next_triggers: std.ArrayList(TriggerEntry) = .empty;
+    errdefer {
+        for (next_triggers.items) |*e| {
+            tc.allocator.free(e.prefix);
+            tc.allocator.free(e.module_path);
+        }
+        next_triggers.deinit(tc.allocator);
+    }
+
     for (manifest.entries) |entry| {
         const path_copy = try tc.allocator.dupe(u8, entry.path);
         errdefer tc.allocator.free(path_copy);
@@ -1109,6 +1208,28 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
                 const bytecode = try bs.get(&entry.bytecode_hex, tc.allocator);
                 errdefer tc.allocator.free(bytecode);
                 try next_bc.put(tc.allocator, path_copy, bytecode);
+
+                // If this handler also matches the trigger path
+                // convention (`_triggers/<.../>index.{mjs,js}`), index
+                // it in the trigger registry. The bytecode lookup at
+                // fire time uses the same path key in `bytecodes`.
+                if (triggerPathToPrefix(entry.path)) |derived_prefix| {
+                    if (isReservedTriggerPrefix(derived_prefix)) {
+                        std.log.warn(
+                            "rove-js: tenant {s} trigger {s} rejected — prefix '{s}' overlaps a platform namespace",
+                            .{ tc.instance_id, entry.path, derived_prefix },
+                        );
+                        return error.ReservedTriggerPrefix;
+                    }
+                    const prefix_copy = try tc.allocator.dupe(u8, derived_prefix);
+                    errdefer tc.allocator.free(prefix_copy);
+                    const module_copy = try tc.allocator.dupe(u8, entry.path);
+                    errdefer tc.allocator.free(module_copy);
+                    try next_triggers.append(tc.allocator, .{
+                        .prefix = prefix_copy,
+                        .module_path = module_copy,
+                    });
+                }
             },
             .static => {
                 const ct_copy = try tc.allocator.dupe(u8, entry.content_type);
@@ -1121,16 +1242,35 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
         }
     }
 
+    // Sort triggers by prefix length descending (longest/innermost
+    // first). AFTER chain iterates forward; BEFORE chain iterates
+    // reverse. See the field doc on TenantFiles.triggers.
+    const triggers_slice = try next_triggers.toOwnedSlice(tc.allocator);
+    errdefer {
+        for (triggers_slice) |*e| {
+            tc.allocator.free(e.prefix);
+            tc.allocator.free(e.module_path);
+        }
+        tc.allocator.free(triggers_slice);
+    }
+    std.mem.sort(TriggerEntry, triggers_slice, {}, struct {
+        fn lessThan(_: void, a: TriggerEntry, b: TriggerEntry) bool {
+            return a.prefix.len > b.prefix.len;
+        }
+    }.lessThan);
+
     // Swap.
     freeBytecodes(tc);
     freeStatics(tc);
+    freeTriggers(tc);
     tc.bytecodes = next_bc;
     tc.statics = next_statics;
+    tc.triggers = triggers_slice;
     tc.current_deployment_id = manifest.id;
 
     std.log.info(
-        "rove-js: tenant {s} loaded deployment {d} ({d} handler(s), {d} static(s))",
-        .{ tc.instance_id, manifest.id, tc.bytecodes.count(), tc.statics.count() },
+        "rove-js: tenant {s} loaded deployment {d} ({d} handler(s), {d} static(s), {d} trigger(s))",
+        .{ tc.instance_id, manifest.id, tc.bytecodes.count(), tc.statics.count(), tc.triggers.len },
     );
 }
 
@@ -3285,6 +3425,66 @@ fn matchAdminSubdomain(host: []const u8, pattern: []const u8) ?[]const u8 {
     if (host[dot_before] != '.') return null;
     if (!std.mem.eql(u8, host[dot_before + 1 ..], pattern)) return null;
     return host[0..dot_before];
+}
+
+test "triggerPathToPrefix: catch-all" {
+    try std.testing.expectEqualStrings("", triggerPathToPrefix("_triggers/index.mjs").?);
+    try std.testing.expectEqualStrings("", triggerPathToPrefix("_triggers/index.js").?);
+}
+
+test "triggerPathToPrefix: single segment" {
+    try std.testing.expectEqualStrings("users/", triggerPathToPrefix("_triggers/users/index.mjs").?);
+    try std.testing.expectEqualStrings("users/", triggerPathToPrefix("_triggers/users/index.js").?);
+}
+
+test "triggerPathToPrefix: nested segments" {
+    try std.testing.expectEqualStrings("users/sessions/", triggerPathToPrefix("_triggers/users/sessions/index.mjs").?);
+    try std.testing.expectEqualStrings("a/b/c/d/", triggerPathToPrefix("_triggers/a/b/c/d/index.mjs").?);
+}
+
+test "triggerPathToPrefix: non-trigger paths return null" {
+    // Not under _triggers/.
+    try std.testing.expectEqual(@as(?[]const u8, null), triggerPathToPrefix("index.mjs"));
+    try std.testing.expectEqual(@as(?[]const u8, null), triggerPathToPrefix("users/index.mjs"));
+    try std.testing.expectEqual(@as(?[]const u8, null), triggerPathToPrefix("_static/index.html"));
+    // Under _triggers/ but not an index file (helper module imported by a trigger).
+    try std.testing.expectEqual(@as(?[]const u8, null), triggerPathToPrefix("_triggers/users/lib.mjs"));
+    try std.testing.expectEqual(@as(?[]const u8, null), triggerPathToPrefix("_triggers/users/sessions/util.mjs"));
+    // Wrong extension.
+    try std.testing.expectEqual(@as(?[]const u8, null), triggerPathToPrefix("_triggers/users/index.ts"));
+}
+
+test "isReservedTriggerPrefix: catch-all is allowed" {
+    try std.testing.expect(!isReservedTriggerPrefix(""));
+}
+
+test "isReservedTriggerPrefix: customer prefixes are allowed" {
+    try std.testing.expect(!isReservedTriggerPrefix("users/"));
+    try std.testing.expect(!isReservedTriggerPrefix("orders/"));
+    try std.testing.expect(!isReservedTriggerPrefix("a/b/c/"));
+    try std.testing.expect(!isReservedTriggerPrefix("my_audit/")); // doesn't share prefix with _audit/
+}
+
+test "isReservedTriggerPrefix: exact platform prefix blocked" {
+    try std.testing.expect(isReservedTriggerPrefix("_audit/"));
+    try std.testing.expect(isReservedTriggerPrefix("_outbox/"));
+    try std.testing.expect(isReservedTriggerPrefix("_events/"));
+    try std.testing.expect(isReservedTriggerPrefix("_sessions/"));
+    try std.testing.expect(isReservedTriggerPrefix("_triggers/"));
+}
+
+test "isReservedTriggerPrefix: deeper-than-platform blocked (would catch system writes)" {
+    try std.testing.expect(isReservedTriggerPrefix("_audit/secrets/"));
+    try std.testing.expect(isReservedTriggerPrefix("_outbox/specific_id"));
+}
+
+test "isReservedTriggerPrefix: shallower-than-platform blocked (would catch system writes)" {
+    // `_aud` would catch writes to `_audit/foo`.
+    try std.testing.expect(isReservedTriggerPrefix("_aud"));
+    // `_o` would catch writes to `_outbox/...`, `_outbox_inflight/...`.
+    try std.testing.expect(isReservedTriggerPrefix("_o"));
+    // `_` alone catches everything starting with underscore — all platform prefixes.
+    try std.testing.expect(isReservedTriggerPrefix("_"));
 }
 
 test "matchAdminSubdomain" {
