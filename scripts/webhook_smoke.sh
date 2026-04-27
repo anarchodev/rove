@@ -6,7 +6,7 @@
 #   - the outbox drainer delivers the row to a real HTTP server
 #   - the drainer writes `_callback/{id}` with the delivery outcome
 #   - `dispatchCallbacks` invokes the customer's callback handler
-#     (`_code/cbresult.mjs`) with a camelCase event object
+#     (`cbresult.mjs`) with a camelCase event object
 #   - the callback's `kv.set` is durable + visible via the admin API
 #
 # Requirements:
@@ -127,7 +127,7 @@ ok "python echo target up on :${ECHO_PORT}"
 
 # ── 3. Fire the webhook through the acme handler ──────────────────────
 #
-# The handler is at _code/cbfire/index.mjs → URL /cbfire?fn=fire.
+# The handler is at cbfire/index.mjs → URL /cbfire?fn=fire.
 # It calls webhook.send(...) and returns { id } so the smoke can
 # correlate the receipt.
 ARGS_JSON=$(python3 -c "

@@ -430,12 +430,17 @@ pub fn uploadStatic(
 }
 
 /// Upload-and-deploy an admin single-file write. Infers kind from the
-/// path prefix (`_code/` → handler, `_static/` → static) and commits a
-/// fresh deployment in the same call. Returns the new deployment id.
+/// path and commits a fresh deployment in the same call. Returns the
+/// new deployment id.
 ///
-/// Anything outside the `_code/` / `_static/` prefixes is rejected with
-/// `Error.InvalidPath`. Customers can't claim top-level `_`-prefixed
-/// paths — the policy lives at the edge (request handler or admin UI).
+/// Kind rules:
+///   - `_static/<path>`            → static (raw bytes, served verbatim)
+///   - top-level `<path>.mjs`/`.js` → handler (compiled to bytecode)
+///   - anything else               → `Error.InvalidPath`
+///
+/// `_static/` wins over the extension check, so a file like
+/// `_static/foo.mjs` is served as bytes — the customer chose to put it
+/// under the static prefix.
 pub fn putFileAndDeploy(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
@@ -449,24 +454,9 @@ pub fn putFileAndDeploy(
     /// writes only.
     replicate: ?*kv_mod.WriteSet,
 ) Error!u64 {
-    // If the file already exists, preserve its kind so the Code tab
-    // can save edits to a handler that wasn't created under `_code/`
-    // (e.g. legacy `index.mjs` deployments) without a prefix rename.
-    var existing: ?files_mod.Kind = null;
-    {
-        var h: InstanceCtx = undefined;
-        try h.init(allocator, data_dir, instance_id, stubCompile, null);
-        defer h.deinit();
-        if (h.store.stat(path)) |info| {
-            var mut = info;
-            defer mut.deinit();
-            existing = mut.kind;
-        } else |_| {}
-    }
-
-    const kind = existing orelse blk: {
-        if (std.mem.startsWith(u8, path, "_code/")) break :blk files_mod.Kind.handler;
-        if (std.mem.startsWith(u8, path, "_static/")) break :blk files_mod.Kind.static;
+    const kind: files_mod.Kind = blk: {
+        if (std.mem.startsWith(u8, path, "_static/")) break :blk .static;
+        if (std.mem.endsWith(u8, path, ".mjs") or std.mem.endsWith(u8, path, ".js")) break :blk .handler;
         return Error.InvalidPath;
     };
 

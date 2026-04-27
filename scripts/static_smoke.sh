@@ -151,7 +151,7 @@ ok "convention 404 served from _static/_404.html"
 # ── 9. PUT at bad prefix → 400 ────────────────────────────────────────
 code=$(put_static "evil/foo.html" "text/html" 'x')
 [[ "$code" == "400" ]] || fail "bad prefix (got $code)"
-ok "PUT outside _code/_static → 400"
+ok "PUT outside _static and not .mjs/.js → 400"
 
 # ── 10. PUT with traversal → 400 ──────────────────────────────────────
 code=$(put_static "_static/../escape" "text/html" 'x')

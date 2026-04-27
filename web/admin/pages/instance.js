@@ -554,19 +554,19 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
 
   newBtn.addEventListener("click", async () => {
     const raw = prompt(
-      "New file path. Must start with `_code/` (handler) or `_static/` (static asset).\n\nExamples:\n  _code/api/index.mjs\n  _static/about.html",
-      "_code/",
+      "New file path. Either a handler ending in `.mjs` / `.js`, or a static asset under `_static/`.\n\nExamples:\n  index.mjs\n  api/users.mjs\n  _static/about.html",
+      "",
     );
     if (raw == null) return;
     const path = raw.trim();
     if (!path) return;
 
     const kind =
-      path.startsWith("_code/") ? "handler"
-      : path.startsWith("_static/") ? "static"
+      path.startsWith("_static/") ? "static"
+      : (path.endsWith(".mjs") || path.endsWith(".js")) ? "handler"
       : null;
     if (!kind) {
-      showError("Path must start with `_code/` or `_static/`.");
+      showError("Path must end in `.mjs` / `.js` or live under `_static/`.");
       return;
     }
 

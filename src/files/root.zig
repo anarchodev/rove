@@ -976,9 +976,11 @@ test "validatePath rejects uppercase, double-slash, percent-encoded slash" {
     try testing.expectError(Error.InvalidPath, validatePath("foo bar"));
     try testing.expectError(Error.InvalidPath, validatePath("foo?bar"));
     // Leading underscore is reserved by policy at a higher layer, but
-    // the core validator lets it through so it can form `_static/*` etc.
+    // the core validator lets it through so it can form `_static/*`,
+    // `_404/*`, `_triggers/*`, etc.
     try validatePath("_static/index.html");
-    try validatePath("_code/_404/index.mjs");
+    try validatePath("_404/index.mjs");
+    try validatePath("_triggers/audit.mjs");
 }
 
 test "putStatic stores raw bytes + content-type, no bytecode" {

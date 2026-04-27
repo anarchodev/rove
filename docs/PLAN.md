@@ -89,10 +89,10 @@ deployment/{id}             → manifest (gains content_type + kind per entry)
 deployment/current          → {id}
 ```
 
-- **Prefix `_static/<path>`**: raw bytes. Kind = `static`. Served at URL `/<path>`. No compile.
-- **Prefix `_code/<path>`**: JS source. Kind = `handler`. Compiled to bytecode.
-- Leading underscore = system-reserved. Customers cannot claim top-level `_` paths.
-- Uploads to any other prefix are rejected.
+- **Prefix `_static/<path>`**: raw bytes. Kind = `static`. Served at URL `/<path>`. No compile. The prefix earns its keep because static files have free-form names (`logo.png`, `style.css`) and need explicit "raw bytes, do not compile" tagging.
+- **Top-level `<path>.mjs` / `<path>.js`**: JS source. Kind = `handler`. Compiled to bytecode. No prefix — the `.mjs`/`.js` extension plus the manifest `kind` field already disambiguates from static. (An earlier draft mandated a `_code/` prefix here for symmetry with `_static/`; dropped 2026-04-27 as pure ceremony.)
+- **Top-level `_*` paths are system-reserved.** `_static/`, `_triggers/`, `_404/`, `_500/`, future system namespaces. Customers cannot claim them.
+- Uploads outside these rules are rejected.
 
 #### Routing resolution (for incoming `GET /foo`)
 
@@ -100,9 +100,9 @@ Order:
 1. `_static/foo` exact match
 2. `_static/foo.html`
 3. `_static/foo/index.html`
-4. Handler: `_code/foo/index.mjs`, `_code/foo.mjs`, walk up to `_code/index.mjs`
-5. Convention 404: `_static/_404.html` → `_code/_404/index.mjs` → built-in 404
-6. Convention 500: `_static/_500.html` → `_code/_500/index.mjs` → built-in 500
+4. Handler: `foo/index.mjs`, `foo.mjs`, walk up to `index.mjs`
+5. Convention 404: `_static/_404.html` → `_404/index.mjs` → built-in 404
+6. Convention 500: `_static/_500.html` → `_500/index.mjs` → built-in 500
 
 Trailing slash: redirect `/foo/` → `/foo` (301).
 
@@ -135,7 +135,7 @@ Extension → MIME table (browser-standard). Override via upload `Content-Type` 
 Default export is the modern path; it's called with **no arguments** — handler reads from the ambient `request` global and writes to `response`. Named exports + `?fn=` stays as a power-user knob for RPC-shaped APIs.
 
 ```javascript
-// _code/index.mjs
+// index.mjs
 export default function () {
   const items = JSON.parse(kv.get("items") || "[]");
   response.headers = { "content-type": "text/html" };
@@ -211,7 +211,7 @@ Trivial because content-addressed: compare manifest entries A vs B, classify as 
 
 #### Module imports
 
-Between handler files: relative paths resolve through the current deployment's manifest only. **No external imports at runtime** in v1 (no `import 'https://esm.sh/...'` inside the runtime — that's a syscall and a security/determinism headache). Customers vendor libraries into `_code/lib/`.
+Between handler files: relative paths resolve through the current deployment's manifest only. **No external imports at runtime** in v1 (no `import 'https://esm.sh/...'` inside the runtime — that's a syscall and a security/determinism headache). Customers vendor libraries into a `lib/` folder (or anywhere they like — the manifest is flat).
 
 ### 2.5 Triggers
 
@@ -220,14 +220,14 @@ Between handler files: relative paths resolve through the current deployment's m
 #### Registration via file convention
 
 ```
-_code/_triggers/
+_triggers/
     00_secrets_audit.mjs
     10_users_index.mjs
     50_orders_totals.mjs
 ```
 
 ```javascript
-// _code/_triggers/secrets_audit.mjs
+// _triggers/secrets_audit.mjs
 export const config = {
   prefix: "secrets/",
   timing: "after",           // "before" | "after"
@@ -294,7 +294,7 @@ const id = webhook.send({
 #### Callback handler
 
 ```javascript
-// _code/stripe/charge_result.mjs
+// stripe/charge_result.mjs
 export default function (event) {
   // event.context     → what was passed in
   // event.outcome     → "delivered" | "failed" | "cancelled"
@@ -505,7 +505,7 @@ Designed as a general primitive from day one — also the knob used to different
 - `POST /v1/signup`: validate, create instance, deploy starter content, enqueue magic-link email.
 - `GET /v1/auth?mt=...`: validate, set cookie, 302 to dashboard.
 - `POST /v1/logout`: clear cookie, revoke session.
-- Starter content: one `_code/index.mjs` (uses `kv`, returns JSON), one `_static/index.html` that fetches it and shows "your API is live at `{name}.loop46.me`".
+- Starter content: one `index.mjs` (uses `kv`, returns JSON), one `_static/index.html` that fetches it and shows "your API is live at `{name}.loop46.me`".
 
 ### Phase 5 — Minimal admin UI (MVP boundary)
 
@@ -518,7 +518,7 @@ Designed as a general primitive from day one — also the knob used to different
 
 ### Phase 6 — Triggers
 
-- Load `_code/_triggers/*.mjs` into a per-instance prefix trie at deployment-load time.
+- Load `_triggers/*.mjs` into a per-instance prefix trie at deployment-load time.
 - `rove-kv` transaction wrapping: before/after trigger dispatch on `put` and `delete`.
 - Cascade with depth limit (8). Platform-prefix guard.
 - Tape replay auto-re-fires triggers (free from kv op capture).
@@ -805,8 +805,8 @@ Not available:
 
 ### File layout conventions
 
-- Handler source lives at top-level paths (`index.mjs`, `foo/index.mjs`, `api/users.mjs`) — PLAN §2.4 names a `_code/` prefix but the current implementation doesn't use it; this is a plan-vs-reality gap to resolve before v1.
-- `_static/<path>` is the only system-reserved prefix for raw bytes
+- Handler source lives at top-level paths (`index.mjs`, `foo/index.mjs`, `api/users.mjs`). An earlier draft of PLAN §2.4 mandated a `_code/` prefix; dropped 2026-04-27 — extension + manifest kind already disambiguates from static, so the prefix was pure ceremony.
+- `_static/<path>` is the system-reserved prefix for raw bytes; other top-level `_*` paths are reserved for system use (`_triggers/`, `_404/`, `_500/`, etc.)
 - `MAX_PATH_LEN = 192`; file-size caps of 1MB static / 64KB handler (plan; not yet enforced)
 - Bulk deploy is **full-replacement** — client sends the entire manifest. Single-file save endpoint exists for the "edit one file" UX; bulk deploy replaces everything not in the request.
 
