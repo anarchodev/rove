@@ -308,6 +308,48 @@ Triggers are part of the deployment manifest — versioned with code, rolled bac
 - Depth 8.
 - 32 triggers per instance (plan-tier).
 
+#### Backfill / reapply (advanced technique, no new primitive)
+
+Common need: customer adds an index trigger (or changes one), wants to apply it to existing data so the index is populated before reads start hitting it. Loop46 ships no `batch.*` API for this — composes from existing primitives.
+
+**Synchronous one-shot (small data):** customer writes a regular handler that scans a page via `kv.prefix(prefix, cursor, limit)` and applies the trigger logic to each key. Trigger logic should be extracted to a shared module the trigger module and the backfill handler both import — single source of truth.
+
+```javascript
+// _backfill_session_index.mjs (called from admin / cron / one-time)
+import { rebuildSessionIndex } from "./lib/session_index.mjs";
+export default function () {
+  const cursor = request.query?.split("cursor=")[1] ?? "";
+  const page = kv.prefix("users/sessions/", cursor, 100);
+  for (const { key, value } of page.entries) rebuildSessionIndex(key, value);
+  return { processed: page.entries.length, next_cursor: page.entries.at(-1)?.key ?? null };
+}
+```
+
+**Asynchronous chain (large data, ergonomic):** customer's handler processes one batch and fires a self-webhook to continue with the cursor in the callback context. Each link gets a fresh 10ms budget; failures surface via standard webhook retry + DLQ; the customer can monitor progress via the request log.
+
+```javascript
+// _backfill_session_index.mjs
+import { rebuildSessionIndex } from "./lib/session_index.mjs";
+export default function () {
+  const cursor = JSON.parse(request.body || "{}").cursor ?? "";
+  const page = kv.prefix("users/sessions/", cursor, 100);
+  for (const { key, value } of page.entries) rebuildSessionIndex(key, value);
+
+  const next_cursor = page.entries.length === 100 ? page.entries.at(-1).key : null;
+  if (next_cursor) {
+    webhook.send({
+      url: `https://${request.headers.host}/_backfill_session_index`,
+      method: "POST",
+      body: JSON.stringify({ cursor: next_cursor }),
+      onResult: "_backfill_done",   // optional — fires on terminal failure
+    });
+  }
+  return { processed: page.entries.length, done: !next_cursor };
+}
+```
+
+A dedicated `batch.*` primitive (background drainer, progress tracking, cascade-during-batch policy, plan-tier rate limits, programmatic semantics) is deferred to v2 — see §4. The self-webhook chain covers the "advanced customer needs to backfill an index" case without committing the platform to those decisions before a real customer asks.
+
 #### Implementation notes (decided 2026-04-27, before code lands)
 
 - **No deploy-load JS evaluation.** The path-based registration model means we don't need to evaluate trigger modules just to learn what prefix they fire on — the path tells us. Deploy-load just walks the manifest for entries matching `_triggers/.../index.{mjs,js}`, derives the prefix from the path, and stores `prefix → bytecode_path` in a per-tenant registry on `TenantFiles`. Compile errors in the trigger source surface at upload time the same way they do for any handler file (PLAN §2.4) — no special-case logic.
@@ -719,6 +761,7 @@ These are explicitly not in v1 so future sessions don't accidentally design arou
 - Circuit breaker per destination URL.
 - Per-destination rate shaping.
 - Read triggers (`beforeGet` / `afterGet`). The path-based registration model (§2.5) accommodates them naturally — same file layout, named exports just expand. Held back because read triggers fire on every `kv.get` (rather than only writes, which are rare), turning every read into a registry scan + potential JS dispatch. The cost story isn't established yet; revisit when a real customer asks.
+- Dedicated `batch.*` task primitive. Background drainer that runs a JS module over a kv prefix in batches with progress tracking, cascade-during-batch policy, plan-tier rate limits, programmatic poll semantics, etc. Motivating use cases: index rebuild after a trigger change, schema migration (transform every value), bulk re-encrypt, audit/report jobs. Held back because v1 covers the common case (index rebuild) via the self-webhook chain pattern documented in §2.5 — fresh 10ms budget per link, standard retry/DLQ for failures, no new platform surface. Revisit when a customer asks for "click button → rebuild index" UX, or when schema migration becomes painful enough that customers complain about composing it from the chain primitive.
 - Cross-instance triggers.
 - Scheduled / cron execution (falls out of outbox with `nextAttemptAt` when needed).
 - Streaming response bodies; Range requests for static.
