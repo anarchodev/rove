@@ -53,6 +53,7 @@ Each decision includes the **why**, often with notes on alternatives that were c
 
 - **C1 auth (admin)**: HttpOnly + Secure + SameSite=Lax session cookies on `app.loop46.me`. Opaque session tokens, stored server-side in root.db, revocable.
 - **C2 auth (customer's end users)**: customer's problem. We expose primitives (HMAC helper, cookie parse/serialize, encrypted KV). Customer's handler code mints and verifies whatever token/cookie shape it wants. Because customer UI and customer API share one origin, cookies are first-party out of the box.
+- **C2 sessions for SSE (`_rove_sess`)**: a separate platform-managed cookie (HttpOnly + Secure + SameSite=Lax) eagerly minted on handler invocations to give every browser a stable identity for the SSE/events stream (§2.12). NOT an auth claim — just an opaque id. Customer binds session→user themselves if they need that link. Distinct namespace from the customer's own auth cookies above.
 - **Magic-link signup**:
   1. `POST /v1/signup` with name + email.
   2. Server validates name available, creates instance, deploys starter content, assigns `{name}.loop46.me`, mints magic token (32 bytes, 15-min TTL, single-use, hashed under `_magic/{hash}`), fires `email.send`.
@@ -67,7 +68,7 @@ Each decision includes the **why**, often with notes on alternatives that were c
 **Handlers are pure functions of `(request, kv_snapshot)`.** Deterministic only.
 
 - No `fetch`, no `setTimeout`, no uncaptured `Date.now()` / `Math.random()`.
-- All external effects route through `webhook.send` (see 2.7).
+- All external effects route through declarative outbox-style primitives: `webhook.send` (§2.6) for outbound HTTP, `email.send` (§2.6) for transactional mail, `events.emit` (§2.12) for live UI push to the customer's connected clients. Each writes a deterministic outbox row inside the handler's transaction; the actual delivery happens in a separate pump.
 - All nondeterministic inputs are tape-captured.
 - Every request gets a fresh QuickJS context via snapshot-restore (existing mechanism in `src/js/worker.zig`).
 - **CPU budget: one 10ms envelope covers the whole request — handler body + every trigger it fires (BEFORE and AFTER) + every cascade those triggers trigger.** No per-trigger or per-cascade sub-budgets. Exceeding 10ms terminates the request and rolls back the transaction. Callbacks run as independent handler invocations in their own transactions and get their own fresh 10ms envelope when they fire.
@@ -456,6 +457,97 @@ Designed as a general primitive from day one — also the knob used to different
 - Wire protocol: content-addressed two-phase (see 2.4). Incremental deploys upload only changed bytes.
 - **Future**: `loop46 kv get/put`, `loop46 logs tail`, `loop46 init`, `loop46 dev` (local mini-rove).
 
+### 2.12 Server-sent events (live UI updates)
+
+The companion to webhooks (§2.6): handlers fire events from inside their transaction, connected clients receive them over a long-lived SSE stream. Same outbox/replay/determinism story; same "pure handler + declarative side effects" model. Different direction — webhooks push out to the world, events push out to *this customer's clients*.
+
+**Why SSE not WebSockets**: HTTP/2, server→client only, browsers auto-reconnect with `Last-Event-ID` resume built in. WebSockets and HTTP/2 don't naturally compose — RFC 6455 is HTTP/1.1 `Upgrade:` (forbidden in h2), RFC 8441 bridges via extended CONNECT but Cloudflare in front (per §2.1) downgrades WS traffic to HTTP/1.1 to the origin. Adding WS support would require a parallel HTTP/1.1 server stack alongside our nghttp2-based h2 stack: separate parser, separate framing (RFC 6455 masking + fragmentation + ping/pong), separate connection lifecycle, ALPN negotiation. Several thousand LOC and a two-stack maintenance burden. WS stays in §4 deferred-to-v2; SSE covers ~90% of "server pushes to client" use cases.
+
+#### Sessions (platform-managed)
+
+A new server-managed cookie `_rove_sess` (parallel to admin's `rove_session` but in customer namespace):
+- 64-hex-char opaque token, HttpOnly + Secure + SameSite=Lax. No server-side validation table — the cookie value IS the id.
+- **Eagerly minted** on any handler invocation that arrives without one. Static asset serving short-circuits before the handler, so `favicon.ico` etc. don't pollute. `Set-Cookie` added to the response when a new id was minted during the request.
+- **One logical stream per session, N concurrent EventSource connections under that session, all receive every event.** Multi-tab works naturally.
+- Customer binds session→user themselves: `kv.set('sessions/${request.session.id}/user', user_id)`.
+
+#### API
+
+```javascript
+events.emit("hello");                                 // current session, type="message"
+events.emit({ data: { count: 42 }, type: "tick" });  // current session, custom type
+events.emit({ to: someSessionId, data: ... });        // explicit target
+events.emit({ to: [sid1, sid2], data: ... });         // fan-out by enumeration
+```
+
+`request.session.id` is always a string when the handler was invoked by a browser request (eager mint). For handlers invoked outside a browser context (webhook callbacks, signup, system maintenance), `request.session === null` and the implicit-target form throws — explicit `to:` required.
+
+Cross-session fan-out is the customer's job: they keep their own subscription map (`subs/{post_id}/{sid}`) and iterate on emit. The platform deliberately doesn't ship a topics / rooms / channels abstraction — every chat-app vendor reinvents it differently, and the customer's subscription model usually needs domain shape (per-post, per-team) anyway.
+
+#### Storage
+
+`_events/{sid}/{request_id}-{call_index}` rows in customer's `app.db`, written inside the handler's transaction. Per-session monotonic by `request_id` (already monotonic per `src/log/root.zig`). The composite seq is the SSE `id:` field. Replay determinism inherits from §2.6.
+
+#### Connection endpoint
+
+```
+GET /_events                  → text/event-stream; honors Last-Event-ID
+GET /_events?since=<id>       → query-string variant for non-EventSource clients
+```
+
+Reads `_rove_sess` cookie; mints + sets if absent. Wire format: standard SSE. Keepalive `:ping\n\n` every 25s to survive proxies. On disconnect, subscription cleared from the worker's connection table; `_events/...` rows persist until retention GC.
+
+#### Pump (in js-worker)
+
+Per-tenant subscription map keyed by session id. On every commit that touches `_events/{sid}/...`, mark corresponding connections dirty; pump cycle reads new events (`> last_sent_id`), writes to wire, advances `last_sent_id`. Single-node v1; multi-node deferred (same call as the webhook drainer's leader-only model, OR session→node registry — decide when multi-node lands).
+
+#### Caps (plan-tier, single-struct interface)
+
+```zig
+pub const EventsCaps = struct {
+    max_concurrent_connections_per_instance: u32,
+    max_concurrent_connections_per_session: u32,
+    max_emits_per_request: u32,
+    retention_seconds: u32,
+    max_events_per_session_in_retention: u32,
+    max_event_payload_bytes: u32,
+};
+pub fn eventsCapsForPlan(plan: tenant.PlanTier) EventsCaps;
+```
+
+Starting numbers:
+
+| Cap | Free | Paid | Notes |
+|---|---|---|---|
+| Concurrent SSE connections / instance | 100 | 10,000 | Real resource cap |
+| Concurrent SSE connections / session | 16 | 16 | Multi-tab sanity guard, not plan-tiered |
+| Emits per request | 100 | 1,000 | Mirrors webhook outbox depth |
+| Retention window | 300s | 3,600s | Last-Event-ID resume window |
+| Events / session in retention | 100 | 1,000 | Slow-consumer defense |
+| Event payload bytes | 64 KB | 256 KB | Inherits kv value cap as floor |
+
+Same `*CapsForPlan(plan)` shape extends to other plan-tiered caps as we add them (KV storage, file size, etc.) — one function per subsystem, one struct of fields, easy to grow.
+
+#### Authorization
+
+Cookie IS the auth. HttpOnly + SameSite=Lax means client JS can't steal it cross-origin and the browser sends it automatically. Customer's responsibility to bind session to a user (via their `/login` handler writing `sessions/{sid}/user = X`) and to refuse to emit to sessions that aren't authorized. No connect-time customer auth handler in v1; add `_events/auth.mjs` convention if revocation demand emerges.
+
+#### Draft mode + tape
+
+`?__draft=` deploys route events to a sandbox bucket, never delivered, visible in dashboard. Tape capture is free — `events.emit` is a KV write, the existing tape covers it.
+
+#### Rove ECS design (must precede implementation per `rove-design-first`)
+
+New collection in js-worker: `events_connections`. Components: `EventsSession { sid }`, `EventsLastEventId { id }`, plus standard h2 stream/session components. Lifecycle: SSE connect → entity created → pump system iterates → disconnect → entity destroyed (component deinit clears subscription). New system: `pumpEvents`, pure function iterating `events_connections`, called between `poll()` and `reg.flush()` like other systems. Detailed Row design + dirty-marking happens at code time.
+
+#### Deferred
+
+- Multi-node session routing.
+- Customer-defined `_events/auth.mjs` connect-time auth.
+- Topic/room/channel abstraction.
+- Per-message client acknowledgment (would require WS).
+- Binary message types (SSE is text-only).
+
 ## 3. Build plan (ordered phases)
 
 **Cross-cutting for every phase**:
@@ -555,6 +647,18 @@ Designed as a general primitive from day one — also the knob used to different
 - Plan tiers wired to rate limiter + size caps + DLQ access.
 - Billing hookup (Stripe) — implement via `webhook.send` + callbacks to dogfood the outbox.
 - **PSL submission** for `loop46.me` (GitHub PR to `publicsuffix/list`). Fire-and-wait; propagation can take weeks-to-months across browser releases. Defense-in-depth only — server-side `Set-Cookie Domain=` stripping from Phase 1 is the authoritative guard.
+
+### Phase 11 — Server-sent events (§2.12)
+
+- `_rove_sess` cookie: 64-hex-char opaque token, HttpOnly + Secure + SameSite=Lax. Eager mint on handler invocations that arrive without one; `Set-Cookie` added on response. Static asset serving short-circuits before mint.
+- `request.session: { id }` global. Null when handler invoked outside browser context (callbacks, signup, system).
+- `events.emit(...)` JS global. Implicit-target form (no `to:`) routes to current session; explicit `to: sid | [sid, ...]` for fan-out.
+- `_events/{sid}/{request_id}-{call_index}` storage in customer's `app.db`, written inside handler tx.
+- `GET /_events` system endpoint: text/event-stream, honors `Last-Event-ID`, mints+sets cookie if absent. Keepalive `:ping\n\n` every 25s.
+- Pump in `js-worker`: per-tenant subscription map keyed by sid, dirty-flag on commits touching `_events/`, drains to wire.
+- `EventsCaps` struct + `eventsCapsForPlan(plan)` lookup — same shape used for future plan-tiered caps in other subsystems.
+- Single-node only. Multi-node session routing deferred (decide when multi-node lands; same call as the webhook drainer's leader-only model OR a session→node registry).
+- Has no hard predecessor — depends on §2.6 webhooks (done) + existing kv/h2/handler infra. Position in the phase list reflects "non-blocking for first-customer launch"; could be pulled forward into the MVP if SSE turns out to be a hot demo feature.
 
 ## 4. Deferred to v2
 
