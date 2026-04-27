@@ -261,6 +261,7 @@ pub const Dispatcher = struct {
         writeset: *kv_mod.WriteSet,
         bytecode: []const u8,
         bytecodes: ?*const std.StringHashMapUnmanaged([]u8),
+        triggers: ?[]const globals.TriggerEntry,
         request: Request,
         budget: *Budget,
     ) DispatchError!Response {
@@ -283,6 +284,8 @@ pub const Dispatcher = struct {
             .request_id = request.request_id,
             .platform = request.platform,
             .root_writeset = request.root_writeset,
+            .triggers = triggers,
+            .bytecodes = bytecodes,
         };
 
         // Memcpy-restore the frozen post-init image of
@@ -293,6 +296,12 @@ pub const Dispatcher = struct {
             return DispatchError.RuntimeCreateFailed;
         var rt: qjs.Runtime = restored.runtime;
         var ctx: qjs.Context = restored.context;
+        // Free any trigger-module namespaces we cached during this
+        // request. Snapshot/restore wipes the qjs runtime each time
+        // so the values would be invalid next request anyway, but the
+        // Zig-side hashmap entries (key + JSValue ref count) need
+        // explicit cleanup.
+        defer state.deinit(ctx.raw);
 
         rt.setInterruptHandler(interruptHandler, budget);
 
@@ -1333,7 +1342,7 @@ fn runOne(
     if (request.query == null) request.query = "fn=go";
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    const resp = try d.run(kv, &txn, &ws, bytecode, null, request, &budget);
+    const resp = try d.run(kv, &txn, &ws, bytecode, null, null, request, &budget);
     try txn.commit();
     return resp;
 }
@@ -1570,6 +1579,7 @@ test "dispatch: malformed bytecode surfaces in exception field" {
         &ws,
         &garbage,
         null,
+        null,
         .{ .method = "GET", .path = "/" },
         &budget,
     );
@@ -1688,7 +1698,7 @@ test "dispatch: kv tape captures get/set/delete with outcomes" {
     defer ws.deinit();
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
         .method = "POST",
         .path = "/",
         .query = "fn=go",
@@ -1765,7 +1775,7 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
         defer ws.deinit();
 
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
             .method = "GET",
             .path = "/",
             .query = "fn=go",
@@ -1798,7 +1808,7 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
         var ws2 = kv_mod.WriteSet.init(testing.allocator);
         defer ws2.deinit();
         var budget2 = Budget.fromNow(Budget.default_duration_ns);
-        var resp2 = try d.run(kv, &txn2, &ws2, bytecode, null, .{
+        var resp2 = try d.run(kv, &txn2, &ws2, bytecode, null, null, .{
             .method = "GET",
             .path = "/",
             .query = "fn=go",
@@ -1865,6 +1875,7 @@ test "dispatch: tight loop hits budget and returns Interrupted" {
         &txn,
         &ws,
         bytecode,
+        null,
         null,
         .{ .method = "GET", .path = "/", .query = "fn=go" },
         &budget,
@@ -1935,7 +1946,7 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
             .method = "GET",
             .path = "/hello",
             .query = "fn=greet&args=%5B%22%2Fhello%22%5D",
@@ -1952,7 +1963,7 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
             .method = "GET",
             .path = "/hello",
             .query = "fn=shout&args=%5B%22%2Fhello%22%5D",
@@ -1969,7 +1980,7 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
             .method = "GET",
             .path = "/hello",
             .query = "fn=nope",
@@ -2016,7 +2027,7 @@ test "dispatch: missing fn defaults to `default` export, called with no args" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
             .method = "GET",
             .path = "/landing",
         }, &budget);
@@ -2032,7 +2043,7 @@ test "dispatch: missing fn defaults to `default` export, called with no args" {
         var ws = kv_mod.WriteSet.init(testing.allocator);
         defer ws.deinit();
         var budget = Budget.fromNow(Budget.default_duration_ns);
-        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
             .method = "GET",
             .path = "/x",
             .query = "page=2&sort=desc",
@@ -2072,7 +2083,7 @@ test "dispatch: no fn and no default export → 404" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -2113,7 +2124,7 @@ test "dispatch: POST with non-envelope JSON body invokes default, body in reques
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
         .method = "POST",
         .path = "/",
         .body = "{\"name\":\"alice\"}",
@@ -2155,7 +2166,7 @@ test "dispatch: POST RPC envelope still routes to named export" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
         .method = "POST",
         .path = "/",
         .body = "{\"fn\":\"greet\",\"args\":[\"world\"]}",
@@ -2227,7 +2238,7 @@ test "dispatch: request.headers exposes named headers, filters pseudo-headers" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
         .method = "GET",
         .path = "/",
         .headers = hdrs,
@@ -2278,7 +2289,7 @@ test "dispatch: request.headers missing → empty object, missing key → undefi
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
     // No headers field — exercises the null path.
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -2332,7 +2343,7 @@ test "dispatch: request.cookies parses RFC 6265 cookie header" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
         .method = "GET",
         .path = "/",
         .headers = hdrs,
@@ -2387,7 +2398,7 @@ test "dispatch: request.cookies empty when no cookie header" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
         .method = "GET",
         .path = "/",
         .headers = hdrs,
@@ -2432,7 +2443,7 @@ test "dispatch: async module handler gets unwrapped" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, .{
         .method = "GET",
         .path = "/x",
         .query = "fn=fetchLike&args=%5B%22%2Fx%22%5D",
@@ -2863,4 +2874,321 @@ test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
     try testing.expectEqual(@as(usize, 2), body.value.object.get("to").?.array.items.len);
     try testing.expectEqual(@as(usize, 1), body.value.object.get("cc").?.array.items.len);
     try testing.expectEqual(@as(usize, 1), body.value.object.get("bcc").?.array.items.len);
+}
+
+// ── Triggers (PLAN §2.5) ──────────────────────────────────────────────
+
+test "trigger: afterPut fires after a kv.set inside the handler" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    // Two modules: handler at index.mjs writes a session;
+    // trigger at _triggers/users/sessions/index.mjs maintains
+    // a reverse index `users/by-session/{sid} -> user_id`.
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("users/sessions/abc", JSON.stringify({ user_id: "u42" }));
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const trigger_bc = try ctx.compileToBytecode(
+        \\export function afterPut(event) {
+        \\  const sess = JSON.parse(event.value);
+        \\  const sid = event.key.split('/').pop();
+        \\  kv.set("users/by-session/" + sid, sess.user_id);
+        \\}
+    , "_triggers/users/sessions/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/users/sessions/index.mjs", trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{.{
+        .prefix = @constCast("users/sessions/"),
+        .module_path = @constCast("_triggers/users/sessions/index.mjs"),
+    }};
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    try testing.expectEqualStrings("ok", resp.body);
+
+    // Trigger should have written the reverse-index row.
+    const indexed = try kv.get("users/by-session/abc");
+    defer testing.allocator.free(indexed);
+    try testing.expectEqualStrings("u42", indexed);
+}
+
+test "trigger: afterDelete fires with previousValue" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("orders/o1", JSON.stringify({ total: 100 }));
+        \\  kv.delete("orders/o1");
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const trigger_bc = try ctx.compileToBytecode(
+        \\export function afterDelete(event) {
+        \\  if (event.previousValue) {
+        \\    const order = JSON.parse(event.previousValue);
+        \\    kv.set("audit/deleted-totals", String(order.total));
+        \\  }
+        \\}
+    , "_triggers/orders/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/orders/index.mjs", trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{.{
+        .prefix = @constCast("orders/"),
+        .module_path = @constCast("_triggers/orders/index.mjs"),
+    }};
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+
+    const audit = try kv.get("audit/deleted-totals");
+    defer testing.allocator.free(audit);
+    try testing.expectEqualStrings("100", audit);
+}
+
+test "trigger: tree-traversal order — outer + inner both fire on AFTER" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Write to users/sessions/abc → matches both
+    // _triggers/users/index.mjs AND _triggers/users/sessions/index.mjs.
+    // Each appends its name to a marker key so we can verify both fired
+    // and in the right order (innermost-first for AFTER).
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("users/sessions/abc", "v");
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const inner_bc = try ctx.compileToBytecode(
+        \\export function afterPut(event) {
+        \\  const cur = kv.get("trace") || "";
+        \\  kv.set("trace", cur + "inner;");
+        \\}
+    , "_triggers/users/sessions/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(inner_bc);
+
+    const outer_bc = try ctx.compileToBytecode(
+        \\export function afterPut(event) {
+        \\  const cur = kv.get("trace") || "";
+        \\  kv.set("trace", cur + "outer;");
+        \\}
+    , "_triggers/users/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(outer_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/users/sessions/index.mjs", inner_bc);
+    try bytecodes.put(testing.allocator, "_triggers/users/index.mjs", outer_bc);
+
+    // Sorted longest-first → forward iteration is innermost-first.
+    const triggers = [_]globals.TriggerEntry{
+        .{ .prefix = @constCast("users/sessions/"), .module_path = @constCast("_triggers/users/sessions/index.mjs") },
+        .{ .prefix = @constCast("users/"), .module_path = @constCast("_triggers/users/index.mjs") },
+    };
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+
+    const trace = try kv.get("trace");
+    defer testing.allocator.free(trace);
+    // AFTER chain fires innermost-first per PLAN §2.5.
+    try testing.expectEqualStrings("inner;outer;", trace);
+}
+
+test "trigger: cascade depth limit halts runaway recursion" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Trigger that writes another key that matches itself → infinite
+    // cascade. The depth cap must throw and abort the handler.
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("loop/0", "x");
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const trigger_bc = try ctx.compileToBytecode(
+        \\export function afterPut(event) {
+        \\  const n = parseInt(event.key.split('/').pop()) + 1;
+        \\  kv.set("loop/" + n, "x");
+        \\}
+    , "_triggers/loop/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/loop/index.mjs", trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{.{
+        .prefix = @constCast("loop/"),
+        .module_path = @constCast("_triggers/loop/index.mjs"),
+    }};
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    // Handler doesn't catch → throw bubbles up, populates exception.
+    try testing.expect(resp.exception.len > 0);
+    try testing.expect(std.mem.indexOf(u8, resp.exception, "depth") != null);
+}
+
+test "trigger: platform-key writes do not fire customer triggers" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Customer's catch-all trigger would fire on every write, BUT
+    // `_outbox/...` is a platform key — the fire-time guard skips
+    // dispatch so the customer's afterPut never sees system writes.
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("_outbox/sys-write", "x");
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const trigger_bc = try ctx.compileToBytecode(
+        \\export default function (event) {
+        \\  kv.set("seen/" + event.key, "1");
+        \\}
+    , "_triggers/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/index.mjs", trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{.{
+        .prefix = @constCast(""),
+        .module_path = @constCast("_triggers/index.mjs"),
+    }};
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+
+    // Trigger SHOULD NOT have written `seen/_outbox/sys-write`.
+    try testing.expectError(error.NotFound, kv.get("seen/_outbox/sys-write"));
 }

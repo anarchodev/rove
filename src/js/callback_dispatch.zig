@@ -287,6 +287,7 @@ fn runOneCallback(
         writeset,
         bytecode,
         &tc.bytecodes,
+        tc.triggers,
         request,
         &budget,
     ) catch |err| {

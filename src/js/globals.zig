@@ -34,6 +34,17 @@ pub const js_undefined: c.JSValue = mkVal(c.JS_TAG_UNDEFINED, 0);
 pub const js_null: c.JSValue = mkVal(c.JS_TAG_NULL, 0);
 pub const js_exception: c.JSValue = mkVal(c.JS_TAG_EXCEPTION, 0);
 
+/// One row in a tenant's trigger registry. Built at deploy-load time
+/// (worker.zig) from manifest paths matching `_triggers/.../index.{mjs,js}`.
+/// `prefix` is what we match kv keys against; `module_path` is the
+/// bytecode lookup key (into the deployment's bytecode map) and the
+/// identity surfaced in error messages (e.g.
+/// `"_triggers/users/sessions/index.mjs"`).
+pub const TriggerEntry = struct {
+    prefix: []u8,
+    module_path: []u8,
+};
+
 pub const DispatchState = struct {
     allocator: std.mem.Allocator,
     /// Per-request KV store. `kv.get("x")` reads from this handle,
@@ -92,7 +103,67 @@ pub const DispatchState = struct {
     /// a type=2 envelope after commit so followers' copies of
     /// `__root__.db` stay in sync.
     root_writeset: ?*kv_mod.WriteSet = null,
+    /// Trigger registry for the active deployment (PLAN §2.5).
+    /// Sorted longest-prefix-first → forward iteration visits
+    /// innermost (most-specific) triggers first; AFTER chain uses
+    /// forward order, BEFORE chain reverses. Null = no triggers
+    /// (test paths that don't care).
+    triggers: ?[]const TriggerEntry = null,
+    /// Per-deployment bytecode map. Same map the module loader
+    /// uses for handler imports — trigger modules live in it under
+    /// their `_triggers/.../index.{mjs,js}` paths. Needed by the
+    /// trigger fire path to load module bytecode lazily on first
+    /// fire and look up named exports.
+    bytecodes: ?*const std.StringHashMapUnmanaged([]u8) = null,
+    /// Cascade depth: how many trigger frames are currently on the
+    /// JS call stack. 0 = user-initiated write. Incremented before
+    /// a trigger fires, decremented after. Throws if a fire would
+    /// take it past `MAX_TRIGGER_DEPTH` (PLAN §2.5 limits).
+    trigger_depth: u32 = 0,
+    /// Per-request cache of trigger-module namespaces. Module
+    /// top-level state (e.g. `let count = 0`) persists across fires
+    /// within one handler invocation but resets between requests
+    /// (the snapshot/restore wipes the runtime). Owned values must
+    /// be `JS_FreeValue`'d on `deinit`.
+    trigger_module_ns: std.StringHashMapUnmanaged(c.JSValue) = .empty,
+
+    pub fn deinit(self: *DispatchState, ctx: ?*c.JSContext) void {
+        var it = self.trigger_module_ns.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            c.JS_FreeValue(ctx, e.value_ptr.*);
+        }
+        self.trigger_module_ns.deinit(self.allocator);
+        self.* = undefined;
+    }
 };
+
+/// PLAN §2.5 cascade depth ceiling.
+pub const MAX_TRIGGER_DEPTH: u32 = 8;
+
+/// Fire-time platform-key guard. Same list as worker.zig's
+/// `PLATFORM_KV_PREFIXES` (deploy-load guard) — defense in depth.
+/// If a kv key under a customer's catch-all trigger happens to
+/// start with one of these, we silently skip trigger dispatch.
+const PLATFORM_KV_PREFIXES_FIRE = [_][]const u8{
+    "_audit/",
+    "_deploy/",
+    "_outbox/",
+    "_outbox_inflight/",
+    "_dlq/",
+    "_callback/",
+    "_magic/",
+    "_triggers/",
+    "_events/",
+    "_sessions/",
+};
+
+fn isPlatformKey(key: []const u8) bool {
+    for (PLATFORM_KV_PREFIXES_FIRE) |p| {
+        if (std.mem.startsWith(u8, key, p)) return true;
+    }
+    return false;
+}
 
 // ── C helpers ──────────────────────────────────────────────────────────
 
@@ -162,6 +233,23 @@ fn jsKvSet(
     const val_str = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
     defer state.allocator.free(val_str);
 
+    // Fetch previous value for the trigger event — only when there
+    // are AFTER triggers matching this key (free check). Skipped
+    // entirely when no trigger fires; read-your-writes via TrackedTxn
+    // sees the txn's own uncommitted writes.
+    var prev_owned: ?[]u8 = null;
+    defer if (prev_owned) |p| state.allocator.free(p);
+    if (anyTriggerMatches(state, key_str)) {
+        if (state.kv.get(key_str)) |bytes| {
+            prev_owned = bytes;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => {
+                state.pending_kv_error = err;
+            },
+        }
+    }
+
     // Two parallel writes:
     //   1. Through the TrackedTxn → local SQLite + undo log. Gives
     //      read-your-writes within this handler and durable local
@@ -177,6 +265,11 @@ fn jsKvSet(
         state.pending_kv_error = err;
     };
     if (state.kv_tape) |t| t.appendKv(.set, key_str, val_str, .ok) catch {};
+
+    // AFTER triggers fire after the write commits to the txn.
+    if (fireAfterTriggers(state, ctx, key_str, .put, val_str, prev_owned)) {
+        return js_exception;
+    }
     return js_undefined;
 }
 
@@ -192,6 +285,20 @@ fn jsKvDelete(
     const key_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(key_str);
 
+    // See jsKvSet: fetch previousValue only when triggers will fire.
+    var prev_owned: ?[]u8 = null;
+    defer if (prev_owned) |p| state.allocator.free(p);
+    if (anyTriggerMatches(state, key_str)) {
+        if (state.kv.get(key_str)) |bytes| {
+            prev_owned = bytes;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => {
+                state.pending_kv_error = err;
+            },
+        }
+    }
+
     state.txn.delete(key_str) catch |err| {
         state.pending_kv_error = err;
         if (state.kv_tape) |t| t.appendKv(.delete, key_str, "", .err) catch {};
@@ -201,7 +308,230 @@ fn jsKvDelete(
         state.pending_kv_error = err;
     };
     if (state.kv_tape) |t| t.appendKv(.delete, key_str, "", .ok) catch {};
+
+    if (fireAfterTriggers(state, ctx, key_str, .delete, null, prev_owned)) {
+        return js_exception;
+    }
     return js_undefined;
+}
+
+// ── Trigger fire path (PLAN §2.5) ─────────────────────────────────────
+
+const TriggerOp = enum { put, delete };
+
+/// Load the trigger module's namespace into the qjs context, caching
+/// it on `state.trigger_module_ns` so subsequent fires within the
+/// same request share the same namespace (so module top-level state
+/// like `let count = 0` persists across fires within one request).
+/// Returns `null` on any failure (missing bytecode, malformed module,
+/// init exception); the caller logs and skips the trigger.
+fn loadTriggerModuleNs(
+    state: *DispatchState,
+    ctx: ?*c.JSContext,
+    module_path: []const u8,
+) ?c.JSValue {
+    if (state.trigger_module_ns.get(module_path)) |cached| {
+        return c.JS_DupValue(ctx, cached);
+    }
+
+    const map = state.bytecodes orelse return null;
+    const bytes = map.get(module_path) orelse return null;
+
+    const obj = c.JS_ReadObject(ctx, bytes.ptr, bytes.len, c.JS_READ_OBJ_BYTECODE);
+    if (c.JS_IsException(obj)) {
+        _ = c.JS_GetException(ctx); // discard
+        return null;
+    }
+    if (obj.tag != c.JS_TAG_MODULE) {
+        c.JS_FreeValue(ctx, obj);
+        return null;
+    }
+    const mod_def: ?*c.JSModuleDef = @ptrCast(@alignCast(obj.u.ptr));
+
+    // JS_EvalFunction consumes `obj` and runs the module's
+    // top-level code. For sync modules this returns a resolved
+    // promise; we don't pump jobs (triggers should be sync) — top-
+    // level await would break the deterministic execution model.
+    const eval_result = c.JS_EvalFunction(ctx, obj);
+    if (c.JS_IsException(eval_result)) {
+        _ = c.JS_GetException(ctx); // discard — caller logs
+        return null;
+    }
+    c.JS_FreeValue(ctx, eval_result);
+
+    const ns = c.JS_GetModuleNamespace(ctx, mod_def);
+    if (c.JS_IsException(ns)) {
+        _ = c.JS_GetException(ctx);
+        return null;
+    }
+
+    const key_copy = state.allocator.dupe(u8, module_path) catch {
+        c.JS_FreeValue(ctx, ns);
+        return null;
+    };
+    // Cache holds one ref; we return a duped ref to the caller.
+    state.trigger_module_ns.put(state.allocator, key_copy, ns) catch {
+        state.allocator.free(key_copy);
+        c.JS_FreeValue(ctx, ns);
+        return null;
+    };
+    return c.JS_DupValue(ctx, ns);
+}
+
+/// Build the event object passed as the trigger handler's argument.
+/// Shape (PLAN §2.5):
+///   { key, value, previousValue, op, timing, timestamp,
+///     actor: { request_id } | null, depth }
+fn buildTriggerEvent(
+    state: *DispatchState,
+    ctx: ?*c.JSContext,
+    key: []const u8,
+    op: TriggerOp,
+    timing: []const u8,
+    new_value: ?[]const u8,
+    prev_value: ?[]const u8,
+) c.JSValue {
+    const event = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, event, "key", c.JS_NewStringLen(ctx, key.ptr, key.len));
+
+    if (new_value) |v| {
+        _ = c.JS_SetPropertyStr(ctx, event, "value", c.JS_NewStringLen(ctx, v.ptr, v.len));
+    } else {
+        _ = c.JS_SetPropertyStr(ctx, event, "value", js_null);
+    }
+
+    if (prev_value) |v| {
+        _ = c.JS_SetPropertyStr(ctx, event, "previousValue", c.JS_NewStringLen(ctx, v.ptr, v.len));
+    } else {
+        _ = c.JS_SetPropertyStr(ctx, event, "previousValue", js_null);
+    }
+
+    const op_str: []const u8 = switch (op) {
+        .put => "put",
+        .delete => "delete",
+    };
+    _ = c.JS_SetPropertyStr(ctx, event, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
+    _ = c.JS_SetPropertyStr(ctx, event, "timing", c.JS_NewStringLen(ctx, timing.ptr, timing.len));
+
+    const ts_ms: f64 = @floatFromInt(@divFloor(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    _ = c.JS_SetPropertyStr(ctx, event, "timestamp", c.JS_NewFloat64(ctx, ts_ms));
+
+    if (state.request_id != 0) {
+        const actor = c.JS_NewObject(ctx);
+        var rid_buf: [16]u8 = undefined;
+        const rid_hex = std.fmt.bufPrint(&rid_buf, "{x:0>16}", .{state.request_id}) catch "";
+        _ = c.JS_SetPropertyStr(ctx, actor, "request_id", c.JS_NewStringLen(ctx, rid_hex.ptr, rid_hex.len));
+        _ = c.JS_SetPropertyStr(ctx, event, "actor", actor);
+    } else {
+        _ = c.JS_SetPropertyStr(ctx, event, "actor", js_null);
+    }
+
+    _ = c.JS_SetPropertyStr(ctx, event, "depth", c.JS_NewInt32(ctx, @intCast(state.trigger_depth)));
+    return event;
+}
+
+/// Pick the right named export for `(op, timing)`, falling back to
+/// `default` if the named export isn't a function. Returns the
+/// JS function value (caller must `JS_FreeValue`) or `js_undefined`
+/// if no callable export matches.
+fn lookupTriggerHandler(
+    ctx: ?*c.JSContext,
+    ns: c.JSValue,
+    op: TriggerOp,
+    timing: []const u8,
+) c.JSValue {
+    const named: [:0]const u8 = switch (op) {
+        .put => if (std.mem.eql(u8, timing, "before")) "beforePut" else "afterPut",
+        .delete => if (std.mem.eql(u8, timing, "before")) "beforeDelete" else "afterDelete",
+    };
+
+    const named_fn = c.JS_GetPropertyStr(ctx, ns, named.ptr);
+    if (c.JS_IsFunction(ctx, named_fn)) return named_fn;
+    c.JS_FreeValue(ctx, named_fn);
+
+    const default_fn = c.JS_GetPropertyStr(ctx, ns, "default");
+    if (c.JS_IsFunction(ctx, default_fn)) return default_fn;
+    c.JS_FreeValue(ctx, default_fn);
+
+    return js_undefined;
+}
+
+/// Cheap probe used by `kv.set` / `kv.delete` to decide whether
+/// to pay the previousValue lookup cost. Walks the registry, returns
+/// true on the first prefix match. No qjs interaction. Returns false
+/// for platform keys (matches the fire-time guard's behavior so we
+/// don't pay the lookup for traffic that won't fire triggers anyway).
+fn anyTriggerMatches(state: *DispatchState, key: []const u8) bool {
+    const triggers = state.triggers orelse return false;
+    if (triggers.len == 0) return false;
+    if (isPlatformKey(key)) return false;
+    for (triggers) |entry| {
+        if (std.mem.startsWith(u8, key, entry.prefix)) return true;
+    }
+    return false;
+}
+
+/// Fire AFTER triggers for a kv write. Tree-traversal order:
+/// triggers sorted longest-prefix-first → forward iteration is
+/// innermost-first (correct for AFTER chain per PLAN §2.5).
+///
+/// Returns `true` if a trigger threw a JS exception (caller should
+/// propagate by returning `js_exception` and leaving the exception
+/// on the context). Returns `false` on success or no-op cases.
+fn fireAfterTriggers(
+    state: *DispatchState,
+    ctx: ?*c.JSContext,
+    key: []const u8,
+    op: TriggerOp,
+    new_value: ?[]const u8,
+    prev_value: ?[]const u8,
+) bool {
+    const triggers = state.triggers orelse return false;
+    if (triggers.len == 0) return false;
+    if (isPlatformKey(key)) return false;
+
+    for (triggers) |entry| {
+        if (!std.mem.startsWith(u8, key, entry.prefix)) continue;
+
+        if (state.trigger_depth >= MAX_TRIGGER_DEPTH) {
+            const msg = std.fmt.allocPrintSentinel(
+                state.allocator,
+                "trigger cascade depth exceeded ({d}) at {s}",
+                .{ MAX_TRIGGER_DEPTH, entry.module_path },
+                0,
+            ) catch return true;
+            defer state.allocator.free(msg);
+            _ = c.JS_ThrowInternalError(ctx, msg.ptr);
+            return true;
+        }
+
+        const ns = loadTriggerModuleNs(state, ctx, entry.module_path) orelse {
+            std.log.warn("rove-js: trigger module {s} failed to load — skipping", .{entry.module_path});
+            continue;
+        };
+        defer c.JS_FreeValue(ctx, ns);
+
+        const handler = lookupTriggerHandler(ctx, ns, op, "after");
+        if (c.JS_IsUndefined(handler)) continue; // module exports nothing for this op×timing
+        defer c.JS_FreeValue(ctx, handler);
+
+        const event = buildTriggerEvent(state, ctx, key, op, "after", new_value, prev_value);
+        defer c.JS_FreeValue(ctx, event);
+
+        state.trigger_depth += 1;
+        defer state.trigger_depth -= 1;
+
+        var args = [_]c.JSValue{event};
+        const ret = c.JS_Call(ctx, handler, js_undefined, 1, &args);
+        if (c.JS_IsException(ret)) {
+            // Leave the exception on the context for the caller to
+            // propagate via js_exception.
+            return true;
+        }
+        c.JS_FreeValue(ctx, ret); // AFTER return value is ignored
+    }
+
+    return false;
 }
 
 /// `kv.prefix(prefix, cursor?, limit?)` → `[ { key, value }, ... ]`

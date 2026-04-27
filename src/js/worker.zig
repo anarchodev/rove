@@ -60,6 +60,7 @@ const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 
 const dispatcher_mod = @import("dispatcher.zig");
+const globals = @import("globals.zig");
 const apply_mod = @import("apply.zig");
 const penalty_mod = @import("penalty.zig");
 const router_mod = @import("router.zig");
@@ -152,15 +153,11 @@ pub const StaticEntry = struct {
 
 /// Per-tenant code state held by the worker. Owns its own KvStore,
 /// BlobStore, and cached bytecode for the tenant's active handler.
-/// One row in a tenant's trigger registry. Built at deploy-load time
-/// from manifest paths matching `_triggers/.../index.{mjs,js}`.
-/// `prefix` is what we match kv keys against; `module_path` is the
-/// bytecode lookup key and the identity surfaced in error messages
-/// (e.g. `"_triggers/users/sessions/index.mjs"`).
-pub const TriggerEntry = struct {
-    prefix: []u8,
-    module_path: []u8,
-};
+/// `TriggerEntry` is defined in globals.zig (lives next to the
+/// dispatch state that consumes it during kv.set / kv.delete fire).
+/// Re-exported here for convenience — `worker.TriggerEntry` reads
+/// naturally next to `worker.TenantFiles`.
+pub const TriggerEntry = globals.TriggerEntry;
 
 /// Reserved key prefixes that customer triggers can't fire on.
 /// See PLAN §2.5 (Implementation notes / Platform-prefix guard).
@@ -2070,6 +2067,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             &writeset,
             bytecode,
             &tc.bytecodes,
+            tc.triggers,
             request,
             &budget,
         ) catch |err| {
