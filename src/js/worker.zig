@@ -1902,6 +1902,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .path = path,
             .body = body,
             .query = route.query,
+            .headers = rh,
             .kv_tape = &tapes.kv,
             .date_tape = &tapes.date,
             .math_random_tape = &tapes.math_random,

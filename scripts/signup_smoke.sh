@@ -182,6 +182,40 @@ grep -q 'handler threw' /tmp/ss-alice-throw.txt || fail "throw body missing 'han
 grep -q 'boom from smoke' /tmp/ss-alice-throw.txt || fail "throw body missing exception message: $(cat /tmp/ss-alice-throw.txt)"
 ok "throwing handler → 500 with exception message in body"
 
+# ── 9c. request.headers + request.cookies reach the handler ───────────
+# Customer-facing primitive: handler reads incoming HTTP headers
+# (lowercase keys, pseudo-headers filtered) and pre-parsed cookies.
+# Webhook signature verification, custom auth, content-type branching
+# all hang off this.
+ECHO_SRC='export default function () {
+  return JSON.stringify({
+    ua: request.headers["user-agent"] ?? null,
+    sig: request.headers["x-test-sig"] ?? null,
+    sess: request.cookies["sid"] ?? null,
+    extra: request.cookies["extra"] ?? null,
+    method_pseudo: request.headers[":method"] ?? null,
+  });
+}'
+code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+    -X PUT \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/javascript" \
+    --data-binary "$ECHO_SRC" \
+    "${ADMIN_ORIGIN}/_system/files/alice/file/echo/index.mjs")
+[[ "$code" == "201" ]] || fail "deploy echo/index.mjs: got $code"
+sleep 0.3
+ECHO_BODY=$("${CURL[@]}" \
+    -H "User-Agent: smoke/1" \
+    -H "X-Test-Sig: v0=abc" \
+    -H "Cookie: sid=alice123; extra=x; bare" \
+    "${ALICE_ORIGIN}/echo")
+echo "$ECHO_BODY" | grep -q '"ua":"smoke/1"' || fail "request.headers user-agent missing: $ECHO_BODY"
+echo "$ECHO_BODY" | grep -q '"sig":"v0=abc"' || fail "request.headers custom header missing: $ECHO_BODY"
+echo "$ECHO_BODY" | grep -q '"sess":"alice123"' || fail "request.cookies sid missing: $ECHO_BODY"
+echo "$ECHO_BODY" | grep -q '"extra":"x"' || fail "request.cookies multi-value missing: $ECHO_BODY"
+echo "$ECHO_BODY" | grep -q '"method_pseudo":null' || fail "pseudo-header :method should be filtered: $ECHO_BODY"
+ok "request.headers + request.cookies expose wire data to handler"
+
 # ── 10. With ROVE_RESEND_KEY configured: signup queues an outbox email
 #        and drops magic_link from the response body. ───────────────────
 #

@@ -17,6 +17,7 @@ const qjs = @import("rove-qjs");
 const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
+const h2 = @import("rove-h2");
 
 const globals = @import("globals.zig");
 const c = qjs.c;
@@ -76,6 +77,11 @@ pub const Request = struct {
     /// to find `?fn=<name>` when dispatching function calls, and
     /// available as `request.query` inside the handler.
     query: ?[]const u8 = null,
+    /// Wire HTTP headers, lowercase per HTTP/2. Surfaced to JS as
+    /// `request.headers` (flat object, pseudo-headers filtered) and
+    /// `request.cookies` (parsed `cookie:` header). Null = none
+    /// supplied (test paths that don't care).
+    headers: ?h2.ReqHeaders = null,
     /// Optional non-determinism tapes. When set, the matching source of
     /// handler non-determinism (`kv.*`, `Date.now`, `Math.random`,
     /// `crypto.getRandomValues` / `crypto.randomUUID`) is captured
@@ -2157,6 +2163,242 @@ test "dispatch: POST RPC envelope still routes to named export" {
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(i32, 200), resp.status);
     try testing.expectEqualStrings("hi world", resp.body);
+}
+
+// ── request.headers + request.cookies ─────────────────────────────────
+
+/// Build a fake ReqHeaders from a slice of (name, value) pairs.
+/// The strings are borrowed — caller keeps them alive for the test.
+fn makeReqHeaders(buf: []h2.HeaderField, pairs: []const [2][]const u8) h2.ReqHeaders {
+    std.debug.assert(buf.len >= pairs.len);
+    for (pairs, 0..) |p, i| {
+        buf[i] = .{
+            .name = p[0].ptr,
+            .name_len = @intCast(p[0].len),
+            .value = p[1].ptr,
+            .value_len = @intCast(p[1].len),
+        };
+    }
+    return .{ .fields = buf.ptr, .count = @intCast(pairs.len) };
+}
+
+test "dispatch: request.headers exposes named headers, filters pseudo-headers" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\    const h = request.headers;
+        \\    return JSON.stringify({
+        \\        ua: h["user-agent"] ?? null,
+        \\        sig: h["x-slack-signature"] ?? null,
+        \\        method_pseudo: h[":method"] ?? null,
+        \\        path_pseudo: h[":path"] ?? null,
+        \\    });
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var hdr_buf: [8]h2.HeaderField = undefined;
+    const hdrs = makeReqHeaders(&hdr_buf, &.{
+        .{ ":method", "GET" },
+        .{ ":path", "/" },
+        .{ "user-agent", "smoke/1" },
+        .{ "x-slack-signature", "v0=abc" },
+    });
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        .method = "GET",
+        .path = "/",
+        .headers = hdrs,
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    try testing.expectEqualStrings(
+        "{\"ua\":\"smoke/1\",\"sig\":\"v0=abc\",\"method_pseudo\":null,\"path_pseudo\":null}",
+        resp.body,
+    );
+}
+
+test "dispatch: request.headers missing → empty object, missing key → undefined" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\    const h = request.headers;
+        \\    return JSON.stringify({
+        \\        type: typeof h,
+        \\        keys: Object.keys(h).length,
+        \\        missing: h["x-not-set"] === undefined,
+        \\    });
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    // No headers field — exercises the null path.
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    try testing.expectEqualStrings(
+        "{\"type\":\"object\",\"keys\":0,\"missing\":true}",
+        resp.body,
+    );
+}
+
+test "dispatch: request.cookies parses RFC 6265 cookie header" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\    const c = request.cookies;
+        \\    return JSON.stringify({
+        \\        sess: c["sid"] ?? null,
+        \\        ab: c["ab"] ?? null,
+        \\        missing: c["nope"] ?? null,
+        \\    });
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var hdr_buf: [4]h2.HeaderField = undefined;
+    const hdrs = makeReqHeaders(&hdr_buf, &.{
+        .{ "cookie", "sid=abc123; ab=  spaced  ; bare" },
+    });
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        .method = "GET",
+        .path = "/",
+        .headers = hdrs,
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    // `bare` (no `=`) is dropped; whitespace around the value is
+    // trimmed (matches browser / Express / Hono cookie parsers).
+    try testing.expectEqualStrings(
+        "{\"sess\":\"abc123\",\"ab\":\"spaced\",\"missing\":null}",
+        resp.body,
+    );
+}
+
+test "dispatch: request.cookies empty when no cookie header" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\    return JSON.stringify({
+        \\        type: typeof request.cookies,
+        \\        keys: Object.keys(request.cookies).length,
+        \\    });
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var hdr_buf: [4]h2.HeaderField = undefined;
+    const hdrs = makeReqHeaders(&hdr_buf, &.{
+        .{ "user-agent", "smoke/1" },
+    });
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        .method = "GET",
+        .path = "/",
+        .headers = hdrs,
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    try testing.expectEqualStrings(
+        "{\"type\":\"object\",\"keys\":0}",
+        resp.body,
+    );
 }
 
 test "dispatch: async module handler gets unwrapped" {

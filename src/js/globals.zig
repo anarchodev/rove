@@ -19,6 +19,7 @@ const qjs = @import("rove-qjs");
 const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
+const h2 = @import("rove-h2");
 
 const c = qjs.c;
 
@@ -1032,7 +1033,7 @@ pub fn installRequest(
     const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);
 
-    // request = { method, path, body, query }
+    // request = { method, path, body, query, headers, cookies }
     //
     // `query` is the raw URL query string (everything after `?`) or
     // null when the URL had none. Parsing is the handler's job —
@@ -1040,6 +1041,15 @@ pub fn installRequest(
     // manual `split("&").reduce(...)` is a few lines in the
     // handler. If customer demand for `URLSearchParams` shows up,
     // it can land as another polyfill alongside TextEncoder.
+    //
+    // `headers` is a flat object, lowercase keys per HTTP/2.
+    // Pseudo-headers (`:method`, `:path`, `:scheme`, `:authority`)
+    // are filtered out — they're already exposed as `request.method`
+    // / `request.path` etc. Multiple headers with the same name
+    // comma-join (HTTP-standard fold).
+    //
+    // `cookies` is a parsed `{name: value}` from the `cookie` header,
+    // RFC 6265 semicolon-separated. Empty / no-cookie → `{}`.
     const req_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, req_obj, "method", c.JS_NewStringLen(ctx, request.method.ptr, request.method.len));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "path", c.JS_NewStringLen(ctx, request.path.ptr, request.path.len));
@@ -1049,6 +1059,7 @@ pub fn installRequest(
     } else {
         _ = c.JS_SetPropertyStr(ctx, req_obj, "query", js_null);
     }
+    installHeaders(ctx, state, req_obj, request.headers);
     _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);
 
     // response = { status: 200, headers: {}, cookies: [] }
@@ -1063,6 +1074,98 @@ pub fn installRequest(
     _ = c.JS_SetPropertyStr(ctx, resp_obj, "headers", c.JS_NewObject(ctx));
     _ = c.JS_SetPropertyStr(ctx, resp_obj, "cookies", c.JS_NewArray(ctx));
     _ = c.JS_SetPropertyStr(ctx, global, "response", resp_obj);
+}
+
+/// Build `request.headers` (flat lowercase object, pseudo-headers
+/// filtered) and `request.cookies` (parsed from the `cookie:` header)
+/// onto `req_obj`. Last-write-wins on duplicate header names — HTTP/2
+/// clients SHOULD coalesce duplicates and most do; if a real customer
+/// hits a producer that doesn't, we revisit.
+fn installHeaders(
+    ctx: *c.JSContext,
+    state: *DispatchState,
+    req_obj: c.JSValue,
+    hdrs_opt: ?h2.ReqHeaders,
+) void {
+    const headers_obj = c.JS_NewObject(ctx);
+    const cookies_obj = c.JS_NewObject(ctx);
+
+    var cookie_value: []const u8 = "";
+
+    if (hdrs_opt) |hdrs| if (hdrs.fields) |fields_ptr| {
+        const fields = fields_ptr[0..hdrs.count];
+        for (fields) |f| {
+            const name = f.name[0..f.name_len];
+            const value = f.value[0..f.value_len];
+
+            // Skip pseudo-headers (`:method`, `:path`, `:scheme`,
+            // `:authority`). They're already exposed as
+            // `request.method` / `request.path` etc.
+            if (name.len > 0 and name[0] == ':') continue;
+
+            // NUL-terminate name for JS_SetPropertyStr.
+            const name_z = state.allocator.allocSentinel(u8, name.len, 0) catch continue;
+            defer state.allocator.free(name_z);
+            @memcpy(name_z, name);
+
+            _ = c.JS_SetPropertyStr(
+                ctx,
+                headers_obj,
+                name_z.ptr,
+                c.JS_NewStringLen(ctx, value.ptr, value.len),
+            );
+
+            // Stash the cookie header for parseCookies below. If the
+            // wire has multiple Cookie headers (RFC 7230 says clients
+            // SHOULD send one) we take the last; this is consistent
+            // with the last-write-wins rule above.
+            if (std.mem.eql(u8, name, "cookie")) {
+                cookie_value = value;
+            }
+        }
+    };
+
+    parseCookies(ctx, state, cookies_obj, cookie_value);
+
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "headers", headers_obj);
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "cookies", cookies_obj);
+}
+
+/// RFC 6265 cookie-string parser: semicolon-separated `name=value`
+/// pairs, optional whitespace around the separator. Sets each into
+/// `cookies_obj` as a string property. Empty `cookie_value` → no-op.
+fn parseCookies(
+    ctx: *c.JSContext,
+    state: *DispatchState,
+    cookies_obj: c.JSValue,
+    cookie_value: []const u8,
+) void {
+    if (cookie_value.len == 0) return;
+
+    var it = std.mem.splitScalar(u8, cookie_value, ';');
+    while (it.next()) |raw| {
+        const pair = std.mem.trim(u8, raw, " \t");
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const name = std.mem.trim(u8, pair[0..eq], " \t");
+        // Trim whitespace from the value too. RFC 6265 strictly only
+        // trims when parsing Set-Cookie, but every practical Cookie
+        // parser (browsers, Express, Hono) trims both sides — matches
+        // customer expectations.
+        const value = std.mem.trim(u8, pair[eq + 1 ..], " \t");
+        if (name.len == 0) continue;
+
+        const name_z = state.allocator.allocSentinel(u8, name.len, 0) catch continue;
+        defer state.allocator.free(name_z);
+        @memcpy(name_z, name);
+
+        _ = c.JS_SetPropertyStr(
+            ctx,
+            cookies_obj,
+            name_z.ptr,
+            c.JS_NewStringLen(ctx, value.ptr, value.len),
+        );
+    }
 }
 
 /// Back-compat wrapper: install everything at once. Used by tests and
