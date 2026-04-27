@@ -218,50 +218,86 @@ Between handler files: relative paths resolve through the current deployment's m
 
 "JS stored procedures" — deterministic, in-transaction code that fires on KV writes matching a prefix.
 
-#### Registration via file convention
+#### Registration via path convention
+
+The path under `_triggers/` IS the prefix. `_triggers/users/sessions/index.mjs` fires on writes whose kv key starts with `users/sessions/`. Symmetric with handler routing (PLAN §2.4) — customers already know "path = config" from `users/index.mjs` → `/users`. No `config` export, no typo'd prefixes, no extra discovery step.
 
 ```
 _triggers/
-    00_secrets_audit.mjs
-    10_users_index.mjs
-    50_orders_totals.mjs
+    index.mjs                    fires on every write (prefix "")
+    users/
+        index.mjs                fires on `users/*`
+        sessions/index.mjs       fires on `users/sessions/*` (more specific)
+    secrets/index.mjs            fires on `secrets/*`
+    orders/index.mjs             fires on `orders/*`
 ```
+
+Each trigger module hooks specific op×timing combinations via named exports, with `default` as a catch-all:
 
 ```javascript
-// _triggers/secrets_audit.mjs
-export const config = {
-  prefix: "secrets/",
-  timing: "after",           // "before" | "after"
-  ops: ["put", "delete"],    // default: both
-};
-export default function (event) {
-  kv.put(
-    `_audit/${event.timestamp}-${event.key}`,
-    JSON.stringify({ op: event.op, key: event.key, actor: event.actor })
-  );
+// _triggers/users/sessions/index.mjs
+// Fires on writes to users/sessions/*
+
+export function beforePut(event) {
+  // Validate the new value. Throw to reject; return a value to mutate;
+  // return undefined to leave alone.
+  const sess = JSON.parse(event.value);
+  if (!sess.user_id) throw new Error("session missing user_id");
 }
+
+export function afterPut(event) {
+  // Maintain a reverse index — runs in the same transaction as the
+  // originating write.
+  const sess = JSON.parse(event.value);
+  const sid = event.key.split('/').pop();
+  kv.set(`users/by-session/${sid}`, sess.user_id);
+}
+
+export function afterDelete(event) {
+  if (event.previousValue) {
+    kv.delete(`users/by-session/${event.key.split('/').pop()}`);
+  }
+}
+
+// No `beforeDelete` exported → delete is allowed without validation.
+// No `default` exported → ops without a named export are no-ops here.
 ```
 
-Triggers are part of the deployment manifest — versioned with code, rolled back atomically. No runtime `triggers.register()`.
+Available named exports:
+
+| Export | Fires when | Can throw? | Return value |
+|---|---|---|---|
+| `beforePut(event)` | before a put commits | yes (rejects write, see §catchable-throw) | new value (or `undefined` to leave alone) |
+| `afterPut(event)` | after a put commits | yes (rolls back the originating write) | ignored |
+| `beforeDelete(event)` | before a delete commits | yes (rejects delete) | ignored |
+| `afterDelete(event)` | after a delete commits | yes (rolls back the originating delete) | ignored |
+| `default(event)` | any op×timing not specifically named | as above (depends on `event.timing`) | as above |
+
+A trigger module exporting nothing (other than imports) is a no-op for that prefix.
+
+Triggers are part of the deployment manifest — versioned with code, rolled back atomically with everything else. No runtime `triggers.register()`.
 
 #### Event object
 
 ```javascript
 {
   key, value, previousValue, op: "put" | "delete",
+  timing: "before" | "after",
   timestamp,
   actor: { request_id, ... } | null,
-  depth: number,     // 0 for user-initiated writes
+  depth: number,     // 0 for user-initiated writes; +1 per cascade level
 }
 ```
 
+`event.op` and `event.timing` are useful inside `default` (catch-all) handlers; the named exports above know their own op×timing implicitly.
+
 #### Semantics
 
-- **Synchronous, in-transaction**. Throw → rollback including the originating write.
-- **BEFORE** can reject or mutate value. **AFTER** can cascade to further KV writes in the same transaction.
-- **Prefix match only**. Multiple matches fire in **lexical order** of filename.
-- **Cascades allowed**, depth limit 8. Platform-reserved prefixes (`_audit/`, `_deploy/`, `_outbox/`, `_magic/`) are un-triggerable from customer code.
-- **Same deterministic rules as handlers**: no `fetch`, no async IO, no uncaptured nondeterminism. Trigger CPU time counts against the request's shared 10ms envelope (2.3) — no separate per-trigger budget.
+- **Synchronous, in-transaction.** A throw in BEFORE rejects the originating write (catchable in handler — see §catchable-throw below); a throw in AFTER rolls back the originating write plus everything the trigger did.
+- **BEFORE** can reject (throw) or mutate (return new value). **AFTER** can cascade further KV writes in the same transaction.
+- **Tree-traversal order on multiple matches.** Writing key `users/sessions/abc` matches `_triggers/index.mjs`, `_triggers/users/index.mjs`, AND `_triggers/users/sessions/index.mjs` if all exist. BEFORE chain fires **outermost-first** (catchall → users → sessions); the actual write happens; AFTER chain fires **innermost-first** (sessions → users → catchall). Mirrors typical onion-shell middleware composition: broad policies validate before narrow ones; narrow cleanup runs before broad cleanup.
+- **Cascades allowed**, depth limit 8. Platform-reserved prefixes (see "Platform-prefix guard" below) are un-triggerable from customer code.
+- **Same deterministic rules as handlers**: no `fetch`, no async IO, no uncaptured nondeterminism. Trigger CPU time counts against the request's shared 10ms envelope (§2.3) — no separate per-trigger budget.
 - **Raft**: leader runs triggers; replicated log entry contains the *final write-set*, not the original write. Replicas apply atomically without re-running JS. This is the only way to stay deterministic given potential future nondeterminism in triggers.
 - **Tape replay**: triggers re-fire automatically when kv ops are replayed — breakpoints in trigger code work on replay.
 
@@ -274,15 +310,17 @@ Triggers are part of the deployment manifest — versioned with code, rolled bac
 
 #### Implementation notes (decided 2026-04-27, before code lands)
 
-- **`config` evaluated eagerly at deploy load.** When a deployment becomes current and `_triggers/*.{mjs,js}` files are present, each trigger module is evaluated in a sandboxed QuickJS context (no `kv`, no `webhook.send`, no `events.emit`, no `console`, no tapes — only standard intrinsics) just to read its `config` export. Bad config (missing `prefix`, invalid `timing`, etc.) rejects the deploy with a `{file, line, col, message}` error, matching §2.4's compile-error story. The handler `default` export is NOT called at load — only at fire time.
-- **BEFORE-trigger value mutation via return value.** Trigger's `default(event)` return value becomes the new value being written. Returning `undefined` leaves the value untouched. Symmetric with PLAN §2.4's "body comes from the return value" rule for handlers — same shape, no `event.value =` mutation surface.
-- **Trigger rejection is a catchable JS exception.** When a BEFORE trigger throws, an inner savepoint (opened only when the registry shows matching BEFORE triggers — no cost when none match) rolls back any writes the trigger made before throwing, then `kv.set` / `kv.delete` re-throws into the handler as `Error` with `code: "trigger_rejected"` and `message: "<trigger_path>: <original message>"`. The customer can `try { kv.set(...) } catch (e) { ... }` to handle the rejection; uncaught throws bubble to the handler-exception path (§11) → 500 with the message in the body. The trigger's *protection* is never bypassable — the rejected write doesn't apply regardless of whether the handler catches; only the handler's *control flow* is affected.
-- **Rollback gotcha to document for customers**: a BEFORE trigger that does `kv.set("audit/last-attempt", ...)` *before* throwing has that audit write also rolled back (the inner savepoint covers everything inside the trigger invocation). Customers who want "log every rejected attempt" should do it from an AFTER trigger (only fires on successful writes) or from the handler itself.
-- **Lookup structure: sorted array, linear scan.** With a 32-trigger ceiling, O(32) per kv write is well under any budget. Defer a prefix trie to v2 if the cap ever raises.
-- **Platform-prefix guard at two layers.** Deploy-load rejects `config.prefix` overlapping any of: `_audit/`, `_deploy/`, `_outbox/`, `_outbox_inflight/`, `_dlq/`, `_callback/`, `_magic/`, `_triggers/`, `_events/`, `_sessions/` (and any future system namespace). Fire-time also skips trigger dispatch when the kv key has a platform prefix — defense in depth.
+- **No deploy-load JS evaluation.** The path-based registration model means we don't need to evaluate trigger modules just to learn what prefix they fire on — the path tells us. Deploy-load just walks the manifest for entries matching `_triggers/.../index.{mjs,js}`, derives the prefix from the path, and stores `prefix → bytecode_path` in a per-tenant registry on `TenantFiles`. Compile errors in the trigger source surface at upload time the same way they do for any handler file (PLAN §2.4) — no special-case logic.
+- **Lazy export lookup at fire time.** Trigger modules are evaluated into the handler's QuickJS context on first fire (same machinery handlers use), then the named export (`beforePut` / `afterPut` / `beforeDelete` / `afterDelete` / `default`) is looked up via `JS_GetPropertyStr`. Missing export → no-op for that op×timing. Hash lookup is O(1); negligible cost per fire.
+- **BEFORE-trigger value mutation via return value.** Trigger function's return value becomes the new value being written. Returning `undefined` leaves the value untouched. Symmetric with PLAN §2.4's "body comes from the return value" rule for handler default exports — same shape, no `event.value =` mutation surface.
+- **Trigger rejection is a catchable JS exception (§catchable-throw).** When a BEFORE trigger throws, an inner savepoint (opened only when the registry shows matching BEFORE triggers — no cost when none match) rolls back any writes the trigger made before throwing, then `kv.set` / `kv.delete` re-throws into the handler as `Error` with `code: "trigger_rejected"` and `message: "<trigger_path>: <original message>"`. The customer can `try { kv.set(...) } catch (e) { ... }` to handle the rejection; uncaught throws bubble to the handler-exception path (§11) → 500 with the message in the body. The trigger's *protection* is never bypassable — the rejected write doesn't apply regardless of whether the handler catches; only the handler's *control flow* is affected.
+- **Rollback gotcha to document for customers**: a BEFORE trigger that does `kv.set("audit/last-attempt", ...)` *before* throwing has that audit write also rolled back (the inner savepoint covers everything inside the trigger invocation). Customers who want "log every rejected attempt" should do it from an `afterPut` (only fires on successful writes) or from the handler itself.
+- **Lookup structure: sorted array, linear scan.** With a 32-trigger ceiling, O(32) per kv write is well under any budget. The array is sorted by prefix length (descending) for stable tree-traversal order. Defer a prefix trie to v2 if the cap ever raises.
+- **Platform-prefix guard at two layers.** Deploy-load rejects trigger paths whose derived prefix overlaps any of: `_audit/`, `_deploy/`, `_outbox/`, `_outbox_inflight/`, `_dlq/`, `_callback/`, `_magic/`, `_triggers/`, `_events/`, `_sessions/` (and any future system namespace). Fire-time also skips trigger dispatch when the kv key has a platform prefix — defense in depth.
 - **Cascade depth tracked on `DispatchState`.** Single counter, incremented before each recursive trigger fire, decremented after; throws at 8.
 - **`previousValue` event field**: implementation does an extra `kv.get` for the existing value before each write that has matching triggers. Acceptable cost given the 32-trigger ceiling and the read-your-writes guarantee from `TrackedTxn`.
-- **Rove ECS audit per `~/.claude/memory/feedback_rove_design_first.md`**: triggers introduce no new entities or collections. The trigger registry lives on `TenantFiles` next to the existing `bytecodes` map (per-tenant data, deploy-lifecycle); execution is recursive enhancement of `kv.set` / `kv.delete` JS globals inside the handler's existing QuickJS context. The handler entity in `request_out` remains the only entity in flight. No new Rows, no new systems at the rove layer.
+- **Storage is just files.** Trigger modules live in the customer's deployment manifest exactly like any other handler file: `file/_triggers/users/sessions/index.mjs → {hash, kind: "handler", content_type}` in `files.db`, source + bytecode bytes in `file-blobs/{hash}`, replicated via raft envelope type 3 (files_writeset). Same content-addressed two-phase upload pipeline (§2.4). What's *new* and lives in the worker (not files-server) is the in-memory **trigger registry** on `TenantFiles`, derived at deploy-load time. Same split as handlers (source in files-server, runtime bytecode cache in worker).
+- **Rove ECS audit per `~/.claude/memory/feedback_rove_design_first.md`**: triggers introduce no new entities or collections. The registry sits on `TenantFiles` next to the existing `bytecodes` map; execution is recursive enhancement of `kv.set` / `kv.delete` JS globals inside the handler's existing QuickJS context. The handler entity in `request_out` remains the only entity in flight. No new Rows, no new systems at the rove layer.
 
 ### 2.6 Webhooks (outbox pattern)
 
@@ -680,7 +718,7 @@ These are explicitly not in v1 so future sessions don't accidentally design arou
 - Async / fire-and-forget webhooks (no callback).
 - Circuit breaker per destination URL.
 - Per-destination rate shaping.
-- Read triggers (`on get`).
+- Read triggers (`beforeGet` / `afterGet`). The path-based registration model (§2.5) accommodates them naturally — same file layout, named exports just expand. Held back because read triggers fire on every `kv.get` (rather than only writes, which are rare), turning every read into a registry scan + potential JS dispatch. The cost story isn't established yet; revisit when a real customer asks.
 - Cross-instance triggers.
 - Scheduled / cron execution (falls out of outbox with `nextAttemptAt` when needed).
 - Streaming response bodies; Range requests for static.
