@@ -156,12 +156,12 @@ grep -q 'Your Loop46 app is live' /tmp/ss-alice-html.txt || fail "starter HTML b
 ok "starter content: GET ${ALICE_ORIGIN}/ → 200 with expected HTML"
 
 # The handler lives at index.mjs; hit a non-static path so static
-# resolution misses and routes to the handler. Default export fires
-# via `?fn=default`.
-code=$("${CURL[@]}" -o /tmp/ss-alice-api.txt -w '%{http_code}' "${ALICE_ORIGIN}/api?fn=default")
+# resolution misses and routes to the handler. No `?fn=` needed —
+# missing fn invokes the default export with no args.
+code=$("${CURL[@]}" -o /tmp/ss-alice-api.txt -w '%{http_code}' "${ALICE_ORIGIN}/api")
 [[ "$code" == "200" ]] || fail "starter handler /api: got $code (body: $(cat /tmp/ss-alice-api.txt))"
 grep -q 'Your Loop46 API is live' /tmp/ss-alice-api.txt || fail "starter handler body missing expected text"
-ok "starter content: GET ${ALICE_ORIGIN}/api?fn=default → 200 with expected JSON"
+ok "starter content: GET ${ALICE_ORIGIN}/api → 200 with expected JSON (default export, no fn=)"
 
 # ── 9b. Throwing handler → 500 with the exception in the body ─────────
 # Customer day-one footgun: until this fix, any uncaught throw came back
@@ -176,7 +176,7 @@ code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
     "${ADMIN_ORIGIN}/_system/files/alice/file/throw/index.mjs")
 [[ "$code" == "201" ]] || fail "deploy throw.mjs: got $code"
 sleep 0.3
-code=$("${CURL[@]}" -o /tmp/ss-alice-throw.txt -w '%{http_code}' "${ALICE_ORIGIN}/throw?fn=default")
+code=$("${CURL[@]}" -o /tmp/ss-alice-throw.txt -w '%{http_code}' "${ALICE_ORIGIN}/throw")
 [[ "$code" == "500" ]] || fail "throw handler: expected 500, got $code (body: $(cat /tmp/ss-alice-throw.txt))"
 grep -q 'handler threw' /tmp/ss-alice-throw.txt || fail "throw body missing 'handler threw' prefix: $(cat /tmp/ss-alice-throw.txt)"
 grep -q 'boom from smoke' /tmp/ss-alice-throw.txt || fail "throw body missing exception message: $(cat /tmp/ss-alice-throw.txt)"

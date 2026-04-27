@@ -118,12 +118,16 @@ code=$("${CURL_BASE[@]}" -o /tmp/admin-smoke-create.json -w '%{http_code}' \
 grep -q '"id":"admintest"' /tmp/admin-smoke-create.json || fail "create response body"
 ok "POST createInstance creates new instance"
 
-# ── 7. Malformed POST body → 400 ──────────────────────────────────
+# ── 7. Malformed RPC envelope → 400 ──────────────────────────────
+# Valid JSON, but `fn` is not a string → BadRequest. (A non-JSON body
+# or a JSON body without `fn` is now treated as opaque payload and
+# routed to the default export — admin has none, so that path returns
+# 404 instead. We test the envelope-shape error here.)
 code=$("${CURL_BASE[@]}" -o /dev/null -w '%{http_code}' \
     "${AUTH_HDR[@]}" -H "Content-Type: application/json" \
-    -d 'not-json' "${API_URL_BASE}/")
-[[ "$code" == "400" ]] || fail "bad json (got $code)"
-ok "POST with bad JSON returns 400"
+    -d '{"fn":42}' "${API_URL_BASE}/")
+[[ "$code" == "400" ]] || fail "malformed RPC envelope (got $code)"
+ok "POST with malformed RPC envelope returns 400"
 
 # ── 8. getInstance existing → 200 ──────────────────────────────────
 code=$("${CURL_BASE[@]}" -o /dev/null -w '%{http_code}' "${AUTH_HDR[@]}" \

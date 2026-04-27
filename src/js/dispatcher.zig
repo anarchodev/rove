@@ -438,7 +438,7 @@ fn runModule(
         error.BadRequest => {
             status_out.* = 400;
             body_out.* = std.fmt.allocPrint(d.allocator,
-                "missing or malformed `fn` / `args`\n", .{}) catch return error.OutOfMemory;
+                "RPC envelope: `fn` must be a string and `args` must be an array\n", .{}) catch return error.OutOfMemory;
             return;
         },
     };
@@ -559,52 +559,56 @@ fn parseDispatch(
     allocator: std.mem.Allocator,
     request: Request,
 ) (error{ OutOfMemory, BadRequest })!DispatchCall {
-    const has_body = request.body.len > 0 and looksLikeJson(request.body);
-
-    if (has_body) {
-        // POST body: `{fn: "...", args: [...]}`. Lightweight parse to
-        // pull `fn` string and `args` slice, then re-serialize `args`
-        // into compact JSON for the qjs side.
-        const parsed = std.json.parseFromSlice(
+    // RPC envelope path: a JSON-looking POST body whose top-level
+    // object has `fn: string` (and optionally `args: array`). Anything
+    // else — a non-JSON body, an array body, an object without `fn`,
+    // or a parse failure — is treated as opaque payload and falls
+    // through to the query-string path. The handler reads the raw
+    // body via `request.body` in that case.
+    if (request.body.len > 0 and looksLikeJson(request.body)) {
+        if (std.json.parseFromSlice(
             std.json.Value,
             allocator,
             request.body,
             .{},
-        ) catch return error.BadRequest;
-        defer parsed.deinit();
+        )) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("fn")) |fn_val| {
+                    if (fn_val != .string) return error.BadRequest;
+                    const fn_owned = try allocator.dupe(u8, fn_val.string);
+                    errdefer allocator.free(fn_owned);
 
-        if (parsed.value != .object) return error.BadRequest;
-        const obj = parsed.value.object;
+                    const args_text = if (parsed.value.object.get("args")) |v| blk: {
+                        if (v != .array) return error.BadRequest;
+                        break :blk try jsonArrayToOwnedText(allocator, v.array.items);
+                    } else try allocator.dupe(u8, "[]");
 
-        const fn_val = obj.get("fn") orelse return error.BadRequest;
-        if (fn_val != .string) return error.BadRequest;
-        const fn_owned = try allocator.dupe(u8, fn_val.string);
-        errdefer allocator.free(fn_owned);
-
-        const args_text = if (obj.get("args")) |v| blk: {
-            if (v != .array) return error.BadRequest;
-            break :blk try jsonArrayToOwnedText(allocator, v.array.items);
-        } else try allocator.dupe(u8, "[]");
-
-        return .{ .fn_name = fn_owned, .args_json_text = args_text };
+                    return .{ .fn_name = fn_owned, .args_json_text = args_text };
+                }
+            }
+        } else |_| {}
     }
 
     // Query-string path: ?fn=name[&args=<urlencoded-json-array>].
+    // Both optional. Missing or empty fn → "default" (PLAN §2.4: the
+    // default export is the modern path, called with no arguments).
     const query = request.query orelse "";
-    const fn_src = queryParam(query, "fn") orelse return error.BadRequest;
-    if (fn_src.len == 0) return error.BadRequest;
-    const fn_owned = try decodePercent(allocator, fn_src);
+    const fn_owned: []u8 = blk: {
+        if (queryParam(query, "fn")) |s| {
+            if (s.len > 0) break :blk try decodePercent(allocator, s);
+        }
+        break :blk try allocator.dupe(u8, "default");
+    };
     errdefer allocator.free(fn_owned);
 
-    const args_src_opt = queryParam(query, "args");
-    if (args_src_opt == null or args_src_opt.?.len == 0) {
-        return .{
-            .fn_name = fn_owned,
-            .args_json_text = try allocator.dupe(u8, "[]"),
-        };
-    }
+    const args_text: []u8 = blk: {
+        if (queryParam(query, "args")) |s| {
+            if (s.len > 0) break :blk try decodePercent(allocator, s);
+        }
+        break :blk try allocator.dupe(u8, "[]");
+    };
 
-    const args_text = try decodePercent(allocator, args_src_opt.?);
     return .{ .fn_name = fn_owned, .args_json_text = args_text };
 }
 
@@ -1968,6 +1972,191 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         try testing.expectEqual(@as(i32, 404), resp.status);
         try testing.expect(std.mem.indexOf(u8, resp.body, "nope") != null);
     }
+}
+
+test "dispatch: missing fn defaults to `default` export, called with no args" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\    return "hi from default at " + request.path;
+        \\}
+        \\export function other() {
+        \\    return "should not be called";
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // GET with no query at all → default export, no args.
+    {
+        var txn = try kv.beginTrackedImmediate();
+        defer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(testing.allocator);
+        defer ws.deinit();
+        var budget = Budget.fromNow(Budget.default_duration_ns);
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+            .method = "GET",
+            .path = "/landing",
+        }, &budget);
+        defer resp.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 200), resp.status);
+        try testing.expectEqualStrings("hi from default at /landing", resp.body);
+    }
+
+    // GET with query that has no fn= → still default.
+    {
+        var txn = try kv.beginTrackedImmediate();
+        defer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(testing.allocator);
+        defer ws.deinit();
+        var budget = Budget.fromNow(Budget.default_duration_ns);
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+            .method = "GET",
+            .path = "/x",
+            .query = "page=2&sort=desc",
+        }, &budget);
+        defer resp.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 200), resp.status);
+        try testing.expectEqualStrings("hi from default at /x", resp.body);
+    }
+}
+
+test "dispatch: no fn and no default export → 404" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export function only_named() { return "x"; }
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 404), resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "default") != null);
+}
+
+test "dispatch: POST with non-envelope JSON body invokes default, body in request.body" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\    const parsed = JSON.parse(request.body);
+        \\    return "got name=" + parsed.name;
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        .method = "POST",
+        .path = "/",
+        .body = "{\"name\":\"alice\"}",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    try testing.expectEqualStrings("got name=alice", resp.body);
+}
+
+test "dispatch: POST RPC envelope still routes to named export" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export function greet(who) {
+        \\    return "hi " + who;
+        \\}
+        \\export default function () { return "default-not-called"; }
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, .{
+        .method = "POST",
+        .path = "/",
+        .body = "{\"fn\":\"greet\",\"args\":[\"world\"]}",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    try testing.expectEqualStrings("hi world", resp.body);
 }
 
 test "dispatch: async module handler gets unwrapped" {
