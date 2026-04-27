@@ -272,6 +272,18 @@ Triggers are part of the deployment manifest — versioned with code, rolled bac
 - Depth 8.
 - 32 triggers per instance (plan-tier).
 
+#### Implementation notes (decided 2026-04-27, before code lands)
+
+- **`config` evaluated eagerly at deploy load.** When a deployment becomes current and `_triggers/*.{mjs,js}` files are present, each trigger module is evaluated in a sandboxed QuickJS context (no `kv`, no `webhook.send`, no `events.emit`, no `console`, no tapes — only standard intrinsics) just to read its `config` export. Bad config (missing `prefix`, invalid `timing`, etc.) rejects the deploy with a `{file, line, col, message}` error, matching §2.4's compile-error story. The handler `default` export is NOT called at load — only at fire time.
+- **BEFORE-trigger value mutation via return value.** Trigger's `default(event)` return value becomes the new value being written. Returning `undefined` leaves the value untouched. Symmetric with PLAN §2.4's "body comes from the return value" rule for handlers — same shape, no `event.value =` mutation surface.
+- **Trigger rejection is a catchable JS exception.** When a BEFORE trigger throws, an inner savepoint (opened only when the registry shows matching BEFORE triggers — no cost when none match) rolls back any writes the trigger made before throwing, then `kv.set` / `kv.delete` re-throws into the handler as `Error` with `code: "trigger_rejected"` and `message: "<trigger_path>: <original message>"`. The customer can `try { kv.set(...) } catch (e) { ... }` to handle the rejection; uncaught throws bubble to the handler-exception path (§11) → 500 with the message in the body. The trigger's *protection* is never bypassable — the rejected write doesn't apply regardless of whether the handler catches; only the handler's *control flow* is affected.
+- **Rollback gotcha to document for customers**: a BEFORE trigger that does `kv.set("audit/last-attempt", ...)` *before* throwing has that audit write also rolled back (the inner savepoint covers everything inside the trigger invocation). Customers who want "log every rejected attempt" should do it from an AFTER trigger (only fires on successful writes) or from the handler itself.
+- **Lookup structure: sorted array, linear scan.** With a 32-trigger ceiling, O(32) per kv write is well under any budget. Defer a prefix trie to v2 if the cap ever raises.
+- **Platform-prefix guard at two layers.** Deploy-load rejects `config.prefix` overlapping any of: `_audit/`, `_deploy/`, `_outbox/`, `_outbox_inflight/`, `_dlq/`, `_callback/`, `_magic/`, `_triggers/`, `_events/`, `_sessions/` (and any future system namespace). Fire-time also skips trigger dispatch when the kv key has a platform prefix — defense in depth.
+- **Cascade depth tracked on `DispatchState`.** Single counter, incremented before each recursive trigger fire, decremented after; throws at 8.
+- **`previousValue` event field**: implementation does an extra `kv.get` for the existing value before each write that has matching triggers. Acceptable cost given the 32-trigger ceiling and the read-your-writes guarantee from `TrackedTxn`.
+- **Rove ECS audit per `~/.claude/memory/feedback_rove_design_first.md`**: triggers introduce no new entities or collections. The trigger registry lives on `TenantFiles` next to the existing `bytecodes` map (per-tenant data, deploy-lifecycle); execution is recursive enhancement of `kv.set` / `kv.delete` JS globals inside the handler's existing QuickJS context. The handler entity in `request_out` remains the only entity in flight. No new Rows, no new systems at the rove layer.
+
 ### 2.6 Webhooks (outbox pattern)
 
 The only path to the outside world. Directly inspired by Elm's `Cmd` model.
