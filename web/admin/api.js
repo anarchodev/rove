@@ -135,6 +135,14 @@ export const api = {
   logout() {
     return postJson(adminBase() + "/v1/logout", {});
   },
+  /// Magic-link signup. Returns `{ok:true, name, magic_link?}` on
+  /// success — `magic_link` is present only when no Resend key is
+  /// configured (dev/MVP mode); in production the link is delivered
+  /// via email and the customer follows it to /v1/auth.
+  /// Errors: 409 = name unavailable / reserved, 400 = invalid email.
+  signup(name, email) {
+    return postJson(adminBase() + "/v1/signup", { name, email });
+  },
   /// Returns `{is_root}` on a valid session, null on 401.
   async whoami() {
     try {

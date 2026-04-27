@@ -149,8 +149,31 @@ label {
   box-shadow: var(--shadow);
 }
 .login p { color: var(--muted); margin-bottom: 20px; }
-.login-form .error { margin-top: 12px; margin-bottom: 0; }
-.login-form button { width: 100%; padding: 8px; font-weight: 500; }
+.login-form .error,
+.signup-form .error { margin-top: 12px; margin-bottom: 0; }
+.login-form button,
+.signup-form button { width: 100%; padding: 8px; font-weight: 500; }
+.signup-form label + label { margin-top: 12px; }
+.signup-form .success {
+  margin-top: 12px;
+  margin-bottom: 0;
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  background: color-mix(in srgb, #1a8f3c 15%, var(--panel));
+  color: #1a8f3c;
+}
+@media (prefers-color-scheme: dark) {
+  .signup-form .success { color: #5dd07c; }
+}
+.login .mode-toggle {
+  margin-top: 16px;
+  margin-bottom: 0;
+  font-size: 13px;
+  color: var(--muted);
+  text-align: center;
+}
+.login .mode-toggle a { color: var(--accent); }
 
 /* ── Instances page ─────────────────────────────────────────────── */
 
