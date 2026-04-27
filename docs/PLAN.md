@@ -872,7 +872,16 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 - Log pagination: `LogStore.list` accepts `after: u64` (a `request_id`); `ListResult` returns `next_cursor: u64`. Wire endpoint `/_system/log/{id}/list?limit=N&after=<hex>` returns `{records: [...], next_cursor: "<hex>" | null}`. Admin UI tracks the cursor and appends pages on Load older — **done 2026-04-27**
 - NOT yet: Logs auto-refresh / live tail, Logs filtering (by status / outcome / deployment / path), nested-thread display under `parent_request_id` (waits on Phase 6 trigger / callback log emits), Deploys tab with history + diff, CodeMirror 6 upgrade, draft workflow, signup form on the login page, tape replay click-through (waits on Phase 4 tape capture)
 
-### Phases 6–10 — **not started**
+### Phase 6 — Triggers — **done 2026-04-27**
+- Path-based registration (PLAN §2.5): `_triggers/users/sessions/index.mjs` fires on writes to `users/sessions/*`. Tree-traversal order across overlapping prefixes — outermost-first BEFORE, innermost-first AFTER. Catch-all via top-level `_triggers/index.mjs` (prefix `""`).
+- Named exports for op×timing: `beforePut`, `afterPut`, `beforeDelete`, `afterDelete`, plus `default` as the catchall.
+- BEFORE return-value mutates the written value (string return only; non-string returns leave the value untouched).
+- Catchable `Error{ code: "trigger_rejected", message: "<trigger_path>: <original>" }` in the handler. Inner savepoint scopes BEFORE chain + actual write + AFTER chain so a throw anywhere rolls back all three (the audit gotcha is real and tested). Uncaught throws bubble to the §11 handler-exception path → 500.
+- Cascade depth tracked on `DispatchState`, throws at 8. Platform-key fire-time guard (defense in depth alongside deploy-load guard) — customer catch-alls don't see writes to `_outbox/`, `_audit/`, etc. Per-request module-namespace cache so trigger top-level state persists across fires within one request.
+- 15 inline dispatcher tests cover registry derivation, BEFORE+AFTER chains, op×timing dispatch + default catchall, tree-traversal order, cascade depth (well-bounded + runaway), platform-prefix block, return-value mutation, audit-gotcha rollback, previousValue exposure, trigger_rejected error shape.
+- `scripts/triggers_smoke.sh` end-to-end against a live worker: signup → deploy trigger module + handler → exercise via curl → verify reverse-index built, BEFORE mutation lowercased the value, rejection caught with the right code, afterDelete cleaned up.
+
+### Phases 7–10 — **not started**
 
 ### Blob replication (multi-node prerequisite)
 - Raft envelopes now include `type=3` files_writeset replicating `{id}/files.db` across nodes — **done**

@@ -644,11 +644,15 @@ fn fireOneTrigger(
     if (c.JS_IsUndefined(handler)) return .skipped;
     defer c.JS_FreeValue(ctx, handler);
 
-    const event = buildTriggerEvent(state, ctx, key, op, timing, cur_value, prev_value);
-    defer c.JS_FreeValue(ctx, event);
-
+    // Depth bumps BEFORE event build so event.depth reflects this
+    // trigger's own cascade level (PLAN §2.5: handler-initiated
+    // writes are depth 0; the trigger fired by them is depth 1;
+    // its cascade is depth 2; etc.).
     state.trigger_depth += 1;
     defer state.trigger_depth -= 1;
+
+    const event = buildTriggerEvent(state, ctx, key, op, timing, cur_value, prev_value);
+    defer c.JS_FreeValue(ctx, event);
 
     var args = [_]c.JSValue{event};
     const ret = c.JS_Call(ctx, handler, js_undefined, 1, &args);
@@ -658,20 +662,24 @@ fn fireOneTrigger(
     // mutated value for the actual write. Other return types
     // (object, number, undefined, null) leave the value untouched —
     // customer who wants to mutate must `return JSON.stringify(x)`.
+    //
+    // Order matters: copy the bytes off the JS string BEFORE
+    // freeing the JS value. JS_ToCStringLen returns a pointer
+    // into the string's internal buffer; JS_FreeValue would drop
+    // the last reference and invalidate it.
+    defer c.JS_FreeValue(ctx, ret);
     if (op == .put and std.mem.eql(u8, timing, "before") and c.JS_IsString(ret)) {
         var len: usize = 0;
         const cstr = c.JS_ToCStringLen(ctx, &len, ret);
-        defer if (cstr != null) c.JS_FreeCString(ctx, cstr);
-        c.JS_FreeValue(ctx, ret);
-
         if (cstr == null) return .{ .ok = .{ .new_value = null } };
+        defer c.JS_FreeCString(ctx, cstr);
+
         const owned = state.allocator.alloc(u8, len) catch
             return .{ .ok = .{ .new_value = null } };
         if (len > 0) @memcpy(owned, @as([*]const u8, @ptrCast(cstr))[0..len]);
         return .{ .ok = .{ .new_value = owned } };
     }
 
-    c.JS_FreeValue(ctx, ret);
     return .{ .ok = .{ .new_value = null } };
 }
 

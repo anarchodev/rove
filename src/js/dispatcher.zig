@@ -3517,3 +3517,217 @@ test "trigger: BEFORE chain runs outermost-first (broad validates before narrow)
     // BEFORE: outer first, then inner. (AFTER would be inner;outer; — see earlier test.)
     try testing.expectEqualStrings("outer;inner;", trace);
 }
+
+test "trigger: default export is the catchall when no named export matches" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Trigger only exports `default`. Should fire for both put and
+    // delete (and both before+after if they're not separately named).
+    // Test: put + delete + verify default ran twice with the right
+    // event.op + event.timing values.
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("orders/o1", "{}");
+        \\  kv.delete("orders/o1");
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const trigger_bc = try ctx.compileToBytecode(
+        \\export default function (event) {
+        \\  const cur = kv.get("trace") || "";
+        \\  kv.set("trace", cur + event.timing + ":" + event.op + ";");
+        \\}
+    , "_triggers/orders/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/orders/index.mjs", trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{.{
+        .prefix = @constCast("orders/"),
+        .module_path = @constCast("_triggers/orders/index.mjs"),
+    }};
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+
+    const trace = try kv.get("trace");
+    defer testing.allocator.free(trace);
+    // put fires before+after (catchall handles both); then delete
+    // fires before+after. AFTER innermost-first, BEFORE outermost-first
+    // — but only one trigger here, so order is: before:put, after:put,
+    // before:delete, after:delete.
+    try testing.expectEqualStrings("before:put;after:put;before:delete;after:delete;", trace);
+}
+
+test "trigger: BEFORE sees previousValue on update" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Handler puts twice. Trigger captures (previousValue, value) on
+    // each put so we can verify the second one saw the first's bytes
+    // as previousValue.
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("docs/d1", "v1");
+        \\  kv.set("docs/d1", "v2");
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const trigger_bc = try ctx.compileToBytecode(
+        \\export function beforePut(event) {
+        \\  const cur = kv.get("trace") || "";
+        \\  const prev = event.previousValue === null ? "<null>" : event.previousValue;
+        \\  kv.set("trace", cur + prev + "->" + event.value + ";");
+        \\}
+    , "_triggers/docs/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/docs/index.mjs", trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{.{
+        .prefix = @constCast("docs/"),
+        .module_path = @constCast("_triggers/docs/index.mjs"),
+    }};
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+
+    const trace = try kv.get("trace");
+    defer testing.allocator.free(trace);
+    // First put: previousValue is null (no existing key). Second put:
+    // previousValue is "v1" (the just-written first value, visible
+    // via TrackedTxn read-your-writes).
+    try testing.expectEqualStrings("<null>->v1;v1->v2;", trace);
+}
+
+test "trigger: well-bounded cascade (depth 2, no runaway)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Handler writes A; A's afterPut writes B (different prefix,
+    // different trigger); B's afterPut writes C (no matching trigger,
+    // chain ends). Verify event.depth reflects the cascade level.
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("a/x", "a-value");
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const a_trigger_bc = try ctx.compileToBytecode(
+        \\export function afterPut(event) {
+        \\  kv.set("trace_a", "depth=" + event.depth);
+        \\  kv.set("b/y", "b-from-a");
+        \\}
+    , "_triggers/a/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(a_trigger_bc);
+
+    const b_trigger_bc = try ctx.compileToBytecode(
+        \\export function afterPut(event) {
+        \\  kv.set("trace_b", "depth=" + event.depth);
+        \\  kv.set("c/z", "c-from-b");  // no matching trigger, chain ends
+        \\}
+    , "_triggers/b/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(b_trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/a/index.mjs", a_trigger_bc);
+    try bytecodes.put(testing.allocator, "_triggers/b/index.mjs", b_trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{
+        .{ .prefix = @constCast("a/"), .module_path = @constCast("_triggers/a/index.mjs") },
+        .{ .prefix = @constCast("b/"), .module_path = @constCast("_triggers/b/index.mjs") },
+    };
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+
+    // Trigger A fires at depth 1 (handler invocation is depth 0).
+    const trace_a = try kv.get("trace_a");
+    defer testing.allocator.free(trace_a);
+    try testing.expectEqualStrings("depth=1", trace_a);
+
+    // Trigger B fires at depth 2 (cascade from A).
+    const trace_b = try kv.get("trace_b");
+    defer testing.allocator.free(trace_b);
+    try testing.expectEqualStrings("depth=2", trace_b);
+
+    // All three writes landed.
+    const c_value = try kv.get("c/z");
+    defer testing.allocator.free(c_value);
+    try testing.expectEqualStrings("c-from-b", c_value);
+}
