@@ -3192,3 +3192,328 @@ test "trigger: platform-key writes do not fire customer triggers" {
     // Trigger SHOULD NOT have written `seen/_outbox/sys-write`.
     try testing.expectError(error.NotFound, kv.get("seen/_outbox/sys-write"));
 }
+
+test "trigger: beforePut throw is catchable in handler with code='trigger_rejected'" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Handler tries to write a session with no user_id; trigger rejects.
+    // Handler catches and reports the error code.
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  try {
+        \\    kv.set("users/sessions/abc", JSON.stringify({}));
+        \\    return "should not reach";
+        \\  } catch (e) {
+        \\    return "code=" + e.code + " msg=" + e.message;
+        \\  }
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const trigger_bc = try ctx.compileToBytecode(
+        \\export function beforePut(event) {
+        \\  const sess = JSON.parse(event.value);
+        \\  if (!sess.user_id) throw new Error("session missing user_id");
+        \\}
+    , "_triggers/users/sessions/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/users/sessions/index.mjs", trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{.{
+        .prefix = @constCast("users/sessions/"),
+        .module_path = @constCast("_triggers/users/sessions/index.mjs"),
+    }};
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    // code=trigger_rejected, message="<trigger_path>: <original>"
+    try testing.expect(std.mem.indexOf(u8, resp.body, "code=trigger_rejected") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "session missing user_id") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "_triggers/users/sessions/index.mjs") != null);
+
+    // The rejected write should NOT be in kv.
+    try testing.expectError(error.NotFound, kv.get("users/sessions/abc"));
+}
+
+test "trigger: beforePut return-value mutates the written value" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Trigger lowercases the value before storage.
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("users/abc", "ALICE");
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const trigger_bc = try ctx.compileToBytecode(
+        \\export function beforePut(event) {
+        \\  return event.value.toLowerCase();
+        \\}
+    , "_triggers/users/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/users/index.mjs", trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{.{
+        .prefix = @constCast("users/"),
+        .module_path = @constCast("_triggers/users/index.mjs"),
+    }};
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+
+    const stored = try kv.get("users/abc");
+    defer testing.allocator.free(stored);
+    try testing.expectEqualStrings("alice", stored);
+}
+
+test "trigger: beforePut throw rolls back trigger-internal writes (the audit gotcha)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Documents the gotcha: a BEFORE that writes an audit row and then
+    // throws does NOT keep the audit row — it gets rolled back with
+    // the originating write. Customer must use afterPut for "log
+    // every accepted write" and the handler itself for "log every
+    // rejected attempt." See PLAN §2.5 implementation notes.
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  try { kv.set("orders/o1", "{}"); } catch (e) {}
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const trigger_bc = try ctx.compileToBytecode(
+        \\export function beforePut(event) {
+        \\  kv.set("audit/last-attempt", event.key);
+        \\  throw new Error("nope");
+        \\}
+    , "_triggers/orders/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/orders/index.mjs", trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{.{
+        .prefix = @constCast("orders/"),
+        .module_path = @constCast("_triggers/orders/index.mjs"),
+    }};
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    // Both the originating write AND the trigger's audit write are
+    // rolled back by the inner savepoint (audit gotcha).
+    try testing.expectError(error.NotFound, kv.get("orders/o1"));
+    try testing.expectError(error.NotFound, kv.get("audit/last-attempt"));
+}
+
+test "trigger: afterPut throw is catchable AND rolls back the originating write" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Handler sets a key, AFTER throws, handler catches. Per PLAN
+    // §2.5 the originating write must be rolled back even though
+    // the handler caught the exception (inner savepoint covers
+    // BEFORE+write+AFTER).
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  try {
+        \\    kv.set("orders/o1", "{}");
+        \\    return "no throw";
+        \\  } catch (e) {
+        \\    return "caught: code=" + e.code;
+        \\  }
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const trigger_bc = try ctx.compileToBytecode(
+        \\export function afterPut(event) {
+        \\  throw new Error("after rejected");
+        \\}
+    , "_triggers/orders/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(trigger_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/orders/index.mjs", trigger_bc);
+
+    const triggers = [_]globals.TriggerEntry{.{
+        .prefix = @constCast("orders/"),
+        .module_path = @constCast("_triggers/orders/index.mjs"),
+    }};
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+    try testing.expectEqualStrings("caught: code=trigger_rejected", resp.body);
+
+    // Originating write rolled back via inner savepoint.
+    try testing.expectError(error.NotFound, kv.get("orders/o1"));
+}
+
+test "trigger: BEFORE chain runs outermost-first (broad validates before narrow)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Two BEFORE triggers: outer + inner. Each appends to a marker.
+    // BEFORE chain should fire outermost-first (opposite of AFTER).
+    const handler_bc = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("users/sessions/abc", "v");
+        \\  return "ok";
+        \\}
+    , "index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+
+    const inner_bc = try ctx.compileToBytecode(
+        \\export function beforePut(event) {
+        \\  const cur = kv.get("trace") || "";
+        \\  kv.set("trace", cur + "inner;");
+        \\}
+    , "_triggers/users/sessions/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(inner_bc);
+
+    const outer_bc = try ctx.compileToBytecode(
+        \\export function beforePut(event) {
+        \\  const cur = kv.get("trace") || "";
+        \\  kv.set("trace", cur + "outer;");
+        \\}
+    , "_triggers/users/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(outer_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_triggers/users/sessions/index.mjs", inner_bc);
+    try bytecodes.put(testing.allocator, "_triggers/users/index.mjs", outer_bc);
+
+    // Sorted longest-first → reverse iteration is outermost-first
+    // (correct for BEFORE chain).
+    const triggers = [_]globals.TriggerEntry{
+        .{ .prefix = @constCast("users/sessions/"), .module_path = @constCast("_triggers/users/sessions/index.mjs") },
+        .{ .prefix = @constCast("users/"), .module_path = @constCast("_triggers/users/index.mjs") },
+    };
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, &triggers, .{
+        .method = "GET",
+        .path = "/",
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+
+    const trace = try kv.get("trace");
+    defer testing.allocator.free(trace);
+    // BEFORE: outer first, then inner. (AFTER would be inner;outer; — see earlier test.)
+    try testing.expectEqualStrings("outer;inner;", trace);
+}

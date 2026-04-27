@@ -233,43 +233,77 @@ fn jsKvSet(
     const val_str = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
     defer state.allocator.free(val_str);
 
-    // Fetch previous value for the trigger event — only when there
-    // are AFTER triggers matching this key (free check). Skipped
-    // entirely when no trigger fires; read-your-writes via TrackedTxn
-    // sees the txn's own uncommitted writes.
+    // Fast path: no triggers match → write directly, no savepoint, no
+    // previousValue lookup, no chain machinery. Same cost as before
+    // triggers existed.
+    if (!anyTriggerMatches(state, key_str)) {
+        state.txn.put(key_str, val_str) catch |err| {
+            state.pending_kv_error = err;
+            if (state.kv_tape) |t| t.appendKv(.set, key_str, val_str, .err) catch {};
+            return js_undefined;
+        };
+        state.writeset.addPut(key_str, val_str) catch |err| {
+            state.pending_kv_error = err;
+        };
+        if (state.kv_tape) |t| t.appendKv(.set, key_str, val_str, .ok) catch {};
+        return js_undefined;
+    }
+
+    // Slow path: there's at least one matching trigger. Fetch the
+    // previousValue, open an inner savepoint, run BEFORE chain
+    // (with possible value mutation), do the write, run AFTER chain.
+    // Throw anywhere → rollback the savepoint and rethrow as
+    // `Error{ code: "trigger_rejected" }`.
     var prev_owned: ?[]u8 = null;
     defer if (prev_owned) |p| state.allocator.free(p);
-    if (anyTriggerMatches(state, key_str)) {
-        if (state.kv.get(key_str)) |bytes| {
-            prev_owned = bytes;
-        } else |err| switch (err) {
-            error.NotFound => {},
-            else => {
-                state.pending_kv_error = err;
-            },
-        }
+    if (state.kv.get(key_str)) |bytes| {
+        prev_owned = bytes;
+    } else |err| switch (err) {
+        error.NotFound => {},
+        else => {
+            state.pending_kv_error = err;
+            return js_undefined;
+        },
     }
 
-    // Two parallel writes:
-    //   1. Through the TrackedTxn → local SQLite + undo log. Gives
-    //      read-your-writes within this handler and durable local
-    //      state on commit.
-    //   2. Into the WriteSet → encoded and proposed through raft so
-    //      followers apply the same writes via `applyEncodedWriteSet`.
-    state.txn.put(key_str, val_str) catch |err| {
+    state.txn.savepoint() catch |err| {
         state.pending_kv_error = err;
-        if (state.kv_tape) |t| t.appendKv(.set, key_str, val_str, .err) catch {};
         return js_undefined;
     };
-    state.writeset.addPut(key_str, val_str) catch |err| {
+
+    // `cur_value` starts as the original `val_str` (borrowed). If a
+    // BEFORE trigger returns a string, the chain helper allocates a
+    // fresh buffer, points `cur_value` at it, and tracks ownership
+    // via `cur_owned` so we can free it before returning.
+    var cur_owned: ?[]u8 = null;
+    defer if (cur_owned) |o| state.allocator.free(o);
+    var cur_value: ?[]const u8 = val_str;
+    if (runBeforeChain(state, ctx, key_str, .put, &cur_value, &cur_owned, prev_owned)) |trigger_path| {
+        rollbackInnerSavepoint(state);
+        return rethrowAsTriggerRejected(state, ctx, trigger_path);
+    }
+
+    const write_value: []const u8 = cur_value.?;
+
+    state.txn.put(key_str, write_value) catch |err| {
+        state.pending_kv_error = err;
+        rollbackInnerSavepoint(state);
+        if (state.kv_tape) |t| t.appendKv(.set, key_str, write_value, .err) catch {};
+        return js_undefined;
+    };
+    state.writeset.addPut(key_str, write_value) catch |err| {
         state.pending_kv_error = err;
     };
-    if (state.kv_tape) |t| t.appendKv(.set, key_str, val_str, .ok) catch {};
+    if (state.kv_tape) |t| t.appendKv(.set, key_str, write_value, .ok) catch {};
 
-    // AFTER triggers fire after the write commits to the txn.
-    if (fireAfterTriggers(state, ctx, key_str, .put, val_str, prev_owned)) {
-        return js_exception;
+    if (runAfterChain(state, ctx, key_str, .put, write_value, prev_owned)) |trigger_path| {
+        rollbackInnerSavepoint(state);
+        return rethrowAsTriggerRejected(state, ctx, trigger_path);
     }
+
+    state.txn.release() catch |err| {
+        state.pending_kv_error = err;
+    };
     return js_undefined;
 }
 
@@ -285,22 +319,52 @@ fn jsKvDelete(
     const key_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(key_str);
 
-    // See jsKvSet: fetch previousValue only when triggers will fire.
+    // Fast path mirrors jsKvSet — no triggers means no savepoint, no
+    // previousValue lookup, no chain machinery.
+    if (!anyTriggerMatches(state, key_str)) {
+        state.txn.delete(key_str) catch |err| {
+            state.pending_kv_error = err;
+            if (state.kv_tape) |t| t.appendKv(.delete, key_str, "", .err) catch {};
+            return js_undefined;
+        };
+        state.writeset.addDelete(key_str) catch |err| {
+            state.pending_kv_error = err;
+        };
+        if (state.kv_tape) |t| t.appendKv(.delete, key_str, "", .ok) catch {};
+        return js_undefined;
+    }
+
     var prev_owned: ?[]u8 = null;
     defer if (prev_owned) |p| state.allocator.free(p);
-    if (anyTriggerMatches(state, key_str)) {
-        if (state.kv.get(key_str)) |bytes| {
-            prev_owned = bytes;
-        } else |err| switch (err) {
-            error.NotFound => {},
-            else => {
-                state.pending_kv_error = err;
-            },
-        }
+    if (state.kv.get(key_str)) |bytes| {
+        prev_owned = bytes;
+    } else |err| switch (err) {
+        error.NotFound => {},
+        else => {
+            state.pending_kv_error = err;
+            return js_undefined;
+        },
+    }
+
+    state.txn.savepoint() catch |err| {
+        state.pending_kv_error = err;
+        return js_undefined;
+    };
+
+    // BEFORE chain: deletes don't carry a value, so cur_value stays
+    // null (the helper passes that through to event.value as JS null,
+    // and ignores any string return from a beforeDelete handler).
+    var cur_owned: ?[]u8 = null;
+    defer if (cur_owned) |o| state.allocator.free(o);
+    var cur_value: ?[]const u8 = null;
+    if (runBeforeChain(state, ctx, key_str, .delete, &cur_value, &cur_owned, prev_owned)) |trigger_path| {
+        rollbackInnerSavepoint(state);
+        return rethrowAsTriggerRejected(state, ctx, trigger_path);
     }
 
     state.txn.delete(key_str) catch |err| {
         state.pending_kv_error = err;
+        rollbackInnerSavepoint(state);
         if (state.kv_tape) |t| t.appendKv(.delete, key_str, "", .err) catch {};
         return js_undefined;
     };
@@ -309,9 +373,14 @@ fn jsKvDelete(
     };
     if (state.kv_tape) |t| t.appendKv(.delete, key_str, "", .ok) catch {};
 
-    if (fireAfterTriggers(state, ctx, key_str, .delete, null, prev_owned)) {
-        return js_exception;
+    if (runAfterChain(state, ctx, key_str, .delete, null, prev_owned)) |trigger_path| {
+        rollbackInnerSavepoint(state);
+        return rethrowAsTriggerRejected(state, ctx, trigger_path);
     }
+
+    state.txn.release() catch |err| {
+        state.pending_kv_error = err;
+    };
     return js_undefined;
 }
 
@@ -471,67 +540,242 @@ fn anyTriggerMatches(state: *DispatchState, key: []const u8) bool {
     return false;
 }
 
-/// Fire AFTER triggers for a kv write. Tree-traversal order:
-/// triggers sorted longest-prefix-first → forward iteration is
-/// innermost-first (correct for AFTER chain per PLAN §2.5).
+/// Take whatever exception is on the qjs context, format it as
+/// `<trigger_path>: <original message>`, and rethrow as a fresh
+/// Error with `code: "trigger_rejected"` (PLAN §2.5). Always
+/// returns `js_exception` for caller's convenience. Caller MUST
+/// have already rolled back the inner savepoint before calling
+/// this — this only handles the JS-side throw.
+fn rethrowAsTriggerRejected(
+    state: *DispatchState,
+    ctx: ?*c.JSContext,
+    trigger_path: []const u8,
+) c.JSValue {
+    // Pull the original message off the context. Some trigger
+    // failures (e.g. depth-cap throw, internal errors during
+    // module load) never leave a real exception on the context —
+    // in that case ctx.takeExceptionMessage returns "" and we
+    // fall back to a synthetic message.
+    const ctx_wrap = qjs.Context{ .raw = ctx.? };
+    const original = ctx_wrap.takeExceptionMessage(state.allocator) catch
+        return c.JS_ThrowOutOfMemory(ctx);
+    defer state.allocator.free(original);
+
+    const fallback = "trigger rejected the write";
+    const original_or_fallback = if (original.len > 0) original else fallback;
+
+    const msg = std.fmt.allocPrintSentinel(
+        state.allocator,
+        "{s}: {s}",
+        .{ trigger_path, original_or_fallback },
+        0,
+    ) catch return c.JS_ThrowOutOfMemory(ctx);
+    defer state.allocator.free(msg);
+
+    const err = c.JS_NewError(ctx);
+    if (c.JS_IsException(err)) return err;
+
+    _ = c.JS_SetPropertyStr(
+        ctx,
+        err,
+        "message",
+        c.JS_NewStringLen(ctx, msg.ptr, msg.len),
+    );
+    _ = c.JS_SetPropertyStr(
+        ctx,
+        err,
+        "code",
+        c.JS_NewStringLen(ctx, "trigger_rejected", "trigger_rejected".len),
+    );
+
+    return c.JS_Throw(ctx, err);
+}
+
+/// Outcome of running one trigger function. Captures both the
+/// success path (with optional value mutation for BEFORE) and the
+/// failure path (exception left on the qjs context). The caller
+/// is responsible for savepoint rollback + rethrow on failure.
+const FireOutcome = union(enum) {
+    /// No-op (module didn't export a matching handler, or load failed).
+    skipped: void,
+    /// Trigger ran. `new_value` is non-null only when this was a
+    /// BEFORE put and the trigger returned a string — that string
+    /// is the customer's mutated value, owned by the state allocator;
+    /// caller frees.
+    ok: struct { new_value: ?[]u8 },
+    /// Trigger threw. The exception is sitting on the qjs context;
+    /// caller must `rethrowAsTriggerRejected` (after rolling back
+    /// the inner savepoint).
+    rejected: void,
+};
+
+/// Run a single trigger's handler for one op×timing combination.
+/// Pure execution — no savepoint management, no chain iteration;
+/// the caller (`runBeforeChain` / `runAfterChain`) wraps that.
+fn fireOneTrigger(
+    state: *DispatchState,
+    ctx: ?*c.JSContext,
+    entry: TriggerEntry,
+    key: []const u8,
+    op: TriggerOp,
+    timing: []const u8,
+    cur_value: ?[]const u8,
+    prev_value: ?[]const u8,
+) FireOutcome {
+    if (state.trigger_depth >= MAX_TRIGGER_DEPTH) {
+        const msg = std.fmt.allocPrintSentinel(
+            state.allocator,
+            "trigger cascade depth exceeded ({d}) at {s}",
+            .{ MAX_TRIGGER_DEPTH, entry.module_path },
+            0,
+        ) catch return .rejected;
+        defer state.allocator.free(msg);
+        _ = c.JS_ThrowInternalError(ctx, msg.ptr);
+        return .rejected;
+    }
+
+    const ns = loadTriggerModuleNs(state, ctx, entry.module_path) orelse {
+        std.log.warn("rove-js: trigger module {s} failed to load — skipping", .{entry.module_path});
+        return .skipped;
+    };
+    defer c.JS_FreeValue(ctx, ns);
+
+    const handler = lookupTriggerHandler(ctx, ns, op, timing);
+    if (c.JS_IsUndefined(handler)) return .skipped;
+    defer c.JS_FreeValue(ctx, handler);
+
+    const event = buildTriggerEvent(state, ctx, key, op, timing, cur_value, prev_value);
+    defer c.JS_FreeValue(ctx, event);
+
+    state.trigger_depth += 1;
+    defer state.trigger_depth -= 1;
+
+    var args = [_]c.JSValue{event};
+    const ret = c.JS_Call(ctx, handler, js_undefined, 1, &args);
+    if (c.JS_IsException(ret)) return .rejected;
+
+    // BEFORE-put trigger return value (if a string) becomes the
+    // mutated value for the actual write. Other return types
+    // (object, number, undefined, null) leave the value untouched —
+    // customer who wants to mutate must `return JSON.stringify(x)`.
+    if (op == .put and std.mem.eql(u8, timing, "before") and c.JS_IsString(ret)) {
+        var len: usize = 0;
+        const cstr = c.JS_ToCStringLen(ctx, &len, ret);
+        defer if (cstr != null) c.JS_FreeCString(ctx, cstr);
+        c.JS_FreeValue(ctx, ret);
+
+        if (cstr == null) return .{ .ok = .{ .new_value = null } };
+        const owned = state.allocator.alloc(u8, len) catch
+            return .{ .ok = .{ .new_value = null } };
+        if (len > 0) @memcpy(owned, @as([*]const u8, @ptrCast(cstr))[0..len]);
+        return .{ .ok = .{ .new_value = owned } };
+    }
+
+    c.JS_FreeValue(ctx, ret);
+    return .{ .ok = .{ .new_value = null } };
+}
+
+/// Run the BEFORE chain for a write. Tree-traversal order is
+/// outermost-first (per PLAN §2.5 "broad policies validate before
+/// narrow ones") — registry is sorted longest-first, so we iterate
+/// in reverse. Each trigger may mutate the value via its return.
 ///
-/// Returns `true` if a trigger threw a JS exception (caller should
-/// propagate by returning `js_exception` and leaving the exception
-/// on the context). Returns `false` on success or no-op cases.
-fn fireAfterTriggers(
+/// `cur_value` tracks the current value being written — starts at
+/// the original (borrowed) buffer the customer passed; if any
+/// BEFORE returns a string, the helper allocates a fresh buffer
+/// and updates both `cur_value` and `cur_owned`. The caller frees
+/// `cur_owned.*` if non-null.
+///
+/// Returns `null` on success; returns the rejecting trigger's
+/// path on failure (caller rolls back + rethrows).
+fn runBeforeChain(
     state: *DispatchState,
     ctx: ?*c.JSContext,
     key: []const u8,
     op: TriggerOp,
-    new_value: ?[]const u8,
+    cur_value: *?[]const u8,
+    cur_owned: *?[]u8,
     prev_value: ?[]const u8,
-) bool {
-    const triggers = state.triggers orelse return false;
-    if (triggers.len == 0) return false;
-    if (isPlatformKey(key)) return false;
+) ?[]const u8 {
+    const triggers = state.triggers orelse return null;
+
+    var i: usize = triggers.len;
+    while (i > 0) {
+        i -= 1;
+        const entry = triggers[i];
+        if (!std.mem.startsWith(u8, key, entry.prefix)) continue;
+
+        const outcome = fireOneTrigger(
+            state,
+            ctx,
+            entry,
+            key,
+            op,
+            "before",
+            cur_value.*,
+            prev_value,
+        );
+        switch (outcome) {
+            .skipped => {},
+            .rejected => return entry.module_path,
+            .ok => |o| if (o.new_value) |new| {
+                if (cur_owned.*) |old| state.allocator.free(old);
+                cur_owned.* = new;
+                cur_value.* = new;
+            },
+        }
+    }
+    return null;
+}
+
+/// Run the AFTER chain for a write. Tree-traversal order is
+/// innermost-first (registry already sorted longest-first → forward
+/// iteration). AFTER triggers' return values are ignored; throws
+/// roll back the originating write via the inner savepoint.
+fn runAfterChain(
+    state: *DispatchState,
+    ctx: ?*c.JSContext,
+    key: []const u8,
+    op: TriggerOp,
+    cur_value: ?[]const u8,
+    prev_value: ?[]const u8,
+) ?[]const u8 {
+    const triggers = state.triggers orelse return null;
 
     for (triggers) |entry| {
         if (!std.mem.startsWith(u8, key, entry.prefix)) continue;
 
-        if (state.trigger_depth >= MAX_TRIGGER_DEPTH) {
-            const msg = std.fmt.allocPrintSentinel(
-                state.allocator,
-                "trigger cascade depth exceeded ({d}) at {s}",
-                .{ MAX_TRIGGER_DEPTH, entry.module_path },
-                0,
-            ) catch return true;
-            defer state.allocator.free(msg);
-            _ = c.JS_ThrowInternalError(ctx, msg.ptr);
-            return true;
+        const outcome = fireOneTrigger(
+            state,
+            ctx,
+            entry,
+            key,
+            op,
+            "after",
+            cur_value,
+            prev_value,
+        );
+        switch (outcome) {
+            .skipped => {},
+            .rejected => return entry.module_path,
+            .ok => {}, // AFTER return value is ignored
         }
-
-        const ns = loadTriggerModuleNs(state, ctx, entry.module_path) orelse {
-            std.log.warn("rove-js: trigger module {s} failed to load — skipping", .{entry.module_path});
-            continue;
-        };
-        defer c.JS_FreeValue(ctx, ns);
-
-        const handler = lookupTriggerHandler(ctx, ns, op, "after");
-        if (c.JS_IsUndefined(handler)) continue; // module exports nothing for this op×timing
-        defer c.JS_FreeValue(ctx, handler);
-
-        const event = buildTriggerEvent(state, ctx, key, op, "after", new_value, prev_value);
-        defer c.JS_FreeValue(ctx, event);
-
-        state.trigger_depth += 1;
-        defer state.trigger_depth -= 1;
-
-        var args = [_]c.JSValue{event};
-        const ret = c.JS_Call(ctx, handler, js_undefined, 1, &args);
-        if (c.JS_IsException(ret)) {
-            // Leave the exception on the context for the caller to
-            // propagate via js_exception.
-            return true;
-        }
-        c.JS_FreeValue(ctx, ret); // AFTER return value is ignored
     }
+    return null;
+}
 
-    return false;
+/// Roll back the inner savepoint and release it. Always called on
+/// the trigger-rejection path. Logs but doesn't throw on rollback
+/// failure (per fail-fast: surface but don't compound).
+fn rollbackInnerSavepoint(state: *DispatchState) void {
+    state.txn.rollbackTo() catch |re| std.log.err(
+        "rove-js: trigger inner-savepoint rollback failed: {s} (kv state may be inconsistent)",
+        .{@errorName(re)},
+    );
+    state.txn.release() catch |re| std.log.err(
+        "rove-js: trigger inner-savepoint release after rollback failed: {s}",
+        .{@errorName(re)},
+    );
 }
 
 /// `kv.prefix(prefix, cursor?, limit?)` → `[ { key, value }, ... ]`
