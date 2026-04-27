@@ -1956,6 +1956,25 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             if (resp.exception.len > 0) allocator.free(resp.exception);
         }
 
+        // JS exception → 500 with the message in the body. The
+        // dispatcher captured the throw into resp.exception while
+        // leaving status at the default 200 and body empty, so without
+        // this check we'd ship a 200 empty body.
+        if (resp.exception.len > 0) {
+            txn.?.rollbackTo() catch {};
+            const console_owned = resp.console;
+            const exception_owned = resp.exception;
+            resp.console = &.{};
+            resp.exception = &.{};
+            const ex_body = std.fmt.allocPrint(allocator, "handler threw: {s}\n", .{exception_owned}) catch &.{};
+            defer if (ex_body.len > 0) allocator.free(ex_body);
+            const ex_body_slice: []const u8 = if (ex_body.len > 0) ex_body else "handler threw\n";
+            try setSimpleResponse(server, ent, sid, sess, 500, ex_body_slice, allocator);
+            captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .handler_error, console_owned, exception_owned, .{});
+            processed += 1;
+            continue;
+        }
+
         if (worker.dispatcher.last_kv_error != null) {
             std.log.warn("rove-js handler kv error: {s}", .{@errorName(worker.dispatcher.last_kv_error.?)});
             worker.dispatcher.last_kv_error = null;

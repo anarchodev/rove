@@ -163,6 +163,25 @@ code=$("${CURL[@]}" -o /tmp/ss-alice-api.txt -w '%{http_code}' "${ALICE_ORIGIN}/
 grep -q 'Your Loop46 API is live' /tmp/ss-alice-api.txt || fail "starter handler body missing expected text"
 ok "starter content: GET ${ALICE_ORIGIN}/api?fn=default → 200 with expected JSON"
 
+# ── 9b. Throwing handler → 500 with the exception in the body ─────────
+# Customer day-one footgun: until this fix, any uncaught throw came back
+# as a 200 with an empty body. Now the worker translates it to a 500
+# with `handler threw: <message>` so the customer sees what blew up.
+THROW_SRC='export default function () { throw new Error("boom from smoke"); }'
+code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+    -X PUT \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/javascript" \
+    --data-binary "$THROW_SRC" \
+    "${ADMIN_ORIGIN}/_system/files/alice/file/throw/index.mjs")
+[[ "$code" == "201" ]] || fail "deploy throw.mjs: got $code"
+sleep 0.3
+code=$("${CURL[@]}" -o /tmp/ss-alice-throw.txt -w '%{http_code}' "${ALICE_ORIGIN}/throw?fn=default")
+[[ "$code" == "500" ]] || fail "throw handler: expected 500, got $code (body: $(cat /tmp/ss-alice-throw.txt))"
+grep -q 'handler threw' /tmp/ss-alice-throw.txt || fail "throw body missing 'handler threw' prefix: $(cat /tmp/ss-alice-throw.txt)"
+grep -q 'boom from smoke' /tmp/ss-alice-throw.txt || fail "throw body missing exception message: $(cat /tmp/ss-alice-throw.txt)"
+ok "throwing handler → 500 with exception message in body"
+
 # ── 10. With ROVE_RESEND_KEY configured: signup queues an outbox email
 #        and drops magic_link from the response body. ───────────────────
 #
