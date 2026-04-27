@@ -243,15 +243,16 @@ fn handleList(
     query: []const u8,
 ) !void {
     const limit = parseLimit(query, 100);
+    const after = parseAfter(query);
 
-    var result = log_server.listRecords(allocator, data_dir, instance_id, limit) catch |err| {
+    var result = log_server.listRecords(allocator, data_dir, instance_id, limit, after) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "list failed: {s}\n", .{@errorName(err)});
         try setResponse(server, ent, sid, sess, 500, msg.ptr, msg);
         return;
     };
     defer result.deinit();
 
-    const json = try renderListJson(allocator, result.records);
+    const json = try renderListJson(allocator, result.records, result.next_cursor);
     try setResponse(server, ent, sid, sess, 200, json.ptr, json);
 }
 
@@ -342,6 +343,20 @@ fn parseLimit(query: []const u8, default: u32) u32 {
     return default;
 }
 
+/// Parse `?after=<request_id_hex>` cursor. Hex matches the format
+/// the LogStore uses internally for `req/{x:0>16}` keys, and the
+/// format `request_id` is rendered as in renderRecordJson. Missing
+/// or malformed → 0 (start at newest).
+fn parseAfter(query: []const u8) u64 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (std.mem.startsWith(u8, pair, "after=")) {
+            return std.fmt.parseInt(u64, pair["after=".len..], 16) catch 0;
+        }
+    }
+    return 0;
+}
+
 fn outcomeName(o: log_mod.Outcome) []const u8 {
     return switch (o) {
         .ok => "ok",
@@ -413,6 +428,7 @@ fn writeRecordJson(
 fn renderListJson(
     allocator: std.mem.Allocator,
     records: []log_mod.LogRecord,
+    next_cursor: u64,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -421,7 +437,11 @@ fn renderListJson(
         if (i > 0) try buf.append(allocator, ',');
         try writeRecordJson(&buf, allocator, r);
     }
-    try buf.appendSlice(allocator, "]}\n");
+    if (next_cursor == 0) {
+        try buf.appendSlice(allocator, "],\"next_cursor\":null}\n");
+    } else {
+        try buf.writer(allocator).print("],\"next_cursor\":\"{x:0>16}\"}}\n", .{next_cursor});
+    }
     return buf.toOwnedSlice(allocator);
 }
 

@@ -113,6 +113,10 @@ pub const LogRecord = struct {
 
 pub const ListResult = struct {
     records: []LogRecord,
+    /// `request_id` of the last record returned. Pass back as
+    /// `ListOpts.after` for the next page. 0 when `records.len == 0`
+    /// (no more pages, or empty initial query).
+    next_cursor: u64 = 0,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ListResult) void {
@@ -125,6 +129,10 @@ pub const ListResult = struct {
 pub const ListOpts = struct {
     /// Max records to return. Newest first.
     limit: u32 = 100,
+    /// Pagination cursor: `request_id` of the last record from the
+    /// previous page. Records strictly older than `after` are
+    /// returned. 0 (the default) starts at the newest record.
+    after: u64 = 0,
 };
 
 const RECORD_VERSION: u32 = 1;
@@ -324,9 +332,23 @@ pub const LogStore = struct {
 
     /// List recent records (newest first). Because the primary key is
     /// inverted (`req/{~id}`), ascending iteration returns newest
-    /// first — no secondary index needed. Caller must deinit.
+    /// first — no secondary index needed. `opts.after` (a `request_id`)
+    /// paginates: records strictly older than `after` are returned.
+    /// Caller must deinit. The returned `next_cursor` is the
+    /// `request_id` of the last record (0 if the page is empty),
+    /// suitable for passing as `after` on the next call.
     pub fn list(self: *LogStore, opts: ListOpts) Error!ListResult {
-        var scan = self.kv.prefix("req/", "", opts.limit) catch
+        // Build the kv-layer cursor. `kv.prefix` returns keys
+        // strictly greater than the cursor; since we store
+        // `req/{~request_id}`, "strictly newer than `after` in
+        // request_id space" maps to "strictly greater than
+        // `req/{~after}` in key space" — newer ids have smaller
+        // inverted keys, so the next page starts past `after`'s
+        // inverted key.
+        var key_buf: [4 + 16]u8 = undefined;
+        const cursor: []const u8 = if (opts.after == 0) "" else reqKey(&key_buf, opts.after);
+
+        var scan = self.kv.prefix("req/", cursor, opts.limit) catch
             return Error.Kv;
         defer scan.deinit();
 
@@ -342,7 +364,8 @@ pub const LogStore = struct {
         }
 
         const slice = out.toOwnedSlice(self.allocator) catch return Error.OutOfMemory;
-        return .{ .records = slice, .allocator = self.allocator };
+        const next: u64 = if (slice.len == 0) 0 else slice[slice.len - 1].request_id;
+        return .{ .records = slice, .next_cursor = next, .allocator = self.allocator };
     }
 
     // ── Internals ─────────────────────────────────────────────────────

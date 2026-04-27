@@ -775,8 +775,9 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 - Pages: login, dashboard home, instance detail with Logs + KV + Code tabs — **done**
 - Cookie-based auth, `X-Rove-Scope` header for cross-tenant admin access — **done**
 - Two-phase deploy client helpers (`api.bulkDeploy`) — **done**
-- Logs tab: newest-first table (time / **deploy** / method / path / status / duration / outcome), click-row drawer with full record incl. console + exception, refresh button, count — **done** (deploy column added 2026-04-27 to surface §2.9's "all 12 failures were on deployment 42" debugging)
-- NOT yet: Logs auto-refresh / live tail, Logs filtering (by status / outcome / deployment / path), Logs pagination past `limit=100` (core only supports `limit`, no cursor), nested-thread display under `parent_request_id` (waits on Phase 6 trigger / callback log emits), Deploys tab with history + diff, CodeMirror 6 upgrade, draft workflow, signup form on the login page, tape replay click-through (waits on Phase 4 tape capture)
+- Logs tab: newest-first table (time / **deploy** / method / path / status / duration / outcome), click-row drawer with full record incl. console + exception, refresh button, count, **Load older button with cursor pagination** — **done**
+- Log pagination: `LogStore.list` accepts `after: u64` (a `request_id`); `ListResult` returns `next_cursor: u64`. Wire endpoint `/_system/log/{id}/list?limit=N&after=<hex>` returns `{records: [...], next_cursor: "<hex>" | null}`. Admin UI tracks the cursor and appends pages on Load older — **done 2026-04-27**
+- NOT yet: Logs auto-refresh / live tail, Logs filtering (by status / outcome / deployment / path), nested-thread display under `parent_request_id` (waits on Phase 6 trigger / callback log emits), Deploys tab with history + diff, CodeMirror 6 upgrade, draft workflow, signup form on the login page, tape replay click-through (waits on Phase 4 tape capture)
 
 ### Phases 6–10 — **not started**
 

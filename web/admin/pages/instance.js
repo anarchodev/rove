@@ -117,6 +117,9 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
         <tbody></tbody>
       </table>
     </div>
+    <div class="load-more-wrap" hidden>
+      <button type="button" class="load-more">Load older</button>
+    </div>
     <aside class="drawer" hidden>
       <div class="drawer-header">
         <h3></h3>
@@ -130,27 +133,42 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
   const tbody = el.querySelector("tbody");
   const refreshBtn = el.querySelector(".refresh");
   const countLabel = el.querySelector(".count");
+  const loadMoreWrap = el.querySelector(".load-more-wrap");
+  const loadMoreBtn = el.querySelector(".load-more");
   const drawer = el.querySelector(".drawer");
   const drawerTitle = drawer.querySelector("h3");
   const drawerBody = drawer.querySelector(".drawer-body");
   const drawerClose = drawer.querySelector(".drawer-close");
 
+  const PAGE_SIZE = 50;
   let rendering = false;
+  let cursor = null; // null = no more pages, set to next_cursor after a page
+  let totalLoaded = 0;
   const recordsById = new Map();
 
-  async function load() {
+  async function load({ append } = { append: false }) {
     if (rendering) return;
     rendering = true;
     refreshBtn.disabled = true;
+    loadMoreBtn.disabled = true;
     clearError();
     try {
-      const res = await api.listLogs(instanceId, { limit: 100 });
+      const res = await api.listLogs(instanceId, {
+        limit: PAGE_SIZE,
+        after: append ? cursor : null,
+      });
       const records = res.records ?? [];
-      recordsById.clear();
+      cursor = res.next_cursor || null;
+
+      if (!append) {
+        recordsById.clear();
+        tbody.replaceChildren();
+        totalLoaded = 0;
+      }
+
       for (const r of records) recordsById.set(r.request_id, r);
 
-      tbody.replaceChildren();
-      if (records.length === 0) {
+      if (!append && records.length === 0) {
         const tr = document.createElement("tr");
         tr.className = "empty";
         tr.innerHTML = `<td colspan="7"><em>no requests logged yet</em></td>`;
@@ -158,7 +176,12 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
       } else {
         for (const r of records) tbody.appendChild(buildRow(r));
       }
-      countLabel.textContent = `${records.length} record${records.length === 1 ? "" : "s"}`;
+
+      totalLoaded += records.length;
+      const more = cursor !== null && records.length > 0;
+      countLabel.textContent =
+        `${totalLoaded} record${totalLoaded === 1 ? "" : "s"}${more ? " (more available)" : ""}`;
+      loadMoreWrap.hidden = !more;
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         location.hash = "#/login";
@@ -167,6 +190,7 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
       showError(`Load logs failed: ${err.message}`);
     } finally {
       refreshBtn.disabled = false;
+      loadMoreBtn.disabled = false;
       rendering = false;
     }
   }
@@ -213,10 +237,11 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
     drawerBody.replaceChildren();
   }
 
-  refreshBtn.addEventListener("click", load);
+  refreshBtn.addEventListener("click", () => load({ append: false }));
+  loadMoreBtn.addEventListener("click", () => load({ append: true }));
   drawerClose.addEventListener("click", closeDrawer);
 
-  load();
+  load({ append: false });
   return () => {};
 }
 

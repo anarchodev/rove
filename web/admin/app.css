@@ -333,6 +333,15 @@ label {
 }
 .log-table .duration { text-align: right; color: var(--muted); }
 
+.logs-panel .load-more-wrap {
+  padding: 12px;
+  text-align: center;
+}
+.logs-panel .load-more {
+  padding: 6px 14px;
+  font-size: 13px;
+}
+
 .log-table .status-2xx { color: #1a8f3c; font-weight: 600; }
 .log-table .status-3xx { color: #a86a0c; font-weight: 600; }
 .log-table .status-4xx { color: #b8860b; font-weight: 600; }

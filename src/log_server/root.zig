@@ -129,17 +129,21 @@ const InstanceCtx = struct {
 };
 
 /// List recent log records for `instance`, newest first. Returns an
-/// owned `ListResult` the caller must `deinit`.
+/// owned `ListResult` the caller must `deinit`. `after` is a
+/// pagination cursor (the `request_id` of the last record from the
+/// previous page); 0 starts from the newest record. The result's
+/// `next_cursor` field is the cursor to pass on the next call.
 pub fn listRecords(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
     instance_id: []const u8,
     limit: u32,
+    after: u64,
 ) Error!log_mod.ListResult {
     var h: InstanceCtx = undefined;
     try h.initReadOnly(allocator, data_dir, instance_id);
     defer h.deinit();
-    return h.store.list(.{ .limit = limit }) catch |err| mapLogError(err);
+    return h.store.list(.{ .limit = limit, .after = after }) catch |err| mapLogError(err);
 }
 
 /// Fetch a single log record by request id. Returns `null` if the
@@ -284,12 +288,51 @@ test "listRecords returns records newest-first" {
 
     try seedLogStore(allocator, data_dir, "acme", 3);
 
-    var result = try listRecords(allocator, data_dir, "acme", 10);
+    var result = try listRecords(allocator, data_dir, "acme", 10, 0);
     defer result.deinit();
     try testing.expectEqual(@as(usize, 3), result.records.len);
     // newest-first — request ids descend.
     try testing.expect(result.records[0].request_id > result.records[1].request_id);
     try testing.expect(result.records[1].request_id > result.records[2].request_id);
+    // next_cursor = the last (oldest) record's id when records.len > 0.
+    try testing.expectEqual(result.records[2].request_id, result.next_cursor);
+}
+
+test "listRecords paginates via after cursor" {
+    const allocator = testing.allocator;
+    const data_dir = try makeTempDir(allocator);
+    defer {
+        std.fs.cwd().deleteTree(data_dir) catch {};
+        allocator.free(data_dir);
+    }
+
+    try seedLogStore(allocator, data_dir, "acme", 5);
+
+    // Page 1: newest 2 records.
+    var p1 = try listRecords(allocator, data_dir, "acme", 2, 0);
+    defer p1.deinit();
+    try testing.expectEqual(@as(usize, 2), p1.records.len);
+    try testing.expect(p1.next_cursor != 0);
+    const cursor_after_page_1 = p1.next_cursor;
+
+    // Page 2: next 2 strictly older.
+    var p2 = try listRecords(allocator, data_dir, "acme", 2, cursor_after_page_1);
+    defer p2.deinit();
+    try testing.expectEqual(@as(usize, 2), p2.records.len);
+    try testing.expect(p2.records[0].request_id < cursor_after_page_1);
+    try testing.expect(p2.next_cursor != 0);
+
+    // Page 3: only 1 record left, next_cursor still set (client retries to confirm).
+    var p3 = try listRecords(allocator, data_dir, "acme", 2, p2.next_cursor);
+    defer p3.deinit();
+    try testing.expectEqual(@as(usize, 1), p3.records.len);
+    try testing.expect(p3.next_cursor != 0);
+
+    // Page 4: empty → next_cursor = 0 signals end.
+    var p4 = try listRecords(allocator, data_dir, "acme", 2, p3.next_cursor);
+    defer p4.deinit();
+    try testing.expectEqual(@as(usize, 0), p4.records.len);
+    try testing.expectEqual(@as(u64, 0), p4.next_cursor);
 }
 
 test "getRecord round-trips a known record" {
@@ -303,7 +346,7 @@ test "getRecord round-trips a known record" {
     try seedLogStore(allocator, data_dir, "acme", 2);
 
     // Find a valid id via list.
-    var result = try listRecords(allocator, data_dir, "acme", 10);
+    var result = try listRecords(allocator, data_dir, "acme", 10, 0);
     const target_id = result.records[0].request_id;
     result.deinit();
 
@@ -344,10 +387,10 @@ test "invalid instance id rejected" {
     const allocator = testing.allocator;
     try testing.expectError(
         Error.InvalidInstanceId,
-        listRecords(allocator, "/tmp/rove-ls-inv", "", 10),
+        listRecords(allocator, "/tmp/rove-ls-inv", "", 10, 0),
     );
     try testing.expectError(
         Error.InvalidInstanceId,
-        listRecords(allocator, "/tmp/rove-ls-inv", "../evil", 10),
+        listRecords(allocator, "/tmp/rove-ls-inv", "../evil", 10, 0),
     );
 }

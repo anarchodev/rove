@@ -327,8 +327,10 @@ export const api = {
   },
 
   // ── Out-of-band: logs (native Zig proxy) ────────────────────────
-  async listLogs(instance_id, { limit = 100 } = {}) {
-    const qs = new URLSearchParams({ limit: String(limit) }).toString();
+  async listLogs(instance_id, { limit = 100, after = null } = {}) {
+    const params = { limit: String(limit) };
+    if (after) params.after = after;
+    const qs = new URLSearchParams(params).toString();
     const res = await rawGet(adminBase(),
       `/_system/log/${encodeURIComponent(instance_id)}/list?${qs}`);
     return res.json();

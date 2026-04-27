@@ -281,5 +281,27 @@ code=$("${CURL_BASE[@]}" -o /dev/null -w '%{http_code}' "${AUTH_HDR[@]}" \
 [[ "$code" == "404" ]] || fail "unknown log id (got $code)"
 ok "log show with unknown id → 404"
 
+# ── 27. Log list pagination via after= cursor ─────────────────────
+# Page 1: limit=2 → 2 records + non-null next_cursor.
+page1=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" \
+    "${API_URL_BASE}/_system/log/acme/list?limit=2")
+p1_count=$(printf '%s' "$page1" | grep -oE '"request_id":' | wc -l | tr -d ' ')
+[[ "$p1_count" == "2" ]] || fail "log list page1 expected 2, got $p1_count: $page1"
+printf '%s' "$page1" | grep -q '"next_cursor":"' \
+    || fail "log list page1 missing next_cursor: $page1"
+cursor=$(printf '%s' "$page1" | sed -E 's/.*"next_cursor":"([0-9a-f]+)".*/\1/')
+[[ ${#cursor} -eq 16 ]] || fail "log list page1 cursor not 16-hex: '$cursor'"
+ok "log list page1 returns next_cursor"
+
+# Page 2: pass cursor → next batch, none of which appear in page 1.
+page2=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" \
+    "${API_URL_BASE}/_system/log/acme/list?limit=2&after=${cursor}")
+p2_count=$(grep -oE '"request_id":' <<<"$page2" | wc -l | tr -d ' ')
+[[ "$p2_count" -ge 1 ]] || fail "log list page2 expected >=1, got $p2_count: $page2"
+# Cursor row itself must NOT appear on page 2 (strictly older).
+printf '%s' "$page2" | grep -q "\"request_id\":\"$cursor\"" \
+    && fail "log list page2 echoed cursor row: $page2"
+ok "log list page2 advances strictly past cursor"
+
 echo ""
 echo "all admin smoke tests passed"
