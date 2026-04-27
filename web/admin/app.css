@@ -325,6 +325,12 @@ label {
 }
 .log-table .method { font-weight: 600; }
 .log-table .time { color: var(--muted); }
+.log-table .deploy {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
 .log-table .duration { text-align: right; color: var(--muted); }
 
 .log-table .status-2xx { color: #1a8f3c; font-weight: 600; }

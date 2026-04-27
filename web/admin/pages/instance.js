@@ -106,6 +106,7 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
         <thead>
           <tr>
             <th>Time</th>
+            <th>Deploy</th>
             <th>Method</th>
             <th>Path</th>
             <th>Status</th>
@@ -152,7 +153,7 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
       if (records.length === 0) {
         const tr = document.createElement("tr");
         tr.className = "empty";
-        tr.innerHTML = `<td colspan="6"><em>no requests logged yet</em></td>`;
+        tr.innerHTML = `<td colspan="7"><em>no requests logged yet</em></td>`;
         tbody.appendChild(tr);
       } else {
         for (const r of records) tbody.appendChild(buildRow(r));
@@ -177,6 +178,7 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
     tr.tabIndex = 0;
     tr.innerHTML = `
       <td class="time" title="${escapeHtml(absTime(r.received_ns))}">${escapeHtml(relTime(r.received_ns))}</td>
+      <td class="deploy" title="deployment ${r.deployment_id}">#${r.deployment_id}</td>
       <td class="method">${escapeHtml(r.method)}</td>
       <td class="path">${escapeHtml(r.path)}</td>
       <td class="status status-${statusClass(r.status)}">${r.status}</td>
