@@ -881,7 +881,17 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 - 15 inline dispatcher tests cover registry derivation, BEFORE+AFTER chains, op×timing dispatch + default catchall, tree-traversal order, cascade depth (well-bounded + runaway), platform-prefix block, return-value mutation, audit-gotcha rollback, previousValue exposure, trigger_rejected error shape.
 - `scripts/triggers_smoke.sh` end-to-end against a live worker: signup → deploy trigger module + handler → exercise via curl → verify reverse-index built, BEFORE mutation lowercased the value, rejection caught with the right code, afterDelete cleaned up.
 
-### Phases 7–10 — **not started**
+### Phase 8 — Rate limiter — **done 2026-04-27 (v1 narrow scope)**
+- `src/js/limiter.zig`: `TokenBucket` (capacity + refill_per_sec; `tryTake`, `secondsUntil`), `RateLimitCaps` (request + email pairs), `RateLimiter` (per-instance × per-action map, lazy bucket creation, `check`, `retryAfterSeconds`). 11 inline tests cover bucket math + per-instance/per-action isolation + Retry-After hint.
+- `request` action: checked at request dispatch in `worker.zig:dispatchOnce` (before `tryServeStatic` so static file requests count too — they consume worker resources). Admin requests bypass entirely. On exhaustion: 429 with `Retry-After: <seconds>` header via `setRateLimitedResponse`.
+- `email` action: checked at the entry of the `email.send` JS wrapper via the `__rove_check_email_rate` hidden builtin. On exhaustion: throws `Error{code:"rate_limited", message:"email rate limit exceeded, retry after Ns"}`. Customer can `try { email.send(...) } catch (e)` and react.
+- Per-worker, in-memory only — no cross-worker sync in v1. Multi-worker configs effectively give each instance Nx the configured limit; acceptable overshoot at launch scale.
+- Single tier in v1 — `WorkerConfig.rate_limit_caps` is operator-tunable via `--rate-limit-{request,email}-{capacity,refill}` CLI flags. Phase 10 will branch on instance plan tier.
+- `scripts/rate_limit_smoke.sh` end-to-end: hammer a tenant past `request_capacity` and verify 429 + Retry-After + body explanation; verify per-instance independence (a second tenant stays at full capacity); verify admin requests bypass; deploy a handler that calls `email.send` in a try/catch and verify the 3rd call surfaces `e.code === "rate_limited"`.
+- Deferred from PLAN §2.10's full action list: `deploy` (low volume), `webhook_attempt` (already paced via outbox depth + per-destination cap + exponential backoff), `kv_write` (hot path, real per-call cost). Add when concrete demand arises.
+- Deferred: per-plan branching, root.db sync for cross-worker coordination, dashboard view of bucket state.
+
+### Phases 7, 9, 10 — **not started**
 
 ### Blob replication (multi-node prerequisite)
 - Raft envelopes now include `type=3` files_writeset replicating `{id}/files.db` across nodes — **done**

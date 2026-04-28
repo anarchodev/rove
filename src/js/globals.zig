@@ -20,6 +20,7 @@ const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
+const limiter_mod = @import("limiter.zig");
 
 const c = qjs.c;
 
@@ -126,6 +127,14 @@ pub const DispatchState = struct {
     /// (the snapshot/restore wipes the runtime). Owned values must
     /// be `JS_FreeValue`'d on `deinit`.
     trigger_module_ns: std.StringHashMapUnmanaged(c.JSValue) = .empty,
+    /// Per-worker rate limiter. Used by the `__rove_check_email_rate`
+    /// builtin (called from the `email.send` JS wrapper) to take
+    /// from the email bucket before queuing the outbox row. Null in
+    /// test paths that don't care.
+    limiter: ?*limiter_mod.RateLimiter = null,
+    /// Instance id for limiter lookup. Empty when the dispatcher
+    /// runs without a worker (test paths).
+    instance_id: []const u8 = "",
 
     pub fn deinit(self: *DispatchState, ctx: ?*c.JSContext) void {
         var it = self.trigger_module_ns.iterator();
@@ -1091,6 +1100,48 @@ fn copyFieldRenamed(
     setOwned(ctx, dst, dst_name, v);
 }
 
+/// Hidden builtin called from the email.send JS wrapper before
+/// queuing the outbox row. Throws Error{code:"rate_limited"} when
+/// the per-instance email bucket is exhausted; customer can catch
+/// in their handler. No-op when the limiter isn't wired (test
+/// paths) so dispatcher tests don't need to plumb a limiter through.
+fn jsCheckEmailRate(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    _: c_int,
+    _: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = getState(ctx);
+    const lim = state.limiter orelse return js_undefined;
+    if (state.instance_id.len == 0) return js_undefined;
+
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const allowed = lim.check(state.instance_id, .email, now_ns) catch |err| {
+        // Lazy bucket creation OOM. Fail open + log — same posture
+        // as the worker.zig request-side check.
+        std.log.warn("rove-js: limiter.check email for {s} failed: {s} — fail open", .{ state.instance_id, @errorName(err) });
+        return js_undefined;
+    };
+    if (allowed) return js_undefined;
+
+    const retry_after = lim.retryAfterSeconds(state.instance_id, .email);
+    const msg = std.fmt.allocPrintSentinel(
+        state.allocator,
+        "email rate limit exceeded, retry after {d}s",
+        .{retry_after},
+        0,
+    ) catch return c.JS_ThrowOutOfMemory(ctx);
+    defer state.allocator.free(msg);
+
+    const err = c.JS_NewError(ctx);
+    if (c.JS_IsException(err)) return err;
+    _ = c.JS_SetPropertyStr(ctx, err, "message",
+        c.JS_NewStringLen(ctx, msg.ptr, msg.len));
+    _ = c.JS_SetPropertyStr(ctx, err, "code",
+        c.JS_NewStringLen(ctx, "rate_limited", "rate_limited".len));
+    return c.JS_Throw(ctx, err);
+}
+
 fn jsWebhookSend(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -1426,6 +1477,14 @@ pub fn installStatic(ctx: *c.JSContext) void {
     _ = c.JS_SetPropertyStr(ctx, webhook_obj, "send", c.JS_NewCFunction2(ctx, jsWebhookSend, "send", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, global, "webhook", webhook_obj);
 
+    // Hidden builtin: take from the email rate-limit bucket. Called
+    // from the email.send JS wrapper below before queuing the outbox
+    // row. Throws Error{code:"rate_limited", message:"..."} when the
+    // bucket is exhausted; customer can try/catch in their handler.
+    // No-op (returns undefined) when state.limiter is null (test paths).
+    _ = c.JS_SetPropertyStr(ctx, global, "__rove_check_email_rate",
+        c.JS_NewCFunction2(ctx, jsCheckEmailRate, "__rove_check_email_rate", 0, c.JS_CFUNC_generic, 0));
+
     // email.send — thin wrapper around webhook.send that builds a
     // Resend-shaped POST and takes the API key as a parameter rather
     // than resolving it from platform config. Keeps key storage a
@@ -1439,6 +1498,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     const email_snippet =
         \\globalThis.email = {
         \\  send(opts) {
+        \\    __rove_check_email_rate();
         \\    if (!opts || typeof opts !== "object")
         \\      throw new TypeError("email.send requires an options object");
         \\    if (typeof opts.key !== "string" || opts.key.length === 0)

@@ -278,6 +278,11 @@ fn runOneCallback(
         .prng_seed = @bitCast(received_ns),
         .request_id = request_id,
         .platform = inst.platform,
+        // Callbacks are platform-driven (drainer fired the webhook,
+        // success/failure routes back through this dispatch); they
+        // share the customer's email bucket via the same limiter.
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
     };
 
     var budget = Budget.fromNow(Budget.default_duration_ns);

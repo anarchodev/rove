@@ -49,11 +49,15 @@ pub const globals = @import("globals.zig");
 pub const worker = @import("worker.zig");
 pub const apply = @import("apply.zig");
 pub const penalty = @import("penalty.zig");
+pub const limiter = @import("limiter.zig");
 pub const router = @import("router.zig");
 pub const callback_dispatch = @import("callback_dispatch.zig");
 
 pub const Budget = dispatcher.Budget;
 pub const PenaltyBox = penalty.PenaltyBox;
+pub const RateLimiter = limiter.RateLimiter;
+pub const RateLimitCaps = limiter.RateLimitCaps;
+pub const Action = limiter.Action;
 
 pub const Dispatcher = dispatcher.Dispatcher;
 pub const Request = dispatcher.Request;
@@ -87,6 +91,7 @@ test {
     _ = worker;
     _ = apply;
     _ = penalty;
+    _ = limiter;
     _ = router;
     _ = callback_dispatch;
 }

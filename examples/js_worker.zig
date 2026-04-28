@@ -461,6 +461,14 @@ const Cli = struct {
     /// emails (magic-link signup, future password-reset, etc.).
     /// Must match a domain configured in Resend.
     platform_email_from: []const u8 = "noreply@loop46.me",
+    /// Per-(instance, action) rate limit caps. Defaults match
+    /// `limiter.RateLimitCaps`'s defaults; flags below let
+    /// operators tune them at launch + smoke tests dial them
+    /// down to small values to provoke 429s in a few requests.
+    rate_limit_request_capacity: u32 = 100,
+    rate_limit_request_refill: u32 = 50,
+    rate_limit_email_capacity: u32 = 10,
+    rate_limit_email_refill: u32 = 1,
 };
 
 fn parseCli(argv: [][:0]u8) !Cli {
@@ -536,6 +544,22 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.platform_email_from = argv[i];
+        } else if (std.mem.eql(u8, a, "--rate-limit-request-capacity")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.rate_limit_request_capacity = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--rate-limit-request-refill")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.rate_limit_request_refill = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--rate-limit-email-capacity")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.rate_limit_email_capacity = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--rate-limit-email-refill")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.rate_limit_email_refill = try std.fmt.parseInt(u32, argv[i], 10);
         } else {
             return error.Usage;
         }
@@ -614,6 +638,7 @@ const WorkerCtx = struct {
     admin_api_domain: ?[]const u8,
     public_suffix: ?[]const u8,
     platform_email_from: []const u8,
+    rate_limit_caps: rjs.RateLimitCaps,
     /// Per-worker QuickJS compiler used by the signup endpoint to
     /// bytecode-compile starter handler content. Runtimes can't be
     /// shared across threads, so each worker owns its own.
@@ -722,6 +747,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .log_worker_id = args.worker_idx,
         .refresh_interval_ns = @as(i64, args.refresh_interval_ms) * std.time.ns_per_ms,
         .platform_email_from = args.platform_email_from,
+        .rate_limit_caps = args.rate_limit_caps,
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
     });
@@ -1140,6 +1166,12 @@ pub fn main() !void {
             .admin_api_domain = cli.admin_api_domain,
             .public_suffix = cli.public_suffix,
             .platform_email_from = cli.platform_email_from,
+            .rate_limit_caps = .{
+                .request_capacity = cli.rate_limit_request_capacity,
+                .request_refill_per_sec = cli.rate_limit_request_refill,
+                .email_capacity = cli.rate_limit_email_capacity,
+                .email_refill_per_sec = cli.rate_limit_email_refill,
+            },
             // The worker thread allocates its QjsCompiler on its own
             // stack (QuickJS runtime pointers have thread affinity)
             // and fills this field before `Worker.create`. The main

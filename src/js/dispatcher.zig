@@ -20,6 +20,7 @@ const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
 
 const globals = @import("globals.zig");
+const limiter_mod = @import("limiter.zig");
 const c = qjs.c;
 
 pub const DispatchError = error{
@@ -82,6 +83,14 @@ pub const Request = struct {
     /// `request.cookies` (parsed `cookie:` header). Null = none
     /// supplied (test paths that don't care).
     headers: ?h2.ReqHeaders = null,
+    /// Per-worker rate limiter, plumbed through to DispatchState so
+    /// the email-rate-check builtin can take from the email bucket.
+    /// Null in test paths that don't exercise rate limiting.
+    limiter: ?*limiter_mod.RateLimiter = null,
+    /// Instance id this request scopes to. Used as the limiter's
+    /// per-instance bucket key. Empty when the dispatcher runs
+    /// outside a worker context (test paths).
+    instance_id: []const u8 = "",
     /// Optional non-determinism tapes. When set, the matching source of
     /// handler non-determinism (`kv.*`, `Date.now`, `Math.random`,
     /// `crypto.getRandomValues` / `crypto.randomUUID`) is captured
@@ -286,6 +295,8 @@ pub const Dispatcher = struct {
             .root_writeset = request.root_writeset,
             .triggers = triggers,
             .bytecodes = bytecodes,
+            .limiter = request.limiter,
+            .instance_id = request.instance_id,
         };
 
         // Memcpy-restore the frozen post-init image of

@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# End-to-end smoke test for the rate limiter (PLAN §2.10).
+#
+# Covers:
+#   - Per-instance request bucket: hammer the tenant's URL until
+#     the bucket is exhausted, verify the next request gets 429
+#     with a Retry-After header. Capacity is dialed down via
+#     --rate-limit-request-capacity for testability.
+#   - Admin requests are not subject to per-instance rate limits
+#     (admin token from the same machine should keep working even
+#     after a tenant is throttled).
+#   - email.send rate limit: deploy a handler that calls email.send,
+#     hammer it past the email bucket capacity, verify the catchable
+#     Error{code:"rate_limited"} surfaces in the handler response.
+#   - Independence: a different tenant's bucket is unaffected by the
+#     first tenant's exhaustion.
+
+set -euo pipefail
+
+DATA_DIR="${DATA_DIR:-/tmp/rove-rate-limit-smoke}"
+HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8200}"
+RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40300}"
+BIN="${BIN:-./zig-out/bin/js-worker}"
+TOKEN="${ROVE_TOKEN:-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff}"
+ADMIN_HOST="api.test"
+PUBLIC_SUFFIX="test"
+PORT="${HTTP_ADDR##*:}"
+ADMIN_ORIGIN="http://${ADMIN_HOST}:${PORT}"
+
+if [[ ! -x "$BIN" ]]; then
+    echo "error: $BIN missing — run 'zig build install' first" >&2
+    exit 2
+fi
+
+rm -rf "$DATA_DIR"
+
+# Tiny capacities + zero refill so a few requests exhaust the bucket
+# and it stays exhausted for the duration of the test (no flakes from
+# wall-clock-driven refills landing mid-sequence).
+"$BIN" \
+    --node-id 0 \
+    --peers "$RAFT_ADDR" \
+    --listen "$RAFT_ADDR" \
+    --http "$HTTP_ADDR" \
+    --data-dir "$DATA_DIR" \
+    --bootstrap-root-token "$TOKEN" \
+    --admin-origin "$ADMIN_ORIGIN" \
+    --admin-api-domain "$ADMIN_HOST" \
+    --public-suffix "$PUBLIC_SUFFIX" \
+    --workers 1 \
+    --refresh-interval-ms 100 \
+    --rate-limit-request-capacity 5 \
+    --rate-limit-request-refill 0 \
+    --rate-limit-email-capacity 2 \
+    --rate-limit-email-refill 0 \
+    --fresh >/tmp/rate-limit-smoke.out 2>&1 &
+PID=$!
+trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
+
+sleep 1.2
+
+RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
+         --resolve "rl1.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
+         --resolve "rl2.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1")
+CURL=(curl --http2-prior-knowledge -sS "${RESOLVE[@]}")
+AUTH=(-H "Authorization: Bearer $TOKEN")
+
+ok() { echo "ok  $1"; }
+fail() {
+    echo "FAIL $1" >&2
+    echo "--- worker log (last 40 lines) ---" >&2
+    tail -40 /tmp/rate-limit-smoke.out >&2
+    exit 1
+}
+
+# Helper: PUT a single file into a tenant's deployment.
+put_file() {
+    local instance="$1" path="$2" body="$3"
+    local code
+    code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+        -X PUT "${AUTH[@]}" \
+        -H "Content-Type: application/javascript" \
+        --data-binary "$body" \
+        "${ADMIN_ORIGIN}/_system/files/${instance}/file/${path}")
+    [[ "$code" == "201" ]] || fail "PUT ${instance}/${path}: got $code"
+}
+
+# ── 1. Two tenants signed up ──────────────────────────────────────────
+for name in rl1 rl2; do
+    body=$("${CURL[@]}" -X POST \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"${name}\",\"email\":\"${name}@example.com\"}" \
+        "${ADMIN_ORIGIN}/v1/signup")
+    echo "$body" | grep -q '"ok":true' || fail "signup ${name}: $body"
+done
+ok "POST /v1/signup rl1 + rl2"
+
+# ── 2. Per-instance request bucket: capacity=5, then 429 ─────────────
+# Hit rl1's URL 5 times — all 200 (starter content's index.html). The
+# 6th must be 429 + Retry-After.
+RL1="http://rl1.${PUBLIC_SUFFIX}:${PORT}"
+for i in 1 2 3 4 5; do
+    code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${RL1}/")
+    [[ "$code" == "200" ]] || fail "request ${i}: expected 200, got $code"
+done
+ok "request 1-5 succeed (within capacity)"
+
+# 6th request: bucket exhausted.
+code=$("${CURL[@]}" -D /tmp/rate-limit-hdrs.txt -o /tmp/rate-limit-body.txt \
+    -w '%{http_code}' "${RL1}/")
+[[ "$code" == "429" ]] || fail "request 6: expected 429, got $code (body: $(cat /tmp/rate-limit-body.txt))"
+ok "request 6 → 429 (bucket exhausted)"
+
+grep -iq "^retry-after:" /tmp/rate-limit-hdrs.txt \
+    || fail "missing Retry-After header: $(cat /tmp/rate-limit-hdrs.txt)"
+ok "Retry-After header present on 429"
+
+grep -q "rate limit exceeded" /tmp/rate-limit-body.txt \
+    || fail "429 body missing 'rate limit exceeded': $(cat /tmp/rate-limit-body.txt)"
+ok "429 body explains the limit"
+
+# ── 3. Different tenant has its own bucket (independence) ────────────
+# rl2 should still be at full capacity.
+RL2="http://rl2.${PUBLIC_SUFFIX}:${PORT}"
+code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${RL2}/")
+[[ "$code" == "200" ]] || fail "rl2 request: expected 200, got $code"
+ok "rl2 not affected by rl1's exhaustion (per-instance buckets)"
+
+# ── 4. Admin requests bypass the per-instance limit ──────────────────
+# Admin (api.test) handler scopes to __admin__ and is exempt. Even
+# after rl1's bucket is dry, admin requests must still work.
+code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+    "${AUTH[@]}" "${ADMIN_ORIGIN}/v1/session")
+[[ "$code" == "200" ]] || fail "admin /v1/session: expected 200, got $code"
+ok "admin requests bypass the rate limit"
+
+# ── 5. Email bucket: catchable Error{code:"rate_limited"} ────────────
+# Deploy a handler on rl2 that calls email.send and reports the result
+# (or caught error). Capacity 2 → first 2 calls go through (queue
+# outbox row), 3rd throws.
+EMAIL_HANDLER='export default function () {
+  try {
+    email.send({
+      key: "re_test",
+      from: "test@example.com",
+      to: "user@example.com",
+      subject: "hi",
+      text: "test",
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, code: e.code, message: e.message };
+  }
+}'
+put_file "rl2" "email/index.mjs" "$EMAIL_HANDLER"
+sleep 0.4
+
+RL2_EMAIL="${RL2}/email"
+# Two successes (capacity 2).
+for i in 1 2; do
+    body=$("${CURL[@]}" "${RL2_EMAIL}")
+    echo "$body" | grep -q '"ok":true' \
+        || fail "email call ${i}: expected ok, got $body"
+done
+ok "email.send 1-2 succeed (within email bucket capacity)"
+
+# Third call: caught, code=rate_limited.
+body=$("${CURL[@]}" "${RL2_EMAIL}")
+echo "$body" | grep -q '"code":"rate_limited"' \
+    || fail "email call 3: expected code=rate_limited, got $body"
+echo "$body" | grep -q "email rate limit exceeded" \
+    || fail "email call 3: missing message text, got $body"
+ok "email.send 3 → catchable Error{code:'rate_limited'}"
+
+echo ""
+echo "all rate limit smoke checks passed"

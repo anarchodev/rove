@@ -63,6 +63,7 @@ const dispatcher_mod = @import("dispatcher.zig");
 const globals = @import("globals.zig");
 const apply_mod = @import("apply.zig");
 const penalty_mod = @import("penalty.zig");
+const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = dispatcher_mod.Request;
@@ -359,6 +360,10 @@ pub const WorkerConfig = struct {
     /// signup, future password-reset, etc.). Must be a domain Resend
     /// is configured to send from. Borrowed; caller keeps alive.
     platform_email_from: []const u8 = "noreply@loop46.me",
+    /// Per-(instance, action) rate limit caps. v1 uses a single
+    /// tier — operator can tune via CLI flags before launch.
+    /// Phase 10 will branch on instance plan tier.
+    rate_limit_caps: limiter_mod.RateLimitCaps = .{},
     /// JS → bytecode compiler used by the signup path to deploy
     /// starter content for a freshly-created instance. When null,
     /// signup still creates the instance but skips the deploy, so
@@ -479,6 +484,15 @@ pub fn Worker(comptime opts: Options) type {
         /// `open_duration_ns` — protecting the shared h2 thread from a
         /// runaway stored procedure. Auto-releases on redeploy.
         penalty_box: penalty_mod.PenaltyBox,
+        /// Per-instance × per-action token-bucket limits. Single tier
+        /// in v1 (`limiter_mod.defaultCaps()`); Phase 10 will branch
+        /// on plan. Customer-tenant traffic checks the `request`
+        /// bucket before dispatch and gets 429 + Retry-After when
+        /// exhausted; admin requests bypass the check entirely.
+        /// `email.send` from a handler checks the `email` bucket and
+        /// throws a catchable JS Error{code:"rate_limited"} when
+        /// exhausted.
+        limiter: limiter_mod.RateLimiter,
         commit_wait_timeout_ns: u64,
         refresh_interval_ns: i64,
         /// Borrowed from `WorkerConfig.admin_origin`. See the config
@@ -548,6 +562,7 @@ pub fn Worker(comptime opts: Options) type {
                 .tenant_files_map = .empty,
                 .tenant_logs = .empty,
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
+                .limiter = limiter_mod.RateLimiter.init(allocator, config.rate_limit_caps),
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
                 .refresh_interval_ns = config.refresh_interval_ns,
                 .admin_origin = config.admin_origin,
@@ -587,6 +602,7 @@ pub fn Worker(comptime opts: Options) type {
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            self.limiter.deinit();
             self.penalty_box.deinit();
             destroyAllTenantLogs(self);
             self.tenant_logs.deinit(allocator);
@@ -1894,6 +1910,27 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             continue;
         }
 
+        // Rate limiter: customer-tenant requests check the per-instance
+        // request bucket. Admin requests bypass entirely (operational
+        // traffic — locking ourselves out would be bad). Runs BEFORE
+        // static dispatch so static file requests count against the
+        // bucket too — they consume worker resources (h2 stream +
+        // memcpy + content-type header build) and are customer-
+        // attributable. On exhaustion: 429 + Retry-After header.
+        if (!is_admin_request) {
+            const allowed = worker.limiter.check(scope_inst.id, .request, received_ns) catch |err| blk: {
+                std.log.warn("rove-js: limiter.check({s}) failed: {s} — fail open", .{ scope_inst.id, @errorName(err) });
+                break :blk true;
+            };
+            if (!allowed) {
+                const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
+                try setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
+                captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 429, .handler_error, &.{}, &.{}, .{});
+                processed += 1;
+                continue;
+            }
+        }
+
         // Static-first dispatch for customer traffic only. Admin
         // requests already ran their own pre-auth static check above —
         // running it here again would shadow the admin JS handler with
@@ -2050,6 +2087,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // singleton — gates installation of `platform.root.*`.
             .platform = handler_inst.platform,
             .root_writeset = root_ws_ptr,
+            // Limiter scope: the SCOPE tenant (the kv this handler
+            // operates on), not the handler tenant. Admin handlers
+            // running as `__admin__` scoped to `acme` should pull
+            // from acme's email bucket, not __admin__'s.
+            .limiter = &worker.limiter,
+            .instance_id = scope_inst.id,
         };
 
         txn.?.savepoint() catch |err| {
@@ -3318,6 +3361,61 @@ fn setSystemResponse(
     try server.reg.set(ent, &server.request_out, h2.RespBody, .{
         .data = copy.ptr,
         .len = @intCast(copy.len),
+    });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// 429 response with a `Retry-After: <sec>` header. Same shape as
+/// setSimpleResponse but stamps a single header in addition to the
+/// status + body. Body text mentions the wait time so curl-style
+/// clients without header inspection still get the hint.
+fn setRateLimitedResponse(
+    server: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    allocator: std.mem.Allocator,
+    retry_after_sec: u32,
+) !void {
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "rate limit exceeded, retry after {d}s\n",
+        .{retry_after_sec},
+    );
+
+    // Build a single-header RespHeaders pointing to a Retry-After
+    // value rendered into the same arena so we own one buffer rather
+    // than two. Layout: [HeaderField, name_bytes, value_bytes].
+    var ra_buf: [16]u8 = undefined;
+    const ra_str = try std.fmt.bufPrint(&ra_buf, "{d}", .{retry_after_sec});
+
+    const NAME = "retry-after";
+    const fields_size = @sizeOf(h2.HeaderField);
+    const total = fields_size + NAME.len + ra_str.len;
+    const hdr_buf = try allocator.alloc(u8, total);
+    errdefer allocator.free(hdr_buf);
+
+    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(hdr_buf.ptr));
+    var off: usize = fields_size;
+    @memcpy(hdr_buf[off .. off + NAME.len], NAME);
+    const name_off = off;
+    off += NAME.len;
+    @memcpy(hdr_buf[off .. off + ra_str.len], ra_str);
+    fields_ptr[0] = .{
+        .name = hdr_buf[name_off..].ptr,
+        .name_len = NAME.len,
+        .value = hdr_buf[off..].ptr,
+        .value_len = @intCast(ra_str.len),
+    };
+
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 429 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = fields_ptr, .count = 1 });
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = body.ptr,
+        .len = @intCast(body.len),
     });
     try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
     try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
