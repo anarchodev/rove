@@ -457,6 +457,14 @@ const Cli = struct {
     /// customer handler probe localhost and leaks request bodies
     /// over plaintext. Startup emits a loud warning when enabled.
     dev_webhook_unsafe: bool = false,
+    /// **Local-dev convenience flag.** When set, the worker
+    /// auto-discovers TLS cert + key at the platform-default
+    /// loop46 data dir (see `defaultDevTlsPaths`). Operators run
+    /// `scripts/rove-dev-setup.sh` once to populate that dir via
+    /// mkcert, then `js-worker --dev` "just works" with HTTPS h2.
+    /// Has no effect in production — explicit `--tls-cert` /
+    /// `--tls-key` always win, and unset defaults stay h2c plaintext.
+    dev: bool = false,
     /// "From:" address the worker uses when queueing platform
     /// emails (magic-link signup, future password-reset, etc.).
     /// Must match a domain configured in Resend.
@@ -540,6 +548,8 @@ fn parseCli(argv: [][:0]u8) !Cli {
             out.refresh_interval_ms = try std.fmt.parseInt(u32, argv[i], 10);
         } else if (std.mem.eql(u8, a, "--dev-webhook-unsafe")) {
             out.dev_webhook_unsafe = true;
+        } else if (std.mem.eql(u8, a, "--dev")) {
+            out.dev = true;
         } else if (std.mem.eql(u8, a, "--platform-email-from")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
@@ -565,6 +575,52 @@ fn parseCli(argv: [][:0]u8) !Cli {
         }
     }
     return out;
+}
+
+/// Resolve the default loop46 data directory for the current OS.
+/// Mirrors mkcert's convention so devs who already know mkcert
+/// recognize the layout.
+///
+///   Linux:   ${XDG_DATA_HOME:-$HOME/.local/share}/loop46
+///   macOS:   $HOME/Library/Application Support/loop46
+///   other:   XDG default (best effort)
+///
+/// Returned slice is owned by the caller.
+fn defaultLoop46DataDir(allocator: std.mem.Allocator) ![]u8 {
+    const builtin = @import("builtin");
+    const home = std.posix.getenv("HOME") orelse "";
+
+    if (builtin.os.tag == .macos) {
+        return std.fmt.allocPrint(allocator, "{s}/Library/Application Support/loop46", .{home});
+    }
+
+    if (std.posix.getenv("XDG_DATA_HOME")) |xdg| {
+        if (xdg.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}/loop46", .{xdg});
+        }
+    }
+    return std.fmt.allocPrint(allocator, "{s}/.local/share/loop46", .{home});
+}
+
+/// Default TLS cert + key paths used by `--dev` mode. Files are
+/// produced by `scripts/rove-dev-setup.sh` via mkcert. Caller frees
+/// both slices.
+fn defaultDevTlsPaths(allocator: std.mem.Allocator) !struct { cert: []u8, key: []u8, dir: []u8 } {
+    const dir = try defaultLoop46DataDir(allocator);
+    errdefer allocator.free(dir);
+    const cert = try std.fmt.allocPrint(allocator, "{s}/dev-cert.pem", .{dir});
+    errdefer allocator.free(cert);
+    const key = try std.fmt.allocPrint(allocator, "{s}/dev-key.pem", .{dir});
+    return .{ .cert = cert, .key = key, .dir = dir };
+}
+
+/// Both files exist + are readable? Used for --dev auto-discovery so
+/// we silently fall back to plaintext h2c when the operator hasn't
+/// run setup yet (rather than erroring out).
+fn devTlsPathsExist(cert: []const u8, key: []const u8) bool {
+    std.fs.cwd().access(cert, .{}) catch return false;
+    std.fs.cwd().access(key, .{}) catch return false;
+    return true;
 }
 
 fn parseHostPort(allocator: std.mem.Allocator, hp: []const u8) !std.net.Address {
@@ -1129,26 +1185,66 @@ pub fn main() !void {
 
     // Optional TLS. Both flags must be set; either alone is a usage
     // error (silent fall-through to plaintext would mask a config
-    // mistake in prod).
+    // mistake in prod). When `--dev` is set AND no explicit cert/key
+    // flags are passed, auto-discover the cert + key produced by
+    // `scripts/rove-dev-setup.sh` at the platform-default loop46
+    // data dir; missing → plaintext h2c with a hint pointing at the
+    // setup script.
+    var dev_tls_cert_owned: ?[]u8 = null;
+    var dev_tls_key_owned: ?[]u8 = null;
+    var dev_tls_dir_owned: ?[]u8 = null;
+    defer if (dev_tls_cert_owned) |s| allocator.free(s);
+    defer if (dev_tls_key_owned) |s| allocator.free(s);
+    defer if (dev_tls_dir_owned) |s| allocator.free(s);
+
     const tls_config: ?*h2_mod.TlsConfig = blk: {
-        const has_cert = cli.tls_cert != null;
-        const has_key = cli.tls_key != null;
-        if (!has_cert and !has_key) break :blk null;
-        if (has_cert != has_key) {
+        var cert_path = cli.tls_cert;
+        var key_path = cli.tls_key;
+        const explicit = cert_path != null or key_path != null;
+
+        if (cert_path != null and key_path == null) {
             std.debug.print("error: --tls-cert and --tls-key must be set together\n", .{});
             std.process.exit(2);
         }
+        if (cert_path == null and key_path != null) {
+            std.debug.print("error: --tls-cert and --tls-key must be set together\n", .{});
+            std.process.exit(2);
+        }
+
+        if (!explicit and cli.dev) {
+            const paths = defaultDevTlsPaths(allocator) catch |err| {
+                std.log.warn("--dev: cannot resolve default TLS paths: {s} — falling back to plaintext h2c", .{@errorName(err)});
+                break :blk null;
+            };
+            dev_tls_cert_owned = paths.cert;
+            dev_tls_key_owned = paths.key;
+            dev_tls_dir_owned = paths.dir;
+            if (devTlsPathsExist(paths.cert, paths.key)) {
+                cert_path = paths.cert;
+                key_path = paths.key;
+                std.log.info("--dev: auto-discovered TLS cert at {s}", .{paths.dir});
+            } else {
+                std.log.warn(
+                    "--dev: no TLS cert at {s}/dev-{{cert,key}}.pem — listening plaintext h2c. Run scripts/rove-dev-setup.sh once to enable HTTPS.",
+                    .{paths.dir},
+                );
+                break :blk null;
+            }
+        }
+
+        if (cert_path == null) break :blk null;
+
         const cfg = h2_mod.TlsConfig.createFromFiles(
             allocator,
-            cli.tls_cert.?,
-            cli.tls_key.?,
+            cert_path.?,
+            key_path.?,
         ) catch |err| {
             std.debug.print("error: tls: {s} (cert={s}, key={s})\n", .{
-                @errorName(err), cli.tls_cert.?, cli.tls_key.?,
+                @errorName(err), cert_path.?, key_path.?,
             });
             std.process.exit(2);
         };
-        std.log.info("tls: loaded {s} + {s}", .{ cli.tls_cert.?, cli.tls_key.? });
+        std.log.info("tls: loaded {s} + {s}", .{ cert_path.?, key_path.? });
         break :blk cfg;
     };
 
