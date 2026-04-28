@@ -457,13 +457,20 @@ const Cli = struct {
     /// customer handler probe localhost and leaks request bodies
     /// over plaintext. Startup emits a loud warning when enabled.
     dev_webhook_unsafe: bool = false,
-    /// **Local-dev convenience flag.** When set, the worker
-    /// auto-discovers TLS cert + key at the platform-default
-    /// loop46 data dir (see `defaultDevTlsPaths`). Operators run
-    /// `scripts/rove-dev-setup.sh` once to populate that dir via
-    /// mkcert, then `js-worker --dev` "just works" with HTTPS h2.
+    /// **Local-dev convenience flag.** When set, the worker uses
+    /// mkcert-issued TLS at the platform-default loop46 data dir
+    /// (see `defaultDevTlsPaths`). On first run, if the cert is
+    /// missing, the binary auto-bootstraps via mkcert (registers
+    /// the local CA, generates the cert, symlinks the rootCA path)
+    /// and continues. mkcert must be installed; missing → fail
+    /// loudly with install hints. Per the "h2+TLS everywhere even
+    /// in dev" stake-in-the-ground, `--dev` mode does NOT fall back
+    /// to plaintext h2c — it's TLS or fail.
+    ///
     /// Has no effect in production — explicit `--tls-cert` /
-    /// `--tls-key` always win, and unset defaults stay h2c plaintext.
+    /// `--tls-key` always win, and the unset case (no `--dev`)
+    /// keeps the existing plaintext h2c behavior used by the
+    /// smoke scripts.
     dev: bool = false,
     /// "From:" address the worker uses when queueing platform
     /// emails (magic-link signup, future password-reset, etc.).
@@ -614,13 +621,146 @@ fn defaultDevTlsPaths(allocator: std.mem.Allocator) !struct { cert: []u8, key: [
     return .{ .cert = cert, .key = key, .dir = dir };
 }
 
-/// Both files exist + are readable? Used for --dev auto-discovery so
-/// we silently fall back to plaintext h2c when the operator hasn't
-/// run setup yet (rather than erroring out).
+/// Both files exist + are readable?
 fn devTlsPathsExist(cert: []const u8, key: []const u8) bool {
     std.fs.cwd().access(cert, .{}) catch return false;
     std.fs.cwd().access(key, .{}) catch return false;
     return true;
+}
+
+const MKCERT_NOT_FOUND_HINT =
+    \\error: mkcert is not installed (required for --dev TLS).
+    \\
+    \\Install instructions:
+    \\  Linux (Debian/Ubuntu):  sudo apt install libnss3-tools && \
+    \\                          curl -L https://github.com/FiloSottile/mkcert/releases/latest/download/mkcert-v1.4.4-linux-amd64 -o /usr/local/bin/mkcert && \
+    \\                          sudo chmod +x /usr/local/bin/mkcert
+    \\  Linux (Fedora):         sudo dnf install nss-tools mkcert
+    \\  macOS:                  brew install mkcert nss
+    \\  Windows / other:        https://github.com/FiloSottile/mkcert#installation
+    \\
+    \\Then re-run `js-worker --dev`.
+    \\
+;
+
+/// Run `mkcert` once at the loop46 data dir to provision a dev TLS
+/// cert + key. Idempotent — re-running over an existing setup just
+/// rewrites the files. Errors with install hints if mkcert isn't on
+/// PATH (a stake-in-the-ground "dev = TLS or fail" — no plaintext
+/// fallback, see PLAN §1.5).
+///
+/// Subprocess steps (matching the legacy scripts/rove-dev-setup.sh
+/// the binary now subsumes):
+///   1. mkcert -CAROOT  → confirm mkcert is installed AND get the
+///                        rootCA path for the symlink later.
+///   2. mkcert -install → register the local CA into system + browser
+///                        trust stores. Inherits stdio so sudo /
+///                        Keychain prompts are visible to the user.
+///   3. mkcert -cert-file <cert> -key-file <key> <SANs>
+///                      → generate the actual leaf cert covering
+///                        every domain our smoke + dev workflows use.
+///   4. symlink mkcert-CAROOT/rootCA.pem → <data-dir>/ca-root.pem so
+///                        tools that need an explicit --cacert path
+///                        (the upcoming loop46 CLI in non-system-
+///                        trust setups) have a stable location.
+fn initDevTls(allocator: std.mem.Allocator, paths: anytype) !void {
+    std.log.info("--dev: no TLS cert at {s} — bootstrapping via mkcert...", .{paths.dir});
+
+    // ── 1. mkcert installed? Capture rootCA path while we're at it.
+    const caroot = caroot: {
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "mkcert", "-CAROOT" },
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.debug.print(MKCERT_NOT_FOUND_HINT, .{});
+                std.process.exit(2);
+            },
+            else => return err,
+        };
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        if (result.term != .Exited or result.term.Exited != 0) {
+            std.debug.print(
+                "error: mkcert -CAROOT exited with {any}: {s}\n",
+                .{ result.term, result.stderr },
+            );
+            std.process.exit(2);
+        }
+        // Strip trailing whitespace/newline.
+        const trimmed = std.mem.trimRight(u8, result.stdout, " \t\r\n");
+        break :caroot try allocator.dupe(u8, trimmed);
+    };
+    defer allocator.free(caroot);
+
+    // ── 2. mkdir the data dir.
+    std.fs.cwd().makePath(paths.dir) catch |err| {
+        std.debug.print("error: cannot create {s}: {s}\n", .{ paths.dir, @errorName(err) });
+        std.process.exit(2);
+    };
+
+    // ── 3. mkcert -install (idempotent; may prompt for sudo on Linux
+    //       or pop a Keychain dialog on macOS — inherited stdio so the
+    //       user sees the prompts).
+    {
+        var child = std.process.Child.init(&.{ "mkcert", "-install" }, allocator);
+        const term = child.spawnAndWait() catch |err| {
+            std.debug.print("error: mkcert -install failed: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+        if (term != .Exited or term.Exited != 0) {
+            std.debug.print("error: mkcert -install exited with {any}\n", .{term});
+            std.process.exit(2);
+        }
+    }
+
+    // ── 4. mkcert -cert-file <cert> -key-file <key> <SANs>
+    //
+    // SAN list covers the dev domains our smokes + dev workflows use.
+    // Includes *.localhost (RFC 6761 — always resolves to loopback in
+    // browsers + curl, no /etc/hosts edits needed) so the upcoming
+    // dev-defaults work (--admin-api-domain admin.localhost,
+    // --public-suffix localhost) has cert coverage.
+    {
+        const argv = [_][]const u8{
+            "mkcert",
+            "-cert-file", paths.cert,
+            "-key-file",  paths.key,
+            "*.test", "test",
+            "*.api.test", "api.test",
+            "*.localhost", "localhost",
+            "127.0.0.1",
+            "::1",
+        };
+        var child = std.process.Child.init(&argv, allocator);
+        const term = child.spawnAndWait() catch |err| {
+            std.debug.print("error: mkcert (cert generation) failed: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+        if (term != .Exited or term.Exited != 0) {
+            std.debug.print("error: mkcert (cert generation) exited with {any}\n", .{term});
+            std.process.exit(2);
+        }
+    }
+
+    // ── 5. Symlink the mkcert root CA → <data-dir>/ca-root.pem.
+    //       Best-effort: if the source is missing or the symlink can't
+    //       be made (pre-existing regular file, FS permissions), log
+    //       a warning but don't fail the launch.
+    {
+        const source = try std.fmt.allocPrint(allocator, "{s}/rootCA.pem", .{caroot});
+        defer allocator.free(source);
+        const dest = try std.fmt.allocPrint(allocator, "{s}/ca-root.pem", .{paths.dir});
+        defer allocator.free(dest);
+
+        // Remove any pre-existing file/symlink so the operation is idempotent.
+        std.fs.cwd().deleteFile(dest) catch {};
+        std.fs.cwd().symLink(source, dest, .{}) catch |err| {
+            std.log.warn("--dev: ca-root.pem symlink ({s} → {s}) failed: {s}", .{ dest, source, @errorName(err) });
+        };
+    }
+
+    std.log.info("--dev: TLS cert + key written to {s}", .{paths.dir});
 }
 
 fn parseHostPort(allocator: std.mem.Allocator, hp: []const u8) !std.net.Address {
@@ -1213,23 +1353,23 @@ pub fn main() !void {
 
         if (!explicit and cli.dev) {
             const paths = defaultDevTlsPaths(allocator) catch |err| {
-                std.log.warn("--dev: cannot resolve default TLS paths: {s} — falling back to plaintext h2c", .{@errorName(err)});
-                break :blk null;
+                std.debug.print("error: --dev: cannot resolve default TLS paths: {s}\n", .{@errorName(err)});
+                std.process.exit(2);
             };
             dev_tls_cert_owned = paths.cert;
             dev_tls_key_owned = paths.key;
             dev_tls_dir_owned = paths.dir;
-            if (devTlsPathsExist(paths.cert, paths.key)) {
-                cert_path = paths.cert;
-                key_path = paths.key;
-                std.log.info("--dev: auto-discovered TLS cert at {s}", .{paths.dir});
+            // First run: cert missing → bootstrap via mkcert. After
+            // initDevTls returns the files exist; if it doesn't, it
+            // exits the process itself (mkcert missing, etc.) so we
+            // never reach the next line on a real failure.
+            if (!devTlsPathsExist(paths.cert, paths.key)) {
+                try initDevTls(allocator, paths);
             } else {
-                std.log.warn(
-                    "--dev: no TLS cert at {s}/dev-{{cert,key}}.pem — listening plaintext h2c. Run scripts/rove-dev-setup.sh once to enable HTTPS.",
-                    .{paths.dir},
-                );
-                break :blk null;
+                std.log.info("--dev: TLS cert at {s}", .{paths.dir});
             }
+            cert_path = paths.cert;
+            key_path = paths.key;
         }
 
         if (cert_path == null) break :blk null;
