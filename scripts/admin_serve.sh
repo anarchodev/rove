@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Dev harness for the browser admin UI.
 #
-# Spins up a fresh js-worker (with --admin-origin wired for CORS) and
+# Spins up a fresh loop46 (with --admin-origin wired for CORS) and
 # serves web/admin/ over plain HTTP on :5173 so the browser can load
 # the static files. Open http://127.0.0.1:5173/?api=http://127.0.0.1:8082
 # on first run — the `?api=` query string saves the API base to
@@ -22,7 +22,7 @@ UI_PORT="${UI_PORT:-5173}"
 ORIGIN="${ADMIN_ORIGIN:-http://localhost:${UI_PORT}}"
 WORKERS="${WORKERS:-4}"
 TOKEN="${ROVE_TOKEN:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
-BIN="${BIN:-./zig-out/bin/js-worker}"
+BIN="${BIN:-./zig-out/bin/loop46}"
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
@@ -31,7 +31,7 @@ fi
 
 rm -rf "$DATA_DIR"
 
-"$BIN" \
+"$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \

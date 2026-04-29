@@ -16,11 +16,28 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/tmp/rove-static-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8199}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40299}"
-ORIGIN="${ADMIN_ORIGIN:-http://localhost:5173}"
-BIN="${BIN:-./zig-out/bin/js-worker}"
+ORIGIN="${ADMIN_ORIGIN:-https://localhost:5173}"
+BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
-API_HOST="api.test"
+API_HOST="app.loop46.localhost"
 PORT="${HTTP_ADDR##*:}"
+
+# TLS via mkcert (Phase 8 + step 2 of the launch checklist). Expects
+# scripts/rove-dev-setup.sh OR `loop46 dev` to have been run
+# once on this machine to generate the cert + register the CA.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
+else
+    LOOP46_DATA="${LOOP46_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/loop46}"
+fi
+TLS_CERT="$LOOP46_DATA/dev-cert.pem"
+TLS_KEY="$LOOP46_DATA/dev-key.pem"
+CACERT="$LOOP46_DATA/ca-root.pem"
+
+if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+    echo "error: missing dev TLS at $LOOP46_DATA. Run 'loop46 dev ...' once to bootstrap." >&2
+    exit 2
+fi
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
@@ -29,7 +46,7 @@ fi
 
 rm -rf "$DATA_DIR"
 
-"$BIN" \
+"$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
@@ -38,6 +55,8 @@ rm -rf "$DATA_DIR"
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ORIGIN" \
     --admin-api-domain "$API_HOST" \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
     --fresh >/tmp/static-smoke.out 2>&1 &
@@ -46,12 +65,12 @@ trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
 
 sleep 1.2
 
-CUSTOMER_HOST="demo.test"
+CUSTOMER_HOST="demo.loop46.localhost"
 RESOLVE_FLAGS=(
     --resolve "${API_HOST}:${PORT}:127.0.0.1"
     --resolve "${CUSTOMER_HOST}:${PORT}:127.0.0.1"
 )
-CURL=(curl --http2-prior-knowledge -sS "${RESOLVE_FLAGS[@]}")
+CURL=(curl -sS --cacert "$CACERT" "${RESOLVE_FLAGS[@]}")
 ADMIN_HDRS=(-H "Authorization: Bearer $TOKEN" -H "Origin: $ORIGIN")
 
 ok() { echo "ok  $1"; }
@@ -66,14 +85,14 @@ fail() {
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
     "${ADMIN_HDRS[@]}" -H "Content-Type: application/json" \
     -d '{"fn":"createInstance","args":["demo"]}' \
-    "http://${API_HOST}:${PORT}/")
+    "https://${API_HOST}:${PORT}/")
 [[ "$code" == "201" ]] || fail "createInstance demo (got $code)"
 ok "createInstance demo"
 
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
     "${ADMIN_HDRS[@]}" -H "Content-Type: application/json" \
     -d "{\"fn\":\"assignDomain\",\"args\":[\"${CUSTOMER_HOST}\",\"demo\"]}" \
-    "http://${API_HOST}:${PORT}/")
+    "https://${API_HOST}:${PORT}/")
 [[ "$code" == "201" ]] || fail "assignDomain ${CUSTOMER_HOST} → demo (got $code)"
 ok "assignDomain ${CUSTOMER_HOST} → demo"
 
@@ -84,7 +103,7 @@ put_static() {
         "${ADMIN_HDRS[@]}" -X PUT \
         -H "Content-Type: $ct" \
         --data-binary "$body" \
-        "http://${API_HOST}:${PORT}/_system/files/demo/file/${path}")
+        "https://${API_HOST}:${PORT}/_system/files/demo/file/${path}")
     # Wait long enough for the worker's refresh poll (100ms + slack)
     # to pick up the new deployment before the next GET.
     sleep 0.25
@@ -97,7 +116,7 @@ code=$(put_static "_static/index.html" "text/html" '<!doctype html><h1>home</h1>
 ok "PUT _static/index.html → 201"
 
 # ── 2. GET / → 200 + html + ETag + Cache-Control ──────────────────────
-hdrs=$("${CURL[@]}" -D - -o /tmp/static-body.html "http://${CUSTOMER_HOST}:${PORT}/")
+hdrs=$("${CURL[@]}" -D - -o /tmp/static-body.html "https://${CUSTOMER_HOST}:${PORT}/")
 echo "$hdrs" | head -1 | grep -q " 200" || fail "GET / status ($hdrs)"
 echo "$hdrs" | grep -iq "content-type: text/html" || fail "content-type missing"
 etag=$(echo "$hdrs" | grep -i "^etag:" | awk '{print $2}' | tr -d '\r')
@@ -108,32 +127,32 @@ ok "GET / returns index.html with ETag + Cache-Control"
 
 # ── 3. If-None-Match matching ETag → 304 ─────────────────────────────
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
-    -H "If-None-Match: $etag" "http://${CUSTOMER_HOST}:${PORT}/")
+    -H "If-None-Match: $etag" "https://${CUSTOMER_HOST}:${PORT}/")
 [[ "$code" == "304" ]] || fail "If-None-Match match → 304 (got $code)"
 ok "If-None-Match match → 304"
 
 # ── 4. If-None-Match not matching → 200 ──────────────────────────────
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
-    -H 'If-None-Match: "different"' "http://${CUSTOMER_HOST}:${PORT}/")
+    -H 'If-None-Match: "different"' "https://${CUSTOMER_HOST}:${PORT}/")
 [[ "$code" == "200" ]] || fail "If-None-Match mismatch → 200 (got $code)"
 ok "If-None-Match mismatch → 200"
 
 # ── 5. .html fallback: GET /about → _static/about.html ───────────────
 code=$(put_static "_static/about.html" "text/html" '<p>about</p>')
 [[ "$code" == "201" ]] || fail "PUT about.html (got $code)"
-body=$("${CURL[@]}" "http://${CUSTOMER_HOST}:${PORT}/about")
+body=$("${CURL[@]}" "https://${CUSTOMER_HOST}:${PORT}/about")
 grep -q '<p>about</p>' <<<"$body" || fail ".html fallback body: $body"
 ok ".html fallback: /about → _static/about.html"
 
 # ── 6. directory index fallback: GET /blog → _static/blog/index.html ─
 code=$(put_static "_static/blog/index.html" "text/html" '<p>blog</p>')
 [[ "$code" == "201" ]] || fail "PUT blog/index.html"
-body=$("${CURL[@]}" "http://${CUSTOMER_HOST}:${PORT}/blog")
+body=$("${CURL[@]}" "https://${CUSTOMER_HOST}:${PORT}/blog")
 grep -q '<p>blog</p>' <<<"$body" || fail "dir index body: $body"
 ok "dir-index fallback: /blog → _static/blog/index.html"
 
 # ── 7. trailing slash canonicalization: /blog/ → 301 /blog ──────────
-hdrs=$("${CURL[@]}" -D - -o /dev/null "http://${CUSTOMER_HOST}:${PORT}/blog/")
+hdrs=$("${CURL[@]}" -D - -o /dev/null "https://${CUSTOMER_HOST}:${PORT}/blog/")
 echo "$hdrs" | head -1 | grep -q " 301" || fail "trailing slash 301 ($hdrs)"
 echo "$hdrs" | grep -iq "location: /blog" || fail "redirect location"
 ok "trailing slash → 301 /blog"
@@ -142,7 +161,7 @@ ok "trailing slash → 301 /blog"
 code=$(put_static "_static/_404.html" "text/html" '<h1>nope</h1>')
 [[ "$code" == "201" ]] || fail "PUT _404.html"
 resp=$("${CURL[@]}" -D /tmp/static-404-hdrs.txt -o /tmp/static-404-body.html \
-    -w '%{http_code}' "http://${CUSTOMER_HOST}:${PORT}/nonexistent")
+    -w '%{http_code}' "https://${CUSTOMER_HOST}:${PORT}/nonexistent")
 [[ "$resp" == "404" ]] || fail "convention 404 status (got $resp)"
 grep -q '<h1>nope</h1>' /tmp/static-404-body.html || fail "404 body"
 grep -iq "content-type: text/html" /tmp/static-404-hdrs.txt || fail "404 content-type"
@@ -166,7 +185,7 @@ ok "PUT with uppercase → 400"
 # ── 12. ETag survives a re-upload of identical bytes ─────────────────
 code=$(put_static "_static/index.html" "text/html" '<!doctype html><h1>home</h1>')
 [[ "$code" == "201" ]] || fail "re-upload identical (got $code)"
-hdrs=$("${CURL[@]}" -D - -o /dev/null "http://${CUSTOMER_HOST}:${PORT}/")
+hdrs=$("${CURL[@]}" -D - -o /dev/null "https://${CUSTOMER_HOST}:${PORT}/")
 new_etag=$(echo "$hdrs" | grep -i "^etag:" | awk '{print $2}' | tr -d '\r')
 [[ "$new_etag" == "$etag" ]] || fail "etag changed on identical re-upload ($etag vs $new_etag)"
 ok "identical re-upload keeps the same ETag"

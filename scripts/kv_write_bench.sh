@@ -6,7 +6,7 @@
 # the only difference is whether concurrent writes collide on a row.
 #
 # Prerequisites:
-#   - js-worker running: ./zig-out/bin/js-worker --fresh --workers 4
+#   - loop46 running: ./zig-out/bin/loop46 --fresh --workers 4
 #   - h2load installed (nghttp2 package)
 #
 # Usage:

@@ -16,11 +16,25 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/tmp/rove-cookie-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8196}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40296}"
-BIN="${BIN:-./zig-out/bin/js-worker}"
+BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
-API_HOST="api.test"
+API_HOST="app.loop46.localhost"
 PORT="${HTTP_ADDR##*:}"
-ORIGIN="http://${API_HOST}:${PORT}"
+ORIGIN="https://${API_HOST}:${PORT}"
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
+else
+    LOOP46_DATA="${LOOP46_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/loop46}"
+fi
+TLS_CERT="$LOOP46_DATA/dev-cert.pem"
+TLS_KEY="$LOOP46_DATA/dev-key.pem"
+CACERT="$LOOP46_DATA/ca-root.pem"
+
+if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+    echo "error: missing dev TLS at $LOOP46_DATA. Run 'loop46 dev ...' once to bootstrap." >&2
+    exit 2
+fi
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
@@ -29,7 +43,7 @@ fi
 
 rm -rf "$DATA_DIR"
 
-"$BIN" \
+"$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
@@ -38,6 +52,8 @@ rm -rf "$DATA_DIR"
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ORIGIN" \
     --admin-api-domain "$API_HOST" \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
     --fresh >/tmp/cookie-smoke.out 2>&1 &
@@ -47,7 +63,7 @@ trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
 sleep 1.2
 
 RESOLVE=(--resolve "${API_HOST}:${PORT}:127.0.0.1")
-CURL=(curl --http2-prior-knowledge -sS "${RESOLVE[@]}")
+CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 
 ok() { echo "ok  $1"; }
 fail() {

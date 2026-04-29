@@ -13,7 +13,7 @@
 # lock is the bottleneck. If (2) ≈ (1), the shared raft log fsync is.
 #
 # Prerequisites:
-#   - js-worker running with write0..write7 tenants
+#   - loop46 running with write0..write7 tenants
 #   - h2load installed
 #
 # Usage:

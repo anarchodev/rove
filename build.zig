@@ -309,24 +309,26 @@ pub fn build(b: *std.Build) void {
     const js_tests = b.addTest(.{ .root_module = js_mod });
     test_step.dependOn(&b.addRunArtifact(js_tests).step);
 
-    // js-worker: smoke-test binary for the rove-js end-to-end path.
-    const js_worker_mod = b.addModule("js-worker", .{
-        .root_source_file = b.path("examples/js_worker.zig"),
+    // loop46: the Loop46 product binary. Subcommand-dispatched entry
+    // point (`loop46 dev`, `loop46 worker`, …) that composes the rove
+    // engine modules with the embedded admin UI bundle.
+    const loop46_mod = b.addModule("loop46", .{
+        .root_source_file = b.path("src/loop46/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    js_worker_mod.addImport("rove", rove_mod);
-    js_worker_mod.addImport("rove-js", js_mod);
-    js_worker_mod.addImport("rove-kv", kv_mod);
-    js_worker_mod.addImport("rove-blob", blob_mod);
-    js_worker_mod.addImport("rove-files", files_mod);
-    js_worker_mod.addImport("rove-files-server", files_server_mod);
-    js_worker_mod.addImport("rove-log-server", log_server_mod);
-    js_worker_mod.addImport("rove-qjs", qjs_mod);
-    js_worker_mod.addImport("rove-tenant", tenant_mod);
-    js_worker_mod.addImport("rove-h2", h2_mod);
-    js_worker_mod.addImport("rove-outbox", outbox_mod);
-    // Admin UI bundle — embedded so js-worker ships with a working
+    loop46_mod.addImport("rove", rove_mod);
+    loop46_mod.addImport("rove-js", js_mod);
+    loop46_mod.addImport("rove-kv", kv_mod);
+    loop46_mod.addImport("rove-blob", blob_mod);
+    loop46_mod.addImport("rove-files", files_mod);
+    loop46_mod.addImport("rove-files-server", files_server_mod);
+    loop46_mod.addImport("rove-log-server", log_server_mod);
+    loop46_mod.addImport("rove-qjs", qjs_mod);
+    loop46_mod.addImport("rove-tenant", tenant_mod);
+    loop46_mod.addImport("rove-h2", h2_mod);
+    loop46_mod.addImport("rove-outbox", outbox_mod);
+    // Admin UI bundle — embedded so the binary ships with a working
     // dashboard at app.{BASE_DOMAIN}/ out of the box. Each file becomes
     // a `_static/<path>` entry in __admin__'s initial deployment.
     const admin_ui_files: []const struct { name: []const u8, path: []const u8 } = &.{
@@ -339,24 +341,24 @@ pub fn build(b: *std.Build) void {
         .{ .name = "admin_ui_page_instance", .path = "web/admin/pages/instance.js" },
     };
     for (admin_ui_files) |f| {
-        js_worker_mod.addAnonymousImport(f.name, .{
+        loop46_mod.addAnonymousImport(f.name, .{
             .root_source_file = b.path(f.path),
         });
     }
-    js_worker_mod.link_libc = true;
-    js_worker_mod.linkSystemLibrary("nghttp2", .{});
-    js_worker_mod.linkSystemLibrary("ssl", .{});
-    js_worker_mod.linkSystemLibrary("crypto", .{});
+    loop46_mod.link_libc = true;
+    loop46_mod.linkSystemLibrary("nghttp2", .{});
+    loop46_mod.linkSystemLibrary("ssl", .{});
+    loop46_mod.linkSystemLibrary("crypto", .{});
 
-    const js_worker_exe = b.addExecutable(.{
-        .name = "js-worker",
-        .root_module = js_worker_mod,
+    const loop46_exe = b.addExecutable(.{
+        .name = "loop46",
+        .root_module = loop46_mod,
     });
-    b.installArtifact(js_worker_exe);
+    b.installArtifact(loop46_exe);
 
-    const run_js_worker = b.addRunArtifact(js_worker_exe);
-    const js_worker_step = b.step("js-worker", "Run the rove-js worker smoke server");
-    js_worker_step.dependOn(&run_js_worker.step);
+    const run_loop46 = b.addRunArtifact(loop46_exe);
+    const loop46_step = b.step("loop46", "Run the loop46 product binary");
+    loop46_step.dependOn(&run_loop46.step);
 
     // qjs-hello: minimal demo that runs a JS snippet via rove-qjs.
     // Will grow into a snapshot-restoring executable in the next Phase 0

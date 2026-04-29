@@ -10,10 +10,10 @@
 #   - the callback's `kv.set` is durable + visible via the admin API
 #
 # Requirements:
-#   - zig-out/bin/js-worker present (run `zig build install` first)
+#   - zig-out/bin/loop46 present (run `zig build install` first)
 #   - python3 on PATH (used as the webhook delivery target)
 #
-# The js-worker runs with `--dev-webhook-unsafe` so the drainer's SSRF
+# The loop46 runs with `--dev-webhook-unsafe` so the drainer's SSRF
 # block and https-required check are relaxed for loopback. **That flag
 # is dev-only** — do not set it in production.
 
@@ -23,13 +23,13 @@ DATA_DIR="${DATA_DIR:-/tmp/rove-webhook-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8197}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40297}"
 ECHO_PORT="${ECHO_PORT:-9197}"
-BIN="${BIN:-./zig-out/bin/js-worker}"
+BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc}"
-ADMIN_HOST="api.test"
+ADMIN_HOST="app.loop46.localhost"
 ACME_HOST="acme.test"
 PORT="${HTTP_ADDR##*:}"
-ADMIN_ORIGIN="http://${ADMIN_HOST}:${PORT}"
-ACME_ORIGIN="http://${ACME_HOST}:${PORT}"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+ACME_ORIGIN="https://${ACME_HOST}:${PORT}"
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
@@ -79,7 +79,7 @@ ECHO_PID=$!
 sleep 0.3
 
 # Start worker.
-"$BIN" \
+"$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
@@ -107,7 +107,7 @@ sleep 1.2
 
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
          --resolve "${ACME_HOST}:${PORT}:127.0.0.1")
-CURL=(curl --http2-prior-knowledge -sS "${RESOLVE[@]}")
+CURL=(curl -sS "${RESOLVE[@]}")
 
 ok() { echo "ok  $1"; }
 fail() {

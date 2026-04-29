@@ -13,7 +13,7 @@
 #           sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443
 #           # persist: /etc/sysctl.d/99-rove.conf
 #      b) grant the capability to the binary (shared hosts):
-#           sudo setcap cap_net_bind_service=+ep zig-out/bin/js-worker
+#           sudo setcap cap_net_bind_service=+ep zig-out/bin/loop46
 #
 # 3. DNS at your registrar:
 #      loop46.me.        A  15.204.47.158
@@ -41,7 +41,7 @@ WORKERS="${WORKERS:-4}"
 # public listener and doesn't need a port opened in any firewall.
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40146}"
 
-WORKER_BIN="${WORKER_BIN:-$REPO_DIR/zig-out/bin/js-worker}"
+WORKER_BIN="${WORKER_BIN:-$REPO_DIR/zig-out/bin/loop46}"
 
 # ── Sanity checks ────────────────────────────────────────────────────
 if [[ ! -x "$WORKER_BIN" ]]; then

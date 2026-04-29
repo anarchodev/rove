@@ -20,12 +20,26 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/tmp/rove-rate-limit-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8200}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40300}"
-BIN="${BIN:-./zig-out/bin/js-worker}"
+BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff}"
-ADMIN_HOST="api.test"
-PUBLIC_SUFFIX="test"
+ADMIN_HOST="app.loop46.localhost"
+PUBLIC_SUFFIX="loop46.localhost"
 PORT="${HTTP_ADDR##*:}"
-ADMIN_ORIGIN="http://${ADMIN_HOST}:${PORT}"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
+else
+    LOOP46_DATA="${LOOP46_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/loop46}"
+fi
+TLS_CERT="$LOOP46_DATA/dev-cert.pem"
+TLS_KEY="$LOOP46_DATA/dev-key.pem"
+CACERT="$LOOP46_DATA/ca-root.pem"
+
+if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+    echo "error: missing dev TLS at $LOOP46_DATA. Run 'loop46 dev ...' once to bootstrap." >&2
+    exit 2
+fi
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
@@ -37,7 +51,7 @@ rm -rf "$DATA_DIR"
 # Tiny capacities + zero refill so a few requests exhaust the bucket
 # and it stays exhausted for the duration of the test (no flakes from
 # wall-clock-driven refills landing mid-sequence).
-"$BIN" \
+"$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
@@ -45,8 +59,9 @@ rm -rf "$DATA_DIR"
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
-    --admin-api-domain "$ADMIN_HOST" \
     --public-suffix "$PUBLIC_SUFFIX" \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
     --rate-limit-request-capacity 5 \
@@ -62,7 +77,7 @@ sleep 1.2
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
          --resolve "rl1.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
          --resolve "rl2.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1")
-CURL=(curl --http2-prior-knowledge -sS "${RESOLVE[@]}")
+CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 AUTH=(-H "Authorization: Bearer $TOKEN")
 
 ok() { echo "ok  $1"; }
@@ -98,7 +113,7 @@ ok "POST /v1/signup rl1 + rl2"
 # ── 2. Per-instance request bucket: capacity=5, then 429 ─────────────
 # Hit rl1's URL 5 times — all 200 (starter content's index.html). The
 # 6th must be 429 + Retry-After.
-RL1="http://rl1.${PUBLIC_SUFFIX}:${PORT}"
+RL1="https://rl1.${PUBLIC_SUFFIX}:${PORT}"
 for i in 1 2 3 4 5; do
     code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${RL1}/")
     [[ "$code" == "200" ]] || fail "request ${i}: expected 200, got $code"
@@ -121,7 +136,7 @@ ok "429 body explains the limit"
 
 # ── 3. Different tenant has its own bucket (independence) ────────────
 # rl2 should still be at full capacity.
-RL2="http://rl2.${PUBLIC_SUFFIX}:${PORT}"
+RL2="https://rl2.${PUBLIC_SUFFIX}:${PORT}"
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${RL2}/")
 [[ "$code" == "200" ]] || fail "rl2 request: expected 200, got $code"
 ok "rl2 not affected by rl1's exhaustion (per-instance buckets)"

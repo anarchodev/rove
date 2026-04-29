@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end smoke test for the worker's `/_system/files/*` proxy.
 #
-# Starts a js-worker (which spawns the in-process rove-files-server
+# Starts a loop46 (which spawns the in-process rove-files-server
 # thread at startup), then drives:
 #   - POST /_system/files/acme/upload
 #   - POST /_system/files/acme/deploy
@@ -18,7 +18,7 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/tmp/rove-proxy-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8195}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40295}"
-BIN="${BIN:-./zig-out/bin/js-worker}"
+BIN="${BIN:-./zig-out/bin/loop46}"
 # 64-char hex root token installed at bootstrap.
 ROVE_TOKEN="${ROVE_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
 
@@ -29,7 +29,7 @@ fi
 
 rm -rf "$DATA_DIR"
 
-"$BIN" \
+"$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
@@ -57,9 +57,9 @@ expect() {
 # Upload a file under the existing `acme` tenant. The worker strips
 # the `/_system/files` prefix and proxies the rest (`/acme/upload`)
 # to the code thread.
-code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+code=$(curl -s -o /dev/null -w '%{http_code}' \
     -X POST \
-    -H "Host: acme.test" \
+    -H "Host: acme.loop46.localhost" \
     -H "X-Rove-Path: smoke/index.mjs" \
     -H "Authorization: Bearer $ROVE_TOKEN" \
     --data-binary 'export function handler() { return "smoke"; }' \
@@ -67,18 +67,18 @@ code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
 expect "proxy upload /acme" 204 "$code"
 
 # Missing token → 401 (auth gate).
-code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+code=$(curl -s -o /dev/null -w '%{http_code}' \
     -X POST \
-    -H "Host: acme.test" \
+    -H "Host: acme.loop46.localhost" \
     -H "X-Rove-Path: smoke/index.mjs" \
     --data-binary 'export function handler() { return "smoke"; }' \
     "http://$HTTP_ADDR/_system/files/acme/upload")
 expect "proxy upload /acme (no token)" 401 "$code"
 
 # Wrong token → 401.
-code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+code=$(curl -s -o /dev/null -w '%{http_code}' \
     -X POST \
-    -H "Host: acme.test" \
+    -H "Host: acme.loop46.localhost" \
     -H "X-Rove-Path: smoke/index.mjs" \
     -H "Authorization: Bearer bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
     --data-binary 'export function handler() { return "smoke"; }' \
@@ -87,9 +87,9 @@ expect "proxy upload /acme (wrong token)" 401 "$code"
 
 # Deploy. The body is the new deployment id — acme already had
 # deployment 1 from the bootstrap, so the new one should be >= 2.
-body=$(curl -s --http2-prior-knowledge \
+body=$(curl -s \
     -X POST \
-    -H "Host: acme.test" \
+    -H "Host: acme.loop46.localhost" \
     -H "Authorization: Bearer $ROVE_TOKEN" \
     "http://$HTTP_ADDR/_system/files/acme/deploy" | tr -d '\n')
 case "$body" in
@@ -104,8 +104,8 @@ esac
 
 # Unrelated user traffic still works — the JS handler at acme's
 # `index.js` should serve GET / and return its hit counter.
-code=$(curl -s --http2-prior-knowledge -o /tmp/proxy-home.out -w '%{http_code}' \
-    -H "Host: acme.test" "http://$HTTP_ADDR/?fn=handler")
+code=$(curl -s -o /tmp/proxy-home.out -w '%{http_code}' \
+    -H "Host: acme.loop46.localhost" "http://$HTTP_ADDR/?fn=handler")
 expect "GET / (unrelated JS handler)" 200 "$code"
 if ! grep -q "acme hit count" /tmp/proxy-home.out; then
     echo "FAIL: unexpected body for GET /" >&2
@@ -114,22 +114,22 @@ if ! grep -q "acme hit count" /tmp/proxy-home.out; then
 fi
 
 # /_system/ path that isn't /_system/files/* → 501 stub.
-code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+code=$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $ROVE_TOKEN" \
     "http://$HTTP_ADDR/_system/foo/acme/x")
 expect "GET /_system/foo/.. (unimplemented)" 501 "$code"
 
 # Drive a couple of real requests so the tenant's log.db has
 # something to return, then exercise the /_system/log/* proxy.
-curl -s --http2-prior-knowledge -o /dev/null \
-    -H "Host: acme.test" "http://$HTTP_ADDR/?fn=handler" >/dev/null
-curl -s --http2-prior-knowledge -o /dev/null \
-    -H "Host: acme.test" "http://$HTTP_ADDR/?fn=handler" >/dev/null
+curl -s -o /dev/null \
+    -H "Host: acme.loop46.localhost" "http://$HTTP_ADDR/?fn=handler" >/dev/null
+curl -s -o /dev/null \
+    -H "Host: acme.loop46.localhost" "http://$HTTP_ADDR/?fn=handler" >/dev/null
 # Give the log buffer a moment to flush.
 sleep 1.2
 
 # GET /_system/log/acme/count — proxied through to log-server.
-body=$(curl -s --http2-prior-knowledge \
+body=$(curl -s \
     -H "Authorization: Bearer $ROVE_TOKEN" \
     "http://$HTTP_ADDR/_system/log/acme/count" | tr -d '\n')
 case "$body" in
@@ -138,7 +138,7 @@ case "$body" in
 esac
 
 # GET /_system/log/acme/list?limit=5 — should return JSON with records.
-body=$(curl -s --http2-prior-knowledge \
+body=$(curl -s \
     -H "Authorization: Bearer $ROVE_TOKEN" \
     "http://$HTTP_ADDR/_system/log/acme/list?limit=5")
 case "$body" in
@@ -152,7 +152,7 @@ case "$body" in
 esac
 
 # Missing auth on log endpoint → 401.
-code=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_code}' \
+code=$(curl -s -o /dev/null -w '%{http_code}' \
     "http://$HTTP_ADDR/_system/log/acme/count")
 expect "proxy log count (no token)" 401 "$code"
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end smoke test for the CPU-budget interrupt handler + penalty box.
 #
-# Boots js-worker (single-node) with the `penalty` tenant wired to a
+# Boots loop46 (single-node) with the `penalty` tenant wired to a
 # `while (true) {}` handler, then fires requests and asserts:
 #
 #   1) the first 3 requests return 504 (interrupt fired, handler killed
@@ -19,8 +19,8 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/tmp/rove-penalty-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8092}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40192}"
-WORKER_BIN="${WORKER_BIN:-./zig-out/bin/js-worker}"
-HOST_HEADER="penalty.test"
+WORKER_BIN="${WORKER_BIN:-./zig-out/bin/loop46}"
+HOST_HEADER="penalty.loop46.localhost"
 
 if [[ ! -x "$WORKER_BIN" ]]; then
     echo "error: $WORKER_BIN not found — run 'zig build install' first" >&2
@@ -49,7 +49,7 @@ curl_status() {
     # --http2-prior-knowledge: speak h2c directly (no upgrade dance).
     # -s: silent; -o /dev/null: drop body; -w '%{http_code}': print just code.
     # --max-time 5: cap in case something is truly stuck.
-    curl --http2-prior-knowledge \
+    curl \
          --max-time 5 \
          -s -o /dev/null \
          -w '%{http_code}' \

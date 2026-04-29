@@ -21,13 +21,13 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/tmp/rove-triggers-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8199}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40299}"
-BIN="${BIN:-./zig-out/bin/js-worker}"
+BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee}"
-ADMIN_HOST="api.test"
-PUBLIC_SUFFIX="test"
+ADMIN_HOST="app.loop46.localhost"
+PUBLIC_SUFFIX="loop46.localhost"
 PORT="${HTTP_ADDR##*:}"
-ADMIN_ORIGIN="http://${ADMIN_HOST}:${PORT}"
-TENANT_ORIGIN="http://trigsmoke.${PUBLIC_SUFFIX}:${PORT}"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+TENANT_ORIGIN="https://trigsmoke.${PUBLIC_SUFFIX}:${PORT}"
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
@@ -36,7 +36,7 @@ fi
 
 rm -rf "$DATA_DIR"
 
-"$BIN" \
+"$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
@@ -44,7 +44,6 @@ rm -rf "$DATA_DIR"
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
-    --admin-api-domain "$ADMIN_HOST" \
     --public-suffix "$PUBLIC_SUFFIX" \
     --workers 1 \
     --refresh-interval-ms 100 \
@@ -56,7 +55,7 @@ sleep 1.2
 
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
          --resolve "trigsmoke.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1")
-CURL=(curl --http2-prior-knowledge -sS "${RESOLVE[@]}")
+CURL=(curl -sS "${RESOLVE[@]}")
 AUTH=(-H "Authorization: Bearer $TOKEN")
 
 ok() { echo "ok  $1"; }

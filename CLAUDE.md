@@ -15,7 +15,9 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 ```bash
 zig build              # Build all modules and examples
 zig build test         # Run all unit tests (inline Zig tests across all modules)
-zig build js-worker    # Run the full rove-js worker smoke server
+zig build loop46       # Build/run the loop46 product binary
+                       # (subcommands: `loop46 dev` for local quickstart,
+                       # `loop46 worker` for production)
 zig build echo-server  # Run the TCP echo server example
 zig build h2-echo-server  # Run the HTTP/2 echo server example
 ```

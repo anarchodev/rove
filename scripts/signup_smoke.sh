@@ -20,13 +20,28 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/tmp/rove-signup-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8198}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40298}"
-BIN="${BIN:-./zig-out/bin/js-worker}"
+BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}"
-ADMIN_HOST="api.test"
-PUBLIC_SUFFIX="test"
+ADMIN_HOST="app.loop46.localhost"
+PUBLIC_SUFFIX="loop46.localhost"
 PORT="${HTTP_ADDR##*:}"
-ADMIN_ORIGIN="http://${ADMIN_HOST}:${PORT}"
-ALICE_ORIGIN="http://alice.${PUBLIC_SUFFIX}:${PORT}"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+ALICE_ORIGIN="https://alice.${PUBLIC_SUFFIX}:${PORT}"
+
+# TLS via mkcert (run `loop46 dev` once to bootstrap if missing).
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
+else
+    LOOP46_DATA="${LOOP46_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/loop46}"
+fi
+TLS_CERT="$LOOP46_DATA/dev-cert.pem"
+TLS_KEY="$LOOP46_DATA/dev-key.pem"
+CACERT="$LOOP46_DATA/ca-root.pem"
+
+if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+    echo "error: missing dev TLS at $LOOP46_DATA. Run 'loop46 dev ...' once to bootstrap." >&2
+    exit 2
+fi
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
@@ -35,7 +50,7 @@ fi
 
 rm -rf "$DATA_DIR"
 
-"$BIN" \
+"$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
@@ -43,8 +58,9 @@ rm -rf "$DATA_DIR"
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
-    --admin-api-domain "$ADMIN_HOST" \
     --public-suffix "$PUBLIC_SUFFIX" \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
     --fresh >/tmp/signup-smoke.out 2>&1 &
@@ -56,7 +72,7 @@ sleep 1.2
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
          --resolve "alice.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
          --resolve "bob.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1")
-CURL=(curl --http2-prior-knowledge -sS "${RESOLVE[@]}")
+CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 
 ok() { echo "ok  $1"; }
 fail() {
@@ -118,10 +134,19 @@ status=$(echo "$hdrs" | tail -n1)
 echo "$hdrs" | grep -iq '^location: /#/alice' || fail "redeem missing Location: /#/alice"
 echo "$hdrs" | grep -iq '^set-cookie: rove_session=' || fail "redeem missing session cookie"
 echo "$hdrs" | grep -iq 'httponly' || fail "redeem cookie missing HttpOnly"
+# Full admin CORS envelope: origin + credentials + vary + expose-headers.
+# Same shape every other admin response uses, so caches behave consistently.
+echo "$hdrs" | grep -iq "^access-control-allow-origin: ${ADMIN_ORIGIN}" \
+    || fail "redeem missing CORS allow-origin"
+echo "$hdrs" | grep -iq '^access-control-allow-credentials: true' \
+    || fail "redeem missing CORS allow-credentials"
+echo "$hdrs" | grep -iq '^vary: origin' || fail "redeem missing Vary: origin"
+echo "$hdrs" | grep -iq '^access-control-expose-headers: content-type' \
+    || fail "redeem missing CORS expose-headers"
 # Extract the cookie for the subsequent whoami check.
 cookie=$(echo "$hdrs" | grep -i '^set-cookie:' \
     | sed 's/^[^:]*: //' | awk -F'; ' '{print $1}' | tr -d '\r')
-ok "GET /v1/auth?mt=... → 302 + session cookie + Location:/#/alice"
+ok "GET /v1/auth?mt=... → 302 + session cookie + Location:/#/alice + full CORS envelope"
 
 # ── 6. Cookie authenticates /v1/session ───────────────────────────────
 whoami=$("${CURL[@]}" -H "Cookie: $cookie" "${ADMIN_ORIGIN}/v1/session")
@@ -226,7 +251,7 @@ RESEND_KEY="re_smoke_${RANDOM}_${RANDOM}"
 kill $PID 2>/dev/null || true
 wait $PID 2>/dev/null || true
 
-"$BIN" \
+"$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
@@ -235,9 +260,10 @@ wait $PID 2>/dev/null || true
     --bootstrap-root-token "$TOKEN" \
     --bootstrap-resend-key "$RESEND_KEY" \
     --admin-origin "$ADMIN_ORIGIN" \
-    --admin-api-domain "$ADMIN_HOST" \
     --public-suffix "$PUBLIC_SUFFIX" \
     --platform-email-from "noreply@smoke.test" \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
     >>/tmp/signup-smoke.out 2>&1 &
