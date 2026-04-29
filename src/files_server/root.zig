@@ -184,7 +184,7 @@ const InlineCompiler = struct {
         allocator: std.mem.Allocator,
     ) anyerror![]u8 {
         const self: *InlineCompiler = @ptrCast(@alignCast(ctx_opaque.?));
-        const flags: qjs.EvalFlags = if (std.mem.endsWith(u8, filename, ".mjs"))
+        const flags: qjs.EvalFlags = if (files_mod.isJsModule(filename))
             .{ .kind = .module }
         else
             .{};
@@ -456,7 +456,7 @@ pub fn putFileAndDeploy(
 ) Error!u64 {
     const kind: files_mod.Kind = blk: {
         if (std.mem.startsWith(u8, path, "_static/")) break :blk .static;
-        if (std.mem.endsWith(u8, path, ".mjs") or std.mem.endsWith(u8, path, ".js")) break :blk .handler;
+        if (files_mod.isJsSource(path)) break :blk .handler;
         return Error.InvalidPath;
     };
 

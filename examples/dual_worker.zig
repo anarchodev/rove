@@ -285,7 +285,7 @@ const QjsCompiler = struct {
         allocator: std.mem.Allocator,
     ) anyerror![]u8 {
         const self: *QjsCompiler = @ptrCast(@alignCast(ctx_opaque.?));
-        const flags: qjs.EvalFlags = if (std.mem.endsWith(u8, filename, ".mjs"))
+        const flags: qjs.EvalFlags = if (files_mod.isJsModule(filename))
             .{ .kind = .module }
         else
             .{};

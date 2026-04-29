@@ -544,6 +544,24 @@ fn hashHex(bytes: []const u8, out: *[HASH_HEX_LEN]u8) void {
     }
 }
 
+/// True when `path` should be evaluated as an ES module (`.mjs`)
+/// rather than a classic script (`.js` or anything else). Single
+/// source of truth for the module/script choice — every JS compiler
+/// hook in the tree (worker, files-server, dual-worker example) uses
+/// this to set `qjs.EvalFlags.kind`.
+pub fn isJsModule(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".mjs");
+}
+
+/// True when `path` is a JavaScript handler source file by extension
+/// (`.mjs` or `.js`). Used by the deploy/upload paths to classify
+/// uploads as `Kind.handler` and by file walkers (rove-files-cli) to
+/// pick out compileable sources.
+pub fn isJsSource(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".mjs") or
+        std.mem.endsWith(u8, path, ".js");
+}
+
 /// Canonical allowed path: lowercase letters, digits, and `-_./`. Reject
 /// traversal, empty segments, percent-encoded slashes, absolute paths,
 /// and control bytes. Matches §2.4 of the product plan.
@@ -954,6 +972,27 @@ test "old deployments remain addressable by id after new deploy" {
     var expected: [HASH_HEX_LEN]u8 = undefined;
     hashHex("v1", &expected);
     try testing.expectEqualSlices(u8, &expected, &old.entries[0].source_hex);
+}
+
+test "isJsModule: only .mjs is a module" {
+    try testing.expect(isJsModule("a.mjs"));
+    try testing.expect(isJsModule("nested/path/index.mjs"));
+    try testing.expect(!isJsModule("a.js"));
+    try testing.expect(!isJsModule("index.js"));
+    try testing.expect(!isJsModule("a.html"));
+    try testing.expect(!isJsModule("mjs")); // no leading dot
+    try testing.expect(!isJsModule(""));
+}
+
+test "isJsSource: .mjs and .js" {
+    try testing.expect(isJsSource("a.mjs"));
+    try testing.expect(isJsSource("a.js"));
+    try testing.expect(isJsSource("deep/index.mjs"));
+    try testing.expect(isJsSource("deep/index.js"));
+    try testing.expect(!isJsSource("a.html"));
+    try testing.expect(!isJsSource("a.css"));
+    try testing.expect(!isJsSource("ajs")); // no dot
+    try testing.expect(!isJsSource(""));
 }
 
 test "validatePath rejects traversal, absolute, empty, control chars" {

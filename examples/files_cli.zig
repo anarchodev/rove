@@ -148,8 +148,7 @@ fn runUpload(allocator: std.mem.Allocator, store: *code.FileStore, dir_path: []c
     var uploaded: usize = 0;
     while (try walker.next()) |entry| {
         if (entry.kind != .file) continue;
-        if (!(std.mem.endsWith(u8, entry.path, ".js") or std.mem.endsWith(u8, entry.path, ".mjs")))
-            continue;
+        if (!code.isJsSource(entry.path)) continue;
 
         const bytes = try entry.dir.readFileAlloc(allocator, entry.basename, MAX_SOURCE_BYTES);
         defer allocator.free(bytes);
