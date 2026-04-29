@@ -686,10 +686,11 @@ New collection in js-worker: `events_connections`. Components: `EventsSession { 
 
 - Magic-link primitive: `_magic/{hash}` in root.db, 15-min TTL, single-use.
 - Session cookie: opaque token, revocable, stored in root.db.
-- `POST /v1/signup`: validate, create instance, deploy starter content, enqueue magic-link email.
-- `GET /v1/auth?mt=...`: validate, set cookie, 302 to dashboard.
+- `POST /v1/signup`: validate, **reserve the name** via `pending/{name}` in admin app.db, mint magic, enqueue magic-link email — does **not** allocate the customer tenant yet (abuse-prevention amendment, see below).
+- `GET /v1/auth?mt=...`: validate, **create instance + deploy starter content as part of redemption**, mint session, 302 to dashboard.
 - `POST /v1/logout`: clear cookie, revoke session.
 - Starter content: one `index.mjs` (uses `kv`, returns JSON), one `_static/index.html` that fetches it and shows "your API is live at `{name}.loop46.me`".
+- **Lazy-creation-on-redeem (abuse prevention).** The customer tenant is *not* created at signup — only a `pending/{name}` reservation in admin app.db. Tenant creation, root_writeset propose, and starter-content deploy all happen inside `redeemMagic`, atomically with the session mint. A periodic sweep deletes expired `pending/*` entries to free the name. Without this, an unredeemed signup squats the name and leaks `{id}/app.db`, `{id}/files.db`, and the file-blob directory indefinitely. Detailed flow in [`docs/flows/signup.md`](flows/signup.md).
 
 ### Phase 5 — Minimal admin UI
 
@@ -735,6 +736,51 @@ Three coupled work items, all following the existing file-blob pattern
    of `raft.log.db`; prune committed entries behind it. Single-node-only is
    fine for v1 (snapshot lives next to the raft log); multi-node snapshot
    transfer deferred to the multi-node milestone alongside `S3BlobStore`.
+
+4. **Centralized webhook subsystem.** Today `drainOnce`
+   (`src/outbox/drainer.zig:137`) snapshots the entire instance set every
+   tick and opens a fresh SQLite connection per tenant for an `_outbox/*`
+   prefix scan — ~40k SQLite open+scan ops/sec at 4 ticks × 10k tenants,
+   almost all empty. Replace with a webhook subsystem structurally
+   analogous to files-server / log-server: single node-scoped database
+   `{data_dir}/_webhooks.db` owns all pending/inflight/DLQ state across
+   every tenant; drainer reads from one DB, not N.
+
+   **Handover.** Apply hook on writeset commit: any `_outbox/*` keys
+   trigger `webhook_subsystem.enqueue(id, payload)` into `_webhooks.db`.
+   Enqueue is keyed by `id` (the existing 64-hex outbox suffix) and
+   idempotent — second call with same id is a no-op. After successful
+   delivery, the subsystem proposes a writeset on the source tenant
+   deleting `_outbox/{id}`. Tenant app.db stays clean in steady state.
+   Idempotency makes the handover eventually consistent rather than
+   transactional (SQLite can't span a transaction across two `.db` files
+   under our connection model anyway), which means a crash between
+   commit-and-enqueue is safe: recovery re-enqueues, dedup no-ops where
+   needed, no data loss and no double-send. Receivers already dedup on
+   `X-Rove-Webhook-Id` per the at-least-once contract.
+
+   **`_webhooks.db` is leader-local in v1** (not raft-replicated). A new
+   envelope type would be cleaner architecturally but adds apply paths
+   and more code surface; idempotent recovery makes raft replication
+   unnecessary for correctness. Promote when multi-node failover latency
+   forces the decision.
+
+   **Failover/startup recovery cost — flagged as the v1 tradeoff.**
+   Without raft replication, a new leader (after election OR fresh
+   start) must scan every tenant app.db's `_outbox/*` once to enqueue
+   anything that wasn't drained before the transition. At 10k tenants
+   that's ~10k SQLite opens + prefix-scans during recovery, almost all
+   returning empty — linear in fleet size, and it can dominate failover
+   latency at scale. The same per-tenant-scan cost the steady-state
+   path is being designed to avoid moves to the recovery path. Mitigations,
+   in increasing cost: (a) parallelize the scan across the existing
+   worker thread pool — cheap, do by default; (b) maintain a
+   leader-local persistent index of "tenants with non-zero outbox" in
+   admin app.db so the new leader only opens those tenants — adds an
+   apply-side write per outbox enqueue but bounds recovery to active
+   tenants; (c) promote `_webhooks.db` to a raft target so failover is
+   just leader-promotion with no scan at all. Land (a) by default;
+   measure before committing to (b) or (c).
 
 `S3BlobStore` itself stays deferred (single-host launch uses
 `FilesystemBlobStore`); the work above is ready for it because `BlobStore`
@@ -955,13 +1001,14 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 - Inflight lease + stale-lease sweep covers drainer crash recovery
 - End-to-end smoke in `scripts/webhook_smoke.sh` against a Python echo target
 
-### Phase 4 — Signup + auth — **done**
-- `mintMagic` / `redeemMagic` primitive (15-min TTL, single-use, hashed-at-rest)
-- `POST /v1/signup`: validates name (reserved list + uniqueness) + email, creates instance via `tenant.createInstance`, mints magic, queues signup email via outbox
-- `GET /v1/auth?mt=...`: redeems, creates session, 302 to `/#/{name}` with HttpOnly+Secure+SameSite=Lax cookie
-- `POST /v1/login` (direct-token) + `POST /v1/logout` — cookie auth
-- Starter content (`index.mjs` + `_static/index.html`) deploys during signup through the files writeset
-- Smoke in `scripts/signup_smoke.sh` covers every branch including CAS, replay rejection, Resend-key vs dev-fallback paths
+### Phase 4 — Signup + auth — **partial**
+- `mintMagic` / `redeemMagic` primitive (15-min TTL, single-use, hashed-at-rest) — **done**
+- `POST /v1/signup`: validates name (reserved list + uniqueness) + email, mints magic, queues signup email via outbox — **done** (but currently allocates the customer tenant up-front; see lazy-creation amendment below)
+- `GET /v1/auth?mt=...`: redeems, creates session, 302 to `/#/{name}` with HttpOnly+Secure+SameSite=Lax cookie — **done**
+- `POST /v1/login` (direct-token) + `POST /v1/logout` — cookie auth — **done**
+- Starter content (`index.mjs` + `_static/index.html`) deploys during signup through the files writeset — **done** (moves to redemption time under amendment below)
+- Smoke in `scripts/signup_smoke.sh` covers every branch including CAS, replay rejection, Resend-key vs dev-fallback paths — **done**
+- **NOT yet — lazy-creation-on-redeem (abuse prevention, 2026-04-29).** Today an unredeemed signup permanently squats the name and leaks `{id}/app.db`, `{id}/files.db`, the file-blob directory, and an outbox row. Fix: signup writes only `pending/{name}` → `{email, expires_at_ns, magic_hash_hex}` in admin app.db; `instanceExists`-style duplicate check covers both `instance/*` and non-expired `pending/*`; outbox row for the magic email moves to admin app.db; redemption (`handleAdminAuth`) becomes the place where `tenant.createInstance`, root_writeset propose, `deployStarterContent`, files_writeset propose, `pending/*` cleanup, and session mint all happen. Periodic sweep over `pending/*` deletes expired entries to free the name. Detailed flow in [`docs/flows/signup.md`](flows/signup.md).
 
 ### Phase 5 — Minimal admin UI — **partial**
 - Pages: login, dashboard home, instance detail with Logs + KV + Code tabs — **done**
@@ -972,8 +1019,9 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 - NOT yet: Logs auto-refresh / live tail, Logs filtering (by status / outcome / deployment / path), nested-thread display under `parent_request_id` (waits on Phase 6 trigger / callback log emits), Deploys tab with history + diff, CodeMirror 6 upgrade, draft workflow, signup form on the login page, tape replay click-through (waits on Phase 4 tape capture)
 
 ### Phase 5.5 — Storage scalability — **not started**
-- Promoted into MVP scope 2026-04-29 (this revision). Three deliverables: (a) log batch payload offload to BlobStore — leader writes batch blob, raft entry carries `{tenant_id, batch_hash, manifest}` only, propose gated on blob-write completion, apply fetches blob from the shared backend; (b) tape body capture wired through the pre-staged `tape_refs` + `LogStore.blob` slots, bodies offloaded to `{inst.dir}/log-blobs/` with §2.4's 256 KB truncation; (c) raft snapshot + log compaction integration via `willemt/raft`'s existing hooks, single-node only in v1.
-- Without these, `raft.log.db` grows unbounded under any sustained traffic and bodies (when added) overwhelm both raft replication and per-tenant `log.db`. Estimate: ~43 GB/day in raft.log.db at 1000 req/s × ~500 B per log record, doubled by apply, ~100× worse with bodies.
+- Promoted into MVP scope 2026-04-29 (this revision). Four deliverables: (a) log batch payload offload to BlobStore — leader writes batch blob, raft entry carries `{tenant_id, batch_hash, manifest}` only, propose gated on blob-write completion, apply fetches blob from the shared backend; (b) tape body capture wired through the pre-staged `tape_refs` + `LogStore.blob` slots, bodies offloaded to `{inst.dir}/log-blobs/` with §2.4's 256 KB truncation; (c) raft snapshot + log compaction integration via `willemt/raft`'s existing hooks, single-node only in v1; (d) centralized webhook subsystem with leader-local `_webhooks.db` and idempotent enqueue, replacing the per-tenant scan in `outbox/drainer.zig`.
+- Without (a)–(c), `raft.log.db` grows unbounded under any sustained traffic and bodies (when added) overwhelm both raft replication and per-tenant `log.db`. Estimate: ~43 GB/day in raft.log.db at 1000 req/s × ~500 B per log record, doubled by apply, ~100× worse with bodies.
+- Without (d), the drainer's steady-state tick cost is O(N tenants) — ~40k SQLite open+scan ops/sec at 4 ticks × 10k tenants. The subsystem move-to-`_webhooks.db` design (see §3 Phase 5.5) eliminates the per-tick scan; idempotency on the handover key (the existing 64-hex outbox id) keeps recovery safe across crashes and failover. **Tradeoff: leader-local `_webhooks.db` means a new leader must scan every tenant app.db `_outbox/*` once during recovery — the same per-tenant-scan cost moves from steady-state to the failover path. Linear in fleet size, can dominate failover latency at scale.** Default mitigation is to parallelize that scan across the worker pool; promote to a persistent "tenants with non-zero outbox" index in admin app.db, or to raft-replicating `_webhooks.db`, only when measurement justifies it.
 - The supersede comment in `src/log/root.zig` header that mentions "Phase 6 changes this so the leader uploads the batch blob to S3" is stale terminology — it predates the current PLAN numbering. Cleanup as part of this work.
 
 ### Phase 6 — Triggers — **done 2026-04-27**
