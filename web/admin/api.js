@@ -7,11 +7,12 @@
 // Every RPC call is still a named function on the `__admin__` handler:
 // `?fn=<name>` (GET, URL-encoded JSON args) or `POST {fn, args}`.
 //
-// Two scopes for the admin handler:
-// 1. Bare admin host (`app.loop46.me`) → `kv` = root store (tenant /
-//    domain CRUD + session store).
-// 2. `{id}.app.loop46.me`              → `kv` = {id}'s app.db
-//    (per-tenant KV browsing).
+// Two scopes for the admin handler, both reached on the bare admin
+// host (`app.loop46.me`):
+// 1. No header                  → `kv` = root store (tenant / domain
+//                                  CRUD + session store).
+// 2. `X-Rove-Scope: <id>`       → `kv` = {id}'s app.db (per-tenant
+//                                  KV browsing).
 //
 // Out-of-band (still the native Zig proxies): logs + code via
 // `/_system/log/*` and `/_system/files/*`.
@@ -37,10 +38,8 @@ function adminBase() {
 
 /// Call a named export on the admin handler. `?fn=<name>&args=...` for
 /// GET, JSON body for POST. Sends cookies. `scope` sets the target
-/// tenant; the server rebinds `kv` to that tenant's store on handler
-/// dispatch. Uses an `X-Rove-Scope` header rather than a subdomain
-/// because SameSite=Lax cookies can't flow across subdomains without
-/// PSL coverage (see PLAN §2.1).
+/// tenant via the `X-Rove-Scope` header; the server rebinds `kv` to
+/// that tenant's store on handler dispatch.
 async function rpc(fn, args, { method = "GET", scope = null } = {}) {
   const argsArr = args ?? [];
   const base = adminBase();
