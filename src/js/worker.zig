@@ -499,8 +499,10 @@ pub fn Worker(comptime opts: Options) type {
         /// Borrowed from `WorkerConfig.admin_origin`. See the config
         /// field for semantics. Null when CORS is disabled.
         admin_origin: ?[]const u8,
-        /// Borrowed from `WorkerConfig.admin_api_domain`. Null
-        /// disables admin subdomain routing entirely.
+        /// Borrowed from `WorkerConfig.admin_api_domain`. Hostname
+        /// that hosts the admin API + dashboard. Null disables admin
+        /// routing entirely. Cross-tenant scoping uses the
+        /// `X-Rove-Scope: <id>` header on this host.
         admin_api_domain: ?[]const u8,
         /// Upper 16 bits every `LogStore.nextRequestId()` minted by this
         /// worker stamps onto ids so they don't collide with other
@@ -1600,10 +1602,11 @@ fn tryHandleSystem(
     const after_sub = sys_rest[sub_slash + 1 ..];
 
     // `/_system/tenant/*` and `/_system/kv/*` moved to the
-    // `__admin__` JS handler; callers target `{id}.api.loop46.com/kv`
-    // etc. `/_system/log/*` and `/_system/files/*` remain native —
-    // log queries poll frequently (would meta-log themselves through
-    // JS) and code uploads are byte-heavy (fit the subsystem thread).
+    // `__admin__` JS handler; callers target the bare admin host
+    // (`app.loop46.me/?fn=listKv`, optionally with `X-Rove-Scope`).
+    // `/_system/log/*` and `/_system/files/*` remain native — log
+    // queries poll frequently (would meta-log themselves through JS)
+    // and code uploads are byte-heavy (fit the subsystem thread).
     const inst_slash = std.mem.indexOfScalar(u8, after_sub, '/');
     const sys_instance_id = if (inst_slash) |s| after_sub[0..s] else after_sub;
     if (sys_instance_id.len == 0) {
@@ -1658,12 +1661,12 @@ const ResolveResult = union(enum) {
 /// Decide what to do with a single request pre-handler. Three shapes
 /// fall out of the call:
 ///
-///  1. Admin subdomain (`{id}.{admin_api_domain}` or the bare domain)
-///     — run OPTIONS preflight, public static fallthrough, pre-auth
-///     routes (`/v1/login`, `/v1/logout`, `/v1/signup`, `/v1/auth`),
-///     auth gate, post-auth `/v1/session`, then scope resolution.
-///     Either finalizes (any of the above) or returns the admin
-///     tenant as `handler_inst` and the scoped tenant as `scope_inst`.
+///  1. Admin host (`host == admin_api_domain`) — run OPTIONS preflight,
+///     public static fallthrough, pre-auth routes (`/v1/login`,
+///     `/v1/logout`, `/v1/signup`, `/v1/auth`), auth gate, post-auth
+///     `/v1/session`, then scope resolution via `X-Rove-Scope`. Either
+///     finalizes (any of the above) or returns the admin tenant as
+///     `handler_inst` and the scoped tenant as `scope_inst`.
 ///
 ///  2. Customer subdomain — lookup via `resolveDomain`. Finalizes on
 ///     unknown host or returns the tenant as both handler and scope.
@@ -1684,17 +1687,31 @@ fn resolveRequest(
     rh: h2.ReqHeaders,
     rb: h2.ReqBody,
 ) !ResolveResult {
-    const admin_scope_opt: ?[]const u8 =
-        if (worker.admin_api_domain) |pat| matchAdminSubdomain(host, pat) else null;
+    const is_admin_host = if (worker.admin_api_domain) |pat|
+        pat.len > 0 and std.mem.eql(u8, host, pat)
+    else
+        false;
 
-    if (admin_scope_opt == null) {
+    if (!is_admin_host) {
         const r = worker.tenant.resolveDomain(host) catch |err| {
             std.log.warn("rove-js: tenant.resolveDomain({s}) failed: {s}", .{ host, @errorName(err) });
             try setSimpleResponse(server, ent, sid, sess, 500, "tenant resolution failed\n", allocator);
             return .handled;
         };
         if (r == null) {
-            try setSimpleResponse(server, ent, sid, sess, 404, "unknown domain\n", allocator);
+            const ps = worker.tenant.publicSuffix() orelse "(none)";
+            const ad = worker.admin_api_domain orelse "(none)";
+            const body_owned = std.fmt.allocPrint(
+                allocator,
+                "no tenant for host '{s}'\n" ++
+                    "  admin_api_domain={s}\n" ++
+                    "  public_suffix={s}\n" ++
+                    "  no domain alias registered for this host\n",
+                .{ host, ad, ps },
+            ) catch null;
+            defer if (body_owned) |b| allocator.free(b);
+            const body: []const u8 = body_owned orelse "no tenant for host\n";
+            try setSimpleResponse(server, ent, sid, sess, 404, body, allocator);
             return .handled;
         }
         return .{ .dispatch = .{
@@ -1704,7 +1721,7 @@ fn resolveRequest(
         } };
     }
 
-    // ── Admin-subdomain branch ────────────────────────────────────
+    // ── Admin host branch ─────────────────────────────────────────
     //
     // CORS preflight + static bundle + /v1/* pre-auth + auth + scope.
 
@@ -1795,17 +1812,11 @@ fn resolveRequest(
     }
     const handler_inst = admin_opt.?;
 
-    // Scope resolution: subdomain wins when present (bearer-driven
-    // path). On the bare admin host, the dashboard JS scopes via
-    // `X-Rove-Scope: <id>` because a SameSite=Lax cookie on
-    // `app.loop46.me` can't flow to `{id}.app.loop46.me` without
-    // PSL coverage.
-    const subdomain_scope = admin_scope_opt.?;
-    const header_scope = findHeader(rh, "x-rove-scope") orelse "";
-    const effective_scope: []const u8 = if (subdomain_scope.len > 0)
-        subdomain_scope
-    else
-        header_scope;
+    // Scope resolution: every cross-tenant admin call carries the
+    // target tenant in `X-Rove-Scope: <id>`. Empty header → admin
+    // operates on its own app.db. (The dashboard JS sets this header
+    // explicitly — see `web/admin/api.js`.)
+    const effective_scope = findHeader(rh, "x-rove-scope") orelse "";
 
     const scope_inst: *const tenant_mod.Instance = if (effective_scope.len == 0)
         handler_inst
@@ -2217,11 +2228,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         resp.body = &.{};
         const status_code: u16 = @intCast(@max(@min(resp.status, 599), 100));
 
-        // Admin-subdomain responses carry CORS headers so the browser
-        // UI on a different origin can read them. Non-admin user
-        // traffic is same-origin (it's their tenant's own domain) and
-        // gets empty RespHeaders (plus any Set-Cookies the handler
-        // pushed via `response.cookies`).
+        // Admin-host responses carry CORS headers so the browser UI
+        // on a different origin can read them. Non-admin user traffic
+        // is same-origin (it's their tenant's own domain) and gets
+        // empty RespHeaders (plus any Set-Cookies the handler pushed
+        // via `response.cookies`).
         const handler_cors = if (is_admin_request) worker.admin_origin else null;
         const handler_ct: ?[]const u8 = if (resp.body_is_json) "application/json" else null;
         const handler_resp_hdrs: h2.RespHeaders = try buildHandlerRespHeaders(
@@ -2811,54 +2822,41 @@ fn setErrorResponse(
     try server.reg.move(ent, &server.request_out, &server.response_in);
 }
 
-/// Build a `RespHeaders` from a mix of CORS + optional content-type,
-/// packed into a single allocation compatible with `RespHeaders.deinit`
-/// (fields array at the start, followed by name/value bytes — same
-/// layout `hdrFinalize` produces in rove-h2).
-///
-/// - `cors_origin`: when set, stamps `Access-Control-Allow-Origin`
-///   + `-Allow-Credentials` + `Vary: origin` + `-Expose-Headers`.
-/// - `preflight`: only meaningful with cors_origin; adds `-Allow-
-///   Methods`, `-Allow-Headers`, `-Max-Age` for a 204 preflight.
-/// - `content_type`: when set, adds a `Content-Type` header.
-///
-/// Returns an empty `RespHeaders` when everything is null.
-fn buildSystemRespHeaders(
+/// One (name, value) entry destined for an `h2.RespHeaders` field
+/// array. The string slices must outlive the call to `packRespHeaders`
+/// — typically they're either string literals or owned by the same
+/// allocator the caller passes in.
+const RespHeaderPair = struct { name: []const u8, value: []const u8 };
+
+/// Static CORS headers that accompany every cross-origin admin
+/// response. The dynamic `access-control-allow-origin` is prepended
+/// separately by callers since its value (the configured admin
+/// origin) is per-request.
+const CORS_FIXED_HEADERS = [_]RespHeaderPair{
+    .{ .name = "access-control-allow-credentials", .value = "true" },
+    .{ .name = "vary", .value = "origin" },
+    .{ .name = "access-control-expose-headers", .value = "content-type" },
+};
+
+/// Extra CORS headers emitted only on OPTIONS preflight responses.
+const CORS_PREFLIGHT_HEADERS = [_]RespHeaderPair{
+    .{ .name = "access-control-allow-methods", .value = "GET, POST, DELETE, OPTIONS" },
+    .{ .name = "access-control-allow-headers", .value = "authorization, content-type" },
+    .{ .name = "access-control-max-age", .value = "600" },
+};
+
+/// Pack a flat list of header pairs into an `h2.RespHeaders`,
+/// allocating one combined buffer for the field array + name/value
+/// bytes so the h2 writer can free everything in one call. Returns an
+/// empty (null-fields) header set when `pairs` is empty, saving an
+/// allocation on the same-origin user-traffic path.
+fn packRespHeaders(
     allocator: std.mem.Allocator,
-    cors_origin: ?[]const u8,
-    preflight: bool,
-    content_type: ?[]const u8,
+    pairs: []const RespHeaderPair,
 ) !h2.RespHeaders {
-    const Pair = struct { name: []const u8, value: []const u8 };
-    var pairs_buf: [8]Pair = undefined;
-    var n: usize = 0;
-    if (cors_origin) |o| {
-        pairs_buf[n] = .{ .name = "access-control-allow-origin", .value = o };
-        n += 1;
-        pairs_buf[n] = .{ .name = "access-control-allow-credentials", .value = "true" };
-        n += 1;
-        pairs_buf[n] = .{ .name = "vary", .value = "origin" };
-        n += 1;
-        pairs_buf[n] = .{ .name = "access-control-expose-headers", .value = "content-type" };
-        n += 1;
-        if (preflight) {
-            pairs_buf[n] = .{ .name = "access-control-allow-methods", .value = "GET, POST, DELETE, OPTIONS" };
-            n += 1;
-            pairs_buf[n] = .{ .name = "access-control-allow-headers", .value = "authorization, content-type" };
-            n += 1;
-            pairs_buf[n] = .{ .name = "access-control-max-age", .value = "600" };
-            n += 1;
-        }
-    }
-    if (content_type) |ct| {
-        pairs_buf[n] = .{ .name = "content-type", .value = ct };
-        n += 1;
-    }
+    if (pairs.len == 0) return .{ .fields = null, .count = 0 };
 
-    if (n == 0) return .{ .fields = null, .count = 0 };
-
-    const pairs = pairs_buf[0..n];
-    const fields_size = n * @sizeOf(h2.HeaderField);
+    const fields_size = pairs.len * @sizeOf(h2.HeaderField);
     var strbuf_size: usize = 0;
     for (pairs) |p| strbuf_size += p.name.len + p.value.len;
 
@@ -2885,20 +2883,55 @@ fn buildSystemRespHeaders(
 
     return .{
         .fields = fields_ptr,
-        .count = @intCast(n),
+        .count = @intCast(pairs.len),
         ._buf = buf.ptr,
         ._buf_len = @intCast(buf.len),
     };
 }
 
+/// Append the standard CORS envelope (origin + 3 fixed headers, plus 3
+/// preflight headers when `preflight` is true) to `pairs` starting at
+/// `n.*`. No-op when `cors_origin` is null. Caller must size `pairs`
+/// for at least 7 additional entries.
+fn appendCorsHeaders(
+    pairs: []RespHeaderPair,
+    n: *usize,
+    cors_origin: ?[]const u8,
+    preflight: bool,
+) void {
+    const origin = cors_origin orelse return;
+    pairs[n.*] = .{ .name = "access-control-allow-origin", .value = origin };
+    n.* += 1;
+    for (CORS_FIXED_HEADERS) |h| {
+        pairs[n.*] = h;
+        n.* += 1;
+    }
+    if (preflight) for (CORS_PREFLIGHT_HEADERS) |h| {
+        pairs[n.*] = h;
+        n.* += 1;
+    };
+}
+
+fn buildSystemRespHeaders(
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+    preflight: bool,
+    content_type: ?[]const u8,
+) !h2.RespHeaders {
+    var pairs: [8]RespHeaderPair = undefined;
+    var n: usize = 0;
+    appendCorsHeaders(&pairs, &n, cors_origin, preflight);
+    if (content_type) |ct| {
+        pairs[n] = .{ .name = "content-type", .value = ct };
+        n += 1;
+    }
+    return packRespHeaders(allocator, pairs[0..n]);
+}
+
 /// Assemble a handler-response `RespHeaders` carrying optional CORS
-/// (admin subdomains only) and a `set-cookie` header per entry in
-/// `set_cookies`. Each cookie has already been sanitized by the
-/// dispatcher — this function is purely a mechanical packer.
-///
-/// Returns an empty `RespHeaders` when there's nothing to emit (no
-/// CORS, no cookies), saving an allocation on the common
-/// same-origin user-traffic path.
+/// (admin host only), a `set-cookie` per `set_cookies` entry, and any
+/// handler-defined custom headers. All inputs have already been
+/// sanitized by the dispatcher.
 fn buildHandlerRespHeaders(
     allocator: std.mem.Allocator,
     cors_origin: ?[]const u8,
@@ -2906,78 +2939,28 @@ fn buildHandlerRespHeaders(
     content_type: ?[]const u8,
     custom_headers: []const dispatcher_mod.ResponseHeader,
 ) !h2.RespHeaders {
-    const cors_fields: usize = if (cors_origin != null) 4 else 0;
-    const ct_fields: usize = if (content_type != null) 1 else 0;
-    const total_fields = cors_fields + ct_fields + set_cookies.len + custom_headers.len;
-    if (total_fields == 0) return .{ .fields = null, .count = 0 };
+    const cors_count: usize = if (cors_origin != null) 4 else 0;
+    const ct_count: usize = if (content_type != null) 1 else 0;
+    const total = cors_count + ct_count + set_cookies.len + custom_headers.len;
+    if (total == 0) return .{ .fields = null, .count = 0 };
 
-    const fields_size = total_fields * @sizeOf(h2.HeaderField);
-    var strbuf_size: usize = 0;
-    if (cors_origin) |o| {
-        strbuf_size += "access-control-allow-origin".len + o.len;
-        strbuf_size += "access-control-allow-credentials".len + "true".len;
-        strbuf_size += "vary".len + "origin".len;
-        strbuf_size += "access-control-expose-headers".len + "content-type".len;
-    }
-    if (content_type) |ct| strbuf_size += "content-type".len + ct.len;
-    for (set_cookies) |cookie| strbuf_size += "set-cookie".len + cookie.len;
-    for (custom_headers) |h| strbuf_size += h.name.len + h.value.len;
-
-    const total = fields_size + strbuf_size;
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
-    var off: usize = fields_size;
-    var i: usize = 0;
-
-    const writePair = struct {
-        fn call(
-            b: []u8,
-            off_p: *usize,
-            fp: [*]h2.HeaderField,
-            idx: *usize,
-            name: []const u8,
-            value: []const u8,
-        ) void {
-            const name_start = off_p.*;
-            @memcpy(b[off_p.* .. off_p.* + name.len], name);
-            off_p.* += name.len;
-            const value_start = off_p.*;
-            @memcpy(b[off_p.* .. off_p.* + value.len], value);
-            off_p.* += value.len;
-            fp[idx.*] = .{
-                .name = b[name_start..].ptr,
-                .name_len = @intCast(name.len),
-                .value = b[value_start..].ptr,
-                .value_len = @intCast(value.len),
-            };
-            idx.* += 1;
-        }
-    }.call;
-
-    if (cors_origin) |o| {
-        writePair(buf, &off, fields_ptr, &i, "access-control-allow-origin", o);
-        writePair(buf, &off, fields_ptr, &i, "access-control-allow-credentials", "true");
-        writePair(buf, &off, fields_ptr, &i, "vary", "origin");
-        writePair(buf, &off, fields_ptr, &i, "access-control-expose-headers", "content-type");
-    }
+    const pairs = try allocator.alloc(RespHeaderPair, total);
+    defer allocator.free(pairs);
+    var n: usize = 0;
+    appendCorsHeaders(pairs, &n, cors_origin, false);
     if (content_type) |ct| {
-        writePair(buf, &off, fields_ptr, &i, "content-type", ct);
+        pairs[n] = .{ .name = "content-type", .value = ct };
+        n += 1;
     }
     for (set_cookies) |cookie| {
-        writePair(buf, &off, fields_ptr, &i, "set-cookie", cookie);
+        pairs[n] = .{ .name = "set-cookie", .value = cookie };
+        n += 1;
     }
     for (custom_headers) |h| {
-        writePair(buf, &off, fields_ptr, &i, h.name, h.value);
+        pairs[n] = .{ .name = h.name, .value = h.value };
+        n += 1;
     }
-
-    return .{
-        .fields = fields_ptr,
-        .count = @intCast(total_fields),
-        ._buf = buf.ptr,
-        ._buf_len = @intCast(buf.len),
-    };
+    return packRespHeaders(allocator, pairs[0..n]);
 }
 
 // ── Static dispatch ────────────────────────────────────────────────────
@@ -3370,10 +3353,9 @@ fn setSystemResponse(
     try server.reg.move(ent, &server.request_out, &server.response_in);
 }
 
-/// 429 response with a `Retry-After: <sec>` header. Same shape as
-/// setSimpleResponse but stamps a single header in addition to the
-/// status + body. Body text mentions the wait time so curl-style
-/// clients without header inspection still get the hint.
+/// 429 response with a `Retry-After: <sec>` header. Body text mentions
+/// the wait time so curl-style clients without header inspection still
+/// get the hint.
 fn setRateLimitedResponse(
     server: anytype,
     ent: rove.Entity,
@@ -3387,34 +3369,14 @@ fn setRateLimitedResponse(
         "rate limit exceeded, retry after {d}s\n",
         .{retry_after_sec},
     );
-
-    // Build a single-header RespHeaders pointing to a Retry-After
-    // value rendered into the same arena so we own one buffer rather
-    // than two. Layout: [HeaderField, name_bytes, value_bytes].
-    var ra_buf: [16]u8 = undefined;
-    const ra_str = try std.fmt.bufPrint(&ra_buf, "{d}", .{retry_after_sec});
-
-    const NAME = "retry-after";
-    const fields_size = @sizeOf(h2.HeaderField);
-    const total = fields_size + NAME.len + ra_str.len;
-    const hdr_buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(hdr_buf);
-
-    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(hdr_buf.ptr));
-    var off: usize = fields_size;
-    @memcpy(hdr_buf[off .. off + NAME.len], NAME);
-    const name_off = off;
-    off += NAME.len;
-    @memcpy(hdr_buf[off .. off + ra_str.len], ra_str);
-    fields_ptr[0] = .{
-        .name = hdr_buf[name_off..].ptr,
-        .name_len = NAME.len,
-        .value = hdr_buf[off..].ptr,
-        .value_len = @intCast(ra_str.len),
-    };
+    const ra_str = try std.fmt.allocPrint(allocator, "{d}", .{retry_after_sec});
+    defer allocator.free(ra_str);
+    const hdrs = try packRespHeaders(allocator, &.{
+        .{ .name = "retry-after", .value = ra_str },
+    });
 
     try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 429 });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = fields_ptr, .count = 1 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
     try server.reg.set(ent, &server.request_out, h2.RespBody, .{
         .data = body.ptr,
         .len = @intCast(body.len),
@@ -3508,23 +3470,6 @@ fn findBytecode(
     }
 }
 
-/// Match `host` against the admin API domain pattern. Returns:
-///   - `null`            — host is not an admin request
-///   - `""`              — host is exactly `pattern` (bare admin API)
-///   - `"acme"`          — host is `acme.{pattern}` (scope = acme)
-/// `host` is the hostname without any port (see `hostOnly`). Matching
-/// is case-sensitive; Hosts on the wire are already lower-cased by
-/// HTTP/2 header rules.
-fn matchAdminSubdomain(host: []const u8, pattern: []const u8) ?[]const u8 {
-    if (pattern.len == 0) return null;
-    if (std.mem.eql(u8, host, pattern)) return "";
-    if (host.len <= pattern.len + 1) return null;
-    const dot_before = host.len - pattern.len - 1;
-    if (host[dot_before] != '.') return null;
-    if (!std.mem.eql(u8, host[dot_before + 1 ..], pattern)) return null;
-    return host[0..dot_before];
-}
-
 test "triggerPathToPrefix: catch-all" {
     try std.testing.expectEqualStrings("", triggerPathToPrefix("_triggers/index.mjs").?);
     try std.testing.expectEqualStrings("", triggerPathToPrefix("_triggers/index.js").?);
@@ -3583,17 +3528,6 @@ test "isReservedTriggerPrefix: shallower-than-platform blocked (would catch syst
     try std.testing.expect(isReservedTriggerPrefix("_o"));
     // `_` alone catches everything starting with underscore — all platform prefixes.
     try std.testing.expect(isReservedTriggerPrefix("_"));
-}
-
-test "matchAdminSubdomain" {
-    try std.testing.expectEqual(@as(?[]const u8, null), matchAdminSubdomain("acme.test", "api.loop46.com"));
-    try std.testing.expectEqualStrings("", matchAdminSubdomain("api.loop46.com", "api.loop46.com").?);
-    try std.testing.expectEqualStrings("acme", matchAdminSubdomain("acme.api.loop46.com", "api.loop46.com").?);
-    try std.testing.expectEqualStrings("__admin__", matchAdminSubdomain("__admin__.api.loop46.com", "api.loop46.com").?);
-    // Non-match: wrong suffix.
-    try std.testing.expectEqual(@as(?[]const u8, null), matchAdminSubdomain("acme.api.other.com", "api.loop46.com"));
-    // Non-match: empty pattern guards.
-    try std.testing.expectEqual(@as(?[]const u8, null), matchAdminSubdomain("anything", ""));
 }
 
 fn findHeader(hdrs: h2.ReqHeaders, name: []const u8) ?[]const u8 {
@@ -4345,62 +4279,24 @@ fn handleAdminAuth(
     try server.reg.move(ent, &server.request_out, &server.response_in);
 }
 
-/// Build response headers for the /v1/auth redirect. Packs
-/// `location`, `set-cookie`, and the admin CORS envelope into a
-/// single contiguous buffer — same shape as buildSystemRespHeaders
-/// so the h2 writer can free the block in one `allocator.free`.
+/// Build response headers for the /v1/auth redirect: `location` +
+/// `set-cookie` + the standard admin CORS envelope (when configured).
+/// Same CORS shape as every other admin response so caches `vary` on
+/// origin and clients see `content-type` in `expose-headers` consistently.
 fn buildRedirectRespHeaders(
     allocator: std.mem.Allocator,
     cors_origin: ?[]const u8,
     set_cookie: []const u8,
     location: []const u8,
 ) !h2.RespHeaders {
-    const Pair = struct { name: []const u8, value: []const u8 };
-    var pairs_buf: [6]Pair = undefined;
+    var pairs: [6]RespHeaderPair = undefined;
     var n: usize = 0;
-    pairs_buf[n] = .{ .name = "location", .value = location };
+    pairs[n] = .{ .name = "location", .value = location };
     n += 1;
-    pairs_buf[n] = .{ .name = "set-cookie", .value = set_cookie };
+    pairs[n] = .{ .name = "set-cookie", .value = set_cookie };
     n += 1;
-    if (cors_origin) |o| {
-        pairs_buf[n] = .{ .name = "access-control-allow-origin", .value = o };
-        n += 1;
-        pairs_buf[n] = .{ .name = "access-control-allow-credentials", .value = "true" };
-        n += 1;
-    }
-
-    const pairs = pairs_buf[0..n];
-    const fields_size = n * @sizeOf(h2.HeaderField);
-    var strbuf_size: usize = 0;
-    for (pairs) |p| strbuf_size += p.name.len + p.value.len;
-
-    const total = fields_size + strbuf_size;
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
-    var off: usize = fields_size;
-    for (pairs, 0..) |p, i| {
-        const name_start = off;
-        @memcpy(buf[off .. off + p.name.len], p.name);
-        off += p.name.len;
-        const value_start = off;
-        @memcpy(buf[off .. off + p.value.len], p.value);
-        off += p.value.len;
-        fields_ptr[i] = .{
-            .name = buf[name_start..].ptr,
-            .name_len = @intCast(p.name.len),
-            .value = buf[value_start..].ptr,
-            .value_len = @intCast(p.value.len),
-        };
-    }
-
-    return .{
-        .fields = fields_ptr,
-        .count = @intCast(n),
-        ._buf = buf.ptr,
-        ._buf_len = @intCast(buf.len),
-    };
+    appendCorsHeaders(&pairs, &n, cors_origin, false);
+    return packRespHeaders(allocator, pairs[0..n]);
 }
 
 /// Pull a single named param out of a URL query string. Returns null

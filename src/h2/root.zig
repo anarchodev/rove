@@ -110,6 +110,11 @@ pub const Conn = struct {
     last_active_ns: u64 = 0,
     /// For client connections: the user's connect entity parked in _client_connect_pending.
     pending_connect_entity: Entity = Entity.nil,
+    /// Set true after the first non-empty read on a server-direction
+    /// plaintext connection. Used to gate the HTTP/1.1-vs-h2 preface
+    /// sniff: only the first read can possibly be a non-h2 protocol;
+    /// later frames may have arbitrary leading bytes.
+    first_read_seen: bool = false,
 
     pub fn deinit(_: std.mem.Allocator, items: []Conn) void {
         for (items) |*item| {
@@ -1636,6 +1641,24 @@ pub fn H2(comptime opts: Options) type {
             try self.reg.set(we, &self.io.write_in, rio.WriteBuf, .{ .data = data.ptr, .len = @intCast(data.len) });
         }
 
+        /// True if `bytes` look like the start of an HTTP/1.x request
+        /// rather than the h2 connection preface. The h2 preface is
+        /// `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`, so `PRI ` at byte 0 is
+        /// h2; any other ASCII method token followed by space is HTTP/1.x.
+        /// Only meant to run on the very first read of a connection.
+        fn looksLikeHttp1Request(bytes: []const u8) bool {
+            if (bytes.len < 4) return false;
+            if (std.mem.startsWith(u8, bytes, "PRI ")) return false;
+            const methods = [_][]const u8{
+                "GET ",   "POST ", "HEAD ", "PUT ", "DELE", "OPTI",
+                "PATCH ", "TRAC", "CONN",
+            };
+            for (methods) |m| {
+                if (std.mem.startsWith(u8, bytes, m)) return true;
+            }
+            return false;
+        }
+
         // =============================================================
         // Feed active data to nghttp2
         // =============================================================
@@ -1681,6 +1704,48 @@ pub fn H2(comptime opts: Options) type {
                             }
                         }
                     } else {
+                        // Plaintext server connections: sniff for an
+                        // HTTP/1.x request on the very first read. Without
+                        // this, nghttp2 rejects non-h2 bytes and we close
+                        // silently — the client sees "empty reply", the
+                        // operator sees nothing in the log. Sending a 426
+                        // back makes the protocol mismatch obvious to both.
+                        if (conn_ptr.direction == .server and !conn_ptr.first_read_seen and
+                            data_len > 0 and looksLikeHttp1Request(data_ptr[0..data_len]))
+                        {
+                            const resp =
+                                "HTTP/1.1 426 Upgrade Required\r\n" ++
+                                "Connection: Upgrade, close\r\n" ++
+                                "Upgrade: h2c\r\n" ++
+                                "Content-Type: text/plain\r\n" ++
+                                "Content-Length: 70\r\n" ++
+                                "\r\n" ++
+                                "this server speaks HTTP/2 only; retry with --http2-prior-knowledge\n";
+                            std.log.warn("rove-h2: HTTP/1.x request rejected on plaintext h2 listener (sent 426 Upgrade Required)", .{});
+                            const copy = self.allocator.dupe(u8, resp) catch {
+                                try self.reg.destroy(conn_ent.entity);
+                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                                continue;
+                            };
+                            self.submitWrite(conn_ent.entity, copy) catch {
+                                self.allocator.free(copy);
+                                try self.reg.destroy(conn_ent.entity);
+                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                                continue;
+                            };
+                            // Don't destroy the conn entity here — that
+                            // would cancel the queued write before
+                            // io_uring submits it. The client gets the
+                            // 426 (with Connection: close), closes from
+                            // their end, and the idle-timeout path GCs
+                            // the connection. Mark first_read_seen so
+                            // any further reads on this conn (there
+                            // shouldn't be) don't re-fire the sniff.
+                            conn_ptr.first_read_seen = true;
+                            try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                            continue;
+                        }
+                        conn_ptr.first_read_seen = true;
                         const rv = c.nghttp2_session_mem_recv(conn_ptr.ng_session.?, data_ptr, data_len);
                         if (rv < 0) {
                             try self.reg.destroy(conn_ent.entity);

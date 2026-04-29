@@ -251,6 +251,13 @@ pub const Tenant = struct {
         self.invalidateHostCache();
     }
 
+    /// Read the configured public suffix (for diagnostic / banner use).
+    /// Returns null when wildcard customer-subdomain resolution is
+    /// disabled.
+    pub fn publicSuffix(self: *const Tenant) ?[]const u8 {
+        return self.public_suffix;
+    }
+
     // ── Writes ────────────────────────────────────────────────────────
 
     /// Create an instance: open (or create) its SQLite file, register

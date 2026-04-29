@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end smoke test for rove-js-ctl.
 #
-# Starts a js-worker with a bootstrap root token, builds a small
+# Starts a loop46 with a bootstrap root token, builds a small
 # source tree in /tmp, uses `rove-js-ctl deploy` to upload and
 # publish it against the `acme` tenant, then curls the resulting
 # routes to verify the worker picked up the new deployment.
@@ -12,7 +12,7 @@ DATA_DIR="${DATA_DIR:-/tmp/rove-ctl-smoke}"
 SRC_DIR="${SRC_DIR:-/tmp/rove-ctl-smoke-src}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8197}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40297}"
-BIN="${BIN:-./zig-out/bin/js-worker}"
+BIN="${BIN:-./zig-out/bin/loop46}"
 CTL="${CTL:-./zig-out/bin/rove-js-ctl}"
 TOKEN="${ROVE_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
 export ROVE_TOKEN="$TOKEN"
@@ -24,16 +24,26 @@ fi
 
 rm -rf "$DATA_DIR" "$SRC_DIR"
 
-"$BIN" \
+# Pre-create the acme tenant via `loop46 seed` so the running worker
+# has it in its instance map. (`ctl deploy` writes files but doesn't
+# create the tenant on a live worker — that's a signup-flow concern.)
+SEED_MANIFEST=$(mktemp --suffix=.json)
+cat > "$SEED_MANIFEST" <<'EOF'
+{"tenants": [{"id": "acme", "domains": [], "files": []}]}
+EOF
+"$BIN" seed --data-dir "$DATA_DIR" --manifest "$SEED_MANIFEST"
+
+"$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
     --data-dir "$DATA_DIR" \
+    --public-suffix loop46.localhost \
     --bootstrap-root-token "$TOKEN" \
-    --fresh >/tmp/ctl-smoke.out 2>&1 &
+    >/tmp/ctl-smoke.out 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
+trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true; rm -f "$SEED_MANIFEST"' EXIT
 
 sleep 1.0
 
@@ -75,10 +85,10 @@ grep -q "deployed 2 file" /tmp/ctl-deploy.out \
 sleep 2.5
 
 # Hit the deployed handlers via the named-export RPC.
-got_root=$(curl -s --http2-prior-knowledge -H "Host: acme.test" "http://$HTTP_ADDR/?fn=handler")
+got_root=$(curl -s --http2-prior-knowledge -H "Host: acme.loop46.localhost" "http://$HTTP_ADDR/?fn=handler")
 expect "GET /?fn=handler (ctl-deployed root handler)" "ctl-root" "$got_root"
 
-got_api=$(curl -s --http2-prior-knowledge -H "Host: acme.test" "http://$HTTP_ADDR/api?fn=handler")
+got_api=$(curl -s --http2-prior-knowledge -H "Host: acme.loop46.localhost" "http://$HTTP_ADDR/api?fn=handler")
 expect "GET /api?fn=handler (ctl-deployed sub-route)" "ctl-api" "$got_api"
 
 # Deploy with no token — should fail at the auth gate.
