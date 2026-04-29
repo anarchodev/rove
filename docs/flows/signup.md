@@ -75,10 +75,26 @@ Body parses as `{name, email}`. Synchronous gates:
 - Email format and instance-id format check (`worker.zig:3832`–3849).
 - Reserved-name check — protects names like `app`, `admin`, `__admin__`.
 - `tenant.instanceExists(name)` (`worker.zig:3846`) for a duplicate-name 409.
+- **Account-limit check (Phase 4 amendment, see below).** Counts the
+  requesting email's owned instances + non-expired pending reservations.
+  If `>= max_instances` for the account's tier, return 403 with a
+  "you're at your tier's instance limit" message. v1 hardcodes `1` for
+  free; Phase 10 wires it to the account's plan record.
 
 All validation is in-memory against root.db's instance map. No raft activity
-yet. Failures here return 400/409 cleanly without touching state — once we're
-past line 3851, every failure becomes a 500-class error with partial state.
+yet. Failures here return 400/403/409 cleanly without touching state — once
+we're past line 3851, every failure becomes a 500-class error with partial
+state.
+
+**Sidebar — the account model.** Email is the account identity. A new
+`account/{sha256(email)}/...` namespace in admin app.db owns plan tier
+(`account/{hash}/plan`), instance ownership index
+(`account/{hash}/instances/{instance_id}`), and eventually billing
+state. The same `account/{hash}/plan` lookup will become the single seam
+for *all* per-account caps in Phase 10 (rate limits, DLQ retention,
+blob caps, custom domains, Stripe customer linkage). Seed-manifest
+tenants (operator-provisioned via `loop46 seed`) stay outside this
+model — no email, no `account/*` record, no count toward any limit.
 
 ---
 
@@ -459,18 +475,25 @@ happens when the user clicks the link.
 1. Validate name + email (unchanged).
 2. Duplicate-name check covers **both** `instance/{name}` and non-expired
    `pending/{name}` entries in admin app.db.
-3. Write `pending/{name}` → `{email, expires_at_ns, magic_hash_hex}` in
-   admin app.db.
-4. `tenant.mintMagic` writes `magic/{hash}` exactly as today.
-5. Queue signup email — but the outbox row goes into **admin** app.db,
-   not into the (nonexistent) customer tenant's app.db. The drainer scans
-   admin's outbox along with every other tenant's; nothing else changes.
-6. Return 202.
+3. **Account-limit check.** Look up `account/{sha256(email)}/plan`
+   (default `"free"` if no record yet); count
+   `account/{hash}/instances/*` plus this email's non-expired
+   `pending/*` reservations; reject 403 if `>= max_instances`.
+4. **Ensure the account record exists.** If `account/{hash}/plan` is
+   missing (first signup for this email), write it with default plan.
+5. Write `pending/{name}` → `{email, expires_at_ns,
+   resend_grace_until_ns, magic_hash_hex}` in admin app.db.
+6. `tenant.mintMagic` writes `magic/{hash}` exactly as today.
+7. Queue signup email — outbox row goes into **admin** app.db (not
+   the nonexistent customer's). Drainer scans admin's outbox along
+   with every other tenant's; nothing else changes.
+8. Return 202.
 
 No `createInstance`. No `proposeRootWriteSet`. No starter content. No
 files writeset. No customer-tenant outbox. The only durable artifacts on
-the leader are two small KV rows in admin app.db (`pending/{name}`,
-`magic/{hash}`) plus the outbox row.
+the leader are an `account/{hash}/plan` row (one-time per email), a
+`pending/{name}` row, a `magic/{hash}` row, and the admin-app.db outbox
+row.
 
 ### New redeem flow
 
@@ -481,14 +504,24 @@ the leader are two small KV rows in admin app.db (`pending/{name}`,
 2. Look up `pending/{name}`. Fail if missing or expired or email
    mismatch. (Email mismatch shouldn't happen in practice, but it
    protects against magic-row corruption-and-replay.)
-3. **Atomically** in the same handler:
+3. **Re-check the account limit** (authoritative gate). Count
+   `account/{sha256(email)}/instances/*` + non-expired `pending/*` for
+   this email *excluding* this redemption's own pending. If still over
+   the cap (two simultaneous signups by the same email both passed step
+   3 of the new signup flow; only one wins here), 403 the loser. The
+   loser's `pending/{name}` and `magic/{hash}` rows clean up via the
+   normal sweep.
+4. **Atomically** in the same handler:
    - `tenant.createInstance(name)` — local marker + in-memory map.
    - `proposeRootWriteSet` — replicates the marker.
    - `deployStarterContent` — writes files.db + blobs.
    - `proposeFilesWriteSet` — replicates files.db.
+   - Write `account/{hash}/instances/{instance_id}` to record
+     ownership (this is what makes the account-limit check work going
+     forward).
    - Delete `pending/{name}`.
    - `tenant.createSession` — admin app.db.
-4. 302 → `/#/{instance_id}` with `Set-Cookie: rove_session=...` (unchanged).
+5. 302 → `/#/{instance_id}` with `Set-Cookie: rove_session=...` (unchanged).
 
 The two non-atomic raft proposes (Open question 1) are still here, just
 shifted from signup time to redemption time. Same correctness story; same
