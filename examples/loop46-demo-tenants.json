@@ -1,0 +1,99 @@
+{
+  "_comment": "Demo + benchmark tenants for loop46 development. Consumed by `loop46 seed --manifest <this>`. Each `files` entry maps a `path` (where it lives in the tenant's deployment) to a `source` (where to read the bytes; resolved relative to this manifest file's directory). The `domains` list registers explicit aliases via tenant.assignDomain — for default `{id}.{public_suffix}` resolution you don't need any. `seed_kv` writes string-valued KV pairs to the tenant's app.db before workers open it.",
+  "tenants": [
+    {
+      "id": "acme",
+      "domains": ["acme.test"],
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/acme/index.mjs"},
+        {"path": "api/index.mjs", "source": "loop46-demo-tenants/acme/api/index.mjs"},
+        {"path": "users/index.mjs", "source": "loop46-demo-tenants/acme/users/index.mjs"},
+        {"path": "cbfire/index.mjs", "source": "loop46-demo-tenants/acme/cbfire/index.mjs"},
+        {"path": "cbresult.mjs", "source": "loop46-demo-tenants/acme/cbresult.mjs"}
+      ]
+    },
+    {
+      "id": "globex",
+      "domains": ["globex.test"],
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/globex/index.mjs"}
+      ]
+    },
+    {
+      "id": "penalty",
+      "domains": ["penalty.test"],
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/penalty/index.mjs"}
+      ]
+    },
+    {
+      "id": "readonly",
+      "domains": ["readonly.test"],
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/readonly/index.mjs"}
+      ],
+      "seed_kv": {"greeting": "hello"}
+    },
+    {
+      "id": "randwrite",
+      "domains": ["randwrite.test"],
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/randwrite/index.mjs"}
+      ]
+    },
+    {
+      "id": "hot",
+      "domains": ["hot.test"],
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/hot/index.mjs"}
+      ]
+    },
+    {
+      "id": "spread",
+      "domains": ["spread.test"],
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/spread/index.mjs"}
+      ]
+    },
+    {
+      "id": "write0",
+      "domains": ["write0.test"],
+      "files": [{"path": "index.mjs", "source": "loop46-demo-tenants/write/index.mjs"}]
+    },
+    {
+      "id": "write1",
+      "domains": ["write1.test"],
+      "files": [{"path": "index.mjs", "source": "loop46-demo-tenants/write/index.mjs"}]
+    },
+    {
+      "id": "write2",
+      "domains": ["write2.test"],
+      "files": [{"path": "index.mjs", "source": "loop46-demo-tenants/write/index.mjs"}]
+    },
+    {
+      "id": "write3",
+      "domains": ["write3.test"],
+      "files": [{"path": "index.mjs", "source": "loop46-demo-tenants/write/index.mjs"}]
+    },
+    {
+      "id": "write4",
+      "domains": ["write4.test"],
+      "files": [{"path": "index.mjs", "source": "loop46-demo-tenants/write/index.mjs"}]
+    },
+    {
+      "id": "write5",
+      "domains": ["write5.test"],
+      "files": [{"path": "index.mjs", "source": "loop46-demo-tenants/write/index.mjs"}]
+    },
+    {
+      "id": "write6",
+      "domains": ["write6.test"],
+      "files": [{"path": "index.mjs", "source": "loop46-demo-tenants/write/index.mjs"}]
+    },
+    {
+      "id": "write7",
+      "domains": ["write7.test"],
+      "files": [{"path": "index.mjs", "source": "loop46-demo-tenants/write/index.mjs"}]
+    }
+  ]
+}
