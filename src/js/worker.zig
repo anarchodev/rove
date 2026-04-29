@@ -62,6 +62,7 @@ const tenant_mod = @import("rove-tenant");
 const dispatcher_mod = @import("dispatcher.zig");
 const globals = @import("globals.zig");
 const apply_mod = @import("apply.zig");
+const panic_mod = @import("panic.zig");
 const penalty_mod = @import("penalty.zig");
 const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
@@ -1443,26 +1444,20 @@ fn finalizeBatch(
     // Commit-fail downgrade path: SQLite has already rolled back, so
     // every success-recorded handler gets its body replaced with 503
     // and a `.kv_error` log outcome.
-    txn.commit() catch |err| {
-        std.log.warn("rove-js txn commit (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
-        for (successes.items) |*s| {
-            overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch {};
-            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
-            const console_owned = s.console_owned;
-            const exception_owned = s.exception_owned;
-            s.console_owned = &.{};
-            s.exception_owned = &.{};
-            captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .kv_error, console_owned, exception_owned, s.tape_refs);
-            processed += 1;
-        }
-        successes.clearRetainingCapacity();
-        return processed;
-    };
+    txn.commit() catch |err| panic_mod.invariantViolated(
+        "finalizeBatch.commit",
+        "tenant={s} err={s}",
+        .{ anchor_id, @errorName(err) },
+    );
 
     if (!has_writes) {
         // Pure read-only batch: no raft hop.
         for (successes.items) |*s| {
-            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
+            server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err| panic_mod.invariantViolated(
+                "finalizeBatch.move(read_only)",
+                "tenant={s} err={s}",
+                .{ anchor_id, @errorName(err) },
+            );
             const console_owned = s.console_owned;
             const exception_owned = s.exception_owned;
             s.console_owned = &.{};
@@ -1478,12 +1473,22 @@ fn finalizeBatch(
     // compensating-rollback via undoTxn + downgrade every success.
     const seq = proposeWriteSet(worker, writeset, anchor_id) catch |err| {
         std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
-        store.undoTxn(batch_seq) catch |undo_err| {
-            std.log.err("rove-js undoTxn failed after propose error: {s}", .{@errorName(undo_err)});
-        };
+        store.undoTxn(batch_seq) catch |undo_err| panic_mod.invariantViolated(
+            "finalizeBatch.undoTxn(after_propose_fail)",
+            "tenant={s} txn_seq={d} err={s}",
+            .{ anchor_id, batch_seq, @errorName(undo_err) },
+        );
         for (successes.items) |*s| {
-            overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch {};
-            server.reg.move(s.ent, &server.request_out, &server.response_in) catch {};
+            overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |err2| panic_mod.invariantViolated(
+                "finalizeBatch.overwriteWith503(propose_fail)",
+                "tenant={s} err={s}",
+                .{ anchor_id, @errorName(err2) },
+            );
+            server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err2| panic_mod.invariantViolated(
+                "finalizeBatch.move(propose_fail)",
+                "tenant={s} err={s}",
+                .{ anchor_id, @errorName(err2) },
+            );
             const console_owned = s.console_owned;
             const exception_owned = s.exception_owned;
             s.console_owned = &.{};
@@ -2095,13 +2100,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .instance_id = scope_inst.id,
         };
 
-        txn.?.savepoint() catch |err| {
-            std.log.warn("rove-js savepoint({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
-            try setSimpleResponse(server, ent, sid, sess, 500, "savepoint failed\n", allocator);
-            captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
-            processed += 1;
-            continue;
-        };
+        txn.?.savepoint() catch |err| panic_mod.invariantViolated(
+            "dispatchOnce.savepoint",
+            "tenant={s} err={s}",
+            .{ scope_inst.id, @errorName(err) },
+        );
 
         var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
         var resp = worker.dispatcher.run(
@@ -2114,8 +2117,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             request,
             &budget,
         ) catch |err| {
-            txn.?.rollbackTo() catch |re| std.log.err(
-                "rove-js: rollbackTo after dispatch error failed for {s}: {s} (kv state may be inconsistent)",
+            txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
+                "dispatchOnce.rollbackTo(after_dispatch_error)",
+                "tenant={s} err={s}",
                 .{ scope_inst.id, @errorName(re) },
             );
             const outcome: log_mod.Outcome = if (err == dispatcher_mod.DispatchError.Interrupted)
@@ -2149,8 +2153,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // leaving status at the default 200 and body empty, so without
         // this check we'd ship a 200 empty body.
         if (resp.exception.len > 0) {
-            txn.?.rollbackTo() catch |re| std.log.err(
-                "rove-js: rollbackTo after handler exception failed for {s}: {s} (kv state may be inconsistent)",
+            txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
+                "dispatchOnce.rollbackTo(after_js_exception)",
+                "tenant={s} err={s}",
                 .{ scope_inst.id, @errorName(re) },
             );
             const console_owned = resp.console;
@@ -2169,8 +2174,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (worker.dispatcher.last_kv_error != null) {
             std.log.warn("rove-js handler kv error: {s}", .{@errorName(worker.dispatcher.last_kv_error.?)});
             worker.dispatcher.last_kv_error = null;
-            txn.?.rollbackTo() catch |re| std.log.err(
-                "rove-js: rollbackTo after kv error failed for {s}: {s} (kv state may be inconsistent)",
+            txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
+                "dispatchOnce.rollbackTo(after_kv_error)",
+                "tenant={s} err={s}",
                 .{ scope_inst.id, @errorName(re) },
             );
             try setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
@@ -2179,13 +2185,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             continue;
         }
 
-        txn.?.release() catch |err| {
-            std.log.warn("rove-js release savepoint failed: {s}", .{@errorName(err)});
-            try setSimpleResponse(server, ent, sid, sess, 500, "kv release failed\n", allocator);
-            captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
-            processed += 1;
-            continue;
-        };
+        txn.?.release() catch |err| panic_mod.invariantViolated(
+            "dispatchOnce.release",
+            "tenant={s} err={s}",
+            .{ scope_inst.id, @errorName(err) },
+        );
 
         // Propose the root writeset (if the admin handler made any
         // `platform.root.*` writes). The local writes already landed
@@ -2637,12 +2641,11 @@ pub fn drainRaftPending(worker: anytype) !void {
             // "orphan" and get rolled back by the next startup sweep,
             // silently corrupting state.
             if (wait.store) |store| {
-                store.commitTxn(wait.txn_seq) catch |err| {
-                    std.log.warn(
-                        "rove-js drain: commitTxn(txn_seq={d}) failed: {s}",
-                        .{ wait.txn_seq, @errorName(err) },
-                    );
-                };
+                store.commitTxn(wait.txn_seq) catch |err| panic_mod.invariantViolated(
+                    "drainRaftPending.commitTxn",
+                    "txn_seq={d} err={s}",
+                    .{ wait.txn_seq, @errorName(err) },
+                );
             }
             try server.reg.move(ent, &worker.raft_pending, &server.response_in);
             continue;
@@ -2658,12 +2661,11 @@ pub fn drainRaftPending(worker: anytype) !void {
         // Reverse iteration ensures correct ordering for same-tenant
         // stacks of faulted writes.
         if (wait.store) |store| {
-            store.undoTxn(wait.txn_seq) catch |err| {
-                std.log.err(
-                    "rove-js drain: undoTxn(txn_seq={d}) failed: {s}",
-                    .{ wait.txn_seq, @errorName(err) },
-                );
-            };
+            store.undoTxn(wait.txn_seq) catch |err| panic_mod.invariantViolated(
+                "drainRaftPending.undoTxn",
+                "txn_seq={d} err={s}",
+                .{ wait.txn_seq, @errorName(err) },
+            );
         }
 
         const old_body_ptr: ?[*]u8 = rb.data;

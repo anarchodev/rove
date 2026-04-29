@@ -59,6 +59,7 @@ const std = @import("std");
 const kv = @import("rove-kv");
 const log_mod = @import("rove-log");
 const blob_mod = @import("rove-blob");
+const panic_mod = @import("panic.zig");
 
 pub const Error = error{
     Truncated,
@@ -395,10 +396,11 @@ pub fn applyOne(
 ) void {
     const ctx: *ApplyCtx = @ptrCast(@alignCast(ctx_opaque.?));
 
-    const env = decodeEnvelope(payload) catch |err| {
-        std.log.warn("rove-js apply: envelope decode failed: {s}", .{@errorName(err)});
-        return;
-    };
+    const env = decodeEnvelope(payload) catch |err| panic_mod.invariantViolated(
+        "applyOne.decodeEnvelope",
+        "err={s}",
+        .{@errorName(err)},
+    );
 
     switch (env.type) {
         .writeset => applyWriteSet(ctx, env),
@@ -414,20 +416,17 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope) void {
     // beyond advancing `committed_seq` (done by the caller).
     if (ctx.raft.isLeader()) return;
 
-    const store = ctx.getKv(env.instance_id) catch |err| {
-        std.log.warn(
-            "rove-js apply: getKv({s}) failed: {s}",
-            .{ env.instance_id, @errorName(err) },
-        );
-        return;
-    };
+    const store = ctx.getKv(env.instance_id) catch |err| panic_mod.invariantViolated(
+        "applyWriteSet.getKv",
+        "tenant={s} err={s}",
+        .{ env.instance_id, @errorName(err) },
+    );
 
-    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| {
-        std.log.warn(
-            "rove-js apply: writeset failed for {s}: {s}",
-            .{ env.instance_id, @errorName(err) },
-        );
-    };
+    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
+        "applyWriteSet.applyEncodedWriteSet",
+        "tenant={s} err={s}",
+        .{ env.instance_id, @errorName(err) },
+    );
 }
 
 /// Follower-only: decode the per-tenant files writeset and apply
@@ -438,20 +437,17 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope) void {
 fn applyFilesWriteSet(ctx: *ApplyCtx, env: Envelope) void {
     if (ctx.raft.isLeader()) return;
 
-    const store = ctx.getFilesKv(env.instance_id) catch |err| {
-        std.log.warn(
-            "rove-js apply: getFilesKv({s}) failed: {s}",
-            .{ env.instance_id, @errorName(err) },
-        );
-        return;
-    };
+    const store = ctx.getFilesKv(env.instance_id) catch |err| panic_mod.invariantViolated(
+        "applyFilesWriteSet.getFilesKv",
+        "tenant={s} err={s}",
+        .{ env.instance_id, @errorName(err) },
+    );
 
-    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| {
-        std.log.warn(
-            "rove-js apply: files writeset failed for {s}: {s}",
-            .{ env.instance_id, @errorName(err) },
-        );
-    };
+    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
+        "applyFilesWriteSet.applyEncodedWriteSet",
+        "tenant={s} err={s}",
+        .{ env.instance_id, @errorName(err) },
+    );
 }
 
 /// Follower-only: decode the root writeset and apply it to this
@@ -462,20 +458,17 @@ fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope) void {
     if (ctx.raft.isLeader()) return;
     std.debug.assert(env.instance_id.len == 0);
 
-    const store = ctx.getRootKv() catch |err| {
-        std.log.warn(
-            "rove-js apply: getRootKv failed: {s}",
-            .{@errorName(err)},
-        );
-        return;
-    };
+    const store = ctx.getRootKv() catch |err| panic_mod.invariantViolated(
+        "applyRootWriteSet.getRootKv",
+        "err={s}",
+        .{@errorName(err)},
+    );
 
-    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| {
-        std.log.warn(
-            "rove-js apply: root writeset failed: {s}",
-            .{@errorName(err)},
-        );
-    };
+    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
+        "applyRootWriteSet.applyEncodedWriteSet",
+        "err={s}",
+        .{@errorName(err)},
+    );
 }
 
 fn applyLogBatch(ctx: *ApplyCtx, env: Envelope) void {
@@ -487,20 +480,17 @@ fn applyLogBatch(ctx: *ApplyCtx, env: Envelope) void {
     // to log.db on followers.
     if (ctx.raft.isLeader()) return;
 
-    const store = ctx.getLog(env.instance_id) catch |err| {
-        std.log.warn(
-            "rove-js apply: getLog({s}) failed: {s}",
-            .{ env.instance_id, @errorName(err) },
-        );
-        return;
-    };
+    const store = ctx.getLog(env.instance_id) catch |err| panic_mod.invariantViolated(
+        "applyLogBatch.getLog",
+        "tenant={s} err={s}",
+        .{ env.instance_id, @errorName(err) },
+    );
 
-    store.applyBatch(env.payload) catch |err| {
-        std.log.warn(
-            "rove-js apply: log batch apply failed for {s}: {s}",
-            .{ env.instance_id, @errorName(err) },
-        );
-    };
+    store.applyBatch(env.payload) catch |err| panic_mod.invariantViolated(
+        "applyLogBatch.applyBatch",
+        "tenant={s} err={s}",
+        .{ env.instance_id, @errorName(err) },
+    );
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
