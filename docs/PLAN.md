@@ -691,14 +691,55 @@ New collection in js-worker: `events_connections`. Components: `EventsSession { 
 - `POST /v1/logout`: clear cookie, revoke session.
 - Starter content: one `index.mjs` (uses `kv`, returns JSON), one `_static/index.html` that fetches it and shows "your API is live at `{name}.loop46.me`".
 
-### Phase 5 — Minimal admin UI (MVP boundary)
+### Phase 5 — Minimal admin UI
 
 - Deploy admin UI to `app.loop46.me` **using Phase 2's file API**. Dogfood.
 - Pages: signup/login, dashboard home, instance detail with tabs (Code, KV, Logs, Deploys).
 - CodeMirror 6 in Code tab. Save-draft + Deploy buttons.
 - Deploy history with diff view.
 - Logs tab uses existing `rove-log` surface; add `deployment_id` display.
-- **First customer can now sign up, deploy, see it live, debug.** MVP complete.
+- **First customer can now sign up, deploy, see it live, debug.**
+
+### Phase 5.5 — Storage scalability for production load (MVP boundary)
+
+Production-blocking. Without this, every observability record rides the raft
+log, request/response bodies (once captured) would too, and `raft.log.db`
+grows without bound. Back-of-envelope at ~500 bytes per log record × 1000
+req/s × one tenant: ~43 GB/day into `raft.log.db` alone, doubled by the
+per-tenant `log.db` apply. Captured bodies make this ~100× worse if they
+land in raft. The cluster lasts days or weeks before disk pressure forces
+ops intervention.
+
+Three coupled work items, all following the existing file-blob pattern
+(bytes on `BlobStore`, raft replicates only the manifest):
+
+1. **Log batch payload offload to blob store.** Today the raft entry payload
+   IS the batch bytes (see the now-stale "Phase 6" comment in
+   `src/log/root.zig` header). Change so the leader writes the drained
+   batch to its `BlobStore` (already used for files), and the raft entry
+   carries `{tenant_id, batch_hash, manifest}`. Apply on followers fetches
+   the blob via the shared backend (`FilesystemBlobStore` for single-host,
+   `S3BlobStore` for multi-node). Propose gated on blob-write completion
+   so applies are referentially valid — same constraint file blobs already
+   honor today.
+
+2. **Tape body capture (request + response).** Infrastructure pre-staged:
+   `tape_refs` slot on `LogRecord`, `BlobStore` field on `LogStore`, 256 KB
+   default truncation cap from §2.4. Wire it. Bodies go straight to the
+   per-tenant blob backend (`{inst.dir}/log-blobs/`); only the hash + meta
+   lands in the log record. Truncation marker preserved across replay so
+   the simulator (Phase 12) sees the same bytes.
+
+3. **Raft snapshot + log compaction.** `willemt/raft` has the snapshot hooks
+   but no integration in `src/kv/raft_*`. Snapshot trigger on size threshold
+   of `raft.log.db`; prune committed entries behind it. Single-node-only is
+   fine for v1 (snapshot lives next to the raft log); multi-node snapshot
+   transfer deferred to the multi-node milestone alongside `S3BlobStore`.
+
+`S3BlobStore` itself stays deferred (single-host launch uses
+`FilesystemBlobStore`); the work above is ready for it because `BlobStore`
+is already the abstraction seam. **First customer can now take real
+production traffic without disk-fill within weeks.** MVP complete.
 
 ### Phase 6 — Triggers
 
@@ -929,6 +970,11 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 - Logs tab: newest-first table (time / **deploy** / method / path / status / duration / outcome), click-row drawer with full record incl. console + exception, refresh button, count, **Load older button with cursor pagination** — **done**
 - Log pagination: `LogStore.list` accepts `after: u64` (a `request_id`); `ListResult` returns `next_cursor: u64`. Wire endpoint `/_system/log/{id}/list?limit=N&after=<hex>` returns `{records: [...], next_cursor: "<hex>" | null}`. Admin UI tracks the cursor and appends pages on Load older — **done 2026-04-27**
 - NOT yet: Logs auto-refresh / live tail, Logs filtering (by status / outcome / deployment / path), nested-thread display under `parent_request_id` (waits on Phase 6 trigger / callback log emits), Deploys tab with history + diff, CodeMirror 6 upgrade, draft workflow, signup form on the login page, tape replay click-through (waits on Phase 4 tape capture)
+
+### Phase 5.5 — Storage scalability — **not started**
+- Promoted into MVP scope 2026-04-29 (this revision). Three deliverables: (a) log batch payload offload to BlobStore — leader writes batch blob, raft entry carries `{tenant_id, batch_hash, manifest}` only, propose gated on blob-write completion, apply fetches blob from the shared backend; (b) tape body capture wired through the pre-staged `tape_refs` + `LogStore.blob` slots, bodies offloaded to `{inst.dir}/log-blobs/` with §2.4's 256 KB truncation; (c) raft snapshot + log compaction integration via `willemt/raft`'s existing hooks, single-node only in v1.
+- Without these, `raft.log.db` grows unbounded under any sustained traffic and bodies (when added) overwhelm both raft replication and per-tenant `log.db`. Estimate: ~43 GB/day in raft.log.db at 1000 req/s × ~500 B per log record, doubled by apply, ~100× worse with bodies.
+- The supersede comment in `src/log/root.zig` header that mentions "Phase 6 changes this so the leader uploads the batch blob to S3" is stale terminology — it predates the current PLAN numbering. Cleanup as part of this work.
 
 ### Phase 6 — Triggers — **done 2026-04-27**
 - Path-based registration (PLAN §2.5): `_triggers/users/sessions/index.mjs` fires on writes to `users/sessions/*`. Tree-traversal order across overlapping prefixes — outermost-first BEFORE, innermost-first AFTER. Catch-all via top-level `_triggers/index.mjs` (prefix `""`).

@@ -12,17 +12,23 @@
 //! is hidden by the batch size, not the per-request synchronous write
 //! that shift-js used.
 //!
-//! ## What's NOT in Phase 3
+//! ## What's NOT yet in this module
 //!
-//! - **Request / response bodies.** Deferred to Phase 4 alongside
-//!   rove-tape. The `tape_refs` slot on `LogRecord` is reserved.
-//! - **Body offload to rove-blob.** Phase 4 will populate tape blobs
-//!   in `{inst.dir}/log-blobs/`. The `blob: BlobStore` field is here
-//!   today so callers can construct a complete LogStore now without
-//!   needing to add a parameter later.
-//! - **S3 batch payload split.** Today the raft entry payload IS the
-//!   batch bytes. Phase 6 changes this so the leader uploads the
-//!   batch blob to S3 and the raft entry carries only the index. The
+//! All three of these are scheduled together in PLAN.md Phase 5.5
+//! ("Storage scalability for production load") since they share the
+//! same blob-offload pattern and are mutually load-bearing.
+//!
+//! - **Request / response bodies.** The `tape_refs` slot on
+//!   `LogRecord` is reserved for the body hash + meta.
+//! - **Body offload to rove-blob.** Will populate tape blobs in
+//!   `{inst.dir}/log-blobs/`. The `blob: BlobStore` field is here
+//!   today so callers can construct a complete LogStore without
+//!   needing to add a parameter when the wiring lands.
+//! - **Batch payload offload to BlobStore.** Today the raft entry
+//!   payload IS the batch bytes. Phase 5.5 changes this so the leader
+//!   writes the batch blob to its `BlobStore` (FilesystemBlobStore
+//!   for single-host, S3BlobStore once multi-node lands) and the raft
+//!   entry carries only `{tenant_id, batch_hash, manifest}`. The
 //!   library API doesn't change.
 //! - **Retention / GC.** No automatic sweep. A future
 //!   `purgeOlderThan(ns)` API is planned but not present yet.
@@ -68,7 +74,7 @@ pub const Outcome = enum(u8) {
     unknown_domain = 6,
 };
 
-/// Phase 4 will populate these. Phase 3 keeps them all null.
+/// Phase 5.5 will populate these. Currently all null.
 pub const TapeRefs = struct {
     kv_tape_hex: ?[HASH_HEX_LEN]u8 = null,
     crypto_random_tape_hex: ?[HASH_HEX_LEN]u8 = null,
@@ -98,7 +104,7 @@ pub const LogRecord = struct {
     console: []const u8,
     /// JS exception message if the handler threw. Empty otherwise.
     exception: []const u8,
-    /// Phase 4 tape references. All null in Phase 3.
+    /// Tape references (Phase 5.5). Currently all null.
     tape_refs: TapeRefs = .{},
 
     pub fn deinit(self: *LogRecord, allocator: std.mem.Allocator) void {
@@ -139,7 +145,7 @@ const RECORD_VERSION: u32 = 1;
 
 /// Bit positions in the `flags` byte used by `serializeRecord`.
 /// Each bit signals presence of one optional field. 5 of the 8 bits
-/// are reserved for tape refs (Phase 4).
+/// are reserved for tape refs (Phase 5.5).
 const FLAG_KV_TAPE: u8 = 1 << 0;
 const FLAG_CRYPTO_RANDOM_TAPE: u8 = 1 << 1;
 const FLAG_DATE_TAPE: u8 = 1 << 2;
@@ -163,9 +169,9 @@ pub const LogStore = struct {
     /// Per-tenant log index. Stores `req/{id}` → serialized record
     /// and `meta/next_request_seq` for restart continuity.
     kv: *kv_mod.KvStore,
-    /// Reserved for Phase 4 tape blob storage. Phase 3 doesn't write
-    /// here, but it's wired so callers can construct a complete
-    /// LogStore without adding a parameter when Phase 4 lands.
+    /// Reserved for Phase 5.5 tape blob storage. Currently unused,
+    /// but wired so callers can construct a complete LogStore today
+    /// without needing to add a parameter when the offload lands.
     blob: blob_mod.BlobStore,
     /// Upper 16 bits of every `request_id` minted by this LogStore.
     /// Sourced from raft node id at the worker layer; unique per node.
