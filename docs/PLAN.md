@@ -752,6 +752,64 @@ New collection in js-worker: `events_connections`. Components: `EventsSession { 
 - Single-node only. Multi-node session routing deferred (decide when multi-node lands; same call as the webhook drainer's leader-only model OR a session→node registry).
 - Has no hard predecessor — depends on §2.6 webhooks (done) + existing kv/h2/handler infra. Position in the phase list reflects "non-blocking for first-customer launch"; could be pulled forward into the MVP if SSE turns out to be a hot demo feature.
 
+### Phase 12 — Sim test framework + simulator library (§10.7, §10.8)
+
+Client-side simulator library + deterministic handler test framework. Worker has no simulator role. Independently shippable: customers get sim tests on day one with no live-state dependency.
+
+- New module `src/simulator/` (CLI library only): `root.zig` + `replay_source.zig` + `bytecode_cache.zig` + small `compile.zig`. **No `thread.zig`, no `main.zig` stub** — there's no worker hosting and no separate binary in v1.
+- `ReplaySource` with composable layers: write buffer / overlay / tape / miss policy. Modes (`strict`, `what_if`, `isolated`) are layer combinations.
+- Dependency surface excludes `rove-kv` (no SQLite in the simulator).
+- New CLI subcommand `loop46 simulate` exposes the simulator library directly: synthetic request + kv overlay + mode flag → bundle on stdout.
+- Bundle JSON module extracted from `examples/log_cli.zig` into `src/tape/bundle.zig`.
+- Bundle JSON additions: cross-channel `seq` ordering, structured stack frames, value previews, structured console, `replay_available`. New `tape_entries` field for inline tapes (used by §10.11 dry-run bundles).
+- Module tape wiring at `JS_ResolveModule` — `appendModule` infrastructure exists in `src/tape/root.zig` but has no caller. Needed for multi-file determinism.
+- Test framework (§10.8): `_tests/` directory + `loop46 test` CLI subcommand embedding QuickJS for test code execution outside the handler sandbox. Sim tests run **fully locally** from the working tree.
+- Snapshot machinery (`_tests/__snapshots__/{name}.json`, `--update-snapshots`).
+- `loop46_export_fixture` writes sibling-file pairs (`_tests/from-prod-{id}.mjs` + `_tests/__fixtures__/from-prod-{id}.json`) so fixtures stay offline-runnable.
+- Production-strip of `_tests/` — test files live in dev repo only.
+- Request body capture into the tape (new request-input channel) — needed for fixtures and replays to faithfully reproduce POST bodies.
+- Stale-comment cleanup at `src/log/root.zig:71`.
+
+**No server endpoints in this phase.** No `simulate` rate-limit action, no `/_system/simulate/{id}` route, no thread pool in worker. The worker is unchanged.
+
+Detailed plan: `docs/sim-test-framework.md`.
+
+### Phase 13 — Fixture lifecycle + worker dry-run (§10.9, §10.11)
+
+Tooling for authoring, editing, and refreshing the fixture data sim tests run against — plus the worker-side dry-run dispatch mode that lets customers capture realistic tapes from synthetic requests without persistence.
+
+**Fixture lifecycle** (§10.9):
+- `/_system/kv/{id}/*` admin endpoint (read-only, paginated): `get/{key}`, `?prefix=...&limit=N&after=<key>`, `count?prefix=...`.
+- New CLI subcommand `loop46 kv` (`get`, `list-prefix`, `count`).
+- New CLI subcommand `loop46 fixture` family: `from-keys`, `add`, `remove`, `edit`, `diff`, `refresh`, `merge`.
+- Runner integration: structured "unresolved read on K" error referencing fixture path + missing key. Optional `loop46 test --auto-fix-from <instance>` flag pulls missing keys on-the-fly and writes them back.
+
+**Worker dry-run** (§10.11):
+- `POST /_system/dry-run/{id}` endpoint — runs synthetic request through dispatch with always-rollback + propose-disabled. Returns bundle (response, kv writes, outbox rows, tape entries) inline; nothing persists.
+- Implementation: `dry_run: bool` flag on `dispatchOnce`. Roughly 50 lines.
+- Optional `dry_run` rate-limit action (default: share `request` budget).
+- New CLI subcommand `loop46 dry-run --request '{...}' --instance <id>`.
+- Composite tool: `loop46 fixture from-dry-run --request '{...}' --instance <id> -o <fixture.json>` runs dry-run, extracts the kv tape, writes a fixture file. Single command, end-to-end fixture authoring from a synthetic request.
+
+**Web UI follow-on** (deferred; lands alongside Phase 5 admin UI maturity): "Fixtures" tab in dashboard with same affordances over the same backend endpoints.
+
+Detailed plan: `docs/fixture-lifecycle.md`.
+
+### Phase 14 — AI agent surface (§10.10)
+
+Skill file + CLI polish + scoped tokens. **No MCP server in v1.** Hosted MCP deferred until concrete remote-agent demand surfaces. The local agent path (Claude Code in customer's working tree) is fully served by CLI + skill file.
+
+- `docs/skills/loop46.md` — canonical skill file for Claude Code (and similar agents). Teaches the workflow, tool catalog, common patterns, gotchas.
+- `--json` output mode audit on every CLI subcommand.
+- New CLI subcommand `loop46 doctor` — environment + connectivity readiness check; first-thing-an-agent-runs.
+- Scoped tokens — new token type at `scoped_token/{sha256_hex}` in root.db. Carries a capability subset (`read`, `simulate`, `deploy`, `fixture`, `kv`, etc.) and instance scope. Independent of MCP; security primitive worth having for any agent integration. Mint via dashboard or `loop46 mint-token --capabilities ...`.
+- `/_system/scoped_tokens` admin routes (mint/list/revoke).
+- Dashboard "Tokens" tab.
+
+What's deferred (not in v1): hosted HTTP MCP at `mcp.loop46.me`, `loop46-mcp` binary, MCP wire-format code. Build when a real remote-agent use case shows up.
+
+Detailed plan: `docs/agent-surface.md`.
+
 ## 4. Deferred to v2
 
 These are explicitly not in v1 so future sessions don't accidentally design around them.
@@ -893,6 +951,18 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 
 ### Phases 7, 9, 10 — **not started**
 
+### Phase 12 — Sim test framework + simulator library — **not started**
+- Locked in §10.7 + §10.8 (2026-04-28). Detailed plan in `docs/sim-test-framework.md`. **Pure client-side**: simulator module (`src/simulator/`) library-linked into the `loop46` CLI; `ReplaySource`; bundle module extraction; bundle JSON additions; module tape wiring; request body capture; `_tests/` directory + `loop46 test` and `loop46 simulate` CLI subcommands; snapshot machinery; sibling-file fixture export; production strip of `_tests/`. **No server endpoints, no thread pool, no rate-limit action** — worker is unchanged.
+
+### Phase 13 — Fixture lifecycle + worker dry-run — **not started**
+- Locked in §10.9 + §10.11 (2026-04-28). Detailed plan in `docs/fixture-lifecycle.md`. Two related pieces: (1) fixture-lifecycle tools (`/_system/kv/{id}/*` admin endpoint, `loop46 kv`, `loop46 fixture` CLI families, runner `--auto-fix-from`); (2) worker dry-run dispatch mode (`POST /_system/dry-run/{id}` endpoint, `dry_run` flag on `dispatchOnce`, `loop46 dry-run` + `loop46 fixture from-dry-run` CLIs). The dry-run path is ~50 lines added to existing dispatch; fixture lifecycle reuses the same kv admin endpoint that backs dashboard KV browser.
+
+### Phase 14 — AI agent surface — **not started**
+- Locked in §10.10 (2026-04-28). Detailed plan in `docs/agent-surface.md`. Pieces: skill file at `docs/skills/loop46.md`, `--json` output audit across CLI, `loop46 doctor` env-check subcommand, scoped tokens at `scoped_token/{hash}` with capability + instance subsets, `/_system/scoped_tokens` admin routes, dashboard "Tokens" tab. **No MCP server in v1** — hosted MCP deferred until remote-agent demand surfaces.
+
+### Future — Browser-side replay (Chrome extension) — not yet phased
+- Locked architecturally in §10.12 (2026-04-28). Implementation deferred until Phase 5 admin UI matures and a "click in dashboard → DevTools-style replay" UX becomes the natural next step. Will be a separate repo (Chrome extension toolchain), consuming the bundle JSON + tape blob format from existing server endpoints. No work item in the current phase list.
+
 ### Blob replication (multi-node prerequisite)
 - Raft envelopes now include `type=3` files_writeset replicating `{id}/files.db` across nodes — **done**
 - Blob bytes (`{id}/file-blobs/*`) **still local to the leader**. Multi-node setups need one of:
@@ -902,7 +972,7 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 
 ## 10. Architecture decisions post-2026-04-17
 
-Six architectural calls were made between 2026-04-17 and 2026-04-21. Captured here so future sessions don't re-derive them.
+Architectural calls captured here so future sessions don't re-derive them. §10.1–§10.6 from 2026-04-17 to 2026-04-21; §10.7–§10.12 added and iterated 2026-04-28 (earlier drafts had different §10.9 / §10.11 for trial deploys + live-state acceptance tests; both dropped after design review favored the FP-pure client-side simulator path).
 
 ### 10.1 Admin is a real instance with a `platform` capability
 
@@ -967,6 +1037,212 @@ The 750-line `dispatchOnce` loop body was split into named helpers:
 - `finalizeBatch` — end-of-walk commit + propose + move
 
 `dispatchOnce` ended at 388 lines, reading as phase selection. The per-handler dispatch body (anchor → savepoint → run → release → success-record) stays inline — it's linear, context-heavy, and extracting it would threaten more parameters than readability gained.
+
+### 10.7 Simulator primitive (purely client-side, KV-less)
+
+**Change**: Loop46 gains a simulator primitive — `simulate(request, source_overlay, kv_overlay, tape, mode, miss_policy) → bundle` — implemented as a **client-side library only**. The worker has no simulator role: no `/_system/simulate/{id}` endpoint, no thread pool, no `simulate` rate-limit action. The worker's job is dispatch (live or dry-run, §10.11) + observation (recording tapes); simulation is purely a client concern.
+
+Two implementations of the simulator share a contract (bundle JSON shape + tape blob format) but otherwise live independently:
+
+- **CLI simulator** (Zig + QuickJS, this repo at `src/simulator/`) — linked into `loop46 test` and `loop46 simulate`. Hermetic, deterministic, used in CI and inner-loop dev. Reads handler source from the working tree (or fetched via existing files-server endpoints when targeting a deployment id).
+- **Browser simulator** (JS + V8 via Chrome DevTools Protocol, separate repo, future per §10.12) — interactive replay debugging in the browser. Loads tape + source from server endpoints, stubs Loop46 globals (`kv`, `webhook`, `email`, etc.) via injected JS, lets the developer use real DevTools (breakpoints, stepping, variable inspection).
+
+**Why purely client-side**: every v1 caller has either local source (CLI) or sufficient browser plumbing (the extension fetches source as needed). The server-side use cases that motivated a worker endpoint — single-request simulation for hosted MCP, cross-machine remote agents — are all deferred to v2. The worker is a recording device + dispatcher; observation flows worker → client; the client does all the compute.
+
+A previously-considered second primitive ("trial-run" against live state, with savepoint rollback) was dropped — it conflicted with the FP story (non-deterministic), and the use cases it served (testing against current data, pre-deploy canaries) are better served by snapshot-derived fixtures (§10.9), running candidates on a separate Loop46 instance (multi-instance staging story), or the dry-run dispatch mode (§10.11).
+
+**Read resolution stack** in `ReplaySource` (precedence high → low; each read records its source in the output bundle):
+
+1. Request-scoped write buffer — handler's own writes during this simulation. Always active so read-after-write within a single request works. Discarded at simulation end.
+2. Overlay map — supplied `{key → value}` for tests / what-if. Optional.
+3. Tape — recorded values from a prior request. Optional.
+4. Miss policy — `fail` (structured "unresolved read on K") or `not_found`. Per-simulation.
+
+**No live KV pass-through layer.** Live state mixing was rejected as conceptually muddy (point-in-time mismatch between tape and live data leads to misleading results).
+
+**Modes** are layer combinations:
+- `strict` (1, 3, miss=fail) — apples-to-apples replay; unresolved reads surface as a first-class signal.
+- `what_if` (1, 2, 3, miss=not_found) — overlay over tape.
+- `isolated` (1, 2, miss=not_found) — overlay only, no tape. The mode sim tests use.
+
+**Why `ReplaySource` is KV-less**: the simulator's dependency surface deliberately excludes `rove-kv` / SQLite. It links rove-tape (parse side only — recording is one-way), rove-files (manifests, when fetching from server), rove-blob (source bytes, when fetching from server), rove-qjs (execution), and the JS API surface from `src/js/globals.zig`. This makes the library CLI-linkable; for the browser implementation, the equivalent stubs are written in JS.
+
+**Safety invariants** (load-bearing):
+- Writes go to the buffer only and are discarded at simulation end. No promotion path through any tool, endpoint, or mode.
+- Outbox effects (`webhook.send`, `email.send`) are recorded as "would-have-enqueued" rows in the bundle; the delivery worker never sees them. Loop46's transactional outbox is declarative, so this is structural.
+- "Re-process this failed request after my fix" is **not** a simulation operation. Real re-processing is a normal HTTP request against a new deployment.
+
+**Side effects**:
+- Bundle JSON format from `rove-log-cli bundle` (`examples/log_cli.zig:210`) becomes the canonical shape consumed by both CLI sim and the future Chrome extension. Code moves into a shared module (`src/tape/bundle.zig`).
+- Tape capture (`uploadTapes` in `src/js/worker.zig`) is unchanged; missing pieces are `ReplaySource` in the CLI simulator (`src/js/globals.zig:862-863` flagged the gap), request body capture, and module tape wiring.
+- New module `src/simulator/` (CLI library only, no thread pool, no standalone-binary stub): `root.zig` + `replay_source.zig` + `bytecode_cache.zig` + small `compile.zig`.
+- New CLI subcommands `loop46 simulate` and `loop46 test` (the latter spec'd in §10.8) link the simulator library.
+- The browser implementation is a separate work item with its own architectural decision (§10.12) — it's not built in v1.
+- Implementation plan: `docs/sim-test-framework.md`.
+
+### 10.8 Sim test framework (deterministic, local-only)
+
+**Change**: Loop46 ships a first-class in-deployment sim test framework. Tests live in a reserved `_tests/` directory of the developer's source repo, are imperative async JS, and run **entirely locally** via a `loop46 test` CLI subcommand that embeds QuickJS and links the simulator library (§10.7). No worker contact, no auth, works offline.
+
+`_tests/` is a platform-prefix-guarded directory (alongside `_static/`, `_triggers/`, etc.). Customer handlers and trigger cascades cannot read or write into it.
+
+**Injected globals** (test code receives these as a destructured argument):
+- `simulate(req)` — invokes the simulator library in-process; reads handler source from the working tree.
+- `expect(value)` — assertions.
+- `snapshot(name, value)` — captures on first run, asserts structural equality on subsequent runs.
+
+**Why first-class**: Loop46's simulator primitive (§10.7) makes handler tests structurally different from typical JS testing — no mocks needed (handlers can't `fetch`, can't bypass `kv`, can't directly send email; their I/O is overlay-able), side effects asserted not dispatched (would-have-enqueued outbox rows checked, never delivered), deterministic by construction (tape-pinned time/random + overlay-pinned state = bit-reproducible). Encoding this as a platform feature rather than leaving customers to choose a framework gives the agent loop a clean surface: production failure → `loop46_export_fixture` writes a sim test → fix → run tests → deploy.
+
+**Why local-only is load-bearing**:
+- Sim tests run from the working tree against the locally-linked simulator. No worker contact. Pre-commit hooks, TDD, CI sim phase all work offline.
+- The worker has no simulation role at all (§10.7) — sim test workloads never hit it. The fixture-authoring story uses dry-run dispatch (§10.11) when capturing realistic state from live instances.
+- Bisect on sim tests is local — fetch each historical deployment's source via `/_system/files/{id}/source/{hash}`, run sim suite locally per deployment, find the regression point. No remote simulation needed.
+- Browser-side replay debugging (§10.12) is a separate Chrome-extension implementation that consumes the same tape + bundle format, also without server-side simulator help.
+
+**Snapshot mechanism**:
+- `snapshot(name, value)` compares against `_tests/__snapshots__/{name}.json` in the dev repo.
+- First run captures; subsequent runs assert structural equality, fail with diff on mismatch.
+- Regenerate via `loop46 test --update-snapshots`. Snapshots commit alongside test code.
+
+**Fixture sibling-file pattern** (for `loop46_export_fixture`):
+- Export writes two files atomically: `_tests/from-prod-{request_id}.mjs` (the test code) and `_tests/__fixtures__/from-prod-{request_id}.json` (captured tape + recorded bundle for the snapshot).
+- The runner detects fixtures referenced by `from_recorded_request_id` in `simulate(...)` calls and loads them from disk instead of any network call. Tests run offline forever, never re-fetching from the server.
+
+**Side effects**:
+- New platform-reserved path `_tests/`. Lives in dev repo only — **stripped from production manifests at deploy time**. Production deployments never include test code.
+- Snapshot files (`__snapshots__/`) and fixtures (`__fixtures__/`) follow the same strip rule.
+- New CLI subcommand `loop46 test`. Embeds QuickJS + simulator library.
+- Fixture-management primitives (§10.9) handle the editing / refreshing workflow that arises when handler changes require new fixture data.
+- Implementation plan: `docs/sim-test-framework.md`.
+
+### 10.9 Fixture lifecycle (curated observations)
+
+**Change**: Loop46 ships fixture-management tooling for sim tests. Fixtures are **curated observations of production state** — files in `_tests/__fixtures__/` that hold the kv data a test uses as `simulate`'s overlay. Two paths to authoring fixtures:
+
+1. **From a recorded request** (already in §10.8) — `loop46_export_fixture --request <id>` promotes a real production observation into a sibling-file fixture pair. Self-contained, snapshot-style.
+2. **From live state, selectively** (this section) — pull specific keys from a target instance into a fixture. Lets the author construct realistic scenarios from production data without dumping the entire instance.
+
+A "snapshot the whole instance" tool was considered and rejected — too coarse, expresses no intent, instantly stale. The right primitives are targeted: pull these keys, edit this fixture, refresh that one, diff fixture-vs-prod.
+
+**Why**: sim tests are pure functions over (request, overlay, source). Realistic test data is the hardest part of authoring tests. As handlers evolve and read new keys, fixtures need updates. The lifecycle tools (add missing keys, refresh stale ones, diff drift) make fixture maintenance ergonomic without breaking the FP story — fixtures stay frozen JSON files committed to the dev repo, used as deterministic inputs to pure functions.
+
+**Primitive set**:
+
+Reading from live state:
+- `/_system/kv/{id}/*` admin endpoint (read-only, paginated): `get/{key}`, `?prefix=...&limit=N&after=<key>`, `count?prefix=...`. Same endpoint backs the dashboard KV browser.
+- `loop46 kv get <key>` / `list-prefix <prefix>` / `count <prefix>` — CLI wrappers.
+
+Authoring + editing fixtures:
+- `loop46 fixture from-keys <key>... [--from <instance>] -o <fixture>` — pull a curated slice into a fixture file.
+- `loop46 fixture add <fixture> <key> [--value <v> | --from <instance>]` — fill in missing keys.
+- `loop46 fixture remove <fixture> <key>`.
+- `loop46 fixture edit <fixture>` — opens $EDITOR.
+- `loop46 fixture diff <fixture-a> [<fixture-b> | --against <instance>]` — show drift.
+- `loop46 fixture refresh <fixture> [--from <instance>] [--key <k>]` — re-pull keys currently in the fixture.
+- `loop46 fixture merge <a> <b> -o <c>` — combine.
+
+Runner integration:
+- Structured "unresolved read on K" error referencing the fixture path + missing key. Easy to act on programmatically.
+- Optional `loop46 test --auto-fix-from <instance>` — on unresolved read, pulls the value, writes back to the fixture, retries. Single-pass fixture filling.
+
+**Side effects**:
+- New admin endpoint `/_system/kv/{id}/*` (also useful for dashboard KV browser, scoped-token auditing, agent ad-hoc state queries).
+- New `loop46 kv` and `loop46 fixture` CLI subcommand families.
+- Web UI follow-on (deferred): "Fixtures" tab in the dashboard with the same affordances over the same backend endpoints. Likely lands alongside Phase 5 admin UI maturity.
+- Implementation plan: `docs/fixture-lifecycle.md`.
+
+### 10.10 AI agent surface — CLI + skill file in v1, hosted MCP deferred
+
+**Change**: Loop46's primary AI agent surface in v1 is **the CLI itself**, taught to agents via a skill file. **No MCP protocol server, no MCP wire-format code, no separate `loop46-mcp` binary in v1.** Hosted MCP at `mcp.loop46.me` is deferred until concrete remote-agent demand surfaces (third-party integrations, cloud agents that don't run on the customer's machine).
+
+**Why this beats the original "MCP server as separate binary" plan**:
+
+- The dominant agent use case (Claude Code, Codex, Cursor running in the customer's working tree) already has shell access. Skill file + CLI is genuinely sufficient — agents read `--help`, compose subcommands, parse JSON output.
+- The MCP wins (typed schemas, server-side rate limiting, token isolation, cross-machine access) only matter for **remote/hosted** scenarios. None apply to local agents on the customer's machine.
+- The MCP spec has been a moving target (SSE → Streamable HTTP). Building against it now means tracking spec churn; deferring lets it settle.
+- The biggest concrete agent-security win (token isolation) is worth building independently of MCP. See "scoped tokens" below.
+- Loop46's actual differentiator is the FP-pure simulation/test/fixture story (§10.7–§10.9). Wrapping it in MCP is icing; if the cake is right, customers don't need the icing yet.
+
+**What ships in v1**:
+- **Skill file** at `docs/skills/loop46.md` (or the path Anthropic's skill convention lands on). Teaches the canonical workflow (edit handler → `loop46 test` → fix fixtures via `loop46 fixture *` → `loop46 deploy`), the tool catalog, common patterns, gotchas, auth setup.
+- **`--json` output mode** on every CLI subcommand for parseable structured results.
+- **`loop46 doctor`** — environment + connectivity readiness check; the first thing an agent runs to confirm working tree, deployment, and credentials are in order.
+- **Scoped tokens** — new token type alongside session/root, stored at `scoped_token/{sha256_hex}` in root.db. Carries a capability subset (`read`, `simulate`, `deploy`, `fixture`, `kv`, etc.) and an instance scope. Customer mints via dashboard or `loop46 mint-token --capabilities ...`. Agent runs with `LOOP46_TOKEN=<scoped>`; if compromised, blast radius is contained to the granted capabilities. **Independent of MCP** — a security primitive worth having for any agent integration (CI bots, hosted automations, third-party tools).
+
+**What's deferred**:
+- Hosted HTTP MCP at `mcp.loop46.me`. Build when a real remote-agent use case demands it. Until then, no protocol code in the repo, no subdomain reservation.
+- `loop46-mcp` binary. Doesn't exist in v1.
+- All MCP-specific tool schemas. They're skill-file documentation instead.
+
+**Side effects**:
+- New scoped-token install/auth functions in `src/tenant/root.zig` (analogues of `installRootToken` / `authenticate`).
+- New `/_system/scoped_tokens` admin routes for mint/list/revoke.
+- Dashboard "Tokens" tab.
+- New `loop46 doctor` and `loop46 mint-token` CLI subcommands.
+- Implementation plan: `docs/agent-surface.md`.
+
+### 10.11 Worker dry-run dispatch mode
+
+**Change**: a new `POST /_system/dry-run/{instance_id}` endpoint runs a synthetic request through the existing dispatch path with one behavioral change: the savepoint is **always rolled back, never proposed to raft**. Returns the bundle inline (response, would-have-written kv ops, would-have-enqueued outbox rows, captured tape entries). Nothing persists.
+
+**Why**: complements §10.9 fixture lifecycle. Customers and agents need a way to capture **realistic tape data** for use as test fixtures — running a synthetic request through the real handler against current state, observing what it reads, but without polluting state. Without this, the only way to get a tape is to fire a real persistent request.
+
+**Why this isn't a "simulator"**: dry-run is literal dispatch — same handler bytecode (precompiled, from the deployment manifest), same kv access (real `app.db` reads), same time/random (wall clock + OS), same trigger cascades. The only behavioral difference is "always rollback the savepoint and skip the propose." It's not running modified source, it's not using overlays, it's not replaying a tape. The simulation primitive (§10.7, purely client-side) handles all the *what-if* / *modified-source* cases; dry-run handles only *what would real dispatch do here, without committing*.
+
+**Endpoint surface**:
+```
+POST /_system/dry-run/{instance_id}
+{
+  "request": { "method": "...", "host": "...", "path": "...", "headers": {...}, "body": "..." }
+}
+→ 200: <bundle JSON>   // includes inline tape entries; nothing persisted to log-blobs
+```
+
+**Implementation**: a small flag on `dispatchOnce` (`dry_run: bool`) plus a new admin route. Roughly 50 lines:
+- Set `dry_run` on the dispatch state.
+- After the handler runs, snapshot the writeset + outbox rows + tape entries from `TrackedTxn` and the recorder.
+- Always rollback the savepoint regardless of handler success/failure.
+- Skip the raft propose unconditionally.
+- Return the snapshot inline as a bundle JSON instead of persisting to log-blobs.
+
+**Cost shape — close to read-only**: dry-run skips the two expensive parts of a write request — the SQLite commit fsync AND the raft propose (network roundtrips + per-follower fsyncs in multi-node). What remains is handler CPU + SQLite reads + the in-memory writeset/tape capture. In multi-node setups where raft propose dominates write latency by several ms, dry-run is essentially as cheap as a synthetic read. Customers and agents can dry-run liberally without worrying about expensive operations or live-write contention.
+
+**Side effects**:
+- New admin endpoint, gated behind the existing admin auth + scope.
+- Optional `dry_run` rate-limit action. Because the cost profile is closer to reads than writes, a more permissive default than `request` is justifiable. v1 simplest: share the `request` budget. Future tuning can give dry-run its own (more generous) bucket once load shapes are observed.
+- Bundle JSON shape adds an inline `tape_entries` field (or includes the tape as a parsed structure) since dry-run tapes don't get a blob hash. Dual-purpose: live dispatch's bundle references tape blobs by hash (persistent); dry-run bundle includes them inline (ephemeral). Test/sim consumers handle both.
+- New CLI: `loop46 dry-run --request '{...}' --instance <id> [--json]`. Prints bundle on stdout.
+- New fixture authoring tool (Phase 13): `loop46 fixture from-dry-run --request '{...}' --instance <id> -o <fixture.json>` composes `dry-run` + extract-kv-tape + write fixture file.
+- Worker dispatch path gets one new flag; the rest of the production hot path is unchanged.
+- Implementation plan: detail in `docs/fixture-lifecycle.md`.
+
+### 10.12 Browser-side replay via Chrome extension (deferred)
+
+**Change**: the dashboard replay viewer described in §2.9 ("DevTools click-through to the dashboard replay viewer") is implemented as a **Chrome extension** that uses the Chrome DevTools Protocol (CDP) to run handler source in the browser's V8 with stubbed Loop46 globals. **Not built in v1** — flagged here so future-us doesn't accidentally re-derive a different approach (e.g., quickjs-wasm).
+
+**Why CDP + V8 instead of quickjs-wasm**:
+- **Real DevTools, free**: with CDP access, the extension gets breakpoints, stepping, variable inspection, source maps — all the standard debugging affordances Chrome already provides. Implementing this on top of quickjs-wasm would mean reinventing a debugger UI.
+- **No WASM toolchain**: shipping quickjs-wasm + a custom debugger would mean a ~MB+ wasm binary plus DevTools-equivalent UI. The extension is much smaller.
+- **Familiar developer experience**: anyone who has used Chrome DevTools recognizes the workflow; no new mental model.
+- **Shared contract**: the extension consumes the same bundle JSON + tape blob format that the CLI simulator produces. Inputs come from existing server endpoints (`/_system/log/{id}/list` + `/blob/{hash}` + `/_system/files/{id}/source/{hash}`). No server-side simulator help needed.
+
+**Tradeoffs**:
+- **V8 vs QuickJS engine differences** (BigInt, regex edge cases, etc.) — not bit-identical with the CLI simulator. For interactive debugging this is acceptable; the goal is "let the developer see what happened and try changes," not strict semantic reproduction. Sim tests (in CI/CLI) remain the determinism authority.
+- **Chrome-only** — Firefox would need a different extension model. v1 / early-adopter audience makes this acceptable.
+- **Extension distribution** — Chrome Web Store publishing is its own small ops cost.
+
+**What ships in the extension** (when it gets built):
+- A stubs library that overrides Loop46 globals (`globalThis.kv`, `globalThis.webhook`, `globalThis.email`, `Date.now`, `Math.random`, `crypto.*`) with implementations that read from a recorded tape (loaded from the worker via `/_system/log/{id}/blob/{hash}`).
+- A CDP client that loads the handler source into the active page's debugger, sets up the stubs, lets the developer drive execution from DevTools.
+- UI for picking a request (from a list of recorded ones), loading its tape, and starting a debug session.
+- Optional: edit-and-rerun affordance once breakpoints + stepping are working.
+
+**Why deferred**: Phase 12's CLI sim covers the test-authoring + agent-driven debugging cases. The browser extension is a separate developer-experience addition; it depends on stable Phase 12 bundle/tape formats but doesn't gate any other Phase 12+ work. Build when Phase 5 admin UI is mature enough that "dashboard click → DevTools-style replay" is the natural next UX step.
+
+**Side effects**:
+- Future repo separate from rove (Chrome extensions have their own toolchain). Probably `loop46-replay-extension` or similar.
+- The bundle JSON + tape format become a public contract (the extension is an external consumer).
+- No PLAN.md §3 phase entry until the work is scheduled; recorded here as locked architecture only.
 
 ## 11. Rove-library principles audit (2026-04-21)
 
