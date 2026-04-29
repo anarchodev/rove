@@ -203,6 +203,50 @@ Failure modes (`root.zig:920`–956): not found, expired (deletes stale
 row), corrupted JSON (deletes corrupted row). All return null and the
 handler responds 401.
 
+### Phase 6a — Auto-resend on expired-but-resendable click (Phase 4 amendment)
+
+15 minutes is short. Users routinely click magic links well after they
+expire (email lag, distraction, "I'll do it later"). Today that's a
+401 with no recovery path other than starting signup over from
+scratch. Better UX: detect the expired-but-recent case and email a
+fresh link automatically.
+
+Implementation needs a small lifecycle change:
+
+- `magic/{hash}` records grow a `resend_grace_until_ns` field
+  (`expires_at_ns + 15min` by default).
+- `redeemMagic` returns a three-state result: `Valid{email, instance}`,
+  `Expired{email, instance}` (within grace), or `null` (gone).
+- `pending/{name}` reservations share the same grace lifecycle so the
+  name stays held during the resend window.
+
+On `Expired{email, instance}`:
+
+1. **Rate-limit check** before doing anything else. Two buckets via the
+   Phase 8 limiter primitive:
+   - `magic_resend` keyed on email — e.g., 3 resends per hour. Prevents
+     email-bombing a target by repeatedly clicking expired links.
+   - `magic_resend` global — fleet-wide cap (e.g., 100/min) as
+     defense-in-depth against a botnet hitting expired links to burn
+     Resend budget.
+2. If allowed: mint a fresh magic record (new opaque, new
+   `expires_at_ns`, new `resend_grace_until_ns`), update `pending/{name}`
+   to match, **delete the old expired magic record** (one-shot — no
+   click amplification), queue the new email through the outbox.
+3. Return a 202-ish response: "We sent you a fresh link, check your
+   email." UI ideally renders a friendly page; raw 202 is fine for v1.
+4. If rate-limited: 429 with Retry-After.
+
+Subsequent clicks of the *same* (now deleted) old link return 401 —
+the user has to look at their email for the new link, not re-click the
+old one.
+
+Outside the grace window (`now >= resend_grace_until_ns`), the record
+is fully purged and behavior matches today's: 401, user must start
+signup over. Two adjacent grace windows do not chain — a fresh magic
+created via resend has its own independent lifecycle, and once *that*
+expires past grace, the user is done.
+
 ---
 
 ## Phase 7 — Session mint
@@ -453,15 +497,18 @@ fix surface if you decide to atomicize them.
 ### New sweep
 
 A periodic task walks `pending/*` in admin app.db, deletes entries whose
-`expires_at_ns < now_ns`. Two natural homes:
+`resend_grace_until_ns < now_ns` (note: not `expires_at_ns` — pending
+records, like magic records, stick around past expiry to support
+auto-resend on expired-but-resendable clicks; see Phase 6a). Magic
+records `magic/*` get the same sweep; the two share their grace
+lifecycle so they purge together. Two natural homes:
 
 - Inside the existing outbox drainer's tick (it already iterates per
-  tenant; admin-tenant ticks could include the pending sweep).
-- A new generic janitor task — overkill for one job, but cleaner if more
-  periodic work accumulates.
+  tenant; admin-tenant ticks could include the pending + magic sweep).
+- A new generic janitor task — overkill for two jobs, but cleaner if
+  more periodic work accumulates.
 
-Cost: a single SQLite `DELETE` per expired entry per sweep interval.
-Negligible.
+Cost: a few SQLite `DELETE`s per sweep interval. Negligible.
 
 ### What changes in the open questions
 
