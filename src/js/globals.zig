@@ -135,6 +135,18 @@ pub const DispatchState = struct {
     /// Instance id for limiter lookup. Empty when the dispatcher
     /// runs without a worker (test paths).
     instance_id: []const u8 = "",
+    /// Trampoline backing `platform.instances.deployStarter(name)`.
+    /// Worker provides a concrete fn that can cast `ctx` back to
+    /// its specific `*Worker(opts)` type, opens the target's
+    /// files.db, runs the deploy, and proposes the resulting files
+    /// writeset through raft. Null on test paths without a worker;
+    /// the JS callable throws a clear error in that case.
+    deploy_starter: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+    ) anyerror!void = null,
+    deploy_starter_ctx: ?*anyopaque = null,
 
     pub fn deinit(self: *DispatchState, ctx: ?*c.JSContext) void {
         var it = self.trigger_module_ns.iterator();
@@ -1541,6 +1553,66 @@ fn jsPlatformInstancesCreate(
     return js_undefined;
 }
 
+/// `platform.instances.deployStarter(name)` — admin-only. Writes
+/// the embedded starter content (`index.mjs` + `_static/index.html`)
+/// into the target instance's files.db + file-blobs/, then proposes
+/// the resulting files writeset through raft so followers see the
+/// same deployment.
+///
+/// Sealed primitive in v1: starter content is platform-baked
+/// (`STARTER_INDEX_MJS` / `STARTER_STATIC_INDEX_HTML` in worker.zig),
+/// not customer-supplied. A general `platform.deploy(name, files)`
+/// is deferred until concrete demand (e.g. a libraries marketplace)
+/// — see PLAN §10.
+///
+/// Throws `Error{code:"InstanceNotFound"}` if `name` doesn't resolve.
+/// Throws `TypeError` when called outside an admin handler or before
+/// the worker has wired the deploy trampoline (test path).
+fn jsPlatformInstancesDeployStarter(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) {
+        _ = c.JS_ThrowTypeError(ctx, "platform.instances.deployStarter requires (name)");
+        return js_exception;
+    }
+    const state = getState(ctx);
+    if (state.platform == null) {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    }
+    const fn_ptr = state.deploy_starter orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform.instances.deployStarter is not configured (no compile callback)");
+        return js_exception;
+    };
+    const fn_ctx = state.deploy_starter_ctx orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform.instances.deployStarter context missing");
+        return js_exception;
+    };
+
+    const name = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(name);
+
+    fn_ptr(fn_ctx, state.allocator, name) catch |err| switch (err) {
+        error.InstanceNotFound => {
+            const err_obj = c.JS_NewError(ctx);
+            if (c.JS_IsException(err_obj)) return err_obj;
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "message",
+                c.JS_NewStringLen(ctx, "instance not found", "instance not found".len));
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "code",
+                c.JS_NewStringLen(ctx, "InstanceNotFound", "InstanceNotFound".len));
+            return c.JS_Throw(ctx, err_obj);
+        },
+        else => {
+            state.pending_kv_error = err;
+            return js_undefined;
+        },
+    };
+    return js_undefined;
+}
+
 // ── Installation ──────────────────────────────────────────────────────
 
 /// Install the pieces of the global surface that do NOT depend on a
@@ -1795,6 +1867,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     _ = c.JS_SetPropertyStr(ctx, platform_obj, "root", root_obj);
     const instances_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, instances_obj, "create", c.JS_NewCFunction2(ctx, jsPlatformInstancesCreate, "create", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, instances_obj, "deployStarter", c.JS_NewCFunction2(ctx, jsPlatformInstancesDeployStarter, "deployStarter", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, platform_obj, "instances", instances_obj);
     _ = c.JS_SetPropertyStr(ctx, global, "platform", platform_obj);
 }

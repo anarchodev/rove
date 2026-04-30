@@ -126,6 +126,18 @@ pub const Request = struct {
     /// Null means writes land locally only — fine for tests and
     /// single-node setups, not for multi-node correctness.
     root_writeset: ?*kv_mod.WriteSet = null,
+    /// Trampoline for `platform.instances.deployStarter(name)`.
+    /// Non-null on admin-tenant requests when the worker has a
+    /// compile callback wired (signup/dev path). The pair (`fn`,
+    /// `ctx`) lets the worker pass an opaque `*Worker(opts)`
+    /// pointer + a concrete trampoline that knows how to cast it,
+    /// without leaking the worker's generic type into globals.zig.
+    deploy_starter: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+    ) anyerror!void = null,
+    deploy_starter_ctx: ?*anyopaque = null,
 };
 
 /// One `(name, value)` pair extracted from the handler's
@@ -297,6 +309,8 @@ pub const Dispatcher = struct {
             .bytecodes = bytecodes,
             .limiter = request.limiter,
             .instance_id = request.instance_id,
+            .deploy_starter = request.deploy_starter,
+            .deploy_starter_ctx = request.deploy_starter_ctx,
         };
 
         // Memcpy-restore the frozen post-init image of
@@ -3141,6 +3155,171 @@ test "dispatch: platform.instances.create throws coded InvalidName on bad name" 
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("code=InvalidName", resp.body);
     try testing.expectEqual(@as(usize, 0), root_ws.ops.items.len);
+}
+
+/// Stub for `platform.instances.deployStarter`'s trampoline. Records
+/// the `target_id` it was called with and optionally fails with a
+/// pre-set error. Matches the `Request.deploy_starter` signature.
+const DeployStarterRecorder = struct {
+    allocator: std.mem.Allocator,
+    last_target_id: ?[]u8 = null,
+    return_error: ?anyerror = null,
+    call_count: u32 = 0,
+
+    fn deinit(self: *DeployStarterRecorder) void {
+        if (self.last_target_id) |s| self.allocator.free(s);
+    }
+
+    fn trampoline(
+        ctx: *anyopaque,
+        _: std.mem.Allocator,
+        target_id: []const u8,
+    ) anyerror!void {
+        const self: *DeployStarterRecorder = @ptrCast(@alignCast(ctx));
+        self.call_count += 1;
+        if (self.last_target_id) |old| {
+            self.allocator.free(old);
+            self.last_target_id = null;
+        }
+        self.last_target_id = self.allocator.dupe(u8, target_id) catch null;
+        if (self.return_error) |err| return err;
+    }
+};
+
+test "dispatch: platform.instances.deployStarter throws on non-admin handler" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { platform.instances.deployStarter("acme"); return "no throw"; }
+        \\catch (e) { return "threw: " + e.message; }
+    ,
+        .{ .method = "POST", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "admin handler") != null);
+}
+
+test "dispatch: platform.instances.deployStarter throws when trampoline not configured" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    var root_ws = kv_mod.WriteSet.init(testing.allocator);
+    defer root_ws.deinit();
+
+    // Admin platform set, but no deploy_starter fn pointer (test path
+    // / library mode without a worker). Should throw a clear error
+    // rather than silently no-op.
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { platform.instances.deployStarter("acme"); return "no throw"; }
+        \\catch (e) { return "threw: " + e.message; }
+    ,
+        .{
+            .method = "POST",
+            .path = "/",
+            .platform = pf.tenant,
+            .root_writeset = &root_ws,
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "not configured") != null);
+}
+
+test "dispatch: platform.instances.deployStarter invokes trampoline with name" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    var root_ws = kv_mod.WriteSet.init(testing.allocator);
+    defer root_ws.deinit();
+
+    var rec = DeployStarterRecorder{ .allocator = testing.allocator };
+    defer rec.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\platform.instances.deployStarter("acme");
+        \\return "ok";
+    ,
+        .{
+            .method = "POST",
+            .path = "/",
+            .platform = pf.tenant,
+            .root_writeset = &root_ws,
+            .deploy_starter = &DeployStarterRecorder.trampoline,
+            .deploy_starter_ctx = &rec,
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok", resp.body);
+    try testing.expectEqual(@as(u32, 1), rec.call_count);
+    try testing.expectEqualStrings("acme", rec.last_target_id.?);
+}
+
+test "dispatch: platform.instances.deployStarter throws coded InstanceNotFound" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    var root_ws = kv_mod.WriteSet.init(testing.allocator);
+    defer root_ws.deinit();
+
+    var rec = DeployStarterRecorder{
+        .allocator = testing.allocator,
+        .return_error = error.InstanceNotFound,
+    };
+    defer rec.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { platform.instances.deployStarter("missing"); return "no throw"; }
+        \\catch (e) { return "code=" + e.code; }
+    ,
+        .{
+            .method = "POST",
+            .path = "/",
+            .platform = pf.tenant,
+            .root_writeset = &root_ws,
+            .deploy_starter = &DeployStarterRecorder.trampoline,
+            .deploy_starter_ctx = &rec,
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("code=InstanceNotFound", resp.body);
 }
 
 test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {

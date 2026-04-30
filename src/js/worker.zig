@@ -633,6 +633,39 @@ pub fn Worker(comptime opts: Options) type {
             try self.h2.pollWithTimeout(timeout_ns);
         }
 
+        /// Trampoline for `platform.instances.deployStarter(name)`.
+        /// Wired into the admin-handler request via
+        /// `Request.deploy_starter` + `.deploy_starter_ctx`. The
+        /// pair lets globals.zig invoke this without depending on
+        /// the generic `Worker(opts)` type — the caller passes the
+        /// `*anyopaque` it received as `ctx`, we cast back to
+        /// `*Self`, and run the same open-files.db + FileStore +
+        /// putSource + putStatic + deploy + propose dance the Zig
+        /// signup path does today.
+        ///
+        /// Returns `error.InstanceNotFound` if `target_id` doesn't
+        /// resolve, `error.CompileFnUnavailable` if this worker has
+        /// no compile callback wired (library mode). Other errors
+        /// propagate from `deployStarterContent` /
+        /// `proposeFilesWriteSet`.
+        fn deployStarterTrampoline(
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            target_id: []const u8,
+        ) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const inst_opt = self.tenant.getInstance(target_id) catch
+                return error.InstanceNotFound;
+            const inst = inst_opt orelse return error.InstanceNotFound;
+            const compile_fn = self.compile_fn orelse
+                return error.CompileFnUnavailable;
+
+            var files_ws = kv_mod.WriteSet.init(allocator);
+            defer files_ws.deinit();
+            try deployStarterContent(allocator, inst.dir, compile_fn, self.compile_ctx, &files_ws);
+            _ = try proposeFilesWriteSet(self, &files_ws, target_id);
+        }
+
     };
 }
 
@@ -2109,6 +2142,18 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // from acme's email bucket, not __admin__'s.
             .limiter = &worker.limiter,
             .instance_id = scope_inst.id,
+            // Deploy-starter trampoline. Only meaningful on admin-
+            // handler requests; customer requests have no platform
+            // capability, and the JS callable rejects them at the
+            // gate before ever reaching this fn pointer.
+            .deploy_starter = if (handler_inst.platform != null)
+                &@TypeOf(worker.*).deployStarterTrampoline
+            else
+                null,
+            .deploy_starter_ctx = if (handler_inst.platform != null)
+                @ptrCast(worker)
+            else
+                null,
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(
