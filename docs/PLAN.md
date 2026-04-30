@@ -1469,6 +1469,59 @@ Neither is *great* but both are *workable* and unblock launch. The new primitive
 
 **The north-star this locks in**: don't accidentally build N independent batched-event pipelines. Logs, customer analytics, future audit-event streams, future trigger-fire logging — all of them flow through `analytics.track` with the appropriate durability tier. Future-us shouldn't reinvent the log pipeline mechanism for "this new kind of structured event"; should add a new event type and emit it via the existing primitive.
 
+### 10.16 `metrics.*` primitive: aggregated time-series observability (decided 2026-04-30)
+
+**Framing**: distinct primitive shape from `analytics.track` (§10.15) because the *delivery characteristics* differ in a way that wants different infrastructure. Events are discrete records; you store each one and query later. Metrics are pre-aggregated *in worker memory* — counter increments accumulate locally, periodic flush ships only the *aggregate state* (label-set → numeric value) to a TSDB push gateway. A handler doing 1M counter increments per second produces zero per-event storage; just an in-memory hashmap that flushes a few hundred (label-set, value) pairs every 10s. The same volume through `analytics.track` would be 1M batch-store rows per second — possible but profligate.
+
+**API shape** (matches industry-standard TSDB metric types):
+
+```js
+// Counter: monotonically increasing
+metrics.inc("http_requests_total", { path: "/foo", method: "GET" });
+metrics.inc("payment_failed_total", { reason: "card_declined" }, 3);  // by N
+
+// Gauge: arbitrary current value
+metrics.set("queue_depth", 47);
+
+// Histogram / timing: observe a numeric value into bucketed buckets
+metrics.observe("request_duration_ms", 123, { path: "/foo" });
+```
+
+**Architecture**:
+
+```
+handler → metrics.inc/set/observe → in-memory accumulator (per worker)
+                                       ↓ (flush every 10-60s)
+                                   per-tenant snapshot of (metric_name, label_set) → value
+                                       ↓ (push to TSDB receiver)
+                                   TSDB destination (Loop46-TSDB service or external Prometheus/Datadog)
+```
+
+The accumulator is just a hashmap keyed on `(metric_name, sorted_labels)` → counter / gauge / histogram bucket array. Per-worker (no cross-worker aggregation in v1; TSDB receiver merges). On worker crash before flush: counter increments from the last flush window are lost. Acceptable because (a) metrics are inherently lossy at high frequency, and (b) the next flush picks up where the new accumulator starts.
+
+**Cardinality guardrails — a real Loop46-specific differentiator.** The most common metrics-system disaster is unbounded label cardinality (`metrics.inc("user_action", { user_id: "..." })` with N users → N distinct time-series → TSDB tips over). The platform should enforce limits the standard libraries don't:
+- **Per-metric label cardinality cap** (e.g., 100 distinct label-sets per metric). New label combinations beyond the cap get dropped + a `metrics_cardinality_dropped_total` counter increments.
+- **UUID-shape detection on label values**. If a label value matches `/^[0-9a-f]{8}-[0-9a-f]{4}-...$/` or `/^[0-9a-f]{32,}$/`, reject the increment with a thrown JS error in dev mode and a silent drop + counter in prod. (Customer is using a metric where they should be using `analytics.track`.)
+- **Documentation pattern**: high-cardinality observation belongs in `analytics.track` (one row per request, query later); aggregated observation belongs in `metrics`. The error message points to the right primitive.
+
+This kind of guardrail typically takes a year of operator pain to land; building it in from day one is a real value-add over Prometheus / OpenTelemetry SDKs that just accept whatever labels you give them.
+
+**The receiver**: TSDB-as-pseudo-third-party, parallel to OLAP-as-pseudo-third-party (§10.15). Either an operator-deployed companion (`loop46-tsdb` binary, embedded VictoriaMetrics or similar) or external (Prometheus push gateway, Datadog metrics API, Grafana Cloud). Same architectural shape as everything else.
+
+**The three-layer observability story this completes**:
+
+| Layer | Primitive | Question it answers | Storage shape | Loop46-specific note |
+|---|---|---|---|---|
+| **Events** | `analytics.track` (§10.15) | "What discrete things happened?" | OLAP (columnar, append-only) | Logs are a specific case |
+| **Metrics** | `metrics.*` (this section) | "How is the system performing?" | TSDB (timestamp + label-set → numeric) | Cardinality guardrails enforced at write |
+| **Tapes** | Tape capture (existing, PLAN §10.7-10.12) | "What exactly happened on *this specific* request?" | Per-request blob, content-addressed | Replay in browser DevTools — the killer feature |
+
+This maps onto industry-standard "logs + metrics + traces" but with Loop46-specific framing: logs collapse into events (broader); metrics gets cardinality guardrails (Prometheus doesn't); traces become full replay (Honeycomb-style sampled traces become per-request reproducible debug sessions).
+
+**Sequencing**: post-launch, alongside the other §10.13/§10.14/§10.15 detach work. For v1, customers with metrics needs use webhook.send to push to Datadog / their TSDB of choice (works, expensive at high volume, no aggregation). Same compromise as analytics.track: workable for first users, real primitive lands when the receiver service exists and the volume justifies it.
+
+**The pitch this enables for launch positioning**: "Loop46 ships built-in observability — events, metrics, and *full per-request replay*. Other platforms give you logs + a sampled trace viewer; we give you the actual reproducer." That's a sentence that converts. Pre-launch the metrics + analytics.track primitives don't exist yet, but **tape replay does** (the architecture is built; just needs the Chrome extension UI per §10.12). The launch story can already say "click any 500 in your logs, get a replayable browser DevTools session" — and *that* is the wedge that nobody else has.
+
 ## 11. Rove-library principles audit (2026-04-21)
 
 Audited against `~/.claude/memory/rove-library.md`. Findings:
