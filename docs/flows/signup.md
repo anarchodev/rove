@@ -453,7 +453,20 @@ considering for Phase 7 (CLI) if power users need it.
 
 ---
 
-## Proposed redesign — lazy creation on redeem (Phase 4 amendment)
+## Proposed redesign — lazy creation + admin-handler JS port (Phase 4 amendment)
+
+> **Scope note.** This amendment folds two coupled changes into one
+> work item: (1) lazy tenant creation on redeem, and (2) porting the
+> admin platform handlers (`/v1/signup`, `/v1/auth`, `/v1/login`,
+> `/v1/logout`, `/v1/session`) from Zig in `worker.zig` to JS in
+> admin's deployed bundle, extending §10.1's "admin is a real
+> instance" dogfooding from storage to handlers. The flow described
+> below is implementation-agnostic — read "the redeem handler" as
+> "admin's JS handler for `GET /v1/auth`" once the port lands. The
+> Zig functions cited (`handleAdminAuth`, `mintMagic`, etc.) describe
+> *today's* code; **all of them delete** as part of this amendment.
+> See *Implementation cost* below for the full deletion list and new
+> primitive surface.
 
 The abuse-prevention problem: today every `POST /v1/signup` immediately
 allocates `instance/{name}` in root.db, `{id}/app.db`, `{id}/files.db`, the
@@ -580,19 +593,63 @@ Cost: a few SQLite `DELETE`s per sweep interval. Negligible.
 
 ### Implementation cost
 
-Mostly a re-shuffle within `handleAdminSignup` and `handleAdminAuth`:
+Two coupled deliverables: (1) lazy creation logic, (2) port the admin
+platform handlers from Zig to JS. Doing both at once because porting
+Zig that's about to be rewritten anyway is wasted churn.
 
-- Move the bulk of `handleAdminSignup`'s body (createInstance, both
-  proposes, deployStarterContent) into a new helper called from
-  `handleAdminAuth`.
-- Add `pending/*` reservation read/write to admin app.db.
-- Update `instanceExists` (or its callers) to check both namespaces.
-- Move the outbox enqueue target from customer tenant to admin tenant.
-- Add the periodic sweep — fold into outbox drainer's loop.
+**New Zig primitives** (admin-only, gated on the `platform` capability
+that §10.1 already established):
 
-Existing `signup_smoke.sh` needs an update: the smoke should observe
-that the customer tenant *doesn't* exist after signup, *does* exist
-after redemption.
+- `platform.instances.create(name)` / `.delete(name)` — wraps
+  `tenant.createInstance` + `proposeRootWriteSet` (and the inverse).
+- `crypto.randomBytes(n) → Uint8Array` and `crypto.sha256(data) →
+  hex` — extends the existing `crypto.hmacSha256` namespace
+  (`globals.zig:921`).
+
+**New JS handler in admin** (deployed bundle, served on
+`app.loop46.me`): owns `/v1/signup`, `/v1/auth`, `/v1/login`,
+`/v1/logout`, `/v1/session`, plus the existing dashboard routes. Auth
+check (cookie → session lookup) runs at handler entry, replacing
+`requireAdminAuth`. Mint/redeem/session become `crypto.randomBytes` +
+`crypto.sha256` + `kv.put`/`kv.get`/`kv.delete` against admin's app.db.
+`pending/*` reservation read/write is just regular `kv.*`. Starter
+content deploys via the existing two-phase deploy primitive — admin JS
+calls it the same way a customer's deploy client would, no special
+starter knob on `platform.instances.create`.
+
+**Lazy-creation specifics** (now implemented in JS):
+
+- Signup writes `pending/{name}` to admin's app.db; duplicate check
+  covers `instance/*` and non-expired `pending/*`.
+- Outbox row for the magic email lands in admin's app.db (not the
+  not-yet-existent customer's).
+- Redeem handler calls `platform.instances.create(name)`, runs the
+  starter deploy, writes `account/{hash}/instances/{instance_id}`,
+  deletes `pending/{name}`, mints the session.
+- Periodic sweep over `pending/*` + `magic/*` lives in admin's JS as a
+  trigger or scheduled handler (Phase 6 triggers exist; scheduled
+  handlers are a small extension if needed).
+
+**Zig deletions** once the JS handler is wired:
+
+- `worker.zig`: `handleAdminSignup`, `handleAdminAuth`,
+  `handleAdminLogin`, `handleAdminLogout`, `handleAdminSession`,
+  `requireAdminAuth`, `deployStarterContent`, `queueSignupEmail`,
+  `buildSignupEmailText` — and the path-prefix dispatch for those
+  routes in `dispatchOnce` (`worker.zig:1775`–1803).
+- `tenant/root.zig`: `mintMagic`, `redeemMagic`, `createSession`,
+  `authenticateSession` (the four functions cited in the file:line
+  index below).
+
+**Routing** is unchanged. Host→tenant fast path stays Zig.
+`app.loop46.me` resolves to the admin tenant via `tenant.resolveDomain`
+exactly as today; admin's JS handler then runs for every path on that
+host (including `/v1/*`), exactly like a customer's handler runs for
+every path on their subdomain.
+
+**Smoke**: `signup_smoke.sh` updates to observe that the customer
+tenant *doesn't* exist after signup, *does* exist after redemption.
+HTTP-shape assertions stay the same — the change is internal.
 
 ---
 
