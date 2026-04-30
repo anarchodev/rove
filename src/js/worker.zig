@@ -357,10 +357,6 @@ pub const WorkerConfig = struct {
     /// back to `raft.config.node_id`, which is correct for the
     /// single-worker-per-process case but wrong for multi-worker.
     log_worker_id: ?u16 = null,
-    /// "From:" address used on platform-sent emails (magic-link
-    /// signup, future password-reset, etc.). Must be a domain Resend
-    /// is configured to send from. Borrowed; caller keeps alive.
-    platform_email_from: []const u8 = "noreply@loop46.me",
     /// Per-(instance, action) rate limit caps. v1 uses a single
     /// tier — operator can tune via CLI flags before launch.
     /// Phase 10 will branch on instance plan tier.
@@ -509,9 +505,6 @@ pub fn Worker(comptime opts: Options) type {
         /// workers' ids. Copied from `WorkerConfig.log_worker_id` (or the
         /// raft node id as a fallback).
         log_worker_id: u16,
-        /// Platform From: address for magic-link emails. Copied from
-        /// `WorkerConfig.platform_email_from`. Borrowed.
-        platform_email_from: []const u8,
         /// Compile callback used by signup to deploy starter content.
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
         compile_fn: ?files_mod.CompileFn,
@@ -571,7 +564,6 @@ pub fn Worker(comptime opts: Options) type {
                 .admin_origin = config.admin_origin,
                 .admin_api_domain = config.admin_api_domain,
                 .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
-                .platform_email_from = config.platform_email_from,
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
             };

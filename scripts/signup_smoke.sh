@@ -258,10 +258,10 @@ wait $PID 2>/dev/null || true
     --http "$HTTP_ADDR" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
-    --bootstrap-resend-key "$RESEND_KEY" \
+    --bootstrap-kv "resend_key=$RESEND_KEY" \
+    --bootstrap-kv "platform_email_from=noreply@smoke.test" \
     --admin-origin "$ADMIN_ORIGIN" \
     --public-suffix "$PUBLIC_SUFFIX" \
-    --platform-email-from "noreply@smoke.test" \
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \

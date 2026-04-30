@@ -66,15 +66,16 @@ ADMIN_API_DOMAIN="app.${BASE_DOMAIN}"
 ADMIN_ORIGIN="https://${ADMIN_API_DOMAIN}"
 
 # Bootstrap plumbing. Flags only pass through when the matching env
-# var is set; otherwise boot reuses what's already in root.db.
-#   ROVE_TOKEN        → --bootstrap-root-token        (admin login)
-#   ROVE_RESEND_KEY   → --bootstrap-resend-key        (platform email default)
+# var is set; otherwise boot reuses what's already in root.db /
+# __admin__/app.db.
+#   ROVE_TOKEN        → --bootstrap-root-token             (admin login)
+#   ROVE_RESEND_KEY   → --bootstrap-kv resend_key=...      (platform email)
 BOOTSTRAP_ARGS=()
 if [[ -n "${ROVE_TOKEN:-}" ]]; then
     BOOTSTRAP_ARGS+=(--bootstrap-root-token "$ROVE_TOKEN")
 fi
 if [[ -n "${ROVE_RESEND_KEY:-}" ]]; then
-    BOOTSTRAP_ARGS+=(--bootstrap-resend-key "$ROVE_RESEND_KEY")
+    BOOTSTRAP_ARGS+=(--bootstrap-kv "resend_key=$ROVE_RESEND_KEY")
 fi
 
 cat <<EOF

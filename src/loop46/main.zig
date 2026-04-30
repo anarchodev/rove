@@ -568,6 +568,12 @@ const ADMIN_HANDLER_SRC =
     \\}
 ;
 
+/// Cap on `--bootstrap-kv` repetitions. Way past anything a real
+/// operator needs (a handful of API keys + email-from + maybe a
+/// dashboard origin); generous enough that bumping it later is a
+/// non-event. Allocator-free Cli parsing depends on a fixed bound.
+const MAX_BOOTSTRAP_KV: usize = 32;
+
 const Cli = struct {
     node_id: u32 = 0,
     /// Comma-separated `host:port` list. Position determines node_id.
@@ -586,12 +592,15 @@ const Cli = struct {
     /// `/_system/*` request must carry this token in an
     /// `Authorization: Bearer <hex>` header.
     bootstrap_root_token: ?[]const u8 = null,
-    /// Platform-provided Resend API key. When set, the worker
-    /// installs it in root.db under `resend_key` so the Zig-native
-    /// signup handler can read it when building a magic-link email
-    /// outbox envelope. Customer handlers never see the plaintext.
-    /// Rotate by re-running with a new value.
-    bootstrap_resend_key: ?[]const u8 = null,
+    /// Generic seed-into-admin's-app.db config pairs. Each pair is
+    /// the raw `key=value` argv string; bootstrap splits at the
+    /// first `=` and writes to admin's kv before workers start
+    /// serving. Replaces the older typed flags
+    /// (`--bootstrap-resend-key`, `--platform-email-from`) so Zig
+    /// no longer enumerates which config keys exist — admin's JS
+    /// handler reads whatever it cares about via `kv.get`.
+    bootstrap_kv: [MAX_BOOTSTRAP_KV][]const u8 = undefined,
+    bootstrap_kv_count: usize = 0,
     /// Number of worker threads. Each owns its own Registry/Io/H2/
     /// Tenant/Dispatcher and binds the same HTTP/2 port via
     /// SO_REUSEPORT. Defaults to the number of online CPUs.
@@ -672,10 +681,6 @@ const Cli = struct {
     /// keeps the existing plaintext h2c behavior used by the
     /// smoke scripts.
     dev: bool = false,
-    /// "From:" address the worker uses when queueing platform
-    /// emails (magic-link signup, future password-reset, etc.).
-    /// Must match a domain configured in Resend.
-    platform_email_from: []const u8 = "noreply@loop46.me",
     /// Per-(instance, action) rate limit caps. Defaults match
     /// `limiter.RateLimitCaps`'s defaults; flags below let
     /// operators tune them at launch + smoke tests dial them
@@ -717,10 +722,20 @@ fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.bootstrap_root_token = args[i];
-        } else if (std.mem.eql(u8, a, "--bootstrap-resend-key")) {
+        } else if (std.mem.eql(u8, a, "--bootstrap-kv")) {
             i += 1;
             if (i >= args.len) return error.Usage;
-            out.bootstrap_resend_key = args[i];
+            if (out.bootstrap_kv_count >= MAX_BOOTSTRAP_KV) {
+                std.debug.print(
+                    "error: too many --bootstrap-kv flags (max {d})\n",
+                    .{MAX_BOOTSTRAP_KV},
+                );
+                return error.Usage;
+            }
+            // The argv slice survives for the lifetime of the binary;
+            // store the raw `key=value` string and split at use site.
+            out.bootstrap_kv[out.bootstrap_kv_count] = args[i];
+            out.bootstrap_kv_count += 1;
         } else if (std.mem.eql(u8, a, "--workers")) {
             i += 1;
             if (i >= args.len) return error.Usage;
@@ -755,10 +770,6 @@ fn parseCli(args: []const [:0]u8) !Cli {
             out.refresh_interval_ms = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, a, "--dev-webhook-unsafe")) {
             out.dev_webhook_unsafe = true;
-        } else if (std.mem.eql(u8, a, "--platform-email-from")) {
-            i += 1;
-            if (i >= args.len) return error.Usage;
-            out.platform_email_from = args[i];
         } else if (std.mem.eql(u8, a, "--rate-limit-request-capacity")) {
             i += 1;
             if (i >= args.len) return error.Usage;
@@ -1176,7 +1187,6 @@ const WorkerCtx = struct {
     admin_origin: ?[]const u8,
     admin_api_domain: ?[]const u8,
     public_suffix: ?[]const u8,
-    platform_email_from: []const u8,
     rate_limit_caps: rjs.RateLimitCaps,
     /// Per-worker QuickJS compiler used by the signup endpoint to
     /// bytecode-compile starter handler content. Runtimes can't be
@@ -1291,7 +1301,6 @@ fn workerMain(args: *WorkerCtx) !void {
         .admin_api_domain = args.admin_api_domain,
         .log_worker_id = args.worker_idx,
         .refresh_interval_ns = @as(i64, args.refresh_interval_ms) * std.time.ns_per_ms,
-        .platform_email_from = args.platform_email_from,
         .rate_limit_caps = args.rate_limit_caps,
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
@@ -1428,6 +1437,12 @@ const USAGE =
     \\  --data-dir <path>           per-node data dir (default /tmp/rove-js-data)
     \\  --fresh                     wipe data dir before start
     \\  --bootstrap-root-token HEX  seed the root auth token at startup
+    \\  --bootstrap-kv key=value    seed a kv pair into __admin__/app.db at
+    \\                              startup. Repeatable. Admin's JS handler
+    \\                              reads these via kv.get; well-known keys
+    \\                              (defined by admin's deployed bundle, not
+    \\                              this binary) include resend_key and
+    \\                              platform_email_from.
     \\  --public-suffix <domain>    customer wildcard suffix (e.g. loop46.me).
     \\                              admin host derives to app.<suffix> unless
     \\                              --admin-api-domain overrides
@@ -1694,22 +1709,53 @@ pub fn main() !void {
         // before any other bootstrap step runs. See `src/tenant/root.zig`.
         try tenant.createInstance("__admin__");
 
-        if (cli.bootstrap_resend_key) |k| {
-            tenant.installResendKey(k) catch |err| {
-                std.debug.print("bootstrap: installResendKey failed: {s}\n", .{@errorName(err)});
+        // Generic config bootstrap: every `--bootstrap-kv key=value`
+        // arg writes to admin's app.db under the given key. Zig knows
+        // nothing about the keys — admin's JS handler reads whatever
+        // it cares about via kv.get with whatever fallback default
+        // it wants (e.g. `kv.get("platform_email_from") ||
+        // "noreply@loop46.me"`).
+        if (cli.bootstrap_kv_count > 0) {
+            const admin_inst = (tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch |err| {
+                std.debug.print("bootstrap: lookup __admin__ failed: {s}\n", .{@errorName(err)});
                 std.process.exit(2);
-            };
-            std.debug.print("bootstrap: resend key installed (platform default)\n", .{});
+            }).?;
+            for (cli.bootstrap_kv[0..cli.bootstrap_kv_count]) |pair| {
+                const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
+                    std.debug.print(
+                        "bootstrap-kv: expected key=value, got '{s}'\n",
+                        .{pair},
+                    );
+                    std.process.exit(2);
+                };
+                const key = pair[0..eq];
+                const value = pair[eq + 1 ..];
+                if (key.len == 0) {
+                    std.debug.print("bootstrap-kv: empty key in '{s}'\n", .{pair});
+                    std.process.exit(2);
+                }
+                if (std.mem.indexOfScalar(u8, key, 0) != null or
+                    std.mem.indexOfScalar(u8, value, 0) != null)
+                {
+                    std.debug.print(
+                        "bootstrap-kv: key/value contains NUL byte (key='{s}')\n",
+                        .{key},
+                    );
+                    std.process.exit(2);
+                }
+                admin_inst.kv.put(key, value) catch |err| {
+                    std.debug.print(
+                        "bootstrap-kv: write {s} failed: {s}\n",
+                        .{ key, @errorName(err) },
+                    );
+                    std.process.exit(2);
+                };
+            }
+            std.debug.print(
+                "bootstrap: wrote {d} kv pair(s) into __admin__/app.db\n",
+                .{cli.bootstrap_kv_count},
+            );
         }
-
-        // Always-write platform_email_from so admin's JS handler can
-        // pull the operator-configured From: address via kv.get
-        // without a fallback hardcode. Defaults to "noreply@loop46.me"
-        // when --platform-email-from is omitted.
-        tenant.installPlatformEmailFrom(cli.platform_email_from) catch |err| {
-            std.debug.print("bootstrap: installPlatformEmailFrom failed: {s}\n", .{@errorName(err)});
-            std.process.exit(2);
-        };
 
         // Always-deploy: the embedded admin UI bundle. Demo + benchmark
         // tenants get provisioned by `loop46 seed --manifest ...` (out
@@ -1909,7 +1955,6 @@ pub fn main() !void {
             .admin_origin = cli.admin_origin,
             .admin_api_domain = cli.admin_api_domain,
             .public_suffix = cli.public_suffix,
-            .platform_email_from = cli.platform_email_from,
             .rate_limit_caps = .{
                 .request_capacity = cli.rate_limit_request_capacity,
                 .request_refill_per_sec = cli.rate_limit_request_refill,

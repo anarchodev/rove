@@ -667,60 +667,6 @@ pub const Tenant = struct {
         return inst.kv;
     }
 
-    // ── Platform secrets: Resend API key ──────────────────────────────
-    //
-    // Admin-surface config, stored in the admin tenant's app.db
-    // under the well-known key `resend_key`. Installed once at
-    // bootstrap by `--bootstrap-resend-key`; rotated by re-running
-    // the worker with a new value on that flag. The signup flow
-    // reads it via `getResendKey` when building a magic-link email
-    // outbox row. Lives in admin/app.db (not root.db) to keep
-    // root.db minimal — it holds only identity + routing tables.
-
-    pub const RESEND_KEY_MIN_LEN: usize = 8;
-    pub const RESEND_KEY_MAX_LEN: usize = 256;
-
-    pub fn installResendKey(self: *Tenant, key: []const u8) Error!void {
-        if (key.len < RESEND_KEY_MIN_LEN or key.len > RESEND_KEY_MAX_LEN) {
-            return Error.InvalidToken;
-        }
-        for (key) |b| {
-            if (b < 0x21 or b > 0x7e) return Error.InvalidToken;
-        }
-        const kv = try self.adminKv();
-        kv.put("resend_key", key) catch return Error.Kv;
-    }
-
-    /// From-address for platform-fired emails (signup magic links,
-    /// future system notifications). Persisted in admin app.db so
-    /// the JS handler can read it via `kv.get("platform_email_from")`
-    /// without needing a custom primitive. Worker bootstrap writes
-    /// the operator's `--platform-email-from` value (defaulting to
-    /// "noreply@loop46.me") at startup.
-    pub fn installPlatformEmailFrom(self: *Tenant, value: []const u8) Error!void {
-        if (value.len == 0 or value.len > 254) return Error.InvalidToken;
-        // Same printable-ASCII gate as the Resend key — keeps a stray
-        // newline or NUL from corrupting the email envelope downstream.
-        for (value) |b| {
-            if (b < 0x21 or b > 0x7e) return Error.InvalidToken;
-        }
-        const kv = try self.adminKv();
-        kv.put("platform_email_from", value) catch return Error.Kv;
-    }
-
-    /// Returns the stored Resend key or null if none installed. The
-    /// bytes are allocated by the admin tenant's `KvStore`'s
-    /// allocator; free with the same allocator the tenant was
-    /// constructed with.
-    pub fn getResendKey(self: *Tenant) Error!?[]u8 {
-        const kv = try self.adminKv();
-        const v = kv.get("resend_key") catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return Error.Kv,
-        };
-        return v;
-    }
-
     // ── Session cookies ───────────────────────────────────────────────
     //
     // A session is an opaque 64-hex token handed to the browser via
@@ -1448,39 +1394,12 @@ test "authenticateSession returns is_root=false for non-root sessions" {
     try testing.expect(!resolved.?.is_root);
 }
 
-test "installResendKey + getResendKey round-trip" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    try testing.expectEqual(@as(?[]u8, null), try fx.tenant.getResendKey());
-
-    try fx.tenant.installResendKey("re_test_key_abc123");
-    const got = (try fx.tenant.getResendKey()).?;
-    defer testing.allocator.free(got);
-    try testing.expectEqualStrings("re_test_key_abc123", got);
-}
-
-test "installResendKey replaces prior value" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    try fx.tenant.installResendKey("re_old_key_xxxxxx");
-    try fx.tenant.installResendKey("re_new_key_yyyyyy");
-
-    const got = (try fx.tenant.getResendKey()).?;
-    defer testing.allocator.free(got);
-    try testing.expectEqualStrings("re_new_key_yyyyyy", got);
-}
-
-test "installResendKey rejects empty / whitespace / out-of-range" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    try testing.expectError(Error.InvalidToken, fx.tenant.installResendKey(""));
-    try testing.expectError(Error.InvalidToken, fx.tenant.installResendKey("short"));
-    try testing.expectError(Error.InvalidToken, fx.tenant.installResendKey("has space in it abc"));
-    try testing.expectError(Error.InvalidToken, fx.tenant.installResendKey("has\nnewline123456"));
-}
+// Note: resend_key + platform_email_from were typed Zig shims
+// (installResendKey / getResendKey / installPlatformEmailFrom) until
+// the bootstrap-kv generalization. They're now plain kv pairs admin's
+// JS reads via `kv.get`; bootstrap writes them via the generic
+// `--bootstrap-kv key=value` flag in `loop46/main.zig`. No Zig-side
+// shim, no Zig-side knowledge of which keys exist.
 
 // Note: mintMagic + redeemMagic + their tests moved to admin's
 // deployed JS bundle (loop46/main.zig ADMIN_HANDLER_SRC) when the
