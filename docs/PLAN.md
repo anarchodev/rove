@@ -1341,6 +1341,43 @@ POST /_system/dry-run/{instance_id}
 - The bundle JSON + tape format become a public contract (the extension is an external consumer).
 - No PLAN.md §3 phase entry until the work is scheduled; recorded here as locked architecture only.
 
+### 10.13 files-server + log-server detach: external services, not tenants (decided 2026-04-30)
+
+**Change**: `rove-files-server` and `rove-log-server` stop being in-process worker threads and become **external HTTP services that loop46 integrates with the same way it integrates with Resend or Stripe**. Admin's JS handler calls them via `webhook.send`, receives results via the existing callback dispatch (`_callback/*` rows + `dispatchCallbacks`), and pushes the result to the dashboard browser via SSE (PLAN §2.12). The dashboard never talks to files-server / log-server directly — admin's JS is the integration seam.
+
+**Why this framing, not "tenants"**: an earlier sketch had files-server + log-server as Loop46 tenants with their own deployed handlers. Wrong shape — they have their own storage layer, their own data model, no need for QJS or the per-tenant kv-undo machinery. Treating them as third-party HTTP services preserves Loop46's purely-functional handler model AND keeps files-server / log-server as **standalone, swappable HTTP servers**: an operator can replace them with S3 + a managed log aggregator without touching loop46.
+
+**What deletes from the worker** (combined with the auth-middleware move planned alongside):
+- `/_system/files/*` and `/_system/log/*` proxy paths in `src/js/worker.zig` — `tryHandleSystem`, the path-rewriting + scope-resolution + per-system auth gate.
+- `code_proxy` + `log_proxy` rove collections + `ProxySubsystem` machinery.
+- The cross-thread h2 *client* embedded in the worker (only the h2 server stays).
+- The in-process spawning of files-server + log-server threads in `loop46/main.zig` — they become separately-deployed binaries pointed at via operator config.
+- `extractAdminAuth` + `findCookie` + `extractBearerToken` + `tenant.authenticate` + `tenant.authenticateSession` (only used by /_system/* auth + the admin-host RPC gate; with /_system/* gone and the admin-host gate moving to a JS `_middlewares/*`, no Zig caller remains).
+
+Net deletion: ~2-3k lines. The platform collapses to: HTTP/2 server, host→tenant routing, QJS dispatch, rate limit + penalty box, outbox drainer, raft apply, tape capture, SSE, static-asset fast path. Everything else is JS in admin's bundle (or in customer bundles).
+
+**Latency cost**: today's `/_system/files/{tenant}/blobs/check` is a microsecond in-process forward. New shape pays drainer-tick + HTTP round-trip + callback-tick + SSE push. At the 250ms default drainer tick, a 50-file bulk deploy goes from <1s to ~25s — unacceptable for the developer-experience promise.
+
+**Latency mitigations** (must land alongside the detach):
+1. **Drainer kick on outbox write.** Handlers writing `_outbox/{id}` wake the drainer immediately rather than waiting for the next 250ms tick. New primitive — probably an eventfd or a per-worker condvar the drainer waits on. Brings round-trip floor to ~10ms.
+2. **Parallel webhook dispatch.** Admin JS fires N `webhook.send` calls in one handler invocation; drainer dispatches them concurrently per tenant rather than serially. Today's drainer is per-tenant-serial — fine for low volume, a bottleneck here.
+3. **SSE-driven optimistic UI.** Dashboard shows "saving…" / "uploading…" immediately, confirms when the SSE event lands. Modern admin-UI aesthetic; works fine at <100ms confirm latency.
+
+Combined target: <100ms effective round-trip from dashboard click to confirmed result, even on 50-file bulk operations.
+
+**Why this is right**:
+- **Dogfoods webhook + callback + SSE harder than any customer use case will.** Admin's own tooling exercises them on every dashboard interaction; design issues surface for *us* before they surface for customers.
+- **Keeps Loop46 pure.** No in-process escape hatches "just because the platform itself wants to call something." The same `webhook.send` primitive customers use *is* how the platform integrates with everything external.
+- **Makes files-server + log-server swappable at the HTTP layer.** Operator can run them on the same box, on different boxes, behind a managed service (S3 for blobs; CloudWatch / Loki for logs), or reimplement them entirely. As long as they speak the agreed HTTP shape, loop46 doesn't care.
+
+**Prerequisites (must land before the detach is realistic)**:
+- **SSE primitive** (PLAN Phase 11 / §2.12). Dashboard can't get reactive updates without it.
+- **Drainer-kick primitive.** Without immediate dispatch on outbox write, the 250ms tick is the latency floor.
+- **HTTP auth on files-server + log-server.** Today's auth model is "trust the local proxy"; new shape needs bearer-token (or HMAC) auth on the HTTP API. Operator provisions the secret via `--bootstrap-kv files_server_token=... files_server_url=...` (the bootstrap-kv mechanism §10's recent generalization handles this trivially — Zig knows nothing about either key).
+- **Operator-side CLI / docs** for deploying files-server + log-server alongside loop46. Today they're spawned automatically; new shape requires the operator to start them and pass URLs.
+
+**Sequencing**: **post-Phase-4 refactor.** Closer-payoff Phase 4 work (auth middleware, per-account instance limit, periodic sweep over `pending/*` + `magic/*`) lands first and unlocks end-to-end Phase 4 / first-customer launch. The detach is its own multi-week shift that wants a focused window. No PLAN §3 phase entry yet; recorded here as locked architectural direction so future-us doesn't rebuild any part of the in-process subsystem proxy plumbing assuming it's permanent.
+
 ## 11. Rove-library principles audit (2026-04-21)
 
 Audited against `~/.claude/memory/rove-library.md`. Findings:
@@ -1356,9 +1393,8 @@ Audited against `~/.claude/memory/rove-library.md`. Findings:
 - **Silent error swallowing on `txn.rollbackTo` after handler failure** (2026-04-27, fail-fast). Three sites in `src/js/worker.zig` per-handler dispatch (dispatcher.run catch, handler exception, kv error) now log `std.log.err` with the tenant id and rollback error name. Rollback failure here indicates kv state inconsistency worth surfacing.
 
 ### Outstanding (nice-to-fix)
-- **Header builder duplication**: `buildSystemRespHeaders`, `buildHandlerRespHeaders`, `buildAuthRespHeaders`, `buildRedirectRespHeaders` all pack pair-lists into one contiguous buffer. ~80 lines of boilerplate collapses to one builder taking a pair slice.
+- **Header builder duplication**: `buildSystemRespHeaders` and `buildHandlerRespHeaders` both pack pair-lists into one contiguous buffer. The other two builders (`buildAuthRespHeaders`, `buildRedirectRespHeaders`) deleted with the admin-handler JS port — only these two remain, and could collapse to one builder taking a pair slice.
 - **Dev-mode escape hatches as `pub var`**: `ssrf.dev_allow_loopback` + `http_client.dev_allow_plaintext` are module-level mutable globals. Works but is ugly; should be plumbed as `DrainerConfig` fields.
-- **`handleAdminSignup` 170 lines** doing six things; could split into validate → provision → build-magic → maybe-queue-email → respond. Low-value cleanup.
 
 ## 12. Pre-release surprises (customer-visible gotchas)
 
