@@ -1422,6 +1422,53 @@ This isn't just a metaphor. The architectural claim is: real-world reactive appl
 6. **Drop the worker proxy + in-process file-server thread.** File-server runs as separate operator-deployed process. Update PLAN §10.13's "what deletes" list as actually-deleted.
 7. **Same shape for log-server**, slightly easier (query-only, latency-tolerant, no deploy-notification path).
 
+### 10.15 `analytics.track` primitive: structured-event emit with variable durability (decided 2026-04-30)
+
+**Framing**: customer-facing primitive for "record that this happened" — distinct from `webhook.send` because the *intent* is fire-and-forget bulk-batched ingest into an OLAP-shaped sink, not request/response with retry-to-DLQ. Same architectural family (structured data going somewhere via a port), different ergonomics. Trying to merge them into one primitive muddles the customer mental model.
+
+| | `webhook.send` | `analytics.track` |
+|---|---|---|
+| Intent | Call this API, react to the result | Record that this happened |
+| Delivery | Per-event HTTP call with `onResult` callback | Batched bulk insert |
+| Durability | At-least-once with retry-to-DLQ | Variable (best-effort default; transacted opt-in) |
+| Receiver | Anything HTTP | OLAP-shaped (columnar, append-only) |
+| Volume profile | Low-to-medium (3rd-party API rate limits) | High (every page view, every kv mutation) |
+
+**Two durability tiers** (third middle tier deliberately omitted — keep API simple):
+
+- **`durability: "best_effort"` (default)** — in-memory buffer per worker, periodic flush (every N events or M ms) into a centralized batch store, batched bulk-insert to OLAP destination on a slower tick. Drops events on crash before flush; drops events on backpressure. The right tier for ~all high-volume analytics: page views, click events, performance probes, request logs. Volume is high, individual loss is acceptable, batching is essential.
+- **`durability: "transacted"`** — event commits in the same writeset as the kv changes that produced it. Mirror into a per-tenant `_analytics_outbox/{id}` row; drainer ships them to OLAP with at-least-once semantics (same shape as `webhook.send`'s outbox). For events that *must* match kv state: "user_signup_completed", "purchase_recorded", "subscription_started." Lower volume by definition (composes with kv writes), higher cost per event, no loss.
+
+**Architecture**:
+
+```
+handler → analytics.track(event) → per-tenant in-memory buffer
+                                       ↓ (flush every N events or M ms)
+                                   centralized batch store (events.db, leader-local)
+                                       ↓ (batch tick: every K seconds, drain N rows)
+                                   OLAP destination (Loop46-OLAP service or external)
+
+handler → analytics.track(event, {durability:"transacted"})
+                                       ↓ (same writeset as kv writes)
+                                   _analytics_outbox/{id} per tenant
+                                       ↓ (drainer, same machinery as webhook.send)
+                                   OLAP destination
+```
+
+The "centralized batch store" is leader-local SQLite (à la `_webhooks.db` in §3 Phase 5.5d). On leader failover, the new leader scans tenants for any in-flight buffered events that need to ship; idempotency on event id (a 64-hex random) makes recovery safe across crashes.
+
+**Logs become a specific case** of this primitive. Once `analytics.track` exists, the platform itself emits a log event per request with `durability: "best_effort"` — automatic capture, same way the platform automatically writes the existing log buffer today. The current bespoke log pipeline (per-tenant `log.db`, batch propose to raft, query API at `/_system/log/*`) collapses into "the platform is a customer of `analytics.track`." Logs and customer analytics flow through the same machinery, end up in the same OLAP destination, get queried the same way. Significant code simplification — `src/log_server/` deletes once log queries become OLAP queries.
+
+**The OLAP destination is the §10.13 receiver shape.** `analytics.track` co-arrives with **Loop46-OLAP-as-pseudo-third-party**: an operator-deployed companion binary (`loop46-olap`) that consumes batched event streams from loop46 workers and stores them columnarly (DuckDB embedded in v1 most likely; ClickHouse-shape if scale demands it later). Customer's handler queries via `webhook.send` with bearer auth — same shape as Stripe, same shape as files-server. Operator can swap loop46-olap for ClickHouse Cloud / Tinybird / BigQuery without customers noticing — destination URL is config.
+
+**Sequencing**: post-launch. For v1, customers who want analytics can:
+- Use `webhook.send` to fire individual events to their OLAP destination (works, expensive at high volume, no batching).
+- Use the existing logs surface for request-level data (works, captured automatically, queryable via `/_system/log/*`).
+
+Neither is *great* but both are *workable* and unblock launch. The new primitive becomes the answer when (a) customer demand for high-volume custom analytics surfaces, and (b) loop46-olap or operator-config'd external OLAP exists as the receiver. Those two probably co-arrive — the OLAP service is what motivates the primitive; the primitive is what makes the OLAP service usable.
+
+**The north-star this locks in**: don't accidentally build N independent batched-event pipelines. Logs, customer analytics, future audit-event streams, future trigger-fire logging — all of them flow through `analytics.track` with the appropriate durability tier. Future-us shouldn't reinvent the log pipeline mechanism for "this new kind of structured event"; should add a new event type and emit it via the existing primitive.
+
 ## 11. Rove-library principles audit (2026-04-21)
 
 Audited against `~/.claude/memory/rove-library.md`. Findings:
