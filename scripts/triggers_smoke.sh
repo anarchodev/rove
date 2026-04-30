@@ -29,6 +29,22 @@ PORT="${HTTP_ADDR##*:}"
 ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
 TENANT_ORIGIN="https://trigsmoke.${PUBLIC_SUFFIX}:${PORT}"
 
+# TLS via mkcert. Both URLs are https://, so the worker has to listen
+# under TLS for curl to make it past the handshake.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
+else
+    LOOP46_DATA="${LOOP46_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/loop46}"
+fi
+TLS_CERT="$LOOP46_DATA/dev-cert.pem"
+TLS_KEY="$LOOP46_DATA/dev-key.pem"
+CACERT="$LOOP46_DATA/ca-root.pem"
+
+if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+    echo "error: missing dev TLS at $LOOP46_DATA. Run 'loop46 dev ...' once to bootstrap." >&2
+    exit 2
+fi
+
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
     exit 2
@@ -45,6 +61,8 @@ rm -rf "$DATA_DIR"
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
     --public-suffix "$PUBLIC_SUFFIX" \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
     --fresh >/tmp/triggers-smoke.out 2>&1 &
@@ -55,7 +73,7 @@ sleep 1.2
 
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
          --resolve "trigsmoke.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1")
-CURL=(curl -sS "${RESOLVE[@]}")
+CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 AUTH=(-H "Authorization: Bearer $TOKEN")
 
 ok() { echo "ok  $1"; }

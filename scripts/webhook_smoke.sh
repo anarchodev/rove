@@ -26,10 +26,27 @@ ECHO_PORT="${ECHO_PORT:-9197}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc}"
 ADMIN_HOST="app.loop46.localhost"
-ACME_HOST="acme.test"
+ACME_HOST="acme.loop46.localhost"
 PORT="${HTTP_ADDR##*:}"
 ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
 ACME_ORIGIN="https://${ACME_HOST}:${PORT}"
+
+# TLS via mkcert. ADMIN_ORIGIN + ACME_ORIGIN are https://, so the
+# worker has to listen under TLS for curl to make it past the
+# handshake.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
+else
+    LOOP46_DATA="${LOOP46_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/loop46}"
+fi
+TLS_CERT="$LOOP46_DATA/dev-cert.pem"
+TLS_KEY="$LOOP46_DATA/dev-key.pem"
+CACERT="$LOOP46_DATA/ca-root.pem"
+
+if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+    echo "error: missing dev TLS at $LOOP46_DATA. Run 'loop46 dev ...' once to bootstrap." >&2
+    exit 2
+fi
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
@@ -41,6 +58,15 @@ if ! command -v python3 >/dev/null; then
 fi
 
 rm -rf "$DATA_DIR"
+
+# Pre-create `acme` (with cbfire/ + cbresult.mjs handlers) via the
+# seed manifest. The smoke fires through `acme.loop46.localhost`
+# (auto-resolved via wildcard public-suffix routing) and the
+# manifest's bundled handlers exercise the webhook + callback path.
+"$BIN" seed \
+    --data-dir "$DATA_DIR" \
+    --manifest examples/loop46-demo-tenants.json >/tmp/webhook-smoke-seed.out 2>&1 \
+    || { cat /tmp/webhook-smoke-seed.out >&2; exit 2; }
 
 # ── 1. Tiny Python echo server ────────────────────────────────────────
 #
@@ -88,10 +114,13 @@ sleep 0.3
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
     --admin-api-domain "$ADMIN_HOST" \
+    --public-suffix loop46.localhost \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
     --dev-webhook-unsafe \
-    --fresh >/tmp/webhook-smoke.out 2>&1 &
+    >/tmp/webhook-smoke.out 2>&1 &
 WORKER_PID=$!
 
 cleanup() {
@@ -107,7 +136,7 @@ sleep 1.2
 
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
          --resolve "${ACME_HOST}:${PORT}:127.0.0.1")
-CURL=(curl -sS "${RESOLVE[@]}")
+CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 
 ok() { echo "ok  $1"; }
 fail() {

@@ -52,6 +52,7 @@ rm -rf "$DATA_DIR"
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ORIGIN" \
     --admin-api-domain "$API_HOST" \
+    --public-suffix loop46.localhost \
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \

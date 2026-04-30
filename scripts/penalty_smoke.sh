@@ -29,16 +29,27 @@ fi
 
 rm -rf "$DATA_DIR"
 
+# Pre-create the `penalty` tenant on disk via the seed manifest. The
+# tenant ships a `while(true)` handler that the budget interrupt
+# fires on. Wildcard routing (--public-suffix loop46.localhost)
+# resolves `penalty.loop46.localhost` → instance `penalty`.
+"$WORKER_BIN" seed \
+    --data-dir "$DATA_DIR" \
+    --manifest examples/loop46-demo-tenants.json >/tmp/penalty-smoke-seed.out 2>&1 \
+    || { cat /tmp/penalty-smoke-seed.out >&2; exit 2; }
+
 # --workers 1: penalty-box state is per-worker, so SO_REUSEPORT spread
 # across N workers would dilute kill counts and never trip the box.
-"$WORKER_BIN" \
+# (Note: --fresh would wipe the seed; deliberately omitted here.)
+"$WORKER_BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
     --data-dir "$DATA_DIR" \
+    --public-suffix loop46.localhost \
     --workers 1 \
-    --fresh >/tmp/penalty-smoke.out 2>&1 &
+    >/tmp/penalty-smoke.out 2>&1 &
 WORKER_PID=$!
 trap 'kill $WORKER_PID 2>/dev/null || true; wait $WORKER_PID 2>/dev/null || true' EXIT
 
@@ -50,6 +61,7 @@ curl_status() {
     # -s: silent; -o /dev/null: drop body; -w '%{http_code}': print just code.
     # --max-time 5: cap in case something is truly stuck.
     curl \
+         --http2-prior-knowledge \
          --max-time 5 \
          -s -o /dev/null \
          -w '%{http_code}' \
