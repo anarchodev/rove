@@ -691,6 +691,23 @@ pub const Tenant = struct {
         kv.put("resend_key", key) catch return Error.Kv;
     }
 
+    /// From-address for platform-fired emails (signup magic links,
+    /// future system notifications). Persisted in admin app.db so
+    /// the JS handler can read it via `kv.get("platform_email_from")`
+    /// without needing a custom primitive. Worker bootstrap writes
+    /// the operator's `--platform-email-from` value (defaulting to
+    /// "noreply@loop46.me") at startup.
+    pub fn installPlatformEmailFrom(self: *Tenant, value: []const u8) Error!void {
+        if (value.len == 0 or value.len > 254) return Error.InvalidToken;
+        // Same printable-ASCII gate as the Resend key — keeps a stray
+        // newline or NUL from corrupting the email envelope downstream.
+        for (value) |b| {
+            if (b < 0x21 or b > 0x7e) return Error.InvalidToken;
+        }
+        const kv = try self.adminKv();
+        kv.put("platform_email_from", value) catch return Error.Kv;
+    }
+
     /// Returns the stored Resend key or null if none installed. The
     /// bytes are allocated by the admin tenant's `KvStore`'s
     /// allocator; free with the same allocator the tenant was
@@ -710,52 +727,17 @@ pub const Tenant = struct {
     // `Set-Cookie` after a successful login. Stored in the admin
     // tenant's app.db under `session/{sha256(opaque)}` — the store
     // only retains the hash, so a leaked app.db can't impersonate
-    // live sessions. Value = `{expires_at_ns i64 little-endian}{is_root u8}`.
-    // TTL comes from the caller at mint time.
+    // live sessions. Value =
+    // `{"expires_at_ns":<i64>,"is_root":<bool>}` (JSON, so admin's
+    // JS handler can parse via `kv.get` + `JSON.parse`).
+    //
+    // Mint + revoke live in admin's deployed JS bundle now (post-
+    // 2d cutover); only `authenticateSession` remains in Zig
+    // because `extractAdminAuth` (used by /_system/* + the admin
+    // host's RPC auth gate) still validates cookies before
+    // dispatching to JS.
 
     pub const SESSION_HEX_LEN: usize = 64;
-
-    /// Fresh opaque 64-hex session token. Returns the plaintext to hand
-    /// the caller (for a `Set-Cookie`); the store only retains its hash.
-    /// `ttl_ns` is the lifetime from now.
-    pub fn createSession(
-        self: *Tenant,
-        ctx: AuthContext,
-        ttl_ns: i64,
-    ) Error![SESSION_HEX_LEN]u8 {
-        const kv = try self.adminKv();
-
-        var raw: [32]u8 = undefined;
-        std.crypto.random.bytes(&raw);
-
-        var opaque_hex: [SESSION_HEX_LEN]u8 = undefined;
-        bytesToHex(&raw, &opaque_hex);
-
-        var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(&opaque_hex, &hash, .{});
-        var hash_hex: [SESSION_HEX_LEN]u8 = undefined;
-        bytesToHex(&hash, &hash_hex);
-
-        var key_buf: [8 + SESSION_HEX_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "session/{s}", .{hash_hex}) catch
-            return Error.Kv;
-
-        // JSON on-disk shape: `{"expires_at_ns":<i64>,"is_root":<bool>}`.
-        // Max length ~58 chars (i64 → 20 chars + boolean + literal
-        // framing); 96 is a safe ceiling. Was 9 raw bytes (8 LE +
-        // flag); switched so admin's JS can read sessions via
-        // `kv.get` + `JSON.parse` once the auth handler ports over.
-        var val_buf: [96]u8 = undefined;
-        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-        const expires_at_ns: i64 = now_ns +| ttl_ns;
-        const json = std.fmt.bufPrint(&val_buf, "{{\"expires_at_ns\":{d},\"is_root\":{s}}}", .{
-            expires_at_ns,
-            if (ctx.is_root) "true" else "false",
-        }) catch return Error.Kv;
-
-        kv.put(key, json) catch return Error.Kv;
-        return opaque_hex;
-    }
 
     /// Validate an opaque session token. Returns `null` if the token is
     /// malformed, unknown, or expired (expired entries are swept on
@@ -805,201 +787,6 @@ pub const Tenant = struct {
             return null;
         }
         return .{ .is_root = parsed.value.is_root };
-    }
-
-    /// Revoke a session by its opaque token. No-op if the session
-    /// doesn't exist (idempotent logout).
-    pub fn revokeSession(self: *Tenant, opaque_hex: []const u8) Error!void {
-        if (opaque_hex.len != SESSION_HEX_LEN) return;
-        const kv = try self.adminKv();
-        var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(opaque_hex, &hash, .{});
-        var hash_hex: [SESSION_HEX_LEN]u8 = undefined;
-        bytesToHex(&hash, &hash_hex);
-        var key_buf: [8 + SESSION_HEX_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "session/{s}", .{hash_hex}) catch
-            return Error.Kv;
-        kv.delete(key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return Error.Kv,
-        };
-    }
-
-    // ── Magic-link primitive ─────────────────────────────────────────
-    //
-    // Signup / email-login flow. `mintMagic` generates a fresh opaque
-    // 64-hex token, hashes it with SHA-256, and stores
-    // `magic/{hash_hex}` in the admin tenant's app.db →
-    //   `{"email":"...","instance_id":"...","expires_at_ns":<i64>}`.
-    // The caller emails the plaintext token; `redeemMagic` hashes the
-    // submitted token, looks up the row, enforces TTL, and
-    // **deletes the row before returning** — single-use, so a replayed
-    // link never validates twice.
-    //
-    // Why hash-at-rest: a leaked admin app.db (backup, support dump,
-    // dev clone) must not let an attacker impersonate pending signups.
-    // The hash stores nothing redeemable; the pre-image (the link in
-    // the user's inbox) is what redeems. Same pattern as
-    // `createSession` above.
-    //
-    // Why JSON as the value: we need variable-length strings (email +
-    // instance_id) where sessions only carry fixed bytes. Email shape
-    // is restricted (`validateEmail`) so JSON escaping concerns can't
-    // bite — no quotes or backslashes can reach the stored string.
-
-    pub const MAGIC_HEX_LEN: usize = 64;
-
-    /// Plaintext + metadata returned from `redeemMagic`. Both strings
-    /// are owned by the caller's allocator (the same one passed at
-    /// `Tenant.init`) and must be freed via `deinit`.
-    pub const RedeemedMagic = struct {
-        email: []u8,
-        instance_id: []u8,
-
-        pub fn deinit(self: *RedeemedMagic, allocator: std.mem.Allocator) void {
-            allocator.free(self.email);
-            allocator.free(self.instance_id);
-            self.* = undefined;
-        }
-    };
-
-    /// Mint a fresh magic token scoped to `(email, instance_id)`.
-    /// Returns the 64-hex plaintext the caller should embed in the
-    /// emailed link. Only `sha256(plaintext)` is stored — the token
-    /// itself is unrecoverable once the return value is dropped.
-    ///
-    /// `ttl_ns` is the lifetime from now; PLAN §2.2 default is
-    /// 15 minutes. The caller picks so the primitive stays general
-    /// (a "forgot password" flow might pick longer; a confirmation
-    /// might pick shorter).
-    pub fn mintMagic(
-        self: *Tenant,
-        email: []const u8,
-        instance_id: []const u8,
-        ttl_ns: i64,
-    ) Error![MAGIC_HEX_LEN]u8 {
-        try validateEmail(email);
-        try validateInstanceId(instance_id);
-        const kv = try self.adminKv();
-
-        var raw: [32]u8 = undefined;
-        std.crypto.random.bytes(&raw);
-        var opaque_hex: [MAGIC_HEX_LEN]u8 = undefined;
-        bytesToHex(&raw, &opaque_hex);
-
-        var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(&opaque_hex, &hash, .{});
-        var hash_hex: [MAGIC_HEX_LEN]u8 = undefined;
-        bytesToHex(&hash, &hash_hex);
-
-        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-        const expires_at_ns: i64 = now_ns +| ttl_ns;
-
-        // Email has no quotes / backslashes (validateEmail) and
-        // instance_id matches `[A-Za-z0-9_-]+` (validateInstanceId),
-        // so direct interpolation is JSON-safe.
-        const body = std.fmt.allocPrint(
-            self.allocator,
-            "{{\"email\":\"{s}\",\"instance_id\":\"{s}\",\"expires_at_ns\":{d}}}",
-            .{ email, instance_id, expires_at_ns },
-        ) catch return Error.OutOfMemory;
-        defer self.allocator.free(body);
-
-        var key_buf: [6 + MAGIC_HEX_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "magic/{s}", .{hash_hex}) catch
-            return Error.Kv;
-        kv.put(key, body) catch return Error.Kv;
-
-        return opaque_hex;
-    }
-
-    /// Single-use redeem. Returns `null` for malformed, unknown, or
-    /// expired tokens (stale rows are swept on access). On success,
-    /// the row is deleted BEFORE returning so a race-redeem can only
-    /// see the hit once.
-    pub fn redeemMagic(
-        self: *Tenant,
-        token_hex: []const u8,
-    ) Error!?RedeemedMagic {
-        if (token_hex.len != MAGIC_HEX_LEN) return null;
-        for (token_hex) |b| {
-            const ok = (b >= '0' and b <= '9') or
-                (b >= 'a' and b <= 'f') or
-                (b >= 'A' and b <= 'F');
-            if (!ok) return null;
-        }
-        const kv = try self.adminKv();
-
-        var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(token_hex, &hash, .{});
-        var hash_hex: [MAGIC_HEX_LEN]u8 = undefined;
-        bytesToHex(&hash, &hash_hex);
-
-        var key_buf: [6 + MAGIC_HEX_LEN]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "magic/{s}", .{hash_hex}) catch
-            return Error.Kv;
-
-        const v = kv.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return Error.Kv,
-        };
-        defer self.allocator.free(v);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, v, .{
-            .allocate = .alloc_always,
-        }) catch {
-            // Corrupted row — drop it and treat as a miss. Better
-            // than leaking parser state up through an auth path.
-            kv.delete(key) catch {};
-            return null;
-        };
-        defer parsed.deinit();
-        const obj = switch (parsed.value) {
-            .object => |o| o,
-            else => {
-                kv.delete(key) catch {};
-                return null;
-            },
-        };
-
-        const expires_at_ns = switch (obj.get("expires_at_ns") orelse .null) {
-            .integer => |i| i,
-            else => {
-                kv.delete(key) catch {};
-                return null;
-            },
-        };
-        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-        if (now_ns >= expires_at_ns) {
-            kv.delete(key) catch {};
-            return null;
-        }
-
-        const email_str = switch (obj.get("email") orelse .null) {
-            .string => |s| s,
-            else => {
-                kv.delete(key) catch {};
-                return null;
-            },
-        };
-        const inst_str = switch (obj.get("instance_id") orelse .null) {
-            .string => |s| s,
-            else => {
-                kv.delete(key) catch {};
-                return null;
-            },
-        };
-
-        const email_copy = self.allocator.dupe(u8, email_str) catch return Error.OutOfMemory;
-        errdefer self.allocator.free(email_copy);
-        const inst_copy = self.allocator.dupe(u8, inst_str) catch return Error.OutOfMemory;
-        errdefer self.allocator.free(inst_copy);
-
-        // Single-use: burn the record before returning. A second
-        // redeem racing the first sees NotFound.
-        kv.delete(key) catch return Error.Kv;
-
-        return .{ .email = email_copy, .instance_id = inst_copy };
     }
 
     /// Check whether the given auth context is allowed to operate on
@@ -1060,24 +847,6 @@ fn bytesToHex(src: []const u8, dst: []u8) void {
 
 // ── Validation ─────────────────────────────────────────────────────────
 
-/// Public accessor for the instance-id shape check. Callers that
-/// need to validate before choosing between "create" and "error"
-/// paths use this; the existing `createInstance` runs the same
-/// check internally. Re-exported verbatim to avoid duplicating the
-/// shape rules.
-pub fn validateInstanceIdForSignup(id: []const u8) Error!void {
-    return validateInstanceId(id);
-}
-
-/// Public accessor for the email shape check used by
-/// `mintMagic`. Lets callers (e.g. the signup HTTP handler) reject
-/// bad input before any side effects — without this, the only way
-/// to probe email validity is to call `mintMagic`, which has
-/// already fired `std.crypto.random.bytes` and written KV state.
-pub fn validateEmailForSignup(email: []const u8) Error!void {
-    return validateEmail(email);
-}
-
 fn validateInstanceId(id: []const u8) Error!void {
     if (id.len == 0 or id.len > MAX_INSTANCE_ID_LEN) return Error.InvalidInstanceId;
     for (id) |b| {
@@ -1095,24 +864,6 @@ fn validateHost(host: []const u8) Error!void {
         if (b < 0x21 or b > 0x7e) return Error.InvalidHost;
         if (b == '/' or b == '\\') return Error.InvalidHost;
     }
-}
-
-/// Lightweight email shape guard for the magic-link primitive:
-/// non-empty, ≤254 bytes (RFC 5321 addr-spec ceiling), exactly one
-/// `@`, printable ASCII, no quote/backslash/whitespace/control
-/// bytes. Deliberately strict — handles the 99% case and keeps the
-/// stored JSON trivially escape-free. Pathological forms (quoted
-/// local-parts, internationalized addresses) would be rejected here
-/// and can be relaxed later without changing the on-disk shape.
-fn validateEmail(email: []const u8) Error!void {
-    if (email.len == 0 or email.len > 254) return Error.InvalidToken;
-    var at_count: usize = 0;
-    for (email) |b| {
-        if (b < 0x21 or b > 0x7e) return Error.InvalidToken;
-        if (b == '"' or b == '\\') return Error.InvalidToken;
-        if (b == '@') at_count += 1;
-    }
-    if (at_count != 1) return Error.InvalidToken;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1622,15 +1373,40 @@ test "validateHost rejects slashes and whitespace" {
     try validateHost("api.v1.example.com:8443");
 }
 
-test "createSession + authenticateSession round-trip" {
+// Helper: write a session row in the JSON-on-disk shape that admin's
+// JS handler produces. Mirrors the format documented above
+// `authenticateSession` so the Zig-side reader is exercised against
+// the same bytes a JS handler would emit.
+fn putSessionRow(
+    tenant: *Tenant,
+    opaque_hex: []const u8,
+    expires_at_ns: i64,
+    is_root: bool,
+) !void {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(opaque_hex, &hash, .{});
+    var hash_hex: [Tenant.SESSION_HEX_LEN]u8 = undefined;
+    bytesToHex(&hash, &hash_hex);
+    var key_buf: [8 + Tenant.SESSION_HEX_LEN]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "session/{s}", .{hash_hex});
+    var val_buf: [96]u8 = undefined;
+    const json = try std.fmt.bufPrint(&val_buf, "{{\"expires_at_ns\":{d},\"is_root\":{s}}}", .{
+        expires_at_ns,
+        if (is_root) "true" else "false",
+    });
+    const kv = try tenant.adminKv();
+    try kv.put(key, json);
+}
+
+test "authenticateSession reads JSON-shape session row produced by admin's JS" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
 
-    const ctx: AuthContext = .{ .is_root = true };
-    const opaque_hex = try fx.tenant.createSession(ctx, std.time.ns_per_s * 60);
-    try testing.expectEqual(@as(usize, 64), opaque_hex.len);
+    const opaque_hex = "a" ** 64;
+    const future_ns: i64 = @intCast(std.time.nanoTimestamp() + std.time.ns_per_s * 60);
+    try putSessionRow(fx.tenant, opaque_hex, future_ns, true);
 
-    const resolved = try fx.tenant.authenticateSession(&opaque_hex);
+    const resolved = try fx.tenant.authenticateSession(opaque_hex);
     try testing.expect(resolved != null);
     try testing.expect(resolved.?.is_root);
 }
@@ -1647,59 +1423,29 @@ test "authenticateSession rejects unknown tokens" {
     try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession("zz" ** 32));
 }
 
-test "revokeSession clears the record" {
+test "expired session is rejected and swept on access" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
 
-    const ctx: AuthContext = .{ .is_root = true };
-    const opaque_hex = try fx.tenant.createSession(ctx, std.time.ns_per_s * 60);
-    try testing.expect(try fx.tenant.authenticateSession(&opaque_hex) != null);
+    const opaque_hex = "b" ** 64;
+    try putSessionRow(fx.tenant, opaque_hex, -1, true); // negative-ns timestamp = already expired
 
-    try fx.tenant.revokeSession(&opaque_hex);
-    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(&opaque_hex));
-
-    // Idempotent revoke.
-    try fx.tenant.revokeSession(&opaque_hex);
+    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(opaque_hex));
+    // Second lookup also null — the first call swept the row.
+    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(opaque_hex));
 }
 
-test "expired session is rejected and swept" {
+test "authenticateSession returns is_root=false for non-root sessions" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
 
-    const ctx: AuthContext = .{ .is_root = true };
-    // Negative TTL → already-expired session, exercises the sweep path.
-    const opaque_hex = try fx.tenant.createSession(ctx, -1);
-    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(&opaque_hex));
-    // Second lookup also null — sweep removed it.
-    try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(&opaque_hex));
-}
+    const opaque_hex = "c" ** 64;
+    const future_ns: i64 = @intCast(std.time.nanoTimestamp() + std.time.ns_per_s * 60);
+    try putSessionRow(fx.tenant, opaque_hex, future_ns, false);
 
-test "session row on disk is JSON parseable as {expires_at_ns, is_root}" {
-    // Locks in the storage shape so admin's JS handler can read
-    // sessions via `kv.get` + `JSON.parse` without a dedicated
-    // primitive (Phase 4 amendment, signup.md).
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    const ctx: AuthContext = .{ .is_root = true };
-    const opaque_hex = try fx.tenant.createSession(ctx, std.time.ns_per_s * 60);
-
-    var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&opaque_hex, &hash, .{});
-    var hash_hex: [64]u8 = undefined;
-    bytesToHex(&hash, &hash_hex);
-    var key_buf: [8 + 64]u8 = undefined;
-    const key = try std.fmt.bufPrint(&key_buf, "session/{s}", .{hash_hex});
-
-    const kv = try fx.tenant.adminKv();
-    const raw = try kv.get(key);
-    defer testing.allocator.free(raw);
-
-    const SessionRow = struct { expires_at_ns: i64, is_root: bool };
-    const parsed = try std.json.parseFromSlice(SessionRow, testing.allocator, raw, .{});
-    defer parsed.deinit();
-    try testing.expect(parsed.value.expires_at_ns > 0);
-    try testing.expect(parsed.value.is_root);
+    const resolved = try fx.tenant.authenticateSession(opaque_hex);
+    try testing.expect(resolved != null);
+    try testing.expect(!resolved.?.is_root);
 }
 
 test "installResendKey + getResendKey round-trip" {
@@ -1736,89 +1482,8 @@ test "installResendKey rejects empty / whitespace / out-of-range" {
     try testing.expectError(Error.InvalidToken, fx.tenant.installResendKey("has\nnewline123456"));
 }
 
-test "mintMagic + redeemMagic round-trip returns email + instance_id" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    const token = try fx.tenant.mintMagic("alice@example.com", "alice-api", std.time.ns_per_s * 60);
-
-    var redeemed = (try fx.tenant.redeemMagic(&token)).?;
-    defer redeemed.deinit(testing.allocator);
-    try testing.expectEqualStrings("alice@example.com", redeemed.email);
-    try testing.expectEqualStrings("alice-api", redeemed.instance_id);
-}
-
-test "redeemMagic is single-use: second redeem returns null" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    const token = try fx.tenant.mintMagic("bob@example.com", "bob-api", std.time.ns_per_s * 60);
-    var first = (try fx.tenant.redeemMagic(&token)).?;
-    first.deinit(testing.allocator);
-
-    try testing.expectEqual(@as(?Tenant.RedeemedMagic, null), try fx.tenant.redeemMagic(&token));
-}
-
-test "redeemMagic rejects expired tokens" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    // Negative TTL → already expired at mint time.
-    const token = try fx.tenant.mintMagic("carol@example.com", "carol-api", -1);
-    try testing.expectEqual(@as(?Tenant.RedeemedMagic, null), try fx.tenant.redeemMagic(&token));
-
-    // And the row should have been swept — a subsequent re-mint
-    // wouldn't observe it either (no prior-state interference).
-    try testing.expectEqual(@as(?Tenant.RedeemedMagic, null), try fx.tenant.redeemMagic(&token));
-}
-
-test "redeemMagic rejects malformed tokens" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    try testing.expectEqual(@as(?Tenant.RedeemedMagic, null), try fx.tenant.redeemMagic(""));
-    try testing.expectEqual(@as(?Tenant.RedeemedMagic, null), try fx.tenant.redeemMagic("too-short"));
-    try testing.expectEqual(@as(?Tenant.RedeemedMagic, null), try fx.tenant.redeemMagic("zz" ** 32));
-    try testing.expectEqual(@as(?Tenant.RedeemedMagic, null), try fx.tenant.redeemMagic("0" ** 63)); // 63 hex
-}
-
-test "redeemMagic rejects unknown tokens without mutating store" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    // Plant a real token so we can prove unrelated lookups don't
-    // disturb it.
-    const real = try fx.tenant.mintMagic("dave@example.com", "dave-api", std.time.ns_per_s * 60);
-
-    // 64 hex chars, but never minted.
-    const bogus = "a" ** 64;
-    try testing.expectEqual(@as(?Tenant.RedeemedMagic, null), try fx.tenant.redeemMagic(bogus));
-
-    // Real token still redeems.
-    var got = (try fx.tenant.redeemMagic(&real)).?;
-    defer got.deinit(testing.allocator);
-    try testing.expectEqualStrings("dave@example.com", got.email);
-}
-
-test "mintMagic rejects invalid email + instance_id" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    try testing.expectError(Error.InvalidToken, fx.tenant.mintMagic("", "x", 0));
-    try testing.expectError(Error.InvalidToken, fx.tenant.mintMagic("no-at-sign", "x", 0));
-    try testing.expectError(Error.InvalidToken, fx.tenant.mintMagic("two@@signs", "x", 0));
-    try testing.expectError(Error.InvalidToken, fx.tenant.mintMagic("has\"quote@x.com", "x", 0));
-    try testing.expectError(Error.InvalidToken, fx.tenant.mintMagic("has\\backslash@x.com", "x", 0));
-    try testing.expectError(Error.InvalidToken, fx.tenant.mintMagic("spaces @x.com", "x", 0));
-    try testing.expectError(Error.InvalidInstanceId, fx.tenant.mintMagic("a@b.com", "", 0));
-    try testing.expectError(Error.InvalidInstanceId, fx.tenant.mintMagic("a@b.com", "has space", 0));
-}
-
-test "mintMagic: fresh tokens are distinct" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-
-    const t1 = try fx.tenant.mintMagic("alice@example.com", "alice", std.time.ns_per_s * 60);
-    const t2 = try fx.tenant.mintMagic("alice@example.com", "alice", std.time.ns_per_s * 60);
-    try testing.expect(!std.mem.eql(u8, &t1, &t2));
-}
+// Note: mintMagic + redeemMagic + their tests moved to admin's
+// deployed JS bundle (loop46/main.zig ADMIN_HANDLER_SRC) when the
+// /v1/* handler port landed. Coverage now lives in
+// scripts/signup_smoke.sh which exercises the full mint → email
+// outbox → click → redeem path against a live worker.

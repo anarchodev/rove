@@ -282,23 +282,25 @@ if echo "$body" | grep -q '"magic_link"'; then
 fi
 ok "signup with Resend key → 202, magic_link suppressed"
 
-# Inspect bob's outbox via the admin listKv RPC. The envelope body
-# should contain the Resend URL, the from/to addresses, and the
-# subject line.
+# Inspect __admin__'s outbox via the admin listKv RPC. Lazy-creation
+# (Phase 4 amendment) keeps bob from existing as a tenant until magic
+# redeem completes — the signup email outbox row therefore lands in
+# admin's app.db, not in a (nonexistent) bob/. The drainer scans
+# every tenant's _outbox/* on tick, so it picks this one up the
+# same way it picks up customer-fired email.send rows.
 qs=$(python3 -c "
 import json, urllib.parse
 print(urllib.parse.quote(json.dumps(['_outbox/','',10])))
 ")
 outbox=$("${CURL[@]}" \
     -H "Authorization: Bearer $TOKEN" \
-    -H "X-Rove-Scope: bob" \
     "${ADMIN_ORIGIN}/?fn=listKv&args=${qs}")
 # The envelope body is JSON-encoded inside the envelope's "body"
 # string, which in turn is JSON-encoded inside the listKv response,
 # so the dynamic fields appear with one layer of JSON escaping. We
 # grep for substrings (avoiding quote characters) rather than reach
 # through two levels of JSON.parse.
-echo "$outbox" | grep -q '"key":"_outbox/' || fail "no _outbox row in bob's kv: $outbox"
+echo "$outbox" | grep -q '"key":"_outbox/' || fail "no _outbox row in __admin__'s kv: $outbox"
 echo "$outbox" | grep -q 'api.resend.com/emails' || fail "outbox envelope missing Resend URL"
 echo "$outbox" | grep -q 'bob@example.com' || fail "outbox envelope missing recipient"
 echo "$outbox" | grep -q 'noreply@smoke.test' || fail "outbox envelope missing from address"

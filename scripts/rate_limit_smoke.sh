@@ -100,15 +100,21 @@ put_file() {
     [[ "$code" == "201" ]] || fail "PUT ${instance}/${path}: got $code"
 }
 
-# ── 1. Two tenants signed up ──────────────────────────────────────────
+# ── 1. Two tenants signed up + magic-link redeemed ────────────────────
+# Lazy creation: signup writes pending/{name} only; the tenant
+# directory + starter deploy happen at /v1/auth redeem time.
 for name in rl1 rl2; do
     body=$("${CURL[@]}" -X POST \
         -H "Content-Type: application/json" \
         -d "{\"name\":\"${name}\",\"email\":\"${name}@example.com\"}" \
         "${ADMIN_ORIGIN}/v1/signup")
     echo "$body" | grep -q '"ok":true' || fail "signup ${name}: $body"
+    mt=$(echo "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["magic_link"])' \
+        | sed 's/.*mt=//')
+    code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${ADMIN_ORIGIN}/v1/auth?mt=${mt}")
+    [[ "$code" == "302" ]] || fail "redeem ${name}: got $code"
 done
-ok "POST /v1/signup rl1 + rl2"
+ok "POST /v1/signup + /v1/auth redeem rl1 + rl2"
 
 # ── 2. Per-instance request bucket: capacity=5, then 429 ─────────────
 # Hit rl1's URL 5 times — all 200 (starter content's index.html). The

@@ -214,7 +214,10 @@ const ADMIN_HANDLER_SRC =
     \\const SESSION_COOKIE = "rove_session";
     \\const SESSION_TTL_NS = 7 * 24 * 3600 * 1_000_000_000;
     \\const MAGIC_TTL_NS   = 30 * 60 * 1_000_000_000;
-    \\const PLATFORM_EMAIL_FROM = "noreply@loop46.me";
+    \\
+    \\function platformEmailFrom() {
+    \\    return kv.get("platform_email_from") || "noreply@loop46.me";
+    \\}
     \\
     \\// Same RESERVED_INSTANCE_NAMES as worker.zig — admin's JS owns
     \\// the list once the port lands so operators can adjust without a
@@ -295,20 +298,40 @@ const ADMIN_HANDLER_SRC =
     \\        + "; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=" + maxAgeS;
     \\}
     \\
+    \\// Authenticate via session cookie OR Authorization: Bearer
+    \\// (root token issued at bootstrap). Cookie path: hash, kv.get
+    \\// session/{hash}, sweep on expiry. Bearer path: hash, look up
+    \\// root_token/{hash} in root.db. Bearer-authed callers always
+    \\// get is_root=true; the dashboard's RPC path uses cookies.
     \\function checkSession() {
     \\    const opaque = request.cookies[SESSION_COOKIE];
-    \\    if (!isHex64(opaque)) return null;
-    \\    const hash = crypto.sha256(opaque);
-    \\    const raw = kv.get("session/" + hash);
-    \\    if (!raw) return null;
-    \\    let row;
-    \\    try { row = JSON.parse(raw); }
-    \\    catch (_) { kv.delete("session/" + hash); return null; }
-    \\    if (nowNs() >= row.expires_at_ns) {
-    \\        kv.delete("session/" + hash);
-    \\        return null;
+    \\    if (isHex64(opaque)) {
+    \\        const hash = crypto.sha256(opaque);
+    \\        const raw = kv.get("session/" + hash);
+    \\        if (raw) {
+    \\            let row = null;
+    \\            try { row = JSON.parse(raw); } catch (_) {}
+    \\            if (!row) { kv.delete("session/" + hash); }
+    \\            else if (nowNs() >= row.expires_at_ns) {
+    \\                kv.delete("session/" + hash);
+    \\            } else {
+    \\                return { is_root: !!row.is_root };
+    \\            }
+    \\        }
     \\    }
-    \\    return { is_root: !!row.is_root };
+    \\    const auth = request.headers.authorization;
+    \\    if (typeof auth === "string" && auth.length > 7) {
+    \\        const lower = auth.slice(0, 7).toLowerCase();
+    \\        if (lower === "bearer ") {
+    \\            const token = auth.slice(7).trim();
+    \\            if (isHex64(token)) {
+    \\                if (platform.root.get("root_token/" + crypto.sha256(token)) !== null) {
+    \\                    return { is_root: true };
+    \\                }
+    \\            }
+    \\        }
+    \\    }
+    \\    return null;
     \\}
     \\
     \\function parseQueryParam(query, name) {
@@ -387,18 +410,18 @@ const ADMIN_HANDLER_SRC =
     \\        // (admin's app.db), which the leader-side drainer scans.
     \\        email.send({
     \\            key: resendKey,
-    \\            from: PLATFORM_EMAIL_FROM,
+    \\            from: platformEmailFrom(),
     \\            to: userEmail,
     \\            subject: "Finish signing up for Loop46",
     \\            text: buildSignupEmailText(magicLink, name),
     \\        });
     \\        response.status = 202;
-    \\        return { ok: true };
+    \\        return { ok: true, name: name };
     \\    }
     \\    // Dev path: no Resend key configured → return link in body so
     \\    // smoke + CLI can click through without an SMTP endpoint.
     \\    response.status = 202;
-    \\    return { ok: true, magic_link: magicLink };
+    \\    return { ok: true, name: name, magic_link: magicLink };
     \\}
     \\
     \\// GET /v1/auth?mt=<64-hex> — redeem the magic link, lazy-create
@@ -515,7 +538,11 @@ const ADMIN_HANDLER_SRC =
     \\}
     \\
     \\export default function() {
-    \\    const path = request.path;
+    \\    // request.path carries the full URL path including any
+    \\    // ?query suffix; strip it for exact-match dispatch below.
+    \\    const fullPath = request.path;
+    \\    const q = fullPath.indexOf("?");
+    \\    const path = q === -1 ? fullPath : fullPath.slice(0, q);
     \\    const method = request.method;
     \\
     \\    // Pre-auth: signup + magic-link redeem + token login + logout
@@ -1674,6 +1701,15 @@ pub fn main() !void {
             };
             std.debug.print("bootstrap: resend key installed (platform default)\n", .{});
         }
+
+        // Always-write platform_email_from so admin's JS handler can
+        // pull the operator-configured From: address via kv.get
+        // without a fallback hardcode. Defaults to "noreply@loop46.me"
+        // when --platform-email-from is omitted.
+        tenant.installPlatformEmailFrom(cli.platform_email_from) catch |err| {
+            std.debug.print("bootstrap: installPlatformEmailFrom failed: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
 
         // Always-deploy: the embedded admin UI bundle. Demo + benchmark
         // tenants get provisioned by `loop46 seed --manifest ...` (out

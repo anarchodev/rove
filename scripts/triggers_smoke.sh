@@ -84,13 +84,19 @@ fail() {
     exit 1
 }
 
-# ── 1. Signup creates the trigsmoke tenant ─────────────────────────────────
+# ── 1. Signup + redeem creates the trigsmoke tenant ────────────────────────
+# Lazy creation: signup writes pending/{name} only; the tenant
+# directory + starter deploy happen at /v1/auth redeem time.
 body=$("${CURL[@]}" -X POST \
     -H "Content-Type: application/json" \
     -d '{"name":"trigsmoke","email":"trigsmoke@example.com"}' \
     "${ADMIN_ORIGIN}/v1/signup")
 echo "$body" | grep -q '"ok":true' || fail "signup not ok: $body"
-ok "POST /v1/signup trigsmoke"
+MT=$(echo "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["magic_link"])' \
+    | sed 's/.*mt=//')
+code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${ADMIN_ORIGIN}/v1/auth?mt=${MT}")
+[[ "$code" == "302" ]] || fail "redeem trigsmoke: got $code"
+ok "POST /v1/signup + /v1/auth redeem trigsmoke"
 
 # Helper: PUT a single file into trigsmoke's deployment. Each call commits
 # a fresh deployment.
