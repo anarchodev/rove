@@ -740,13 +740,20 @@ pub const Tenant = struct {
         const key = std.fmt.bufPrint(&key_buf, "session/{s}", .{hash_hex}) catch
             return Error.Kv;
 
-        var val_buf: [9]u8 = undefined;
+        // JSON on-disk shape: `{"expires_at_ns":<i64>,"is_root":<bool>}`.
+        // Max length ~58 chars (i64 → 20 chars + boolean + literal
+        // framing); 96 is a safe ceiling. Was 9 raw bytes (8 LE +
+        // flag); switched so admin's JS can read sessions via
+        // `kv.get` + `JSON.parse` once the auth handler ports over.
+        var val_buf: [96]u8 = undefined;
         const now_ns: i64 = @intCast(std.time.nanoTimestamp());
         const expires_at_ns: i64 = now_ns +| ttl_ns;
-        std.mem.writeInt(i64, val_buf[0..8], expires_at_ns, .little);
-        val_buf[8] = if (ctx.is_root) 1 else 0;
+        const json = std.fmt.bufPrint(&val_buf, "{{\"expires_at_ns\":{d},\"is_root\":{s}}}", .{
+            expires_at_ns,
+            if (ctx.is_root) "true" else "false",
+        }) catch return Error.Kv;
 
-        kv.put(key, &val_buf) catch return Error.Kv;
+        kv.put(key, json) catch return Error.Kv;
         return opaque_hex;
     }
 
@@ -776,16 +783,28 @@ pub const Tenant = struct {
             else => return Error.Kv,
         };
         defer self.allocator.free(v);
-        if (v.len != 9) return null;
 
-        const expires_at_ns = std.mem.readInt(i64, v[0..8], .little);
+        const SessionRow = struct {
+            expires_at_ns: i64,
+            is_root: bool,
+        };
+        const parsed = std.json.parseFromSlice(SessionRow, self.allocator, v, .{
+            .allocate = .alloc_always,
+        }) catch {
+            // Corrupted row — drop it and treat as a miss. Better
+            // than leaking parser state up through an auth path.
+            kv.delete(key) catch {};
+            return null;
+        };
+        defer parsed.deinit();
+
         const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-        if (now_ns >= expires_at_ns) {
+        if (now_ns >= parsed.value.expires_at_ns) {
             // Drop the stale record opportunistically.
             kv.delete(key) catch {};
             return null;
         }
-        return .{ .is_root = v[8] != 0 };
+        return .{ .is_root = parsed.value.is_root };
     }
 
     /// Revoke a session by its opaque token. No-op if the session
@@ -1653,6 +1672,34 @@ test "expired session is rejected and swept" {
     try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(&opaque_hex));
     // Second lookup also null — sweep removed it.
     try testing.expectEqual(@as(?AuthContext, null), try fx.tenant.authenticateSession(&opaque_hex));
+}
+
+test "session row on disk is JSON parseable as {expires_at_ns, is_root}" {
+    // Locks in the storage shape so admin's JS handler can read
+    // sessions via `kv.get` + `JSON.parse` without a dedicated
+    // primitive (Phase 4 amendment, signup.md).
+    var fx = try TestFixture.init(testing.allocator);
+    defer fx.deinit();
+
+    const ctx: AuthContext = .{ .is_root = true };
+    const opaque_hex = try fx.tenant.createSession(ctx, std.time.ns_per_s * 60);
+
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&opaque_hex, &hash, .{});
+    var hash_hex: [64]u8 = undefined;
+    bytesToHex(&hash, &hash_hex);
+    var key_buf: [8 + 64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "session/{s}", .{hash_hex});
+
+    const kv = try fx.tenant.adminKv();
+    const raw = try kv.get(key);
+    defer testing.allocator.free(raw);
+
+    const SessionRow = struct { expires_at_ns: i64, is_root: bool };
+    const parsed = try std.json.parseFromSlice(SessionRow, testing.allocator, raw, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.expires_at_ns > 0);
+    try testing.expect(parsed.value.is_root);
 }
 
 test "installResendKey + getResendKey round-trip" {
