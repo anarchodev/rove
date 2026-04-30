@@ -200,6 +200,345 @@ const ADMIN_HANDLER_SRC =
     \\    response.status = 204;
     \\    return null;
     \\}
+    \\
+    \\// ── /v1/* path-routed admin handlers ────────────────────────────────
+    \\//
+    \\// The named exports above are the dashboard's RPC surface
+    \\// (?fn=name); they're auth-gated in Zig (extractAdminAuth) and
+    \\// don't see this default. The default below owns the path-routed
+    \\// admin endpoints — signup, magic-link redeem, login, logout,
+    \\// session whoami — that 2d will route off `worker.zig`'s prefix
+    \\// dispatch and onto admin's deployed bundle. Until 2d cuts over,
+    \\// Zig still serves /v1/*; this code is dormant on the wire.
+    \\
+    \\const SESSION_COOKIE = "rove_session";
+    \\const SESSION_TTL_NS = 7 * 24 * 3600 * 1_000_000_000;
+    \\const MAGIC_TTL_NS   = 30 * 60 * 1_000_000_000;
+    \\const PLATFORM_EMAIL_FROM = "noreply@loop46.me";
+    \\
+    \\// Same RESERVED_INSTANCE_NAMES as worker.zig — admin's JS owns
+    \\// the list once the port lands so operators can adjust without a
+    \\// Zig recompile.
+    \\const RESERVED_NAMES = [
+    \\    "__admin__","admin","api","app","www",
+    \\    "auth","login","signup","logout","dashboard",
+    \\    "static","system","public","root","mail",
+    \\];
+    \\
+    \\function bytesToHex(bytes) {
+    \\    let s = "";
+    \\    for (let i = 0; i < bytes.length; i++) {
+    \\        const b = bytes[i];
+    \\        s += (b < 16 ? "0" : "") + b.toString(16);
+    \\    }
+    \\    return s;
+    \\}
+    \\
+    \\// ms × 1e6 = ns. Date.now() returns ms so the multiply keeps
+    \\// precision in the same class as stored expires_at_ns values.
+    \\// Loss past 2^53 is real but uniform across both sides, so the
+    \\// inequality comparisons used below are within ~256 ns at the
+    \\// boundary — irrelevant for 30-min / 7-day TTLs.
+    \\function nowNs() { return Date.now() * 1_000_000; }
+    \\
+    \\function isHex64(s) {
+    \\    if (typeof s !== "string" || s.length !== 64) return false;
+    \\    for (let i = 0; i < 64; i++) {
+    \\        const c = s.charCodeAt(i);
+    \\        if (!((c >= 48 && c <= 57)
+    \\           || (c >= 97 && c <= 102)
+    \\           || (c >= 65 && c <= 70))) return false;
+    \\    }
+    \\    return true;
+    \\}
+    \\
+    \\function validInstanceName(name) {
+    \\    return typeof name === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(name);
+    \\}
+    \\
+    \\function validEmail(s) {
+    \\    if (typeof s !== "string") return false;
+    \\    if (s.length === 0 || s.length > 254) return false;
+    \\    const at = s.indexOf("@");
+    \\    if (at <= 0 || at !== s.lastIndexOf("@")) return false;
+    \\    if (at === s.length - 1) return false;
+    \\    return true;
+    \\}
+    \\
+    \\function isReserved(name) {
+    \\    const lower = name.toLowerCase();
+    \\    for (let i = 0; i < RESERVED_NAMES.length; i++) {
+    \\        if (RESERVED_NAMES[i] === lower) return true;
+    \\    }
+    \\    return false;
+    \\}
+    \\
+    \\function mintOpaque() { return bytesToHex(crypto.randomBytes(32)); }
+    \\
+    \\function parseBody() {
+    \\    if (!request.body) return null;
+    \\    try { return JSON.parse(request.body); } catch (_) { return null; }
+    \\}
+    \\
+    \\function jsonError(status, message) {
+    \\    response.status = status;
+    \\    return { error: message };
+    \\}
+    \\
+    \\function formatSessionCookie(opaqueHex, clearing) {
+    \\    if (clearing) {
+    \\        return SESSION_COOKIE
+    \\            + "=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
+    \\    }
+    \\    const maxAgeS = Math.floor(SESSION_TTL_NS / 1_000_000_000);
+    \\    return SESSION_COOKIE + "=" + opaqueHex
+    \\        + "; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=" + maxAgeS;
+    \\}
+    \\
+    \\function checkSession() {
+    \\    const opaque = request.cookies[SESSION_COOKIE];
+    \\    if (!isHex64(opaque)) return null;
+    \\    const hash = crypto.sha256(opaque);
+    \\    const raw = kv.get("session/" + hash);
+    \\    if (!raw) return null;
+    \\    let row;
+    \\    try { row = JSON.parse(raw); }
+    \\    catch (_) { kv.delete("session/" + hash); return null; }
+    \\    if (nowNs() >= row.expires_at_ns) {
+    \\        kv.delete("session/" + hash);
+    \\        return null;
+    \\    }
+    \\    return { is_root: !!row.is_root };
+    \\}
+    \\
+    \\function parseQueryParam(query, name) {
+    \\    const parts = (query || "").split("&");
+    \\    const prefix = name + "=";
+    \\    for (let i = 0; i < parts.length; i++) {
+    \\        if (parts[i].indexOf(prefix) === 0) {
+    \\            return parts[i].slice(prefix.length);
+    \\        }
+    \\    }
+    \\    return null;
+    \\}
+    \\
+    \\function buildSignupEmailText(magicLink, name) {
+    \\    return "Welcome to Loop46!\n\n"
+    \\        + "Click the link below to finish signing up and land "
+    \\        + "in your dashboard:\n\n"
+    \\        + magicLink + "\n\n"
+    \\        + "This link expires in 30 minutes and can only be used once.\n\n"
+    \\        + "Your API will be live at:\n"
+    \\        + "  https://" + name + ".loop46.me";
+    \\}
+    \\
+    \\// POST /v1/signup — body {name, email}. Lazy creation: writes
+    \\// pending/{name} reservation + magic/{hash} record, queues
+    \\// signup email via outbox. Does NOT create the customer tenant
+    \\// — that happens at redeem time in handleAuth.
+    \\function handleSignup() {
+    \\    const body = parseBody();
+    \\    if (!body || typeof body.name !== "string"
+    \\              || typeof body.email !== "string") {
+    \\        return jsonError(400, "bad request body");
+    \\    }
+    \\    const name = body.name;
+    \\    const userEmail = body.email;
+    \\
+    \\    if (!validEmail(userEmail))     return jsonError(400, "invalid email");
+    \\    if (!validInstanceName(name))   return jsonError(400, "invalid name");
+    \\    if (isReserved(name))           return jsonError(409, "name unavailable");
+    \\
+    \\    // Duplicate check: live tenant OR non-expired pending.
+    \\    if (platform.root.get("instance/" + name) !== null) {
+    \\        return jsonError(409, "name unavailable");
+    \\    }
+    \\    const existingPending = kv.get("pending/" + name);
+    \\    if (existingPending) {
+    \\        let row = null;
+    \\        try { row = JSON.parse(existingPending); } catch (_) {}
+    \\        if (row && nowNs() < row.expires_at_ns) {
+    \\            return jsonError(409, "name unavailable");
+    \\        }
+    \\        kv.delete("pending/" + name);
+    \\    }
+    \\
+    \\    const opaque = mintOpaque();
+    \\    const magicHash = crypto.sha256(opaque);
+    \\    const expires_at_ns = nowNs() + MAGIC_TTL_NS;
+    \\
+    \\    kv.set("magic/" + magicHash, JSON.stringify({
+    \\        email: userEmail,
+    \\        instance_id: name,
+    \\        expires_at_ns: expires_at_ns,
+    \\    }));
+    \\    kv.set("pending/" + name, JSON.stringify({
+    \\        email: userEmail,
+    \\        expires_at_ns: expires_at_ns,
+    \\        magic_hash_hex: magicHash,
+    \\    }));
+    \\
+    \\    const magicLink = "https://" + request.host + "/v1/auth?mt=" + opaque;
+    \\
+    \\    const resendKey = kv.get("resend_key");
+    \\    if (resendKey) {
+    \\        // Production: queue real email via the existing email.send
+    \\        // wrapper. It writes _outbox/{id} into THIS handler's kv
+    \\        // (admin's app.db), which the leader-side drainer scans.
+    \\        email.send({
+    \\            key: resendKey,
+    \\            from: PLATFORM_EMAIL_FROM,
+    \\            to: userEmail,
+    \\            subject: "Finish signing up for Loop46",
+    \\            text: buildSignupEmailText(magicLink, name),
+    \\        });
+    \\        response.status = 202;
+    \\        return { ok: true };
+    \\    }
+    \\    // Dev path: no Resend key configured → return link in body so
+    \\    // smoke + CLI can click through without an SMTP endpoint.
+    \\    response.status = 202;
+    \\    return { ok: true, magic_link: magicLink };
+    \\}
+    \\
+    \\// GET /v1/auth?mt=<64-hex> — redeem the magic link, lazy-create
+    \\// the tenant + deploy starter, mint session, 302 to dashboard.
+    \\function handleAuth() {
+    \\    const mt = parseQueryParam(request.query, "mt");
+    \\    if (!isHex64(mt)) {
+    \\        response.status = 401;
+    \\        return { error: "invalid or expired magic link" };
+    \\    }
+    \\
+    \\    const magicHash = crypto.sha256(mt);
+    \\    const raw = kv.get("magic/" + magicHash);
+    \\    if (!raw) {
+    \\        response.status = 401;
+    \\        return { error: "invalid or expired magic link" };
+    \\    }
+    \\    let row = null;
+    \\    try { row = JSON.parse(raw); } catch (_) {}
+    \\    // Single-use: drop the magic record up front (matches today's
+    \\    // tenant.redeemMagic). Re-clicks of the same link 401.
+    \\    kv.delete("magic/" + magicHash);
+    \\    if (!row || nowNs() >= row.expires_at_ns) {
+    \\        response.status = 401;
+    \\        return { error: "invalid or expired magic link" };
+    \\    }
+    \\
+    \\    const name = row.instance_id;
+    \\    const userEmail = row.email;
+    \\
+    \\    // Pending reservation must still exist — sweep would have
+    \\    // dropped it past expires_at_ns. Email mismatch protects
+    \\    // against magic/pending desync (shouldn't happen in practice).
+    \\    const pendingRaw = kv.get("pending/" + name);
+    \\    if (!pendingRaw) {
+    \\        response.status = 401;
+    \\        return { error: "signup not found" };
+    \\    }
+    \\    let pendingRow = null;
+    \\    try { pendingRow = JSON.parse(pendingRaw); } catch (_) {}
+    \\    if (!pendingRow || pendingRow.email !== userEmail) {
+    \\        response.status = 401;
+    \\        return { error: "signup not found" };
+    \\    }
+    \\
+    \\    // Lazy creation: dir + app.db + marker, then starter content.
+    \\    // platform.instances.create is idempotent so a retried redeem
+    \\    // (e.g. session mint failed last time) doesn't double-create.
+    \\    try { platform.instances.create(name); }
+    \\    catch (e) {
+    \\        response.status = 500;
+    \\        return { error: "create failed: " + (e && e.message) };
+    \\    }
+    \\    // Starter content best-effort: same posture as today's Zig
+    \\    // signup — log on failure, customer still has a usable account
+    \\    // and can push their own code via the files API.
+    \\    try { platform.instances.deployStarter(name); } catch (_) {}
+    \\
+    \\    kv.delete("pending/" + name);
+    \\
+    \\    const opaqueSession = mintOpaque();
+    \\    const sessionHash = crypto.sha256(opaqueSession);
+    \\    kv.set("session/" + sessionHash, JSON.stringify({
+    \\        expires_at_ns: nowNs() + SESSION_TTL_NS,
+    \\        is_root: true,
+    \\    }));
+    \\
+    \\    response.status = 302;
+    \\    response.headers.location = "/#/" + name;
+    \\    response.cookies.push(formatSessionCookie(opaqueSession, false));
+    \\    return "";
+    \\}
+    \\
+    \\// POST /v1/login — body {token}. Operator-issued root token →
+    \\// session cookie. Token must already exist as a root_token/{hash}
+    \\// row in root.db (provisioned by --bootstrap-root-token).
+    \\function handleLogin() {
+    \\    const body = parseBody();
+    \\    if (!body || !isHex64(body.token)) {
+    \\        response.status = 401;
+    \\        return { error: "invalid token" };
+    \\    }
+    \\    const tokenHash = crypto.sha256(body.token);
+    \\    if (platform.root.get("root_token/" + tokenHash) === null) {
+    \\        response.status = 401;
+    \\        return { error: "invalid token" };
+    \\    }
+    \\    const opaque = mintOpaque();
+    \\    const sessionHash = crypto.sha256(opaque);
+    \\    kv.set("session/" + sessionHash, JSON.stringify({
+    \\        expires_at_ns: nowNs() + SESSION_TTL_NS,
+    \\        is_root: true,
+    \\    }));
+    \\    response.status = 200;
+    \\    response.cookies.push(formatSessionCookie(opaque, false));
+    \\    return { ok: true };
+    \\}
+    \\
+    \\// POST /v1/logout — revoke the session cookie's record + clear
+    \\// the cookie on the client. Idempotent.
+    \\function handleLogout() {
+    \\    const opaque = request.cookies[SESSION_COOKIE];
+    \\    if (isHex64(opaque)) {
+    \\        kv.delete("session/" + crypto.sha256(opaque));
+    \\    }
+    \\    response.status = 200;
+    \\    response.cookies.push(formatSessionCookie("", true));
+    \\    return { ok: true };
+    \\}
+    \\
+    \\// GET /v1/session — whoami for a still-authenticated request.
+    \\function handleSession(auth) {
+    \\    return { is_root: !!auth.is_root };
+    \\}
+    \\
+    \\export default function() {
+    \\    const path = request.path;
+    \\    const method = request.method;
+    \\
+    \\    // Pre-auth: signup + magic-link redeem + token login + logout
+    \\    // never require a session cookie.
+    \\    if (method === "POST" && path === "/v1/signup") return handleSignup();
+    \\    if (method === "GET"  && path === "/v1/auth")   return handleAuth();
+    \\    if (method === "POST" && path === "/v1/login")  return handleLogin();
+    \\    if (method === "POST" && path === "/v1/logout") return handleLogout();
+    \\
+    \\    // Everything else under default is auth-gated. The dashboard's
+    \\    // ?fn=<name> RPCs bypass default entirely (named-export
+    \\    // dispatch) and stay Zig-auth-gated for now — see worker.zig's
+    \\    // `extractAdminAuth`. Revisiting that is post-2d cleanup.
+    \\    const auth = checkSession();
+    \\    if (!auth) {
+    \\        response.status = 401;
+    \\        return { error: "unauthenticated" };
+    \\    }
+    \\    if (method === "GET" && path === "/v1/session") return handleSession(auth);
+    \\
+    \\    response.status = 404;
+    \\    return { error: "not found" };
+    \\}
 ;
 
 const Cli = struct {
