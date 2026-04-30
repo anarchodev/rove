@@ -1027,6 +1027,81 @@ fn jsCryptoRandomUuid(
     return c.JS_NewStringLen(ctx, &out, 36);
 }
 
+/// `crypto.randomBytes(n) → Uint8Array` — n cryptographically random
+/// bytes drawn from the per-request PRNG. Tape-backed: bytes are
+/// recorded on `crypto_random_tape` so replay produces the same
+/// sequence.
+///
+/// `n` must be a non-negative integer ≤ 65536 (Web Crypto's typical
+/// per-call cap). Throws RangeError otherwise.
+fn jsCryptoRandomBytes(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.randomBytes requires (n)");
+        return js_exception;
+    }
+    const state = getState(ctx);
+
+    var n_i32: i32 = 0;
+    if (c.JS_ToInt32(ctx, &n_i32, argv[0]) != 0) return js_exception;
+    if (n_i32 < 0 or n_i32 > 65536) {
+        _ = c.JS_ThrowRangeError(ctx, "crypto.randomBytes: n must be in [0, 65536]");
+        return js_exception;
+    }
+
+    const n: usize = @intCast(n_i32);
+    const bytes = state.allocator.alloc(u8, n) catch {
+        _ = c.JS_ThrowOutOfMemory(ctx);
+        return js_exception;
+    };
+    defer state.allocator.free(bytes);
+
+    state.prng.random().bytes(bytes);
+    if (state.crypto_random_tape) |t| t.appendCryptoRandom(bytes) catch {};
+
+    return c.JS_NewUint8ArrayCopy(ctx, bytes.ptr, bytes.len);
+}
+
+/// `crypto.sha256(data) → hex string` (64 chars).
+///
+/// `data` accepts a JS string (UTF-8 bytes) or a Uint8Array. Pure
+/// deterministic — no tape capture (replay reproduces the same digest
+/// from the same input).
+fn jsCryptoSha256(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256 requires (data)");
+        return js_exception;
+    }
+
+    var data_cstr: [*c]const u8 = null;
+    defer if (data_cstr != null) c.JS_FreeCString(ctx, data_cstr);
+
+    const data_bytes = extractKeyOrDataBytes(ctx, argv[0], &data_cstr) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256: data must be a string or Uint8Array");
+        return js_exception;
+    };
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data_bytes, &digest, .{});
+
+    var out: [64]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+    return c.JS_NewStringLen(ctx, &out, 64);
+}
+
 // ── webhook.send ──────────────────────────────────────────────────────
 //
 // Writes a serialized delivery envelope to `_outbox/{id}` inside the
@@ -1410,6 +1485,62 @@ fn jsPlatformRootPrefix(
     return arr;
 }
 
+/// `platform.instances.create(name)` — admin-only. Creates the
+/// instance directory, opens its app.db, writes the local
+/// `instance/{name}` marker, and mirrors the marker into the root
+/// writeset for raft replication. Idempotent: re-creating an already
+/// existing instance is a no-op (matches the underlying
+/// `tenant.createInstance`).
+///
+/// Throws `Error{code:"InvalidName"}` if the name fails validation
+/// (empty, too long, bad characters). Other errors land in
+/// `state.pending_kv_error` and surface as a 5xx.
+fn jsPlatformInstancesCreate(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) {
+        _ = c.JS_ThrowTypeError(ctx, "platform.instances.create requires (name)");
+        return js_exception;
+    }
+    const state = getState(ctx);
+    const tenant = state.platform orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    };
+
+    const name = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(name);
+
+    tenant.createInstance(name) catch |err| switch (err) {
+        error.InvalidInstanceId => {
+            const err_obj = c.JS_NewError(ctx);
+            if (c.JS_IsException(err_obj)) return err_obj;
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "message",
+                c.JS_NewStringLen(ctx, "invalid instance name", "invalid instance name".len));
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "code",
+                c.JS_NewStringLen(ctx, "InvalidName", "InvalidName".len));
+            return c.JS_Throw(ctx, err_obj);
+        },
+        else => {
+            state.pending_kv_error = err;
+            return js_undefined;
+        },
+    };
+
+    if (state.root_writeset) |ws| {
+        var key_buf: [16 + tenant_mod.MAX_INSTANCE_ID_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{name}) catch
+            unreachable; // name was validated by createInstance above
+        ws.addPut(key, "") catch |err| {
+            state.pending_kv_error = err;
+        };
+    }
+    return js_undefined;
+}
+
 // ── Installation ──────────────────────────────────────────────────────
 
 /// Install the pieces of the global surface that do NOT depend on a
@@ -1460,13 +1591,17 @@ pub fn installStatic(ctx: *c.JSContext) void {
         _ = c.JS_SetPropertyStr(ctx, math_obj, "random", c.JS_NewCFunction2(ctx, jsMathRandom, "random", 0, c.JS_CFUNC_generic, 0));
     }
 
-    // crypto = { getRandomValues, randomUUID, hmacSha256 }. No crypto
-    // global in qjs-ng by default, so we fabricate one. hmacSha256 is
-    // the vendor-neutral primitive for building Stripe / Slack / AWS
-    // style signatures in handler code (see PLAN §2.6).
+    // crypto = { getRandomValues, randomUUID, randomBytes, sha256,
+    // hmacSha256 }. No crypto global in qjs-ng by default, so we
+    // fabricate one. hmacSha256 is the vendor-neutral primitive for
+    // building Stripe / Slack / AWS style signatures (PLAN §2.6);
+    // randomBytes + sha256 are what admin's JS handler composes into
+    // magic-link / session token mint and hash-at-rest.
     const crypto_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, crypto_obj, "getRandomValues", c.JS_NewCFunction2(ctx, jsCryptoGetRandomValues, "getRandomValues", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomUUID", c.JS_NewCFunction2(ctx, jsCryptoRandomUuid, "randomUUID", 0, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomBytes", c.JS_NewCFunction2(ctx, jsCryptoRandomBytes, "randomBytes", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "sha256", c.JS_NewCFunction2(ctx, jsCryptoSha256, "sha256", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, crypto_obj, "hmacSha256", c.JS_NewCFunction2(ctx, jsCryptoHmacSha256, "hmacSha256", 2, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, global, "crypto", crypto_obj);
 
@@ -1647,9 +1782,10 @@ pub fn installStatic(ctx: *c.JSContext) void {
     );
     c.JS_FreeValue(ctx, textcodec_result);
 
-    // platform = { root: { get, set, delete, prefix } }. Installed
-    // on every context; the C callbacks check `state.platform` and
-    // throw for non-admin handlers. See `jsPlatformRoot*`.
+    // platform = { root: { get, set, delete, prefix }, instances:
+    // { create } }. Installed on every context; the C callbacks
+    // check `state.platform` and throw for non-admin handlers.
+    // See `jsPlatformRoot*` and `jsPlatformInstancesCreate`.
     const platform_obj = c.JS_NewObject(ctx);
     const root_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, root_obj, "get", c.JS_NewCFunction2(ctx, jsPlatformRootGet, "get", 1, c.JS_CFUNC_generic, 0));
@@ -1657,6 +1793,9 @@ pub fn installStatic(ctx: *c.JSContext) void {
     _ = c.JS_SetPropertyStr(ctx, root_obj, "delete", c.JS_NewCFunction2(ctx, jsPlatformRootDelete, "delete", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, root_obj, "prefix", c.JS_NewCFunction2(ctx, jsPlatformRootPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, platform_obj, "root", root_obj);
+    const instances_obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, instances_obj, "create", c.JS_NewCFunction2(ctx, jsPlatformInstancesCreate, "create", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, platform_obj, "instances", instances_obj);
     _ = c.JS_SetPropertyStr(ctx, global, "platform", platform_obj);
 }
 

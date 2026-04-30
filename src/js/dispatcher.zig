@@ -2845,6 +2845,304 @@ test "dispatch: crypto.hmacSha256 throws on missing args" {
     try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
 }
 
+test "dispatch: crypto.randomBytes returns Uint8Array of requested length" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const a = crypto.randomBytes(32);
+        \\const b = crypto.randomBytes(0);
+        \\return {
+        \\  ctor_a: a.constructor.name,
+        \\  len_a: a.length,
+        \\  ctor_b: b.constructor.name,
+        \\  len_b: b.length,
+        \\};
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    var out = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+    defer out.deinit();
+    try testing.expectEqualStrings("Uint8Array", out.value.object.get("ctor_a").?.string);
+    try testing.expectEqual(@as(i64, 32), out.value.object.get("len_a").?.integer);
+    try testing.expectEqualStrings("Uint8Array", out.value.object.get("ctor_b").?.string);
+    try testing.expectEqual(@as(i64, 0), out.value.object.get("len_b").?.integer);
+}
+
+test "dispatch: crypto.randomBytes rejects out-of-range n" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // -1 → RangeError; 65537 → RangeError. Both must throw and the
+    // catch produces a string starting "threw:".
+    const cases = [_][]const u8{
+        \\try { crypto.randomBytes(-1); return "no throw"; }
+        \\catch (e) { return "threw: " + e.message; }
+        ,
+        \\try { crypto.randomBytes(65537); return "no throw"; }
+        \\catch (e) { return "threw: " + e.message; }
+        ,
+    };
+    for (cases) |src| {
+        var resp = try runOne(&d, kv, src, .{ .method = "GET", .path = "/" });
+        defer resp.deinit(testing.allocator);
+        try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
+    }
+}
+
+test "dispatch: crypto.sha256 matches empty-string test vector" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // SHA-256 of "" = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return crypto.sha256("");
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        resp.body,
+    );
+}
+
+test "dispatch: crypto.sha256 string and Uint8Array agree" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const s = crypto.sha256("Hi There");
+        \\const b = crypto.sha256(new TextEncoder().encode("Hi There"));
+        \\return s === b ? "match:" + s : "mismatch";
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.startsWith(u8, resp.body, "match:"));
+}
+
+test "dispatch: crypto.sha256 throws on missing arg" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { crypto.sha256(); return "no throw"; }
+        \\catch (e) { return "threw: " + e.message; }
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
+}
+
+test "dispatch: platform.instances.create throws on non-admin handler" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // state.platform is null in vanilla runOne — the C callback should
+    // throw a TypeError mentioning "admin handler".
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { platform.instances.create("acme"); return "no throw"; }
+        \\catch (e) { return "threw: " + e.message; }
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "admin handler") != null);
+}
+
+/// Thin wrapper around tenant test setup. Used by platform.instances.*
+/// tests below to put a real `Tenant` behind `state.platform`.
+const PlatformFixture = struct {
+    allocator: std.mem.Allocator,
+    tmp_dir: []u8,
+    root_kv: *kv_mod.KvStore,
+    tenant: *tenant_mod.Tenant,
+
+    fn init(allocator: std.mem.Allocator) !PlatformFixture {
+        const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+        const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-js-disp-pf-{x}", .{seed});
+        errdefer allocator.free(tmp_dir);
+        std.fs.cwd().deleteTree(tmp_dir) catch {};
+        try std.fs.cwd().makePath(tmp_dir);
+        const root_path = try std.fmt.allocPrintSentinel(allocator, "{s}/__root__.db", .{tmp_dir}, 0);
+        defer allocator.free(root_path);
+        const root_kv = try kv_mod.KvStore.open(allocator, root_path);
+        errdefer root_kv.close();
+        const tenant = try tenant_mod.Tenant.create(allocator, root_kv, tmp_dir);
+        return .{ .allocator = allocator, .tmp_dir = tmp_dir, .root_kv = root_kv, .tenant = tenant };
+    }
+
+    fn deinit(self: *PlatformFixture) void {
+        self.tenant.destroy();
+        self.root_kv.close();
+        std.fs.cwd().deleteTree(self.tmp_dir) catch {};
+        self.allocator.free(self.tmp_dir);
+    }
+};
+
+test "dispatch: platform.instances.create creates instance and mirrors to root_writeset" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    var root_ws = kv_mod.WriteSet.init(testing.allocator);
+    defer root_ws.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\platform.instances.create("acme");
+        \\return "ok";
+    ,
+        .{
+            .method = "POST",
+            .path = "/",
+            .platform = pf.tenant,
+            .root_writeset = &root_ws,
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok", resp.body);
+
+    // Tenant has the instance in its in-memory map and root.db marker.
+    try testing.expect(pf.tenant.instances.get("acme") != null);
+    try testing.expectEqual(true, try pf.tenant.instanceExists("acme"));
+
+    // Root writeset got the matching put for raft replication.
+    try testing.expectEqual(@as(usize, 1), root_ws.ops.items.len);
+    switch (root_ws.ops.items[0]) {
+        .put => |p| {
+            try testing.expectEqualStrings("instance/acme", p.key);
+            try testing.expectEqualStrings("", p.value);
+        },
+        .delete => try testing.expect(false),
+    }
+}
+
+test "dispatch: platform.instances.create is idempotent on existing instance" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    try pf.tenant.createInstance("acme"); // pre-existing
+    var root_ws = kv_mod.WriteSet.init(testing.allocator);
+    defer root_ws.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\platform.instances.create("acme");
+        \\platform.instances.create("acme");
+        \\return "ok";
+    ,
+        .{
+            .method = "POST",
+            .path = "/",
+            .platform = pf.tenant,
+            .root_writeset = &root_ws,
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok", resp.body);
+}
+
+test "dispatch: platform.instances.create throws coded InvalidName on bad name" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var pf = try PlatformFixture.init(testing.allocator);
+    defer pf.deinit();
+    var root_ws = kv_mod.WriteSet.init(testing.allocator);
+    defer root_ws.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { platform.instances.create("has space"); return "no throw"; }
+        \\catch (e) { return "code=" + e.code; }
+    ,
+        .{
+            .method = "POST",
+            .path = "/",
+            .platform = pf.tenant,
+            .root_writeset = &root_ws,
+        },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("code=InvalidName", resp.body);
+    try testing.expectEqual(@as(usize, 0), root_ws.ops.items.len);
+}
+
 test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
