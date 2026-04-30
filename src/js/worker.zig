@@ -2123,6 +2123,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const request: Request = .{
             .method = method,
             .path = path,
+            .host = authority,
             .body = body,
             .query = route.query,
             .headers = rh,
@@ -3949,8 +3950,10 @@ fn handleAdminSignup(
         }
     }
 
-    // PLAN §2.2 default magic-link TTL: 15 minutes.
-    const MAGIC_TTL_NS: i64 = 15 * 60 * std.time.ns_per_s;
+    // PLAN §2.2 default magic-link TTL: 30 minutes (was 15; bumped
+    // 2026-04-30 with the auto-resend amendment dropped — flat TTL
+    // beats grace+resend, see PLAN §7).
+    const MAGIC_TTL_NS: i64 = 30 * 60 * std.time.ns_per_s;
     const token = worker.tenant.mintMagic(email, name, MAGIC_TTL_NS) catch |err| {
         std.log.warn("rove-js: signup mintMagic failed: {s}", .{@errorName(err)});
         try setSystemResponse(server, ent, sid, sess, 500, "signup failed\n", allocator, admin_cors, null);
@@ -4165,7 +4168,7 @@ fn buildSignupEmailText(
         \\
         \\{s}
         \\
-        \\This link expires in 15 minutes and can only be used once.
+        \\This link expires in 30 minutes and can only be used once.
         \\
         \\Your API will be live at:
         \\  https://{s}.loop46.me

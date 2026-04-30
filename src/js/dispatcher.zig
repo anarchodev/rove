@@ -72,6 +72,13 @@ fn interruptHandler(_: ?*c.JSRuntime, opaque_ctx: ?*anyopaque) callconv(.c) c_in
 pub const Request = struct {
     method: []const u8,
     path: []const u8,
+    /// Wire host (HTTP/2 `:authority`, or HTTP/1 `Host:`). Includes
+    /// the `:port` segment when present — admin's JS handler uses
+    /// it verbatim to build absolute magic-link URLs that work in
+    /// both dev (`app.loop46.localhost:8198`) and prod
+    /// (`app.loop46.me`). Empty when the worker dispatches without
+    /// a wire request (test paths, internal callback dispatch).
+    host: []const u8 = "",
     body: []const u8 = "",
     /// Query string (everything after `?` in the URL, not including
     /// the `?`). Null when the URL had none. Used by module handlers
@@ -1430,6 +1437,27 @@ test "dispatch: kv.delete removes key" {
 
     // After commit, the key is gone.
     try testing.expectError(error.NotFound, kv.get("k"));
+}
+
+test "dispatch: request.host is exposed verbatim from :authority" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return request.host;
+    ,
+        .{ .method = "GET", .path = "/", .host = "app.loop46.localhost:8198" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("app.loop46.localhost:8198", resp.body);
 }
 
 test "dispatch: read-your-writes within one handler works via TrackedTxn" {
