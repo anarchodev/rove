@@ -374,6 +374,61 @@ pub const Dispatcher = struct {
             headers.deinit(self.allocator);
         }
 
+        // Optional `_middlewares/index.mjs` runs before the handler
+        // in the same QJS context. Mutations it makes to globalThis
+        // — most usefully `request.auth = {...}` — persist into the
+        // handler's call. If the middleware returns any non-undefined
+        // value, the dispatcher short-circuits with that value as the
+        // body and skips the handler. Return undefined / fall off the
+        // end → continue.
+        var middleware_short_circuited = false;
+        const mw_bytecode_opt: ?[]const u8 = blk: {
+            if (bytecodes) |bcs| {
+                if (bcs.get("_middlewares/index.mjs")) |bc| break :blk bc;
+                if (bcs.get("_middlewares/index.js")) |bc| break :blk bc;
+            }
+            break :blk null;
+        };
+        if (mw_bytecode_opt) |mw_bc| {
+            const mw_fun_obj = c.JS_ReadObject(ctx.raw, mw_bc.ptr, mw_bc.len, c.JS_READ_OBJ_BYTECODE);
+            var mw_fun_val: qjs.Value = .{ .raw = mw_fun_obj, .ctx = ctx.raw };
+            if (mw_fun_val.isException()) {
+                exception_msg = ctx.takeExceptionMessage(self.allocator) catch
+                    return DispatchError.OutOfMemory;
+                mw_fun_val.deinit();
+                return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
+            }
+            if (mw_fun_val.raw.tag != c.JS_TAG_MODULE) {
+                mw_fun_val.deinit();
+                status = 500;
+                body_buf = self.allocator.dupe(u8, "_middlewares/index.mjs is not an ES module") catch
+                    return DispatchError.OutOfMemory;
+                return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
+            }
+            runMiddleware(
+                self,
+                &rt,
+                &ctx,
+                mw_fun_val,
+                budget,
+                &status,
+                &body_buf,
+                &body_is_json,
+                &exception_msg,
+                &cookies,
+                &headers,
+                &middleware_short_circuited,
+            ) catch |err| switch (err) {
+                error.Interrupted => return DispatchError.Interrupted,
+                error.OutOfMemory => return DispatchError.OutOfMemory,
+                error.JsException => middleware_short_circuited = true,
+            };
+        }
+
+        if (middleware_short_circuited) {
+            return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
+        }
+
         const fun_obj = c.JS_ReadObject(
             ctx.raw,
             bytecode.ptr,
@@ -422,6 +477,131 @@ pub const Dispatcher = struct {
 };
 
 const RunError = error{ Interrupted, OutOfMemory, JsException };
+
+/// Run `_middlewares/index.mjs`'s `before` export. The middleware sees
+/// the same `globalThis.request` / `globalThis.response` the handler
+/// will see — its mutations (most usefully `request.auth = {...}`)
+/// persist into the handler's call.
+///
+/// Return-value semantics differ from `runModule`:
+/// - `undefined` / `null` → continue (no `short_circuit_out` set)
+/// - any other value → short-circuit. Return value becomes the body
+///   (same `bodyFromReturn` rules as a handler); status / cookies /
+///   custom headers come from the response global, also like a
+///   handler.
+///
+/// A throw or rejected promise sets `exception_out` and surfaces as
+/// `error.JsException`; the caller treats that as a short-circuit
+/// with whatever the response global says (typically 500).
+///
+/// Missing `before` export is treated as an operator-visible 500 —
+/// admin's bundle declares it on purpose, and customer middlewares
+/// that forget to export it deserve a loud failure.
+fn runMiddleware(
+    d: *Dispatcher,
+    rt: *qjs.Runtime,
+    ctx: *qjs.Context,
+    fun_val_in: qjs.Value,
+    budget: *Budget,
+    status_out: *i32,
+    body_out: *[]u8,
+    body_is_json_out: *bool,
+    exception_out: *[]u8,
+    cookies_out: *std.ArrayList([]u8),
+    headers_out: *std.ArrayList(ResponseHeader),
+    short_circuit_out: *bool,
+) RunError!void {
+    short_circuit_out.* = false;
+
+    const mod_def_ptr: ?*c.JSModuleDef = @ptrCast(@alignCast(fun_val_in.raw.u.ptr));
+
+    var fun_val = fun_val_in;
+    const eval_result = c.JS_EvalFunction(ctx.raw, fun_val.raw);
+    fun_val = undefined;
+    var eval_val: qjs.Value = .{ .raw = eval_result, .ctx = ctx.raw };
+    defer eval_val.deinit();
+
+    if (eval_val.isException()) {
+        exception_out.* = ctx.takeExceptionMessage(d.allocator) catch
+            return error.OutOfMemory;
+        if (budgetExpired(budget)) return error.Interrupted;
+        return error.JsException;
+    }
+
+    rt.pumpJobs();
+    if (budgetExpired(budget)) return error.Interrupted;
+
+    if (c.JS_PromiseState(ctx.raw, eval_val.raw) == c.JS_PROMISE_REJECTED) {
+        const reason = c.JS_PromiseResult(ctx.raw, eval_val.raw);
+        defer c.JS_FreeValue(ctx.raw, reason);
+        exception_out.* = jsValueToOwned(d.allocator, ctx.raw, reason) catch
+            return error.OutOfMemory;
+        return error.JsException;
+    }
+
+    const ns = c.JS_GetModuleNamespace(ctx.raw, mod_def_ptr);
+    defer c.JS_FreeValue(ctx.raw, ns);
+    if (c.JS_IsException(ns)) {
+        exception_out.* = ctx.takeExceptionMessage(d.allocator) catch
+            return error.OutOfMemory;
+        return error.JsException;
+    }
+
+    const before_fn = c.JS_GetPropertyStr(ctx.raw, ns, "before");
+    defer c.JS_FreeValue(ctx.raw, before_fn);
+    if (c.JS_IsException(before_fn) or !c.JS_IsFunction(ctx.raw, before_fn)) {
+        // No `before` export — surface as a 500 rather than silently
+        // skipping. A malformed middleware should be loud.
+        _ = ctx.takeException();
+        status_out.* = 500;
+        body_out.* = std.fmt.allocPrint(
+            d.allocator,
+            "_middlewares/index.mjs must export a `before` function\n",
+            .{},
+        ) catch return error.OutOfMemory;
+        short_circuit_out.* = true;
+        return;
+    }
+
+    const ret = c.JS_Call(ctx.raw, before_fn, globals.js_undefined, 0, null);
+    var ret_val: qjs.Value = .{ .raw = ret, .ctx = ctx.raw };
+    defer ret_val.deinit();
+
+    if (ret_val.isException()) {
+        exception_out.* = ctx.takeExceptionMessage(d.allocator) catch
+            return error.OutOfMemory;
+        if (budgetExpired(budget)) return error.Interrupted;
+        return error.JsException;
+    }
+
+    rt.pumpJobs();
+    if (budgetExpired(budget)) return error.Interrupted;
+
+    const final = unwrapPromise(ctx.raw, ret_val.raw);
+    if (final.rejected) {
+        exception_out.* = jsValueToOwned(d.allocator, ctx.raw, final.val) catch
+            return error.OutOfMemory;
+        c.JS_FreeValue(ctx.raw, final.val);
+        return error.JsException;
+    }
+    var final_val: qjs.Value = .{ .raw = final.val, .ctx = ctx.raw };
+    defer if (final.owns) final_val.deinit();
+
+    // Undefined / null → middleware passed; handler runs next. Any
+    // mutations to globalThis.request and globalThis.response made
+    // along the way persist via the shared QJS context.
+    if (c.JS_IsUndefined(final_val.raw) or c.JS_IsNull(final_val.raw)) {
+        return;
+    }
+
+    // Otherwise short-circuit: middleware's return value becomes the
+    // body, response-global metadata applies as if it were a handler.
+    bodyFromReturn(d.allocator, ctx.raw, final_val.raw, body_out, body_is_json_out) catch
+        return error.OutOfMemory;
+    extractResponseMetadata(d.allocator, ctx.raw, status_out, cookies_out, headers_out) catch
+        return error.OutOfMemory;
+    short_circuit_out.* = true;
+}
 
 /// Evaluate the module top-level, drain jobs, look up `exports[fn]`
 /// (fn picked via `?fn=X` on GET or `{fn,args}` JSON body on POST),
@@ -2042,6 +2222,207 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         try testing.expectEqual(@as(i32, 404), resp.status);
         try testing.expect(std.mem.indexOf(u8, resp.body, "nope") != null);
     }
+}
+
+// Helper: drive a dispatch where a `_middlewares/index.mjs` is
+// present alongside the handler. Bytecodes share the per-tenant
+// StringHashMap shape the worker uses in production.
+fn runWithMiddleware(
+    d: *Dispatcher,
+    kv: *kv_mod.KvStore,
+    handler_body: []const u8,
+    middleware_src: []const u8,
+    request_in: Request,
+) !Response {
+    const wrapped = try std.fmt.allocPrint(testing.allocator,
+        "export function go() {{ {s} }}\n", .{handler_body});
+    defer testing.allocator.free(wrapped);
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    const handler_bc = try ctx.compileToBytecode(wrapped, "h.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(handler_bc);
+    const mw_bc = try ctx.compileToBytecode(middleware_src, "_middlewares/index.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(mw_bc);
+
+    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
+    defer bytecodes.deinit(testing.allocator);
+    try bytecodes.put(testing.allocator, "_middlewares/index.mjs", @constCast(mw_bc));
+
+    var txn = try kv.beginTrackedImmediate();
+    errdefer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+
+    var request = request_in;
+    if (request.query == null) request.query = "fn=go";
+
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    const resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, request, &budget);
+    try txn.commit();
+    return resp;
+}
+
+test "dispatch: middleware that returns undefined → handler runs" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runWithMiddleware(
+        &d,
+        kv,
+        \\return "handler-ran";
+    ,
+        \\export function before() {
+        \\    // implicit undefined → continue
+        \\}
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("handler-ran", resp.body);
+}
+
+test "dispatch: middleware mutation of request.auth flows to handler" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runWithMiddleware(
+        &d,
+        kv,
+        \\return "is_root=" + (request.auth && request.auth.is_root ? "yes" : "no");
+    ,
+        \\export function before() {
+        \\    request.auth = { is_root: true };
+        \\}
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("is_root=yes", resp.body);
+}
+
+test "dispatch: middleware short-circuits with response when before returns a value" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runWithMiddleware(
+        &d,
+        kv,
+        \\return "handler-ran";
+    ,
+        \\export function before() {
+        \\    response.status = 401;
+        \\    return { error: "no" };
+        \\}
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 401), resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\":\"no\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "handler-ran") == null);
+}
+
+test "dispatch: middleware throw surfaces as 500 with exception" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runWithMiddleware(
+        &d,
+        kv,
+        \\return "should-not-run";
+    ,
+        \\export function before() { throw new Error("nope"); }
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, resp.exception, "nope") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "should-not-run") == null);
+}
+
+test "dispatch: middleware without `before` export → 500" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Module exports something else, not `before`. Operator-visible 500
+    // rather than silent skip.
+    var resp = try runWithMiddleware(
+        &d,
+        kv,
+        \\return "handler-ran";
+    ,
+        \\export function notBefore() { return "wrong"; }
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 500), resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "before") != null);
+}
+
+test "dispatch: middleware applies to ?fn=<named> RPC dispatch too" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Important property: middleware fires before *any* dispatch,
+    // including the dashboard's `?fn=<named-export>` RPC path.
+    // Without this admin's named-export RPCs would bypass the auth
+    // gate entirely.
+    var resp = try runWithMiddleware(
+        &d,
+        kv,
+        \\return "handler-ran";
+    ,
+        \\export function before() {
+        \\    response.status = 401;
+        \\    return { error: "blocked" };
+        \\}
+    ,
+        .{ .method = "GET", .path = "/", .query = "fn=go" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 401), resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"error\":\"blocked\"") != null);
 }
 
 test "dispatch: missing fn defaults to `default` export, called with no args" {

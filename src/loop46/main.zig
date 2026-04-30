@@ -298,41 +298,8 @@ const ADMIN_HANDLER_SRC =
     \\        + "; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=" + maxAgeS;
     \\}
     \\
-    \\// Authenticate via session cookie OR Authorization: Bearer
-    \\// (root token issued at bootstrap). Cookie path: hash, kv.get
-    \\// session/{hash}, sweep on expiry. Bearer path: hash, look up
-    \\// root_token/{hash} in root.db. Bearer-authed callers always
-    \\// get is_root=true; the dashboard's RPC path uses cookies.
-    \\function checkSession() {
-    \\    const opaque = request.cookies[SESSION_COOKIE];
-    \\    if (isHex64(opaque)) {
-    \\        const hash = crypto.sha256(opaque);
-    \\        const raw = kv.get("session/" + hash);
-    \\        if (raw) {
-    \\            let row = null;
-    \\            try { row = JSON.parse(raw); } catch (_) {}
-    \\            if (!row) { kv.delete("session/" + hash); }
-    \\            else if (nowNs() >= row.expires_at_ns) {
-    \\                kv.delete("session/" + hash);
-    \\            } else {
-    \\                return { is_root: !!row.is_root };
-    \\            }
-    \\        }
-    \\    }
-    \\    const auth = request.headers.authorization;
-    \\    if (typeof auth === "string" && auth.length > 7) {
-    \\        const lower = auth.slice(0, 7).toLowerCase();
-    \\        if (lower === "bearer ") {
-    \\            const token = auth.slice(7).trim();
-    \\            if (isHex64(token)) {
-    \\                if (platform.root.get("root_token/" + crypto.sha256(token)) !== null) {
-    \\                    return { is_root: true };
-    \\                }
-    \\            }
-    \\        }
-    \\    }
-    \\    return null;
-    \\}
+    \\// Auth check moved to `_middlewares/index.mjs`. Handlers below
+    \\// trust `request.auth = {is_root: bool}` set by the middleware.
     \\
     \\function parseQueryParam(query, name) {
     \\    const parts = (query || "").split("&");
@@ -545,26 +512,99 @@ const ADMIN_HANDLER_SRC =
     \\    const path = q === -1 ? fullPath : fullPath.slice(0, q);
     \\    const method = request.method;
     \\
-    \\    // Pre-auth: signup + magic-link redeem + token login + logout
-    \\    // never require a session cookie.
+    \\    // Pre-auth paths skip the auth gate; everything else has
+    \\    // already passed through `_middlewares/index.mjs` which
+    \\    // either set request.auth or short-circuited 401. Handlers
+    \\    // here trust request.auth for any authed surfaces.
     \\    if (method === "POST" && path === "/v1/signup") return handleSignup();
     \\    if (method === "GET"  && path === "/v1/auth")   return handleAuth();
     \\    if (method === "POST" && path === "/v1/login")  return handleLogin();
     \\    if (method === "POST" && path === "/v1/logout") return handleLogout();
+    \\    if (method === "GET"  && path === "/v1/session") return handleSession(request.auth);
     \\
-    \\    // Everything else under default is auth-gated. The dashboard's
-    \\    // ?fn=<name> RPCs bypass default entirely (named-export
-    \\    // dispatch) and stay Zig-auth-gated for now — see worker.zig's
-    \\    // `extractAdminAuth`. Revisiting that is post-2d cleanup.
+    \\    response.status = 404;
+    \\    return { error: "not found" };
+    \\}
+;
+
+/// Admin's request-time auth middleware. Runs before every dispatch
+/// to admin's bundle (default export AND named-export RPCs). Reads
+/// the session cookie (or Authorization: Bearer for the dashboard's
+/// bootstrap-token sign-in path), looks up the row in admin's app.db
+/// or the root_token/{hash} entry in root.db, and either sets
+/// `request.auth = {is_root: ...}` or short-circuits with 401.
+///
+/// Pre-auth paths (signup / magic redeem / login / logout) skip the
+/// gate entirely — those endpoints exist precisely so an unauthed
+/// caller can become authed.
+const ADMIN_MIDDLEWARE_SRC =
+    \\const SESSION_COOKIE = "rove_session";
+    \\
+    \\const PRE_AUTH_PATHS = [
+    \\    "/v1/signup", "/v1/auth", "/v1/login", "/v1/logout",
+    \\];
+    \\
+    \\function isHex64(s) {
+    \\    if (typeof s !== "string" || s.length !== 64) return false;
+    \\    for (let i = 0; i < 64; i++) {
+    \\        const c = s.charCodeAt(i);
+    \\        if (!((c >= 48 && c <= 57)
+    \\           || (c >= 97 && c <= 102)
+    \\           || (c >= 65 && c <= 70))) return false;
+    \\    }
+    \\    return true;
+    \\}
+    \\
+    \\// Cookie path: hash, kv.get session/{hash}, sweep on expiry.
+    \\// Bearer path: hash, look up root_token/{hash} in root.db.
+    \\// Bearer-authed callers always get is_root=true; the dashboard's
+    \\// RPC path uses cookies, the operator's curl/CLI uses bearer.
+    \\function checkSession() {
+    \\    const opaque = request.cookies[SESSION_COOKIE];
+    \\    if (isHex64(opaque)) {
+    \\        const hash = crypto.sha256(opaque);
+    \\        const raw = kv.get("session/" + hash);
+    \\        if (raw) {
+    \\            let row = null;
+    \\            try { row = JSON.parse(raw); } catch (_) {}
+    \\            const nowNs = Date.now() * 1_000_000;
+    \\            if (!row) { kv.delete("session/" + hash); }
+    \\            else if (nowNs >= row.expires_at_ns) {
+    \\                kv.delete("session/" + hash);
+    \\            } else {
+    \\                return { is_root: !!row.is_root };
+    \\            }
+    \\        }
+    \\    }
+    \\    const auth = request.headers.authorization;
+    \\    if (typeof auth === "string" && auth.length > 7) {
+    \\        const lower = auth.slice(0, 7).toLowerCase();
+    \\        if (lower === "bearer ") {
+    \\            const token = auth.slice(7).trim();
+    \\            if (isHex64(token)) {
+    \\                if (platform.root.get("root_token/" + crypto.sha256(token)) !== null) {
+    \\                    return { is_root: true };
+    \\                }
+    \\            }
+    \\        }
+    \\    }
+    \\    return null;
+    \\}
+    \\
+    \\export function before() {
+    \\    const fullPath = request.path;
+    \\    const q = fullPath.indexOf("?");
+    \\    const path = q === -1 ? fullPath : fullPath.slice(0, q);
+    \\
+    \\    if (PRE_AUTH_PATHS.indexOf(path) !== -1) return; // continue
+    \\
     \\    const auth = checkSession();
     \\    if (!auth) {
     \\        response.status = 401;
     \\        return { error: "unauthenticated" };
     \\    }
-    \\    if (method === "GET" && path === "/v1/session") return handleSession(auth);
-    \\
-    \\    response.status = 404;
-    \\    return { error: "not found" };
+    \\    request.auth = auth;
+    \\    // fall through (undefined return) → continue to handler
     \\}
 ;
 
@@ -2101,6 +2141,7 @@ const ADMIN_UI_PAGE_INSTANCE = @embedFile("admin_ui_page_instance");
 
 const ADMIN_DEPLOY_FILES = [_]DeployFile{
     .{ .path = "index.mjs", .content = ADMIN_HANDLER_SRC },
+    .{ .path = "_middlewares/index.mjs", .content = ADMIN_MIDDLEWARE_SRC },
     .{ .path = "_static/index.html", .content = ADMIN_UI_INDEX_HTML, .content_type = "text/html; charset=utf-8" },
     .{ .path = "_static/app.js", .content = ADMIN_UI_APP_JS, .content_type = "application/javascript" },
     .{ .path = "_static/api.js", .content = ADMIN_UI_API_JS, .content_type = "application/javascript" },

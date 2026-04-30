@@ -1774,15 +1774,12 @@ fn resolveRequest(
 
     const admin_cors = worker.admin_origin;
 
-    // Strip query before path matching — login/logout/session are
-    // simple static paths.
-    const qmark = std.mem.indexOfScalar(u8, path, '?');
-    const path_no_q = if (qmark) |q| path[0..q] else path;
-
     // Public static bundle: the admin UI's HTML/JS/CSS must reach
-    // the browser before auth so the login page can render. Serves
-    // GET requests with no query string. POSTs and /v1/* take the
-    // auth gate below.
+    // the browser before any JS dispatch happens so the login page
+    // can render without being told it's unauthenticated. Serves
+    // GET requests with no query string; everything else falls
+    // through to admin's JS bundle (where `_middlewares/index.mjs`
+    // applies the auth gate).
     const has_query = std.mem.indexOfScalar(u8, path, '?') != null;
     if (std.mem.eql(u8, method, "GET") and !has_query) {
         const admin_inst = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
@@ -1795,23 +1792,14 @@ fn resolveRequest(
         }
     }
 
-    // /v1/* paths are owned by admin's deployed JS handler — its
-    // `default` export self-auths at entry (pre-auth for signup /
-    // auth / login / logout, session-cookie gated for /v1/session).
-    // Fall through to JS dispatch without the Zig auth gate. Other
-    // paths (?fn=* RPC, anything else under admin host) keep the
-    // Zig gate below.
-    const is_v1_path = std.mem.startsWith(u8, path_no_q, "/v1/");
-    if (!is_v1_path) {
-        const ctx_opt = extractAdminAuth(worker.tenant, rh) catch |err| blk: {
-            std.log.warn("rove-js: admin auth resolution failed: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        if (ctx_opt == null or !ctx_opt.?.is_root) {
-            try setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, admin_cors, null);
-            return .handled;
-        }
-    }
+    // Auth for the admin host is owned by admin's deployed
+    // `_middlewares/index.mjs` — it runs before every dispatch
+    // (default export AND named-export RPCs), checks cookie/bearer,
+    // and either sets request.auth or short-circuits 401. Pre-auth
+    // paths (signup / auth / login / logout) skip the gate inside
+    // the middleware. Zig is no longer in the admin auth path —
+    // `/_system/*` keeps its own auth gate via `tryHandleSystem`
+    // until the files-server + log-server detach (PLAN §10.13).
 
     const admin_opt = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
     if (admin_opt == null) {
