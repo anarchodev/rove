@@ -127,6 +127,27 @@ code=$("${CURL[@]}" -o /tmp/ss-bademail.json -w '%{http_code}' -X POST \
 [[ "$code" == "400" ]] || fail "bad email got $code"
 ok "invalid email → 400"
 
+# ── 4a. Per-account instance limit (pending state) ─────────────────────
+# alice@example.com still has the pending(alice) reservation from
+# section 1 — a second signup with the SAME email but a DIFFERENT name
+# must hit the limit (free tier, max_instances=1).
+code=$("${CURL[@]}" -o /tmp/ss-limit-pending.json -w '%{http_code}' -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"name":"alice2","email":"alice@example.com"}' \
+    "${ADMIN_ORIGIN}/v1/signup")
+[[ "$code" == "403" ]] || fail "limit (pending) got $code: $(cat /tmp/ss-limit-pending.json)"
+grep -q '"error":"account_limit_reached"' /tmp/ss-limit-pending.json \
+    || fail "limit (pending) body: $(cat /tmp/ss-limit-pending.json)"
+ok "second signup for same email (pending state) → 403 account_limit_reached"
+
+# A different email is unaffected — proves the limit is per-account, not global.
+code=$("${CURL[@]}" -o /tmp/ss-other-email.json -w '%{http_code}' -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"name":"carol","email":"carol@example.com"}' \
+    "${ADMIN_ORIGIN}/v1/signup")
+[[ "$code" == "202" ]] || fail "different email got $code: $(cat /tmp/ss-other-email.json)"
+ok "different email accepted (limit is per-account, not global)"
+
 # ── 5. Redeem the magic link → 302 + Set-Cookie + Location ───────────
 hdrs=$("${CURL[@]}" -D - -o /dev/null -w '%{http_code}' "${ADMIN_ORIGIN}/v1/auth?mt=${MT}")
 status=$(echo "$hdrs" | tail -n1)
@@ -169,6 +190,19 @@ ok "malformed / missing magic token → 401"
 list=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" "${ADMIN_ORIGIN}/?fn=listInstance")
 echo "$list" | grep -q '"id":"alice"' || fail "listInstance missing alice: $list"
 ok "signup-created instance visible via listInstance"
+
+# ── 9a. Per-account instance limit (owned state) ──────────────────────
+# alice@example.com now owns the alice tenant; pending is empty. A
+# new signup with the same email must still hit the limit — the cap
+# applies to (owned + pending), and owned is now 1.
+code=$("${CURL[@]}" -o /tmp/ss-limit-owned.json -w '%{http_code}' -X POST \
+    -H "Content-Type: application/json" \
+    -d '{"name":"alicepost","email":"alice@example.com"}' \
+    "${ADMIN_ORIGIN}/v1/signup")
+[[ "$code" == "403" ]] || fail "limit (owned) got $code: $(cat /tmp/ss-limit-owned.json)"
+grep -q '"error":"account_limit_reached"' /tmp/ss-limit-owned.json \
+    || fail "limit (owned) body: $(cat /tmp/ss-limit-owned.json)"
+ok "second signup for same email (owned state) → 403 account_limit_reached"
 
 # ── 9a. Starter content answers on the new instance ───────────────────
 # `/` should resolve via the wildcard public suffix to alice's static

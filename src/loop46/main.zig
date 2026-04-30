@@ -322,6 +322,47 @@ const ADMIN_HANDLER_SRC =
     \\        + "  https://" + name + ".loop46.me";
     \\}
     \\
+    \\// ── Account model ───────────────────────────────────────────────────
+    \\// Email is the account identity. account/{sha256(email)}/plan stores
+    \\// the tier; account/{hash}/instances/{instance_id} marks ownership.
+    \\// v1 hardcodes a single "free" tier with max_instances=1 — Phase 10
+    \\// will branch on plan values (rate caps, DLQ retention, blob caps,
+    \\// custom-domain counts, Stripe linkage). Seed-manifest tenants stay
+    \\// outside the account model entirely (no email, no account/* rows,
+    \\// no count toward any limit).
+    \\
+    \\const PLAN_LIMITS = {
+    \\    free: { max_instances: 1 },
+    \\};
+    \\
+    \\function accountHashFor(email) { return crypto.sha256(email); }
+    \\
+    \\function planLimitsFor(accountHash) {
+    \\    const plan = kv.get("account/" + accountHash + "/plan") || "free";
+    \\    return PLAN_LIMITS[plan] || PLAN_LIMITS.free;
+    \\}
+    \\
+    \\// Count this email's owned instances + non-expired pending
+    \\// reservations. Both kinds count against the limit — without the
+    \\// pending half, the free tier is trivially evadable: spam /v1/signup
+    \\// with N different names, never redeem, hold N name reservations
+    \\// forever (well, until expiry). Pending scan is O(global pending
+    \\// count); fine at v1 scale.
+    \\function countAccountUsage(accountHash, email) {
+    \\    const ownedRows = kv.prefix("account/" + accountHash + "/instances/", "", 1000);
+    \\    let pending = 0;
+    \\    const nowNsVal = nowNs();
+    \\    const pendingRows = kv.prefix("pending/", "", 1000);
+    \\    for (let i = 0; i < pendingRows.length; i++) {
+    \\        let row = null;
+    \\        try { row = JSON.parse(pendingRows[i].value); } catch (_) {}
+    \\        if (!row || row.email !== email) continue;
+    \\        if (nowNsVal >= row.expires_at_ns) continue; // expired; doesn't count
+    \\        pending++;
+    \\    }
+    \\    return { owned: ownedRows.length, pending: pending };
+    \\}
+    \\
     \\// POST /v1/signup — body {name, email}. Lazy creation: writes
     \\// pending/{name} reservation + magic/{hash} record, queues
     \\// signup email via outbox. Does NOT create the customer tenant
@@ -351,6 +392,28 @@ const ADMIN_HANDLER_SRC =
     \\            return jsonError(409, "name unavailable");
     \\        }
     \\        kv.delete("pending/" + name);
+    \\    }
+    \\
+    \\    // Per-account instance limit. owned+pending must stay under the
+    \\    // plan cap; signup-time check rejects most over-limit attempts,
+    \\    // redeem-time recheck (handleAuth) is the authoritative gate
+    \\    // against simultaneous-signup races. Default plan written
+    \\    // here on first signup so future limit lookups for this email
+    \\    // see the same value (Phase 10 will let operators bump).
+    \\    const accHash = accountHashFor(userEmail);
+    \\    const limits = planLimitsFor(accHash);
+    \\    const usage = countAccountUsage(accHash, userEmail);
+    \\    if (usage.owned + usage.pending >= limits.max_instances) {
+    \\        response.status = 403;
+    \\        return {
+    \\            error: "account_limit_reached",
+    \\            limit: limits.max_instances,
+    \\            owned: usage.owned,
+    \\            pending: usage.pending,
+    \\        };
+    \\    }
+    \\    if (kv.get("account/" + accHash + "/plan") === null) {
+    \\        kv.set("account/" + accHash + "/plan", "free");
     \\    }
     \\
     \\    const opaque = mintOpaque();
@@ -434,6 +497,24 @@ const ADMIN_HANDLER_SRC =
     \\        return { error: "signup not found" };
     \\    }
     \\
+    \\    // Authoritative account-limit recheck. Two simultaneous signups
+    \\    // by the same email could both pass the signup-time gate when
+    \\    // limit > 1; only the second to redeem hits this. After this
+    \\    // redemption: owned' = owned + 1, pending' = pending - 1
+    \\    // (we're consuming our own pending), so total stays at
+    \\    // owned + pending — reject iff that exceeds the cap.
+    \\    const accHash = accountHashFor(userEmail);
+    \\    const limits = planLimitsFor(accHash);
+    \\    const usage = countAccountUsage(accHash, userEmail);
+    \\    if (usage.owned + usage.pending > limits.max_instances) {
+    \\        kv.delete("pending/" + name);
+    \\        response.status = 403;
+    \\        return {
+    \\            error: "account_limit_reached",
+    \\            limit: limits.max_instances,
+    \\        };
+    \\    }
+    \\
     \\    // Lazy creation: dir + app.db + marker, then starter content.
     \\    // platform.instances.create is idempotent so a retried redeem
     \\    // (e.g. session mint failed last time) doesn't double-create.
@@ -447,6 +528,9 @@ const ADMIN_HANDLER_SRC =
     \\    // and can push their own code via the files API.
     \\    try { platform.instances.deployStarter(name); } catch (_) {}
     \\
+    \\    // Mark account ownership BEFORE deleting pending. Future
+    \\    // signups by this email will see this in countAccountUsage.
+    \\    kv.set("account/" + accHash + "/instances/" + name, "");
     \\    kv.delete("pending/" + name);
     \\
     \\    const opaqueSession = mintOpaque();
