@@ -1376,7 +1376,51 @@ Combined target: <100ms effective round-trip from dashboard click to confirmed r
 - **HTTP auth on files-server + log-server.** Today's auth model is "trust the local proxy"; new shape needs bearer-token (or HMAC) auth on the HTTP API. Operator provisions the secret via `--bootstrap-kv files_server_token=... files_server_url=...` (the bootstrap-kv mechanism §10's recent generalization handles this trivially — Zig knows nothing about either key).
 - **Operator-side CLI / docs** for deploying files-server + log-server alongside loop46. Today they're spawned automatically; new shape requires the operator to start them and pass URLs.
 
-**Sequencing**: **post-Phase-4 refactor.** Closer-payoff Phase 4 work (auth middleware, per-account instance limit, periodic sweep over `pending/*` + `magic/*`) lands first and unlocks end-to-end Phase 4 / first-customer launch. The detach is its own multi-week shift that wants a focused window. No PLAN §3 phase entry yet; recorded here as locked architectural direction so future-us doesn't rebuild any part of the in-process subsystem proxy plumbing assuming it's permanent.
+**Sequencing**: **pre-launch (revised 2026-04-30).** Originally framed as post-launch refactor, but the detach is the load-bearing exercise of the webhook + callback + SSE + bearer-auth loop that customers will use to integrate with arbitrary third-party services (§10.14). Shipping launch without this means: (a) we haven't dogfooded the end-to-end async-port story, and (b) the dashboard-to-file-server path still goes through an in-process proxy that contradicts the architectural framing. Better to fold it into the launch-path Phase 5/5.5 work. Auth specifics in §10.14.
+
+### 10.14 Distributed Elm ports: webhook + callback + SSE + bearer auth (decided 2026-04-30)
+
+**Framing**: Loop46's customer model is **Elm with distribution**. Pure handler functions (`request × kv → response × cmds`); explicit Cmd-shaped side effects via `webhook.send` and `email.send`; Sub-shaped reactive intake via triggers (kv-write subscriptions), callback handlers (webhook-result subscriptions), and SSE (server-pushed events to client). The combination is **distributed Elm ports** — typed channels between pure-functional handlers and the imperative world.
+
+This isn't just a metaphor. The architectural claim is: real-world reactive applications can be expressed in Loop46's pure-functional handler model *without escape hatches*, because every imperative concern (HTTP I/O, time, retries, browser updates, third-party integrations) has a port-shaped primitive. The combination of webhook + callback + SSE + bearer-mediated cross-origin auth is what makes the model complete enough that customers don't reach for an escape hatch.
+
+**What this unblocks for launch**: the full third-party integration story. Customers integrate with Stripe, Twilio, GitHub, AWS, etc. through these ports without any pure-functional escape hatch. Loop46-the-platform dogfoods the same pattern: file-server and log-server (§10.13) become pseudo-third-party services that admin's editor and runtime talk to via bearer-authed HTTP, with deploy notifications and live UI updates flowing back through webhook + SSE.
+
+**Customer third-party auth toolkit** (orthogonal to editor auth — different surface, different primitives):
+- **Stored keys**: customer puts API tokens in kv (`kv.set("stripe_secret", "sk_live_...")`); operator-config'd or end-user-supplied via signup forms.
+- **Arbitrary headers**: `webhook.send({ headers: { Authorization: "Bearer " + kv.get("stripe_secret") } })`. Covers Bearer (Stripe / GitHub PAT / Slack / Resend), API-Key, custom-header.
+- **HMAC per-request signing**: `crypto.hmacSha256(key, canonicalRequest)` covers AWS SigV4, Twilio request-signature verification, Stripe webhook verification, etc.
+- **OAuth refresh flows**: refresh token in kv; on-401 callback handler mints fresh access token via `webhook.send` to the OAuth provider's token endpoint; new access_token written back to kv. ~30 lines of customer JS, no new primitive.
+
+**Audit gap-fills** (small primitives to add when concrete demand surfaces — not pre-emptively):
+- `crypto.base64Encode(Uint8Array) → string` and `crypto.base64Decode(string) → Uint8Array`. Twilio basic-auth (`Basic base64(sid:token)`) needs it; many APIs return base64 signature material. QJS-ng has no built-in `btoa/atob`. ~30 lines (Zig native using `std.base64`).
+- `crypto.hmacSha1(key, data) → hex`. AWS SigV2 (legacy), Twilio request signing on TwiML callbacks. ~10 lines, same shape as the existing `hmacSha256`.
+- **Deferred**: RSA/ECDSA signing (GitHub Apps, Google service accounts, Apple Push). Bigger surface; HMAC-signed JWTs (which our stack already handles via hmacSha256 + base64) cover a meaningful subset. Add when a customer asks.
+
+**Editor auth (dashboard-internal; does NOT generalize to third parties)**:
+- Editor's session lives in the existing HttpOnly cookie set by `/v1/auth` or `/v1/login`.
+- For cross-origin calls to file-server / log-server, editor exchanges its cookie for a short-lived bearer via a new `GET /v1/files-token` endpoint on admin. Admin signs the bearer (HMAC over `session_opaque || expiry_ms`, with a shared signing secret operator-provisioned via `--bootstrap-kv files_token_signing_secret=...`).
+- File-server validates the bearer locally — same shared secret, same HMAC verification. **No round-trip to admin per request.**
+- Bearer TTL: 5 minutes. Editor refreshes transparently on 401 by re-calling `/v1/files-token`.
+- Logout invalidates the session row in admin's kv; existing bearers continue to work until they expire (≤5 min). Acceptable revocation latency for a development tool; tighten if it ever matters by including `session_revoked_at_ms` in the signed token and re-checking on file-server.
+
+**Why this isn't generalized to customer third-party auth**: the cookie-to-bearer flow only makes sense for clients that *have* a Loop46 cookie session — i.e., the dashboard. Stripe / GitHub / AWS don't have access to that cookie; customers' integrations with them use the kv-stored-keys + arbitrary-headers + crypto-signing toolkit above. The two paths are orthogonal and don't share API surface beyond `webhook.send` itself.
+
+**Deploy notification**: editor orchestrates v1. After committing a deploy on file-server, the editor receives the new manifest hash in the response; it then POSTs that hash to admin (`POST /v1/internal/deploy-applied`) which updates `tenant_files_map.current_deployment_id` and fires an SSE event for any listening dashboard sessions. File-server-pushes-to-worker is left as a v2 option — useful when CLI deploys land that don't go through the editor.
+
+**Pre-launch implications**:
+- §10.13 sequencing flips from post-launch to pre-launch (already done above).
+- The customer third-party-auth story becomes documented + audited — operators can promise customers "integrate with any HTTP API using webhook.send + crypto.\*."
+- The ports/commands framing becomes the documentation north star for the customer-facing handler model. PLAN §1 / §2 audience descriptions update accordingly.
+
+**Order** (each row is its own work-window, several PRs):
+1. **SSE primitive** (Phase 11). Without it the post-save / deploy-confirmation loop has nowhere to land.
+2. **`crypto.base64Encode/Decode` + `crypto.hmacSha1`** if any pre-launch customer integration needs them. Audit the in-flight customer integrations before launch.
+3. **Bearer-token issuance** in admin's JS (`/v1/files-token`) + HMAC-signed-bearer validation in file-server. Operator provisions `files_token_signing_secret` via `--bootstrap-kv`.
+4. **Editor switches** to direct-to-file-server bearer-authed calls (parallel with the existing /_system/files/* proxy during migration).
+5. **Editor orchestrates deploy**: after file-server commit, POST manifest hash to admin. Admin updates state, fires SSE.
+6. **Drop the worker proxy + in-process file-server thread.** File-server runs as separate operator-deployed process. Update PLAN §10.13's "what deletes" list as actually-deleted.
+7. **Same shape for log-server**, slightly easier (query-only, latency-tolerant, no deploy-notification path).
 
 ## 11. Rove-library principles audit (2026-04-21)
 
