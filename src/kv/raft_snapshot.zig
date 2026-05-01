@@ -23,10 +23,7 @@ const raft_rpc = @import("raft_rpc.zig");
 const kvstore_mod = @import("kvstore.zig");
 const raft_node_mod = @import("raft_node.zig");
 
-const c = @cImport({
-    @cInclude("stddef.h");
-    @cInclude("raft.h");
-});
+const c = raft_node_mod.c;
 
 const RaftNode = raft_node_mod.RaftNode;
 
@@ -168,6 +165,65 @@ pub fn buildSnapData(
     }
     raft_rpc.finalizeFrame(buf);
     return buf;
+}
+
+// ── Inbound snap-protocol message handlers ────────────────────────
+//
+// These run from `onPeerMessage` (in raft_node.zig) before willemt or
+// raft_rpc.decode see the bytes. Each takes the body slice (the bytes
+// AFTER the 1-byte type discriminator).
+
+pub fn handleSnapOffer(self: *RaftNode, from_id: u32, body: []const u8) void {
+    // Body: [8B term][8B idx][8B snapshot_seq]. We only need these for
+    // logging; the follower's reply uses its own kv.maxSeq() as after_seq.
+    if (body.len < 24) return;
+
+    // Only meaningful in kv-apply mode.
+    const kv_store = switch (self.config.apply) {
+        .kv => |k| k.store,
+        .opaque_bytes => return,
+    };
+
+    const my_max: u64 = kv_store.maxSeq();
+    const frame = buildSnapReq(self, my_max) catch return;
+    defer self.allocator.free(frame);
+    self.transport.send(from_id, frame) catch {};
+}
+
+pub fn handleSnapReq(self: *RaftNode, from_id: u32, body: []const u8) void {
+    // Body: [8B after_seq]
+    if (body.len < 8) return;
+    const after_seq = std.mem.readInt(u64, body[0..8], .big);
+
+    const kv_store = switch (self.config.apply) {
+        .kv => |k| k.store,
+        .opaque_bytes => return,
+    };
+
+    // Upper bound: the last snapshotted seq. 0 means "no completed snapshot
+    // yet" — fall back to unbounded so a SNAP_REQ still yields something
+    // useful in a fresh cluster.
+    var through = self.snapshot_seq;
+    if (through == 0) through = std.math.maxInt(u64);
+
+    const snap_idx: u64 = @intCast(c.raft_get_snapshot_last_idx(self.raft));
+    const snap_term: u64 = @intCast(c.raft_get_snapshot_last_term(self.raft));
+
+    const maybe_frame = buildSnapData(self, kv_store, snap_term, snap_idx, after_seq, through) catch return;
+    if (maybe_frame) |frame| {
+        defer self.allocator.free(frame);
+        self.transport.send(from_id, frame) catch {};
+    }
+}
+
+pub fn handleSnapData(self: *RaftNode, body: []const u8) void {
+    const kv_store = switch (self.config.apply) {
+        .kv => |k| k.store,
+        .opaque_bytes => return,
+    };
+    applySnapData(self, kv_store, body) catch |err| {
+        std.log.warn("raft_node: snap data apply failed: {s}", .{@errorName(err)});
+    };
 }
 
 /// Apply a received SNAP_DATA payload (bytes after the 1-byte type).

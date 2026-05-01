@@ -18,20 +18,17 @@
 //! as the raft log. See `raft_log.zig` for the full rationale.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+const schema = @import("sqlite_schema.zig");
+const c = schema.c;
 
-pub const Error = error{
-    Conflict,
-    NotFound,
-    Sqlite,
-    /// `PRAGMA journal_mode=WAL` didn't take.
-    JournalMode,
-    /// `PRAGMA synchronous=FULL` didn't take or report back.
-    SynchronousMode,
-    OutOfMemory,
-};
+pub const Error = schema.Error;
+
+/// Sentinel used as the exclusive upper bound when a prefix scan has no
+/// finite successor — empty prefix (scan everything), or a prefix that
+/// is all-0xff bytes. 256 bytes of 0xff compares larger than any key
+/// callers actually use in this codebase (instance ids are ASCII and
+/// capped at 64, domain hosts at 253, log keys at ~40).
+const PREFIX_UPPER_SENTINEL = [_]u8{0xff} ** 256;
 
 pub const Entry = struct {
     key: []u8,
@@ -72,107 +69,6 @@ pub const DeltaResult = struct {
     }
 };
 
-const SQL_CREATE =
-    \\CREATE TABLE IF NOT EXISTS kv (
-    \\  key   TEXT PRIMARY KEY NOT NULL,
-    \\  value BLOB NOT NULL,
-    \\  seq   INTEGER NOT NULL DEFAULT 0
-    \\) WITHOUT ROWID;
-;
-
-const SQL_CREATE_SEQ =
-    \\CREATE TABLE IF NOT EXISTS kv_seq (id INTEGER PRIMARY KEY AUTOINCREMENT);
-;
-
-// Index on kv.seq so `MAX(seq)` at open is O(log n) and the delta
-// replication query (`WHERE seq > ? AND seq <= ?`) is a range scan
-// instead of a full table scan. Created lazily inside openInternal so
-// existing databases pick it up on next open without a migration step.
-const SQL_CREATE_SEQ_INDEX =
-    \\CREATE INDEX IF NOT EXISTS kv_seq_idx ON kv (seq);
-;
-
-// Undo log. See module doc comment for the full rationale. Briefly: a
-// `TrackedTxn` captures the pre-image of every key it touches so a crash
-// between local commit and raft commit can be rolled back on startup. A
-// NULL `prev_value` means "this key didn't exist before the txn" — the
-// undo action is then a delete rather than a restore.
-const SQL_CREATE_UNDO =
-    \\CREATE TABLE IF NOT EXISTS kv_undo (
-    \\  txn_seq    INTEGER NOT NULL,
-    \\  key        TEXT    NOT NULL,
-    \\  prev_value BLOB,
-    \\  prev_seq   INTEGER,
-    \\  PRIMARY KEY (txn_seq, key)
-    \\) WITHOUT ROWID;
-;
-
-const SQL_GET = "SELECT value FROM kv WHERE key = ?;";
-const SQL_PUT = "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?);";
-const SQL_PUT_SEQ = "INSERT OR REPLACE INTO kv (key, value, seq) VALUES (?, ?, ?);";
-const SQL_DEL = "DELETE FROM kv WHERE key = ?;";
-const SQL_PREFIX = "SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key LIMIT ?;";
-
-// Sentinel used as the exclusive upper bound when a prefix scan has no
-// finite successor — empty prefix (scan everything), or a prefix that
-// is all-0xff bytes. 256 bytes of 0xff compares larger than any key
-// callers actually use in this codebase (instance ids are ASCII and
-// capped at 64, domain hosts at 253, log keys at ~40).
-const PREFIX_UPPER_SENTINEL = [_]u8{0xff} ** 256;
-const SQL_DELTA = "SELECT key, value, seq FROM kv WHERE seq > ? AND seq <= ? ORDER BY seq;";
-const SQL_BEGIN = "BEGIN;";
-// BEGIN IMMEDIATE acquires RESERVED at begin time, serializing
-// concurrent writers up front (they block inside SQLite's busy retry
-// loop for up to `busy_timeout` ms). Used by rove-js so per-tenant
-// handler transactions get clean FIFO serialization without bubbling
-// SQLITE_BUSY up to the dispatcher.
-const SQL_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE;";
-const SQL_COMMIT = "COMMIT;";
-const SQL_ROLLBACK = "ROLLBACK;";
-const SQL_MAX_SEQ = "SELECT MAX(seq) FROM kv;";
-// Initial seq for a fresh store / for verifying migration from an older
-// schema. Reads the historical high-water mark from kv_seq's
-// `sqlite_sequence` row — AUTOINCREMENT tracks "max id ever used" even
-// after rows are deleted, so this is stable across restarts. Seq
-// allocation is now done in-memory (see `SeqCounter`), but we still
-// seed from max(kv_seq historical max, MAX(kv.seq)) so an upgrade from
-// the old per-write-INSERT scheme never reuses a value.
-const SQL_MAX_SEQ_SEQUENCE = "SELECT COALESCE(seq, 0) FROM sqlite_sequence WHERE name = 'kv_seq';";
-
-// Undo log statements.
-//
-// `SQL_UNDO_CAPTURE` folds the "SELECT prev value, seq FROM kv / bind /
-// INSERT OR IGNORE INTO kv_undo" pair into a single statement. The
-// one-row literal subquery (`SELECT ?2 AS key`) guarantees we always
-// generate exactly one candidate undo row — the LEFT JOIN fills
-// prev_value/prev_seq with NULLs when the key did not exist. On the
-// second+ capture for the same (txn_seq, key) pair within one txn,
-// `INSERT OR IGNORE` no-ops, so only the first pre-image sticks —
-// same contract as the old two-statement path.
-const SQL_UNDO_CAPTURE =
-    \\INSERT OR IGNORE INTO kv_undo (txn_seq, key, prev_value, prev_seq)
-    \\SELECT ?1, lit.key, k.value, k.seq
-    \\FROM (SELECT ?2 AS key) AS lit
-    \\LEFT JOIN kv AS k ON k.key = lit.key;
-;
-const SQL_UNDO_SELECT_UNCOMMITTED =
-    \\SELECT txn_seq, key, prev_value, prev_seq FROM kv_undo
-    \\WHERE txn_seq > ?
-    \\ORDER BY txn_seq DESC, key;
-;
-const SQL_UNDO_DELETE_COMMITTED = "DELETE FROM kv_undo WHERE txn_seq <= ?;";
-const SQL_UNDO_DELETE_UNCOMMITTED = "DELETE FROM kv_undo WHERE txn_seq > ?;";
-const SQL_UNDO_DELETE_TXN = "DELETE FROM kv_undo WHERE txn_seq = ?;";
-
-// Single reusable savepoint name. Handlers in a batched dispatch run
-// sequentially — each one SAVEPOINT+RELEASE (or ROLLBACK TO) before
-// the next starts — so there's never more than one savepoint live at
-// once, and reusing the name is safe. Using a fixed name lets us
-// prepare these statements once at open time instead of formatting a
-// new savepoint name per handler.
-const SQL_SAVEPOINT_H = "SAVEPOINT h;";
-const SQL_RELEASE_H = "RELEASE h;";
-const SQL_ROLLBACK_TO_H = "ROLLBACK TO h;";
 
 /// Monotonic counter for `nextSeq`. Replaces the per-write
 /// `INSERT INTO kv_seq` (and its WAL page write) with an atomic
@@ -384,14 +280,14 @@ pub const KvStore = struct {
         // settings that mutate the database — only valid on a
         // read-write connection.
         if (mode == .read_write) {
-            try pinDurability(db.?);
+            try schema.pinDurability(db.?);
         }
 
         if (mode == .read_write) {
-            if (c.sqlite3_exec(db, SQL_CREATE, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
-            if (c.sqlite3_exec(db, SQL_CREATE_SEQ, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
-            if (c.sqlite3_exec(db, SQL_CREATE_SEQ_INDEX, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
-            if (c.sqlite3_exec(db, SQL_CREATE_UNDO, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
+            if (c.sqlite3_exec(db, schema.SQL_CREATE, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
+            if (c.sqlite3_exec(db, schema.SQL_CREATE_SEQ, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
+            if (c.sqlite3_exec(db, schema.SQL_CREATE_SEQ_INDEX, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
+            if (c.sqlite3_exec(db, schema.SQL_CREATE_UNDO, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
         }
 
         self.allocator = allocator;
@@ -400,24 +296,24 @@ pub const KvStore = struct {
         // Prepare statements; on failure, finalize what we've prepared so far.
         var prepared: usize = 0;
         const stmts = [_]struct { sql: []const u8, field: []const u8 }{
-            .{ .sql = SQL_GET, .field = "stmt_get" },
-            .{ .sql = SQL_PUT, .field = "stmt_put" },
-            .{ .sql = SQL_PUT_SEQ, .field = "stmt_put_seq" },
-            .{ .sql = SQL_DEL, .field = "stmt_del" },
-            .{ .sql = SQL_PREFIX, .field = "stmt_prefix" },
-            .{ .sql = SQL_DELTA, .field = "stmt_delta" },
-            .{ .sql = SQL_BEGIN, .field = "stmt_begin" },
-            .{ .sql = SQL_BEGIN_IMMEDIATE, .field = "stmt_begin_immediate" },
-            .{ .sql = SQL_COMMIT, .field = "stmt_commit" },
-            .{ .sql = SQL_ROLLBACK, .field = "stmt_rollback" },
-            .{ .sql = SQL_UNDO_CAPTURE, .field = "stmt_undo_capture" },
-            .{ .sql = SQL_UNDO_SELECT_UNCOMMITTED, .field = "stmt_undo_select_uncommitted" },
-            .{ .sql = SQL_UNDO_DELETE_COMMITTED, .field = "stmt_undo_delete_committed" },
-            .{ .sql = SQL_UNDO_DELETE_UNCOMMITTED, .field = "stmt_undo_delete_uncommitted" },
-            .{ .sql = SQL_UNDO_DELETE_TXN, .field = "stmt_undo_delete_txn" },
-            .{ .sql = SQL_SAVEPOINT_H, .field = "stmt_savepoint" },
-            .{ .sql = SQL_RELEASE_H, .field = "stmt_release" },
-            .{ .sql = SQL_ROLLBACK_TO_H, .field = "stmt_rollback_to" },
+            .{ .sql = schema.SQL_GET, .field = "stmt_get" },
+            .{ .sql = schema.SQL_PUT, .field = "stmt_put" },
+            .{ .sql = schema.SQL_PUT_SEQ, .field = "stmt_put_seq" },
+            .{ .sql = schema.SQL_DEL, .field = "stmt_del" },
+            .{ .sql = schema.SQL_PREFIX, .field = "stmt_prefix" },
+            .{ .sql = schema.SQL_DELTA, .field = "stmt_delta" },
+            .{ .sql = schema.SQL_BEGIN, .field = "stmt_begin" },
+            .{ .sql = schema.SQL_BEGIN_IMMEDIATE, .field = "stmt_begin_immediate" },
+            .{ .sql = schema.SQL_COMMIT, .field = "stmt_commit" },
+            .{ .sql = schema.SQL_ROLLBACK, .field = "stmt_rollback" },
+            .{ .sql = schema.SQL_UNDO_CAPTURE, .field = "stmt_undo_capture" },
+            .{ .sql = schema.SQL_UNDO_SELECT_UNCOMMITTED, .field = "stmt_undo_select_uncommitted" },
+            .{ .sql = schema.SQL_UNDO_DELETE_COMMITTED, .field = "stmt_undo_delete_committed" },
+            .{ .sql = schema.SQL_UNDO_DELETE_UNCOMMITTED, .field = "stmt_undo_delete_uncommitted" },
+            .{ .sql = schema.SQL_UNDO_DELETE_TXN, .field = "stmt_undo_delete_txn" },
+            .{ .sql = schema.SQL_SAVEPOINT_H, .field = "stmt_savepoint" },
+            .{ .sql = schema.SQL_RELEASE_H, .field = "stmt_release" },
+            .{ .sql = schema.SQL_ROLLBACK_TO_H, .field = "stmt_rollback_to" },
         };
 
         errdefer {
@@ -429,7 +325,7 @@ pub const KvStore = struct {
         }
 
         inline for (stmts) |s| {
-            @field(self, s.field) = try prepare(self.db, s.sql);
+            @field(self, s.field) = try schema.prepare(self.db, s.sql);
             prepared += 1;
         }
 
@@ -439,7 +335,7 @@ pub const KvStore = struct {
         // after we stopped inserting) and take the larger. This keeps
         // existing databases migrating from the old SQL-allocated
         // scheme from reusing seq values.
-        const disk_floor = readSeqFloor(self.db);
+        const disk_floor = schema.readSeqFloor(self.db);
         if (shared_counter) |sc| {
             sc.raiseTo(disk_floor);
             self.counter = sc;
@@ -479,11 +375,11 @@ pub const KvStore = struct {
     // ── Transactions ──────────────────────────────────────────────────
 
     pub fn begin(self: *KvStore) Error!void {
-        return runVoid(self.stmt_begin);
+        return schema.runVoid(self.stmt_begin);
     }
 
     pub fn commit(self: *KvStore) Error!void {
-        return runVoid(self.stmt_commit);
+        return schema.runVoid(self.stmt_commit);
     }
 
     pub fn rollback(self: *KvStore) Error!void {
@@ -501,7 +397,7 @@ pub const KvStore = struct {
     pub fn get(self: *KvStore, key: []const u8) Error![]u8 {
         const st = self.stmt_get;
         _ = c.sqlite3_reset(st);
-        bindText(st, 1, key);
+        schema.bindText(st, 1, key);
 
         const rc = c.sqlite3_step(st);
         defer _ = c.sqlite3_reset(st);
@@ -522,8 +418,8 @@ pub const KvStore = struct {
     pub fn put(self: *KvStore, key: []const u8, value: []const u8) Error!void {
         const st = self.stmt_put;
         _ = c.sqlite3_reset(st);
-        bindText(st, 1, key);
-        bindBlob(st, 2, value);
+        schema.bindText(st, 1, key);
+        schema.bindBlob(st, 2, value);
 
         const rc = c.sqlite3_step(st);
         _ = c.sqlite3_reset(st);
@@ -533,8 +429,8 @@ pub const KvStore = struct {
     pub fn putSeq(self: *KvStore, key: []const u8, value: []const u8, seq: u64) Error!void {
         const st = self.stmt_put_seq;
         _ = c.sqlite3_reset(st);
-        bindText(st, 1, key);
-        bindBlob(st, 2, value);
+        schema.bindText(st, 1, key);
+        schema.bindBlob(st, 2, value);
         _ = c.sqlite3_bind_int64(st, 3, @bitCast(seq));
 
         const rc = c.sqlite3_step(st);
@@ -545,7 +441,7 @@ pub const KvStore = struct {
     pub fn delete(self: *KvStore, key: []const u8) Error!void {
         const st = self.stmt_del;
         _ = c.sqlite3_reset(st);
-        bindText(st, 1, key);
+        schema.bindText(st, 1, key);
 
         const rc = c.sqlite3_step(st);
         _ = c.sqlite3_reset(st);
@@ -614,8 +510,8 @@ pub const KvStore = struct {
 
         const st = self.stmt_prefix;
         _ = c.sqlite3_reset(st);
-        bindText(st, 1, start);
-        bindText(st, 2, end);
+        schema.bindText(st, 1, start);
+        schema.bindText(st, 2, end);
         _ = c.sqlite3_bind_int64(st, 3, count);
 
         var list: std.ArrayList(Entry) = .empty;
@@ -676,7 +572,7 @@ pub const KvStore = struct {
     /// Returns the maximum seq value in the kv table, or 0 if empty.
     pub fn maxSeq(self: *KvStore) u64 {
         var st: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, SQL_MAX_SEQ, -1, &st, null) != c.SQLITE_OK) return 0;
+        if (c.sqlite3_prepare_v2(self.db, schema.SQL_MAX_SEQ, -1, &st, null) != c.SQLITE_OK) return 0;
         defer _ = c.sqlite3_finalize(st);
         var result: u64 = 0;
         if (c.sqlite3_step(st) == c.SQLITE_ROW) {
@@ -897,21 +793,21 @@ pub const KvStore = struct {
         /// tenant-level transaction.
         pub fn savepoint(self: *TrackedTxn) Error!void {
             try self.ensureOpen();
-            try runVoid(self.store.stmt_savepoint);
+            try schema.runVoid(self.store.stmt_savepoint);
         }
 
         /// Drop the current savepoint; any writes since `savepoint()`
         /// are promoted into the enclosing txn and will COMMIT if the
         /// txn commits. Cheap — no disk I/O.
         pub fn release(self: *TrackedTxn) Error!void {
-            try runVoid(self.store.stmt_release);
+            try schema.runVoid(self.store.stmt_release);
         }
 
         /// Rewind to the savepoint; any writes since `savepoint()` —
         /// including undo-log inserts — are discarded. The enclosing
         /// txn remains open and can continue.
         pub fn rollbackTo(self: *TrackedTxn) Error!void {
-            try runVoid(self.store.stmt_rollback_to);
+            try schema.runVoid(self.store.stmt_rollback_to);
         }
 
         pub fn commit(self: *TrackedTxn) Error!void {
@@ -932,11 +828,11 @@ pub const KvStore = struct {
             // row (with NULL prev_value/prev_seq when the key doesn't
             // exist); `INSERT OR IGNORE` no-ops on subsequent writes
             // to the same (txn_seq, key) pair within the txn. See
-            // `SQL_UNDO_CAPTURE`.
+            // `schema.SQL_UNDO_CAPTURE`.
             const st = self.store.stmt_undo_capture;
             _ = c.sqlite3_reset(st);
             _ = c.sqlite3_bind_int64(st, 1, @bitCast(self.txn_seq));
-            bindText(st, 2, key);
+            schema.bindText(st, 2, key);
             const rc = c.sqlite3_step(st);
             _ = c.sqlite3_reset(st);
             if (rc != c.SQLITE_DONE) return Error.Sqlite;
@@ -1126,8 +1022,8 @@ pub const KvStore = struct {
             // Restore (prev_value, prev_seq).
             const st = self.stmt_put_seq;
             _ = c.sqlite3_reset(st);
-            bindText(st, 1, row.key);
-            bindBlob(st, 2, pv);
+            schema.bindText(st, 1, row.key);
+            schema.bindBlob(st, 2, pv);
             const seq_i64: i64 = row.prev_seq orelse 0;
             _ = c.sqlite3_bind_int64(st, 3, seq_i64);
             const rc = c.sqlite3_step(st);
@@ -1137,7 +1033,7 @@ pub const KvStore = struct {
             // Key didn't exist before the txn — delete it.
             const st = self.stmt_del;
             _ = c.sqlite3_reset(st);
-            bindText(st, 1, row.key);
+            schema.bindText(st, 1, row.key);
             const rc = c.sqlite3_step(st);
             _ = c.sqlite3_reset(st);
             if (rc != c.SQLITE_DONE) return Error.Sqlite;
@@ -1180,91 +1076,6 @@ fn freeUndoRows(allocator: std.mem.Allocator, rows: []const KvStore.UndoRow) voi
     allocator.free(rows);
 }
 
-// ── helpers ────────────────────────────────────────────────────────────
-
-/// Compute the seed value for `SeqCounter` at open time:
-/// `max(MAX(kv.seq), sqlite_sequence['kv_seq'])`. Both queries are
-/// O(log n) — kv.seq is indexed by `kv_seq_idx`, and sqlite_sequence
-/// is a single-row lookup. Returns 0 on empty/missing data (fresh db
-/// with no writes yet).
-fn readSeqFloor(db: *c.sqlite3) u64 {
-    var floor: u64 = 0;
-
-    var st1: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, SQL_MAX_SEQ, -1, &st1, null) == c.SQLITE_OK) {
-        defer _ = c.sqlite3_finalize(st1);
-        if (c.sqlite3_step(st1) == c.SQLITE_ROW) {
-            const v: u64 = @bitCast(c.sqlite3_column_int64(st1, 0));
-            if (v > floor) floor = v;
-        }
-    }
-
-    var st2: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, SQL_MAX_SEQ_SEQUENCE, -1, &st2, null) == c.SQLITE_OK) {
-        defer _ = c.sqlite3_finalize(st2);
-        if (c.sqlite3_step(st2) == c.SQLITE_ROW) {
-            const v: u64 = @bitCast(c.sqlite3_column_int64(st2, 0));
-            if (v > floor) floor = v;
-        }
-    }
-
-    return floor;
-}
-
-fn prepare(db: *c.sqlite3, sql: []const u8) Error!*c.sqlite3_stmt {
-    var st: ?*c.sqlite3_stmt = null;
-    const rc = c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &st, null);
-    if (rc != c.SQLITE_OK or st == null) return Error.Sqlite;
-    return st.?;
-}
-
-/// Pin WAL mode + synchronous=FULL and verify both took. See the module
-/// doc-comment for why these matter.
-fn pinDurability(db: *c.sqlite3) Error!void {
-    {
-        var st: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, "PRAGMA journal_mode=WAL;", -1, &st, null) != c.SQLITE_OK) return Error.Sqlite;
-        defer _ = c.sqlite3_finalize(st);
-        if (c.sqlite3_step(st) != c.SQLITE_ROW) return Error.JournalMode;
-        const text_ptr = c.sqlite3_column_text(st, 0);
-        const text_len: usize = @intCast(c.sqlite3_column_bytes(st, 0));
-        if (text_ptr == null or text_len == 0) return Error.JournalMode;
-        const mode: []const u8 = @as([*]const u8, @ptrCast(text_ptr))[0..text_len];
-        if (!std.ascii.eqlIgnoreCase(mode, "wal")) return Error.JournalMode;
-    }
-    // synchronous=NORMAL is the right level for tenant kv + log kv:
-    // raft is the durability boundary, so an in-process fsync on every
-    // kv commit is redundant. raft_log.db stays FULL (it's the source
-    // of truth on restart). NORMAL still fsyncs at WAL checkpoints,
-    // which is what we want — each commit just gets written to the WAL
-    // page cache without blocking.
-    if (c.sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", null, null, null) != c.SQLITE_OK) {
-        return Error.SynchronousMode;
-    }
-    {
-        var st: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, "PRAGMA synchronous;", -1, &st, null) != c.SQLITE_OK) return Error.Sqlite;
-        defer _ = c.sqlite3_finalize(st);
-        if (c.sqlite3_step(st) != c.SQLITE_ROW) return Error.SynchronousMode;
-        if (c.sqlite3_column_int(st, 0) != 1) return Error.SynchronousMode;
-    }
-}
-
-fn bindText(st: *c.sqlite3_stmt, idx: c_int, text: []const u8) void {
-    _ = c.sqlite3_bind_text(st, idx, text.ptr, @intCast(text.len), c.SQLITE_STATIC);
-}
-
-fn bindBlob(st: *c.sqlite3_stmt, idx: c_int, blob: []const u8) void {
-    _ = c.sqlite3_bind_blob(st, idx, blob.ptr, @intCast(blob.len), c.SQLITE_STATIC);
-}
-
-fn runVoid(st: *c.sqlite3_stmt) Error!void {
-    _ = c.sqlite3_reset(st);
-    const rc = c.sqlite3_step(st);
-    _ = c.sqlite3_reset(st);
-    if (rc == c.SQLITE_BUSY) return Error.Conflict;
-    if (rc != c.SQLITE_DONE) return Error.Sqlite;
-}
 
 // ── tests ──────────────────────────────────────────────────────────────
 
