@@ -427,6 +427,82 @@ pub fn H2(comptime opts: Options) type {
         var ng_client_callbacks: ?*c.nghttp2_session_callbacks = null;
 
         // =============================================================
+        // COLLECTIONS — single source of truth for the 27 collection
+        // fields above. Drives init, registerCollection, deinit, and
+        // the serverStreamColls / clientStreamColls helpers via
+        // comptime loops, so adding a collection is a one-line spec
+        // change rather than edits in 4–6 places.
+        // =============================================================
+
+        const Kind = enum {
+            server_stream,
+            server_read,
+            server_conn,
+            client_connect,
+            client_stream,
+        };
+
+        const CollSpec = struct {
+            name: []const u8,
+            Coll: type,
+            kind: Kind,
+            client_only: bool = false,
+            // True for collections that hold an entity in some
+            // intermediate state of the kind's pipeline (so the
+            // serverStreamClose / clientStreamClose helpers iterate
+            // them looking for the entity's current home). False for
+            // terminal collections (response_out / client_response_out)
+            // — those are the move target, not a search target.
+            in_chain: bool = false,
+        };
+
+        const COLLECTIONS = [_]CollSpec{
+            .{ .name = "request_out",          .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "response_in",          .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "response_out",         .Coll = StreamColl, .kind = .server_stream },
+            .{ .name = "_response_sending",    .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "stream_response_in",   .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "stream_data_out",      .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "stream_data_in",       .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "stream_close_in",      .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "_stream_data_sending", .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "_read_errors",         .Coll = ReadColl,   .kind = .server_read },
+            .{ .name = "_read_init",           .Coll = ReadColl,   .kind = .server_read },
+            .{ .name = "_read_active",         .Coll = ReadColl,   .kind = .server_read },
+            .{ .name = "_read_handshake",      .Coll = ReadColl,   .kind = .server_read },
+            .{ .name = "_conn_tls_handshake",  .Coll = ConnColl,   .kind = .server_conn },
+            .{ .name = "_conn_active",         .Coll = ConnColl,   .kind = .server_conn },
+            .{ .name = "client_connect_in",        .Coll = ClientConnectColl, .kind = .client_connect, .client_only = true },
+            .{ .name = "client_connect_out",       .Coll = ClientConnectColl, .kind = .client_connect, .client_only = true },
+            .{ .name = "client_connect_errors",    .Coll = ClientConnectColl, .kind = .client_connect, .client_only = true },
+            .{ .name = "_client_connect_pending",  .Coll = ClientConnectColl, .kind = .client_connect, .client_only = true },
+            .{ .name = "client_request_in",           .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
+            .{ .name = "client_response_out",         .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true },
+            .{ .name = "_client_request_sending",     .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
+            .{ .name = "client_stream_request_in",    .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
+            .{ .name = "client_stream_data_out",      .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
+            .{ .name = "client_stream_data_in",       .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
+            .{ .name = "client_stream_close_in",      .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
+            .{ .name = "_client_stream_data_sending", .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
+        };
+
+        const SERVER_STREAM_CHAIN: []const []const u8 = blk: {
+            var names: []const []const u8 = &.{};
+            for (COLLECTIONS) |s| {
+                if (s.kind == .server_stream and s.in_chain) names = names ++ &[_][]const u8{s.name};
+            }
+            break :blk names;
+        };
+
+        const CLIENT_STREAM_CHAIN: []const []const u8 = blk: {
+            var names: []const []const u8 = &.{};
+            for (COLLECTIONS) |s| {
+                if (s.kind == .client_stream and s.in_chain) names = names ++ &[_][]const u8{s.name};
+            }
+            break :blk names;
+        };
+
+        // =============================================================
         // NgCtx — nghttp2 session user_data, holds *Self for collection access
         // =============================================================
 
@@ -441,30 +517,21 @@ pub fn H2(comptime opts: Options) type {
         // =============================================================
 
         /// All collections a server stream entity can be in between request_out and response_out.
-        inline fn serverStreamColls(h2: *Self) [8]*StreamColl {
-            return .{
-                &h2.request_out,
-                &h2.response_in,
-                &h2._response_sending,
-                &h2.stream_response_in,
-                &h2.stream_data_out,
-                &h2.stream_data_in,
-                &h2.stream_close_in,
-                &h2._stream_data_sending,
-            };
+        inline fn serverStreamColls(h2: *Self) [SERVER_STREAM_CHAIN.len]*StreamColl {
+            var out: [SERVER_STREAM_CHAIN.len]*StreamColl = undefined;
+            inline for (SERVER_STREAM_CHAIN, 0..) |name, i| {
+                out[i] = &@field(h2, name);
+            }
+            return out;
         }
 
         /// All collections a client stream entity can be in between client_request_in and client_response_out.
-        inline fn clientStreamColls(h2: *Self) [7]*ClientStreamColl {
-            return .{
-                &h2.client_request_in,
-                &h2._client_request_sending,
-                &h2.client_stream_request_in,
-                &h2.client_stream_data_out,
-                &h2.client_stream_data_in,
-                &h2.client_stream_close_in,
-                &h2._client_stream_data_sending,
-            };
+        inline fn clientStreamColls(h2: *Self) [CLIENT_STREAM_CHAIN.len]*ClientStreamColl {
+            var out: [CLIENT_STREAM_CHAIN.len]*ClientStreamColl = undefined;
+            inline for (CLIENT_STREAM_CHAIN, 0..) |name, i| {
+                out[i] = &@field(h2, name);
+            }
+            return out;
         }
 
         /// All collections a connection entity can be in (io's + h2's).
@@ -972,69 +1039,25 @@ pub fn H2(comptime opts: Options) type {
             errdefer io.destroy();
 
             const self = try allocator.create(Self);
-            self.* = .{
-                .io = io,
-                .request_out = try StreamColl.init(allocator),
-                .response_in = try StreamColl.init(allocator),
-                .response_out = try StreamColl.init(allocator),
-                ._response_sending = try StreamColl.init(allocator),
-                .stream_response_in = try StreamColl.init(allocator),
-                .stream_data_out = try StreamColl.init(allocator),
-                .stream_data_in = try StreamColl.init(allocator),
-                .stream_close_in = try StreamColl.init(allocator),
-                ._stream_data_sending = try StreamColl.init(allocator),
-                ._read_errors = try ReadColl.init(allocator),
-                ._read_init = try ReadColl.init(allocator),
-                ._read_active = try ReadColl.init(allocator),
-                ._read_handshake = try ReadColl.init(allocator),
-                ._conn_tls_handshake = try ConnColl.init(allocator),
-                ._conn_active = try ConnColl.init(allocator),
-                .client_connect_in = if (has_client) try ClientConnectColl.init(allocator) else {},
-                .client_connect_out = if (has_client) try ClientConnectColl.init(allocator) else {},
-                .client_connect_errors = if (has_client) try ClientConnectColl.init(allocator) else {},
-                ._client_connect_pending = if (has_client) try ClientConnectColl.init(allocator) else {},
-                .client_request_in = if (has_client) try ClientStreamColl.init(allocator) else {},
-                .client_response_out = if (has_client) try ClientStreamColl.init(allocator) else {},
-                ._client_request_sending = if (has_client) try ClientStreamColl.init(allocator) else {},
-                .client_stream_request_in = if (has_client) try ClientStreamColl.init(allocator) else {},
-                .client_stream_data_out = if (has_client) try ClientStreamColl.init(allocator) else {},
-                .client_stream_data_in = if (has_client) try ClientStreamColl.init(allocator) else {},
-                .client_stream_close_in = if (has_client) try ClientStreamColl.init(allocator) else {},
-                ._client_stream_data_sending = if (has_client) try ClientStreamColl.init(allocator) else {},
-                .h2_opts = h2_opts,
-                .reg = reg,
-                .allocator = allocator,
-            };
+            self.io = io;
+            self.h2_opts = h2_opts;
+            self.reg = reg;
+            self.allocator = allocator;
 
-            // Register all collections
-            reg.registerCollection(&self.request_out);
-            reg.registerCollection(&self.response_in);
-            reg.registerCollection(&self.response_out);
-            reg.registerCollection(&self._response_sending);
-            reg.registerCollection(&self.stream_response_in);
-            reg.registerCollection(&self.stream_data_out);
-            reg.registerCollection(&self.stream_data_in);
-            reg.registerCollection(&self.stream_close_in);
-            reg.registerCollection(&self._stream_data_sending);
-            reg.registerCollection(&self._read_errors);
-            reg.registerCollection(&self._read_init);
-            reg.registerCollection(&self._read_active);
-            reg.registerCollection(&self._read_handshake);
-            reg.registerCollection(&self._conn_tls_handshake);
-            reg.registerCollection(&self._conn_active);
-            if (has_client) {
-                reg.registerCollection(&self.client_connect_in);
-                reg.registerCollection(&self.client_connect_out);
-                reg.registerCollection(&self.client_connect_errors);
-                reg.registerCollection(&self._client_connect_pending);
-                reg.registerCollection(&self.client_request_in);
-                reg.registerCollection(&self.client_response_out);
-                reg.registerCollection(&self._client_request_sending);
-                reg.registerCollection(&self.client_stream_request_in);
-                reg.registerCollection(&self.client_stream_data_out);
-                reg.registerCollection(&self.client_stream_data_in);
-                reg.registerCollection(&self.client_stream_close_in);
-                reg.registerCollection(&self._client_stream_data_sending);
+            // Init every collection field. Disabled (client_only with
+            // has_client = false) collections have field type `void` —
+            // assign `{}` so the field is defined.
+            inline for (COLLECTIONS) |s| {
+                if (s.client_only and !has_client) {
+                    @field(self, s.name) = {};
+                } else {
+                    @field(self, s.name) = try s.Coll.init(allocator);
+                }
+            }
+
+            inline for (COLLECTIONS) |s| {
+                if (s.client_only and !has_client) continue;
+                reg.registerCollection(&@field(self, s.name));
             }
 
             // Register FD resolver with io so that processWriteIn/processReadIn
@@ -1046,34 +1069,9 @@ pub fn H2(comptime opts: Options) type {
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
-            self.request_out.deinit();
-            self.response_in.deinit();
-            self.response_out.deinit();
-            self._response_sending.deinit();
-            self.stream_response_in.deinit();
-            self.stream_data_out.deinit();
-            self.stream_data_in.deinit();
-            self.stream_close_in.deinit();
-            self._stream_data_sending.deinit();
-            self._read_errors.deinit();
-            self._read_init.deinit();
-            self._read_active.deinit();
-            self._read_handshake.deinit();
-            self._conn_tls_handshake.deinit();
-            self._conn_active.deinit();
-            if (has_client) {
-                self.client_connect_in.deinit();
-                self.client_connect_out.deinit();
-                self.client_connect_errors.deinit();
-                self._client_connect_pending.deinit();
-                self.client_request_in.deinit();
-                self.client_response_out.deinit();
-                self._client_request_sending.deinit();
-                self.client_stream_request_in.deinit();
-                self.client_stream_data_out.deinit();
-                self.client_stream_data_in.deinit();
-                self.client_stream_close_in.deinit();
-                self._client_stream_data_sending.deinit();
+            inline for (COLLECTIONS) |s| {
+                if (s.client_only and !has_client) continue;
+                @field(self, s.name).deinit();
             }
             self.io.destroy();
             allocator.destroy(self);
