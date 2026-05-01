@@ -838,7 +838,7 @@ production traffic without disk-fill within weeks.** MVP complete.
 - Pump in `js-worker`: per-tenant subscription map keyed by sid, dirty-flag on commits touching `_events/`, drains to wire.
 - `EventsCaps` struct + `eventsCapsForPlan(plan)` lookup — same shape used for future plan-tiered caps in other subsystems.
 - Single-node only. Multi-node session routing deferred (decide when multi-node lands; same call as the webhook drainer's leader-only model OR a session→node registry).
-- Has no hard predecessor — depends on §2.6 webhooks (done) + existing kv/h2/handler infra. Position in the phase list reflects "non-blocking for first-customer launch"; could be pulled forward into the MVP if SSE turns out to be a hot demo feature.
+- Has no hard predecessor — depends on §2.6 webhooks (done) + existing kv/h2/handler infra. **Sequencing per §10.17 (2026-04-30): NOT in beta, IS in 1.0** as launch path item #1 — needed for the live use cases (Stripe Checkout, OAuth, AI-agent results) that beta deliberately omits.
 
 ### Phase 12 — Sim test framework + simulator library (§10.7, §10.8)
 
@@ -1048,8 +1048,11 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 
 ### Phases 7, 9, 10 — **not started**
 
-### Phase 12 — Sim test framework + simulator library — **not started**
-- Locked in §10.7 + §10.8 (2026-04-28). Detailed plan in `docs/sim-test-framework.md`. **Pure client-side**: simulator module (`src/simulator/`) library-linked into the `loop46` CLI; `ReplaySource`; bundle module extraction; bundle JSON additions; module tape wiring; request body capture; `_tests/` directory + `loop46 test` and `loop46 simulate` CLI subcommands; snapshot machinery; sibling-file fixture export; production strip of `_tests/`. **No server endpoints, no thread pool, no rate-limit action** — worker is unchanged.
+### Phase 12 — Sim test framework + simulator library — **not started; partially absorbed into beta + 1.0**
+- Locked in §10.7 + §10.8 (2026-04-28); scope narrowed by the §10.12 two-path replay wedge (2026-04-30) and the beta-first sequencing in §10.17 / §10.18 (2026-04-30). Detailed plan in `docs/sim-test-framework.md`. **Pure client-side**: simulator module (`src/simulator/`) library-linked into the `loop46` CLI; `ReplaySource`; bundle module extraction; bundle JSON additions; module tape wiring; request body capture; `_tests/` directory + `loop46 test` and `loop46 simulate` CLI subcommands; snapshot machinery; sibling-file fixture export; production strip of `_tests/`. **No server endpoints, no thread pool, no rate-limit action** — worker is unchanged.
+- **Beta absorbs**: bundle JSON shape (extracted into `src/tape/bundle.zig`), stubs-library shape (Loop46 globals reading from tape, shared with the `replay.loop46.me` browser-replay page), request body capture into the tape. Beta-path prerequisites for §10.12's Story 1 path and stop being Phase-12-specific work.
+- **1.0 absorbs**: nothing additional from Phase 12 — the DAP CLI reuses the beta stubs library directly.
+- **Stays post-1.0**: Zig + QuickJS `ReplaySource` (the strict-determinism authority — distinct from the V8-based launch interactive-replay paths), sim test framework + assertions, snapshot machinery, fixture lifecycle, `_tests/` directory + `loop46 test` / `loop46 simulate` subcommands.
 
 ### Phase 13 — Fixture lifecycle + worker dry-run — **not started**
 - Locked in §10.9 + §10.11 (2026-04-28). Detailed plan in `docs/fixture-lifecycle.md`. Two related pieces: (1) fixture-lifecycle tools (`/_system/kv/{id}/*` admin endpoint, `loop46 kv`, `loop46 fixture` CLI families, runner `--auto-fix-from`); (2) worker dry-run dispatch mode (`POST /_system/dry-run/{id}` endpoint, `dry_run` flag on `dispatchOnce`, `loop46 dry-run` + `loop46 fixture from-dry-run` CLIs). The dry-run path is ~50 lines added to existing dispatch; fixture lifecycle reuses the same kv admin endpoint that backs dashboard KV browser.
@@ -1057,8 +1060,11 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 ### Phase 14 — AI agent surface — **not started**
 - Locked in §10.10 (2026-04-28). Detailed plan in `docs/agent-surface.md`. Pieces: skill file at `docs/skills/loop46.md`, `--json` output audit across CLI, `loop46 doctor` env-check subcommand, scoped tokens at `scoped_token/{hash}` with capability + instance subsets, `/_system/scoped_tokens` admin routes, dashboard "Tokens" tab. **No MCP server in v1** — hosted MCP deferred until remote-agent demand surfaces.
 
-### Future — Browser-side replay (Chrome extension) — not yet phased
-- Locked architecturally in §10.12 (2026-04-28). Implementation deferred until Phase 5 admin UI matures and a "click in dashboard → DevTools-style replay" UX becomes the natural next step. Will be a separate repo (Chrome extension toolchain), consuming the bundle JSON + tape blob format from existing server endpoints. No work item in the current phase list.
+### Tape-replay wedge (browser page for Story 1 in beta + DAP CLI for Story 2 at 1.0) — **launch path** as of 2026-04-30
+- Locked architecturally in §10.12 (2026-04-28; two-path split 2026-04-30). Beta-first sequencing per §10.17 / §10.18 (decided 2026-04-30): browser page (Story 1) ships in beta; DAP CLI (Story 2) ships at 1.0. Two paths share bundle JSON shape, tape blob format, and stubs library — beta lands all three plus the browser-side consumer; 1.0 adds the CLI orchestration on top.
+- **Beta scope**: bundle endpoint + `replay.loop46.me` page + sandboxed iframe + stubs library + `debugger;` injection + "Replay" button + "copy request ID" affordance. ~1-2 weeks.
+- **1.0 adds**: `loop46 replay <id>` CLI spawning Node under `--inspect-brk` for DAP-aware editor attach (VS Code / JetBrains / nvim-dap / dap-mode). ~1-2 weeks.
+- No Chrome extension, no in-dashboard debugger UI. CodeMirror 6 lands in beta but only for syntax highlighting in the Code tab, not for an integrated debugger view (see §10.12 closing note + §10.17 beta launch list item 3).
 
 ### Blob replication (multi-node prerequisite)
 - Raft envelopes now include `type=3` files_writeset replicating `{id}/files.db` across nodes — **done**
@@ -1142,7 +1148,8 @@ The 750-line `dispatchOnce` loop body was split into named helpers:
 Two implementations of the simulator share a contract (bundle JSON shape + tape blob format) but otherwise live independently:
 
 - **CLI simulator** (Zig + QuickJS, this repo at `src/simulator/`) — linked into `loop46 test` and `loop46 simulate`. Hermetic, deterministic, used in CI and inner-loop dev. Reads handler source from the working tree (or fetched via existing files-server endpoints when targeting a deployment id).
-- **Browser simulator** (JS + V8 via Chrome DevTools Protocol, separate repo, future per §10.12) — interactive replay debugging in the browser. Loads tape + source from server endpoints, stubs Loop46 globals (`kv`, `webhook`, `email`, etc.) via injected JS, lets the developer use real DevTools (breakpoints, stepping, variable inspection).
+- **Browser-replay page** (JS + V8 in the browser, launch-path per §10.12 / §10.17) — interactive replay for Story 1 (new programmer) in a sandboxed iframe served from `replay.loop46.me`. Loads tape + source from server endpoints, stubs Loop46 globals (`kv`, `webhook`, `email`, etc.) from the tape, injects `debugger;` at handler entry, lets the user use their browser's own DevTools (breakpoints, stepping, variable inspection). No Chrome extension; not Chrome-only.
+- **DAP-attach CLI** (`loop46 replay <id>`, Node + V8, launch-path per §10.12 / §10.17) — interactive replay for Story 2 (engineering team) in their editor of choice. Spawns Node under `--inspect-brk` with stubs preloaded; DAP-aware editors (VS Code, JetBrains, nvim-dap, dap-mode) attach via V8 Inspector Protocol. No web replay UI is involved on this path — the dashboard Logs view is request-ID discovery only, the actual debugging happens in the engineer's editor.
 
 **Why purely client-side**: every v1 caller has either local source (CLI) or sufficient browser plumbing (the extension fetches source as needed). The server-side use cases that motivated a worker endpoint — single-request simulation for hosted MCP, cross-machine remote agents — are all deferred to v2. The worker is a recording device + dispatcher; observation flows worker → client; the client does all the compute.
 
@@ -1170,7 +1177,7 @@ A previously-considered second primitive ("trial-run" against live state, with s
 - "Re-process this failed request after my fix" is **not** a simulation operation. Real re-processing is a normal HTTP request against a new deployment.
 
 **Side effects**:
-- Bundle JSON format from `rove-log-cli bundle` (`examples/log_cli.zig:210`) becomes the canonical shape consumed by both CLI sim and the future Chrome extension. Code moves into a shared module (`src/tape/bundle.zig`).
+- Bundle JSON format from `rove-log-cli bundle` (`examples/log_cli.zig:210`) becomes the canonical shape consumed by both CLI sim and the launch-path browser replay page (§10.12). Code moves into a shared module (`src/tape/bundle.zig`).
 - Tape capture (`uploadTapes` in `src/js/worker.zig`) is unchanged; missing pieces are `ReplaySource` in the CLI simulator (`src/js/globals.zig:862-863` flagged the gap), request body capture, and module tape wiring.
 - New module `src/simulator/` (CLI library only, no thread pool, no standalone-binary stub): `root.zig` + `replay_source.zig` + `bytecode_cache.zig` + small `compile.zig`.
 - New CLI subcommands `loop46 simulate` and `loop46 test` (the latter spec'd in §10.8) link the simulator library.
@@ -1313,38 +1320,65 @@ POST /_system/dry-run/{instance_id}
 - Worker dispatch path gets one new flag; the rest of the production hot path is unchanged.
 - Implementation plan: detail in `docs/fixture-lifecycle.md`.
 
-### 10.12 Browser-side replay via Chrome extension (PROMOTED to launch path 2026-04-30)
+### 10.12 Replay — two paths, one per audience: browser page (Story 1) + DAP CLI (Story 2) (PROMOTED to launch path 2026-04-30; two-path split 2026-04-30)
 
-**Change**: the dashboard replay viewer described in §2.9 ("DevTools click-through to the dashboard replay viewer") is implemented as a **Chrome extension** that uses the Chrome DevTools Protocol (CDP) to run handler source in the browser's V8 with stubbed Loop46 globals. **Promoted into the launch path** — see §10.17 for the sequencing decision. The original "deferred until Phase 5 admin UI is mature" stance flipped because tape replay is the load-bearing differentiator: every other Loop46 capability has a competitor that does it better, but **nobody else can let a developer click a failed request and step through the actual reproducer in their browser**. Without it shipped at launch the differentiation pitch is hand-wavy ("we capture deterministic tapes for every request"); with it shipped the pitch is concrete ("click any 500, debug it like it just happened").
+**Change**: tape replay ships as **two paths sharing bundle JSON, tape blob format, and the stubs library** — one optimized for each launch audience (§10.17).
+- **Story 1 (new programmer)**: dashboard "Replay" button → new tab on `replay.loop46.me` (sandboxed iframe + global stubs + `debugger;` injection at handler entry). User opens F12 to step through using their browser's own DevTools.
+- **Story 2 (engineering team)**: `loop46 replay <request_id>` CLI in the engineer's terminal. Spawns Node.js under `--inspect-brk` with stubs preloaded; their DAP-aware editor (VS Code / JetBrains / Neovim with nvim-dap / Emacs with dap-mode) attaches via V8 Inspector Protocol. They debug in the editor they already live in. **Story 2 is expected to never use the browser path** — the dashboard Logs view's job for them is request-ID discovery (one-click copy on each row → paste into terminal).
 
-**Why CDP + V8 instead of quickjs-wasm**:
-- **Real DevTools, free**: with CDP access, the extension gets breakpoints, stepping, variable inspection, source maps — all the standard debugging affordances Chrome already provides. Implementing this on top of quickjs-wasm would mean reinventing a debugger UI.
-- **No WASM toolchain**: shipping quickjs-wasm + a custom debugger would mean a ~MB+ wasm binary plus DevTools-equivalent UI. The extension is much smaller.
-- **Familiar developer experience**: anyone who has used Chrome DevTools recognizes the workflow; no new mental model.
-- **Shared contract**: the extension consumes the same bundle JSON + tape blob format that the CLI simulator produces. Inputs come from existing server endpoints (`/_system/log/{id}/list` + `/blob/{hash}` + `/_system/files/{id}/source/{hash}`). No server-side simulator help needed.
+**Promoted into the launch path** — see §10.17 for sequencing. The original "deferred until Phase 5 admin UI is mature" stance flipped because tape replay is the load-bearing differentiator: every other Loop46 capability has a competitor that does it better, but **nobody else can let you click a failed request and step through the actual reproducer in your usual debugger**. Story 1 hears "click any 500, hit replay, step through it in F12"; Story 2 hears "`loop46 replay <id>` in your terminal, attach VS Code, step through it in your editor."
+
+**Story 1 path — `replay.loop46.me` page (page-only, "use real DevTools, free")**:
+1. Dashboard ships a "Replay" button on each Logs row → opens `https://replay.loop46.me/{request_id}` in a new tab.
+2. The replay page hosts an iframe sandboxed with `sandbox="allow-scripts"`, served from a separate origin so dashboard cookies / localStorage stay out of the handler's reach.
+3. The iframe page:
+   - Fetches bundle + tape from server endpoints (compose, or use a new `/_system/replay/bundle/{request_id}` aggregator).
+   - Sets up Loop46 global stubs (`globalThis.kv`, `webhook`, `email`, `Date.now`, `Math.random`, `crypto.*`) that read from the tape.
+   - Loads handler modules via `<script type="module">` (with `//# sourceURL=...` for synthesized cases) so source shows up as a real file in DevTools' Sources panel — module imports resolve through an import map populated from the bundle.
+   - Injects `debugger;` at handler entry (and optionally at the recorded throw site).
+   - Calls the handler with the replay request.
+4. User opens F12, lands paused, steps through.
+
+Why this for Story 1: no install, no auth setup, no editor configuration. They click a button, they're in DevTools.
+
+**Story 2 path — `loop46 replay <request_id>` CLI (DAP-attach via Node `--inspect-brk`)**:
+1. Engineer copies the request ID from the dashboard Logs view (one-click copy) and runs `loop46 replay <id>` in their terminal.
+2. CLI fetches bundle + tape from the same server endpoints the browser path uses.
+3. CLI writes a small entry script to a temp dir: loads stubs, dynamic-imports handler modules, invokes `handler(replayRequest)`.
+4. CLI spawns `node --inspect-brk=127.0.0.1:9229 <entry>` and prints attach instructions ("In VS Code: pick 'Node.js: Attach' from the Run panel" + a pasteable `launch.json` snippet for first-time setup; equivalent recipes for JetBrains / nvim-dap / dap-mode).
+5. Engineer's DAP-aware editor attaches to the V8 Inspector Protocol port. Real breakpoints, watches, call stack, variable inspection — all in their IDE.
+
+Why this for Story 2: Story 2 engineers live in their editor 8 hours a day. Sending them to a browser tab for debugging would be a worse version of tools they already have. The dashboard Logs view is a request-ID-discovery surface; the actual debugging happens in their terminal + editor.
+
+**Why DAP / V8 Inspector instead of writing a custom debugger**:
+- **V8's Inspector Protocol is a free byproduct of `node --inspect-brk`.** Every DAP-aware editor has built-in adapters that translate. We don't write a debug adapter — we lean on Node's inspector + every editor's existing tooling.
+- **We don't reimplement debugger UI for either audience.** Story 1 gets browser DevTools; Story 2 gets VS Code / JetBrains / nvim-dap. Both are battle-tested.
+- **No WASM toolchain.** Shipping quickjs-wasm + a custom debugger would mean ~MB+ wasm binary plus debugger UI from scratch.
+- **Same engine for both interactive paths**: V8. The browser runs V8 natively; the CLI runs Node which embeds V8. Engine differences with QuickJS apply uniformly to both interactive paths; sim tests (Phase 12, Zig + QuickJS) remain the strict-determinism authority.
 
 **Tradeoffs**:
-- **V8 vs QuickJS engine differences** (BigInt, regex edge cases, etc.) — not bit-identical with the CLI simulator. For interactive debugging this is acceptable; the goal is "let the developer see what happened and try changes," not strict semantic reproduction. Sim tests (in CI/CLI) remain the determinism authority.
-- **Chrome-only** — Firefox would need a different extension model. v1 / early-adopter audience makes this acceptable.
-- **Extension distribution** — Chrome Web Store publishing is its own small ops cost.
+- **V8 vs QuickJS engine differences** (BigInt, regex edges, etc.) — acceptable for interactive debugging on both paths; not bit-identical with production. The Phase 12 simulator (post-launch, Zig + QuickJS) is the determinism authority.
+- **Node.js becomes a Story 2 runtime dependency.** Almost every Story 2 engineer has it; minor friction for Zig/Rust-only shops who can fall back to the browser path.
+- **Engineers using non-DAP editors** (raw vim without nvim-dap, plain Sublime, etc.) — fall back to the browser path. ~5% of Story 2 affected.
+- **Less integrated than a dashboard-owned editor + variables panel** would be — but Story 2 wouldn't want that anyway (their editor is the integrated experience), and Story 1 is a button-click away from F12. The dashboard-owned debugger UX is the *wrong* answer for both audiences once they're framed separately.
 
-**What ships in the extension** (when it gets built):
-- A stubs library that overrides Loop46 globals (`globalThis.kv`, `globalThis.webhook`, `globalThis.email`, `Date.now`, `Math.random`, `crypto.*`) with implementations that read from a recorded tape (loaded from the worker via `/_system/log/{id}/blob/{hash}`).
-- A CDP client that loads the handler source into the active page's debugger, sets up the stubs, lets the developer drive execution from DevTools.
-- UI for picking a request (from a list of recorded ones), loading its tape, and starting a debug session.
-- Optional: edit-and-rerun affordance once breakpoints + stepping are working.
+**What ships at launch**:
+- Bundle JSON shape on the worker (deployment + module dependency graph + source per module). New `/_system/replay/bundle/{request_id}` aggregator or composed from existing endpoints.
+- Tape blob format consumed as-is from existing tape capture.
+- **Stubs library** (Loop46 globals reading from tape) shared between both paths — same JS module, served to the iframe and required from the Node entry script.
+- **Browser path**: replay page on `replay.loop46.me` (sandboxed iframe + module loader + `debugger;` injection). Dashboard "Replay" button on each Logs row.
+- **CLI path**: `loop46 replay <request_id>` subcommand on the existing `loop46` binary. Loads bundle + tape, writes Node entry script, spawns under `--inspect-brk`, prints editor-specific attach instructions.
+- **Logs row affordance**: one-click copy of request ID for terminal paste — equally useful to Story 1 ("can I just send my friend the failing request?") and Story 2.
 
-**MVP scope for launch** (smaller than the original "build all of Phase 12 first" framing):
-- Minimal bundle JSON shape (a deployment + its module dependencies + the source for each), generated by a new `/_system/replay/bundle/{request_id}` worker endpoint or pulled from existing log/files/blob endpoints.
-- Tape blob format consumed as-is from the existing tape capture (already builds for every request).
-- Chrome extension that fetches a `(bundle, tape)` pair, loads source into the active page's V8 via CDP, installs stubs, lets the developer set breakpoints + step.
-
-The full Phase 12 CLI simulator (sim test framework, fixture lifecycle, `loop46 test` / `loop46 simulate` subcommands) does NOT need to land for the extension to be useful — those are agent-driven debugging affordances, separate concern. The MVP extension is purely browser-side debugging on captured production tapes.
+**Synergy with Phase 12** (post-launch sim test framework + Zig+QuickJS strict-determinism simulator):
+The bundle JSON shape, stubs-library design, and request body capture into the tape all land at launch as part of this work. Phase 12's *Zig + QuickJS deterministic CLI simulator* (`loop46 test`, `loop46 simulate`, `_tests/` directory, snapshot machinery, fixture lifecycle) is **still post-launch** — different engine, different purpose (deterministic CI authority, not interactive debug). What Phase 12 absorbs at launch: bundle module extraction (`src/tape/bundle.zig`), stubs-library shape, request body capture wiring. What stays post-launch: the Zig + QuickJS `ReplaySource`, the test framework + assertions, fixture tooling.
 
 **Side effects**:
-- Future separate repo (Chrome extensions have their own toolchain). Probably `loop46-replay-extension`.
-- The bundle JSON + tape format become a public contract (the extension is an external consumer). Locking these formats early matters more now that the launch story depends on the extension working.
-- The full Phase 12 simulator + fixture work moves to post-launch — replayability for end users via the extension lands first, programmatic simulator + sim-tests follow.
+- New origin to provision (`replay.loop46.me`) under the existing `*.loop46.me` wildcard cert.
+- The bundle JSON + tape format become a semi-public contract (consumed by browser page, CLI, eventually Phase 12 simulator).
+- `loop46 replay` is the first launch-path CLI subcommand. Phase 7 (`loop46 deploy`, `kv`, `logs`) is still post-launch, but the `loop46` binary growing subcommands incrementally is fine — `loop46 dev` / `loop46 worker` already exist.
+
+**Chrome extension dropped entirely.** Earlier drafts of §10.12 considered a Chrome extension as a CDP bridge to an in-dashboard debugger UX (CodeMirror 6 viewer + breakpoint gutter + variables panel + step controls). The two-audience framing makes that the wrong answer for both audiences: Story 1 gets a simpler experience from browser DevTools directly; Story 2 gets a strictly better experience by debugging in their actual IDE via DAP. No post-launch enhancement path for the extension is recorded — DAP attach is the durable answer for the integrated UX Story 2 wants.
 
 ### 10.13 files-server + log-server detach: external services, not tenants (decided 2026-04-30)
 
@@ -1381,7 +1415,7 @@ Combined target: <100ms effective round-trip from dashboard click to confirmed r
 - **HTTP auth on files-server + log-server.** Today's auth model is "trust the local proxy"; new shape needs bearer-token (or HMAC) auth on the HTTP API. Operator provisions the secret via `--bootstrap-kv files_server_token=... files_server_url=...` (the bootstrap-kv mechanism §10's recent generalization handles this trivially — Zig knows nothing about either key).
 - **Operator-side CLI / docs** for deploying files-server + log-server alongside loop46. Today they're spawned automatically; new shape requires the operator to start them and pass URLs.
 
-**Sequencing**: **pre-launch (revised 2026-04-30).** Originally framed as post-launch refactor, but the detach is the load-bearing exercise of the webhook + callback + SSE + bearer-auth loop that customers will use to integrate with arbitrary third-party services (§10.14). Shipping launch without this means: (a) we haven't dogfooded the end-to-end async-port story, and (b) the dashboard-to-file-server path still goes through an in-process proxy that contradicts the architectural framing. Better to fold it into the launch-path Phase 5/5.5 work. Auth specifics in §10.14.
+**Sequencing**: **post-1.0 (revised 2026-04-30 with beta-first launch sequencing).** Earlier on 2026-04-30 the detach was framed as pre-launch because it dogfoods §10.14's webhook + callback + SSE + bearer-auth loop. The beta-first reframing later that day reversed that call: the detach is architectural purification that doesn't differentiate value to Story 1 (beta audience) or Story 2 (1.0 audience), so it doesn't belong in either window. With SSE shipping at 1.0, §10.14's prerequisite is satisfied — the detach becomes a clean post-1.0 refactor gated only on engineering bandwidth. Auth specifics in §10.14.
 
 ### 10.14 Distributed Elm ports: webhook + callback + SSE + bearer auth (decided 2026-04-30)
 
@@ -1414,7 +1448,7 @@ This isn't just a metaphor. The architectural claim is: real-world reactive appl
 **Deploy notification**: editor orchestrates v1. After committing a deploy on file-server, the editor receives the new manifest hash in the response; it then POSTs that hash to admin (`POST /v1/internal/deploy-applied`) which updates `tenant_files_map.current_deployment_id` and fires an SSE event for any listening dashboard sessions. File-server-pushes-to-worker is left as a v2 option — useful when CLI deploys land that don't go through the editor.
 
 **Pre-launch implications**:
-- §10.13 sequencing flips from post-launch to pre-launch (already done above).
+- §10.13 sequencing returned to post-1.0 with the beta-first reframing later 2026-04-30 — see §10.13's updated Sequencing note.
 - The customer third-party-auth story becomes documented + audited — operators can promise customers "integrate with any HTTP API using webhook.send + crypto.\*."
 - The ports/commands framing becomes the documentation north star for the customer-facing handler model. PLAN §1 / §2 audience descriptions update accordingly.
 
@@ -1519,13 +1553,13 @@ This kind of guardrail typically takes a year of operator pain to land; building
 |---|---|---|---|---|
 | **Events** | `analytics.track` (§10.15) | "What discrete things happened?" | OLAP (columnar, append-only) | Logs are a specific case |
 | **Metrics** | `metrics.*` (this section) | "How is the system performing?" | TSDB (timestamp + label-set → numeric) | Cardinality guardrails enforced at write |
-| **Tapes** | Tape capture (existing, PLAN §10.7-10.12) | "What exactly happened on *this specific* request?" | Per-request blob, content-addressed | Replay in browser DevTools — the killer feature |
+| **Tapes** | Tape capture (existing, PLAN §10.7-10.12) | "What exactly happened on *this specific* request?" | Per-request blob, content-addressed | Replay in your IDE (DAP attach via `loop46 replay`) or your browser's DevTools — the killer feature |
 
 This maps onto industry-standard "logs + metrics + traces" but with Loop46-specific framing: logs collapse into events (broader); metrics gets cardinality guardrails (Prometheus doesn't); traces become full replay (Honeycomb-style sampled traces become per-request reproducible debug sessions).
 
 **Sequencing**: post-launch, alongside the other §10.13/§10.14/§10.15 detach work. For v1, customers with metrics needs use webhook.send to push to Datadog / their TSDB of choice (works, expensive at high volume, no aggregation). Same compromise as analytics.track: workable for first users, real primitive lands when the receiver service exists and the volume justifies it.
 
-**The pitch this enables for launch positioning**: "Loop46 ships built-in observability — events, metrics, and *full per-request replay*. Other platforms give you logs + a sampled trace viewer; we give you the actual reproducer." That's a sentence that converts. Pre-launch the metrics + analytics.track primitives don't exist yet, but **tape replay does** (the architecture is built; just needs the Chrome extension UI per §10.12). The launch story can already say "click any 500 in your logs, get a replayable browser DevTools session" — and *that* is the wedge that nobody else has.
+**The pitch this enables for launch positioning**: "Loop46 ships built-in observability — events, metrics, and *full per-request replay*. Other platforms give you logs + a sampled trace viewer; we give you the actual reproducer." That's a sentence that converts. Pre-launch the metrics + analytics.track primitives don't exist yet, but **tape replay does** (the architecture is built; needs the browser page + DAP CLI per §10.12). The launch story can already say "click any 500 in your logs, hit replay (browser) or `loop46 replay <id>` (terminal + your editor), step through it in your usual debugger" — and *that* is the wedge that nobody else has.
 
 ### 10.17 Launch sequencing: lead with replay, two-audience framing locked in (decided 2026-04-30)
 
@@ -1536,18 +1570,35 @@ This maps onto industry-standard "logs + metrics + traces" but with Loop46-speci
 
 The framings differ but the product is identical: **Story 1 hears "ship in minutes"; Story 2 hears "step through it in your browser"**; same launch sentence ("Build a working app in minutes. When it breaks, you can see exactly why and step through the reproducer in your browser") serves both.
 
-**Tape replay is the wedge.** Every other capability has a competitor that does it better — Cloudflare Workers is faster, Vercel has slicker DX, Supabase is more familiar (Postgres-shaped), Firebase has the brand. None of them can match **per-request browser-DevTools replay**. The pure-functional handler choice + tape capture for all non-determinism + the Chrome extension is the combo that uniquely enables this. Without the extension shipped at launch, the differentiation pitch is hand-wavy ("we capture deterministic tapes"); with it shipped, the pitch is concrete ("click any 500, debug it"). That sentence is the difference between "interesting weird platform" and "I have to try this."
+**Tape replay is the wedge.** Every other capability has a competitor that does it better — Cloudflare Workers is faster, Vercel has slicker DX, Supabase is more familiar (Postgres-shaped), Firebase has the brand. None of them can match **per-request browser-DevTools replay**. The pure-functional handler choice + tape capture for all non-determinism + the dashboard replay page (§10.12) is the combo that uniquely enables this. Without replay shipped at launch, the differentiation pitch is hand-wavy ("we capture deterministic tapes"); with it shipped, the pitch is concrete ("click any 500, debug it"). That sentence is the difference between "interesting weird platform" and "I have to try this."
 
-**Launch path, ranked by impact** (each row is a separable work-window):
+**Sequencing — beta-first launch (decided 2026-04-30).** Open beta with Story 1 scope ~3-5 weeks from this decision; 1.0 adds Story 2 scope another ~9-13 weeks later. Beta is **web-only, free-tier-only, no CLI**. See §10.18 for beta operational specifics (data-continuity promise, free-tier caps, banner, feedback channel, no-CLI positioning).
 
-1. **Phase 5 dashboard polish** — signup form on the login page (today there's no UI to drive `/v1/signup`, you have to curl), a logs view discoverable for Story 1 users (newest-first, click-row-for-detail), instance list with health indicators. ~2 weeks. Without this the product isn't usable by Story 1.
-2. **SSE primitive (Phase 11 / §2.12) — basic single-worker version.** Long-lived HTTP/2 stream the worker holds open; in-memory per-channel pub/sub; `events.emit(channel, payload)` from handlers + callbacks; customer-side `events.subscribe(channel)` returns a stream the dispatcher pumps; browser uses native `EventSource`. Multi-worker fan-out + persistent event buffering deferred to post-launch when usage patterns surface the need. ~3 weeks. **Why this is launch-blocking despite earlier framing as post-launch**: the pure-functional Cmd/Sub model wants Sub-as-push, not Sub-as-pull. Without SSE, the only answer for synchronous-feel third-party flows (Stripe Checkout, OAuth code exchange, AI agent results, slow API calls) is polling — and **first patterns are sticky.** If v1 docs teach polling, polling becomes the cultural default even after SSE lands; and polling has real per-request costs (rate-limit budget, log volume, kv reads, latency floor) plus contradicts the "reactive observability" pitch. Better to ship the right primitive at launch than walk back the wrong one later.
-3. **Loop46-the-project Stripe integration for supporter payments** — *the real production integration that doubles as the customer-facing docs example.* Loop46's admin handler exposes a "support Loop46" page that creates a Stripe Checkout session via `webhook.send`, returns a tiny shell page that subscribes via SSE, the callback `events.emit`s the session URL to the connected client, browser navigates. Receives `checkout.session.completed` webhook with timing-safe HMAC signature verification, writes a `supporter/{email}` row in admin's app.db, fires another SSE event so the originating tab updates to "Thanks!" without a refresh. This gives Loop46 the project a real source of funding from day one AND solves Story 2's "real work, not toys" credibility doubt simultaneously. **Docs example is extracted from this**: the patterns we actually use become the patterns we teach. No fake-looking demo code; if it works for us, it'll work for them. ~1.5-2 weeks (real Stripe integration is heavier than a contrived example), plus the small primitives audit (`crypto.timingSafeEqual` confirmed; `base64Encode/Decode` and `hmacSha1` if needed).
-4. **Tape-replay Chrome extension MVP** (§10.12) — **the wedge.** Bundle JSON shape + the existing tape format + a Chrome extension that loads `(bundle, tape)` into the active page's V8 via CDP, stubs the Loop46 globals, lets the developer set breakpoints and step through the actual reproducer. ~4-5 weeks. The largest pre-launch chunk by far and it's worth it.
-5. **Phase 14 LLM skill file** (`docs/skills/loop46.md`) — the AI-coding angle. Without it, LLMs writing Loop46 code default to imperative `await fetch()` patterns that don't compile. With it, Loop46 becomes the AI-friendly platform (small surface, deterministic replay → great LLM debugging story). ~1 week.
-6. **Story 1 leaderboard example tenant** in the demo seed manifest — the literal Firebase-pain demo, on Loop46. 5 lines of handler, one HTML page. ~half a day. Pairs with the launch blog post.
+**Beta launch path** (Story 1 audience):
 
-**Total launch path**: ~12-13 weeks if serialized; ~6-8 weeks with two people parallelizing (Phase 5 polish + SSE primitive can run in parallel; Chrome extension is independent of both). ~3 months from this decision.
+1. **Phase 5 dashboard polish** — instance health indicators, logs view discoverability for Story 1, "Replay" button on Logs rows, "copy request ID" affordance. ~2 weeks.
+2. **Tape-replay browser page** (§10.12 Story 1 path) — bundle JSON shape on the worker (compose from existing endpoints, or new `/_system/replay/bundle/{request_id}` aggregator), sandboxed iframe replay page on `replay.loop46.me`, stubs library (Loop46 globals reading from tape), `<script type="module">` source loading, `debugger;` injection at handler entry. ~1-2 weeks.
+3. **CodeMirror 6 syntax-highlighting upgrade for the Code tab** — replaces the existing `<textarea>` with a CM6 `EditorView`. Language modes by file extension: `.mjs` / `.js` → `@codemirror/lang-javascript`, `.html` → `@codemirror/lang-html`, `.css` → `@codemirror/lang-css`; default plain text. Line numbers + basic editing extensions. **Out of scope for beta**: autocomplete, lint, fold gutter, breakpoint gutter, draft workflow integration. Vendored bundle (no third-party CDN at runtime). ~½ week.
+4. **Phase 14 LLM skill file** (`docs/skills/loop46.md`) — AI-assisted Loop46 coding. Without it, LLMs default to imperative `await fetch()` patterns that don't compile. ~1 week.
+5. **Story 1 leaderboard example tenant** — the literal Firebase-pain demo, 5 lines of handler + one HTML page. ~½ day. Pairs with the beta launch post.
+6. **Beta operational** — free-tier caps wired to existing rate limiter defaults, beta banner in dashboard, data-continuity promise visible at signup, feedback channel link, per-account storage cap enforcement. ~3-5 days. Detail in §10.18.
+
+**Beta total**: ~5 weeks serialized; ~3 weeks with two-person parallelization (Phase 5 polish + replay page parallelize cleanly; CodeMirror upgrade lands alongside Phase 5 polish without coupling).
+
+**1.0 launch path** (Story 2 audience adds, builds on top of operating beta):
+
+1. **SSE primitive (Phase 11 / §2.12) — basic single-worker version.** Long-lived HTTP/2 stream the worker holds open; in-memory per-channel pub/sub; `events.emit(channel, payload)` from handlers + callbacks; customer-side `events.subscribe(channel)` returns a stream the dispatcher pumps; browser uses native `EventSource`. Multi-worker fan-out + persistent buffering deferred. ~3 weeks. **The "first patterns sticky" risk dissolves under beta sequencing**: beta docs deliberately omit live use cases (Stripe Checkout, OAuth, AI-agent results, slow API calls) entirely, so SSE arrives at 1.0 as the *first* answer for those flows, not as a replacement for established polling.
+2. **Tape-replay DAP CLI** (§10.12 Story 2 path) — `loop46 replay <request_id>` CLI fetching bundle + tape, writing a Node entry script with stubs preloaded, spawning under `--inspect-brk`, printing attach instructions for VS Code / JetBrains / nvim-dap / dap-mode. Reuses the stubs library shipped in beta. ~1-2 weeks.
+3. **Loop46-the-project Stripe integration for supporter payments** — *the real production integration that doubles as the customer-facing docs example.* Loop46's admin handler exposes a "support Loop46" page that creates a Stripe Checkout session via `webhook.send`, returns a tiny shell page that subscribes via SSE, the callback `events.emit`s the session URL to the connected client, browser navigates. Receives `checkout.session.completed` webhook with timing-safe HMAC signature verification, writes a `supporter/{email}` row in admin's app.db, fires another SSE event so the originating tab updates to "Thanks!" without a refresh. **Docs example is extracted from this**: the patterns we actually use become the patterns we teach. ~1.5-2 weeks, plus the small primitives audit (`crypto.timingSafeEqual` confirmed; `base64Encode/Decode` and `hmacSha1` if needed).
+4. **Phase 7 `loop46 deploy` CLI** subset — content-addressed two-phase upload, `loop46.json` parsing, deploy-token issuance UI in dashboard. ~1-2 weeks for v1 scope; later CLI subcommands (`kv`, `logs`, `init`) deferred.
+5. **Plan tiers + paid pricing** — first paid tier, plan-tier branching in rate limiter caps, billing wiring via Stripe (uses item 3's primitives). ~1-2 weeks.
+6. **Custom domains** (Phase 10) — customer CNAME + per-domain Let's Encrypt. ~2 weeks.
+
+**1.0 additional**: ~9-13 weeks serialized; ~5-7 weeks parallelized.
+
+**Total time to 1.0**: ~14-18 weeks serialized; ~8-10 weeks parallelized. **~3-4 months from this decision**, with beta operating in production for ~2-3 of those months gathering real-user signal.
+
+Phase 9 encryption at rest joins the 1.0 path only if B2B compliance demand surfaces during beta — otherwise it stays post-1.0.
 
 **Why dogfooding Stripe (item 2) matters beyond the credibility argument**:
 - **Authenticity**: every "Loop46 + Stripe" code snippet in the docs is code we actually run in production. No theoretical-best-practice patterns that fall apart on first contact with real Stripe API quirks (idempotency keys, webhook ordering, test-vs-live mode handling, the dual-redirect dance for Connect onboarding).
@@ -1555,20 +1606,75 @@ The framings differ but the product is identical: **Story 1 hears "ship in minut
 - **Forces us to think like a customer**: building Stripe integration *as a customer of our own platform* is the cleanest possible test of "does this primitive set actually work for a real production integration." If we hit friction, we fix the platform — and customers benefit. The friction we don't fix becomes the friction we document. Either way customers win.
 - **Failure-mode audit**: real money is real stakes. The webhook signature timing-safe-equal becomes load-bearing when it's *our* customers' card charges flowing through it. We'll discover the actual gaps in the toolkit far faster than a contrived example would surface them.
 
-**What's explicitly NOT in the launch path** (recorded so future-us doesn't second-guess):
-- §10.13 / §10.14 file-server + log-server detach + bearer-auth dogfooding. Multi-week refactor that makes the architecture purer but doesn't make the product more useful to a first user. **Post-launch** when the dashboard-to-file-server path's in-process proxy starts hurting (it doesn't yet). With SSE shipping at launch (item 2 above), §10.14's prerequisite is satisfied — the detach is gated only on engineering bandwidth, not blocking primitives.
-- §10.15 / §10.16 `analytics.track` + `metrics.*` primitives. Their absence is workable (customers `webhook.send` to their OLAP / TSDB of choice). **Post-launch** alongside the loop46-olap / loop46-tsdb pseudo-third-party companion services that motivate them.
-- **SSE multi-worker fan-out + persistent buffering**. The launch SSE is per-worker in-memory; cross-worker delivery (events.emit on worker A, subscriber on worker B) and replay-after-reconnect (Last-Event-ID buffering) wait until usage exposes whether they actually matter. Single-worker setups (the most common Loop46 deployment shape at launch) are unaffected.
-- Phase 5.5 storage scalability (log batch offload, raft snapshot, centralized webhook subsystem). Premature optimization at v1 scale; matters when usage grows.
-- Phase 7 (CLI), Phase 9 (encryption-at-rest), Phase 10 (custom domains + billing).
+**What's NOT in beta but lands at 1.0**:
+- SSE primitive
+- DAP CLI replay (`loop46 replay`)
+- Stripe-on-Loop46 supporter payments
+- `loop46 deploy` CLI
+- Plan tiers + paid pricing
+- Custom domains
+- Phase 9 encryption (only if B2B compliance demand surfaces during beta)
+
+**What's NOT in either beta or 1.0** (recorded so future-us doesn't second-guess):
+- §10.13 / §10.14 file-server + log-server detach + bearer-auth dogfooding. Multi-week refactor that makes the architecture purer but doesn't make the product more useful to a first user. **Post-1.0** when the dashboard-to-file-server path's in-process proxy starts hurting (it doesn't yet). With SSE shipping at 1.0, §10.14's prerequisite is satisfied — the detach is gated only on engineering bandwidth, not blocking primitives.
+- §10.15 / §10.16 `analytics.track` + `metrics.*` primitives. Their absence is workable (customers `webhook.send` to their OLAP / TSDB of choice). **Post-1.0** alongside the loop46-olap / loop46-tsdb pseudo-third-party companion services that motivate them.
+- **SSE multi-worker fan-out + persistent buffering**. The 1.0 SSE is per-worker in-memory; cross-worker delivery and replay-after-reconnect (Last-Event-ID buffering) wait until usage exposes whether they actually matter. Single-worker setups (the most common Loop46 deployment shape at 1.0) are unaffected.
+- Phase 5.5 storage scalability (log batch offload, raft snapshot, centralized webhook subsystem). Matters when sustained production traffic forces it; not at beta or first-1.0 volumes.
+- **Phase 12 / 13 sim test framework + fixture lifecycle + worker dry-run**. Beta absorbs the bundle JSON shape, stubs library, and request body capture (§10.12); the Zig + QuickJS strict-determinism `ReplaySource` + sim test framework + fixtures wait. Post-1.0.
 
 **Marketing surface this locks in** (one-sentence variants for different channels):
+
+*Beta launch* (Story 1 audience):
 - *General audience*: "Build a working app in minutes. When it breaks, see exactly why and step through it in your browser."
 - *Indie-dev pitch*: "Skip the 47 setup steps Firebase makes you do. Sign up with email, get an API + database + dashboard. Build your leaderboard in 5 minutes."
-- *Senior-engineer pitch*: "Pure-functional handlers eliminate the transaction-boundary / race-condition class of bugs structurally. Built-in observability with full per-request replay. Every external integration goes through a durable outbox by default. Stop building this stuff yourself."
 - *AI-coding pitch*: "Tight, narrow handler surface that LLMs can't get wrong + deterministic per-request replay that turns LLM-generated bugs from frustrating into delightful. The AI-friendly platform."
 
+*1.0 launch adds* (Story 2 audience):
+- *Senior-engineer pitch*: "Pure-functional handlers eliminate the transaction-boundary / race-condition class of bugs structurally. Built-in observability with full per-request replay (browser or your IDE via DAP attach). Every external integration goes through a durable outbox by default. Stop building this stuff yourself."
+
 All four variants are TRUE — they're not different products, they're different cuts of the same observation.
+
+### 10.18 Beta launch operational specifics (decided 2026-04-30)
+
+Operational items required to open Loop46 beta to external Story 1 users. All small, all needed before the dashboard URL gets shared publicly.
+
+**Free tier scope**:
+- Existing per-instance rate-limiter defaults (`request` + `email`) become the free-tier caps. Operator-tunable via `WorkerConfig.rate_limit_caps` from §8.
+- Per-account instance cap visible to customers (the Phase 4 hardcode becomes an explicit displayed cap).
+- Per-account total-storage cap (sum across all that account's instances) — enforced at deploy time, small addition over Phase 2's per-instance caps.
+- No paid tier in beta. Stripe-on-Loop46 supporter payments ships at 1.0.
+
+**Data-continuity promise**:
+- Visible at signup and in the beta banner: *"Your data carries forward to 1.0. Beta data will not be wiped."*
+- Binding commitment. Schema changes during beta require migration, not reset. Tape replay (§10.12) provides natural fixture data for migration testing.
+- If a migration becomes prohibitively expensive, the framing has to change to "preview" without that promise — don't break the commitment silently.
+
+**Beta banner**:
+- Persistent banner in `app.loop46.me` shell: *"Loop46 is in beta. [Feedback]."* Click opens the feedback channel.
+- Dismissible per-session (so users see it again next visit).
+- Removed at 1.0 launch.
+
+**Feedback channel**:
+- Single low-friction surface (email address, forum, or Discord — pick whichever captures most signal).
+- Goal: surface real Story 1 needs informing 1.0 priorities (does SSE matter? custom domains? does the basic editor frustrate? do they hit the "I want to integrate Stripe" wall?).
+
+**Sign-up gating**:
+- Open beta. No waitlist, no invite codes — friction-free is the point. Rate limiter + storage caps keep first ~thousand users tractable.
+- Reserve the right to introduce a waitlist if abuse or capacity becomes an issue.
+
+**No-CLI positioning**:
+- Beta docs explicitly say *"All workflows are dashboard-driven. CLI ships at 1.0."* Pre-empts "where's the CLI?" feedback from Story 2 visitors and lets them self-select to wait.
+- The `loop46` binary during beta only ships operator commands (`loop46 dev`, `loop46 worker`) — no customer-facing subcommands.
+- Beta docs omit live use cases (Stripe Checkout, OAuth code exchange, AI agent results, slow API calls) entirely rather than teaching polling for them. SSE arrives at 1.0 as the *first* answer for those flows.
+
+**Beta-open checklist** (items to complete before public URL):
+- Beta banner + feedback link in dashboard shell
+- Per-account storage cap enforcement
+- Free-tier caps documented at `app.loop46.me/docs/limits`
+- Data-continuity promise text in signup flow
+- End-to-end smoke test: signup → magic link via prod Resend → deploy starter via Code tab → trigger a 500 → click Replay → step through in browser DevTools
+
+Total: ~3-5 days, included in §10.17 beta launch path item 6.
 
 ## 11. Rove-library principles audit (2026-04-21)
 
