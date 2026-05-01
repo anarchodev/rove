@@ -301,6 +301,18 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-log", log_mod);
     js_mod.addImport("rove-tape", tape_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
+    // JS-side runtime polyfills evaluated into every dispatcher's QJS
+    // context after the native CFunction bindings install. email.js
+    // wraps `webhook.send`; textcodec.js polyfills TextEncoder/Decoder.
+    const js_runtime_files: []const struct { name: []const u8, path: []const u8 } = &.{
+        .{ .name = "email_js", .path = "src/js/bindings/email.js" },
+        .{ .name = "textcodec_js", .path = "src/js/bindings/textcodec.js" },
+    };
+    for (js_runtime_files) |f| {
+        js_mod.addAnonymousImport(f.name, .{
+            .root_source_file = b.path(f.path),
+        });
+    }
     js_mod.link_libc = true;
     js_mod.linkSystemLibrary("nghttp2", .{});
     js_mod.linkSystemLibrary("ssl", .{});

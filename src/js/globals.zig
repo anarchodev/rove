@@ -800,242 +800,161 @@ pub fn installStatic(ctx: *c.JSContext) void {
     const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);
 
-    // kv = { get, set, delete, prefix }
-    const kv_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, kv_obj, "get", c.JS_NewCFunction2(ctx, jsKvGet, "get", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, kv_obj, "set", c.JS_NewCFunction2(ctx, jsKvSet, "set", 2, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, kv_obj, "delete", c.JS_NewCFunction2(ctx, jsKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, kv_obj, "prefix", c.JS_NewCFunction2(ctx, jsKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, global, "kv", kv_obj);
+    // Build the fresh-namespace tree (kv, console, crypto, webhook,
+    // platform/...). For nested paths the parent must already exist
+    // as a JSObject, so STATIC_NAMESPACES is ordered parent-before-
+    // child — the empty `platform` entry creates the holder before
+    // platform.root and platform.instances populate it.
+    for (STATIC_NAMESPACES) |ns| installNamespace(ctx, global, ns);
 
-    // console = { log }
-    const console_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, console_obj, "log", c.JS_NewCFunction2(ctx, jsConsoleLog, "log", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, global, "console", console_obj);
+    // Extend existing intrinsics. Skipped if the intrinsic isn't
+    // installed in this runtime (Dispatcher.snapshotInitFn keeps
+    // the intrinsic-add minimal). Tape capture is gated on a non-
+    // null DispatchState tape, so the API is stable whether we're
+    // capturing or not.
+    for (INTRINSIC_EXTENSIONS) |ns| extendIntrinsic(ctx, global, ns);
 
-    // Non-determinism overrides. Always installed (tape optional) so
-    // the handler-visible API is stable whether we're capturing or not;
-    // the C callbacks short-circuit their tape branches when the
-    // matching `DispatchState` tape is null.
-    const date_obj = c.JS_GetPropertyStr(ctx, global, "Date");
-    defer c.JS_FreeValue(ctx, date_obj);
-    if (!c.JS_IsUndefined(date_obj)) {
-        _ = c.JS_SetPropertyStr(ctx, date_obj, "now", c.JS_NewCFunction2(ctx, jsDateNow, "now", 0, c.JS_CFUNC_generic, 0));
+    // Globals attached directly to globalThis with no namespace.
+    for (GLOBAL_BUILTINS) |fb| attachFn(ctx, global, fb);
+
+    // JS-side wrappers/polyfills evaluated last so they can call
+    // into the native bindings installed above. email.js wraps
+    // webhook.send for Resend; textcodec.js polyfills
+    // TextEncoder/TextDecoder (UTF-8 only).
+    evalSnippet(ctx, "email.js", EMAIL_JS);
+    evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
+}
+
+const NativeFn = *const fn (
+    ctx: ?*c.JSContext,
+    this: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue;
+
+const FnBinding = struct {
+    name: [:0]const u8,
+    cfunc: NativeFn,
+    argc: c_int,
+};
+
+const NamespaceBindings = struct {
+    /// Path under globalThis. Non-empty. Multi-element paths require
+    /// their parent path to appear earlier in STATIC_NAMESPACES.
+    path: []const [:0]const u8,
+    fns: []const FnBinding,
+};
+
+const STATIC_NAMESPACES = [_]NamespaceBindings{
+    .{ .path = &.{"kv"}, .fns = &.{
+        .{ .name = "get",    .cfunc = jsKvGet,    .argc = 1 },
+        .{ .name = "set",    .cfunc = jsKvSet,    .argc = 2 },
+        .{ .name = "delete", .cfunc = jsKvDelete, .argc = 1 },
+        .{ .name = "prefix", .cfunc = jsKvPrefix, .argc = 3 },
+    } },
+    .{ .path = &.{"console"}, .fns = &.{
+        .{ .name = "log", .cfunc = jsConsoleLog, .argc = 1 },
+    } },
+    // crypto. No crypto global in qjs-ng by default, so we fabricate
+    // one. hmacSha256 is the vendor-neutral primitive for building
+    // Stripe / Slack / AWS style signatures (PLAN §2.6); randomBytes +
+    // sha256 are what admin's JS handler composes into magic-link /
+    // session token mint and hash-at-rest.
+    .{ .path = &.{"crypto"}, .fns = &.{
+        .{ .name = "getRandomValues", .cfunc = crypto_b.jsCryptoGetRandomValues, .argc = 1 },
+        .{ .name = "randomUUID",      .cfunc = crypto_b.jsCryptoRandomUuid,      .argc = 0 },
+        .{ .name = "randomBytes",     .cfunc = crypto_b.jsCryptoRandomBytes,     .argc = 1 },
+        .{ .name = "sha256",          .cfunc = crypto_b.jsCryptoSha256,          .argc = 1 },
+        .{ .name = "hmacSha256",      .cfunc = crypto_b.jsCryptoHmacSha256,      .argc = 2 },
+    } },
+    // webhook.send. Delivery is async — send() persists the envelope
+    // in the handler's transaction and returns an id; the drainer
+    // thread on the raft leader does the actual HTTP call.
+    .{ .path = &.{"webhook"}, .fns = &.{
+        .{ .name = "send", .cfunc = webhook_b.jsWebhookSend, .argc = 1 },
+    } },
+    // platform = { root, instances }. Installed on every context;
+    // the C callbacks check `state.platform` and throw for non-admin
+    // handlers.
+    .{ .path = &.{"platform"}, .fns = &.{} },
+    .{ .path = &.{ "platform", "root" }, .fns = &.{
+        .{ .name = "get",    .cfunc = jsPlatformRootGet,    .argc = 1 },
+        .{ .name = "set",    .cfunc = jsPlatformRootSet,    .argc = 2 },
+        .{ .name = "delete", .cfunc = jsPlatformRootDelete, .argc = 1 },
+        .{ .name = "prefix", .cfunc = jsPlatformRootPrefix, .argc = 3 },
+    } },
+    .{ .path = &.{ "platform", "instances" }, .fns = &.{
+        .{ .name = "create",        .cfunc = jsPlatformInstancesCreate,        .argc = 1 },
+        .{ .name = "deployStarter", .cfunc = jsPlatformInstancesDeployStarter, .argc = 1 },
+    } },
+};
+
+const INTRINSIC_EXTENSIONS = [_]NamespaceBindings{
+    .{ .path = &.{"Date"}, .fns = &.{
+        .{ .name = "now", .cfunc = jsDateNow, .argc = 0 },
+    } },
+    .{ .path = &.{"Math"}, .fns = &.{
+        .{ .name = "random", .cfunc = jsMathRandom, .argc = 0 },
+    } },
+};
+
+const GLOBAL_BUILTINS = [_]FnBinding{
+    // Take from the email rate-limit bucket. Called from the
+    // email.send JS wrapper before queuing the outbox row. Throws
+    // Error{code:"rate_limited"} on exhaustion; no-op (returns
+    // undefined) when state.limiter is null (test paths).
+    .{ .name = "__rove_check_email_rate", .cfunc = webhook_b.jsCheckEmailRate, .argc = 0 },
+};
+
+const EMAIL_JS = @embedFile("email_js");
+const TEXTCODEC_JS = @embedFile("textcodec_js");
+
+fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
+    const leaf = c.JS_NewObject(ctx);
+    for (ns.fns) |fb| attachFn(ctx, leaf, fb);
+
+    // Walk to the parent of the leaf. parent starts as a fresh dup
+    // so the same free-and-replace pattern works on iteration zero
+    // and onwards.
+    var parent = c.JS_DupValue(ctx, global);
+    defer c.JS_FreeValue(ctx, parent);
+
+    for (ns.path[0 .. ns.path.len - 1]) |seg| {
+        const next = c.JS_GetPropertyStr(ctx, parent, seg.ptr);
+        c.JS_FreeValue(ctx, parent);
+        parent = next;
     }
 
-    const math_obj = c.JS_GetPropertyStr(ctx, global, "Math");
-    defer c.JS_FreeValue(ctx, math_obj);
-    if (!c.JS_IsUndefined(math_obj)) {
-        _ = c.JS_SetPropertyStr(ctx, math_obj, "random", c.JS_NewCFunction2(ctx, jsMathRandom, "random", 0, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, parent, ns.path[ns.path.len - 1].ptr, leaf);
+}
+
+fn extendIntrinsic(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
+    var target = c.JS_DupValue(ctx, global);
+    defer c.JS_FreeValue(ctx, target);
+
+    for (ns.path) |seg| {
+        const next = c.JS_GetPropertyStr(ctx, target, seg.ptr);
+        c.JS_FreeValue(ctx, target);
+        target = next;
     }
 
-    // crypto = { getRandomValues, randomUUID, randomBytes, sha256,
-    // hmacSha256 }. No crypto global in qjs-ng by default, so we
-    // fabricate one. hmacSha256 is the vendor-neutral primitive for
-    // building Stripe / Slack / AWS style signatures (PLAN §2.6);
-    // randomBytes + sha256 are what admin's JS handler composes into
-    // magic-link / session token mint and hash-at-rest.
-    const crypto_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "getRandomValues", c.JS_NewCFunction2(ctx, crypto_b.jsCryptoGetRandomValues, "getRandomValues", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomUUID", c.JS_NewCFunction2(ctx, crypto_b.jsCryptoRandomUuid, "randomUUID", 0, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomBytes", c.JS_NewCFunction2(ctx, crypto_b.jsCryptoRandomBytes, "randomBytes", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "sha256", c.JS_NewCFunction2(ctx, crypto_b.jsCryptoSha256, "sha256", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "hmacSha256", c.JS_NewCFunction2(ctx, crypto_b.jsCryptoHmacSha256, "hmacSha256", 2, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, global, "crypto", crypto_obj);
+    if (c.JS_IsUndefined(target)) return;
 
-    // webhook = { send }. Delivery is async — send() persists the
-    // envelope in the handler's transaction and returns an id; the
-    // drainer thread on the raft leader does the actual HTTP call.
-    const webhook_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, webhook_obj, "send", c.JS_NewCFunction2(ctx, webhook_b.jsWebhookSend, "send", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, global, "webhook", webhook_obj);
+    for (ns.fns) |fb| attachFn(ctx, target, fb);
+}
 
-    // Hidden builtin: take from the email rate-limit bucket. Called
-    // from the email.send JS wrapper below before queuing the outbox
-    // row. Throws Error{code:"rate_limited", message:"..."} when the
-    // bucket is exhausted; customer can try/catch in their handler.
-    // No-op (returns undefined) when state.limiter is null (test paths).
-    _ = c.JS_SetPropertyStr(ctx, global, "__rove_check_email_rate",
-        c.JS_NewCFunction2(ctx, webhook_b.jsCheckEmailRate, "__rove_check_email_rate", 0, c.JS_CFUNC_generic, 0));
-
-    // email.send — thin wrapper around webhook.send that builds a
-    // Resend-shaped POST and takes the API key as a parameter rather
-    // than resolving it from platform config. Keeps key storage a
-    // customer concern (kv entry, inlined, fetched from elsewhere)
-    // and keeps the platform out of the abuse loop: a customer can
-    // only email.send using a Resend key they have.
-    //
-    // Our own magic-link / signup emails are queued by the Zig-
-    // native signup handler, which reads the platform Resend key
-    // off root.db and writes the outbox row into __admin__'s app.db.
-    const email_snippet =
-        \\globalThis.email = {
-        \\  send(opts) {
-        \\    __rove_check_email_rate();
-        \\    if (!opts || typeof opts !== "object")
-        \\      throw new TypeError("email.send requires an options object");
-        \\    if (typeof opts.key !== "string" || opts.key.length === 0)
-        \\      throw new TypeError("email.send: `key` must be a non-empty string");
-        \\    if (typeof opts.from !== "string")
-        \\      throw new TypeError("email.send: `from` must be a string");
-        \\    if (typeof opts.subject !== "string")
-        \\      throw new TypeError("email.send: `subject` must be a string");
-        \\    if (!opts.to)
-        \\      throw new TypeError("email.send: `to` is required");
-        \\    const body = {
-        \\      from: opts.from,
-        \\      to: Array.isArray(opts.to) ? opts.to : [opts.to],
-        \\      subject: opts.subject,
-        \\    };
-        \\    if (opts.text) body.text = opts.text;
-        \\    if (opts.html) body.html = opts.html;
-        \\    if (opts.reply_to) body.reply_to = opts.reply_to;
-        \\    if (opts.cc) body.cc = Array.isArray(opts.cc) ? opts.cc : [opts.cc];
-        \\    if (opts.bcc) body.bcc = Array.isArray(opts.bcc) ? opts.bcc : [opts.bcc];
-        \\    const env = {
-        \\      url: "https://api.resend.com/emails",
-        \\      method: "POST",
-        \\      headers: {
-        \\        "Authorization": "Bearer " + opts.key,
-        \\        "Content-Type": "application/json",
-        \\      },
-        \\      body: JSON.stringify(body),
-        \\    };
-        \\    if (opts.onResult) env.onResult = opts.onResult;
-        \\    if (opts.context !== undefined) env.context = opts.context;
-        \\    if (opts.maxAttempts) env.maxAttempts = opts.maxAttempts;
-        \\    if (opts.timeout) env.timeout = opts.timeout;
-        \\    return webhook.send(env);
-        \\  },
-        \\};
-    ;
-    const email_result = c.JS_Eval(
+fn attachFn(ctx: *c.JSContext, target: c.JSValue, fb: FnBinding) void {
+    _ = c.JS_SetPropertyStr(
         ctx,
-        email_snippet.ptr,
-        email_snippet.len,
-        "email.js",
-        c.JS_EVAL_TYPE_GLOBAL,
+        target,
+        fb.name.ptr,
+        c.JS_NewCFunction2(ctx, fb.cfunc, fb.name.ptr, fb.argc, c.JS_CFUNC_generic, 0),
     );
-    c.JS_FreeValue(ctx, email_result);
+}
 
-    // TextEncoder / TextDecoder — UTF-8 only. QuickJS-ng doesn't
-    // expose a native intrinsic for these, so we install a minimal
-    // JS polyfill. Sufficient for the common use cases: hashing a
-    // UTF-8 string, building a Uint8Array body for webhook.send,
-    // decoding a webhook response back to a string. NOT feature-
-    // complete — doesn't handle streaming or the replacement
-    // character on malformed input; handlers that need fidelity
-    // against adversarial input should check their bytes.
-    const textcodec_snippet =
-        \\(function () {
-        \\  class TextEncoder {
-        \\    get encoding() { return "utf-8"; }
-        \\    encode(input) {
-        \\      const s = String(input ?? "");
-        \\      const out = [];
-        \\      for (let i = 0; i < s.length; i++) {
-        \\        let cp = s.charCodeAt(i);
-        \\        if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < s.length) {
-        \\          const low = s.charCodeAt(i + 1);
-        \\          if (low >= 0xdc00 && low <= 0xdfff) {
-        \\            cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
-        \\            i++;
-        \\          }
-        \\        }
-        \\        if (cp < 0x80) {
-        \\          out.push(cp);
-        \\        } else if (cp < 0x800) {
-        \\          out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
-        \\        } else if (cp < 0x10000) {
-        \\          out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
-        \\        } else {
-        \\          out.push(
-        \\            0xf0 | (cp >> 18),
-        \\            0x80 | ((cp >> 12) & 0x3f),
-        \\            0x80 | ((cp >> 6) & 0x3f),
-        \\            0x80 | (cp & 0x3f),
-        \\          );
-        \\        }
-        \\      }
-        \\      return new Uint8Array(out);
-        \\    }
-        \\  }
-        \\  class TextDecoder {
-        \\    constructor(label, options) {
-        \\      const enc = String(label ?? "utf-8").toLowerCase();
-        \\      if (enc !== "utf-8" && enc !== "utf8") {
-        \\        throw new RangeError("TextDecoder: only utf-8 is supported");
-        \\      }
-        \\      this._fatal = !!(options && options.fatal);
-        \\    }
-        \\    get encoding() { return "utf-8"; }
-        \\    decode(buffer) {
-        \\      if (buffer === undefined || buffer === null) return "";
-        \\      let bytes;
-        \\      if (buffer instanceof Uint8Array) {
-        \\        bytes = buffer;
-        \\      } else if (ArrayBuffer.isView(buffer)) {
-        \\        bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-        \\      } else if (buffer instanceof ArrayBuffer) {
-        \\        bytes = new Uint8Array(buffer);
-        \\      } else {
-        \\        throw new TypeError("TextDecoder.decode: expected BufferSource");
-        \\      }
-        \\      let s = "";
-        \\      let i = 0;
-        \\      while (i < bytes.length) {
-        \\        const b = bytes[i++];
-        \\        if (b < 0x80) {
-        \\          s += String.fromCharCode(b);
-        \\        } else if ((b & 0xe0) === 0xc0 && i < bytes.length) {
-        \\          const b2 = bytes[i++];
-        \\          s += String.fromCharCode(((b & 0x1f) << 6) | (b2 & 0x3f));
-        \\        } else if ((b & 0xf0) === 0xe0 && i + 1 < bytes.length) {
-        \\          const b2 = bytes[i++], b3 = bytes[i++];
-        \\          s += String.fromCharCode(((b & 0x0f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f));
-        \\        } else if ((b & 0xf8) === 0xf0 && i + 2 < bytes.length) {
-        \\          const b2 = bytes[i++], b3 = bytes[i++], b4 = bytes[i++];
-        \\          let cp = ((b & 0x07) << 18) | ((b2 & 0x3f) << 12) | ((b3 & 0x3f) << 6) | (b4 & 0x3f);
-        \\          cp -= 0x10000;
-        \\          s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
-        \\        } else if (this._fatal) {
-        \\          throw new TypeError("TextDecoder: malformed utf-8");
-        \\        } else {
-        \\          s += "�";
-        \\        }
-        \\      }
-        \\      return s;
-        \\    }
-        \\  }
-        \\  globalThis.TextEncoder = TextEncoder;
-        \\  globalThis.TextDecoder = TextDecoder;
-        \\})();
-    ;
-    const textcodec_result = c.JS_Eval(
-        ctx,
-        textcodec_snippet.ptr,
-        textcodec_snippet.len,
-        "textcodec.js",
-        c.JS_EVAL_TYPE_GLOBAL,
-    );
-    c.JS_FreeValue(ctx, textcodec_result);
-
-    // platform = { root: { get, set, delete, prefix }, instances:
-    // { create } }. Installed on every context; the C callbacks
-    // check `state.platform` and throw for non-admin handlers.
-    // See `jsPlatformRoot*` and `jsPlatformInstancesCreate`.
-    const platform_obj = c.JS_NewObject(ctx);
-    const root_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, root_obj, "get", c.JS_NewCFunction2(ctx, jsPlatformRootGet, "get", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, root_obj, "set", c.JS_NewCFunction2(ctx, jsPlatformRootSet, "set", 2, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, root_obj, "delete", c.JS_NewCFunction2(ctx, jsPlatformRootDelete, "delete", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, root_obj, "prefix", c.JS_NewCFunction2(ctx, jsPlatformRootPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, platform_obj, "root", root_obj);
-    const instances_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, instances_obj, "create", c.JS_NewCFunction2(ctx, jsPlatformInstancesCreate, "create", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, instances_obj, "deployStarter", c.JS_NewCFunction2(ctx, jsPlatformInstancesDeployStarter, "deployStarter", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, platform_obj, "instances", instances_obj);
-    _ = c.JS_SetPropertyStr(ctx, global, "platform", platform_obj);
+fn evalSnippet(ctx: *c.JSContext, name: [*:0]const u8, source: []const u8) void {
+    const result = c.JS_Eval(ctx, source.ptr, source.len, name, c.JS_EVAL_TYPE_GLOBAL);
+    c.JS_FreeValue(ctx, result);
 }
 
 /// Install the per-request pieces of the global surface: attach
