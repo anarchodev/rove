@@ -264,6 +264,14 @@ pub const TenantFiles = struct {
     /// whose deadline hasn't passed yet so we don't hammer the code
     /// store on every tick.
     next_refresh_ns: i64,
+
+    pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFiles {
+        return openTenantFiles(worker, inst);
+    }
+
+    pub fn free(allocator: std.mem.Allocator, tc: *TenantFiles) void {
+        freeTenantFiles(allocator, tc);
+    }
 };
 
 /// Worker never uploads code, so the `CompileFn` it passes into
@@ -293,7 +301,79 @@ pub const TenantLog = struct {
     log_kv: *kv_mod.KvStore,
     blob_backend: blob_mod.FilesystemBlobStore,
     store: log_mod.LogStore,
+
+    pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantLog {
+        return openTenantLog(worker, inst, worker.log_worker_id);
+    }
+
+    pub fn free(allocator: std.mem.Allocator, tl: *TenantLog) void {
+        freeTenantLog(allocator, tl);
+    }
 };
+
+/// Cache wrapper around `StringHashMapUnmanaged(*Entry)` that drives
+/// the lifecycle through `Entry.open(worker, inst)` and `Entry.free(
+/// allocator, *Entry)`. `TenantFiles` and `TenantLog` had eight
+/// near-identical helpers (open / free / destroyAll / getOrOpen × 2);
+/// only open and free are domain-specific, so this generic absorbs
+/// destroyAll and getOrOpen.
+fn TenantMap(comptime Entry: type) type {
+    return struct {
+        const Self = @This();
+
+        map: std.StringHashMapUnmanaged(*Entry) = .empty,
+
+        pub const empty: Self = .{};
+
+        /// Free every entry and the map's internal storage.
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.clearAllEntries(allocator);
+            self.map.deinit(allocator);
+        }
+
+        /// Free every entry but keep the map's internal capacity. Used
+        /// by `Worker.create`'s errdefer path so a failure mid-eager-
+        /// open clears the entries it created without preempting the
+        /// final `deinit` that fires from `Worker.destroy`.
+        pub fn clearAllEntries(self: *Self, allocator: std.mem.Allocator) void {
+            var it = self.map.iterator();
+            while (it.next()) |entry| Entry.free(allocator, entry.value_ptr.*);
+            self.map.clearRetainingCapacity();
+        }
+
+        /// Eagerly insert an already-opened entry. Worker.create uses
+        /// this to prefill the map; the entry's owned `instance_id`
+        /// becomes the map key (its lifetime matches the entry's).
+        pub fn put(self: *Self, allocator: std.mem.Allocator, entry: *Entry) !void {
+            try self.map.put(allocator, entry.instance_id, entry);
+        }
+
+        /// Lookup-or-lazy-open: if the map already has an entry for
+        /// `inst`, return it. Otherwise open via `Entry.open`, cache,
+        /// and return. On a failed `put`, frees the just-opened entry.
+        pub fn getOrOpen(
+            self: *Self,
+            worker: anytype,
+            inst: *const tenant_mod.Instance,
+        ) !*Entry {
+            if (self.map.get(inst.id)) |e| return e;
+            const opened = try Entry.open(worker, inst);
+            self.map.put(worker.allocator, opened.instance_id, opened) catch |err| {
+                Entry.free(worker.allocator, opened);
+                return err;
+            };
+            return opened;
+        }
+
+        pub fn get(self: *const Self, id: []const u8) ?*Entry {
+            return self.map.get(id);
+        }
+
+        pub fn iterator(self: *Self) std.StringHashMapUnmanaged(*Entry).Iterator {
+            return self.map.iterator();
+        }
+    };
+}
 
 pub const Options = struct {
     /// Application-specific components to attach to every request entity.
@@ -441,12 +521,12 @@ pub fn Worker(comptime opts: Options) type {
         /// Per-tenant code state. Keyed by instance id (the string the
         /// `TenantFiles` owns internally — the map slot's key points at
         /// that allocation, so lifetimes line up).
-        tenant_files_map: std.StringHashMapUnmanaged(*TenantFiles),
+        tenant_files_map: TenantMap(TenantFiles),
         /// Per-tenant log state. Same lifetime + key-stability story
         /// as `tenant_files_map`. Opened eagerly alongside it. The worker's
         /// dispatch path appends LogRecords into each tenant's
         /// `store.buffer`; `flushLogs` drains and proposes batches.
-        tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
+        tenant_logs: TenantMap(TenantLog),
         /// Circuit breaker for handlers that blow past their CPU
         /// budget. A tenant with `kill_threshold` interrupts inside a
         /// single `window_ns` gets bounced with 503 for
@@ -542,8 +622,8 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
             errdefer self.log_proxy.deinit();
-            errdefer destroyAllTenantFiles(self);
-            errdefer destroyAllTenantLogs(self);
+            errdefer self.tenant_files_map.clearAllEntries(allocator);
+            errdefer self.tenant_logs.clearAllEntries(allocator);
 
             reg.registerCollection(&self.raft_pending);
             reg.registerCollection(&self.code_proxy.pending);
@@ -558,10 +638,8 @@ pub fn Worker(comptime opts: Options) type {
             var it = config.tenant.instances.iterator();
             while (it.next()) |entry| {
                 const inst = entry.value_ptr.*;
-                const tc = try openTenantFiles(self, inst);
-                try self.tenant_files_map.put(self.allocator, tc.instance_id, tc);
-                const tl = try openTenantLog(self, inst, self.log_worker_id);
-                try self.tenant_logs.put(self.allocator, tl.instance_id, tl);
+                try self.tenant_files_map.put(allocator, try TenantFiles.open(self, inst));
+                try self.tenant_logs.put(allocator, try TenantLog.open(self, inst));
             }
 
             return self;
@@ -571,9 +649,7 @@ pub fn Worker(comptime opts: Options) type {
             const allocator = self.allocator;
             self.limiter.deinit();
             self.penalty_box.deinit();
-            destroyAllTenantLogs(self);
             self.tenant_logs.deinit(allocator);
-            destroyAllTenantFiles(self);
             self.tenant_files_map.deinit(allocator);
             self.log_proxy.deinit();
             self.code_proxy.deinit();
@@ -742,12 +818,6 @@ fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
     allocator.destroy(tc);
 }
 
-fn destroyAllTenantFiles(worker: anytype) void {
-    var it = worker.tenant_files_map.iterator();
-    while (it.next()) |entry| freeTenantFiles(worker.allocator, entry.value_ptr.*);
-    worker.tenant_files_map.clearRetainingCapacity();
-}
-
 /// Lookup-or-lazy-open: if the worker already has a TenantFiles for
 /// `inst`, return it. Otherwise open a fresh one, cache it, and return.
 /// Callers fall through to 500 on failure — propagates errors up.
@@ -755,13 +825,7 @@ pub fn getOrOpenTenantFiles(
     worker: anytype,
     inst: *const tenant_mod.Instance,
 ) !*TenantFiles {
-    if (worker.tenant_files_map.get(inst.id)) |tc| return tc;
-    const opened = try openTenantFiles(worker, inst);
-    worker.tenant_files_map.put(worker.allocator, opened.instance_id, opened) catch |err| {
-        freeTenantFiles(worker.allocator, opened);
-        return err;
-    };
-    return opened;
+    return worker.tenant_files_map.getOrOpen(worker, inst);
 }
 
 // ── Per-tenant log loading ────────────────────────────────────────────
@@ -824,12 +888,6 @@ fn freeTenantLog(allocator: std.mem.Allocator, tl: *TenantLog) void {
     allocator.destroy(tl);
 }
 
-fn destroyAllTenantLogs(worker: anytype) void {
-    var it = worker.tenant_logs.iterator();
-    while (it.next()) |entry| freeTenantLog(worker.allocator, entry.value_ptr.*);
-    worker.tenant_logs.clearRetainingCapacity();
-}
-
 /// Mirror of `getOrOpenTenantFiles` for the log store. Lazy-opens a
 /// TenantLog for instances created at runtime so pre-minted
 /// request_ids and webhook outbox rows get matching log records.
@@ -837,13 +895,7 @@ pub fn getOrOpenTenantLog(
     worker: anytype,
     inst: *const tenant_mod.Instance,
 ) !*TenantLog {
-    if (worker.tenant_logs.get(inst.id)) |tl| return tl;
-    const opened = try openTenantLog(worker, inst, worker.log_worker_id);
-    worker.tenant_logs.put(worker.allocator, opened.instance_id, opened) catch |err| {
-        freeTenantLog(worker.allocator, opened);
-        return err;
-    };
-    return opened;
+    return worker.tenant_logs.getOrOpen(worker, inst);
 }
 
 /// Append a log record for a request that has finished its dispatch
