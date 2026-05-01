@@ -21,6 +21,8 @@ const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
 const limiter_mod = @import("limiter.zig");
+const crypto_b = @import("bindings/crypto.zig");
+const webhook_b = @import("bindings/webhook.zig");
 
 const c = qjs.c;
 
@@ -188,7 +190,7 @@ fn isPlatformKey(key: []const u8) bool {
 
 // ── C helpers ──────────────────────────────────────────────────────────
 
-fn getState(ctx: ?*c.JSContext) *DispatchState {
+pub fn getState(ctx: ?*c.JSContext) *DispatchState {
     const opaque_ptr = c.JS_GetContextOpaque(ctx);
     return @ptrCast(@alignCast(opaque_ptr.?));
 }
@@ -907,420 +909,7 @@ fn jsMathRandom(
     return c.JS_NewFloat64(ctx, v);
 }
 
-fn jsCryptoGetRandomValues(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_exception;
-    const state = getState(ctx);
 
-    // The Web Crypto API expects a typed array. We reach into the
-    // ArrayBuffer directly via JS_GetArrayBuffer. Non-typed-array
-    // inputs get rejected with an exception.
-    var byte_len: usize = 0;
-    const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, argv[0]);
-    if (buf_ptr == null) return js_exception;
-
-    const bytes = buf_ptr[0..byte_len];
-    state.prng.random().bytes(bytes);
-    if (state.crypto_random_tape) |t| t.appendCryptoRandom(bytes) catch {};
-    // Spec says return the input typed array.
-    return c.JS_DupValue(ctx, argv[0]);
-}
-
-/// `crypto.hmacSha256(key, data)` → hex string (64 chars).
-///
-/// Both arguments accept either a JS string (UTF-8 bytes) or a
-/// Uint8Array. Deterministic — does NOT tape-capture (HMAC of known
-/// inputs is a pure function, so replay reproduces the same digest).
-///
-/// PLAN §2.6: we keep `webhook.send` vendor-neutral and expose this
-/// as the primitive customers compose into Stripe-Signature,
-/// Slack X-Slack-Signature, AWS SigV4 derivations, etc.
-fn jsCryptoHmacSha256(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 2) {
-        _ = c.JS_ThrowTypeError(ctx, "crypto.hmacSha256 requires (key, data)");
-        return js_exception;
-    }
-
-    var key_cstr: [*c]const u8 = null;
-    defer if (key_cstr != null) c.JS_FreeCString(ctx, key_cstr);
-    var data_cstr: [*c]const u8 = null;
-    defer if (data_cstr != null) c.JS_FreeCString(ctx, data_cstr);
-
-    const key_bytes = extractKeyOrDataBytes(ctx, argv[0], &key_cstr) orelse {
-        _ = c.JS_ThrowTypeError(ctx, "crypto.hmacSha256: key must be a string or Uint8Array");
-        return js_exception;
-    };
-    const data_bytes = extractKeyOrDataBytes(ctx, argv[1], &data_cstr) orelse {
-        _ = c.JS_ThrowTypeError(ctx, "crypto.hmacSha256: data must be a string or Uint8Array");
-        return js_exception;
-    };
-
-    var digest: [32]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&digest, data_bytes, key_bytes);
-
-    var out: [64]u8 = undefined;
-    const hex_chars = "0123456789abcdef";
-    for (digest, 0..) |b, i| {
-        out[i * 2] = hex_chars[b >> 4];
-        out[i * 2 + 1] = hex_chars[b & 0x0f];
-    }
-    return c.JS_NewStringLen(ctx, &out, 64);
-}
-
-/// Read a JS value as a byte slice. Tries string first (common path
-/// for HMAC over request bodies), falls back to Uint8Array (for
-/// binary secrets / pre-hashed data). Returns null if neither.
-///
-/// When the string path is taken, `cstr_out` gets the JS_ToCStringLen
-/// pointer that the caller must free via `JS_FreeCString`.
-fn extractKeyOrDataBytes(
-    ctx: ?*c.JSContext,
-    val: c.JSValue,
-    cstr_out: *[*c]const u8,
-) ?[]const u8 {
-    if (c.JS_IsString(val)) {
-        var len: usize = 0;
-        const cstr = c.JS_ToCStringLen(ctx, &len, val);
-        if (cstr == null) return null;
-        cstr_out.* = cstr;
-        return @as([*]const u8, @ptrCast(cstr))[0..len];
-    }
-    var byte_len: usize = 0;
-    const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, val);
-    if (buf_ptr == null) {
-        // JS_GetUint8Array may have set a pending exception — clear
-        // it so we can throw our own message above.
-        const pending = c.JS_GetException(ctx);
-        c.JS_FreeValue(ctx, pending);
-        return null;
-    }
-    return buf_ptr[0..byte_len];
-}
-
-fn jsCryptoRandomUuid(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    _: c_int,
-    _: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    const state = getState(ctx);
-
-    var raw: [16]u8 = undefined;
-    state.prng.random().bytes(&raw);
-    // RFC 4122 v4: set the version and variant bits.
-    raw[6] = (raw[6] & 0x0f) | 0x40;
-    raw[8] = (raw[8] & 0x3f) | 0x80;
-
-    // Capture the raw bytes on the crypto tape so the replay source
-    // can reconstruct the same UUID without knowing the formatting.
-    if (state.crypto_random_tape) |t| t.appendCryptoRandom(&raw) catch {};
-
-    var out: [36]u8 = undefined;
-    const hex = "0123456789abcdef";
-    var oi: usize = 0;
-    for (raw, 0..) |b, i| {
-        if (i == 4 or i == 6 or i == 8 or i == 10) {
-            out[oi] = '-';
-            oi += 1;
-        }
-        out[oi] = hex[b >> 4];
-        out[oi + 1] = hex[b & 0x0f];
-        oi += 2;
-    }
-    return c.JS_NewStringLen(ctx, &out, 36);
-}
-
-/// `crypto.randomBytes(n) → Uint8Array` — n cryptographically random
-/// bytes drawn from the per-request PRNG. Tape-backed: bytes are
-/// recorded on `crypto_random_tape` so replay produces the same
-/// sequence.
-///
-/// `n` must be a non-negative integer ≤ 65536 (Web Crypto's typical
-/// per-call cap). Throws RangeError otherwise.
-fn jsCryptoRandomBytes(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) {
-        _ = c.JS_ThrowTypeError(ctx, "crypto.randomBytes requires (n)");
-        return js_exception;
-    }
-    const state = getState(ctx);
-
-    var n_i32: i32 = 0;
-    if (c.JS_ToInt32(ctx, &n_i32, argv[0]) != 0) return js_exception;
-    if (n_i32 < 0 or n_i32 > 65536) {
-        _ = c.JS_ThrowRangeError(ctx, "crypto.randomBytes: n must be in [0, 65536]");
-        return js_exception;
-    }
-
-    const n: usize = @intCast(n_i32);
-    const bytes = state.allocator.alloc(u8, n) catch {
-        _ = c.JS_ThrowOutOfMemory(ctx);
-        return js_exception;
-    };
-    defer state.allocator.free(bytes);
-
-    state.prng.random().bytes(bytes);
-    if (state.crypto_random_tape) |t| t.appendCryptoRandom(bytes) catch {};
-
-    return c.JS_NewUint8ArrayCopy(ctx, bytes.ptr, bytes.len);
-}
-
-/// `crypto.sha256(data) → hex string` (64 chars).
-///
-/// `data` accepts a JS string (UTF-8 bytes) or a Uint8Array. Pure
-/// deterministic — no tape capture (replay reproduces the same digest
-/// from the same input).
-fn jsCryptoSha256(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) {
-        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256 requires (data)");
-        return js_exception;
-    }
-
-    var data_cstr: [*c]const u8 = null;
-    defer if (data_cstr != null) c.JS_FreeCString(ctx, data_cstr);
-
-    const data_bytes = extractKeyOrDataBytes(ctx, argv[0], &data_cstr) orelse {
-        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256: data must be a string or Uint8Array");
-        return js_exception;
-    };
-
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data_bytes, &digest, .{});
-
-    var out: [64]u8 = undefined;
-    const hex_chars = "0123456789abcdef";
-    for (digest, 0..) |b, i| {
-        out[i * 2] = hex_chars[b >> 4];
-        out[i * 2 + 1] = hex_chars[b & 0x0f];
-    }
-    return c.JS_NewStringLen(ctx, &out, 64);
-}
-
-// ── webhook.send ──────────────────────────────────────────────────────
-//
-// Writes a serialized delivery envelope to `_outbox/{id}` inside the
-// current handler transaction. The drainer (separate thread on the
-// raft leader) picks these up, makes the HTTP call, and enqueues a
-// callback. Id derivation: `sha256(request_id || call_index)` — both
-// pre-minted so the same handler run against the same inputs produces
-// the same ids, which is what replay determinism wants.
-//
-// We build the envelope as a JS object with a normalized shape
-// (defaults filled in, derived fields stamped), then `JS_JSONStringify`
-// it. Cheaper than hand-rolling the escaping for strings / headers /
-// context.
-
-fn computeOutboxId(request_id: u64, call_index: u32, out: *[64]u8) void {
-    var buf: [12]u8 = undefined;
-    std.mem.writeInt(u64, buf[0..8], request_id, .big);
-    std.mem.writeInt(u32, buf[8..12], call_index, .big);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&buf, &digest, .{});
-    const hex_chars = "0123456789abcdef";
-    for (digest, 0..) |b, i| {
-        out[i * 2] = hex_chars[b >> 4];
-        out[i * 2 + 1] = hex_chars[b & 0x0f];
-    }
-}
-
-/// Transfer `src` to `dst[name]`. Ownership moves — don't free `src`
-/// after this.
-fn setOwned(ctx: ?*c.JSContext, dst: c.JSValue, name: [:0]const u8, src: c.JSValue) void {
-    _ = c.JS_SetPropertyStr(ctx, dst, name.ptr, src);
-}
-
-/// Copy `opts[name]` to `dst[name]` when present. If `default_val` is
-/// non-null, fall back to it (refcount consumed).
-fn copyField(
-    ctx: ?*c.JSContext,
-    opts: c.JSValue,
-    dst: c.JSValue,
-    name: [:0]const u8,
-    default_val: ?c.JSValue,
-) void {
-    const v = c.JS_GetPropertyStr(ctx, opts, name.ptr);
-    if (c.JS_IsUndefined(v)) {
-        c.JS_FreeValue(ctx, v);
-        if (default_val) |d| setOwned(ctx, dst, name, d);
-        return;
-    }
-    if (default_val) |d| c.JS_FreeValue(ctx, d);
-    setOwned(ctx, dst, name, v);
-}
-
-/// Copy `opts[src_name]` to `dst[dst_name]` when present. Used to map
-/// the camelCase public API (`onResult`, `maxAttempts`, ...) onto the
-/// snake_case envelope shape that tools on the delivery side read.
-fn copyFieldRenamed(
-    ctx: ?*c.JSContext,
-    opts: c.JSValue,
-    dst: c.JSValue,
-    src_name: [:0]const u8,
-    dst_name: [:0]const u8,
-    default_val: ?c.JSValue,
-) void {
-    const v = c.JS_GetPropertyStr(ctx, opts, src_name.ptr);
-    if (c.JS_IsUndefined(v)) {
-        c.JS_FreeValue(ctx, v);
-        if (default_val) |d| setOwned(ctx, dst, dst_name, d);
-        return;
-    }
-    if (default_val) |d| c.JS_FreeValue(ctx, d);
-    setOwned(ctx, dst, dst_name, v);
-}
-
-/// Hidden builtin called from the email.send JS wrapper before
-/// queuing the outbox row. Throws Error{code:"rate_limited"} when
-/// the per-instance email bucket is exhausted; customer can catch
-/// in their handler. No-op when the limiter isn't wired (test
-/// paths) so dispatcher tests don't need to plumb a limiter through.
-fn jsCheckEmailRate(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    _: c_int,
-    _: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    const state = getState(ctx);
-    const lim = state.limiter orelse return js_undefined;
-    if (state.instance_id.len == 0) return js_undefined;
-
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const allowed = lim.check(state.instance_id, .email, now_ns) catch |err| {
-        // Lazy bucket creation OOM. Fail open + log — same posture
-        // as the worker.zig request-side check.
-        std.log.warn("rove-js: limiter.check email for {s} failed: {s} — fail open", .{ state.instance_id, @errorName(err) });
-        return js_undefined;
-    };
-    if (allowed) return js_undefined;
-
-    const retry_after = lim.retryAfterSeconds(state.instance_id, .email);
-    const msg = std.fmt.allocPrintSentinel(
-        state.allocator,
-        "email rate limit exceeded, retry after {d}s",
-        .{retry_after},
-        0,
-    ) catch return c.JS_ThrowOutOfMemory(ctx);
-    defer state.allocator.free(msg);
-
-    const err = c.JS_NewError(ctx);
-    if (c.JS_IsException(err)) return err;
-    _ = c.JS_SetPropertyStr(ctx, err, "message",
-        c.JS_NewStringLen(ctx, msg.ptr, msg.len));
-    _ = c.JS_SetPropertyStr(ctx, err, "code",
-        c.JS_NewStringLen(ctx, "rate_limited", "rate_limited".len));
-    return c.JS_Throw(ctx, err);
-}
-
-fn jsWebhookSend(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    const state = getState(ctx);
-    if (argc < 1 or !c.JS_IsObject(argv[0])) {
-        _ = c.JS_ThrowTypeError(ctx, "webhook.send requires an options object");
-        return js_exception;
-    }
-    const opts = argv[0];
-
-    // url is required and must be a string.
-    const url_v = c.JS_GetPropertyStr(ctx, opts, "url");
-    if (!c.JS_IsString(url_v)) {
-        c.JS_FreeValue(ctx, url_v);
-        _ = c.JS_ThrowTypeError(ctx, "webhook.send: `url` must be a string");
-        return js_exception;
-    }
-
-    var id_hex: [64]u8 = undefined;
-    computeOutboxId(state.request_id, state.webhook_call_index, &id_hex);
-
-    // Build the canonical envelope. Users supply the interesting
-    // fields; we derive id / attempts / next_attempt_at / created_at /
-    // parent_request_id. Setting on env transfers ownership — don't
-    // free the `url_v` below.
-    const env = c.JS_NewObject(ctx);
-    setOwned(ctx, env, "v", c.JS_NewInt32(ctx, 1));
-    setOwned(ctx, env, "id", c.JS_NewStringLen(ctx, &id_hex, 64));
-    setOwned(ctx, env, "url", url_v);
-
-    // Public input shape uses camelCase (matches PLAN §2.6); envelope
-    // on disk uses snake_case so Zig-side tools + JSON tooling around
-    // the drainer don't have to transliterate.
-    copyField(ctx, opts, env, "method", c.JS_NewString(ctx, "POST"));
-    copyField(ctx, opts, env, "headers", c.JS_NewObject(ctx));
-    copyField(ctx, opts, env, "body", c.JS_NewString(ctx, ""));
-    copyField(ctx, opts, env, "context", js_null);
-    copyFieldRenamed(ctx, opts, env, "onResult", "on_result", js_null);
-    copyFieldRenamed(ctx, opts, env, "maxAttempts", "max_attempts", c.JS_NewInt32(ctx, 10));
-    copyFieldRenamed(ctx, opts, env, "timeout", "timeout_ms", c.JS_NewInt32(ctx, 30_000));
-    // retryOn: default the standard retryable status list + "network".
-    const default_retry = c.JS_NewArray(ctx);
-    const default_codes = [_]i32{ 408, 425, 429, 500, 502, 503, 504 };
-    for (default_codes, 0..) |code, i| {
-        _ = c.JS_SetPropertyUint32(ctx, default_retry, @intCast(i), c.JS_NewInt32(ctx, code));
-    }
-    _ = c.JS_SetPropertyUint32(ctx, default_retry, default_codes.len, c.JS_NewString(ctx, "network"));
-    copyFieldRenamed(ctx, opts, env, "retryOn", "retry_on", default_retry);
-
-    // Derived state. These advance as the drainer works through it.
-    setOwned(ctx, env, "attempts", c.JS_NewInt32(ctx, 0));
-    setOwned(ctx, env, "next_attempt_at_ms", c.JS_NewInt64(ctx, 0));
-    const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-    setOwned(ctx, env, "created_at_ms", c.JS_NewInt64(ctx, now_ms));
-    setOwned(ctx, env, "parent_request_id", c.JS_NewInt64(ctx, @bitCast(state.request_id)));
-
-    // Serialize envelope → bytes.
-    const json = c.JS_JSONStringify(ctx, env, js_undefined, js_undefined);
-    c.JS_FreeValue(ctx, env);
-    if (c.JS_IsException(json) or c.JS_IsUndefined(json)) {
-        c.JS_FreeValue(ctx, json);
-        return js_exception;
-    }
-    defer c.JS_FreeValue(ctx, json);
-
-    var json_len: usize = 0;
-    const json_cstr = c.JS_ToCStringLen(ctx, &json_len, json);
-    if (json_cstr == null) return js_exception;
-    defer c.JS_FreeCString(ctx, json_cstr);
-    const json_slice = @as([*]const u8, @ptrCast(json_cstr))[0..json_len];
-
-    // Write `_outbox/{id}` through the handler's tx + writeset so the
-    // outbox entry commits (or rolls back) atomically with the rest of
-    // the handler's kv writes.
-    var key_buf: [8 + 64]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "_outbox/{s}", .{id_hex}) catch unreachable;
-
-    state.txn.put(key, json_slice) catch |err| {
-        state.pending_kv_error = err;
-        return js_exception;
-    };
-    state.writeset.addPut(key, json_slice) catch |err| {
-        state.pending_kv_error = err;
-        return js_exception;
-    };
-
-    state.webhook_call_index += 1;
-    return c.JS_NewStringLen(ctx, &id_hex, 64);
-}
 
 // ── console.log ───────────────────────────────────────────────────────
 
@@ -1670,18 +1259,18 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // randomBytes + sha256 are what admin's JS handler composes into
     // magic-link / session token mint and hash-at-rest.
     const crypto_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "getRandomValues", c.JS_NewCFunction2(ctx, jsCryptoGetRandomValues, "getRandomValues", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomUUID", c.JS_NewCFunction2(ctx, jsCryptoRandomUuid, "randomUUID", 0, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomBytes", c.JS_NewCFunction2(ctx, jsCryptoRandomBytes, "randomBytes", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "sha256", c.JS_NewCFunction2(ctx, jsCryptoSha256, "sha256", 1, c.JS_CFUNC_generic, 0));
-    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "hmacSha256", c.JS_NewCFunction2(ctx, jsCryptoHmacSha256, "hmacSha256", 2, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "getRandomValues", c.JS_NewCFunction2(ctx, crypto_b.jsCryptoGetRandomValues, "getRandomValues", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomUUID", c.JS_NewCFunction2(ctx, crypto_b.jsCryptoRandomUuid, "randomUUID", 0, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "randomBytes", c.JS_NewCFunction2(ctx, crypto_b.jsCryptoRandomBytes, "randomBytes", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "sha256", c.JS_NewCFunction2(ctx, crypto_b.jsCryptoSha256, "sha256", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, crypto_obj, "hmacSha256", c.JS_NewCFunction2(ctx, crypto_b.jsCryptoHmacSha256, "hmacSha256", 2, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, global, "crypto", crypto_obj);
 
     // webhook = { send }. Delivery is async — send() persists the
     // envelope in the handler's transaction and returns an id; the
     // drainer thread on the raft leader does the actual HTTP call.
     const webhook_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, webhook_obj, "send", c.JS_NewCFunction2(ctx, jsWebhookSend, "send", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, webhook_obj, "send", c.JS_NewCFunction2(ctx, webhook_b.jsWebhookSend, "send", 1, c.JS_CFUNC_generic, 0));
     _ = c.JS_SetPropertyStr(ctx, global, "webhook", webhook_obj);
 
     // Hidden builtin: take from the email rate-limit bucket. Called
@@ -1690,7 +1279,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // bucket is exhausted; customer can try/catch in their handler.
     // No-op (returns undefined) when state.limiter is null (test paths).
     _ = c.JS_SetPropertyStr(ctx, global, "__rove_check_email_rate",
-        c.JS_NewCFunction2(ctx, jsCheckEmailRate, "__rove_check_email_rate", 0, c.JS_CFUNC_generic, 0));
+        c.JS_NewCFunction2(ctx, webhook_b.jsCheckEmailRate, "__rove_check_email_rate", 0, c.JS_CFUNC_generic, 0));
 
     // email.send — thin wrapper around webhook.send that builds a
     // Resend-shaped POST and takes the API key as a parameter rather

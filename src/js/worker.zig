@@ -62,6 +62,8 @@ const tenant_mod = @import("rove-tenant");
 const dispatcher_mod = @import("dispatcher.zig");
 const globals = @import("globals.zig");
 const apply_mod = @import("apply.zig");
+const raft_propose = @import("raft_propose.zig");
+const respb = @import("response_builder.zig");
 const panic_mod = @import("panic.zig");
 const penalty_mod = @import("penalty.zig");
 const limiter_mod = @import("limiter.zig");
@@ -1506,8 +1508,8 @@ fn finalizeBatch(
             .{ anchor_id, batch_seq, @errorName(undo_err) },
         );
         for (successes.items) |*s| {
-            overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |err2| panic_mod.invariantViolated(
-                "finalizeBatch.overwriteWith503(propose_fail)",
+            respb.overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |err2| panic_mod.invariantViolated(
+                "finalizeBatch.respb.overwriteWith503(propose_fail)",
                 "tenant={s} err={s}",
                 .{ anchor_id, @errorName(err2) },
             );
@@ -1580,11 +1582,11 @@ fn tryHandleSystem(
     // preflights don't carry the bearer token.
     if (std.mem.eql(u8, method, "OPTIONS")) {
         if (cors_origin) |o| {
-            const req_origin = findHeader(rh, "origin") orelse "";
+            const req_origin = respb.findHeader(rh, "origin") orelse "";
             if (req_origin.len == 0 or !std.mem.eql(u8, req_origin, o)) {
-                try setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
+                try respb.setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
             } else {
-                const hdrs = try buildSystemRespHeaders(allocator, o, true, null);
+                const hdrs = try respb.buildSystemRespHeaders(allocator, o, true, null);
                 try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
                 try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
                 try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
@@ -1594,7 +1596,7 @@ fn tryHandleSystem(
                 try server.reg.move(ent, &server.request_out, &server.response_in);
             }
         } else {
-            try setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
+            try respb.setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
         }
         return true;
     }
@@ -1604,11 +1606,11 @@ fn tryHandleSystem(
     // juggling a bearer header.
     const auth_ctx = extractAdminAuth(worker.tenant, rh) catch |err| {
         std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
-        try setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
+        try respb.setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
         return true;
     };
     if (auth_ctx == null) {
-        try setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, cors_origin, null);
+        try respb.setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, cors_origin, null);
         return true;
     }
 
@@ -1620,7 +1622,7 @@ fn tryHandleSystem(
 
     const sys_rest = path_no_q["/_system/".len..];
     const sub_slash = std.mem.indexOfScalar(u8, sys_rest, '/') orelse {
-        try setSystemResponse(server, ent, sid, sess, 404, "malformed system path\n", allocator, cors_origin, null);
+        try respb.setSystemResponse(server, ent, sid, sess, 404, "malformed system path\n", allocator, cors_origin, null);
         return true;
     };
     const subsystem = sys_rest[0..sub_slash];
@@ -1635,18 +1637,18 @@ fn tryHandleSystem(
     const inst_slash = std.mem.indexOfScalar(u8, after_sub, '/');
     const sys_instance_id = if (inst_slash) |s| after_sub[0..s] else after_sub;
     if (sys_instance_id.len == 0) {
-        try setSystemResponse(server, ent, sid, sess, 404, "missing instance id\n", allocator, cors_origin, null);
+        try respb.setSystemResponse(server, ent, sid, sess, 404, "missing instance id\n", allocator, cors_origin, null);
         return true;
     }
     const allowed = worker.tenant.canAccessInstance(auth_ctx.?, sys_instance_id) catch false;
     if (!allowed) {
-        try setSystemResponse(server, ent, sid, sess, 403, "forbidden\n", allocator, cors_origin, null);
+        try respb.setSystemResponse(server, ent, sid, sess, 403, "forbidden\n", allocator, cors_origin, null);
         return true;
     }
 
     if (std.mem.eql(u8, subsystem, "files")) {
         if (worker.code_proxy.addr == null) {
-            try setSystemResponse(server, ent, sid, sess, 503, "files subsystem disabled\n", allocator, cors_origin, null);
+            try respb.setSystemResponse(server, ent, sid, sess, 503, "files subsystem disabled\n", allocator, cors_origin, null);
             return true;
         }
         try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
@@ -1655,7 +1657,7 @@ fn tryHandleSystem(
     }
     if (std.mem.eql(u8, subsystem, "log")) {
         if (worker.log_proxy.addr == null) {
-            try setSystemResponse(server, ent, sid, sess, 503, "log subsystem disabled\n", allocator, cors_origin, null);
+            try respb.setSystemResponse(server, ent, sid, sess, 503, "log subsystem disabled\n", allocator, cors_origin, null);
             return true;
         }
         try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
@@ -1663,7 +1665,7 @@ fn tryHandleSystem(
         return true;
     }
 
-    try setSystemResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator, cors_origin, null);
+    try respb.setSystemResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator, cors_origin, null);
     return true;
 }
 
@@ -1719,7 +1721,7 @@ fn resolveRequest(
     if (!is_admin_host) {
         const r = worker.tenant.resolveDomain(host) catch |err| {
             std.log.warn("rove-js: tenant.resolveDomain({s}) failed: {s}", .{ host, @errorName(err) });
-            try setSimpleResponse(server, ent, sid, sess, 500, "tenant resolution failed\n", allocator);
+            try respb.setSimpleResponse(server, ent, sid, sess, 500, "tenant resolution failed\n", allocator);
             return .handled;
         };
         if (r == null) {
@@ -1735,7 +1737,7 @@ fn resolveRequest(
             ) catch null;
             defer if (body_owned) |b| allocator.free(b);
             const body: []const u8 = body_owned orelse "no tenant for host\n";
-            try setSimpleResponse(server, ent, sid, sess, 404, body, allocator);
+            try respb.setSimpleResponse(server, ent, sid, sess, 404, body, allocator);
             return .handled;
         }
         return .{ .dispatch = .{
@@ -1753,11 +1755,11 @@ fn resolveRequest(
     // call. 204 with CORS preflight headers; never touch auth.
     if (std.mem.eql(u8, method, "OPTIONS")) {
         if (worker.admin_origin) |o| {
-            const req_origin = findHeader(rh, "origin") orelse "";
+            const req_origin = respb.findHeader(rh, "origin") orelse "";
             if (req_origin.len == 0 or !std.mem.eql(u8, req_origin, o)) {
-                try setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
+                try respb.setSystemResponse(server, ent, sid, sess, 403, "cors origin not allowed\n", allocator, null, null);
             } else {
-                const hdrs = try buildSystemRespHeaders(allocator, o, true, null);
+                const hdrs = try respb.buildSystemRespHeaders(allocator, o, true, null);
                 try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
                 try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
                 try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
@@ -1767,7 +1769,7 @@ fn resolveRequest(
                 try server.reg.move(ent, &server.request_out, &server.response_in);
             }
         } else {
-            try setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
+            try respb.setSimpleResponse(server, ent, sid, sess, 405, "OPTIONS not supported\n", allocator);
         }
         return .handled;
     }
@@ -1786,7 +1788,7 @@ fn resolveRequest(
         if (admin_inst) |ai| {
             const admin_tc = getOrOpenTenantFiles(worker, ai) catch null;
             if (admin_tc) |tc| {
-                const outcome = try tryServeStatic(server, allocator, ent, sid, sess, tc, path, rh);
+                const outcome = try respb.tryServeStatic(server, allocator, ent, sid, sess, tc, path, rh);
                 if (outcome != .miss) return .handled;
             }
         }
@@ -1803,7 +1805,7 @@ fn resolveRequest(
 
     const admin_opt = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
     if (admin_opt == null) {
-        try setSystemResponse(server, ent, sid, sess, 503, "admin tenant not provisioned\n", allocator, admin_cors, null);
+        try respb.setSystemResponse(server, ent, sid, sess, 503, "admin tenant not provisioned\n", allocator, admin_cors, null);
         return .handled;
     }
     const handler_inst = admin_opt.?;
@@ -1812,7 +1814,7 @@ fn resolveRequest(
     // target tenant in `X-Rove-Scope: <id>`. Empty header → admin
     // operates on its own app.db. (The dashboard JS sets this header
     // explicitly — see `web/admin/api.js`.)
-    const effective_scope = findHeader(rh, "x-rove-scope") orelse "";
+    const effective_scope = respb.findHeader(rh, "x-rove-scope") orelse "";
 
     const scope_inst: *const tenant_mod.Instance = if (effective_scope.len == 0)
         handler_inst
@@ -1822,7 +1824,7 @@ fn resolveRequest(
             break :inner null;
         };
         if (s_opt == null) {
-            try setSystemResponse(server, ent, sid, sess, 404, "unknown instance\n", allocator, admin_cors, null);
+            try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown instance\n", allocator, admin_cors, null);
             return .handled;
         }
         break :blk s_opt.?;
@@ -1874,19 +1876,19 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
     var processed: usize = 0;
 
-    for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
+    for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, req_body| {
         if (!is_leader) {
-            try setSimpleResponse(server, ent, sid, sess, 503, "not leader; retry against the cluster leader\n", allocator);
+            try respb.setSimpleResponse(server, ent, sid, sess, 503, "not leader; retry against the cluster leader\n", allocator);
             processed += 1;
             continue;
         }
 
         const received_ns: i64 = @intCast(std.time.nanoTimestamp());
 
-        const method = findHeader(rh, ":method") orelse "GET";
-        const path = findHeader(rh, ":path") orelse "/";
-        const authority = findHeader(rh, ":authority") orelse "";
-        const body: []const u8 = if (rb.data) |p| p[0..rb.len] else "";
+        const method = respb.findHeader(rh, ":method") orelse "GET";
+        const path = respb.findHeader(rh, ":path") orelse "/";
+        const authority = respb.findHeader(rh, ":authority") orelse "";
+        const body: []const u8 = if (req_body.data) |p| p[0..req_body.len] else "";
 
         // `/_system/*` — CORS gate, then auth + proxy routing.
         if (try tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh)) {
@@ -1910,13 +1912,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // Lazy-open: instances created at runtime aren't in the map yet.
         const tc = getOrOpenTenantFiles(worker, handler_inst) catch |err| {
             std.log.warn("rove-js: lazy openTenantFiles({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
-            try setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
+            try respb.setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
             captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
         if (tc.current_deployment_id == 0) {
-            try setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
+            try respb.setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
             captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{});
             processed += 1;
             continue;
@@ -1936,7 +1938,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             };
             if (!allowed) {
                 const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
-                try setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
+                try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
                 captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 429, .handler_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
@@ -1948,7 +1950,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // running it here again would shadow the admin JS handler with
         // `_static/index.html` on `/?fn=...` API calls.
         if (!is_admin_request and std.mem.eql(u8, method, "GET")) {
-            const static_outcome = try tryServeStatic(
+            const static_outcome = try respb.tryServeStatic(
                 server,
                 allocator,
                 ent,
@@ -1970,7 +1972,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
         var route = router_mod.resolveRoute(allocator, path) catch |err| {
             std.log.warn("rove-js router failed: {s}", .{@errorName(err)});
-            try setErrorResponse(server, ent, sid, sess);
+            try respb.setErrorResponse(server, ent, sid, sess);
             captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
@@ -1980,8 +1982,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const bytecode = (try findBytecode(tc, route.module_base, allocator)) orelse {
             // Convention 404: serve `_static/_404.html` if the tenant
             // has it. Otherwise fall back to the built-in text body.
-            if (!try serveConvention404(server, allocator, ent, sid, sess, tc)) {
-                try setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
+            if (!try respb.serveConvention404(server, allocator, ent, sid, sess, tc)) {
+                try respb.setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
             }
             captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 404, .handler_error, &.{}, &.{}, .{});
             processed += 1;
@@ -1989,7 +1991,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
 
         if (worker.penalty_box.isBoxed(handler_inst.id, tc.current_deployment_id, received_ns)) {
-            try setSimpleResponse(server, ent, sid, sess, 503, "tenant temporarily disabled (cpu budget)\n", allocator);
+            try respb.setSimpleResponse(server, ent, sid, sess, 503, "tenant temporarily disabled (cpu budget)\n", allocator);
             captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 503, .timeout, &.{}, &.{}, .{});
             processed += 1;
             continue;
@@ -2015,7 +2017,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
             var new_txn = scope_inst.kv.beginTrackedImmediate() catch |err| {
                 std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
-                try setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
                 captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
@@ -2039,7 +2041,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     continue;
                 }
                 std.log.warn("rove-js open tracked txn ({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
-                try setSimpleResponse(server, ent, sid, sess, 500, "txn open failed\n", allocator);
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn open failed\n", allocator);
                 captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
@@ -2148,14 +2150,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .handler_error;
             const status: u16 = if (err == dispatcher_mod.DispatchError.Interrupted) 504 else 500;
             if (err == dispatcher_mod.DispatchError.Interrupted) {
-                try setSimpleResponse(server, ent, sid, sess, 504, "handler exceeded cpu budget\n", allocator);
+                try respb.setSimpleResponse(server, ent, sid, sess, 504, "handler exceeded cpu budget\n", allocator);
                 worker.penalty_box.recordKill(
                     handler_inst.id,
                     tc.current_deployment_id,
                     received_ns,
                 ) catch |pe| std.log.warn("rove-js penalty recordKill failed: {s}", .{@errorName(pe)});
             } else {
-                try setErrorResponse(server, ent, sid, sess);
+                try respb.setErrorResponse(server, ent, sid, sess);
             }
             captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, status, outcome, &.{}, &.{}, .{});
             processed += 1;
@@ -2185,7 +2187,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             const ex_body = std.fmt.allocPrint(allocator, "handler threw: {s}\n", .{exception_owned}) catch &.{};
             defer if (ex_body.len > 0) allocator.free(ex_body);
             const ex_body_slice: []const u8 = if (ex_body.len > 0) ex_body else "handler threw\n";
-            try setSimpleResponse(server, ent, sid, sess, 500, ex_body_slice, allocator);
+            try respb.setSimpleResponse(server, ent, sid, sess, 500, ex_body_slice, allocator);
             captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .handler_error, console_owned, exception_owned, .{});
             processed += 1;
             continue;
@@ -2199,7 +2201,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 "tenant={s} err={s}",
                 .{ scope_inst.id, @errorName(re) },
             );
-            try setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
+            try respb.setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
             captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
@@ -2244,7 +2246,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // via `response.cookies`).
         const handler_cors = if (is_admin_request) worker.admin_origin else null;
         const handler_ct: ?[]const u8 = if (resp.body_is_json) "application/json" else null;
-        const handler_resp_hdrs: h2.RespHeaders = try buildHandlerRespHeaders(
+        const handler_resp_hdrs: h2.RespHeaders = try respb.buildHandlerRespHeaders(
             allocator,
             handler_cors,
             resp.set_cookies,
@@ -2428,7 +2430,7 @@ fn flushOne(
 
     for (snapshot) |server_ent| {
         const rh = try worker.reg.get(server_ent, &ps.pending, h2.ReqHeaders);
-        const rb = try worker.reg.get(server_ent, &ps.pending, h2.ReqBody);
+        const req_body = try worker.reg.get(server_ent, &ps.pending, h2.ReqBody);
 
         // Rewrite `:path` by stripping the `/_system/{subsystem}`
         // prefix so the subsystem's routes match. `forwardHeaders`
@@ -2443,11 +2445,11 @@ fn flushOne(
 
         var body_copy: ?[*]u8 = null;
         var body_len: u32 = 0;
-        if (rb.data != null and rb.len > 0) {
-            const buf = try allocator.alloc(u8, rb.len);
-            @memcpy(buf, rb.data.?[0..rb.len]);
+        if (req_body.data != null and req_body.len > 0) {
+            const buf = try allocator.alloc(u8, req_body.len);
+            @memcpy(buf, req_body.data.?[0..req_body.len]);
             body_copy = buf.ptr;
-            body_len = rb.len;
+            body_len = req_body.len;
         }
 
         const client_ent = try reg.create(&server.client_request_in);
@@ -2545,7 +2547,7 @@ fn mapOneResponse(
     }
     try worker.reg.set(server_ent, &ps.inflight, h2.RespBody, .{ .data = body_copy, .len = body_len });
     const resp_hdrs: h2.RespHeaders = if (worker.admin_origin) |o|
-        try buildSystemRespHeaders(allocator, o, false, null)
+        try respb.buildSystemRespHeaders(allocator, o, false, null)
     else
         .{ .fields = null, .count = 0 };
     try worker.reg.set(server_ent, &ps.inflight, h2.RespHeaders, resp_hdrs);
@@ -2610,7 +2612,7 @@ fn setProxyFault(
 ) !void {
     try server.reg.set(ent, src_coll, h2.Status, .{ .code = status });
     const resp_hdrs: h2.RespHeaders = if (cors_origin) |o|
-        try buildSystemRespHeaders(allocator, o, false, null)
+        try respb.buildSystemRespHeaders(allocator, o, false, null)
     else
         .{ .fields = null, .count = 0 };
     try server.reg.set(ent, src_coll, h2.RespHeaders, resp_hdrs);
@@ -2652,7 +2654,7 @@ pub fn drainRaftPending(worker: anytype) !void {
         i -= 1;
         const ent = entities[i];
         const wait = waits[i];
-        const rb = resp_bodies[i];
+        const resp_body = resp_bodies[i];
 
         if (committed >= wait.seq) {
             // Happy path: raft committed, local writes already durable.
@@ -2688,737 +2690,19 @@ pub fn drainRaftPending(worker: anytype) !void {
             );
         }
 
-        const old_body_ptr: ?[*]u8 = rb.data;
-        const old_body_len: u32 = rb.len;
-        try overwrite503InPending(worker, ent, allocator);
+        const old_body_ptr: ?[*]u8 = resp_body.data;
+        const old_body_len: u32 = resp_body.len;
+        try respb.overwrite503InPending(worker, ent, allocator);
         if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
 
         try server.reg.move(ent, &worker.raft_pending, &server.response_in);
     }
 }
 
-/// Encode the writeset + envelope, propose through raft, and return
-/// the assigned seq. The caller parks the entity in `raft_pending`
-/// with a `RaftWait{seq}` component; `drainRaftPending` then observes
-/// `raft.committedSeq()` advancing past the stamp and releases the
-/// entity downstream. No spinning here — the h2 poll loop stays hot.
-pub fn proposeWriteSet(
-    worker: anytype,
-    writeset: *const kv_mod.WriteSet,
-    instance_id: []const u8,
-) !u64 {
-    const allocator = worker.allocator;
+pub const proposeWriteSet = raft_propose.proposeWriteSet;
+pub const proposeFilesWriteSet = raft_propose.proposeFilesWriteSet;
+pub const proposeRootWriteSet = raft_propose.proposeRootWriteSet;
 
-    const ws_bytes = try writeset.encode(allocator);
-    defer allocator.free(ws_bytes);
-
-    const envelope = try apply_mod.encodeWriteSetEnvelope(allocator, instance_id, ws_bytes);
-    defer allocator.free(envelope);
-
-    const seq = worker.raft.highWatermark() + 1;
-    try worker.raft.propose(seq, envelope);
-    return seq;
-}
-
-/// Propose a per-tenant files writeset (envelope type=3) through
-/// raft. Followers apply the encoded ops to their copy of
-/// `{data_dir}/{id}/files.db` so manifests + deployment pointers
-/// stay in sync. Used by `deployStarterContent` and the files-
-/// server's upload + deploy endpoints. Blob bytes are NOT carried
-/// in the envelope — multi-node setups need a shared BlobStore
-/// backend.
-pub fn proposeFilesWriteSet(
-    worker: anytype,
-    writeset: *const kv_mod.WriteSet,
-    instance_id: []const u8,
-) !u64 {
-    const allocator = worker.allocator;
-    if (writeset.ops.items.len == 0) return 0;
-
-    const ws_bytes = try writeset.encode(allocator);
-    defer allocator.free(ws_bytes);
-
-    const envelope = try apply_mod.encodeFilesWriteSetEnvelope(allocator, instance_id, ws_bytes);
-    defer allocator.free(envelope);
-
-    const seq = worker.raft.highWatermark() + 1;
-    try worker.raft.propose(seq, envelope);
-    return seq;
-}
-
-/// Propose a root writeset (envelope type=2) through raft. Followers
-/// apply the encoded ops to their own `__root__.db` in
-/// `applyRootWriteSet`. Used by signup (instance marker + domain
-/// assignment) and by the admin JS handler's `platform.root.*`
-/// writes.
-///
-/// No-op fast path for empty writesets — saves a raft entry for
-/// admin requests that only read platform state.
-///
-/// **Divergence note**: if the caller already wrote to root locally
-/// and this propose fails, the leader's root.db has state that
-/// followers don't. Current code logs and moves on (at-least-once
-/// semantics consistent with the outbox / callback layers). A
-/// future iteration can wrap root writes in a TrackedTxn with undo
-/// semantics so propose failure triggers a compensating rollback.
-pub fn proposeRootWriteSet(
-    worker: anytype,
-    writeset: *const kv_mod.WriteSet,
-) !u64 {
-    const allocator = worker.allocator;
-    if (writeset.ops.items.len == 0) return 0;
-
-    const ws_bytes = try writeset.encode(allocator);
-    defer allocator.free(ws_bytes);
-
-    const envelope = try apply_mod.encodeRootWriteSetEnvelope(allocator, ws_bytes);
-    defer allocator.free(envelope);
-
-    const seq = worker.raft.highWatermark() + 1;
-    try worker.raft.propose(seq, envelope);
-    return seq;
-}
-
-/// Overwrite an entity in `request_out` with a 503 body. Used when a
-/// raft propose fails before the entity gets parked. Frees any body
-/// the handler wrote before stamping the new one.
-fn overwriteWith503(
-    server: anytype,
-    ent: rove.Entity,
-    allocator: std.mem.Allocator,
-    old_body_ptr: ?[*]u8,
-    old_body_len: u32,
-) !void {
-    if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-    const body = try allocator.dupe(u8, "write replication failed\n");
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 503 });
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
-        .data = body.ptr,
-        .len = @intCast(body.len),
-    });
-}
-
-/// Overwrite a parked entity's response with a 503. Caller is
-/// responsible for freeing the old body (done in `drainRaftPending`
-/// where the column access lives).
-fn overwrite503InPending(
-    worker: anytype,
-    ent: rove.Entity,
-    allocator: std.mem.Allocator,
-) !void {
-    const body = try allocator.dupe(u8, "raft commit failed\n");
-    try worker.reg.set(ent, &worker.raft_pending, h2.Status, .{ .code = 503 });
-    try worker.reg.set(ent, &worker.raft_pending, h2.RespBody, .{
-        .data = body.ptr,
-        .len = @intCast(body.len),
-    });
-}
-
-/// Write a canned `500 Internal Server Error` response onto an entity
-/// and queue its move to `response_in`.
-fn setErrorResponse(
-    server: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-) !void {
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 500 });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
-}
-
-/// One (name, value) entry destined for an `h2.RespHeaders` field
-/// array. The string slices must outlive the call to `packRespHeaders`
-/// — typically they're either string literals or owned by the same
-/// allocator the caller passes in.
-const RespHeaderPair = struct { name: []const u8, value: []const u8 };
-
-/// Static CORS headers that accompany every cross-origin admin
-/// response. The dynamic `access-control-allow-origin` is prepended
-/// separately by callers since its value (the configured admin
-/// origin) is per-request.
-const CORS_FIXED_HEADERS = [_]RespHeaderPair{
-    .{ .name = "access-control-allow-credentials", .value = "true" },
-    .{ .name = "vary", .value = "origin" },
-    .{ .name = "access-control-expose-headers", .value = "content-type" },
-};
-
-/// Extra CORS headers emitted only on OPTIONS preflight responses.
-const CORS_PREFLIGHT_HEADERS = [_]RespHeaderPair{
-    .{ .name = "access-control-allow-methods", .value = "GET, POST, DELETE, OPTIONS" },
-    .{ .name = "access-control-allow-headers", .value = "authorization, content-type" },
-    .{ .name = "access-control-max-age", .value = "600" },
-};
-
-/// Pack a flat list of header pairs into an `h2.RespHeaders`,
-/// allocating one combined buffer for the field array + name/value
-/// bytes so the h2 writer can free everything in one call. Returns an
-/// empty (null-fields) header set when `pairs` is empty, saving an
-/// allocation on the same-origin user-traffic path.
-fn packRespHeaders(
-    allocator: std.mem.Allocator,
-    pairs: []const RespHeaderPair,
-) !h2.RespHeaders {
-    if (pairs.len == 0) return .{ .fields = null, .count = 0 };
-
-    const fields_size = pairs.len * @sizeOf(h2.HeaderField);
-    var strbuf_size: usize = 0;
-    for (pairs) |p| strbuf_size += p.name.len + p.value.len;
-
-    const total = fields_size + strbuf_size;
-    const buf = try allocator.alloc(u8, total);
-    errdefer allocator.free(buf);
-
-    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
-    var off: usize = fields_size;
-    for (pairs, 0..) |p, i| {
-        const name_start = off;
-        @memcpy(buf[off .. off + p.name.len], p.name);
-        off += p.name.len;
-        const value_start = off;
-        @memcpy(buf[off .. off + p.value.len], p.value);
-        off += p.value.len;
-        fields_ptr[i] = .{
-            .name = buf[name_start..].ptr,
-            .name_len = @intCast(p.name.len),
-            .value = buf[value_start..].ptr,
-            .value_len = @intCast(p.value.len),
-        };
-    }
-
-    return .{
-        .fields = fields_ptr,
-        .count = @intCast(pairs.len),
-        ._buf = buf.ptr,
-        ._buf_len = @intCast(buf.len),
-    };
-}
-
-/// Append the standard CORS envelope (origin + 3 fixed headers, plus 3
-/// preflight headers when `preflight` is true) to `pairs` starting at
-/// `n.*`. No-op when `cors_origin` is null. Caller must size `pairs`
-/// for at least 7 additional entries.
-fn appendCorsHeaders(
-    pairs: []RespHeaderPair,
-    n: *usize,
-    cors_origin: ?[]const u8,
-    preflight: bool,
-) void {
-    const origin = cors_origin orelse return;
-    pairs[n.*] = .{ .name = "access-control-allow-origin", .value = origin };
-    n.* += 1;
-    for (CORS_FIXED_HEADERS) |h| {
-        pairs[n.*] = h;
-        n.* += 1;
-    }
-    if (preflight) for (CORS_PREFLIGHT_HEADERS) |h| {
-        pairs[n.*] = h;
-        n.* += 1;
-    };
-}
-
-fn buildSystemRespHeaders(
-    allocator: std.mem.Allocator,
-    cors_origin: ?[]const u8,
-    preflight: bool,
-    content_type: ?[]const u8,
-) !h2.RespHeaders {
-    var pairs: [8]RespHeaderPair = undefined;
-    var n: usize = 0;
-    appendCorsHeaders(&pairs, &n, cors_origin, preflight);
-    if (content_type) |ct| {
-        pairs[n] = .{ .name = "content-type", .value = ct };
-        n += 1;
-    }
-    return packRespHeaders(allocator, pairs[0..n]);
-}
-
-/// Assemble a handler-response `RespHeaders` carrying optional CORS
-/// (admin host only), a `set-cookie` per `set_cookies` entry, and any
-/// handler-defined custom headers. All inputs have already been
-/// sanitized by the dispatcher.
-fn buildHandlerRespHeaders(
-    allocator: std.mem.Allocator,
-    cors_origin: ?[]const u8,
-    set_cookies: []const []const u8,
-    content_type: ?[]const u8,
-    custom_headers: []const dispatcher_mod.ResponseHeader,
-) !h2.RespHeaders {
-    const cors_count: usize = if (cors_origin != null) 4 else 0;
-    const ct_count: usize = if (content_type != null) 1 else 0;
-    const total = cors_count + ct_count + set_cookies.len + custom_headers.len;
-    if (total == 0) return .{ .fields = null, .count = 0 };
-
-    const pairs = try allocator.alloc(RespHeaderPair, total);
-    defer allocator.free(pairs);
-    var n: usize = 0;
-    appendCorsHeaders(pairs, &n, cors_origin, false);
-    if (content_type) |ct| {
-        pairs[n] = .{ .name = "content-type", .value = ct };
-        n += 1;
-    }
-    for (set_cookies) |cookie| {
-        pairs[n] = .{ .name = "set-cookie", .value = cookie };
-        n += 1;
-    }
-    for (custom_headers) |h| {
-        pairs[n] = .{ .name = h.name, .value = h.value };
-        n += 1;
-    }
-    return packRespHeaders(allocator, pairs[0..n]);
-}
-
-// ── Static dispatch ────────────────────────────────────────────────────
-
-/// Result of a static-file lookup/serve attempt. `miss` means the
-/// caller should fall through to handler routing.
-pub const StaticOutcome = union(enum) {
-    served: u16,
-    miss: void,
-};
-
-/// Try to serve `path` from the tenant's `_static/*` set. Returns the
-/// status code if we took the response (200, 304, or 301 for trailing-
-/// slash canonicalization) or `.miss` when nothing matched. Only called
-/// on `GET`; the caller enforces the method gate.
-fn tryServeStatic(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    tc: *TenantFiles,
-    path: []const u8,
-    rh: h2.ReqHeaders,
-) !StaticOutcome {
-    const qmark = std.mem.indexOfScalar(u8, path, '?');
-    const path_no_q = if (qmark) |q| path[0..q] else path;
-    if (path_no_q.len == 0 or path_no_q[0] != '/') return .miss;
-
-    // Trailing-slash canonicalization: redirect `/foo/` → `/foo` (not
-    // `/` itself). Only on GET, by design, so API clients using
-    // trailing-slash conventions on POST aren't surprised.
-    if (path_no_q.len > 1 and path_no_q[path_no_q.len - 1] == '/') {
-        var canon_buf: [files_mod.MAX_PATH_LEN + 16]u8 = undefined;
-        var stripped: []const u8 = path_no_q;
-        while (stripped.len > 1 and stripped[stripped.len - 1] == '/') {
-            stripped = stripped[0 .. stripped.len - 1];
-        }
-        // Preserve the original query string on the redirect target.
-        const loc = if (qmark) |q|
-            std.fmt.bufPrint(&canon_buf, "{s}?{s}", .{ stripped, path[q + 1 ..] }) catch return .miss
-        else
-            stripped;
-        try emitStaticRedirect(server, allocator, ent, sid, sess, loc);
-        return .{ .served = 301 };
-    }
-
-    const rel = path_no_q[1..];
-
-    var key_buf: [8 + files_mod.MAX_PATH_LEN + 16]u8 = undefined;
-    if (rel.len == 0) {
-        const key = std.fmt.bufPrint(&key_buf, "_static/index.html", .{}) catch return .miss;
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, key, rh)) |st| {
-            return .{ .served = st };
-        }
-        return .miss;
-    }
-
-    // Exact match: `_static/<rel>`.
-    if (std.fmt.bufPrint(&key_buf, "_static/{s}", .{rel})) |k| {
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh)) |st| {
-            return .{ .served = st };
-        }
-    } else |_| {}
-
-    // `.html` suffix: `_static/<rel>.html`.
-    if (std.fmt.bufPrint(&key_buf, "_static/{s}.html", .{rel})) |k| {
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh)) |st| {
-            return .{ .served = st };
-        }
-    } else |_| {}
-
-    // Directory index: `_static/<rel>/index.html`.
-    if (std.fmt.bufPrint(&key_buf, "_static/{s}/index.html", .{rel})) |k| {
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh)) |st| {
-            return .{ .served = st };
-        }
-    } else |_| {}
-
-    return .miss;
-}
-
-/// Return the status code if `key` is present and we wrote a response,
-/// or null if the key isn't in the static map.
-fn serveStaticByKey(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    tc: *TenantFiles,
-    key: []const u8,
-    rh: h2.ReqHeaders,
-) !?u16 {
-    const entry = tc.statics.get(key) orelse return null;
-
-    // Build the strong ETag value (`"<hex>"`) once; shared by 200 and 304.
-    var etag_buf: [files_mod.HASH_HEX_LEN + 2]u8 = undefined;
-    etag_buf[0] = '"';
-    @memcpy(etag_buf[1 .. 1 + files_mod.HASH_HEX_LEN], &entry.hash_hex);
-    etag_buf[1 + files_mod.HASH_HEX_LEN] = '"';
-    const etag = etag_buf[0..];
-
-    // If-None-Match: a comma-separated list of quoted tags (or `*`).
-    // Match = any one of them equals our etag.
-    const inm = findHeader(rh, "if-none-match");
-    if (inm != null and etagMatches(inm.?, etag)) {
-        try emitStaticResponse(
-            server,
-            allocator,
-            ent,
-            sid,
-            sess,
-            304,
-            "",
-            "",
-            etag,
-        );
-        return 304;
-    }
-
-    const bytes = tc.blob_backend.blobStore().get(&entry.hash_hex, allocator) catch |err| {
-        std.log.warn(
-            "rove-js: static blob fetch for {s} failed: {s}",
-            .{ key, @errorName(err) },
-        );
-        return err;
-    };
-    try emitStaticResponse(
-        server,
-        allocator,
-        ent,
-        sid,
-        sess,
-        200,
-        bytes,
-        entry.content_type,
-        etag,
-    );
-    return 200;
-}
-
-/// True if `inm` (If-None-Match header value) contains a tag equal to
-/// `etag`. Handles comma-separated lists and the `*` wildcard.
-fn etagMatches(inm: []const u8, etag: []const u8) bool {
-    var rest = inm;
-    while (rest.len > 0) {
-        while (rest.len > 0 and (rest[0] == ' ' or rest[0] == ',' or rest[0] == '\t')) {
-            rest = rest[1..];
-        }
-        if (rest.len == 0) break;
-        if (rest[0] == '*') return true;
-        // Find the next comma or end.
-        const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
-        var tag = rest[0..end];
-        // Trim trailing whitespace.
-        while (tag.len > 0 and (tag[tag.len - 1] == ' ' or tag[tag.len - 1] == '\t')) {
-            tag = tag[0 .. tag.len - 1];
-        }
-        // Strip a weak prefix (`W/`) if present — for static we only
-        // emit strong tags, but a client may be comparing weakly.
-        if (tag.len >= 2 and tag[0] == 'W' and tag[1] == '/') tag = tag[2..];
-        if (std.mem.eql(u8, tag, etag)) return true;
-        rest = rest[end..];
-        if (rest.len > 0) rest = rest[1..]; // skip the comma
-    }
-    return false;
-}
-
-/// Write a 200/304 static response. Body is duped into the response
-/// entity (so caller's `bytes` can be freed by its allocator immediately
-/// after). Passes an empty body for 304.
-fn emitStaticResponse(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    status_code: u16,
-    body: []const u8,
-    content_type: []const u8,
-    etag: []const u8,
-) !void {
-    const hdrs = try buildStaticRespHeaders(allocator, content_type, etag);
-    var body_ptr: ?[*]u8 = null;
-    var body_len: u32 = 0;
-    if (body.len > 0) {
-        const copy = try allocator.dupe(u8, body);
-        body_ptr = copy.ptr;
-        body_len = @intCast(copy.len);
-    }
-
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
-        .data = body_ptr,
-        .len = body_len,
-    });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
-}
-
-fn buildStaticRespHeaders(
-    allocator: std.mem.Allocator,
-    content_type: []const u8,
-    etag: []const u8,
-) !h2.RespHeaders {
-    const Pair = struct { name: []const u8, value: []const u8 };
-    var pairs: [3]Pair = undefined;
-    var n: usize = 0;
-    if (content_type.len > 0) {
-        pairs[n] = .{ .name = "content-type", .value = content_type };
-        n += 1;
-    }
-    pairs[n] = .{ .name = "etag", .value = etag };
-    n += 1;
-    pairs[n] = .{ .name = "cache-control", .value = "public, max-age=0, must-revalidate" };
-    n += 1;
-
-    const fields_size = n * @sizeOf(h2.HeaderField);
-    var strbuf_size: usize = 0;
-    for (pairs[0..n]) |p| strbuf_size += p.name.len + p.value.len;
-
-    const buf = try allocator.alloc(u8, fields_size + strbuf_size);
-    errdefer allocator.free(buf);
-
-    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
-    var off: usize = fields_size;
-    for (pairs[0..n], 0..) |p, i| {
-        const name_start = off;
-        @memcpy(buf[off .. off + p.name.len], p.name);
-        off += p.name.len;
-        const value_start = off;
-        @memcpy(buf[off .. off + p.value.len], p.value);
-        off += p.value.len;
-        fields_ptr[i] = .{
-            .name = buf[name_start..].ptr,
-            .name_len = @intCast(p.name.len),
-            .value = buf[value_start..].ptr,
-            .value_len = @intCast(p.value.len),
-        };
-    }
-
-    return .{
-        .fields = fields_ptr,
-        .count = @intCast(n),
-        ._buf = buf.ptr,
-        ._buf_len = @intCast(buf.len),
-    };
-}
-
-/// If the tenant has `_static/_404.html`, emit it as a 404 response
-/// with its stored content-type (no ETag — error bodies shouldn't be
-/// cached). Returns `true` when served, `false` when there's no such
-/// static so the caller can fall back to the built-in text body.
-fn serveConvention404(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    tc: *TenantFiles,
-) !bool {
-    const entry = tc.statics.get("_static/_404.html") orelse return false;
-    const bytes = tc.blob_backend.blobStore().get(&entry.hash_hex, allocator) catch |err| {
-        std.log.warn("rove-js: _404.html blob fetch failed: {s}", .{@errorName(err)});
-        return false;
-    };
-
-    // Minimal header set — just the content-type. No caching hints for
-    // error responses.
-    const Pair = struct { name: []const u8, value: []const u8 };
-    var pairs: [1]Pair = undefined;
-    var n: usize = 0;
-    if (entry.content_type.len > 0) {
-        pairs[n] = .{ .name = "content-type", .value = entry.content_type };
-        n += 1;
-    }
-    const hdrs: h2.RespHeaders = if (n == 0)
-        .{ .fields = null, .count = 0 }
-    else blk: {
-        const fields_size = n * @sizeOf(h2.HeaderField);
-        var strbuf_size: usize = 0;
-        for (pairs[0..n]) |p| strbuf_size += p.name.len + p.value.len;
-        const buf = try allocator.alloc(u8, fields_size + strbuf_size);
-        const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
-        var off: usize = fields_size;
-        for (pairs[0..n], 0..) |p, i| {
-            const name_start = off;
-            @memcpy(buf[off .. off + p.name.len], p.name);
-            off += p.name.len;
-            const value_start = off;
-            @memcpy(buf[off .. off + p.value.len], p.value);
-            off += p.value.len;
-            fields_ptr[i] = .{
-                .name = buf[name_start..].ptr,
-                .name_len = @intCast(p.name.len),
-                .value = buf[value_start..].ptr,
-                .value_len = @intCast(p.value.len),
-            };
-        }
-        break :blk .{
-            .fields = fields_ptr,
-            .count = @intCast(n),
-            ._buf = buf.ptr,
-            ._buf_len = @intCast(buf.len),
-        };
-    };
-
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 404 });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
-        .data = bytes.ptr,
-        .len = @intCast(bytes.len),
-    });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
-    return true;
-}
-
-/// Write a 301 redirect response. `location` is duped into the response
-/// header buffer so the caller doesn't need to keep it alive.
-fn emitStaticRedirect(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    location: []const u8,
-) !void {
-    const fields_size = @sizeOf(h2.HeaderField);
-    const name_len: usize = "location".len;
-    const buf = try allocator.alloc(u8, fields_size + name_len + location.len);
-    errdefer allocator.free(buf);
-
-    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
-    @memcpy(buf[fields_size .. fields_size + name_len], "location");
-    @memcpy(buf[fields_size + name_len ..][0..location.len], location);
-    fields_ptr[0] = .{
-        .name = buf[fields_size..].ptr,
-        .name_len = @intCast(name_len),
-        .value = buf[fields_size + name_len ..].ptr,
-        .value_len = @intCast(location.len),
-    };
-
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 301 });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{
-        .fields = fields_ptr,
-        .count = 1,
-        ._buf = buf.ptr,
-        ._buf_len = @intCast(buf.len),
-    });
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
-}
-
-/// Like `setSimpleResponse`, but stamps CORS response headers when
-/// `cors_origin` is non-null and an optional `Content-Type`. Use in
-/// the `/_system/*` branch so admin UI responses carry the right
-/// headers without the caller hand-assembling `RespHeaders`.
-fn setSystemResponse(
-    server: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    status_code: u16,
-    body: []const u8,
-    allocator: std.mem.Allocator,
-    cors_origin: ?[]const u8,
-    content_type: ?[]const u8,
-) !void {
-    const copy = try allocator.dupe(u8, body);
-    const resp_hdrs = try buildSystemRespHeaders(allocator, cors_origin, false, content_type);
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, resp_hdrs);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
-        .data = copy.ptr,
-        .len = @intCast(copy.len),
-    });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
-}
-
-/// 429 response with a `Retry-After: <sec>` header. Body text mentions
-/// the wait time so curl-style clients without header inspection still
-/// get the hint.
-fn setRateLimitedResponse(
-    server: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    allocator: std.mem.Allocator,
-    retry_after_sec: u32,
-) !void {
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "rate limit exceeded, retry after {d}s\n",
-        .{retry_after_sec},
-    );
-    const ra_str = try std.fmt.allocPrint(allocator, "{d}", .{retry_after_sec});
-    defer allocator.free(ra_str);
-    const hdrs = try packRespHeaders(allocator, &.{
-        .{ .name = "retry-after", .value = ra_str },
-    });
-
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 429 });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
-        .data = body.ptr,
-        .len = @intCast(body.len),
-    });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
-}
-
-/// Write a canned status + body response, allocating an h2-owned copy
-/// of `body`.
-fn setSimpleResponse(
-    server: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    status_code: u16,
-    body: []const u8,
-    allocator: std.mem.Allocator,
-) !void {
-    const copy = try allocator.dupe(u8, body);
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
-        .data = copy.ptr,
-        .len = @intCast(copy.len),
-    });
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
-}
 
 /// Destroy entities sitting in `response_out` (h2 has finished
 /// flushing them to the wire). Same pattern as the echo example's
@@ -3539,23 +2823,11 @@ test "isReservedTriggerPrefix: shallower-than-platform blocked (would catch syst
     try std.testing.expect(isReservedTriggerPrefix("_"));
 }
 
-fn findHeader(hdrs: h2.ReqHeaders, name: []const u8) ?[]const u8 {
-    if (hdrs.fields == null) return null;
-    const fields = hdrs.fields.?[0..hdrs.count];
-    for (fields) |f| {
-        const fname = f.name[0..f.name_len];
-        if (std.mem.eql(u8, fname, name)) {
-            return f.value[0..f.value_len];
-        }
-    }
-    return null;
-}
-
 /// Extract the bearer token from the `authorization` header.
 /// Returns null if the header is absent, the scheme isn't `Bearer`,
 /// or the token is empty. Header name is lowercase per HTTP/2 rules.
 fn extractBearerToken(hdrs: h2.ReqHeaders) ?[]const u8 {
-    const value = findHeader(hdrs, "authorization") orelse return null;
+    const value = respb.findHeader(hdrs, "authorization") orelse return null;
     const prefix = "Bearer ";
     if (value.len <= prefix.len) return null;
     if (!std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix)) return null;
@@ -3571,7 +2843,7 @@ pub const ADMIN_SESSION_COOKIE: []const u8 = "rove_session";
 /// Find `name` inside the request's Cookie header. Returns the raw
 /// value (trimmed of surrounding whitespace) or null if missing.
 fn findCookie(hdrs: h2.ReqHeaders, name: []const u8) ?[]const u8 {
-    const value = findHeader(hdrs, "cookie") orelse return null;
+    const value = respb.findHeader(hdrs, "cookie") orelse return null;
     var rest = value;
     while (rest.len > 0) {
         while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t' or rest[0] == ';')) {
@@ -3915,28 +3187,4 @@ test "captureLog appends a record to the tenant's LogStore" {
     try testing.expectEqualStrings("/test", result.records[0].path);
     try testing.expectEqual(@as(u64, 42), result.records[0].deployment_id);
     try testing.expectEqual(log_mod.Outcome.ok, result.records[0].outcome);
-}
-
-test "etagMatches: single tag" {
-    try std.testing.expect(etagMatches("\"abc\"", "\"abc\""));
-    try std.testing.expect(!etagMatches("\"abc\"", "\"xyz\""));
-}
-
-test "etagMatches: weak prefix stripped" {
-    try std.testing.expect(etagMatches("W/\"abc\"", "\"abc\""));
-}
-
-test "etagMatches: comma list" {
-    try std.testing.expect(etagMatches("\"xyz\", \"abc\", \"qqq\"", "\"abc\""));
-    try std.testing.expect(!etagMatches("\"xyz\", \"qqq\"", "\"abc\""));
-}
-
-test "etagMatches: wildcard" {
-    try std.testing.expect(etagMatches("*", "\"anything\""));
-    try std.testing.expect(etagMatches("\"a\", *", "\"b\""));
-}
-
-test "etagMatches: empty or whitespace only" {
-    try std.testing.expect(!etagMatches("", "\"abc\""));
-    try std.testing.expect(!etagMatches("   ", "\"abc\""));
 }
