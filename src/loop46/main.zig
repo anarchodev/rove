@@ -105,6 +105,14 @@ const ADMIN_HANDLER_SRC = @embedFile("admin_handler_mjs");
 const ADMIN_MIDDLEWARE_SRC = @embedFile("admin_middleware_mjs");
 
 
+/// Print a startup error to stderr and exit with code 2 (matching the
+/// CLI parser's `error.Usage` convention so a wrapping shell script
+/// can distinguish user-facing config failures from crashes).
+fn failExit(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print(fmt, args);
+    std.process.exit(2);
+}
+
 fn parseHostPort(allocator: std.mem.Allocator, hp: []const u8) !std.net.Address {
     const colon = std.mem.lastIndexOfScalar(u8, hp, ':') orelse return error.MalformedHostPort;
     const host = hp[0..colon];
@@ -408,17 +416,22 @@ fn raftThreadMain(node: *kv.RaftNode) void {
 
 // ── main ──────────────────────────────────────────────────────────────
 
+const SubcommandResult = union(enum) {
+    /// Help/seed/usage error already handled — caller should return.
+    handled,
+    /// `dev` or `worker` mode with a parsed CLI ready to drive.
+    run: cli_mod.Cli,
+};
 
-
-pub fn main() !void {
-    // c_allocator (glibc malloc) — NOT DebugAllocator. The latter
-    // spends ~20% of CPU in stack-trace capture per alloc even in
-    // ReleaseFast. See memory `feedback_zig_*` / session-9 notes.
-    const allocator = std.heap.c_allocator;
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
-
+/// Process argv: dispatch help / seed, validate the subcommand, and
+/// parse the CLI for dev/worker modes. Calls `std.process.exit(2)`
+/// directly on usage errors (matching the existing convention so a
+/// wrapping shell can distinguish user-facing config failures from
+/// crashes).
+fn dispatchSubcommand(
+    allocator: std.mem.Allocator,
+    argv: []const [:0]u8,
+) !SubcommandResult {
     if (argv.len < 2) {
         try cli_mod.printUsage();
         std.process.exit(2);
@@ -432,7 +445,7 @@ pub fn main() !void {
         std.mem.eql(u8, cmd, "-h"))
     {
         try cli_mod.printUsage();
-        return;
+        return .handled;
     }
 
     if (std.mem.eql(u8, cmd, "seed")) {
@@ -444,7 +457,7 @@ pub fn main() !void {
             }
             std.process.exit(2);
         };
-        return;
+        return .handled;
     }
 
     const dev_mode = std.mem.eql(u8, cmd, "dev");
@@ -472,6 +485,202 @@ pub fn main() !void {
         });
     }
 
+    return .{ .run = cli };
+}
+
+/// One-time bootstrap on the main thread before any worker / raft /
+/// subsystem thread starts. Opens root.db, ensures __admin__ exists,
+/// applies any `--bootstrap-kv key=value` entries to admin's app.db,
+/// deploys the embedded admin UI bundle, and prewarms every existing
+/// tenant's app.db + log.db so the WAL-mode upgrade is committed
+/// before workers race to open them. Each worker opens its own
+/// connections to these files later.
+fn bootstrapTenants(allocator: std.mem.Allocator, cli: cli_mod.Cli) !void {
+    const root_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/__root__.db",
+        .{cli.data_dir},
+        0,
+    );
+    defer allocator.free(root_path);
+    const root_kv = try kv.KvStore.open(allocator, root_path);
+    defer root_kv.close();
+
+    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, cli.data_dir);
+    defer tenant.destroy();
+
+    if (cli.bootstrap_root_token) |t| {
+        tenant.installRootToken(t) catch |err| {
+            failExit("bootstrap: installRootToken failed: {s}\n", .{@errorName(err)});
+        };
+        std.debug.print("bootstrap: root token installed\n", .{});
+    }
+
+    // __admin__ is created first so session / magic / resend-key
+    // operations (which live in its app.db) have a place to land
+    // before any other bootstrap step runs. See `src/tenant/root.zig`.
+    try tenant.createInstance("__admin__");
+
+    // Generic config bootstrap: every `--bootstrap-kv key=value`
+    // arg writes to admin's app.db under the given key. Zig knows
+    // nothing about the keys — admin's JS handler reads whatever
+    // it cares about via kv.get with whatever fallback default
+    // it wants (e.g. `kv.get("platform_email_from") ||
+    // "noreply@loop46.me"`).
+    if (cli.bootstrap_kv_count > 0) {
+        const admin_inst = (tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch |err| {
+            failExit("bootstrap: lookup __admin__ failed: {s}\n", .{@errorName(err)});
+        }).?;
+        for (cli.bootstrap_kv[0..cli.bootstrap_kv_count]) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse
+                failExit("bootstrap-kv: expected key=value, got '{s}'\n", .{pair});
+            const key = pair[0..eq];
+            const value = pair[eq + 1 ..];
+            if (key.len == 0)
+                failExit("bootstrap-kv: empty key in '{s}'\n", .{pair});
+            if (std.mem.indexOfScalar(u8, key, 0) != null or
+                std.mem.indexOfScalar(u8, value, 0) != null)
+            {
+                failExit("bootstrap-kv: key/value contains NUL byte (key='{s}')\n", .{key});
+            }
+            admin_inst.kv.put(key, value) catch |err| {
+                failExit("bootstrap-kv: write {s} failed: {s}\n", .{ key, @errorName(err) });
+            };
+        }
+        std.debug.print(
+            "bootstrap: wrote {d} kv pair(s) into __admin__/app.db\n",
+            .{cli.bootstrap_kv_count},
+        );
+    }
+
+    // Always-deploy: the embedded admin UI bundle. Demo + benchmark
+    // tenants get provisioned by `loop46 seed --manifest ...` (out
+    // of band of this binary). The worker discovers them on disk.
+    try bootstrapHandler(allocator, cli.data_dir, "__admin__", &ADMIN_DEPLOY_FILES);
+
+    // Prewarm __admin__ + every disk-discovered tenant's app.db +
+    // log.db on the main thread so the WAL-mode transition is
+    // committed before workers race to open them. Without this,
+    // `--workers 8` occasionally kills a worker with
+    // `error: JournalMode` because two openers try to upgrade
+    // journal_mode=WAL at the same time.
+    const prewarm_ids = try discoverTenantIds(allocator, cli.data_dir);
+    defer {
+        for (prewarm_ids) |id| allocator.free(id);
+        allocator.free(prewarm_ids);
+    }
+    try prewarmTenantDbs(allocator, cli.data_dir, &.{tenant_mod.ADMIN_INSTANCE_ID});
+    try prewarmTenantDbs(allocator, cli.data_dir, prewarm_ids);
+}
+
+/// Owned strings produced by `resolveTls` when `--dev` auto-discovers
+/// cert/key paths. Lives in main()'s frame so the buffers survive
+/// past `resolveTls`'s return; cleaned up via `deinit` at exit.
+const TlsResources = struct {
+    cert: ?[]u8 = null,
+    key: ?[]u8 = null,
+    dir: ?[]u8 = null,
+
+    fn deinit(self: *TlsResources, allocator: std.mem.Allocator) void {
+        if (self.cert) |s| allocator.free(s);
+        if (self.key) |s| allocator.free(s);
+        if (self.dir) |s| allocator.free(s);
+    }
+};
+
+/// Build the `TlsConfig` for the worker pool. Both `--tls-cert` and
+/// `--tls-key` must be set together, or both absent. When `--dev` is
+/// set AND neither flag was passed, auto-discover the default cert +
+/// key produced by `scripts/rove-dev-setup.sh` (or bootstrap via
+/// mkcert on first run); the resulting owned path strings live in
+/// `owned` so the caller's defer can free them. Returns null for
+/// plaintext (no TLS configured).
+fn resolveTls(
+    allocator: std.mem.Allocator,
+    cli: cli_mod.Cli,
+    owned: *TlsResources,
+) !?*h2_mod.TlsConfig {
+    var cert_path = cli.tls_cert;
+    var key_path = cli.tls_key;
+    const explicit = cert_path != null or key_path != null;
+
+    if ((cert_path != null and key_path == null) or
+        (cert_path == null and key_path != null))
+    {
+        failExit("error: --tls-cert and --tls-key must be set together\n", .{});
+    }
+
+    if (!explicit and cli.dev) {
+        const paths = tls_dev.defaultDevTlsPaths(allocator) catch |err|
+            failExit("error: --dev: cannot resolve default TLS paths: {s}\n", .{@errorName(err)});
+        owned.cert = paths.cert;
+        owned.key = paths.key;
+        owned.dir = paths.dir;
+        // First run: cert missing → bootstrap via mkcert. After
+        // initDevTls returns the files exist; if it doesn't, it exits
+        // the process itself (mkcert missing, etc.) so we never reach
+        // the next line on a real failure.
+        if (!tls_dev.devTlsPathsExist(paths.cert, paths.key)) {
+            try tls_dev.initDevTls(allocator, paths);
+        } else {
+            std.log.info("--dev: TLS cert at {s}", .{paths.dir});
+        }
+        cert_path = paths.cert;
+        key_path = paths.key;
+    }
+
+    if (cert_path == null) return null;
+
+    const cfg = h2_mod.TlsConfig.createFromFiles(
+        allocator,
+        cert_path.?,
+        key_path.?,
+    ) catch |err| failExit(
+        "error: tls: {s} (cert={s}, key={s})\n",
+        .{ @errorName(err), cert_path.?, key_path.? },
+    );
+    std.log.info("tls: loaded {s} + {s}", .{ cert_path.?, key_path.? });
+    return cfg;
+}
+
+/// Block the main thread until SIGINT/SIGTERM flips `stop_flag`. 50ms
+/// poll granularity is invisible to shutdown perception and costs
+/// nothing. If TLS is on, the main thread also stat()s the PEM files
+/// once per second — the sidecar (scripts/rove-lego-renew.sh)
+/// rewrites these whenever lego renews, and workers pick up the new
+/// cert on the next TLS accept.
+fn runUntilStopped(tls_config: ?*h2_mod.TlsConfig) void {
+    const reload_interval_ticks: u64 = 20; // 20 × 50ms = 1s
+    var tick: u64 = 0;
+    while (!stop_flag.load(.acquire)) {
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+        tick += 1;
+        if (tls_config) |cfg| {
+            if (tick % reload_interval_ticks == 0) {
+                const changed = cfg.reloadIfChanged() catch |err| blk: {
+                    std.log.warn("tls: reloadIfChanged failed: {s}", .{@errorName(err)});
+                    break :blk false;
+                };
+                if (changed) std.log.info("tls: cert/key reloaded", .{});
+            }
+        }
+    }
+}
+
+pub fn main() !void {
+    // c_allocator (glibc malloc) — NOT DebugAllocator. The latter
+    // spends ~20% of CPU in stack-trace capture per alloc even in
+    // ReleaseFast. See memory `feedback_zig_*` / session-9 notes.
+    const allocator = std.heap.c_allocator;
+
+    const argv = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv);
+
+    const cli = switch (try dispatchSubcommand(allocator, argv)) {
+        .handled => return,
+        .run => |c| c,
+    };
+
     // Resolve workers=0 → online CPU count (minus one for the raft thread).
     const num_workers: u16 = if (cli.workers == 0) blk: {
         const cpus = std.Thread.getCpuCount() catch 4;
@@ -491,106 +700,7 @@ pub fn main() !void {
 
     try installSignalHandlers();
 
-    // ── One-time bootstrap: __root__ + instances + handler ────────────
-    //
-    // Done on the main thread so the workers only have to discover
-    // pre-existing state on startup. Each worker will open its OWN
-    // connections to these files when it spins up.
-    {
-        const root_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/__root__.db",
-            .{cli.data_dir},
-            0,
-        );
-        defer allocator.free(root_path);
-        const root_kv = try kv.KvStore.open(allocator, root_path);
-        defer root_kv.close();
-
-        const tenant = try tenant_mod.Tenant.create(allocator, root_kv, cli.data_dir);
-        defer tenant.destroy();
-
-        if (cli.bootstrap_root_token) |t| {
-            tenant.installRootToken(t) catch |err| {
-                std.debug.print("bootstrap: installRootToken failed: {s}\n", .{@errorName(err)});
-                std.process.exit(2);
-            };
-            std.debug.print("bootstrap: root token installed\n", .{});
-        }
-
-        // __admin__ is created first so session / magic / resend-key
-        // operations (which live in its app.db) have a place to land
-        // before any other bootstrap step runs. See `src/tenant/root.zig`.
-        try tenant.createInstance("__admin__");
-
-        // Generic config bootstrap: every `--bootstrap-kv key=value`
-        // arg writes to admin's app.db under the given key. Zig knows
-        // nothing about the keys — admin's JS handler reads whatever
-        // it cares about via kv.get with whatever fallback default
-        // it wants (e.g. `kv.get("platform_email_from") ||
-        // "noreply@loop46.me"`).
-        if (cli.bootstrap_kv_count > 0) {
-            const admin_inst = (tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch |err| {
-                std.debug.print("bootstrap: lookup __admin__ failed: {s}\n", .{@errorName(err)});
-                std.process.exit(2);
-            }).?;
-            for (cli.bootstrap_kv[0..cli.bootstrap_kv_count]) |pair| {
-                const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
-                    std.debug.print(
-                        "bootstrap-kv: expected key=value, got '{s}'\n",
-                        .{pair},
-                    );
-                    std.process.exit(2);
-                };
-                const key = pair[0..eq];
-                const value = pair[eq + 1 ..];
-                if (key.len == 0) {
-                    std.debug.print("bootstrap-kv: empty key in '{s}'\n", .{pair});
-                    std.process.exit(2);
-                }
-                if (std.mem.indexOfScalar(u8, key, 0) != null or
-                    std.mem.indexOfScalar(u8, value, 0) != null)
-                {
-                    std.debug.print(
-                        "bootstrap-kv: key/value contains NUL byte (key='{s}')\n",
-                        .{key},
-                    );
-                    std.process.exit(2);
-                }
-                admin_inst.kv.put(key, value) catch |err| {
-                    std.debug.print(
-                        "bootstrap-kv: write {s} failed: {s}\n",
-                        .{ key, @errorName(err) },
-                    );
-                    std.process.exit(2);
-                };
-            }
-            std.debug.print(
-                "bootstrap: wrote {d} kv pair(s) into __admin__/app.db\n",
-                .{cli.bootstrap_kv_count},
-            );
-        }
-
-        // Always-deploy: the embedded admin UI bundle. Demo + benchmark
-        // tenants get provisioned by `loop46 seed --manifest ...` (out
-        // of band of this binary). The worker discovers them on disk
-        // here.
-        try bootstrapHandler(allocator, cli.data_dir, "__admin__", &ADMIN_DEPLOY_FILES);
-
-        // Prewarm __admin__ + every disk-discovered tenant's app.db +
-        // log.db on the main thread so the WAL-mode transition is
-        // committed before workers race to open them. Without this,
-        // `--workers 8` occasionally kills a worker with
-        // `error: JournalMode` because two openers try to upgrade
-        // journal_mode=WAL at the same time.
-        const prewarm_ids = try discoverTenantIds(allocator, cli.data_dir);
-        defer {
-            for (prewarm_ids) |id| allocator.free(id);
-            allocator.free(prewarm_ids);
-        }
-        try prewarmTenantDbs(allocator, cli.data_dir, &.{tenant_mod.ADMIN_INSTANCE_ID});
-        try prewarmTenantDbs(allocator, cli.data_dir, prewarm_ids);
-    }
+    try bootstrapTenants(allocator, cli);
 
     const subsystem_max_connections: u32 = @as(u32, num_workers) + 4;
 
@@ -691,70 +801,9 @@ pub fn main() !void {
     var seq_counters = kv.SeqCounterRegistry.init(allocator);
     defer seq_counters.deinit();
 
-    // Optional TLS. Both flags must be set; either alone is a usage
-    // error (silent fall-through to plaintext would mask a config
-    // mistake in prod). When `--dev` is set AND no explicit cert/key
-    // flags are passed, auto-discover the cert + key produced by
-    // `scripts/rove-dev-setup.sh` at the platform-default loop46
-    // data dir; missing → plaintext h2c with a hint pointing at the
-    // setup script.
-    var dev_tls_cert_owned: ?[]u8 = null;
-    var dev_tls_key_owned: ?[]u8 = null;
-    var dev_tls_dir_owned: ?[]u8 = null;
-    defer if (dev_tls_cert_owned) |s| allocator.free(s);
-    defer if (dev_tls_key_owned) |s| allocator.free(s);
-    defer if (dev_tls_dir_owned) |s| allocator.free(s);
-
-    const tls_config: ?*h2_mod.TlsConfig = blk: {
-        var cert_path = cli.tls_cert;
-        var key_path = cli.tls_key;
-        const explicit = cert_path != null or key_path != null;
-
-        if (cert_path != null and key_path == null) {
-            std.debug.print("error: --tls-cert and --tls-key must be set together\n", .{});
-            std.process.exit(2);
-        }
-        if (cert_path == null and key_path != null) {
-            std.debug.print("error: --tls-cert and --tls-key must be set together\n", .{});
-            std.process.exit(2);
-        }
-
-        if (!explicit and cli.dev) {
-            const paths = tls_dev.defaultDevTlsPaths(allocator) catch |err| {
-                std.debug.print("error: --dev: cannot resolve default TLS paths: {s}\n", .{@errorName(err)});
-                std.process.exit(2);
-            };
-            dev_tls_cert_owned = paths.cert;
-            dev_tls_key_owned = paths.key;
-            dev_tls_dir_owned = paths.dir;
-            // First run: cert missing → bootstrap via mkcert. After
-            // initDevTls returns the files exist; if it doesn't, it
-            // exits the process itself (mkcert missing, etc.) so we
-            // never reach the next line on a real failure.
-            if (!tls_dev.devTlsPathsExist(paths.cert, paths.key)) {
-                try tls_dev.initDevTls(allocator, paths);
-            } else {
-                std.log.info("--dev: TLS cert at {s}", .{paths.dir});
-            }
-            cert_path = paths.cert;
-            key_path = paths.key;
-        }
-
-        if (cert_path == null) break :blk null;
-
-        const cfg = h2_mod.TlsConfig.createFromFiles(
-            allocator,
-            cert_path.?,
-            key_path.?,
-        ) catch |err| {
-            std.debug.print("error: tls: {s} (cert={s}, key={s})\n", .{
-                @errorName(err), cert_path.?, key_path.?,
-            });
-            std.process.exit(2);
-        };
-        std.log.info("tls: loaded {s} + {s}", .{ cert_path.?, key_path.? });
-        break :blk cfg;
-    };
+    var tls_owned: TlsResources = .{};
+    defer tls_owned.deinit(allocator);
+    const tls_config = try resolveTls(allocator, cli, &tls_owned);
 
     var i: u16 = 0;
     while (i < num_workers) : (i += 1) {
@@ -811,27 +860,7 @@ pub fn main() !void {
         },
     );
 
-    // Block until SIGINT/SIGTERM flips stop_flag, then join workers.
-    // 50ms poll granularity is invisible to shutdown perception and
-    // costs nothing. If TLS is on, the main thread also stat()s the
-    // PEM files once per second — the sidecar (scripts/rove-lego-
-    // renew.sh) rewrites these whenever lego renews, and workers pick
-    // up the new cert on the next TLS accept.
-    const reload_interval_ticks: u64 = 20; // 20 × 50ms = 1s
-    var tick: u64 = 0;
-    while (!stop_flag.load(.acquire)) {
-        std.Thread.sleep(50 * std.time.ns_per_ms);
-        tick += 1;
-        if (tls_config) |cfg| {
-            if (tick % reload_interval_ticks == 0) {
-                const changed = cfg.reloadIfChanged() catch |err| blk: {
-                    std.log.warn("tls: reloadIfChanged failed: {s}", .{@errorName(err)});
-                    break :blk false;
-                };
-                if (changed) std.log.info("tls: cert/key reloaded", .{});
-            }
-        }
-    }
+    runUntilStopped(tls_config);
     std.log.info("js-worker: shutdown requested, joining {d} worker(s)", .{num_workers});
     for (threads) |t| t.join();
     std.log.info("js-worker: bye", .{});
