@@ -354,25 +354,8 @@ pub const Dispatcher = struct {
 
         globals.installRequest(ctx.raw, &state, request);
 
-        var exception_msg: []u8 = &.{};
-        errdefer self.allocator.free(exception_msg);
-        var body_buf: []u8 = &.{};
-        errdefer self.allocator.free(body_buf);
-        var body_is_json: bool = false;
-        var status: i32 = 200;
-        var cookies: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (cookies.items) |c2| self.allocator.free(c2);
-            cookies.deinit(self.allocator);
-        }
-        var headers: std.ArrayList(ResponseHeader) = .empty;
-        errdefer {
-            for (headers.items) |h| {
-                self.allocator.free(h.name);
-                self.allocator.free(h.value);
-            }
-            headers.deinit(self.allocator);
-        }
+        var pending: PendingResponse = .{};
+        errdefer pending.deinit(self.allocator);
 
         // Optional `_middlewares/index.mjs` runs before the handler
         // in the same QJS context. Mutations it makes to globalThis
@@ -381,7 +364,6 @@ pub const Dispatcher = struct {
         // value, the dispatcher short-circuits with that value as the
         // body and skips the handler. Return undefined / fall off the
         // end → continue.
-        var middleware_short_circuited = false;
         const mw_bytecode_opt: ?[]const u8 = blk: {
             if (bytecodes) |bcs| {
                 if (bcs.get("_middlewares/index.mjs")) |bc| break :blk bc;
@@ -390,93 +372,196 @@ pub const Dispatcher = struct {
             break :blk null;
         };
         if (mw_bytecode_opt) |mw_bc| {
-            const mw_fun_obj = c.JS_ReadObject(ctx.raw, mw_bc.ptr, mw_bc.len, c.JS_READ_OBJ_BYTECODE);
-            var mw_fun_val: qjs.Value = .{ .raw = mw_fun_obj, .ctx = ctx.raw };
-            if (mw_fun_val.isException()) {
-                exception_msg = ctx.takeExceptionMessage(self.allocator) catch
-                    return DispatchError.OutOfMemory;
-                mw_fun_val.deinit();
-                return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
-            }
-            if (mw_fun_val.raw.tag != c.JS_TAG_MODULE) {
-                mw_fun_val.deinit();
-                status = 500;
-                body_buf = self.allocator.dupe(u8, "_middlewares/index.mjs is not an ES module") catch
-                    return DispatchError.OutOfMemory;
-                return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
-            }
-            runMiddleware(
-                self,
-                &rt,
-                &ctx,
-                mw_fun_val,
-                budget,
-                &status,
-                &body_buf,
-                &body_is_json,
-                &exception_msg,
-                &cookies,
-                &headers,
-                &middleware_short_circuited,
-            ) catch |err| switch (err) {
+            const mw_fun_val = (try loadModuleBytecode(&ctx, self.allocator, mw_bc, &pending,
+                "_middlewares/index.mjs is not an ES module")) orelse
+                return finishResponse(self, &state, &pending, &console_buf);
+            runMiddleware(self, &rt, &ctx, mw_fun_val, budget, &pending) catch |err| switch (err) {
                 error.Interrupted => return DispatchError.Interrupted,
                 error.OutOfMemory => return DispatchError.OutOfMemory,
-                error.JsException => middleware_short_circuited = true,
+                error.JsException => pending.short_circuit = true,
             };
         }
 
-        if (middleware_short_circuited) {
-            return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
+        if (pending.short_circuit) {
+            return finishResponse(self, &state, &pending, &console_buf);
         }
 
-        const fun_obj = c.JS_ReadObject(
-            ctx.raw,
-            bytecode.ptr,
-            bytecode.len,
-            c.JS_READ_OBJ_BYTECODE,
-        );
-        var fun_val: qjs.Value = .{ .raw = fun_obj, .ctx = ctx.raw };
+        const fun_val = (try loadModuleBytecode(&ctx, self.allocator, bytecode, &pending,
+            "handler bytecode is not an ES module (.mjs)")) orelse
+            return finishResponse(self, &state, &pending, &console_buf);
 
-        if (fun_val.isException()) {
-            exception_msg = ctx.takeExceptionMessage(self.allocator) catch
-                return DispatchError.OutOfMemory;
-            fun_val.deinit();
-            return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
-        }
-
-        if (fun_val.raw.tag != c.JS_TAG_MODULE) {
-            fun_val.deinit();
-            status = 500;
-            body_buf = self.allocator.dupe(u8, "handler bytecode is not an ES module (.mjs)") catch
-                return DispatchError.OutOfMemory;
-            return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
-        }
-
-        runModule(
-            self,
-            &rt,
-            &ctx,
-            &state,
-            fun_val,
-            request,
-            budget,
-            &status,
-            &body_buf,
-            &body_is_json,
-            &exception_msg,
-            &cookies,
-            &headers,
-        ) catch |err| switch (err) {
+        runModule(self, &rt, &ctx, fun_val, request, budget, &pending) catch |err| switch (err) {
             error.Interrupted => return DispatchError.Interrupted,
             error.OutOfMemory => return DispatchError.OutOfMemory,
-            error.JsException => {}, // exception_msg already populated
+            error.JsException => {}, // pending.exception already populated
         };
 
-        return finishResponse(self, &state, status, body_buf, body_is_json, exception_msg, &console_buf, &cookies, &headers);
+        return finishResponse(self, &state, &pending, &console_buf);
     }
 };
 
 const RunError = error{ Interrupted, OutOfMemory, JsException };
+
+/// Mutable response state accumulated across the dispatcher's run.
+/// Bundled so the helpers and the run* functions take one pointer
+/// instead of six out-params each. `finishResponse` consumes it
+/// (cookies/headers via `toOwnedSlice`, body/exception via direct
+/// transfer); on the error paths the caller's errdefer fires
+/// `deinit` to free anything still owned here.
+const PendingResponse = struct {
+    status: i32 = 200,
+    body: []u8 = &.{},
+    body_is_json: bool = false,
+    exception: []u8 = &.{},
+    cookies: std.ArrayList([]u8) = .empty,
+    headers: std.ArrayList(ResponseHeader) = .empty,
+    /// Set by `runMiddleware` when the middleware returns a non-
+    /// undefined/null value (or a malformed module) — the caller
+    /// skips the handler and goes straight to `finishResponse`.
+    short_circuit: bool = false,
+
+    fn deinit(self: *PendingResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.body);
+        allocator.free(self.exception);
+        for (self.cookies.items) |c2| allocator.free(c2);
+        self.cookies.deinit(allocator);
+        for (self.headers.items) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        self.headers.deinit(allocator);
+    }
+};
+
+/// Result of `JS_ReadObject` + module-tag validation. Returns `null`
+/// when bytecode failed to load or wasn't an ES module — `pending`
+/// has been populated with the appropriate exception/body and the
+/// caller should fall through to `finishResponse`.
+fn loadModuleBytecode(
+    ctx: *qjs.Context,
+    allocator: std.mem.Allocator,
+    bytecode: []const u8,
+    pending: *PendingResponse,
+    not_a_module_msg: []const u8,
+) DispatchError!?qjs.Value {
+    const obj = c.JS_ReadObject(ctx.raw, bytecode.ptr, bytecode.len, c.JS_READ_OBJ_BYTECODE);
+    var val: qjs.Value = .{ .raw = obj, .ctx = ctx.raw };
+    if (val.isException()) {
+        pending.exception = ctx.takeExceptionMessage(allocator) catch
+            return DispatchError.OutOfMemory;
+        val.deinit();
+        return null;
+    }
+    if (val.raw.tag != c.JS_TAG_MODULE) {
+        val.deinit();
+        pending.status = 500;
+        pending.body = allocator.dupe(u8, not_a_module_msg) catch
+            return DispatchError.OutOfMemory;
+        return null;
+    }
+    return val;
+}
+
+/// Steps shared by middleware and handler module execution: evaluate
+/// the module top level, drain microtasks, check for a rejected
+/// top-level await, then materialize the namespace. Returns the
+/// namespace JSValue; caller owns and must `JS_FreeValue` it.
+/// `fun_val_in` is consumed by `JS_EvalFunction` — caller must not
+/// reuse it after this call.
+fn evalModule(
+    d: *Dispatcher,
+    rt: *qjs.Runtime,
+    ctx: *qjs.Context,
+    fun_val_in: qjs.Value,
+    budget: *Budget,
+    pending: *PendingResponse,
+) RunError!c.JSValue {
+    const mod_def_ptr: ?*c.JSModuleDef = @ptrCast(@alignCast(fun_val_in.raw.u.ptr));
+
+    var fun_val = fun_val_in;
+    const eval_result = c.JS_EvalFunction(ctx.raw, fun_val.raw);
+    fun_val = undefined;
+    var eval_val: qjs.Value = .{ .raw = eval_result, .ctx = ctx.raw };
+    defer eval_val.deinit();
+
+    if (eval_val.isException()) {
+        pending.exception = ctx.takeExceptionMessage(d.allocator) catch
+            return error.OutOfMemory;
+        if (budgetExpired(budget)) return error.Interrupted;
+        return error.JsException;
+    }
+
+    rt.pumpJobs();
+    if (budgetExpired(budget)) return error.Interrupted;
+
+    if (c.JS_PromiseState(ctx.raw, eval_val.raw) == c.JS_PROMISE_REJECTED) {
+        const reason = c.JS_PromiseResult(ctx.raw, eval_val.raw);
+        defer c.JS_FreeValue(ctx.raw, reason);
+        pending.exception = jsValueToOwned(d.allocator, ctx.raw, reason) catch
+            return error.OutOfMemory;
+        return error.JsException;
+    }
+
+    const ns = c.JS_GetModuleNamespace(ctx.raw, mod_def_ptr);
+    if (c.JS_IsException(ns)) {
+        pending.exception = ctx.takeExceptionMessage(d.allocator) catch
+            return error.OutOfMemory;
+        return error.JsException;
+    }
+    return ns;
+}
+
+const UnwrappedCall = struct {
+    val: c.JSValue,
+    /// Caller must `JS_FreeValue` iff true (promise-fulfilled path
+    /// returns a fresh ref; the not-a-promise path returns a borrow).
+    owns: bool,
+};
+
+/// Steps shared by middleware-call and handler-call: check the call's
+/// return value for a synchronous exception, drain jobs, then unwrap
+/// the (possibly-promise) value. Throws `JsException` with `pending.
+/// exception` populated on either failure mode.
+fn awaitAndUnwrap(
+    d: *Dispatcher,
+    rt: *qjs.Runtime,
+    ctx: *qjs.Context,
+    ret_val: qjs.Value,
+    budget: *Budget,
+    pending: *PendingResponse,
+) RunError!UnwrappedCall {
+    if (ret_val.isException()) {
+        pending.exception = ctx.takeExceptionMessage(d.allocator) catch
+            return error.OutOfMemory;
+        if (budgetExpired(budget)) return error.Interrupted;
+        return error.JsException;
+    }
+
+    rt.pumpJobs();
+    if (budgetExpired(budget)) return error.Interrupted;
+
+    const final = unwrapPromise(ctx.raw, ret_val.raw);
+    if (final.rejected) {
+        pending.exception = jsValueToOwned(d.allocator, ctx.raw, final.val) catch
+            return error.OutOfMemory;
+        c.JS_FreeValue(ctx.raw, final.val);
+        return error.JsException;
+    }
+    return .{ .val = final.val, .owns = final.owns };
+}
+
+/// Populate `pending.body`/`body_is_json` from the handler's return
+/// value, then read `pending.status`/`cookies`/`headers` from the
+/// ambient `response` global.
+fn extractBodyAndMeta(
+    d: *Dispatcher,
+    ctx: *qjs.Context,
+    val: c.JSValue,
+    pending: *PendingResponse,
+) error{OutOfMemory}!void {
+    try bodyFromReturn(d.allocator, ctx.raw, val, &pending.body, &pending.body_is_json);
+    try extractResponseMetadata(d.allocator, ctx.raw, &pending.status, &pending.cookies, &pending.headers);
+}
 
 /// Run `_middlewares/index.mjs`'s `before` export. The middleware sees
 /// the same `globalThis.request` / `globalThis.response` the handler
@@ -503,49 +588,10 @@ fn runMiddleware(
     ctx: *qjs.Context,
     fun_val_in: qjs.Value,
     budget: *Budget,
-    status_out: *i32,
-    body_out: *[]u8,
-    body_is_json_out: *bool,
-    exception_out: *[]u8,
-    cookies_out: *std.ArrayList([]u8),
-    headers_out: *std.ArrayList(ResponseHeader),
-    short_circuit_out: *bool,
+    pending: *PendingResponse,
 ) RunError!void {
-    short_circuit_out.* = false;
-
-    const mod_def_ptr: ?*c.JSModuleDef = @ptrCast(@alignCast(fun_val_in.raw.u.ptr));
-
-    var fun_val = fun_val_in;
-    const eval_result = c.JS_EvalFunction(ctx.raw, fun_val.raw);
-    fun_val = undefined;
-    var eval_val: qjs.Value = .{ .raw = eval_result, .ctx = ctx.raw };
-    defer eval_val.deinit();
-
-    if (eval_val.isException()) {
-        exception_out.* = ctx.takeExceptionMessage(d.allocator) catch
-            return error.OutOfMemory;
-        if (budgetExpired(budget)) return error.Interrupted;
-        return error.JsException;
-    }
-
-    rt.pumpJobs();
-    if (budgetExpired(budget)) return error.Interrupted;
-
-    if (c.JS_PromiseState(ctx.raw, eval_val.raw) == c.JS_PROMISE_REJECTED) {
-        const reason = c.JS_PromiseResult(ctx.raw, eval_val.raw);
-        defer c.JS_FreeValue(ctx.raw, reason);
-        exception_out.* = jsValueToOwned(d.allocator, ctx.raw, reason) catch
-            return error.OutOfMemory;
-        return error.JsException;
-    }
-
-    const ns = c.JS_GetModuleNamespace(ctx.raw, mod_def_ptr);
+    const ns = try evalModule(d, rt, ctx, fun_val_in, budget, pending);
     defer c.JS_FreeValue(ctx.raw, ns);
-    if (c.JS_IsException(ns)) {
-        exception_out.* = ctx.takeExceptionMessage(d.allocator) catch
-            return error.OutOfMemory;
-        return error.JsException;
-    }
 
     const before_fn = c.JS_GetPropertyStr(ctx.raw, ns, "before");
     defer c.JS_FreeValue(ctx.raw, before_fn);
@@ -553,13 +599,13 @@ fn runMiddleware(
         // No `before` export — surface as a 500 rather than silently
         // skipping. A malformed middleware should be loud.
         _ = ctx.takeException();
-        status_out.* = 500;
-        body_out.* = std.fmt.allocPrint(
+        pending.status = 500;
+        pending.body = std.fmt.allocPrint(
             d.allocator,
             "_middlewares/index.mjs must export a `before` function\n",
             .{},
         ) catch return error.OutOfMemory;
-        short_circuit_out.* = true;
+        pending.short_circuit = true;
         return;
     }
 
@@ -567,40 +613,19 @@ fn runMiddleware(
     var ret_val: qjs.Value = .{ .raw = ret, .ctx = ctx.raw };
     defer ret_val.deinit();
 
-    if (ret_val.isException()) {
-        exception_out.* = ctx.takeExceptionMessage(d.allocator) catch
-            return error.OutOfMemory;
-        if (budgetExpired(budget)) return error.Interrupted;
-        return error.JsException;
-    }
-
-    rt.pumpJobs();
-    if (budgetExpired(budget)) return error.Interrupted;
-
-    const final = unwrapPromise(ctx.raw, ret_val.raw);
-    if (final.rejected) {
-        exception_out.* = jsValueToOwned(d.allocator, ctx.raw, final.val) catch
-            return error.OutOfMemory;
-        c.JS_FreeValue(ctx.raw, final.val);
-        return error.JsException;
-    }
-    var final_val: qjs.Value = .{ .raw = final.val, .ctx = ctx.raw };
-    defer if (final.owns) final_val.deinit();
+    const result = try awaitAndUnwrap(d, rt, ctx, ret_val, budget, pending);
+    defer if (result.owns) c.JS_FreeValue(ctx.raw, result.val);
 
     // Undefined / null → middleware passed; handler runs next. Any
     // mutations to globalThis.request and globalThis.response made
     // along the way persist via the shared QJS context.
-    if (c.JS_IsUndefined(final_val.raw) or c.JS_IsNull(final_val.raw)) {
-        return;
-    }
+    if (c.JS_IsUndefined(result.val) or c.JS_IsNull(result.val)) return;
 
     // Otherwise short-circuit: middleware's return value becomes the
     // body, response-global metadata applies as if it were a handler.
-    bodyFromReturn(d.allocator, ctx.raw, final_val.raw, body_out, body_is_json_out) catch
+    extractBodyAndMeta(d, ctx, result.val, pending) catch
         return error.OutOfMemory;
-    extractResponseMetadata(d.allocator, ctx.raw, status_out, cookies_out, headers_out) catch
-        return error.OutOfMemory;
-    short_circuit_out.* = true;
+    pending.short_circuit = true;
 }
 
 /// Evaluate the module top-level, drain jobs, look up `exports[fn]`
@@ -613,58 +638,20 @@ fn runModule(
     d: *Dispatcher,
     rt: *qjs.Runtime,
     ctx: *qjs.Context,
-    state: *globals.DispatchState,
     fun_val_in: qjs.Value,
     request: Request,
     budget: *Budget,
-    status_out: *i32,
-    body_out: *[]u8,
-    body_is_json_out: *bool,
-    exception_out: *[]u8,
-    cookies_out: *std.ArrayList([]u8),
-    headers_out: *std.ArrayList(ResponseHeader),
+    pending: *PendingResponse,
 ) RunError!void {
-    _ = state;
-    const mod_def_ptr: ?*c.JSModuleDef = @ptrCast(@alignCast(fun_val_in.raw.u.ptr));
-
-    var fun_val = fun_val_in;
-    const eval_result = c.JS_EvalFunction(ctx.raw, fun_val.raw);
-    fun_val = undefined;
-    var eval_val: qjs.Value = .{ .raw = eval_result, .ctx = ctx.raw };
-    defer eval_val.deinit();
-
-    if (eval_val.isException()) {
-        exception_out.* = ctx.takeExceptionMessage(d.allocator) catch
-            return error.OutOfMemory;
-        if (budgetExpired(budget)) return error.Interrupted;
-        return error.JsException;
-    }
-
-    rt.pumpJobs();
-    if (budgetExpired(budget)) return error.Interrupted;
-
-    if (c.JS_PromiseState(ctx.raw, eval_val.raw) == c.JS_PROMISE_REJECTED) {
-        const reason = c.JS_PromiseResult(ctx.raw, eval_val.raw);
-        defer c.JS_FreeValue(ctx.raw, reason);
-        exception_out.* = jsValueToOwned(d.allocator, ctx.raw, reason) catch
-            return error.OutOfMemory;
-        return error.JsException;
-    }
-
-    const ns = c.JS_GetModuleNamespace(ctx.raw, mod_def_ptr);
+    const ns = try evalModule(d, rt, ctx, fun_val_in, budget, pending);
     defer c.JS_FreeValue(ctx.raw, ns);
-    if (c.JS_IsException(ns)) {
-        exception_out.* = ctx.takeExceptionMessage(d.allocator) catch
-            return error.OutOfMemory;
-        return error.JsException;
-    }
 
     // ── Resolve fn name + args JSON from the request. ─────────────
     var dispatch = parseDispatch(d.allocator, request) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.BadRequest => {
-            status_out.* = 400;
-            body_out.* = std.fmt.allocPrint(d.allocator,
+            pending.status = 400;
+            pending.body = std.fmt.allocPrint(d.allocator,
                 "RPC envelope: `fn` must be a string and `args` must be an array\n", .{}) catch return error.OutOfMemory;
             return;
         },
@@ -678,8 +665,8 @@ fn runModule(
     const handler = c.JS_GetPropertyStr(ctx.raw, ns, fn_name_z.ptr);
     defer c.JS_FreeValue(ctx.raw, handler);
     if (c.JS_IsException(handler) or !c.JS_IsFunction(ctx.raw, handler)) {
-        status_out.* = 404;
-        body_out.* = std.fmt.allocPrint(
+        pending.status = 404;
+        pending.body = std.fmt.allocPrint(
             d.allocator,
             "module export \"{s}\" not found or not a function\n",
             .{dispatch.fn_name},
@@ -707,8 +694,8 @@ fn runModule(
     );
     defer c.JS_FreeValue(ctx.raw, args_arr);
     if (c.JS_IsException(args_arr)) {
-        status_out.* = 400;
-        body_out.* = std.fmt.allocPrint(d.allocator, "args JSON parse failed\n", .{}) catch
+        pending.status = 400;
+        pending.body = std.fmt.allocPrint(d.allocator, "args JSON parse failed\n", .{}) catch
             return error.OutOfMemory;
         _ = ctx.takeException();
         return;
@@ -739,31 +726,12 @@ fn runModule(
     var ret_val: qjs.Value = .{ .raw = ret, .ctx = ctx.raw };
     defer ret_val.deinit();
 
-    if (ret_val.isException()) {
-        exception_out.* = ctx.takeExceptionMessage(d.allocator) catch
-            return error.OutOfMemory;
-        if (budgetExpired(budget)) return error.Interrupted;
-        return error.JsException;
-    }
-
-    rt.pumpJobs();
-    if (budgetExpired(budget)) return error.Interrupted;
-
-    const final = unwrapPromise(ctx.raw, ret_val.raw);
-    if (final.rejected) {
-        exception_out.* = jsValueToOwned(d.allocator, ctx.raw, final.val) catch
-            return error.OutOfMemory;
-        c.JS_FreeValue(ctx.raw, final.val);
-        return error.JsException;
-    }
-    var final_val: qjs.Value = .{ .raw = final.val, .ctx = ctx.raw };
-    defer if (final.owns) final_val.deinit();
+    const result = try awaitAndUnwrap(d, rt, ctx, ret_val, budget, pending);
+    defer if (result.owns) c.JS_FreeValue(ctx.raw, result.val);
 
     // Body from return value. Status / cookies from the ambient
     // `response` global.
-    bodyFromReturn(d.allocator, ctx.raw, final_val.raw, body_out, body_is_json_out) catch
-        return error.OutOfMemory;
-    extractResponseMetadata(d.allocator, ctx.raw, status_out, cookies_out, headers_out) catch
+    extractBodyAndMeta(d, ctx, result.val, pending) catch
         return error.OutOfMemory;
 }
 
@@ -1340,36 +1308,29 @@ fn resolveSpecifier(base: []const u8, specifier: []const u8, scratch: []u8) []co
 fn finishResponse(
     d: *Dispatcher,
     state: *globals.DispatchState,
-    status: i32,
-    body_buf: []u8,
-    body_is_json: bool,
-    exception_msg: []u8,
+    pending: *PendingResponse,
     console_buf: *std.ArrayList(u8),
-    cookies: *std.ArrayList([]u8),
-    headers: *std.ArrayList(ResponseHeader),
 ) DispatchError!Response {
     if (state.pending_kv_error) |err| {
         d.last_kv_error = err;
-        d.allocator.free(body_buf);
-        d.allocator.free(exception_msg);
+        // pending.deinit fires via the caller's errdefer when we
+        // return an error — don't double-free here.
         console_buf.deinit(d.allocator);
-        // Cookies + headers get cleaned up by the caller's errdefer
-        // when we return an error from here — don't double-free.
         return DispatchError.KvFailed;
     }
 
     const console_bytes = console_buf.toOwnedSlice(d.allocator) catch
         return DispatchError.OutOfMemory;
 
-    const set_cookies = cookies.toOwnedSlice(d.allocator) catch
+    const set_cookies = pending.cookies.toOwnedSlice(d.allocator) catch
         return DispatchError.OutOfMemory;
 
-    const headers_slice = headers.toOwnedSlice(d.allocator) catch
+    const headers_slice = pending.headers.toOwnedSlice(d.allocator) catch
         return DispatchError.OutOfMemory;
 
     // If the handler explicitly set content-type in response.headers,
     // suppress our auto-stamped JSON one so the handler's choice wins.
-    var effective_body_is_json = body_is_json;
+    var effective_body_is_json = pending.body_is_json;
     if (effective_body_is_json) {
         for (headers_slice) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
@@ -1380,11 +1341,11 @@ fn finishResponse(
     }
 
     return .{
-        .status = status,
-        .body = body_buf,
+        .status = pending.status,
+        .body = pending.body,
         .body_is_json = effective_body_is_json,
         .console = console_bytes,
-        .exception = exception_msg,
+        .exception = pending.exception,
         .set_cookies = set_cookies,
         .headers = headers_slice,
     };
