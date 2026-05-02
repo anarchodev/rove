@@ -203,12 +203,28 @@
   // specifier shape so the importmap can resolve them — relative
   // imports against blob URLs would resolve to gibberish otherwise.
   //
-  // The import-rewrite is regex-based: matches `import "..."` and
-  // `import ... from "..."` at the top of the source. Doesn't catch
-  // dynamic `import(expr)` (handled at runtime, would need executable
-  // string mapping) or imports inside template literals / comments.
-  // For beta-scope handler patterns this is sufficient; documented
-  // limitation otherwise.
+  // The rewriter uses a single-pass JS lexer (below) that correctly
+  // skips lexical contexts where an `import` keyword is hidden:
+  // line + block comments, string literals (single + double),
+  // template literals (including `${...}` expressions, recursively),
+  // and regex literals (with the `/` ambiguity disambiguated via
+  // last-significant-token tracking).
+  //
+  // Output is a list of `{start, end, original}` records — byte
+  // offsets into the source identifying each specifier (excluding
+  // the surrounding quotes). The rewriter applies edits in
+  // reverse-offset order so earlier offsets stay valid; alongside,
+  // a future source-map pass can record the
+  // `original_offset → rewritten_offset` mapping without
+  // re-tokenizing. (Zero source maps generated today; the structure
+  // is set up so adding them is a localized change.)
+  //
+  // Known gaps (deferred until a customer hits one):
+  //   - HTML-style comments `<!-- -->` (legacy ES, never valid in
+  //     modules).
+  //   - JSX (`<Foo />` confuses `/` as regex vs. tag close). Loop46
+  //     handlers don't ship JSX directly; pre-compiled JSX is fine.
+  //   - Hashbang `#!` line at file start (uncommon in handlers).
 
   /// Resolve a relative specifier (`./x`, `../x`) against the
   /// importing module's path into a canonical deployment-relative
@@ -232,17 +248,312 @@
     return dir ? dir + "/" + rest : rest;
   }
 
-  /// Rewrite static `import` statements in `source` to use a stable
-  /// `loop46-replay/<resolved>` bare specifier the iframe importmap
-  /// can resolve. Catches the four common forms — `import "x"`,
-  /// `import default from "x"`, `import { ... } from "x"`,
-  /// `import * as m from "x"` — plus `export ... from "x"`.
+  // ── JS lexer for import-specifier discovery ─────────────────────
+
+  const REGEX_PREFIX_KEYWORDS = new Set([
+    "return", "typeof", "instanceof", "in", "of", "delete", "void",
+    "throw", "new", "case", "do", "else", "yield", "await", "if",
+    "while", "for", "switch", "catch", "finally", "try",
+  ]);
+  const NO_FROM_EXPORT_KEYWORDS = new Set([
+    "const", "let", "var", "function", "class", "default",
+    "async", "interface", "type", "enum",
+  ]);
+
+  function isIdStart(c) {
+    return (c >= 0x61 && c <= 0x7a) || (c >= 0x41 && c <= 0x5a) ||
+      c === 0x5f /* _ */ || c === 0x24 /* $ */;
+  }
+  function isIdContinue(c) {
+    return isIdStart(c) || (c >= 0x30 && c <= 0x39);
+  }
+  function isDecDigit(c) { return c >= 0x30 && c <= 0x39; }
+
+  /// Find every static `import`/`export ... from` and dynamic
+  /// `import(...)` specifier in `source`. Returns
+  /// `[{start, end, specifier}, ...]` where `start`/`end` are byte
+  /// offsets BETWEEN the surrounding quotes (i.e. `source.slice(
+  /// start, end) === specifier`).
+  function findImportSpecifiers(source) {
+    const len = source.length;
+    const out = [];
+    let pos = 0;
+    let canRegex = true;
+    // Stack of brace depths for active `${...}` template expressions.
+    // While the top-of-stack is non-empty, we're "inside an
+    // expression that's inside a template literal." Closing brace
+    // that brings the depth to 0 returns us to template-text mode.
+    const tplExprStack = [];
+
+    function skipLineComment() {
+      pos += 2;
+      while (pos < len && source.charCodeAt(pos) !== 0x0a) pos++;
+    }
+    function skipBlockComment() {
+      pos += 2;
+      while (pos + 1 < len) {
+        if (source.charCodeAt(pos) === 0x2a && source.charCodeAt(pos + 1) === 0x2f) {
+          pos += 2;
+          return;
+        }
+        pos++;
+      }
+      pos = len;
+    }
+    function skipTrivia() {
+      while (pos < len) {
+        const c = source.charCodeAt(pos);
+        if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) { pos++; continue; }
+        if (c === 0x2f && pos + 1 < len) {
+          const c1 = source.charCodeAt(pos + 1);
+          if (c1 === 0x2f) { skipLineComment(); continue; }
+          if (c1 === 0x2a) { skipBlockComment(); continue; }
+        }
+        break;
+      }
+    }
+    function skipString(quote) {
+      pos++;
+      while (pos < len) {
+        const c = source.charCodeAt(pos);
+        if (c === 0x5c) { pos += 2; continue; }
+        if (c === quote) { pos++; return; }
+        if (c === 0x0a) return; // unterminated; bail
+        pos++;
+      }
+    }
+    function readStringSpecAt(p) {
+      if (p >= len) return null;
+      const q = source.charCodeAt(p);
+      if (q !== 0x22 && q !== 0x27) return null;
+      let i = p + 1;
+      const start = i;
+      while (i < len) {
+        const c = source.charCodeAt(i);
+        if (c === 0x5c) { i += 2; continue; }
+        if (c === q) {
+          return { start, end: i, specifier: source.slice(start, i) };
+        }
+        if (c === 0x0a) return null;
+        i++;
+      }
+      return null;
+    }
+    function skipRegex() {
+      pos++;
+      let inClass = false;
+      while (pos < len) {
+        const c = source.charCodeAt(pos);
+        if (c === 0x5c) { pos += 2; continue; }
+        if (c === 0x5b) { inClass = true; pos++; continue; }
+        if (c === 0x5d) { inClass = false; pos++; continue; }
+        if (c === 0x2f && !inClass) { pos++; break; }
+        if (c === 0x0a) return;
+        pos++;
+      }
+      // regex flags
+      while (pos < len && isIdContinue(source.charCodeAt(pos))) pos++;
+    }
+    /// Enter template-literal text mode at `pos` (currently on the
+    /// backtick or after a ${...} closer). Walks until the closing
+    /// backtick OR a `${`, in which case we push onto the
+    /// `tplExprStack` and let the main loop scan the embedded
+    /// expression — when its matching `}` lands, we'll re-enter
+    /// here for the rest of the template.
+    function skipTemplateText(opening) {
+      if (opening) pos++;  // consume the opening backtick
+      while (pos < len) {
+        const c = source.charCodeAt(pos);
+        if (c === 0x5c) { pos += 2; continue; }
+        if (c === 0x60) { pos++; return; }  // closing backtick
+        if (c === 0x24 && pos + 1 < len && source.charCodeAt(pos + 1) === 0x7b) {
+          // ${  — enter expression context
+          pos += 2;
+          tplExprStack.push(0);
+          return;
+        }
+        pos++;
+      }
+    }
+    function skipNumber() {
+      pos++;
+      while (pos < len) {
+        const c = source.charCodeAt(pos);
+        const isHexDig = (c >= 0x30 && c <= 0x39) ||
+          (c >= 0x61 && c <= 0x66) || (c >= 0x41 && c <= 0x46);
+        if (isHexDig || c === 0x2e || c === 0x65 || c === 0x45 ||
+            c === 0x6e /* n */ || c === 0x5f /* _ */ ||
+            c === 0x78 || c === 0x58 || c === 0x6f || c === 0x4f ||
+            c === 0x62 || c === 0x42 || c === 0x70 || c === 0x50) {
+          pos++;
+        } else break;
+      }
+    }
+    function handleImportKeyword() {
+      // Two cases:
+      //   `import(spec)` — dynamic
+      //   `import [clause] [from] "spec"` — static
+      const before = pos;
+      skipTrivia();
+      if (pos >= len) return;
+      if (source.charCodeAt(pos) === 0x28 /* ( */) {
+        pos++;  // consume `(`
+        skipTrivia();
+        const spec = readStringSpecAt(pos);
+        if (spec) out.push(spec);
+        // Don't consume past the `)`; the main loop will continue
+        // with `pos` left pointing into the parens. canRegex stays
+        // true (after `(` we expect an expression).
+        canRegex = true;
+        return;
+      }
+      // Static. `import "x"` (bare side-effect) or `import ... from "x"`.
+      const direct = readStringSpecAt(pos);
+      if (direct) {
+        out.push(direct);
+        pos = direct.end + 1; // skip past closing quote
+        canRegex = false;
+        return;
+      }
+      // Walk until `from` keyword (skipping clause that may have
+      // `{...}` and string literals that mustn't be matched as the
+      // specifier — this happens with import attributes like
+      // `import x from "./y" with { type: "json" }` though attrs
+      // come AFTER the specifier, not before).
+      let depth = 0;
+      while (pos < len) {
+        skipTrivia();
+        if (pos >= len) break;
+        const c = source.charCodeAt(pos);
+        if (c === 0x3b /* ; */) return;
+        if (c === 0x7b) { depth++; pos++; continue; }
+        if (c === 0x7d) { depth--; pos++; continue; }
+        if (c === 0x22 || c === 0x27) { skipString(c); continue; }
+        if (depth === 0 && isIdStart(c)) {
+          const wStart = pos;
+          pos++;
+          while (pos < len && isIdContinue(source.charCodeAt(pos))) pos++;
+          if (source.slice(wStart, pos) === "from") {
+            skipTrivia();
+            const s = readStringSpecAt(pos);
+            if (s) {
+              out.push(s);
+              pos = s.end + 1;
+            }
+            canRegex = false;
+            return;
+          }
+          continue;
+        }
+        pos++;
+      }
+      void before;
+    }
+    function handleExportKeyword() {
+      // `export ... from "spec"`. Other `export` forms (default,
+      // const, function, ...) have no specifier; bail when we
+      // hit an indicative keyword.
+      let depth = 0;
+      while (pos < len) {
+        skipTrivia();
+        if (pos >= len) break;
+        const c = source.charCodeAt(pos);
+        if (c === 0x3b) return;
+        if (c === 0x7b) { depth++; pos++; continue; }
+        if (c === 0x7d) { depth--; pos++; continue; }
+        if (c === 0x22 || c === 0x27) { skipString(c); continue; }
+        if (depth === 0 && isIdStart(c)) {
+          const wStart = pos;
+          pos++;
+          while (pos < len && isIdContinue(source.charCodeAt(pos))) pos++;
+          const word = source.slice(wStart, pos);
+          if (word === "from") {
+            skipTrivia();
+            const s = readStringSpecAt(pos);
+            if (s) {
+              out.push(s);
+              pos = s.end + 1;
+            }
+            canRegex = false;
+            return;
+          }
+          if (NO_FROM_EXPORT_KEYWORDS.has(word)) return;
+          continue;
+        }
+        pos++;
+      }
+    }
+
+    while (pos < len) {
+      skipTrivia();
+      if (pos >= len) break;
+      const c = source.charCodeAt(pos);
+
+      // Inside a template-literal expression, `}` at the bottom of
+      // its brace stack closes the ${...} and we resume template
+      // text. Check this BEFORE general punctuator handling.
+      if (c === 0x7d && tplExprStack.length > 0 &&
+          tplExprStack[tplExprStack.length - 1] === 0) {
+        tplExprStack.pop();
+        pos++;
+        skipTemplateText(false);  // resume from after `}`
+        canRegex = false;
+        continue;
+      }
+
+      if (c === 0x22 || c === 0x27) { skipString(c); canRegex = false; continue; }
+      if (c === 0x60) { skipTemplateText(true); canRegex = false; continue; }
+      if (c === 0x2f && canRegex) { skipRegex(); canRegex = false; continue; }
+
+      if (isIdStart(c)) {
+        const wStart = pos;
+        pos++;
+        while (pos < len && isIdContinue(source.charCodeAt(pos))) pos++;
+        const word = source.slice(wStart, pos);
+        if (word === "import") { handleImportKeyword(); continue; }
+        if (word === "export") { handleExportKeyword(); continue; }
+        canRegex = REGEX_PREFIX_KEYWORDS.has(word);
+        continue;
+      }
+
+      if (isDecDigit(c) || (c === 0x2e && pos + 1 < len &&
+          isDecDigit(source.charCodeAt(pos + 1)))) {
+        skipNumber();
+        canRegex = false;
+        continue;
+      }
+
+      // Punctuator. Track brace depth inside any active template
+      // expression so we know when ${...} closes.
+      if (tplExprStack.length > 0) {
+        if (c === 0x7b) tplExprStack[tplExprStack.length - 1]++;
+        else if (c === 0x7d) tplExprStack[tplExprStack.length - 1]--;
+      }
+      // After operands (`)`/`]`/`}`), `/` is division. After
+      // operators / open-bracket / comma / etc., it's a regex.
+      canRegex = !(c === 0x29 || c === 0x5d || c === 0x7d);
+      pos++;
+    }
+
+    return out;
+  }
+
+  /// Apply edits to `source`, replacing each found specifier with
+  /// `loop46-replay/<resolved>`. Edits are applied in reverse-offset
+  /// order so earlier offsets remain valid through the rewrite. The
+  /// edit list is the substrate for a future source-map pass: each
+  /// edit records `original_offset` and `length_delta` so a mapping
+  /// from rewritten offset to original offset can be derived
+  /// without re-tokenizing.
   function rewriteImports(source, modulePath) {
-    const re = /(\b(?:import|export)\b[^"';\n]*?\bfrom\s*['"]|\bimport\s*['"])([^"']+)(['"])/g;
-    return source.replace(re, (_match, pre, spec, post) => {
-      const resolved = resolveRelative(modulePath, spec);
-      return pre + "loop46-replay/" + resolved + post;
-    });
+    const specs = findImportSpecifiers(source);
+    let out = source;
+    for (let i = specs.length - 1; i >= 0; i--) {
+      const s = specs[i];
+      const replacement = "loop46-replay/" + resolveRelative(modulePath, s.specifier);
+      out = out.slice(0, s.start) + replacement + out.slice(s.end);
+    }
+    return out;
   }
 
   function buildIframeSrcdoc(bundle, parsedTapes) {
@@ -557,9 +868,16 @@ function installStubs(tapes) {
 
   // Ambient request / response globals. Body comes in via the same
   // `replay:tapes` message — the iframe materializes a JS string
-  // from the captured bytes (UTF-8 decode with replacement chars
-  // for any invalid sequences, matching how QJS hands bytes to the
-  // handler via JS_NewStringLen).
+  // from the captured bytes via UTF-8 decode with replacement chars
+  // for invalid sequences. This MATCHES production: QJS's
+  // JS_NewStringLen runs the bytes through utf8_decode_buf16 whose
+  // own comment says "encoding errors are converted as 0xFFFD and
+  // use a single byte" (vendor/quickjs-ng/cutils.h). So a handler
+  // that receives a non-UTF-8 byte already lost it in production —
+  // replay sees the same lossy string. If handlers ever need
+  // byte-precise binary access, that's a NEW api (request.bodyBytes
+  // returning Uint8Array via QJS typed-array bindings), not a
+  // replay-shell fix.
   window.request = Object.assign({}, META.request);
   if (tapes.body_bytes) {
     window.request.body = new TextDecoder("utf-8", { fatal: false }).decode(tapes.body_bytes);
