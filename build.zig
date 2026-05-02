@@ -113,18 +113,28 @@ pub fn build(b: *std.Build) void {
     log_mod.addImport("rove-kv", kv_mod);
     log_mod.addImport("rove-blob", blob_mod);
 
-    // ── rove-tape: deterministic replay capture ──
+    // ── rove-tape: deterministic replay capture + replay bundle ──
     //
     // Phase 4. Per-channel append-only tapes (kv, date, math_random,
     // crypto_random, module) that serialize to self-describing blobs.
     // The worker attaches tape references to each LogRecord; replay
     // reads them back via `parse` and feeds them to instrumented
-    // globals. No deps beyond std.
+    // globals.
+    //
+    // `bundle.zig` (PLAN §10.12) renders a single request_id's log
+    // record + captured tapes as the JSON document the browser-side
+    // replay harness consumes. That brings rove-log + rove-blob in as
+    // deps — bundle reads the LogRecord and fetches tape blobs.
     const tape_mod = b.addModule("rove-tape", .{
         .root_source_file = b.path("src/tape/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    tape_mod.addImport("rove-log", log_mod);
+    tape_mod.addImport("rove-blob", blob_mod);
+    // rove-kv is only used in bundle.zig's tests (to open a fresh
+    // LogStore). Production bundle code never touches kv directly.
+    tape_mod.addImport("rove-kv", kv_mod);
 
     // ── rove-qjs: quickjs-ng wrapper + snapshot machinery ──
     //
@@ -361,6 +371,17 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(f.path),
         });
     }
+    // Replay tenant bundle — `__replay__` serves the tape-replay
+    // browser page at `replay.{public_suffix}` (PLAN §10.12). The
+    // shell receives a bundle from the dashboard via postMessage,
+    // parses captured tapes, and runs the handler in a sandboxed
+    // iframe so the user can step through under F12 DevTools.
+    loop46_mod.addAnonymousImport("replay_index_html", .{
+        .root_source_file = b.path("web/replay/index.html"),
+    });
+    loop46_mod.addAnonymousImport("replay_app_js", .{
+        .root_source_file = b.path("web/replay/app.js"),
+    });
     loop46_mod.link_libc = true;
     loop46_mod.linkSystemLibrary("nghttp2", .{});
     loop46_mod.linkSystemLibrary("ssl", .{});

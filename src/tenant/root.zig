@@ -93,6 +93,14 @@ pub const MAX_HOST_LEN: usize = 253; // RFC 1035
 /// Every other instance has `platform = null`.
 pub const ADMIN_INSTANCE_ID = "__admin__";
 
+/// Reserved tenant id for the tape-replay browser page (PLAN §10.12).
+/// Bootstrapped as a regular instance — no `platform` capability, no
+/// special dispatch path. The only platform-special bit is the
+/// `replay.{public_suffix}` host alias added in `bootstrapTenants`,
+/// which routes the well-known host straight at this tenant via the
+/// existing `assignDomain` machinery.
+pub const REPLAY_INSTANCE_ID = "__replay__";
+
 pub const InstanceList = struct {
     ids: [][]u8,
     allocator: std.mem.Allocator,

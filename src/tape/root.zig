@@ -62,6 +62,11 @@
 
 const std = @import("std");
 
+/// Replay-bundle JSON renderer (PLAN §10.12). Composes `tape.parse`
+/// with rove-log's `LogRecord` + rove-blob's `BlobStore` to render the
+/// document the browser-side replay harness consumes.
+pub const bundle = @import("bundle.zig");
+
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 pub const VERSION: u16 = 1;
 
@@ -90,6 +95,20 @@ pub const KvOp = enum(u8) {
     get = 0,
     set = 1,
     delete = 2,
+    /// `kv.prefix(prefix, cursor, limit) → [...]`. The captured entry
+    /// holds the inputs (prefix, cursor, limit) AND the full result
+    /// list — replay needs all of them: the inputs to validate the
+    /// handler called with the same arguments, the results to feed
+    /// back to the handler. Replay-determinism failures here usually
+    /// indicate handler-source drift since capture, not platform bugs.
+    prefix = 3,
+};
+
+/// One row returned by a `kv.prefix(...)` scan, captured inside a
+/// `KvEntry` with `op = .prefix`.
+pub const KvPair = struct {
+    key: []const u8,
+    value: []const u8,
 };
 
 /// Single captured event. Owned storage: the `Tape` that holds this
@@ -103,12 +122,25 @@ pub const Entry = union(Channel) {
 
     pub const KvEntry = struct {
         op: KvOp,
+        outcome: KvOutcome,
+        /// For `.get`/`.set`/`.delete`: the key passed to the handler.
+        /// For `.prefix`: the prefix string scanned.
         key: []const u8,
         /// For `.get .ok` this is the value read; for `.set` it is the
         /// value written; for `.delete` + `.not_found` + `.err` it is
-        /// empty.
+        /// empty. For `.prefix`: empty (the input cursor is in `cursor`,
+        /// the rows are in `results`).
         value: []const u8,
-        outcome: KvOutcome,
+        /// `.prefix` only: the input cursor (empty for the first page).
+        cursor: []const u8 = "",
+        /// `.prefix` only: the requested page-size cap.
+        limit: u32 = 0,
+        /// `.prefix` only: the rows the scan returned. Up to `limit`
+        /// entries; empty when the scan found nothing AND the outcome
+        /// was `.ok`. Owning storage matches the rest of the entry —
+        /// each pair's `key`/`value` lives in the tape allocator (write
+        /// side) or the parsed-tape backing buffer (read side).
+        results: []const KvPair = &.{},
     };
 
     pub const DateEntry = struct {
@@ -165,7 +197,9 @@ pub const Tape = struct {
     }
 
     /// Append a kv event. Dups `key` + `value` into tape-owned storage
-    /// so the caller's buffers can go away.
+    /// so the caller's buffers can go away. NOT for `.prefix` —
+    /// callers use `appendKvPrefix` for that, since prefix carries a
+    /// list of result rows the flat (key, value) shape can't express.
     pub fn appendKv(
         self: *Tape,
         op: KvOp,
@@ -174,6 +208,7 @@ pub const Tape = struct {
         outcome: KvOutcome,
     ) !void {
         std.debug.assert(self.channel == .kv);
+        std.debug.assert(op != .prefix);
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
         const val_copy = try self.allocator.dupe(u8, value);
@@ -185,6 +220,59 @@ pub const Tape = struct {
             .outcome = outcome,
         } });
         self.owned_bytes += key_copy.len + val_copy.len;
+    }
+
+    /// Append a `kv.prefix(prefix, cursor, limit)` scan capture. Dups
+    /// every input string and every result pair's bytes into tape
+    /// storage. `results` may be empty (no rows matched).
+    pub fn appendKvPrefix(
+        self: *Tape,
+        prefix: []const u8,
+        cursor: []const u8,
+        limit: u32,
+        results: []const KvPair,
+        outcome: KvOutcome,
+    ) !void {
+        std.debug.assert(self.channel == .kv);
+
+        const prefix_copy = try self.allocator.dupe(u8, prefix);
+        errdefer self.allocator.free(prefix_copy);
+        const cursor_copy = try self.allocator.dupe(u8, cursor);
+        errdefer self.allocator.free(cursor_copy);
+
+        const results_slab = try self.allocator.alloc(KvPair, results.len);
+        // Tracks how many slab entries already have allocated bytes,
+        // so we can roll back cleanly on a mid-loop dup failure.
+        var initialized: usize = 0;
+        errdefer {
+            for (results_slab[0..initialized]) |p| {
+                self.allocator.free(p.key);
+                self.allocator.free(p.value);
+            }
+            self.allocator.free(results_slab);
+        }
+        var owned_added: usize = prefix_copy.len + cursor_copy.len;
+        for (results, 0..) |p, i| {
+            const k = try self.allocator.dupe(u8, p.key);
+            const v = self.allocator.dupe(u8, p.value) catch |err| {
+                self.allocator.free(k);
+                return err;
+            };
+            results_slab[i] = .{ .key = k, .value = v };
+            initialized = i + 1;
+            owned_added += k.len + v.len;
+        }
+
+        try self.entries.append(self.allocator, .{ .kv = .{
+            .op = .prefix,
+            .outcome = outcome,
+            .key = prefix_copy,
+            .value = "",
+            .cursor = cursor_copy,
+            .limit = limit,
+            .results = results_slab,
+        } });
+        self.owned_bytes += owned_added;
     }
 
     pub fn appendDate(self: *Tape, ms_epoch: i64) !void {
@@ -288,8 +376,15 @@ pub const ParsedTape = struct {
     /// The original bytes. Every `[]const u8` inside `entries` points
     /// into this buffer, so it must outlive the parsed tape.
     backing: []u8,
+    /// One slab per `kv.prefix` entry in the tape — the per-result
+    /// `KvPair` array (each pair's bytes still point into `backing`,
+    /// just the slab itself needs heap storage). Empty for tapes
+    /// without prefix entries, which is the common case.
+    aux: std.ArrayList([]KvPair),
 
     pub fn deinit(self: *ParsedTape) void {
+        for (self.aux.items) |slab| self.allocator.free(slab);
+        self.aux.deinit(self.allocator);
         self.allocator.free(self.entries);
         self.allocator.free(self.backing);
         self.* = undefined;
@@ -324,6 +419,12 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!ParsedT
     const entries = allocator.alloc(Entry, count) catch return ParseError.OutOfMemory;
     errdefer allocator.free(entries);
 
+    var aux: std.ArrayList([]KvPair) = .empty;
+    errdefer {
+        for (aux.items) |slab| allocator.free(slab);
+        aux.deinit(allocator);
+    }
+
     var cur: usize = 12;
     var i: u32 = 0;
     while (i < count) : (i += 1) {
@@ -333,7 +434,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!ParsedT
         if (cur + elen > backing.len) return ParseError.Truncated;
         const slice = backing[cur .. cur + elen];
         cur += elen;
-        entries[i] = try decodeEntry(channel, slice);
+        entries[i] = try decodeEntry(allocator, &aux, channel, slice);
     }
 
     return .{
@@ -341,6 +442,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!ParsedT
         .channel = channel,
         .entries = entries,
         .backing = backing,
+        .aux = aux,
     };
 }
 
@@ -351,6 +453,14 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
         .kv => |*k| {
             allocator.free(k.key);
             allocator.free(k.value);
+            if (k.op == .prefix) {
+                allocator.free(k.cursor);
+                for (k.results) |p| {
+                    allocator.free(p.key);
+                    allocator.free(p.value);
+                }
+                allocator.free(k.results);
+            }
         },
         .date, .math_random => {},
         .crypto_random => |*c| allocator.free(c.bytes),
@@ -392,7 +502,21 @@ fn encodeEntry(
             try buf.append(allocator, @intFromEnum(k.op));
             try buf.append(allocator, @intFromEnum(k.outcome));
             try appendLenPrefixed(allocator, buf, k.key);
-            try appendLenPrefixed(allocator, buf, k.value);
+            if (k.op == .prefix) {
+                try appendLenPrefixed(allocator, buf, k.cursor);
+                var limit_be: [4]u8 = undefined;
+                std.mem.writeInt(u32, &limit_be, k.limit, .big);
+                try buf.appendSlice(allocator, &limit_be);
+                var count_be: [4]u8 = undefined;
+                std.mem.writeInt(u32, &count_be, @intCast(k.results.len), .big);
+                try buf.appendSlice(allocator, &count_be);
+                for (k.results) |p| {
+                    try appendLenPrefixed(allocator, buf, p.key);
+                    try appendLenPrefixed(allocator, buf, p.value);
+                }
+            } else {
+                try appendLenPrefixed(allocator, buf, k.value);
+            }
         },
         .date => |d| {
             var be: [8]u8 = undefined;
@@ -414,7 +538,12 @@ fn encodeEntry(
     }
 }
 
-fn decodeEntry(channel: Channel, bytes: []const u8) ParseError!Entry {
+fn decodeEntry(
+    allocator: std.mem.Allocator,
+    aux: *std.ArrayList([]KvPair),
+    channel: Channel,
+    bytes: []const u8,
+) ParseError!Entry {
     var cur: usize = 0;
     switch (channel) {
         .kv => {
@@ -425,6 +554,32 @@ fn decodeEntry(channel: Channel, bytes: []const u8) ParseError!Entry {
                 return ParseError.UnknownChannel;
             cur = 2;
             const key = try readLenPrefixed(bytes, &cur);
+            if (op == .prefix) {
+                const cursor = try readLenPrefixed(bytes, &cur);
+                if (cur + 8 > bytes.len) return ParseError.Truncated;
+                const limit = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+                cur += 4;
+                const count = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+                cur += 4;
+                const slab = allocator.alloc(KvPair, count) catch return ParseError.OutOfMemory;
+                aux.append(allocator, slab) catch {
+                    allocator.free(slab);
+                    return ParseError.OutOfMemory;
+                };
+                for (slab) |*p| {
+                    p.key = try readLenPrefixed(bytes, &cur);
+                    p.value = try readLenPrefixed(bytes, &cur);
+                }
+                return .{ .kv = .{
+                    .op = .prefix,
+                    .outcome = outcome,
+                    .key = key,
+                    .value = "",
+                    .cursor = cursor,
+                    .limit = limit,
+                    .results = slab,
+                } };
+            }
             const value = try readLenPrefixed(bytes, &cur);
             return .{ .kv = .{ .op = op, .outcome = outcome, .key = key, .value = value } };
         },
@@ -485,6 +640,60 @@ test "kv tape: roundtrip with mixed ops and outcomes" {
     try testing.expectEqualStrings("rove", parsed.entries[2].kv.value);
     try testing.expectEqual(KvOp.delete, parsed.entries[3].kv.op);
     try testing.expectEqual(KvOutcome.err, parsed.entries[4].kv.outcome);
+}
+
+test "kv tape: prefix capture round-trips inputs and results" {
+    var tape = Tape.init(testing.allocator, .kv);
+    defer tape.deinit();
+
+    // Mix prefix with simple ops so the parser proves it can read
+    // both shapes from one tape and that the aux slab tracking
+    // doesn't disturb other entry types.
+    try tape.appendKv(.get, "score/alice", "10", .ok);
+    const results = [_]KvPair{
+        .{ .key = "score/alice", .value = "10" },
+        .{ .key = "score/bob", .value = "7" },
+        .{ .key = "score/carol", .value = "13" },
+    };
+    try tape.appendKvPrefix("score/", "", 100, &results, .ok);
+    try tape.appendKvPrefix("missing/", "", 100, &.{}, .ok);
+    try tape.appendKv(.set, "score/dan", "1", .ok);
+
+    const bytes = try tape.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+
+    var parsed = try parse(testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, 4), parsed.entries.len);
+
+    // Simple op survived.
+    try testing.expectEqual(KvOp.get, parsed.entries[0].kv.op);
+    try testing.expectEqualStrings("score/alice", parsed.entries[0].kv.key);
+    try testing.expectEqualStrings("10", parsed.entries[0].kv.value);
+
+    // First prefix entry.
+    const p1 = parsed.entries[1].kv;
+    try testing.expectEqual(KvOp.prefix, p1.op);
+    try testing.expectEqualStrings("score/", p1.key);
+    try testing.expectEqualStrings("", p1.cursor);
+    try testing.expectEqual(@as(u32, 100), p1.limit);
+    try testing.expectEqual(@as(usize, 3), p1.results.len);
+    try testing.expectEqualStrings("score/alice", p1.results[0].key);
+    try testing.expectEqualStrings("10", p1.results[0].value);
+    try testing.expectEqualStrings("score/carol", p1.results[2].key);
+    try testing.expectEqualStrings("13", p1.results[2].value);
+
+    // Empty-result prefix.
+    const p2 = parsed.entries[2].kv;
+    try testing.expectEqual(KvOp.prefix, p2.op);
+    try testing.expectEqualStrings("missing/", p2.key);
+    try testing.expectEqual(@as(usize, 0), p2.results.len);
+
+    // Trailing simple op survived.
+    try testing.expectEqual(KvOp.set, parsed.entries[3].kv.op);
+    try testing.expectEqualStrings("score/dan", parsed.entries[3].kv.key);
+    try testing.expectEqualStrings("1", parsed.entries[3].kv.value);
 }
 
 test "date tape: roundtrip preserves exact ms" {

@@ -112,6 +112,7 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
             <th>Status</th>
             <th>Duration</th>
             <th>Outcome</th>
+            <th></th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -171,7 +172,7 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
       if (!append && records.length === 0) {
         const tr = document.createElement("tr");
         tr.className = "empty";
-        tr.innerHTML = `<td colspan="7"><em>no requests logged yet</em></td>`;
+        tr.innerHTML = `<td colspan="8"><em>no requests logged yet</em></td>`;
         tbody.appendChild(tr);
       } else {
         for (const r of records) tbody.appendChild(buildRow(r));
@@ -208,15 +209,55 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
       <td class="status status-${statusClass(r.status)}">${r.status}</td>
       <td class="duration">${formatDuration(r.duration_ns)}</td>
       <td class="outcome outcome-${escapeHtml(r.outcome)}">${escapeHtml(r.outcome)}</td>
+      <td class="actions">
+        <button type="button" class="row-act replay" title="Replay this request in a new tab">Replay</button>
+        <button type="button" class="row-act copy-id" title="Copy request ID">⎘</button>
+      </td>
     `;
-    tr.addEventListener("click", () => openDrawer(r.request_id));
+    tr.addEventListener("click", (ev) => {
+      // Don't open the drawer when clicking row-action buttons.
+      if (ev.target.closest(".row-act")) return;
+      openDrawer(r.request_id);
+    });
     tr.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter" || ev.key === " ") {
         ev.preventDefault();
         openDrawer(r.request_id);
       }
     });
+    tr.querySelector(".replay").addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      void replayRequest(r.request_id, ev.currentTarget);
+    });
+    tr.querySelector(".copy-id").addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const btn = ev.currentTarget;
+      try {
+        await navigator.clipboard.writeText(r.request_id);
+        const orig = btn.textContent;
+        btn.textContent = "✓";
+        setTimeout(() => { btn.textContent = orig; }, 1200);
+      } catch (err) {
+        showError("copy failed: " + err.message);
+      }
+    });
     return tr;
+  }
+
+  async function replayRequest(requestId, btn) {
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = "…";
+    clearError();
+    try {
+      const bundle = await api.composeReplayBundle(instanceId, requestId);
+      api.replayOpen(bundle);
+    } catch (err) {
+      showError(`Replay failed: ${err.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = orig;
+    }
   }
 
   async function openDrawer(requestId) {

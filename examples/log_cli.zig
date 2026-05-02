@@ -207,147 +207,18 @@ fn noopCompile(
 
 // ── bundle ─────────────────────────────────────────────────────────────
 //
-// `rove-log-cli bundle` emits a JSON document the browser-side replay
-// harness can consume. Shape:
-//
-//   {
-//     "request_id": "...",
-//     "deployment_id": N,
-//     "received_ns": N,
-//     "duration_ns": N,
-//     "request":  { "method": "...", "path": "...", "host": "..." },
-//     "response": { "status": N, "outcome": "...",
-//                   "console": "...", "exception": "..." },
-//     "entry_source_hash": "..." | null,
-//     "modules": [ {"specifier":"...","source_hash":"..."} ],
-//     "tapes": {
-//       "kv":            { "entries": [...] } | null,
-//       "date":          { "entries": [...] } | null,
-//       "math_random":   { "entries": [...] } | null,
-//       "crypto_random": { "entries": [...] } | null
-//     }
-//   }
-//
-// `entry_source_hash` is the content-addressed source blob the browser
-// must fetch to run the handler. For M1 that's the `DEFAULT_HANDLER_PATH`
-// entry of the deployment manifest in `files.db`; multi-module support
-// will fill `modules` from the module tape later.
+// `rove-log-cli bundle` resolves the deployment's entry-source hash
+// (CLI's concern — files.db lives next to log.db on disk) and delegates
+// the actual JSON formatting to `rove-tape`'s `bundle` module so the
+// same code path serves the worker's `/_system/replay/bundle/{id}`
+// endpoint. Wire shape lives in `src/tape/bundle.zig`.
 
-fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeAll("\"");
-    for (s) |b| {
-        switch (b) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            0...8, 11, 12, 14...0x1f => try w.print("\\u{x:0>4}", .{b}),
-            else => try w.writeByte(b),
-        }
-    }
-    try w.writeAll("\"");
-}
-
-fn writeBase64(w: *std.Io.Writer, bytes: []const u8) !void {
-    const enc = std.base64.standard.Encoder;
-    const buf_len = enc.calcSize(bytes.len);
-    const buf = try std.heap.page_allocator.alloc(u8, buf_len);
-    defer std.heap.page_allocator.free(buf);
-    _ = enc.encode(buf, bytes);
-    try w.writeAll("\"");
-    try w.writeAll(buf);
-    try w.writeAll("\"");
-}
-
-fn emitTapeBlob(
-    w: *std.Io.Writer,
+fn resolveEntrySourceHash(
     allocator: std.mem.Allocator,
-    blob: blob_mod.BlobStore,
-    hash_hex: []const u8,
-    channel: tape_mod.Channel,
-) !void {
-    const bytes = try blob.get(hash_hex, allocator);
-    defer allocator.free(bytes);
-
-    var parsed = try tape_mod.parse(allocator, bytes);
-    defer parsed.deinit();
-    if (parsed.channel != channel) return error.ChannelMismatch;
-
-    try w.print("{{\"hash\":\"{s}\",\"entries\":[", .{hash_hex});
-    for (parsed.entries, 0..) |*e, i| {
-        if (i > 0) try w.writeAll(",");
-        switch (e.*) {
-            .kv => |k| {
-                try w.writeAll("{\"op\":\"");
-                try w.writeAll(@tagName(k.op));
-                try w.writeAll("\",\"outcome\":\"");
-                try w.writeAll(@tagName(k.outcome));
-                try w.writeAll("\",\"key\":");
-                try writeJsonString(w, k.key);
-                try w.writeAll(",\"value\":");
-                try writeJsonString(w, k.value);
-                try w.writeAll("}");
-            },
-            .date => |d| try w.print("{{\"ms\":{d}}}", .{d.ms_epoch}),
-            .math_random => |m| {
-                const f: f64 = @bitCast(m.bits);
-                try w.print("{{\"bits\":\"{x:0>16}\",\"value\":{d}}}", .{ m.bits, f });
-            },
-            .crypto_random => |cr| {
-                try w.writeAll("{\"bytes\":");
-                try writeBase64(w, cr.bytes);
-                try w.writeAll("}");
-            },
-            .module => |m| {
-                try w.writeAll("{\"specifier\":");
-                try writeJsonString(w, m.specifier);
-                try w.writeAll(",\"source_hash\":");
-                try writeJsonString(w, m.source_hash_hex);
-                try w.writeAll("}");
-            },
-        }
-    }
-    try w.writeAll("]}");
-}
-
-fn emitTapeField(
-    w: *std.Io.Writer,
-    allocator: std.mem.Allocator,
-    blob: blob_mod.BlobStore,
-    field_name: []const u8,
-    hash_hex: ?[64]u8,
-    channel: tape_mod.Channel,
-) !void {
-    try w.print(",\"{s}\":", .{field_name});
-    if (hash_hex) |h| {
-        try emitTapeBlob(w, allocator, blob, &h, channel);
-    } else {
-        try w.writeAll("null");
-    }
-}
-
-fn runBundle(
-    allocator: std.mem.Allocator,
-    store: *log_mod.LogStore,
-    log_blob: blob_mod.BlobStore,
     data_dir: []const u8,
     instance: []const u8,
-    request_id: u64,
-) !void {
-    var rec = (try store.get(request_id)) orelse {
-        var stderr_buf: [256]u8 = undefined;
-        var sw = std.fs.File.stderr().writer(&stderr_buf);
-        try sw.interface.print("rove-log-cli: no record with request_id={x}\n", .{request_id});
-        try sw.interface.flush();
-        std.process.exit(1);
-    };
-    defer rec.deinit(allocator);
-
-    // Open the tenant's files.db read-only to resolve the deployment's
-    // entry source hash. Optional — if it fails (tenant has no code
-    // store yet, or deployment was GC'd) we emit null and let the
-    // browser fall back to whatever source cache it has.
+    deployment_id: u64,
+) !?[64]u8 {
     const files_db_path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/{s}/files.db",
@@ -362,74 +233,61 @@ fn runBundle(
     );
     defer allocator.free(files_blob_dir);
 
-    var entry_source_hash_buf: [64]u8 = undefined;
-    var entry_source_hash: ?[]const u8 = null;
-    const files_kv = kv.KvStore.openReadOnly(allocator, files_db_path) catch null;
-    defer if (files_kv) |ck| ck.close();
+    const files_kv = kv.KvStore.openReadOnly(allocator, files_db_path) catch return null;
+    defer files_kv.close();
 
-    if (files_kv) |ck| {
-        var files_blob = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
-        defer files_blob.deinit();
-        var files_store = files_mod.FileStore.init(allocator, ck, files_blob.blobStore(), noopCompile, null);
-        var manifest = files_store.loadDeployment(rec.deployment_id) catch null;
-        if (manifest) |*m| {
-            defer m.deinit();
-            for (m.entries) |e| {
-                if (std.mem.eql(u8, e.path, "index.js")) {
-                    @memcpy(&entry_source_hash_buf, &e.source_hex);
-                    entry_source_hash = &entry_source_hash_buf;
-                    break;
-                }
-            }
-            // No `index.js`? Take the first entry as the entrypoint.
-            if (entry_source_hash == null and m.entries.len > 0) {
-                @memcpy(&entry_source_hash_buf, &m.entries[0].source_hex);
-                entry_source_hash = &entry_source_hash_buf;
-            }
-        }
+    var files_blob = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
+    defer files_blob.deinit();
+    var files_store = files_mod.FileStore.init(allocator, files_kv, files_blob.blobStore(), noopCompile, null);
+    var manifest = files_store.loadDeployment(deployment_id) catch return null;
+    defer manifest.deinit();
+
+    for (manifest.entries) |e| {
+        if (std.mem.eql(u8, e.path, "index.js")) return e.source_hex;
     }
+    if (manifest.entries.len > 0) return manifest.entries[0].source_hex;
+    return null;
+}
+
+fn runBundle(
+    allocator: std.mem.Allocator,
+    store: *log_mod.LogStore,
+    log_blob: blob_mod.BlobStore,
+    data_dir: []const u8,
+    instance: []const u8,
+    request_id: u64,
+) !void {
+    // Peek at the record once to (a) surface NotFound as exit-1 with a
+    // stderr message and (b) grab `deployment_id` to resolve the entry
+    // source hash before delegating the JSON emit. `writeBundle` will
+    // re-read the record itself; the per-record cost is negligible vs.
+    // the SQL+blob work involved in tape decoding.
+    const dep_id = blk: {
+        var rec = (try store.get(request_id)) orelse {
+            var stderr_buf: [256]u8 = undefined;
+            var sw = std.fs.File.stderr().writer(&stderr_buf);
+            try sw.interface.print("rove-log-cli: no record with request_id={x}\n", .{request_id});
+            try sw.interface.flush();
+            std.process.exit(1);
+        };
+        defer rec.deinit(allocator);
+        break :blk rec.deployment_id;
+    };
+
+    const entry_hash = resolveEntrySourceHash(allocator, data_dir, instance, dep_id) catch null;
 
     var stdout_buf: [4096]u8 = undefined;
     var sw = std.fs.File.stdout().writer(&stdout_buf);
     const w = &sw.interface;
 
-    try w.print(
-        "{{\"request_id\":\"{x:0>16}\",\"deployment_id\":{d}," ++
-            "\"received_ns\":{d},\"duration_ns\":{d},",
-        .{ rec.request_id, rec.deployment_id, rec.received_ns, rec.duration_ns },
-    );
-    try w.writeAll("\"request\":{\"method\":");
-    try writeJsonString(w, rec.method);
-    try w.writeAll(",\"path\":");
-    try writeJsonString(w, rec.path);
-    try w.writeAll(",\"host\":");
-    try writeJsonString(w, rec.host);
-    try w.writeAll("},\"response\":{\"status\":");
-    try w.print("{d},\"outcome\":\"{s}\",\"console\":", .{ rec.status, outcomeName(rec.outcome) });
-    try writeJsonString(w, rec.console);
-    try w.writeAll(",\"exception\":");
-    try writeJsonString(w, rec.exception);
-    try w.writeAll("},");
-
-    if (entry_source_hash) |h| {
-        try w.writeAll("\"entry_source_hash\":");
-        try writeJsonString(w, h);
-    } else {
-        try w.writeAll("\"entry_source_hash\":null");
-    }
-    try w.writeAll(",\"modules\":[],\"tapes\":{");
-
-    // First field has no leading comma — emit it without `emitTapeField`.
-    try w.writeAll("\"kv\":");
-    if (rec.tape_refs.kv_tape_hex) |h| {
-        try emitTapeBlob(w, allocator, log_blob, &h, .kv);
-    } else {
-        try w.writeAll("null");
-    }
-    try emitTapeField(w, allocator, log_blob, "date", rec.tape_refs.date_tape_hex, .date);
-    try emitTapeField(w, allocator, log_blob, "math_random", rec.tape_refs.math_random_tape_hex, .math_random);
-    try emitTapeField(w, allocator, log_blob, "crypto_random", rec.tape_refs.crypto_random_tape_hex, .crypto_random);
-    try w.writeAll("}}\n");
+    try tape_mod.bundle.writeBundle(w, .{
+        .allocator = allocator,
+        .log_store = store,
+        .log_blob = log_blob,
+        .request_id = request_id,
+        .entry_source_hash = entry_hash,
+    });
+    try w.writeAll("\n");
     try w.flush();
 }
 

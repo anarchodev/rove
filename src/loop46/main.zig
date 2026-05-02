@@ -558,12 +558,36 @@ fn bootstrapTenants(allocator: std.mem.Allocator, cli: cli_mod.Cli) !void {
     // of band of this binary). The worker discovers them on disk.
     try bootstrapHandler(allocator, cli.data_dir, "__admin__", &ADMIN_DEPLOY_FILES);
 
+    // __replay__ — platform tenant for the tape-replay browser page
+    // (PLAN §10.12). Lives at `replay.{public_suffix}` via an
+    // explicit domain alias; resolveDomain's alias path wins over
+    // the wildcard so a customer signup for the name "replay"
+    // (already blocked at the JS layer's RESERVED_NAMES, defense in
+    // depth) couldn't squat the host even if it slipped through.
+    // The deployed bundle is a static-only placeholder for now —
+    // the actual iframe + stubs library lands as a follow-up deploy
+    // through the existing files API.
+    try tenant.createInstance(tenant_mod.REPLAY_INSTANCE_ID);
+    if (cli.public_suffix) |ps| {
+        const replay_host = try std.fmt.allocPrint(allocator, "replay.{s}", .{ps});
+        defer allocator.free(replay_host);
+        tenant.assignDomain(replay_host, tenant_mod.REPLAY_INSTANCE_ID) catch |err| {
+            failExit(
+                "bootstrap: assignDomain {s} -> __replay__ failed: {s}\n",
+                .{ replay_host, @errorName(err) },
+            );
+        };
+    }
+    try bootstrapHandler(allocator, cli.data_dir, tenant_mod.REPLAY_INSTANCE_ID, &REPLAY_DEPLOY_FILES);
+
     // Prewarm __admin__ + every disk-discovered tenant's app.db +
     // log.db on the main thread so the WAL-mode transition is
     // committed before workers race to open them. Without this,
     // `--workers 8` occasionally kills a worker with
     // `error: JournalMode` because two openers try to upgrade
-    // journal_mode=WAL at the same time.
+    // journal_mode=WAL at the same time. `__replay__` is bootstrap-
+    // created above but isn't in the explicit list — discoverTenantIds
+    // picks it up like any other on-disk tenant.
     const prewarm_ids = try discoverTenantIds(allocator, cli.data_dir);
     defer {
         for (prewarm_ids) |id| allocator.free(id);
@@ -952,6 +976,18 @@ const ADMIN_DEPLOY_FILES = [_]DeployFile{
     .{ .path = "_static/pages/login.js", .content = ADMIN_UI_PAGE_LOGIN, .content_type = "application/javascript" },
     .{ .path = "_static/pages/instances.js", .content = ADMIN_UI_PAGE_INSTANCES, .content_type = "application/javascript" },
     .{ .path = "_static/pages/instance.js", .content = ADMIN_UI_PAGE_INSTANCE, .content_type = "application/javascript" },
+};
+
+// __replay__ tenant bundle. Static-only — the shell uses postMessage
+// to receive the bundle from the dashboard (no worker round-trips
+// from this origin), parses captured tapes in JS, and runs the
+// handler in a sandboxed iframe with stubbed Loop46 globals.
+const REPLAY_INDEX_HTML = @embedFile("replay_index_html");
+const REPLAY_APP_JS = @embedFile("replay_app_js");
+
+const REPLAY_DEPLOY_FILES = [_]DeployFile{
+    .{ .path = "_static/index.html", .content = REPLAY_INDEX_HTML, .content_type = "text/html; charset=utf-8" },
+    .{ .path = "_static/app.js", .content = REPLAY_APP_JS, .content_type = "application/javascript" },
 };
 
 /// Walk `<data_dir>/*` and return every subdirectory containing an

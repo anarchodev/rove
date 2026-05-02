@@ -136,6 +136,7 @@ const RESERVED_NAMES = [
     "__admin__","admin","api","app","www",
     "auth","login","signup","logout","dashboard",
     "static","system","public","root","mail",
+    "__replay__","replay",
 ];
 
 function bytesToHex(bytes) {

@@ -352,4 +352,127 @@ export const api = {
       `/_system/log/${encodeURIComponent(instance_id)}/count`);
     return res.text();
   },
+
+  // ── Replay bundle composer (PLAN §10.12) ────────────────────────
+  //
+  // Builds the bundle the replay shell consumes by fetching the log
+  // record + current deployment manifest + handler source bytes +
+  // captured tape blobs. All fetches use existing /_system/log/* and
+  // /_system/files/* routes (cookie auth, same-origin). The composed
+  // bundle is then handed to the replay shell on `replay.<suffix>`
+  // via postMessage — see `replayOpen` below.
+  //
+  // BETA LIMITATION: uses the CURRENT manifest to resolve the entry
+  // source. If the deployment changed between the original request
+  // and the replay click, the source loaded in the iframe is the
+  // CURRENT source, not the historical one. Source bytes are
+  // content-addressed, so source-by-hash lookup against historical
+  // deployments would work — but the manifest endpoint only exposes
+  // the current deployment today. Acceptable for beta where most
+  // replays target recent failures against the live deployment.
+  async composeReplayBundle(instance_id, request_id_hex) {
+    const inst = encodeURIComponent(instance_id);
+    const rid = encodeURIComponent(request_id_hex);
+
+    const [recordRes, manifestRes] = await Promise.all([
+      rawGet(adminBase(), `/_system/log/${inst}/show/${rid}`),
+      rawGet(adminBase(), `/_system/files/${inst}/list`),
+    ]);
+    const record = await recordRes.json();
+    const manifest = await manifestRes.json();
+
+    // Find the handler entry. PLAN §2.4 says the default export at
+    // `index.mjs` (or `index.js` post-compile) is the catch-all
+    // entrypoint. Fall back to the first .mjs/.js entry if neither
+    // exact name is present.
+    let entryHash = null;
+    let entryPath = null;
+    const entries = manifest.entries || [];
+    for (const e of entries) {
+      if (e.path === "index.mjs" || e.path === "index.js") {
+        entryHash = e.hash; entryPath = e.path; break;
+      }
+    }
+    if (!entryHash) {
+      for (const e of entries) {
+        if (e.kind === "handler" && (e.path.endsWith(".mjs") || e.path.endsWith(".js"))) {
+          entryHash = e.hash; entryPath = e.path; break;
+        }
+      }
+    }
+
+    let entrySource = "";
+    if (entryHash) {
+      const srcRes = await rawGet(adminBase(),
+        `/_system/files/${inst}/source/${encodeURIComponent(entryHash)}`);
+      entrySource = await srcRes.text();
+    }
+
+    // Tape blobs — fetch each non-null hash in parallel and turn the
+    // raw bytes into Uint8Arrays for postMessage's structured-clone
+    // transport. Replay shell parses each blob on the other side.
+    const tapeRefs = {
+      kv: record.tape_refs?.kv_tape_hex || null,
+      date: record.tape_refs?.date_tape_hex || null,
+      math_random: record.tape_refs?.math_random_tape_hex || null,
+      crypto_random: record.tape_refs?.crypto_random_tape_hex || null,
+    };
+    const tapeBlobs = { kv: null, date: null, math_random: null, crypto_random: null };
+    await Promise.all(Object.keys(tapeRefs).map(async (name) => {
+      const hash = tapeRefs[name];
+      if (!hash) return;
+      const r = await rawGet(adminBase(),
+        `/_system/log/${inst}/blob/${encodeURIComponent(hash)}`);
+      const buf = await r.arrayBuffer();
+      tapeBlobs[name] = new Uint8Array(buf);
+    }));
+
+    return {
+      request_id: record.request_id,
+      deployment_id: record.deployment_id,
+      received_ns: record.received_ns,
+      duration_ns: record.duration_ns,
+      request: { method: record.method, path: record.path, host: record.host },
+      response: {
+        status: record.status,
+        outcome: record.outcome,
+        console: record.console,
+        exception: record.exception,
+      },
+      entry_path: entryPath,
+      entry_source_hash: entryHash,
+      entry_source: entrySource,
+      modules: [], // populated once `appendModule` callers land (S2)
+      tape_blobs: tapeBlobs,
+    };
+  },
+
+  /// Open the replay shell in a new tab and send it the bundle via
+  /// postMessage. The shell is at `replay.<suffix>` — derived from
+  /// the dashboard's own origin by replacing the `app.` label.
+  /// Returns the opened window (caller can close it on error).
+  replayOpen(bundle) {
+    const replayOrigin = window.location.origin.replace("://app.", "://replay.");
+    const popup = window.open(replayOrigin + "/", "_blank");
+    if (!popup) {
+      throw new Error("popup blocked — allow popups for the dashboard");
+    }
+    // The shell sends `replay:ready` once it's listening; we reply
+    // with `replay:bundle`. We can't deliver the bundle until then —
+    // postMessage to a not-yet-loaded page is dropped.
+    function onMsg(e) {
+      if (e.origin !== replayOrigin) return;
+      if (e.source !== popup) return;
+      if (e.data?.kind === "replay:ready") {
+        window.removeEventListener("message", onMsg);
+        popup.postMessage({ kind: "replay:bundle", bundle }, replayOrigin);
+      }
+    }
+    window.addEventListener("message", onMsg);
+    // 30s safety net — give up if the shell never reports ready
+    // (popup blocker, navigation away, etc.). At that point the
+    // dashboard has nothing to clean up — user just closes the tab.
+    setTimeout(() => window.removeEventListener("message", onMsg), 30_000);
+    return popup;
+  },
 };

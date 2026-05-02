@@ -422,7 +422,47 @@ fn writeRecordJson(
     try writeJsonString(w, allocator, r.console);
     try w.appendSlice(allocator, ",\"exception\":");
     try writeJsonString(w, allocator, r.exception);
+    try w.appendSlice(allocator, ",\"tape_refs\":");
+    try writeTapeRefs(w, allocator, &r.tape_refs);
     try w.append(allocator, '}');
+}
+
+/// Emit `tape_refs` as a JSON object whose keys match the field
+/// names of `log_mod.TapeRefs` — null for any channel that wasn't
+/// captured. The dashboard's replay-bundle composer reads this to
+/// know which `/_system/log/{inst}/blob/{hash}` calls to make.
+fn writeTapeRefs(
+    w: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    refs: *const log_mod.TapeRefs,
+) !void {
+    try w.append(allocator, '{');
+    try writeTapeRefField(w, allocator, "kv_tape_hex", refs.kv_tape_hex, true);
+    try writeTapeRefField(w, allocator, "date_tape_hex", refs.date_tape_hex, false);
+    try writeTapeRefField(w, allocator, "math_random_tape_hex", refs.math_random_tape_hex, false);
+    try writeTapeRefField(w, allocator, "crypto_random_tape_hex", refs.crypto_random_tape_hex, false);
+    try writeTapeRefField(w, allocator, "module_tree_hex", refs.module_tree_hex, false);
+    try w.append(allocator, '}');
+}
+
+fn writeTapeRefField(
+    w: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    value: ?[64]u8,
+    first: bool,
+) !void {
+    if (!first) try w.append(allocator, ',');
+    try w.append(allocator, '"');
+    try w.appendSlice(allocator, name);
+    try w.appendSlice(allocator, "\":");
+    if (value) |v| {
+        try w.append(allocator, '"');
+        try w.appendSlice(allocator, &v);
+        try w.append(allocator, '"');
+    } else {
+        try w.appendSlice(allocator, "null");
+    }
 }
 
 fn renderListJson(

@@ -396,9 +396,10 @@ fn jsKvDelete(
 /// because the underlying SQLite connection sees its own uncommitted
 /// txn state.
 ///
-/// NOT tape-captured in this slice — replay of prefix-scanning
-/// handlers will see live KV state, not the state at capture time.
-/// Deferred until the replay surface actually needs it.
+/// Tape-captured via `appendKvPrefix` — the captured entry holds the
+/// inputs (prefix/cursor/limit) AND the full result list, so the
+/// replay shell's `kv.prefix` stub can return the same rows without
+/// reaching live KV state.
 fn jsKvPrefix(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -428,9 +429,33 @@ fn jsKvPrefix(
 
     var scan = state.kv.prefix(prefix_str, cursor_str, limit) catch |err| {
         state.pending_kv_error = err;
+        // Capture the failure path too — replay needs to surface the
+        // same null return, otherwise a defensive `if (page === null)`
+        // branch in the handler would diverge.
+        if (state.kv_tape) |t| t.appendKvPrefix(prefix_str, cursor_str, limit, &.{}, .err) catch {};
         return js_null;
     };
     defer scan.deinit();
+
+    if (state.kv_tape) |t| {
+        // Convert `kv.PrefixScan.entries` (rove-kv's shape) into the
+        // tape's `KvPair`s. Both are the same `(key, value)` pair, but
+        // they belong to different modules so we materialize the
+        // bridge on the stack. `appendKvPrefix` dups everything into
+        // tape storage, so the lifetime of `pairs` and `scan` doesn't
+        // need to extend past this call.
+        var stack_pairs: [256]tape_mod.KvPair = undefined;
+        const heap_pairs: ?[]tape_mod.KvPair = if (scan.entries.len <= stack_pairs.len)
+            null
+        else
+            state.allocator.alloc(tape_mod.KvPair, scan.entries.len) catch null;
+        defer if (heap_pairs) |h| state.allocator.free(h);
+        const pairs: []tape_mod.KvPair = if (heap_pairs) |h| h else stack_pairs[0..scan.entries.len];
+        for (scan.entries, 0..) |e, i| {
+            pairs[i] = .{ .key = e.key, .value = e.value };
+        }
+        t.appendKvPrefix(prefix_str, cursor_str, limit, pairs, .ok) catch {};
+    }
 
     const arr = c.JS_NewArray(ctx);
     for (scan.entries, 0..) |e, i| {
