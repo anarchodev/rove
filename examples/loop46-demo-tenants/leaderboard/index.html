@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Leaderboard</title>
+<style>
+  body { font: 15px/1.5 system-ui, -apple-system, sans-serif; max-width: 28em; margin: 4em auto; padding: 0 1em; color: #222; }
+  h1 { margin: 0 0 0.5em; font-size: 1.4em; }
+  .hint { color: #888; font-size: 13px; margin: 0 0 1.2em; }
+  form { display: flex; gap: 6px; margin: 1em 0; }
+  input { padding: 6px 10px; font: inherit; border: 1px solid #ccc; border-radius: 4px; flex: 1; min-width: 0; }
+  input[type=number] { flex: 0 0 5em; }
+  button { padding: 6px 14px; font: inherit; border: 1px solid #2563eb; background: #2563eb; color: #fff; border-radius: 4px; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #eee; }
+  th { background: #fafafa; color: #555; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  td:last-child, th:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  .empty { color: #999; font-style: italic; padding: 1em; }
+  .err { color: #b00020; font-size: 13px; min-height: 1.2em; margin-top: 0.4em; }
+</style>
+</head>
+<body>
+<h1>Leaderboard</h1>
+<p class="hint">A working app in 5 lines of handler code. KV store, persistent storage, no setup. Submit a name + score to see it land.</p>
+
+<form id="f">
+  <input id="n" placeholder="name" maxlength="32" required>
+  <input id="s" type="number" min="0" max="999999999" placeholder="score" required>
+  <button>Submit</button>
+</form>
+<div id="err" class="err"></div>
+
+<table>
+  <thead><tr><th>Name</th><th>Score</th></tr></thead>
+  <tbody id="t"><tr><td colspan="2" class="empty">loading…</td></tr></tbody>
+</table>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const escapeHtml = (s) => s.replace(/[<>&"']/g, (c) => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;", '"':"&quot;", "'":"&#39;" }[c]));
+
+async function load() {
+  const res = await fetch("/api");
+  const rows = await res.json();
+  $("t").innerHTML = rows.length === 0
+    ? '<tr><td colspan="2" class="empty">no scores yet — be first</td></tr>'
+    : rows.map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${r.score}</td></tr>`).join("");
+}
+
+$("f").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("err").textContent = "";
+  const name = $("n").value.trim();
+  const score = parseInt($("s").value, 10);
+  const res = await fetch("/api", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name, score }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    $("err").textContent = err.error || `error ${res.status}`;
+    return;
+  }
+  $("f").reset();
+  load();
+});
+
+load();
+</script>
+</body>
+</html>

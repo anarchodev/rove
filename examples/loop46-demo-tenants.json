@@ -20,6 +20,15 @@
       ]
     },
     {
+      "id": "leaderboard",
+      "_comment": "Story 1 demo — leaderboard. The Firebase-pain pitch in code form. KV-backed top-N table with a tiny SPA page.",
+      "domains": ["leaderboard.test"],
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/leaderboard/index.mjs"},
+        {"path": "_static/index.html", "source": "loop46-demo-tenants/leaderboard/index.html", "content_type": "text/html; charset=utf-8"}
+      ]
+    },
+    {
       "id": "penalty",
       "domains": ["penalty.test"],
       "files": [

@@ -32,6 +32,11 @@ const SeedFile = struct {
     /// File on disk to read bytes from. Resolved relative to the
     /// manifest file's parent directory.
     source: []const u8,
+    /// Non-null marks this entry as a STATIC file served verbatim
+    /// with the given content-type — paired with a `_static/`
+    /// path. Null (or omitted) means handler source compiled to
+    /// bytecode at deploy time.
+    content_type: ?[]const u8 = null,
 };
 
 /// Drive `loop46 seed --data-dir <dir> --manifest <path>`. The data
@@ -107,6 +112,7 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
             try deploy_files.append(allocator, .{
                 .path = entry.path,
                 .content = bytes,
+                .content_type = entry.content_type,
             });
         }
 
