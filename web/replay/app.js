@@ -166,9 +166,19 @@
   }
 
   function parseTapesFromBundle(bundle) {
-    const out = { kv: [], date: [], math_random: [], crypto_random: [] };
+    const out = {
+      kv: [],
+      date: [],
+      math_random: [],
+      crypto_random: [],
+      // The captured request body — passed through to the iframe so
+      // its `installStubs` can stamp `window.request.body`. Bundle
+      // also carries `request.body_truncated` for the user-visible
+      // warning.
+      body_bytes: bundle.request?.body_bytes || null,
+    };
     const blobs = bundle.tape_blobs || {};
-    for (const name of Object.keys(out)) {
+    for (const name of ["kv", "date", "math_random", "crypto_random"]) {
       if (blobs[name]) {
         const parsed = parseTapeBlob(blobs[name]);
         out[name] = parsed.entries;
@@ -545,8 +555,17 @@ function installStubs(tapes) {
     } catch (e) { /* postMessage can fail on un-cloneable args */ }
   };
 
-  // Ambient request / response globals.
-  window.request = META.request;
+  // Ambient request / response globals. Body comes in via the same
+  // `replay:tapes` message — the iframe materializes a JS string
+  // from the captured bytes (UTF-8 decode with replacement chars
+  // for any invalid sequences, matching how QJS hands bytes to the
+  // handler via JS_NewStringLen).
+  window.request = Object.assign({}, META.request);
+  if (tapes.body_bytes) {
+    window.request.body = new TextDecoder("utf-8", { fatal: false }).decode(tapes.body_bytes);
+  } else {
+    window.request.body = "";
+  }
   window.response = { status: 200, headers: {}, cookies: [] };
 
   return { state: { tapes, cur, sideEffects } };
@@ -664,6 +683,9 @@ function safeStringify(v) {
 
     if (bundle.historical_manifest_missing) {
       appendSideEffect("warning", "Historical deployment was GC'd; replay loaded the CURRENT manifest. Source you're stepping through may not match what originally ran.");
+    }
+    if (bundle.request?.body_truncated) {
+      appendSideEffect("warning", "Request body was larger than the capture cap (256 KB). Replay sees the truncated prefix; the original handler saw the full body.");
     }
 
     let parsedTapes;

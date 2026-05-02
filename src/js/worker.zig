@@ -961,10 +961,16 @@ pub const RequestTapes = struct {
 /// Best-effort: on any serialize/upload failure for a given channel,
 /// the ref for that channel is left null and a warning is logged. We
 /// don't want tape capture failures to kill the request.
+/// Maximum captured request-body length. Anything bigger gets
+/// truncated to this prefix and `request_body_truncated` set on the
+/// log record's tape refs. Mirrors PLAN §2.4's body-cap default.
+pub const REQUEST_BODY_CAP: usize = 256 * 1024;
+
 pub fn uploadTapes(
     worker: anytype,
     instance_id: []const u8,
     tapes: *RequestTapes,
+    request_body: []const u8,
 ) log_mod.TapeRefs {
     const tl = worker.tenant_logs.get(instance_id) orelse return .{};
     const allocator = worker.allocator;
@@ -996,6 +1002,27 @@ pub fn uploadTapes(
             continue;
         };
         ch.out.* = hash;
+    }
+
+    // Request body — captured to the same per-tenant log-blobs/. This
+    // is what makes the replay shell's `request.body` non-empty for
+    // POST / PUT requests. Bodies bigger than `REQUEST_BODY_CAP` get
+    // truncated to that prefix; the truncation flag is preserved
+    // through the log record so the simulator (and the replay shell)
+    // know the captured bytes are a prefix.
+    if (request_body.len > 0) {
+        const captured_len = @min(request_body.len, REQUEST_BODY_CAP);
+        const captured = request_body[0..captured_len];
+        const hash = tape_mod.hashHexBytes(captured);
+        if (blob.put(&hash, captured)) {
+            refs.request_body_hex = hash;
+            refs.request_body_truncated = captured_len < request_body.len;
+        } else |err| {
+            // Better to surface a missing-body in the bundle than
+            // dangle a hash whose blob never landed. Replay falls
+            // back to empty body.
+            std.log.warn("rove-js request-body blob put failed: {s}", .{@errorName(err)});
+        }
     }
 
     return refs;

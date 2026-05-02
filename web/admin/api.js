@@ -436,6 +436,8 @@ export const api = {
     // Tape blobs — fetch each non-null hash in parallel and turn the
     // raw bytes into Uint8Arrays for postMessage's structured-clone
     // transport. Replay shell parses each blob on the other side.
+    // The request body lives in the same per-tenant log-blobs/ store
+    // (worker dispatcher writes it via uploadTapes).
     const tapeRefs = {
       kv: record.tape_refs?.kv_tape_hex || null,
       date: record.tape_refs?.date_tape_hex || null,
@@ -443,21 +445,42 @@ export const api = {
       crypto_random: record.tape_refs?.crypto_random_tape_hex || null,
     };
     const tapeBlobs = { kv: null, date: null, math_random: null, crypto_random: null };
-    await Promise.all(Object.keys(tapeRefs).map(async (name) => {
-      const hash = tapeRefs[name];
-      if (!hash) return;
-      const r = await rawGet(adminBase(),
-        `/_system/log/${inst}/blob/${encodeURIComponent(hash)}`);
-      const buf = await r.arrayBuffer();
-      tapeBlobs[name] = new Uint8Array(buf);
-    }));
+    const bodyHash = record.tape_refs?.request_body_hex || null;
+    let bodyBytes = null;
+    await Promise.all([
+      ...Object.keys(tapeRefs).map(async (name) => {
+        const hash = tapeRefs[name];
+        if (!hash) return;
+        const r = await rawGet(adminBase(),
+          `/_system/log/${inst}/blob/${encodeURIComponent(hash)}`);
+        const buf = await r.arrayBuffer();
+        tapeBlobs[name] = new Uint8Array(buf);
+      }),
+      bodyHash ? (async () => {
+        const r = await rawGet(adminBase(),
+          `/_system/log/${inst}/blob/${encodeURIComponent(bodyHash)}`);
+        const buf = await r.arrayBuffer();
+        bodyBytes = new Uint8Array(buf);
+      })() : Promise.resolve(),
+    ]);
 
     return {
       request_id: record.request_id,
       deployment_id: record.deployment_id,
       received_ns: record.received_ns,
       duration_ns: record.duration_ns,
-      request: { method: record.method, path: record.path, host: record.host },
+      request: {
+        method: record.method,
+        path: record.path,
+        host: record.host,
+        // Replay shell decodes these to a string (UTF-8) and stamps
+        // `window.request.body`. Null when the request had no body
+        // OR the worker chose not to capture (no tenant log open at
+        // capture time). Truncated bodies get an explicit flag so
+        // the shell can warn the handler may see less than original.
+        body_bytes: bodyBytes,
+        body_truncated: !!record.tape_refs?.request_body_truncated,
+      },
       response: {
         status: record.status,
         outcome: record.outcome,

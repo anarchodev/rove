@@ -442,6 +442,9 @@ fn writeTapeRefs(
     try writeTapeRefField(w, allocator, "math_random_tape_hex", refs.math_random_tape_hex, false);
     try writeTapeRefField(w, allocator, "crypto_random_tape_hex", refs.crypto_random_tape_hex, false);
     try writeTapeRefField(w, allocator, "module_tree_hex", refs.module_tree_hex, false);
+    try writeTapeRefField(w, allocator, "request_body_hex", refs.request_body_hex, false);
+    try w.appendSlice(allocator, ",\"request_body_truncated\":");
+    try w.appendSlice(allocator, if (refs.request_body_truncated) "true" else "false");
     try w.append(allocator, '}');
 }
 

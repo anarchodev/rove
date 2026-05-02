@@ -74,13 +74,28 @@ pub const Outcome = enum(u8) {
     unknown_domain = 6,
 };
 
-/// Phase 5.5 will populate these. Currently all null.
+/// Per-request blob references attached to a `LogRecord`. Each
+/// non-null field is a 64-char hex hash of bytes living in the
+/// tenant's `log-blobs/`. Replay fetches each by hash and either
+/// re-drives the handler from the captured non-determinism (the
+/// `*_tape_*` channels) or stamps the runtime globals (the
+/// request_body capture).
 pub const TapeRefs = struct {
     kv_tape_hex: ?[HASH_HEX_LEN]u8 = null,
     crypto_random_tape_hex: ?[HASH_HEX_LEN]u8 = null,
     date_tape_hex: ?[HASH_HEX_LEN]u8 = null,
     math_random_tape_hex: ?[HASH_HEX_LEN]u8 = null,
     module_tree_hex: ?[HASH_HEX_LEN]u8 = null,
+    /// Hash of the captured request body (or its 256 KB prefix if
+    /// the body was larger). Null when the request had no body or
+    /// the worker chose not to capture (no tenant log open). The
+    /// blob lives in the same `log-blobs/` directory as tape blobs.
+    request_body_hex: ?[HASH_HEX_LEN]u8 = null,
+    /// True iff `request_body_hex` references a truncated prefix.
+    /// Replay still feeds the captured bytes — the handler's view
+    /// is what was captured, even if that's less than the full
+    /// original body.
+    request_body_truncated: bool = false,
 };
 
 /// One request's log entry. All `[]const u8` fields are owned by the
@@ -144,13 +159,21 @@ pub const ListOpts = struct {
 const RECORD_VERSION: u32 = 1;
 
 /// Bit positions in the `flags` byte used by `serializeRecord`.
-/// Each bit signals presence of one optional field. 5 of the 8 bits
-/// are reserved for tape refs (Phase 5.5).
+/// Each bit signals presence of one optional field. 7 of the 8 bits
+/// are claimed; one reserved for a future ref.
 const FLAG_KV_TAPE: u8 = 1 << 0;
 const FLAG_CRYPTO_RANDOM_TAPE: u8 = 1 << 1;
 const FLAG_DATE_TAPE: u8 = 1 << 2;
 const FLAG_MATH_RANDOM_TAPE: u8 = 1 << 3;
 const FLAG_MODULE_TREE: u8 = 1 << 4;
+/// Set when `request_body_hex` is non-null. Followed by 64 hex bytes
+/// in the on-the-wire blob list, just like the tape flags above.
+const FLAG_REQ_BODY: u8 = 1 << 5;
+/// Truncation marker for the request body. Independent of
+/// `FLAG_REQ_BODY` only because a no-body request can't be
+/// "truncated" (the bit is meaningless without REQ_BODY set), but
+/// the encoder always clears it when REQ_BODY is clear.
+const FLAG_REQ_BODY_TRUNC: u8 = 1 << 6;
 
 /// Request-id reservation window size. `nextRequestId` hands out this
 /// many ids in memory before persisting a new high-water mark to the
@@ -436,6 +459,7 @@ fn estimateRecordBytes(r: *const LogRecord) usize {
     if (r.tape_refs.date_tape_hex != null) n += HASH_HEX_LEN;
     if (r.tape_refs.math_random_tape_hex != null) n += HASH_HEX_LEN;
     if (r.tape_refs.module_tree_hex != null) n += HASH_HEX_LEN;
+    if (r.tape_refs.request_body_hex != null) n += HASH_HEX_LEN;
     return n;
 }
 
@@ -471,6 +495,10 @@ fn serializeRecord(allocator: std.mem.Allocator, r: *const LogRecord) ![]u8 {
     if (r.tape_refs.date_tape_hex != null) flags |= FLAG_DATE_TAPE;
     if (r.tape_refs.math_random_tape_hex != null) flags |= FLAG_MATH_RANDOM_TAPE;
     if (r.tape_refs.module_tree_hex != null) flags |= FLAG_MODULE_TREE;
+    if (r.tape_refs.request_body_hex != null) {
+        flags |= FLAG_REQ_BODY;
+        if (r.tape_refs.request_body_truncated) flags |= FLAG_REQ_BODY_TRUNC;
+    }
     out[i] = flags;
     i += 1;
 
@@ -480,6 +508,7 @@ fn serializeRecord(allocator: std.mem.Allocator, r: *const LogRecord) ![]u8 {
         .{ FLAG_DATE_TAPE, r.tape_refs.date_tape_hex },
         .{ FLAG_MATH_RANDOM_TAPE, r.tape_refs.math_random_tape_hex },
         .{ FLAG_MODULE_TREE, r.tape_refs.module_tree_hex },
+        .{ FLAG_REQ_BODY, r.tape_refs.request_body_hex },
     }) |pair| {
         if (pair[1]) |hex| {
             @memcpy(out[i..][0..HASH_HEX_LEN], &hex);
@@ -532,6 +561,10 @@ fn parseRecord(allocator: std.mem.Allocator, bytes: []const u8) Error!LogRecord 
     if (flags & FLAG_DATE_TAPE != 0) tape_refs.date_tape_hex = try r.hexBlock();
     if (flags & FLAG_MATH_RANDOM_TAPE != 0) tape_refs.math_random_tape_hex = try r.hexBlock();
     if (flags & FLAG_MODULE_TREE != 0) tape_refs.module_tree_hex = try r.hexBlock();
+    if (flags & FLAG_REQ_BODY != 0) {
+        tape_refs.request_body_hex = try r.hexBlock();
+        tape_refs.request_body_truncated = (flags & FLAG_REQ_BODY_TRUNC) != 0;
+    }
 
     return .{
         .request_id = request_id,
