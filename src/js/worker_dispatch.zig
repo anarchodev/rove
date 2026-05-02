@@ -521,6 +521,28 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const scope_inst = resolved.scope_inst;
         const is_admin_request = resolved.is_admin;
 
+        // Lazy-open the tenant log eagerly on every request, BEFORE
+        // any of the early-exit `captureLog` paths below (rate-limit,
+        // static-served, no-handler 404, penalty-box, no-deployment).
+        // `captureLogInner` looks up the per-worker `tenant_logs`
+        // cache and silently drops the record on miss; without this
+        // line, runtime-created tenants (signup) lose their first
+        // request's log entry on every non-handler-dispatch path
+        // until something else opens the log. Multi-worker
+        // SO_REUSEPORT inherits the same cold-cache problem on each
+        // worker's first request for a given tenant.
+        //
+        // The handler-dispatch path also lazy-opens (at the
+        // request-id mint just below the per-handler section), but
+        // that runs AFTER these early exits — so the early-exit
+        // captures need their own seed.
+        _ = worker_mod.getOrOpenTenantLog(worker, scope_inst) catch |err| {
+            std.log.warn(
+                "rove-js: getOrOpenTenantLog({s}) failed before captureLog: {s}",
+                .{ scope_inst.id, @errorName(err) },
+            );
+        };
+
         // Lazy-open: instances created at runtime aren't in the map yet.
         const tc = worker_mod.getOrOpenTenantFiles(worker, handler_inst) catch |err| {
             std.log.warn("rove-js: lazy openTenantFiles({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
