@@ -81,6 +81,10 @@ pub const DispatchState = struct {
     date_tape: ?*tape_mod.Tape = null,
     math_random_tape: ?*tape_mod.Tape = null,
     crypto_random_tape: ?*tape_mod.Tape = null,
+    /// Per-request module-resolution tape — see Request.module_tape.
+    /// Read by the QuickJS module loader (dispatcher.module_loader.load)
+    /// to capture each successful import as `(specifier, source_hash)`.
+    module_tape: ?*tape_mod.Tape = null,
     /// PRNG used by our `Math.random` override so the test path and
     /// production path stay deterministic w.r.t. a given seed. Seeded
     /// by the dispatcher per request. Installed only when a tape is

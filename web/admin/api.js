@@ -401,11 +401,20 @@ export const api = {
       }
     }
 
+    // Fetch source bytes for EVERY handler entry, not just the
+    // entry. This lets the replay shell build an importmap so
+    // multi-file handlers' sibling imports (`import "./lib/foo"`)
+    // resolve to the right blob inside the iframe. Static entries
+    // are skipped — they aren't part of the JS module graph.
+    const handlerEntries = entries.filter((e) => e.kind === "handler");
+    const sources = await Promise.all(handlerEntries.map(async (e) => {
+      const r = await rawGet(adminBase(),
+        `/_system/files/${inst}/source/${encodeURIComponent(e.hash)}`);
+      return { path: e.path, hash: e.hash, source: await r.text() };
+    }));
     let entrySource = "";
-    if (entryHash) {
-      const srcRes = await rawGet(adminBase(),
-        `/_system/files/${inst}/source/${encodeURIComponent(entryHash)}`);
-      entrySource = await srcRes.text();
+    for (const s of sources) {
+      if (s.path === entryPath) entrySource = s.source;
     }
 
     // Tape blobs — fetch each non-null hash in parallel and turn the
@@ -442,7 +451,11 @@ export const api = {
       entry_path: entryPath,
       entry_source_hash: entryHash,
       entry_source: entrySource,
-      modules: [], // populated once `appendModule` callers land (S2)
+      // Every handler in the deployment's manifest, not just the
+      // captured imports — the replay shell builds an importmap from
+      // this so any `import` in any module resolves. Sources fetched
+      // by hash; the entry itself is also in here.
+      modules: sources,
       tape_blobs: tapeBlobs,
     };
   },

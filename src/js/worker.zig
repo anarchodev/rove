@@ -247,6 +247,14 @@ pub const TenantFiles = struct {
     /// full deployment path (e.g. `"index.js"`, `"api/users/index.js"`).
     /// Both keys and values are owned by `allocator`.
     bytecodes: std.StringHashMapUnmanaged([]u8),
+    /// Source-blob hash hex (64 chars) per handler path. Parallel to
+    /// `bytecodes` and refreshed alongside it. Read by the QuickJS
+    /// module loader to populate the per-request module-resolution
+    /// tape — replay needs the source hash to fetch the same bytes
+    /// from the file blob store. Owns its own key copies (allocator-
+    /// duped from manifest entries) so it can be torn down
+    /// independently of `bytecodes`.
+    source_hashes: std.StringHashMapUnmanaged([64]u8),
     /// Static files in the active deployment, keyed by the stored path
     /// (e.g. `"_static/index.html"`). Keys and `StaticEntry.content_type`
     /// are owned by `allocator`; bytes are fetched from `blob_backend`
@@ -779,6 +787,7 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
         .store = undefined, // filled after we have a stable `tc` pointer
         .current_deployment_id = 0,
         .bytecodes = .empty,
+        .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
         .next_refresh_ns = 0,
@@ -810,6 +819,7 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
 
 fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
     freeBytecodes(tc);
+    freeSourceHashes(tc);
     freeStatics(tc);
     freeTriggers(tc);
     tc.blob_backend.deinit();
@@ -922,6 +932,7 @@ pub const RequestTapes = struct {
     date: tape_mod.Tape,
     math_random: tape_mod.Tape,
     crypto_random: tape_mod.Tape,
+    module: tape_mod.Tape,
 
     pub fn init(allocator: std.mem.Allocator) RequestTapes {
         return .{
@@ -929,6 +940,7 @@ pub const RequestTapes = struct {
             .date = tape_mod.Tape.init(allocator, .date),
             .math_random = tape_mod.Tape.init(allocator, .math_random),
             .crypto_random = tape_mod.Tape.init(allocator, .crypto_random),
+            .module = tape_mod.Tape.init(allocator, .module),
         };
     }
 
@@ -937,6 +949,7 @@ pub const RequestTapes = struct {
         self.date.deinit();
         self.math_random.deinit();
         self.crypto_random.deinit();
+        self.module.deinit();
     }
 };
 
@@ -967,6 +980,7 @@ pub fn uploadTapes(
         .{ .tape = &tapes.date, .out = &refs.date_tape_hex },
         .{ .tape = &tapes.math_random, .out = &refs.math_random_tape_hex },
         .{ .tape = &tapes.crypto_random, .out = &refs.crypto_random_tape_hex },
+        .{ .tape = &tapes.module, .out = &refs.module_tree_hex },
     };
 
     for (channels) |ch| {
@@ -1197,6 +1211,15 @@ fn freeBytecodes(tc: *TenantFiles) void {
     tc.bytecodes = .empty;
 }
 
+/// Free the keys in `tc.source_hashes` and clear the map. Values are
+/// `[64]u8` by-value, no separate free needed.
+fn freeSourceHashes(tc: *TenantFiles) void {
+    var it = tc.source_hashes.iterator();
+    while (it.next()) |e| tc.allocator.free(e.key_ptr.*);
+    tc.source_hashes.deinit(tc.allocator);
+    tc.source_hashes = .empty;
+}
+
 /// Free every key + StaticEntry.content_type in `tc.statics` and clear
 /// the map. Paired with `freeBytecodes` for deployment teardown.
 fn freeStatics(tc: *TenantFiles) void {
@@ -1246,6 +1269,13 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
         next_bc.deinit(tc.allocator);
     }
 
+    var next_source_hashes: std.StringHashMapUnmanaged([64]u8) = .empty;
+    errdefer {
+        var it = next_source_hashes.iterator();
+        while (it.next()) |e| tc.allocator.free(e.key_ptr.*);
+        next_source_hashes.deinit(tc.allocator);
+    }
+
     var next_statics: std.StringHashMapUnmanaged(StaticEntry) = .empty;
     errdefer {
         var it = next_statics.iterator();
@@ -1273,6 +1303,14 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
                 const bytecode = try bs.get(&entry.bytecode_hex, tc.allocator);
                 errdefer tc.allocator.free(bytecode);
                 try next_bc.put(tc.allocator, path_copy, bytecode);
+
+                // Mirror the path → source-hash mapping so the per-
+                // request module loader can stamp `appendModule(name,
+                // source_hash)` on each successful import. Owns its
+                // own key copy.
+                const sh_key = try tc.allocator.dupe(u8, entry.path);
+                errdefer tc.allocator.free(sh_key);
+                try next_source_hashes.put(tc.allocator, sh_key, entry.source_hex);
 
                 // If this handler also matches the trigger path
                 // convention (`_triggers/<.../>index.{mjs,js}`), index
@@ -1326,9 +1364,11 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
 
     // Swap.
     freeBytecodes(tc);
+    freeSourceHashes(tc);
     freeStatics(tc);
     freeTriggers(tc);
     tc.bytecodes = next_bc;
+    tc.source_hashes = next_source_hashes;
     tc.statics = next_statics;
     tc.triggers = triggers_slice;
     tc.current_deployment_id = manifest.id;

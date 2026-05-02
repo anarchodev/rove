@@ -185,29 +185,88 @@
   // reach this page's storage (and we don't have any sensitive
   // storage on `replay.<suffix>` anyway).
   //
-  // The bundle is passed in via srcdoc as a JSON-stringified blob.
-  // The handler source is loaded as an ES module via a blob URL so
-  // DevTools shows it as a navigable file (`//# sourceURL=`).
+  // Multi-module support: each handler file in the deployment
+  // becomes its own blob: URL inside the iframe. An importmap
+  // injected before any module evaluates maps a stable specifier
+  // (`loop46-replay/<path>`) to that blob URL. We rewrite each
+  // module's relative imports (`import "./lib/foo"`) to the bare
+  // specifier shape so the importmap can resolve them — relative
+  // imports against blob URLs would resolve to gibberish otherwise.
+  //
+  // The import-rewrite is regex-based: matches `import "..."` and
+  // `import ... from "..."` at the top of the source. Doesn't catch
+  // dynamic `import(expr)` (handled at runtime, would need executable
+  // string mapping) or imports inside template literals / comments.
+  // For beta-scope handler patterns this is sufficient; documented
+  // limitation otherwise.
+
+  /// Resolve a relative specifier (`./x`, `../x`) against the
+  /// importing module's path into a canonical deployment-relative
+  /// key. Mirrors the QJS module loader's resolver in
+  /// `src/js/dispatcher.zig:resolveSpecifier`.
+  function resolveRelative(base, specifier) {
+    if (!specifier.startsWith("./") && !specifier.startsWith("../")) {
+      return specifier;
+    }
+    let dir = base.includes("/") ? base.slice(0, base.lastIndexOf("/")) : "";
+    let rest = specifier;
+    while (true) {
+      if (rest.startsWith("./")) {
+        rest = rest.slice(2);
+      } else if (rest.startsWith("../")) {
+        const slash = dir.lastIndexOf("/");
+        dir = slash >= 0 ? dir.slice(0, slash) : "";
+        rest = rest.slice(3);
+      } else break;
+    }
+    return dir ? dir + "/" + rest : rest;
+  }
+
+  /// Rewrite static `import` statements in `source` to use a stable
+  /// `loop46-replay/<resolved>` bare specifier the iframe importmap
+  /// can resolve. Catches the four common forms — `import "x"`,
+  /// `import default from "x"`, `import { ... } from "x"`,
+  /// `import * as m from "x"` — plus `export ... from "x"`.
+  function rewriteImports(source, modulePath) {
+    const re = /(\b(?:import|export)\b[^"';\n]*?\bfrom\s*['"]|\bimport\s*['"])([^"']+)(['"])/g;
+    return source.replace(re, (_match, pre, spec, post) => {
+      const resolved = resolveRelative(modulePath, spec);
+      return pre + "loop46-replay/" + resolved + post;
+    });
+  }
+
   function buildIframeSrcdoc(bundle, parsedTapes) {
-    // Stringify the bundle's "data shape" (without the raw tape
-    // blobs, which we already parsed). The iframe doesn't need
-    // parsed tape entries to be in the JSON — we'll send them via
-    // postMessage on the iframe's `replay:iframe-ready`.
     const meta = JSON.stringify({
       request: bundle.request || {},
       response_was: bundle.response || {},
       deployment_id: bundle.deployment_id ?? null,
     });
 
-    // The handler's source is materialized in the iframe via a blob
-    // URL so DevTools shows a real file. We prepend `debugger;` so
-    // the browser pauses the FIRST time the module evaluates — that
-    // gives the user a chance to set further breakpoints in their
-    // own DevTools before stepping into the handler.
-    const handlerSourceRaw = bundle.entry_source || "export default function() { return 'no handler source'; }";
-    const sourceUrlComment = "//# sourceURL=loop46-replay/" + (bundle.deployment_id ?? "x") + "/index.mjs\n";
-    // Escape `<` so `</script>` in user code can't break us out.
-    const handlerSourceJson = JSON.stringify("debugger;\n" + handlerSourceRaw + "\n" + sourceUrlComment);
+    // Pre-process every module: rewrite relative imports to bare
+    // specifiers and append a `//# sourceURL=` comment so DevTools
+    // shows them as real files under `loop46-replay/<path>`. The
+    // entry path is whichever module the dispatcher picked as the
+    // request handler.
+    const entryPath = bundle.entry_path ||
+      (bundle.modules?.find((m) => m.path === "index.mjs") ? "index.mjs" : null);
+    const modulesIn = bundle.modules || [];
+    const modulesOut = modulesIn.map((m) => ({
+      path: m.path,
+      source: rewriteImports(m.source, m.path) +
+        "\n//# sourceURL=loop46-replay/" + m.path + "\n",
+    }));
+    // Fallback for the legacy single-file shape (entry_source set,
+    // modules empty): synthesize a single-entry list so the
+    // importmap path still applies.
+    if (modulesOut.length === 0 && bundle.entry_source) {
+      modulesOut.push({
+        path: entryPath || "index.mjs",
+        source: bundle.entry_source +
+          "\n//# sourceURL=loop46-replay/" + (entryPath || "index.mjs") + "\n",
+      });
+    }
+    const modulesJson = JSON.stringify(modulesOut);
+    const entryPathJson = JSON.stringify(entryPath || "index.mjs");
 
     return `<!doctype html>
 <html>
@@ -215,7 +274,8 @@
 <body>
 <script>
 const META = ${meta};
-const HANDLER_SOURCE = ${handlerSourceJson};
+const MODULES = ${modulesJson};
+const ENTRY_PATH = ${entryPathJson};
 
 // Stubs — the rest of this script installs Loop46 globals reading
 // from tapes that the parent page sends in a moment. We can't run
@@ -501,14 +561,28 @@ function safeStringify(v) {
   const tapes = await __tapesReady;
   __state = installStubs(tapes);
 
-  // Materialize the handler module via a blob URL so DevTools
-  // navigates to a "real" file under loop46-replay/...
-  const blob = new Blob([HANDLER_SOURCE], { type: "application/javascript" });
-  const url = URL.createObjectURL(blob);
+  // Build a blob URL for every module and inject an importmap so
+  // bare \`loop46-replay/<path>\` specifiers (already in the
+  // rewritten source) resolve to the right blob. Importmap MUST be
+  // injected before any module loads — that's why we do this in a
+  // regular script before the dynamic import below.
+  const importmap = { imports: {} };
+  for (const m of MODULES) {
+    const blob = new Blob([m.source], { type: "application/javascript" });
+    importmap.imports["loop46-replay/" + m.path] = URL.createObjectURL(blob);
+  }
+  const mapScript = document.createElement("script");
+  mapScript.type = "importmap";
+  mapScript.textContent = JSON.stringify(importmap);
+  document.head.appendChild(mapScript);
 
   let mod;
   try {
-    mod = await import(url);
+    // Pause one step before the handler runs so the user can set
+    // breakpoints in any module's Sources panel entry. Module
+    // top-level evaluation has already finished by this point —
+    // \`mod.default()\` is the actual handler call.
+    mod = await import("loop46-replay/" + ENTRY_PATH);
   } catch (err) {
     window.parent.postMessage({ kind: "replay:error", phase: "module-load", message: err.message, stack: err.stack }, "*");
     return;
@@ -521,6 +595,7 @@ function safeStringify(v) {
 
   let result;
   try {
+    debugger;
     result = await mod.default();
   } catch (err) {
     window.parent.postMessage({ kind: "replay:error", phase: "handler-throw", message: err.message, stack: err.stack }, "*");

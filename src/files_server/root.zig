@@ -161,20 +161,58 @@ const InstanceCtx = struct {
 /// call is correct but wasteful; the eventual thread pool will keep
 /// one alive per worker thread. Matches the compile-hook pattern used
 /// elsewhere in the codebase.
+/// Per-deploy compile context. Owns one QJS runtime + context for the
+/// whole deploy so cross-file module imports resolve through the same
+/// module cache. The caller populates `path_sources` (path → raw
+/// source bytes) before invoking `compile`; the QJS module loader
+/// installed at init reads from this map to resolve sibling imports
+/// at compile time.
+///
+/// Init-in-place (`init(self, alloc)`) instead of returning by value:
+/// the loader's opaque pointer is `&self`, which must be stable for
+/// the lifetime of the runtime. A return-by-value init would make
+/// that pointer dangling on return.
 const InlineCompiler = struct {
     runtime: qjs.Runtime,
     context: qjs.Context,
+    /// Path → source bytes for the current deploy. Populated by
+    /// `deployManifest` before any compile call. Slices are borrowed —
+    /// caller keeps the underlying buffers alive until `deinit`.
+    path_sources: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Reserved for `compileLoad` to allocate its NUL-terminated
+    /// source buffer when QJS calls back into Zig. Not used elsewhere.
+    loader_allocator: std.mem.Allocator,
 
-    fn init() Error!InlineCompiler {
-        var rt = qjs.Runtime.init() catch return Error.OutOfMemory;
-        errdefer rt.deinit();
-        const ctx = rt.newContext() catch return Error.OutOfMemory;
-        return .{ .runtime = rt, .context = ctx };
+    fn init(self: *InlineCompiler, allocator: std.mem.Allocator) Error!void {
+        self.runtime = qjs.Runtime.init() catch return Error.OutOfMemory;
+        errdefer self.runtime.deinit();
+        self.context = self.runtime.newContext() catch return Error.OutOfMemory;
+        errdefer self.context.deinit();
+        self.path_sources = .empty;
+        self.loader_allocator = allocator;
+        // Install the module loader. Passing NULL for the normalize
+        // hook lets QJS use its default `./` and `../` resolver, which
+        // matches the canonical-path key shape rove's runtime loader
+        // produces (`lib/foo` for `./lib/foo` from `index.mjs`).
+        qjs.c.JS_SetModuleLoaderFunc(
+            self.runtime.raw,
+            null,
+            compileLoad,
+            self,
+        );
     }
 
     fn deinit(self: *InlineCompiler) void {
+        self.path_sources.deinit(self.loader_allocator);
         self.context.deinit();
         self.runtime.deinit();
+    }
+
+    /// Register `source` (borrowed) under `path` so cross-module
+    /// imports referencing `path` can resolve during compile. Caller
+    /// keeps the source bytes alive until `deinit`.
+    fn putSource(self: *InlineCompiler, path: []const u8, source: []const u8) Error!void {
+        self.path_sources.put(self.loader_allocator, path, source) catch return Error.OutOfMemory;
     }
 
     fn compile(
@@ -190,7 +228,42 @@ const InlineCompiler = struct {
             .{};
         return self.context.compileToBytecode(source, filename, allocator, flags);
     }
+
+    /// QJS module loader callback for the compile pass. Looks up the
+    /// resolved path in `path_sources`, runs `JS_Eval` with
+    /// `COMPILE_ONLY | TYPE_MODULE` to produce a module def QJS can
+    /// link the importing module against. Cross-module compile errors
+    /// surface back through the original `compileToBytecode` call as
+    /// a QJS exception.
+    fn compileLoad(
+        ctx: ?*qjs.c.JSContext,
+        name: [*c]const u8,
+        opaque_ptr: ?*anyopaque,
+    ) callconv(.c) ?*qjs.c.JSModuleDef {
+        const self: *InlineCompiler = @ptrCast(@alignCast(opaque_ptr.?));
+        const name_s = std.mem.span(name);
+        const src = self.path_sources.get(name_s) orelse return null;
+
+        const src_z = self.loader_allocator.allocSentinel(u8, src.len, 0) catch return null;
+        defer self.loader_allocator.free(src_z);
+        @memcpy(src_z, src);
+
+        const flags = qjs.c.JS_EVAL_TYPE_MODULE | qjs.c.JS_EVAL_FLAG_COMPILE_ONLY;
+        const fun_obj = qjs.c.JS_Eval(ctx, src_z.ptr, src.len, name, flags);
+        if (qjs.c.JS_IsException(fun_obj)) return null;
+        if (fun_obj.tag != qjs.c.JS_TAG_MODULE) {
+            qjs.c.JS_FreeValue(ctx, fun_obj);
+            return null;
+        }
+        const mod_def: ?*qjs.c.JSModuleDef = @ptrCast(@alignCast(fun_obj.u.ptr));
+        // JS_Eval returned a held module value; QJS expects the
+        // loader to return the module def directly (it owns its own
+        // references). Drop the JSValue handle.
+        qjs.c.JS_FreeValue(ctx, fun_obj);
+        return mod_def;
+    }
 };
+
 
 /// Hex string length for a SHA-256 digest. Callers of `putBlobByHash`
 /// and `checkBlobs` must present claimed hashes as exactly this many
@@ -339,7 +412,8 @@ pub fn deployManifest(
     expected_parent_id: ?u64,
     replicate: ?*kv_mod.WriteSet,
 ) Error!DeployResult {
-    var compiler = try InlineCompiler.init();
+    var compiler: InlineCompiler = undefined;
+    try compiler.init(allocator);
     defer compiler.deinit();
 
     var h: InstanceCtx = undefined;
@@ -373,6 +447,30 @@ pub fn deployManifest(
     // content-addressed and may be reused by a later deploy.
     h.store.clearFileEntries() catch |err| return mapCodeError(err);
 
+    // ── Pre-fetch all handler sources into the compile context so
+    // cross-module imports can resolve at compile time. Without this
+    // step a handler with `import "./lib/foo.mjs"` fails to compile
+    // because QJS's module loader has no way to find the sibling
+    // source. The fetched buffers are owned here and live until end
+    // of deploy (compiler.deinit drops the registry; we free the
+    // bytes ourselves). The double-fetch (here + inside
+    // putSourceByHash below) is wasteful but limited to deploy-time
+    // and bounded by the per-file 64 KB cap.
+    var owned_sources: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned_sources.items) |b| allocator.free(b);
+        owned_sources.deinit(allocator);
+    }
+    for (entries) |entry| {
+        if (entry.kind != .handler) continue;
+        const src = h.store.blob.get(entry.hash, allocator) catch |err| switch (err) {
+            error.NotFound => return Error.NotFound,
+            else => return Error.Blob,
+        };
+        owned_sources.append(allocator, src) catch return Error.OutOfMemory;
+        compiler.putSource(entry.path, src) catch return Error.OutOfMemory;
+    }
+
     // ── Stamp each entry. putSourceByHash fetches the source blob
     // and compiles; putStaticByHash just verifies the blob is
     // present and stamps the index.
@@ -401,7 +499,8 @@ pub fn uploadFile(
     path: []const u8,
     source: []const u8,
 ) Error!void {
-    var compiler = try InlineCompiler.init();
+    var compiler: InlineCompiler = undefined;
+    try compiler.init(allocator);
     defer compiler.deinit();
 
     var h: InstanceCtx = undefined;
@@ -461,7 +560,8 @@ pub fn putFileAndDeploy(
     };
 
     if (kind == .handler) {
-        var compiler = try InlineCompiler.init();
+        var compiler: InlineCompiler = undefined;
+        try compiler.init(allocator);
         defer compiler.deinit();
         var h: InstanceCtx = undefined;
         try h.init(allocator, data_dir, instance_id, InlineCompiler.compile, &compiler);

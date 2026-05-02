@@ -708,6 +708,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .date_tape = &tapes.date,
             .math_random_tape = &tapes.math_random,
             .crypto_random_tape = &tapes.crypto_random,
+            .module_tape = &tapes.module,
             .prng_seed = @bitCast(received_ns),
             .request_id = request_id,
             // Non-null only when the handler-tenant is the admin
@@ -747,6 +748,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             &writeset,
             bytecode,
             &tc.bytecodes,
+            &tc.source_hashes,
             tc.triggers,
             request,
             &budget,
