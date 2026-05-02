@@ -109,9 +109,10 @@ status=$("${CURL[@]}" -o /dev/null -w "%{http_code}" "${REPLAY_ORIGIN}/")
 [[ "$status" == "200" ]] || fail "replay shell GET / → $status (expected 200)"
 ok "replay.${PUBLIC_SUFFIX}/ serves shell index"
 
-ct=$("${CURL[@]}" -o /dev/null -w "%{content_type}" "${REPLAY_ORIGIN}/app.js")
-echo "$ct" | grep -qi "application/javascript" || fail "replay app.js content-type: $ct"
-ok "replay shell app.js served as application/javascript"
+# HEAD on a static file: same headers as GET, no body.
+ct=$("${CURL[@]}" -I "${REPLAY_ORIGIN}/app.js" | grep -i "^content-type:" | tr -d '\r')
+echo "$ct" | grep -qi "application/javascript" || fail "replay app.js HEAD content-type: $ct"
+ok "replay shell app.js served as application/javascript (HEAD)"
 
 # ── 2. Fresh-tenant first request via static — log must capture ─
 resp=$("${CURL[@]}" -X POST \

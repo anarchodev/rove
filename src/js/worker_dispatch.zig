@@ -395,12 +395,13 @@ fn resolveRequest(
     // through to admin's JS bundle (where `_middlewares/index.mjs`
     // applies the auth gate).
     const has_query = std.mem.indexOfScalar(u8, path, '?') != null;
-    if (std.mem.eql(u8, method, "GET") and !has_query) {
+    const is_static_method = std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD");
+    if (is_static_method and !has_query) {
         const admin_inst = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
         if (admin_inst) |ai| {
             const admin_tc = worker_mod.getOrOpenTenantFiles(worker, ai) catch null;
             if (admin_tc) |tc| {
-                const outcome = try respb.tryServeStatic(server, allocator, ent, sid, sess, tc, path, rh);
+                const outcome = try respb.tryServeStatic(server, allocator, ent, sid, sess, tc, method, path, rh);
                 if (outcome != .miss) return .handled;
             }
         }
@@ -582,8 +583,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // Static-first dispatch for customer traffic only. Admin
         // requests already ran their own pre-auth static check above —
         // running it here again would shadow the admin JS handler with
-        // `_static/index.html` on `/?fn=...` API calls.
-        if (!is_admin_request and std.mem.eql(u8, method, "GET")) {
+        // `_static/index.html` on `/?fn=...` API calls. Both GET and
+        // HEAD route through here; HEAD gets identical headers but no
+        // body (RFC 9110 §9.3.2).
+        if (!is_admin_request and (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD"))) {
             const static_outcome = try respb.tryServeStatic(
                 server,
                 allocator,
@@ -591,6 +594,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 sid,
                 sess,
                 tc,
+                method,
                 path,
                 rh,
             );

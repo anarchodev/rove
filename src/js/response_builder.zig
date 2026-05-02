@@ -322,8 +322,10 @@ pub const StaticOutcome = union(enum) {
 
 /// Try to serve `path` from the tenant's `_static/*` set. Returns the
 /// status code if we took the response (200, 304, or 301 for trailing-
-/// slash canonicalization) or `.miss` when nothing matched. Only called
-/// on `GET`; the caller enforces the method gate.
+/// slash canonicalization) or `.miss` when nothing matched. Caller
+/// gates on `method` being `GET` or `HEAD`. For `HEAD`, response
+/// headers (content-type, etag, cache-control) match what `GET`
+/// would emit; the body is omitted, per RFC 9110 §9.3.2.
 pub fn tryServeStatic(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -331,16 +333,18 @@ pub fn tryServeStatic(
     sid: h2.StreamId,
     sess: h2.Session,
     tc: anytype,
+    method: []const u8,
     path: []const u8,
     rh: h2.ReqHeaders,
 ) !StaticOutcome {
+    const is_head = std.mem.eql(u8, method, "HEAD");
     const qmark = std.mem.indexOfScalar(u8, path, '?');
     const path_no_q = if (qmark) |q| path[0..q] else path;
     if (path_no_q.len == 0 or path_no_q[0] != '/') return .miss;
 
     // Trailing-slash canonicalization: redirect `/foo/` → `/foo` (not
-    // `/` itself). Only on GET, by design, so API clients using
-    // trailing-slash conventions on POST aren't surprised.
+    // `/` itself). Applies on GET and HEAD; API clients using
+    // trailing-slash conventions on POST/etc aren't redirected.
     if (path_no_q.len > 1 and path_no_q[path_no_q.len - 1] == '/') {
         var canon_buf: [files_mod.MAX_PATH_LEN + 16]u8 = undefined;
         var stripped: []const u8 = path_no_q;
@@ -361,7 +365,7 @@ pub fn tryServeStatic(
     var key_buf: [8 + files_mod.MAX_PATH_LEN + 16]u8 = undefined;
     if (rel.len == 0) {
         const key = std.fmt.bufPrint(&key_buf, "_static/index.html", .{}) catch return .miss;
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, key, rh)) |st| {
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, key, rh, is_head)) |st| {
             return .{ .served = st };
         }
         return .miss;
@@ -369,21 +373,21 @@ pub fn tryServeStatic(
 
     // Exact match: `_static/<rel>`.
     if (std.fmt.bufPrint(&key_buf, "_static/{s}", .{rel})) |k| {
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh)) |st| {
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh, is_head)) |st| {
             return .{ .served = st };
         }
     } else |_| {}
 
     // `.html` suffix: `_static/<rel>.html`.
     if (std.fmt.bufPrint(&key_buf, "_static/{s}.html", .{rel})) |k| {
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh)) |st| {
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh, is_head)) |st| {
             return .{ .served = st };
         }
     } else |_| {}
 
     // Directory index: `_static/<rel>/index.html`.
     if (std.fmt.bufPrint(&key_buf, "_static/{s}/index.html", .{rel})) |k| {
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh)) |st| {
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh, is_head)) |st| {
             return .{ .served = st };
         }
     } else |_| {}
@@ -402,6 +406,7 @@ fn serveStaticByKey(
     tc: anytype,
     key: []const u8,
     rh: h2.ReqHeaders,
+    is_head: bool,
 ) !?u16 {
     const entry = tc.statics.get(key) orelse return null;
 
@@ -437,6 +442,26 @@ fn serveStaticByKey(
         );
         return err;
     };
+    // HEAD: emit the same headers GET would, but no body. Per RFC
+    // 9110 §9.3.2 "the server SHOULD send the same header fields
+    // in response to a HEAD request as it would have sent if the
+    // request method had been GET". Browsers + curl handle absent
+    // content-length on HTTP/2 fine (END_STREAM marks body end).
+    if (is_head) {
+        defer allocator.free(bytes);
+        try emitStaticResponse(
+            server,
+            allocator,
+            ent,
+            sid,
+            sess,
+            200,
+            "",
+            entry.content_type,
+            etag,
+        );
+        return 200;
+    }
     try emitStaticResponse(
         server,
         allocator,

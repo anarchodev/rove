@@ -126,6 +126,15 @@ echo "$hdrs" | grep -iq "cache-control: public" || fail "cache-control missing"
 grep -q '<h1>home</h1>' /tmp/static-body.html || fail "body mismatch"
 ok "GET / returns index.html with ETag + Cache-Control"
 
+# ── 2b. HEAD / → 200 + identical headers, no body (RFC 9110 §9.3.2) ──
+head_resp=$("${CURL[@]}" -D - -o /tmp/static-head-body.html -X HEAD "https://${CUSTOMER_HOST}:${PORT}/")
+echo "$head_resp" | head -1 | grep -q " 200" || fail "HEAD / status ($head_resp)"
+echo "$head_resp" | grep -iq "content-type: text/html" || fail "HEAD / content-type missing"
+echo "$head_resp" | grep -iq "^etag:" || fail "HEAD / etag missing"
+echo "$head_resp" | grep -iq "cache-control: public" || fail "HEAD / cache-control missing"
+[[ ! -s /tmp/static-head-body.html ]] || fail "HEAD / returned a body ($(wc -c < /tmp/static-head-body.html) bytes)"
+ok "HEAD / matches GET headers but omits body"
+
 # ── 3. If-None-Match matching ETag → 304 ─────────────────────────────
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
     -H "If-None-Match: $etag" "https://${CUSTOMER_HOST}:${PORT}/")
