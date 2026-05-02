@@ -302,6 +302,9 @@ fn handleOne(
         try handlePutBlob(server, allocator, data_dir, ent, sid, sess, instance_id, hash, rb);
     } else if (std.mem.eql(u8, remainder, "deployments") and std.mem.eql(u8, method, "POST")) {
         try handleDeployments(server, allocator, data_dir, raft, ent, sid, sess, instance_id, rb);
+    } else if (std.mem.startsWith(u8, remainder, "deployments/") and std.mem.eql(u8, method, "GET")) {
+        const id_str = remainder["deployments/".len..];
+        try handleGetDeployment(server, allocator, data_dir, ent, sid, sess, instance_id, id_str);
     } else {
         try setResponse(server, ent, sid, sess, 404, null, "not found\n");
     }
@@ -671,6 +674,55 @@ fn handleList(
             .{@errorName(err)},
         );
         try setResponse(server, ent, sid, sess, 500, msg.ptr, msg);
+        return;
+    };
+    defer manifest.deinit();
+
+    const body = try encodeListJson(allocator, &manifest);
+    try setResponse(server, ent, sid, sess, 200, body.ptr, body);
+}
+
+/// `GET /{instance}/deployments/{id}` — read-only manifest fetch by
+/// id. Used by the dashboard's replay-bundle composer to load the
+/// HISTORICAL manifest a request was dispatched against, instead of
+/// the current one. Without this, replays of older requests load
+/// current source — silently wrong when the deployment changed
+/// between the original request and the replay click.
+///
+/// `{id}` is a hex-encoded u64 (matches the `deployment/current`
+/// storage shape and the `id` POST /deployments returns). 400 on
+/// non-hex input; 404 when the id was never deployed (e.g. cleaned
+/// up by retention) or the instance has no deploys yet.
+fn handleGetDeployment(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    instance_id: []const u8,
+    id_str: []const u8,
+) !void {
+    if (id_str.len == 0) {
+        try setResponse(server, ent, sid, sess, 400, null, "missing deployment id\n");
+        return;
+    }
+    const deployment_id = std.fmt.parseInt(u64, id_str, 16) catch {
+        try setResponse(server, ent, sid, sess, 400, null, "invalid deployment id (want hex)\n");
+        return;
+    };
+
+    var manifest = files_server.loadDeployment(allocator, data_dir, instance_id, deployment_id) catch |err| {
+        const code: u16 = switch (err) {
+            files_server.Error.NotFound => 404,
+            else => 500,
+        };
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "loadDeployment failed: {s}\n",
+            .{@errorName(err)},
+        );
+        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
     defer manifest.deinit();

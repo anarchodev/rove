@@ -356,30 +356,46 @@ export const api = {
   // ── Replay bundle composer (PLAN §10.12) ────────────────────────
   //
   // Builds the bundle the replay shell consumes by fetching the log
-  // record + current deployment manifest + handler source bytes +
-  // captured tape blobs. All fetches use existing /_system/log/* and
-  // /_system/files/* routes (cookie auth, same-origin). The composed
-  // bundle is then handed to the replay shell on `replay.<suffix>`
-  // via postMessage — see `replayOpen` below.
+  // record + the deployment manifest the request was dispatched
+  // against + handler source bytes + captured tape blobs. All
+  // fetches use existing /_system/log/* and /_system/files/* routes
+  // (cookie auth, same-origin). The composed bundle is then handed
+  // to the replay shell on `replay.<suffix>` via postMessage — see
+  // `replayOpen` below.
   //
-  // BETA LIMITATION: uses the CURRENT manifest to resolve the entry
-  // source. If the deployment changed between the original request
-  // and the replay click, the source loaded in the iframe is the
-  // CURRENT source, not the historical one. Source bytes are
-  // content-addressed, so source-by-hash lookup against historical
-  // deployments would work — but the manifest endpoint only exposes
-  // the current deployment today. Acceptable for beta where most
-  // replays target recent failures against the live deployment.
+  // The manifest is loaded by the request's captured deployment_id,
+  // not the current pointer — replays of older requests get the
+  // historical source the handler actually ran with. If retention
+  // has GC'd that deployment, we fall back to the current manifest
+  // and surface a `historical_manifest_missing` flag so the replay
+  // shell can warn the user.
   async composeReplayBundle(instance_id, request_id_hex) {
     const inst = encodeURIComponent(instance_id);
     const rid = encodeURIComponent(request_id_hex);
 
-    const [recordRes, manifestRes] = await Promise.all([
-      rawGet(adminBase(), `/_system/log/${inst}/show/${rid}`),
-      rawGet(adminBase(), `/_system/files/${inst}/list`),
-    ]);
+    const recordRes = await rawGet(adminBase(), `/_system/log/${inst}/show/${rid}`);
     const record = await recordRes.json();
-    const manifest = await manifestRes.json();
+
+    // Hex-encoded deployment id matches the
+    // /_system/files/{inst}/deployments/{hex} route shape.
+    const depHex = (record.deployment_id ?? 0).toString(16).padStart(16, "0");
+    let manifest;
+    let historicalManifestMissing = false;
+    try {
+      const r = await rawGet(adminBase(),
+        `/_system/files/${inst}/deployments/${depHex}`);
+      manifest = await r.json();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) {
+        // Historical deployment GC'd or otherwise unreachable —
+        // fall back to current. Replay shell can flag the mismatch.
+        historicalManifestMissing = true;
+        const r = await rawGet(adminBase(), `/_system/files/${inst}/list`);
+        manifest = await r.json();
+      } else {
+        throw err;
+      }
+    }
 
     // Find the handler entry. PLAN §2.4 says the default export at
     // `index.mjs` (or `index.js` post-compile) is the catch-all
@@ -457,6 +473,12 @@ export const api = {
       // by hash; the entry itself is also in here.
       modules: sources,
       tape_blobs: tapeBlobs,
+      // True iff the historical manifest was unreachable and the
+      // shell got the CURRENT manifest as a fallback. Replay shell
+      // surfaces this in the side-effects panel so the user knows
+      // the source they're stepping through may not match what
+      // originally ran.
+      historical_manifest_missing: historicalManifestMissing,
     };
   },
 

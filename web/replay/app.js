@@ -662,6 +662,10 @@ function safeStringify(v) {
 
     renderMeta(bundle);
 
+    if (bundle.historical_manifest_missing) {
+      appendSideEffect("warning", "Historical deployment was GC'd; replay loaded the CURRENT manifest. Source you're stepping through may not match what originally ran.");
+    }
+
     let parsedTapes;
     try {
       parsedTapes = parseTapesFromBundle(bundle);
