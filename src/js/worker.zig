@@ -1548,11 +1548,22 @@ pub fn drainRaftPending(worker: anytype) !void {
             // "orphan" and get rolled back by the next startup sweep,
             // silently corrupting state.
             if (wait.store) |store| {
-                store.commitTxn(wait.txn_seq) catch |err| panic_mod.invariantViolated(
-                    "drainRaftPending.commitTxn",
-                    "txn_seq={d} err={s}",
-                    .{ wait.txn_seq, @errorName(err) },
-                );
+                store.commitTxn(wait.txn_seq) catch |err| switch (err) {
+                    // Per-tenant app.db connections run with
+                    // busy_timeout=0 (so the dispatcher's BEGIN IMMEDIATE
+                    // surfaces BUSY immediately for the anchor-skip
+                    // dance); a different worker holding the writer lock
+                    // briefly is expected contention, not a broken
+                    // invariant. Leave the entity in raft_pending and
+                    // try again on the next tick — the undo row is
+                    // harmless to leave around for a few ms.
+                    error.Conflict => continue,
+                    else => panic_mod.invariantViolated(
+                        "drainRaftPending.commitTxn",
+                        "txn_seq={d} err={s}",
+                        .{ wait.txn_seq, @errorName(err) },
+                    ),
+                };
             }
             try server.reg.move(ent, &worker.raft_pending, &server.response_in);
             continue;
@@ -1568,11 +1579,17 @@ pub fn drainRaftPending(worker: anytype) !void {
         // Reverse iteration ensures correct ordering for same-tenant
         // stacks of faulted writes.
         if (wait.store) |store| {
-            store.undoTxn(wait.txn_seq) catch |err| panic_mod.invariantViolated(
-                "drainRaftPending.undoTxn",
-                "txn_seq={d} err={s}",
-                .{ wait.txn_seq, @errorName(err) },
-            );
+            store.undoTxn(wait.txn_seq) catch |err| switch (err) {
+                // Same reasoning as the commitTxn branch: another worker
+                // briefly holds the writer lock; defer this entity to
+                // the next tick instead of aborting.
+                error.Conflict => continue,
+                else => panic_mod.invariantViolated(
+                    "drainRaftPending.undoTxn",
+                    "txn_seq={d} err={s}",
+                    .{ wait.txn_seq, @errorName(err) },
+                ),
+            };
         }
 
         const old_body_ptr: ?[*]u8 = resp_body.data;

@@ -1046,7 +1046,9 @@ pub const KvStore = struct {
         _ = c.sqlite3_bind_int64(st, 1, @bitCast(txn_seq));
         const rc = c.sqlite3_step(st);
         _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
+        if (rc == c.SQLITE_DONE) return;
+        if (rc == c.SQLITE_BUSY) return Error.Conflict;
+        return Error.Sqlite;
     }
 
     fn deleteUndoBelowEq(self: *KvStore, committed_seq: u64) Error!void {
