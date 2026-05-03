@@ -965,6 +965,7 @@ const ADMIN_UI_APP_CSS = @embedFile("admin_ui_app_css");
 const ADMIN_UI_PAGE_LOGIN = @embedFile("admin_ui_page_login");
 const ADMIN_UI_PAGE_INSTANCES = @embedFile("admin_ui_page_instances");
 const ADMIN_UI_PAGE_INSTANCE = @embedFile("admin_ui_page_instance");
+const ADMIN_UI_CODEMIRROR = @embedFile("admin_ui_codemirror");
 
 const ADMIN_DEPLOY_FILES = [_]DeployFile{
     .{ .path = "index.mjs", .content = ADMIN_HANDLER_SRC },
@@ -976,6 +977,7 @@ const ADMIN_DEPLOY_FILES = [_]DeployFile{
     .{ .path = "_static/pages/login.js", .content = ADMIN_UI_PAGE_LOGIN, .content_type = "application/javascript" },
     .{ .path = "_static/pages/instances.js", .content = ADMIN_UI_PAGE_INSTANCES, .content_type = "application/javascript" },
     .{ .path = "_static/pages/instance.js", .content = ADMIN_UI_PAGE_INSTANCE, .content_type = "application/javascript" },
+    .{ .path = "_static/codemirror.mjs", .content = ADMIN_UI_CODEMIRROR, .content_type = "application/javascript" },
 };
 
 // __replay__ tenant bundle. Static-only — the shell uses postMessage

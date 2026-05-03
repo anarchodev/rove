@@ -365,6 +365,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "admin_ui_page_login", .path = "web/admin/pages/login.js" },
         .{ .name = "admin_ui_page_instances", .path = "web/admin/pages/instances.js" },
         .{ .name = "admin_ui_page_instance", .path = "web/admin/pages/instance.js" },
+        .{ .name = "admin_ui_codemirror", .path = "web/admin/codemirror.mjs" },
     };
     for (admin_files) |f| {
         loop46_mod.addAnonymousImport(f.name, .{

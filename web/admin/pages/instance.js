@@ -508,7 +508,7 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
           <span class="editor-meta muted"></span>
           <button type="button" class="save" disabled>Save</button>
         </div>
-        <textarea class="editor-body" spellcheck="false" disabled></textarea>
+        <div class="editor-body" tabindex="-1"></div>
       </section>
     </div>
   `;
@@ -520,9 +520,51 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
   const pathLabel = el.querySelector(".current-path");
   const metaLabel = el.querySelector(".editor-meta");
   const saveBtn = el.querySelector(".save");
-  const textarea = el.querySelector(".editor-body");
+  const editorMount = el.querySelector(".editor-body");
 
   let selected = null; // { path, kind, content_type, original }
+  let cm = null;       // { view, langCompartment, EditorView, EditorState, ... }
+  let cmLoading = null; // in-flight import promise
+
+  // Lazy-load + mount the CodeMirror editor on first use. Returns
+  // the resolved `cm` handle. The vendored bundle is ~450 KB; only
+  // pulled when the user actually opens the Code tab.
+  function ensureEditor() {
+    if (cm) return Promise.resolve(cm);
+    if (cmLoading) return cmLoading;
+    cmLoading = import("/codemirror.mjs").then((CM) => {
+      const langCompartment = new CM.Compartment();
+      const editableCompartment = new CM.Compartment();
+      const docChanged = CM.EditorView.updateListener.of((u) => {
+        if (!u.docChanged || !selected) return;
+        const cur = u.state.doc.toString();
+        saveBtn.disabled = cur === selected.original;
+      });
+      const state = CM.EditorState.create({
+        doc: "",
+        extensions: [
+          CM.lineNumbers(),
+          CM.highlightActiveLine(),
+          CM.history(),
+          CM.bracketMatching(),
+          CM.indentOnInput(),
+          CM.syntaxHighlighting(CM.defaultHighlightStyle, { fallback: true }),
+          CM.keymap.of([...CM.defaultKeymap, ...CM.historyKeymap, CM.indentWithTab]),
+          langCompartment.of([]),
+          editableCompartment.of(CM.EditorView.editable.of(false)),
+          docChanged,
+        ],
+      });
+      const view = new CM.EditorView({ state, parent: editorMount });
+      cm = { CM, view, langCompartment, editableCompartment };
+      return cm;
+    }).catch((err) => {
+      cmLoading = null;
+      showError(`Code editor failed to load: ${err.message}`);
+      throw err;
+    });
+    return cmLoading;
+  }
 
   async function loadList() {
     refreshBtn.disabled = true;
@@ -562,6 +604,16 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
     return li;
   }
 
+  /// Pick a CodeMirror language extension based on the file path.
+  /// `.mjs` / `.js` → JavaScript (with optional JSX flag off);
+  /// `.html` / `.htm` → HTML; `.css` → CSS; otherwise plain text.
+  function langFor(CM, path) {
+    if (path.endsWith(".mjs") || path.endsWith(".js")) return CM.javascript();
+    if (path.endsWith(".html") || path.endsWith(".htm")) return CM.html();
+    if (path.endsWith(".css")) return CM.css();
+    return [];
+  }
+
   async function openFile(path) {
     clearError();
     for (const node of list.querySelectorAll("li")) {
@@ -569,8 +621,21 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
     }
     pathLabel.textContent = path;
     metaLabel.textContent = "Loading…";
-    textarea.disabled = true;
     saveBtn.disabled = true;
+
+    let editor;
+    try {
+      editor = await ensureEditor();
+    } catch {
+      return; // showError already invoked inside ensureEditor
+    }
+    // Disable while we fetch.
+    editor.view.dispatch({
+      effects: editor.editableCompartment.reconfigure(
+        editor.CM.EditorView.editable.of(false),
+      ),
+    });
+
     try {
       const file = await api.getFile(instanceId, path);
       selected = {
@@ -579,8 +644,15 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
         content_type: file.content_type,
         original: file.content ?? "",
       };
-      textarea.value = selected.original;
-      textarea.disabled = false;
+      editor.view.dispatch({
+        changes: { from: 0, to: editor.view.state.doc.length, insert: selected.original },
+        effects: [
+          editor.langCompartment.reconfigure(langFor(editor.CM, path)),
+          editor.editableCompartment.reconfigure(
+            editor.CM.EditorView.editable.of(true),
+          ),
+        ],
+      });
       metaLabel.textContent = `${file.kind} · ${file.content_type || "(no content-type)"} · ${selected.original.length} bytes`;
       saveBtn.disabled = true; // enable only when dirty
     } catch (err) {
@@ -593,17 +665,12 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
     }
   }
 
-  textarea.addEventListener("input", () => {
-    if (!selected) return;
-    saveBtn.disabled = textarea.value === selected.original;
-  });
-
   saveBtn.addEventListener("click", async () => {
-    if (!selected) return;
+    if (!selected || !cm) return;
     saveBtn.disabled = true;
     saveBtn.textContent = "Saving…";
     try {
-      const body = textarea.value;
+      const body = cm.view.state.doc.toString();
       const ct = selected.content_type && selected.content_type.length > 0
         ? selected.content_type
         : (selected.kind === "handler" ? "application/javascript" : "application/octet-stream");
@@ -656,7 +723,12 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
   });
 
   loadList();
-  return () => {};
+  return () => {
+    if (cm) {
+      cm.view.destroy();
+      cm = null;
+    }
+  };
 }
 
 /// Small extension → MIME table for new static files. Covers the
