@@ -1808,27 +1808,44 @@ pub fn H2(comptime opts: Options) type {
                 if (c.nghttp2_session_want_write(ng_session) == 0) continue;
 
                 if (conn_ptr.tls_conn) |tc| {
+                    // Mirrors the plaintext path below: flush the buffer
+                    // when a frame won't fit, then keep going. The old
+                    // code destroyed the connection on overflow, which
+                    // killed any response > ~64KB (e.g. the codemirror
+                    // bundle in the admin UI).
                     var accum_buf: [65536]u8 = undefined;
                     var accum_len: usize = 0;
+                    var broke = false;
 
                     while (true) {
                         var frame_data: [*c]const u8 = undefined;
                         const len = c.nghttp2_session_mem_send(ng_session, &frame_data);
                         if (len < 0) {
                             try self.reg.destroy(ent);
+                            broke = true;
                             break;
                         }
                         if (len == 0) break;
                         const flen: usize = @intCast(len);
                         if (accum_len + flen > accum_buf.len) {
-                            try self.reg.destroy(ent);
-                            break;
+                            const cipher = tc.encrypt(accum_buf[0..accum_len], self.allocator) catch {
+                                try self.reg.destroy(ent);
+                                broke = true;
+                                break;
+                            };
+                            self.submitWrite(ent, cipher) catch {
+                                self.allocator.free(cipher);
+                                try self.reg.destroy(ent);
+                                broke = true;
+                                break;
+                            };
+                            accum_len = 0;
                         }
                         @memcpy(accum_buf[accum_len .. accum_len + flen], frame_data[0..flen]);
                         accum_len += flen;
                     }
 
-                    if (accum_len > 0) {
+                    if (!broke and accum_len > 0) {
                         const cipher = tc.encrypt(accum_buf[0..accum_len], self.allocator) catch {
                             try self.reg.destroy(ent);
                             continue;
@@ -1845,7 +1862,7 @@ pub fn H2(comptime opts: Options) type {
                     // + DATA for each response become separate `prep_send`
                     // SQEs and therefore separate TCP segments, and the
                     // client's delayed-ACK stalls every request-response
-                    // round trip by ~40 ms. Mirrors the TLS path above.
+                    // round trip by ~40 ms.
                     var accum_buf: [65536]u8 = undefined;
                     var accum_len: usize = 0;
                     var broke = false;
