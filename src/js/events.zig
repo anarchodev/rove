@@ -14,6 +14,7 @@ const h2 = @import("rove-h2");
 const respb = @import("response_builder.zig");
 const session_mod = @import("session.zig");
 const events_pump = @import("events_pump.zig");
+const limiter_mod = @import("limiter.zig");
 
 /// Per-account plan tier. Lives here for now until the platform-wide
 /// `tenant.PlanTier` lands in Phase 10 (PLAN §3 / §2.4 account model).
@@ -129,6 +130,9 @@ pub fn tryHandleEvents(
     server: anytype,
     allocator: std.mem.Allocator,
     tc: anytype,
+    instance_id: []const u8,
+    limiter: ?*limiter_mod.RateLimiter,
+    caps: EventsCaps,
     ent: rove.Entity,
     sid_h2: h2.StreamId,
     sess: h2.Session,
@@ -151,10 +155,35 @@ pub fn tryHandleEvents(
         return true;
     }
 
+    // Hard cap: per-instance concurrent connections. At capacity →
+    // 503 immediately so a flooding tenant can't exhaust h2 streams.
+    if (events_pump.countConnections(tc) >= caps.max_concurrent_connections_per_instance) {
+        try respb.setSimpleResponse(server, ent, sid_h2, sess, 503, "events: per-instance connection cap reached\n", allocator);
+        return true;
+    }
+
+    // Connect-rate limit. Defends against churn DoS (open/close
+    // repeatedly to chew CPU). 429 with Retry-After lets honest
+    // clients back off gracefully.
+    if (limiter) |lim| {
+        const allowed = lim.check(instance_id, .events_connect, received_ns) catch true;
+        if (!allowed) {
+            try respb.setRateLimitedResponse(server, ent, sid_h2, sess, allocator, lim.retryAfterSeconds(instance_id, .events_connect));
+            return true;
+        }
+    }
+
     // Resolve / mint the session cookie. Mint policy + cookie shape
     // are defined in session.zig.
     var prng = std.Random.DefaultPrng.init(@bitCast(received_ns));
     const resolved = session_mod.resolve(rh, prng.random());
+
+    // Per-session concurrent-connection cap. Multi-tab sanity guard —
+    // refuses the (cap+1)th simultaneous connection from one session.
+    if (events_pump.countConnectionsForSid(tc, &resolved.sid) >= caps.max_concurrent_connections_per_session) {
+        try respb.setSimpleResponse(server, ent, sid_h2, sess, 503, "events: per-session connection cap reached\n", allocator);
+        return true;
+    }
 
     // Last-Event-ID resume cursor: header takes precedence; ?since=
     // is the non-EventSource fallback (SSE clients send the header

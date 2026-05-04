@@ -33,6 +33,7 @@ const qjs = @import("rove-qjs");
 const c = qjs.c;
 
 const globals = @import("../globals.zig");
+const limiter_mod = @import("../limiter.zig");
 
 const js_undefined = globals.js_undefined;
 const js_null = globals.js_null;
@@ -162,6 +163,18 @@ pub fn jsEventsEmit(
     if (argc < 1) {
         _ = c.JS_ThrowTypeError(ctx, "events.emit requires at least one argument");
         return js_exception;
+    }
+
+    // Per-instance rate limit on emit calls. One token per call
+    // regardless of fan-out cardinality. No-op when limiter is
+    // unwired (test paths) — same posture as email.send.
+    if (state.limiter) |lim| {
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        const allowed = lim.check(state.instance_id, .events_emit, now_ns) catch true;
+        if (!allowed) {
+            return throwCoded(ctx, state, "rate_limited",
+                "events.emit: per-instance emit rate exceeded");
+        }
     }
 
     // Argument normalization. String form → {data: <s>, type: "message",

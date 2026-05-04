@@ -29,6 +29,7 @@ const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
 
 const events_mod = @import("events.zig");
+const limiter_mod = @import("limiter.zig");
 
 /// Per-connection record. Owned by the tenant's `TenantFiles`.
 pub const SseConnection = struct {
@@ -303,6 +304,20 @@ pub fn pumpEvents(worker: anytype) !void {
     }
 }
 
+/// Outcome of one connection's push attempt this tick.
+const PushOutcome = enum {
+    /// Wrote at least one frame. Move on; the dirty mark is consumed.
+    pushed,
+    /// Dirty mark fired but the prefix scan came up empty. Clear the
+    /// mark — this was either a stale signal or rows already drained
+    /// last tick.
+    no_rows,
+    /// Had rows ready but the events_bytes_out bucket was empty.
+    /// Keep the sid dirty so we retry next tick (when the bucket has
+    /// refilled).
+    backpressured,
+};
+
 fn pumpTenant(
     worker: anytype,
     tc: anytype,
@@ -311,6 +326,13 @@ fn pumpTenant(
 ) !void {
     const server = worker.h2;
     const allocator = worker.allocator;
+    const limiter: ?*limiter_mod.RateLimiter = &worker.limiter;
+    const instance_id = inst.id;
+
+    // Sids that backpressured this tick — kept in dirty_sids after
+    // the drain at the bottom so we retry next tick.
+    var keep: std.StringHashMapUnmanaged(void) = .empty;
+    defer keep.deinit(allocator);
 
     // Walk connections; for each in stream_data_out, decide what to
     // push. We mutate sse_connections (advancing last_event_id /
@@ -322,15 +344,24 @@ fn pumpTenant(
 
         const sid_dirty = tc.dirty_sids.contains(&conn.sid);
         if (sid_dirty) {
-            const wrote = try pushDirtyEvents(server, allocator, inst, conn);
-            if (wrote) {
-                conn.last_send_ns = now_ns;
-                continue;
+            const outcome = try pushDirtyEvents(server, allocator, inst, conn, limiter, instance_id, now_ns);
+            switch (outcome) {
+                .pushed => {
+                    conn.last_send_ns = now_ns;
+                    continue;
+                },
+                .backpressured => {
+                    // Remember to retain this sid in dirty_sids so we
+                    // retry next tick. We can't insert directly while
+                    // iterating dirty_sids' keys (we don't), but we
+                    // can use a side hashmap.
+                    try keep.put(allocator, &conn.sid, {});
+                    // Still consider keepalive — wire isn't blocked.
+                },
+                .no_rows => {
+                    // Stale dirty mark; nothing to do, fall through.
+                },
             }
-            // No new rows after `last_event_id` despite the dirty mark
-            // (e.g. the writeset's emit was deleted before we got
-            // here, or an unrelated key under a not-yet-cleared prefix
-            // tripped the mark). Fall through to keepalive logic.
         }
 
         if (now_ns - conn.last_send_ns >= KEEPALIVE_INTERVAL_NS) {
@@ -339,11 +370,36 @@ fn pumpTenant(
         }
     }
 
-    // Drain dirty_sids — every dirty sid we either delivered for, or
-    // had no rows for. Either way the mark is consumed.
-    clearDirtySids(tc);
+    // Drain dirty_sids, retaining sids in `keep`. The retained sids
+    // need NEW owned allocations because the originals get freed in
+    // clearDirtySids.
+    try drainDirtyExcept(tc, &keep);
 }
 
+fn drainDirtyExcept(tc: anytype, keep: *const std.StringHashMapUnmanaged(void)) !void {
+    var to_keep: std.ArrayListUnmanaged([]u8) = .empty;
+    defer to_keep.deinit(tc.allocator);
+
+    var it = tc.dirty_sids.iterator();
+    while (it.next()) |entry| {
+        const sid = entry.key_ptr.*;
+        if (keep.contains(sid)) {
+            const dup = try tc.allocator.dupe(u8, sid);
+            errdefer tc.allocator.free(dup);
+            try to_keep.append(tc.allocator, dup);
+        }
+        tc.allocator.free(sid);
+    }
+    tc.dirty_sids.clearRetainingCapacity();
+
+    for (to_keep.items) |sid| {
+        try tc.dirty_sids.put(tc.allocator, sid, {});
+    }
+}
+
+// `clearDirtySids` superseded by `drainDirtyExcept` in the pump path.
+// Retained as a freestanding helper for tests / callers that want a
+// full wipe.
 fn clearDirtySids(tc: anytype) void {
     var it = tc.dirty_sids.iterator();
     while (it.next()) |entry| tc.allocator.free(entry.key_ptr.*);
@@ -358,7 +414,10 @@ fn pushDirtyEvents(
     allocator: std.mem.Allocator,
     inst: *const @import("rove-tenant").Instance,
     conn: *SseConnection,
-) !bool {
+    limiter: ?*limiter_mod.RateLimiter,
+    instance_id: []const u8,
+    now_ns: i64,
+) !PushOutcome {
     var key_buf: [8 + 64 + 1]u8 = undefined;
     const prefix = std.fmt.bufPrint(
         &key_buf,
@@ -367,11 +426,11 @@ fn pushDirtyEvents(
     ) catch unreachable;
 
     var scan = inst.kv.prefix(prefix, &conn.last_event_id, PUMP_BATCH_LIMIT) catch |err| switch (err) {
-        error.NotFound => return false,
+        error.NotFound => return .no_rows,
         else => return err,
     };
     defer scan.deinit();
-    if (scan.entries.len == 0) return false;
+    if (scan.entries.len == 0) return .no_rows;
 
     // Build a single buffer holding every frame for this tick. h2
     // copies it into its own send buffer when it picks up the
@@ -396,7 +455,25 @@ fn pushDirtyEvents(
         @memcpy(&last_id, wire_id_slice[0..27]);
     }
 
-    if (out.items.len == 0) return false;
+    if (out.items.len == 0) {
+        out.deinit(allocator);
+        return .no_rows;
+    }
+
+    // events_bytes_out rate limit. 1 token = 1 byte. When the bucket
+    // can't cover the whole frame buffer, defer this connection to
+    // the next tick — caller leaves the sid in dirty_sids so we
+    // retry. The buffer is discarded; we'll re-build next tick from
+    // a fresh prefix scan (cheap because last_event_id wasn't
+    // advanced).
+    if (limiter) |lim| {
+        const want: u32 = @intCast(out.items.len);
+        const allowed = lim.checkN(instance_id, .events_bytes_out, want, now_ns) catch true;
+        if (!allowed) {
+            out.deinit(allocator);
+            return .backpressured;
+        }
+    }
 
     const owned = try out.toOwnedSlice(allocator);
     server.reg.set(conn.stream_ent, &server.stream_data_out, h2.RespBody, .{
@@ -412,7 +489,7 @@ fn pushDirtyEvents(
     };
 
     conn.last_event_id = last_id;
-    return true;
+    return .pushed;
 }
 
 fn writeKeepalive(server: anytype, allocator: std.mem.Allocator, conn: *SseConnection) !void {

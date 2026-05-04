@@ -580,10 +580,27 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
         // `/_events` — SSE endpoint, scoped to the resolved tenant
         // (its sse_connections + dirty_sids tables). Mints
-        // `__Host-rove_sid` if absent, sends text/event-stream headers,
-        // moves into stream_response_in for the pump to drive on
-        // subsequent ticks. See docs/sse-plan.md §11d/§11e.
-        if (try events_mod.tryHandleEvents(server, allocator, tc, ent, sid, sess, method, path, rh, received_ns)) {
+        // `__Host-rove_sid` if absent, sends text/event-stream
+        // headers, moves into stream_response_in for the pump to
+        // drive on subsequent ticks. Caps + connect-rate enforced
+        // here so a flooding tenant can't exhaust resources before
+        // the connection table even sees them. See
+        // docs/sse-plan.md §11d-f.
+        if (try events_mod.tryHandleEvents(
+            server,
+            allocator,
+            tc,
+            scope_inst.id,
+            &worker.limiter,
+            events_mod.FREE,
+            ent,
+            sid,
+            sess,
+            method,
+            path,
+            rh,
+            received_ns,
+        )) {
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 200, .ok, &.{}, &.{}, .{});
             processed += 1;
             continue;
