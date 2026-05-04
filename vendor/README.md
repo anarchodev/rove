@@ -10,32 +10,28 @@ and any local patches applied on top. When you want to update one,
 re-vendor from the noted base and re-apply the patches (or bring the
 local changes forward manually and update the note).
 
-## quickjs-ng
+## arenajs
 
-- **Upstream:** <https://github.com/quickjs-ng/quickjs>
-- **Base:** v0.13.0 (commit `71a3c54`)
-- **License:** MIT (see `quickjs-ng/LICENSE`)
-- **Local changes:** one patch, documented inline at
-  `quickjs-ng/rove-kv-deterministic-init.patch.md`.
+- **Upstream:** <https://github.com/anarchodev/arenajs>
+- **Base:** see `arenajs/README.md` for the pinned commit.
+- **License:** MIT (see `arenajs/LICENSE`)
+- **What it is:** a fork of quickjs-ng tuned for one-shot
+  per-request server execution. The runtime is initialized once
+  into a frozen base snapshot; per-request reset collapses to a
+  single bump-cursor write (~9 ns) instead of the memcpy of the
+  whole image that the previous shift-js-style snapshot path used.
 
-  The patch makes `JS_NewContext` byte-for-byte deterministic so
-  rove-qjs's memcpy-restore-per-request path (the feature that
-  justifies using quickjs at all) produces identical arena contents
-  on back-to-back restores. Without it, three volatile slots
-  (`random_state`, `time_origin`, and `performance.timeOrigin`) would
-  diverge between passes and force semantic-type-aware re-seeding in
-  the restore code. The patch zeros them at construction; rove-qjs
-  seeds them explicitly in `newContext` / `Snapshot.restore` instead.
-
-  Applied directly to `quickjs.c` — there is no separate `.patch`
-  file because the diff is small and maintaining a two-step
-  "vendor + apply" workflow buys nothing when we already own the
-  vendored copy.
+  Replaces the previously-vendored quickjs-ng plus its
+  `rove-kv-deterministic-init.patch.md` (the deterministic-init
+  fixes are baked into the fork). See `arenajs/README.md` for the
+  upgrade procedure and the constraints inherited from the fork
+  (single context per runtime, no `JS_FreeRuntime` after freeze,
+  fixed buffer sizes, weak-ref behaviour on base targets).
 
 - **Build flags:** see `build.zig` — `-D_GNU_SOURCE`,
-  `-DQUICKJS_NG_BUILD`, no libc module, no CLI. The four source
-  files we compile are `quickjs.c`, `libregexp.c`, `libunicode.c`,
-  `dtoa.c`.
+  `-DQUICKJS_NG_BUILD`, no libc module, no CLI. Five source files:
+  `quickjs.c`, `qjs-arena.c` (new in the fork), `libregexp.c`,
+  `libunicode.c`, `dtoa.c`.
 
 ## raft
 
@@ -54,10 +50,10 @@ local changes forward manually and update the note).
 
 - Don't reformat vendored source. Any local edit should be a
   minimal diff we could theoretically upstream.
-- If you patch quickjs-ng, append a paragraph to
-  `rove-kv-deterministic-init.patch.md` (or add a sibling `.md` if
-  the new patch is unrelated to determinism) explaining the "why"
-  and "how to re-apply." Future you will thank you.
+- arenajs has no in-tree rove patches today — the determinism +
+  arena-mode changes that used to live as a `.patch.md` are now
+  part of the fork itself. To re-vendor a newer arenajs commit,
+  follow the procedure in `arenajs/README.md`.
 - rove-kv's Maelstrom tests are the canary for any raft vendor bump:
   willemt's library changes subtle behavior across versions, and
   Maelstrom's linearizability checker catches it faster than any

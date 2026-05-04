@@ -102,7 +102,7 @@ Raft replicates the manifest (the `file/{path}` key → `{hash, kind, content_ty
 ### Vendored C code
 
 See `vendor/README.md` for upstream revisions, patches, and maintenance procedures:
-- **quickjs-ng** (v0.13.0) — patched for deterministic `JS_NewContext` (zeroed volatile slots)
+- **arenajs** — fork of quickjs-ng with a dual bump arena (base + per-request); per-request reset is one cursor write instead of memcpy. Replaces the previously-vendored quickjs-ng + deterministic-init patch. See `vendor/arenajs/README.md` for the pinned commit and inherited constraints.
 - **willemt/raft** — consensus library, unmodified
 
 ## Conventions

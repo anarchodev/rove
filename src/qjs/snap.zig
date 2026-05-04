@@ -1,612 +1,194 @@
-//! Snapshot + arena machinery for rove-qjs.
+//! arenajs wrapper for rove-qjs.
 //!
-//! This is the port of shift-js's `qjs_snap.c`/`.h` — the memcpy-restore
-//! trick that lets us reset a JS runtime to a fully-initialized state in
-//! microseconds. The model:
+//! Replaces shift-js's memcpy + bitmap-relocation snapshot machinery
+//! with the arenajs dual-arena model: the runtime+context are created
+//! and frozen once into a base arena that lives forever; each request
+//! resets the request arena via a single cursor write (~9 ns) and
+//! reseeds time/random.
 //!
-//! 1. All JS runtime allocations flow through a per-arena bump allocator
-//!    (`BumpMallocFunctions`) wired into QuickJS via `JS_NewRuntime2`.
-//! 2. `Snapshot.create` runs an init callback TWICE in two separately-
-//!    allocated arenas. By diffing the two byte images, we identify:
-//!      - bytes that are identical → constants, copy verbatim on restore
-//!      - 8-byte slots that differ by exactly `(baseB - baseA)` → relocatable
-//!        pointers; remember them in a bitmap
-//!      - 8-byte slots that differ otherwise → non-deterministic ("volatile")
-//!        slots that must be re-seeded per restore. QuickJS has two:
-//!        `random_state` and `time_origin`, both inside `JSContext`.
-//! 3. `Snapshot.restore` memcpy's the frozen image into a target arena,
-//!    walks the bitmap adding `(new_base - old_base)` to each flagged slot,
-//!    rewrites the JSRuntime opaque pointer, re-seeds the volatile slots
-//!    from the wall clock, and returns the rebuilt `Runtime` + `Context`.
+//! Lifecycle (paired with caller code, typically a Dispatcher):
 //!
-//! The determinism check is the load-bearing correctness property. If a
-//! future quickjs-ng upgrade introduces new non-deterministic state inside
-//! JSContext, `create` will detect it and either grow the volatile list or
-//! abort. Volatile slots outside JSContext are considered a catastrophic
-//! bug and panic.
+//!   var snap = try Snapshot.create(.{}, init_fn, user_data);
+//!   // init_fn ran with ALLOC mode = base; everything it allocated
+//!   // (intrinsics, globals, prelude eval results) lives in the
+//!   // immortal base. JS_FreezeRuntime has flipped allocation to
+//!   // request mode and page-protected base.
+//!
+//!   for each request:
+//!       const restored = snap.restore();
+//!       // restored.runtime / .context are the same pointers each
+//!       // request — base is shared. Per-request allocations land
+//!       // in the request arena.
+//!       defer snap.resetForNext();  // or call at top of next request
+//!
+//!   snap.deinit();
+//!
+//! Constraints inherited from arenajs (see vendor/arenajs/README.md):
+//!
+//!   - One arena-backed runtime per *thread* (per the per-thread fix
+//!     in arenajs master). Multi-tenant rove deploys one Snapshot per
+//!     worker thread.
+//!   - Single context per runtime.
+//!   - No JS_FreeRuntime after JS_FreezeRuntime; teardown is
+//!     js_dual_arena_free (called from Snapshot.deinit).
+//!   - Fixed buffer sizes — sized at create() and never grow. Sizing
+//!     is the embedder's responsibility.
 
 const std = @import("std");
 const root = @import("root.zig");
 
 pub const c = root.c;
 
-/// Bytes reserved per arena. Matches shift-js. Any JS runtime + context +
-/// global setup must fit in this; we don't grow.
-pub const ARENA_SIZE: usize = 10 * 1024 * 1024;
+/// Default base-arena size: holds the runtime, intrinsics, globals,
+/// and any setup eval the init_fn does. Must fit everything the
+/// init_fn allocates plus arenajs's internal overhead. Matches the
+/// 10 MiB ceiling shift-js's old memcpy snapshot used to hit.
+pub const DEFAULT_BASE_SIZE: usize = 10 * 1024 * 1024;
 
-/// Hard cap on non-deterministic slots the snapshot can tolerate.
-/// QuickJS currently has two (`random_state`, `time_origin`). If this
-/// trips, either the runtime gained a new volatile field or our init
-/// function introduced one via a global (e.g. `Math.random()` called
-/// during init). Either way, investigate before bumping.
-pub const MAX_VOLATILE: usize = 8;
+/// Default request-arena size: holds per-request allocations (loaded
+/// handler bytecode, intermediate JS values, response building).
+/// Handler authors who exceed this see JS OOM on the offending alloc.
+pub const DEFAULT_REQUEST_SIZE: usize = 4 * 1024 * 1024;
+
+pub const Sizes = struct {
+    base_size: usize = DEFAULT_BASE_SIZE,
+    request_size: usize = DEFAULT_REQUEST_SIZE,
+};
 
 pub const Error = error{
-    ArenaAllocFailed,
-    ArenaOutOfMemory,
-    InitFnFailed,
-    NonDeterministic,
-    /// A non-deterministic slot was detected during snapshot creation.
-    /// Under the rove-kv deterministic-init patch applied to vendor/
-    /// quickjs-ng (see vendor/quickjs-ng/rove-kv-deterministic-init.patch.md),
-    /// there should be ZERO volatile slots. This error means either:
-    ///   1. The quickjs-ng upgrade reintroduced volatile state; reapply
-    ///      the patch or extend it.
-    ///   2. The user-supplied init_fn invoked a non-deterministic op
-    ///      (Math.random, Date.now, crypto.getRandomValues, reading
-    ///      an env var, ...).
-    VolatileSlotDetected,
     RuntimeCreateFailed,
     ContextCreateFailed,
+    InitFnFailed,
     OutOfMemory,
 };
 
-// ── Bump arena ─────────────────────────────────────────────────────────
-
-/// Per-request arena. Holds exactly `ARENA_SIZE` bytes of owned memory.
+/// Caller-supplied setup. Runs ONCE during Snapshot.create with the
+/// dual arena in BASE mode — every allocation lands in the immortal
+/// base arena. Install intrinsics, globals, and run any prelude eval
+/// here. After init_fn returns, Snapshot.create calls
+/// JS_FreezeRuntime which page-protects base; subsequent JS execution
+/// is verified base-clean by arenajs's test262 sweep.
 ///
-/// **The bump cursor lives INSIDE the data buffer** (at offset 0) rather
-/// than as a separate field on this struct. Reason: QuickJS stores the
-/// opaque pointer we hand to `JS_NewRuntime2` inside its `JSRuntime`
-/// struct, and that pointer has to relocate correctly across snapshot
-/// restore. If we passed `&arena` (the Zig control struct), its address
-/// has no fixed relationship to the arena buffer base — so the two
-/// determinism-verifying init passes would compute different `opaque`
-/// values whose delta is unrelated to the arena-data delta, and the
-/// snapshot diff would classify it as "volatile" (unrelocatable random
-/// state). By passing `arena.data.ptr` directly as the opaque, we make
-/// its delta across runs exactly equal the data-base delta, so the
-/// diff classifies it as a relocatable pointer and the bitmap handles
-/// it just like any other.
-///
-/// The first 16 bytes of `data` are reserved (8 for the used counter,
-/// 8 for padding to keep everything 16-aligned). Allocations start at
-/// offset 16.
-pub const Arena = struct {
-    allocator: std.mem.Allocator,
-    /// Owned backing storage, 16-byte aligned. First 16 bytes are the
-    /// reserved prefix described above.
-    data: []align(16) u8,
-
-    /// Initial `used` value for a fresh or reset arena. 16 bytes of
-    /// prefix: 8 for the counter + 8 padding to keep user allocations
-    /// 16-aligned after the counter.
-    const PREFIX_LEN: usize = 16;
-
-    pub fn create(allocator: std.mem.Allocator) Error!*Arena {
-        const self = allocator.create(Arena) catch return Error.OutOfMemory;
-        errdefer allocator.destroy(self);
-        const buf = allocator.alignedAlloc(u8, .@"16", ARENA_SIZE) catch return Error.ArenaAllocFailed;
-        self.* = .{ .allocator = allocator, .data = buf };
-        self.writeUsed(PREFIX_LEN);
-        return self;
-    }
-
-    pub fn destroy(self: *Arena) void {
-        const allocator = self.allocator;
-        allocator.free(self.data);
-        allocator.destroy(self);
-    }
-
-    /// Opaque pointer to hand to `JS_NewRuntime2`. This is the arena
-    /// data base, which contains the used counter at offset 0.
-    pub fn qjsOpaque(self: *Arena) *anyopaque {
-        return @ptrCast(self.data.ptr);
-    }
-
-    /// Current bump cursor (number of bytes consumed including the
-    /// 16-byte prefix). Reads from the in-buffer counter.
-    pub fn used(self: *const Arena) usize {
-        return std.mem.readInt(usize, self.data[0..@sizeOf(usize)], .little);
-    }
-
-    fn writeUsed(self: *Arena, n: usize) void {
-        std.mem.writeInt(usize, self.data[0..@sizeOf(usize)], n, .little);
-    }
-
-    /// Rewind the bump cursor to the empty state. Required before
-    /// restoring into this arena (though `Snapshot.restore` does it
-    /// for you).
-    pub fn reset(self: *Arena) void {
-        self.writeUsed(PREFIX_LEN);
-    }
-
-    /// Clear ALL bytes in the arena to zero and reset the cursor.
-    /// Used by `Snapshot.create` before each determinism-verifying
-    /// init pass so stale content can't sneak in.
-    fn zero(self: *Arena) void {
-        @memset(self.data, 0);
-        self.writeUsed(PREFIX_LEN);
-    }
-};
-
-// ── QuickJS bump malloc functions ──────────────────────────────────────
-//
-// Each alloc is a 16-byte-aligned block prefixed by an 8-byte size
-// header: `[hdr: u64][payload]`. `free` is a no-op (arena resets wipe
-// the lot). `realloc` can grow in place IFF the block is at the end of
-// the used region.
-
-const BumpHeader = extern struct {
-    size: usize,
-};
-
-/// Read the used counter given the opaque data base.
-inline fn readUsed(data_ptr: [*]u8) usize {
-    const slice: *[@sizeOf(usize)]u8 = @ptrCast(data_ptr);
-    return std.mem.readInt(usize, slice, .little);
-}
-
-inline fn writeUsedAt(data_ptr: [*]u8, n: usize) void {
-    const slice: *[@sizeOf(usize)]u8 = @ptrCast(data_ptr);
-    std.mem.writeInt(usize, slice, n, .little);
-}
-
-fn bumpMalloc(opaque_ptr: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
-    const data_ptr: [*]u8 = @ptrCast(opaque_ptr.?);
-    const used = readUsed(data_ptr);
-    const need = std.mem.alignForward(usize, @sizeOf(BumpHeader) + size, 16);
-    if (used + need > ARENA_SIZE) return null;
-    const slot_ptr: [*]u8 = data_ptr + used;
-    writeUsedAt(data_ptr, used + need);
-    const hdr: *BumpHeader = @ptrCast(@alignCast(slot_ptr));
-    hdr.size = size;
-    return @ptrCast(slot_ptr + @sizeOf(BumpHeader));
-}
-
-fn bumpCalloc(opaque_ptr: ?*anyopaque, count: usize, size: usize) callconv(.c) ?*anyopaque {
-    const total = count * size;
-    const p = bumpMalloc(opaque_ptr, total);
-    if (p) |ptr| {
-        const bytes: [*]u8 = @ptrCast(ptr);
-        @memset(bytes[0..total], 0);
-    }
-    return p;
-}
-
-fn bumpFree(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-    // no-op — arena reset reclaims everything
-}
-
-fn bumpRealloc(opaque_ptr: ?*anyopaque, ptr: ?*anyopaque, new_size: usize) callconv(.c) ?*anyopaque {
-    if (ptr == null) return bumpMalloc(opaque_ptr, new_size);
-    if (new_size == 0) return null;
-
-    const data_ptr: [*]u8 = @ptrCast(opaque_ptr.?);
-    const hdr_ptr: *BumpHeader = @ptrFromInt(@intFromPtr(ptr.?) - @sizeOf(BumpHeader));
-    const old_size = hdr_ptr.size;
-
-    const old_total = std.mem.alignForward(usize, @sizeOf(BumpHeader) + old_size, 16);
-    const old_end = @intFromPtr(hdr_ptr) + old_total;
-    const used = readUsed(data_ptr);
-    const arena_end = @intFromPtr(data_ptr) + used;
-
-    if (old_end == arena_end) {
-        const new_total = std.mem.alignForward(usize, @sizeOf(BumpHeader) + new_size, 16);
-        if (new_total >= old_total) {
-            const delta = new_total - old_total;
-            if (used + delta > ARENA_SIZE) return null;
-            writeUsedAt(data_ptr, used + delta);
-        } else {
-            writeUsedAt(data_ptr, used - (old_total - new_total));
-        }
-        hdr_ptr.size = new_size;
-        return ptr;
-    }
-
-    const new_ptr = bumpMalloc(opaque_ptr, new_size) orelse return null;
-    const copy_len = @min(old_size, new_size);
-    const src: [*]const u8 = @ptrCast(ptr.?);
-    const dst: [*]u8 = @ptrCast(new_ptr);
-    @memcpy(dst[0..copy_len], src[0..copy_len]);
-    return new_ptr;
-}
-
-fn bumpUsableSize(ptr: ?*const anyopaque) callconv(.c) usize {
-    const hdr_ptr: *const BumpHeader = @ptrFromInt(@intFromPtr(ptr.?) - @sizeOf(BumpHeader));
-    return hdr_ptr.size;
-}
-
-pub const bump_mf: c.JSMallocFunctions = .{
-    .js_calloc = &bumpCalloc,
-    .js_malloc = &bumpMalloc,
-    .js_free = &bumpFree,
-    .js_realloc = &bumpRealloc,
-    .js_malloc_usable_size = &bumpUsableSize,
-};
-
-// ── Init callback ──────────────────────────────────────────────────────
-
-/// Called by `Snapshot.create` to build the runtime+context inside an
-/// arena. Must:
-///
-///   1. Call `c.JS_NewRuntime2(&bump_mf, arena)` to create the runtime.
-///   2. Call `c.JS_NewContext(rt)` to create the context.
-///   3. Install any globals / evaluate any setup code.
-///   4. Return the offsets of the rt and ctx pointers within the arena
-///      bytes via `out_rt_offset` / `out_ctx_offset`.
-///
-/// The same init function is called TWICE by `create` for the
-/// determinism verification, so it must be fully deterministic — no
-/// timestamps, no reading /dev/urandom, no filesystem I/O that could
-/// change between calls.
+/// Must NOT call JS_FreeRuntime / JS_FreeContext.
 pub const InitFn = *const fn (
-    arena: *Arena,
-    out_rt_offset: *usize,
-    out_ctx_offset: *usize,
+    rt: *c.JSRuntime,
+    ctx: *c.JSContext,
     user_data: ?*anyopaque,
 ) Error!void;
 
-/// Compute the offset of `ptr` within `arena.data`. The init callback
-/// uses this to report rt/ctx offsets.
-pub fn offsetOf(arena: *const Arena, ptr: *const anyopaque) usize {
-    return @intFromPtr(ptr) - @intFromPtr(arena.data.ptr);
-}
-
-// ── Snapshot type ──────────────────────────────────────────────────────
-
+/// Frozen runtime+context. Owns the dual arena; lives until deinit.
 pub const Snapshot = struct {
-    allocator: std.mem.Allocator,
-    data: []u8, // owned frozen image
-    bitmap: []u64, // one bit per 8-byte slot; set = needs relocation
-    /// Pointer value that the frozen image was originally built against.
-    /// The restore path uses this to compute the delta for relocation.
-    old_base: [*]const u8,
-    rt_offset: usize,
-    ctx_offset: usize,
-    /// Pre-relocated image cache. Populated the first time `restore`
-    /// is called for a given target arena base, used by every
-    /// subsequent restore into the same base to skip the bitmap walk
-    /// (~1.7 µs/restore in Phase 0 benchmarks; ~4% of throughput on a
-    /// complex handler at 25k req/s). A second-time hit just memcpys
-    /// `reloc_cache.data` into the target and is otherwise identical
-    /// to the slow path.
-    ///
-    /// Null until the first restore. Dropped and rebuilt if `restore`
-    /// is ever called with a different target base (not expected in
-    /// normal use — the dispatcher binds one arena to one snapshot).
-    reloc_cache: ?RelocCache = null,
-
-    const RelocCache = struct {
-        data: []u8, // same length as self.data, bytes relocated for `base`
-        base: [*]const u8, // target.data.ptr this cache is valid for
-    };
+    rt: *c.JSRuntime,
+    ctx: *c.JSContext,
 
     pub const Restored = struct {
         runtime: root.Runtime,
         context: root.Context,
     };
 
+    /// Build the runtime, run init_fn against base, freeze.
+    pub fn create(sizes: Sizes, init_fn: InitFn, user_data: ?*anyopaque) Error!Snapshot {
+        const rt = c.JS_NewRuntimeArena(sizes.base_size, sizes.request_size) orelse
+            return Error.RuntimeCreateFailed;
+        errdefer c.js_dual_arena_free(c.JS_GetDualArena(rt));
+
+        // JS_NewContextRaw + selective intrinsics: lets init_fn pick
+        // which intrinsics to install. JS_NewContext is fine too;
+        // both work pre-freeze.
+        const ctx = c.JS_NewContextRaw(rt) orelse return Error.ContextCreateFailed;
+
+        try init_fn(rt, ctx, user_data);
+
+        // Flip allocator to request mode + page-protect base + relocate
+        // per-request mutable runtime state. After this returns, no JS
+        // code can mutate base bytes (verified by arenajs's test262
+        // sweep at vendor/arenajs/arena-test262.c).
+        c.JS_FreezeRuntime(rt);
+
+        return .{ .rt = rt, .ctx = ctx };
+    }
+
     pub fn deinit(self: *Snapshot) void {
-        self.allocator.free(self.data);
-        self.allocator.free(self.bitmap);
-        if (self.reloc_cache) |cache| self.allocator.free(cache.data);
+        c.js_dual_arena_free(c.JS_GetDualArena(self.rt));
         self.* = undefined;
     }
 
-    pub fn reloc_count(self: *const Snapshot) usize {
-        var n: usize = 0;
-        for (self.bitmap) |w| n += @popCount(w);
-        return n;
-    }
+    /// Reset the request arena (one cursor write) and reseed the
+    /// per-request time / random state. Returns the runtime+context
+    /// pointers (same every call — base is shared).
+    ///
+    /// Call before evaluating each request's handler. On the very
+    /// first request this is also fine — JS_FreezeRuntime leaves the
+    /// request arena in a clean state, and the reseed gets the
+    /// per-request state to a sensible value.
+    pub fn restore(self: *Snapshot) Restored {
+        c.JS_ResetRequestArena(self.rt);
 
-    /// For diagnostics only. Always 0 under the deterministic-init patch.
-    pub fn volatile_count(self: *const Snapshot) usize {
-        _ = self;
-        return 0;
-    }
-
-    /// Two-pass determinism-verified snapshot of the runtime an init
-    /// callback produces. Allocates a scratch arena at a different
-    /// address for the second pass so relocatable pointers can be
-    /// distinguished from stable data by diffing.
-    pub fn create(
-        allocator: std.mem.Allocator,
-        arena_a: *Arena,
-        init_fn: InitFn,
-        user_data: ?*anyopaque,
-    ) Error!Snapshot {
-        arena_a.zero();
-        var rt_off_a: usize = 0;
-        var ctx_off_a: usize = 0;
-        try init_fn(arena_a, &rt_off_a, &ctx_off_a, user_data);
-        const used_a = arena_a.used();
-
-        // Copy pass-A's bytes so we can diff them while pass B reuses
-        // the live arena state.
-        const data_a = allocator.alloc(u8, used_a) catch return Error.OutOfMemory;
-        errdefer allocator.free(data_a);
-        @memcpy(data_a, arena_a.data[0..used_a]);
-
-        // Scratch arena at a different address.
-        const arena_b = try Arena.create(allocator);
-        defer arena_b.destroy();
-        arena_b.zero();
-
-        var rt_off_b: usize = 0;
-        var ctx_off_b: usize = 0;
-        try init_fn(arena_b, &rt_off_b, &ctx_off_b, user_data);
-        const used_b = arena_b.used();
-
-        if (used_a != used_b or rt_off_a != rt_off_b or ctx_off_a != ctx_off_b) {
-            std.log.err(
-                "qjs_snap: non-deterministic init (used {d} vs {d}, rt_off {d} vs {d}, ctx_off {d} vs {d})",
-                .{ used_a, used_b, rt_off_a, rt_off_b, ctx_off_a, ctx_off_b },
-            );
-            return Error.NonDeterministic;
-        }
-
-        // Build the relocation bitmap by comparing 8-byte slots.
-        //
-        // Under the rove-kv deterministic-init patch (see
-        // vendor/quickjs-ng/rove-kv-deterministic-init.patch.md), every
-        // 8-byte slot must fall into exactly one of three categories:
-        //
-        //   1. Bit-identical across passes → stable non-pointer data.
-        //      Stored verbatim.
-        //   2. Differs by exactly `base_delta` → relocatable pointer.
-        //      Marked in the relocation bitmap.
-        //   3. Differs by anything else → FATAL. Something introduced
-        //      non-determinism we don't understand. Either a
-        //      quickjs-ng upgrade reintroduced time_origin/random_state
-        //      seeding (reapply the patch), or the user's init_fn did
-        //      something nondeterministic (called Math.random,
-        //      Date.now, read an env var, etc.).
-        const num_slots = used_a / @sizeOf(*anyopaque);
-        const bitmap_words = (num_slots + 63) / 64;
-        const bitmap = allocator.alloc(u64, bitmap_words) catch return Error.OutOfMemory;
-        errdefer allocator.free(bitmap);
-        @memset(bitmap, 0);
-
-        const base_delta: i64 = @as(i64, @intCast(@intFromPtr(arena_b.data.ptr))) -
-            @as(i64, @intCast(@intFromPtr(arena_a.data.ptr)));
-
-        for (0..num_slots) |i| {
-            var val_a: u64 = 0;
-            var val_b: u64 = 0;
-            const byte_off = i * @sizeOf(*anyopaque);
-            @memcpy(std.mem.asBytes(&val_a), data_a[byte_off..][0..8]);
-            @memcpy(std.mem.asBytes(&val_b), arena_b.data[byte_off..][0..8]);
-            if (val_a == val_b) continue;
-
-            const diff: i64 = @bitCast(val_b -% val_a);
-            if (diff == base_delta) {
-                bitmap[i / 64] |= @as(u64, 1) << @intCast(i % 64);
-                continue;
-            }
-
-            std.log.err(
-                "qjs_snap: non-deterministic slot detected at byte offset {d} (a=0x{x:0>16} b=0x{x:0>16}, base_delta={d}). Under the rove-kv deterministic-init patch this should never happen; audit the patch + your init_fn.",
-                .{ byte_off, val_a, val_b, base_delta },
-            );
-            return Error.VolatileSlotDetected;
-        }
+        // performance.timeOrigin is a getter reading whatever we set
+        // here; performance.now() is `monotonic_now_ms - time_origin`.
+        // arenajs's internal `js__now_ms` reads CLOCK_MONOTONIC (via
+        // `js__hrtime_ns`); we set time_origin from the same clock so
+        // performance.now() returns small relative ms instead of
+        // process-uptime ms.
+        c.JS_SetTimeOrigin(self.ctx, monotonicMs());
+        // Math.random() degenerates to always-0 with a 0 seed; xorshift
+        // needs any non-zero seed.
+        c.JS_SetRandomSeed(self.ctx, @intCast(std.time.microTimestamp()));
 
         return .{
-            .allocator = allocator,
-            .data = data_a,
-            .bitmap = bitmap,
-            .old_base = arena_a.data.ptr,
-            .rt_offset = rt_off_a,
-            .ctx_offset = ctx_off_a,
-        };
-    }
-
-    /// Restore a snapshot into `target`. Memcpy's the frozen image,
-    /// relocates pointers (first call into a given arena only), re-
-    /// seeds volatile slots from the current wall clock, and returns
-    /// the rebuilt Runtime/Context.
-    ///
-    /// Fast path: if we already cached a pre-relocated image for this
-    /// exact target base, skip the bitmap walk entirely and memcpy
-    /// directly from the cache. Slow path runs the walk and populates
-    /// the cache so the next call hits the fast path.
-    ///
-    /// The returned `Runtime` wraps the reconstructed `JSRuntime*`. Do
-    /// NOT call `Runtime.deinit` on it — the memory is owned by the
-    /// arena, not by QuickJS's normal free path. Reset the arena instead
-    /// (or restore a new snapshot over the top).
-    pub fn restore(
-        self: *Snapshot,
-        target: *Arena,
-    ) Error!Restored {
-        // Fast path: already-relocated cache valid for this target base.
-        if (self.reloc_cache) |cache| {
-            if (cache.base == target.data.ptr) {
-                @memcpy(target.data[0..cache.data.len], cache.data);
-                return self.finishRestore(target);
-            }
-            // Stale cache (caller switched target arenas). Drop it and
-            // fall through to the slow path, which will rebuild for
-            // the new base.
-            self.allocator.free(cache.data);
-            self.reloc_cache = null;
-        }
-
-        // Slow path: memcpy the frozen image, then walk the bitmap to
-        // relocate pointers into this target base. Byte 0..8 holds the
-        // bump used counter, so target.used() is automatically restored.
-        @memcpy(target.data[0..self.data.len], self.data);
-
-        const new_base: i64 = @intCast(@intFromPtr(target.data.ptr));
-        const old_base: i64 = @intCast(@intFromPtr(self.old_base));
-        const delta: i64 = new_base - old_base;
-
-        if (delta != 0) {
-            for (self.bitmap, 0..) |word_const, word_idx| {
-                var word = word_const;
-                while (word != 0) {
-                    const bit: u6 = @intCast(@ctz(word));
-                    const slot_idx = word_idx * 64 + bit;
-                    const offset = slot_idx * @sizeOf(*anyopaque);
-                    var slot_val: u64 = 0;
-                    @memcpy(std.mem.asBytes(&slot_val), target.data[offset..][0..8]);
-                    const relocated: u64 = @bitCast(@as(i64, @bitCast(slot_val)) + delta);
-                    @memcpy(target.data[offset..][0..8], std.mem.asBytes(&relocated));
-                    word &= word - 1;
-                }
-            }
-        }
-
-        // Populate the cache from the now-relocated bytes in the target
-        // arena. Best-effort — on OOM we keep running (every restore
-        // just stays on the slow path, no correctness impact).
-        if (self.allocator.alloc(u8, self.data.len)) |cache_buf| {
-            @memcpy(cache_buf, target.data[0..self.data.len]);
-            self.reloc_cache = .{ .data = cache_buf, .base = target.data.ptr };
-        } else |_| {}
-
-        return self.finishRestore(target);
-    }
-
-    fn finishRestore(
-        self: *const Snapshot,
-        target: *Arena,
-    ) Error!Restored {
-        const rt_ptr: *c.JSRuntime = @ptrCast(@alignCast(target.data[self.rt_offset..].ptr));
-        const ctx_ptr: *c.JSContext = @ptrCast(@alignCast(target.data[self.ctx_offset..].ptr));
-
-        c.JS_UpdateStackTop(rt_ptr);
-        c.JS_SetMaxStackSize(rt_ptr, c.JS_DEFAULT_STACK_SIZE);
-
-        // Inject fresh time/seed into the two deterministic-by-default
-        // fields. See vendor/quickjs-ng/rove-kv-deterministic-init.patch.md.
-        //
-        // time_origin MUST come from the same monotonic clock quickjs-ng
-        // uses internally (`js__hrtime_ns`). JS_GetMonotonicTimeMs is
-        // exposed by the patch for exactly this purpose — using wall-
-        // clock time here would make `performance.now()` return large
-        // negative values.
-        //
-        // random_state seed can be anything non-zero; wall-clock
-        // microseconds is a convenient source of entropy.
-        c.JS_SetTimeOrigin(ctx_ptr, c.JS_GetMonotonicTimeMs());
-        c.JS_SetRandomSeed(ctx_ptr, @intCast(std.time.microTimestamp()));
-
-        return .{
-            .runtime = .{ .raw = rt_ptr },
-            .context = .{ .raw = ctx_ptr },
+            .runtime = .{ .raw = self.rt },
+            .context = .{ .raw = self.ctx },
         };
     }
 };
+
+/// Monotonic milliseconds, matching arenajs's internal `js__now_ms`
+/// (which reads CLOCK_MONOTONIC via `js__hrtime_ns`). Used as the
+/// `performance.timeOrigin` anchor so `performance.now()` returns
+/// small relative milliseconds.
+pub fn monotonicMs() f64 {
+    const ts = std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC) catch return 0;
+    const sec_ms = @as(f64, @floatFromInt(ts.sec)) * 1000.0;
+    const nsec_ms = @as(f64, @floatFromInt(ts.nsec)) / 1_000_000.0;
+    return sec_ms + nsec_ms;
+}
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-/// Default init callback for tests — just creates a runtime + context
-/// with no extra globals or setup. Deterministic.
-fn minimalInit(
-    arena: *Arena,
-    out_rt_offset: *usize,
-    out_ctx_offset: *usize,
-    _: ?*anyopaque,
-) Error!void {
-    const rt = c.JS_NewRuntime2(&bump_mf, arena.qjsOpaque()) orelse return Error.RuntimeCreateFailed;
-    const ctx = c.JS_NewContext(rt) orelse return Error.ContextCreateFailed;
-    out_rt_offset.* = offsetOf(arena, rt);
-    out_ctx_offset.* = offsetOf(arena, ctx);
-}
-
-test "arena alloc/destroy cycle" {
-    var arena = try Arena.create(testing.allocator);
-    defer arena.destroy();
-    try testing.expectEqual(ARENA_SIZE, arena.data.len);
-    try testing.expectEqual(Arena.PREFIX_LEN, arena.used());
-
-    arena.reset();
-    try testing.expectEqual(Arena.PREFIX_LEN, arena.used());
-}
-
-test "bump allocator serves sequential allocs within arena" {
-    var arena = try Arena.create(testing.allocator);
-    defer arena.destroy();
-
-    const opq = arena.qjsOpaque();
-    const a = bumpMalloc(opq, 100);
-    try testing.expect(a != null);
-    const b = bumpMalloc(opq, 200);
-    try testing.expect(b != null);
-    try testing.expect(@intFromPtr(b.?) > @intFromPtr(a.?));
-
-    // Oversize request → null, no state corruption.
-    const huge = bumpMalloc(opq, ARENA_SIZE);
-    try testing.expect(huge == null);
-
-    // A smaller alloc after the failure still works.
-    const c2 = bumpMalloc(opq, 50);
-    try testing.expect(c2 != null);
+fn minimalInit(rt: *c.JSRuntime, ctx: *c.JSContext, _: ?*anyopaque) Error!void {
+    _ = rt;
+    _ = c.JS_AddIntrinsicBaseObjects(ctx);
+    _ = c.JS_AddIntrinsicEval(ctx);
+    // performance.now() / performance.timeOrigin land on the global
+    // via this; without it the perf-time-origin test below sees
+    // ReferenceError on `performance`.
+    _ = c.JS_AddPerformance(ctx);
 }
 
 test "Snapshot.create succeeds with minimal init" {
-    var arena = try Arena.create(testing.allocator);
-    defer arena.destroy();
-
-    var snap = try Snapshot.create(testing.allocator, arena, minimalInit, null);
+    var snap = try Snapshot.create(.{}, minimalInit, null);
     defer snap.deinit();
-
-    // With the deterministic-init patch applied, there should be zero
-    // volatile slots — every non-identical byte between the two init
-    // passes must be a relocatable pointer.
-    try testing.expect(snap.data.len > 0);
-    try testing.expect(snap.reloc_count() > 0);
-    try testing.expectEqual(@as(usize, 0), snap.volatile_count());
 }
 
 test "Snapshot.restore round-trips: 1 + 1 still = 2" {
-    var arena_src = try Arena.create(testing.allocator);
-    defer arena_src.destroy();
-
-    var snap = try Snapshot.create(testing.allocator, arena_src, minimalInit, null);
+    var snap = try Snapshot.create(.{}, minimalInit, null);
     defer snap.deinit();
 
-    // Restore into a DIFFERENT arena (different base address) to
-    // exercise the relocation path.
-    var arena_dst = try Arena.create(testing.allocator);
-    defer arena_dst.destroy();
-
-    const restored = try snap.restore(arena_dst);
-    const ctx = restored.context;
-
-    var result = try ctx.eval("1 + 1", "snap-test.js", .{});
+    const r = snap.restore();
+    var result = try r.context.eval("1 + 1", "snap-test.js", .{});
     defer result.deinit();
     try testing.expectEqual(@as(i32, 2), try result.toI32());
 }
 
 test "Snapshot.restore repeated N times is stable" {
-    var arena_src = try Arena.create(testing.allocator);
-    defer arena_src.destroy();
-
-    var snap = try Snapshot.create(testing.allocator, arena_src, minimalInit, null);
+    var snap = try Snapshot.create(.{}, minimalInit, null);
     defer snap.deinit();
-
-    var arena_dst = try Arena.create(testing.allocator);
-    defer arena_dst.destroy();
 
     var i: usize = 0;
     while (i < 50) : (i += 1) {
-        arena_dst.reset();
-        const r = try snap.restore(arena_dst);
+        const r = snap.restore();
         var result = try r.context.eval("2 * 21", "snap-test.js", .{});
         defer result.deinit();
         try testing.expectEqual(@as(i32, 42), try result.toI32());
@@ -614,70 +196,44 @@ test "Snapshot.restore repeated N times is stable" {
 }
 
 test "Snapshot.restore: performance.now and Math.random work after restore" {
-    var arena_src = try Arena.create(testing.allocator);
-    defer arena_src.destroy();
-    var snap = try Snapshot.create(testing.allocator, arena_src, minimalInit, null);
+    var snap = try Snapshot.create(.{}, minimalInit, null);
     defer snap.deinit();
 
-    var arena_dst = try Arena.create(testing.allocator);
-    defer arena_dst.destroy();
-
-    const r = try snap.restore(arena_dst);
+    const r = snap.restore();
     const ctx = r.context;
 
-    // performance.now() reads `js__now_ms() - ctx.time_origin`. If
-    // restore didn't call JS_SetTimeOrigin, time_origin would be 0 and
-    // performance.now() would return a giant hrtime value. With the
-    // setter called, elapsed_ms should be a small non-negative number.
     var perf_result = try ctx.eval("performance.now()", "perf.js", .{});
     defer perf_result.deinit();
     const elapsed_ms = try perf_result.toF64();
     try testing.expect(std.math.isFinite(elapsed_ms));
     try testing.expect(elapsed_ms >= 0);
-    try testing.expect(elapsed_ms < 1000); // < 1s between restore and eval
+    try testing.expect(elapsed_ms < 1000);
 
-    // performance.timeOrigin is now a getter (rove-kv patch), so it
-    // must reflect whatever JS_SetTimeOrigin wrote.
     var origin_result = try ctx.eval("performance.timeOrigin", "origin.js", .{});
     defer origin_result.deinit();
     const origin_ms = try origin_result.toF64();
     try testing.expect(std.math.isFinite(origin_ms));
     try testing.expect(origin_ms > 0);
 
-    // Math.random() must produce a valid [0, 1) double. Requires
-    // JS_SetRandomSeed to have been called post-restore; otherwise
-    // random_state is 0 and xorshift64 degenerates to always 0.
     var rand_result = try ctx.eval("Math.random()", "rand.js", .{});
     defer rand_result.deinit();
-    const r_val = try rand_result.toF64();
-    try testing.expect(std.math.isFinite(r_val));
-    try testing.expect(r_val >= 0);
-    try testing.expect(r_val < 1);
+    const rv = try rand_result.toF64();
+    try testing.expect(std.math.isFinite(rv));
+    try testing.expect(rv >= 0);
+    try testing.expect(rv < 1);
 
-    // Two consecutive calls should give different values (proves the
-    // PRNG is actually stepping, not just returning 0).
-    var r_val2_result = try ctx.eval("Math.random()", "rand2.js", .{});
-    defer r_val2_result.deinit();
-    const r_val2 = try r_val2_result.toF64();
-    try testing.expect(r_val2 != r_val);
+    var rv2_result = try ctx.eval("Math.random()", "rand2.js", .{});
+    defer rv2_result.deinit();
+    const rv2 = try rv2_result.toF64();
+    try testing.expect(rv2 != rv);
 }
 
 test "Snapshot.restore preserves complex JS behavior" {
-    var arena_src = try Arena.create(testing.allocator);
-    defer arena_src.destroy();
-
-    var snap = try Snapshot.create(testing.allocator, arena_src, minimalInit, null);
+    var snap = try Snapshot.create(.{}, minimalInit, null);
     defer snap.deinit();
 
-    var arena_dst = try Arena.create(testing.allocator);
-    defer arena_dst.destroy();
-
-    const r = try snap.restore(arena_dst);
-    const ctx = r.context;
-
-    // Closures, array methods, template literals — real JS features
-    // that exercise the shape/atom tables we relocated.
-    var result = try ctx.eval(
+    const r = snap.restore();
+    var result = try r.context.eval(
         \\const nums = [1, 2, 3, 4, 5];
         \\const squared = nums.map(n => n * n);
         \\const sum = squared.reduce((a, b) => a + b, 0);

@@ -136,15 +136,13 @@ pub fn build(b: *std.Build) void {
     // LogStore). Production bundle code never touches kv directly.
     tape_mod.addImport("rove-kv", kv_mod);
 
-    // ── rove-qjs: quickjs-ng wrapper + snapshot machinery ──
+    // ── rove-qjs: arenajs (quickjs-ng fork) wrapper ──
     //
-    // Vendors quickjs-ng v0.13.0+ (commit 71a3c54) with shift-js's
-    // stable-shape-hash patch already applied to vendor/quickjs-ng/
-    // quickjs.c (see vendor/quickjs-ng/LICENSE, MIT licensed).
-    //
-    // The four C files below are the complete quickjs-ng core — no
-    // libc module, no CLI. Definitions match shift-js's build:
-    // -D_GNU_SOURCE and -DQUICKJS_NG_BUILD are both required.
+    // Vendors anarchodev/arenajs at vendor/arenajs/ — a quickjs-ng
+    // fork that replaces malloc + GC with a dual bump arena (base
+    // + per-request) and collapses per-request restore to a single
+    // cursor write. See vendor/arenajs/README.md for the snapshot
+    // commit and the constraints inherited from the fork.
     const qjs_mod = b.addModule("rove-qjs", .{
         .root_source_file = b.path("src/qjs/root.zig"),
         .target = target,
@@ -153,11 +151,12 @@ pub fn build(b: *std.Build) void {
     qjs_mod.link_libc = true;
     qjs_mod.linkSystemLibrary("m", .{});
     qjs_mod.linkSystemLibrary("pthread", .{});
-    qjs_mod.addIncludePath(b.path("vendor/quickjs-ng"));
+    qjs_mod.addIncludePath(b.path("vendor/arenajs"));
     qjs_mod.addCSourceFiles(.{
-        .root = b.path("vendor/quickjs-ng"),
+        .root = b.path("vendor/arenajs"),
         .files = &.{
             "quickjs.c",
+            "qjs-arena.c",
             "libregexp.c",
             "libunicode.c",
             "dtoa.c",

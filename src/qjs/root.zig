@@ -1,37 +1,31 @@
-//! rove-qjs — Zig wrapper around vendored quickjs-ng.
+//! rove-qjs — Zig wrapper around vendored arenajs (quickjs-ng fork).
 //!
-//! This module is Phase 0 of the rove-js build. Scope:
+//! Scope:
 //!
 //! - Thin Zig types over `JSRuntime`, `JSContext`, `JSValue`.
-//! - `eval` of a source string returning either a result value or a typed
-//!   error with the JS exception message available for logging.
-//! - Conversions for the primitive JS types (undefined/null/bool/int/float/
-//!   string) needed to test the wrapper end-to-end.
+//! - `eval` of a source string returning either a result value or a
+//!   typed error with the JS exception message available for logging.
+//! - Conversions for the primitive JS types
+//!   (undefined/null/bool/int/float/string).
+//! - Snapshot + per-request reset (see `snap.zig`) — wraps arenajs's
+//!   dual-arena runtime so each worker thread keeps a frozen base
+//!   and a per-request arena that resets in one cursor write.
 //!
-//! **Not yet implemented** (arriving in a follow-up):
-//!
-//! - Snapshot + restore (the memcpy-relocation trick). This is the big
-//!   prize of quickjs-ng for our use case and is substantial enough to
-//!   deserve its own session.
-//! - Per-request bump arena. Rides along with the snapshot work because
-//!   they share allocator plumbing.
-//! - Module loader integration (reading bytecode from rove-files).
-//!
-//! The QuickJS C API lives at `c.JS_*`. Everything user-facing goes
-//! through the Zig types defined here.
+//! The QuickJS C API lives at `c.JS_*`. arenajs's additional API
+//! (dual arena, freeze, reset) lives at `c.JS_*Arena*` and
+//! `c.js_dual_arena_*`. Everything user-facing goes through the Zig
+//! types defined here.
 
 const std = @import("std");
 
 pub const c = @cImport({
     @cInclude("quickjs.h");
+    @cInclude("qjs-arena.h");
 });
 
 pub const snap = @import("snap.zig");
-pub const Arena = snap.Arena;
 pub const Snapshot = snap.Snapshot;
 pub const InitFn = snap.InitFn;
-pub const offsetOf = snap.offsetOf;
-pub const bump_mf = snap.bump_mf;
 
 pub const Error = error{
     RuntimeCreateFailed,
@@ -124,16 +118,16 @@ pub const Runtime = struct {
     /// the global object and installable intrinsics.
     ///
     /// The rove-kv patch to vendor/quickjs-ng leaves `ctx.random_state`
-    /// and `ctx.time_origin` at 0 so snapshot creation is deterministic.
-    /// For callers using the direct (non-snapshot) path, this method
-    /// auto-seeds both from wall-clock sources so `Math.random()` and
-    /// `performance.now()` behave normally out of the box.
+    /// and `ctx.time_origin` at 0 by default. For callers using the
+    /// direct (non-snapshot) path, this method auto-seeds both so
+    /// `Math.random()` and `performance.now()` behave normally out
+    /// of the box.
     ///
     /// The snapshot path does the same seeding in `Snapshot.restore`,
     /// not here — callers that use snapshots should NOT call this.
     pub fn newContext(self: Runtime) Error!Context {
         const ctx = c.JS_NewContext(self.raw) orelse return Error.ContextCreateFailed;
-        c.JS_SetTimeOrigin(ctx, c.JS_GetMonotonicTimeMs());
+        c.JS_SetTimeOrigin(ctx, snap.monotonicMs());
         c.JS_SetRandomSeed(ctx, @intCast(std.time.microTimestamp()));
         return .{ .raw = ctx };
     }

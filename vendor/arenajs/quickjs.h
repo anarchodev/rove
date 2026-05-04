@@ -118,7 +118,8 @@ extern "C" {
 
 /* Borrowed from Folly */
 #ifndef JS_PRINTF_FORMAT
-#ifdef _MSC_VER
+/* Clang on Windows doesn't seem to support _Printf_format_string_ */
+#if defined(_MSC_VER) && !defined(__clang__)
 #include <sal.h>
 #define JS_PRINTF_FORMAT _Printf_format_string_
 #define JS_PRINTF_FORMAT_ATTR(format_param, dots_param)
@@ -524,6 +525,9 @@ JS_EXTERN JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque);
 JS_EXTERN void JS_FreeRuntime(JSRuntime *rt);
 JS_EXTERN void *JS_GetRuntimeOpaque(JSRuntime *rt);
 JS_EXTERN void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque);
+/* Returns the opaque pointer that was passed to JS_NewRuntime2, i.e. the one
+   threaded through JSMallocFunctions callbacks. */
+JS_EXTERN void *JS_GetMallocOpaque(JSRuntime *rt);
 JS_EXTERN int JS_AddRuntimeFinalizer(JSRuntime *rt,
                                      JSRuntimeFinalizer *finalizer, void *arg);
 typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
@@ -558,34 +562,13 @@ JS_EXTERN int JS_AddIntrinsicPromise(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicBigInt(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicWeakRef(JSContext *ctx);
 JS_EXTERN int JS_AddPerformance(JSContext *ctx);
-
-/* rove-kv patch: snapshot-friendly setters.
- *
- * The default quickjs-ng behavior seeds `random_state` from
- * gettimeofday_us and `time_origin` from hrtime at context-construction
- * time, which makes those fields non-deterministic across two
- * initializations of the same code. For rove-js we want
- * context-construction to be fully deterministic (so snapshots contain
- * zero non-deterministic slots and memcpy-restore is pointer-clean);
- * the host then calls these setters post-restore to inject fresh wall-
- * clock values.
- *
- * JS_SetRandomSeed: writes `ctx->random_state` directly. Pass any
- * non-zero u64; xorshift64* requires non-zero. If you pass 0, the
- * setter stores 1 instead to avoid a degenerate PRNG state.
- *
- * JS_SetTimeOrigin: writes `ctx->time_origin` directly. This is the
- * anchor for both `performance.now()` (live subtraction) and
- * `performance.timeOrigin` (getter over the same field). Pass
- * milliseconds; `js__hrtime_ns() / 1.0e6` is the canonical choice.
- */
+/* arena: deterministic-init companions. After JS_NewContext, ctx->time_origin
+   defaults to 0 and ctx->random_state defaults to 0 (Math.random returns 0
+   until seeded). Call these to inject wall-clock values post-init/restore. */
 JS_EXTERN void JS_SetRandomSeed(JSContext *ctx, uint64_t seed);
 JS_EXTERN void JS_SetTimeOrigin(JSContext *ctx, double time_origin_ms);
-/* Returns the monotonic millisecond clock quickjs-ng itself uses for
- * `performance.now()`. Exposed so callers setting time_origin via
- * JS_SetTimeOrigin can pass a value on the same clock. */
-JS_EXTERN double JS_GetMonotonicTimeMs(void);
 JS_EXTERN int JS_AddIntrinsicDOMException(JSContext *ctx);
+JS_EXTERN int JS_AddIntrinsicAToB(JSContext *ctx);
 
 /* for equality comparisons and sameness */
 JS_EXTERN int JS_IsEqual(JSContext *ctx, JSValueConst op1, JSValueConst op2);
@@ -952,6 +935,7 @@ JS_EXTERN JSValue JS_ToObject(JSContext *ctx, JSValueConst val);
 JS_EXTERN JSValue JS_ToObjectString(JSContext *ctx, JSValueConst val);
 
 JS_EXTERN bool JS_IsFunction(JSContext* ctx, JSValueConst val);
+JS_EXTERN bool JS_IsAsyncFunction(JSValueConst val);
 JS_EXTERN bool JS_IsConstructor(JSContext* ctx, JSValueConst val);
 JS_EXTERN bool JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, bool val);
 
@@ -1435,7 +1419,7 @@ JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
 /* Version */
 
 #define QJS_VERSION_MAJOR 0
-#define QJS_VERSION_MINOR 13
+#define QJS_VERSION_MINOR 14
 #define QJS_VERSION_PATCH 0
 #define QJS_VERSION_SUFFIX ""
 

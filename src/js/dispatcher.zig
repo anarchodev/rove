@@ -1,16 +1,16 @@
 //! `Dispatcher` — runs one JS handler against a request.
 //!
-//! Each `Dispatcher` owns a `qjs.Arena` + `qjs.Snapshot` pair, built
-//! once at construction time. The snapshot captures a fully-initialized
-//! QuickJS runtime + context with all static rove-js globals installed
-//! (kv, console, crypto, Date.now override, Math.random override). Per
-//! request, `run` memcpy-restores the snapshot into the arena
-//! (~microseconds), installs the per-request `request`/`response`
-//! globals, and evaluates the handler bytecode. Nothing allocated by
-//! the handler needs to be freed — the next restore overwrites the
-//! whole arena. This is the whole point of the rove-qjs design and is
-//! worth ~50%+ of handler CPU over the old per-request
-//! `JS_NewRuntime` + `JS_NewContext` + `installStatic` path.
+//! Each `Dispatcher` owns a `qjs.Snapshot` (an arenajs dual-arena
+//! runtime+context), built once at construction time with all static
+//! rove-js globals installed in base (kv, console, crypto, Date.now
+//! override, Math.random override). Per request, `run` calls
+//! `snapshot.restore()` — one cursor-write reset of the request
+//! arena (~9 ns) plus reseeding time/random — installs the
+//! per-request `request`/`response` globals, and evaluates the
+//! handler bytecode. Nothing allocated by the handler needs to be
+//! freed; the next reset wipes the request arena. The base arena is
+//! page-protected immortal: all per-request handlers on this thread
+//! share it without copying.
 
 const std = @import("std");
 const qjs = @import("rove-qjs");
@@ -203,35 +203,28 @@ pub const Response = struct {
 
 pub const Dispatcher = struct {
     allocator: std.mem.Allocator,
-    /// Per-dispatcher arena that holds the live QuickJS runtime+context
-    /// (plus any allocations they make during handler execution). The
-    /// snapshot memcpys its frozen image into this arena at the start
-    /// of every `run`, so anything the previous handler dirtied is
-    /// wiped in one shot.
-    arena: *qjs.Arena,
-    /// Frozen post-`installStatic` image of the runtime+context. Built
-    /// once in `init`, read-only thereafter.
+    /// Per-dispatcher frozen runtime+context. Built once in `init`,
+    /// the base arena is page-protected immortal; each `run` resets
+    /// the per-request arena via a single cursor write before
+    /// evaluating the handler.
     snapshot: qjs.Snapshot,
     /// Last `kv.*` error surfaced from a JS call during the most recent
     /// `run`. Useful for tests and for the worker to log root causes.
     last_kv_error: ?anyerror = null,
 
     fn snapshotInitFn(
-        arena: *qjs.Arena,
-        out_rt_offset: *usize,
-        out_ctx_offset: *usize,
+        rt: *c.JSRuntime,
+        ctx: *c.JSContext,
         _: ?*anyopaque,
     ) qjs.snap.Error!void {
-        const rt = c.JS_NewRuntime2(&qjs.bump_mf, arena.qjsOpaque()) orelse
-            return qjs.snap.Error.RuntimeCreateFailed;
-        // Use JS_NewContextRaw + selective intrinsics so the snapshot
-        // only contains what handlers actually use. Every intrinsic we
-        // add grows the snapshot image and costs per-request memcpy
-        // bandwidth at restore. Skipping WeakRef / DOMException /
-        // Proxy saves 20-30 KB with essentially no loss — handlers
-        // that genuinely need them can be added back.
-        const ctx = c.JS_NewContextRaw(rt) orelse
-            return qjs.snap.Error.ContextCreateFailed;
+        _ = rt;
+        // Selective intrinsics keep the base arena small. With arenajs
+        // there's no per-request memcpy cost (base is shared in place
+        // across all requests), so the optimization is now about base
+        // memory + freeze-time work, not per-request bandwidth.
+        // Skipping WeakRef / DOMException / Proxy saves 20-30 KB with
+        // essentially no loss — handlers that genuinely need them can
+        // be added back.
         _ = c.JS_AddIntrinsicBaseObjects(ctx);
         _ = c.JS_AddIntrinsicDate(ctx);
         _ = c.JS_AddIntrinsicEval(ctx);
@@ -242,24 +235,18 @@ pub const Dispatcher = struct {
         _ = c.JS_AddIntrinsicPromise(ctx);
         _ = c.JS_AddIntrinsicBigInt(ctx);
         globals.installStatic(ctx);
-        out_rt_offset.* = qjs.offsetOf(arena, rt);
-        out_ctx_offset.* = qjs.offsetOf(arena, ctx);
     }
 
     pub fn init(allocator: std.mem.Allocator) !Dispatcher {
-        const arena = try qjs.Arena.create(allocator);
-        errdefer arena.destroy();
-        const snapshot = try qjs.Snapshot.create(allocator, arena, snapshotInitFn, null);
+        const snapshot = try qjs.Snapshot.create(.{}, snapshotInitFn, null);
         return .{
             .allocator = allocator,
-            .arena = arena,
             .snapshot = snapshot,
         };
     }
 
     pub fn deinit(self: *Dispatcher) void {
         self.snapshot.deinit();
-        self.arena.destroy();
         self.* = undefined;
     }
 
@@ -327,18 +314,16 @@ pub const Dispatcher = struct {
             .deploy_starter_ctx = request.deploy_starter_ctx,
         };
 
-        // Memcpy-restore the frozen post-init image of
-        // runtime+context+static globals into our arena. Handler
-        // allocations from the previous request get overwritten in one
-        // shot; no per-request teardown needed.
-        const restored = self.snapshot.restore(self.arena) catch
-            return DispatchError.RuntimeCreateFailed;
+        // Reset the per-request arena (one cursor write) and reseed
+        // time/random. The base arena (runtime, intrinsics, globals)
+        // is shared in place across all requests on this thread —
+        // no memcpy, no relocation.
+        const restored = self.snapshot.restore();
         var rt: qjs.Runtime = restored.runtime;
         var ctx: qjs.Context = restored.context;
         // Free any trigger-module namespaces we cached during this
-        // request. Snapshot/restore wipes the qjs runtime each time
-        // so the values would be invalid next request anyway, but the
-        // Zig-side hashmap entries (key + JSValue ref count) need
+        // request. The request arena reset wipes the QJS-side state;
+        // Zig-side hashmap entries (key + JSValue ref counts) need
         // explicit cleanup.
         defer state.deinit(ctx.raw);
 
