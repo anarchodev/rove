@@ -126,6 +126,14 @@ pub const Request = struct {
     /// replay. Also used downstream so the log record and the outbox
     /// rows spawned by the request share the same id.
     request_id: u64 = 0,
+    /// Resolved session id (`__Host-rove_sid` cookie value or freshly
+    /// minted by the worker via `session.resolve`). 64 lowercase hex
+    /// chars when set; null on dispatch paths with no browser context
+    /// (callbacks, signup, sim/dry-run, internal admin tooling). The
+    /// dispatcher copies the bytes into `DispatchState` and exposes
+    /// them as `request.session.id` to JS handlers; null surfaces as
+    /// `request.session === null` so handlers can branch on it.
+    session_id: ?[64]u8 = null,
     /// Non-null on admin-tenant requests — points back at the
     /// `Tenant` so the JS globals can install `platform.root.*` for
     /// the admin handler. Every other tenant's request passes null
@@ -304,6 +312,7 @@ pub const Dispatcher = struct {
             .module_tape = request.module_tape,
             .prng = std.Random.DefaultPrng.init(request.prng_seed),
             .request_id = request.request_id,
+            .session_id = request.session_id,
             .platform = request.platform,
             .root_writeset = request.root_writeset,
             .triggers = triggers,
@@ -1568,6 +1577,53 @@ test "dispatch: kv.set + kv.get round trip" {
     defer r2.deinit(testing.allocator);
 
     try testing.expectEqualStrings("rove", r2.body);
+}
+
+test "dispatch: request.session.id surfaces resolved sid" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const known: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return request.session.id;
+    ,
+        .{ .method = "GET", .path = "/", .session_id = known },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings(&known, resp.body);
+}
+
+test "dispatch: request.session is null when no sid resolved" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return String(request.session);
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("null", resp.body);
 }
 
 test "dispatch: kv.set rejects platform-reserved prefixes" {

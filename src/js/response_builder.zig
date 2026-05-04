@@ -138,19 +138,24 @@ pub fn buildSystemRespHeaders(
 }
 
 /// Assemble a handler-response `RespHeaders` carrying optional CORS
-/// (admin host only), a `set-cookie` per `set_cookies` entry, and any
+/// (admin host only), an optional platform-managed `set-cookie`
+/// (currently the `__Host-rove_sid` mint from session.zig), one
+/// `set-cookie` per `set_cookies` entry the handler pushed, and any
 /// handler-defined custom headers. All inputs have already been
-/// sanitized by the dispatcher.
+/// sanitized by the dispatcher (or constructed locally for the
+/// platform cookie).
 pub fn buildHandlerRespHeaders(
     allocator: std.mem.Allocator,
     cors_origin: ?[]const u8,
+    platform_set_cookie: ?[]const u8,
     set_cookies: []const []const u8,
     content_type: ?[]const u8,
     custom_headers: []const dispatcher_mod.ResponseHeader,
 ) !h2.RespHeaders {
     const cors_count: usize = if (cors_origin != null) 4 else 0;
     const ct_count: usize = if (content_type != null) 1 else 0;
-    const total = cors_count + ct_count + set_cookies.len + custom_headers.len;
+    const platform_count: usize = if (platform_set_cookie != null) 1 else 0;
+    const total = cors_count + ct_count + platform_count + set_cookies.len + custom_headers.len;
     if (total == 0) return .{ .fields = null, .count = 0 };
 
     const pairs = try allocator.alloc(RespHeaderPair, total);
@@ -159,6 +164,10 @@ pub fn buildHandlerRespHeaders(
     appendCorsHeaders(pairs, &n, cors_origin, false);
     if (content_type) |ct| {
         pairs[n] = .{ .name = "content-type", .value = ct };
+        n += 1;
+    }
+    if (platform_set_cookie) |pc| {
+        pairs[n] = .{ .name = "set-cookie", .value = pc };
         n += 1;
     }
     for (set_cookies) |cookie| {

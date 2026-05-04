@@ -99,6 +99,10 @@ pub const DispatchState = struct {
     /// invocation. Resets per request. Part of the outbox id derivation
     /// so replays produce the same ids.
     webhook_call_index: u32 = 0,
+    /// Resolved session id (see `Request.session_id`). 64 lowercase hex
+    /// chars when set; null in non-browser dispatch paths. Surfaced as
+    /// `request.session = {id: ...}` (or `request.session = null`).
+    session_id: ?[64]u8 = null,
     /// Singleton admin-capability pointer. Non-null only when the
     /// handler-tenant is `__admin__`; the dispatcher installs the
     /// `platform.*` JS globals (instance / domain / root kv access)
@@ -1065,6 +1069,21 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, req_obj, "query", js_null);
     }
     installHeaders(ctx, state, req_obj, request.headers);
+
+    // request.session = {id: "<64hex>"} when the worker resolved a
+    // session cookie (or freshly minted one) for this request, else
+    // null. Customer JS branches on `request.session === null` for
+    // the "called outside browser context" cases (callbacks, signup,
+    // sim/dry-run). Eager mint on browser-facing handler invocations
+    // means the null branch is rare in production handler code.
+    if (state.session_id) |sid| {
+        const session_obj = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, session_obj, "id", c.JS_NewStringLen(ctx, &sid, sid.len));
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "session", session_obj);
+    } else {
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "session", js_null);
+    }
+
     _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);
 
     // response = { status: 200, headers: {}, cookies: [] }

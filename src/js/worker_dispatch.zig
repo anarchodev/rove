@@ -27,6 +27,7 @@ const auth = @import("auth.zig");
 const raft_propose = @import("raft_propose.zig");
 const panic_mod = @import("panic.zig");
 const worker_mod = @import("worker.zig");
+const session_mod = @import("session.zig");
 
 const Request = dispatcher_mod.Request;
 const ProxyPeer = worker_mod.ProxyPeer;
@@ -723,6 +724,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         }
         defer if (root_ws_ptr) |ws| ws.deinit();
 
+        // Resolve (or eagerly mint) the platform session cookie. Static
+        // assets and /_system/* short-circuited above, so reaching here
+        // means we're about to invoke a customer/admin JS handler — the
+        // points where SSE event-routing identity matters. If the
+        // browser sent no `__Host-rove_sid` (or sent a malformed one),
+        // we mint a fresh sid and append a `Set-Cookie` to the response
+        // below. See docs/sse-plan.md §1.
+        var sid_prng = std.Random.DefaultPrng.init(@bitCast(received_ns));
+        const session_resolved = session_mod.resolve(rh, sid_prng.random());
+
         const request: Request = .{
             .method = method,
             .path = path,
@@ -737,6 +748,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .module_tape = &tapes.module,
             .prng_seed = @bitCast(received_ns),
             .request_id = request_id,
+            .session_id = session_resolved.sid,
             // Non-null only when the handler-tenant is the admin
             // singleton — gates installation of `platform.root.*`.
             .platform = handler_inst.platform,
@@ -886,9 +898,18 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // via `response.cookies`).
         const handler_cors = if (is_admin_request) worker.admin_origin else null;
         const handler_ct: ?[]const u8 = if (resp.body_is_json) "application/json" else null;
+        // Append the platform `__Host-rove_sid` Set-Cookie when the
+        // worker had to mint a new sid for this request. Owned slice
+        // freed via h2's RespHeaders teardown of the packed header buf.
+        const platform_cookie: ?[]u8 = if (session_resolved.mint_set_cookie)
+            try session_mod.formatSetCookie(allocator, &session_resolved.sid)
+        else
+            null;
+        defer if (platform_cookie) |pc| allocator.free(pc);
         const handler_resp_hdrs: h2.RespHeaders = try respb.buildHandlerRespHeaders(
             allocator,
             handler_cors,
+            platform_cookie,
             resp.set_cookies,
             handler_ct,
             resp.headers,
