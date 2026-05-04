@@ -231,6 +231,47 @@ if grep -q 'should_not_arrive' "$SSE_LOG_X"; then
 fi
 ok "cross-tenant emit did NOT leak to tenant A's SSE stream"
 
+# ── 6. Reconnect catch-up: events emitted while disconnected ─────
+#
+# Models the closed-browser-then-reopen case. With the cookie alive
+# (Max-Age=1y), the new EventSource connect should see historical
+# events emitted while no client was attached. Without the
+# pending_catchup gate in events_pump, those events sit in kv until
+# retention expiry — the dirty-mark optimization drops them because
+# nobody was listening at emit time.
+#
+# Emit 3 more events from /emit while NO stream is open. Then open
+# /_events with the same cookie file (sid stays the same) and
+# confirm the historical events arrive within one pump tick.
+#
+# We need fresh wire ids each time, so this implicitly relies on
+# request_id incrementing across requests.
+
+# Note: the previous /emit calls used request_ids 2 and 3; this one
+# will use a higher one. The pump reads all rows past last_event_id
+# so it picks up everything.
+"${CURL[@]}" -b "$COOKIE_JAR" "${TENANT_A_ORIGIN}/emit" >/dev/null
+sleep 0.1
+"${CURL[@]}" -b "$COOKIE_JAR" "${TENANT_A_ORIGIN}/emit" >/dev/null
+sleep 0.5  # let pump + kv writes settle, no listener attached
+
+# Now reopen the SSE stream. With pending_catchup=true on the new
+# SseConnection and the events still in retention, the first pump
+# tick should deliver everything past the previous last_event_id.
+SSE_LOG_R=/tmp/sse-smoke-stream-reconnect.out
+rm -f "$SSE_LOG_R"
+"${CURL[@]}" --no-buffer -b "$COOKIE_JAR" --max-time 4 \
+    "${TENANT_A_ORIGIN}/_events" >"$SSE_LOG_R" 2>/dev/null &
+SSE_PID_R=$!
+sleep 1.0  # one pump tick (~1ms) but allow generous wall-clock for h2 flush
+wait $SSE_PID_R 2>/dev/null || true
+
+# Should have delivered the 6 emits (2 calls * 3 emits each) that
+# happened while no listener was connected.
+n_pings=$(grep -c '^event: ping$' "$SSE_LOG_R")
+[[ "$n_pings" -ge 6 ]] || fail "reconnect catch-up missed events: got $n_pings ping frames, expected ≥6"
+ok "reconnect with stale events: catch-up delivered $n_pings frames"
+
 # Cookie scoping: a request to tenant B with no cookie file should
 # get a fresh, different sid in Set-Cookie. (We can't force the
 # browser-level __Host- send-cross-host refusal here, but we can

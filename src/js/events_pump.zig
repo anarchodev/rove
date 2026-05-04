@@ -48,6 +48,18 @@ pub const SseConnection = struct {
     /// Monotonic-ns timestamp of the last frame we wrote (data or
     /// keepalive ping). Drives the keepalive cycle.
     last_send_ns: i64,
+    /// True until this connection has been scanned for historical
+    /// events at least once. Steady-state delivery is dirty-marked
+    /// (commit hook → `dirty_sids`), but a fresh connect or reconnect
+    /// has nothing in `dirty_sids` for its sid yet — emits that
+    /// landed while the client was offline must still be delivered
+    /// based on `last_event_id` alone. The pump treats
+    /// `pending_catchup` as equivalent to a dirty mark for this
+    /// connection's first scan; cleared on `pushed` or `no_rows`
+    /// outcomes, retained on `backpressured` so the next tick retries.
+    /// See docs/sse-plan.md §4.1 (cold-start / reconnect always
+    /// full-scans from `last_event_id`).
+    pending_catchup: bool,
 
     pub fn newAt(stream_ent: rove.Entity, sid: [64]u8, last_event_id: [27]u8, now_ns: i64) SseConnection {
         return .{
@@ -55,6 +67,7 @@ pub const SseConnection = struct {
             .sid = sid,
             .last_event_id = last_event_id,
             .last_send_ns = now_ns,
+            .pending_catchup = true,
         };
     }
 };
@@ -336,30 +349,41 @@ fn pumpTenant(
 
     // Walk connections; for each in stream_data_out, decide what to
     // push. We mutate sse_connections (advancing last_event_id /
-    // last_send_ns) but don't add or remove during the walk.
+    // last_send_ns / pending_catchup) but don't add or remove during
+    // the walk.
     var i: usize = 0;
     while (i < tc.sse_connections.items.len) : (i += 1) {
         const conn = &tc.sse_connections.items[i];
         if (!server.reg.isInCollection(conn.stream_ent, &server.stream_data_out)) continue;
 
+        // Two conditions trigger a prefix scan: a fresh emit landed
+        // (sid in dirty_sids) OR this connection has never been
+        // scanned for catch-up events (pending_catchup). The latter
+        // covers reconnects after an idle window where events were
+        // emitted with no listener — they sat in kv past the
+        // disconnect, the dirty mark fired against zero connections
+        // and was dropped, but a fresh connect must still see them.
         const sid_dirty = tc.dirty_sids.contains(&conn.sid);
-        if (sid_dirty) {
+        if (sid_dirty or conn.pending_catchup) {
             const outcome = try pushDirtyEvents(server, allocator, inst, conn, limiter, instance_id, now_ns);
             switch (outcome) {
                 .pushed => {
                     conn.last_send_ns = now_ns;
+                    conn.pending_catchup = false;
                     continue;
                 },
                 .backpressured => {
-                    // Remember to retain this sid in dirty_sids so we
-                    // retry next tick. We can't insert directly while
-                    // iterating dirty_sids' keys (we don't), but we
-                    // can use a side hashmap.
+                    // Retain the dirty mark and the catch-up flag so
+                    // the next tick retries when the bytes_out bucket
+                    // has refilled. No state advance.
                     try keep.put(allocator, &conn.sid, {});
                     // Still consider keepalive — wire isn't blocked.
                 },
                 .no_rows => {
-                    // Stale dirty mark; nothing to do, fall through.
+                    // Either a stale dirty mark or a fresh connection
+                    // that found no historical rows. Either way the
+                    // catch-up obligation is discharged for this conn.
+                    conn.pending_catchup = false;
                 },
             }
         }
