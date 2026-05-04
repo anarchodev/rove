@@ -24,6 +24,7 @@ const limiter_mod = @import("limiter.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const webhook_b = @import("bindings/webhook.zig");
 const td = @import("trigger_dispatch.zig");
+const reserved = @import("reserved.zig");
 
 const c = qjs.c;
 
@@ -195,6 +196,27 @@ fn valueToOwnedString(
 
 // ── kv.* ──────────────────────────────────────────────────────────────
 
+/// Throw `Error{message: "...", code: "reserved_key"}` for a customer
+/// `kv.set` / `kv.delete` against a platform-reserved namespace. Same
+/// shape as the `rate_limited` error from `email.send` so customer
+/// JS can branch on `err.code`.
+fn throwReservedKey(ctx: ?*c.JSContext, key: []const u8) c.JSValue {
+    const state = getState(ctx);
+    const msg = std.fmt.allocPrintSentinel(
+        state.allocator,
+        "kv: '{s}' is in a platform-reserved prefix",
+        .{key},
+        0,
+    ) catch return c.JS_ThrowOutOfMemory(ctx);
+    defer state.allocator.free(msg);
+
+    const err = c.JS_NewError(ctx);
+    if (c.JS_IsException(err)) return err;
+    _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
+    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, "reserved_key", "reserved_key".len));
+    return c.JS_Throw(ctx, err);
+}
+
 fn jsKvGet(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -237,6 +259,15 @@ fn jsKvSet(
     defer state.allocator.free(key_str);
     const val_str = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
     defer state.allocator.free(val_str);
+
+    // Reject writes into platform-reserved namespaces. Platform writers
+    // (webhook.send → _outbox/, events.emit → _events/, ...) bypass
+    // jsKvSet and write through state.txn / state.writeset directly,
+    // so this guard only fires when customer JS tries to spoof a
+    // platform key.
+    if (reserved.isCustomerWriteReserved(key_str)) {
+        return throwReservedKey(ctx, key_str);
+    }
 
     // Fast path: no triggers match → write directly, no savepoint, no
     // previousValue lookup, no chain machinery. Same cost as before
@@ -323,6 +354,11 @@ fn jsKvDelete(
 
     const key_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(key_str);
+
+    // Same reserved-namespace guard as jsKvSet — see the comment there.
+    if (reserved.isCustomerWriteReserved(key_str)) {
+        return throwReservedKey(ctx, key_str);
+    }
 
     // Fast path mirrors jsKvSet — no triggers means no savepoint, no
     // previousValue lookup, no chain machinery.

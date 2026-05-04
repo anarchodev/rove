@@ -52,6 +52,7 @@ pub const penalty = @import("penalty.zig");
 pub const limiter = @import("limiter.zig");
 pub const router = @import("router.zig");
 pub const callback_dispatch = @import("callback_dispatch.zig");
+pub const reserved = @import("reserved.zig");
 
 pub const Budget = dispatcher.Budget;
 pub const PenaltyBox = penalty.PenaltyBox;
@@ -94,4 +95,5 @@ test {
     _ = limiter;
     _ = router;
     _ = callback_dispatch;
+    _ = reserved;
 }

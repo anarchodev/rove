@@ -71,6 +71,7 @@ const panic_mod = @import("panic.zig");
 const penalty_mod = @import("penalty.zig");
 const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
+const reserved = @import("reserved.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = dispatcher_mod.Request;
 
@@ -166,26 +167,6 @@ pub const StaticEntry = struct {
 /// naturally next to `worker.TenantFiles`.
 pub const TriggerEntry = globals.TriggerEntry;
 
-/// Reserved key prefixes that customer triggers can't fire on.
-/// See PLAN §2.5 (Implementation notes / Platform-prefix guard).
-/// Both directions are checked at deploy-load: a derived prefix that
-/// starts with one of these is rejected; a derived prefix that one of
-/// these starts with is also rejected (since it would otherwise catch
-/// system writes via the platform's own prefix). Catch-all (prefix="")
-/// is allowed; the fire-time guard skips dispatch on platform keys.
-const PLATFORM_KV_PREFIXES = [_][]const u8{
-    "_audit/",
-    "_deploy/",
-    "_outbox/",
-    "_outbox_inflight/",
-    "_dlq/",
-    "_callback/",
-    "_magic/",
-    "_triggers/",
-    "_events/",
-    "_sessions/",
-};
-
 /// Returns the kv key prefix this manifest path registers as a trigger
 /// for, or null if the path isn't a trigger module entry. The path IS
 /// the prefix (PLAN §2.5):
@@ -215,16 +196,10 @@ fn triggerPathToPrefix(path: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Customer trigger registration prefix collides with a platform
-/// namespace (either direction). See `PLATFORM_KV_PREFIXES`.
-fn isReservedTriggerPrefix(prefix: []const u8) bool {
-    if (prefix.len == 0) return false; // catch-all is allowed
-    for (PLATFORM_KV_PREFIXES) |p| {
-        if (std.mem.startsWith(u8, prefix, p)) return true;
-        if (std.mem.startsWith(u8, p, prefix)) return true;
-    }
-    return false;
-}
+/// Re-export so callers reading worker.zig find the trigger guard
+/// without leaving the file. See `reserved.zig` for the prefix list
+/// and the customer-write guard counterpart.
+const isReservedTriggerPrefix = reserved.isReservedTriggerPrefix;
 
 /// Refreshed periodically via `refreshDeployments` when the tenant's
 /// `deployment/current` advances.
@@ -1692,38 +1667,7 @@ test "triggerPathToPrefix: non-trigger paths return null" {
     try std.testing.expectEqual(@as(?[]const u8, null), triggerPathToPrefix("_triggers/users/index.ts"));
 }
 
-test "isReservedTriggerPrefix: catch-all is allowed" {
-    try std.testing.expect(!isReservedTriggerPrefix(""));
-}
-
-test "isReservedTriggerPrefix: customer prefixes are allowed" {
-    try std.testing.expect(!isReservedTriggerPrefix("users/"));
-    try std.testing.expect(!isReservedTriggerPrefix("orders/"));
-    try std.testing.expect(!isReservedTriggerPrefix("a/b/c/"));
-    try std.testing.expect(!isReservedTriggerPrefix("my_audit/")); // doesn't share prefix with _audit/
-}
-
-test "isReservedTriggerPrefix: exact platform prefix blocked" {
-    try std.testing.expect(isReservedTriggerPrefix("_audit/"));
-    try std.testing.expect(isReservedTriggerPrefix("_outbox/"));
-    try std.testing.expect(isReservedTriggerPrefix("_events/"));
-    try std.testing.expect(isReservedTriggerPrefix("_sessions/"));
-    try std.testing.expect(isReservedTriggerPrefix("_triggers/"));
-}
-
-test "isReservedTriggerPrefix: deeper-than-platform blocked (would catch system writes)" {
-    try std.testing.expect(isReservedTriggerPrefix("_audit/secrets/"));
-    try std.testing.expect(isReservedTriggerPrefix("_outbox/specific_id"));
-}
-
-test "isReservedTriggerPrefix: shallower-than-platform blocked (would catch system writes)" {
-    // `_aud` would catch writes to `_audit/foo`.
-    try std.testing.expect(isReservedTriggerPrefix("_aud"));
-    // `_o` would catch writes to `_outbox/...`, `_outbox_inflight/...`.
-    try std.testing.expect(isReservedTriggerPrefix("_o"));
-    // `_` alone catches everything starting with underscore — all platform prefixes.
-    try std.testing.expect(isReservedTriggerPrefix("_"));
-}
+// `isReservedTriggerPrefix` tests live alongside the helper in reserved.zig.
 
 pub const ADMIN_SESSION_COOKIE = auth.ADMIN_SESSION_COOKIE;
 

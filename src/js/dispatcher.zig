@@ -1570,6 +1570,113 @@ test "dispatch: kv.set + kv.get round trip" {
     try testing.expectEqualStrings("rove", r2.body);
 }
 
+test "dispatch: kv.set rejects platform-reserved prefixes" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Attempting to spoof an outbox row from customer code throws
+    // Error{code: "reserved_key"}. Same shape applies to _events/,
+    // _callback/, _audit/, etc.
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try {
+        \\  kv.set("_outbox/spoofed", "x");
+        \\  return "no_throw";
+        \\} catch (e) {
+        \\  return e.code + ":" + e.message;
+        \\}
+    ,
+        .{ .method = "POST", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expect(std.mem.startsWith(u8, resp.body, "reserved_key:"));
+    try testing.expect(std.mem.indexOf(u8, resp.body, "_outbox/spoofed") != null);
+
+    // The spoofed row must NOT be in the kv after commit.
+    try testing.expectError(error.NotFound, kv.get("_outbox/spoofed"));
+}
+
+test "dispatch: kv.delete rejects platform-reserved prefixes" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Seed an event row directly through the kv (simulating a real
+    // events.emit having written it earlier).
+    try kv.put("_events/sid/0001-000001", "real_event");
+
+    // Customer kv.delete against the reserved prefix throws.
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try {
+        \\  kv.delete("_events/sid/0001-000001");
+        \\  return "no_throw";
+        \\} catch (e) {
+        \\  return e.code;
+        \\}
+    ,
+        .{ .method = "POST", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("reserved_key", resp.body);
+
+    // The seeded row must still be there.
+    const v = try kv.get("_events/sid/0001-000001");
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("real_event", v);
+}
+
+test "dispatch: kv.set into customer namespace still works" {
+    // Regression: the reserved-prefix guard must not catch normal
+    // customer keys that happen to share a prefix substring (e.g.
+    // "my_outbox/" should not collide with "_outbox/").
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var r1 = try runOne(
+        &d,
+        kv,
+        \\kv.set("my_outbox/x", "v1");
+        \\kv.set("users/alice", "v2");
+        \\return "ok";
+    ,
+        .{ .method = "POST", .path = "/" },
+    );
+    defer r1.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok", r1.body);
+
+    const a = try kv.get("my_outbox/x");
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("v1", a);
+    const b = try kv.get("users/alice");
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("v2", b);
+}
+
 test "dispatch: kv.delete removes key" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
