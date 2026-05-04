@@ -1579,6 +1579,213 @@ test "dispatch: kv.set + kv.get round trip" {
     try testing.expectEqualStrings("rove", r2.body);
 }
 
+test "dispatch: events.emit string form writes to current sid" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const sid: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const id = events.emit("hello");
+        \\return id;
+    ,
+        .{ .method = "POST", .path = "/", .session_id = sid, .request_id = 42 },
+    );
+    defer resp.deinit(testing.allocator);
+
+    // Returned wire id is request_id-call_index, zero-padded.
+    try testing.expectEqualStrings("00000000000000000042-000000", resp.body);
+
+    // The envelope was written to _events/{sid}/{wire_id}.
+    const expected_key = "_events/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/00000000000000000042-000000";
+    const env_bytes = try kv.get(expected_key);
+    defer testing.allocator.free(env_bytes);
+    // The data field should round-trip the string "hello".
+    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"data\":\"hello\"") != null);
+    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"type\":\"message\"") != null);
+    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"v\":1") != null);
+}
+
+test "dispatch: events.emit object form with custom type + data" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const sid: [64]u8 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".*;
+    var resp = try runOne(
+        &d,
+        kv,
+        \\events.emit({type: "tick", data: {count: 7, label: "foo"}});
+        \\return "ok";
+    ,
+        .{ .method = "POST", .path = "/", .session_id = sid, .request_id = 1 },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok", resp.body);
+
+    const expected_key = "_events/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789/00000000000000000001-000000";
+    const env_bytes = try kv.get(expected_key);
+    defer testing.allocator.free(env_bytes);
+    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"type\":\"tick\"") != null);
+    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"count\":7") != null);
+    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"label\":\"foo\"") != null);
+}
+
+test "dispatch: events.emit explicit fan-out writes to each sid" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const me: [64]u8 = "1111111111111111111111111111111111111111111111111111111111111111".*;
+    var resp = try runOne(
+        &d,
+        kv,
+        \\events.emit({to: ["aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+        \\                  "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"],
+        \\             data: "x"});
+        \\return "ok";
+    ,
+        .{ .method = "POST", .path = "/", .session_id = me, .request_id = 5 },
+    );
+    defer resp.deinit(testing.allocator);
+
+    // Both target sids got the envelope. Same wire id, different keys.
+    const a = try kv.get("_events/aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111/00000000000000000005-000000");
+    defer testing.allocator.free(a);
+    const b = try kv.get("_events/bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222/00000000000000000005-000000");
+    defer testing.allocator.free(b);
+    try testing.expectEqualSlices(u8, a, b);
+
+    // The current sid did NOT receive a copy — explicit `to:`
+    // overrides the implicit-target.
+    try testing.expectError(error.NotFound, kv.get("_events/1111111111111111111111111111111111111111111111111111111111111111/00000000000000000005-000000"));
+}
+
+test "dispatch: events.emit increments call_index across calls" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const sid: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const a = events.emit("first");
+        \\const b = events.emit("second");
+        \\const c = events.emit("third");
+        \\return a + "|" + b + "|" + c;
+    ,
+        .{ .method = "POST", .path = "/", .session_id = sid, .request_id = 9 },
+    );
+    defer resp.deinit(testing.allocator);
+
+    // Call indices 0, 1, 2 — all under the same request_id.
+    try testing.expectEqualStrings(
+        "00000000000000000009-000000|00000000000000000009-000001|00000000000000000009-000002",
+        resp.body,
+    );
+}
+
+test "dispatch: events.emit throws when no session and no to:" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { events.emit("hi"); return "no_throw"; }
+        \\catch (e) { return e.code; }
+    ,
+        .{ .method = "POST", .path = "/" }, // no session_id
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("no_session", resp.body);
+}
+
+test "dispatch: events.emit rejects customer-supplied id" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const sid: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { events.emit({id: "cheat", data: "x"}); return "no_throw"; }
+        \\catch (e) { return e.code; }
+    ,
+        .{ .method = "POST", .path = "/", .session_id = sid, .request_id = 1 },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("events_id_reserved", resp.body);
+}
+
+test "dispatch: events.emit rejects malformed sid in to:" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    const sid: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
+    var resp = try runOne(
+        &d,
+        kv,
+        \\try { events.emit({to: "not-a-sid", data: "x"}); return "no_throw"; }
+        \\catch (e) { return e.code; }
+    ,
+        .{ .method = "POST", .path = "/", .session_id = sid, .request_id = 1 },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("events_bad_sid", resp.body);
+}
+
 test "dispatch: request.session.id surfaces resolved sid" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

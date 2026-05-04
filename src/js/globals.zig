@@ -23,6 +23,7 @@ const h2 = @import("rove-h2");
 const limiter_mod = @import("limiter.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const webhook_b = @import("bindings/webhook.zig");
+const events_b = @import("bindings/events.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
 
@@ -99,6 +100,14 @@ pub const DispatchState = struct {
     /// invocation. Resets per request. Part of the outbox id derivation
     /// so replays produce the same ids.
     webhook_call_index: u32 = 0,
+    /// 0-based counter of `events.emit` calls within this handler
+    /// invocation. Resets per request. Combined with `request_id`
+    /// to derive the SSE wire id (`{request_id:020d}-{call_index:06d}`)
+    /// so replays produce the same ids and lexical sort = numeric sort.
+    /// One emit increments by one regardless of fan-out cardinality
+    /// (`{to: [a, b, c]}` is one emit, three writes — all share the
+    /// same wire id).
+    events_call_index: u32 = 0,
     /// Resolved session id (see `Request.session_id`). 64 lowercase hex
     /// chars when set; null in non-browser dispatch paths. Surfaced as
     /// `request.session = {id: ...}` (or `request.session = null`).
@@ -941,6 +950,13 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // thread on the raft leader does the actual HTTP call.
     .{ .path = &.{"webhook"}, .fns = &.{
         .{ .name = "send", .cfunc = webhook_b.jsWebhookSend, .argc = 1 },
+    } },
+    // events.emit. Writes _events/{sid}/{seq} rows in the handler tx;
+    // the SSE pump (worker.zig) drives connected EventSource clients
+    // off those rows. Cross-tenant integrity is structural — each
+    // tenant's events live only in that tenant's app.db.
+    .{ .path = &.{"events"}, .fns = &.{
+        .{ .name = "emit", .cfunc = events_b.jsEventsEmit, .argc = 1 },
     } },
     // platform = { root, instances }. Installed on every context;
     // the C callbacks check `state.platform` and throw for non-admin
