@@ -54,6 +54,7 @@ pub const router = @import("router.zig");
 pub const callback_dispatch = @import("callback_dispatch.zig");
 pub const reserved = @import("reserved.zig");
 pub const session = @import("session.zig");
+pub const events = @import("events.zig");
 
 pub const Budget = dispatcher.Budget;
 pub const PenaltyBox = penalty.PenaltyBox;
@@ -98,4 +99,5 @@ test {
     _ = callback_dispatch;
     _ = reserved;
     _ = session;
+    _ = events;
 }

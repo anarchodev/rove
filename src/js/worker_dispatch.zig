@@ -28,6 +28,7 @@ const raft_propose = @import("raft_propose.zig");
 const panic_mod = @import("panic.zig");
 const worker_mod = @import("worker.zig");
 const session_mod = @import("session.zig");
+const events_mod = @import("events.zig");
 
 const Request = dispatcher_mod.Request;
 const ProxyPeer = worker_mod.ProxyPeer;
@@ -506,6 +507,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
         // `/_system/*` — CORS gate, then auth + proxy routing.
         if (try tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh)) {
+            processed += 1;
+            continue;
+        }
+
+        // `/_events` — SSE endpoint. Mints `__Host-rove_sid` if absent,
+        // sends text/event-stream headers, finalizes immediately in v1
+        // (streaming pump lands sub-phase 11e). Handled per-tenant: the
+        // host has already been resolved by the time we get here, but
+        // we don't need the tenant context yet — the connection table
+        // wiring lands with the pump.
+        if (try events_mod.tryHandleEvents(server, allocator, ent, sid, sess, method, path, rh, received_ns)) {
             processed += 1;
             continue;
         }
