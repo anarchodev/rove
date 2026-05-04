@@ -1579,6 +1579,72 @@ test "dispatch: kv.set + kv.get round trip" {
     try testing.expectEqualStrings("rove", r2.body);
 }
 
+test "dispatch: cross-tenant events.emit{to:} writes only to caller's kv" {
+    // SSE cross-tenant isolation argument from docs/sse-plan.md §2.2.
+    // events.emit({to: <tenant-A's sid>}) called from tenant B's
+    // handler writes the row into tenant B's app.db, NOT tenant A's.
+    // The pump on tenant A's host never reads from tenant B's db,
+    // so the spoofing attempt is structurally ineffective.
+    //
+    // This test models the per-tenant kv isolation by giving each
+    // "tenant" its own KvStore and confirming the cross-target emit
+    // lands only in the caller's. The actual host→tenant routing
+    // happens upstream in worker_dispatch.resolveRequest; here we
+    // exercise the kv-scope half of the argument.
+    var buf_a: [64]u8 = undefined;
+    const kv_a = try openTempKv(testing.allocator, &buf_a);
+    defer {
+        kv_a.close();
+        cleanupTempKv(&buf_a);
+    }
+
+    var buf_b: [64]u8 = undefined;
+    const kv_b = try openTempKv(testing.allocator, &buf_b);
+    defer {
+        kv_b.close();
+        cleanupTempKv(&buf_b);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Tenant A's session id — what tenant B is going to try to spoof
+    // by passing it to events.emit({to: ...}).
+    const sid_a = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
+    const sid_b: [64]u8 = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222".*;
+
+    // Tenant B's handler fires `events.emit({to: <sid_a>, data: "spoof"})`.
+    // Dispatch runs against kv_b (tenant B's app.db).
+    var resp = try runOne(
+        &d,
+        kv_b,
+        \\events.emit({to: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111", data: "spoof"});
+        \\return "ok";
+    ,
+        .{ .method = "POST", .path = "/", .session_id = sid_b, .request_id = 1 },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok", resp.body);
+
+    // Spoof landed in tenant B's kv at the targeted sid prefix —
+    // confirms the JS-level emit went through.
+    const expected_b_key = "_events/" ++ sid_a ++ "/00000000000000000001-000000";
+    const v_in_b = try kv_b.get(expected_b_key);
+    defer testing.allocator.free(v_in_b);
+    try testing.expect(std.mem.indexOf(u8, v_in_b, "\"data\":\"spoof\"") != null);
+
+    // Tenant A's kv has NO _events/ rows — the cross-tenant write
+    // was structurally impossible. This is the load-bearing isolation
+    // claim: the pump on tenant A's host will iterate ONLY tenant
+    // A's kv when delivering to a connected EventSource client, so
+    // even though tenant B successfully wrote a row "addressed" to
+    // sid_a, nobody connected to tenant A's /_events will ever see it.
+    try testing.expectError(error.NotFound, kv_a.get(expected_b_key));
+    var scan_a = try kv_a.prefix("_events/", "", 100);
+    defer scan_a.deinit();
+    try testing.expectEqual(@as(usize, 0), scan_a.entries.len);
+}
+
 test "dispatch: events.emit string form writes to current sid" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
