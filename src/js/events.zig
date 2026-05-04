@@ -232,6 +232,21 @@ pub fn tryHandleEvents(
     const conn = events_pump.SseConnection.newAt(ent, resolved.sid, last_event_id, received_ns);
     try events_pump.addConnection(tc, conn);
 
+    // Mark the sid dirty so the first pump tick after this
+    // connection reaches stream_data_out scans `_events/{sid}/`
+    // forward from `last_event_id`. Covers two cases the
+    // dirty-marked steady-state path can't:
+    //   1. Reconnect within the cookie window — events emitted
+    //      while no listener was attached sit in kv past the
+    //      retention floor.
+    //   2. Fresh connect carrying `Last-Event-ID: <X>` from a prior
+    //      session — historical events between X and the head of
+    //      the prefix.
+    // The pump retains the dirty mark while the entity is in
+    // stream_response_in (h2 hasn't sent headers yet); on the
+    // following tick it lands in stream_data_out and the scan fires.
+    try events_pump.markSidDirty(tc, &resolved.sid);
+
     return true;
 }
 

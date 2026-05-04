@@ -32,10 +32,21 @@ const events_mod = @import("events.zig");
 const limiter_mod = @import("limiter.zig");
 
 /// Per-connection record. Owned by the tenant's `TenantFiles`.
+///
+/// State semantics: a connection's lifecycle phase is read from the
+/// h2 collection its `stream_ent` currently sits in. There is no
+/// state field on the record itself; the rove principle is that
+/// state IS collection membership.
+///   - `stream_response_in`: h2 hasn't sent the response headers yet.
+///   - `stream_data_out`: h2 is asking us for the next chunk —
+///     this is where the pump pushes.
+///   - `stream_data_in` / `_stream_data_sending`: a frame we pushed
+///     is in flight; nothing for the pump to do.
+///   - `response_out`: stream closed; `cleanupClosedSseConnections`
+///     removes the record on the next tick.
 pub const SseConnection = struct {
     /// The h2 stream entity. Lifecycle managed by h2. We read its
-    /// current collection (`stream_data_out` vs `stream_data_in` vs
-    /// `response_out`) to know whether it's ready for our next push.
+    /// current collection on every pump pass.
     stream_ent: rove.Entity,
     /// Owned 64-hex sid. Same value as the cookie.
     sid: [64]u8,
@@ -48,18 +59,6 @@ pub const SseConnection = struct {
     /// Monotonic-ns timestamp of the last frame we wrote (data or
     /// keepalive ping). Drives the keepalive cycle.
     last_send_ns: i64,
-    /// True until this connection has been scanned for historical
-    /// events at least once. Steady-state delivery is dirty-marked
-    /// (commit hook → `dirty_sids`), but a fresh connect or reconnect
-    /// has nothing in `dirty_sids` for its sid yet — emits that
-    /// landed while the client was offline must still be delivered
-    /// based on `last_event_id` alone. The pump treats
-    /// `pending_catchup` as equivalent to a dirty mark for this
-    /// connection's first scan; cleared on `pushed` or `no_rows`
-    /// outcomes, retained on `backpressured` so the next tick retries.
-    /// See docs/sse-plan.md §4.1 (cold-start / reconnect always
-    /// full-scans from `last_event_id`).
-    pending_catchup: bool,
 
     pub fn newAt(stream_ent: rove.Entity, sid: [64]u8, last_event_id: [27]u8, now_ns: i64) SseConnection {
         return .{
@@ -67,7 +66,6 @@ pub const SseConnection = struct {
             .sid = sid,
             .last_event_id = last_event_id,
             .last_send_ns = now_ns,
-            .pending_catchup = true,
         };
     }
 };
@@ -142,6 +140,20 @@ pub fn countConnectionsForSid(tc: anytype, sid: []const u8) u32 {
 
 // ── Dirty-marking ─────────────────────────────────────────────────
 
+/// Insert `sid` into `tc.dirty_sids` if absent. Allocator-owned key
+/// duped on first sight; subsequent calls dedupe via getOrPut.
+/// Used both by `markDirtyFromWriteset` (steady-state delivery) and
+/// by `tryHandleEvents` at connect time (so the next pump tick
+/// scans for any historical events the new connection should
+/// catch up on).
+pub fn markSidDirty(tc: anytype, sid: []const u8) !void {
+    const gop = try tc.dirty_sids.getOrPut(tc.allocator, sid);
+    if (!gop.found_existing) {
+        const owned = try tc.allocator.dupe(u8, sid);
+        gop.key_ptr.* = owned;
+    }
+}
+
 /// Inspect a freshly-committed writeset for `_events/{sid}/...` keys
 /// and insert each sid into `tc.dirty_sids` IFF the tenant has at
 /// least one connection subscribed to that sid. Skipping the
@@ -158,16 +170,8 @@ pub fn markDirtyFromWriteset(
             .delete => |d| d.key,
         };
         const sid = sidFromEventsKey(key) orelse continue;
-        // Skip if no connection for this sid.
         if (countConnectionsForSid(tc, sid) == 0) continue;
-        // dirty_sids is a hashmap keyed by the sid string. We need an
-        // owned key the table can hold; allocate-on-insert via
-        // getOrPut and dupe on first sight.
-        const gop = try tc.dirty_sids.getOrPut(tc.allocator, sid);
-        if (!gop.found_existing) {
-            const owned = try tc.allocator.dupe(u8, sid);
-            gop.key_ptr.* = owned;
-        }
+        try markSidDirty(tc, sid);
     }
 }
 
@@ -347,43 +351,47 @@ fn pumpTenant(
     var keep: std.StringHashMapUnmanaged(void) = .empty;
     defer keep.deinit(allocator);
 
-    // Walk connections; for each in stream_data_out, decide what to
-    // push. We mutate sse_connections (advancing last_event_id /
-    // last_send_ns / pending_catchup) but don't add or remove during
-    // the walk.
+    // Walk connections; the gate for both push and dirty-retention
+    // is collection membership — the rove-native state read.
     var i: usize = 0;
     while (i < tc.sse_connections.items.len) : (i += 1) {
         const conn = &tc.sse_connections.items[i];
-        if (!server.reg.isInCollection(conn.stream_ent, &server.stream_data_out)) continue;
-
-        // Two conditions trigger a prefix scan: a fresh emit landed
-        // (sid in dirty_sids) OR this connection has never been
-        // scanned for catch-up events (pending_catchup). The latter
-        // covers reconnects after an idle window where events were
-        // emitted with no listener — they sat in kv past the
-        // disconnect, the dirty mark fired against zero connections
-        // and was dropped, but a fresh connect must still see them.
         const sid_dirty = tc.dirty_sids.contains(&conn.sid);
-        if (sid_dirty or conn.pending_catchup) {
+
+        if (!server.reg.isInCollection(conn.stream_ent, &server.stream_data_out)) {
+            // h2 has the entity in transit (stream_response_in
+            // before headers fly, or stream_data_in /
+            // _stream_data_sending mid-flush). If the sid has
+            // pending work, retain the dirty mark so the next tick
+            // — by which time the entity is back in
+            // stream_data_out — can deliver it. This is the
+            // catch-up path for fresh connects: tryHandleEvents
+            // marks the sid dirty at register time; the entity
+            // sits in stream_response_in for one tick; the mark is
+            // retained; next tick the entity reaches
+            // stream_data_out and we push.
+            if (sid_dirty) try keep.put(allocator, &conn.sid, {});
+            continue;
+        }
+
+        if (sid_dirty) {
             const outcome = try pushDirtyEvents(server, allocator, inst, conn, limiter, instance_id, now_ns);
             switch (outcome) {
                 .pushed => {
                     conn.last_send_ns = now_ns;
-                    conn.pending_catchup = false;
                     continue;
                 },
                 .backpressured => {
-                    // Retain the dirty mark and the catch-up flag so
-                    // the next tick retries when the bytes_out bucket
-                    // has refilled. No state advance.
+                    // Retain the dirty mark so the next tick
+                    // retries when the bytes_out bucket has
+                    // refilled. No state advance.
                     try keep.put(allocator, &conn.sid, {});
                     // Still consider keepalive — wire isn't blocked.
                 },
                 .no_rows => {
-                    // Either a stale dirty mark or a fresh connection
-                    // that found no historical rows. Either way the
-                    // catch-up obligation is discharged for this conn.
-                    conn.pending_catchup = false;
+                    // Either a stale dirty mark or a fresh
+                    // connection that found no historical rows.
+                    // Either way the catch-up scan is complete.
                 },
             }
         }
