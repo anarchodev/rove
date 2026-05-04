@@ -56,6 +56,7 @@ pub const reserved = @import("reserved.zig");
 pub const session = @import("session.zig");
 pub const events = @import("events.zig");
 pub const events_pump = @import("events_pump.zig");
+pub const events_sweep = @import("events_sweep.zig");
 
 pub const Budget = dispatcher.Budget;
 pub const PenaltyBox = penalty.PenaltyBox;
@@ -85,6 +86,8 @@ pub const refreshDeployments = worker.refreshDeployments;
 pub const cleanupResponses = worker.cleanupResponses;
 pub const pumpEvents = events_pump.pumpEvents;
 pub const cleanupClosedSseConnections = events_pump.cleanupClosedSseConnections;
+pub const sweepEvents = events_sweep.sweepEvents;
+pub const SSE_SWEEP_INTERVAL_NS = events_sweep.SWEEP_INTERVAL_NS;
 pub const flushLogs = worker.flushLogs;
 pub const connectProxies = worker.connectProxies;
 pub const ingestProxyConnects = worker.ingestProxyConnects;
@@ -104,4 +107,5 @@ test {
     _ = session;
     _ = events;
     _ = events_pump;
+    _ = events_sweep;
 }
