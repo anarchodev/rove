@@ -72,6 +72,7 @@ const penalty_mod = @import("penalty.zig");
 const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
+const events_pump = @import("events_pump.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = dispatcher_mod.Request;
 
@@ -247,6 +248,18 @@ pub const TenantFiles = struct {
     /// whose deadline hasn't passed yet so we don't hammer the code
     /// store on every tick.
     next_refresh_ns: i64,
+    /// Active SSE connections for this tenant. Owned `SseConnection`
+    /// records — sid + h2 stream entity + cursor + last-send timestamp.
+    /// Linear-scan lookup is fine at v1's per-instance caps. Populated
+    /// by `events.tryHandleEvents` on connect, removed by
+    /// `events_pump.cleanupClosedSseConnections` after h2 finishes.
+    sse_connections: std.ArrayListUnmanaged(events_pump.SseConnection),
+    /// Sids that need pump attention next tick (their `_events/{sid}/...`
+    /// rows just got new entries via `events.emit`). Populated by
+    /// `events_pump.markDirtyFromWriteset` after each successful commit;
+    /// drained by `pumpEvents`. Hashmap keyed by allocator-owned sid
+    /// strings so `getOrPut` can dedupe.
+    dirty_sids: std.StringHashMapUnmanaged(void),
 
     pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFiles {
         return openTenantFiles(worker, inst);
@@ -766,6 +779,8 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
         .statics = .empty,
         .triggers = &.{},
         .next_refresh_ns = 0,
+        .sse_connections = .empty,
+        .dirty_sids = .empty,
     };
     tc.store = files_mod.FileStore.init(
         allocator,
@@ -797,6 +812,14 @@ fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
     freeSourceHashes(tc);
     freeStatics(tc);
     freeTriggers(tc);
+    // SSE connection table — entries hold no owned slices beyond the
+    // record itself, so the ArrayList free covers the whole thing.
+    tc.sse_connections.deinit(allocator);
+    // dirty_sids holds allocator-owned sid keys — free each before the
+    // hashmap teardown.
+    var ds_it = tc.dirty_sids.iterator();
+    while (ds_it.next()) |entry| allocator.free(entry.key_ptr.*);
+    tc.dirty_sids.deinit(allocator);
     tc.blob_backend.deinit();
     tc.files_kv.close();
     allocator.free(tc.instance_id);

@@ -29,6 +29,7 @@ const panic_mod = @import("panic.zig");
 const worker_mod = @import("worker.zig");
 const session_mod = @import("session.zig");
 const events_mod = @import("events.zig");
+const events_pump = @import("events_pump.zig");
 
 const Request = dispatcher_mod.Request;
 const ProxyPeer = worker_mod.ProxyPeer;
@@ -97,6 +98,22 @@ fn finalizeBatch(
         "tenant={s} err={s}",
         .{ anchor_id, @errorName(err) },
     );
+
+    // SSE: now that the writes are durable on the leader, mark any
+    // sids touched by `_events/{sid}/...` rows as dirty so the next
+    // pump tick wakes them up. Skip on no-writes (nothing to mark)
+    // and on lookup failure (anchor must exist for us to be here,
+    // but fail-soft if the tenant_files map raced a teardown).
+    if (has_writes) {
+        if (worker.tenant_files_map.get(anchor_id)) |tc| {
+            events_pump.markDirtyFromWriteset(tc, writeset) catch |err| {
+                std.log.warn(
+                    "rove-js: events_pump.markDirtyFromWriteset({s}) failed: {s}",
+                    .{ anchor_id, @errorName(err) },
+                );
+            };
+        }
+    }
 
     if (!has_writes) {
         // Pure read-only batch: no raft hop.
@@ -511,17 +528,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             continue;
         }
 
-        // `/_events` — SSE endpoint. Mints `__Host-rove_sid` if absent,
-        // sends text/event-stream headers, finalizes immediately in v1
-        // (streaming pump lands sub-phase 11e). Handled per-tenant: the
-        // host has already been resolved by the time we get here, but
-        // we don't need the tenant context yet — the connection table
-        // wiring lands with the pump.
-        if (try events_mod.tryHandleEvents(server, allocator, ent, sid, sess, method, path, rh, received_ns)) {
-            processed += 1;
-            continue;
-        }
-
         const host = worker_mod.hostOnly(authority);
 
         const resolved = switch (try resolveRequest(server, allocator, worker, ent, sid, sess, method, path, host, rh)) {
@@ -568,6 +574,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (tc.current_deployment_id == 0) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{});
+            processed += 1;
+            continue;
+        }
+
+        // `/_events` — SSE endpoint, scoped to the resolved tenant
+        // (its sse_connections + dirty_sids tables). Mints
+        // `__Host-rove_sid` if absent, sends text/event-stream headers,
+        // moves into stream_response_in for the pump to drive on
+        // subsequent ticks. See docs/sse-plan.md §11d/§11e.
+        if (try events_mod.tryHandleEvents(server, allocator, tc, ent, sid, sess, method, path, rh, received_ns)) {
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 200, .ok, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }

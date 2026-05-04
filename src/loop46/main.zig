@@ -368,6 +368,17 @@ fn workerMain(args: *WorkerCtx) !void {
         }
         try rjs.drainRaftPending(worker);
         try reg.flush();
+        // SSE: drive connected EventSource clients off newly-emitted
+        // _events/{sid}/... rows. Runs after drainRaftPending so any
+        // dirty marks set during this tick's commits are visible.
+        try rjs.pumpEvents(worker);
+        try reg.flush();
+        // SSE: scrub the per-tenant connection table for any h2
+        // entities that just landed in response_out (client
+        // disconnect, transport error). MUST run before
+        // cleanupResponses or the records would point at destroyed
+        // entities next tick.
+        try rjs.cleanupClosedSseConnections(worker);
         try rjs.cleanupResponses(worker);
         try reg.flush();
         try rjs.refreshDeployments(worker);

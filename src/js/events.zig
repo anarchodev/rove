@@ -13,6 +13,7 @@ const h2 = @import("rove-h2");
 
 const respb = @import("response_builder.zig");
 const session_mod = @import("session.zig");
+const events_pump = @import("events_pump.zig");
 
 /// Per-account plan tier. Lives here for now until the platform-wide
 /// `tenant.PlanTier` lands in Phase 10 (PLAN §3 / §2.4 account model).
@@ -115,18 +116,19 @@ pub fn eventsCapsForPlan(plan: PlanTier) EventsCaps {
 /// `tryHandleSystem` shape so the worker_dispatch loop's branch
 /// reads naturally.
 ///
-/// **v1 SCOPE NOTE**: the response moves into `response_in`
-/// immediately with headers + minted `Set-Cookie` and an empty body.
-/// The streaming path (`stream_response_in` → pump → `stream_data_in`
-/// → keepalive) lands in sub-phase 11e. Browsers connecting today
-/// will see a clean 200 + the cookie set, but EventSource will
-/// reconnect immediately because the response closes. That's
-/// acceptable as a step — the cookie minting is the load-bearing
-/// piece for cross-tenant isolation testing, and the test gates
-/// established here will remain the same once the stream phase lands.
+/// On match: minted `__Host-rove_sid` if absent, response headers
+/// (text/event-stream + cache-control: no-store + optional
+/// Set-Cookie), entity moved into `stream_response_in`, and a
+/// `SseConnection` record inserted into `tc.sse_connections` so
+/// `events_pump.pumpEvents` can drive it on subsequent ticks.
+///
+/// `tc` is the per-tenant `TenantFiles` resolved by the worker
+/// upstream. Type-erased to break the import cycle (worker.zig
+/// already imports this module).
 pub fn tryHandleEvents(
     server: anytype,
     allocator: std.mem.Allocator,
+    tc: anytype,
     ent: rove.Entity,
     sid_h2: h2.StreamId,
     sess: h2.Session,
@@ -154,6 +156,16 @@ pub fn tryHandleEvents(
     var prng = std.Random.DefaultPrng.init(@bitCast(received_ns));
     const resolved = session_mod.resolve(rh, prng.random());
 
+    // Last-Event-ID resume cursor: header takes precedence; ?since=
+    // is the non-EventSource fallback (SSE clients send the header
+    // automatically on reconnect).
+    const last_event_id = blk: {
+        if (respb.findHeader(rh, "last-event-id")) |hv| {
+            break :blk events_pump.parseLastEventId(hv);
+        }
+        break :blk events_pump.parseLastEventId(extractSinceQuery(path));
+    };
+
     // Build response headers: text/event-stream + cache-control: no-store
     // + (optional) Set-Cookie.
     const platform_cookie: ?[]u8 = if (resolved.mint_set_cookie)
@@ -174,14 +186,60 @@ pub fn tryHandleEvents(
     }
     const hdrs = try respb.packRespHeaders(allocator, pairs_buf[0..n]);
 
+    // Stamp response components and move into stream_response_in.
+    // h2 sends headers, then parks the entity in stream_data_out
+    // asking for the first data chunk; the pump picks it up from
+    // there.
     try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 200 });
     try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
-    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
     try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
     try server.reg.set(ent, &server.request_out, h2.StreamId, sid_h2);
     try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.response_in);
+    try server.reg.move(ent, &server.request_out, &server.stream_response_in);
+
+    // Record the connection. The pump uses this to drive frame
+    // delivery on subsequent ticks; cleanupClosedSseConnections
+    // tears it down when h2 retires the entity.
+    const conn = events_pump.SseConnection.newAt(ent, resolved.sid, last_event_id, received_ns);
+    try events_pump.addConnection(tc, conn);
+
     return true;
+}
+
+/// Pull `?since=<value>` (or `&since=<value>`) out of a request
+/// path. Returns null if missing. Stops at the next `&` or end.
+fn extractSinceQuery(path: []const u8) ?[]const u8 {
+    const qmark = std.mem.indexOfScalar(u8, path, '?') orelse return null;
+    var rest = path[qmark + 1 ..];
+    while (rest.len > 0) {
+        const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
+        const seg = rest[0..amp];
+        if (std.mem.startsWith(u8, seg, "since=")) {
+            return seg["since=".len..];
+        }
+        if (amp == rest.len) return null;
+        rest = rest[amp + 1 ..];
+    }
+    return null;
+}
+
+test "extractSinceQuery: present at start" {
+    try std.testing.expectEqualStrings(
+        "00000000000000000042-000007",
+        extractSinceQuery("/_events?since=00000000000000000042-000007").?,
+    );
+}
+
+test "extractSinceQuery: present after another param" {
+    try std.testing.expectEqualStrings(
+        "00000000000000000042-000007",
+        extractSinceQuery("/_events?foo=1&since=00000000000000000042-000007").?,
+    );
+}
+
+test "extractSinceQuery: missing" {
+    try std.testing.expect(extractSinceQuery("/_events") == null);
+    try std.testing.expect(extractSinceQuery("/_events?foo=1&bar=2") == null);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

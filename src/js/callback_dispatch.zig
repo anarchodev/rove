@@ -493,6 +493,8 @@ test "findCallbackBytecode: exact .mjs match wins over .js" {
         .statics = .empty,
         .triggers = &.{},
         .next_refresh_ns = 0,
+        .sse_connections = .empty,
+        .dirty_sids = .empty,
     };
     defer tc.bytecodes.deinit(testing.allocator);
 
@@ -516,6 +518,8 @@ test "findCallbackBytecode: falls back to .js when no .mjs" {
         .statics = .empty,
         .triggers = &.{},
         .next_refresh_ns = 0,
+        .sse_connections = .empty,
+        .dirty_sids = .empty,
     };
     defer tc.bytecodes.deinit(testing.allocator);
 
@@ -538,6 +542,8 @@ test "findCallbackBytecode: rejects absolute + parent-escape paths" {
         .statics = .empty,
         .triggers = &.{},
         .next_refresh_ns = 0,
+        .sse_connections = .empty,
+        .dirty_sids = .empty,
     };
     defer tc.bytecodes.deinit(testing.allocator);
 
@@ -562,6 +568,8 @@ test "findCallbackBytecode: miss returns null" {
         .statics = .empty,
         .triggers = &.{},
         .next_refresh_ns = 0,
+        .sse_connections = .empty,
+        .dirty_sids = .empty,
     };
     defer tc.bytecodes.deinit(testing.allocator);
 
