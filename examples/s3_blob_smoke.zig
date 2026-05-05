@@ -43,6 +43,16 @@ const ENV_KEY_PREFIX = "S3_KEY_PREFIX";
 const ENV_AK = "AWS_ACCESS_KEY_ID";
 const ENV_SK = "AWS_SECRET_ACCESS_KEY";
 
+fn elapsedMs(start_ns: i128) u64 {
+    const now = std.time.nanoTimestamp();
+    const d = if (now > start_ns) now - start_ns else 0;
+    return @intCast(@divFloor(d, std.time.ns_per_ms));
+}
+
+fn elapsedMsSince(start_ns: i128) u64 {
+    return elapsedMs(start_ns);
+}
+
 fn fail(msg: []const u8) noreturn {
     var buf: [1024]u8 = undefined;
     var sw = std.fs.File.stderr().writer(&buf);
@@ -100,6 +110,11 @@ pub fn main() !void {
     );
     try out.flush();
 
+    // Timer base for "ms since start" prefixes — easy way to spot
+    // slow first-request paths in the smoke log without paying for
+    // a structured-logger.
+    const start_ns = std.time.nanoTimestamp();
+
     var store = blob.S3BlobStore.init(allocator, .{
         .endpoint = endpoint,
         .region = region,
@@ -122,36 +137,48 @@ pub fn main() !void {
     const key = try std.fmt.bufPrint(&key_buf, "rove-smoke-{x}", .{seed});
 
     // ── 1. exists on missing key → false ──────────────────────────────
+    var t = std.time.nanoTimestamp();
+    try out.print("[+{d:>6}ms] →  exists(missing) ...\n", .{elapsedMs(start_ns)});
+    try out.flush();
     const exists0 = bs.exists(key) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "exists(missing) failed: {s}", .{@errorName(err)}) catch "exists failed";
         fail(msg);
     };
     if (exists0) fail("exists(missing) returned true — key collision?");
-    try out.writeAll("ok  exists(missing) → false\n");
+    try out.print("[+{d:>6}ms] ok  exists(missing) → false ({d}ms)\n", .{ elapsedMs(start_ns), elapsedMsSince(t) });
     try out.flush();
 
     // ── 2. put a known payload ────────────────────────────────────────
+    t = std.time.nanoTimestamp();
+    try out.print("[+{d:>6}ms] →  put ...\n", .{elapsedMs(start_ns)});
+    try out.flush();
     const payload = "hello from rove-blob s3 smoke\nbinary too: \x00\x01\x02\xff";
     bs.put(key, payload) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "put failed: {s}", .{@errorName(err)}) catch "put failed";
         fail(msg);
     };
-    try out.writeAll("ok  put\n");
+    try out.print("[+{d:>6}ms] ok  put ({d}ms)\n", .{ elapsedMs(start_ns), elapsedMsSince(t) });
     try out.flush();
 
     // ── 3. exists after put → true ────────────────────────────────────
+    t = std.time.nanoTimestamp();
+    try out.print("[+{d:>6}ms] →  exists(after put) ...\n", .{elapsedMs(start_ns)});
+    try out.flush();
     const exists1 = bs.exists(key) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "exists(after put) failed: {s}", .{@errorName(err)}) catch "exists failed";
         fail(msg);
     };
     if (!exists1) fail("exists(after put) returned false");
-    try out.writeAll("ok  exists(after put) → true\n");
+    try out.print("[+{d:>6}ms] ok  exists(after put) → true ({d}ms)\n", .{ elapsedMs(start_ns), elapsedMsSince(t) });
     try out.flush();
 
     // ── 4. get → byte-identical ───────────────────────────────────────
+    t = std.time.nanoTimestamp();
+    try out.print("[+{d:>6}ms] →  get ...\n", .{elapsedMs(start_ns)});
+    try out.flush();
     const got = bs.get(key, allocator) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "get failed: {s}", .{@errorName(err)}) catch "get failed";
@@ -168,10 +195,13 @@ pub fn main() !void {
         try ew.interface.flush();
         std.process.exit(1);
     }
-    try out.print("ok  get → {d} bytes byte-identical\n", .{got.len});
+    try out.print("[+{d:>6}ms] ok  get → {d} bytes byte-identical ({d}ms)\n", .{ elapsedMs(start_ns), got.len, elapsedMsSince(t) });
     try out.flush();
 
     // ── 5. idempotent put: overwrite with new value ───────────────────
+    t = std.time.nanoTimestamp();
+    try out.print("[+{d:>6}ms] →  put (overwrite) ...\n", .{elapsedMs(start_ns)});
+    try out.flush();
     const payload2 = "overwritten — second put";
     bs.put(key, payload2) catch |err| {
         var buf: [256]u8 = undefined;
@@ -181,10 +211,13 @@ pub fn main() !void {
     const got2 = try bs.get(key, allocator);
     defer allocator.free(got2);
     if (!std.mem.eql(u8, got2, payload2)) fail("get after overwrite returned stale payload");
-    try out.writeAll("ok  put overwrites + get returns new value\n");
+    try out.print("[+{d:>6}ms] ok  put overwrites + get returns new value ({d}ms)\n", .{ elapsedMs(start_ns), elapsedMsSince(t) });
     try out.flush();
 
     // ── 6. delete + verify gone ───────────────────────────────────────
+    t = std.time.nanoTimestamp();
+    try out.print("[+{d:>6}ms] →  delete ...\n", .{elapsedMs(start_ns)});
+    try out.flush();
     bs.delete(key) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "delete failed: {s}", .{@errorName(err)}) catch "delete failed";
@@ -192,16 +225,19 @@ pub fn main() !void {
     };
     const exists2 = try bs.exists(key);
     if (exists2) fail("exists(after delete) returned true");
-    try out.writeAll("ok  delete\n");
+    try out.print("[+{d:>6}ms] ok  delete ({d}ms)\n", .{ elapsedMs(start_ns), elapsedMsSince(t) });
     try out.flush();
 
     // ── 7. delete on missing key is idempotent ────────────────────────
+    t = std.time.nanoTimestamp();
+    try out.print("[+{d:>6}ms] →  delete (missing) ...\n", .{elapsedMs(start_ns)});
+    try out.flush();
     bs.delete(key) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "delete(missing) failed: {s}", .{@errorName(err)}) catch "delete failed";
         fail(msg);
     };
-    try out.writeAll("ok  delete(missing) idempotent\n");
+    try out.print("[+{d:>6}ms] ok  delete(missing) idempotent ({d}ms)\n", .{ elapsedMs(start_ns), elapsedMsSince(t) });
     try out.flush();
 
     try out.writeAll("\nPASS s3-blob smoke\n");

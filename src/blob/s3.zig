@@ -12,12 +12,12 @@
 //! supports both. Path-style is the simpler default and avoids DNS
 //! complications when bucket names contain dots (rare, but real).
 //!
-//! Concurrency: `*S3BlobStore` is safe to share across threads —
-//! each call creates its own `std.http.Client` so connection pools
-//! aren't contended. (Trade-off: TLS handshake per call. Small
-//! tenant fleets won't notice; if blob ops become a bottleneck the
-//! next iteration would pool clients per-thread the same way the
-//! per-tenant kv handles do.)
+//! Concurrency: NOT thread-safe. Each `*S3BlobStore` owns one
+//! `std.http.Client` reused across calls (so TLS handshake +
+//! TCP connect happen once, not per-op — the smoke went from
+//! ~500ms × 6 ops to one handshake + amortized request cost).
+//! Multi-threaded callers should hold per-thread instances, the
+//! same model the per-tenant SQLite handles use elsewhere in rove.
 //!
 //! What's deliberately NOT here:
 //! - Multipart upload (single PUT only — capped at S3's 5 GiB
@@ -71,6 +71,13 @@ pub const Config = struct {
 pub const S3BlobStore = struct {
     allocator: std.mem.Allocator,
     config: Config,
+    /// Shared HTTP client. One per S3BlobStore instance — keeps
+    /// the TLS session + TCP connection alive across put/get/exists/
+    /// delete so we don't pay handshake cost on every op. The Client
+    /// struct itself is just a holder for the connection pool +
+    /// allocator; the real cost (TCP connect + TLS handshake + CA
+    /// bundle scan) is paid on first fetch.
+    http: std.http.Client,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !S3BlobStore {
         if (config.endpoint.len == 0) {
@@ -111,10 +118,15 @@ pub const S3BlobStore = struct {
         }
         var fixed = config;
         fixed.endpoint = ep;
-        return .{ .allocator = allocator, .config = fixed };
+        return .{
+            .allocator = allocator,
+            .config = fixed,
+            .http = .{ .allocator = allocator },
+        };
     }
 
     pub fn deinit(self: *S3BlobStore) void {
+        self.http.deinit();
         self.* = undefined;
     }
 
@@ -274,9 +286,6 @@ pub const S3BlobStore = struct {
 
         const uri = std.Uri.parse(url) catch return Error.Io;
 
-        var client: std.http.Client = .{ .allocator = self.allocator };
-        defer client.deinit();
-
         // For HEAD we don't need to capture body; for GET we want it
         // verbatim. PUT / DELETE responses are typically empty or
         // small XML errors — capture a snippet for diagnostics.
@@ -284,7 +293,16 @@ pub const S3BlobStore = struct {
         errdefer body_buf.deinit(body_allocator);
         var aw = std.Io.Writer.Allocating.fromArrayList(body_allocator, &body_buf);
 
-        const result = client.fetch(.{
+        // Visibility for the most-frequent first-time failure mode:
+        // a fetch that hangs because the endpoint is unreachable
+        // (DNS, firewall, wrong region). std.http.Client has no
+        // wired connect timeout in this Zig version, so a hung
+        // fetch blocks forever silently. Logging at warn level
+        // surfaces in operator-side smoke runs and the rove worker
+        // log alike (the worker's default log level catches warn).
+        std.log.warn("rove-blob s3: → {s} {s}", .{ methodName(method), url });
+
+        const result = self.http.fetch(.{
             .location = .{ .uri = uri },
             .method = method,
             .payload = if (body.len > 0) body else null,
