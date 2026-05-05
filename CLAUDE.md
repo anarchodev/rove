@@ -95,7 +95,9 @@ Envelopes are typed byte blobs (`src/js/apply.zig`):
 Blob bytes (source, bytecode, static assets) live in `{data_dir}/{id}/file-blobs/` and are **not** carried through raft envelopes — a 1MB static blob per envelope would blow the raft log size/latency budget. Single-node: `FilesystemBlobStore` works as-is. **Multi-node requires a shared `BlobStore` backend** — all nodes read the same content-addressed store. Two options:
 
 1. **Shared filesystem mount** (NFS, EFS, Ceph) at `{data_dir}` on every node. Zero new code — `FilesystemBlobStore` treats the mount point like any other directory.
-2. **S3 / object store** — a future `S3BlobStore` impl in `rove-blob` (not yet written). Cleaner ops story, more setup.
+2. **S3 / object store** — `S3BlobStore` in `rove-blob` (path-style, SigV4-signed; tested against OVH but works against AWS / MinIO / R2 / B2). Cleaner ops story, more setup.
+
+Backend pick is process-wide via `BLOB_BACKEND=fs|s3` (+ `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_KEY_PREFIX_BASE` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `S3_USE_TLS`) read by the `loop46` binary at startup. The chosen `blob_mod.BackendConfig` threads through `WorkerConfig.blob_backend`, `ApplyCtx.blob_backend_cfg`, and the files-server / log-server `spawn` so every per-tenant backend on the node opens against the same store. Per-tenant scoping in S3 is the key prefix `{key_prefix_base}{instance_id}/{file-blobs|log-blobs}/`, mirroring the on-disk layout exactly so leader and followers hit identical keys.
 
 Raft replicates the manifest (the `file/{path}` key → `{hash, kind, content_type}` pointer); the shared backend serves the bytes referenced by those hashes. Followers apply the manifest ops; readers fetch the blob bytes from whichever backend `rove-blob` is configured with.
 
