@@ -151,21 +151,29 @@ const RingEntry = struct {
 };
 
 // Per tenant: HashMap<sid, RingBuffer<RingEntry, RING_CAPACITY>>
-// Per RingBuffer: fixed capacity (e.g., 100 entries), oldest evicted
-//                 when full. Evicted entries are unrecoverable.
+// RING_CAPACITY = 30 entries per sid.
+// Oldest evicted on overflow. Evicted entries are unrecoverable
+// (reconnect with a Last-Event-ID older than the ring hits the
+// sentinel path in §4.4).
 ```
 
-Sized so a typical "user types in chat for a few minutes then briefly
-loses connection" reconnect catches up cleanly; deliberately too
-small to hold "I closed my laptop overnight." That case hits the
-sentinel path (§3.3).
+Sized for brief reconnect catch-up (network blip, page hidden for
+30s), not for backlog buffering. Math: a customer reconnecting
+within 30s at 1 event/sec/sid (already a high notification rate)
+sees 30 events — a 30-entry ring covers it. Anything longer hits
+sentinel and the customer's UI refetches state, which is cheaper
+than replaying minutes of stale notifications.
 
-Per-tenant total ring memory bounded by
-`max_concurrent_connections_per_instance * RING_CAPACITY * avg_entry_bytes`.
-For free-tier (100 conns × 100 entries × ~500B avg) ≈ 5MB per
-tenant. For paid (10k conns) ≈ 500MB per tenant — high enough that
-paid-tier ring capacity may need to drop, or the operator shards
-sse-service per tenant. Defer; v1 free-tier first.
+Memory bounds:
+
+| Tier              | Conn cap | Per-tenant ring memory     |
+|-------------------|----------|----------------------------|
+| Free              | 100      | 100 × 30 × ~500B ≈ 1.5 MB  |
+| Paid v1           | 1k       | 1k × 30 × ~500B ≈ 15 MB    |
+| Pathological paid | 10k      | 10k × 30 × ~500B ≈ 150 MB  |
+
+Comfortable on bare metal at any v1 scale. Revisit only if
+measurement shows the ring eating real memory.
 
 ### 2.4 Connection table (sse-service, in-memory)
 
@@ -286,14 +294,14 @@ GET  /v1/health                                   ← LB health check
 
 ```
 1. Validate token (JWT signed by platform key; payload includes
-   {tenant_id, sid, exp}). Reject 401 on signature/expiry/tenant mismatch.
-2. Check per-tenant connection cap (existing `EventsCaps`).
+   {tenant_id, sid, caps, exp}). Reject 401 on signature/expiry/
+   tenant mismatch with URL path.
+2. Check per-tenant connection cap (caps embedded in JWT, see §5.1).
 3. Send response headers:
      200 OK
      Content-Type: text/event-stream
      Cache-Control: no-store
-     Access-Control-Allow-Origin: <customer's app origin from token claim>
-     Access-Control-Allow-Credentials: true
+     X-Accel-Buffering: no
 4. If Last-Event-ID present:
      if id in this sid's ring: replay events after id, then stream future
      if id not in ring (evicted, or sse-service restarted since):
@@ -306,22 +314,52 @@ GET  /v1/health                                   ← LB health check
    table, free the connection record.
 ```
 
+No CORS headers needed — EventSource opens with `withCredentials:
+false` (auth is the JWT, not cookies), which makes it a "simple"
+cross-origin request: no preflight, no `Access-Control-*` response
+headers required, browser accepts events from any origin. Same code
+path for `acme.loop46.me` customers and `acme.com` custom-domain
+customers; sse-service doesn't need to know the origin.
+
+**Token leakage hardening:** sse-service MUST strip `?token=` from
+its access-log query string before logging. Standard concern with
+token-in-query; bounded for SSE because EventSource URLs aren't
+stored in browser navigation history and SSE responses don't
+trigger sub-resource fetches (no Referer leaks). 1h token TTL +
+`(tenant, sid)` scope further bounds blast radius.
+
 ### 4.3 Emit POST flow
 
 ```
 1. Validate internal token. Reject 401 on mismatch.
 2. For each event in body.events:
+     append to (tenant, sid) ring cache (evict oldest if full)
      for sid in event.target_sids:
          look up sid in tenant's connection table
-         if found: format SSE frame, push to h2 stream
-         append to (tenant, sid) ring cache (evict oldest if full)
+         if found:
+             try to push SSE frame to h2 stream's stream_data_in
+             if would-block (send buffer full):
+                 increment connection.backpressure_strikes
+                 if strikes >= MAX_STRIKES (5) within STRIKE_WINDOW (30s):
+                     close the connection (client will reconnect → sentinel)
 3. Respond 204.
 ```
 
 The ring cache is updated regardless of whether a connection is
 currently open — that's how a brief connect-window race is handled
-(events posted before the connect arrives are cached and replayed on
-catch-up).
+(events posted before the connect arrives are cached and replayed
+on catch-up). The cache update happens *before* the push attempt so
+a slow consumer doesn't lose events from the ring; they only lose
+the live push, which the next reconnect's catch-up replays.
+
+**Backpressure rationale:** blocking the emit POST would create
+head-of-line for other emits in the same batch and tie worker
+threads to slow consumers — no. Dropping the connection on first
+strike would over-react to transient slowness (window-resize lag,
+GC pause) — no. Skip-with-strikes-counter bounds how far a slow
+consumer can fall behind without forcing immediate disconnect on
+hiccups: 5 strikes within 30s = "consistently can't keep up" → close
+→ client reconnects → sentinel → refetch.
 
 ### 4.4 Sentinel event
 
@@ -376,25 +414,29 @@ Operator (or k8s, or systemd) handles "process died, restart it."
 
 ### 5.1 EventSource auth: token handoff (cross-origin)
 
-The customer's app on `acme.loop46.me` opens an EventSource to
-`sse.{public_suffix}`. To preserve `__Host-` cookie security on the
-customer's app domain (cookies are bound to a specific host, so
-sharing across `acme.loop46.me` and `sse.{public_suffix}` would
-require dropping `__Host-` and scoping to `.loop46.me` — a security
-regression), use a token-handoff flow:
+The customer's app on `acme.loop46.me` (or `acme.com`, custom
+domain — same flow either way) opens an EventSource to a single
+platform-managed hostname `sse.loop46.me`. **One TLS cert, one DNS
+record, no per-tenant SSE subdomains, no SSE in custom-domain TLS
+provisioning.** The JWT carries identity; `withCredentials` is
+false, so no cookies cross origins and `__Host-` cookies stay
+safely pinned to the customer's app domain.
 
 ```
-1. Customer's JS code: GET https://acme.loop46.me/_session/sse-token
-     Auth: __Host-rove_sid cookie (existing session)
+1. Customer's JS code: fetch('/_session/sse-token')
+     (same-origin to whatever domain the app is on; sends
+      __Host-rove_sid cookie automatically)
      Response: { token: "<JWT>", expires_in: 3600 }
 
    The JWT is signed by the platform key, payload:
      {
-       "v": 1,
+       "v":         1,
        "tenant_id": "acme",
-       "sid": "<session id>",
-       "origin": "https://acme.loop46.me",  // for CORS allow-origin
-       "exp": 1730768400
+       "sid":       "<session id hex>",
+       "caps":      { "max_conns_per_session": 5,
+                      "max_event_payload_bytes": 65536,
+                      ... },
+       "exp":       1730768400
      }
 
 2. Customer's JS code:
@@ -402,19 +444,31 @@ regression), use a token-handoff flow:
        'https://sse.loop46.me/v1/acme/sse?token=' + token
      );
 
-3. sse-service validates token, opens stream.
+3. sse-service validates token signature + expiry + tenant_id ==
+   URL path tenant. Opens stream.
 
-4. Customer's JS code refreshes the token before expiry (e.g., 5min
-   before exp) and reconnects with the new token. Or just lets the
-   connection die and gets a fresh one — the EventSource auto-reconnect
-   handles it as long as the customer's UI fetches a fresh token in
-   the reconnect handler.
+4. Customer's JS code refreshes the token before expiry (e.g.,
+   5min before exp) and reconnects with the new token. Or just
+   lets the connection die and gets a fresh one — EventSource
+   auto-reconnect handles it as long as the reconnect handler
+   fetches a fresh token first.
 ```
 
 The token endpoint `/_session/sse-token` is a new well-known route
-on the customer subdomain. It's a thin wrapper around the existing
-session lookup — verifies the cookie, mints a JWT scoped to
-`(tenant_id, sid, origin)` from the cookie's session, returns it.
+on the customer's app domain (worker handles it via existing
+custom-domain routing). Thin wrapper around the existing session
+lookup: verifies the cookie, looks up the `EventsCaps` for the
+session's plan tier, mints a JWT scoped to
+`(tenant_id, sid, caps)`, returns it.
+
+**Caps embedded in JWT, not queried per-connect.** Cap changes
+propagate within `token_ttl` (1h default) when clients refresh.
+Saves an HTTP roundtrip per connect; removes a sse-service →
+worker dependency on the connect path (one fewer failure mode).
+The 1h propagation delay is acceptable — caps are not a security
+boundary that needs instant revocation; for emergency cap
+tightening (e.g., abuse), revoking the session itself drops the
+token's effective scope on next refresh.
 
 ### 5.2 Worker → sse-service auth: shared internal token
 
@@ -489,102 +543,37 @@ Smokes at each step:
 
 ## 8. Open questions / deferred
 
-### 8.1 Per-tenant ring sizing for paid tier
+The bulk of the original v2 open questions are now resolved and live
+in the relevant sections (ring sizing → §2.3; token-in-JWT auth +
+single-hostname for all customers → §5.1; backpressure
+skip-with-strikes → §4.3; emits-not-stored via determinism → §8.2
+below). What remains:
 
-Free tier (100 conns × 100-entry ring × ~500B avg entry) ≈ 5MB per
-tenant. Paid tier with 10k conns balloons to 500MB per tenant. Three
-options when paid tier becomes a real concern:
-
-- Drop ring capacity per sid for paid tier (e.g., 20 entries instead
-  of 100). Smaller catch-up window per reconnect; sentinel fires
-  more often.
-- Move ring storage to a small dedicated SQLite or RocksDB on
-  sse-service (no longer in-memory). Bigger windows, more I/O cost.
-- Shard sse-service per-tenant or per-shard-of-tenants. Brings back
-  the cross-replica fan-out problem inside sse-service.
-
-V1 ships with free-tier-only sizing; revisit when paid tier launches.
-
-### 8.2 Triggers and webhook callbacks
+### 8.1 Triggers and webhook callbacks wiring
 
 Both have execution contexts; both can emit. Their completion paths
-need to invoke `pumpEmitsForContext` the same way the request handler
-path does. Concrete wiring TBD during implementation; the data model
-(buffer on the context, fire POST after commit) is identical.
+need to invoke `pumpEmitsForContext` the same way the request
+handler path does. Concrete wiring is mechanical; the data model
+(buffer on the context, fire POST after commit) is identical to the
+request path. Implementation will likely live alongside
+`trigger_dispatch.zig` and `dispatchCallbacks` — one call to the
+pump after each successful commit.
 
-### 8.3 Tape replay — emits are not stored or taped
+### 8.2 Replay UI capture mode
 
-The whole tape model is built on handlers being deterministic
-functions of their inputs `(request, kv reads, date, random,
-modules)` — all of which are taped. Same inputs, same outputs.
-**Emits are an output.** Replay re-runs the handler, the
-`events.emit` binding sees the same calls in the same order with the
-same args, the replay UI captures them into a side panel without
-actually firing them.
+Tape replay re-runs the handler, which means `events.emit` calls
+happen during replay. The binding needs a "capture, don't fire"
+mode for replay context — appends to a captured-emits list visible
+in the replay UI sidebar but doesn't POST to sse-service. Hook
+point is the same place tape replay already swaps in stub
+implementations of other side-effect bindings (webhook.send, etc.).
+Implementation detail; design is fine as is.
 
-So emits are stored nowhere:
+### 8.3 Future: pluggable emit transport
 
-- Not in `app.db` (no `_events/` rows).
-- Not in the request log (no `events_fired` field).
-- Not in any tape stream.
-
-Replay reproduces them by virtue of the handler being deterministic
-— same model as kv writes (which also aren't stored; replay
-reproduces them by re-execution). The replay UI side panel runs the
-binding in "capture, don't fire" mode and displays what `emit`
-calls happened.
-
-Implication for production observability: developers who want to
-debug "what events did request 1234 fire?" do a replay. The
-dashboard's replay viewer shows the captured emit list. If
-zero-replay observability for emits ever becomes a real need, a
-small `events_count: u32` field can be added to the LogRecord
-later — but the body data of each emit stays out of the log
-(too much bloat, customer data, encryption concerns).
-
-This crystallizes the asymmetry vs. webhooks: webhooks persist via
-transactional outbox in `app.db` because customers depend on the
-"I called `webhook.send` therefore the call WILL be made or surface
-as failure" guarantee; emits are pure outputs of a deterministic
-handler, recoverable from replay, lost on the wire if no listener
-is connected. Outbox = strong delivery; emits = best-effort
-notification.
-
-### 8.4 Same-origin alternative
-
-Custom domains (PLAN §2.10) put customers on their own apex (e.g.,
-`acme.com`). A customer's app at `acme.com` opening EventSource to
-`sse.loop46.me` is cross-origin in every meaningful sense. The
-token-handoff flow handles this — the customer's app fetches the
-token from `acme.com` (via the worker, via custom-domain routing),
-opens EventSource to `sse.loop46.me`. Works.
-
-A future `sse.acme.com` per-customer-domain hostname is possible
-(CNAME to the platform's sse-service) but defers to the broader
-custom-domain DNS plumbing.
-
-### 8.5 Backpressure on slow consumers
-
-If a customer's EventSource client stops draining (laptop suspended,
-network slow), the h2 stream's send buffer fills. Today's pump has
-slow-consumer defenses (drop oldest cached events). With the ring
-cache, the analogous defense is: when the h2 stream's
-`stream_data_in` pressure is high, sse-service stops pushing new
-events to that connection (they accumulate in the ring instead).
-The connection eventually closes on h2 timeout; client reconnects;
-sentinel if ring history is exhausted. Same UX as today, simpler
-implementation.
-
-### 8.6 `EventsCaps` location of truth
-
-Today `EventsCaps` is computed per-tenant from plan tier. In v2 it's
-read by sse-service. Two ways sse-service finds the cap:
-
-- **Embedded in the JWT.** Token includes `caps: {max_conns: 100}`.
-  sse-service reads from the token; no plan-tier lookup needed.
-  Caveat: caps change requires customers to refresh tokens.
-- **sse-service queries the platform.** GET `worker/_admin/caps/{tenant}`
-  on connect. Adds an HTTP round trip per connect.
-
-Token-embedded is cleaner and matches the "stateless service" goal.
-Defer the decision to implementation; both are easy.
+The worker-to-sse-service POST is a hard-coded HTTP call. If a
+future deployment wants to skip sse-service entirely (single-binary
+mode, embedded test mode, or a custom delivery target), the emit
+sink could become an interface with HTTP as the v1 implementation.
+Not needed for v1; flagged so the binding doesn't bake the URL
+into too many places.
