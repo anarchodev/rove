@@ -768,3 +768,137 @@ pointers at once. The contention cost alone disqualifies it.
 The kv marker is the single source of truth for "what should the
 worker run." Listing `tenants/{id}/deployments/` covers the
 "what's been deployed" admin question.
+
+---
+
+## 11. Detach plan: files-server as external HTTP service (post-1.0)
+
+The §6 model assumes files-server is reachable as its own subdomain
+(`files.{public_suffix}`) but doesn't fully specify the integration
+path that replaces today's in-process worker thread. This section
+captures the post-1.0 detach work originally drafted in PLAN §10.13 +
+§10.14.
+
+### 11.1 Integration shape — webhook-call from admin's JS handler
+
+`rove-files-server` (and `rove-log-server`) stop being in-process
+worker threads and become **external HTTP services that loop46
+integrates with the same way it integrates with Resend or Stripe**.
+Admin's JS handler calls them via `webhook.send`, receives results
+via the existing callback dispatch (`_callback/*` rows +
+`dispatchCallbacks`), and pushes the result to the dashboard browser
+via SSE (PLAN §2.12). The dashboard never talks to files-server
+directly — admin's JS is the integration seam.
+
+Earlier sketches treated files-server / log-server as Loop46 tenants
+with their own deployed handlers. Wrong shape — they have their own
+storage layer, their own data model, no need for QJS or the
+per-tenant kv-undo machinery. Treating them as third-party HTTP
+services preserves Loop46's purely-functional handler model AND
+keeps files-server / log-server as **standalone, swappable HTTP
+servers**: an operator can replace them with S3 + a managed log
+aggregator without touching loop46.
+
+### 11.2 What deletes from the worker
+
+- `/_system/files/*` and `/_system/log/*` proxy paths in
+  `src/js/worker.zig` — `tryHandleSystem`, the path-rewriting +
+  scope-resolution + per-system auth gate.
+- `code_proxy` + `log_proxy` rove collections + `ProxySubsystem`
+  machinery.
+- The cross-thread h2 *client* embedded in the worker (only the h2
+  server stays).
+- The in-process spawning of files-server + log-server threads in
+  `loop46/main.zig` — they become separately-deployed binaries
+  pointed at via operator config.
+- `extractAdminAuth` + `findCookie` + `extractBearerToken` +
+  `tenant.authenticate` + `tenant.authenticateSession` (only used
+  by `/_system/*` auth + the admin-host RPC gate; with `/_system/*`
+  gone and the admin-host gate moving to a JS `_middlewares/*`, no
+  Zig caller remains).
+
+Net deletion: ~2-3k lines. The platform collapses to: HTTP/2 server,
+host→tenant routing, QJS dispatch, rate limit + penalty box, outbox
+drainer, raft apply, tape capture, SSE, static-asset fast path.
+Everything else is JS in admin's bundle (or in customer bundles).
+
+### 11.3 Latency cost + mitigations
+
+Today's `/_system/files/{tenant}/blobs/check` is a microsecond
+in-process forward. The new shape pays drainer-tick + HTTP
+round-trip + callback-tick + SSE push. At the 250ms default drainer
+tick, a 50-file bulk deploy goes from <1s to ~25s — unacceptable
+for the developer-experience promise.
+
+Mitigations (must land alongside the detach):
+
+1. **Drainer kick on outbox write.** Handlers writing `_outbox/{id}`
+   wake the drainer immediately rather than waiting for the next
+   250ms tick. New primitive — probably an eventfd or a per-worker
+   condvar the drainer waits on. Brings round-trip floor to ~10ms.
+2. **Parallel webhook dispatch.** Admin JS fires N `webhook.send`
+   calls in one handler invocation; drainer dispatches them
+   concurrently per tenant rather than serially. Today's drainer
+   is per-tenant-serial — fine for low volume, a bottleneck here.
+3. **SSE-driven optimistic UI.** Dashboard shows "saving…" /
+   "uploading…" immediately, confirms when the SSE event lands.
+   Modern admin-UI aesthetic; works fine at <100ms confirm latency.
+
+Combined target: <100ms effective round-trip from dashboard click
+to confirmed result, even on 50-file bulk operations.
+
+### 11.4 Editor bearer-auth flow
+
+The cookie-to-bearer flow only makes sense for clients that *have*
+a Loop46 cookie session — i.e., the dashboard. Stripe / GitHub /
+AWS don't have access to that cookie; customer integrations with
+them use the kv-stored-keys + arbitrary-headers + crypto-signing
+toolkit (PLAN §10.14). The two paths are orthogonal and don't
+share API surface beyond `webhook.send` itself.
+
+- Editor's session lives in the existing HttpOnly cookie set by
+  `/v1/auth` or `/v1/login`.
+- For cross-origin calls to files-server / log-server, editor
+  exchanges its cookie for a short-lived bearer via a new
+  `GET /v1/files-token` endpoint on admin. Admin signs the bearer
+  (HMAC over `session_opaque || expiry_ms`, with a shared signing
+  secret operator-provisioned via
+  `--bootstrap-kv files_token_signing_secret=...`).
+- Files-server validates the bearer locally — same shared secret,
+  same HMAC verification. **No round-trip to admin per request.**
+- Bearer TTL: 5 minutes. Editor refreshes transparently on 401 by
+  re-calling `/v1/files-token`.
+- Logout invalidates the session row in admin's kv; existing bearers
+  continue to work until they expire (≤5 min). Acceptable revocation
+  latency for a development tool; tighten if it ever matters by
+  including `session_revoked_at_ms` in the signed token and
+  re-checking on files-server.
+
+### 11.5 Deploy notification
+
+Editor orchestrates v1. After committing a deploy on files-server,
+the editor receives the new manifest hash in the response; it then
+POSTs that hash to admin (`POST /v1/internal/deploy-applied`) which
+updates `tenant_files_map.current_deployment_id` and fires an SSE
+event for any listening dashboard sessions. files-server-pushes-to-
+worker is left as a v2 option — useful when CLI deploys land that
+don't go through the editor.
+
+### 11.6 Order of work (each row is its own work-window)
+
+1. **SSE primitive** (PLAN Phase 11). Without it the post-save /
+   deploy-confirmation loop has nowhere to land.
+2. **`crypto.base64Encode/Decode` + `crypto.hmacSha1`** if any
+   pre-launch customer integration needs them.
+3. **Bearer-token issuance** in admin's JS (`/v1/files-token`) +
+   HMAC-signed-bearer validation in files-server. Operator
+   provisions `files_token_signing_secret` via `--bootstrap-kv`.
+4. **Editor switches** to direct-to-files-server bearer-authed
+   calls (parallel with the existing `/_system/files/*` proxy
+   during migration).
+5. **Editor orchestrates deploy**: after files-server commit, POST
+   manifest hash to admin. Admin updates state, fires SSE.
+6. **Drop the worker proxy + in-process files-server thread.**
+   files-server runs as separate operator-deployed process.
+7. **Same shape for log-server**, slightly easier (query-only,
+   latency-tolerant, no deploy-notification path).

@@ -374,7 +374,7 @@ A dedicated `batch.*` primitive (background drainer, progress tracking, cascade-
 - **Cascade depth tracked on `DispatchState`.** Single counter, incremented before each recursive trigger fire, decremented after; throws at 8.
 - **`previousValue` event field**: implementation does an extra `kv.get` for the existing value before each write that has matching triggers. Acceptable cost given the 32-trigger ceiling and the read-your-writes guarantee from `TrackedTxn`.
 - **Storage is just files.** Trigger modules live in the customer's deployment manifest exactly like any other handler file: `file/_triggers/users/sessions/index.mjs → {hash, kind: "handler", content_type}` in `files.db`, source + bytecode bytes in `file-blobs/{hash}`, replicated via raft envelope type 3 (files_writeset). Same content-addressed two-phase upload pipeline (§2.4). What's *new* and lives in the worker (not files-server) is the in-memory **trigger registry** on `TenantFiles`, derived at deploy-load time. Same split as handlers (source in files-server, runtime bytecode cache in worker).
-- **Rove ECS audit per `~/.claude/memory/feedback_rove_design_first.md`**: triggers introduce no new entities or collections. The registry sits on `TenantFiles` next to the existing `bytecodes` map; execution is recursive enhancement of `kv.set` / `kv.delete` JS globals inside the handler's existing QuickJS context. The handler entity in `request_out` remains the only entity in flight. No new Rows, no new systems at the rove layer.
+- **Rove ECS audit per `~/.claude/memory/feedback_state_is_collection.md`**: triggers introduce no new entities or collections. The registry sits on `TenantFiles` next to the existing `bytecodes` map; execution is recursive enhancement of `kv.set` / `kv.delete` JS globals inside the handler's existing QuickJS context. The handler entity in `request_out` remains the only entity in flight. No new Rows, no new systems at the rove layer.
 
 ### 2.6 Webhooks (outbox pattern)
 
@@ -461,10 +461,12 @@ export default function (event) {
 
 - `X-Rove-Webhook-Id: <outbox_id>`
 - `X-Rove-Webhook-Attempt: <n>`
-- `X-Rove-Signature: <hmac-sha256 of body with per-instance webhook secret>`
 - Optional `X-Rove-Idempotency-Key: <customer-provided>` passthrough
 
-Per-instance webhook signing secret auto-provisioned on instance create, rotatable.
+`webhook.send` is vendor-neutral — no platform-owned signing header. Customers
+that need vendor-specific signatures (Stripe, Slack, AWS SigV4, etc.)
+construct them in the handler via `crypto.hmacSha256(key, body)` and pass the
+result through `headers`. See §10.4 for the rationale.
 
 #### Security
 
@@ -585,11 +587,10 @@ Designed as a general primitive from day one — also the knob used to different
 
 ### 2.12 Server-sent events (live UI updates)
 
-> **See `docs/sse-plan-v2.md`** (which supersedes the older
-> `docs/sse-plan.md`) for the implementable expansion: the original
-> "rows in customer's `app.db` under `_events/{sid}/{seq}`" model is
-> replaced with response-attached emit buffers shipped fire-and-
-> forget to a centralized sse-service singleton on
+> **See `docs/sse-plan.md`** for the implementable expansion: the
+> original "rows in customer's `app.db` under `_events/{sid}/{seq}`"
+> model is replaced with response-attached emit buffers shipped fire-
+> and-forget to a centralized sse-service singleton on
 > `sse.{public_suffix}`. Sse-service holds all EventSource
 > connections + a small per-(tenant, sid) ring cache for reconnect
 > catch-up; cache eviction emits a `rove:resync` sentinel telling
@@ -713,6 +714,12 @@ node" density.
 
 ## 3. Build plan (ordered phases)
 
+> **Note on ordering**: the *content* of these phases is canonical, but
+> the original number-order is no longer the launch sequence. §10.16
+> (Launch sequencing) owns the beta / 1.0 / post-1.0 split and remaps
+> phases across those windows. Read this section for what each phase
+> *contains*; read §10.16 for what ships *when*.
+
 **Cross-cutting for every phase**:
 - `deployment_id` on all request logs.
 - Raft apply hook for cache invalidation.
@@ -746,7 +753,7 @@ node" density.
 
 - Outbox schema (`_outbox/*`, `_outbox_inflight/*`, `_dlq/*`) in instance `app.db`.
 - HTTP client: SSRF blocklist, TLS always, redirect cap, timeouts.
-- HMAC signing with per-instance webhook secret (auto-provisioned on instance create).
+- `crypto.hmacSha256(key, data)` JS primitive so customers can build vendor-specific signatures (Stripe, Slack, etc.) in their handlers — no platform-owned signing header (see §10.4).
 - Drainer on raft leader (lease-based). Exponential backoff + full jitter.
 - Callback invocation as a handler event in its own transaction.
 - `email.send` wraps `webhook.send` with platform SMTP creds.
@@ -825,50 +832,22 @@ Three coupled work items, all following the existing file-blob pattern
    fine for v1 (snapshot lives next to the raft log); multi-node snapshot
    transfer deferred to the multi-node milestone alongside `S3BlobStore`.
 
-4. **Centralized webhook subsystem.** Today `drainOnce`
-   (`src/outbox/drainer.zig:137`) snapshots the entire instance set every
-   tick and opens a fresh SQLite connection per tenant for an `_outbox/*`
-   prefix scan — ~40k SQLite open+scan ops/sec at 4 ticks × 10k tenants,
-   almost all empty. Replace with a webhook subsystem structurally
-   analogous to files-server / log-server: single node-scoped database
-   `{data_dir}/_webhooks.db` owns all pending/inflight/DLQ state across
-   every tenant; drainer reads from one DB, not N.
+4. **Centralized webhook subsystem (raft-replicated `webhooks.db`).** Today
+   `drainOnce` (`src/outbox/drainer.zig:137`) snapshots the entire instance
+   set every tick and opens a fresh SQLite connection per tenant for an
+   `_outbox/*` prefix scan — ~40k SQLite open+scan ops/sec at 4 ticks ×
+   10k tenants, almost all empty. Replace with a single node-scoped
+   `webhooks.db` raft-replicated via new envelope types 4 (enqueue), 5
+   (lease/attempt), and 6 (terminal). Drainer reads from one DB, not N;
+   on leader change, the new leader inherits committed state with no
+   per-tenant scan. The customer-facing per-tenant `_outbox/*` row
+   becomes the transactional handoff point only — enqueue fires from the
+   apply hook on writeset commit, idempotent on the existing 64-hex
+   outbox id. Detail in `docs/webhook-server-plan.md`.
 
-   **Handover.** Apply hook on writeset commit: any `_outbox/*` keys
-   trigger `webhook_subsystem.enqueue(id, payload)` into `_webhooks.db`.
-   Enqueue is keyed by `id` (the existing 64-hex outbox suffix) and
-   idempotent — second call with same id is a no-op. After successful
-   delivery, the subsystem proposes a writeset on the source tenant
-   deleting `_outbox/{id}`. Tenant app.db stays clean in steady state.
-   Idempotency makes the handover eventually consistent rather than
-   transactional (SQLite can't span a transaction across two `.db` files
-   under our connection model anyway), which means a crash between
-   commit-and-enqueue is safe: recovery re-enqueues, dedup no-ops where
-   needed, no data loss and no double-send. Receivers already dedup on
-   `X-Rove-Webhook-Id` per the at-least-once contract.
-
-   **`_webhooks.db` is leader-local in v1** (not raft-replicated). A new
-   envelope type would be cleaner architecturally but adds apply paths
-   and more code surface; idempotent recovery makes raft replication
-   unnecessary for correctness. Promote when multi-node failover latency
-   forces the decision.
-
-   **Failover/startup recovery cost — flagged as the v1 tradeoff.**
-   Without raft replication, a new leader (after election OR fresh
-   start) must scan every tenant app.db's `_outbox/*` once to enqueue
-   anything that wasn't drained before the transition. At 10k tenants
-   that's ~10k SQLite opens + prefix-scans during recovery, almost all
-   returning empty — linear in fleet size, and it can dominate failover
-   latency at scale. The same per-tenant-scan cost the steady-state
-   path is being designed to avoid moves to the recovery path. Mitigations,
-   in increasing cost: (a) parallelize the scan across the existing
-   worker thread pool — cheap, do by default; (b) maintain a
-   leader-local persistent index of "tenants with non-zero outbox" in
-   admin app.db so the new leader only opens those tenants — adds an
-   apply-side write per outbox enqueue but bounds recovery to active
-   tenants; (c) promote `_webhooks.db` to a raft target so failover is
-   just leader-promotion with no scan at all. Land (a) by default;
-   measure before committing to (b) or (c).
+   The earlier "leader-local in v1, raft-replicate later" position was
+   rejected (see §7) because leader-local recovery requires the same
+   per-tenant scan the consolidation is trying to eliminate.
 
 `S3BlobStore` itself stays deferred (single-host launch uses
 `FilesystemBlobStore`); the work above is ready for it because `BlobStore`
@@ -925,7 +904,7 @@ production traffic without disk-fill within weeks.** MVP complete.
 - Pump in `js-worker`: per-tenant subscription map keyed by sid, dirty-flag on commits touching `_events/`, drains to wire.
 - `EventsCaps` struct + `eventsCapsForPlan(plan)` lookup — same shape used for future plan-tiered caps in other subsystems.
 - Single-node only. Multi-node session routing deferred (decide when multi-node lands; same call as the webhook drainer's leader-only model OR a session→node registry).
-- Has no hard predecessor — depends on §2.6 webhooks (done) + existing kv/h2/handler infra. **Sequencing per §10.17 (2026-04-30): NOT in beta, IS in 1.0** as launch path item #1 — needed for the live use cases (Stripe Checkout, OAuth, AI-agent results) that beta deliberately omits.
+- Has no hard predecessor — depends on §2.6 webhooks (done) + existing kv/h2/handler infra. **Sequencing per §10.16 (2026-04-30): NOT in beta, IS in 1.0** as launch path item #1 — needed for the live use cases (Stripe Checkout, OAuth, AI-agent results) that beta deliberately omits.
 
 ### Phase 12 — Sim test framework + simulator library (§10.7, §10.8)
 
@@ -940,7 +919,7 @@ Client-side simulator library + deterministic handler test framework. Worker has
 - Module tape wiring at `JS_ResolveModule` — `appendModule` infrastructure exists in `src/tape/root.zig` but has no caller. Needed for multi-file determinism.
 - Test framework (§10.8): `_tests/` directory + `loop46 test` CLI subcommand embedding QuickJS for test code execution outside the handler sandbox. Sim tests run **fully locally** from the working tree.
 - Snapshot machinery (`_tests/__snapshots__/{name}.json`, `--update-snapshots`).
-- `loop46_export_fixture` writes sibling-file pairs (`_tests/from-prod-{id}.mjs` + `_tests/__fixtures__/from-prod-{id}.json`) so fixtures stay offline-runnable.
+- `loop46 export-fixture` writes sibling-file pairs (`_tests/from-prod-{id}.mjs` + `_tests/__fixtures__/from-prod-{id}.json`) so fixtures stay offline-runnable.
 - Production-strip of `_tests/` — test files live in dev repo only.
 - Request body capture into the tape (new request-input channel) — needed for fixtures and replays to faithfully reproduce POST bodies.
 - Stale-comment cleanup at `src/log/root.zig:71`.
@@ -1023,21 +1002,22 @@ Resolved items moved to §10. Open items:
 - `src/files/root.zig:14` — content-addressed manifest + blob scheme; Phase 2 extends this.
 - `src/files/root.zig:73` — `MAX_PATH_LEN = 192`; reused in path validation.
 - `src/tenant/root.zig:459` — `__admin__` KV aliases to root.db. Pivot may keep, repurpose, or deprecate; re-evaluate in Phase 5.
-- `src/tenant/root.zig:518` — root-token hash scheme; pattern reused for magic-link tokens (`_magic/{hash}`, 15-min TTL).
+- `src/tenant/root.zig:518` — root-token hash scheme; pattern reused for magic-link tokens (`_magic/{hash}`, 30-min TTL).
 - `src/js/worker.zig` — QuickJS snapshot-restore per-request; trigger and callback invocations reuse this.
 - `vendor/README.md` — dependency posture (no network installs, everything vendored). Informs Phase 9 SQLCipher-vs-VFS decision.
 - `web/admin/` — existing admin UI skeleton. Will be largely rewritten in Phase 5 against the new auth + file API.
 
-### Sub-plans expanding sections of this document
+## 6a. Sub-plans expanding sections of this document
 
 - `docs/files-server-plan.md` — §2.4 expansion: own subdomain,
   manifest in S3, marker-driven release, async load + atomic
-  pointer swap, Cloudflare-fronted static serving.
+  pointer swap, Cloudflare-fronted static serving. Also contains
+  the post-1.0 detach detail (§11) — editor bearer-auth flow,
+  deploy-notification path, work-order list, latency mitigations.
 - `docs/logs-plan.md` — §2.9 expansion: S3-direct batches with
   `.idx.json` sidecars, log-server on `logs.{public_suffix}`.
-- `docs/sse-plan-v2.md` — §2.12 expansion (supersedes
-  `docs/sse-plan.md`): centralized sse-service singleton on
-  `sse.{public_suffix}`, response-attached emit buffers,
+- `docs/sse-plan.md` — §2.12 expansion: centralized sse-service
+  singleton on `sse.{public_suffix}`, response-attached emit buffers,
   `rove:resync` sentinel for cache eviction.
 - `docs/webhook-server-plan.md` — §2.6 + Phase 5.5 item 4
   expansion: cluster-wide raft-replicated `webhooks.db` written
@@ -1046,8 +1026,14 @@ Resolved items moved to §10. Open items:
   process — see architectural principle below).
 - `docs/snapshot-plan.md` — §2.13 + Phase 5.5 item 3 expansion:
   per-tenant snapshot indices, S3 transport, no global write-pause.
+- `docs/sim-test-framework.md` — §10.7 + §10.8 expansion: simulator
+  module, `_tests/` directory, `loop46 test` / `loop46 simulate`.
+- `docs/fixture-lifecycle.md` — §10.9 + §10.11 expansion: fixture
+  authoring tooling + worker dry-run dispatch mode.
+- `docs/agent-surface.md` — §10.10 expansion: skill file, `--json`
+  audit, `loop46 doctor`, scoped tokens.
 
-### Architectural principle: separability follows raft participation
+## 6b. Architectural principle: separability follows raft participation
 
 The right axis for "should this subsystem be its own process /
 binary / machine" is **whether it participates in raft**, NOT
@@ -1073,7 +1059,7 @@ envelopes, OR is leader-pinned by definition.
 The principle lets us cleanly answer the "split or not" question
 without re-litigating the tradeoffs case by case.
 
-### Leader-only public surface
+## 6c. Leader-only public surface
 
 Related architectural property: **only the raft leader accepts
 customer requests.** Workers run only on the leader; followers are
@@ -1107,7 +1093,7 @@ The following were explored during the 2026-04-17 design conversation and ruled 
 - **Strict FIFO ordering guarantees for webhooks.** Rejected: impossible to deliver meaningfully across destinations with different latencies; customers who need ordering chain via callbacks.
 - **Fan-in of multiple webhooks into one callback.** Rejected for v1. Customers build saga patterns by hand with triggers/callback-chaining.
 - **Auto-resend on expired-but-recent magic-link click** (15-min validity + 15-min grace window with `resend_grace_until_ns`, `magic_resend` rate-limit action, "we sent a fresh link" UI page). Rejected: trades a friendly page for an extra email round-trip that's strictly worse than just bumping the magic TTL. Replaced by 30-minute flat validity + an `email` URL hint on the signup form pre-fill for the 401-page case. Also avoids a name-squat amplification in the original design — the resend chain renews `pending/{name}` lifecycle, letting one signup hold a name for hours within the 3/hr per-email rate limit; flat TTL caps the reservation at 30 min.
-- **SSE rows in customer's `app.db` under reserved prefix `_events/{sid}/{seq}`**, replicated through raft envelope 0, with a per-tenant retention sweep + Last-Event-ID catch-up over the persisted rows. Rejected (2026-05): SSE is a notification channel, not a source-of-truth state store; the reserved-prefix storage entangled SSE state with customer kv writesets, raft replication, the markDirtyFromWriteset scan, and a 365-line retention sweep — for semantics that are explicitly losable and recoverable via replay. Replaced by `docs/sse-plan-v2.md`: centralized sse-service singleton, response-attached emit buffers, in-memory ring cache with sentinel-on-eviction.
+- **SSE rows in customer's `app.db` under reserved prefix `_events/{sid}/{seq}`**, replicated through raft envelope 0, with a per-tenant retention sweep + Last-Event-ID catch-up over the persisted rows. Rejected (2026-05): SSE is a notification channel, not a source-of-truth state store; the reserved-prefix storage entangled SSE state with customer kv writesets, raft replication, the markDirtyFromWriteset scan, and a 365-line retention sweep — for semantics that are explicitly losable and recoverable via replay. Replaced by `docs/sse-plan.md`: centralized sse-service singleton, response-attached emit buffers, in-memory ring cache with sentinel-on-eviction.
 - **Log batches replicated through raft (envelope type 1) + per-tenant `log.db` apply on every node.** Rejected (2026-05): logs are best-effort and lossy by design (PLAN §2.9), don't need raft's strong durability, and forcing them through the raft log dominates cluster bandwidth at scale. Replaced by `docs/logs-plan.md`: per-node S3-direct batch upload + a single log-server process polling S3 to maintain a local SQLite index.
 - **Per-tenant `files.db` on every worker mirroring the manifest via raft envelope type 3.** Rejected (2026-05): worker-as-read-only-consumer model is cleaner. Replaced by `docs/files-server-plan.md`: manifest lives in S3, runtime release signal is a `_deploy/active` kv marker on the customer's app.db, worker reads on demand.
 - **Worker hairpin proxy `/_system/files/*` and `/_system/log/*`.** Rejected (2026-05): these subsystems should be on their own subdomains (`files.{public_suffix}`, `logs.{public_suffix}`), terminating their own TLS, with token-handoff auth from the customer's app domain. Worker stops mediating their traffic entirely. Per `docs/files-server-plan.md` and `docs/logs-plan.md`.
@@ -1131,9 +1117,9 @@ The uniqueness isn't any single feature — it's the coherence of the set:
 
 Nobody is offering this combination. The marketing headline is the functional core + replay; the developer hook is the one-minute demo. The rest of the plan is making both of those true.
 
-## 9. Implementation status (2026-04-21)
+## 9. Implementation status (as of 2026-04-30)
 
-A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almost entirely and restructured a few architectural decisions (flagged in §10). Current status against the §3 phase list:
+Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 (narrow scope), restructured several architectural decisions (flagged in §10), and locked the beta-first launch sequencing in §10.16/§10.17. Current status against the §3 phase list:
 
 ### Phase 1 — Domain infrastructure
 - Wildcard DNS, Let's Encrypt, `rove-lego-renew.sh`, Cloudflare Full/Strict — **operator work, gated on domain registration**
@@ -1180,9 +1166,9 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 - NOT yet: Logs auto-refresh / live tail, Logs filtering (by status / outcome / deployment / path), nested-thread display under `parent_request_id` (waits on Phase 6 trigger / callback log emits), Deploys tab with history + diff, CodeMirror 6 upgrade, draft workflow, signup form on the login page, tape replay click-through (waits on Phase 4 tape capture)
 
 ### Phase 5.5 — Storage scalability — **not started**
-- Promoted into MVP scope 2026-04-29 (this revision). Four deliverables: (a) log batch payload offload to BlobStore — leader writes batch blob, raft entry carries `{tenant_id, batch_hash, manifest}` only, propose gated on blob-write completion, apply fetches blob from the shared backend; (b) tape body capture wired through the pre-staged `tape_refs` + `LogStore.blob` slots, bodies offloaded to `{inst.dir}/log-blobs/` with §2.4's 256 KB truncation; (c) raft snapshot + log compaction integration via `willemt/raft`'s existing hooks, single-node only in v1; (d) centralized webhook subsystem with leader-local `_webhooks.db` and idempotent enqueue, replacing the per-tenant scan in `outbox/drainer.zig`.
+- Promoted into MVP scope 2026-04-29. Four deliverables, each with its own sub-plan: (a) log batch payload offload — superseded by `docs/logs-plan.md` (logs leave raft entirely, go S3-direct with sidecar index); (b) tape body capture wired through the pre-staged `tape_refs` + `LogStore.blob` slots, bodies offloaded to `{inst.dir}/log-blobs/` with §2.4's 256 KB truncation; (c) raft snapshot + log compaction — see `docs/snapshot-plan.md` (per-tenant snapshot indices, S3 transport, no global write-pause); (d) centralized webhook subsystem — see `docs/webhook-server-plan.md` (cluster-wide raft-replicated `webhooks.db` via new envelope types 4/5/6).
 - Without (a)–(c), `raft.log.db` grows unbounded under any sustained traffic and bodies (when added) overwhelm both raft replication and per-tenant `log.db`. Estimate: ~43 GB/day in raft.log.db at 1000 req/s × ~500 B per log record, doubled by apply, ~100× worse with bodies.
-- Without (d), the drainer's steady-state tick cost is O(N tenants) — ~40k SQLite open+scan ops/sec at 4 ticks × 10k tenants. The subsystem move-to-`_webhooks.db` design (see §3 Phase 5.5) eliminates the per-tick scan; idempotency on the handover key (the existing 64-hex outbox id) keeps recovery safe across crashes and failover. **Tradeoff: leader-local `_webhooks.db` means a new leader must scan every tenant app.db `_outbox/*` once during recovery — the same per-tenant-scan cost moves from steady-state to the failover path. Linear in fleet size, can dominate failover latency at scale.** Default mitigation is to parallelize that scan across the worker pool; promote to a persistent "tenants with non-zero outbox" index in admin app.db, or to raft-replicating `_webhooks.db`, only when measurement justifies it.
+- Without (d), the drainer's steady-state tick cost is O(N tenants) — ~40k SQLite open+scan ops/sec at 4 ticks × 10k tenants. The raft-replicated `webhooks.db` design eliminates that per-tick scan; on leader change, the new leader inherits committed state with no per-tenant outbox scan. Idempotency on the 64-hex outbox id makes the per-tenant-`_outbox/*` → `webhooks.db` handover safe across crashes and failover.
 - The supersede comment in `src/log/root.zig` header that mentions "Phase 6 changes this so the leader uploads the batch blob to S3" is stale terminology — it predates the current PLAN numbering. Cleanup as part of this work.
 
 ### Phase 6 — Triggers — **done 2026-04-27**
@@ -1207,7 +1193,7 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 ### Phases 7, 9, 10 — **not started**
 
 ### Phase 12 — Sim test framework + simulator library — **not started; partially absorbed into beta + 1.0**
-- Locked in §10.7 + §10.8 (2026-04-28); scope narrowed by the §10.12 two-path replay wedge (2026-04-30) and the beta-first sequencing in §10.17 / §10.18 (2026-04-30). Detailed plan in `docs/sim-test-framework.md`. **Pure client-side**: simulator module (`src/simulator/`) library-linked into the `loop46` CLI; `ReplaySource`; bundle module extraction; bundle JSON additions; module tape wiring; request body capture; `_tests/` directory + `loop46 test` and `loop46 simulate` CLI subcommands; snapshot machinery; sibling-file fixture export; production strip of `_tests/`. **No server endpoints, no thread pool, no rate-limit action** — worker is unchanged.
+- Locked in §10.7 + §10.8 (2026-04-28); scope narrowed by the §10.12 two-path replay wedge (2026-04-30) and the beta-first sequencing in §10.16 / §10.17 (2026-04-30). Detailed plan in `docs/sim-test-framework.md`. **Pure client-side**: simulator module (`src/simulator/`) library-linked into the `loop46` CLI; `ReplaySource`; bundle module extraction; bundle JSON additions; module tape wiring; request body capture; `_tests/` directory + `loop46 test` and `loop46 simulate` CLI subcommands; snapshot machinery; sibling-file fixture export; production strip of `_tests/`. **No server endpoints, no thread pool, no rate-limit action** — worker is unchanged.
 - **Beta absorbs**: bundle JSON shape (extracted into `src/tape/bundle.zig`), stubs-library shape (Loop46 globals reading from tape, shared with the `replay.loop46.me` browser-replay page), request body capture into the tape. Beta-path prerequisites for §10.12's Story 1 path and stop being Phase-12-specific work.
 - **1.0 absorbs**: nothing additional from Phase 12 — the DAP CLI reuses the beta stubs library directly.
 - **Stays post-1.0**: Zig + QuickJS `ReplaySource` (the strict-determinism authority — distinct from the V8-based launch interactive-replay paths), sim test framework + assertions, snapshot machinery, fixture lifecycle, `_tests/` directory + `loop46 test` / `loop46 simulate` subcommands.
@@ -1219,10 +1205,10 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 - Locked in §10.10 (2026-04-28). Detailed plan in `docs/agent-surface.md`. Pieces: skill file at `docs/skills/loop46.md`, `--json` output audit across CLI, `loop46 doctor` env-check subcommand, scoped tokens at `scoped_token/{hash}` with capability + instance subsets, `/_system/scoped_tokens` admin routes, dashboard "Tokens" tab. **No MCP server in v1** — hosted MCP deferred until remote-agent demand surfaces.
 
 ### Tape-replay wedge (browser page for Story 1 in beta + DAP CLI for Story 2 at 1.0) — **launch path** as of 2026-04-30
-- Locked architecturally in §10.12 (2026-04-28; two-path split 2026-04-30). Beta-first sequencing per §10.17 / §10.18 (decided 2026-04-30): browser page (Story 1) ships in beta; DAP CLI (Story 2) ships at 1.0. Two paths share bundle JSON shape, tape blob format, and stubs library — beta lands all three plus the browser-side consumer; 1.0 adds the CLI orchestration on top.
+- Locked architecturally in §10.12 (2026-04-28; two-path split 2026-04-30). Beta-first sequencing per §10.16 / §10.17 (decided 2026-04-30): browser page (Story 1) ships in beta; DAP CLI (Story 2) ships at 1.0. Two paths share bundle JSON shape, tape blob format, and stubs library — beta lands all three plus the browser-side consumer; 1.0 adds the CLI orchestration on top.
 - **Beta scope**: bundle endpoint + `replay.loop46.me` page + sandboxed iframe + stubs library + `debugger;` injection + "Replay" button + "copy request ID" affordance. ~1-2 weeks.
 - **1.0 adds**: `loop46 replay <id>` CLI spawning Node under `--inspect-brk` for DAP-aware editor attach (VS Code / JetBrains / nvim-dap / dap-mode). ~1-2 weeks.
-- No Chrome extension, no in-dashboard debugger UI. CodeMirror 6 lands in beta but only for syntax highlighting in the Code tab, not for an integrated debugger view (see §10.12 closing note + §10.17 beta launch list item 3).
+- No Chrome extension, no in-dashboard debugger UI. CodeMirror 6 lands in beta but only for syntax highlighting in the Code tab, not for an integrated debugger view (see §10.12 closing note + §10.16 beta launch list item 3).
 
 ### Blob replication (multi-node prerequisite)
 - Raft envelopes now include `type=3` files_writeset replicating `{id}/files.db` across nodes — **done**
@@ -1233,7 +1219,7 @@ A long build session between 2026-04-17 and 2026-04-21 shipped Phases 1–4 almo
 
 ## 10. Architecture decisions post-2026-04-17
 
-Architectural calls captured here so future sessions don't re-derive them. §10.1–§10.6 from 2026-04-17 to 2026-04-21; §10.7–§10.12 added and iterated 2026-04-28 (earlier drafts had different §10.9 / §10.11 for trial deploys + live-state acceptance tests; both dropped after design review favored the FP-pure client-side simulator path).
+Architectural calls captured here so future sessions don't re-derive them. §10.1–§10.6 from 2026-04-17 to 2026-04-21; §10.7–§10.12 added and iterated 2026-04-28 (earlier drafts had different §10.9 / §10.11 for trial deploys + live-state acceptance tests; both dropped after design review favored the FP-pure client-side simulator path); §10.13–§10.17 added 2026-04-30 covering the post-1.0 detach, the distributed-Elm-ports framing, the post-1.0 observability primitives, and beta/1.0 launch sequencing.
 
 ### 10.1 Admin is a real instance with a `platform` capability
 
@@ -1301,190 +1287,52 @@ The 750-line `dispatchOnce` loop body was split into named helpers:
 
 ### 10.7 Simulator primitive (purely client-side, KV-less)
 
-**Change**: Loop46 gains a simulator primitive — `simulate(request, source_overlay, kv_overlay, tape, mode, miss_policy) → bundle` — implemented as a **client-side library only**. The worker has no simulator role: no `/_system/simulate/{id}` endpoint, no thread pool, no `simulate` rate-limit action. The worker's job is dispatch (live or dry-run, §10.11) + observation (recording tapes); simulation is purely a client concern.
+The simulator is a **client-side library only** — no `/_system/simulate/{id}` endpoint, no thread pool, no `simulate` rate-limit action. The worker's job is dispatch (live or dry-run, §10.11) + observation (recording tapes); simulation is purely a client concern. Two implementations share a contract (bundle JSON shape + tape blob format):
 
-Two implementations of the simulator share a contract (bundle JSON shape + tape blob format) but otherwise live independently:
+- **CLI simulator** (Zig + QuickJS, `src/simulator/`) — linked into `loop46 test` and `loop46 simulate`. Hermetic, deterministic, used in CI and inner-loop dev. Authoritative for strict-determinism replay.
+- **Browser-replay page** (V8 in browser, launch-path per §10.12) — interactive replay for Story 1 in a sandboxed iframe at `replay.loop46.me`. Stubs Loop46 globals from the tape, injects `debugger;` at handler entry. Engine differences with QuickJS apply uniformly.
 
-- **CLI simulator** (Zig + QuickJS, this repo at `src/simulator/`) — linked into `loop46 test` and `loop46 simulate`. Hermetic, deterministic, used in CI and inner-loop dev. Reads handler source from the working tree (or fetched via existing files-server endpoints when targeting a deployment id).
-- **Browser-replay page** (JS + V8 in the browser, launch-path per §10.12 / §10.17) — interactive replay for Story 1 (new programmer) in a sandboxed iframe served from `replay.loop46.me`. Loads tape + source from server endpoints, stubs Loop46 globals (`kv`, `webhook`, `email`, etc.) from the tape, injects `debugger;` at handler entry, lets the user use their browser's own DevTools (breakpoints, stepping, variable inspection). No Chrome extension; not Chrome-only.
-- **DAP-attach CLI** (`loop46 replay <id>`, Node + V8, launch-path per §10.12 / §10.17) — interactive replay for Story 2 (engineering team) in their editor of choice. Spawns Node under `--inspect-brk` with stubs preloaded; DAP-aware editors (VS Code, JetBrains, nvim-dap, dap-mode) attach via V8 Inspector Protocol. No web replay UI is involved on this path — the dashboard Logs view is request-ID discovery only, the actual debugging happens in the engineer's editor.
+`ReplaySource` is **KV-less** — the dependency surface deliberately excludes `rove-kv` / SQLite. Modes (`strict`, `what_if`, `isolated`) are layer combinations over write-buffer / overlay / tape / miss-policy. **No live-KV pass-through layer**: live-state mixing was rejected as conceptually muddy. Writes go to the buffer only; outbox effects (`webhook.send`, `email.send`) are recorded as "would-have-enqueued" rows, never delivered.
 
-**Why purely client-side**: every v1 caller has either local source (CLI) or sufficient browser plumbing (the extension fetches source as needed). The server-side use cases that motivated a worker endpoint — single-request simulation for hosted MCP, cross-machine remote agents — are all deferred to v2. The worker is a recording device + dispatcher; observation flows worker → client; the client does all the compute.
-
-A previously-considered second primitive ("trial-run" against live state, with savepoint rollback) was dropped — it conflicted with the FP story (non-deterministic), and the use cases it served (testing against current data, pre-deploy canaries) are better served by snapshot-derived fixtures (§10.9), running candidates on a separate Loop46 instance (multi-instance staging story), or the dry-run dispatch mode (§10.11).
-
-**Read resolution stack** in `ReplaySource` (precedence high → low; each read records its source in the output bundle):
-
-1. Request-scoped write buffer — handler's own writes during this simulation. Always active so read-after-write within a single request works. Discarded at simulation end.
-2. Overlay map — supplied `{key → value}` for tests / what-if. Optional.
-3. Tape — recorded values from a prior request. Optional.
-4. Miss policy — `fail` (structured "unresolved read on K") or `not_found`. Per-simulation.
-
-**No live KV pass-through layer.** Live state mixing was rejected as conceptually muddy (point-in-time mismatch between tape and live data leads to misleading results).
-
-**Modes** are layer combinations:
-- `strict` (1, 3, miss=fail) — apples-to-apples replay; unresolved reads surface as a first-class signal.
-- `what_if` (1, 2, 3, miss=not_found) — overlay over tape.
-- `isolated` (1, 2, miss=not_found) — overlay only, no tape. The mode sim tests use.
-
-**Why `ReplaySource` is KV-less**: the simulator's dependency surface deliberately excludes `rove-kv` / SQLite. It links rove-tape (parse side only — recording is one-way), rove-files (manifests, when fetching from server), rove-blob (source bytes, when fetching from server), rove-qjs (execution), and the JS API surface from `src/js/globals.zig`. This makes the library CLI-linkable; for the browser implementation, the equivalent stubs are written in JS.
-
-**Safety invariants** (load-bearing):
-- Writes go to the buffer only and are discarded at simulation end. No promotion path through any tool, endpoint, or mode.
-- Outbox effects (`webhook.send`, `email.send`) are recorded as "would-have-enqueued" rows in the bundle; the delivery worker never sees them. Loop46's transactional outbox is declarative, so this is structural.
-- "Re-process this failed request after my fix" is **not** a simulation operation. Real re-processing is a normal HTTP request against a new deployment.
-
-**Side effects**:
-- Bundle JSON format from `rove-log-cli bundle` (`examples/log_cli.zig:210`) becomes the canonical shape consumed by both CLI sim and the launch-path browser replay page (§10.12). Code moves into a shared module (`src/tape/bundle.zig`).
-- Tape capture (`uploadTapes` in `src/js/worker.zig`) is unchanged; missing pieces are `ReplaySource` in the CLI simulator (`src/js/globals.zig:862-863` flagged the gap), request body capture, and module tape wiring.
-- New module `src/simulator/` (CLI library only, no thread pool, no standalone-binary stub): `root.zig` + `replay_source.zig` + `bytecode_cache.zig` + small `compile.zig`.
-- New CLI subcommands `loop46 simulate` and `loop46 test` (the latter spec'd in §10.8) link the simulator library.
-- The browser implementation is a separate work item with its own architectural decision (§10.12) — it's not built in v1.
-- Implementation plan: `docs/sim-test-framework.md`.
+Detail in `docs/sim-test-framework.md`.
 
 ### 10.8 Sim test framework (deterministic, local-only)
 
-**Change**: Loop46 ships a first-class in-deployment sim test framework. Tests live in a reserved `_tests/` directory of the developer's source repo, are imperative async JS, and run **entirely locally** via a `loop46 test` CLI subcommand that embeds QuickJS and links the simulator library (§10.7). No worker contact, no auth, works offline.
+`_tests/` directory + `loop46 test` CLI subcommand that embeds QuickJS and links the simulator library. **Entirely local** — no worker contact, no auth, works offline; pre-commit hooks, TDD, and CI sim phase all run without network. Injected globals: `simulate(req)`, `expect(value)`, `snapshot(name, value)`. `_tests/` is platform-prefix-guarded and **stripped from production manifests at deploy time**.
 
-`_tests/` is a platform-prefix-guarded directory (alongside `_static/`, `_triggers/`, etc.). Customer handlers and trigger cascades cannot read or write into it.
-
-**Injected globals** (test code receives these as a destructured argument):
-- `simulate(req)` — invokes the simulator library in-process; reads handler source from the working tree.
-- `expect(value)` — assertions.
-- `snapshot(name, value)` — captures on first run, asserts structural equality on subsequent runs.
-
-**Why first-class**: Loop46's simulator primitive (§10.7) makes handler tests structurally different from typical JS testing — no mocks needed (handlers can't `fetch`, can't bypass `kv`, can't directly send email; their I/O is overlay-able), side effects asserted not dispatched (would-have-enqueued outbox rows checked, never delivered), deterministic by construction (tape-pinned time/random + overlay-pinned state = bit-reproducible). Encoding this as a platform feature rather than leaving customers to choose a framework gives the agent loop a clean surface: production failure → `loop46_export_fixture` writes a sim test → fix → run tests → deploy.
-
-**Why local-only is load-bearing**:
-- Sim tests run from the working tree against the locally-linked simulator. No worker contact. Pre-commit hooks, TDD, CI sim phase all work offline.
-- The worker has no simulation role at all (§10.7) — sim test workloads never hit it. The fixture-authoring story uses dry-run dispatch (§10.11) when capturing realistic state from live instances.
-- Bisect on sim tests is local — fetch each historical deployment's source via `/_system/files/{id}/source/{hash}`, run sim suite locally per deployment, find the regression point. No remote simulation needed.
-- Browser-side replay debugging (§10.12) is a separate Chrome-extension implementation that consumes the same tape + bundle format, also without server-side simulator help.
-
-**Snapshot mechanism**:
-- `snapshot(name, value)` compares against `_tests/__snapshots__/{name}.json` in the dev repo.
-- First run captures; subsequent runs assert structural equality, fail with diff on mismatch.
-- Regenerate via `loop46 test --update-snapshots`. Snapshots commit alongside test code.
-
-**Fixture sibling-file pattern** (for `loop46_export_fixture`):
-- Export writes two files atomically: `_tests/from-prod-{request_id}.mjs` (the test code) and `_tests/__fixtures__/from-prod-{request_id}.json` (captured tape + recorded bundle for the snapshot).
-- The runner detects fixtures referenced by `from_recorded_request_id` in `simulate(...)` calls and loads them from disk instead of any network call. Tests run offline forever, never re-fetching from the server.
-
-**Side effects**:
-- New platform-reserved path `_tests/`. Lives in dev repo only — **stripped from production manifests at deploy time**. Production deployments never include test code.
-- Snapshot files (`__snapshots__/`) and fixtures (`__fixtures__/`) follow the same strip rule.
-- New CLI subcommand `loop46 test`. Embeds QuickJS + simulator library.
-- Fixture-management primitives (§10.9) handle the editing / refreshing workflow that arises when handler changes require new fixture data.
-- Implementation plan: `docs/sim-test-framework.md`.
+Detail in `docs/sim-test-framework.md`.
 
 ### 10.9 Fixture lifecycle (curated observations)
 
-**Change**: Loop46 ships fixture-management tooling for sim tests. Fixtures are **curated observations of production state** — files in `_tests/__fixtures__/` that hold the kv data a test uses as `simulate`'s overlay. Two paths to authoring fixtures:
+Fixtures are **curated observations of production state** — files in `_tests/__fixtures__/` that hold kv data a test uses as `simulate`'s overlay. Two authoring paths: (1) from a recorded request via `loop46 export-fixture --request <id>` (sibling-file pair, snapshot-style), (2) from live state selectively via `loop46 fixture from-keys <key>... --from <instance>`. A "snapshot the whole instance" tool was considered and rejected — too coarse, expresses no intent, instantly stale.
 
-1. **From a recorded request** (already in §10.8) — `loop46_export_fixture --request <id>` promotes a real production observation into a sibling-file fixture pair. Self-contained, snapshot-style.
-2. **From live state, selectively** (this section) — pull specific keys from a target instance into a fixture. Lets the author construct realistic scenarios from production data without dumping the entire instance.
+Primitive set: `/_system/kv/{id}/*` admin endpoint, `loop46 kv` CLI family, `loop46 fixture` CLI family, runner `--auto-fix-from <instance>` flag.
 
-A "snapshot the whole instance" tool was considered and rejected — too coarse, expresses no intent, instantly stale. The right primitives are targeted: pull these keys, edit this fixture, refresh that one, diff fixture-vs-prod.
-
-**Why**: sim tests are pure functions over (request, overlay, source). Realistic test data is the hardest part of authoring tests. As handlers evolve and read new keys, fixtures need updates. The lifecycle tools (add missing keys, refresh stale ones, diff drift) make fixture maintenance ergonomic without breaking the FP story — fixtures stay frozen JSON files committed to the dev repo, used as deterministic inputs to pure functions.
-
-**Primitive set**:
-
-Reading from live state:
-- `/_system/kv/{id}/*` admin endpoint (read-only, paginated): `get/{key}`, `?prefix=...&limit=N&after=<key>`, `count?prefix=...`. Same endpoint backs the dashboard KV browser.
-- `loop46 kv get <key>` / `list-prefix <prefix>` / `count <prefix>` — CLI wrappers.
-
-Authoring + editing fixtures:
-- `loop46 fixture from-keys <key>... [--from <instance>] -o <fixture>` — pull a curated slice into a fixture file.
-- `loop46 fixture add <fixture> <key> [--value <v> | --from <instance>]` — fill in missing keys.
-- `loop46 fixture remove <fixture> <key>`.
-- `loop46 fixture edit <fixture>` — opens $EDITOR.
-- `loop46 fixture diff <fixture-a> [<fixture-b> | --against <instance>]` — show drift.
-- `loop46 fixture refresh <fixture> [--from <instance>] [--key <k>]` — re-pull keys currently in the fixture.
-- `loop46 fixture merge <a> <b> -o <c>` — combine.
-
-Runner integration:
-- Structured "unresolved read on K" error referencing the fixture path + missing key. Easy to act on programmatically.
-- Optional `loop46 test --auto-fix-from <instance>` — on unresolved read, pulls the value, writes back to the fixture, retries. Single-pass fixture filling.
-
-**Side effects**:
-- New admin endpoint `/_system/kv/{id}/*` (also useful for dashboard KV browser, scoped-token auditing, agent ad-hoc state queries).
-- New `loop46 kv` and `loop46 fixture` CLI subcommand families.
-- Web UI follow-on (deferred): "Fixtures" tab in the dashboard with the same affordances over the same backend endpoints. Likely lands alongside Phase 5 admin UI maturity.
-- Implementation plan: `docs/fixture-lifecycle.md`.
+Detail in `docs/fixture-lifecycle.md`.
 
 ### 10.10 AI agent surface — CLI + skill file in v1, hosted MCP deferred
 
-**Change**: Loop46's primary AI agent surface in v1 is **the CLI itself**, taught to agents via a skill file. **No MCP protocol server, no MCP wire-format code, no separate `loop46-mcp` binary in v1.** Hosted MCP at `mcp.loop46.me` is deferred until concrete remote-agent demand surfaces (third-party integrations, cloud agents that don't run on the customer's machine).
+Loop46's primary AI agent surface in v1 is **the CLI itself**, taught to agents via a skill file. **No MCP protocol server, no `loop46-mcp` binary.** Hosted MCP at `mcp.loop46.me` is deferred until concrete remote-agent demand surfaces — the dominant case (Claude Code, Codex, Cursor in the customer's working tree) already has shell access, and the MCP wins (typed schemas, server-side rate limiting, cross-machine) only matter for remote/hosted scenarios.
 
-**Why this beats the original "MCP server as separate binary" plan**:
+What ships in v1: skill file at `docs/skills/loop46.md`, `--json` output on every CLI subcommand, `loop46 doctor` readiness check, and **scoped tokens** at `scoped_token/{sha256_hex}` (capability subset + instance scope). Scoped tokens are independent of MCP — a security primitive worth having for any agent integration.
 
-- The dominant agent use case (Claude Code, Codex, Cursor running in the customer's working tree) already has shell access. Skill file + CLI is genuinely sufficient — agents read `--help`, compose subcommands, parse JSON output.
-- The MCP wins (typed schemas, server-side rate limiting, token isolation, cross-machine access) only matter for **remote/hosted** scenarios. None apply to local agents on the customer's machine.
-- The MCP spec has been a moving target (SSE → Streamable HTTP). Building against it now means tracking spec churn; deferring lets it settle.
-- The biggest concrete agent-security win (token isolation) is worth building independently of MCP. See "scoped tokens" below.
-- Loop46's actual differentiator is the FP-pure simulation/test/fixture story (§10.7–§10.9). Wrapping it in MCP is icing; if the cake is right, customers don't need the icing yet.
-
-**What ships in v1**:
-- **Skill file** at `docs/skills/loop46.md` (or the path Anthropic's skill convention lands on). Teaches the canonical workflow (edit handler → `loop46 test` → fix fixtures via `loop46 fixture *` → `loop46 deploy`), the tool catalog, common patterns, gotchas, auth setup.
-- **`--json` output mode** on every CLI subcommand for parseable structured results.
-- **`loop46 doctor`** — environment + connectivity readiness check; the first thing an agent runs to confirm working tree, deployment, and credentials are in order.
-- **Scoped tokens** — new token type alongside session/root, stored at `scoped_token/{sha256_hex}` in root.db. Carries a capability subset (`read`, `simulate`, `deploy`, `fixture`, `kv`, etc.) and an instance scope. Customer mints via dashboard or `loop46 mint-token --capabilities ...`. Agent runs with `LOOP46_TOKEN=<scoped>`; if compromised, blast radius is contained to the granted capabilities. **Independent of MCP** — a security primitive worth having for any agent integration (CI bots, hosted automations, third-party tools).
-
-**What's deferred**:
-- Hosted HTTP MCP at `mcp.loop46.me`. Build when a real remote-agent use case demands it. Until then, no protocol code in the repo, no subdomain reservation.
-- `loop46-mcp` binary. Doesn't exist in v1.
-- All MCP-specific tool schemas. They're skill-file documentation instead.
-
-**Side effects**:
-- New scoped-token install/auth functions in `src/tenant/root.zig` (analogues of `installRootToken` / `authenticate`).
-- New `/_system/scoped_tokens` admin routes for mint/list/revoke.
-- Dashboard "Tokens" tab.
-- New `loop46 doctor` and `loop46 mint-token` CLI subcommands.
-- Implementation plan: `docs/agent-surface.md`.
+Detail in `docs/agent-surface.md`.
 
 ### 10.11 Worker dry-run dispatch mode
 
-**Change**: a new `POST /_system/dry-run/{instance_id}` endpoint runs a synthetic request through the existing dispatch path with one behavioral change: the savepoint is **always rolled back, never proposed to raft**. Returns the bundle inline (response, would-have-written kv ops, would-have-enqueued outbox rows, captured tape entries). Nothing persists.
+`POST /_system/dry-run/{instance_id}` runs a synthetic request through the existing dispatch path with one behavioral change: the savepoint is **always rolled back, never proposed to raft**. Returns the bundle inline (response, would-have-written kv ops, would-have-enqueued outbox rows, captured tape entries); nothing persists. Implementation is roughly 50 lines — a `dry_run: bool` flag on `dispatchOnce` plus a new admin route.
 
-**Why**: complements §10.9 fixture lifecycle. Customers and agents need a way to capture **realistic tape data** for use as test fixtures — running a synthetic request through the real handler against current state, observing what it reads, but without polluting state. Without this, the only way to get a tape is to fire a real persistent request.
+**Distinct from the simulator**: dry-run is literal dispatch (same bytecode, real `app.db` reads, real time/random, real trigger cascades) with commit + propose suppressed. The simulator (§10.7, client-side) handles modified-source / overlay / replay; dry-run answers "what would real dispatch do here, without committing." Cost shape is close to read-only — skips the two expensive parts of a write (SQLite commit fsync + raft propose) — so customers and agents can dry-run liberally.
 
-**Why this isn't a "simulator"**: dry-run is literal dispatch — same handler bytecode (precompiled, from the deployment manifest), same kv access (real `app.db` reads), same time/random (wall clock + OS), same trigger cascades. The only behavioral difference is "always rollback the savepoint and skip the propose." It's not running modified source, it's not using overlays, it's not replaying a tape. The simulation primitive (§10.7, purely client-side) handles all the *what-if* / *modified-source* cases; dry-run handles only *what would real dispatch do here, without committing*.
-
-**Endpoint surface**:
-```
-POST /_system/dry-run/{instance_id}
-{
-  "request": { "method": "...", "host": "...", "path": "...", "headers": {...}, "body": "..." }
-}
-→ 200: <bundle JSON>   // includes inline tape entries; nothing persisted to log-blobs
-```
-
-**Implementation**: a small flag on `dispatchOnce` (`dry_run: bool`) plus a new admin route. Roughly 50 lines:
-- Set `dry_run` on the dispatch state.
-- After the handler runs, snapshot the writeset + outbox rows + tape entries from `TrackedTxn` and the recorder.
-- Always rollback the savepoint regardless of handler success/failure.
-- Skip the raft propose unconditionally.
-- Return the snapshot inline as a bundle JSON instead of persisting to log-blobs.
-
-**Cost shape — close to read-only**: dry-run skips the two expensive parts of a write request — the SQLite commit fsync AND the raft propose (network roundtrips + per-follower fsyncs in multi-node). What remains is handler CPU + SQLite reads + the in-memory writeset/tape capture. In multi-node setups where raft propose dominates write latency by several ms, dry-run is essentially as cheap as a synthetic read. Customers and agents can dry-run liberally without worrying about expensive operations or live-write contention.
-
-**Side effects**:
-- New admin endpoint, gated behind the existing admin auth + scope.
-- Optional `dry_run` rate-limit action. Because the cost profile is closer to reads than writes, a more permissive default than `request` is justifiable. v1 simplest: share the `request` budget. Future tuning can give dry-run its own (more generous) bucket once load shapes are observed.
-- Bundle JSON shape adds an inline `tape_entries` field (or includes the tape as a parsed structure) since dry-run tapes don't get a blob hash. Dual-purpose: live dispatch's bundle references tape blobs by hash (persistent); dry-run bundle includes them inline (ephemeral). Test/sim consumers handle both.
-- New CLI: `loop46 dry-run --request '{...}' --instance <id> [--json]`. Prints bundle on stdout.
-- New fixture authoring tool (Phase 13): `loop46 fixture from-dry-run --request '{...}' --instance <id> -o <fixture.json>` composes `dry-run` + extract-kv-tape + write fixture file.
-- Worker dispatch path gets one new flag; the rest of the production hot path is unchanged.
-- Implementation plan: detail in `docs/fixture-lifecycle.md`.
+Detail in `docs/fixture-lifecycle.md`.
 
 ### 10.12 Replay — two paths, one per audience: browser page (Story 1) + DAP CLI (Story 2) (PROMOTED to launch path 2026-04-30; two-path split 2026-04-30)
 
-**Change**: tape replay ships as **two paths sharing bundle JSON, tape blob format, and the stubs library** — one optimized for each launch audience (§10.17).
+**Change**: tape replay ships as **two paths sharing bundle JSON, tape blob format, and the stubs library** — one optimized for each launch audience (§10.16).
 - **Story 1 (new programmer)**: dashboard "Replay" button → new tab on `replay.loop46.me` (sandboxed iframe + global stubs + `debugger;` injection at handler entry). User opens F12 to step through using their browser's own DevTools.
 - **Story 2 (engineering team)**: `loop46 replay <request_id>` CLI in the engineer's terminal. Spawns Node.js under `--inspect-brk` with stubs preloaded; their DAP-aware editor (VS Code / JetBrains / Neovim with nvim-dap / Emacs with dap-mode) attaches via V8 Inspector Protocol. They debug in the editor they already live in. **Story 2 is expected to never use the browser path** — the dashboard Logs view's job for them is request-ID discovery (one-click copy on each row → paste into terminal).
 
-**Promoted into the launch path** — see §10.17 for sequencing. The original "deferred until Phase 5 admin UI is mature" stance flipped because tape replay is the load-bearing differentiator: every other Loop46 capability has a competitor that does it better, but **nobody else can let you click a failed request and step through the actual reproducer in your usual debugger**. Story 1 hears "click any 500, hit replay, step through it in F12"; Story 2 hears "`loop46 replay <id>` in your terminal, attach VS Code, step through it in your editor."
+**Promoted into the launch path** — see §10.16 for sequencing. The original "deferred until Phase 5 admin UI is mature" stance flipped because tape replay is the load-bearing differentiator: every other Loop46 capability has a competitor that does it better, but **nobody else can let you click a failed request and step through the actual reproducer in your usual debugger**. Story 1 hears "click any 500, hit replay, step through it in F12"; Story 2 hears "`loop46 replay <id>` in your terminal, attach VS Code, step through it in your editor."
 
 **Story 1 path — `replay.loop46.me` page (page-only, "use real DevTools, free")**:
 1. Dashboard ships a "Replay" button on each Logs row → opens `https://replay.loop46.me/{request_id}` in a new tab.
@@ -1538,188 +1386,45 @@ The bundle JSON shape, stubs-library design, and request body capture into the t
 
 **Chrome extension dropped entirely.** Earlier drafts of §10.12 considered a Chrome extension as a CDP bridge to an in-dashboard debugger UX (CodeMirror 6 viewer + breakpoint gutter + variables panel + step controls). The two-audience framing makes that the wrong answer for both audiences: Story 1 gets a simpler experience from browser DevTools directly; Story 2 gets a strictly better experience by debugging in their actual IDE via DAP. No post-launch enhancement path for the extension is recorded — DAP attach is the durable answer for the integrated UX Story 2 wants.
 
-### 10.13 files-server + log-server detach: external services, not tenants (decided 2026-04-30)
+### 10.13 files-server + log-server detach (post-1.0)
 
-**Change**: `rove-files-server` and `rove-log-server` stop being in-process worker threads and become **external HTTP services that loop46 integrates with the same way it integrates with Resend or Stripe**. Admin's JS handler calls them via `webhook.send`, receives results via the existing callback dispatch (`_callback/*` rows + `dispatchCallbacks`), and pushes the result to the dashboard browser via SSE (PLAN §2.12). The dashboard never talks to files-server / log-server directly — admin's JS is the integration seam.
+`rove-files-server` and `rove-log-server` stop being in-process worker threads and become **external HTTP services that loop46 integrates with the same way it integrates with Resend or Stripe**. Admin's JS handler calls them via `webhook.send`, receives results via callback dispatch, and pushes the result to the dashboard browser via SSE. The dashboard never talks to files-server / log-server directly — admin's JS is the integration seam. Worker drops ~2-3k lines (`/_system/files/*` and `/_system/log/*` proxies, `code_proxy` / `log_proxy` collections, the cross-thread h2 client, `extractAdminAuth` and friends).
 
-**Why this framing, not "tenants"**: an earlier sketch had files-server + log-server as Loop46 tenants with their own deployed handlers. Wrong shape — they have their own storage layer, their own data model, no need for QJS or the per-tenant kv-undo machinery. Treating them as third-party HTTP services preserves Loop46's purely-functional handler model AND keeps files-server / log-server as **standalone, swappable HTTP servers**: an operator can replace them with S3 + a managed log aggregator without touching loop46.
+Sequencing is **post-1.0** — architectural purification that doesn't differentiate value to Story 1 (beta) or Story 2 (1.0). With SSE shipping at 1.0, the prerequisite is satisfied; the detach becomes a clean refactor gated only on engineering bandwidth.
 
-**What deletes from the worker** (combined with the auth-middleware move planned alongside):
-- `/_system/files/*` and `/_system/log/*` proxy paths in `src/js/worker.zig` — `tryHandleSystem`, the path-rewriting + scope-resolution + per-system auth gate.
-- `code_proxy` + `log_proxy` rove collections + `ProxySubsystem` machinery.
-- The cross-thread h2 *client* embedded in the worker (only the h2 server stays).
-- The in-process spawning of files-server + log-server threads in `loop46/main.zig` — they become separately-deployed binaries pointed at via operator config.
-- `extractAdminAuth` + `findCookie` + `extractBearerToken` + `tenant.authenticate` + `tenant.authenticateSession` (only used by /_system/* auth + the admin-host RPC gate; with /_system/* gone and the admin-host gate moving to a JS `_middlewares/*`, no Zig caller remains).
+Detail (latency mitigations, editor bearer-auth flow, deploy-notification path, work-order list) in `docs/files-server-plan.md` §11.
 
-Net deletion: ~2-3k lines. The platform collapses to: HTTP/2 server, host→tenant routing, QJS dispatch, rate limit + penalty box, outbox drainer, raft apply, tape capture, SSE, static-asset fast path. Everything else is JS in admin's bundle (or in customer bundles).
-
-**Latency cost**: today's `/_system/files/{tenant}/blobs/check` is a microsecond in-process forward. New shape pays drainer-tick + HTTP round-trip + callback-tick + SSE push. At the 250ms default drainer tick, a 50-file bulk deploy goes from <1s to ~25s — unacceptable for the developer-experience promise.
-
-**Latency mitigations** (must land alongside the detach):
-1. **Drainer kick on outbox write.** Handlers writing `_outbox/{id}` wake the drainer immediately rather than waiting for the next 250ms tick. New primitive — probably an eventfd or a per-worker condvar the drainer waits on. Brings round-trip floor to ~10ms.
-2. **Parallel webhook dispatch.** Admin JS fires N `webhook.send` calls in one handler invocation; drainer dispatches them concurrently per tenant rather than serially. Today's drainer is per-tenant-serial — fine for low volume, a bottleneck here.
-3. **SSE-driven optimistic UI.** Dashboard shows "saving…" / "uploading…" immediately, confirms when the SSE event lands. Modern admin-UI aesthetic; works fine at <100ms confirm latency.
-
-Combined target: <100ms effective round-trip from dashboard click to confirmed result, even on 50-file bulk operations.
-
-**Why this is right**:
-- **Dogfoods webhook + callback + SSE harder than any customer use case will.** Admin's own tooling exercises them on every dashboard interaction; design issues surface for *us* before they surface for customers.
-- **Keeps Loop46 pure.** No in-process escape hatches "just because the platform itself wants to call something." The same `webhook.send` primitive customers use *is* how the platform integrates with everything external.
-- **Makes files-server + log-server swappable at the HTTP layer.** Operator can run them on the same box, on different boxes, behind a managed service (S3 for blobs; CloudWatch / Loki for logs), or reimplement them entirely. As long as they speak the agreed HTTP shape, loop46 doesn't care.
-
-**Prerequisites (must land before the detach is realistic)**:
-- **SSE primitive** (PLAN Phase 11 / §2.12). Dashboard can't get reactive updates without it.
-- **Drainer-kick primitive.** Without immediate dispatch on outbox write, the 250ms tick is the latency floor.
-- **HTTP auth on files-server + log-server.** Today's auth model is "trust the local proxy"; new shape needs bearer-token (or HMAC) auth on the HTTP API. Operator provisions the secret via `--bootstrap-kv files_server_token=... files_server_url=...` (the bootstrap-kv mechanism §10's recent generalization handles this trivially — Zig knows nothing about either key).
-- **Operator-side CLI / docs** for deploying files-server + log-server alongside loop46. Today they're spawned automatically; new shape requires the operator to start them and pass URLs.
-
-**Sequencing**: **post-1.0 (revised 2026-04-30 with beta-first launch sequencing).** Earlier on 2026-04-30 the detach was framed as pre-launch because it dogfoods §10.14's webhook + callback + SSE + bearer-auth loop. The beta-first reframing later that day reversed that call: the detach is architectural purification that doesn't differentiate value to Story 1 (beta audience) or Story 2 (1.0 audience), so it doesn't belong in either window. With SSE shipping at 1.0, §10.14's prerequisite is satisfied — the detach becomes a clean post-1.0 refactor gated only on engineering bandwidth. Auth specifics in §10.14.
-
-### 10.14 Distributed Elm ports: webhook + callback + SSE + bearer auth (decided 2026-04-30)
+### 10.14 Distributed Elm ports: webhook + callback + SSE (decided 2026-04-30)
 
 **Framing**: Loop46's customer model is **Elm with distribution**. Pure handler functions (`request × kv → response × cmds`); explicit Cmd-shaped side effects via `webhook.send` and `email.send`; Sub-shaped reactive intake via triggers (kv-write subscriptions), callback handlers (webhook-result subscriptions), and SSE (server-pushed events to client). The combination is **distributed Elm ports** — typed channels between pure-functional handlers and the imperative world.
 
-This isn't just a metaphor. The architectural claim is: real-world reactive applications can be expressed in Loop46's pure-functional handler model *without escape hatches*, because every imperative concern (HTTP I/O, time, retries, browser updates, third-party integrations) has a port-shaped primitive. The combination of webhook + callback + SSE + bearer-mediated cross-origin auth is what makes the model complete enough that customers don't reach for an escape hatch.
+This isn't just a metaphor. The architectural claim is: real-world reactive applications can be expressed in Loop46's pure-functional handler model *without escape hatches*, because every imperative concern (HTTP I/O, time, retries, browser updates, third-party integrations) has a port-shaped primitive.
 
-**What this unblocks for launch**: the full third-party integration story. Customers integrate with Stripe, Twilio, GitHub, AWS, etc. through these ports without any pure-functional escape hatch. Loop46-the-platform dogfoods the same pattern: file-server and log-server (§10.13) become pseudo-third-party services that admin's editor and runtime talk to via bearer-authed HTTP, with deploy notifications and live UI updates flowing back through webhook + SSE.
+**Customer third-party auth toolkit**:
+- **Stored keys**: customer puts API tokens in kv (`kv.set("stripe_secret", "sk_live_...")`).
+- **Arbitrary headers**: `webhook.send({ headers: { Authorization: "Bearer " + kv.get("stripe_secret") } })` covers Bearer, API-Key, custom-header.
+- **HMAC per-request signing**: `crypto.hmacSha256(key, canonicalRequest)` covers AWS SigV4, Twilio, Stripe webhook verification, etc.
+- **OAuth refresh flows**: refresh token in kv; on-401 callback handler mints fresh access token via `webhook.send`; new access_token written back to kv. ~30 lines of customer JS, no new primitive.
 
-**Customer third-party auth toolkit** (orthogonal to editor auth — different surface, different primitives):
-- **Stored keys**: customer puts API tokens in kv (`kv.set("stripe_secret", "sk_live_...")`); operator-config'd or end-user-supplied via signup forms.
-- **Arbitrary headers**: `webhook.send({ headers: { Authorization: "Bearer " + kv.get("stripe_secret") } })`. Covers Bearer (Stripe / GitHub PAT / Slack / Resend), API-Key, custom-header.
-- **HMAC per-request signing**: `crypto.hmacSha256(key, canonicalRequest)` covers AWS SigV4, Twilio request-signature verification, Stripe webhook verification, etc.
-- **OAuth refresh flows**: refresh token in kv; on-401 callback handler mints fresh access token via `webhook.send` to the OAuth provider's token endpoint; new access_token written back to kv. ~30 lines of customer JS, no new primitive.
+**Audit gap-fills** (add when concrete demand surfaces, not pre-emptively):
+- `crypto.base64Encode(Uint8Array) → string` and `crypto.base64Decode(string) → Uint8Array`. Twilio basic-auth needs it; QJS-ng has no built-in `btoa/atob`. ~30 lines (Zig native via `std.base64`).
+- `crypto.hmacSha1(key, data) → hex`. AWS SigV2 (legacy), Twilio request signing. ~10 lines, mirrors `hmacSha256`.
+- **Deferred**: RSA/ECDSA signing (GitHub Apps, Google service accounts, Apple Push). Bigger surface; HMAC-signed JWTs cover a meaningful subset.
 
-**Audit gap-fills** (small primitives to add when concrete demand surfaces — not pre-emptively):
-- `crypto.base64Encode(Uint8Array) → string` and `crypto.base64Decode(string) → Uint8Array`. Twilio basic-auth (`Basic base64(sid:token)`) needs it; many APIs return base64 signature material. QJS-ng has no built-in `btoa/atob`. ~30 lines (Zig native using `std.base64`).
-- `crypto.hmacSha1(key, data) → hex`. AWS SigV2 (legacy), Twilio request signing on TwiML callbacks. ~10 lines, same shape as the existing `hmacSha256`.
-- **Deferred**: RSA/ECDSA signing (GitHub Apps, Google service accounts, Apple Push). Bigger surface; HMAC-signed JWTs (which our stack already handles via hmacSha256 + base64) cover a meaningful subset. Add when a customer asks.
+**Editor auth (dashboard-internal)** is orthogonal to the customer third-party auth toolkit — the cookie-to-bearer flow only makes sense for clients that *have* a Loop46 cookie session. The flow specifics (`/v1/files-token` endpoint, HMAC-signed bearer, 5-minute TTL, files-server-side validation without admin round-trip) live in `docs/files-server-plan.md` §11.4.
 
-**Editor auth (dashboard-internal; does NOT generalize to third parties)**:
-- Editor's session lives in the existing HttpOnly cookie set by `/v1/auth` or `/v1/login`.
-- For cross-origin calls to file-server / log-server, editor exchanges its cookie for a short-lived bearer via a new `GET /v1/files-token` endpoint on admin. Admin signs the bearer (HMAC over `session_opaque || expiry_ms`, with a shared signing secret operator-provisioned via `--bootstrap-kv files_token_signing_secret=...`).
-- File-server validates the bearer locally — same shared secret, same HMAC verification. **No round-trip to admin per request.**
-- Bearer TTL: 5 minutes. Editor refreshes transparently on 401 by re-calling `/v1/files-token`.
-- Logout invalidates the session row in admin's kv; existing bearers continue to work until they expire (≤5 min). Acceptable revocation latency for a development tool; tighten if it ever matters by including `session_revoked_at_ms` in the signed token and re-checking on file-server.
+### 10.15 `analytics.track` and `metrics.*` — speculative, post-1.0
 
-**Why this isn't generalized to customer third-party auth**: the cookie-to-bearer flow only makes sense for clients that *have* a Loop46 cookie session — i.e., the dashboard. Stripe / GitHub / AWS don't have access to that cookie; customers' integrations with them use the kv-stored-keys + arbitrary-headers + crypto-signing toolkit above. The two paths are orthogonal and don't share API surface beyond `webhook.send` itself.
+Two future observability primitives are explicitly held back per `feedback_compose_from_primitives.md` ("every primitive added is forever — defer the dedicated API until concrete customer demand"):
 
-**Deploy notification**: editor orchestrates v1. After committing a deploy on file-server, the editor receives the new manifest hash in the response; it then POSTs that hash to admin (`POST /v1/internal/deploy-applied`) which updates `tenant_files_map.current_deployment_id` and fires an SSE event for any listening dashboard sessions. File-server-pushes-to-worker is left as a v2 option — useful when CLI deploys land that don't go through the editor.
+- **`analytics.track(event)`** — fire-and-forget bulk-batched event emit into an OLAP-shaped sink. Distinct from `webhook.send` (request/response with retry-to-DLQ); same architectural family (structured data via a port), different ergonomics. Two-tier durability sketch: `best_effort` (in-memory buffer, periodic batch flush) and `transacted` (commits in the originating writeset, same machinery as `webhook.send`'s outbox). North-star claim worth recording: logs would become a specific case of this primitive once it exists.
+- **`metrics.*`** — pre-aggregated counters / gauges / histograms flushed to a TSDB push gateway. Distinct from `analytics.track` because aggregation happens in worker memory, not per-event storage. Cardinality guardrails (per-metric label cap, UUID-shape detection on label values) would be a real differentiator over Prometheus / OpenTelemetry SDKs.
 
-**Pre-launch implications**:
-- §10.13 sequencing returned to post-1.0 with the beta-first reframing later 2026-04-30 — see §10.13's updated Sequencing note.
-- The customer third-party-auth story becomes documented + audited — operators can promise customers "integrate with any HTTP API using webhook.send + crypto.\*."
-- The ports/commands framing becomes the documentation north star for the customer-facing handler model. PLAN §1 / §2 audience descriptions update accordingly.
+**Both are post-1.0.** v1 customers compose: `webhook.send` to their OLAP / TSDB of choice for events and metrics; the existing logs surface (`/_system/log/*`) for request-level data. Workable, not great. The dedicated primitives become the answer when (a) concrete customer demand for high-volume custom observability surfaces and (b) operator-deployed companion services (`loop46-olap`, `loop46-tsdb`) exist as the receivers. Those probably co-arrive — the receiver is what motivates the primitive; the primitive is what makes the receiver usable.
 
-**Order** (each row is its own work-window, several PRs):
-1. **SSE primitive** (Phase 11). Without it the post-save / deploy-confirmation loop has nowhere to land.
-2. **`crypto.base64Encode/Decode` + `crypto.hmacSha1`** if any pre-launch customer integration needs them. Audit the in-flight customer integrations before launch.
-3. **Bearer-token issuance** in admin's JS (`/v1/files-token`) + HMAC-signed-bearer validation in file-server. Operator provisions `files_token_signing_secret` via `--bootstrap-kv`.
-4. **Editor switches** to direct-to-file-server bearer-authed calls (parallel with the existing /_system/files/* proxy during migration).
-5. **Editor orchestrates deploy**: after file-server commit, POST manifest hash to admin. Admin updates state, fires SSE.
-6. **Drop the worker proxy + in-process file-server thread.** File-server runs as separate operator-deployed process. Update PLAN §10.13's "what deletes" list as actually-deleted.
-7. **Same shape for log-server**, slightly easier (query-only, latency-tolerant, no deploy-notification path).
+**Launch pitch already works without these.** Tape replay (§10.12) is the wedge: "click any 500, step through it in your browser DevTools or your editor via DAP." Events + metrics complete the three-layer observability story (events / metrics / tapes ≈ logs / metrics / traces, with replay replacing sampled traces) but the wedge sentence stands without them.
 
-### 10.15 `analytics.track` primitive: structured-event emit with variable durability (decided 2026-04-30)
-
-**Framing**: customer-facing primitive for "record that this happened" — distinct from `webhook.send` because the *intent* is fire-and-forget bulk-batched ingest into an OLAP-shaped sink, not request/response with retry-to-DLQ. Same architectural family (structured data going somewhere via a port), different ergonomics. Trying to merge them into one primitive muddles the customer mental model.
-
-| | `webhook.send` | `analytics.track` |
-|---|---|---|
-| Intent | Call this API, react to the result | Record that this happened |
-| Delivery | Per-event HTTP call with `onResult` callback | Batched bulk insert |
-| Durability | At-least-once with retry-to-DLQ | Variable (best-effort default; transacted opt-in) |
-| Receiver | Anything HTTP | OLAP-shaped (columnar, append-only) |
-| Volume profile | Low-to-medium (3rd-party API rate limits) | High (every page view, every kv mutation) |
-
-**Two durability tiers** (third middle tier deliberately omitted — keep API simple):
-
-- **`durability: "best_effort"` (default)** — in-memory buffer per worker, periodic flush (every N events or M ms) into a centralized batch store, batched bulk-insert to OLAP destination on a slower tick. Drops events on crash before flush; drops events on backpressure. The right tier for ~all high-volume analytics: page views, click events, performance probes, request logs. Volume is high, individual loss is acceptable, batching is essential.
-- **`durability: "transacted"`** — event commits in the same writeset as the kv changes that produced it. Mirror into a per-tenant `_analytics_outbox/{id}` row; drainer ships them to OLAP with at-least-once semantics (same shape as `webhook.send`'s outbox). For events that *must* match kv state: "user_signup_completed", "purchase_recorded", "subscription_started." Lower volume by definition (composes with kv writes), higher cost per event, no loss.
-
-**Architecture**:
-
-```
-handler → analytics.track(event) → per-tenant in-memory buffer
-                                       ↓ (flush every N events or M ms)
-                                   centralized batch store (events.db, leader-local)
-                                       ↓ (batch tick: every K seconds, drain N rows)
-                                   OLAP destination (Loop46-OLAP service or external)
-
-handler → analytics.track(event, {durability:"transacted"})
-                                       ↓ (same writeset as kv writes)
-                                   _analytics_outbox/{id} per tenant
-                                       ↓ (drainer, same machinery as webhook.send)
-                                   OLAP destination
-```
-
-The "centralized batch store" is leader-local SQLite (à la `_webhooks.db` in §3 Phase 5.5d). On leader failover, the new leader scans tenants for any in-flight buffered events that need to ship; idempotency on event id (a 64-hex random) makes recovery safe across crashes.
-
-**Logs become a specific case** of this primitive. Once `analytics.track` exists, the platform itself emits a log event per request with `durability: "best_effort"` — automatic capture, same way the platform automatically writes the existing log buffer today. The current bespoke log pipeline (per-tenant `log.db`, batch propose to raft, query API at `/_system/log/*`) collapses into "the platform is a customer of `analytics.track`." Logs and customer analytics flow through the same machinery, end up in the same OLAP destination, get queried the same way. Significant code simplification — `src/log_server/` deletes once log queries become OLAP queries.
-
-**The OLAP destination is the §10.13 receiver shape.** `analytics.track` co-arrives with **Loop46-OLAP-as-pseudo-third-party**: an operator-deployed companion binary (`loop46-olap`) that consumes batched event streams from loop46 workers and stores them columnarly (DuckDB embedded in v1 most likely; ClickHouse-shape if scale demands it later). Customer's handler queries via `webhook.send` with bearer auth — same shape as Stripe, same shape as files-server. Operator can swap loop46-olap for ClickHouse Cloud / Tinybird / BigQuery without customers noticing — destination URL is config.
-
-**Sequencing**: post-launch. For v1, customers who want analytics can:
-- Use `webhook.send` to fire individual events to their OLAP destination (works, expensive at high volume, no batching).
-- Use the existing logs surface for request-level data (works, captured automatically, queryable via `/_system/log/*`).
-
-Neither is *great* but both are *workable* and unblock launch. The new primitive becomes the answer when (a) customer demand for high-volume custom analytics surfaces, and (b) loop46-olap or operator-config'd external OLAP exists as the receiver. Those two probably co-arrive — the OLAP service is what motivates the primitive; the primitive is what makes the OLAP service usable.
-
-**The north-star this locks in**: don't accidentally build N independent batched-event pipelines. Logs, customer analytics, future audit-event streams, future trigger-fire logging — all of them flow through `analytics.track` with the appropriate durability tier. Future-us shouldn't reinvent the log pipeline mechanism for "this new kind of structured event"; should add a new event type and emit it via the existing primitive.
-
-### 10.16 `metrics.*` primitive: aggregated time-series observability (decided 2026-04-30)
-
-**Framing**: distinct primitive shape from `analytics.track` (§10.15) because the *delivery characteristics* differ in a way that wants different infrastructure. Events are discrete records; you store each one and query later. Metrics are pre-aggregated *in worker memory* — counter increments accumulate locally, periodic flush ships only the *aggregate state* (label-set → numeric value) to a TSDB push gateway. A handler doing 1M counter increments per second produces zero per-event storage; just an in-memory hashmap that flushes a few hundred (label-set, value) pairs every 10s. The same volume through `analytics.track` would be 1M batch-store rows per second — possible but profligate.
-
-**API shape** (matches industry-standard TSDB metric types):
-
-```js
-// Counter: monotonically increasing
-metrics.inc("http_requests_total", { path: "/foo", method: "GET" });
-metrics.inc("payment_failed_total", { reason: "card_declined" }, 3);  // by N
-
-// Gauge: arbitrary current value
-metrics.set("queue_depth", 47);
-
-// Histogram / timing: observe a numeric value into bucketed buckets
-metrics.observe("request_duration_ms", 123, { path: "/foo" });
-```
-
-**Architecture**:
-
-```
-handler → metrics.inc/set/observe → in-memory accumulator (per worker)
-                                       ↓ (flush every 10-60s)
-                                   per-tenant snapshot of (metric_name, label_set) → value
-                                       ↓ (push to TSDB receiver)
-                                   TSDB destination (Loop46-TSDB service or external Prometheus/Datadog)
-```
-
-The accumulator is just a hashmap keyed on `(metric_name, sorted_labels)` → counter / gauge / histogram bucket array. Per-worker (no cross-worker aggregation in v1; TSDB receiver merges). On worker crash before flush: counter increments from the last flush window are lost. Acceptable because (a) metrics are inherently lossy at high frequency, and (b) the next flush picks up where the new accumulator starts.
-
-**Cardinality guardrails — a real Loop46-specific differentiator.** The most common metrics-system disaster is unbounded label cardinality (`metrics.inc("user_action", { user_id: "..." })` with N users → N distinct time-series → TSDB tips over). The platform should enforce limits the standard libraries don't:
-- **Per-metric label cardinality cap** (e.g., 100 distinct label-sets per metric). New label combinations beyond the cap get dropped + a `metrics_cardinality_dropped_total` counter increments.
-- **UUID-shape detection on label values**. If a label value matches `/^[0-9a-f]{8}-[0-9a-f]{4}-...$/` or `/^[0-9a-f]{32,}$/`, reject the increment with a thrown JS error in dev mode and a silent drop + counter in prod. (Customer is using a metric where they should be using `analytics.track`.)
-- **Documentation pattern**: high-cardinality observation belongs in `analytics.track` (one row per request, query later); aggregated observation belongs in `metrics`. The error message points to the right primitive.
-
-This kind of guardrail typically takes a year of operator pain to land; building it in from day one is a real value-add over Prometheus / OpenTelemetry SDKs that just accept whatever labels you give them.
-
-**The receiver**: TSDB-as-pseudo-third-party, parallel to OLAP-as-pseudo-third-party (§10.15). Either an operator-deployed companion (`loop46-tsdb` binary, embedded VictoriaMetrics or similar) or external (Prometheus push gateway, Datadog metrics API, Grafana Cloud). Same architectural shape as everything else.
-
-**The three-layer observability story this completes**:
-
-| Layer | Primitive | Question it answers | Storage shape | Loop46-specific note |
-|---|---|---|---|---|
-| **Events** | `analytics.track` (§10.15) | "What discrete things happened?" | OLAP (columnar, append-only) | Logs are a specific case |
-| **Metrics** | `metrics.*` (this section) | "How is the system performing?" | TSDB (timestamp + label-set → numeric) | Cardinality guardrails enforced at write |
-| **Tapes** | Tape capture (existing, PLAN §10.7-10.12) | "What exactly happened on *this specific* request?" | Per-request blob, content-addressed | Replay in your IDE (DAP attach via `loop46 replay`) or your browser's DevTools — the killer feature |
-
-This maps onto industry-standard "logs + metrics + traces" but with Loop46-specific framing: logs collapse into events (broader); metrics gets cardinality guardrails (Prometheus doesn't); traces become full replay (Honeycomb-style sampled traces become per-request reproducible debug sessions).
-
-**Sequencing**: post-launch, alongside the other §10.13/§10.14/§10.15 detach work. For v1, customers with metrics needs use webhook.send to push to Datadog / their TSDB of choice (works, expensive at high volume, no aggregation). Same compromise as analytics.track: workable for first users, real primitive lands when the receiver service exists and the volume justifies it.
-
-**The pitch this enables for launch positioning**: "Loop46 ships built-in observability — events, metrics, and *full per-request replay*. Other platforms give you logs + a sampled trace viewer; we give you the actual reproducer." That's a sentence that converts. Pre-launch the metrics + analytics.track primitives don't exist yet, but **tape replay does** (the architecture is built; needs the browser page + DAP CLI per §10.12). The launch story can already say "click any 500 in your logs, hit replay (browser) or `loop46 replay <id>` (terminal + your editor), step through it in your usual debugger" — and *that* is the wedge that nobody else has.
-
-### 10.17 Launch sequencing: lead with replay, two-audience framing locked in (decided 2026-04-30)
+### 10.16 Launch sequencing: lead with replay, two-audience framing locked in (decided 2026-04-30)
 
 **Two audiences served by one product**, both motivating the build from day one:
 
@@ -1730,7 +1435,7 @@ The framings differ but the product is identical: **Story 1 hears "ship in minut
 
 **Tape replay is the wedge.** Every other capability has a competitor that does it better — Cloudflare Workers is faster, Vercel has slicker DX, Supabase is more familiar (Postgres-shaped), Firebase has the brand. None of them can match **per-request browser-DevTools replay**. The pure-functional handler choice + tape capture for all non-determinism + the dashboard replay page (§10.12) is the combo that uniquely enables this. Without replay shipped at launch, the differentiation pitch is hand-wavy ("we capture deterministic tapes"); with it shipped, the pitch is concrete ("click any 500, debug it"). That sentence is the difference between "interesting weird platform" and "I have to try this."
 
-**Sequencing — beta-first launch (decided 2026-04-30).** Open beta with Story 1 scope ~3-5 weeks from this decision; 1.0 adds Story 2 scope another ~9-13 weeks later. Beta is **web-only, free-tier-only, no CLI**. See §10.18 for beta operational specifics (data-continuity promise, free-tier caps, banner, feedback channel, no-CLI positioning).
+**Sequencing — beta-first launch (decided 2026-04-30).** Open beta with Story 1 scope ~3-5 weeks from this decision; 1.0 adds Story 2 scope another ~9-13 weeks later. Beta is **web-only, free-tier-only, no CLI**. See §10.17 for beta operational specifics (data-continuity promise, free-tier caps, banner, feedback channel, no-CLI positioning).
 
 **Beta launch path** (Story 1 audience):
 
@@ -1739,7 +1444,7 @@ The framings differ but the product is identical: **Story 1 hears "ship in minut
 3. **CodeMirror 6 syntax-highlighting upgrade for the Code tab** — replaces the existing `<textarea>` with a CM6 `EditorView`. Language modes by file extension: `.mjs` / `.js` → `@codemirror/lang-javascript`, `.html` → `@codemirror/lang-html`, `.css` → `@codemirror/lang-css`; default plain text. Line numbers + basic editing extensions. **Out of scope for beta**: autocomplete, lint, fold gutter, breakpoint gutter, draft workflow integration. Vendored bundle (no third-party CDN at runtime). ~½ week.
 4. **Phase 14 LLM skill file** (`docs/skills/loop46.md`) — AI-assisted Loop46 coding. Without it, LLMs default to imperative `await fetch()` patterns that don't compile. ~1 week.
 5. **Story 1 leaderboard example tenant** — the literal Firebase-pain demo, 5 lines of handler + one HTML page. ~½ day. Pairs with the beta launch post.
-6. **Beta operational** — free-tier caps wired to existing rate limiter defaults, beta banner in dashboard, data-continuity promise visible at signup, feedback channel link, per-account storage cap enforcement. ~3-5 days. Detail in §10.18.
+6. **Beta operational** — free-tier caps wired to existing rate limiter defaults, beta banner in dashboard, data-continuity promise visible at signup, feedback channel link, per-account storage cap enforcement. ~3-5 days. Detail in §10.17.
 
 **Beta total**: ~5 weeks serialized; ~3 weeks with two-person parallelization (Phase 5 polish + replay page parallelize cleanly; CodeMirror upgrade lands alongside Phase 5 polish without coupling).
 
@@ -1775,7 +1480,7 @@ Phase 9 encryption at rest joins the 1.0 path only if B2B compliance demand surf
 
 **What's NOT in either beta or 1.0** (recorded so future-us doesn't second-guess):
 - §10.13 / §10.14 file-server + log-server detach + bearer-auth dogfooding. Multi-week refactor that makes the architecture purer but doesn't make the product more useful to a first user. **Post-1.0** when the dashboard-to-file-server path's in-process proxy starts hurting (it doesn't yet). With SSE shipping at 1.0, §10.14's prerequisite is satisfied — the detach is gated only on engineering bandwidth, not blocking primitives.
-- §10.15 / §10.16 `analytics.track` + `metrics.*` primitives. Their absence is workable (customers `webhook.send` to their OLAP / TSDB of choice). **Post-1.0** alongside the loop46-olap / loop46-tsdb pseudo-third-party companion services that motivate them.
+- §10.15 `analytics.track` + `metrics.*` primitives. Their absence is workable (customers `webhook.send` to their OLAP / TSDB of choice). **Post-1.0** alongside the loop46-olap / loop46-tsdb pseudo-third-party companion services that motivate them.
 - **SSE multi-worker fan-out + persistent buffering**. The 1.0 SSE is per-worker in-memory; cross-worker delivery and replay-after-reconnect (Last-Event-ID buffering) wait until usage exposes whether they actually matter. Single-worker setups (the most common Loop46 deployment shape at 1.0) are unaffected.
 - Phase 5.5 storage scalability (log batch offload, raft snapshot, centralized webhook subsystem). Matters when sustained production traffic forces it; not at beta or first-1.0 volumes.
 - **Phase 12 / 13 sim test framework + fixture lifecycle + worker dry-run**. Beta absorbs the bundle JSON shape, stubs library, and request body capture (§10.12); the Zig + QuickJS strict-determinism `ReplaySource` + sim test framework + fixtures wait. Post-1.0.
@@ -1792,7 +1497,7 @@ Phase 9 encryption at rest joins the 1.0 path only if B2B compliance demand surf
 
 All four variants are TRUE — they're not different products, they're different cuts of the same observation.
 
-### 10.18 Beta launch operational specifics (decided 2026-04-30)
+### 10.17 Beta launch operational specifics (decided 2026-04-30)
 
 Operational items required to open Loop46 beta to external Story 1 users. All small, all needed before the dashboard URL gets shared publicly.
 
@@ -1832,7 +1537,7 @@ Operational items required to open Loop46 beta to external Story 1 users. All sm
 - Data-continuity promise text in signup flow
 - End-to-end smoke test: signup → magic link via prod Resend → deploy starter via Code tab → trigger a 500 → click Replay → step through in browser DevTools
 
-Total: ~3-5 days, included in §10.17 beta launch path item 6.
+Total: ~3-5 days, included in §10.16 beta launch path item 6.
 
 ## 11. Rove-library principles audit (2026-04-21)
 
@@ -1903,7 +1608,7 @@ Not available:
 
 ### Auth / signup
 
-- **Magic link TTL 15 min, single-use.** A redeemed link 401s on replay.
+- **Magic link TTL 30 min, single-use.** A redeemed link 401s on replay. (Was 15 min in early drafts; bumped 2026-04-30 so click-late users land on the happy path — see §9 Phase 4 amendments.)
 - **Session cookie is `HttpOnly + Secure + SameSite=Lax`.** `Secure` requires HTTPS; localhost is treated as a secure context by modern browsers, but plain-HTTP non-localhost dev won't get the cookie. Use `curl -H 'Cookie: rove_session=...'` manually for HTTP-only dev.
 - **Signup without Resend key configured** → response body carries `magic_link` in-band so dev + CI smoke tests still work. When a key IS configured, `magic_link` is suppressed and the email is queued via outbox.
 - **Reserved instance names** rejected with 409: `admin`, `api`, `app`, `www`, `__admin__`, `auth`, `login`, `signup`, `logout`, `dashboard`, `static`, `system`, `public`, `root`, `mail`. Collisions on real signups also return 409 with the same body (no enumeration).
