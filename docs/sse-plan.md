@@ -1,4 +1,16 @@
-# SSE plan (Phase 11 build-out)
+# SSE plan (Phase 11 build-out) — SUPERSEDED
+
+> **This plan is superseded by `docs/sse-plan-v2.md`.** The original
+> design treated SSE events as durable state in customer `app.db`
+> under `_events/{sid}/{seq}`, replicated through raft, with a
+> retention sweep + reconnect catch-up window. v2 collapses the
+> entire storage layer in favor of response-attached emit buffers
+> shipped to a centralized sse-service singleton on its own
+> subdomain (`sse.{public_suffix}`); reconnect catch-up becomes a
+> small in-memory ring cache + sentinel signal. Read v2 for current
+> direction; this doc is kept for the historical reasoning on
+> session-id assignment and cross-tenant isolation, both of which
+> carry forward.
 
 This document expands `docs/PLAN.md` §2.12 + Phase 11 into an
 implementable plan. It assumes the framing already locked in PLAN
