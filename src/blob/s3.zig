@@ -51,6 +51,14 @@ pub const Config = struct {
     region: []const u8,
     /// Bucket name. Path-style: appears as the first URI segment.
     bucket: []const u8,
+    /// Optional key prefix prepended to every operation. Lets one
+    /// shared bucket host many tenants (each with its own prefix
+    /// like `{instance_id}/file-blobs/`) without mutating
+    /// `validateKey` to permit slashes inside the user-supplied
+    /// hash. Empty = no prefix. The prefix may contain slashes
+    /// (e.g. `{tenant}/file-blobs/`); the SigV4 path canonicalizer
+    /// preserves them.
+    key_prefix: []const u8 = "",
     /// AWS access key id.
     access_key: []const u8,
     /// AWS secret access key. Never sent on the wire.
@@ -190,17 +198,21 @@ pub const S3BlobStore = struct {
         body: []const u8,
         body_allocator: std.mem.Allocator,
     ) !HttpResp {
-        // Build the URL: scheme://endpoint/bucket/key
+        // Build the URL: scheme://endpoint/bucket/{prefix}{key}
         const scheme = if (self.config.use_tls) "https" else "http";
         const url = try std.fmt.allocPrint(
             self.allocator,
-            "{s}://{s}/{s}/{s}",
-            .{ scheme, self.config.endpoint, self.config.bucket, key },
+            "{s}://{s}/{s}/{s}{s}",
+            .{ scheme, self.config.endpoint, self.config.bucket, self.config.key_prefix, key },
         );
         defer self.allocator.free(url);
 
         // Path piece used by SigV4 canonicalization.
-        const path = try std.fmt.allocPrint(self.allocator, "/{s}/{s}", .{ self.config.bucket, key });
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/{s}/{s}{s}",
+            .{ self.config.bucket, self.config.key_prefix, key },
+        );
         defer self.allocator.free(path);
 
         // Host piece: SigV4 wants the literal `Host:` value, which

@@ -621,6 +621,25 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(h2_stream_test);
 
+    // s3-blob-smoke: exercise rove-blob's S3BlobStore against any
+    // S3-compatible endpoint (default-tested against OVH). Pure
+    // round-trip — no rove server, no raft, no h2 stack.
+    const s3_blob_smoke_mod = b.addModule("s3-blob-smoke", .{
+        .root_source_file = b.path("examples/s3_blob_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    s3_blob_smoke_mod.addImport("rove-blob", blob_mod);
+    s3_blob_smoke_mod.link_libc = true;
+    s3_blob_smoke_mod.linkSystemLibrary("ssl", .{});
+    s3_blob_smoke_mod.linkSystemLibrary("crypto", .{});
+
+    const s3_blob_smoke = b.addExecutable(.{
+        .name = "s3-blob-smoke",
+        .root_module = s3_blob_smoke_mod,
+    });
+    b.installArtifact(s3_blob_smoke);
+
     // h2 TLS test
     const h2_tls_mod = b.addModule("h2-tls-test", .{
         .root_source_file = b.path("examples/h2_tls_test.zig"),
