@@ -79,6 +79,18 @@ The cost: "call an external API and use the result inline" is impossible. Custom
 
 ### 2.4 File API + static serving
 
+> **See `docs/files-server-plan.md`** for the implementable expansion:
+> files-server moves to `files.{public_suffix}` with its own TLS,
+> manifest moves from per-tenant `files.db` to S3
+> (`tenants/{id}/deployments/{dep_id}.json`), runtime release signal is
+> a `_deploy/active` kv marker observed via the existing
+> writeset-scan path (no polling), worker reads bytecodes/statics on
+> demand from S3 with content-hash ETags + Cloudflare in front. Worker
+> drops the entire `/_system/files/*` proxy and the `files.db` per-
+> tenant store. The §2.4 routing/cache/path-validation/size-cap rules
+> below are unchanged and carry forward to the new layout.
+
+
 #### Storage layout
 
 Extends the content-addressed scheme already in `src/files/root.zig:14`:
@@ -366,6 +378,17 @@ A dedicated `batch.*` primitive (background drainer, progress tracking, cascade-
 
 ### 2.6 Webhooks (outbox pattern)
 
+> **See `docs/webhook-server-plan.md`** for the implementable
+> expansion: per-tenant `_outbox/{id}` becomes the transactional
+> handoff point only; a dedicated webhook-server process owns a
+> cluster-wide `webhooks.db` (raft-replicated via new envelope types
+> 4 + 5 + 6) for all in-flight delivery state. Drainer shrinks to a
+> safety net (re-POST orphans). Webhook-server has no public
+> subdomain — internal HTTP only, customer URLs reached via outbound
+> HTTPS. The §2.6 customer-facing API + at-least-once-with-
+> X-Rove-Webhook-Id contract carry forward unchanged.
+
+
 The only path to the outside world. Directly inspired by Elm's `Cmd` model.
 
 #### API
@@ -522,6 +545,17 @@ Magic-link emails go through this same primitive — dogfood from day one.
 
 ### 2.9 Logs + observability
 
+> **See `docs/logs-plan.md`** for the implementable expansion:
+> worker batches log records in memory and PUTs directly to S3 as
+> `.ndjson.gz` payloads + `.idx.json` sidecars (no raft for the log
+> path). A standalone log-server on `logs.{public_suffix}` polls S3
+> sidecars, maintains a local SQLite `log_index.db`, serves dashboard
+> queries with JWT-handoff auth. Drops envelope type 1 (log_batch),
+> per-tenant `log.db` files, and the worker's `/_system/log/*` proxy.
+> The §2.9 semantics below (deployment_id tagging, parent_request_id,
+> tape sampling, TTL) carry forward.
+
+
 - **Every request log tagged with `deployment_id`.** Enables "all 12 failures were on deployment 42" debugging.
 - No synthetic "deploy event" in the stream — the per-request tag is more accurate and doesn't mislead about the transition window.
 - Trigger fires + webhook attempts + callback invocations log with `parent_request_id` for nested-thread display in the dashboard log view.
@@ -550,6 +584,21 @@ Designed as a general primitive from day one — also the knob used to different
 - **Future**: `loop46 kv get/put`, `loop46 logs tail`, `loop46 init`, `loop46 dev` (local mini-rove).
 
 ### 2.12 Server-sent events (live UI updates)
+
+> **See `docs/sse-plan-v2.md`** (which supersedes the older
+> `docs/sse-plan.md`) for the implementable expansion: the original
+> "rows in customer's `app.db` under `_events/{sid}/{seq}`" model is
+> replaced with response-attached emit buffers shipped fire-and-
+> forget to a centralized sse-service singleton on
+> `sse.{public_suffix}`. Sse-service holds all EventSource
+> connections + a small per-(tenant, sid) ring cache for reconnect
+> catch-up; cache eviction emits a `rove:resync` sentinel telling
+> the client to refetch. Auth via JWT handoff from the customer's app
+> domain (preserves `__Host-` cookies). The §2.12 customer-facing API
+> (`events.emit`, session id semantics, cross-tenant isolation
+> guarantees) carries forward; the storage / pump / sweep mechanics
+> below are fully replaced.
+
 
 The companion to webhooks (§2.6): handlers fire events from inside their transaction, connected clients receive them over a long-lived SSE stream. Same outbox/replay/determinism story; same "pure handler + declarative side effects" model. Different direction — webhooks push out to the world, events push out to *this customer's clients*.
 
@@ -640,6 +689,28 @@ New collection in js-worker: `events_connections`. Components: `EventsSession { 
 - Per-message client acknowledgment (would require WS).
 - Binary message types (SSE is text-only).
 
+### 2.13 Raft snapshot strategy
+
+> **See `docs/snapshot-plan.md`** for the implementable expansion.
+
+Per-tenant snapshot indices with always-refresh-all-tenants
+discipline. Snapshots transport via S3 (per-tenant `app.db` files
+captured via `VACUUM INTO`, content-addressed in S3, manifest
+references previous-snapshot files for unchanged tenants). No global
+write-pause during capture; the always-refresh property prevents
+dormant tenants from pinning the willemt compaction floor. Followers
+load by downloading from S3 in parallel and atomic-renaming into
+`data_dir`. Per-tenant `_apply_state` table on each `app.db` filters
+duplicate applies during catch-up. Replaces the row-level delta
+protocol that exists today (only meaningful in `.kv` apply mode,
+which loop46 doesn't use).
+
+The decision was driven by the worker-kv-path north star: keep the
+worker fast, consistent, and uninterrupted. Pause-and-snapshot was
+considered and rejected because even a few-seconds cluster-wide
+write pause is incompatible with that goal at the "many tenants per
+node" density.
+
 ## 3. Build plan (ordered phases)
 
 **Cross-cutting for every phase**:
@@ -711,6 +782,22 @@ req/s × one tenant: ~43 GB/day into `raft.log.db` alone, doubled by the
 per-tenant `log.db` apply. Captured bodies make this ~100× worse if they
 land in raft. The cluster lasts days or weeks before disk pressure forces
 ops intervention.
+
+> **The work items below are now elaborated in dedicated sub-plans.**
+> `docs/logs-plan.md` covers item 1 (logs leave raft entirely, go S3-direct
+> with a sidecar-indexed log-server on `logs.{public_suffix}`).
+> `docs/snapshot-plan.md` covers item 3 (per-tenant snapshot indices with
+> S3 transport — replaces the original "raft snapshot + log compaction" with
+> a no-pause file-shipping model).
+> `docs/webhook-server-plan.md` covers item 4 (cluster-wide raft-replicated
+> `webhooks.db` with a dedicated webhook-server process — promotes the
+> "leader-local in v1" position to "raft-replicated from day one" because
+> leader-local recovery requires the per-tenant scan we're trying to avoid).
+> `docs/files-server-plan.md` covers the related move of files-server to
+> its own subdomain with manifest-in-S3 (not directly listed below but
+> follows the same architectural direction).
+> Item 2 (tape body capture) is straightforward and remains an
+> implementation detail rather than a separate plan.
 
 Three coupled work items, all following the existing file-blob pattern
 (bytes on `BlobStore`, raft replicates only the manifest):
@@ -941,6 +1028,23 @@ Resolved items moved to §10. Open items:
 - `vendor/README.md` — dependency posture (no network installs, everything vendored). Informs Phase 9 SQLCipher-vs-VFS decision.
 - `web/admin/` — existing admin UI skeleton. Will be largely rewritten in Phase 5 against the new auth + file API.
 
+### Sub-plans expanding sections of this document
+
+- `docs/files-server-plan.md` — §2.4 expansion: own subdomain,
+  manifest in S3, marker-driven release, async load + atomic
+  pointer swap, Cloudflare-fronted static serving.
+- `docs/logs-plan.md` — §2.9 expansion: S3-direct batches with
+  `.idx.json` sidecars, log-server on `logs.{public_suffix}`.
+- `docs/sse-plan-v2.md` — §2.12 expansion (supersedes
+  `docs/sse-plan.md`): centralized sse-service singleton on
+  `sse.{public_suffix}`, response-attached emit buffers,
+  `rove:resync` sentinel for cache eviction.
+- `docs/webhook-server-plan.md` — §2.6 + Phase 5.5 item 4
+  expansion: cluster-wide raft-replicated `webhooks.db` with a
+  dedicated webhook-server process.
+- `docs/snapshot-plan.md` — §2.13 + Phase 5.5 item 3 expansion:
+  per-tenant snapshot indices, S3 transport, no global write-pause.
+
 ## 7. Superseded decisions (do not re-propose)
 
 The following were explored during the 2026-04-17 design conversation and ruled out. Captured here so future sessions don't re-derive them.
@@ -958,6 +1062,14 @@ The following were explored during the 2026-04-17 design conversation and ruled 
 - **Strict FIFO ordering guarantees for webhooks.** Rejected: impossible to deliver meaningfully across destinations with different latencies; customers who need ordering chain via callbacks.
 - **Fan-in of multiple webhooks into one callback.** Rejected for v1. Customers build saga patterns by hand with triggers/callback-chaining.
 - **Auto-resend on expired-but-recent magic-link click** (15-min validity + 15-min grace window with `resend_grace_until_ns`, `magic_resend` rate-limit action, "we sent a fresh link" UI page). Rejected: trades a friendly page for an extra email round-trip that's strictly worse than just bumping the magic TTL. Replaced by 30-minute flat validity + an `email` URL hint on the signup form pre-fill for the 401-page case. Also avoids a name-squat amplification in the original design — the resend chain renews `pending/{name}` lifecycle, letting one signup hold a name for hours within the 3/hr per-email rate limit; flat TTL caps the reservation at 30 min.
+- **SSE rows in customer's `app.db` under reserved prefix `_events/{sid}/{seq}`**, replicated through raft envelope 0, with a per-tenant retention sweep + Last-Event-ID catch-up over the persisted rows. Rejected (2026-05): SSE is a notification channel, not a source-of-truth state store; the reserved-prefix storage entangled SSE state with customer kv writesets, raft replication, the markDirtyFromWriteset scan, and a 365-line retention sweep — for semantics that are explicitly losable and recoverable via replay. Replaced by `docs/sse-plan-v2.md`: centralized sse-service singleton, response-attached emit buffers, in-memory ring cache with sentinel-on-eviction.
+- **Log batches replicated through raft (envelope type 1) + per-tenant `log.db` apply on every node.** Rejected (2026-05): logs are best-effort and lossy by design (PLAN §2.9), don't need raft's strong durability, and forcing them through the raft log dominates cluster bandwidth at scale. Replaced by `docs/logs-plan.md`: per-node S3-direct batch upload + a single log-server process polling S3 to maintain a local SQLite index.
+- **Per-tenant `files.db` on every worker mirroring the manifest via raft envelope type 3.** Rejected (2026-05): worker-as-read-only-consumer model is cleaner. Replaced by `docs/files-server-plan.md`: manifest lives in S3, runtime release signal is a `_deploy/active` kv marker on the customer's app.db, worker reads on demand.
+- **Worker hairpin proxy `/_system/files/*` and `/_system/log/*`.** Rejected (2026-05): these subsystems should be on their own subdomains (`files.{public_suffix}`, `logs.{public_suffix}`), terminating their own TLS, with token-handoff auth from the customer's app domain. Worker stops mediating their traffic entirely. Per `docs/files-server-plan.md` and `docs/logs-plan.md`.
+- **Webhook subsystem leader-local in v1 with per-tenant `_outbox/*` scan recovery on leader change.** Rejected (2026-05): the per-tenant scan is exactly the cost we're trying to eliminate; replicating recovery state via raft from day one removes it. Replaced by `docs/webhook-server-plan.md`: cluster-wide `webhooks.db` raft-replicated via new envelope types 4/5/6.
+- **Pause-and-snapshot raft snapshot strategy** (briefly stopping all applies during VACUUM pass to capture every tenant's `app.db` at a single global raft index). Rejected (2026-05): contradicts the worker-kv-path north star — even a few seconds of cluster-wide write pause every snapshot interval is unacceptable at the "many tenants per node" density. Replaced by per-tenant snapshot indices with always-refresh-all-tenants discipline (`docs/snapshot-plan.md`). The slow-tenant pinning concern is mitigated by the always-refresh trick (dormant tenants get manifest-bookkeeping refresh without re-VACUUM).
+- **Static file serving via 302-to-S3 redirect (public bucket or pre-signed).** Rejected (2026-05): considered as a way to take the worker entirely out of the static bytes path, but Cloudflare in front already absorbs essentially all repeat traffic. The marginal further reduction isn't worth a per-deployment flag, public-bucket security model, CSP friction, or per-request HMAC signing. Worker proxies with hash ETag + immutable Cache-Control; Cloudflare does the heavy lifting.
+- **Polling `current.json` (or per-tenant `latest.json`) for files-server release detection.** Rejected (2026-05): adds per-tenant LIST/GET cost to every worker every interval. Replaced by `_deploy/active` kv marker observed via the existing `markDirtyFromWriteset` post-commit scan path — no polling, no new envelope type, marker rides through the customer kv writeset that the customer's deploy CLI writes.
 
 ## 8. Why this is a compelling product
 
