@@ -25,9 +25,15 @@ Stated end state:
   it; worker reads it. Raft envelope type 3 goes away.
 - **Bytecode + statics live in S3** (already true with
   `BLOB_BACKEND=s3`). Worker reads on cache miss.
-- **Atomic deployment switch is a single S3 object overwrite** of
-  `tenants/{id}/deployments/current.json`. Worker polls; on change,
-  loads the new manifest + bytecodes.
+- **Deploy and release are separate steps.** Files-server writing a
+  new manifest to S3 is the *deploy*. Activating it on workers is the
+  *release* — an explicit `_deploy/active = {target_dep_id}` write
+  through the customer's kv that rides existing raft replication.
+  Workers observe the marker via the same writeset-scan path SSE
+  uses (`markDirtyFromWriteset`), load the new manifest + bytecodes
+  asynchronously from S3, and atomically swap the active manifest
+  pointer when the load is complete. **No polling.** No new RPC
+  surface between files-server and worker. No new envelope type.
 - **Static files are served by the worker as a proxy with aggressive
   HTTP caching** (hash ETag + `immutable` Cache-Control). The
   "redirect to S3 URL" alternative is discussed and rejected as
@@ -54,32 +60,42 @@ Stated end state:
                   │  S3 bucket                                  │
                   │   tenants/{id}/blobs/{sha256_hex}           │
                   │   tenants/{id}/deployments/{dep_id}.json    │
-                  │   tenants/{id}/deployments/current.json     │
                   └─────────────────────────────────────────────┘
                                              ▲
-                                             │ poll current.json (5s)
-                                             │ GET on change: manifest + new blobs
+                                             │ GET (on release marker)
+                                             │ manifest + new blobs
                                              │
                                     ┌────────┴─────────┐
-                                    │     worker       │
-                                    │ (per-tenant      │
-                                    │  TenantFiles     │
-                                    │  cache, no       │
-                                    │  files.db, no    │
-                                    │  proxy)          │
-                                    └────────┬─────────┘
-                                             │ HTTPS
-                                             ▼
-                                    ┌─────────────────┐
-                                    │ end-user browser│
-                                    └─────────────────┘
+                                    │     worker       │       ┌──────────────┐
+                                    │ (per-tenant      │◀──────│ raft apply   │
+                                    │  TenantFiles     │ kv    │ envelope 0   │
+                                    │  with active +   │ marker│ (the release │
+                                    │  pending pointers│       │  signal)     │
+                                    │  no files.db,    │       └──────────────┘
+                                    │  no proxy)       │              ▲
+                                    └────────┬─────────┘              │
+                                             │ HTTPS                  │ kv.put
+                                             ▼                        │ _deploy/active
+                                    ┌─────────────────┐               │
+                                    │ end-user browser│       ┌───────┴──────┐
+                                    └─────────────────┘       │ admin call   │
+                                                              │ POST .../_   │
+                                                              │ admin/release│
+                                                              └──────────────┘
 ```
 
-S3 is the **only** coupling point between worker and files-server.
-Worker doesn't know the files-server exists; files-server doesn't
-know which workers are running. Both can be killed and restarted at
-will. (Same invariant we adopted for logs in
-`docs/logs-plan.md`.)
+Two coupling channels, neither of which involves direct
+worker↔files-server RPC:
+
+1. **S3** carries the bytes (blobs, manifests). Files-server writes;
+   worker reads.
+2. **Raft kv** carries the release signal (`_deploy/active`). The
+   admin call writes; the worker observes via the same
+   writeset-scan path SSE uses.
+
+Worker doesn't know files-server exists. Files-server doesn't know
+which workers are running. Both can be killed and restarted at will.
+(Same invariant we adopted for logs in `docs/logs-plan.md`.)
 
 ---
 
@@ -113,7 +129,6 @@ allow the admin origin (`app.{public_suffix}`).
 tenants/{tenant_id}/blobs/{sha256_hex}                  ← raw bytes
                                                           (source, bytecode, static)
 tenants/{tenant_id}/deployments/{dep_id:020d}.json      ← per-deployment manifest
-tenants/{tenant_id}/deployments/current.json            ← atomic pointer
 ```
 
 - `blobs/` is the existing `BlobBackend.openPerTenant` layout when
@@ -121,9 +136,15 @@ tenants/{tenant_id}/deployments/current.json            ← atomic pointer
   rewritten. No change.
 - `deployments/{dep_id:020d}.json` — one JSON file per deployment.
   Lexicographic sort = chronological. Listing the prefix gives
-  deployment history.
-- `deployments/current.json` — single small file with the active
-  deployment_id + integrity hash. Overwritten on each deploy.
+  deployment history; files-server's admin UI reads it via
+  `LIST tenants/{id}/deployments/` (cheap — typically a few hundred
+  entries per tenant under retention).
+
+**No `latest.json` or `current.json`.** The runtime pointer is the
+kv marker (§3.5); raft replication carries it to every node.
+Listing handles the operator's "what's been deployed?" question. A
+separate "latest pointer" file would be a redundant source of truth
+without earning its keep — see §10.6 for the tradeoffs considered.
 
 ### 3.2 `deployments/{dep_id}.json` shape
 
@@ -149,76 +170,196 @@ is referenced by hash. The worker can verify integrity (recompute
 sha256 of fetched bytes against the manifest hash) before promoting
 the new deployment.
 
-### 3.3 `deployments/current.json` shape
+### 3.3 Concurrent deploy protection
 
-```json
-{
-  "v": 1,
-  "deployment_id": 42,
-  "manifest_key": "tenants/acme/deployments/00000000000000000042.json",
-  "manifest_sha256": "abc...",
-  "switched_at_ms": 1730764800000
-}
+S3's strong read-after-write consistency (default since 2020-12 on
+AWS, default on OVH and R2) makes the manifest PUT atomic.
+
+Concurrent deploys racing for the same `dep_id` are guarded by S3's
+`PUT-if-not-exists` (`If-None-Match: *`, supported by AWS, OVH,
+Cloudflare R2, MinIO; documented as "S3 conditional writes").
+Files-server allocates the next deployment id by listing the
+`deployments/` prefix, picking max+1, and PUT-if-not-exists. On
+collision (another deploy already wrote that id), it retries with
+max+1 of the new listing. Bounded retry loop; in practice rare.
+
+This replaces today's `expected_parent_id` CAS that runs against
+`files.db`.
+
+### 3.5 `_deploy/active` kv marker (the release signal)
+
+The runtime "what should the workers run" pointer is a single key in
+the customer's `app.db`:
+
+```
+key:   _deploy/active
+value: {"v": 1, "target_deployment_id": 42, "set_at_ms": 1730764800000}
 ```
 
-Tiny (~200 bytes). Worker GETs this on every poll; the polling cost
-is one HEAD-equivalent per tenant per polling interval.
+- Reserved-prefix `_deploy/` (added to `reserved.zig` alongside
+  `_events/`, `_outbox/`, etc.). Customer JS cannot write it.
+- Written by the admin handler in response to a `POST .../_admin/release`
+  call. Replicates through raft envelope type 0 (the standard
+  customer kv writeset) — same machinery as every other kv write.
+- Workers observe new values via `markDirtyFromWriteset`-style scans
+  on the post-commit hook (existing pattern from SSE).
+- "Target" semantics: the value names the deployment_id the worker
+  *should* be running. The worker's TenantFiles tracks what it's
+  *currently* running (`active.deployment_id`). When target ≠ active,
+  a load is in flight or queued.
 
-### 3.4 Atomic switch
-
-S3's strong read-after-write consistency (default since 2020-12 on AWS,
-default on OVH and R2) makes the swap atomic from the worker's
-perspective: a single PUT replaces `current.json` in one shot. Workers
-that GET *before* the PUT see the old manifest; workers that GET
-*after* see the new. No partial state visible.
-
-For multi-step protection against a torn deploy (files-server crashes
-between writing `deployments/{dep_id}.json` and overwriting
-`current.json`): the manifest is uploaded **first**, then `current.json`
-is flipped. A crash mid-way leaves an unreferenced manifest in
-`deployments/`. Janitor pass collects them.
-
-For protection against concurrent deploys racing on `current.json`:
-S3's `If-Match: <etag>` conditional PUT (supported by AWS, OVH,
-Cloudflare R2, MinIO; documented as "S3 conditional writes") lets
-files-server CAS the swap. Two concurrent `POST /deploy` calls
-serialize: the loser sees the etag mismatch and either retries or
-returns 409. This replaces today's `expected_parent_id` CAS that runs
-against `files.db`.
+The marker IS the source of truth at runtime. `latest.json` is
+informational. Most of the time they match (deploy → release
+immediately); they can intentionally diverge for "uploaded but not
+released" workflows (canary deploys, scheduled rollouts).
 
 ---
 
 ## 4. Worker load path
 
-### 4.1 Polling
+### 4.1 Trigger: marker observation, not polling
 
-Each worker, per cached tenant, on its existing `refreshDeployments`
-tick (default 2s):
+Workers do not poll S3. The trigger to load a new deployment is an
+observed change to `_deploy/active` in the tenant's kv. The
+observation path mirrors the existing SSE pattern in
+`src/js/worker_dispatch.zig` (`events_pump.markDirtyFromWriteset`):
 
 ```
-1. GET tenants/{id}/deployments/current.json
-2. parse → {deployment_id, manifest_key, manifest_sha256}
-3. if deployment_id == cached.deployment_id: done (no work)
-4. GET manifest_key
-5. verify sha256(manifest_bytes) == manifest_sha256 (else log + skip)
-6. parse manifest → {files map}
-7. for each new bytecode_hash not in cache: GET tenants/{id}/blobs/{hash}
-8. atomically promote new manifest + bytecode cache
-9. update cached.deployment_id
+1. customer admin writes _deploy/active = {target: 42}  (via admin handler)
+2. writeset commits locally + proposes through raft
+3. worker (every node, every worker thread): post-commit hook
+   scans the just-committed writeset for keys under `_deploy/`
+4. if `_deploy/active` is in the set, parse the value, compare
+   target_deployment_id against TenantFiles.active.deployment_id
+5. if different and no matching pending load: kick off async load
 ```
 
-Step 1 is the hot path: one small GET per tenant per 2s. With S3
-charging per-request rather than per-byte, this is the dominant cost.
-A 5s interval with 1000 active tenants per node = 200 GETs/s/node;
-meaningful but well under any operator's budget. The interval is
-configurable; can also gate by tenant activity (only poll tenants
-with traffic).
+The hook is a 5-line scan; adds nothing measurable to commit latency.
+Quiet tenants impose zero S3 cost (no kv writes → no scan → no
+load). Active tenants only do S3 work when a release actually
+happens.
 
-Step 7 is amortized: a new deployment typically reuses 90%+ of the
-previous deployment's bytecodes (only the changed handler files have
-new hashes). Bytecode cache hit rate stays high across deploys.
+### 4.2 Async load + atomic pointer swap
 
-### 4.2 What goes away on the worker
+`TenantFiles` carries two manifest pointers:
+
+```zig
+const TenantFiles = struct {
+    active:  *TenantManifest,     // currently serving requests
+    pending: ?*PendingLoad,       // load in flight (if any)
+    ...
+};
+
+const TenantManifest = struct {
+    deployment_id: u64,
+    bytecodes:     StringHashMap([]u8),
+    statics:       StringHashMap(StaticEntry),
+    triggers:      []TriggerEntry,
+    source_hashes: StringHashMap([64]u8),
+    refcount:      Atomic(u32),    // see §4.3
+};
+
+const PendingLoad = struct {
+    target_deployment_id: u64,
+    next_manifest:        ?*TenantManifest,
+    progress: enum { fetching_manifest, fetching_blobs, ready, failed },
+    started_ns:           i64,
+};
+```
+
+Load is non-blocking. The worker spawns a one-shot OS thread (or
+posts a job to a small per-worker thread pool) that:
+
+```
+1. GET tenants/{id}/deployments/{target_dep_id:020d}.json
+2. parse → manifest
+3. for each bytecode_hash not already in active.bytecodes:
+       GET tenants/{id}/blobs/{hash}
+       (parallelizable; typically only changed files)
+4. allocate next_manifest, populate bytecodes / statics / triggers
+5. mark pending.progress = ready, post completion to a worker queue
+```
+
+The dispatch loop continues serving against `active` for the entire
+duration. On the next worker tick after `pending.progress = ready`,
+the worker:
+
+```
+1. take old = TenantFiles.active
+2. TenantFiles.active = pending.next_manifest
+3. TenantFiles.pending = null
+4. release(old)   ← refcount-aware free; see §4.3
+```
+
+The swap is a single pointer write, ordered against subsequent
+dispatches by the worker's single-threaded poll loop. No requests
+are blocked; no requests dispatched after the swap see the old
+manifest; no requests dispatched before the swap see the new.
+
+### 4.3 Manifest lifetime + safe free
+
+A request dispatched against `active` may take ms to complete; if the
+swap happens mid-request, the in-flight request still holds pointers
+into the old manifest's `bytecodes` slice (the JS context's loaded
+bytecode is borrowed, not copied). Freeing the old manifest at swap
+time would dangle.
+
+Discipline: refcount on `TenantManifest`. Each in-flight request
+that resolves a bytecode takes +1 on the manifest at dispatch start;
+releases on dispatch end (the existing per-request cleanup hook).
+The `active` slot itself holds +1; the swap drops that reference.
+The manifest is freed when refcount hits 0 — which is "no in-flight
+requests still using it AND it's no longer the active." Single-
+threaded refcount math is fine because the worker thread owns all
+mutations.
+
+### 4.4 Concurrent and rapid-fire releases
+
+If a new marker arrives while `pending` is still loading:
+
+- If `new.target == pending.target`: no-op (already loading the right
+  thing).
+- If `new.target != pending.target`: cancel the in-flight load (set
+  a stop flag the loader thread checks between blob GETs), free
+  `pending.next_manifest` if partially built, kick off a fresh load
+  for the new target. Avoids spending bandwidth on bytecode for a
+  superseded deployment.
+
+Failed loads (S3 outage, manifest sha mismatch, blob not found): set
+`pending.progress = failed`, log, leave `active` untouched. Next
+release attempt (or a retry timer) starts a fresh load. The active
+deployment keeps serving regardless.
+
+### 4.5 Cold start
+
+Worker startup does **zero** S3 work for files. The kv markers
+(`_deploy/active`) live in each tenant's `app.db`, which is replicated
+through raft — a fresh node joining the cluster gets every tenant's
+marker via raft state transfer; a hot restart re-opens the local
+stores with markers already present. TenantFiles is opened lazily on
+the first request per tenant (existing `getOrOpenTenantFiles`
+pattern); on that open, the worker reads the in-memory marker and
+kicks off the load.
+
+If a tenant has never had a release call (`_deploy/active` absent),
+the worker returns 503 "no deployment yet" — the existing behavior
+for fresh tenants. There is no cold-start fallback to S3 listing;
+the kv marker is the only runtime pointer.
+
+Disaster recovery (kv lost but S3 intact) is handled by a separate
+one-shot `loop46 reconcile-kv-from-s3` tool that walks
+`tenants/*/deployments/`, picks the highest `dep_id` per tenant, and
+writes the kv marker. Run once on recovery, not in the steady-state
+boot path.
+
+### 4.6 Bytecode cache hit rate
+
+A new deployment typically reuses 90%+ of the previous deployment's
+bytecodes (only the changed handler files have new hashes). The
+loader's "GET only blobs not already in active.bytecodes" rule keeps
+the fetch list small. A typical release loads only 1-3 new blobs.
+
+### 4.7 What goes away on the worker
 
 - `TenantFiles.files_kv: *kv_mod.KvStore` (the per-tenant `files.db`
   handle).
@@ -231,20 +372,26 @@ new hashes). Bytecode cache hit rate stays high across deploys.
   Worker, `code_addr` config, `connectProxies` / `flushProxyPending`
   / `drainProxyResponses` for the code subsystem).
 - `proposeFilesWriteSet` and the entire envelope type 3 path.
-- `deployStarterContent` (replaced by direct-to-S3 bootstrap; see §6).
+- `deployStarterContent` (replaced by direct-to-S3 bootstrap; see §7).
+- `refreshDeployments` polling phase + `next_refresh_ns` timer field
+  on `TenantFiles`. The marker-scan path replaces it entirely.
 
-### 4.3 What stays
+### 4.8 What stays / what's added
 
-- The in-memory `bytecodes` map keyed by deployment path.
-- The `statics` map (path → {hash, content_type}). Bytes still fetched
-  on demand, just from S3 directly instead of via blob_backend.
+- The in-memory `bytecodes` map keyed by deployment path (now living
+  on `TenantManifest`, not `TenantFiles` directly).
+- The `statics` map. Bytes still fetched on demand, from S3 directly.
 - The `triggers` array (derived from manifest entries matching
   `_triggers/.../index.{mjs,js}`).
-- `refreshDeployments` poll loop (rewired to GET S3 instead of
-  reading files.db).
 - Source-hashes map for tape replay.
+- **New:** `TenantFiles.{active, pending}` pointer pair for the
+  atomic-swap model.
+- **New:** `markDirtyFromWriteset` extension that scans for
+  `_deploy/active` keys (alongside the existing `_events/` scan).
+- **New:** Per-worker loader (one-shot threads or small pool) for
+  async manifest + bytecode fetches.
 
-The shape of `TenantFiles` shrinks; the lifecycle stays.
+The shape of `TenantFiles` changes more than it shrinks.
 
 ---
 
@@ -356,14 +503,32 @@ to the public listen address instead of an ephemeral loopback port.
 Same h2 server, same handlers; just different network exposure +
 TLS config.
 
-### 6.2 Writes manifest + current to S3
+### 6.2 Writes manifest to S3
 
 The existing `deployManifest` / `putFileAndDeploy` / `deploy` paths in
 `src/files_server/root.zig` change in one spot: instead of writing
 manifest rows to `files.db` + proposing through raft, they write
-`tenants/{id}/deployments/{dep_id}.json` to S3 then CAS-overwrite
-`tenants/{id}/deployments/current.json`. The blob PUTs (already going
-to S3 in s3 mode) are unchanged.
+`tenants/{id}/deployments/{dep_id:020d}.json` to S3 with
+`If-None-Match: *` (PUT-if-not-exists). On 412 (collision), increment
+`dep_id` and retry. The blob PUTs (already going to S3 in s3 mode)
+are unchanged.
+
+Files-server returns the new `deployment_id` to the caller. **It does
+NOT touch the kv release marker.** The release is a separate,
+explicit step performed by the caller (admin UI, CI tool, or an
+automated post-deploy hook), via `POST {tenant}/_admin/release` —
+which is just a kv write through the customer's admin handler.
+
+This split is intentional. Deploy and release have different
+authorization boundaries (deploy = "I can write code for this
+tenant"; release = "I can change what users see right now"), different
+audit semantics, and naturally support workflows like "upload now,
+release later" or "release a specific older deployment." Coupling
+them with an automatic release-on-upload would prevent both.
+
+For the common case where the customer wants both in one step, the
+CLI does both calls back-to-back. The convenience composition lives
+in the CLI, not in files-server.
 
 ### 6.3 Files-server keeps a small local SQLite for its own state
 
@@ -400,8 +565,8 @@ own listener instead of the worker's proxy.
 
 Today: `loop46 worker` calls `bootstrapHandler` which writes
 admin/replay manifests + blobs through `FileStore` (SQLite-backed).
-After this change: `bootstrapHandler` becomes a direct-to-S3
-function:
+After this change, bootstrap is a deploy-then-release sequence
+performed directly against S3 + the root kv:
 
 ```
 1. for each embedded file:
@@ -409,8 +574,13 @@ function:
      PUT tenants/__admin__/blobs/{sha256}     ← idempotent if already present
 2. build manifest JSON referencing the hashes
 3. PUT tenants/__admin__/deployments/00000000000000000001.json
-4. PUT tenants/__admin__/deployments/current.json (deployment_id=1)
+   with If-None-Match: * (skip if already exists)
+4. write _deploy/active = {target: 1} into __admin__'s app.db
+   (this rides through the regular kv path so workers observe it)
 ```
+
+Steps 1-3 are the deploy. Step 4 is the release. Same split as
+the customer-facing flow.
 
 No QuickJS compilation in bootstrap (admin handler bytecode is
 embedded in the binary alongside the source — same as today, just
@@ -418,9 +588,10 @@ the storage destination changes).
 
 `loop46 seed` does the same for manifest-driven tenants.
 
-Bootstrap can be **idempotent**: if `current.json` already exists and
-points at the embedded admin handler's hash, skip. Allows safe
-restart without re-uploading.
+Bootstrap is **idempotent**: each step is a no-op when the target
+state already matches (PUT-if-not-exists for the manifest; kv marker
+write is a no-op when the value is unchanged). Allows safe restart
+without re-uploading or re-releasing.
 
 ---
 
@@ -441,11 +612,14 @@ After this lands:
 - `proposeFilesWriteSet` in raft_propose.
 - Files-server's `thread.spawn` loopback-binding mode (replaced by
   public-listener mode).
+- `refreshDeployments` polling phase + `next_refresh_ns` /
+  `refresh_interval_ns` config / fields. Replaced by
+  marker-observation in the post-commit hook.
 
-The cleanup ripples through `loop46/main.zig` (drops `code_addr`
-plumbing through `WorkerCtx`), `files_server/thread.zig` (TLS config
-+ public listener), and the proxy module if no other subsystem
-remains using it.
+The cleanup ripples through `loop46/main.zig` (drops `code_addr` and
+`refresh_interval_ms` plumbing through `WorkerCtx`),
+`files_server/thread.zig` (TLS config + public listener), and the
+proxy module if no other subsystem remains using it.
 
 ---
 
@@ -527,3 +701,31 @@ Per §5.2, opt-in `{"static_serve": "redirect"}` is left for a future
 customer ask. The flag lives in the manifest (per-deployment), not
 the tenant config, so it can be tested by deploying with the flag
 and rolled back by redeploying without it.
+
+### 10.6 Why no `latest.json` (per-tenant or global)
+
+Considered and rejected during planning.
+
+**Per-tenant `tenants/{id}/deployments/latest.json`:** would only
+earn its keep as a cold-start fallback when no kv marker exists. But
+the kv markers replicate via raft, so a fresh node already has every
+tenant's marker after raft state transfer; greenfield bootstrap
+writes the marker as part of the bootstrap flow; new tenants without
+a release legitimately return 503 ("no deployment yet"). The genuine
+"no marker" recovery scenario is kv-loss, which is a one-shot
+reconciler-tool job, not a runtime cold-path. A per-tenant
+`latest.json` would just be a redundant source of truth that has to
+stay in sync with the kv marker, with nothing to show for the
+synchronization work.
+
+**Global `latest.json`:** would replace N per-tenant files with one
+combined file. Worse: every deploy across every tenant contends on
+the same object (CAS via If-Match works for correctness but
+throughput collapses at scale); the file grows unbounded with tenant
+count (~200 bytes × N entries — 100k tenants = 20MB read on every
+consultation); a misbehaving deploy can corrupt all tenants'
+pointers at once. The contention cost alone disqualifies it.
+
+The kv marker is the single source of truth for "what should the
+worker run." Listing `tenants/{id}/deployments/` covers the
+"what's been deployed" admin question.
