@@ -293,21 +293,25 @@ pub const S3BlobStore = struct {
         errdefer body_buf.deinit(body_allocator);
         var aw = std.Io.Writer.Allocating.fromArrayList(body_allocator, &body_buf);
 
-        // Visibility for the most-frequent first-time failure mode:
-        // a fetch that hangs because the endpoint is unreachable
-        // (DNS, firewall, wrong region). std.http.Client has no
-        // wired connect timeout in this Zig version, so a hung
-        // fetch blocks forever silently. Logging at warn level
-        // surfaces in operator-side smoke runs and the rove worker
-        // log alike (the worker's default log level catches warn).
-        std.log.warn("rove-blob s3: → {s} {s}", .{ methodName(method), url });
+        std.log.debug("rove-blob s3: → {s} {s}", .{ methodName(method), url });
 
+        // HEAD must NOT pass `response_writer`. std.http.Client's
+        // `Response.reader()` correctly returns an `.ending` reader
+        // for HEAD (per RFC 7230 §3.3.3 — HEAD responses include
+        // Content-Length but no body). But `readerDecompressing` —
+        // which fetch() picks when a `response_writer` is supplied
+        // — does NOT check `method.responseHasBody()` and tries to
+        // read Content-Length bytes that never come. Against OVH
+        // that meant every HEAD blocked until the 60-second idle
+        // timeout. With response_writer = null, fetch falls into
+        // the `discardRemaining` path that uses `reader()` and
+        // returns immediately for HEAD.
         const result = self.http.fetch(.{
             .location = .{ .uri = uri },
             .method = method,
             .payload = if (body.len > 0) body else null,
             .extra_headers = &headers,
-            .response_writer = &aw.writer,
+            .response_writer = if (method == .HEAD) null else &aw.writer,
             .redirect_behavior = @enumFromInt(0),
         }) catch |err| {
             std.log.warn(
