@@ -313,17 +313,80 @@ both the customer writeset and the index update. The map itself
 lives in memory; persisted into the per-tenant `_apply_state` table
 (see §5) so a leader restart picks up where it left off.
 
-### 4.4 What about envelopes that don't target a single tenant?
+### 4.4 Envelope-type → target-store mapping
 
-- `type 2 root_writeset` targets `__root__.db` — tracked separately
-  as `root_apply_idx`.
-- `type 0 writeset` targets a specific tenant — tracked per-tenant.
-- `type 1 log_batch` and `type 3 files_writeset` go away per
-  `logs-plan.md` and `files-server-plan.md`. After their migration,
-  only types 0 and 2 remain.
+After all the sub-plan migrations land, the active envelope types
+and their target stores are:
 
-So the per-tenant tracking is straightforward: every active envelope
-type maps to one specific store.
+| Envelope | Targets | Apply state tracking |
+|---|---|---|
+| 0 writeset | `{tenant}/app.db` | per-tenant `_apply_state` row |
+| 2 root_writeset | `__root__.db` | singleton `_apply_state` row in root.db |
+| 4 webhook_enqueue | `webhooks.db` | singleton `_apply_state` row in webhooks.db |
+| 5 webhook_complete | `webhooks.db` AND `{tenant}/app.db` (cross-db) | per-store check at apply time |
+| 6 webhook_retry_schedule | `webhooks.db` | singleton `_apply_state` row in webhooks.db |
+
+(Envelope types 1 `log_batch` and 3 `files_writeset` go away per
+`logs-plan.md` and `files-server-plan.md` respectively.)
+
+`webhooks.db` is the cluster-wide consolidated webhook state from
+`webhook-server-plan.md` — a new singleton store joining
+`__root__.db` in the snapshot model. The snapshot manifest gains a
+`webhooks_db` entry mirroring the `root_db` entry shape:
+
+```json
+{
+  "tenants": { ... },
+  "root_db": { "db_key": ..., "snapshot_idx": 105 },
+  "webhooks_db": { "db_key": ..., "snapshot_idx": 105 }
+}
+```
+
+The compaction floor is `min(snapshot_idx)` across all entries —
+tenants + root + webhooks. Always-refresh applies to webhooks_db
+the same way it does to a dormant tenant: if no envelope 4/5/6
+fired since the last pass, the manifest entry references the
+previous snapshot's file. In practice webhooks.db usually has
+activity per pass, so it'll be re-VACUUMed most snapshot intervals.
+
+### 4.5 Cross-db apply for envelope 5
+
+Envelope 5 `webhook_complete` is the only envelope that touches more
+than one store. Apply-time semantics:
+
+```
+on apply(envelope_5, idx I):
+  payload = parse(envelope_5)
+  webhooks_db.last_applied = SELECT v FROM webhooks.db._apply_state ...
+  tenant_db.last_applied   = SELECT v FROM tenant_T.app.db._apply_state ...
+
+  BEGIN ATTACH-spanning transaction across webhooks.db + tenant T's app.db
+    if I > webhooks_db.last_applied:
+      DELETE FROM webhooks WHERE webhook_id = payload.webhook_id
+      UPDATE webhooks.db._apply_state SET v = I
+
+    if I > tenant_db.last_applied:
+      INSERT OR REPLACE INTO kv (key, value)
+        VALUES ('_callback/' || payload.webhook_id, serialize(payload.result))
+      DELETE FROM kv WHERE key = '_outbox/' || payload.webhook_id
+      UPDATE tenant T's app.db._apply_state SET v = I
+  COMMIT
+```
+
+The per-store check makes envelope 5 **splittable**: a follower
+loading a snapshot where the two stores are at different indices
+(because they were captured at different wall-clock moments during a
+non-pausing snapshot pass) does only the parts of envelope 5 that
+hadn't already been applied to each store. The kv operations are
+idempotent (`INSERT OR REPLACE`, `DELETE` is a no-op on missing
+rows), so even an over-apply is safe.
+
+This is the one piece of cross-db plumbing the snapshot model has to
+accommodate — flagged because it's where the per-store-snapshot-
+index property and the cross-db-atomic-apply property meet. The
+implementation is mechanical (per-target-store conditional inside
+the existing apply transaction); the correctness reasoning lives
+here.
 
 ---
 
@@ -331,8 +394,8 @@ type maps to one specific store.
 
 ### 5.1 Apply state table
 
-Each tenant's `app.db` (and `__root__.db`) gains a small bookkeeping
-table:
+Every raft-applied store (each `{tenant}/app.db`, `__root__.db`,
+and `webhooks.db`) gains a small bookkeeping table:
 
 ```sql
 CREATE TABLE _apply_state (
@@ -343,8 +406,12 @@ CREATE TABLE _apply_state (
 ```
 
 Read on apply-loop startup. Updated inside every apply transaction
-(same SQLite tx as the customer writeset). The follower uses this to
-filter applies: "only apply entry I to tenant T if I > T.last_applied".
+(same SQLite tx as the writeset). The follower uses this to filter
+applies: "only apply entry I to store S if I > S.last_applied".
+
+For envelopes that target multiple stores (envelope 5; see §4.5),
+each target store's `_apply_state` is checked independently — the
+apply does only the parts that haven't been done yet.
 
 ### 5.2 Snapshot load flow
 
@@ -360,10 +427,13 @@ follower receives a SNAP_OFFER with snap_id (S3 path) from the leader:
        Atomic-rename /tmp/staging/{T}/app.db → data_dir/{T}/app.db
        Open the new app.db, INSERT INTO _apply_state
          (k='last_applied_raft_idx', v=manifest.tenants[T].snapshot_idx)
-  5. Same for __root__.db.
-  6. raft_begin_load_snapshot(willemt_term, willemt_compaction_floor)
+  5. Same for __root__.db (using manifest.root_db).
+  6. Same for webhooks.db (using manifest.webhooks_db).
+  7. raft_begin_load_snapshot(willemt_term, willemt_compaction_floor)
      raft_end_load_snapshot()
-  7. Resume the apply loop from (willemt_compaction_floor + 1).
+  8. Resume the apply loop from (willemt_compaction_floor + 1).
+     Webhook-server (when it next opens webhooks.db) sees the
+     restored pending entries and resumes its delivery loop.
 ```
 
 ### 5.3 Apply rule (post-snapshot or steady-state)
@@ -433,18 +503,25 @@ operator error, restoring to a new region):
    - For each tenant: downloads db file, places in data_dir/{T}/app.db,
      populates _apply_state with snapshot_idx
    - Same for __root__.db
+   - Same for webhooks.db (cluster-wide consolidated webhook state)
    - Initializes willemt's raft state to the snapshot's term + floor
 5. Cluster is online at the snapshot's state.
 6. Subsequent followers join via normal SNAP_OFFER flow.
+7. Webhook-server starts up, opens the restored webhooks.db, sees
+   pending entries, resumes delivery.
 ```
 
 The on-disk state of any node IS recoverable from the most recent
 S3 snapshot plus any raft entries past the floor that haven't been
 ingested. With raft entries past floor lost (cluster-wide failure),
 the cluster is at the snapshot's point. Customers' kv state is
-"last snapshot." Webhook outbox rows in app.db are present (they
-ride the snapshot); the webhook-server safety-net drainer
-re-delivers any that hadn't completed.
+"last snapshot." Webhook state survives via the restored
+webhooks.db; some in-flight deliveries may be re-attempted (the
+X-Rove-Webhook-Id idempotency contract handles dupes on the
+customer side). Per-tenant `_outbox/{id}` rows that were in
+limbo (worker handed off to webhook-server but envelope 5 hadn't
+fired yet) ride the snapshot; the drainer's safety-net pass
+re-POSTs them to webhook-server.
 
 ### 6.3 Point-in-time recovery
 
