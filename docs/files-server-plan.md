@@ -330,7 +330,54 @@ Failed loads (S3 outage, manifest sha mismatch, blob not found): set
 release attempt (or a retry timer) starts a fresh load. The active
 deployment keeps serving regardless.
 
-### 4.5 Cold start
+### 4.5 Parking requests during a cold load
+
+A request that arrives while its tenant's `active` manifest is null
+(first request after worker boot, before the load completes) needs
+to wait. This is the same parking-collection pattern the worker
+already uses for raft (`raft_pending`) and the files / log proxies
+(`code_proxy.pending`, `log_proxy.pending`).
+
+**New collection:** `pending_deploy_load: StreamColl` — same row
+type as the other parking collections so an entity preserves every
+component (headers, body, session, scope) across the move in and
+out.
+
+Dispatch flow:
+
+```
+1. dispatcher pulls entity for tenant T from request_out
+2. tc = getOrOpenTenantFiles(T)        ← reads kv marker, allocates TenantFiles
+3. if tc.active != null: dispatch normally
+4. if tc.pending == null: kick off async load against the marker's target
+5. move entity from request_out → pending_deploy_load
+   (no other work this tick for this entity)
+```
+
+Resume flow (on the worker tick after the loader thread posts
+`pending.progress = ready`):
+
+```
+1. swap tc.active = pending.next_manifest, clear tc.pending
+2. walk pending_deploy_load, for each entity whose tenant id == T,
+   move it back to request_out
+3. next dispatch tick picks them up against the now-loaded manifest
+```
+
+**Timeout:** the worker tick also scans `pending_deploy_load` for
+entities older than `deploy_load_timeout_ns` (mirror of
+`commit_wait_timeout_ns`, default 5s) and emits 503 with a
+`Retry-After: 1` header. Same fate when the load explicitly fails —
+the loader sets `pending.progress = failed`, the next worker tick
+walks parked entities for that tenant and 503s them, then clears
+`tc.pending` so the next request triggers a fresh load attempt.
+
+The tenant id lookup for the resume walk uses the existing authority
+component on each entity. Linear scan is fine at realistic backlogs
+(a few hundred parked entities × a few resumed tenants per tick is
+microseconds).
+
+### 4.6 Cold start
 
 Worker startup does **zero** S3 work for files. The kv markers
 (`_deploy/active`) live in each tenant's `app.db`, which is replicated
@@ -338,8 +385,8 @@ through raft — a fresh node joining the cluster gets every tenant's
 marker via raft state transfer; a hot restart re-opens the local
 stores with markers already present. TenantFiles is opened lazily on
 the first request per tenant (existing `getOrOpenTenantFiles`
-pattern); on that open, the worker reads the in-memory marker and
-kicks off the load.
+pattern); on that open, the worker reads the in-memory marker, kicks
+off the load, and parks the request per §4.5.
 
 If a tenant has never had a release call (`_deploy/active` absent),
 the worker returns 503 "no deployment yet" — the existing behavior
@@ -352,14 +399,14 @@ one-shot `loop46 reconcile-kv-from-s3` tool that walks
 writes the kv marker. Run once on recovery, not in the steady-state
 boot path.
 
-### 4.6 Bytecode cache hit rate
+### 4.7 Bytecode cache hit rate
 
 A new deployment typically reuses 90%+ of the previous deployment's
 bytecodes (only the changed handler files have new hashes). The
 loader's "GET only blobs not already in active.bytecodes" rule keeps
 the fetch list small. A typical release loads only 1-3 new blobs.
 
-### 4.7 What goes away on the worker
+### 4.8 What goes away on the worker
 
 - `TenantFiles.files_kv: *kv_mod.KvStore` (the per-tenant `files.db`
   handle).
@@ -376,7 +423,7 @@ the fetch list small. A typical release loads only 1-3 new blobs.
 - `refreshDeployments` polling phase + `next_refresh_ns` timer field
   on `TenantFiles`. The marker-scan path replaces it entirely.
 
-### 4.8 What stays / what's added
+### 4.9 What stays / what's added
 
 - The in-memory `bytecodes` map keyed by deployment path (now living
   on `TenantManifest`, not `TenantFiles` directly).
@@ -390,6 +437,12 @@ the fetch list small. A typical release loads only 1-3 new blobs.
   `_deploy/active` keys (alongside the existing `_events/` scan).
 - **New:** Per-worker loader (one-shot threads or small pool) for
   async manifest + bytecode fetches.
+- **New:** `pending_deploy_load: StreamColl` — parking collection
+  for requests that arrived during a cold load (§4.5). Same shape
+  and lifecycle as `raft_pending`.
+- **New:** `deploy_load_timeout_ns` config (mirror of
+  `commit_wait_timeout_ns`, default 5s) for parked-request
+  expiration.
 
 The shape of `TenantFiles` changes more than it shrinks.
 
