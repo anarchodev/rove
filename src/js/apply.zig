@@ -83,7 +83,11 @@ pub const APPLY_WORKER_ID: u16 = 0xFFFF;
 /// allocated together, freed together.
 const RaftLogHandle = struct {
     kv_store: *kv.KvStore,
-    blob_backend: blob_mod.FilesystemBlobStore,
+    /// fs or s3 — picked from `ApplyCtx.blob_backend_cfg`. With s3
+    /// the prefix is `{base}{instance_id}/log-blobs/`, mirroring the
+    /// worker's per-tenant layout exactly so leader and followers
+    /// hit identical keys.
+    blob_backend: blob_mod.BlobBackend,
     store: log_mod.LogStore,
 };
 
@@ -212,6 +216,12 @@ pub const ApplyCtx = struct {
     /// apply. Null on the leader path (leader-skip fires before we'd
     /// open it) and on nodes that never see a root writeset.
     root_store: ?*kv.KvStore = null,
+    /// Picks fs vs s3 for every per-tenant log blob backend the raft
+    /// thread opens. Must match the worker's `blob_backend` setting
+    /// — leader writes via the worker, followers read via this ctx;
+    /// using different backends would split the bytes across stores
+    /// the cluster can't agree on. Owned by the caller.
+    blob_backend_cfg: blob_mod.BackendConfig = .fs,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -369,7 +379,13 @@ pub const ApplyCtx = struct {
         const handle = try self.allocator.create(RaftLogHandle);
         errdefer self.allocator.destroy(handle);
         handle.kv_store = kv_store;
-        handle.blob_backend = try blob_mod.FilesystemBlobStore.open(self.allocator, log_blob_dir);
+        handle.blob_backend = try blob_mod.BlobBackend.openPerTenant(
+            self.allocator,
+            self.blob_backend_cfg,
+            log_blob_dir,
+            instance_id,
+            "log-blobs",
+        );
         errdefer handle.blob_backend.deinit();
         handle.store = try log_mod.LogStore.init(
             self.allocator,
