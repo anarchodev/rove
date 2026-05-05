@@ -39,89 +39,89 @@ webhook-server process).
 
 ## 1. Architecture
 
-**Webhook-server is its own binary (`rove-webhook-server`),
-following the same pattern as files-server / log-server / sse-
-service.** Even though it has no public TLS surface, it gets its own
-process for the same reason the worker is being kept minimal:
-resource isolation. A bug, memory leak, or runaway loop in
-webhook-server should not be able to degrade the worker's kv path.
-Worker process stays focused on customer requests + raft + apply.
+**Webhook-server is a leader-pinned thread inside the loop46
+binary, NOT a separate process.** Unlike files-server / log-server
+/ sse-service — which can be separate processes (and even separate
+machines) because their state lives in S3 and they don't
+participate in raft — webhook-server **does** participate in raft:
+it reads `webhooks.db` (raft-replicated), proposes envelopes
+4/5/6, and is leader-pinned by definition. Crossing a process
+boundary would force RPC for raft proposes, file-share or
+learner-replication for `webhooks.db` access, and would re-
+introduce the very plumbing the consolidation was supposed to
+eliminate.
 
-Webhook-server runs **on every node, leader-pinned active**:
-followers' webhook-server processes are alive but idle (waiting on
-the leader-acquired signal); only the leader's instance accepts
-handoffs and runs the delivery loop. On raft election, the new
-leader's webhook-server transitions to active, opens the local
-`webhooks.db` (in-sync via raft replication), and resumes
-processing. The previous leader's instance transitions to idle.
+The architectural rule that emerges and is worth carrying
+forward to other future subsystems:
 
-Worker handoffs happen over **loopback HTTP** — workers always run
-on the leader (only-leader-takes-requests property), and the active
-webhook-server is also on the leader, so the handoff is
-single-machine loopback. Authenticated with a shared internal token.
-~50µs overhead per handoff vs an in-process call; not on the
-customer-response hot path.
+> **Subsystems that participate in raft live in the loop46 binary.
+> Subsystems that don't can be split into their own processes /
+> machines.**
+
+The thread runs **only on the raft leader** (same pattern as today's
+drainer), guaranteeing a single delivery loop per cluster without
+any election protocol of its own. Leader failover starts the thread
+on the new leader's loop46 binary; it opens the local `webhooks.db`
+(already populated via raft replication) and resumes processing.
 
 ```
-┌─── leader node ────────────────────────────────────────────────────┐
+┌─── leader node — loop46 binary ────────────────────────────────────┐
 │                                                                    │
-│  ┌── loop46 binary ─────────────────┐                              │
-│  │  worker thread(s):                │                              │
-│  │    customer handler runs          │                              │
-│  │    TrackedTxn writes              │                              │
-│  │    customer kv + _outbox/{id}     │                              │
-│  │    raft commit (envelope 0) ──┐   │                              │
-│  │                                │  │ POST /v1/accept (loopback)  │
-│  │                                │  │ Authorization: Bearer <tok> │
-│  └────────────────────────────────┼──┘──────────┐                  │
-│                                   │              ▼                  │
-│                                   │  ┌── rove-webhook-server ───┐  │
-│                                   │  │  (separate binary,       │  │
-│                                   │  │   leader-pinned active)  │  │
-│                                   │  │  - HTTP listener         │  │
-│                                   │  │    (loopback only)       │  │
-│                                   │  │  - raft proposer client  │  │
-│                                   │  │  - delivery loop         │  │
-│                                   │  └──────────┬──────────────┘  │
-│                                   │             │ POST customer    │
-│                                   │             │ URL              │
-│                                   │             ▼                  │
-│                                   │  ┌─────────────────────┐       │
-│                                   │  │ customer's webhook  │       │
-│                                   │  │ receiver            │       │
-│                                   │  └─────────────────────┘       │
-│                                   │                                │
-│              raft apply hooks ────┴──┐                             │
+│  ┌──────────────┐    customer handler runs                         │
+│  │   worker     │    TrackedTxn writes customer kv ops +           │
+│  │   thread(s)  │    _outbox/{webhook_id}                          │
+│  │              │    raft commit (envelope 0) ──┐                  │
+│  │              │                                │                  │
+│  │              │    in-process queue push ──┐   │                  │
+│  └──────────────┘                            │   │                  │
+│                                              ▼   ▼                  │
+│                              ┌──────────────────────────────┐      │
+│                              │ webhook-server thread         │      │
+│                              │  (leader-pinned)              │      │
+│                              │  - in-process queue receiver  │      │
+│                              │  - raft proposer (local)      │      │
+│                              │  - delivery loop              │      │
+│                              └──────────┬───────────────────┘      │
+│                                         │ POST customer URL         │
+│                                         ▼                           │
+│                              ┌─────────────────────┐                │
+│                              │ customer's webhook  │                │
+│                              │ receiver            │                │
+│                              └─────────────────────┘                │
+│                                                                    │
+│              raft apply hooks ▼                                    │
 │              ┌─────────────────────────────┐                       │
 │              │ data_dir/webhooks.db        │                       │
-│              │  (read by rove-webhook-     │                       │
-│              │   server's delivery loop)   │                       │
+│              │  (read by webhook-server    │                       │
+│              │   thread; written via       │                       │
+│              │   envelope-4/5/6 apply)     │                       │
 │              └─────────────────────────────┘                       │
+│                                                                    │
+│  (Other subsystems that DON'T participate in raft —                │
+│   rove-files-server, rove-log-server, rove-sse-service —           │
+│   are separate processes/binaries; can be on the same node         │
+│   or on entirely different machines.)                              │
 └────────────────────────────────────────────────────────────────────┘
                                   │ raft replication
                                   ▼
-┌─── follower node ──────────────────────────────────────────────────┐
-│  loop46:                no public listeners, no worker threads.    │
-│  rove-webhook-server:   running but IDLE (no leader signal).       │
-│  rove-files-server,                                                │
-│  rove-log-server,                                                  │
-│  rove-sse-service:      same pattern — present but idle.           │
-│  apply hooks update local data_dir/webhooks.db via raft.           │
-│  Ready to assume leadership on raft election.                      │
+┌─── follower node — loop46 binary ──────────────────────────────────┐
+│  - no public listeners (leader-only takes requests)                │
+│  - no worker threads serving customer traffic                      │
+│  - webhook-server thread present but IDLE (no leader signal)       │
+│  - apply hooks update local data_dir/webhooks.db via raft          │
+│  - ready to assume leadership on raft election                     │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
 Two flow paths, neither on the customer-response hot path:
 
-1. **Handoff (worker → webhook-server → raft):** worker fires a
-   loopback HTTP POST to `rove-webhook-server`'s `/v1/accept`
-   endpoint with a shared internal token. Both processes are on
-   the leader's node, so the round trip is single-machine
-   (~50µs). Webhook-server proposes envelope 4 (`webhook_enqueue`)
-   through its raft client; raft commits + applies on every node;
-   webhook-server returns 204. Worker fires it after kv commit and
-   doesn't wait for the response — the customer's handler response
-   is already going.
+1. **Handoff (worker → webhook-server → raft):** worker pushes the
+   new outbox row into webhook-server's in-process queue (a Zig
+   function call — no HTTP, no auth, no serialization, no network).
+   Webhook-server proposes envelope 4 (`webhook_enqueue`) through
+   the local raft node; raft commits + applies on every node;
+   webhook-server signals the worker's callback that the handoff
+   is durable.
 2. **Completion (webhook-server → raft → apply on every node):**
    webhook-server's delivery loop attempts the customer URL; on
    terminal outcome it proposes envelope 5 (`webhook_complete`)
@@ -138,8 +138,8 @@ Two flow paths, neither on the customer-response hot path:
 **The drainer becomes a tiny safety net.** Its only job is "did
 some `_outbox/{id}` row exist for more than N seconds without a
 matching `webhooks.db` entry?" If so, the worker crashed before its
-HTTP POST to webhook-server completed (or webhook-server was
-restarting); drainer re-POSTs to webhook-server. The idempotency
+in-process push to webhook-server completed; drainer re-pushes
+(also in-process, same Zig function). webhook-server's idempotency
 check (envelope 4 with same webhook_id is a no-op if already
 enqueued) handles dupes safely.
 
@@ -334,67 +334,63 @@ picks one.
 
 ## 4. Webhook-server
 
-New module: `src/webhook_server/` + new binary `rove-webhook-server`.
-Runs on every node alongside the loop46 binary; **leader-pinned
-active behavior** — only the leader's instance accepts handoffs and
-runs the delivery loop, follower instances idle waiting for the
-leader-acquired signal.
+New module: `src/webhook_server/` inside the loop46 binary.
+Leader-pinned thread spawned by the loop46 main loop on
+leadership-acquired and stopped on leadership-lost. Single instance
+per cluster guaranteed by raft leader uniqueness.
 
 ### 4.1 Process model
 
-- **Separate binary `rove-webhook-server`.** Resource isolation
-  from the loop46 worker process — a bug or memory leak in webhook-
-  server cannot degrade the worker's kv path. Same architectural
-  pattern as files-server / log-server / sse-service.
-- **Loopback HTTP listener** (`POST /v1/accept`) for worker handoffs.
-  Bound to `127.0.0.1:<port>` so it's reachable only from the same
-  node — workers are always on the leader (only-leader-takes-requests
-  property), as is the active webhook-server, so handoffs are always
-  loopback.
-- **Authenticated with shared internal token** — `WEBHOOK_INTERNAL_TOKEN`
-  env, set identically on loop46 + rove-webhook-server. Defends
-  against any other process on the same node speaking the API.
-- **Raft proposer client.** Webhook-server connects to the local
-  raft node's transport endpoint and submits propose RPCs for
-  envelopes 4 / 5 / 6. Lightweight client library; doesn't itself
-  participate in raft consensus.
+- **Same binary as the worker.** No new binary, no new
+  operational artifact. Justified because webhook-server
+  participates in raft (reads webhooks.db, proposes envelopes,
+  leader-pinned by definition); separating across a process
+  boundary would force RPC for proposes and file-share for
+  webhooks.db reads — the very plumbing the consolidation was
+  supposed to avoid.
+- **In-process queue API for worker handoffs.** Worker threads in
+  the same binary push outbox rows via a Zig function call — no
+  HTTP, no serialization, no auth.
+- **No HTTP listener at all.** Webhook-server's only network
+  presence is its outbound HTTPS client (for customer URL delivery).
+- **Raft proposer.** Webhook-server proposes envelopes 4 / 5 / 6
+  through the local raft node — same in-process raft client every
+  other proposer uses (apply path, drainer, etc.).
 - **Outbound HTTPS client** for delivery. Reuses the existing
   `src/outbox/ssrf.zig` guards (factored out of the drainer).
-- **Reads `webhooks.db`** directly off the local filesystem (which
-  is on the same node as the leader's raft state). Writes only via
-  envelope proposals through the raft client.
-- **Leader-pinned active state.** Reads raft leadership status via
-  the raft transport; only the instance on the current leader
-  accepts handoffs / runs delivery. Followers' instances stay
-  responsive (LB health checks, etc.) but reject `/v1/accept` with
-  503 when not leader.
+- **Reads `webhooks.db`** directly via a local SQLite handle.
+  Writes only via envelope proposals (which apply through raft, like
+  every other write to a raft-replicated db).
 
-### 4.2 Endpoints
+### 4.2 No HTTP endpoints
+
+Webhook-server's API surface to the rest of the loop46 binary is a
+single Zig module function:
 
 ```
-POST /v1/accept          ← worker (on leader, via loopback)
-GET  /v1/health          ← LB / monitoring
+webhook_server.enqueue(tenant_id, webhook_id, row) -> Future<Result>
 ```
 
-Listener bound to loopback only. The only customer-visible HTTP
-traffic is rove-webhook-server's outbound POSTs to customer URLs.
+That's it. The only HTTP webhook-server speaks is the outbound POSTs
+to customer URLs.
 
 ### 4.3 Accept flow
 
 ```
-on POST /v1/accept (loopback only):
-  validate Authorization: Bearer <WEBHOOK_INTERNAL_TOKEN>
-  if not currently raft leader: return 503 (worker / drainer retries)
-  parse body → outbox_row
-  build envelope 4 (webhook_enqueue) from outbox_row
-  propose envelope 4 through the raft client
-  on raft commit: return 204
-  on raft propose failure: return 503 (worker / drainer retries)
+webhook_server.enqueue(tenant_id, webhook_id, row):
+  if not currently raft leader: return error.NotLeader (caller logs;
+                                drainer's safety net handles it)
+  build envelope 4 (webhook_enqueue) from the row
+  propose envelope 4 through the local raft node
+  on raft commit: signal success to the caller's future
+  on raft propose failure: signal failure
+                           caller logs; drainer will retry
 ```
 
-The 503-when-not-leader handling lets the LB / DNS catch up to the
-new leader without webhook-server having to know which node IS the
-leader — caller retries to whoever's currently routed.
+A Zig function returning a future that resolves on raft commit. No
+HTTP framing, no JSON parsing on the inbound side, no auth check.
+The only serialization that happens is building the envelope payload
+to hand to the raft proposer.
 
 ### 4.4 Delivery loop
 
@@ -487,16 +483,10 @@ webhook subsystem specifically — just the normal worker recovery.
 
 ### 5.1 Worker → webhook-server
 
-Loopback HTTP with shared internal token: `WEBHOOK_INTERNAL_TOKEN`
-env, set identically on the loop46 binary and `rove-webhook-server`.
-Sent as `Authorization: Bearer <token>` on every POST. Rotated by
-restarting both with a new value.
-
-The token defends against any other process on the same node (e.g.,
-a misconfigured monitoring tool, an exploited co-tenant on a shared
-host) speaking the API. mTLS is the future upgrade if cross-process
-isolation needs to be stronger; for now token-on-loopback is the
-right level.
+No auth needed. The handoff is an in-process Zig function call; the
+caller and callee share the same process address space and there's
+no trust boundary to cross. (Workers only run on the leader, as
+does webhook-server, so there's no cross-node case.)
 
 ### 5.2 Webhook-server → customer URL
 
@@ -537,19 +527,16 @@ No change.
 
 ### 6.3 Added
 
-- `src/webhook_server/` module + new binary `rove-webhook-server`.
-  Runs on every node; leader-pinned active behavior (active on
-  leader, idle on followers). Loopback HTTP listener, raft proposer
-  client, outbound HTTPS delivery loop.
+- `src/webhook_server/` module — leader-pinned thread inside the
+  loop46 binary. Spawned on leadership-acquired, stopped on
+  leadership-lost. In-process queue API; no HTTP listener.
 - New raft envelope types 4 (enqueue), 5 (complete), 6 (retry-
   schedule).
 - New cluster-wide SQLite db: `data_dir/webhooks.db`. Initialized at
-  cluster bootstrap; opened by every node's loop46 apply path
-  (write side); opened by the leader's `rove-webhook-server`
-  delivery loop (read side).
-- New env vars: `WEBHOOK_INTERNAL_TOKEN` (shared between loop46 and
-  rove-webhook-server), `WEBHOOK_SERVER_PORT` (loopback port the
-  webhook-server binds to).
+  cluster bootstrap; opened by every node's apply path (write side);
+  opened by the leader's webhook-server thread (read side).
+- No new binaries, no new env vars — webhook-server is purely
+  in-process within an existing binary.
 
 ---
 
@@ -557,34 +544,31 @@ No change.
 
 Each step independently shippable + smoke-testable.
 
-1. **Add `webhooks.db` schema + envelope types 4/5/6 to apply path
-   in loop46.** Default behavior unchanged because nothing proposes
-   them yet. Smoke: hand-craft an envelope 4 directly via raft,
-   observe the row appears in `webhooks.db` on every node.
-2. **Build `rove-webhook-server` binary skeleton.** Loopback HTTP
-   listener with token auth, raft proposer client, leader-pinned
-   active state. No delivery loop yet. Smoke: start the binary;
-   become leader → /v1/accept returns 204; lose leadership →
-   /v1/accept returns 503; POST /v1/accept → envelope 4 proposed →
-   row appears.
+1. **Add `webhooks.db` schema + envelope types 4/5/6 to apply path.**
+   Default behavior unchanged because nothing proposes them yet.
+   Smoke: hand-craft an envelope 4, observe the row appears in
+   `webhooks.db` on every node.
+2. **Build webhook-server thread** in `src/webhook_server/`: leader-
+   pinned spawn/stop wired into the raft leadership signals,
+   in-process queue API, raft proposer. No delivery loop yet.
+   Smoke: become leader → thread starts; lose leadership → thread
+   stops; call `webhook_server.enqueue` → envelope 4 proposed → row
+   appears.
 3. **Build the delivery loop.** Reads `webhooks.db`, POSTs customer
    URLs, proposes envelope 5 on completion. Smoke: end-to-end
-   accept → deliver → callback row appears.
-4. **Add `pumpWebhooksForResponse` to loop46 worker** behind feature
-   flag (`webhook.deliver_via = drainer | service`). Default
-   `drainer`. Workers fire loopback HTTP POST in parallel with
-   drainer behavior; validate webhook-server delivery matches
-   drainer outcome.
-5. **Switch loop46 worker default to `service`.** Drainer becomes
-   the safety net; webhook-server is the primary path.
-6. **Trim the drainer** to the safety-net role (re-POST orphans
+   enqueue → deliver → callback row appears.
+4. **Add `pumpWebhooksForResponse` to worker** behind feature flag
+   (`webhook.deliver_via = drainer | service`). Default `drainer`.
+   Workers call `webhook_server.enqueue` in parallel with drainer
+   behavior; validate webhook-server delivery matches drainer
+   outcome.
+5. **Switch worker default to `service`.** Drainer becomes the
+   safety net; webhook-server is the primary path.
+6. **Trim the drainer** to the safety-net role (re-enqueue orphans
    only).
 7. **Drop `_outbox_inflight/{id}` lease pattern.** Webhook-server's
    `inflight_lease_ns` replaces it.
 8. **Drop the feature flag.** `service` is the only path.
-9. **Deploy `rove-webhook-server` on every node** (operator step —
-   add to systemd unit / k8s manifest / etc.). Leader-pinned active
-   behavior makes deploy safe at any time.
 
 Smokes:
 - Existing webhook smoke runs through the new path end-to-end.
@@ -613,14 +597,26 @@ write fails, the next apply attempt retries from the still-present
 state — but envelope 5 apply needs to be idempotent, which it is
 if `_callback/{id}` insert uses INSERT OR REPLACE).
 
-### 8.2 Resolved: leader-pinned thread, no separate process
+### 8.2 Resolved: in-process leader-pinned thread, NOT separate binary
 
-The earlier draft of this plan proposed a separate webhook-server
-process. Resolved (2026-05) in favor of a leader-pinned thread
-within the loop46 binary: webhook-server has no public TLS surface,
-so the operational case for a separate process doesn't apply. Single
-binary, one fewer thing to deploy, in-process queue for same-binary
-worker handoffs.
+This iterated multiple times during planning. Final resolution
+(2026-05): leader-pinned thread inside the loop46 binary.
+
+The architectural principle the iteration produced, worth
+carrying forward to other future subsystems:
+
+> **Subsystems that participate in raft live in the loop46 binary.
+> Subsystems that don't can be split into their own processes /
+> machines.**
+
+By "participate in raft" we mean: reads raft-replicated state OR
+proposes envelopes OR is leader-pinned by definition. Webhook-
+server hits all three. files-server / log-server / sse-service
+hit none — their state lives in S3, they don't propose, they
+serve customer requests on their own subdomains. So those three
+can be (and are) separate binaries; webhook-server can't
+meaningfully be one without re-introducing RPC plumbing for raft
+proposes and file-share for webhooks.db reads.
 
 Tying webhook delivery to raft-leader liveness is the explicit
 tradeoff: webhook delivery pauses briefly during leader election.

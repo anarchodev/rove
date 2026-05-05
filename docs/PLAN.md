@@ -1040,10 +1040,55 @@ Resolved items moved to §10. Open items:
   `sse.{public_suffix}`, response-attached emit buffers,
   `rove:resync` sentinel for cache eviction.
 - `docs/webhook-server-plan.md` — §2.6 + Phase 5.5 item 4
-  expansion: cluster-wide raft-replicated `webhooks.db` with a
-  dedicated webhook-server process.
+  expansion: cluster-wide raft-replicated `webhooks.db` written
+  via new envelope types 4/5/6; the delivery loop is a
+  leader-pinned thread INSIDE the loop46 binary (not a separate
+  process — see architectural principle below).
 - `docs/snapshot-plan.md` — §2.13 + Phase 5.5 item 3 expansion:
   per-tenant snapshot indices, S3 transport, no global write-pause.
+
+### Architectural principle: separability follows raft participation
+
+The right axis for "should this subsystem be its own process /
+binary / machine" is **whether it participates in raft**, NOT
+whether it has a public TLS surface (the original heuristic).
+
+> **Subsystems that participate in raft live in the loop46 binary.
+> Subsystems that don't can be split into their own processes /
+> machines.**
+
+Participation = reads raft-replicated state, OR proposes
+envelopes, OR is leader-pinned by definition.
+
+| Subsystem | Participates in raft? | Where it lives |
+|---|---|---|
+| worker (customer kv path) | yes (proposes envelope 0; leader-only) | loop46 binary |
+| files-server | no (state in S3) | own binary, own subdomain, separable to its own machine |
+| log-server | no (state in S3 + local index cache) | own binary, own subdomain, separable to its own machine |
+| sse-service | no (state in memory + S3 cache) | own binary, own subdomain, separable to its own machine |
+| webhook-server | yes (reads webhooks.db; proposes 4/5/6; leader-pinned) | thread in loop46 binary |
+| (future) anything else needing raft state | yes by definition | thread in loop46 binary |
+| (future) anything else stateless wrt raft | no | candidate for separate binary |
+
+The principle lets us cleanly answer the "split or not" question
+without re-litigating the tradeoffs case by case.
+
+### Leader-only public surface
+
+Related architectural property: **only the raft leader accepts
+customer requests.** Workers run only on the leader; followers are
+pure raft replicas with no public listeners. Customer-facing LBs
+route the worker subdomain (and the files-server / log-server /
+sse-service subdomains) to the current leader; on raft election,
+the LB switches.
+
+Implication for the separable subsystems: while files-server /
+log-server / sse-service CAN run on different machines from any
+raft node (their state is in S3), they're typically deployed on
+every node with a leader-pinned active state — same pattern as
+webhook-server but at process granularity instead of thread
+granularity. Operators who want to scale them independently can,
+because nothing in their architecture requires co-location.
 
 ## 7. Superseded decisions (do not re-propose)
 
@@ -1067,6 +1112,7 @@ The following were explored during the 2026-04-17 design conversation and ruled 
 - **Per-tenant `files.db` on every worker mirroring the manifest via raft envelope type 3.** Rejected (2026-05): worker-as-read-only-consumer model is cleaner. Replaced by `docs/files-server-plan.md`: manifest lives in S3, runtime release signal is a `_deploy/active` kv marker on the customer's app.db, worker reads on demand.
 - **Worker hairpin proxy `/_system/files/*` and `/_system/log/*`.** Rejected (2026-05): these subsystems should be on their own subdomains (`files.{public_suffix}`, `logs.{public_suffix}`), terminating their own TLS, with token-handoff auth from the customer's app domain. Worker stops mediating their traffic entirely. Per `docs/files-server-plan.md` and `docs/logs-plan.md`.
 - **Webhook subsystem leader-local in v1 with per-tenant `_outbox/*` scan recovery on leader change.** Rejected (2026-05): the per-tenant scan is exactly the cost we're trying to eliminate; replicating recovery state via raft from day one removes it. Replaced by `docs/webhook-server-plan.md`: cluster-wide `webhooks.db` raft-replicated via new envelope types 4/5/6.
+- **Webhook-server as a separate binary `rove-webhook-server`.** Considered (2026-05) and rejected. Webhook-server participates in raft (reads `webhooks.db`, proposes envelopes, leader-pinned) — separating across a process boundary forces RPC for proposes and file-share or learner-replication for `webhooks.db` reads, re-introducing the very plumbing the consolidation was supposed to eliminate. The right separability axis is raft participation, not public-TLS-surface presence. Webhook-server lives as a leader-pinned thread inside the loop46 binary; the cluster-wide `webhooks.db` design (envelope types 4/5/6) stays. Architectural principle captured in §6.
 - **Pause-and-snapshot raft snapshot strategy** (briefly stopping all applies during VACUUM pass to capture every tenant's `app.db` at a single global raft index). Rejected (2026-05): contradicts the worker-kv-path north star — even a few seconds of cluster-wide write pause every snapshot interval is unacceptable at the "many tenants per node" density. Replaced by per-tenant snapshot indices with always-refresh-all-tenants discipline (`docs/snapshot-plan.md`). The slow-tenant pinning concern is mitigated by the always-refresh trick (dormant tenants get manifest-bookkeeping refresh without re-VACUUM).
 - **Static file serving via 302-to-S3 redirect (public bucket or pre-signed).** Rejected (2026-05): considered as a way to take the worker entirely out of the static bytes path, but Cloudflare in front already absorbs essentially all repeat traffic. The marginal further reduction isn't worth a per-deployment flag, public-bucket security model, CSP friction, or per-request HMAC signing. Worker proxies with hash ETag + immutable Cache-Control; Cloudflare does the heavy lifting.
 - **Polling `current.json` (or per-tenant `latest.json`) for files-server release detection.** Rejected (2026-05): adds per-tenant LIST/GET cost to every worker every interval. Replaced by `_deploy/active` kv marker observed via the existing `markDirtyFromWriteset` post-commit scan path — no polling, no new envelope type, marker rides through the customer kv writeset that the customer's deploy CLI writes.
