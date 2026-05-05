@@ -70,6 +70,11 @@ pub const Config = struct {
 
 pub const S3BlobStore = struct {
     allocator: std.mem.Allocator,
+    /// All `[]const u8` fields are allocator-duplicated copies. The
+    /// caller's `Config` strings need only outlive the `init` call —
+    /// the store is self-contained afterwards. This removes the
+    /// lifetime trap that bites callers who build per-tenant configs
+    /// from short-lived allocations (e.g. a per-request key prefix).
     config: Config,
     /// Shared HTTP client. One per S3BlobStore instance — keeps
     /// the TLS session + TCP connection alive across put/get/exists/
@@ -116,17 +121,46 @@ pub const S3BlobStore = struct {
             std.log.warn("rove-blob s3.init: endpoint resolved to empty after stripping scheme", .{});
             return Error.Io;
         }
-        var fixed = config;
-        fixed.endpoint = ep;
+
+        // Dupe every config string so callers don't have to track
+        // lifetimes. Use errdefer in declaration order so a later
+        // failure cleans up earlier dupes.
+        const endpoint_owned = try allocator.dupe(u8, ep);
+        errdefer allocator.free(endpoint_owned);
+        const region_owned = try allocator.dupe(u8, config.region);
+        errdefer allocator.free(region_owned);
+        const bucket_owned = try allocator.dupe(u8, config.bucket);
+        errdefer allocator.free(bucket_owned);
+        const key_prefix_owned = try allocator.dupe(u8, config.key_prefix);
+        errdefer allocator.free(key_prefix_owned);
+        const access_key_owned = try allocator.dupe(u8, config.access_key);
+        errdefer allocator.free(access_key_owned);
+        const secret_key_owned = try allocator.dupe(u8, config.secret_key);
+        errdefer allocator.free(secret_key_owned);
+
         return .{
             .allocator = allocator,
-            .config = fixed,
+            .config = .{
+                .endpoint = endpoint_owned,
+                .region = region_owned,
+                .bucket = bucket_owned,
+                .key_prefix = key_prefix_owned,
+                .access_key = access_key_owned,
+                .secret_key = secret_key_owned,
+                .use_tls = config.use_tls,
+            },
             .http = .{ .allocator = allocator },
         };
     }
 
     pub fn deinit(self: *S3BlobStore) void {
         self.http.deinit();
+        self.allocator.free(self.config.endpoint);
+        self.allocator.free(self.config.region);
+        self.allocator.free(self.config.bucket);
+        self.allocator.free(self.config.key_prefix);
+        self.allocator.free(self.config.access_key);
+        self.allocator.free(self.config.secret_key);
         self.* = undefined;
     }
 
