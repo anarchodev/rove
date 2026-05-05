@@ -73,16 +73,45 @@ pub const S3BlobStore = struct {
     config: Config,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !S3BlobStore {
-        // Sanity-check: endpoint shouldn't carry scheme; bucket
-        // shouldn't be empty.
-        if (config.endpoint.len == 0) return Error.Io;
-        if (config.bucket.len == 0) return Error.Io;
-        if (std.mem.startsWith(u8, config.endpoint, "http://") or
-            std.mem.startsWith(u8, config.endpoint, "https://"))
-        {
+        if (config.endpoint.len == 0) {
+            std.log.warn("rove-blob s3.init: endpoint is empty", .{});
             return Error.Io;
         }
-        return .{ .allocator = allocator, .config = config };
+        if (config.bucket.len == 0) {
+            std.log.warn("rove-blob s3.init: bucket is empty", .{});
+            return Error.Io;
+        }
+        if (config.region.len == 0) {
+            std.log.warn("rove-blob s3.init: region is empty", .{});
+            return Error.Io;
+        }
+        if (config.access_key.len == 0) {
+            std.log.warn("rove-blob s3.init: access_key is empty", .{});
+            return Error.Io;
+        }
+        if (config.secret_key.len == 0) {
+            std.log.warn("rove-blob s3.init: secret_key is empty", .{});
+            return Error.Io;
+        }
+        // Endpoint should NOT include scheme — we add it from
+        // `use_tls`. Strip leniently if the operator pasted a URL
+        // (every OVH / AWS doc shows the endpoint with `https://`
+        // prefix, so this is the most-frequent first-time mistake).
+        var ep = config.endpoint;
+        if (std.mem.startsWith(u8, ep, "https://")) {
+            ep = ep["https://".len..];
+        } else if (std.mem.startsWith(u8, ep, "http://")) {
+            ep = ep["http://".len..];
+        }
+        // Strip trailing slash if present.
+        if (ep.len > 0 and ep[ep.len - 1] == '/') ep = ep[0 .. ep.len - 1];
+        if (ep.len == 0) {
+            std.log.warn("rove-blob s3.init: endpoint resolved to empty after stripping scheme", .{});
+            return Error.Io;
+        }
+        var fixed = config;
+        fixed.endpoint = ep;
+        return .{ .allocator = allocator, .config = fixed };
     }
 
     pub fn deinit(self: *S3BlobStore) void {
@@ -292,17 +321,67 @@ pub const S3BlobStore = struct {
 
 const testing = std.testing;
 
-test "init: rejects scheme in endpoint" {
-    try testing.expectError(Error.Io, S3BlobStore.init(testing.allocator, .{
+test "init: strips scheme leniently from endpoint" {
+    var s = try S3BlobStore.init(testing.allocator, .{
         .endpoint = "https://s3.gra.io.cloud.ovh.net",
         .region = "gra",
         .bucket = "b",
         .access_key = "a",
         .secret_key = "s",
-    }));
-    try testing.expectError(Error.Io, S3BlobStore.init(testing.allocator, .{
+    });
+    defer s.deinit();
+    try testing.expectEqualStrings("s3.gra.io.cloud.ovh.net", s.config.endpoint);
+
+    var s2 = try S3BlobStore.init(testing.allocator, .{
         .endpoint = "http://localhost:9000",
         .region = "us-east-1",
+        .bucket = "b",
+        .access_key = "a",
+        .secret_key = "s",
+        .use_tls = false,
+    });
+    defer s2.deinit();
+    try testing.expectEqualStrings("localhost:9000", s2.config.endpoint);
+}
+
+test "init: strips trailing slash" {
+    var s = try S3BlobStore.init(testing.allocator, .{
+        .endpoint = "s3.gra.io.cloud.ovh.net/",
+        .region = "gra",
+        .bucket = "b",
+        .access_key = "a",
+        .secret_key = "s",
+    });
+    defer s.deinit();
+    try testing.expectEqualStrings("s3.gra.io.cloud.ovh.net", s.config.endpoint);
+}
+
+test "init: strips both scheme and trailing slash" {
+    var s = try S3BlobStore.init(testing.allocator, .{
+        .endpoint = "https://s3.gra.io.cloud.ovh.net/",
+        .region = "gra",
+        .bucket = "b",
+        .access_key = "a",
+        .secret_key = "s",
+    });
+    defer s.deinit();
+    try testing.expectEqualStrings("s3.gra.io.cloud.ovh.net", s.config.endpoint);
+}
+
+test "init: rejects empty access_key" {
+    try testing.expectError(Error.Io, S3BlobStore.init(testing.allocator, .{
+        .endpoint = "s3.gra.io.cloud.ovh.net",
+        .region = "gra",
+        .bucket = "b",
+        .access_key = "",
+        .secret_key = "s",
+    }));
+}
+
+test "init: rejects empty region" {
+    try testing.expectError(Error.Io, S3BlobStore.init(testing.allocator, .{
+        .endpoint = "s3.gra.io.cloud.ovh.net",
+        .region = "",
         .bucket = "b",
         .access_key = "a",
         .secret_key = "s",

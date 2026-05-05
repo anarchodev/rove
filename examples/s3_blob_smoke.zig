@@ -30,6 +30,12 @@
 const std = @import("std");
 const blob = @import("rove-blob");
 
+/// Default log level — show warn/err so init / wire failures emit
+/// the specific reason instead of just the bubbled error name.
+pub const std_options: std.Options = .{
+    .log_level = .warn,
+};
+
 const ENV_ENDPOINT = "S3_ENDPOINT";
 const ENV_REGION = "S3_REGION";
 const ENV_BUCKET = "S3_BUCKET";
