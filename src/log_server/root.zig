@@ -75,13 +75,14 @@ fn validateInstanceId(id: []const u8) Error!void {
 const InstanceCtx = struct {
     allocator: std.mem.Allocator,
     kv: *kv_mod.KvStore,
-    blob_backend: blob_mod.FilesystemBlobStore,
+    blob_backend: blob_mod.BlobBackend,
     store: log_mod.LogStore,
 
     fn initReadOnly(
         self: *InstanceCtx,
         allocator: std.mem.Allocator,
         data_dir: []const u8,
+        blob_cfg: blob_mod.BackendConfig,
         instance_id: []const u8,
     ) Error!void {
         try validateInstanceId(instance_id);
@@ -106,8 +107,13 @@ const InstanceCtx = struct {
             return Error.Kv;
         errdefer self.kv.close();
 
-        self.blob_backend = blob_mod.FilesystemBlobStore.open(allocator, blob_dir) catch
-            return Error.Blob;
+        self.blob_backend = blob_mod.BlobBackend.openPerTenant(
+            allocator,
+            blob_cfg,
+            blob_dir,
+            instance_id,
+            "log-blobs",
+        ) catch return Error.Blob;
         errdefer self.blob_backend.deinit();
 
         // worker_id = 0 is fine: list / get / applyBatch don't
@@ -136,12 +142,13 @@ const InstanceCtx = struct {
 pub fn listRecords(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     limit: u32,
     after: u64,
 ) Error!log_mod.ListResult {
     var h: InstanceCtx = undefined;
-    try h.initReadOnly(allocator, data_dir, instance_id);
+    try h.initReadOnly(allocator, data_dir, blob_cfg, instance_id);
     defer h.deinit();
     return h.store.list(.{ .limit = limit, .after = after }) catch |err| mapLogError(err);
 }
@@ -153,11 +160,12 @@ pub fn listRecords(
 pub fn getRecord(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     request_id: u64,
 ) Error!?log_mod.LogRecord {
     var h: InstanceCtx = undefined;
-    try h.initReadOnly(allocator, data_dir, instance_id);
+    try h.initReadOnly(allocator, data_dir, blob_cfg, instance_id);
     defer h.deinit();
     return h.store.get(request_id) catch |err| mapLogError(err);
 }
@@ -169,10 +177,11 @@ pub fn getRecord(
 pub fn countRecords(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
 ) Error!usize {
     var h: InstanceCtx = undefined;
-    try h.initReadOnly(allocator, data_dir, instance_id);
+    try h.initReadOnly(allocator, data_dir, blob_cfg, instance_id);
     defer h.deinit();
     var result = h.store.list(.{ .limit = std.math.maxInt(u32) }) catch |err|
         return mapLogError(err);
@@ -186,6 +195,7 @@ pub fn countRecords(
 pub fn getBlob(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     key: []const u8,
 ) Error![]u8 {
@@ -198,8 +208,13 @@ pub fn getBlob(
     ) catch return Error.OutOfMemory;
     defer allocator.free(blob_dir);
 
-    var backend = blob_mod.FilesystemBlobStore.open(allocator, blob_dir) catch
-        return Error.Blob;
+    var backend = blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        blob_cfg,
+        blob_dir,
+        instance_id,
+        "log-blobs",
+    ) catch return Error.Blob;
     defer backend.deinit();
 
     return backend.blobStore().get(key, allocator) catch Error.NotFound;
@@ -288,7 +303,7 @@ test "listRecords returns records newest-first" {
 
     try seedLogStore(allocator, data_dir, "acme", 3);
 
-    var result = try listRecords(allocator, data_dir, "acme", 10, 0);
+    var result = try listRecords(allocator, data_dir, .fs, "acme", 10, 0);
     defer result.deinit();
     try testing.expectEqual(@as(usize, 3), result.records.len);
     // newest-first — request ids descend.
@@ -309,27 +324,27 @@ test "listRecords paginates via after cursor" {
     try seedLogStore(allocator, data_dir, "acme", 5);
 
     // Page 1: newest 2 records.
-    var p1 = try listRecords(allocator, data_dir, "acme", 2, 0);
+    var p1 = try listRecords(allocator, data_dir, .fs, "acme", 2, 0);
     defer p1.deinit();
     try testing.expectEqual(@as(usize, 2), p1.records.len);
     try testing.expect(p1.next_cursor != 0);
     const cursor_after_page_1 = p1.next_cursor;
 
     // Page 2: next 2 strictly older.
-    var p2 = try listRecords(allocator, data_dir, "acme", 2, cursor_after_page_1);
+    var p2 = try listRecords(allocator, data_dir, .fs, "acme", 2, cursor_after_page_1);
     defer p2.deinit();
     try testing.expectEqual(@as(usize, 2), p2.records.len);
     try testing.expect(p2.records[0].request_id < cursor_after_page_1);
     try testing.expect(p2.next_cursor != 0);
 
     // Page 3: only 1 record left, next_cursor still set (client retries to confirm).
-    var p3 = try listRecords(allocator, data_dir, "acme", 2, p2.next_cursor);
+    var p3 = try listRecords(allocator, data_dir, .fs, "acme", 2, p2.next_cursor);
     defer p3.deinit();
     try testing.expectEqual(@as(usize, 1), p3.records.len);
     try testing.expect(p3.next_cursor != 0);
 
     // Page 4: empty → next_cursor = 0 signals end.
-    var p4 = try listRecords(allocator, data_dir, "acme", 2, p3.next_cursor);
+    var p4 = try listRecords(allocator, data_dir, .fs, "acme", 2, p3.next_cursor);
     defer p4.deinit();
     try testing.expectEqual(@as(usize, 0), p4.records.len);
     try testing.expectEqual(@as(u64, 0), p4.next_cursor);
@@ -346,11 +361,11 @@ test "getRecord round-trips a known record" {
     try seedLogStore(allocator, data_dir, "acme", 2);
 
     // Find a valid id via list.
-    var result = try listRecords(allocator, data_dir, "acme", 10, 0);
+    var result = try listRecords(allocator, data_dir, .fs, "acme", 10, 0);
     const target_id = result.records[0].request_id;
     result.deinit();
 
-    var rec = (try getRecord(allocator, data_dir, "acme", target_id)).?;
+    var rec = (try getRecord(allocator, data_dir, .fs, "acme", target_id)).?;
     defer rec.deinit(allocator);
     try testing.expectEqual(target_id, rec.request_id);
     try testing.expectEqualStrings("GET", rec.method);
@@ -367,7 +382,7 @@ test "getRecord returns null for unknown id" {
     try seedLogStore(allocator, data_dir, "acme", 1);
     try testing.expectEqual(
         @as(?log_mod.LogRecord, null),
-        try getRecord(allocator, data_dir, "acme", 0xdeadbeef_cafebabe),
+        try getRecord(allocator, data_dir, .fs, "acme", 0xdeadbeef_cafebabe),
     );
 }
 
@@ -380,17 +395,17 @@ test "countRecords matches seeded count" {
     }
 
     try seedLogStore(allocator, data_dir, "acme", 5);
-    try testing.expectEqual(@as(usize, 5), try countRecords(allocator, data_dir, "acme"));
+    try testing.expectEqual(@as(usize, 5), try countRecords(allocator, data_dir, .fs, "acme"));
 }
 
 test "invalid instance id rejected" {
     const allocator = testing.allocator;
     try testing.expectError(
         Error.InvalidInstanceId,
-        listRecords(allocator, "/tmp/rove-ls-inv", "", 10, 0),
+        listRecords(allocator, "/tmp/rove-ls-inv", .fs, "", 10, 0),
     );
     try testing.expectError(
         Error.InvalidInstanceId,
-        listRecords(allocator, "/tmp/rove-ls-inv", "../evil", 10, 0),
+        listRecords(allocator, "/tmp/rove-ls-inv", .fs, "../evil", 10, 0),
     );
 }

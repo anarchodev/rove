@@ -41,6 +41,7 @@ const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 const kv = @import("rove-kv");
+const blob_mod = @import("rove-blob");
 
 const files_server = @import("root.zig");
 const files_mod = @import("rove-files");
@@ -80,6 +81,11 @@ pub const Handle = struct {
     /// Absolute path to `{data_dir}`. Borrowed from the caller — must
     /// outlive the handle.
     data_dir: []const u8,
+    /// fs / s3 picker for every per-tenant file-blobs backend the
+    /// handlers open. Borrowed; must outlive the handle (loop46
+    /// constructs it once at startup and keeps it alive for process
+    /// life).
+    blob_cfg: blob_mod.BackendConfig,
     /// Raft node to propose files.db writesets through. When null,
     /// writes apply locally only — fine for single-node dev smoke
     /// tests, broken for multi-node correctness. Borrowed.
@@ -114,6 +120,7 @@ pub const Handle = struct {
 pub fn spawn(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     max_connections: u32,
     raft: ?*kv.RaftNode,
 ) !*Handle {
@@ -125,6 +132,7 @@ pub fn spawn(
         .thread = undefined,
         .port = 0,
         .data_dir = data_dir,
+        .blob_cfg = blob_cfg,
         .max_connections = max_connections,
         .stop = .{ .raw = false },
         .ready = .{},
@@ -190,7 +198,7 @@ fn runThread(h: *Handle) !void {
 
     while (!h.stop.load(.acquire)) {
         try server.pollWithTimeout(100 * std.time.ns_per_ms);
-        try processRequests(server, allocator, h.data_dir, h.raft);
+        try processRequests(server, allocator, h.data_dir, h.blob_cfg, h.raft);
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
@@ -211,6 +219,7 @@ fn processRequests(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     raft: ?*kv.RaftNode,
 ) !void {
     const entities = server.request_out.entitySlice();
@@ -220,7 +229,7 @@ fn processRequests(
     const req_bodies = server.request_out.column(h2.ReqBody);
 
     for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
-        handleOne(server, allocator, data_dir, raft, ent, sid, sess, rh, rb) catch |err| {
+        handleOne(server, allocator, data_dir, blob_cfg, raft, ent, sid, sess, rh, rb) catch |err| {
             std.log.warn("files-server: handler error: {s}", .{@errorName(err)});
             setResponse(server, ent, sid, sess, 500, null, "internal error\n") catch |se| std.log.err(
                 "files-server: failed to write 500 response after handler error: {s} (entity may be stuck in request_out)",
@@ -234,6 +243,7 @@ fn handleOne(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     raft: ?*kv.RaftNode,
     ent: rove.Entity,
     sid: h2.StreamId,
@@ -281,30 +291,30 @@ fn handleOne(
     }
 
     if (std.mem.eql(u8, remainder, "upload") and std.mem.eql(u8, method, "POST")) {
-        try handleUpload(server, allocator, data_dir, ent, sid, sess, instance_id, x_rove_path, rb);
+        try handleUpload(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, x_rove_path, rb);
     } else if (std.mem.eql(u8, remainder, "deploy") and std.mem.eql(u8, method, "POST")) {
-        try handleDeploy(server, allocator, data_dir, ent, sid, sess, instance_id);
+        try handleDeploy(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id);
     } else if (std.mem.startsWith(u8, remainder, "source/") and std.mem.eql(u8, method, "GET")) {
         const hash = remainder["source/".len..];
-        try handleSource(server, allocator, data_dir, ent, sid, sess, instance_id, hash);
+        try handleSource(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, hash);
     } else if (std.mem.eql(u8, remainder, "list") and std.mem.eql(u8, method, "GET")) {
-        try handleList(server, allocator, data_dir, ent, sid, sess, instance_id);
+        try handleList(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id);
     } else if (std.mem.startsWith(u8, remainder, "file/") and std.mem.eql(u8, method, "GET")) {
         const file_path = remainder["file/".len..];
-        try handleGetFile(server, allocator, data_dir, ent, sid, sess, instance_id, file_path);
+        try handleGetFile(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, file_path);
     } else if (std.mem.startsWith(u8, remainder, "file/") and std.mem.eql(u8, method, "PUT")) {
         const file_path = remainder["file/".len..];
-        try handlePutFile(server, allocator, data_dir, raft, ent, sid, sess, instance_id, file_path, content_type, rb);
+        try handlePutFile(server, allocator, data_dir, blob_cfg, raft, ent, sid, sess, instance_id, file_path, content_type, rb);
     } else if (std.mem.eql(u8, remainder, "blobs/check") and std.mem.eql(u8, method, "POST")) {
-        try handleBlobsCheck(server, allocator, data_dir, ent, sid, sess, instance_id, rb);
+        try handleBlobsCheck(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, rb);
     } else if (std.mem.startsWith(u8, remainder, "blobs/") and std.mem.eql(u8, method, "PUT")) {
         const hash = remainder["blobs/".len..];
-        try handlePutBlob(server, allocator, data_dir, ent, sid, sess, instance_id, hash, rb);
+        try handlePutBlob(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, hash, rb);
     } else if (std.mem.eql(u8, remainder, "deployments") and std.mem.eql(u8, method, "POST")) {
-        try handleDeployments(server, allocator, data_dir, raft, ent, sid, sess, instance_id, rb);
+        try handleDeployments(server, allocator, data_dir, blob_cfg, raft, ent, sid, sess, instance_id, rb);
     } else if (std.mem.startsWith(u8, remainder, "deployments/") and std.mem.eql(u8, method, "GET")) {
         const id_str = remainder["deployments/".len..];
-        try handleGetDeployment(server, allocator, data_dir, ent, sid, sess, instance_id, id_str);
+        try handleGetDeployment(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, id_str);
     } else {
         try setResponse(server, ent, sid, sess, 404, null, "not found\n");
     }
@@ -326,6 +336,7 @@ fn handleBlobsCheck(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -346,6 +357,7 @@ fn handleBlobsCheck(
     var check = files_server.checkBlobs(
         allocator,
         data_dir,
+        blob_cfg,
         instance_id,
         parsed.value.hashes,
     ) catch |err| {
@@ -407,6 +419,7 @@ fn handleDeployments(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     raft: ?*kv.RaftNode,
     ent: rove.Entity,
     sid: h2.StreamId,
@@ -522,6 +535,7 @@ fn handleDeployments(
     const result = files_server.deployManifest(
         allocator,
         data_dir,
+        blob_cfg,
         instance_id,
         entries.items,
         expected_parent,
@@ -575,6 +589,7 @@ fn handlePutBlob(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -584,7 +599,7 @@ fn handlePutBlob(
 ) !void {
     const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
 
-    files_server.putBlobByHash(allocator, data_dir, instance_id, hash, body) catch |err| {
+    files_server.putBlobByHash(allocator, data_dir, blob_cfg, instance_id, hash, body) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.InvalidInstanceId, files_server.Error.InvalidManifest => 400,
             else => 500,
@@ -600,6 +615,7 @@ fn handleUpload(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -613,7 +629,7 @@ fn handleUpload(
     }
     const source: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
 
-    files_server.uploadFile(allocator, data_dir, instance_id, x_rove_path, source) catch |err| {
+    files_server.uploadFile(allocator, data_dir, blob_cfg, instance_id, x_rove_path, source) catch |err| {
         std.log.warn("files-server: uploadFile failed: {s}", .{@errorName(err)});
         const msg = try std.fmt.allocPrint(
             allocator,
@@ -630,12 +646,13 @@ fn handleDeploy(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
     instance_id: []const u8,
 ) !void {
-    const dep_id = files_server.deploy(allocator, data_dir, instance_id) catch |err| {
+    const dep_id = files_server.deploy(allocator, data_dir, blob_cfg, instance_id) catch |err| {
         const msg = try std.fmt.allocPrint(
             allocator,
             "deploy failed: {s}\n",
@@ -652,12 +669,13 @@ fn handleList(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
     instance_id: []const u8,
 ) !void {
-    var manifest = files_server.loadCurrentManifest(allocator, data_dir, instance_id) catch |err| {
+    var manifest = files_server.loadCurrentManifest(allocator, data_dir, blob_cfg, instance_id) catch |err| {
         if (err == files_server.Error.NotFound) {
             // No deployment yet — empty list, not an error.
             const empty = try std.fmt.allocPrint(
@@ -697,6 +715,7 @@ fn handleGetDeployment(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -712,7 +731,7 @@ fn handleGetDeployment(
         return;
     };
 
-    var manifest = files_server.loadDeployment(allocator, data_dir, instance_id, deployment_id) catch |err| {
+    var manifest = files_server.loadDeployment(allocator, data_dir, blob_cfg, instance_id, deployment_id) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.NotFound => 404,
             else => 500,
@@ -774,6 +793,7 @@ fn handleGetFile(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -785,7 +805,7 @@ fn handleGetFile(
         return;
     }
 
-    var content = files_server.readFileByPath(allocator, data_dir, instance_id, file_path) catch |err| {
+    var content = files_server.readFileByPath(allocator, data_dir, blob_cfg, instance_id, file_path) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.NotFound => 404,
             files_server.Error.InvalidPath, files_server.Error.InvalidInstanceId => 400,
@@ -821,6 +841,7 @@ fn handlePutFile(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     raft: ?*kv.RaftNode,
     ent: rove.Entity,
     sid: h2.StreamId,
@@ -842,6 +863,7 @@ fn handlePutFile(
     const dep_id = files_server.putFileAndDeploy(
         allocator,
         data_dir,
+        blob_cfg,
         instance_id,
         file_path,
         body,
@@ -893,6 +915,7 @@ fn handleSource(
     server: *CodeH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -904,7 +927,7 @@ fn handleSource(
         return;
     }
 
-    const bytes = files_server.getSourceByHash(allocator, data_dir, instance_id, hash) catch |err| {
+    const bytes = files_server.getSourceByHash(allocator, data_dir, blob_cfg, instance_id, hash) catch |err| {
         const code: u16 = if (err == files_server.Error.NotFound) 404 else 500;
         const msg = try std.fmt.allocPrint(
             allocator,

@@ -88,7 +88,7 @@ fn validateInstanceId(id: []const u8) Error!void {
 const InstanceCtx = struct {
     allocator: std.mem.Allocator,
     files_kv: *kv_mod.KvStore,
-    blob_backend: blob_mod.FilesystemBlobStore,
+    blob_backend: blob_mod.BlobBackend,
     store: files_mod.FileStore,
 
     /// In-place construction. Must be called on a stack-local
@@ -97,6 +97,7 @@ const InstanceCtx = struct {
         self: *InstanceCtx,
         allocator: std.mem.Allocator,
         data_dir: []const u8,
+        blob_cfg: blob_mod.BackendConfig,
         instance_id: []const u8,
         compile: files_mod.CompileFn,
         compile_ctx: ?*anyopaque,
@@ -135,8 +136,13 @@ const InstanceCtx = struct {
             return Error.Kv;
         errdefer self.files_kv.close();
 
-        self.blob_backend = blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir) catch
-            return Error.Blob;
+        self.blob_backend = blob_mod.BlobBackend.openPerTenant(
+            allocator,
+            blob_cfg,
+            files_blob_dir,
+            instance_id,
+            "file-blobs",
+        ) catch return Error.Blob;
         errdefer self.blob_backend.deinit();
 
         // Take the BlobStore vtable ONLY AFTER `self.blob_backend` is
@@ -293,11 +299,12 @@ pub const CheckResult = struct {
 pub fn checkBlobs(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     hashes: []const []const u8,
 ) Error!CheckResult {
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     var list: std.ArrayListUnmanaged([]u8) = .empty;
@@ -327,6 +334,7 @@ pub fn checkBlobs(
 pub fn putBlobByHash(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     claimed_hash: []const u8,
     bytes: []const u8,
@@ -338,7 +346,7 @@ pub fn putBlobByHash(
     if (!std.mem.eql(u8, claimed_hash, &actual)) return Error.InvalidManifest;
 
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     h.blob_backend.blobStore().put(claimed_hash, bytes) catch return Error.Blob;
@@ -407,6 +415,7 @@ pub const DeployResult = struct {
 pub fn deployManifest(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     entries: []const DeployEntry,
     expected_parent_id: ?u64,
@@ -417,7 +426,7 @@ pub fn deployManifest(
     defer compiler.deinit();
 
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, instance_id, InlineCompiler.compile, &compiler);
+    try h.init(allocator, data_dir, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
     defer h.deinit();
 
     // ── CAS check: read current deployment pointer BEFORE any write.
@@ -495,6 +504,7 @@ pub fn deployManifest(
 pub fn uploadFile(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     path: []const u8,
     source: []const u8,
@@ -504,7 +514,7 @@ pub fn uploadFile(
     defer compiler.deinit();
 
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, instance_id, InlineCompiler.compile, &compiler);
+    try h.init(allocator, data_dir, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
     defer h.deinit();
 
     h.store.putSource(path, source) catch |err| return mapCodeError(err);
@@ -516,13 +526,14 @@ pub fn uploadFile(
 pub fn uploadStatic(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     path: []const u8,
     bytes: []const u8,
     content_type: []const u8,
 ) Error!void {
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     h.store.putStatic(path, bytes, content_type) catch |err| return mapCodeError(err);
@@ -543,6 +554,7 @@ pub fn uploadStatic(
 pub fn putFileAndDeploy(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     path: []const u8,
     body: []const u8,
@@ -564,14 +576,14 @@ pub fn putFileAndDeploy(
         try compiler.init(allocator);
         defer compiler.deinit();
         var h: InstanceCtx = undefined;
-        try h.init(allocator, data_dir, instance_id, InlineCompiler.compile, &compiler);
+        try h.init(allocator, data_dir, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
         defer h.deinit();
         h.store.setReplicate(replicate);
         h.store.putSource(path, body) catch |err| return mapCodeError(err);
         return h.store.deploy() catch |err| mapCodeError(err);
     } else {
         var h: InstanceCtx = undefined;
-        try h.init(allocator, data_dir, instance_id, stubCompile, null);
+        try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
         defer h.deinit();
         h.store.setReplicate(replicate);
         h.store.putStatic(path, body, content_type) catch |err| return mapCodeError(err);
@@ -584,13 +596,14 @@ pub fn putFileAndDeploy(
 pub fn deploy(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
 ) Error!u64 {
     // Deploy doesn't actually compile, but FileStore.init demands a
     // non-null compile hook. Give it a stub that errors out — if it
     // ever gets called during deploy, something's wrong.
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     return h.store.deploy() catch |err| mapCodeError(err);
@@ -602,6 +615,7 @@ pub fn deploy(
 pub fn getSourceByHash(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     source_hash_hex: []const u8,
 ) Error![]u8 {
@@ -614,8 +628,13 @@ pub fn getSourceByHash(
     ) catch return Error.OutOfMemory;
     defer allocator.free(files_blob_dir);
 
-    var blob_backend = blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir) catch
-        return Error.Blob;
+    var blob_backend = blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        blob_cfg,
+        files_blob_dir,
+        instance_id,
+        "file-blobs",
+    ) catch return Error.Blob;
     defer blob_backend.deinit();
 
     return blob_backend.blobStore().get(source_hash_hex, allocator) catch
@@ -628,11 +647,12 @@ pub fn getSourceByHash(
 pub fn loadDeployment(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     deployment_id: u64,
 ) Error!files_mod.FileStore.Manifest {
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     return h.store.loadDeployment(deployment_id) catch |err| mapCodeError(err);
@@ -642,10 +662,11 @@ pub fn loadDeployment(
 pub fn loadCurrentManifest(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
 ) Error!files_mod.FileStore.Manifest {
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
     return h.store.loadCurrentDeployment() catch |err| mapCodeError(err);
 }
@@ -669,11 +690,12 @@ pub const FileContent = struct {
 pub fn readFileByPath(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     path: []const u8,
 ) Error!FileContent {
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     var info = h.store.stat(path) catch |err| return mapCodeError(err);
@@ -732,13 +754,13 @@ test "uploadFile + loadDeployment round trip" {
         allocator.free(data_dir);
     }
 
-    try uploadFile(allocator, data_dir, "acme", "index.js",
+    try uploadFile(allocator, data_dir, .fs, "acme", "index.js",
         "response.body = 'hi';",
     );
-    const dep_id = try deploy(allocator, data_dir, "acme");
+    const dep_id = try deploy(allocator, data_dir, .fs, "acme");
     try testing.expect(dep_id > 0);
 
-    var manifest = try loadDeployment(allocator, data_dir, "acme", dep_id);
+    var manifest = try loadDeployment(allocator, data_dir, .fs, "acme", dep_id);
     defer manifest.deinit();
 
     try testing.expectEqual(@as(usize, 1), manifest.entries.len);
@@ -753,16 +775,16 @@ test "uploadFile produces stable hashes for identical input" {
         allocator.free(data_dir);
     }
 
-    try uploadFile(allocator, data_dir, "acme", "a.js", "1 + 2;");
-    const dep1 = try deploy(allocator, data_dir, "acme");
-    var m1 = try loadDeployment(allocator, data_dir, "acme", dep1);
+    try uploadFile(allocator, data_dir, .fs, "acme", "a.js", "1 + 2;");
+    const dep1 = try deploy(allocator, data_dir, .fs, "acme");
+    var m1 = try loadDeployment(allocator, data_dir, .fs, "acme", dep1);
     defer m1.deinit();
     const hash_a1 = m1.entries[0].source_hex;
 
     // Re-upload identical bytes → same source hash.
-    try uploadFile(allocator, data_dir, "acme", "a.js", "1 + 2;");
-    const dep2 = try deploy(allocator, data_dir, "acme");
-    var m2 = try loadDeployment(allocator, data_dir, "acme", dep2);
+    try uploadFile(allocator, data_dir, .fs, "acme", "a.js", "1 + 2;");
+    const dep2 = try deploy(allocator, data_dir, .fs, "acme");
+    var m2 = try loadDeployment(allocator, data_dir, .fs, "acme", dep2);
     defer m2.deinit();
     const hash_a2 = m2.entries[0].source_hex;
 
@@ -778,14 +800,14 @@ test "getSourceByHash fetches the exact bytes" {
     }
 
     const source = "response.body = 'hash me';";
-    try uploadFile(allocator, data_dir, "acme", "index.js", source);
-    const dep = try deploy(allocator, data_dir, "acme");
+    try uploadFile(allocator, data_dir, .fs, "acme", "index.js", source);
+    const dep = try deploy(allocator, data_dir, .fs, "acme");
 
-    var manifest = try loadDeployment(allocator, data_dir, "acme", dep);
+    var manifest = try loadDeployment(allocator, data_dir, .fs, "acme", dep);
     defer manifest.deinit();
     const hash = &manifest.entries[0].source_hex;
 
-    const fetched = try getSourceByHash(allocator, data_dir, "acme", hash);
+    const fetched = try getSourceByHash(allocator, data_dir, .fs, "acme", hash);
     defer allocator.free(fetched);
     try testing.expectEqualStrings(source, fetched);
 }
@@ -794,11 +816,11 @@ test "uploadFile rejects invalid instance id" {
     const allocator = testing.allocator;
     try testing.expectError(
         Error.InvalidInstanceId,
-        uploadFile(allocator, "/tmp/rove-cs-inv", "", "a.js", "1;"),
+        uploadFile(allocator, "/tmp/rove-cs-inv", .fs, "", "a.js", "1;"),
     );
     try testing.expectError(
         Error.InvalidInstanceId,
-        uploadFile(allocator, "/tmp/rove-cs-inv", "../etc", "a.js", "1;"),
+        uploadFile(allocator, "/tmp/rove-cs-inv", .fs, "../etc", "a.js", "1;"),
     );
 }
 
@@ -810,12 +832,12 @@ test "multi-file deployment manifest lists every entry" {
         allocator.free(data_dir);
     }
 
-    try uploadFile(allocator, data_dir, "acme", "index.js", "1;");
-    try uploadFile(allocator, data_dir, "acme", "api/users.mjs",
+    try uploadFile(allocator, data_dir, .fs, "acme", "index.js", "1;");
+    try uploadFile(allocator, data_dir, .fs, "acme", "api/users.mjs",
         "export function list(req) { return { status: 200, body: 'ok' }; }",
     );
-    const dep = try deploy(allocator, data_dir, "acme");
-    var manifest = try loadDeployment(allocator, data_dir, "acme", dep);
+    const dep = try deploy(allocator, data_dir, .fs, "acme");
+    var manifest = try loadDeployment(allocator, data_dir, .fs, "acme", dep);
     defer manifest.deinit();
 
     try testing.expectEqual(@as(usize, 2), manifest.entries.len);

@@ -53,7 +53,7 @@ pub fn main() !void {
     // to 32 concurrent connections — plenty of headroom for smoke
     // tests and manual pokes. No raft here — standalone mode writes
     // locally only (no cluster to replicate to).
-    const handle = try cs.thread.spawn(allocator, cli.data_dir, 32, null);
+    const handle = try cs.thread.spawn(allocator, cli.data_dir, .fs, 32, null);
     defer handle.shutdown();
 
     // Print the bound port on a predictable line so the smoke test

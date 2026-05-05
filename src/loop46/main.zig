@@ -809,11 +809,11 @@ pub fn main() !void {
     // files-server can propose files.db writesets through it. Each
     // subsystem owns its own rove context (registry + io_uring +
     // h2 server) and binds to a loopback TCP ephemeral port.
-    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, subsystem_max_connections, raft_node);
+    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, .fs, subsystem_max_connections, raft_node);
     defer cs_handle.shutdown();
     const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
 
-    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir, subsystem_max_connections);
+    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir, .fs, subsystem_max_connections);
     defer ls_handle.shutdown();
     const log_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ls_handle.port);
 

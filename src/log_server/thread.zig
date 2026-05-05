@@ -36,6 +36,7 @@ const h2 = @import("rove-h2");
 
 const log_server = @import("root.zig");
 const log_mod = @import("rove-log");
+const blob_mod = @import("rove-blob");
 
 const LogH2 = h2.H2(.{});
 
@@ -44,6 +45,10 @@ pub const Handle = struct {
     thread: std.Thread,
     port: u16,
     data_dir: []const u8,
+    /// fs / s3 picker for every per-tenant log-blobs backend the
+    /// handlers open. Borrowed; loop46 keeps the source strings alive
+    /// for process life.
+    blob_cfg: blob_mod.BackendConfig,
     /// Max concurrent inbound h2c connections. Sized from the worker
     /// count — one persistent client per worker.
     max_connections: u32,
@@ -61,6 +66,7 @@ pub const Handle = struct {
 pub fn spawn(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     max_connections: u32,
 ) !*Handle {
     const h = try allocator.create(Handle);
@@ -71,6 +77,7 @@ pub fn spawn(
         .thread = undefined,
         .port = 0,
         .data_dir = data_dir,
+        .blob_cfg = blob_cfg,
         .max_connections = max_connections,
         .stop = .{ .raw = false },
         .ready = .{},
@@ -129,7 +136,7 @@ fn runThread(h: *Handle) !void {
 
     while (!h.stop.load(.acquire)) {
         try server.pollWithTimeout(100 * std.time.ns_per_ms);
-        try processRequests(server, allocator, h.data_dir);
+        try processRequests(server, allocator, h.data_dir, h.blob_cfg);
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
@@ -150,6 +157,7 @@ fn processRequests(
     server: *LogH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
 ) !void {
     const entities = server.request_out.entitySlice();
     const sids = server.request_out.column(h2.StreamId);
@@ -157,7 +165,7 @@ fn processRequests(
     const req_hdrs = server.request_out.column(h2.ReqHeaders);
 
     for (entities, sids, sessions, req_hdrs) |ent, sid, sess, rh| {
-        handleOne(server, allocator, data_dir, ent, sid, sess, rh) catch |err| {
+        handleOne(server, allocator, data_dir, blob_cfg, ent, sid, sess, rh) catch |err| {
             std.log.warn("log-server: handler error: {s}", .{@errorName(err)});
             setResponse(server, ent, sid, sess, 500, null, "internal error\n") catch |se| std.log.err(
                 "log-server: failed to write 500 response after handler error: {s} (entity may be stuck in request_out)",
@@ -171,6 +179,7 @@ fn handleOne(
     server: *LogH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -216,15 +225,15 @@ fn handleOne(
     }
 
     if (std.mem.eql(u8, remainder, "list")) {
-        try handleList(server, allocator, data_dir, ent, sid, sess, instance_id, query);
+        try handleList(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, query);
     } else if (std.mem.startsWith(u8, remainder, "show/")) {
         const id_hex = remainder["show/".len..];
-        try handleShow(server, allocator, data_dir, ent, sid, sess, instance_id, id_hex);
+        try handleShow(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, id_hex);
     } else if (std.mem.eql(u8, remainder, "count")) {
-        try handleCount(server, allocator, data_dir, ent, sid, sess, instance_id);
+        try handleCount(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id);
     } else if (std.mem.startsWith(u8, remainder, "blob/")) {
         const key = remainder["blob/".len..];
-        try handleBlob(server, allocator, data_dir, ent, sid, sess, instance_id, key);
+        try handleBlob(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, key);
     } else {
         try setResponse(server, ent, sid, sess, 404, null, "not found\n");
     }
@@ -236,6 +245,7 @@ fn handleList(
     server: *LogH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -245,7 +255,7 @@ fn handleList(
     const limit = parseLimit(query, 100);
     const after = parseAfter(query);
 
-    var result = log_server.listRecords(allocator, data_dir, instance_id, limit, after) catch |err| {
+    var result = log_server.listRecords(allocator, data_dir, blob_cfg, instance_id, limit, after) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "list failed: {s}\n", .{@errorName(err)});
         try setResponse(server, ent, sid, sess, 500, msg.ptr, msg);
         return;
@@ -260,6 +270,7 @@ fn handleShow(
     server: *LogH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -275,7 +286,7 @@ fn handleShow(
         return;
     };
 
-    var maybe_rec = log_server.getRecord(allocator, data_dir, instance_id, request_id) catch |err| {
+    var maybe_rec = log_server.getRecord(allocator, data_dir, blob_cfg, instance_id, request_id) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "show failed: {s}\n", .{@errorName(err)});
         try setResponse(server, ent, sid, sess, 500, msg.ptr, msg);
         return;
@@ -294,12 +305,13 @@ fn handleCount(
     server: *LogH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
     instance_id: []const u8,
 ) !void {
-    const n = log_server.countRecords(allocator, data_dir, instance_id) catch |err| {
+    const n = log_server.countRecords(allocator, data_dir, blob_cfg, instance_id) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "count failed: {s}\n", .{@errorName(err)});
         try setResponse(server, ent, sid, sess, 500, msg.ptr, msg);
         return;
@@ -312,6 +324,7 @@ fn handleBlob(
     server: *LogH2,
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -322,7 +335,7 @@ fn handleBlob(
         try setResponse(server, ent, sid, sess, 400, null, "missing blob key\n");
         return;
     }
-    const bytes = log_server.getBlob(allocator, data_dir, instance_id, key) catch |err| {
+    const bytes = log_server.getBlob(allocator, data_dir, blob_cfg, instance_id, key) catch |err| {
         const code: u16 = if (err == log_server.Error.NotFound) 404 else 500;
         const msg = try std.fmt.allocPrint(allocator, "blob failed: {s}\n", .{@errorName(err)});
         try setResponse(server, ent, sid, sess, code, msg.ptr, msg);

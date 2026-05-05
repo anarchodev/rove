@@ -358,11 +358,11 @@ pub fn main() !void {
     // for reconnect churn and any manual pokes from the outside.
     // Benchmark spike runs single-node; leader-local files.db
     // writes are fine. Passing null skips the raft propose path.
-    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, 8, null);
+    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, .fs, 8, null);
     defer cs_handle.shutdown();
     const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
 
-    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir, 8);
+    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir, .fs, 8);
     defer ls_handle.shutdown();
     const log_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ls_handle.port);
 
