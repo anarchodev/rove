@@ -20,6 +20,7 @@ const std = @import("std");
 
 pub const fs = @import("fs.zig");
 pub const FilesystemBlobStore = fs.FilesystemBlobStore;
+pub const sigv4 = @import("sigv4.zig");
 
 pub const Error = error{
     /// The key contained characters that could escape the blob store's
@@ -140,4 +141,5 @@ test "validateKey rejects non-printable bytes" {
 
 test {
     _ = @import("fs.zig");
+    _ = @import("sigv4.zig");
 }
