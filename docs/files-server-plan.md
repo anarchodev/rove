@@ -486,58 +486,106 @@ Cloudflare in front of `/_static/*` (PLAN §2.4) handles the cold-cache
 case across browsers — most static fetches never reach the worker
 at all.
 
-### 5.2 The "redirect to S3 URL" alternative — analyzed, deferred
+### 5.2 Per-deployment `static_serve` mode
 
-Considered: instead of the worker proxying the bytes, return a 307
-redirect to a public S3 URL.
+A manifest field `static_serve` selects how the worker handles
+`GET /<static path>` requests. Three modes, picked per deployment:
 
-Pros:
-- Worker carries zero static bytes after the first manifest GET.
-- Same model as image CDNs (S3 with public bucket → direct browser
-  GET).
+```json
+{ "static_serve": "proxy" }              // default — see §5.1
+{ "static_serve": "redirect-public" }    // 302 to public S3 URL
+{ "static_serve": "redirect-presigned" } // 302 to pre-signed S3 URL
+```
 
-Cons (the reasons it's not the default):
-1. **Bucket exposure.** S3 URL leaks bucket name + key prefix layout.
-   For a multi-tenant bucket where prefix = tenant id, this leaks
-   the customer's instance id structure to anyone who watches the
-   redirect chain.
-2. **Cookies stripped on cross-origin redirect.** A static asset that
-   needs the platform session cookie (rare but real — e.g.,
-   `__Host-rove_sid` on a script that calls back into the worker)
-   loses it on the hop. Same-origin proxy preserves it.
-3. **Custom domains.** PLAN §2.10 ships custom domains
-   (`acme.com/logo.png`). Redirecting customer traffic to
-   `s3.foo.com/...` is a UX regression; visible in DevTools, breaks
-   per-domain CSP, breaks "everything served from one origin"
-   simplicity.
-4. **CSP / SRI / SubresourceIntegrity.** Many SPAs lock origins via
-   CSP; a redirect to a third-party origin requires the customer to
-   add that origin to their CSP, which they can't easily do per-asset.
-5. **Private buckets.** rove's S3 bucket is private (no anonymous
-   reads — keys are SigV4-signed). Public-read mode would weaken the
-   security posture significantly. Pre-signed URLs work but expire
-   (TTL'd; can't cache forever) and add CPU per request to sign.
-6. **3xx-followers.** Some HTTP clients (older mobile SDKs, some
-   server-side fetchers) don't follow 3xx automatically. Same-origin
-   200 is more universally supported.
+#### `proxy` (default)
 
-Verdict: not the default. The proxy-with-aggressive-caching model
-gives you 90% of the bandwidth savings (after first hit, browser
-caches forever) without the failure modes.
+Worker streams bytes from S3 on first hit per browser per max-age,
+serves 304 on subsequent revalidations. Same-origin everything;
+cookies preserved; works with custom domains, strict CSP, all HTTP
+clients. Cost: first-hit S3 GET routes through the worker. Mitigated
+by Cloudflare edge cache + browser cache (immutable hash = forever-
+cacheable on the browser side).
 
-**Opt-in mode** for the future: a per-deployment manifest flag
-`{"static_serve": "redirect"}` that switches the worker's static
-handler to issue 307s to pre-signed S3 URLs (with a 1-hour TTL,
-Cache-Control aligned to TTL). Useful for huge customer-facing assets
-where bandwidth dominates and the customer has explicitly chosen
-public-URL exposure. Deferred until a customer needs it.
+The choice when the customer has truly private statics, or when
+URL-leaking the platform's S3 hostname is unacceptable, or when the
+customer's CSP is strict.
+
+#### `redirect-public`
+
+```
+GET acme.loop46.me/img/logo.png
+→ worker reads {hash, content_type} from manifest (in-memory; ~10µs)
+→ 302 Location: https://s3.region.platform.com/bucket/tenants/acme/blobs/{hash}
+→ browser follows; URL is stable per-hash so Cloudflare can cache
+  the redirect target
+→ subsequent requests within Cache-Control TTL: browser cache;
+  cold-edge subsequent requests: edge cache; new edge / new browser:
+  one S3 GET (NOT through worker)
+```
+
+**Worker carries zero bytes after the manifest lookup.** Per-request
+cost is a hash table read + 200-byte 302 response. Customers with
+heavy static traffic (image-rich SaaS, JS bundle ships) get the
+biggest win.
+
+Requires the platform's S3 bucket to be publicly readable. Security
+model: "secure by hash" — sha256 keys are computationally infeasible
+to guess, so an attacker who somehow knew a customer's hashes could
+read them, but those hashes only appear in the customer's own
+manifest (which is itself not public).
+
+Tradeoffs the customer accepts:
+- Bucket name + key layout visible in the redirect chain (DevTools).
+- Customer's CSP must allow the platform's S3 origin (`img-src`,
+  `script-src`, etc. as appropriate).
+- For custom-domain customers (`acme.com/logo.png` → `s3.platform.com/...`),
+  the platform hostname is visible in DevTools — a UX consideration,
+  not a security one.
+
+#### `redirect-presigned`
+
+```
+GET acme.loop46.me/img/logo.png
+→ worker reads hash + signs SigV4 URL with 1h TTL (~100µs HMAC)
+→ 302 Location: https://s3.../bucket/tenants/acme/blobs/{hash}?X-Amz-Signature=...&X-Amz-Expires=3600
+→ browser follows
+→ next request → fresh signature → different URL → can't dedupe at
+  edge cache, but browser still caches per its TTL
+```
+
+Bucket stays private; auth boundary preserved. Cost is per-request
+HMAC signing on the worker (~100µs) and loss of edge-cache
+deduplication across requests (each browser pulls its own copy from
+S3 within its cache window). Worker still carries zero bytes — the
+S3 fetch goes browser-direct.
+
+Useful when bytes-through-worker must be zero AND bucket-must-stay-
+private. Less throughput-friendly than `redirect-public`; more
+private-by-default.
+
+#### Choosing
+
+| Mode | Bytes through worker | Edge-cacheable | CSP friction | Bucket exposure | Per-request CPU |
+|---|---|---|---|---|---|
+| `proxy`             | First hit, then 304s | Yes (via worker) | None | None | ~5µs |
+| `redirect-public`   | Zero | Yes (S3 URL) | Customer adds platform S3 to CSP | Bucket name + hashes visible | ~10µs |
+| `redirect-presigned`| Zero | Browser cache only (URLs vary) | Customer adds platform S3 to CSP | Bucket name visible (signed URL) | ~100µs |
+
+Default is `proxy` for safest semantics. Customers opt into one of
+the redirect modes per-deployment when they want the worker out of
+the bytes path. The flag lives in the manifest, so it's testable by
+deploying with a different value and rolled back by redeploying.
+
+**Range requests:** for `proxy` mode with files > 1 MiB, worker
+forwards `Range` headers to S3 and streams the byte range. For both
+redirect modes, the browser handles ranges directly against S3 — no
+worker involvement.
 
 ### 5.3 Range requests for large statics
 
-For statics > a threshold (say 1 MiB), proxy with `Range` passthrough:
-worker accepts `Range: bytes=0-1023`, forwards to S3, streams the
-range. Avoids buffering the whole file. (The 1 MiB cap in PLAN §2.4
-keeps this from being a v1 issue; relevant if the cap ever lifts.)
+Covered in §5.2 — for `proxy` mode the worker forwards `Range`
+headers to S3 and streams the response; for the redirect modes the
+browser handles ranges directly against S3.
 
 ---
 
@@ -748,12 +796,12 @@ from `files.db`. After: `LIST tenants/{id}/deployments/` returns the
 same set (filenames are zero-padded ids; sort gives chronology). One
 LIST call; no pagination needed for typical tenant scales.
 
-### 10.5 Static-redirect mode
+### 10.5 Static-redirect mode (resolved)
 
-Per §5.2, opt-in `{"static_serve": "redirect"}` is left for a future
-customer ask. The flag lives in the manifest (per-deployment), not
-the tenant config, so it can be tested by deploying with the flag
-and rolled back by redeploying without it.
+Locked in §5.2 as three first-class modes (`proxy`,
+`redirect-public`, `redirect-presigned`), per-deployment manifest
+flag. Default `proxy` preserves all current semantics; the redirect
+modes drop worker bytes entirely for customers who opt in.
 
 ### 10.6 Why no `latest.json` (per-tenant or global)
 
