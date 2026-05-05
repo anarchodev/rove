@@ -212,8 +212,11 @@ pub const TenantFiles = struct {
     instance_id: []u8,
     /// Owned tenant code index (SQLite at `{inst.dir}/files.db`).
     files_kv: *kv_mod.KvStore,
-    /// Owned blob backend at `{inst.dir}/file-blobs/`.
-    blob_backend: blob_mod.FilesystemBlobStore,
+    /// Owned blob backend. With `.fs` config: opens at
+    /// `{inst.dir}/file-blobs/`. With `.s3`: shares the bucket with
+    /// every other tenant on this node, scoped by key prefix
+    /// `{base}{inst.id}/file-blobs/`.
+    blob_backend: blob_mod.BlobBackend,
     /// rove-files wrapper over `files_kv` + `blob_backend`. Compile hook
     /// is a stub — the worker only reads, never uploads.
     store: files_mod.FileStore,
@@ -295,7 +298,10 @@ pub const TenantLog = struct {
     allocator: std.mem.Allocator,
     instance_id: []u8,
     log_kv: *kv_mod.KvStore,
-    blob_backend: blob_mod.FilesystemBlobStore,
+    /// Owned blob backend for log batches. Same `.fs` / `.s3` switch
+    /// as `TenantFiles.blob_backend`; for `.s3` the per-tenant prefix
+    /// is `{base}{inst.id}/log-blobs/`.
+    blob_backend: blob_mod.BlobBackend,
     store: log_mod.LogStore,
 
     pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantLog {
@@ -453,6 +459,14 @@ pub const WorkerConfig = struct {
     /// each worker thread typically gets its own compiler instance
     /// because QuickJS runtimes aren't shareable across threads.
     compile_ctx: ?*anyopaque = null,
+    /// Picks the blob backend each `TenantFiles` / `TenantLog` opens.
+    /// `.fs` keeps the on-disk layout `{inst.dir}/{file,log}-blobs/`;
+    /// `.s3` shares one bucket across all tenants on the node, scoped
+    /// per-tenant by key prefix `{base}{instance_id}/{subdir}/`.
+    /// Owned by the caller — backend strings (endpoint, region, etc.)
+    /// must outlive the worker's `create` call (S3BlobStore.init dupes
+    /// them, so afterwards they can be freed).
+    blob_backend: blob_mod.BackendConfig = .fs,
 };
 
 /// Cross-reference component used by the `/_system/*` proxy. Lives
@@ -557,6 +571,9 @@ pub fn Worker(comptime opts: Options) type {
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
         compile_fn: ?files_mod.CompileFn,
         compile_ctx: ?*anyopaque,
+        /// Picks fs vs s3 for every per-tenant blob backend this
+        /// worker opens. Borrowed from `WorkerConfig.blob_backend`.
+        blob_backend_cfg: blob_mod.BackendConfig,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -614,6 +631,7 @@ pub fn Worker(comptime opts: Options) type {
                 .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
+                .blob_backend_cfg = config.blob_backend,
             };
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
@@ -698,7 +716,15 @@ pub fn Worker(comptime opts: Options) type {
 
             var files_ws = kv_mod.WriteSet.init(allocator);
             defer files_ws.deinit();
-            try deployStarterContent(allocator, inst.dir, compile_fn, self.compile_ctx, &files_ws);
+            try deployStarterContent(
+                allocator,
+                inst.dir,
+                inst.id,
+                self.blob_backend_cfg,
+                compile_fn,
+                self.compile_ctx,
+                &files_ws,
+            );
             _ = try proposeFilesWriteSet(self, &files_ws, target_id);
         }
 
@@ -759,7 +785,13 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
     const files_kv = try kv_mod.KvStore.open(allocator, files_db_path);
     errdefer files_kv.close();
 
-    var blob_backend = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
+    var blob_backend = try blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        worker.blob_backend_cfg,
+        files_blob_dir,
+        inst.id,
+        "file-blobs",
+    );
     errdefer blob_backend.deinit();
 
     const id_copy = try allocator.dupe(u8, inst.id);
@@ -869,7 +901,13 @@ fn openTenantLog(
     const log_kv = try kv_mod.KvStore.open(allocator, log_db_path);
     errdefer log_kv.close();
 
-    var blob_backend = try blob_mod.FilesystemBlobStore.open(allocator, log_blob_dir);
+    var blob_backend = try blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        worker.blob_backend_cfg,
+        log_blob_dir,
+        inst.id,
+        "log-blobs",
+    );
     errdefer blob_backend.deinit();
 
     const id_copy = try allocator.dupe(u8, inst.id);
@@ -1770,6 +1808,8 @@ const STARTER_STATIC_INDEX_HTML =
 fn deployStarterContent(
     allocator: std.mem.Allocator,
     inst_dir: []const u8,
+    inst_id: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
     replicate: ?*kv_mod.WriteSet,
@@ -1792,7 +1832,13 @@ fn deployStarterContent(
     const files_kv = try kv_mod.KvStore.open(allocator, files_db_path);
     defer files_kv.close();
 
-    var blob_backend = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
+    var blob_backend = try blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        blob_cfg,
+        files_blob_dir,
+        inst_id,
+        "file-blobs",
+    );
     defer blob_backend.deinit();
 
     var store = files_mod.FileStore.init(
@@ -1865,7 +1911,10 @@ test "openTenantFiles runs the orphan sweep on startup" {
     allocator.free(before);
 
     // Simulate worker startup: openTenantFiles runs the sweep.
-    const FakeWorker = struct { allocator: std.mem.Allocator };
+    const FakeWorker = struct {
+        allocator: std.mem.Allocator,
+        blob_backend_cfg: blob_mod.BackendConfig = .fs,
+    };
     var fake = FakeWorker{ .allocator = allocator };
     const tc = try openTenantFiles(&fake, inst);
     defer freeTenantFiles(allocator, tc);
@@ -1905,7 +1954,10 @@ test "commitTxn drops the undo row so the next sweep is a no-op" {
     }
 
     // Worker startup runs the sweep; should NOT touch durable-key.
-    const FakeWorker = struct { allocator: std.mem.Allocator };
+    const FakeWorker = struct {
+        allocator: std.mem.Allocator,
+        blob_backend_cfg: blob_mod.BackendConfig = .fs,
+    };
     var fake = FakeWorker{ .allocator = allocator };
     const tc = try openTenantFiles(&fake, inst);
     defer freeTenantFiles(allocator, tc);
@@ -1946,6 +1998,7 @@ test "captureLog appends a record to the tenant's LogStore" {
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
         tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
+        blob_backend_cfg: blob_mod.BackendConfig = .fs,
     };
     var fake = FakeWorker{
         .allocator = allocator,
