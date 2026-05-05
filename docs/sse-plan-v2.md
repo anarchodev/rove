@@ -512,14 +512,43 @@ need to invoke `pumpEmitsForContext` the same way the request handler
 path does. Concrete wiring TBD during implementation; the data model
 (buffer on the context, fire POST after commit) is identical.
 
-### 8.3 Tape replay implications
+### 8.3 Tape replay — emits are not stored or taped
 
-Tape replay deterministically reconstructs handler execution. With
-`events.emit()` no longer touching kv, the writeset tape is smaller —
-no longer carrying the reserved-prefix rows. Replay tooling needs to
-record + replay emits as a separate tape stream (or treat them as
-ephemeral side-effects skipped during replay, depending on what the
-replay UI wants to show).
+The whole tape model is built on handlers being deterministic
+functions of their inputs `(request, kv reads, date, random,
+modules)` — all of which are taped. Same inputs, same outputs.
+**Emits are an output.** Replay re-runs the handler, the
+`events.emit` binding sees the same calls in the same order with the
+same args, the replay UI captures them into a side panel without
+actually firing them.
+
+So emits are stored nowhere:
+
+- Not in `app.db` (no `_events/` rows).
+- Not in the request log (no `events_fired` field).
+- Not in any tape stream.
+
+Replay reproduces them by virtue of the handler being deterministic
+— same model as kv writes (which also aren't stored; replay
+reproduces them by re-execution). The replay UI side panel runs the
+binding in "capture, don't fire" mode and displays what `emit`
+calls happened.
+
+Implication for production observability: developers who want to
+debug "what events did request 1234 fire?" do a replay. The
+dashboard's replay viewer shows the captured emit list. If
+zero-replay observability for emits ever becomes a real need, a
+small `events_count: u32` field can be added to the LogRecord
+later — but the body data of each emit stays out of the log
+(too much bloat, customer data, encryption concerns).
+
+This crystallizes the asymmetry vs. webhooks: webhooks persist via
+transactional outbox in `app.db` because customers depend on the
+"I called `webhook.send` therefore the call WILL be made or surface
+as failure" guarantee; emits are pure outputs of a deterministic
+handler, recoverable from replay, lost on the wire if no listener
+is connected. Outbox = strong delivery; emits = best-effort
+notification.
 
 ### 8.4 Same-origin alternative
 
