@@ -36,27 +36,46 @@ Stated semantics for logs in this design:
 └──────────┘               └─────────────────────────────────────────┘
                                   ▲                          ▲
                                   │ poll LIST + GET          │ ranged GET
-                                  │ (.idx files only)        │ (on click)
+                                  │ (.idx files only,        │ (on record show
+                                  │  background task)        │  click-through)
                                   │                          │
-                           ┌──────┴───────┐           ┌──────┴──────┐
-                           │   indexer    │           │ log-server  │
-                           │ (singleton   │◀──────────│ (per node;  │
-                           │  or sharded; │   query   │  fans out   │
-                           │  rebuildable │           │  to indexer)│
-                           │  from S3)    │           │             │
-                           │              │           │             │
-                           │ log_index.db │           │             │
-                           └──────────────┘           └─────────────┘
-                                  ▲
-                                  │ HTTP query
-                                  │
-                              dashboard
+                                  └────────┬─────────────────┘
+                                           │
+                                ┌──────────┴────────────────┐
+                                │  log-server                │
+                                │  (single process,          │
+                                │   own subdomain            │
+                                │   logs.{public_suffix},    │
+                                │   own TLS, token-handoff   │
+                                │   auth — same shape as     │
+                                │   sse-service)             │
+                                │                            │
+                                │   log_index.db (local      │
+                                │   SQLite; rebuildable      │
+                                │   from S3 at any time)     │
+                                └──────────┬─────────────────┘
+                                           │ HTTPS
+                                           ▼
+                                ┌────────────────────────┐
+                                │ dashboard / customer JS│
+                                │ (token from app domain)│
+                                └────────────────────────┘
 ```
 
-S3 is the **only** coupling point between worker and indexer. There is
-no RPC, no message queue, no raft cluster for the index. The worker
-doesn't know whether an indexer is running; the indexer doesn't know
-which workers exist. Both can be killed and restarted at will.
+**Single binary, single hostname.** What was originally sketched as
+two processes (a background indexer + a per-node log-server with
+fan-out) collapses to one process: the polling-and-indexing loop and
+the HTTP query API live together, the index lives next to them in
+local SQLite, the public surface is one subdomain. Same architectural
+shape sse-service ended up at — single instance, LB+restart for
+failover, no cross-replica coordination.
+
+S3 is the **only** coupling point between worker and log-server.
+Worker writes batches; log-server reads them. Neither knows the other
+exists at runtime beyond the S3 bucket. Both can be killed and
+restarted at will. log-server's local SQLite is recoverable from S3
+on any startup — `last_seen_key` is just a steady-state-polling
+optimization, not a crash-recovery dependency.
 
 ---
 
@@ -190,27 +209,47 @@ The current model's:
 - `RaftLogHandle` / `applyLogBatch` / follower-side log.db apply.
 - Per-tenant `log.db` + `log-blobs/` on every node.
 - The raft propose call inside `flushLogs`.
+- The worker's `/_system/log/*` proxy subsystem (`log_proxy` field,
+  `log_addr` config, the proxy's place in `connectProxies` /
+  `flushProxyPending` / `drainProxyResponses`).
+- The current `src/log_server/` thread that runs as a loopback
+  service on each worker process. log-server moves to a standalone
+  process on `logs.{public_suffix}`.
 
-All of those are replaced by direct S3 PUT. The local
-`LogStore` shrinks to "buffer + serialize + flush"; nothing else.
+All of those are replaced by direct S3 PUT (worker side) and a
+single standalone log-server process (read side). The local
+`LogStore` on the worker shrinks to "buffer + serialize + flush";
+nothing else.
 
 ---
 
-## 4. Indexer
+## 4. log-server (single binary: indexer + query API)
 
 ### 4.1 Process model
 
-A standalone binary (`rove-log-indexer`) with one job: keep
-`log_index.db` in sync with the S3 bucket.
+A standalone binary (`rove-log-server`) with two cooperating jobs:
 
-- Single process per cluster is fine for v1 (workload is small —
-  LIST + GET of a few KB sidecars at 5s cadence).
-- Horizontal scale by sharding on `tenant_id` prefix later. Two
-  indexers running against the same S3 bucket and writing to separate
-  SQLite files is *correct* (idempotent inserts; each is a complete
-  copy); they just duplicate work.
-- Crash recovery: restart and resume from `last_seen_key` (stored in
-  the `_meta` table). No external state needed.
+1. **Background indexing task** keeps `log_index.db` in sync with the
+   S3 bucket (the polling loop in §4.3).
+2. **Public HTTP API** on `logs.{public_suffix}` (own TLS, own h2
+   listener) serves dashboard / customer queries against the index
+   (§5).
+
+Single process per cluster — same architectural shape as sse-service.
+The two jobs share an `*sqlite.Connection` to the local
+`log_index.db`; the indexing task writes, the HTTP API reads.
+
+- Failover: if the process dies, restart on whatever node the LB
+  routes to. log-server's local SQLite is recoverable from S3 — on
+  cold start with no `_meta.last_seen_key`, the polling loop walks
+  the entire bucket and rebuilds (bounded; see §4.4). The
+  steady-state `last_seen_key` is just a polling-efficiency
+  optimization, not a crash-recovery dependency.
+- Cap on horizontal scale at v1: one process per cluster. The
+  workload is small (LIST + small GETs at 5s cadence; SQLite reads
+  for queries). When scale demands it, shard by `hash(tenant_id) % N`
+  into N processes — each owns a subset of tenants. Defer until
+  measurement says so.
 
 ### 4.2 SQLite schema
 
@@ -305,10 +344,11 @@ rebuild a year. Bounded; acceptable for a one-shot recovery.
 ### 5.1 Dashboard "list recent requests"
 
 ```
-log-server fans out → indexer's HTTP API:
+GET https://logs.{public_suffix}/v1/{tenant_id}/list
+    ?after={cursor}&limit=100&status=>=500&token=<jwt>
 
-  GET /v1/{tenant_id}/list?after={cursor}&limit=100&status=>=500
-
+→ validate JWT (signed by platform key; payload = {tenant_id, scope, exp})
+→ verify URL path tenant_id matches token's tenant_id
 → SELECT request_id, received_ns, method, path, status, outcome, ...
   FROM log_index
   WHERE tenant_id = ?
@@ -324,28 +364,60 @@ SQLite query for typical ranges.
 ### 5.2 Dashboard "show full record"
 
 ```
-GET /v1/{tenant_id}/show/{request_id:hex}
+GET https://logs.{public_suffix}/v1/{tenant_id}/show/{request_id:hex}
+    ?token=<jwt>
 
+→ validate JWT (same shape as list)
 → SELECT ndjson_key, offset, length FROM log_index WHERE ...
 → S3 GET ndjson_key WITH Range: bytes=offset-(offset+length-1)
 → gunzip → return JSON record
 ```
 
-One ranged GET. Latency dominated by S3 RTT (~50-150ms typical).
+One ranged GET against S3. Latency dominated by S3 RTT (~50-150ms
+typical).
 
-### 5.3 log-server's role
+### 5.3 Auth: token handoff (same shape as sse-service)
 
-`log-server` becomes a thin shim that:
+log-server lives on `logs.{public_suffix}` — single platform-managed
+hostname for all tenants, mirroring the sse-service model. JWT
+carries identity; queries run with `Authorization: Bearer <jwt>`
+header (or `?token=` query param for environments that prefer it),
+no cookies, no CORS preflight.
 
-1. Authenticates the request (root token, same as today).
-2. Validates the tenant_id is the caller's scope.
-3. Forwards to the indexer's HTTP API (or queries the local
-   `log_index.db` directly if log-server and indexer co-locate).
-4. Returns the response.
+Token-mint endpoints live on whichever domain the caller is on:
 
-If the indexer is the singleton process model: `log-server` on every
-node points at the same indexer's HTTP endpoint. If sharded:
-`log-server` uses `hash(tenant_id) % N` to pick the right indexer.
+- **Admin UI on `app.{public_suffix}`** wants to read any tenant's
+  logs. Calls `app.{public_suffix}/_admin/log-token?tenant=acme&scope=read`
+  (auth: root-token cookie). Returns JWT scoped to `(tenant=acme,
+  scope=read, exp)`.
+- **Customer's own app on `acme.{public_suffix}` or `acme.com`**
+  (custom domain) wants to expose a self-service log view to its
+  users. Calls `/_session/log-token?scope=read-self` on its own
+  domain (auth: `__Host-rove_sid` cookie). Returns JWT scoped to
+  `(tenant=acme, scope=read-self, exp)`.
+
+JWT shape:
+
+```json
+{
+  "v":         1,
+  "tenant_id": "acme",
+  "scope":     "read",            // or "read-self" / "admin"
+  "exp":       1730768400
+}
+```
+
+log-server validates: signature, expiry, URL path tenant_id matches
+token tenant_id, query type is allowed by `scope`. Any failure → 401.
+
+Token leakage hardening: same as sse-service — strip `?token=` from
+access logs before logging; tokens TTL'd to ~1h; scope-bound so a
+leaked token only exposes that tenant's logs at that scope.
+
+The worker's existing `/_system/log/*` proxy goes away. Same cleanup
+shape as files-server: customer admin UI repointed at
+`logs.{public_suffix}` directly, the worker's proxy stays as a
+deprecation bridge for one release, then deletes.
 
 ---
 
@@ -369,15 +441,18 @@ storage cost becomes meaningful.
 JSON is human-readable and the indexer cost is negligible. Sticking
 with JSON for v1 unless sidecar parse time shows up in profiling.
 
-### 6.3 Indexer redundancy
+### 6.3 log-server redundancy
 
-V1: single indexer process, restart on crash. The 5s catch-up window
-on restart is acceptable.
+V1: single process, LB+restart on crash. The 5s polling-catch-up
+window on restart is acceptable; query-API downtime is bounded by
+"how fast does the LB notice the failure and start a fresh
+process."
 
-If the dashboard ever needs <1s availability post-indexer-crash, run
-two indexers against the same S3 bucket, each with its own
-`log_index.db`. log-server's fan-out can pick whichever responds
-first. Trivial because the indexers are pure functions of S3 state.
+If the dashboard ever needs <1s availability post-crash, run two
+log-server processes against the same S3 bucket, each with its own
+`log_index.db`. The LB picks whichever responds first; both indexes
+converge to the same state because both read the same S3. Trivial
+because log-server is a pure function of S3 state.
 
 ### 6.4 Cross-cluster (multi-region) queries
 
@@ -406,20 +481,31 @@ The rip-and-replace is staged so each step is independently
 shippable + smoke-testable.
 
 1. **`rove-blob` already supports S3 (commit ce29f26).** No change.
-2. **Build the indexer binary.** Standalone; can be exercised against
-   a hand-populated bucket. Smoke: PUT a few sidecars, verify the
-   indexer's `log_index.db` reflects them.
-3. **Add the new flush path to `LogStore`** behind a config flag
-   (`log.backend = raft | s3`). Default stays `raft`. Run both code
-   paths in dev to compare.
+2. **Build the standalone log-server binary** (indexing loop +
+   HTTP API + local SQLite, no public listener yet — bind to
+   loopback so existing smokes work). Exercise against a
+   hand-populated bucket: PUT a few sidecars, query via the HTTP
+   API, verify the index reflects them.
+3. **Add the new flush path to worker's `LogStore`** behind a
+   config flag (`log.backend = raft | s3`). Default stays `raft`.
+   Run both code paths in dev to compare.
 4. **Switch `loop46 worker --log-backend=s3`** in dev. Verify
-   end-to-end (worker writes → indexer indexes → dashboard reads).
-5. **Switch the production default to `s3`.** Old `log.db` files on
-   disk become read-only (still readable by the existing `log-server`
-   for historical queries during the transition window).
-6. **Remove envelope type 1, `RaftLogHandle`, `applyLogBatch`,
-   per-tenant `log.db` opens.** Drop the config flag.
-7. **Old `log.db` files** can be migrated by a one-shot
+   end-to-end (worker writes → log-server indexes → dashboard reads
+   via worker's `/_system/log/*` proxy still in place).
+5. **Switch the production default to `s3`.** Old per-tenant `log.db`
+   files on disk become read-only (existing log-server-on-worker
+   thread keeps serving historical queries during transition).
+6. **Move log-server to its own subdomain** `logs.{public_suffix}`.
+   Add the public TLS listener, the token-handoff endpoints
+   (`/_admin/log-token`, `/_session/log-token`) on the worker / admin
+   domains. Admin UI repointed at `logs.{public_suffix}` directly.
+7. **Deprecate the worker `/_system/log/*` proxy.** Worker's old
+   route stays as a deprecation bridge for one release, then deletes
+   in step 8.
+8. **Remove envelope type 1, `RaftLogHandle`, `applyLogBatch`,
+   per-tenant `log.db` opens, the `log_proxy` subsystem, the
+   in-process log-server thread.** Drop the `log.backend` config flag.
+9. **Old per-tenant `log.db` files** can be migrated by a one-shot
    `rove-log-cli migrate-to-s3 --data-dir ... --bucket ...` if any
    operator wants to retain old records; otherwise let TTL expire
    them on disk.
