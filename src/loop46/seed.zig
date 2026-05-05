@@ -64,6 +64,12 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
 
     try std.fs.cwd().makePath(dd);
 
+    // Pick fs vs s3 from env so seed-time bootstraps land in the same
+    // backend the worker will read from. Strings live for the function
+    // body only; bootstrapHandler dupes them on use.
+    var blob_owned = try main_mod.loadBlobBackend(allocator);
+    defer blob_owned.deinit(allocator);
+
     // Resolve manifest dir so relative file paths inside the manifest
     // are interpreted against the manifest file's directory, not cwd.
     const manifest_dir = std.fs.path.dirname(mf) orelse ".";
@@ -116,7 +122,7 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
             });
         }
 
-        try main_mod.bootstrapHandler(allocator, dd, t.id, deploy_files.items);
+        try main_mod.bootstrapHandler(allocator, dd, blob_owned.cfg, t.id, deploy_files.items);
 
         if (t.seed_kv) |kvs| {
             const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dd, t.id });

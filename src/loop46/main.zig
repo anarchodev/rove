@@ -151,6 +151,131 @@ fn parsePeerList(allocator: std.mem.Allocator, peers_str: []const u8) ![]kv.Raft
     return out;
 }
 
+// ── Blob backend env wiring ───────────────────────────────────────────
+//
+// The blob backend is picked at startup from env. With `BLOB_BACKEND=s3`
+// every per-tenant file-blobs / log-blobs handle in this process opens
+// against the configured S3 bucket (path-style, key-prefixed by
+// `{tenant}/{subdir}/`); without it (or `BLOB_BACKEND=fs`) the existing
+// on-disk layout is used. The string allocations live for the process'
+// lifetime — `BlobBackendOwned.deinit` frees them on shutdown.
+
+const ENV_BLOB_BACKEND = "BLOB_BACKEND";
+const ENV_S3_ENDPOINT = "S3_ENDPOINT";
+const ENV_S3_REGION = "S3_REGION";
+const ENV_S3_BUCKET = "S3_BUCKET";
+const ENV_S3_KEY_PREFIX_BASE = "S3_KEY_PREFIX_BASE";
+const ENV_S3_USE_TLS = "S3_USE_TLS";
+const ENV_AWS_AK = "AWS_ACCESS_KEY_ID";
+const ENV_AWS_SK = "AWS_SECRET_ACCESS_KEY";
+
+/// Owns the env-allocated strings that back a `.s3` `BackendConfig`.
+/// `cfg` is the pointer-stable view callers pass to spawn / Worker /
+/// ApplyCtx; `deinit` frees the underlying strings AFTER all workers
+/// have joined.
+pub const BlobBackendOwned = struct {
+    cfg: blob_mod.BackendConfig,
+    /// Owned strings backing `cfg.s3` when `cfg == .s3`. All `null`
+    /// for the `.fs` variant.
+    endpoint: ?[]u8 = null,
+    region: ?[]u8 = null,
+    bucket: ?[]u8 = null,
+    key_prefix_base: ?[]u8 = null,
+    access_key: ?[]u8 = null,
+    secret_key: ?[]u8 = null,
+
+    pub fn deinit(self: *BlobBackendOwned, allocator: std.mem.Allocator) void {
+        if (self.endpoint) |s| allocator.free(s);
+        if (self.region) |s| allocator.free(s);
+        if (self.bucket) |s| allocator.free(s);
+        if (self.key_prefix_base) |s| allocator.free(s);
+        if (self.access_key) |s| allocator.free(s);
+        if (self.secret_key) |s| allocator.free(s);
+    }
+};
+
+fn envOpt(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => err,
+    };
+}
+
+fn envRequired(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    return envOpt(allocator, name) catch |err| return err orelse failExit(
+        "loop46: BLOB_BACKEND=s3 requires {s} to be set\n",
+        .{name},
+    );
+}
+
+/// Build a `BlobBackendOwned` from env. Defaults to `.fs` when
+/// BLOB_BACKEND is unset or `fs`. Any unknown value or missing s3
+/// requirement exits with an explanatory message — startup misconfig
+/// is loud, never silent.
+pub fn loadBlobBackend(allocator: std.mem.Allocator) !BlobBackendOwned {
+    const kind_owned = (try envOpt(allocator, ENV_BLOB_BACKEND)) orelse {
+        return .{ .cfg = .fs };
+    };
+    defer allocator.free(kind_owned);
+
+    if (std.mem.eql(u8, kind_owned, "fs")) return .{ .cfg = .fs };
+
+    if (!std.mem.eql(u8, kind_owned, "s3")) {
+        failExit(
+            "loop46: BLOB_BACKEND must be \"fs\" or \"s3\" (got: \"{s}\")\n",
+            .{kind_owned},
+        );
+    }
+
+    const endpoint = (try envOpt(allocator, ENV_S3_ENDPOINT)) orelse
+        failExit("loop46: BLOB_BACKEND=s3 requires {s} to be set\n", .{ENV_S3_ENDPOINT});
+    errdefer allocator.free(endpoint);
+    const region = (try envOpt(allocator, ENV_S3_REGION)) orelse
+        failExit("loop46: BLOB_BACKEND=s3 requires {s} to be set\n", .{ENV_S3_REGION});
+    errdefer allocator.free(region);
+    const bucket = (try envOpt(allocator, ENV_S3_BUCKET)) orelse
+        failExit("loop46: BLOB_BACKEND=s3 requires {s} to be set\n", .{ENV_S3_BUCKET});
+    errdefer allocator.free(bucket);
+    const access_key = (try envOpt(allocator, ENV_AWS_AK)) orelse
+        failExit("loop46: BLOB_BACKEND=s3 requires {s} to be set\n", .{ENV_AWS_AK});
+    errdefer allocator.free(access_key);
+    const secret_key = (try envOpt(allocator, ENV_AWS_SK)) orelse
+        failExit("loop46: BLOB_BACKEND=s3 requires {s} to be set\n", .{ENV_AWS_SK});
+    errdefer allocator.free(secret_key);
+
+    // Optional: prefix base shared across tenants. Empty default lets
+    // a single bucket host one deployment cleanly.
+    const key_prefix_base = (try envOpt(allocator, ENV_S3_KEY_PREFIX_BASE)) orelse
+        try allocator.dupe(u8, "");
+    errdefer allocator.free(key_prefix_base);
+
+    // Optional: opt out of TLS (DEV ONLY — local MinIO smoke).
+    const use_tls = blk: {
+        const v = (try envOpt(allocator, ENV_S3_USE_TLS)) orelse break :blk true;
+        defer allocator.free(v);
+        if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk false;
+        break :blk true;
+    };
+
+    return .{
+        .cfg = .{ .s3 = .{
+            .endpoint = endpoint,
+            .region = region,
+            .bucket = bucket,
+            .key_prefix_base = key_prefix_base,
+            .access_key = access_key,
+            .secret_key = secret_key,
+            .use_tls = use_tls,
+        } },
+        .endpoint = endpoint,
+        .region = region,
+        .bucket = bucket,
+        .key_prefix_base = key_prefix_base,
+        .access_key = access_key,
+        .secret_key = secret_key,
+    };
+}
+
 // ── Signal-driven shutdown ────────────────────────────────────────────
 //
 // sigaction handler has to be signal-safe; it only stores into an
@@ -198,6 +323,11 @@ const WorkerCtx = struct {
     /// Initialized at the top of `workerMain` and destroyed at exit.
     compiler: *QjsCompiler,
     refresh_interval_ms: u32,
+    /// Picks fs vs s3 for every per-tenant blob backend the worker
+    /// opens. Borrowed from the main thread's `BlobBackendOwned`,
+    /// which keeps the underlying strings alive for the worker's
+    /// lifetime. Identical across all workers.
+    blob_backend_cfg: blob_mod.BackendConfig,
     /// Shared TlsConfig (or null for plaintext h2c). When present,
     /// all workers hand it to their h2 session on accept. Lives in
     /// the main thread; workers borrow.
@@ -308,6 +438,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .rate_limit_caps = args.rate_limit_caps,
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
+        .blob_backend = args.blob_backend_cfg,
     });
     defer worker.destroy();
 
@@ -524,7 +655,11 @@ fn dispatchSubcommand(
 /// tenant's app.db + log.db so the WAL-mode upgrade is committed
 /// before workers race to open them. Each worker opens its own
 /// connections to these files later.
-fn bootstrapTenants(allocator: std.mem.Allocator, cli: cli_mod.Cli) !void {
+fn bootstrapTenants(
+    allocator: std.mem.Allocator,
+    cli: cli_mod.Cli,
+    blob_cfg: blob_mod.BackendConfig,
+) !void {
     const root_path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/__root__.db",
@@ -585,7 +720,7 @@ fn bootstrapTenants(allocator: std.mem.Allocator, cli: cli_mod.Cli) !void {
     // Always-deploy: the embedded admin UI bundle. Demo + benchmark
     // tenants get provisioned by `loop46 seed --manifest ...` (out
     // of band of this binary). The worker discovers them on disk.
-    try bootstrapHandler(allocator, cli.data_dir, "__admin__", &ADMIN_DEPLOY_FILES);
+    try bootstrapHandler(allocator, cli.data_dir, blob_cfg, "__admin__", &ADMIN_DEPLOY_FILES);
 
     // __replay__ — platform tenant for the tape-replay browser page
     // (PLAN §10.12). Lives at `replay.{public_suffix}` via an
@@ -607,7 +742,7 @@ fn bootstrapTenants(allocator: std.mem.Allocator, cli: cli_mod.Cli) !void {
             );
         };
     }
-    try bootstrapHandler(allocator, cli.data_dir, tenant_mod.REPLAY_INSTANCE_ID, &REPLAY_DEPLOY_FILES);
+    try bootstrapHandler(allocator, cli.data_dir, blob_cfg, tenant_mod.REPLAY_INSTANCE_ID, &REPLAY_DEPLOY_FILES);
 
     // Prewarm __admin__ + every disk-discovered tenant's app.db +
     // log.db on the main thread so the WAL-mode transition is
@@ -753,7 +888,20 @@ pub fn main() !void {
 
     try installSignalHandlers();
 
-    try bootstrapTenants(allocator, cli);
+    // Pick fs vs s3 from env. Strings live in `blob_owned` for the
+    // entire process — every per-tenant backend the workers / apply
+    // / files-server / log-server open borrows from `blob_owned.cfg`.
+    var blob_owned = try loadBlobBackend(allocator);
+    defer blob_owned.deinit(allocator);
+    switch (blob_owned.cfg) {
+        .fs => std.log.info("blob backend: fs ({s})", .{cli.data_dir}),
+        .s3 => |s| std.log.info(
+            "blob backend: s3 endpoint={s} region={s} bucket={s} key_prefix_base='{s}' use_tls={}",
+            .{ s.endpoint, s.region, s.bucket, s.key_prefix_base, s.use_tls },
+        ),
+    }
+
+    try bootstrapTenants(allocator, cli, blob_owned.cfg);
 
     const subsystem_max_connections: u32 = @as(u32, num_workers) + 4;
 
@@ -797,6 +945,7 @@ pub fn main() !void {
     defer raft_node.deinit();
 
     apply_ctx = rjs.apply.ApplyCtx.init(allocator, cli.data_dir, raft_node);
+    apply_ctx.blob_backend_cfg = blob_owned.cfg;
     defer apply_ctx.deinit();
 
     var raft_thread = try std.Thread.spawn(.{}, raftThreadMain, .{raft_node});
@@ -809,11 +958,11 @@ pub fn main() !void {
     // files-server can propose files.db writesets through it. Each
     // subsystem owns its own rove context (registry + io_uring +
     // h2 server) and binds to a loopback TCP ephemeral port.
-    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, .fs, subsystem_max_connections, raft_node);
+    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, blob_owned.cfg, subsystem_max_connections, raft_node);
     defer cs_handle.shutdown();
     const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
 
-    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir, .fs, subsystem_max_connections);
+    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir, blob_owned.cfg, subsystem_max_connections);
     defer ls_handle.shutdown();
     const log_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ls_handle.port);
 
@@ -883,6 +1032,7 @@ pub fn main() !void {
             // thread never dereferences it.
             .compiler = undefined,
             .refresh_interval_ms = cli.refresh_interval_ms,
+            .blob_backend_cfg = blob_owned.cfg,
             .tls_config = tls_config,
             .seq_counters = &seq_counters,
             .ready = &ready_events[i],
@@ -944,6 +1094,7 @@ pub const DeployFile = struct {
 pub fn bootstrapHandler(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     files: []const DeployFile,
 ) !void {
@@ -959,7 +1110,13 @@ pub fn bootstrapHandler(
 
     const files_kv = try kv.KvStore.open(allocator, files_db_path);
     defer files_kv.close();
-    var fs_store = try blob_mod.FilesystemBlobStore.open(allocator, files_blob_dir);
+    var fs_store = try blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        blob_cfg,
+        files_blob_dir,
+        instance_id,
+        "file-blobs",
+    );
     defer fs_store.deinit();
 
     // Real qjs compile so the stored bytecode is real.
