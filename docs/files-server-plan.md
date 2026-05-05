@@ -486,106 +486,42 @@ Cloudflare in front of `/_static/*` (PLAN §2.4) handles the cold-cache
 case across browsers — most static fetches never reach the worker
 at all.
 
-### 5.2 Per-deployment `static_serve` mode
+### 5.2 Cloudflare in front does the heavy lifting
 
-A manifest field `static_serve` selects how the worker handles
-`GET /<static path>` requests. Three modes, picked per deployment:
+The whole platform sits behind Cloudflare (PLAN §2.4). For static
+assets that means:
 
-```json
-{ "static_serve": "proxy" }              // default — see §5.1
-{ "static_serve": "redirect-public" }    // 302 to public S3 URL
-{ "static_serve": "redirect-presigned" } // 302 to pre-signed S3 URL
-```
+- First request from any browser anywhere → hits Cloudflare edge.
+  Edge has nothing cached → forwards to worker. Worker reads hash
+  from manifest, GETs from S3, streams back with `ETag: "<hash>"` +
+  appropriate `Cache-Control`. Edge caches the response by URL.
+- Every subsequent request hitting that edge → served from edge
+  cache, never reaches the worker.
+- Browser cache also holds the bytes per `Cache-Control` (immutable
+  for `_static/_immutable/*`; `max-age=600, must-revalidate` for
+  the rest).
+- After browser cache expires → `If-None-Match: "<hash>"` →
+  edge-or-worker returns 304 cheaply.
 
-#### `proxy` (default)
+Effective worker load: one fetch per file per edge per cache TTL
+across the entire visitor base. For a customer with a global
+audience, that's a few hits per file per cache window — negligible.
 
-Worker streams bytes from S3 on first hit per browser per max-age,
-serves 304 on subsequent revalidations. Same-origin everything;
-cookies preserved; works with custom domains, strict CSP, all HTTP
-clients. Cost: first-hit S3 GET routes through the worker. Mitigated
-by Cloudflare edge cache + browser cache (immutable hash = forever-
-cacheable on the browser side).
-
-The choice when the customer has truly private statics, or when
-URL-leaking the platform's S3 hostname is unacceptable, or when the
-customer's CSP is strict.
-
-#### `redirect-public`
-
-```
-GET acme.loop46.me/img/logo.png
-→ worker reads {hash, content_type} from manifest (in-memory; ~10µs)
-→ 302 Location: https://s3.region.platform.com/bucket/tenants/acme/blobs/{hash}
-→ browser follows; URL is stable per-hash so Cloudflare can cache
-  the redirect target
-→ subsequent requests within Cache-Control TTL: browser cache;
-  cold-edge subsequent requests: edge cache; new edge / new browser:
-  one S3 GET (NOT through worker)
-```
-
-**Worker carries zero bytes after the manifest lookup.** Per-request
-cost is a hash table read + 200-byte 302 response. Customers with
-heavy static traffic (image-rich SaaS, JS bundle ships) get the
-biggest win.
-
-Requires the platform's S3 bucket to be publicly readable. Security
-model: "secure by hash" — sha256 keys are computationally infeasible
-to guess, so an attacker who somehow knew a customer's hashes could
-read them, but those hashes only appear in the customer's own
-manifest (which is itself not public).
-
-Tradeoffs the customer accepts:
-- Bucket name + key layout visible in the redirect chain (DevTools).
-- Customer's CSP must allow the platform's S3 origin (`img-src`,
-  `script-src`, etc. as appropriate).
-- For custom-domain customers (`acme.com/logo.png` → `s3.platform.com/...`),
-  the platform hostname is visible in DevTools — a UX consideration,
-  not a security one.
-
-#### `redirect-presigned`
-
-```
-GET acme.loop46.me/img/logo.png
-→ worker reads hash + signs SigV4 URL with 1h TTL (~100µs HMAC)
-→ 302 Location: https://s3.../bucket/tenants/acme/blobs/{hash}?X-Amz-Signature=...&X-Amz-Expires=3600
-→ browser follows
-→ next request → fresh signature → different URL → can't dedupe at
-  edge cache, but browser still caches per its TTL
-```
-
-Bucket stays private; auth boundary preserved. Cost is per-request
-HMAC signing on the worker (~100µs) and loss of edge-cache
-deduplication across requests (each browser pulls its own copy from
-S3 within its cache window). Worker still carries zero bytes — the
-S3 fetch goes browser-direct.
-
-Useful when bytes-through-worker must be zero AND bucket-must-stay-
-private. Less throughput-friendly than `redirect-public`; more
-private-by-default.
-
-#### Choosing
-
-| Mode | Bytes through worker | Edge-cacheable | CSP friction | Bucket exposure | Per-request CPU |
-|---|---|---|---|---|---|
-| `proxy`             | First hit, then 304s | Yes (via worker) | None | None | ~5µs |
-| `redirect-public`   | Zero | Yes (S3 URL) | Customer adds platform S3 to CSP | Bucket name + hashes visible | ~10µs |
-| `redirect-presigned`| Zero | Browser cache only (URLs vary) | Customer adds platform S3 to CSP | Bucket name visible (signed URL) | ~100µs |
-
-Default is `proxy` for safest semantics. Customers opt into one of
-the redirect modes per-deployment when they want the worker out of
-the bytes path. The flag lives in the manifest, so it's testable by
-deploying with a different value and rolled back by redeploying.
-
-**Range requests:** for `proxy` mode with files > 1 MiB, worker
-forwards `Range` headers to S3 and streams the byte range. For both
-redirect modes, the browser handles ranges directly against S3 — no
-worker involvement.
+**Considered: 302 to S3 URL (public bucket or pre-signed) to take
+the worker entirely out of the bytes path.** Rejected as
+unnecessary complexity given Cloudflare. The worker's role per
+static request is already a hash table read + a small range of
+proxied bytes for the rare cache miss; not worth a per-deployment
+flag, two new modes, public-bucket security model, CSP friction,
+or per-request HMAC signing to optimize further. If a future
+customer has traffic patterns Cloudflare can't absorb, revisit.
 
 ### 5.3 Range requests for large statics
 
-Covered in §5.2 — for `proxy` mode the worker forwards `Range`
-headers to S3 and streams the response; for the redirect modes the
-browser handles ranges directly against S3.
+For statics > 1 MiB, worker forwards `Range` headers to S3 and
+streams the byte range back. Avoids buffering the whole file in
+worker memory. The 1 MiB per-file cap in PLAN §2.4 keeps this rare
+in v1; matters if the cap ever lifts.
 
 ---
 
@@ -796,12 +732,14 @@ from `files.db`. After: `LIST tenants/{id}/deployments/` returns the
 same set (filenames are zero-padded ids; sort gives chronology). One
 LIST call; no pagination needed for typical tenant scales.
 
-### 10.5 Static-redirect mode (resolved)
+### 10.5 Static-redirect mode (rejected)
 
-Locked in §5.2 as three first-class modes (`proxy`,
-`redirect-public`, `redirect-presigned`), per-deployment manifest
-flag. Default `proxy` preserves all current semantics; the redirect
-modes drop worker bytes entirely for customers who opt in.
+Considered in §5.2: redirect to public-S3 or pre-signed URL to take
+the worker entirely out of the bytes path. Rejected — Cloudflare in
+front already absorbs essentially all repeat traffic, leaving the
+worker's per-file cost at a few cache-miss fetches per edge per
+TTL. Not worth a per-deployment flag, public-bucket security model,
+or per-request HMAC signing for the marginal further reduction.
 
 ### 10.6 Why no `latest.json` (per-tenant or global)
 
