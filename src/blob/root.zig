@@ -20,6 +20,8 @@ const std = @import("std");
 
 pub const fs = @import("fs.zig");
 pub const FilesystemBlobStore = fs.FilesystemBlobStore;
+pub const s3 = @import("s3.zig");
+pub const S3BlobStore = s3.S3BlobStore;
 pub const sigv4 = @import("sigv4.zig");
 
 pub const Error = error{
@@ -142,4 +144,5 @@ test "validateKey rejects non-printable bytes" {
 test {
     _ = @import("fs.zig");
     _ = @import("sigv4.zig");
+    _ = @import("s3.zig");
 }
