@@ -84,7 +84,7 @@ multi-node gap (replay-after-failover).
 **Sub-plan**: PLAN §3 Phase 5.5 (b) is the spec; no separate
 sub-plan because the work is contained.
 
-### 2. Webhook subsystem — **in progress (steps 1–2 done 2026-05-05)**
+### 2. Webhook subsystem — **in progress (steps 1–3 done 2026-05-05)**
 
 - **Step 1 — done.** `src/webhook_server/root.zig` ships: `WebhookRow`,
   `WebhookStore` (kv-backed at `{data_dir}/webhooks.db`), apply
@@ -109,11 +109,22 @@ sub-plan because the work is contained.
   wrap/unwrap across mixed inner types, truncated-payload rejection,
   and `buildCallbackJson` (delivered + failed) parses with std.json
   matching the schema `callback_dispatch.zig` consumes.
+- **Step 3 — done.** `src/webhook_server/thread.zig` ships a leader-
+  pinned poll loop that scans `webhooks.db` via the new
+  `WebhookStore.readyRows`, POSTs ready rows through `outbox/http_client`
+  (SSRF-checked), classifies the response, and proposes envelope 5
+  (`webhook_complete`) or envelope 6 (`webhook_retry_schedule`)
+  through the local raft node. Wired into `loop46/main.zig` alongside
+  the legacy drainer (both gate on leader; never run concurrently on
+  a follower). Smoke (`scripts/webhook_server_smoke.sh`) injects a
+  row via the new `webhook-test-enqueue` helper, watches the python
+  echo target receive the POST with stamped metadata headers, and
+  verifies envelope 5 applied + the existing `dispatchCallbacks`
+  invoked the customer's `onResult` handler. Lease columns reserved
+  for cross-leader handover; v1 uses an in-memory in-flight set
+  during a single leader's tenure.
 - Remaining steps (per webhook-server-plan.md §7):
-  3. **Webhook-server thread** (next) — leader-pinned spawn/stop,
-     delivery loop reading `WebhookStore`, raft proposer for
-     envelopes 5/6.
-  4. **Dispatcher cutover** — `webhook.send` accumulates per-handler
+  4. **Dispatcher cutover** (next) — `webhook.send` accumulates per-handler
      into a webhook batch on the dispatch state. Combined propose
      at handler-batch commit emits a multi-envelope (type 7)
      containing envelope 0 (writeset) + envelope 4 (webhook batch).
