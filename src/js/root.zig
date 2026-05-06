@@ -57,6 +57,9 @@ pub const session = @import("session.zig");
 pub const events = @import("events.zig");
 pub const events_pump = @import("events_pump.zig");
 pub const events_sweep = @import("events_sweep.zig");
+pub const release_table = @import("release_table.zig");
+
+pub const ReleaseTable = release_table.ReleaseTable;
 
 pub const Budget = dispatcher.Budget;
 pub const PenaltyBox = penalty.PenaltyBox;
@@ -81,7 +84,7 @@ pub const dispatchOnce = worker.dispatchOnce;
 pub const dispatchCallbacks = callback_dispatch.dispatchCallbacks;
 pub const CALLBACK_DEFAULT_MAX_PER_TENANT = callback_dispatch.DEFAULT_MAX_PER_TENANT;
 pub const drainRaftPending = worker.drainRaftPending;
-pub const refreshDeployments = worker.refreshDeployments;
+pub const applyPendingReleases = worker.applyPendingReleases;
 pub const cleanupResponses = worker.cleanupResponses;
 pub const pumpEvents = events_pump.pumpEvents;
 pub const cleanupClosedSseConnections = events_pump.cleanupClosedSseConnections;
@@ -103,4 +106,5 @@ test {
     _ = events;
     _ = events_pump;
     _ = events_sweep;
+    _ = release_table;
 }

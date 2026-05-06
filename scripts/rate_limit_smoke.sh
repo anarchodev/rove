@@ -72,7 +72,6 @@ LOG_HOST="logs.${PUBLIC_SUFFIX}"
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \
-    --refresh-interval-ms 100 \
     --rate-limit-request-capacity 5 \
     --rate-limit-request-refill 0 \
     --rate-limit-email-capacity 2 \
@@ -103,16 +102,21 @@ fail() {
     exit 1
 }
 
-# Helper: PUT a single file into a tenant's deployment.
+# Helper: PUT a single file into a tenant's deployment AND release the
+# new dep_id to the worker (Phase 5.5(e) F2 retired the polling
+# fallback, so the worker only reloads on a release POST).
 put_file() {
     local instance="$1" path="$2" body="$3"
-    local code
-    code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+    local resp
+    resp=$("${CURL[@]}" -w $'\n%{http_code}' \
         -X PUT -H "Authorization: Bearer $JWT" \
         -H "Content-Type: application/javascript" \
         --data-binary "$body" \
         "${FILES_BASE}/${instance}/file/${path}")
+    local code="${resp##*$'\n'}"
+    local dep_id="${resp%$'\n'*}"
     [[ "$code" == "201" ]] || fail "PUT ${instance}/${path}: got $code"
+    release_deployment "$instance" "$dep_id" || fail "release ${instance}/${dep_id}"
 }
 
 # ── 1. Two tenants signed up + magic-link redeemed ────────────────────

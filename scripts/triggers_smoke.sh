@@ -74,7 +74,6 @@ FILES_ORIGIN="https://${FILES_HOST}:${FILES_PORT}"
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \
-    --refresh-interval-ms 100 \
     --fresh >/tmp/triggers-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
@@ -115,18 +114,22 @@ code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${ADMIN_ORIGIN}/v1/auth?mt=$
 ok "POST /v1/signup + /v1/auth redeem trigsmoke"
 
 # Helper: PUT a single file into trigsmoke's deployment. Each call commits
-# a fresh deployment.
+# a fresh deployment AND pushes the new dep_id to the worker via
+# /_system/release (Phase 5.5(e) F2 retired the polling fallback).
 put_file() {
     local path="$1"
     local body="$2"
-    local code
-    code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+    local resp
+    resp=$("${CURL[@]}" -w $'\n%{http_code}' \
         -X PUT \
         -H "Authorization: Bearer $JWT" \
         -H "Content-Type: application/javascript" \
         --data-binary "$body" \
         "${FILES_BASE}/trigsmoke/file/${path}")
+    local code="${resp##*$'\n'}"
+    local dep_id="${resp%$'\n'*}"
     [[ "$code" == "201" ]] || fail "PUT $path: got $code"
+    release_deployment "trigsmoke" "$dep_id" || fail "release after PUT $path failed"
 }
 
 # Helper: read a kv value from trigsmoke's app.db via admin listKv.

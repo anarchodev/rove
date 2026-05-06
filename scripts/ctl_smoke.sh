@@ -112,9 +112,15 @@ dep_id=$("${CURL[@]}" -X POST -H "Authorization: Bearer $JWT" \
 [[ -n "$dep_id" ]] || { echo "FAIL deploy: empty response" >&2; exit 1; }
 echo "deployed 2 file(s) → id=${dep_id}"
 
-# Wait for the worker's deployment refresh poll to observe the new
-# deployment (2s default interval, give it a little extra).
-sleep 2.5
+# Phase 5.5(e) F2 — push the release to the worker. Replaces the
+# 2-second `refreshDeployments` poll. Auth is the root bearer token.
+code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+    -X POST -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"tenant_id\":\"acme\",\"dep_id\":${dep_id}}" \
+    "${ADMIN_ORIGIN}/_system/release")
+[[ "$code" == "204" ]] || { echo "FAIL release: $code" >&2; exit 1; }
+echo "released dep_id=${dep_id}"
 
 # Hit the deployed handlers via the named-export RPC.
 got_root=$(curl -s --http2-prior-knowledge -H "Host: acme.${PUBLIC_SUFFIX}" "${ADMIN_ORIGIN}/?fn=handler")

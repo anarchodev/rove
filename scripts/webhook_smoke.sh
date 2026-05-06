@@ -122,7 +122,6 @@ sleep 0.3
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \
-    --refresh-interval-ms 100 \
     --dev-webhook-unsafe \
     >/tmp/webhook-smoke.out 2>&1 &
 WORKER_PID=$!

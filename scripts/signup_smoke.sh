@@ -71,7 +71,6 @@ LOG_HOST="logs.${PUBLIC_SUFFIX}"
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \
-    --refresh-interval-ms 100 \
     --fresh >/tmp/signup-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
@@ -244,14 +243,16 @@ ok "starter content: GET ${ALICE_ORIGIN}/api → 200 with expected JSON (default
 # as a 200 with an empty body. Now the worker translates it to a 500
 # with `handler threw: <message>` so the customer sees what blew up.
 THROW_SRC='export default function () { throw new Error("boom from smoke"); }'
-code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+resp=$("${CURL[@]}" -w $'\n%{http_code}' \
     -X PUT \
     -H "Authorization: Bearer $JWT" \
     -H "Content-Type: application/javascript" \
     --data-binary "$THROW_SRC" \
     "${FILES_BASE}/alice/file/throw/index.mjs")
+code="${resp##*$'\n'}"
+dep_id="${resp%$'\n'*}"
 [[ "$code" == "201" ]] || fail "deploy throw.mjs: got $code"
-sleep 0.3
+release_deployment "alice" "$dep_id" || fail "release alice/$dep_id (throw deploy)"
 code=$("${CURL[@]}" -o /tmp/ss-alice-throw.txt -w '%{http_code}' "${ALICE_ORIGIN}/throw")
 [[ "$code" == "500" ]] || fail "throw handler: expected 500, got $code (body: $(cat /tmp/ss-alice-throw.txt))"
 grep -q 'handler threw' /tmp/ss-alice-throw.txt || fail "throw body missing 'handler threw' prefix: $(cat /tmp/ss-alice-throw.txt)"
@@ -272,14 +273,16 @@ ECHO_SRC='export default function () {
     method_pseudo: request.headers[":method"] ?? null,
   });
 }'
-code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+resp=$("${CURL[@]}" -w $'\n%{http_code}' \
     -X PUT \
     -H "Authorization: Bearer $JWT" \
     -H "Content-Type: application/javascript" \
     --data-binary "$ECHO_SRC" \
     "${FILES_BASE}/alice/file/echo/index.mjs")
+code="${resp##*$'\n'}"
+dep_id="${resp%$'\n'*}"
 [[ "$code" == "201" ]] || fail "deploy echo/index.mjs: got $code"
-sleep 0.3
+release_deployment "alice" "$dep_id" || fail "release alice/$dep_id (echo deploy)"
 ECHO_BODY=$("${CURL[@]}" \
     -H "User-Agent: smoke/1" \
     -H "X-Test-Sig: v0=abc" \
@@ -316,7 +319,6 @@ wait $PID 2>/dev/null || true
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \
-    --refresh-interval-ms 100 \
     >>/tmp/signup-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT

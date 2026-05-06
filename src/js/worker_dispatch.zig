@@ -207,6 +207,7 @@ fn tryHandleSystem(
     method: []const u8,
     path: []const u8,
     rh: h2.ReqHeaders,
+    body: []const u8,
 ) !bool {
     if (!std.mem.startsWith(u8, path, "/_system/")) return false;
 
@@ -268,6 +269,17 @@ fn tryHandleSystem(
         return true;
     }
 
+    // Phase 5.5(e) F2 — push-based release. The dashboard / CLI
+    // POSTs `{"tenant_id":"...","dep_id":N}` here right after a
+    // successful files-server deploy; we record the new id in the
+    // process-wide `ReleaseTable` and every worker's next dispatch
+    // tick reloads bytecodes via `applyPendingReleases`. Replaces
+    // the legacy 2-second `refreshDeployments` polling loop.
+    if (std.mem.eql(u8, sys_rest, "release")) {
+        try handleRelease(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
+        return true;
+    }
+
     // No remaining proxy subsystems on the worker — `/_system/log/*`
     // retired in Phase 5.5(a) Step B, `/_system/files/*` retired in
     // Phase 5.5(e) Step F1. `/_system/kv/*` and `/_system/tenant/*`
@@ -318,6 +330,63 @@ fn handleServicesTokenMint(
         .{ token, log_base, files_base, exp_ms },
     );
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/json");
+}
+
+/// Body shape: `{"tenant_id":"<id>","dep_id":<u64>}`. Records the
+/// release in the process-wide `ReleaseTable` and returns 204; the
+/// next dispatch tick on every worker observes the update and
+/// reloads. Idempotent — a repeat with the same dep_id is a no-op.
+/// The validation here is intentionally minimal because the caller
+/// is already admin-authenticated; bad bodies just bounce with 400.
+fn handleRelease(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+    cors_origin: ?[]const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST")) {
+        try respb.setSystemResponse(server, ent, sid, sess, 405, "POST only\n", allocator, cors_origin, null);
+        return;
+    }
+    const table = worker.release_table orelse {
+        try respb.setSystemResponse(server, ent, sid, sess, 503, "release table not configured\n", allocator, cors_origin, null);
+        return;
+    };
+
+    var parsed = std.json.parseFromSlice(struct {
+        tenant_id: []const u8,
+        dep_id: u64,
+    }, allocator, body, .{ .ignore_unknown_fields = true }) catch {
+        try respb.setSystemResponse(server, ent, sid, sess, 400, "expected {\"tenant_id\":\"...\",\"dep_id\":N}\n", allocator, cors_origin, null);
+        return;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value.tenant_id.len == 0 or parsed.value.dep_id == 0) {
+        try respb.setSystemResponse(server, ent, sid, sess, 400, "tenant_id required and dep_id must be > 0\n", allocator, cors_origin, null);
+        return;
+    }
+
+    // Reject unknown tenants — keeps stale dashboard sessions from
+    // populating the table with garbage that never matches.
+    const inst_opt = worker.tenant.getInstance(parsed.value.tenant_id) catch null;
+    if (inst_opt == null) {
+        try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown tenant\n", allocator, cors_origin, null);
+        return;
+    }
+
+    table.set(parsed.value.tenant_id, parsed.value.dep_id) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "release record failed: {s}\n", .{@errorName(err)});
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        return;
+    };
+
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
 }
 
 /// Outcome of `resolveRequest`: either the request was finalized
@@ -553,7 +622,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const body: []const u8 = if (req_body.data) |p| p[0..req_body.len] else "";
 
         // `/_system/*` — CORS gate, then auth + proxy routing.
-        if (try tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh)) {
+        if (try tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh, body)) {
             processed += 1;
             continue;
         }

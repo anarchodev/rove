@@ -30,3 +30,22 @@ files_curl() {
 log_curl() {
     "${CURL[@]}" -H "Authorization: Bearer $JWT" "$@"
 }
+
+# `release_deployment <tenant_id> <dep_id>` — POST /_system/release on
+# the worker so it reloads bytecodes for the tenant. Replaces the
+# 2-second `refreshDeployments` poll retired in Phase 5.5(e) F2.
+# ROVE_TOKEN must be the root bearer.
+release_deployment() {
+    local tenant="$1"
+    local dep_id="$2"
+    local code
+    code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+        -X POST -H "Authorization: Bearer $ROVE_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"tenant_id\":\"${tenant}\",\"dep_id\":${dep_id}}" \
+        "${ADMIN_ORIGIN}/_system/release")
+    if [[ "$code" != "204" ]]; then
+        echo "release_deployment ${tenant}/${dep_id}: got $code" >&2
+        return 1
+    fi
+}

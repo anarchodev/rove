@@ -76,7 +76,6 @@ rm -rf "$DATA_DIR"
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \
-    --refresh-interval-ms 100 \
     --fresh >/tmp/replay-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
@@ -208,7 +207,7 @@ print(json.dumps({
 echo "$deploy_v2_resp" | grep -q '"id":"0000000000000002"' || \
     fail "multi-file deploy v2 unexpected response: $deploy_v2_resp"
 ok "multi-file deploy compiled (sibling import resolved at compile time)"
-sleep 0.5
+release_deployment "alice" 2 || fail "release alice/2"
 
 resp=$("${CURL[@]}" -X POST -d 'first-visit' \
     "https://${ALICE_HOST}:${PORT}/world")

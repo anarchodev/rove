@@ -68,7 +68,6 @@ LOG_HOST="logs.loop46.localhost"
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \
-    --refresh-interval-ms 100 \
     --fresh >/tmp/static-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
@@ -115,15 +114,19 @@ ok "assignDomain ${CUSTOMER_HOST} → demo"
 
 put_static() {
     local path="$1" ct="$2" body="$3"
-    local code
-    code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+    local resp
+    resp=$("${CURL[@]}" -w $'\n%{http_code}' \
         -H "Authorization: Bearer $JWT" -X PUT \
         -H "Content-Type: $ct" \
         --data-binary "$body" \
         "${FILES_BASE}/demo/file/${path}")
-    # Wait long enough for the worker's refresh poll (100ms + slack)
-    # to pick up the new deployment before the next GET.
-    sleep 0.25
+    local code="${resp##*$'\n'}"
+    local dep_id="${resp%$'\n'*}"
+    if [[ "$code" == "201" ]]; then
+        # Push the release so the worker reloads before the next GET.
+        # Phase 5.5(e) F2 retired the polling fallback.
+        release_deployment "demo" "$dep_id" >/dev/null 2>&1 || true
+    fi
     printf '%s\n' "$code"
 }
 

@@ -76,7 +76,6 @@ LOG_HOST="logs.${PUBLIC_SUFFIX}"
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \
-    --refresh-interval-ms 100 \
     --fresh >/tmp/sse-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
@@ -123,14 +122,17 @@ put_file_to() {
     local tenant="$1"
     local path="$2"
     local body="$3"
-    local code
-    code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+    local resp
+    resp=$("${CURL[@]}" -w $'\n%{http_code}' \
         -X PUT \
         -H "Authorization: Bearer $JWT" \
         -H "Content-Type: application/javascript" \
         --data-binary "$body" \
         "${FILES_BASE}/${tenant}/file/${path}")
+    local code="${resp##*$'\n'}"
+    local dep_id="${resp%$'\n'*}"
     [[ "$code" == "201" ]] || fail "PUT ${tenant}/${path}: got $code"
+    release_deployment "$tenant" "$dep_id" || fail "release ${tenant}/${dep_id}"
 }
 
 # ── 1. Two tenants ────────────────────────────────────────────────

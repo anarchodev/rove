@@ -67,25 +67,30 @@ sub-plan's migration order. No big-bang cutovers between them.
   refreshes ~once per 4 minutes). Per-tenant `log.db` and
   `Worker.log_proxy` are gone; tape body capture flows via the
   per-tenant `BlobBackend` shared between worker + standalone.
-- **(e) files-server — F1 done (subdomain + JWT); F2 pending
-  (S3-manifest data-model migration).** Files-server now runs at
-  `https://files.{public_suffix}` with TLS + JWT-gated routes,
-  reusing the same shared HMAC secret as log-server. Worker
-  proxy / `code_proxy` / `ProxyTag` / `ProxyPeer` / `proxy.zig` /
-  `/_system/files/*` route all deleted. Dashboard hits files-server
-  cross-origin via `filesFetch()`. Data model unchanged — files.db
-  + envelope type 3 still in place; F2 retires them.
+- **(e) files-server — F1 + F2-push done; F2-storage pending.**
+  Files-server runs at `https://files.{public_suffix}` with TLS +
+  JWT-gated routes, reusing the same shared HMAC secret as
+  log-server. Worker proxy / `code_proxy` / `ProxyTag` / `ProxyPeer`
+  / `proxy.zig` / `/_system/files/*` route all deleted (F1).
+  Dashboard / CLI now POST `/_system/release {tenant_id, dep_id}`
+  on the worker after every successful deploy; the worker's
+  process-wide `ReleaseTable` carries the signal across worker
+  threads and `applyPendingReleases` triggers the bytecode reload
+  on every worker's next dispatch tick (F2-push). Polling loop +
+  `--refresh-interval-ms` flag retired. Data model unchanged —
+  files.db + envelope type 3 still in place; F2-storage retires
+  them.
 - **(c) snapshot — not started.** Waits on (a) + (e) retiring
   envelope types 1 + 3 to reduce raft log pressure.
 
 **Next pickup:**
-1. **(e) F2 — files data-model migration.** S3 manifest at
-   `tenants/{id}/deployments/{dep_id}.json`, `_deploy/active` kv
-   marker as the release signal, worker reads from S3 (drop
-   files.db + envelope type 3). Big piece — see
-   `docs/files-server-plan.md` §3-§7 for the design and the F2
-   notes under piece 4 below for the cross-thread coordination
-   problem that has to be solved as part of it.
+1. **(e) F2-storage — manifest in S3, drop files.db.** Move the
+   per-tenant manifest from `{id}/files.db` (deployment/* rows) to
+   S3 at `tenants/{id}/deployments/{dep_id:020d}.json`. Worker
+   reload reads JSON via files-server HTTP instead of opening
+   files.db. Drops envelope type 3, `applyFilesWriteSet`,
+   `ApplyCtx.files_stores`, `deployStarterContent`'s writeset path,
+   files.db opens entirely. See `docs/files-server-plan.md` §3-§7.
 
 Detail per piece below.
 
@@ -382,14 +387,16 @@ sequence). Each step is independently shippable + smoke-testable.
 
 **Sub-plan**: `docs/logs-plan.md`.
 
-### 4. Files-server architectural move — **F1 done 2026-05-06; F2 (data-model migration) pending**
+### 4. Files-server architectural move — **F1 + F2-push done 2026-05-06; F2-storage pending**
 
 **What it delivers**: files-server moves to its own subdomain
-(`files.{public_suffix}`), manifest in S3
-(`tenants/{id}/deployments/{dep_id}.json`), runtime release signal
-becomes `_deploy/active` kv marker observed via
-`markDirtyFromWriteset`. Worker drops `files.db` per tenant, the
-`/_system/files/*` proxy, and envelope type 3.
+(`files.{public_suffix}`), the runtime release signal becomes a
+push from the dashboard / CLI rather than a polled kv read, and
+the manifest eventually moves from per-tenant `files.db` to S3
+(`tenants/{id}/deployments/{dep_id}.json`). Worker drops the
+`/_system/files/*` proxy (F1), `refreshDeployments` polling loop
+(F2-push), and eventually `files.db` per tenant + envelope type 3
+(F2-storage).
 
 **F1 — done 2026-05-06.** Subdomain move + JWT handoff. Files-server
 runs at `https://files.{public_suffix}` with its own TLS listener
@@ -408,37 +415,39 @@ deletion: `rove-js-ctl` removed (legacy h2-client over the proxy);
 proxy — gone). Pre-launch sweep: no parallel-write code, no
 back-compat fallback, no dual auth shape.
 
-**F2 — pending.** S3 manifest at
-`tenants/{id}/deployments/{dep_id}.json`, runtime release signal
-becomes `_deploy/active` kv marker observed via
-`markDirtyFromWriteset`. Worker drops `files.db` per tenant + the
-async load + atomic-swap manifest model. Drops envelope type 3
-entirely. Big piece — see `docs/files-server-plan.md` §3-§7.
+**F2-push — done 2026-05-06.** Push-from-dashboard release signal.
+The earlier design (kv `_deploy/active` marker observed via
+`markDirtyFromWriteset`) was discarded after the user pointed out
+that the dashboard / CLI is the natural orchestrator: it already
+knows when a deploy completed, so just have it tell the worker
+directly. Implementation: new `/_system/release` system route on
+the worker (root-bearer or cookie auth) accepts
+`{"tenant_id":"...","dep_id":N}` and writes into a process-wide
+`ReleaseTable` (mutex-guarded `StringHashMapUnmanaged(u64)`).
+Each worker's dispatch tick calls `applyPendingReleases`, which
+walks `tenant_files_map`, looks up the table, and reloads
+bytecodes for any tenant whose released id advanced past the
+cached `current_deployment_id`. Multi-worker propagation comes
+free — every worker reads the same table on every tick. Cold-load
+on first request to a fresh tenant still works (lazy-open hits
+files.db's `deployment/current`), and a worker restart eagerly
+loads the latest deployment in `Worker.create`. Retires:
+`refreshDeployments`, `--refresh-interval-ms` CLI flag,
+`WorkerConfig.refresh_interval_ns`, `TenantFiles.next_refresh_ns`.
+Smokes (`ctl_smoke.sh`, `triggers_smoke.sh`, `replay_smoke.sh`,
+`static_smoke.sh`, `rate_limit_smoke.sh`, `sse_smoke.sh`,
+`signup_smoke.sh`) updated to POST `/_system/release` (via
+`release_deployment` helper in `_smoke_helpers.sh`) after each
+files-server deploy. Multi-node propagation deferred; today's
+single-node deployments work as designed.
 
-**Open design problem flagged during F1's planning round:** the
-release-signal observer needs to fire on every node, but the
-producer (files-server thread) and consumer (worker thread) live
-in different threading domains, and ApplyCtx — which sees the
-apply on followers — doesn't have access to worker state. Three
-options surveyed:
-
-1. **Add a callback to ApplyCtx** that the worker thread polls for
-   notifications. Cleanest but most code.
-2. **Files-server writes `_deploy/active` directly to leader's
-   app.db** (fresh KvStore connection) + proposes envelope 0 for
-   follower replication. Worker observes via the dispatcher hook
-   (worker_dispatch.zig:112's `markDirtyFromWriteset` call)
-   on the leader; followers depend on their own apply path
-   triggering somehow. Asymmetric.
-3. **Just keep polling, reduce interval to 100ms.** Trivial change
-   but doesn't match the plan.
-
-F2 should likely combine (1) with the rest of the data-model
-migration in one cutover — the cross-thread coordination plumbing
-is needed regardless of whether the manifest lives in S3 or
-files.db. Splitting F2 into "release signal first, manifest
-second" doesn't reduce risk because both halves need the
-notification machinery.
+**F2-storage — pending.** Move the per-tenant manifest from
+`{id}/files.db` (deployment/* rows) to S3 at
+`tenants/{id}/deployments/{dep_id:020d}.json`. Worker reload
+reads JSON via files-server HTTP instead of opening files.db.
+Drops envelope type 3, `applyFilesWriteSet`,
+`ApplyCtx.files_stores`, `deployStarterContent`'s writeset path,
+files.db opens entirely. See `docs/files-server-plan.md` §3-§7.
 
 **Definition of done**: see `docs/files-server-plan.md` §9
 "Migration order."

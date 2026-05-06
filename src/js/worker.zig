@@ -73,6 +73,7 @@ const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
 const events_pump = @import("events_pump.zig");
+const release_table_mod = @import("release_table.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = dispatcher_mod.Request;
 
@@ -146,11 +147,6 @@ pub const BlockedTenants = struct {
     }
 };
 
-/// Default interval between deployment refresh checks. Each tick the
-/// worker may check one tenant's `deployment/current` to see if it
-/// advanced and reload the handler bytecode if so.
-pub const DEFAULT_REFRESH_INTERVAL_NS: i64 = 2 * std.time.ns_per_s;
-
 
 /// Metadata about a static file in the active deployment. Bytes are
 /// not cached — the dispatcher fetches them from the blob store on hit.
@@ -202,8 +198,9 @@ fn triggerPathToPrefix(path: []const u8) ?[]const u8 {
 /// and the customer-write guard counterpart.
 const isReservedTriggerPrefix = reserved.isReservedTriggerPrefix;
 
-/// Refreshed periodically via `refreshDeployments` when the tenant's
-/// `deployment/current` advances.
+/// Reloaded by `applyPendingReleases` whenever the dashboard / CLI
+/// pushes a new deployment id into the process-wide `ReleaseTable`
+/// via `/_system/release`.
 pub const TenantFiles = struct {
     allocator: std.mem.Allocator,
     /// Owned copy of the instance id. Used as the key in the worker's
@@ -246,11 +243,6 @@ pub const TenantFiles = struct {
     /// BEFORE chain reverses (outermost-first). See PLAN §2.5 for the
     /// tree-traversal-order rationale.
     triggers: []TriggerEntry,
-    /// When the next refresh check is allowed (absolute
-    /// `std.time.nanoTimestamp()`). `refreshDeployments` skips tenants
-    /// whose deadline hasn't passed yet so we don't hammer the code
-    /// store on every tick.
-    next_refresh_ns: i64,
     /// Active SSE connections for this tenant. Owned `SseConnection`
     /// records — sid + h2 stream entity + cursor + last-send timestamp.
     /// Linear-scan lookup is fine at v1's per-instance caps. Populated
@@ -410,9 +402,13 @@ pub const WorkerConfig = struct {
     /// Upper bound on how long a parked raft proposal can wait before
     /// we compensate-rollback and return 503. See `RaftWait` docs.
     commit_wait_timeout_ns: u64 = 2 * std.time.ns_per_s,
-    /// How often `refreshDeployments` re-reads `deployment/current`
-    /// per tenant.
-    refresh_interval_ns: i64 = DEFAULT_REFRESH_INTERVAL_NS,
+    /// Process-wide `tenant_id → released_dep_id` table the worker
+    /// reads on every dispatch tick. The dashboard / CLI POST to
+    /// `/_system/release` after each successful files-server deploy
+    /// stamps the new id here; `applyPendingReleases` triggers the
+    /// reload. When null, releases never reach the worker — useful
+    /// only for tests that pre-load every deployment at startup.
+    release_table: ?*release_table_mod.ReleaseTable = null,
     /// Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — HMAC-SHA256
     /// secret used to sign JWTs minted at `/_system/services-token`.
     /// The standalone log-server + files-server (separate threads /
@@ -539,7 +535,9 @@ pub fn Worker(comptime opts: Options) type {
         /// exhausted.
         limiter: limiter_mod.RateLimiter,
         commit_wait_timeout_ns: u64,
-        refresh_interval_ns: i64,
+        /// Borrowed from `WorkerConfig.release_table`. See the config
+        /// field for semantics. Null disables the push surface entirely.
+        release_table: ?*release_table_mod.ReleaseTable,
         /// Borrowed from `WorkerConfig.admin_origin`. See the config
         /// field for semantics. Null when CORS is disabled.
         admin_origin: ?[]const u8,
@@ -611,7 +609,7 @@ pub fn Worker(comptime opts: Options) type {
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .limiter = limiter_mod.RateLimiter.init(allocator, config.rate_limit_caps),
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
-                .refresh_interval_ns = config.refresh_interval_ns,
+                .release_table = config.release_table,
                 .admin_origin = config.admin_origin,
                 .admin_api_domain = config.admin_api_domain,
                 .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
@@ -792,7 +790,6 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
         .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
-        .next_refresh_ns = 0,
         .sse_connections = .empty,
         .dirty_sids = .empty,
     };
@@ -1424,45 +1421,30 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
     );
 }
 
-/// Check each tenant's `deployment/current`; if it advanced since the
-/// last observed id, reload the handler bytecode. Respects per-tenant
-/// `next_refresh_ns` deadlines so we don't hammer the store on every
-/// tick. Called from the main poll loop alongside `dispatchPending`.
-pub fn refreshDeployments(worker: anytype) !void {
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+/// Walk every open tenant once per tick. For each, look up the latest
+/// released dep_id in the process-wide `ReleaseTable`; if it's newer
+/// than what the worker has cached, reload the bytecodes from this
+/// tenant's local files.db.
+///
+/// The push that populates the table comes from `/_system/release`
+/// (POST), driven by the dashboard / CLI right after a successful
+/// files-server deploy. Without the push, this is a no-op — there's
+/// no polling fallback. A new leader / restarted worker will have
+/// already loaded the latest deployment during `Worker.create`'s
+/// eager open, so the no-push baseline is "what was on disk at
+/// startup" rather than "nothing".
+pub fn applyPendingReleases(worker: anytype) !void {
+    const table = worker.release_table orelse return;
     var it = worker.tenant_files_map.iterator();
     while (it.next()) |entry| {
         const tc = entry.value_ptr.*;
-        if (now_ns < tc.next_refresh_ns) continue;
-        tc.next_refresh_ns = now_ns + worker.refresh_interval_ns;
-
-        // Peek at deployment/current without loading the full manifest —
-        // if the id hasn't changed we skip the work.
-        const cur_bytes = tc.files_kv.get("deployment/current") catch |err| switch (err) {
-            error.NotFound => continue, // still no deployment
-            else => {
-                std.log.warn(
-                    "rove-js refresh: tenant {s} kv.get failed: {s}",
-                    .{ tc.instance_id, @errorName(err) },
-                );
-                continue;
-            },
-        };
-        defer worker.allocator.free(cur_bytes);
-
-        const new_id = std.fmt.parseInt(u64, cur_bytes, 16) catch |err| {
-            std.log.warn(
-                "rove-js refresh: tenant {s} current parse failed: {s}",
-                .{ tc.instance_id, @errorName(err) },
-            );
-            continue;
-        };
-        if (new_id == tc.current_deployment_id) continue;
+        const released = table.get(tc.instance_id) orelse continue;
+        if (released == tc.current_deployment_id) continue;
 
         reloadAllBytecodes(tc) catch |err| {
             std.log.warn(
-                "rove-js refresh: tenant {s} reload failed: {s}",
-                .{ tc.instance_id, @errorName(err) },
+                "rove-js release: tenant {s} reload to {d} failed: {s}",
+                .{ tc.instance_id, released, @errorName(err) },
             );
         };
     }

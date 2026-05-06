@@ -326,6 +326,24 @@ export const api = {
     return res.json(); // { id, parent_id }
   },
 
+  /// Phase 5.5(e) F2 — push the deploy id back to the worker so it
+  /// reloads bytecodes immediately. Replaces the legacy 2-second
+  /// `refreshDeployments` polling loop. Same-origin POST against the
+  /// admin host (cookie-authenticated). Idempotent — repeating the
+  /// same {tenant_id, dep_id} is a no-op.
+  async releaseDeployment(instance_id, dep_id) {
+    const res = await fetch(adminBase() + "/_system/release", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: instance_id, dep_id }),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new ApiError(res.status, res.statusText, txt);
+    }
+  },
+
   /// High-level helper: takes a map `{path: {bytes, kind, content_type?}}`,
   /// hashes each, uploads missing blobs in parallel, and commits the
   /// manifest. Returns the deploy result `{id, parent_id}`.
@@ -361,7 +379,14 @@ export const api = {
       manifest[e.path] = { hash: e.hash, kind: e.kind };
       if (e.content_type) manifest[e.path].content_type = e.content_type;
     }
-    return this.deployManifest(instance_id, manifest, { parent_id, comment });
+    const result = await this.deployManifest(instance_id, manifest, { parent_id, comment });
+    // The dashboard / CLI is the source of truth for "this deploy is
+    // live now". Tell the worker to reload before resolving the
+    // promise so the next request lands on the new code. The
+    // numeric id comes back as a hex string from the files-server.
+    const dep_id_num = typeof result.id === "string" ? parseInt(result.id, 16) : result.id;
+    await this.releaseDeployment(instance_id, dep_id_num);
+    return result;
   },
 
   // ── Out-of-band: logs ─────────────────────────────────────────────

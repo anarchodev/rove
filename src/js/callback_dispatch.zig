@@ -493,7 +493,6 @@ test "findCallbackBytecode: exact .mjs match wins over .js" {
         .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
-        .next_refresh_ns = 0,
         .sse_connections = .empty,
         .dirty_sids = .empty,
     };
@@ -518,7 +517,6 @@ test "findCallbackBytecode: falls back to .js when no .mjs" {
         .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
-        .next_refresh_ns = 0,
         .sse_connections = .empty,
         .dirty_sids = .empty,
     };
@@ -542,7 +540,6 @@ test "findCallbackBytecode: rejects absolute + parent-escape paths" {
         .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
-        .next_refresh_ns = 0,
         .sse_connections = .empty,
         .dirty_sids = .empty,
     };
@@ -568,7 +565,6 @@ test "findCallbackBytecode: miss returns null" {
         .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
-        .next_refresh_ns = 0,
         .sse_connections = .empty,
         .dirty_sids = .empty,
     };

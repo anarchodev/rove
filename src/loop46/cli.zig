@@ -89,11 +89,6 @@ pub const Cli = struct {
     /// has). Mapped directly to `RaftNodeConfig.propose_linger_ns`
     /// at init time.
     propose_linger_us: u64 = 500,
-    /// How often each tenant's `deployment/current` is polled for
-    /// changes. Low values make new deploys visible fast (good for
-    /// tests); high values reduce per-tenant kv work. Mapped onto
-    /// `WorkerConfig.refresh_interval_ns`. 0 means "every tick".
-    refresh_interval_ms: u32 = 2000,
     /// **DEV-ONLY.** Relax the outbox drainer's SSRF block on
     /// loopback (`127/8`, `::1`) and accept `http://` webhook URLs.
     /// Intended for local smoke tests against an on-box HTTP echo
@@ -220,10 +215,6 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.propose_linger_us = try std.fmt.parseInt(u64, args[i], 10);
-        } else if (std.mem.eql(u8, a, "--refresh-interval-ms")) {
-            i += 1;
-            if (i >= args.len) return error.Usage;
-            out.refresh_interval_ms = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, a, "--dev-webhook-unsafe")) {
             out.dev_webhook_unsafe = true;
         } else if (std.mem.eql(u8, a, "--rate-limit-request-capacity")) {

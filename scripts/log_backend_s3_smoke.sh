@@ -121,7 +121,6 @@ export S3_KEY_PREFIX_BASE="$SMOKE_PREFIX"
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \
-    --refresh-interval-ms 100 \
     >/tmp/lbs-worker.out 2>&1 &
 WORKER_PID=$!
 
