@@ -40,6 +40,7 @@ const blob_mod = @import("rove-blob");
 const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const indexer_mod = @import("indexer.zig");
+const auth = @import("auth.zig");
 
 const LogH2 = h2.H2(.{});
 
@@ -74,6 +75,24 @@ pub const Config = struct {
     /// Loop46 passes its `--data-dir`; the standalone binary doesn't
     /// expose this because it's S3-only.
     fs_data_dir: ?[]const u8 = null,
+    /// Optional TLS — when set, the listener does TLS termination via
+    /// rove-h2's standard path (the `*TlsConfig` is shared with the
+    /// worker, both built once by `loop46/main.zig::resolveTls`).
+    /// Null = h2c (the standalone binary's smoke driver path).
+    tls_config: ?*h2.TlsConfig = null,
+    /// Required for `/v1/*` requests — HMAC-SHA256 secret used to
+    /// verify the JWT in `Authorization: Bearer <token>`. The worker
+    /// mints these tokens at `/_system/log-token` after a session /
+    /// bearer-auth check; the dashboard sends them with each
+    /// log-server call. When null, every `/v1/*` request returns 401
+    /// (lets a smoke spin up a standalone without auth wired).
+    jwt_secret: ?[]const u8 = null,
+    /// `Access-Control-Allow-Origin` value emitted on every `/v1/*`
+    /// response. The dashboard at `https://app.{suffix}` calls the
+    /// log-server at `https://logs.{suffix}`, so the browser refuses
+    /// the response without a matching CORS header. Null = no CORS
+    /// (the standalone binary's loopback smoke path doesn't need it).
+    cors_origin: ?[]const u8 = null,
 };
 
 /// Lazy per-tenant `BlobBackend` cache for the blob read path.
@@ -213,7 +232,9 @@ fn runThread(h: *Handle) !void {
         .max_connections = h.config.max_connections,
         .buf_count = 64,
         .buf_size = 64 * 1024,
-    }, .{}) catch |err| {
+    }, .{
+        .tls_config = h.config.tls_config,
+    }) catch |err| {
         h.bind_err = err;
         h.ready.set();
         return;
@@ -223,7 +244,11 @@ fn runThread(h: *Handle) !void {
     h.port = try resolveBoundPort(server);
     h.ready.set();
 
-    std.log.info("log-server-standalone: h2c on 127.0.0.1:{d}", .{h.port});
+    if (h.config.tls_config != null) {
+        std.log.info("log-server-standalone: h2 (TLS) on port {d}", .{h.port});
+    } else {
+        std.log.info("log-server-standalone: h2c on 127.0.0.1:{d}", .{h.port});
+    }
 
     var blob_cache: ?BlobCache = if (h.config.blob_backend_cfg) |cfg|
         BlobCache.init(allocator, cfg, h.config.fs_data_dir orelse "")
@@ -231,15 +256,16 @@ fn runThread(h: *Handle) !void {
         null;
     defer if (blob_cache) |*c| c.deinit();
 
+    const rctx: ReqCtx = .{
+        .cfg = &h.config,
+        .store = h.config.store,
+        .db = h.config.db,
+        .blob_cache = if (blob_cache) |*c| c else null,
+    };
+
     while (!h.stop.load(.acquire)) {
         try server.pollWithTimeout(100 * std.time.ns_per_ms);
-        try processRequests(
-            server,
-            allocator,
-            h.config.store,
-            h.config.db,
-            if (blob_cache) |*c| c else null,
-        );
+        try processRequests(server, allocator, rctx);
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
@@ -261,12 +287,17 @@ fn cleanupResponses(server: *LogH2) !void {
 
 // ── Request routing ───────────────────────────────────────────────
 
-fn processRequests(
-    server: *LogH2,
-    allocator: std.mem.Allocator,
+const ReqCtx = struct {
+    cfg: *const Config,
     store: batch_store_mod.BatchStore,
     db: *index_db_mod.IndexDb,
     blob_cache: ?*BlobCache,
+};
+
+fn processRequests(
+    server: *LogH2,
+    allocator: std.mem.Allocator,
+    rctx: ReqCtx,
 ) !void {
     const entities = server.request_out.entitySlice();
     const sids = server.request_out.column(h2.StreamId);
@@ -274,9 +305,9 @@ fn processRequests(
     const req_hdrs = server.request_out.column(h2.ReqHeaders);
 
     for (entities, sids, sessions, req_hdrs) |ent, sid, sess, rh| {
-        handleOne(server, allocator, store, db, blob_cache, ent, sid, sess, rh) catch |err| {
+        handleOne(server, allocator, rctx, ent, sid, sess, rh) catch |err| {
             std.log.warn("log-server-standalone: handler error: {s}", .{@errorName(err)});
-            setResponse(server, ent, sid, sess, 500, "internal error\n") catch |se| std.log.err(
+            setResponse(server, ent, sid, sess, 500, "internal error\n", rctx.cfg) catch |se| std.log.err(
                 "log-server-standalone: 500 write failed: {s}",
                 .{@errorName(se)},
             );
@@ -287,9 +318,7 @@ fn processRequests(
 fn handleOne(
     server: *LogH2,
     allocator: std.mem.Allocator,
-    store: batch_store_mod.BatchStore,
-    db: *index_db_mod.IndexDb,
-    blob_cache: ?*BlobCache,
+    rctx: ReqCtx,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -297,6 +326,7 @@ fn handleOne(
 ) !void {
     var method: []const u8 = "";
     var path: []const u8 = "";
+    var authz: []const u8 = "";
     if (rh.fields != null) {
         const fields = rh.fields.?[0..rh.count];
         for (fields) |f| {
@@ -304,22 +334,59 @@ fn handleOne(
             const value = f.value[0..f.value_len];
             if (std.mem.eql(u8, name, ":method")) method = value;
             if (std.mem.eql(u8, name, ":path")) path = value;
+            if (std.mem.eql(u8, name, "authorization")) authz = value;
         }
     }
+
+    // CORS preflight from the dashboard's cross-origin fetch. Browser
+    // sends `OPTIONS` before any GET that carries a custom header
+    // (Authorization counts). Reply 204 with the allow-set; the real
+    // request follows on the same connection.
+    if (std.mem.eql(u8, method, "OPTIONS")) {
+        try setPreflight(server, ent, sid, sess, rctx.cfg);
+        return;
+    }
     if (!std.mem.eql(u8, method, "GET")) {
-        try setResponse(server, ent, sid, sess, 405, "method not allowed\n");
+        try setResponse(server, ent, sid, sess, 405, "method not allowed\n", rctx.cfg);
+        return;
+    }
+
+    // JWT gate. The worker mints these at /_system/log-token after
+    // its own auth check (cookie or bearer); the standalone trusts
+    // the signed `exp` and otherwise treats every token as authorized
+    // for every tenant. Per-tenant scoping moves into the token in a
+    // future revision.
+    if (rctx.cfg.jwt_secret) |secret| {
+        if (!std.mem.startsWith(u8, authz, "Bearer ")) {
+            try setResponse(server, ent, sid, sess, 401, "missing bearer token\n", rctx.cfg);
+            return;
+        }
+        const token = authz["Bearer ".len..];
+        const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+        _ = auth.verify(secret, token, now_ms) catch |err| {
+            const msg = switch (err) {
+                auth.Error.Expired => "token expired\n",
+                auth.Error.BadSignature => "bad signature\n",
+                auth.Error.Malformed, auth.Error.UnsupportedAlg => "malformed token\n",
+                auth.Error.OutOfMemory => "out of memory\n",
+            };
+            try setResponse(server, ent, sid, sess, 401, msg, rctx.cfg);
+            return;
+        };
+    } else {
+        try setResponse(server, ent, sid, sess, 401, "auth not configured\n", rctx.cfg);
         return;
     }
 
     const route = parseRoute(path) orelse {
-        try setResponse(server, ent, sid, sess, 404, "not found\n");
+        try setResponse(server, ent, sid, sess, 404, "not found\n", rctx.cfg);
         return;
     };
     switch (route.kind) {
-        .list => try handleList(server, allocator, db, ent, sid, sess, route.tenant_id, route.query),
-        .show => try handleShow(server, allocator, store, db, ent, sid, sess, route.tenant_id, route.tail),
-        .blob => try handleBlob(server, allocator, blob_cache, ent, sid, sess, route.tenant_id, route.tail),
-        .count => try handleCount(server, allocator, db, ent, sid, sess, route.tenant_id),
+        .list => try handleList(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, route.query, rctx.cfg),
+        .show => try handleShow(server, allocator, rctx.store, rctx.db, ent, sid, sess, route.tenant_id, route.tail, rctx.cfg),
+        .blob => try handleBlob(server, allocator, rctx.blob_cache, ent, sid, sess, route.tenant_id, route.tail, rctx.cfg),
+        .count => try handleCount(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, rctx.cfg),
     }
 }
 
@@ -379,6 +446,7 @@ fn handleList(
     sess: h2.Session,
     tenant_id: []const u8,
     query: []const u8,
+    cfg: *const Config,
 ) !void {
     const limit = parseUint(u32, query, "limit", 100);
     const after_received_ns = parseInt(i64, query, "after_received_ns", 0);
@@ -386,13 +454,13 @@ fn handleList(
 
     var list = db.queryList(tenant_id, after_received_ns, after_request_id, limit) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "list failed: {s}\n", .{@errorName(err)});
-        try setResponseOwned(server, ent, sid, sess, 500, msg);
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
         return;
     };
     defer list.deinit();
 
     const json = try renderListJson(allocator, list.rows);
-    try setResponseOwned(server, ent, sid, sess, 200, json);
+    try setResponseOwned(server, ent, sid, sess, 200, json, cfg);
 }
 
 fn handleShow(
@@ -405,18 +473,19 @@ fn handleShow(
     sess: h2.Session,
     tenant_id: []const u8,
     request_id_str: []const u8,
+    cfg: *const Config,
 ) !void {
     const request_id = std.fmt.parseInt(u64, request_id_str, 10) catch {
-        try setResponse(server, ent, sid, sess, 400, "invalid request id (want decimal u64)\n");
+        try setResponse(server, ent, sid, sess, 400, "invalid request id (want decimal u64)\n", cfg);
         return;
     };
     var maybe = db.queryShow(tenant_id, request_id) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "show failed: {s}\n", .{@errorName(err)});
-        try setResponseOwned(server, ent, sid, sess, 500, msg);
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
         return;
     };
     if (maybe == null) {
-        try setResponse(server, ent, sid, sess, 404, "record not found\n");
+        try setResponse(server, ent, sid, sess, 404, "record not found\n", cfg);
         return;
     }
     defer maybe.?.deinit(allocator);
@@ -429,7 +498,7 @@ fn handleShow(
             "payload fetch failed for {s}: {s}\n",
             .{ row.ndjson_key, @errorName(err) },
         );
-        try setResponseOwned(server, ent, sid, sess, 500, msg);
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
         return;
     };
     // Strip trailing newline if present so the JSON we hand back is
@@ -450,7 +519,7 @@ fn handleShow(
     try buf.appendSlice(allocator, "}\n");
     allocator.free(payload);
     const out = try buf.toOwnedSlice(allocator);
-    try setResponseOwned(server, ent, sid, sess, 200, out);
+    try setResponseOwned(server, ent, sid, sess, 200, out, cfg);
 }
 
 /// Total record count for a tenant (Phase 5.5 a, A2). Plain decimal
@@ -465,14 +534,15 @@ fn handleCount(
     sid: h2.StreamId,
     sess: h2.Session,
     tenant_id: []const u8,
+    cfg: *const Config,
 ) !void {
     const total = db.queryCount(tenant_id) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "count failed: {s}\n", .{@errorName(err)});
-        try setResponseOwned(server, ent, sid, sess, 500, msg);
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
         return;
     };
     const body = try std.fmt.allocPrint(allocator, "{d}\n", .{total});
-    try setResponseOwned(server, ent, sid, sess, 200, body);
+    try setResponseOwned(server, ent, sid, sess, 200, body, cfg);
 }
 
 /// Tape blob fetch (Phase 5.5 a, A1). Reads from the per-tenant
@@ -490,9 +560,10 @@ fn handleBlob(
     sess: h2.Session,
     tenant_id: []const u8,
     hash: []const u8,
+    cfg: *const Config,
 ) !void {
     const cache = blob_cache orelse {
-        try setResponse(server, ent, sid, sess, 501, "blob backend not configured\n");
+        try setResponse(server, ent, sid, sess, 501, "blob backend not configured\n", cfg);
         return;
     };
 
@@ -501,7 +572,7 @@ fn handleBlob(
     // empty keys, but we tighten further so a bogus path-y hash
     // doesn't burn an S3 round-trip just to learn it's NotFound.
     if (hash.len != 64 or !isHex(hash)) {
-        try setResponse(server, ent, sid, sess, 400, "invalid hash (want 64 lowercase hex)\n");
+        try setResponse(server, ent, sid, sess, 400, "invalid hash (want 64 lowercase hex)\n", cfg);
         return;
     }
 
@@ -511,7 +582,7 @@ fn handleBlob(
             "blob open failed for {s}: {s}\n",
             .{ tenant_id, @errorName(err) },
         );
-        try setResponseOwned(server, ent, sid, sess, 500, msg);
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
         return;
     };
 
@@ -522,10 +593,10 @@ fn handleBlob(
             "blob fetch failed: {s}\n",
             .{@errorName(err)},
         );
-        try setResponseOwned(server, ent, sid, sess, code, msg);
+        try setResponseOwned(server, ent, sid, sess, code, msg, cfg);
         return;
     };
-    try setResponseOwned(server, ent, sid, sess, 200, bytes);
+    try setResponseOwned(server, ent, sid, sess, 200, bytes, cfg);
 }
 
 fn isHex(s: []const u8) bool {
@@ -600,12 +671,42 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
-/// Stamp a response without allocator-owned body bytes. The h2
-/// `RespBody.deinit` frees `data` when non-null, so static literal
-/// bodies must be sent with `data = null` (and a non-zero `len`
-/// recorded for observability — actual bytes are not framed). This
-/// mirrors `src/log_server/thread.zig`'s null-data convention for
-/// short error strings.
+const HdrPair = struct { name: []const u8, value: []const u8 };
+
+/// Pack a flat list of header pairs into an `h2.RespHeaders`. The
+/// h2 writer frees the underlying allocation when the response
+/// finishes. Returns an empty set when `pairs` is empty.
+fn packHeaders(allocator: std.mem.Allocator, pairs: []const HdrPair) !h2.RespHeaders {
+    if (pairs.len == 0) return .{ .fields = null, .count = 0 };
+    const fields_size = pairs.len * @sizeOf(h2.HeaderField);
+    var str_size: usize = 0;
+    for (pairs) |p| str_size += p.name.len + p.value.len;
+
+    const buf = try allocator.alloc(u8, fields_size + str_size);
+    errdefer allocator.free(buf);
+    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
+    var off: usize = fields_size;
+    for (pairs, 0..) |p, i| {
+        const name_start = off;
+        @memcpy(buf[off..][0..p.name.len], p.name);
+        off += p.name.len;
+        const value_start = off;
+        @memcpy(buf[off..][0..p.value.len], p.value);
+        off += p.value.len;
+        fields_ptr[i] = .{
+            .name = buf[name_start..].ptr,
+            .name_len = @intCast(p.name.len),
+            .value = buf[value_start..].ptr,
+            .value_len = @intCast(p.value.len),
+        };
+    }
+    return .{ .fields = fields_ptr, .count = @intCast(pairs.len) };
+}
+
+/// Stamp a response with optional CORS + content-type. Static literal
+/// body bytes are NOT framed (rove-h2 reads from `data`); the helper
+/// passes `data = null, len = body.len` so the writer treats it as a
+/// short canned response.
 fn setResponse(
     server: *LogH2,
     ent: rove.Entity,
@@ -613,9 +714,11 @@ fn setResponse(
     sess: h2.Session,
     status: u16,
     body_static: []const u8,
+    cfg: *const Config,
 ) !void {
+    const headers = try buildResponseHeaders(server.reg.allocator, cfg, null);
     try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, headers);
     try server.reg.set(ent, &server.request_out, h2.RespBody, .{
         .data = null,
         .len = @intCast(body_static.len),
@@ -633,9 +736,11 @@ fn setResponseOwned(
     sess: h2.Session,
     status: u16,
     body_owned: []u8,
+    cfg: *const Config,
 ) !void {
+    const headers = try buildResponseHeaders(server.reg.allocator, cfg, null);
     try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, headers);
     try server.reg.set(ent, &server.request_out, h2.RespBody, .{
         .data = body_owned.ptr,
         .len = @intCast(body_owned.len),
@@ -644,6 +749,51 @@ fn setResponseOwned(
     try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
     try server.reg.set(ent, &server.request_out, h2.Session, sess);
     try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// CORS preflight response — 204 with the full allow-set so the
+/// browser caches the policy for `max-age` seconds. Body is empty.
+fn setPreflight(
+    server: *LogH2,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    cfg: *const Config,
+) !void {
+    const headers = try buildResponseHeaders(server.reg.allocator, cfg, .preflight);
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, headers);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+const ResponseKind = enum { normal, preflight };
+
+/// Builds the CORS header set used by every response. When
+/// `cfg.cors_origin` is null (loopback / smoke), returns an empty
+/// header set. Preflight responses additionally carry
+/// allow-methods + allow-headers + max-age so the browser can cache
+/// the policy.
+fn buildResponseHeaders(allocator: std.mem.Allocator, cfg: *const Config, kind: ?ResponseKind) !h2.RespHeaders {
+    const origin = cfg.cors_origin orelse return .{ .fields = null, .count = 0 };
+    var pairs: [5]HdrPair = undefined;
+    var n: usize = 0;
+    pairs[n] = .{ .name = "access-control-allow-origin", .value = origin };
+    n += 1;
+    pairs[n] = .{ .name = "vary", .value = "origin" };
+    n += 1;
+    if (kind == .preflight) {
+        pairs[n] = .{ .name = "access-control-allow-methods", .value = "GET, OPTIONS" };
+        n += 1;
+        pairs[n] = .{ .name = "access-control-allow-headers", .value = "authorization" };
+        n += 1;
+        pairs[n] = .{ .name = "access-control-max-age", .value = "600" };
+        n += 1;
+    }
+    return packHeaders(allocator, pairs[0..n]);
 }
 
 fn parseUint(comptime T: type, query: []const u8, key: []const u8, default: T) T {

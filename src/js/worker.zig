@@ -420,9 +420,17 @@ pub const WorkerConfig = struct {
     /// to this address. When null, `/_system/files/*` requests return
     /// 503 (feature disabled).
     code_addr: ?std.net.Address = null,
-    /// Address of the in-process rove-log-server thread. Mirror of
-    /// `code_addr` for `/_system/log/*`.
-    log_addr: ?std.net.Address = null,
+    /// Phase 5.5(a) Step B — HMAC-SHA256 secret used to sign JWTs
+    /// minted at `/_system/log-token`. The standalone log-server
+    /// (separate process, addressable at `log_public_base`) verifies
+    /// the same JWT on every `/v1/*` request. Borrowed; the caller
+    /// keeps the bytes alive for the worker's lifetime. When null,
+    /// `/_system/log-token` returns 503.
+    log_jwt_secret: ?[]const u8 = null,
+    /// Public origin the dashboard uses to reach the log-server.
+    /// Returned in the `/_system/log-token` response so the browser
+    /// knows where to send `/v1/*` requests. Borrowed.
+    log_public_base: ?[]const u8 = null,
     /// Origin allowed to call `/_system/*` with CORS. When set, the
     /// worker answers browser preflight (OPTIONS) requests from this
     /// origin and stamps `Access-Control-Allow-*` headers onto every
@@ -527,9 +535,6 @@ pub fn Worker(comptime opts: Options) type {
         /// `/_system/files/*` proxy state. Targets the in-process
         /// rove-files-server thread.
         code_proxy: ProxySubsystem(StreamColl),
-        /// `/_system/log/*` proxy state. Targets the in-process
-        /// rove-log-server thread.
-        log_proxy: ProxySubsystem(StreamColl),
         dispatcher: Dispatcher,
         tenant: *tenant_mod.Tenant,
         raft: *kv_mod.RaftNode,
@@ -583,6 +588,11 @@ pub fn Worker(comptime opts: Options) type {
         /// Lives for the worker's full lifetime; loop46 picks S3 vs
         /// in-memory at startup.
         log_batch_store: log_server_mod.batch_store.BatchStore,
+        /// Phase 5.5(a) Step B — JWT secret + public log-server origin.
+        /// Both are returned to the dashboard via `/_system/log-token`
+        /// so the browser knows where + how to call `/v1/*`.
+        log_jwt_secret: ?[]const u8,
+        log_public_base: ?[]const u8,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -621,11 +631,6 @@ pub fn Worker(comptime opts: Options) type {
                     .{ .kind = .code },
                     config.code_addr,
                 ),
-                .log_proxy = try ProxySubsystem(StreamColl).init(
-                    allocator,
-                    .{ .kind = .log },
-                    config.log_addr,
-                ),
                 .dispatcher = try Dispatcher.init(allocator),
                 .tenant = config.tenant,
                 .raft = config.raft,
@@ -642,18 +647,17 @@ pub fn Worker(comptime opts: Options) type {
                 .compile_ctx = config.compile_ctx,
                 .blob_backend_cfg = config.blob_backend,
                 .log_batch_store = config.log_batch_store,
+                .log_jwt_secret = config.log_jwt_secret,
+                .log_public_base = config.log_public_base,
             };
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
-            errdefer self.log_proxy.deinit();
             errdefer self.tenant_files_map.clearAllEntries(allocator);
             errdefer self.tenant_logs.clearAllEntries(allocator);
 
             reg.registerCollection(&self.raft_pending);
             reg.registerCollection(&self.code_proxy.pending);
             reg.registerCollection(&self.code_proxy.inflight);
-            reg.registerCollection(&self.log_proxy.pending);
-            reg.registerCollection(&self.log_proxy.inflight);
 
             // Eagerly open code AND log state for every known tenant.
             // The tenant registry's instances map was populated by
@@ -675,7 +679,6 @@ pub fn Worker(comptime opts: Options) type {
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
             self.tenant_files_map.deinit(allocator);
-            self.log_proxy.deinit();
             self.code_proxy.deinit();
             self.raft_pending.deinit();
             self.dispatcher.deinit();

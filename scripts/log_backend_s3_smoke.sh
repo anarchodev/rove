@@ -126,6 +126,11 @@ export S3_KEY_PREFIX_BASE="$SMOKE_PREFIX"
 WORKER_PID=$!
 
 # ── Spawn log-server pointing at the SAME bucket+prefix ───────────
+# Per-run JWT secret (32 hex bytes = 16 random bytes). Standalone
+# server verifies; the smoke mints test tokens with the same value.
+LOG_JWT_SECRET=$(head -c16 /dev/urandom | xxd -p | tr -d '\n')
+export LOG_JWT_SECRET
+
 "$LS_BIN" \
     --index-db "$INDEX_DB" \
     --listen 127.0.0.1:${LS_PORT} \
@@ -174,7 +179,24 @@ fail() {
 
 RESOLVE=(--resolve "${ACME_HOST}:${PORT}:127.0.0.1")
 WORKER_CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
-LS_CURL=(curl -sS --http2-prior-knowledge --max-time 10)
+
+# Mint an HS256 JWT signed with $LOG_JWT_SECRET. Expires 5 minutes
+# from now — long enough for the smoke. Pure stdlib python (hmac +
+# hashlib + base64 + json).
+mint_log_jwt() {
+    LOG_JWT_SECRET="$LOG_JWT_SECRET" python3 - <<'PY'
+import base64, hmac, hashlib, json, os, time
+secret = bytes.fromhex(os.environ["LOG_JWT_SECRET"])
+header = b'{"alg":"HS256","typ":"JWT"}'
+payload = json.dumps({"exp": int(time.time() * 1000) + 5 * 60 * 1000}).encode()
+def b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+signing_input = b64u(header) + "." + b64u(payload)
+sig = hmac.new(secret, signing_input.encode(), hashlib.sha256).digest()
+print(signing_input + "." + b64u(sig))
+PY
+}
+JWT=$(mint_log_jwt)
+LS_CURL=(curl -sS --http2-prior-knowledge --max-time 10 -H "Authorization: Bearer ${JWT}")
 
 # ── Drive 3 requests against acme's /api handler ──────────────────
 for n in 1 2 3; do

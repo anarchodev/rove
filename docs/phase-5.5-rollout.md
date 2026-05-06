@@ -60,24 +60,23 @@ sub-plan's migration order. No big-bang cutovers between them.
 - **(d) webhooks — done.** Cluster-wide `webhooks.db`, envelope
   types 4/5/6, multi-envelope-per-raft-entry, leader-pinned
   webhook-server thread.
-- **(a) logs — done (Step A).** Worker → S3 (ndjson + sidecar);
-  read path goes via the standalone log-server's
-  `/v1/{tenant}/{list,show,count,blob}` API, fronted by the worker's
-  `/_system/log/*` proxy with a URL prefix rewrite. Per-tenant
-  `log.db` retired (`nextRequestSeq` moved to `_log/next_request_seq`
-  in app.db); in-process log-server thread + LogStore record-side
-  + tape `bundle` composer + rove-log-cli + dual-worker spike all
-  deleted. Step B (subdomain + JWT handoff) remains.
-- **(e) files-server — not started.** Waits on (a) Step B
-  (subdomain + JWT-handoff pattern).
+- **(a) logs — done.** Worker → S3 (ndjson + sidecar). Standalone
+  log-server runs on `logs.{public_suffix}` with its own TLS
+  listener, JWT-gated `/v1/{tenant}/{list,show,count,blob}` (HS256;
+  worker mints at `/_system/log-token` after admin auth, dashboard
+  refreshes ~once per 4 minutes). Per-tenant `log.db` and
+  `Worker.log_proxy` are gone; tape body capture flows via the
+  per-tenant `BlobBackend` shared between worker + standalone.
+- **(e) files-server — not started.** Reuses the subdomain +
+  JWT-handoff pattern from (a) Step B.
 - **(c) snapshot — not started.** Waits on (a) + (e) retiring
   envelope types 1 + 3 to reduce raft log pressure.
 
 **Next pickup:**
-1. **(a) Step B — log-server subdomain + JWT handoff.** Move the
-   standalone server off loopback onto `logs.{public_suffix}` with
-   its own TLS listener + the token-handoff endpoints; admin UI
-   repointed at the subdomain. Unblocks piece 4.
+1. **(e) files-server architectural move.** With (a) done, all the
+   subdomain + JWT-handoff pieces (TLS reuse pattern, `/_system/log-token`
+   minting shape, dashboard cross-origin fetch with bearer +
+   refresh) translate directly to a `files.{public_suffix}` move.
 
 Detail per piece below.
 
@@ -213,7 +212,7 @@ each step.
 
 **Sub-plan**: `docs/webhook-server-plan.md`.
 
-### 3. Logs — **Step A done 2026-05-06 (write + read paths fully migrated; subdomain Step B pending)**
+### 3. Logs — **done 2026-05-06 (Steps A + B both shipped)**
 
 **What it delivers**: log-server runs on its own subdomain
 (`logs.{public_suffix}`) with its own TLS and JWT-handoff auth.
@@ -349,15 +348,25 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
     - **No legacy / migration scaffolding kept.** Pre-launch — no
       need to carry old-format readers or one-shot migrations as
       tech debt.
-- **Step B — log-server subdomain + JWT handoff (pending).** Move
-  the standalone server off loopback onto `logs.{public_suffix}`
-  with its own TLS listener; add the token-handoff endpoints
-  (`/_admin/log-token`, `/_session/log-token`) on the worker /
-  admin domains; admin UI repointed at `logs.{public_suffix}`
-  directly so `Worker.log_proxy` can come out. This establishes
-  the subdomain + JWT-handoff pattern that **files-server (piece
-  4 below)** then reuses, so it should land before piece 4
-  starts.
+- **Step B — log-server subdomain + JWT handoff (done 2026-05-06).**
+  Standalone log-server gained a TLS listener at `--log-listen`
+  (default `127.0.0.1:8083`), reusing the worker's wildcard
+  `*TlsConfig`. Auth: `/v1/*` requests must carry
+  `Authorization: Bearer <jwt>`; the worker mints HS256 tokens at
+  `/_system/log-token` after running its existing admin-auth check
+  (cookie or bearer). Tokens expire in 5 minutes; the dashboard
+  caches and refreshes ~1 minute before expiry. The JWT secret is
+  per-process random (multi-node ops will need a shared env var
+  later). Standalone responses carry CORS allow-origin =
+  `--admin-origin` so the dashboard at `app.{public_suffix}` can
+  call `logs.{public_suffix}` cross-origin. New helpers:
+  `src/log_server/auth.zig` (HS256 mint + verify, hand-coded —
+  no JWT library) and a `--log-public-base` CLI flag (auto-derived
+  from `--public-suffix` + the bound port). With Step B in place,
+  `Worker.log_proxy` + the `/_system/log/*` route + `ProxyTag.log`
+  + `proxy.zig`'s log-prefix URL rewrite all came out — the
+  worker is no longer in the log read path. Sets the template
+  files-server (piece 4) reuses verbatim.
 
 **Definition of done**: see `docs/logs-plan.md` §7 (migration
 sequence). Each step is independently shippable + smoke-testable.

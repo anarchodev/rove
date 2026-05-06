@@ -16,6 +16,10 @@
 //!   S3_BUCKET            bucket name
 //!   AWS_ACCESS_KEY_ID
 //!   AWS_SECRET_ACCESS_KEY
+//!   LOG_JWT_SECRET       hex-encoded HMAC-SHA256 secret used to verify
+//!                        the `Authorization: Bearer <jwt>` on every
+//!                        `/v1/*` request. Must match what whoever
+//!                        mints tokens uses (loop46 worker, smoke, etc).
 //!
 //! Optional env:
 //!   LOG_S3_KEY_PREFIX    prefix prepended to every batch-store key
@@ -183,6 +187,22 @@ pub fn main() !void {
     };
     const bind_addr = std.net.Address.initIp4(ip, cli.listen_port);
 
+    // JWT verification secret. Hex-encoded so the smoke can pass it
+    // through env without binary-clean shell escaping. We don't dupe
+    // — the slice lives until the binary exits.
+    const jwt_secret_hex = try envRequired(allocator, "LOG_JWT_SECRET");
+    defer allocator.free(jwt_secret_hex);
+    if (jwt_secret_hex.len == 0 or jwt_secret_hex.len % 2 != 0) {
+        std.debug.print("error: LOG_JWT_SECRET must be even-length hex\n", .{});
+        std.process.exit(2);
+    }
+    const jwt_secret = try allocator.alloc(u8, jwt_secret_hex.len / 2);
+    defer allocator.free(jwt_secret);
+    _ = std.fmt.hexToBytes(jwt_secret, jwt_secret_hex) catch {
+        std.debug.print("error: LOG_JWT_SECRET is not valid hex\n", .{});
+        std.process.exit(2);
+    };
+
     const handle = try log_server.standalone.spawn(.{
         .allocator = allocator,
         .store = s3.batchStore(),
@@ -190,6 +210,7 @@ pub fn main() !void {
         .bind_addr = bind_addr,
         .poll_interval_ms = cli.poll_interval_ms,
         .blob_backend_cfg = blob_backend_cfg,
+        .jwt_secret = jwt_secret,
     });
     defer handle.shutdown();
 

@@ -18,6 +18,7 @@ const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
 const log_mod = @import("rove-log");
+const log_server_mod = @import("rove-log-server");
 const tenant_mod = @import("rove-tenant");
 const webhook_server_mod = @import("rove-webhook-server");
 
@@ -242,8 +243,7 @@ fn tryHandleSystem(
     }
 
     // Auth shape: cookie first, then Authorization: Bearer. Lets the
-    // dashboard JS call /_system/files/* and /_system/log/* without
-    // juggling a bearer header.
+    // dashboard JS call /_system/* without juggling a bearer header.
     const auth_ctx = auth.extractAdminAuth(worker.tenant, rh) catch |err| {
         std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
         try respb.setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
@@ -254,13 +254,20 @@ fn tryHandleSystem(
         return true;
     }
 
-    // Strip `?query=string` off the path before routing. Subsystems
-    // (log, code proxies) forward the whole `:path` downstream;
-    // query parsing happens in the subsystem thread, not here.
+    // Strip `?query=string` off the path before routing.
     const qmark = std.mem.indexOfScalar(u8, path, '?');
     const path_no_q = if (qmark) |q| path[0..q] else path;
-
     const sys_rest = path_no_q["/_system/".len..];
+
+    // Phase 5.5(a) Step B — JWT minter for the standalone log-server.
+    // Caller is already admin-authenticated; we hand back a 5-minute
+    // HS256 token + the public log origin so the dashboard can call
+    // `{log_public_base}/v1/*` directly.
+    if (std.mem.eql(u8, sys_rest, "log-token")) {
+        try handleLogTokenMint(server, allocator, worker, ent, sid, sess, cors_origin);
+        return true;
+    }
+
     const sub_slash = std.mem.indexOfScalar(u8, sys_rest, '/') orelse {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "malformed system path\n", allocator, cors_origin, null);
         return true;
@@ -268,12 +275,12 @@ fn tryHandleSystem(
     const subsystem = sys_rest[0..sub_slash];
     const after_sub = sys_rest[sub_slash + 1 ..];
 
-    // `/_system/tenant/*` and `/_system/kv/*` moved to the
-    // `__admin__` JS handler; callers target the bare admin host
+    // `/_system/tenant/*` and `/_system/kv/*` moved to the `__admin__`
+    // JS handler; callers target the bare admin host
     // (`app.loop46.me/?fn=listKv`, optionally with `X-Rove-Scope`).
-    // `/_system/log/*` and `/_system/files/*` remain native — log
-    // queries poll frequently (would meta-log themselves through JS)
-    // and code uploads are byte-heavy (fit the subsystem thread).
+    // `/_system/files/*` remains a native proxy because code uploads
+    // are byte-heavy. Log queries moved to the standalone server's
+    // public subdomain (Phase 5.5(a) Step B).
     const inst_slash = std.mem.indexOfScalar(u8, after_sub, '/');
     const sys_instance_id = if (inst_slash) |s| after_sub[0..s] else after_sub;
     if (sys_instance_id.len == 0) {
@@ -295,18 +302,49 @@ fn tryHandleSystem(
         try server.reg.move(ent, &server.request_out, &worker.code_proxy.pending);
         return true;
     }
-    if (std.mem.eql(u8, subsystem, "log")) {
-        if (worker.log_proxy.addr == null) {
-            try respb.setSystemResponse(server, ent, sid, sess, 503, "log subsystem disabled\n", allocator, cors_origin, null);
-            return true;
-        }
-        try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
-        try server.reg.move(ent, &server.request_out, &worker.log_proxy.pending);
-        return true;
-    }
 
     try respb.setSystemResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator, cors_origin, null);
     return true;
+}
+
+/// Mint an HS256 JWT for the standalone log-server. Body shape:
+///   `{"token":"<jwt>","log_url":"<base>"}`
+/// Token expires in 5 minutes; the dashboard refreshes by hitting
+/// this endpoint again. 503 when the server wasn't started with a
+/// JWT secret (operator skipped Step B wiring).
+fn handleLogTokenMint(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    cors_origin: ?[]const u8,
+) !void {
+    const secret = worker.log_jwt_secret orelse {
+        try respb.setSystemResponse(server, ent, sid, sess, 503, "log-server jwt not configured\n", allocator, cors_origin, null);
+        return;
+    };
+    const log_base = worker.log_public_base orelse {
+        try respb.setSystemResponse(server, ent, sid, sess, 503, "log-server public base not configured\n", allocator, cors_origin, null);
+        return;
+    };
+
+    const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    const exp_ms: i64 = now_ms + 5 * 60 * 1000;
+    const token = log_server_mod.auth.mint(allocator, secret, .{ .exp_ms = exp_ms }) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "mint failed: {s}\n", .{@errorName(err)});
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        return;
+    };
+    defer allocator.free(token);
+
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"token\":\"{s}\",\"log_url\":\"{s}\",\"exp_ms\":{d}}}\n",
+        .{ token, log_base, exp_ms },
+    );
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/json");
 }
 
 /// Outcome of `resolveRequest`: either the request was finalized

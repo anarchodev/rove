@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # End-to-end smoke for the tape-replay browser path (PLAN §10.12).
 #
-# Exercises the full feature surface against the standalone log-server
-# (Phase 5.5 a, A3 — read path now goes worker → /_system/log/* →
-# proxy URL rewrite → standalone server's /v1/*):
+# Phase 5.5(a) Step B layout: dashboard talks to two origins.
+#   - app.{suffix}:{worker_port}  — worker (admin handler, files proxy,
+#                                   /_system/log-token JWT minter)
+#   - logs.{suffix}:{log_port}    — standalone log-server (TLS, JWT-gated
+#                                   /v1/{tenant}/{list,show,count,blob})
+#
+# Each smoke section authenticates against the worker, mints a JWT,
+# and uses it to call the standalone directly.
 #
 #   1. `__replay__` tenant + `replay.{suffix}` host alias serve the
 #      replay shell static bundle (`web/replay/index.html` + `app.js`).
@@ -14,20 +19,24 @@
 #      response body refs visible on the show response.
 #   5. Historical deployment manifest endpoint.
 #   6. Request body truncation flag fires for >256 KB bodies.
-#   7. Tape blobs round-trip via /_system/log/.../blob/{hash}.
+#   7. Tape blobs round-trip via the log-server's /v1/.../blob/{hash}.
 
 set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/tmp/rove-replay-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8210}"
+LOG_ADDR="${LOG_ADDR:-127.0.0.1:8211}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40310}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}"
 ADMIN_HOST="app.loop46.localhost"
+LOG_HOST="logs.loop46.localhost"
 PUBLIC_SUFFIX="loop46.localhost"
 PORT="${HTTP_ADDR##*:}"
+LOG_PORT="${LOG_ADDR##*:}"
 ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
 REPLAY_ORIGIN="https://replay.${PUBLIC_SUFFIX}:${PORT}"
+LOG_ORIGIN="https://${LOG_HOST}:${LOG_PORT}"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
@@ -54,6 +63,7 @@ rm -rf "$DATA_DIR"
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
+    --log-listen "$LOG_ADDR" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
@@ -70,7 +80,8 @@ sleep 1.5
 ALICE_HOST="alice.${PUBLIC_SUFFIX}"
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
          --resolve "${ALICE_HOST}:${PORT}:127.0.0.1" \
-         --resolve "replay.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1")
+         --resolve "replay.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
+         --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1")
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 
 ok() { echo "ok  $1"; }
@@ -81,17 +92,33 @@ fail() {
     exit 1
 }
 
-# Standalone log-server's indexer polls every 5s by default. The
-# loop46 spawn above doesn't override that, so each "did the record
-# show up" check needs to wait. Use a polling loop with ~6s budget.
+# Mint a fresh JWT against the worker's /_system/log-token endpoint
+# (cookie / bearer auth gate) and stash both the token and the public
+# log origin returned alongside it. Used by every log-server call
+# below — refresh on demand.
+mint_log_token() {
+    local resp
+    resp=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
+        "${ADMIN_ORIGIN}/_system/log-token")
+    JWT=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+    LOG_BASE=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin)["log_url"])')
+}
+mint_log_token
+[[ -n "${JWT:-}" ]] || fail "mint_log_token: empty JWT"
+[[ "${LOG_BASE}" == "${LOG_ORIGIN}" ]] || \
+    fail "log_url mismatch: got '${LOG_BASE}', expected '${LOG_ORIGIN}'"
+ok "minted log JWT via /_system/log-token (log_url=${LOG_BASE})"
+
+# Standalone log-server's indexer polls every 500ms (loop46 default).
+# Each "did the record show up" check waits up to 12s.
 wait_for_record() {
     local path_filter="$1"
     local max_attempts=30
     local i=0
     while (( i < max_attempts )); do
         local list
-        list=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
-            "${ADMIN_ORIGIN}/_system/log/alice/list?limit=20" 2>/dev/null || echo '{"records":[]}')
+        list=$("${CURL[@]}" -H "Authorization: Bearer $JWT" \
+            "${LOG_ORIGIN}/v1/alice/list?limit=20" 2>/dev/null || echo '{"records":[]}')
         local rid
         rid=$(echo "$list" | python3 -c "
 import json, sys
@@ -191,8 +218,8 @@ ok "multi-module handler executed (transitive import works)"
 # ── 4. Tape capture: kv + date + module + body ───────────────────
 RID=$(wait_for_record "/world") || fail "couldn't find POST /world in indexed log"
 
-REC=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
-    "${ADMIN_ORIGIN}/_system/log/alice/show/${RID}")
+REC=$("${CURL[@]}" -H "Authorization: Bearer $JWT" \
+    "${LOG_ORIGIN}/v1/alice/show/${RID}")
 got_kv=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["kv_tape_hex"] or "")')
 got_date=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["date_tape_hex"] or "")')
 got_mod=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["module_tree_hex"] or "")')
@@ -211,13 +238,13 @@ got_resp_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.s
 ok "log record carries kv + date + module + req-body + resp-body tape refs"
 
 # Fetch the body blob and verify content.
-body_text=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
-    "${ADMIN_ORIGIN}/_system/log/alice/blob/${got_body}")
+body_text=$("${CURL[@]}" -H "Authorization: Bearer $JWT" \
+    "${LOG_ORIGIN}/v1/alice/blob/${got_body}")
 [[ "$body_text" == "first-visit" ]] || fail "body blob content drift: '$body_text'"
 ok "request body blob content round-trips"
 
-resp_text=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
-    "${ADMIN_ORIGIN}/_system/log/alice/blob/${got_resp_body}")
+resp_text=$("${CURL[@]}" -H "Authorization: Bearer $JWT" \
+    "${LOG_ORIGIN}/v1/alice/blob/${got_resp_body}")
 [[ "$resp_text" == "$resp" ]] || \
     fail "response body blob drift: expected '$resp', got '$resp_text'"
 ok "response body blob content round-trips"
@@ -261,21 +288,26 @@ python3 -c "import sys; sys.stdout.buffer.write(b'x' * 300000)" \
         "https://${ALICE_HOST}:${PORT}/big"
 
 BIG_RID=$(wait_for_record "/big") || fail "couldn't find POST /big in indexed log"
-BIG_REC=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
-    "${ADMIN_ORIGIN}/_system/log/alice/show/${BIG_RID}")
+BIG_REC=$("${CURL[@]}" -H "Authorization: Bearer $JWT" \
+    "${LOG_ORIGIN}/v1/alice/show/${BIG_RID}")
 big_trunc=$(echo "$BIG_REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["request_body_truncated"])')
 big_hash=$(echo "$BIG_REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["request_body_hex"])')
 [[ "$big_trunc" == "True" ]] || fail "300 KB body should set truncation flag (got $big_trunc)"
 ok "truncation flag set for >256 KB body"
 
 # Verify the captured blob is exactly 256 KB by fetching it.
-big_body=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" -o /tmp/replay-smoke-big.bin -w '%{http_code}' \
-    "${ADMIN_ORIGIN}/_system/log/alice/blob/${big_hash}")
+big_body=$("${CURL[@]}" -H "Authorization: Bearer $JWT" -o /tmp/replay-smoke-big.bin -w '%{http_code}' \
+    "${LOG_ORIGIN}/v1/alice/blob/${big_hash}")
 [[ "$big_body" == "200" ]] || fail "big body blob fetch got $big_body"
 blob_size=$(wc -c < /tmp/replay-smoke-big.bin)
 [[ "$blob_size" == "262144" ]] || fail "captured blob should be 256 KB, got $blob_size"
 ok "captured body blob exactly 262144 bytes (256 KB)"
 rm -f /tmp/replay-smoke-big.bin
+
+# JWT gate sanity: the same /v1 path without a bearer must 401.
+code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${LOG_ORIGIN}/v1/alice/list")
+[[ "$code" == "401" ]] || fail "log-server without bearer should 401, got $code"
+ok "log-server /v1/* without bearer → 401"
 
 echo ""
 echo "all replay smoke checks passed"

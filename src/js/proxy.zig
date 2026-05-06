@@ -1,17 +1,19 @@
 //! HTTP/2 proxy subsystem used by the worker to forward
-//! `/_system/{code,log}/*` requests to the in-process files-server
-//! and log-server. Each subsystem keeps its own pending/inflight
-//! collections + persistent client session; the worker holds two
-//! `ProxySubsystem` instances (one per subsystem).
+//! `/_system/files/*` requests to the in-process files-server. The
+//! worker holds one `ProxySubsystem` for `files`; the abstraction
+//! keeps room for adding more if a future subsystem needs a
+//! same-origin proxy. (`/_system/log/*` was retired in Phase 5.5(a)
+//! Step B — the standalone log-server now serves the dashboard
+//! directly at `logs.{public_suffix}`.)
 //!
 //! Lifecycle per tick:
 //!   1. `connectProxies` — open a new client session if the existing
 //!      one is stale and we're not already mid-connect.
 //!   2. `ingestProxyConnects` — drain `client_connect_out` /
 //!      `client_connect_errors`, route each by `ProxyTag`.
-//!   3. `flushProxyPending` — for each subsystem, copy parked server
-//!      requests onto the client side, rewrite the `:path` header to
-//!      strip `/_system/{subsystem}`, and submit upstream.
+//!   3. `flushProxyPending` — copy parked server requests onto the
+//!      client side, rewrite the `:path` header to strip
+//!      `/_system/files`, and submit upstream.
 //!   4. `drainProxyResponses` — map upstream responses back onto the
 //!      original server entities and move them to `response_in`.
 
@@ -32,7 +34,7 @@ pub const ProxyPeer = struct { client: rove.Entity };
 /// `.none` is the default for non-proxy client entities (tests /
 /// future uses) and is a no-op sentinel.
 pub const ProxyTag = struct {
-    kind: enum(u8) { none = 0, code = 1, log = 2 } = .none,
+    kind: enum(u8) { none = 0, code = 1 } = .none,
 };
 
 /// Per-subsystem proxy state. The worker holds one of these for
@@ -75,7 +77,6 @@ pub fn ProxySubsystem(comptime StreamCollT: type) type {
 /// other proxy systems.
 pub fn connectProxies(worker: anytype) !void {
     try connectOne(worker, &worker.code_proxy, "code");
-    try connectOne(worker, &worker.log_proxy, "log");
 }
 
 fn connectOne(
@@ -120,11 +121,6 @@ pub fn ingestProxyConnects(worker: anytype) !void {
                     worker.code_proxy.connecting = false;
                     std.log.info("rove-js: files-server connected (session={d})", .{sess.entity.index});
                 },
-                .log => {
-                    worker.log_proxy.session = sess.entity;
-                    worker.log_proxy.connecting = false;
-                    std.log.info("rove-js: log server connected (session={d})", .{sess.entity.index});
-                },
                 .none => std.log.warn("rove-js: untagged proxy connect succeeded", .{}),
             }
             try reg.destroy(ent);
@@ -140,7 +136,6 @@ pub fn ingestProxyConnects(worker: anytype) !void {
             const kind = if (tag) |t| t.kind else .none;
             switch (kind) {
                 .code => worker.code_proxy.connecting = false,
-                .log => worker.log_proxy.connecting = false,
                 .none => {},
             }
             const io = reg.get(ent, &server.client_connect_errors, h2.H2IoResult) catch null;
@@ -155,7 +150,6 @@ pub fn ingestProxyConnects(worker: anytype) !void {
 /// upstream session.
 pub fn flushProxyPending(worker: anytype) !void {
     try flushOne(worker, &worker.code_proxy);
-    try flushOne(worker, &worker.log_proxy);
 }
 
 fn flushOne(
@@ -234,7 +228,6 @@ pub fn drainProxyResponses(worker: anytype) !void {
 
         switch (kind) {
             .code => try mapOneResponse(worker, &worker.code_proxy, client_ent),
-            .log => try mapOneResponse(worker, &worker.log_proxy, client_ent),
             .none => {
                 std.log.warn("rove-js proxy: untagged upstream response", .{});
                 try reg.destroy(client_ent);
@@ -302,17 +295,11 @@ fn mapOneResponse(
     try reg.destroy(client_ent);
 }
 
-/// Duplicate the request headers, rewriting `:path` to the form the
-/// downstream subsystem expects:
-///
-///   - `/_system/files/{rest}` → `/{rest}` (files-server keys its
-///     handlers on bare `/{instance_id}/{op}`)
-///   - `/_system/log/{rest}`   → `/v1/{rest}` (standalone log-server's
-///     query API lives under `/v1/{tenant}/{op}`)
-///
-/// `:authority` is left alone — subsystems don't care what host name
-/// the caller used. Fields are allocated on `allocator` and owned by
-/// the returned slice; rove-h2 frees them when the request finishes.
+/// Duplicate the request headers, rewriting `:path` from
+/// `/_system/files/{rest}` to `/{rest}` so the files-server's bare
+/// `/{instance_id}/{op}` handlers match. `:authority` is left alone.
+/// Fields are allocated on `allocator` and owned by the returned
+/// slice; rove-h2 frees them when the request finishes.
 fn forwardHeaders(
     allocator: std.mem.Allocator,
     rh: h2.ReqHeaders,
@@ -325,22 +312,16 @@ fn forwardHeaders(
         @memcpy(name, f.name[0..f.name_len]);
 
         var value_slice: []const u8 = f.value[0..f.value_len];
-        var rewritten_owned: ?[]u8 = null;
-        if (f.name_len == 5 and std.mem.eql(u8, name, ":path")) {
-            const log_prefix = "/_system/log/";
-            const files_prefix = "/_system/files/";
-            if (std.mem.startsWith(u8, value_slice, log_prefix)) {
-                rewritten_owned = try std.fmt.allocPrint(allocator, "/v1/{s}", .{value_slice[log_prefix.len..]});
-                value_slice = rewritten_owned.?;
-            } else if (std.mem.startsWith(u8, value_slice, files_prefix)) {
-                value_slice = value_slice[files_prefix.len - 1 ..]; // keep leading '/'
-                if (value_slice.len == 0) value_slice = "/";
-            }
+        const files_prefix = "/_system/files/";
+        if (f.name_len == 5 and std.mem.eql(u8, name, ":path") and
+            std.mem.startsWith(u8, value_slice, files_prefix))
+        {
+            value_slice = value_slice[files_prefix.len - 1 ..]; // keep leading '/'
+            if (value_slice.len == 0) value_slice = "/";
         }
 
         const value = try allocator.alloc(u8, value_slice.len);
         @memcpy(value, value_slice);
-        if (rewritten_owned) |r| allocator.free(r);
         out[i] = .{
             .name = name.ptr,
             .name_len = f.name_len,

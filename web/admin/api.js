@@ -96,6 +96,47 @@ async function rawGet(base, path) {
   return res;
 }
 
+/// Phase 5.5(a) Step B — minted by the worker at /_system/log-token,
+/// cached for 4 of its 5 minute lifetime so the dashboard rarely
+/// blocks on a refresh round-trip. Reset to null on 401 so the next
+/// call re-mints.
+let _logTokenCache = null; // { token, log_url, refresh_at_ms } | null
+
+async function getLogToken() {
+  const now = Date.now();
+  if (_logTokenCache && now < _logTokenCache.refresh_at_ms) return _logTokenCache;
+  const res = await rawGet(adminBase(), "/_system/log-token");
+  const body = await res.json();
+  _logTokenCache = {
+    token: body.token,
+    log_url: body.log_url.replace(/\/+$/, ""),
+    // Refresh ~1 minute before exp so an in-flight call never blocks.
+    refresh_at_ms: body.exp_ms - 60_000,
+  };
+  return _logTokenCache;
+}
+
+/// Cross-origin fetch against the standalone log-server. Stamps the
+/// JWT, refreshes once on 401, throws ApiError on any other failure.
+async function logFetch(path) {
+  let creds = await getLogToken();
+  let res = await fetch(creds.log_url + path, {
+    headers: { authorization: "Bearer " + creds.token },
+  });
+  if (res.status === 401) {
+    _logTokenCache = null;
+    creds = await getLogToken();
+    res = await fetch(creds.log_url + path, {
+      headers: { authorization: "Bearer " + creds.token },
+    });
+  }
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new ApiError(res.status, res.statusText, txt);
+  }
+  return res;
+}
+
 /// URL-encode a file path that may contain `/` separators. Slashes are
 /// preserved; each segment gets `encodeURIComponent`'d.
 function encodePath(path) {
@@ -333,10 +374,16 @@ export const api = {
     return this.deployManifest(instance_id, manifest, { parent_id, comment });
   },
 
-  // ── Out-of-band: logs (worker proxies /_system/log/* → /v1/* on
-  // the loopback standalone log-server). request_ids are decimal
-  // numbers (the standalone's wire shape); pagination cursor is
-  // `{received_ns, request_id}` rather than a single hex string.
+  // ── Out-of-band: logs ─────────────────────────────────────────────
+  //
+  // Phase 5.5(a) Step B — the dashboard talks to the standalone
+  // log-server directly at `https://logs.{public_suffix}` (cross-
+  // origin), not through the worker proxy. Auth is a short-lived
+  // HS256 JWT minted at `/_system/log-token` on the worker. The
+  // token + base URL are cached for a few minutes; refresh on demand.
+  //
+  // request_ids are decimal numbers (the standalone's wire shape);
+  // pagination cursor is `{received_ns, request_id}`.
   async listLogs(instance_id, { limit = 100, after = null } = {}) {
     const params = { limit: String(limit) };
     if (after) {
@@ -344,19 +391,19 @@ export const api = {
       params.after_request_id = String(after.request_id);
     }
     const qs = new URLSearchParams(params).toString();
-    const res = await rawGet(adminBase(),
-      `/_system/log/${encodeURIComponent(instance_id)}/list?${qs}`);
+    const res = await logFetch(
+      `/v1/${encodeURIComponent(instance_id)}/list?${qs}`);
     return res.json();
   },
   async showLog(instance_id, request_id) {
-    const res = await rawGet(adminBase(),
-      `/_system/log/${encodeURIComponent(instance_id)}/show/${encodeURIComponent(String(request_id))}`);
+    const res = await logFetch(
+      `/v1/${encodeURIComponent(instance_id)}/show/${encodeURIComponent(String(request_id))}`);
     const body = await res.json();
     return body.record;
   },
   async countLogs(instance_id) {
-    const res = await rawGet(adminBase(),
-      `/_system/log/${encodeURIComponent(instance_id)}/count`);
+    const res = await logFetch(
+      `/v1/${encodeURIComponent(instance_id)}/count`);
     return res.text();
   },
 
@@ -381,7 +428,7 @@ export const api = {
     const inst = encodeURIComponent(instance_id);
     const rid = encodeURIComponent(String(request_id));
 
-    const recordRes = await rawGet(adminBase(), `/_system/log/${inst}/show/${rid}`);
+    const recordRes = await logFetch(`/v1/${inst}/show/${rid}`);
     const recordWrap = await recordRes.json();
     const record = recordWrap.record;
 
@@ -460,14 +507,14 @@ export const api = {
       ...Object.keys(tapeRefs).map(async (name) => {
         const hash = tapeRefs[name];
         if (!hash) return;
-        const r = await rawGet(adminBase(),
-          `/_system/log/${inst}/blob/${encodeURIComponent(hash)}`);
+        const r = await logFetch(
+          `/v1/${inst}/blob/${encodeURIComponent(hash)}`);
         const buf = await r.arrayBuffer();
         tapeBlobs[name] = new Uint8Array(buf);
       }),
       bodyHash ? (async () => {
-        const r = await rawGet(adminBase(),
-          `/_system/log/${inst}/blob/${encodeURIComponent(bodyHash)}`);
+        const r = await logFetch(
+          `/v1/${inst}/blob/${encodeURIComponent(bodyHash)}`);
         const buf = await r.arrayBuffer();
         bodyBytes = new Uint8Array(buf);
       })() : Promise.resolve(),

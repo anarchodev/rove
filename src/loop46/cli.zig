@@ -124,6 +124,20 @@ pub const Cli = struct {
     rate_limit_request_refill: u32 = 50,
     rate_limit_email_capacity: u32 = 10,
     rate_limit_email_refill: u32 = 1,
+    /// Where the standalone log-server binds its TLS listener.
+    /// Browser hits this directly with a JWT minted at
+    /// `/_system/log-token` on the worker. Default
+    /// `127.0.0.1:8083` for dev; production overrides to the
+    /// public-facing IP/port the load balancer fronts.
+    log_listen: []const u8 = "127.0.0.1:8083",
+    /// Public origin the dashboard hits to call the log-server.
+    /// Auto-derived to `https://logs.{public_suffix}:{log_port}` when
+    /// only `--public-suffix` is set; this flag is the escape hatch
+    /// for serving logs on a different host (e.g. behind a load
+    /// balancer that strips the port). Returned to the dashboard
+    /// alongside the JWT so the browser knows where to send `/v1/*`
+    /// requests.
+    log_public_base: ?[]const u8 = null,
 };
 
 pub fn parseCli(args: []const [:0]u8) !Cli {
@@ -221,6 +235,14 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.rate_limit_email_refill = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--log-listen")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.log_listen = args[i];
+        } else if (std.mem.eql(u8, a, "--log-public-base")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.log_public_base = args[i];
         } else {
             return error.Usage;
         }

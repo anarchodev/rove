@@ -312,7 +312,16 @@ const WorkerCtx = struct {
     http_addr: std.net.Address,
     raft: *kv.RaftNode,
     code_addr: std.net.Address,
-    log_addr: std.net.Address,
+    /// Phase 5.5(a) Step B — JWT secret shared with the standalone
+    /// log-server. Worker mints tokens at `/_system/log-token` after
+    /// admin auth; standalone verifies them on every `/v1/*` request.
+    /// Generated once per process; lives in the main thread; workers
+    /// borrow.
+    log_jwt_secret: []const u8,
+    /// Public origin the dashboard uses to reach the log-server.
+    /// Returned in the `/_system/log-token` response so the dashboard
+    /// doesn't have to derive it. Borrowed.
+    log_public_base: []const u8,
     admin_origin: ?[]const u8,
     admin_api_domain: ?[]const u8,
     public_suffix: ?[]const u8,
@@ -437,7 +446,8 @@ fn workerMain(args: *WorkerCtx) !void {
             .tls_config = args.tls_config,
         },
         .code_addr = args.code_addr,
-        .log_addr = args.log_addr,
+        .log_jwt_secret = args.log_jwt_secret,
+        .log_public_base = args.log_public_base,
         .admin_origin = args.admin_origin,
         .admin_api_domain = args.admin_api_domain,
         .log_worker_id = args.worker_idx,
@@ -1039,13 +1049,32 @@ pub fn main() !void {
     defer cs_handle.shutdown();
     const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
 
-    // log-server-standalone (loopback). Worker.log_proxy targets
-    // this; the standalone reads from the shared batch store +
-    // BlobBackend so leader and followers see identical bytes when
-    // S3 is configured. IndexDb persists to `{data_dir}/log_index.db`
-    // — a freshly-spawned standalone re-indexes from the batch
-    // store via the indexer thread (cheap on first start, idempotent
-    // via INSERT OR IGNORE on subsequent runs).
+    // ── TLS resolution (hoisted above the standalone spawn so the
+    //    log-server can reuse the same `*TlsConfig` for its public
+    //    listener; production wildcard cert covers both `app.` and
+    //    `logs.` subdomains).
+    var tls_owned: TlsResources = .{};
+    defer tls_owned.deinit(allocator);
+    const tls_config = try resolveTls(allocator, cli, &tls_owned);
+
+    // ── log-server-standalone (Phase 5.5(a) Step B) ───────────────────
+    //
+    // Public TLS listener at `--log-listen` (defaults to
+    // 127.0.0.1:8083 for dev). Same shared BatchStore + BlobBackend
+    // as the worker, so leader and followers see identical bytes
+    // when S3 is configured. IndexDb persists to `{data_dir}/log_index.db`
+    // — a freshly-spawned standalone re-indexes via the indexer
+    // thread (cheap on first start, idempotent via INSERT OR IGNORE).
+    //
+    // Auth: every `/v1/*` request must carry `Authorization: Bearer <jwt>`.
+    // The worker mints these at `/_system/log-token` after running its
+    // own admin-auth check; both sides share the same per-process
+    // HMAC-SHA256 secret. CORS-allowed origin is the admin origin so
+    // the dashboard at `app.{suffix}` can call `logs.{suffix}` directly.
+    var log_jwt_secret: [32]u8 = undefined;
+    std.crypto.random.bytes(&log_jwt_secret);
+
+    const log_listen_addr = try parseHostPort(allocator, cli.log_listen);
     const log_index_db_path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/log_index.db",
@@ -1060,17 +1089,31 @@ pub fn main() !void {
         .allocator = allocator,
         .store = log_batch_store,
         .db = log_index_db,
-        .bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+        .bind_addr = log_listen_addr,
         .max_connections = subsystem_max_connections,
         .blob_backend_cfg = blob_owned.cfg,
         .fs_data_dir = cli.data_dir,
+        .tls_config = tls_config,
+        .jwt_secret = &log_jwt_secret,
+        .cors_origin = cli.admin_origin,
         // 500ms keeps the dashboard "show me my latest request" feel
         // tight; the indexer pass is cheap (full bucket scan with
         // INSERT OR IGNORE dedup).
         .poll_interval_ms = 500,
     });
     defer ls_handle.shutdown();
-    const log_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ls_handle.port);
+
+    // Public origin the dashboard hits to call /v1/*. Auto-derived
+    // from `--public-suffix` + the standalone's bound port when
+    // `--log-public-base` isn't set. The dashboard receives this
+    // alongside the JWT in the `/_system/log-token` response.
+    const log_public_base = if (cli.log_public_base) |s|
+        try allocator.dupe(u8, s)
+    else if (cli.public_suffix) |suffix|
+        try std.fmt.allocPrint(allocator, "https://logs.{s}:{d}", .{ suffix, ls_handle.port })
+    else
+        try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}", .{ls_handle.port});
+    defer allocator.free(log_public_base);
 
     // ── Webhook-server thread (Phase 5.5 d) ───────────────────────────
     //
@@ -1104,10 +1147,6 @@ pub fn main() !void {
     var seq_counters = kv.SeqCounterRegistry.init(allocator);
     defer seq_counters.deinit();
 
-    var tls_owned: TlsResources = .{};
-    defer tls_owned.deinit(allocator);
-    const tls_config = try resolveTls(allocator, cli, &tls_owned);
-
     var i: u16 = 0;
     while (i < num_workers) : (i += 1) {
         ctxs[i] = .{
@@ -1117,7 +1156,8 @@ pub fn main() !void {
             .http_addr = http_addr,
             .raft = raft_node,
             .code_addr = code_addr,
-            .log_addr = log_addr,
+            .log_jwt_secret = &log_jwt_secret,
+            .log_public_base = log_public_base,
             .admin_origin = cli.admin_origin,
             .admin_api_domain = cli.admin_api_domain,
             .public_suffix = cli.public_suffix,

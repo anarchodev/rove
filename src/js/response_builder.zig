@@ -296,6 +296,23 @@ pub fn setSystemResponse(
     try finalizeResponse(server, ent, sid, sess, status_code, resp_hdrs, copy.ptr, @intCast(copy.len));
 }
 
+/// Same as `setSystemResponse` but takes ownership of `body` (no
+/// extra dupe). Frees on response completion via the same h2 path.
+pub fn setSystemResponseOwned(
+    server: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    status_code: u16,
+    body: []u8,
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+    content_type: ?[]const u8,
+) !void {
+    const resp_hdrs = try buildSystemRespHeaders(allocator, cors_origin, false, content_type);
+    try finalizeResponse(server, ent, sid, sess, status_code, resp_hdrs, body.ptr, @intCast(body.len));
+}
+
 /// 429 response with a `Retry-After: <sec>` header. Body text mentions
 /// the wait time so curl-style clients without header inspection still
 /// get the hint.
