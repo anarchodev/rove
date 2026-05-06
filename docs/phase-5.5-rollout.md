@@ -84,7 +84,7 @@ multi-node gap (replay-after-failover).
 **Sub-plan**: PLAN §3 Phase 5.5 (b) is the spec; no separate
 sub-plan because the work is contained.
 
-### 2. Webhook subsystem — **in progress (step 1 done 2026-05-05)**
+### 2. Webhook subsystem — **in progress (steps 1–2 done 2026-05-05)**
 
 - **Step 1 — done.** `src/webhook_server/root.zig` ships: `WebhookRow`,
   `WebhookStore` (kv-backed at `{data_dir}/webhooks.db`), apply
@@ -96,14 +96,21 @@ sub-plan because the work is contained.
   step-1 stand-in for the real partial-index sqlite schema; step 2
   swaps in the schema-from-webhook-server-plan.md §2.2 when the
   delivery loop's "ready rows" query needs the index.
+- **Step 2 — done.** `EnvelopeType` extended with
+  `webhook_enqueue_batch=4`, `webhook_complete=5`,
+  `webhook_retry_schedule=6`, and `multi=7` (length-prefixed
+  inner-envelope wrapper). `applyOne` dispatches each envelope type;
+  `ApplyCtx.webhooks_store` opens `{data_dir}/webhooks.db` lazily on
+  first webhook envelope. Webhook envelopes do NOT leader-skip — both
+  leader and follower apply. Envelope 5's cross-db apply
+  (`_callback/{id}` → tenant app.db, then DELETE → webhooks.db) uses
+  sequential idempotent ordering per webhook-server-plan §8.1's
+  fallback path. Tests cover envelope round-trips, multi-wrapper
+  wrap/unwrap across mixed inner types, truncated-payload rejection,
+  and `buildCallbackJson` (delivered + failed) parses with std.json
+  matching the schema `callback_dispatch.zig` consumes.
 - Remaining steps (per webhook-server-plan.md §7):
-  2. **Apply path integration** — add envelope types 4/5/6 to
-     `src/js/apply.zig`'s `EnvelopeType` enum + introduce
-     multi-envelope-per-raft-entry wrapper (envelope type 7). Wire
-     `applyOne` dispatch to the new types. ApplyCtx gets a
-     `webhooks_store: ?*WebhookStore` lazily opened on first
-     webhook envelope.
-  3. **Webhook-server thread** — leader-pinned spawn/stop,
+  3. **Webhook-server thread** (next) — leader-pinned spawn/stop,
      delivery loop reading `WebhookStore`, raft proposer for
      envelopes 5/6.
   4. **Dispatcher cutover** — `webhook.send` accumulates per-handler
