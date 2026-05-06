@@ -56,31 +56,28 @@ sub-plan's migration order. No big-bang cutovers between them.
 - **(b) tape-body capture — done.** Bodies stored
   content-addressed via the per-tenant `BlobBackend`
   (`{inst.dir}/log-blobs/` for fs, `{S3_KEY_PREFIX_BASE}{tenant}/log-blobs/{hash}`
-  for s3); the standalone log-server reads from the same backend
-  via the A1 endpoint.
+  for s3); the standalone log-server reads from the same backend.
 - **(d) webhooks — done.** Cluster-wide `webhooks.db`, envelope
   types 4/5/6, multi-envelope-per-raft-entry, leader-pinned
   webhook-server thread.
-- **(a) logs — write path done; read path migration in flight.**
-  Worker → S3 (ndjson + sidecar) flows; envelope type 1 + raft
-  log path deleted. Standalone log-server now exposes
-  `/v1/{tenant}/{list,show,count,blob}` (A1 + A2 done).
-  `nextRequestSeq` moved off `log.db` onto a `_log/next_request_seq`
-  row in app.db with a one-shot migration on tenant open (A4 done).
-  A3 (dashboard JS → v1 + worker proxy redirect + delete legacy
-  plumbing) is the last piece left in Step A.
+- **(a) logs — done (Step A).** Worker → S3 (ndjson + sidecar);
+  read path goes via the standalone log-server's
+  `/v1/{tenant}/{list,show,count,blob}` API, fronted by the worker's
+  `/_system/log/*` proxy with a URL prefix rewrite. Per-tenant
+  `log.db` retired (`nextRequestSeq` moved to `_log/next_request_seq`
+  in app.db); in-process log-server thread + LogStore record-side
+  + tape `bundle` composer + rove-log-cli + dual-worker spike all
+  deleted. Step B (subdomain + JWT handoff) remains.
 - **(e) files-server — not started.** Waits on (a) Step B
   (subdomain + JWT-handoff pattern).
 - **(c) snapshot — not started.** Waits on (a) + (e) retiring
   envelope types 1 + 3 to reduce raft log pressure.
 
-**Next pickup, then alternatives:**
-1. **(a) A3 — repoint proxy + delete legacy plumbing.** Last piece
-   of Step A. Coordinated dashboard JS update + `proxy.zig` URL
-   rewrite (`/_system/log` → `/v1`) + in-process server deletion
-   + `log-blobs/` deletion + restore `replay_smoke`.
-2. **(a) Step B — log-server subdomain + JWT handoff.** Independent
-   of A3 (can land in any order); unblocks piece 4.
+**Next pickup:**
+1. **(a) Step B — log-server subdomain + JWT handoff.** Move the
+   standalone server off loopback onto `logs.{public_suffix}` with
+   its own TLS listener + the token-handoff endpoints; admin UI
+   repointed at the subdomain. Unblocks piece 4.
 
 Detail per piece below.
 
@@ -216,7 +213,7 @@ each step.
 
 **Sub-plan**: `docs/webhook-server-plan.md`.
 
-### 3. Logs — **in progress (write-path complete 2026-05-06; read-path migration pending)**
+### 3. Logs — **Step A done 2026-05-06 (write + read paths fully migrated; subdomain Step B pending)**
 
 **What it delivers**: log-server runs on its own subdomain
 (`logs.{public_suffix}`) with its own TLS and JWT-handoff auth.
@@ -300,72 +297,67 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
   `/_system/log/*` route (proxies to the now-empty in-process
   server). Step 9 (operator migrate-to-s3 helper) skipped per
   direction.
-- **Step A — read-side migration to S3 (in progress).** The
-  in-process log-server thread, `Worker.log_proxy`, the
-  `/_system/log/*` route, per-tenant `log.db`, and the `log-blobs/`
-  directory are all still alive solely because the dashboard's
-  replay-bundle composer + `rove-log-cli bundle` read through them.
-  Worker's tape-body capture already writes blobs to S3 today (when
-  `BLOB_BACKEND=s3`) at `{S3_KEY_PREFIX_BASE}{tenant}/log-blobs/{hash}`
-  — same key prefix scheme the standalone server reads. The
-  migration is mostly client-side rewiring + retiring the legacy
-  worker plumbing.
-  - **A1 — done 2026-05-06.** Standalone log-server gained
+- **Step A — read-side migration to S3 (done 2026-05-06).** The
+  legacy in-process log-server thread + `Worker.log_proxy` →
+  per-tenant `log.db` path retired. Replay clients now go through
+  the worker's `/_system/log/*` proxy (URL-rewritten to `/v1/*`)
+  to a loopback `log-server-standalone` spawned in the loop46
+  process, which reads `LogRecord`s from the shared S3
+  `BatchStore` (or in-memory dev store) via `IndexDb` queries and
+  tape blobs from the same per-tenant `BlobBackend` the worker
+  writes to.
+  - **A1 — done.** Standalone log-server gained
     `/v1/{tenant}/blob/{hash}` backed by a per-tenant
-    `BlobBackend` cache. `log_backend_s3_smoke.sh` validates a
-    sha256 round-trip + 404/400 paths.
-  - **A2 — done 2026-05-06.** Standalone log-server gained
-    `/v1/{tenant}/count` (parity with the legacy proxy), backed by
-    `IndexDb.queryCount`. The originally-scoped client-migration
-    work in A2 (rove-log-cli HTTP mode + web admin to v1) was
-    re-folded into A3 (web admin) and A4 (rove-log-cli) — a CLI
-    HTTP client requires either an h1 listener on the standalone
-    or wiring rove-h2 client into the CLI binary, both bigger than
-    the rove-log-cli surface justifies until A4 actually retires
-    its filesystem mode.
-  - **A3 — pending.** Repoint `Worker.log_proxy` at the standalone
-    server (currently points at the in-process server). Two
-    sub-pieces that have to land coordinated:
-    1. Update `web/admin/api.js` to handle the v1 wire shape
-       (decimal request_ids on `/v1/{tenant}/show/{decimal}`,
-       `{record:...}` wrapper, `received_ns + request_id` cursor
-       on `/v1/{tenant}/list`). Today the dashboard speaks the
-       legacy proxy shape (hex IDs, raw record, `?after=hex`
-       cursor).
-    2. Make `proxy.zig`'s `forwardHeaders` rewrite
-       `/_system/log/{rest}` → `/v1/{rest}` (currently strips
-       `/_system/log` to `/{rest}`).
-    Ship the in-process log-server thread deletion +
-    `log-blobs/` filesystem-directory deletion in the same commit
-    so the dashboard / proxy / server / smokes all flip together.
-    Restore `replay_smoke` from its SKIP state. Depends on **A4**
-    — the worker can't drop its `log.db` open until
-    `nextRequestSeq` lives somewhere else.
-  - **A4 — done 2026-05-06.** `nextRequestSeq` lives at
+    `BlobBackend` cache.
+  - **A2 — done.** Standalone gained `/v1/{tenant}/count` for
+    parity. The originally-scoped client-migration work folded
+    into A3 (web admin) and A4 (rove-log-cli).
+  - **A4 — done.** `nextRequestSeq` lives at
     `_log/next_request_seq` in the per-tenant `app.db`. `LogStore.init`
-    gained an `Options{ seq_kv, seq_key }` arg so the counter store
-    can be different from the records store; the worker passes
-    `inst.kv` (app.db) for the counter while still passing log.db
-    for records (A3 deletes the records side). `_log/` joined
-    `PLATFORM_KV_PREFIXES` so customer code can't read or stomp the
-    counter. One-shot migration in `migrateRequestSeqIfNeeded`
-    copies any pre-A4 `meta/next_request_seq` from log.db to app.db
-    on tenant open so the counter stays monotonic across the
-    upgrade. The worker still opens log.db (A3's cleanup), but
-    nothing in this commit reads from or writes to it anymore.
-    rove-log-cli's filesystem mode also still reads log.db —
-    retiring it is rolled into A3 since both want to land together.
+    gained an `Options{ seq_kv, seq_key }` arg; `_log/` joined
+    `PLATFORM_KV_PREFIXES` so customer code can't read or stomp
+    the counter.
+  - **A3 — done.** Coordinated cutover:
+    - `proxy.zig`'s `forwardHeaders` rewrites
+      `/_system/log/{rest}` → `/v1/{rest}` (and keeps the existing
+      `/_system/files` strip).
+    - `loop46/main.zig` spawns the `log-server-standalone` on
+      loopback (instead of the legacy thread); the worker proxy
+      points at it. The shared `BatchStore` is S3 when the env is
+      wired, in-memory `MemoryBatchStore` otherwise — both let
+      worker writes flow through to standalone reads in the same
+      process.
+    - `web/admin/api.js` rewritten for the v1 wire shape (decimal
+      request_ids, `{record:...}` unwrap, `{received_ns,
+      request_id}` cursor).
+    - `LogStore` collapsed to write-side only — `kv`, `blob`,
+      `serializeRecord`, `parseRecord`, `serializeBatch`,
+      `parseBatch`, `applyBatch`, `writeOne`, `list`, `get`,
+      `RECORD_VERSION`, all `FLAG_*` bits, the v1-record fallback,
+      and every related test all dropped.
+    - `src/log_server/thread.zig` deleted; `src/log_server/root.zig`
+      collapsed to just the standalone-side module re-exports.
+    - `src/tape/bundle.zig` and `examples/log_cli.zig` deleted —
+      the dashboard composes replay bundles via HTTP + the
+      standalone server already serves the same data. Web replay
+      shell lost its single-file-shape fallback. `examples/dual_worker.zig`
+      (the shift-js spike) deleted — superseded by loop46's
+      `--workers N`.
+    - Worker.openTenantLog no longer opens `log.db`; old `log.db`
+      files on disk are inert orphans. `replay_smoke.sh` restored
+      from its SKIP state and rewritten against the v1 wire shape.
+    - **No legacy / migration scaffolding kept.** Pre-launch — no
+      need to carry old-format readers or one-shot migrations as
+      tech debt.
 - **Step B — log-server subdomain + JWT handoff (pending).** Move
-  log-server off loopback onto `logs.{public_suffix}` with its own
-  TLS listener; add the token-handoff endpoints
+  the standalone server off loopback onto `logs.{public_suffix}`
+  with its own TLS listener; add the token-handoff endpoints
   (`/_admin/log-token`, `/_session/log-token`) on the worker /
   admin domains; admin UI repointed at `logs.{public_suffix}`
-  directly. This establishes the subdomain + JWT-handoff pattern
-  that **files-server (piece 4 below)** then reuses, so it should
-  land before piece 4 starts. Step B is independent of A3/A4 —
-  can land in any order — but A3 has to land before B can retire
-  `Worker.log_proxy`, since B's subdomain move is what removes
-  the proxy's reason to exist.
+  directly so `Worker.log_proxy` can come out. This establishes
+  the subdomain + JWT-handoff pattern that **files-server (piece
+  4 below)** then reuses, so it should land before piece 4
+  starts.
 
 **Definition of done**: see `docs/logs-plan.md` §7 (migration
 sequence). Each step is independently shippable + smoke-testable.

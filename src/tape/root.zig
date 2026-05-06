@@ -62,11 +62,6 @@
 
 const std = @import("std");
 
-/// Replay-bundle JSON renderer (PLAN §10.12). Composes `tape.parse`
-/// with rove-log's `LogRecord` + rove-blob's `BlobStore` to render the
-/// document the browser-side replay harness consumes.
-pub const bundle = @import("bundle.zig");
-
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 pub const VERSION: u16 = 1;
 

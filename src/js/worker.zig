@@ -286,22 +286,21 @@ fn stubCompile(
     return error.CompileNotSupportedOnWorker;
 }
 
-/// Per-tenant log state held by the worker. Mirrors `TenantFiles`'s
-/// shape: owns its KvStore + BlobStore, wraps a rove-log `LogStore`,
-/// is opened eagerly in `Worker.create` and closed in `Worker.destroy`.
+/// Per-tenant log state held by the worker. Owns the `BlobBackend`
+/// for tape body / per-channel tape blobs and a `LogStore` whose
+/// chunked-reservation counter persists into the tenant's app.db.
+/// Opened eagerly in `Worker.create`, closed in `Worker.destroy`.
 ///
-/// The `LogStore`'s in-memory buffer accumulates `LogRecord`s as the
-/// dispatch path appends them; `flushLogs` periodically drains the
-/// buffer into a batch envelope and either proposes through raft (if
-/// leader) or applies directly to the local log.db (if follower —
-/// best-effort, no replication).
+/// The `LogStore`'s in-memory buffer accumulates `LogRecord`s as
+/// the dispatch path appends them; `flushLogs` periodically drains
+/// the buffer to S3 (or in-memory dev store) via `flush_writer`.
 pub const TenantLog = struct {
     allocator: std.mem.Allocator,
     instance_id: []u8,
-    log_kv: *kv_mod.KvStore,
-    /// Owned blob backend for log batches. Same `.fs` / `.s3` switch
-    /// as `TenantFiles.blob_backend`; for `.s3` the per-tenant prefix
-    /// is `{base}{inst.id}/log-blobs/`.
+    /// Owned blob backend for tape body / per-channel tape blobs.
+    /// Same `.fs` / `.s3` switch as `TenantFiles.blob_backend`; for
+    /// `.s3` the per-tenant prefix is `{base}{inst.id}/log-blobs/`.
+    /// The standalone log-server reads from this same backend.
     blob_backend: blob_mod.BlobBackend,
     store: log_mod.LogStore,
 
@@ -469,11 +468,10 @@ pub const WorkerConfig = struct {
     /// them, so afterwards they can be freed).
     blob_backend: blob_mod.BackendConfig = .fs,
     /// Phase 5.5 (a) — `BatchStore` the worker flushes log batches
-    /// into. Optional: when null, log records are drained from
-    /// per-tenant buffers + dropped with a warning. Production wires
-    /// an `S3BatchStore` here; dev paths can leave it null and skip
-    /// observability.
-    log_batch_store: ?log_server_mod.batch_store.BatchStore = null,
+    /// into. loop46 always supplies one — S3 if env wired, in-memory
+    /// otherwise. Required because `flushLogs` shouldn't have to
+    /// reason about a missing observability backend.
+    log_batch_store: log_server_mod.batch_store.BatchStore,
 };
 
 /// Cross-reference component used by the `/_system/*` proxy. Lives
@@ -582,9 +580,9 @@ pub fn Worker(comptime opts: Options) type {
         /// worker opens. Borrowed from `WorkerConfig.blob_backend`.
         blob_backend_cfg: blob_mod.BackendConfig,
         /// Phase 5.5 (a) — store the worker flushes log batches into.
-        /// Null disables the flush (records get dropped). Lives for
-        /// the worker's full lifetime.
-        log_batch_store: ?log_server_mod.batch_store.BatchStore,
+        /// Lives for the worker's full lifetime; loop46 picks S3 vs
+        /// in-memory at startup.
+        log_batch_store: log_server_mod.batch_store.BatchStore,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -882,11 +880,12 @@ pub fn getOrOpenTenantFiles(
 
 // ── Per-tenant log loading ────────────────────────────────────────────
 //
-// Mirrors the TenantFiles helpers above. Each tenant gets a `log.db` +
-// `log-blobs/` directory under its instance dir, and a LogStore that
-// wraps both. Opened eagerly during `Worker.create`; freed during
-// `Worker.destroy`. Per-record append happens during dispatchPending;
-// batch flush + raft propose happens in `flushLogs`.
+// Mirrors the TenantFiles helpers above. Each tenant gets a
+// `log-blobs/` BlobBackend (tape body bytes) and a LogStore whose
+// chunked-reservation counter persists into the tenant's app.db.
+// Opened eagerly during `Worker.create`; freed during
+// `Worker.destroy`. Per-record append happens during
+// dispatchPending; batch flush to S3 happens in `flushLogs`.
 
 fn openTenantLog(
     worker: anytype,
@@ -895,35 +894,12 @@ fn openTenantLog(
 ) !*TenantLog {
     const allocator = worker.allocator;
 
-    const log_db_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/log.db",
-        .{inst.dir},
-        0,
-    );
-    defer allocator.free(log_db_path);
-
     const log_blob_dir = try std.fmt.allocPrint(
         allocator,
         "{s}/log-blobs",
         .{inst.dir},
     );
     defer allocator.free(log_blob_dir);
-
-    const log_kv = try kv_mod.KvStore.open(allocator, log_db_path);
-    errdefer log_kv.close();
-
-    // Phase 5.5 (a) A4: nextRequestSeq lives at `_log/next_request_seq`
-    // in the per-tenant app.db. One-shot migration — if app.db doesn't
-    // have the key yet but log.db does (worker is upgrading from a
-    // pre-A4 build), copy the value across before LogStore.init reads
-    // it. Otherwise the worker would mint colliding ids.
-    migrateRequestSeqIfNeeded(allocator, inst.kv, log_kv) catch |err| {
-        std.log.warn(
-            "rove-js openTenantLog({s}): seq migration failed: {s}",
-            .{ inst.id, @errorName(err) },
-        );
-    };
 
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
@@ -942,14 +918,11 @@ fn openTenantLog(
     tl.* = .{
         .allocator = allocator,
         .instance_id = id_copy,
-        .log_kv = log_kv,
         .blob_backend = blob_backend,
         .store = undefined,
     };
     tl.store = try log_mod.LogStore.init(
         allocator,
-        tl.log_kv,
-        tl.blob_backend.blobStore(),
         worker_id,
         .{
             .seq_kv = inst.kv,
@@ -959,35 +932,9 @@ fn openTenantLog(
     return tl;
 }
 
-/// One-shot copy of pre-A4 `meta/next_request_seq` from log.db over to
-/// `_log/next_request_seq` in app.db. Idempotent: if app.db already
-/// has the key, no-op. If log.db doesn't have the legacy key either
-/// (fresh tenant), no-op. Runs once per tenant per process; the cost
-/// is two SQLite reads on the cold-open path.
-fn migrateRequestSeqIfNeeded(
-    allocator: std.mem.Allocator,
-    app_kv: *kv_mod.KvStore,
-    log_kv: *kv_mod.KvStore,
-) !void {
-    if (app_kv.get("_log/next_request_seq")) |bytes| {
-        allocator.free(bytes);
-        return;
-    } else |err| switch (err) {
-        error.NotFound => {},
-        else => return err,
-    }
-    const legacy = log_kv.get("meta/next_request_seq") catch |err| switch (err) {
-        error.NotFound => return,
-        else => return err,
-    };
-    defer allocator.free(legacy);
-    try app_kv.put("_log/next_request_seq", legacy);
-}
-
 fn freeTenantLog(allocator: std.mem.Allocator, tl: *TenantLog) void {
     tl.store.deinit();
     tl.blob_backend.deinit();
-    tl.log_kv.close();
     allocator.free(tl.instance_id);
     allocator.destroy(tl);
 }
@@ -1268,11 +1215,6 @@ fn captureLogInner(
 /// 503 on followers. Lossy on PUT failure: records already left the
 /// buffer; per `docs/logs-plan.md` §1 a node-failure window may drop
 /// one batch.
-///
-/// `log_batch_store == null` means S3 wasn't configured at startup
-/// (operator skipped the env vars). Records are drained + dropped
-/// with a warning so the worker still functions for tenants that
-/// only need request handling, not observability.
 pub fn flushLogs(worker: anytype) !void {
     const allocator = worker.allocator;
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
@@ -1310,21 +1252,13 @@ fn flushOne(
         return;
     }
 
-    const store = worker.log_batch_store orelse {
-        std.log.warn(
-            "rove-js flushLogs: no log_batch_store configured; dropping {d} records for {s}",
-            .{ records.len, tl.instance_id },
-        );
-        return;
-    };
-
     var node_buf: [8]u8 = undefined;
     const node_id_hex = std.fmt.bufPrint(&node_buf, "{x:0>8}", .{worker.raft.config.node_id}) catch unreachable;
     const flush_unix_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
 
     log_server_mod.flush_writer.writeBatch(
         allocator,
-        store,
+        worker.log_batch_store,
         tl.instance_id,
         node_id_hex,
         records,
@@ -2104,78 +2038,14 @@ test "captureLog appends a record to the tenant's LogStore" {
         .{},
     );
 
-    // Buffer should hold one record.
+    // Buffer should hold one record. The worker doesn't read records
+    // back through LogStore anymore — flushLogs drains them into S3
+    // sidecars, the standalone server reads from there.
     try testing.expectEqual(@as(usize, 1), tl.store.buffer.items.len);
     const buffered = &tl.store.buffer.items[0];
     try testing.expectEqual(@as(u64, 200), @as(u64, buffered.status));
-    try testing.expectEqualStrings("acme", "acme"); // sanity
     try testing.expectEqualStrings("/test", buffered.path);
     try testing.expectEqual(@as(u64, 42), buffered.deployment_id);
     try testing.expectEqual(log_mod.Outcome.ok, buffered.outcome);
-
-    // Drain the batch and apply it locally so we exercise the same
-    // code path the leader path would after raft commit.
-    const batch = (try tl.store.drainBatch(allocator)).?;
-    defer allocator.free(batch);
-    try tl.store.applyBatch(batch);
-
-    // Read it back via the public LogStore API.
-    var result = try tl.store.list(.{ .limit = 10 });
-    defer result.deinit();
-    try testing.expectEqual(@as(usize, 1), result.records.len);
-    try testing.expectEqualStrings("/test", result.records[0].path);
-    try testing.expectEqual(@as(u64, 42), result.records[0].deployment_id);
-    try testing.expectEqual(log_mod.Outcome.ok, result.records[0].outcome);
 }
 
-test "openTenantLog migrates legacy log.db meta/next_request_seq into app.db" {
-    // Phase 5.5 (a) A4 — pre-A4 workers persisted the chunked
-    // reservation at `meta/next_request_seq` in log.db. Post-A4
-    // openTenantLog reads from `_log/next_request_seq` in app.db.
-    // The one-shot migration in `migrateRequestSeqIfNeeded` keeps
-    // ids monotonic across the upgrade.
-    const allocator = testing.allocator;
-    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-js-seqmig-{x}", .{seed});
-    defer allocator.free(tmp_dir);
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-
-    const root_path = try std.fmt.allocPrintSentinel(allocator, "{s}/__root__.db", .{tmp_dir}, 0);
-    defer allocator.free(root_path);
-    const root_kv = try kv_mod.KvStore.open(allocator, root_path);
-    defer root_kv.close();
-
-    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, tmp_dir);
-    defer tenant.destroy();
-    try tenant.createInstance("acme");
-    const inst = tenant.instances.get("acme").?;
-
-    // Seed the legacy key in log.db before the worker opens it.
-    const log_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/acme/log.db", .{tmp_dir}, 0);
-    defer allocator.free(log_db_path);
-    const log_kv_seed = try kv_mod.KvStore.open(allocator, log_db_path);
-    try log_kv_seed.put("meta/next_request_seq", "00000000abcd");
-    log_kv_seed.close();
-
-    const FakeWorker = struct {
-        allocator: std.mem.Allocator,
-        tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
-        blob_backend_cfg: blob_mod.BackendConfig = .fs,
-    };
-    var fake = FakeWorker{ .allocator = allocator, .tenant_logs = .empty };
-    defer fake.tenant_logs.deinit(allocator);
-
-    const tl = try openTenantLog(&fake, inst, 9);
-    defer freeTenantLog(allocator, tl);
-
-    // app.db should now carry the migrated counter, and a fresh
-    // mint should resume from at-or-after the legacy reservation.
-    const migrated = try inst.kv.get("_log/next_request_seq");
-    defer allocator.free(migrated);
-    try testing.expectEqualStrings("00000000abcd", migrated);
-
-    const id = try tl.store.nextRequestId();
-    try testing.expect((id & 0xFFFFFFFFFFFF) >= 0xabcd);
-}

@@ -333,19 +333,26 @@ export const api = {
     return this.deployManifest(instance_id, manifest, { parent_id, comment });
   },
 
-  // ── Out-of-band: logs (native Zig proxy) ────────────────────────
+  // ── Out-of-band: logs (worker proxies /_system/log/* → /v1/* on
+  // the loopback standalone log-server). request_ids are decimal
+  // numbers (the standalone's wire shape); pagination cursor is
+  // `{received_ns, request_id}` rather than a single hex string.
   async listLogs(instance_id, { limit = 100, after = null } = {}) {
     const params = { limit: String(limit) };
-    if (after) params.after = after;
+    if (after) {
+      params.after_received_ns = String(after.received_ns);
+      params.after_request_id = String(after.request_id);
+    }
     const qs = new URLSearchParams(params).toString();
     const res = await rawGet(adminBase(),
       `/_system/log/${encodeURIComponent(instance_id)}/list?${qs}`);
     return res.json();
   },
-  async showLog(instance_id, request_id_hex) {
+  async showLog(instance_id, request_id) {
     const res = await rawGet(adminBase(),
-      `/_system/log/${encodeURIComponent(instance_id)}/show/${encodeURIComponent(request_id_hex)}`);
-    return res.json();
+      `/_system/log/${encodeURIComponent(instance_id)}/show/${encodeURIComponent(String(request_id))}`);
+    const body = await res.json();
+    return body.record;
   },
   async countLogs(instance_id) {
     const res = await rawGet(adminBase(),
@@ -357,10 +364,11 @@ export const api = {
   //
   // Builds the bundle the replay shell consumes by fetching the log
   // record + the deployment manifest the request was dispatched
-  // against + handler source bytes + captured tape blobs. All
-  // fetches use existing /_system/log/* and /_system/files/* routes
-  // (cookie auth, same-origin). The composed bundle is then handed
-  // to the replay shell on `replay.<suffix>` via postMessage — see
+  // against + handler source bytes + captured tape blobs. Log fetches
+  // go through the worker's /_system/log/* proxy → standalone
+  // log-server (S3-backed). Files fetches stay on the worker's
+  // /_system/files/* proxy. The composed bundle is then handed to
+  // the replay shell on `replay.<suffix>` via postMessage — see
   // `replayOpen` below.
   //
   // The manifest is loaded by the request's captured deployment_id,
@@ -369,12 +377,13 @@ export const api = {
   // has GC'd that deployment, we fall back to the current manifest
   // and surface a `historical_manifest_missing` flag so the replay
   // shell can warn the user.
-  async composeReplayBundle(instance_id, request_id_hex) {
+  async composeReplayBundle(instance_id, request_id) {
     const inst = encodeURIComponent(instance_id);
-    const rid = encodeURIComponent(request_id_hex);
+    const rid = encodeURIComponent(String(request_id));
 
     const recordRes = await rawGet(adminBase(), `/_system/log/${inst}/show/${rid}`);
-    const record = await recordRes.json();
+    const recordWrap = await recordRes.json();
+    const record = recordWrap.record;
 
     // Hex-encoded deployment id matches the
     // /_system/files/{inst}/deployments/{hex} route shape.

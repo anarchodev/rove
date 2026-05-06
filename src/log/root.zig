@@ -1,67 +1,43 @@
-//! rove-log — per-tenant request log store.
+//! rove-log — per-request log buffer + chunked request-id minting.
 //!
-//! Every request the worker dispatches gets a `LogRecord`. Records
-//! accumulate in an in-memory buffer per tenant. Periodically
-//! (`shouldFlush`), the buffer is drained into a serialized **batch**
-//! that the worker proposes through raft as a single entry. The apply
-//! callback decodes the batch on every node and writes individual
-//! records to that node's local `log.db`.
+//! `LogStore` holds:
+//!   - a per-tenant in-memory `LogRecord` buffer (the worker's
+//!     dispatch loop appends here on every request)
+//!   - a chunked-reservation counter for `request_id`, persisted to
+//!     a caller-provided KvStore + key (the worker passes app.db at
+//!     `_log/next_request_seq`)
 //!
-//! Batching amortizes raft cost across N records. Reads AND writes
-//! are logged because some tenants want a full audit trail; the cost
-//! is hidden by the batch size, not the per-request synchronous write
-//! that shift-js used.
+//! `flushLogs` periodically calls `drainRecords` and ships the
+//! `LogRecord`s straight to S3 via `rove-log-server.flush_writer`
+//! (ndjson + sidecar). The standalone log-server reads them back
+//! out via `IndexDb` + range-reads.
 //!
-//! ## What's NOT yet in this module
-//!
-//! These are scheduled together in PLAN.md Phase 5.5 ("Storage
-//! scalability for production load") since they share the same
-//! blob-offload pattern and are mutually load-bearing.
-//!
-//! - **Request / response body capture is wired** as of Phase 5.5
-//!   (b). Bodies up to 256 KB land in the per-tenant `log-blobs/`
-//!   directory; `tape_refs.{request,response}_body_hex` carry the
-//!   hash; `_truncated` flags signal when the captured bytes are a
-//!   prefix.
-//! - **Batch payload offload to BlobStore (Phase 5.5 a).** Today
-//!   the raft entry payload IS the batch bytes. Phase 5.5 (a)
-//!   changes this so the leader writes batches to S3 directly and
-//!   the per-tenant `log.db` retires entirely (logs become S3-direct
-//!   per `docs/logs-plan.md`). The library API doesn't change.
-//! - **Retention / GC.** No automatic sweep. A future
-//!   `purgeOlderThan(ns)` API is planned but not present yet.
+//! There is no longer a record-side KV / records-on-disk path. Pre-
+//! Phase-5.5(a), records lived in a per-tenant `log.db` so the
+//! in-process log-server thread could `list`/`get` them; that thread
+//! is gone, log.db is gone, and this module's API is correspondingly
+//! buffer-only. Tape body bytes still live in the per-tenant
+//! `BlobBackend` (fs or s3 prefix `{base}{tenant}/log-blobs/`); the
+//! BlobBackend is owned by the worker, not by `LogStore`, so it
+//! doesn't appear here either.
 //!
 //! ## Best-effort, not durable
 //!
 //! Records sit in volatile memory between flushes. A worker crash
 //! between `append` and the next flush loses those records. This is
 //! intentional — logs are observability, not source-of-truth state.
-//! The user explicitly chose this trade-off.
-//!
-//! ## Followers without raft proposal rights
-//!
-//! In a multi-node cluster, only the leader can propose raft entries.
-//! Follower-handled requests (currently: reads on followers in the
-//! existing rove-js model) get logged via a direct `applyBatch` call
-//! to the local store, bypassing raft. They're visible in local
-//! queries but not replicated to other nodes. Documented gap.
 
 const std = @import("std");
 const kv_mod = @import("rove-kv");
-const blob_mod = @import("rove-blob");
 
 pub const Error = error{
-    Truncated,
-    InvalidVersion,
-    InvalidOutcome,
     Kv,
-    Blob,
     OutOfMemory,
 };
 
 pub const HASH_HEX_LEN: usize = 64;
 
-/// Per-request lifecycle outcome. Stored in a single byte on the wire.
+/// Per-request lifecycle outcome.
 pub const Outcome = enum(u8) {
     ok = 0,
     fault = 1,
@@ -74,10 +50,10 @@ pub const Outcome = enum(u8) {
 
 /// Per-request blob references attached to a `LogRecord`. Each
 /// non-null field is a 64-char hex hash of bytes living in the
-/// tenant's `log-blobs/`. Replay fetches each by hash and either
-/// re-drives the handler from the captured non-determinism (the
-/// `*_tape_*` channels) or stamps the runtime globals (the
-/// request_body capture).
+/// tenant's `log-blobs/` BlobBackend. Replay fetches each by hash
+/// and either re-drives the handler from the captured non-determinism
+/// (the `*_tape_*` channels) or stamps the runtime globals (the
+/// `*_body_*` captures).
 pub const TapeRefs = struct {
     kv_tape_hex: ?[HASH_HEX_LEN]u8 = null,
     crypto_random_tape_hex: ?[HASH_HEX_LEN]u8 = null,
@@ -86,8 +62,7 @@ pub const TapeRefs = struct {
     module_tree_hex: ?[HASH_HEX_LEN]u8 = null,
     /// Hash of the captured request body (or its 256 KB prefix if
     /// the body was larger). Null when the request had no body or
-    /// the worker chose not to capture (no tenant log open). The
-    /// blob lives in the same `log-blobs/` directory as tape blobs.
+    /// the worker chose not to capture (no tenant log open).
     request_body_hex: ?[HASH_HEX_LEN]u8 = null,
     /// True iff `request_body_hex` references a truncated prefix.
     /// Replay still feeds the captured bytes — the handler's view
@@ -97,9 +72,7 @@ pub const TapeRefs = struct {
     /// Hash of the captured response body (handler return value
     /// after content-type sniffing / JSON serialization, truncated
     /// to 256 KB). Null when the handler returned no body or the
-    /// worker chose not to capture (no tenant log open). Same blob
-    /// store as the other tape refs. Replay UI uses this to show
-    /// the actual response bytes alongside the request.
+    /// worker chose not to capture.
     response_body_hex: ?[HASH_HEX_LEN]u8 = null,
     /// True iff `response_body_hex` references a truncated prefix.
     response_body_truncated: bool = false,
@@ -126,7 +99,6 @@ pub const LogRecord = struct {
     console: []const u8,
     /// JS exception message if the handler threw. Empty otherwise.
     exception: []const u8,
-    /// Tape references (Phase 5.5). Currently all null.
     tape_refs: TapeRefs = .{},
 
     pub fn deinit(self: *LogRecord, allocator: std.mem.Allocator) void {
@@ -138,59 +110,6 @@ pub const LogRecord = struct {
         self.* = undefined;
     }
 };
-
-pub const ListResult = struct {
-    records: []LogRecord,
-    /// `request_id` of the last record returned. Pass back as
-    /// `ListOpts.after` for the next page. 0 when `records.len == 0`
-    /// (no more pages, or empty initial query).
-    next_cursor: u64 = 0,
-    allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *ListResult) void {
-        for (self.records) |*r| r.deinit(self.allocator);
-        self.allocator.free(self.records);
-        self.records = &.{};
-    }
-};
-
-pub const ListOpts = struct {
-    /// Max records to return. Newest first.
-    limit: u32 = 100,
-    /// Pagination cursor: `request_id` of the last record from the
-    /// previous page. Records strictly older than `after` are
-    /// returned. 0 (the default) starts at the newest record.
-    after: u64 = 0,
-};
-
-/// Wire-format version. v1 used a u8 flags byte and didn't carry
-/// response-body refs. v2 widens flags to u16 and adds
-/// FLAG_RESP_BODY / FLAG_RESP_BODY_TRUNC. parseRecord still reads
-/// v1 records (flags as u8, no resp-body fields) so a worker
-/// upgrade doesn't strand old records in log.db.
-const RECORD_VERSION: u32 = 2;
-
-/// Bit positions in the `flags` field used by `serializeRecord`.
-/// Each bit signals presence of one optional field. v2 widened from
-/// u8 to u16 to make room for the response body refs.
-const FLAG_KV_TAPE: u16 = 1 << 0;
-const FLAG_CRYPTO_RANDOM_TAPE: u16 = 1 << 1;
-const FLAG_DATE_TAPE: u16 = 1 << 2;
-const FLAG_MATH_RANDOM_TAPE: u16 = 1 << 3;
-const FLAG_MODULE_TREE: u16 = 1 << 4;
-/// Set when `request_body_hex` is non-null. Followed by 64 hex bytes
-/// in the on-the-wire blob list, just like the tape flags above.
-const FLAG_REQ_BODY: u16 = 1 << 5;
-/// Truncation marker for the request body. Independent of
-/// `FLAG_REQ_BODY` only because a no-body request can't be
-/// "truncated" (the bit is meaningless without REQ_BODY set), but
-/// the encoder always clears it when REQ_BODY is clear.
-const FLAG_REQ_BODY_TRUNC: u16 = 1 << 6;
-/// Set when `response_body_hex` is non-null. Same hex-block layout.
-const FLAG_RESP_BODY: u16 = 1 << 7;
-/// Truncation marker for the response body. Same dependency rule
-/// as FLAG_REQ_BODY_TRUNC.
-const FLAG_RESP_BODY_TRUNC: u16 = 1 << 8;
 
 /// Request-id reservation window size. `nextRequestId` hands out this
 /// many ids in memory before persisting a new high-water mark to the
@@ -204,34 +123,17 @@ const FLAG_RESP_BODY_TRUNC: u16 = 1 << 8;
 /// is benign — ids never collide across restarts.
 pub const REQUEST_ID_CHUNK: u48 = 1024;
 
-/// Where the chunked-reservation counter lives. Defaults preserve
-/// the historical behavior (counter on the records `kv` at
-/// `meta/next_request_seq`) so test/CLI sites that don't care can
-/// pass `.{}`. The worker passes `.{ .seq_kv = inst.kv,
-/// .seq_key = "_log/next_request_seq" }` to put the counter on
-/// app.db — Phase 5.5 a, A4 — so dropping the log.db open in A3
-/// doesn't strand the counter.
+/// Where the chunked-reservation counter lives. The worker passes
+/// `inst.kv` (app.db) and `"_log/next_request_seq"`. Tests pass a
+/// dedicated SQLite file. Both fields are required — there is no
+/// implicit fallback.
 pub const Options = struct {
-    /// KvStore the chunked-reservation counter reads + writes.
-    /// `null` falls back to the records `kv` (back-compat).
-    seq_kv: ?*kv_mod.KvStore = null,
-    /// Key the chunked-reservation counter persists at. Default
-    /// matches the historical log.db key.
-    seq_key: []const u8 = "meta/next_request_seq",
+    seq_kv: *kv_mod.KvStore,
+    seq_key: []const u8,
 };
 
 pub const LogStore = struct {
     allocator: std.mem.Allocator,
-    /// Per-tenant log index. Historically stored `req/{id}` →
-    /// serialized record + `meta/next_request_seq`. Phase 5.5 (a)
-    /// retired the writer; the in-process log-server thread still
-    /// reads `req/{id}` until A3 deletes it. Counter moved off via
-    /// `Options.seq_kv` (A4).
-    kv: *kv_mod.KvStore,
-    /// Reserved for Phase 5.5 tape blob storage. Currently unused,
-    /// but wired so callers can construct a complete LogStore today
-    /// without needing to add a parameter when the offload lands.
-    blob: blob_mod.BlobStore,
     /// Upper 16 bits of every `request_id` minted by this LogStore.
     /// Sourced from raft node id at the worker layer; unique per node.
     worker_id: u16,
@@ -256,7 +158,7 @@ pub const LogStore = struct {
     /// fully owned (its slices were allocated by `allocator` when the
     /// caller built the record).
     buffer: std.ArrayList(LogRecord),
-    /// Wall-clock at the last `drainBatch` call. Used by `shouldFlush`
+    /// Wall-clock at the last `drainRecords` call. Used by `shouldFlush`
     /// for the time-based threshold.
     last_flush_ns: i64,
 
@@ -264,26 +166,20 @@ pub const LogStore = struct {
     flush_threshold_bytes: u32 = 64 * 1024,
     flush_interval_ns: i64 = 1 * std.time.ns_per_s,
 
-    /// Open or initialize a LogStore on top of an already-open KvStore
-    /// + BlobStore. The store reads its chunked-reservation counter
-    /// (key from `opts.seq_key` on `opts.seq_kv` or `kv`) if present
-    /// so request_ids don't collide after a restart. Any gap between
-    /// the loaded value and what was actually handed out before the
-    /// previous crash is intentional — see `REQUEST_ID_CHUNK`.
+    /// Open a LogStore. Reads its chunked-reservation counter from
+    /// `opts.seq_kv` at `opts.seq_key`; if absent, starts at 0. Any
+    /// gap between the loaded value and what was actually handed out
+    /// before the previous crash is intentional — see `REQUEST_ID_CHUNK`.
     pub fn init(
         allocator: std.mem.Allocator,
-        kv: *kv_mod.KvStore,
-        blob: blob_mod.BlobStore,
         worker_id: u16,
         opts: Options,
     ) Error!LogStore {
         const seq_key = allocator.dupe(u8, opts.seq_key) catch return Error.OutOfMemory;
         var self: LogStore = .{
             .allocator = allocator,
-            .kv = kv,
-            .blob = blob,
             .worker_id = worker_id,
-            .seq_kv = opts.seq_kv orelse kv,
+            .seq_kv = opts.seq_kv,
             .seq_key = seq_key,
             .next_request_seq = 0,
             .reserved_until = 0,
@@ -312,11 +208,9 @@ pub const LogStore = struct {
     /// per-request autocommit was ~29% of CPU in a 2026-04-14 profile.
     /// On restart, any unused tail of the last reservation is
     /// abandoned — ids become sparse across restarts, but never
-    /// collide, which is the only property we actually need.
+    /// collide.
     pub fn nextRequestId(self: *LogStore) Error!u64 {
         if (self.next_request_seq >= self.reserved_until) {
-            // Burn a new chunk of reserved ids and persist the new
-            // high-water mark in one commit.
             self.reserved_until = self.next_request_seq + REQUEST_ID_CHUNK;
             self.persistReservedUntil() catch return Error.Kv;
         }
@@ -334,7 +228,7 @@ pub const LogStore = struct {
 
     /// Returns true if any flush threshold has been crossed:
     ///   - record count >= flush_threshold_records
-    ///   - serialized buffer bytes >= flush_threshold_bytes (estimated)
+    ///   - estimated buffer bytes >= flush_threshold_bytes
     ///   - elapsed since last flush >= flush_interval_ns
     /// Cheap to call every tick.
     pub fn shouldFlush(self: *LogStore, now_ns: i64) bool {
@@ -347,30 +241,13 @@ pub const LogStore = struct {
         return false;
     }
 
-    /// Serialize the buffer into a single batch payload, clear the
-    /// buffer, and return owned bytes. Caller frees with
-    /// `allocator.free`. Returns null if the buffer is empty.
-    /// `last_flush_ns` is updated unconditionally so the time-based
-    /// threshold doesn't fire repeatedly on a quiet tenant.
-    pub fn drainBatch(self: *LogStore, allocator: std.mem.Allocator) Error!?[]u8 {
-        self.last_flush_ns = @as(i64, @intCast(std.time.nanoTimestamp()));
-        if (self.buffer.items.len == 0) return null;
-
-        const out = serializeBatch(allocator, self.buffer.items) catch return Error.OutOfMemory;
-        // Free the records' owned slices now that they're encoded.
-        for (self.buffer.items) |*r| r.deinit(self.allocator);
-        self.buffer.clearRetainingCapacity();
-        return out;
-    }
-
-    /// Hand the buffered records to the caller WITHOUT serializing.
-    /// Phase 5.5 (a) S3 flush path needs `LogRecord` access to build
-    /// per-record offset+length entries for the sidecar; the binary
-    /// serialization in `drainBatch` strips that. Caller takes
+    /// Hand the buffered records to the caller. The worker's flush
+    /// path needs the structured `LogRecord`s (not a serialized blob)
+    /// to build per-record offsets for the S3 sidecar. Caller takes
     /// ownership of every record's `[]const u8` fields and the outer
     /// slice; deinit each then `free` the slice with `allocator`.
-    /// Updates `last_flush_ns` like `drainBatch`. Returns null on
-    /// empty buffer.
+    /// Updates `last_flush_ns` so the time-based threshold doesn't
+    /// fire repeatedly. Returns null when the buffer is empty.
     pub fn drainRecords(self: *LogStore, allocator: std.mem.Allocator) Error!?[]LogRecord {
         self.last_flush_ns = @as(i64, @intCast(std.time.nanoTimestamp()));
         if (self.buffer.items.len == 0) return null;
@@ -382,108 +259,6 @@ pub const LogStore = struct {
         // buffer without re-freeing them — caller owns now.
         self.buffer.clearRetainingCapacity();
         return out;
-    }
-
-    /// Decode a batch payload (produced by `drainBatch` somewhere in
-    /// the cluster — possibly this node, possibly another) and write
-    /// each record to the local KV index. Idempotent on the
-    /// `req/{id}` keys: re-applying a batch overwrites with identical
-    /// bytes.
-    pub fn applyBatch(self: *LogStore, batch_bytes: []const u8) Error!void {
-        const records = try parseBatch(self.allocator, batch_bytes);
-        defer {
-            for (records) |*r| r.deinit(self.allocator);
-            self.allocator.free(records);
-        }
-
-        // Wrap the whole batch in ONE SQLite transaction. Without this,
-        // every record paid an individual `BEGIN`/`COMMIT` pair — at
-        // ~20k req/s that was ~80 flushes/sec × 256 commits each =
-        // ~20k WAL appends/sec, dominating CPU in walIndexAppend /
-        // walChecksumBytes. One batch → one commit → one WAL append.
-        self.kv.begin() catch return Error.Kv;
-        errdefer self.kv.rollback() catch {};
-        for (records) |*r| try self.writeOneInTxn(r);
-        self.kv.commit() catch return Error.Kv;
-    }
-
-    /// Build the storage key for a request id. The id is bitwise-
-    /// inverted so that ascending `kv.range` iteration over `req/`
-    /// walks newest-first naturally — giving us `list()` without a
-    /// secondary index. `get()` inverts once more before looking up.
-    fn reqKey(buf: *[4 + 16]u8, request_id: u64) []u8 {
-        return std.fmt.bufPrint(buf, "req/{x:0>16}", .{~request_id}) catch unreachable;
-    }
-
-    /// Single-record lookup by request_id. Returns null if not found.
-    /// Caller must `deinit` the returned record.
-    pub fn get(self: *LogStore, request_id: u64) Error!?LogRecord {
-        var key_buf: [4 + 16]u8 = undefined;
-        const key = reqKey(&key_buf, request_id);
-        const bytes = self.kv.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return Error.Kv,
-        };
-        defer self.allocator.free(bytes);
-        return try parseRecord(self.allocator, bytes);
-    }
-
-    /// List recent records (newest first). Because the primary key is
-    /// inverted (`req/{~id}`), ascending iteration returns newest
-    /// first — no secondary index needed. `opts.after` (a `request_id`)
-    /// paginates: records strictly older than `after` are returned.
-    /// Caller must deinit. The returned `next_cursor` is the
-    /// `request_id` of the last record (0 if the page is empty),
-    /// suitable for passing as `after` on the next call.
-    pub fn list(self: *LogStore, opts: ListOpts) Error!ListResult {
-        // Build the kv-layer cursor. `kv.prefix` returns keys
-        // strictly greater than the cursor; since we store
-        // `req/{~request_id}`, "strictly newer than `after` in
-        // request_id space" maps to "strictly greater than
-        // `req/{~after}` in key space" — newer ids have smaller
-        // inverted keys, so the next page starts past `after`'s
-        // inverted key.
-        var key_buf: [4 + 16]u8 = undefined;
-        const cursor: []const u8 = if (opts.after == 0) "" else reqKey(&key_buf, opts.after);
-
-        var scan = self.kv.prefix("req/", cursor, opts.limit) catch
-            return Error.Kv;
-        defer scan.deinit();
-
-        var out = std.ArrayList(LogRecord).empty;
-        errdefer {
-            for (out.items) |*r| r.deinit(self.allocator);
-            out.deinit(self.allocator);
-        }
-
-        for (scan.entries) |entry| {
-            const rec = parseRecord(self.allocator, entry.value) catch continue;
-            out.append(self.allocator, rec) catch return Error.OutOfMemory;
-        }
-
-        const slice = out.toOwnedSlice(self.allocator) catch return Error.OutOfMemory;
-        const next: u64 = if (slice.len == 0) 0 else slice[slice.len - 1].request_id;
-        return .{ .records = slice, .next_cursor = next, .allocator = self.allocator };
-    }
-
-    // ── Internals ─────────────────────────────────────────────────────
-
-    /// Write one `req/{~id}` row. Single INSERT — no secondary index.
-    /// Caller holds the SQLite txn (`applyBatch` opens one per batch).
-    fn writeOne(self: *LogStore, record: *const LogRecord) Error!void {
-        self.kv.begin() catch return Error.Kv;
-        errdefer self.kv.rollback() catch {};
-        try self.writeOneInTxn(record);
-        self.kv.commit() catch return Error.Kv;
-    }
-
-    fn writeOneInTxn(self: *LogStore, record: *const LogRecord) Error!void {
-        const bytes = serializeRecord(self.allocator, record) catch return Error.OutOfMemory;
-        defer self.allocator.free(bytes);
-
-        var key_buf: [4 + 16]u8 = undefined;
-        const key = reqKey(&key_buf, record.request_id);
-        self.kv.put(key, bytes) catch return Error.Kv;
     }
 
     fn loadNextSeq(self: *LogStore) Error!u48 {
@@ -502,27 +277,13 @@ pub const LogStore = struct {
     }
 };
 
-// ── Encoding ───────────────────────────────────────────────────────────
-//
-// Record layout (binary, little-endian):
-//   [u32 version=1][u64 request_id][u64 deployment_id]
-//   [i64 received_ns][i64 duration_ns][u16 status][u8 outcome]
-//   [u16 method_len][method][u16 path_len][path][u16 host_len][host]
-//   [u32 console_len][console][u32 exception_len][exception]
-//   [u8 flags][optional 64-byte tape hex blocks per set flag]
-//
-// Batch layout:
-//   [u32 record_count][u32 total_payload_len]
-//   [per record: [u32 record_len][record bytes]]
-
+/// Approximate per-record byte cost used by `shouldFlush`'s byte
+/// threshold. The flush path serializes to ndjson, which is roughly
+/// 2-3× the raw struct size; the threshold is a soft cap, not exact.
 fn estimateRecordBytes(r: *const LogRecord) usize {
-    var n: usize = 4 + 8 + 8 + 8 + 8 + 2 + 1; // header fixed
-    n += 2 + r.method.len;
-    n += 2 + r.path.len;
-    n += 2 + r.host.len;
-    n += 4 + r.console.len;
-    n += 4 + r.exception.len;
-    n += 2; // flags (u16 in v2)
+    var n: usize = 64; // fixed-width header (request_id, timestamps, status, ...)
+    n += r.method.len + r.path.len + r.host.len;
+    n += r.console.len + r.exception.len;
     if (r.tape_refs.kv_tape_hex != null) n += HASH_HEX_LEN;
     if (r.tape_refs.crypto_random_tape_hex != null) n += HASH_HEX_LEN;
     if (r.tape_refs.date_tape_hex != null) n += HASH_HEX_LEN;
@@ -533,304 +294,9 @@ fn estimateRecordBytes(r: *const LogRecord) usize {
     return n;
 }
 
-fn serializeRecord(allocator: std.mem.Allocator, r: *const LogRecord) ![]u8 {
-    const total = estimateRecordBytes(r);
-    const out = try allocator.alloc(u8, total);
-    var i: usize = 0;
-
-    std.mem.writeInt(u32, out[i..][0..4], RECORD_VERSION, .little);
-    i += 4;
-    std.mem.writeInt(u64, out[i..][0..8], r.request_id, .little);
-    i += 8;
-    std.mem.writeInt(u64, out[i..][0..8], r.deployment_id, .little);
-    i += 8;
-    std.mem.writeInt(i64, out[i..][0..8], r.received_ns, .little);
-    i += 8;
-    std.mem.writeInt(i64, out[i..][0..8], r.duration_ns, .little);
-    i += 8;
-    std.mem.writeInt(u16, out[i..][0..2], r.status, .little);
-    i += 2;
-    out[i] = @intFromEnum(r.outcome);
-    i += 1;
-
-    i += writeLenPrefixed(out[i..], r.method, 2);
-    i += writeLenPrefixed(out[i..], r.path, 2);
-    i += writeLenPrefixed(out[i..], r.host, 2);
-    i += writeLenPrefixed(out[i..], r.console, 4);
-    i += writeLenPrefixed(out[i..], r.exception, 4);
-
-    var flags: u16 = 0;
-    if (r.tape_refs.kv_tape_hex != null) flags |= FLAG_KV_TAPE;
-    if (r.tape_refs.crypto_random_tape_hex != null) flags |= FLAG_CRYPTO_RANDOM_TAPE;
-    if (r.tape_refs.date_tape_hex != null) flags |= FLAG_DATE_TAPE;
-    if (r.tape_refs.math_random_tape_hex != null) flags |= FLAG_MATH_RANDOM_TAPE;
-    if (r.tape_refs.module_tree_hex != null) flags |= FLAG_MODULE_TREE;
-    if (r.tape_refs.request_body_hex != null) {
-        flags |= FLAG_REQ_BODY;
-        if (r.tape_refs.request_body_truncated) flags |= FLAG_REQ_BODY_TRUNC;
-    }
-    if (r.tape_refs.response_body_hex != null) {
-        flags |= FLAG_RESP_BODY;
-        if (r.tape_refs.response_body_truncated) flags |= FLAG_RESP_BODY_TRUNC;
-    }
-    std.mem.writeInt(u16, out[i..][0..2], flags, .little);
-    i += 2;
-
-    inline for (.{
-        .{ FLAG_KV_TAPE, r.tape_refs.kv_tape_hex },
-        .{ FLAG_CRYPTO_RANDOM_TAPE, r.tape_refs.crypto_random_tape_hex },
-        .{ FLAG_DATE_TAPE, r.tape_refs.date_tape_hex },
-        .{ FLAG_MATH_RANDOM_TAPE, r.tape_refs.math_random_tape_hex },
-        .{ FLAG_MODULE_TREE, r.tape_refs.module_tree_hex },
-        .{ FLAG_REQ_BODY, r.tape_refs.request_body_hex },
-        .{ FLAG_RESP_BODY, r.tape_refs.response_body_hex },
-    }) |pair| {
-        if (pair[1]) |hex| {
-            @memcpy(out[i..][0..HASH_HEX_LEN], &hex);
-            i += HASH_HEX_LEN;
-        }
-    }
-
-    return out;
-}
-
-fn writeLenPrefixed(dst: []u8, src: []const u8, comptime prefix_len: comptime_int) usize {
-    if (prefix_len == 2) {
-        std.mem.writeInt(u16, dst[0..2], @intCast(src.len), .little);
-        @memcpy(dst[2..][0..src.len], src);
-        return 2 + src.len;
-    } else if (prefix_len == 4) {
-        std.mem.writeInt(u32, dst[0..4], @intCast(src.len), .little);
-        @memcpy(dst[4..][0..src.len], src);
-        return 4 + src.len;
-    } else @compileError("unsupported prefix_len");
-}
-
-fn parseRecord(allocator: std.mem.Allocator, bytes: []const u8) Error!LogRecord {
-    var r = ParseReader{ .data = bytes, .pos = 0 };
-    const version = try r.u32le();
-    // v1 records exist on disk for tenants whose log.db predates the
-    // resp-body-capture upgrade. We read them with the narrower u8
-    // flags layout and synthesize zero-filled response refs. v2 is
-    // current.
-    if (version != 1 and version != RECORD_VERSION) return Error.InvalidVersion;
-    const request_id = try r.u64le();
-    const deployment_id = try r.u64le();
-    const received_ns = try r.i64le();
-    const duration_ns = try r.i64le();
-    const status = try r.u16le();
-    const outcome_byte = try r.byte();
-    const outcome = std.meta.intToEnum(Outcome, outcome_byte) catch return Error.InvalidOutcome;
-
-    const method = try r.bytes16(allocator);
-    errdefer allocator.free(method);
-    const path = try r.bytes16(allocator);
-    errdefer allocator.free(path);
-    const host = try r.bytes16(allocator);
-    errdefer allocator.free(host);
-    const console = try r.bytes32(allocator);
-    errdefer allocator.free(console);
-    const exception = try r.bytes32(allocator);
-    errdefer allocator.free(exception);
-
-    const flags: u16 = if (version == 1) @intCast(try r.byte()) else try r.u16le();
-    var tape_refs: TapeRefs = .{};
-    if (flags & FLAG_KV_TAPE != 0) tape_refs.kv_tape_hex = try r.hexBlock();
-    if (flags & FLAG_CRYPTO_RANDOM_TAPE != 0) tape_refs.crypto_random_tape_hex = try r.hexBlock();
-    if (flags & FLAG_DATE_TAPE != 0) tape_refs.date_tape_hex = try r.hexBlock();
-    if (flags & FLAG_MATH_RANDOM_TAPE != 0) tape_refs.math_random_tape_hex = try r.hexBlock();
-    if (flags & FLAG_MODULE_TREE != 0) tape_refs.module_tree_hex = try r.hexBlock();
-    if (flags & FLAG_REQ_BODY != 0) {
-        tape_refs.request_body_hex = try r.hexBlock();
-        tape_refs.request_body_truncated = (flags & FLAG_REQ_BODY_TRUNC) != 0;
-    }
-    if (flags & FLAG_RESP_BODY != 0) {
-        tape_refs.response_body_hex = try r.hexBlock();
-        tape_refs.response_body_truncated = (flags & FLAG_RESP_BODY_TRUNC) != 0;
-    }
-
-    return .{
-        .request_id = request_id,
-        .deployment_id = deployment_id,
-        .received_ns = received_ns,
-        .duration_ns = duration_ns,
-        .method = method,
-        .path = path,
-        .host = host,
-        .status = status,
-        .outcome = outcome,
-        .console = console,
-        .exception = exception,
-        .tape_refs = tape_refs,
-    };
-}
-
-const ParseReader = struct {
-    data: []const u8,
-    pos: usize,
-
-    fn remaining(self: *const ParseReader) usize {
-        return self.data.len - self.pos;
-    }
-
-    fn byte(self: *ParseReader) Error!u8 {
-        if (self.remaining() < 1) return Error.Truncated;
-        const v = self.data[self.pos];
-        self.pos += 1;
-        return v;
-    }
-
-    fn u16le(self: *ParseReader) Error!u16 {
-        if (self.remaining() < 2) return Error.Truncated;
-        const v = std.mem.readInt(u16, self.data[self.pos..][0..2], .little);
-        self.pos += 2;
-        return v;
-    }
-
-    fn u32le(self: *ParseReader) Error!u32 {
-        if (self.remaining() < 4) return Error.Truncated;
-        const v = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
-        self.pos += 4;
-        return v;
-    }
-
-    fn u64le(self: *ParseReader) Error!u64 {
-        if (self.remaining() < 8) return Error.Truncated;
-        const v = std.mem.readInt(u64, self.data[self.pos..][0..8], .little);
-        self.pos += 8;
-        return v;
-    }
-
-    fn i64le(self: *ParseReader) Error!i64 {
-        return @bitCast(try self.u64le());
-    }
-
-    fn bytes16(self: *ParseReader, allocator: std.mem.Allocator) Error![]u8 {
-        const n = try self.u16le();
-        if (self.remaining() < n) return Error.Truncated;
-        const out = allocator.alloc(u8, n) catch return Error.OutOfMemory;
-        @memcpy(out, self.data[self.pos..][0..n]);
-        self.pos += n;
-        return out;
-    }
-
-    fn bytes32(self: *ParseReader, allocator: std.mem.Allocator) Error![]u8 {
-        const n = try self.u32le();
-        if (self.remaining() < n) return Error.Truncated;
-        const out = allocator.alloc(u8, n) catch return Error.OutOfMemory;
-        @memcpy(out, self.data[self.pos..][0..n]);
-        self.pos += n;
-        return out;
-    }
-
-    fn hexBlock(self: *ParseReader) Error![HASH_HEX_LEN]u8 {
-        if (self.remaining() < HASH_HEX_LEN) return Error.Truncated;
-        var out: [HASH_HEX_LEN]u8 = undefined;
-        @memcpy(&out, self.data[self.pos..][0..HASH_HEX_LEN]);
-        self.pos += HASH_HEX_LEN;
-        return out;
-    }
-};
-
-fn serializeBatch(allocator: std.mem.Allocator, records: []const LogRecord) ![]u8 {
-    // Pre-encode each record so we know the sizes.
-    var encoded = std.ArrayList([]u8).empty;
-    defer {
-        for (encoded.items) |b| allocator.free(b);
-        encoded.deinit(allocator);
-    }
-    for (records) |*r| {
-        const b = try serializeRecord(allocator, r);
-        try encoded.append(allocator, b);
-    }
-
-    var total: usize = 4 + 4; // count + total_len header
-    for (encoded.items) |b| total += 4 + b.len;
-
-    const out = try allocator.alloc(u8, total);
-    var i: usize = 0;
-    std.mem.writeInt(u32, out[i..][0..4], @intCast(records.len), .little);
-    i += 4;
-    std.mem.writeInt(u32, out[i..][0..4], @intCast(total), .little);
-    i += 4;
-    for (encoded.items) |b| {
-        std.mem.writeInt(u32, out[i..][0..4], @intCast(b.len), .little);
-        i += 4;
-        @memcpy(out[i..][0..b.len], b);
-        i += b.len;
-    }
-    return out;
-}
-
-fn parseBatch(allocator: std.mem.Allocator, bytes: []const u8) Error![]LogRecord {
-    var r = ParseReader{ .data = bytes, .pos = 0 };
-    const count = try r.u32le();
-    _ = try r.u32le(); // total_len, currently unused; kept for forward compat
-
-    const out = allocator.alloc(LogRecord, count) catch return Error.OutOfMemory;
-    var filled: usize = 0;
-    errdefer {
-        for (out[0..filled]) |*rec| rec.deinit(allocator);
-        allocator.free(out);
-    }
-
-    while (filled < count) : (filled += 1) {
-        const rec_len = try r.u32le();
-        if (r.remaining() < rec_len) return Error.Truncated;
-        const slice = r.data[r.pos..][0..rec_len];
-        r.pos += rec_len;
-        out[filled] = try parseRecord(allocator, slice);
-    }
-    return out;
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const fs_backend = blob_mod.fs;
-
-const TestFixture = struct {
-    allocator: std.mem.Allocator,
-    tmp_dir: []u8,
-    kv: *kv_mod.KvStore,
-    blob_store: fs_backend.FilesystemBlobStore,
-    log: LogStore,
-
-    fn init(allocator: std.mem.Allocator) !TestFixture {
-        const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-        const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-log-test-{x}", .{seed});
-        errdefer allocator.free(tmp_dir);
-        std.fs.cwd().deleteTree(tmp_dir) catch {};
-        try std.fs.cwd().makePath(tmp_dir);
-
-        const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/log.db", .{tmp_dir}, 0);
-        defer allocator.free(db_path);
-        const kv = try kv_mod.KvStore.open(allocator, db_path);
-        errdefer kv.close();
-
-        const blob_dir = try std.fmt.allocPrint(allocator, "{s}/log-blobs", .{tmp_dir});
-        defer allocator.free(blob_dir);
-        var bs = try fs_backend.FilesystemBlobStore.open(allocator, blob_dir);
-        errdefer bs.deinit();
-
-        const log = try LogStore.init(allocator, kv, bs.blobStore(), 7, .{});
-        return .{
-            .allocator = allocator,
-            .tmp_dir = tmp_dir,
-            .kv = kv,
-            .blob_store = bs,
-            .log = log,
-        };
-    }
-
-    fn deinit(self: *TestFixture) void {
-        self.log.deinit();
-        self.blob_store.deinit();
-        self.kv.close();
-        std.fs.cwd().deleteTree(self.tmp_dir) catch {};
-        self.allocator.free(self.tmp_dir);
-    }
-};
 
 fn buildRecord(
     allocator: std.mem.Allocator,
@@ -856,243 +322,40 @@ fn buildRecord(
     };
 }
 
-test "serialize + parse single record round-trip" {
-    const a = testing.allocator;
-    var rec = try buildRecord(a, 0x1234567890abcdef, "GET", "/foo", 200, .ok, "hello\n");
-    defer rec.deinit(a);
+const TestStore = struct {
+    allocator: std.mem.Allocator,
+    tmp_dir: []u8,
+    seq_kv: *kv_mod.KvStore,
+    log: LogStore,
 
-    const bytes = try serializeRecord(a, &rec);
-    defer a.free(bytes);
-
-    var parsed = try parseRecord(a, bytes);
-    defer parsed.deinit(a);
-
-    try testing.expectEqual(rec.request_id, parsed.request_id);
-    try testing.expectEqual(rec.deployment_id, parsed.deployment_id);
-    try testing.expectEqual(rec.received_ns, parsed.received_ns);
-    try testing.expectEqual(rec.duration_ns, parsed.duration_ns);
-    try testing.expectEqual(rec.status, parsed.status);
-    try testing.expectEqual(rec.outcome, parsed.outcome);
-    try testing.expectEqualStrings(rec.method, parsed.method);
-    try testing.expectEqualStrings(rec.path, parsed.path);
-    try testing.expectEqualStrings(rec.host, parsed.host);
-    try testing.expectEqualStrings(rec.console, parsed.console);
-}
-
-test "tape_refs default null round-trip" {
-    const a = testing.allocator;
-    var rec = try buildRecord(a, 1, "POST", "/x", 200, .ok, "");
-    defer rec.deinit(a);
-
-    const bytes = try serializeRecord(a, &rec);
-    defer a.free(bytes);
-    var parsed = try parseRecord(a, bytes);
-    defer parsed.deinit(a);
-
-    try testing.expect(parsed.tape_refs.kv_tape_hex == null);
-    try testing.expect(parsed.tape_refs.crypto_random_tape_hex == null);
-    try testing.expect(parsed.tape_refs.date_tape_hex == null);
-    try testing.expect(parsed.tape_refs.math_random_tape_hex == null);
-    try testing.expect(parsed.tape_refs.module_tree_hex == null);
-}
-
-test "tape_refs partial set round-trip" {
-    const a = testing.allocator;
-    var rec = try buildRecord(a, 2, "GET", "/", 200, .ok, "");
-    defer rec.deinit(a);
-    rec.tape_refs.kv_tape_hex = [_]u8{'a'} ** HASH_HEX_LEN;
-    rec.tape_refs.module_tree_hex = [_]u8{'b'} ** HASH_HEX_LEN;
-
-    const bytes = try serializeRecord(a, &rec);
-    defer a.free(bytes);
-    var parsed = try parseRecord(a, bytes);
-    defer parsed.deinit(a);
-
-    try testing.expect(parsed.tape_refs.kv_tape_hex != null);
-    try testing.expectEqualSlices(u8, &([_]u8{'a'} ** HASH_HEX_LEN), &parsed.tape_refs.kv_tape_hex.?);
-    try testing.expect(parsed.tape_refs.crypto_random_tape_hex == null);
-    try testing.expect(parsed.tape_refs.module_tree_hex != null);
-}
-
-test "request + response body refs round-trip with truncation flags" {
-    const a = testing.allocator;
-    var rec = try buildRecord(a, 99, "POST", "/upload", 201, .ok, "");
-    defer rec.deinit(a);
-    rec.tape_refs.request_body_hex = [_]u8{'r'} ** HASH_HEX_LEN;
-    rec.tape_refs.request_body_truncated = true;
-    rec.tape_refs.response_body_hex = [_]u8{'s'} ** HASH_HEX_LEN;
-    rec.tape_refs.response_body_truncated = false;
-
-    const bytes = try serializeRecord(a, &rec);
-    defer a.free(bytes);
-    var parsed = try parseRecord(a, bytes);
-    defer parsed.deinit(a);
-
-    try testing.expect(parsed.tape_refs.request_body_hex != null);
-    try testing.expectEqualSlices(u8, &([_]u8{'r'} ** HASH_HEX_LEN), &parsed.tape_refs.request_body_hex.?);
-    try testing.expectEqual(true, parsed.tape_refs.request_body_truncated);
-    try testing.expect(parsed.tape_refs.response_body_hex != null);
-    try testing.expectEqualSlices(u8, &([_]u8{'s'} ** HASH_HEX_LEN), &parsed.tape_refs.response_body_hex.?);
-    try testing.expectEqual(false, parsed.tape_refs.response_body_truncated);
-}
-
-test "response body absent serializes without ref bytes" {
-    const a = testing.allocator;
-    var rec = try buildRecord(a, 100, "GET", "/", 200, .ok, "");
-    defer rec.deinit(a);
-    // Only request body — no response body. Encoder must not write
-    // a response-body hex block, decoder must produce null refs.
-    rec.tape_refs.request_body_hex = [_]u8{'q'} ** HASH_HEX_LEN;
-
-    const bytes = try serializeRecord(a, &rec);
-    defer a.free(bytes);
-    var parsed = try parseRecord(a, bytes);
-    defer parsed.deinit(a);
-
-    try testing.expect(parsed.tape_refs.request_body_hex != null);
-    try testing.expect(parsed.tape_refs.response_body_hex == null);
-    try testing.expectEqual(false, parsed.tape_refs.response_body_truncated);
-}
-
-test "v1 record with u8 flags decodes (forward compat for in-flight upgrade)" {
-    // Hand-craft a v1 record byte sequence that mirrors what
-    // pre-upgrade workers wrote. parseRecord must accept it and
-    // synthesize null response-body refs.
-    const a = testing.allocator;
-
-    // Build via the v2 path then patch: change the version to 1 and
-    // collapse the u16 flags down to u8. That gives us a known-good
-    // v1 layout without re-implementing the encoder.
-    var rec = try buildRecord(a, 7, "GET", "/v1", 200, .ok, "old\n");
-    defer rec.deinit(a);
-    rec.tape_refs.kv_tape_hex = [_]u8{'k'} ** HASH_HEX_LEN;
-    rec.tape_refs.request_body_hex = [_]u8{'b'} ** HASH_HEX_LEN;
-    rec.tape_refs.request_body_truncated = true;
-
-    const v2_bytes = try serializeRecord(a, &rec);
-    defer a.free(v2_bytes);
-
-    // Locate the flags field: header (4+8+8+8+8+2+1) + len-prefixed
-    // method/path/host/console/exception. We'll find it by walking.
-    var pos: usize = 4 + 8 + 8 + 8 + 8 + 2 + 1;
-    inline for (.{ 2, 2, 2, 4, 4 }) |prefix_len| {
-        if (prefix_len == 2) {
-            const n = std.mem.readInt(u16, v2_bytes[pos..][0..2], .little);
-            pos += 2 + n;
-        } else if (prefix_len == 4) {
-            const n = std.mem.readInt(u32, v2_bytes[pos..][0..4], .little);
-            pos += 4 + n;
-        }
-    }
-    // pos now points at the u16 flags field.
-
-    // Build the v1-shaped buffer: copy [0..pos], drop one byte from
-    // the flags field (u16 → u8), copy the rest. Update version.
-    var v1 = std.ArrayList(u8).empty;
-    defer v1.deinit(a);
-    try v1.appendSlice(a, v2_bytes[0..pos]);
-    try v1.append(a, v2_bytes[pos]); // low byte of flags is the v1 flag byte
-    try v1.appendSlice(a, v2_bytes[pos + 2 ..]);
-    std.mem.writeInt(u32, v1.items[0..4], 1, .little);
-
-    var parsed = try parseRecord(a, v1.items);
-    defer parsed.deinit(a);
-
-    try testing.expectEqual(@as(u64, 7), parsed.request_id);
-    try testing.expect(parsed.tape_refs.kv_tape_hex != null);
-    try testing.expect(parsed.tape_refs.request_body_hex != null);
-    try testing.expectEqual(true, parsed.tape_refs.request_body_truncated);
-    // v1 had no response-body slot; must come back null.
-    try testing.expect(parsed.tape_refs.response_body_hex == null);
-}
-
-test "batch serialize + parse round-trip" {
-    const a = testing.allocator;
-    var records = [_]LogRecord{
-        try buildRecord(a, 1, "GET", "/a", 200, .ok, ""),
-        try buildRecord(a, 2, "POST", "/b", 503, .fault, "boom\n"),
-        try buildRecord(a, 3, "DELETE", "/c", 404, .no_deployment, ""),
-    };
-    defer for (&records) |*r| r.deinit(a);
-
-    const bytes = try serializeBatch(a, &records);
-    defer a.free(bytes);
-
-    const parsed = try parseBatch(a, bytes);
-    defer {
-        for (parsed) |*r| r.deinit(a);
-        a.free(parsed);
+    fn init(allocator: std.mem.Allocator) !TestStore {
+        const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+        const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-log-test-{x}", .{seed});
+        errdefer allocator.free(tmp_dir);
+        std.fs.cwd().deleteTree(tmp_dir) catch {};
+        try std.fs.cwd().makePath(tmp_dir);
+        const seq_path = try std.fmt.allocPrintSentinel(allocator, "{s}/seq.db", .{tmp_dir}, 0);
+        defer allocator.free(seq_path);
+        const seq_kv = try kv_mod.KvStore.open(allocator, seq_path);
+        errdefer seq_kv.close();
+        const log = try LogStore.init(allocator, 7, .{
+            .seq_kv = seq_kv,
+            .seq_key = "_log/next_request_seq",
+        });
+        return .{ .allocator = allocator, .tmp_dir = tmp_dir, .seq_kv = seq_kv, .log = log };
     }
 
-    try testing.expectEqual(@as(usize, 3), parsed.len);
-    try testing.expectEqual(records[0].request_id, parsed[0].request_id);
-    try testing.expectEqual(records[1].outcome, parsed[1].outcome);
-    try testing.expectEqualStrings(records[2].path, parsed[2].path);
-}
-
-test "parseBatch rejects truncated input" {
-    const a = testing.allocator;
-    try testing.expectError(Error.Truncated, parseBatch(a, &[_]u8{}));
-    // claim 3 records but stop after the header
-    try testing.expectError(
-        Error.Truncated,
-        parseBatch(a, &[_]u8{ 3, 0, 0, 0, 0, 0, 0, 0 }),
-    );
-}
-
-test "LogStore append + drainBatch + applyBatch round-trip via local kv" {
-    const a = testing.allocator;
-    var fx = try TestFixture.init(a);
-    defer fx.deinit();
-
-    const id1 = try fx.log.nextRequestId();
-    try fx.log.append(try buildRecord(a, id1, "GET", "/one", 200, .ok, "a\n"));
-    const id2 = try fx.log.nextRequestId();
-    try fx.log.append(try buildRecord(a, id2, "POST", "/two", 201, .ok, "b\n"));
-
-    const batch = (try fx.log.drainBatch(a)).?;
-    defer a.free(batch);
-    try testing.expectEqual(@as(usize, 0), fx.log.buffer.items.len);
-
-    try fx.log.applyBatch(batch);
-
-    var got1 = (try fx.log.get(id1)).?;
-    defer got1.deinit(a);
-    try testing.expectEqualStrings("/one", got1.path);
-
-    var got2 = (try fx.log.get(id2)).?;
-    defer got2.deinit(a);
-    try testing.expectEqualStrings("/two", got2.path);
-}
-
-test "LogStore.list returns records newest first" {
-    const a = testing.allocator;
-    var fx = try TestFixture.init(a);
-    defer fx.deinit();
-
-    var i: u32 = 0;
-    while (i < 5) : (i += 1) {
-        const id = try fx.log.nextRequestId();
-        var path_buf: [16]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "/p{d}", .{i});
-        try fx.log.append(try buildRecord(a, id, "GET", path, 200, .ok, ""));
+    fn deinit(self: *TestStore) void {
+        self.log.deinit();
+        self.seq_kv.close();
+        std.fs.cwd().deleteTree(self.tmp_dir) catch {};
+        self.allocator.free(self.tmp_dir);
     }
-    const batch = (try fx.log.drainBatch(a)).?;
-    defer a.free(batch);
-    try fx.log.applyBatch(batch);
-
-    var result = try fx.log.list(.{ .limit = 10 });
-    defer result.deinit();
-
-    try testing.expectEqual(@as(usize, 5), result.records.len);
-    // Newest first: /p4 then /p3 ... /p0
-    try testing.expectEqualStrings("/p4", result.records[0].path);
-    try testing.expectEqualStrings("/p0", result.records[4].path);
-}
+};
 
 test "shouldFlush honors record-count threshold" {
     const a = testing.allocator;
-    var fx = try TestFixture.init(a);
+    var fx = try TestStore.init(a);
     defer fx.deinit();
     fx.log.flush_threshold_records = 3;
     fx.log.flush_interval_ns = std.math.maxInt(i64); // disable time path
@@ -1109,16 +372,36 @@ test "shouldFlush honors record-count threshold" {
 
 test "shouldFlush honors time threshold" {
     const a = testing.allocator;
-    var fx = try TestFixture.init(a);
+    var fx = try TestStore.init(a);
     defer fx.deinit();
-    fx.log.flush_threshold_records = 1000; // disable count path
+    fx.log.flush_threshold_records = 1000;
     fx.log.flush_threshold_bytes = std.math.maxInt(u32);
     fx.log.flush_interval_ns = 1_000_000; // 1 ms
     fx.log.last_flush_ns = 0;
 
     try fx.log.append(try buildRecord(a, 1, "GET", "/", 200, .ok, ""));
-    try testing.expect(!fx.log.shouldFlush(500_000)); // 0.5 ms
-    try testing.expect(fx.log.shouldFlush(1_500_000)); // 1.5 ms
+    try testing.expect(!fx.log.shouldFlush(500_000));
+    try testing.expect(fx.log.shouldFlush(1_500_000));
+}
+
+test "drainRecords transfers ownership and clears the buffer" {
+    const a = testing.allocator;
+    var fx = try TestStore.init(a);
+    defer fx.deinit();
+
+    try fx.log.append(try buildRecord(a, 1, "GET", "/a", 200, .ok, ""));
+    try fx.log.append(try buildRecord(a, 2, "POST", "/b", 503, .fault, "boom\n"));
+
+    const drained = (try fx.log.drainRecords(a)).?;
+    defer {
+        for (drained) |*r| r.deinit(a);
+        a.free(drained);
+    }
+    try testing.expectEqual(@as(usize, 2), drained.len);
+    try testing.expectEqualStrings("/a", drained[0].path);
+    try testing.expectEqualStrings("/b", drained[1].path);
+    try testing.expectEqual(@as(usize, 0), fx.log.buffer.items.len);
+    try testing.expectEqual(@as(?[]LogRecord, null), try fx.log.drainRecords(a));
 }
 
 test "next_request_seq persists across LogStore reopen (chunked)" {
@@ -1130,29 +413,29 @@ test "next_request_seq persists across LogStore reopen (chunked)" {
     try std.fs.cwd().makePath(tmp_dir);
     defer std.fs.cwd().deleteTree(tmp_dir) catch {};
 
-    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/log.db", .{tmp_dir}, 0);
-    defer a.free(db_path);
-    const blob_dir = try std.fmt.allocPrint(a, "{s}/log-blobs", .{tmp_dir});
-    defer a.free(blob_dir);
+    const seq_path = try std.fmt.allocPrintSentinel(a, "{s}/seq.db", .{tmp_dir}, 0);
+    defer a.free(seq_path);
 
     var first_ids: [3]u64 = undefined;
     {
-        const kv = try kv_mod.KvStore.open(a, db_path);
-        defer kv.close();
-        var bs = try fs_backend.FilesystemBlobStore.open(a, blob_dir);
-        defer bs.deinit();
-        var log = try LogStore.init(a, kv, bs.blobStore(), 0, .{});
+        const seq_kv = try kv_mod.KvStore.open(a, seq_path);
+        defer seq_kv.close();
+        var log = try LogStore.init(a, 0, .{
+            .seq_kv = seq_kv,
+            .seq_key = "_log/next_request_seq",
+        });
         defer log.deinit();
         first_ids[0] = try log.nextRequestId();
         first_ids[1] = try log.nextRequestId();
         first_ids[2] = try log.nextRequestId();
     }
     {
-        const kv = try kv_mod.KvStore.open(a, db_path);
-        defer kv.close();
-        var bs = try fs_backend.FilesystemBlobStore.open(a, blob_dir);
-        defer bs.deinit();
-        var log = try LogStore.init(a, kv, bs.blobStore(), 0, .{});
+        const seq_kv = try kv_mod.KvStore.open(a, seq_path);
+        defer seq_kv.close();
+        var log = try LogStore.init(a, 0, .{
+            .seq_kv = seq_kv,
+            .seq_key = "_log/next_request_seq",
+        });
         defer log.deinit();
         const next = try log.nextRequestId();
         // Under chunked reservation: the first nextRequestId call in
@@ -1161,89 +444,21 @@ test "next_request_seq persists across LogStore reopen (chunked)" {
         // id at exactly `REQUEST_ID_CHUNK` — the intervening seqs
         // 3..REQUEST_ID_CHUNK-1 become an intentional sparse gap.
         try testing.expectEqual(@as(u64, REQUEST_ID_CHUNK), next);
-        // And no collisions with the previous process's ids.
         for (first_ids) |prior| try testing.expect(next > prior);
     }
 }
 
 test "worker_id occupies the upper 16 bits of request_id" {
     const a = testing.allocator;
-    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const tmp_dir = try std.fmt.allocPrint(a, "/tmp/rove-log-wid-{x}", .{seed});
-    defer a.free(tmp_dir);
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-
-    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/log.db", .{tmp_dir}, 0);
-    defer a.free(db_path);
-    const blob_dir = try std.fmt.allocPrint(a, "{s}/log-blobs", .{tmp_dir});
-    defer a.free(blob_dir);
-
-    const kv = try kv_mod.KvStore.open(a, db_path);
-    defer kv.close();
-    var bs = try fs_backend.FilesystemBlobStore.open(a, blob_dir);
-    defer bs.deinit();
-    var log = try LogStore.init(a, kv, bs.blobStore(), 0xCAFE, .{});
-    defer log.deinit();
-
-    const id = try log.nextRequestId();
+    var fx = try TestStore.init(a);
+    defer fx.deinit();
+    // Override the worker_id by re-initing — fixture defaults to 7.
+    fx.log.deinit();
+    fx.log = try LogStore.init(a, 0xCAFE, .{
+        .seq_kv = fx.seq_kv,
+        .seq_key = "_log/next_request_seq",
+    });
+    const id = try fx.log.nextRequestId();
     try testing.expectEqual(@as(u64, 0xCAFE), id >> 48);
     try testing.expectEqual(@as(u64, 0), id & 0xFFFFFFFFFFFF);
-}
-
-test "LogStore: separate seq_kv persists chunked reservation independently" {
-    const a = testing.allocator;
-    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const tmp_dir = try std.fmt.allocPrint(a, "/tmp/rove-log-seq-{x}", .{seed});
-    defer a.free(tmp_dir);
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-
-    const records_path = try std.fmt.allocPrintSentinel(a, "{s}/records.db", .{tmp_dir}, 0);
-    defer a.free(records_path);
-    const seq_path = try std.fmt.allocPrintSentinel(a, "{s}/seq.db", .{tmp_dir}, 0);
-    defer a.free(seq_path);
-    const blob_dir = try std.fmt.allocPrint(a, "{s}/blobs", .{tmp_dir});
-    defer a.free(blob_dir);
-
-    const records_kv = try kv_mod.KvStore.open(a, records_path);
-    defer records_kv.close();
-    const seq_kv = try kv_mod.KvStore.open(a, seq_path);
-    defer seq_kv.close();
-    var bs = try fs_backend.FilesystemBlobStore.open(a, blob_dir);
-    defer bs.deinit();
-
-    // Phase 1: open with the split stores, mint enough ids to cross
-    // the chunk boundary, then close.
-    {
-        var log = try LogStore.init(a, records_kv, bs.blobStore(), 1, .{
-            .seq_kv = seq_kv,
-            .seq_key = "_log/next_request_seq",
-        });
-        defer log.deinit();
-        const ids_to_mint = REQUEST_ID_CHUNK + 5;
-        var k: u48 = 0;
-        while (k < ids_to_mint) : (k += 1) _ = try log.nextRequestId();
-    }
-
-    // The counter must have landed in seq_kv, not records_kv.
-    try testing.expectEqual(@as(?[]u8, null), records_kv.get("_log/next_request_seq") catch null);
-    try testing.expectEqual(@as(?[]u8, null), records_kv.get("meta/next_request_seq") catch null);
-    const persisted = try seq_kv.get("_log/next_request_seq");
-    defer a.free(persisted);
-    const reserved = try std.fmt.parseInt(u48, persisted, 16);
-    try testing.expect(reserved >= REQUEST_ID_CHUNK + 5);
-
-    // Phase 2: re-open and verify the next mint resumes past the
-    // persisted reservation (no collisions across restart).
-    {
-        var log2 = try LogStore.init(a, records_kv, bs.blobStore(), 1, .{
-            .seq_kv = seq_kv,
-            .seq_key = "_log/next_request_seq",
-        });
-        defer log2.deinit();
-        const id = try log2.nextRequestId();
-        try testing.expect((id & 0xFFFFFFFFFFFF) >= reserved);
-    }
 }

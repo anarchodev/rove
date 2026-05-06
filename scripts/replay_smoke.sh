@@ -1,38 +1,20 @@
 #!/usr/bin/env bash
 # End-to-end smoke for the tape-replay browser path (PLAN §10.12).
 #
-# Exercises the full feature surface:
+# Exercises the full feature surface against the standalone log-server
+# (Phase 5.5 a, A3 — read path now goes worker → /_system/log/* →
+# proxy URL rewrite → standalone server's /v1/*):
 #
 #   1. `__replay__` tenant + `replay.{suffix}` host alias serve the
 #      replay shell static bundle (`web/replay/index.html` + `app.js`).
-#
-#   2. Fresh-tenant first request via the static path is captured
-#      in the log — the lazy-open fix that hoists
-#      `getOrOpenTenantLog` ahead of the early-exit `captureLog`
-#      branches in `dispatchOnce`.
-#
-#   3. Multi-file handler deploy: handler that `import`s a sibling
-#      module compiles via the InlineCompiler module loader, runs
-#      under runtime dispatch.
-#
-#   4. Tape capture for handler dispatch: kv (incl. `kv.prefix`),
-#      Date, module-resolution, and request body all stamped into
-#      `tape_refs` on the log record. Each blob fetched by hash
-#      from the per-tenant log-blobs/.
-#
-#   5. Historical deployment manifest endpoint
-#      (`GET /_system/files/{inst}/deployments/{hex}`) returns the
-#      manifest of a specific past deployment, not the current one.
-#
-#   6. Request body truncation flag (`request_body_truncated`)
-#      fires when the body exceeds the 256 KB cap.
-#
-#   7. `rove-log-cli bundle` JSON shape — modules array populated
-#      from the captured module tape, tape arrays populated, body
-#      hash present.
-#
-# Each ok-line below corresponds to one assertion. Failures dump
-# the worker log tail and exit non-zero.
+#   2. Fresh-tenant first request via the static path is captured in
+#      the standalone server's index.
+#   3. Multi-file handler deploy + run.
+#   4. Tape capture for handler dispatch: kv, Date, module, request +
+#      response body refs visible on the show response.
+#   5. Historical deployment manifest endpoint.
+#   6. Request body truncation flag fires for >256 KB bodies.
+#   7. Tape blobs round-trip via /_system/log/.../blob/{hash}.
 
 set -euo pipefail
 
@@ -40,7 +22,6 @@ DATA_DIR="${DATA_DIR:-/tmp/rove-replay-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8210}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40310}"
 BIN="${BIN:-./zig-out/bin/loop46}"
-LOG_CLI="${LOG_CLI:-./zig-out/bin/rove-log-cli}"
 TOKEN="${ROVE_TOKEN:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}"
 ADMIN_HOST="app.loop46.localhost"
 PUBLIC_SUFFIX="loop46.localhost"
@@ -65,20 +46,6 @@ if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
     exit 2
 fi
-if [[ ! -x "$LOG_CLI" ]]; then
-    echo "error: $LOG_CLI missing — run 'zig build install' first" >&2
-    exit 2
-fi
-
-# Phase 5.5(a) deleted the raft envelope-1 log path. The whole
-# replay surface (list/show/blob proxies + rove-log-cli bundle)
-# depends on per-tenant log records, which now flow worker → S3
-# instead of worker → raft → log.db. Until the S3 read-side wiring
-# lands, this smoke can't drive any of the replay assertions and
-# is short-circuited to a no-op. The S3-direct cross-validation
-# lives in scripts/log_backend_s3_smoke.sh.
-echo "SKIP replay smoke (Phase 5.5(a) read-side wiring pending)"
-exit 0
 
 rm -rf "$DATA_DIR"
 
@@ -114,12 +81,41 @@ fail() {
     exit 1
 }
 
+# Standalone log-server's indexer polls every 5s by default. The
+# loop46 spawn above doesn't override that, so each "did the record
+# show up" check needs to wait. Use a polling loop with ~6s budget.
+wait_for_record() {
+    local path_filter="$1"
+    local max_attempts=30
+    local i=0
+    while (( i < max_attempts )); do
+        local list
+        list=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
+            "${ADMIN_ORIGIN}/_system/log/alice/list?limit=20" 2>/dev/null || echo '{"records":[]}')
+        local rid
+        rid=$(echo "$list" | python3 -c "
+import json, sys
+recs = json.load(sys.stdin)['records']
+for r in recs:
+    if r['path'] == '$path_filter':
+        print(r['request_id'])
+        sys.exit(0)
+" 2>/dev/null)
+        if [[ -n "$rid" ]]; then
+            echo "$rid"
+            return 0
+        fi
+        sleep 0.4
+        i=$((i + 1))
+    done
+    return 1
+}
+
 # ── 1. Replay tenant + host alias ────────────────────────────────
 status=$("${CURL[@]}" -o /dev/null -w "%{http_code}" "${REPLAY_ORIGIN}/")
 [[ "$status" == "200" ]] || fail "replay shell GET / → $status (expected 200)"
 ok "replay.${PUBLIC_SUFFIX}/ serves shell index"
 
-# HEAD on a static file: same headers as GET, no body.
 ct=$("${CURL[@]}" -I "${REPLAY_ORIGIN}/app.js" | grep -i "^content-type:" | tr -d '\r')
 echo "$ct" | grep -qi "application/javascript" || fail "replay app.js HEAD content-type: $ct"
 ok "replay shell app.js served as application/javascript (HEAD)"
@@ -130,24 +126,15 @@ resp=$("${CURL[@]}" -X POST \
     -d '{"name":"alice","email":"alice@example.com"}' \
     "${ADMIN_ORIGIN}/v1/signup")
 MAGIC=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin)["magic_link"])' | sed 's/.*mt=//')
-# Redeem the magic link — that's what allocates the tenant +
-# deploys starter content (Phase 4 lazy-creation-on-redeem).
 "${CURL[@]}" -i "${ADMIN_ORIGIN}/v1/auth?mt=${MAGIC}" >/dev/null
 
-# First request to the new tenant — STATIC path (starter index.html).
-# Without the d732641 fix this captureLog drops silently because
-# the tenant_logs cache is cold for runtime-created tenants.
 status=$("${CURL[@]}" -o /dev/null -w "%{http_code}" "https://${ALICE_HOST}:${PORT}/")
 [[ "$status" == "200" ]] || fail "fresh-tenant static GET / → $status"
-sleep 1
 
-list=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
-    "${ADMIN_ORIGIN}/_system/log/alice/list?limit=5")
-n=$(echo "$list" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["records"]))')
-[[ "$n" -ge 1 ]] || fail "fresh-tenant static request not logged ($n records)"
-ok "fresh-tenant static request captured in log (lazy-open fix)"
+# Wait for the standalone server's indexer to surface the record.
+FRESH_RID=$(wait_for_record "/") || fail "fresh-tenant static request not indexed within 12s"
+ok "fresh-tenant static request captured + indexed"
 
-# Confirm no NoTenantLog warnings landed in the worker output.
 if grep -q "NoTenantLog\|log capture failed" /tmp/replay-smoke.out; then
     fail "NoTenantLog warning appeared during smoke — lazy-open regression"
 fi
@@ -158,7 +145,6 @@ LIB_SRC='export function greet(name) { return "hello " + name; }'
 IDX_SRC='import { greet } from "./lib/util.mjs";
 
 export default function () {
-  // Tag every visit so the kv tape gets `set` + `prefix` entries.
   kv.set("hits/" + Date.now(), request.body || "");
   const visits = kv.prefix("hits/", "", 100);
   response.headers = { "content-type": "application/json" };
@@ -196,36 +182,24 @@ echo "$deploy_v2_resp" | grep -q '"id":"0000000000000002"' || \
 ok "multi-file deploy compiled (sibling import resolved at compile time)"
 sleep 0.5
 
-# Hit the multi-module handler with a small POST body.
 resp=$("${CURL[@]}" -X POST -d 'first-visit' \
     "https://${ALICE_HOST}:${PORT}/world")
 echo "$resp" | grep -q '"greeting":"hello /world"' || \
     fail "handler return wrong: $resp"
 ok "multi-module handler executed (transitive import works)"
-sleep 0.7
 
 # ── 4. Tape capture: kv + date + module + body ───────────────────
-list=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
-    "${ADMIN_ORIGIN}/_system/log/alice/list?limit=10")
-RID=$(echo "$list" | python3 -c '
-import json, sys
-recs = json.load(sys.stdin)["records"]
-for r in recs:
-    if r["method"] == "POST" and r["path"] == "/world":
-        print(r["request_id"])
-        break
-')
-[[ -n "$RID" ]] || fail "couldn'\''t find POST /world in log list"
+RID=$(wait_for_record "/world") || fail "couldn't find POST /world in indexed log"
 
 REC=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
     "${ADMIN_ORIGIN}/_system/log/alice/show/${RID}")
-got_kv=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["kv_tape_hex"] or "")')
-got_date=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["date_tape_hex"] or "")')
-got_mod=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["module_tree_hex"] or "")')
-got_body=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["request_body_hex"] or "")')
-got_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["request_body_truncated"])')
-got_resp_body=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["response_body_hex"] or "")')
-got_resp_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["response_body_truncated"])')
+got_kv=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["kv_tape_hex"] or "")')
+got_date=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["date_tape_hex"] or "")')
+got_mod=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["module_tree_hex"] or "")')
+got_body=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["request_body_hex"] or "")')
+got_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["request_body_truncated"])')
+got_resp_body=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["response_body_hex"] or "")')
+got_resp_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["response_body_truncated"])')
 
 [[ -n "$got_kv" ]]    || fail "kv_tape_hex missing on log record"
 [[ -n "$got_date" ]]  || fail "date_tape_hex missing"
@@ -242,7 +216,6 @@ body_text=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
 [[ "$body_text" == "first-visit" ]] || fail "body blob content drift: '$body_text'"
 ok "request body blob content round-trips"
 
-# Fetch the response body blob and verify it matches what curl saw.
 resp_text=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
     "${ADMIN_ORIGIN}/_system/log/alice/blob/${got_resp_body}")
 [[ "$resp_text" == "$resp" ]] || \
@@ -250,9 +223,6 @@ resp_text=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
 ok "response body blob content round-trips"
 
 # ── 5. Historical deployment manifest ────────────────────────────
-# Deploy v3 with different content, then verify v2's manifest is
-# still fetchable by hex id and matches what alice's POST ran
-# against (deployment_id=2 captured on the request).
 NEW_IDX_SRC='export default function () { return "v3"; }'
 NEW_HASH=$(printf '%s' "$NEW_IDX_SRC" | sha256sum | awk '{print $1}')
 "${CURL[@]}" -H "Authorization: Bearer $TOKEN" -X PUT \
@@ -263,7 +233,6 @@ NEW_HASH=$(printf '%s' "$NEW_IDX_SRC" | sha256sum | awk '{print $1}')
     -d "{\"files\":{\"index.mjs\":{\"hash\":\"${NEW_HASH}\",\"kind\":\"handler\"}},\"parent_id\":\"0000000000000002\"}" \
     "${ADMIN_ORIGIN}/_system/files/alice/deployments" >/dev/null
 
-# v2 manifest must still be reachable by id.
 v2=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
     "${ADMIN_ORIGIN}/_system/files/alice/deployments/0000000000000002")
 echo "$v2" | python3 -c '
@@ -286,77 +255,27 @@ status=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" -o /dev/null -w "%{http_
 ok "invalid hex deployment id → 400"
 
 # ── 6. Request body truncation flag ──────────────────────────────
-# 300 KB body → captured to 256 KB prefix, truncation flag set.
 python3 -c "import sys; sys.stdout.buffer.write(b'x' * 300000)" \
     | "${CURL[@]}" -X POST --data-binary @- \
         -o /dev/null \
         "https://${ALICE_HOST}:${PORT}/big"
-sleep 1
 
-big=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
-    "${ADMIN_ORIGIN}/_system/log/alice/list?limit=10")
-BIG_RID=$(echo "$big" | python3 -c '
-import json, sys
-for r in json.load(sys.stdin)["records"]:
-    if r["path"] == "/big":
-        print(r["request_id"])
-        break
-')
+BIG_RID=$(wait_for_record "/big") || fail "couldn't find POST /big in indexed log"
 BIG_REC=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
     "${ADMIN_ORIGIN}/_system/log/alice/show/${BIG_RID}")
-big_trunc=$(echo "$BIG_REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["request_body_truncated"])')
-big_hash=$(echo "$BIG_REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["request_body_hex"])')
+big_trunc=$(echo "$BIG_REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["request_body_truncated"])')
+big_hash=$(echo "$BIG_REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["request_body_hex"])')
 [[ "$big_trunc" == "True" ]] || fail "300 KB body should set truncation flag (got $big_trunc)"
 ok "truncation flag set for >256 KB body"
 
-# Verify the captured blob is exactly 256 KB on disk.
-blob_size=$(wc -c < "$DATA_DIR/alice/log-blobs/${big_hash}")
+# Verify the captured blob is exactly 256 KB by fetching it.
+big_body=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" -o /tmp/replay-smoke-big.bin -w '%{http_code}' \
+    "${ADMIN_ORIGIN}/_system/log/alice/blob/${big_hash}")
+[[ "$big_body" == "200" ]] || fail "big body blob fetch got $big_body"
+blob_size=$(wc -c < /tmp/replay-smoke-big.bin)
 [[ "$blob_size" == "262144" ]] || fail "captured blob should be 256 KB, got $blob_size"
 ok "captured body blob exactly 262144 bytes (256 KB)"
+rm -f /tmp/replay-smoke-big.bin
 
-# ── 7. rove-log-cli bundle JSON shape ────────────────────────────
-"$LOG_CLI" bundle --data-dir "$DATA_DIR" --instance alice \
-    --request-id "$RID" > /tmp/replay-bundle.json
-# log_cli only stamps `entry_source_hash`; the dashboard composer
-# is what inlines `entry_source_b64`. CLI bundle output is for
-# human inspection of tape data, so don't assert b64 source here.
-export EXPECTED_RESP="$resp"
-python3 <<PY || fail "bundle JSON shape mismatch"
-import base64
-import json
-import os
-expected_resp = os.environ.get("EXPECTED_RESP", "")
-with open("/tmp/replay-bundle.json") as f:
-    b = json.load(f)
-assert b["entry_source_hash"], "no entry_source_hash"
-mods = b.get("modules", [])
-assert len(mods) >= 1, f"modules empty: {mods}"
-specs = sorted(m["specifier"] for m in mods)
-assert "lib/util.mjs" in specs, f"lib/util.mjs not in module tape: {specs}"
-tapes = b.get("tapes", {})
-assert tapes.get("kv"), "no kv tape in bundle"
-assert tapes.get("date"), "no date tape in bundle"
-kv_entries = tapes["kv"]["entries"]
-ops = sorted(set(e["op"] for e in kv_entries))
-assert "set" in ops, f"no kv.set in tape: {ops}"
-assert "prefix" in ops, f"no kv.prefix in tape: {ops}"
-prefix_entry = next(e for e in kv_entries if e["op"] == "prefix")
-assert prefix_entry["key"] == "hits/", prefix_entry
-assert "results" in prefix_entry, prefix_entry
-
-req = b.get("request") or {}
-assert req.get("body_b64") == base64.b64encode(b"first-visit").decode(), \
-    f"request.body_b64 mismatch: {req.get('body_b64')!r}"
-assert req.get("body_truncated") is False, "request.body_truncated should be false"
-
-rsp = b.get("response") or {}
-assert rsp.get("body_b64") == base64.b64encode(expected_resp.encode()).decode(), \
-    f"response.body_b64 mismatch (expected '{expected_resp}')"
-assert rsp.get("body_truncated") is False, "response.body_truncated should be false"
-PY
-unset EXPECTED_RESP
-ok "rove-log-cli bundle: modules, kv (incl. prefix), date, req+resp body all present"
-
-rm -f /tmp/replay-bundle.json
 echo ""
 echo "all replay smoke checks passed"

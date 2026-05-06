@@ -576,16 +576,6 @@
       source: rewriteImports(m.source, m.path) +
         "\n//# sourceURL=loop46-replay/" + m.path + "\n",
     }));
-    // Fallback for the legacy single-file shape (entry_source set,
-    // modules empty): synthesize a single-entry list so the
-    // importmap path still applies.
-    if (modulesOut.length === 0 && bundle.entry_source) {
-      modulesOut.push({
-        path: entryPath || "index.mjs",
-        source: bundle.entry_source +
-          "\n//# sourceURL=loop46-replay/" + (entryPath || "index.mjs") + "\n",
-      });
-    }
     const modulesJson = JSON.stringify(modulesOut);
     const entryPathJson = JSON.stringify(entryPath || "index.mjs");
 

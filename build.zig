@@ -465,24 +465,6 @@ pub fn build(b: *std.Build) void {
     const code_cli_tests = b.addTest(.{ .root_module = files_cli_mod });
     test_step.dependOn(&b.addRunArtifact(code_cli_tests).step);
 
-    // log-cli: read-only query tool for the per-tenant log store.
-    const log_cli_mod = b.addModule("rove-log-cli", .{
-        .root_source_file = b.path("examples/log_cli.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    log_cli_mod.addImport("rove-kv", kv_mod);
-    log_cli_mod.addImport("rove-blob", blob_mod);
-    log_cli_mod.addImport("rove-log", log_mod);
-    log_cli_mod.addImport("rove-files", files_mod);
-    log_cli_mod.addImport("rove-tape", tape_mod);
-
-    const log_cli = b.addExecutable(.{
-        .name = "rove-log-cli",
-        .root_module = log_cli_mod,
-    });
-    b.installArtifact(log_cli);
-
     // files-server-standalone: spawns the rove-files-server thread and
     // idles. Exists so the smoke test can drive it from curl.
     const cs_standalone_mod = b.addModule("files-server-standalone", .{
@@ -513,34 +495,6 @@ pub fn build(b: *std.Build) void {
         .root_module = ls_standalone_mod,
     });
     b.installArtifact(ls_standalone);
-
-    // dual-worker: shift-js shared-nothing spike. Two full rove-js
-    // worker instances in one process, both bound to the same port
-    // via SO_REUSEPORT, sharing one raft node + one apply ctx.
-    const dual_worker_mod = b.addModule("dual-worker", .{
-        .root_source_file = b.path("examples/dual_worker.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    dual_worker_mod.addImport("rove", rove_mod);
-    dual_worker_mod.addImport("rove-io", io_mod);
-    dual_worker_mod.addImport("rove-js", js_mod);
-    dual_worker_mod.addImport("rove-kv", kv_mod);
-    dual_worker_mod.addImport("rove-blob", blob_mod);
-    dual_worker_mod.addImport("rove-files", files_mod);
-    dual_worker_mod.addImport("rove-files-server", files_server_mod);
-    dual_worker_mod.addImport("rove-log-server", log_server_mod);
-    dual_worker_mod.addImport("rove-qjs", qjs_mod);
-    dual_worker_mod.addImport("rove-tenant", tenant_mod);
-    dual_worker_mod.link_libc = true;
-    dual_worker_mod.linkSystemLibrary("nghttp2", .{});
-    dual_worker_mod.linkSystemLibrary("ssl", .{});
-    dual_worker_mod.linkSystemLibrary("crypto", .{});
-    const dual_worker_exe = b.addExecutable(.{
-        .name = "dual-worker",
-        .root_module = dual_worker_mod,
-    });
-    b.installArtifact(dual_worker_exe);
 
     // rove-js-ctl: admin CLI over the worker's /_system/* surface.
     const js_ctl_mod = b.addModule("rove-js-ctl", .{

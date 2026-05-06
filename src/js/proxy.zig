@@ -302,14 +302,17 @@ fn mapOneResponse(
     try reg.destroy(client_ent);
 }
 
-/// Duplicate the request headers, rewriting `:path` to strip the
-/// `/_system/{subsystem}` prefix so downstream subsystem routes
-/// (`/{instance_id}/upload`, `/{instance_id}/list`, etc.) match. The
-/// prefix is two segments: `/_system` + `/code` or `/log`. We walk
-/// past the first two `/`s. `:authority` is left alone — subsystems
-/// don't care what host name the caller used. Fields are allocated
-/// on `allocator` and owned by the returned slice; rove-h2 frees
-/// them when the request finishes.
+/// Duplicate the request headers, rewriting `:path` to the form the
+/// downstream subsystem expects:
+///
+///   - `/_system/files/{rest}` → `/{rest}` (files-server keys its
+///     handlers on bare `/{instance_id}/{op}`)
+///   - `/_system/log/{rest}`   → `/v1/{rest}` (standalone log-server's
+///     query API lives under `/v1/{tenant}/{op}`)
+///
+/// `:authority` is left alone — subsystems don't care what host name
+/// the caller used. Fields are allocated on `allocator` and owned by
+/// the returned slice; rove-h2 frees them when the request finishes.
 fn forwardHeaders(
     allocator: std.mem.Allocator,
     rh: h2.ReqHeaders,
@@ -322,20 +325,22 @@ fn forwardHeaders(
         @memcpy(name, f.name[0..f.name_len]);
 
         var value_slice: []const u8 = f.value[0..f.value_len];
+        var rewritten_owned: ?[]u8 = null;
         if (f.name_len == 5 and std.mem.eql(u8, name, ":path")) {
-            if (std.mem.startsWith(u8, value_slice, "/_system/")) {
-                // Find the second '/' after "/_system/" to strip
-                // `/{subsystem}` as well.
-                const after_sys = value_slice["/_system/".len..];
-                if (std.mem.indexOfScalar(u8, after_sys, '/')) |slash| {
-                    value_slice = after_sys[slash..];
-                    if (value_slice.len == 0) value_slice = "/";
-                }
+            const log_prefix = "/_system/log/";
+            const files_prefix = "/_system/files/";
+            if (std.mem.startsWith(u8, value_slice, log_prefix)) {
+                rewritten_owned = try std.fmt.allocPrint(allocator, "/v1/{s}", .{value_slice[log_prefix.len..]});
+                value_slice = rewritten_owned.?;
+            } else if (std.mem.startsWith(u8, value_slice, files_prefix)) {
+                value_slice = value_slice[files_prefix.len - 1 ..]; // keep leading '/'
+                if (value_slice.len == 0) value_slice = "/";
             }
         }
 
         const value = try allocator.alloc(u8, value_slice.len);
         @memcpy(value, value_slice);
+        if (rewritten_owned) |r| allocator.free(r);
         out[i] = .{
             .name = name.ptr,
             .name_len = f.name_len,

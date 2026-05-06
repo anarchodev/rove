@@ -336,12 +336,13 @@ const WorkerCtx = struct {
     /// opens with a counter from this registry so seq allocation
     /// stays globally monotonic.
     seq_counters: *kv.SeqCounterRegistry,
-    /// Phase 5.5 (a). Borrowed from main thread; null when S3 env
-    /// vars aren't set (dev / smoke). Same `BatchStore` shared by
-    /// every worker thread (the underlying S3 client is thread-safe
-    /// for concurrent put — process-wide state). Lives for the
-    /// worker's full lifetime.
-    log_batch_store: ?log_server.batch_store.BatchStore,
+    /// Phase 5.5 (a). Borrowed from main thread. Same `BatchStore`
+    /// shared by every worker thread + the standalone log-server
+    /// thread (concurrent put is supported by both backends —
+    /// `S3BatchStore` uses a process-wide HTTP client,
+    /// `MemoryBatchStore` uses a mutex). Lives for the worker's
+    /// full lifetime.
+    log_batch_store: log_server.batch_store.BatchStore,
     /// Main thread blocks on these until every worker has bound its
     /// h2 listener — this is what `SO_REUSEPORT` needs before requests
     /// can hit any of them.
@@ -924,9 +925,17 @@ pub fn main() !void {
     // If the env vars aren't set the store stays null and `flushLogs`
     // logs once + drops records. This is the dev / smoke path —
     // production wires real S3.
-    var log_batch_store_handle: ?*log_server.batch_store_s3.S3BatchStore = null;
-    defer if (log_batch_store_handle) |h| h.deinit();
-    var log_batch_store: ?log_server.batch_store.BatchStore = null;
+    // S3 if env wired, MemoryBatchStore otherwise. The store is
+    // shared between the worker (write side, via flushLogs) and the
+    // standalone log-server (read side, via the indexer + show
+    // range-reads). MemoryBatchStore lets dev / smokes work without
+    // S3 env — log records sit in process memory and are queryable
+    // via /_system/log/* until restart.
+    var log_s3_handle: ?*log_server.batch_store_s3.S3BatchStore = null;
+    defer if (log_s3_handle) |h| h.deinit();
+    var log_memory_handle: ?*log_server.batch_store.MemoryBatchStore = null;
+    defer if (log_memory_handle) |h| h.deinit();
+    var log_batch_store: log_server.batch_store.BatchStore = undefined;
     {
         const endpoint = try envOpt(allocator, ENV_S3_ENDPOINT);
         const region = try envOpt(allocator, ENV_S3_REGION);
@@ -951,7 +960,7 @@ pub fn main() !void {
                 if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk_tls false;
                 break :blk_tls true;
             };
-            log_batch_store_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+            log_s3_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
                 .endpoint = endpoint.?,
                 .region = region.?,
                 .bucket = bucket.?,
@@ -960,16 +969,15 @@ pub fn main() !void {
                 .secret_key = secret_key.?,
                 .use_tls = use_tls,
             });
-            log_batch_store = log_batch_store_handle.?.batchStore();
+            log_batch_store = log_s3_handle.?.batchStore();
             std.log.info(
                 "log backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
                 .{ endpoint.?, region.?, bucket.?, key_prefix },
             );
         } else {
-            std.log.info(
-                "log backend: none (S3 env not set — request logs will be dropped)",
-                .{},
-            );
+            log_memory_handle = try log_server.batch_store.MemoryBatchStore.init(allocator);
+            log_batch_store = log_memory_handle.?.batchStore();
+            std.log.info("log backend: memory (S3 env not set — logs do not survive restart)", .{});
         }
     }
 
@@ -1031,7 +1039,36 @@ pub fn main() !void {
     defer cs_handle.shutdown();
     const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
 
-    const ls_handle = try log_server.thread.spawn(allocator, cli.data_dir, blob_owned.cfg, subsystem_max_connections);
+    // log-server-standalone (loopback). Worker.log_proxy targets
+    // this; the standalone reads from the shared batch store +
+    // BlobBackend so leader and followers see identical bytes when
+    // S3 is configured. IndexDb persists to `{data_dir}/log_index.db`
+    // — a freshly-spawned standalone re-indexes from the batch
+    // store via the indexer thread (cheap on first start, idempotent
+    // via INSERT OR IGNORE on subsequent runs).
+    const log_index_db_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/log_index.db",
+        .{cli.data_dir},
+        0,
+    );
+    defer allocator.free(log_index_db_path);
+    var log_index_db = try log_server.index_db.IndexDb.open(allocator, log_index_db_path);
+    defer log_index_db.close();
+
+    const ls_handle = try log_server.standalone.spawn(.{
+        .allocator = allocator,
+        .store = log_batch_store,
+        .db = log_index_db,
+        .bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+        .max_connections = subsystem_max_connections,
+        .blob_backend_cfg = blob_owned.cfg,
+        .fs_data_dir = cli.data_dir,
+        // 500ms keeps the dashboard "show me my latest request" feel
+        // tight; the indexer pass is cheap (full bucket scan with
+        // INSERT OR IGNORE dedup).
+        .poll_interval_ms = 500,
+    });
     defer ls_handle.shutdown();
     const log_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ls_handle.port);
 
