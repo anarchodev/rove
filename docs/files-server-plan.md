@@ -221,8 +221,11 @@ released" workflows (canary deploys, scheduled rollouts).
 
 Workers do not poll S3. The trigger to load a new deployment is an
 observed change to `_deploy/active` in the tenant's kv. The
-observation path mirrors the existing SSE pattern in
-`src/js/worker_dispatch.zig` (`events_pump.markDirtyFromWriteset`):
+observation path is a post-commit writeset scan
+(`markDirtyFromWriteset`) — the same machinery the v1 SSE pump
+used before sse-plan.md moved SSE state out of the worker. After
+SSE detaches, the deploy-marker observer is the only remaining
+consumer of this scan path:
 
 ```
 1. customer admin writes _deploy/active = {target: 42}  (via admin handler)
@@ -433,8 +436,12 @@ the fetch list small. A typical release loads only 1-3 new blobs.
 - Source-hashes map for tape replay.
 - **New:** `TenantFiles.{active, pending}` pointer pair for the
   atomic-swap model.
-- **New:** `markDirtyFromWriteset` extension that scans for
-  `_deploy/active` keys (alongside the existing `_events/` scan).
+- **New:** `markDirtyFromWriteset` extension that scans the
+  committed writeset for `_deploy/active` keys. (`_events/` scan
+  in this same path is being removed by `docs/sse-plan.md` —
+  worker no longer mediates SSE writes — so by the time
+  files-server detach lands, the only consumer of the writeset
+  scan is the deploy-marker observer.)
 - **New:** Per-worker loader (one-shot threads or small pool) for
   async manifest + bytecode fetches.
 - **New:** `pending_deploy_load: StreamColl` — parking collection

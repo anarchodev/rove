@@ -310,9 +310,11 @@ row's next attempt into the future.
 ### 3.1 webhook.send binding
 
 Customer's JS handler calls `webhook.send({...})` exactly as today.
-Binding builds the outbox row and appends to a **per-handler
-webhook accumulator** on the dispatch state, NOT to the kv
-writeset. The accumulator is parallel to the writeset: each
+Binding builds the webhook entry (url + headers + body + retry
+config + onResult path + serialized context, with the deterministic
+`webhook_id = hash(request_id || call_index)`) and appends it to a
+**per-handler webhook accumulator** on the dispatch state, NOT to
+the kv writeset. The accumulator is parallel to the writeset: each
 contributes to the same final propose, but they live in distinct
 data structures because their destinations are distinct
 (tenant app.db vs webhooks.db).

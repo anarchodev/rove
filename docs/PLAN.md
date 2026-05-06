@@ -373,7 +373,7 @@ A dedicated `batch.*` primitive (background drainer, progress tracking, cascade-
 - **Platform-prefix guard at two layers.** Deploy-load rejects trigger paths whose derived prefix overlaps any of: `_audit/`, `_deploy/`, `_callback/`, `_magic/`, `_triggers/`, `_events/`, `_sessions/` (and any future system namespace). Fire-time also skips trigger dispatch when the kv key has a platform prefix — defense in depth. (`_outbox/*` and friends are not in this list because they don't live in tenant `app.db` — webhook state lives in cluster-wide `webhooks.db`; see §2.6.)
 - **Cascade depth tracked on `DispatchState`.** Single counter, incremented before each recursive trigger fire, decremented after; throws at 8.
 - **`previousValue` event field**: implementation does an extra `kv.get` for the existing value before each write that has matching triggers. Acceptable cost given the 32-trigger ceiling and the read-your-writes guarantee from `TrackedTxn`.
-- **Storage is just files.** Trigger modules live in the customer's deployment manifest exactly like any other handler file: `file/_triggers/users/sessions/index.mjs → {hash, kind: "handler", content_type}` in `files.db`, source + bytecode bytes in `file-blobs/{hash}`, replicated via raft envelope type 3 (files_writeset). Same content-addressed two-phase upload pipeline (§2.4). What's *new* and lives in the worker (not files-server) is the in-memory **trigger registry** on `TenantFiles`, derived at deploy-load time. Same split as handlers (source in files-server, runtime bytecode cache in worker).
+- **Storage is just files.** Trigger modules live in the customer's deployment manifest exactly like any other handler file: `file/_triggers/users/sessions/index.mjs → {hash, kind: "handler", content_type}` plus source + bytecode bytes content-addressed in the deploy blob store. Same content-addressed two-phase upload pipeline (§2.4). (Today these flow through `files.db` + raft envelope type 3; after Phase 5.5 (e) they live in S3 per `docs/files-server-plan.md`.) What's *new* and lives in the worker (not files-server) is the in-memory **trigger registry** on `TenantFiles`, derived at deploy-load time. Same split as handlers (source in files-server, runtime bytecode cache in worker).
 - **Rove ECS audit per `~/.claude/memory/feedback_state_is_collection.md`**: triggers introduce no new entities or collections. The registry sits on `TenantFiles` next to the existing `bytecodes` map; execution is recursive enhancement of `kv.set` / `kv.delete` JS globals inside the handler's existing QuickJS context. The handler entity in `request_out` remains the only entity in flight. No new Rows, no new systems at the rove layer.
 
 ### 2.6 Webhooks (Cmd pattern)
@@ -1060,23 +1060,31 @@ Resolved items moved to §10. Open items:
 
 ## 6a. Sub-plans expanding sections of this document
 
-- `docs/files-server-plan.md` — §2.4 expansion: own subdomain,
-  manifest in S3, marker-driven release, async load + atomic
-  pointer swap, Cloudflare-fronted static serving. Also contains
-  the post-1.0 detach detail (§11) — editor bearer-auth flow,
-  deploy-notification path, work-order list, latency mitigations.
-- `docs/logs-plan.md` — §2.9 expansion: S3-direct batches with
-  `.idx.json` sidecars, log-server on `logs.{public_suffix}`.
-- `docs/sse-plan.md` — §2.12 expansion: centralized sse-service
-  singleton on `sse.{public_suffix}`, response-attached emit buffers,
-  `rove:resync` sentinel for cache eviction.
-- `docs/webhook-server-plan.md` — §2.6 + Phase 5.5 item 4
+- `docs/files-server-plan.md` — §2.4 + Phase 5.5 (e) expansion:
+  own subdomain, manifest in S3, marker-driven release, async
+  load + atomic pointer swap, Cloudflare-fronted static serving.
+  Also contains the post-1.0 detach detail (§11) — editor
+  bearer-auth flow, deploy-notification path, work-order list,
+  latency mitigations.
+- `docs/logs-plan.md` — §2.9 + Phase 5.5 (a) expansion: S3-direct
+  batches with `.idx.json` sidecars, log-server on
+  `logs.{public_suffix}`. Envelope type 1 retires.
+- `docs/sse-plan.md` — §2.12 + Phase 11 expansion: centralized
+  sse-service singleton on `sse.{public_suffix}` from inception
+  (no in-worker phase), response-attached emit buffers,
+  `rove:resync` sentinel for cache eviction, JWT token handoff
+  from `/_session/sse-token`.
+- `docs/webhook-server-plan.md` — §2.6 + Phase 5.5 (d)
   expansion: cluster-wide raft-replicated `webhooks.db` written
-  via new envelope types 4/5/6; the delivery loop is a
-  leader-pinned thread INSIDE the loop46 binary (not a separate
-  process — see architectural principle below).
-- `docs/snapshot-plan.md` — §2.13 + Phase 5.5 item 3 expansion:
-  per-tenant snapshot indices, S3 transport, no global write-pause.
+  via new envelope types 4/5/6; envelope 4 rides with envelope 0
+  in the same raft entry so there is no per-tenant `_outbox/*`
+  row and no drainer; the delivery loop is a leader-pinned thread
+  INSIDE the loop46 binary (not a separate process — see
+  architectural principle below).
+- `docs/snapshot-plan.md` — §2.13 + Phase 5.5 (c) expansion:
+  per-tenant snapshot indices, S3 transport, no global
+  write-pause. Replaces the row-level delta protocol in
+  `src/kv/raft_snapshot.zig`.
 - `docs/sim-test-framework.md` — §10.7 + §10.8 expansion: simulator
   module, `_tests/` directory, `loop46 test` / `loop46 simulate`.
 - `docs/fixture-lifecycle.md` — §10.9 + §10.11 expansion: fixture
@@ -1102,7 +1110,7 @@ envelopes, OR is leader-pinned by definition.
 | worker (customer kv path) | yes (proposes envelope 0; leader-only) | loop46 binary |
 | files-server | no (state in S3) | own binary, own subdomain, separable to its own machine |
 | log-server | no (state in S3 + local index cache) | own binary, own subdomain, separable to its own machine |
-| sse-service | no (state in memory + S3 cache) | own binary, own subdomain, separable to its own machine |
+| sse-service | no (state in memory only — ring cache + connection table; no persistence) | own binary, own subdomain, separable to its own machine |
 | webhook-server | yes (reads webhooks.db; proposes 4/5/6; leader-pinned) | thread in loop46 binary |
 | (future) anything else needing raft state | yes by definition | thread in loop46 binary |
 | (future) anything else stateless wrt raft | no | candidate for separate binary |
@@ -1291,16 +1299,21 @@ Architectural calls captured here so future sessions don't re-derive them. §10.
 
 ### 10.2 Root replication via raft envelope type 2
 
-Envelopes now have four types:
+Envelopes today (in shipped code):
 
-| Type | Target store | Producer |
-|---|---|---|
-| `0` writeset | `{id}/app.db` | Customer handler `kv.*` via TrackedTxn + writeset |
-| `1` log_batch | `{id}/log.db` | Worker `flushLogs` |
-| `2` root_writeset | `__root__.db` | Signup's `tenant.createInstance`; admin JS `platform.root.*` |
-| `3` files_writeset | `{id}/files.db` | Signup's `deployStarterContent`; files-server `putFileAndDeploy` |
+| Type | Target store | Producer | Status |
+|---|---|---|---|
+| `0` writeset | `{id}/app.db` | Customer handler `kv.*` via TrackedTxn + writeset | active |
+| `1` log_batch | `{id}/log.db` | Worker `flushLogs` | retires in Phase 5.5 (a) — logs go S3-direct per `docs/logs-plan.md` |
+| `2` root_writeset | `__root__.db` | Signup's `tenant.createInstance`; admin JS `platform.root.*` | active |
+| `3` files_writeset | `{id}/files.db` | Signup's `deployStarterContent`; files-server `putFileAndDeploy` | retires in Phase 5.5 (e) — manifest moves to S3 per `docs/files-server-plan.md` |
+| `4` webhook_enqueue_batch | `webhooks.db` | Worker dispatcher (rides with envelope 0) | added in Phase 5.5 (d) per `docs/webhook-server-plan.md` |
+| `5` webhook_complete | `webhooks.db` + tenant `app.db` (`_callback/{id}`) | webhook-server thread | added in Phase 5.5 (d) |
+| `6` webhook_retry_schedule | `webhooks.db` | webhook-server thread | added in Phase 5.5 (d) |
 
-Type-2 writes come from two producers: the signup HTTP handler (mirrors `tenant.createInstance`'s local write into a root writeset) and the admin JS handler's `platform.root.set/delete` calls (collected into a per-request root writeset, proposed after commit). **Divergence on propose failure is logged, not compensated** — at-least-once semantics consistent with the outbox/callback layers. A future iteration wraps root writes in a TrackedTxn with undo semantics.
+Multi-envelope-per-raft-entry support also lands in Phase 5.5 (d) so envelope 0 and envelope 4 can ride atomically in one raft entry.
+
+Type-2 writes come from two producers: the signup HTTP handler (mirrors `tenant.createInstance`'s local write into a root writeset) and the admin JS handler's `platform.root.set/delete` calls (collected into a per-request root writeset, proposed after commit). **Divergence on propose failure is logged, not compensated** — at-least-once semantics consistent with the Cmd/callback layers. A future iteration wraps root writes in a TrackedTxn with undo semantics.
 
 ### 10.3 Two-phase deploy protocol on FS backend
 
@@ -1538,7 +1551,7 @@ Phase 9 encryption at rest joins the 1.0 path only if B2B compliance demand surf
 - §10.13 / §10.14 file-server + log-server detach + bearer-auth dogfooding. Multi-week refactor that makes the architecture purer but doesn't make the product more useful to a first user. **Post-1.0** when the dashboard-to-file-server path's in-process proxy starts hurting (it doesn't yet). With SSE shipping at 1.0, §10.14's prerequisite is satisfied — the detach is gated only on engineering bandwidth, not blocking primitives.
 - §10.15 `analytics.track` + `metrics.*` primitives. Their absence is workable (customers `webhook.send` to their OLAP / TSDB of choice). **Post-1.0** alongside the loop46-olap / loop46-tsdb pseudo-third-party companion services that motivate them.
 - **Multi-instance sse-service + persistent emit buffering**. The 1.0 SSE is a single sse-service process with a 30-entry ring cache for reconnect catch-up; cross-instance fan-out and replay-after-restart wait until usage exposes whether they actually matter. The single-process bet matches "customers fit on dedicated bare metal" and lets the `rove:resync` sentinel handle reconnect cases where the ring's been evicted.
-- Phase 5.5 storage scalability (log batch offload, raft snapshot, centralized webhook subsystem). Matters when sustained production traffic forces it; not at beta or first-1.0 volumes.
+- Phase 5.5 storage scalability (log batch offload, tape body capture, raft snapshot, centralized webhook subsystem, files-server architectural move). Matters when sustained production traffic forces it; not at beta or first-1.0 volumes.
 - **Phase 12 / 13 sim test framework + fixture lifecycle + worker dry-run**. Beta absorbs the bundle JSON shape, stubs library, and request body capture (§10.12); the Zig + QuickJS strict-determinism `ReplaySource` + sim test framework + fixtures wait. Post-1.0.
 
 **Marketing surface this locks in** (one-sentence variants for different channels):
