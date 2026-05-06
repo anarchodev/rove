@@ -16,6 +16,9 @@
 //!         in the .ndjson payload)
 //!       → 404 if the request id isn't indexed
 //!
+//!   GET /v1/{tenant_id}/count                       (Phase 5.5 a, A2)
+//!       → 200 text/plain (decimal record count for the tenant)
+//!
 //!   GET /v1/{tenant_id}/blob/{hash}                 (Phase 5.5 a, A1)
 //!       → 200 application/octet-stream (raw blob bytes)
 //!       → 404 if the blob isn't in the per-tenant `log-blobs/` store
@@ -303,10 +306,11 @@ fn handleOne(
         .list => try handleList(server, allocator, db, ent, sid, sess, route.tenant_id, route.query),
         .show => try handleShow(server, allocator, store, db, ent, sid, sess, route.tenant_id, route.tail),
         .blob => try handleBlob(server, allocator, blob_cache, ent, sid, sess, route.tenant_id, route.tail),
+        .count => try handleCount(server, allocator, db, ent, sid, sess, route.tenant_id),
     }
 }
 
-const RouteKind = enum { list, show, blob };
+const RouteKind = enum { list, show, blob, count };
 
 const ParsedRoute = struct {
     kind: RouteKind,
@@ -334,6 +338,9 @@ fn parseRoute(path: []const u8) ?ParsedRoute {
 
     if (std.mem.eql(u8, remainder, "list")) {
         return .{ .kind = .list, .tenant_id = tenant_id, .tail = "", .query = query };
+    }
+    if (std.mem.eql(u8, remainder, "count")) {
+        return .{ .kind = .count, .tenant_id = tenant_id, .tail = "", .query = query };
     }
     if (std.mem.startsWith(u8, remainder, "show/")) {
         const tail = remainder["show/".len..];
@@ -431,6 +438,28 @@ fn handleShow(
     allocator.free(payload);
     const out = try buf.toOwnedSlice(allocator);
     try setResponseOwned(server, ent, sid, sess, 200, out);
+}
+
+/// Total record count for a tenant (Phase 5.5 a, A2). Plain decimal
+/// body (`{count}\n`) so a shell pipeline can `wc`/`grep` it without
+/// pulling in jq. Backed by `IndexDb.queryCount` — covering scan on
+/// the (tenant_id, received_ns) primary index, cheap.
+fn handleCount(
+    server: *LogH2,
+    allocator: std.mem.Allocator,
+    db: *index_db_mod.IndexDb,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    tenant_id: []const u8,
+) !void {
+    const total = db.queryCount(tenant_id) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "count failed: {s}\n", .{@errorName(err)});
+        try setResponseOwned(server, ent, sid, sess, 500, msg);
+        return;
+    };
+    const body = try std.fmt.allocPrint(allocator, "{d}\n", .{total});
+    try setResponseOwned(server, ent, sid, sess, 200, body);
 }
 
 /// Tape blob fetch (Phase 5.5 a, A1). Reads from the per-tenant
@@ -647,6 +676,13 @@ test "parseRoute matches /v1/{tenant}/blob/{hash}" {
     try testing.expectEqual(RouteKind.blob, r.kind);
     try testing.expectEqualStrings("acme", r.tenant_id);
     try testing.expectEqualStrings("deadbeef", r.tail);
+}
+
+test "parseRoute matches /v1/{tenant}/count" {
+    const r = parseRoute("/v1/acme/count").?;
+    try testing.expectEqual(RouteKind.count, r.kind);
+    try testing.expectEqualStrings("acme", r.tenant_id);
+    try testing.expectEqualStrings("", r.tail);
 }
 
 test "parseRoute rejects bad shapes" {

@@ -54,25 +54,34 @@ sub-plan's migration order. No big-bang cutovers between them.
 ## Where we are (2026-05-06)
 
 - **(b) tape-body capture — done.** Bodies stored
-  content-addressed in `{inst.dir}/log-blobs/`; replay path
-  resolves by hash. Storage location moves to S3 in (a) Step A.
+  content-addressed via the per-tenant `BlobBackend`
+  (`{inst.dir}/log-blobs/` for fs, `{S3_KEY_PREFIX_BASE}{tenant}/log-blobs/{hash}`
+  for s3); the standalone log-server reads from the same backend
+  via the A1 endpoint.
 - **(d) webhooks — done.** Cluster-wide `webhooks.db`, envelope
   types 4/5/6, multi-envelope-per-raft-entry, leader-pinned
   webhook-server thread.
-- **(a) logs — write path done.** Worker → S3 (ndjson + sidecar);
-  envelope type 1 + raft log path deleted. Read path (replay UI,
-  rove-log-cli) still goes through the legacy in-process
-  log-server thread; that's what (a) Step A retires.
+- **(a) logs — write path done; read path migration in flight.**
+  Worker → S3 (ndjson + sidecar) flows; envelope type 1 + raft
+  log path deleted. Standalone log-server now exposes
+  `/v1/{tenant}/{list,show,count,blob}` (A1 + A2 done); the
+  dashboard / `Worker.log_proxy` / in-process log-server thread
+  flip is A3, gated on A4 moving `nextRequestSeq` off `log.db`.
 - **(e) files-server — not started.** Waits on (a) Step B
   (subdomain + JWT-handoff pattern).
 - **(c) snapshot — not started.** Waits on (a) + (e) retiring
   envelope types 1 + 3 to reduce raft log pressure.
 
-**Next two pickups, in priority order:**
-1. (a) Step A — replay read-side migration to S3 (unblocks
-   `replay_smoke`, fixes multi-node tape replay correctness).
-2. (a) Step B — log-server subdomain + JWT handoff (unblocks
-   piece 4).
+**Next pickup, then alternatives:**
+1. **(a) A4 — `nextRequestSeq` off `log.db`.** Unblocks A3.
+   Smallest contained piece left in (a). Likely a `meta/` row in
+   `app.db` mirroring the existing chunked-reservation pattern.
+2. **(a) A3 — repoint proxy + delete legacy plumbing.** After A4.
+   Coordinated dashboard JS update + `proxy.zig` URL rewrite +
+   in-process server deletion + `log-blobs/` deletion + restore
+   `replay_smoke`.
+3. **(a) Step B — log-server subdomain + JWT handoff.** Independent
+   of A3/A4 (can land in any order); unblocks piece 4.
 
 Detail per piece below.
 
@@ -292,36 +301,72 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
   `/_system/log/*` route (proxies to the now-empty in-process
   server). Step 9 (operator migrate-to-s3 helper) skipped per
   direction.
-- **Up next — Step A: replay read-side migration to S3.** The
+- **Step A — read-side migration to S3 (in progress).** The
   in-process log-server thread, `Worker.log_proxy`, the
   `/_system/log/*` route, per-tenant `log.db`, and the `log-blobs/`
-  directory are all still alive solely because the replay UI +
-  `rove-log-cli bundle` read through them. Migrate replay onto the
-  standalone log-server's S3-backed query API: extend
-  `src/log_server/standalone.zig` with `/v1/{tenant}/blob/{hash}`
-  (range-reads a tape blob from S3) and have replay's existing
-  `_system/log/*` callers move to `logs.{public_suffix}` (or
-  loopback during the transition). Tape-body capture (Phase 5.5 b)
-  has to start uploading body blobs to S3 alongside the
-  `.ndjson.gz` + `.idx.json` instead of writing
-  `{inst.dir}/log-blobs/`. Once it lands: delete the in-process
-  log-server thread, `Worker.log_proxy`, the `/_system/log/*` route,
-  per-tenant `log.db` opens (`nextRequestSeq` moves to a header on
-  the worker's in-memory `TenantLog` plus restart-time S3 max
-  scan), the `log-blobs/` directory. Restore `replay_smoke` from
-  its current SKIP state. Add an integration smoke that hits the
-  standalone server's blob endpoint via the worker.
-- **Up next — Step B: log-server subdomain + JWT handoff.** Move
+  directory are all still alive solely because the dashboard's
+  replay-bundle composer + `rove-log-cli bundle` read through them.
+  Worker's tape-body capture already writes blobs to S3 today (when
+  `BLOB_BACKEND=s3`) at `{S3_KEY_PREFIX_BASE}{tenant}/log-blobs/{hash}`
+  — same key prefix scheme the standalone server reads. The
+  migration is mostly client-side rewiring + retiring the legacy
+  worker plumbing.
+  - **A1 — done 2026-05-06.** Standalone log-server gained
+    `/v1/{tenant}/blob/{hash}` backed by a per-tenant
+    `BlobBackend` cache. `log_backend_s3_smoke.sh` validates a
+    sha256 round-trip + 404/400 paths.
+  - **A2 — done 2026-05-06.** Standalone log-server gained
+    `/v1/{tenant}/count` (parity with the legacy proxy), backed by
+    `IndexDb.queryCount`. The originally-scoped client-migration
+    work in A2 (rove-log-cli HTTP mode + web admin to v1) was
+    re-folded into A3 (web admin) and A4 (rove-log-cli) — a CLI
+    HTTP client requires either an h1 listener on the standalone
+    or wiring rove-h2 client into the CLI binary, both bigger than
+    the rove-log-cli surface justifies until A4 actually retires
+    its filesystem mode.
+  - **A3 — pending.** Repoint `Worker.log_proxy` at the standalone
+    server (currently points at the in-process server). Two
+    sub-pieces that have to land coordinated:
+    1. Update `web/admin/api.js` to handle the v1 wire shape
+       (decimal request_ids on `/v1/{tenant}/show/{decimal}`,
+       `{record:...}` wrapper, `received_ns + request_id` cursor
+       on `/v1/{tenant}/list`). Today the dashboard speaks the
+       legacy proxy shape (hex IDs, raw record, `?after=hex`
+       cursor).
+    2. Make `proxy.zig`'s `forwardHeaders` rewrite
+       `/_system/log/{rest}` → `/v1/{rest}` (currently strips
+       `/_system/log` to `/{rest}`).
+    Ship the in-process log-server thread deletion +
+    `log-blobs/` filesystem-directory deletion in the same commit
+    so the dashboard / proxy / server / smokes all flip together.
+    Restore `replay_smoke` from its SKIP state. Depends on **A4**
+    — the worker can't drop its `log.db` open until
+    `nextRequestSeq` lives somewhere else.
+  - **A4 — pending.** Move `nextRequestSeq` off `log.db`. The
+    counter is the only thing the worker still reads from `log.db`;
+    everything else flows through the S3 batch store. Two viable
+    landing spots: (a) a `meta/` row in the per-tenant `app.db`
+    (cheapest — `app.db` is already open per worker, same chunked-
+    reservation pattern works); or (b) a worker-thread-local
+    counter that survives restart by scanning S3 sidecars at
+    startup for the max `request_id`. (a) is simpler; (b) is
+    purer (truly nothing on disk in the worker beyond `app.db`)
+    but requires a new startup scan path. Once landed: drop
+    `log.db` opens entirely + retire `rove-log-cli`'s filesystem
+    mode (it can move to either S3-direct via `rove-blob` +
+    `rove-log-server` query helpers, or to HTTP against the
+    standalone — pick when the work happens).
+- **Step B — log-server subdomain + JWT handoff (pending).** Move
   log-server off loopback onto `logs.{public_suffix}` with its own
   TLS listener; add the token-handoff endpoints
   (`/_admin/log-token`, `/_session/log-token`) on the worker /
   admin domains; admin UI repointed at `logs.{public_suffix}`
   directly. This establishes the subdomain + JWT-handoff pattern
   that **files-server (piece 4 below)** then reuses, so it should
-  land before piece 4 starts. Independent of Step A — can land
-  before, after, or alongside — but Step A is higher-priority
-  because it unblocks `replay_smoke` and tape-body-capture
-  multi-node correctness.
+  land before piece 4 starts. Step B is independent of A3/A4 —
+  can land in any order — but A3 has to land before B can retire
+  `Worker.log_proxy`, since B's subdomain move is what removes
+  the proxy's reason to exist.
 
 **Definition of done**: see `docs/logs-plan.md` §7 (migration
 sequence). Each step is independently shippable + smoke-testable.

@@ -142,6 +142,22 @@ pub const IndexDb = struct {
         return setMetaInTxn(self.db, key, value);
     }
 
+    /// Total indexed records for `tenant_id`. Cheap because the
+    /// (tenant_id, received_ns DESC) primary index makes the count a
+    /// covering scan. Used by `/v1/{tenant}/count` so dashboards can
+    /// surface a record total without paginating the whole list.
+    pub fn queryCount(self: *IndexDb, tenant_id: []const u8) Error!u64 {
+        const sql = "SELECT COUNT(*) FROM log_index WHERE tenant_id = ?";
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, tenant_id);
+        const rc = c.sqlite3_step(st);
+        if (rc != c.SQLITE_ROW) return Error.Sqlite;
+        return @intCast(c.sqlite3_column_int64(st, 0));
+    }
+
     /// One row in a list-query response.
     pub const ListRow = struct {
         tenant_id: []u8,

@@ -220,6 +220,13 @@ for r in api_records[:3]:
 ' || fail "log-server /list didn't return the worker's records"
 ok "worker → S3 → indexer → /list shows all 3 acme records"
 
+# ── /v1/acme/count returns the record total ────────────────────────
+COUNT=$("${LS_CURL[@]}" -X GET "http://127.0.0.1:${LS_BOUND_PORT}/v1/acme/count" | tr -d '[:space:]')
+case "$COUNT" in
+    [3-9]|[1-9][0-9]*) ok "count: GET /v1/acme/count → $COUNT (>=3)" ;;
+    *) fail "count: expected >=3, got '$COUNT'" ;;
+esac
+
 # ── /show round-trips one record via S3 range-read ────────────────
 FIRST_ID=$(echo "$LIST" | python3 -c '
 import json, sys
