@@ -183,7 +183,7 @@ each step.
 
 **Sub-plan**: `docs/webhook-server-plan.md`.
 
-### 3. Logs — **not started**
+### 3. Logs — **in progress (step 2 done 2026-05-06)**
 
 **What it delivers**: log-server runs on its own subdomain
 (`logs.{public_suffix}`) with its own TLS and JWT-handoff auth.
@@ -193,8 +193,37 @@ maintains a local SQLite `log_index.db`, serves dashboard queries.
 Drops envelope type 1, per-tenant `log.db`, and the worker's
 `/_system/log/*` proxy.
 
-**Definition of done**: see `docs/logs-plan.md` §10 (final cleanup)
-and the migration sequence above it.
+- **Step 2 — done.** Standalone log-server binary
+  (`log-server-standalone`) ships indexer thread + h2c query API on
+  loopback. New `src/log_server/` modules: `sidecar.zig` (JSON
+  encoder/parser), `batch_store.zig` (vtable + filesystem backend),
+  `index_db.zig` (SQLite schema + insert + queryList +
+  queryShow), `indexer.zig` (full-scan polling loop with `INSERT
+  OR IGNORE` dedup), `standalone.zig` (h2 routes
+  `/v1/{tenant}/list` + `/v1/{tenant}/show/{request_id}`). Smoke
+  populates a local batch-store dir and exercises 9 assertions
+  end-to-end (newest-first, pagination, cross-tenant isolation,
+  range-read /show, 404/405, incremental indexing). Cursor-based
+  LIST optimization sketched in plan §4.3 deferred to v2 — full
+  scan + DB-side dedup avoids the cross-tenant interleave bug.
+- Remaining steps (per `docs/logs-plan.md` §7):
+  3. **Add s3 batch-store backend + worker `log.backend` flag**
+     (next). Worker writes start hitting the bucket behind a
+     `log.backend = raft | s3` flag; default stays `raft`.
+  4. Switch worker default to `s3` in dev; verify dashboard via
+     existing `/_system/log/*` proxy.
+  5. Switch production default to `s3`.
+  6. Move log-server to `logs.{public_suffix}` subdomain with
+     TLS + JWT handoff.
+  7. Deprecate worker's `/_system/log/*` proxy.
+  8. Remove envelope type 1, `RaftLogHandle`, `applyLogBatch`,
+     per-tenant `log.db` opens, the in-process log-server thread,
+     the `log.backend` flag.
+  9. One-shot `rove-log-cli migrate-to-s3` for any operator who
+     wants to retain pre-cutover records.
+
+**Definition of done**: see `docs/logs-plan.md` §7 (migration
+sequence). Each step is independently shippable + smoke-testable.
 
 **Sub-plan**: `docs/logs-plan.md`.
 
