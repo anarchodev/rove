@@ -124,14 +124,15 @@ pub const Cli = struct {
     rate_limit_request_refill: u32 = 50,
     rate_limit_email_capacity: u32 = 10,
     rate_limit_email_refill: u32 = 1,
-    /// Phase 5.5 (a). `raft` (default) keeps the legacy log_batch
-    /// envelope-1 path. `s3` switches the worker's `flushLogs` to
-    /// build `.ndjson` + `.idx.json` and PUT them to a `BatchStore`.
-    /// When `s3`, the backend is picked from `LOG_BATCH_STORE_BACKEND`
-    /// env (`fs`|`s3`); the fs backend's root is `LOG_BATCH_STORE_DIR`.
-    /// S3-backend env mirrors `BLOB_BACKEND=s3` (separate vars to
-    /// allow per-target buckets).
-    log_backend: []const u8 = "raft",
+    /// Phase 5.5 (a). `s3` (default as of step 4, 2026-05-06) builds
+    /// `.ndjson` + `.idx.json` per flush and PUTs them to a
+    /// `BatchStore` (S3-backed; configured via the same env vars as
+    /// `BLOB_BACKEND=s3` plus an optional `LOG_S3_KEY_PREFIX`).
+    /// `raft` keeps the legacy envelope-1 path for one-release
+    /// rollback safety + for smokes that don't need (or have access
+    /// to) S3 credentials. Step 8 of the migration deletes the raft
+    /// path; this flag goes away then.
+    log_backend: []const u8 = "s3",
 };
 
 pub fn parseCli(args: []const [:0]u8) !Cli {

@@ -40,6 +40,7 @@ rm -rf "$DATA_DIR"
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ORIGIN" \
     --workers "$WORKERS" \
+    --log-backend raft \
     --fresh &
 WORKER_PID=$!
 

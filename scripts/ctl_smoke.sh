@@ -41,6 +41,7 @@ EOF
     --data-dir "$DATA_DIR" \
     --public-suffix loop46.localhost \
     --bootstrap-root-token "$TOKEN" \
+    --log-backend raft \
     >/tmp/ctl-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true; rm -f "$SEED_MANIFEST"' EXIT

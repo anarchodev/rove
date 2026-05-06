@@ -64,6 +64,7 @@ rm -rf "$DATA_DIR"
     --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
+    --log-backend raft \
     --rate-limit-request-capacity 5 \
     --rate-limit-request-refill 0 \
     --rate-limit-email-capacity 2 \

@@ -47,6 +47,7 @@ rm -rf "$DATA_DIR"
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$ROVE_TOKEN" \
     --public-suffix loop46.localhost \
+    --log-backend raft \
     >/tmp/proxy-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT

@@ -77,7 +77,8 @@ rm -rf "$DATA_DIR"
     --public-suffix "$PUBLIC_SUFFIX" \
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
-    --workers 1 >/tmp/admin-smoke.out 2>&1 &
+    --workers 1 \
+    --log-backend raft >/tmp/admin-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
 

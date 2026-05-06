@@ -468,12 +468,12 @@ pub const WorkerConfig = struct {
     /// must outlive the worker's `create` call (S3BlobStore.init dupes
     /// them, so afterwards they can be freed).
     blob_backend: blob_mod.BackendConfig = .fs,
-    /// Phase 5.5 (a) — selects the log-flush path. `.raft` (default)
-    /// uses the legacy envelope-1 propose + per-tenant `log.db`
-    /// apply. `.s3` writes `.ndjson` payload + `.idx.json` sidecar
-    /// to `log_batch_store` instead. Default stays `.raft` until
-    /// step 5 of `docs/logs-plan.md` flips it.
-    log_backend: LogBackend = .raft,
+    /// Phase 5.5 (a) — selects the log-flush path. `.s3` (default
+    /// as of step 4) writes `.ndjson` payload + `.idx.json` sidecar
+    /// to `log_batch_store`. `.raft` keeps the legacy envelope-1
+    /// propose + per-tenant `log.db` apply for one-release rollback
+    /// safety; step 8 deletes that path entirely.
+    log_backend: LogBackend = .s3,
     /// Required when `log_backend == .s3`. Worker-side flushes call
     /// `flush_writer.writeBatch` against this. The pointer + the
     /// underlying store must outlive the worker; in production
