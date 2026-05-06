@@ -44,6 +44,24 @@ const log_mod = @import("rove-log");
 
 pub const thread = @import("thread.zig");
 
+// Phase 5.5 (a) — standalone log-server pieces (S3-direct + sidecar
+// indexer). These supersede the per-tenant `log.db` read API above
+// when step 8 deletes envelope type 1, but coexist during the
+// migration so the worker's `/_system/log/*` proxy keeps working.
+pub const sidecar = @import("sidecar.zig");
+pub const batch_store = @import("batch_store.zig");
+pub const index_db = @import("index_db.zig");
+pub const indexer = @import("indexer.zig");
+pub const standalone = @import("standalone.zig");
+
+test {
+    _ = sidecar;
+    _ = batch_store;
+    _ = index_db;
+    _ = indexer;
+    _ = standalone;
+}
+
 pub const Error = error{
     InvalidInstanceId,
     OutOfMemory,

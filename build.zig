@@ -496,6 +496,22 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cs_standalone);
 
+    // log-server-standalone: Phase 5.5 (a) step 2 — runs the new
+    // S3-direct logs indexer + h2 query API as a standalone process.
+    // Smoke driver populates the batch-store dir directly on disk
+    // (no worker yet); step 3 wires the worker's flush path into S3.
+    const ls_standalone_mod = b.addModule("log-server-standalone", .{
+        .root_source_file = b.path("examples/log_server_standalone.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ls_standalone_mod.addImport("rove-log-server", log_server_mod);
+    const ls_standalone = b.addExecutable(.{
+        .name = "log-server-standalone",
+        .root_module = ls_standalone_mod,
+    });
+    b.installArtifact(ls_standalone);
+
     // dual-worker: shift-js shared-nothing spike. Two full rove-js
     // worker instances in one process, both bound to the same port
     // via SO_REUSEPORT, sharing one raft node + one apply ctx.
