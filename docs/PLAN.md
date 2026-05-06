@@ -1469,6 +1469,17 @@ Detail (latency mitigations, editor bearer-auth flow, deploy-notification path, 
 
 This isn't just a metaphor. The architectural claim is: real-world reactive applications can be expressed in Loop46's pure-functional handler model *without escape hatches*, because every imperative concern (HTTP I/O, time, retries, browser updates, third-party integrations) has a port-shaped primitive.
 
+**Cmd taxonomy: two axes, four quadrants.** The handler's outputs are governed by two axes — whether deliveries are **batched** (combined with sibling Cmds before going out) or **unbatched** (one delivery per emit), and whether they're **guaranteed** (at-least-once with retry / commit-with-writeset) or **best-effort** (lost on crash / backpressure / eviction). The four quadrants each have a named platform verb today or in the speculative-post-1.0 sketch:
+
+|  | Best-effort | Guaranteed |
+|---|---|---|
+| **Unbatched** | `events.emit` (SSE — push to current connections, lost if no listener) | `webhook.send` (HTTP POST with retry / DLQ / callback) |
+| **Batched** | log emit (auto-captured per request, lossy on node failure per `docs/logs-plan.md`) | `analytics.track(transacted)` (post-1.0 sketch in §10.15 — commits with writeset, drained to OLAP) |
+
+**Ports are platform-declared, not customer-declared.** Each named verb IS a port — it's just declared by the platform rather than by customer code. The (batched, guaranteed) tuple is a property of the destination's *nature* (an OLAP sink wants batches; an arbitrary HTTP webhook can't be batched across destinations; a browser EventSource has no ack channel so guaranteed delivery is undefined), not a property the caller picks per-call. Letting customers declare arbitrary ports would push that decision onto them without the context to make it well — they don't know whether a given platform destination is per-record HTTP or columnar batch ingest. So ports stay platform-declared; if a fifth use case emerges that doesn't fit the four named verbs, we add a fifth named verb (and platform-decide its tuple).
+
+A literal unified `send({batched, guaranteed, ...})` API was considered and dropped — same reasoning. Per-call parameterization wouldn't carry the weight (those parameters are channel properties, not call properties), and per-channel parameterization would require customer-declared ports. Per `feedback_compose_from_primitives.md`: every primitive added is forever; the four named verbs cover the four quadrants without locking us into a shape we can't yet justify.
+
 **Customer third-party auth toolkit**:
 - **Stored keys**: customer puts API tokens in kv (`kv.set("stripe_secret", "sk_live_...")`).
 - **Arbitrary headers**: `webhook.send({ headers: { Authorization: "Bearer " + kv.get("stripe_secret") } })` covers Bearer, API-Key, custom-header.
@@ -1484,9 +1495,9 @@ This isn't just a metaphor. The architectural claim is: real-world reactive appl
 
 ### 10.15 `analytics.track` and `metrics.*` — speculative, post-1.0
 
-Two future observability primitives are explicitly held back per `feedback_compose_from_primitives.md` ("every primitive added is forever — defer the dedicated API until concrete customer demand"):
+Two future observability primitives are explicitly held back per `feedback_compose_from_primitives.md` ("every primitive added is forever — defer the dedicated API until concrete customer demand"). Both fill the **batched** row of the §10.14 Cmd taxonomy:
 
-- **`analytics.track(event)`** — fire-and-forget bulk-batched event emit into an OLAP-shaped sink. Distinct from `webhook.send` (request/response with retry-to-DLQ); same architectural family (structured data via a port), different ergonomics. Two-tier durability sketch: `best_effort` (in-memory buffer, periodic batch flush) and `transacted` (commits in the originating writeset, same machinery as `webhook.send`'s outbox). North-star claim worth recording: logs would become a specific case of this primitive once it exists.
+- **`analytics.track(event)`** — fills the (batched, guaranteed) quadrant. Fire-and-forget bulk-batched event emit into an OLAP-shaped sink. Distinct from `webhook.send` (request/response with retry-to-DLQ); same architectural family (structured data via a port), different ergonomics. Two-tier durability sketch: `best_effort` (in-memory buffer, periodic batch flush — fills the (batched, best-effort) quadrant alongside platform logs) and `transacted` (commits in the originating writeset, same machinery as `webhook.send`'s envelope-4-with-envelope-0 propose). North-star claim worth recording: logs would become a specific case of this primitive once it exists.
 - **`metrics.*`** — pre-aggregated counters / gauges / histograms flushed to a TSDB push gateway. Distinct from `analytics.track` because aggregation happens in worker memory, not per-event storage. Cardinality guardrails (per-metric label cap, UUID-shape detection on label values) would be a real differentiator over Prometheus / OpenTelemetry SDKs.
 
 **Both are post-1.0.** v1 customers compose: `webhook.send` to their OLAP / TSDB of choice for events and metrics; the existing logs surface (`/_system/log/*`) for request-level data. Workable, not great. The dedicated primitives become the answer when (a) concrete customer demand for high-volume custom observability surfaces and (b) operator-deployed companion services (`loop46-olap`, `loop46-tsdb`) exist as the receivers. Those probably co-arrive — the receiver is what motivates the primitive; the primitive is what makes the receiver usable.
