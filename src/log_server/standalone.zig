@@ -16,15 +16,23 @@
 //!         in the .ndjson payload)
 //!       → 404 if the request id isn't indexed
 //!
+//!   GET /v1/{tenant_id}/blob/{hash}                 (Phase 5.5 a, A1)
+//!       → 200 application/octet-stream (raw blob bytes)
+//!       → 404 if the blob isn't in the per-tenant `log-blobs/` store
+//!       → 501 if the server wasn't started with a blob backend
+//!
 //! For step 2 the binary spawns one indexer + one h2 server, both
 //! against a `BatchStore` / `IndexDb` the caller wires up. Step 3
-//! adds the worker-side flush path (`log.backend = s3`) so real
-//! traffic populates the bucket.
+//! added the worker-side flush path (`log.backend = s3`) so real
+//! traffic populates the bucket. A1 adds the blob endpoint so the
+//! replay UI can fetch tape body / tape blobs from the same shared
+//! S3 store the worker writes to.
 
 const std = @import("std");
 const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
+const blob_mod = @import("rove-blob");
 
 const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
@@ -49,6 +57,66 @@ pub const Config = struct {
     poll_interval_ms: u32 = 5_000,
     /// h2 connection cap.
     max_connections: u32 = 64,
+    /// Optional per-tenant blob backend used by `/v1/{tenant}/blob/{hash}`.
+    /// Null disables the blob route (returns 501). When non-null, the
+    /// backend must point at the same store the worker writes tape
+    /// blobs to — same `BLOB_BACKEND=s3` config the worker uses, so
+    /// `key_prefix_base` lines up. The standalone server lazily opens
+    /// one backend per tenant on first blob request; backends live for
+    /// the server's lifetime.
+    blob_backend_cfg: ?blob_mod.BackendConfig = null,
+};
+
+/// Lazy per-tenant `BlobBackend` cache for the blob read path.
+/// Single-thread owned (the h2 server thread); no locking. Each
+/// entry opens against the configured backend with `subdir =
+/// "log-blobs"` and `instance_id = tenant_id`, mirroring the
+/// `TenantLog` open path on the worker side so leader and standalone
+/// hit identical S3 keys.
+const BlobCache = struct {
+    allocator: std.mem.Allocator,
+    cfg: blob_mod.BackendConfig,
+    map: std.StringHashMapUnmanaged(*blob_mod.BlobBackend),
+
+    fn init(allocator: std.mem.Allocator, cfg: blob_mod.BackendConfig) BlobCache {
+        return .{ .allocator = allocator, .cfg = cfg, .map = .empty };
+    }
+
+    fn deinit(self: *BlobCache) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            const ptr = e.value_ptr.*;
+            ptr.deinit();
+            self.allocator.destroy(ptr);
+        }
+        self.map.deinit(self.allocator);
+    }
+
+    fn getOrOpen(self: *BlobCache, tenant_id: []const u8) !*blob_mod.BlobBackend {
+        if (self.map.get(tenant_id)) |existing| return existing;
+
+        const backend = try self.allocator.create(blob_mod.BlobBackend);
+        errdefer self.allocator.destroy(backend);
+        // The standalone is S3-only for blobs in A1; a future shared-
+        // mount design would thread a real fs path here. Empty string
+        // is fine for `.s3` because `openPerTenant` ignores `fs_path`
+        // for that variant.
+        backend.* = try blob_mod.BlobBackend.openPerTenant(
+            self.allocator,
+            self.cfg,
+            "",
+            tenant_id,
+            "log-blobs",
+        );
+        errdefer backend.deinit();
+
+        const id_copy = try self.allocator.dupe(u8, tenant_id);
+        errdefer self.allocator.free(id_copy);
+
+        try self.map.put(self.allocator, id_copy, backend);
+        return backend;
+    }
 };
 
 pub const Handle = struct {
@@ -141,9 +209,21 @@ fn runThread(h: *Handle) !void {
 
     std.log.info("log-server-standalone: h2c on 127.0.0.1:{d}", .{h.port});
 
+    var blob_cache: ?BlobCache = if (h.config.blob_backend_cfg) |cfg|
+        BlobCache.init(allocator, cfg)
+    else
+        null;
+    defer if (blob_cache) |*c| c.deinit();
+
     while (!h.stop.load(.acquire)) {
         try server.pollWithTimeout(100 * std.time.ns_per_ms);
-        try processRequests(server, allocator, h.config.store, h.config.db);
+        try processRequests(
+            server,
+            allocator,
+            h.config.store,
+            h.config.db,
+            if (blob_cache) |*c| c else null,
+        );
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
@@ -170,6 +250,7 @@ fn processRequests(
     allocator: std.mem.Allocator,
     store: batch_store_mod.BatchStore,
     db: *index_db_mod.IndexDb,
+    blob_cache: ?*BlobCache,
 ) !void {
     const entities = server.request_out.entitySlice();
     const sids = server.request_out.column(h2.StreamId);
@@ -177,7 +258,7 @@ fn processRequests(
     const req_hdrs = server.request_out.column(h2.ReqHeaders);
 
     for (entities, sids, sessions, req_hdrs) |ent, sid, sess, rh| {
-        handleOne(server, allocator, store, db, ent, sid, sess, rh) catch |err| {
+        handleOne(server, allocator, store, db, blob_cache, ent, sid, sess, rh) catch |err| {
             std.log.warn("log-server-standalone: handler error: {s}", .{@errorName(err)});
             setResponse(server, ent, sid, sess, 500, "internal error\n") catch |se| std.log.err(
                 "log-server-standalone: 500 write failed: {s}",
@@ -192,6 +273,7 @@ fn handleOne(
     allocator: std.mem.Allocator,
     store: batch_store_mod.BatchStore,
     db: *index_db_mod.IndexDb,
+    blob_cache: ?*BlobCache,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -220,10 +302,11 @@ fn handleOne(
     switch (route.kind) {
         .list => try handleList(server, allocator, db, ent, sid, sess, route.tenant_id, route.query),
         .show => try handleShow(server, allocator, store, db, ent, sid, sess, route.tenant_id, route.tail),
+        .blob => try handleBlob(server, allocator, blob_cache, ent, sid, sess, route.tenant_id, route.tail),
     }
 }
 
-const RouteKind = enum { list, show };
+const RouteKind = enum { list, show, blob };
 
 const ParsedRoute = struct {
     kind: RouteKind,
@@ -256,6 +339,11 @@ fn parseRoute(path: []const u8) ?ParsedRoute {
         const tail = remainder["show/".len..];
         if (tail.len == 0) return null;
         return .{ .kind = .show, .tenant_id = tenant_id, .tail = tail, .query = query };
+    }
+    if (std.mem.startsWith(u8, remainder, "blob/")) {
+        const tail = remainder["blob/".len..];
+        if (tail.len == 0) return null;
+        return .{ .kind = .blob, .tenant_id = tenant_id, .tail = tail, .query = query };
     }
     return null;
 }
@@ -343,6 +431,67 @@ fn handleShow(
     allocator.free(payload);
     const out = try buf.toOwnedSlice(allocator);
     try setResponseOwned(server, ent, sid, sess, 200, out);
+}
+
+/// Tape blob fetch (Phase 5.5 a, A1). Reads from the per-tenant
+/// `log-blobs` BlobStore, opened lazily on first request and cached.
+/// Returns 200 + raw bytes (no content-type — replay clients sniff
+/// or know the encoding from the calling tape ref). 404 when the
+/// hash isn't in the store, 501 when the server has no blob backend
+/// configured (operator hasn't wired the env vars).
+fn handleBlob(
+    server: *LogH2,
+    allocator: std.mem.Allocator,
+    blob_cache: ?*BlobCache,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    tenant_id: []const u8,
+    hash: []const u8,
+) !void {
+    const cache = blob_cache orelse {
+        try setResponse(server, ent, sid, sess, 501, "blob backend not configured\n");
+        return;
+    };
+
+    // Tape blob hashes are 64-char lowercase hex. The BlobStore's
+    // `validateKey` already rejects `/`, `..`, control chars, and
+    // empty keys, but we tighten further so a bogus path-y hash
+    // doesn't burn an S3 round-trip just to learn it's NotFound.
+    if (hash.len != 64 or !isHex(hash)) {
+        try setResponse(server, ent, sid, sess, 400, "invalid hash (want 64 lowercase hex)\n");
+        return;
+    }
+
+    const backend = cache.getOrOpen(tenant_id) catch |err| {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "blob open failed for {s}: {s}\n",
+            .{ tenant_id, @errorName(err) },
+        );
+        try setResponseOwned(server, ent, sid, sess, 500, msg);
+        return;
+    };
+
+    const bytes = backend.blobStore().get(hash, allocator) catch |err| {
+        const code: u16 = if (err == blob_mod.Error.NotFound) 404 else 500;
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "blob fetch failed: {s}\n",
+            .{@errorName(err)},
+        );
+        try setResponseOwned(server, ent, sid, sess, code, msg);
+        return;
+    };
+    try setResponseOwned(server, ent, sid, sess, 200, bytes);
+}
+
+fn isHex(s: []const u8) bool {
+    for (s) |b| switch (b) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
 }
 
 // ── JSON rendering ─────────────────────────────────────────────────
@@ -493,6 +642,13 @@ test "parseRoute matches /v1/{tenant}/show/{id}" {
     try testing.expectEqualStrings("12345", r.tail);
 }
 
+test "parseRoute matches /v1/{tenant}/blob/{hash}" {
+    const r = parseRoute("/v1/acme/blob/deadbeef").?;
+    try testing.expectEqual(RouteKind.blob, r.kind);
+    try testing.expectEqualStrings("acme", r.tenant_id);
+    try testing.expectEqualStrings("deadbeef", r.tail);
+}
+
 test "parseRoute rejects bad shapes" {
     try testing.expect(parseRoute("/") == null);
     try testing.expect(parseRoute("/v1/") == null);
@@ -500,7 +656,17 @@ test "parseRoute rejects bad shapes" {
     try testing.expect(parseRoute("/v1/acme/unknown") == null);
     try testing.expect(parseRoute("/v1//list") == null);
     try testing.expect(parseRoute("/v1/acme/show/") == null);
+    try testing.expect(parseRoute("/v1/acme/blob/") == null);
     try testing.expect(parseRoute("/v2/acme/list") == null);
+}
+
+test "isHex accepts 64 lowercase hex chars" {
+    try testing.expect(isHex("0123456789abcdef"));
+    try testing.expect(isHex(""));
+    try testing.expect(!isHex("ABCDEF"));
+    try testing.expect(!isHex("g"));
+    try testing.expect(!isHex("0/1"));
+    try testing.expect(!isHex("0.1"));
 }
 
 test "parseUint reads ?limit= or returns default" {

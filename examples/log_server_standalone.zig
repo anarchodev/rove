@@ -10,7 +10,7 @@
 //! message if anything's missing. The smoke driver sources `.env`
 //! before spawning.
 //!
-//! Required env:
+//! Required env (batch store + tape blob backend):
 //!   S3_ENDPOINT          hostname (no scheme)
 //!   S3_REGION            sigv4 signing region
 //!   S3_BUCKET            bucket name
@@ -18,7 +18,13 @@
 //!   AWS_SECRET_ACCESS_KEY
 //!
 //! Optional env:
-//!   LOG_S3_KEY_PREFIX    prefix prepended to every key (default ``)
+//!   LOG_S3_KEY_PREFIX    prefix prepended to every batch-store key
+//!                        (sidecars + ndjson; default ``)
+//!   S3_KEY_PREFIX_BASE   prefix prepended to every per-tenant
+//!                        BlobBackend key (`{base}{tenant}/log-blobs/{hash}`).
+//!                        Must match the worker's `S3_KEY_PREFIX_BASE`
+//!                        so the standalone reads from the same keys
+//!                        the worker writes. Default ``.
 //!   S3_USE_TLS           `0` / `false` to drop to http (DEV ONLY,
 //!                        for local MinIO smoke)
 //!
@@ -33,6 +39,7 @@
 
 const std = @import("std");
 const log_server = @import("rove-log-server");
+const blob_mod = @import("rove-blob");
 
 const Cli = struct {
     index_db_path: []const u8 = "/tmp/log-server-index.db",
@@ -127,6 +134,11 @@ pub fn main() !void {
     const key_prefix = (try envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
         try allocator.dupe(u8, "");
     defer allocator.free(key_prefix);
+    // Optional. Empty default means tape blobs sit at
+    // `{tenant}/log-blobs/{hash}` (matches the worker default).
+    const blob_key_prefix_base = (try envOpt(allocator, "S3_KEY_PREFIX_BASE")) orelse
+        try allocator.dupe(u8, "");
+    defer allocator.free(blob_key_prefix_base);
     const use_tls = blk: {
         const v = (try envOpt(allocator, "S3_USE_TLS")) orelse break :blk true;
         defer allocator.free(v);
@@ -144,6 +156,20 @@ pub fn main() !void {
         .use_tls = use_tls,
     });
     defer s3.deinit();
+
+    // Same S3 connection params as the batch store; differs only in
+    // the per-tenant key prefix scheme (BlobBackend.openPerTenant
+    // builds it lazily). Threaded into standalone.spawn so the blob
+    // route opens a per-tenant BlobBackend on first request.
+    const blob_backend_cfg: blob_mod.BackendConfig = .{ .s3 = .{
+        .endpoint = endpoint,
+        .region = region,
+        .bucket = bucket,
+        .key_prefix_base = blob_key_prefix_base,
+        .access_key = access_key,
+        .secret_key = secret_key,
+        .use_tls = use_tls,
+    } };
 
     const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}", .{cli.index_db_path}, 0);
     defer allocator.free(db_path);
@@ -163,6 +189,7 @@ pub fn main() !void {
         .db = db,
         .bind_addr = bind_addr,
         .poll_interval_ms = cli.poll_interval_ms,
+        .blob_backend_cfg = blob_backend_cfg,
     });
     defer handle.shutdown();
 

@@ -507,6 +507,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ls_standalone_mod.addImport("rove-log-server", log_server_mod);
+    ls_standalone_mod.addImport("rove-blob", blob_mod);
     const ls_standalone = b.addExecutable(.{
         .name = "log-server-standalone",
         .root_module = ls_standalone_mod,

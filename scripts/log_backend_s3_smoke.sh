@@ -91,6 +91,16 @@ rm -f "$INDEX_DB" "${INDEX_DB}-shm" "${INDEX_DB}-wal"
 
 rm -rf "$DATA_DIR"
 
+# Force BLOB_BACKEND=s3 + a per-run S3_KEY_PREFIX_BASE so EVERY blob
+# (file-blobs from seed, tape blobs from request handling) lands in
+# the same bucket the log-server reads. The per-run prefix base
+# mirrors LOG_S3_KEY_PREFIX so concurrent runs don't collide on
+# blobs either. Set BEFORE seed so the seed's bytecode writes go to
+# S3 — otherwise the worker crashes at startup trying to read
+# bytecodes that aren't there.
+export BLOB_BACKEND=s3
+export S3_KEY_PREFIX_BASE="$SMOKE_PREFIX"
+
 # Pre-create acme via seed.
 "$BIN" seed \
     --data-dir "$DATA_DIR" \
@@ -228,6 +238,48 @@ assert r["path"].startswith("/api")
 ' || fail "show on a worker-emitted record didn't round-trip"
 ok "show: S3 range-read returned the worker-emitted record"
 
+# ── /v1/{tenant}/blob/{hash} round-trips a tape blob via S3 ───────
+# Phase 5.5(a) A1. Pull a tape ref hash off the record and fetch the
+# bytes through the standalone server; the server lazily opens a
+# per-tenant BlobBackend against `${SMOKE_PREFIX}acme/log-blobs/`
+# (matches the worker's per-tenant log-blobs prefix).
+TAPE_HASH=$(echo "$SHOW" | python3 -c '
+import json, sys
+r = json.loads(sys.stdin.read())["record"]
+refs = r.get("tape_refs") or {}
+for k in ("response_body_hex", "kv_tape_hex", "date_tape_hex", "request_body_hex"):
+    h = refs.get(k)
+    if h: print(h); break
+')
+if [[ -z "$TAPE_HASH" ]]; then
+    fail "no tape ref hash on the show record (was BLOB_BACKEND=s3 active?)"
+fi
+
+# 200 path: existing hash → bytes come back.
+BLOB_BODY=$("${LS_CURL[@]}" -o /tmp/lbs-blob.bin -w '%{http_code}' \
+    "http://127.0.0.1:${LS_BOUND_PORT}/v1/acme/blob/${TAPE_HASH}")
+[[ "$BLOB_BODY" == "200" ]] || fail "blob fetch got $BLOB_BODY (want 200)"
+[[ -s /tmp/lbs-blob.bin ]] || fail "blob fetch returned empty body"
+# Hash the bytes back to verify the BlobStore returned the right blob.
+GOT_HASH=$(sha256sum /tmp/lbs-blob.bin | awk '{print $1}')
+[[ "$GOT_HASH" == "$TAPE_HASH" ]] || fail "blob bytes hash to $GOT_HASH, expected $TAPE_HASH"
+ok "blob: GET /v1/acme/blob/{hash} returned the right $((${#GOT_HASH})) byte hash"
+
+# 404 path: missing hash (also valid 64-hex but non-existent).
+BOGUS="0000000000000000000000000000000000000000000000000000000000000000"
+CODE=$("${LS_CURL[@]}" -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:${LS_BOUND_PORT}/v1/acme/blob/${BOGUS}")
+[[ "$CODE" == "404" ]] || fail "blob fetch for nonexistent hash got $CODE (want 404)"
+ok "blob: 404 for nonexistent hash"
+
+# 400 path: malformed hash (not 64 lowercase hex).
+CODE=$("${LS_CURL[@]}" -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:${LS_BOUND_PORT}/v1/acme/blob/not-a-hash")
+[[ "$CODE" == "400" ]] || fail "blob fetch for malformed hash got $CODE (want 400)"
+ok "blob: 400 for malformed hash"
+
+rm -f /tmp/lbs-blob.bin
+
 echo ""
 echo "all log-backend=s3 smoke checks passed"
-echo "(left ~6 objects under s3://${S3_BUCKET}/${SMOKE_PREFIX} — operator/OVH lifecycle handles cleanup)"
+echo "(left ~10 objects under s3://${S3_BUCKET}/${SMOKE_PREFIX} — operator/OVH lifecycle handles cleanup)"
