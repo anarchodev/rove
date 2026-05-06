@@ -38,7 +38,12 @@ fn proposeEncoded(
         .writeset => apply_mod.encodeWriteSetEnvelope(allocator, instance_id, ws_bytes),
         .files_writeset => apply_mod.encodeFilesWriteSetEnvelope(allocator, instance_id, ws_bytes),
         .root_writeset => apply_mod.encodeRootWriteSetEnvelope(allocator, ws_bytes),
-        .log_batch => unreachable,
+        .log_batch,
+        .webhook_enqueue_batch,
+        .webhook_complete,
+        .webhook_retry_schedule,
+        .multi,
+        => unreachable,
     };
     defer allocator.free(envelope);
 

@@ -59,6 +59,7 @@ const std = @import("std");
 const kv = @import("rove-kv");
 const log_mod = @import("rove-log");
 const blob_mod = @import("rove-blob");
+const webhook_server = @import("rove-webhook-server");
 const panic_mod = @import("panic.zig");
 
 pub const Error = error{
@@ -66,6 +67,7 @@ pub const Error = error{
     UnknownInstance,
     UnknownEnvelopeType,
     ApplyFailed,
+    NestedMulti,
 };
 
 pub const MAX_ID_LEN: usize = 256;
@@ -96,6 +98,29 @@ pub const EnvelopeType = enum(u8) {
     log_batch = 1,
     root_writeset = 2,
     files_writeset = 3,
+    /// Phase 5.5 (d) — webhook enqueue batch. Payload is a
+    /// `webhook_server.encodeEnqueueBatch` blob; apply INSERTs OR
+    /// IGNOREs each row into `{data_dir}/webhooks.db`. Applied on both
+    /// leader and follower (no leader-skip): the dispatcher proposes
+    /// without pre-writing webhooks.db locally.
+    webhook_enqueue_batch = 4,
+    /// Phase 5.5 (d) — webhook completed. Payload is a
+    /// `webhook_server.encodeComplete` blob; apply DELETEs from
+    /// `webhooks.db` and writes `_callback/{id}` into the tenant's
+    /// app.db. Applied on both leader and follower.
+    webhook_complete = 5,
+    /// Phase 5.5 (d) — webhook retry schedule. Payload is a
+    /// `webhook_server.encodeRetrySchedule` blob; apply UPDATEs the
+    /// row's attempts + next_attempt_at_ns in `webhooks.db`. Applied
+    /// on both leader and follower.
+    webhook_retry_schedule = 6,
+    /// Phase 5.5 (d) — multi-envelope wrapper. Payload is
+    /// `[u8 count][u32 inner_len][inner_envelope_bytes]{count}` where
+    /// each inner envelope is a complete `[type][id_len][id][payload]`
+    /// blob. Inner envelopes apply in order; nesting (a `multi` inside
+    /// a `multi`) panics. The standard envelope `instance_id` is empty
+    /// for type=7 — per-inner-envelope ids carry the real targets.
+    multi = 7,
 };
 
 /// Build a writeset envelope. `id_len` and `id` plus a leading type=0
@@ -139,6 +164,93 @@ pub fn encodeFilesWriteSetEnvelope(
     ws_bytes: []const u8,
 ) ![]u8 {
     return encodeTyped(allocator, .files_writeset, id, ws_bytes);
+}
+
+/// Build a webhook enqueue batch envelope (type=4). `payload` is the
+/// `webhook_server.encodeEnqueueBatch` body. instance_id is empty —
+/// the webhooks store is cluster-wide, not per-tenant.
+pub fn encodeWebhookEnqueueBatchEnvelope(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) ![]u8 {
+    return encodeTyped(allocator, .webhook_enqueue_batch, "", payload);
+}
+
+/// Build a webhook-complete envelope (type=5). `instance_id` is the
+/// tenant id whose app.db will receive the `_callback/{id}` write.
+pub fn encodeWebhookCompleteEnvelope(
+    allocator: std.mem.Allocator,
+    tenant_id: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    return encodeTyped(allocator, .webhook_complete, tenant_id, payload);
+}
+
+/// Build a webhook retry-schedule envelope (type=6). instance_id
+/// empty — only webhooks.db is touched.
+pub fn encodeWebhookRetryScheduleEnvelope(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) ![]u8 {
+    return encodeTyped(allocator, .webhook_retry_schedule, "", payload);
+}
+
+/// Build a multi-envelope wrapper (type=7) carrying `inner` as already-
+/// encoded inner envelopes. The wrapper's `instance_id` is empty;
+/// real targets live on each inner envelope's id.
+///
+/// Inner envelopes must NOT themselves be type=7. The apply path
+/// panics on nested multi to keep the recursion bounded.
+///
+/// Wire format (after the standard `[1B type=7][2B id_len=0]` header):
+///   `[u8 count][ [u32 len][len bytes inner_envelope] ]{count}`
+pub fn encodeMultiEnvelope(
+    allocator: std.mem.Allocator,
+    inner: []const []const u8,
+) ![]u8 {
+    if (inner.len > 0xff) return error.OutOfMemory;
+    var inner_total: usize = 0;
+    for (inner) |b| inner_total += 4 + b.len;
+    const payload_len = 1 + inner_total;
+    const total = 3 + payload_len;
+    const out = try allocator.alloc(u8, total);
+    out[0] = @intFromEnum(EnvelopeType.multi);
+    std.mem.writeInt(u16, out[1..3], 0, .big);
+    out[3] = @intCast(inner.len);
+    var pos: usize = 4;
+    for (inner) |b| {
+        std.mem.writeInt(u32, out[pos..][0..4], @intCast(b.len), .little);
+        pos += 4;
+        @memcpy(out[pos..][0..b.len], b);
+        pos += b.len;
+    }
+    return out;
+}
+
+/// Decode the inner-envelope byte slices from a type=7 wrapper's
+/// payload (i.e., `Envelope.payload` for an envelope whose type is
+/// `multi`). Returned slices alias the caller's payload buffer; do
+/// not free individually. Caller frees the outer slice with
+/// `allocator.free`.
+pub fn decodeMultiInner(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) ![][]const u8 {
+    if (payload.len < 1) return Error.Truncated;
+    const count = payload[0];
+    const out = try allocator.alloc([]const u8, count);
+    errdefer allocator.free(out);
+    var pos: usize = 1;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (payload.len < pos + 4) return Error.Truncated;
+        const len = std.mem.readInt(u32, payload[pos..][0..4], .little);
+        pos += 4;
+        if (payload.len < pos + len) return Error.Truncated;
+        out[i] = payload[pos .. pos + len];
+        pos += len;
+    }
+    return out;
 }
 
 fn encodeTyped(
@@ -216,6 +328,13 @@ pub const ApplyCtx = struct {
     /// apply. Null on the leader path (leader-skip fires before we'd
     /// open it) and on nodes that never see a root writeset.
     root_store: ?*kv.KvStore = null,
+    /// Lazy cluster-wide webhook store handle for `type=4/5/6` applies
+    /// (Phase 5.5 d). Opens `{data_dir}/webhooks.db` on first webhook
+    /// envelope. Unlike per-tenant stores this is shared across all
+    /// tenants — there is exactly one webhooks.db per node, replicated
+    /// to identical state via raft. Applied on BOTH leader and
+    /// follower (no leader-skip): the proposer doesn't pre-write.
+    webhooks_store: ?*webhook_server.WebhookStore = null,
     /// Picks fs vs s3 for every per-tenant log blob backend the raft
     /// thread opens. Must match the worker's `blob_backend` setting
     /// — leader writes via the worker, followers read via this ctx;
@@ -264,6 +383,31 @@ pub const ApplyCtx = struct {
         self.files_stores.deinit(self.allocator);
 
         if (self.root_store) |s| s.close();
+        if (self.webhooks_store) |s| {
+            s.close();
+            self.allocator.destroy(s);
+        }
+    }
+
+    /// Lazily open the cluster-wide `webhooks.db`. Returned pointer is
+    /// owned by the context and stable for its lifetime. Reached on
+    /// both leader and follower because envelope types 4/5/6 don't
+    /// leader-skip.
+    fn getWebhooks(self: *ApplyCtx) !*webhook_server.WebhookStore {
+        if (self.webhooks_store) |existing| return existing;
+        const path = try std.fmt.allocPrintSentinel(
+            self.allocator,
+            "{s}/webhooks.db",
+            .{self.data_dir},
+            0,
+        );
+        defer self.allocator.free(path);
+
+        const ptr = try self.allocator.create(webhook_server.WebhookStore);
+        errdefer self.allocator.destroy(ptr);
+        ptr.* = try webhook_server.WebhookStore.open(self.allocator, path);
+        self.webhooks_store = ptr;
+        return ptr;
     }
 
     /// Lazily open the follower's local copy of `__root__.db`. Returns
@@ -418,11 +562,28 @@ pub fn applyOne(
         .{@errorName(err)},
     );
 
+    dispatch(ctx, env, .top_level);
+}
+
+const NestingLevel = enum { top_level, inside_multi };
+
+fn dispatch(ctx: *ApplyCtx, env: Envelope, nesting: NestingLevel) void {
     switch (env.type) {
         .writeset => applyWriteSet(ctx, env),
         .log_batch => applyLogBatch(ctx, env),
         .root_writeset => applyRootWriteSet(ctx, env),
         .files_writeset => applyFilesWriteSet(ctx, env),
+        .webhook_enqueue_batch => applyWebhookEnqueueBatch(ctx, env),
+        .webhook_complete => applyWebhookComplete(ctx, env),
+        .webhook_retry_schedule => applyWebhookRetrySchedule(ctx, env),
+        .multi => {
+            if (nesting == .inside_multi) panic_mod.invariantViolated(
+                "applyOne.multi",
+                "nested multi-envelope wrapper",
+                .{},
+            );
+            applyMulti(ctx, env);
+        },
     }
 }
 
@@ -509,6 +670,241 @@ fn applyLogBatch(ctx: *ApplyCtx, env: Envelope) void {
     );
 }
 
+/// Phase 5.5 (d). No leader-skip: the dispatcher (step 4) proposes
+/// envelope 4 alongside envelope 0 without pre-writing webhooks.db.
+/// Both leader and follower apply against their local
+/// `{data_dir}/webhooks.db`.
+fn applyWebhookEnqueueBatch(ctx: *ApplyCtx, env: Envelope) void {
+    std.debug.assert(env.instance_id.len == 0);
+
+    const store = ctx.getWebhooks() catch |err| panic_mod.invariantViolated(
+        "applyWebhookEnqueueBatch.getWebhooks",
+        "err={s}",
+        .{@errorName(err)},
+    );
+
+    const rows = webhook_server.decodeEnqueueBatch(ctx.allocator, env.payload) catch |err|
+        panic_mod.invariantViolated(
+            "applyWebhookEnqueueBatch.decode",
+            "err={s}",
+            .{@errorName(err)},
+        );
+    defer {
+        for (rows) |*r| r.deinit(ctx.allocator);
+        ctx.allocator.free(rows);
+    }
+
+    store.applyEnqueueBatch(rows) catch |err| panic_mod.invariantViolated(
+        "applyWebhookEnqueueBatch.apply",
+        "err={s}",
+        .{@errorName(err)},
+    );
+}
+
+/// Phase 5.5 (d). Cross-db apply: writes `_callback/{id}` into the
+/// tenant's app.db, then DELETEs the row from `webhooks.db`. Both
+/// halves are idempotent (`INSERT OR REPLACE` and `DELETE … WHERE`),
+/// so a partial-failure re-apply converges to the same state.
+///
+/// Order matters: tenant write FIRST, then webhooks delete. If we
+/// crash between them, the next apply attempt re-reads the still-
+/// present webhooks row and re-issues both writes.
+///
+/// On a fully idempotent re-apply (row already gone), we skip both
+/// halves — the callback was written by the prior apply.
+fn applyWebhookComplete(ctx: *ApplyCtx, env: Envelope) void {
+    const tenant_id = env.instance_id;
+
+    var complete = webhook_server.decodeComplete(ctx.allocator, env.payload) catch |err|
+        panic_mod.invariantViolated(
+            "applyWebhookComplete.decode",
+            "err={s}",
+            .{@errorName(err)},
+        );
+    defer complete.deinit(ctx.allocator);
+
+    const store = ctx.getWebhooks() catch |err| panic_mod.invariantViolated(
+        "applyWebhookComplete.getWebhooks",
+        "err={s}",
+        .{@errorName(err)},
+    );
+
+    var existing_opt = store.get(&complete.webhook_id_hex) catch |err|
+        panic_mod.invariantViolated(
+            "applyWebhookComplete.get",
+            "err={s}",
+            .{@errorName(err)},
+        );
+    if (existing_opt) |*existing| {
+        defer existing.deinit(ctx.allocator);
+
+        const callback_json = buildCallbackJson(
+            ctx.allocator,
+            &complete,
+            existing,
+        ) catch |err| panic_mod.invariantViolated(
+            "applyWebhookComplete.buildCallback",
+            "err={s}",
+            .{@errorName(err)},
+        );
+        defer ctx.allocator.free(callback_json);
+
+        const tenant_kv = ctx.getKv(tenant_id) catch |err|
+            panic_mod.invariantViolated(
+                "applyWebhookComplete.getKv",
+                "tenant={s} err={s}",
+                .{ tenant_id, @errorName(err) },
+            );
+
+        var key_buf: [10 + webhook_server.WEBHOOK_ID_HEX_LEN]u8 = undefined;
+        const key = std.fmt.bufPrint(
+            &key_buf,
+            "_callback/{s}",
+            .{&complete.webhook_id_hex},
+        ) catch |err| panic_mod.invariantViolated(
+            "applyWebhookComplete.bufPrint",
+            "err={s}",
+            .{@errorName(err)},
+        );
+        tenant_kv.put(key, callback_json) catch |err|
+            panic_mod.invariantViolated(
+                "applyWebhookComplete.put",
+                "tenant={s} err={s}",
+                .{ tenant_id, @errorName(err) },
+            );
+    }
+
+    store.applyComplete(&complete.webhook_id_hex) catch |err|
+        panic_mod.invariantViolated(
+            "applyWebhookComplete.delete",
+            "err={s}",
+            .{@errorName(err)},
+        );
+}
+
+/// Phase 5.5 (d). Updates attempts + next_attempt_at_ns + clears the
+/// inflight lease. Idempotent: missing row is a no-op (a racing
+/// envelope 5 already won and removed it). No leader-skip.
+fn applyWebhookRetrySchedule(ctx: *ApplyCtx, env: Envelope) void {
+    std.debug.assert(env.instance_id.len == 0);
+
+    const sched = webhook_server.decodeRetrySchedule(env.payload) catch |err|
+        panic_mod.invariantViolated(
+            "applyWebhookRetrySchedule.decode",
+            "err={s}",
+            .{@errorName(err)},
+        );
+
+    const store = ctx.getWebhooks() catch |err| panic_mod.invariantViolated(
+        "applyWebhookRetrySchedule.getWebhooks",
+        "err={s}",
+        .{@errorName(err)},
+    );
+
+    store.applyRetrySchedule(
+        &sched.webhook_id_hex,
+        sched.attempts,
+        sched.next_attempt_at_ns,
+    ) catch |err| panic_mod.invariantViolated(
+        "applyWebhookRetrySchedule.apply",
+        "err={s}",
+        .{@errorName(err)},
+    );
+}
+
+/// Phase 5.5 (d). Multi-envelope wrapper: unwraps inner envelopes and
+/// dispatches each. Inner envelopes apply in order. Nesting (multi
+/// inside multi) panics in `dispatch`.
+fn applyMulti(ctx: *ApplyCtx, env: Envelope) void {
+    std.debug.assert(env.instance_id.len == 0);
+    const inner = decodeMultiInner(ctx.allocator, env.payload) catch |err|
+        panic_mod.invariantViolated(
+            "applyMulti.decode",
+            "err={s}",
+            .{@errorName(err)},
+        );
+    defer ctx.allocator.free(inner);
+
+    for (inner) |bytes| {
+        const inner_env = decodeEnvelope(bytes) catch |err|
+            panic_mod.invariantViolated(
+                "applyMulti.decodeInner",
+                "err={s}",
+                .{@errorName(err)},
+            );
+        dispatch(ctx, inner_env, .inside_multi);
+    }
+}
+
+/// Build the `_callback/{id}` JSON envelope written into the tenant's
+/// app.db when a webhook reaches a terminal outcome. Schema matches
+/// `src/outbox/drainer.zig`'s `writeCallback`: webhook_id, on_result,
+/// outcome, attempts, context, plus either `response` (delivered) or
+/// `error` (failed). The callback consumer in
+/// `src/js/callback_dispatch.zig` parses this with
+/// `ignore_unknown_fields = true`, so missing fields are tolerated.
+fn buildCallbackJson(
+    allocator: std.mem.Allocator,
+    complete: *const webhook_server.CompleteEnvelope,
+    stored: *const webhook_server.StoredWebhook,
+) ![]u8 {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer list.deinit(allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &list);
+    const w = &aw.writer;
+
+    const outcome_str: []const u8 = switch (complete.outcome) {
+        .delivered => "delivered",
+        .failed => "failed",
+    };
+
+    try w.writeAll("{\"webhook_id\":\"");
+    try w.writeAll(&complete.webhook_id_hex);
+    try w.writeAll("\",\"on_result\":");
+    if (stored.row.on_result_path.len == 0) {
+        try w.writeAll("null");
+    } else {
+        try w.writeAll("\"");
+        try writeJsonString(w, stored.row.on_result_path);
+        try w.writeAll("\"");
+    }
+    try w.print(",\"outcome\":\"{s}\",\"attempts\":{d},\"context\":", .{
+        outcome_str,
+        complete.attempts,
+    });
+    if (stored.row.context_json.len == 0) {
+        try w.writeAll("null");
+    } else {
+        try w.writeAll(stored.row.context_json);
+    }
+
+    switch (complete.outcome) {
+        .delivered => {
+            try w.print(",\"response\":{{\"status\":{d},\"body\":\"", .{complete.status});
+            try writeJsonString(w, complete.response_body);
+            try w.writeAll("\",\"truncated\":false}");
+        },
+        .failed => {
+            try w.writeAll(",\"error\":\"delivery_failed\"");
+        },
+    }
+
+    try w.writeAll("}");
+    return aw.toOwnedSlice();
+}
+
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    for (s) |b| switch (b) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        0...0x07, 0x0b, 0x0e...0x1f => try w.print("\\u{x:0>4}", .{b}),
+        else => try w.writeByte(b),
+    };
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -585,4 +981,175 @@ test "decodeEnvelope handles empty payload" {
     try testing.expectEqual(EnvelopeType.writeset, dec.type);
     try testing.expectEqualStrings("x", dec.instance_id);
     try testing.expectEqualStrings("", dec.payload);
+}
+
+test "webhook_enqueue_batch envelope encode/decode round trip" {
+    const a = testing.allocator;
+    const inner = "fake encoded batch bytes";
+    const enc = try encodeWebhookEnqueueBatchEnvelope(a, inner);
+    defer a.free(enc);
+    const dec = try decodeEnvelope(enc);
+    try testing.expectEqual(EnvelopeType.webhook_enqueue_batch, dec.type);
+    try testing.expectEqualStrings("", dec.instance_id);
+    try testing.expectEqualStrings(inner, dec.payload);
+}
+
+test "webhook_complete envelope encode/decode round trip" {
+    const a = testing.allocator;
+    const enc = try encodeWebhookCompleteEnvelope(a, "acme", "fake complete bytes");
+    defer a.free(enc);
+    const dec = try decodeEnvelope(enc);
+    try testing.expectEqual(EnvelopeType.webhook_complete, dec.type);
+    try testing.expectEqualStrings("acme", dec.instance_id);
+    try testing.expectEqualStrings("fake complete bytes", dec.payload);
+}
+
+test "webhook_retry_schedule envelope encode/decode round trip" {
+    const a = testing.allocator;
+    const enc = try encodeWebhookRetryScheduleEnvelope(a, "fake retry bytes");
+    defer a.free(enc);
+    const dec = try decodeEnvelope(enc);
+    try testing.expectEqual(EnvelopeType.webhook_retry_schedule, dec.type);
+    try testing.expectEqualStrings("", dec.instance_id);
+    try testing.expectEqualStrings("fake retry bytes", dec.payload);
+}
+
+test "multi envelope wraps + unwraps several inner envelopes" {
+    const a = testing.allocator;
+    const inner_ws = try encodeWriteSetEnvelope(a, "acme", "ws bytes");
+    defer a.free(inner_ws);
+    const inner_wh = try encodeWebhookEnqueueBatchEnvelope(a, "wh bytes");
+    defer a.free(inner_wh);
+
+    const wrapped = try encodeMultiEnvelope(a, &.{ inner_ws, inner_wh });
+    defer a.free(wrapped);
+
+    const outer = try decodeEnvelope(wrapped);
+    try testing.expectEqual(EnvelopeType.multi, outer.type);
+    try testing.expectEqualStrings("", outer.instance_id);
+
+    const inner = try decodeMultiInner(a, outer.payload);
+    defer a.free(inner);
+    try testing.expectEqual(@as(usize, 2), inner.len);
+
+    const e0 = try decodeEnvelope(inner[0]);
+    try testing.expectEqual(EnvelopeType.writeset, e0.type);
+    try testing.expectEqualStrings("acme", e0.instance_id);
+    try testing.expectEqualStrings("ws bytes", e0.payload);
+
+    const e1 = try decodeEnvelope(inner[1]);
+    try testing.expectEqual(EnvelopeType.webhook_enqueue_batch, e1.type);
+    try testing.expectEqualStrings("", e1.instance_id);
+    try testing.expectEqualStrings("wh bytes", e1.payload);
+}
+
+test "multi envelope with empty inner list" {
+    const a = testing.allocator;
+    const wrapped = try encodeMultiEnvelope(a, &.{});
+    defer a.free(wrapped);
+    const outer = try decodeEnvelope(wrapped);
+    try testing.expectEqual(EnvelopeType.multi, outer.type);
+    const inner = try decodeMultiInner(a, outer.payload);
+    defer a.free(inner);
+    try testing.expectEqual(@as(usize, 0), inner.len);
+}
+
+test "decodeMultiInner rejects truncated payload" {
+    const a = testing.allocator;
+    try testing.expectError(Error.Truncated, decodeMultiInner(a, ""));
+    // count=1 but no length prefix
+    try testing.expectError(Error.Truncated, decodeMultiInner(a, &[_]u8{1}));
+    // count=1, length=10 but only 4 bytes follow
+    try testing.expectError(
+        Error.Truncated,
+        decodeMultiInner(a, &[_]u8{ 1, 10, 0, 0, 0, 'a', 'b', 'c', 'd' }),
+    );
+}
+
+test "buildCallbackJson delivered shape parses + carries fields" {
+    const a = testing.allocator;
+    const stored: webhook_server.StoredWebhook = .{
+        .row = .{
+            .webhook_id_hex = [_]u8{'a'} ** webhook_server.WEBHOOK_ID_HEX_LEN,
+            .tenant_id = "acme",
+            .url = "https://x.test/h",
+            .method = "POST",
+            .headers_json = "{}",
+            .body = "",
+            .max_attempts = 3,
+            .timeout_ms = 1000,
+            .retry_on_json = "[]",
+            .context_json = "{\"chargeId\":\"ch_1\"}",
+            .on_result_path = "stripe/charge_result",
+            .enqueued_at_ns = 0,
+        },
+        .state = .pending,
+        .next_attempt_at_ns = 0,
+        .attempts = 1,
+    };
+    const complete: webhook_server.CompleteEnvelope = .{
+        .webhook_id_hex = [_]u8{'a'} ** webhook_server.WEBHOOK_ID_HEX_LEN,
+        .tenant_id = "acme",
+        .outcome = .delivered,
+        .attempts = 1,
+        .status = 200,
+        .response_headers_json = "{}",
+        .response_body = "ok",
+    };
+
+    const json = try buildCallbackJson(a, &complete, &stored);
+    defer a.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("delivered", obj.get("outcome").?.string);
+    try testing.expectEqualStrings("stripe/charge_result", obj.get("on_result").?.string);
+    try testing.expectEqual(@as(i64, 1), obj.get("attempts").?.integer);
+    const ctx = obj.get("context").?.object;
+    try testing.expectEqualStrings("ch_1", ctx.get("chargeId").?.string);
+    const resp = obj.get("response").?.object;
+    try testing.expectEqual(@as(i64, 200), resp.get("status").?.integer);
+    try testing.expectEqualStrings("ok", resp.get("body").?.string);
+}
+
+test "buildCallbackJson failed shape carries error field" {
+    const a = testing.allocator;
+    const stored: webhook_server.StoredWebhook = .{
+        .row = .{
+            .webhook_id_hex = [_]u8{'b'} ** webhook_server.WEBHOOK_ID_HEX_LEN,
+            .tenant_id = "acme",
+            .url = "https://x.test/h",
+            .method = "POST",
+            .headers_json = "{}",
+            .body = "",
+            .max_attempts = 3,
+            .timeout_ms = 1000,
+            .retry_on_json = "[]",
+            .context_json = "null",
+            .on_result_path = "",
+            .enqueued_at_ns = 0,
+        },
+        .state = .pending,
+        .next_attempt_at_ns = 0,
+        .attempts = 4,
+    };
+    const complete: webhook_server.CompleteEnvelope = .{
+        .webhook_id_hex = [_]u8{'b'} ** webhook_server.WEBHOOK_ID_HEX_LEN,
+        .tenant_id = "acme",
+        .outcome = .failed,
+        .attempts = 4,
+        .status = 0,
+        .response_headers_json = "",
+        .response_body = "",
+    };
+    const json = try buildCallbackJson(a, &complete, &stored);
+    defer a.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("failed", obj.get("outcome").?.string);
+    try testing.expect(obj.get("on_result").? == .null);
+    try testing.expectEqualStrings("delivery_failed", obj.get("error").?.string);
 }

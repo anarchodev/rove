@@ -330,6 +330,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-log", log_mod);
     js_mod.addImport("rove-tape", tape_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
+    js_mod.addImport("rove-webhook-server", webhook_server_mod);
     // JS-side runtime polyfills evaluated into every dispatcher's QJS
     // context after the native CFunction bindings install. email.js
     // wraps `webhook.send`; textcodec.js polyfills TextEncoder/Decoder.
