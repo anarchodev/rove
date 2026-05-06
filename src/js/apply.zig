@@ -11,17 +11,15 @@
 //! `type=2` → ROOT writeset (payload is `WriteSet.encode` bytes,
 //!           target store = `{data_dir}/__root__.db`, id_len must
 //!           be 0 — the envelope carries no per-tenant id)
-//! `type=3` → per-tenant FILES writeset (payload is `WriteSet.encode`
-//!           bytes, target store = `{data_dir}/{id}/files.db`). Used
-//!           for code manifests + deployment-pointer updates.
-//!           Blob bytes are NOT in this envelope — they live in a
-//!           shared BlobStore backend (path B: shared FS or S3).
 //!
-//! Type 1 (`log_batch`) was retired in Phase 5.5 (a) — log records
-//! flow worker → S3 (sidecar + ndjson) directly, no longer through
-//! raft. The decoder still rejects the value as `UnknownEnvelopeType`
-//! so a stale entry in someone's raft log surfaces loudly rather
-//! than silently mis-applying.
+//! Types 1 (`log_batch`) and 3 (`files_writeset`) were retired in
+//! Phase 5.5 (a) and 5.5 (e) F2-storage respectively. Log records
+//! flow worker → S3 (sidecar + ndjson) directly; per-tenant
+//! manifests live in a per-tenant `deployments/` BlobBackend, with
+//! the runtime release pointer riding envelope 0 in the customer's
+//! own app.db. The decoder rejects both values as
+//! `UnknownEnvelopeType` so any stale entry in an old raft log
+//! surfaces loudly instead of silently mis-applying.
 //!
 //! The `id` is the tenant `instance_id`. `id_len` caps at 64KB. The
 //! trailing `payload` is whatever the dispatch callback for that
@@ -73,7 +71,15 @@ pub const MAX_ID_LEN: usize = 256;
 pub const EnvelopeType = enum(u8) {
     writeset = 0,
     root_writeset = 2,
-    files_writeset = 3,
+    /// Type 3 (`files_writeset`) was retired in Phase 5.5(e)
+    /// F2-storage. Manifests live in a per-tenant `deployments/`
+    /// BlobBackend (shared via fs/s3 between leader + followers);
+    /// the runtime release pointer (`_deploy/current` in the
+    /// tenant's app.db) rides envelope 0 alongside the customer's
+    /// own kv writes. The decoder rejects type=3 with
+    /// `UnknownEnvelopeType` so any old log entries from a
+    /// pre-F2-storage deploy will trip the apply panic at startup
+    /// — that's deliberate; the migration window predates 1.0.
     /// Phase 5.5 (d) — webhook enqueue batch. Payload is a
     /// `webhook_server.encodeEnqueueBatch` blob; apply INSERTs OR
     /// IGNOREs each row into `{data_dir}/webhooks.db`. Applied on both
@@ -119,18 +125,6 @@ pub fn encodeRootWriteSetEnvelope(
     ws_bytes: []const u8,
 ) ![]u8 {
     return encodeTyped(allocator, .root_writeset, "", ws_bytes);
-}
-
-/// Build a per-tenant files writeset envelope. type=3; target is
-/// `{data_dir}/{id}/files.db` on followers. Carries manifest +
-/// deployment-pointer updates; blob bytes ride separately through a
-/// shared BlobStore backend.
-pub fn encodeFilesWriteSetEnvelope(
-    allocator: std.mem.Allocator,
-    id: []const u8,
-    ws_bytes: []const u8,
-) ![]u8 {
-    return encodeTyped(allocator, .files_writeset, id, ws_bytes);
 }
 
 /// Build a webhook enqueue batch envelope (type=4). `payload` is the
@@ -283,9 +277,6 @@ pub const ApplyCtx = struct {
     /// Lazy per-tenant KvStore cache (instance_id → *KvStore). Keys
     /// are owned copies of the instance id.
     kv_stores: std.StringHashMapUnmanaged(*kv.KvStore),
-    /// Lazy per-tenant files.db cache (instance_id → *KvStore). Parallel
-    /// to `kv_stores` but keyed at `{data_dir}/{id}/files.db`.
-    files_stores: std.StringHashMapUnmanaged(*kv.KvStore) = .empty,
     /// Lazy root-store handle for `type=2 root_writeset` applies.
     /// Opens `{data_dir}/__root__.db` on first follower-side root
     /// apply. Null on the leader path (leader-skip fires before we'd
@@ -319,13 +310,6 @@ pub const ApplyCtx = struct {
             e.value_ptr.*.close();
         }
         self.kv_stores.deinit(self.allocator);
-
-        var files_it = self.files_stores.iterator();
-        while (files_it.next()) |e| {
-            self.allocator.free(e.key_ptr.*);
-            e.value_ptr.*.close();
-        }
-        self.files_stores.deinit(self.allocator);
 
         if (self.root_store) |s| s.close();
         if (self.webhooks_store) |s| {
@@ -370,43 +354,6 @@ pub const ApplyCtx = struct {
         defer self.allocator.free(path);
         const store = try kv.KvStore.open(self.allocator, path);
         self.root_store = store;
-        return store;
-    }
-
-    /// Lazily open this tenant's files.db. Used by follower-side
-    /// apply of `type=3 files_writeset` entries. Creates the tenant
-    /// directory if it doesn't exist yet (signup-on-leader → apply-
-    /// on-follower often reaches the follower before any other
-    /// traffic has touched that tenant).
-    fn getFilesKv(self: *ApplyCtx, instance_id: []const u8) !*kv.KvStore {
-        if (self.files_stores.get(instance_id)) |existing| return existing;
-
-        const inst_dir = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{s}",
-            .{ self.data_dir, instance_id },
-        );
-        defer self.allocator.free(inst_dir);
-        std.fs.cwd().makePath(inst_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-
-        const path = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "{s}/files.db",
-            .{inst_dir},
-            0,
-        );
-        defer self.allocator.free(path);
-
-        const store = try kv.KvStore.open(self.allocator, path);
-        errdefer store.close();
-
-        const id_copy = try self.allocator.dupe(u8, instance_id);
-        errdefer self.allocator.free(id_copy);
-
-        try self.files_stores.put(self.allocator, id_copy, store);
         return store;
     }
 
@@ -460,7 +407,6 @@ fn dispatch(ctx: *ApplyCtx, env: Envelope, nesting: NestingLevel) void {
     switch (env.type) {
         .writeset => applyWriteSet(ctx, env),
         .root_writeset => applyRootWriteSet(ctx, env),
-        .files_writeset => applyFilesWriteSet(ctx, env),
         .webhook_enqueue_batch => applyWebhookEnqueueBatch(ctx, env),
         .webhook_complete => applyWebhookComplete(ctx, env),
         .webhook_retry_schedule => applyWebhookRetrySchedule(ctx, env),
@@ -489,27 +435,6 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope) void {
 
     kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
         "applyWriteSet.applyEncodedWriteSet",
-        "tenant={s} err={s}",
-        .{ env.instance_id, @errorName(err) },
-    );
-}
-
-/// Follower-only: decode the per-tenant files writeset and apply
-/// it to this node's copy of `{data_dir}/{id}/files.db`. Mirrors
-/// the per-tenant app.db path — leader-skip, then replay against
-/// the follower's files.db. Blob bytes referenced by these ops
-/// must be resolvable through the shared BlobStore backend.
-fn applyFilesWriteSet(ctx: *ApplyCtx, env: Envelope) void {
-    if (ctx.raft.isLeader()) return;
-
-    const store = ctx.getFilesKv(env.instance_id) catch |err| panic_mod.invariantViolated(
-        "applyFilesWriteSet.getFilesKv",
-        "tenant={s} err={s}",
-        .{ env.instance_id, @errorName(err) },
-    );
-
-    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
-        "applyFilesWriteSet.applyEncodedWriteSet",
         "tenant={s} err={s}",
         .{ env.instance_id, @errorName(err) },
     );
@@ -797,18 +722,6 @@ test "root writeset envelope encode/decode round trip" {
     const dec = try decodeEnvelope(enc);
     try testing.expectEqual(EnvelopeType.root_writeset, dec.type);
     try testing.expectEqualStrings("", dec.instance_id);
-    try testing.expectEqualStrings(ws, dec.payload);
-}
-
-test "files writeset envelope encode/decode round trip" {
-    const id = "acme";
-    const ws = "files ws bytes";
-    const enc = try encodeFilesWriteSetEnvelope(testing.allocator, id, ws);
-    defer testing.allocator.free(enc);
-
-    const dec = try decodeEnvelope(enc);
-    try testing.expectEqual(EnvelopeType.files_writeset, dec.type);
-    try testing.expectEqualStrings(id, dec.instance_id);
     try testing.expectEqualStrings(ws, dec.payload);
 }
 

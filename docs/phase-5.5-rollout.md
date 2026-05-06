@@ -67,7 +67,7 @@ sub-plan's migration order. No big-bang cutovers between them.
   refreshes ~once per 4 minutes). Per-tenant `log.db` and
   `Worker.log_proxy` are gone; tape body capture flows via the
   per-tenant `BlobBackend` shared between worker + standalone.
-- **(e) files-server — F1 + F2-push done; F2-storage pending.**
+- **(e) files-server — F1 + F2-push + F2-storage done.**
   Files-server runs at `https://files.{public_suffix}` with TLS +
   JWT-gated routes, reusing the same shared HMAC secret as
   log-server. Worker proxy / `code_proxy` / `ProxyTag` / `ProxyPeer`
@@ -76,21 +76,26 @@ sub-plan's migration order. No big-bang cutovers between them.
   on the worker after every successful deploy; the worker's
   process-wide `ReleaseTable` carries the signal across worker
   threads and `applyPendingReleases` triggers the bytecode reload
-  on every worker's next dispatch tick (F2-push). Polling loop +
-  `--refresh-interval-ms` flag retired. Data model unchanged —
-  files.db + envelope type 3 still in place; F2-storage retires
-  them.
-- **(c) snapshot — not started.** Waits on (a) + (e) retiring
-  envelope types 1 + 3 to reduce raft log pressure.
+  on every worker's next dispatch tick (F2-push). Manifest JSON
+  lives in a per-tenant `deployments/` BlobBackend
+  (`{dep_id:020d}.json`), shared via the same fs/s3 backend as
+  file-blobs; the runtime release pointer (`_deploy/current`) lands
+  in the tenant's app.db and rides envelope 0 through raft so cold
+  starts and follower nodes recover the active deployment without
+  files.db (F2-storage). Envelope type 3 / `applyFilesWriteSet` /
+  `ApplyCtx.files_stores` / `proposeFilesWriteSet` /
+  `FileStore.replicate` all deleted; the worker no longer opens
+  files.db at all (files-server keeps a local files.db for its own
+  working tree, but the worker reads manifests from
+  manifest_backend instead).
+- **(c) snapshot — not started.** Waits on (a) retiring envelope
+  type 1 to reduce raft log pressure (envelope 3 is already gone).
 
 **Next pickup:**
-1. **(e) F2-storage — manifest in S3, drop files.db.** Move the
-   per-tenant manifest from `{id}/files.db` (deployment/* rows) to
-   S3 at `tenants/{id}/deployments/{dep_id:020d}.json`. Worker
-   reload reads JSON via files-server HTTP instead of opening
-   files.db. Drops envelope type 3, `applyFilesWriteSet`,
-   `ApplyCtx.files_stores`, `deployStarterContent`'s writeset path,
-   files.db opens entirely. See `docs/files-server-plan.md` §3-§7.
+1. **(c) snapshot — see `docs/snapshot-plan.md`.** With (a) and
+   (e) F2-storage done, the largest remaining source of raft log
+   growth is webhook replay; snapshot work is the natural next
+   storage-scalability piece.
 
 Detail per piece below.
 
@@ -387,7 +392,7 @@ sequence). Each step is independently shippable + smoke-testable.
 
 **Sub-plan**: `docs/logs-plan.md`.
 
-### 4. Files-server architectural move — **F1 + F2-push done 2026-05-06; F2-storage pending**
+### 4. Files-server architectural move — **F1 + F2-push + F2-storage done 2026-05-06**
 
 **What it delivers**: files-server moves to its own subdomain
 (`files.{public_suffix}`), the runtime release signal becomes a
@@ -441,13 +446,28 @@ Smokes (`ctl_smoke.sh`, `triggers_smoke.sh`, `replay_smoke.sh`,
 files-server deploy. Multi-node propagation deferred; today's
 single-node deployments work as designed.
 
-**F2-storage — pending.** Move the per-tenant manifest from
-`{id}/files.db` (deployment/* rows) to S3 at
-`tenants/{id}/deployments/{dep_id:020d}.json`. Worker reload
-reads JSON via files-server HTTP instead of opening files.db.
-Drops envelope type 3, `applyFilesWriteSet`,
-`ApplyCtx.files_stores`, `deployStarterContent`'s writeset path,
-files.db opens entirely. See `docs/files-server-plan.md` §3-§7.
+**F2-storage — done 2026-05-06.** Manifests landed in a per-tenant
+`deployments/` BlobBackend (`tenants/{id}/deployments/{N:020d}.json`
+in s3 mode, `{inst.dir}/deployments/{N:020d}.json` on fs). Files-
+server's `deploy` paths now `assembleManifest` from the working
+tree, encode JSON via `files.manifest_json.encode`, write to the
+manifest backend, and bump a local `deployment/current` next-id
+counter in files.db (files-server-private; not replicated). The
+runtime release pointer lives in the tenant's app.db at
+`_deploy/current`; the `/_system/release` POST commits it locally
+and proposes envelope 0 so followers' apply path picks it up.
+Worker `openTenantFiles` opens a per-tenant `manifest_backend`
+alongside `blob_backend`, drops `files_kv` + `store` + the files.db
+open entirely, reads `_deploy/current` from `inst.kv` on cold-load
+and parses `{dep_id:020d}.json` into the active maps. Envelope
+type 3 (`files_writeset`) gone; `applyFilesWriteSet`,
+`ApplyCtx.files_stores`, `getFilesKv`, `proposeFilesWriteSet`,
+`encodeFilesWriteSetEnvelope`, `FileStore.replicate`,
+`FileStore.setReplicate`, `FileStore.deploy`,
+`FileStore.loadCurrentDeployment`, `FileStore.loadDeployment` all
+deleted. `deployStarterContent` writes the starter manifest to
+manifest_backend and stages `_deploy/current=1` into a writeset
+the trampoline commits + proposes via envelope 0.
 
 **Definition of done**: see `docs/files-server-plan.md` §9
 "Migration order."

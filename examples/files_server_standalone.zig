@@ -85,7 +85,6 @@ pub fn main() !void {
         .blob_cfg = .fs,
         .bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
         .jwt_secret = jwt_secret,
-        .raft = null,
         .max_connections = 32,
     });
     defer handle.shutdown();

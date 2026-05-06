@@ -404,14 +404,11 @@ pub const DeployResult = struct {
 /// changed — or use the single-file `putFileAndDeploy` convenience.
 ///
 /// `expected_parent_id`:
-///   - non-null  → CAS: require `deployment/current` to equal this
-///     value (0 means "no deployment yet"). Rejects with
-///     `Error.CasConflict` if the tree has moved.
+///   - non-null  → CAS: require `deployment/current` (the local
+///     next-id counter) to equal this value (0 means "no deployment
+///     yet"). Rejects with `Error.CasConflict` if the tree has moved.
 ///   - null      → skip the check (client doesn't care about
 ///     concurrent deploys).
-///
-/// All index writes go through `replicate` if provided so the
-/// follower's files.db converges.
 pub fn deployManifest(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
@@ -419,7 +416,6 @@ pub fn deployManifest(
     instance_id: []const u8,
     entries: []const DeployEntry,
     expected_parent_id: ?u64,
-    replicate: ?*kv_mod.WriteSet,
 ) Error!DeployResult {
     var compiler: InlineCompiler = undefined;
     try compiler.init(allocator);
@@ -431,24 +427,16 @@ pub fn deployManifest(
 
     // ── CAS check: read current deployment pointer BEFORE any write.
     //
-    // `deployment/current` is the hex-encoded u64 id of the active
-    // deploy, or missing when nothing has shipped yet. If the caller
-    // passed a non-null parent_id, we demand equality.
-    const current_parsed: u64 = blk: {
-        const cur_bytes = h.files_kv.get("deployment/current") catch |err| switch (err) {
-            error.NotFound => break :blk 0,
-            else => return Error.Kv,
-        };
-        defer allocator.free(cur_bytes);
-        break :blk std.fmt.parseInt(u64, cur_bytes, 16) catch return Error.InvalidManifest;
-    };
+    // `deployment/current` is files-server's local next-id counter
+    // (NOT the runtime release pointer — that lives in the customer's
+    // app.db at `_deploy/current`). For deploy CAS we want "did the
+    // client base its parent_id on the same upload-tree we're about
+    // to mutate?", so the local counter is the right comparison.
+    const current_parsed: u64 = h.store.currentDeploymentId() catch |err|
+        return mapCodeError(err);
     if (expected_parent_id) |want| {
         if (want != current_parsed) return Error.CasConflict;
     }
-
-    // ── Attach the replication writeset AFTER CAS so a rejected
-    // deploy doesn't leave partial entries in the writeset.
-    h.store.setReplicate(replicate);
 
     // ── Full-replace: drop any existing file/* entries so paths
     // removed from the manifest actually disappear from the new
@@ -492,9 +480,71 @@ pub fn deployManifest(
         }
     }
 
-    // ── Stamp deployment/{next} + update current.
-    const next_id = h.store.deploy() catch |err| return mapCodeError(err);
+    const next_id = try writeManifestFromWorkingTree(allocator, &h, data_dir, blob_cfg, instance_id, current_parsed);
     return .{ .id = next_id, .parent_id = current_parsed };
+}
+
+/// Snapshot the working tree, JSON-encode it as the manifest for
+/// `current + 1`, write it to the per-tenant `deployments/`
+/// BlobBackend, and bump the local next-id counter. Returns the
+/// new deployment id.
+///
+/// Caller must have already mutated the working tree (clearFileEntries
+/// + putSourceByHash / putStaticByHash) and verified CAS. This helper
+/// exists so the deploy paths share the manifest-write tail.
+fn writeManifestFromWorkingTree(
+    allocator: std.mem.Allocator,
+    h: *InstanceCtx,
+    data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
+    instance_id: []const u8,
+    current_id: u64,
+) Error!u64 {
+    const next_id = current_id + 1;
+
+    const entries = h.store.assembleManifest() catch |err| return mapCodeError(err);
+    defer h.store.freeEntries(entries);
+
+    const json_bytes = files_mod.manifest_json.encode(allocator, next_id, entries) catch
+        return Error.OutOfMemory;
+    defer allocator.free(json_bytes);
+
+    var manifest_be = openManifestBackend(allocator, data_dir, blob_cfg, instance_id) catch
+        return Error.Blob;
+    defer manifest_be.deinit();
+
+    var key_buf: [25]u8 = undefined;
+    const key = files_mod.manifest_json.manifestKey(&key_buf, next_id);
+    manifest_be.blobStore().put(key, json_bytes) catch return Error.Blob;
+
+    h.store.setCurrentDeploymentId(next_id) catch |err| return mapCodeError(err);
+    return next_id;
+}
+
+/// Open a per-tenant BlobBackend for manifest objects (subdir
+/// `deployments`). Caller frees with `deinit`. Wires through the
+/// same `BackendConfig` as the file-blobs backend so leader and
+/// followers see identical keys (fs: `{data_dir}/{id}/deployments/`,
+/// s3: `{base}{id}/deployments/`).
+fn openManifestBackend(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
+    instance_id: []const u8,
+) !blob_mod.BlobBackend {
+    const fs_dir = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/deployments",
+        .{ data_dir, instance_id },
+    );
+    defer allocator.free(fs_dir);
+    return blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        blob_cfg,
+        fs_dir,
+        instance_id,
+        "deployments",
+    );
 }
 
 /// Upload a single source file into the tenant's working tree.
@@ -559,11 +609,6 @@ pub fn putFileAndDeploy(
     path: []const u8,
     body: []const u8,
     content_type: []const u8,
-    /// When non-null, every files.db write this call performs is
-    /// mirrored into the writeset so the caller can propose it
-    /// through raft. Null = single-node / test mode, leader-local
-    /// writes only.
-    replicate: ?*kv_mod.WriteSet,
 ) Error!u64 {
     const kind: files_mod.Kind = blk: {
         if (std.mem.startsWith(u8, path, "_static/")) break :blk .static;
@@ -578,21 +623,23 @@ pub fn putFileAndDeploy(
         var h: InstanceCtx = undefined;
         try h.init(allocator, data_dir, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
         defer h.deinit();
-        h.store.setReplicate(replicate);
         h.store.putSource(path, body) catch |err| return mapCodeError(err);
-        return h.store.deploy() catch |err| mapCodeError(err);
+        const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
+        return writeManifestFromWorkingTree(allocator, &h, data_dir, blob_cfg, instance_id, cur);
     } else {
         var h: InstanceCtx = undefined;
         try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
         defer h.deinit();
-        h.store.setReplicate(replicate);
         h.store.putStatic(path, body, content_type) catch |err| return mapCodeError(err);
-        return h.store.deploy() catch |err| mapCodeError(err);
+        const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
+        return writeManifestFromWorkingTree(allocator, &h, data_dir, blob_cfg, instance_id, cur);
     }
 }
 
-/// Snapshot the current working tree into a new deployment and swap
-/// `deployment/current`. Returns the new deployment id.
+/// Snapshot the current working tree into a new deployment manifest
+/// and bump the local next-id counter. Returns the new deployment id.
+/// The manifest lands in the per-tenant `deployments/` BlobBackend;
+/// activating it on the worker is a separate `/_system/release` call.
 pub fn deploy(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
@@ -606,7 +653,8 @@ pub fn deploy(
     try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
-    return h.store.deploy() catch |err| mapCodeError(err);
+    const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
+    return writeManifestFromWorkingTree(allocator, &h, data_dir, blob_cfg, instance_id, cur);
 }
 
 /// Fetch a source blob by its content hash. Read-only — used by the
@@ -643,32 +691,51 @@ pub fn getSourceByHash(
 
 /// Load a deployment's manifest (list of entries with source + bytecode
 /// hashes). Read-only. Used by the bundle/replay path to enumerate the
-/// files the browser may need to fetch.
+/// files the browser may need to fetch. Reads JSON from the per-tenant
+/// `deployments/` BlobBackend.
 pub fn loadDeployment(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     deployment_id: u64,
-) Error!files_mod.FileStore.Manifest {
-    var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
-    defer h.deinit();
+) Error!files_mod.manifest_json.Manifest {
+    try validateInstanceId(instance_id);
 
-    return h.store.loadDeployment(deployment_id) catch |err| mapCodeError(err);
+    var manifest_be = openManifestBackend(allocator, data_dir, blob_cfg, instance_id) catch
+        return Error.Blob;
+    defer manifest_be.deinit();
+
+    var key_buf: [25]u8 = undefined;
+    const key = files_mod.manifest_json.manifestKey(&key_buf, deployment_id);
+    const json_bytes = manifest_be.blobStore().get(key, allocator) catch |err| switch (err) {
+        error.NotFound => return Error.NotFound,
+        else => return Error.Blob,
+    };
+    defer allocator.free(json_bytes);
+
+    return files_mod.manifest_json.decode(allocator, json_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return Error.OutOfMemory,
+        else => return Error.InvalidManifest,
+    };
 }
 
-/// Load the currently-active deployment manifest.
+/// Load the latest manifest files-server has on file (the local
+/// next-id counter's previous value). Used by the bundle / replay
+/// path's "what's the deployment?" query. Returns `Error.NotFound`
+/// when no deploy has shipped yet.
 pub fn loadCurrentManifest(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
-) Error!files_mod.FileStore.Manifest {
+) Error!files_mod.manifest_json.Manifest {
     var h: InstanceCtx = undefined;
     try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
-    return h.store.loadCurrentDeployment() catch |err| mapCodeError(err);
+    const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
+    if (cur == 0) return Error.NotFound;
+    return loadDeployment(allocator, data_dir, blob_cfg, instance_id, cur);
 }
 
 pub const FileContent = struct {

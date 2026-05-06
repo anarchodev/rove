@@ -42,36 +42,11 @@ const std = @import("std");
 const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
-const kv = @import("rove-kv");
 const blob_mod = @import("rove-blob");
 const jwt = @import("rove-jwt");
 
 const files_server = @import("root.zig");
 const files_mod = @import("rove-files");
-
-/// Raft envelope type byte matching `rove-js/apply.zig`
-/// `EnvelopeType.files_writeset = 3`. Duplicated here (tiny,
-/// stable wire-format constant) to avoid a files-server → rove-js
-/// import cycle — rove-js already depends on rove-files-server for
-/// its `/_system/files/*` proxy. Keep the two in sync; the apply
-/// side is the authority.
-const ENVELOPE_TYPE_FILES_WRITESET: u8 = 3;
-const ENVELOPE_MAX_ID_LEN: usize = 256;
-
-fn encodeFilesWriteSetEnvelope(
-    allocator: std.mem.Allocator,
-    instance_id: []const u8,
-    ws_bytes: []const u8,
-) ![]u8 {
-    if (instance_id.len > ENVELOPE_MAX_ID_LEN) return error.OutOfMemory;
-    const total = 1 + 2 + instance_id.len + ws_bytes.len;
-    const out = try allocator.alloc(u8, total);
-    out[0] = ENVELOPE_TYPE_FILES_WRITESET;
-    std.mem.writeInt(u16, out[1..3], @intCast(instance_id.len), .big);
-    @memcpy(out[3 .. 3 + instance_id.len], instance_id);
-    @memcpy(out[3 + instance_id.len ..], ws_bytes);
-    return out;
-}
 
 const CodeH2 = h2.H2(.{});
 
@@ -103,10 +78,6 @@ pub const Config = struct {
     /// at `https://files.{suffix}` cross-origin; the browser refuses
     /// the response without a matching CORS header. Null = no CORS.
     cors_origin: ?[]const u8 = null,
-    /// Raft node to propose files.db writesets through. When null,
-    /// writes apply locally only — fine for single-node dev smoke
-    /// tests, broken for multi-node correctness. Borrowed.
-    raft: ?*kv.RaftNode = null,
     /// Max concurrent inbound h2 connections this server accepts.
     /// Sized from the worker count at spawn time.
     max_connections: u32 = 64,
@@ -567,12 +538,6 @@ fn handleDeployments(
         };
     }
 
-    // Collect writes into a files writeset; propose through raft if
-    // the caller wired one. Deploy failures never propose (we clean
-    // up the writeset on any early return).
-    var files_ws = kv.WriteSet.init(allocator);
-    defer files_ws.deinit();
-
     const result = files_server.deployManifest(
         allocator,
         cfg.data_dir,
@@ -580,7 +545,6 @@ fn handleDeployments(
         instance_id,
         entries.items,
         expected_parent,
-        &files_ws,
     ) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.InvalidInstanceId,
@@ -596,24 +560,6 @@ fn handleDeployments(
         try setResponse(server, cfg, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
-
-    // Replicate to followers. Leader-local writes are already in
-    // files.db; this is the raft-side of the same thing.
-    if (cfg.raft) |r| {
-        if (files_ws.ops.items.len > 0) {
-            const ws_bytes = try files_ws.encode(allocator);
-            defer allocator.free(ws_bytes);
-            const envelope = try encodeFilesWriteSetEnvelope(allocator, instance_id, ws_bytes);
-            defer allocator.free(envelope);
-            const seq = r.highWatermark() + 1;
-            r.propose(seq, envelope) catch |err| {
-                std.log.warn(
-                    "rove-files-server: propose files writeset for {s} failed: {s} (leader deployed, followers may diverge)",
-                    .{ instance_id, @errorName(err) },
-                );
-            };
-        }
-    }
 
     const body_out = try std.fmt.allocPrint(
         allocator,
@@ -890,9 +836,6 @@ fn handlePutFile(
     }
     const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
 
-    var files_ws = kv.WriteSet.init(allocator);
-    defer files_ws.deinit();
-
     const dep_id = files_server.putFileAndDeploy(
         allocator,
         cfg.data_dir,
@@ -901,7 +844,6 @@ fn handlePutFile(
         file_path,
         body,
         content_type,
-        &files_ws,
     ) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.InvalidPath => 400,
@@ -917,28 +859,6 @@ fn handlePutFile(
         try setResponse(server, cfg, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
-
-    // Replicate the files.db writes to followers so their copy of
-    // `{id}/files.db` lines up with this deployment. Blob bytes live
-    // in the shared BlobStore backend; only the manifest rows need
-    // the raft hop. On propose failure the leader's files.db still
-    // has the deployment locally — at-least-once semantics match
-    // the outbox + root paths.
-    if (cfg.raft) |r| {
-        if (files_ws.ops.items.len > 0) {
-            const ws_bytes = try files_ws.encode(allocator);
-            defer allocator.free(ws_bytes);
-            const envelope = try encodeFilesWriteSetEnvelope(allocator, instance_id, ws_bytes);
-            defer allocator.free(envelope);
-            const seq = r.highWatermark() + 1;
-            r.propose(seq, envelope) catch |err| {
-                std.log.warn(
-                    "rove-files-server: propose files writeset for {s} failed: {s} (leader has the deploy, followers may diverge)",
-                    .{ instance_id, @errorName(err) },
-                );
-            };
-        }
-    }
 
     const body_out = try std.fmt.allocPrint(allocator, "{d}\n", .{dep_id});
     try setResponse(server, cfg, ent, sid, sess, 201, body_out.ptr, body_out);

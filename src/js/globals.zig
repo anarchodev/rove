@@ -170,10 +170,11 @@ pub const DispatchState = struct {
     instance_id: []const u8 = "",
     /// Trampoline backing `platform.instances.deployStarter(name)`.
     /// Worker provides a concrete fn that can cast `ctx` back to
-    /// its specific `*Worker(opts)` type, opens the target's
-    /// files.db, runs the deploy, and proposes the resulting files
-    /// writeset through raft. Null on test paths without a worker;
-    /// the JS callable throws a clear error in that case.
+    /// its specific `*Worker(opts)` type, deploys the embedded
+    /// starter content into the target tenant's manifest_backend,
+    /// and proposes `_deploy/current = 1` through raft envelope 0.
+    /// Null on test paths without a worker; the JS callable throws
+    /// a clear error in that case.
     deploy_starter: ?*const fn (
         ctx: *anyopaque,
         allocator: std.mem.Allocator,
@@ -812,9 +813,9 @@ fn jsPlatformInstancesCreate(
 
 /// `platform.instances.deployStarter(name)` — admin-only. Writes
 /// the embedded starter content (`index.mjs` + `_static/index.html`)
-/// into the target instance's files.db + file-blobs/, then proposes
-/// the resulting files writeset through raft so followers see the
-/// same deployment.
+/// into the target instance's `file-blobs/` + writes a manifest
+/// JSON to `deployments/`, then proposes `_deploy/current = 1`
+/// through raft so followers see the active deployment.
 ///
 /// Sealed primitive in v1: starter content is platform-baked
 /// (`STARTER_INDEX_MJS` / `STARTER_STATIC_INDEX_HTML` in worker.zig),

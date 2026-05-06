@@ -1108,7 +1108,6 @@ pub fn main() !void {
         .tls_config = tls_config,
         .jwt_secret = &services_jwt_secret,
         .cors_origin = cli.admin_origin,
-        .raft = raft_node,
         .max_connections = subsystem_max_connections,
     });
     defer cs_handle.shutdown();
@@ -1294,7 +1293,47 @@ pub fn bootstrapHandler(
             try store.putSource(f.path, f.content);
         }
     }
-    _ = try store.deploy();
+
+    // Phase 5.5(e) F2-storage — assemble the manifest, JSON-encode,
+    // write it to the per-tenant `deployments/` BlobBackend, then
+    // bump the local files.db next-id counter. The release pointer
+    // (`_deploy/current` in the tenant's app.db) is set further down
+    // in `bootstrapTenants` so the worker eagerly loads this
+    // bootstrap deployment on first openTenantFiles().
+    const cur = try store.currentDeploymentId();
+    const next_id = cur + 1;
+
+    const entries = try store.assembleManifest();
+    defer store.freeEntries(entries);
+
+    const json_bytes = try files_mod.manifest_json.encode(allocator, next_id, entries);
+    defer allocator.free(json_bytes);
+
+    const manifest_dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}/deployments", .{ data_dir, instance_id });
+    defer allocator.free(manifest_dir_path);
+    var manifest_be = try blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        blob_cfg,
+        manifest_dir_path,
+        instance_id,
+        "deployments",
+    );
+    defer manifest_be.deinit();
+
+    var key_buf: [25]u8 = undefined;
+    const key = files_mod.manifest_json.manifestKey(&key_buf, next_id);
+    try manifest_be.blobStore().put(key, json_bytes);
+
+    try store.setCurrentDeploymentId(next_id);
+
+    // Write the release pointer so the worker eager-opens this deploy.
+    const app_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{inst_dir}, 0);
+    defer allocator.free(app_db_path);
+    const app_kv = try kv.KvStore.open(allocator, app_db_path);
+    defer app_kv.close();
+    var current_buf: [16]u8 = undefined;
+    const current_hex = try std.fmt.bufPrint(&current_buf, "{x:0>16}", .{next_id});
+    try app_kv.put("_deploy/current", current_hex);
 }
 
 // The admin UI bundle is embedded into the binary so a fresh start

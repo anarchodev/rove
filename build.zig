@@ -458,28 +458,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(qjs_bench);
 
-    // code-cli: local driver for rove-files. Wires rove-qjs in as the
-    // compile hook and runs against a local KvStore + fs BlobStore.
-    // Also houses the rove-files × rove-qjs integration tests.
-    const files_cli_mod = b.addModule("rove-files-cli", .{
-        .root_source_file = b.path("examples/files_cli.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    files_cli_mod.addImport("rove-qjs", qjs_mod);
-    files_cli_mod.addImport("rove-files", files_mod);
-    files_cli_mod.addImport("rove-kv", kv_mod);
-    files_cli_mod.addImport("rove-blob", blob_mod);
-
-    const files_cli = b.addExecutable(.{
-        .name = "rove-files-cli",
-        .root_module = files_cli_mod,
-    });
-    b.installArtifact(files_cli);
-
-    const code_cli_tests = b.addTest(.{ .root_module = files_cli_mod });
-    test_step.dependOn(&b.addRunArtifact(code_cli_tests).step);
-
     // files-server-standalone: spawns the rove-files-server thread and
     // idles. Exists so the smoke test can drive it from curl.
     const cs_standalone_mod = b.addModule("files-server-standalone", .{

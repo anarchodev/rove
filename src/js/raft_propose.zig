@@ -37,7 +37,6 @@ fn proposeEncoded(
 
     const envelope = try switch (kind) {
         .writeset => apply_mod.encodeWriteSetEnvelope(allocator, instance_id, ws_bytes),
-        .files_writeset => apply_mod.encodeFilesWriteSetEnvelope(allocator, instance_id, ws_bytes),
         .root_writeset => apply_mod.encodeRootWriteSetEnvelope(allocator, ws_bytes),
         .webhook_enqueue_batch,
         .webhook_complete,
@@ -61,22 +60,6 @@ pub fn proposeWriteSet(
     instance_id: []const u8,
 ) !u64 {
     return proposeEncoded(worker, writeset, .writeset, instance_id, false);
-}
-
-/// Per-tenant files.db writeset (envelope type=3). Used by
-/// `deployStarterContent` and the files-server's upload + deploy
-/// endpoints. Followers replay onto their copy of
-/// `{data_dir}/{id}/files.db`. Blob bytes are NOT in the envelope —
-/// multi-node setups need a shared BlobStore backend.
-///
-/// No-op fast path for empty writesets: returns seq=0 so callers
-/// don't park on a meaningless raft entry.
-pub fn proposeFilesWriteSet(
-    worker: anytype,
-    writeset: *const kv_mod.WriteSet,
-    instance_id: []const u8,
-) !u64 {
-    return proposeEncoded(worker, writeset, .files_writeset, instance_id, true);
 }
 
 /// Root writeset (envelope type=2). Followers apply to their own

@@ -207,16 +207,22 @@ pub const TenantFiles = struct {
     /// `tenant_files_map` map; owning it here keeps that map's lifetime
     /// self-contained.
     instance_id: []u8,
-    /// Owned tenant code index (SQLite at `{inst.dir}/files.db`).
-    files_kv: *kv_mod.KvStore,
-    /// Owned blob backend. With `.fs` config: opens at
-    /// `{inst.dir}/file-blobs/`. With `.s3`: shares the bucket with
-    /// every other tenant on this node, scoped by key prefix
-    /// `{base}{inst.id}/file-blobs/`.
+    /// Borrowed pointer to the tenant's app.db — used to read
+    /// `_deploy/current` (set by the release POST, replicated via
+    /// envelope 0). Phase 5.5(e) F2-storage retired the per-tenant
+    /// `files.db` on the worker entirely; the worker never opens
+    /// files-server's local working tree.
+    app_kv: *kv_mod.KvStore,
+    /// Owned blob backend for the file-blobs (source + bytecode bytes).
+    /// With `.fs` config: opens at `{inst.dir}/file-blobs/`. With
+    /// `.s3`: shares the bucket with every other tenant on this node,
+    /// scoped by key prefix `{base}{inst.id}/file-blobs/`.
     blob_backend: blob_mod.BlobBackend,
-    /// rove-files wrapper over `files_kv` + `blob_backend`. Compile hook
-    /// is a stub — the worker only reads, never uploads.
-    store: files_mod.FileStore,
+    /// Owned blob backend for per-deployment manifest JSON. Same fs/
+    /// s3 picker as `blob_backend`, just a different per-tenant
+    /// subdir (`deployments/`). Files-server writes here at deploy
+    /// time; the worker reads here on `applyPendingReleases`.
+    manifest_backend: blob_mod.BlobBackend,
     /// Deployment id we last loaded. `0` = no deployment observed yet.
     current_deployment_id: u64,
     /// All handler bytecodes from the active deployment, keyed by the
@@ -673,15 +679,13 @@ pub fn Worker(comptime opts: Options) type {
         /// pair lets globals.zig invoke this without depending on
         /// the generic `Worker(opts)` type — the caller passes the
         /// `*anyopaque` it received as `ctx`, we cast back to
-        /// `*Self`, and run the same open-files.db + FileStore +
-        /// putSource + putStatic + deploy + propose dance the Zig
-        /// signup path does today.
+        /// `*Self`, and run starter-deploy with envelope-0 propose
+        /// for the `_deploy/current` release pointer.
         ///
         /// Returns `error.InstanceNotFound` if `target_id` doesn't
         /// resolve, `error.CompileFnUnavailable` if this worker has
         /// no compile callback wired (library mode). Other errors
-        /// propagate from `deployStarterContent` /
-        /// `proposeFilesWriteSet`.
+        /// propagate from `deployStarterContent`.
         pub fn deployStarterTrampoline(
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
@@ -694,8 +698,13 @@ pub fn Worker(comptime opts: Options) type {
             const compile_fn = self.compile_fn orelse
                 return error.CompileFnUnavailable;
 
-            var files_ws = kv_mod.WriteSet.init(allocator);
-            defer files_ws.deinit();
+            // `deployStarterContent` writes the manifest JSON to the
+            // tenant's `deployments/` BlobBackend on disk, then
+            // stages `_deploy/current = 1` into `release_ws`. We
+            // commit that write locally + propose envelope 0 so
+            // followers see the release pointer too.
+            var release_ws = kv_mod.WriteSet.init(allocator);
+            defer release_ws.deinit();
             try deployStarterContent(
                 allocator,
                 inst.dir,
@@ -703,9 +712,29 @@ pub fn Worker(comptime opts: Options) type {
                 self.blob_backend_cfg,
                 compile_fn,
                 self.compile_ctx,
-                &files_ws,
+                &release_ws,
             );
-            _ = try proposeFilesWriteSet(self, &files_ws, target_id);
+
+            var txn = try inst.kv.beginTrackedImmediate();
+            errdefer txn.rollback() catch {};
+            for (release_ws.ops.items) |op| switch (op) {
+                .put => |p| try txn.put(p.key, p.value),
+                .delete => |d| try txn.delete(d.key),
+            };
+            try txn.commit();
+
+            _ = raft_propose.proposeWriteSet(self, &release_ws, target_id) catch |err| {
+                std.log.warn(
+                    "deployStarter: propose envelope 0 for {s} _deploy/current failed: {s}",
+                    .{ target_id, @errorName(err) },
+                );
+            };
+            inst.kv.commitTxn(txn.txn_seq) catch |err| {
+                std.log.warn(
+                    "deployStarter: commitTxn for {s} failed: {s}",
+                    .{ target_id, @errorName(err) },
+                );
+            };
         }
 
     };
@@ -713,11 +742,12 @@ pub fn Worker(comptime opts: Options) type {
 
 // ── Per-tenant code loading ───────────────────────────────────────────
 //
-// These helpers open a tenant's code store (`{inst.dir}/files.db` +
-// `{inst.dir}/file-blobs/`) and load the active handler bytecode.
-// Called eagerly during `Worker.create` for every registered instance,
-// and by `refreshDeployments` when a tenant's `deployment/current`
-// advances.
+// These helpers open a tenant's blob backends (`{inst.dir}/file-blobs/`
+// for source + bytecode bytes, `{inst.dir}/deployments/` for manifest
+// JSON) and load the active deployment from the tenant's app.db
+// `_deploy/current` pointer. Called eagerly during `Worker.create` for
+// every registered instance, and by `applyPendingReleases` whenever
+// the dashboard / CLI pushes a new release into the `ReleaseTable`.
 
 /// Open (or re-use) a tenant code state. Allocates a `*TenantFiles`
 /// and attempts to load the current deployment's handler bytecode.
@@ -747,23 +777,12 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
         );
     };
 
-    const files_db_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/files.db",
-        .{inst.dir},
-        0,
-    );
-    defer allocator.free(files_db_path);
-
     const files_blob_dir = try std.fmt.allocPrint(
         allocator,
         "{s}/file-blobs",
         .{inst.dir},
     );
     defer allocator.free(files_blob_dir);
-
-    const files_kv = try kv_mod.KvStore.open(allocator, files_db_path);
-    errdefer files_kv.close();
 
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
@@ -774,6 +793,22 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
     );
     errdefer blob_backend.deinit();
 
+    const manifest_dir = try std.fmt.allocPrint(
+        allocator,
+        "{s}/deployments",
+        .{inst.dir},
+    );
+    defer allocator.free(manifest_dir);
+
+    var manifest_backend = try blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        worker.blob_backend_cfg,
+        manifest_dir,
+        inst.id,
+        "deployments",
+    );
+    errdefer manifest_backend.deinit();
+
     const id_copy = try allocator.dupe(u8, inst.id);
     errdefer allocator.free(id_copy);
 
@@ -782,9 +817,9 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
     tc.* = .{
         .allocator = allocator,
         .instance_id = id_copy,
-        .files_kv = files_kv,
+        .app_kv = inst.kv,
         .blob_backend = blob_backend,
-        .store = undefined, // filled after we have a stable `tc` pointer
+        .manifest_backend = manifest_backend,
         .current_deployment_id = 0,
         .bytecodes = .empty,
         .source_hashes = .empty,
@@ -793,18 +828,12 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
         .sse_connections = .empty,
         .dirty_sids = .empty,
     };
-    tc.store = files_mod.FileStore.init(
-        allocator,
-        tc.files_kv,
-        tc.blob_backend.blobStore(),
-        stubCompile,
-        null,
-    );
 
-    // Best-effort initial load. If there's no deployment yet, we log
-    // and leave `bytecodes` empty. Real errors (corrupt store, I/O
-    // failure) fall through as an error so the caller can decide
-    // whether to proceed.
+    // Best-effort initial load. Read `_deploy/current` from the
+    // tenant's app.db (set by release POST + replicated via raft);
+    // load that manifest from manifest_backend. If absent, log and
+    // leave `bytecodes` empty — requests get 503 until the dashboard
+    // pushes a release.
     reloadAllBytecodes(tc) catch |err| switch (err) {
         error.NoDeployment => {
             std.log.info(
@@ -831,8 +860,8 @@ fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
     var ds_it = tc.dirty_sids.iterator();
     while (ds_it.next()) |entry| allocator.free(entry.key_ptr.*);
     tc.dirty_sids.deinit(allocator);
+    tc.manifest_backend.deinit();
     tc.blob_backend.deinit();
-    tc.files_kv.close();
     allocator.free(tc.instance_id);
     allocator.destroy(tc);
 }
@@ -1291,10 +1320,34 @@ fn freeTriggers(tc: *TenantFiles) void {
 /// when no deploy has been made yet — soft failure the caller treats
 /// as "leave the maps empty".
 fn reloadAllBytecodes(tc: *TenantFiles) !void {
-    var manifest = tc.store.loadCurrentDeployment() catch |err| switch (err) {
+    // Read the release pointer from the tenant's app.db. Set by
+    // /_system/release (replicated through raft envelope 0); absent
+    // for tenants that haven't been released yet.
+    const cur_bytes = tc.app_kv.get("_deploy/current") catch |err| switch (err) {
         error.NotFound => return error.NoDeployment,
         else => return err,
     };
+    defer tc.allocator.free(cur_bytes);
+    const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch return error.NoDeployment;
+    return reloadDeployment(tc, dep_id);
+}
+
+/// Pull a specific deployment manifest from the per-tenant
+/// `deployments/` BlobBackend, fetch every referenced bytecode, and
+/// atomically swap the maps on `tc`. Used by `reloadAllBytecodes`
+/// (cold start / restart) and by `applyPendingReleases` (the
+/// dashboard pushed a new release).
+fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
+    var key_buf: [25]u8 = undefined;
+    const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+    const json_bytes = tc.manifest_backend.blobStore().get(key, tc.allocator) catch |err| switch (err) {
+        error.NotFound => return error.NoDeployment,
+        else => return err,
+    };
+    defer tc.allocator.free(json_bytes);
+
+    var manifest = files_mod.manifest_json.decode(tc.allocator, json_bytes) catch
+        return error.InvalidManifest;
     defer manifest.deinit();
 
     const bs = tc.blob_backend.blobStore();
@@ -1441,7 +1494,12 @@ pub fn applyPendingReleases(worker: anytype) !void {
         const released = table.get(tc.instance_id) orelse continue;
         if (released == tc.current_deployment_id) continue;
 
-        reloadAllBytecodes(tc) catch |err| {
+        // Load the manifest the table named — NOT `_deploy/current`
+        // from the kv. The dashboard / CLI is the source of truth at
+        // release time; the kv copy is for cold-start recovery only.
+        // Reading from kv here would let in-flight envelope-0 apply
+        // delays bounce the worker between old and new manifests.
+        reloadDeployment(tc, released) catch |err| {
             std.log.warn(
                 "rove-js release: tenant {s} reload to {d} failed: {s}",
                 .{ tc.instance_id, released, @errorName(err) },
@@ -1602,7 +1660,6 @@ pub fn drainRaftPending(worker: anytype) !void {
 }
 
 pub const proposeWriteSet = raft_propose.proposeWriteSet;
-pub const proposeFilesWriteSet = raft_propose.proposeFilesWriteSet;
 pub const proposeRootWriteSet = raft_propose.proposeRootWriteSet;
 
 
@@ -1759,16 +1816,14 @@ const STARTER_STATIC_INDEX_HTML =
 /// out — the main worker and files-server lazy-open their own
 /// connections later, so we're not holding onto any state that would
 /// conflict.
-/// Deploy the embedded starter bundle into a freshly-created
-/// instance. Writes source + static blobs to the instance's
-/// file-blobs/, stamps manifest entries in files.db, and
-/// commits a deployment row pointing at them.
-///
-/// When `replicate` is non-null, every files.db write is mirrored
-/// into the writeset so the caller can propose it through raft
-/// (see `proposeFilesWriteSet`). Blob bytes are written to disk
-/// locally on the leader and are expected to live in a shared
-/// BlobStore backend for multi-node visibility.
+/// Drop the starter content into the freshly-created tenant's
+/// working tree, encode the resulting manifest as JSON, write it to
+/// the per-tenant `deployments/` BlobBackend, and stage a `_deploy/
+/// current = 1` write into `release_ws` so the caller can propose
+/// it through raft alongside the rest of the signup writeset.
+/// Phase 5.5(e) F2-storage retired the per-tenant files writeset
+/// (envelope 3); the runtime release pointer rides envelope 0 with
+/// the rest of the customer kv writes.
 fn deployStarterContent(
     allocator: std.mem.Allocator,
     inst_dir: []const u8,
@@ -1776,7 +1831,7 @@ fn deployStarterContent(
     blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
-    replicate: ?*kv_mod.WriteSet,
+    release_ws: *kv_mod.WriteSet,
 ) !void {
     const files_db_path = try std.fmt.allocPrintSentinel(
         allocator,
@@ -1812,11 +1867,44 @@ fn deployStarterContent(
         compile_fn,
         compile_ctx,
     );
-    store.setReplicate(replicate);
 
     try store.putSource("index.mjs", STARTER_INDEX_MJS);
     try store.putStatic("_static/index.html", STARTER_STATIC_INDEX_HTML, "text/html; charset=utf-8");
-    _ = try store.deploy();
+
+    const cur = try store.currentDeploymentId();
+    const next_id = cur + 1;
+
+    const entries = try store.assembleManifest();
+    defer store.freeEntries(entries);
+
+    const json_bytes = try files_mod.manifest_json.encode(allocator, next_id, entries);
+    defer allocator.free(json_bytes);
+
+    const manifest_dir = try std.fmt.allocPrint(allocator, "{s}/deployments", .{inst_dir});
+    defer allocator.free(manifest_dir);
+    var manifest_be = try blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        blob_cfg,
+        manifest_dir,
+        inst_id,
+        "deployments",
+    );
+    defer manifest_be.deinit();
+
+    var key_buf: [25]u8 = undefined;
+    const key = files_mod.manifest_json.manifestKey(&key_buf, next_id);
+    try manifest_be.blobStore().put(key, json_bytes);
+
+    try store.setCurrentDeploymentId(next_id);
+
+    // Stage `_deploy/current = next_id` so the caller's raft propose
+    // sees it. Followers' apply path commits it into their copies of
+    // the tenant's app.db; the worker's TenantFiles eager-open then
+    // reads it on first request and loads the manifest from
+    // manifest_backend (shared via fs/s3 between leader + followers).
+    var hex_buf: [16]u8 = undefined;
+    const hex = std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{next_id}) catch unreachable;
+    try release_ws.addPut("_deploy/current", hex);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

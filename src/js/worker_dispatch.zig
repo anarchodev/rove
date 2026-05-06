@@ -332,12 +332,13 @@ fn handleServicesTokenMint(
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/json");
 }
 
-/// Body shape: `{"tenant_id":"<id>","dep_id":<u64>}`. Records the
-/// release in the process-wide `ReleaseTable` and returns 204; the
-/// next dispatch tick on every worker observes the update and
-/// reloads. Idempotent — a repeat with the same dep_id is a no-op.
-/// The validation here is intentionally minimal because the caller
-/// is already admin-authenticated; bad bodies just bounce with 400.
+/// Body shape: `{"tenant_id":"<id>","dep_id":<u64>}`. Persists the
+/// release pointer to the tenant's app.db at `_deploy/current`
+/// (replicated via raft envelope 0 so cold-starts and other nodes
+/// see it), records the release in the process-wide `ReleaseTable`
+/// (so the per-worker dispatch tick observes it without polling),
+/// and returns 204. Idempotent — a repeat with the same dep_id
+/// re-stamps the kv row and re-publishes the table entry.
 fn handleRelease(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -375,13 +376,60 @@ fn handleRelease(
     // Reject unknown tenants — keeps stale dashboard sessions from
     // populating the table with garbage that never matches.
     const inst_opt = worker.tenant.getInstance(parsed.value.tenant_id) catch null;
-    if (inst_opt == null) {
+    const inst = inst_opt orelse {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown tenant\n", allocator, cors_origin, null);
         return;
-    }
+    };
+
+    // Persist the release pointer to the tenant's app.db. Stamps
+    // `_deploy/current = {dep_id:016x}` and proposes through raft
+    // envelope 0; followers' apply path picks it up and the worker's
+    // openTenantFiles reads it on first request after a restart.
+    var hex_buf: [16]u8 = undefined;
+    const hex = std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{parsed.value.dep_id}) catch unreachable;
+
+    var txn = inst.kv.beginTrackedImmediate() catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "release txn open failed: {s}\n", .{@errorName(err)});
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        return;
+    };
+    txn.put("_deploy/current", hex) catch |err| {
+        txn.rollback() catch {};
+        const msg = try std.fmt.allocPrint(allocator, "release put failed: {s}\n", .{@errorName(err)});
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        return;
+    };
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    ws.addPut("_deploy/current", hex) catch |err| {
+        txn.rollback() catch {};
+        const msg = try std.fmt.allocPrint(allocator, "release writeset failed: {s}\n", .{@errorName(err)});
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        return;
+    };
+    txn.commit() catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "release commit failed: {s}\n", .{@errorName(err)});
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        return;
+    };
+
+    _ = raft_propose.proposeWriteSet(worker, &ws, parsed.value.tenant_id) catch |err| {
+        // At-least-once semantics: leader has the write; followers
+        // may not. Same compromise the outbox / root paths take.
+        std.log.warn(
+            "release: propose envelope 0 for {s}/_deploy/current = {x:0>16} failed: {s}",
+            .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
+        );
+    };
+    inst.kv.commitTxn(txn.txn_seq) catch |err| {
+        std.log.warn(
+            "release: commitTxn drop-undo for {s} failed: {s}",
+            .{ parsed.value.tenant_id, @errorName(err) },
+        );
+    };
 
     table.set(parsed.value.tenant_id, parsed.value.dep_id) catch |err| {
-        const msg = try std.fmt.allocPrint(allocator, "release record failed: {s}\n", .{@errorName(err)});
+        const msg = try std.fmt.allocPrint(allocator, "release table failed: {s}\n", .{@errorName(err)});
         try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
         return;
     };

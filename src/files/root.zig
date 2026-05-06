@@ -14,8 +14,12 @@
 //!
 //!   `file/{path}`                → `{source_sha256_hex}`
 //!   `bytecode/{source_sha256}`   → `{bytecode_sha256_hex}` (compile cache)
-//!   `deployment/{id}`            → binary manifest (see `Manifest` below)
-//!   `deployment/current`         → `{id}` (the active deployment)
+//!   `deployment/current`         → `{id}` (next-id counter; files-server
+//!                                  local only — Phase 5.5(e) F2-storage
+//!                                  retired files.db replication, so this
+//!                                  is a per-node hint, not the runtime
+//!                                  release pointer; see `manifest_json`
+//!                                  for where deployments actually live)
 //!
 //! Blobs in the `BlobStore`:
 //!
@@ -28,12 +32,16 @@
 //!    source, writes the blob (if new), compiles to bytecode (if not
 //!    already cached), writes the bytecode blob, and stamps
 //!    `file/{path}` + `bytecode/{source_hash}` in the index.
-//! 2. Client calls `deploy()`: the current `file/*` set is snapshotted
-//!    into a new manifest. The manifest gets an id (monotonic integer
-//!    encoded as hex) and `deployment/current` is updated.
-//! 3. Worker fetches the current deployment: `loadCurrentDeployment()`
-//!    returns the manifest; the worker resolves each entry's bytecode
-//!    blob through the same `BlobStore`.
+//! 2. Files-server snapshots the working tree via `assembleManifest`,
+//!    JSON-encodes the result via `manifest_json.encode`, and stores
+//!    the bytes in a per-tenant `deployments/` BlobBackend (key shape
+//!    `{dep_id:020d}.json`). `deployment/current` in files.db tracks
+//!    the next-id counter.
+//! 3. Worker reads `_deploy/current` from the tenant's app.db (set by
+//!    the release POST and replicated via raft), then fetches the
+//!    matching manifest object from the `deployments/` BlobBackend
+//!    and resolves each entry's bytecode through the file-blobs
+//!    BlobBackend.
 //!
 //! ## Compile hook
 //!
@@ -50,6 +58,8 @@ const blob_mod = @import("rove-blob");
 
 pub const KvStore = kv.KvStore;
 pub const BlobStore = blob_mod.BlobStore;
+
+pub const manifest_json = @import("manifest_json.zig");
 
 pub const Error = error{
     NotFound,
@@ -96,21 +106,6 @@ pub const FileStore = struct {
     blob: BlobStore,
     compile: CompileFn,
     compile_ctx: ?*anyopaque,
-    /// Optional raft-replication target. When non-null, every kv
-    /// put/delete this FileStore performs is mirrored into the
-    /// writeset so the caller can propose it through raft — the
-    /// follower applies the same ops against its own copy of
-    /// `{instance}/files.db`. Blob bytes are NOT replicated this
-    /// way (they'd blow the raft entry size for large static
-    /// assets); multi-node deployments rely on a shared BlobStore
-    /// backend (path B — shared filesystem or S3).
-    ///
-    /// Null for: bootstrap deploys (each node runs the same
-    /// deterministic sequence independently) and tests. Non-null
-    /// for: signup's `deployStarterContent`, the files-server's
-    /// single-file PUT + bulk deploy endpoints.
-    replicate: ?*kv.WriteSet = null,
-
     pub fn init(
         allocator: std.mem.Allocator,
         kv_store: *KvStore,
@@ -127,20 +122,16 @@ pub const FileStore = struct {
         };
     }
 
-    /// Attach a writeset that mirrors every kv put/delete for the
-    /// remaining lifetime of this FileStore. Callers that need raft
-    /// replication construct the writeset, call this, drive their
-    /// deploy, and then propose the writeset. Pass null to detach.
-    pub fn setReplicate(self: *FileStore, ws: ?*kv.WriteSet) void {
-        self.replicate = ws;
-    }
+    /// Phase 5.5(e) F2-storage retired the replicate writeset and
+    /// envelope type 3 — files-server's working tree is local-only
+    /// (per-node files.db not replicated). The runtime release
+    /// signal travels through the customer's app.db
+    /// (`_deploy/current`, replicated via envelope 0); manifests
+    /// themselves live in a per-tenant `deployments/` BlobBackend
+    /// shared between nodes via the same backend the file-blobs use.
 
-    /// Internal put that tees through to the replicate writeset when
-    /// one is attached. Every FileStore put/delete must go through
-    /// these helpers (not self.kv directly) for follower correctness.
     fn kvPut(self: *FileStore, key: []const u8, value: []const u8) Error!void {
         self.kv.put(key, value) catch return Error.Kv;
-        if (self.replicate) |ws| ws.addPut(key, value) catch return Error.OutOfMemory;
     }
 
     fn kvDelete(self: *FileStore, key: []const u8) Error!void {
@@ -148,7 +139,6 @@ pub const FileStore = struct {
             error.NotFound => {},
             else => return Error.Kv,
         };
-        if (self.replicate) |ws| ws.addDelete(key) catch return Error.OutOfMemory;
     }
 
     // ── Source upload ─────────────────────────────────────────────────
@@ -405,29 +395,23 @@ pub const FileStore = struct {
         bytecode_hex: [HASH_HEX_LEN]u8,
     };
 
-    pub const Manifest = struct {
-        id: u64,
-        entries: []Entry,
-        allocator: std.mem.Allocator,
+    /// In-memory manifest type — re-export from `manifest_json` so
+    /// callers that received `FileStore.Manifest` from the old binary
+    /// path keep compiling. Phase 5.5(e) F2-storage moved both encode
+    /// and decode there; this alias exists only because the wire-format
+    /// transition is still in flight in some call sites.
+    pub const Manifest = manifest_json.Manifest;
 
-        pub fn deinit(self: *Manifest) void {
-            for (self.entries) |e| {
-                self.allocator.free(e.path);
-                self.allocator.free(e.content_type);
-            }
-            self.allocator.free(self.entries);
-            self.* = undefined;
-        }
-    };
-
-    /// Snapshot the current working tree (`file/*`) into a new deployment.
-    /// Assigns a monotonically increasing id (current + 1) and stores the
-    /// manifest under `deployment/{id_hex}`, then updates
-    /// `deployment/current`. Returns the new id.
-    pub fn deploy(self: *FileStore) Error!u64 {
-        // Collect all `file/*` entries.
+    /// Walk the working tree (`file/*` rows + `bytecode/{source}`
+    /// cache) and produce a fresh `[]Entry` snapshot. Caller owns the
+    /// returned slice and the per-entry `path` / `content_type`
+    /// allocations — `freeEntries` releases them. Phase 5.5(e)
+    /// F2-storage moved manifest persistence out of FileStore: callers
+    /// take this snapshot, JSON-encode it via `manifest_json.encode`,
+    /// and store the bytes in a per-tenant `deployments/` BlobBackend.
+    pub fn assembleManifest(self: *FileStore) Error![]Entry {
         var entries: std.ArrayList(Entry) = .empty;
-        defer {
+        errdefer {
             for (entries.items) |e| {
                 self.allocator.free(e.path);
                 self.allocator.free(e.content_type);
@@ -476,59 +460,39 @@ pub const FileStore = struct {
             }) catch return Error.OutOfMemory;
         }
 
-        // Determine next id.
-        const next_id: u64 = blk: {
-            const cur = self.kv.get("deployment/current") catch |err| switch (err) {
-                error.NotFound => break :blk 1,
-                else => return Error.Kv,
-            };
-            defer self.allocator.free(cur);
-            const parsed = std.fmt.parseInt(u64, cur, 16) catch return Error.InvalidManifest;
-            break :blk parsed + 1;
-        };
-
-        // Serialize + write manifest blob.
-        const bytes = serializeManifest(self.allocator, entries.items) catch
-            return Error.OutOfMemory;
-        defer self.allocator.free(bytes);
-
-        var id_hex_buf: [16]u8 = undefined;
-        const id_hex = std.fmt.bufPrint(&id_hex_buf, "{x:0>16}", .{next_id}) catch unreachable;
-
-        var dep_key_buf: [11 + 16]u8 = undefined;
-        const dep_key = std.fmt.bufPrint(&dep_key_buf, "deployment/{s}", .{id_hex}) catch
-            unreachable;
-
-        try self.kvPut(dep_key, bytes);
-        try self.kvPut("deployment/current", id_hex);
-        return next_id;
+        return entries.toOwnedSlice(self.allocator) catch return Error.OutOfMemory;
     }
 
-    /// Load the active deployment manifest. Caller must `deinit` the
-    /// returned `Manifest`.
-    pub fn loadCurrentDeployment(self: *FileStore) Error!Manifest {
+    /// Free a slice produced by `assembleManifest`.
+    pub fn freeEntries(self: *FileStore, entries: []Entry) void {
+        for (entries) |e| {
+            self.allocator.free(e.path);
+            self.allocator.free(e.content_type);
+        }
+        self.allocator.free(entries);
+    }
+
+    /// Read `deployment/current` (hex u64). Returns 0 when no deploy
+    /// has shipped yet. Used by files-server to compute the next
+    /// deployment id; not used by the worker (worker reads
+    /// `_deploy/current` from the tenant's app.db, replicated via
+    /// raft envelope 0).
+    pub fn currentDeploymentId(self: *FileStore) Error!u64 {
         const cur = self.kv.get("deployment/current") catch |err| switch (err) {
-            error.NotFound => return Error.NotFound,
+            error.NotFound => return 0,
             else => return Error.Kv,
         };
         defer self.allocator.free(cur);
-        const id = std.fmt.parseInt(u64, cur, 16) catch return Error.InvalidManifest;
-        return self.loadDeployment(id);
+        return std.fmt.parseInt(u64, cur, 16) catch return Error.InvalidManifest;
     }
 
-    pub fn loadDeployment(self: *FileStore, id: u64) Error!Manifest {
+    /// Stamp `deployment/current = id_hex` in the local files.db.
+    /// Files-server-only — the manifest itself lives in the per-tenant
+    /// `deployments/` BlobBackend, not in files.db.
+    pub fn setCurrentDeploymentId(self: *FileStore, id: u64) Error!void {
         var id_hex_buf: [16]u8 = undefined;
         const id_hex = std.fmt.bufPrint(&id_hex_buf, "{x:0>16}", .{id}) catch unreachable;
-        var dep_key_buf: [11 + 16]u8 = undefined;
-        const dep_key = std.fmt.bufPrint(&dep_key_buf, "deployment/{s}", .{id_hex}) catch
-            unreachable;
-        const bytes = self.kv.get(dep_key) catch |err| switch (err) {
-            error.NotFound => return Error.NotFound,
-            else => return Error.Kv,
-        };
-        defer self.allocator.free(bytes);
-        const entries = try parseManifest(self.allocator, bytes);
-        return .{ .id = id, .entries = entries, .allocator = self.allocator };
+        try self.kvPut("deployment/current", id_hex);
     }
 };
 
@@ -632,115 +596,6 @@ fn decodeFileValue(value: []const u8) Error!FileValueView {
         .source_hex = undefined,
     };
     @memcpy(&out.source_hex, value[2 + ct_len ..][0..HASH_HEX_LEN]);
-    return out;
-}
-
-// Manifest binary format (version 2):
-//   [u8 version=2]
-//   [u32 count]
-//   for each entry:
-//     [u16 path_len][path bytes]
-//     [u8 kind]
-//     [u8 ct_len][ct bytes]
-//     [64 source_hex][64 bytecode_hex]
-//
-// Little-endian. `bytecode_hex` is all-zero for static entries.
-const MANIFEST_VERSION: u8 = 2;
-
-fn serializeManifest(
-    allocator: std.mem.Allocator,
-    entries: []const FileStore.Entry,
-) error{OutOfMemory}![]u8 {
-    var total: usize = 1 + 4;
-    for (entries) |e| {
-        total += 2 + e.path.len + 1 + 1 + e.content_type.len + HASH_HEX_LEN * 2;
-    }
-
-    const out = try allocator.alloc(u8, total);
-    var i: usize = 0;
-    out[i] = MANIFEST_VERSION;
-    i += 1;
-    std.mem.writeInt(u32, out[i..][0..4], @intCast(entries.len), .little);
-    i += 4;
-    for (entries) |e| {
-        std.mem.writeInt(u16, out[i..][0..2], @intCast(e.path.len), .little);
-        i += 2;
-        @memcpy(out[i..][0..e.path.len], e.path);
-        i += e.path.len;
-        out[i] = @intFromEnum(e.kind);
-        i += 1;
-        out[i] = @intCast(e.content_type.len);
-        i += 1;
-        @memcpy(out[i..][0..e.content_type.len], e.content_type);
-        i += e.content_type.len;
-        @memcpy(out[i..][0..HASH_HEX_LEN], &e.source_hex);
-        i += HASH_HEX_LEN;
-        @memcpy(out[i..][0..HASH_HEX_LEN], &e.bytecode_hex);
-        i += HASH_HEX_LEN;
-    }
-    return out;
-}
-
-fn parseManifest(
-    allocator: std.mem.Allocator,
-    bytes: []const u8,
-) Error![]FileStore.Entry {
-    if (bytes.len < 5) return Error.InvalidManifest;
-    var i: usize = 0;
-    if (bytes[i] != MANIFEST_VERSION) return Error.InvalidManifest;
-    i += 1;
-    const count = std.mem.readInt(u32, bytes[i..][0..4], .little);
-    i += 4;
-
-    const out = allocator.alloc(FileStore.Entry, count) catch return Error.OutOfMemory;
-    var filled: usize = 0;
-    errdefer {
-        for (out[0..filled]) |e| {
-            allocator.free(e.path);
-            allocator.free(e.content_type);
-        }
-        allocator.free(out);
-    }
-
-    while (filled < count) : (filled += 1) {
-        if (i + 2 > bytes.len) return Error.InvalidManifest;
-        const path_len = std.mem.readInt(u16, bytes[i..][0..2], .little);
-        i += 2;
-        if (i + path_len + 2 > bytes.len) return Error.InvalidManifest;
-
-        const path = allocator.dupe(u8, bytes[i .. i + path_len]) catch
-            return Error.OutOfMemory;
-        errdefer allocator.free(path);
-        i += path_len;
-
-        const kind: Kind = switch (bytes[i]) {
-            0 => .handler,
-            1 => .static,
-            else => return Error.InvalidManifest,
-        };
-        i += 1;
-        const ct_len = bytes[i];
-        i += 1;
-        if (i + ct_len + HASH_HEX_LEN * 2 > bytes.len) return Error.InvalidManifest;
-        const ct = allocator.dupe(u8, bytes[i .. i + ct_len]) catch
-            return Error.OutOfMemory;
-        i += ct_len;
-
-        var src_hex: [HASH_HEX_LEN]u8 = undefined;
-        @memcpy(&src_hex, bytes[i..][0..HASH_HEX_LEN]);
-        i += HASH_HEX_LEN;
-        var bc_hex: [HASH_HEX_LEN]u8 = undefined;
-        @memcpy(&bc_hex, bytes[i..][0..HASH_HEX_LEN]);
-        i += HASH_HEX_LEN;
-
-        out[filled] = .{
-            .path = path,
-            .kind = kind,
-            .content_type = ct,
-            .source_hex = src_hex,
-            .bytecode_hex = bc_hex,
-        };
-    }
     return out;
 }
 
@@ -909,69 +764,36 @@ test "putSource overwrites existing file with new hash" {
     try testing.expectEqualStrings("v2", got);
 }
 
-test "deploy snapshots current files and assigns id=1 then 2" {
+test "assembleManifest produces an entry per file/* row" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
     var code = fx.fileStore();
 
     try code.putSource("a.js", "A");
     try code.putSource("b.js", "B");
+    try code.setCurrentDeploymentId(1);
 
-    const id1 = try code.deploy();
-    try testing.expectEqual(@as(u64, 1), id1);
-
-    try code.putSource("a.js", "A2");
-    const id2 = try code.deploy();
-    try testing.expectEqual(@as(u64, 2), id2);
+    const entries = try code.assembleManifest();
+    defer code.freeEntries(entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("a.js", entries[0].path);
+    try testing.expectEqualStrings("b.js", entries[1].path);
+    try testing.expectEqual(@as(u64, 1), try code.currentDeploymentId());
 }
 
-test "loadCurrentDeployment returns manifest with all entries" {
+test "currentDeploymentId returns 0 when no deploy yet" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
     var code = fx.fileStore();
-
-    try code.putSource("a.js", "A");
-    try code.putSource("sub/b.js", "BB");
-    _ = try code.deploy();
-
-    var m = try code.loadCurrentDeployment();
-    defer m.deinit();
-
-    try testing.expectEqual(@as(u64, 1), m.id);
-    try testing.expectEqual(@as(usize, 2), m.entries.len);
-
-    // kv.range returns entries sorted by key — so "a.js" then "sub/b.js".
-    try testing.expectEqualStrings("a.js", m.entries[0].path);
-    try testing.expectEqualStrings("sub/b.js", m.entries[1].path);
+    try testing.expectEqual(@as(u64, 0), try code.currentDeploymentId());
 }
 
-test "loadCurrentDeployment returns NotFound when no deploy yet" {
+test "setCurrentDeploymentId round-trips through currentDeploymentId" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
     var code = fx.fileStore();
-
-    try code.putSource("a.js", "A");
-    try testing.expectError(Error.NotFound, code.loadCurrentDeployment());
-}
-
-test "old deployments remain addressable by id after new deploy" {
-    var fx = try TestFixture.init(testing.allocator);
-    defer fx.deinit();
-    var code = fx.fileStore();
-
-    try code.putSource("a.js", "v1");
-    _ = try code.deploy();
-    try code.putSource("a.js", "v2");
-    _ = try code.deploy();
-
-    var old = try code.loadDeployment(1);
-    defer old.deinit();
-    try testing.expectEqual(@as(usize, 1), old.entries.len);
-
-    // Source hash in the old manifest should match sha256("v1").
-    var expected: [HASH_HEX_LEN]u8 = undefined;
-    hashHex("v1", &expected);
-    try testing.expectEqualSlices(u8, &expected, &old.entries[0].source_hex);
+    try code.setCurrentDeploymentId(42);
+    try testing.expectEqual(@as(u64, 42), try code.currentDeploymentId());
 }
 
 test "isJsModule: only .mjs is a module" {
@@ -1042,7 +864,7 @@ test "putStatic stores raw bytes + content-type, no bytecode" {
     try testing.expectEqualStrings("text/html", stat_e.content_type);
 }
 
-test "deploy produces mixed handler + static manifest with content-types" {
+test "assembleManifest produces mixed handler + static entries with content-types" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
     var fs = fx.fileStore();
@@ -1050,76 +872,23 @@ test "deploy produces mixed handler + static manifest with content-types" {
     try fs.putSource("index.mjs", "export default () => 42;");
     try fs.putStatic("_static/style.css", "body { color: red; }", "text/css");
 
-    _ = try fs.deploy();
-    var m = try fs.loadCurrentDeployment();
-    defer m.deinit();
-    try testing.expectEqual(@as(usize, 2), m.entries.len);
+    const entries = try fs.assembleManifest();
+    defer fs.freeEntries(entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
 
     // Entries sorted by key → "_static/style.css" then "index.mjs"
     // (underscore < lowercase letters in ASCII).
-    try testing.expectEqualStrings("_static/style.css", m.entries[0].path);
-    try testing.expectEqual(Kind.static, m.entries[0].kind);
-    try testing.expectEqualStrings("text/css", m.entries[0].content_type);
-    // Static bytecode hash is all-zero.
+    try testing.expectEqualStrings("_static/style.css", entries[0].path);
+    try testing.expectEqual(Kind.static, entries[0].kind);
+    try testing.expectEqualStrings("text/css", entries[0].content_type);
     const zeros: [HASH_HEX_LEN]u8 = @splat(0);
-    try testing.expectEqualSlices(u8, &zeros, &m.entries[0].bytecode_hex);
+    try testing.expectEqualSlices(u8, &zeros, &entries[0].bytecode_hex);
 
-    try testing.expectEqualStrings("index.mjs", m.entries[1].path);
-    try testing.expectEqual(Kind.handler, m.entries[1].kind);
-    try testing.expectEqualStrings("", m.entries[1].content_type);
+    try testing.expectEqualStrings("index.mjs", entries[1].path);
+    try testing.expectEqual(Kind.handler, entries[1].kind);
+    try testing.expectEqualStrings("", entries[1].content_type);
 }
 
-test "serialize + parse manifest round-trip" {
-    var entries = [_]FileStore.Entry{
-        .{
-            .path = @constCast("a.js"),
-            .kind = .handler,
-            .content_type = @constCast(""),
-            .source_hex = [_]u8{'a'} ** HASH_HEX_LEN,
-            .bytecode_hex = [_]u8{'1'} ** HASH_HEX_LEN,
-        },
-        .{
-            .path = @constCast("_static/b.css"),
-            .kind = .static,
-            .content_type = @constCast("text/css"),
-            .source_hex = [_]u8{'b'} ** HASH_HEX_LEN,
-            .bytecode_hex = [_]u8{0} ** HASH_HEX_LEN,
-        },
-    };
-
-    const bytes = try serializeManifest(testing.allocator, &entries);
-    defer testing.allocator.free(bytes);
-
-    const parsed = try parseManifest(testing.allocator, bytes);
-    defer {
-        for (parsed) |e| {
-            testing.allocator.free(e.path);
-            testing.allocator.free(e.content_type);
-        }
-        testing.allocator.free(parsed);
-    }
-
-    try testing.expectEqual(@as(usize, 2), parsed.len);
-    try testing.expectEqualStrings("a.js", parsed[0].path);
-    try testing.expectEqual(Kind.handler, parsed[0].kind);
-    try testing.expectEqualStrings("", parsed[0].content_type);
-    try testing.expectEqualStrings("_static/b.css", parsed[1].path);
-    try testing.expectEqual(Kind.static, parsed[1].kind);
-    try testing.expectEqualStrings("text/css", parsed[1].content_type);
-    try testing.expectEqualSlices(u8, &entries[0].source_hex, &parsed[0].source_hex);
-    try testing.expectEqualSlices(u8, &entries[1].bytecode_hex, &parsed[1].bytecode_hex);
-}
-
-test "parseManifest rejects wrong version + truncated input" {
-    try testing.expectError(Error.InvalidManifest, parseManifest(testing.allocator, &[_]u8{}));
-    // Version 1 is no longer accepted.
-    try testing.expectError(
-        Error.InvalidManifest,
-        parseManifest(testing.allocator, &[_]u8{ 1, 0, 0, 0, 0 }),
-    );
-    // Version 2, count=5, but no entries follow.
-    try testing.expectError(
-        Error.InvalidManifest,
-        parseManifest(testing.allocator, &[_]u8{ MANIFEST_VERSION, 5, 0, 0, 0 }),
-    );
+test {
+    _ = manifest_json;
 }
