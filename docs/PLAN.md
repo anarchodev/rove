@@ -816,17 +816,17 @@ ops intervention.
 > S3 transport — replaces the original "raft snapshot + log compaction" with
 > a no-pause file-shipping model).
 > `docs/webhook-server-plan.md` covers item 4 (cluster-wide raft-replicated
-> `webhooks.db` with a dedicated webhook-server process — promotes the
-> "leader-local in v1" position to "raft-replicated from day one" because
-> leader-local recovery requires the per-tenant scan we're trying to avoid).
-> `docs/files-server-plan.md` covers the related move of files-server to
-> its own subdomain with manifest-in-S3 (not directly listed below but
-> follows the same architectural direction).
+> `webhooks.db` with a leader-pinned webhook-server thread; the per-tenant
+> `_outbox/*` row + drainer are dropped because envelope 4 rides with
+> envelope 0 in the same raft entry).
+> `docs/files-server-plan.md` covers item 5 (files-server moves to its own
+> subdomain with manifest-in-S3, marker-driven release).
 > Item 2 (tape body capture) is straightforward and remains an
 > implementation detail rather than a separate plan.
 
-Three coupled work items, all following the existing file-blob pattern
-(bytes on `BlobStore`, raft replicates only the manifest):
+Five coupled work items, all following the existing file-blob pattern
+(bytes on `BlobStore`, raft replicates only the manifest where applicable;
+state moves out of raft where stronger guarantees aren't needed):
 
 1. **Log batch payload offload to blob store.** Today the raft entry payload
    IS the batch bytes (see the now-stale "Phase 6" comment in
@@ -873,10 +873,34 @@ Three coupled work items, all following the existing file-blob pattern
    positions were both rejected (see §7) — neither paid for the
    complexity once envelope 4 could ride with envelope 0 directly.
 
+5. **Files-server architectural move.** Today the worker holds per-tenant
+   `files.db` SQLite + an in-memory manifest cache mirroring files-server's
+   local SQLite, kept in sync via raft envelope type 3 + a 2s polling
+   refresh. Two replicas of the same state, expensive to keep coherent.
+   Replace with: files-server moves to its own subdomain
+   (`files.{public_suffix}`) with its own TLS, manifest moves to S3
+   (`tenants/{id}/deployments/{dep_id}.json` + `tenants/{id}/blobs/{hash}`),
+   runtime release signal becomes a `_deploy/active` kv marker observed
+   via the existing post-commit writeset scan (no polling), worker reads
+   bytecodes/statics on demand from S3 with content-hash ETags +
+   Cloudflare in front. Worker drops the entire `/_system/files/*` proxy
+   and the `files.db` per-tenant store (envelope type 3 retires); the §2.4
+   routing/cache/path-validation/size-cap rules carry forward unchanged.
+   Detail in `docs/files-server-plan.md`. Lower urgency than (a)/(c)
+   (files.db doesn't blow up under sustained traffic the way log.db does)
+   but unblocks multi-node deployment (S3-backed manifest IS the cross-node
+   share path) and removes ~2 replicas-worth of in-process state from the
+   worker.
+
 `S3BlobStore` itself stays deferred (single-host launch uses
 `FilesystemBlobStore`); the work above is ready for it because `BlobStore`
 is already the abstraction seam. **First customer can now take real
 production traffic without disk-fill within weeks.** MVP complete.
+
+The further detach of files-server / log-server into separately-deployed
+processes that admin's JS handler calls via `webhook.send` (rather than
+the worker proxying) is **post-1.0** — see §10.13 + `files-server-plan.md`
+§11.
 
 ### Phase 6 — Triggers
 
@@ -1193,10 +1217,12 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 - NOT yet: Logs auto-refresh / live tail, Logs filtering (by status / outcome / deployment / path), nested-thread display under `parent_request_id` (waits on Phase 6 trigger / callback log emits), Deploys tab with history + diff, CodeMirror 6 upgrade, draft workflow, signup form on the login page, tape replay click-through (waits on Phase 4 tape capture)
 
 ### Phase 5.5 — Storage scalability — **not started**
-- Promoted into MVP scope 2026-04-29. Four deliverables, each with its own sub-plan: (a) log batch payload offload — superseded by `docs/logs-plan.md` (logs leave raft entirely, go S3-direct with sidecar index); (b) tape body capture wired through the pre-staged `tape_refs` + `LogStore.blob` slots, bodies offloaded to `{inst.dir}/log-blobs/` with §2.4's 256 KB truncation; (c) raft snapshot + log compaction — see `docs/snapshot-plan.md` (per-tenant snapshot indices, S3 transport, no global write-pause); (d) centralized webhook subsystem — see `docs/webhook-server-plan.md` (cluster-wide raft-replicated `webhooks.db` via new envelope types 4/5/6, no per-tenant `_outbox/*` row, no drainer; envelope 4 rides with envelope 0 in the same raft entry).
+- Promoted into MVP scope 2026-04-29. Five deliverables, each with its own sub-plan: (a) log batch payload offload — superseded by `docs/logs-plan.md` (logs leave raft entirely, go S3-direct with sidecar index); (b) tape body capture wired through the pre-staged `tape_refs` + `LogStore.blob` slots, bodies offloaded to `{inst.dir}/log-blobs/` with §2.4's 256 KB truncation; (c) raft snapshot + log compaction — see `docs/snapshot-plan.md` (per-tenant snapshot indices, S3 transport, no global write-pause); (d) centralized webhook subsystem — see `docs/webhook-server-plan.md` (cluster-wide raft-replicated `webhooks.db` via new envelope types 4/5/6, no per-tenant `_outbox/*` row, no drainer; envelope 4 rides with envelope 0 in the same raft entry); (e) files-server architectural move — see `docs/files-server-plan.md` (own subdomain `files.{public_suffix}`, manifest in S3, marker-driven release, worker drops `files.db` + `/_system/files/*` proxy + envelope type 3).
 - Without (a)–(c), `raft.log.db` grows unbounded under any sustained traffic and bodies (when added) overwhelm both raft replication and per-tenant `log.db`. Estimate: ~43 GB/day in raft.log.db at 1000 req/s × ~500 B per log record, doubled by apply, ~100× worse with bodies.
 - Without (d), the drainer's steady-state tick cost is O(N tenants) — ~40k SQLite open+scan ops/sec at 4 ticks × 10k tenants. The raft-replicated `webhooks.db` design eliminates that per-tick scan; on leader change, the new leader inherits committed state with no per-tenant outbox scan. Webhook intent rides through raft as envelope 4 in the same raft entry as envelope 0 (the writeset), so the per-tenant `_outbox/{id}` row goes away entirely — the handoff IS the propose, and the customer response (gated on raft commit) guarantees `webhooks.db` durability cluster-wide. The drainer is deleted along with the `_outbox/*` / `_outbox_inflight/*` / `_dlq/*` prefixes.
+- (e) is lower urgency than (a)/(c) (files.db doesn't fill disk under sustained traffic the way raft.log.db does) but unblocks multi-node deployment — S3-backed manifest IS the cross-node share path — and removes ~2 replicas-worth of in-process state (per-tenant `files.db` + in-memory manifest cache in the worker, both mirroring files-server's authoritative store via envelope type 3 + 2s polling refresh).
 - The supersede comment in `src/log/root.zig` header that mentions "Phase 6 changes this so the leader uploads the batch blob to S3" is stale terminology — it predates the current PLAN numbering. Cleanup as part of this work.
+- The further detach (files-server / log-server become separately-deployed processes that admin's JS handler calls via `webhook.send`, with the worker no longer proxying) is **post-1.0** — see §10.13 + `files-server-plan.md` §11.
 
 ### Phase 6 — Triggers — **done 2026-04-27**
 - Path-based registration (PLAN §2.5): `_triggers/users/sessions/index.mjs` fires on writes to `users/sessions/*`. Tree-traversal order across overlapping prefixes — outermost-first BEFORE, innermost-first AFTER. Catch-all via top-level `_triggers/index.mjs` (prefix `""`).
@@ -1413,9 +1439,9 @@ The bundle JSON shape, stubs-library design, and request body capture into the t
 
 **Chrome extension dropped entirely.** Earlier drafts of §10.12 considered a Chrome extension as a CDP bridge to an in-dashboard debugger UX (CodeMirror 6 viewer + breakpoint gutter + variables panel + step controls). The two-audience framing makes that the wrong answer for both audiences: Story 1 gets a simpler experience from browser DevTools directly; Story 2 gets a strictly better experience by debugging in their actual IDE via DAP. No post-launch enhancement path for the extension is recorded — DAP attach is the durable answer for the integrated UX Story 2 wants.
 
-### 10.13 files-server + log-server detach (post-1.0)
+### 10.13 files-server + log-server further detach (post-1.0)
 
-`rove-files-server` and `rove-log-server` stop being in-process worker threads and become **external HTTP services that loop46 integrates with the same way it integrates with Resend or Stripe**. Admin's JS handler calls them via `webhook.send`, receives results via callback dispatch, and pushes the result to the dashboard browser via SSE. The dashboard never talks to files-server / log-server directly — admin's JS is the integration seam. Worker drops ~2-3k lines (`/_system/files/*` and `/_system/log/*` proxies, `code_proxy` / `log_proxy` collections, the cross-thread h2 client, `extractAdminAuth` and friends).
+The Phase 5.5 architectural moves (item (a) for log-server, item (e) for files-server) put both subsystems on their own subdomains with their state in S3, but the worker still proxies dashboard / CLI traffic to them via `/_system/files/*` and `/_system/log/*`. The post-1.0 further detach drops that proxy entirely: `rove-files-server` and `rove-log-server` become **external HTTP services that loop46 integrates with the same way it integrates with Resend or Stripe**. Admin's JS handler calls them via `webhook.send`, receives results via callback dispatch, and pushes the result to the dashboard browser via SSE. The dashboard never talks to files-server / log-server directly — admin's JS is the integration seam. Worker drops another ~2-3k lines (`/_system/files/*` and `/_system/log/*` proxies, `code_proxy` / `log_proxy` collections, the cross-thread h2 client, `extractAdminAuth` and friends).
 
 Sequencing is **post-1.0** — architectural purification that doesn't differentiate value to Story 1 (beta) or Story 2 (1.0). With SSE shipping at 1.0, the prerequisite is satisfied; the detach becomes a clean refactor gated only on engineering bandwidth.
 
