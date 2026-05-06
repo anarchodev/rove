@@ -1,14 +1,17 @@
-//! `webhook.send` JS binding — writes a serialized delivery envelope
-//! to `_outbox/{id}` inside the current handler transaction. The
-//! outbox drainer (separate thread on the raft leader) picks these up,
-//! makes the HTTP call, and enqueues a callback.
+//! `webhook.send` JS binding — appends a `WebhookRow` to the
+//! dispatcher's per-batch `pending_webhooks` accumulator. The list is
+//! proposed as raft envelope 4 inside the type-7 multi-envelope
+//! alongside envelope 0 (writeset) at handler-batch commit. The
+//! webhook-server thread (Phase 5.5 d, leader-pinned) reads
+//! `webhooks.db`, POSTs the customer URL, and proposes envelope 5
+//! (complete) or envelope 6 (retry).
 //!
 //! Id derivation: `sha256(request_id || call_index)` — both pre-minted
 //! so the same handler run against the same inputs produces the same
 //! ids, which is what replay determinism wants.
 //!
 //! Also hosts `__rove_check_email_rate`, the hidden builtin called from
-//! the email.send JS wrapper before queuing the outbox row. Lives next
+//! the email.send JS wrapper before queuing the webhook row. Lives next
 //! to webhook because email.send composes on top of webhook.send and
 //! shares the rate-limit posture.
 
@@ -20,10 +23,9 @@ const webhook_server = @import("rove-webhook-server");
 const globals = @import("../globals.zig");
 
 const js_undefined = globals.js_undefined;
-const js_null = globals.js_null;
 const js_exception = globals.js_exception;
 
-fn computeOutboxId(request_id: u64, call_index: u32, out: *[64]u8) void {
+fn computeWebhookId(request_id: u64, call_index: u32, out: *[64]u8) void {
     var buf: [12]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], request_id, .big);
     std.mem.writeInt(u32, buf[8..12], call_index, .big);
@@ -36,54 +38,8 @@ fn computeOutboxId(request_id: u64, call_index: u32, out: *[64]u8) void {
     }
 }
 
-/// Transfer `src` to `dst[name]`. Ownership moves — don't free `src`
-/// after this.
-fn setOwned(ctx: ?*c.JSContext, dst: c.JSValue, name: [:0]const u8, src: c.JSValue) void {
-    _ = c.JS_SetPropertyStr(ctx, dst, name.ptr, src);
-}
-
-/// Copy `opts[name]` to `dst[name]` when present. If `default_val` is
-/// non-null, fall back to it (refcount consumed).
-fn copyField(
-    ctx: ?*c.JSContext,
-    opts: c.JSValue,
-    dst: c.JSValue,
-    name: [:0]const u8,
-    default_val: ?c.JSValue,
-) void {
-    const v = c.JS_GetPropertyStr(ctx, opts, name.ptr);
-    if (c.JS_IsUndefined(v)) {
-        c.JS_FreeValue(ctx, v);
-        if (default_val) |d| setOwned(ctx, dst, name, d);
-        return;
-    }
-    if (default_val) |d| c.JS_FreeValue(ctx, d);
-    setOwned(ctx, dst, name, v);
-}
-
-/// Copy `opts[src_name]` to `dst[dst_name]` when present. Used to map
-/// the camelCase public API (`onResult`, `maxAttempts`, ...) onto the
-/// snake_case envelope shape that tools on the delivery side read.
-fn copyFieldRenamed(
-    ctx: ?*c.JSContext,
-    opts: c.JSValue,
-    dst: c.JSValue,
-    src_name: [:0]const u8,
-    dst_name: [:0]const u8,
-    default_val: ?c.JSValue,
-) void {
-    const v = c.JS_GetPropertyStr(ctx, opts, src_name.ptr);
-    if (c.JS_IsUndefined(v)) {
-        c.JS_FreeValue(ctx, v);
-        if (default_val) |d| setOwned(ctx, dst, dst_name, d);
-        return;
-    }
-    if (default_val) |d| c.JS_FreeValue(ctx, d);
-    setOwned(ctx, dst, dst_name, v);
-}
-
 /// Hidden builtin called from the email.send JS wrapper before
-/// queuing the outbox row. Throws Error{code:"rate_limited"} when
+/// queuing the webhook row. Throws Error{code:"rate_limited"} when
 /// the per-instance email bucket is exhausted; customer can catch
 /// in their handler. No-op when the limiter isn't wired (test
 /// paths) so dispatcher tests don't need to plumb a limiter through.
@@ -137,140 +93,75 @@ pub fn jsWebhookSend(
 
     // url is required and must be a string.
     const url_v = c.JS_GetPropertyStr(ctx, opts, "url");
+    defer c.JS_FreeValue(ctx, url_v);
     if (!c.JS_IsString(url_v)) {
-        c.JS_FreeValue(ctx, url_v);
         _ = c.JS_ThrowTypeError(ctx, "webhook.send: `url` must be a string");
         return js_exception;
     }
 
     var id_hex: [64]u8 = undefined;
-    computeOutboxId(state.request_id, state.webhook_call_index, &id_hex);
+    computeWebhookId(state.request_id, state.webhook_call_index, &id_hex);
 
-    // Build the canonical envelope. Users supply the interesting
-    // fields; we derive id / attempts / next_attempt_at / created_at /
-    // parent_request_id. Setting on env transfers ownership — don't
-    // free the `url_v` below.
-    const env = c.JS_NewObject(ctx);
-    setOwned(ctx, env, "v", c.JS_NewInt32(ctx, 1));
-    setOwned(ctx, env, "id", c.JS_NewStringLen(ctx, &id_hex, 64));
-    setOwned(ctx, env, "url", url_v);
+    const list = state.pending_webhooks orelse {
+        // Production paths always allocate the accumulator; the only
+        // way to reach here is a Zig-side test that didn't plumb one
+        // through. Throw rather than panic so the calling test can
+        // surface the misconfiguration cleanly.
+        _ = c.JS_ThrowInternalError(ctx, "webhook.send: dispatcher did not allocate pending_webhooks");
+        return js_exception;
+    };
 
-    // Public input shape uses camelCase (matches PLAN §2.6); envelope
-    // on disk uses snake_case so Zig-side tools + JSON tooling around
-    // the drainer don't have to transliterate.
-    copyField(ctx, opts, env, "method", c.JS_NewString(ctx, "POST"));
-    copyField(ctx, opts, env, "headers", c.JS_NewObject(ctx));
-    copyField(ctx, opts, env, "body", c.JS_NewString(ctx, ""));
-    copyField(ctx, opts, env, "context", js_null);
-    copyFieldRenamed(ctx, opts, env, "onResult", "on_result", js_null);
-    copyFieldRenamed(ctx, opts, env, "maxAttempts", "max_attempts", c.JS_NewInt32(ctx, 10));
-    copyFieldRenamed(ctx, opts, env, "timeout", "timeout_ms", c.JS_NewInt32(ctx, 30_000));
-    // retryOn: default the standard retryable status list + "network".
-    const default_retry = c.JS_NewArray(ctx);
-    const default_codes = [_]i32{ 408, 425, 429, 500, 502, 503, 504 };
-    for (default_codes, 0..) |code, i| {
-        _ = c.JS_SetPropertyUint32(ctx, default_retry, @intCast(i), c.JS_NewInt32(ctx, code));
-    }
-    _ = c.JS_SetPropertyUint32(ctx, default_retry, default_codes.len, c.JS_NewString(ctx, "network"));
-    copyFieldRenamed(ctx, opts, env, "retryOn", "retry_on", default_retry);
-
-    // Derived state. These advance as the drainer works through it.
-    setOwned(ctx, env, "attempts", c.JS_NewInt32(ctx, 0));
-    setOwned(ctx, env, "next_attempt_at_ms", c.JS_NewInt64(ctx, 0));
-    const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-    setOwned(ctx, env, "created_at_ms", c.JS_NewInt64(ctx, now_ms));
-    setOwned(ctx, env, "parent_request_id", c.JS_NewInt64(ctx, @bitCast(state.request_id)));
-
-    // Phase 5.5 (d), step 4. When the dispatcher allocated a per-batch
-    // `pending_webhooks` accumulator (= worker is in `direct` mode),
-    // extract a `WebhookRow` from the env we just built and append.
-    // No `_outbox/{id}` write — envelope 4 (the merged batch) rides
-    // with envelope 0 (writeset) in a type-7 multi-envelope at batch
-    // commit. Drainer-mode falls through to the legacy path below.
-    if (state.pending_webhooks) |list| {
-        var row = extractRowFromEnv(ctx, state, env, &id_hex) catch |err| {
-            c.JS_FreeValue(ctx, env);
-            switch (err) {
-                error.JsException => return js_exception,
-                else => {
-                    state.pending_kv_error = err;
-                    return js_exception;
-                },
-            }
-        };
-        c.JS_FreeValue(ctx, env);
-        errdefer row.deinit(state.allocator);
-        list.append(state.allocator, row) catch |err| {
-            row.deinit(state.allocator);
+    var row = buildRow(ctx, state, opts, &id_hex) catch |err| switch (err) {
+        error.JsException => return js_exception,
+        else => {
             state.pending_kv_error = err;
             return js_exception;
-        };
-        state.webhook_call_index += 1;
-        return c.JS_NewStringLen(ctx, &id_hex, 64);
-    }
-
-    // Drainer mode (legacy): serialize envelope → bytes → _outbox/{id}.
-    const json = c.JS_JSONStringify(ctx, env, js_undefined, js_undefined);
-    c.JS_FreeValue(ctx, env);
-    if (c.JS_IsException(json) or c.JS_IsUndefined(json)) {
-        c.JS_FreeValue(ctx, json);
-        return js_exception;
-    }
-    defer c.JS_FreeValue(ctx, json);
-
-    var json_len: usize = 0;
-    const json_cstr = c.JS_ToCStringLen(ctx, &json_len, json);
-    if (json_cstr == null) return js_exception;
-    defer c.JS_FreeCString(ctx, json_cstr);
-    const json_slice = @as([*]const u8, @ptrCast(json_cstr))[0..json_len];
-
-    // Write `_outbox/{id}` through the handler's tx + writeset so the
-    // outbox entry commits (or rolls back) atomically with the rest of
-    // the handler's kv writes.
-    var key_buf: [8 + 64]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "_outbox/{s}", .{id_hex}) catch unreachable;
-
-    state.txn.put(key, json_slice) catch |err| {
+        },
+    };
+    errdefer row.deinit(state.allocator);
+    list.append(state.allocator, row) catch |err| {
+        row.deinit(state.allocator);
         state.pending_kv_error = err;
         return js_exception;
     };
-    state.writeset.addPut(key, json_slice) catch |err| {
-        state.pending_kv_error = err;
-        return js_exception;
-    };
-
     state.webhook_call_index += 1;
     return c.JS_NewStringLen(ctx, &id_hex, 64);
 }
 
-/// Walk the JSON envelope we just built and produce a `WebhookRow`
-/// owned by `state.allocator`. All `[]const u8` fields are owned
-/// duplicates so the row's `deinit` can free them uniformly. The row
-/// shape mirrors what envelope 4 carries on the wire.
-fn extractRowFromEnv(
+/// Pull the public `webhook.send` options into a `WebhookRow` whose
+/// `[]const u8` fields are duplicates owned by `state.allocator`. The
+/// row is freed uniformly via `WebhookRow.deinit`. Wire-shape mirrors
+/// envelope 4. Customer field defaults match PLAN §2.6: `method=POST`,
+/// `body=""`, `headers={}`, `maxAttempts=10`, `timeout=30000`,
+/// `retryOn=[408,425,429,500,502,503,504,"network"]`, `context=null`,
+/// `onResult=null`.
+fn buildRow(
     ctx: ?*c.JSContext,
     state: *globals.DispatchState,
-    env: c.JSValue,
+    opts: c.JSValue,
     id_hex: *const [64]u8,
 ) !webhook_server.WebhookRow {
     const a = state.allocator;
-
     var owned: ExtractedStrings = .{};
     errdefer owned.deinit(a);
 
     owned.tenant_id = try a.dupe(u8, state.instance_id);
-    owned.url = try dupeJsString(ctx, a, env, "url");
-    owned.method = try dupeJsString(ctx, a, env, "method");
-    owned.body = try dupeJsString(ctx, a, env, "body");
-    owned.headers_json = try dupeJsObjectAsJson(ctx, a, env, "headers");
-    owned.retry_on_json = try dupeJsObjectAsJson(ctx, a, env, "retry_on");
-    owned.context_json = try dupeJsObjectAsJson(ctx, a, env, "context");
-    // on_result is null when omitted; store as empty string so the
-    // delivery-side apply writes `"on_result": null` in the callback.
-    owned.on_result_path = try dupeJsStringOrEmpty(ctx, a, env, "on_result");
+    owned.url = try dupeJsString(ctx, a, opts, "url", null);
+    owned.method = try dupeJsString(ctx, a, opts, "method", "POST");
+    owned.body = try dupeJsString(ctx, a, opts, "body", "");
+    owned.headers_json = try dupeJsObjectAsJson(ctx, a, opts, "headers", "{}");
+    owned.retry_on_json = try dupeJsObjectAsJson(
+        ctx,
+        a,
+        opts,
+        "retryOn",
+        "[408,425,429,500,502,503,504,\"network\"]",
+    );
+    owned.context_json = try dupeJsObjectAsJson(ctx, a, opts, "context", "null");
+    owned.on_result_path = try dupeJsStringOrEmpty(ctx, a, opts, "onResult");
 
-    const max_attempts = try getIntField(ctx, env, "max_attempts");
-    const timeout_ms = try getIntField(ctx, env, "timeout_ms");
+    const max_attempts = try getIntField(ctx, opts, "maxAttempts", 10);
+    const timeout_ms = try getIntField(ctx, opts, "timeout", 30_000);
 
     const row: webhook_server.WebhookRow = .{
         .webhook_id_hex = id_hex.*,
@@ -312,25 +203,32 @@ const ExtractedStrings = struct {
     }
 };
 
+/// Read a string property and dupe it. `default_str` is used if the
+/// property is undefined; if `null`, undefined → JsException. Anything
+/// else non-string → JsException so the customer sees a clear failure.
 fn dupeJsString(
     ctx: ?*c.JSContext,
     a: std.mem.Allocator,
     obj: c.JSValue,
     name: [:0]const u8,
+    default_str: ?[]const u8,
 ) ![]u8 {
     const v = c.JS_GetPropertyStr(ctx, obj, name.ptr);
     defer c.JS_FreeValue(ctx, v);
+    if (c.JS_IsUndefined(v)) {
+        if (default_str) |d| return try a.dupe(u8, d);
+        return error.JsException;
+    }
     if (!c.JS_IsString(v)) return error.JsException;
     var len: usize = 0;
     const cstr = c.JS_ToCStringLen(ctx, &len, v);
     if (cstr == null) return error.JsException;
     defer c.JS_FreeCString(ctx, cstr);
-    const slice = @as([*]const u8, @ptrCast(cstr))[0..len];
-    return try a.dupe(u8, slice);
+    return try a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
 }
 
-/// Same as `dupeJsString` but returns `""` when the property is null
-/// or undefined. Used for `on_result` which is allowed to be missing.
+/// Returns `""` when the property is null / undefined; otherwise
+/// behaves like `dupeJsString`. Used for `onResult`.
 fn dupeJsStringOrEmpty(
     ctx: ?*c.JSContext,
     a: std.mem.Allocator,
@@ -345,22 +243,22 @@ fn dupeJsStringOrEmpty(
     const cstr = c.JS_ToCStringLen(ctx, &len, v);
     if (cstr == null) return error.JsException;
     defer c.JS_FreeCString(ctx, cstr);
-    const slice = @as([*]const u8, @ptrCast(cstr))[0..len];
-    return try a.dupe(u8, slice);
+    return try a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
 }
 
-/// JSON.stringify the property and return owned bytes. Used for
-/// `headers`, `retry_on`, `context` — all of which envelope 4 carries
-/// as opaque JSON-string blobs.
+/// JSON.stringify the property and return owned bytes. `default_json`
+/// is used when the property is undefined.
 fn dupeJsObjectAsJson(
     ctx: ?*c.JSContext,
     a: std.mem.Allocator,
     obj: c.JSValue,
     name: [:0]const u8,
+    default_json: []const u8,
 ) ![]u8 {
     const v = c.JS_GetPropertyStr(ctx, obj, name.ptr);
     defer c.JS_FreeValue(ctx, v);
-    if (c.JS_IsNull(v) or c.JS_IsUndefined(v)) return try a.dupe(u8, "null");
+    if (c.JS_IsUndefined(v)) return try a.dupe(u8, default_json);
+    if (c.JS_IsNull(v)) return try a.dupe(u8, "null");
     const s = c.JS_JSONStringify(ctx, v, js_undefined, js_undefined);
     if (c.JS_IsException(s) or c.JS_IsUndefined(s)) {
         c.JS_FreeValue(ctx, s);
@@ -374,9 +272,15 @@ fn dupeJsObjectAsJson(
     return try a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
 }
 
-fn getIntField(ctx: ?*c.JSContext, obj: c.JSValue, name: [:0]const u8) !i32 {
+fn getIntField(
+    ctx: ?*c.JSContext,
+    obj: c.JSValue,
+    name: [:0]const u8,
+    default_val: i32,
+) !i32 {
     const v = c.JS_GetPropertyStr(ctx, obj, name.ptr);
     defer c.JS_FreeValue(ctx, v);
+    if (c.JS_IsUndefined(v)) return default_val;
     var out: i32 = 0;
     if (c.JS_ToInt32(ctx, &out, v) < 0) return error.JsException;
     return out;

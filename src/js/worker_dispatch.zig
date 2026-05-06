@@ -56,7 +56,7 @@ const SuccessRec = struct {
     received_ns: i64,
     tape_refs: log_mod.TapeRefs,
     /// Pre-minted id reused on commit-time log capture so the log
-    /// record shares its id with any outbox rows `webhook.send`
+    /// record shares its id with any webhook rows `webhook.send`
     /// wrote during this request's handler.
     request_id: u64,
 };
@@ -502,19 +502,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
-    // Phase 5.5 (d), step 4 — per-batch webhook accumulator. Allocated
-    // only when the worker is in `direct` mode; null disables the new
-    // path so `webhook.send` falls through to `_outbox/{id}`. Rows are
-    // owned by the list (allocator-allocated strings inside each
-    // `WebhookRow`) and freed on `deinit` regardless of how the batch
-    // ends.
+    // Per-batch webhook accumulator. `webhook.send` appends a
+    // `WebhookRow` here; `finalizeBatch` proposes the merged batch as
+    // envelope 4 inside the type-7 multi-envelope alongside envelope
+    // 0 (writeset). Rows own allocator-allocated strings; the defer
+    // frees them regardless of how the batch ends.
     var pending_webhooks: std.ArrayListUnmanaged(webhook_server_mod.WebhookRow) = .empty;
     defer {
         for (pending_webhooks.items) |*r| r.deinit(allocator);
         pending_webhooks.deinit(allocator);
     }
-    const pending_webhooks_ptr: ?*std.ArrayListUnmanaged(webhook_server_mod.WebhookRow) =
-        if (worker.webhook_path == .direct) &pending_webhooks else null;
 
     // Successful handlers awaiting the shared commit + final move.
     // Owns `console_owned` / `exception_owned` until they transfer
@@ -764,10 +761,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var tapes = worker_mod.RequestTapes.init(allocator);
         defer tapes.deinit();
 
-        // Pre-mint the request id. webhook.send derives its outbox id
+        // Pre-mint the request id. webhook.send derives its webhook id
         // from this (so replays produce matching ids), and captureLog
         // at the end reuses it so the log record shares the id with
-        // every outbox row this request spawned. Lazy-opens the log
+        // every webhook row this request spawned. Lazy-opens the log
         // store if the tenant was created at runtime.
         const request_id: u64 = blk: {
             const tl_opt = worker_mod.getOrOpenTenantLog(worker, scope_inst) catch |err| {
@@ -839,7 +836,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 @ptrCast(worker)
             else
                 null,
-            .pending_webhooks = pending_webhooks_ptr,
+            .pending_webhooks = &pending_webhooks,
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(

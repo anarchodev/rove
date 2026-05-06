@@ -101,13 +101,6 @@ pub const Cli = struct {
     /// customer handler probe localhost and leaks request bodies
     /// over plaintext. Startup emits a loud warning when enabled.
     dev_webhook_unsafe: bool = false,
-    /// Phase 5.5 (d). `direct` (default as of step 5, 2026-05-06)
-    /// is the new path: `webhook.send` accumulates per-batch and
-    /// rides atomically with the writeset via the multi-envelope
-    /// wrapper. `drainer` keeps the legacy per-tenant `_outbox/{id}`
-    /// + drainer-thread path for one-release rollback safety; step 6
-    /// deletes the drainer outright and removes this flag.
-    webhook_path: []const u8 = "direct",
     /// **Local-dev convenience flag.** When set, the worker uses
     /// mkcert-issued TLS at the platform-default loop46 data dir
     /// (see `defaultDevTlsPaths`). On first run, if the cert is
@@ -212,19 +205,6 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             out.refresh_interval_ms = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, a, "--dev-webhook-unsafe")) {
             out.dev_webhook_unsafe = true;
-        } else if (std.mem.eql(u8, a, "--webhook-path")) {
-            i += 1;
-            if (i >= args.len) return error.Usage;
-            out.webhook_path = args[i];
-            if (!std.mem.eql(u8, out.webhook_path, "drainer") and
-                !std.mem.eql(u8, out.webhook_path, "direct"))
-            {
-                std.debug.print(
-                    "error: --webhook-path must be 'drainer' or 'direct' (got '{s}')\n",
-                    .{out.webhook_path},
-                );
-                return error.Usage;
-            }
         } else if (std.mem.eql(u8, a, "--rate-limit-request-capacity")) {
             i += 1;
             if (i >= args.len) return error.Usage;

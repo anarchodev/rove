@@ -159,11 +159,13 @@ pub const Request = struct {
         target_id: []const u8,
     ) anyerror!void = null,
     deploy_starter_ctx: ?*anyopaque = null,
-    /// Phase 5.5 (d), step 4. When non-null, `webhook.send` appends a
-    /// `WebhookRow` here instead of writing `_outbox/{id}`. The
-    /// dispatcher allocates this list once per batch when the worker
-    /// is in `direct` mode and proposes it as envelope 4 alongside
-    /// envelope 0 in a multi-envelope at batch commit.
+    /// Phase 5.5 (d). `webhook.send` appends a `WebhookRow` to this
+    /// list; the dispatcher allocates it once per batch and proposes
+    /// it as envelope 4 alongside envelope 0 in a multi-envelope at
+    /// batch commit. Optional only because dispatcher-test paths can
+    /// leave it null (the test helper allocates a local list); the
+    /// production dispatcher always sets it non-null. `webhook.send`
+    /// throws if it's null.
     pending_webhooks: ?*std.ArrayListUnmanaged(webhook_server.WebhookRow) = null,
 };
 
@@ -1542,10 +1544,22 @@ fn runOne(
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
 
+    // `webhook.send` requires a non-null pending_webhooks list (Phase
+    // 5.5 d step 6 removed the legacy `_outbox/{id}` fallback). Tests
+    // that don't care still need one allocated; ones that DO care
+    // pass their own list in via `request.pending_webhooks` and the
+    // local one stays unused.
+    var local_webhooks: std.ArrayListUnmanaged(webhook_server.WebhookRow) = .empty;
+    defer {
+        for (local_webhooks.items) |*r| r.deinit(testing.allocator);
+        local_webhooks.deinit(testing.allocator);
+    }
+
     // If the caller didn't set a query, force `fn=go` so the
     // dispatcher finds our wrapper export.
     var request = request_in;
     if (request.query == null) request.query = "fn=go";
+    if (request.pending_webhooks == null) request.pending_webhooks = &local_webhooks;
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
     const resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, request, &budget);
@@ -3356,7 +3370,7 @@ test "dispatch: request.query exposes raw query string" {
 }
 
 
-test "dispatch: webhook.send writes _outbox/{id} with the envelope" {
+test "dispatch: webhook.send appends WebhookRow to pending_webhooks" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -3366,6 +3380,12 @@ test "dispatch: webhook.send writes _outbox/{id} with the envelope" {
 
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
+
+    var webhooks: std.ArrayListUnmanaged(webhook_server.WebhookRow) = .empty;
+    defer {
+        for (webhooks.items) |*r| r.deinit(testing.allocator);
+        webhooks.deinit(testing.allocator);
+    }
 
     // Handler fires two webhooks; the second exercises call_index = 1.
     var resp = try runOne(
@@ -3383,33 +3403,35 @@ test "dispatch: webhook.send writes _outbox/{id} with the envelope" {
         \\});
         \\return id1 + "|" + id2;
     ,
-        .{ .method = "GET", .path = "/hook", .request_id = 0xdeadbeef },
+        .{
+            .method = "GET",
+            .path = "/hook",
+            .request_id = 0xdeadbeef,
+            .pending_webhooks = &webhooks,
+        },
     );
     defer resp.deinit(testing.allocator);
 
     // 64-hex id | 64-hex id → 129 chars total.
     try testing.expectEqual(@as(usize, 64 * 2 + 1), resp.body.len);
 
-    // Commit has already fired inside runOne. Scan `_outbox/*`; expect
-    // two rows in insertion order, each with the envelope we fed in.
-    const scan = try kv.prefix("_outbox/", "", 10);
-    defer {
-        var m = scan;
-        m.deinit();
-    }
-    try testing.expectEqual(@as(usize, 2), scan.entries.len);
+    try testing.expectEqual(@as(usize, 2), webhooks.items.len);
 
-    // Each value must be JSON with the url/body/context we passed.
-    const parsed_a = try std.json.parseFromSlice(std.json.Value, testing.allocator, scan.entries[0].value, .{});
-    defer parsed_a.deinit();
-    const url_a = parsed_a.value.object.get("url").?.string;
-    try testing.expect(std.mem.endsWith(u8, url_a, "/a") or std.mem.endsWith(u8, url_a, "/b"));
+    // Insertion order preserved.
+    try testing.expectEqualStrings("https://example.test/a", webhooks.items[0].url);
+    try testing.expectEqualStrings("POST", webhooks.items[0].method);
+    try testing.expectEqualStrings("one", webhooks.items[0].body);
+    try testing.expectEqualStrings("cb/a", webhooks.items[0].on_result_path);
+    try testing.expectEqualStrings("{\"x\":1}", webhooks.items[0].context_json);
 
-    const attempts = parsed_a.value.object.get("attempts").?.integer;
-    try testing.expectEqual(@as(i64, 0), attempts);
+    try testing.expectEqualStrings("https://example.test/b", webhooks.items[1].url);
+    try testing.expectEqualStrings("GET", webhooks.items[1].method);
 
-    const parent = parsed_a.value.object.get("parent_request_id").?.integer;
-    try testing.expectEqual(@as(i64, 0xdeadbeef), parent);
+    // Webhook ids match the response body.
+    const id1 = resp.body[0..64];
+    const id2 = resp.body[65..];
+    try testing.expectEqualSlices(u8, id1, &webhooks.items[0].webhook_id_hex);
+    try testing.expectEqualSlices(u8, id2, &webhooks.items[1].webhook_id_hex);
 }
 
 test "dispatch: webhook.send ids are deterministic under replay" {
@@ -3482,6 +3504,11 @@ test "dispatch: email.send wraps webhook.send with Resend shape" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
+    var webhooks: std.ArrayListUnmanaged(webhook_server.WebhookRow) = .empty;
+    defer {
+        for (webhooks.items) |*r| r.deinit(testing.allocator);
+        webhooks.deinit(testing.allocator);
+    }
     var resp = try runOne(
         &d,
         kv,
@@ -3495,36 +3522,36 @@ test "dispatch: email.send wraps webhook.send with Resend shape" {
         \\  context: { user_id: 42 },
         \\});
     ,
-        .{ .method = "POST", .path = "/", .request_id = 7 },
+        .{
+            .method = "POST",
+            .path = "/",
+            .request_id = 7,
+            .pending_webhooks = &webhooks,
+        },
     );
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 64), resp.body.len); // id hex
 
-    const scan = try kv.prefix("_outbox/", "", 10);
-    defer {
-        var m = scan;
-        m.deinit();
-    }
-    try testing.expectEqual(@as(usize, 1), scan.entries.len);
+    try testing.expectEqual(@as(usize, 1), webhooks.items.len);
+    const row = webhooks.items[0];
 
-    var env = try std.json.parseFromSlice(std.json.Value, testing.allocator, scan.entries[0].value, .{});
-    defer env.deinit();
-    const obj = env.value.object;
+    try testing.expectEqualStrings("https://api.resend.com/emails", row.url);
+    try testing.expectEqualStrings("POST", row.method);
 
-    try testing.expectEqualStrings("https://api.resend.com/emails", obj.get("url").?.string);
-    try testing.expectEqualStrings("POST", obj.get("method").?.string);
+    var headers = try std.json.parseFromSlice(std.json.Value, testing.allocator, row.headers_json, .{});
+    defer headers.deinit();
     try testing.expectEqualStrings(
         "Bearer re_test_abc",
-        obj.get("headers").?.object.get("Authorization").?.string,
+        headers.value.object.get("Authorization").?.string,
     );
     try testing.expectEqualStrings(
         "application/json",
-        obj.get("headers").?.object.get("Content-Type").?.string,
+        headers.value.object.get("Content-Type").?.string,
     );
-    try testing.expectEqualStrings("signup/email_result", obj.get("on_result").?.string);
+    try testing.expectEqualStrings("signup/email_result", row.on_result_path);
 
     // Body is a JSON string; parse to check shape.
-    var body_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, obj.get("body").?.string, .{});
+    var body_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, row.body, .{});
     defer body_parsed.deinit();
     const body_obj = body_parsed.value.object;
     try testing.expectEqualStrings("noreply@loop46.me", body_obj.get("from").?.string);
@@ -4164,6 +4191,11 @@ test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
+    var webhooks: std.ArrayListUnmanaged(webhook_server.WebhookRow) = .empty;
+    defer {
+        for (webhooks.items) |*r| r.deinit(testing.allocator);
+        webhooks.deinit(testing.allocator);
+    }
     var resp = try runOne(
         &d,
         kv,
@@ -4177,18 +4209,17 @@ test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
         \\  text: "t",
         \\});
     ,
-        .{ .method = "POST", .path = "/", .request_id = 2 },
+        .{
+            .method = "POST",
+            .path = "/",
+            .request_id = 2,
+            .pending_webhooks = &webhooks,
+        },
     );
     defer resp.deinit(testing.allocator);
 
-    const scan = try kv.prefix("_outbox/", "", 10);
-    defer {
-        var m = scan;
-        m.deinit();
-    }
-    var env = try std.json.parseFromSlice(std.json.Value, testing.allocator, scan.entries[0].value, .{});
-    defer env.deinit();
-    var body = try std.json.parseFromSlice(std.json.Value, testing.allocator, env.value.object.get("body").?.string, .{});
+    try testing.expectEqual(@as(usize, 1), webhooks.items.len);
+    var body = try std.json.parseFromSlice(std.json.Value, testing.allocator, webhooks.items[0].body, .{});
     defer body.deinit();
 
     try testing.expectEqual(@as(usize, 2), body.value.object.get("to").?.array.items.len);

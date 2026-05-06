@@ -91,7 +91,7 @@ pub fn proposeFilesWriteSet(
 /// **Divergence note**: if the caller already wrote to root locally
 /// and this propose fails, the leader's root.db has state that
 /// followers don't. Current code logs and moves on (at-least-once
-/// semantics consistent with the outbox / callback layers). A future
+/// semantics consistent with the webhook / callback layers). A future
 /// iteration can wrap root writes in a TrackedTxn with undo
 /// semantics so propose failure triggers a compensating rollback.
 pub fn proposeRootWriteSet(

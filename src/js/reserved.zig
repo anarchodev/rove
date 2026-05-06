@@ -14,11 +14,10 @@
 //!
 //! - `isCustomerWriteReserved` (runtime guard on `kv.set` / `kv.delete`):
 //!   rejects any key starting with a platform prefix. Customer code has
-//!   no business writing into `_outbox/`, `_events/`, `_callback/`, etc.
-//!   — those are platform-write-only. Platform writes (e.g.
-//!   `webhook.send` writing `_outbox/{id}`) bypass `jsKvSet` and write
-//!   directly via `state.txn.put`, so this check catches only the
-//!   spoofing path through `kv.set`.
+//!   no business writing into `_events/`, `_callback/`, etc. — those
+//!   are platform-write-only. Platform writes bypass `jsKvSet` and
+//!   write directly via `state.txn.put`, so this check catches only
+//!   the spoofing path through `kv.set`.
 
 const std = @import("std");
 
@@ -26,10 +25,13 @@ const std = @import("std");
 /// the platform writers that own each namespace:
 ///   `_audit/`           → reserved for future audit log
 ///   `_deploy/`          → reserved for future deploy metadata in app.db
-///   `_outbox/`          → webhook.send writes here (drainer reads)
-///   `_outbox_inflight/` → webhook drainer's lease parking spot
-///   `_dlq/`             → terminal-failed webhook envelopes
-///   `_callback/`        → webhook drainer writes; dispatchCallbacks reads
+///   `_outbox/`          → historical (legacy webhook drainer); kept
+///                         reserved so the prefix can't be spoofed by
+///                         customer writes after Phase 5.5 (d) cutover
+///   `_outbox_inflight/` → historical (legacy lease parking spot)
+///   `_dlq/`             → historical (legacy terminal-failed webhooks)
+///   `_callback/`        → webhook envelope-5 apply writes here;
+///                         dispatchCallbacks reads + invokes onResult
 ///   `_magic/`           → magic-link tokens (root.db only, but list-wide)
 ///   `_triggers/`        → trigger module bytecode (manifest, not app.db)
 ///   `_events/`          → SSE event rows (events.emit writes)

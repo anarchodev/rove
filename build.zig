@@ -91,14 +91,6 @@ pub fn build(b: *std.Build) void {
     files_mod.addImport("rove-kv", kv_mod);
     files_mod.addImport("rove-blob", blob_mod);
 
-    // ── rove-outbox: webhook delivery (SSRF + HTTP client + drainer) ──
-    const outbox_mod = b.addModule("rove-outbox", .{
-        .root_source_file = b.path("src/outbox/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    outbox_mod.addImport("rove-kv", kv_mod);
-
     // ── rove-log: per-tenant request log store ──
     //
     // Phase 3. Mirrors rove-files's "per-tenant SQLite index + rove-blob
@@ -215,12 +207,10 @@ pub fn build(b: *std.Build) void {
     webhook_server_mod.linkSystemLibrary("ssl", .{});
     webhook_server_mod.linkSystemLibrary("crypto", .{});
     webhook_server_mod.addImport("rove-kv", kv_mod);
-    // Reuses `outbox/ssrf.zig` + `outbox/http_client.zig` for outbound
-    // delivery. When the drainer goes away in step 6 of the migration,
-    // those utilities move into rove-webhook-server proper (or into a
-    // shared http-out module). For now, importing rove-outbox keeps
-    // them in one canonical place.
-    webhook_server_mod.addImport("rove-outbox", outbox_mod);
+    // `webhook_server/ssrf.zig` + `http_client.zig` are the outbound
+    // delivery utilities. They moved here from the deleted rove-outbox
+    // module in Phase 5.5 (d) step 6 — webhook-server is the only
+    // consumer.
 
     // ── rove-files-server: per-instance code operations (Phase 5) ──
     //
@@ -277,10 +267,6 @@ pub fn build(b: *std.Build) void {
     // rove-files tests
     const files_tests = b.addTest(.{ .root_module = files_mod });
     test_step.dependOn(&b.addRunArtifact(files_tests).step);
-
-    // rove-outbox tests
-    const outbox_tests = b.addTest(.{ .root_module = outbox_mod });
-    test_step.dependOn(&b.addRunArtifact(outbox_tests).step);
 
     // rove-log tests
     const log_tests = b.addTest(.{ .root_module = log_mod });
@@ -377,7 +363,6 @@ pub fn build(b: *std.Build) void {
     loop46_mod.addImport("rove-qjs", qjs_mod);
     loop46_mod.addImport("rove-tenant", tenant_mod);
     loop46_mod.addImport("rove-h2", h2_mod);
-    loop46_mod.addImport("rove-outbox", outbox_mod);
     loop46_mod.addImport("rove-webhook-server", webhook_server_mod);
     // Admin tenant bundle — embedded so the binary ships with a working
     // dashboard + handler at app.{BASE_DOMAIN}/ out of the box. The

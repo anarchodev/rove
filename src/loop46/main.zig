@@ -57,7 +57,6 @@ const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
 const files_server = @import("rove-files-server");
 const log_server = @import("rove-log-server");
-const outbox = @import("rove-outbox");
 const webhook_server_mod = @import("rove-webhook-server");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
@@ -337,11 +336,6 @@ const WorkerCtx = struct {
     /// opens with a counter from this registry so seq allocation
     /// stays globally monotonic.
     seq_counters: *kv.SeqCounterRegistry,
-    /// Phase 5.5 (d), step 4. Borrowed from the main thread's `cli`;
-    /// drives the dispatcher's per-batch `pending_webhooks` allocation
-    /// and the multi-envelope propose at finalize. See
-    /// `WorkerConfig.webhook_path`.
-    webhook_path: rjs.WebhookPath,
     /// Main thread blocks on these until every worker has bound its
     /// h2 listener — this is what `SO_REUSEPORT` needs before requests
     /// can hit any of them.
@@ -445,7 +439,6 @@ fn workerMain(args: *WorkerCtx) !void {
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
         .blob_backend = args.blob_backend_cfg,
-        .webhook_path = args.webhook_path,
     });
     defer worker.destroy();
 
@@ -527,9 +520,10 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.refreshDeployments(worker);
 
         // Webhook callback dispatch: on the raft leader, worker 0
-        // scans every tenant's `_callback/*` rows left by the outbox
-        // drainer and invokes the customer's `onResult` handler in
-        // its own transaction. Gated to worker 0 so two threads on
+        // scans every tenant's `_callback/*` rows left by the
+        // webhook-server's envelope-5 apply and invokes the customer's
+        // `onResult` handler in its own transaction. Gated to worker 0
+        // so two threads on
         // the same node don't race on the same receipt — the inner
         // SQLite txn would serialize them anyway via SQLITE_BUSY,
         // but pinning avoids the wasted turnaround.
@@ -888,8 +882,8 @@ pub fn main() !void {
     try std.fs.cwd().makePath(cli.data_dir);
 
     if (cli.dev_webhook_unsafe) {
-        outbox.ssrf.dev_allow_loopback = true;
-        outbox.http_client.dev_allow_plaintext = true;
+        webhook_server_mod.ssrf.dev_allow_loopback = true;
+        webhook_server_mod.http_client.dev_allow_plaintext = true;
         std.log.warn("*** --dev-webhook-unsafe enabled: webhook.send may target loopback over http:// — DEV ONLY ***", .{});
     }
 
@@ -973,35 +967,13 @@ pub fn main() !void {
     defer ls_handle.shutdown();
     const log_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, ls_handle.port);
 
-    // ── Outbox drainer ──
+    // ── Webhook-server thread (Phase 5.5 d) ───────────────────────────
     //
-    // One thread on the raft leader scans every tenant's `_outbox/*`
-    // and runs the HTTP side. At-least-once delivery; receivers dedup
-    // on X-Rove-Webhook-Id. The InstanceProvider here is a simple
-    // filesystem walk — cheap at our current scale; slice 3b replaces
-    // it with a root-marker index once the LRU matters.
-    var fs_provider_ctx = FsInstanceProvider{ .data_dir = cli.data_dir };
-    const drainer_handle = try outbox.spawnDrainer(.{
-        .allocator = allocator,
-        .raft = raft_node,
-        .instances = .{
-            .snapshot = FsInstanceProvider.snapshot,
-            .deinit = FsInstanceProvider.deinit,
-            .ctx = &fs_provider_ctx,
-        },
-    });
-    defer drainer_handle.join();
-    defer drainer_handle.signalStop();
-
-    // ── Webhook-server thread (Phase 5.5 d, step 3) ────────────────────
-    //
-    // Leader-pinned poll loop reading `{data_dir}/webhooks.db`. Until
-    // the dispatcher cutover (step 4) lands the drainer continues to
-    // own the legacy `_outbox/*` path; this thread starts processing
-    // rows the moment something writes to the consolidated
-    // `webhooks.db` (test-driven for now, dispatcher-driven once
-    // step 4 ships). Both threads gate on `raft.isLeader()` so they
-    // never run concurrently on a follower.
+    // Leader-pinned poll loop reading `{data_dir}/webhooks.db`. The
+    // dispatcher's `webhook.send` calls accumulate into a per-batch
+    // webhook list which rides atomically with the writeset via the
+    // type-7 multi-envelope; this thread reads the resulting rows
+    // and POSTs them.
     const webhook_handle = try webhook_server_mod.thread.spawn(.{
         .allocator = allocator,
         .data_dir = cli.data_dir,
@@ -1059,10 +1031,6 @@ pub fn main() !void {
             .blob_backend_cfg = blob_owned.cfg,
             .tls_config = tls_config,
             .seq_counters = &seq_counters,
-            .webhook_path = if (std.mem.eql(u8, cli.webhook_path, "direct"))
-                rjs.WebhookPath.direct
-            else
-                rjs.WebhookPath.drainer,
             .ready = &ready_events[i],
         };
         threads[i] = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctxs[i]});
@@ -1306,52 +1274,3 @@ const QjsCompiler = struct {
     }
 };
 
-/// InstanceProvider that walks `{data_dir}/*` on each scan and
-/// reports every subdir that has an `app.db` file. Cheap at our
-/// current scale (tens of tenants); slice 3b replaces it with a
-/// root-marker scan once the LRU cache lands.
-const FsInstanceProvider = struct {
-    data_dir: []const u8,
-
-    fn snapshot(ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror![]outbox.InstanceInfo {
-        const self: *FsInstanceProvider = @ptrCast(@alignCast(ctx.?));
-        var list: std.ArrayListUnmanaged(outbox.InstanceInfo) = .empty;
-        errdefer {
-            for (list.items) |info| {
-                allocator.free(info.id);
-                allocator.free(info.dir);
-            }
-            list.deinit(allocator);
-        }
-
-        var dir = std.fs.cwd().openDir(self.data_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return list.toOwnedSlice(allocator),
-            else => return err,
-        };
-        defer dir.close();
-
-        var it = dir.iterate();
-        while (try it.next()) |entry| {
-            if (entry.kind != .directory) continue;
-            // Peek for an app.db to confirm this is a tenant dir.
-            const probe = try std.fmt.allocPrint(allocator, "{s}/{s}/app.db", .{ self.data_dir, entry.name });
-            defer allocator.free(probe);
-            std.fs.cwd().access(probe, .{}) catch continue;
-
-            const id_copy = try allocator.dupe(u8, entry.name);
-            errdefer allocator.free(id_copy);
-            const dir_copy = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.data_dir, entry.name });
-            errdefer allocator.free(dir_copy);
-            try list.append(allocator, .{ .id = id_copy, .dir = dir_copy });
-        }
-        return list.toOwnedSlice(allocator);
-    }
-
-    fn deinit(_: ?*anyopaque, allocator: std.mem.Allocator, slice: []outbox.InstanceInfo) void {
-        for (slice) |info| {
-            allocator.free(info.id);
-            allocator.free(info.dir);
-        }
-        allocator.free(slice);
-    }
-};

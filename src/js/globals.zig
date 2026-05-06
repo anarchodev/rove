@@ -28,14 +28,6 @@ const events_b = @import("bindings/events.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
 
-/// Phase 5.5 (d), step 4 — selects which webhook delivery path the
-/// dispatcher uses. `drainer` is the legacy per-tenant `_outbox/{id}`
-/// + drainer thread; `direct` is the new path where `webhook.send`
-/// accumulates per-batch and rides atomically with the writeset via
-/// the multi-envelope wrapper. Default `drainer` until the cutover
-/// is verified; flipped to `direct` in dev → smoked → made the only
-/// path in step 5.
-pub const WebhookPath = enum { drainer, direct };
 
 const c = qjs.c;
 
@@ -103,11 +95,11 @@ pub const DispatchState = struct {
     /// present (so the normal path still uses qjs's built-in Math.random).
     prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     /// Per-request identifier, pre-minted by the worker. Combined with
-    /// `webhook_call_index` to derive a deterministic outbox id for
+    /// `webhook_call_index` to derive a deterministic webhook id for
     /// every `webhook.send` this handler invocation performs.
     request_id: u64 = 0,
     /// 0-based counter of `webhook.send` calls within this handler
-    /// invocation. Resets per request. Part of the outbox id derivation
+    /// invocation. Resets per request. Part of the webhook id derivation
     /// so replays produce the same ids.
     webhook_call_index: u32 = 0,
     /// 0-based counter of `events.emit` calls within this handler
@@ -158,19 +150,19 @@ pub const DispatchState = struct {
     /// (the snapshot/restore wipes the runtime). Owned values must
     /// be `JS_FreeValue`'d on `deinit`.
     trigger_module_ns: std.StringHashMapUnmanaged(c.JSValue) = .empty,
-    /// Phase 5.5 (d), step 4 — per-batch webhook accumulator. When
-    /// non-null, `webhook.send` appends a `WebhookRow` here instead of
-    /// writing `_outbox/{id}` to the tenant's app.db. The dispatcher
-    /// (worker_dispatch.dispatchOnce) allocates this list once per
-    /// batch when `worker.webhook_path == .direct` and proposes it as
-    /// envelope 4 inside the type-7 multi-envelope at batch commit.
-    /// Owned by worker_dispatch; rows' []const u8 fields are owned
-    /// strings allocated from `state.allocator` and freed on the
-    /// list's `WebhookRow.deinit`.
+    /// Phase 5.5 (d) — per-batch webhook accumulator. `webhook.send`
+    /// appends a `WebhookRow` here; `worker_dispatch.finalizeBatch`
+    /// proposes the merged batch as envelope 4 inside the type-7
+    /// multi-envelope alongside envelope 0 (writeset). Owned by
+    /// `worker_dispatch.dispatchOnce`; rows' `[]const u8` fields are
+    /// allocator-owned strings freed on the list's `WebhookRow.deinit`.
+    /// Optional purely so the dispatcher's standalone test paths
+    /// (which don't allocate the list) can leave it null and skip
+    /// the new path; production worker code always sets it non-null.
     pending_webhooks: ?*std.ArrayListUnmanaged(webhook_server.WebhookRow) = null,
     /// Per-worker rate limiter. Used by the `__rove_check_email_rate`
     /// builtin (called from the `email.send` JS wrapper) to take
-    /// from the email bucket before queuing the outbox row. Null in
+    /// from the email bucket before queuing the webhook row. Null in
     /// test paths that don't care.
     limiter: ?*limiter_mod.RateLimiter = null,
     /// Instance id for limiter lookup. Empty when the dispatcher
@@ -294,9 +286,10 @@ fn jsKvSet(
     defer state.allocator.free(val_str);
 
     // Reject writes into platform-reserved namespaces. Platform writers
-    // (webhook.send → _outbox/, events.emit → _events/, ...) bypass
-    // jsKvSet and write through state.txn / state.writeset directly,
-    // so this guard only fires when customer JS tries to spoof a
+    // (webhook.send → pending_webhooks accumulator, events.emit →
+    // _events/, etc.) bypass jsKvSet and write through state.txn /
+    // state.writeset directly (or the per-batch webhook list), so
+    // this guard only fires when customer JS tries to spoof a
     // platform key.
     if (reserved.isCustomerWriteReserved(key_str)) {
         return throwReservedKey(ctx, key_str);
@@ -965,9 +958,11 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "sha256",          .cfunc = crypto_b.jsCryptoSha256,          .argc = 1 },
         .{ .name = "hmacSha256",      .cfunc = crypto_b.jsCryptoHmacSha256,      .argc = 2 },
     } },
-    // webhook.send. Delivery is async — send() persists the envelope
-    // in the handler's transaction and returns an id; the drainer
-    // thread on the raft leader does the actual HTTP call.
+    // webhook.send. Delivery is async — send() appends a WebhookRow
+    // to the dispatcher's per-batch accumulator and returns an id;
+    // the leader-pinned webhook-server thread reads webhooks.db (the
+    // raft-replicated store the apply-side writes envelope 4 into)
+    // and does the actual HTTP call.
     .{ .path = &.{"webhook"}, .fns = &.{
         .{ .name = "send", .cfunc = webhook_b.jsWebhookSend, .argc = 1 },
     } },
@@ -1005,7 +1000,7 @@ const INTRINSIC_EXTENSIONS = [_]NamespaceBindings{
 
 const GLOBAL_BUILTINS = [_]FnBinding{
     // Take from the email rate-limit bucket. Called from the
-    // email.send JS wrapper before queuing the outbox row. Throws
+    // email.send JS wrapper before queuing the webhook row. Throws
     // Error{code:"rate_limited"} on exhaustion; no-op (returns
     // undefined) when state.limiter is null (test paths).
     .{ .name = "__rove_check_email_rate", .cfunc = webhook_b.jsCheckEmailRate, .argc = 0 },

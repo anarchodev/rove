@@ -19,9 +19,9 @@
 //! (per-instance Resend send budget, protects the platform's
 //! reputation/bill). Other actions in PLAN §2.10 (`deploy`,
 //! `webhook_attempt`, `kv_write`) are deferred — webhooks are already
-//! paced by outbox depth + per-destination cap + exponential backoff;
-//! deploys are low-volume; kv_write is a hot path with real per-call
-//! cost to add bucket math.
+//! paced by webhooks.db depth + per-destination cap + exponential
+//! backoff; deploys are low-volume; kv_write is a hot path with real
+//! per-call cost to add bucket math.
 //!
 //! Thread safety: not synchronized; each worker thread owns its own
 //! RateLimiter. Same model as `penalty.zig`.

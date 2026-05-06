@@ -467,14 +467,6 @@ pub const WorkerConfig = struct {
     /// must outlive the worker's `create` call (S3BlobStore.init dupes
     /// them, so afterwards they can be freed).
     blob_backend: blob_mod.BackendConfig = .fs,
-    /// Phase 5.5 (d). `direct` (default as of step 5) means
-    /// `webhook.send` accumulates per-batch and rides atomically
-    /// with the writeset via the multi-envelope wrapper. `drainer`
-    /// keeps the legacy `_outbox/{id}` path for rollback safety;
-    /// step 6 deletes it. The webhook-server thread (step 3)
-    /// handles delivery in both modes — it's the worker → store
-    /// path that flips here.
-    webhook_path: globals.WebhookPath = .direct,
 };
 
 /// Cross-reference component used by the `/_system/*` proxy. Lives
@@ -582,10 +574,6 @@ pub fn Worker(comptime opts: Options) type {
         /// Picks fs vs s3 for every per-tenant blob backend this
         /// worker opens. Borrowed from `WorkerConfig.blob_backend`.
         blob_backend_cfg: blob_mod.BackendConfig,
-        /// Phase 5.5 (d), step 4. Drives the worker_dispatch
-        /// allocation of `pending_webhooks` and the multi-envelope
-        /// propose at batch commit. See `WorkerConfig.webhook_path`.
-        webhook_path: globals.WebhookPath,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -644,7 +632,6 @@ pub fn Worker(comptime opts: Options) type {
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
                 .blob_backend_cfg = config.blob_backend,
-                .webhook_path = config.webhook_path,
             };
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
@@ -949,7 +936,7 @@ fn freeTenantLog(allocator: std.mem.Allocator, tl: *TenantLog) void {
 
 /// Mirror of `getOrOpenTenantFiles` for the log store. Lazy-opens a
 /// TenantLog for instances created at runtime so pre-minted
-/// request_ids and webhook outbox rows get matching log records.
+/// request_ids and webhook rows get matching log records.
 pub fn getOrOpenTenantLog(
     worker: anytype,
     inst: *const tenant_mod.Instance,
@@ -1130,7 +1117,7 @@ pub fn captureLog(
 }
 
 /// Same as `captureLog`, but lets the caller supply a pre-minted
-/// `request_id` so the log record shares its id with the outbox rows
+/// `request_id` so the log record shares its id with the webhook rows
 /// a handler may have spawned via `webhook.send`. Pass `null` to mint
 /// fresh.
 pub fn captureLogWithId(

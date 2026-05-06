@@ -553,9 +553,9 @@ No change.
 
 ## 7. Migration order
 
-The current code has a fully-functional drainer + per-tenant outbox.
-Cutover happens in steps so each is independently shippable +
-smoke-testable.
+All six migration steps shipped 2026-05-05/06; left in original
+"not started yet" form below for the historical trail. Status snapshot
+lives in `docs/phase-5.5-rollout.md` §2.
 
 1. **Add `webhooks.db` schema + envelope types 4/5/6 + multi-
    envelope-entry support to apply path.** Default behavior

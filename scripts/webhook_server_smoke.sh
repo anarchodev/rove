@@ -10,7 +10,7 @@
 #     to the tenant's app.db
 #   - the existing `dispatchCallbacks` phase invokes the customer
 #     `onResult` handler, which is the existing path (unchanged from
-#     the legacy drainer flow)
+#     the customer onResult contract; unchanged from before Phase 5.5)
 #
 # Differs from `webhook_smoke.sh`: no `webhook.send` from JS; the row
 # is injected directly into `webhooks.db` via the `webhook-test-enqueue`

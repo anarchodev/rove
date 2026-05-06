@@ -1,9 +1,10 @@
 //! Callback dispatch — invokes the tenant's `onResult` handler after
-//! the outbox drainer finishes a webhook attempt (delivered or
+//! the webhook-server finishes a webhook attempt (delivered or
 //! terminally failed).
 //!
-//! The drainer writes `_callback/{id}` receipts into the tenant's
-//! app.db when delivery completes. This phase, driven from the worker
+//! Envelope-5 apply (Phase 5.5 d) writes `_callback/{id}` receipts
+//! into the tenant's app.db when delivery completes. This phase,
+//! driven from the worker
 //! poll loop on the raft leader, scans those receipts, resolves the
 //! customer's `on_result` handler path to bytecode, and invokes it
 //! with a synthetic event object. Each tenant's successful invocations
@@ -219,7 +220,7 @@ fn runOneCallback(
     const on_result: []const u8 = switch (obj.get("on_result") orelse std.json.Value{ .null = {} }) {
         .string => |s| s,
         else => {
-            // No callback path on the envelope — a drainer bug; drop
+            // No callback path on the envelope — apply-side bug; drop
             // rather than loop forever.
             std.log.warn(
                 "rove-js callbacks: {s}/{s}: no on_result; dropping",
@@ -279,9 +280,9 @@ fn runOneCallback(
         .prng_seed = @bitCast(received_ns),
         .request_id = request_id,
         .platform = inst.platform,
-        // Callbacks are platform-driven (drainer fired the webhook,
-        // success/failure routes back through this dispatch); they
-        // share the customer's email bucket via the same limiter.
+        // Callbacks are platform-driven (webhook-server fired the
+        // webhook, success/failure routes back through this dispatch);
+        // they share the customer's email bucket via the same limiter.
         .limiter = &worker.limiter,
         .instance_id = inst.id,
     };
@@ -347,9 +348,9 @@ fn findCallbackBytecode(
     tc: *const worker_mod.TenantFiles,
     on_result: []const u8,
 ) !?[]u8 {
-    // Forbid absolute paths / parent-escape. The drainer writes
-    // envelopes from what `webhook.send` accepted, but defense in
-    // depth is cheap.
+    // Forbid absolute paths / parent-escape. The webhook-server
+    // produces envelopes from what `webhook.send` accepted, but
+    // defense in depth is cheap.
     if (on_result.len == 0) return null;
     if (on_result[0] == '/') return null;
     if (std.mem.indexOf(u8, on_result, "..") != null) return null;
@@ -364,8 +365,8 @@ fn findCallbackBytecode(
 
 /// Build the dispatcher's POST body — `{fn: "default", args: [event]}`
 /// — from the parsed envelope. Keys in the outer envelope are
-/// snake_case (as written by the drainer); the event object exposed
-/// to JS uses camelCase, matching PLAN §2.6.
+/// snake_case (as written by envelope-5 apply); the event object
+/// exposed to JS uses camelCase, matching PLAN §2.6.
 fn buildCallbackBody(
     allocator: std.mem.Allocator,
     envelope: std.json.Value,

@@ -84,7 +84,7 @@ multi-node gap (replay-after-failover).
 **Sub-plan**: PLAN §3 Phase 5.5 (b) is the spec; no separate
 sub-plan because the work is contained.
 
-### 2. Webhook subsystem — **in progress (steps 1–5 done 2026-05-06)**
+### 2. Webhook subsystem — **done 2026-05-06**
 
 - **Step 1 — done.** `src/webhook_server/root.zig` ships: `WebhookRow`,
   `WebhookStore` (kv-backed at `{data_dir}/webhooks.db`), apply
@@ -147,8 +147,22 @@ sub-plan because the work is contained.
   verifies `_outbox/*` is empty during steady state. The legacy
   `--webhook-path drainer` flag still works for rollback safety
   during the one-release window before step 6 deletes it.
-- Remaining steps (per webhook-server-plan.md §7):
-  6. **Drop the feature flag** (next) + **delete `src/outbox/drainer.zig`**.
+- **Step 6 — done.** Drainer + flag deletion. `src/outbox/` removed
+  entirely; `ssrf.zig` + `http_client.zig` moved into
+  `src/webhook_server/` (their only consumer). `WebhookPath` enum,
+  `--webhook-path` CLI flag, `WorkerConfig.webhook_path`, and
+  `Worker.webhook_path` all stripped — direct is the only path.
+  `webhook.send` simplified: extracts a `WebhookRow` from `opts`
+  directly, throws if `pending_webhooks` is null (production
+  worker_dispatch always allocates it). `loop46/main.zig` no longer
+  imports rove-outbox or spawns `drainer_handle`; the
+  `FsInstanceProvider` walker (drainer's tenant snapshot) is gone.
+  `_outbox/`, `_outbox_inflight/`, `_dlq/` stay in `reserved.zig`'s
+  PLATFORM_KV_PREFIXES list (forward-compat hygiene; nothing writes
+  them now). `webhook_direct_smoke.sh` deleted (redundant with
+  `webhook_smoke.sh`, which now exercises the direct path by
+  default). All smokes pass; dispatcher webhook tests rewritten
+  against the `pending_webhooks` accumulator.
 
 **What it delivers**: cluster-wide raft-replicated `webhooks.db`,
 new envelope types 4 (enqueue batch), 5 (complete), 6 (retry

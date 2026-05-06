@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # End-to-end smoke test for the webhook → callback pipeline.
 #
-# Covers:
-#   - `webhook.send` inside a handler writes `_outbox/{id}` + returns the id
-#   - the outbox drainer delivers the row to a real HTTP server
-#   - the drainer writes `_callback/{id}` with the delivery outcome
+# Covers (Phase 5.5 d direct-only path):
+#   - `webhook.send` inside a handler appends a WebhookRow to the
+#     dispatcher's per-batch accumulator + returns the id
+#   - the type-7 multi-envelope (writeset + webhook batch) commits
+#     atomically through raft
+#   - the leader-pinned webhook-server thread reads webhooks.db and
+#     delivers the row to a real HTTP server
+#   - envelope-5 apply writes `_callback/{id}` with the delivery outcome
 #   - `dispatchCallbacks` invokes the customer's callback handler
 #     (`cbresult.mjs`) with a camelCase event object
 #   - the callback's `kv.set` is durable + visible via the admin API
@@ -13,9 +17,9 @@
 #   - zig-out/bin/loop46 present (run `zig build install` first)
 #   - python3 on PATH (used as the webhook delivery target)
 #
-# The loop46 runs with `--dev-webhook-unsafe` so the drainer's SSRF
-# block and https-required check are relaxed for loopback. **That flag
-# is dev-only** — do not set it in production.
+# The loop46 runs with `--dev-webhook-unsafe` so the webhook-server's
+# SSRF block and https-required check are relaxed for loopback. **That
+# flag is dev-only** — do not set it in production.
 
 set -euo pipefail
 
@@ -166,9 +170,9 @@ print(urllib.parse.quote(json.dumps(['http://127.0.0.1:${ECHO_PORT}/hook','smoke
 FIRE_BODY=$("${CURL[@]}" "${ACME_ORIGIN}/cbfire?fn=fire&args=${ARGS_JSON}")
 ID=$(echo "$FIRE_BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 [[ -n "$ID" ]] || fail "fire didn't return an id: $FIRE_BODY"
-ok "handler fired webhook, outbox id=$ID"
+ok "handler fired webhook, id=$ID"
 
-# ── 4. Wait for drainer to deliver + callback to run ─────────────────
+# ── 4. Wait for webhook-server to deliver + callback to run ──────────
 FOUND_ECHO=0
 for _ in $(seq 1 30); do
     if grep -q 'POST /hook' "$ECHO_LOG"; then
@@ -177,15 +181,15 @@ for _ in $(seq 1 30); do
     fi
     sleep 0.1
 done
-[[ $FOUND_ECHO -eq 1 ]] || fail "drainer never delivered to echo server"
-ok "drainer delivered webhook to echo target"
+[[ $FOUND_ECHO -eq 1 ]] || fail "webhook-server never delivered to echo server"
+ok "webhook-server delivered webhook to echo target"
 
 # ── 4a. Metadata headers stamped on outbound request ──────────────────
 grep -q "hdr X-Rove-Webhook-Id=${ID}" "$ECHO_LOG" \
     || fail "X-Rove-Webhook-Id header missing or wrong"
 grep -q "hdr X-Rove-Webhook-Attempt=1" "$ECHO_LOG" \
     || fail "X-Rove-Webhook-Attempt header missing or wrong"
-ok "drainer stamped X-Rove-Webhook-Id + X-Rove-Webhook-Attempt"
+ok "webhook-server stamped X-Rove-Webhook-Id + X-Rove-Webhook-Attempt"
 
 # ── 5. Read the callback result via admin API ─────────────────────────
 #

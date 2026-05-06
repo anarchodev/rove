@@ -837,12 +837,14 @@ fn applyMulti(ctx: *ApplyCtx, env: Envelope) void {
 }
 
 /// Build the `_callback/{id}` JSON envelope written into the tenant's
-/// app.db when a webhook reaches a terminal outcome. Schema matches
-/// `src/outbox/drainer.zig`'s `writeCallback`: webhook_id, on_result,
-/// outcome, attempts, context, plus either `response` (delivered) or
-/// `error` (failed). The callback consumer in
-/// `src/js/callback_dispatch.zig` parses this with
+/// app.db when a webhook reaches a terminal outcome. Schema:
+/// webhook_id, on_result, outcome, attempts, context, plus either
+/// `response` (delivered) or `error` (failed). The callback consumer
+/// in `src/js/callback_dispatch.zig` parses this with
 /// `ignore_unknown_fields = true`, so missing fields are tolerated.
+/// (The historical drainer's `writeCallback` produced this same shape;
+/// kept stable so existing customer `onResult` handlers see no change
+/// across the Phase 5.5 (d) cutover.)
 fn buildCallbackJson(
     allocator: std.mem.Allocator,
     complete: *const webhook_server.CompleteEnvelope,

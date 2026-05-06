@@ -43,8 +43,8 @@
 
 const std = @import("std");
 const kv_mod = @import("rove-kv");
-const ssrf = @import("rove-outbox").ssrf;
-const http_client = @import("rove-outbox").http_client;
+const ssrf = @import("ssrf.zig");
+const http_client = @import("http_client.zig");
 
 const webhook_server = @import("root.zig");
 

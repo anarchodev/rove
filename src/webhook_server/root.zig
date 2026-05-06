@@ -43,6 +43,8 @@ const std = @import("std");
 const kv = @import("rove-kv");
 
 pub const thread = @import("thread.zig");
+pub const ssrf = @import("ssrf.zig");
+pub const http_client = @import("http_client.zig");
 
 pub const Error = error{
     Truncated,
