@@ -19,6 +19,7 @@ const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
 const log_mod = @import("rove-log");
 const tenant_mod = @import("rove-tenant");
+const webhook_server_mod = @import("rove-webhook-server");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const router_mod = @import("router.zig");
@@ -80,6 +81,7 @@ fn finalizeBatch(
     anchor: *const tenant_mod.Instance,
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *const kv_mod.WriteSet,
+    pending_webhooks: *const std.ArrayListUnmanaged(webhook_server_mod.WebhookRow),
     successes: *std.ArrayList(SuccessRec),
 ) !usize {
     const server = worker.h2;
@@ -88,6 +90,7 @@ fn finalizeBatch(
     const store = anchor.kv;
     const batch_seq = txn.txn_seq;
     const has_writes = writeset.ops.items.len > 0;
+    const has_webhooks = pending_webhooks.items.len > 0;
     var processed: usize = 0;
 
     // Commit-fail downgrade path: SQLite has already rolled back, so
@@ -115,7 +118,7 @@ fn finalizeBatch(
         }
     }
 
-    if (!has_writes) {
+    if (!has_writes and !has_webhooks) {
         // Pure read-only batch: no raft hop.
         for (successes.items) |*s| {
             server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err| panic_mod.invariantViolated(
@@ -134,9 +137,14 @@ fn finalizeBatch(
         return processed;
     }
 
-    // Writes present: propose the merged writeset once. On failure,
-    // compensating-rollback via undoTxn + downgrade every success.
-    const seq = raft_propose.proposeWriteSet(worker, writeset, anchor_id) catch |err| {
+    // Writes and/or webhooks present: propose ONE raft entry. The
+    // shape is multi-envelope (env 0 + env 4) when both, or a single
+    // envelope when only one side has content. See
+    // `raft_propose.proposeBatchAndWebhooks` for the wire decision.
+    // On failure: compensating-rollback via undoTxn + downgrade every
+    // success. The webhook accumulator is freed by the caller's
+    // `defer` regardless of which branch we take here.
+    const seq = raft_propose.proposeBatchAndWebhooks(worker, writeset, pending_webhooks.items, anchor_id) catch |err| {
         std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
         store.undoTxn(batch_seq) catch |undo_err| panic_mod.invariantViolated(
             "finalizeBatch.undoTxn(after_propose_fail)",
@@ -494,6 +502,20 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
+    // Phase 5.5 (d), step 4 — per-batch webhook accumulator. Allocated
+    // only when the worker is in `direct` mode; null disables the new
+    // path so `webhook.send` falls through to `_outbox/{id}`. Rows are
+    // owned by the list (allocator-allocated strings inside each
+    // `WebhookRow`) and freed on `deinit` regardless of how the batch
+    // ends.
+    var pending_webhooks: std.ArrayListUnmanaged(webhook_server_mod.WebhookRow) = .empty;
+    defer {
+        for (pending_webhooks.items) |*r| r.deinit(allocator);
+        pending_webhooks.deinit(allocator);
+    }
+    const pending_webhooks_ptr: ?*std.ArrayListUnmanaged(webhook_server_mod.WebhookRow) =
+        if (worker.webhook_path == .direct) &pending_webhooks else null;
+
     // Successful handlers awaiting the shared commit + final move.
     // Owns `console_owned` / `exception_owned` until they transfer
     // into a log record after commit.
@@ -817,6 +839,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 @ptrCast(worker)
             else
                 null,
+            .pending_webhooks = pending_webhooks_ptr,
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(
@@ -1003,6 +1026,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // End of walk. If no anchor was opened we're done — all processing
     // was short-circuit (failed) paths.
     if (anchor == null) return processed;
-    processed += try finalizeBatch(worker, anchor.?, &txn.?, &writeset, &successes);
+    processed += try finalizeBatch(worker, anchor.?, &txn.?, &writeset, &pending_webhooks, &successes);
     return processed;
 }

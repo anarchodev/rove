@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const kv_mod = @import("rove-kv");
+const webhook_server = @import("rove-webhook-server");
 const apply_mod = @import("apply.zig");
 
 fn proposeEncoded(
@@ -98,4 +99,65 @@ pub fn proposeRootWriteSet(
     writeset: *const kv_mod.WriteSet,
 ) !u64 {
     return proposeEncoded(worker, writeset, .root_writeset, "", true);
+}
+
+/// Phase 5.5 (d), step 4. Propose the per-batch writeset + webhook
+/// batch as ONE raft entry — the unit of atomicity for the
+/// `webhook.path = direct` cutover. Three shapes:
+///
+///   - both non-empty → type-7 multi-envelope wrapping envelope 0
+///     (writeset, with `instance_id`) + envelope 4 (enqueue batch)
+///   - writes only → a bare type-0 writeset envelope (same as
+///     `proposeWriteSet`)
+///   - webhooks only → a bare type-4 enqueue-batch envelope
+///
+/// Empty + empty is unreachable from the caller (worker_dispatch only
+/// calls when `has_writes or has_webhooks`); we still no-op-return
+/// `seq=0` rather than panic so refactoring stays graceful.
+///
+/// Returns the assigned raft seq for the caller to park on.
+pub fn proposeBatchAndWebhooks(
+    worker: anytype,
+    writeset: *const kv_mod.WriteSet,
+    webhooks: []const webhook_server.WebhookRow,
+    anchor_id: []const u8,
+) !u64 {
+    const allocator = worker.allocator;
+    const has_writes = writeset.ops.items.len > 0;
+    const has_webhooks = webhooks.len > 0;
+    if (!has_writes and !has_webhooks) return 0;
+
+    if (has_writes and has_webhooks) {
+        const ws_bytes = try writeset.encode(allocator);
+        defer allocator.free(ws_bytes);
+        const ws_env = try apply_mod.encodeWriteSetEnvelope(allocator, anchor_id, ws_bytes);
+        defer allocator.free(ws_env);
+
+        const wh_payload = try webhook_server.encodeEnqueueBatch(allocator, webhooks);
+        defer allocator.free(wh_payload);
+        const wh_env = try apply_mod.encodeWebhookEnqueueBatchEnvelope(allocator, wh_payload);
+        defer allocator.free(wh_env);
+
+        const inner: [2][]const u8 = .{ ws_env, wh_env };
+        const multi = try apply_mod.encodeMultiEnvelope(allocator, &inner);
+        defer allocator.free(multi);
+
+        const seq = worker.raft.highWatermark() + 1;
+        try worker.raft.propose(seq, multi);
+        return seq;
+    }
+
+    if (has_writes) {
+        return proposeWriteSet(worker, writeset, anchor_id);
+    }
+
+    // Webhooks only.
+    const wh_payload = try webhook_server.encodeEnqueueBatch(allocator, webhooks);
+    defer allocator.free(wh_payload);
+    const wh_env = try apply_mod.encodeWebhookEnqueueBatchEnvelope(allocator, wh_payload);
+    defer allocator.free(wh_env);
+
+    const seq = worker.raft.highWatermark() + 1;
+    try worker.raft.propose(seq, wh_env);
+    return seq;
 }

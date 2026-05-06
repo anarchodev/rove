@@ -337,6 +337,11 @@ const WorkerCtx = struct {
     /// opens with a counter from this registry so seq allocation
     /// stays globally monotonic.
     seq_counters: *kv.SeqCounterRegistry,
+    /// Phase 5.5 (d), step 4. Borrowed from the main thread's `cli`;
+    /// drives the dispatcher's per-batch `pending_webhooks` allocation
+    /// and the multi-envelope propose at finalize. See
+    /// `WorkerConfig.webhook_path`.
+    webhook_path: rjs.WebhookPath,
     /// Main thread blocks on these until every worker has bound its
     /// h2 listener — this is what `SO_REUSEPORT` needs before requests
     /// can hit any of them.
@@ -440,6 +445,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
         .blob_backend = args.blob_backend_cfg,
+        .webhook_path = args.webhook_path,
     });
     defer worker.destroy();
 
@@ -1053,6 +1059,10 @@ pub fn main() !void {
             .blob_backend_cfg = blob_owned.cfg,
             .tls_config = tls_config,
             .seq_counters = &seq_counters,
+            .webhook_path = if (std.mem.eql(u8, cli.webhook_path, "direct"))
+                rjs.WebhookPath.direct
+            else
+                rjs.WebhookPath.drainer,
             .ready = &ready_events[i],
         };
         threads[i] = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctxs[i]});

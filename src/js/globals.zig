@@ -20,12 +20,22 @@ const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
+const webhook_server = @import("rove-webhook-server");
 const limiter_mod = @import("limiter.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const webhook_b = @import("bindings/webhook.zig");
 const events_b = @import("bindings/events.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
+
+/// Phase 5.5 (d), step 4 — selects which webhook delivery path the
+/// dispatcher uses. `drainer` is the legacy per-tenant `_outbox/{id}`
+/// + drainer thread; `direct` is the new path where `webhook.send`
+/// accumulates per-batch and rides atomically with the writeset via
+/// the multi-envelope wrapper. Default `drainer` until the cutover
+/// is verified; flipped to `direct` in dev → smoked → made the only
+/// path in step 5.
+pub const WebhookPath = enum { drainer, direct };
 
 const c = qjs.c;
 
@@ -148,6 +158,16 @@ pub const DispatchState = struct {
     /// (the snapshot/restore wipes the runtime). Owned values must
     /// be `JS_FreeValue`'d on `deinit`.
     trigger_module_ns: std.StringHashMapUnmanaged(c.JSValue) = .empty,
+    /// Phase 5.5 (d), step 4 — per-batch webhook accumulator. When
+    /// non-null, `webhook.send` appends a `WebhookRow` here instead of
+    /// writing `_outbox/{id}` to the tenant's app.db. The dispatcher
+    /// (worker_dispatch.dispatchOnce) allocates this list once per
+    /// batch when `worker.webhook_path == .direct` and proposes it as
+    /// envelope 4 inside the type-7 multi-envelope at batch commit.
+    /// Owned by worker_dispatch; rows' []const u8 fields are owned
+    /// strings allocated from `state.allocator` and freed on the
+    /// list's `WebhookRow.deinit`.
+    pending_webhooks: ?*std.ArrayListUnmanaged(webhook_server.WebhookRow) = null,
     /// Per-worker rate limiter. Used by the `__rove_check_email_rate`
     /// builtin (called from the `email.send` JS wrapper) to take
     /// from the email bucket before queuing the outbox row. Null in

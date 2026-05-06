@@ -18,6 +18,7 @@ const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
+const webhook_server = @import("rove-webhook-server");
 
 const globals = @import("globals.zig");
 const limiter_mod = @import("limiter.zig");
@@ -158,6 +159,12 @@ pub const Request = struct {
         target_id: []const u8,
     ) anyerror!void = null,
     deploy_starter_ctx: ?*anyopaque = null,
+    /// Phase 5.5 (d), step 4. When non-null, `webhook.send` appends a
+    /// `WebhookRow` here instead of writing `_outbox/{id}`. The
+    /// dispatcher allocates this list once per batch when the worker
+    /// is in `direct` mode and proposes it as envelope 4 alongside
+    /// envelope 0 in a multi-envelope at batch commit.
+    pending_webhooks: ?*std.ArrayListUnmanaged(webhook_server.WebhookRow) = null,
 };
 
 /// One `(name, value)` pair extracted from the handler's
@@ -321,6 +328,7 @@ pub const Dispatcher = struct {
             .instance_id = request.instance_id,
             .deploy_starter = request.deploy_starter,
             .deploy_starter_ctx = request.deploy_starter_ctx,
+            .pending_webhooks = request.pending_webhooks,
         };
 
         // Reset the per-request arena (one cursor write) and reseed

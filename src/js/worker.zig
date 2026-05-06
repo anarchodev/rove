@@ -467,6 +467,13 @@ pub const WorkerConfig = struct {
     /// must outlive the worker's `create` call (S3BlobStore.init dupes
     /// them, so afterwards they can be freed).
     blob_backend: blob_mod.BackendConfig = .fs,
+    /// Phase 5.5 (d), step 4. `drainer` (default) keeps the legacy
+    /// per-tenant `_outbox/{id}` + drainer-thread path. `direct`
+    /// switches `webhook.send` to accumulate per-batch and ride
+    /// atomically with the writeset via the multi-envelope wrapper.
+    /// The webhook-server thread (step 3) handles delivery in both
+    /// modes — it's the worker → store path that flips here.
+    webhook_path: globals.WebhookPath = .drainer,
 };
 
 /// Cross-reference component used by the `/_system/*` proxy. Lives
@@ -574,6 +581,10 @@ pub fn Worker(comptime opts: Options) type {
         /// Picks fs vs s3 for every per-tenant blob backend this
         /// worker opens. Borrowed from `WorkerConfig.blob_backend`.
         blob_backend_cfg: blob_mod.BackendConfig,
+        /// Phase 5.5 (d), step 4. Drives the worker_dispatch
+        /// allocation of `pending_webhooks` and the multi-envelope
+        /// propose at batch commit. See `WorkerConfig.webhook_path`.
+        webhook_path: globals.WebhookPath,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -632,6 +643,7 @@ pub fn Worker(comptime opts: Options) type {
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
                 .blob_backend_cfg = config.blob_backend,
+                .webhook_path = config.webhook_path,
             };
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();

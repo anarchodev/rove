@@ -15,6 +15,7 @@
 const std = @import("std");
 const qjs = @import("rove-qjs");
 const c = qjs.c;
+const webhook_server = @import("rove-webhook-server");
 
 const globals = @import("../globals.zig");
 
@@ -180,7 +181,35 @@ pub fn jsWebhookSend(
     setOwned(ctx, env, "created_at_ms", c.JS_NewInt64(ctx, now_ms));
     setOwned(ctx, env, "parent_request_id", c.JS_NewInt64(ctx, @bitCast(state.request_id)));
 
-    // Serialize envelope → bytes.
+    // Phase 5.5 (d), step 4. When the dispatcher allocated a per-batch
+    // `pending_webhooks` accumulator (= worker is in `direct` mode),
+    // extract a `WebhookRow` from the env we just built and append.
+    // No `_outbox/{id}` write — envelope 4 (the merged batch) rides
+    // with envelope 0 (writeset) in a type-7 multi-envelope at batch
+    // commit. Drainer-mode falls through to the legacy path below.
+    if (state.pending_webhooks) |list| {
+        var row = extractRowFromEnv(ctx, state, env, &id_hex) catch |err| {
+            c.JS_FreeValue(ctx, env);
+            switch (err) {
+                error.JsException => return js_exception,
+                else => {
+                    state.pending_kv_error = err;
+                    return js_exception;
+                },
+            }
+        };
+        c.JS_FreeValue(ctx, env);
+        errdefer row.deinit(state.allocator);
+        list.append(state.allocator, row) catch |err| {
+            row.deinit(state.allocator);
+            state.pending_kv_error = err;
+            return js_exception;
+        };
+        state.webhook_call_index += 1;
+        return c.JS_NewStringLen(ctx, &id_hex, 64);
+    }
+
+    // Drainer mode (legacy): serialize envelope → bytes → _outbox/{id}.
     const json = c.JS_JSONStringify(ctx, env, js_undefined, js_undefined);
     c.JS_FreeValue(ctx, env);
     if (c.JS_IsException(json) or c.JS_IsUndefined(json)) {
@@ -212,4 +241,143 @@ pub fn jsWebhookSend(
 
     state.webhook_call_index += 1;
     return c.JS_NewStringLen(ctx, &id_hex, 64);
+}
+
+/// Walk the JSON envelope we just built and produce a `WebhookRow`
+/// owned by `state.allocator`. All `[]const u8` fields are owned
+/// duplicates so the row's `deinit` can free them uniformly. The row
+/// shape mirrors what envelope 4 carries on the wire.
+fn extractRowFromEnv(
+    ctx: ?*c.JSContext,
+    state: *globals.DispatchState,
+    env: c.JSValue,
+    id_hex: *const [64]u8,
+) !webhook_server.WebhookRow {
+    const a = state.allocator;
+
+    var owned: ExtractedStrings = .{};
+    errdefer owned.deinit(a);
+
+    owned.tenant_id = try a.dupe(u8, state.instance_id);
+    owned.url = try dupeJsString(ctx, a, env, "url");
+    owned.method = try dupeJsString(ctx, a, env, "method");
+    owned.body = try dupeJsString(ctx, a, env, "body");
+    owned.headers_json = try dupeJsObjectAsJson(ctx, a, env, "headers");
+    owned.retry_on_json = try dupeJsObjectAsJson(ctx, a, env, "retry_on");
+    owned.context_json = try dupeJsObjectAsJson(ctx, a, env, "context");
+    // on_result is null when omitted; store as empty string so the
+    // delivery-side apply writes `"on_result": null` in the callback.
+    owned.on_result_path = try dupeJsStringOrEmpty(ctx, a, env, "on_result");
+
+    const max_attempts = try getIntField(ctx, env, "max_attempts");
+    const timeout_ms = try getIntField(ctx, env, "timeout_ms");
+
+    const row: webhook_server.WebhookRow = .{
+        .webhook_id_hex = id_hex.*,
+        .tenant_id = owned.tenant_id.?,
+        .url = owned.url.?,
+        .method = owned.method.?,
+        .headers_json = owned.headers_json.?,
+        .body = owned.body.?,
+        .max_attempts = @intCast(@min(@max(max_attempts, 1), 255)),
+        .timeout_ms = @intCast(@max(timeout_ms, 1)),
+        .retry_on_json = owned.retry_on_json.?,
+        .context_json = owned.context_json.?,
+        .on_result_path = owned.on_result_path.?,
+        .enqueued_at_ns = @intCast(std.time.nanoTimestamp()),
+    };
+    owned = .{}; // ownership transferred to row
+    return row;
+}
+
+const ExtractedStrings = struct {
+    tenant_id: ?[]u8 = null,
+    url: ?[]u8 = null,
+    method: ?[]u8 = null,
+    headers_json: ?[]u8 = null,
+    body: ?[]u8 = null,
+    retry_on_json: ?[]u8 = null,
+    context_json: ?[]u8 = null,
+    on_result_path: ?[]u8 = null,
+
+    fn deinit(self: *ExtractedStrings, a: std.mem.Allocator) void {
+        if (self.tenant_id) |s| a.free(s);
+        if (self.url) |s| a.free(s);
+        if (self.method) |s| a.free(s);
+        if (self.headers_json) |s| a.free(s);
+        if (self.body) |s| a.free(s);
+        if (self.retry_on_json) |s| a.free(s);
+        if (self.context_json) |s| a.free(s);
+        if (self.on_result_path) |s| a.free(s);
+    }
+};
+
+fn dupeJsString(
+    ctx: ?*c.JSContext,
+    a: std.mem.Allocator,
+    obj: c.JSValue,
+    name: [:0]const u8,
+) ![]u8 {
+    const v = c.JS_GetPropertyStr(ctx, obj, name.ptr);
+    defer c.JS_FreeValue(ctx, v);
+    if (!c.JS_IsString(v)) return error.JsException;
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx, &len, v);
+    if (cstr == null) return error.JsException;
+    defer c.JS_FreeCString(ctx, cstr);
+    const slice = @as([*]const u8, @ptrCast(cstr))[0..len];
+    return try a.dupe(u8, slice);
+}
+
+/// Same as `dupeJsString` but returns `""` when the property is null
+/// or undefined. Used for `on_result` which is allowed to be missing.
+fn dupeJsStringOrEmpty(
+    ctx: ?*c.JSContext,
+    a: std.mem.Allocator,
+    obj: c.JSValue,
+    name: [:0]const u8,
+) ![]u8 {
+    const v = c.JS_GetPropertyStr(ctx, obj, name.ptr);
+    defer c.JS_FreeValue(ctx, v);
+    if (c.JS_IsNull(v) or c.JS_IsUndefined(v)) return try a.dupe(u8, "");
+    if (!c.JS_IsString(v)) return error.JsException;
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx, &len, v);
+    if (cstr == null) return error.JsException;
+    defer c.JS_FreeCString(ctx, cstr);
+    const slice = @as([*]const u8, @ptrCast(cstr))[0..len];
+    return try a.dupe(u8, slice);
+}
+
+/// JSON.stringify the property and return owned bytes. Used for
+/// `headers`, `retry_on`, `context` — all of which envelope 4 carries
+/// as opaque JSON-string blobs.
+fn dupeJsObjectAsJson(
+    ctx: ?*c.JSContext,
+    a: std.mem.Allocator,
+    obj: c.JSValue,
+    name: [:0]const u8,
+) ![]u8 {
+    const v = c.JS_GetPropertyStr(ctx, obj, name.ptr);
+    defer c.JS_FreeValue(ctx, v);
+    if (c.JS_IsNull(v) or c.JS_IsUndefined(v)) return try a.dupe(u8, "null");
+    const s = c.JS_JSONStringify(ctx, v, js_undefined, js_undefined);
+    if (c.JS_IsException(s) or c.JS_IsUndefined(s)) {
+        c.JS_FreeValue(ctx, s);
+        return error.JsException;
+    }
+    defer c.JS_FreeValue(ctx, s);
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx, &len, s);
+    if (cstr == null) return error.JsException;
+    defer c.JS_FreeCString(ctx, cstr);
+    return try a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
+}
+
+fn getIntField(ctx: ?*c.JSContext, obj: c.JSValue, name: [:0]const u8) !i32 {
+    const v = c.JS_GetPropertyStr(ctx, obj, name.ptr);
+    defer c.JS_FreeValue(ctx, v);
+    var out: i32 = 0;
+    if (c.JS_ToInt32(ctx, &out, v) < 0) return error.JsException;
+    return out;
 }
