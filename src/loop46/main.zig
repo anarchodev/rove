@@ -916,35 +916,60 @@ pub fn main() !void {
 
     // ── Log batch store (Phase 5.5 a) ─────────────────────────────────
     //
-    // Worker's `flushLogs` writes here when `--log-backend s3`. Picks
-    // its backend from env: LOG_BATCH_STORE_BACKEND=fs|s3 (default fs),
-    // LOG_BATCH_STORE_DIR (fs root, defaults to {data_dir}/log-batches).
-    // The s3 backend lands in a follow-up; for now fs is enough to
-    // exercise the worker path end-to-end.
-    const log_backend_str: []const u8 = cli.log_backend;
-    const log_backend: rjs.LogBackend = if (std.mem.eql(u8, log_backend_str, "s3"))
+    // Worker's `flushLogs` writes here when `--log-backend s3`. The
+    // store is the new `S3BatchStore` that talks real S3 via the
+    // sigv4 helpers shared with `rove-blob`. Reuses the same env vars
+    // as BLOB_BACKEND=s3 (S3_ENDPOINT / S3_REGION / S3_BUCKET /
+    // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) plus an optional
+    // `LOG_S3_KEY_PREFIX` so log batches can sit under a named prefix
+    // alongside other tenant-scoped artifacts in the same bucket.
+    // Filesystem backend is gone — the design is S3-only after step 3a.
+    const log_backend: rjs.LogBackend = if (std.mem.eql(u8, cli.log_backend, "s3"))
         .s3
     else
         .raft;
-    var log_batch_store_handle: ?*log_server.batch_store.FilesystemBatchStore = null;
+    var log_batch_store_handle: ?*log_server.batch_store_s3.S3BatchStore = null;
     defer if (log_batch_store_handle) |h| h.deinit();
     var log_batch_store: ?log_server.batch_store.BatchStore = null;
     if (log_backend == .s3) {
-        const root_env = std.posix.getenv("LOG_BATCH_STORE_DIR");
-        const root: []const u8 = root_env orelse blk: {
-            const default_root = try std.fmt.allocPrint(
-                allocator,
-                "{s}/log-batches",
-                .{cli.data_dir},
-            );
-            break :blk default_root;
+        const endpoint = (try envOpt(allocator, ENV_S3_ENDPOINT)) orelse
+            failExit("loop46: --log-backend s3 requires {s} to be set\n", .{ENV_S3_ENDPOINT});
+        defer allocator.free(endpoint);
+        const region = (try envOpt(allocator, ENV_S3_REGION)) orelse
+            failExit("loop46: --log-backend s3 requires {s} to be set\n", .{ENV_S3_REGION});
+        defer allocator.free(region);
+        const bucket = (try envOpt(allocator, ENV_S3_BUCKET)) orelse
+            failExit("loop46: --log-backend s3 requires {s} to be set\n", .{ENV_S3_BUCKET});
+        defer allocator.free(bucket);
+        const access_key = (try envOpt(allocator, ENV_AWS_AK)) orelse
+            failExit("loop46: --log-backend s3 requires {s} to be set\n", .{ENV_AWS_AK});
+        defer allocator.free(access_key);
+        const secret_key = (try envOpt(allocator, ENV_AWS_SK)) orelse
+            failExit("loop46: --log-backend s3 requires {s} to be set\n", .{ENV_AWS_SK});
+        defer allocator.free(secret_key);
+        const key_prefix = (try envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
+            try allocator.dupe(u8, "");
+        defer allocator.free(key_prefix);
+        const use_tls = blk_tls: {
+            const v = (try envOpt(allocator, ENV_S3_USE_TLS)) orelse break :blk_tls true;
+            defer allocator.free(v);
+            if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk_tls false;
+            break :blk_tls true;
         };
-        // Note: when root_env is null, `root` was just allocated and
-        // we let it leak for the process lifetime — the FilesystemBatchStore
-        // dupes the string internally so it's safe to drop our reference.
-        log_batch_store_handle = try log_server.batch_store.FilesystemBatchStore.init(allocator, root);
+        log_batch_store_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+            .endpoint = endpoint,
+            .region = region,
+            .bucket = bucket,
+            .key_prefix = key_prefix,
+            .access_key = access_key,
+            .secret_key = secret_key,
+            .use_tls = use_tls,
+        });
         log_batch_store = log_batch_store_handle.?.batchStore();
-        std.log.info("log backend: s3 (fs-backed batch store at {s})", .{root});
+        std.log.info(
+            "log backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
+            .{ endpoint, region, bucket, key_prefix },
+        );
     } else {
         std.log.info("log backend: raft (legacy envelope-1 path)", .{});
     }

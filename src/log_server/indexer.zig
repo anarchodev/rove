@@ -192,11 +192,15 @@ fn runLoop(h: *Handle) !void {
 
 const testing = std.testing;
 
-fn tempDir(allocator: std.mem.Allocator, tag: []const u8) ![]u8 {
+fn tempDbPath(allocator: std.mem.Allocator, tag: []const u8) ![:0]u8 {
     const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const path = try std.fmt.allocPrint(allocator, "/tmp/rove-idxer-{s}-{x}", .{ tag, seed });
-    std.fs.cwd().deleteTree(path) catch {};
-    try std.fs.cwd().makePath(path);
+    const path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "/tmp/rove-idxer-{s}-{x}.db",
+        .{ tag, seed },
+        0,
+    );
+    std.fs.cwd().deleteFile(path) catch {};
     return path;
 }
 
@@ -243,17 +247,15 @@ fn writeSidecar(
 
 test "pollOnce indexes a single sidecar end-to-end" {
     const a = testing.allocator;
-    const root = try tempDir(a, "single");
-    defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
-    }
-    const fs_store = try batch_store_mod.FilesystemBatchStore.init(a, root);
-    defer fs_store.deinit();
-    const store = fs_store.batchStore();
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
 
-    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/index.db", .{root}, 0);
-    defer a.free(db_path);
+    const db_path = try tempDbPath(a, "single");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
+    }
     var db = try index_db_mod.IndexDb.open(a, db_path);
     defer db.close();
 
@@ -278,10 +280,8 @@ test "pollOnce indexes a single sidecar end-to-end" {
     try testing.expectEqual(@as(u32, 1), stats.sidecars_seen);
     try testing.expectEqual(@as(u32, 1), stats.batches_indexed);
     try testing.expectEqual(@as(u32, 1), stats.records_indexed);
-    // Two non-sidecar entries: the .ndjson + the SQLite file's own
-    // `index.db-wal` / `index.db-shm` may show up too, depending on
-    // sync state. Lower-bound.
-    try testing.expect(stats.skipped_non_sidecars >= 1);
+    // The matching .ndjson sits in the store too and isn't a sidecar.
+    try testing.expectEqual(@as(u32, 1), stats.skipped_non_sidecars);
 
     // Index now has the row.
     var list = try db.queryList("acme", 0, 0, 10);
@@ -292,16 +292,14 @@ test "pollOnce indexes a single sidecar end-to-end" {
 
 test "pollOnce is idempotent across runs" {
     const a = testing.allocator;
-    const root = try tempDir(a, "idem");
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
+    const db_path = try tempDbPath(a, "idem");
     defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
     }
-    const fs_store = try batch_store_mod.FilesystemBatchStore.init(a, root);
-    defer fs_store.deinit();
-    const store = fs_store.batchStore();
-    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/index.db", .{root}, 0);
-    defer a.free(db_path);
     var db = try index_db_mod.IndexDb.open(a, db_path);
     defer db.close();
 
@@ -339,16 +337,14 @@ test "pollOnce is idempotent across runs" {
 
 test "pollOnce picks up newly-arrived sidecars across passes" {
     const a = testing.allocator;
-    const root = try tempDir(a, "incr");
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
+    const db_path = try tempDbPath(a, "incr");
     defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
     }
-    const fs_store = try batch_store_mod.FilesystemBatchStore.init(a, root);
-    defer fs_store.deinit();
-    const store = fs_store.batchStore();
-    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/index.db", .{root}, 0);
-    defer a.free(db_path);
     var db = try index_db_mod.IndexDb.open(a, db_path);
     defer db.close();
 
@@ -403,16 +399,14 @@ test "pollOnce picks up newly-arrived sidecars across passes" {
 
 test "pollOnce skips non-sidecar files" {
     const a = testing.allocator;
-    const root = try tempDir(a, "noise");
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
+    const db_path = try tempDbPath(a, "noise");
     defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
     }
-    const fs_store = try batch_store_mod.FilesystemBatchStore.init(a, root);
-    defer fs_store.deinit();
-    const store = fs_store.batchStore();
-    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/index.db", .{root}, 0);
-    defer a.free(db_path);
     var db = try index_db_mod.IndexDb.open(a, db_path);
     defer db.close();
 

@@ -31,9 +31,22 @@ pub const SignInput = struct {
     /// S3 canonicalization rules (every byte except the unreserved
     /// set encodes as %XX).
     path: []const u8,
-    /// Query string (no leading `?`), or empty. Caller pre-encodes
-    /// reserved chars; the signer just sorts by key.
+    /// Query string (no leading `?`), or empty. The signer parses
+    /// `key=value&...` pairs, sorts alphabetically by key, and
+    /// URI-encodes both name and value per the SigV4 canonical-query
+    /// rules (every byte outside the unreserved set → `%XY`,
+    /// including `/`). For values that already contain percent-
+    /// encoded bytes, prefer `query_canonical` to skip re-encoding
+    /// (the signer would otherwise turn `%2F` into `%252F`).
     query: []const u8 = "",
+    /// Optional pre-built canonical query string. When non-null this
+    /// is used VERBATIM as the canonical-query line in the canonical
+    /// request, bypassing the parse + re-encode pass on `query`.
+    /// Caller is responsible for: alphabetical sort by key, double-
+    /// encoding any literal `%`, and encoding `/` to `%2F`. Used by
+    /// callers that send the same encoded query on the wire and
+    /// want to control exactly how the signature canonicalizes it.
+    query_canonical: ?[]const u8 = null,
     /// HTTP `Host` header value (e.g. `s3.gra.io.cloud.ovh.net`).
     /// Goes into the canonical request and the signed-headers list.
     host: []const u8,
@@ -91,11 +104,16 @@ pub fn sign(allocator: std.mem.Allocator, in: SignInput) !SignedHeaders {
     defer canon_path.deinit(allocator);
     try uriEncodePath(allocator, &canon_path, in.path);
 
-    // 3. Canonical query string: caller passes pre-encoded; we sort
-    //    by key. Empty → empty line.
+    // 3. Canonical query string: when `query_canonical` is set, use
+    //    it verbatim (the caller already canonicalized). Otherwise
+    //    parse `query`, sort by key, re-encode each value.
     var canon_query = std.ArrayList(u8){};
     defer canon_query.deinit(allocator);
-    try canonicalQuery(allocator, &canon_query, in.query);
+    if (in.query_canonical) |qc| {
+        try canon_query.appendSlice(allocator, qc);
+    } else {
+        try canonicalQuery(allocator, &canon_query, in.query);
+    }
 
     // 4. Canonical headers (lowercase name, trim value, sorted).
     //    We sign exactly: host, x-amz-content-sha256, x-amz-date.

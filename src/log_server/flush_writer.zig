@@ -245,13 +245,6 @@ fn bytesToHex(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
 
 const testing = std.testing;
 
-fn tempDir(allocator: std.mem.Allocator, tag: []const u8) ![]u8 {
-    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const path = try std.fmt.allocPrint(allocator, "/tmp/rove-fw-{s}-{x}", .{ tag, seed });
-    std.fs.cwd().deleteTree(path) catch {};
-    try std.fs.cwd().makePath(path);
-    return path;
-}
 
 fn makeRecord(allocator: std.mem.Allocator, id: u64, path: []const u8) !log_mod.LogRecord {
     return .{
@@ -271,14 +264,9 @@ fn makeRecord(allocator: std.mem.Allocator, id: u64, path: []const u8) !log_mod.
 
 test "writeBatch puts ndjson + sidecar with correct offsets" {
     const a = testing.allocator;
-    const root = try tempDir(a, "wb");
-    defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
-    }
-    const fs = try batch_store_mod.FilesystemBatchStore.init(a, root);
-    defer fs.deinit();
-    const store = fs.batchStore();
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
 
     var r0 = try makeRecord(a, 1, "/a");
     defer r0.deinit(a);
@@ -323,14 +311,9 @@ test "writeBatch puts ndjson + sidecar with correct offsets" {
 
 test "writeBatch with empty records is a no-op (no PUTs)" {
     const a = testing.allocator;
-    const root = try tempDir(a, "empty");
-    defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
-    }
-    const fs = try batch_store_mod.FilesystemBatchStore.init(a, root);
-    defer fs.deinit();
-    const store = fs.batchStore();
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
 
     try writeBatch(a, store, "acme", "00000001", &.{}, 0);
 
@@ -341,14 +324,9 @@ test "writeBatch with empty records is a no-op (no PUTs)" {
 
 test "writeBatch sorts records by received_ns before encoding" {
     const a = testing.allocator;
-    const root = try tempDir(a, "sort");
-    defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
-    }
-    const fs = try batch_store_mod.FilesystemBatchStore.init(a, root);
-    defer fs.deinit();
-    const store = fs.batchStore();
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
 
     // Submit records in reverse order of received_ns.
     var hi = try makeRecord(a, 5, "/late");

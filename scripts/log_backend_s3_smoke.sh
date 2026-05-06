@@ -1,23 +1,41 @@
 #!/usr/bin/env bash
-# Phase 5.5 (a) step 3 smoke — worker `--log-backend s3` with the
-# fs-backed BatchStore. Verifies the new flush path end-to-end:
+# Phase 5.5 (a) end-to-end smoke against real S3.
 #
-#   1. Spawn loop46 with `--log-backend s3` + LOG_BATCH_STORE_DIR.
-#   2. Drive a few requests against acme.
-#   3. Wait for `flushLogs` to run and produce sidecar + ndjson on
-#      disk under `{LOG_BATCH_STORE_DIR}/acme/{node}/...`.
-#   4. Spawn the standalone log-server pointing at the SAME dir.
-#   5. Curl `/v1/acme/list` and verify the records the worker just
-#      logged are visible.
+#   1. Spawn loop46 with `--log-backend s3` (worker writes
+#      ndjson + sidecar to the bucket via S3BatchStore).
+#   2. Spawn the standalone log-server pointing at the SAME bucket
+#      (indexer polls + h2 query API serves).
+#   3. Drive a few requests against acme.
+#   4. Wait for the worker to flush and the indexer to pick up.
+#   5. Query /v1/acme/list + /show, verify the worker-emitted
+#      records round-trip via the indexer + range-read.
 #
-# Cross-validates two pieces with one fixture: the worker's
-# flush_writer-built sidecar shape AND the standalone log-server's
-# indexer + query API. If either side diverges the smoke catches it.
+# Cross-validates the worker's flush_writer + the indexer + S3
+# transport with one fixture; either side diverging breaks the
+# smoke.
+#
+# Required env (or sourced from `.env`):
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#   S3_BUCKET
+#   S3_ENDPOINT          (hostname only, no scheme — strips leniently)
+#   S3_REGION
+#
+# Each run picks a unique LOG_S3_KEY_PREFIX so concurrent runs +
+# leftover objects from prior runs don't collide. The smoke does
+# NOT clean up after itself — operators / OVH lifecycle policies
+# handle the eventual sweep.
 
 set -euo pipefail
 
+if [[ -f .env ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source .env
+    set +a
+fi
+
 DATA_DIR="${DATA_DIR:-/tmp/rove-logbackend-smoke}"
-LOG_BATCH_DIR="${LOG_BATCH_DIR:-${DATA_DIR}/log-batches}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8200}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40300}"
 LS_PORT="${LS_PORT:-0}"
@@ -39,6 +57,19 @@ TLS_CERT="$LOOP46_DATA/dev-cert.pem"
 TLS_KEY="$LOOP46_DATA/dev-key.pem"
 CACERT="$LOOP46_DATA/ca-root.pem"
 
+# Required env checks.
+need_env() {
+    if [[ -z "${!1:-}" ]]; then
+        echo "error: $1 not set (and not in .env)" >&2
+        exit 2
+    fi
+}
+need_env AWS_ACCESS_KEY_ID
+need_env AWS_SECRET_ACCESS_KEY
+need_env S3_BUCKET
+need_env S3_ENDPOINT
+need_env S3_REGION
+
 if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
     echo "error: missing dev TLS at $LOOP46_DATA. Run 'loop46 dev ...' once." >&2
     exit 2
@@ -48,8 +79,17 @@ if [[ ! -x "$BIN" || ! -x "$LS_BIN" ]]; then
     exit 2
 fi
 
+# Unique prefix for this run — keeps concurrent runs from colliding
+# in the shared bucket and makes leftover objects easy to identify
+# (`smoke/{unix_ms}-{rand}/`).
+RAND=$(head -c4 /dev/urandom | xxd -p)
+SMOKE_PREFIX="smoke/$(date +%s%N | cut -c1-13)-${RAND}/"
+export LOG_S3_KEY_PREFIX="$SMOKE_PREFIX"
+
+INDEX_DB="/tmp/rove-logbackend-index-${RAND}.db"
+rm -f "$INDEX_DB" "${INDEX_DB}-shm" "${INDEX_DB}-wal"
+
 rm -rf "$DATA_DIR"
-mkdir -p "$LOG_BATCH_DIR"
 
 # Pre-create acme via seed.
 "$BIN" seed \
@@ -58,7 +98,6 @@ mkdir -p "$LOG_BATCH_DIR"
     || { cat /tmp/lbs-seed.out >&2; exit 2; }
 
 # ── Spawn worker with --log-backend s3 ─────────────────────────────
-LOG_BATCH_STORE_DIR="$LOG_BATCH_DIR" \
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
@@ -77,22 +116,23 @@ LOG_BATCH_STORE_DIR="$LOG_BATCH_DIR" \
     >/tmp/lbs-worker.out 2>&1 &
 WORKER_PID=$!
 
-# ── Spawn log-server pointing at the same batch dir ───────────────
+# ── Spawn log-server pointing at the SAME bucket+prefix ───────────
 "$LS_BIN" \
-    --batch-store-dir "$LOG_BATCH_DIR" \
+    --index-db "$INDEX_DB" \
     --listen 127.0.0.1:${LS_PORT} \
-    --poll-interval-ms 200 \
+    --poll-interval-ms 500 \
     >/tmp/lbs-server.out 2>&1 &
 LS_PID=$!
 
 cleanup() {
     kill $WORKER_PID $LS_PID 2>/dev/null || true
     wait $WORKER_PID $LS_PID 2>/dev/null || true
+    rm -f "$INDEX_DB" "${INDEX_DB}-shm" "${INDEX_DB}-wal"
 }
 trap cleanup EXIT
 
 # Wait for both to be ready.
-sleep 1.2
+sleep 1.5
 
 LS_BOUND_PORT=""
 for _ in $(seq 1 50); do
@@ -111,7 +151,7 @@ fi
 # Confirm worker reported s3 backend at startup.
 grep -q "log backend: s3" /tmp/lbs-worker.out \
     || { echo "FAIL worker didn't report 's3' backend" >&2; tail -40 /tmp/lbs-worker.out >&2; exit 1; }
-echo "ok  worker started with --log-backend s3"
+echo "ok  worker started with --log-backend s3 → bucket=${S3_BUCKET} prefix=${SMOKE_PREFIX}"
 
 ok() { echo "ok  $1"; }
 fail() {
@@ -120,14 +160,12 @@ fail() {
     tail -40 /tmp/lbs-worker.out >&2 || true
     echo "--- log-server log (tail 40) ---" >&2
     tail -40 /tmp/lbs-server.out >&2 || true
-    echo "--- log batch dir contents ---" >&2
-    find "$LOG_BATCH_DIR" -type f 2>/dev/null >&2 || true
     exit 1
 }
 
 RESOLVE=(--resolve "${ACME_HOST}:${PORT}:127.0.0.1")
 WORKER_CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
-LS_CURL=(curl -sS --http2-prior-knowledge --max-time 5)
+LS_CURL=(curl -sS --http2-prior-knowledge --max-time 10)
 
 # ── Drive 3 requests against acme's /api handler ──────────────────
 for n in 1 2 3; do
@@ -136,14 +174,12 @@ for n in 1 2 3; do
 done
 ok "drove 3 acme requests, all 200"
 
-# ── Wait for ALL 3 requests to surface in the indexer ─────────────
+# ── Wait for ALL 3 records to surface in the indexer via S3 ────────
 #
-# `flushLogs` fires when shouldFlush() returns true; the relevant
-# threshold here is `flush_interval_ns = 1s`. With 3 sequential
-# requests + a single-worker setup, all three may not land in the
-# same batch (request 1 triggers a flush at t=1s, requests 2-3 sit
-# in the buffer for the next flush window). Poll the indexer until
-# it returns >=3 records, with a generous ceiling.
+# Worker `flushLogs` fires when shouldFlush() returns true; relevant
+# threshold is `flush_interval_ns = 1s`. Indexer polls every 500ms.
+# S3 round-trip + propagation adds a few hundred ms — generous
+# ceiling of 30s.
 LIST=""
 for _ in $(seq 1 60); do
     LIST=$("${LS_CURL[@]}" -X GET "http://127.0.0.1:${LS_BOUND_PORT}/v1/acme/list?limit=100" || true)
@@ -158,32 +194,24 @@ except Exception:
     if [[ "$n" -ge 3 ]]; then
         break
     fi
-    sleep 0.2
+    sleep 0.5
 done
 
-sidecar_count=$(find "$LOG_BATCH_DIR/acme" -name "*.idx.json" 2>/dev/null | wc -l)
-ndjson_count=$(find "$LOG_BATCH_DIR/acme" -name "*.ndjson" 2>/dev/null | wc -l)
-[[ "$sidecar_count" -ge 1 ]] || fail "no .idx.json appeared in $LOG_BATCH_DIR/acme"
-[[ "$ndjson_count" -eq "$sidecar_count" ]] \
-    || fail "ndjson count $ndjson_count != sidecar count $sidecar_count"
-ok "worker flushed $sidecar_count batch(es) to disk ($ndjson_count payload(s))"
 echo "$LIST" | python3 -c '
 import json, sys
 d = json.loads(sys.stdin.read())
 records = d["records"]
-assert len(records) >= 3, f"want >=3 records, got {len(records)}: {d}"
-# All three /api requests must show up — same path, same host, same method.
 api_records = [r for r in records if r["path"].startswith("/api")]
-assert len(api_records) >= 3, f"want >=3 /api records: {api_records}"
+assert len(api_records) >= 3, f"want >=3 /api records, got {len(api_records)}: {records}"
 for r in api_records[:3]:
     assert r["method"] == "GET", f"unexpected method: {r}"
     assert r["host"] == "acme.loop46.localhost", f"unexpected host: {r}"
     assert r["status"] == 200, f"unexpected status: {r}"
     assert r["outcome"] == "ok", f"unexpected outcome: {r}"
 ' || fail "log-server /list didn't return the worker's records"
-ok "log-server indexed the worker's batches; /list shows acme records"
+ok "worker → S3 → indexer → /list shows all 3 acme records"
 
-# ── Spot-check /show on one record ─────────────────────────────────
+# ── /show round-trips one record via S3 range-read ────────────────
 FIRST_ID=$(echo "$LIST" | python3 -c '
 import json, sys
 d = json.loads(sys.stdin.read())
@@ -199,7 +227,8 @@ assert r["status"] == 200
 assert r["method"] == "GET"
 assert r["path"].startswith("/api")
 ' || fail "show on a worker-emitted record didn't round-trip"
-ok "show: range-read returned the worker-emitted record"
+ok "show: S3 range-read returned the worker-emitted record"
 
 echo ""
 echo "all log-backend=s3 smoke checks passed"
+echo "(left ~6 objects under s3://${S3_BUCKET}/${SMOKE_PREFIX} — operator/OVH lifecycle handles cleanup)"

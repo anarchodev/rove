@@ -6,10 +6,18 @@
 //! across tenants, (b) a LIST operation the indexer polls. Cleaner to
 //! ship a focused interface than to overload `BlobStore`.
 //!
-//! V1 ships only the filesystem backend (good enough for dev + smoke).
-//! S3 backend lands in step 3 when worker-side write code starts
-//! pushing real batches at production cadence; the same vtable shape
-//! covers both.
+//! Backends:
+//!   - `S3BatchStore` (`batch_store_s3.zig`) — production. Real S3
+//!     PUT/GET with Range header + ListObjectsV2.
+//!   - `MemoryBatchStore` (this file) — in-process map-backed test
+//!     fixture. Used by unit tests to stay hermetic; production
+//!     never touches it.
+//!
+//! There is no longer a filesystem backend — the design ships
+//! S3-only after Phase 5.5 (a) step 3. Local-disk batch storage
+//! created subtle drift between dev and prod (different list
+//! semantics, different consistency, different operational story);
+//! collapsing to one backend removes that fork.
 
 const std = @import("std");
 
@@ -106,32 +114,36 @@ pub fn freeListResult(allocator: std.mem.Allocator, keys: [][]const u8) void {
     allocator.free(keys);
 }
 
-// ── Filesystem backend ─────────────────────────────────────────────
+// ── In-process backend (test fixture only) ─────────────────────────
 
-/// Stores batches under `{root}/{key}`. The key may contain `/` so
-/// nested directories materialize naturally.
-pub const FilesystemBatchStore = struct {
+/// In-memory implementation backed by a `StringHashMap`. **Test-only**
+/// — production code paths use `S3BatchStore`. Exposed publicly so
+/// dispatcher / indexer / flush_writer unit tests can drive the
+/// interface without an S3 endpoint.
+///
+/// Concurrency: NOT thread-safe. Each test owns its own instance.
+pub const MemoryBatchStore = struct {
     allocator: std.mem.Allocator,
-    root: []u8,
+    objects: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, root: []const u8) !*FilesystemBatchStore {
-        const self = try allocator.create(FilesystemBatchStore);
-        errdefer allocator.destroy(self);
-        self.* = .{
-            .allocator = allocator,
-            .root = try allocator.dupe(u8, root),
-        };
-        std.fs.cwd().makePath(self.root) catch {};
+    pub fn init(allocator: std.mem.Allocator) !*MemoryBatchStore {
+        const self = try allocator.create(MemoryBatchStore);
+        self.* = .{ .allocator = allocator };
         return self;
     }
 
-    pub fn deinit(self: *FilesystemBatchStore) void {
-        self.allocator.free(self.root);
+    pub fn deinit(self: *MemoryBatchStore) void {
+        var it = self.objects.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.free(e.value_ptr.*);
+        }
+        self.objects.deinit(self.allocator);
         const a = self.allocator;
         a.destroy(self);
     }
 
-    pub fn batchStore(self: *FilesystemBatchStore) BatchStore {
+    pub fn batchStore(self: *MemoryBatchStore) BatchStore {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
@@ -143,34 +155,23 @@ pub const FilesystemBatchStore = struct {
     };
 
     fn vtablePut(ptr: *anyopaque, key: []const u8, bytes: []const u8) anyerror!void {
-        const self: *FilesystemBatchStore = @ptrCast(@alignCast(ptr));
-        const path = try fullPath(self.allocator, self.root, key);
-        defer self.allocator.free(path);
-        if (std.fs.path.dirname(path)) |dir| {
-            std.fs.cwd().makePath(dir) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                else => return err,
-            };
+        const self: *MemoryBatchStore = @ptrCast(@alignCast(ptr));
+        const value = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(value);
+
+        if (self.objects.fetchRemove(key)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value);
         }
-        // Atomic-ish write: tmp + rename.
-        const tmp = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
-        defer self.allocator.free(tmp);
-        const file = try std.fs.cwd().createFile(tmp, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(bytes);
-        try std.fs.cwd().rename(tmp, path);
+        const k = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(k);
+        try self.objects.put(self.allocator, k, value);
     }
 
     fn vtableGet(ptr: *anyopaque, key: []const u8, allocator: std.mem.Allocator) anyerror![]u8 {
-        const self: *FilesystemBatchStore = @ptrCast(@alignCast(ptr));
-        const path = try fullPath(allocator, self.root, key);
-        defer allocator.free(path);
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return Error.NotFound,
-            else => return err,
-        };
-        defer file.close();
-        return file.readToEndAlloc(allocator, std.math.maxInt(u32));
+        const self: *MemoryBatchStore = @ptrCast(@alignCast(ptr));
+        const v = self.objects.get(key) orelse return Error.NotFound;
+        return allocator.dupe(u8, v);
     }
 
     fn vtableGetRange(
@@ -180,20 +181,11 @@ pub const FilesystemBatchStore = struct {
         length: u32,
         allocator: std.mem.Allocator,
     ) anyerror![]u8 {
-        const self: *FilesystemBatchStore = @ptrCast(@alignCast(ptr));
-        const path = try fullPath(allocator, self.root, key);
-        defer allocator.free(path);
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return Error.NotFound,
-            else => return err,
-        };
-        defer file.close();
-        try file.seekTo(offset);
-        const buf = try allocator.alloc(u8, length);
-        errdefer allocator.free(buf);
-        const n = try file.readAll(buf);
-        if (n < buf.len) return allocator.realloc(buf, n);
-        return buf;
+        const self: *MemoryBatchStore = @ptrCast(@alignCast(ptr));
+        const v = self.objects.get(key) orelse return Error.NotFound;
+        if (offset >= v.len) return allocator.dupe(u8, "");
+        const end = @min(@as(u64, @intCast(v.len)), offset + length);
+        return allocator.dupe(u8, v[@intCast(offset)..@intCast(end)]);
     }
 
     fn vtableList(
@@ -203,36 +195,24 @@ pub const FilesystemBatchStore = struct {
         max: u32,
         allocator: std.mem.Allocator,
     ) anyerror![][]const u8 {
-        const self: *FilesystemBatchStore = @ptrCast(@alignCast(ptr));
+        const self: *MemoryBatchStore = @ptrCast(@alignCast(ptr));
         var collected: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer {
             for (collected.items) |k| allocator.free(k);
             collected.deinit(allocator);
         }
-        var dir = std.fs.cwd().openDir(self.root, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return collected.toOwnedSlice(allocator),
-            else => return err,
-        };
-        defer dir.close();
-        var walker = try dir.walk(allocator);
-        defer walker.deinit();
-        while (try walker.next()) |entry| {
-            if (entry.kind != .file) continue;
-            // Walk gives us OS-native separators; on Linux that's '/'.
-            // Sidestep portability for now (we support Linux only).
-            if (!std.mem.startsWith(u8, entry.path, prefix)) continue;
-            if (after.len > 0 and std.mem.lessThan(u8, entry.path, after)) continue;
-            if (after.len > 0 and std.mem.eql(u8, entry.path, after)) continue;
-            const dup = try allocator.dupe(u8, entry.path);
+        var it = self.objects.iterator();
+        while (it.next()) |e| {
+            const k = e.key_ptr.*;
+            if (!std.mem.startsWith(u8, k, prefix)) continue;
+            if (after.len > 0 and !std.mem.lessThan(u8, after, k)) continue;
+            const dup = try allocator.dupe(u8, k);
             errdefer allocator.free(dup);
             try collected.append(allocator, dup);
         }
         const slice = try collected.toOwnedSlice(allocator);
-        // Sort ascending so the indexer can rely on lexical order even
-        // when `dir.walk` returns out of order.
         std.mem.sort([]const u8, slice, {}, lessThan);
         if (slice.len <= max) return slice;
-        // Keep first `max`, free the rest.
         for (slice[max..]) |k| allocator.free(k);
         return allocator.realloc(slice, max);
     }
@@ -240,27 +220,11 @@ pub const FilesystemBatchStore = struct {
     fn lessThan(_: void, a: []const u8, b: []const u8) bool {
         return std.mem.lessThan(u8, a, b);
     }
-
-    fn fullPath(
-        allocator: std.mem.Allocator,
-        root: []const u8,
-        key: []const u8,
-    ) ![]u8 {
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, key });
-    }
 };
 
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn tempDir(allocator: std.mem.Allocator, tag: []const u8) ![]u8 {
-    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const path = try std.fmt.allocPrint(allocator, "/tmp/rove-bs-{s}-{x}", .{ tag, seed });
-    std.fs.cwd().deleteTree(path) catch {};
-    try std.fs.cwd().makePath(path);
-    return path;
-}
 
 test "validateKey allows hierarchical paths and rejects traversal" {
     try validateKey("acme/00000001/00000000000000000001-0001730764800000.idx.json");
@@ -272,16 +236,11 @@ test "validateKey allows hierarchical paths and rejects traversal" {
     try testing.expectError(Error.InvalidKey, validateKey("a\\b"));
 }
 
-test "FilesystemBatchStore put + get round-trips" {
+test "MemoryBatchStore put + get round-trips" {
     const a = testing.allocator;
-    const root = try tempDir(a, "fs1");
-    defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
-    }
-    const fs_store = try FilesystemBatchStore.init(a, root);
-    defer fs_store.deinit();
-    const store = fs_store.batchStore();
+    const m = try MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
 
     try store.put("acme/00000001/000000-001.ndjson", "line1\nline2\n");
     const back = try store.get("acme/00000001/000000-001.ndjson", a);
@@ -289,16 +248,11 @@ test "FilesystemBatchStore put + get round-trips" {
     try testing.expectEqualStrings("line1\nline2\n", back);
 }
 
-test "FilesystemBatchStore list returns sorted keys after cursor" {
+test "MemoryBatchStore list returns sorted keys after cursor" {
     const a = testing.allocator;
-    const root = try tempDir(a, "fs2");
-    defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
-    }
-    const fs_store = try FilesystemBatchStore.init(a, root);
-    defer fs_store.deinit();
-    const store = fs_store.batchStore();
+    const m = try MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
 
     try store.put("acme/00000001/b1.idx.json", "x");
     try store.put("acme/00000001/b1.ndjson", "x");
@@ -327,16 +281,11 @@ test "FilesystemBatchStore list returns sorted keys after cursor" {
     try testing.expectEqual(@as(usize, 2), limit_2.len);
 }
 
-test "FilesystemBatchStore getRange reads partial bytes" {
+test "MemoryBatchStore getRange reads partial bytes" {
     const a = testing.allocator;
-    const root = try tempDir(a, "fs3");
-    defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
-    }
-    const fs_store = try FilesystemBatchStore.init(a, root);
-    defer fs_store.deinit();
-    const store = fs_store.batchStore();
+    const m = try MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
 
     try store.put("acme/00000001/b1.ndjson", "0123456789ABCDEF");
     const slice = try store.getRange("acme/00000001/b1.ndjson", 4, 6, a);
@@ -344,16 +293,11 @@ test "FilesystemBatchStore getRange reads partial bytes" {
     try testing.expectEqualStrings("456789", slice);
 }
 
-test "FilesystemBatchStore getRange tolerates short tail" {
+test "MemoryBatchStore getRange tolerates short tail" {
     const a = testing.allocator;
-    const root = try tempDir(a, "fs4");
-    defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
-    }
-    const fs_store = try FilesystemBatchStore.init(a, root);
-    defer fs_store.deinit();
-    const store = fs_store.batchStore();
+    const m = try MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
 
     try store.put("acme/00000001/b1.ndjson", "abc");
     const slice = try store.getRange("acme/00000001/b1.ndjson", 1, 100, a);
@@ -361,16 +305,11 @@ test "FilesystemBatchStore getRange tolerates short tail" {
     try testing.expectEqualStrings("bc", slice);
 }
 
-test "FilesystemBatchStore get on missing key returns NotFound" {
+test "MemoryBatchStore get on missing key returns NotFound" {
     const a = testing.allocator;
-    const root = try tempDir(a, "fs5");
-    defer {
-        std.fs.cwd().deleteTree(root) catch {};
-        a.free(root);
-    }
-    const fs_store = try FilesystemBatchStore.init(a, root);
-    defer fs_store.deinit();
-    const store = fs_store.batchStore();
+    const m = try MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
 
     try testing.expectError(Error.NotFound, store.get("missing/key", a));
 }

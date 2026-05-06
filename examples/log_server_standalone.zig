@@ -1,25 +1,41 @@
-//! `log-server-standalone` — Phase 5.5 (a) step 2 entry point.
+//! `log-server-standalone` — Phase 5.5 (a) entry point.
 //!
 //! Spawns the indexer thread + h2 query API together. Loopback-only;
 //! TLS + JWT-handoff land in step 6 when the server moves to its own
 //! subdomain.
 //!
-//! Usage:
-//!     log-server-standalone \
-//!         --batch-store-dir <path> \
-//!         --index-db <path> \
-//!         [--listen 127.0.0.1:0] \
-//!         [--poll-interval-ms 5000]
+//! Storage is S3 — there is no longer a filesystem backend. The
+//! standalone reads its S3 config entirely from env (matches the
+//! BLOB_BACKEND=s3 vars used elsewhere) and exits with a clear
+//! message if anything's missing. The smoke driver sources `.env`
+//! before spawning.
 //!
-//! Prints `listening on port {N}` on a stable line so the smoke test
-//! can scrape it from stdout without racing log output.
+//! Required env:
+//!   S3_ENDPOINT          hostname (no scheme)
+//!   S3_REGION            sigv4 signing region
+//!   S3_BUCKET            bucket name
+//!   AWS_ACCESS_KEY_ID
+//!   AWS_SECRET_ACCESS_KEY
+//!
+//! Optional env:
+//!   LOG_S3_KEY_PREFIX    prefix prepended to every key (default ``)
+//!   S3_USE_TLS           `0` / `false` to drop to http (DEV ONLY,
+//!                        for local MinIO smoke)
+//!
+//! CLI flags:
+//!   --index-db <path>    where local SQLite index lives
+//!                        (default /tmp/log-server-index.db)
+//!   --listen host:port   bind address (default 127.0.0.1:0)
+//!   --poll-interval-ms N indexer cadence (default 5000)
+//!
+//! Prints `listening on port {N}` on a stable line so the smoke can
+//! scrape it from stdout without racing log output.
 
 const std = @import("std");
 const log_server = @import("rove-log-server");
 
 const Cli = struct {
-    batch_store_dir: []const u8 = "/tmp/rove-log-store",
-    index_db_path: ?[]const u8 = null,
+    index_db_path: []const u8 = "/tmp/log-server-index.db",
     listen_host: []const u8 = "127.0.0.1",
     listen_port: u16 = 0,
     poll_interval_ms: u32 = 5_000,
@@ -30,11 +46,7 @@ fn parseCli(argv: [][:0]u8) !Cli {
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
-        if (std.mem.eql(u8, a, "--batch-store-dir")) {
-            i += 1;
-            if (i >= argv.len) return error.Usage;
-            out.batch_store_dir = argv[i];
-        } else if (std.mem.eql(u8, a, "--index-db")) {
+        if (std.mem.eql(u8, a, "--index-db")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.index_db_path = argv[i];
@@ -56,6 +68,26 @@ fn parseCli(argv: [][:0]u8) !Cli {
     return out;
 }
 
+fn envRequired(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => {
+            std.debug.print(
+                "log-server-standalone: missing required env var: {s}\n",
+                .{name},
+            );
+            std.process.exit(2);
+        },
+        else => err,
+    };
+}
+
+fn envOpt(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => err,
+    };
+}
+
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -69,32 +101,51 @@ pub fn main() !void {
         var sw = std.fs.File.stderr().writer(&stderr_buf);
         try sw.interface.writeAll(
             \\usage: log-server-standalone \
-            \\    --batch-store-dir <path> \
-            \\    --index-db <path> \
+            \\    [--index-db /path/to/log_index.db] \
             \\    [--listen 127.0.0.1:0] \
             \\    [--poll-interval-ms 5000]
+            \\
+            \\Required env: S3_ENDPOINT S3_REGION S3_BUCKET
+            \\              AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+            \\Optional env: LOG_S3_KEY_PREFIX S3_USE_TLS
             \\
         );
         try sw.interface.flush();
         std.process.exit(2);
     };
 
-    std.fs.cwd().makePath(cli.batch_store_dir) catch {};
+    const endpoint = try envRequired(allocator, "S3_ENDPOINT");
+    defer allocator.free(endpoint);
+    const region = try envRequired(allocator, "S3_REGION");
+    defer allocator.free(region);
+    const bucket = try envRequired(allocator, "S3_BUCKET");
+    defer allocator.free(bucket);
+    const access_key = try envRequired(allocator, "AWS_ACCESS_KEY_ID");
+    defer allocator.free(access_key);
+    const secret_key = try envRequired(allocator, "AWS_SECRET_ACCESS_KEY");
+    defer allocator.free(secret_key);
+    const key_prefix = (try envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
+        try allocator.dupe(u8, "");
+    defer allocator.free(key_prefix);
+    const use_tls = blk: {
+        const v = (try envOpt(allocator, "S3_USE_TLS")) orelse break :blk true;
+        defer allocator.free(v);
+        if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk false;
+        break :blk true;
+    };
 
-    const fs_store = try log_server.batch_store.FilesystemBatchStore.init(
-        allocator,
-        cli.batch_store_dir,
-    );
-    defer fs_store.deinit();
+    const s3 = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+        .endpoint = endpoint,
+        .region = region,
+        .bucket = bucket,
+        .key_prefix = key_prefix,
+        .access_key = access_key,
+        .secret_key = secret_key,
+        .use_tls = use_tls,
+    });
+    defer s3.deinit();
 
-    const default_db_path = try std.fmt.allocPrint(
-        allocator,
-        "{s}/log_index.db",
-        .{cli.batch_store_dir},
-    );
-    defer allocator.free(default_db_path);
-    const db_path_str = cli.index_db_path orelse default_db_path;
-    const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}", .{db_path_str}, 0);
+    const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}", .{cli.index_db_path}, 0);
     defer allocator.free(db_path);
 
     var db = try log_server.index_db.IndexDb.open(allocator, db_path);
@@ -108,7 +159,7 @@ pub fn main() !void {
 
     const handle = try log_server.standalone.spawn(.{
         .allocator = allocator,
-        .store = fs_store.batchStore(),
+        .store = s3.batchStore(),
         .db = db,
         .bind_addr = bind_addr,
         .poll_interval_ms = cli.poll_interval_ms,

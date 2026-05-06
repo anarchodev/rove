@@ -50,6 +50,7 @@ pub const thread = @import("thread.zig");
 // migration so the worker's `/_system/log/*` proxy keeps working.
 pub const sidecar = @import("sidecar.zig");
 pub const batch_store = @import("batch_store.zig");
+pub const batch_store_s3 = @import("batch_store_s3.zig");
 pub const index_db = @import("index_db.zig");
 pub const indexer = @import("indexer.zig");
 pub const standalone = @import("standalone.zig");
@@ -58,6 +59,7 @@ pub const flush_writer = @import("flush_writer.zig");
 test {
     _ = sidecar;
     _ = batch_store;
+    _ = batch_store_s3;
     _ = index_db;
     _ = indexer;
     _ = standalone;
