@@ -354,7 +354,7 @@ test "writeBundle: not_found returns error" {
     defer log_kv.close();
     var blob_backend = try blob_mod.FilesystemBlobStore.open(allocator, blob_dir);
     defer blob_backend.deinit();
-    var store = try log_mod.LogStore.init(allocator, log_kv, blob_backend.blobStore(), 0);
+    var store = try log_mod.LogStore.init(allocator, log_kv, blob_backend.blobStore(), 0, .{});
     defer store.deinit();
 
     var buf: [256]u8 = undefined;
@@ -389,7 +389,7 @@ test "writeBundle: minimal record without tapes" {
     defer log_kv.close();
     var blob_backend = try blob_mod.FilesystemBlobStore.open(allocator, blob_dir);
     defer blob_backend.deinit();
-    var store = try log_mod.LogStore.init(allocator, log_kv, blob_backend.blobStore(), 0);
+    var store = try log_mod.LogStore.init(allocator, log_kv, blob_backend.blobStore(), 0, .{});
     defer store.deinit();
 
     // Insert a record via a synthetic batch.

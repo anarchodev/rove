@@ -64,24 +64,23 @@ sub-plan's migration order. No big-bang cutovers between them.
 - **(a) logs — write path done; read path migration in flight.**
   Worker → S3 (ndjson + sidecar) flows; envelope type 1 + raft
   log path deleted. Standalone log-server now exposes
-  `/v1/{tenant}/{list,show,count,blob}` (A1 + A2 done); the
-  dashboard / `Worker.log_proxy` / in-process log-server thread
-  flip is A3, gated on A4 moving `nextRequestSeq` off `log.db`.
+  `/v1/{tenant}/{list,show,count,blob}` (A1 + A2 done).
+  `nextRequestSeq` moved off `log.db` onto a `_log/next_request_seq`
+  row in app.db with a one-shot migration on tenant open (A4 done).
+  A3 (dashboard JS → v1 + worker proxy redirect + delete legacy
+  plumbing) is the last piece left in Step A.
 - **(e) files-server — not started.** Waits on (a) Step B
   (subdomain + JWT-handoff pattern).
 - **(c) snapshot — not started.** Waits on (a) + (e) retiring
   envelope types 1 + 3 to reduce raft log pressure.
 
 **Next pickup, then alternatives:**
-1. **(a) A4 — `nextRequestSeq` off `log.db`.** Unblocks A3.
-   Smallest contained piece left in (a). Likely a `meta/` row in
-   `app.db` mirroring the existing chunked-reservation pattern.
-2. **(a) A3 — repoint proxy + delete legacy plumbing.** After A4.
-   Coordinated dashboard JS update + `proxy.zig` URL rewrite +
-   in-process server deletion + `log-blobs/` deletion + restore
-   `replay_smoke`.
-3. **(a) Step B — log-server subdomain + JWT handoff.** Independent
-   of A3/A4 (can land in any order); unblocks piece 4.
+1. **(a) A3 — repoint proxy + delete legacy plumbing.** Last piece
+   of Step A. Coordinated dashboard JS update + `proxy.zig` URL
+   rewrite (`/_system/log` → `/v1`) + in-process server deletion
+   + `log-blobs/` deletion + restore `replay_smoke`.
+2. **(a) Step B — log-server subdomain + JWT handoff.** Independent
+   of A3 (can land in any order); unblocks piece 4.
 
 Detail per piece below.
 
@@ -342,20 +341,20 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
     Restore `replay_smoke` from its SKIP state. Depends on **A4**
     — the worker can't drop its `log.db` open until
     `nextRequestSeq` lives somewhere else.
-  - **A4 — pending.** Move `nextRequestSeq` off `log.db`. The
-    counter is the only thing the worker still reads from `log.db`;
-    everything else flows through the S3 batch store. Two viable
-    landing spots: (a) a `meta/` row in the per-tenant `app.db`
-    (cheapest — `app.db` is already open per worker, same chunked-
-    reservation pattern works); or (b) a worker-thread-local
-    counter that survives restart by scanning S3 sidecars at
-    startup for the max `request_id`. (a) is simpler; (b) is
-    purer (truly nothing on disk in the worker beyond `app.db`)
-    but requires a new startup scan path. Once landed: drop
-    `log.db` opens entirely + retire `rove-log-cli`'s filesystem
-    mode (it can move to either S3-direct via `rove-blob` +
-    `rove-log-server` query helpers, or to HTTP against the
-    standalone — pick when the work happens).
+  - **A4 — done 2026-05-06.** `nextRequestSeq` lives at
+    `_log/next_request_seq` in the per-tenant `app.db`. `LogStore.init`
+    gained an `Options{ seq_kv, seq_key }` arg so the counter store
+    can be different from the records store; the worker passes
+    `inst.kv` (app.db) for the counter while still passing log.db
+    for records (A3 deletes the records side). `_log/` joined
+    `PLATFORM_KV_PREFIXES` so customer code can't read or stomp the
+    counter. One-shot migration in `migrateRequestSeqIfNeeded`
+    copies any pre-A4 `meta/next_request_seq` from log.db to app.db
+    on tenant open so the counter stays monotonic across the
+    upgrade. The worker still opens log.db (A3's cleanup), but
+    nothing in this commit reads from or writes to it anymore.
+    rove-log-cli's filesystem mode also still reads log.db —
+    retiring it is rolled into A3 since both want to land together.
 - **Step B — log-server subdomain + JWT handoff (pending).** Move
   log-server off loopback onto `logs.{public_suffix}` with its own
   TLS listener; add the token-handoff endpoints

@@ -913,6 +913,18 @@ fn openTenantLog(
     const log_kv = try kv_mod.KvStore.open(allocator, log_db_path);
     errdefer log_kv.close();
 
+    // Phase 5.5 (a) A4: nextRequestSeq lives at `_log/next_request_seq`
+    // in the per-tenant app.db. One-shot migration — if app.db doesn't
+    // have the key yet but log.db does (worker is upgrading from a
+    // pre-A4 build), copy the value across before LogStore.init reads
+    // it. Otherwise the worker would mint colliding ids.
+    migrateRequestSeqIfNeeded(allocator, inst.kv, log_kv) catch |err| {
+        std.log.warn(
+            "rove-js openTenantLog({s}): seq migration failed: {s}",
+            .{ inst.id, @errorName(err) },
+        );
+    };
+
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         worker.blob_backend_cfg,
@@ -934,8 +946,42 @@ fn openTenantLog(
         .blob_backend = blob_backend,
         .store = undefined,
     };
-    tl.store = try log_mod.LogStore.init(allocator, tl.log_kv, tl.blob_backend.blobStore(), worker_id);
+    tl.store = try log_mod.LogStore.init(
+        allocator,
+        tl.log_kv,
+        tl.blob_backend.blobStore(),
+        worker_id,
+        .{
+            .seq_kv = inst.kv,
+            .seq_key = "_log/next_request_seq",
+        },
+    );
     return tl;
+}
+
+/// One-shot copy of pre-A4 `meta/next_request_seq` from log.db over to
+/// `_log/next_request_seq` in app.db. Idempotent: if app.db already
+/// has the key, no-op. If log.db doesn't have the legacy key either
+/// (fresh tenant), no-op. Runs once per tenant per process; the cost
+/// is two SQLite reads on the cold-open path.
+fn migrateRequestSeqIfNeeded(
+    allocator: std.mem.Allocator,
+    app_kv: *kv_mod.KvStore,
+    log_kv: *kv_mod.KvStore,
+) !void {
+    if (app_kv.get("_log/next_request_seq")) |bytes| {
+        allocator.free(bytes);
+        return;
+    } else |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    }
+    const legacy = log_kv.get("meta/next_request_seq") catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    defer allocator.free(legacy);
+    try app_kv.put("_log/next_request_seq", legacy);
 }
 
 fn freeTenantLog(allocator: std.mem.Allocator, tl: *TenantLog) void {
@@ -2080,4 +2126,56 @@ test "captureLog appends a record to the tenant's LogStore" {
     try testing.expectEqualStrings("/test", result.records[0].path);
     try testing.expectEqual(@as(u64, 42), result.records[0].deployment_id);
     try testing.expectEqual(log_mod.Outcome.ok, result.records[0].outcome);
+}
+
+test "openTenantLog migrates legacy log.db meta/next_request_seq into app.db" {
+    // Phase 5.5 (a) A4 — pre-A4 workers persisted the chunked
+    // reservation at `meta/next_request_seq` in log.db. Post-A4
+    // openTenantLog reads from `_log/next_request_seq` in app.db.
+    // The one-shot migration in `migrateRequestSeqIfNeeded` keeps
+    // ids monotonic across the upgrade.
+    const allocator = testing.allocator;
+    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-js-seqmig-{x}", .{seed});
+    defer allocator.free(tmp_dir);
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const root_path = try std.fmt.allocPrintSentinel(allocator, "{s}/__root__.db", .{tmp_dir}, 0);
+    defer allocator.free(root_path);
+    const root_kv = try kv_mod.KvStore.open(allocator, root_path);
+    defer root_kv.close();
+
+    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, tmp_dir);
+    defer tenant.destroy();
+    try tenant.createInstance("acme");
+    const inst = tenant.instances.get("acme").?;
+
+    // Seed the legacy key in log.db before the worker opens it.
+    const log_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/acme/log.db", .{tmp_dir}, 0);
+    defer allocator.free(log_db_path);
+    const log_kv_seed = try kv_mod.KvStore.open(allocator, log_db_path);
+    try log_kv_seed.put("meta/next_request_seq", "00000000abcd");
+    log_kv_seed.close();
+
+    const FakeWorker = struct {
+        allocator: std.mem.Allocator,
+        tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
+        blob_backend_cfg: blob_mod.BackendConfig = .fs,
+    };
+    var fake = FakeWorker{ .allocator = allocator, .tenant_logs = .empty };
+    defer fake.tenant_logs.deinit(allocator);
+
+    const tl = try openTenantLog(&fake, inst, 9);
+    defer freeTenantLog(allocator, tl);
+
+    // app.db should now carry the migrated counter, and a fresh
+    // mint should resume from at-or-after the legacy reservation.
+    const migrated = try inst.kv.get("_log/next_request_seq");
+    defer allocator.free(migrated);
+    try testing.expectEqualStrings("00000000abcd", migrated);
+
+    const id = try tl.store.nextRequestId();
+    try testing.expect((id & 0xFFFFFFFFFFFF) >= 0xabcd);
 }

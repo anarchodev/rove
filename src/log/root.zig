@@ -204,10 +204,29 @@ const FLAG_RESP_BODY_TRUNC: u16 = 1 << 8;
 /// is benign — ids never collide across restarts.
 pub const REQUEST_ID_CHUNK: u48 = 1024;
 
+/// Where the chunked-reservation counter lives. Defaults preserve
+/// the historical behavior (counter on the records `kv` at
+/// `meta/next_request_seq`) so test/CLI sites that don't care can
+/// pass `.{}`. The worker passes `.{ .seq_kv = inst.kv,
+/// .seq_key = "_log/next_request_seq" }` to put the counter on
+/// app.db — Phase 5.5 a, A4 — so dropping the log.db open in A3
+/// doesn't strand the counter.
+pub const Options = struct {
+    /// KvStore the chunked-reservation counter reads + writes.
+    /// `null` falls back to the records `kv` (back-compat).
+    seq_kv: ?*kv_mod.KvStore = null,
+    /// Key the chunked-reservation counter persists at. Default
+    /// matches the historical log.db key.
+    seq_key: []const u8 = "meta/next_request_seq",
+};
+
 pub const LogStore = struct {
     allocator: std.mem.Allocator,
-    /// Per-tenant log index. Stores `req/{id}` → serialized record
-    /// and `meta/next_request_seq` for restart continuity.
+    /// Per-tenant log index. Historically stored `req/{id}` →
+    /// serialized record + `meta/next_request_seq`. Phase 5.5 (a)
+    /// retired the writer; the in-process log-server thread still
+    /// reads `req/{id}` until A3 deletes it. Counter moved off via
+    /// `Options.seq_kv` (A4).
     kv: *kv_mod.KvStore,
     /// Reserved for Phase 5.5 tape blob storage. Currently unused,
     /// but wired so callers can construct a complete LogStore today
@@ -216,13 +235,19 @@ pub const LogStore = struct {
     /// Upper 16 bits of every `request_id` minted by this LogStore.
     /// Sourced from raft node id at the worker layer; unique per node.
     worker_id: u16,
+    /// Where chunked-reservation persists. See `Options.seq_kv`.
+    seq_kv: *kv_mod.KvStore,
+    /// Owned key used by the chunked-reservation counter (heap-
+    /// allocated copy of `Options.seq_key` so the caller can pass
+    /// a stack-local literal without lifetime worries).
+    seq_key: []u8,
     /// Lower 48 bits of the next `request_id` to hand out. In-memory
     /// counter that advances on every `nextRequestId` call. Only
     /// values < `reserved_until` are safe to hand out — when they
     /// catch up, `nextRequestId` reserves a new chunk on disk.
     next_request_seq: u48,
     /// Highest (exclusive) seq that has been reserved on disk via
-    /// `meta/next_request_seq`. On restart this value is loaded and
+    /// `seq_key`. On restart this value is loaded and
     /// `next_request_seq` resumes from it, which may leave a sparse
     /// gap up to `REQUEST_ID_CHUNK` wide — acceptable since the
     /// invariant we need is "ids never collide," not "ids are dense."
@@ -240,7 +265,8 @@ pub const LogStore = struct {
     flush_interval_ns: i64 = 1 * std.time.ns_per_s,
 
     /// Open or initialize a LogStore on top of an already-open KvStore
-    /// + BlobStore. The store reads `meta/next_request_seq` if present
+    /// + BlobStore. The store reads its chunked-reservation counter
+    /// (key from `opts.seq_key` on `opts.seq_kv` or `kv`) if present
     /// so request_ids don't collide after a restart. Any gap between
     /// the loaded value and what was actually handed out before the
     /// previous crash is intentional — see `REQUEST_ID_CHUNK`.
@@ -249,12 +275,16 @@ pub const LogStore = struct {
         kv: *kv_mod.KvStore,
         blob: blob_mod.BlobStore,
         worker_id: u16,
+        opts: Options,
     ) Error!LogStore {
+        const seq_key = allocator.dupe(u8, opts.seq_key) catch return Error.OutOfMemory;
         var self: LogStore = .{
             .allocator = allocator,
             .kv = kv,
             .blob = blob,
             .worker_id = worker_id,
+            .seq_kv = opts.seq_kv orelse kv,
+            .seq_key = seq_key,
             .next_request_seq = 0,
             .reserved_until = 0,
             .buffer = .empty,
@@ -269,6 +299,7 @@ pub const LogStore = struct {
     pub fn deinit(self: *LogStore) void {
         for (self.buffer.items) |*r| r.deinit(self.allocator);
         self.buffer.deinit(self.allocator);
+        self.allocator.free(self.seq_key);
         self.* = undefined;
     }
 
@@ -456,7 +487,7 @@ pub const LogStore = struct {
     }
 
     fn loadNextSeq(self: *LogStore) Error!u48 {
-        const bytes = self.kv.get("meta/next_request_seq") catch |err| switch (err) {
+        const bytes = self.seq_kv.get(self.seq_key) catch |err| switch (err) {
             error.NotFound => return 0,
             else => return Error.Kv,
         };
@@ -467,7 +498,7 @@ pub const LogStore = struct {
     fn persistReservedUntil(self: *LogStore) !void {
         var buf: [12]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "{x:0>12}", .{self.reserved_until}) catch unreachable;
-        self.kv.put("meta/next_request_seq", s) catch return Error.Kv;
+        self.seq_kv.put(self.seq_key, s) catch return Error.Kv;
     }
 };
 
@@ -782,7 +813,7 @@ const TestFixture = struct {
         var bs = try fs_backend.FilesystemBlobStore.open(allocator, blob_dir);
         errdefer bs.deinit();
 
-        const log = try LogStore.init(allocator, kv, bs.blobStore(), 7);
+        const log = try LogStore.init(allocator, kv, bs.blobStore(), 7, .{});
         return .{
             .allocator = allocator,
             .tmp_dir = tmp_dir,
@@ -1110,7 +1141,7 @@ test "next_request_seq persists across LogStore reopen (chunked)" {
         defer kv.close();
         var bs = try fs_backend.FilesystemBlobStore.open(a, blob_dir);
         defer bs.deinit();
-        var log = try LogStore.init(a, kv, bs.blobStore(), 0);
+        var log = try LogStore.init(a, kv, bs.blobStore(), 0, .{});
         defer log.deinit();
         first_ids[0] = try log.nextRequestId();
         first_ids[1] = try log.nextRequestId();
@@ -1121,7 +1152,7 @@ test "next_request_seq persists across LogStore reopen (chunked)" {
         defer kv.close();
         var bs = try fs_backend.FilesystemBlobStore.open(a, blob_dir);
         defer bs.deinit();
-        var log = try LogStore.init(a, kv, bs.blobStore(), 0);
+        var log = try LogStore.init(a, kv, bs.blobStore(), 0, .{});
         defer log.deinit();
         const next = try log.nextRequestId();
         // Under chunked reservation: the first nextRequestId call in
@@ -1153,10 +1184,66 @@ test "worker_id occupies the upper 16 bits of request_id" {
     defer kv.close();
     var bs = try fs_backend.FilesystemBlobStore.open(a, blob_dir);
     defer bs.deinit();
-    var log = try LogStore.init(a, kv, bs.blobStore(), 0xCAFE);
+    var log = try LogStore.init(a, kv, bs.blobStore(), 0xCAFE, .{});
     defer log.deinit();
 
     const id = try log.nextRequestId();
     try testing.expectEqual(@as(u64, 0xCAFE), id >> 48);
     try testing.expectEqual(@as(u64, 0), id & 0xFFFFFFFFFFFF);
+}
+
+test "LogStore: separate seq_kv persists chunked reservation independently" {
+    const a = testing.allocator;
+    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    const tmp_dir = try std.fmt.allocPrint(a, "/tmp/rove-log-seq-{x}", .{seed});
+    defer a.free(tmp_dir);
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const records_path = try std.fmt.allocPrintSentinel(a, "{s}/records.db", .{tmp_dir}, 0);
+    defer a.free(records_path);
+    const seq_path = try std.fmt.allocPrintSentinel(a, "{s}/seq.db", .{tmp_dir}, 0);
+    defer a.free(seq_path);
+    const blob_dir = try std.fmt.allocPrint(a, "{s}/blobs", .{tmp_dir});
+    defer a.free(blob_dir);
+
+    const records_kv = try kv_mod.KvStore.open(a, records_path);
+    defer records_kv.close();
+    const seq_kv = try kv_mod.KvStore.open(a, seq_path);
+    defer seq_kv.close();
+    var bs = try fs_backend.FilesystemBlobStore.open(a, blob_dir);
+    defer bs.deinit();
+
+    // Phase 1: open with the split stores, mint enough ids to cross
+    // the chunk boundary, then close.
+    {
+        var log = try LogStore.init(a, records_kv, bs.blobStore(), 1, .{
+            .seq_kv = seq_kv,
+            .seq_key = "_log/next_request_seq",
+        });
+        defer log.deinit();
+        const ids_to_mint = REQUEST_ID_CHUNK + 5;
+        var k: u48 = 0;
+        while (k < ids_to_mint) : (k += 1) _ = try log.nextRequestId();
+    }
+
+    // The counter must have landed in seq_kv, not records_kv.
+    try testing.expectEqual(@as(?[]u8, null), records_kv.get("_log/next_request_seq") catch null);
+    try testing.expectEqual(@as(?[]u8, null), records_kv.get("meta/next_request_seq") catch null);
+    const persisted = try seq_kv.get("_log/next_request_seq");
+    defer a.free(persisted);
+    const reserved = try std.fmt.parseInt(u48, persisted, 16);
+    try testing.expect(reserved >= REQUEST_ID_CHUNK + 5);
+
+    // Phase 2: re-open and verify the next mint resumes past the
+    // persisted reservation (no collisions across restart).
+    {
+        var log2 = try LogStore.init(a, records_kv, bs.blobStore(), 1, .{
+            .seq_kv = seq_kv,
+            .seq_key = "_log/next_request_seq",
+        });
+        defer log2.deinit();
+        const id = try log2.nextRequestId();
+        try testing.expect((id & 0xFFFFFFFFFFFF) >= reserved);
+    }
 }

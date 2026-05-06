@@ -27,6 +27,10 @@ const std = @import("std");
 ///   `_deploy/`          → reserved for future deploy metadata in app.db
 ///   `_callback/`        → webhook envelope-5 apply writes here;
 ///                         dispatchCallbacks reads + invokes onResult
+///   `_log/`             → per-tenant log metadata in app.db. Today
+///                         only `_log/next_request_seq` lives here
+///                         (Phase 5.5 a, A4 — moved off log.db so
+///                         the worker can drop log.db opens entirely).
 ///   `_magic/`           → magic-link tokens (root.db only, but list-wide)
 ///   `_triggers/`        → trigger module bytecode (manifest, not app.db)
 ///   `_events/`          → SSE event rows (events.emit writes)
@@ -35,6 +39,7 @@ pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_audit/",
     "_deploy/",
     "_callback/",
+    "_log/",
     "_magic/",
     "_triggers/",
     "_events/",
@@ -79,6 +84,7 @@ test "isReservedTriggerPrefix: exact platform prefix blocked" {
     try std.testing.expect(isReservedTriggerPrefix("_audit/"));
     try std.testing.expect(isReservedTriggerPrefix("_callback/"));
     try std.testing.expect(isReservedTriggerPrefix("_events/"));
+    try std.testing.expect(isReservedTriggerPrefix("_log/"));
     try std.testing.expect(isReservedTriggerPrefix("_sessions/"));
     try std.testing.expect(isReservedTriggerPrefix("_triggers/"));
 }
@@ -106,6 +112,7 @@ test "isCustomerWriteReserved: platform prefixes blocked" {
     try std.testing.expect(isCustomerWriteReserved("_events/sid/0001-000001"));
     try std.testing.expect(isCustomerWriteReserved("_callback/xyz"));
     try std.testing.expect(isCustomerWriteReserved("_audit/anything"));
+    try std.testing.expect(isCustomerWriteReserved("_log/next_request_seq"));
     try std.testing.expect(isCustomerWriteReserved("_magic/token"));
     try std.testing.expect(isCustomerWriteReserved("_triggers/users/index.mjs"));
 }

@@ -332,7 +332,7 @@ pub fn main() !void {
     var blob_backend = try blob_mod.FilesystemBlobStore.open(allocator, log_blob_dir);
     defer blob_backend.deinit();
 
-    var store = try log_mod.LogStore.init(allocator, log_kv, blob_backend.blobStore(), 0);
+    var store = try log_mod.LogStore.init(allocator, log_kv, blob_backend.blobStore(), 0, .{});
     defer store.deinit();
 
     switch (args.cmd) {

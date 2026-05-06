@@ -146,6 +146,7 @@ const InstanceCtx = struct {
             self.kv,
             self.blob_backend.blobStore(),
             0,
+            .{},
         ) catch return Error.Kv;
     }
 
@@ -288,7 +289,7 @@ fn seedLogStore(
     defer kv.close();
     var backend = try blob_mod.FilesystemBlobStore.open(allocator, blob_dir);
     defer backend.deinit();
-    var store = try log_mod.LogStore.init(allocator, kv, backend.blobStore(), 1);
+    var store = try log_mod.LogStore.init(allocator, kv, backend.blobStore(), 1, .{});
     defer store.deinit();
 
     var i: usize = 0;
