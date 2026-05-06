@@ -53,7 +53,7 @@ sub-plan's migration order. No big-bang cutovers between them.
 
 ## Per-piece status
 
-### 1. Tape body capture — **in progress**
+### 1. Tape body capture — **done 2026-05-05**
 
 **What it delivers**: request and response bodies stored
 content-addressed in the per-tenant blob backend

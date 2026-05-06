@@ -970,7 +970,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // Upload tapes now — blob-addressed and idempotent, so storing
         // them before commit is safe even if the batch later rolls
         // back. The refs get carried into the log record after commit.
-        const tape_refs = worker_mod.uploadTapes(worker, scope_inst.id, &tapes, body);
+        // `body` is the inbound request body; `body_ptr[0..body_len]`
+        // is the outbound response body the worker just stamped on
+        // `request_out`. Both get captured.
+        const response_body_slice: []const u8 = if (body_ptr) |p| p[0..body_len] else &.{};
+        const tape_refs = worker_mod.uploadTapes(worker, scope_inst.id, &tapes, body, response_body_slice);
 
         const console_owned = resp.console;
         const exception_owned = resp.exception;

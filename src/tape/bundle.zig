@@ -25,8 +25,16 @@
 //!     "deployment_id": N,
 //!     "received_ns": N,
 //!     "duration_ns": N,
-//!     "request":  { "method", "path", "host" },
-//!     "response": { "status", "outcome", "console", "exception" },
+//!     "request":  {
+//!       "method", "path", "host",
+//!       "body_b64": "<base64>" | null,
+//!       "body_truncated": bool
+//!     },
+//!     "response": {
+//!       "status", "outcome", "console", "exception",
+//!       "body_b64": "<base64>" | null,
+//!       "body_truncated": bool
+//!     },
 //!     "entry_source_hash": "<64 hex>" | null,
 //!     "entry_source_b64":  "<base64>" | null,
 //!     "modules": [ { "specifier", "source_hash" }, ... ],
@@ -89,11 +97,17 @@ pub fn writeBundle(w: *std.Io.Writer, ctx: Context) !void {
     try writeJsonString(w, rec.path);
     try w.writeAll(",\"host\":");
     try writeJsonString(w, rec.host);
+    try w.writeAll(",\"body_b64\":");
+    try emitBlobBase64(w, ctx.allocator, ctx.log_blob, rec.tape_refs.request_body_hex);
+    try w.print(",\"body_truncated\":{}", .{rec.tape_refs.request_body_truncated});
     try w.writeAll("},\"response\":{\"status\":");
     try w.print("{d},\"outcome\":\"{s}\",\"console\":", .{ rec.status, outcomeName(rec.outcome) });
     try writeJsonString(w, rec.console);
     try w.writeAll(",\"exception\":");
     try writeJsonString(w, rec.exception);
+    try w.writeAll(",\"body_b64\":");
+    try emitBlobBase64(w, ctx.allocator, ctx.log_blob, rec.tape_refs.response_body_hex);
+    try w.print(",\"body_truncated\":{}", .{rec.tape_refs.response_body_truncated});
     try w.writeAll("},");
 
     if (ctx.entry_source_hash) |h| {
@@ -162,6 +176,29 @@ fn writeBase64(w: *std.Io.Writer, allocator: std.mem.Allocator, bytes: []const u
     try w.writeAll("\"");
     try w.writeAll(buf);
     try w.writeAll("\"");
+}
+
+/// Emit a base64 string for the bytes referenced by `hash_hex`, or
+/// `null` when the hash is absent OR the blob fetch fails. Body
+/// capture is best-effort, so a missing blob is "skip the body in
+/// the bundle," not an error — same posture as tape-blob fetch
+/// (`emitTapeField` swallows fetch errors as null).
+fn emitBlobBase64(
+    w: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    blob: blob_mod.BlobStore,
+    hash_opt: ?[64]u8,
+) !void {
+    const hash = hash_opt orelse {
+        try w.writeAll("null");
+        return;
+    };
+    const bytes = blob.get(&hash, allocator) catch {
+        try w.writeAll("null");
+        return;
+    };
+    defer allocator.free(bytes);
+    try writeBase64(w, allocator, bytes);
 }
 
 /// Fetch a tape blob, parse it, emit `{"hash":"...","entries":[...]}`.

@@ -214,19 +214,30 @@ got_date=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)[
 got_mod=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["module_tree_hex"] or "")')
 got_body=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["request_body_hex"] or "")')
 got_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["request_body_truncated"])')
+got_resp_body=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["response_body_hex"] or "")')
+got_resp_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tape_refs"]["response_body_truncated"])')
 
 [[ -n "$got_kv" ]]    || fail "kv_tape_hex missing on log record"
 [[ -n "$got_date" ]]  || fail "date_tape_hex missing"
 [[ -n "$got_mod" ]]   || fail "module_tree_hex missing (multi-module capture)"
 [[ -n "$got_body" ]]  || fail "request_body_hex missing"
 [[ "$got_trunc" == "False" ]] || fail "request_body_truncated should be false for small body"
-ok "log record carries kv + date + module + body tape refs"
+[[ -n "$got_resp_body" ]] || fail "response_body_hex missing"
+[[ "$got_resp_trunc" == "False" ]] || fail "response_body_truncated should be false for small response"
+ok "log record carries kv + date + module + req-body + resp-body tape refs"
 
 # Fetch the body blob and verify content.
 body_text=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
     "${ADMIN_ORIGIN}/_system/log/alice/blob/${got_body}")
 [[ "$body_text" == "first-visit" ]] || fail "body blob content drift: '$body_text'"
 ok "request body blob content round-trips"
+
+# Fetch the response body blob and verify it matches what curl saw.
+resp_text=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
+    "${ADMIN_ORIGIN}/_system/log/alice/blob/${got_resp_body}")
+[[ "$resp_text" == "$resp" ]] || \
+    fail "response body blob drift: expected '$resp', got '$resp_text'"
+ok "response body blob content round-trips"
 
 # ── 5. Historical deployment manifest ────────────────────────────
 # Deploy v3 with different content, then verify v2's manifest is
@@ -299,8 +310,12 @@ ok "captured body blob exactly 262144 bytes (256 KB)"
 # log_cli only stamps `entry_source_hash`; the dashboard composer
 # is what inlines `entry_source_b64`. CLI bundle output is for
 # human inspection of tape data, so don't assert b64 source here.
+export EXPECTED_RESP="$resp"
 python3 <<PY || fail "bundle JSON shape mismatch"
+import base64
 import json
+import os
+expected_resp = os.environ.get("EXPECTED_RESP", "")
 with open("/tmp/replay-bundle.json") as f:
     b = json.load(f)
 assert b["entry_source_hash"], "no entry_source_hash"
@@ -318,8 +333,19 @@ assert "prefix" in ops, f"no kv.prefix in tape: {ops}"
 prefix_entry = next(e for e in kv_entries if e["op"] == "prefix")
 assert prefix_entry["key"] == "hits/", prefix_entry
 assert "results" in prefix_entry, prefix_entry
+
+req = b.get("request") or {}
+assert req.get("body_b64") == base64.b64encode(b"first-visit").decode(), \
+    f"request.body_b64 mismatch: {req.get('body_b64')!r}"
+assert req.get("body_truncated") is False, "request.body_truncated should be false"
+
+rsp = b.get("response") or {}
+assert rsp.get("body_b64") == base64.b64encode(expected_resp.encode()).decode(), \
+    f"response.body_b64 mismatch (expected '{expected_resp}')"
+assert rsp.get("body_truncated") is False, "response.body_truncated should be false"
 PY
-ok "rove-log-cli bundle: modules, kv (incl. prefix), date all present"
+unset EXPECTED_RESP
+ok "rove-log-cli bundle: modules, kv (incl. prefix), date, req+resp body all present"
 
 rm -f /tmp/replay-bundle.json
 echo ""

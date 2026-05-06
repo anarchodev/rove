@@ -997,16 +997,19 @@ pub const RequestTapes = struct {
 /// Best-effort: on any serialize/upload failure for a given channel,
 /// the ref for that channel is left null and a warning is logged. We
 /// don't want tape capture failures to kill the request.
-/// Maximum captured request-body length. Anything bigger gets
-/// truncated to this prefix and `request_body_truncated` set on the
-/// log record's tape refs. Mirrors PLAN §2.4's body-cap default.
+/// Maximum captured body length (request OR response). Anything
+/// bigger gets truncated to this prefix and the corresponding
+/// `*_truncated` flag set on the log record's tape refs. Mirrors
+/// PLAN §2.4's body-cap default.
 pub const REQUEST_BODY_CAP: usize = 256 * 1024;
+pub const RESPONSE_BODY_CAP: usize = 256 * 1024;
 
 pub fn uploadTapes(
     worker: anytype,
     instance_id: []const u8,
     tapes: *RequestTapes,
     request_body: []const u8,
+    response_body: []const u8,
 ) log_mod.TapeRefs {
     const tl = worker.tenant_logs.get(instance_id) orelse return .{};
     const allocator = worker.allocator;
@@ -1058,6 +1061,24 @@ pub fn uploadTapes(
             // dangle a hash whose blob never landed. Replay falls
             // back to empty body.
             std.log.warn("rove-js request-body blob put failed: {s}", .{@errorName(err)});
+        }
+    }
+
+    // Response body — same capture pattern as request body.
+    // Captured AFTER content-type sniffing / JSON serialization (the
+    // worker has already turned `resp.body` into the bytes that go
+    // out on the wire). Replay UI shows these alongside the request
+    // bytes so debugging "what did this request return" doesn't
+    // require log scraping.
+    if (response_body.len > 0) {
+        const captured_len = @min(response_body.len, RESPONSE_BODY_CAP);
+        const captured = response_body[0..captured_len];
+        const hash = tape_mod.hashHexBytes(captured);
+        if (blob.put(&hash, captured)) {
+            refs.response_body_hex = hash;
+            refs.response_body_truncated = captured_len < response_body.len;
+        } else |err| {
+            std.log.warn("rove-js response-body blob put failed: {s}", .{@errorName(err)});
         }
     }
 

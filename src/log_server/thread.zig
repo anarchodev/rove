@@ -458,6 +458,9 @@ fn writeTapeRefs(
     try writeTapeRefField(w, allocator, "request_body_hex", refs.request_body_hex, false);
     try w.appendSlice(allocator, ",\"request_body_truncated\":");
     try w.appendSlice(allocator, if (refs.request_body_truncated) "true" else "false");
+    try writeTapeRefField(w, allocator, "response_body_hex", refs.response_body_hex, false);
+    try w.appendSlice(allocator, ",\"response_body_truncated\":");
+    try w.appendSlice(allocator, if (refs.response_body_truncated) "true" else "false");
     try w.append(allocator, '}');
 }
 

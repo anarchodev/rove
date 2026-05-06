@@ -14,22 +14,20 @@
 //!
 //! ## What's NOT yet in this module
 //!
-//! All three of these are scheduled together in PLAN.md Phase 5.5
-//! ("Storage scalability for production load") since they share the
-//! same blob-offload pattern and are mutually load-bearing.
+//! These are scheduled together in PLAN.md Phase 5.5 ("Storage
+//! scalability for production load") since they share the same
+//! blob-offload pattern and are mutually load-bearing.
 //!
-//! - **Request / response bodies.** The `tape_refs` slot on
-//!   `LogRecord` is reserved for the body hash + meta.
-//! - **Body offload to rove-blob.** Will populate tape blobs in
-//!   `{inst.dir}/log-blobs/`. The `blob: BlobStore` field is here
-//!   today so callers can construct a complete LogStore without
-//!   needing to add a parameter when the wiring lands.
-//! - **Batch payload offload to BlobStore.** Today the raft entry
-//!   payload IS the batch bytes. Phase 5.5 changes this so the leader
-//!   writes the batch blob to its `BlobStore` (FilesystemBlobStore
-//!   for single-host, S3BlobStore once multi-node lands) and the raft
-//!   entry carries only `{tenant_id, batch_hash, manifest}`. The
-//!   library API doesn't change.
+//! - **Request / response body capture is wired** as of Phase 5.5
+//!   (b). Bodies up to 256 KB land in the per-tenant `log-blobs/`
+//!   directory; `tape_refs.{request,response}_body_hex` carry the
+//!   hash; `_truncated` flags signal when the captured bytes are a
+//!   prefix.
+//! - **Batch payload offload to BlobStore (Phase 5.5 a).** Today
+//!   the raft entry payload IS the batch bytes. Phase 5.5 (a)
+//!   changes this so the leader writes batches to S3 directly and
+//!   the per-tenant `log.db` retires entirely (logs become S3-direct
+//!   per `docs/logs-plan.md`). The library API doesn't change.
 //! - **Retention / GC.** No automatic sweep. A future
 //!   `purgeOlderThan(ns)` API is planned but not present yet.
 //!
@@ -96,6 +94,15 @@ pub const TapeRefs = struct {
     /// is what was captured, even if that's less than the full
     /// original body.
     request_body_truncated: bool = false,
+    /// Hash of the captured response body (handler return value
+    /// after content-type sniffing / JSON serialization, truncated
+    /// to 256 KB). Null when the handler returned no body or the
+    /// worker chose not to capture (no tenant log open). Same blob
+    /// store as the other tape refs. Replay UI uses this to show
+    /// the actual response bytes alongside the request.
+    response_body_hex: ?[HASH_HEX_LEN]u8 = null,
+    /// True iff `response_body_hex` references a truncated prefix.
+    response_body_truncated: bool = false,
 };
 
 /// One request's log entry. All `[]const u8` fields are owned by the
@@ -156,24 +163,34 @@ pub const ListOpts = struct {
     after: u64 = 0,
 };
 
-const RECORD_VERSION: u32 = 1;
+/// Wire-format version. v1 used a u8 flags byte and didn't carry
+/// response-body refs. v2 widens flags to u16 and adds
+/// FLAG_RESP_BODY / FLAG_RESP_BODY_TRUNC. parseRecord still reads
+/// v1 records (flags as u8, no resp-body fields) so a worker
+/// upgrade doesn't strand old records in log.db.
+const RECORD_VERSION: u32 = 2;
 
-/// Bit positions in the `flags` byte used by `serializeRecord`.
-/// Each bit signals presence of one optional field. 7 of the 8 bits
-/// are claimed; one reserved for a future ref.
-const FLAG_KV_TAPE: u8 = 1 << 0;
-const FLAG_CRYPTO_RANDOM_TAPE: u8 = 1 << 1;
-const FLAG_DATE_TAPE: u8 = 1 << 2;
-const FLAG_MATH_RANDOM_TAPE: u8 = 1 << 3;
-const FLAG_MODULE_TREE: u8 = 1 << 4;
+/// Bit positions in the `flags` field used by `serializeRecord`.
+/// Each bit signals presence of one optional field. v2 widened from
+/// u8 to u16 to make room for the response body refs.
+const FLAG_KV_TAPE: u16 = 1 << 0;
+const FLAG_CRYPTO_RANDOM_TAPE: u16 = 1 << 1;
+const FLAG_DATE_TAPE: u16 = 1 << 2;
+const FLAG_MATH_RANDOM_TAPE: u16 = 1 << 3;
+const FLAG_MODULE_TREE: u16 = 1 << 4;
 /// Set when `request_body_hex` is non-null. Followed by 64 hex bytes
 /// in the on-the-wire blob list, just like the tape flags above.
-const FLAG_REQ_BODY: u8 = 1 << 5;
+const FLAG_REQ_BODY: u16 = 1 << 5;
 /// Truncation marker for the request body. Independent of
 /// `FLAG_REQ_BODY` only because a no-body request can't be
 /// "truncated" (the bit is meaningless without REQ_BODY set), but
 /// the encoder always clears it when REQ_BODY is clear.
-const FLAG_REQ_BODY_TRUNC: u8 = 1 << 6;
+const FLAG_REQ_BODY_TRUNC: u16 = 1 << 6;
+/// Set when `response_body_hex` is non-null. Same hex-block layout.
+const FLAG_RESP_BODY: u16 = 1 << 7;
+/// Truncation marker for the response body. Same dependency rule
+/// as FLAG_REQ_BODY_TRUNC.
+const FLAG_RESP_BODY_TRUNC: u16 = 1 << 8;
 
 /// Request-id reservation window size. `nextRequestId` hands out this
 /// many ids in memory before persisting a new high-water mark to the
@@ -453,13 +470,14 @@ fn estimateRecordBytes(r: *const LogRecord) usize {
     n += 2 + r.host.len;
     n += 4 + r.console.len;
     n += 4 + r.exception.len;
-    n += 1; // flags
+    n += 2; // flags (u16 in v2)
     if (r.tape_refs.kv_tape_hex != null) n += HASH_HEX_LEN;
     if (r.tape_refs.crypto_random_tape_hex != null) n += HASH_HEX_LEN;
     if (r.tape_refs.date_tape_hex != null) n += HASH_HEX_LEN;
     if (r.tape_refs.math_random_tape_hex != null) n += HASH_HEX_LEN;
     if (r.tape_refs.module_tree_hex != null) n += HASH_HEX_LEN;
     if (r.tape_refs.request_body_hex != null) n += HASH_HEX_LEN;
+    if (r.tape_refs.response_body_hex != null) n += HASH_HEX_LEN;
     return n;
 }
 
@@ -489,7 +507,7 @@ fn serializeRecord(allocator: std.mem.Allocator, r: *const LogRecord) ![]u8 {
     i += writeLenPrefixed(out[i..], r.console, 4);
     i += writeLenPrefixed(out[i..], r.exception, 4);
 
-    var flags: u8 = 0;
+    var flags: u16 = 0;
     if (r.tape_refs.kv_tape_hex != null) flags |= FLAG_KV_TAPE;
     if (r.tape_refs.crypto_random_tape_hex != null) flags |= FLAG_CRYPTO_RANDOM_TAPE;
     if (r.tape_refs.date_tape_hex != null) flags |= FLAG_DATE_TAPE;
@@ -499,8 +517,12 @@ fn serializeRecord(allocator: std.mem.Allocator, r: *const LogRecord) ![]u8 {
         flags |= FLAG_REQ_BODY;
         if (r.tape_refs.request_body_truncated) flags |= FLAG_REQ_BODY_TRUNC;
     }
-    out[i] = flags;
-    i += 1;
+    if (r.tape_refs.response_body_hex != null) {
+        flags |= FLAG_RESP_BODY;
+        if (r.tape_refs.response_body_truncated) flags |= FLAG_RESP_BODY_TRUNC;
+    }
+    std.mem.writeInt(u16, out[i..][0..2], flags, .little);
+    i += 2;
 
     inline for (.{
         .{ FLAG_KV_TAPE, r.tape_refs.kv_tape_hex },
@@ -509,6 +531,7 @@ fn serializeRecord(allocator: std.mem.Allocator, r: *const LogRecord) ![]u8 {
         .{ FLAG_MATH_RANDOM_TAPE, r.tape_refs.math_random_tape_hex },
         .{ FLAG_MODULE_TREE, r.tape_refs.module_tree_hex },
         .{ FLAG_REQ_BODY, r.tape_refs.request_body_hex },
+        .{ FLAG_RESP_BODY, r.tape_refs.response_body_hex },
     }) |pair| {
         if (pair[1]) |hex| {
             @memcpy(out[i..][0..HASH_HEX_LEN], &hex);
@@ -534,7 +557,11 @@ fn writeLenPrefixed(dst: []u8, src: []const u8, comptime prefix_len: comptime_in
 fn parseRecord(allocator: std.mem.Allocator, bytes: []const u8) Error!LogRecord {
     var r = ParseReader{ .data = bytes, .pos = 0 };
     const version = try r.u32le();
-    if (version != RECORD_VERSION) return Error.InvalidVersion;
+    // v1 records exist on disk for tenants whose log.db predates the
+    // resp-body-capture upgrade. We read them with the narrower u8
+    // flags layout and synthesize zero-filled response refs. v2 is
+    // current.
+    if (version != 1 and version != RECORD_VERSION) return Error.InvalidVersion;
     const request_id = try r.u64le();
     const deployment_id = try r.u64le();
     const received_ns = try r.i64le();
@@ -554,7 +581,7 @@ fn parseRecord(allocator: std.mem.Allocator, bytes: []const u8) Error!LogRecord 
     const exception = try r.bytes32(allocator);
     errdefer allocator.free(exception);
 
-    const flags = try r.byte();
+    const flags: u16 = if (version == 1) @intCast(try r.byte()) else try r.u16le();
     var tape_refs: TapeRefs = .{};
     if (flags & FLAG_KV_TAPE != 0) tape_refs.kv_tape_hex = try r.hexBlock();
     if (flags & FLAG_CRYPTO_RANDOM_TAPE != 0) tape_refs.crypto_random_tape_hex = try r.hexBlock();
@@ -564,6 +591,10 @@ fn parseRecord(allocator: std.mem.Allocator, bytes: []const u8) Error!LogRecord 
     if (flags & FLAG_REQ_BODY != 0) {
         tape_refs.request_body_hex = try r.hexBlock();
         tape_refs.request_body_truncated = (flags & FLAG_REQ_BODY_TRUNC) != 0;
+    }
+    if (flags & FLAG_RESP_BODY != 0) {
+        tape_refs.response_body_hex = try r.hexBlock();
+        tape_refs.response_body_truncated = (flags & FLAG_RESP_BODY_TRUNC) != 0;
     }
 
     return .{
@@ -829,6 +860,98 @@ test "tape_refs partial set round-trip" {
     try testing.expectEqualSlices(u8, &([_]u8{'a'} ** HASH_HEX_LEN), &parsed.tape_refs.kv_tape_hex.?);
     try testing.expect(parsed.tape_refs.crypto_random_tape_hex == null);
     try testing.expect(parsed.tape_refs.module_tree_hex != null);
+}
+
+test "request + response body refs round-trip with truncation flags" {
+    const a = testing.allocator;
+    var rec = try buildRecord(a, 99, "POST", "/upload", 201, .ok, "");
+    defer rec.deinit(a);
+    rec.tape_refs.request_body_hex = [_]u8{'r'} ** HASH_HEX_LEN;
+    rec.tape_refs.request_body_truncated = true;
+    rec.tape_refs.response_body_hex = [_]u8{'s'} ** HASH_HEX_LEN;
+    rec.tape_refs.response_body_truncated = false;
+
+    const bytes = try serializeRecord(a, &rec);
+    defer a.free(bytes);
+    var parsed = try parseRecord(a, bytes);
+    defer parsed.deinit(a);
+
+    try testing.expect(parsed.tape_refs.request_body_hex != null);
+    try testing.expectEqualSlices(u8, &([_]u8{'r'} ** HASH_HEX_LEN), &parsed.tape_refs.request_body_hex.?);
+    try testing.expectEqual(true, parsed.tape_refs.request_body_truncated);
+    try testing.expect(parsed.tape_refs.response_body_hex != null);
+    try testing.expectEqualSlices(u8, &([_]u8{'s'} ** HASH_HEX_LEN), &parsed.tape_refs.response_body_hex.?);
+    try testing.expectEqual(false, parsed.tape_refs.response_body_truncated);
+}
+
+test "response body absent serializes without ref bytes" {
+    const a = testing.allocator;
+    var rec = try buildRecord(a, 100, "GET", "/", 200, .ok, "");
+    defer rec.deinit(a);
+    // Only request body — no response body. Encoder must not write
+    // a response-body hex block, decoder must produce null refs.
+    rec.tape_refs.request_body_hex = [_]u8{'q'} ** HASH_HEX_LEN;
+
+    const bytes = try serializeRecord(a, &rec);
+    defer a.free(bytes);
+    var parsed = try parseRecord(a, bytes);
+    defer parsed.deinit(a);
+
+    try testing.expect(parsed.tape_refs.request_body_hex != null);
+    try testing.expect(parsed.tape_refs.response_body_hex == null);
+    try testing.expectEqual(false, parsed.tape_refs.response_body_truncated);
+}
+
+test "v1 record with u8 flags decodes (forward compat for in-flight upgrade)" {
+    // Hand-craft a v1 record byte sequence that mirrors what
+    // pre-upgrade workers wrote. parseRecord must accept it and
+    // synthesize null response-body refs.
+    const a = testing.allocator;
+
+    // Build via the v2 path then patch: change the version to 1 and
+    // collapse the u16 flags down to u8. That gives us a known-good
+    // v1 layout without re-implementing the encoder.
+    var rec = try buildRecord(a, 7, "GET", "/v1", 200, .ok, "old\n");
+    defer rec.deinit(a);
+    rec.tape_refs.kv_tape_hex = [_]u8{'k'} ** HASH_HEX_LEN;
+    rec.tape_refs.request_body_hex = [_]u8{'b'} ** HASH_HEX_LEN;
+    rec.tape_refs.request_body_truncated = true;
+
+    const v2_bytes = try serializeRecord(a, &rec);
+    defer a.free(v2_bytes);
+
+    // Locate the flags field: header (4+8+8+8+8+2+1) + len-prefixed
+    // method/path/host/console/exception. We'll find it by walking.
+    var pos: usize = 4 + 8 + 8 + 8 + 8 + 2 + 1;
+    inline for (.{ 2, 2, 2, 4, 4 }) |prefix_len| {
+        if (prefix_len == 2) {
+            const n = std.mem.readInt(u16, v2_bytes[pos..][0..2], .little);
+            pos += 2 + n;
+        } else if (prefix_len == 4) {
+            const n = std.mem.readInt(u32, v2_bytes[pos..][0..4], .little);
+            pos += 4 + n;
+        }
+    }
+    // pos now points at the u16 flags field.
+
+    // Build the v1-shaped buffer: copy [0..pos], drop one byte from
+    // the flags field (u16 → u8), copy the rest. Update version.
+    var v1 = std.ArrayList(u8).empty;
+    defer v1.deinit(a);
+    try v1.appendSlice(a, v2_bytes[0..pos]);
+    try v1.append(a, v2_bytes[pos]); // low byte of flags is the v1 flag byte
+    try v1.appendSlice(a, v2_bytes[pos + 2 ..]);
+    std.mem.writeInt(u32, v1.items[0..4], 1, .little);
+
+    var parsed = try parseRecord(a, v1.items);
+    defer parsed.deinit(a);
+
+    try testing.expectEqual(@as(u64, 7), parsed.request_id);
+    try testing.expect(parsed.tape_refs.kv_tape_hex != null);
+    try testing.expect(parsed.tape_refs.request_body_hex != null);
+    try testing.expectEqual(true, parsed.tape_refs.request_body_truncated);
+    // v1 had no response-body slot; must come back null.
+    try testing.expect(parsed.tape_refs.response_body_hex == null);
 }
 
 test "batch serialize + parse round-trip" {
