@@ -467,13 +467,14 @@ pub const WorkerConfig = struct {
     /// must outlive the worker's `create` call (S3BlobStore.init dupes
     /// them, so afterwards they can be freed).
     blob_backend: blob_mod.BackendConfig = .fs,
-    /// Phase 5.5 (d), step 4. `drainer` (default) keeps the legacy
-    /// per-tenant `_outbox/{id}` + drainer-thread path. `direct`
-    /// switches `webhook.send` to accumulate per-batch and ride
-    /// atomically with the writeset via the multi-envelope wrapper.
-    /// The webhook-server thread (step 3) handles delivery in both
-    /// modes — it's the worker → store path that flips here.
-    webhook_path: globals.WebhookPath = .drainer,
+    /// Phase 5.5 (d). `direct` (default as of step 5) means
+    /// `webhook.send` accumulates per-batch and rides atomically
+    /// with the writeset via the multi-envelope wrapper. `drainer`
+    /// keeps the legacy `_outbox/{id}` path for rollback safety;
+    /// step 6 deletes it. The webhook-server thread (step 3)
+    /// handles delivery in both modes — it's the worker → store
+    /// path that flips here.
+    webhook_path: globals.WebhookPath = .direct,
 };
 
 /// Cross-reference component used by the `/_system/*` proxy. Lives

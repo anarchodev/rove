@@ -84,7 +84,7 @@ multi-node gap (replay-after-failover).
 **Sub-plan**: PLAN §3 Phase 5.5 (b) is the spec; no separate
 sub-plan because the work is contained.
 
-### 2. Webhook subsystem — **in progress (steps 1–4 done 2026-05-06)**
+### 2. Webhook subsystem — **in progress (steps 1–5 done 2026-05-06)**
 
 - **Step 1 — done.** `src/webhook_server/root.zig` ships: `WebhookRow`,
   `WebhookStore` (kv-backed at `{data_dir}/webhooks.db`), apply
@@ -141,10 +141,14 @@ sub-plan because the work is contained.
   accumulator mirrors the existing flat writeset shape — neither has
   per-savepoint rollback; the plan's "structurally identical" framing
   documents this.
+- **Step 5 — done.** `--webhook-path` default flipped from `drainer`
+  to `direct` (`WorkerConfig.webhook_path` matches). All three
+  webhook smokes pass with the new default; `webhook_direct_smoke`
+  verifies `_outbox/*` is empty during steady state. The legacy
+  `--webhook-path drainer` flag still works for rollback safety
+  during the one-release window before step 6 deletes it.
 - Remaining steps (per webhook-server-plan.md §7):
-  5. **Cut over to `direct`** (next) in dev, run all webhook smokes,
-     verify `_outbox/*` empty during steady state.
-  6. **Drop the feature flag** + **delete `src/outbox/drainer.zig`**.
+  6. **Drop the feature flag** (next) + **delete `src/outbox/drainer.zig`**.
 
 **What it delivers**: cluster-wide raft-replicated `webhooks.db`,
 new envelope types 4 (enqueue batch), 5 (complete), 6 (retry

@@ -101,13 +101,13 @@ pub const Cli = struct {
     /// customer handler probe localhost and leaks request bodies
     /// over plaintext. Startup emits a loud warning when enabled.
     dev_webhook_unsafe: bool = false,
-    /// Phase 5.5 (d), step 4. `drainer` (default) keeps the legacy
-    /// per-tenant `_outbox/{id}` + drainer-thread path intact.
-    /// `direct` switches `webhook.send` to the new path: per-batch
-    /// accumulator → multi-envelope (writeset + webhook batch) →
-    /// raft → webhook-server thread. Both modes coexist during
-    /// rollout; step 5 makes `direct` the only option.
-    webhook_path: []const u8 = "drainer",
+    /// Phase 5.5 (d). `direct` (default as of step 5, 2026-05-06)
+    /// is the new path: `webhook.send` accumulates per-batch and
+    /// rides atomically with the writeset via the multi-envelope
+    /// wrapper. `drainer` keeps the legacy per-tenant `_outbox/{id}`
+    /// + drainer-thread path for one-release rollback safety; step 6
+    /// deletes the drainer outright and removes this flag.
+    webhook_path: []const u8 = "direct",
     /// **Local-dev convenience flag.** When set, the worker uses
     /// mkcert-issued TLS at the platform-default loop46 data dir
     /// (see `defaultDevTlsPaths`). On first run, if the cert is
