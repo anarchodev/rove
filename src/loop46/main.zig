@@ -58,6 +58,7 @@ const files_mod = @import("rove-files");
 const files_server = @import("rove-files-server");
 const log_server = @import("rove-log-server");
 const outbox = @import("rove-outbox");
+const webhook_server_mod = @import("rove-webhook-server");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
 const h2_mod = @import("rove-h2");
@@ -985,6 +986,23 @@ pub fn main() !void {
     });
     defer drainer_handle.join();
     defer drainer_handle.signalStop();
+
+    // ── Webhook-server thread (Phase 5.5 d, step 3) ────────────────────
+    //
+    // Leader-pinned poll loop reading `{data_dir}/webhooks.db`. Until
+    // the dispatcher cutover (step 4) lands the drainer continues to
+    // own the legacy `_outbox/*` path; this thread starts processing
+    // rows the moment something writes to the consolidated
+    // `webhooks.db` (test-driven for now, dispatcher-driven once
+    // step 4 ships). Both threads gate on `raft.isLeader()` so they
+    // never run concurrently on a follower.
+    const webhook_handle = try webhook_server_mod.thread.spawn(.{
+        .allocator = allocator,
+        .data_dir = cli.data_dir,
+        .raft = raft_node,
+    });
+    defer webhook_handle.join();
+    defer webhook_handle.signalStop();
 
     // ── Spawn worker threads ───────────────────────────────────────────
     const http_addr = try parseHostPort(allocator, cli.http);

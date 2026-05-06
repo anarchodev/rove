@@ -42,6 +42,8 @@
 const std = @import("std");
 const kv = @import("rove-kv");
 
+pub const thread = @import("thread.zig");
+
 pub const Error = error{
     Truncated,
     InvalidVersion,
@@ -56,6 +58,34 @@ pub const Error = error{
 pub const RESPONSE_BODY_CAP: usize = 256 * 1024;
 
 pub const WEBHOOK_ID_HEX_LEN: usize = 64;
+
+/// Apply-envelope type bytes (mirroring `src/js/apply.zig`'s
+/// `EnvelopeType`). Duplicated here so `webhook_server.thread` can
+/// build raft envelopes without depending on `rove-js`. Keep in sync;
+/// `apply.zig` is the authority.
+pub const ENVELOPE_TYPE_ENQUEUE_BATCH: u8 = 4;
+pub const ENVELOPE_TYPE_COMPLETE: u8 = 5;
+pub const ENVELOPE_TYPE_RETRY_SCHEDULE: u8 = 6;
+pub const ENVELOPE_MAX_ID_LEN: usize = 256;
+
+/// Build the apply envelope: `[type][u16 id_len BE][id][payload]`.
+/// Used by the webhook-server thread when proposing envelopes 5 + 6.
+/// Caller frees.
+pub fn wrapApplyEnvelope(
+    allocator: std.mem.Allocator,
+    envelope_type: u8,
+    instance_id: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    if (instance_id.len > ENVELOPE_MAX_ID_LEN) return error.OutOfMemory;
+    const total = 1 + 2 + instance_id.len + payload.len;
+    const out = try allocator.alloc(u8, total);
+    out[0] = envelope_type;
+    std.mem.writeInt(u16, out[1..3], @intCast(instance_id.len), .big);
+    @memcpy(out[3 .. 3 + instance_id.len], instance_id);
+    @memcpy(out[3 + instance_id.len ..], payload);
+    return out;
+}
 
 /// Lifecycle state of a single webhook. The future delivery loop
 /// walks rows in `pending` state ordered by `next_attempt_at_ns`.
@@ -257,7 +287,77 @@ pub const WebhookStore = struct {
         defer self.allocator.free(bytes);
         return try parseStored(self.allocator, bytes);
     }
+
+    /// Scan all rows in `state='pending'` whose `next_attempt_at_ns`
+    /// is `<= now_ns`, ordered ascending by `next_attempt_at_ns`. Cap
+    /// is `max`. Caller owns the returned slice; each entry must be
+    /// `deinit`'d, then the slice freed.
+    ///
+    /// V1 does a full prefix scan + in-memory filter. The kv-backed
+    /// store has no partial index; the future sqlite-schema variant
+    /// (webhook-server-plan.md §2.2) will use the
+    /// `webhooks_ready` partial index to cut scan cost. Per the
+    /// existing module doc, this stand-in is acceptable while the
+    /// delivery loop's request rate is single-leader and small.
+    pub fn readyRows(
+        self: *WebhookStore,
+        allocator: std.mem.Allocator,
+        now_ns: i64,
+        max: u32,
+    ) Error![]StoredWebhook {
+        const SCAN_PAGE: u32 = 256;
+        var collected: std.ArrayList(StoredWebhook) = .empty;
+        errdefer {
+            for (collected.items) |*r| r.deinit(allocator);
+            collected.deinit(allocator);
+        }
+
+        var cursor_buf: [3 + WEBHOOK_ID_HEX_LEN]u8 = undefined;
+        var have_cursor: bool = false;
+
+        while (true) {
+            const cursor_slice: []const u8 = if (have_cursor) cursor_buf[0..] else "";
+            var page = self.db.prefix("wh/", cursor_slice, SCAN_PAGE) catch return Error.Kv;
+            defer page.deinit();
+            if (page.entries.len == 0) break;
+
+            for (page.entries) |entry| {
+                var stored = parseStored(allocator, entry.value) catch |err| switch (err) {
+                    Error.OutOfMemory => return Error.OutOfMemory,
+                    else => continue, // skip malformed; retain in store for later inspection
+                };
+                if (stored.state != .pending or stored.next_attempt_at_ns > now_ns) {
+                    stored.deinit(allocator);
+                    continue;
+                }
+                collected.append(allocator, stored) catch |err| {
+                    stored.deinit(allocator);
+                    switch (err) {
+                        error.OutOfMemory => return Error.OutOfMemory,
+                    }
+                };
+            }
+
+            if (page.entries.len < SCAN_PAGE) break;
+            // Page-cursor: last key seen this page.
+            const last_key = page.entries[page.entries.len - 1].key;
+            if (last_key.len != cursor_buf.len) break; // unexpected key shape — stop
+            @memcpy(&cursor_buf, last_key);
+            have_cursor = true;
+        }
+
+        std.mem.sort(StoredWebhook, collected.items, {}, lessByNextAttempt);
+        if (collected.items.len > max) {
+            for (collected.items[max..]) |*r| r.deinit(allocator);
+            collected.shrinkRetainingCapacity(max);
+        }
+        return collected.toOwnedSlice(allocator) catch return Error.OutOfMemory;
+    }
 };
+
+fn lessByNextAttempt(_: void, a: StoredWebhook, b: StoredWebhook) bool {
+    return a.next_attempt_at_ns < b.next_attempt_at_ns;
+}
 
 // ── StoredWebhook serialization (kv value bytes) ──────────────────────
 //
@@ -790,6 +890,67 @@ test "WebhookStore enqueue → retry → complete round-trip" {
 
     // Retry on a missing webhook is a no-op (no error).
     try store.applyRetrySchedule(&rows[1].webhook_id_hex, 5, 1);
+}
+
+test "WebhookStore readyRows filters by state + next_attempt_at_ns and orders earliest-first" {
+    const a = testing.allocator;
+    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    const tmp_dir = try std.fmt.allocPrint(a, "/tmp/rove-webhook-ready-{x}", .{seed});
+    defer a.free(tmp_dir);
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const db_path = try std.fmt.allocPrintSentinel(a, "{s}/webhooks.db", .{tmp_dir}, 0);
+    defer a.free(db_path);
+
+    var store = try WebhookStore.open(a, db_path);
+    defer store.close();
+
+    // Three rows with different enqueue times. fillHex collapses on
+    // `seed % 16`, so derive distinct ids from a base hex pattern.
+    var row_now = try testRow(a, 0x1);
+    @memcpy(&row_now.webhook_id_hex, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    row_now.enqueued_at_ns = 100;
+    var row_old = try testRow(a, 0x2);
+    @memcpy(&row_old.webhook_id_hex, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    row_old.enqueued_at_ns = 50;
+    var row_future = try testRow(a, 0x3);
+    @memcpy(&row_future.webhook_id_hex, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    row_future.enqueued_at_ns = 1_000_000;
+
+    var rows = [_]WebhookRow{ row_now, row_old, row_future };
+    defer for (&rows) |*r| r.deinit(a);
+    try store.applyEnqueueBatch(&rows);
+
+    // now=200 → row_old (50) and row_now (100) ready, row_future (1M) not.
+    const ready = try store.readyRows(a, 200, 16);
+    defer {
+        for (ready) |*r| r.deinit(a);
+        a.free(ready);
+    }
+    try testing.expectEqual(@as(usize, 2), ready.len);
+    try testing.expectEqual(@as(i64, 50), ready[0].next_attempt_at_ns);
+    try testing.expectEqual(@as(i64, 100), ready[1].next_attempt_at_ns);
+
+    // Cap respected.
+    const capped = try store.readyRows(a, 200, 1);
+    defer {
+        for (capped) |*r| r.deinit(a);
+        a.free(capped);
+    }
+    try testing.expectEqual(@as(usize, 1), capped.len);
+    try testing.expectEqual(@as(i64, 50), capped[0].next_attempt_at_ns);
+
+    // Pushing row_old's state forward via complete removes it from results.
+    try store.applyComplete(&row_old.webhook_id_hex);
+    const after_complete = try store.readyRows(a, 200, 16);
+    defer {
+        for (after_complete) |*r| r.deinit(a);
+        a.free(after_complete);
+    }
+    try testing.expectEqual(@as(usize, 1), after_complete.len);
+    try testing.expectEqualSlices(u8, &row_now.webhook_id_hex, &after_complete[0].row.webhook_id_hex);
 }
 
 test "applyComplete on missing id is a no-op" {

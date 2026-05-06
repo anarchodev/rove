@@ -212,7 +212,15 @@ pub fn build(b: *std.Build) void {
     });
     webhook_server_mod.link_libc = true;
     webhook_server_mod.linkSystemLibrary("sqlite3", .{});
+    webhook_server_mod.linkSystemLibrary("ssl", .{});
+    webhook_server_mod.linkSystemLibrary("crypto", .{});
     webhook_server_mod.addImport("rove-kv", kv_mod);
+    // Reuses `outbox/ssrf.zig` + `outbox/http_client.zig` for outbound
+    // delivery. When the drainer goes away in step 6 of the migration,
+    // those utilities move into rove-webhook-server proper (or into a
+    // shared http-out module). For now, importing rove-outbox keeps
+    // them in one canonical place.
+    webhook_server_mod.addImport("rove-outbox", outbox_mod);
 
     // ── rove-files-server: per-instance code operations (Phase 5) ──
     //
@@ -370,6 +378,7 @@ pub fn build(b: *std.Build) void {
     loop46_mod.addImport("rove-tenant", tenant_mod);
     loop46_mod.addImport("rove-h2", h2_mod);
     loop46_mod.addImport("rove-outbox", outbox_mod);
+    loop46_mod.addImport("rove-webhook-server", webhook_server_mod);
     // Admin tenant bundle — embedded so the binary ships with a working
     // dashboard + handler at app.{BASE_DOMAIN}/ out of the box. The
     // handler/middleware become `index.mjs` / `_middlewares/index.mjs`
@@ -641,6 +650,23 @@ pub fn build(b: *std.Build) void {
         .root_module = h2_stream_mod,
     });
     b.installArtifact(h2_stream_test);
+
+    // webhook-test-enqueue: tiny helper that opens
+    // `{data_dir}/webhooks.db` directly and inserts one row, simulating
+    // the dispatcher's envelope-4 propose without going through raft.
+    // Used only by `scripts/webhook_server_smoke.sh` to exercise the
+    // delivery thread end-to-end on a single node.
+    const wte_mod = b.addModule("webhook-test-enqueue", .{
+        .root_source_file = b.path("examples/webhook_test_enqueue.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wte_mod.addImport("rove-webhook-server", webhook_server_mod);
+    const wte_exe = b.addExecutable(.{
+        .name = "webhook-test-enqueue",
+        .root_module = wte_mod,
+    });
+    b.installArtifact(wte_exe);
 
     // s3-blob-smoke: exercise rove-blob's S3BlobStore against any
     // S3-compatible endpoint (default-tested against OVH). Pure
