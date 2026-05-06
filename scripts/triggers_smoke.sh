@@ -52,11 +52,21 @@ fi
 
 rm -rf "$DATA_DIR"
 
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8214}"
+LOG_ADDR="${LOG_ADDR:-127.0.0.1:8213}"
+FILES_PORT="${FILES_ADDR##*:}"
+LOG_PORT="${LOG_ADDR##*:}"
+FILES_HOST="files.${PUBLIC_SUFFIX}"
+LOG_HOST="logs.${PUBLIC_SUFFIX}"
+FILES_ORIGIN="https://${FILES_HOST}:${FILES_PORT}"
+
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
+    --log-listen "$LOG_ADDR" \
+    --files-listen "$FILES_ADDR" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
@@ -72,9 +82,15 @@ trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
 sleep 1.2
 
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
-         --resolve "trigsmoke.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1")
+         --resolve "trigsmoke.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
+         --resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
+         --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1")
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 AUTH=(-H "Authorization: Bearer $TOKEN")
+
+ROVE_TOKEN="$TOKEN"
+. "$(dirname "$0")/_smoke_helpers.sh"
+mint_services_token
 
 ok() { echo "ok  $1"; }
 fail() {
@@ -106,10 +122,10 @@ put_file() {
     local code
     code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
         -X PUT \
-        "${AUTH[@]}" \
+        -H "Authorization: Bearer $JWT" \
         -H "Content-Type: application/javascript" \
         --data-binary "$body" \
-        "${ADMIN_ORIGIN}/_system/files/trigsmoke/file/${path}")
+        "${FILES_BASE}/trigsmoke/file/${path}")
     [[ "$code" == "201" ]] || fail "PUT $path: got $code"
 }
 

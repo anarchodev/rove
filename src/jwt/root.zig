@@ -1,21 +1,21 @@
-//! HS256 JWT helpers for the log-server's `Authorization: Bearer`
-//! gate.
+//! HS256 JWT helpers for the standalone services' `Authorization:
+//! Bearer` gates (log-server, files-server). Not a general-purpose
+//! JWT library — fixed alg, single-claim payload.
 //!
 //! Wire format is the standard JWT three-part token:
 //!   `<base64url(header)>.<base64url(payload)>.<base64url(sig)>`
 //!
 //! Header is fixed: `{"alg":"HS256","typ":"JWT"}`.
-//! Payload is `{"exp":<unix_ms>}`. No subject / issuer / audience —
-//! the token's only job is to prove "an authenticated dashboard
-//! session minted this token within the last few minutes." Tenant
-//! authorization happens on the worker (when minting) and on the
-//! standalone (when applying the token to a per-tenant route).
+//! Payload is `{"exp":<unix_ms>}`. No subject / issuer / audience /
+//! scope — the token's only job is to prove "an authenticated
+//! dashboard session minted this token within the last few minutes."
+//! Per-tenant authorization happens on the worker (when minting) and
+//! on the service (when applying the token to a per-tenant route).
 //!
 //! The HMAC secret is shared between the worker process (which mints
-//! tokens at `/_system/log-token`) and the standalone log-server
-//! (which verifies them on every `/v1/*` request). Both run inside
-//! the same loop46 process for now; multi-node will need an
-//! operator-supplied env var.
+//! tokens at `/_system/services-token`) and every standalone service
+//! that verifies them. All run inside the same loop46 process for
+//! now; multi-node will need an operator-supplied env var.
 
 const std = @import("std");
 

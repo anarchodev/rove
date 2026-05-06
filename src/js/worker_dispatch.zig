@@ -18,7 +18,7 @@ const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
 const log_mod = @import("rove-log");
-const log_server_mod = @import("rove-log-server");
+const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
 const webhook_server_mod = @import("rove-webhook-server");
 
@@ -34,7 +34,6 @@ const events_mod = @import("events.zig");
 const events_pump = @import("events_pump.zig");
 
 const Request = dispatcher_mod.Request;
-const ProxyPeer = worker_mod.ProxyPeer;
 const RaftWait = worker_mod.RaftWait;
 
 /// Per-handler record carried through the batch walk, from a
@@ -259,60 +258,30 @@ fn tryHandleSystem(
     const path_no_q = if (qmark) |q| path[0..q] else path;
     const sys_rest = path_no_q["/_system/".len..];
 
-    // Phase 5.5(a) Step B — JWT minter for the standalone log-server.
-    // Caller is already admin-authenticated; we hand back a 5-minute
-    // HS256 token + the public log origin so the dashboard can call
-    // `{log_public_base}/v1/*` directly.
-    if (std.mem.eql(u8, sys_rest, "log-token")) {
-        try handleLogTokenMint(server, allocator, worker, ent, sid, sess, cors_origin);
+    // Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — JWT minter for
+    // the standalone services (log-server + files-server). Caller is
+    // already admin-authenticated; we hand back a 5-minute HS256
+    // token + the public origins of both services so the dashboard
+    // can call them directly cross-origin.
+    if (std.mem.eql(u8, sys_rest, "services-token")) {
+        try handleServicesTokenMint(server, allocator, worker, ent, sid, sess, cors_origin);
         return true;
     }
 
-    const sub_slash = std.mem.indexOfScalar(u8, sys_rest, '/') orelse {
-        try respb.setSystemResponse(server, ent, sid, sess, 404, "malformed system path\n", allocator, cors_origin, null);
-        return true;
-    };
-    const subsystem = sys_rest[0..sub_slash];
-    const after_sub = sys_rest[sub_slash + 1 ..];
-
-    // `/_system/tenant/*` and `/_system/kv/*` moved to the `__admin__`
-    // JS handler; callers target the bare admin host
-    // (`app.loop46.me/?fn=listKv`, optionally with `X-Rove-Scope`).
-    // `/_system/files/*` remains a native proxy because code uploads
-    // are byte-heavy. Log queries moved to the standalone server's
-    // public subdomain (Phase 5.5(a) Step B).
-    const inst_slash = std.mem.indexOfScalar(u8, after_sub, '/');
-    const sys_instance_id = if (inst_slash) |s| after_sub[0..s] else after_sub;
-    if (sys_instance_id.len == 0) {
-        try respb.setSystemResponse(server, ent, sid, sess, 404, "missing instance id\n", allocator, cors_origin, null);
-        return true;
-    }
-    const allowed = worker.tenant.canAccessInstance(auth_ctx.?, sys_instance_id) catch false;
-    if (!allowed) {
-        try respb.setSystemResponse(server, ent, sid, sess, 403, "forbidden\n", allocator, cors_origin, null);
-        return true;
-    }
-
-    if (std.mem.eql(u8, subsystem, "files")) {
-        if (worker.code_proxy.addr == null) {
-            try respb.setSystemResponse(server, ent, sid, sess, 503, "files subsystem disabled\n", allocator, cors_origin, null);
-            return true;
-        }
-        try server.reg.set(ent, &server.request_out, ProxyPeer, .{ .client = rove.Entity.nil });
-        try server.reg.move(ent, &server.request_out, &worker.code_proxy.pending);
-        return true;
-    }
-
+    // No remaining proxy subsystems on the worker — `/_system/log/*`
+    // retired in Phase 5.5(a) Step B, `/_system/files/*` retired in
+    // Phase 5.5(e) Step F1. `/_system/kv/*` and `/_system/tenant/*`
+    // moved to the `__admin__` JS handler long before.
     try respb.setSystemResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator, cors_origin, null);
     return true;
 }
 
-/// Mint an HS256 JWT for the standalone log-server. Body shape:
-///   `{"token":"<jwt>","log_url":"<base>"}`
+/// Mint an HS256 JWT for the standalone services. Body shape:
+///   `{"token":"<jwt>","log_url":"<base>","files_url":"<base>","exp_ms":<...>}`
 /// Token expires in 5 minutes; the dashboard refreshes by hitting
 /// this endpoint again. 503 when the server wasn't started with a
-/// JWT secret (operator skipped Step B wiring).
-fn handleLogTokenMint(
+/// JWT secret (operator skipped Step B / F1 wiring).
+fn handleServicesTokenMint(
     server: anytype,
     allocator: std.mem.Allocator,
     worker: anytype,
@@ -321,18 +290,22 @@ fn handleLogTokenMint(
     sess: h2.Session,
     cors_origin: ?[]const u8,
 ) !void {
-    const secret = worker.log_jwt_secret orelse {
-        try respb.setSystemResponse(server, ent, sid, sess, 503, "log-server jwt not configured\n", allocator, cors_origin, null);
+    const secret = worker.services_jwt_secret orelse {
+        try respb.setSystemResponse(server, ent, sid, sess, 503, "services jwt not configured\n", allocator, cors_origin, null);
         return;
     };
     const log_base = worker.log_public_base orelse {
         try respb.setSystemResponse(server, ent, sid, sess, 503, "log-server public base not configured\n", allocator, cors_origin, null);
         return;
     };
+    const files_base = worker.files_public_base orelse {
+        try respb.setSystemResponse(server, ent, sid, sess, 503, "files-server public base not configured\n", allocator, cors_origin, null);
+        return;
+    };
 
     const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
     const exp_ms: i64 = now_ms + 5 * 60 * 1000;
-    const token = log_server_mod.auth.mint(allocator, secret, .{ .exp_ms = exp_ms }) catch |err| {
+    const token = jwt.mint(allocator, secret, .{ .exp_ms = exp_ms }) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "mint failed: {s}\n", .{@errorName(err)});
         try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
         return;
@@ -341,8 +314,8 @@ fn handleLogTokenMint(
 
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"token\":\"{s}\",\"log_url\":\"{s}\",\"exp_ms\":{d}}}\n",
-        .{ token, log_base, exp_ms },
+        "{{\"token\":\"{s}\",\"log_url\":\"{s}\",\"files_url\":\"{s}\",\"exp_ms\":{d}}}\n",
+        .{ token, log_base, files_base, exp_ms },
     );
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/json");
 }

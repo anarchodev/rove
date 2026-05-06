@@ -73,7 +73,6 @@ pub const Worker = worker.Worker;
 pub const WorkerConfig = worker.WorkerConfig;
 pub const WorkerOptions = worker.Options;
 pub const RaftWait = worker.RaftWait;
-pub const ProxyPeer = worker.ProxyPeer;
 pub const TenantFiles = worker.TenantFiles;
 pub const TenantLog = worker.TenantLog;
 pub const DEFAULT_HANDLER_PATH = worker.DEFAULT_HANDLER_PATH;
@@ -89,10 +88,6 @@ pub const cleanupClosedSseConnections = events_pump.cleanupClosedSseConnections;
 pub const sweepEvents = events_sweep.sweepEvents;
 pub const SSE_SWEEP_INTERVAL_NS = events_sweep.SWEEP_INTERVAL_NS;
 pub const flushLogs = worker.flushLogs;
-pub const connectProxies = worker.connectProxies;
-pub const ingestProxyConnects = worker.ingestProxyConnects;
-pub const flushProxyPending = worker.flushProxyPending;
-pub const drainProxyResponses = worker.drainProxyResponses;
 
 test {
     _ = dispatcher;

@@ -67,16 +67,23 @@ sub-plan's migration order. No big-bang cutovers between them.
   refreshes ~once per 4 minutes). Per-tenant `log.db` and
   `Worker.log_proxy` are gone; tape body capture flows via the
   per-tenant `BlobBackend` shared between worker + standalone.
-- **(e) files-server — not started.** Reuses the subdomain +
-  JWT-handoff pattern from (a) Step B.
+- **(e) files-server — F1 done (subdomain + JWT); F2 pending
+  (S3-manifest data-model migration).** Files-server now runs at
+  `https://files.{public_suffix}` with TLS + JWT-gated routes,
+  reusing the same shared HMAC secret as log-server. Worker
+  proxy / `code_proxy` / `ProxyTag` / `ProxyPeer` / `proxy.zig` /
+  `/_system/files/*` route all deleted. Dashboard hits files-server
+  cross-origin via `filesFetch()`. Data model unchanged — files.db
+  + envelope type 3 still in place; F2 retires them.
 - **(c) snapshot — not started.** Waits on (a) + (e) retiring
   envelope types 1 + 3 to reduce raft log pressure.
 
 **Next pickup:**
-1. **(e) files-server architectural move.** With (a) done, all the
-   subdomain + JWT-handoff pieces (TLS reuse pattern, `/_system/log-token`
-   minting shape, dashboard cross-origin fetch with bearer +
-   refresh) translate directly to a `files.{public_suffix}` move.
+1. **(e) F2 — files data-model migration.** S3 manifest at
+   `tenants/{id}/deployments/{dep_id}.json`, `_deploy/active` kv
+   marker as the release signal, worker reads from S3 (drop
+   files.db + envelope type 3). Big piece — see
+   `docs/files-server-plan.md` §3-§7 for the design.
 
 Detail per piece below.
 
@@ -373,7 +380,7 @@ sequence). Each step is independently shippable + smoke-testable.
 
 **Sub-plan**: `docs/logs-plan.md`.
 
-### 4. Files-server architectural move — **not started (blocked on logs Step B)**
+### 4. Files-server architectural move — **F1 done 2026-05-06; F2 (data-model migration) pending**
 
 **What it delivers**: files-server moves to its own subdomain
 (`files.{public_suffix}`), manifest in S3
@@ -382,12 +389,29 @@ becomes `_deploy/active` kv marker observed via
 `markDirtyFromWriteset`. Worker drops `files.db` per tenant, the
 `/_system/files/*` proxy, and envelope type 3.
 
-**Why blocked**: piece 4 reuses the subdomain + JWT-handoff
-machinery introduced for log-server in (a) Step B. Starting
-files-server's subdomain move first would mean inventing the
-handoff pattern twice. The S3-manifest steps of (e) (steps 1–4 of
-its sub-plan) are independent and could proceed in parallel
-without that machinery, but the subdomain steps (5–6) need it.
+**F1 — done 2026-05-06.** Subdomain move + JWT handoff. Files-server
+runs at `https://files.{public_suffix}` with its own TLS listener
+(reusing the worker's `*TlsConfig`), gates every request on a JWT
+verified against the shared services secret. Worker no longer
+proxies — `/_system/files/*` route, `code_proxy`, `ProxyTag.code`,
+`proxy.zig`, `ProxyPeer`, the `connect/ingest/flush/drain` proxy
+loop in main.zig — all deleted. The `/_system/log-token` endpoint
+became `/_system/services-token` and now returns both `log_url`
+and `files_url`. The HS256 helper extracted from `log_server/auth.zig`
+to a new top-level `rove-jwt` module so both standalone services
+share. Dashboard's `filesFetch()` mirrors `logFetch()`. CLI
+deletion: `rove-js-ctl` removed (legacy h2-client over the proxy);
+`scripts/ctl_smoke.sh` rewritten as curl + Python JWT mint.
+`scripts/proxy_smoke.sh` deleted (its sole purpose — testing the
+proxy — gone). Pre-launch sweep: no parallel-write code, no
+back-compat fallback, no dual auth shape.
+
+**F2 — pending.** S3 manifest at
+`tenants/{id}/deployments/{dep_id}.json`, runtime release signal
+becomes `_deploy/active` kv marker observed via
+`markDirtyFromWriteset`. Worker drops `files.db` per tenant + the
+async load + atomic-swap manifest model. Drops envelope type 3
+entirely. Big piece — see `docs/files-server-plan.md` §3-§7.
 
 **Definition of done**: see `docs/files-server-plan.md` §9
 "Migration order."

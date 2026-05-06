@@ -26,7 +26,6 @@ pub const index_db = @import("index_db.zig");
 pub const indexer = @import("indexer.zig");
 pub const standalone = @import("standalone.zig");
 pub const flush_writer = @import("flush_writer.zig");
-pub const auth = @import("auth.zig");
 
 test {
     _ = sidecar;
@@ -36,5 +35,4 @@ test {
     _ = indexer;
     _ = standalone;
     _ = flush_writer;
-    _ = auth;
 }

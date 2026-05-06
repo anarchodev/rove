@@ -14,8 +14,9 @@
 // 2. `X-Rove-Scope: <id>`       → `kv` = {id}'s app.db (per-tenant
 //                                  KV browsing).
 //
-// Out-of-band (still the native Zig proxies): logs + code via
-// `/_system/log/*` and `/_system/files/*`.
+// Out-of-band: logs + files calls go cross-origin to
+// `logs.{public_suffix}` / `files.{public_suffix}` via a short-lived
+// HS256 JWT minted at `/_system/services-token` on the worker.
 
 const BASE_KEY = "rove.admin.api_base";
 
@@ -96,39 +97,40 @@ async function rawGet(base, path) {
   return res;
 }
 
-/// Phase 5.5(a) Step B — minted by the worker at /_system/log-token,
-/// cached for 4 of its 5 minute lifetime so the dashboard rarely
-/// blocks on a refresh round-trip. Reset to null on 401 so the next
-/// call re-mints.
-let _logTokenCache = null; // { token, log_url, refresh_at_ms } | null
+/// Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — single JWT minted by
+/// the worker at /_system/services-token, good for all standalone
+/// services (log-server, files-server). Cached until ~1 minute
+/// before exp; reset to null on 401 so the next call re-mints.
+let _servicesTokenCache = null; // { token, log_url, files_url, refresh_at_ms } | null
 
-async function getLogToken() {
+async function getServicesToken() {
   const now = Date.now();
-  if (_logTokenCache && now < _logTokenCache.refresh_at_ms) return _logTokenCache;
-  const res = await rawGet(adminBase(), "/_system/log-token");
+  if (_servicesTokenCache && now < _servicesTokenCache.refresh_at_ms) return _servicesTokenCache;
+  const res = await rawGet(adminBase(), "/_system/services-token");
   const body = await res.json();
-  _logTokenCache = {
+  _servicesTokenCache = {
     token: body.token,
     log_url: body.log_url.replace(/\/+$/, ""),
-    // Refresh ~1 minute before exp so an in-flight call never blocks.
+    files_url: body.files_url.replace(/\/+$/, ""),
     refresh_at_ms: body.exp_ms - 60_000,
   };
-  return _logTokenCache;
+  return _servicesTokenCache;
 }
 
-/// Cross-origin fetch against the standalone log-server. Stamps the
-/// JWT, refreshes once on 401, throws ApiError on any other failure.
-async function logFetch(path) {
-  let creds = await getLogToken();
-  let res = await fetch(creds.log_url + path, {
-    headers: { authorization: "Bearer " + creds.token },
-  });
+/// Cross-origin fetch helper: stamps the JWT, retries once on 401,
+/// throws ApiError on any other failure. `service` picks the URL
+/// base from the token cache ("log_url" or "files_url"); `init` is
+/// passed through to fetch (for POST/PUT bodies, custom headers).
+async function serviceFetch(service, path, init) {
+  let creds = await getServicesToken();
+  const opts = init || {};
+  const headers = { ...(opts.headers || {}), authorization: "Bearer " + creds.token };
+  let res = await fetch(creds[service] + path, { ...opts, headers });
   if (res.status === 401) {
-    _logTokenCache = null;
-    creds = await getLogToken();
-    res = await fetch(creds.log_url + path, {
-      headers: { authorization: "Bearer " + creds.token },
-    });
+    _servicesTokenCache = null;
+    creds = await getServicesToken();
+    headers.authorization = "Bearer " + creds.token;
+    res = await fetch(creds[service] + path, { ...opts, headers });
   }
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
@@ -136,6 +138,9 @@ async function logFetch(path) {
   }
   return res;
 }
+
+const logFetch = (path, init) => serviceFetch("log_url", path, init);
+const filesFetch = (path, init) => serviceFetch("files_url", path, init);
 
 /// URL-encode a file path that may contain `/` separators. Slashes are
 /// preserved; each segment gets `encodeURIComponent`'d.
@@ -233,31 +238,30 @@ export const api = {
     return rpc("deleteKv", [key], { method: "POST", scope: instance_id });
   },
 
-  // ── Out-of-band: files (native Zig proxy) ────────────────────────
+  // ── Out-of-band: files (cross-origin via JWT) ─────────────────────
+  //
+  // Phase 5.5(e) Step F1 — the dashboard talks to the standalone
+  // files-server directly at `https://files.{public_suffix}`. Auth
+  // is the same JWT minted at /_system/services-token; CORS allows
+  // the admin origin.
   async listFiles(instance_id) {
-    const res = await rawGet(adminBase(),
-      `/_system/files/${encodeURIComponent(instance_id)}/list`);
+    const res = await filesFetch(`/${encodeURIComponent(instance_id)}/list`);
     return res.json();
   },
   async getFile(instance_id, path) {
-    const res = await rawGet(adminBase(),
-      `/_system/files/${encodeURIComponent(instance_id)}/file/${encodePath(path)}`);
+    const res = await filesFetch(
+      `/${encodeURIComponent(instance_id)}/file/${encodePath(path)}`);
     return res.json();
   },
   async putFile(instance_id, path, content, contentType) {
-    const res = await fetch(
-      adminBase() + `/_system/files/${encodeURIComponent(instance_id)}/file/${encodePath(path)}`,
+    const res = await filesFetch(
+      `/${encodeURIComponent(instance_id)}/file/${encodePath(path)}`,
       {
         method: "PUT",
-        credentials: "include",
         headers: { "Content-Type": contentType || "application/octet-stream" },
         body: content,
       },
     );
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new ApiError(res.status, res.statusText, txt);
-    }
     return res.text();
   },
 
@@ -265,74 +269,60 @@ export const api = {
   //
   // The protocol mirrors PLAN §2.4 and swaps in cleanly for presigned
   // S3 uploads later: the client always follows whatever URL the
-  // server hands back in `/blobs/check`, so an FS backend returns
-  // our-own-server URLs and a future S3 backend returns presigned
-  // S3 URLs — same client flow. Hash files client-side with
+  // server hands back in `/blobs/check`. Hash files client-side with
   // SHA-256 (`hashBytes` below); 64 lowercase hex chars.
 
   async checkBlobs(instance_id, hashes) {
-    const url = adminBase()
-      + `/_system/files/${encodeURIComponent(instance_id)}/blobs/check`;
-    const res = await fetch(url, {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ hashes }),
-    });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new ApiError(res.status, res.statusText, txt);
-    }
+    const res = await filesFetch(
+      `/${encodeURIComponent(instance_id)}/blobs/check`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hashes }),
+      },
+    );
     return res.json(); // { missing: [...], uploads: {hash: {url, method, expires_in}} }
   },
 
   /// Upload one blob. `uploadInfo` comes from `checkBlobs`' `uploads`
-  /// object (or is manufactured for the single-blob case). We pass
-  /// credentials + let the browser follow the URL verbatim, so the
-  /// same code path works against our FS backend (URL points at our
-  /// own server) and a future S3 backend (URL is presigned S3).
+  /// object. URLs are resolved against the files-server's base.
+  /// Future S3-presign mode would return absolute https URLs; the
+  /// `startsWith("http")` branch handles that case without auth.
   async uploadBlob(uploadInfo, bytes) {
-    // For FS-backend upload-URLs we resolve against the admin base;
-    // for absolute URLs (future S3 presign) the fetch takes them
-    // as-is.
-    const url = uploadInfo.url.startsWith("http")
-      ? uploadInfo.url
-      : adminBase() + uploadInfo.url;
-    const headers = { ...(uploadInfo.headers || {}) };
-    // FS-backend accepts any content-type; S3 presigns demand the
-    // signed one. Only set if the server told us to.
-    const init = {
-      method: uploadInfo.method || "PUT",
-      headers,
-      body: bytes,
-    };
-    // Only include credentials for our own origin — presigned S3
-    // URLs must not carry the session cookie.
-    if (!uploadInfo.url.startsWith("http")) init.credentials = "include";
-    const res = await fetch(url, init);
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new ApiError(res.status, res.statusText, txt);
+    if (uploadInfo.url.startsWith("http")) {
+      // Presigned (e.g. S3) URL: no auth, no credentials.
+      const headers = { ...(uploadInfo.headers || {}) };
+      const res = await fetch(uploadInfo.url, {
+        method: uploadInfo.method || "PUT",
+        headers,
+        body: bytes,
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new ApiError(res.status, res.statusText, txt);
+      }
+      return;
     }
+    // Same-files-server upload — needs the JWT.
+    await filesFetch(uploadInfo.url, {
+      method: uploadInfo.method || "PUT",
+      headers: { ...(uploadInfo.headers || {}) },
+      body: bytes,
+    });
   },
 
   async deployManifest(instance_id, files, { parent_id = null, comment = null } = {}) {
     const body = { files };
     if (parent_id !== null) body.parent_id = parent_id;
     if (comment !== null) body.comment = comment;
-    const res = await fetch(
-      adminBase() + `/_system/files/${encodeURIComponent(instance_id)}/deployments`,
+    const res = await filesFetch(
+      `/${encodeURIComponent(instance_id)}/deployments`,
       {
         method: "POST",
-        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       },
     );
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new ApiError(res.status, res.statusText, txt);
-    }
     return res.json(); // { id, parent_id }
   },
 
@@ -379,7 +369,7 @@ export const api = {
   // Phase 5.5(a) Step B — the dashboard talks to the standalone
   // log-server directly at `https://logs.{public_suffix}` (cross-
   // origin), not through the worker proxy. Auth is a short-lived
-  // HS256 JWT minted at `/_system/log-token` on the worker. The
+  // HS256 JWT minted at `/_system/services-token` on the worker. The
   // token + base URL are cached for a few minutes; refresh on demand.
   //
   // request_ids are decimal numbers (the standalone's wire shape);
@@ -414,7 +404,7 @@ export const api = {
   // against + handler source bytes + captured tape blobs. Log fetches
   // go through the worker's /_system/log/* proxy → standalone
   // log-server (S3-backed). Files fetches stay on the worker's
-  // /_system/files/* proxy. The composed bundle is then handed to
+  // files-server's subdomain. The composed bundle is then handed to
   // the replay shell on `replay.<suffix>` via postMessage — see
   // `replayOpen` below.
   //
@@ -432,21 +422,20 @@ export const api = {
     const recordWrap = await recordRes.json();
     const record = recordWrap.record;
 
-    // Hex-encoded deployment id matches the
-    // /_system/files/{inst}/deployments/{hex} route shape.
+    // Hex-encoded deployment id matches the files-server's
+    // /{inst}/deployments/{hex} route shape.
     const depHex = (record.deployment_id ?? 0).toString(16).padStart(16, "0");
     let manifest;
     let historicalManifestMissing = false;
     try {
-      const r = await rawGet(adminBase(),
-        `/_system/files/${inst}/deployments/${depHex}`);
+      const r = await filesFetch(`/${inst}/deployments/${depHex}`);
       manifest = await r.json();
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) {
         // Historical deployment GC'd or otherwise unreachable —
         // fall back to current. Replay shell can flag the mismatch.
         historicalManifestMissing = true;
-        const r = await rawGet(adminBase(), `/_system/files/${inst}/list`);
+        const r = await filesFetch(`/${inst}/list`);
         manifest = await r.json();
       } else {
         throw err;
@@ -480,8 +469,7 @@ export const api = {
     // are skipped — they aren't part of the JS module graph.
     const handlerEntries = entries.filter((e) => e.kind === "handler");
     const sources = await Promise.all(handlerEntries.map(async (e) => {
-      const r = await rawGet(adminBase(),
-        `/_system/files/${inst}/source/${encodeURIComponent(e.hash)}`);
+      const r = await filesFetch(`/${inst}/source/${encodeURIComponent(e.hash)}`);
       return { path: e.path, hash: e.hash, source: await r.text() };
     }));
     let entrySource = "";

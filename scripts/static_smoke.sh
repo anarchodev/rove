@@ -46,11 +46,20 @@ fi
 
 rm -rf "$DATA_DIR"
 
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8221}"
+LOG_ADDR="${LOG_ADDR:-127.0.0.1:8220}"
+FILES_PORT="${FILES_ADDR##*:}"
+LOG_PORT="${LOG_ADDR##*:}"
+FILES_HOST="files.loop46.localhost"
+LOG_HOST="logs.loop46.localhost"
+
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
+    --log-listen "$LOG_ADDR" \
+    --files-listen "$FILES_ADDR" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ORIGIN" \
@@ -70,9 +79,16 @@ CUSTOMER_HOST="demo.loop46.localhost"
 RESOLVE_FLAGS=(
     --resolve "${API_HOST}:${PORT}:127.0.0.1"
     --resolve "${CUSTOMER_HOST}:${PORT}:127.0.0.1"
+    --resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1"
+    --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1"
 )
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE_FLAGS[@]}")
 ADMIN_HDRS=(-H "Authorization: Bearer $TOKEN" -H "Origin: $ORIGIN")
+ADMIN_ORIGIN="https://${API_HOST}:${PORT}"
+
+ROVE_TOKEN="$TOKEN"
+. "$(dirname "$0")/_smoke_helpers.sh"
+mint_services_token
 
 ok() { echo "ok  $1"; }
 fail() {
@@ -101,10 +117,10 @@ put_static() {
     local path="$1" ct="$2" body="$3"
     local code
     code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
-        "${ADMIN_HDRS[@]}" -X PUT \
+        -H "Authorization: Bearer $JWT" -X PUT \
         -H "Content-Type: $ct" \
         --data-binary "$body" \
-        "https://${API_HOST}:${PORT}/_system/files/demo/file/${path}")
+        "${FILES_BASE}/demo/file/${path}")
     # Wait long enough for the worker's refresh poll (100ms + slack)
     # to pick up the new deployment before the next GET.
     sleep 0.25

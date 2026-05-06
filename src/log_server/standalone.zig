@@ -40,7 +40,7 @@ const blob_mod = @import("rove-blob");
 const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const indexer_mod = @import("indexer.zig");
-const auth = @import("auth.zig");
+const jwt = @import("rove-jwt");
 
 const LogH2 = h2.H2(.{});
 
@@ -363,12 +363,12 @@ fn handleOne(
         }
         const token = authz["Bearer ".len..];
         const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-        _ = auth.verify(secret, token, now_ms) catch |err| {
+        _ = jwt.verify(secret, token, now_ms) catch |err| {
             const msg = switch (err) {
-                auth.Error.Expired => "token expired\n",
-                auth.Error.BadSignature => "bad signature\n",
-                auth.Error.Malformed, auth.Error.UnsupportedAlg => "malformed token\n",
-                auth.Error.OutOfMemory => "out of memory\n",
+                jwt.Error.Expired => "token expired\n",
+                jwt.Error.BadSignature => "bad signature\n",
+                jwt.Error.Malformed, jwt.Error.UnsupportedAlg => "malformed token\n",
+                jwt.Error.OutOfMemory => "out of memory\n",
             };
             try setResponse(server, ent, sid, sess, 401, msg, rctx.cfg);
             return;

@@ -50,11 +50,20 @@ fi
 
 rm -rf "$DATA_DIR"
 
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8219}"
+LOG_ADDR="${LOG_ADDR:-127.0.0.1:8218}"
+FILES_PORT="${FILES_ADDR##*:}"
+LOG_PORT="${LOG_ADDR##*:}"
+FILES_HOST="files.${PUBLIC_SUFFIX}"
+LOG_HOST="logs.${PUBLIC_SUFFIX}"
+
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
+    --log-listen "$LOG_ADDR" \
+    --files-listen "$FILES_ADDR" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
@@ -71,8 +80,14 @@ sleep 1.2
 
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
          --resolve "alice.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
-         --resolve "bob.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1")
+         --resolve "bob.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
+         --resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
+         --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1")
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
+
+ROVE_TOKEN="$TOKEN"
+. "$(dirname "$0")/_smoke_helpers.sh"
+mint_services_token
 
 ok() { echo "ok  $1"; }
 fail() {
@@ -164,8 +179,10 @@ echo "$hdrs" | grep -iq '^access-control-allow-credentials: true' \
 echo "$hdrs" | grep -iq '^vary: origin' || fail "redeem missing Vary: origin"
 echo "$hdrs" | grep -iq '^access-control-expose-headers: content-type' \
     || fail "redeem missing CORS expose-headers"
-# Extract the cookie for the subsequent whoami check.
-cookie=$(echo "$hdrs" | grep -i '^set-cookie:' \
+# Extract the cookie for the subsequent whoami check. (`__Host-rove_sid`
+# is the SSE pre-mint that arrives on every response — pick out the
+# auth `rove_session` specifically.)
+cookie=$(echo "$hdrs" | grep -iE '^set-cookie:.*rove_session' \
     | sed 's/^[^:]*: //' | awk -F'; ' '{print $1}' | tr -d '\r')
 ok "GET /v1/auth?mt=... → 302 + session cookie + Location:/#/alice + full CORS envelope"
 
@@ -229,10 +246,10 @@ ok "starter content: GET ${ALICE_ORIGIN}/api → 200 with expected JSON (default
 THROW_SRC='export default function () { throw new Error("boom from smoke"); }'
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
     -X PUT \
-    -H "Authorization: Bearer $TOKEN" \
+    -H "Authorization: Bearer $JWT" \
     -H "Content-Type: application/javascript" \
     --data-binary "$THROW_SRC" \
-    "${ADMIN_ORIGIN}/_system/files/alice/file/throw/index.mjs")
+    "${FILES_BASE}/alice/file/throw/index.mjs")
 [[ "$code" == "201" ]] || fail "deploy throw.mjs: got $code"
 sleep 0.3
 code=$("${CURL[@]}" -o /tmp/ss-alice-throw.txt -w '%{http_code}' "${ALICE_ORIGIN}/throw")
@@ -257,10 +274,10 @@ ECHO_SRC='export default function () {
 }'
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
     -X PUT \
-    -H "Authorization: Bearer $TOKEN" \
+    -H "Authorization: Bearer $JWT" \
     -H "Content-Type: application/javascript" \
     --data-binary "$ECHO_SRC" \
-    "${ADMIN_ORIGIN}/_system/files/alice/file/echo/index.mjs")
+    "${FILES_BASE}/alice/file/echo/index.mjs")
 [[ "$code" == "201" ]] || fail "deploy echo/index.mjs: got $code"
 sleep 0.3
 ECHO_BODY=$("${CURL[@]}" \

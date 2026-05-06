@@ -1,22 +1,22 @@
-//! `files_server.thread` — the background-thread host for the
-//! synchronous files-server operations in `root.zig`.
+//! `files_server.thread` — public-facing files-server, spawned by
+//! loop46 alongside the worker. Browser dashboard + CLI clients hit
+//! it directly at `files.{public_suffix}` over TLS; the worker is
+//! NOT in the upload/deploy path (Phase 5.5 e Step F1).
 //!
-//! The design goal is "compile does not block the worker's h2 event
-//! loop." The mechanism is standard: spawn a thread that owns its own
-//! rove registry + io_uring + rove-h2 server instance, binding to a
-//! loopback TCP port. The worker (on a separate thread) connects as
-//! an HTTP/2 client and forwards any request whose path starts with
-//! `/_system/files/` here.
+//! Auth: every request must carry `Authorization: Bearer <jwt>`. The
+//! worker mints these JWTs at `/_system/services-token` after running
+//! its existing admin-auth check (cookie or bearer). Same shared
+//! HMAC-SHA256 secret on both sides — see `src/jwt/root.zig`.
 //!
-//! Unix domain sockets would be nicer (no port, filesystem perms as
-//! auth) but rove-io's connect path is currently hard-coded to
-//! AF_INET. Loopback TCP on 127.0.0.1:ephemeral is equivalent for the
-//! single-host case we're in, and switching to unix sockets later is
-//! a rove-io extension — no changes to this module.
+//! CORS: every response carries `Access-Control-Allow-Origin =
+//! cfg.cors_origin` so the dashboard at `app.{public_suffix}` can
+//! call cross-origin. OPTIONS preflight returns 204 with the
+//! method/header allow-set.
 //!
 //! ## Wire protocol
 //!
-//! Plain HTTP/2 (h2c), no TLS. The routes are:
+//! HTTP/2 (TLS-terminated by rove-h2 when `tls_config != null`).
+//! Routes (unchanged from the original loopback h2c shape):
 //!
 //!   POST /{instance_id}/upload     X-Rove-Path: <path>
 //!                                  body: source bytes
@@ -28,9 +28,11 @@
 //!                                  → 200, body = raw source bytes
 //!                                  → 404 if the blob isn't present
 //!
-//! The instance-id-first shape lets the worker's `/_system/files/*`
-//! proxy do a pure prefix strip — `/_system/files/acme/upload` maps
-//! directly to `/acme/upload` without reordering segments.
+//!   POST /{instance_id}/blobs/check, PUT /{instance_id}/blobs/{hash},
+//!   POST /{instance_id}/deployments, GET /{instance_id}/deployments/{hex_id},
+//!   GET  /{instance_id}/list, GET /{instance_id}/file/{path},
+//!   PUT  /{instance_id}/file/{path}
+//!     — see individual handlers.
 //!
 //! The handler path intentionally avoids JSON — the only structured
 //! field the CLI needs to send is the deployment-relative file path,
@@ -42,6 +44,7 @@ const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 const kv = @import("rove-kv");
 const blob_mod = @import("rove-blob");
+const jwt = @import("rove-jwt");
 
 const files_server = @import("root.zig");
 const files_mod = @import("rove-files");
@@ -72,29 +75,50 @@ fn encodeFilesWriteSetEnvelope(
 
 const CodeH2 = h2.H2(.{});
 
+pub const Config = struct {
+    allocator: std.mem.Allocator,
+    /// Absolute path to `{data_dir}`. Per-tenant `{data_dir}/{id}/files.db`
+    /// + `file-blobs/` open lazily on each request. Borrowed; must
+    /// outlive the handle.
+    data_dir: []const u8,
+    /// fs / s3 picker for every per-tenant file-blobs backend the
+    /// handlers open. Borrowed; must outlive the handle.
+    blob_cfg: blob_mod.BackendConfig,
+    /// Where to bind the h2 listener. loop46 passes a public address
+    /// (`--files-listen`); the smoke binary may pass `127.0.0.1:0`.
+    bind_addr: std.net.Address,
+    /// Optional TLS — when set, the listener does TLS termination via
+    /// rove-h2's standard path (the `*TlsConfig` is shared with the
+    /// worker, both built once by `loop46/main.zig::resolveTls`).
+    /// Null = h2c.
+    tls_config: ?*h2.TlsConfig = null,
+    /// Required for any non-OPTIONS request — HMAC-SHA256 secret used
+    /// to verify the JWT in `Authorization: Bearer <token>`. The
+    /// worker mints these tokens at `/_system/services-token` after
+    /// running its admin-auth check (cookie or bearer). When null,
+    /// every request returns 401.
+    jwt_secret: ?[]const u8 = null,
+    /// `Access-Control-Allow-Origin` value emitted on every response.
+    /// The dashboard at `https://app.{suffix}` calls the files-server
+    /// at `https://files.{suffix}` cross-origin; the browser refuses
+    /// the response without a matching CORS header. Null = no CORS.
+    cors_origin: ?[]const u8 = null,
+    /// Raft node to propose files.db writesets through. When null,
+    /// writes apply locally only — fine for single-node dev smoke
+    /// tests, broken for multi-node correctness. Borrowed.
+    raft: ?*kv.RaftNode = null,
+    /// Max concurrent inbound h2 connections this server accepts.
+    /// Sized from the worker count at spawn time.
+    max_connections: u32 = 64,
+};
+
 /// Handle returned by `spawn`. The caller is expected to hold this
 /// for the life of the worker process; `shutdown` tears it down.
 pub const Handle = struct {
     allocator: std.mem.Allocator,
     thread: std.Thread,
     port: u16,
-    /// Absolute path to `{data_dir}`. Borrowed from the caller — must
-    /// outlive the handle.
-    data_dir: []const u8,
-    /// fs / s3 picker for every per-tenant file-blobs backend the
-    /// handlers open. Borrowed; must outlive the handle (loop46
-    /// constructs it once at startup and keeps it alive for process
-    /// life).
-    blob_cfg: blob_mod.BackendConfig,
-    /// Raft node to propose files.db writesets through. When null,
-    /// writes apply locally only — fine for single-node dev smoke
-    /// tests, broken for multi-node correctness. Borrowed.
-    raft: ?*kv.RaftNode,
-    /// Max concurrent inbound h2c connections this server accepts.
-    /// Sized from the worker count at spawn time — each worker holds
-    /// one persistent client, so the cap must be `>= num_workers` or
-    /// later workers get ECONNREFUSED and spin in a reconnect loop.
-    max_connections: u32,
+    config: Config,
     /// Signalled by the main thread to request graceful shutdown.
     /// The thread's poll loop observes it between ticks.
     stop: std.atomic.Value(bool),
@@ -117,27 +141,18 @@ pub const Handle = struct {
 /// its listen socket (or failed trying). The returned `Handle.port`
 /// is the concrete port the caller should connect to — 0 is never
 /// returned (OS picks an ephemeral port for us).
-pub fn spawn(
-    allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
-    max_connections: u32,
-    raft: ?*kv.RaftNode,
-) !*Handle {
-    const h = try allocator.create(Handle);
-    errdefer allocator.destroy(h);
+pub fn spawn(config: Config) !*Handle {
+    const h = try config.allocator.create(Handle);
+    errdefer config.allocator.destroy(h);
 
     h.* = .{
-        .allocator = allocator,
+        .allocator = config.allocator,
         .thread = undefined,
         .port = 0,
-        .data_dir = data_dir,
-        .blob_cfg = blob_cfg,
-        .max_connections = max_connections,
+        .config = config,
         .stop = .{ .raw = false },
         .ready = .{},
         .bind_err = null,
-        .raft = raft,
     };
 
     h.thread = try std.Thread.spawn(.{}, threadMain, .{h});
@@ -145,7 +160,7 @@ pub fn spawn(
 
     if (h.bind_err) |err| {
         h.thread.join();
-        allocator.destroy(h);
+        config.allocator.destroy(h);
         return err;
     }
     return h;
@@ -170,35 +185,37 @@ fn runThread(h: *Handle) !void {
     };
     defer reg.deinit();
 
-    // Bind to port 0 — OS picks one. After `H2.create` returns we'll
-    // read it back off the listen_fd with getsockname. Same pattern
-    // most test servers use.
-    const bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    const server = CodeH2.create(&reg, allocator, bind_addr, .{
-        .max_connections = h.max_connections,
+    const server = CodeH2.create(&reg, allocator, h.config.bind_addr, .{
+        .max_connections = h.config.max_connections,
         .buf_count = 64,
         .buf_size = 64 * 1024,
-    }, .{}) catch |err| {
+    }, .{
+        .tls_config = h.config.tls_config,
+    }) catch |err| {
         h.bind_err = err;
         h.ready.set();
         return;
     };
     defer server.destroy();
 
-    // Read the actual bound port via getsockname(listen_fd).
     h.port = try resolveBoundPort(server);
-
-    // Signal readiness — parent spawn() returns after this.
     h.ready.set();
 
-    std.log.info(
-        "rove-files-server thread listening on 127.0.0.1:{d} (h2c) data_dir={s}",
-        .{ h.port, h.data_dir },
-    );
+    if (h.config.tls_config != null) {
+        std.log.info(
+            "rove-files-server thread listening on port {d} (TLS) data_dir={s}",
+            .{ h.port, h.config.data_dir },
+        );
+    } else {
+        std.log.info(
+            "rove-files-server thread listening on 127.0.0.1:{d} (h2c) data_dir={s}",
+            .{ h.port, h.config.data_dir },
+        );
+    }
 
     while (!h.stop.load(.acquire)) {
         try server.pollWithTimeout(100 * std.time.ns_per_ms);
-        try processRequests(server, allocator, h.data_dir, h.blob_cfg, h.raft);
+        try processRequests(server, allocator, &h.config);
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
@@ -218,9 +235,7 @@ fn resolveBoundPort(server: *CodeH2) !u16 {
 fn processRequests(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
-    raft: ?*kv.RaftNode,
+    cfg: *const Config,
 ) !void {
     const entities = server.request_out.entitySlice();
     const sids = server.request_out.column(h2.StreamId);
@@ -229,9 +244,9 @@ fn processRequests(
     const req_bodies = server.request_out.column(h2.ReqBody);
 
     for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
-        handleOne(server, allocator, data_dir, blob_cfg, raft, ent, sid, sess, rh, rb) catch |err| {
+        handleOne(server, allocator, cfg, ent, sid, sess, rh, rb) catch |err| {
             std.log.warn("files-server: handler error: {s}", .{@errorName(err)});
-            setResponse(server, ent, sid, sess, 500, null, "internal error\n") catch |se| std.log.err(
+            setResponse(server, cfg, ent, sid, sess, 500, null, "internal error\n") catch |se| std.log.err(
                 "files-server: failed to write 500 response after handler error: {s} (entity may be stuck in request_out)",
                 .{@errorName(se)},
             );
@@ -242,23 +257,18 @@ fn processRequests(
 fn handleOne(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
-    raft: ?*kv.RaftNode,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
     rh: h2.ReqHeaders,
     rb: h2.ReqBody,
 ) !void {
-    // Extract `:method` and `:path` from the request headers. We
-    // don't route by anything else — no content-type negotiation, no
-    // query strings except on /source where the hash is a path
-    // segment.
     var method: []const u8 = "";
     var path: []const u8 = "";
     var x_rove_path: []const u8 = "";
     var content_type: []const u8 = "";
+    var authz: []const u8 = "";
     if (rh.fields != null) {
         const fields = rh.fields.?[0..rh.count];
         for (fields) |f| {
@@ -268,55 +278,89 @@ fn handleOne(
             if (std.mem.eql(u8, name, ":path")) path = value;
             if (std.mem.eql(u8, name, "x-rove-path")) x_rove_path = value;
             if (std.mem.eql(u8, name, "content-type")) content_type = value;
+            if (std.mem.eql(u8, name, "authorization")) authz = value;
         }
     }
 
+    // CORS preflight from the dashboard's cross-origin fetch. Browser
+    // sends OPTIONS before any non-simple method (PUT/POST) or any
+    // request that carries a custom header (Authorization counts).
+    if (std.mem.eql(u8, method, "OPTIONS")) {
+        try setPreflight(server, cfg, ent, sid, sess);
+        return;
+    }
+
+    // JWT gate. The worker mints these at /_system/services-token
+    // after admin auth (cookie or bearer); the standalone trusts the
+    // signed `exp` and otherwise treats every token as authorized for
+    // every tenant. Per-tenant scoping moves into the token in a
+    // future revision.
+    if (cfg.jwt_secret) |secret| {
+        if (!std.mem.startsWith(u8, authz, "Bearer ")) {
+            try setResponse(server, cfg, ent, sid, sess, 401, null, "missing bearer token\n");
+            return;
+        }
+        const token = authz["Bearer ".len..];
+        const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+        _ = jwt.verify(secret, token, now_ms) catch |err| {
+            const msg = switch (err) {
+                jwt.Error.Expired => "token expired\n",
+                jwt.Error.BadSignature => "bad signature\n",
+                jwt.Error.Malformed, jwt.Error.UnsupportedAlg => "malformed token\n",
+                jwt.Error.OutOfMemory => "out of memory\n",
+            };
+            try setResponse(server, cfg, ent, sid, sess, 401, null, msg);
+            return;
+        };
+    } else {
+        try setResponse(server, cfg, ent, sid, sess, 401, null, "auth not configured\n");
+        return;
+    }
+
     // All routes share the shape `/{instance_id}/{op}[/{tail...}]`.
-    // Split once to get the instance id and remainder, then dispatch
-    // on the remainder.
     if (path.len == 0 or path[0] != '/') {
-        try setResponse(server, ent, sid, sess, 404, null, "not found\n");
+        try setResponse(server, cfg, ent, sid, sess, 404, null, "not found\n");
         return;
     }
     const after_slash = path[1..];
     const slash_idx = std.mem.indexOfScalar(u8, after_slash, '/') orelse {
-        try setResponse(server, ent, sid, sess, 404, null, "not found\n");
+        try setResponse(server, cfg, ent, sid, sess, 404, null, "not found\n");
         return;
     };
     const instance_id = after_slash[0..slash_idx];
-    const remainder = after_slash[slash_idx + 1 ..]; // "upload", "deploy", "source/abc..."
+    const remainder = after_slash[slash_idx + 1 ..];
     if (instance_id.len == 0) {
-        try setResponse(server, ent, sid, sess, 400, null, "missing instance id\n");
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "missing instance id\n");
         return;
     }
 
     if (std.mem.eql(u8, remainder, "upload") and std.mem.eql(u8, method, "POST")) {
-        try handleUpload(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, x_rove_path, rb);
+        try handleUpload(server, allocator, cfg, ent, sid, sess, instance_id, x_rove_path, rb);
     } else if (std.mem.eql(u8, remainder, "deploy") and std.mem.eql(u8, method, "POST")) {
-        try handleDeploy(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id);
+        try handleDeploy(server, allocator, cfg, ent, sid, sess, instance_id);
     } else if (std.mem.startsWith(u8, remainder, "source/") and std.mem.eql(u8, method, "GET")) {
         const hash = remainder["source/".len..];
-        try handleSource(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, hash);
+        try handleSource(server, allocator, cfg, ent, sid, sess, instance_id, hash);
     } else if (std.mem.eql(u8, remainder, "list") and std.mem.eql(u8, method, "GET")) {
-        try handleList(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id);
+        try handleList(server, allocator, cfg, ent, sid, sess, instance_id);
     } else if (std.mem.startsWith(u8, remainder, "file/") and std.mem.eql(u8, method, "GET")) {
         const file_path = remainder["file/".len..];
-        try handleGetFile(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, file_path);
+        try handleGetFile(server, allocator, cfg, ent, sid, sess, instance_id, file_path);
     } else if (std.mem.startsWith(u8, remainder, "file/") and std.mem.eql(u8, method, "PUT")) {
         const file_path = remainder["file/".len..];
-        try handlePutFile(server, allocator, data_dir, blob_cfg, raft, ent, sid, sess, instance_id, file_path, content_type, rb);
+        try handlePutFile(server, allocator, cfg, ent, sid, sess, instance_id, file_path, content_type, rb);
     } else if (std.mem.eql(u8, remainder, "blobs/check") and std.mem.eql(u8, method, "POST")) {
-        try handleBlobsCheck(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, rb);
+        try handleBlobsCheck(server, allocator, cfg, ent, sid, sess, instance_id, rb);
     } else if (std.mem.startsWith(u8, remainder, "blobs/") and std.mem.eql(u8, method, "PUT")) {
         const hash = remainder["blobs/".len..];
-        try handlePutBlob(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, hash, rb);
+        try handlePutBlob(server, allocator, cfg, ent, sid, sess, instance_id, hash, rb);
     } else if (std.mem.eql(u8, remainder, "deployments") and std.mem.eql(u8, method, "POST")) {
-        try handleDeployments(server, allocator, data_dir, blob_cfg, raft, ent, sid, sess, instance_id, rb);
+        try handleDeployments(server, allocator, cfg, ent, sid, sess, instance_id, rb);
     } else if (std.mem.startsWith(u8, remainder, "deployments/") and std.mem.eql(u8, method, "GET")) {
         const id_str = remainder["deployments/".len..];
-        try handleGetDeployment(server, allocator, data_dir, blob_cfg, ent, sid, sess, instance_id, id_str);
+        try handleGetDeployment(server, allocator, cfg, ent, sid, sess, instance_id, id_str);
     } else {
-        try setResponse(server, ent, sid, sess, 404, null, "not found\n");
+        try setResponse(server, cfg, ent, sid, sess, 404, null, "not found\n");
     }
 }
 
@@ -335,8 +379,7 @@ fn handleOne(
 fn handleBlobsCheck(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -349,15 +392,15 @@ fn handleBlobsCheck(
     var parsed = std.json.parseFromSlice(BodyShape, allocator, body, .{
         .ignore_unknown_fields = true,
     }) catch {
-        try setResponse(server, ent, sid, sess, 400, null, "bad request body\n");
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "bad request body\n");
         return;
     };
     defer parsed.deinit();
 
     var check = files_server.checkBlobs(
         allocator,
-        data_dir,
-        blob_cfg,
+        cfg.data_dir,
+        cfg.blob_cfg,
         instance_id,
         parsed.value.hashes,
     ) catch |err| {
@@ -366,7 +409,7 @@ fn handleBlobsCheck(
             else => 500,
         };
         const msg = try std.fmt.allocPrint(allocator, "check failed: {s}\n", .{@errorName(err)});
-        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        try setResponse(server, cfg, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
     defer check.deinit();
@@ -401,7 +444,7 @@ fn handleBlobsCheck(
     try w.writeAll("}}");
 
     const out = try buf.toOwnedSlice(allocator);
-    try setResponse(server, ent, sid, sess, 200, out.ptr, out);
+    try setResponse(server, cfg, ent, sid, sess, 200, out.ptr, out);
 }
 
 /// POST /{instance}/deployments — body JSON:
@@ -418,9 +461,7 @@ fn handleBlobsCheck(
 fn handleDeployments(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
-    raft: ?*kv.RaftNode,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -436,7 +477,7 @@ fn handleDeployments(
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{
         .allocate = .alloc_always,
     }) catch {
-        try setResponse(server, ent, sid, sess, 400, null, "bad request body\n");
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "bad request body\n");
         return;
     };
     defer parsed.deinit();
@@ -444,7 +485,7 @@ fn handleDeployments(
     const root_obj = switch (parsed.value) {
         .object => |o| o,
         else => {
-            try setResponse(server, ent, sid, sess, 400, null, "body must be a JSON object\n");
+            try setResponse(server, cfg, ent, sid, sess, 400, null, "body must be a JSON object\n");
             return;
         },
     };
@@ -453,12 +494,12 @@ fn handleDeployments(
     var expected_parent: ?u64 = null;
     if (root_obj.get("parent_id")) |pid_val| switch (pid_val) {
         .string => |s| expected_parent = std.fmt.parseInt(u64, s, 16) catch {
-            try setResponse(server, ent, sid, sess, 400, null, "invalid parent_id hex\n");
+            try setResponse(server, cfg, ent, sid, sess, 400, null, "invalid parent_id hex\n");
             return;
         },
         .null => {},
         else => {
-            try setResponse(server, ent, sid, sess, 400, null, "parent_id must be a hex string\n");
+            try setResponse(server, cfg, ent, sid, sess, 400, null, "parent_id must be a hex string\n");
             return;
         },
     };
@@ -466,7 +507,7 @@ fn handleDeployments(
     const files_obj = switch (root_obj.get("files") orelse .null) {
         .object => |o| o,
         else => {
-            try setResponse(server, ent, sid, sess, 400, null, "`files` must be a JSON object\n");
+            try setResponse(server, cfg, ent, sid, sess, 400, null, "`files` must be a JSON object\n");
             return;
         },
     };
@@ -480,21 +521,21 @@ fn handleDeployments(
         const entry_obj = switch (kv_pair.value_ptr.*) {
             .object => |o| o,
             else => {
-                try setResponse(server, ent, sid, sess, 400, null, "file entry must be a JSON object\n");
+                try setResponse(server, cfg, ent, sid, sess, 400, null, "file entry must be a JSON object\n");
                 return;
             },
         };
         const hash = switch (entry_obj.get("hash") orelse .null) {
             .string => |s| s,
             else => {
-                try setResponse(server, ent, sid, sess, 400, null, "file entry missing hash\n");
+                try setResponse(server, cfg, ent, sid, sess, 400, null, "file entry missing hash\n");
                 return;
             },
         };
         const kind_str = switch (entry_obj.get("kind") orelse .null) {
             .string => |s| s,
             else => {
-                try setResponse(server, ent, sid, sess, 400, null, "file entry missing kind\n");
+                try setResponse(server, cfg, ent, sid, sess, 400, null, "file entry missing kind\n");
                 return;
             },
         };
@@ -503,14 +544,14 @@ fn handleDeployments(
         else if (std.mem.eql(u8, kind_str, "static"))
             .static
         else {
-            try setResponse(server, ent, sid, sess, 400, null, "kind must be \"handler\" or \"static\"\n");
+            try setResponse(server, cfg, ent, sid, sess, 400, null, "kind must be \"handler\" or \"static\"\n");
             return;
         };
         const content_type: []const u8 = switch (entry_obj.get("content_type") orelse .null) {
             .string => |s| s,
             .null => "",
             else => {
-                try setResponse(server, ent, sid, sess, 400, null, "content_type must be a string\n");
+                try setResponse(server, cfg, ent, sid, sess, 400, null, "content_type must be a string\n");
                 return;
             },
         };
@@ -521,7 +562,7 @@ fn handleDeployments(
             .kind = kind,
             .content_type = content_type,
         }) catch {
-            try setResponse(server, ent, sid, sess, 500, null, "oom\n");
+            try setResponse(server, cfg, ent, sid, sess, 500, null, "oom\n");
             return;
         };
     }
@@ -534,8 +575,8 @@ fn handleDeployments(
 
     const result = files_server.deployManifest(
         allocator,
-        data_dir,
-        blob_cfg,
+        cfg.data_dir,
+        cfg.blob_cfg,
         instance_id,
         entries.items,
         expected_parent,
@@ -552,13 +593,13 @@ fn handleDeployments(
             else => 500,
         };
         const msg = try std.fmt.allocPrint(allocator, "deploy failed: {s}\n", .{@errorName(err)});
-        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        try setResponse(server, cfg, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
 
     // Replicate to followers. Leader-local writes are already in
     // files.db; this is the raft-side of the same thing.
-    if (raft) |r| {
+    if (cfg.raft) |r| {
         if (files_ws.ops.items.len > 0) {
             const ws_bytes = try files_ws.encode(allocator);
             defer allocator.free(ws_bytes);
@@ -579,7 +620,7 @@ fn handleDeployments(
         "{{\"id\":\"{x:0>16}\",\"parent_id\":\"{x:0>16}\"}}\n",
         .{ result.id, result.parent_id },
     );
-    try setResponse(server, ent, sid, sess, 201, body_out.ptr, body_out);
+    try setResponse(server, cfg, ent, sid, sess, 201, body_out.ptr, body_out);
 }
 
 /// PUT /{instance}/blobs/{hash} — body is the raw bytes. Server
@@ -588,8 +629,7 @@ fn handleDeployments(
 fn handlePutBlob(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -599,23 +639,22 @@ fn handlePutBlob(
 ) !void {
     const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
 
-    files_server.putBlobByHash(allocator, data_dir, blob_cfg, instance_id, hash, body) catch |err| {
+    files_server.putBlobByHash(allocator, cfg.data_dir, cfg.blob_cfg, instance_id, hash, body) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.InvalidInstanceId, files_server.Error.InvalidManifest => 400,
             else => 500,
         };
         const msg = try std.fmt.allocPrint(allocator, "putBlob failed: {s}\n", .{@errorName(err)});
-        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        try setResponse(server, cfg, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
-    try setResponse(server, ent, sid, sess, 204, null, "");
+    try setResponse(server, cfg, ent, sid, sess, 204, null, "");
 }
 
 fn handleUpload(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -624,58 +663,56 @@ fn handleUpload(
     rb: h2.ReqBody,
 ) !void {
     if (x_rove_path.len == 0) {
-        try setResponse(server, ent, sid, sess, 400, null, "missing X-Rove-Path header\n");
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "missing X-Rove-Path header\n");
         return;
     }
     const source: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
 
-    files_server.uploadFile(allocator, data_dir, blob_cfg, instance_id, x_rove_path, source) catch |err| {
+    files_server.uploadFile(allocator, cfg.data_dir, cfg.blob_cfg, instance_id, x_rove_path, source) catch |err| {
         std.log.warn("files-server: uploadFile failed: {s}", .{@errorName(err)});
         const msg = try std.fmt.allocPrint(
             allocator,
             "upload failed: {s}\n",
             .{@errorName(err)},
         );
-        try setResponse(server, ent, sid, sess, 500, msg.ptr, msg);
+        try setResponse(server, cfg, ent, sid, sess, 500, msg.ptr, msg);
         return;
     };
-    try setResponse(server, ent, sid, sess, 204, null, "");
+    try setResponse(server, cfg, ent, sid, sess, 204, null, "");
 }
 
 fn handleDeploy(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
     instance_id: []const u8,
 ) !void {
-    const dep_id = files_server.deploy(allocator, data_dir, blob_cfg, instance_id) catch |err| {
+    const dep_id = files_server.deploy(allocator, cfg.data_dir, cfg.blob_cfg, instance_id) catch |err| {
         const msg = try std.fmt.allocPrint(
             allocator,
             "deploy failed: {s}\n",
             .{@errorName(err)},
         );
-        try setResponse(server, ent, sid, sess, 500, msg.ptr, msg);
+        try setResponse(server, cfg, ent, sid, sess, 500, msg.ptr, msg);
         return;
     };
     const body = try std.fmt.allocPrint(allocator, "{d}\n", .{dep_id});
-    try setResponse(server, ent, sid, sess, 200, body.ptr, body);
+    try setResponse(server, cfg, ent, sid, sess, 200, body.ptr, body);
 }
 
 fn handleList(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
     instance_id: []const u8,
 ) !void {
-    var manifest = files_server.loadCurrentManifest(allocator, data_dir, blob_cfg, instance_id) catch |err| {
+    var manifest = files_server.loadCurrentManifest(allocator, cfg.data_dir, cfg.blob_cfg, instance_id) catch |err| {
         if (err == files_server.Error.NotFound) {
             // No deployment yet — empty list, not an error.
             const empty = try std.fmt.allocPrint(
@@ -683,7 +720,7 @@ fn handleList(
                 "{{\"deployment_id\":0,\"entries\":[]}}",
                 .{},
             );
-            try setResponse(server, ent, sid, sess, 200, empty.ptr, empty);
+            try setResponse(server, cfg, ent, sid, sess, 200, empty.ptr, empty);
             return;
         }
         const msg = try std.fmt.allocPrint(
@@ -691,13 +728,13 @@ fn handleList(
             "list failed: {s}\n",
             .{@errorName(err)},
         );
-        try setResponse(server, ent, sid, sess, 500, msg.ptr, msg);
+        try setResponse(server, cfg, ent, sid, sess, 500, msg.ptr, msg);
         return;
     };
     defer manifest.deinit();
 
     const body = try encodeListJson(allocator, &manifest);
-    try setResponse(server, ent, sid, sess, 200, body.ptr, body);
+    try setResponse(server, cfg, ent, sid, sess, 200, body.ptr, body);
 }
 
 /// `GET /{instance}/deployments/{id}` — read-only manifest fetch by
@@ -714,8 +751,7 @@ fn handleList(
 fn handleGetDeployment(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -723,15 +759,15 @@ fn handleGetDeployment(
     id_str: []const u8,
 ) !void {
     if (id_str.len == 0) {
-        try setResponse(server, ent, sid, sess, 400, null, "missing deployment id\n");
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "missing deployment id\n");
         return;
     }
     const deployment_id = std.fmt.parseInt(u64, id_str, 16) catch {
-        try setResponse(server, ent, sid, sess, 400, null, "invalid deployment id (want hex)\n");
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "invalid deployment id (want hex)\n");
         return;
     };
 
-    var manifest = files_server.loadDeployment(allocator, data_dir, blob_cfg, instance_id, deployment_id) catch |err| {
+    var manifest = files_server.loadDeployment(allocator, cfg.data_dir, cfg.blob_cfg, instance_id, deployment_id) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.NotFound => 404,
             else => 500,
@@ -741,13 +777,13 @@ fn handleGetDeployment(
             "loadDeployment failed: {s}\n",
             .{@errorName(err)},
         );
-        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        try setResponse(server, cfg, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
     defer manifest.deinit();
 
     const body = try encodeListJson(allocator, &manifest);
-    try setResponse(server, ent, sid, sess, 200, body.ptr, body);
+    try setResponse(server, cfg, ent, sid, sess, 200, body.ptr, body);
 }
 
 fn encodeListJson(
@@ -792,8 +828,7 @@ fn writeJsonString(w: anytype, s: []const u8) !void {
 fn handleGetFile(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -801,11 +836,11 @@ fn handleGetFile(
     file_path: []const u8,
 ) !void {
     if (file_path.len == 0) {
-        try setResponse(server, ent, sid, sess, 400, null, "empty file path\n");
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "empty file path\n");
         return;
     }
 
-    var content = files_server.readFileByPath(allocator, data_dir, blob_cfg, instance_id, file_path) catch |err| {
+    var content = files_server.readFileByPath(allocator, cfg.data_dir, cfg.blob_cfg, instance_id, file_path) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.NotFound => 404,
             files_server.Error.InvalidPath, files_server.Error.InvalidInstanceId => 400,
@@ -816,7 +851,7 @@ fn handleGetFile(
             "getFile failed: {s}\n",
             .{@errorName(err)},
         );
-        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        try setResponse(server, cfg, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
     defer content.deinit();
@@ -834,15 +869,13 @@ fn handleGetFile(
     try w.writeByte('}');
 
     const body = try buf.toOwnedSlice(allocator);
-    try setResponse(server, ent, sid, sess, 200, body.ptr, body);
+    try setResponse(server, cfg, ent, sid, sess, 200, body.ptr, body);
 }
 
 fn handlePutFile(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
-    raft: ?*kv.RaftNode,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -852,7 +885,7 @@ fn handlePutFile(
     rb: h2.ReqBody,
 ) !void {
     if (file_path.len == 0) {
-        try setResponse(server, ent, sid, sess, 400, null, "empty file path\n");
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "empty file path\n");
         return;
     }
     const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
@@ -862,8 +895,8 @@ fn handlePutFile(
 
     const dep_id = files_server.putFileAndDeploy(
         allocator,
-        data_dir,
-        blob_cfg,
+        cfg.data_dir,
+        cfg.blob_cfg,
         instance_id,
         file_path,
         body,
@@ -881,7 +914,7 @@ fn handlePutFile(
             "putFile failed: {s}\n",
             .{@errorName(err)},
         );
-        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        try setResponse(server, cfg, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
 
@@ -891,7 +924,7 @@ fn handlePutFile(
     // the raft hop. On propose failure the leader's files.db still
     // has the deployment locally — at-least-once semantics match
     // the outbox + root paths.
-    if (raft) |r| {
+    if (cfg.raft) |r| {
         if (files_ws.ops.items.len > 0) {
             const ws_bytes = try files_ws.encode(allocator);
             defer allocator.free(ws_bytes);
@@ -908,14 +941,13 @@ fn handlePutFile(
     }
 
     const body_out = try std.fmt.allocPrint(allocator, "{d}\n", .{dep_id});
-    try setResponse(server, ent, sid, sess, 201, body_out.ptr, body_out);
+    try setResponse(server, cfg, ent, sid, sess, 201, body_out.ptr, body_out);
 }
 
 fn handleSource(
     server: *CodeH2,
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -923,30 +955,31 @@ fn handleSource(
     hash: []const u8,
 ) !void {
     if (hash.len == 0) {
-        try setResponse(server, ent, sid, sess, 400, null, "missing hash\n");
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "missing hash\n");
         return;
     }
 
-    const bytes = files_server.getSourceByHash(allocator, data_dir, blob_cfg, instance_id, hash) catch |err| {
+    const bytes = files_server.getSourceByHash(allocator, cfg.data_dir, cfg.blob_cfg, instance_id, hash) catch |err| {
         const code: u16 = if (err == files_server.Error.NotFound) 404 else 500;
         const msg = try std.fmt.allocPrint(
             allocator,
             "source fetch failed: {s}\n",
             .{@errorName(err)},
         );
-        try setResponse(server, ent, sid, sess, code, msg.ptr, msg);
+        try setResponse(server, cfg, ent, sid, sess, code, msg.ptr, msg);
         return;
     };
-    try setResponse(server, ent, sid, sess, 200, bytes.ptr, bytes);
+    try setResponse(server, cfg, ent, sid, sess, 200, bytes.ptr, bytes);
 }
 
 /// Stamp a Status + RespBody + friends onto the entity and move it
 /// from request_out to response_in. The body bytes are transferred
 /// into the RespBody component; ownership passes to rove-h2 which
 /// frees them after sending. Passing `body_ptr = null` is fine for
-/// empty responses.
+/// empty responses. CORS allow-origin (when configured) is added.
 fn setResponse(
     server: *CodeH2,
+    cfg: *const Config,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
@@ -954,11 +987,9 @@ fn setResponse(
     body_ptr: ?[*]u8,
     body_slice: []const u8,
 ) !void {
+    const headers = try buildResponseHeaders(server.reg.allocator, cfg, .normal);
     try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{
-        .fields = null,
-        .count = 0,
-    });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, headers);
     try server.reg.set(ent, &server.request_out, h2.RespBody, .{
         .data = body_ptr,
         .len = @intCast(body_slice.len),
@@ -967,6 +998,75 @@ fn setResponse(
     try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
     try server.reg.set(ent, &server.request_out, h2.Session, sess);
     try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// CORS preflight response — 204 with the full allow-set so the
+/// browser caches the policy for `max-age` seconds.
+fn setPreflight(
+    server: *CodeH2,
+    cfg: *const Config,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+) !void {
+    const headers = try buildResponseHeaders(server.reg.allocator, cfg, .preflight);
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 204 });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, headers);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+const ResponseKind = enum { normal, preflight };
+
+const HdrPair = struct { name: []const u8, value: []const u8 };
+
+fn buildResponseHeaders(allocator: std.mem.Allocator, cfg: *const Config, kind: ResponseKind) !h2.RespHeaders {
+    const origin = cfg.cors_origin orelse return .{ .fields = null, .count = 0 };
+    var pairs: [5]HdrPair = undefined;
+    var n: usize = 0;
+    pairs[n] = .{ .name = "access-control-allow-origin", .value = origin };
+    n += 1;
+    pairs[n] = .{ .name = "vary", .value = "origin" };
+    n += 1;
+    if (kind == .preflight) {
+        pairs[n] = .{ .name = "access-control-allow-methods", .value = "GET, POST, PUT, DELETE, OPTIONS" };
+        n += 1;
+        pairs[n] = .{ .name = "access-control-allow-headers", .value = "authorization, content-type, x-rove-path" };
+        n += 1;
+        pairs[n] = .{ .name = "access-control-max-age", .value = "600" };
+        n += 1;
+    }
+    return packHeaders(allocator, pairs[0..n]);
+}
+
+fn packHeaders(allocator: std.mem.Allocator, pairs: []const HdrPair) !h2.RespHeaders {
+    if (pairs.len == 0) return .{ .fields = null, .count = 0 };
+    const fields_size = pairs.len * @sizeOf(h2.HeaderField);
+    var str_size: usize = 0;
+    for (pairs) |p| str_size += p.name.len + p.value.len;
+
+    const buf = try allocator.alloc(u8, fields_size + str_size);
+    errdefer allocator.free(buf);
+    const fields_ptr: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
+    var off: usize = fields_size;
+    for (pairs, 0..) |p, i| {
+        const name_start = off;
+        @memcpy(buf[off..][0..p.name.len], p.name);
+        off += p.name.len;
+        const value_start = off;
+        @memcpy(buf[off..][0..p.value.len], p.value);
+        off += p.value.len;
+        fields_ptr[i] = .{
+            .name = buf[name_start..].ptr,
+            .name_len = @intCast(p.name.len),
+            .value = buf[value_start..].ptr,
+            .value_len = @intCast(p.value.len),
+        };
+    }
+    return .{ .fields = fields_ptr, .count = @intCast(pairs.len) };
 }
 
 fn cleanupResponses(server: *CodeH2) !void {

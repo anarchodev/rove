@@ -311,17 +311,18 @@ const WorkerCtx = struct {
     data_dir: []const u8,
     http_addr: std.net.Address,
     raft: *kv.RaftNode,
-    code_addr: std.net.Address,
     /// Phase 5.5(a) Step B — JWT secret shared with the standalone
-    /// log-server. Worker mints tokens at `/_system/log-token` after
-    /// admin auth; standalone verifies them on every `/v1/*` request.
-    /// Generated once per process; lives in the main thread; workers
-    /// borrow.
-    log_jwt_secret: []const u8,
+    /// services (log-server, files-server). Worker mints tokens at
+    /// `/_system/services-token` after admin auth; each service
+    /// verifies on every request. Generated once per process; lives
+    /// in the main thread; workers borrow.
+    services_jwt_secret: []const u8,
     /// Public origin the dashboard uses to reach the log-server.
-    /// Returned in the `/_system/log-token` response so the dashboard
-    /// doesn't have to derive it. Borrowed.
+    /// Returned in the `/_system/services-token` response. Borrowed.
     log_public_base: []const u8,
+    /// Public origin the dashboard / CLI uses to reach files-server.
+    /// Returned in the `/_system/services-token` response. Borrowed.
+    files_public_base: []const u8,
     admin_origin: ?[]const u8,
     admin_api_domain: ?[]const u8,
     public_suffix: ?[]const u8,
@@ -445,9 +446,9 @@ fn workerMain(args: *WorkerCtx) !void {
             .max_frame_size = 16384,
             .tls_config = args.tls_config,
         },
-        .code_addr = args.code_addr,
-        .log_jwt_secret = args.log_jwt_secret,
+        .services_jwt_secret = args.services_jwt_secret,
         .log_public_base = args.log_public_base,
+        .files_public_base = args.files_public_base,
         .admin_origin = args.admin_origin,
         .admin_api_domain = args.admin_api_domain,
         .log_worker_id = args.worker_idx,
@@ -494,19 +495,9 @@ fn workerMain(args: *WorkerCtx) !void {
             else => return err,
         };
 
-        // Code-server proxy: maintain the upstream session, forward
-        // any parked /_system/files/* requests, map upstream responses
-        // back onto their server-side peers. Order matters — ingest
-        // before flush (so a connection that just came up is usable
-        // in the same tick), and drain after flush (so responses
-        // that came back in the same tick flow onward).
-        try rjs.connectProxies(worker);
-        try rjs.ingestProxyConnects(worker);
-        try reg.flush();
-        try rjs.flushProxyPending(worker);
-        try reg.flush();
-        try rjs.drainProxyResponses(worker);
-        try reg.flush();
+        // No /_system/* proxies on the worker anymore — the dashboard
+        // hits the standalone services directly (logs.{suffix},
+        // files.{suffix}). Phase 5.5(a) Step B / Phase 5.5(e) F1.
 
         // Drain request_out one tenant-batch at a time. Each call
         // processes at most one tenant's requests; the flush between
@@ -1038,42 +1029,28 @@ pub fn main() !void {
     var raft_thread = try std.Thread.spawn(.{}, raftThreadMain, .{raft_node});
     raft_thread.detach();
 
-    // ── Subsystem threads (shared across workers) ──────────────────────
-    //
-    // Spawn BEFORE the workers so the workers can open client
-    // connections to them during startup. Spawn AFTER raft so the
-    // files-server can propose files.db writesets through it. Each
-    // subsystem owns its own rove context (registry + io_uring +
-    // h2 server) and binds to a loopback TCP ephemeral port.
-    const cs_handle = try files_server.thread.spawn(allocator, cli.data_dir, blob_owned.cfg, subsystem_max_connections, raft_node);
-    defer cs_handle.shutdown();
-    const code_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, cs_handle.port);
-
-    // ── TLS resolution (hoisted above the standalone spawn so the
-    //    log-server can reuse the same `*TlsConfig` for its public
-    //    listener; production wildcard cert covers both `app.` and
-    //    `logs.` subdomains).
+    // ── TLS resolution (shared across the worker + standalone
+    //    services. Production wildcard cert covers `app.`, `logs.`,
+    //    `files.` subdomains).
     var tls_owned: TlsResources = .{};
     defer tls_owned.deinit(allocator);
     const tls_config = try resolveTls(allocator, cli, &tls_owned);
 
-    // ── log-server-standalone (Phase 5.5(a) Step B) ───────────────────
-    //
-    // Public TLS listener at `--log-listen` (defaults to
-    // 127.0.0.1:8083 for dev). Same shared BatchStore + BlobBackend
-    // as the worker, so leader and followers see identical bytes
-    // when S3 is configured. IndexDb persists to `{data_dir}/log_index.db`
-    // — a freshly-spawned standalone re-indexes via the indexer
-    // thread (cheap on first start, idempotent via INSERT OR IGNORE).
-    //
-    // Auth: every `/v1/*` request must carry `Authorization: Bearer <jwt>`.
-    // The worker mints these at `/_system/log-token` after running its
-    // own admin-auth check; both sides share the same per-process
-    // HMAC-SHA256 secret. CORS-allowed origin is the admin origin so
-    // the dashboard at `app.{suffix}` can call `logs.{suffix}` directly.
-    var log_jwt_secret: [32]u8 = undefined;
-    std.crypto.random.bytes(&log_jwt_secret);
+    // ── Per-process HMAC secret used by the standalone services
+    //    (log-server + files-server) to verify JWTs minted by the
+    //    worker at `/_system/services-token`. Multi-node ops will
+    //    eventually need an operator-supplied env var.
+    var services_jwt_secret: [32]u8 = undefined;
+    std.crypto.random.bytes(&services_jwt_secret);
 
+    // ── Subsystem threads (shared across workers) ──────────────────────
+    //
+    // All subsystems run as separate threads inside the loop46
+    // process. Each is independently addressable on its own
+    // public-facing TLS port; the worker doesn't proxy to any of
+    // them anymore (Phase 5.5 a/e Step B/F1).
+
+    // ── log-server-standalone (Phase 5.5(a) Step B) ───────────────────
     const log_listen_addr = try parseHostPort(allocator, cli.log_listen);
     const log_index_db_path = try std.fmt.allocPrintSentinel(
         allocator,
@@ -1094,19 +1071,12 @@ pub fn main() !void {
         .blob_backend_cfg = blob_owned.cfg,
         .fs_data_dir = cli.data_dir,
         .tls_config = tls_config,
-        .jwt_secret = &log_jwt_secret,
+        .jwt_secret = &services_jwt_secret,
         .cors_origin = cli.admin_origin,
-        // 500ms keeps the dashboard "show me my latest request" feel
-        // tight; the indexer pass is cheap (full bucket scan with
-        // INSERT OR IGNORE dedup).
         .poll_interval_ms = 500,
     });
     defer ls_handle.shutdown();
 
-    // Public origin the dashboard hits to call /v1/*. Auto-derived
-    // from `--public-suffix` + the standalone's bound port when
-    // `--log-public-base` isn't set. The dashboard receives this
-    // alongside the JWT in the `/_system/log-token` response.
     const log_public_base = if (cli.log_public_base) |s|
         try allocator.dupe(u8, s)
     else if (cli.public_suffix) |suffix|
@@ -1114,6 +1084,34 @@ pub fn main() !void {
     else
         try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}", .{ls_handle.port});
     defer allocator.free(log_public_base);
+
+    // ── files-server thread (Phase 5.5(e) Step F1) ────────────────────
+    //
+    // Public TLS listener at `--files-listen`. Browser dashboard +
+    // CLI hit it directly; the worker is no longer in the
+    // upload/deploy path. Shares the TLS config + JWT secret with
+    // log-server.
+    const files_listen_addr = try parseHostPort(allocator, cli.files_listen);
+    const cs_handle = try files_server.thread.spawn(.{
+        .allocator = allocator,
+        .data_dir = cli.data_dir,
+        .blob_cfg = blob_owned.cfg,
+        .bind_addr = files_listen_addr,
+        .tls_config = tls_config,
+        .jwt_secret = &services_jwt_secret,
+        .cors_origin = cli.admin_origin,
+        .raft = raft_node,
+        .max_connections = subsystem_max_connections,
+    });
+    defer cs_handle.shutdown();
+
+    const files_public_base = if (cli.files_public_base) |s|
+        try allocator.dupe(u8, s)
+    else if (cli.public_suffix) |suffix|
+        try std.fmt.allocPrint(allocator, "https://files.{s}:{d}", .{ suffix, cs_handle.port })
+    else
+        try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}", .{cs_handle.port});
+    defer allocator.free(files_public_base);
 
     // ── Webhook-server thread (Phase 5.5 d) ───────────────────────────
     //
@@ -1155,9 +1153,9 @@ pub fn main() !void {
             .data_dir = cli.data_dir,
             .http_addr = http_addr,
             .raft = raft_node,
-            .code_addr = code_addr,
-            .log_jwt_secret = &log_jwt_secret,
+            .services_jwt_secret = &services_jwt_secret,
             .log_public_base = log_public_base,
+            .files_public_base = files_public_base,
             .admin_origin = cli.admin_origin,
             .admin_api_domain = cli.admin_api_domain,
             .public_suffix = cli.public_suffix,

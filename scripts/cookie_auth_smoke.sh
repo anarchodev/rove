@@ -95,10 +95,14 @@ hdrs=$("${CURL[@]}" -D - -o /dev/null -X POST \
     -d '{"token":"0000000000000000000000000000000000000000000000000000000000000000"}' \
     "${ORIGIN}/v1/login")
 echo "$hdrs" | head -1 | grep -q " 401" || fail "bad-token login status"
-if echo "$hdrs" | grep -iq "^set-cookie:"; then
-    fail "bad-token login emitted Set-Cookie"
+# The platform pre-mints `__Host-rove_sid` (a guest session id used
+# by SSE) on every request — that's expected and not the auth
+# cookie. Only `rove_session` (set on a successful login) should be
+# absent on 401.
+if echo "$hdrs" | grep -iE "^set-cookie:.*rove_session" >/dev/null; then
+    fail "bad-token login emitted rove_session cookie"
 fi
-ok "POST /v1/login with bad token → 401, no Set-Cookie"
+ok "POST /v1/login with bad token → 401, no rove_session cookie"
 
 # ── 4. Good token → 200 + Set-Cookie ─────────────────────────────────
 hdrs=$("${CURL[@]}" -D - -o /tmp/cs-login.json -X POST \
@@ -113,7 +117,7 @@ echo "$hdrs" | grep -iq "secure" || fail "login cookie missing Secure"
 grep -q '"ok":true' /tmp/cs-login.json || fail "login body not ok"
 # Extract cookie for replay. The Secure attribute means curl won't
 # autosave it over plain HTTP, so we do it by hand.
-cookie=$(echo "$hdrs" | grep -i "^set-cookie:" \
+cookie=$(echo "$hdrs" | grep -iE "^set-cookie:.*rove_session" \
     | sed 's/^[^:]*: //' | awk -F'; ' '{print $1}' | tr -d '\r')
 ok "POST /v1/login → 200 + HttpOnly+Secure+SameSite=Lax cookie"
 

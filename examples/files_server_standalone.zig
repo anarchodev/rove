@@ -2,6 +2,12 @@
 //! and idles until SIGINT. Exists so the end-to-end smoke test can
 //! drive it from curl without standing up a full js-worker.
 //!
+//! Required env:
+//!   FILES_JWT_SECRET     hex-encoded HMAC-SHA256 secret used to
+//!                        verify the `Authorization: Bearer <jwt>`
+//!                        on every request. Must match what the
+//!                        smoke driver uses to mint test tokens.
+//!
 //! Usage:
 //!     files-server-standalone --data-dir <path>
 
@@ -49,23 +55,46 @@ pub fn main() !void {
 
     std.fs.cwd().makePath(cli.data_dir) catch {};
 
-    // Standalone: one process, a handful of clients at most. Default
-    // to 32 concurrent connections — plenty of headroom for smoke
-    // tests and manual pokes. No raft here — standalone mode writes
-    // locally only (no cluster to replicate to).
-    const handle = try cs.thread.spawn(allocator, cli.data_dir, .fs, 32, null);
+    // JWT secret (hex). The standalone refuses any request whose
+    // bearer doesn't verify against this; the smoke mints test
+    // tokens with the matching value.
+    const jwt_secret_hex = std.process.getEnvVarOwned(allocator, "FILES_JWT_SECRET") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => {
+            std.debug.print("error: FILES_JWT_SECRET not set\n", .{});
+            std.process.exit(2);
+        },
+        else => return err,
+    };
+    defer allocator.free(jwt_secret_hex);
+    if (jwt_secret_hex.len == 0 or jwt_secret_hex.len % 2 != 0) {
+        std.debug.print("error: FILES_JWT_SECRET must be even-length hex\n", .{});
+        std.process.exit(2);
+    }
+    const jwt_secret = try allocator.alloc(u8, jwt_secret_hex.len / 2);
+    defer allocator.free(jwt_secret);
+    _ = std.fmt.hexToBytes(jwt_secret, jwt_secret_hex) catch {
+        std.debug.print("error: FILES_JWT_SECRET is not valid hex\n", .{});
+        std.process.exit(2);
+    };
+
+    // Loopback h2c (no TLS) for the smoke driver. Production wires
+    // this through loop46 which provides a TlsConfig.
+    const handle = try cs.thread.spawn(.{
+        .allocator = allocator,
+        .data_dir = cli.data_dir,
+        .blob_cfg = .fs,
+        .bind_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+        .jwt_secret = jwt_secret,
+        .raft = null,
+        .max_connections = 32,
+    });
     defer handle.shutdown();
 
-    // Print the bound port on a predictable line so the smoke test
-    // can scrape it from stdout without racing stderr log output.
     var stdout_buf: [64]u8 = undefined;
     var sw = std.fs.File.stdout().writer(&stdout_buf);
     try sw.interface.print("listening on port {d}\n", .{handle.port});
     try sw.interface.flush();
 
-    // Block forever. SIGTERM / SIGINT causes the process to exit;
-    // the `defer handle.shutdown()` signals the thread to unwind
-    // cleanly (it checks the atomic flag between poll ticks).
     while (true) {
         std.Thread.sleep(1 * std.time.ns_per_s);
     }

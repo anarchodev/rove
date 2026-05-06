@@ -66,7 +66,6 @@ const apply_mod = @import("apply.zig");
 const raft_propose = @import("raft_propose.zig");
 const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
-const proxy = @import("proxy.zig");
 const dispatch = @import("worker_dispatch.zig");
 const panic_mod = @import("panic.zig");
 const penalty_mod = @import("penalty.zig");
@@ -414,23 +413,20 @@ pub const WorkerConfig = struct {
     /// How often `refreshDeployments` re-reads `deployment/current`
     /// per tenant.
     refresh_interval_ns: i64 = DEFAULT_REFRESH_INTERVAL_NS,
-    /// Address of the in-process rove-files-server thread. When set,
-    /// the worker opens an HTTP/2 client connection at startup and
-    /// proxies any request whose path starts with `/_system/files/`
-    /// to this address. When null, `/_system/files/*` requests return
-    /// 503 (feature disabled).
-    code_addr: ?std.net.Address = null,
-    /// Phase 5.5(a) Step B — HMAC-SHA256 secret used to sign JWTs
-    /// minted at `/_system/log-token`. The standalone log-server
-    /// (separate process, addressable at `log_public_base`) verifies
-    /// the same JWT on every `/v1/*` request. Borrowed; the caller
+    /// Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — HMAC-SHA256
+    /// secret used to sign JWTs minted at `/_system/services-token`.
+    /// The standalone log-server + files-server (separate threads /
+    /// processes, addressable at `log_public_base` + `files_public_base`)
+    /// verify the same JWT on every request. Borrowed; the caller
     /// keeps the bytes alive for the worker's lifetime. When null,
-    /// `/_system/log-token` returns 503.
-    log_jwt_secret: ?[]const u8 = null,
+    /// `/_system/services-token` returns 503.
+    services_jwt_secret: ?[]const u8 = null,
     /// Public origin the dashboard uses to reach the log-server.
-    /// Returned in the `/_system/log-token` response so the browser
-    /// knows where to send `/v1/*` requests. Borrowed.
+    /// Returned in the `/_system/services-token` response. Borrowed.
     log_public_base: ?[]const u8 = null,
+    /// Public origin the dashboard / CLI uses to reach files-server.
+    /// Returned in the `/_system/services-token` response. Borrowed.
+    files_public_base: ?[]const u8 = null,
     /// Origin allowed to call `/_system/*` with CORS. When set, the
     /// worker answers browser preflight (OPTIONS) requests from this
     /// origin and stamps `Access-Control-Allow-*` headers onto every
@@ -482,32 +478,15 @@ pub const WorkerConfig = struct {
     log_batch_store: log_server_mod.batch_store.BatchStore,
 };
 
-/// Cross-reference component used by the `/_system/*` proxy. Lives
-/// on server-side entities parked in each subsystem's `inflight`
-/// collection; the `client` field points at the client-side entity
-/// that was submitted into rove-h2's `client_request_in`. On each
-/// tick we scan `client_response_out`, match each client entity
-/// back to its server peer via this field, and copy the upstream
-/// response onto the server entity before delivering it to the
-/// downstream user.
-pub const ProxyPeer = proxy.ProxyPeer;
-pub const ProxyTag = proxy.ProxyTag;
-pub const ProxySubsystem = proxy.ProxySubsystem;
-pub const connectProxies = proxy.connectProxies;
-pub const ingestProxyConnects = proxy.ingestProxyConnects;
-pub const flushProxyPending = proxy.flushProxyPending;
-pub const drainProxyResponses = proxy.drainProxyResponses;
 pub const dispatchOnce = dispatch.dispatchOnce;
 
 pub fn Worker(comptime opts: Options) type {
     // rove-js contributes `RaftWait` to every request entity so we can
     // park entities in `raft_pending` without allocating side state.
-    // Also `ProxyPeer` so `/_system/*` requests can carry the cross-
-    // reference to their in-flight upstream client entity through
-    // the parking collections, and `ProxyTag` so the connect + drain
-    // systems can route each client entity back to its originating
-    // subsystem in O(1) instead of scanning every inflight collection.
-    const merged_request_row = rove.Row(&.{ RaftWait, ProxyPeer, ProxyTag }).merge(opts.request_row);
+    // No proxy components anymore — Phase 5.5 retired all `/_system/*`
+    // proxies (logs Step B, files Step F1) in favor of standalone
+    // services on their own subdomains.
+    const merged_request_row = rove.Row(&.{RaftWait}).merge(opts.request_row);
 
     const H2Type = h2.H2(.{
         .request_row = merged_request_row,
@@ -532,9 +511,6 @@ pub fn Worker(comptime opts: Options) type {
         /// Uses the same row as every other h2 stream collection so
         /// moves in and out preserve every component.
         raft_pending: StreamColl,
-        /// `/_system/files/*` proxy state. Targets the in-process
-        /// rove-files-server thread.
-        code_proxy: ProxySubsystem(StreamColl),
         dispatcher: Dispatcher,
         tenant: *tenant_mod.Tenant,
         raft: *kv_mod.RaftNode,
@@ -588,11 +564,12 @@ pub fn Worker(comptime opts: Options) type {
         /// Lives for the worker's full lifetime; loop46 picks S3 vs
         /// in-memory at startup.
         log_batch_store: log_server_mod.batch_store.BatchStore,
-        /// Phase 5.5(a) Step B — JWT secret + public log-server origin.
-        /// Both are returned to the dashboard via `/_system/log-token`
-        /// so the browser knows where + how to call `/v1/*`.
-        log_jwt_secret: ?[]const u8,
+        /// Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — JWT secret +
+        /// public origins for the standalone services. Returned to the
+        /// dashboard via `/_system/services-token`.
+        services_jwt_secret: ?[]const u8,
         log_public_base: ?[]const u8,
+        files_public_base: ?[]const u8,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -626,11 +603,6 @@ pub fn Worker(comptime opts: Options) type {
                 .reg = reg,
                 .h2 = server,
                 .raft_pending = try StreamColl.init(allocator),
-                .code_proxy = try ProxySubsystem(StreamColl).init(
-                    allocator,
-                    .{ .kind = .code },
-                    config.code_addr,
-                ),
                 .dispatcher = try Dispatcher.init(allocator),
                 .tenant = config.tenant,
                 .raft = config.raft,
@@ -647,17 +619,15 @@ pub fn Worker(comptime opts: Options) type {
                 .compile_ctx = config.compile_ctx,
                 .blob_backend_cfg = config.blob_backend,
                 .log_batch_store = config.log_batch_store,
-                .log_jwt_secret = config.log_jwt_secret,
+                .services_jwt_secret = config.services_jwt_secret,
                 .log_public_base = config.log_public_base,
+                .files_public_base = config.files_public_base,
             };
             errdefer self.raft_pending.deinit();
-            errdefer self.code_proxy.deinit();
             errdefer self.tenant_files_map.clearAllEntries(allocator);
             errdefer self.tenant_logs.clearAllEntries(allocator);
 
             reg.registerCollection(&self.raft_pending);
-            reg.registerCollection(&self.code_proxy.pending);
-            reg.registerCollection(&self.code_proxy.inflight);
 
             // Eagerly open code AND log state for every known tenant.
             // The tenant registry's instances map was populated by
@@ -679,7 +649,6 @@ pub fn Worker(comptime opts: Options) type {
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
             self.tenant_files_map.deinit(allocator);
-            self.code_proxy.deinit();
             self.raft_pending.deinit();
             self.dispatcher.deinit();
             self.h2.destroy();

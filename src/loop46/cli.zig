@@ -126,7 +126,7 @@ pub const Cli = struct {
     rate_limit_email_refill: u32 = 1,
     /// Where the standalone log-server binds its TLS listener.
     /// Browser hits this directly with a JWT minted at
-    /// `/_system/log-token` on the worker. Default
+    /// `/_system/services-token` on the worker. Default
     /// `127.0.0.1:8083` for dev; production overrides to the
     /// public-facing IP/port the load balancer fronts.
     log_listen: []const u8 = "127.0.0.1:8083",
@@ -138,6 +138,13 @@ pub const Cli = struct {
     /// alongside the JWT so the browser knows where to send `/v1/*`
     /// requests.
     log_public_base: ?[]const u8 = null,
+    /// Where the files-server binds its TLS listener. Same shape as
+    /// `--log-listen`. Default `127.0.0.1:8084`.
+    files_listen: []const u8 = "127.0.0.1:8084",
+    /// Public origin the dashboard / CLI hits to call files-server.
+    /// Auto-derived to `https://files.{public_suffix}:{files_port}`
+    /// when `--public-suffix` is set.
+    files_public_base: ?[]const u8 = null,
 };
 
 pub fn parseCli(args: []const [:0]u8) !Cli {
@@ -243,6 +250,14 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.log_public_base = args[i];
+        } else if (std.mem.eql(u8, a, "--files-listen")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.files_listen = args[i];
+        } else if (std.mem.eql(u8, a, "--files-public-base")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.files_public_base = args[i];
         } else {
             return error.Usage;
         }

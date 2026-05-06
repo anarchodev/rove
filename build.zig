@@ -168,12 +168,20 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // ── rove-log-server: per-instance log read operations (Phase 5) ──
+    // ── rove-jwt: shared HS256 mint + verify for the standalone
+    //    services' Authorization gate (log-server, files-server).
+    //    Pure stdlib, no external library — see src/jwt/root.zig.
+    const jwt_mod = b.addModule("rove-jwt", .{
+        .root_source_file = b.path("src/jwt/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ── rove-log-server: standalone log-server (Phase 5.5 a) ─────────
     //
-    // Mirror of rove-files-server for the observability side. Read-only
-    // SQLite connections per call so the worker's h2 thread remains
-    // the sole writer. Wrapped by a later thread subsystem + proxied
-    // via `/_system/log/*` on the worker.
+    // Indexer + h2 query API, S3-backed. Runs in the loop46 process
+    // for the in-process spawn path; the standalone binary at
+    // examples/log_server_standalone.zig wraps the same modules.
     const log_server_mod = b.addModule("rove-log-server", .{
         .root_source_file = b.path("src/log_server/root.zig"),
         .target = target,
@@ -189,6 +197,7 @@ pub fn build(b: *std.Build) void {
     log_server_mod.addImport("rove-kv", kv_mod);
     log_server_mod.addImport("rove-blob", blob_mod);
     log_server_mod.addImport("rove-log", log_mod);
+    log_server_mod.addImport("rove-jwt", jwt_mod);
 
     // ── rove-webhook-server: cluster-wide webhook subsystem (Phase 5.5 d) ──
     //
@@ -236,6 +245,7 @@ pub fn build(b: *std.Build) void {
     files_server_mod.addImport("rove-blob", blob_mod);
     files_server_mod.addImport("rove-files", files_mod);
     files_server_mod.addImport("rove-qjs", qjs_mod);
+    files_server_mod.addImport("rove-jwt", jwt_mod);
 
     // ── Tests ──
     const test_step = b.step("test", "Run all unit tests");
@@ -284,6 +294,10 @@ pub fn build(b: *std.Build) void {
     const log_server_tests = b.addTest(.{ .root_module = log_server_mod });
     test_step.dependOn(&b.addRunArtifact(log_server_tests).step);
 
+    // rove-jwt tests
+    const jwt_tests = b.addTest(.{ .root_module = jwt_mod });
+    test_step.dependOn(&b.addRunArtifact(jwt_tests).step);
+
     // rove-webhook-server tests
     const webhook_server_tests = b.addTest(.{ .root_module = webhook_server_mod });
     test_step.dependOn(&b.addRunArtifact(webhook_server_tests).step);
@@ -323,6 +337,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-files", files_mod);
     js_mod.addImport("rove-log", log_mod);
     js_mod.addImport("rove-log-server", log_server_mod);
+    js_mod.addImport("rove-jwt", jwt_mod);
     js_mod.addImport("rove-tape", tape_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
     js_mod.addImport("rove-webhook-server", webhook_server_mod);
@@ -496,24 +511,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(ls_standalone);
 
-    // rove-js-ctl: admin CLI over the worker's /_system/* surface.
-    const js_ctl_mod = b.addModule("rove-js-ctl", .{
-        .root_source_file = b.path("examples/rove_js_ctl.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    js_ctl_mod.addImport("rove", rove_mod);
-    js_ctl_mod.addImport("rove-io", io_mod);
-    js_ctl_mod.addImport("rove-h2", h2_mod);
-    js_ctl_mod.link_libc = true;
-    js_ctl_mod.linkSystemLibrary("nghttp2", .{});
-    js_ctl_mod.linkSystemLibrary("ssl", .{});
-    js_ctl_mod.linkSystemLibrary("crypto", .{});
-    const js_ctl = b.addExecutable(.{
-        .name = "rove-js-ctl",
-        .root_module = js_ctl_mod,
-    });
-    b.installArtifact(js_ctl);
 
     // kv-maelstrom: adapter binary that lets Maelstrom drive lin-kv
     // linearizability workloads against rove-kv over stdin/stdout.

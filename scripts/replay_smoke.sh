@@ -26,17 +26,21 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/tmp/rove-replay-smoke}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8210}"
 LOG_ADDR="${LOG_ADDR:-127.0.0.1:8211}"
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8212}"
 RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40310}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}"
 ADMIN_HOST="app.loop46.localhost"
 LOG_HOST="logs.loop46.localhost"
+FILES_HOST="files.loop46.localhost"
 PUBLIC_SUFFIX="loop46.localhost"
 PORT="${HTTP_ADDR##*:}"
 LOG_PORT="${LOG_ADDR##*:}"
+FILES_PORT="${FILES_ADDR##*:}"
 ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
 REPLAY_ORIGIN="https://replay.${PUBLIC_SUFFIX}:${PORT}"
 LOG_ORIGIN="https://${LOG_HOST}:${LOG_PORT}"
+FILES_ORIGIN="https://${FILES_HOST}:${FILES_PORT}"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
@@ -64,6 +68,7 @@ rm -rf "$DATA_DIR"
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
     --log-listen "$LOG_ADDR" \
+    --files-listen "$FILES_ADDR" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
@@ -81,7 +86,8 @@ ALICE_HOST="alice.${PUBLIC_SUFFIX}"
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
          --resolve "${ALICE_HOST}:${PORT}:127.0.0.1" \
          --resolve "replay.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
-         --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1")
+         --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1" \
+         --resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1")
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 
 ok() { echo "ok  $1"; }
@@ -92,22 +98,17 @@ fail() {
     exit 1
 }
 
-# Mint a fresh JWT against the worker's /_system/log-token endpoint
-# (cookie / bearer auth gate) and stash both the token and the public
-# log origin returned alongside it. Used by every log-server call
-# below — refresh on demand.
-mint_log_token() {
-    local resp
-    resp=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
-        "${ADMIN_ORIGIN}/_system/log-token")
-    JWT=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
-    LOG_BASE=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin)["log_url"])')
-}
-mint_log_token
-[[ -n "${JWT:-}" ]] || fail "mint_log_token: empty JWT"
+# Mint the services JWT against /_system/services-token. Returns
+# both log_url and files_url so the smoke can call each standalone
+# subdomain directly. ROVE_TOKEN drives the worker-side auth gate.
+ROVE_TOKEN="$TOKEN"
+. "$(dirname "$0")/_smoke_helpers.sh"
+mint_services_token
 [[ "${LOG_BASE}" == "${LOG_ORIGIN}" ]] || \
     fail "log_url mismatch: got '${LOG_BASE}', expected '${LOG_ORIGIN}'"
-ok "minted log JWT via /_system/log-token (log_url=${LOG_BASE})"
+[[ "${FILES_BASE}" == "${FILES_ORIGIN}" ]] || \
+    fail "files_url mismatch: got '${FILES_BASE}', expected '${FILES_ORIGIN}'"
+ok "minted services JWT via /_system/services-token (log=${LOG_BASE} files=${FILES_BASE})"
 
 # Standalone log-server's indexer polls every 500ms (loop46 default).
 # Each "did the record show up" check waits up to 12s.
@@ -184,14 +185,14 @@ export default function () {
 LIB_HASH=$(printf '%s' "$LIB_SRC" | sha256sum | awk '{print $1}')
 IDX_HASH=$(printf '%s' "$IDX_SRC" | sha256sum | awk '{print $1}')
 
-"${CURL[@]}" -H "Authorization: Bearer $TOKEN" -X PUT \
+"${CURL[@]}" -H "Authorization: Bearer $JWT" -X PUT \
     -H 'Content-Type: application/octet-stream' --data-binary "$LIB_SRC" \
-    "${ADMIN_ORIGIN}/_system/files/alice/blobs/${LIB_HASH}" >/dev/null
-"${CURL[@]}" -H "Authorization: Bearer $TOKEN" -X PUT \
+    "${FILES_BASE}/alice/blobs/${LIB_HASH}" >/dev/null
+"${CURL[@]}" -H "Authorization: Bearer $JWT" -X PUT \
     -H 'Content-Type: application/octet-stream' --data-binary "$IDX_SRC" \
-    "${ADMIN_ORIGIN}/_system/files/alice/blobs/${IDX_HASH}" >/dev/null
+    "${FILES_BASE}/alice/blobs/${IDX_HASH}" >/dev/null
 
-deploy_v2_resp=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" -X POST \
+deploy_v2_resp=$("${CURL[@]}" -H "Authorization: Bearer $JWT" -X POST \
     -H 'Content-Type: application/json' \
     -d "$(python3 -c "
 import json
@@ -203,7 +204,7 @@ print(json.dumps({
     'parent_id': '0000000000000001',
 }))
 ")" \
-    "${ADMIN_ORIGIN}/_system/files/alice/deployments")
+    "${FILES_BASE}/alice/deployments")
 echo "$deploy_v2_resp" | grep -q '"id":"0000000000000002"' || \
     fail "multi-file deploy v2 unexpected response: $deploy_v2_resp"
 ok "multi-file deploy compiled (sibling import resolved at compile time)"
@@ -252,16 +253,16 @@ ok "response body blob content round-trips"
 # ── 5. Historical deployment manifest ────────────────────────────
 NEW_IDX_SRC='export default function () { return "v3"; }'
 NEW_HASH=$(printf '%s' "$NEW_IDX_SRC" | sha256sum | awk '{print $1}')
-"${CURL[@]}" -H "Authorization: Bearer $TOKEN" -X PUT \
+"${CURL[@]}" -H "Authorization: Bearer $JWT" -X PUT \
     -H 'Content-Type: application/octet-stream' --data-binary "$NEW_IDX_SRC" \
-    "${ADMIN_ORIGIN}/_system/files/alice/blobs/${NEW_HASH}" >/dev/null
-"${CURL[@]}" -H "Authorization: Bearer $TOKEN" -X POST \
+    "${FILES_BASE}/alice/blobs/${NEW_HASH}" >/dev/null
+"${CURL[@]}" -H "Authorization: Bearer $JWT" -X POST \
     -H 'Content-Type: application/json' \
     -d "{\"files\":{\"index.mjs\":{\"hash\":\"${NEW_HASH}\",\"kind\":\"handler\"}},\"parent_id\":\"0000000000000002\"}" \
-    "${ADMIN_ORIGIN}/_system/files/alice/deployments" >/dev/null
+    "${FILES_BASE}/alice/deployments" >/dev/null
 
-v2=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
-    "${ADMIN_ORIGIN}/_system/files/alice/deployments/0000000000000002")
+v2=$("${CURL[@]}" -H "Authorization: Bearer $JWT" \
+    "${FILES_BASE}/alice/deployments/0000000000000002")
 echo "$v2" | python3 -c '
 import json, sys
 m = json.load(sys.stdin)
@@ -271,13 +272,13 @@ assert paths == ["index.mjs", "lib/util.mjs"], paths
 ' || fail "v2 historical manifest content mismatch"
 ok "historical deployment manifest by hex id"
 
-status=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" -o /dev/null -w "%{http_code}" \
-    "${ADMIN_ORIGIN}/_system/files/alice/deployments/0000000000000099")
+status=$("${CURL[@]}" -H "Authorization: Bearer $JWT" -o /dev/null -w "%{http_code}" \
+    "${FILES_BASE}/alice/deployments/0000000000000099")
 [[ "$status" == "404" ]] || fail "missing deployment → $status (expected 404)"
 ok "missing deployment id → 404"
 
-status=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" -o /dev/null -w "%{http_code}" \
-    "${ADMIN_ORIGIN}/_system/files/alice/deployments/notHex")
+status=$("${CURL[@]}" -H "Authorization: Bearer $JWT" -o /dev/null -w "%{http_code}" \
+    "${FILES_BASE}/alice/deployments/notHex")
 [[ "$status" == "400" ]] || fail "invalid hex deployment id → $status (expected 400)"
 ok "invalid hex deployment id → 400"
 

@@ -51,11 +51,20 @@ rm -rf "$DATA_DIR"
 # Tiny capacities + zero refill so a few requests exhaust the bucket
 # and it stays exhausted for the duration of the test (no flakes from
 # wall-clock-driven refills landing mid-sequence).
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8223}"
+LOG_ADDR="${LOG_ADDR:-127.0.0.1:8222}"
+FILES_PORT="${FILES_ADDR##*:}"
+LOG_PORT="${LOG_ADDR##*:}"
+FILES_HOST="files.${PUBLIC_SUFFIX}"
+LOG_HOST="logs.${PUBLIC_SUFFIX}"
+
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
+    --log-listen "$LOG_ADDR" \
+    --files-listen "$FILES_ADDR" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
@@ -76,9 +85,15 @@ sleep 1.2
 
 RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
          --resolve "rl1.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
-         --resolve "rl2.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1")
+         --resolve "rl2.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
+         --resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
+         --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1")
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 AUTH=(-H "Authorization: Bearer $TOKEN")
+
+ROVE_TOKEN="$TOKEN"
+. "$(dirname "$0")/_smoke_helpers.sh"
+mint_services_token
 
 ok() { echo "ok  $1"; }
 fail() {
@@ -93,10 +108,10 @@ put_file() {
     local instance="$1" path="$2" body="$3"
     local code
     code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
-        -X PUT "${AUTH[@]}" \
+        -X PUT -H "Authorization: Bearer $JWT" \
         -H "Content-Type: application/javascript" \
         --data-binary "$body" \
-        "${ADMIN_ORIGIN}/_system/files/${instance}/file/${path}")
+        "${FILES_BASE}/${instance}/file/${path}")
     [[ "$code" == "201" ]] || fail "PUT ${instance}/${path}: got $code"
 }
 
