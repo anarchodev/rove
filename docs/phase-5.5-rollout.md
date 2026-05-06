@@ -84,7 +84,7 @@ multi-node gap (replay-after-failover).
 **Sub-plan**: PLAN §3 Phase 5.5 (b) is the spec; no separate
 sub-plan because the work is contained.
 
-### 2. Webhook subsystem — **in progress (steps 1–3 done 2026-05-05)**
+### 2. Webhook subsystem — **in progress (steps 1–4 done 2026-05-06)**
 
 - **Step 1 — done.** `src/webhook_server/root.zig` ships: `WebhookRow`,
   `WebhookStore` (kv-backed at `{data_dir}/webhooks.db`), apply
@@ -123,13 +123,26 @@ sub-plan because the work is contained.
   invoked the customer's `onResult` handler. Lease columns reserved
   for cross-leader handover; v1 uses an in-memory in-flight set
   during a single leader's tenure.
+- **Step 4 — done.** CLI flag `--webhook-path drainer|direct`
+  (default `drainer`) plumbs through `WorkerConfig.webhook_path` →
+  `Worker.webhook_path` → worker_dispatch's per-batch `pending_webhooks`
+  accumulator (allocated only in direct mode). `webhook.send` branches
+  on `state.pending_webhooks`: direct → extract a `WebhookRow` from
+  the JSON envelope and append (no `_outbox/{id}` write); drainer →
+  legacy path. `finalizeBatch` proposes via the new
+  `raft_propose.proposeBatchAndWebhooks` helper which picks: both →
+  type-7 multi (env 0 + env 4); writes only → bare env 0; webhooks
+  only → bare env 4. Customer response still gated on raft commit so
+  both halves are durable cluster-wide before the user sees 200.
+  Smoke (`scripts/webhook_direct_smoke.sh`): exercises the cbfire
+  handler that does `kv.set` + `webhook.send`, verifies env 0 +
+  env 4 + envelope 5 + callback all fire, and that `_outbox/*` is
+  empty under direct mode. Per-handler savepoint discipline for the
+  accumulator mirrors the existing flat writeset shape — neither has
+  per-savepoint rollback; the plan's "structurally identical" framing
+  documents this.
 - Remaining steps (per webhook-server-plan.md §7):
-  4. **Dispatcher cutover** (next) — `webhook.send` accumulates per-handler
-     into a webhook batch on the dispatch state. Combined propose
-     at handler-batch commit emits a multi-envelope (type 7)
-     containing envelope 0 (writeset) + envelope 4 (webhook batch).
-     Behind feature flag `webhook.path = drainer | direct`.
-  5. **Cut over to `direct`** in dev, run all webhook smokes,
+  5. **Cut over to `direct`** (next) in dev, run all webhook smokes,
      verify `_outbox/*` empty during steady state.
   6. **Drop the feature flag** + **delete `src/outbox/drainer.zig`**.
 
