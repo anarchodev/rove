@@ -1,101 +1,99 @@
 # Webhook-server plan — consolidated, raft-backed delivery subsystem
 
-This document expands `docs/PLAN.md` §2.6 (Webhooks/outbox) and
-Phase 5.5 item 4 (Centralized webhook subsystem) into an
-implementable plan. It promotes PLAN's "leader-local
-`_webhooks.db` in v1, raft-replicate later" decision to **raft-
-replicated from day one** because the user's north-star is keeping
-the worker kv path fast and consistent — and a leader-local
-webhook db forces a recovery scan across every tenant's app.db on
-leader change, which is exactly the per-tenant scan cost we're
-trying to eliminate.
+This document expands `docs/PLAN.md` §2.6 (Webhooks) and Phase 5.5
+item 4 (Centralized webhook subsystem) into an implementable plan.
 
 The motivating framing:
 
 - **Webhooks need strong durability + consistency.** Once a customer's
-  `webhook.send()` returns, the platform owes "delivered or terminally
-  failed with a callback." This guarantee can't lean on best-effort
-  storage.
-- **Per-tenant outbox alone forces 10k-SQLite-scans-per-tick at
-  scale.** Today's drainer scans every tenant's `_outbox/*` every
-  tick, mostly empty. Doesn't scale.
+  `webhook.send()` returns, the platform owes "delivered or
+  terminally failed with a callback." This guarantee can't lean on
+  best-effort storage.
+- **Per-tenant outbox + drainer doesn't scale.** Today's drainer
+  scans every tenant's `_outbox/*` every tick, mostly empty. At 10k
+  tenants that's ~40k SQLite open+scan ops/sec.
 - **Consolidated webhook state, raft-replicated.** A single
   `webhooks.db` (cluster-wide, not per-tenant) holds every pending
   webhook across every tenant, replicated through raft so any node
   can become webhook-leader on failover with zero scan cost.
-- **Per-tenant `_outbox/` is the transactional handoff point only.**
-  It exists for the brief window between handler commit and
-  handoff-to-webhook-server. Steady-state, customer's app.db carries
-  no webhook state.
+- **No per-tenant `_outbox/` row at all.** The customer handler's
+  `webhook.send` calls accumulate in the dispatcher's per-handler
+  state (alongside the writeset). At commit time the dispatcher
+  proposes the writeset envelope AND the webhook-enqueue envelope
+  in **the same raft entry**, so by the time the customer response
+  returns (gated on raft commit), webhooks.db already holds the
+  pending row durably across the cluster. There is nothing to
+  recover, nothing to drain, nothing to forward.
 
 What stays from today: the JS API (`webhook.send`), the
 X-Rove-Webhook-Id at-least-once contract, the `onResult` handler
 dispatch from `_callback/{id}` rows, the SSRF guards. What changes:
-the storage layer for in-flight webhooks (per-tenant → consolidated)
-and the delivery loop's location (worker drainer thread → dedicated
-webhook-server process).
+in-flight webhook state moves from per-tenant `_outbox/*` to
+cluster-wide `webhooks.db`; the delivery loop moves from the
+worker's drainer thread to a leader-pinned webhook-server thread;
+the drainer goes away entirely.
 
 ---
 
 ## 1. Architecture
 
-**Webhook-server is a leader-pinned thread inside the loop46
-binary, NOT a separate process.** Unlike files-server / log-server
-/ sse-service — which can be separate processes (and even separate
-machines) because their state lives in S3 and they don't
-participate in raft — webhook-server **does** participate in raft:
-it reads `webhooks.db` (raft-replicated), proposes envelopes
-4/5/6, and is leader-pinned by definition. Crossing a process
-boundary would force RPC for raft proposes, file-share or
-learner-replication for `webhooks.db` access, and would re-
-introduce the very plumbing the consolidation was supposed to
-eliminate.
+**Webhook-server is a leader-pinned thread inside the loop46 binary,
+NOT a separate process.** Unlike files-server / log-server /
+sse-service — which can be separate processes (and even separate
+machines) because their state lives in S3 and they don't participate
+in raft — webhook-server **does** participate in raft: it reads
+`webhooks.db` (raft-replicated), proposes envelopes 5/6, and is
+leader-pinned by definition. Crossing a process boundary would
+force RPC for raft proposes, file-share or learner-replication for
+`webhooks.db` access, and would re-introduce the very plumbing the
+consolidation was supposed to eliminate.
 
-The architectural rule that emerges and is worth carrying
-forward to other future subsystems:
+The architectural rule that emerges and is worth carrying forward
+to other future subsystems:
 
 > **Subsystems that participate in raft live in the loop46 binary.
 > Subsystems that don't can be split into their own processes /
 > machines.**
 
-The thread runs **only on the raft leader** (same pattern as today's
-drainer), guaranteeing a single delivery loop per cluster without
-any election protocol of its own. Leader failover starts the thread
-on the new leader's loop46 binary; it opens the local `webhooks.db`
-(already populated via raft replication) and resumes processing.
+The thread runs **only on the raft leader**, guaranteeing a single
+delivery loop per cluster without any election protocol of its own.
+Leader failover starts the thread on the new leader's loop46
+binary; it opens the local `webhooks.db` (already populated via
+raft replication) and resumes processing.
 
 ```
 ┌─── leader node — loop46 binary ────────────────────────────────────┐
 │                                                                    │
 │  ┌──────────────┐    customer handler runs                         │
-│  │   worker     │    TrackedTxn writes customer kv ops +           │
-│  │   thread(s)  │    _outbox/{webhook_id}                          │
-│  │              │    raft commit (envelope 0) ──┐                  │
-│  │              │                                │                  │
-│  │              │    in-process queue push ──┐   │                  │
-│  └──────────────┘                            │   │                  │
-│                                              ▼   ▼                  │
-│                              ┌──────────────────────────────┐      │
-│                              │ webhook-server thread         │      │
-│                              │  (leader-pinned)              │      │
-│                              │  - in-process queue receiver  │      │
-│                              │  - raft proposer (local)      │      │
-│                              │  - delivery loop              │      │
-│                              └──────────┬───────────────────┘      │
-│                                         │ POST customer URL         │
-│                                         ▼                           │
-│                              ┌─────────────────────┐                │
-│                              │ customer's webhook  │                │
-│                              │ receiver            │                │
-│                              └─────────────────────┘                │
+│  │   worker     │    TrackedTxn accumulates writeset               │
+│  │   thread(s)  │    webhook.send() accumulates webhook batch      │
+│  │              │    on commit: propose ONE raft entry             │
+│  │              │      = envelope 0 (writeset)                     │
+│  │              │      + envelope 4 (webhook_enqueue batch)        │
+│  │              │    response returned after raft commit           │
+│  └──────────────┘                                                  │
 │                                                                    │
 │              raft apply hooks ▼                                    │
 │              ┌─────────────────────────────┐                       │
+│              │ tenant app.db (envelope 0)  │                       │
 │              │ data_dir/webhooks.db        │                       │
-│              │  (read by webhook-server    │                       │
-│              │   thread; written via       │                       │
-│              │   envelope-4/5/6 apply)     │                       │
+│              │   (envelope 4 INSERT)       │                       │
 │              └─────────────────────────────┘                       │
+│                       ▲                                            │
+│                       │ envelope 5/6 proposed by webhook-server    │
+│  ┌─────────────────────────────────┐                               │
+│  │ webhook-server thread           │ reads webhooks.db             │
+│  │  (leader-pinned)                │ POSTs customer URLs           │
+│  │  - delivery loop                │ proposes envelope 5 on done   │
+│  │  - retry scheduler              │ proposes envelope 6 on retry  │
+│  │  - raft proposer (local)        │                               │
+│  └─────────────────────────────────┘                               │
+│                       │ POST customer URL                          │
+│                       ▼                                            │
+│              ┌─────────────────────┐                               │
+│              │ customer's webhook  │                               │
+│              │ receiver            │                               │
+│              └─────────────────────┘                               │
 │                                                                    │
 │  (Other subsystems that DON'T participate in raft —                │
 │   rove-files-server, rove-log-server, rove-sse-service —           │
@@ -113,15 +111,19 @@ on the new leader's loop46 binary; it opens the local `webhooks.db`
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-Two flow paths, neither on the customer-response hot path:
+Two flow paths:
 
-1. **Handoff (worker → webhook-server → raft):** worker pushes the
-   new outbox row into webhook-server's in-process queue (a Zig
-   function call — no HTTP, no auth, no serialization, no network).
-   Webhook-server proposes envelope 4 (`webhook_enqueue`) through
-   the local raft node; raft commits + applies on every node;
-   webhook-server signals the worker's callback that the handoff
-   is durable.
+1. **Enqueue (worker → raft):** the worker dispatcher accumulates
+   `webhook.send` calls during handler execution into a per-handler
+   list (parallel to the kv writeset). On savepoint release, the
+   list moves into the batch's webhook accumulator. On batch
+   commit, the dispatcher proposes a single raft entry carrying
+   envelope 0 (merged writeset across handlers) AND envelope 4
+   (webhook batch). Apply on every node is sequential within the
+   entry: writeset to tenant app.db, then webhook-batch INSERT into
+   `webhooks.db`. The customer response is gated on raft commit, so
+   by the time the user sees the response, both writes are durable
+   cluster-wide.
 2. **Completion (webhook-server → raft → apply on every node):**
    webhook-server's delivery loop attempts the customer URL; on
    terminal outcome it proposes envelope 5 (`webhook_complete`)
@@ -129,19 +131,12 @@ Two flow paths, neither on the customer-response hot path:
    atomically:
    - removes the row from `webhooks.db`
    - writes `_callback/{id}` into tenant's `app.db`
-   - deletes `_outbox/{id}` from tenant's `app.db` (idempotent if
-     worker already deleted it)
-   The customer's existing `dispatchCallbacks` worker phase fires the
-   `onResult` handler from the `_callback/` row — running on the
-   leader, since that's where workers run.
+   The customer's existing `dispatchCallbacks` worker phase fires
+   the `onResult` handler from the `_callback/` row — running on
+   the leader, since that's where workers run.
 
-**The drainer becomes a tiny safety net.** Its only job is "did
-some `_outbox/{id}` row exist for more than N seconds without a
-matching `webhooks.db` entry?" If so, the worker crashed before its
-in-process push to webhook-server completed; drainer re-pushes
-(also in-process, same Zig function). webhook-server's idempotency
-check (envelope 4 with same webhook_id is a no-op if already
-enqueued) handles dupes safely.
+**There is no drainer.** No per-tenant scan, no orphan recovery, no
+re-forward path. The propose IS the handoff.
 
 ---
 
@@ -151,9 +146,14 @@ enqueued) handles dupes safely.
 
 | Data | Where | Lifetime | Why |
 |---|---|---|---|
-| `_outbox/{id}` | tenant `app.db`, envelope 0 | ms (steady state); seconds-to-minutes if webhook-server lags | Transactional with kv writes; transient handoff |
-| `webhooks.db` rows | cluster-wide `data_dir/webhooks.db`, envelopes 4+5 | Until delivered or terminally failed | Consolidated authoritative state, raft-replicated |
+| `webhooks.db` rows | cluster-wide `data_dir/webhooks.db`, envelopes 4/5/6 | Until delivered or terminally failed | Consolidated authoritative state, raft-replicated |
 | `_callback/{id}` | tenant `app.db`, envelope 5 | Until customer's `onResult` runs and worker deletes | Triggers customer onResult dispatch |
+
+Notable: **no `_outbox/{id}` in tenant app.db**, no
+`_outbox_inflight/{id}`, no `_dlq/{id}`. Failed webhooks live in
+`webhooks.db` as `state = 'failed_pending_callback'` until the
+callback fires; the consolidated db replaces all three per-tenant
+prefixes.
 
 `webhooks.db` is **cluster-wide** — one file per node, all replicated
 to identical state via raft. Workers don't open `webhooks.db`
@@ -188,38 +188,71 @@ CREATE INDEX webhooks_tenant ON webhooks (tenant_id);
 ```
 
 The `inflight_lease_ns` + `inflight_leader_term` columns let the
-delivery loop take a lease before attempting (so a leader-failover
-mid-delivery doesn't double-fire). Lease duration = max delivery
+delivery loop detect stale leases across leader failover (the old
+leader can't have completed delivery if it lost leadership before
+its envelope-5 propose committed). Lease duration = max delivery
 timeout × small fudge factor.
 
-### 2.3 New raft envelope types
+### 2.3 Multi-envelope raft entries
 
-**Type 4: `webhook_enqueue`**
+Today's raft entries carry one envelope each. To propose envelope 0
+(writeset) + envelope 4 (webhook batch) atomically, the entry
+payload becomes a length-prefixed sequence of envelopes:
 
-Payload (after the type byte + standard envelope header):
+```
+entry payload := count:u8 || (envelope_type:u8 || envelope_len:u32 || envelope_bytes){count}
+```
+
+Apply iterates envelopes in order; each one routes to its target
+DB (tenant app.db, webhooks.db, root.db, etc.) via the existing
+type dispatch. A single follower transaction per target DB covers
+the per-DB writes; cross-DB atomicity is via raft entry boundary
+(both apply or neither does).
+
+Backwards compat for callers that still propose a single envelope:
+`count = 1` with the old envelope-bytes layout. The wire change is
+adding the count prefix; existing single-envelope callers update to
+write `count = 1`.
+
+### 2.4 New raft envelope types
+
+**Type 4: `webhook_enqueue_batch`**
+
+Payload (after the type byte + standard envelope header) is a
+length-prefixed sequence of webhook rows:
 
 ```
 {
   "v": 1,
-  "webhook_id": "<64-hex>",
-  "tenant_id": "acme",
-  "url": "...",
-  "method": "POST",
-  "headers": { ... },
-  "body": "<base64-or-binary>",
-  "max_attempts": 10,
-  "timeout_ms": 30000,
-  "retry_on": [...],
-  "context": { ... },
-  "on_result_path": "stripe/charge_result",
-  "enqueued_at_ns": 1730764800000000000
+  "rows": [
+    {
+      "webhook_id": "<64-hex>",
+      "tenant_id": "acme",
+      "url": "...",
+      "method": "POST",
+      "headers": { ... },
+      "body": "<base64-or-binary>",
+      "max_attempts": 10,
+      "timeout_ms": 30000,
+      "retry_on": [...],
+      "context": { ... },
+      "on_result_path": "stripe/charge_result",
+      "enqueued_at_ns": 1730764800000000000
+    },
+    ...
+  ]
 }
 ```
 
-Apply on every node: `INSERT OR IGNORE INTO webhooks (...) VALUES (...)`
-into `webhooks.db`. The `OR IGNORE` makes the apply idempotent — a
-duplicate envelope (e.g., from a re-fire after restart) is a no-op.
-Initial state = 'pending', `next_attempt_at_ns` = `enqueued_at_ns`.
+Apply on every node: `INSERT OR IGNORE INTO webhooks (...)` for
+each row, into `webhooks.db`. The `OR IGNORE` makes the apply
+idempotent — a duplicate entry (e.g., from raft entry redelivery
+during recovery) is a no-op. Initial state = `'pending'`,
+`next_attempt_at_ns` = `enqueued_at_ns`.
+
+Webhook ids are deterministic (`hash(request_id || call_index)`)
+so replay of the same request produces the same id; idempotency
+covers the rare cases where a raft entry gets re-applied.
 
 **Type 5: `webhook_complete`**
 
@@ -240,95 +273,100 @@ Payload:
 }
 ```
 
-Apply on every node, in one SQLite transaction across BOTH
+Apply on every node, in one logical transaction across BOTH
 `webhooks.db` AND tenant's `app.db`:
 
 1. `DELETE FROM webhooks WHERE webhook_id = ?` (in `webhooks.db`)
 2. `INSERT OR REPLACE INTO kv (key, value) VALUES ('_callback/{id}', serialize(result))` (in tenant `app.db`)
-3. `DELETE FROM kv WHERE key = '_outbox/{id}'` (in tenant `app.db`,
-   idempotent — usually already deleted)
 
-The cross-db atomicity is fine because both are local-file SQLite
-opens on the same node; the apply uses ATTACH or just sequential
-commits with a try-except wrapper to roll back. (Pure SQLite
-multi-db transaction support via ATTACH gives single-tx semantics.)
+The cross-db atomicity uses ATTACH (`ATTACH 'app.db' AS tenant_db; BEGIN; UPDATE webhooks ...; UPDATE tenant_db.kv ...; COMMIT;`)
+or sequential commits with idempotent retry on partial failure.
+Envelope 5 apply is idempotent (DELETE is a no-op on missing row;
+INSERT OR REPLACE on `_callback/{id}` is idempotent), so retry is
+safe.
 
-### 2.4 Per-tenant `_outbox/{id}` shape
+**Type 6: `webhook_retry_schedule`**
 
-Unchanged from today. The row exists as the transactional handoff;
-its content mirrors what gets serialized into the type 4 envelope.
+Payload:
+
+```
+{
+  "v": 1,
+  "webhook_id": "<64-hex>",
+  "attempts": 2,
+  "next_attempt_at_ns": 1730764920000000000
+}
+```
+
+Apply: `UPDATE webhooks SET attempts = ?, next_attempt_at_ns = ?,
+state = 'pending', inflight_lease_ns = NULL WHERE webhook_id = ?`.
+Used by the delivery loop after a retryable failure to push the
+row's next attempt into the future.
 
 ---
 
 ## 3. Worker integration
 
-### 3.1 webhook.send binding (unchanged)
+### 3.1 webhook.send binding
 
 Customer's JS handler calls `webhook.send({...})` exactly as today.
-Binding builds the outbox row and appends to TrackedTxn.
+Binding builds the outbox row and appends to a **per-handler
+webhook accumulator** on the dispatch state, NOT to the kv
+writeset. The accumulator is parallel to the writeset: each
+contributes to the same final propose, but they live in distinct
+data structures because their destinations are distinct
+(tenant app.db vs webhooks.db).
 
-### 3.2 New worker phase: pumpWebhooksForResponse
+### 3.2 Per-handler savepoint + commit
 
-After kv commit confirms (raft commit, envelope 0), scan the writeset
-for newly-written `_outbox/*` keys. For each:
+Within a per-tenant batch, each handler runs under a SAVEPOINT.
+On successful release, both the handler's writeset rows AND its
+webhook accumulator entries are merged into the batch's combined
+state. On rollback (handler threw), both are discarded.
 
-```
-fire-and-forget POST to webhook-server /v1/accept:
-  body = serialize(outbox_row)
-  timeout = 1s
-on response:
-  204:    log success; optionally fire a follow-up kv writeset to
-          delete _outbox/{id} (fast-path cleanup; not strictly needed
-          since envelope 5 apply also deletes it)
-  4xx/5xx/timeout: log; do nothing — drainer will retry
-```
+This means the abort case is structurally identical to today's
+`_outbox/*` model: a handler that calls `webhook.send` and then
+throws produces no committed kv writes AND no enqueued webhook,
+because neither the writeset nor the webhook batch reached the
+propose.
 
-Implementation: per-worker h2 client connection to webhook-server,
-parking the POST in a `webhook_emit_pending` queue (mirrors the SSE
-emit POST pattern). Worker's tick drains the queue independently of
-request response timing.
+### 3.3 Combined propose at batch commit
 
-**Worker never blocks the customer's response on the webhook-server
-POST.**
+After all handlers in the per-tenant batch have run, the dispatcher
+proposes ONE raft entry carrying:
 
-### 3.3 Drainer simplification
+- envelope 0 = the merged kv writeset (all handlers' kv changes),
+  which may be empty if no handler wrote
+- envelope 4 = the merged webhook batch (all handlers' webhook
+  enqueues), which may be empty if no handler called webhook.send
 
-The current `src/outbox/drainer.zig` does heavy work: scans every
-tenant's `app.db` every tick, makes HTTP calls, computes retries,
-writes results. After this change:
+Empty envelopes are skipped — if the batch produced only kv writes,
+only envelope 0 ships; if only webhook calls, only envelope 4. The
+common mixed case ships both in one raft entry.
 
-- Drainer no longer makes HTTP calls. webhook-server owns delivery.
-- Drainer no longer computes retry timing. webhook-server owns the
-  schedule.
-- Drainer's only job: periodic scan of `_outbox/*` rows older than
-  threshold (~5s — longer than worker→webhook-server round trip).
-  For each: re-POST to webhook-server `/v1/accept`. Idempotent
-  envelope 4 apply makes this safe.
-- Optional further optimization: maintain a leader-local index of
-  "tenants with non-zero outbox count" so the drainer scans only
-  active tenants. Adds an apply hook to maintain the index. Defer
-  unless the unbounded scan starts costing.
+The customer-response gate is unchanged: response returns to the
+user after raft commit. Because the entry is atomic, both the kv
+writes and the webhook enqueues are durable cluster-wide by the
+time the user sees a response.
 
-### 3.4 What about workers vs webhook-server geometry?
+### 3.4 What the worker does NOT do
 
-**Workers** are stateless wrt webhooks beyond firing the accept POST
-and apply path. Run on every node.
+- **No drainer.** No periodic scan of any kv prefix.
+- **No `_outbox/{id}` writes.** Webhook state never lives in tenant
+  app.db.
+- **No HTTP delivery from worker.** webhook-server owns all outbound
+  HTTP.
+- **No retry timing.** webhook-server owns the schedule.
+- **No `pumpWebhooksForResponse` phase.** The propose in §3.3 IS the
+  handoff; nothing further is needed.
 
-**Webhook-server** is one process per cluster (with HA via active-
-backup LB later). It owns the delivery loop. The leader of the
-delivery loop is whichever webhook-server replica currently holds
-the inflight lease for each row — naturally serialized via the
-lease columns in `webhooks.db`.
+### 3.5 Callback dispatch (unchanged)
 
-Worker's accept POST can land on any webhook-server replica (LB
-round-robins). The replica that received it proposes envelope 4 to
-the raft leader (raft handles forwarding if not the leader). Apply
-hits every node's `webhooks.db`.
-
-Webhook-server's delivery loop runs on whichever replica is willing
-to take the lease. With single replica, that's just "the one process";
-with multi-replica, the active-backup LB or a simple lease lottery
-picks one.
+When envelope 5 applies (webhook completed), `_callback/{id}`
+appears in the tenant's app.db. The existing `dispatchCallbacks`
+worker phase reads `_callback/*` rows, runs the customer's
+`onResult` handler in a fresh transaction, and deletes the row on
+success. This path is unchanged.
 
 ---
 
@@ -341,58 +379,34 @@ per cluster guaranteed by raft leader uniqueness.
 
 ### 4.1 Process model
 
-- **Same binary as the worker.** No new binary, no new
-  operational artifact. Justified because webhook-server
-  participates in raft (reads webhooks.db, proposes envelopes,
-  leader-pinned by definition); separating across a process
-  boundary would force RPC for proposes and file-share for
-  webhooks.db reads — the very plumbing the consolidation was
-  supposed to avoid.
-- **In-process queue API for worker handoffs.** Worker threads in
-  the same binary push outbox rows via a Zig function call — no
-  HTTP, no serialization, no auth.
+- **Same binary as the worker.** No new binary, no new operational
+  artifact. Justified because webhook-server participates in raft
+  (reads webhooks.db, proposes envelopes, leader-pinned by
+  definition); separating across a process boundary would force
+  RPC for proposes and file-share for webhooks.db reads.
 - **No HTTP listener at all.** Webhook-server's only network
-  presence is its outbound HTTPS client (for customer URL delivery).
-- **Raft proposer.** Webhook-server proposes envelopes 4 / 5 / 6
+  presence is its outbound HTTPS client (for customer URL
+  delivery).
+- **No accept API for workers.** The worker proposes envelope 4
+  directly via the local raft proposer; webhook-server learns of
+  new rows by watching `webhooks.db` (or by being signalled from
+  the apply path on envelope-4 commit).
+- **Raft proposer.** Webhook-server proposes envelopes 5 and 6
   through the local raft node — same in-process raft client every
-  other proposer uses (apply path, drainer, etc.).
-- **Outbound HTTPS client** for delivery. Reuses the existing
-  `src/outbox/ssrf.zig` guards (factored out of the drainer).
+  other proposer uses.
+- **Outbound HTTPS client** for delivery. Reuses the SSRF guards
+  factored out of the old drainer.
 - **Reads `webhooks.db`** directly via a local SQLite handle.
-  Writes only via envelope proposals (which apply through raft, like
-  every other write to a raft-replicated db).
+  Writes only via envelope proposals.
 
-### 4.2 No HTTP endpoints
+### 4.2 Apply-side wakeup
 
-Webhook-server's API surface to the rest of the loop46 binary is a
-single Zig module function:
+When envelope 4 applies on the leader, the apply path signals
+webhook-server (a condvar / eventfd) so it doesn't have to poll.
+Followers also apply envelope 4 but their webhook-server thread is
+idle, so the wakeup is a no-op there.
 
-```
-webhook_server.enqueue(tenant_id, webhook_id, row) -> Future<Result>
-```
-
-That's it. The only HTTP webhook-server speaks is the outbound POSTs
-to customer URLs.
-
-### 4.3 Accept flow
-
-```
-webhook_server.enqueue(tenant_id, webhook_id, row):
-  if not currently raft leader: return error.NotLeader (caller logs;
-                                drainer's safety net handles it)
-  build envelope 4 (webhook_enqueue) from the row
-  propose envelope 4 through the local raft node
-  on raft commit: signal success to the caller's future
-  on raft propose failure: signal failure
-                           caller logs; drainer will retry
-```
-
-A Zig function returning a future that resolves on raft commit. No
-HTTP framing, no JSON parsing on the inbound side, no auth check.
-The only serialization that happens is building the envelope payload
-to hand to the raft proposer.
-
-### 4.4 Delivery loop
+### 4.3 Delivery loop
 
 ```
 loop forever:
@@ -403,79 +417,67 @@ loop forever:
     LIMIT N
 
   for each row:
-    take lease: propose a small "lease" envelope
-                (or update inflight_lease_ns inline via envelope 5 variant)
-    [v1: simpler — single replica, lease is just an in-memory mark]
+    take lease (in-memory mark + propose-when-needed if multi-replica)
 
     POST row.url with row.method, row.headers + X-Rove-Webhook-Id,
          row.body, timeout = row.timeout_ms
 
     if 2xx:
       propose envelope 5 (webhook_complete, outcome=delivered)
-      → raft commits → apply on every node (removes from webhooks.db,
-         writes _callback/, deletes _outbox/)
+      → raft commits → apply removes from webhooks.db,
+                       writes _callback/ to tenant app.db
     elif retryable AND attempts+1 < max_attempts:
       compute next_attempt_at_ns = now + backoff
-      propose envelope 5b "webhook_retry_schedule" (or update via 4 variant)
-      → raft commits → apply updates the row's attempts + next_attempt_at_ns
+      propose envelope 6 (webhook_retry_schedule)
+      → raft commits → apply updates row's attempts + next_attempt_at_ns
     else (terminal failure):
       propose envelope 5 (webhook_complete, outcome=failed)
 
-  if no rows ready: sleep until next deadline or wakeup signal
+  if no rows ready: wait on apply-side wakeup or next deadline
 ```
 
-The "envelope 5b" for retry-schedule could either be a third type or
-a discriminated variant of envelope 5. Slight schema choice; either
-works. Probably make it envelope 6 = `webhook_retry_schedule` for
-clarity.
-
-### 4.5 Failover via raft leader change
+### 4.4 Failover via raft leader change
 
 Because webhook-server is a leader-pinned thread, "failover" is just
 "the raft leader changed." The previous leader's webhook-server
 thread shuts down (it sees the leadership-loss signal); the new
-leader's webhook-server thread starts (it sees the leadership-acquired
-signal). The new thread opens the local `webhooks.db` (already in
-sync via raft replication) and resumes processing.
+leader's webhook-server thread starts (it sees the
+leadership-acquired signal). The new thread opens the local
+`webhooks.db` (already in sync via raft replication) and resumes
+processing.
 
 The lease columns (`inflight_lease_ns`, `inflight_leader_term`)
 remain useful for one specific case: a row was being delivered when
-the old leader lost leadership. The new leader's first sweep of
-`webhooks.db` checks the lease — if `inflight_leader_term < current_term`,
-the lease is stale (the old leader can't have completed the delivery
+the old leader lost leadership. The new leader's first sweep
+checks the lease — if `inflight_leader_term < current_term`, the
+lease is stale (the old leader can't have completed delivery
 because it lost leadership before that propose-cycle). Treat as
 unleased and re-attempt. The customer URL receives a duplicate
 delivery; X-Rove-Webhook-Id dedup contract handles it.
 
-No "multi-replica with active-backup LB" because there's never more
-than one webhook-server thread active — the raft leader is unique by
-construction.
+### 4.5 Backpressure / pacing
 
-### 4.6 Backpressure / pacing
+Per-instance `webhook_attempt` rate limit (PLAN §2.10) lives in
+webhook-server's delivery loop — same token bucket, checked before
+each POST attempt. Tenant exceeding budget gets its row deferred
+(`next_attempt_at_ns` = now + 1s).
 
-Per-instance `webhook_attempt` rate limit (PLAN §2.10) moves from
-the drainer to webhook-server's delivery loop — same token bucket,
-checked before each POST attempt. Tenant exceeding budget gets its
-row deferred (`next_attempt_at_ns` = now + 1s).
+Per-destination-URL rate-limit / circuit-breaker is a v2 feature.
 
-Per-destination-URL rate-limit / circuit-breaker is a v2 feature
-(PLAN §8.5 in webhook-server-plan original).
-
-### 4.7 Crash recovery
+### 4.6 Crash recovery
 
 The loop46 process crashing on the leader → raft elects a new
 leader → the new leader's loop46 process spawns the webhook-server
 thread → that thread opens `webhooks.db` (durable on local disk,
-in-sync via raft) and sees all pending rows → resumes delivery loop
-from `WHERE state = 'pending'`. **Zero scan of tenant app.db
+in-sync via raft) and sees all pending rows → resumes delivery
+loop from `WHERE state = 'pending'`. **Zero scan of tenant app.db
 needed** — the consolidated `webhooks.db` IS the recovery state.
 
-This is the entire reason the user pushed for raft-replicated
-webhook state: leader failover is O(1) instead of O(num_tenants).
-
-If the loop46 process crashes on a *non-leader* node, webhook-server
-isn't running there anyway, so there's nothing to recover for the
-webhook subsystem specifically — just the normal worker recovery.
+Worker-side crash recovery is also trivial: any in-flight webhook
+batch that didn't reach raft propose is lost along with the
+handler's writeset. The customer either saw an error response (and
+will retry) or never sees a response at all (request died with the
+worker). Either way, no half-committed state on the platform side.
 
 ---
 
@@ -483,10 +485,9 @@ webhook subsystem specifically — just the normal worker recovery.
 
 ### 5.1 Worker → webhook-server
 
-No auth needed. The handoff is an in-process Zig function call; the
-caller and callee share the same process address space and there's
-no trust boundary to cross. (Workers only run on the leader, as
-does webhook-server, so there's no cross-node case.)
+No auth needed. There is no worker → webhook-server call. Workers
+propose envelope 4 directly via the local raft proposer; webhook-
+server reads from the locally-applied `webhooks.db`.
 
 ### 5.2 Webhook-server → customer URL
 
@@ -505,80 +506,89 @@ No change.
 
 ### 6.1 Removed
 
-- The drainer's HTTP delivery code path. Webhook-server owns all
+- **`src/outbox/drainer.zig` entirely.** No replacement. There is
+  nothing to drain.
+- The per-tenant `_outbox/{id}` storage shape. No row ever exists
+  in tenant app.db.
+- The `_outbox_inflight/{id}` lease pattern. Replaced by
+  `inflight_lease_ns` columns in `webhooks.db`.
+- The drainer's HTTP delivery code path. webhook-server owns all
   HTTP-out.
-- The drainer's retry-timing logic. Webhook-server owns the
-  schedule.
-- The `_outbox_inflight/{id}` lease pattern in tenant app.db.
-  Replaced by `inflight_lease_ns` columns in `webhooks.db`.
-- The drainer's per-tenant SQLite-open-and-scan-all-tenants pattern.
-  Drainer becomes a thin re-POST-orphan loop.
+- The drainer's retry-timing logic. webhook-server owns the schedule.
+- The `_dlq/{id}` per-tenant prefix. Failed webhooks live in
+  `webhooks.db` as `state = 'failed_pending_callback'` until the
+  callback fires.
 
 ### 6.2 Changed
 
-- `src/outbox/drainer.zig` shrinks to ~50-100 lines: periodic scan
-  of `_outbox/*` rows older than threshold, re-POST to webhook-server.
-- `webhook.send` JS binding: unchanged.
+- `webhook.send` JS binding: appends to a per-handler webhook
+  accumulator on the dispatch state, not to the kv writeset.
+- The dispatcher's batch-commit path: proposes a single raft entry
+  carrying envelope 0 (writeset) + envelope 4 (webhook batch)
+  together, instead of two separate proposes.
+- Raft entry payload shape: now a length-prefixed sequence of
+  envelopes (count = 1 for the existing single-envelope cases).
+- `src/js/apply.zig` gains `applyWebhookEnqueueBatch`,
+  `applyWebhookComplete`, `applyWebhookRetrySchedule` for envelopes
+  4/5/6, plus the multi-envelope-per-entry dispatcher.
 - Customer's `onResult` handler dispatch: unchanged (fired from
   `_callback/{id}` rows, written by envelope 5 apply).
-- `src/js/apply.zig` gains `applyWebhookEnqueue` and
-  `applyWebhookComplete` for envelopes 4 and 5 (and 6 for retry-
-  schedule).
 
 ### 6.3 Added
 
 - `src/webhook_server/` module — leader-pinned thread inside the
   loop46 binary. Spawned on leadership-acquired, stopped on
-  leadership-lost. In-process queue API; no HTTP listener.
-- New raft envelope types 4 (enqueue), 5 (complete), 6 (retry-
-  schedule).
-- New cluster-wide SQLite db: `data_dir/webhooks.db`. Initialized at
-  cluster bootstrap; opened by every node's apply path (write side);
-  opened by the leader's webhook-server thread (read side).
-- No new binaries, no new env vars — webhook-server is purely
-  in-process within an existing binary.
+  leadership-lost. Reads `webhooks.db`, POSTs customer URLs,
+  proposes envelopes 5/6.
+- New raft envelope types 4 (enqueue batch), 5 (complete), 6
+  (retry schedule).
+- New cluster-wide SQLite db: `data_dir/webhooks.db`. Initialized
+  at cluster bootstrap; opened by every node's apply path (write
+  side); opened by the leader's webhook-server thread (read side).
+- No new binaries, no new env vars.
 
 ---
 
 ## 7. Migration order
 
-Each step independently shippable + smoke-testable.
+The current code has a fully-functional drainer + per-tenant outbox.
+Cutover happens in steps so each is independently shippable +
+smoke-testable.
 
-1. **Add `webhooks.db` schema + envelope types 4/5/6 to apply path.**
-   Default behavior unchanged because nothing proposes them yet.
-   Smoke: hand-craft an envelope 4, observe the row appears in
+1. **Add `webhooks.db` schema + envelope types 4/5/6 + multi-
+   envelope-entry support to apply path.** Default behavior
+   unchanged because nothing proposes the new types yet. Smoke:
+   hand-craft an envelope 4 batch, observe the rows appear in
    `webhooks.db` on every node.
-2. **Build webhook-server thread** in `src/webhook_server/`: leader-
-   pinned spawn/stop wired into the raft leadership signals,
-   in-process queue API, raft proposer. No delivery loop yet.
-   Smoke: become leader → thread starts; lose leadership → thread
-   stops; call `webhook_server.enqueue` → envelope 4 proposed → row
-   appears.
-3. **Build the delivery loop.** Reads `webhooks.db`, POSTs customer
-   URLs, proposes envelope 5 on completion. Smoke: end-to-end
-   enqueue → deliver → callback row appears.
-4. **Add `pumpWebhooksForResponse` to worker** behind feature flag
-   (`webhook.deliver_via = drainer | service`). Default `drainer`.
-   Workers call `webhook_server.enqueue` in parallel with drainer
-   behavior; validate webhook-server delivery matches drainer
-   outcome.
-5. **Switch worker default to `service`.** Drainer becomes the
-   safety net; webhook-server is the primary path.
-6. **Trim the drainer** to the safety-net role (re-enqueue orphans
-   only).
-7. **Drop `_outbox_inflight/{id}` lease pattern.** Webhook-server's
-   `inflight_lease_ns` replaces it.
-8. **Drop the feature flag.** `service` is the only path.
+2. **Build webhook-server thread** in `src/webhook_server/`:
+   leader-pinned spawn/stop wired into the raft leadership signals,
+   delivery loop, raft proposer for envelopes 5/6. Smoke: become
+   leader → thread starts; lose leadership → thread stops;
+   hand-craft an envelope 4 batch → delivery loop POSTs the URL →
+   envelope 5 applies → `_callback/` appears.
+3. **Switch dispatcher to combined propose** behind a feature flag
+   (`webhook.path = drainer | direct`). Default `drainer`. When
+   `direct`: dispatcher accumulates webhook.send calls per-handler,
+   proposes envelope 0 + envelope 4 together. Existing drainer
+   path keeps working when flag is `drainer`.
+4. **Cut over to `direct` in dev**, run all webhook smokes
+   end-to-end: enqueue → deliver → callback. Verify the
+   `_outbox/*` prefix is empty during steady state.
+5. **Drop the feature flag.** `direct` is the only path.
+6. **Delete `src/outbox/drainer.zig`** and the
+   `_outbox/`-related code paths in worker / dispatcher / apply.
 
-Smokes:
+Smokes after cutover:
 - Existing webhook smoke runs through the new path end-to-end.
-- New smoke: webhook-server killed mid-delivery → restart → continues
-  from `webhooks.db` state without scanning any tenant app.db.
-- New smoke: worker crash between handler commit and accept-POST →
-  drainer's next pass enqueues via webhook-server → delivery
-  completes.
+- New smoke: webhook-server killed mid-delivery → restart →
+  continues from `webhooks.db` state without scanning any tenant
+  app.db.
 - New smoke: cluster failover during delivery → new leader's
-  webhook-server picks up `webhooks.db` state and continues delivery.
+  webhook-server picks up `webhooks.db` state and continues
+  delivery (duplicate POST possible; X-Rove-Webhook-Id dedup
+  expected).
+- New smoke: handler throws after webhook.send → no row in
+  `webhooks.db`, no kv write committed.
 
 ---
 
@@ -586,24 +596,38 @@ Smokes:
 
 ### 8.1 Cross-db atomicity in envelope 5 apply
 
-Envelope 5 apply touches both `webhooks.db` and tenant's `app.db`
-in one logical transaction. SQLite supports this via ATTACH
-(`ATTACH 'app.db' AS tenant_db; BEGIN; UPDATE webhooks ...; UPDATE tenant_db.kv ...; COMMIT;`)
+Envelope 5 apply touches both `webhooks.db` and tenant's `app.db`.
+SQLite supports cross-db transactions via ATTACH
+(`ATTACH 'app.db' AS tenant_db; BEGIN; DELETE FROM webhooks ...; INSERT INTO tenant_db.kv ...; COMMIT;`)
 but ATTACH has caveats around journal mode interaction. Verify
 during implementation that ATTACH+WAL works correctly across both
 attached dbs. Fallback: sequential commits with idempotent retry
 on partial failure (`webhooks.db` delete first; if tenant app.db
 write fails, the next apply attempt retries from the still-present
-state — but envelope 5 apply needs to be idempotent, which it is
-if `_callback/{id}` insert uses INSERT OR REPLACE).
+`_callback/{id}` `INSERT OR REPLACE` semantics — idempotent).
 
-### 8.2 Resolved: in-process leader-pinned thread, NOT separate binary
+### 8.2 Resolved: no per-tenant outbox, no drainer
 
 This iterated multiple times during planning. Final resolution
-(2026-05): leader-pinned thread inside the loop46 binary.
+(2026-05): the per-tenant `_outbox/{id}` row and the drainer go
+away entirely. The dispatcher proposes envelope 0 + envelope 4 in
+the same raft entry; customer-response gating on raft commit
+guarantees `webhooks.db` durability before the user sees a
+response. There is nothing to recover, nothing to drain, nothing
+to forward.
 
-The architectural principle the iteration produced, worth
-carrying forward to other future subsystems:
+The argument that earlier drafts retained the outbox + drainer
+("transactional handoff", "drainer as safety net") was unsound:
+the only thing the outbox row could buy was customer-visible kv
+inspection of pending webhooks, which isn't a real customer
+benefit (customers observe webhook state via callbacks, not by
+peeking kv). The drainer was solving a problem that doesn't exist
+once envelope 4 rides with envelope 0.
+
+### 8.3 Resolved: in-process leader-pinned thread, NOT separate binary
+
+Leader-pinned thread inside the loop46 binary. The architectural
+principle:
 
 > **Subsystems that participate in raft live in the loop46 binary.
 > Subsystems that don't can be split into their own processes /
@@ -613,46 +637,41 @@ By "participate in raft" we mean: reads raft-replicated state OR
 proposes envelopes OR is leader-pinned by definition. Webhook-
 server hits all three. files-server / log-server / sse-service
 hit none — their state lives in S3, they don't propose, they
-serve customer requests on their own subdomains. So those three
-can be (and are) separate binaries; webhook-server can't
-meaningfully be one without re-introducing RPC plumbing for raft
-proposes and file-share for webhooks.db reads.
+serve customer requests on their own subdomains.
 
 Tying webhook delivery to raft-leader liveness is the explicit
 tradeoff: webhook delivery pauses briefly during leader election.
 Acceptable because elections are rare (seconds, after a leader
-crash) and webhook delivery has no per-second SLA — customers
-expect "delivered or terminally failed eventually," not "delivered
-within N ms." The drainer's safety-net role catches anything that
-ages past threshold during the gap.
+crash) and webhook delivery has no per-second SLA.
 
-### 8.3 Backfill / schema migration for `webhooks.db`
+### 8.4 Backfill / schema migration for `webhooks.db`
 
-When the new code rolls out, `webhooks.db` doesn't exist yet on any
-node. First worker startup needs to create it and apply schema. Not
-hard; flag as one of the "first-time bootstrap" tasks.
+When the new code rolls out, `webhooks.db` doesn't exist yet on
+any node. First worker startup needs to create it and apply
+schema. Not hard; flag as one of the "first-time bootstrap" tasks.
 
-### 8.4 webhooks.db growth + retention
+### 8.5 webhooks.db growth + retention
 
-Delivered webhooks are deleted on envelope 5 apply. Failed webhooks
-might want to stick around for an audit window before deletion (so
-operators can inspect "what failed and why"). Flag for v2 — for v1,
-delete on terminal outcome.
+Delivered webhooks are deleted on envelope 5 apply. Failed
+webhooks transition to `state = 'failed_pending_callback'` until
+the callback fires; a follow-up envelope 5 (or a callback-cleanup
+envelope) deletes the row when the customer's `onResult` returns.
+For v1, delete on terminal outcome after callback dispatch. Audit
+window for failed webhooks is a v2 knob.
 
-### 8.5 Customer-facing outbox visibility
+### 8.6 Customer-facing webhook visibility
 
-Today customers can't easily inspect their pending webhooks. With
-consolidated `webhooks.db`, the admin UI could expose a "pending
-webhooks" view per tenant via a query into `webhooks.db`. Punt for
-now; flag as future-admin-UI feature.
+With consolidated `webhooks.db`, the admin UI could expose a
+"pending webhooks" view per tenant via a query into `webhooks.db`.
+Punt for now; flag as future-admin-UI feature.
 
-### 8.6 Per-destination circuit breaker
+### 8.7 Per-destination circuit breaker
 
 Per-customer-URL circuit-breaker (back off entirely from a
 consistently-failing destination instead of pounding it with
 retries) is a real production concern. V2 knob; defer.
 
-### 8.7 Inbound webhooks
+### 8.8 Inbound webhooks
 
-Out of scope for this plan. Inbound webhooks are normal HTTP requests
-to customer worker subdomains.
+Out of scope for this plan. Inbound webhooks are normal HTTP
+requests to customer worker subdomains.

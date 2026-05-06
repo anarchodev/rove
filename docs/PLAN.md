@@ -68,12 +68,12 @@ Each decision includes the **why**, often with notes on alternatives that were c
 **Handlers are pure functions of `(request, kv_snapshot)`.** Deterministic only.
 
 - No `fetch`, no `setTimeout`, no uncaptured `Date.now()` / `Math.random()`.
-- All external effects route through declarative outbox-style primitives: `webhook.send` (§2.6) for outbound HTTP, `email.send` (§2.6) for transactional mail, `events.emit` (§2.12) for live UI push to the customer's connected clients. Each writes a deterministic outbox row inside the handler's transaction; the actual delivery happens in a separate pump.
+- All external effects route through declarative Cmd-style primitives: `webhook.send` (§2.6) for outbound HTTP, `email.send` (§2.6) for transactional mail, `events.emit` (§2.12) for live UI push to the customer's connected clients. Each accumulates a deterministic Cmd record on the dispatch state during the handler's transaction; at commit, the Cmds ride alongside the kv writeset through raft, and a separate delivery loop carries them out.
 - All nondeterministic inputs are tape-captured.
 - Every request gets a fresh QuickJS context via snapshot-restore (existing mechanism in `src/js/worker.zig`).
 - **CPU budget: one 10ms envelope covers the whole request — handler body + every trigger it fires (BEFORE and AFTER) + every cascade those triggers trigger.** No per-trigger or per-cascade sub-budgets. Exceeding 10ms terminates the request and rolls back the transaction. Callbacks run as independent handler invocations in their own transactions and get their own fresh 10ms envelope when they fire.
 
-**Why so strict?** Determinism is what lets us offer the replay-with-breakpoints story that differentiates Loop46. The moment a handler can `await fetch(...)` inline, replay has to either re-execute the fetch (loses determinism) or fake it (diverges from prod). Forcing all external I/O through the outbox means replay is exact, always — a captured response from the outbox record drives the callback on replay just like it did in prod.
+**Why so strict?** Determinism is what lets us offer the replay-with-breakpoints story that differentiates Loop46. The moment a handler can `await fetch(...)` inline, replay has to either re-execute the fetch (loses determinism) or fake it (diverges from prod). Forcing all external I/O through Cmds means replay is exact, always — the captured response that drove the original callback drives the callback on replay too.
 
 The cost: "call an external API and use the result inline" is impossible. Customers rewrite as "fire webhook → return 'accepted' → callback updates state → client observes via poll/SSE." This is where modern serverless is going anyway (every SaaS backend is full of async job queues), so it's a calculated bet.
 
@@ -370,23 +370,25 @@ A dedicated `batch.*` primitive (background drainer, progress tracking, cascade-
 - **Trigger rejection is a catchable JS exception (§catchable-throw).** When a BEFORE trigger throws, an inner savepoint (opened only when the registry shows matching BEFORE triggers — no cost when none match) rolls back any writes the trigger made before throwing, then `kv.set` / `kv.delete` re-throws into the handler as `Error` with `code: "trigger_rejected"` and `message: "<trigger_path>: <original message>"`. The customer can `try { kv.set(...) } catch (e) { ... }` to handle the rejection; uncaught throws bubble to the handler-exception path (§11) → 500 with the message in the body. The trigger's *protection* is never bypassable — the rejected write doesn't apply regardless of whether the handler catches; only the handler's *control flow* is affected.
 - **Rollback gotcha to document for customers**: a BEFORE trigger that does `kv.set("audit/last-attempt", ...)` *before* throwing has that audit write also rolled back (the inner savepoint covers everything inside the trigger invocation). Customers who want "log every rejected attempt" should do it from an `afterPut` (only fires on successful writes) or from the handler itself.
 - **Lookup structure: sorted array, linear scan.** With a 32-trigger ceiling, O(32) per kv write is well under any budget. The array is sorted by prefix length (descending) for stable tree-traversal order. Defer a prefix trie to v2 if the cap ever raises.
-- **Platform-prefix guard at two layers.** Deploy-load rejects trigger paths whose derived prefix overlaps any of: `_audit/`, `_deploy/`, `_outbox/`, `_outbox_inflight/`, `_dlq/`, `_callback/`, `_magic/`, `_triggers/`, `_events/`, `_sessions/` (and any future system namespace). Fire-time also skips trigger dispatch when the kv key has a platform prefix — defense in depth.
+- **Platform-prefix guard at two layers.** Deploy-load rejects trigger paths whose derived prefix overlaps any of: `_audit/`, `_deploy/`, `_callback/`, `_magic/`, `_triggers/`, `_events/`, `_sessions/` (and any future system namespace). Fire-time also skips trigger dispatch when the kv key has a platform prefix — defense in depth. (`_outbox/*` and friends are not in this list because they don't live in tenant `app.db` — webhook state lives in cluster-wide `webhooks.db`; see §2.6.)
 - **Cascade depth tracked on `DispatchState`.** Single counter, incremented before each recursive trigger fire, decremented after; throws at 8.
 - **`previousValue` event field**: implementation does an extra `kv.get` for the existing value before each write that has matching triggers. Acceptable cost given the 32-trigger ceiling and the read-your-writes guarantee from `TrackedTxn`.
 - **Storage is just files.** Trigger modules live in the customer's deployment manifest exactly like any other handler file: `file/_triggers/users/sessions/index.mjs → {hash, kind: "handler", content_type}` in `files.db`, source + bytecode bytes in `file-blobs/{hash}`, replicated via raft envelope type 3 (files_writeset). Same content-addressed two-phase upload pipeline (§2.4). What's *new* and lives in the worker (not files-server) is the in-memory **trigger registry** on `TenantFiles`, derived at deploy-load time. Same split as handlers (source in files-server, runtime bytecode cache in worker).
 - **Rove ECS audit per `~/.claude/memory/feedback_state_is_collection.md`**: triggers introduce no new entities or collections. The registry sits on `TenantFiles` next to the existing `bytecodes` map; execution is recursive enhancement of `kv.set` / `kv.delete` JS globals inside the handler's existing QuickJS context. The handler entity in `request_out` remains the only entity in flight. No new Rows, no new systems at the rove layer.
 
-### 2.6 Webhooks (outbox pattern)
+### 2.6 Webhooks (Cmd pattern)
 
 > **See `docs/webhook-server-plan.md`** for the implementable
-> expansion: per-tenant `_outbox/{id}` becomes the transactional
-> handoff point only; a dedicated webhook-server process owns a
-> cluster-wide `webhooks.db` (raft-replicated via new envelope types
-> 4 + 5 + 6) for all in-flight delivery state. Drainer shrinks to a
-> safety net (re-POST orphans). Webhook-server has no public
-> subdomain — internal HTTP only, customer URLs reached via outbound
-> HTTPS. The §2.6 customer-facing API + at-least-once-with-
-> X-Rove-Webhook-Id contract carry forward unchanged.
+> expansion: in-flight webhook state lives in a cluster-wide
+> `webhooks.db` (raft-replicated via new envelope types 4/5/6); a
+> leader-pinned webhook-server thread inside the loop46 binary
+> owns delivery. Webhook intent rides through raft as **envelope 4
+> in the same raft entry as the customer's writeset (envelope 0)**,
+> so by the time the response returns to the user, the webhook is
+> durably enqueued cluster-wide. There is no per-tenant
+> `_outbox/{id}` row, no drainer, no orphan-recovery scan. The
+> §2.6 customer-facing API + at-least-once-with-X-Rove-Webhook-Id
+> contract carry forward unchanged.
 
 
 The only path to the outside world. Directly inspired by Elm's `Cmd` model.
@@ -429,19 +431,28 @@ export default function (event) {
 
 #### Storage
 
-- `_outbox/{monotonic_id}` — pending deliveries, committed in originating transaction.
-- `_outbox_inflight/{id}` — lease records while drainer holds an item.
-- `_dlq/{id}` — terminal failures (paid-tier feature).
+- **`webhooks.db`** — cluster-wide, raft-replicated, holds every pending / inflight / failed-pending-callback webhook across every tenant. Indexed by `tenant_id`. Written via envelope 4 (enqueue) / 5 (complete) / 6 (retry-schedule) apply.
+- **`_callback/{id}`** — per-tenant `app.db` row written by envelope-5 apply when a webhook reaches a terminal outcome. Drives the existing `dispatchCallbacks` worker phase that fires the customer's `onResult` handler.
 
-**Outbox id derivation**: `hash(request_id || call_index)`. Deterministic across replays. Call index = 0-based order of `webhook.send` within one handler execution.
+No per-tenant `_outbox/{id}`, no `_outbox_inflight/{id}`, no `_dlq/{id}`. Failed webhooks live in `webhooks.db` as `state = 'failed_pending_callback'` until the callback fires.
 
-#### Drainer
+**Webhook id derivation**: `hash(request_id || call_index)`. Deterministic across replays. Call index = 0-based order of `webhook.send` within one handler execution.
 
-- Runs on raft leader. Lease-based for failover.
-- Scans `_outbox/*` where `nextAttemptAt <= now`, leases, attempts delivery.
-- On 2xx: delete outbox, enqueue callback invocation (itself a raft-replicated "run handler" event so callback timing matches normal request timing).
-- On retryable failure: update attempts, compute `nextAttemptAt = now + base * 2^attempts + jitter`, release lease.
-- On non-retryable failure or attempts exhausted: move to `_dlq`, enqueue callback with `outcome: "failed"`.
+#### Enqueue path
+
+- Customer's `webhook.send` call accumulates in the dispatcher's per-handler webhook list (parallel to the kv writeset, not part of it).
+- On savepoint release, the list merges into the per-tenant batch's webhook accumulator. On rollback, both writeset and webhooks discard.
+- At batch commit, dispatcher proposes ONE raft entry carrying envelope 0 (merged writeset) + envelope 4 (merged webhook batch). Apply on every node writes both atomically (writeset to tenant `app.db`, webhook batch INSERT into `webhooks.db`).
+- Customer response gates on raft commit, so by the time the user sees a 2xx, the webhook is durable cluster-wide.
+
+#### Delivery loop
+
+- Runs as a leader-pinned thread inside the loop46 binary (see `docs/webhook-server-plan.md`). Single instance per cluster, guaranteed by raft leader uniqueness.
+- Reads `webhooks.db` directly: `WHERE state = 'pending' AND next_attempt_at_ns <= now()`. Apply-side wakeup on envelope-4 commit signals new rows (no polling).
+- POSTs the customer URL with the row's body + headers + `X-Rove-Webhook-Id` + `X-Rove-Webhook-Attempt`.
+- On 2xx: propose envelope 5 (`webhook_complete`, outcome=delivered). Apply removes from `webhooks.db` + writes `_callback/{id}` to tenant app.db.
+- On retryable failure (and attempts < max): propose envelope 6 (`webhook_retry_schedule`) with new `next_attempt_at_ns`. Apply updates the row in place.
+- On terminal failure: propose envelope 5 with outcome=failed. Apply same as the success case (removes row, writes callback with failure outcome).
 
 #### Retry defaults
 
@@ -459,7 +470,7 @@ export default function (event) {
 
 #### Headers injected
 
-- `X-Rove-Webhook-Id: <outbox_id>`
+- `X-Rove-Webhook-Id: <webhook_id>`
 - `X-Rove-Webhook-Attempt: <n>`
 - Optional `X-Rove-Idempotency-Key: <customer-provided>` passthrough
 
@@ -481,7 +492,7 @@ Default 256KB; truncation flagged as `truncated: true`. Larger caps as plan-tier
 
 #### Draft webhooks
 
-`?__draft=` deploys route `webhook.send` to a **sandbox outbox**: visible in dashboard (see what would fire), never delivered. Avoids spooky action where a QA preview causes production side effects.
+`?__draft=` deploys route `webhook.send` to a **sandbox webhook batch**: visible in dashboard (see what would fire), never enqueued into `webhooks.db`. Avoids spooky action where a QA preview causes production side effects.
 
 #### Replay
 
@@ -601,7 +612,7 @@ Designed as a general primitive from day one — also the knob used to different
 > below are fully replaced.
 
 
-The companion to webhooks (§2.6): handlers fire events from inside their transaction, connected clients receive them over a long-lived SSE stream. Same outbox/replay/determinism story; same "pure handler + declarative side effects" model. Different direction — webhooks push out to the world, events push out to *this customer's clients*.
+The companion to webhooks (§2.6): handlers fire events from inside their transaction, connected clients receive them over a long-lived SSE stream. Same Cmd / replay / determinism story; same "pure handler + declarative side effects" model. Different direction — webhooks push out to the world, events push out to *this customer's clients*.
 
 **Why SSE not WebSockets**: HTTP/2, server→client only, browsers auto-reconnect with `Last-Event-ID` resume built in. WebSockets and HTTP/2 don't naturally compose — RFC 6455 is HTTP/1.1 `Upgrade:` (forbidden in h2), RFC 8441 bridges via extended CONNECT but Cloudflare in front (per §2.1) downgrades WS traffic to HTTP/1.1 to the origin. Adding WS support would require a parallel HTTP/1.1 server stack alongside our nghttp2-based h2 stack: separate parser, separate framing (RFC 6455 masking + fragmentation + ping/pong), separate connection lifecycle, ALPN negotiation. Several thousand LOC and a two-stack maintenance burden. WS stays in §4 deferred-to-v2; SSE covers ~90% of "server pushes to client" use cases.
 
@@ -641,7 +652,7 @@ Reads `_rove_sess` cookie; mints + sets if absent. Wire format: standard SSE. Ke
 
 #### Pump (in js-worker)
 
-Per-tenant subscription map keyed by session id. On every commit that touches `_events/{sid}/...`, mark corresponding connections dirty; pump cycle reads new events (`> last_sent_id`), writes to wire, advances `last_sent_id`. Single-node v1; multi-node deferred (same call as the webhook drainer's leader-only model, OR session→node registry — decide when multi-node lands).
+Per-tenant subscription map keyed by session id. On every commit that touches `_events/{sid}/...`, mark corresponding connections dirty; pump cycle reads new events (`> last_sent_id`), writes to wire, advances `last_sent_id`. Single-node v1; multi-node deferred (same call as the webhook-server's leader-pinned model, OR session→node registry — decide when multi-node lands).
 
 #### Caps (plan-tier, single-struct interface)
 
@@ -663,7 +674,7 @@ Starting numbers:
 |---|---|---|---|
 | Concurrent SSE connections / instance | 100 | 10,000 | Real resource cap |
 | Concurrent SSE connections / session | 16 | 16 | Multi-tab sanity guard, not plan-tiered |
-| Emits per request | 100 | 1,000 | Mirrors webhook outbox depth |
+| Emits per request | 100 | 1,000 | Mirrors webhook batch depth |
 | Retention window | 300s | 3,600s | Last-Event-ID resume window |
 | Events / session in retention | 100 | 1,000 | Slow-consumer defense |
 | Event payload bytes | 64 KB | 256 KB | Inherits kv value cap as floor |
@@ -751,13 +762,21 @@ node" density.
 
 ### Phase 3 — Webhooks + email
 
-- Outbox schema (`_outbox/*`, `_outbox_inflight/*`, `_dlq/*`) in instance `app.db`.
+> Note: as initially shipped (see §9), Phase 3 used a per-tenant
+> `_outbox/*` + `_outbox_inflight/*` + `_dlq/*` schema with a
+> drainer thread doing the deliveries. Phase 5.5 item 4 replaces
+> that with a cluster-wide raft-replicated `webhooks.db` and a
+> leader-pinned webhook-server thread; the customer-facing API is
+> unchanged. The bullets below describe the eventual end state (not
+> the historical Phase-3 implementation).
+
+- `webhooks.db` cluster-wide schema (raft-replicated via envelope types 4/5/6).
 - HTTP client: SSRF blocklist, TLS always, redirect cap, timeouts.
 - `crypto.hmacSha256(key, data)` JS primitive so customers can build vendor-specific signatures (Stripe, Slack, etc.) in their handlers — no platform-owned signing header (see §10.4).
-- Drainer on raft leader (lease-based). Exponential backoff + full jitter.
-- Callback invocation as a handler event in its own transaction.
+- Webhook-server (leader-pinned thread inside loop46 binary): reads `webhooks.db`, POSTs customer URLs, proposes envelopes 5/6 on completion. Exponential backoff + full jitter.
+- Callback invocation: envelope 5 apply writes `_callback/{id}` to tenant app.db; existing `dispatchCallbacks` worker phase fires the customer's `onResult` handler in a fresh transaction.
 - `email.send` wraps `webhook.send` with platform SMTP creds.
-- Observability: log each attempt, dashboard queue/inflight/DLQ views.
+- Observability: log each attempt, dashboard queries `webhooks.db` for pending / inflight / failed views.
 - **SMTP provider decision** (SES / Postmark / Resend) must be made before this phase kicks off.
 
 ### Phase 4 — Signup + auth
@@ -836,18 +855,23 @@ Three coupled work items, all following the existing file-blob pattern
    `drainOnce` (`src/outbox/drainer.zig:137`) snapshots the entire instance
    set every tick and opens a fresh SQLite connection per tenant for an
    `_outbox/*` prefix scan — ~40k SQLite open+scan ops/sec at 4 ticks ×
-   10k tenants, almost all empty. Replace with a single node-scoped
-   `webhooks.db` raft-replicated via new envelope types 4 (enqueue), 5
-   (lease/attempt), and 6 (terminal). Drainer reads from one DB, not N;
-   on leader change, the new leader inherits committed state with no
-   per-tenant scan. The customer-facing per-tenant `_outbox/*` row
-   becomes the transactional handoff point only — enqueue fires from the
-   apply hook on writeset commit, idempotent on the existing 64-hex
-   outbox id. Detail in `docs/webhook-server-plan.md`.
+   10k tenants, almost all empty. Replace with a single cluster-wide
+   `webhooks.db` raft-replicated via new envelope types 4 (enqueue
+   batch), 5 (complete), and 6 (retry-schedule). The dispatcher
+   accumulates `webhook.send` calls per-handler and proposes envelope 4
+   in **the same raft entry as envelope 0 (the writeset)**, so by the
+   time the customer response returns (gated on raft commit), the
+   webhook is durable cluster-wide. There is no per-tenant
+   `_outbox/{id}` row, no apply-hook forwarding, no drainer. Delivery
+   runs from a leader-pinned webhook-server thread inside the loop46
+   binary; on leader change, the new leader inherits all in-flight
+   state via `webhooks.db` with zero scan cost. Detail in
+   `docs/webhook-server-plan.md`.
 
-   The earlier "leader-local in v1, raft-replicate later" position was
-   rejected (see §7) because leader-local recovery requires the same
-   per-tenant scan the consolidation is trying to eliminate.
+   The earlier "leader-local in v1, raft-replicate later" and
+   "transactional `_outbox/*` handoff with apply-hook forwarding"
+   positions were both rejected (see §7) — neither paid for the
+   complexity once envelope 4 could ride with envelope 0 directly.
 
 `S3BlobStore` itself stays deferred (single-host launch uses
 `FilesystemBlobStore`); the work above is ready for it because `BlobStore`
@@ -891,7 +915,7 @@ production traffic without disk-fill within weeks.** MVP complete.
 - Per-custom-domain Let's Encrypt cert provisioning. Watch ACME rate limits at signup surges.
 - Domain assignment UI in dashboard.
 - Plan tiers wired to all per-account caps via the `account/{sha256(email)}/plan` namespace introduced in Phase 4. Single lookup drives `max_instances` (Phase 4 hardcode goes away), `request` / `email` rate-limit caps, DLQ retention, blob storage caps, custom-domain counts, and Stripe customer-id linkage below.
-- Billing hookup (Stripe) — implement via `webhook.send` + callbacks to dogfood the outbox. Customer id stored at `account/{hash}/stripe_customer_id`.
+- Billing hookup (Stripe) — implement via `webhook.send` + callbacks to dogfood the Cmd path. Customer id stored at `account/{hash}/stripe_customer_id`.
 - **PSL submission** for `loop46.me` (GitHub PR to `publicsuffix/list`). Fire-and-wait; propagation can take weeks-to-months across browser releases. Defense-in-depth only — server-side `Set-Cookie Domain=` stripping from Phase 1 is the authoritative guard.
 
 ### Phase 11 — Server-sent events (§2.12)
@@ -903,7 +927,7 @@ production traffic without disk-fill within weeks.** MVP complete.
 - `GET /_events` system endpoint: text/event-stream, honors `Last-Event-ID`, mints+sets cookie if absent. Keepalive `:ping\n\n` every 25s.
 - Pump in `js-worker`: per-tenant subscription map keyed by sid, dirty-flag on commits touching `_events/`, drains to wire.
 - `EventsCaps` struct + `eventsCapsForPlan(plan)` lookup — same shape used for future plan-tiered caps in other subsystems.
-- Single-node only. Multi-node session routing deferred (decide when multi-node lands; same call as the webhook drainer's leader-only model OR a session→node registry).
+- Single-node only. Multi-node session routing deferred (decide when multi-node lands; same call as the webhook-server's leader-pinned model OR a session→node registry).
 - Has no hard predecessor — depends on §2.6 webhooks (done) + existing kv/h2/handler infra. **Sequencing per §10.16 (2026-04-30): NOT in beta, IS in 1.0** as launch path item #1 — needed for the live use cases (Stripe Checkout, OAuth, AI-agent results) that beta deliberately omits.
 
 ### Phase 12 — Sim test framework + simulator library (§10.7, §10.8)
@@ -939,7 +963,7 @@ Tooling for authoring, editing, and refreshing the fixture data sim tests run ag
 - Runner integration: structured "unresolved read on K" error referencing fixture path + missing key. Optional `loop46 test --auto-fix-from <instance>` flag pulls missing keys on-the-fly and writes them back.
 
 **Worker dry-run** (§10.11):
-- `POST /_system/dry-run/{id}` endpoint — runs synthetic request through dispatch with always-rollback + propose-disabled. Returns bundle (response, kv writes, outbox rows, tape entries) inline; nothing persists.
+- `POST /_system/dry-run/{id}` endpoint — runs synthetic request through dispatch with always-rollback + propose-disabled. Returns bundle (response, kv writes, would-have-enqueued webhook rows, tape entries) inline; nothing persists.
 - Implementation: `dry_run: bool` flag on `dispatchOnce`. Roughly 50 lines.
 - Optional `dry_run` rate-limit action (default: share `request` budget).
 - New CLI subcommand `loop46 dry-run --request '{...}' --instance <id>`.
@@ -1098,6 +1122,8 @@ The following were explored during the 2026-04-17 design conversation and ruled 
 - **Per-tenant `files.db` on every worker mirroring the manifest via raft envelope type 3.** Rejected (2026-05): worker-as-read-only-consumer model is cleaner. Replaced by `docs/files-server-plan.md`: manifest lives in S3, runtime release signal is a `_deploy/active` kv marker on the customer's app.db, worker reads on demand.
 - **Worker hairpin proxy `/_system/files/*` and `/_system/log/*`.** Rejected (2026-05): these subsystems should be on their own subdomains (`files.{public_suffix}`, `logs.{public_suffix}`), terminating their own TLS, with token-handoff auth from the customer's app domain. Worker stops mediating their traffic entirely. Per `docs/files-server-plan.md` and `docs/logs-plan.md`.
 - **Webhook subsystem leader-local in v1 with per-tenant `_outbox/*` scan recovery on leader change.** Rejected (2026-05): the per-tenant scan is exactly the cost we're trying to eliminate; replicating recovery state via raft from day one removes it. Replaced by `docs/webhook-server-plan.md`: cluster-wide `webhooks.db` raft-replicated via new envelope types 4/5/6.
+- **Per-tenant `_outbox/{id}` as the transactional handoff point, with an apply-hook forwarding committed outbox rows into `webhooks.db`.** Rejected (2026-05): the only thing the per-tenant row could buy was customer-visible kv inspection of pending webhooks, which isn't a real customer benefit (customers observe webhook state via callbacks, not by peeking kv). And once envelope 4 can ride in the same raft entry as envelope 0 (the writeset), the handoff happens atomically at propose time — by the time the customer response gates on raft commit, `webhooks.db` is already durable cluster-wide. Replaced by direct envelope 0 + envelope 4 propose at handler-batch commit; the dispatcher accumulates `webhook.send` calls in a per-handler list parallel to the writeset, and the per-tenant `_outbox/*` prefix is gone entirely.
+- **Drainer thread doing the actual webhook delivery.** Rejected (2026-05): with `webhooks.db` raft-replicated and webhook-server as a leader-pinned thread, there is nothing left for a drainer to do. No orphan recovery (every committed writeset already has its corresponding webhook rows committed cluster-wide), no fall-back delivery (webhook-server owns delivery), no retry scheduling (envelope 6 covers it). Replaced by deleting `src/outbox/drainer.zig` outright.
 - **Webhook-server as a separate binary `rove-webhook-server`.** Considered (2026-05) and rejected. Webhook-server participates in raft (reads `webhooks.db`, proposes envelopes, leader-pinned) — separating across a process boundary forces RPC for proposes and file-share or learner-replication for `webhooks.db` reads, re-introducing the very plumbing the consolidation was supposed to eliminate. The right separability axis is raft participation, not public-TLS-surface presence. Webhook-server lives as a leader-pinned thread inside the loop46 binary; the cluster-wide `webhooks.db` design (envelope types 4/5/6) stays. Architectural principle captured in §6.
 - **Pause-and-snapshot raft snapshot strategy** (briefly stopping all applies during VACUUM pass to capture every tenant's `app.db` at a single global raft index). Rejected (2026-05): contradicts the worker-kv-path north star — even a few seconds of cluster-wide write pause every snapshot interval is unacceptable at the "many tenants per node" density. Replaced by per-tenant snapshot indices with always-refresh-all-tenants discipline (`docs/snapshot-plan.md`). The slow-tenant pinning concern is mitigated by the always-refresh trick (dormant tenants get manifest-bookkeeping refresh without re-VACUUM).
 - **Static file serving via 302-to-S3 redirect (public bucket or pre-signed).** Rejected (2026-05): considered as a way to take the worker entirely out of the static bytes path, but Cloudflare in front already absorbs essentially all repeat traffic. The marginal further reduction isn't worth a per-deployment flag, public-bucket security model, CSP friction, or per-request HMAC signing. Worker proxies with hash ETag + immutable Cache-Control; Cloudflare does the heavy lifting.
@@ -1108,7 +1134,7 @@ The following were explored during the 2026-04-17 design conversation and ruled 
 The uniqueness isn't any single feature — it's the coherence of the set:
 
 - **Purely functional handlers** (no async IO, no fetch, all effects are Cmds).
-- **Transactional outbox as the only outbound path.**
+- **Cmd-pattern outbound path: `webhook.send` is the only door to the outside world**, accumulated alongside the writeset and proposed atomically with kv writes.
 - **Deterministic triggers in the same KV transaction as the write.**
 - **Tape capture on every request, encrypted at rest.**
 - **Browser-based replay with DevTools breakpoints on production bugs.**
@@ -1136,16 +1162,17 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 - Admin JS client helpers for the two-phase flow (`api.bulkDeploy`) — **done**
 - NOT yet: draft-with-CAS workflow, `POST /lint`, deploy history/diff UI, deploy-size caps, retention/GC. Deferred into Phase 5 finish.
 
-### Phase 3 — Webhooks + email — **done**
-- `_outbox/*`, `_outbox_inflight/*`, `_dlq/*`, lease-based drainer
+### Phase 3 — Webhooks + email — **done (initial implementation; will be replaced by Phase 5.5 item 4)**
+- `_outbox/*`, `_outbox_inflight/*`, `_dlq/*`, lease-based drainer (the historical shape; `webhook-server-plan.md` replaces it)
 - SSRF blocklist + HTTP client + exponential backoff with full jitter
-- `webhook.send` JS global with deterministic outbox ids (`sha256(request_id || call_index)`)
+- `webhook.send` JS global with deterministic ids (`sha256(request_id || call_index)`)
 - `email.send` JS wrapper (key as explicit arg — vendor-neutral; see §10)
 - `crypto.hmacSha256(key, data)` primitive — customers roll vendor-specific signatures themselves
 - `X-Rove-Webhook-Id` + `X-Rove-Webhook-Attempt` headers stamped; the planned `X-Rove-Signature` was dropped per §10
 - Callback dispatch phase (`dispatchCallbacks`) invokes `onResult` handlers in their own tx
 - Inflight lease + stale-lease sweep covers drainer crash recovery
 - End-to-end smoke in `scripts/webhook_smoke.sh` against a Python echo target
+- **Cutover note**: this whole stack — drainer, `_outbox/*` shape, `_outbox_inflight/*`, `_dlq/*` — is being replaced by the Phase 5.5 item 4 work. The customer-facing API (`webhook.send`, callback shape, X-Rove-Webhook-Id contract) carries forward unchanged; the storage layer and delivery loop swap underneath.
 
 ### Phase 4 — Signup + auth — **done** (modulo deferred sweep)
 - `mintMagic` / `redeemMagic` primitive (15-min TTL, single-use, hashed-at-rest) — **done**
@@ -1166,9 +1193,9 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 - NOT yet: Logs auto-refresh / live tail, Logs filtering (by status / outcome / deployment / path), nested-thread display under `parent_request_id` (waits on Phase 6 trigger / callback log emits), Deploys tab with history + diff, CodeMirror 6 upgrade, draft workflow, signup form on the login page, tape replay click-through (waits on Phase 4 tape capture)
 
 ### Phase 5.5 — Storage scalability — **not started**
-- Promoted into MVP scope 2026-04-29. Four deliverables, each with its own sub-plan: (a) log batch payload offload — superseded by `docs/logs-plan.md` (logs leave raft entirely, go S3-direct with sidecar index); (b) tape body capture wired through the pre-staged `tape_refs` + `LogStore.blob` slots, bodies offloaded to `{inst.dir}/log-blobs/` with §2.4's 256 KB truncation; (c) raft snapshot + log compaction — see `docs/snapshot-plan.md` (per-tenant snapshot indices, S3 transport, no global write-pause); (d) centralized webhook subsystem — see `docs/webhook-server-plan.md` (cluster-wide raft-replicated `webhooks.db` via new envelope types 4/5/6).
+- Promoted into MVP scope 2026-04-29. Four deliverables, each with its own sub-plan: (a) log batch payload offload — superseded by `docs/logs-plan.md` (logs leave raft entirely, go S3-direct with sidecar index); (b) tape body capture wired through the pre-staged `tape_refs` + `LogStore.blob` slots, bodies offloaded to `{inst.dir}/log-blobs/` with §2.4's 256 KB truncation; (c) raft snapshot + log compaction — see `docs/snapshot-plan.md` (per-tenant snapshot indices, S3 transport, no global write-pause); (d) centralized webhook subsystem — see `docs/webhook-server-plan.md` (cluster-wide raft-replicated `webhooks.db` via new envelope types 4/5/6, no per-tenant `_outbox/*` row, no drainer; envelope 4 rides with envelope 0 in the same raft entry).
 - Without (a)–(c), `raft.log.db` grows unbounded under any sustained traffic and bodies (when added) overwhelm both raft replication and per-tenant `log.db`. Estimate: ~43 GB/day in raft.log.db at 1000 req/s × ~500 B per log record, doubled by apply, ~100× worse with bodies.
-- Without (d), the drainer's steady-state tick cost is O(N tenants) — ~40k SQLite open+scan ops/sec at 4 ticks × 10k tenants. The raft-replicated `webhooks.db` design eliminates that per-tick scan; on leader change, the new leader inherits committed state with no per-tenant outbox scan. Idempotency on the 64-hex outbox id makes the per-tenant-`_outbox/*` → `webhooks.db` handover safe across crashes and failover.
+- Without (d), the drainer's steady-state tick cost is O(N tenants) — ~40k SQLite open+scan ops/sec at 4 ticks × 10k tenants. The raft-replicated `webhooks.db` design eliminates that per-tick scan; on leader change, the new leader inherits committed state with no per-tenant outbox scan. Webhook intent rides through raft as envelope 4 in the same raft entry as envelope 0 (the writeset), so the per-tenant `_outbox/{id}` row goes away entirely — the handoff IS the propose, and the customer response (gated on raft commit) guarantees `webhooks.db` durability cluster-wide. The drainer is deleted along with the `_outbox/*` / `_outbox_inflight/*` / `_dlq/*` prefixes.
 - The supersede comment in `src/log/root.zig` header that mentions "Phase 6 changes this so the leader uploads the batch blob to S3" is stale terminology — it predates the current PLAN numbering. Cleanup as part of this work.
 
 ### Phase 6 — Triggers — **done 2026-04-27**
@@ -1176,7 +1203,7 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 - Named exports for op×timing: `beforePut`, `afterPut`, `beforeDelete`, `afterDelete`, plus `default` as the catchall.
 - BEFORE return-value mutates the written value (string return only; non-string returns leave the value untouched).
 - Catchable `Error{ code: "trigger_rejected", message: "<trigger_path>: <original>" }` in the handler. Inner savepoint scopes BEFORE chain + actual write + AFTER chain so a throw anywhere rolls back all three (the audit gotcha is real and tested). Uncaught throws bubble to the §11 handler-exception path → 500.
-- Cascade depth tracked on `DispatchState`, throws at 8. Platform-key fire-time guard (defense in depth alongside deploy-load guard) — customer catch-alls don't see writes to `_outbox/`, `_audit/`, etc. Per-request module-namespace cache so trigger top-level state persists across fires within one request.
+- Cascade depth tracked on `DispatchState`, throws at 8. Platform-key fire-time guard (defense in depth alongside deploy-load guard) — customer catch-alls don't see writes to `_audit/`, `_callback/`, etc. Per-request module-namespace cache so trigger top-level state persists across fires within one request.
 - 15 inline dispatcher tests cover registry derivation, BEFORE+AFTER chains, op×timing dispatch + default catchall, tree-traversal order, cascade depth (well-bounded + runaway), platform-prefix block, return-value mutation, audit-gotcha rollback, previousValue exposure, trigger_rejected error shape.
 - `scripts/triggers_smoke.sh` end-to-end against a live worker: signup → deploy trigger module + handler → exercise via curl → verify reverse-index built, BEFORE mutation lowercased the value, rejection caught with the right code, afterDelete cleaned up.
 
@@ -1187,7 +1214,7 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 - Per-worker, in-memory only — no cross-worker sync in v1. Multi-worker configs effectively give each instance Nx the configured limit; acceptable overshoot at launch scale.
 - Single tier in v1 — `WorkerConfig.rate_limit_caps` is operator-tunable via `--rate-limit-{request,email}-{capacity,refill}` CLI flags. Phase 10 will branch on instance plan tier.
 - `scripts/rate_limit_smoke.sh` end-to-end: hammer a tenant past `request_capacity` and verify 429 + Retry-After + body explanation; verify per-instance independence (a second tenant stays at full capacity); verify admin requests bypass; deploy a handler that calls `email.send` in a try/catch and verify the 3rd call surfaces `e.code === "rate_limited"`.
-- Deferred from PLAN §2.10's full action list: `deploy` (low volume), `webhook_attempt` (already paced via outbox depth + per-destination cap + exponential backoff), `kv_write` (hot path, real per-call cost). Add when concrete demand arises.
+- Deferred from PLAN §2.10's full action list: `deploy` (low volume), `webhook_attempt` (already paced via webhook batch depth + per-destination cap + exponential backoff), `kv_write` (hot path, real per-call cost). Add when concrete demand arises.
 - Deferred: per-plan branching, root.db sync for cross-worker coordination, dashboard view of bucket state.
 
 ### Phases 7, 9, 10 — **not started**
@@ -1225,10 +1252,10 @@ Architectural calls captured here so future sessions don't re-derive them. §10.
 
 **Change**: dropped the `__admin__.kv` aliases-to-root hack. The admin tenant now has its own `{data_dir}/__admin__/app.db` like every other tenant. `Instance.platform: ?*Tenant` points back at the `Tenant` on the singleton admin instance only; the JS dispatcher installs `platform.root.*` globals gated on that field.
 
-**Why**: the aliasing made admin-tenant outbox rows unreachable to the drainer (which scans per-tenant `app.db` files, never the root store) and leaked root-store key shapes into admin-handler JS code. Making admin "an instance like any other, plus a capability" solves both — drainer sees admin-fired email queues naturally, and platform-level operations become a well-typed JS surface instead of raw `__root__/…` key writes.
+**Why**: the aliasing made admin-tenant Cmd records (webhook.send / email.send) unreachable to the delivery path (which expects per-tenant `app.db`, not the root store) and leaked root-store key shapes into admin-handler JS code. Making admin "an instance like any other, plus a capability" solves both — admin-fired webhook batches ride through the same envelope-4 path as customer handlers, and platform-level operations become a well-typed JS surface instead of raw `__root__/…` key writes.
 
 **Side effects**:
-- Sessions, magic-link rows, resend key, admin-fired outbox rows all moved from root.db to `__admin__/app.db`.
+- Sessions, magic-link rows, resend key, admin-fired Cmd records all moved from root.db to `__admin__/app.db` (and onward to cluster-wide `webhooks.db` for webhook intent).
 - `__root__/` key prefixes dropped — root.db holds only identity+routing tables (`instance/`, `domain/`, `root_token/`).
 - `Tenant.create` / `.destroy` replaced `init` / `deinit` (heap-allocated; the `platform` interior pointer requires stable address — rove-library principle 14).
 - Admin JS handler rewritten to use `platform.root.*` for root-kv reads/writes.
@@ -1263,7 +1290,7 @@ The `uploads` object's URL is path-relative on the FS backend (client resolves a
 **What ships instead**:
 - `crypto.hmacSha256(key, data) → hex` JS global — primitive for customers to roll their own signing
 - `X-Rove-Webhook-Id` + `X-Rove-Webhook-Attempt` headers (vendor-neutral; receivers use the id for dedup)
-- `email.send({key, from, to, subject, text?, html?, …})` takes the Resend key as an explicit argument. Customer's abuse-control concern: they can only email using a Resend key they provide. Our own magic-link email reads the platform Resend key from `__admin__/app.db` and queues an outbox row; customer handlers never see that key.
+- `email.send({key, from, to, subject, text?, html?, …})` takes the Resend key as an explicit argument. Customer's abuse-control concern: they can only email using a Resend key they provide. Our own magic-link email reads the platform Resend key from `__admin__/app.db` and accumulates a webhook batch entry on the dispatch state (proposed via envelope 4 alongside the writeset); customer handlers never see that key.
 
 ### 10.5 Replication-ready blob backend (path B: shared object store)
 
@@ -1320,7 +1347,7 @@ Detail in `docs/agent-surface.md`.
 
 ### 10.11 Worker dry-run dispatch mode
 
-`POST /_system/dry-run/{instance_id}` runs a synthetic request through the existing dispatch path with one behavioral change: the savepoint is **always rolled back, never proposed to raft**. Returns the bundle inline (response, would-have-written kv ops, would-have-enqueued outbox rows, captured tape entries); nothing persists. Implementation is roughly 50 lines — a `dry_run: bool` flag on `dispatchOnce` plus a new admin route.
+`POST /_system/dry-run/{instance_id}` runs a synthetic request through the existing dispatch path with one behavioral change: the savepoint is **always rolled back, never proposed to raft**. Returns the bundle inline (response, would-have-written kv ops, would-have-enqueued webhook batch entries, captured tape entries); nothing persists. Implementation is roughly 50 lines — a `dry_run: bool` flag on `dispatchOnce` plus a new admin route.
 
 **Distinct from the simulator**: dry-run is literal dispatch (same bytecode, real `app.db` reads, real time/random, real trigger cascades) with commit + propose suppressed. The simulator (§10.7, client-side) handles modified-source / overlay / replay; dry-run answers "what would real dispatch do here, without committing." Cost shape is close to read-only — skips the two expensive parts of a write (SQLite commit fsync + raft propose) — so customers and agents can dry-run liberally.
 
