@@ -84,7 +84,36 @@ multi-node gap (replay-after-failover).
 **Sub-plan**: PLAN §3 Phase 5.5 (b) is the spec; no separate
 sub-plan because the work is contained.
 
-### 2. Webhook subsystem — **not started**
+### 2. Webhook subsystem — **in progress (step 1 done 2026-05-05)**
+
+- **Step 1 — done.** `src/webhook_server/root.zig` ships: `WebhookRow`,
+  `WebhookStore` (kv-backed at `{data_dir}/webhooks.db`), apply
+  primitives `applyEnqueueBatch` / `applyComplete` /
+  `applyRetrySchedule`, and the wire-format encode/decode for
+  envelope types 4 / 5 / 6. Module wired into `build.zig`; unit
+  tests cover envelope round-trips, idempotent enqueue, retry
+  schedule, missing-row no-op completes. The kv-backed store is the
+  step-1 stand-in for the real partial-index sqlite schema; step 2
+  swaps in the schema-from-webhook-server-plan.md §2.2 when the
+  delivery loop's "ready rows" query needs the index.
+- Remaining steps (per webhook-server-plan.md §7):
+  2. **Apply path integration** — add envelope types 4/5/6 to
+     `src/js/apply.zig`'s `EnvelopeType` enum + introduce
+     multi-envelope-per-raft-entry wrapper (envelope type 7). Wire
+     `applyOne` dispatch to the new types. ApplyCtx gets a
+     `webhooks_store: ?*WebhookStore` lazily opened on first
+     webhook envelope.
+  3. **Webhook-server thread** — leader-pinned spawn/stop,
+     delivery loop reading `WebhookStore`, raft proposer for
+     envelopes 5/6.
+  4. **Dispatcher cutover** — `webhook.send` accumulates per-handler
+     into a webhook batch on the dispatch state. Combined propose
+     at handler-batch commit emits a multi-envelope (type 7)
+     containing envelope 0 (writeset) + envelope 4 (webhook batch).
+     Behind feature flag `webhook.path = drainer | direct`.
+  5. **Cut over to `direct`** in dev, run all webhook smokes,
+     verify `_outbox/*` empty during steady state.
+  6. **Drop the feature flag** + **delete `src/outbox/drainer.zig`**.
 
 **What it delivers**: cluster-wide raft-replicated `webhooks.db`,
 new envelope types 4 (enqueue batch), 5 (complete), 6 (retry

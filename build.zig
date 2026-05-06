@@ -198,6 +198,22 @@ pub fn build(b: *std.Build) void {
     log_server_mod.addImport("rove-blob", blob_mod);
     log_server_mod.addImport("rove-log", log_mod);
 
+    // ── rove-webhook-server: cluster-wide webhook subsystem (Phase 5.5 d) ──
+    //
+    // Schema, wire format, and apply primitives for the
+    // raft-replicated `webhooks.db` (PLAN §3 Phase 5.5 (d) and
+    // `docs/webhook-server-plan.md`). The leader-pinned delivery
+    // thread + dispatcher integration land in later steps; this
+    // module ships the foundation.
+    const webhook_server_mod = b.addModule("rove-webhook-server", .{
+        .root_source_file = b.path("src/webhook_server/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    webhook_server_mod.link_libc = true;
+    webhook_server_mod.linkSystemLibrary("sqlite3", .{});
+    webhook_server_mod.addImport("rove-kv", kv_mod);
+
     // ── rove-files-server: per-instance code operations (Phase 5) ──
     //
     // Compile + upload + deploy + source fetch, wrapping rove-files.
@@ -273,6 +289,10 @@ pub fn build(b: *std.Build) void {
     // rove-log-server tests
     const log_server_tests = b.addTest(.{ .root_module = log_server_mod });
     test_step.dependOn(&b.addRunArtifact(log_server_tests).step);
+
+    // rove-webhook-server tests
+    const webhook_server_tests = b.addTest(.{ .root_module = webhook_server_mod });
+    test_step.dependOn(&b.addRunArtifact(webhook_server_tests).step);
 
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
