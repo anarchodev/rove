@@ -83,7 +83,9 @@ sub-plan's migration order. No big-bang cutovers between them.
    `tenants/{id}/deployments/{dep_id}.json`, `_deploy/active` kv
    marker as the release signal, worker reads from S3 (drop
    files.db + envelope type 3). Big piece — see
-   `docs/files-server-plan.md` §3-§7 for the design.
+   `docs/files-server-plan.md` §3-§7 for the design and the F2
+   notes under piece 4 below for the cross-thread coordination
+   problem that has to be solved as part of it.
 
 Detail per piece below.
 
@@ -412,6 +414,31 @@ becomes `_deploy/active` kv marker observed via
 `markDirtyFromWriteset`. Worker drops `files.db` per tenant + the
 async load + atomic-swap manifest model. Drops envelope type 3
 entirely. Big piece — see `docs/files-server-plan.md` §3-§7.
+
+**Open design problem flagged during F1's planning round:** the
+release-signal observer needs to fire on every node, but the
+producer (files-server thread) and consumer (worker thread) live
+in different threading domains, and ApplyCtx — which sees the
+apply on followers — doesn't have access to worker state. Three
+options surveyed:
+
+1. **Add a callback to ApplyCtx** that the worker thread polls for
+   notifications. Cleanest but most code.
+2. **Files-server writes `_deploy/active` directly to leader's
+   app.db** (fresh KvStore connection) + proposes envelope 0 for
+   follower replication. Worker observes via the dispatcher hook
+   (worker_dispatch.zig:112's `markDirtyFromWriteset` call)
+   on the leader; followers depend on their own apply path
+   triggering somehow. Asymmetric.
+3. **Just keep polling, reduce interval to 100ms.** Trivial change
+   but doesn't match the plan.
+
+F2 should likely combine (1) with the rest of the data-model
+migration in one cutover — the cross-thread coordination plumbing
+is needed regardless of whether the manifest lives in S3 or
+files.db. Splitting F2 into "release signal first, manifest
+second" doesn't reduce risk because both halves need the
+notification machinery.
 
 **Definition of done**: see `docs/files-server-plan.md` §9
 "Migration order."
