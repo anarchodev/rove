@@ -56,6 +56,7 @@ const kv_mod = @import("rove-kv");
 const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
+const log_server_mod = @import("rove-log-server");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 
@@ -467,7 +468,21 @@ pub const WorkerConfig = struct {
     /// must outlive the worker's `create` call (S3BlobStore.init dupes
     /// them, so afterwards they can be freed).
     blob_backend: blob_mod.BackendConfig = .fs,
+    /// Phase 5.5 (a) — selects the log-flush path. `.raft` (default)
+    /// uses the legacy envelope-1 propose + per-tenant `log.db`
+    /// apply. `.s3` writes `.ndjson` payload + `.idx.json` sidecar
+    /// to `log_batch_store` instead. Default stays `.raft` until
+    /// step 5 of `docs/logs-plan.md` flips it.
+    log_backend: LogBackend = .raft,
+    /// Required when `log_backend == .s3`. Worker-side flushes call
+    /// `flush_writer.writeBatch` against this. The pointer + the
+    /// underlying store must outlive the worker; in production
+    /// loop46 owns the lifetime via a process-global handle.
+    log_batch_store: ?log_server_mod.batch_store.BatchStore = null,
 };
+
+/// Selector for the worker's log-flush path. See `WorkerConfig`.
+pub const LogBackend = enum { raft, s3 };
 
 /// Cross-reference component used by the `/_system/*` proxy. Lives
 /// on server-side entities parked in each subsystem's `inflight`
@@ -574,6 +589,12 @@ pub fn Worker(comptime opts: Options) type {
         /// Picks fs vs s3 for every per-tenant blob backend this
         /// worker opens. Borrowed from `WorkerConfig.blob_backend`.
         blob_backend_cfg: blob_mod.BackendConfig,
+        /// Phase 5.5 (a) — log flush path selector. See
+        /// `WorkerConfig.log_backend`.
+        log_backend: LogBackend,
+        /// Set when `log_backend == .s3`. The store survives the
+        /// worker's lifetime; `flushLogs` writes to it directly.
+        log_batch_store: ?log_server_mod.batch_store.BatchStore,
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -632,6 +653,8 @@ pub fn Worker(comptime opts: Options) type {
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
                 .blob_backend_cfg = config.blob_backend,
+                .log_backend = config.log_backend,
+                .log_batch_store = config.log_batch_store,
             };
             errdefer self.raft_pending.deinit();
             errdefer self.code_proxy.deinit();
@@ -1233,53 +1256,119 @@ pub fn flushLogs(worker: anytype) !void {
         const tl = entry.value_ptr.*;
         if (!tl.store.shouldFlush(now_ns)) continue;
 
-        const batch = (tl.store.drainBatch(allocator) catch |err| {
-            std.log.warn("rove-js flushLogs: drainBatch({s}) failed: {s}", .{ tl.instance_id, @errorName(err) });
-            continue;
-        }) orelse continue;
-        defer allocator.free(batch);
-
-        if (!is_leader) {
-            // Leadership flipped between dispatchPending (when the
-            // records were appended) and this flush. Drop the batch —
-            // the new leader will produce its own logs for any
-            // requests it handles. Per the "best-effort + no
-            // follower-originated logs" rules.
-            std.log.warn(
-                "rove-js flushLogs: dropping {d}-byte batch for {s} — lost leadership mid-tick",
-                .{ batch.len, tl.instance_id },
-            );
-            continue;
+        switch (worker.log_backend) {
+            .raft => try flushOneRaft(worker, tl, allocator, is_leader),
+            .s3 => try flushOneS3(worker, tl, allocator, is_leader),
         }
-
-        const envelope = apply_mod.encodeLogBatchEnvelope(allocator, tl.instance_id, batch) catch |err| {
-            std.log.warn("rove-js flushLogs: envelope encode failed: {s}", .{@errorName(err)});
-            // Local write still useful even if envelope fails.
-            tl.store.applyBatch(batch) catch |le| std.log.warn(
-                "rove-js flushLogs: local applyBatch fallback for {s} also failed: {s} ({d} log records dropped)",
-                .{ tl.instance_id, @errorName(le), batch.len },
-            );
-            continue;
-        };
-        defer allocator.free(envelope);
-
-        const seq = worker.raft.highWatermark() + 1;
-        worker.raft.propose(seq, envelope) catch |err| {
-            std.log.warn(
-                "rove-js flushLogs: raft propose failed for {s}: {s} — local-only write",
-                .{ tl.instance_id, @errorName(err) },
-            );
-        };
-
-        // Local apply on the h2 thread. Single-writer to leader's
-        // log.db — see the doc comment above + `applyLogBatch`.
-        tl.store.applyBatch(batch) catch |err| {
-            std.log.warn(
-                "rove-js flushLogs: local applyBatch({s}) failed: {s}",
-                .{ tl.instance_id, @errorName(err) },
-            );
-        };
     }
+}
+
+/// Legacy raft-replicated flush path. Encodes the buffer into the
+/// type-1 envelope, proposes it, and applies locally. Best-effort:
+/// every step that fails is logged + skipped, with the records
+/// already drained from the buffer (lost). See the leader-skip story
+/// in `apply.zig:applyLogBatch`.
+fn flushOneRaft(
+    worker: anytype,
+    tl: *TenantLog,
+    allocator: std.mem.Allocator,
+    is_leader: bool,
+) !void {
+    const batch = (tl.store.drainBatch(allocator) catch |err| {
+        std.log.warn("rove-js flushLogs: drainBatch({s}) failed: {s}", .{ tl.instance_id, @errorName(err) });
+        return;
+    }) orelse return;
+    defer allocator.free(batch);
+
+    if (!is_leader) {
+        std.log.warn(
+            "rove-js flushLogs: dropping {d}-byte batch for {s} — lost leadership mid-tick",
+            .{ batch.len, tl.instance_id },
+        );
+        return;
+    }
+
+    const envelope = apply_mod.encodeLogBatchEnvelope(allocator, tl.instance_id, batch) catch |err| {
+        std.log.warn("rove-js flushLogs: envelope encode failed: {s}", .{@errorName(err)});
+        tl.store.applyBatch(batch) catch |le| std.log.warn(
+            "rove-js flushLogs: local applyBatch fallback for {s} also failed: {s} ({d} log records dropped)",
+            .{ tl.instance_id, @errorName(le), batch.len },
+        );
+        return;
+    };
+    defer allocator.free(envelope);
+
+    const seq = worker.raft.highWatermark() + 1;
+    worker.raft.propose(seq, envelope) catch |err| {
+        std.log.warn(
+            "rove-js flushLogs: raft propose failed for {s}: {s} — local-only write",
+            .{ tl.instance_id, @errorName(err) },
+        );
+    };
+
+    tl.store.applyBatch(batch) catch |err| {
+        std.log.warn(
+            "rove-js flushLogs: local applyBatch({s}) failed: {s}",
+            .{ tl.instance_id, @errorName(err) },
+        );
+    };
+}
+
+/// Phase 5.5 (a) S3 flush path. Drains the buffer as `LogRecord`s
+/// (no binary serialization), builds the `.ndjson` payload + the
+/// matching `.idx.json` sidecar, and PUTs them to the configured
+/// `BatchStore`. Lossy on PUT failure — records already left the
+/// buffer; per the stated semantics in `docs/logs-plan.md` §1 a
+/// node-failure window may drop one batch.
+fn flushOneS3(
+    worker: anytype,
+    tl: *TenantLog,
+    allocator: std.mem.Allocator,
+    is_leader: bool,
+) !void {
+    const records_opt = tl.store.drainRecords(allocator) catch |err| {
+        std.log.warn("rove-js flushLogs: drainRecords({s}) failed: {s}", .{ tl.instance_id, @errorName(err) });
+        return;
+    };
+    const records = records_opt orelse return;
+    defer {
+        for (records) |*r| r.deinit(allocator);
+        allocator.free(records);
+    }
+
+    if (!is_leader) {
+        std.log.warn(
+            "rove-js flushLogs: dropping {d}-record batch for {s} — lost leadership mid-tick",
+            .{ records.len, tl.instance_id },
+        );
+        return;
+    }
+
+    const store = worker.log_batch_store orelse {
+        std.log.warn(
+            "rove-js flushLogs: log_backend=.s3 but no log_batch_store configured; dropping {d} records for {s}",
+            .{ records.len, tl.instance_id },
+        );
+        return;
+    };
+
+    var node_buf: [8]u8 = undefined;
+    const node_id_hex = std.fmt.bufPrint(&node_buf, "{x:0>8}", .{worker.raft.config.node_id}) catch unreachable;
+    const flush_unix_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+
+    log_server_mod.flush_writer.writeBatch(
+        allocator,
+        store,
+        tl.instance_id,
+        node_id_hex,
+        records,
+        flush_unix_ms,
+    ) catch |err| {
+        std.log.warn(
+            "rove-js flushLogs: writeBatch({s}, {d} records) failed: {s}",
+            .{ tl.instance_id, records.len, @errorName(err) },
+        );
+    };
 }
 
 /// Free every key + bytecode value in `tc.bytecodes` and clear the map.

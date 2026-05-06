@@ -124,6 +124,14 @@ pub const Cli = struct {
     rate_limit_request_refill: u32 = 50,
     rate_limit_email_capacity: u32 = 10,
     rate_limit_email_refill: u32 = 1,
+    /// Phase 5.5 (a). `raft` (default) keeps the legacy log_batch
+    /// envelope-1 path. `s3` switches the worker's `flushLogs` to
+    /// build `.ndjson` + `.idx.json` and PUT them to a `BatchStore`.
+    /// When `s3`, the backend is picked from `LOG_BATCH_STORE_BACKEND`
+    /// env (`fs`|`s3`); the fs backend's root is `LOG_BATCH_STORE_DIR`.
+    /// S3-backend env mirrors `BLOB_BACKEND=s3` (separate vars to
+    /// allow per-target buckets).
+    log_backend: []const u8 = "raft",
 };
 
 pub fn parseCli(args: []const [:0]u8) !Cli {
@@ -221,6 +229,19 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.rate_limit_email_refill = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--log-backend")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.log_backend = args[i];
+            if (!std.mem.eql(u8, out.log_backend, "raft") and
+                !std.mem.eql(u8, out.log_backend, "s3"))
+            {
+                std.debug.print(
+                    "error: --log-backend must be 'raft' or 's3' (got '{s}')\n",
+                    .{out.log_backend},
+                );
+                return error.Usage;
+            }
         } else {
             return error.Usage;
         }

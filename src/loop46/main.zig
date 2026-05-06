@@ -336,6 +336,14 @@ const WorkerCtx = struct {
     /// opens with a counter from this registry so seq allocation
     /// stays globally monotonic.
     seq_counters: *kv.SeqCounterRegistry,
+    /// Phase 5.5 (a). Borrowed from main thread's CLI parse.
+    log_backend: rjs.LogBackend,
+    /// Borrowed from main thread; non-null only when `log_backend ==
+    /// .s3`. Same `BatchStore` shared by every worker thread (the
+    /// underlying FilesystemBatchStore / S3 client is thread-safe
+    /// for concurrent put — they use process-wide state). Lives for
+    /// the worker's full lifetime.
+    log_batch_store: ?log_server.batch_store.BatchStore,
     /// Main thread blocks on these until every worker has bound its
     /// h2 listener — this is what `SO_REUSEPORT` needs before requests
     /// can hit any of them.
@@ -439,6 +447,8 @@ fn workerMain(args: *WorkerCtx) !void {
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
         .blob_backend = args.blob_backend_cfg,
+        .log_backend = args.log_backend,
+        .log_batch_store = args.log_batch_store,
     });
     defer worker.destroy();
 
@@ -904,6 +914,41 @@ pub fn main() !void {
 
     try bootstrapTenants(allocator, cli, blob_owned.cfg);
 
+    // ── Log batch store (Phase 5.5 a) ─────────────────────────────────
+    //
+    // Worker's `flushLogs` writes here when `--log-backend s3`. Picks
+    // its backend from env: LOG_BATCH_STORE_BACKEND=fs|s3 (default fs),
+    // LOG_BATCH_STORE_DIR (fs root, defaults to {data_dir}/log-batches).
+    // The s3 backend lands in a follow-up; for now fs is enough to
+    // exercise the worker path end-to-end.
+    const log_backend_str: []const u8 = cli.log_backend;
+    const log_backend: rjs.LogBackend = if (std.mem.eql(u8, log_backend_str, "s3"))
+        .s3
+    else
+        .raft;
+    var log_batch_store_handle: ?*log_server.batch_store.FilesystemBatchStore = null;
+    defer if (log_batch_store_handle) |h| h.deinit();
+    var log_batch_store: ?log_server.batch_store.BatchStore = null;
+    if (log_backend == .s3) {
+        const root_env = std.posix.getenv("LOG_BATCH_STORE_DIR");
+        const root: []const u8 = root_env orelse blk: {
+            const default_root = try std.fmt.allocPrint(
+                allocator,
+                "{s}/log-batches",
+                .{cli.data_dir},
+            );
+            break :blk default_root;
+        };
+        // Note: when root_env is null, `root` was just allocated and
+        // we let it leak for the process lifetime — the FilesystemBatchStore
+        // dupes the string internally so it's safe to drop our reference.
+        log_batch_store_handle = try log_server.batch_store.FilesystemBatchStore.init(allocator, root);
+        log_batch_store = log_batch_store_handle.?.batchStore();
+        std.log.info("log backend: s3 (fs-backed batch store at {s})", .{root});
+    } else {
+        std.log.info("log backend: raft (legacy envelope-1 path)", .{});
+    }
+
     const subsystem_max_connections: u32 = @as(u32, num_workers) + 4;
 
     // ── Raft setup ─────────────────────────────────────────────────────
@@ -1031,6 +1076,8 @@ pub fn main() !void {
             .blob_backend_cfg = blob_owned.cfg,
             .tls_config = tls_config,
             .seq_counters = &seq_counters,
+            .log_backend = log_backend,
+            .log_batch_store = log_batch_store,
             .ready = &ready_events[i],
         };
         threads[i] = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctxs[i]});

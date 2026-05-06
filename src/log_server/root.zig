@@ -53,6 +53,7 @@ pub const batch_store = @import("batch_store.zig");
 pub const index_db = @import("index_db.zig");
 pub const indexer = @import("indexer.zig");
 pub const standalone = @import("standalone.zig");
+pub const flush_writer = @import("flush_writer.zig");
 
 test {
     _ = sidecar;
@@ -60,6 +61,7 @@ test {
     _ = index_db;
     _ = indexer;
     _ = standalone;
+    _ = flush_writer;
 }
 
 pub const Error = error{

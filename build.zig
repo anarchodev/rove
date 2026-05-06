@@ -322,6 +322,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-blob", blob_mod);
     js_mod.addImport("rove-files", files_mod);
     js_mod.addImport("rove-log", log_mod);
+    js_mod.addImport("rove-log-server", log_server_mod);
     js_mod.addImport("rove-tape", tape_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
     js_mod.addImport("rove-webhook-server", webhook_server_mod);

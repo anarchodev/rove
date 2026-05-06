@@ -332,6 +332,27 @@ pub const LogStore = struct {
         return out;
     }
 
+    /// Hand the buffered records to the caller WITHOUT serializing.
+    /// Phase 5.5 (a) S3 flush path needs `LogRecord` access to build
+    /// per-record offset+length entries for the sidecar; the binary
+    /// serialization in `drainBatch` strips that. Caller takes
+    /// ownership of every record's `[]const u8` fields and the outer
+    /// slice; deinit each then `free` the slice with `allocator`.
+    /// Updates `last_flush_ns` like `drainBatch`. Returns null on
+    /// empty buffer.
+    pub fn drainRecords(self: *LogStore, allocator: std.mem.Allocator) Error!?[]LogRecord {
+        self.last_flush_ns = @as(i64, @intCast(std.time.nanoTimestamp()));
+        if (self.buffer.items.len == 0) return null;
+
+        const out = allocator.alloc(LogRecord, self.buffer.items.len) catch
+            return Error.OutOfMemory;
+        @memcpy(out, self.buffer.items);
+        // Records' []const u8 fields move into `out`. Clear the
+        // buffer without re-freeing them — caller owns now.
+        self.buffer.clearRetainingCapacity();
+        return out;
+    }
+
     /// Decode a batch payload (produced by `drainBatch` somewhere in
     /// the cluster — possibly this node, possibly another) and write
     /// each record to the local KV index. Idempotent on the
