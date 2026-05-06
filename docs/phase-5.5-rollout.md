@@ -183,7 +183,7 @@ each step.
 
 **Sub-plan**: `docs/webhook-server-plan.md`.
 
-### 3. Logs — **in progress (steps 2–3 done 2026-05-06)**
+### 3. Logs — **in progress (steps 2, 3, 3a done 2026-05-06)**
 
 **What it delivers**: log-server runs on its own subdomain
 (`logs.{public_suffix}`) with its own TLS and JWT-handoff auth.
@@ -219,10 +219,24 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
   path end-to-end: 3 acme requests → flush_writer sidecars on disk
   → standalone log-server indexes them → /list returns the records
   → /show round-trips via range-read.
+- **Step 3a — done.** `S3BatchStore` ships in
+  `src/log_server/batch_store_s3.zig`. Mirrors `S3BlobStore`'s sigv4
+  plumbing but adds the two ops the BlobStore doesn't have: `Range`-
+  header `getRange` for /show range-reads, and ListObjectsV2 with
+  `prefix=` + `start-after=` (XML response parsed with a tight
+  `<Key>...</Key>` substring scan). `FilesystemBatchStore` deleted
+  entirely — the design is S3-only after step 3a; an in-process
+  `MemoryBatchStore` keeps unit tests hermetic. `loop46/main.zig`
+  reads the same env vars as `BLOB_BACKEND=s3` plus an optional
+  `LOG_S3_KEY_PREFIX`; standalone log-server CLI dropped
+  `--batch-store-dir` for the same env-driven config. Smoke
+  (`scripts/log_backend_s3_smoke.sh`) hits the real OVH `replaykv`
+  bucket end-to-end. Two sigv4/std.http gotchas caught + fixed:
+  added `query_canonical` opt-out to sigv4 to avoid double-encoding
+  pre-canonicalized query strings; the wire URL must include the
+  query string (otherwise std.http forwards a query-less URL while
+  sigv4 signs a populated one, mismatching AWS's canonicalization).
 - Remaining steps (per `docs/logs-plan.md` §7):
-  3a. **Add S3 backend to `BatchStore`** (next, before step 4).
-      Mirror `S3BlobStore`'s sigv4 plumbing but with hierarchical
-      keys + LIST + getRange. Enables true multi-node operation.
   4. Switch worker default to `s3` in dev; verify dashboard via
      existing `/_system/log/*` proxy.
   5. Switch production default to `s3`.
