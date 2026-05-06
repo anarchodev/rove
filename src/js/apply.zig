@@ -385,8 +385,15 @@ pub const ApplyCtx = struct {
 
 /// The function rove-kv's `RaftNode` calls for every committed entry
 /// in `.opaque_bytes` apply mode. Dispatches on envelope type byte.
+///
+/// `entry_idx` is the raft log index of this committed entry. Phase
+/// 5.5(c) snapshot model uses it as the per-store
+/// `_apply_state.last_applied_raft_idx` stamp + filter so a follower
+/// loaded from a snapshot at floor F can replay entries F+1..N
+/// without re-applying anything already in the snapshot. Pre-snapshot
+/// stores have `last_applied=0` so the filter is a no-op.
 pub fn applyOne(
-    _: u64, // entry_idx — we don't track per-row seq in M1
+    entry_idx: u64,
     payload: []const u8,
     ctx_opaque: ?*anyopaque,
 ) void {
@@ -398,15 +405,15 @@ pub fn applyOne(
         .{@errorName(err)},
     );
 
-    dispatch(ctx, env, .top_level);
+    dispatch(ctx, env, entry_idx, .top_level);
 }
 
 const NestingLevel = enum { top_level, inside_multi };
 
-fn dispatch(ctx: *ApplyCtx, env: Envelope, nesting: NestingLevel) void {
+fn dispatch(ctx: *ApplyCtx, env: Envelope, entry_idx: u64, nesting: NestingLevel) void {
     switch (env.type) {
-        .writeset => applyWriteSet(ctx, env),
-        .root_writeset => applyRootWriteSet(ctx, env),
+        .writeset => applyWriteSet(ctx, env, entry_idx),
+        .root_writeset => applyRootWriteSet(ctx, env, entry_idx),
         .webhook_enqueue_batch => applyWebhookEnqueueBatch(ctx, env),
         .webhook_complete => applyWebhookComplete(ctx, env),
         .webhook_retry_schedule => applyWebhookRetrySchedule(ctx, env),
@@ -416,12 +423,12 @@ fn dispatch(ctx: *ApplyCtx, env: Envelope, nesting: NestingLevel) void {
                 "nested multi-envelope wrapper",
                 .{},
             );
-            applyMulti(ctx, env);
+            applyMulti(ctx, env, entry_idx);
         },
     }
 }
 
-fn applyWriteSet(ctx: *ApplyCtx, env: Envelope) void {
+fn applyWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
     // Leader-skip: workers already wrote through their own
     // connections before proposing. On the leader, apply is a no-op
     // beyond advancing `committed_seq` (done by the caller).
@@ -433,7 +440,18 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope) void {
         .{ env.instance_id, @errorName(err) },
     );
 
-    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
+    // Snapshot-replay filter: if this store has already absorbed an
+    // entry at this idx (via snapshot load or earlier apply), skip.
+    // The stamp inside applyEncoded keeps the next write moving the
+    // mark forward atomically with the writeset commit.
+    const last = store.lastAppliedRaftIdx() catch |err| panic_mod.invariantViolated(
+        "applyWriteSet.lastAppliedRaftIdx",
+        "tenant={s} err={s}",
+        .{ env.instance_id, @errorName(err) },
+    );
+    if (entry_idx <= last) return;
+
+    kv.applyEncodedWriteSet(store, 0, env.payload, entry_idx) catch |err| panic_mod.invariantViolated(
         "applyWriteSet.applyEncodedWriteSet",
         "tenant={s} err={s}",
         .{ env.instance_id, @errorName(err) },
@@ -444,7 +462,7 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope) void {
 /// node's copy of `__root__.db`. Leader-skip matches the per-tenant
 /// path — the proposer already wrote locally before proposing, so
 /// the leader's own raft-thread apply is a no-op.
-fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope) void {
+fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
     if (ctx.raft.isLeader()) return;
     std.debug.assert(env.instance_id.len == 0);
 
@@ -454,7 +472,14 @@ fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope) void {
         .{@errorName(err)},
     );
 
-    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
+    const last = store.lastAppliedRaftIdx() catch |err| panic_mod.invariantViolated(
+        "applyRootWriteSet.lastAppliedRaftIdx",
+        "err={s}",
+        .{@errorName(err)},
+    );
+    if (entry_idx <= last) return;
+
+    kv.applyEncodedWriteSet(store, 0, env.payload, entry_idx) catch |err| panic_mod.invariantViolated(
         "applyRootWriteSet.applyEncodedWriteSet",
         "err={s}",
         .{@errorName(err)},
@@ -606,7 +631,7 @@ fn applyWebhookRetrySchedule(ctx: *ApplyCtx, env: Envelope) void {
 /// Phase 5.5 (d). Multi-envelope wrapper: unwraps inner envelopes and
 /// dispatches each. Inner envelopes apply in order. Nesting (multi
 /// inside multi) panics in `dispatch`.
-fn applyMulti(ctx: *ApplyCtx, env: Envelope) void {
+fn applyMulti(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
     std.debug.assert(env.instance_id.len == 0);
     const inner = decodeMultiInner(ctx.allocator, env.payload) catch |err|
         panic_mod.invariantViolated(
@@ -616,6 +641,11 @@ fn applyMulti(ctx: *ApplyCtx, env: Envelope) void {
         );
     defer ctx.allocator.free(inner);
 
+    // Inner envelopes share the wrapper's raft entry idx — they
+    // landed in the log atomically together, so a snapshot loaded
+    // partway through the wrapper would either be missing the whole
+    // multi or have it. Per-store filtering still applies inside
+    // each inner dispatch.
     for (inner) |bytes| {
         const inner_env = decodeEnvelope(bytes) catch |err|
             panic_mod.invariantViolated(
@@ -623,7 +653,7 @@ fn applyMulti(ctx: *ApplyCtx, env: Envelope) void {
                 "err={s}",
                 .{@errorName(err)},
             );
-        dispatch(ctx, inner_env, .inside_multi);
+        dispatch(ctx, inner_env, entry_idx, .inside_multi);
     }
 }
 

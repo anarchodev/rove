@@ -189,6 +189,8 @@ pub const KvStore = struct {
     stmt_savepoint: *c.sqlite3_stmt,
     stmt_release: *c.sqlite3_stmt,
     stmt_rollback_to: *c.sqlite3_stmt,
+    stmt_apply_state_get: *c.sqlite3_stmt,
+    stmt_apply_state_put: *c.sqlite3_stmt,
 
     /// Open mode for `openInternal`. Most callers use `open` for the
     /// read-write path; `openReadOnly` is for inspection tools (the
@@ -288,6 +290,7 @@ pub const KvStore = struct {
             if (c.sqlite3_exec(db, schema.SQL_CREATE_SEQ, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
             if (c.sqlite3_exec(db, schema.SQL_CREATE_SEQ_INDEX, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
             if (c.sqlite3_exec(db, schema.SQL_CREATE_UNDO, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
+            if (c.sqlite3_exec(db, schema.SQL_CREATE_APPLY_STATE, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
         }
 
         self.allocator = allocator;
@@ -314,6 +317,8 @@ pub const KvStore = struct {
             .{ .sql = schema.SQL_SAVEPOINT_H, .field = "stmt_savepoint" },
             .{ .sql = schema.SQL_RELEASE_H, .field = "stmt_release" },
             .{ .sql = schema.SQL_ROLLBACK_TO_H, .field = "stmt_rollback_to" },
+            .{ .sql = schema.SQL_GET_APPLY_STATE, .field = "stmt_apply_state_get" },
+            .{ .sql = schema.SQL_PUT_APPLY_STATE, .field = "stmt_apply_state_put" },
         };
 
         errdefer {
@@ -367,6 +372,8 @@ pub const KvStore = struct {
         _ = c.sqlite3_finalize(self.stmt_savepoint);
         _ = c.sqlite3_finalize(self.stmt_release);
         _ = c.sqlite3_finalize(self.stmt_rollback_to);
+        _ = c.sqlite3_finalize(self.stmt_apply_state_get);
+        _ = c.sqlite3_finalize(self.stmt_apply_state_put);
         _ = c.sqlite3_close(self.db);
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -443,6 +450,41 @@ pub const KvStore = struct {
         _ = c.sqlite3_reset(st);
         schema.bindText(st, 1, key);
 
+        const rc = c.sqlite3_step(st);
+        _ = c.sqlite3_reset(st);
+        if (rc != c.SQLITE_DONE) return Error.Sqlite;
+    }
+
+    /// Read this store's `last_applied_raft_idx` from `_apply_state`.
+    /// Returns 0 when the row is missing — the natural baseline so a
+    /// fresh store accepts every committed raft entry, matching
+    /// pre-snapshot behavior. Phase 5.5(c).
+    pub fn lastAppliedRaftIdx(self: *KvStore) Error!u64 {
+        const st = self.stmt_apply_state_get;
+        _ = c.sqlite3_reset(st);
+        schema.bindText(st, 1, schema.APPLY_STATE_KEY_LAST_APPLIED);
+        const rc = c.sqlite3_step(st);
+        defer _ = c.sqlite3_reset(st);
+        if (rc == c.SQLITE_ROW) {
+            const v = c.sqlite3_column_int64(st, 0);
+            if (v < 0) return Error.Sqlite;
+            return @intCast(v);
+        }
+        if (rc == c.SQLITE_DONE) return 0;
+        return Error.Sqlite;
+    }
+
+    /// Stamp `_apply_state.last_applied_raft_idx = idx`. Caller is
+    /// responsible for ensuring the surrounding SQLite transaction
+    /// commits the row alongside the writeset's data ops — apply
+    /// callers do this from inside `applyEncodedWriteSet`'s implicit
+    /// transaction boundary; the snapshot follower-load path opens
+    /// its own.
+    pub fn setLastAppliedRaftIdx(self: *KvStore, idx: u64) Error!void {
+        const st = self.stmt_apply_state_put;
+        _ = c.sqlite3_reset(st);
+        schema.bindText(st, 1, schema.APPLY_STATE_KEY_LAST_APPLIED);
+        _ = c.sqlite3_bind_int64(st, 2, @bitCast(idx));
         const rc = c.sqlite3_step(st);
         _ = c.sqlite3_reset(st);
         if (rc != c.SQLITE_DONE) return Error.Sqlite;

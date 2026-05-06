@@ -157,7 +157,12 @@ pub fn cbApplyLog(
                 // txn that assigned the seq, BEFORE proposing. Followers
                 // replay the write-set into their own KvStore.
                 if (!is_leader) {
-                    writeset.applyEncoded(kv_cfg.store, seq, body) catch |err| {
+                    // .kv apply mode predates the snapshot model;
+                    // pass null `apply_idx` so the per-store
+                    // `_apply_state` stamp doesn't fire. Phase
+                    // 5.5(c)'s snapshot model only targets
+                    // `.opaque_bytes`.
+                    writeset.applyEncoded(kv_cfg.store, seq, body, null) catch |err| {
                         std.log.warn(
                             "raft_node: follower apply failed at idx={d} seq={d}: {s}",
                             .{ entry_idx, seq, @errorName(err) },

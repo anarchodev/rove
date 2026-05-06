@@ -63,6 +63,25 @@ pub const SQL_CREATE_UNDO =
     \\) WITHOUT ROWID;
 ;
 
+// Phase 5.5(c) — per-store apply-state for the snapshot model.
+// Each replicated store (per-tenant app.db, __root__.db, webhooks.db)
+// stamps `('last_applied_raft_idx', N)` here inside the same SQLite
+// transaction as every applied writeset. The follower-side snapshot
+// load populates it from the manifest's `snapshot_idx`; subsequent
+// raft entries replay through the apply path with `idx <= last_applied`
+// short-circuited so nothing applies twice. Default empty (= 0); on a
+// pre-snapshot db every committed raft entry is "new" relative to the
+// floor, which matches today's behavior.
+pub const SQL_CREATE_APPLY_STATE =
+    \\CREATE TABLE IF NOT EXISTS _apply_state (
+    \\  k TEXT PRIMARY KEY NOT NULL,
+    \\  v INTEGER NOT NULL
+    \\) WITHOUT ROWID;
+;
+pub const SQL_GET_APPLY_STATE = "SELECT v FROM _apply_state WHERE k = ?;";
+pub const SQL_PUT_APPLY_STATE = "INSERT OR REPLACE INTO _apply_state (k, v) VALUES (?, ?);";
+pub const APPLY_STATE_KEY_LAST_APPLIED: []const u8 = "last_applied_raft_idx";
+
 // ── Prepared statement SQL ────────────────────────────────────────────
 
 pub const SQL_GET = "SELECT value FROM kv WHERE key = ?;";
