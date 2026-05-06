@@ -893,10 +893,7 @@ state moves out of raft where stronger guarantees aren't needed):
    share path) and removes ~2 replicas-worth of in-process state from the
    worker.
 
-`S3BlobStore` itself stays deferred (single-host launch uses
-`FilesystemBlobStore`); the work above is ready for it because `BlobStore`
-is already the abstraction seam. **First customer can now take real
-production traffic without disk-fill within weeks.** MVP complete.
+Single-host launch defaults to `FilesystemBlobStore` against the local `{data_dir}`; multi-node launch picks `S3BlobStore` (shipped — see §9 "Blob replication" and §10.5) or a shared FS mount via `BLOB_BACKEND`. The work above is backend-agnostic because `BlobStore` is already the abstraction seam. **First customer can now take real production traffic without disk-fill within weeks.** MVP complete.
 
 The further detach of files-server / log-server into separately-deployed
 processes that admin's JS handler calls via `webhook.send` (rather than
@@ -1046,7 +1043,7 @@ Resolved items moved to §10. Open items:
 - **Phase 9 (encryption)**: commit to SQLCipher vs vendored VFS. Audit implications differ.
 - **Phase 10 (custom domains)**: ACME rate-limit strategy for a signup surge.
 - **Phase 5 (admin UI hosting)**: Cloudflare Pages vs rove-hosted dogfood for the admin UI static bundle in production. Dogfood is more honest; Cloudflare is lower risk for launch.
-- **Blob backend for multi-node** (new, §10 detail): shared filesystem mount vs `S3BlobStore` + SigV4 signer. Single-node launch doesn't need either; multi-node launch needs one.
+- **Blob backend for multi-node**: shared filesystem mount (`BLOB_BACKEND=fs`) vs `S3BlobStore` (`BLOB_BACKEND=s3`). Both shipped; ops decision per deployment. Single-node launch defaults to `fs` against local `{data_dir}`. See §10.5.
 
 ## 6. Relevant existing code
 
@@ -1274,12 +1271,12 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 - **1.0 adds**: `loop46 replay <id>` CLI spawning Node under `--inspect-brk` for DAP-aware editor attach (VS Code / JetBrains / nvim-dap / dap-mode). ~1-2 weeks.
 - No Chrome extension, no in-dashboard debugger UI. CodeMirror 6 lands in beta but only for syntax highlighting in the Code tab, not for an integrated debugger view (see §10.12 closing note + §10.16 beta launch list item 3).
 
-### Blob replication (multi-node prerequisite)
-- Raft envelopes now include `type=3` files_writeset replicating `{id}/files.db` across nodes — **done**
-- Blob bytes (`{id}/file-blobs/*`) **still local to the leader**. Multi-node setups need one of:
-  - Shared filesystem mount at `{data_dir}` (NFS/EFS/Ceph) — zero code, operator work
-  - Future `S3BlobStore` impl in `rove-blob` — not yet written
-- Single-node launch is unaffected; multi-node launch is gated on picking one.
+### Blob replication (multi-node prerequisite) — **done**
+- Raft envelopes include `type=3` files_writeset replicating `{id}/files.db` across nodes — **done**
+- Blob bytes (`{id}/file-blobs/*`) are not carried through raft envelopes (a 1MB static per envelope would blow raft-log size/latency budget). Multi-node setups configure a shared `BlobStore` backend via `BLOB_BACKEND=fs|s3`:
+  - **`fs`** (`FilesystemBlobStore`) — points at `{data_dir}` on every node, expects a shared mount (NFS / EFS / Ceph). Zero new code; ops responsibility.
+  - **`s3`** (`S3BlobStore`) — **shipped**. Path-style + SigV4-signed; works against AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces, MinIO, OVH Object Storage. Configured via `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_KEY_PREFIX_BASE` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `S3_USE_TLS`. Smoke-tested via `scripts/s3_blob_smoke.sh` (env vars sourced from repo-root `.env` per `reference_s3_smoke_env.md`).
+- Single-node launch defaults to `fs` against the local `{data_dir}`. Multi-node launch picks either backend; both work today.
 
 ## 10. Architecture decisions post-2026-04-17
 
@@ -1323,7 +1320,7 @@ Implemented PLAN §2.4's three-leg content-addressed protocol:
 - `PUT /v1/instances/{id}/blobs/{hash}` → server hashes on arrival, rejects mismatch
 - `POST /v1/instances/{id}/deployments` → full-replacement manifest commit, optional `parent_id` CAS
 
-The `uploads` object's URL is path-relative on the FS backend (client resolves against whichever origin it reached); when a future `S3BlobStore` lands it will return absolute pre-signed S3 URLs, client follows them verbatim. **Same client code, different backends.** Admin UI JS exposes `api.bulkDeploy(instance_id, files, {parent_id, comment})` that hashes client-side with `crypto.subtle.digest("SHA-256")`, checks, uploads missing in parallel, commits.
+The `uploads` object's URL is path-relative on the FS backend (client resolves against whichever origin it reached); on the S3 backend (shipped — see §9 "Blob replication") it returns absolute pre-signed S3 URLs and the client follows them verbatim. **Same client code, different backends.** Admin UI JS exposes `api.bulkDeploy(instance_id, files, {parent_id, comment})` that hashes client-side with `crypto.subtle.digest("SHA-256")`, checks, uploads missing in parallel, commits.
 
 ### 10.4 `webhook.send` stays vendor-neutral; `email.send` takes key as parameter
 
@@ -1334,16 +1331,18 @@ The `uploads` object's URL is path-relative on the FS backend (client resolves a
 - `X-Rove-Webhook-Id` + `X-Rove-Webhook-Attempt` headers (vendor-neutral; receivers use the id for dedup)
 - `email.send({key, from, to, subject, text?, html?, …})` takes the Resend key as an explicit argument. Customer's abuse-control concern: they can only email using a Resend key they provide. Our own magic-link email reads the platform Resend key from `__admin__/app.db` and accumulates a webhook batch entry on the dispatch state (proposed via envelope 4 alongside the writeset); customer handlers never see that key.
 
-### 10.5 Replication-ready blob backend (path B: shared object store)
+### 10.5 Replication-ready blob backend (path B: shared object store) — **shipped**
 
-Ruled out: "raft carries blob bytes." A 1MB static file per envelope would blow raft-log size and commit-fsync budget. Two options remain for multi-node:
+Ruled out: "raft carries blob bytes." A 1MB static file per envelope would blow raft-log size and commit-fsync budget. Two options for multi-node, both shipped:
 
-- **Shared filesystem mount** (NFS/EFS/Ceph) at `{data_dir}` on every node. Zero code — existing `FilesystemBlobStore` treats the mount like any other directory. Ops tradeoff: depends on reliable distributed FS.
-- **`S3BlobStore` + SigV4 signer** (~500-800 LOC, uses `std.http.Client`). Targets S3 the *protocol* — works against AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces, MinIO, etc. Credentials via env vars; no IAM metadata fetch in v1 (SSRF carve-out deferred).
+- **Shared filesystem mount** (NFS/EFS/Ceph) at `{data_dir}` on every node. Zero code — `FilesystemBlobStore` treats the mount like any other directory. Ops tradeoff: depends on reliable distributed FS.
+- **`S3BlobStore` + SigV4 signer**, in `rove-blob`. Targets S3 the *protocol* — works against AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces, MinIO, OVH Object Storage. Path-style URLs. Credentials via env vars; no IAM metadata fetch in v1 (SSRF carve-out deferred). Smoke-tested via `scripts/s3_blob_smoke.sh`.
+
+Backend pick is process-wide via `BLOB_BACKEND=fs|s3` (+ the `S3_*` / `AWS_*` env vars per CLAUDE.md), threaded through `WorkerConfig.blob_backend`, `ApplyCtx.blob_backend_cfg`, and the files-server / log-server `spawn` so every per-tenant backend opens against the same store. Per-tenant scoping in S3 uses key prefix `{key_prefix_base}{instance_id}/{file-blobs|log-blobs}/`, mirroring the on-disk layout exactly so leader and followers hit identical keys.
 
 OVH setup notes (if that's the target host): use OVH Object Storage "Standard" tier (S3-compatible), pick region matching compute (EU: GRA/SBG; NA: BHS), endpoint `https://s3.{region}.io.cloud.ovh.net`, path-style URLs.
 
-Caching shape for followers: `CachedBlobStore` wrapper composing local-FS in front of S3. Content-addressed → no staleness. Not yet built.
+Caching shape for followers: a `CachedBlobStore` wrapper composing local-FS in front of S3 is a future-deferred optimization. Content-addressed → no staleness, just an avoid-the-S3-roundtrip win. Not yet built; pick up if S3 latency starts hurting reads.
 
 ### 10.6 dispatchOnce refactored into phase-shaped helpers
 
@@ -1702,8 +1701,11 @@ Not available:
 ### Multi-node setup
 
 - Customer KV writes, request logs, root metadata, and files.db manifests all replicate via raft. **Blob bytes do not.**
-- Running more than one node requires either a shared filesystem mount at `{data_dir}` (NFS/EFS/Ceph) or a future `S3BlobStore` backend.
-- On leader failover, the new leader has full manifests but may 503 on any blob not yet cached locally until either (a) the shared backend serves them or (b) the leader pushes them to S3.
+- Running more than one node requires either a shared filesystem mount at `{data_dir}` (NFS/EFS/Ceph) or the shipped `S3BlobStore` backend (`BLOB_BACKEND=s3` + the `S3_*` / `AWS_*` env vars). Both work today.
+- Tape bodies (Phase 5.5 b — staged but not wired) live in `{inst.dir}/log-blobs/` only on the leader; on leader change, replay for old request IDs would 404 until that phase ships.
+- On leader failover, the new leader has full manifests but may 503 on any blob not yet served by the shared backend (FS mount serves them transparently; S3 backend serves them on first read).
+- Webhook delivery: today's drainer is leader-pinned and does an O(N tenants) scan of `_outbox/*` on leader change to enqueue any pending webhooks (Phase 5.5 d eliminates this with cluster-wide raft-replicated `webhooks.db`).
+- `raft.log.db` grows unbounded under sustained traffic until Phase 5.5 c (snapshot + log compaction) ships.
 
 ### Operational
 
