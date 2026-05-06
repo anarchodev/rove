@@ -51,6 +51,31 @@ The five pieces are ordered by **dependency × risk × value**:
 Each step is independently shippable + smoke-testable per its
 sub-plan's migration order. No big-bang cutovers between them.
 
+## Where we are (2026-05-06)
+
+- **(b) tape-body capture — done.** Bodies stored
+  content-addressed in `{inst.dir}/log-blobs/`; replay path
+  resolves by hash. Storage location moves to S3 in (a) Step A.
+- **(d) webhooks — done.** Cluster-wide `webhooks.db`, envelope
+  types 4/5/6, multi-envelope-per-raft-entry, leader-pinned
+  webhook-server thread.
+- **(a) logs — write path done.** Worker → S3 (ndjson + sidecar);
+  envelope type 1 + raft log path deleted. Read path (replay UI,
+  rove-log-cli) still goes through the legacy in-process
+  log-server thread; that's what (a) Step A retires.
+- **(e) files-server — not started.** Waits on (a) Step B
+  (subdomain + JWT-handoff pattern).
+- **(c) snapshot — not started.** Waits on (a) + (e) retiring
+  envelope types 1 + 3 to reduce raft log pressure.
+
+**Next two pickups, in priority order:**
+1. (a) Step A — replay read-side migration to S3 (unblocks
+   `replay_smoke`, fixes multi-node tape replay correctness).
+2. (a) Step B — log-server subdomain + JWT handoff (unblocks
+   piece 4).
+
+Detail per piece below.
+
 ## Per-piece status
 
 ### 1. Tape body capture — **done 2026-05-05**
@@ -183,7 +208,7 @@ each step.
 
 **Sub-plan**: `docs/webhook-server-plan.md`.
 
-### 3. Logs — **in progress (steps 2, 3, 3a, 4, 5+7+8 done 2026-05-06)**
+### 3. Logs — **in progress (write-path complete 2026-05-06; read-path migration pending)**
 
 **What it delivers**: log-server runs on its own subdomain
 (`logs.{public_suffix}`) with its own TLS and JWT-handoff auth.
@@ -267,22 +292,43 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
   `/_system/log/*` route (proxies to the now-empty in-process
   server). Step 9 (operator migrate-to-s3 helper) skipped per
   direction.
-- Remaining work (separate from this stream):
-  6. **Move log-server to its own subdomain** `logs.{public_suffix}`
-     with TLS + JWT-handoff auth.
-  - **Replay path read-side migration** to the standalone
-     log-server's S3-backed query API + a new
-     `/v1/{tenant}/blob/{hash}` endpoint that range-reads tape
-     blobs from S3. Once that lands, the in-process log-server
-     thread + `Worker.log_proxy` + per-tenant `log.db` come out
-     and replay_smoke comes back online.
+- **Up next — Step A: replay read-side migration to S3.** The
+  in-process log-server thread, `Worker.log_proxy`, the
+  `/_system/log/*` route, per-tenant `log.db`, and the `log-blobs/`
+  directory are all still alive solely because the replay UI +
+  `rove-log-cli bundle` read through them. Migrate replay onto the
+  standalone log-server's S3-backed query API: extend
+  `src/log_server/standalone.zig` with `/v1/{tenant}/blob/{hash}`
+  (range-reads a tape blob from S3) and have replay's existing
+  `_system/log/*` callers move to `logs.{public_suffix}` (or
+  loopback during the transition). Tape-body capture (Phase 5.5 b)
+  has to start uploading body blobs to S3 alongside the
+  `.ndjson.gz` + `.idx.json` instead of writing
+  `{inst.dir}/log-blobs/`. Once it lands: delete the in-process
+  log-server thread, `Worker.log_proxy`, the `/_system/log/*` route,
+  per-tenant `log.db` opens (`nextRequestSeq` moves to a header on
+  the worker's in-memory `TenantLog` plus restart-time S3 max
+  scan), the `log-blobs/` directory. Restore `replay_smoke` from
+  its current SKIP state. Add an integration smoke that hits the
+  standalone server's blob endpoint via the worker.
+- **Up next — Step B: log-server subdomain + JWT handoff.** Move
+  log-server off loopback onto `logs.{public_suffix}` with its own
+  TLS listener; add the token-handoff endpoints
+  (`/_admin/log-token`, `/_session/log-token`) on the worker /
+  admin domains; admin UI repointed at `logs.{public_suffix}`
+  directly. This establishes the subdomain + JWT-handoff pattern
+  that **files-server (piece 4 below)** then reuses, so it should
+  land before piece 4 starts. Independent of Step A — can land
+  before, after, or alongside — but Step A is higher-priority
+  because it unblocks `replay_smoke` and tape-body-capture
+  multi-node correctness.
 
 **Definition of done**: see `docs/logs-plan.md` §7 (migration
 sequence). Each step is independently shippable + smoke-testable.
 
 **Sub-plan**: `docs/logs-plan.md`.
 
-### 4. Files-server architectural move — **not started**
+### 4. Files-server architectural move — **not started (blocked on logs Step B)**
 
 **What it delivers**: files-server moves to its own subdomain
 (`files.{public_suffix}`), manifest in S3
@@ -290,6 +336,13 @@ sequence). Each step is independently shippable + smoke-testable.
 becomes `_deploy/active` kv marker observed via
 `markDirtyFromWriteset`. Worker drops `files.db` per tenant, the
 `/_system/files/*` proxy, and envelope type 3.
+
+**Why blocked**: piece 4 reuses the subdomain + JWT-handoff
+machinery introduced for log-server in (a) Step B. Starting
+files-server's subdomain move first would mean inventing the
+handoff pattern twice. The S3-manifest steps of (e) (steps 1–4 of
+its sub-plan) are independent and could proceed in parallel
+without that machinery, but the subdomain steps (5–6) need it.
 
 **Definition of done**: see `docs/files-server-plan.md` §9
 "Migration order."
