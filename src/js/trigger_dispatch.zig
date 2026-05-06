@@ -35,9 +35,6 @@ const js_null = globals.js_null;
 const PLATFORM_KV_PREFIXES_FIRE = [_][]const u8{
     "_audit/",
     "_deploy/",
-    "_outbox/",
-    "_outbox_inflight/",
-    "_dlq/",
     "_callback/",
     "_magic/",
     "_triggers/",

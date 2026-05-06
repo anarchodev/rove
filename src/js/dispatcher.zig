@@ -1932,14 +1932,14 @@ test "dispatch: kv.set rejects platform-reserved prefixes" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // Attempting to spoof an outbox row from customer code throws
+    // Attempting to spoof a callback row from customer code throws
     // Error{code: "reserved_key"}. Same shape applies to _events/,
-    // _callback/, _audit/, etc.
+    // _audit/, _magic/, _triggers/, etc.
     var resp = try runOne(
         &d,
         kv,
         \\try {
-        \\  kv.set("_outbox/spoofed", "x");
+        \\  kv.set("_callback/spoofed", "x");
         \\  return "no_throw";
         \\} catch (e) {
         \\  return e.code + ":" + e.message;
@@ -1950,10 +1950,10 @@ test "dispatch: kv.set rejects platform-reserved prefixes" {
     defer resp.deinit(testing.allocator);
 
     try testing.expect(std.mem.startsWith(u8, resp.body, "reserved_key:"));
-    try testing.expect(std.mem.indexOf(u8, resp.body, "_outbox/spoofed") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "_callback/spoofed") != null);
 
     // The spoofed row must NOT be in the kv after commit.
-    try testing.expectError(error.NotFound, kv.get("_outbox/spoofed"));
+    try testing.expectError(error.NotFound, kv.get("_callback/spoofed"));
 }
 
 test "dispatch: kv.delete rejects platform-reserved prefixes" {
@@ -1997,7 +1997,7 @@ test "dispatch: kv.delete rejects platform-reserved prefixes" {
 test "dispatch: kv.set into customer namespace still works" {
     // Regression: the reserved-prefix guard must not catch normal
     // customer keys that happen to share a prefix substring (e.g.
-    // "my_outbox/" should not collide with "_outbox/").
+    // "my_audit/" should not collide with "_audit/").
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2011,7 +2011,7 @@ test "dispatch: kv.set into customer namespace still works" {
     var r1 = try runOne(
         &d,
         kv,
-        \\kv.set("my_outbox/x", "v1");
+        \\kv.set("my_audit/x", "v1");
         \\kv.set("users/alice", "v2");
         \\return "ok";
     ,
@@ -2020,7 +2020,7 @@ test "dispatch: kv.set into customer namespace still works" {
     defer r1.deinit(testing.allocator);
     try testing.expectEqualStrings("ok", r1.body);
 
-    const a = try kv.get("my_outbox/x");
+    const a = try kv.get("my_audit/x");
     defer testing.allocator.free(a);
     try testing.expectEqualStrings("v1", a);
     const b = try kv.get("users/alice");
@@ -4499,11 +4499,11 @@ test "trigger: platform-key writes do not fire customer triggers" {
     defer ctx.deinit();
 
     // Customer's catch-all trigger would fire on every write, BUT
-    // `_outbox/...` is a platform key — the fire-time guard skips
+    // `_callback/...` is a platform key — the fire-time guard skips
     // dispatch so the customer's afterPut never sees system writes.
     const handler_bc = try ctx.compileToBytecode(
         \\export default function () {
-        \\  kv.set("_outbox/sys-write", "x");
+        \\  kv.set("_callback/sys-write", "x");
         \\  return "ok";
         \\}
     , "index.mjs", testing.allocator, .{ .kind = .module });
@@ -4540,8 +4540,8 @@ test "trigger: platform-key writes do not fire customer triggers" {
 
     try testing.expectEqual(@as(i32, 200), resp.status);
 
-    // Trigger SHOULD NOT have written `seen/_outbox/sys-write`.
-    try testing.expectError(error.NotFound, kv.get("seen/_outbox/sys-write"));
+    // Trigger SHOULD NOT have written `seen/_callback/sys-write`.
+    try testing.expectError(error.NotFound, kv.get("seen/_callback/sys-write"));
 }
 
 test "trigger: beforePut throw is catchable in handler with code='trigger_rejected'" {

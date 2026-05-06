@@ -25,11 +25,6 @@ const std = @import("std");
 /// the platform writers that own each namespace:
 ///   `_audit/`           → reserved for future audit log
 ///   `_deploy/`          → reserved for future deploy metadata in app.db
-///   `_outbox/`          → historical (legacy webhook drainer); kept
-///                         reserved so the prefix can't be spoofed by
-///                         customer writes after Phase 5.5 (d) cutover
-///   `_outbox_inflight/` → historical (legacy lease parking spot)
-///   `_dlq/`             → historical (legacy terminal-failed webhooks)
 ///   `_callback/`        → webhook envelope-5 apply writes here;
 ///                         dispatchCallbacks reads + invokes onResult
 ///   `_magic/`           → magic-link tokens (root.db only, but list-wide)
@@ -39,9 +34,6 @@ const std = @import("std");
 pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_audit/",
     "_deploy/",
-    "_outbox/",
-    "_outbox_inflight/",
-    "_dlq/",
     "_callback/",
     "_magic/",
     "_triggers/",
@@ -85,51 +77,56 @@ test "isReservedTriggerPrefix: customer prefixes are allowed" {
 
 test "isReservedTriggerPrefix: exact platform prefix blocked" {
     try std.testing.expect(isReservedTriggerPrefix("_audit/"));
-    try std.testing.expect(isReservedTriggerPrefix("_outbox/"));
+    try std.testing.expect(isReservedTriggerPrefix("_callback/"));
     try std.testing.expect(isReservedTriggerPrefix("_events/"));
     try std.testing.expect(isReservedTriggerPrefix("_sessions/"));
     try std.testing.expect(isReservedTriggerPrefix("_triggers/"));
 }
 
 test "isReservedTriggerPrefix: descendant of platform prefix blocked" {
-    try std.testing.expect(isReservedTriggerPrefix("_outbox/specific_id"));
+    try std.testing.expect(isReservedTriggerPrefix("_callback/specific_id"));
     try std.testing.expect(isReservedTriggerPrefix("_events/sid/0001-000001"));
 }
 
 test "isReservedTriggerPrefix: ancestor catching platform prefix blocked" {
     // `_aud` would catch writes to `_audit/foo`.
     try std.testing.expect(isReservedTriggerPrefix("_aud"));
-    // `_o` would catch writes to `_outbox/...`, `_outbox_inflight/...`.
-    try std.testing.expect(isReservedTriggerPrefix("_o"));
+    // `_c` would catch writes to `_callback/...`.
+    try std.testing.expect(isReservedTriggerPrefix("_c"));
     // `_` alone catches everything under any platform prefix.
     try std.testing.expect(isReservedTriggerPrefix("_"));
 }
 
 test "isReservedTriggerPrefix: deeper-than-platform blocked (would catch system writes)" {
     try std.testing.expect(isReservedTriggerPrefix("_audit/secrets/"));
-    try std.testing.expect(isReservedTriggerPrefix("_outbox/specific_id"));
+    try std.testing.expect(isReservedTriggerPrefix("_callback/specific_id"));
 }
 
 test "isCustomerWriteReserved: platform prefixes blocked" {
-    try std.testing.expect(isCustomerWriteReserved("_outbox/abc"));
     try std.testing.expect(isCustomerWriteReserved("_events/sid/0001-000001"));
     try std.testing.expect(isCustomerWriteReserved("_callback/xyz"));
-    try std.testing.expect(isCustomerWriteReserved("_dlq/abc"));
     try std.testing.expect(isCustomerWriteReserved("_audit/anything"));
     try std.testing.expect(isCustomerWriteReserved("_magic/token"));
+    try std.testing.expect(isCustomerWriteReserved("_triggers/users/index.mjs"));
 }
 
 test "isCustomerWriteReserved: customer keys allowed" {
     try std.testing.expect(!isCustomerWriteReserved(""));
     try std.testing.expect(!isCustomerWriteReserved("users/alice"));
-    try std.testing.expect(!isCustomerWriteReserved("my_outbox/x"));
+    try std.testing.expect(!isCustomerWriteReserved("my_audit/"));
     try std.testing.expect(!isCustomerWriteReserved("orders/123"));
     // Single-leading-underscore keys without trailing slash aren't
     // reserved (only the prefixes that include `/` are).
     try std.testing.expect(!isCustomerWriteReserved("_my_data"));
+    // Historical drainer prefixes are no longer reserved (Phase 5.5
+    // (d) deleted the drainer; the prefix names are now free for
+    // customer use).
+    try std.testing.expect(!isCustomerWriteReserved("_outbox/abc"));
+    try std.testing.expect(!isCustomerWriteReserved("_dlq/abc"));
+    try std.testing.expect(!isCustomerWriteReserved("_outbox_inflight/abc"));
 }
 
 test "isCustomerWriteReserved: exact prefix without trailing key part is blocked" {
     // The prefix itself counts as a write into the namespace.
-    try std.testing.expect(isCustomerWriteReserved("_outbox/"));
+    try std.testing.expect(isCustomerWriteReserved("_callback/"));
 }
