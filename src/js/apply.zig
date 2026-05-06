@@ -277,11 +277,27 @@ pub const ApplyCtx = struct {
     /// Lazy per-tenant KvStore cache (instance_id → *KvStore). Keys
     /// are owned copies of the instance id.
     kv_stores: std.StringHashMapUnmanaged(*kv.KvStore),
+    /// Phase 5.5(c) — in-memory mirror of every per-tenant
+    /// `_apply_state.last_applied_raft_idx` row. Seeded from disk on
+    /// lazy open in `getKv`; bumped inside `applyWriteSet` after a
+    /// successful apply. Used by the snapshot capture loop (next
+    /// pickup) to decide whether a tenant's db needs re-VACUUM since
+    /// the previous snapshot pass without a per-tenant SQLite query.
+    /// Borrowed keys: each entry's key is the same allocator-owned
+    /// string `kv_stores` holds, so the kv_stores map must outlive
+    /// this one (deinit orders it accordingly).
+    tenant_apply_idx: std.StringHashMapUnmanaged(u64) = .empty,
     /// Lazy root-store handle for `type=2 root_writeset` applies.
     /// Opens `{data_dir}/__root__.db` on first follower-side root
     /// apply. Null on the leader path (leader-skip fires before we'd
     /// open it) and on nodes that never see a root writeset.
     root_store: ?*kv.KvStore = null,
+    /// In-memory mirror of `__root__.db`'s `_apply_state` row. Seeded
+    /// from disk on `getRootKv`'s first call; bumped after each
+    /// successful root apply. The capture loop uses this to skip
+    /// re-VACUUM-ing the singleton root db when nothing has changed
+    /// since the previous snapshot.
+    root_apply_idx: u64 = 0,
     /// Lazy cluster-wide webhook store handle for `type=4/5/6` applies
     /// (Phase 5.5 d). Opens `{data_dir}/webhooks.db` on first webhook
     /// envelope. Unlike per-tenant stores this is shared across all
@@ -304,6 +320,10 @@ pub const ApplyCtx = struct {
     }
 
     pub fn deinit(self: *ApplyCtx) void {
+        // Drop the apply-idx mirror first — its keys are borrowed
+        // from kv_stores entries that follow.
+        self.tenant_apply_idx.deinit(self.allocator);
+
         var kv_it = self.kv_stores.iterator();
         while (kv_it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
@@ -354,6 +374,10 @@ pub const ApplyCtx = struct {
         defer self.allocator.free(path);
         const store = try kv.KvStore.open(self.allocator, path);
         self.root_store = store;
+        // Seed the in-memory mirror from disk so a node restart picks
+        // up where it left off — the snapshot capture loop trusts the
+        // mirror to decide whether root.db needs re-VACUUM.
+        self.root_apply_idx = store.lastAppliedRaftIdx() catch 0;
         return store;
     }
 
@@ -378,7 +402,35 @@ pub const ApplyCtx = struct {
         errdefer self.allocator.free(id_copy);
 
         try self.kv_stores.put(self.allocator, id_copy, store);
+        // Seed the per-tenant mirror from disk. Borrowed key shares
+        // the kv_stores allocation — see the field doc.
+        const seeded = store.lastAppliedRaftIdx() catch 0;
+        try self.tenant_apply_idx.put(self.allocator, id_copy, seeded);
         return store;
+    }
+
+    /// Bump the in-memory mirror after a successful tenant apply.
+    /// Keyed by `instance_id`; expects `getKv` to have populated the
+    /// entry already (which it does on first apply, since
+    /// `applyWriteSet` calls `getKv` before this).
+    fn noteTenantApplied(self: *ApplyCtx, instance_id: []const u8, idx: u64) void {
+        if (self.tenant_apply_idx.getPtr(instance_id)) |slot| slot.* = idx;
+    }
+
+    /// Bump the in-memory root-db mirror.
+    fn noteRootApplied(self: *ApplyCtx, idx: u64) void {
+        self.root_apply_idx = idx;
+    }
+
+    /// Snapshot capture loop's read interface. Returns null when this
+    /// node has never opened the named tenant's app.db (the in-memory
+    /// mirror seeds lazily in `getKv`).
+    pub fn tenantLastApplied(self: *const ApplyCtx, instance_id: []const u8) ?u64 {
+        return self.tenant_apply_idx.get(instance_id);
+    }
+
+    pub fn rootLastApplied(self: *const ApplyCtx) u64 {
+        return self.root_apply_idx;
     }
 
 };
@@ -456,6 +508,7 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
         "tenant={s} err={s}",
         .{ env.instance_id, @errorName(err) },
     );
+    ctx.noteTenantApplied(env.instance_id, entry_idx);
 }
 
 /// Follower-only: decode the root writeset and apply it to this
@@ -484,6 +537,7 @@ fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
         "err={s}",
         .{@errorName(err)},
     );
+    ctx.noteRootApplied(entry_idx);
 }
 
 /// Phase 5.5 (d). No leader-skip: the dispatcher (step 4) proposes
