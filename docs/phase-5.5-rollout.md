@@ -183,7 +183,7 @@ each step.
 
 **Sub-plan**: `docs/webhook-server-plan.md`.
 
-### 3. Logs — **in progress (steps 2, 3, 3a done 2026-05-06)**
+### 3. Logs — **in progress (steps 2, 3, 3a, 4 done 2026-05-06)**
 
 **What it delivers**: log-server runs on its own subdomain
 (`logs.{public_suffix}`) with its own TLS and JWT-handoff auth.
@@ -236,9 +236,33 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
   pre-canonicalized query strings; the wire URL must include the
   query string (otherwise std.http forwards a query-less URL while
   sigv4 signs a populated one, mismatching AWS's canonicalization).
-- Remaining steps (per `docs/logs-plan.md` §7):
-  4. Switch worker default to `s3` in dev; verify dashboard via
-     existing `/_system/log/*` proxy.
+- **Step 4 — done.** `WorkerConfig.log_backend` + the CLI default
+  flipped from `raft` to `s3`. All worker-spawning smokes that don't
+  exercise the new log path get explicit `--log-backend raft` so
+  they don't need S3 env. The existing `/_system/log/*` proxy
+  returns empty results under the default now (worker writes to S3,
+  not per-tenant `log.db`); the proxy stays around for one-release
+  rollback safety + because `replay` still uses per-tenant
+  `log-blobs/` for tape blobs. Skipping the optional step 9
+  migration helper per direction.
+- Remaining steps (compressed per direction "by the end have
+  removed raft as a log backend"):
+  5+7+8 (combined). **Delete the raft log path entirely.**
+     `flushOneRaft`, `WorkerConfig.log_backend`, the
+     `--log-backend` CLI flag, envelope type 1, `applyLogBatch`,
+     `RaftLogHandle`, `ApplyCtx.log_stores`, the in-process
+     log-server thread (`src/log_server/thread.zig`), the
+     `/_system/log/*` proxy + `Worker.log_proxy`, per-tenant
+     `log.db` opens. Replay path needs migration off the proxy
+     onto the standalone log-server's S3-backed query API +
+     a new `/v1/{tenant}/blob/{hash}` endpoint that range-reads
+     tape blobs from S3 (tape blobs need to live in S3 alongside
+     ndjson + sidecar). Smokes that exercise `/_system/log/*`
+     today (admin_smoke, proxy_smoke, replay_smoke) repoint at
+     the new query API.
+  6. **Move log-server to its own subdomain** `logs.{public_suffix}`
+     with TLS + JWT-handoff auth. Independent of the deletion
+     above; can land before, after, or alongside.
   5. Switch production default to `s3`.
   6. Move log-server to `logs.{public_suffix}` subdomain with
      TLS + JWT handoff.
