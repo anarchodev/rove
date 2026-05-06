@@ -183,7 +183,7 @@ each step.
 
 **Sub-plan**: `docs/webhook-server-plan.md`.
 
-### 3. Logs — **in progress (step 2 done 2026-05-06)**
+### 3. Logs — **in progress (steps 2–3 done 2026-05-06)**
 
 **What it delivers**: log-server runs on its own subdomain
 (`logs.{public_suffix}`) with its own TLS and JWT-handoff auth.
@@ -206,10 +206,23 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
   range-read /show, 404/405, incremental indexing). Cursor-based
   LIST optimization sketched in plan §4.3 deferred to v2 — full
   scan + DB-side dedup avoids the cross-tenant interleave bug.
+- **Step 3 — done.** Worker gains `--log-backend raft|s3` (default
+  `raft`). When `s3`, `flushLogs` builds `.ndjson` + `.idx.json` via
+  the new `flush_writer` and PUTs to a `BatchStore`. `LogStore`
+  gains `drainRecords` (sibling to `drainBatch`) so the s3 path
+  gets per-record offsets for the sidecar. `loop46/main.zig`
+  constructs a process-global `FilesystemBatchStore` rooted at
+  `LOG_BATCH_STORE_DIR` env (or `{data_dir}/log-batches`). The
+  S3-backed `BatchStore` lands in a follow-up before the default
+  flips in step 5; fs is enough to validate the worker integration.
+  Smoke (`scripts/log_backend_s3_smoke.sh`) drives the worker's s3
+  path end-to-end: 3 acme requests → flush_writer sidecars on disk
+  → standalone log-server indexes them → /list returns the records
+  → /show round-trips via range-read.
 - Remaining steps (per `docs/logs-plan.md` §7):
-  3. **Add s3 batch-store backend + worker `log.backend` flag**
-     (next). Worker writes start hitting the bucket behind a
-     `log.backend = raft | s3` flag; default stays `raft`.
+  3a. **Add S3 backend to `BatchStore`** (next, before step 4).
+      Mirror `S3BlobStore`'s sigv4 plumbing but with hierarchical
+      keys + LIST + getRange. Enables true multi-node operation.
   4. Switch worker default to `s3` in dev; verify dashboard via
      existing `/_system/log/*` proxy.
   5. Switch production default to `s3`.
