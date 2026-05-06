@@ -77,8 +77,7 @@ rm -rf "$DATA_DIR"
     --public-suffix "$PUBLIC_SUFFIX" \
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
-    --workers 1 \
-    --log-backend raft >/tmp/admin-smoke.out 2>&1 &
+    --workers 1 >/tmp/admin-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
 
@@ -285,58 +284,10 @@ code=$("${CURL_BASE[@]}" -o /dev/null -w '%{http_code}' "${AUTH_HDR[@]}" \
 [[ "$code" == "404" ]] || fail "unknown scope should 404 (got $code)"
 ok "X-Rove-Scope: <unknown> → 404"
 
-# ── 23. Log count reflects seeded requests (native proxy) ─────────
-sleep 1.5
-resp=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" "${API_URL_BASE}/_system/log/acme/count")
-count_n=$(printf '%s' "$resp" | tr -d '[:space:]')
-[[ "$count_n" -ge 3 ]] || fail "log count: expected >=3, got '$count_n'"
-ok "GET /_system/log/{id}/count returns a decimal"
-
-# ── 24. Log list returns records with CORS headers ────────────────
-headers_file=/tmp/admin-smoke-log-hdrs.txt
-"${CURL_BASE[@]}" -D "$headers_file" -o /tmp/admin-smoke-log.json \
-    "${AUTH_HDR[@]}" "${API_URL_BASE}/_system/log/acme/list?limit=50" >/dev/null
-grep -iq "access-control-allow-origin: $ORIGIN" "$headers_file" \
-    || fail "log list missing CORS header"
-rec_count=$(grep -oE '"request_id":' /tmp/admin-smoke-log.json | wc -l | tr -d ' ')
-[[ "$rec_count" -ge 3 ]] || fail "log list: expected >=3 records, got $rec_count"
-ok "GET /_system/log/{id}/list returns records + CORS"
-
-# ── 25. Log show returns full record for a known id ───────────────
-req_id=$(sed -E 's/.*"request_id":"([0-9a-f]+)".*/\1/' /tmp/admin-smoke-log.json | head -1)
-[[ ${#req_id} -eq 16 ]] || fail "couldn't parse request_id (got '$req_id')"
-resp=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" "${API_URL_BASE}/_system/log/acme/show/$req_id")
-printf '%s' "$resp" | grep -q "\"request_id\":\"$req_id\"" \
-    || fail "log show: request_id mismatch"
-ok "GET /_system/log/{id}/show/{hex} returns the full record"
-
-# ── 26. Log show with unknown id → 404 ────────────────────────────
-code=$("${CURL_BASE[@]}" -o /dev/null -w '%{http_code}' "${AUTH_HDR[@]}" \
-    "${API_URL_BASE}/_system/log/acme/show/ffffffffffffffff")
-[[ "$code" == "404" ]] || fail "unknown log id (got $code)"
-ok "log show with unknown id → 404"
-
-# ── 27. Log list pagination via after= cursor ─────────────────────
-# Page 1: limit=2 → 2 records + non-null next_cursor.
-page1=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" \
-    "${API_URL_BASE}/_system/log/acme/list?limit=2")
-p1_count=$(printf '%s' "$page1" | grep -oE '"request_id":' | wc -l | tr -d ' ')
-[[ "$p1_count" == "2" ]] || fail "log list page1 expected 2, got $p1_count: $page1"
-printf '%s' "$page1" | grep -q '"next_cursor":"' \
-    || fail "log list page1 missing next_cursor: $page1"
-cursor=$(printf '%s' "$page1" | sed -E 's/.*"next_cursor":"([0-9a-f]+)".*/\1/')
-[[ ${#cursor} -eq 16 ]] || fail "log list page1 cursor not 16-hex: '$cursor'"
-ok "log list page1 returns next_cursor"
-
-# Page 2: pass cursor → next batch, none of which appear in page 1.
-page2=$("${CURL_BASE[@]}" "${AUTH_HDR[@]}" \
-    "${API_URL_BASE}/_system/log/acme/list?limit=2&after=${cursor}")
-p2_count=$(grep -oE '"request_id":' <<<"$page2" | wc -l | tr -d ' ')
-[[ "$p2_count" -ge 1 ]] || fail "log list page2 expected >=1, got $p2_count: $page2"
-# Cursor row itself must NOT appear on page 2 (strictly older).
-printf '%s' "$page2" | grep -q "\"request_id\":\"$cursor\"" \
-    && fail "log list page2 echoed cursor row: $page2"
-ok "log list page2 advances strictly past cursor"
+# Cases 23–27 (log count / list / show / pagination via /_system/log/*)
+# moved out — Phase 5.5(a) deleted the raft log envelope. The replacement
+# is the standalone log-server backed by S3 (see scripts/log_backend_s3_smoke.sh);
+# wiring that into admin_smoke is its own task.
 
 echo ""
 echo "all admin smoke tests passed"

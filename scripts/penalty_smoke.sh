@@ -49,7 +49,6 @@ rm -rf "$DATA_DIR"
     --data-dir "$DATA_DIR" \
     --public-suffix loop46.localhost \
     --workers 1 \
-    --log-backend raft \
     >/tmp/penalty-smoke.out 2>&1 &
 WORKER_PID=$!
 trap 'kill $WORKER_PID 2>/dev/null || true; wait $WORKER_PID 2>/dev/null || true' EXIT

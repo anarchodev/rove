@@ -47,7 +47,6 @@ rm -rf "$DATA_DIR"
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$ROVE_TOKEN" \
     --public-suffix loop46.localhost \
-    --log-backend raft \
     >/tmp/proxy-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
@@ -131,37 +130,9 @@ code=$(curl --http2-prior-knowledge -s -o /dev/null -w '%{http_code}' \
     "http://$HTTP_ADDR/_system/foo/acme/x")
 expect "GET /_system/foo/.. (unimplemented)" 501 "$code"
 
-# Drive a couple of real requests so the tenant's log.db has
-# something to return, then exercise the /_system/log/* proxy.
-curl --http2-prior-knowledge -s -o /dev/null \
-    -H "Host: acme.loop46.localhost" "http://$HTTP_ADDR/?fn=handler" >/dev/null
-curl --http2-prior-knowledge -s -o /dev/null \
-    -H "Host: acme.loop46.localhost" "http://$HTTP_ADDR/?fn=handler" >/dev/null
-# Give the log buffer a moment to flush.
-sleep 1.2
-
-# GET /_system/log/acme/count — proxied through to log-server.
-body=$(curl --http2-prior-knowledge -s \
-    -H "Authorization: Bearer $ROVE_TOKEN" \
-    "http://$HTTP_ADDR/_system/log/acme/count" | tr -d '\n')
-case "$body" in
-    [1-9]*) echo "ok  proxy log count: $body" ;;
-    *) echo "FAIL log count: expected >=1, got '$body'" >&2; exit 1 ;;
-esac
-
-# GET /_system/log/acme/list?limit=5 — should return JSON with records.
-body=$(curl --http2-prior-knowledge -s \
-    -H "Authorization: Bearer $ROVE_TOKEN" \
-    "http://$HTTP_ADDR/_system/log/acme/list?limit=5")
-case "$body" in
-    *'"records":['*)
-        echo "ok  proxy log list: JSON returned"
-        ;;
-    *)
-        echo "FAIL log list: unexpected body '$body'" >&2
-        exit 1
-        ;;
-esac
+# /_system/log/* round-trip checks moved out — Phase 5.5(a) deleted
+# the raft log envelope, and the read-side replacement (S3 indexer)
+# isn't wired into this smoke. Auth gate still tested.
 
 # Missing auth on log endpoint → 401.
 code=$(curl --http2-prior-knowledge -s -o /dev/null -w '%{http_code}' \

@@ -336,13 +336,11 @@ const WorkerCtx = struct {
     /// opens with a counter from this registry so seq allocation
     /// stays globally monotonic.
     seq_counters: *kv.SeqCounterRegistry,
-    /// Phase 5.5 (a). Borrowed from main thread's CLI parse.
-    log_backend: rjs.LogBackend,
-    /// Borrowed from main thread; non-null only when `log_backend ==
-    /// .s3`. Same `BatchStore` shared by every worker thread (the
-    /// underlying FilesystemBatchStore / S3 client is thread-safe
-    /// for concurrent put — they use process-wide state). Lives for
-    /// the worker's full lifetime.
+    /// Phase 5.5 (a). Borrowed from main thread; null when S3 env
+    /// vars aren't set (dev / smoke). Same `BatchStore` shared by
+    /// every worker thread (the underlying S3 client is thread-safe
+    /// for concurrent put — process-wide state). Lives for the
+    /// worker's full lifetime.
     log_batch_store: ?log_server.batch_store.BatchStore,
     /// Main thread blocks on these until every worker has bound its
     /// h2 listener — this is what `SO_REUSEPORT` needs before requests
@@ -447,7 +445,6 @@ fn workerMain(args: *WorkerCtx) !void {
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
         .blob_backend = args.blob_backend_cfg,
-        .log_backend = args.log_backend,
         .log_batch_store = args.log_batch_store,
     });
     defer worker.destroy();
@@ -916,62 +913,64 @@ pub fn main() !void {
 
     // ── Log batch store (Phase 5.5 a) ─────────────────────────────────
     //
-    // Worker's `flushLogs` writes here when `--log-backend s3`. The
-    // store is the new `S3BatchStore` that talks real S3 via the
-    // sigv4 helpers shared with `rove-blob`. Reuses the same env vars
-    // as BLOB_BACKEND=s3 (S3_ENDPOINT / S3_REGION / S3_BUCKET /
+    // Worker's `flushLogs` writes here when configured. The store is
+    // an `S3BatchStore` that talks real S3 via the sigv4 helpers
+    // shared with `rove-blob`. Reuses the same env vars as
+    // BLOB_BACKEND=s3 (S3_ENDPOINT / S3_REGION / S3_BUCKET /
     // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) plus an optional
     // `LOG_S3_KEY_PREFIX` so log batches can sit under a named prefix
     // alongside other tenant-scoped artifacts in the same bucket.
-    // Filesystem backend is gone — the design is S3-only after step 3a.
-    const log_backend: rjs.LogBackend = if (std.mem.eql(u8, cli.log_backend, "s3"))
-        .s3
-    else
-        .raft;
+    //
+    // If the env vars aren't set the store stays null and `flushLogs`
+    // logs once + drops records. This is the dev / smoke path —
+    // production wires real S3.
     var log_batch_store_handle: ?*log_server.batch_store_s3.S3BatchStore = null;
     defer if (log_batch_store_handle) |h| h.deinit();
     var log_batch_store: ?log_server.batch_store.BatchStore = null;
-    if (log_backend == .s3) {
-        const endpoint = (try envOpt(allocator, ENV_S3_ENDPOINT)) orelse
-            failExit("loop46: --log-backend s3 requires {s} to be set\n", .{ENV_S3_ENDPOINT});
-        defer allocator.free(endpoint);
-        const region = (try envOpt(allocator, ENV_S3_REGION)) orelse
-            failExit("loop46: --log-backend s3 requires {s} to be set\n", .{ENV_S3_REGION});
-        defer allocator.free(region);
-        const bucket = (try envOpt(allocator, ENV_S3_BUCKET)) orelse
-            failExit("loop46: --log-backend s3 requires {s} to be set\n", .{ENV_S3_BUCKET});
-        defer allocator.free(bucket);
-        const access_key = (try envOpt(allocator, ENV_AWS_AK)) orelse
-            failExit("loop46: --log-backend s3 requires {s} to be set\n", .{ENV_AWS_AK});
-        defer allocator.free(access_key);
-        const secret_key = (try envOpt(allocator, ENV_AWS_SK)) orelse
-            failExit("loop46: --log-backend s3 requires {s} to be set\n", .{ENV_AWS_SK});
-        defer allocator.free(secret_key);
-        const key_prefix = (try envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
-            try allocator.dupe(u8, "");
-        defer allocator.free(key_prefix);
-        const use_tls = blk_tls: {
-            const v = (try envOpt(allocator, ENV_S3_USE_TLS)) orelse break :blk_tls true;
-            defer allocator.free(v);
-            if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk_tls false;
-            break :blk_tls true;
-        };
-        log_batch_store_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
-            .endpoint = endpoint,
-            .region = region,
-            .bucket = bucket,
-            .key_prefix = key_prefix,
-            .access_key = access_key,
-            .secret_key = secret_key,
-            .use_tls = use_tls,
-        });
-        log_batch_store = log_batch_store_handle.?.batchStore();
-        std.log.info(
-            "log backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
-            .{ endpoint, region, bucket, key_prefix },
-        );
-    } else {
-        std.log.info("log backend: raft (legacy envelope-1 path)", .{});
+    {
+        const endpoint = try envOpt(allocator, ENV_S3_ENDPOINT);
+        const region = try envOpt(allocator, ENV_S3_REGION);
+        const bucket = try envOpt(allocator, ENV_S3_BUCKET);
+        const access_key = try envOpt(allocator, ENV_AWS_AK);
+        const secret_key = try envOpt(allocator, ENV_AWS_SK);
+        defer if (endpoint) |s| allocator.free(s);
+        defer if (region) |s| allocator.free(s);
+        defer if (bucket) |s| allocator.free(s);
+        defer if (access_key) |s| allocator.free(s);
+        defer if (secret_key) |s| allocator.free(s);
+
+        if (endpoint != null and region != null and bucket != null and
+            access_key != null and secret_key != null)
+        {
+            const key_prefix = (try envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
+                try allocator.dupe(u8, "");
+            defer allocator.free(key_prefix);
+            const use_tls = blk_tls: {
+                const v = (try envOpt(allocator, ENV_S3_USE_TLS)) orelse break :blk_tls true;
+                defer allocator.free(v);
+                if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk_tls false;
+                break :blk_tls true;
+            };
+            log_batch_store_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+                .endpoint = endpoint.?,
+                .region = region.?,
+                .bucket = bucket.?,
+                .key_prefix = key_prefix,
+                .access_key = access_key.?,
+                .secret_key = secret_key.?,
+                .use_tls = use_tls,
+            });
+            log_batch_store = log_batch_store_handle.?.batchStore();
+            std.log.info(
+                "log backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
+                .{ endpoint.?, region.?, bucket.?, key_prefix },
+            );
+        } else {
+            std.log.info(
+                "log backend: none (S3 env not set — request logs will be dropped)",
+                .{},
+            );
+        }
     }
 
     const subsystem_max_connections: u32 = @as(u32, num_workers) + 4;
@@ -1016,7 +1015,6 @@ pub fn main() !void {
     defer raft_node.deinit();
 
     apply_ctx = rjs.apply.ApplyCtx.init(allocator, cli.data_dir, raft_node);
-    apply_ctx.blob_backend_cfg = blob_owned.cfg;
     defer apply_ctx.deinit();
 
     var raft_thread = try std.Thread.spawn(.{}, raftThreadMain, .{raft_node});
@@ -1101,7 +1099,6 @@ pub fn main() !void {
             .blob_backend_cfg = blob_owned.cfg,
             .tls_config = tls_config,
             .seq_counters = &seq_counters,
-            .log_backend = log_backend,
             .log_batch_store = log_batch_store,
             .ready = &ready_events[i],
         };

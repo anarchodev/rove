@@ -63,7 +63,6 @@ rm -rf "$DATA_DIR"
     --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
-    --log-backend raft \
     --fresh >/tmp/signup-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
@@ -301,7 +300,6 @@ wait $PID 2>/dev/null || true
     --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
-    --log-backend raft \
     >>/tmp/signup-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT

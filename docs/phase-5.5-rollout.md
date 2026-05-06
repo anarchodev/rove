@@ -183,7 +183,7 @@ each step.
 
 **Sub-plan**: `docs/webhook-server-plan.md`.
 
-### 3. Logs — **in progress (steps 2, 3, 3a, 4 done 2026-05-06)**
+### 3. Logs — **in progress (steps 2, 3, 3a, 4, 5+7+8 done 2026-05-06)**
 
 **What it delivers**: log-server runs on its own subdomain
 (`logs.{public_suffix}`) with its own TLS and JWT-handoff auth.
@@ -245,33 +245,37 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
   rollback safety + because `replay` still uses per-tenant
   `log-blobs/` for tape blobs. Skipping the optional step 9
   migration helper per direction.
-- Remaining steps (compressed per direction "by the end have
-  removed raft as a log backend"):
-  5+7+8 (combined). **Delete the raft log path entirely.**
-     `flushOneRaft`, `WorkerConfig.log_backend`, the
-     `--log-backend` CLI flag, envelope type 1, `applyLogBatch`,
-     `RaftLogHandle`, `ApplyCtx.log_stores`, the in-process
-     log-server thread (`src/log_server/thread.zig`), the
-     `/_system/log/*` proxy + `Worker.log_proxy`, per-tenant
-     `log.db` opens. Replay path needs migration off the proxy
-     onto the standalone log-server's S3-backed query API +
-     a new `/v1/{tenant}/blob/{hash}` endpoint that range-reads
-     tape blobs from S3 (tape blobs need to live in S3 alongside
-     ndjson + sidecar). Smokes that exercise `/_system/log/*`
-     today (admin_smoke, proxy_smoke, replay_smoke) repoint at
-     the new query API.
+- **Steps 5+7+8 (compressed) — done 2026-05-06.** Raft log WRITE
+  path deleted. Removed: `flushOneRaft`, `WorkerConfig.log_backend`,
+  the `LogBackend` enum, the `--log-backend` CLI flag, envelope
+  type 1, `applyLogBatch`, `RaftLogHandle`, `ApplyCtx.log_stores`,
+  `ApplyCtx.blob_backend_cfg` (was log-only). The dispatcher's
+  envelope dispatch table no longer carries `.log_batch`; the
+  decoder still rejects type=1 as `UnknownEnvelopeType` so a stale
+  raft entry surfaces loudly rather than silently mis-applying.
+  `loop46/main.zig` made the S3 batch-store wiring lenient — when
+  the `S3_*`/`AWS_*` env vars aren't set, `log_batch_store` stays
+  null and `flushLogs` drops records with a one-line warn (dev /
+  smoke path; production wires real S3). 14 smokes lost
+  `--log-backend raft` (flag is gone); admin_smoke + proxy_smoke
+  lost their `/_system/log/*` round-trip assertions (kept the auth
+  401 gate); replay_smoke skips entirely until the read-side
+  migration to S3 lands. KEPT for one more release: TenantLog +
+  per-tenant `log.db` (still needed for `nextRequestSeq`),
+  `log-blobs/` directory (tape body blobs), in-process log-server
+  thread (returns empty results), `Worker.log_proxy` +
+  `/_system/log/*` route (proxies to the now-empty in-process
+  server). Step 9 (operator migrate-to-s3 helper) skipped per
+  direction.
+- Remaining work (separate from this stream):
   6. **Move log-server to its own subdomain** `logs.{public_suffix}`
-     with TLS + JWT-handoff auth. Independent of the deletion
-     above; can land before, after, or alongside.
-  5. Switch production default to `s3`.
-  6. Move log-server to `logs.{public_suffix}` subdomain with
-     TLS + JWT handoff.
-  7. Deprecate worker's `/_system/log/*` proxy.
-  8. Remove envelope type 1, `RaftLogHandle`, `applyLogBatch`,
-     per-tenant `log.db` opens, the in-process log-server thread,
-     the `log.backend` flag.
-  9. One-shot `rove-log-cli migrate-to-s3` for any operator who
-     wants to retain pre-cutover records.
+     with TLS + JWT-handoff auth.
+  - **Replay path read-side migration** to the standalone
+     log-server's S3-backed query API + a new
+     `/v1/{tenant}/blob/{hash}` endpoint that range-reads tape
+     blobs from S3. Once that lands, the in-process log-server
+     thread + `Worker.log_proxy` + per-tenant `log.db` come out
+     and replay_smoke comes back online.
 
 **Definition of done**: see `docs/logs-plan.md` §7 (migration
 sequence). Each step is independently shippable + smoke-testable.

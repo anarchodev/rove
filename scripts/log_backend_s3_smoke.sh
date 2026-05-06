@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Phase 5.5 (a) end-to-end smoke against real S3.
 #
-#   1. Spawn loop46 with `--log-backend s3` (worker writes
-#      ndjson + sidecar to the bucket via S3BatchStore).
+#   1. Spawn loop46 with S3 env set (worker writes ndjson + sidecar
+#      to the bucket via S3BatchStore).
 #   2. Spawn the standalone log-server pointing at the SAME bucket
 #      (indexer polls + h2 query API serves).
 #   3. Drive a few requests against acme.
@@ -97,7 +97,7 @@ rm -rf "$DATA_DIR"
     --manifest examples/loop46-demo-tenants.json >/tmp/lbs-seed.out 2>&1 \
     || { cat /tmp/lbs-seed.out >&2; exit 2; }
 
-# ── Spawn worker with --log-backend s3 ─────────────────────────────
+# ── Spawn worker (S3 env wired in via bootstrap-time env vars) ─────
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
@@ -112,7 +112,6 @@ rm -rf "$DATA_DIR"
     --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
-    --log-backend s3 \
     >/tmp/lbs-worker.out 2>&1 &
 WORKER_PID=$!
 
@@ -151,7 +150,7 @@ fi
 # Confirm worker reported s3 backend at startup.
 grep -q "log backend: s3" /tmp/lbs-worker.out \
     || { echo "FAIL worker didn't report 's3' backend" >&2; tail -40 /tmp/lbs-worker.out >&2; exit 1; }
-echo "ok  worker started with --log-backend s3 → bucket=${S3_BUCKET} prefix=${SMOKE_PREFIX}"
+echo "ok  worker started with S3 backend → bucket=${S3_BUCKET} prefix=${SMOKE_PREFIX}"
 
 ok() { echo "ok  $1"; }
 fail() {

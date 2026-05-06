@@ -108,7 +108,6 @@ sleep 0.3
     --tls-key "$TLS_KEY" \
     --workers 1 \
     --refresh-interval-ms 100 \
-    --log-backend raft \
     --dev-webhook-unsafe \
     >/tmp/whs-smoke.out 2>&1 &
 WORKER_PID=$!

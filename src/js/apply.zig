@@ -8,8 +8,6 @@
 //!
 //! `type=0` → per-tenant writeset (payload is `WriteSet.encode` bytes,
 //!           target store = `{data_dir}/{id}/app.db`)
-//! `type=1` → per-tenant log batch (payload is `LogStore.drainBatch`
-//!           bytes, target store = `{data_dir}/{id}/log.db`)
 //! `type=2` → ROOT writeset (payload is `WriteSet.encode` bytes,
 //!           target store = `{data_dir}/__root__.db`, id_len must
 //!           be 0 — the envelope carries no per-tenant id)
@@ -18,6 +16,12 @@
 //!           for code manifests + deployment-pointer updates.
 //!           Blob bytes are NOT in this envelope — they live in a
 //!           shared BlobStore backend (path B: shared FS or S3).
+//!
+//! Type 1 (`log_batch`) was retired in Phase 5.5 (a) — log records
+//! flow worker → S3 (sidecar + ndjson) directly, no longer through
+//! raft. The decoder still rejects the value as `UnknownEnvelopeType`
+//! so a stale entry in someone's raft log surfaces loudly rather
+//! than silently mis-applying.
 //!
 //! The `id` is the tenant `instance_id`. `id_len` caps at 64KB. The
 //! trailing `payload` is whatever the dispatch callback for that
@@ -29,11 +33,6 @@
 //!   `TrackedTxn` already wrote locally), follower replays through
 //!   `kv.applyEncodedWriteSet` against the apply context's own
 //!   per-tenant kv store.
-//! - **type=1 log batch**: ALSO leader-skips — the worker h2 thread
-//!   is the sole writer to its own log.db on the leader, and running
-//!   this apply there would race on the same NOMUTEX sqlite
-//!   connection. Followers see this as the only code path writing
-//!   log.db, so their raft thread is safely the sole writer.
 //!
 //! ## Threading model — strict isolation from worker state
 //!
@@ -42,23 +41,22 @@
 //! connections between the raft thread and worker threads, which is
 //! undefined behavior per sqlite's threading docs.
 //!
-//! Instead, `ApplyCtx` owns ITS OWN per-tenant store map (`kv_stores`
-//! and `log_stores`), opened lazily on first apply for each tenant.
-//! These connections are raft-thread-local and never touched by any
-//! worker. They point at the same sqlite files the workers use, but
-//! via independent connections — WAL mode handles the coexistence.
+//! Instead, `ApplyCtx` owns ITS OWN per-tenant store map (`kv_stores`),
+//! opened lazily on first apply for each tenant. These connections
+//! are raft-thread-local and never touched by any worker. They point
+//! at the same sqlite files the workers use, but via independent
+//! connections — WAL mode handles the coexistence.
 //!
-//! On the leader, both apply paths short-circuit via the leader-skip,
-//! so the raft-thread-owned connections stay idle. Cost of an idle
-//! cached connection is a pair of fds per tenant; acceptable.
+//! On the leader, the writeset apply short-circuits via the
+//! leader-skip, so the raft-thread-owned connections stay idle. Cost
+//! of an idle cached connection is a pair of fds per tenant;
+//! acceptable.
 //!
 //! On followers, the raft thread is the only thread that writes
 //! tenant state, so there is no contention to coordinate with.
 
 const std = @import("std");
 const kv = @import("rove-kv");
-const log_mod = @import("rove-log");
-const blob_mod = @import("rove-blob");
 const webhook_server = @import("rove-webhook-server");
 const panic_mod = @import("panic.zig");
 
@@ -72,30 +70,8 @@ pub const Error = error{
 
 pub const MAX_ID_LEN: usize = 256;
 
-/// worker_id used for the raft-thread's own LogStore connections.
-/// Must not collide with any real worker's `worker_id` (which come
-/// from `raft.config.node_id`). We reserve the top bit — any worker
-/// using node_id >= 0x8000 would collide, but node ids that big are
-/// already out of range for a willemt cluster.
-pub const APPLY_WORKER_ID: u16 = 0xFFFF;
-
-/// Internal bundle of the three things needed to run a per-tenant
-/// log_store write on the raft thread: the sqlite connection, the
-/// blob backend, and the LogStore wrapping them. All three are
-/// allocated together, freed together.
-const RaftLogHandle = struct {
-    kv_store: *kv.KvStore,
-    /// fs or s3 — picked from `ApplyCtx.blob_backend_cfg`. With s3
-    /// the prefix is `{base}{instance_id}/log-blobs/`, mirroring the
-    /// worker's per-tenant layout exactly so leader and followers
-    /// hit identical keys.
-    blob_backend: blob_mod.BlobBackend,
-    store: log_mod.LogStore,
-};
-
 pub const EnvelopeType = enum(u8) {
     writeset = 0,
-    log_batch = 1,
     root_writeset = 2,
     files_writeset = 3,
     /// Phase 5.5 (d) — webhook enqueue batch. Payload is a
@@ -131,15 +107,6 @@ pub fn encodeWriteSetEnvelope(
     ws_bytes: []const u8,
 ) ![]u8 {
     return encodeTyped(allocator, .writeset, id, ws_bytes);
-}
-
-/// Build a log batch envelope. type=1 + id + batch bytes.
-pub fn encodeLogBatchEnvelope(
-    allocator: std.mem.Allocator,
-    id: []const u8,
-    batch_bytes: []const u8,
-) ![]u8 {
-    return encodeTyped(allocator, .log_batch, id, batch_bytes);
 }
 
 /// Build a root writeset envelope. type=2, no per-tenant id (id_len=0).
@@ -298,28 +265,24 @@ pub fn decodeEnvelope(payload: []const u8) Error!Envelope {
 /// are DISTINCT from any worker's connections; they exist solely for
 /// the raft thread's use.
 ///
-/// On the leader path, both `applyWriteSet` and `applyLogBatch`
-/// short-circuit via `raft.isLeader()`, so the cached stores stay
-/// idle — workers wrote locally via their own connections, and the
-/// raft thread just advances `committed_seq`. The caches come alive
-/// on followers, where the raft thread is the sole writer.
+/// On the leader path, `applyWriteSet` short-circuits via
+/// `raft.isLeader()`, so the cached stores stay idle — workers wrote
+/// locally via their own connections, and the raft thread just
+/// advances `committed_seq`. The caches come alive on followers,
+/// where the raft thread is the sole writer.
 ///
 /// Lifecycle: construct before starting the raft thread, `deinit`
 /// after the raft thread has stopped. The caches are grown only by
 /// the raft thread itself (via `applyOne`), so no locking is needed.
 pub const ApplyCtx = struct {
     allocator: std.mem.Allocator,
-    /// Root data dir. Per-tenant stores live at
-    /// `{data_dir}/{id}/{app,log}.db` + `log-blobs/`.
+    /// Root data dir. Per-tenant stores live at `{data_dir}/{id}/`.
     data_dir: []const u8,
     /// Used for the leader-skip check on every envelope type.
     raft: *kv.RaftNode,
     /// Lazy per-tenant KvStore cache (instance_id → *KvStore). Keys
     /// are owned copies of the instance id.
     kv_stores: std.StringHashMapUnmanaged(*kv.KvStore),
-    /// Lazy per-tenant log handle cache (instance_id → *RaftLogHandle).
-    /// Keys are owned copies of the instance id.
-    log_stores: std.StringHashMapUnmanaged(*RaftLogHandle),
     /// Lazy per-tenant files.db cache (instance_id → *KvStore). Parallel
     /// to `kv_stores` but keyed at `{data_dir}/{id}/files.db`.
     files_stores: std.StringHashMapUnmanaged(*kv.KvStore) = .empty,
@@ -335,12 +298,6 @@ pub const ApplyCtx = struct {
     /// to identical state via raft. Applied on BOTH leader and
     /// follower (no leader-skip): the proposer doesn't pre-write.
     webhooks_store: ?*webhook_server.WebhookStore = null,
-    /// Picks fs vs s3 for every per-tenant log blob backend the raft
-    /// thread opens. Must match the worker's `blob_backend` setting
-    /// — leader writes via the worker, followers read via this ctx;
-    /// using different backends would split the bytes across stores
-    /// the cluster can't agree on. Owned by the caller.
-    blob_backend_cfg: blob_mod.BackendConfig = .fs,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -352,7 +309,6 @@ pub const ApplyCtx = struct {
             .data_dir = data_dir,
             .raft = raft,
             .kv_stores = .empty,
-            .log_stores = .empty,
         };
     }
 
@@ -363,17 +319,6 @@ pub const ApplyCtx = struct {
             e.value_ptr.*.close();
         }
         self.kv_stores.deinit(self.allocator);
-
-        var log_it = self.log_stores.iterator();
-        while (log_it.next()) |e| {
-            self.allocator.free(e.key_ptr.*);
-            const h = e.value_ptr.*;
-            h.store.deinit();
-            h.blob_backend.deinit();
-            h.kv_store.close();
-            self.allocator.destroy(h);
-        }
-        self.log_stores.deinit(self.allocator);
 
         var files_it = self.files_stores.iterator();
         while (files_it.next()) |e| {
@@ -489,62 +434,6 @@ pub const ApplyCtx = struct {
         return store;
     }
 
-    /// Lazily open this tenant's log.db + log-blobs/ and wrap them
-    /// in a LogStore. Pointer is owned by the context.
-    fn getLog(self: *ApplyCtx, instance_id: []const u8) !*log_mod.LogStore {
-        if (self.log_stores.get(instance_id)) |existing| return &existing.store;
-
-        const inst_dir = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{s}",
-            .{ self.data_dir, instance_id },
-        );
-        defer self.allocator.free(inst_dir);
-        std.fs.cwd().makePath(inst_dir) catch {};
-
-        const log_db_path = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "{s}/log.db",
-            .{inst_dir},
-            0,
-        );
-        defer self.allocator.free(log_db_path);
-
-        const log_blob_dir = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/log-blobs",
-            .{inst_dir},
-        );
-        defer self.allocator.free(log_blob_dir);
-
-        const kv_store = try kv.KvStore.open(self.allocator, log_db_path);
-        errdefer kv_store.close();
-
-        const handle = try self.allocator.create(RaftLogHandle);
-        errdefer self.allocator.destroy(handle);
-        handle.kv_store = kv_store;
-        handle.blob_backend = try blob_mod.BlobBackend.openPerTenant(
-            self.allocator,
-            self.blob_backend_cfg,
-            log_blob_dir,
-            instance_id,
-            "log-blobs",
-        );
-        errdefer handle.blob_backend.deinit();
-        handle.store = try log_mod.LogStore.init(
-            self.allocator,
-            handle.kv_store,
-            handle.blob_backend.blobStore(),
-            APPLY_WORKER_ID,
-        );
-        errdefer handle.store.deinit();
-
-        const id_copy = try self.allocator.dupe(u8, instance_id);
-        errdefer self.allocator.free(id_copy);
-
-        try self.log_stores.put(self.allocator, id_copy, handle);
-        return &handle.store;
-    }
 };
 
 /// The function rove-kv's `RaftNode` calls for every committed entry
@@ -570,7 +459,6 @@ const NestingLevel = enum { top_level, inside_multi };
 fn dispatch(ctx: *ApplyCtx, env: Envelope, nesting: NestingLevel) void {
     switch (env.type) {
         .writeset => applyWriteSet(ctx, env),
-        .log_batch => applyLogBatch(ctx, env),
         .root_writeset => applyRootWriteSet(ctx, env),
         .files_writeset => applyFilesWriteSet(ctx, env),
         .webhook_enqueue_batch => applyWebhookEnqueueBatch(ctx, env),
@@ -645,28 +533,6 @@ fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope) void {
         "applyRootWriteSet.applyEncodedWriteSet",
         "err={s}",
         .{@errorName(err)},
-    );
-}
-
-fn applyLogBatch(ctx: *ApplyCtx, env: Envelope) void {
-    // Leader-skip for the same reason as writesets: on the leader,
-    // the worker h2 thread is the sole writer to log.db via its own
-    // connection, and running apply on the raft thread would race
-    // two NOMUTEX sqlite connections on the same file. Followers
-    // don't serve requests, so the raft thread is the sole writer
-    // to log.db on followers.
-    if (ctx.raft.isLeader()) return;
-
-    const store = ctx.getLog(env.instance_id) catch |err| panic_mod.invariantViolated(
-        "applyLogBatch.getLog",
-        "tenant={s} err={s}",
-        .{ env.instance_id, @errorName(err) },
-    );
-
-    store.applyBatch(env.payload) catch |err| panic_mod.invariantViolated(
-        "applyLogBatch.applyBatch",
-        "tenant={s} err={s}",
-        .{ env.instance_id, @errorName(err) },
     );
 }
 
@@ -944,18 +810,6 @@ test "files writeset envelope encode/decode round trip" {
     try testing.expectEqual(EnvelopeType.files_writeset, dec.type);
     try testing.expectEqualStrings(id, dec.instance_id);
     try testing.expectEqualStrings(ws, dec.payload);
-}
-
-test "log batch envelope encode/decode round trip" {
-    const id = "acme";
-    const batch = "log batch bytes";
-    const enc = try encodeLogBatchEnvelope(testing.allocator, id, batch);
-    defer testing.allocator.free(enc);
-
-    const dec = try decodeEnvelope(enc);
-    try testing.expectEqual(EnvelopeType.log_batch, dec.type);
-    try testing.expectEqualStrings(id, dec.instance_id);
-    try testing.expectEqualStrings(batch, dec.payload);
 }
 
 test "decodeEnvelope rejects truncated input" {
