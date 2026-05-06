@@ -8,7 +8,7 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 
 ## Product direction
 
-`rove` is the engine for **Loop46**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, transactional outbox for all external effects, page-level encryption at rest, etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information.
+`rove` is the engine for **Loop46**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via `webhook.send` / `email.send` / `events.emit`, page-level encryption at rest, etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. Sub-plans in `docs/` (`files-server-plan.md`, `logs-plan.md`, `sse-plan.md`, `snapshot-plan.md`, `webhook-server-plan.md`, `sim-test-framework.md`, `fixture-lifecycle.md`, `agent-surface.md`) elaborate specific PLAN sections.
 
 ## Build commands
 
@@ -48,7 +48,7 @@ rove-files (content-addressed files) ──┤          │
 rove-log (per-tenant request logs) ────┤          │
 rove-tape (deterministic replay) ──────┤          │
 rove-tenant (account/domain metadata) ─┤          │
-rove-qjs (QuickJS-ng wrapper) ─────────┤          │
+rove-qjs (arenajs JS engine wrapper) ──┤          │
                                        ↓          │
                               rove-js (worker dispatcher) ──┘
                               rove-files-server (compile/deploy HTTP surface)
@@ -73,7 +73,7 @@ Systems are pure functions called between `poll()` and `reg.flush()`, not method
 h2.request_out → dispatchPending → [drainRaftPending if writes] → h2.response_in → h2.response_out
 ```
 
-Each JS request gets a fresh QuickJS context. Snapshot/restore (memcpy of a pre-seeded arena) is the fast path for per-request context creation instead of full `JS_NewRuntime`.
+Each JS request gets a fresh JS context via arenajs's dual-arena reset (one cursor write per request — see `vendor/arenajs/README.md`). The base arena is built once at worker startup and shared across all requests on the thread; the per-request arena is reset between handler invocations.
 
 ### Data durability model
 
@@ -81,7 +81,7 @@ Local KV writes commit immediately (releasing the lock fast), then a parallel Ra
 
 ### What replicates through raft
 
-Envelopes are typed byte blobs (`src/js/apply.zig`):
+Envelopes are typed byte blobs (`src/js/apply.zig`). Current state of the codebase:
 
 | Type | Target store | Producer |
 |---|---|---|
@@ -89,6 +89,8 @@ Envelopes are typed byte blobs (`src/js/apply.zig`):
 | `1` log_batch | `{data_dir}/{id}/log.db` | Worker `flushLogs` |
 | `2` root_writeset | `{data_dir}/__root__.db` | Signup's `tenant.createInstance`; admin JS `platform.root.*` |
 | `3` files_writeset | `{data_dir}/{id}/files.db` | Signup's `deployStarterContent`; files-server `putFileAndDeploy` |
+
+Phase 5.5 retires types 1 and 3 (logs go S3-direct per `docs/logs-plan.md`; files manifest moves to S3 per `docs/files-server-plan.md`) and adds types 4/5/6 for the cluster-wide raft-replicated `webhooks.db` per `docs/webhook-server-plan.md`. Multi-envelope-per-raft-entry support also lands then so envelope 4 (webhook batch) can ride atomically with envelope 0 (writeset). See PLAN.md §10.2 for the full evolution table.
 
 ### Blob replication (multi-node)
 
@@ -112,4 +114,4 @@ See `vendor/README.md` for upstream revisions, patches, and maintenance procedur
 - Tests are inline Zig tests (`test "description" { ... }`) co-located with the code they cover.
 - Module public API is exported through each module's `root.zig`.
 - No async/await — concurrency uses collection-based polling + phase-based dispatch.
-- Comments reference a "Phase" numbering system (0–6) tracking the incremental delivery plan.
+- Comments reference a "Phase" numbering system tracking the incremental delivery plan; phases run 0 through 14 (with 5.5 as the storage-scalability bucket). See `docs/PLAN.md` §3 for current phase content and §10.16 for the beta / 1.0 / post-1.0 launch sequencing.
