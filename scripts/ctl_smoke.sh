@@ -1,81 +1,139 @@
 #!/usr/bin/env bash
-# End-to-end smoke for the deploy flow against a live loop46 worker.
+# End-to-end smoke for the deploy flow against a 3-node loop46 cluster.
 #
-# Mirrors what `loop46-files-cli` would do (Phase 5.5(e) Step F1
-# retired the in-process rove-js-ctl Zig binary): mint a JWT via
-# `/_system/services-token`, upload sources via the standalone
-# files-server's `/{tenant}/upload`, deploy via `/{tenant}/deploy`,
-# then drive the resulting routes against the worker.
+# Phase 5.5(?) — `loop46 worker` requires --peers ≥ 2; this smoke
+# spins up 3 workers (matching the typical production 3-node deploy:
+# 1 leader + 2 followers, raft 2/3 quorum, 1-failure tolerance),
+# discovers the leader by probing each node's admin port, and drives
+# the deploy flow against the leader. Followers replicate via raft;
+# `dispatchOnce` leader-skips them on every request (existing
+# behavior — followers reject with 503 not leader).
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-ctl-smoke}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-ctl-smoke}"
 SRC_DIR="${SRC_DIR:-/tmp/rove-ctl-smoke-src}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8197}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8197}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40297}"
 LOG_ADDR="${LOG_ADDR:-127.0.0.1:8224}"
 FILES_ADDR="${FILES_ADDR:-127.0.0.1:8225}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40297}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
-PORT="${HTTP_ADDR##*:}"
-LOG_PORT="${LOG_ADDR##*:}"
-FILES_PORT="${FILES_ADDR##*:}"
 PUBLIC_SUFFIX="loop46.localhost"
 ADMIN_HOST="app.${PUBLIC_SUFFIX}"
-FILES_HOST="files.${PUBLIC_SUFFIX}"
-LOG_HOST="logs.${PUBLIC_SUFFIX}"
-ADMIN_ORIGIN="http://${HTTP_ADDR}"
+LOG_PORT="${LOG_ADDR##*:}"
+FILES_PORT="${FILES_ADDR##*:}"
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
     exit 2
 fi
 
-rm -rf "$DATA_DIR" "$SRC_DIR"
+# 3-node addresses derived from the port bases.
+HTTP_ADDRS=()
+RAFT_ADDRS=()
+DATA_DIRS=()
+for i in 0 1 2; do
+    HTTP_ADDRS+=("127.0.0.1:$((HTTP_PORT_BASE + i))")
+    RAFT_ADDRS+=("127.0.0.1:$((RAFT_PORT_BASE + i))")
+    DATA_DIRS+=("${DATA_DIR_PREFIX}-${i}")
+done
+PEERS_CSV=$(IFS=,; echo "${RAFT_ADDRS[*]}")
 
-# Pre-create the acme tenant via `loop46 seed` so the running worker
-# has it in its instance map.
+rm -rf "$SRC_DIR" "${DATA_DIRS[@]}"
+
+# Seed the same tenant on every node — each maintains its own
+# __root__.db, but the membership has to match across the cluster
+# so raft's apply path replicates writes consistently.
 SEED_MANIFEST=$(mktemp --suffix=.json)
 cat > "$SEED_MANIFEST" <<'EOF'
 {"tenants": [{"id": "acme", "domains": [], "files": []}]}
 EOF
-"$BIN" seed --data-dir "$DATA_DIR" --manifest "$SEED_MANIFEST"
+for d in "${DATA_DIRS[@]}"; do
+    "$BIN" seed --data-dir "$d" --manifest "$SEED_MANIFEST"
+done
 
-# Phase 5.5(e) Task #62 — files-server runs as a separate process.
-# Both the worker and the standalone need the same JWT secret in env
-# so the worker's `/_system/services-token` mints tokens that the
-# standalone verifies.
 . "$(dirname "$0")/_smoke_helpers.sh"
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
 
-# Spawn standalone services first so the worker has somewhere to
-# point `--files-public-base` / `--log-public-base` at right from
-# boot. Both share the worker's data_dir for the fs batch store +
-# manifest backend; LOOP46_SERVICES_JWT_SECRET in env wires the
-# JWT verification on both ends.
-spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/ctl-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
-spawn_log_server "$LOG_ADDR" "$DATA_DIR" /tmp/ctl-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
-
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --log-public-base "http://${LOG_ADDR}" \
-    --files-public-base "http://${FILES_ADDR}" \
-    --data-dir "$DATA_DIR" \
-    --public-suffix "$PUBLIC_SUFFIX" \
-    --bootstrap-root-token "$TOKEN" \
-    >/tmp/ctl-smoke.out 2>&1 &
-PID=$!
-trap 'kill $PID $CS_PID $LS_PID 2>/dev/null || true; wait $PID $CS_PID $LS_PID 2>/dev/null || true; rm -f "$SEED_MANIFEST"' EXIT
-sleep 1.0
+# Spawn the 3-node cluster first. Workers are configured with
+# `--files-public-base` / `--log-public-base` set to the eventual
+# (fixed) standalone addresses; the standalones don't have to be
+# up at worker startup — workers only need the URL strings to
+# return via /_system/services-token. We'll spawn the standalones
+# below pointing at whichever node ends up leader.
+PIDS=()
+for i in 0 1 2; do
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --log-public-base "http://${LOG_ADDR}" \
+        --files-public-base "http://${FILES_ADDR}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --bootstrap-root-token "$TOKEN" \
+        >"/tmp/ctl-smoke-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+trap '
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+    rm -f "$SEED_MANIFEST"
+' EXIT
+sleep 2
 
 # Smoke runs against h2c (no TLS); CURL is plain curl + h2c flag.
 CURL=(curl -sS --http2-prior-knowledge)
 
-# Mint the JWT by curling the worker. /_system/services-token returns
-# both files_url and log_url so smokes can hit each subdomain.
+# Discover the leader by probing each node's admin port. Followers
+# reject every request with 503 + "not leader; retry against the
+# cluster leader" (existing leader-skip in dispatchOnce). The
+# leader's `?fn=listInstance` returns 200. Tries up to 30 × 200ms
+# = 6s, generous enough for willemt's election timeout.
+LEADER_HTTP=""
+LEADER_IDX=""
+for _ in $(seq 1 30); do
+    for i in 0 1 2; do
+        code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+            -H "Host: $ADMIN_HOST" \
+            -H "Authorization: Bearer $TOKEN" \
+            "http://${HTTP_ADDRS[$i]}/?fn=listInstance" 2>/dev/null || echo 000)
+        if [[ "$code" == "200" ]]; then
+            LEADER_HTTP="${HTTP_ADDRS[$i]}"
+            LEADER_IDX="$i"
+            break 2
+        fi
+    done
+    sleep 0.2
+done
+if [[ -z "$LEADER_HTTP" ]]; then
+    echo "FAIL: no leader elected within 6s" >&2
+    for i in 0 1 2; do
+        echo "--- worker $i log (last 30 lines) ---" >&2
+        tail -30 "/tmp/ctl-smoke-worker-${i}.out" >&2
+    done
+    exit 1
+fi
+ADMIN_ORIGIN="http://${LEADER_HTTP}"
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+
+# Spawn files-server / log-server pinned to the leader's data_dir.
+# Multi-node deploys need a shared blob backend (S3 / NFS) so
+# blobs survive failover; for this smoke (no failover, just steady-
+# state leader processing) the leader's local data_dir is the
+# correct operational choice.
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/ctl-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+spawn_log_server   "$LOG_ADDR"   "${DATA_DIRS[$LEADER_IDX]}" /tmp/ctl-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
+
+# Mint the JWT by curling the leader. /_system/services-token
+# returns both files_url and log_url so smokes can hit each
+# subdomain.
 ROVE_TOKEN="$TOKEN"
 mint_services_token
 
@@ -92,20 +150,17 @@ expect() {
     local label="$1" expected="$2" actual="$3"
     if [[ "$actual" != "$expected" ]]; then
         echo "FAIL $label: expected '$expected', got '$actual'" >&2
-        echo "--- worker log ---" >&2
-        tail -30 /tmp/ctl-smoke.out >&2
+        for i in 0 1 2; do
+            echo "--- worker $i log ---" >&2
+            tail -30 "/tmp/ctl-smoke-worker-${i}.out" >&2
+        done
         exit 1
     fi
     echo "ok  $label"
 }
 
-# Files-server is bound on the loopback addr by spawn_files_server; we
-# call it directly with the JWT (no TLS — h2c on loopback). The
-# default log/files origins from /_system/services-token assume TLS
-# + a public suffix; here we override with the loopback addr.
 FILES_LOOP="http://${FILES_ADDR}"
 
-# Upload each source file by walking the dir.
 upload_file() {
     local rel="$1"
     local code
@@ -120,14 +175,17 @@ upload_file() {
 upload_file "index.mjs"
 upload_file "api/index.mjs"
 
-# Deploy.
 dep_id=$("${CURL[@]}" -X POST -H "Authorization: Bearer $JWT" \
     "${FILES_LOOP}/acme/deploy")
 [[ -n "$dep_id" ]] || { echo "FAIL deploy: empty response" >&2; exit 1; }
 echo "deployed 2 file(s) → id=${dep_id}"
 
-# Phase 5.5(e) F2 — push the release to the worker. Replaces the
-# 2-second `refreshDeployments` poll. Auth is the root bearer token.
+# Phase 5.5(e) F2 — push the release to the worker. Goes to the
+# leader; each worker process maintains its own ReleaseTable, so
+# the release fires reload only on the node receiving the request.
+# Followers will pick it up after raft replicates the kv write
+# (envelope 0 → `_deploy/current`); the existing
+# applyPendingReleases tick handles it.
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
     -X POST -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
@@ -136,12 +194,23 @@ code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
 [[ "$code" == "204" ]] || { echo "FAIL release: $code" >&2; exit 1; }
 echo "released dep_id=${dep_id}"
 
-# Hit the deployed handlers via the named-export RPC.
+# Hit the deployed handlers via the named-export RPC, against the
+# leader.
 got_root=$(curl -s --http2-prior-knowledge -H "Host: acme.${PUBLIC_SUFFIX}" "${ADMIN_ORIGIN}/?fn=handler")
 expect "GET /?fn=handler (ctl-deployed root handler)" "ctl-root" "$got_root"
 
 got_api=$(curl -s --http2-prior-knowledge -H "Host: acme.${PUBLIC_SUFFIX}" "${ADMIN_ORIGIN}/api?fn=handler")
 expect "GET /api?fn=handler (ctl-deployed sub-route)" "ctl-api" "$got_api"
+
+# Followers (every node that's NOT the leader) should reject with
+# 503 not-leader.
+for i in 0 1 2; do
+    [[ "$i" == "$LEADER_IDX" ]] && continue
+    code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+        -H "Host: acme.${PUBLIC_SUFFIX}" "http://${HTTP_ADDRS[$i]}/?fn=handler")
+    [[ "$code" == "503" ]] || { echo "FAIL: follower $i should 503, got $code" >&2; exit 1; }
+done
+echo "ok  followers reject with 503 not-leader"
 
 # Wrong JWT secret → 401 from the files-server. We mint a token with
 # a randomly-different secret and confirm the upload is rejected.
@@ -165,4 +234,4 @@ code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
 [[ "$code" == "401" ]] || { echo "FAIL wrong jwt: expected 401, got $code" >&2; exit 1; }
 echo "ok  deploy with wrong JWT: rejected (401)"
 
-echo "PASS ctl smoke"
+echo "PASS ctl smoke (3-node)"

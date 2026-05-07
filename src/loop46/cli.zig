@@ -387,6 +387,29 @@ pub fn finalizeCli(allocator: std.mem.Allocator, cli: *Cli) !void {
             );
             return error.Usage;
         }
+
+        // Production deploys are multi-node (1 leader + ≥2 followers
+        // for raft 2/3 quorum / 1-failure tolerance). Reject single-
+        // node `--peers` so a misconfig — or worse, a "looked fine in
+        // dev so we shipped it" path — surfaces at startup rather
+        // than at first failover. `loop46 dev` keeps the single-node
+        // ergonomic for local iteration; the smokes that mirror
+        // production spin up real multi-node clusters.
+        var peer_count: usize = 1;
+        for (cli.peers) |b| {
+            if (b == ',') peer_count += 1;
+        }
+        if (peer_count < 2) {
+            std.debug.print(
+                "error: --peers must list at least 2 entries in worker " ++
+                    "mode (got: \"{s}\"). Production deploys require ≥3 " ++
+                    "for raft 2/3 quorum + 1-failure tolerance; 2 is the " ++
+                    "minimum that exercises the multi-node code paths.\n" ++
+                    "       For local iteration use `loop46 dev`.\n",
+                .{cli.peers},
+            );
+            return error.Usage;
+        }
     }
 
     if (cli.admin_api_domain == null) {
