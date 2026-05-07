@@ -41,6 +41,7 @@ const files_mod = @import("rove-files");
 const qjs = @import("rove-qjs");
 
 pub const thread = @import("thread.zig");
+pub const bootstrap = @import("bootstrap.zig");
 
 pub const Error = error{
     InvalidInstanceId,

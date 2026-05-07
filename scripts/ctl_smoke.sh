@@ -107,7 +107,7 @@ discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
 echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 ADMIN_ORIGIN="https://${ADMIN_HOST}:${LEADER_PORT}"
 
-spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/ctl-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/ctl-smoke-cs.out "$ADMIN_ORIGIN" "$ADMIN_ORIGIN" || exit 1
 spawn_log_server   "$LOG_ADDR"   "${DATA_DIRS[$LEADER_IDX]}" /tmp/ctl-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
 # Mint the JWT by curling the leader. /_system/services-token

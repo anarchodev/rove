@@ -80,12 +80,35 @@ spawn_files_server() {
     local data_dir="$2"
     local log_path="$3"
     local cors_origin="${4:-}"
-    "${BIN%/loop46}/files-server-standalone" \
+    # Optional 5th arg: leader URL. When set, files-server runs the
+    # one-time platform-deploy bootstrap (admin/replay) before
+    # serving. files-server's release POST shells out to curl (worker
+    # speaks h2 only; Zig's std.http.Client is HTTP/1.1); to reach
+    # `app.{public_suffix}:port` from inside the binary we pass the
+    # CA bundle + --resolve mapping via env (LOOP46_LEADER_CACERT /
+    # LOOP46_LEADER_RESOLVE) — same shape as the smoke's own curl.
+    local leader_url="${5:-}"
+    local env_assigns=()
+    if [[ -n "$leader_url" && -n "${CACERT:-}" ]]; then
+        env_assigns+=(LOOP46_LEADER_CACERT="$CACERT")
+        # Map the admin host:port to 127.0.0.1 for curl's internal
+        # DNS override; the leader URL hostname (admin host) is what
+        # the cert SAN matches, but the cluster lives on loopback in
+        # smokes.
+        local leader_host_port="${leader_url#https://}"
+        leader_host_port="${leader_host_port#http://}"
+        local leader_host="${leader_host_port%%:*}"
+        local leader_port="${leader_host_port##*:}"
+        env_assigns+=(LOOP46_LEADER_RESOLVE="${leader_host}:${leader_port}:127.0.0.1")
+    fi
+    env "${env_assigns[@]}" \
+        "${BIN%/loop46}/files-server-standalone" \
         --data-dir "$data_dir" \
         --listen "$listen" \
         ${TLS_CERT:+--tls-cert "$TLS_CERT"} \
         ${TLS_KEY:+--tls-key "$TLS_KEY"} \
         ${cors_origin:+--cors-origin "$cors_origin"} \
+        ${leader_url:+--leader-url "$leader_url"} \
         >"$log_path" 2>&1 &
     CS_PID=$!
     # Wait for the standalone's startup line so the worker doesn't

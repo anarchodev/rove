@@ -37,6 +37,14 @@ const Cli = struct {
     tls_key: ?[]const u8 = null,
     cors_origin: ?[]const u8 = null,
     max_connections: u32 = 64,
+    /// Cluster leader's admin-host URL (e.g.
+    /// `https://app.loop46.localhost:8197`). When set, files-server
+    /// runs the platform-deploy bootstrap on startup: it ensures the
+    /// `__admin__` and `__replay__` tenants have a deployment in S3
+    /// and POSTs `/_system/release` to the leader so the
+    /// `_deploy/current` pointer lands via raft. Idempotent on warm
+    /// S3.
+    leader_url: ?[]const u8 = null,
 };
 
 fn usage(stderr: *std.fs.File.Writer) !void {
@@ -46,13 +54,16 @@ fn usage(stderr: *std.fs.File.Writer) !void {
         \\                               [--tls-cert <path> --tls-key <path>]
         \\                               [--cors-origin <origin>]
         \\                               [--max-connections <N>]
+        \\                               [--leader-url <admin-host-url>]
         \\
         \\env (required):
         \\  LOOP46_SERVICES_JWT_SECRET   hex HMAC-SHA256 shared with loop46 worker
+        \\  S3_ENDPOINT, S3_REGION, S3_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
         \\
-        \\env (optional, S3 blob backend):
-        \\  BLOB_BACKEND=s3              + S3_ENDPOINT / S3_REGION / S3_BUCKET /
-        \\                                AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+        \\When --leader-url is set, files-server runs a one-time platform-deploy
+        \\bootstrap before serving: it ensures __admin__ and __replay__ have a
+        \\deployment in S3 and POSTs /_system/release to the leader so the
+        \\_deploy/current pointer lands via raft. Idempotent on warm S3.
         \\
     );
     try stderr.interface.flush();
@@ -87,6 +98,10 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.max_connections = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--leader-url")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.leader_url = argv[i];
         } else {
             return error.Usage;
         }
@@ -200,6 +215,31 @@ pub fn main() !void {
         scheme, cli.listen, handle.port,
     });
     try sw.interface.flush();
+
+    // Platform-deploy bootstrap: ensure __admin__ and __replay__ have
+    // a deployment in S3 + a `_deploy/current` pointer in the
+    // cluster's app.db. Idempotent — a warm S3 + healthy cluster
+    // boils down to two HEADs and two release POSTs that the worker
+    // applies as no-ops. Skipped when --leader-url isn't set so the
+    // operator can run files-server in a "deploy server only, no
+    // cluster behind it" mode for development.
+    if (cli.leader_url) |leader_url| {
+        cs.bootstrap.bootstrapPlatformDeployments(
+            allocator,
+            blob_owned.cfg,
+            cli.data_dir,
+            leader_url,
+            jwt_secret,
+        ) catch |err| {
+            std.log.err(
+                "files-server bootstrap failed: {s} (leader_url={s})",
+                .{ @errorName(err), leader_url },
+            );
+            std.process.exit(2);
+        };
+    } else {
+        std.log.info("files-server: --leader-url not set, skipping platform-deploy bootstrap", .{});
+    }
 
     while (true) {
         std.Thread.sleep(1 * std.time.ns_per_s);
