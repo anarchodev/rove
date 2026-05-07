@@ -112,24 +112,53 @@ echo "ok  capture + restore round-trip (operator CLI)"
 # that captures landed in the snapshot store AND that willemt's
 # snapshot_last_idx advanced past 0 (i.e. log compaction is now
 # bounded by our snapshots, not unbounded).
-PERIODIC_DIR="${PERIODIC_DIR:-/tmp/rove-snapshot-periodic}"
-rm -rf "$PERIODIC_DIR"
-
+PERIODIC_PREFIX="${PERIODIC_PREFIX:-/tmp/rove-snapshot-periodic}"
+PERIODIC_HTTP_BASE="${PERIODIC_HTTP_BASE:-8460}"
+PERIODIC_RAFT_BASE="${PERIODIC_RAFT_BASE:-40460}"
 PERIODIC_TOKEN=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-"$BIN" seed --data-dir "$PERIODIC_DIR" --manifest <(echo '{"tenants":[{"id":"acme","domains":[],"files":[]}]}') >/dev/null
+
+. "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=snapshot-smoke
+init_cluster_addrs "$PERIODIC_PREFIX" "$PERIODIC_HTTP_BASE" "$PERIODIC_RAFT_BASE"
+
+# Seed acme onto every node.
+PERIODIC_MANIFEST=$(mktemp --suffix=.json)
+echo '{"tenants":[{"id":"acme","domains":[],"files":[]}]}' > "$PERIODIC_MANIFEST"
+seed_all_dirs "$PERIODIC_MANIFEST"
+rm -f "$PERIODIC_MANIFEST"
 
 export LOOP46_SERVICES_JWT_SECRET=$(head -c32 /dev/urandom | xxd -p | tr -d '\n')
-"$BIN" worker \
-    --node-id 0 --peers 127.0.0.1:40460 --listen 127.0.0.1:40460 \
-    --http 127.0.0.1:8460 --data-dir "$PERIODIC_DIR" \
-    --public-suffix loop46.localhost \
-    --bootstrap-root-token "$PERIODIC_TOKEN" \
-    --snapshot-interval-ms 500 \
-    --workers 1 \
-    >/tmp/snapshot-smoke-periodic.out 2>&1 &
-PERIODIC_PID=$!
-trap 'kill $PERIODIC_PID 2>/dev/null || true; wait $PERIODIC_PID 2>/dev/null || true' EXIT
+
+PIDS=()
+for i in 0 1 2; do
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --public-suffix loop46.localhost \
+        --bootstrap-root-token "$PERIODIC_TOKEN" \
+        --snapshot-interval-ms 500 \
+        --workers 1 \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+trap '
+    for p in "${PIDS[@]}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+    rm -f "$SEED_MANIFEST"
+' EXIT
 sleep 2
+
+CURL=(curl -sS --http2-prior-knowledge --max-time 5)
+discover_leader "app.loop46.localhost" "$PERIODIC_TOKEN" || exit 1
+echo "ok  periodic-loop leader: node $LEADER_IDX at $LEADER_HTTP"
+LEADER_DIR="${DATA_DIRS[$LEADER_IDX]}"
 
 # Drive 5 raft commits so willemt has > 1 log entry (begin_snapshot
 # returns -1 below that threshold — willemt's invariant, not ours).
@@ -138,25 +167,25 @@ for i in 1 2 3 4 5; do
         -H "Authorization: Bearer $PERIODIC_TOKEN" \
         -H "Content-Type: application/json" \
         -d "{\"tenant_id\":\"acme\",\"dep_id\":$i}" \
-        http://127.0.0.1:8460/_system/release >/dev/null
+        "http://${LEADER_HTTP}/_system/release" >/dev/null
 done
 
 # Wait for at least 2 capture intervals so we can verify the loop
 # actually fires (not just bootstraps once).
 sleep 3
 
-NUM_SNAPS=$(ls "$PERIODIC_DIR/.snapshots/cluster/snapshots/" 2>/dev/null | wc -l)
+NUM_SNAPS=$(ls "$LEADER_DIR/.snapshots/cluster/snapshots/" 2>/dev/null | wc -l)
 [[ "$NUM_SNAPS" -ge 1 ]] || {
-    echo "FAIL: periodic loop didn't produce any snapshots (got $NUM_SNAPS)" >&2
-    tail -30 /tmp/snapshot-smoke-periodic.out >&2
+    echo "FAIL: periodic loop didn't produce any snapshots on leader (got $NUM_SNAPS)" >&2
+    tail -30 "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out" >&2
     exit 1
 }
-echo "ok  periodic loop produced $NUM_SNAPS snapshot(s) in 5s"
+echo "ok  periodic loop produced $NUM_SNAPS snapshot(s) on leader"
 
-CAPTURE_LOGS=$(grep -c 'snapshot captured ' /tmp/snapshot-smoke-periodic.out)
+CAPTURE_LOGS=$(grep -c 'snapshot captured ' "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out")
 [[ "$CAPTURE_LOGS" -ge 1 ]] || {
-    echo "FAIL: no 'snapshot captured' log lines" >&2
-    tail -30 /tmp/snapshot-smoke-periodic.out >&2
+    echo "FAIL: no 'snapshot captured' log lines on leader" >&2
+    tail -30 "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out" >&2
     exit 1
 }
 echo "ok  worker logged $CAPTURE_LOGS capture(s)"

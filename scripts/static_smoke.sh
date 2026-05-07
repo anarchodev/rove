@@ -13,14 +13,14 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-static-smoke}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8199}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40299}"
-ORIGIN="${ADMIN_ORIGIN:-https://localhost:5173}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-static-smoke}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8202}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40302}"
+ORIGIN="${ADMIN_ORIGIN_OVERRIDE:-https://localhost:5173}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
 API_HOST="app.loop46.localhost"
-PORT="${HTTP_ADDR##*:}"
+PUBLIC_SUFFIX="loop46.localhost"
 
 # TLS via mkcert (Phase 8 + step 2 of the launch checklist). Expects
 # scripts/rove-dev-setup.sh OR `loop46 dev` to have been run
@@ -44,8 +44,6 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
-rm -rf "$DATA_DIR"
-
 FILES_ADDR="${FILES_ADDR:-127.0.0.1:8221}"
 LOG_ADDR="${LOG_ADDR:-127.0.0.1:8220}"
 FILES_PORT="${FILES_ADDR##*:}"
@@ -53,43 +51,65 @@ LOG_PORT="${LOG_ADDR##*:}"
 FILES_HOST="files.loop46.localhost"
 LOG_HOST="logs.loop46.localhost"
 
-# Phase 5.5(e) Task #62 — files-server runs as a separate process.
 . "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=static-smoke
+SMOKE_PROTO=https
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
+
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
-spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/static-smoke-cs.out "$ORIGIN" || exit 1
-spawn_log_server "$LOG_ADDR" "$DATA_DIR" /tmp/static-smoke-ls.out "$ORIGIN" || exit 1
-
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --log-public-base "https://logs.loop46.localhost:${LOG_PORT}" \
-    --files-public-base "https://files.loop46.localhost:${FILES_PORT}" \
-    --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
-    --admin-origin "$ORIGIN" \
-    --admin-api-domain "$API_HOST" \
-    --public-suffix loop46.localhost \
-    --tls-cert "$TLS_CERT" \
-    --tls-key "$TLS_KEY" \
-    --workers 1 \
-    --fresh >/tmp/static-smoke.out 2>&1 &
-PID=$!
-trap 'kill $PID $CS_PID $LS_PID 2>/dev/null || true; wait $PID $CS_PID $LS_PID 2>/dev/null || true' EXIT
-
-sleep 1.2
 
 CUSTOMER_HOST="demo.loop46.localhost"
+
+PIDS=()
+for i in 0 1 2; do
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --log-public-base "https://${LOG_HOST}:${LOG_PORT}" \
+        --files-public-base "https://${FILES_HOST}:${FILES_PORT}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --bootstrap-root-token "$TOKEN" \
+        --admin-origin "$ORIGIN" \
+        --admin-api-domain "$API_HOST" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --workers 2 \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+trap '
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+' EXIT
+sleep 2
+
 RESOLVE_FLAGS=(
-    --resolve "${API_HOST}:${PORT}:127.0.0.1"
-    --resolve "${CUSTOMER_HOST}:${PORT}:127.0.0.1"
     --resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1"
     --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1"
 )
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE_FLAGS+=(--resolve "${API_HOST}:${p}:127.0.0.1")
+    RESOLVE_FLAGS+=(--resolve "${CUSTOMER_HOST}:${p}:127.0.0.1")
+done
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE_FLAGS[@]}")
 ADMIN_HDRS=(-H "Authorization: Bearer $TOKEN" -H "Origin: $ORIGIN")
+
+discover_leader "$API_HOST" "$TOKEN" || exit 1
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+
+PORT="$LEADER_PORT"
 ADMIN_ORIGIN="https://${API_HOST}:${PORT}"
+
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/static-smoke-cs.out "$ORIGIN" || exit 1
+spawn_log_server   "$LOG_ADDR"   "${DATA_DIRS[$LEADER_IDX]}" /tmp/static-smoke-ls.out "$ORIGIN" || exit 1
 
 ROVE_TOKEN="$TOKEN"
 mint_services_token
@@ -97,8 +117,10 @@ mint_services_token
 ok() { echo "ok  $1"; }
 fail() {
     echo "FAIL $1" >&2
-    echo "--- worker log ---" >&2
-    tail -40 /tmp/static-smoke.out >&2
+    for i in 0 1 2; do
+        echo "--- worker $i log ---" >&2
+        tail -30 "/tmp/${SMOKE_TAG}-worker-${i}.out" >&2
+    done
     exit 1
 }
 

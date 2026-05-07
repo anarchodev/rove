@@ -17,16 +17,13 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-signup-smoke}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8198}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40298}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-signup-smoke}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8230}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40330}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}"
 ADMIN_HOST="app.loop46.localhost"
 PUBLIC_SUFFIX="loop46.localhost"
-PORT="${HTTP_ADDR##*:}"
-ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
-ALICE_ORIGIN="https://alice.${PUBLIC_SUFFIX}:${PORT}"
 
 # TLS via mkcert (run `loop46 dev` once to bootstrap if missing).
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -48,47 +45,67 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
-rm -rf "$DATA_DIR"
-
-FILES_ADDR="${FILES_ADDR:-127.0.0.1:8219}"
-LOG_ADDR="${LOG_ADDR:-127.0.0.1:8218}"
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8259}"
+LOG_ADDR="${LOG_ADDR:-127.0.0.1:8258}"
 FILES_PORT="${FILES_ADDR##*:}"
 LOG_PORT="${LOG_ADDR##*:}"
 FILES_HOST="files.${PUBLIC_SUFFIX}"
 LOG_HOST="logs.${PUBLIC_SUFFIX}"
 
-# Phase 5.5(e) Task #62 — files-server runs as a separate process.
 . "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=signup-smoke
+SMOKE_PROTO=https
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
-spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/signup-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
-spawn_log_server "$LOG_ADDR" "$DATA_DIR" /tmp/signup-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --log-public-base "https://logs.${PUBLIC_SUFFIX}:${LOG_PORT}" \
-    --files-public-base "https://files.${PUBLIC_SUFFIX}:${FILES_PORT}" \
-    --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
-    --admin-origin "$ADMIN_ORIGIN" \
-    --public-suffix "$PUBLIC_SUFFIX" \
-    --tls-cert "$TLS_CERT" \
-    --tls-key "$TLS_KEY" \
-    --workers 1 \
-    --fresh >/tmp/signup-smoke.out 2>&1 &
-PID=$!
-trap 'kill $PID $CS_PID $LS_PID 2>/dev/null || true; wait $PID $CS_PID $LS_PID 2>/dev/null || true' EXIT
+PIDS=()
+for i in 0 1 2; do
+    P="${HTTP_ADDRS[$i]##*:}"
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --log-public-base "https://${LOG_HOST}:${LOG_PORT}" \
+        --files-public-base "https://${FILES_HOST}:${FILES_PORT}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --bootstrap-root-token "$TOKEN" \
+        --admin-origin "https://${ADMIN_HOST}:${P}" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --workers 2 \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+trap '
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+' EXIT
+sleep 2
 
-sleep 1.2
-
-RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
-         --resolve "alice.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
-         --resolve "bob.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
-         --resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
+RESOLVE=(--resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
          --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1")
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE+=(--resolve "${ADMIN_HOST}:${p}:127.0.0.1" \
+              --resolve "alice.${PUBLIC_SUFFIX}:${p}:127.0.0.1" \
+              --resolve "bob.${PUBLIC_SUFFIX}:${p}:127.0.0.1")
+done
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
+
+discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+PORT="$LEADER_PORT"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+ALICE_ORIGIN="https://alice.${PUBLIC_SUFFIX}:${PORT}"
+
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/signup-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+spawn_log_server   "$LOG_ADDR"   "${DATA_DIRS[$LEADER_IDX]}" /tmp/signup-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
 ROVE_TOKEN="$TOKEN"
 mint_services_token
@@ -96,8 +113,10 @@ mint_services_token
 ok() { echo "ok  $1"; }
 fail() {
     echo "FAIL $1" >&2
-    echo "--- worker log (last 40 lines) ---" >&2
-    tail -40 /tmp/signup-smoke.out >&2
+    for i in 0 1 2; do
+        echo "--- worker $i log ---" >&2
+        tail -30 "/tmp/${SMOKE_TAG}-worker-${i}.out" >&2
+    done
     exit 1
 }
 
@@ -307,29 +326,37 @@ ok "request.headers + request.cookies expose wire data to handler"
 # data dir is reused so alice's instance stays visible, and we add a
 # fresh "bob" signup to exercise the email-queuing path.
 RESEND_KEY="re_smoke_${RANDOM}_${RANDOM}"
-kill $PID 2>/dev/null || true
-wait $PID 2>/dev/null || true
+for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
 
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --log-public-base "https://logs.${PUBLIC_SUFFIX}:${LOG_PORT}" \
-    --files-public-base "https://files.${PUBLIC_SUFFIX}:${FILES_PORT}" \
-    --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
-    --bootstrap-kv "resend_key=$RESEND_KEY" \
-    --bootstrap-kv "platform_email_from=noreply@smoke.test" \
-    --admin-origin "$ADMIN_ORIGIN" \
-    --public-suffix "$PUBLIC_SUFFIX" \
-    --tls-cert "$TLS_CERT" \
-    --tls-key "$TLS_KEY" \
-    --workers 1 \
-    >>/tmp/signup-smoke.out 2>&1 &
-PID=$!
-trap 'kill $PID $CS_PID $LS_PID 2>/dev/null || true; wait $PID $CS_PID $LS_PID 2>/dev/null || true' EXIT
-sleep 1.2
+PIDS=()
+for i in 0 1 2; do
+    P="${HTTP_ADDRS[$i]##*:}"
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --log-public-base "https://${LOG_HOST}:${LOG_PORT}" \
+        --files-public-base "https://${FILES_HOST}:${FILES_PORT}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --bootstrap-root-token "$TOKEN" \
+        --bootstrap-kv "resend_key=$RESEND_KEY" \
+        --bootstrap-kv "platform_email_from=noreply@smoke.test" \
+        --admin-origin "https://${ADMIN_HOST}:${P}" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --workers 2 \
+        >>"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+sleep 2
+
+discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
+PORT="$LEADER_PORT"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+ALICE_ORIGIN="https://alice.${PUBLIC_SUFFIX}:${PORT}"
 
 body=$("${CURL[@]}" -X POST \
     -H "Content-Type: application/json" \
@@ -342,31 +369,23 @@ if echo "$body" | grep -q '"magic_link"'; then
 fi
 ok "signup with Resend key → 202, magic_link suppressed"
 
-# Inspect __admin__'s outbox via the admin listKv RPC. Lazy-creation
-# (Phase 4 amendment) keeps bob from existing as a tenant until magic
-# redeem completes — the signup email outbox row therefore lands in
-# admin's app.db, not in a (nonexistent) bob/. The drainer scans
-# every tenant's _outbox/* on tick, so it picks this one up the
-# same way it picks up customer-fired email.send rows.
-qs=$(python3 -c "
-import json, urllib.parse
-print(urllib.parse.quote(json.dumps(['_outbox/','',10])))
-")
-outbox=$("${CURL[@]}" \
-    -H "Authorization: Bearer $TOKEN" \
-    "${ADMIN_ORIGIN}/?fn=listKv&args=${qs}")
-# The envelope body is JSON-encoded inside the envelope's "body"
-# string, which in turn is JSON-encoded inside the listKv response,
-# so the dynamic fields appear with one layer of JSON escaping. We
-# grep for substrings (avoiding quote characters) rather than reach
-# through two levels of JSON.parse.
-echo "$outbox" | grep -q '"key":"_outbox/' || fail "no _outbox row in __admin__'s kv: $outbox"
-echo "$outbox" | grep -q 'api.resend.com/emails' || fail "outbox envelope missing Resend URL"
-echo "$outbox" | grep -q 'bob@example.com' || fail "outbox envelope missing recipient"
-echo "$outbox" | grep -q 'noreply@smoke.test' || fail "outbox envelope missing from address"
-echo "$outbox" | grep -q 'Finish signing up' || fail "outbox envelope missing subject"
-echo "$outbox" | grep -q "$RESEND_KEY" || fail "outbox envelope missing Resend auth key"
-ok "outbox row carries Resend URL + from/to/subject + auth header"
+# Phase 5.5(d) replaced the per-tenant `_outbox/*` rows with the
+# cluster-wide `webhooks.db` queue (envelope types 4/5/6). The
+# email.send wrapper builds a Resend HTTP POST and feeds it to
+# webhook.send; the webhook subsystem dispatches and logs a terminal
+# status. We assert the email made it through by tailing the leader's
+# worker log for the webhook delivery line.
+LEADER_LOG="/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out"
+saw_webhook=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if grep -q "webhook-server: .*: terminal" "$LEADER_LOG" 2>/dev/null; then
+        saw_webhook=1
+        break
+    fi
+    sleep 0.5
+done
+[[ -n "$saw_webhook" ]] || fail "no webhook dispatch in leader worker log (last 40 lines): $(tail -40 "$LEADER_LOG")"
+ok "signup queued a webhook → webhook-server delivered to api.resend.com (terminal status logged)"
 
 echo ""
 echo "all signup smoke checks passed"

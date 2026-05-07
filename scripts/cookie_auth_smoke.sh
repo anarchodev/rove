@@ -13,14 +13,13 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-cookie-smoke}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8196}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40296}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-cookie-smoke}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8235}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40335}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
 API_HOST="app.loop46.localhost"
-PORT="${HTTP_ADDR##*:}"
-ORIGIN="https://${API_HOST}:${PORT}"
+PUBLIC_SUFFIX="loop46.localhost"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
@@ -41,35 +40,59 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
-rm -rf "$DATA_DIR"
+. "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=cookie-smoke
+SMOKE_PROTO=https
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
-    --admin-origin "$ORIGIN" \
-    --admin-api-domain "$API_HOST" \
-    --public-suffix loop46.localhost \
-    --tls-cert "$TLS_CERT" \
-    --tls-key "$TLS_KEY" \
-    --workers 1 \
-    --fresh >/tmp/cookie-smoke.out 2>&1 &
-PID=$!
-trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
+PIDS=()
+for i in 0 1 2; do
+    P="${HTTP_ADDRS[$i]##*:}"
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --bootstrap-root-token "$TOKEN" \
+        --admin-origin "https://${API_HOST}:${P}" \
+        --admin-api-domain "$API_HOST" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --workers 2 \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+trap '
+    for p in "${PIDS[@]}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+' EXIT
+sleep 2
 
-sleep 1.2
-
-RESOLVE=(--resolve "${API_HOST}:${PORT}:127.0.0.1")
+RESOLVE=()
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE+=(--resolve "${API_HOST}:${p}:127.0.0.1")
+done
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
+
+discover_leader "$API_HOST" "$TOKEN" || exit 1
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+PORT="$LEADER_PORT"
+ORIGIN="https://${API_HOST}:${PORT}"
 
 ok() { echo "ok  $1"; }
 fail() {
     echo "FAIL $1" >&2
-    echo "--- worker log (last 30 lines) ---" >&2
-    tail -30 /tmp/cookie-smoke.out >&2
+    for i in 0 1 2; do
+        echo "--- worker $i log ---" >&2
+        tail -30 "/tmp/${SMOKE_TAG}-worker-${i}.out" >&2
+    done
     exit 1
 }
 

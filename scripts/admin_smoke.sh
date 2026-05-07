@@ -20,16 +20,13 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-admin-smoke}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8198}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40298}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-admin-smoke}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8240}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40340}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
 API_HOST="app.loop46.localhost"
 PUBLIC_SUFFIX="loop46.localhost"
-PORT="${HTTP_ADDR##*:}"
-API_URL_BASE="https://${API_HOST}:${PORT}"
-ORIGIN="${ADMIN_ORIGIN:-$API_URL_BASE}"
 
 # TLS via mkcert. `loop46 dev` generates the cert + installs the
 # CA on first run; this smoke just consumes those files.
@@ -52,50 +49,68 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
-rm -rf "$DATA_DIR"
+. "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=admin-smoke
+SMOKE_PROTO=https
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
-# Seed acme + randwrite (and the rest of the demo set) before starting
-# the worker. The worker discovers tenants on disk; the manifest +
-# files live under examples/.
-"$BIN" seed \
-    --data-dir "$DATA_DIR" \
-    --manifest ./examples/loop46-demo-tenants.json \
-    >/tmp/admin-smoke-seed.out 2>&1 || {
-    echo "FAIL seed step:" >&2
-    cat /tmp/admin-smoke-seed.out >&2
-    exit 1
-}
+# Seed acme + randwrite into every node's data dir so the cluster has
+# the same starting tenant set on each replica.
+seed_all_dirs ./examples/loop46-demo-tenants.json
 
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
-    --admin-origin "$ORIGIN" \
-    --public-suffix "$PUBLIC_SUFFIX" \
-    --tls-cert "$TLS_CERT" \
-    --tls-key "$TLS_KEY" \
-    --workers 1 >/tmp/admin-smoke.out 2>&1 &
-PID=$!
-trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
+PIDS=()
+for i in 0 1 2; do
+    P="${HTTP_ADDRS[$i]##*:}"
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --bootstrap-root-token "$TOKEN" \
+        --admin-origin "https://${API_HOST}:${P}" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --workers 2 \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+trap '
+    for p in "${PIDS[@]}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+' EXIT
+sleep 2
 
-sleep 1.2
-
-RESOLVE_FLAGS=(
-    --resolve "${API_HOST}:${PORT}:127.0.0.1"
-    --resolve "acme.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1"
-    --resolve "randwrite.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1"
-)
+RESOLVE_FLAGS=()
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE_FLAGS+=(--resolve "${API_HOST}:${p}:127.0.0.1"
+                    --resolve "acme.${PUBLIC_SUFFIX}:${p}:127.0.0.1"
+                    --resolve "randwrite.${PUBLIC_SUFFIX}:${p}:127.0.0.1")
+done
 CURL_BASE=(curl -sS --cacert "$CACERT" "${RESOLVE_FLAGS[@]}")
+CURL=("${CURL_BASE[@]}")
+
+discover_leader "$API_HOST" "$TOKEN" || exit 1
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+PORT="$LEADER_PORT"
+API_URL_BASE="https://${API_HOST}:${PORT}"
+ORIGIN="$API_URL_BASE"
+
 AUTH_HDR=(-H "Authorization: Bearer $TOKEN" -H "Origin: $ORIGIN")
 
 ok() { echo "ok  $1"; }
 fail() {
     echo "FAIL $1" >&2
-    echo "--- worker log ---" >&2
-    tail -30 /tmp/admin-smoke.out >&2
+    for i in 0 1 2; do
+        echo "--- worker $i log ---" >&2
+        tail -30 "/tmp/${SMOKE_TAG}-worker-${i}.out" >&2
+    done
     exit 1
 }
 

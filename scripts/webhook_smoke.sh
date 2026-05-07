@@ -23,17 +23,15 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-webhook-smoke}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8197}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40297}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-webhook-smoke}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8245}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40345}"
 ECHO_PORT="${ECHO_PORT:-9197}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc}"
 ADMIN_HOST="app.loop46.localhost"
 ACME_HOST="acme.loop46.localhost"
-PORT="${HTTP_ADDR##*:}"
-ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
-ACME_ORIGIN="https://${ACME_HOST}:${PORT}"
+PUBLIC_SUFFIX="loop46.localhost"
 
 # TLS via mkcert. ADMIN_ORIGIN + ACME_ORIGIN are https://, so the
 # worker has to listen under TLS for curl to make it past the
@@ -61,16 +59,13 @@ if ! command -v python3 >/dev/null; then
     exit 2
 fi
 
-rm -rf "$DATA_DIR"
+. "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=webhook-smoke
+SMOKE_PROTO=https
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
-# Pre-create `acme` (with cbfire/ + cbresult.mjs handlers) via the
-# seed manifest. The smoke fires through `acme.loop46.localhost`
-# (auto-resolved via wildcard public-suffix routing) and the
-# manifest's bundled handlers exercise the webhook + callback path.
-"$BIN" seed \
-    --data-dir "$DATA_DIR" \
-    --manifest examples/loop46-demo-tenants.json >/tmp/webhook-smoke-seed.out 2>&1 \
-    || { cat /tmp/webhook-smoke-seed.out >&2; exit 2; }
+# Seed `acme` (with cbfire/ + cbresult.mjs handlers) onto every node.
+seed_all_dirs ./examples/loop46-demo-tenants.json
 
 # ── 1. Tiny Python echo server ────────────────────────────────────────
 #
@@ -108,44 +103,59 @@ python3 "$ECHO_PY" "$ECHO_PORT" >"$ECHO_LOG" 2>&1 &
 ECHO_PID=$!
 sleep 0.3
 
-# Start worker.
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
-    --admin-origin "$ADMIN_ORIGIN" \
-    --admin-api-domain "$ADMIN_HOST" \
-    --public-suffix loop46.localhost \
-    --tls-cert "$TLS_CERT" \
-    --tls-key "$TLS_KEY" \
-    --workers 1 \
-    --dev-webhook-unsafe \
-    >/tmp/webhook-smoke.out 2>&1 &
-WORKER_PID=$!
+# Start cluster.
+PIDS=()
+for i in 0 1 2; do
+    P="${HTTP_ADDRS[$i]##*:}"
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --bootstrap-root-token "$TOKEN" \
+        --admin-origin "https://${ADMIN_HOST}:${P}" \
+        --admin-api-domain "$ADMIN_HOST" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --workers 2 \
+        --dev-webhook-unsafe \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
 
 cleanup() {
-    kill $WORKER_PID 2>/dev/null || true
+    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
     kill $ECHO_PID 2>/dev/null || true
-    wait $WORKER_PID 2>/dev/null || true
+    for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
     wait $ECHO_PID 2>/dev/null || true
     rm -f "$ECHO_PY"
 }
 trap cleanup EXIT
+sleep 2
 
-sleep 1.2
-
-RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
-         --resolve "${ACME_HOST}:${PORT}:127.0.0.1")
+RESOLVE=()
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE+=(--resolve "${ADMIN_HOST}:${p}:127.0.0.1" \
+              --resolve "${ACME_HOST}:${p}:127.0.0.1")
+done
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
+
+discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+PORT="$LEADER_PORT"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+ACME_ORIGIN="https://${ACME_HOST}:${PORT}"
 
 ok() { echo "ok  $1"; }
 fail() {
     echo "FAIL $1" >&2
-    echo "--- worker log (last 40 lines) ---" >&2
-    tail -40 /tmp/webhook-smoke.out >&2
+    for i in 0 1 2; do
+        echo "--- worker $i log ---" >&2
+        tail -30 "/tmp/${SMOKE_TAG}-worker-${i}.out" >&2
+    done
     echo "--- echo server log ---" >&2
     cat "$ECHO_LOG" >&2 || true
     exit 1

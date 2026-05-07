@@ -392,10 +392,30 @@ pub const ApplyCtx = struct {
     pub fn getKv(self: *ApplyCtx, instance_id: []const u8) !*kv.KvStore {
         if (self.kv_stores.get(instance_id)) |existing| return existing;
 
+        // Lazy mkpath: on a follower, the per-tenant directory may
+        // not exist yet. The leader's `tenant.createInstance` makes
+        // it locally during signup, but followers only see the
+        // resulting envelope 2 (root_writeset) — they never get a
+        // signal to mkdir the per-tenant subdir. So when envelope
+        // 0 lands here for a tenant whose dir doesn't exist,
+        // SQLite's open fails. Make the dir on demand: it's
+        // idempotent and matches the single-store-per-tenant
+        // contract the worker already assumes.
+        const inst_dir = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ self.data_dir, instance_id },
+        );
+        defer self.allocator.free(inst_dir);
+        std.fs.cwd().makePath(inst_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
         const path = try std.fmt.allocPrintSentinel(
             self.allocator,
-            "{s}/{s}/app.db",
-            .{ self.data_dir, instance_id },
+            "{s}/app.db",
+            .{inst_dir},
             0,
         );
         defer self.allocator.free(path);

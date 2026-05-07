@@ -35,18 +35,16 @@ if [[ -f .env ]]; then
     set +a
 fi
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-logbackend-smoke}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8200}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40300}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-logbackend-smoke}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8255}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40355}"
 LS_PORT="${LS_PORT:-0}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 LS_BIN="${LS_BIN:-./zig-out/bin/log-server-standalone}"
 TOKEN="${ROVE_TOKEN:-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff}"
 ADMIN_HOST="app.loop46.localhost"
 ACME_HOST="acme.loop46.localhost"
-PORT="${HTTP_ADDR##*:}"
-ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
-ACME_ORIGIN="https://${ACME_HOST}:${PORT}"
+PUBLIC_SUFFIX="loop46.localhost"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
@@ -89,23 +87,20 @@ export LOG_S3_KEY_PREFIX="$SMOKE_PREFIX"
 INDEX_DB="/tmp/rove-logbackend-index-${RAND}.db"
 rm -f "$INDEX_DB" "${INDEX_DB}-shm" "${INDEX_DB}-wal"
 
-rm -rf "$DATA_DIR"
+. "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=lbs-smoke
+SMOKE_PROTO=https
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
 # Force BLOB_BACKEND=s3 + a per-run S3_KEY_PREFIX_BASE so EVERY blob
-# (file-blobs from seed, tape blobs from request handling) lands in
-# the same bucket the log-server reads. The per-run prefix base
-# mirrors LOG_S3_KEY_PREFIX so concurrent runs don't collide on
-# blobs either. Set BEFORE seed so the seed's bytecode writes go to
-# S3 — otherwise the worker crashes at startup trying to read
-# bytecodes that aren't there.
+# lands in the same bucket the log-server reads. Set BEFORE seed so
+# bytecode writes go to S3 — otherwise the worker crashes at startup
+# trying to read bytecodes that aren't there.
 export BLOB_BACKEND=s3
 export S3_KEY_PREFIX_BASE="$SMOKE_PREFIX"
 
-# Pre-create acme via seed.
-"$BIN" seed \
-    --data-dir "$DATA_DIR" \
-    --manifest examples/loop46-demo-tenants.json >/tmp/lbs-seed.out 2>&1 \
-    || { cat /tmp/lbs-seed.out >&2; exit 2; }
+# Seed acme onto every node.
+seed_all_dirs ./examples/loop46-demo-tenants.json
 
 # ── JWT secret shared between worker mint + standalone verify ─────
 # Per-run 32-byte hex; both processes need the same value via
@@ -113,41 +108,49 @@ export S3_KEY_PREFIX_BASE="$SMOKE_PREFIX"
 export LOOP46_SERVICES_JWT_SECRET=$(head -c32 /dev/urandom | xxd -p | tr -d '\n')
 
 # ── Spawn log-server pointing at the SAME bucket+prefix ───────────
+# Pinned to node 0's data_dir; with S3 backend the actual log batches
+# live in S3 and the indexer just needs index db + S3 access — the
+# data_dir is a placeholder only.
 "$LS_BIN" \
-    --data-dir "$DATA_DIR" \
+    --data-dir "${DATA_DIRS[0]}" \
     --index-db "$INDEX_DB" \
     --listen 127.0.0.1:${LS_PORT} \
     --poll-interval-ms 500 \
     >/tmp/lbs-server.out 2>&1 &
 LS_PID=$!
 
-# ── Spawn worker (S3 env wired in via bootstrap-time env vars) ─────
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
-    --admin-origin "$ADMIN_ORIGIN" \
-    --admin-api-domain "$ADMIN_HOST" \
-    --public-suffix loop46.localhost \
-    --log-public-base "http://127.0.0.1:${LS_PORT}" \
-    --tls-cert "$TLS_CERT" \
-    --tls-key "$TLS_KEY" \
-    --workers 1 \
-    >/tmp/lbs-worker.out 2>&1 &
-WORKER_PID=$!
+# ── Spawn 3-node cluster (workers all write logs to the same S3 bucket+prefix)
+PIDS=()
+for i in 0 1 2; do
+    P="${HTTP_ADDRS[$i]##*:}"
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --bootstrap-root-token "$TOKEN" \
+        --admin-origin "https://${ADMIN_HOST}:${P}" \
+        --admin-api-domain "$ADMIN_HOST" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --log-public-base "http://127.0.0.1:${LS_PORT}" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --workers 2 \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
 
 cleanup() {
-    kill $WORKER_PID $LS_PID 2>/dev/null || true
-    wait $WORKER_PID $LS_PID 2>/dev/null || true
+    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    kill $LS_PID 2>/dev/null || true
+    for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
+    wait $LS_PID 2>/dev/null || true
     rm -f "$INDEX_DB" "${INDEX_DB}-shm" "${INDEX_DB}-wal"
 }
 trap cleanup EXIT
 
-# Wait for both to be ready.
-sleep 1.5
+sleep 2
 
 LS_BOUND_PORT=""
 for _ in $(seq 1 50); do
@@ -163,33 +166,45 @@ if [[ -z "$LS_BOUND_PORT" ]]; then
     exit 1
 fi
 
-# Confirm worker reported s3 backend at startup. Bootstrap of the
-# admin UI uploads ~50 blobs to S3 before the worker prints the
-# `log backend: s3` line, so allow ~5s of polling.
+# Confirm at least one worker reported s3 backend at startup.
 WORKER_S3_OK=""
 for _ in $(seq 1 50); do
-    if grep -q "log backend: s3" /tmp/lbs-worker.out 2>/dev/null; then
+    if grep -q "log backend: s3" "/tmp/${SMOKE_TAG}-worker-0.out" 2>/dev/null; then
         WORKER_S3_OK=1
         break
     fi
     sleep 0.1
 done
 [[ -n "$WORKER_S3_OK" ]] \
-    || { echo "FAIL worker didn't report 's3' backend" >&2; tail -40 /tmp/lbs-worker.out >&2; exit 1; }
-echo "ok  worker started with S3 backend → bucket=${S3_BUCKET} prefix=${SMOKE_PREFIX}"
+    || { echo "FAIL worker didn't report 's3' backend" >&2; tail -40 "/tmp/${SMOKE_TAG}-worker-0.out" >&2; exit 1; }
+echo "ok  workers started with S3 backend → bucket=${S3_BUCKET} prefix=${SMOKE_PREFIX}"
 
 ok() { echo "ok  $1"; }
 fail() {
     echo "FAIL $1" >&2
-    echo "--- worker log (tail 40) ---" >&2
-    tail -40 /tmp/lbs-worker.out >&2 || true
+    for i in 0 1 2; do
+        echo "--- worker $i log (tail 30) ---" >&2
+        tail -30 "/tmp/${SMOKE_TAG}-worker-${i}.out" >&2 || true
+    done
     echo "--- log-server log (tail 40) ---" >&2
     tail -40 /tmp/lbs-server.out >&2 || true
     exit 1
 }
 
-RESOLVE=(--resolve "${ACME_HOST}:${PORT}:127.0.0.1")
+RESOLVE=()
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE+=(--resolve "${ADMIN_HOST}:${p}:127.0.0.1"
+              --resolve "${ACME_HOST}:${p}:127.0.0.1")
+done
 WORKER_CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
+CURL=("${WORKER_CURL[@]}")
+
+discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+PORT="$LEADER_PORT"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+ACME_ORIGIN="https://${ACME_HOST}:${PORT}"
 
 # Mint an HS256 JWT signed with $LOOP46_SERVICES_JWT_SECRET. Expires 5 minutes
 # from now — long enough for the smoke. Pure stdlib python (hmac +

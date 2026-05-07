@@ -16,65 +16,100 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-penalty-smoke}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8092}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40192}"
-WORKER_BIN="${WORKER_BIN:-./zig-out/bin/loop46}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-penalty-smoke}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8092}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40192}"
+BIN="${WORKER_BIN:-./zig-out/bin/loop46}"
+WORKER_BIN="$BIN"
 HOST_HEADER="penalty.loop46.localhost"
+PUBLIC_SUFFIX="loop46.localhost"
+ADMIN_HOST="app.${PUBLIC_SUFFIX}"
 
 if [[ ! -x "$WORKER_BIN" ]]; then
     echo "error: $WORKER_BIN not found — run 'zig build install' first" >&2
     exit 2
 fi
 
-rm -rf "$DATA_DIR"
+. "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=penalty-smoke
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
-# Pre-create the `penalty` tenant on disk via the seed manifest. The
-# tenant ships a `while(true)` handler that the budget interrupt
-# fires on. Wildcard routing (--public-suffix loop46.localhost)
-# resolves `penalty.loop46.localhost` → instance `penalty`.
-"$WORKER_BIN" seed \
-    --data-dir "$DATA_DIR" \
-    --manifest examples/loop46-demo-tenants.json >/tmp/penalty-smoke-seed.out 2>&1 \
-    || { cat /tmp/penalty-smoke-seed.out >&2; exit 2; }
+# Seed `penalty` tenant onto every node. The tenant ships a
+# `while(true)` handler that the budget interrupt fires on.
+seed_all_dirs ./examples/loop46-demo-tenants.json
 
 # --workers 1: penalty-box state is per-worker, so SO_REUSEPORT spread
 # across N workers would dilute kill counts and never trip the box.
-# (Note: --fresh would wipe the seed; deliberately omitted here.)
-"$WORKER_BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --data-dir "$DATA_DIR" \
-    --public-suffix loop46.localhost \
-    --workers 1 \
-    >/tmp/penalty-smoke.out 2>&1 &
-WORKER_PID=$!
-trap 'kill $WORKER_PID 2>/dev/null || true; wait $WORKER_PID 2>/dev/null || true' EXIT
+PIDS=()
+for i in 0 1 2; do
+    "$WORKER_BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --workers 1 \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+trap '
+    for p in "${PIDS[@]}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+' EXIT
+sleep 2
 
-# Let the worker bind + elect itself leader.
-sleep 0.8
+# Discover leader by probing for a non-handler path (avoid consuming
+# penalty-box budget kills). The penalty tenant has no static, so the
+# leader returns 404 and followers return 503 (leader-skip).
+LEADER_HTTP=""
+LEADER_IDX=""
+for _ in $(seq 1 75); do
+    for i in 0 1 2; do
+        c=$(curl --http2-prior-knowledge --max-time 2 -s -o /dev/null -w '%{http_code}' \
+            -H "Host: $HOST_HEADER" \
+            "http://${HTTP_ADDRS[$i]}/__leader_probe__" 2>/dev/null || echo 000)
+        # 404 = leader (route miss); 503 = follower (leader-skip)
+        if [[ "$c" == "404" ]]; then
+            LEADER_HTTP="${HTTP_ADDRS[$i]}"
+            LEADER_IDX="$i"
+            break 2
+        fi
+    done
+    sleep 0.2
+done
+[[ -n "$LEADER_HTTP" ]] || {
+    echo "FAIL: no leader returned 404 within 15s" >&2
+    for i in 0 1 2; do
+        echo "--- worker $i log ---" >&2
+        tail -30 "/tmp/${SMOKE_TAG}-worker-${i}.out" >&2
+    done
+    exit 1
+}
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 
 curl_status() {
-    # --http2-prior-knowledge: speak h2c directly (no upgrade dance).
-    # -s: silent; -o /dev/null: drop body; -w '%{http_code}': print just code.
-    # --max-time 5: cap in case something is truly stuck.
     curl \
          --http2-prior-knowledge \
          --max-time 5 \
          -s -o /dev/null \
          -w '%{http_code}' \
          -H "Host: $HOST_HEADER" \
-         "http://$HTTP_ADDR/?fn=handler"
+         "http://$LEADER_HTTP/?fn=handler"
 }
 
 expect() {
     local label="$1" expected="$2" actual="$3"
     if [[ "$actual" != "$expected" ]]; then
         echo "FAIL $label: expected $expected, got $actual" >&2
-        echo "--- worker log ---" >&2
-        tail -40 /tmp/penalty-smoke.out >&2
+        for i in 0 1 2; do
+            echo "--- worker $i log ---" >&2
+            tail -40 "/tmp/${SMOKE_TAG}-worker-${i}.out" >&2
+        done
         exit 1
     fi
     echo "ok  $label: $actual"

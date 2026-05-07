@@ -102,6 +102,87 @@ spawn_log_server() {
     return 1
 }
 
+# `init_cluster_addrs <data_dir_prefix> <http_port_base> <raft_port_base>` —
+# allocate 3-node cluster addresses + data dirs. Sets the
+# following globals for the caller:
+#
+#   HTTP_ADDRS=( 127.0.0.1:N 127.0.0.1:N+1 127.0.0.1:N+2 )
+#   RAFT_ADDRS=( 127.0.0.1:M 127.0.0.1:M+1 127.0.0.1:M+2 )
+#   DATA_DIRS=( ${prefix}-0 ${prefix}-1 ${prefix}-2 )
+#   PEERS_CSV (raft addresses joined by commas)
+#
+# Each smoke picks unique port bases so multiple smokes can run
+# in parallel without colliding. Production deploys are 3-node
+# typical (1 leader + 2 followers); 2/3 quorum + 1-failure
+# tolerance.
+init_cluster_addrs() {
+    local prefix="$1"
+    local http_base="$2"
+    local raft_base="$3"
+    HTTP_ADDRS=()
+    RAFT_ADDRS=()
+    DATA_DIRS=()
+    for i in 0 1 2; do
+        HTTP_ADDRS+=("127.0.0.1:$((http_base + i))")
+        RAFT_ADDRS+=("127.0.0.1:$((raft_base + i))")
+        DATA_DIRS+=("${prefix}-${i}")
+    done
+    PEERS_CSV=$(IFS=,; echo "${RAFT_ADDRS[*]}")
+    rm -rf "${DATA_DIRS[@]}"
+}
+
+# `seed_all_dirs <manifest_path>` — run `loop46 seed` against
+# every node's data dir. Each node maintains its own __root__.db
+# so the cluster shares the same membership view from boot.
+seed_all_dirs() {
+    local manifest="$1"
+    for d in "${DATA_DIRS[@]}"; do
+        "$BIN" seed --data-dir "$d" --manifest "$manifest" >/dev/null
+    done
+}
+
+# `discover_leader <admin_host> <token>` — probe each HTTP_ADDRS
+# entry's `?fn=listInstance` until one responds 200. Followers
+# reject every request with 503 + "not leader; retry against the
+# cluster leader" via the existing leader-skip in dispatchOnce,
+# so the first 200 wins. Tries up to 30 × 200ms = 6s, generous
+# enough for willemt's election timeout.
+#
+# Sets LEADER_IDX, LEADER_HTTP, ADMIN_ORIGIN. CURL must already
+# be set up by the caller (`CURL=(curl -sS ...)`).
+discover_leader() {
+    local admin_host="$1"
+    local token="$2"
+    LEADER_HTTP=""
+    LEADER_IDX=""
+    for _ in $(seq 1 75); do
+        for i in 0 1 2; do
+            local code
+            code=$("${CURL[@]}" --max-time 2 -o /dev/null -w '%{http_code}' \
+                -H "Host: $admin_host" \
+                -H "Authorization: Bearer $token" \
+                "${SMOKE_PROTO:-http}://${HTTP_ADDRS[$i]}/?fn=listInstance" 2>/dev/null || echo 000)
+            if [[ "$code" == "200" ]]; then
+                LEADER_HTTP="${HTTP_ADDRS[$i]}"
+                LEADER_IDX="$i"
+                LEADER_PORT="${LEADER_HTTP##*:}"
+                ADMIN_ORIGIN="${SMOKE_PROTO:-http}://${LEADER_HTTP}"
+                return 0
+            fi
+        done
+        sleep 0.2
+    done
+    echo "FAIL: no leader elected within 15s" >&2
+    for i in 0 1 2; do
+        local logf="/tmp/${SMOKE_TAG:-smoke}-worker-${i}.out"
+        if [[ -f "$logf" ]]; then
+            echo "--- worker $i log (last 30 lines) ---" >&2
+            tail -30 "$logf" >&2
+        fi
+    done
+    return 1
+}
+
 # `release_deployment <tenant_id> <dep_id>` — POST /_system/release on
 # the worker so it reloads bytecodes for the tenant. Replaces the
 # 2-second `refreshDeployments` poll retired in Phase 5.5(e) F2.

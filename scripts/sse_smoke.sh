@@ -20,19 +20,15 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-sse-smoke}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8201}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40301}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-sse-smoke}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8214}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40314}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff}"
 ADMIN_HOST="app.loop46.localhost"
 PUBLIC_SUFFIX="loop46.localhost"
-PORT="${HTTP_ADDR##*:}"
-ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
 TENANT_A="ssesmoke"
 TENANT_B="ssesmokeb"
-TENANT_A_ORIGIN="https://${TENANT_A}.${PUBLIC_SUFFIX}:${PORT}"
-TENANT_B_ORIGIN="https://${TENANT_B}.${PUBLIC_SUFFIX}:${PORT}"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
@@ -53,48 +49,67 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
-rm -rf "$DATA_DIR"
-
-FILES_ADDR="${FILES_ADDR:-127.0.0.1:8217}"
-LOG_ADDR="${LOG_ADDR:-127.0.0.1:8216}"
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8227}"
+LOG_ADDR="${LOG_ADDR:-127.0.0.1:8226}"
 FILES_PORT="${FILES_ADDR##*:}"
 LOG_PORT="${LOG_ADDR##*:}"
 FILES_HOST="files.${PUBLIC_SUFFIX}"
 LOG_HOST="logs.${PUBLIC_SUFFIX}"
 
-# Phase 5.5(e) Task #62 — files-server runs as a separate process.
 . "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=sse-smoke
+SMOKE_PROTO=https
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
-spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/sse-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
-spawn_log_server "$LOG_ADDR" "$DATA_DIR" /tmp/sse-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --log-public-base "https://logs.${PUBLIC_SUFFIX}:${LOG_PORT}" \
-    --files-public-base "https://files.${PUBLIC_SUFFIX}:${FILES_PORT}" \
-    --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
-    --admin-origin "$ADMIN_ORIGIN" \
-    --public-suffix "$PUBLIC_SUFFIX" \
-    --tls-cert "$TLS_CERT" \
-    --tls-key "$TLS_KEY" \
-    --workers 1 \
-    --fresh >/tmp/sse-smoke.out 2>&1 &
-PID=$!
-trap 'kill $PID $CS_PID $LS_PID 2>/dev/null || true; wait $PID $CS_PID $LS_PID 2>/dev/null || true' EXIT
+PIDS=()
+for i in 0 1 2; do
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --log-public-base "https://${LOG_HOST}:${LOG_PORT}" \
+        --files-public-base "https://${FILES_HOST}:${FILES_PORT}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --bootstrap-root-token "$TOKEN" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --workers 2 \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+trap '
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+' EXIT
+sleep 2
 
-sleep 1.2
-
-RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
-         --resolve "${TENANT_A}.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
-         --resolve "${TENANT_B}.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
-         --resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
+RESOLVE=(--resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
          --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1")
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE+=(--resolve "${ADMIN_HOST}:${p}:127.0.0.1" \
+              --resolve "${TENANT_A}.${PUBLIC_SUFFIX}:${p}:127.0.0.1" \
+              --resolve "${TENANT_B}.${PUBLIC_SUFFIX}:${p}:127.0.0.1")
+done
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 AUTH=(-H "Authorization: Bearer $TOKEN")
+
+discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+PORT="$LEADER_PORT"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+TENANT_A_ORIGIN="https://${TENANT_A}.${PUBLIC_SUFFIX}:${PORT}"
+TENANT_B_ORIGIN="https://${TENANT_B}.${PUBLIC_SUFFIX}:${PORT}"
+
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/sse-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+spawn_log_server   "$LOG_ADDR"   "${DATA_DIRS[$LEADER_IDX]}" /tmp/sse-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
 ROVE_TOKEN="$TOKEN"
 mint_services_token
@@ -102,8 +117,10 @@ mint_services_token
 ok() { echo "ok  $1"; }
 fail() {
     echo "FAIL $1" >&2
-    echo "--- worker log (last 80 lines) ---" >&2
-    tail -80 /tmp/sse-smoke.out >&2
+    for i in 0 1 2; do
+        echo "--- worker $i log ---" >&2
+        tail -40 "/tmp/${SMOKE_TAG}-worker-${i}.out" >&2
+    done
     exit 1
 }
 

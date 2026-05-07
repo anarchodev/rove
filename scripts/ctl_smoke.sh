@@ -29,31 +29,17 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
-# 3-node addresses derived from the port bases.
-HTTP_ADDRS=()
-RAFT_ADDRS=()
-DATA_DIRS=()
-for i in 0 1 2; do
-    HTTP_ADDRS+=("127.0.0.1:$((HTTP_PORT_BASE + i))")
-    RAFT_ADDRS+=("127.0.0.1:$((RAFT_PORT_BASE + i))")
-    DATA_DIRS+=("${DATA_DIR_PREFIX}-${i}")
-done
-PEERS_CSV=$(IFS=,; echo "${RAFT_ADDRS[*]}")
+. "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=ctl-smoke
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
+rm -rf "$SRC_DIR"
 
-rm -rf "$SRC_DIR" "${DATA_DIRS[@]}"
-
-# Seed the same tenant on every node — each maintains its own
-# __root__.db, but the membership has to match across the cluster
-# so raft's apply path replicates writes consistently.
 SEED_MANIFEST=$(mktemp --suffix=.json)
 cat > "$SEED_MANIFEST" <<'EOF'
 {"tenants": [{"id": "acme", "domains": [], "files": []}]}
 EOF
-for d in "${DATA_DIRS[@]}"; do
-    "$BIN" seed --data-dir "$d" --manifest "$SEED_MANIFEST"
-done
+seed_all_dirs "$SEED_MANIFEST"
 
-. "$(dirname "$0")/_smoke_helpers.sh"
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
 
 # Spawn the 3-node cluster first. Workers are configured with
@@ -74,7 +60,8 @@ for i in 0 1 2; do
         --data-dir "${DATA_DIRS[$i]}" \
         --public-suffix "$PUBLIC_SUFFIX" \
         --bootstrap-root-token "$TOKEN" \
-        >"/tmp/ctl-smoke-worker-${i}.out" 2>&1 &
+        --workers 2 \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
     PIDS+=($!)
 done
 trap '
@@ -91,36 +78,7 @@ sleep 2
 # Smoke runs against h2c (no TLS); CURL is plain curl + h2c flag.
 CURL=(curl -sS --http2-prior-knowledge)
 
-# Discover the leader by probing each node's admin port. Followers
-# reject every request with 503 + "not leader; retry against the
-# cluster leader" (existing leader-skip in dispatchOnce). The
-# leader's `?fn=listInstance` returns 200. Tries up to 30 × 200ms
-# = 6s, generous enough for willemt's election timeout.
-LEADER_HTTP=""
-LEADER_IDX=""
-for _ in $(seq 1 30); do
-    for i in 0 1 2; do
-        code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
-            -H "Host: $ADMIN_HOST" \
-            -H "Authorization: Bearer $TOKEN" \
-            "http://${HTTP_ADDRS[$i]}/?fn=listInstance" 2>/dev/null || echo 000)
-        if [[ "$code" == "200" ]]; then
-            LEADER_HTTP="${HTTP_ADDRS[$i]}"
-            LEADER_IDX="$i"
-            break 2
-        fi
-    done
-    sleep 0.2
-done
-if [[ -z "$LEADER_HTTP" ]]; then
-    echo "FAIL: no leader elected within 6s" >&2
-    for i in 0 1 2; do
-        echo "--- worker $i log (last 30 lines) ---" >&2
-        tail -30 "/tmp/ctl-smoke-worker-${i}.out" >&2
-    done
-    exit 1
-fi
-ADMIN_ORIGIN="http://${LEADER_HTTP}"
+discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
 echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 
 # Spawn files-server / log-server pinned to the leader's data_dir.

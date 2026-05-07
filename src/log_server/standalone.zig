@@ -200,10 +200,7 @@ pub fn spawn(config: Config) !*Handle {
     h.thread = try std.Thread.spawn(.{}, threadMain, .{h});
     h.ready.wait();
     if (h.bind_err) |err| {
-        h.indexer.signalStop();
         h.thread.join();
-        h.indexer.join();
-        config.allocator.destroy(h);
         return err;
     }
     return h;

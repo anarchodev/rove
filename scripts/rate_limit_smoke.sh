@@ -17,15 +17,13 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-rate-limit-smoke}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8200}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40300}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-rate-limit-smoke}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8205}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40305}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff}"
 ADMIN_HOST="app.loop46.localhost"
 PUBLIC_SUFFIX="loop46.localhost"
-PORT="${HTTP_ADDR##*:}"
-ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
@@ -46,8 +44,6 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
-rm -rf "$DATA_DIR"
-
 # Tiny capacities + zero refill so a few requests exhaust the bucket
 # and it stays exhausted for the duration of the test (no flakes from
 # wall-clock-driven refills landing mid-sequence).
@@ -58,43 +54,62 @@ LOG_PORT="${LOG_ADDR##*:}"
 FILES_HOST="files.${PUBLIC_SUFFIX}"
 LOG_HOST="logs.${PUBLIC_SUFFIX}"
 
-# Phase 5.5(e) Task #62 — files-server runs as a separate process.
 . "$(dirname "$0")/_smoke_helpers.sh"
+SMOKE_TAG=rate-limit-smoke
+SMOKE_PROTO=https
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
-spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/rate-limit-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
-spawn_log_server "$LOG_ADDR" "$DATA_DIR" /tmp/rate-limit-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --log-public-base "https://logs.${PUBLIC_SUFFIX}:${LOG_PORT}" \
-    --files-public-base "https://files.${PUBLIC_SUFFIX}:${FILES_PORT}" \
-    --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
-    --admin-origin "$ADMIN_ORIGIN" \
-    --public-suffix "$PUBLIC_SUFFIX" \
-    --tls-cert "$TLS_CERT" \
-    --tls-key "$TLS_KEY" \
-    --workers 1 \
-    --rate-limit-request-capacity 5 \
-    --rate-limit-request-refill 0 \
-    --rate-limit-email-capacity 2 \
-    --rate-limit-email-refill 0 \
-    --fresh >/tmp/rate-limit-smoke.out 2>&1 &
-PID=$!
-trap 'kill $PID $CS_PID $LS_PID 2>/dev/null || true; wait $PID $CS_PID $LS_PID 2>/dev/null || true' EXIT
+PIDS=()
+for i in 0 1 2; do
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --log-public-base "https://${LOG_HOST}:${LOG_PORT}" \
+        --files-public-base "https://${FILES_HOST}:${FILES_PORT}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --bootstrap-root-token "$TOKEN" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --workers 1 \
+        --rate-limit-request-capacity 5 \
+        --rate-limit-request-refill 0 \
+        --rate-limit-email-capacity 2 \
+        --rate-limit-email-refill 0 \
+        >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+trap '
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+' EXIT
+sleep 2
 
-sleep 1.2
-
-RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
-         --resolve "rl1.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
-         --resolve "rl2.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
-         --resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
+RESOLVE=(--resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
          --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1")
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE+=(--resolve "${ADMIN_HOST}:${p}:127.0.0.1" \
+              --resolve "rl1.${PUBLIC_SUFFIX}:${p}:127.0.0.1" \
+              --resolve "rl2.${PUBLIC_SUFFIX}:${p}:127.0.0.1")
+done
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 AUTH=(-H "Authorization: Bearer $TOKEN")
+
+discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+PORT="$LEADER_PORT"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/rate-limit-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+spawn_log_server   "$LOG_ADDR"   "${DATA_DIRS[$LEADER_IDX]}" /tmp/rate-limit-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
 ROVE_TOKEN="$TOKEN"
 mint_services_token
@@ -102,8 +117,10 @@ mint_services_token
 ok() { echo "ok  $1"; }
 fail() {
     echo "FAIL $1" >&2
-    echo "--- worker log (last 40 lines) ---" >&2
-    tail -40 /tmp/rate-limit-smoke.out >&2
+    for i in 0 1 2; do
+        echo "--- worker $i log ---" >&2
+        tail -30 "/tmp/${SMOKE_TAG}-worker-${i}.out" >&2
+    done
     exit 1
 }
 

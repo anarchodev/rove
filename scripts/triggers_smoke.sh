@@ -18,16 +18,13 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/tmp/rove-triggers-smoke}"
-HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8199}"
-RAFT_ADDR="${RAFT_ADDR:-127.0.0.1:40299}"
+DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-triggers-smoke}"
+HTTP_PORT_BASE="${HTTP_PORT_BASE:-8265}"
+RAFT_PORT_BASE="${RAFT_PORT_BASE:-40365}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee}"
 ADMIN_HOST="app.loop46.localhost"
 PUBLIC_SUFFIX="loop46.localhost"
-PORT="${HTTP_ADDR##*:}"
-ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
-TENANT_ORIGIN="https://trigsmoke.${PUBLIC_SUFFIX}:${PORT}"
 
 # TLS via mkcert. Both URLs are https://, so the worker has to listen
 # under TLS for curl to make it past the handshake.
@@ -50,8 +47,6 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
-rm -rf "$DATA_DIR"
-
 FILES_ADDR="${FILES_ADDR:-127.0.0.1:8214}"
 LOG_ADDR="${LOG_ADDR:-127.0.0.1:8213}"
 FILES_PORT="${FILES_ADDR##*:}"
@@ -60,38 +55,60 @@ FILES_HOST="files.${PUBLIC_SUFFIX}"
 LOG_HOST="logs.${PUBLIC_SUFFIX}"
 FILES_ORIGIN="https://${FILES_HOST}:${FILES_PORT}"
 
-# Phase 5.5(e) Task #62 — files-server runs as a separate process.
+# 3-node cluster (Phase 5.5(?) — `loop46 worker` requires --peers ≥ 2).
 . "$(dirname "$0")/_smoke_helpers.sh"
-export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
-spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/triggers-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
-spawn_log_server "$LOG_ADDR" "$DATA_DIR" /tmp/triggers-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
+SMOKE_TAG=triggers-smoke
+SMOKE_PROTO=https
+init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
-"$BIN" worker \
-    --node-id 0 \
-    --peers "$RAFT_ADDR" \
-    --listen "$RAFT_ADDR" \
-    --http "$HTTP_ADDR" \
-    --log-public-base "https://logs.${PUBLIC_SUFFIX}:${LOG_PORT}" \
-    --files-public-base "https://files.${PUBLIC_SUFFIX}:${FILES_PORT}" \
-    --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
-    --admin-origin "$ADMIN_ORIGIN" \
-    --public-suffix "$PUBLIC_SUFFIX" \
-    --tls-cert "$TLS_CERT" \
-    --tls-key "$TLS_KEY" \
-    --workers 1 \
-    --fresh >/tmp/triggers-smoke.out 2>&1 &
-PID=$!
-trap 'kill $PID $CS_PID $LS_PID 2>/dev/null || true; wait $PID $CS_PID $LS_PID 2>/dev/null || true' EXIT
-
-sleep 1.2
-
-RESOLVE=(--resolve "${ADMIN_HOST}:${PORT}:127.0.0.1" \
-         --resolve "trigsmoke.${PUBLIC_SUFFIX}:${PORT}:127.0.0.1" \
-         --resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
-         --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1")
+RESOLVE=()
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE+=(--resolve "${ADMIN_HOST}:${p}:127.0.0.1" \
+              --resolve "trigsmoke.${PUBLIC_SUFFIX}:${p}:127.0.0.1")
+done
+RESOLVE+=(--resolve "${FILES_HOST}:${FILES_PORT}:127.0.0.1" \
+          --resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1")
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 AUTH=(-H "Authorization: Bearer $TOKEN")
+
+export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+
+PIDS=()
+for i in 0 1 2; do
+    "$BIN" worker \
+        --node-id "$i" \
+        --peers "$PEERS_CSV" \
+        --listen "${RAFT_ADDRS[$i]}" \
+        --http "${HTTP_ADDRS[$i]}" \
+        --log-public-base "https://logs.${PUBLIC_SUFFIX}:${LOG_PORT}" \
+        --files-public-base "https://files.${PUBLIC_SUFFIX}:${FILES_PORT}" \
+        --data-dir "${DATA_DIRS[$i]}" \
+        --bootstrap-root-token "$TOKEN" \
+        --public-suffix "$PUBLIC_SUFFIX" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --workers 2 \
+        --fresh >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
+    PIDS+=($!)
+done
+trap '
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]}" "${CS_PID:-}" "${LS_PID:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+' EXIT
+sleep 2
+
+discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${LEADER_PORT}"
+TENANT_ORIGIN="https://trigsmoke.${PUBLIC_SUFFIX}:${LEADER_PORT}"
+echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/${SMOKE_TAG}-cs.out "$ADMIN_ORIGIN" || exit 1
+spawn_log_server "$LOG_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/${SMOKE_TAG}-ls.out "$ADMIN_ORIGIN" || exit 1
 
 ROVE_TOKEN="$TOKEN"
 mint_services_token
@@ -100,7 +117,7 @@ ok() { echo "ok  $1"; }
 fail() {
     echo "FAIL $1" >&2
     echo "--- worker log (last 60 lines) ---" >&2
-    tail -60 /tmp/triggers-smoke.out >&2
+    tail -60 /tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out >&2
     exit 1
 }
 
