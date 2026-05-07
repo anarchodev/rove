@@ -99,13 +99,39 @@ pub fn cbSendSnapshot(
     const self = ctxFrom(udata);
     const peer_id: u32 = @intCast(c.raft_node_get_id(node));
 
-    const snap_idx: u64 = @intCast(c.raft_get_snapshot_last_idx(self.raft));
-    const snap_term: u64 = @intCast(c.raft_get_snapshot_last_term(self.raft));
-
-    const frame = snapshot.buildSnapOffer(self, snap_term, snap_idx, self.snapshot_seq) catch return -1;
-    defer self.allocator.free(frame);
-    self.transport.send(peer_id, frame) catch {};
-    return 0;
+    switch (self.config.apply) {
+        .opaque_bytes => {
+            // Phase 5.5(c) step C — application-level snapshot
+            // catch-up. Hand off to the operator-supplied callback
+            // (typically logs a warning + the recovery command).
+            // Future iteration: send a SNAP_OFFER RPC carrying the
+            // snap_id, follower auto-installs.
+            if (self.config.needs_snapshot) |cb| {
+                cb(self.config.needs_snapshot_ctx, self, peer_id);
+            } else {
+                std.log.warn(
+                    "raft: peer {d} needs snapshot but no needs_snapshot callback wired (snap_last_idx={d}, snap_last_term={d})",
+                    .{
+                        peer_id,
+                        c.raft_get_snapshot_last_idx(self.raft),
+                        c.raft_get_snapshot_last_term(self.raft),
+                    },
+                );
+            }
+            return 0;
+        },
+        .kv => {
+            // Legacy `.kv`-mode delta protocol. Sends a SNAP_OFFER
+            // frame the follower replies to with SNAP_REQ; the
+            // delta rows arrive as SNAP_DATA. See raft_snapshot.zig.
+            const snap_idx: u64 = @intCast(c.raft_get_snapshot_last_idx(self.raft));
+            const snap_term: u64 = @intCast(c.raft_get_snapshot_last_term(self.raft));
+            const frame = snapshot.buildSnapOffer(self, snap_term, snap_idx, self.snapshot_seq) catch return -1;
+            defer self.allocator.free(frame);
+            self.transport.send(peer_id, frame) catch {};
+            return 0;
+        },
+    }
 }
 
 pub fn cbApplyLog(

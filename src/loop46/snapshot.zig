@@ -449,6 +449,33 @@ fn deleteWithSuffix(allocator: std.mem.Allocator, path: []const u8, suffix: []co
     std.fs.cwd().deleteFile(buf) catch {};
 }
 
+/// Phase 5.5(c) step C — operator-actionable warning when willemt
+/// asks the leader to ship a snapshot to a far-behind follower
+/// (`raft.cb.send_snapshot`). The current minimum logs the
+/// recovery action: which peer is behind, what willemt's most
+/// recent snapshot is, and the exact `loop46 restore-from-snapshot`
+/// command the operator should run on that node.
+///
+/// Future iteration: send a SNAP_OFFER RPC carrying the snap_id;
+/// follower auto-runs the restore. That needs follower-side
+/// download + restore plumbing on the raft thread, which lands
+/// alongside the multi-node smoke harness it requires.
+pub fn logNeedsSnapshot(
+    ctx: ?*anyopaque,
+    raft: *kv.RaftNode,
+    peer_id: u32,
+) void {
+    _ = ctx;
+    const idx = raft.snapshotLastIdx();
+    const term = raft.currentTerm();
+    std.log.warn(
+        "raft: peer {d} needs snapshot (snap_last_idx={d}, term={d}). " ++
+            "Run `loop46 restore-from-snapshot --snap-id <latest>` on that " ++
+            "node, then restart the worker. Future automation: SNAP_OFFER RPC.",
+        .{ peer_id, idx, term },
+    );
+}
+
 /// In-process periodic capture for the raft thread (Phase 5.5(c)
 /// step B). Designed to be called from the raft thread's main
 /// loop on every tick — checks the elapsed-time gate, and on each

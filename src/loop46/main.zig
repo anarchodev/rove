@@ -1034,6 +1034,13 @@ pub fn main() !void {
                 .ctx = &apply_ctx,
             },
         },
+        // Phase 5.5(c) step C — wire willemt's send_snapshot
+        // callback so a far-behind follower's catch-up surfaces
+        // as an actionable log line instead of silent log-replay
+        // loops. Future automation: send SNAP_OFFER + follower
+        // auto-restore.
+        .needs_snapshot = snapshot_mod.logNeedsSnapshot,
+        .needs_snapshot_ctx = null,
         .raft_log_path = raft_log_path,
         .worker_count = 0,
         .propose_linger_ns = cli.propose_linger_us * std.time.ns_per_us,

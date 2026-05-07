@@ -144,11 +144,35 @@ pub const ApplyMode = union(enum) {
     },
 };
 
+/// Phase 5.5(c) step C — willemt fires `send_snapshot` when a
+/// follower's `next_idx` falls below the leader's `snapshot_last_idx`
+/// (i.e. willemt has compacted past entries the follower still
+/// needs). Without a callback, willemt keeps trying to send log
+/// entries it doesn't have and the follower never catches up.
+///
+/// The callback runs on the raft thread. Implementations should
+/// stay fast — a typical impl sends a SNAP_OFFER RPC to the
+/// follower and returns; the follower-side automation (download
+/// + restore + raft_begin/end_load_snapshot) lands in a future
+/// step. The current minimal callback just logs a clear,
+/// operator-actionable warning naming the lagging peer + the
+/// snap_id to restore from.
+pub const NeedsSnapshotFn = *const fn (
+    ctx: ?*anyopaque,
+    raft: *RaftNode,
+    peer_id: u32,
+) void;
+
 pub const Config = struct {
     node_id: u32,
     peers: []const PeerAddr,
     listen_addr: std.net.Address,
     apply: ApplyMode,
+    /// Optional. When set, willemt's `send_snapshot` callback
+    /// fires this fn instead of the no-op default. See
+    /// `NeedsSnapshotFn` doc for the contract.
+    needs_snapshot: ?NeedsSnapshotFn = null,
+    needs_snapshot_ctx: ?*anyopaque = null,
     election_timeout_ms: u32 = 1000,
     request_timeout_ms: u32 = 200,
     /// If non-null, raft log + persistent state (term/vote) are backed by a
