@@ -103,8 +103,18 @@ sub-plan's migration order. No big-bang cutovers between them.
   `--files-listen` retired from `loop46`. Dev (`scripts/dev_serve.sh`)
   + production (`scripts/rove-loop46-serve.sh`) helpers fork-exec
   the standalone alongside the worker for one-command startup.
-- **(c) snapshot — not started.** Waits on (a) retiring envelope
-  type 1 to reduce raft log pressure (envelope 3 is already gone).
+- **(c) snapshot — steps 1-3a done.** `_apply_state` per-store
+  table + per-entry idempotency filter (step 1), in-memory
+  `ApplyCtx.tenant_apply_idx` mirror (step 2), and the
+  end-to-end S3 / fs capture orchestrator
+  (`src/loop46/snapshot.zig`, step 3a — VACUUM INTO each
+  per-tenant app.db, content-address, PUT to BatchStore at
+  `cluster/snapshots/{snap_id}/...` plus a manifest JSON).
+  Always-refreshes every tenant's `snapshot_idx`; the
+  by-reference reuse for unchanged tenants + raft log
+  compaction wiring + periodic capture loop are step 3b. The
+  follower-side load + `loop46 restore-from-snapshot` CLI is
+  step 4.
 
 **Next pickup:**
 1. **(c) snapshot — see `docs/snapshot-plan.md`.** With (a) and

@@ -361,6 +361,25 @@ pub fn build(b: *std.Build) void {
     const js_tests = b.addTest(.{ .root_module = js_mod });
     test_step.dependOn(&b.addRunArtifact(js_tests).step);
 
+    // Phase 5.5(c) snapshot capture orchestrator. Lives under
+    // src/loop46/ since it composes apply-side state with a
+    // BatchStore output, but it's testable in isolation against
+    // a FsBatchStore + a stub RaftNode + a real ApplyCtx.
+    const snapshot_mod = b.addModule("rove-snapshot", .{
+        .root_source_file = b.path("src/loop46/snapshot.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    snapshot_mod.addImport("rove-kv", kv_mod);
+    snapshot_mod.addImport("rove-js", js_mod);
+    snapshot_mod.addImport("rove-log-server", log_server_mod);
+    snapshot_mod.link_libc = true;
+    snapshot_mod.linkSystemLibrary("nghttp2", .{});
+    snapshot_mod.linkSystemLibrary("ssl", .{});
+    snapshot_mod.linkSystemLibrary("crypto", .{});
+    const snapshot_tests = b.addTest(.{ .root_module = snapshot_mod });
+    test_step.dependOn(&b.addRunArtifact(snapshot_tests).step);
+
     // loop46: the Loop46 product binary. Subcommand-dispatched entry
     // point (`loop46 dev`, `loop46 worker`, …) that composes the rove
     // engine modules with the embedded admin UI bundle.

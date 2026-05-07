@@ -712,6 +712,27 @@ pub const KvStore = struct {
         _ = try self.checkpointV2();
     }
 
+    /// `VACUUM INTO 'target'` — atomically write a defragmented copy
+    /// of this database to a new file path. Phase 5.5(c) snapshot
+    /// capture uses this to produce per-tenant + root snapshots: a
+    /// brief writer lock during the copy, no reader blocking, and
+    /// the resulting file is a clean SQLite database the follower
+    /// can install via atomic-rename. `target_path` must NOT
+    /// already exist (SQLite errors out otherwise) — the caller's
+    /// snapshot-id keying gives that property naturally.
+    pub fn vacuumInto(self: *KvStore, target_path: [:0]const u8) Error!void {
+        const sql = std.fmt.allocPrintSentinel(
+            self.allocator,
+            "VACUUM INTO '{s}';",
+            .{target_path},
+            0,
+        ) catch return Error.OutOfMemory;
+        defer self.allocator.free(sql);
+        if (c.sqlite3_exec(self.db, sql.ptr, null, null, null) != c.SQLITE_OK) {
+            return Error.Sqlite;
+        }
+    }
+
     pub const CheckpointResult = struct {
         /// Total frames currently in the WAL file after the call.
         log_pages: u32,

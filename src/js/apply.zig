@@ -360,10 +360,12 @@ pub const ApplyCtx = struct {
     }
 
     /// Lazily open the follower's local copy of `__root__.db`. Returns
-    /// the cached handle on subsequent calls. Only ever reached on
-    /// the follower path (`applyRootWriteSet` leader-skips before
-    /// opening).
-    fn getRootKv(self: *ApplyCtx) !*kv.KvStore {
+    /// the cached handle on subsequent calls. Reached on the
+    /// follower path (`applyRootWriteSet` leader-skips before
+    /// opening) and from the snapshot capture loop on the leader
+    /// (which needs to VACUUM INTO root.db whether or not any
+    /// follower-side apply has touched it).
+    pub fn getRootKv(self: *ApplyCtx) !*kv.KvStore {
         if (self.root_store) |existing| return existing;
         const path = try std.fmt.allocPrintSentinel(
             self.allocator,
@@ -383,8 +385,11 @@ pub const ApplyCtx = struct {
 
     /// Lazily open this tenant's app.db kv store. The returned
     /// pointer is owned by the context and stable for the lifetime
-    /// of the context.
-    fn getKv(self: *ApplyCtx, instance_id: []const u8) !*kv.KvStore {
+    /// of the context. Public so the snapshot capture loop can
+    /// warm the cache for tenants the apply path hasn't reached
+    /// yet (e.g. dormant tenants that nonetheless need a snapshot
+    /// entry per the always-refresh property).
+    pub fn getKv(self: *ApplyCtx, instance_id: []const u8) !*kv.KvStore {
         if (self.kv_stores.get(instance_id)) |existing| return existing;
 
         const path = try std.fmt.allocPrintSentinel(
