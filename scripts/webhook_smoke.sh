@@ -64,6 +64,9 @@ SMOKE_TAG=webhook-smoke
 SMOKE_PROTO=https
 init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
+# Shared secret between worker + files-server.
+export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+
 # Seed `acme` (with cbfire/ + cbresult.mjs handlers) onto every node.
 seed_all_dirs ./examples/loop46-demo-tenants.json
 
@@ -127,9 +130,9 @@ for i in 0 1 2; do
 done
 
 cleanup() {
-    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    for p in "${PIDS[@]}" "${CS_PID:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
     kill $ECHO_PID 2>/dev/null || true
-    for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
+    for p in "${PIDS[@]}" "${CS_PID:-}"; do [ -n "$p" ] && wait "$p" 2>/dev/null || true; done
     wait $ECHO_PID 2>/dev/null || true
     rm -f "$ECHO_PY"
 }
@@ -149,6 +152,12 @@ echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 PORT="$LEADER_PORT"
 ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
 ACME_ORIGIN="https://${ACME_HOST}:${PORT}"
+
+# files-server pushes the admin tenant deploy. /v1/auth (used by
+# the smoke for tenant signups) routes through admin and returns
+# 503 until this lands.
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8249}"
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/webhook-smoke-cs.out "$ADMIN_ORIGIN" "$ADMIN_ORIGIN" || exit 1
 
 ok() { echo "ok  $1"; }
 fail() {

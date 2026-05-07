@@ -45,6 +45,10 @@ SMOKE_TAG=cookie-smoke
 SMOKE_PROTO=https
 init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
+# Shared secret between worker + files-server so files-server's
+# /_system/release POST verifies on the worker.
+export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+
 PIDS=()
 for i in 0 1 2; do
     P="${HTTP_ADDRS[$i]##*:}"
@@ -66,10 +70,10 @@ for i in 0 1 2; do
     PIDS+=($!)
 done
 trap '
-    for p in "${PIDS[@]}"; do
+    for p in "${PIDS[@]}" "${CS_PID:-}"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null || true
     done
-    for p in "${PIDS[@]}"; do
+    for p in "${PIDS[@]}" "${CS_PID:-}"; do
         [ -n "$p" ] && wait "$p" 2>/dev/null || true
     done
 ' EXIT
@@ -86,6 +90,12 @@ discover_leader "$API_HOST" "$TOKEN" || exit 1
 echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 PORT="$LEADER_PORT"
 ORIGIN="https://${API_HOST}:${PORT}"
+
+# files-server pushes the admin tenant deploy via /_system/release.
+# Without this, every request to admin (the dashboard, /v1/login,
+# etc.) returns 503 "no deployment yet".
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8239}"
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/cookie-smoke-cs.out "$ORIGIN" "$ORIGIN" || exit 1
 
 ok() { echo "ok  $1"; }
 fail() {

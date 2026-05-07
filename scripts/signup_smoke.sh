@@ -105,7 +105,7 @@ PORT="$LEADER_PORT"
 ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
 ALICE_ORIGIN="https://alice.${PUBLIC_SUFFIX}:${PORT}"
 
-spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/signup-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/signup-smoke-cs.out "$ADMIN_ORIGIN" "$ADMIN_ORIGIN" || exit 1
 spawn_log_server   "$LOG_ADDR"   "${DATA_DIRS[$LEADER_IDX]}" /tmp/signup-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
 ROVE_TOKEN="$TOKEN"
@@ -323,42 +323,18 @@ ok "request.headers + request.cookies expose wire data to handler"
 # ── 10. With ROVE_RESEND_KEY configured: signup queues an outbox email
 #        and drops magic_link from the response body. ───────────────────
 #
-# Stop the current worker and relaunch with --bootstrap-resend-key. The
-# data dir is reused so alice's instance stays visible, and we add a
-# fresh "bob" signup to exercise the email-queuing path.
+# Push resend_key + platform_email_from into __admin__/app.db via
+# files-server's bootstrap-kv path. The worker reads them on the
+# next signup; no worker restart needed since the values land via
+# raft envelope 0.
 RESEND_KEY="re_smoke_${RANDOM}_${RANDOM}"
-for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
-for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
-
-PIDS=()
-for i in 0 1 2; do
-    P="${HTTP_ADDRS[$i]##*:}"
-    "$BIN" worker \
-        --node-id "$i" \
-        --peers "$PEERS_CSV" \
-        --listen "${RAFT_ADDRS[$i]}" \
-        --http "${HTTP_ADDRS[$i]}" \
-        --log-public-base "https://${LOG_HOST}:${LOG_PORT}" \
-        --files-public-base "https://${FILES_HOST}:${FILES_PORT}" \
-        --data-dir "${DATA_DIRS[$i]}" \
-        --bootstrap-root-token "$TOKEN" \
-        --bootstrap-kv "resend_key=$RESEND_KEY" \
-        --bootstrap-kv "platform_email_from=noreply@smoke.test" \
-        --admin-origin "https://${ADMIN_HOST}:${P}" \
-        --public-suffix "$PUBLIC_SUFFIX" \
-        --tls-cert "$TLS_CERT" \
-        --tls-key "$TLS_KEY" \
-        --workers 2 \
-        "${RAFT_TIMING_FLAGS[@]}" \
-        >>"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
-    PIDS+=($!)
-done
-sleep 2
-
-discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
-PORT="$LEADER_PORT"
-ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
-ALICE_ORIGIN="https://alice.${PUBLIC_SUFFIX}:${PORT}"
+kill $CS_PID 2>/dev/null || true
+wait $CS_PID 2>/dev/null || true
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/signup-smoke-cs.out "$ADMIN_ORIGIN" "$ADMIN_ORIGIN" \
+    --bootstrap-kv "resend_key=$RESEND_KEY" \
+    --bootstrap-kv "platform_email_from=noreply@smoke.test" || exit 1
+# Mint a fresh services-token now that files-server is back.
+mint_services_token
 
 body=$("${CURL[@]}" -X POST \
     -H "Content-Type: application/json" \

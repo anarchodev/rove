@@ -115,7 +115,7 @@ ADMIN_ORIGIN="https://${ADMIN_HOST}:${LEADER_PORT}"
 REPLAY_ORIGIN="https://replay.${PUBLIC_SUFFIX}:${LEADER_PORT}"
 echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 
-spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/${SMOKE_TAG}-cs.out "$ADMIN_ORIGIN" || exit 1
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/${SMOKE_TAG}-cs.out "$ADMIN_ORIGIN" "$ADMIN_ORIGIN" || exit 1
 spawn_log_server "$LOG_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/${SMOKE_TAG}-ls.out "$ADMIN_ORIGIN" || exit 1
 
 ok() { echo "ok  $1"; }

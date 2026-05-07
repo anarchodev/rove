@@ -6,7 +6,6 @@
 
 const std = @import("std");
 
-pub const MAX_BOOTSTRAP_KV: usize = 32;
 
 pub const Cli = struct {
     node_id: u32 = 0,
@@ -26,15 +25,6 @@ pub const Cli = struct {
     /// `/_system/*` request must carry this token in an
     /// `Authorization: Bearer <hex>` header.
     bootstrap_root_token: ?[]const u8 = null,
-    /// Generic seed-into-admin's-app.db config pairs. Each pair is
-    /// the raw `key=value` argv string; bootstrap splits at the
-    /// first `=` and writes to admin's kv before workers start
-    /// serving. Replaces the older typed flags
-    /// (`--bootstrap-resend-key`, `--platform-email-from`) so Zig
-    /// no longer enumerates which config keys exist — admin's JS
-    /// handler reads whatever it cares about via `kv.get`.
-    bootstrap_kv: [MAX_BOOTSTRAP_KV][]const u8 = undefined,
-    bootstrap_kv_count: usize = 0,
     /// Number of worker threads. Each owns its own Registry/Io/H2/
     /// Tenant/Dispatcher and binds the same HTTP/2 port via
     /// SO_REUSEPORT. Defaults to the number of online CPUs.
@@ -184,20 +174,6 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.bootstrap_root_token = args[i];
-        } else if (std.mem.eql(u8, a, "--bootstrap-kv")) {
-            i += 1;
-            if (i >= args.len) return error.Usage;
-            if (out.bootstrap_kv_count >= MAX_BOOTSTRAP_KV) {
-                std.debug.print(
-                    "error: too many --bootstrap-kv flags (max {d})\n",
-                    .{MAX_BOOTSTRAP_KV},
-                );
-                return error.Usage;
-            }
-            // The argv slice survives for the lifetime of the binary;
-            // store the raw `key=value` string and split at use site.
-            out.bootstrap_kv[out.bootstrap_kv_count] = args[i];
-            out.bootstrap_kv_count += 1;
         } else if (std.mem.eql(u8, a, "--workers")) {
             i += 1;
             if (i >= args.len) return error.Usage;
@@ -379,12 +355,6 @@ pub const USAGE =
     \\  --data-dir <path>           per-node data dir
     \\  --fresh                     wipe data dir before start
     \\  --bootstrap-root-token HEX  seed the root auth token at startup
-    \\  --bootstrap-kv key=value    seed a kv pair into __admin__/app.db at
-    \\                              startup. Repeatable. Admin's JS handler
-    \\                              reads these via kv.get; well-known keys
-    \\                              (defined by admin's deployed bundle, not
-    \\                              this binary) include resend_key and
-    \\                              platform_email_from.
     \\  --public-suffix <domain>    customer wildcard suffix (e.g. loop46.me).
     \\                              admin host derives to app.<suffix> unless
     \\                              --admin-api-domain overrides

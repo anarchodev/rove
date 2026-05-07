@@ -75,9 +75,16 @@ trap '
 ' EXIT
 sleep 2
 
-# Discover leader by probing for a non-handler path (avoid consuming
-# penalty-box budget kills). The penalty tenant has no static, so the
-# leader returns 404 and followers return 503 (leader-skip).
+# Discover leader via /_system/leader. Penalty tenant has no auth
+# config so we probe the platform admin host (app.{public_suffix})
+# without a bearer — /_system/leader is gated by admin auth, but
+# the penalty-smoke worker has --bootstrap-root-token unset, so we
+# bypass auth concerns by using a host header that targets a tenant
+# with a customer-shaped auth path.  Simpler: this smoke doesn't
+# auth admin at all, so we use the customer host's leader-skip: a
+# request to penalty.{public_suffix} returns 503 on followers and
+# whatever the dispatcher returns on the leader. Since penalty has
+# no deploy and no static, leader returns 404 (route miss).
 RESOLVE=()
 for h in "${HTTP_ADDRS[@]}"; do
     p="${h##*:}"

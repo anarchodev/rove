@@ -422,39 +422,12 @@ pub fn build(b: *std.Build) void {
     loop46_mod.addImport("rove-tenant", tenant_mod);
     loop46_mod.addImport("rove-h2", h2_mod);
     loop46_mod.addImport("rove-webhook-server", webhook_server_mod);
-    // Admin tenant bundle — embedded so the binary ships with a working
-    // dashboard + handler at app.{BASE_DOMAIN}/ out of the box. The
-    // handler/middleware become `index.mjs` / `_middlewares/index.mjs`
-    // in __admin__'s initial deployment; the UI files become
-    // `_static/<path>` entries.
-    const admin_files: []const struct { name: []const u8, path: []const u8 } = &.{
-        .{ .name = "admin_handler_mjs", .path = "web/admin/handler.mjs" },
-        .{ .name = "admin_middleware_mjs", .path = "web/admin/middleware.mjs" },
-        .{ .name = "admin_ui_index_html", .path = "web/admin/index.html" },
-        .{ .name = "admin_ui_app_js", .path = "web/admin/app.js" },
-        .{ .name = "admin_ui_api_js", .path = "web/admin/api.js" },
-        .{ .name = "admin_ui_app_css", .path = "web/admin/app.css" },
-        .{ .name = "admin_ui_page_login", .path = "web/admin/pages/login.js" },
-        .{ .name = "admin_ui_page_instances", .path = "web/admin/pages/instances.js" },
-        .{ .name = "admin_ui_page_instance", .path = "web/admin/pages/instance.js" },
-        .{ .name = "admin_ui_codemirror", .path = "web/admin/codemirror.mjs" },
-    };
-    for (admin_files) |f| {
-        loop46_mod.addAnonymousImport(f.name, .{
-            .root_source_file = b.path(f.path),
-        });
-    }
-    // Replay tenant bundle — `__replay__` serves the tape-replay
-    // browser page at `replay.{public_suffix}` (PLAN §10.12). The
-    // shell receives a bundle from the dashboard via postMessage,
-    // parses captured tapes, and runs the handler in a sandboxed
-    // iframe so the user can step through under F12 DevTools.
-    loop46_mod.addAnonymousImport("replay_index_html", .{
-        .root_source_file = b.path("web/replay/index.html"),
-    });
-    loop46_mod.addAnonymousImport("replay_app_js", .{
-        .root_source_file = b.path("web/replay/app.js"),
-    });
+    // The admin + replay tenant bundles + UI files used to be
+    // embedded into the loop46 binary so the worker could
+    // bootstrap-deploy them at startup. Phase 5.5(e) step 3 moved
+    // that responsibility to files-server-standalone, so the embeds
+    // moved with it (see the platform_bundle_files block on
+    // files_server_mod above).
     loop46_mod.link_libc = true;
     loop46_mod.linkSystemLibrary("nghttp2", .{});
     loop46_mod.linkSystemLibrary("ssl", .{});

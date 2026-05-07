@@ -88,6 +88,10 @@ spawn_files_server() {
     # CA bundle + --resolve mapping via env (LOOP46_LEADER_CACERT /
     # LOOP46_LEADER_RESOLVE) — same shape as the smoke's own curl.
     local leader_url="${5:-}"
+    shift $(($# < 5 ? $# : 5))
+    # Remaining args (e.g. --bootstrap-kv key=value) pass through to
+    # files-server-standalone unchanged.
+    local extra_args=("$@")
     local env_assigns=()
     if [[ -n "$leader_url" && -n "${CACERT:-}" ]]; then
         env_assigns+=(LOOP46_LEADER_CACERT="$CACERT")
@@ -109,17 +113,32 @@ spawn_files_server() {
         ${TLS_KEY:+--tls-key "$TLS_KEY"} \
         ${cors_origin:+--cors-origin "$cors_origin"} \
         ${leader_url:+--leader-url "$leader_url"} \
+        "${extra_args[@]}" \
         >"$log_path" 2>&1 &
     CS_PID=$!
-    # Wait for the standalone's startup line so the worker doesn't
-    # mint tokens against an unbound listener.
+    # Wait for the standalone's startup line.
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        if grep -q 'listening on' "$log_path" 2>/dev/null; then return 0; fi
+        if grep -q 'listening on' "$log_path" 2>/dev/null; then break; fi
         sleep 0.1
     done
-    echo "spawn_files_server: didn't see 'listening on' in $log_path within 1s" >&2
-    cat "$log_path" >&2
-    return 1
+    if ! grep -q 'listening on' "$log_path" 2>/dev/null; then
+        echo "spawn_files_server: didn't see 'listening on' in $log_path within 1s" >&2
+        cat "$log_path" >&2
+        return 1
+    fi
+    # When --leader-url was passed, also wait for the bootstrap step
+    # to finish (admin + replay deploys released). Otherwise the
+    # smoke can race the bootstrap and hit /v1/signup before admin's
+    # deploy has propagated through raft.
+    if [[ -n "$leader_url" ]]; then
+        for _ in $(seq 1 60); do
+            if grep -q '__replay__ deploy.*released' "$log_path" 2>/dev/null; then return 0; fi
+            sleep 0.2
+        done
+        echo "spawn_files_server: didn't see '__replay__ deploy released' in $log_path within 12s" >&2
+        cat "$log_path" >&2
+        return 1
+    fi
 }
 
 # `spawn_log_server <listen> <data_dir> <log_path> [cors_origin]` —
@@ -207,14 +226,14 @@ seed_all_dirs() {
 }
 
 # `discover_leader <admin_host> <token>` — probe each HTTP_ADDRS
-# entry's `?fn=listInstance` until one responds 200. Followers
-# reject every request with 503 + "not leader; retry against the
-# cluster leader" via the existing leader-skip in dispatchOnce,
-# so the first 200 wins. Tries up to 30 × 200ms = 6s, generous
-# enough for willemt's election timeout.
+# entry's `/_system/leader` until one responds 200. Followers
+# return 503 ("not leader; retry against the cluster leader\n").
+# The probe doesn't depend on admin's tenant being deployed
+# (worker no longer self-bootstraps admin since step 3 of phase
+# 5.5(e); files-server ships the deploy AFTER discover_leader).
 #
-# Sets LEADER_IDX, LEADER_HTTP, ADMIN_ORIGIN. CURL must already
-# be set up by the caller (`CURL=(curl -sS ...)`).
+# Sets LEADER_IDX, LEADER_HTTP, LEADER_PORT, ADMIN_ORIGIN. CURL
+# must already be set up by the caller (`CURL=(curl -sS ...)`).
 discover_leader() {
     local admin_host="$1"
     local token="$2"
@@ -222,15 +241,18 @@ discover_leader() {
     LEADER_IDX=""
     for _ in $(seq 1 75); do
         for i in 0 1 2; do
+            local p="${HTTP_ADDRS[$i]##*:}"
+            # Use admin_host in the URL (not the raw IP) so TLS smokes
+            # match the cert SAN. The CURL array's --resolve already
+            # maps admin_host:port → 127.0.0.1.
             local code
             code=$("${CURL[@]}" --max-time 2 -o /dev/null -w '%{http_code}' \
-                -H "Host: $admin_host" \
                 -H "Authorization: Bearer $token" \
-                "${SMOKE_PROTO:-http}://${HTTP_ADDRS[$i]}/?fn=listInstance" 2>/dev/null || echo 000)
+                "${SMOKE_PROTO:-http}://${admin_host}:${p}/_system/leader" 2>/dev/null || echo 000)
             if [[ "$code" == "200" ]]; then
                 LEADER_HTTP="${HTTP_ADDRS[$i]}"
                 LEADER_IDX="$i"
-                LEADER_PORT="${LEADER_HTTP##*:}"
+                LEADER_PORT="$p"
                 ADMIN_ORIGIN="${SMOKE_PROTO:-http}://${LEADER_HTTP}"
                 return 0
             fi

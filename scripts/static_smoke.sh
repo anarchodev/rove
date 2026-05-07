@@ -109,7 +109,7 @@ echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 PORT="$LEADER_PORT"
 ADMIN_ORIGIN="https://${API_HOST}:${PORT}"
 
-spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/static-smoke-cs.out "$ORIGIN" || exit 1
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/static-smoke-cs.out "$ORIGIN" "$ADMIN_ORIGIN" || exit 1
 spawn_log_server   "$LOG_ADDR"   "${DATA_DIRS[$LEADER_IDX]}" /tmp/static-smoke-ls.out "$ORIGIN" || exit 1
 
 ROVE_TOKEN="$TOKEN"

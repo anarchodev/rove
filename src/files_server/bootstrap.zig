@@ -231,14 +231,13 @@ pub fn bootstrapTenant(
 
 // ── Release POST + JWT mint ───────────────────────────────────────────
 
-/// Mint a 5-minute services-JWT carrying the `release` capability.
-/// Caller frees the returned token.
-pub fn mintReleaseToken(allocator: std.mem.Allocator, jwt_secret: []const u8) ![]u8 {
+/// Mint a 5-minute services-JWT carrying `cap`. Caller frees.
+pub fn mintCapToken(allocator: std.mem.Allocator, jwt_secret: []const u8, cap: []const u8) ![]u8 {
     const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
     const exp_ms: i64 = now_ms + 5 * 60 * 1000;
     return jwt.mint(allocator, jwt_secret, .{
         .exp_ms = exp_ms,
-        .caps = &.{jwt.Cap.RELEASE},
+        .caps = &.{cap},
     });
 }
 
@@ -259,32 +258,20 @@ pub fn mintReleaseToken(allocator: std.mem.Allocator, jwt_secret: []const u8) ![
 /// one-shot POST is a lot of code; `curl` is already a smoke + ops
 /// dependency and gives us a real h2 client for free. A future
 /// revision can swap this for rove-h2's client surface.
-pub fn postRelease(
+/// Internal: shell out to curl for a POST with a Bearer-token JSON
+/// body. Expects 204. Reads optional `LOOP46_LEADER_CACERT` +
+/// `LOOP46_LEADER_RESOLVE` env vars so the smoke can pass dev-cert
+/// + DNS overrides through without putting them in the binary's
+/// flag surface.
+fn curlPostJson(
     allocator: std.mem.Allocator,
-    leader_url: []const u8,
-    jwt_secret: []const u8,
-    tenant_id: []const u8,
-    dep_id: u64,
+    url: []const u8,
+    bearer_token: []const u8,
+    body: []const u8,
 ) !void {
-    const token = try mintReleaseToken(allocator, jwt_secret);
-    defer allocator.free(token);
-
-    const url = try std.fmt.allocPrint(allocator, "{s}/_system/release", .{leader_url});
-    defer allocator.free(url);
-
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "{{\"tenant_id\":\"{s}\",\"dep_id\":{d}}}",
-        .{ tenant_id, dep_id },
-    );
-    defer allocator.free(body);
-
-    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{token});
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{bearer_token});
     defer allocator.free(auth_header);
 
-    // Build curl argv. Runtime-determined `--cacert` + `--resolve`
-    // come from env so the smoke can pass them through without
-    // hardcoding TLS config in the deploy authority.
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{
@@ -348,24 +335,118 @@ pub fn postRelease(
     }
 }
 
+pub fn postRelease(
+    allocator: std.mem.Allocator,
+    leader_url: []const u8,
+    jwt_secret: []const u8,
+    tenant_id: []const u8,
+    dep_id: u64,
+) !void {
+    const token = try mintCapToken(allocator, jwt_secret, jwt.Cap.RELEASE);
+    defer allocator.free(token);
+
+    const url = try std.fmt.allocPrint(allocator, "{s}/_system/release", .{leader_url});
+    defer allocator.free(url);
+
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"tenant_id\":\"{s}\",\"dep_id\":{d}}}",
+        .{ tenant_id, dep_id },
+    );
+    defer allocator.free(body);
+
+    try curlPostJson(allocator, url, token, body);
+}
+
+/// POST `/_system/admin-kv` with a list of `key=value` pairs (parsed
+/// from `--bootstrap-kv key=value` flags). The worker writes each
+/// pair into `__admin__/app.db` via raft so every node sees the same
+/// admin config.
+///
+/// `pairs` is a slice of `"key=value"` strings (the flag's raw form).
+/// Empty list → no-op (no POST). Mints a JWT with `cap=admin-kv`.
+pub fn postAdminKv(
+    allocator: std.mem.Allocator,
+    leader_url: []const u8,
+    jwt_secret: []const u8,
+    pairs: []const []const u8,
+) !void {
+    if (pairs.len == 0) return;
+
+    const token = try mintCapToken(allocator, jwt_secret, jwt.Cap.ADMIN_KV);
+    defer allocator.free(token);
+
+    const url = try std.fmt.allocPrint(allocator, "{s}/_system/admin-kv", .{leader_url});
+    defer allocator.free(url);
+
+    // Build `{"pairs":[{"key":"k","value":"v"},...]}`. Hand-coded
+    // because the keys/values are small + deterministic and we want
+    // to avoid pulling std.json's encoder for ~50 lines of glue.
+    // Validates pair shape (`key=value`, key non-empty, no
+    // double-quotes, no NUL).
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(allocator);
+    try json.appendSlice(allocator, "{\"pairs\":[");
+    for (pairs, 0..) |pair, i| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return Error.ReleasePostFailed;
+        const key = pair[0..eq];
+        const value = pair[eq + 1 ..];
+        if (key.len == 0) return Error.ReleasePostFailed;
+        if (i > 0) try json.append(allocator, ',');
+        try json.appendSlice(allocator, "{\"key\":");
+        try jsonEncodeString(&json, allocator, key);
+        try json.appendSlice(allocator, ",\"value\":");
+        try jsonEncodeString(&json, allocator, value);
+        try json.append(allocator, '}');
+    }
+    try json.appendSlice(allocator, "]}");
+
+    try curlPostJson(allocator, url, token, json.items);
+}
+
+/// Append `s` to `out` as a JSON string literal. Escapes the
+/// characters JSON requires escaping for and rejects control bytes
+/// + NUL — our admin-kv values come from `--bootstrap-kv` flags so
+/// shouldn't contain anything weird, but we belt-and-suspender it.
+fn jsonEncodeString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try out.append(allocator, '"');
+    for (s) |b| {
+        switch (b) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            0...0x08, 0x0b, 0x0c, 0x0e...0x1f => return Error.ReleasePostFailed,
+            else => try out.append(allocator, b),
+        }
+    }
+    try out.append(allocator, '"');
+}
+
 // ── Public entry point ────────────────────────────────────────────────
 
-/// Bootstrap admin + replay deploys. Idempotent — safe to run on
-/// every files-server boot. On warm S3 + a healthy cluster this is
-/// roughly: 2 HEADs (one per manifest), then 2 release POSTs that
-/// raft applies as no-ops (already at the same dep_id).
+/// Bootstrap admin + replay deploys + push admin-kv pairs.
+/// Idempotent — safe to run on every files-server boot. On warm S3
+/// + a healthy cluster this is roughly: 2 HEADs (one per manifest),
+/// 2 release POSTs that raft applies as no-ops, and 1 admin-kv POST
+/// that re-stamps the same kv rows.
 ///
 /// `leader_url` must point at a cluster node that can route
-/// `/_system/release`. The smoke / operator points it at the elected
+/// `/_system/*`. The smoke / operator points it at the elected
 /// leader's admin host (e.g. `https://app.loop46.localhost:8197`).
-/// Followers reject release POSTs with 503 — the caller polls
+/// Followers reject these POSTs with 503 — the caller polls
 /// `discover_leader`-style if needed before invoking this.
+///
+/// `bootstrap_kv` is a slice of `"key=value"` strings parsed from
+/// `--bootstrap-kv` flags. Empty slice = no admin-kv POST.
 pub fn bootstrapPlatformDeployments(
     allocator: std.mem.Allocator,
     blob_cfg: blob_mod.BackendConfig,
     data_dir: []const u8,
     leader_url: []const u8,
     jwt_secret: []const u8,
+    bootstrap_kv: []const []const u8,
 ) !void {
     const admin_dep_id = try bootstrapTenant(
         allocator,
@@ -392,4 +473,12 @@ pub fn bootstrapPlatformDeployments(
         "files-server bootstrap: __replay__ deploy {d} released",
         .{replay_dep_id},
     );
+
+    if (bootstrap_kv.len > 0) {
+        try postAdminKv(allocator, leader_url, jwt_secret, bootstrap_kv);
+        std.log.info(
+            "files-server bootstrap: pushed {d} admin-kv pair(s)",
+            .{bootstrap_kv.len},
+        );
+    }
 }

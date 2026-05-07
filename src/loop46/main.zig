@@ -74,38 +74,11 @@ const snapshot_mod = @import("snapshot.zig");
 // worker discovers them on disk at startup; nothing about the demo
 // set is hard-coded in this binary anymore.
 
-/// JS source for the admin handler. Deployed to `__admin__` at
-/// bootstrap. Each RPC function is a named export; the UI calls them
-/// by name (`?fn=listInstance` or `POST {fn:"listInstance",args:[...]}`).
-///
-/// Reads platform-level state (instances, domains) via the
-/// `platform.root.*` globals, which are only installed on the admin
-/// handler (gated by `Instance.platform` being non-null). Writes go
-/// through the same primitives but aren't replicated through raft
-/// yet (single-node admin writes only) — multi-node correctness for
-/// admin-handler writes is a follow-up; signup-driven instance
-/// creation already goes through the replicated Zig-native path.
-///
-/// The KV RPCs (`listKv`, `setKv`, etc.) still operate on whatever
-/// store the dispatcher selected — admin's own app.db by default,
-/// the target tenant's app.db under `X-Rove-Scope: <id>`.
-///
-/// Status on error flows through the ambient `response` global;
-/// non-200 return values use the `{ error }` shape as the body.
-const ADMIN_HANDLER_SRC = @embedFile("admin_handler_mjs");
-
-/// Admin's request-time auth middleware. Runs before every dispatch
-/// to admin's bundle (default export AND named-export RPCs). Reads
-/// the session cookie (or Authorization: Bearer for the dashboard's
-/// bootstrap-token sign-in path), looks up the row in admin's app.db
-/// or the root_token/{hash} entry in root.db, and either sets
-/// `request.auth = {is_root: ...}` or short-circuits with 401.
-///
-/// Pre-auth paths (signup / magic redeem / login / logout) skip the
-/// gate entirely — those endpoints exist precisely so an unauthed
-/// caller can become authed.
-const ADMIN_MIDDLEWARE_SRC = @embedFile("admin_middleware_mjs");
-
+// Phase 5.5(e) step 3 — admin + replay JS source + UI bytecode now
+// live in `src/files_server/bootstrap.zig` (along with the deploy
+// machinery that ships them to S3). The worker doesn't need the
+// source bytes; it loads bytecodes from the cluster's shared S3
+// blob backend at runtime, same as any customer tenant.
 
 /// Print a startup error to stderr and exit with code 2 (matching the
 /// CLI parser's `error.Usage` convention so a wrapping shell script
@@ -685,7 +658,6 @@ fn dispatchSubcommand(
 fn bootstrapTenants(
     allocator: std.mem.Allocator,
     cli: cli_mod.Cli,
-    blob_cfg: blob_mod.BackendConfig,
 ) !void {
     const root_path = try std.fmt.allocPrintSentinel(
         allocator,
@@ -707,65 +679,17 @@ fn bootstrapTenants(
         std.debug.print("bootstrap: root token installed\n", .{});
     }
 
-    // __admin__ is created first so session / magic / resend-key
-    // operations (which live in its app.db) have a place to land
-    // before any other bootstrap step runs. See `src/tenant/root.zig`.
+    // Phase 5.5(e) step 3 — admin and replay deploys are owned by
+    // files-server-standalone now. The worker creates the per-node
+    // tenant rows in __root__.db so the dispatcher can route to
+    // them, but the bytecodes + manifest + `_deploy/current` arrive
+    // via files-server's bootstrap (S3 PUTs + raft-replicated
+    // /_system/release POST). Until that lands the admin/replay
+    // tenants return 503 ("no deployment yet") on every request —
+    // expected steady state for a fresh cluster between worker boot
+    // and files-server's first call.
+
     try tenant.createInstance("__admin__");
-
-    // Generic config bootstrap: every `--bootstrap-kv key=value`
-    // arg writes to admin's app.db under the given key. Zig knows
-    // nothing about the keys — admin's JS handler reads whatever
-    // it cares about via kv.get with whatever fallback default
-    // it wants (e.g. `kv.get("platform_email_from") ||
-    // "noreply@loop46.me"`).
-    if (cli.bootstrap_kv_count > 0) {
-        const admin_inst = (tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch |err| {
-            failExit("bootstrap: lookup __admin__ failed: {s}\n", .{@errorName(err)});
-        }).?;
-        for (cli.bootstrap_kv[0..cli.bootstrap_kv_count]) |pair| {
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse
-                failExit("bootstrap-kv: expected key=value, got '{s}'\n", .{pair});
-            const key = pair[0..eq];
-            const value = pair[eq + 1 ..];
-            if (key.len == 0)
-                failExit("bootstrap-kv: empty key in '{s}'\n", .{pair});
-            if (std.mem.indexOfScalar(u8, key, 0) != null or
-                std.mem.indexOfScalar(u8, value, 0) != null)
-            {
-                failExit("bootstrap-kv: key/value contains NUL byte (key='{s}')\n", .{key});
-            }
-            admin_inst.kv.put(key, value) catch |err| {
-                failExit("bootstrap-kv: write {s} failed: {s}\n", .{ key, @errorName(err) });
-            };
-        }
-        std.debug.print(
-            "bootstrap: wrote {d} kv pair(s) into __admin__/app.db\n",
-            .{cli.bootstrap_kv_count},
-        );
-    }
-
-    // Always-deploy: the embedded admin UI bundle. Demo + benchmark
-    // tenants get provisioned by `loop46 seed --manifest ...` (out
-    // of band of this binary). The worker discovers them on disk.
-    //
-    // Every node runs this so each gets its own `_deploy/current`
-    // pointer in __admin__'s app.db (admin handler resolves on each
-    // node; followers leader-skip but the leader serves it). S3
-    // blobs are content-addressed; FileStore.putBlobIfMissing
-    // skip-then-retry tolerates concurrent PUTs for identical bytes
-    // (some object stores like OVH OS reject overlapping conditional
-    // writes for the same key).
-    try bootstrapHandler(allocator, cli.data_dir, blob_cfg, "__admin__", &ADMIN_DEPLOY_FILES);
-
-    // __replay__ — platform tenant for the tape-replay browser page
-    // (PLAN §10.12). Lives at `replay.{public_suffix}` via an
-    // explicit domain alias; resolveDomain's alias path wins over
-    // the wildcard so a customer signup for the name "replay"
-    // (already blocked at the JS layer's RESERVED_NAMES, defense in
-    // depth) couldn't squat the host even if it slipped through.
-    // The deployed bundle is a static-only placeholder for now —
-    // the actual iframe + stubs library lands as a follow-up deploy
-    // through the existing files API.
     try tenant.createInstance(tenant_mod.REPLAY_INSTANCE_ID);
     if (cli.public_suffix) |ps| {
         const replay_host = try std.fmt.allocPrint(allocator, "replay.{s}", .{ps});
@@ -777,7 +701,6 @@ fn bootstrapTenants(
             );
         };
     }
-    try bootstrapHandler(allocator, cli.data_dir, blob_cfg, tenant_mod.REPLAY_INSTANCE_ID, &REPLAY_DEPLOY_FILES);
 
     // Prewarm __admin__ + every disk-discovered tenant's app.db +
     // log.db on the main thread so the WAL-mode transition is
@@ -896,7 +819,7 @@ pub fn main() !void {
         );
     }
 
-    try bootstrapTenants(allocator, cli, blob_owned.cfg);
+    try bootstrapTenants(allocator, cli);
 
     // ── Log batch store (Phase 5.5 a) ─────────────────────────────────
     //
@@ -1225,148 +1148,6 @@ pub fn main() !void {
     // every subsystem.
     std.process.exit(0);
 }
-
-/// Compile `source` (or pass-through for static) for an instance and
-/// publish it as the current deployment through that tenant's file
-/// store. Mirrors what `rove-files-cli upload + deploy` would do
-/// externally; kept inline so the smoke test is a single binary.
-pub const DeployFile = struct {
-    path: []const u8,
-    content: []const u8,
-    /// null → handler source (compile to bytecode). Non-null → static
-    /// file served verbatim with this content-type.
-    content_type: ?[]const u8 = null,
-};
-
-pub fn bootstrapHandler(
-    allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    blob_cfg: blob_mod.BackendConfig,
-    instance_id: []const u8,
-    files: []const DeployFile,
-) !void {
-    const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, instance_id });
-    defer allocator.free(inst_dir);
-    try std.fs.cwd().makePath(inst_dir);
-
-    const files_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/files.db", .{inst_dir}, 0);
-    defer allocator.free(files_db_path);
-
-    const files_kv = try kv.KvStore.open(allocator, files_db_path);
-    defer files_kv.close();
-    var fs_store = try blob_mod.BlobBackend.openPerTenant(
-        allocator,
-        blob_cfg,
-        instance_id,
-        "file-blobs",
-    );
-    defer fs_store.deinit();
-
-    // Real qjs compile so the stored bytecode is real.
-    var compiler = try QjsCompiler.init();
-    defer compiler.deinit();
-
-    var store = files_mod.FileStore.init(
-        allocator,
-        files_kv,
-        fs_store.blobStore(),
-        QjsCompiler.compile,
-        &compiler,
-    );
-
-    for (files) |f| {
-        if (f.content_type) |ct| {
-            try store.putStatic(f.path, f.content, ct);
-        } else {
-            try store.putSource(f.path, f.content);
-        }
-    }
-
-    // Phase 5.5(e) F2-storage — assemble the manifest, JSON-encode,
-    // write it to the per-tenant `deployments/` BlobBackend, then
-    // bump the local files.db next-id counter. The release pointer
-    // (`_deploy/current` in the tenant's app.db) is set further down
-    // in `bootstrapTenants` so the worker eagerly loads this
-    // bootstrap deployment on first openTenantFiles().
-    const cur = try store.currentDeploymentId();
-    const next_id = cur + 1;
-
-    const entries = try store.assembleManifest();
-    defer store.freeEntries(entries);
-
-    const json_bytes = try files_mod.manifest_json.encode(allocator, next_id, entries);
-    defer allocator.free(json_bytes);
-
-    var manifest_be = try blob_mod.BlobBackend.openPerTenant(
-        allocator,
-        blob_cfg,
-        instance_id,
-        "deployments",
-    );
-    defer manifest_be.deinit();
-
-    var key_buf: [25]u8 = undefined;
-    const key = files_mod.manifest_json.manifestKey(&key_buf, next_id);
-    // Skip-if-exists: every node bootstraps with the same
-    // deterministic content; one node's PUT wins and the rest are
-    // no-ops. Tolerates the OVH OS "OperationAborted" race on
-    // concurrent PUTs for identical keys.
-    if (!(manifest_be.blobStore().exists(key) catch false)) {
-        manifest_be.blobStore().put(key, json_bytes) catch {
-            // Loser of the race: another node landed the same
-            // content first. Verify and continue.
-            if (!(manifest_be.blobStore().exists(key) catch false)) return error.Blob;
-        };
-    }
-
-    try store.setCurrentDeploymentId(next_id);
-
-    // Write the release pointer so the worker eager-opens this deploy.
-    const app_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{inst_dir}, 0);
-    defer allocator.free(app_db_path);
-    const app_kv = try kv.KvStore.open(allocator, app_db_path);
-    defer app_kv.close();
-    var current_buf: [16]u8 = undefined;
-    const current_hex = try std.fmt.bufPrint(&current_buf, "{x:0>16}", .{next_id});
-    try app_kv.put("_deploy/current", current_hex);
-}
-
-// The admin UI bundle is embedded into the binary so a fresh start
-// ships with a functioning login page at app.loop46.me. Each file
-// becomes a `_static/<path>` entry in __admin__'s initial deployment.
-const ADMIN_UI_INDEX_HTML = @embedFile("admin_ui_index_html");
-const ADMIN_UI_APP_JS = @embedFile("admin_ui_app_js");
-const ADMIN_UI_API_JS = @embedFile("admin_ui_api_js");
-const ADMIN_UI_APP_CSS = @embedFile("admin_ui_app_css");
-const ADMIN_UI_PAGE_LOGIN = @embedFile("admin_ui_page_login");
-const ADMIN_UI_PAGE_INSTANCES = @embedFile("admin_ui_page_instances");
-const ADMIN_UI_PAGE_INSTANCE = @embedFile("admin_ui_page_instance");
-const ADMIN_UI_CODEMIRROR = @embedFile("admin_ui_codemirror");
-
-const ADMIN_DEPLOY_FILES = [_]DeployFile{
-    .{ .path = "index.mjs", .content = ADMIN_HANDLER_SRC },
-    .{ .path = "_middlewares/index.mjs", .content = ADMIN_MIDDLEWARE_SRC },
-    .{ .path = "_static/index.html", .content = ADMIN_UI_INDEX_HTML, .content_type = "text/html; charset=utf-8" },
-    .{ .path = "_static/app.js", .content = ADMIN_UI_APP_JS, .content_type = "application/javascript" },
-    .{ .path = "_static/api.js", .content = ADMIN_UI_API_JS, .content_type = "application/javascript" },
-    .{ .path = "_static/app.css", .content = ADMIN_UI_APP_CSS, .content_type = "text/css" },
-    .{ .path = "_static/pages/login.js", .content = ADMIN_UI_PAGE_LOGIN, .content_type = "application/javascript" },
-    .{ .path = "_static/pages/instances.js", .content = ADMIN_UI_PAGE_INSTANCES, .content_type = "application/javascript" },
-    .{ .path = "_static/pages/instance.js", .content = ADMIN_UI_PAGE_INSTANCE, .content_type = "application/javascript" },
-    .{ .path = "_static/codemirror.mjs", .content = ADMIN_UI_CODEMIRROR, .content_type = "application/javascript" },
-};
-
-// __replay__ tenant bundle. Static-only — the shell uses postMessage
-// to receive the bundle from the dashboard (no worker round-trips
-// from this origin), parses captured tapes in JS, and runs the
-// handler in a sandboxed iframe with stubbed Loop46 globals.
-const REPLAY_INDEX_HTML = @embedFile("replay_index_html");
-const REPLAY_APP_JS = @embedFile("replay_app_js");
-
-const REPLAY_DEPLOY_FILES = [_]DeployFile{
-    .{ .path = "_static/index.html", .content = REPLAY_INDEX_HTML, .content_type = "text/html; charset=utf-8" },
-    .{ .path = "_static/app.js", .content = REPLAY_APP_JS, .content_type = "application/javascript" },
-};
 
 /// Walk `<data_dir>/*` and return every subdirectory containing an
 /// `app.db` — i.e. every tenant the worker should know about. Skips

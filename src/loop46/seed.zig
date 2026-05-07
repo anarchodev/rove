@@ -7,6 +7,7 @@
 const std = @import("std");
 const kv = @import("rove-kv");
 const tenant_mod = @import("rove-tenant");
+const files_server = @import("rove-files-server");
 
 const main_mod = @import("main.zig");
 
@@ -104,7 +105,7 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
             try tenant.assignDomain(dom, t.id);
         }
 
-        var deploy_files: std.ArrayList(main_mod.DeployFile) = .empty;
+        var deploy_files: std.ArrayList(files_server.bootstrap.DeployFile) = .empty;
         defer {
             for (deploy_files.items) |f| allocator.free(f.content);
             deploy_files.deinit(allocator);
@@ -122,7 +123,20 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
             });
         }
 
-        try main_mod.bootstrapHandler(allocator, dd, blob_owned.cfg, t.id, deploy_files.items);
+        // Deploy the tenant's bundle to S3 via files-server's
+        // bootstrapTenant. seed is offline (runs before any cluster
+        // is up) so the per-node `_deploy/current` write that
+        // files-server normally pushes via raft instead lands here
+        // as a direct app.db write — same shape as old
+        // bootstrapHandler did, just with the deploy half outsourced.
+        const dep_id = try files_server.bootstrap.bootstrapTenant(
+            allocator,
+            blob_owned.cfg,
+            dd,
+            t.id,
+            deploy_files.items,
+        );
+        try writeLocalDeployCurrent(allocator, dd, t.id, dep_id);
 
         if (t.seed_kv) |kvs| {
             const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dd, t.id });
@@ -145,4 +159,29 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     }
 
     std.debug.print("seed: provisioned {d} tenant(s) into {s}\n", .{ parsed.value.tenants.len, dd });
+}
+
+/// Write `_deploy/current = {dep_id:016x}` to `<dd>/<id>/app.db`.
+/// Used by `seed` to publish the deployment that
+/// `files_server.bootstrap.bootstrapTenant` just uploaded. Direct
+/// per-node SQLite write — `seed` is offline, before any worker /
+/// raft cluster exists. (Live-cluster deploys use `/_system/release`
+/// instead, which routes through raft so every node sees the same
+/// pointer.)
+fn writeLocalDeployCurrent(
+    allocator: std.mem.Allocator,
+    dd: []const u8,
+    instance_id: []const u8,
+    dep_id: u64,
+) !void {
+    const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dd, instance_id });
+    defer allocator.free(inst_dir);
+    try std.fs.cwd().makePath(inst_dir);
+    const app_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{inst_dir}, 0);
+    defer allocator.free(app_db_path);
+    const app_kv = try kv.KvStore.open(allocator, app_db_path);
+    defer app_kv.close();
+    var hex_buf: [16]u8 = undefined;
+    const hex = try std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{dep_id});
+    try app_kv.put("_deploy/current", hex);
 }

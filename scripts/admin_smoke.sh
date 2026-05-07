@@ -54,6 +54,10 @@ SMOKE_TAG=admin-smoke
 SMOKE_PROTO=https
 init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
+# Shared secret between worker + files-server so files-server's
+# /_system/release POST verifies on the worker.
+export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+
 # Seed acme + randwrite into every node's data dir so the cluster has
 # the same starting tenant set on each replica.
 seed_all_dirs ./examples/loop46-demo-tenants.json
@@ -78,10 +82,10 @@ for i in 0 1 2; do
     PIDS+=($!)
 done
 trap '
-    for p in "${PIDS[@]}"; do
+    for p in "${PIDS[@]}" "${CS_PID:-}"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null || true
     done
-    for p in "${PIDS[@]}"; do
+    for p in "${PIDS[@]}" "${CS_PID:-}"; do
         [ -n "$p" ] && wait "$p" 2>/dev/null || true
     done
 ' EXIT
@@ -102,6 +106,11 @@ echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 PORT="$LEADER_PORT"
 API_URL_BASE="https://${API_HOST}:${PORT}"
 ORIGIN="$API_URL_BASE"
+
+# files-server pushes the admin tenant deploy. Without it, every
+# admin-routed request returns 503 "no deployment yet".
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8244}"
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/admin-smoke-cs.out "$ORIGIN" "$ORIGIN" || exit 1
 
 AUTH_HDR=(-H "Authorization: Bearer $TOKEN" -H "Origin: $ORIGIN")
 

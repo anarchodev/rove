@@ -30,6 +30,11 @@ const h2 = @import("rove-h2");
 
 const ENV_JWT_SECRET = "LOOP46_SERVICES_JWT_SECRET";
 
+/// Maximum number of `--bootstrap-kv` pairs accepted on the command
+/// line. Plenty for typical platform-config use (resend_key,
+/// platform_email_from, etc.).
+const MAX_BOOTSTRAP_KV: usize = 32;
+
 const Cli = struct {
     data_dir: []const u8 = "/tmp/rove-files-thread",
     listen: []const u8 = "127.0.0.1:0",
@@ -45,6 +50,14 @@ const Cli = struct {
     /// `_deploy/current` pointer lands via raft. Idempotent on warm
     /// S3.
     leader_url: ?[]const u8 = null,
+    /// Repeatable `--bootstrap-kv key=value` pairs pushed into
+    /// `__admin__/app.db` via the worker's `/_system/admin-kv`
+    /// endpoint at platform-bootstrap time. Replaces the worker's
+    /// old per-node `--bootstrap-kv` flag (which bypassed raft and
+    /// produced inconsistent state across nodes). Requires
+    /// `--leader-url`.
+    bootstrap_kv: [MAX_BOOTSTRAP_KV][]const u8 = undefined,
+    bootstrap_kv_count: usize = 0,
 };
 
 fn usage(stderr: *std.fs.File.Writer) !void {
@@ -102,6 +115,12 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.leader_url = argv[i];
+        } else if (std.mem.eql(u8, a, "--bootstrap-kv")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            if (out.bootstrap_kv_count >= MAX_BOOTSTRAP_KV) return error.Usage;
+            out.bootstrap_kv[out.bootstrap_kv_count] = argv[i];
+            out.bootstrap_kv_count += 1;
         } else {
             return error.Usage;
         }
@@ -230,6 +249,7 @@ pub fn main() !void {
             cli.data_dir,
             leader_url,
             jwt_secret,
+            cli.bootstrap_kv[0..cli.bootstrap_kv_count],
         ) catch |err| {
             std.log.err(
                 "files-server bootstrap failed: {s} (leader_url={s})",
@@ -238,6 +258,9 @@ pub fn main() !void {
             std.process.exit(2);
         };
     } else {
+        if (cli.bootstrap_kv_count > 0) {
+            std.log.warn("files-server: --bootstrap-kv set but --leader-url is not; admin-kv push skipped", .{});
+        }
         std.log.info("files-server: --leader-url not set, skipping platform-deploy bootstrap", .{});
     }
 

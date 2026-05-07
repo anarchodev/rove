@@ -256,6 +256,8 @@ fn tryHandleSystem(
     // there is no global "admin or cap" pass.
     const required_cap: ?[]const u8 = if (std.mem.eql(u8, sys_rest, "release"))
         jwt.Cap.RELEASE
+    else if (std.mem.eql(u8, sys_rest, "admin-kv"))
+        jwt.Cap.ADMIN_KV
     else
         null;
 
@@ -281,6 +283,34 @@ fn tryHandleSystem(
     // the legacy 2-second `refreshDeployments` polling loop.
     if (std.mem.eql(u8, sys_rest, "release")) {
         try handleRelease(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
+        return true;
+    }
+
+    // Leader-status probe used by smokes + files-server bootstrap to
+    // discover which node will accept release / admin-kv POSTs. The
+    // tenant-routing leader-skip in dispatchOnce doesn't apply here
+    // (`/_system/*` short-circuits before tenant routing), so /_system
+    // probes alone can't tell leader from follower. Returns 200 on the
+    // leader and 503 ("not leader; retry against the cluster leader\n")
+    // on followers — same shape as the customer-tenant leader-skip
+    // response so tooling can treat both the same way.
+    if (std.mem.eql(u8, sys_rest, "leader")) {
+        if (worker.raft.isLeader()) {
+            try respb.setSystemResponse(server, ent, sid, sess, 200, "leader\n", allocator, cors_origin, null);
+        } else {
+            try respb.setSystemResponse(server, ent, sid, sess, 503, "not leader; retry against the cluster leader\n", allocator, cors_origin, null);
+        }
+        return true;
+    }
+
+    // Cluster-wide admin config push. files-server-standalone POSTs
+    // `{"pairs":[{"key":"...","value":"..."},...]}` here at platform
+    // bootstrap time so operator-supplied --bootstrap-kv values land
+    // in `__admin__/app.db` via raft (envelope 0). Replaces the
+    // worker's old --bootstrap-kv flag, which wrote per-node
+    // bypassing raft.
+    if (std.mem.eql(u8, sys_rest, "admin-kv")) {
+        try handleAdminKv(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
         return true;
     }
 
@@ -484,6 +514,107 @@ fn handleRelease(
         const msg = try std.fmt.allocPrint(allocator, "release table failed: {s}\n", .{@errorName(err)});
         try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
         return;
+    };
+
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
+}
+
+/// Body shape: `{"pairs":[{"key":"<k>","value":"<v>"}, ...]}`. Writes
+/// each pair into `__admin__/app.db` via a raft-replicated envelope
+/// 0 writeset, so every node sees the same admin config. Used by
+/// files-server-standalone at platform-bootstrap time to ship
+/// operator-supplied config (resend_key, platform_email_from, ...)
+/// without a per-node `--bootstrap-kv` flag.
+///
+/// Idempotent: re-posting the same pairs re-stamps the kv rows. The
+/// caller (files-server) does this on every restart with the same
+/// values, which is fine.
+fn handleAdminKv(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+    cors_origin: ?[]const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST")) {
+        try respb.setSystemResponse(server, ent, sid, sess, 405, "POST only\n", allocator, cors_origin, null);
+        return;
+    }
+
+    const Pair = struct { key: []const u8, value: []const u8 };
+    var parsed = std.json.parseFromSlice(struct {
+        pairs: []const Pair,
+    }, allocator, body, .{ .ignore_unknown_fields = true }) catch {
+        try respb.setSystemResponse(server, ent, sid, sess, 400, "expected {\"pairs\":[{\"key\":\"...\",\"value\":\"...\"},...]}\n", allocator, cors_origin, null);
+        return;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value.pairs.len == 0) {
+        try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
+        return;
+    }
+
+    const admin_inst_opt = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+    const admin_inst = admin_inst_opt orelse {
+        try respb.setSystemResponse(server, ent, sid, sess, 503, "__admin__ tenant not initialized\n", allocator, cors_origin, null);
+        return;
+    };
+
+    var txn = admin_inst.kv.beginTrackedImmediate() catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "admin-kv txn open failed: {s}\n", .{@errorName(err)});
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        return;
+    };
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    for (parsed.value.pairs) |p| {
+        if (p.key.len == 0) {
+            txn.rollback() catch {};
+            try respb.setSystemResponse(server, ent, sid, sess, 400, "empty key\n", allocator, cors_origin, null);
+            return;
+        }
+        if (std.mem.indexOfScalar(u8, p.key, 0) != null or
+            std.mem.indexOfScalar(u8, p.value, 0) != null)
+        {
+            txn.rollback() catch {};
+            try respb.setSystemResponse(server, ent, sid, sess, 400, "key/value contains NUL\n", allocator, cors_origin, null);
+            return;
+        }
+        txn.put(p.key, p.value) catch |err| {
+            txn.rollback() catch {};
+            const msg = try std.fmt.allocPrint(allocator, "admin-kv put failed: {s}\n", .{@errorName(err)});
+            try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+            return;
+        };
+        ws.addPut(p.key, p.value) catch |err| {
+            txn.rollback() catch {};
+            const msg = try std.fmt.allocPrint(allocator, "admin-kv writeset failed: {s}\n", .{@errorName(err)});
+            try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+            return;
+        };
+    }
+    txn.commit() catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "admin-kv commit failed: {s}\n", .{@errorName(err)});
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        return;
+    };
+
+    _ = raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID) catch |err| {
+        std.log.warn(
+            "admin-kv: propose envelope 0 for {d} pair(s) failed: {s}",
+            .{ parsed.value.pairs.len, @errorName(err) },
+        );
+    };
+    admin_inst.kv.commitTxn(txn.txn_seq) catch |err| {
+        std.log.warn(
+            "admin-kv: commitTxn drop-undo failed: {s}",
+            .{@errorName(err)},
+        );
     };
 
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);

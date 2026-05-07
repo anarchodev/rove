@@ -57,6 +57,9 @@ SMOKE_TAG=whs-smoke
 SMOKE_PROTO=https
 init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
+# Shared secret between worker + files-server.
+export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+
 # Seed acme onto every node.
 seed_all_dirs ./examples/loop46-demo-tenants.json
 
@@ -115,9 +118,9 @@ for i in 0 1 2; do
 done
 
 cleanup() {
-    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    for p in "${PIDS[@]}" "${CS_PID:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
     kill $ECHO_PID 2>/dev/null || true
-    for p in "${PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
+    for p in "${PIDS[@]}" "${CS_PID:-}"; do [ -n "$p" ] && wait "$p" 2>/dev/null || true; done
     wait $ECHO_PID 2>/dev/null || true
     rm -f "$ECHO_PY"
 }
@@ -147,6 +150,14 @@ discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
 echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 PORT="$LEADER_PORT"
 ADMIN_ORIGIN="https://${ADMIN_HOST}:${PORT}"
+
+# files-server pushes the admin tenant deploy. cbresult.mjs lives
+# under acme (seeded), but tasks like /_system/release on the
+# leader path hit the worker dispatcher that needs admin tenant
+# initialized. Without files-server running the bootstrap step,
+# admin returns 503.
+FILES_ADDR="${FILES_ADDR:-127.0.0.1:8254}"
+spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/whs-smoke-cs.out "$ADMIN_ORIGIN" "$ADMIN_ORIGIN" || exit 1
 DATA_DIR="${DATA_DIRS[$LEADER_IDX]}"
 
 # Sanity check echo target.
