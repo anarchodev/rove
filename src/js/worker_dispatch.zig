@@ -973,7 +973,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .{ scope_inst.id, @errorName(err) },
         );
 
-        var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+        // Admin tenant requests get a longer budget — signup + deploy
+        // legitimately block on S3 PUTs for a few seconds. Customer
+        // tenants stay on the default (1s).
+        const budget_ns = if (std.mem.eql(u8, scope_inst.id, tenant_mod.ADMIN_INSTANCE_ID))
+            dispatcher_mod.Budget.admin_duration_ns
+        else
+            dispatcher_mod.Budget.default_duration_ns;
+        var budget = dispatcher_mod.Budget.fromNow(budget_ns);
         var resp = worker.dispatcher.run(
             scope_inst.kv,
             &txn.?,

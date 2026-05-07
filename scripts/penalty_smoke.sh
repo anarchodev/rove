@@ -113,7 +113,7 @@ echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 
 curl_status() {
     curl --cacert "$CACERT" "${RESOLVE[@]}" \
-         --max-time 5 \
+         --max-time 8 \
          -s -o /dev/null \
          -w '%{http_code}' \
          "https://${HOST_HEADER}:${LEADER_PORT}/?fn=handler"

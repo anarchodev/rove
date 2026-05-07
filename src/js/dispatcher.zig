@@ -56,7 +56,22 @@ pub const Budget = struct {
     /// cuts off at the same logical point as the original run.
     tick_count: u64 = 0,
 
-    pub const default_duration_ns: i64 = 10 * std.time.ns_per_ms;
+    /// Per-request wall-clock budget for customer handlers. Fires
+    /// QuickJS's interrupt handler when exceeded so a runaway handler
+    /// can't pin a worker. 1s covers a few sync kv writes (each
+    /// raft-replicated, ~5-50ms) plus pure-CPU work; everything past
+    /// that is genuinely abusive. The penalty box (`penalty.zig`)
+    /// adds back-pressure if a single instance trips this budget
+    /// repeatedly inside the box's window.
+    pub const default_duration_ns: i64 = 1 * std.time.ns_per_s;
+
+    /// Larger budget for `__admin__` requests. Signup + deploy on the
+    /// admin tenant blocks on S3 PUTs (compile + upload starter
+    /// content); each PUT is ~100-300ms RTT and a fresh tenant
+    /// uploads a handful of files. 10s gives real headroom for that
+    /// path without forcing every customer request to share the same
+    /// (much larger) budget.
+    pub const admin_duration_ns: i64 = 10 * std.time.ns_per_s;
 
     pub fn fromNow(duration_ns: i64) Budget {
         return .{ .deadline_ns = @as(i64, @intCast(std.time.nanoTimestamp())) + duration_ns };
