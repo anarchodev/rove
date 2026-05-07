@@ -140,6 +140,23 @@ pub const Cli = struct {
     /// Production typical: 600000 (10 minutes). Smokes use a few
     /// hundred ms to provoke firing inside a short test window.
     snapshot_interval_ms: u32 = 0,
+    /// willemt election timeout (ms). Followers wait this long
+    /// without a heartbeat before starting an election; randomized
+    /// internally to `[T, 2*T)` to avoid split votes. Default 1000ms
+    /// matches etcd / Consul / TiKV. Lower (200ms) for smokes that
+    /// need fast first-election. Higher (2000ms+) for noisy cloud
+    /// VMs / cross-region clusters where 500ms-1s pauses would
+    /// otherwise trip spurious elections. willemt sends heartbeats
+    /// at `request_timeout_ms`, so keep that ≤ election_timeout/2.
+    election_timeout_ms: u32 = 1000,
+    /// willemt heartbeat interval AND outbound RPC retry timeout
+    /// (ms). Leader sends AppendEntries to each follower this often.
+    /// Default 200ms = 5 heartbeats per second. Must be < election
+    /// timeout / 2 to keep followers from starting elections under
+    /// healthy steady-state. Lower for snappier failover detection,
+    /// higher to reduce wire chatter on bandwidth-constrained
+    /// links.
+    request_timeout_ms: u32 = 200,
     /// Public origin the dashboard / CLI hits to call files-server.
     /// Required when serving the admin dashboard — the operator runs
     /// `files-server-standalone` as a separate process and points
@@ -246,6 +263,14 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.snapshot_interval_ms = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--election-timeout-ms")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.election_timeout_ms = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--heartbeat-ms")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.request_timeout_ms = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, a, "--log-public-base")) {
             i += 1;
             if (i >= args.len) return error.Usage;
@@ -496,6 +521,14 @@ pub const USAGE =
     \\                              disabled). Captures via BLOB_BACKEND-picked store
     \\                              and brackets with raft_begin/end_snapshot so the
     \\                              on-disk willemt log gets compacted past each pass.
+    \\  --election-timeout-ms <n>   willemt election timeout (default 1000). Followers
+    \\                              start an election after this long without a heartbeat
+    \\                              (randomized to [T, 2T) internally to break ties).
+    \\                              Lower for fast smokes (~200ms); raise for noisy cloud
+    \\                              VMs / cross-region clusters.
+    \\  --heartbeat-ms <n>          willemt heartbeat / RPC retry interval (default 200).
+    \\                              Must be < election-timeout / 2 to avoid spurious
+    \\                              elections under healthy load.
     \\  --dev-webhook-unsafe        DEV ONLY: allow http:// + loopback webhook targets
     \\
 ;

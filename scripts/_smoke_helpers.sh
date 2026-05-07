@@ -129,6 +129,17 @@ init_cluster_addrs() {
     done
     PEERS_CSV=$(IFS=,; echo "${RAFT_ADDRS[*]}")
     rm -rf "${DATA_DIRS[@]}"
+
+    # Tighten raft timing for smokes: production default is 1000ms
+    # election timeout / 200ms heartbeat (matches etcd / Consul /
+    # TiKV). Smokes don't care about spurious-election resilience —
+    # they care about fast first-election. 200ms / 50ms drops smoke
+    # startup by 5-7s without changing the production envelope.
+    # Smokes can override by setting RAFT_TIMING_FLAGS=(--election-timeout-ms 200 --heartbeat-ms 50) before
+    # sourcing.
+    if [[ -z "${RAFT_TIMING_FLAGS+x}" ]]; then
+        RAFT_TIMING_FLAGS=(--election-timeout-ms 200 --heartbeat-ms 50)
+    fi
 }
 
 # `seed_all_dirs <manifest_path>` — run `loop46 seed` against

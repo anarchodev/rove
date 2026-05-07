@@ -1044,6 +1044,8 @@ pub fn main() !void {
         .raft_log_path = raft_log_path,
         .worker_count = 0,
         .propose_linger_ns = cli.propose_linger_us * std.time.ns_per_us,
+        .election_timeout_ms = cli.election_timeout_ms,
+        .request_timeout_ms = cli.request_timeout_ms,
     });
     defer raft_node.deinit();
 

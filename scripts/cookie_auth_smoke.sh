@@ -61,6 +61,7 @@ for i in 0 1 2; do
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
         --workers 2 \
+        "${RAFT_TIMING_FLAGS[@]}" \
         >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
     PIDS+=($!)
 done

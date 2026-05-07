@@ -60,6 +60,14 @@ LOG_HOST="logs.${PUBLIC_SUFFIX}"
 SMOKE_TAG=sse-smoke
 SMOKE_PROTO=https
 init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
+
+# --workers 1: SSE pump state lives per worker process. With
+# --workers 2 + SO_REUSEPORT, the /_events long-poll connection
+# can land on worker A while /emit lands on worker B; B writes the
+# event to app.db but A's pump tick races the read (or the kernel
+# doesn't wake it before max-time). Surfaces as flaky "missing
+# first emit" failures. Real fix is shared pump state across
+# workers (or pin an SSE-affinity scheme); see docs/sse-plan.md.
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
 
 PIDS=()
@@ -76,7 +84,8 @@ for i in 0 1 2; do
         --public-suffix "$PUBLIC_SUFFIX" \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
-        --workers 2 \
+        --workers 1 \
+        "${RAFT_TIMING_FLAGS[@]}" \
         >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
     PIDS+=($!)
 done

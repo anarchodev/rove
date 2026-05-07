@@ -75,6 +75,7 @@ for i in 0 1 2; do
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
         --workers 1 \
+        "${RAFT_TIMING_FLAGS[@]}" \
         --rate-limit-request-capacity 5 \
         --rate-limit-request-refill 0 \
         --rate-limit-email-capacity 2 \

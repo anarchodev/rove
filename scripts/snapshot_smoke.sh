@@ -141,6 +141,7 @@ for i in 0 1 2; do
         --bootstrap-root-token "$PERIODIC_TOKEN" \
         --snapshot-interval-ms 500 \
         --workers 1 \
+        "${RAFT_TIMING_FLAGS[@]}" \
         >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
     PIDS+=($!)
 done
