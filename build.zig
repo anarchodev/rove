@@ -466,6 +466,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cs_standalone_mod.addImport("rove-files-server", files_server_mod);
+    cs_standalone_mod.addImport("rove-blob", blob_mod);
+    cs_standalone_mod.addImport("rove-h2", h2_mod);
     const cs_standalone = b.addExecutable(.{
         .name = "files-server-standalone",
         .root_module = cs_standalone_mod,

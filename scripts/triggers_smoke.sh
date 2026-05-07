@@ -60,13 +60,18 @@ FILES_HOST="files.${PUBLIC_SUFFIX}"
 LOG_HOST="logs.${PUBLIC_SUFFIX}"
 FILES_ORIGIN="https://${FILES_HOST}:${FILES_PORT}"
 
+# Phase 5.5(e) Task #62 — files-server runs as a separate process.
+. "$(dirname "$0")/_smoke_helpers.sh"
+export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/triggers-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
     --log-listen "$LOG_ADDR" \
-    --files-listen "$FILES_ADDR" \
+    --files-public-base "https://files.${PUBLIC_SUFFIX}:${FILES_PORT}" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
@@ -76,7 +81,7 @@ FILES_ORIGIN="https://${FILES_HOST}:${FILES_PORT}"
     --workers 1 \
     --fresh >/tmp/triggers-smoke.out 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
+trap 'kill $PID $CS_PID 2>/dev/null || true; wait $PID $CS_PID 2>/dev/null || true' EXIT
 
 sleep 1.2
 
@@ -88,7 +93,6 @@ CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 AUTH=(-H "Authorization: Bearer $TOKEN")
 
 ROVE_TOKEN="$TOKEN"
-. "$(dirname "$0")/_smoke_helpers.sh"
 mint_services_token
 
 ok() { echo "ok  $1"; }

@@ -59,8 +59,10 @@ pub const Config = struct {
     /// fs / s3 picker for every per-tenant file-blobs backend the
     /// handlers open. Borrowed; must outlive the handle.
     blob_cfg: blob_mod.BackendConfig,
-    /// Where to bind the h2 listener. loop46 passes a public address
-    /// (`--files-listen`); the smoke binary may pass `127.0.0.1:0`.
+    /// Where to bind the h2 listener. The standalone binary
+    /// (`files-server-standalone`) takes this from its `--listen`
+    /// flag; smokes may pass `127.0.0.1:0` to ask the OS for an
+    /// ephemeral port.
     bind_addr: std.net.Address,
     /// Optional TLS — when set, the listener does TLS termination via
     /// rove-h2's standard path (the `*TlsConfig` is shared with the

@@ -67,7 +67,7 @@ sub-plan's migration order. No big-bang cutovers between them.
   refreshes ~once per 4 minutes). Per-tenant `log.db` and
   `Worker.log_proxy` are gone; tape body capture flows via the
   per-tenant `BlobBackend` shared between worker + standalone.
-- **(e) files-server — F1 + F2-push + F2-storage done.**
+- **(e) files-server — F1 + F2-push + F2-storage + process split done.**
   Files-server runs at `https://files.{public_suffix}` with TLS +
   JWT-gated routes, reusing the same shared HMAC secret as
   log-server. Worker proxy / `code_proxy` / `ProxyTag` / `ProxyPeer`
@@ -87,7 +87,15 @@ sub-plan's migration order. No big-bang cutovers between them.
   `FileStore.replicate` all deleted; the worker no longer opens
   files.db at all (files-server keeps a local files.db for its own
   working tree, but the worker reads manifests from
-  manifest_backend instead).
+  manifest_backend instead). After Task #62 the in-process
+  `files_server.thread.spawn` from `loop46/main.zig` is gone:
+  operators run `files-server-standalone` as a separate process and
+  point the worker at it via `--files-public-base`.
+  `LOOP46_SERVICES_JWT_SECRET` (operator-supplied env, hex
+  HMAC-SHA256) shares the JWT key across the two processes;
+  `--files-listen` retired from `loop46`. Dev (`scripts/dev_serve.sh`)
+  + production (`scripts/rove-loop46-serve.sh`) helpers fork-exec
+  the standalone alongside the worker for one-command startup.
 - **(c) snapshot — not started.** Waits on (a) retiring envelope
   type 1 to reduce raft log pressure (envelope 3 is already gone).
 
@@ -392,7 +400,7 @@ sequence). Each step is independently shippable + smoke-testable.
 
 **Sub-plan**: `docs/logs-plan.md`.
 
-### 4. Files-server architectural move — **F1 + F2-push + F2-storage done 2026-05-06**
+### 4. Files-server architectural move — **F1 + F2-push + F2-storage + process split done 2026-05-06**
 
 **What it delivers**: files-server moves to its own subdomain
 (`files.{public_suffix}`), the runtime release signal becomes a

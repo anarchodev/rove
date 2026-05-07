@@ -90,7 +90,37 @@ rove-js: starting
 
 EOF
 
-exec "$WORKER_BIN" \
+# Phase 5.5(e) Task #62 — files-server runs as a separate process.
+# Spawn it on a fixed local port behind the same TLS cert as the
+# worker, share LOOP46_SERVICES_JWT_SECRET so JWTs minted at the
+# worker's `/_system/services-token` verify here. Production-grade
+# supervision (systemd, etc.) should run them as separate units;
+# this single-script helper just shells the process out for now.
+FILES_PORT="${FILES_PORT:-8444}"
+FILES_SERVER_BIN="${FILES_SERVER_BIN:-$REPO_DIR/zig-out/bin/files-server-standalone}"
+JWT_SECRET_FILE="${JWT_SECRET_FILE:-$DATA_DIR/services-jwt-secret}"
+if [[ ! -f "$JWT_SECRET_FILE" ]]; then
+    head -c32 /dev/urandom | xxd -p | tr -d '\n' > "$JWT_SECRET_FILE"
+    chmod 0600 "$JWT_SECRET_FILE"
+fi
+export LOOP46_SERVICES_JWT_SECRET="$(cat "$JWT_SECRET_FILE")"
+
+CS_LOG="${CS_LOG:-$DATA_DIR/files-server.log}"
+"$FILES_SERVER_BIN" \
+    --data-dir "$DATA_DIR" \
+    --listen "127.0.0.1:${FILES_PORT}" \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
+    --cors-origin "$ADMIN_ORIGIN" \
+    >"$CS_LOG" 2>&1 &
+CS_PID=$!
+trap 'kill $CS_PID 2>/dev/null || true; wait $CS_PID 2>/dev/null || true' EXIT
+echo "  files-server: log at $CS_LOG (pid $CS_PID, port $FILES_PORT)"
+
+# Foreground (no `exec`) so the EXIT trap above can tear down the
+# standalone when the worker exits. For systemd-supervised deploys
+# both processes should be separate units instead.
+"$WORKER_BIN" \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
@@ -100,6 +130,7 @@ exec "$WORKER_BIN" \
     --public-suffix "$BASE_DOMAIN" \
     --admin-api-domain "$ADMIN_API_DOMAIN" \
     --admin-origin "$ADMIN_ORIGIN" \
+    --files-public-base "https://files.${BASE_DOMAIN}:${FILES_PORT}" \
     --data-dir "$DATA_DIR" \
     --workers "$WORKERS" \
     "${BOOTSTRAP_ARGS[@]}"

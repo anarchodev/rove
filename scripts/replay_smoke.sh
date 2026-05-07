@@ -62,13 +62,18 @@ fi
 
 rm -rf "$DATA_DIR"
 
+# Phase 5.5(e) Task #62 — files-server runs as a separate process.
+. "$(dirname "$0")/_smoke_helpers.sh"
+export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/replay-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
     --log-listen "$LOG_ADDR" \
-    --files-listen "$FILES_ADDR" \
+    --files-public-base "https://files.${PUBLIC_SUFFIX}:${FILES_PORT}" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ADMIN_ORIGIN" \
@@ -78,7 +83,7 @@ rm -rf "$DATA_DIR"
     --workers 1 \
     --fresh >/tmp/replay-smoke.out 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
+trap 'kill $PID $CS_PID 2>/dev/null || true; wait $PID $CS_PID 2>/dev/null || true' EXIT
 sleep 1.5
 
 ALICE_HOST="alice.${PUBLIC_SUFFIX}"
@@ -101,7 +106,6 @@ fail() {
 # both log_url and files_url so the smoke can call each standalone
 # subdomain directly. ROVE_TOKEN drives the worker-side auth gate.
 ROVE_TOKEN="$TOKEN"
-. "$(dirname "$0")/_smoke_helpers.sh"
 mint_services_token
 [[ "${LOG_BASE}" == "${LOG_ORIGIN}" ]] || \
     fail "log_url mismatch: got '${LOG_BASE}', expected '${LOG_ORIGIN}'"

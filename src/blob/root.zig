@@ -27,6 +27,8 @@ pub const backend = @import("backend.zig");
 pub const BlobBackend = backend.BlobBackend;
 pub const BackendConfig = backend.BackendConfig;
 pub const S3SharedConfig = backend.S3SharedConfig;
+pub const env = @import("env.zig");
+pub const BlobBackendOwned = env.BlobBackendOwned;
 
 pub const Error = error{
     /// The key contained characters that could escape the blob store's

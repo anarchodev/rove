@@ -53,13 +53,18 @@ LOG_PORT="${LOG_ADDR##*:}"
 FILES_HOST="files.loop46.localhost"
 LOG_HOST="logs.loop46.localhost"
 
+# Phase 5.5(e) Task #62 — files-server runs as a separate process.
+. "$(dirname "$0")/_smoke_helpers.sh"
+export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/static-smoke-cs.out "$ORIGIN" || exit 1
+
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
     --log-listen "$LOG_ADDR" \
-    --files-listen "$FILES_ADDR" \
+    --files-public-base "https://files.loop46.localhost:${FILES_PORT}" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ORIGIN" \
@@ -70,7 +75,7 @@ LOG_HOST="logs.loop46.localhost"
     --workers 1 \
     --fresh >/tmp/static-smoke.out 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
+trap 'kill $PID $CS_PID 2>/dev/null || true; wait $PID $CS_PID 2>/dev/null || true' EXIT
 
 sleep 1.2
 
@@ -86,7 +91,6 @@ ADMIN_HDRS=(-H "Authorization: Bearer $TOKEN" -H "Origin: $ORIGIN")
 ADMIN_ORIGIN="https://${API_HOST}:${PORT}"
 
 ROVE_TOKEN="$TOKEN"
-. "$(dirname "$0")/_smoke_helpers.sh"
 mint_services_token
 
 ok() { echo "ok  $1"; }

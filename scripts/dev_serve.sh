@@ -59,7 +59,30 @@ else
 fi
 echo
 
+# Phase 5.5(e) Task #62 — files-server runs as a separate process.
+# Generate a per-run JWT secret, spawn the standalone in the
+# background on a fixed dev port, and tear it down when loop46 dev
+# exits. The worker reads the same env to mint matching tokens.
+FILES_PORT="${FILES_PORT:-8444}"
+TLS_CERT="${LOOP46_DIR}/dev-cert.pem"
+TLS_KEY="${LOOP46_DIR}/dev-key.pem"
+export LOOP46_SERVICES_JWT_SECRET="$(head -c32 /dev/urandom | xxd -p | tr -d '\n')"
+
+CS_LOG="${LOOP46_DIR}/files-server-dev.log"
+"./zig-out/bin/files-server-standalone" \
+    --data-dir "$DATA_DIR" \
+    --listen "127.0.0.1:${FILES_PORT}" \
+    ${TLS_CERT:+--tls-cert "$TLS_CERT"} \
+    ${TLS_KEY:+--tls-key "$TLS_KEY"} \
+    --cors-origin "https://app.loop46.localhost:${PORT}" \
+    >"$CS_LOG" 2>&1 &
+CS_PID=$!
+trap 'kill $CS_PID 2>/dev/null || true; wait $CS_PID 2>/dev/null || true' EXIT
+echo "  files-server: log at $CS_LOG (pid $CS_PID, port $FILES_PORT)"
+echo
+
 exec ./zig-out/bin/loop46 dev \
     --data-dir "$DATA_DIR" \
     --http "127.0.0.1:${PORT}" \
+    --files-public-base "https://files.loop46.localhost:${FILES_PORT}" \
     "$@"

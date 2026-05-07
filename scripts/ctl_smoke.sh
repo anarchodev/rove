@@ -41,19 +41,30 @@ cat > "$SEED_MANIFEST" <<'EOF'
 EOF
 "$BIN" seed --data-dir "$DATA_DIR" --manifest "$SEED_MANIFEST"
 
+# Phase 5.5(e) Task #62 — files-server runs as a separate process.
+# Both the worker and the standalone need the same JWT secret in env
+# so the worker's `/_system/services-token` mints tokens that the
+# standalone verifies.
+. "$(dirname "$0")/_smoke_helpers.sh"
+export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+
+# Spawn the standalone first so the worker has somewhere to point
+# `--files-public-base` at right from boot.
+spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/ctl-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
     --log-listen "$LOG_ADDR" \
-    --files-listen "$FILES_ADDR" \
+    --files-public-base "http://${FILES_ADDR}" \
     --data-dir "$DATA_DIR" \
     --public-suffix "$PUBLIC_SUFFIX" \
     --bootstrap-root-token "$TOKEN" \
     >/tmp/ctl-smoke.out 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true; rm -f "$SEED_MANIFEST"' EXIT
+trap 'kill $PID $CS_PID 2>/dev/null || true; wait $PID $CS_PID 2>/dev/null || true; rm -f "$SEED_MANIFEST"' EXIT
 sleep 1.0
 
 # Smoke runs against h2c (no TLS); CURL is plain curl + h2c flag.
@@ -62,7 +73,6 @@ CURL=(curl -sS --http2-prior-knowledge)
 # Mint the JWT by curling the worker. /_system/services-token returns
 # both files_url and log_url so smokes can hit each subdomain.
 ROVE_TOKEN="$TOKEN"
-. "$(dirname "$0")/_smoke_helpers.sh"
 mint_services_token
 
 # Build a small source tree with two routes.
@@ -85,7 +95,7 @@ expect() {
     echo "ok  $label"
 }
 
-# Files-server is bound on the loopback addr from --files-listen; we
+# Files-server is bound on the loopback addr by spawn_files_server; we
 # call it directly with the JWT (no TLS — h2c on loopback). The
 # default log/files origins from /_system/services-token assume TLS
 # + a public suffix; here we override with the loopback addr.

@@ -19,17 +19,18 @@ fi
 rm -rf "$DATA_DIR"
 
 # Per-run JWT secret. Standalone binary verifies; smoke mints
-# matching test tokens.
-FILES_JWT_SECRET=$(head -c16 /dev/urandom | xxd -p | tr -d '\n')
-export FILES_JWT_SECRET
+# matching test tokens. Uses the post-Task-#62 env name shared
+# between the worker and every standalone service.
+LOOP46_SERVICES_JWT_SECRET=$(head -c16 /dev/urandom | xxd -p | tr -d '\n')
+export LOOP46_SERVICES_JWT_SECRET
 
-"$BIN" --data-dir "$DATA_DIR" >/tmp/cs-smoke.out 2>&1 &
+"$BIN" --data-dir "$DATA_DIR" --listen 127.0.0.1:0 >/tmp/cs-smoke.out 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true' EXIT
 
-# Wait for the "listening on port N" line.
+# Wait for the "listening on" line.
 for _ in $(seq 1 20); do
-    if grep -q "listening on port" /tmp/cs-smoke.out; then break; fi
+    if grep -q "listening on" /tmp/cs-smoke.out; then break; fi
     sleep 0.05
 done
 PORT=$(grep -oE 'port [0-9]+' /tmp/cs-smoke.out | awk '{print $2}')
@@ -40,11 +41,11 @@ if [[ -z "${PORT:-}" ]]; then
 fi
 echo "files-server listening on port $PORT"
 
-# Mint an HS256 JWT signed with $FILES_JWT_SECRET. 5-minute expiry.
+# Mint an HS256 JWT signed with $LOOP46_SERVICES_JWT_SECRET. 5-minute expiry.
 mint_jwt() {
-    FILES_JWT_SECRET="$FILES_JWT_SECRET" python3 - <<'PY'
+    LOOP46_SERVICES_JWT_SECRET="$LOOP46_SERVICES_JWT_SECRET" python3 - <<'PY'
 import base64, hmac, hashlib, json, os, time
-secret = bytes.fromhex(os.environ["FILES_JWT_SECRET"])
+secret = bytes.fromhex(os.environ["LOOP46_SERVICES_JWT_SECRET"])
 header = b'{"alg":"HS256","typ":"JWT"}'
 payload = json.dumps({"exp": int(time.time() * 1000) + 5 * 60 * 1000}).encode()
 def b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()

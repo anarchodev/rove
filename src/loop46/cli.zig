@@ -133,12 +133,14 @@ pub const Cli = struct {
     /// alongside the JWT so the browser knows where to send `/v1/*`
     /// requests.
     log_public_base: ?[]const u8 = null,
-    /// Where the files-server binds its TLS listener. Same shape as
-    /// `--log-listen`. Default `127.0.0.1:8084`.
-    files_listen: []const u8 = "127.0.0.1:8084",
     /// Public origin the dashboard / CLI hits to call files-server.
-    /// Auto-derived to `https://files.{public_suffix}:{files_port}`
-    /// when `--public-suffix` is set.
+    /// Required when serving the admin dashboard — the operator runs
+    /// `files-server-standalone` as a separate process and points
+    /// the worker at it here. Auto-derived to
+    /// `https://files.{public_suffix}` when only `--public-suffix`
+    /// is set (the common case for a same-cluster deploy).
+    /// `/_system/services-token` returns 503 for `files_url` when
+    /// neither this nor `--public-suffix` is set.
     files_public_base: ?[]const u8 = null,
 };
 
@@ -241,10 +243,6 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.log_public_base = args[i];
-        } else if (std.mem.eql(u8, a, "--files-listen")) {
-            i += 1;
-            if (i >= args.len) return error.Usage;
-            out.files_listen = args[i];
         } else if (std.mem.eql(u8, a, "--files-public-base")) {
             i += 1;
             if (i >= args.len) return error.Usage;

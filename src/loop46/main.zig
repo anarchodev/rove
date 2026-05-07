@@ -158,121 +158,33 @@ fn parsePeerList(allocator: std.mem.Allocator, peers_str: []const u8) ![]kv.Raft
 // against the configured S3 bucket (path-style, key-prefixed by
 // `{tenant}/{subdir}/`); without it (or `BLOB_BACKEND=fs`) the existing
 // on-disk layout is used. The string allocations live for the process'
-// lifetime — `BlobBackendOwned.deinit` frees them on shutdown.
+// lifetime — `BlobBackendOwned.deinit` frees them on shutdown. The
+// loader itself lives in `rove-blob/env.zig` so the standalone
+// services share the same env-var contract.
 
-const ENV_BLOB_BACKEND = "BLOB_BACKEND";
-const ENV_S3_ENDPOINT = "S3_ENDPOINT";
-const ENV_S3_REGION = "S3_REGION";
-const ENV_S3_BUCKET = "S3_BUCKET";
-const ENV_S3_KEY_PREFIX_BASE = "S3_KEY_PREFIX_BASE";
-const ENV_S3_USE_TLS = "S3_USE_TLS";
-const ENV_AWS_AK = "AWS_ACCESS_KEY_ID";
-const ENV_AWS_SK = "AWS_SECRET_ACCESS_KEY";
+pub const BlobBackendOwned = blob_mod.BlobBackendOwned;
 
-/// Owns the env-allocated strings that back a `.s3` `BackendConfig`.
-/// `cfg` is the pointer-stable view callers pass to spawn / Worker /
-/// ApplyCtx; `deinit` frees the underlying strings AFTER all workers
-/// have joined.
-pub const BlobBackendOwned = struct {
-    cfg: blob_mod.BackendConfig,
-    /// Owned strings backing `cfg.s3` when `cfg == .s3`. All `null`
-    /// for the `.fs` variant.
-    endpoint: ?[]u8 = null,
-    region: ?[]u8 = null,
-    bucket: ?[]u8 = null,
-    key_prefix_base: ?[]u8 = null,
-    access_key: ?[]u8 = null,
-    secret_key: ?[]u8 = null,
+/// Operator-supplied HMAC secret (hex) for `/_system/services-token`.
+/// When set, the worker AND every standalone service must read the
+/// same value so JWTs verify across processes. Without it, the
+/// worker generates a random per-process secret — useful only for
+/// in-process subsystems.
+pub const ENV_SERVICES_JWT_SECRET = "LOOP46_SERVICES_JWT_SECRET";
 
-    pub fn deinit(self: *BlobBackendOwned, allocator: std.mem.Allocator) void {
-        if (self.endpoint) |s| allocator.free(s);
-        if (self.region) |s| allocator.free(s);
-        if (self.bucket) |s| allocator.free(s);
-        if (self.key_prefix_base) |s| allocator.free(s);
-        if (self.access_key) |s| allocator.free(s);
-        if (self.secret_key) |s| allocator.free(s);
-    }
-};
-
-fn envOpt(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => err,
-    };
-}
-
-fn envRequired(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    return envOpt(allocator, name) catch |err| return err orelse failExit(
-        "loop46: BLOB_BACKEND=s3 requires {s} to be set\n",
-        .{name},
-    );
-}
-
-/// Build a `BlobBackendOwned` from env. Defaults to `.fs` when
-/// BLOB_BACKEND is unset or `fs`. Any unknown value or missing s3
-/// requirement exits with an explanatory message — startup misconfig
-/// is loud, never silent.
 pub fn loadBlobBackend(allocator: std.mem.Allocator) !BlobBackendOwned {
-    const kind_owned = (try envOpt(allocator, ENV_BLOB_BACKEND)) orelse {
-        return .{ .cfg = .fs };
-    };
-    defer allocator.free(kind_owned);
-
-    if (std.mem.eql(u8, kind_owned, "fs")) return .{ .cfg = .fs };
-
-    if (!std.mem.eql(u8, kind_owned, "s3")) {
-        failExit(
-            "loop46: BLOB_BACKEND must be \"fs\" or \"s3\" (got: \"{s}\")\n",
-            .{kind_owned},
-        );
-    }
-
-    const endpoint = (try envOpt(allocator, ENV_S3_ENDPOINT)) orelse
-        failExit("loop46: BLOB_BACKEND=s3 requires {s} to be set\n", .{ENV_S3_ENDPOINT});
-    errdefer allocator.free(endpoint);
-    const region = (try envOpt(allocator, ENV_S3_REGION)) orelse
-        failExit("loop46: BLOB_BACKEND=s3 requires {s} to be set\n", .{ENV_S3_REGION});
-    errdefer allocator.free(region);
-    const bucket = (try envOpt(allocator, ENV_S3_BUCKET)) orelse
-        failExit("loop46: BLOB_BACKEND=s3 requires {s} to be set\n", .{ENV_S3_BUCKET});
-    errdefer allocator.free(bucket);
-    const access_key = (try envOpt(allocator, ENV_AWS_AK)) orelse
-        failExit("loop46: BLOB_BACKEND=s3 requires {s} to be set\n", .{ENV_AWS_AK});
-    errdefer allocator.free(access_key);
-    const secret_key = (try envOpt(allocator, ENV_AWS_SK)) orelse
-        failExit("loop46: BLOB_BACKEND=s3 requires {s} to be set\n", .{ENV_AWS_SK});
-    errdefer allocator.free(secret_key);
-
-    // Optional: prefix base shared across tenants. Empty default lets
-    // a single bucket host one deployment cleanly.
-    const key_prefix_base = (try envOpt(allocator, ENV_S3_KEY_PREFIX_BASE)) orelse
-        try allocator.dupe(u8, "");
-    errdefer allocator.free(key_prefix_base);
-
-    // Optional: opt out of TLS (DEV ONLY — local MinIO smoke).
-    const use_tls = blk: {
-        const v = (try envOpt(allocator, ENV_S3_USE_TLS)) orelse break :blk true;
-        defer allocator.free(v);
-        if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk false;
-        break :blk true;
-    };
-
-    return .{
-        .cfg = .{ .s3 = .{
-            .endpoint = endpoint,
-            .region = region,
-            .bucket = bucket,
-            .key_prefix_base = key_prefix_base,
-            .access_key = access_key,
-            .secret_key = secret_key,
-            .use_tls = use_tls,
-        } },
-        .endpoint = endpoint,
-        .region = region,
-        .bucket = bucket,
-        .key_prefix_base = key_prefix_base,
-        .access_key = access_key,
-        .secret_key = secret_key,
+    return blob_mod.env.loadFromEnv(allocator) catch |err| switch (err) {
+        blob_mod.env.LoadError.UnknownBackend => failExit(
+            "loop46: BLOB_BACKEND must be \"fs\" or \"s3\"\n",
+            .{},
+        ),
+        blob_mod.env.LoadError.OutOfMemory => return error.OutOfMemory,
+        else => |e| {
+            const name = blob_mod.env.errorEnvName(e) orelse "<unknown>";
+            failExit(
+                "loop46: BLOB_BACKEND=s3 requires {s} to be set\n",
+                .{name},
+            );
+        },
     };
 }
 
@@ -320,9 +232,12 @@ const WorkerCtx = struct {
     /// Public origin the dashboard uses to reach the log-server.
     /// Returned in the `/_system/services-token` response. Borrowed.
     log_public_base: []const u8,
-    /// Public origin the dashboard / CLI uses to reach files-server.
-    /// Returned in the `/_system/services-token` response. Borrowed.
-    files_public_base: []const u8,
+    /// Public origin the dashboard / CLI uses to reach the files-server
+    /// process. Borrowed. Null when the operator hasn't wired one
+    /// (yet) — `/_system/services-token` returns 503 in that case so
+    /// the dashboard can surface a clear error instead of silently
+    /// failing on the next files-server fetch.
+    files_public_base: ?[]const u8,
     admin_origin: ?[]const u8,
     admin_api_domain: ?[]const u8,
     public_suffix: ?[]const u8,
@@ -946,11 +861,12 @@ pub fn main() !void {
     defer if (log_memory_handle) |h| h.deinit();
     var log_batch_store: log_server.batch_store.BatchStore = undefined;
     {
-        const endpoint = try envOpt(allocator, ENV_S3_ENDPOINT);
-        const region = try envOpt(allocator, ENV_S3_REGION);
-        const bucket = try envOpt(allocator, ENV_S3_BUCKET);
-        const access_key = try envOpt(allocator, ENV_AWS_AK);
-        const secret_key = try envOpt(allocator, ENV_AWS_SK);
+        const env = blob_mod.env;
+        const endpoint = try env.envOpt(allocator, env.ENV_S3_ENDPOINT);
+        const region = try env.envOpt(allocator, env.ENV_S3_REGION);
+        const bucket = try env.envOpt(allocator, env.ENV_S3_BUCKET);
+        const access_key = try env.envOpt(allocator, env.ENV_AWS_AK);
+        const secret_key = try env.envOpt(allocator, env.ENV_AWS_SK);
         defer if (endpoint) |s| allocator.free(s);
         defer if (region) |s| allocator.free(s);
         defer if (bucket) |s| allocator.free(s);
@@ -960,11 +876,11 @@ pub fn main() !void {
         if (endpoint != null and region != null and bucket != null and
             access_key != null and secret_key != null)
         {
-            const key_prefix = (try envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
+            const key_prefix = (try env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
                 try allocator.dupe(u8, "");
             defer allocator.free(key_prefix);
             const use_tls = blk_tls: {
-                const v = (try envOpt(allocator, ENV_S3_USE_TLS)) orelse break :blk_tls true;
+                const v = (try env.envOpt(allocator, env.ENV_S3_USE_TLS)) orelse break :blk_tls true;
                 defer allocator.free(v);
                 if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk_tls false;
                 break :blk_tls true;
@@ -1044,12 +960,34 @@ pub fn main() !void {
     defer tls_owned.deinit(allocator);
     const tls_config = try resolveTls(allocator, cli, &tls_owned);
 
-    // ── Per-process HMAC secret used by the standalone services
-    //    (log-server + files-server) to verify JWTs minted by the
-    //    worker at `/_system/services-token`. Multi-node ops will
-    //    eventually need an operator-supplied env var.
+    // ── HMAC secret used by the standalone services (log-server
+    //    in-process for now, files-server out-of-process post Task #62)
+    //    to verify JWTs minted at `/_system/services-token`.
+    //    `LOOP46_SERVICES_JWT_SECRET` (hex-encoded) is the operator's
+    //    way to pin a known value across both the worker process and
+    //    the external `files-server-standalone` it runs alongside.
+    //    Without the env, we generate a random secret per process —
+    //    fine for in-process subsystems, useless to a separately-
+    //    deployed standalone (its tokens won't verify, by design).
     var services_jwt_secret: [32]u8 = undefined;
-    std.crypto.random.bytes(&services_jwt_secret);
+    if (try blob_mod.env.envOpt(allocator, ENV_SERVICES_JWT_SECRET)) |hex| {
+        defer allocator.free(hex);
+        if (hex.len != services_jwt_secret.len * 2) failExit(
+            "loop46: {s} must be {d} hex chars (got {d})\n",
+            .{ ENV_SERVICES_JWT_SECRET, services_jwt_secret.len * 2, hex.len },
+        );
+        _ = std.fmt.hexToBytes(&services_jwt_secret, hex) catch failExit(
+            "loop46: {s} is not valid hex\n",
+            .{ENV_SERVICES_JWT_SECRET},
+        );
+        std.log.info("services-jwt-secret: loaded from {s}", .{ENV_SERVICES_JWT_SECRET});
+    } else {
+        std.crypto.random.bytes(&services_jwt_secret);
+        std.log.info(
+            "services-jwt-secret: generated per-process (set {s} to share with external services)",
+            .{ENV_SERVICES_JWT_SECRET},
+        );
+    }
 
     // ── Subsystem threads (shared across workers) ──────────────────────
     //
@@ -1093,32 +1031,24 @@ pub fn main() !void {
         try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}", .{ls_handle.port});
     defer allocator.free(log_public_base);
 
-    // ── files-server thread (Phase 5.5(e) Step F1) ────────────────────
+    // ── files-server (Phase 5.5(e) F1 + Task #62 split) ───────────────
     //
-    // Public TLS listener at `--files-listen`. Browser dashboard +
-    // CLI hit it directly; the worker is no longer in the
-    // upload/deploy path. Shares the TLS config + JWT secret with
-    // log-server.
-    const files_listen_addr = try parseHostPort(allocator, cli.files_listen);
-    const cs_handle = try files_server.thread.spawn(.{
-        .allocator = allocator,
-        .data_dir = cli.data_dir,
-        .blob_cfg = blob_owned.cfg,
-        .bind_addr = files_listen_addr,
-        .tls_config = tls_config,
-        .jwt_secret = &services_jwt_secret,
-        .cors_origin = cli.admin_origin,
-        .max_connections = subsystem_max_connections,
-    });
-    defer cs_handle.shutdown();
-
-    const files_public_base = if (cli.files_public_base) |s|
+    // Files-server now runs as a separate `files-server-standalone`
+    // process. The operator launches it independently and tells the
+    // worker where to find it via `--files-public-base`; both
+    // processes must agree on `LOOP46_SERVICES_JWT_SECRET` so the
+    // worker's `/_system/services-token` mints tokens that the
+    // standalone verifies. Without `--files-public-base` the worker
+    // still boots, but `/_system/services-token` returns 503 for the
+    // `files_url` field — useful for nodes that don't expose the
+    // dashboard.
+    const files_public_base: ?[]u8 = if (cli.files_public_base) |s|
         try allocator.dupe(u8, s)
     else if (cli.public_suffix) |suffix|
-        try std.fmt.allocPrint(allocator, "https://files.{s}:{d}", .{ suffix, cs_handle.port })
+        try std.fmt.allocPrint(allocator, "https://files.{s}", .{suffix})
     else
-        try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}", .{cs_handle.port});
-    defer allocator.free(files_public_base);
+        null;
+    defer if (files_public_base) |s| allocator.free(s);
 
     // ── Webhook-server thread (Phase 5.5 d) ───────────────────────────
     //
