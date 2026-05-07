@@ -449,6 +449,72 @@ fn deleteWithSuffix(allocator: std.mem.Allocator, path: []const u8, suffix: []co
     std.fs.cwd().deleteFile(buf) catch {};
 }
 
+/// In-process periodic capture for the raft thread (Phase 5.5(c)
+/// step B). Designed to be called from the raft thread's main
+/// loop on every tick — checks the elapsed-time gate, and on each
+/// firing brackets the capture with `raft.beginSnapshotOpaque()`
+/// + `raft.endSnapshotOpaque()` so willemt's on-disk log gets
+/// compacted past the new snapshot floor.
+///
+/// Capture runs synchronously on the raft thread — no concurrent
+/// applies during the work, so the snapshot bytes match willemt's
+/// `snapshot_last_idx = commit_idx_at_begin`. For low-tenant-count
+/// clusters this is fine; high-scale will eventually want a
+/// dedicated snapshot thread + a different begin/end strategy.
+///
+/// Returns the elapsed-since-last-capture time so the caller can
+/// log + observability metrics. `null` means we skipped this tick.
+pub fn tickRaftCapture(
+    state: *RaftCaptureState,
+    now_ns: i64,
+    raft: *kv.RaftNode,
+    apply_ctx: *apply_mod.ApplyCtx,
+    snapshot_store: ls.batch_store.BatchStore,
+    tmp_dir: []const u8,
+) !?Captured {
+    if (state.interval_ns == 0) return null;
+    if (!raft.isLeader()) return null;
+    if (now_ns - state.last_attempt_ns < state.interval_ns) return null;
+    state.last_attempt_ns = now_ns;
+
+    // willemt's begin returns false when there's nothing to
+    // snapshot (commit_idx <= snap_last, no log entries past the
+    // floor) — completely fine, just means no progress since the
+    // last pass. Stays silent in that case; non-trivial errors
+    // (NONBLOCKING_APPLY rejected, etc) would surface as the
+    // capture itself failing further down.
+    if (!raft.beginSnapshotOpaque()) return null;
+    errdefer raft.endSnapshotOpaque();
+
+    const apply_position = raft.snapshotLastIdx();
+    const willemt_term = raft.currentTerm();
+
+    const sources = try tenantSourcesFromApplyCtx(state.allocator, apply_ctx);
+    defer state.allocator.free(sources);
+
+    const captured = try capture(
+        state.allocator,
+        sources,
+        apply_ctx.root_store,
+        snapshot_store,
+        tmp_dir,
+        apply_position,
+        willemt_term,
+    );
+
+    raft.endSnapshotOpaque();
+    return captured;
+}
+
+/// Per-raft-node state the periodic snapshot ticker carries. Owned
+/// by the caller (typically loop46/main); passed by mutable
+/// reference into `tickRaftCapture`.
+pub const RaftCaptureState = struct {
+    allocator: std.mem.Allocator,
+    interval_ns: i64,
+    last_attempt_ns: i64 = 0,
+};
+
 /// Build a `[]TenantSource` slice from an already-warmed
 /// `ApplyCtx.kv_stores`. Borrows the keys + store pointers; caller
 /// frees the returned slice with `allocator.free`. Use this from

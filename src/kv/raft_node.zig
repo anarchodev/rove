@@ -744,6 +744,55 @@ pub const RaftNode = struct {
         return self.high_watermark.load(.acquire);
     }
 
+    /// willemt's current term. Caller-side snapshot orchestration
+    /// records this in the manifest so a follower load can verify
+    /// + reject term mismatches.
+    pub fn currentTerm(self: *RaftNode) u64 {
+        return @intCast(c.raft_get_current_term(self.raft));
+    }
+
+    /// Phase 5.5(c) — application-level snapshot lifecycle for
+    /// `.opaque_bytes` apply mode. The caller is the orchestrator
+    /// (loop46/snapshot.zig); these are thin wrappers over the
+    /// willemt C API used to bracket the actual capture work so
+    /// the on-disk raft log can be compacted past the snapshot's
+    /// floor.
+    ///
+    /// Contract:
+    ///   1. Caller calls `beginSnapshotOpaque()`. willemt records
+    ///      `snapshot_last_idx = commit_idx_now`. Returns false if
+    ///      a snapshot is already in progress or there's nothing
+    ///      to snapshot.
+    ///   2. Caller does the application-level capture work
+    ///      (VACUUM INTO, upload, etc.) — must observe state ≤
+    ///      `commit_idx_now`. On a single thread (the raft thread),
+    ///      this is automatic: applies past now don't run while
+    ///      this code is executing.
+    ///   3. Caller calls `endSnapshotOpaque()`. willemt compacts
+    ///      the on-disk log past `snapshot_last_idx`.
+    ///
+    /// Both calls MUST come from the same thread that owns the
+    /// raft node (the willemt C API is not thread-safe).
+    pub fn beginSnapshotOpaque(self: *RaftNode) bool {
+        if (c.raft_snapshot_is_in_progress(self.raft) != 0) return false;
+        const commit_idx = c.raft_get_commit_idx(self.raft);
+        const snap_last = c.raft_get_snapshot_last_idx(self.raft);
+        if (commit_idx <= snap_last) return false;
+        return c.raft_begin_snapshot(self.raft, c.RAFT_SNAPSHOT_NONBLOCKING_APPLY) == 0;
+    }
+
+    pub fn endSnapshotOpaque(self: *RaftNode) void {
+        _ = c.raft_end_snapshot(self.raft);
+    }
+
+    /// willemt's view of the highest log index covered by the
+    /// most recent snapshot. Useful for tests + the
+    /// `send_snapshot` callback (step C) which compares against
+    /// each follower's `next_idx`.
+    pub fn snapshotLastIdx(self: *RaftNode) u64 {
+        return @intCast(c.raft_get_snapshot_last_idx(self.raft));
+    }
+
     /// When non-zero, leadership was lost with in-flight proposals. Any
     /// worker whose seq is in (committedSeq, faultedSeq()] MUST treat its
     /// write as lost. Cleared back to 0 on the next successful election.

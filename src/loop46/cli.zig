@@ -128,6 +128,18 @@ pub const Cli = struct {
     /// 503 for `log_url` when this and `--public-suffix` are both
     /// unset.
     log_public_base: ?[]const u8 = null,
+    /// How often the raft thread should capture a snapshot to the
+    /// snapshot BatchStore (fs or s3 via `BLOB_BACKEND`, with
+    /// `SNAPSHOT_S3_KEY_PREFIX` for s3 namespacing). Each pass
+    /// runs synchronously on the raft thread between
+    /// `raft_begin_snapshot` / `raft_end_snapshot` so the on-disk
+    /// willemt log gets compacted past the snapshot's floor —
+    /// without that bracketing, the log grows forever even when
+    /// captures land. Set to 0 (default) to disable; operator can
+    /// still trigger one-off captures via `loop46 snapshot`.
+    /// Production typical: 600000 (10 minutes). Smokes use a few
+    /// hundred ms to provoke firing inside a short test window.
+    snapshot_interval_ms: u32 = 0,
     /// Public origin the dashboard / CLI hits to call files-server.
     /// Required when serving the admin dashboard — the operator runs
     /// `files-server-standalone` as a separate process and points
@@ -230,6 +242,10 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.rate_limit_email_refill = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--snapshot-interval-ms")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.snapshot_interval_ms = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, a, "--log-public-base")) {
             i += 1;
             if (i >= args.len) return error.Usage;
@@ -453,6 +469,10 @@ pub const USAGE =
     \\  --tls-key  <path>           PEM key  for h2 TLS (with --tls-cert)
     \\  --workers <n>               number of worker threads (default 0 = nCPU - 1)
     \\  --propose-linger-us <n>     raft proposal linger budget in µs (default 500)
+    \\  --snapshot-interval-ms <n>  periodic raft-thread snapshot interval (default 0 =
+    \\                              disabled). Captures via BLOB_BACKEND-picked store
+    \\                              and brackets with raft_begin/end_snapshot so the
+    \\                              on-disk willemt log gets compacted past each pass.
     \\  --dev-webhook-unsafe        DEV ONLY: allow http:// + loopback webhook targets
     \\
 ;

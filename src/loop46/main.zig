@@ -66,6 +66,7 @@ const tls_dev = @import("tls_dev.zig");
 const seed_mod = @import("seed.zig");
 const restore_cli = @import("restore_cli.zig");
 const snapshot_cli = @import("snapshot_cli.zig");
+const snapshot_mod = @import("snapshot.zig");
 
 // Demo + benchmark tenants used to live inline as Zig string literals
 // here. They now live as real `.mjs` files under
@@ -505,10 +506,68 @@ fn workerThreadEntry(args: *WorkerCtx) void {
     };
 }
 
-fn raftThreadMain(node: *kv.RaftNode) void {
-    node.run(null) catch |err| {
+/// Args bundled for the raft thread. The loop ticks willemt + an
+/// optional periodic snapshot (Phase 5.5(c) step B). Snapshot work
+/// runs synchronously between `raft.beginSnapshotOpaque` /
+/// `endSnapshotOpaque` so the on-disk log gets compacted past
+/// each snapshot's floor — without that bracketing, captures land
+/// in S3 / fs but the willemt log keeps growing forever.
+const RaftThreadArgs = struct {
+    node: *kv.RaftNode,
+    apply_ctx: *rjs.apply.ApplyCtx,
+    /// Null disables the periodic capture. The standalone CLI
+    /// `loop46 snapshot` still works against the same data dir.
+    snapshot_state: ?*snapshot_mod.RaftCaptureState = null,
+    snapshot_store: ?log_server.batch_store.BatchStore = null,
+    snapshot_tmp_dir: ?[]const u8 = null,
+    stop: *std.atomic.Value(bool),
+};
+
+fn raftThreadMain(args: *RaftThreadArgs) void {
+    runRaftLoop(args) catch |err| {
         std.log.err("raft thread exited: {s}", .{@errorName(err)});
     };
+}
+
+fn runRaftLoop(args: *RaftThreadArgs) !void {
+    while (!args.node.stopping.load(.acquire) and !args.stop.load(.acquire)) {
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        try args.node.tick(now_ns);
+
+        // Periodic snapshot capture. Only fires when the operator
+        // wired --snapshot-interval-ms. NONBLOCKING_APPLY in the
+        // begin/end pair lets willemt continue accepting committed
+        // entries logically; on a single thread they queue until
+        // capture returns, which is fine for low-tenant-count
+        // clusters. High scale needs a dedicated snapshot thread —
+        // a future step.
+        if (args.snapshot_state) |state| {
+            const store = args.snapshot_store.?;
+            const tmp = args.snapshot_tmp_dir.?;
+            const out = snapshot_mod.tickRaftCapture(
+                state,
+                now_ns,
+                args.node,
+                args.apply_ctx,
+                store,
+                tmp,
+            ) catch |err| blk: {
+                std.log.warn("snapshot tick failed: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+            if (out) |captured| {
+                var c = captured;
+                std.log.info(
+                    "snapshot captured {s} (manifest_key={s})",
+                    .{ c.snap_id, c.manifest_key },
+                );
+                c.deinit();
+            }
+        }
+
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try args.node.drainPending(2 * std.time.ns_per_s);
 }
 
 // ── main ──────────────────────────────────────────────────────────────
@@ -984,8 +1043,70 @@ pub fn main() !void {
     apply_ctx = rjs.apply.ApplyCtx.init(allocator, cli.data_dir, raft_node);
     defer apply_ctx.deinit();
 
-    var raft_thread = try std.Thread.spawn(.{}, raftThreadMain, .{raft_node});
-    raft_thread.detach();
+    // ── Optional periodic snapshot (Phase 5.5(c) step B) ──────────────
+    //
+    // Off by default. When `--snapshot-interval-ms` is set we open a
+    // BatchStore (fs or s3 via BLOB_BACKEND), allocate a per-raft-thread
+    // capture state, and the raft loop fires `snapshot.tickRaftCapture`
+    // each interval. The capture wraps in `raft.beginSnapshotOpaque` /
+    // `endSnapshotOpaque` so willemt actually compacts the on-disk log
+    // past each pass — without that bracketing, periodic captures
+    // would land in S3 / fs but the raft log would grow forever.
+    var snap_state: ?snapshot_mod.RaftCaptureState = null;
+    var snap_fs: ?*log_server.batch_store_fs.FsBatchStore = null;
+    defer if (snap_fs) |h| h.deinit();
+    var snap_s3: ?*log_server.batch_store_s3.S3BatchStore = null;
+    defer if (snap_s3) |h| h.deinit();
+    var snap_store: ?log_server.batch_store.BatchStore = null;
+    var snap_tmp: ?[]u8 = null;
+    defer if (snap_tmp) |s| allocator.free(s);
+    if (cli.snapshot_interval_ms > 0) {
+        snap_tmp = try std.fmt.allocPrint(allocator, "{s}/.snapshot-stage", .{cli.data_dir});
+        switch (blob_owned.cfg) {
+            .fs => {
+                const dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{cli.data_dir});
+                defer allocator.free(dir);
+                snap_fs = try log_server.batch_store_fs.FsBatchStore.init(allocator, dir);
+                snap_store = snap_fs.?.batchStore();
+                std.log.info("snapshot store: fs at {s} (interval {d}ms)", .{ dir, cli.snapshot_interval_ms });
+            },
+            .s3 => |s3cfg| {
+                const env = blob_mod.env;
+                const key_prefix = (try env.envOpt(allocator, "SNAPSHOT_S3_KEY_PREFIX")) orelse
+                    try allocator.dupe(u8, "");
+                defer allocator.free(key_prefix);
+                snap_s3 = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+                    .endpoint = s3cfg.endpoint,
+                    .region = s3cfg.region,
+                    .bucket = s3cfg.bucket,
+                    .key_prefix = key_prefix,
+                    .access_key = s3cfg.access_key,
+                    .secret_key = s3cfg.secret_key,
+                    .use_tls = s3cfg.use_tls,
+                });
+                snap_store = snap_s3.?.batchStore();
+                std.log.info(
+                    "snapshot store: s3 endpoint={s} bucket={s} key_prefix='{s}' (interval {d}ms)",
+                    .{ s3cfg.endpoint, s3cfg.bucket, key_prefix, cli.snapshot_interval_ms },
+                );
+            },
+        }
+        snap_state = .{
+            .allocator = allocator,
+            .interval_ns = @as(i64, cli.snapshot_interval_ms) * std.time.ns_per_ms,
+        };
+    }
+
+    var raft_thread_args = RaftThreadArgs{
+        .node = raft_node,
+        .apply_ctx = &apply_ctx,
+        .snapshot_state = if (snap_state) |*s| s else null,
+        .snapshot_store = snap_store,
+        .snapshot_tmp_dir = snap_tmp,
+        .stop = &stop_flag,
+    };
+    var raft_thread = try std.Thread.spawn(.{}, raftThreadMain, .{&raft_thread_args});
+    defer raft_thread.join();
 
     // ── TLS resolution (shared across the worker + standalone
     //    services. Production wildcard cert covers `app.`, `logs.`,
