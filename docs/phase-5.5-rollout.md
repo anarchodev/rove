@@ -60,13 +60,20 @@ sub-plan's migration order. No big-bang cutovers between them.
 - **(d) webhooks — done.** Cluster-wide `webhooks.db`, envelope
   types 4/5/6, multi-envelope-per-raft-entry, leader-pinned
   webhook-server thread.
-- **(a) logs — done.** Worker → S3 (ndjson + sidecar). Standalone
-  log-server runs on `logs.{public_suffix}` with its own TLS
-  listener, JWT-gated `/v1/{tenant}/{list,show,count,blob}` (HS256;
-  worker mints at `/_system/log-token` after admin auth, dashboard
-  refreshes ~once per 4 minutes). Per-tenant `log.db` and
-  `Worker.log_proxy` are gone; tape body capture flows via the
-  per-tenant `BlobBackend` shared between worker + standalone.
+- **(a) logs — done + process split done.** Worker → S3 / fs
+  batch store (ndjson + sidecar). Standalone log-server runs at
+  `logs.{public_suffix}` with its own TLS listener, JWT-gated
+  `/v1/{tenant}/{list,show,count,blob}` (HS256; worker mints at
+  `/_system/services-token` after admin auth, dashboard refreshes
+  on 401). Per-tenant `log.db` and `Worker.log_proxy` are gone;
+  tape body capture flows via the per-tenant `BlobBackend` shared
+  between worker + standalone. Task #61 dropped the in-process
+  log-server thread from `loop46`; operators run
+  `log-server-standalone` separately and point the worker at it
+  via `--log-public-base`. New `FsBatchStore` (alongside the
+  existing `S3BatchStore` and the test-only `MemoryBatchStore`)
+  provides the cross-process worker → standalone batch path under
+  `{data_dir}/log-batches/` for fs-backend deploys.
 - **(e) files-server — F1 + F2-push + F2-storage + process split done.**
   Files-server runs at `https://files.{public_suffix}` with TLS +
   JWT-gated routes, reusing the same shared HMAC secret as

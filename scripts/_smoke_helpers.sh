@@ -73,6 +73,35 @@ spawn_files_server() {
     return 1
 }
 
+# `spawn_log_server <listen> <data_dir> <log_path> [cors_origin]` —
+# start the log-server-standalone subprocess. Same shape as
+# spawn_files_server (TLS + CORS via env / arg, JWT secret read
+# from LOOP46_SERVICES_JWT_SECRET). Sets LS_PID. Worker and
+# standalone share `data_dir` so the fs batch-store path
+# `{data_dir}/log-batches/` is the same physical directory.
+spawn_log_server() {
+    local listen="$1"
+    local data_dir="$2"
+    local log_path="$3"
+    local cors_origin="${4:-}"
+    "${BIN%/loop46}/log-server-standalone" \
+        --data-dir "$data_dir" \
+        --listen "$listen" \
+        --poll-interval-ms 100 \
+        ${TLS_CERT:+--tls-cert "$TLS_CERT"} \
+        ${TLS_KEY:+--tls-key "$TLS_KEY"} \
+        ${cors_origin:+--cors-origin "$cors_origin"} \
+        >"$log_path" 2>&1 &
+    LS_PID=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if grep -q 'listening on' "$log_path" 2>/dev/null; then return 0; fi
+        sleep 0.1
+    done
+    echo "spawn_log_server: didn't see 'listening on' in $log_path within 1s" >&2
+    cat "$log_path" >&2
+    return 1
+}
+
 # `release_deployment <tenant_id> <dep_id>` — POST /_system/release on
 # the worker so it reloads bytecodes for the tenant. Replaces the
 # 2-second `refreshDeployments` poll retired in Phase 5.5(e) F2.

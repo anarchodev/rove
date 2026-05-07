@@ -57,13 +57,14 @@ LOG_HOST="logs.loop46.localhost"
 . "$(dirname "$0")/_smoke_helpers.sh"
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
 spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/static-smoke-cs.out "$ORIGIN" || exit 1
+spawn_log_server "$LOG_ADDR" "$DATA_DIR" /tmp/static-smoke-ls.out "$ORIGIN" || exit 1
 
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
-    --log-listen "$LOG_ADDR" \
+    --log-public-base "https://logs.loop46.localhost:${LOG_PORT}" \
     --files-public-base "https://files.loop46.localhost:${FILES_PORT}" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
@@ -75,7 +76,7 @@ spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/static-smoke-cs.out "$ORIGIN" 
     --workers 1 \
     --fresh >/tmp/static-smoke.out 2>&1 &
 PID=$!
-trap 'kill $PID $CS_PID 2>/dev/null || true; wait $PID $CS_PID 2>/dev/null || true' EXIT
+trap 'kill $PID $CS_PID $LS_PID 2>/dev/null || true; wait $PID $CS_PID $LS_PID 2>/dev/null || true' EXIT
 
 sleep 1.2
 

@@ -1,101 +1,169 @@
-//! `log-server-standalone` — Phase 5.5 (a) entry point.
+//! `log-server-standalone` — Phase 5.5 (a) standalone log query API.
 //!
-//! Spawns the indexer thread + h2 query API together. Loopback-only;
-//! TLS + JWT-handoff land in step 6 when the server moves to its own
-//! subdomain.
+//! After Task #61 the loop46 worker no longer spawns log-server
+//! in-process; the operator runs this binary alongside `loop46
+//! worker` and points the worker at it via `--log-public-base`. Both
+//! processes share the JWT secret (`LOOP46_SERVICES_JWT_SECRET`) so
+//! tokens minted at the worker's `/_system/services-token` verify
+//! here on every `/v1/*` request, AND share the same batch-store +
+//! blob-backend config so the standalone can index/serve what the
+//! worker writes.
 //!
-//! Storage is S3 — there is no longer a filesystem backend. The
-//! standalone reads its S3 config entirely from env (matches the
-//! BLOB_BACKEND=s3 vars used elsewhere) and exits with a clear
-//! message if anything's missing. The smoke driver sources `.env`
-//! before spawning.
+//! Required env:
+//!   LOOP46_SERVICES_JWT_SECRET   hex HMAC-SHA256 shared with the
+//!                                loop46 worker.
 //!
-//! Required env (batch store + tape blob backend):
-//!   S3_ENDPOINT          hostname (no scheme)
-//!   S3_REGION            sigv4 signing region
-//!   S3_BUCKET            bucket name
-//!   AWS_ACCESS_KEY_ID
-//!   AWS_SECRET_ACCESS_KEY
-//!   LOG_JWT_SECRET       hex-encoded HMAC-SHA256 secret used to verify
-//!                        the `Authorization: Bearer <jwt>` on every
-//!                        `/v1/*` request. Must match what whoever
-//!                        mints tokens uses (loop46 worker, smoke, etc).
+//! Optional env (S3 batch store + tape blob backend):
+//!   BLOB_BACKEND=s3              + S3_ENDPOINT / S3_REGION /
+//!                                S3_BUCKET / AWS_ACCESS_KEY_ID /
+//!                                AWS_SECRET_ACCESS_KEY (and optional
+//!                                S3_KEY_PREFIX_BASE / S3_USE_TLS).
+//!                                Default `fs` writes / reads under
+//!                                `--data-dir/log-batches/`.
+//!   LOG_S3_KEY_PREFIX            prepended to every batch-store key
+//!                                when BLOB_BACKEND=s3 (default ``).
 //!
-//! Optional env:
-//!   LOG_S3_KEY_PREFIX    prefix prepended to every batch-store key
-//!                        (sidecars + ndjson; default ``)
-//!   S3_KEY_PREFIX_BASE   prefix prepended to every per-tenant
-//!                        BlobBackend key (`{base}{tenant}/log-blobs/{hash}`).
-//!                        Must match the worker's `S3_KEY_PREFIX_BASE`
-//!                        so the standalone reads from the same keys
-//!                        the worker writes. Default ``.
-//!   S3_USE_TLS           `0` / `false` to drop to http (DEV ONLY,
-//!                        for local MinIO smoke)
-//!
-//! CLI flags:
-//!   --index-db <path>    where local SQLite index lives
-//!                        (default /tmp/log-server-index.db)
-//!   --listen host:port   bind address (default 127.0.0.1:0)
-//!   --poll-interval-ms N indexer cadence (default 5000)
-//!
-//! Prints `listening on port {N}` on a stable line so the smoke can
-//! scrape it from stdout without racing log output.
+//! Usage:
+//!   log-server-standalone --data-dir <path> --listen <host:port> \
+//!                         [--tls-cert <path> --tls-key <path>] \
+//!                         [--cors-origin <origin>] \
+//!                         [--index-db <path>] \
+//!                         [--poll-interval-ms 5000]
 
 const std = @import("std");
 const log_server = @import("rove-log-server");
 const blob_mod = @import("rove-blob");
+const h2 = @import("rove-h2");
+
+const ENV_JWT_SECRET = "LOOP46_SERVICES_JWT_SECRET";
 
 const Cli = struct {
-    index_db_path: []const u8 = "/tmp/log-server-index.db",
-    listen_host: []const u8 = "127.0.0.1",
-    listen_port: u16 = 0,
-    poll_interval_ms: u32 = 5_000,
+    data_dir: []const u8 = "/tmp/rove-log-server",
+    index_db_path: ?[]const u8 = null,
+    listen: []const u8 = "127.0.0.1:0",
+    tls_cert: ?[]const u8 = null,
+    tls_key: ?[]const u8 = null,
+    cors_origin: ?[]const u8 = null,
+    poll_interval_ms: u32 = 500,
+    max_connections: u32 = 64,
 };
+
+fn usage(stderr: *std.fs.File.Writer) !void {
+    try stderr.interface.writeAll(
+        \\usage: log-server-standalone --data-dir <path>
+        \\                             --listen <host:port>
+        \\                             [--tls-cert <path> --tls-key <path>]
+        \\                             [--cors-origin <origin>]
+        \\                             [--index-db <path>]
+        \\                             [--poll-interval-ms <ms>]
+        \\                             [--max-connections <N>]
+        \\
+        \\env (required):
+        \\  LOOP46_SERVICES_JWT_SECRET   hex HMAC-SHA256 shared with loop46 worker
+        \\
+        \\env (optional, S3 backend):
+        \\  BLOB_BACKEND=s3              + S3_ENDPOINT / S3_REGION / S3_BUCKET /
+        \\                                AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+        \\  LOG_S3_KEY_PREFIX            prepended to batch-store keys
+        \\
+    );
+    try stderr.interface.flush();
+}
 
 fn parseCli(argv: [][:0]u8) !Cli {
     var out: Cli = .{};
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
-        if (std.mem.eql(u8, a, "--index-db")) {
+        if (std.mem.eql(u8, a, "--data-dir")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.data_dir = argv[i];
+        } else if (std.mem.eql(u8, a, "--index-db")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.index_db_path = argv[i];
         } else if (std.mem.eql(u8, a, "--listen")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
-            const arg = argv[i];
-            const colon = std.mem.lastIndexOfScalar(u8, arg, ':') orelse return error.Usage;
-            out.listen_host = arg[0..colon];
-            out.listen_port = try std.fmt.parseInt(u16, arg[colon + 1 ..], 10);
+            out.listen = argv[i];
+        } else if (std.mem.eql(u8, a, "--tls-cert")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.tls_cert = argv[i];
+        } else if (std.mem.eql(u8, a, "--tls-key")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.tls_key = argv[i];
+        } else if (std.mem.eql(u8, a, "--cors-origin")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.cors_origin = argv[i];
         } else if (std.mem.eql(u8, a, "--poll-interval-ms")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.poll_interval_ms = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--max-connections")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.max_connections = try std.fmt.parseInt(u32, argv[i], 10);
         } else {
             return error.Usage;
         }
     }
+    if ((out.tls_cert == null) != (out.tls_key == null)) return error.Usage;
     return out;
 }
 
-fn envRequired(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+fn parseHostPort(allocator: std.mem.Allocator, hp: []const u8) !std.net.Address {
+    const colon = std.mem.lastIndexOfScalar(u8, hp, ':') orelse return error.MalformedHostPort;
+    const host = hp[0..colon];
+    const port = try std.fmt.parseInt(u16, hp[colon + 1 ..], 10);
+    if (std.mem.eql(u8, host, "localhost")) {
+        return std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+    }
+    const host_z = try allocator.dupeZ(u8, host);
+    defer allocator.free(host_z);
+    return try std.net.Address.parseIp(host_z, port);
+}
+
+fn loadJwtSecret(allocator: std.mem.Allocator) ![]u8 {
+    const hex = std.process.getEnvVarOwned(allocator, ENV_JWT_SECRET) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => {
+            std.debug.print("error: {s} not set\n", .{ENV_JWT_SECRET});
+            std.process.exit(2);
+        },
+        else => return err,
+    };
+    defer allocator.free(hex);
+    if (hex.len == 0 or hex.len % 2 != 0) {
+        std.debug.print("error: {s} must be even-length hex\n", .{ENV_JWT_SECRET});
+        std.process.exit(2);
+    }
+    const bytes = try allocator.alloc(u8, hex.len / 2);
+    errdefer allocator.free(bytes);
+    _ = std.fmt.hexToBytes(bytes, hex) catch {
+        std.debug.print("error: {s} is not valid hex\n", .{ENV_JWT_SECRET});
+        std.process.exit(2);
+    };
+    return bytes;
+}
+
+fn loadBlobBackend(allocator: std.mem.Allocator) !blob_mod.BlobBackendOwned {
+    return blob_mod.env.loadFromEnv(allocator) catch |err| switch (err) {
+        blob_mod.env.LoadError.UnknownBackend => {
+            std.debug.print("error: BLOB_BACKEND must be \"fs\" or \"s3\"\n", .{});
+            std.process.exit(2);
+        },
+        blob_mod.env.LoadError.OutOfMemory => return error.OutOfMemory,
+        else => |e| {
+            const name = blob_mod.env.errorEnvName(e) orelse "<unknown>";
             std.debug.print(
-                "log-server-standalone: missing required env var: {s}\n",
+                "error: BLOB_BACKEND=s3 requires {s} to be set\n",
                 .{name},
             );
             std.process.exit(2);
         },
-        else => err,
-    };
-}
-
-fn envOpt(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => err,
     };
 }
 
@@ -107,129 +175,108 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
+    var stderr_buf: [512]u8 = undefined;
+    var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
     const cli = parseCli(argv) catch {
-        var stderr_buf: [512]u8 = undefined;
-        var sw = std.fs.File.stderr().writer(&stderr_buf);
-        try sw.interface.writeAll(
-            \\usage: log-server-standalone \
-            \\    [--index-db /path/to/log_index.db] \
-            \\    [--listen 127.0.0.1:0] \
-            \\    [--poll-interval-ms 5000]
-            \\
-            \\Required env: S3_ENDPOINT S3_REGION S3_BUCKET
-            \\              AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-            \\Optional env: LOG_S3_KEY_PREFIX S3_USE_TLS
-            \\
-        );
-        try sw.interface.flush();
+        usage(&stderr_w) catch {};
         std.process.exit(2);
     };
 
-    const endpoint = try envRequired(allocator, "S3_ENDPOINT");
-    defer allocator.free(endpoint);
-    const region = try envRequired(allocator, "S3_REGION");
-    defer allocator.free(region);
-    const bucket = try envRequired(allocator, "S3_BUCKET");
-    defer allocator.free(bucket);
-    const access_key = try envRequired(allocator, "AWS_ACCESS_KEY_ID");
-    defer allocator.free(access_key);
-    const secret_key = try envRequired(allocator, "AWS_SECRET_ACCESS_KEY");
-    defer allocator.free(secret_key);
-    const key_prefix = (try envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
-        try allocator.dupe(u8, "");
-    defer allocator.free(key_prefix);
-    // Optional. Empty default means tape blobs sit at
-    // `{tenant}/log-blobs/{hash}` (matches the worker default).
-    const blob_key_prefix_base = (try envOpt(allocator, "S3_KEY_PREFIX_BASE")) orelse
-        try allocator.dupe(u8, "");
-    defer allocator.free(blob_key_prefix_base);
-    const use_tls = blk: {
-        const v = (try envOpt(allocator, "S3_USE_TLS")) orelse break :blk true;
-        defer allocator.free(v);
-        if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk false;
-        break :blk true;
-    };
+    std.fs.cwd().makePath(cli.data_dir) catch {};
 
-    const s3 = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
-        .endpoint = endpoint,
-        .region = region,
-        .bucket = bucket,
-        .key_prefix = key_prefix,
-        .access_key = access_key,
-        .secret_key = secret_key,
-        .use_tls = use_tls,
-    });
-    defer s3.deinit();
-
-    // Same S3 connection params as the batch store; differs only in
-    // the per-tenant key prefix scheme (BlobBackend.openPerTenant
-    // builds it lazily). Threaded into standalone.spawn so the blob
-    // route opens a per-tenant BlobBackend on first request.
-    const blob_backend_cfg: blob_mod.BackendConfig = .{ .s3 = .{
-        .endpoint = endpoint,
-        .region = region,
-        .bucket = bucket,
-        .key_prefix_base = blob_key_prefix_base,
-        .access_key = access_key,
-        .secret_key = secret_key,
-        .use_tls = use_tls,
-    } };
-
-    const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}", .{cli.index_db_path}, 0);
-    defer allocator.free(db_path);
-
-    var db = try log_server.index_db.IndexDb.open(allocator, db_path);
-    defer db.close();
-
-    const ip = parseIp4(cli.listen_host) catch {
-        std.debug.print("error: --listen host must be an IPv4 dotted quad\n", .{});
-        std.process.exit(2);
-    };
-    const bind_addr = std.net.Address.initIp4(ip, cli.listen_port);
-
-    // JWT verification secret. Hex-encoded so the smoke can pass it
-    // through env without binary-clean shell escaping. We don't dupe
-    // — the slice lives until the binary exits.
-    const jwt_secret_hex = try envRequired(allocator, "LOG_JWT_SECRET");
-    defer allocator.free(jwt_secret_hex);
-    if (jwt_secret_hex.len == 0 or jwt_secret_hex.len % 2 != 0) {
-        std.debug.print("error: LOG_JWT_SECRET must be even-length hex\n", .{});
-        std.process.exit(2);
-    }
-    const jwt_secret = try allocator.alloc(u8, jwt_secret_hex.len / 2);
+    const jwt_secret = try loadJwtSecret(allocator);
     defer allocator.free(jwt_secret);
-    _ = std.fmt.hexToBytes(jwt_secret, jwt_secret_hex) catch {
-        std.debug.print("error: LOG_JWT_SECRET is not valid hex\n", .{});
+
+    var blob_owned = try loadBlobBackend(allocator);
+    defer blob_owned.deinit(allocator);
+
+    // Pick the batch store backend off the same env signal. `fs` mode
+    // points at `{data_dir}/log-batches/` so the worker (running with
+    // the same data_dir) writes batches to a path the standalone can
+    // see directly; `s3` mode uses the same connection params + an
+    // optional LOG_S3_KEY_PREFIX namespace, matching what the worker's
+    // flushLogs path does.
+    var fs_handle: ?*log_server.batch_store_fs.FsBatchStore = null;
+    defer if (fs_handle) |h| h.deinit();
+    var s3_handle: ?*log_server.batch_store_s3.S3BatchStore = null;
+    defer if (s3_handle) |h| h.deinit();
+    var batch_store: log_server.batch_store.BatchStore = undefined;
+
+    switch (blob_owned.cfg) {
+        .fs => {
+            const fs_dir = try std.fmt.allocPrint(allocator, "{s}/log-batches", .{cli.data_dir});
+            defer allocator.free(fs_dir);
+            fs_handle = try log_server.batch_store_fs.FsBatchStore.init(allocator, fs_dir);
+            batch_store = fs_handle.?.batchStore();
+            std.log.info("batch backend: fs at {s}", .{fs_dir});
+        },
+        .s3 => |s3cfg| {
+            const key_prefix = (try blob_mod.env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
+                try allocator.dupe(u8, "");
+            defer allocator.free(key_prefix);
+            s3_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+                .endpoint = s3cfg.endpoint,
+                .region = s3cfg.region,
+                .bucket = s3cfg.bucket,
+                .key_prefix = key_prefix,
+                .access_key = s3cfg.access_key,
+                .secret_key = s3cfg.secret_key,
+                .use_tls = s3cfg.use_tls,
+            });
+            batch_store = s3_handle.?.batchStore();
+            std.log.info(
+                "batch backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
+                .{ s3cfg.endpoint, s3cfg.region, s3cfg.bucket, key_prefix },
+            );
+        },
+    }
+
+    var tls_config: ?*h2.TlsConfig = null;
+    defer if (tls_config) |c| c.destroy();
+    if (cli.tls_cert) |cert| {
+        tls_config = h2.TlsConfig.createFromFiles(allocator, cert, cli.tls_key.?) catch |err| {
+            std.debug.print("error: tls: {s} (cert={s}, key={s})\n", .{ @errorName(err), cert, cli.tls_key.? });
+            std.process.exit(2);
+        };
+        std.log.info("tls: loaded {s} + {s}", .{ cert, cli.tls_key.? });
+    }
+
+    const listen_addr = parseHostPort(allocator, cli.listen) catch |err| {
+        std.debug.print("error: --listen {s}: {s}\n", .{ cli.listen, @errorName(err) });
         std.process.exit(2);
     };
+
+    const index_db_path = if (cli.index_db_path) |p|
+        try std.fmt.allocPrintSentinel(allocator, "{s}", .{p}, 0)
+    else
+        try std.fmt.allocPrintSentinel(allocator, "{s}/log_index.db", .{cli.data_dir}, 0);
+    defer allocator.free(index_db_path);
+
+    var db = try log_server.index_db.IndexDb.open(allocator, index_db_path);
+    defer db.close();
 
     const handle = try log_server.standalone.spawn(.{
         .allocator = allocator,
-        .store = s3.batchStore(),
+        .store = batch_store,
         .db = db,
-        .bind_addr = bind_addr,
-        .poll_interval_ms = cli.poll_interval_ms,
-        .blob_backend_cfg = blob_backend_cfg,
+        .bind_addr = listen_addr,
+        .max_connections = cli.max_connections,
+        .blob_backend_cfg = blob_owned.cfg,
+        .fs_data_dir = cli.data_dir,
+        .tls_config = tls_config,
         .jwt_secret = jwt_secret,
+        .cors_origin = cli.cors_origin,
+        .poll_interval_ms = cli.poll_interval_ms,
     });
     defer handle.shutdown();
 
+    const scheme: []const u8 = if (tls_config != null) "https" else "http";
     var stdout_buf: [128]u8 = undefined;
     var sw = std.fs.File.stdout().writer(&stdout_buf);
-    try sw.interface.print("listening on port {d}\n", .{handle.port});
+    try sw.interface.print("log-server-standalone listening on {s}://{s} (port {d})\n", .{
+        scheme, cli.listen, handle.port,
+    });
     try sw.interface.flush();
 
     while (true) std.Thread.sleep(1 * std.time.ns_per_s);
-}
-
-fn parseIp4(host: []const u8) ![4]u8 {
-    var out: [4]u8 = undefined;
-    var it = std.mem.splitScalar(u8, host, '.');
-    var i: usize = 0;
-    while (it.next()) |part| : (i += 1) {
-        if (i >= 4) return error.InvalidIp;
-        out[i] = try std.fmt.parseInt(u8, part, 10);
-    }
-    if (i != 4) return error.InvalidIp;
-    return out;
 }

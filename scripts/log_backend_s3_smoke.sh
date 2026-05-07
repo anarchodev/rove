@@ -107,6 +107,20 @@ export S3_KEY_PREFIX_BASE="$SMOKE_PREFIX"
     --manifest examples/loop46-demo-tenants.json >/tmp/lbs-seed.out 2>&1 \
     || { cat /tmp/lbs-seed.out >&2; exit 2; }
 
+# ── JWT secret shared between worker mint + standalone verify ─────
+# Per-run 32-byte hex; both processes need the same value via
+# LOOP46_SERVICES_JWT_SECRET in env.
+export LOOP46_SERVICES_JWT_SECRET=$(head -c32 /dev/urandom | xxd -p | tr -d '\n')
+
+# ── Spawn log-server pointing at the SAME bucket+prefix ───────────
+"$LS_BIN" \
+    --data-dir "$DATA_DIR" \
+    --index-db "$INDEX_DB" \
+    --listen 127.0.0.1:${LS_PORT} \
+    --poll-interval-ms 500 \
+    >/tmp/lbs-server.out 2>&1 &
+LS_PID=$!
+
 # ── Spawn worker (S3 env wired in via bootstrap-time env vars) ─────
 "$BIN" worker \
     --node-id 0 \
@@ -118,24 +132,12 @@ export S3_KEY_PREFIX_BASE="$SMOKE_PREFIX"
     --admin-origin "$ADMIN_ORIGIN" \
     --admin-api-domain "$ADMIN_HOST" \
     --public-suffix loop46.localhost \
+    --log-public-base "http://127.0.0.1:${LS_PORT}" \
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --workers 1 \
     >/tmp/lbs-worker.out 2>&1 &
 WORKER_PID=$!
-
-# ── Spawn log-server pointing at the SAME bucket+prefix ───────────
-# Per-run JWT secret (32 hex bytes = 16 random bytes). Standalone
-# server verifies; the smoke mints test tokens with the same value.
-LOG_JWT_SECRET=$(head -c16 /dev/urandom | xxd -p | tr -d '\n')
-export LOG_JWT_SECRET
-
-"$LS_BIN" \
-    --index-db "$INDEX_DB" \
-    --listen 127.0.0.1:${LS_PORT} \
-    --poll-interval-ms 500 \
-    >/tmp/lbs-server.out 2>&1 &
-LS_PID=$!
 
 cleanup() {
     kill $WORKER_PID $LS_PID 2>/dev/null || true
@@ -149,8 +151,8 @@ sleep 1.5
 
 LS_BOUND_PORT=""
 for _ in $(seq 1 50); do
-    if grep -q '^listening on port ' /tmp/lbs-server.out 2>/dev/null; then
-        LS_BOUND_PORT=$(awk '/^listening on port / {print $4; exit}' /tmp/lbs-server.out)
+    if grep -q 'listening on .* (port ' /tmp/lbs-server.out 2>/dev/null; then
+        LS_BOUND_PORT=$(grep -oE 'port [0-9]+' /tmp/lbs-server.out | awk '{print $2; exit}')
         break
     fi
     sleep 0.1
@@ -161,8 +163,18 @@ if [[ -z "$LS_BOUND_PORT" ]]; then
     exit 1
 fi
 
-# Confirm worker reported s3 backend at startup.
-grep -q "log backend: s3" /tmp/lbs-worker.out \
+# Confirm worker reported s3 backend at startup. Bootstrap of the
+# admin UI uploads ~50 blobs to S3 before the worker prints the
+# `log backend: s3` line, so allow ~5s of polling.
+WORKER_S3_OK=""
+for _ in $(seq 1 50); do
+    if grep -q "log backend: s3" /tmp/lbs-worker.out 2>/dev/null; then
+        WORKER_S3_OK=1
+        break
+    fi
+    sleep 0.1
+done
+[[ -n "$WORKER_S3_OK" ]] \
     || { echo "FAIL worker didn't report 's3' backend" >&2; tail -40 /tmp/lbs-worker.out >&2; exit 1; }
 echo "ok  worker started with S3 backend → bucket=${S3_BUCKET} prefix=${SMOKE_PREFIX}"
 
@@ -179,13 +191,13 @@ fail() {
 RESOLVE=(--resolve "${ACME_HOST}:${PORT}:127.0.0.1")
 WORKER_CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 
-# Mint an HS256 JWT signed with $LOG_JWT_SECRET. Expires 5 minutes
+# Mint an HS256 JWT signed with $LOOP46_SERVICES_JWT_SECRET. Expires 5 minutes
 # from now — long enough for the smoke. Pure stdlib python (hmac +
 # hashlib + base64 + json).
 mint_log_jwt() {
-    LOG_JWT_SECRET="$LOG_JWT_SECRET" python3 - <<'PY'
+    LOOP46_SERVICES_JWT_SECRET="$LOOP46_SERVICES_JWT_SECRET" python3 - <<'PY'
 import base64, hmac, hashlib, json, os, time
-secret = bytes.fromhex(os.environ["LOG_JWT_SECRET"])
+secret = bytes.fromhex(os.environ["LOOP46_SERVICES_JWT_SECRET"])
 header = b'{"alg":"HS256","typ":"JWT"}'
 payload = json.dumps({"exp": int(time.time() * 1000) + 5 * 60 * 1000}).encode()
 def b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()

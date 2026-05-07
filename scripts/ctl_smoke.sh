@@ -48,23 +48,27 @@ EOF
 . "$(dirname "$0")/_smoke_helpers.sh"
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
 
-# Spawn the standalone first so the worker has somewhere to point
-# `--files-public-base` at right from boot.
+# Spawn standalone services first so the worker has somewhere to
+# point `--files-public-base` / `--log-public-base` at right from
+# boot. Both share the worker's data_dir for the fs batch store +
+# manifest backend; LOOP46_SERVICES_JWT_SECRET in env wires the
+# JWT verification on both ends.
 spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/ctl-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+spawn_log_server "$LOG_ADDR" "$DATA_DIR" /tmp/ctl-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
-    --log-listen "$LOG_ADDR" \
+    --log-public-base "http://${LOG_ADDR}" \
     --files-public-base "http://${FILES_ADDR}" \
     --data-dir "$DATA_DIR" \
     --public-suffix "$PUBLIC_SUFFIX" \
     --bootstrap-root-token "$TOKEN" \
     >/tmp/ctl-smoke.out 2>&1 &
 PID=$!
-trap 'kill $PID $CS_PID 2>/dev/null || true; wait $PID $CS_PID 2>/dev/null || true; rm -f "$SEED_MANIFEST"' EXIT
+trap 'kill $PID $CS_PID $LS_PID 2>/dev/null || true; wait $PID $CS_PID $LS_PID 2>/dev/null || true; rm -f "$SEED_MANIFEST"' EXIT
 sleep 1.0
 
 # Smoke runs against h2c (no TLS); CURL is plain curl + h2c flag.

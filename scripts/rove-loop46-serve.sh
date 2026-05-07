@@ -114,12 +114,27 @@ CS_LOG="${CS_LOG:-$DATA_DIR/files-server.log}"
     --cors-origin "$ADMIN_ORIGIN" \
     >"$CS_LOG" 2>&1 &
 CS_PID=$!
-trap 'kill $CS_PID 2>/dev/null || true; wait $CS_PID 2>/dev/null || true' EXIT
 echo "  files-server: log at $CS_LOG (pid $CS_PID, port $FILES_PORT)"
 
+LOG_PORT="${LOG_PORT:-8445}"
+LS_BIN="${LS_BIN:-$REPO_DIR/zig-out/bin/log-server-standalone}"
+LS_LOG="${LS_LOG:-$DATA_DIR/log-server.log}"
+"$LS_BIN" \
+    --data-dir "$DATA_DIR" \
+    --listen "127.0.0.1:${LOG_PORT}" \
+    --poll-interval-ms 500 \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
+    --cors-origin "$ADMIN_ORIGIN" \
+    >"$LS_LOG" 2>&1 &
+LS_PID=$!
+echo "  log-server  : log at $LS_LOG (pid $LS_PID, port $LOG_PORT)"
+
+trap 'kill $CS_PID $LS_PID 2>/dev/null || true; wait $CS_PID $LS_PID 2>/dev/null || true' EXIT
+
 # Foreground (no `exec`) so the EXIT trap above can tear down the
-# standalone when the worker exits. For systemd-supervised deploys
-# both processes should be separate units instead.
+# standalones when the worker exits. For systemd-supervised deploys
+# all three processes should be separate units instead.
 "$WORKER_BIN" \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
@@ -131,6 +146,7 @@ echo "  files-server: log at $CS_LOG (pid $CS_PID, port $FILES_PORT)"
     --admin-api-domain "$ADMIN_API_DOMAIN" \
     --admin-origin "$ADMIN_ORIGIN" \
     --files-public-base "https://files.${BASE_DOMAIN}:${FILES_PORT}" \
+    --log-public-base "https://logs.${BASE_DOMAIN}:${LOG_PORT}" \
     --data-dir "$DATA_DIR" \
     --workers "$WORKERS" \
     "${BOOTSTRAP_ARGS[@]}"

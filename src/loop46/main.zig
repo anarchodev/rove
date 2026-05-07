@@ -229,9 +229,11 @@ const WorkerCtx = struct {
     /// verifies on every request. Generated once per process; lives
     /// in the main thread; workers borrow.
     services_jwt_secret: []const u8,
-    /// Public origin the dashboard uses to reach the log-server.
-    /// Returned in the `/_system/services-token` response. Borrowed.
-    log_public_base: []const u8,
+    /// Public origin the dashboard uses to reach the log-server
+    /// process. Returned in the `/_system/services-token` response.
+    /// Borrowed. Null when the operator hasn't wired one (yet) —
+    /// `/_system/services-token` returns 503 in that case.
+    log_public_base: ?[]const u8,
     /// Public origin the dashboard / CLI uses to reach the files-server
     /// process. Borrowed. Null when the operator hasn't wired one
     /// (yet) — `/_system/services-token` returns 503 in that case so
@@ -846,67 +848,50 @@ pub fn main() !void {
     // `LOG_S3_KEY_PREFIX` so log batches can sit under a named prefix
     // alongside other tenant-scoped artifacts in the same bucket.
     //
-    // If the env vars aren't set the store stays null and `flushLogs`
-    // logs once + drops records. This is the dev / smoke path —
-    // production wires real S3.
-    // S3 if env wired, MemoryBatchStore otherwise. The store is
-    // shared between the worker (write side, via flushLogs) and the
-    // standalone log-server (read side, via the indexer + show
-    // range-reads). MemoryBatchStore lets dev / smokes work without
-    // S3 env — log records sit in process memory and are queryable
-    // via /_system/log/* until restart.
+    // The batch store is shared with the standalone log-server
+    // process (Task #61): the worker writes batches via flushLogs;
+    // the standalone's indexer polls + serves them. Both processes
+    // must point at the same physical store. Two backends:
+    //   - `BLOB_BACKEND=s3` → both open S3BatchStore against the
+    //     same bucket + LOG_S3_KEY_PREFIX namespace.
+    //   - `BLOB_BACKEND=fs` (default) → FsBatchStore at
+    //     `{data_dir}/log-batches/`. Worker and standalone share
+    //     the data_dir (or an NFS mount of it) so PUT-then-LIST
+    //     round-trips across processes.
+    var log_fs_handle: ?*log_server.batch_store_fs.FsBatchStore = null;
+    defer if (log_fs_handle) |h| h.deinit();
     var log_s3_handle: ?*log_server.batch_store_s3.S3BatchStore = null;
     defer if (log_s3_handle) |h| h.deinit();
-    var log_memory_handle: ?*log_server.batch_store.MemoryBatchStore = null;
-    defer if (log_memory_handle) |h| h.deinit();
     var log_batch_store: log_server.batch_store.BatchStore = undefined;
-    {
-        const env = blob_mod.env;
-        const endpoint = try env.envOpt(allocator, env.ENV_S3_ENDPOINT);
-        const region = try env.envOpt(allocator, env.ENV_S3_REGION);
-        const bucket = try env.envOpt(allocator, env.ENV_S3_BUCKET);
-        const access_key = try env.envOpt(allocator, env.ENV_AWS_AK);
-        const secret_key = try env.envOpt(allocator, env.ENV_AWS_SK);
-        defer if (endpoint) |s| allocator.free(s);
-        defer if (region) |s| allocator.free(s);
-        defer if (bucket) |s| allocator.free(s);
-        defer if (access_key) |s| allocator.free(s);
-        defer if (secret_key) |s| allocator.free(s);
-
-        if (endpoint != null and region != null and bucket != null and
-            access_key != null and secret_key != null)
-        {
+    switch (blob_owned.cfg) {
+        .fs => {
+            const fs_dir = try std.fmt.allocPrint(allocator, "{s}/log-batches", .{cli.data_dir});
+            defer allocator.free(fs_dir);
+            log_fs_handle = try log_server.batch_store_fs.FsBatchStore.init(allocator, fs_dir);
+            log_batch_store = log_fs_handle.?.batchStore();
+            std.log.info("log backend: fs at {s}", .{fs_dir});
+        },
+        .s3 => |s3cfg| {
+            const env = blob_mod.env;
             const key_prefix = (try env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
                 try allocator.dupe(u8, "");
             defer allocator.free(key_prefix);
-            const use_tls = blk_tls: {
-                const v = (try env.envOpt(allocator, env.ENV_S3_USE_TLS)) orelse break :blk_tls true;
-                defer allocator.free(v);
-                if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false")) break :blk_tls false;
-                break :blk_tls true;
-            };
             log_s3_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
-                .endpoint = endpoint.?,
-                .region = region.?,
-                .bucket = bucket.?,
+                .endpoint = s3cfg.endpoint,
+                .region = s3cfg.region,
+                .bucket = s3cfg.bucket,
                 .key_prefix = key_prefix,
-                .access_key = access_key.?,
-                .secret_key = secret_key.?,
-                .use_tls = use_tls,
+                .access_key = s3cfg.access_key,
+                .secret_key = s3cfg.secret_key,
+                .use_tls = s3cfg.use_tls,
             });
             log_batch_store = log_s3_handle.?.batchStore();
             std.log.info(
                 "log backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
-                .{ endpoint.?, region.?, bucket.?, key_prefix },
+                .{ s3cfg.endpoint, s3cfg.region, s3cfg.bucket, key_prefix },
             );
-        } else {
-            log_memory_handle = try log_server.batch_store.MemoryBatchStore.init(allocator);
-            log_batch_store = log_memory_handle.?.batchStore();
-            std.log.info("log backend: memory (S3 env not set — logs do not survive restart)", .{});
-        }
+        },
     }
-
-    const subsystem_max_connections: u32 = @as(u32, num_workers) + 4;
 
     // ── Raft setup ─────────────────────────────────────────────────────
     //
@@ -996,40 +981,22 @@ pub fn main() !void {
     // public-facing TLS port; the worker doesn't proxy to any of
     // them anymore (Phase 5.5 a/e Step B/F1).
 
-    // ── log-server-standalone (Phase 5.5(a) Step B) ───────────────────
-    const log_listen_addr = try parseHostPort(allocator, cli.log_listen);
-    const log_index_db_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/log_index.db",
-        .{cli.data_dir},
-        0,
-    );
-    defer allocator.free(log_index_db_path);
-    var log_index_db = try log_server.index_db.IndexDb.open(allocator, log_index_db_path);
-    defer log_index_db.close();
-
-    const ls_handle = try log_server.standalone.spawn(.{
-        .allocator = allocator,
-        .store = log_batch_store,
-        .db = log_index_db,
-        .bind_addr = log_listen_addr,
-        .max_connections = subsystem_max_connections,
-        .blob_backend_cfg = blob_owned.cfg,
-        .fs_data_dir = cli.data_dir,
-        .tls_config = tls_config,
-        .jwt_secret = &services_jwt_secret,
-        .cors_origin = cli.admin_origin,
-        .poll_interval_ms = 500,
-    });
-    defer ls_handle.shutdown();
-
-    const log_public_base = if (cli.log_public_base) |s|
+    // ── log-server (Phase 5.5(a) Step B + Task #61 split) ─────────────
+    //
+    // Log-server now runs as a separate `log-server-standalone`
+    // process. The worker only writes batches into the shared
+    // `log_batch_store` (fs or s3); the standalone's indexer reads
+    // them and serves the dashboard's `/v1/{tenant}/...` queries.
+    // Operator wires `--log-public-base` and `LOOP46_SERVICES_JWT_SECRET`
+    // so the worker's `/_system/services-token` returns a usable URL
+    // and the standalone's JWT verifier accepts the minted tokens.
+    const log_public_base: ?[]u8 = if (cli.log_public_base) |s|
         try allocator.dupe(u8, s)
     else if (cli.public_suffix) |suffix|
-        try std.fmt.allocPrint(allocator, "https://logs.{s}:{d}", .{ suffix, ls_handle.port })
+        try std.fmt.allocPrint(allocator, "https://logs.{s}", .{suffix})
     else
-        try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}", .{ls_handle.port});
-    defer allocator.free(log_public_base);
+        null;
+    defer if (log_public_base) |s| allocator.free(s);
 
     // ── files-server (Phase 5.5(e) F1 + Task #62 split) ───────────────
     //

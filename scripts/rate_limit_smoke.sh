@@ -62,13 +62,14 @@ LOG_HOST="logs.${PUBLIC_SUFFIX}"
 . "$(dirname "$0")/_smoke_helpers.sh"
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
 spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/rate-limit-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
+spawn_log_server "$LOG_ADDR" "$DATA_DIR" /tmp/rate-limit-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
-    --log-listen "$LOG_ADDR" \
+    --log-public-base "https://logs.${PUBLIC_SUFFIX}:${LOG_PORT}" \
     --files-public-base "https://files.${PUBLIC_SUFFIX}:${FILES_PORT}" \
     --data-dir "$DATA_DIR" \
     --bootstrap-root-token "$TOKEN" \
@@ -83,7 +84,7 @@ spawn_files_server "$FILES_ADDR" "$DATA_DIR" /tmp/rate-limit-smoke-cs.out "$ADMI
     --rate-limit-email-refill 0 \
     --fresh >/tmp/rate-limit-smoke.out 2>&1 &
 PID=$!
-trap 'kill $PID $CS_PID 2>/dev/null || true; wait $PID $CS_PID 2>/dev/null || true' EXIT
+trap 'kill $PID $CS_PID $LS_PID 2>/dev/null || true; wait $PID $CS_PID $LS_PID 2>/dev/null || true' EXIT
 
 sleep 1.2
 
