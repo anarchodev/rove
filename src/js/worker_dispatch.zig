@@ -242,22 +242,26 @@ fn tryHandleSystem(
         return true;
     }
 
-    // Auth shape: cookie first, then Authorization: Bearer. Lets the
-    // dashboard JS call /_system/* without juggling a bearer header.
-    const auth_ctx = auth.extractAdminAuth(worker.tenant, rh) catch |err| {
-        std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
-        try respb.setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
-        return true;
-    };
-    if (auth_ctx == null) {
-        try respb.setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, cors_origin, null);
-        return true;
-    }
-
     // Strip `?query=string` off the path before routing.
     const qmark = std.mem.indexOfScalar(u8, path, '?');
     const path_no_q = if (qmark) |q| path[0..q] else path;
     const sys_rest = path_no_q["/_system/".len..];
+
+    // Per-endpoint auth. Most `/_system/*` endpoints require admin
+    // auth (root bearer or session cookie); a small allow-list of
+    // cluster-internal endpoints also accept a services-JWT carrying
+    // the matching capability so files-server can push deploys +
+    // config without holding the operator's root bearer. The cap
+    // alternative is gated to the exact endpoint that needs it —
+    // there is no global "admin or cap" pass.
+    const required_cap: ?[]const u8 = if (std.mem.eql(u8, sys_rest, "release"))
+        jwt.Cap.RELEASE
+    else
+        null;
+
+    if (!try authorizeSystemRequest(server, allocator, worker, ent, sid, sess, rh, cors_origin, required_cap)) {
+        return true;
+    }
 
     // Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — JWT minter for
     // the standalone services (log-server + files-server). Caller is
@@ -286,6 +290,54 @@ fn tryHandleSystem(
     // moved to the `__admin__` JS handler long before.
     try respb.setSystemResponse(server, ent, sid, sess, 501, "system endpoint not implemented\n", allocator, cors_origin, null);
     return true;
+}
+
+/// Auth gate for `/_system/*` requests. Accepts either:
+///   - admin auth: session cookie (`rove_session`) or `Authorization:
+///     Bearer <root-token>`
+///   - **only when `required_cap` is set**: a services-JWT signed by
+///     `LOOP46_SERVICES_JWT_SECRET` whose `caps` claim contains the
+///     given cap. Used by files-server to push platform deploys +
+///     config without holding the operator's root bearer.
+///
+/// Returns true when the caller is allowed to proceed, false when
+/// the response (401 / 500) has already been stamped onto the entity.
+fn authorizeSystemRequest(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    rh: h2.ReqHeaders,
+    cors_origin: ?[]const u8,
+    required_cap: ?[]const u8,
+) !bool {
+    const auth_ctx = auth.extractAdminAuth(worker.tenant, rh) catch |err| {
+        std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
+        try respb.setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
+        return false;
+    };
+    if (auth_ctx != null) return true;
+
+    // Admin auth missing/invalid. If this endpoint accepts a cap
+    // alternative, try the services-JWT.
+    if (required_cap) |cap| {
+        const secret = worker.services_jwt_secret;
+        const token = auth.extractBearerToken(rh);
+        if (secret != null and token != null) {
+            const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+            if (jwt.verifyWithCap(secret.?, token.?, now_ms, cap)) |_| {
+                return true;
+            } else |_| {
+                // Fall through to 401 — the cap check failed for
+                // some reason (expired, wrong secret, missing cap).
+            }
+        }
+    }
+
+    try respb.setSystemResponse(server, ent, sid, sess, 401, "unauthenticated\n", allocator, cors_origin, null);
+    return false;
 }
 
 /// Mint an HS256 JWT for the standalone services. Body shape:
