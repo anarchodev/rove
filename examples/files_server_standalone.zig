@@ -131,15 +131,11 @@ fn loadJwtSecret(allocator: std.mem.Allocator) ![]u8 {
 
 fn loadBlobBackend(allocator: std.mem.Allocator) !blob_mod.BlobBackendOwned {
     return blob_mod.env.loadFromEnv(allocator) catch |err| switch (err) {
-        blob_mod.env.LoadError.UnknownBackend => {
-            std.debug.print("error: BLOB_BACKEND must be \"fs\" or \"s3\"\n", .{});
-            std.process.exit(2);
-        },
         blob_mod.env.LoadError.OutOfMemory => return error.OutOfMemory,
         else => |e| {
             const name = blob_mod.env.errorEnvName(e) orelse "<unknown>";
             std.debug.print(
-                "error: BLOB_BACKEND=s3 requires {s} to be set\n",
+                "error: S3 blob backend requires {s} to be set\n",
                 .{name},
             );
             std.process.exit(2);

@@ -63,18 +63,11 @@ pub const Config = struct {
     max_connections: u32 = 64,
     /// Optional per-tenant blob backend used by `/v1/{tenant}/blob/{hash}`.
     /// Null disables the blob route (returns 501). When non-null, the
-    /// backend must point at the same store the worker writes tape
-    /// blobs to — same `BLOB_BACKEND` config the worker uses, so
-    /// `key_prefix_base` (s3) or the on-disk layout (fs) lines up.
-    /// The standalone server lazily opens one backend per tenant on
-    /// first blob request; backends live for the server's lifetime.
+    /// backend must point at the same S3 bucket the worker writes
+    /// tape blobs to (matching `key_prefix_base`). The standalone
+    /// server lazily opens one backend per tenant on first blob
+    /// request; backends live for the server's lifetime.
     blob_backend_cfg: ?blob_mod.BackendConfig = null,
-    /// Required when `blob_backend_cfg == .fs` — root directory the
-    /// worker writes tape blobs under (`{fs_data_dir}/{tenant}/log-blobs/`).
-    /// Ignored for `.s3` (key_prefix_base does the per-tenant scoping).
-    /// Loop46 passes its `--data-dir`; the standalone binary doesn't
-    /// expose this because it's S3-only.
-    fs_data_dir: ?[]const u8 = null,
     /// Optional TLS — when set, the listener does TLS termination via
     /// rove-h2's standard path (the `*TlsConfig` is shared with the
     /// worker, both built once by `loop46/main.zig::resolveTls`).
@@ -104,12 +97,10 @@ pub const Config = struct {
 const BlobCache = struct {
     allocator: std.mem.Allocator,
     cfg: blob_mod.BackendConfig,
-    /// Required for `.fs`. Empty for `.s3`.
-    fs_data_dir: []const u8,
     map: std.StringHashMapUnmanaged(*blob_mod.BlobBackend),
 
-    fn init(allocator: std.mem.Allocator, cfg: blob_mod.BackendConfig, fs_data_dir: []const u8) BlobCache {
-        return .{ .allocator = allocator, .cfg = cfg, .fs_data_dir = fs_data_dir, .map = .empty };
+    fn init(allocator: std.mem.Allocator, cfg: blob_mod.BackendConfig) BlobCache {
+        return .{ .allocator = allocator, .cfg = cfg, .map = .empty };
     }
 
     fn deinit(self: *BlobCache) void {
@@ -126,21 +117,11 @@ const BlobCache = struct {
     fn getOrOpen(self: *BlobCache, tenant_id: []const u8) !*blob_mod.BlobBackend {
         if (self.map.get(tenant_id)) |existing| return existing;
 
-        // Build the per-tenant fs path lazily; harmless for s3 (the
-        // openPerTenant switch ignores it).
-        const fs_path = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{s}/log-blobs",
-            .{ self.fs_data_dir, tenant_id },
-        );
-        defer self.allocator.free(fs_path);
-
         const backend = try self.allocator.create(blob_mod.BlobBackend);
         errdefer self.allocator.destroy(backend);
         backend.* = try blob_mod.BlobBackend.openPerTenant(
             self.allocator,
             self.cfg,
-            fs_path,
             tenant_id,
             "log-blobs",
         );
@@ -248,7 +229,7 @@ fn runThread(h: *Handle) !void {
     }
 
     var blob_cache: ?BlobCache = if (h.config.blob_backend_cfg) |cfg|
-        BlobCache.init(allocator, cfg, h.config.fs_data_dir orelse "")
+        BlobCache.init(allocator, cfg)
     else
         null;
     defer if (blob_cache) |*c| c.deinit();

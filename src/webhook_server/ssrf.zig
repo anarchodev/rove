@@ -42,14 +42,14 @@ pub const Error = error{
     EmptyHost,
 };
 
-/// **DEV-ONLY** escape hatch that skips the loopback (127/8) and IPv6
-/// `::1` blocks so a local smoke test can point a webhook at an
-/// on-box echo server. **Never set in production** — enabling this
-/// would let a malicious customer handler probe the host's own
+/// **TEST-ONLY** escape hatch that skips the loopback (127/8) and
+/// IPv6 `::1` blocks so an end-to-end smoke can point a webhook at
+/// an on-box echo server. **Never set in production** — enabling
+/// this would let a malicious customer handler probe the host's own
 /// services. The EC2-metadata link-local range (169.254.0.0/16) is
-/// still blocked unconditionally. Set via the js-worker
-/// `--dev-webhook-unsafe` CLI flag; there is no config-file path.
-pub var dev_allow_loopback: bool = false;
+/// still blocked unconditionally. Set via the worker's
+/// `--dev-webhook-unsafe` CLI flag; no config-file path.
+pub var test_allow_loopback: bool = false;
 
 /// Look up every address `host` resolves to on `port`, bail out if
 /// any hits the blocklist. Returns the first safe address (caller
@@ -99,7 +99,7 @@ fn isBlockedV4(ip: u32) bool {
     // 100.64.0.0/10  — CGNAT (100.64 – 100.127)
     if (a == 100 and (b >= 64 and b <= 127)) return true;
     // 127.0.0.0/8 — loopback (dev flag can unblock this only)
-    if (a == 127) return !dev_allow_loopback;
+    if (a == 127) return !test_allow_loopback;
     // 169.254.0.0/16 (link-local + metadata)
     if (a == 169 and b == 254) return true;
     // 172.16.0.0/12 (172.16 – 172.31)
@@ -133,7 +133,7 @@ fn isBlockedV6(addr: *const [16]u8) bool {
         // blocked unless the dev flag is set — same semantics as 127/8.
         const is_loopback = addr[15] == 1;
         if (!is_loopback) return true;
-        return !dev_allow_loopback;
+        return !test_allow_loopback;
     }
 
     // ::ffff:0:0/96 — IPv4-mapped. Re-check against v4 rules.

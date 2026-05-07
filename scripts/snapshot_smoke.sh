@@ -5,15 +5,10 @@
 # Drives the full operator flow:
 #   1. `loop46 seed` provisions a tenant on disk
 #   2. `loop46 snapshot --data-dir ...` captures it (writes manifest +
-#      app.db files into the snapshot store under
-#      cluster/snapshots/{snap_id}/)
+#      per-tenant DBs to the S3 snapshot store)
 #   3. `loop46 restore-from-snapshot --snap-id ...` installs into a
 #      fresh data dir
 #   4. Verify the restored db has the same state as the source
-#
-# Backend defaults to fs (`BLOB_BACKEND` unset). Set BLOB_BACKEND=s3 +
-# the standard S3 env vars to drive the real bucket — this same script
-# round-trips against either.
 
 set -euo pipefail
 
@@ -29,6 +24,17 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
     echo "skip: sqlite3 CLI not in PATH (this smoke needs it to plant test rows)"
     exit 0
 fi
+
+# Source .env early so the standalone `loop46 snapshot` /
+# `restore-from-snapshot` CLI calls below see S3 creds.
+__snap_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "${__snap_repo_root}/.env" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "${__snap_repo_root}/.env"
+    set +a
+fi
+export S3_KEY_PREFIX_BASE="${S3_KEY_PREFIX_BASE:-smoke-snapshot-$(hostname)-$(id -u)/}"
 
 rm -rf "$DATA_DIR" "$RESTORE_DIR"
 
@@ -56,27 +62,12 @@ SNAP_ID=$(echo "$SNAP_OUT" | awk '/^captured snapshot / {print $3; exit}')
 [[ -n "$SNAP_ID" ]] || { echo "FAIL: no snap_id in output" >&2; exit 1; }
 echo "ok  loop46 snapshot captured snap_id=$SNAP_ID"
 
-# In fs mode, verify the manifest landed under the expected on-disk
-# key shape. In s3 mode the keys are in the bucket — restore round-
-# trip below is the verification.
-if [[ "${BLOB_BACKEND:-fs}" == "fs" ]]; then
-    MANIFEST_PATH="$DATA_DIR/.snapshots/cluster/snapshots/$SNAP_ID/manifest.json"
-    [[ -f "$MANIFEST_PATH" ]] || { echo "FAIL: manifest missing at $MANIFEST_PATH" >&2; exit 1; }
-    echo "ok  manifest at $MANIFEST_PATH"
-    ACME_PATH="$DATA_DIR/.snapshots/cluster/snapshots/$SNAP_ID/acme/app.db"
-    [[ -f "$ACME_PATH" ]] || { echo "FAIL: acme/app.db missing at $ACME_PATH" >&2; exit 1; }
-    echo "ok  acme/app.db at $ACME_PATH"
-    ROOT_PATH="$DATA_DIR/.snapshots/cluster/snapshots/$SNAP_ID/__root__.db"
-    [[ -f "$ROOT_PATH" ]] || { echo "FAIL: __root__.db missing at $ROOT_PATH" >&2; exit 1; }
-    echo "ok  __root__.db at $ROOT_PATH"
-fi
+# Snapshots land in S3 — the restore round-trip below is the
+# end-to-end verification that the manifest + per-tenant DBs were
+# written correctly.
 
 # ── 3. Restore into a fresh data dir ───────────────────────────────
-RESTORE_FLAGS=(--snap-id "$SNAP_ID" --data-dir "$RESTORE_DIR")
-if [[ "${BLOB_BACKEND:-fs}" == "fs" ]]; then
-    RESTORE_FLAGS+=(--snapshot-dir "$DATA_DIR/.snapshots")
-fi
-"$BIN" restore-from-snapshot "${RESTORE_FLAGS[@]}" 2>&1 | tee /tmp/snapshot-smoke-restore.out
+"$BIN" restore-from-snapshot --snap-id "$SNAP_ID" --data-dir "$RESTORE_DIR" 2>&1 | tee /tmp/snapshot-smoke-restore.out
 
 # ── 4. Verify the restored state ───────────────────────────────────
 RESTORED_DB="$RESTORE_DIR/acme/app.db"
@@ -117,8 +108,18 @@ PERIODIC_HTTP_BASE="${PERIODIC_HTTP_BASE:-8460}"
 PERIODIC_RAFT_BASE="${PERIODIC_RAFT_BASE:-40460}"
 PERIODIC_TOKEN=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
+else
+    LOOP46_DATA="${LOOP46_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/loop46}"
+fi
+TLS_CERT="$LOOP46_DATA/dev-cert.pem"
+TLS_KEY="$LOOP46_DATA/dev-key.pem"
+CACERT="$LOOP46_DATA/ca-root.pem"
+
 . "$(dirname "$0")/_smoke_helpers.sh"
 SMOKE_TAG=snapshot-smoke
+SMOKE_PROTO=https
 init_cluster_addrs "$PERIODIC_PREFIX" "$PERIODIC_HTTP_BASE" "$PERIODIC_RAFT_BASE"
 
 # Seed acme onto every node.
@@ -140,6 +141,8 @@ for i in 0 1 2; do
         --public-suffix loop46.localhost \
         --bootstrap-root-token "$PERIODIC_TOKEN" \
         --snapshot-interval-ms 500 \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
         --workers 1 \
         "${RAFT_TIMING_FLAGS[@]}" \
         >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
@@ -156,7 +159,12 @@ trap '
 ' EXIT
 sleep 2
 
-CURL=(curl -sS --http2-prior-knowledge --max-time 5)
+RESOLVE=()
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE+=(--resolve "app.loop46.localhost:${p}:127.0.0.1")
+done
+CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}" --max-time 5)
 discover_leader "app.loop46.localhost" "$PERIODIC_TOKEN" || exit 1
 echo "ok  periodic-loop leader: node $LEADER_IDX at $LEADER_HTTP"
 LEADER_DIR="${DATA_DIRS[$LEADER_IDX]}"
@@ -164,25 +172,19 @@ LEADER_DIR="${DATA_DIRS[$LEADER_IDX]}"
 # Drive 5 raft commits so willemt has > 1 log entry (begin_snapshot
 # returns -1 below that threshold — willemt's invariant, not ours).
 for i in 1 2 3 4 5; do
-    curl -sS --http2-prior-knowledge -H "Host: app.loop46.localhost" \
+    "${CURL[@]}" \
         -H "Authorization: Bearer $PERIODIC_TOKEN" \
         -H "Content-Type: application/json" \
         -d "{\"tenant_id\":\"acme\",\"dep_id\":$i}" \
-        "http://${LEADER_HTTP}/_system/release" >/dev/null
+        "https://app.loop46.localhost:${LEADER_PORT}/_system/release" >/dev/null
 done
 
 # Wait for at least 2 capture intervals so we can verify the loop
 # actually fires (not just bootstraps once).
 sleep 3
 
-NUM_SNAPS=$(ls "$LEADER_DIR/.snapshots/cluster/snapshots/" 2>/dev/null | wc -l)
-[[ "$NUM_SNAPS" -ge 1 ]] || {
-    echo "FAIL: periodic loop didn't produce any snapshots on leader (got $NUM_SNAPS)" >&2
-    tail -30 "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out" >&2
-    exit 1
-}
-echo "ok  periodic loop produced $NUM_SNAPS snapshot(s) on leader"
-
+# Snapshots land in S3 — verify via the worker log's "snapshot
+# captured" line which is emitted by the raft thread after each pass.
 CAPTURE_LOGS=$(grep -c 'snapshot captured ' "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out")
 [[ "$CAPTURE_LOGS" -ge 1 ]] || {
     echo "FAIL: no 'snapshot captured' log lines on leader" >&2

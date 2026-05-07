@@ -62,7 +62,6 @@ const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
 const h2_mod = @import("rove-h2");
 const cli_mod = @import("cli.zig");
-const tls_dev = @import("tls_dev.zig");
 const seed_mod = @import("seed.zig");
 const restore_cli = @import("restore_cli.zig");
 const snapshot_cli = @import("snapshot_cli.zig");
@@ -159,8 +158,7 @@ fn parsePeerList(allocator: std.mem.Allocator, peers_str: []const u8) ![]kv.Raft
 // The blob backend is picked at startup from env. With `BLOB_BACKEND=s3`
 // every per-tenant file-blobs / log-blobs handle in this process opens
 // against the configured S3 bucket (path-style, key-prefixed by
-// `{tenant}/{subdir}/`); without it (or `BLOB_BACKEND=fs`) the existing
-// on-disk layout is used. The string allocations live for the process'
+// `{tenant}/{subdir}/`). The string allocations live for the process'
 // lifetime — `BlobBackendOwned.deinit` frees them on shutdown. The
 // loader itself lives in `rove-blob/env.zig` so the standalone
 // services share the same env-var contract.
@@ -176,15 +174,11 @@ pub const ENV_SERVICES_JWT_SECRET = "LOOP46_SERVICES_JWT_SECRET";
 
 pub fn loadBlobBackend(allocator: std.mem.Allocator) !BlobBackendOwned {
     return blob_mod.env.loadFromEnv(allocator) catch |err| switch (err) {
-        blob_mod.env.LoadError.UnknownBackend => failExit(
-            "loop46: BLOB_BACKEND must be \"fs\" or \"s3\"\n",
-            .{},
-        ),
         blob_mod.env.LoadError.OutOfMemory => return error.OutOfMemory,
         else => |e| {
             const name = blob_mod.env.errorEnvName(e) orelse "<unknown>";
             failExit(
-                "loop46: BLOB_BACKEND=s3 requires {s} to be set\n",
+                "loop46: S3 blob backend requires {s} to be set\n",
                 .{name},
             );
         },
@@ -663,16 +657,13 @@ fn dispatchSubcommand(
         return .handled;
     }
 
-    const dev_mode = std.mem.eql(u8, cmd, "dev");
-    const worker_mode = std.mem.eql(u8, cmd, "worker");
-
-    if (!dev_mode and !worker_mode) {
+    if (!std.mem.eql(u8, cmd, "worker")) {
         std.debug.print("error: unknown subcommand '{s}'\n\n", .{cmd});
         try cli_mod.printUsage();
         std.process.exit(2);
     }
 
-    const cli = cli_mod.parseAndFinalize(allocator, sub_args, dev_mode) catch |err| {
+    const cli = cli_mod.parseAndFinalize(allocator, sub_args) catch |err| {
         if (err == error.Usage) {
             try cli_mod.printUsage();
         } else {
@@ -680,13 +671,6 @@ fn dispatchSubcommand(
         }
         std.process.exit(2);
     };
-    if (cli.dev) {
-        std.log.info("dev: admin = {s}", .{cli.admin_origin.?});
-        std.log.info("dev: customer instances = https://*.{s}:{d}", .{
-            cli.public_suffix.?,
-            cli_mod.portFromAddr(cli.http) orelse 8443,
-        });
-    }
 
     return .{ .run = cli };
 }
@@ -763,6 +747,14 @@ fn bootstrapTenants(
     // Always-deploy: the embedded admin UI bundle. Demo + benchmark
     // tenants get provisioned by `loop46 seed --manifest ...` (out
     // of band of this binary). The worker discovers them on disk.
+    //
+    // Every node runs this so each gets its own `_deploy/current`
+    // pointer in __admin__'s app.db (admin handler resolves on each
+    // node; followers leader-skip but the leader serves it). S3
+    // blobs are content-addressed; FileStore.putBlobIfMissing
+    // skip-then-retry tolerates concurrent PUTs for identical bytes
+    // (some object stores like OVH OS reject overlapping conditional
+    // writes for the same key).
     try bootstrapHandler(allocator, cli.data_dir, blob_cfg, "__admin__", &ADMIN_DEPLOY_FILES);
 
     // __replay__ — platform tenant for the tape-replay browser page
@@ -804,73 +796,33 @@ fn bootstrapTenants(
     try prewarmTenantDbs(allocator, cli.data_dir, prewarm_ids);
 }
 
-/// Owned strings produced by `resolveTls` when `--dev` auto-discovers
-/// cert/key paths. Lives in main()'s frame so the buffers survive
-/// past `resolveTls`'s return; cleaned up via `deinit` at exit.
-const TlsResources = struct {
-    cert: ?[]u8 = null,
-    key: ?[]u8 = null,
-    dir: ?[]u8 = null,
-
-    fn deinit(self: *TlsResources, allocator: std.mem.Allocator) void {
-        if (self.cert) |s| allocator.free(s);
-        if (self.key) |s| allocator.free(s);
-        if (self.dir) |s| allocator.free(s);
-    }
-};
-
 /// Build the `TlsConfig` for the worker pool. Both `--tls-cert` and
-/// `--tls-key` must be set together, or both absent. When `--dev` is
-/// set AND neither flag was passed, auto-discover the default cert +
-/// key produced by `scripts/rove-dev-setup.sh` (or bootstrap via
-/// mkcert on first run); the resulting owned path strings live in
-/// `owned` so the caller's defer can free them. Returns null for
-/// plaintext (no TLS configured).
+/// `--tls-key` are required. Operators provision certs out-of-band
+/// (Let's Encrypt via lego, internal PKI, etc.); the worker reads
+/// the PEM files and reloads them when their mtime changes (see
+/// `runUntilStopped`).
 fn resolveTls(
     allocator: std.mem.Allocator,
     cli: cli_mod.Cli,
-    owned: *TlsResources,
-) !?*h2_mod.TlsConfig {
-    var cert_path = cli.tls_cert;
-    var key_path = cli.tls_key;
-    const explicit = cert_path != null or key_path != null;
-
-    if ((cert_path != null and key_path == null) or
-        (cert_path == null and key_path != null))
-    {
-        failExit("error: --tls-cert and --tls-key must be set together\n", .{});
-    }
-
-    if (!explicit and cli.dev) {
-        const paths = tls_dev.defaultDevTlsPaths(allocator) catch |err|
-            failExit("error: --dev: cannot resolve default TLS paths: {s}\n", .{@errorName(err)});
-        owned.cert = paths.cert;
-        owned.key = paths.key;
-        owned.dir = paths.dir;
-        // First run: cert missing → bootstrap via mkcert. After
-        // initDevTls returns the files exist; if it doesn't, it exits
-        // the process itself (mkcert missing, etc.) so we never reach
-        // the next line on a real failure.
-        if (!tls_dev.devTlsPathsExist(paths.cert, paths.key)) {
-            try tls_dev.initDevTls(allocator, paths);
-        } else {
-            std.log.info("--dev: TLS cert at {s}", .{paths.dir});
-        }
-        cert_path = paths.cert;
-        key_path = paths.key;
-    }
-
-    if (cert_path == null) return null;
+) !*h2_mod.TlsConfig {
+    const cert_path = cli.tls_cert orelse failExit(
+        "error: --tls-cert is required\n",
+        .{},
+    );
+    const key_path = cli.tls_key orelse failExit(
+        "error: --tls-key is required\n",
+        .{},
+    );
 
     const cfg = h2_mod.TlsConfig.createFromFiles(
         allocator,
-        cert_path.?,
-        key_path.?,
+        cert_path,
+        key_path,
     ) catch |err| failExit(
         "error: tls: {s} (cert={s}, key={s})\n",
-        .{ @errorName(err), cert_path.?, key_path.? },
+        .{ @errorName(err), cert_path, key_path },
     );
-    std.log.info("tls: loaded {s} + {s}", .{ cert_path.?, key_path.? });
+    std.log.info("tls: loaded {s} + {s}", .{ cert_path, key_path });
     return cfg;
 }
 
@@ -924,81 +876,58 @@ pub fn main() !void {
     try std.fs.cwd().makePath(cli.data_dir);
 
     if (cli.dev_webhook_unsafe) {
-        webhook_server_mod.ssrf.dev_allow_loopback = true;
-        webhook_server_mod.http_client.dev_allow_plaintext = true;
+        webhook_server_mod.ssrf.test_allow_loopback = true;
+        webhook_server_mod.http_client.test_allow_plaintext = true;
         std.log.warn("*** --dev-webhook-unsafe enabled: webhook.send may target loopback over http:// — DEV ONLY ***", .{});
     }
 
     try installSignalHandlers();
 
-    // Pick fs vs s3 from env. Strings live in `blob_owned` for the
+    // S3 blob backend config. Strings live in `blob_owned` for the
     // entire process — every per-tenant backend the workers / apply
     // / files-server / log-server open borrows from `blob_owned.cfg`.
     var blob_owned = try loadBlobBackend(allocator);
     defer blob_owned.deinit(allocator);
-    switch (blob_owned.cfg) {
-        .fs => std.log.info("blob backend: fs ({s})", .{cli.data_dir}),
-        .s3 => |s| std.log.info(
+    {
+        const s = blob_owned.cfg;
+        std.log.info(
             "blob backend: s3 endpoint={s} region={s} bucket={s} key_prefix_base='{s}' use_tls={}",
             .{ s.endpoint, s.region, s.bucket, s.key_prefix_base, s.use_tls },
-        ),
+        );
     }
 
     try bootstrapTenants(allocator, cli, blob_owned.cfg);
 
     // ── Log batch store (Phase 5.5 a) ─────────────────────────────────
     //
-    // Worker's `flushLogs` writes here when configured. The store is
-    // an `S3BatchStore` that talks real S3 via the sigv4 helpers
-    // shared with `rove-blob`. Reuses the same env vars as
-    // BLOB_BACKEND=s3 (S3_ENDPOINT / S3_REGION / S3_BUCKET /
-    // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) plus an optional
-    // `LOG_S3_KEY_PREFIX` so log batches can sit under a named prefix
-    // alongside other tenant-scoped artifacts in the same bucket.
-    //
-    // The batch store is shared with the standalone log-server
-    // process (Task #61): the worker writes batches via flushLogs;
-    // the standalone's indexer polls + serves them. Both processes
-    // must point at the same physical store. Two backends:
-    //   - `BLOB_BACKEND=s3` → both open S3BatchStore against the
-    //     same bucket + LOG_S3_KEY_PREFIX namespace.
-    //   - `BLOB_BACKEND=fs` (default) → FsBatchStore at
-    //     `{data_dir}/log-batches/`. Worker and standalone share
-    //     the data_dir (or an NFS mount of it) so PUT-then-LIST
-    //     round-trips across processes.
-    var log_fs_handle: ?*log_server.batch_store_fs.FsBatchStore = null;
-    defer if (log_fs_handle) |h| h.deinit();
-    var log_s3_handle: ?*log_server.batch_store_s3.S3BatchStore = null;
-    defer if (log_s3_handle) |h| h.deinit();
+    // Worker's `flushLogs` writes here. Same connection params as the
+    // blob backend plus an optional `LOG_S3_KEY_PREFIX` so log batches
+    // can sit under a named prefix alongside tenant-scoped artifacts.
+    // Shared with the standalone log-server process (Task #61): worker
+    // writes batches; standalone's indexer polls + serves them.
+    var log_s3_handle: *log_server.batch_store_s3.S3BatchStore = undefined;
+    defer log_s3_handle.deinit();
     var log_batch_store: log_server.batch_store.BatchStore = undefined;
-    switch (blob_owned.cfg) {
-        .fs => {
-            const fs_dir = try std.fmt.allocPrint(allocator, "{s}/log-batches", .{cli.data_dir});
-            defer allocator.free(fs_dir);
-            log_fs_handle = try log_server.batch_store_fs.FsBatchStore.init(allocator, fs_dir);
-            log_batch_store = log_fs_handle.?.batchStore();
-            std.log.info("log backend: fs at {s}", .{fs_dir});
-        },
-        .s3 => |s3cfg| {
-            const env = blob_mod.env;
-            const key_prefix = (try env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
-                try allocator.dupe(u8, "");
-            defer allocator.free(key_prefix);
-            log_s3_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
-                .endpoint = s3cfg.endpoint,
-                .region = s3cfg.region,
-                .bucket = s3cfg.bucket,
-                .key_prefix = key_prefix,
-                .access_key = s3cfg.access_key,
-                .secret_key = s3cfg.secret_key,
-                .use_tls = s3cfg.use_tls,
-            });
-            log_batch_store = log_s3_handle.?.batchStore();
-            std.log.info(
-                "log backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
-                .{ s3cfg.endpoint, s3cfg.region, s3cfg.bucket, key_prefix },
-            );
-        },
+    {
+        const s3cfg = blob_owned.cfg;
+        const env = blob_mod.env;
+        const key_prefix = (try env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
+            try allocator.dupe(u8, "");
+        defer allocator.free(key_prefix);
+        log_s3_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+            .endpoint = s3cfg.endpoint,
+            .region = s3cfg.region,
+            .bucket = s3cfg.bucket,
+            .key_prefix = key_prefix,
+            .access_key = s3cfg.access_key,
+            .secret_key = s3cfg.secret_key,
+            .use_tls = s3cfg.use_tls,
+        });
+        log_batch_store = log_s3_handle.batchStore();
+        std.log.info(
+            "log backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
+            .{ s3cfg.endpoint, s3cfg.region, s3cfg.bucket, key_prefix },
+        );
     }
 
     // ── Raft setup ─────────────────────────────────────────────────────
@@ -1062,8 +991,6 @@ pub fn main() !void {
     // past each pass — without that bracketing, periodic captures
     // would land in S3 / fs but the raft log would grow forever.
     var snap_state: ?snapshot_mod.RaftCaptureState = null;
-    var snap_fs: ?*log_server.batch_store_fs.FsBatchStore = null;
-    defer if (snap_fs) |h| h.deinit();
     var snap_s3: ?*log_server.batch_store_s3.S3BatchStore = null;
     defer if (snap_s3) |h| h.deinit();
     var snap_store: ?log_server.batch_store.BatchStore = null;
@@ -1071,35 +998,25 @@ pub fn main() !void {
     defer if (snap_tmp) |s| allocator.free(s);
     if (cli.snapshot_interval_ms > 0) {
         snap_tmp = try std.fmt.allocPrint(allocator, "{s}/.snapshot-stage", .{cli.data_dir});
-        switch (blob_owned.cfg) {
-            .fs => {
-                const dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{cli.data_dir});
-                defer allocator.free(dir);
-                snap_fs = try log_server.batch_store_fs.FsBatchStore.init(allocator, dir);
-                snap_store = snap_fs.?.batchStore();
-                std.log.info("snapshot store: fs at {s} (interval {d}ms)", .{ dir, cli.snapshot_interval_ms });
-            },
-            .s3 => |s3cfg| {
-                const env = blob_mod.env;
-                const key_prefix = (try env.envOpt(allocator, "SNAPSHOT_S3_KEY_PREFIX")) orelse
-                    try allocator.dupe(u8, "");
-                defer allocator.free(key_prefix);
-                snap_s3 = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
-                    .endpoint = s3cfg.endpoint,
-                    .region = s3cfg.region,
-                    .bucket = s3cfg.bucket,
-                    .key_prefix = key_prefix,
-                    .access_key = s3cfg.access_key,
-                    .secret_key = s3cfg.secret_key,
-                    .use_tls = s3cfg.use_tls,
-                });
-                snap_store = snap_s3.?.batchStore();
-                std.log.info(
-                    "snapshot store: s3 endpoint={s} bucket={s} key_prefix='{s}' (interval {d}ms)",
-                    .{ s3cfg.endpoint, s3cfg.bucket, key_prefix, cli.snapshot_interval_ms },
-                );
-            },
-        }
+        const s3cfg = blob_owned.cfg;
+        const env = blob_mod.env;
+        const key_prefix = (try env.envOpt(allocator, "SNAPSHOT_S3_KEY_PREFIX")) orelse
+            try allocator.dupe(u8, "");
+        defer allocator.free(key_prefix);
+        snap_s3 = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+            .endpoint = s3cfg.endpoint,
+            .region = s3cfg.region,
+            .bucket = s3cfg.bucket,
+            .key_prefix = key_prefix,
+            .access_key = s3cfg.access_key,
+            .secret_key = s3cfg.secret_key,
+            .use_tls = s3cfg.use_tls,
+        });
+        snap_store = snap_s3.?.batchStore();
+        std.log.info(
+            "snapshot store: s3 endpoint={s} bucket={s} key_prefix='{s}' (interval {d}ms)",
+            .{ s3cfg.endpoint, s3cfg.bucket, key_prefix, cli.snapshot_interval_ms },
+        );
         snap_state = .{
             .allocator = allocator,
             .interval_ns = @as(i64, cli.snapshot_interval_ms) * std.time.ns_per_ms,
@@ -1120,9 +1037,7 @@ pub fn main() !void {
     // ── TLS resolution (shared across the worker + standalone
     //    services. Production wildcard cert covers `app.`, `logs.`,
     //    `files.` subdomains).
-    var tls_owned: TlsResources = .{};
-    defer tls_owned.deinit(allocator);
-    const tls_config = try resolveTls(allocator, cli, &tls_owned);
+    const tls_config = try resolveTls(allocator, cli);
 
     // ── HMAC secret used by the standalone services (log-server
     //    in-process for now, files-server out-of-process post Task #62)
@@ -1337,15 +1252,11 @@ pub fn bootstrapHandler(
     const files_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/files.db", .{inst_dir}, 0);
     defer allocator.free(files_db_path);
 
-    const files_blob_dir = try std.fmt.allocPrint(allocator, "{s}/file-blobs", .{inst_dir});
-    defer allocator.free(files_blob_dir);
-
     const files_kv = try kv.KvStore.open(allocator, files_db_path);
     defer files_kv.close();
     var fs_store = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         blob_cfg,
-        files_blob_dir,
         instance_id,
         "file-blobs",
     );
@@ -1386,12 +1297,9 @@ pub fn bootstrapHandler(
     const json_bytes = try files_mod.manifest_json.encode(allocator, next_id, entries);
     defer allocator.free(json_bytes);
 
-    const manifest_dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}/deployments", .{ data_dir, instance_id });
-    defer allocator.free(manifest_dir_path);
     var manifest_be = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         blob_cfg,
-        manifest_dir_path,
         instance_id,
         "deployments",
     );
@@ -1399,7 +1307,17 @@ pub fn bootstrapHandler(
 
     var key_buf: [25]u8 = undefined;
     const key = files_mod.manifest_json.manifestKey(&key_buf, next_id);
-    try manifest_be.blobStore().put(key, json_bytes);
+    // Skip-if-exists: every node bootstraps with the same
+    // deterministic content; one node's PUT wins and the rest are
+    // no-ops. Tolerates the OVH OS "OperationAborted" race on
+    // concurrent PUTs for identical keys.
+    if (!(manifest_be.blobStore().exists(key) catch false)) {
+        manifest_be.blobStore().put(key, json_bytes) catch {
+            // Loser of the race: another node landed the same
+            // content first. Verify and continue.
+            if (!(manifest_be.blobStore().exists(key) catch false)) return error.Blob;
+        };
+    }
 
     try store.setCurrentDeploymentId(next_id);
 

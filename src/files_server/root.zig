@@ -114,13 +114,6 @@ const InstanceCtx = struct {
         ) catch return Error.OutOfMemory;
         defer allocator.free(files_db_path);
 
-        const files_blob_dir = std.fmt.allocPrint(
-            allocator,
-            "{s}/{s}/file-blobs",
-            .{ data_dir, instance_id },
-        ) catch return Error.OutOfMemory;
-        defer allocator.free(files_blob_dir);
-
         self.allocator = allocator;
         self.files_kv = kv_mod.KvStore.open(allocator, files_db_path) catch
             return Error.Kv;
@@ -129,7 +122,6 @@ const InstanceCtx = struct {
         self.blob_backend = blob_mod.BlobBackend.openPerTenant(
             allocator,
             blob_cfg,
-            files_blob_dir,
             instance_id,
             "file-blobs",
         ) catch return Error.Blob;
@@ -470,7 +462,7 @@ pub fn deployManifest(
         }
     }
 
-    const next_id = try writeManifestFromWorkingTree(allocator, &h, data_dir, blob_cfg, instance_id, current_parsed);
+    const next_id = try writeManifestFromWorkingTree(allocator, &h, blob_cfg, instance_id, current_parsed);
     return .{ .id = next_id, .parent_id = current_parsed };
 }
 
@@ -485,7 +477,6 @@ pub fn deployManifest(
 fn writeManifestFromWorkingTree(
     allocator: std.mem.Allocator,
     h: *InstanceCtx,
-    data_dir: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     current_id: u64,
@@ -499,7 +490,7 @@ fn writeManifestFromWorkingTree(
         return Error.OutOfMemory;
     defer allocator.free(json_bytes);
 
-    var manifest_be = openManifestBackend(allocator, data_dir, blob_cfg, instance_id) catch
+    var manifest_be = openManifestBackend(allocator, blob_cfg, instance_id) catch
         return Error.Blob;
     defer manifest_be.deinit();
 
@@ -514,24 +505,15 @@ fn writeManifestFromWorkingTree(
 /// Open a per-tenant BlobBackend for manifest objects (subdir
 /// `deployments`). Caller frees with `deinit`. Wires through the
 /// same `BackendConfig` as the file-blobs backend so leader and
-/// followers see identical keys (fs: `{data_dir}/{id}/deployments/`,
-/// s3: `{base}{id}/deployments/`).
+/// followers see identical keys (`{base}{id}/deployments/`).
 fn openManifestBackend(
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
 ) !blob_mod.BlobBackend {
-    const fs_dir = try std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}/deployments",
-        .{ data_dir, instance_id },
-    );
-    defer allocator.free(fs_dir);
     return blob_mod.BlobBackend.openPerTenant(
         allocator,
         blob_cfg,
-        fs_dir,
         instance_id,
         "deployments",
     );
@@ -615,14 +597,14 @@ pub fn putFileAndDeploy(
         defer h.deinit();
         h.store.putSource(path, body) catch |err| return mapCodeError(err);
         const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
-        return writeManifestFromWorkingTree(allocator, &h, data_dir, blob_cfg, instance_id, cur);
+        return writeManifestFromWorkingTree(allocator, &h, blob_cfg, instance_id, cur);
     } else {
         var h: InstanceCtx = undefined;
         try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
         defer h.deinit();
         h.store.putStatic(path, body, content_type) catch |err| return mapCodeError(err);
         const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
-        return writeManifestFromWorkingTree(allocator, &h, data_dir, blob_cfg, instance_id, cur);
+        return writeManifestFromWorkingTree(allocator, &h, blob_cfg, instance_id, cur);
     }
 }
 
@@ -644,7 +626,7 @@ pub fn deploy(
     defer h.deinit();
 
     const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
-    return writeManifestFromWorkingTree(allocator, &h, data_dir, blob_cfg, instance_id, cur);
+    return writeManifestFromWorkingTree(allocator, &h, blob_cfg, instance_id, cur);
 }
 
 /// Fetch a source blob by its content hash. Read-only — used by the
@@ -652,24 +634,15 @@ pub fn deploy(
 /// corresponding to a deployment entry.
 pub fn getSourceByHash(
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     source_hash_hex: []const u8,
 ) Error![]u8 {
     try validateInstanceId(instance_id);
 
-    const files_blob_dir = std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}/file-blobs",
-        .{ data_dir, instance_id },
-    ) catch return Error.OutOfMemory;
-    defer allocator.free(files_blob_dir);
-
     var blob_backend = blob_mod.BlobBackend.openPerTenant(
         allocator,
         blob_cfg,
-        files_blob_dir,
         instance_id,
         "file-blobs",
     ) catch return Error.Blob;
@@ -685,14 +658,13 @@ pub fn getSourceByHash(
 /// `deployments/` BlobBackend.
 pub fn loadDeployment(
     allocator: std.mem.Allocator,
-    data_dir: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     deployment_id: u64,
 ) Error!files_mod.manifest_json.Manifest {
     try validateInstanceId(instance_id);
 
-    var manifest_be = openManifestBackend(allocator, data_dir, blob_cfg, instance_id) catch
+    var manifest_be = openManifestBackend(allocator, blob_cfg, instance_id) catch
         return Error.Blob;
     defer manifest_be.deinit();
 
@@ -725,7 +697,7 @@ pub fn loadCurrentManifest(
     defer h.deinit();
     const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
     if (cur == 0) return Error.NotFound;
-    return loadDeployment(allocator, data_dir, blob_cfg, instance_id, cur);
+    return loadDeployment(allocator, blob_cfg, instance_id, cur);
 }
 
 pub const FileContent = struct {
@@ -791,120 +763,3 @@ fn mapCodeError(err: anyerror) Error {
     };
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────
-
-const testing = std.testing;
-
-fn makeTempDir(allocator: std.mem.Allocator) ![]u8 {
-    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const path = try std.fmt.allocPrint(allocator, "/tmp/rove-cs-{x}", .{seed});
-    std.fs.cwd().deleteTree(path) catch {};
-    try std.fs.cwd().makePath(path);
-    return path;
-}
-
-test "uploadFile + loadDeployment round trip" {
-    const allocator = testing.allocator;
-    const data_dir = try makeTempDir(allocator);
-    defer {
-        std.fs.cwd().deleteTree(data_dir) catch {};
-        allocator.free(data_dir);
-    }
-
-    try uploadFile(allocator, data_dir, .fs, "acme", "index.js",
-        "response.body = 'hi';",
-    );
-    const dep_id = try deploy(allocator, data_dir, .fs, "acme");
-    try testing.expect(dep_id > 0);
-
-    var manifest = try loadDeployment(allocator, data_dir, .fs, "acme", dep_id);
-    defer manifest.deinit();
-
-    try testing.expectEqual(@as(usize, 1), manifest.entries.len);
-    try testing.expectEqualStrings("index.js", manifest.entries[0].path);
-}
-
-test "uploadFile produces stable hashes for identical input" {
-    const allocator = testing.allocator;
-    const data_dir = try makeTempDir(allocator);
-    defer {
-        std.fs.cwd().deleteTree(data_dir) catch {};
-        allocator.free(data_dir);
-    }
-
-    try uploadFile(allocator, data_dir, .fs, "acme", "a.js", "1 + 2;");
-    const dep1 = try deploy(allocator, data_dir, .fs, "acme");
-    var m1 = try loadDeployment(allocator, data_dir, .fs, "acme", dep1);
-    defer m1.deinit();
-    const hash_a1 = m1.entries[0].source_hex;
-
-    // Re-upload identical bytes → same source hash.
-    try uploadFile(allocator, data_dir, .fs, "acme", "a.js", "1 + 2;");
-    const dep2 = try deploy(allocator, data_dir, .fs, "acme");
-    var m2 = try loadDeployment(allocator, data_dir, .fs, "acme", dep2);
-    defer m2.deinit();
-    const hash_a2 = m2.entries[0].source_hex;
-
-    try testing.expectEqualSlices(u8, &hash_a1, &hash_a2);
-}
-
-test "getSourceByHash fetches the exact bytes" {
-    const allocator = testing.allocator;
-    const data_dir = try makeTempDir(allocator);
-    defer {
-        std.fs.cwd().deleteTree(data_dir) catch {};
-        allocator.free(data_dir);
-    }
-
-    const source = "response.body = 'hash me';";
-    try uploadFile(allocator, data_dir, .fs, "acme", "index.js", source);
-    const dep = try deploy(allocator, data_dir, .fs, "acme");
-
-    var manifest = try loadDeployment(allocator, data_dir, .fs, "acme", dep);
-    defer manifest.deinit();
-    const hash = &manifest.entries[0].source_hex;
-
-    const fetched = try getSourceByHash(allocator, data_dir, .fs, "acme", hash);
-    defer allocator.free(fetched);
-    try testing.expectEqualStrings(source, fetched);
-}
-
-test "uploadFile rejects invalid instance id" {
-    const allocator = testing.allocator;
-    try testing.expectError(
-        Error.InvalidInstanceId,
-        uploadFile(allocator, "/tmp/rove-cs-inv", .fs, "", "a.js", "1;"),
-    );
-    try testing.expectError(
-        Error.InvalidInstanceId,
-        uploadFile(allocator, "/tmp/rove-cs-inv", .fs, "../etc", "a.js", "1;"),
-    );
-}
-
-test "multi-file deployment manifest lists every entry" {
-    const allocator = testing.allocator;
-    const data_dir = try makeTempDir(allocator);
-    defer {
-        std.fs.cwd().deleteTree(data_dir) catch {};
-        allocator.free(data_dir);
-    }
-
-    try uploadFile(allocator, data_dir, .fs, "acme", "index.js", "1;");
-    try uploadFile(allocator, data_dir, .fs, "acme", "api/users.mjs",
-        "export function list(req) { return { status: 200, body: 'ok' }; }",
-    );
-    const dep = try deploy(allocator, data_dir, .fs, "acme");
-    var manifest = try loadDeployment(allocator, data_dir, .fs, "acme", dep);
-    defer manifest.deinit();
-
-    try testing.expectEqual(@as(usize, 2), manifest.entries.len);
-
-    // Order is determined by rove-kv's range scan; check by set membership.
-    var saw_index = false;
-    var saw_users = false;
-    for (manifest.entries) |e| {
-        if (std.mem.eql(u8, e.path, "index.js")) saw_index = true;
-        if (std.mem.eql(u8, e.path, "api/users.mjs")) saw_users = true;
-    }
-    try testing.expect(saw_index and saw_users);
-}

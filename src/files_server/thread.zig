@@ -714,7 +714,7 @@ fn handleGetDeployment(
         return;
     };
 
-    var manifest = files_server.loadDeployment(allocator, cfg.data_dir, cfg.blob_cfg, instance_id, deployment_id) catch |err| {
+    var manifest = files_server.loadDeployment(allocator, cfg.blob_cfg, instance_id, deployment_id) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.NotFound => 404,
             else => 500,
@@ -880,7 +880,7 @@ fn handleSource(
         return;
     }
 
-    const bytes = files_server.getSourceByHash(allocator, cfg.data_dir, cfg.blob_cfg, instance_id, hash) catch |err| {
+    const bytes = files_server.getSourceByHash(allocator, cfg.blob_cfg, instance_id, hash) catch |err| {
         const code: u16 = if (err == files_server.Error.NotFound) 404 else 500;
         const msg = try std.fmt.allocPrint(
             allocator,

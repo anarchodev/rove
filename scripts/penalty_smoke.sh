@@ -30,6 +30,15 @@ if [[ ! -x "$WORKER_BIN" ]]; then
     exit 2
 fi
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
+else
+    LOOP46_DATA="${LOOP46_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/loop46}"
+fi
+TLS_CERT="$LOOP46_DATA/dev-cert.pem"
+TLS_KEY="$LOOP46_DATA/dev-key.pem"
+CACERT="$LOOP46_DATA/ca-root.pem"
+
 . "$(dirname "$0")/_smoke_helpers.sh"
 SMOKE_TAG=penalty-smoke
 init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
@@ -49,6 +58,8 @@ for i in 0 1 2; do
         --http "${HTTP_ADDRS[$i]}" \
         --data-dir "${DATA_DIRS[$i]}" \
         --public-suffix "$PUBLIC_SUFFIX" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
         --workers 1 \
         "${RAFT_TIMING_FLAGS[@]}" \
         >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
@@ -67,17 +78,24 @@ sleep 2
 # Discover leader by probing for a non-handler path (avoid consuming
 # penalty-box budget kills). The penalty tenant has no static, so the
 # leader returns 404 and followers return 503 (leader-skip).
+RESOLVE=()
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE+=(--resolve "${HOST_HEADER}:${p}:127.0.0.1")
+done
 LEADER_HTTP=""
 LEADER_IDX=""
+LEADER_PORT=""
 for _ in $(seq 1 75); do
     for i in 0 1 2; do
-        c=$(curl --http2-prior-knowledge --max-time 2 -s -o /dev/null -w '%{http_code}' \
-            -H "Host: $HOST_HEADER" \
-            "http://${HTTP_ADDRS[$i]}/__leader_probe__" 2>/dev/null || echo 000)
+        P="${HTTP_ADDRS[$i]##*:}"
+        c=$(curl --cacert "$CACERT" "${RESOLVE[@]}" --max-time 2 -s -o /dev/null -w '%{http_code}' \
+            "https://${HOST_HEADER}:${P}/__leader_probe__" 2>/dev/null || echo 000)
         # 404 = leader (route miss); 503 = follower (leader-skip)
         if [[ "$c" == "404" ]]; then
             LEADER_HTTP="${HTTP_ADDRS[$i]}"
             LEADER_IDX="$i"
+            LEADER_PORT="$P"
             break 2
         fi
     done
@@ -94,13 +112,11 @@ done
 echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
 
 curl_status() {
-    curl \
-         --http2-prior-knowledge \
+    curl --cacert "$CACERT" "${RESOLVE[@]}" \
          --max-time 5 \
          -s -o /dev/null \
          -w '%{http_code}' \
-         -H "Host: $HOST_HEADER" \
-         "http://$LEADER_HTTP/?fn=handler"
+         "https://${HOST_HEADER}:${LEADER_PORT}/?fn=handler"
 }
 
 expect() {

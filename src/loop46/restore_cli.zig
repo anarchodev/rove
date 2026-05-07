@@ -77,43 +77,25 @@ pub fn runRestore(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     var blob_owned = try main_mod.loadBlobBackend(allocator);
     defer blob_owned.deinit(allocator);
 
-    var fs_handle: ?*ls.batch_store_fs.FsBatchStore = null;
-    defer if (fs_handle) |h| h.deinit();
-    var s3_handle: ?*ls.batch_store_s3.S3BatchStore = null;
-    defer if (s3_handle) |h| h.deinit();
-    var store: ls.batch_store.BatchStore = undefined;
-
-    switch (blob_owned.cfg) {
-        .fs => {
-            const dir = if (parsed.snapshot_dir) |d|
-                try allocator.dupe(u8, d)
-            else
-                try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{parsed.data_dir});
-            defer allocator.free(dir);
-            fs_handle = try ls.batch_store_fs.FsBatchStore.init(allocator, dir);
-            store = fs_handle.?.batchStore();
-            std.log.info("snapshot store: fs at {s}", .{dir});
-        },
-        .s3 => |s3cfg| {
-            const key_prefix = (try blob_mod.env.envOpt(allocator, ENV_SNAPSHOT_S3_KEY_PREFIX)) orelse
-                try allocator.dupe(u8, "");
-            defer allocator.free(key_prefix);
-            s3_handle = try ls.batch_store_s3.S3BatchStore.init(allocator, .{
-                .endpoint = s3cfg.endpoint,
-                .region = s3cfg.region,
-                .bucket = s3cfg.bucket,
-                .key_prefix = key_prefix,
-                .access_key = s3cfg.access_key,
-                .secret_key = s3cfg.secret_key,
-                .use_tls = s3cfg.use_tls,
-            });
-            store = s3_handle.?.batchStore();
-            std.log.info(
-                "snapshot store: s3 endpoint={s} bucket={s} key_prefix='{s}'",
-                .{ s3cfg.endpoint, s3cfg.bucket, key_prefix },
-            );
-        },
-    }
+    const s3cfg = blob_owned.cfg;
+    const key_prefix = (try blob_mod.env.envOpt(allocator, ENV_SNAPSHOT_S3_KEY_PREFIX)) orelse
+        try allocator.dupe(u8, "");
+    defer allocator.free(key_prefix);
+    var s3_handle = try ls.batch_store_s3.S3BatchStore.init(allocator, .{
+        .endpoint = s3cfg.endpoint,
+        .region = s3cfg.region,
+        .bucket = s3cfg.bucket,
+        .key_prefix = key_prefix,
+        .access_key = s3cfg.access_key,
+        .secret_key = s3cfg.secret_key,
+        .use_tls = s3cfg.use_tls,
+    });
+    defer s3_handle.deinit();
+    const store: ls.batch_store.BatchStore = s3_handle.batchStore();
+    std.log.info(
+        "snapshot store: s3 endpoint={s} bucket={s} key_prefix='{s}'",
+        .{ s3cfg.endpoint, s3cfg.bucket, key_prefix },
+    );
 
     const stage_dir = try std.fmt.allocPrint(
         allocator,

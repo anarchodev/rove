@@ -29,8 +29,23 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
+else
+    LOOP46_DATA="${LOOP46_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/loop46}"
+fi
+TLS_CERT="$LOOP46_DATA/dev-cert.pem"
+TLS_KEY="$LOOP46_DATA/dev-key.pem"
+CACERT="$LOOP46_DATA/ca-root.pem"
+
+if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+    echo "error: missing TLS at $LOOP46_DATA. Run mkcert once to generate dev-cert.pem + dev-key.pem." >&2
+    exit 2
+fi
+
 . "$(dirname "$0")/_smoke_helpers.sh"
 SMOKE_TAG=ctl-smoke
+SMOKE_PROTO=https
 init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 rm -rf "$SRC_DIR"
 
@@ -55,11 +70,13 @@ for i in 0 1 2; do
         --peers "$PEERS_CSV" \
         --listen "${RAFT_ADDRS[$i]}" \
         --http "${HTTP_ADDRS[$i]}" \
-        --log-public-base "http://${LOG_ADDR}" \
-        --files-public-base "http://${FILES_ADDR}" \
+        --log-public-base "https://${LOG_ADDR}" \
+        --files-public-base "https://${FILES_ADDR}" \
         --data-dir "${DATA_DIRS[$i]}" \
         --public-suffix "$PUBLIC_SUFFIX" \
         --bootstrap-root-token "$TOKEN" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
         --workers 2 \
         "${RAFT_TIMING_FLAGS[@]}" \
         >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
@@ -76,17 +93,20 @@ trap '
 ' EXIT
 sleep 2
 
-# Smoke runs against h2c (no TLS); CURL is plain curl + h2c flag.
-CURL=(curl -sS --http2-prior-knowledge)
+# TLS curl with --resolve for every cluster + standalone endpoint.
+RESOLVE=(--resolve "files.${PUBLIC_SUFFIX}:${FILES_PORT}:127.0.0.1"
+         --resolve "logs.${PUBLIC_SUFFIX}:${LOG_PORT}:127.0.0.1")
+for h in "${HTTP_ADDRS[@]}"; do
+    p="${h##*:}"
+    RESOLVE+=(--resolve "${ADMIN_HOST}:${p}:127.0.0.1"
+              --resolve "acme.${PUBLIC_SUFFIX}:${p}:127.0.0.1")
+done
+CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 
 discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
 echo "ok  leader elected: node $LEADER_IDX at $LEADER_HTTP"
+ADMIN_ORIGIN="https://${ADMIN_HOST}:${LEADER_PORT}"
 
-# Spawn files-server / log-server pinned to the leader's data_dir.
-# Multi-node deploys need a shared blob backend (S3 / NFS) so
-# blobs survive failover; for this smoke (no failover, just steady-
-# state leader processing) the leader's local data_dir is the
-# correct operational choice.
 spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/ctl-smoke-cs.out "$ADMIN_ORIGIN" || exit 1
 spawn_log_server   "$LOG_ADDR"   "${DATA_DIRS[$LEADER_IDX]}" /tmp/ctl-smoke-ls.out "$ADMIN_ORIGIN" || exit 1
 
@@ -118,7 +138,7 @@ expect() {
     echo "ok  $label"
 }
 
-FILES_LOOP="http://${FILES_ADDR}"
+FILES_LOOP="https://files.${PUBLIC_SUFFIX}:${FILES_PORT}"
 
 upload_file() {
     local rel="$1"
@@ -155,18 +175,19 @@ echo "released dep_id=${dep_id}"
 
 # Hit the deployed handlers via the named-export RPC, against the
 # leader.
-got_root=$(curl -s --http2-prior-knowledge -H "Host: acme.${PUBLIC_SUFFIX}" "${ADMIN_ORIGIN}/?fn=handler")
+got_root=$("${CURL[@]}" "https://acme.${PUBLIC_SUFFIX}:${LEADER_PORT}/?fn=handler")
 expect "GET /?fn=handler (ctl-deployed root handler)" "ctl-root" "$got_root"
 
-got_api=$(curl -s --http2-prior-knowledge -H "Host: acme.${PUBLIC_SUFFIX}" "${ADMIN_ORIGIN}/api?fn=handler")
+got_api=$("${CURL[@]}" "https://acme.${PUBLIC_SUFFIX}:${LEADER_PORT}/api?fn=handler")
 expect "GET /api?fn=handler (ctl-deployed sub-route)" "ctl-api" "$got_api"
 
 # Followers (every node that's NOT the leader) should reject with
 # 503 not-leader.
 for i in 0 1 2; do
     [[ "$i" == "$LEADER_IDX" ]] && continue
+    P="${HTTP_ADDRS[$i]##*:}"
     code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
-        -H "Host: acme.${PUBLIC_SUFFIX}" "http://${HTTP_ADDRS[$i]}/?fn=handler")
+        "https://acme.${PUBLIC_SUFFIX}:${P}/?fn=handler")
     [[ "$code" == "503" ]] || { echo "FAIL: follower $i should 503, got $code" >&2; exit 1; }
 done
 echo "ok  followers reject with 503 not-leader"

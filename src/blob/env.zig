@@ -5,8 +5,6 @@
 //! the deploy contract:
 //!
 //! ```
-//! BLOB_BACKEND=fs                                # default; fs only
-//! BLOB_BACKEND=s3
 //! S3_ENDPOINT=https://...
 //! S3_REGION=...
 //! S3_BUCKET=...
@@ -23,7 +21,6 @@
 const std = @import("std");
 const backend = @import("backend.zig");
 
-pub const ENV_BLOB_BACKEND = "BLOB_BACKEND";
 pub const ENV_S3_ENDPOINT = "S3_ENDPOINT";
 pub const ENV_S3_REGION = "S3_REGION";
 pub const ENV_S3_BUCKET = "S3_BUCKET";
@@ -33,7 +30,6 @@ pub const ENV_AWS_AK = "AWS_ACCESS_KEY_ID";
 pub const ENV_AWS_SK = "AWS_SECRET_ACCESS_KEY";
 
 pub const LoadError = error{
-    UnknownBackend,
     MissingS3Endpoint,
     MissingS3Region,
     MissingS3Bucket,
@@ -42,28 +38,26 @@ pub const LoadError = error{
     OutOfMemory,
 };
 
-/// Owns the env-allocated strings that back a `.s3` `BackendConfig`.
-/// `cfg` is the pointer-stable view callers pass to spawn / Worker /
-/// ApplyCtx; `deinit` frees the underlying strings AFTER all consumers
-/// have finished with them.
+/// Owns the env-allocated strings that back `cfg`. `cfg` is the
+/// pointer-stable view callers pass to spawn / Worker / ApplyCtx;
+/// `deinit` frees the underlying strings AFTER all consumers have
+/// finished with them.
 pub const BlobBackendOwned = struct {
     cfg: backend.BackendConfig,
-    /// Owned strings backing `cfg.s3` when `cfg == .s3`. All `null`
-    /// for the `.fs` variant.
-    endpoint: ?[]u8 = null,
-    region: ?[]u8 = null,
-    bucket: ?[]u8 = null,
-    key_prefix_base: ?[]u8 = null,
-    access_key: ?[]u8 = null,
-    secret_key: ?[]u8 = null,
+    endpoint: []u8,
+    region: []u8,
+    bucket: []u8,
+    key_prefix_base: []u8,
+    access_key: []u8,
+    secret_key: []u8,
 
     pub fn deinit(self: *BlobBackendOwned, allocator: std.mem.Allocator) void {
-        if (self.endpoint) |s| allocator.free(s);
-        if (self.region) |s| allocator.free(s);
-        if (self.bucket) |s| allocator.free(s);
-        if (self.key_prefix_base) |s| allocator.free(s);
-        if (self.access_key) |s| allocator.free(s);
-        if (self.secret_key) |s| allocator.free(s);
+        allocator.free(self.endpoint);
+        allocator.free(self.region);
+        allocator.free(self.bucket);
+        allocator.free(self.key_prefix_base);
+        allocator.free(self.access_key);
+        allocator.free(self.secret_key);
     }
 };
 
@@ -77,19 +71,10 @@ pub fn envOpt(allocator: std.mem.Allocator, name: []const u8) error{OutOfMemory}
     };
 }
 
-/// Build a `BlobBackendOwned` from process env. Defaults to `.fs` when
-/// `BLOB_BACKEND` is unset or `fs`. Returns specific `LoadError`
-/// values for missing required s3 settings so each binary can print
-/// its own diagnostic.
+/// Build a `BlobBackendOwned` from process env. Returns specific
+/// `LoadError` values for missing required S3 settings so each binary
+/// can print its own diagnostic.
 pub fn loadFromEnv(allocator: std.mem.Allocator) LoadError!BlobBackendOwned {
-    const kind_owned = (try envOpt(allocator, ENV_BLOB_BACKEND)) orelse {
-        return .{ .cfg = .fs };
-    };
-    defer allocator.free(kind_owned);
-
-    if (std.mem.eql(u8, kind_owned, "fs")) return .{ .cfg = .fs };
-    if (!std.mem.eql(u8, kind_owned, "s3")) return LoadError.UnknownBackend;
-
     const endpoint = (try envOpt(allocator, ENV_S3_ENDPOINT)) orelse return LoadError.MissingS3Endpoint;
     errdefer allocator.free(endpoint);
     const region = (try envOpt(allocator, ENV_S3_REGION)) orelse return LoadError.MissingS3Region;
@@ -113,7 +98,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) LoadError!BlobBackendOwned {
     };
 
     return .{
-        .cfg = .{ .s3 = .{
+        .cfg = .{
             .endpoint = endpoint,
             .region = region,
             .bucket = bucket,
@@ -121,7 +106,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) LoadError!BlobBackendOwned {
             .access_key = access_key,
             .secret_key = secret_key,
             .use_tls = use_tls,
-        } },
+        },
         .endpoint = endpoint,
         .region = region,
         .bucket = bucket,
@@ -132,8 +117,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) LoadError!BlobBackendOwned {
 }
 
 /// Render a `LoadError` into the env-var name the operator needs to
-/// set. Used by callers to print "BLOB_BACKEND=s3 requires {name}"
-/// messages without listing every error explicitly.
+/// set. Used by callers to print "missing {name}" messages without
+/// listing every error explicitly.
 pub fn errorEnvName(err: LoadError) ?[]const u8 {
     return switch (err) {
         LoadError.MissingS3Endpoint => ENV_S3_ENDPOINT,
@@ -141,6 +126,6 @@ pub fn errorEnvName(err: LoadError) ?[]const u8 {
         LoadError.MissingS3Bucket => ENV_S3_BUCKET,
         LoadError.MissingS3AccessKey => ENV_AWS_AK,
         LoadError.MissingS3SecretKey => ENV_AWS_SK,
-        LoadError.UnknownBackend, LoadError.OutOfMemory => null,
+        LoadError.OutOfMemory => null,
     };
 }

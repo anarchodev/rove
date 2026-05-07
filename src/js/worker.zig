@@ -465,14 +465,13 @@ pub const WorkerConfig = struct {
     /// each worker thread typically gets its own compiler instance
     /// because QuickJS runtimes aren't shareable across threads.
     compile_ctx: ?*anyopaque = null,
-    /// Picks the blob backend each `TenantFiles` / `TenantLog` opens.
-    /// `.fs` keeps the on-disk layout `{inst.dir}/{file,log}-blobs/`;
-    /// `.s3` shares one bucket across all tenants on the node, scoped
-    /// per-tenant by key prefix `{base}{instance_id}/{subdir}/`.
-    /// Owned by the caller — backend strings (endpoint, region, etc.)
-    /// must outlive the worker's `create` call (S3BlobStore.init dupes
-    /// them, so afterwards they can be freed).
-    blob_backend: blob_mod.BackendConfig = .fs,
+    /// S3 blob backend each `TenantFiles` / `TenantLog` opens. One
+    /// bucket across all tenants on the node, scoped per-tenant by
+    /// key prefix `{base}{instance_id}/{subdir}/`. Owned by the
+    /// caller — backend strings (endpoint, region, etc.) must outlive
+    /// the worker's `create` call (S3BlobStore.init dupes them, so
+    /// afterwards they can be freed).
+    blob_backend: blob_mod.BackendConfig,
     /// Phase 5.5 (a) — `BatchStore` the worker flushes log batches
     /// into. loop46 always supplies one — S3 if env wired, in-memory
     /// otherwise. Required because `flushLogs` shouldn't have to
@@ -777,33 +776,17 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
         );
     };
 
-    const files_blob_dir = try std.fmt.allocPrint(
-        allocator,
-        "{s}/file-blobs",
-        .{inst.dir},
-    );
-    defer allocator.free(files_blob_dir);
-
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         worker.blob_backend_cfg,
-        files_blob_dir,
         inst.id,
         "file-blobs",
     );
     errdefer blob_backend.deinit();
 
-    const manifest_dir = try std.fmt.allocPrint(
-        allocator,
-        "{s}/deployments",
-        .{inst.dir},
-    );
-    defer allocator.free(manifest_dir);
-
     var manifest_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         worker.blob_backend_cfg,
-        manifest_dir,
         inst.id,
         "deployments",
     );
@@ -892,17 +875,9 @@ fn openTenantLog(
 ) !*TenantLog {
     const allocator = worker.allocator;
 
-    const log_blob_dir = try std.fmt.allocPrint(
-        allocator,
-        "{s}/log-blobs",
-        .{inst.dir},
-    );
-    defer allocator.free(log_blob_dir);
-
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         worker.blob_backend_cfg,
-        log_blob_dir,
         inst.id,
         "log-blobs",
     );
@@ -1840,20 +1815,12 @@ fn deployStarterContent(
     );
     defer allocator.free(files_db_path);
 
-    const files_blob_dir = try std.fmt.allocPrint(
-        allocator,
-        "{s}/file-blobs",
-        .{inst_dir},
-    );
-    defer allocator.free(files_blob_dir);
-
     const files_kv = try kv_mod.KvStore.open(allocator, files_db_path);
     defer files_kv.close();
 
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         blob_cfg,
-        files_blob_dir,
         inst_id,
         "file-blobs",
     );
@@ -1879,12 +1846,9 @@ fn deployStarterContent(
     const json_bytes = try files_mod.manifest_json.encode(allocator, next_id, entries);
     defer allocator.free(json_bytes);
 
-    const manifest_dir = try std.fmt.allocPrint(allocator, "{s}/deployments", .{inst_dir});
-    defer allocator.free(manifest_dir);
     var manifest_be = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         blob_cfg,
-        manifest_dir,
         inst_id,
         "deployments",
     );
@@ -1964,7 +1928,7 @@ test "openTenantFiles runs the orphan sweep on startup" {
     // Simulate worker startup: openTenantFiles runs the sweep.
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
-        blob_backend_cfg: blob_mod.BackendConfig = .fs,
+        blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
     };
     var fake = FakeWorker{ .allocator = allocator };
     const tc = try openTenantFiles(&fake, inst);
@@ -2007,7 +1971,7 @@ test "commitTxn drops the undo row so the next sweep is a no-op" {
     // Worker startup runs the sweep; should NOT touch durable-key.
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
-        blob_backend_cfg: blob_mod.BackendConfig = .fs,
+        blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
     };
     var fake = FakeWorker{ .allocator = allocator };
     const tc = try openTenantFiles(&fake, inst);
@@ -2049,7 +2013,7 @@ test "captureLog appends a record to the tenant's LogStore" {
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
         tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
-        blob_backend_cfg: blob_mod.BackendConfig = .fs,
+        blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
     };
     var fake = FakeWorker{
         .allocator = allocator,

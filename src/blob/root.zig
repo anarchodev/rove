@@ -1,10 +1,9 @@
-//! rove-blob — pluggable blob storage for rove-files and rove-log.
+//! rove-blob — S3-backed blob storage for rove-files and rove-log.
 //!
 //! Blobs are opaque byte sequences addressed by ASCII string keys.
-//! Phase 1a ships a filesystem backend only. Phase 6 adds an S3
-//! backend for production deployments. The vtable abstraction lets
-//! both backends slot in behind the same type without rebuilding the
-//! consumers.
+//! The store is S3-shaped (AWS / OVH / R2 / B2 / MinIO); a vtable
+//! `BlobStore` interface lets consumers hold the store without
+//! depending on the concrete S3 implementation.
 //!
 //! **What "blob" means here**: the content. rove-files hashes source
 //! files to SHA-256 and passes `sha256_hex` as the key; rove-log uses
@@ -14,19 +13,16 @@
 //!
 //! **What "key" means**: a short ASCII string. The validator rejects
 //! path separators (`/`, `\`), parent-dir references (`..`), leading
-//! dots, and non-printable bytes. Backends may further restrict.
+//! dots, and non-printable bytes.
 
 const std = @import("std");
 
-pub const fs = @import("fs.zig");
-pub const FilesystemBlobStore = fs.FilesystemBlobStore;
 pub const s3 = @import("s3.zig");
 pub const S3BlobStore = s3.S3BlobStore;
 pub const sigv4 = @import("sigv4.zig");
 pub const backend = @import("backend.zig");
 pub const BlobBackend = backend.BlobBackend;
 pub const BackendConfig = backend.BackendConfig;
-pub const S3SharedConfig = backend.S3SharedConfig;
 pub const env = @import("env.zig");
 pub const BlobBackendOwned = env.BlobBackendOwned;
 
@@ -148,7 +144,6 @@ test "validateKey rejects non-printable bytes" {
 }
 
 test {
-    _ = @import("fs.zig");
     _ = @import("sigv4.zig");
     _ = @import("s3.zig");
     _ = @import("backend.zig");

@@ -10,6 +10,32 @@
 # Then call `mint_services_token` to populate JWT / LOG_BASE / FILES_BASE.
 # Use the JWT in `Authorization: Bearer ...` against the standalone
 # services. `files_curl` and `log_curl` are convenience wrappers.
+#
+# rove is S3-only. Sourcing this file pulls AWS / S3_* from `.env` at
+# the repo root and assigns each smoke a per-run S3_KEY_PREFIX_BASE so
+# concurrent runs don't trample each other.
+
+# Source .env (repo root) for AWS_* + S3_* env vars. The .env path is
+# relative to the smoke script's caller — when sourced by a
+# scripts/*_smoke.sh, $(dirname "$0")/.. is the repo root. Fall back
+# to ./ when sourced directly.
+__smoke_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "${__smoke_repo_root}/.env" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "${__smoke_repo_root}/.env"
+    set +a
+fi
+for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY S3_BUCKET S3_ENDPOINT S3_REGION; do
+    if [[ -z "${!v:-}" ]]; then
+        echo "error: $v not set (need .env at repo root with S3 credentials)" >&2
+        exit 2
+    fi
+done
+
+# Stable dev id used to namespace each smoke's S3 prefix. The prefix
+# itself is set by `init_cluster_addrs` once SMOKE_TAG is known.
+__smoke_dev_id="$(hostname)-$(id -u)"
 
 mint_services_token() {
     local resp
@@ -129,6 +155,11 @@ init_cluster_addrs() {
     done
     PEERS_CSV=$(IFS=,; echo "${RAFT_ADDRS[*]}")
     rm -rf "${DATA_DIRS[@]}"
+
+    # Per-smoke S3 key prefix base, stable across runs of the same
+    # smoke on the same dev box. Subsequent runs see bootstrap blobs
+    # already in S3 → no re-upload, no startup delay.
+    export S3_KEY_PREFIX_BASE="${S3_KEY_PREFIX_BASE:-smoke-${SMOKE_TAG:-default}-${__smoke_dev_id}/}"
 
     # Tighten raft timing for smokes: production default is 1000ms
     # election timeout / 200ms heartbeat (matches etcd / Consul /

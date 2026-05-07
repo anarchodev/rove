@@ -151,15 +151,11 @@ fn loadJwtSecret(allocator: std.mem.Allocator) ![]u8 {
 
 fn loadBlobBackend(allocator: std.mem.Allocator) !blob_mod.BlobBackendOwned {
     return blob_mod.env.loadFromEnv(allocator) catch |err| switch (err) {
-        blob_mod.env.LoadError.UnknownBackend => {
-            std.debug.print("error: BLOB_BACKEND must be \"fs\" or \"s3\"\n", .{});
-            std.process.exit(2);
-        },
         blob_mod.env.LoadError.OutOfMemory => return error.OutOfMemory,
         else => |e| {
             const name = blob_mod.env.errorEnvName(e) orelse "<unknown>";
             std.debug.print(
-                "error: BLOB_BACKEND=s3 requires {s} to be set\n",
+                "error: S3 blob backend requires {s} to be set\n",
                 .{name},
             );
             std.process.exit(2);
@@ -191,45 +187,28 @@ pub fn main() !void {
     defer blob_owned.deinit(allocator);
 
     // Pick the batch store backend off the same env signal. `fs` mode
-    // points at `{data_dir}/log-batches/` so the worker (running with
-    // the same data_dir) writes batches to a path the standalone can
-    // see directly; `s3` mode uses the same connection params + an
-    // optional LOG_S3_KEY_PREFIX namespace, matching what the worker's
-    // flushLogs path does.
-    var fs_handle: ?*log_server.batch_store_fs.FsBatchStore = null;
-    defer if (fs_handle) |h| h.deinit();
-    var s3_handle: ?*log_server.batch_store_s3.S3BatchStore = null;
-    defer if (s3_handle) |h| h.deinit();
-    var batch_store: log_server.batch_store.BatchStore = undefined;
-
-    switch (blob_owned.cfg) {
-        .fs => {
-            const fs_dir = try std.fmt.allocPrint(allocator, "{s}/log-batches", .{cli.data_dir});
-            defer allocator.free(fs_dir);
-            fs_handle = try log_server.batch_store_fs.FsBatchStore.init(allocator, fs_dir);
-            batch_store = fs_handle.?.batchStore();
-            std.log.info("batch backend: fs at {s}", .{fs_dir});
-        },
-        .s3 => |s3cfg| {
-            const key_prefix = (try blob_mod.env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
-                try allocator.dupe(u8, "");
-            defer allocator.free(key_prefix);
-            s3_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
-                .endpoint = s3cfg.endpoint,
-                .region = s3cfg.region,
-                .bucket = s3cfg.bucket,
-                .key_prefix = key_prefix,
-                .access_key = s3cfg.access_key,
-                .secret_key = s3cfg.secret_key,
-                .use_tls = s3cfg.use_tls,
-            });
-            batch_store = s3_handle.?.batchStore();
-            std.log.info(
-                "batch backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
-                .{ s3cfg.endpoint, s3cfg.region, s3cfg.bucket, key_prefix },
-            );
-        },
-    }
+    // S3-only batch store. Same connection params as the worker plus
+    // an optional LOG_S3_KEY_PREFIX namespace, matching what the
+    // worker's flushLogs path uses.
+    const s3cfg = blob_owned.cfg;
+    const key_prefix = (try blob_mod.env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
+        try allocator.dupe(u8, "");
+    defer allocator.free(key_prefix);
+    var s3_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+        .endpoint = s3cfg.endpoint,
+        .region = s3cfg.region,
+        .bucket = s3cfg.bucket,
+        .key_prefix = key_prefix,
+        .access_key = s3cfg.access_key,
+        .secret_key = s3cfg.secret_key,
+        .use_tls = s3cfg.use_tls,
+    });
+    defer s3_handle.deinit();
+    const batch_store: log_server.batch_store.BatchStore = s3_handle.batchStore();
+    std.log.info(
+        "batch backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
+        .{ s3cfg.endpoint, s3cfg.region, s3cfg.bucket, key_prefix },
+    );
 
     var tls_config: ?*h2.TlsConfig = null;
     defer if (tls_config) |c| c.destroy();
@@ -262,7 +241,6 @@ pub fn main() !void {
         .bind_addr = listen_addr,
         .max_connections = cli.max_connections,
         .blob_backend_cfg = blob_owned.cfg,
-        .fs_data_dir = cli.data_dir,
         .tls_config = tls_config,
         .jwt_secret = jwt_secret,
         .cors_origin = cli.cors_origin,

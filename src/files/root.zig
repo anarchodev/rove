@@ -134,6 +134,32 @@ pub const FileStore = struct {
         self.kv.put(key, value) catch return Error.Kv;
     }
 
+    /// Content-addressed PUT: skip if the key already exists in the
+    /// blob store. Lets multiple cluster nodes bootstrap the same
+    /// shared S3 backend concurrently without conflicting on PUT for
+    /// identical bytes (some object stores reject overlapping
+    /// conditional writes for the same key — OVH OS in particular).
+    /// Retries up to ~1s on PUT errors so the loser of a race waits
+    /// for the winner's write to land + becomes visible via exists().
+    fn putBlobIfMissing(self: *FileStore, key: []const u8, bytes: []const u8) Error!void {
+        if (self.blob.exists(key) catch false) return;
+        var attempt: u8 = 0;
+        while (attempt < 6) : (attempt += 1) {
+            self.blob.put(key, bytes) catch {
+                // Sleep with exponential backoff (50ms, 100ms, 200ms,
+                // 400ms, 800ms) then re-check. Identical content
+                // means whoever wins is fine; we just need to confirm
+                // the key landed.
+                const delay_ms: u64 = @as(u64, 50) << @as(u6, @intCast(attempt));
+                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                if (self.blob.exists(key) catch false) return;
+                continue;
+            };
+            return;
+        }
+        return Error.Blob;
+    }
+
     fn kvDelete(self: *FileStore, key: []const u8) Error!void {
         self.kv.delete(key) catch |err| switch (err) {
             error.NotFound => {},
@@ -161,7 +187,7 @@ pub const FileStore = struct {
         hashHex(source, &src_hex);
 
         // Source blob first.
-        self.blob.put(&src_hex, source) catch return Error.Blob;
+        self.putBlobIfMissing(&src_hex, source) catch return Error.Blob;
 
         // Compile (or reuse cached bytecode hash).
         var bc_hex: [HASH_HEX_LEN]u8 = undefined;
@@ -186,7 +212,7 @@ pub const FileStore = struct {
         var src_hex: [HASH_HEX_LEN]u8 = undefined;
         hashHex(bytes, &src_hex);
 
-        self.blob.put(&src_hex, bytes) catch return Error.Blob;
+        self.putBlobIfMissing(&src_hex, bytes) catch return Error.Blob;
         try self.writeFileEntry(path, .static, content_type, &src_hex);
     }
 
@@ -304,7 +330,7 @@ pub const FileStore = struct {
         defer self.allocator.free(bytecode);
 
         hashHex(bytecode, out_bc_hex);
-        self.blob.put(out_bc_hex, bytecode) catch return Error.Blob;
+        self.putBlobIfMissing(out_bc_hex, bytecode) catch return Error.Blob;
         try self.kvPut(bc_key, out_bc_hex);
     }
 
@@ -602,7 +628,68 @@ fn decodeFileValue(value: []const u8) Error!FileValueView {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const fs_backend = blob_mod.fs;
+
+/// Test-only in-memory `BlobStore`. The vtable interface makes a
+/// per-test stand-in cheap; production stores are S3-only and require
+/// real bucket creds.
+const MemBlobStore = struct {
+    allocator: std.mem.Allocator,
+    map: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) MemBlobStore {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *MemBlobStore) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.free(e.value_ptr.*);
+        }
+        self.map.deinit(self.allocator);
+    }
+
+    fn blobStore(self: *MemBlobStore) blob_mod.BlobStore {
+        return .{ .ptr = self, .vtable = &.{
+            .put = vtPut,
+            .get = vtGet,
+            .exists = vtExists,
+            .delete = vtDelete,
+        } };
+    }
+
+    fn vtPut(ptr: *anyopaque, key: []const u8, bytes: []const u8) anyerror!void {
+        const self: *MemBlobStore = @ptrCast(@alignCast(ptr));
+        const v = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(v);
+        const gop = try self.map.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            self.allocator.free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = try self.allocator.dupe(u8, key);
+        }
+        gop.value_ptr.* = v;
+    }
+
+    fn vtGet(ptr: *anyopaque, key: []const u8, allocator: std.mem.Allocator) anyerror![]u8 {
+        const self: *MemBlobStore = @ptrCast(@alignCast(ptr));
+        const v = self.map.get(key) orelse return blob_mod.Error.NotFound;
+        return allocator.dupe(u8, v);
+    }
+
+    fn vtExists(ptr: *anyopaque, key: []const u8) anyerror!bool {
+        const self: *MemBlobStore = @ptrCast(@alignCast(ptr));
+        return self.map.contains(key);
+    }
+
+    fn vtDelete(ptr: *anyopaque, key: []const u8) anyerror!void {
+        const self: *MemBlobStore = @ptrCast(@alignCast(ptr));
+        if (self.map.fetchRemove(key)) |entry| {
+            self.allocator.free(entry.key);
+            self.allocator.free(entry.value);
+        }
+    }
+};
 
 /// Pass-through compiler for tests: "bytecode" is just `"bc:" ++ source`.
 /// Good enough to exercise the cache — different source yields different
@@ -634,7 +721,7 @@ const TestFixture = struct {
     allocator: std.mem.Allocator,
     tmp_path: []u8,
     kv: *KvStore,
-    blob_store: fs_backend.FilesystemBlobStore,
+    blob_store: MemBlobStore,
 
     fn init(allocator: std.mem.Allocator) !TestFixture {
         const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
@@ -649,15 +736,11 @@ const TestFixture = struct {
         const kvs = try KvStore.open(allocator, db_path);
         errdefer kvs.close();
 
-        const blob_path = try std.fmt.allocPrint(allocator, "{s}/blobs", .{tmp_path});
-        defer allocator.free(blob_path);
-        const bs = try fs_backend.FilesystemBlobStore.open(allocator, blob_path);
-
         return .{
             .allocator = allocator,
             .tmp_path = tmp_path,
             .kv = kvs,
-            .blob_store = bs,
+            .blob_store = MemBlobStore.init(allocator),
         };
     }
 
