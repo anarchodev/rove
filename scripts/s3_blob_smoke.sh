@@ -28,6 +28,13 @@
 
 set -euo pipefail
 
+if [[ -f .env ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source .env
+    set +a
+fi
+
 BIN="${BIN:-./zig-out/bin/s3-blob-smoke}"
 
 if [[ ! -x "$BIN" ]]; then

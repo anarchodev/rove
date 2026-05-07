@@ -8,8 +8,19 @@
 
 set -euo pipefail
 
+if [[ -f .env ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source .env
+    set +a
+fi
+
 DATA_DIR="${DATA_DIR:-/tmp/rove-cs-smoke}"
 BIN="${BIN:-./zig-out/bin/files-server-standalone}"
+
+# Isolate S3 keys per run so static bytes uploaded by a prior run
+# don't pre-fill the bucket and turn /blobs/check missing→present.
+export S3_KEY_PREFIX_BASE="${S3_KEY_PREFIX_BASE:-smoke-files-server-$(hostname)-$(id -u)-$(date +%s)/}"
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN not found — run 'zig build install' first" >&2
@@ -91,20 +102,11 @@ case "$body" in
     *) echo "FAIL deploy expected id 1, got '$body'" >&2; exit 1 ;;
 esac
 
-# Find the source blob on disk by grepping for known content. (The
-# blob dir holds both the source and the bytecode — only the source
-# matches plain-text grep.)
-SRC_BLOB=""
-for f in "$DATA_DIR"/acme/file-blobs/*; do
-    if grep -q "hi from smoke" "$f" 2>/dev/null; then
-        SRC_BLOB="$(basename "$f")"
-        break
-    fi
-done
-if [[ -z "$SRC_BLOB" ]]; then
-    echo "FAIL: could not find source blob on disk" >&2
-    exit 1
-fi
+# Source blobs are content-addressed, so the source hash is just
+# sha256 of the upload bytes. Pre-S3, the smoke discovered this by
+# grepping the local blob dir; that file no longer exists (blobs
+# live in S3 now), so compute the hash directly.
+SRC_BLOB=$(printf '%s' "$SOURCE" | sha256sum | awk '{print $1}')
 
 # Fetch the source blob over HTTP.
 code=$(curl -s --http2-prior-knowledge "${AUTH[@]}" -o /tmp/cs-src.out -w '%{http_code}' \
