@@ -129,6 +129,7 @@ seed_all_dirs "$PERIODIC_MANIFEST"
 rm -f "$PERIODIC_MANIFEST"
 
 export LOOP46_SERVICES_JWT_SECRET=$(head -c32 /dev/urandom | xxd -p | tr -d '\n')
+export LOOP46_ROOT_TOKEN="$PERIODIC_TOKEN"
 
 PIDS=()
 for i in 0 1 2; do
@@ -139,7 +140,6 @@ for i in 0 1 2; do
         --http "${HTTP_ADDRS[$i]}" \
         --data-dir "${DATA_DIRS[$i]}" \
         --public-suffix loop46.localhost \
-        --bootstrap-root-token "$PERIODIC_TOKEN" \
         --snapshot-interval-ms 500 \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \

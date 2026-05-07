@@ -65,17 +65,18 @@ mkdir -p "$DATA_DIR"
 ADMIN_API_DOMAIN="app.${BASE_DOMAIN}"
 ADMIN_ORIGIN="https://${ADMIN_API_DOMAIN}"
 
-# Bootstrap plumbing. Flags only pass through when the matching env
-# var is set; otherwise boot reuses what's already in root.db /
-# __admin__/app.db.
-#   ROVE_TOKEN        → --bootstrap-root-token             (admin login)
-#   ROVE_RESEND_KEY   → --bootstrap-kv resend_key=...      (platform email)
-BOOTSTRAP_ARGS=()
+# Bootstrap plumbing.
+#   ROVE_TOKEN       → LOOP46_ROOT_TOKEN env (worker reads at startup;
+#                       constant-time compared against the bearer on
+#                       /_system/* and /v1/login).
+#   ROVE_RESEND_KEY  → files-server --bootstrap-kv resend_key=... (one-shot
+#                       admin-kv push at standalone startup).
 if [[ -n "${ROVE_TOKEN:-}" ]]; then
-    BOOTSTRAP_ARGS+=(--bootstrap-root-token "$ROVE_TOKEN")
+    export LOOP46_ROOT_TOKEN="$ROVE_TOKEN"
 fi
+FILES_BOOTSTRAP_ARGS=()
 if [[ -n "${ROVE_RESEND_KEY:-}" ]]; then
-    BOOTSTRAP_ARGS+=(--bootstrap-kv "resend_key=$ROVE_RESEND_KEY")
+    FILES_BOOTSTRAP_ARGS+=(--bootstrap-kv "resend_key=$ROVE_RESEND_KEY")
 fi
 
 cat <<EOF
@@ -112,6 +113,8 @@ CS_LOG="${CS_LOG:-$DATA_DIR/files-server.log}"
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --cors-origin "$ADMIN_ORIGIN" \
+    --leader-url "https://${BIND_ADDR}" \
+    "${FILES_BOOTSTRAP_ARGS[@]}" \
     >"$CS_LOG" 2>&1 &
 CS_PID=$!
 echo "  files-server: log at $CS_LOG (pid $CS_PID, port $FILES_PORT)"
@@ -148,5 +151,4 @@ trap 'kill $CS_PID $LS_PID 2>/dev/null || true; wait $CS_PID $LS_PID 2>/dev/null
     --files-public-base "https://files.${BASE_DOMAIN}:${FILES_PORT}" \
     --log-public-base "https://logs.${BASE_DOMAIN}:${LOG_PORT}" \
     --data-dir "$DATA_DIR" \
-    --workers "$WORKERS" \
-    "${BOOTSTRAP_ARGS[@]}"
+    --workers "$WORKERS"

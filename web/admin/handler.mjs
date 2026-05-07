@@ -458,16 +458,15 @@ function handleAuth() {
 }
 
 // POST /v1/login — body {token}. Operator-issued root token →
-// session cookie. Token must already exist as a root_token/{hash}
-// row in root.db (provisioned by --bootstrap-root-token).
+// session cookie. Token must equal LOOP46_ROOT_TOKEN (read by the
+// worker at startup, validated via constant-time compare).
 function handleLogin() {
     const body = parseBody();
     if (!body || !isHex64(body.token)) {
         response.status = 401;
         return { error: "invalid token" };
     }
-    const tokenHash = crypto.sha256(body.token);
-    if (platform.root.get("root_token/" + tokenHash) === null) {
+    if (!platform.auth.checkRootToken(body.token)) {
         response.status = 401;
         return { error: "invalid token" };
     }

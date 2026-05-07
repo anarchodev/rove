@@ -41,6 +41,8 @@ inline fn mkVal(tag: i64, val: i32) c.JSValue {
 pub const js_undefined: c.JSValue = mkVal(c.JS_TAG_UNDEFINED, 0);
 pub const js_null: c.JSValue = mkVal(c.JS_TAG_NULL, 0);
 pub const js_exception: c.JSValue = mkVal(c.JS_TAG_EXCEPTION, 0);
+pub const js_true: c.JSValue = mkVal(c.JS_TAG_BOOL, 1);
+pub const js_false: c.JSValue = mkVal(c.JS_TAG_BOOL, 0);
 
 /// One row in a tenant's trigger registry. Built at deploy-load time
 /// (worker.zig) from manifest paths matching `_triggers/.../index.{mjs,js}`.
@@ -755,6 +757,35 @@ fn jsPlatformRootPrefix(
     return arr;
 }
 
+/// `platform.auth.checkRootToken(token_hex)` — admin-only.
+/// Returns `true` iff `token_hex` matches the operator-supplied
+/// root token (read from `LOOP46_ROOT_TOKEN` at worker startup).
+/// Constant-time compare via `tenant.authenticate`. JS handler uses
+/// this from `/v1/login` so the secret never crosses into JS state
+/// or the SQLite root store.
+fn jsPlatformAuthCheckRootToken(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) return js_false;
+    const state = getState(ctx);
+    const tenant = state.platform orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    };
+
+    const token = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(token);
+
+    const auth = tenant.authenticate(token) catch |err| {
+        state.pending_kv_error = err;
+        return js_false;
+    };
+    return if (auth != null) js_true else js_false;
+}
+
 /// `platform.instances.create(name)` — admin-only. Creates the
 /// instance directory, opens its app.db, writes the local
 /// `instance/{name}` marker, and mirrors the marker into the root
@@ -987,6 +1018,9 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "platform", "instances" }, .fns = &.{
         .{ .name = "create",        .cfunc = jsPlatformInstancesCreate,        .argc = 1 },
         .{ .name = "deployStarter", .cfunc = jsPlatformInstancesDeployStarter, .argc = 1 },
+    } },
+    .{ .path = &.{ "platform", "auth" }, .fns = &.{
+        .{ .name = "checkRootToken", .cfunc = jsPlatformAuthCheckRootToken, .argc = 1 },
     } },
 };
 

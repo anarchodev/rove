@@ -106,6 +106,7 @@ seed_all_dirs ./examples/loop46-demo-tenants.json
 # Per-run 32-byte hex; both processes need the same value via
 # LOOP46_SERVICES_JWT_SECRET in env.
 export LOOP46_SERVICES_JWT_SECRET=$(head -c32 /dev/urandom | xxd -p | tr -d '\n')
+export LOOP46_ROOT_TOKEN="$TOKEN"
 
 # ── Spawn log-server pointing at the SAME bucket+prefix ───────────
 # Pinned to node 0's data_dir; with S3 backend the actual log batches
@@ -129,7 +130,6 @@ for i in 0 1 2; do
         --listen "${RAFT_ADDRS[$i]}" \
         --http "${HTTP_ADDRS[$i]}" \
         --data-dir "${DATA_DIRS[$i]}" \
-        --bootstrap-root-token "$TOKEN" \
         --admin-origin "https://${ADMIN_HOST}:${P}" \
         --admin-api-domain "$ADMIN_HOST" \
         --public-suffix "$PUBLIC_SUFFIX" \

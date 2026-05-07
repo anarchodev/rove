@@ -57,6 +57,7 @@ SMOKE_PROTO=https
 init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+export LOOP46_ROOT_TOKEN="$TOKEN"
 
 CUSTOMER_HOST="demo.loop46.localhost"
 
@@ -70,7 +71,6 @@ for i in 0 1 2; do
         --log-public-base "https://${LOG_HOST}:${LOG_PORT}" \
         --files-public-base "https://${FILES_HOST}:${FILES_PORT}" \
         --data-dir "${DATA_DIRS[$i]}" \
-        --bootstrap-root-token "$TOKEN" \
         --admin-origin "$ORIGIN" \
         --admin-api-domain "$API_HOST" \
         --public-suffix "$PUBLIC_SUFFIX" \

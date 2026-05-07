@@ -57,6 +57,7 @@ init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 # Shared secret between worker + files-server so files-server's
 # /_system/release POST verifies on the worker.
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+export LOOP46_ROOT_TOKEN="$TOKEN"
 
 # Seed acme + randwrite into every node's data dir so the cluster has
 # the same starting tenant set on each replica.
@@ -71,7 +72,6 @@ for i in 0 1 2; do
         --listen "${RAFT_ADDRS[$i]}" \
         --http "${HTTP_ADDRS[$i]}" \
         --data-dir "${DATA_DIRS[$i]}" \
-        --bootstrap-root-token "$TOKEN" \
         --admin-origin "https://${API_HOST}:${P}" \
         --public-suffix "$PUBLIC_SUFFIX" \
         --tls-cert "$TLS_CERT" \

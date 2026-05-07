@@ -31,13 +31,14 @@ fi
 
 rm -rf "$DATA_DIR"
 
+export LOOP46_ROOT_TOKEN="$TOKEN"
+
 "$BIN" worker \
     --node-id 0 \
     --peers "$RAFT_ADDR" \
     --listen "$RAFT_ADDR" \
     --http "$HTTP_ADDR" \
     --data-dir "$DATA_DIR" \
-    --bootstrap-root-token "$TOKEN" \
     --admin-origin "$ORIGIN" \
     --workers "$WORKERS" \
     --fresh &

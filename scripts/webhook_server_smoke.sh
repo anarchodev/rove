@@ -59,6 +59,7 @@ init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 
 # Shared secret between worker + files-server.
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+export LOOP46_ROOT_TOKEN="$TOKEN"
 
 # Seed acme onto every node.
 seed_all_dirs ./examples/loop46-demo-tenants.json
@@ -104,7 +105,6 @@ for i in 0 1 2; do
         --listen "${RAFT_ADDRS[$i]}" \
         --http "${HTTP_ADDRS[$i]}" \
         --data-dir "${DATA_DIRS[$i]}" \
-        --bootstrap-root-token "$TOKEN" \
         --admin-origin "https://${ADMIN_HOST}:${P}" \
         --admin-api-domain "$ADMIN_HOST" \
         --public-suffix "$PUBLIC_SUFFIX" \

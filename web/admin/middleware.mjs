@@ -16,7 +16,9 @@ function isHex64(s) {
 }
 
 // Cookie path: hash, kv.get session/{hash}, sweep on expiry.
-// Bearer path: hash, look up root_token/{hash} in root.db.
+// Bearer path: constant-time compare against LOOP46_ROOT_TOKEN
+// (read by the worker at startup; surfaced via
+// `platform.auth.checkRootToken`).
 // Bearer-authed callers always get is_root=true; the dashboard's
 // RPC path uses cookies, the operator's curl/CLI uses bearer.
 function checkSession() {
@@ -41,10 +43,8 @@ function checkSession() {
         const lower = auth.slice(0, 7).toLowerCase();
         if (lower === "bearer ") {
             const token = auth.slice(7).trim();
-            if (isHex64(token)) {
-                if (platform.root.get("root_token/" + crypto.sha256(token)) !== null) {
-                    return { is_root: true };
-                }
+            if (isHex64(token) && platform.auth.checkRootToken(token)) {
+                return { is_root: true };
             }
         }
     }

@@ -1713,7 +1713,7 @@ Not available:
 
 ### Operational
 
-- `--bootstrap-root-token <hex>` seeds the operator bearer token at startup. Token can be any 32–128 printable ASCII chars; hex is convention not requirement.
+- `LOOP46_ROOT_TOKEN=<hex>` env var supplies the operator bearer token. Workers read it at startup and validate `Authorization: Bearer <hex>` via constant-time compare — no SQLite write, no rotation API. Must be ≥32 chars; rotate by restarting workers with a new value.
 - `--bootstrap-resend-key <key>` seeds the platform Resend key into `__admin__/app.db`.
 - `--public-suffix <domain>` enables wildcard `{id}.<domain>` → instance routing. Without it, every host needs an explicit `assignDomain` entry.
 - `--admin-api-domain <domain>` routes that host's traffic through the `__admin__` handler with auth. Separate from `--public-suffix`.

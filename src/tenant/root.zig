@@ -180,6 +180,14 @@ pub const Tenant = struct {
     /// are dropped on any `Tenant` write (coarse but fine — root writes
     /// are rare bootstrap ops in M1).
     host_cache: std.StringHashMapUnmanaged(*Instance) = .empty,
+    /// Operator-supplied root bearer token (the `LOOP46_ROOT_TOKEN`
+    /// env var). When non-null, presenting an `Authorization: Bearer
+    /// <this>` proves "platform operator." When null, every request
+    /// authenticates as non-root — useful in tests + tenants that
+    /// don't expose a root surface. Borrowed; lifetime managed by
+    /// the caller (typically the worker's main() frame which holds
+    /// the env-var slice for the process lifetime).
+    root_token_secret: ?[]const u8 = null,
 
     /// Heap-allocate a `Tenant`. The admin instance's `platform`
     /// capability field stores a pointer BACK at this Tenant (see
@@ -596,69 +604,34 @@ pub const Tenant = struct {
 
     // ── Auth ──────────────────────────────────────────────────────────
     //
-    // M1 shape: one platform root token, stored as its SHA-256 hash
-    // under `root_token/{sha256_hex}` in root.db. Presenting the
-    // matching plaintext authenticates as platform operator. Admin
-    // sessions + magic links live in `__admin__`'s app.db (see the
-    // session + magic sections below).
+    // The root bearer token is operator-supplied via the
+    // `LOOP46_ROOT_TOKEN` env var, read at worker startup, and stored
+    // on the Tenant as `root_token_secret`. Presenting the matching
+    // plaintext authenticates as platform operator. Admin sessions +
+    // magic links live in `__admin__`'s app.db (see the session +
+    // magic sections below).
     //
-    // The plaintext token is never stored; only its hash lives in the
-    // root store. An attacker who reads root.db cannot forge a token,
-    // and the bootstrap flag that installs it is the only place the
-    // plaintext ever appears.
+    // No SQLite write at startup, no per-node `__root__.db` row to
+    // get out of sync across the cluster — every node reads the same
+    // env value. Rotating the token = restart the workers with a new
+    // env value. Comparison is constant-time so a leaked timing
+    // signal doesn't help an attacker brute-force the token byte-by-
+    // byte.
 
-    /// Install a root token. Idempotent — re-installing the same
-    /// token is a no-op; re-installing a different token replaces
-    /// any existing one. The plaintext is SHA-256'd before storage.
-    pub fn installRootToken(self: *Tenant, token_hex: []const u8) Error!void {
-        try validateTokenShape(token_hex);
-
-        var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(token_hex, &hash, .{});
-        const hex_chars = "0123456789abcdef";
-        var hash_hex: [64]u8 = undefined;
-        for (hash, 0..) |b, i| {
-            hash_hex[i * 2] = hex_chars[b >> 4];
-            hash_hex[i * 2 + 1] = hex_chars[b & 0x0f];
-        }
-
-        // Clear any pre-existing root token. A deployment only ever
-        // has one root token at a time — this keeps the root store
-        // from accumulating stale entries on token rotation.
-        try self.clearRootTokens();
-
-        var key_buf: [12 + 64]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "root_token/{s}", .{hash_hex}) catch
-            return Error.Kv;
-        self.root.put(key, "") catch return Error.Kv;
-    }
-
-    /// Authenticate a plaintext token. Returns `null` if the token
-    /// doesn't match any installed token, or an `AuthContext`
-    /// describing the identity on success. Constant-time comparison
-    /// isn't needed because we hash-and-lookup rather than string-
-    /// compare — the kv index returns `NotFound` without scanning.
+    /// Authenticate a plaintext token against `root_token_secret`.
+    /// Returns `null` if the token is malformed, doesn't match, or
+    /// no root token is configured. Returns `AuthContext{is_root:
+    /// true}` on a constant-time match.
     pub fn authenticate(self: *Tenant, token_hex: []const u8) Error!?AuthContext {
+        const secret = self.root_token_secret orelse return null;
+        if (token_hex.len != secret.len) return null;
         if (validateTokenShape(token_hex)) |_| {} else |_| return null;
-
-        var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(token_hex, &hash, .{});
-        const hex_chars = "0123456789abcdef";
-        var hash_hex: [64]u8 = undefined;
-        for (hash, 0..) |b, i| {
-            hash_hex[i * 2] = hex_chars[b >> 4];
-            hash_hex[i * 2 + 1] = hex_chars[b & 0x0f];
-        }
-
-        var key_buf: [12 + 64]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "root_token/{s}", .{hash_hex}) catch
-            return Error.Kv;
-        const v = self.root.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return Error.Kv,
-        };
-        self.allocator.free(v);
-        return .{ .is_root = true };
+        // std.crypto.timing_safe.eql wants compile-time-known size.
+        // Tokens are at most a few hundred bytes; do a manual
+        // constant-time XOR-accumulate to avoid the size constraint.
+        var diff: u8 = 0;
+        for (token_hex, secret) |a, b| diff |= a ^ b;
+        return if (diff == 0) .{ .is_root = true } else null;
     }
 
     // ── adminKv: storage handle for admin-surface state ──────────────
@@ -759,25 +732,6 @@ pub const Tenant = struct {
         return ctx.is_root;
     }
 
-    fn clearRootTokens(self: *Tenant) Error!void {
-        // Track the currently-active token hash via a single
-        // well-known key so rotation can find and delete the prior
-        // entry. Deleting THAT key's referent clears the old token.
-        const current_key = "root_token_hash";
-        const prior_hash = self.root.get(current_key) catch |err| switch (err) {
-            error.NotFound => return,
-            else => return Error.Kv,
-        };
-        defer self.allocator.free(prior_hash);
-
-        var key_buf: [12 + 64]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "root_token/{s}", .{prior_hash}) catch
-            return Error.Kv;
-        self.root.delete(key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return Error.Kv,
-        };
-    }
 };
 
 fn validateTokenShape(token: []const u8) Error!void {
@@ -1103,12 +1057,12 @@ test "validateInstanceId rejects bad ids" {
     try validateInstanceId("ACME-123_v2");
 }
 
-test "installRootToken + authenticate round trip" {
+test "authenticate matches root_token_secret" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
 
     const token = "a" ** 64;
-    try fx.tenant.installRootToken(token);
+    fx.tenant.root_token_secret = token;
 
     const ctx = try fx.tenant.authenticate(token);
     try testing.expect(ctx != null);
@@ -1119,7 +1073,7 @@ test "authenticate rejects unknown tokens" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
 
-    try fx.tenant.installRootToken("a" ** 64);
+    fx.tenant.root_token_secret = "a" ** 64;
     // Different valid-shape token → null.
     try testing.expectEqual(
         @as(?AuthContext, null),
@@ -1137,18 +1091,14 @@ test "authenticate rejects unknown tokens" {
     );
 }
 
-test "installRootToken is idempotent and supports rotation" {
+test "authenticate returns null when no root_token_secret is set" {
     var fx = try TestFixture.init(testing.allocator);
     defer fx.deinit();
-
-    const old_token = "1" ** 64;
-
-    try fx.tenant.installRootToken(old_token);
-    try testing.expect((try fx.tenant.authenticate(old_token)) != null);
-
-    // Re-installing the SAME token must leave it valid.
-    try fx.tenant.installRootToken(old_token);
-    try testing.expect((try fx.tenant.authenticate(old_token)) != null);
+    // Default — root_token_secret is null.
+    try testing.expectEqual(
+        @as(?AuthContext, null),
+        try fx.tenant.authenticate("a" ** 64),
+    );
 }
 
 test "canAccessInstance short-circuits for root" {

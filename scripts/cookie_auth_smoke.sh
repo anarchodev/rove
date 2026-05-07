@@ -48,6 +48,7 @@ init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 # Shared secret between worker + files-server so files-server's
 # /_system/release POST verifies on the worker.
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+export LOOP46_ROOT_TOKEN="$TOKEN"
 
 PIDS=()
 for i in 0 1 2; do
@@ -58,7 +59,6 @@ for i in 0 1 2; do
         --listen "${RAFT_ADDRS[$i]}" \
         --http "${HTTP_ADDRS[$i]}" \
         --data-dir "${DATA_DIRS[$i]}" \
-        --bootstrap-root-token "$TOKEN" \
         --admin-origin "https://${API_HOST}:${P}" \
         --admin-api-domain "$API_HOST" \
         --public-suffix "$PUBLIC_SUFFIX" \

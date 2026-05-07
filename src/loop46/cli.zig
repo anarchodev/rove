@@ -20,11 +20,6 @@ pub const Cli = struct {
     data_dir: []const u8 = "/tmp/rove-js-data",
     /// If true, wipe the data dir before starting (smoke-test mode).
     fresh: bool = false,
-    /// Hex-encoded 256-bit root token. When set, the worker installs
-    /// it into the tenant root store at startup; any subsequent
-    /// `/_system/*` request must carry this token in an
-    /// `Authorization: Bearer <hex>` header.
-    bootstrap_root_token: ?[]const u8 = null,
     /// Number of worker threads. Each owns its own Registry/Io/H2/
     /// Tenant/Dispatcher and binds the same HTTP/2 port via
     /// SO_REUSEPORT. Defaults to the number of online CPUs.
@@ -170,10 +165,6 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             out.data_dir = args[i];
         } else if (std.mem.eql(u8, a, "--fresh")) {
             out.fresh = true;
-        } else if (std.mem.eql(u8, a, "--bootstrap-root-token")) {
-            i += 1;
-            if (i >= args.len) return error.Usage;
-            out.bootstrap_root_token = args[i];
         } else if (std.mem.eql(u8, a, "--workers")) {
             i += 1;
             if (i >= args.len) return error.Usage;
@@ -354,7 +345,6 @@ pub const USAGE =
     \\  --http <host:port>          HTTP/2 listen
     \\  --data-dir <path>           per-node data dir
     \\  --fresh                     wipe data dir before start
-    \\  --bootstrap-root-token HEX  seed the root auth token at startup
     \\  --public-suffix <domain>    customer wildcard suffix (e.g. loop46.me).
     \\                              admin host derives to app.<suffix> unless
     \\                              --admin-api-domain overrides

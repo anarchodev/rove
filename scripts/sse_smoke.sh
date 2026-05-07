@@ -69,6 +69,7 @@ init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 # first emit" failures. Real fix is shared pump state across
 # workers (or pin an SSE-affinity scheme); see docs/sse-plan.md.
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+export LOOP46_ROOT_TOKEN="$TOKEN"
 
 PIDS=()
 for i in 0 1 2; do
@@ -80,7 +81,6 @@ for i in 0 1 2; do
         --log-public-base "https://${LOG_HOST}:${LOG_PORT}" \
         --files-public-base "https://${FILES_HOST}:${FILES_PORT}" \
         --data-dir "${DATA_DIRS[$i]}" \
-        --bootstrap-root-token "$TOKEN" \
         --public-suffix "$PUBLIC_SUFFIX" \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \

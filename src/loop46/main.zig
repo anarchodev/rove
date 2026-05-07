@@ -145,6 +145,16 @@ pub const BlobBackendOwned = blob_mod.BlobBackendOwned;
 /// in-process subsystems.
 pub const ENV_SERVICES_JWT_SECRET = "LOOP46_SERVICES_JWT_SECRET";
 
+/// Operator-supplied root bearer token (the `Authorization: Bearer
+/// <hex>` value the dashboard / files-server-standalone present
+/// against `/_system/*` for admin auth). Read at worker startup,
+/// stored on the per-worker Tenant, validated by `tenant.authenticate`
+/// via constant-time compare. No SQLite write — every node reads the
+/// same env value, so cluster-wide consistency is automatic.
+/// Operators rotate the token by restarting the workers with a new
+/// env value.
+pub const ENV_ROOT_TOKEN = "LOOP46_ROOT_TOKEN";
+
 pub fn loadBlobBackend(allocator: std.mem.Allocator) !BlobBackendOwned {
     return blob_mod.env.loadFromEnv(allocator) catch |err| switch (err) {
         blob_mod.env.LoadError.OutOfMemory => return error.OutOfMemory,
@@ -214,6 +224,12 @@ const WorkerCtx = struct {
     admin_api_domain: ?[]const u8,
     public_suffix: ?[]const u8,
     rate_limit_caps: rjs.RateLimitCaps,
+    /// Operator-supplied root bearer token (`LOOP46_ROOT_TOKEN`
+    /// env). Borrowed from the main thread's frame which holds the
+    /// env-allocated slice for the process lifetime. When null, no
+    /// root auth is configured — every `/_system/*` request that
+    /// requires admin auth returns 401.
+    root_token_secret: ?[]const u8,
     /// Per-worker QuickJS compiler used by the signup endpoint to
     /// bytecode-compile starter handler content. Runtimes can't be
     /// shared across threads, so each worker owns its own.
@@ -293,6 +309,7 @@ fn workerMain(args: *WorkerCtx) !void {
     );
     defer tenant.destroy();
     try tenant.setPublicSuffix(args.public_suffix);
+    tenant.root_token_secret = args.root_token_secret;
 
     // The main thread created __admin__ + the root token + any
     // pre-seeded tenants before spawning us. Promote them into THIS
@@ -672,13 +689,6 @@ fn bootstrapTenants(
     const tenant = try tenant_mod.Tenant.create(allocator, root_kv, cli.data_dir);
     defer tenant.destroy();
 
-    if (cli.bootstrap_root_token) |t| {
-        tenant.installRootToken(t) catch |err| {
-            failExit("bootstrap: installRootToken failed: {s}\n", .{@errorName(err)});
-        };
-        std.debug.print("bootstrap: root token installed\n", .{});
-    }
-
     // Phase 5.5(e) step 3 — admin and replay deploys are owned by
     // files-server-standalone now. The worker creates the per-node
     // tenant rows in __root__.db so the dispatcher can route to
@@ -991,6 +1001,24 @@ pub fn main() !void {
         );
     }
 
+    // Root bearer token for `/_system/*` admin auth. Owned slice
+    // lives for the rest of main()'s frame (and therefore the
+    // process); per-worker `Tenant` borrows.
+    const root_token_secret: ?[]const u8 = try blob_mod.env.envOpt(allocator, ENV_ROOT_TOKEN);
+    defer if (root_token_secret) |s| allocator.free(s);
+    if (root_token_secret) |s| {
+        if (s.len < 32) failExit(
+            "loop46: {s} must be at least 32 chars (got {d}) — generate via `head -c32 /dev/urandom | xxd -p`\n",
+            .{ ENV_ROOT_TOKEN, s.len },
+        );
+        std.log.info("root-token: loaded from {s}", .{ENV_ROOT_TOKEN});
+    } else {
+        std.log.info(
+            "root-token: {s} unset; /_system/* admin auth will reject every bearer (only files-server cap-JWT path will work)",
+            .{ENV_ROOT_TOKEN},
+        );
+    }
+
     // ── External services ─────────────────────────────────────────────
     //
     // After Tasks #61 + #62, files-server and log-server run as
@@ -1089,6 +1117,7 @@ pub fn main() !void {
             .admin_origin = cli.admin_origin,
             .admin_api_domain = cli.admin_api_domain,
             .public_suffix = cli.public_suffix,
+            .root_token_secret = root_token_secret,
             .rate_limit_caps = .{
                 .request_capacity = cli.rate_limit_request_capacity,
                 .request_refill_per_sec = cli.rate_limit_request_refill,

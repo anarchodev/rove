@@ -56,6 +56,7 @@ EOF
 seed_all_dirs "$SEED_MANIFEST"
 
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+export LOOP46_ROOT_TOKEN="$TOKEN"
 
 # Spawn the 3-node cluster first. Workers are configured with
 # `--files-public-base` / `--log-public-base` set to the eventual
@@ -74,7 +75,6 @@ for i in 0 1 2; do
         --files-public-base "https://${FILES_ADDR}" \
         --data-dir "${DATA_DIRS[$i]}" \
         --public-suffix "$PUBLIC_SUFFIX" \
-        --bootstrap-root-token "$TOKEN" \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
         --workers 2 \

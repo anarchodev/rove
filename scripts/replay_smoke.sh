@@ -80,6 +80,7 @@ RESOLVE+=(--resolve "${LOG_HOST}:${LOG_PORT}:127.0.0.1" \
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
+export LOOP46_ROOT_TOKEN="$TOKEN"
 
 PIDS=()
 for i in 0 1 2; do
@@ -91,7 +92,6 @@ for i in 0 1 2; do
         --log-public-base "https://logs.${PUBLIC_SUFFIX}:${LOG_PORT}" \
         --files-public-base "https://files.${PUBLIC_SUFFIX}:${FILES_PORT}" \
         --data-dir "${DATA_DIRS[$i]}" \
-        --bootstrap-root-token "$TOKEN" \
         --public-suffix "$PUBLIC_SUFFIX" \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
