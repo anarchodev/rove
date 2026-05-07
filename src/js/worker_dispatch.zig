@@ -194,9 +194,9 @@ fn finalizeBatch(
     return processed;
 }
 
-/// `/_system/*` proxy + preflight handler. Returns true iff the
-/// request matched and was finalized (response stamped + moved to
-/// `response_in` or forwarded to a subsystem `pending` queue).
+/// `/_system/*` route handler — CORS preflight + `services-token`
+/// mint + `release` POST. Returns true iff the request matched and
+/// was finalized (response stamped + moved to `response_in`).
 fn tryHandleSystem(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -669,7 +669,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const authority = respb.findHeader(rh, ":authority") orelse "";
         const body: []const u8 = if (req_body.data) |p| p[0..req_body.len] else "";
 
-        // `/_system/*` — CORS gate, then auth + proxy routing.
+        // `/_system/*` — CORS gate, then auth + system route dispatch.
         if (try tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh, body)) {
             processed += 1;
             continue;

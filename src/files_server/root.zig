@@ -1,48 +1,38 @@
-//! rove-files-server — per-instance file/deploy operations, designed
-//! to run off the worker's h2 thread.
+//! rove-files-server — per-instance file/deploy operations.
 //!
-//! ## Why this module exists
+//! ## What this module is
+//!
+//! The operation functions: `uploadFile`, `putBlobByHash`,
+//! `deployManifest`, `putFileAndDeploy`, `deploy`, `loadDeployment`,
+//! `loadCurrentManifest`, `getSourceByHash`. Each opens its own
+//! per-instance `{data_dir}/{instance_id}/{files.db, file-blobs/}`
+//! pair, does one operation, and closes. `thread.zig` wraps these
+//! in an h2 server; `examples/files_server_standalone.zig` is the
+//! production deploy artifact that runs the thread as a separate
+//! process (Phase 5.5(e) Task #62).
+//!
+//! ## Why a separate process
 //!
 //! Compile is the only part of the request-serving path that's
 //! meaningfully expensive: a 20 KB `.mjs` takes ~5-20 ms to compile
 //! with quickjs-ng. That's the entire per-request wall-clock budget
-//! blown before a byte of user code runs. We can't put deploy behind
-//! the penalty box — deploy is legitimately heavy, and it's initiated
-//! by operators, not request handlers.
-//!
-//! The solution is an "infrastructure plane" subsystem: a separate
-//! thread (later, possibly a separate process) that owns all the
-//! compile + file-store I/O, so the h2 thread only handles
-//! HTTP/2 framing + forwarding. In the MVP everything runs in the
-//! same process; the worker calls this module via a thin proxy layer
-//! whose wire contract is `/_system/files/{instance_id}/{op}`.
-//!
-//! ## What this module is (today)
-//!
-//! Just the operation functions. No thread, no h2, no socket. Each
-//! function opens its own per-instance `{data_dir}/{instance_id}/
-//! {files.db, file-blobs/}` pair, does one operation, and closes. This
-//! keeps the module trivially testable in isolation — later slices
-//! wrap these in a job queue + thread, then in an h2 server listening
-//! on a loopback socket.
+//! blown before a byte of user code runs. Deploy is legitimately
+//! heavy + initiated by operators, not request handlers, so it
+//! belongs off the request-serving thread entirely. After Task #62
+//! the loop46 worker no longer spawns this in-process either —
+//! operators run `files-server-standalone` separately and point
+//! the worker at it via `--files-public-base`.
 //!
 //! ## Interaction with running workers
 //!
-//! SQLite opens with NOMUTEX, meaning one connection per thread. The
-//! worker already holds long-running connections to `{files.db,
-//! file-blobs/}` via its `TenantFiles` cache. When this module opens
-//! a second connection on a different thread:
-//!
-//!   - Reads are always safe (WAL).
-//!   - Writes (upload, deploy) are serialized by SQLite's internal
-//!     database-level lock; the worker's `refreshDeployments` poll
-//!     observes the new `deployment/current` on its next tick and
-//!     reloads the bytecode map.
-//!
-//! There's a small window after a deploy where the worker is still
-//! serving the old deployment. That's acceptable — deployments aren't
-//! request-latency-critical and the stale window is bounded by the
-//! refresh interval (2 s default).
+//! SQLite opens with NOMUTEX, meaning one connection per thread.
+//! With the process split the worker holds NO connection to
+//! `files.db` (Phase 5.5(e) F2-storage retired the worker-side
+//! files.db open). The worker reads manifests from the per-tenant
+//! `deployments/` BlobBackend (shared via fs/s3 with this server)
+//! and bytecodes from the file-blobs BlobBackend. The runtime
+//! release pointer (`_deploy/current`) lands in the customer's
+//! app.db and rides envelope 0 through raft.
 
 const std = @import("std");
 const kv_mod = @import("rove-kv");

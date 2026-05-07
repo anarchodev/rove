@@ -1518,8 +1518,7 @@ pub fn applyPendingReleases(worker: anytype) !void {
 //   1. Walks `request_out.entitySlice()` once.
 //   2. Short-circuits (not-leader, `/_system/*`, unknown tenant,
 //      missing deployment, router / penalty failures) finalize inline
-//      — `setSimpleResponse` + move to `response_in` or a proxy
-//      queue.
+//      — `setSimpleResponse` + move to `response_in`.
 //   3. The first handler-bound entity establishes the anchor tenant;
 //      opens `beginTrackedImmediate` + a `WriteSet`. Subsequent
 //      handler entities are run under `SAVEPOINT h → dispatcher.run
@@ -1544,7 +1543,7 @@ pub fn applyPendingReleases(worker: anytype) !void {
 
 /// Process one tenant's batch of requests from `request_out`. Returns
 /// the number of entities moved out of `request_out` (to
-/// `response_in`, `raft_pending`, or a proxy queue). Zero means the
+/// `response_in` or `raft_pending`). Zero means the
 /// collection has no work the caller can make progress on — either
 /// `request_out` is empty, or all remaining handler entities target
 /// tenants in `blocked`.

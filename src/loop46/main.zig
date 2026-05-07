@@ -20,7 +20,7 @@
 //!   - per-tenant `KvStore` + `LogStore` (every worker opens its own
 //!     — NOMUTEX sqlite connections cannot be shared across threads)
 //!   - qjs `Dispatcher` (its own arena + snapshot)
-//!   - penalty box, proxy state, raft-pending collection
+//!   - penalty box, raft-pending collection
 //!
 //! ## Data layout
 //!
@@ -974,12 +974,13 @@ pub fn main() !void {
         );
     }
 
-    // ── Subsystem threads (shared across workers) ──────────────────────
+    // ── External services ─────────────────────────────────────────────
     //
-    // All subsystems run as separate threads inside the loop46
-    // process. Each is independently addressable on its own
-    // public-facing TLS port; the worker doesn't proxy to any of
-    // them anymore (Phase 5.5 a/e Step B/F1).
+    // After Tasks #61 + #62, files-server and log-server run as
+    // separate operator-deployed processes; loop46 only carries the
+    // worker, raft, and webhook-server threads. The two URL fields
+    // below are what `/_system/services-token` returns to the
+    // dashboard so it knows where to fetch + log queries land.
 
     // ── log-server (Phase 5.5(a) Step B + Task #61 split) ─────────────
     //

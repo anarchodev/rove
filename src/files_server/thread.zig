@@ -346,9 +346,8 @@ fn handleOne(
 /// flow.
 ///
 /// URLs are path-only; the client resolves against whichever origin
-/// it reached us on (directly or via the worker's `/_system/files/*`
-/// proxy). We never emit a host, so the admin UI and a direct-to-
-/// files-server CLI both work.
+/// it reached us on. We never emit a host, so the admin UI and a
+/// direct-to-files-server CLI both work.
 fn handleBlobsCheck(
     server: *CodeH2,
     allocator: std.mem.Allocator,
