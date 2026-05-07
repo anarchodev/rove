@@ -116,11 +116,21 @@ pub const Captured = struct {
     }
 };
 
+/// One tenant's input to `capture` — borrowed pointers; the caller
+/// owns lifetime. Both `ApplyCtx`-driven and operator-trigger paths
+/// build a slice of these.
+pub const TenantSource = struct {
+    instance_id: []const u8,
+    store: *kv.KvStore,
+};
+
 /// Capture a snapshot end-to-end. The caller threads the
 /// just-promoted `apply_position` (current willemt commit idx) and
 /// `willemt_term`; both end up in the manifest so a follower's
-/// load path can reject mismatches and so the compaction floor is
-/// recorded.
+/// load path can reject mismatches and the compaction floor is
+/// recorded. `tenants` is a borrowed slice of (id, store) pairs;
+/// `root_store` is null on test fixtures that don't have a root
+/// (production always passes one).
 ///
 /// `tmp_dir` is where intermediate VACUUM outputs land before
 /// upload. Caller picks (typically `{data_dir}/.snapshot-stage/`);
@@ -129,7 +139,8 @@ pub const Captured = struct {
 /// captures — the snap_id namespace gives that property.
 pub fn capture(
     allocator: std.mem.Allocator,
-    apply_ctx: *apply_mod.ApplyCtx,
+    tenants_in: []const TenantSource,
+    root_store: ?*kv.KvStore,
     snapshot_store: ls.batch_store.BatchStore,
     tmp_dir: []const u8,
     apply_position: u64,
@@ -138,9 +149,6 @@ pub fn capture(
     const snap_id = try mintSnapId(allocator);
     errdefer allocator.free(snap_id);
 
-    // Stage dir lives at `{tmp_dir}/{snap_id}/` so a crash mid-
-    // capture leaves an isolated, identifiable directory the next
-    // run (or a janitor) can clean up.
     const stage = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_dir, snap_id });
     defer allocator.free(stage);
     std.fs.cwd().makePath(stage) catch return Error.Io;
@@ -150,30 +158,25 @@ pub fn capture(
     errdefer freeTenantList(allocator, &tenants);
 
     // ── Per-tenant captures ─────────────────────────────────────
-    var it = apply_ctx.kv_stores.iterator();
-    while (it.next()) |entry| {
-        const id = entry.key_ptr.*;
-        const store = entry.value_ptr.*;
-
-        // VACUUM INTO `{stage}/{id}.db`, then read + sha + put.
+    for (tenants_in) |t| {
         const tmp_path = try std.fmt.allocPrintSentinel(
             allocator,
             "{s}/{s}.db",
-            .{ stage, id },
+            .{ stage, t.instance_id },
             0,
         );
         defer allocator.free(tmp_path);
 
-        store.vacuumInto(tmp_path) catch return Error.Sqlite;
+        t.store.vacuumInto(tmp_path) catch return Error.Sqlite;
 
         const captured = try uploadDbFile(
             allocator,
             snapshot_store,
             tmp_path,
-            try snapshotKey(allocator, snap_id, id),
+            try snapshotKey(allocator, snap_id, t.instance_id),
         );
 
-        const id_copy = try allocator.dupe(u8, id);
+        const id_copy = try allocator.dupe(u8, t.instance_id);
         errdefer allocator.free(id_copy);
         try tenants.append(allocator, .{
             .instance_id = id_copy,
@@ -187,7 +190,7 @@ pub fn capture(
     // ── Root db (singleton) ─────────────────────────────────────
     var root_entry: ?SingletonEntry = null;
     errdefer if (root_entry) |*r| allocator.free(r.db_key);
-    if (apply_ctx.root_store) |root_store| {
+    if (root_store) |rs| {
         const tmp_path = try std.fmt.allocPrintSentinel(
             allocator,
             "{s}/__root__.db",
@@ -195,7 +198,7 @@ pub fn capture(
             0,
         );
         defer allocator.free(tmp_path);
-        root_store.vacuumInto(tmp_path) catch return Error.Sqlite;
+        rs.vacuumInto(tmp_path) catch return Error.Sqlite;
 
         const root_key = try std.fmt.allocPrint(
             allocator,
@@ -248,6 +251,302 @@ pub fn capture(
         .manifest_key = manifest_key,
         .manifest_bytes = manifest_bytes,
     };
+}
+
+/// Result of `restore` — bookkeeping the caller can log + use to
+/// initialize willemt's state via `raft_begin_load_snapshot` /
+/// `raft_end_load_snapshot` (step 4b wiring).
+pub const Restored = struct {
+    /// The manifest that was loaded; caller must `deinit`.
+    manifest: Manifest,
+    /// Number of tenant dbs successfully written + sha-verified.
+    tenants_restored: usize,
+    /// True if the manifest had a root_db entry that was applied.
+    root_restored: bool,
+};
+
+/// Phase 5.5(c) snapshot step 4 — pull a snapshot down from a
+/// `BatchStore` (fs in dev, S3 in prod) and install it into a
+/// fresh `data_dir`. Used by:
+///
+/// - `loop46 restore-from-snapshot` admin CLI for disaster
+///   recovery (a node lost its disk; restore from S3).
+/// - The follower-side load path triggered by willemt's
+///   `send_snapshot` callback (step 4b wires that — for now this
+///   function is the building block).
+///
+/// Flow per `docs/snapshot-plan.md` §5.2:
+///
+///   1. GET `cluster/snapshots/{snap_id}/manifest.json`
+///   2. For each tenant in manifest:
+///      - GET the db bytes, verify sha256 against the manifest,
+///        write to `{tmp_dir}/{snap_id}/{tenant}/app.db`
+///      - mkdir `{data_dir}/{tenant}/`, atomic-rename the staged
+///        file into `{data_dir}/{tenant}/app.db`
+///      - Open it, stamp `_apply_state.last_applied_raft_idx =
+///        snapshot_idx` so subsequent raft entries replay through
+///        `applyOne`'s filter without re-applying anything in the
+///        snapshot.
+///   3. Same for `__root__.db` when the manifest carries one.
+///
+/// Caller owns + must `deinit` the returned `Restored.manifest`.
+pub fn restore(
+    allocator: std.mem.Allocator,
+    snapshot_store: ls.batch_store.BatchStore,
+    snap_id: []const u8,
+    data_dir: []const u8,
+    tmp_dir: []const u8,
+) !Restored {
+    // Stage area for atomic-rename. Per-snap_id subdir so a crash
+    // mid-restore leaves an isolated tree the next run can clean.
+    const stage = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_dir, snap_id });
+    defer allocator.free(stage);
+    std.fs.cwd().makePath(stage) catch return Error.Io;
+    defer std.fs.cwd().deleteTree(stage) catch {};
+
+    // ── Pull + decode the manifest ──────────────────────────────
+    const manifest_key = try std.fmt.allocPrint(
+        allocator,
+        "cluster/snapshots/{s}/manifest.json",
+        .{snap_id},
+    );
+    defer allocator.free(manifest_key);
+
+    const manifest_bytes = snapshot_store.get(manifest_key, allocator) catch
+        return Error.Backend;
+    defer allocator.free(manifest_bytes);
+
+    var manifest = try decodeManifest(allocator, manifest_bytes);
+    errdefer manifest.deinit();
+
+    // ── Per-tenant restore ──────────────────────────────────────
+    var tenants_done: usize = 0;
+    for (manifest.tenants) |entry| {
+        try restoreOneDb(
+            allocator,
+            snapshot_store,
+            entry.db_key,
+            &entry.db_sha256,
+            entry.db_size,
+            entry.snapshot_idx,
+            stage,
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, entry.instance_id }),
+            "app.db",
+        );
+        tenants_done += 1;
+    }
+
+    // ── Root db (singleton) ─────────────────────────────────────
+    var root_done: bool = false;
+    if (manifest.root_db) |r| {
+        try restoreOneDb(
+            allocator,
+            snapshot_store,
+            r.db_key,
+            &r.db_sha256,
+            r.db_size,
+            r.snapshot_idx,
+            stage,
+            try allocator.dupe(u8, data_dir),
+            "__root__.db",
+        );
+        root_done = true;
+    }
+
+    return .{
+        .manifest = manifest,
+        .tenants_restored = tenants_done,
+        .root_restored = root_done,
+    };
+}
+
+/// Pull one db from the snapshot store, verify sha + size, atomic-
+/// rename into `target_dir/file_name`, and stamp
+/// `_apply_state.last_applied_raft_idx = snapshot_idx` so subsequent
+/// raft-applied entries replay correctly past the snapshot floor.
+///
+/// `target_dir` is owned by this fn (will be freed before return).
+fn restoreOneDb(
+    allocator: std.mem.Allocator,
+    snapshot_store: ls.batch_store.BatchStore,
+    db_key: []const u8,
+    expected_sha256_hex: *const [64]u8,
+    expected_size: u64,
+    snapshot_idx: u64,
+    stage_dir: []const u8,
+    target_dir: []u8,
+    file_name: []const u8,
+) !void {
+    defer allocator.free(target_dir);
+
+    const bytes = snapshot_store.get(db_key, allocator) catch return Error.Backend;
+    defer allocator.free(bytes);
+
+    if (bytes.len != expected_size) return Error.InvalidManifest;
+    var actual_sha: [64]u8 = undefined;
+    sha256Hex(bytes, &actual_sha);
+    if (!std.mem.eql(u8, &actual_sha, expected_sha256_hex)) return Error.InvalidManifest;
+
+    // Stage path is keyed by the basename (file_name) — collisions
+    // across multiple tenants restoring concurrently from one
+    // `restore` call are impossible because we serialize, but using
+    // file_name keeps the stage tree mirror-shaped to the data dir.
+    const stage_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ stage_dir, file_name },
+    );
+    defer allocator.free(stage_path);
+
+    {
+        const f = std.fs.cwd().createFile(stage_path, .{ .mode = 0o600 }) catch
+            return Error.Io;
+        defer f.close();
+        f.writeAll(bytes) catch return Error.Io;
+    }
+
+    std.fs.cwd().makePath(target_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return Error.Io,
+    };
+
+    const final_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ target_dir, file_name },
+    );
+    defer allocator.free(final_path);
+
+    // Drop any prior copy + WAL/SHM sidecars that would otherwise
+    // race with the fresh open below. SQLite re-creates them.
+    deleteIfPresent(final_path);
+    deleteWithSuffix(allocator, final_path, "-wal");
+    deleteWithSuffix(allocator, final_path, "-shm");
+
+    std.fs.cwd().rename(stage_path, final_path) catch return Error.Io;
+
+    // Stamp `_apply_state` so the apply path's per-entry filter
+    // skips everything ≤ snapshot_idx without falling for it.
+    const final_path_z = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}",
+        .{final_path},
+        0,
+    );
+    defer allocator.free(final_path_z);
+    const ks = kv.KvStore.open(allocator, final_path_z) catch return Error.Sqlite;
+    defer ks.close();
+    ks.setLastAppliedRaftIdx(snapshot_idx) catch return Error.Sqlite;
+}
+
+fn deleteIfPresent(path: []const u8) void {
+    std.fs.cwd().deleteFile(path) catch {};
+}
+
+fn deleteWithSuffix(allocator: std.mem.Allocator, path: []const u8, suffix: []const u8) void {
+    const buf = std.fmt.allocPrint(allocator, "{s}{s}", .{ path, suffix }) catch return;
+    defer allocator.free(buf);
+    std.fs.cwd().deleteFile(buf) catch {};
+}
+
+/// Build a `[]TenantSource` slice from an already-warmed
+/// `ApplyCtx.kv_stores`. Borrows the keys + store pointers; caller
+/// frees the returned slice with `allocator.free`. Use this from
+/// the raft thread (which owns the connections) — not from a
+/// worker, since SQLite NOMUTEX connections aren't shareable.
+pub fn tenantSourcesFromApplyCtx(
+    allocator: std.mem.Allocator,
+    apply_ctx: *apply_mod.ApplyCtx,
+) ![]TenantSource {
+    var list = try allocator.alloc(TenantSource, apply_ctx.kv_stores.count());
+    var idx: usize = 0;
+    var it = apply_ctx.kv_stores.iterator();
+    while (it.next()) |entry| : (idx += 1) {
+        list[idx] = .{ .instance_id = entry.key_ptr.*, .store = entry.value_ptr.* };
+    }
+    return list;
+}
+
+/// Capture a snapshot from the on-disk data dir, opening fresh
+/// per-tenant SQLite connections instead of reusing the
+/// raft-thread or worker-thread caches. Designed for the dedicated
+/// snapshot thread the periodic capture loop spawns: it has no
+/// share of the worker / raft NOMUTEX connections, so any access
+/// it makes has to be via its own opens.
+///
+/// Walks `{data_dir}/*` for tenant subdirectories (each containing
+/// `app.db`) and includes `{data_dir}/__root__.db` when present.
+/// Skips subdirs that don't have `app.db` — they're either
+/// half-bootstrapped tenants, scratch dirs, or the `.snapshots/`
+/// store itself.
+pub fn captureFromDataDir(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    snapshot_store: ls.batch_store.BatchStore,
+    tmp_dir: []const u8,
+    apply_position: u64,
+    willemt_term: u64,
+) !Captured {
+    var sources: std.ArrayListUnmanaged(TenantSource) = .empty;
+    defer {
+        for (sources.items) |t| {
+            allocator.free(t.instance_id);
+            t.store.close();
+        }
+        sources.deinit(allocator);
+    }
+
+    var dir = std.fs.cwd().openDir(data_dir, .{ .iterate = true }) catch
+        return Error.Io;
+    defer dir.close();
+
+    var root_store: ?*kv.KvStore = null;
+    defer if (root_store) |s| s.close();
+
+    var it = dir.iterate();
+    while (it.next() catch return Error.Io) |entry| {
+        if (entry.kind == .file and std.mem.eql(u8, entry.name, "__root__.db")) {
+            const path = try std.fmt.allocPrintSentinel(
+                allocator,
+                "{s}/__root__.db",
+                .{data_dir},
+                0,
+            );
+            defer allocator.free(path);
+            root_store = kv.KvStore.open(allocator, path) catch return Error.Sqlite;
+            continue;
+        }
+        if (entry.kind != .directory) continue;
+        // Skip dot-dirs (e.g. `.snapshots`, `.stage`) and any subdir
+        // without an `app.db`.
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        const app_db_path = try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/{s}/app.db",
+            .{ data_dir, entry.name },
+            0,
+        );
+        defer allocator.free(app_db_path);
+        std.fs.cwd().access(app_db_path, .{}) catch continue;
+
+        const ks = kv.KvStore.open(allocator, app_db_path) catch return Error.Sqlite;
+        const id_copy = try allocator.dupe(u8, entry.name);
+        errdefer {
+            ks.close();
+            allocator.free(id_copy);
+        }
+        try sources.append(allocator, .{ .instance_id = id_copy, .store = ks });
+    }
+
+    return capture(
+        allocator,
+        sources.items,
+        root_store,
+        snapshot_store,
+        tmp_dir,
+        apply_position,
+        willemt_term,
+    );
 }
 
 /// 26-char ULID-ish stamp: `{ms_since_epoch_hex:0>14}{random_hex:12}`.
@@ -496,6 +795,189 @@ fn tmpPath(buf: *[96]u8, tag: []const u8) []const u8 {
 
 fn noopApply(_: u64, _: []const u8, _: ?*anyopaque) void {}
 
+test "capture + restore: round-trips tenant + root state into a fresh data_dir" {
+    const allocator = testing.allocator;
+
+    var path_buf: [96]u8 = undefined;
+    const root_path = tmpPath(&path_buf, "rt");
+    defer std.fs.cwd().deleteTree(root_path) catch {};
+    try std.fs.cwd().makePath(root_path);
+
+    // ── Source state: __root__.db + tenant `acme`/app.db ───────
+    {
+        const root_db_path = try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/__root__.db",
+            .{root_path},
+            0,
+        );
+        defer allocator.free(root_db_path);
+        const root_kv = try kv.KvStore.open(allocator, root_db_path);
+        defer root_kv.close();
+        try root_kv.put("tenant/acme", "{}");
+        try root_kv.setLastAppliedRaftIdx(50);
+    }
+
+    const acme_dir = try std.fmt.allocPrint(allocator, "{s}/acme", .{root_path});
+    defer allocator.free(acme_dir);
+    try std.fs.cwd().makePath(acme_dir);
+    const acme_db_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/app.db",
+        .{acme_dir},
+        0,
+    );
+    defer allocator.free(acme_db_path);
+    {
+        const acme_kv = try kv.KvStore.open(allocator, acme_db_path);
+        defer acme_kv.close();
+        try acme_kv.put("greeting", "hello");
+        try acme_kv.put("counter", "42");
+        try acme_kv.setLastAppliedRaftIdx(99);
+    }
+
+    // ── Stand up a raft node + ApplyCtx for the source side ────
+    const raft_log_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/raft.log.db",
+        .{root_path},
+        0,
+    );
+    defer allocator.free(raft_log_path);
+    const peers = [_]kv.RaftPeerAddr{.{ .host = "127.0.0.1", .port = 39801 }};
+    const node = try kv.RaftNode.init(allocator, .{
+        .node_id = 0,
+        .peers = &peers,
+        .listen_addr = try std.net.Address.parseIp("127.0.0.1", 39801),
+        .apply = .{ .opaque_bytes = .{ .apply_fn = noopApply, .ctx = null } },
+        .raft_log_path = raft_log_path,
+    });
+    defer node.deinit();
+
+    var apply_ctx = apply_mod.ApplyCtx.init(allocator, root_path, node);
+    defer apply_ctx.deinit();
+    _ = try apply_ctx.getKv("acme");
+    _ = try apply_ctx.getRootKv();
+
+    // ── Capture into an FsBatchStore ────────────────────────────
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{root_path});
+    defer allocator.free(store_dir);
+    const stage_dir = try std.fmt.allocPrint(allocator, "{s}/.stage", .{root_path});
+    defer allocator.free(stage_dir);
+
+    const store = try ls.batch_store_fs.FsBatchStore.init(allocator, store_dir);
+    defer store.deinit();
+
+    const sources = try tenantSourcesFromApplyCtx(allocator, &apply_ctx);
+    defer allocator.free(sources);
+
+    var captured = try capture(
+        allocator,
+        sources,
+        apply_ctx.root_store,
+        store.batchStore(),
+        stage_dir,
+        100,
+        7,
+    );
+    defer captured.deinit();
+
+    // ── Restore into a fresh data_dir ───────────────────────────
+    const restore_dir = try std.fmt.allocPrint(allocator, "{s}-restored", .{root_path});
+    defer std.fs.cwd().deleteTree(restore_dir) catch {};
+    defer allocator.free(restore_dir);
+    try std.fs.cwd().makePath(restore_dir);
+
+    const restore_stage = try std.fmt.allocPrint(allocator, "{s}/.stage", .{restore_dir});
+    defer allocator.free(restore_stage);
+
+    var restored = try restore(
+        allocator,
+        store.batchStore(),
+        captured.snap_id,
+        restore_dir,
+        restore_stage,
+    );
+    defer restored.manifest.deinit();
+
+    try testing.expectEqual(@as(usize, 1), restored.tenants_restored);
+    try testing.expect(restored.root_restored);
+
+    // ── Verify the restored state matches the source ───────────
+    const restored_acme = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/acme/app.db",
+        .{restore_dir},
+        0,
+    );
+    defer allocator.free(restored_acme);
+    {
+        const ks = try kv.KvStore.open(allocator, restored_acme);
+        defer ks.close();
+        const v = try ks.get("greeting");
+        defer allocator.free(v);
+        try testing.expectEqualStrings("hello", v);
+        const c = try ks.get("counter");
+        defer allocator.free(c);
+        try testing.expectEqualStrings("42", c);
+        try testing.expectEqual(@as(u64, 100), try ks.lastAppliedRaftIdx());
+    }
+
+    const restored_root = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/__root__.db",
+        .{restore_dir},
+        0,
+    );
+    defer allocator.free(restored_root);
+    {
+        const ks = try kv.KvStore.open(allocator, restored_root);
+        defer ks.close();
+        const v = try ks.get("tenant/acme");
+        defer allocator.free(v);
+        try testing.expectEqualStrings("{}", v);
+        try testing.expectEqual(@as(u64, 100), try ks.lastAppliedRaftIdx());
+    }
+}
+
+test "restore: rejects sha256 mismatch" {
+    const allocator = testing.allocator;
+
+    var path_buf: [96]u8 = undefined;
+    const root_path = tmpPath(&path_buf, "tamper");
+    defer std.fs.cwd().deleteTree(root_path) catch {};
+    try std.fs.cwd().makePath(root_path);
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/store", .{root_path});
+    defer allocator.free(store_dir);
+    const store = try ls.batch_store_fs.FsBatchStore.init(allocator, store_dir);
+    defer store.deinit();
+
+    // Hand-craft a manifest pointing at a bad-sha db key.
+    try store.batchStore().put(
+        "cluster/snapshots/AAAA/acme/app.db",
+        "this isn't a valid sqlite db, doesn't matter",
+    );
+    try store.batchStore().put(
+        "cluster/snapshots/AAAA/manifest.json",
+        \\{"v":1,"snap_id":"AAAA","captured_at_ms":1,"willemt_compaction_floor":0,"willemt_term":0,
+        \\"tenants":{"acme":{"db_key":"cluster/snapshots/AAAA/acme/app.db",
+        \\"db_sha256":"00000000000000000000000000000000000000000000000000000000deadbeef",
+        \\"db_size":99,"snapshot_idx":0}}}
+        ,
+    );
+
+    const stage_dir = try std.fmt.allocPrint(allocator, "{s}/stage", .{root_path});
+    defer allocator.free(stage_dir);
+    try testing.expectError(Error.InvalidManifest, restore(
+        allocator,
+        store.batchStore(),
+        "AAAA",
+        root_path,
+        stage_dir,
+    ));
+}
+
 test "encode + decode manifest round-trips with one tenant" {
     var m = Manifest{
         .allocator = testing.allocator,
@@ -617,9 +1099,14 @@ test "capture: end-to-end against FsBatchStore round-trips a tenant db" {
     const store = try ls.batch_store_fs.FsBatchStore.init(allocator, store_dir);
     defer store.deinit();
 
+    // Build the (id, store) slice from the warmed ApplyCtx caches.
+    const sources = try tenantSourcesFromApplyCtx(allocator, &apply_ctx);
+    defer allocator.free(sources);
+
     var captured = try capture(
         allocator,
-        &apply_ctx,
+        sources,
+        apply_ctx.root_store,
         store.batchStore(),
         stage_dir,
         100,

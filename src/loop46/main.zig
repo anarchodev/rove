@@ -64,6 +64,8 @@ const h2_mod = @import("rove-h2");
 const cli_mod = @import("cli.zig");
 const tls_dev = @import("tls_dev.zig");
 const seed_mod = @import("seed.zig");
+const restore_cli = @import("restore_cli.zig");
+const snapshot_cli = @import("snapshot_cli.zig");
 
 // Demo + benchmark tenants used to live inline as Zig string literals
 // here. They now live as real `.mjs` files under
@@ -549,6 +551,53 @@ fn dispatchSubcommand(
                 try cli_mod.printUsage();
             } else {
                 std.debug.print("error: seed: {s}\n", .{@errorName(err)});
+            }
+            std.process.exit(2);
+        };
+        return .handled;
+    }
+
+    if (std.mem.eql(u8, cmd, "snapshot")) {
+        snapshot_cli.runSnapshot(allocator, sub_args) catch |err| {
+            if (err == error.Usage) {
+                std.debug.print(
+                    \\usage: loop46 snapshot --data-dir <path>
+                    \\                       [--snapshot-dir <path>]
+                    \\                       [--apply-position <N>]
+                    \\                       [--willemt-term <N>]
+                    \\
+                    \\Walks {{data_dir}}/* for tenant subdirs, VACUUM-INTOs each
+                    \\app.db + __root__.db, sha256s + uploads to a BatchStore
+                    \\(BLOB_BACKEND=fs|s3, with optional SNAPSHOT_S3_KEY_PREFIX
+                    \\for s3 namespacing), writes a manifest under
+                    \\cluster/snapshots/{{snap_id}}/manifest.json. Operator can
+                    \\later restore via loop46 restore-from-snapshot --snap-id ...
+                    \\
+                , .{});
+            } else {
+                std.debug.print("error: snapshot: {s}\n", .{@errorName(err)});
+            }
+            std.process.exit(2);
+        };
+        return .handled;
+    }
+
+    if (std.mem.eql(u8, cmd, "restore-from-snapshot")) {
+        restore_cli.runRestore(allocator, sub_args) catch |err| {
+            if (err == error.Usage) {
+                std.debug.print(
+                    \\usage: loop46 restore-from-snapshot --snap-id <id>
+                    \\                                    --data-dir <path>
+                    \\                                    [--snapshot-dir <path>]
+                    \\
+                    \\With BLOB_BACKEND=fs (default) the snapshot store reads
+                    \\from --snapshot-dir (defaults to {{data_dir}}/.snapshots).
+                    \\With BLOB_BACKEND=s3 the standard S3 env vars apply, plus
+                    \\optional SNAPSHOT_S3_KEY_PREFIX for bucket namespacing.
+                    \\
+                , .{});
+            } else {
+                std.debug.print("error: restore-from-snapshot: {s}\n", .{@errorName(err)});
             }
             std.process.exit(2);
         };

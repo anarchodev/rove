@@ -404,11 +404,33 @@ pub const USAGE =
     \\  seed                        provision tenants from a JSON manifest into
     \\                              an offline data dir (one-shot, run before
     \\                              `loop46 worker`)
+    \\  snapshot                    capture a snapshot of every tenant's app.db
+    \\                              + __root__.db into a BatchStore (fs or s3
+    \\                              via BLOB_BACKEND)
+    \\  restore-from-snapshot       install a captured snapshot into a fresh
+    \\                              data dir (disaster recovery / rollback)
     \\  help                        print this message
     \\
     \\seed flags:
     \\  --data-dir <path>           target data dir (will be created if missing)
     \\  --manifest <path>           JSON manifest listing tenants + their files
+    \\
+    \\snapshot flags:
+    \\  --data-dir <path>           data dir to capture from
+    \\  --snapshot-dir <path>       (BLOB_BACKEND=fs only) snapshot store dir;
+    \\                              defaults to {data_dir}/.snapshots
+    \\  --apply-position <N>        willemt commit idx to record in the
+    \\                              manifest (default 0; for periodic captures
+    \\                              against a running raft node, future work
+    \\                              wires the live value)
+    \\  --willemt-term <N>          raft term to record (default 0)
+    \\
+    \\restore-from-snapshot flags:
+    \\  --snap-id <id>              snapshot id (the value `capture` returned)
+    \\  --data-dir <path>           target data dir (must NOT contain prior tenant
+    \\                              dbs — typically a fresh node)
+    \\  --snapshot-dir <path>       (BLOB_BACKEND=fs only) snapshot store dir;
+    \\                              defaults to {data_dir}/.snapshots
     \\
     \\common worker flags:
     \\  --node-id <n>               index into --peers (default 0)

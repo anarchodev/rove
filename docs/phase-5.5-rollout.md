@@ -103,18 +103,24 @@ sub-plan's migration order. No big-bang cutovers between them.
   `--files-listen` retired from `loop46`. Dev (`scripts/dev_serve.sh`)
   + production (`scripts/rove-loop46-serve.sh`) helpers fork-exec
   the standalone alongside the worker for one-command startup.
-- **(c) snapshot — steps 1-3a done.** `_apply_state` per-store
-  table + per-entry idempotency filter (step 1), in-memory
-  `ApplyCtx.tenant_apply_idx` mirror (step 2), and the
-  end-to-end S3 / fs capture orchestrator
-  (`src/loop46/snapshot.zig`, step 3a — VACUUM INTO each
-  per-tenant app.db, content-address, PUT to BatchStore at
-  `cluster/snapshots/{snap_id}/...` plus a manifest JSON).
-  Always-refreshes every tenant's `snapshot_idx`; the
-  by-reference reuse for unchanged tenants + raft log
-  compaction wiring + periodic capture loop are step 3b. The
-  follower-side load + `loop46 restore-from-snapshot` CLI is
-  step 4.
+- **(c) snapshot — steps 1-4 done; periodic loop deferred.**
+  `_apply_state` per-store table + per-entry idempotency filter
+  (step 1), in-memory `ApplyCtx.tenant_apply_idx` mirror
+  (step 2), end-to-end capture orchestrator + manifest JSON
+  shape (`src/loop46/snapshot.zig`, step 3a), follower-side
+  `restore()` + atomic-rename + `_apply_state` stamp (step 4),
+  and operator CLIs `loop46 snapshot --data-dir ...` /
+  `loop46 restore-from-snapshot --snap-id ...` driven by the
+  same `BLOB_BACKEND` env contract as files / logs (S3 with
+  `SNAPSHOT_S3_KEY_PREFIX` namespacing or fs at
+  `{data_dir}/.snapshots/`). `scripts/snapshot_smoke.sh`
+  exercises seed → capture → restore round-trip against
+  either backend; verified end-to-end against real OVH S3.
+  By-reference reuse for unchanged tenants, an in-process
+  periodic capture loop, and the willemt
+  `raft_begin_snapshot` / `raft_end_snapshot` log compaction
+  wiring all stay deferred — the operator-CLI form is enough
+  for crontab-driven captures pre-launch.
 
 **Next pickup:**
 1. **(c) snapshot — see `docs/snapshot-plan.md`.** With (a) and
