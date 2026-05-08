@@ -191,6 +191,11 @@ pub fn build(b: *std.Build) void {
     log_server_mod.linkSystemLibrary("nghttp2", .{});
     log_server_mod.linkSystemLibrary("ssl", .{});
     log_server_mod.linkSystemLibrary("crypto", .{});
+    // Per-record raw-deflate compression on log batch payloads.
+    // Zig 0.15.x stdlib's `flate.Compress.drain` is incomplete
+    // (panics on payloads larger than ~32 KB lookahead), so we use
+    // libz directly. Already a transitive dep via nghttp2.
+    log_server_mod.linkSystemLibrary("z", .{});
     log_server_mod.addImport("rove", rove_mod);
     log_server_mod.addImport("rove-io", io_mod);
     log_server_mod.addImport("rove-h2", h2_mod);

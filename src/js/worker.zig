@@ -584,6 +584,7 @@ pub fn Worker(comptime opts: Options) type {
         /// the worker is configured without a log backend.
         flusher_thread: ?std.Thread = null,
         flusher_should_stop: std.atomic.Value(bool) = .init(false),
+        flusher_done: std.atomic.Value(bool) = .init(false),
         flusher_wake: std.Thread.ResetEvent = .{},
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
@@ -670,9 +671,14 @@ pub fn Worker(comptime opts: Options) type {
         /// thread — the dispatch path stays free of synchronous
         /// network I/O.
         ///
-        /// Exits when `flusher_should_stop` flips true. The final
-        /// `flushLogs` after the loop drains anything queued during
-        /// shutdown so we don't lose the last partial batch.
+        /// Exits when `flusher_should_stop` flips true. We deliberately
+        /// do NOT do a final blocking drain on shutdown — the last
+        /// partial batch is best-effort, and a graceful stop must not
+        /// block the worker process on a multi-second S3 PUT (which
+        /// would in turn block whatever supervisor is waiting on the
+        /// child). This matches the stated lossy-on-node-failure
+        /// semantics in `docs/logs-plan.md`: in-flight log records
+        /// can be lost on shutdown.
         fn flusherLoop(self: *Self) void {
             const FLUSHER_TICK_NS: u64 = 50 * std.time.ns_per_ms;
             while (!self.flusher_should_stop.load(.acquire)) {
@@ -682,24 +688,42 @@ pub fn Worker(comptime opts: Options) type {
                 self.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
                 self.flusher_wake.reset();
             }
-            // Drain anything queued between the last tick and the
-            // shutdown signal so we don't lose partial batches on a
-            // graceful stop.
-            _ = flushLogs(self) catch |err| {
-                std.log.warn("rove-js flusher: final flushLogs failed: {s}", .{@errorName(err)});
-            };
+            self.flusher_done.store(true, .release);
         }
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
-            // Signal the flusher thread to stop, wake it once so it
-            // notices the flag promptly, then join. The flusher's
-            // post-loop drain catches anything appended since its
-            // last tick.
+            // Signal the flusher thread to stop, wake it, then poll
+            // its `flusher_done` ack with a short deadline. If the
+            // flusher is mid-PUT (multi-second S3 round trip), we
+            // don't block worker shutdown on it — supervisors doing
+            // `kill $pid; wait $pid` get a prompt exit. We detach
+            // and leak the unfinished thread; the OS reaps it when
+            // the process exits. The last partial batch is
+            // best-effort per `docs/logs-plan.md`'s lossy semantics.
             if (self.flusher_thread) |t| {
                 self.flusher_should_stop.store(true, .release);
                 self.flusher_wake.set();
-                t.join();
+                const SHUTDOWN_GRACE_MS: u64 = 200;
+                const deadline_ns: i128 = std.time.nanoTimestamp() +
+                    @as(i128, SHUTDOWN_GRACE_MS) * std.time.ns_per_ms;
+                while (!self.flusher_done.load(.acquire)) {
+                    if (std.time.nanoTimestamp() > deadline_ns) break;
+                    std.Thread.sleep(2 * std.time.ns_per_ms);
+                }
+                if (self.flusher_done.load(.acquire)) {
+                    t.join();
+                } else {
+                    std.log.warn("rove-js: flusher didn't ack within {d}ms; detaching", .{SHUTDOWN_GRACE_MS});
+                    t.detach();
+                    // Detached flusher still holds references into
+                    // `self.tenant_logs` / `self.log_batch_store` /
+                    // `self.allocator`. Cleanest move is to leak the
+                    // worker struct entirely — process is exiting
+                    // anyway, kernel reclaims the memory.
+                    self.flusher_thread = null;
+                    return;
+                }
                 self.flusher_thread = null;
             }
             self.limiter.deinit();

@@ -781,6 +781,12 @@ fn runUntilStopped(tls_config: ?*h2_mod.TlsConfig) void {
     }
 }
 
+/// Keep `std.log.info` calls live in ReleaseFast so operators can
+/// see startup banners + per-PUT diagnostics without rebuilding at
+/// ReleaseSafe (which is ~3× slower and unfit for the production
+/// path). `.warn` and `.err` stay enabled at every optimize level.
+pub const std_options: std.Options = .{ .log_level = .info };
+
 pub fn main() !void {
     // c_allocator (glibc malloc) — NOT DebugAllocator. The latter
     // spends ~20% of CPU in stack-trace capture per alloc even in

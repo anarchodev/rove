@@ -38,6 +38,9 @@ const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const indexer_mod = @import("indexer.zig");
 const jwt = @import("rove-jwt");
+const zlib = @cImport({
+    @cInclude("zlib.h");
+});
 
 const LogH2 = h2.H2(.{});
 
@@ -399,7 +402,9 @@ fn handleShow(
     defer maybe.?.deinit(allocator);
     const row = maybe.?;
 
-    // Range-read the matching ndjson line out of the batch payload.
+    // Range-read the compressed frame out of the batch payload.
+    // Each record is its own raw-deflate stream; the sidecar's
+    // `(offset, length)` brackets exactly one frame.
     const payload = store.getRange(row.ndjson_key, row.offset, row.length, allocator) catch |err| {
         const msg = try std.fmt.allocPrint(
             allocator,
@@ -409,25 +414,73 @@ fn handleShow(
         try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
         return;
     };
-    // Strip trailing newline if present so the JSON we hand back is
-    // exactly one record's bytes (the ndjson layout puts `\n` at the
-    // tail of every line).
-    const trimmed = if (payload.len > 0 and payload[payload.len - 1] == '\n')
-        payload[0 .. payload.len - 1]
-    else
-        payload;
+    defer allocator.free(payload);
+
+    const decompressed = decompressRawDeflate(allocator, payload) catch |err| {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "frame decompress failed for {s}: {s}\n",
+            .{ row.ndjson_key, @errorName(err) },
+        );
+        try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
+        return;
+    };
+    defer allocator.free(decompressed);
 
     // Wrap in `{record: ...}` so callers can branch on shape later
-    // (e.g. error responses). Slightly redundant for the happy path
-    // but cheaper than re-parsing the line at the consumer.
+    // (e.g. error responses).
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, "{\"record\":");
-    try buf.appendSlice(allocator, trimmed);
+    try buf.appendSlice(allocator, decompressed);
     try buf.appendSlice(allocator, "}\n");
-    allocator.free(payload);
     const out = try buf.toOwnedSlice(allocator);
     try setResponseOwned(server, ent, sid, sess, 200, out, cfg);
+}
+
+/// Decode one raw-deflate frame (the per-record framing the worker
+/// emits, see `flush_writer.compressRawDeflateAppend`). Uses libz
+/// directly — keeps both ends of the wire format on the same
+/// implementation (Zig stdlib's `flate.Compress` is incomplete in
+/// 0.15.x; see `feedback`/memory). The full decompressed JSON is
+/// small (≤ a few hundred KB after the 256 KB body cap) so we grow
+/// the output buffer in chunks rather than streaming.
+fn decompressRawDeflate(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+    var z: zlib.z_stream = std.mem.zeroes(zlib.z_stream);
+    // -15 = raw deflate window, matches the writer side.
+    if (zlib.inflateInit2_(
+        &z,
+        -15,
+        zlib.zlibVersion(),
+        @sizeOf(zlib.z_stream),
+    ) != zlib.Z_OK) return error.InflateInit;
+    defer _ = zlib.inflateEnd(&z);
+
+    z.next_in = @constCast(src.ptr);
+    z.avail_in = @intCast(src.len);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    // Initial guess: 4× compressed size, grown in 64 KB chunks if
+    // we underestimate. JSON-of-base64 typically deflates 4-6×.
+    var capacity: usize = @max(src.len * 4, 4096);
+    try out.ensureTotalCapacity(allocator, capacity);
+    out.items.len = capacity;
+    var written: usize = 0;
+    while (true) {
+        z.next_out = out.items[written..].ptr;
+        z.avail_out = @intCast(capacity - written);
+        const rc = zlib.inflate(&z, zlib.Z_NO_FLUSH);
+        written = capacity - z.avail_out;
+        if (rc == zlib.Z_STREAM_END) break;
+        if (rc != zlib.Z_OK) return error.InflateBadData;
+        // Need more space — grow.
+        capacity += 64 * 1024;
+        try out.ensureTotalCapacity(allocator, capacity);
+        out.items.len = capacity;
+    }
+    out.items.len = written;
+    return out.toOwnedSlice(allocator);
 }
 
 /// Total record count for a tenant (Phase 5.5 a, A2). Plain decimal

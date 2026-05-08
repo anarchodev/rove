@@ -19,11 +19,15 @@ const std = @import("std");
 const log_mod = @import("rove-log");
 const batch_store_mod = @import("batch_store.zig");
 const sidecar = @import("sidecar.zig");
+const c = @cImport({
+    @cInclude("zlib.h");
+});
 
 pub const Error = error{
     InvalidRecord,
     Io,
     OutOfMemory,
+    WriteFailed,
 };
 
 /// Build + PUT a batch's `.ndjson` payload + `.idx.json` sidecar.
@@ -63,9 +67,17 @@ pub fn writeBatch(
         return Error.OutOfMemory;
     defer allocator.free(idx_records);
 
+    // Per-record JSON scratch buffer. Reused across records;
+    // grows to the largest record's size and stays there for the
+    // lifetime of writeBatch.
+    var json_scratch: std.ArrayList(u8) = .empty;
+    defer json_scratch.deinit(allocator);
+
     for (sorted, 0..) |r, i| {
+        json_scratch.clearRetainingCapacity();
+        encodeRecordJson(allocator, &json_scratch, &r) catch return Error.OutOfMemory;
         const offset = ndjson.items.len;
-        encodeRecordLine(allocator, &ndjson, &r) catch return Error.OutOfMemory;
+        try compressRawDeflateAppend(allocator, &ndjson, json_scratch.items);
         const length = ndjson.items.len - offset;
         idx_records[i] = .{
             .tenant_id = r.tenant_id,
@@ -152,11 +164,11 @@ fn outcomeName(o: log_mod.Outcome) []const u8 {
     };
 }
 
-/// Emit one record as a single JSON object followed by `\n` (ndjson).
+/// Emit one record as a single JSON object (no trailing newline —
+/// the per-record deflate framing replaces ndjson line framing).
 /// Schema mirrors what `log_server/thread.zig`'s `writeRecordJson`
-/// produces, plus the request_id rendered as a u64 integer (not the
-/// hex string — readable + matches the index column type).
-fn encodeRecordLine(
+/// produces, plus the request_id rendered as a u64 integer.
+fn encodeRecordJson(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(u8),
     r: *const log_mod.LogRecord,
@@ -183,7 +195,56 @@ fn encodeRecordLine(
     try writeJsonString(w, r.exception);
     try w.writeAll(",\"tapes\":");
     try writeTapePayloads(allocator, w, &r.tapes);
-    try w.writeAll("}\n");
+    try w.writeAll("}");
+}
+
+/// Compress `src` as a raw-deflate stream and append the bytes to
+/// `out`. Each call produces a self-terminating deflate stream
+/// (BFINAL set on the final block); concatenating multiple frames
+/// in `out` is fine because the sidecar's `(offset, length)` per
+/// record bounds each Range GET to exactly one frame.
+///
+/// Uses libz directly — Zig 0.15.x stdlib's `flate.Compress.drain`
+/// has `@panic("TODO")` in the tokenization path and only works on
+/// inputs smaller than the lookahead window. Real log-batch records
+/// (with inline base64 tape bytes) are well above that.
+fn compressRawDeflateAppend(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    src: []const u8,
+) !void {
+    var z: c.z_stream = std.mem.zeroes(c.z_stream);
+    // windowBits = -15 selects raw deflate (no zlib / gzip header
+    // or trailer). Level 1 = fastest deflate compression.
+    if (c.deflateInit2_(
+        &z,
+        1,
+        c.Z_DEFLATED,
+        -15,
+        8,
+        c.Z_DEFAULT_STRATEGY,
+        c.zlibVersion(),
+        @sizeOf(c.z_stream),
+    ) != c.Z_OK) return Error.Io;
+    defer _ = c.deflateEnd(&z);
+
+    z.next_in = @constCast(src.ptr);
+    z.avail_in = @intCast(src.len);
+
+    // Worst-case bound: src + 5 bytes per 16 KB block + 6 bytes
+    // overhead. zlib's `deflateBound` computes it for us.
+    const upper_bound: usize = c.deflateBound(&z, @intCast(src.len));
+    const start_len = out.items.len;
+    try out.ensureUnusedCapacity(allocator, upper_bound);
+    out.items.len = start_len + upper_bound;
+    z.next_out = out.items[start_len..].ptr;
+    z.avail_out = @intCast(upper_bound);
+
+    const rc = c.deflate(&z, c.Z_FINISH);
+    if (rc != c.Z_STREAM_END) return Error.Io;
+
+    const written = upper_bound - z.avail_out;
+    out.items.len = start_len + written;
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
@@ -312,12 +373,25 @@ test "writeBatch puts ndjson + sidecar with correct offsets" {
     defer a.free(ndjson);
     try testing.expectEqual(idx.ndjson_size, ndjson.len);
 
-    // Range-read using the sidecar offsets returns the same bytes
-    // for each record line.
-    for (idx.records) |rec| {
-        const slice = ndjson[rec.offset .. rec.offset + rec.length];
-        // Last byte is '\n' (ndjson framing).
-        try testing.expectEqual(@as(u8, '\n'), slice[slice.len - 1]);
+    // Range-read using the sidecar offsets returns one self-contained
+    // deflate frame per record. Decompress the first one and check
+    // the JSON shape — proves the wire format round-trips end-to-end.
+    {
+        const frame = ndjson[idx.records[0].offset .. idx.records[0].offset + idx.records[0].length];
+        var z: c.z_stream = std.mem.zeroes(c.z_stream);
+        try testing.expectEqual(@as(c_int, c.Z_OK), c.inflateInit2_(&z, -15, c.zlibVersion(), @sizeOf(c.z_stream)));
+        defer _ = c.inflateEnd(&z);
+        z.next_in = @constCast(frame.ptr);
+        z.avail_in = @intCast(frame.len);
+        var out_buf: [4096]u8 = undefined;
+        z.next_out = &out_buf;
+        z.avail_out = out_buf.len;
+        const rc = c.inflate(&z, c.Z_FINISH);
+        try testing.expectEqual(@as(c_int, c.Z_STREAM_END), rc);
+        const written = out_buf.len - z.avail_out;
+        const json = out_buf[0..written];
+        try testing.expect(std.mem.startsWith(u8, json, "{\"tenant_id\":"));
+        try testing.expect(std.mem.endsWith(u8, json, "}"));
     }
 
     // Sha256 in sidecar matches actual payload.
