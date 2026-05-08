@@ -33,9 +33,20 @@ for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY S3_BUCKET S3_ENDPOINT S3_REGION
     fi
 done
 
-# Stable dev id used to namespace each smoke's S3 prefix. The prefix
-# itself is set by `init_cluster_addrs` once SMOKE_TAG is known.
-__smoke_dev_id="$(hostname)-$(id -u)"
+# Stable dev id used to namespace each smoke's S3 prefix. Includes a
+# short hash of the files-server-standalone binary so that rebuilding
+# (which re-embeds admin/replay handler + middleware sources) yields a
+# fresh prefix — same-binary reruns still hit the warm-S3 fast path,
+# but a binary change forces a clean redeploy. Without this, stale
+# admin bytecode in S3 survives source-level fixes (the bootstrap
+# skips redeploy when the manifest already exists).
+__smoke_fs_bin="${FS_BIN:-./zig-out/bin/files-server-standalone}"
+if [[ -x "$__smoke_fs_bin" ]]; then
+    __smoke_bin_hash="$(sha256sum "$__smoke_fs_bin" | head -c 12)"
+else
+    __smoke_bin_hash="nobin"
+fi
+__smoke_dev_id="$(hostname)-$(id -u)-${__smoke_bin_hash}"
 
 mint_services_token() {
     local resp
