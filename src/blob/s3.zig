@@ -329,23 +329,33 @@ pub const S3BlobStore = struct {
 
         std.log.debug("rove-blob s3: → {s} {s}", .{ methodName(method), url });
 
-        // HEAD must NOT pass `response_writer`. std.http.Client's
-        // `Response.reader()` correctly returns an `.ending` reader
-        // for HEAD (per RFC 7230 §3.3.3 — HEAD responses include
-        // Content-Length but no body). But `readerDecompressing` —
-        // which fetch() picks when a `response_writer` is supplied
-        // — does NOT check `method.responseHasBody()` and tries to
-        // read Content-Length bytes that never come. Against OVH
-        // that meant every HEAD blocked until the 60-second idle
-        // timeout. With response_writer = null, fetch falls into
-        // the `discardRemaining` path that uses `reader()` and
-        // returns immediately for HEAD.
+        // HEAD goes through the low-level request/send/receiveHead
+        // path so we never touch the body reader. Two stdlib bugs
+        // make `fetch()` unusable for HEAD in zig 0.15.2:
+        //
+        //   1. With `response_writer` set, fetch picks
+        //      `readerDecompressing`, which doesn't check
+        //      `method.responseHasBody()` and blocks reading
+        //      Content-Length bytes that never come (60s OVH idle
+        //      stall observed pre-c94eb64).
+        //   2. With `response_writer = null`, fetch picks the
+        //      `response.reader(&.{})` branch, which returns
+        //      `Reader.ending` — a `@constCast` of a `const` global.
+        //      `discardRemaining` then writes `r.seek = r.end` into
+        //      `.rodata` and segfaults in ReleaseSafe / ReleaseFast.
+        //
+        // The workaround: for HEAD, send the request, read the head,
+        // and return the status. No body reader is constructed.
+        if (method == .HEAD) {
+            return self.requestHead(uri, &headers);
+        }
+
         const result = self.http.fetch(.{
             .location = .{ .uri = uri },
             .method = method,
             .payload = if (body.len > 0) body else null,
             .extra_headers = &headers,
-            .response_writer = if (method == .HEAD) null else &aw.writer,
+            .response_writer = &aw.writer,
             .redirect_behavior = @enumFromInt(0),
         }) catch |err| {
             std.log.warn(
@@ -359,6 +369,42 @@ pub const S3BlobStore = struct {
         return .{
             .status = @intFromEnum(result.status),
             .body_owned = if (body_owned.len > 0) body_owned else null,
+        };
+    }
+
+    /// HEAD via `client.request()` + `sendBodiless()` + `receiveHead()`.
+    /// Bypasses `fetch()`, which is broken for HEAD in zig 0.15.2 (see
+    /// the comment in `requestAlloc`). Returns just the status; HEAD
+    /// responses carry no body we care about for `exists()` /
+    /// `delete()` validation.
+    fn requestHead(
+        self: *S3BlobStore,
+        uri: std.Uri,
+        extra_headers: []const std.http.Header,
+    ) !HttpResp {
+        var req = self.http.request(.HEAD, uri, .{
+            .extra_headers = extra_headers,
+            .redirect_behavior = @enumFromInt(0),
+        }) catch |err| {
+            std.log.warn("rove-blob s3: HEAD request init failed: {s}", .{@errorName(err)});
+            return Error.Io;
+        };
+        defer req.deinit();
+
+        req.sendBodiless() catch |err| {
+            std.log.warn("rove-blob s3: HEAD send failed: {s}", .{@errorName(err)});
+            return Error.Io;
+        };
+
+        var redirect_buf: [256]u8 = undefined;
+        const response = req.receiveHead(&redirect_buf) catch |err| {
+            std.log.warn("rove-blob s3: HEAD receiveHead failed: {s}", .{@errorName(err)});
+            return Error.Io;
+        };
+
+        return .{
+            .status = @intFromEnum(response.head.status),
+            .body_owned = null,
         };
     }
 
