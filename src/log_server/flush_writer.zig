@@ -1,19 +1,27 @@
 //! Flush writer — turns a batch of `LogRecord`s into the on-bucket
-//! shape (`{tenant}/{node}/{batch}.ndjson` payload + matching
-//! `.idx.json` sidecar) and PUTs both into a `BatchStore` (Phase 5.5
-//! a, step 3).
+//! shape (`_logs/{node}/{batch}.ndjson` with the index sidecar
+//! embedded as a fixed-size header prefix) and PUTs it into a
+//! `BatchStore` as a single object.
 //!
-//! Used from the worker's `flushLogs` when `log.backend = s3`. The
-//! ordering matters per `docs/logs-plan.md` §3.2: payload first,
-//! sidecar second. A crash between the two leaves an orphan
-//! `.ndjson` with no sidecar — invisible to the indexer (which only
-//! keys off sidecars) and reapable by a future janitor pass.
+//! Wire format (Phase 5.5(a-3)):
+//!
+//!   [4 bytes]  sidecar_size_le  — u32, little-endian
+//!   [N bytes]  sidecar JSON     — same shape as the old `.idx.json`
+//!                                 minus `ndjson_key` (now self-
+//!                                 referential)
+//!   [M bytes]  concatenated raw-deflate frames
+//!                                — one self-terminating frame per
+//!                                  record, BFINAL=1; record offsets
+//!                                  in the sidecar are file-relative
+//!                                  (i.e. include `4 + sidecar_size`)
+//!
+//! One PUT per flush replaces the previous ndjson + .idx.json pair.
+//! The orphan-on-crash story is bounded by the BatchStore's atomic
+//! semantics — partial PUTs surface as 4xx/5xx and the in-memory
+//! records are dropped per the lossy-on-failure semantics in
+//! `docs/logs-plan.md`.
 //!
 //! The writer is allocator-agnostic + stateless; one call per flush.
-//! No retries here — failed PUTs surface as errors that the worker
-//! logs and continues past, with the records already drained from
-//! the buffer (lost). Matches the stated lossy-on-node-failure
-//! semantics in `docs/logs-plan.md`.
 
 const std = @import("std");
 const log_mod = @import("rove-log");
@@ -30,15 +38,18 @@ pub const Error = error{
     WriteFailed,
 };
 
-/// Build + PUT a batch's `.ndjson` payload + `.idx.json` sidecar.
+/// Build + PUT a batch as a single embedded-sidecar object.
 /// `records` are NOT consumed (caller deinits); their `[]const u8`
 /// fields must outlive this call.
 ///
-/// Phase 5.5(a-2) interleaved-per-node layout: every record
-/// in `records` carries its own `tenant_id`. The object key path
-/// is `_logs/{node_id}/{batch_id}.{ext}` — one ndjson per node per
-/// flush window regardless of how many tenants contributed.
-/// `node_id` is the raft node id zero-padded to u32 hex (8 chars).
+/// Object layout: `[u32 LE sidecar_size][sidecar JSON][raw-deflate frames]`.
+/// One PUT to `_logs/{node_id}/{batch_id}.ndjson`; no separate sidecar
+/// object. Record offsets in the sidecar JSON are frame-relative
+/// (i.e. into the deflate-frames region only); the indexer adds
+/// `4 + sidecar_size` when populating `log_index` so /show's stored
+/// offset is file-relative.
+///
+/// `node_id_hex` is the raft node id zero-padded to u32 hex (8 chars).
 /// `flush_unix_ms` is millis-since-epoch at flush time, used to
 /// disambiguate batch_ids if a node's request_id allocator ever
 /// resets.
@@ -51,17 +62,18 @@ pub fn writeBatch(
 ) Error!void {
     if (records.len == 0) return;
 
-    // Per §2.3: records ordered by ascending received_ns. The buffer
-    // is appended in dispatch order, which IS receive order for a
-    // single worker thread, so sorting is normally a no-op. Sort
-    // defensively in case future code path appends out of order.
+    // Per `docs/logs-plan.md` §2.2: records ordered by ascending
+    // received_ns. The buffer is appended in dispatch order, which
+    // IS receive order for a single worker thread, so sorting is
+    // normally a no-op. Sort defensively in case a future code path
+    // appends out of order.
     const sorted = allocator.dupe(log_mod.LogRecord, records) catch return Error.OutOfMemory;
     defer allocator.free(sorted);
     std.mem.sort(log_mod.LogRecord, sorted, {}, lessByReceivedNs);
 
-    // ── ndjson payload ────────────────────────────────────────────
-    var ndjson = std.ArrayList(u8).empty;
-    defer ndjson.deinit(allocator);
+    // ── frames region (concatenated raw-deflate frames) ──────────
+    var frames = std.ArrayList(u8).empty;
+    defer frames.deinit(allocator);
 
     const idx_records = allocator.alloc(sidecar.Record, sorted.len) catch
         return Error.OutOfMemory;
@@ -76,9 +88,9 @@ pub fn writeBatch(
     for (sorted, 0..) |r, i| {
         json_scratch.clearRetainingCapacity();
         encodeRecordJson(allocator, &json_scratch, &r) catch return Error.OutOfMemory;
-        const offset = ndjson.items.len;
-        try compressRawDeflateAppend(allocator, &ndjson, json_scratch.items);
-        const length = ndjson.items.len - offset;
+        const offset = frames.items.len;
+        try compressRawDeflateAppend(allocator, &frames, json_scratch.items);
+        const length = frames.items.len - offset;
         idx_records[i] = .{
             .tenant_id = r.tenant_id,
             .request_id = r.request_id,
@@ -96,7 +108,7 @@ pub fn writeBatch(
     }
 
     var sha: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(ndjson.items, &sha, .{});
+    std.crypto.hash.sha2.Sha256.hash(frames.items, &sha, .{});
     const sha_hex = bytesToHex(allocator, sha[0..]) catch return Error.OutOfMemory;
     defer allocator.free(sha_hex);
 
@@ -113,25 +125,17 @@ pub fn writeBatch(
     ) catch return Error.OutOfMemory;
     defer allocator.free(batch_id);
 
-    const ndjson_key = std.fmt.allocPrint(
+    const obj_key = std.fmt.allocPrint(
         allocator,
         "_logs/{s}/{s}.ndjson",
         .{ node_id_hex, batch_id },
     ) catch return Error.OutOfMemory;
-    defer allocator.free(ndjson_key);
-
-    const idx_key = std.fmt.allocPrint(
-        allocator,
-        "_logs/{s}/{s}.idx.json",
-        .{ node_id_hex, batch_id },
-    ) catch return Error.OutOfMemory;
-    defer allocator.free(idx_key);
+    defer allocator.free(obj_key);
 
     const idx_file = sidecar.IdxFile{
         .node_id = node_id_hex,
         .batch_id = batch_id,
-        .ndjson_key = ndjson_key,
-        .ndjson_size = ndjson.items.len,
+        .ndjson_size = frames.items.len,
         .ndjson_sha256 = sha_hex,
         .first_received_ns = sorted[0].received_ns,
         .last_received_ns = sorted[sorted.len - 1].received_ns,
@@ -140,12 +144,16 @@ pub fn writeBatch(
     const sidecar_bytes = sidecar.encode(allocator, &idx_file) catch return Error.OutOfMemory;
     defer allocator.free(sidecar_bytes);
 
-    // PUT order: payload first. An orphan ndjson is invisible (the
-    // indexer only iterates `.idx.json`); an orphan sidecar pointing
-    // at a missing payload would 404 every /show — the case we
-    // mustn't ship.
-    store.put(ndjson_key, ndjson.items) catch return Error.Io;
-    store.put(idx_key, sidecar_bytes) catch return Error.Io;
+    // Final object: [u32 LE sidecar_size][sidecar JSON][frames].
+    const sidecar_size = std.math.cast(u32, sidecar_bytes.len) orelse return Error.WriteFailed;
+    const total_len = 4 + sidecar_bytes.len + frames.items.len;
+    const obj = allocator.alloc(u8, total_len) catch return Error.OutOfMemory;
+    defer allocator.free(obj);
+    std.mem.writeInt(u32, obj[0..4], sidecar_size, .little);
+    @memcpy(obj[4 .. 4 + sidecar_bytes.len], sidecar_bytes);
+    @memcpy(obj[4 + sidecar_bytes.len ..], frames.items);
+
+    store.put(obj_key, obj) catch return Error.Io;
 }
 
 fn lessByReceivedNs(_: void, a: log_mod.LogRecord, b: log_mod.LogRecord) bool {
@@ -342,7 +350,7 @@ fn makeRecord(allocator: std.mem.Allocator, id: u64, path: []const u8) !log_mod.
     };
 }
 
-test "writeBatch puts ndjson + sidecar with correct offsets" {
+test "writeBatch emits one object with embedded sidecar + frames" {
     const a = testing.allocator;
     const m = try batch_store_mod.MemoryBatchStore.init(a);
     defer m.deinit();
@@ -356,10 +364,23 @@ test "writeBatch puts ndjson + sidecar with correct offsets" {
 
     try writeBatch(a, store, "00000001", &records, 1730764800000);
 
-    // Sidecar present + parses.
-    const sidecar_bytes = try store.get("_logs/00000001/00000000000000000001-1730764800000.idx.json", a);
-    defer a.free(sidecar_bytes);
-    var idx = try sidecar.parse(a, sidecar_bytes);
+    // Single object exists at the .ndjson key — no separate .idx.json.
+    const obj_key = "_logs/00000001/00000000000000000001-1730764800000.ndjson";
+    const obj = try store.get(obj_key, a);
+    defer a.free(obj);
+
+    // Confirm there's no separate sidecar object.
+    const list = try store.list("", "", 16, a);
+    defer batch_store_mod.freeListResult(a, list);
+    try testing.expectEqual(@as(usize, 1), list.len);
+    try testing.expectEqualStrings(obj_key, list[0]);
+
+    // Header layout: [u32 LE sidecar_size][sidecar JSON][frames].
+    try testing.expect(obj.len >= 4);
+    const sidecar_size = std.mem.readInt(u32, obj[0..4], .little);
+    try testing.expect(4 + sidecar_size <= obj.len);
+
+    var idx = try sidecar.parse(a, obj[4 .. 4 + sidecar_size]);
     defer idx.deinit(a);
 
     try testing.expectEqualStrings("acme", idx.records[0].tenant_id);
@@ -368,16 +389,14 @@ test "writeBatch puts ndjson + sidecar with correct offsets" {
     try testing.expectEqual(@as(u64, 1), idx.records[0].request_id);
     try testing.expectEqual(@as(u64, 2), idx.records[1].request_id);
 
-    // Offsets line up with the ndjson layout.
-    const ndjson = try store.get("_logs/00000001/00000000000000000001-1730764800000.ndjson", a);
-    defer a.free(ndjson);
-    try testing.expectEqual(idx.ndjson_size, ndjson.len);
+    const frames = obj[4 + sidecar_size ..];
+    try testing.expectEqual(idx.ndjson_size, frames.len);
 
     // Range-read using the sidecar offsets returns one self-contained
     // deflate frame per record. Decompress the first one and check
     // the JSON shape — proves the wire format round-trips end-to-end.
     {
-        const frame = ndjson[idx.records[0].offset .. idx.records[0].offset + idx.records[0].length];
+        const frame = frames[idx.records[0].offset .. idx.records[0].offset + idx.records[0].length];
         var z: c.z_stream = std.mem.zeroes(c.z_stream);
         try testing.expectEqual(@as(c_int, c.Z_OK), c.inflateInit2_(&z, -15, c.zlibVersion(), @sizeOf(c.z_stream)));
         defer _ = c.inflateEnd(&z);
@@ -394,9 +413,9 @@ test "writeBatch puts ndjson + sidecar with correct offsets" {
         try testing.expect(std.mem.endsWith(u8, json, "}"));
     }
 
-    // Sha256 in sidecar matches actual payload.
+    // Sha256 in sidecar matches the frames-region bytes.
     var sha: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(ndjson, &sha, .{});
+    std.crypto.hash.sha2.Sha256.hash(frames, &sha, .{});
     const expected_hex = try bytesToHex(a, sha[0..]);
     defer a.free(expected_hex);
     try testing.expectEqualStrings(expected_hex, idx.ndjson_sha256);
@@ -433,9 +452,10 @@ test "writeBatch sorts records by received_ns before encoding" {
     try writeBatch(a, store, "00000001", &records, 1730764800000);
 
     // batch_id = first_request_id (after sort) → record at received=1000 → request_id=6.
-    const sidecar_bytes = try store.get("_logs/00000001/00000000000000000006-1730764800000.idx.json", a);
-    defer a.free(sidecar_bytes);
-    var idx = try sidecar.parse(a, sidecar_bytes);
+    const obj = try store.get("_logs/00000001/00000000000000000006-1730764800000.ndjson", a);
+    defer a.free(obj);
+    const sidecar_size = std.mem.readInt(u32, obj[0..4], .little);
+    var idx = try sidecar.parse(a, obj[4 .. 4 + sidecar_size]);
     defer idx.deinit(a);
 
     try testing.expectEqual(@as(i64, 1000), idx.first_received_ns);

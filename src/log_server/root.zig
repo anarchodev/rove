@@ -12,17 +12,18 @@
 //!
 //! Sub-modules:
 //!
-//! - `sidecar`    — JSON wire format for `.idx.json` files
+//! - `sidecar`    — JSON wire format for the embedded sidecar header
+//!                 inside each `.ndjson` batch object
 //! - `batch_store` / `batch_store_s3` / `batch_store_fs` — vtable
-//!                 + S3, fs, and (test-only) memory backends
-//!                 holding `.ndjson` payloads + `.idx.json`
-//!                 sidecars per tenant
+//!                 + S3, fs, and (test-only) memory backends holding
+//!                 the per-flush `.ndjson` objects
 //! - `index_db`   — SQLite schema + queries (`queryList`,
 //!                 `queryShow`, `queryCount`)
 //! - `indexer`    — background loop that polls the BatchStore for
-//!                 new sidecars and inserts into IndexDb
+//!                 new `.ndjson` objects, range-reads the embedded
+//!                 sidecar prefix, and inserts into IndexDb
 //! - `standalone` — h2 server (`/v1/{tenant}/{list,show,count,blob}`)
-//! - `flush_writer` — worker-side ndjson + sidecar encoder
+//! - `flush_writer` — worker-side encoder ([u32 size][sidecar JSON][frames])
 
 pub const sidecar = @import("sidecar.zig");
 pub const batch_store = @import("batch_store.zig");

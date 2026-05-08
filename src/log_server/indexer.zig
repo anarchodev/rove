@@ -1,24 +1,29 @@
-//! Indexer — polling loop that walks the batch store for `.idx.json`
-//! sidecars and inserts them into `log_index.db` (Phase 5.5 a).
+//! Indexer — polling loop that walks the batch store for `.ndjson`
+//! batch objects, range-reads the embedded sidecar prefix, and
+//! inserts the records into `log_index.db`.
 //!
 //! Each pass:
-//!   1. LIST every sidecar in the batch store (no cursor — see below).
-//!   2. For each sidecar key, GET → parse → `index_db.insertBatch`.
+//!   1. LIST every key in the batch store (no cross-pass cursor — see below).
+//!   2. For each `.ndjson` key, range-GET the head bytes
+//!      (`HEAD_FETCH_BYTES`), parse `[u32 LE sidecar_size][sidecar JSON]`,
+//!      refetch with a larger range if the sidecar exceeds the
+//!      initial fetch size.
+//!   3. Pass `header_size = 4 + sidecar_size` to `index_db.insertBatch`
+//!      so per-record offsets stored in `log_index` are file-relative.
 //!      Both `batches` and `log_index` insert with `OR IGNORE`, so
-//!      already-indexed sidecars cost a PK lookup and skip writes.
-//!   3. `_meta.last_seen_key` is updated for observability + future
+//!      already-indexed batches cost a PK lookup and skip writes.
+//!   4. `_meta.last_seen_key` is updated for observability + future
 //!      cursor-based optimization, but isn't consulted on read.
 //!
 //! ## Why a full scan instead of `--start-after` cursor
 //!
 //! `docs/logs-plan.md` §4.3 sketches an `S3 LIST --start-after last`
-//! optimization. That works only when keys arrive in lex-monotonic
-//! order; it breaks when a NEW tenant whose id sorts lex-earlier
-//! than the current cursor first writes a sidecar — the cursor would
-//! leapfrog past their first batch and never come back. Step 2 keeps
-//! the simpler full-scan approach (cost is `O(total sidecars)` per
-//! pass, dominated by the S3 LIST). The cursor optimization with
-//! per-`(tenant, node)` book-keeping is a v2 refinement.
+//! optimization. The `_logs/{node}/{batch}` key shape IS lex-monotonic
+//! per node, but a cluster-wide cursor is fragile if a new node first
+//! emits a batch whose key sorts earlier than the current cursor.
+//! Per-pass full scan with `INSERT OR IGNORE` dedup is simpler and
+//! cheap (cost dominated by the S3 LIST itself). Cursor refinement
+//! with per-`node` book-keeping is a v2 task.
 //!
 //! Two surfaces:
 //!   - `pollOnce` runs a single pass and returns. Useful for tests
@@ -34,7 +39,13 @@ const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const sidecar = @import("sidecar.zig");
 
-const SIDECAR_SUFFIX: []const u8 = ".idx.json";
+const NDJSON_SUFFIX: []const u8 = ".ndjson";
+
+/// Initial Range-GET length when reading the embedded sidecar header.
+/// Sidecars at 1024 records × ~250 bytes/record JSON ≈ 256 KB. 512 KB
+/// covers typical batches in one round trip; oversized sidecars trigger
+/// a refetch below.
+const HEAD_FETCH_BYTES: u32 = 512 * 1024;
 
 pub const Error = error{
     Sqlite,
@@ -79,27 +90,21 @@ pub fn pollOnce(
         if (keys.len == 0) break;
 
         for (keys) |key| {
-            if (!std.mem.endsWith(u8, key, SIDECAR_SUFFIX)) {
+            if (!std.mem.endsWith(u8, key, NDJSON_SUFFIX)) {
                 stats.skipped_non_sidecars += 1;
                 continue;
             }
             stats.sidecars_seen += 1;
 
-            const bytes = store.get(key, allocator) catch |err| {
-                std.log.warn("log-indexer: GET {s}: {s}", .{ key, @errorName(err) });
+            const parsed = readEmbeddedSidecar(allocator, store, key) catch |err| {
+                std.log.warn("log-indexer: read {s}: {s}", .{ key, @errorName(err) });
                 stats.skipped_invalid += 1;
                 continue;
             };
-            defer allocator.free(bytes);
-
-            var idx = sidecar.parse(allocator, bytes) catch |err| {
-                std.log.warn("log-indexer: parse {s}: {s}", .{ key, @errorName(err) });
-                stats.skipped_invalid += 1;
-                continue;
-            };
+            var idx = parsed.idx;
             defer idx.deinit(allocator);
 
-            db.insertBatch(&idx, key) catch |err| {
+            db.insertBatch(&idx, key, parsed.header_size) catch |err| {
                 std.log.warn("log-indexer: insert {s}: {s}", .{ key, @errorName(err) });
                 return Error.Sqlite;
             };
@@ -119,6 +124,46 @@ pub fn pollOnce(
     }
 
     return stats;
+}
+
+const ParsedSidecar = struct {
+    idx: sidecar.IdxFile,
+    /// `4 + sidecar_size`. Indexer adds this to per-record offsets
+    /// when populating `log_index` so /show's stored offset is
+    /// file-relative.
+    header_size: u64,
+};
+
+/// Range-GET the head of `key`, parse the embedded sidecar prefix
+/// (`[u32 LE sidecar_size][sidecar JSON]`), and return the parsed
+/// `IdxFile` plus `header_size`. Issues a second range-GET if the
+/// sidecar is larger than `HEAD_FETCH_BYTES`.
+fn readEmbeddedSidecar(
+    allocator: std.mem.Allocator,
+    store: batch_store_mod.BatchStore,
+    key: []const u8,
+) !ParsedSidecar {
+    var head = store.getRange(key, 0, HEAD_FETCH_BYTES, allocator) catch
+        return error.BatchStoreRead;
+    defer allocator.free(head);
+    if (head.len < 4) return error.SidecarTruncated;
+
+    const sidecar_size = std.mem.readInt(u32, head[0..4], .little);
+    const want: usize = 4 + @as(usize, sidecar_size);
+
+    if (head.len < want) {
+        // Oversized sidecar — refetch enough bytes to cover it.
+        // Replace `head` with the larger fetch so the existing defer
+        // frees the right buffer.
+        const refetched = store.getRange(key, 0, @intCast(want), allocator) catch
+            return error.BatchStoreRead;
+        allocator.free(head);
+        head = refetched;
+        if (head.len < want) return error.SidecarTruncated;
+    }
+
+    const idx = try sidecar.parse(allocator, head[4..want]);
+    return .{ .idx = idx, .header_size = want };
 }
 
 pub const Config = struct {
@@ -204,6 +249,9 @@ fn tempDbPath(allocator: std.mem.Allocator, tag: []const u8) ![:0]u8 {
     return path;
 }
 
+/// Test helper: PUT a `.ndjson` object with the embedded-sidecar
+/// layout the indexer expects ([u32 LE sidecar_size][sidecar JSON]).
+/// No real frames region — the indexer only reads the sidecar.
 fn writeSidecar(
     allocator: std.mem.Allocator,
     store: batch_store_mod.BatchStore,
@@ -217,30 +265,25 @@ fn writeSidecar(
         .{ node, batch_id },
     );
     defer allocator.free(ndjson_key);
-    const idx_key = try std.fmt.allocPrint(
-        allocator,
-        "_logs/{s}/{s}.idx.json",
-        .{ node, batch_id },
-    );
-    defer allocator.free(idx_key);
 
     const idx = sidecar.IdxFile{
         .node_id = node,
         .batch_id = batch_id,
-        .ndjson_key = ndjson_key,
         .ndjson_size = 0,
         .ndjson_sha256 = "deadbeef",
         .first_received_ns = if (records.len == 0) 0 else records[0].received_ns,
         .last_received_ns = if (records.len == 0) 0 else records[records.len - 1].received_ns,
         .records = records,
     };
-    const bytes = try sidecar.encode(allocator, &idx);
-    defer allocator.free(bytes);
+    const sidecar_bytes = try sidecar.encode(allocator, &idx);
+    defer allocator.free(sidecar_bytes);
 
-    // Write the ndjson before the sidecar — orphan-payload safety:
-    // the indexer only keys off sidecars.
-    try store.put(ndjson_key, "placeholder ndjson bytes");
-    try store.put(idx_key, bytes);
+    const sidecar_size = std.math.cast(u32, sidecar_bytes.len) orelse return error.SidecarTooLarge;
+    const obj = try allocator.alloc(u8, 4 + sidecar_bytes.len);
+    defer allocator.free(obj);
+    std.mem.writeInt(u32, obj[0..4], sidecar_size, .little);
+    @memcpy(obj[4..], sidecar_bytes);
+    try store.put(ndjson_key, obj);
 }
 
 test "pollOnce indexes a single sidecar end-to-end" {
@@ -279,8 +322,8 @@ test "pollOnce indexes a single sidecar end-to-end" {
     try testing.expectEqual(@as(u32, 1), stats.sidecars_seen);
     try testing.expectEqual(@as(u32, 1), stats.batches_indexed);
     try testing.expectEqual(@as(u32, 1), stats.records_indexed);
-    // The matching .ndjson sits in the store too and isn't a sidecar.
-    try testing.expectEqual(@as(u32, 1), stats.skipped_non_sidecars);
+    // Single object — embedded sidecar lives inside the .ndjson.
+    try testing.expectEqual(@as(u32, 0), stats.skipped_non_sidecars);
 
     // Index now has the row.
     var list = try db.queryList("acme", 0, 0, 10);
@@ -399,7 +442,7 @@ test "pollOnce picks up newly-arrived sidecars across passes" {
     try testing.expectEqual(@as(u64, 1), list.rows[1].request_id);
 }
 
-test "pollOnce skips non-sidecar files" {
+test "pollOnce skips garbage objects" {
     const a = testing.allocator;
     const m = try batch_store_mod.MemoryBatchStore.init(a);
     defer m.deinit();
@@ -412,11 +455,15 @@ test "pollOnce skips non-sidecar files" {
     var db = try index_db_mod.IndexDb.open(a, db_path);
     defer db.close();
 
-    try store.put("acme/00000001/orphan.ndjson", "no sidecar yet");
-    try store.put("acme/00000001/junk.txt", "garbage");
+    // garbage.ndjson has random bytes — readEmbeddedSidecar will read a
+    // bogus sidecar_size, refetch, fail, and skip with skipped_invalid.
+    try store.put("_logs/00000001/garbage.ndjson", "no sidecar yet");
+    try store.put("_logs/00000001/junk.txt", "garbage");
 
     const stats = try pollOnce(a, store, db, 32);
-    try testing.expectEqual(@as(u32, 0), stats.sidecars_seen);
+    // .ndjson is seen but invalid; .txt is not even attempted.
+    try testing.expectEqual(@as(u32, 1), stats.sidecars_seen);
     try testing.expectEqual(@as(u32, 0), stats.batches_indexed);
-    try testing.expect(stats.skipped_non_sidecars >= 2);
+    try testing.expectEqual(@as(u32, 1), stats.skipped_invalid);
+    try testing.expectEqual(@as(u32, 1), stats.skipped_non_sidecars);
 }

@@ -1227,7 +1227,7 @@ fn captureLogInner(
 }
 
 /// Periodically drain the worker's node-wide log buffer into a
-/// `.ndjson` payload + `.idx.json` sidecar and PUT both to the
+/// single embedded-sidecar `.ndjson` object and PUT it to the
 /// configured `BatchStore` (Phase 5.5 a). Runs on the leader only
 /// — followers' buffer is always empty because `dispatchPending`
 /// early-returns 503 on followers. Lossy on PUT failure: records

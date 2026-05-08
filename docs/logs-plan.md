@@ -152,18 +152,25 @@ suffix would be misleading. Operators with existing `.ndjson.gz`
 objects from earlier rollout pre-dating Phase 5.5(a-2) are addressed
 in §6.6.
 
-### 2.3 `.idx.json` sidecar
+### 2.3 Embedded sidecar header
 
-One JSON object describing the batch + per-record index entries.
-Tenant lives per-record (records mix tenants under the interleaved
-layout); the top-level no longer carries one:
+Each `.ndjson` object opens with a length-prefixed sidecar JSON
+blob, then the concatenated raw-deflate frames. The whole batch
+lives in **one** S3 object — there is no separate `.idx.json` file.
+
+```
++0         [4 bytes]   sidecar_size_le  (u32, little-endian)
++4         [N bytes]   sidecar JSON     (the structure shown below)
++(4+N)     [M bytes]   raw-deflate frames region
+```
+
+Sidecar JSON shape:
 
 ```json
 {
   "v": 1,
   "node_id": "00000001",
   "batch_id": "00000000000000000042-1730764800000",
-  "ndjson_key": "_logs/00000001/00000000000000000042-1730764800000.ndjson",
   "ndjson_size": 84321,
   "ndjson_sha256": "abc...",
   "first_received_ns": 1730764800000000000,
@@ -188,18 +195,22 @@ layout); the top-level no longer carries one:
 }
 ```
 
-The indexer downloads `.idx.json` (small — typically <1% of the
-`.ndjson` size) and never fetches the payload during indexing.
-`offset` + `length` are byte ranges into the **on-the-wire** ndjson
-(i.e. the concatenated raw-deflate frame stream), so a record fetch
-is `Range: bytes=offset-(offset+length-1)` followed by one
-`inflate(Z_FINISH)` of the returned bytes. No whole-batch
-decompression dance.
+- `ndjson_size` is the size of the **frames region** (the bytes
+  after `4 + sidecar_size`).
+- `ndjson_sha256` is computed over the same frames region — cheap
+  insurance against a partial upload.
+- The sidecar's per-record `offset` is **frame-relative** (offset
+  into the frames region only). The indexer adds `4 + sidecar_size`
+  when populating `log_index.offset` so /show's stored offset is
+  file-relative and the read path needs no further math.
+- There is no `ndjson_key` in the sidecar (the sidecar lives inside
+  the same object it would have pointed at).
 
-`ndjson_sha256` is computed over the on-the-wire bytes and lets the
-indexer (and the dashboard) verify the payload matches what the
-sidecar describes. Cheap insurance against a partial S3 upload that
-surfaced before the sidecar got written.
+The indexer issues a Range-GET of the head of the object (default
+512 KB) to read the size prefix + sidecar JSON without fetching the
+frames; oversized sidecars trigger a single re-fetch with the exact
+size now known. The frames are touched only on dashboard click-
+through (one Range-GET + one `inflate(Z_FINISH)`).
 
 ---
 
@@ -207,31 +218,21 @@ surfaced before the sidecar got written.
 
 ### 3.1 Buffering on the worker
 
-Each worker today keeps a **per-tenant** `LogStore` buffer (leftover
-from the raft-era per-tenant `log.db`; see §6.9 for the planned
-simplification to a single node-wide buffer). A record is appended
-at the end of every dispatch tick that produced one.
+Each worker keeps a single **node-wide** in-memory `LogRecord`
+buffer (`NodeLogBuffer`). Every tenant's dispatch tick appends here;
+each record carries its own `tenant_id`. Per-tenant `RequestIdMinter`s
+still exist for issuing request_ids (chunked-reservation persisted
+to the tenant's app.db), but they no longer carry a buffer.
 
-Per-tenant flush triggers (whichever fires first):
+Flush triggers on the combined buffer (whichever fires first):
 
 - **Count:** 1024 records.
 - **Bytes:** 1 MiB uncompressed.
-- **Time:** 1s since the buffer's first record (caps tail latency for
-  low-traffic tenants).
+- **Time:** 1s since the buffer's first record.
 
-When *any* tenant's threshold trips, `flushLogs` drains **every
-non-empty tenant's buffer on the node** into a single combined batch
-and PUTs it as one `_logs/{node}/{batch}.ndjson` plus its sidecar.
-Per-tenant thresholds gate *when* a flush happens; the flush itself
-is node-global. Result: 2 PUTs per node per flush window regardless
-of how many tenants contributed records, with each tenant's records
-still labelled by `tenant_id` per row in the sidecar.
-
-The combined-batch policy means a tenant doing one request per minute
-gets its records flushed roughly every 1s anyway (whenever a busier
-tenant on the same node trips a threshold), without paying for its
-own dedicated PUT. A node with no traffic at all does no flushes —
-`flushLogs` returns early when no tenant has crossed a threshold.
+When any threshold trips, `flushLogs` drains the whole buffer and
+PUTs one `_logs/{node}/{batch}.ndjson` object — a single PUT per
+node per flush window, regardless of tenant fan-in.
 
 Customer dispatch already runs leader-only (followers reply 503 to
 tenant traffic and ask the caller to retry against the leader), so a
@@ -244,31 +245,26 @@ buffered between leadership transitions.
 ### 3.2 Flush ordering
 
 ```
-0. Drain every non-empty per-tenant LogStore on the node into one
-   combined record list (in-process; clears the buffers under their
-   per-tenant locks)
-1. For each record: encode JSON → raw-deflate frame → append to
-   on-the-wire ndjson buffer; record (offset, length) in sidecar
-2. Compute sha256 over the on-the-wire bytes
-3. PUT _logs/{node}/{batch}.ndjson    ← payload first, sidecar second
-4. PUT _logs/{node}/{batch}.idx.json  ← only references valid keys
-                                        after step 3 succeeds
+0. Drain the node-wide buffer into a combined record list (in-process;
+   clears the buffer under its mutex)
+1. For each record: encode JSON → raw-deflate frame → append to the
+   frames buffer; record (offset, length) in the sidecar's records
+   array (frame-relative offsets)
+2. Compute sha256 over the frames region
+3. Encode the sidecar JSON; compute sidecar_size
+4. Build the object: [u32 LE sidecar_size][sidecar JSON][frames]
+5. PUT _logs/{node}/{batch}.ndjson — single PUT
 ```
 
-**Crash between 3 and 4** = orphan `.ndjson` in S3 with no sidecar.
-The indexer ignores ndjson files without a matching `.idx.json` (it
-only keys off sidecars), so the orphan is invisible to dashboards.
-A janitor pass can collect orphans on a long cadence (weekly) —
-cheap at S3 prices, and the orphan rate is bounded by node-crash
-frequency × the per-flush batch size.
-
-**Crash before 3** = records stayed in the in-memory buffer and are
+**Crash before 5** = records stayed in the in-memory buffer and are
 lost on the worker that crashed (the drain in step 0 already cleared
 them, but they hadn't reached S3). Acceptable per the stated lossy
 semantics.
 
-**Never** index-then-upload; that creates pointers to non-existent
-objects.
+**Crash mid-PUT** = the BatchStore's underlying object semantics
+(S3 / fs / mem) make a partial object either invisible (object
+never appears) or detectable (size mismatch + truncated sidecar);
+the indexer's parse step rejects anything malformed.
 
 ### 3.3 Decommissioned (historical)
 
@@ -375,14 +371,20 @@ loop every 5s:
     while true:
         keys = batch_store.list("", cursor, page_size)  ← walk page-by-page
         if keys.empty: break
-        for key in keys where key.endswith(".idx.json"):
-            idx = GET key                              ← parse JSON
+        for key in keys where key.endswith(".ndjson"):
+            head = batch_store.getRange(key, 0, HEAD_FETCH_BYTES)  ← 512 KB by default
+            sidecar_size = u32 LE from head[0..4]
+            if 4 + sidecar_size > head.len:
+                head = batch_store.getRange(key, 0, 4 + sidecar_size)  ← refetch oversized
+            sidecar_json = head[4 .. 4 + sidecar_size]
             BEGIN TRANSACTION
                 INSERT OR IGNORE INTO batches (...)
-                INSERT OR IGNORE INTO log_index (...)  ← bulk insert
+                INSERT OR IGNORE INTO log_index (...)
+                  ← per-record offset stored as `sidecar_record.offset + 4 + sidecar_size`
+                    so /show's range-GET reads at this offset directly
             COMMIT
+            UPDATE _meta SET v = key WHERE k='last_seen_key'  ← observability only
         cursor = keys[-1]
-    UPDATE _meta SET v = <last sidecar seen> WHERE k='last_seen_key'  ← observability only
 ```
 
 Notes:
@@ -390,9 +392,9 @@ Notes:
 - **Full scan per pass, not `--start-after last_seen_key` across passes.**
   Within a single pass `cursor` advances monotonically (paging through
   the LIST response), but each pass restarts at `""`. `INSERT OR IGNORE`
-  on both tables makes re-walking already-indexed sidecars a cheap
+  on both tables makes re-walking already-indexed batches a cheap
   PK-lookup-and-skip. The cross-pass cursor optimization is a v2
-  refinement (the new `_logs/{node}/{batch}` key shape *is* lex-monotonic
+  refinement (the `_logs/{node}/{batch}` key shape *is* lex-monotonic
   per node, so `--start-after` per-(node) book-keeping would be safe —
   see `src/log_server/indexer.zig` doc comment).
 - `_meta.last_seen_key` is updated for observability/operator
@@ -400,13 +402,18 @@ Notes:
   doesn't need it.
 - The 5s cadence is tunable; 1s is plausible for a "live tail" feature
   later, at the cost of more LIST calls.
+- The frames region (the bulk of each object) is never fetched
+  during indexing — only the head bytes containing the sidecar.
+  /show fetches one frame's range on click-through.
 
 ### 4.4 Rebuild from scratch
 
 Set `last_seen_key` = '' (or just delete the meta row). Next loop
-iteration walks the entire bucket. With sidecars at ~10KB each and a
-year of logs at 1k batches/day = 365k sidecars = ~3.6GB of GETs to
-rebuild a year. Bounded; acceptable for a one-shot recovery.
+iteration walks the entire bucket. With embedded-sidecar heads at
+~256 KB each and a year of logs at 1k batches/day = 365k objects =
+~90 GB of GETs to rebuild a year (note: only the head bytes per
+object, not the full frames region). Bounded; acceptable for a
+one-shot recovery.
 
 ---
 
@@ -545,20 +552,12 @@ A weekly process that lists `.ndjson` files without a matching
 `.idx.json` and deletes them after a 24h grace period (avoids racing
 in-flight uploads). Trivial; defer until orphan accumulation matters.
 
-### 6.7 Embedded sidecar vs separate `.idx.json`
+### 6.7 Embedded sidecar — *shipped*
 
-Today every flush issues two PUTs (payload + sidecar). The orphan-on-
-crash story (§3.2) and the indexer's "list-only-`.idx.json`"
-shortcut (§4.3) both depend on the sidecar being a separate object.
-
-Open question: collapse to a single PUT by prefixing the `.ndjson`
-with a fixed-size header (sidecar length + bytes) so the indexer
-does a small ranged GET on the head of the object instead of a
-separate sidecar GET. Halves PUT count per flush; complicates the
-"orphan" story (a partially-uploaded object with a header-prefix
-needs to be detectable by the indexer rather than skipped by suffix
-matching). Defer until PUT cost shows up; revisit alongside the
-retention/GC design (§6.8) since GC will care about object count.
+The sidecar lives at the head of the `.ndjson` object as a
+length-prefixed JSON blob; one PUT per flush. See §2.3 for the
+on-disk layout and §4.3 for how the indexer Range-GETs just the
+head bytes. Replaces the previous payload + `.idx.json` pair.
 
 ### 6.8 Retention / GC — *compacting GC + current-policy retention*
 
@@ -706,10 +705,10 @@ real workload data.
   binary), or separate process? Sibling is simpler at v1 — same
   SQLite handle, same access patterns. Promote to its own process
   if it ever needs to scale independently.
-- **Interaction with §6.7 (embedded sidecar).** If we ever collapse
-  to a single PUT per flush with a header-prefix sidecar, the
-  compactor's rewrite path also halves PUT count. Design the
-  compactor against the current shape; revisit if §6.7 lands.
+- **Interaction with §6.7 (embedded sidecar).** Embedded sidecar
+  shipped — the compactor's rewrite path produces objects with the
+  same `[u32 sidecar_size][sidecar JSON][frames]` layout as fresh
+  flushes, and the indexer treats them identically.
 - **Interaction with §6.5 (encryption at rest).** Compactor reads
   ciphertext, drops expired records, writes new ciphertext. Needs
   the page-level encryption envelope to be record-granular, not
@@ -717,30 +716,21 @@ real workload data.
   knowing the plaintext of records we're keeping. Flag for the
   encryption phase.
 
-### 6.9 Collapse per-tenant `LogStore` to a single per-node buffer
+### 6.9 Per-node log buffer — *shipped*
 
-Tech debt from the raft-era per-tenant `log.db` model. With the
-interleaved-per-node flush there is no per-tenant state worth
-keeping in the buffer: every record already carries `tenant_id` as
-a field, and the only operation we do on the per-tenant slices is
-"drain everything into one combined batch" at flush time.
+The old per-tenant `LogStore` split into:
 
-Proposed: replace `tenant_logs: HashMap(instance_id, *LogStore)`
-with one node-wide `LogStore` (or just an `ArrayList(LogRecord)`
-behind a mutex). The flush triggers fold to a single check on the
-combined buffer:
+- `RequestIdMinter` — per-tenant, holds the chunked-reservation
+  counter persisted into the tenant's app.db (genuinely per-tenant
+  because each tenant's request_id space must be monotonic across
+  cluster restarts).
+- `NodeLogBuffer` — per-node, single in-memory `LogRecord` buffer
+  every tenant's dispatch tick appends to. Thresholds (1024 records
+  / 1 MiB / 1s) apply to the combined buffer.
 
-- Count: 1024 records
-- Bytes: 1 MiB uncompressed
-- Time: 1s since the buffer's first record
-
-Drops the two-pass `flushLogs` (any-should-flush check, then per-
-tenant drain) for a single threshold check + drain. No behaviour
-change at the S3 layer — same key shape, same combined batch — just
-fewer maps and one fewer indirection on every log append.
-
-Defer to a small dedicated commit; orthogonal to retention/GC
-(§6.8) and to the embedded-sidecar question (§6.7).
+`flushLogs` collapsed from a two-pass any-should-flush + per-tenant
+drain to a single threshold check + drain. `TenantLog.blob_backend`
+(dead post-tape-inlining) was removed at the same time.
 
 ---
 

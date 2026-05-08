@@ -100,24 +100,30 @@ pub const IndexDb = struct {
         a.destroy(self);
     }
 
-    /// Idempotently insert a sidecar's batch row + per-record rows.
-    /// `INSERT OR IGNORE` on both tables means re-indexing the same
-    /// sidecar (e.g. after a crash mid-poll) is a no-op. After the
-    /// transaction commits, `_meta.last_seen_key` is updated to point
-    /// at this sidecar so subsequent polls don't re-fetch it.
+    /// Idempotently insert a batch's `batches` row + per-record
+    /// `log_index` rows. `INSERT OR IGNORE` on both tables means
+    /// re-indexing the same object (e.g. after a crash mid-poll) is
+    /// a no-op. After the transaction commits, `_meta.last_seen_key`
+    /// is updated to point at the .ndjson key (observability only).
+    ///
+    /// `ndjson_key` is the batch-store key the embedded-sidecar
+    /// object lives at. `header_size` is `4 + sidecar_size` so the
+    /// per-record offsets stored in `log_index` are file-relative
+    /// (sidecar offsets are frame-relative — see `flush_writer.zig`).
     pub fn insertBatch(
         self: *IndexDb,
         idx: *const sidecar.IdxFile,
-        sidecar_key: []const u8,
+        ndjson_key: []const u8,
+        header_size: u64,
     ) Error!void {
         const indexed_at_ns: i64 = @intCast(std.time.nanoTimestamp());
         if (c.sqlite3_exec(self.db, "BEGIN IMMEDIATE;", null, null, null) != c.SQLITE_OK)
             return Error.Sqlite;
         errdefer _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, null);
 
-        try execBatchInsert(self.db, idx, indexed_at_ns);
-        try execLogIndexInserts(self.db, idx);
-        try setMetaInTxn(self.db, "last_seen_key", sidecar_key);
+        try execBatchInsert(self.db, idx, ndjson_key, indexed_at_ns);
+        try execLogIndexInserts(self.db, idx, ndjson_key, header_size);
+        try setMetaInTxn(self.db, "last_seen_key", ndjson_key);
 
         if (c.sqlite3_exec(self.db, "COMMIT;", null, null, null) != c.SQLITE_OK)
             return Error.Sqlite;
@@ -312,7 +318,12 @@ pub const IndexDb = struct {
 
 // ── Internal helpers ──────────────────────────────────────────────
 
-fn execBatchInsert(db: *c.sqlite3, idx: *const sidecar.IdxFile, indexed_at_ns: i64) Error!void {
+fn execBatchInsert(
+    db: *c.sqlite3,
+    idx: *const sidecar.IdxFile,
+    ndjson_key: []const u8,
+    indexed_at_ns: i64,
+) Error!void {
     const sql =
         \\INSERT OR IGNORE INTO batches
         \\(node_id, batch_id, ndjson_key, ndjson_size,
@@ -324,7 +335,7 @@ fn execBatchInsert(db: *c.sqlite3, idx: *const sidecar.IdxFile, indexed_at_ns: i
     defer _ = c.sqlite3_finalize(st);
     bindText(st.?, 1, idx.node_id);
     bindText(st.?, 2, idx.batch_id);
-    bindText(st.?, 3, idx.ndjson_key);
+    bindText(st.?, 3, ndjson_key);
     _ = c.sqlite3_bind_int64(st, 4, @intCast(idx.ndjson_size));
     bindText(st.?, 5, idx.ndjson_sha256);
     _ = c.sqlite3_bind_int64(st, 6, idx.first_received_ns);
@@ -333,7 +344,12 @@ fn execBatchInsert(db: *c.sqlite3, idx: *const sidecar.IdxFile, indexed_at_ns: i
     if (c.sqlite3_step(st) != c.SQLITE_DONE) return Error.Sqlite;
 }
 
-fn execLogIndexInserts(db: *c.sqlite3, idx: *const sidecar.IdxFile) Error!void {
+fn execLogIndexInserts(
+    db: *c.sqlite3,
+    idx: *const sidecar.IdxFile,
+    ndjson_key: []const u8,
+    header_size: u64,
+) Error!void {
     const sql =
         \\INSERT OR IGNORE INTO log_index
         \\(tenant_id, request_id, received_ns, duration_ns,
@@ -351,6 +367,10 @@ fn execLogIndexInserts(db: *c.sqlite3, idx: *const sidecar.IdxFile) Error!void {
         // Each record carries its own tenant_id under the
         // interleaved-per-node layout (Phase 5.5 a-2). The indexer
         // demuxes here so log_index stays per-tenant.
+        // The sidecar's per-record offset is frame-relative; add
+        // `header_size` (= 4 + sidecar_size) so the stored offset is
+        // file-relative — /show's range-GET reads at this offset
+        // directly with no further math.
         bindText(st.?, 1, r.tenant_id);
         _ = c.sqlite3_bind_int64(st, 2, @intCast(r.request_id));
         _ = c.sqlite3_bind_int64(st, 3, r.received_ns);
@@ -361,8 +381,8 @@ fn execLogIndexInserts(db: *c.sqlite3, idx: *const sidecar.IdxFile) Error!void {
         _ = c.sqlite3_bind_int(st, 8, @intCast(r.status));
         bindText(st.?, 9, r.outcome);
         _ = c.sqlite3_bind_int64(st, 10, @intCast(r.deployment_id));
-        bindText(st.?, 11, idx.ndjson_key);
-        _ = c.sqlite3_bind_int64(st, 12, @intCast(r.offset));
+        bindText(st.?, 11, ndjson_key);
+        _ = c.sqlite3_bind_int64(st, 12, @intCast(r.offset + header_size));
         _ = c.sqlite3_bind_int(st, 13, @intCast(r.length));
         if (c.sqlite3_step(st) != c.SQLITE_DONE) return Error.Sqlite;
     }
@@ -466,14 +486,14 @@ test "insertBatch + queryList round-trips, newest-first" {
     const batch = sidecar.IdxFile{
         .node_id = "00000001",
         .batch_id = "00000000000000000100-1730764800000",
-        .ndjson_key = "acme/00000001/00000000000000000100-1730764800000.ndjson",
         .ndjson_size = 210,
         .ndjson_sha256 = "deadbeef",
         .first_received_ns = 1_000,
         .last_received_ns = 2_000,
         .records = &records,
     };
-    try idx.insertBatch(&batch, "acme/00000001/00000000000000000100-1730764800000.idx.json");
+    const ndjson_key = "_logs/00000001/00000000000000000100-1730764800000.ndjson";
+    try idx.insertBatch(&batch, ndjson_key, 0);
 
     var list = try idx.queryList("acme", 0, 0, 10);
     defer list.deinit();
@@ -522,17 +542,16 @@ test "insertBatch is idempotent on the same sidecar key" {
     const batch = sidecar.IdxFile{
         .node_id = "00000002",
         .batch_id = "00000000000000000050-1730764900000",
-        .ndjson_key = "globex/00000002/00000000000000000050-1730764900000.ndjson",
         .ndjson_size = 80,
         .ndjson_sha256 = "abc",
         .first_received_ns = 5_000,
         .last_received_ns = 5_000,
         .records = &records,
     };
-    const sk = "globex/00000002/00000000000000000050-1730764900000.idx.json";
-    try idx.insertBatch(&batch, sk);
-    try idx.insertBatch(&batch, sk);
-    try idx.insertBatch(&batch, sk);
+    const ndjson_key = "_logs/00000002/00000000000000000050-1730764900000.ndjson";
+    try idx.insertBatch(&batch, ndjson_key, 0);
+    try idx.insertBatch(&batch, ndjson_key, 0);
+    try idx.insertBatch(&batch, ndjson_key, 0);
 
     var list = try idx.queryList("globex", 0, 0, 10);
     defer list.deinit();
@@ -569,20 +588,21 @@ test "queryShow returns ndjson_key + offset + length" {
     const batch = sidecar.IdxFile{
         .node_id = "00000001",
         .batch_id = "b1",
-        .ndjson_key = "acme/00000001/b1.ndjson",
         .ndjson_size = 1801,
         .ndjson_sha256 = "abc",
         .first_received_ns = 1,
         .last_received_ns = 1,
         .records = &records,
     };
-    try idx.insertBatch(&batch, "acme/00000001/b1.idx.json");
+    // header_size = 200 covers a 4-byte size prefix + 196-byte sidecar.
+    // queryShow should return the file-relative offset (= 1234 + 200).
+    try idx.insertBatch(&batch, "_logs/00000001/b1.ndjson", 200);
 
     var got = (try idx.queryShow("acme", 7)).?;
     defer got.deinit(a);
-    try testing.expectEqual(@as(u64, 1234), got.offset);
+    try testing.expectEqual(@as(u64, 1434), got.offset);
     try testing.expectEqual(@as(u32, 567), got.length);
-    try testing.expectEqualStrings("acme/00000001/b1.ndjson", got.ndjson_key);
+    try testing.expectEqualStrings("_logs/00000001/b1.ndjson", got.ndjson_key);
     try testing.expectEqual(@as(u64, 9), got.deployment_id);
 
     try testing.expectEqual(@as(?IndexDb.ShowResult, null), try idx.queryShow("acme", 9999));
@@ -605,20 +625,19 @@ test "_meta last_seen_key tracks the most recent insertBatch" {
     const batch = sidecar.IdxFile{
         .node_id = "00000001",
         .batch_id = "b1",
-        .ndjson_key = "t/00000001/b1.ndjson",
         .ndjson_size = 0,
         .ndjson_sha256 = "0",
         .first_received_ns = 0,
         .last_received_ns = 0,
         .records = &records,
     };
-    try idx.insertBatch(&batch, "t/00000001/b1.idx.json");
+    try idx.insertBatch(&batch, "_logs/00000001/b1.ndjson", 0);
     const v1 = (try idx.getMeta("last_seen_key")).?;
     defer a.free(v1);
-    try testing.expectEqualStrings("t/00000001/b1.idx.json", v1);
+    try testing.expectEqualStrings("_logs/00000001/b1.ndjson", v1);
 
-    try idx.insertBatch(&batch, "t/00000001/b2.idx.json");
+    try idx.insertBatch(&batch, "_logs/00000001/b2.ndjson", 0);
     const v2 = (try idx.getMeta("last_seen_key")).?;
     defer a.free(v2);
-    try testing.expectEqualStrings("t/00000001/b2.idx.json", v2);
+    try testing.expectEqualStrings("_logs/00000001/b2.ndjson", v2);
 }

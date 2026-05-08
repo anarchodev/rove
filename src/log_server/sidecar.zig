@@ -1,12 +1,12 @@
-//! Sidecar / ndjson wire format for the S3-direct logs path
-//! (Phase 5.5 a). Worker writes a `.ndjson.gz` payload + an `.idx.json`
-//! sidecar per flush; log-server reads the sidecar to populate
-//! `log_index.db` without touching the payload until a click-through.
+//! Sidecar wire format for the S3-direct logs path. Phase 5.5(a-3)
+//! embeds the sidecar at the head of the `.ndjson` object as a
+//! length-prefixed JSON blob; this module owns the sidecar's JSON
+//! shape (parse + encode), independent of where it lives on disk.
 //!
-//! See `docs/logs-plan.md` §2.3 for the schema. v1 reads + writes a
-//! flat JSON object with a per-record `records` array. v2 will switch
-//! to a more compact format if profiling says JSON parse cost matters
-//! at scale; deferred per §6.2.
+//! See `docs/logs-plan.md` §2 for the on-disk layout. Record offsets
+//! in the sidecar are **frame-relative** (into the raw-deflate
+//! frames region only) — the indexer adds `4 + sidecar_size` to
+//! produce the file-relative offsets it stores in `log_index`.
 
 const std = @import("std");
 
@@ -54,18 +54,16 @@ pub const Record = struct {
 };
 
 /// Top-level sidecar shape. `records` is ordered by ascending
-/// `received_ns`, matching the order of lines in the payload.
+/// `received_ns`, matching the order of frames in the payload.
 /// Records may belong to many tenants; each carries its `tenant_id`.
 pub const IdxFile = struct {
     node_id: []const u8,
     batch_id: []const u8,
-    /// S3 / batch-store key the payload lives at. Encoded so the
-    /// `_logs/{node_id}/{batch_id}.ndjson` lookup doesn't need the
-    /// indexer to recompose it.
-    ndjson_key: []const u8,
+    /// Size of the raw-deflate frames region that follows the sidecar
+    /// in the same object. Used by readers to validate truncation.
     ndjson_size: u64,
-    /// Hex-encoded SHA-256 of the payload bytes. Lets the indexer
-    /// detect partial-upload corruption before inserting.
+    /// Hex-encoded SHA-256 of the frames-region bytes. Lets the
+    /// indexer detect partial-upload corruption before inserting.
     ndjson_sha256: []const u8,
     first_received_ns: i64,
     last_received_ns: i64,
@@ -74,7 +72,6 @@ pub const IdxFile = struct {
     pub fn deinit(self: *IdxFile, allocator: std.mem.Allocator) void {
         allocator.free(self.node_id);
         allocator.free(self.batch_id);
-        allocator.free(self.ndjson_key);
         allocator.free(self.ndjson_sha256);
         for (self.records) |*r| r.deinit(allocator);
         allocator.free(self.records);
@@ -112,8 +109,6 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!IdxFile
     errdefer allocator.free(out.node_id);
     out.batch_id = try dupeStr(allocator, obj, "batch_id");
     errdefer allocator.free(out.batch_id);
-    out.ndjson_key = try dupeStr(allocator, obj, "ndjson_key");
-    errdefer allocator.free(out.ndjson_key);
     out.ndjson_size = try getInt(obj, "ndjson_size");
     out.ndjson_sha256 = try dupeStr(allocator, obj, "ndjson_sha256");
     errdefer allocator.free(out.ndjson_sha256);
@@ -168,8 +163,6 @@ pub fn encode(allocator: std.mem.Allocator, idx: *const IdxFile) ![]u8 {
     try writeJsonString(w, idx.node_id);
     try w.writeAll(",\"batch_id\":");
     try writeJsonString(w, idx.batch_id);
-    try w.writeAll(",\"ndjson_key\":");
-    try writeJsonString(w, idx.ndjson_key);
     try w.print(",\"ndjson_size\":{d}", .{idx.ndjson_size});
     try w.writeAll(",\"ndjson_sha256\":");
     try writeJsonString(w, idx.ndjson_sha256);
@@ -278,7 +271,6 @@ test "encode → parse round-trip" {
     const idx = IdxFile{
         .node_id = "00000001",
         .batch_id = "00000000000000000001-0001730764800000",
-        .ndjson_key = "_logs/00000001/00000000000000000001-0001730764800000.ndjson",
         .ndjson_size = 84321,
         .ndjson_sha256 = "deadbeef",
         .first_received_ns = 1_000_000_000,
