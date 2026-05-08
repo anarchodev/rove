@@ -20,6 +20,7 @@ const std = @import("std");
 pub const s3 = @import("s3.zig");
 pub const S3BlobStore = s3.S3BlobStore;
 pub const sigv4 = @import("sigv4.zig");
+pub const curl = @import("curl.zig");
 pub const backend = @import("backend.zig");
 pub const BlobBackend = backend.BlobBackend;
 pub const BackendConfig = backend.BackendConfig;

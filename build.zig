@@ -78,6 +78,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    blob_mod.link_libc = true;
+    // libcurl backs the S3 outbound path. Replaces std.http.Client,
+    // which has a string of bugs in 0.15.x (HEAD stalls / segfaults,
+    // no application-level timeouts → 15-minute kernel TCP retry
+    // hangs, incomplete flate Compress, etc.) that we kept patching
+    // around. libcurl handles HTTPS keep-alive, timeouts, and HEAD
+    // correctly out of the box.
+    blob_mod.linkSystemLibrary("curl", .{});
 
     // ── rove-files: content-addressed module store + deploy index ──
     //

@@ -35,6 +35,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const sigv4 = @import("sigv4.zig");
+const curl_mod = @import("curl.zig");
 
 const Error = root.Error;
 
@@ -76,13 +77,11 @@ pub const S3BlobStore = struct {
     /// lifetime trap that bites callers who build per-tenant configs
     /// from short-lived allocations (e.g. a per-request key prefix).
     config: Config,
-    /// Shared HTTP client. One per S3BlobStore instance — keeps
-    /// the TLS session + TCP connection alive across put/get/exists/
-    /// delete so we don't pay handshake cost on every op. The Client
-    /// struct itself is just a holder for the connection pool +
-    /// allocator; the real cost (TCP connect + TLS handshake + CA
-    /// bundle scan) is paid on first fetch.
-    http: std.http.Client,
+    /// libcurl handle. One per S3BlobStore instance. Reuse keeps
+    /// the TLS session + TCP connection warm across calls. Not
+    /// thread-safe — callers single-thread access (the worker
+    /// background flusher does this naturally).
+    curl: *curl_mod.Easy,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !S3BlobStore {
         if (config.endpoint.len == 0) {
@@ -138,6 +137,10 @@ pub const S3BlobStore = struct {
         const secret_key_owned = try allocator.dupe(u8, config.secret_key);
         errdefer allocator.free(secret_key_owned);
 
+        curl_mod.globalInit();
+        const curl_easy = curl_mod.Easy.init(allocator) catch return Error.Io;
+        errdefer curl_easy.deinit();
+
         return .{
             .allocator = allocator,
             .config = .{
@@ -149,12 +152,12 @@ pub const S3BlobStore = struct {
                 .secret_key = secret_key_owned,
                 .use_tls = config.use_tls,
             },
-            .http = .{ .allocator = allocator },
+            .curl = curl_easy,
         };
     }
 
     pub fn deinit(self: *S3BlobStore) void {
-        self.http.deinit();
+        self.curl.deinit();
         self.allocator.free(self.config.endpoint);
         self.allocator.free(self.config.region);
         self.allocator.free(self.config.bucket);
@@ -258,7 +261,7 @@ pub const S3BlobStore = struct {
     /// Internal: dispatch a request and discard the body (returns
     /// status only, plus a small captured snippet for logging on
     /// non-2xx). For GET we use `requestAlloc` instead.
-    fn request(self: *S3BlobStore, method: std.http.Method, key: []const u8, body: []const u8) !HttpResp {
+    fn request(self: *S3BlobStore, method: curl_mod.Method, key: []const u8, body: []const u8) !HttpResp {
         return self.requestAlloc(method, key, body, self.allocator);
     }
 
@@ -268,7 +271,7 @@ pub const S3BlobStore = struct {
     /// has its own 1 MiB-per-static-file cap that gates uploads).
     fn requestAlloc(
         self: *S3BlobStore,
-        method: std.http.Method,
+        method: curl_mod.Method,
         key: []const u8,
         body: []const u8,
         body_allocator: std.mem.Allocator,
@@ -290,10 +293,6 @@ pub const S3BlobStore = struct {
         );
         defer self.allocator.free(path);
 
-        // Host piece: SigV4 wants the literal `Host:` value, which
-        // for a default port is just the hostname.
-        const host = self.config.endpoint;
-
         // Sign the request. Timestamp comes from the wall clock —
         // S3 enforces a 15-minute skew window.
         var ts_buf: [16]u8 = undefined;
@@ -302,7 +301,7 @@ pub const S3BlobStore = struct {
         var signed = try sigv4.sign(self.allocator, .{
             .method = methodName(method),
             .path = path,
-            .host = host,
+            .host = self.config.endpoint,
             .body = body,
             .access_key = self.config.access_key,
             .secret_key = self.config.secret_key,
@@ -312,109 +311,43 @@ pub const S3BlobStore = struct {
         });
         defer signed.deinit(self.allocator);
 
-        const headers = [_]std.http.Header{
+        const headers = [_]curl_mod.Header{
             .{ .name = "x-amz-date", .value = signed.x_amz_date },
             .{ .name = "x-amz-content-sha256", .value = signed.x_amz_content_sha256 },
             .{ .name = "Authorization", .value = signed.authorization },
         };
 
-        const uri = std.Uri.parse(url) catch return Error.Io;
-
-        // For HEAD we don't need to capture body; for GET we want it
-        // verbatim. PUT / DELETE responses are typically empty or
-        // small XML errors — capture a snippet for diagnostics.
-        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer body_buf.deinit(body_allocator);
-        var aw = std.Io.Writer.Allocating.fromArrayList(body_allocator, &body_buf);
-
         std.log.debug("rove-blob s3: → {s} {s}", .{ methodName(method), url });
 
-        // HEAD goes through the low-level request/send/receiveHead
-        // path so we never touch the body reader. Two stdlib bugs
-        // make `fetch()` unusable for HEAD in zig 0.15.2:
-        //
-        //   1. With `response_writer` set, fetch picks
-        //      `readerDecompressing`, which doesn't check
-        //      `method.responseHasBody()` and blocks reading
-        //      Content-Length bytes that never come (60s OVH idle
-        //      stall observed pre-c94eb64).
-        //   2. With `response_writer = null`, fetch picks the
-        //      `response.reader(&.{})` branch, which returns
-        //      `Reader.ending` — a `@constCast` of a `const` global.
-        //      `discardRemaining` then writes `r.seek = r.end` into
-        //      `.rodata` and segfaults in ReleaseSafe / ReleaseFast.
-        //
-        // The workaround: for HEAD, send the request, read the head,
-        // and return the status. No body reader is constructed.
-        if (method == .HEAD) {
-            return self.requestHead(uri, &headers);
-        }
-
-        const result = self.http.fetch(.{
-            .location = .{ .uri = uri },
+        const resp = self.curl.request(body_allocator, .{
             .method = method,
-            .payload = if (body.len > 0) body else null,
-            .extra_headers = &headers,
-            .response_writer = &aw.writer,
-            .redirect_behavior = @enumFromInt(0),
+            .url = url,
+            .headers = &headers,
+            .body = body,
         }) catch |err| {
             std.log.warn(
-                "rove-blob s3: fetch {s} {s} failed: {s}",
+                "rove-blob s3: {s} {s} failed: {s}",
                 .{ methodName(method), url, @errorName(err) },
             );
             return Error.Io;
         };
 
-        const body_owned = aw.toOwnedSlice() catch return Error.OutOfMemory;
         return .{
-            .status = @intFromEnum(result.status),
-            .body_owned = if (body_owned.len > 0) body_owned else null,
+            .status = resp.status,
+            .body_owned = if (resp.body) |b| (if (b.len > 0) b else blk: {
+                body_allocator.free(b);
+                break :blk null;
+            }) else null,
         };
     }
 
-    /// HEAD via `client.request()` + `sendBodiless()` + `receiveHead()`.
-    /// Bypasses `fetch()`, which is broken for HEAD in zig 0.15.2 (see
-    /// the comment in `requestAlloc`). Returns just the status; HEAD
-    /// responses carry no body we care about for `exists()` /
-    /// `delete()` validation.
-    fn requestHead(
-        self: *S3BlobStore,
-        uri: std.Uri,
-        extra_headers: []const std.http.Header,
-    ) !HttpResp {
-        var req = self.http.request(.HEAD, uri, .{
-            .extra_headers = extra_headers,
-            .redirect_behavior = @enumFromInt(0),
-        }) catch |err| {
-            std.log.warn("rove-blob s3: HEAD request init failed: {s}", .{@errorName(err)});
-            return Error.Io;
-        };
-        defer req.deinit();
-
-        req.sendBodiless() catch |err| {
-            std.log.warn("rove-blob s3: HEAD send failed: {s}", .{@errorName(err)});
-            return Error.Io;
-        };
-
-        var redirect_buf: [256]u8 = undefined;
-        const response = req.receiveHead(&redirect_buf) catch |err| {
-            std.log.warn("rove-blob s3: HEAD receiveHead failed: {s}", .{@errorName(err)});
-            return Error.Io;
-        };
-
-        return .{
-            .status = @intFromEnum(response.head.status),
-            .body_owned = null,
-        };
-    }
-
-    fn methodName(m: std.http.Method) []const u8 {
+    fn methodName(m: curl_mod.Method) []const u8 {
         return switch (m) {
             .GET => "GET",
             .PUT => "PUT",
+            .POST => "POST",
             .HEAD => "HEAD",
             .DELETE => "DELETE",
-            else => "GET",
         };
     }
 };

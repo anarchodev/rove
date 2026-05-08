@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const sigv4 = @import("rove-blob").sigv4;
+const curl_mod = @import("rove-blob").curl;
 const batch_store_mod = @import("batch_store.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -58,7 +59,10 @@ pub const S3BatchStore = struct {
     /// All `[]const u8` fields are allocator-duplicated copies; the
     /// caller's `Config` strings need only outlive `init`.
     config: Config,
-    http: std.http.Client,
+    /// libcurl easy handle. Reuse keeps TLS warm across calls. Not
+    /// thread-safe — single-thread access only (the worker's
+    /// background flusher serializes through one thread).
+    curl: *curl_mod.Easy,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !*S3BatchStore {
         if (config.endpoint.len == 0) return Error.Io;
@@ -74,6 +78,10 @@ pub const S3BatchStore = struct {
         if (ep.len > 0 and ep[ep.len - 1] == '/') ep = ep[0 .. ep.len - 1];
         if (ep.len == 0) return Error.Io;
 
+        curl_mod.globalInit();
+        const curl_easy = curl_mod.Easy.init(allocator) catch return Error.Io;
+        errdefer curl_easy.deinit();
+
         const self = try allocator.create(S3BatchStore);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -87,13 +95,13 @@ pub const S3BatchStore = struct {
                 .secret_key = try allocator.dupe(u8, config.secret_key),
                 .use_tls = config.use_tls,
             },
-            .http = .{ .allocator = allocator },
+            .curl = curl_easy,
         };
         return self;
     }
 
     pub fn deinit(self: *S3BatchStore) void {
-        self.http.deinit();
+        self.curl.deinit();
         self.allocator.free(self.config.endpoint);
         self.allocator.free(self.config.region);
         self.allocator.free(self.config.bucket);
@@ -302,7 +310,7 @@ pub const S3BatchStore = struct {
     /// `requestAllocOverride` directly.
     fn requestAlloc(
         self: *S3BatchStore,
-        method: std.http.Method,
+        method: curl_mod.Method,
         key: []const u8,
         query: []const u8,
         body: []const u8,
@@ -341,7 +349,7 @@ pub const S3BatchStore = struct {
     /// `requestAllocCanonical` instead.
     fn requestAllocOverride(
         self: *S3BatchStore,
-        method: std.http.Method,
+        method: curl_mod.Method,
         url: []const u8,
         path: []const u8,
         query: []const u8,
@@ -357,7 +365,7 @@ pub const S3BatchStore = struct {
     /// same string lands in the wire URL.
     fn requestAllocCanonical(
         self: *S3BatchStore,
-        method: std.http.Method,
+        method: curl_mod.Method,
         url: []const u8,
         path: []const u8,
         query_canon: []const u8,
@@ -370,7 +378,7 @@ pub const S3BatchStore = struct {
 
     fn dispatchSigned(
         self: *S3BatchStore,
-        method: std.http.Method,
+        method: curl_mod.Method,
         url: []const u8,
         path: []const u8,
         query_raw: []const u8,
@@ -397,50 +405,44 @@ pub const S3BatchStore = struct {
         });
         defer signed.deinit(self.allocator);
 
-        var headers_list: std.ArrayListUnmanaged(std.http.Header) = .empty;
-        defer headers_list.deinit(self.allocator);
-        try headers_list.append(self.allocator, .{ .name = "x-amz-date", .value = signed.x_amz_date });
-        try headers_list.append(self.allocator, .{ .name = "x-amz-content-sha256", .value = signed.x_amz_content_sha256 });
-        try headers_list.append(self.allocator, .{ .name = "Authorization", .value = signed.authorization });
-        if (range) |r| try headers_list.append(self.allocator, .{ .name = "Range", .value = r });
-
-        const uri = std.Uri.parse(url) catch return Error.Io;
-
-        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer body_buf.deinit(body_allocator);
-        var aw = std.Io.Writer.Allocating.fromArrayList(body_allocator, &body_buf);
+        const headers = [_]curl_mod.Header{
+            .{ .name = "x-amz-date", .value = signed.x_amz_date },
+            .{ .name = "x-amz-content-sha256", .value = signed.x_amz_content_sha256 },
+            .{ .name = "Authorization", .value = signed.authorization },
+        };
 
         std.log.debug("log s3: → {s} {s} body_size={d}", .{ methodName(method), url, body.len });
 
-        const result = self.http.fetch(.{
-            .location = .{ .uri = uri },
+        const resp = self.curl.request(body_allocator, .{
             .method = method,
-            .payload = if (body.len > 0) body else null,
-            .extra_headers = headers_list.items,
-            .response_writer = if (method == .HEAD) null else &aw.writer,
-            .redirect_behavior = @enumFromInt(0),
+            .url = url,
+            .headers = &headers,
+            .body = body,
+            .range = range,
         }) catch |err| {
             std.log.warn(
-                "log s3: fetch {s} {s} failed: {s}",
+                "log s3: {s} {s} failed: {s}",
                 .{ methodName(method), url, @errorName(err) },
             );
             return Error.Io;
         };
 
-        const owned = aw.toOwnedSlice() catch return Error.OutOfMemory;
         return .{
-            .status = @intFromEnum(result.status),
-            .body = if (owned.len > 0) owned else null,
+            .status = resp.status,
+            .body = if (resp.body) |b| (if (b.len > 0) b else blk: {
+                body_allocator.free(b);
+                break :blk null;
+            }) else null,
         };
     }
 
-    fn methodName(m: std.http.Method) []const u8 {
+    fn methodName(m: curl_mod.Method) []const u8 {
         return switch (m) {
             .GET => "GET",
             .PUT => "PUT",
+            .POST => "POST",
             .HEAD => "HEAD",
             .DELETE => "DELETE",
-            else => "GET",
         };
     }
 };
