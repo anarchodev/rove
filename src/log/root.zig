@@ -1,25 +1,29 @@
-//! rove-log — per-request log buffer + chunked request-id minting.
+//! rove-log — request-id minting + node-wide log buffer.
 //!
-//! `LogStore` holds:
-//!   - a per-tenant in-memory `LogRecord` buffer (the worker's
-//!     dispatch loop appends here on every request)
-//!   - a chunked-reservation counter for `request_id`, persisted to
-//!     a caller-provided KvStore + key (the worker passes app.db at
-//!     `_log/next_request_seq`)
+//! Two responsibilities, two structs:
 //!
-//! `flushLogs` periodically calls `drainRecords` and ships the
-//! `LogRecord`s straight to S3 via `rove-log-server.flush_writer`
-//! (ndjson + sidecar). The standalone log-server reads them back
-//! out via `IndexDb` + range-reads.
+//!   - `RequestIdMinter` is per-tenant. Mints `request_id`s by combining
+//!     the worker_id (upper 16 bits) with a chunked-reservation seq
+//!     (lower 48 bits) persisted into the tenant's app.db at
+//!     `_log/next_request_seq`. Per-tenant because each tenant's
+//!     request_id space must be monotonic across cluster restarts —
+//!     replay would mismatch otherwise.
 //!
-//! There is no longer a record-side KV / records-on-disk path. Pre-
-//! Phase-5.5(a), records lived in a per-tenant `log.db` so the
-//! in-process log-server thread could `list`/`get` them; that thread
-//! is gone, log.db is gone, and this module's API is correspondingly
-//! buffer-only. Tape body bytes still live in the per-tenant
-//! `BlobBackend` (fs or s3 prefix `{base}{tenant}/log-blobs/`); the
-//! BlobBackend is owned by the worker, not by `LogStore`, so it
-//! doesn't appear here either.
+//!   - `NodeLogBuffer` is per-node. A single in-memory `LogRecord`
+//!     buffer that the dispatch path appends to from every tenant on
+//!     the node. `flushLogs` periodically drains it into one combined
+//!     batch and PUTs it to S3. Per-node because the on-the-wire
+//!     layout interleaves tenants — the worker writes one object per
+//!     flush window regardless of tenant fan-in.
+//!
+//! Pre-Phase-5.5(a-2): a single `LogStore` per tenant held both
+//! responsibilities, plus a per-tenant in-memory buffer. The buffer
+//! was leftover from the raft-era per-tenant `log.db` model — every
+//! flush combined all tenants' buffers into one batch anyway, so the
+//! per-tenant slicing was complexity with no purpose. Splitting the
+//! struct removes a `HashMap(instance_id, *Buffer)` from the hot
+//! append path and folds the two-pass `flushLogs` into a single
+//! threshold check + drain.
 //!
 //! ## Best-effort, not durable
 //!
@@ -93,7 +97,7 @@ pub const TapePayloads = struct {
 };
 
 /// One request's log entry. All `[]const u8` fields are owned by the
-/// record (allocated via the LogStore's allocator). `deinit` frees them.
+/// record (allocated via the buffer's allocator). `deinit` frees them.
 pub const LogRecord = struct {
     /// Tenant the request was scoped to. Lives on the record so a
     /// single per-node ndjson can interleave records from many
@@ -152,9 +156,12 @@ pub const Options = struct {
     seq_key: []const u8,
 };
 
-pub const LogStore = struct {
+/// Per-tenant request_id minter. Holds the chunked-reservation state
+/// for one tenant; `nextRequestId` mints the next id and persists
+/// every `REQUEST_ID_CHUNK`-th one to the kv store.
+pub const RequestIdMinter = struct {
     allocator: std.mem.Allocator,
-    /// Upper 16 bits of every `request_id` minted by this LogStore.
+    /// Upper 16 bits of every `request_id` minted by this minter.
     /// Sourced from raft node id at the worker layer; unique per node.
     worker_id: u16,
     /// Where chunked-reservation persists. See `Options.seq_kv`.
@@ -174,24 +181,8 @@ pub const LogStore = struct {
     /// gap up to `REQUEST_ID_CHUNK` wide — acceptable since the
     /// invariant we need is "ids never collide," not "ids are dense."
     reserved_until: u48,
-    /// In-memory batch waiting for the next flush. Each record is
-    /// fully owned (its slices were allocated by `allocator` when the
-    /// caller built the record).
-    buffer: std.ArrayList(LogRecord),
-    /// Wall-clock at the last `drainRecords` call. Used by `shouldFlush`
-    /// for the time-based threshold.
-    last_flush_ns: i64,
-    /// Guards `buffer` and `last_flush_ns`. The dispatch thread calls
-    /// `append`; a per-worker flusher thread calls `drainRecords`.
-    /// `nextRequestId` does NOT take this — it operates on a
-    /// dispatch-only counter that the flusher never reads.
-    mutex: std.Thread.Mutex = .{},
 
-    flush_threshold_records: u32 = 256,
-    flush_threshold_bytes: u32 = 64 * 1024,
-    flush_interval_ns: i64 = 1 * std.time.ns_per_s,
-
-    /// Open a LogStore. Reads its chunked-reservation counter from
+    /// Open a minter. Reads its chunked-reservation counter from
     /// `opts.seq_kv` at `opts.seq_key`; if absent, starts at 0. Any
     /// gap between the loaded value and what was actually handed out
     /// before the previous crash is intentional — see `REQUEST_ID_CHUNK`.
@@ -199,17 +190,15 @@ pub const LogStore = struct {
         allocator: std.mem.Allocator,
         worker_id: u16,
         opts: Options,
-    ) Error!LogStore {
+    ) Error!RequestIdMinter {
         const seq_key = allocator.dupe(u8, opts.seq_key) catch return Error.OutOfMemory;
-        var self: LogStore = .{
+        var self: RequestIdMinter = .{
             .allocator = allocator,
             .worker_id = worker_id,
             .seq_kv = opts.seq_kv,
             .seq_key = seq_key,
             .next_request_seq = 0,
             .reserved_until = 0,
-            .buffer = .empty,
-            .last_flush_ns = @as(i64, @intCast(std.time.nanoTimestamp())),
         };
         const loaded = self.loadNextSeq() catch 0;
         self.next_request_seq = loaded;
@@ -217,9 +206,7 @@ pub const LogStore = struct {
         return self;
     }
 
-    pub fn deinit(self: *LogStore) void {
-        for (self.buffer.items) |*r| r.deinit(self.allocator);
-        self.buffer.deinit(self.allocator);
+    pub fn deinit(self: *RequestIdMinter) void {
         self.allocator.free(self.seq_key);
         self.* = undefined;
     }
@@ -234,7 +221,7 @@ pub const LogStore = struct {
     /// On restart, any unused tail of the last reservation is
     /// abandoned — ids become sparse across restarts, but never
     /// collide.
-    pub fn nextRequestId(self: *LogStore) Error!u64 {
+    pub fn nextRequestId(self: *RequestIdMinter) Error!u64 {
         if (self.next_request_seq >= self.reserved_until) {
             self.reserved_until = self.next_request_seq + REQUEST_ID_CHUNK;
             self.persistReservedUntil() catch return Error.Kv;
@@ -244,14 +231,63 @@ pub const LogStore = struct {
         return (@as(u64, self.worker_id) << 48) | @as(u64, seq);
     }
 
+    fn loadNextSeq(self: *RequestIdMinter) Error!u48 {
+        const bytes = self.seq_kv.get(self.seq_key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return Error.Kv,
+        };
+        defer self.allocator.free(bytes);
+        return std.fmt.parseInt(u48, bytes, 16) catch 0;
+    }
+
+    fn persistReservedUntil(self: *RequestIdMinter) !void {
+        var buf: [12]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{x:0>12}", .{self.reserved_until}) catch unreachable;
+        self.seq_kv.put(self.seq_key, s) catch return Error.Kv;
+    }
+};
+
+/// Single per-node in-memory `LogRecord` buffer. The dispatch path
+/// appends from every tenant on the node; `flushLogs` drains the
+/// whole buffer into one batch per flush window. Thresholds are
+/// applied to the combined buffer, not per tenant.
+pub const NodeLogBuffer = struct {
+    allocator: std.mem.Allocator,
+    /// In-memory batch waiting for the next flush. Each record is
+    /// fully owned (its slices were allocated by `allocator` when the
+    /// caller built the record).
+    buffer: std.ArrayList(LogRecord),
+    /// Wall-clock at the last `drainRecords` call. Used by `shouldFlush`
+    /// for the time-based threshold.
+    last_flush_ns: i64,
+    /// Guards `buffer` and `last_flush_ns`. Multiple dispatch threads
+    /// (one per tenant in the worker pool, in principle) can call
+    /// `append` concurrently with the flusher's `drainRecords`. The
+    /// critical section is just an ArrayList.append — sub-microsecond.
+    mutex: std.Thread.Mutex = .{},
+
+    flush_threshold_records: u32 = 1024,
+    flush_threshold_bytes: u32 = 1 * 1024 * 1024,
+    flush_interval_ns: i64 = 1 * std.time.ns_per_s,
+
+    pub fn init(allocator: std.mem.Allocator) NodeLogBuffer {
+        return .{
+            .allocator = allocator,
+            .buffer = .empty,
+            .last_flush_ns = @as(i64, @intCast(std.time.nanoTimestamp())),
+        };
+    }
+
+    pub fn deinit(self: *NodeLogBuffer) void {
+        for (self.buffer.items) |*r| r.deinit(self.allocator);
+        self.buffer.deinit(self.allocator);
+        self.* = undefined;
+    }
+
     /// Append a fully-owned LogRecord to the buffer. Caller transfers
-    /// ownership of all slices; the LogStore frees them on flush or
-    /// deinit. Use `nextRequestId` first to get a stable id.
-    ///
-    /// Holds `mutex` for the duration of the push. The flusher thread
-    /// does the same in `drainRecords`. Critical section is just an
-    /// ArrayList.append — sub-microsecond.
-    pub fn append(self: *LogStore, record: LogRecord) Error!void {
+    /// ownership of all slices; the buffer frees them on flush or
+    /// deinit.
+    pub fn append(self: *NodeLogBuffer, record: LogRecord) Error!void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.buffer.append(self.allocator, record) catch return Error.OutOfMemory;
@@ -260,9 +296,9 @@ pub const LogStore = struct {
     /// Returns true if any flush threshold has been crossed:
     ///   - record count >= flush_threshold_records
     ///   - estimated buffer bytes >= flush_threshold_bytes
-    ///   - elapsed since last flush >= flush_interval_ns
+    ///   - elapsed since last flush >= flush_interval_ns (when buffer non-empty)
     /// Cheap to call every tick. Takes the mutex briefly.
-    pub fn shouldFlush(self: *LogStore, now_ns: i64) bool {
+    pub fn shouldFlush(self: *NodeLogBuffer, now_ns: i64) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.buffer.items.len == 0) return false;
@@ -274,14 +310,12 @@ pub const LogStore = struct {
         return false;
     }
 
-    /// Hand the buffered records to the caller. The worker's flush
-    /// path needs the structured `LogRecord`s (not a serialized blob)
-    /// to build per-record offsets for the S3 sidecar. Caller takes
-    /// ownership of every record's `[]const u8` fields and the outer
-    /// slice; deinit each then `free` the slice with `allocator`.
-    /// Updates `last_flush_ns` so the time-based threshold doesn't
-    /// fire repeatedly. Returns null when the buffer is empty.
-    pub fn drainRecords(self: *LogStore, allocator: std.mem.Allocator) Error!?[]LogRecord {
+    /// Hand the buffered records to the caller. Caller takes ownership
+    /// of every record's `[]const u8` fields and the outer slice;
+    /// deinit each then `free` the slice with `allocator`. Updates
+    /// `last_flush_ns` so the time-based threshold doesn't fire
+    /// repeatedly. Returns null when the buffer is empty.
+    pub fn drainRecords(self: *NodeLogBuffer, allocator: std.mem.Allocator) Error!?[]LogRecord {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.last_flush_ns = @as(i64, @intCast(std.time.nanoTimestamp()));
@@ -294,21 +328,6 @@ pub const LogStore = struct {
         // buffer without re-freeing them — caller owns now.
         self.buffer.clearRetainingCapacity();
         return out;
-    }
-
-    fn loadNextSeq(self: *LogStore) Error!u48 {
-        const bytes = self.seq_kv.get(self.seq_key) catch |err| switch (err) {
-            error.NotFound => return 0,
-            else => return Error.Kv,
-        };
-        defer self.allocator.free(bytes);
-        return std.fmt.parseInt(u48, bytes, 16) catch 0;
-    }
-
-    fn persistReservedUntil(self: *LogStore) !void {
-        var buf: [12]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "{x:0>12}", .{self.reserved_until}) catch unreachable;
-        self.seq_kv.put(self.seq_key, s) catch return Error.Kv;
     }
 };
 
@@ -362,13 +381,13 @@ fn buildRecord(
     };
 }
 
-const TestStore = struct {
+const TestMinter = struct {
     allocator: std.mem.Allocator,
     tmp_dir: []u8,
     seq_kv: *kv_mod.KvStore,
-    log: LogStore,
+    minter: RequestIdMinter,
 
-    fn init(allocator: std.mem.Allocator) !TestStore {
+    fn init(allocator: std.mem.Allocator) !TestMinter {
         const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
         const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-log-test-{x}", .{seed});
         errdefer allocator.free(tmp_dir);
@@ -378,61 +397,61 @@ const TestStore = struct {
         defer allocator.free(seq_path);
         const seq_kv = try kv_mod.KvStore.open(allocator, seq_path);
         errdefer seq_kv.close();
-        const log = try LogStore.init(allocator, 7, .{
+        const minter = try RequestIdMinter.init(allocator, 7, .{
             .seq_kv = seq_kv,
             .seq_key = "_log/next_request_seq",
         });
-        return .{ .allocator = allocator, .tmp_dir = tmp_dir, .seq_kv = seq_kv, .log = log };
+        return .{ .allocator = allocator, .tmp_dir = tmp_dir, .seq_kv = seq_kv, .minter = minter };
     }
 
-    fn deinit(self: *TestStore) void {
-        self.log.deinit();
+    fn deinit(self: *TestMinter) void {
+        self.minter.deinit();
         self.seq_kv.close();
         std.fs.cwd().deleteTree(self.tmp_dir) catch {};
         self.allocator.free(self.tmp_dir);
     }
 };
 
-test "shouldFlush honors record-count threshold" {
+test "NodeLogBuffer shouldFlush honors record-count threshold" {
     const a = testing.allocator;
-    var fx = try TestStore.init(a);
-    defer fx.deinit();
-    fx.log.flush_threshold_records = 3;
-    fx.log.flush_interval_ns = std.math.maxInt(i64); // disable time path
+    var buf = NodeLogBuffer.init(a);
+    defer buf.deinit();
+    buf.flush_threshold_records = 3;
+    buf.flush_interval_ns = std.math.maxInt(i64); // disable time path
 
     const now: i64 = 0;
-    try testing.expect(!fx.log.shouldFlush(now));
-    try fx.log.append(try buildRecord(a, 1, "GET", "/", 200, .ok, ""));
-    try testing.expect(!fx.log.shouldFlush(now));
-    try fx.log.append(try buildRecord(a, 2, "GET", "/", 200, .ok, ""));
-    try testing.expect(!fx.log.shouldFlush(now));
-    try fx.log.append(try buildRecord(a, 3, "GET", "/", 200, .ok, ""));
-    try testing.expect(fx.log.shouldFlush(now));
+    try testing.expect(!buf.shouldFlush(now));
+    try buf.append(try buildRecord(a, 1, "GET", "/", 200, .ok, ""));
+    try testing.expect(!buf.shouldFlush(now));
+    try buf.append(try buildRecord(a, 2, "GET", "/", 200, .ok, ""));
+    try testing.expect(!buf.shouldFlush(now));
+    try buf.append(try buildRecord(a, 3, "GET", "/", 200, .ok, ""));
+    try testing.expect(buf.shouldFlush(now));
 }
 
-test "shouldFlush honors time threshold" {
+test "NodeLogBuffer shouldFlush honors time threshold" {
     const a = testing.allocator;
-    var fx = try TestStore.init(a);
-    defer fx.deinit();
-    fx.log.flush_threshold_records = 1000;
-    fx.log.flush_threshold_bytes = std.math.maxInt(u32);
-    fx.log.flush_interval_ns = 1_000_000; // 1 ms
-    fx.log.last_flush_ns = 0;
+    var buf = NodeLogBuffer.init(a);
+    defer buf.deinit();
+    buf.flush_threshold_records = 1000;
+    buf.flush_threshold_bytes = std.math.maxInt(u32);
+    buf.flush_interval_ns = 1_000_000; // 1 ms
+    buf.last_flush_ns = 0;
 
-    try fx.log.append(try buildRecord(a, 1, "GET", "/", 200, .ok, ""));
-    try testing.expect(!fx.log.shouldFlush(500_000));
-    try testing.expect(fx.log.shouldFlush(1_500_000));
+    try buf.append(try buildRecord(a, 1, "GET", "/", 200, .ok, ""));
+    try testing.expect(!buf.shouldFlush(500_000));
+    try testing.expect(buf.shouldFlush(1_500_000));
 }
 
-test "drainRecords transfers ownership and clears the buffer" {
+test "NodeLogBuffer drainRecords transfers ownership and clears the buffer" {
     const a = testing.allocator;
-    var fx = try TestStore.init(a);
-    defer fx.deinit();
+    var buf = NodeLogBuffer.init(a);
+    defer buf.deinit();
 
-    try fx.log.append(try buildRecord(a, 1, "GET", "/a", 200, .ok, ""));
-    try fx.log.append(try buildRecord(a, 2, "POST", "/b", 503, .fault, "boom\n"));
+    try buf.append(try buildRecord(a, 1, "GET", "/a", 200, .ok, ""));
+    try buf.append(try buildRecord(a, 2, "POST", "/b", 503, .fault, "boom\n"));
 
-    const drained = (try fx.log.drainRecords(a)).?;
+    const drained = (try buf.drainRecords(a)).?;
     defer {
         for (drained) |*r| r.deinit(a);
         a.free(drained);
@@ -440,11 +459,11 @@ test "drainRecords transfers ownership and clears the buffer" {
     try testing.expectEqual(@as(usize, 2), drained.len);
     try testing.expectEqualStrings("/a", drained[0].path);
     try testing.expectEqualStrings("/b", drained[1].path);
-    try testing.expectEqual(@as(usize, 0), fx.log.buffer.items.len);
-    try testing.expectEqual(@as(?[]LogRecord, null), try fx.log.drainRecords(a));
+    try testing.expectEqual(@as(usize, 0), buf.buffer.items.len);
+    try testing.expectEqual(@as(?[]LogRecord, null), try buf.drainRecords(a));
 }
 
-test "next_request_seq persists across LogStore reopen (chunked)" {
+test "RequestIdMinter persists next_request_seq across reopen (chunked)" {
     const a = testing.allocator;
     const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
     const tmp_dir = try std.fmt.allocPrint(a, "/tmp/rove-log-persist-{x}", .{seed});
@@ -460,27 +479,27 @@ test "next_request_seq persists across LogStore reopen (chunked)" {
     {
         const seq_kv = try kv_mod.KvStore.open(a, seq_path);
         defer seq_kv.close();
-        var log = try LogStore.init(a, 0, .{
+        var minter = try RequestIdMinter.init(a, 0, .{
             .seq_kv = seq_kv,
             .seq_key = "_log/next_request_seq",
         });
-        defer log.deinit();
-        first_ids[0] = try log.nextRequestId();
-        first_ids[1] = try log.nextRequestId();
-        first_ids[2] = try log.nextRequestId();
+        defer minter.deinit();
+        first_ids[0] = try minter.nextRequestId();
+        first_ids[1] = try minter.nextRequestId();
+        first_ids[2] = try minter.nextRequestId();
     }
     {
         const seq_kv = try kv_mod.KvStore.open(a, seq_path);
         defer seq_kv.close();
-        var log = try LogStore.init(a, 0, .{
+        var minter = try RequestIdMinter.init(a, 0, .{
             .seq_kv = seq_kv,
             .seq_key = "_log/next_request_seq",
         });
-        defer log.deinit();
-        const next = try log.nextRequestId();
+        defer minter.deinit();
+        const next = try minter.nextRequestId();
         // Under chunked reservation: the first nextRequestId call in
         // the previous process persisted `reserved_until = REQUEST_ID_CHUNK`.
-        // The reopened store loads that value and hands out its first
+        // The reopened minter loads that value and hands out its first
         // id at exactly `REQUEST_ID_CHUNK` — the intervening seqs
         // 3..REQUEST_ID_CHUNK-1 become an intentional sparse gap.
         try testing.expectEqual(@as(u64, REQUEST_ID_CHUNK), next);
@@ -488,17 +507,17 @@ test "next_request_seq persists across LogStore reopen (chunked)" {
     }
 }
 
-test "worker_id occupies the upper 16 bits of request_id" {
+test "RequestIdMinter worker_id occupies the upper 16 bits of request_id" {
     const a = testing.allocator;
-    var fx = try TestStore.init(a);
+    var fx = try TestMinter.init(a);
     defer fx.deinit();
     // Override the worker_id by re-initing — fixture defaults to 7.
-    fx.log.deinit();
-    fx.log = try LogStore.init(a, 0xCAFE, .{
+    fx.minter.deinit();
+    fx.minter = try RequestIdMinter.init(a, 0xCAFE, .{
         .seq_kv = fx.seq_kv,
         .seq_key = "_log/next_request_seq",
     });
-    const id = try fx.log.nextRequestId();
+    const id = try fx.minter.nextRequestId();
     try testing.expectEqual(@as(u64, 0xCAFE), id >> 48);
     try testing.expectEqual(@as(u64, 0), id & 0xFFFFFFFFFFFF);
 }

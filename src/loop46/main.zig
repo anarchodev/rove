@@ -17,8 +17,10 @@
 //! Per-worker (thread-local):
 //!   - rove `Registry`, rove-io `Io`, rove-h2 `H2`
 //!   - per-worker `Tenant` with its own `__root__.db` sqlite connection
-//!   - per-tenant `KvStore` + `LogStore` (every worker opens its own
-//!     — NOMUTEX sqlite connections cannot be shared across threads)
+//!   - per-tenant `KvStore` + `RequestIdMinter` (every worker opens
+//!     its own — NOMUTEX sqlite connections cannot be shared across
+//!     threads). One node-wide `NodeLogBuffer` per worker for the
+//!     interleaved log batches.
 //!   - qjs `Dispatcher` (its own arena + snapshot)
 //!   - penalty box, raft-pending collection
 //!

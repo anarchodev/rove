@@ -1082,7 +1082,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 std.log.warn("rove-js: getOrOpenTenantLog({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 break :blk 0;
             };
-            break :blk tl_opt.store.nextRequestId() catch |err| {
+            break :blk tl_opt.id_minter.nextRequestId() catch |err| {
                 std.log.warn("rove-js: nextRequestId({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 break :blk 0;
             };

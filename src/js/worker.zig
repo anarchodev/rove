@@ -283,23 +283,18 @@ fn stubCompile(
     return error.CompileNotSupportedOnWorker;
 }
 
-/// Per-tenant log state held by the worker. Owns the `BlobBackend`
-/// for tape body / per-channel tape blobs and a `LogStore` whose
-/// chunked-reservation counter persists into the tenant's app.db.
-/// Opened eagerly in `Worker.create`, closed in `Worker.destroy`.
+/// Per-tenant log state held by the worker — currently just the
+/// per-tenant `RequestIdMinter`. Opened eagerly in `Worker.create`,
+/// closed in `Worker.destroy`.
 ///
-/// The `LogStore`'s in-memory buffer accumulates `LogRecord`s as
-/// the dispatch path appends them; `flushLogs` periodically drains
-/// the buffer to S3 (or in-memory dev store) via `flush_writer`.
+/// The in-memory record buffer that used to live here has moved to
+/// the worker-wide `log_buffer: NodeLogBuffer` (one buffer per node,
+/// not per tenant), since every flush combines all tenants' records
+/// into one batch anyway. See `docs/logs-plan.md` §3.1 / §6.9.
 pub const TenantLog = struct {
     allocator: std.mem.Allocator,
     instance_id: []u8,
-    /// Owned blob backend for tape body / per-channel tape blobs.
-    /// Same `.fs` / `.s3` switch as `TenantFiles.blob_backend`; for
-    /// `.s3` the per-tenant prefix is `{base}{inst.id}/log-blobs/`.
-    /// The standalone log-server reads from this same backend.
-    blob_backend: blob_mod.BlobBackend,
-    store: log_mod.LogStore,
+    id_minter: log_mod.RequestIdMinter,
 
     pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantLog {
         return openTenantLog(worker, inst, worker.log_worker_id);
@@ -443,12 +438,13 @@ pub const WorkerConfig = struct {
     /// rebound to the scope's store. Root bearer token required.
     /// Borrowed; caller keeps it alive for the worker's lifetime.
     admin_api_domain: ?[]const u8 = null,
-    /// Upper 16 bits of every LogStore request_id this worker issues.
-    /// Must be unique per Worker instance within one process — if two
-    /// workers on the same node both use the same id, their captured
-    /// log records will collide on `nextRequestId`. When null, falls
-    /// back to `raft.config.node_id`, which is correct for the
-    /// single-worker-per-process case but wrong for multi-worker.
+    /// Upper 16 bits of every `request_id` this worker's tenants
+    /// mint. Must be unique per Worker instance within one process
+    /// — if two workers on the same node both use the same id,
+    /// their captured log records will collide on `nextRequestId`.
+    /// When null, falls back to `raft.config.node_id`, which is
+    /// correct for the single-worker-per-process case but wrong for
+    /// multi-worker.
     log_worker_id: ?u16 = null,
     /// Per-(instance, action) rate limit caps. v1 uses a single
     /// tier — operator can tune via CLI flags before launch.
@@ -520,10 +516,15 @@ pub fn Worker(comptime opts: Options) type {
         /// that allocation, so lifetimes line up).
         tenant_files_map: TenantMap(TenantFiles),
         /// Per-tenant log state. Same lifetime + key-stability story
-        /// as `tenant_files_map`. Opened eagerly alongside it. The worker's
-        /// dispatch path appends LogRecords into each tenant's
-        /// `store.buffer`; `flushLogs` drains and proposes batches.
+        /// as `tenant_files_map`. Opened eagerly alongside it. Holds
+        /// each tenant's `RequestIdMinter`; the in-memory record
+        /// buffer is `log_buffer` (per-node, not per-tenant).
         tenant_logs: TenantMap(TenantLog),
+        /// Per-node in-memory `LogRecord` buffer. Every tenant's
+        /// dispatch tick appends here; `flushLogs` drains the whole
+        /// buffer into one combined batch per flush window. Replaces
+        /// the per-tenant `LogStore.buffer` from before Phase 5.5(a-2).
+        log_buffer: log_mod.NodeLogBuffer,
         /// Circuit breaker for handlers that blow past their CPU
         /// budget. A tenant with `kill_threshold` interrupts inside a
         /// single `window_ns` gets bounced with 503 for
@@ -551,10 +552,11 @@ pub fn Worker(comptime opts: Options) type {
         /// routing entirely. Cross-tenant scoping uses the
         /// `X-Rove-Scope: <id>` header on this host.
         admin_api_domain: ?[]const u8,
-        /// Upper 16 bits every `LogStore.nextRequestId()` minted by this
-        /// worker stamps onto ids so they don't collide with other
-        /// workers' ids. Copied from `WorkerConfig.log_worker_id` (or the
-        /// raft node id as a fallback).
+        /// Upper 16 bits every `RequestIdMinter.nextRequestId()`
+        /// minted by this worker stamps onto ids so they don't
+        /// collide with other workers' ids. Copied from
+        /// `WorkerConfig.log_worker_id` (or the raft node id as a
+        /// fallback).
         log_worker_id: u16,
         /// Compile callback used by signup to deploy starter content.
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
@@ -575,8 +577,8 @@ pub fn Worker(comptime opts: Options) type {
         files_public_base: ?[]const u8,
 
         /// Background log flusher — owns its own thread, sleeps on
-        /// `flusher_wake` between ticks, drains every tenant's
-        /// LogStore via `flushLogs`, and PUTs each batch into
+        /// `flusher_wake` between ticks, drains the worker's
+        /// `log_buffer` via `flushLogs`, and PUTs each batch into
         /// `log_batch_store`. Decouples request latency from S3 RTT:
         /// the dispatch path's `captureLog` is now a mutex-protected
         /// ArrayList.append, with the multi-millisecond S3 round-
@@ -623,6 +625,7 @@ pub fn Worker(comptime opts: Options) type {
                 .raft = config.raft,
                 .tenant_files_map = .empty,
                 .tenant_logs = .empty,
+                .log_buffer = log_mod.NodeLogBuffer.init(allocator),
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .limiter = limiter_mod.RateLimiter.init(allocator, config.rate_limit_caps),
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
@@ -663,9 +666,9 @@ pub fn Worker(comptime opts: Options) type {
         /// Background log-flusher loop. Wakes every
         /// `FLUSHER_TICK_NS` (50 ms — matches the existing periodic
         /// scheduler default) OR immediately when `flusher_wake` is
-        /// signalled. Calls `flushLogs(self)` which iterates each
-        /// tenant's `LogStore`, drains records past any threshold
-        /// (count / bytes / time), and PUTs them through
+        /// signalled. Calls `flushLogs(self)` which checks the node-
+        /// wide `log_buffer` against its thresholds (count / bytes /
+        /// time) and, when crossed, drains + PUTs through
         /// `log_batch_store`. The S3 RTT happens entirely on this
         /// thread — the dispatch path stays free of synchronous
         /// network I/O.
@@ -706,6 +709,7 @@ pub fn Worker(comptime opts: Options) type {
             self.limiter.deinit();
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
+            self.log_buffer.deinit();
             self.tenant_files_map.deinit(allocator);
             self.raft_pending.deinit();
             self.dispatcher.deinit();
@@ -917,11 +921,10 @@ pub fn getOrOpenTenantFiles(
 // ── Per-tenant log loading ────────────────────────────────────────────
 //
 // Mirrors the TenantFiles helpers above. Each tenant gets a
-// `log-blobs/` BlobBackend (tape body bytes) and a LogStore whose
-// chunked-reservation counter persists into the tenant's app.db.
+// per-tenant `RequestIdMinter` whose chunked-reservation counter
+// persists into the tenant's app.db at `_log/next_request_seq`.
 // Opened eagerly during `Worker.create`; freed during
-// `Worker.destroy`. Per-record append happens during
-// dispatchPending; batch flush to S3 happens in `flushLogs`.
+// `Worker.destroy`.
 
 fn openTenantLog(
     worker: anytype,
@@ -929,14 +932,6 @@ fn openTenantLog(
     worker_id: u16,
 ) !*TenantLog {
     const allocator = worker.allocator;
-
-    var blob_backend = try blob_mod.BlobBackend.openPerTenant(
-        allocator,
-        worker.blob_backend_cfg,
-        inst.id,
-        "log-blobs",
-    );
-    errdefer blob_backend.deinit();
 
     const id_copy = try allocator.dupe(u8, inst.id);
     errdefer allocator.free(id_copy);
@@ -946,10 +941,9 @@ fn openTenantLog(
     tl.* = .{
         .allocator = allocator,
         .instance_id = id_copy,
-        .blob_backend = blob_backend,
-        .store = undefined,
+        .id_minter = undefined,
     };
-    tl.store = try log_mod.LogStore.init(
+    tl.id_minter = try log_mod.RequestIdMinter.init(
         allocator,
         worker_id,
         .{
@@ -961,8 +955,7 @@ fn openTenantLog(
 }
 
 fn freeTenantLog(allocator: std.mem.Allocator, tl: *TenantLog) void {
-    tl.store.deinit();
-    tl.blob_backend.deinit();
+    tl.id_minter.deinit();
     allocator.free(tl.instance_id);
     allocator.destroy(tl);
 }
@@ -1213,10 +1206,10 @@ fn captureLogInner(
     const a_host = try allocator.dupe(u8, host);
     errdefer allocator.free(a_host);
 
-    const id = request_id orelse try tl.store.nextRequestId();
+    const id = request_id orelse try tl.id_minter.nextRequestId();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
-    try tl.store.append(.{
+    try worker.log_buffer.append(.{
         .tenant_id = a_tenant,
         .request_id = id,
         .deployment_id = deployment_id,
@@ -1233,84 +1226,40 @@ fn captureLogInner(
     });
 }
 
-/// Periodically drain each tenant's log buffer into a `.ndjson`
-/// payload + `.idx.json` sidecar and PUT both to the configured
-/// `BatchStore` (Phase 5.5 a). Runs on the leader only — followers'
-/// buffers are always empty because `dispatchPending` early-returns
-/// 503 on followers. Lossy on PUT failure: records already left the
-/// buffer; per `docs/logs-plan.md` §1 a node-failure window may drop
-/// one batch.
-/// Phase 5.5(a-2) interleaved-per-node flush. Iterates every
-/// tenant's `LogStore`, drains records into one combined slice,
-/// and emits a single `_logs/{node}/{batch}.ndjson` PUT — one S3
-/// object per flush window per node, regardless of how many
-/// tenants contributed. Each LogRecord carries its `tenant_id`;
-/// the indexer demuxes on read.
+/// Periodically drain the worker's node-wide log buffer into a
+/// `.ndjson` payload + `.idx.json` sidecar and PUT both to the
+/// configured `BatchStore` (Phase 5.5 a). Runs on the leader only
+/// — followers' buffer is always empty because `dispatchPending`
+/// early-returns 503 on followers. Lossy on PUT failure: records
+/// already left the buffer; per `docs/logs-plan.md` §1 a node-
+/// failure window may drop one batch.
 ///
-/// We drain *every* tenant whose `shouldFlush` is true (per the
-/// per-tenant threshold check) PLUS every other tenant that has
-/// any buffered records, so the combined batch reflects the full
-/// per-node window. Skipping non-threshold tenants would split
-/// records across windows and give the indexer half-empty
-/// batches.
+/// Phase 5.5(a-2) interleaved-per-node flush: every record carries
+/// its `tenant_id`; the indexer demuxes on read. One S3 object per
+/// flush window per node regardless of tenant fan-in.
 pub fn flushLogs(worker: anytype) !void {
     const allocator = worker.allocator;
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const is_leader = worker.raft.isLeader();
 
-    // First pass: do any tenants have a flush threshold crossed?
-    // If none, skip the whole tick — log buffers live on.
-    var any_should_flush = false;
-    {
-        var it = worker.tenant_logs.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.*.store.shouldFlush(now_ns)) {
-                any_should_flush = true;
-                break;
-            }
-        }
-    }
-    if (!any_should_flush) return;
+    if (!worker.log_buffer.shouldFlush(now_ns)) return;
 
-    // Second pass: drain every non-empty tenant. drainRecords clears
-    // its buffer; the records' []const u8 fields move into our combined
-    // slice (we own them now).
-    var combined: std.ArrayListUnmanaged(log_mod.LogRecord) = .empty;
+    const drained = worker.log_buffer.drainRecords(allocator) catch |err| {
+        std.log.warn(
+            "rove-js flushLogs: drainRecords failed: {s}",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    const records = drained orelse return;
     defer {
-        for (combined.items) |*r| r.deinit(allocator);
-        combined.deinit(allocator);
-    }
-    {
-        var it = worker.tenant_logs.iterator();
-        while (it.next()) |entry| {
-            const tl = entry.value_ptr.*;
-            const drained = tl.store.drainRecords(allocator) catch |err| {
-                std.log.warn(
-                    "rove-js flushLogs: drainRecords({s}) failed: {s}",
-                    .{ tl.instance_id, @errorName(err) },
-                );
-                continue;
-            };
-            const records = drained orelse continue;
-            defer allocator.free(records);
-            combined.appendSlice(allocator, records) catch |err| {
-                std.log.warn(
-                    "rove-js flushLogs: combined.appendSlice failed: {s}",
-                    .{@errorName(err)},
-                );
-                // Free the records we couldn't take ownership of, then bail.
-                for (records) |*r| r.deinit(allocator);
-                return;
-            };
-        }
+        for (records) |*r| r.deinit(allocator);
+        allocator.free(records);
     }
 
-    if (combined.items.len == 0) return;
-
-    if (!is_leader) {
+    if (!worker.raft.isLeader()) {
         std.log.warn(
             "rove-js flushLogs: dropping {d}-record batch — lost leadership mid-tick",
-            .{combined.items.len},
+            .{records.len},
         );
         return;
     }
@@ -1323,12 +1272,12 @@ pub fn flushLogs(worker: anytype) !void {
         allocator,
         worker.log_batch_store,
         node_id_hex,
-        combined.items,
+        records,
         flush_unix_ms,
     ) catch |err| {
         std.log.warn(
             "rove-js flushLogs: writeBatch ({d} records) failed: {s}",
-            .{ combined.items.len, @errorName(err) },
+            .{ records.len, @errorName(err) },
         );
     };
 }
@@ -2071,11 +2020,12 @@ test "commitTxn drops the undo row so the next sweep is a no-op" {
     try testing.expectEqualStrings("durable-value", v);
 }
 
-test "captureLog appends a record to the tenant's LogStore" {
+test "captureLog appends a record to the worker's node-wide buffer" {
     // Verifies the captureLog helper end to end: build a fake worker
     // with a real TenantLog open against a temp dir, call captureLog,
-    // then drain + apply the buffer and read the record back. Mirrors
-    // the dispatchPending capture path without spinning up h2 or raft.
+    // then read the record back out of the worker's log_buffer.
+    // Mirrors the dispatchPending capture path without spinning up
+    // h2 or raft.
     const allocator = testing.allocator;
     const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
     const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-js-logcap-{x}", .{seed});
@@ -2095,20 +2045,18 @@ test "captureLog appends a record to the tenant's LogStore" {
     try tenant.createInstance("acme");
     const inst = tenant.instances.get("acme").?;
 
-    // Construct a TenantLog directly (no Worker involved).
-    const tl_dir = try std.fmt.allocPrint(allocator, "{s}/log-test", .{tmp_dir});
-    defer allocator.free(tl_dir);
-
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
         tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
-        blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
+        log_buffer: log_mod.NodeLogBuffer,
     };
     var fake = FakeWorker{
         .allocator = allocator,
         .tenant_logs = .empty,
+        .log_buffer = log_mod.NodeLogBuffer.init(allocator),
     };
     defer fake.tenant_logs.deinit(allocator);
+    defer fake.log_buffer.deinit();
 
     const tl = try openTenantLog(&fake, inst, 7);
     defer freeTenantLog(allocator, tl);
@@ -2132,11 +2080,8 @@ test "captureLog appends a record to the tenant's LogStore" {
         .{},
     );
 
-    // Buffer should hold one record. The worker doesn't read records
-    // back through LogStore anymore — flushLogs drains them into S3
-    // sidecars, the standalone server reads from there.
-    try testing.expectEqual(@as(usize, 1), tl.store.buffer.items.len);
-    const buffered = &tl.store.buffer.items[0];
+    try testing.expectEqual(@as(usize, 1), fake.log_buffer.buffer.items.len);
+    const buffered = &fake.log_buffer.buffer.items[0];
     try testing.expectEqual(@as(u64, 200), @as(u64, buffered.status));
     try testing.expectEqualStrings("/test", buffered.path);
     try testing.expectEqual(@as(u64, 42), buffered.deployment_id);

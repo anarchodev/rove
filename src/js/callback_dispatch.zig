@@ -254,7 +254,7 @@ fn runOneCallback(
 
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.store.nextRequestId() catch 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
     };
 
     var tapes = worker_mod.RequestTapes.init(allocator);
