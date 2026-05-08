@@ -17,7 +17,13 @@ pub const VERSION: u32 = 1;
 /// One indexed row in a sidecar. Mirrors what `log_index.db`'s
 /// `log_index` table stores per record. Owned strings are duplicated
 /// on parse so the caller can free the source bytes immediately.
+///
+/// Phase 5.5(a-2) interleaved layout: each row carries its own
+/// `tenant_id` so a single per-node sidecar can index records
+/// belonging to many tenants. The indexer demuxes on this when
+/// populating `log_index.db`.
 pub const Record = struct {
+    tenant_id: []const u8,
     request_id: u64,
     received_ns: i64,
     duration_ns: i64,
@@ -38,6 +44,7 @@ pub const Record = struct {
     length: u32,
 
     pub fn deinit(self: *Record, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
         allocator.free(self.method);
         allocator.free(self.path);
         allocator.free(self.host);
@@ -48,13 +55,13 @@ pub const Record = struct {
 
 /// Top-level sidecar shape. `records` is ordered by ascending
 /// `received_ns`, matching the order of lines in the payload.
+/// Records may belong to many tenants; each carries its `tenant_id`.
 pub const IdxFile = struct {
-    tenant_id: []const u8,
     node_id: []const u8,
     batch_id: []const u8,
-    /// S3 / batch-store key the payload lives at. Encoded so that
-    /// `{tenant_id}/{node_id}/{batch_id}.ndjson` lookups don't need
-    /// the indexer to recompose anything.
+    /// S3 / batch-store key the payload lives at. Encoded so the
+    /// `_logs/{node_id}/{batch_id}.ndjson` lookup doesn't need the
+    /// indexer to recompose it.
     ndjson_key: []const u8,
     ndjson_size: u64,
     /// Hex-encoded SHA-256 of the payload bytes. Lets the indexer
@@ -65,7 +72,6 @@ pub const IdxFile = struct {
     records: []Record,
 
     pub fn deinit(self: *IdxFile, allocator: std.mem.Allocator) void {
-        allocator.free(self.tenant_id);
         allocator.free(self.node_id);
         allocator.free(self.batch_id);
         allocator.free(self.ndjson_key);
@@ -102,8 +108,6 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!IdxFile
     if (v != @as(i64, VERSION)) return ParseError.InvalidVersion;
 
     var out: IdxFile = undefined;
-    out.tenant_id = try dupeStr(allocator, obj, "tenant_id");
-    errdefer allocator.free(out.tenant_id);
     out.node_id = try dupeStr(allocator, obj, "node_id");
     errdefer allocator.free(out.node_id);
     out.batch_id = try dupeStr(allocator, obj, "batch_id");
@@ -135,6 +139,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!IdxFile
             else => return ParseError.InvalidJson,
         };
         out.records[filled] = .{
+            .tenant_id = try dupeStr(allocator, ro, "tenant_id"),
             .request_id = try getInt(ro, "request_id"),
             .received_ns = @intCast(try getInt(ro, "received_ns")),
             .duration_ns = @intCast(try getInt(ro, "duration_ns")),
@@ -159,9 +164,7 @@ pub fn encode(allocator: std.mem.Allocator, idx: *const IdxFile) ![]u8 {
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &list);
     const w = &aw.writer;
 
-    try w.writeAll("{\"v\":1,\"tenant_id\":");
-    try writeJsonString(w, idx.tenant_id);
-    try w.writeAll(",\"node_id\":");
+    try w.writeAll("{\"v\":1,\"node_id\":");
     try writeJsonString(w, idx.node_id);
     try w.writeAll(",\"batch_id\":");
     try writeJsonString(w, idx.batch_id);
@@ -177,7 +180,9 @@ pub fn encode(allocator: std.mem.Allocator, idx: *const IdxFile) ![]u8 {
     try w.writeAll(",\"records\":[");
     for (idx.records, 0..) |r, i| {
         if (i > 0) try w.writeAll(",");
-        try w.print("{{\"request_id\":{d},\"received_ns\":{d},\"duration_ns\":{d},\"method\":", .{
+        try w.writeAll("{\"tenant_id\":");
+        try writeJsonString(w, r.tenant_id);
+        try w.print(",\"request_id\":{d},\"received_ns\":{d},\"duration_ns\":{d},\"method\":", .{
             r.request_id,
             r.received_ns,
             r.duration_ns,
@@ -242,6 +247,7 @@ test "encode → parse round-trip" {
     const a = testing.allocator;
     var records = [_]Record{
         .{
+            .tenant_id = "acme",
             .request_id = 1,
             .received_ns = 1_000_000_000,
             .duration_ns = 3_000_000,
@@ -255,12 +261,13 @@ test "encode → parse round-trip" {
             .length = 412,
         },
         .{
+            .tenant_id = "globex",
             .request_id = 2,
             .received_ns = 1_000_001_000,
             .duration_ns = 4_000_000,
             .method = "POST",
             .path = "/users",
-            .host = "acme.test",
+            .host = "globex.test",
             .status = 500,
             .outcome = "handler_error",
             .deployment_id = 7,
@@ -269,10 +276,9 @@ test "encode → parse round-trip" {
         },
     };
     const idx = IdxFile{
-        .tenant_id = "acme",
         .node_id = "00000001",
         .batch_id = "00000000000000000001-0001730764800000",
-        .ndjson_key = "acme/00000001/00000000000000000001-0001730764800000.ndjson",
+        .ndjson_key = "_logs/00000001/00000000000000000001-0001730764800000.ndjson",
         .ndjson_size = 84321,
         .ndjson_sha256 = "deadbeef",
         .first_received_ns = 1_000_000_000,
@@ -285,9 +291,10 @@ test "encode → parse round-trip" {
     var parsed = try parse(a, bytes);
     defer parsed.deinit(a);
 
-    try testing.expectEqualStrings("acme", parsed.tenant_id);
     try testing.expectEqualStrings("00000001", parsed.node_id);
     try testing.expectEqual(@as(usize, 2), parsed.records.len);
+    try testing.expectEqualStrings("acme", parsed.records[0].tenant_id);
+    try testing.expectEqualStrings("globex", parsed.records[1].tenant_id);
     try testing.expectEqual(@as(u64, 1), parsed.records[0].request_id);
     try testing.expectEqualStrings("/api/foo", parsed.records[0].path);
     try testing.expectEqualStrings("handler_error", parsed.records[1].outcome);

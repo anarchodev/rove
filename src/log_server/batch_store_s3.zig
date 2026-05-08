@@ -410,7 +410,7 @@ pub const S3BatchStore = struct {
         errdefer body_buf.deinit(body_allocator);
         var aw = std.Io.Writer.Allocating.fromArrayList(body_allocator, &body_buf);
 
-        std.log.debug("log s3: → {s} {s}", .{ methodName(method), url });
+        std.log.debug("log s3: → {s} {s} body_size={d}", .{ methodName(method), url, body.len });
 
         const result = self.http.fetch(.{
             .location = .{ .uri = uri },

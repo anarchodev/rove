@@ -28,7 +28,6 @@ const SCHEMA: [:0]const u8 =
     \\    v TEXT NOT NULL
     \\);
     \\CREATE TABLE IF NOT EXISTS batches (
-    \\    tenant_id     TEXT NOT NULL,
     \\    node_id       TEXT NOT NULL,
     \\    batch_id      TEXT NOT NULL,
     \\    ndjson_key    TEXT NOT NULL,
@@ -37,9 +36,9 @@ const SCHEMA: [:0]const u8 =
     \\    first_received_ns INTEGER NOT NULL,
     \\    last_received_ns  INTEGER NOT NULL,
     \\    indexed_at_ns INTEGER NOT NULL,
-    \\    PRIMARY KEY (tenant_id, node_id, batch_id)
+    \\    PRIMARY KEY (node_id, batch_id)
     \\);
-    \\CREATE INDEX IF NOT EXISTS batches_recv ON batches (tenant_id, last_received_ns DESC);
+    \\CREATE INDEX IF NOT EXISTS batches_recv ON batches (last_received_ns DESC);
     \\CREATE TABLE IF NOT EXISTS log_index (
     \\    tenant_id      TEXT NOT NULL,
     \\    request_id     INTEGER NOT NULL,
@@ -316,22 +315,21 @@ pub const IndexDb = struct {
 fn execBatchInsert(db: *c.sqlite3, idx: *const sidecar.IdxFile, indexed_at_ns: i64) Error!void {
     const sql =
         \\INSERT OR IGNORE INTO batches
-        \\(tenant_id, node_id, batch_id, ndjson_key, ndjson_size,
+        \\(node_id, batch_id, ndjson_key, ndjson_size,
         \\ ndjson_sha256, first_received_ns, last_received_ns, indexed_at_ns)
-        \\VALUES (?,?,?,?,?,?,?,?,?)
+        \\VALUES (?,?,?,?,?,?,?,?)
     ;
     var st: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(db, sql.ptr, -1, &st, null) != c.SQLITE_OK) return Error.Sqlite;
     defer _ = c.sqlite3_finalize(st);
-    bindText(st.?, 1, idx.tenant_id);
-    bindText(st.?, 2, idx.node_id);
-    bindText(st.?, 3, idx.batch_id);
-    bindText(st.?, 4, idx.ndjson_key);
-    _ = c.sqlite3_bind_int64(st, 5, @intCast(idx.ndjson_size));
-    bindText(st.?, 6, idx.ndjson_sha256);
-    _ = c.sqlite3_bind_int64(st, 7, idx.first_received_ns);
-    _ = c.sqlite3_bind_int64(st, 8, idx.last_received_ns);
-    _ = c.sqlite3_bind_int64(st, 9, indexed_at_ns);
+    bindText(st.?, 1, idx.node_id);
+    bindText(st.?, 2, idx.batch_id);
+    bindText(st.?, 3, idx.ndjson_key);
+    _ = c.sqlite3_bind_int64(st, 4, @intCast(idx.ndjson_size));
+    bindText(st.?, 5, idx.ndjson_sha256);
+    _ = c.sqlite3_bind_int64(st, 6, idx.first_received_ns);
+    _ = c.sqlite3_bind_int64(st, 7, idx.last_received_ns);
+    _ = c.sqlite3_bind_int64(st, 8, indexed_at_ns);
     if (c.sqlite3_step(st) != c.SQLITE_DONE) return Error.Sqlite;
 }
 
@@ -350,7 +348,10 @@ fn execLogIndexInserts(db: *c.sqlite3, idx: *const sidecar.IdxFile) Error!void {
     for (idx.records) |r| {
         _ = c.sqlite3_reset(st);
         _ = c.sqlite3_clear_bindings(st);
-        bindText(st.?, 1, idx.tenant_id);
+        // Each record carries its own tenant_id under the
+        // interleaved-per-node layout (Phase 5.5 a-2). The indexer
+        // demuxes here so log_index stays per-tenant.
+        bindText(st.?, 1, r.tenant_id);
         _ = c.sqlite3_bind_int64(st, 2, @intCast(r.request_id));
         _ = c.sqlite3_bind_int64(st, 3, r.received_ns);
         _ = c.sqlite3_bind_int64(st, 4, r.duration_ns);
@@ -434,6 +435,7 @@ test "insertBatch + queryList round-trips, newest-first" {
 
     var records = [_]sidecar.Record{
         .{
+            .tenant_id = "acme",
             .request_id = 100,
             .received_ns = 1_000,
             .duration_ns = 500_000,
@@ -447,6 +449,7 @@ test "insertBatch + queryList round-trips, newest-first" {
             .length = 100,
         },
         .{
+            .tenant_id = "acme",
             .request_id = 101,
             .received_ns = 2_000,
             .duration_ns = 600_000,
@@ -461,7 +464,6 @@ test "insertBatch + queryList round-trips, newest-first" {
         },
     };
     const batch = sidecar.IdxFile{
-        .tenant_id = "acme",
         .node_id = "00000001",
         .batch_id = "00000000000000000100-1730764800000",
         .ndjson_key = "acme/00000001/00000000000000000100-1730764800000.ndjson",
@@ -503,6 +505,7 @@ test "insertBatch is idempotent on the same sidecar key" {
 
     var records = [_]sidecar.Record{
         .{
+            .tenant_id = "globex",
             .request_id = 50,
             .received_ns = 5_000,
             .duration_ns = 1_000,
@@ -517,7 +520,6 @@ test "insertBatch is idempotent on the same sidecar key" {
         },
     };
     const batch = sidecar.IdxFile{
-        .tenant_id = "globex",
         .node_id = "00000002",
         .batch_id = "00000000000000000050-1730764900000",
         .ndjson_key = "globex/00000002/00000000000000000050-1730764900000.ndjson",
@@ -550,6 +552,7 @@ test "queryShow returns ndjson_key + offset + length" {
 
     var records = [_]sidecar.Record{
         .{
+            .tenant_id = "acme",
             .request_id = 7,
             .received_ns = 1,
             .duration_ns = 1,
@@ -564,7 +567,6 @@ test "queryShow returns ndjson_key + offset + length" {
         },
     };
     const batch = sidecar.IdxFile{
-        .tenant_id = "acme",
         .node_id = "00000001",
         .batch_id = "b1",
         .ndjson_key = "acme/00000001/b1.ndjson",
@@ -601,7 +603,6 @@ test "_meta last_seen_key tracks the most recent insertBatch" {
 
     var records = [_]sidecar.Record{};
     const batch = sidecar.IdxFile{
-        .tenant_id = "t",
         .node_id = "00000001",
         .batch_id = "b1",
         .ndjson_key = "t/00000001/b1.ndjson",

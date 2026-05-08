@@ -95,6 +95,10 @@ pub const TapePayloads = struct {
 /// One request's log entry. All `[]const u8` fields are owned by the
 /// record (allocated via the LogStore's allocator). `deinit` frees them.
 pub const LogRecord = struct {
+    /// Tenant the request was scoped to. Lives on the record so a
+    /// single per-node ndjson can interleave records from many
+    /// tenants — the indexer demuxes on this field. Owned slice.
+    tenant_id: []const u8,
     /// Combined identifier: upper 16 bits = worker_id, lower 48 = seq.
     request_id: u64,
     /// The deployment that was active when this request ran.
@@ -116,6 +120,7 @@ pub const LogRecord = struct {
     tapes: TapePayloads = .{},
 
     pub fn deinit(self: *LogRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
         allocator.free(self.method);
         allocator.free(self.path);
         allocator.free(self.host);
@@ -342,6 +347,7 @@ fn buildRecord(
     console: []const u8,
 ) !LogRecord {
     return .{
+        .tenant_id = try allocator.dupe(u8, "acme"),
         .request_id = request_id,
         .deployment_id = 42,
         .received_ns = 1_000_000_000,

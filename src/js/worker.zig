@@ -1200,8 +1200,11 @@ fn captureLogInner(
     const tl = worker.tenant_logs.get(instance_id) orelse return error.NoTenantLog;
     const allocator = worker.allocator;
 
-    // Dupe the borrowed strings (method/path/host). On failure the
-    // transferred buffers are freed by the outer captureLog wrapper.
+    // Dupe the borrowed strings (tenant_id/method/path/host). On
+    // failure the transferred buffers are freed by the outer
+    // captureLog wrapper.
+    const a_tenant = try allocator.dupe(u8, instance_id);
+    errdefer allocator.free(a_tenant);
     const a_method = try allocator.dupe(u8, method);
     errdefer allocator.free(a_method);
     const a_path = try allocator.dupe(u8, path);
@@ -1213,6 +1216,7 @@ fn captureLogInner(
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
     try tl.store.append(.{
+        .tenant_id = a_tenant,
         .request_id = id,
         .deployment_id = deployment_id,
         .received_ns = received_ns,
@@ -1235,39 +1239,77 @@ fn captureLogInner(
 /// 503 on followers. Lossy on PUT failure: records already left the
 /// buffer; per `docs/logs-plan.md` §1 a node-failure window may drop
 /// one batch.
+/// Phase 5.5(a-2) interleaved-per-node flush. Iterates every
+/// tenant's `LogStore`, drains records into one combined slice,
+/// and emits a single `_logs/{node}/{batch}.ndjson` PUT — one S3
+/// object per flush window per node, regardless of how many
+/// tenants contributed. Each LogRecord carries its `tenant_id`;
+/// the indexer demuxes on read.
+///
+/// We drain *every* tenant whose `shouldFlush` is true (per the
+/// per-tenant threshold check) PLUS every other tenant that has
+/// any buffered records, so the combined batch reflects the full
+/// per-node window. Skipping non-threshold tenants would split
+/// records across windows and give the indexer half-empty
+/// batches.
 pub fn flushLogs(worker: anytype) !void {
     const allocator = worker.allocator;
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     const is_leader = worker.raft.isLeader();
 
-    var it = worker.tenant_logs.iterator();
-    while (it.next()) |entry| {
-        const tl = entry.value_ptr.*;
-        if (!tl.store.shouldFlush(now_ns)) continue;
-        try flushOne(worker, tl, allocator, is_leader);
+    // First pass: do any tenants have a flush threshold crossed?
+    // If none, skip the whole tick — log buffers live on.
+    var any_should_flush = false;
+    {
+        var it = worker.tenant_logs.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*.store.shouldFlush(now_ns)) {
+                any_should_flush = true;
+                break;
+            }
+        }
     }
-}
+    if (!any_should_flush) return;
 
-fn flushOne(
-    worker: anytype,
-    tl: *TenantLog,
-    allocator: std.mem.Allocator,
-    is_leader: bool,
-) !void {
-    const records_opt = tl.store.drainRecords(allocator) catch |err| {
-        std.log.warn("rove-js flushLogs: drainRecords({s}) failed: {s}", .{ tl.instance_id, @errorName(err) });
-        return;
-    };
-    const records = records_opt orelse return;
+    // Second pass: drain every non-empty tenant. drainRecords clears
+    // its buffer; the records' []const u8 fields move into our combined
+    // slice (we own them now).
+    var combined: std.ArrayListUnmanaged(log_mod.LogRecord) = .empty;
     defer {
-        for (records) |*r| r.deinit(allocator);
-        allocator.free(records);
+        for (combined.items) |*r| r.deinit(allocator);
+        combined.deinit(allocator);
     }
+    {
+        var it = worker.tenant_logs.iterator();
+        while (it.next()) |entry| {
+            const tl = entry.value_ptr.*;
+            const drained = tl.store.drainRecords(allocator) catch |err| {
+                std.log.warn(
+                    "rove-js flushLogs: drainRecords({s}) failed: {s}",
+                    .{ tl.instance_id, @errorName(err) },
+                );
+                continue;
+            };
+            const records = drained orelse continue;
+            defer allocator.free(records);
+            combined.appendSlice(allocator, records) catch |err| {
+                std.log.warn(
+                    "rove-js flushLogs: combined.appendSlice failed: {s}",
+                    .{@errorName(err)},
+                );
+                // Free the records we couldn't take ownership of, then bail.
+                for (records) |*r| r.deinit(allocator);
+                return;
+            };
+        }
+    }
+
+    if (combined.items.len == 0) return;
 
     if (!is_leader) {
         std.log.warn(
-            "rove-js flushLogs: dropping {d}-record batch for {s} — lost leadership mid-tick",
-            .{ records.len, tl.instance_id },
+            "rove-js flushLogs: dropping {d}-record batch — lost leadership mid-tick",
+            .{combined.items.len},
         );
         return;
     }
@@ -1279,14 +1321,13 @@ fn flushOne(
     log_server_mod.flush_writer.writeBatch(
         allocator,
         worker.log_batch_store,
-        tl.instance_id,
         node_id_hex,
-        records,
+        combined.items,
         flush_unix_ms,
     ) catch |err| {
         std.log.warn(
-            "rove-js flushLogs: writeBatch({s}, {d} records) failed: {s}",
-            .{ tl.instance_id, records.len, @errorName(err) },
+            "rove-js flushLogs: writeBatch ({d} records) failed: {s}",
+            .{ combined.items.len, @errorName(err) },
         );
     };
 }

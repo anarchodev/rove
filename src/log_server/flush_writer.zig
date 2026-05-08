@@ -30,7 +30,10 @@ pub const Error = error{
 /// `records` are NOT consumed (caller deinits); their `[]const u8`
 /// fields must outlive this call.
 ///
-/// `tenant_id` and `node_id` go into the keys; per the plan,
+/// Phase 5.5(a-2) interleaved-per-node layout: every record
+/// in `records` carries its own `tenant_id`. The object key path
+/// is `_logs/{node_id}/{batch_id}.{ext}` — one ndjson per node per
+/// flush window regardless of how many tenants contributed.
 /// `node_id` is the raft node id zero-padded to u32 hex (8 chars).
 /// `flush_unix_ms` is millis-since-epoch at flush time, used to
 /// disambiguate batch_ids if a node's request_id allocator ever
@@ -38,7 +41,6 @@ pub const Error = error{
 pub fn writeBatch(
     allocator: std.mem.Allocator,
     store: batch_store_mod.BatchStore,
-    tenant_id: []const u8,
     node_id_hex: []const u8,
     records: []const log_mod.LogRecord,
     flush_unix_ms: i64,
@@ -66,6 +68,7 @@ pub fn writeBatch(
         encodeRecordLine(allocator, &ndjson, &r) catch return Error.OutOfMemory;
         const length = ndjson.items.len - offset;
         idx_records[i] = .{
+            .tenant_id = r.tenant_id,
             .request_id = r.request_id,
             .received_ns = r.received_ns,
             .duration_ns = r.duration_ns,
@@ -100,20 +103,19 @@ pub fn writeBatch(
 
     const ndjson_key = std.fmt.allocPrint(
         allocator,
-        "{s}/{s}/{s}.ndjson",
-        .{ tenant_id, node_id_hex, batch_id },
+        "_logs/{s}/{s}.ndjson",
+        .{ node_id_hex, batch_id },
     ) catch return Error.OutOfMemory;
     defer allocator.free(ndjson_key);
 
     const idx_key = std.fmt.allocPrint(
         allocator,
-        "{s}/{s}/{s}.idx.json",
-        .{ tenant_id, node_id_hex, batch_id },
+        "_logs/{s}/{s}.idx.json",
+        .{ node_id_hex, batch_id },
     ) catch return Error.OutOfMemory;
     defer allocator.free(idx_key);
 
     const idx_file = sidecar.IdxFile{
-        .tenant_id = tenant_id,
         .node_id = node_id_hex,
         .batch_id = batch_id,
         .ndjson_key = ndjson_key,
@@ -162,8 +164,10 @@ fn encodeRecordLine(
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, out);
     defer out.* = aw.toArrayList();
     const w = &aw.writer;
+    try w.writeAll("{\"tenant_id\":");
+    try writeJsonString(w, r.tenant_id);
     try w.print(
-        "{{\"request_id\":{d},\"deployment_id\":{d},\"received_ns\":{d},\"duration_ns\":{d},\"status\":{d},\"outcome\":",
+        ",\"request_id\":{d},\"deployment_id\":{d},\"received_ns\":{d},\"duration_ns\":{d},\"status\":{d},\"outcome\":",
         .{ r.request_id, r.deployment_id, r.received_ns, r.duration_ns, r.status },
     );
     try writeJsonString(w, outcomeName(r.outcome));
@@ -262,6 +266,7 @@ const testing = std.testing;
 
 fn makeRecord(allocator: std.mem.Allocator, id: u64, path: []const u8) !log_mod.LogRecord {
     return .{
+        .tenant_id = try allocator.dupe(u8, "acme"),
         .request_id = id,
         .deployment_id = 1,
         .received_ns = @intCast(id * 1000),
@@ -288,22 +293,22 @@ test "writeBatch puts ndjson + sidecar with correct offsets" {
     defer r1.deinit(a);
     const records = [_]log_mod.LogRecord{ r0, r1 };
 
-    try writeBatch(a, store, "acme", "00000001", &records, 1730764800000);
+    try writeBatch(a, store, "00000001", &records, 1730764800000);
 
     // Sidecar present + parses.
-    const sidecar_bytes = try store.get("acme/00000001/00000000000000000001-1730764800000.idx.json", a);
+    const sidecar_bytes = try store.get("_logs/00000001/00000000000000000001-1730764800000.idx.json", a);
     defer a.free(sidecar_bytes);
     var idx = try sidecar.parse(a, sidecar_bytes);
     defer idx.deinit(a);
 
-    try testing.expectEqualStrings("acme", idx.tenant_id);
+    try testing.expectEqualStrings("acme", idx.records[0].tenant_id);
     try testing.expectEqualStrings("00000001", idx.node_id);
     try testing.expectEqual(@as(usize, 2), idx.records.len);
     try testing.expectEqual(@as(u64, 1), idx.records[0].request_id);
     try testing.expectEqual(@as(u64, 2), idx.records[1].request_id);
 
     // Offsets line up with the ndjson layout.
-    const ndjson = try store.get("acme/00000001/00000000000000000001-1730764800000.ndjson", a);
+    const ndjson = try store.get("_logs/00000001/00000000000000000001-1730764800000.ndjson", a);
     defer a.free(ndjson);
     try testing.expectEqual(idx.ndjson_size, ndjson.len);
 
@@ -329,7 +334,7 @@ test "writeBatch with empty records is a no-op (no PUTs)" {
     defer m.deinit();
     const store = m.batchStore();
 
-    try writeBatch(a, store, "acme", "00000001", &.{}, 0);
+    try writeBatch(a, store, "00000001", &.{}, 0);
 
     const list = try store.list("", "", 16, a);
     defer batch_store_mod.freeListResult(a, list);
@@ -351,10 +356,10 @@ test "writeBatch sorts records by received_ns before encoding" {
     defer lo.deinit(a);
     const records = [_]log_mod.LogRecord{ hi, lo };
 
-    try writeBatch(a, store, "acme", "00000001", &records, 1730764800000);
+    try writeBatch(a, store, "00000001", &records, 1730764800000);
 
     // batch_id = first_request_id (after sort) → record at received=1000 → request_id=6.
-    const sidecar_bytes = try store.get("acme/00000001/00000000000000000006-1730764800000.idx.json", a);
+    const sidecar_bytes = try store.get("_logs/00000001/00000000000000000006-1730764800000.idx.json", a);
     defer a.free(sidecar_bytes);
     var idx = try sidecar.parse(a, sidecar_bytes);
     defer idx.deinit(a);

@@ -207,26 +207,24 @@ fn tempDbPath(allocator: std.mem.Allocator, tag: []const u8) ![:0]u8 {
 fn writeSidecar(
     allocator: std.mem.Allocator,
     store: batch_store_mod.BatchStore,
-    tenant: []const u8,
     node: []const u8,
     batch_id: []const u8,
     records: []sidecar.Record,
 ) !void {
     const ndjson_key = try std.fmt.allocPrint(
         allocator,
-        "{s}/{s}/{s}.ndjson",
-        .{ tenant, node, batch_id },
+        "_logs/{s}/{s}.ndjson",
+        .{ node, batch_id },
     );
     defer allocator.free(ndjson_key);
     const idx_key = try std.fmt.allocPrint(
         allocator,
-        "{s}/{s}/{s}.idx.json",
-        .{ tenant, node, batch_id },
+        "_logs/{s}/{s}.idx.json",
+        .{ node, batch_id },
     );
     defer allocator.free(idx_key);
 
     const idx = sidecar.IdxFile{
-        .tenant_id = tenant,
         .node_id = node,
         .batch_id = batch_id,
         .ndjson_key = ndjson_key,
@@ -261,6 +259,7 @@ test "pollOnce indexes a single sidecar end-to-end" {
 
     var records = [_]sidecar.Record{
         .{
+            .tenant_id = "acme",
             .request_id = 7,
             .received_ns = 1_000,
             .duration_ns = 500,
@@ -274,7 +273,7 @@ test "pollOnce indexes a single sidecar end-to-end" {
             .length = 100,
         },
     };
-    try writeSidecar(a, store, "acme", "00000001", "00000000000000000007-1730764800000", &records);
+    try writeSidecar(a, store, "00000001", "00000000000000000007-1730764800000", &records);
 
     const stats = try pollOnce(a, store, db, 32);
     try testing.expectEqual(@as(u32, 1), stats.sidecars_seen);
@@ -305,6 +304,7 @@ test "pollOnce is idempotent across runs" {
 
     var records = [_]sidecar.Record{
         .{
+            .tenant_id = "acme",
             .request_id = 1,
             .received_ns = 100,
             .duration_ns = 1,
@@ -318,7 +318,7 @@ test "pollOnce is idempotent across runs" {
             .length = 1,
         },
     };
-    try writeSidecar(a, store, "acme", "00000001", "b1-001", &records);
+    try writeSidecar(a, store, "00000001", "b1-001", &records);
 
     _ = try pollOnce(a, store, db, 32);
     const stats2 = try pollOnce(a, store, db, 32);
@@ -350,6 +350,7 @@ test "pollOnce picks up newly-arrived sidecars across passes" {
 
     var r1 = [_]sidecar.Record{
         .{
+            .tenant_id = "acme",
             .request_id = 1,
             .received_ns = 100,
             .duration_ns = 1,
@@ -363,7 +364,7 @@ test "pollOnce picks up newly-arrived sidecars across passes" {
             .length = 1,
         },
     };
-    try writeSidecar(a, store, "acme", "00000001", "b1", &r1);
+    try writeSidecar(a, store, "00000001", "b1", &r1);
     const s1 = try pollOnce(a, store, db, 32);
     try testing.expectEqual(@as(u32, 1), s1.batches_indexed);
 
@@ -372,6 +373,7 @@ test "pollOnce picks up newly-arrived sidecars across passes" {
     // no-op via `OR IGNORE`. End state: both rows in the index.
     var r2 = [_]sidecar.Record{
         .{
+            .tenant_id = "acme",
             .request_id = 2,
             .received_ns = 200,
             .duration_ns = 1,
@@ -385,7 +387,7 @@ test "pollOnce picks up newly-arrived sidecars across passes" {
             .length = 1,
         },
     };
-    try writeSidecar(a, store, "acme", "00000001", "b2", &r2);
+    try writeSidecar(a, store, "00000001", "b2", &r2);
     const s2 = try pollOnce(a, store, db, 32);
     try testing.expectEqual(@as(u32, 2), s2.sidecars_seen);
     try testing.expectEqual(@as(u32, 2), s2.batches_indexed);
