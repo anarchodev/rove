@@ -502,36 +502,25 @@ export const api = {
       if (s.path === entryPath) entrySource = s.source;
     }
 
-    // Tape blobs — fetch each non-null hash in parallel and turn the
-    // raw bytes into Uint8Arrays for postMessage's structured-clone
-    // transport. Replay shell parses each blob on the other side.
-    // The request body lives in the same per-tenant log-blobs/ store
-    // (worker dispatcher writes it via uploadTapes).
-    const tapeRefs = {
-      kv: record.tape_refs?.kv_tape_hex || null,
-      date: record.tape_refs?.date_tape_hex || null,
-      math_random: record.tape_refs?.math_random_tape_hex || null,
-      crypto_random: record.tape_refs?.crypto_random_tape_hex || null,
+    // Tape + body bytes ride inline in the LogRecord (post-Phase-
+    // 5.5 a-2). The /show endpoint range-reads the whole record
+    // line in a single round trip; we just base64-decode the
+    // channels we care about for the replay shell.
+    const tapesField = record.tapes || {};
+    function decodeB64(s) {
+      if (!s) return null;
+      const bin = atob(s);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+    const tapeBlobs = {
+      kv: decodeB64(tapesField.kv_tape_b64),
+      date: decodeB64(tapesField.date_tape_b64),
+      math_random: decodeB64(tapesField.math_random_tape_b64),
+      crypto_random: decodeB64(tapesField.crypto_random_tape_b64),
     };
-    const tapeBlobs = { kv: null, date: null, math_random: null, crypto_random: null };
-    const bodyHash = record.tape_refs?.request_body_hex || null;
-    let bodyBytes = null;
-    await Promise.all([
-      ...Object.keys(tapeRefs).map(async (name) => {
-        const hash = tapeRefs[name];
-        if (!hash) return;
-        const r = await logFetch(
-          `/v1/${inst}/blob/${encodeURIComponent(hash)}`);
-        const buf = await r.arrayBuffer();
-        tapeBlobs[name] = new Uint8Array(buf);
-      }),
-      bodyHash ? (async () => {
-        const r = await logFetch(
-          `/v1/${inst}/blob/${encodeURIComponent(bodyHash)}`);
-        const buf = await r.arrayBuffer();
-        bodyBytes = new Uint8Array(buf);
-      })() : Promise.resolve(),
-    ]);
+    const bodyBytes = decodeB64(tapesField.request_body_b64);
 
     return {
       request_id: record.request_id,
@@ -548,7 +537,7 @@ export const api = {
         // capture time). Truncated bodies get an explicit flag so
         // the shell can warn the handler may see less than original.
         body_bytes: bodyBytes,
-        body_truncated: !!record.tape_refs?.request_body_truncated,
+        body_truncated: !!tapesField.request_body_truncated,
       },
       response: {
         status: record.status,

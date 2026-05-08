@@ -240,7 +240,6 @@ pub fn main() !void {
         .db = db,
         .bind_addr = listen_addr,
         .max_connections = cli.max_connections,
-        .blob_backend_cfg = blob_owned.cfg,
         .tls_config = tls_config,
         .jwt_secret = jwt_secret,
         .cors_origin = cli.cors_origin,

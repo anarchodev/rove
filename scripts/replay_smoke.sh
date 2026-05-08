@@ -5,7 +5,7 @@
 #   - app.{suffix}:{worker_port}  — worker (admin handler, files proxy,
 #                                   /_system/log-token JWT minter)
 #   - logs.{suffix}:{log_port}    — standalone log-server (TLS, JWT-gated
-#                                   /v1/{tenant}/{list,show,count,blob})
+#                                   /v1/{tenant}/{list,show,count})
 #
 # Each smoke section authenticates against the worker, mints a JWT,
 # and uses it to call the standalone directly.
@@ -19,7 +19,8 @@
 #      response body refs visible on the show response.
 #   5. Historical deployment manifest endpoint.
 #   6. Request body truncation flag fires for >256 KB bodies.
-#   7. Tape blobs round-trip via the log-server's /v1/.../blob/{hash}.
+#   7. Tape + body bytes ride inline in the /v1/.../show/{request_id}
+#      response under `record.tapes.*_b64`.
 
 set -euo pipefail
 
@@ -81,6 +82,10 @@ CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
 export LOOP46_ROOT_TOKEN="$TOKEN"
+# Per-run log-batch-store namespace so old batches from prior runs
+# (which used the previous `tape_refs`/log-blobs format) don't bleed
+# into this run's `/show` lookups.
+export LOG_S3_KEY_PREFIX="${LOG_S3_KEY_PREFIX:-smoke-replay-$(hostname)-$(id -u)-$(date +%s)/}"
 
 PIDS=()
 for i in 0 1 2; do
@@ -248,34 +253,35 @@ RID=$(wait_for_record "/world") || fail "couldn't find POST /world in indexed lo
 
 REC=$("${CURL[@]}" -H "Authorization: Bearer $JWT" \
     "${LOG_ORIGIN}/v1/alice/show/${RID}")
-got_kv=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["kv_tape_hex"] or "")')
-got_date=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["date_tape_hex"] or "")')
-got_mod=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["module_tree_hex"] or "")')
-got_body=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["request_body_hex"] or "")')
-got_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["request_body_truncated"])')
-got_resp_body=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["response_body_hex"] or "")')
-got_resp_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["response_body_truncated"])')
+# Tape + body bytes ride inline in the record under `tapes.*_b64`.
+# The /show endpoint range-reads the whole record line in a single
+# round trip — no second fetch by hash.
+got_kv=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tapes"]["kv_tape_b64"] or "")')
+got_date=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tapes"]["date_tape_b64"] or "")')
+got_mod=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tapes"]["module_tree_b64"] or "")')
+got_body_b64=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tapes"]["request_body_b64"] or "")')
+got_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tapes"]["request_body_truncated"])')
+got_resp_body_b64=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tapes"]["response_body_b64"] or "")')
+got_resp_trunc=$(echo "$REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tapes"]["response_body_truncated"])')
 
-[[ -n "$got_kv" ]]    || fail "kv_tape_hex missing on log record"
-[[ -n "$got_date" ]]  || fail "date_tape_hex missing"
-[[ -n "$got_mod" ]]   || fail "module_tree_hex missing (multi-module capture)"
-[[ -n "$got_body" ]]  || fail "request_body_hex missing"
+[[ -n "$got_kv" ]]    || fail "kv_tape_b64 missing on log record"
+[[ -n "$got_date" ]]  || fail "date_tape_b64 missing"
+[[ -n "$got_mod" ]]   || fail "module_tree_b64 missing (multi-module capture)"
+[[ -n "$got_body_b64" ]]  || fail "request_body_b64 missing"
 [[ "$got_trunc" == "False" ]] || fail "request_body_truncated should be false for small body"
-[[ -n "$got_resp_body" ]] || fail "response_body_hex missing"
+[[ -n "$got_resp_body_b64" ]] || fail "response_body_b64 missing"
 [[ "$got_resp_trunc" == "False" ]] || fail "response_body_truncated should be false for small response"
-ok "log record carries kv + date + module + req-body + resp-body tape refs"
+ok "log record carries kv + date + module + req-body + resp-body tape payloads"
 
-# Fetch the body blob and verify content.
-body_text=$("${CURL[@]}" -H "Authorization: Bearer $JWT" \
-    "${LOG_ORIGIN}/v1/alice/blob/${got_body}")
-[[ "$body_text" == "first-visit" ]] || fail "body blob content drift: '$body_text'"
-ok "request body blob content round-trips"
+# Decode the inline base64 bytes and verify content.
+body_text=$(printf '%s' "$got_body_b64" | base64 -d)
+[[ "$body_text" == "first-visit" ]] || fail "request body inline content drift: '$body_text'"
+ok "request body inline content round-trips"
 
-resp_text=$("${CURL[@]}" -H "Authorization: Bearer $JWT" \
-    "${LOG_ORIGIN}/v1/alice/blob/${got_resp_body}")
+resp_text=$(printf '%s' "$got_resp_body_b64" | base64 -d)
 [[ "$resp_text" == "$resp" ]] || \
-    fail "response body blob drift: expected '$resp', got '$resp_text'"
-ok "response body blob content round-trips"
+    fail "response body inline drift: expected '$resp', got '$resp_text'"
+ok "response body inline content round-trips"
 
 # ── 5. Historical deployment manifest ────────────────────────────
 NEW_IDX_SRC='export default function () { return "v3"; }'
@@ -318,19 +324,16 @@ python3 -c "import sys; sys.stdout.buffer.write(b'x' * 300000)" \
 BIG_RID=$(wait_for_record "/big") || fail "couldn't find POST /big in indexed log"
 BIG_REC=$("${CURL[@]}" -H "Authorization: Bearer $JWT" \
     "${LOG_ORIGIN}/v1/alice/show/${BIG_RID}")
-big_trunc=$(echo "$BIG_REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["request_body_truncated"])')
-big_hash=$(echo "$BIG_REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tape_refs"]["request_body_hex"])')
+big_trunc=$(echo "$BIG_REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tapes"]["request_body_truncated"])')
+big_b64=$(echo "$BIG_REC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["record"]["tapes"]["request_body_b64"])')
 [[ "$big_trunc" == "True" ]] || fail "300 KB body should set truncation flag (got $big_trunc)"
 ok "truncation flag set for >256 KB body"
 
-# Verify the captured blob is exactly 256 KB by fetching it.
-big_body=$("${CURL[@]}" -H "Authorization: Bearer $JWT" -o /tmp/replay-smoke-big.bin -w '%{http_code}' \
-    "${LOG_ORIGIN}/v1/alice/blob/${big_hash}")
-[[ "$big_body" == "200" ]] || fail "big body blob fetch got $big_body"
-blob_size=$(wc -c < /tmp/replay-smoke-big.bin)
-[[ "$blob_size" == "262144" ]] || fail "captured blob should be 256 KB, got $blob_size"
-ok "captured body blob exactly 262144 bytes (256 KB)"
-rm -f /tmp/replay-smoke-big.bin
+# Captured prefix is exactly 256 KB. base64 decode (4/3 expansion ≈
+# 349525 chars) and check the byte count.
+blob_size=$(printf '%s' "$big_b64" | base64 -d | wc -c)
+[[ "$blob_size" == "262144" ]] || fail "captured inline body should be 256 KB, got $blob_size"
+ok "captured body inline payload exactly 262144 bytes (256 KB)"
 
 # JWT gate sanity: the same /v1 path without a bearer must 401.
 code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' "${LOG_ORIGIN}/v1/alice/list")
