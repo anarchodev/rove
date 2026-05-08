@@ -54,7 +54,7 @@ const SuccessRec = struct {
     host: []const u8,
     deployment_id: u64,
     received_ns: i64,
-    tape_refs: log_mod.TapeRefs,
+    tapes: log_mod.TapePayloads,
     /// Pre-minted id reused on commit-time log capture so the log
     /// record shares its id with any webhook rows `webhook.send`
     /// wrote during this request's handler.
@@ -130,7 +130,7 @@ fn finalizeBatch(
             const exception_owned = s.exception_owned;
             s.console_owned = &.{};
             s.exception_owned = &.{};
-            worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
+            worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
             processed += 1;
         }
         successes.clearRetainingCapacity();
@@ -166,7 +166,7 @@ fn finalizeBatch(
             const exception_owned = s.exception_owned;
             s.console_owned = &.{};
             s.exception_owned = &.{};
-            worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .fault, console_owned, exception_owned, s.tape_refs);
+            worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .fault, console_owned, exception_owned, s.tapes);
             processed += 1;
         }
         successes.clearRetainingCapacity();
@@ -187,7 +187,7 @@ fn finalizeBatch(
         const exception_owned = s.exception_owned;
         s.console_owned = &.{};
         s.exception_owned = &.{};
-        worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tape_refs);
+        worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
         processed += 1;
     }
     successes.clearRetainingCapacity();
@@ -1305,14 +1305,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
         try server.reg.set(ent, &server.request_out, h2.Session, sess);
 
-        // Upload tapes now — blob-addressed and idempotent, so storing
-        // them before commit is safe even if the batch later rolls
-        // back. The refs get carried into the log record after commit.
-        // `body` is the inbound request body; `body_ptr[0..body_len]`
-        // is the outbound response body the worker just stamped on
-        // `request_out`. Both get captured.
+        // Capture tapes now — bytes are owned by the LogRecord, ride
+        // inline in the next ndjson flush, and the inbound `body`
+        // plus the outbound `body_ptr[0..body_len]` get captured
+        // alongside. No S3 round trip in the request path.
         const response_body_slice: []const u8 = if (body_ptr) |p| p[0..body_len] else &.{};
-        const tape_refs = worker_mod.uploadTapes(worker, scope_inst.id, &tapes, body, response_body_slice);
+        const tape_payloads = worker_mod.captureTapes(worker, &tapes, body, response_body_slice);
 
         const console_owned = resp.console;
         const exception_owned = resp.exception;
@@ -1333,7 +1331,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .host = host,
             .deployment_id = tc.current_deployment_id,
             .received_ns = received_ns,
-            .tape_refs = tape_refs,
+            .tapes = tape_payloads,
             .request_id = request_id,
         });
     }

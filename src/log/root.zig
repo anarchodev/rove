@@ -35,8 +35,6 @@ pub const Error = error{
     OutOfMemory,
 };
 
-pub const HASH_HEX_LEN: usize = 64;
-
 /// Per-request lifecycle outcome.
 pub const Outcome = enum(u8) {
     ok = 0,
@@ -48,34 +46,50 @@ pub const Outcome = enum(u8) {
     unknown_domain = 6,
 };
 
-/// Per-request blob references attached to a `LogRecord`. Each
-/// non-null field is a 64-char hex hash of bytes living in the
-/// tenant's `log-blobs/` BlobBackend. Replay fetches each by hash
-/// and either re-drives the handler from the captured non-determinism
-/// (the `*_tape_*` channels) or stamps the runtime globals (the
-/// `*_body_*` captures).
-pub const TapeRefs = struct {
-    kv_tape_hex: ?[HASH_HEX_LEN]u8 = null,
-    crypto_random_tape_hex: ?[HASH_HEX_LEN]u8 = null,
-    date_tape_hex: ?[HASH_HEX_LEN]u8 = null,
-    math_random_tape_hex: ?[HASH_HEX_LEN]u8 = null,
-    module_tree_hex: ?[HASH_HEX_LEN]u8 = null,
-    /// Hash of the captured request body (or its 256 KB prefix if
-    /// the body was larger). Null when the request had no body or
-    /// the worker chose not to capture (no tenant log open).
-    request_body_hex: ?[HASH_HEX_LEN]u8 = null,
-    /// True iff `request_body_hex` references a truncated prefix.
-    /// Replay still feeds the captured bytes — the handler's view
-    /// is what was captured, even if that's less than the full
-    /// original body.
+/// Inline tape + body byte payloads for one request. Each `_bytes`
+/// field is allocator-owned; empty (`&.{}`) for channels the handler
+/// didn't touch. Tape capture stores these directly in the LogRecord
+/// — the `tapes: TapePayloads` field — and the flush writer emits
+/// them base64-encoded in the ndjson line.
+///
+/// Pre-Phase-5.5(a-2) these were content-addressed blobs in a
+/// per-tenant `log-blobs/` S3 prefix, with the LogRecord carrying
+/// only `*_hex` hash refs. The fanout (one PUT per channel per
+/// request) capped tape capture at single-digit-thousand req/s
+/// because std.http.Client serializes a single OVH connection that
+/// drops mid-write under concurrent load. Inlining collapses the
+/// per-request PUT count to zero — bytes ride the existing per-flush
+/// ndjson PUT — and removes the read-side hash→blob fetch hop.
+pub const TapePayloads = struct {
+    kv_tape_bytes: []const u8 = &.{},
+    crypto_random_tape_bytes: []const u8 = &.{},
+    date_tape_bytes: []const u8 = &.{},
+    math_random_tape_bytes: []const u8 = &.{},
+    module_tree_bytes: []const u8 = &.{},
+    /// Captured request body (or its 256 KB prefix if the body was
+    /// larger). Empty when the request had no body or the worker
+    /// chose not to capture (no tenant log open).
+    request_body_bytes: []const u8 = &.{},
+    /// True iff `request_body_bytes` is a truncated prefix. Replay
+    /// still feeds the captured bytes — the handler's view is what
+    /// was captured, even if that's less than the original.
     request_body_truncated: bool = false,
-    /// Hash of the captured response body (handler return value
-    /// after content-type sniffing / JSON serialization, truncated
-    /// to 256 KB). Null when the handler returned no body or the
-    /// worker chose not to capture.
-    response_body_hex: ?[HASH_HEX_LEN]u8 = null,
-    /// True iff `response_body_hex` references a truncated prefix.
+    /// Captured response body (handler return value after content-
+    /// type sniffing / JSON serialization, truncated to 256 KB).
+    response_body_bytes: []const u8 = &.{},
+    /// True iff `response_body_bytes` is a truncated prefix.
     response_body_truncated: bool = false,
+
+    pub fn deinit(self: *TapePayloads, allocator: std.mem.Allocator) void {
+        if (self.kv_tape_bytes.len != 0) allocator.free(self.kv_tape_bytes);
+        if (self.crypto_random_tape_bytes.len != 0) allocator.free(self.crypto_random_tape_bytes);
+        if (self.date_tape_bytes.len != 0) allocator.free(self.date_tape_bytes);
+        if (self.math_random_tape_bytes.len != 0) allocator.free(self.math_random_tape_bytes);
+        if (self.module_tree_bytes.len != 0) allocator.free(self.module_tree_bytes);
+        if (self.request_body_bytes.len != 0) allocator.free(self.request_body_bytes);
+        if (self.response_body_bytes.len != 0) allocator.free(self.response_body_bytes);
+        self.* = .{};
+    }
 };
 
 /// One request's log entry. All `[]const u8` fields are owned by the
@@ -99,7 +113,7 @@ pub const LogRecord = struct {
     console: []const u8,
     /// JS exception message if the handler threw. Empty otherwise.
     exception: []const u8,
-    tape_refs: TapeRefs = .{},
+    tapes: TapePayloads = .{},
 
     pub fn deinit(self: *LogRecord, allocator: std.mem.Allocator) void {
         allocator.free(self.method);
@@ -107,6 +121,7 @@ pub const LogRecord = struct {
         allocator.free(self.host);
         allocator.free(self.console);
         allocator.free(self.exception);
+        self.tapes.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -161,6 +176,11 @@ pub const LogStore = struct {
     /// Wall-clock at the last `drainRecords` call. Used by `shouldFlush`
     /// for the time-based threshold.
     last_flush_ns: i64,
+    /// Guards `buffer` and `last_flush_ns`. The dispatch thread calls
+    /// `append`; a per-worker flusher thread calls `drainRecords`.
+    /// `nextRequestId` does NOT take this — it operates on a
+    /// dispatch-only counter that the flusher never reads.
+    mutex: std.Thread.Mutex = .{},
 
     flush_threshold_records: u32 = 256,
     flush_threshold_bytes: u32 = 64 * 1024,
@@ -222,7 +242,13 @@ pub const LogStore = struct {
     /// Append a fully-owned LogRecord to the buffer. Caller transfers
     /// ownership of all slices; the LogStore frees them on flush or
     /// deinit. Use `nextRequestId` first to get a stable id.
+    ///
+    /// Holds `mutex` for the duration of the push. The flusher thread
+    /// does the same in `drainRecords`. Critical section is just an
+    /// ArrayList.append — sub-microsecond.
     pub fn append(self: *LogStore, record: LogRecord) Error!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.buffer.append(self.allocator, record) catch return Error.OutOfMemory;
     }
 
@@ -230,8 +256,10 @@ pub const LogStore = struct {
     ///   - record count >= flush_threshold_records
     ///   - estimated buffer bytes >= flush_threshold_bytes
     ///   - elapsed since last flush >= flush_interval_ns
-    /// Cheap to call every tick.
+    /// Cheap to call every tick. Takes the mutex briefly.
     pub fn shouldFlush(self: *LogStore, now_ns: i64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.buffer.items.len == 0) return false;
         if (self.buffer.items.len >= self.flush_threshold_records) return true;
         if (now_ns - self.last_flush_ns >= self.flush_interval_ns) return true;
@@ -249,6 +277,8 @@ pub const LogStore = struct {
     /// Updates `last_flush_ns` so the time-based threshold doesn't
     /// fire repeatedly. Returns null when the buffer is empty.
     pub fn drainRecords(self: *LogStore, allocator: std.mem.Allocator) Error!?[]LogRecord {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.last_flush_ns = @as(i64, @intCast(std.time.nanoTimestamp()));
         if (self.buffer.items.len == 0) return null;
 
@@ -284,13 +314,17 @@ fn estimateRecordBytes(r: *const LogRecord) usize {
     var n: usize = 64; // fixed-width header (request_id, timestamps, status, ...)
     n += r.method.len + r.path.len + r.host.len;
     n += r.console.len + r.exception.len;
-    if (r.tape_refs.kv_tape_hex != null) n += HASH_HEX_LEN;
-    if (r.tape_refs.crypto_random_tape_hex != null) n += HASH_HEX_LEN;
-    if (r.tape_refs.date_tape_hex != null) n += HASH_HEX_LEN;
-    if (r.tape_refs.math_random_tape_hex != null) n += HASH_HEX_LEN;
-    if (r.tape_refs.module_tree_hex != null) n += HASH_HEX_LEN;
-    if (r.tape_refs.request_body_hex != null) n += HASH_HEX_LEN;
-    if (r.tape_refs.response_body_hex != null) n += HASH_HEX_LEN;
+    // Inline tape + body payloads ride in the ndjson record as
+    // base64. The threshold is a soft cap so we skip the *4/3
+    // expansion and just account raw bytes — slightly under-counts
+    // but matches the original "approximate" intent.
+    n += r.tapes.kv_tape_bytes.len;
+    n += r.tapes.crypto_random_tape_bytes.len;
+    n += r.tapes.date_tape_bytes.len;
+    n += r.tapes.math_random_tape_bytes.len;
+    n += r.tapes.module_tree_bytes.len;
+    n += r.tapes.request_body_bytes.len;
+    n += r.tapes.response_body_bytes.len;
     return n;
 }
 

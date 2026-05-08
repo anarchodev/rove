@@ -63,12 +63,6 @@ init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 export S3_KEY_PREFIX_BASE="${S3_KEY_PREFIX_BASE:-bench-kv-$(hostname)-$(id -u)-$(date +%s)/}"
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
 export LOOP46_ROOT_TOKEN="$TOKEN"
-# Per-request tape + log-batch S3 PUTs cap throughput at single-digit
-# thousand req/s because std.http.Client serializes against a single
-# OVH connection that drops mid-write under load. Disable for the
-# bench so we measure raw KV-write + raft-replicate throughput
-# instead of S3 latency. Production-only path stays the default.
-export LOOP46_DISABLE_TAPE_CAPTURE=1
 
 # Seed bench tenants onto every node's data dir. seed_all_dirs writes
 # manifest blobs to S3 + stamps `_deploy/current` in the local app.db.

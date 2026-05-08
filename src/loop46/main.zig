@@ -454,11 +454,9 @@ fn workerMain(args: *WorkerCtx) !void {
             };
         }
 
-        // Best-effort log batch flush: drains each tenant's in-memory
-        // buffer if any threshold (count/bytes/time) has been crossed
-        // and proposes through raft (leader) or writes locally
-        // (follower).
-        try rjs.flushLogs(worker);
+        // Log batch flush moved to a background thread spawned in
+        // Worker.create — the dispatch loop stays free of S3 RTT.
+        // See `Worker.flusherLoop` in src/js/worker.zig.
 
         // SSE retention sweep — leader-only inside sweepEvents.
         // Worker 0 runs it (matches the dispatchCallbacks pinning

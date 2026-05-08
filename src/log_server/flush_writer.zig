@@ -177,8 +177,8 @@ fn encodeRecordLine(
     try writeJsonString(w, r.console);
     try w.writeAll(",\"exception\":");
     try writeJsonString(w, r.exception);
-    try w.writeAll(",\"tape_refs\":");
-    try writeTapeRefs(w, &r.tape_refs);
+    try w.writeAll(",\"tapes\":");
+    try writeTapePayloads(allocator, w, &r.tapes);
     try w.writeAll("}\n");
 }
 
@@ -196,39 +196,53 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
-fn writeTapeRefs(w: *std.Io.Writer, t: *const log_mod.TapeRefs) !void {
+/// Emit `tapes` as `{name_b64: "<base64>", ...}`. Empty channels
+/// emit `null` (not the empty string) so consumers can distinguish
+/// "no capture" from "captured zero bytes." `*_body_truncated`
+/// flags are only emitted alongside the body fields, matching the
+/// pre-refactor schema.
+fn writeTapePayloads(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    t: *const log_mod.TapePayloads,
+) !void {
     try w.writeByte('{');
-    try writeRefField(w, "kv_tape_hex", t.kv_tape_hex, true);
-    try writeRefField(w, "date_tape_hex", t.date_tape_hex, false);
-    try writeRefField(w, "math_random_tape_hex", t.math_random_tape_hex, false);
-    try writeRefField(w, "crypto_random_tape_hex", t.crypto_random_tape_hex, false);
-    try writeRefField(w, "module_tree_hex", t.module_tree_hex, false);
-    try writeRefField(w, "request_body_hex", t.request_body_hex, false);
+    try writeBytesField(allocator, w, "kv_tape_b64", t.kv_tape_bytes, true);
+    try writeBytesField(allocator, w, "date_tape_b64", t.date_tape_bytes, false);
+    try writeBytesField(allocator, w, "math_random_tape_b64", t.math_random_tape_bytes, false);
+    try writeBytesField(allocator, w, "crypto_random_tape_b64", t.crypto_random_tape_bytes, false);
+    try writeBytesField(allocator, w, "module_tree_b64", t.module_tree_bytes, false);
+    try writeBytesField(allocator, w, "request_body_b64", t.request_body_bytes, false);
     try w.writeAll(",\"request_body_truncated\":");
     try w.writeAll(if (t.request_body_truncated) "true" else "false");
-    try writeRefField(w, "response_body_hex", t.response_body_hex, false);
+    try writeBytesField(allocator, w, "response_body_b64", t.response_body_bytes, false);
     try w.writeAll(",\"response_body_truncated\":");
     try w.writeAll(if (t.response_body_truncated) "true" else "false");
     try w.writeByte('}');
 }
 
-fn writeRefField(
+fn writeBytesField(
+    allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     name: []const u8,
-    value: ?[64]u8,
+    bytes: []const u8,
     first: bool,
 ) !void {
     if (!first) try w.writeByte(',');
     try w.writeByte('"');
     try w.writeAll(name);
     try w.writeAll("\":");
-    if (value) |v| {
-        try w.writeByte('"');
-        try w.writeAll(&v);
-        try w.writeByte('"');
-    } else {
+    if (bytes.len == 0) {
         try w.writeAll("null");
+        return;
     }
+    const enc_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    const buf = try allocator.alloc(u8, enc_len);
+    defer allocator.free(buf);
+    const out = std.base64.standard.Encoder.encode(buf, bytes);
+    try w.writeByte('"');
+    try w.writeAll(out);
+    try w.writeByte('"');
 }
 
 fn bytesToHex(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {

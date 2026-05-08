@@ -574,6 +574,18 @@ pub fn Worker(comptime opts: Options) type {
         log_public_base: ?[]const u8,
         files_public_base: ?[]const u8,
 
+        /// Background log flusher — owns its own thread, sleeps on
+        /// `flusher_wake` between ticks, drains every tenant's
+        /// LogStore via `flushLogs`, and PUTs each batch into
+        /// `log_batch_store`. Decouples request latency from S3 RTT:
+        /// the dispatch path's `captureLog` is now a mutex-protected
+        /// ArrayList.append, with the multi-millisecond S3 round-
+        /// trip happening asynchronously on this thread. `null` when
+        /// the worker is configured without a log backend.
+        flusher_thread: ?std.Thread = null,
+        flusher_should_stop: std.atomic.Value(bool) = .init(false),
+        flusher_wake: std.Thread.ResetEvent = .{},
+
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
         /// `TenantFiles` for every instance currently registered with
@@ -643,11 +655,53 @@ pub fn Worker(comptime opts: Options) type {
                 try self.tenant_logs.put(allocator, try TenantLog.open(self, inst));
             }
 
+            self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
+
             return self;
+        }
+
+        /// Background log-flusher loop. Wakes every
+        /// `FLUSHER_TICK_NS` (50 ms — matches the existing periodic
+        /// scheduler default) OR immediately when `flusher_wake` is
+        /// signalled. Calls `flushLogs(self)` which iterates each
+        /// tenant's `LogStore`, drains records past any threshold
+        /// (count / bytes / time), and PUTs them through
+        /// `log_batch_store`. The S3 RTT happens entirely on this
+        /// thread — the dispatch path stays free of synchronous
+        /// network I/O.
+        ///
+        /// Exits when `flusher_should_stop` flips true. The final
+        /// `flushLogs` after the loop drains anything queued during
+        /// shutdown so we don't lose the last partial batch.
+        fn flusherLoop(self: *Self) void {
+            const FLUSHER_TICK_NS: u64 = 50 * std.time.ns_per_ms;
+            while (!self.flusher_should_stop.load(.acquire)) {
+                _ = flushLogs(self) catch |err| {
+                    std.log.warn("rove-js flusher: flushLogs failed: {s}", .{@errorName(err)});
+                };
+                self.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
+                self.flusher_wake.reset();
+            }
+            // Drain anything queued between the last tick and the
+            // shutdown signal so we don't lose partial batches on a
+            // graceful stop.
+            _ = flushLogs(self) catch |err| {
+                std.log.warn("rove-js flusher: final flushLogs failed: {s}", .{@errorName(err)});
+            };
         }
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            // Signal the flusher thread to stop, wake it once so it
+            // notices the flag promptly, then join. The flusher's
+            // post-loop drain catches anything appended since its
+            // last tick.
+            if (self.flusher_thread) |t| {
+                self.flusher_should_stop.store(true, .release);
+                self.flusher_wake.set();
+                t.join();
+                self.flusher_thread = null;
+            }
             self.limiter.deinit();
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
@@ -967,58 +1021,48 @@ pub const RequestTapes = struct {
     }
 };
 
-/// Serialize each non-empty tape, upload to the tenant's log blob
-/// store keyed by hash-hex, and return a `TapeRefs` that points at
-/// whichever channels actually recorded something. Empty channels
-/// stay null on the refs so the log record doesn't carry noise.
-///
-/// Best-effort: on any serialize/upload failure for a given channel,
-/// the ref for that channel is left null and a warning is logged. We
-/// don't want tape capture failures to kill the request.
 /// Maximum captured body length (request OR response). Anything
 /// bigger gets truncated to this prefix and the corresponding
-/// `*_truncated` flag set on the log record's tape refs. Mirrors
+/// `*_truncated` flag set on the log record's tape payloads. Mirrors
 /// PLAN §2.4's body-cap default.
 pub const REQUEST_BODY_CAP: usize = 256 * 1024;
 pub const RESPONSE_BODY_CAP: usize = 256 * 1024;
 
-/// `LOOP46_DISABLE_TAPE_CAPTURE=1` short-circuits per-request tape /
-/// body blob uploads. Useful for benchmarking the KV-write path
-/// without the S3 PUT-per-request overhead (tape capture issues two
-/// synchronous PUTs per request through std.http.Client, which has a
-/// keep-alive bug under concurrency that caps throughput in the
-/// single-digit-thousand-req/s range). With this set the request log
-/// records still get written but their tape_refs / body refs stay
-/// null, so the replay UI can't reconstruct individual requests.
-/// Don't enable in production.
-fn tapeCaptureDisabled() bool {
-    const v = std.posix.getenv("LOOP46_DISABLE_TAPE_CAPTURE") orelse return false;
-    return v.len > 0 and v[0] != '0';
-}
-
-pub fn uploadTapes(
+/// Serialize each non-empty tape into the request's `TapePayloads`,
+/// owned by the caller's allocator. The bytes ride inline in the
+/// next ndjson flush — no per-request S3 PUT, no separate blob
+/// store.
+///
+/// Best-effort: on any serialize failure the channel is left empty
+/// and a warning is logged. Tape capture failures must never kill
+/// the request.
+///
+/// Pre-Phase-5.5(a-2) this function ('uploadTapes') issued one
+/// content-addressed S3 PUT per channel per request through a
+/// shared std.http.Client. The fanout — plus a stdlib keep-alive
+/// bug that drops the OVH connection under concurrency — capped
+/// tape capture at single-digit-thousand req/s. Inlining moves
+/// the bytes onto the per-flush PUT path, which carries the whole
+/// batch in a single request.
+pub fn captureTapes(
     worker: anytype,
-    instance_id: []const u8,
     tapes: *RequestTapes,
     request_body: []const u8,
     response_body: []const u8,
-) log_mod.TapeRefs {
-    if (tapeCaptureDisabled()) return .{};
-    const tl = worker.tenant_logs.get(instance_id) orelse return .{};
+) log_mod.TapePayloads {
     const allocator = worker.allocator;
-    const blob = tl.blob_backend.blobStore();
 
-    var refs: log_mod.TapeRefs = .{};
+    var payloads: log_mod.TapePayloads = .{};
 
     const channels = [_]struct {
         tape: *tape_mod.Tape,
-        out: *?[64]u8,
+        out: *[]const u8,
     }{
-        .{ .tape = &tapes.kv, .out = &refs.kv_tape_hex },
-        .{ .tape = &tapes.date, .out = &refs.date_tape_hex },
-        .{ .tape = &tapes.math_random, .out = &refs.math_random_tape_hex },
-        .{ .tape = &tapes.crypto_random, .out = &refs.crypto_random_tape_hex },
-        .{ .tape = &tapes.module, .out = &refs.module_tree_hex },
+        .{ .tape = &tapes.kv, .out = &payloads.kv_tape_bytes },
+        .{ .tape = &tapes.date, .out = &payloads.date_tape_bytes },
+        .{ .tape = &tapes.math_random, .out = &payloads.math_random_tape_bytes },
+        .{ .tape = &tapes.crypto_random, .out = &payloads.crypto_random_tape_bytes },
+        .{ .tape = &tapes.module, .out = &payloads.module_tree_bytes },
     };
 
     for (channels) |ch| {
@@ -1027,55 +1071,38 @@ pub fn uploadTapes(
             std.log.warn("rove-js tape serialize failed: {s}", .{@errorName(err)});
             continue;
         };
-        defer allocator.free(bytes);
-        const hash = tape_mod.hashHexBytes(bytes);
-        blob.put(&hash, bytes) catch |err| {
-            std.log.warn("rove-js tape blob put failed: {s}", .{@errorName(err)});
-            continue;
-        };
-        ch.out.* = hash;
+        ch.out.* = bytes;
     }
 
-    // Request body — captured to the same per-tenant log-blobs/. This
-    // is what makes the replay shell's `request.body` non-empty for
-    // POST / PUT requests. Bodies bigger than `REQUEST_BODY_CAP` get
-    // truncated to that prefix; the truncation flag is preserved
-    // through the log record so the simulator (and the replay shell)
-    // know the captured bytes are a prefix.
+    // Request body — captured into the log record so the replay
+    // shell's `request.body` is non-empty for POST / PUT requests.
+    // Bodies bigger than `REQUEST_BODY_CAP` get truncated to that
+    // prefix; the truncation flag is preserved so the simulator (and
+    // the replay shell) know the captured bytes are a prefix.
     if (request_body.len > 0) {
         const captured_len = @min(request_body.len, REQUEST_BODY_CAP);
-        const captured = request_body[0..captured_len];
-        const hash = tape_mod.hashHexBytes(captured);
-        if (blob.put(&hash, captured)) {
-            refs.request_body_hex = hash;
-            refs.request_body_truncated = captured_len < request_body.len;
+        if (allocator.dupe(u8, request_body[0..captured_len])) |captured| {
+            payloads.request_body_bytes = captured;
+            payloads.request_body_truncated = captured_len < request_body.len;
         } else |err| {
-            // Better to surface a missing-body in the bundle than
-            // dangle a hash whose blob never landed. Replay falls
-            // back to empty body.
-            std.log.warn("rove-js request-body blob put failed: {s}", .{@errorName(err)});
+            std.log.warn("rove-js request-body capture failed: {s}", .{@errorName(err)});
         }
     }
 
-    // Response body — same capture pattern as request body.
-    // Captured AFTER content-type sniffing / JSON serialization (the
-    // worker has already turned `resp.body` into the bytes that go
-    // out on the wire). Replay UI shows these alongside the request
-    // bytes so debugging "what did this request return" doesn't
-    // require log scraping.
+    // Response body — same capture pattern. Captured AFTER content-
+    // type sniffing / JSON serialization (the worker has already
+    // turned `resp.body` into the bytes that go out on the wire).
     if (response_body.len > 0) {
         const captured_len = @min(response_body.len, RESPONSE_BODY_CAP);
-        const captured = response_body[0..captured_len];
-        const hash = tape_mod.hashHexBytes(captured);
-        if (blob.put(&hash, captured)) {
-            refs.response_body_hex = hash;
-            refs.response_body_truncated = captured_len < response_body.len;
+        if (allocator.dupe(u8, response_body[0..captured_len])) |captured| {
+            payloads.response_body_bytes = captured;
+            payloads.response_body_truncated = captured_len < response_body.len;
         } else |err| {
-            std.log.warn("rove-js response-body blob put failed: {s}", .{@errorName(err)});
+            std.log.warn("rove-js response-body capture failed: {s}", .{@errorName(err)});
         }
     }
 
-    return refs;
+    return payloads;
 }
 
 pub fn captureLog(
@@ -1090,7 +1117,7 @@ pub fn captureLog(
     outcome: log_mod.Outcome,
     console_owned: []u8,
     exception_owned: []u8,
-    tape_refs: log_mod.TapeRefs,
+    tapes: log_mod.TapePayloads,
 ) void {
     captureLogWithId(
         worker,
@@ -1105,7 +1132,7 @@ pub fn captureLog(
         outcome,
         console_owned,
         exception_owned,
-        tape_refs,
+        tapes,
     );
 }
 
@@ -1113,6 +1140,9 @@ pub fn captureLog(
 /// `request_id` so the log record shares its id with the webhook rows
 /// a handler may have spawned via `webhook.send`. Pass `null` to mint
 /// fresh.
+///
+/// Takes ownership of `tapes` byte allocations on success. On
+/// failure they're freed alongside `console_owned` / `exception_owned`.
 pub fn captureLogWithId(
     worker: anytype,
     instance_id: []const u8,
@@ -1126,7 +1156,7 @@ pub fn captureLogWithId(
     outcome: log_mod.Outcome,
     console_owned: []u8,
     exception_owned: []u8,
-    tape_refs: log_mod.TapeRefs,
+    tapes: log_mod.TapePayloads,
 ) void {
     captureLogInner(
         worker,
@@ -1141,12 +1171,14 @@ pub fn captureLogWithId(
         outcome,
         console_owned,
         exception_owned,
-        tape_refs,
+        tapes,
     ) catch |err| {
         std.log.warn("rove-js: log capture failed for {s}: {s}", .{ instance_id, @errorName(err) });
         // The transferred buffers must still be freed.
         if (console_owned.len > 0) worker.allocator.free(console_owned);
         if (exception_owned.len > 0) worker.allocator.free(exception_owned);
+        var t = tapes;
+        t.deinit(worker.allocator);
     };
 }
 
@@ -1163,7 +1195,7 @@ fn captureLogInner(
     outcome: log_mod.Outcome,
     console_owned: []u8,
     exception_owned: []u8,
-    tape_refs: log_mod.TapeRefs,
+    tapes: log_mod.TapePayloads,
 ) !void {
     const tl = worker.tenant_logs.get(instance_id) orelse return error.NoTenantLog;
     const allocator = worker.allocator;
@@ -1192,7 +1224,7 @@ fn captureLogInner(
         .outcome = outcome,
         .console = console_owned,
         .exception = exception_owned,
-        .tape_refs = tape_refs,
+        .tapes = tapes,
     });
 }
 
@@ -1239,8 +1271,6 @@ fn flushOne(
         );
         return;
     }
-
-    if (tapeCaptureDisabled()) return;
 
     var node_buf: [8]u8 = undefined;
     const node_id_hex = std.fmt.bufPrint(&node_buf, "{x:0>8}", .{worker.raft.config.node_id}) catch unreachable;

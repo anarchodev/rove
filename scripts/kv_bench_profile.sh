@@ -62,7 +62,6 @@ init_cluster_addrs "$DATA_DIR_PREFIX" "$HTTP_PORT_BASE" "$RAFT_PORT_BASE"
 export S3_KEY_PREFIX_BASE="${S3_KEY_PREFIX_BASE:-bench-prof-$(hostname)-$(id -u)-$(date +%s)/}"
 export LOOP46_SERVICES_JWT_SECRET="$(gen_jwt_secret)"
 export LOOP46_ROOT_TOKEN="$TOKEN"
-export LOOP46_DISABLE_TAPE_CAPTURE=1
 
 seed_all_dirs ./examples/loop46-demo-tenants.json
 
