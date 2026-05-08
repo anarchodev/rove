@@ -982,6 +982,20 @@ pub const RequestTapes = struct {
 pub const REQUEST_BODY_CAP: usize = 256 * 1024;
 pub const RESPONSE_BODY_CAP: usize = 256 * 1024;
 
+/// `LOOP46_DISABLE_TAPE_CAPTURE=1` short-circuits per-request tape /
+/// body blob uploads. Useful for benchmarking the KV-write path
+/// without the S3 PUT-per-request overhead (tape capture issues two
+/// synchronous PUTs per request through std.http.Client, which has a
+/// keep-alive bug under concurrency that caps throughput in the
+/// single-digit-thousand-req/s range). With this set the request log
+/// records still get written but their tape_refs / body refs stay
+/// null, so the replay UI can't reconstruct individual requests.
+/// Don't enable in production.
+fn tapeCaptureDisabled() bool {
+    const v = std.posix.getenv("LOOP46_DISABLE_TAPE_CAPTURE") orelse return false;
+    return v.len > 0 and v[0] != '0';
+}
+
 pub fn uploadTapes(
     worker: anytype,
     instance_id: []const u8,
@@ -989,6 +1003,7 @@ pub fn uploadTapes(
     request_body: []const u8,
     response_body: []const u8,
 ) log_mod.TapeRefs {
+    if (tapeCaptureDisabled()) return .{};
     const tl = worker.tenant_logs.get(instance_id) orelse return .{};
     const allocator = worker.allocator;
     const blob = tl.blob_backend.blobStore();
@@ -1224,6 +1239,8 @@ fn flushOne(
         );
         return;
     }
+
+    if (tapeCaptureDisabled()) return;
 
     var node_buf: [8]u8 = undefined;
     const node_id_hex = std.fmt.bufPrint(&node_buf, "{x:0>8}", .{worker.raft.config.node_id}) catch unreachable;
