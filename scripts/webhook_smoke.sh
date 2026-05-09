@@ -59,6 +59,14 @@ if ! command -v python3 >/dev/null; then
     exit 2
 fi
 
+# Per-run S3 prefix. The default helper prefix is hashed off the
+# files-server binary; customer-source changes (cbfire/cbresult.mjs)
+# don't bump that hash, so a re-run with the default prefix would
+# reuse stale bytecode via bootstrapTenant's skip-on-existing-
+# manifest fast path. Date-stamping forces a fresh deployment on
+# every run.
+export S3_KEY_PREFIX_BASE="${S3_KEY_PREFIX_BASE:-smoke-webhook-$(date +%s)/}"
+
 . "$(dirname "$0")/_smoke_helpers.sh"
 SMOKE_TAG=webhook-smoke
 SMOKE_PROTO=https
@@ -87,11 +95,15 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get('content-length') or 0)
         body = self.rfile.read(n)
-        # Log metadata headers so the smoke script can assert on them.
-        sys.stderr.write("hdr X-Rove-Webhook-Id=%s\n"
-            % (self.headers.get('X-Rove-Webhook-Id') or ''))
-        sys.stderr.write("hdr X-Rove-Webhook-Attempt=%s\n"
-            % (self.headers.get('X-Rove-Webhook-Attempt') or ''))
+        # Log metadata headers so the smoke script can assert on
+        # them. Since `webhook.send` is now a polyfill on top of
+        # `http.send`, the legacy `X-Rove-Webhook-*` headers are
+        # gone — replaced by `X-Rove-Schedule-Id` +
+        # `X-Rove-Schedule-Version`.
+        sys.stderr.write("hdr X-Rove-Schedule-Id=%s\n"
+            % (self.headers.get('X-Rove-Schedule-Id') or ''))
+        sys.stderr.write("hdr X-Rove-Schedule-Version=%s\n"
+            % (self.headers.get('X-Rove-Schedule-Version') or ''))
         self.send_response(200)
         self.send_header('content-type', 'text/plain')
         self.send_header('content-length', str(len(body) + 5))
@@ -200,15 +212,15 @@ for _ in $(seq 1 30); do
     fi
     sleep 0.1
 done
-[[ $FOUND_ECHO -eq 1 ]] || fail "webhook-server never delivered to echo server"
-ok "webhook-server delivered webhook to echo target"
+[[ $FOUND_ECHO -eq 1 ]] || fail "scheduler never delivered to echo server"
+ok "scheduler delivered webhook to echo target"
 
 # ── 4a. Metadata headers stamped on outbound request ──────────────────
-grep -q "hdr X-Rove-Webhook-Id=${ID}" "$ECHO_LOG" \
-    || fail "X-Rove-Webhook-Id header missing or wrong"
-grep -q "hdr X-Rove-Webhook-Attempt=1" "$ECHO_LOG" \
-    || fail "X-Rove-Webhook-Attempt header missing or wrong"
-ok "webhook-server stamped X-Rove-Webhook-Id + X-Rove-Webhook-Attempt"
+grep -q "hdr X-Rove-Schedule-Id=${ID}" "$ECHO_LOG" \
+    || fail "X-Rove-Schedule-Id header missing or wrong"
+grep -q "hdr X-Rove-Schedule-Version=1" "$ECHO_LOG" \
+    || fail "X-Rove-Schedule-Version header missing or wrong"
+ok "scheduler stamped X-Rove-Schedule-Id + X-Rove-Schedule-Version"
 
 # ── 5. Read the callback result via admin API ─────────────────────────
 #
@@ -247,10 +259,13 @@ for e in doc.get("entries", []):
 if match is None:
     print("no match for cb/result/" + id, file=sys.stderr)
     sys.exit(2)
-assert match["outcome"] == "delivered", f"outcome={match['outcome']!r}"
+# Schedule envelope-9 event shape (http-send-plan): ok bool, flat
+# status/body, no attempts, no nested response. Replaces the legacy
+# webhook event shape now that webhook.send is a JS polyfill on
+# top of http.send.
+assert match["ok"] is True, f"ok={match['ok']!r}"
 assert match["status"] == 200, f"status={match['status']!r}"
 assert match["body"] == "echo:ping", f"body={match['body']!r}"
-assert match["attempts"] == 1, f"attempts={match['attempts']!r}"
 assert match["context"]["tag"] == "smoke1", f"context={match['context']!r}"
 assert match.get("error") in (None, ""), f"error={match.get('error')!r}"
 print(json.dumps(match))
@@ -259,7 +274,7 @@ PY
 ID="$ID" python3 "$VERIFY_PY" <<<"$RESULT_BODY" \
     || { rm -f "$VERIFY_PY"; fail "event shape check failed: $RESULT_BODY"; }
 rm -f "$VERIFY_PY"
-ok "callback event shape: outcome=delivered, status=200, body='echo:ping', attempts=1, context.tag=smoke1"
+ok "callback event shape: ok=true, status=200, body='echo:ping', context.tag=smoke1"
 
 # ── 6. Receipt should be deleted after delivery ───────────────────────
 QS=$(python3 -c "

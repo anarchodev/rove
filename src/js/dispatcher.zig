@@ -3506,7 +3506,7 @@ test "dispatch: request.query exposes raw query string" {
 }
 
 
-test "dispatch: webhook.send appends WebhookRow to pending_webhooks" {
+test "dispatch: webhook.send (polyfill) appends ScheduleRow to pending_schedules" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -3517,13 +3517,15 @@ test "dispatch: webhook.send appends WebhookRow to pending_webhooks" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    var webhooks: std.ArrayListUnmanaged(webhook_server.WebhookRow) = .empty;
+    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
     defer {
-        for (webhooks.items) |*r| r.deinit(testing.allocator);
-        webhooks.deinit(testing.allocator);
+        for (schedules.items) |*r| r.deinit(testing.allocator);
+        schedules.deinit(testing.allocator);
     }
 
-    // Handler fires two webhooks; the second exercises call_index = 1.
+    // The legacy webhook.send is now a JS polyfill on top of
+    // http.send (src/js/bindings/webhook.js). Same call shape from
+    // customer code, but rows land in pending_schedules.
     var resp = try runOne(
         &d,
         kv,
@@ -3543,34 +3545,31 @@ test "dispatch: webhook.send appends WebhookRow to pending_webhooks" {
             .method = "GET",
             .path = "/hook",
             .request_id = 0xdeadbeef,
-            .pending_webhooks = &webhooks,
+            .pending_schedules = &schedules,
         },
     );
     defer resp.deinit(testing.allocator);
 
-    // 64-hex id | 64-hex id → 129 chars total.
-    try testing.expectEqual(@as(usize, 64 * 2 + 1), resp.body.len);
-
-    try testing.expectEqual(@as(usize, 2), webhooks.items.len);
+    try testing.expectEqual(@as(usize, 2), schedules.items.len);
 
     // Insertion order preserved.
-    try testing.expectEqualStrings("https://example.test/a", webhooks.items[0].url);
-    try testing.expectEqualStrings("POST", webhooks.items[0].method);
-    try testing.expectEqualStrings("one", webhooks.items[0].body);
-    try testing.expectEqualStrings("cb/a", webhooks.items[0].on_result_path);
-    try testing.expectEqualStrings("{\"x\":1}", webhooks.items[0].context_json);
+    try testing.expectEqualStrings("https://example.test/a", schedules.items[0].url);
+    try testing.expectEqualStrings("POST", schedules.items[0].method);
+    try testing.expectEqualStrings("one", schedules.items[0].body);
+    try testing.expectEqualStrings("cb/a", schedules.items[0].on_result_module);
+    try testing.expectEqualStrings("{\"x\":1}", schedules.items[0].context_json);
 
-    try testing.expectEqualStrings("https://example.test/b", webhooks.items[1].url);
-    try testing.expectEqualStrings("GET", webhooks.items[1].method);
+    try testing.expectEqualStrings("https://example.test/b", schedules.items[1].url);
+    try testing.expectEqualStrings("GET", schedules.items[1].method);
 
-    // Webhook ids match the response body.
+    // Schedule ids (64-hex sha256 hex) match the response body.
     const id1 = resp.body[0..64];
     const id2 = resp.body[65..];
-    try testing.expectEqualSlices(u8, id1, &webhooks.items[0].webhook_id_hex);
-    try testing.expectEqualSlices(u8, id2, &webhooks.items[1].webhook_id_hex);
+    try testing.expectEqualSlices(u8, id1, schedules.items[0].id);
+    try testing.expectEqualSlices(u8, id2, schedules.items[1].id);
 }
 
-test "dispatch: webhook.send ids are deterministic under replay" {
+test "dispatch: webhook.send (polyfill) ids are deterministic under replay" {
     var buf_a: [64]u8 = undefined;
     const kv_a = try openTempKv(testing.allocator, &buf_a);
     defer {
@@ -3629,7 +3628,7 @@ test "dispatch: webhook.send rejects missing url" {
     try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
 }
 
-test "dispatch: email.send wraps webhook.send with Resend shape" {
+test "dispatch: email.send wraps webhook.send (polyfill) with Resend shape" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -3640,10 +3639,11 @@ test "dispatch: email.send wraps webhook.send with Resend shape" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    var webhooks: std.ArrayListUnmanaged(webhook_server.WebhookRow) = .empty;
+    // email.send → webhook.send (JS polyfill) → http.send → ScheduleRow.
+    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
     defer {
-        for (webhooks.items) |*r| r.deinit(testing.allocator);
-        webhooks.deinit(testing.allocator);
+        for (schedules.items) |*r| r.deinit(testing.allocator);
+        schedules.deinit(testing.allocator);
     }
     var resp = try runOne(
         &d,
@@ -3662,14 +3662,14 @@ test "dispatch: email.send wraps webhook.send with Resend shape" {
             .method = "POST",
             .path = "/",
             .request_id = 7,
-            .pending_webhooks = &webhooks,
+            .pending_schedules = &schedules,
         },
     );
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 64), resp.body.len); // id hex
 
-    try testing.expectEqual(@as(usize, 1), webhooks.items.len);
-    const row = webhooks.items[0];
+    try testing.expectEqual(@as(usize, 1), schedules.items.len);
+    const row = schedules.items[0];
 
     try testing.expectEqualStrings("https://api.resend.com/emails", row.url);
     try testing.expectEqualStrings("POST", row.method);
@@ -3684,7 +3684,7 @@ test "dispatch: email.send wraps webhook.send with Resend shape" {
         "application/json",
         headers.value.object.get("Content-Type").?.string,
     );
-    try testing.expectEqualStrings("signup/email_result", row.on_result_path);
+    try testing.expectEqualStrings("signup/email_result", row.on_result_module);
 
     // Body is a JSON string; parse to check shape.
     var body_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, row.body, .{});
@@ -4327,10 +4327,10 @@ test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    var webhooks: std.ArrayListUnmanaged(webhook_server.WebhookRow) = .empty;
+    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
     defer {
-        for (webhooks.items) |*r| r.deinit(testing.allocator);
-        webhooks.deinit(testing.allocator);
+        for (schedules.items) |*r| r.deinit(testing.allocator);
+        schedules.deinit(testing.allocator);
     }
     var resp = try runOne(
         &d,
@@ -4349,13 +4349,13 @@ test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
             .method = "POST",
             .path = "/",
             .request_id = 2,
-            .pending_webhooks = &webhooks,
+            .pending_schedules = &schedules,
         },
     );
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 1), webhooks.items.len);
-    var body = try std.json.parseFromSlice(std.json.Value, testing.allocator, webhooks.items[0].body, .{});
+    try testing.expectEqual(@as(usize, 1), schedules.items.len);
+    var body = try std.json.parseFromSlice(std.json.Value, testing.allocator, schedules.items[0].body, .{});
     defer body.deinit();
 
     try testing.expectEqual(@as(usize, 2), body.value.object.get("to").?.array.items.len);

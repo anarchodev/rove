@@ -969,9 +969,13 @@ pub fn installStatic(ctx: *c.JSContext) void {
     for (GLOBAL_BUILTINS) |fb| attachFn(ctx, global, fb);
 
     // JS-side wrappers/polyfills evaluated last so they can call
-    // into the native bindings installed above. email.js wraps
-    // webhook.send for Resend; textcodec.js polyfills
-    // TextEncoder/TextDecoder (UTF-8 only).
+    // into the native bindings installed above. webhook.js layers
+    // a legacy `webhook.send` shim on top of `http.send`; email.js
+    // wraps `webhook.send` for Resend; textcodec.js polyfills
+    // TextEncoder/TextDecoder (UTF-8 only). Order matters —
+    // webhook.js runs before email.js because email.js calls into
+    // the polyfilled `webhook.send`.
+    evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
     evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
 }
@@ -1018,20 +1022,13 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "sha256",          .cfunc = crypto_b.jsCryptoSha256,          .argc = 1 },
         .{ .name = "hmacSha256",      .cfunc = crypto_b.jsCryptoHmacSha256,      .argc = 2 },
     } },
-    // webhook.send. Delivery is async — send() appends a WebhookRow
-    // to the dispatcher's per-batch accumulator and returns an id;
-    // the leader-pinned webhook-server thread reads webhooks.db (the
-    // raft-replicated store the apply-side writes envelope 4 into)
-    // and does the actual HTTP call.
-    .{ .path = &.{"webhook"}, .fns = &.{
-        .{ .name = "send", .cfunc = webhook_b.jsWebhookSend, .argc = 1 },
-    } },
-    // http.send / http.cancel — the new generic outbound HTTP
-    // primitive (docs/http-send-plan.md). Same lifecycle as
-    // webhook.send: send appends a ScheduleRow to the dispatcher's
-    // per-batch list and returns an id; the leader-pinned scheduler
-    // thread (next slice) reads schedules.db and fires libcurl.
-    // cancel appends a CancelTarget to drop a pending row.
+    // http.send / http.cancel — the platform's outbound HTTP
+    // primitive (docs/http-send-plan.md). send appends a
+    // ScheduleRow to the dispatcher's per-batch list and returns
+    // an id; the leader-pinned scheduler thread reads schedules.db
+    // and fires libcurl. cancel appends a CancelTarget to drop a
+    // pending row. webhook.send + email.send polyfill on top
+    // (see webhook.js + email.js).
     .{ .path = &.{"http"}, .fns = &.{
         .{ .name = "send",   .cfunc = http_b.jsHttpSend,   .argc = 1 },
         .{ .name = "cancel", .cfunc = http_b.jsHttpCancel, .argc = 1 },
@@ -1079,6 +1076,7 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     .{ .name = "__rove_check_email_rate", .cfunc = webhook_b.jsCheckEmailRate, .argc = 0 },
 };
 
+const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
 
