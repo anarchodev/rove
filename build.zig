@@ -256,6 +256,24 @@ pub fn build(b: *std.Build) void {
     // module in Phase 5.5 (d) step 6 — webhook-server is the only
     // consumer.
 
+    // ── rove-schedule-server: generic scheduled HTTP delivery ────────
+    //
+    // The `http.send` / `http.cancel` storage + envelope layer. See
+    // `docs/http-send-plan.md`. Step 1 of the migration ships just
+    // the schema + wire format; the leader-pinned scheduler thread,
+    // the JS bindings, and the `webhook.loop46.com` default-policy
+    // tenant land in subsequent slices. Same shape as
+    // rove-webhook-server's step-1 module — kv-backed store,
+    // envelope encode/decode, no thread yet.
+    const schedule_server_mod = b.addModule("rove-schedule-server", .{
+        .root_source_file = b.path("src/schedule_server/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    schedule_server_mod.link_libc = true;
+    schedule_server_mod.linkSystemLibrary("sqlite3", .{});
+    schedule_server_mod.addImport("rove-kv", kv_mod);
+
     // ── rove-files-server: per-instance code operations (Phase 5) ──
     //
     // Compile + upload + deploy + source fetch, wrapping rove-files.
@@ -363,6 +381,10 @@ pub fn build(b: *std.Build) void {
     // rove-sse-server tests
     const sse_server_tests = b.addTest(.{ .root_module = sse_server_mod });
     test_step.dependOn(&b.addRunArtifact(sse_server_tests).step);
+
+    // rove-schedule-server tests
+    const schedule_server_tests = b.addTest(.{ .root_module = schedule_server_mod });
+    test_step.dependOn(&b.addRunArtifact(schedule_server_tests).step);
 
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
