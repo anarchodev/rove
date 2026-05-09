@@ -84,6 +84,9 @@ globalThis.retry = {
       timeout_ms: opts.timeout_ms,
       max_body_bytes: opts.max_body_bytes,
     };
+    const on_result = { module: opts.on_result_module };
+    if (opts.on_result_fn) on_result.fn = opts.on_result_fn;
+    if (opts.on_result_args !== undefined) on_result.args = opts.on_result_args;
     const send_opts = {
       url: opts.url,
       method: opts.method,
@@ -92,13 +95,15 @@ globalThis.retry = {
       timeout_ms: opts.timeout_ms,
       max_body_bytes: opts.max_body_bytes,
       fire_at_ns: opts.fire_at_ns,
-      on_result: { module: opts.on_result_module },
+      on_result,
       context: Object.assign({}, opts.context || {}, {
         [RETRY_KEY]: {
           attempt: 1,
           max_attempts,
           backoff_ms: opts.backoff_ms,
           on_result_module: opts.on_result_module,
+          on_result_fn: opts.on_result_fn,
+          on_result_args: opts.on_result_args,
           original,
         },
       }),
@@ -130,6 +135,9 @@ globalThis.retry = {
     // User-domain context is everything except _retry.
     const user_context = Object.assign({}, event.context);
     delete user_context[RETRY_KEY];
+    const on_result = { module: r.on_result_module };
+    if (r.on_result_fn) on_result.fn = r.on_result_fn;
+    if (r.on_result_args !== undefined) on_result.args = r.on_result_args;
     return http.send({
       url: r.original.url,
       method: r.original.method,
@@ -138,7 +146,7 @@ globalThis.retry = {
       timeout_ms: r.original.timeout_ms,
       max_body_bytes: r.original.max_body_bytes,
       fire_at_ns,
-      on_result: { module: r.on_result_module },
+      on_result,
       context: Object.assign({}, user_context, {
         [RETRY_KEY]: Object.assign({}, r, { attempt: next_attempt }),
       }),

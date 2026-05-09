@@ -329,6 +329,14 @@ fn runOneCallback(
     const body = try buildCallbackEvent(allocator, parsed.value);
     defer allocator.free(body);
 
+    // Optional named-export dispatch. When the receipt carries
+    // `on_result_fn`, we synthesize a `?fn={fn}&args={...}` query
+    // so parseDispatch routes to the named export with positional
+    // args. Empty `on_result_fn` falls through to today's default-
+    // export-with-no-args behavior.
+    const synthetic_query = try buildSyntheticQuery(allocator, obj);
+    defer if (synthetic_query) |q| allocator.free(q);
+
     try txn.savepoint();
 
     const request_id: u64 = blk: {
@@ -350,7 +358,7 @@ fn runOneCallback(
         .method = "POST",
         .path = synthetic_path,
         .body = body,
-        .query = null,
+        .query = synthetic_query,
         .kv_tape = &tapes.kv,
         .date_tape = &tapes.date,
         .math_random_tape = &tapes.math_random,
@@ -496,6 +504,67 @@ fn buildCallbackEvent(
     return aw.toOwnedSlice();
 }
 
+/// Build a synthesized query string for the callback request when
+/// the receipt carries `on_result_fn`. Returns null when the
+/// receipt has no fn (use the default-export-with-no-args path).
+/// Format: `fn={name}` or `fn={name}&args={url-encoded-json}`.
+/// Returned slice is allocator-owned.
+fn buildSyntheticQuery(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+) !?[]const u8 {
+    const fn_v = obj.get("on_result_fn") orelse return null;
+    const fn_name = switch (fn_v) {
+        .string => |s| s,
+        else => return null,
+    };
+    if (fn_name.len == 0) return null;
+
+    const args_v = obj.get("on_result_args");
+    if (args_v == null or args_v.? == .null) {
+        // Just `?fn={name}` — handler called with no JS args.
+        return try std.fmt.allocPrint(allocator, "fn={s}", .{fn_name});
+    }
+    // Re-stringify the args array (it's already JSON in the
+    // receipt, but obj.get returns the parsed Value; serialize
+    // back to text). Then URL-encode minimally — `args=` is what
+    // `parseDispatch` expects to decode via decodePercent.
+    var args_text: std.ArrayList(u8) = .empty;
+    defer args_text.deinit(allocator);
+    {
+        // Inner scope so the writer's internal buffer is synced
+        // back into `args_text` BEFORE we read `args_text.items`.
+        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &args_text);
+        defer args_text = aw.toArrayList();
+        try std.json.Stringify.value(args_v.?, .{}, &aw.writer);
+    }
+    const encoded = try urlEncode(allocator, args_text.items);
+    defer allocator.free(encoded);
+    return try std.fmt.allocPrint(allocator, "fn={s}&args={s}", .{ fn_name, encoded });
+}
+
+/// Minimal URL encoder for the args JSON. Escapes everything that
+/// isn't unreserved per RFC 3986. Allocator-owned return.
+fn urlEncode(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const hex = "0123456789ABCDEF";
+    for (src) |b| {
+        const unreserved = (b >= 'A' and b <= 'Z') or
+            (b >= 'a' and b <= 'z') or
+            (b >= '0' and b <= '9') or
+            b == '-' or b == '_' or b == '.' or b == '~';
+        if (unreserved) {
+            try out.append(allocator, b);
+        } else {
+            try out.append(allocator, '%');
+            try out.append(allocator, hex[b >> 4]);
+            try out.append(allocator, hex[b & 0x0f]);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 // Maps fields from either envelope flavor (legacy webhook
 // envelope-5 or new schedule envelope-9) into the camelCase event
 // the handler sees. A given receipt will only carry fields from one
@@ -630,6 +699,44 @@ test "buildCallbackEvent: schedule envelope-9 → camelCase event with id/ok/sta
     try testing.expect(obj.get("response") == null);
     try testing.expect(obj.get("on_result") == null); // server-side only
     try testing.expect(obj.get("error") == null); // null in envelope → dropped
+}
+
+test "buildSyntheticQuery: receipt without on_result_fn returns null" {
+    const a = testing.allocator;
+    const receipt =
+        \\{ "id": "x", "on_result": "stripe_done", "ok": true }
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, receipt, .{});
+    defer parsed.deinit();
+    const q = try buildSyntheticQuery(a, parsed.value.object);
+    try testing.expect(q == null);
+}
+
+test "buildSyntheticQuery: receipt with on_result_fn (no args) emits ?fn=" {
+    const a = testing.allocator;
+    const receipt =
+        \\{ "id": "x", "on_result": "stripe", "on_result_fn": "handleCharge", "ok": true }
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, receipt, .{});
+    defer parsed.deinit();
+    const q = (try buildSyntheticQuery(a, parsed.value.object)).?;
+    defer a.free(q);
+    try testing.expectEqualStrings("fn=handleCharge", q);
+}
+
+test "buildSyntheticQuery: receipt with on_result_fn + on_result_args emits ?fn=&args=" {
+    const a = testing.allocator;
+    const receipt =
+        \\{ "id": "x", "on_result": "stripe", "on_result_fn": "handleCharge",
+        \\  "on_result_args": [42, "subscription"], "ok": true }
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, receipt, .{});
+    defer parsed.deinit();
+    const q = (try buildSyntheticQuery(a, parsed.value.object)).?;
+    defer a.free(q);
+    // args are url-encoded JSON: [42,"subscription"] →
+    // %5B42%2C%22subscription%22%5D
+    try testing.expectEqualStrings("fn=handleCharge&args=%5B42%2C%22subscription%22%5D", q);
 }
 
 test "findCallbackBytecode: exact .mjs match wins over .js" {

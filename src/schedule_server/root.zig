@@ -128,7 +128,24 @@ pub const ScheduleRow = struct {
     /// Customer-tenant module that runs on result. Empty = fire-
     /// and-forget.
     on_result_module: []const u8 = "",
-    /// JSON object handed back to the on_result handler.
+    /// Named export within `on_result_module` to invoke. Empty
+    /// means the dispatcher's default — `?fn=` behavior — which
+    /// is the module's `default` export with no JS args. When set,
+    /// the synthesized callback request gets `?fn={on_result_fn}`
+    /// in its query string so `parseDispatch` routes accordingly.
+    on_result_fn: []const u8 = "",
+    /// JSON-array text of positional args to pass to `on_result_fn`.
+    /// Empty defaults to "[]". When set + on_result_fn is set, the
+    /// synthesized callback request gets `&args={url-encoded-json}`
+    /// alongside `?fn=`. The handler reads the result event from
+    /// `request.body`; these args are pre-bound at fire time and
+    /// arrive as JS positional parameters.
+    on_result_args_json: []const u8 = "",
+    /// JSON object handed back to the on_result handler. Stays in
+    /// the event payload (event.context); orthogonal to args (which
+    /// is fire-time-bound positional data). Customers pick whichever
+    /// shape fits — args for fixed positional, context for structured
+    /// event-time-relevant fields.
     context_json: []const u8 = "null",
     /// True if the URL host matches a tenant on this cluster — set
     /// by the apply path via `detectInternal` (next slice). Routes
@@ -144,6 +161,8 @@ pub const ScheduleRow = struct {
         allocator.free(self.headers_json);
         allocator.free(self.body);
         allocator.free(self.on_result_module);
+        allocator.free(self.on_result_fn);
+        allocator.free(self.on_result_args_json);
         allocator.free(self.context_json);
         self.* = undefined;
     }
@@ -540,7 +559,9 @@ fn validateId(id: []const u8) Error!void {
 
 // ── Stored shape: serialize / parse ────────────────────────────────────
 
-const STORED_VERSION: u8 = 1;
+// Bumped 2026-05-09: added on_result_fn + on_result_args_json
+// fields. Pre-launch — no production data to migrate.
+const STORED_VERSION: u8 = 2;
 
 pub fn serializeStored(allocator: std.mem.Allocator, s: *const StoredSchedule) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -560,6 +581,8 @@ pub fn serializeStored(allocator: std.mem.Allocator, s: *const StoredSchedule) !
     try writeU32(allocator, &out, s.row.timeout_ms);
     try writeU32(allocator, &out, s.row.max_body_bytes);
     try writeU16Bytes(allocator, &out, s.row.on_result_module);
+    try writeU16Bytes(allocator, &out, s.row.on_result_fn);
+    try writeU32Bytes(allocator, &out, s.row.on_result_args_json);
     try writeU32Bytes(allocator, &out, s.row.context_json);
     return out.toOwnedSlice(allocator);
 }
@@ -589,6 +612,10 @@ pub fn parseStored(allocator: std.mem.Allocator, bytes: []const u8) Error!Stored
     const max_body_bytes = try r.u32le();
     const on_result_module = try r.bytesU16(allocator);
     errdefer allocator.free(on_result_module);
+    const on_result_fn = try r.bytesU16(allocator);
+    errdefer allocator.free(on_result_fn);
+    const on_result_args_json = try r.bytesU32(allocator);
+    errdefer allocator.free(on_result_args_json);
     const context_json = try r.bytesU32(allocator);
     errdefer allocator.free(context_json);
     return .{
@@ -603,6 +630,8 @@ pub fn parseStored(allocator: std.mem.Allocator, bytes: []const u8) Error!Stored
             .timeout_ms = timeout_ms,
             .max_body_bytes = max_body_bytes,
             .on_result_module = on_result_module,
+            .on_result_fn = on_result_fn,
+            .on_result_args_json = on_result_args_json,
             .context_json = context_json,
             .is_internal = is_internal,
         },
@@ -614,7 +643,9 @@ pub fn parseStored(allocator: std.mem.Allocator, bytes: []const u8) Error!Stored
 
 // ── Wire format: envelope 8 (upsert batch) ─────────────────────────────
 
-pub const ENVELOPE_8_VERSION: u8 = 1;
+// Bumped 2026-05-09 alongside STORED_VERSION: row carries
+// on_result_fn + on_result_args_json. Pre-launch.
+pub const ENVELOPE_8_VERSION: u8 = 2;
 
 pub fn encodeUpsertBatch(allocator: std.mem.Allocator, rows: []const ScheduleRow) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -654,6 +685,8 @@ fn encodeOneRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), row: *con
     try writeU32(allocator, out, row.timeout_ms);
     try writeU32(allocator, out, row.max_body_bytes);
     try writeU16Bytes(allocator, out, row.on_result_module);
+    try writeU16Bytes(allocator, out, row.on_result_fn);
+    try writeU32Bytes(allocator, out, row.on_result_args_json);
     try writeU32Bytes(allocator, out, row.context_json);
     try out.append(allocator, @intFromBool(row.is_internal));
 }
@@ -677,6 +710,10 @@ fn decodeOneRow(allocator: std.mem.Allocator, r: *Reader) Error!ScheduleRow {
     const max_body_bytes = try r.u32le();
     const on_result_module = try r.bytesU16(allocator);
     errdefer allocator.free(on_result_module);
+    const on_result_fn = try r.bytesU16(allocator);
+    errdefer allocator.free(on_result_fn);
+    const on_result_args_json = try r.bytesU32(allocator);
+    errdefer allocator.free(on_result_args_json);
     const context_json = try r.bytesU32(allocator);
     errdefer allocator.free(context_json);
     const is_internal = (try r.byte()) != 0;
@@ -691,6 +728,8 @@ fn decodeOneRow(allocator: std.mem.Allocator, r: *Reader) Error!ScheduleRow {
         .timeout_ms = timeout_ms,
         .max_body_bytes = max_body_bytes,
         .on_result_module = on_result_module,
+        .on_result_fn = on_result_fn,
+        .on_result_args_json = on_result_args_json,
         .context_json = context_json,
         .is_internal = is_internal,
     };
@@ -970,6 +1009,8 @@ fn testRow(allocator: std.mem.Allocator, tenant: []const u8, id: []const u8, fir
         .timeout_ms = 30_000,
         .max_body_bytes = RESPONSE_BODY_CAP,
         .on_result_module = try allocator.dupe(u8, "stripe_response"),
+        .on_result_fn = try allocator.dupe(u8, ""),
+        .on_result_args_json = try allocator.dupe(u8, ""),
         .context_json = try allocator.dupe(u8, "{\"order_id\":\"o-42\"}"),
         .is_internal = false,
     };
@@ -1003,6 +1044,34 @@ test "envelope 8 upsert batch round-trip" {
     try testing.expectEqualStrings("beta", decoded[1].tenant_id);
     try testing.expectEqualStrings("checkout-99", decoded[1].id);
     try testing.expect(decoded[1].is_internal);
+    // on_result_fn + args default to empty (testRow stamps "")
+    try testing.expectEqualStrings("", decoded[0].on_result_fn);
+    try testing.expectEqualStrings("", decoded[0].on_result_args_json);
+}
+
+test "envelope 8 round-trip with on_result_fn + on_result_args_json" {
+    const a = testing.allocator;
+    var row = try testRow(a, "acme", "x", 0);
+    a.free(@constCast(row.on_result_fn));
+    row.on_result_fn = try a.dupe(u8, "handleCharge");
+    a.free(@constCast(row.on_result_args_json));
+    row.on_result_args_json = try a.dupe(u8, "[42,\"subscription\"]");
+    defer row.deinit(a);
+    const rows = [_]ScheduleRow{row};
+
+    const encoded = try encodeUpsertBatch(a, &rows);
+    defer a.free(encoded);
+    const decoded = try decodeUpsertBatch(a, encoded);
+    defer {
+        for (decoded) |*r| {
+            var rr = r.*;
+            rr.deinit(a);
+        }
+        a.free(decoded);
+    }
+    try testing.expectEqual(@as(usize, 1), decoded.len);
+    try testing.expectEqualStrings("handleCharge", decoded[0].on_result_fn);
+    try testing.expectEqualStrings("[42,\"subscription\"]", decoded[0].on_result_args_json);
 }
 
 test "envelope 8 rejects bad version" {

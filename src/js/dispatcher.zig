@@ -1936,6 +1936,111 @@ test "dispatch: http.send with handle uses handle as id + same handle overwrites
     try testing.expectEqual(@as(i64, 1234), schedules.items[1].fire_at_ns);
 }
 
+test "dispatch: http.send accepts on_result.fn + on_result.args" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
+    defer {
+        for (schedules.items) |*r| r.deinit(testing.allocator);
+        schedules.deinit(testing.allocator);
+    }
+
+    var resp = try runOne(&d, kv,
+        \\http.send({
+        \\  url: "https://stripe.com/x",
+        \\  on_result: {
+        \\    module: "stripe",
+        \\    fn: "handleCharge",
+        \\    args: [42, "subscription"],
+        \\  },
+        \\});
+        \\return "ok";
+    , .{
+        .method = "POST",
+        .path = "/",
+        .request_id = 7,
+        .pending_schedules = &schedules,
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), schedules.items.len);
+    const row = &schedules.items[0];
+    try testing.expectEqualStrings("stripe", row.on_result_module);
+    try testing.expectEqualStrings("handleCharge", row.on_result_fn);
+    try testing.expectEqualStrings("[42,\"subscription\"]", row.on_result_args_json);
+}
+
+test "dispatch: http.send rejects non-array on_result.args" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\try {
+        \\  http.send({
+        \\    url: "https://x/",
+        \\    on_result: { module: "m", fn: "f", args: { not: "array" } },
+        \\  });
+        \\  return "ok";
+        \\} catch (e) {
+        \\  return "threw:" + e.message;
+        \\}
+    , .{
+        .method = "POST",
+        .path = "/",
+        .request_id = 1,
+    });
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
+}
+
+test "dispatch: http.send omitted on_result.fn defaults to empty" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
+    defer {
+        for (schedules.items) |*r| r.deinit(testing.allocator);
+        schedules.deinit(testing.allocator);
+    }
+
+    var resp = try runOne(&d, kv,
+        \\http.send({ url: "https://x/", on_result: { module: "m" } });
+        \\return "ok";
+    , .{
+        .method = "POST",
+        .path = "/",
+        .request_id = 1,
+        .pending_schedules = &schedules,
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), schedules.items.len);
+    try testing.expectEqualStrings("", schedules.items[0].on_result_fn);
+    try testing.expectEqualStrings("", schedules.items[0].on_result_args_json);
+}
+
 test "dispatch: http.cancel appends a CancelTarget" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

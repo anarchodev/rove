@@ -921,6 +921,19 @@ fn buildScheduleCallbackJson(
         try writeJsonString(w, stored.row.on_result_module);
         try w.writeByte('"');
     }
+    // on_result_fn / on_result_args ride alongside the module name
+    // so callback_dispatch can synthesize a `?fn=&args=` query
+    // string for the callback request. Empty fn = use the module's
+    // default export with no JS args (today's behavior).
+    if (stored.row.on_result_fn.len > 0) {
+        try w.writeAll(",\"on_result_fn\":\"");
+        try writeJsonString(w, stored.row.on_result_fn);
+        try w.writeByte('"');
+    }
+    if (stored.row.on_result_args_json.len > 0) {
+        try w.writeAll(",\"on_result_args\":");
+        try w.writeAll(stored.row.on_result_args_json);
+    }
     try w.print(",\"ok\":{},\"status\":{d},\"version\":{d},\"context\":", .{
         ok,
         complete.status,
@@ -1096,6 +1109,50 @@ test "buildScheduleCallbackJson delivered shape" {
     try testing.expect(std.mem.indexOf(u8, json, "\"context\":{\"order\":\"o-42\"}") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"body\":\"{\\\"id\\\":\\\"ch_123\\\"}\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"error\":null") != null);
+    // No on_result_fn / on_result_args fields when stored row had
+    // empty defaults — keeps the JSON tight when fn dispatch isn't used.
+    try testing.expect(std.mem.indexOf(u8, json, "\"on_result_fn\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"on_result_args\"") == null);
+}
+
+test "buildScheduleCallbackJson includes on_result_fn + on_result_args when set" {
+    const a = testing.allocator;
+    var stored: schedule_server.StoredSchedule = .{
+        .row = .{
+            .tenant_id = "acme",
+            .id = "x",
+            .fire_at_ns = 0,
+            .url = "https://x/",
+            .method = "POST",
+            .headers_json = "{}",
+            .body = "",
+            .timeout_ms = 30_000,
+            .max_body_bytes = 256 * 1024,
+            .on_result_module = "stripe",
+            .on_result_fn = "handleCharge",
+            .on_result_args_json = "[42,\"subscription\"]",
+            .context_json = "null",
+            .is_internal = false,
+        },
+        .version = 1,
+        .inflight_until_ns = 0,
+        .created_at_ns = 0,
+    };
+    const complete: schedule_server.CompleteEnvelope = .{
+        .tenant_id = "acme",
+        .id = "x",
+        .version_at_fire = 1,
+        .outcome = .delivered,
+        .status = 200,
+        .response_headers_json = "",
+        .response_body = "ok",
+        .error_message = "",
+    };
+    const json = try buildScheduleCallbackJson(a, &complete, &stored);
+    defer a.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"on_result\":\"stripe\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"on_result_fn\":\"handleCharge\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"on_result_args\":[42,\"subscription\"]") != null);
 }
 
 test "buildScheduleCallbackJson failed shape carries error string + ok=false" {

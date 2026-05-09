@@ -136,6 +136,8 @@ fn buildRow(
     owned.headers_json = try dupeJsObjectAsJson(ctx, a, opts, "headers", "{}");
     owned.context_json = try dupeJsObjectAsJson(ctx, a, opts, "context", "null");
     owned.on_result_module = try resolveOnResultModule(ctx, a, opts);
+    owned.on_result_fn = try resolveOnResultFn(ctx, a, opts);
+    owned.on_result_args_json = try resolveOnResultArgs(ctx, a, opts);
 
     const fire_at_ns_i64 = try resolveFireAtNs(ctx, opts);
     const timeout_ms = try getIntField(ctx, opts, "timeout_ms", 30_000);
@@ -152,6 +154,8 @@ fn buildRow(
         .timeout_ms = @intCast(@max(timeout_ms, 1)),
         .max_body_bytes = @intCast(@max(max_body_bytes, 1)),
         .on_result_module = owned.on_result_module.?,
+        .on_result_fn = owned.on_result_fn.?,
+        .on_result_args_json = owned.on_result_args_json.?,
         .context_json = owned.context_json.?,
         .is_internal = false, // apply path detects + stamps
     };
@@ -167,6 +171,8 @@ const ExtractedStrings = struct {
     headers_json: ?[]u8 = null,
     body: ?[]u8 = null,
     on_result_module: ?[]u8 = null,
+    on_result_fn: ?[]u8 = null,
+    on_result_args_json: ?[]u8 = null,
     context_json: ?[]u8 = null,
 
     fn deinit(self: *ExtractedStrings, a: std.mem.Allocator) void {
@@ -177,6 +183,8 @@ const ExtractedStrings = struct {
         if (self.headers_json) |s| a.free(s);
         if (self.body) |s| a.free(s);
         if (self.on_result_module) |s| a.free(s);
+        if (self.on_result_fn) |s| a.free(s);
+        if (self.on_result_args_json) |s| a.free(s);
         if (self.context_json) |s| a.free(s);
     }
 };
@@ -250,6 +258,56 @@ fn resolveOnResultModule(ctx: ?*c.JSContext, a: std.mem.Allocator, opts: c.JSVal
     }
     var len: usize = 0;
     const cstr = c.JS_ToCStringLen(ctx, &len, module_v);
+    if (cstr == null) return error.JsException;
+    defer c.JS_FreeCString(ctx, cstr);
+    return a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
+}
+
+/// `on_result.fn` is optional. Empty string = use the dispatcher's
+/// default (`?fn=`) → calls the module's `default` export. When set,
+/// the synthesized callback request gets `?fn={on_result_fn}`.
+fn resolveOnResultFn(ctx: ?*c.JSContext, a: std.mem.Allocator, opts: c.JSValue) ![]u8 {
+    const on_result = c.JS_GetPropertyStr(ctx, opts, "on_result");
+    defer c.JS_FreeValue(ctx, on_result);
+    if (c.JS_IsUndefined(on_result) or c.JS_IsNull(on_result)) return a.dupe(u8, "");
+    if (!c.JS_IsObject(on_result)) return a.dupe(u8, "");
+    const fn_v = c.JS_GetPropertyStr(ctx, on_result, "fn");
+    defer c.JS_FreeValue(ctx, fn_v);
+    if (c.JS_IsUndefined(fn_v) or c.JS_IsNull(fn_v)) return a.dupe(u8, "");
+    if (!c.JS_IsString(fn_v)) {
+        _ = c.JS_ThrowTypeError(ctx, "http.send: `on_result.fn` must be a string");
+        return error.JsException;
+    }
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx, &len, fn_v);
+    if (cstr == null) return error.JsException;
+    defer c.JS_FreeCString(ctx, cstr);
+    return a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
+}
+
+/// `on_result.args` is optional. JSON-stringified positional args
+/// to pass to `on_result.fn`. Empty / omitted = no args. Validated
+/// to be a JS array; non-array throws TypeError.
+fn resolveOnResultArgs(ctx: ?*c.JSContext, a: std.mem.Allocator, opts: c.JSValue) ![]u8 {
+    const on_result = c.JS_GetPropertyStr(ctx, opts, "on_result");
+    defer c.JS_FreeValue(ctx, on_result);
+    if (c.JS_IsUndefined(on_result) or c.JS_IsNull(on_result)) return a.dupe(u8, "");
+    if (!c.JS_IsObject(on_result)) return a.dupe(u8, "");
+    const args_v = c.JS_GetPropertyStr(ctx, on_result, "args");
+    defer c.JS_FreeValue(ctx, args_v);
+    if (c.JS_IsUndefined(args_v) or c.JS_IsNull(args_v)) return a.dupe(u8, "");
+    if (!c.JS_IsArray(args_v)) {
+        _ = c.JS_ThrowTypeError(ctx, "http.send: `on_result.args` must be an array");
+        return error.JsException;
+    }
+    const s = c.JS_JSONStringify(ctx, args_v, js_undefined, js_undefined);
+    if (c.JS_IsException(s) or c.JS_IsUndefined(s)) {
+        c.JS_FreeValue(ctx, s);
+        return error.JsException;
+    }
+    defer c.JS_FreeValue(ctx, s);
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx, &len, s);
     if (cstr == null) return error.JsException;
     defer c.JS_FreeCString(ctx, cstr);
     return a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
