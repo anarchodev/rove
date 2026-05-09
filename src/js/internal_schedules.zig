@@ -360,6 +360,11 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
     else
         .failed;
 
+    std.log.info(
+        "internal-schedules: {s}/{s}: dispatched in-process to {s} status={d} outcome={s}",
+        .{ row.tenant_id, row.id, target_id, status, @tagName(outcome) },
+    );
+
     try proposeResult(
         worker,
         stored,

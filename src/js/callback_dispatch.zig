@@ -482,12 +482,28 @@ fn buildCallbackBody(
     return aw.toOwnedSlice();
 }
 
+// Maps fields from either envelope flavor (legacy webhook
+// envelope-5 or new schedule envelope-9) into the camelCase event
+// the handler sees. A given receipt will only carry fields from one
+// flavor; the other flavor's fields silently skip.
+//
+// Schedule envelope-9 fields (id, ok, status, version, body) ride
+// through with the same name they have on the receipt — they're
+// already snake-case-clean.
 const FIELD_MAP = [_]struct { src: []const u8, dst: []const u8 }{
+    // Legacy webhook envelope-5 only:
     .{ .src = "webhook_id", .dst = "webhookId" },
-    .{ .src = "outcome", .dst = "outcome" },
     .{ .src = "attempts", .dst = "attempts" },
-    .{ .src = "context", .dst = "context" },
     .{ .src = "response", .dst = "response" },
+    // Schedule envelope-9 only:
+    .{ .src = "id", .dst = "id" },
+    .{ .src = "ok", .dst = "ok" },
+    .{ .src = "status", .dst = "status" },
+    .{ .src = "version", .dst = "version" },
+    .{ .src = "body", .dst = "body" },
+    // Both flavors:
+    .{ .src = "outcome", .dst = "outcome" },
+    .{ .src = "context", .dst = "context" },
     .{ .src = "error", .dst = "error" },
 };
 
@@ -564,6 +580,42 @@ test "buildCallbackBody: failed envelope → error field passthrough" {
     // side sees `event.context === undefined`, not `null`. (Either
     // is acceptable; dropping keeps the event payload small.)
     try testing.expect(event.get("context") == null);
+}
+
+test "buildCallbackBody: schedule envelope-9 → camelCase event with id/ok/status/version/body" {
+    const envelope_bytes =
+        \\{
+        \\  "id": "sched-abc",
+        \\  "on_result": "stripe_done",
+        \\  "ok": true,
+        \\  "status": 200,
+        \\  "version": 3,
+        \\  "context": {"orderId": "o-42"},
+        \\  "body": "{\"forwarded\":true}",
+        \\  "error": null
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, envelope_bytes, .{});
+    defer parsed.deinit();
+
+    const body = try buildCallbackBody(testing.allocator, parsed.value);
+    defer testing.allocator.free(body);
+
+    var out = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer out.deinit();
+    const event = out.value.object.get("args").?.array.items[0].object;
+    try testing.expectEqualStrings("sched-abc", event.get("id").?.string);
+    try testing.expectEqual(true, event.get("ok").?.bool);
+    try testing.expectEqual(@as(i64, 200), event.get("status").?.integer);
+    try testing.expectEqual(@as(i64, 3), event.get("version").?.integer);
+    try testing.expectEqualStrings("{\"forwarded\":true}", event.get("body").?.string);
+    try testing.expectEqualStrings("o-42", event.get("context").?.object.get("orderId").?.string);
+    // No webhook fields leaked through.
+    try testing.expect(event.get("webhookId") == null);
+    try testing.expect(event.get("attempts") == null);
+    try testing.expect(event.get("response") == null);
+    try testing.expect(event.get("on_result") == null); // server-side only
+    try testing.expect(event.get("error") == null); // null in envelope → dropped
 }
 
 test "findCallbackBytecode: exact .mjs match wins over .js" {
