@@ -30,7 +30,7 @@
 //! - `ScheduleRow` — in-memory shape for one schedule, owned by the
 //!   producer (dispatcher), consumed by the scheduler thread.
 //! - `StoredSchedule` — the on-disk row (adds `version`,
-//!   `inflight_until_ns`, `is_internal`).
+//!   `inflight_until_ns`, `created_at_ns`).
 //! - `ScheduleStore` — opens / owns the per-node `schedules.db`
 //!   and exposes the apply primitives raft replays.
 //! - Wire-format encode/decode for envelope types 8 (upsert),
@@ -53,9 +53,11 @@ const kv = @import("rove-kv");
 /// over libcurl, proposes envelope-9 with the result. See plan §5.
 pub const thread = @import("thread.zig");
 
-/// URL → cluster-tenant detection (plan §3.2). Called at apply time
-/// from `applyScheduleUpsertBatch` to stamp `is_internal` on rows
-/// targeting `{id}.{public_suffix}`.
+/// URL → cluster-tenant detection (plan §3.2). Called at fire time
+/// by both consumers — the scheduler thread (to know whether to give
+/// internal-shape URLs a brief grace before libcurl) and the (future)
+/// worker phase (to decide whether the row can be served in-process).
+/// Pure function, deterministic, no apply-side stamping needed.
 pub const internal_routing = @import("internal_routing.zig");
 
 pub const Error = error{
@@ -123,11 +125,6 @@ pub const ScheduleRow = struct {
     on_result_module: []const u8 = "",
     /// JSON object handed back to the on_result handler.
     context_json: []const u8 = "null",
-    /// True if the URL host matches a tenant on this cluster — set
-    /// by the apply path via `detectInternal` (next slice). Routes
-    /// the row into `dispatchInternalSchedules` instead of the
-    /// libcurl path.
-    is_internal: bool = false,
 
     pub fn deinit(self: *ScheduleRow, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);
@@ -320,29 +317,19 @@ pub const ScheduleStore = struct {
         };
     }
 
-    /// Grace before the libcurl scheduler thread takes over an
-    /// internal-stamped row. Rows whose URL targets a cluster-local
-    /// tenant get `is_internal=true` at apply (plan §3.2); the
-    /// worker phase (`dispatchInternalSchedules`, future slice) is
-    /// expected to dispatch them in-process within this window. If
-    /// no node hosts the target locally — misconfiguration, tenant
-    /// just got removed, or the worker phase isn't deployed yet —
-    /// the libcurl thread fires the row instead. 5s is enough for
-    /// a fresh tick on every node to attempt the in-process path
-    /// while keeping the customer-visible delay small for the
-    /// fallback case. Plan §3.2 calls this "the failsafe."
-    pub const INTERNAL_FALLBACK_NS: i64 = 5 * std.time.ns_per_s;
-
-    /// Scan rows the libcurl scheduler thread should fire.
-    /// External rows (`is_internal=false`): eligible as soon as
-    ///   `fire_at_ns ≤ now_ns AND inflight_until_ns ≤ now_ns`.
-    /// Internal rows (`is_internal=true`): eligible only once
-    ///   `fire_at_ns + INTERNAL_FALLBACK_NS ≤ now_ns` — the grace
-    ///   period the worker phase (future slice) gets to try
-    ///   in-process dispatch first.
+    /// Scan rows whose `fire_at_ns ≤ now_ns AND inflight_until_ns ≤
+    /// now_ns` and return up to `max` of them. Caller owns the
+    /// returned slice; each element must be `deinit`'d (then the
+    /// slice freed).
     ///
-    /// Caller owns the returned slice; each element must be
-    /// `deinit`'d (then the slice freed).
+    /// Both consumers (libcurl scheduler thread + the worker phase
+    /// for in-cluster targets) call this same query — coordination
+    /// between them happens via a shared in-memory inflight set in
+    /// loop46/main.zig. The worker phase, ticking faster, parses the
+    /// row's URL and grabs in-process if the target is hosted
+    /// locally; otherwise it leaves the row alone and the libcurl
+    /// thread picks it up. Single-fire by virtue of the shared
+    /// inflight, not by routing rows into different scans.
     ///
     /// V1 implementation: full-prefix scan with in-Zig filtering. Fine
     /// for the row counts the platform will see at launch. When the
@@ -353,35 +340,6 @@ pub const ScheduleStore = struct {
         allocator: std.mem.Allocator,
         now_ns: i64,
         max: usize,
-    ) Error![]StoredSchedule {
-        return self.scanRows(allocator, now_ns, max, .libcurl);
-    }
-
-    /// Scan rows the worker phase should dispatch in-process — i.e.
-    /// `is_internal=true AND fire_at_ns ≤ now_ns AND inflight_until_ns
-    /// ≤ now_ns`. The future `dispatchInternalSchedules` consumer
-    /// (plan §3.2) calls this each tick; rows it can't serve locally
-    /// (target tenant not hosted on this node) get released and the
-    /// libcurl thread picks them up after `INTERNAL_FALLBACK_NS`.
-    ///
-    /// Caller owns the slice + must `deinit` each element.
-    pub fn dueInternalRows(
-        self: *ScheduleStore,
-        allocator: std.mem.Allocator,
-        now_ns: i64,
-        max: usize,
-    ) Error![]StoredSchedule {
-        return self.scanRows(allocator, now_ns, max, .internal);
-    }
-
-    const ScanFlavor = enum { libcurl, internal };
-
-    fn scanRows(
-        self: *ScheduleStore,
-        allocator: std.mem.Allocator,
-        now_ns: i64,
-        max: usize,
-        flavor: ScanFlavor,
     ) Error![]StoredSchedule {
         var out: std.ArrayList(StoredSchedule) = .empty;
         errdefer {
@@ -401,22 +359,7 @@ pub const ScheduleStore = struct {
                     Error.OutOfMemory => return Error.OutOfMemory,
                     else => continue,
                 };
-                if (stored.inflight_until_ns > now_ns) {
-                    stored.deinit(allocator);
-                    continue;
-                }
-                const eligible = switch (flavor) {
-                    .libcurl => blk: {
-                        if (stored.row.is_internal) {
-                            // Internal-stamped rows wait out the grace
-                            // before libcurl takes over.
-                            break :blk stored.row.fire_at_ns + INTERNAL_FALLBACK_NS <= now_ns;
-                        }
-                        break :blk stored.row.fire_at_ns <= now_ns;
-                    },
-                    .internal => stored.row.is_internal and stored.row.fire_at_ns <= now_ns,
-                };
-                if (!eligible) {
+                if (stored.inflight_until_ns > now_ns or stored.row.fire_at_ns > now_ns) {
                     stored.deinit(allocator);
                     continue;
                 }
@@ -469,7 +412,6 @@ pub fn serializeStored(allocator: std.mem.Allocator, s: *const StoredSchedule) !
     try writeU32(allocator, &out, s.version);
     try writeI64(allocator, &out, s.inflight_until_ns);
     try writeI64(allocator, &out, s.created_at_ns);
-    try out.append(allocator, @intFromBool(s.row.is_internal));
     try writeU16Bytes(allocator, &out, s.row.tenant_id);
     try writeU16Bytes(allocator, &out, s.row.id);
     try writeI64(allocator, &out, s.row.fire_at_ns);
@@ -491,7 +433,6 @@ pub fn parseStored(allocator: std.mem.Allocator, bytes: []const u8) Error!Stored
     const version = try r.u32le();
     const inflight_until_ns = try r.i64le();
     const created_at_ns = try r.i64le();
-    const is_internal = (try r.byte()) != 0;
     const tenant_id = try r.bytesU16(allocator);
     errdefer allocator.free(tenant_id);
     const id = try r.bytesU16(allocator);
@@ -524,7 +465,6 @@ pub fn parseStored(allocator: std.mem.Allocator, bytes: []const u8) Error!Stored
             .max_body_bytes = max_body_bytes,
             .on_result_module = on_result_module,
             .context_json = context_json,
-            .is_internal = is_internal,
         },
         .version = version,
         .inflight_until_ns = inflight_until_ns,
@@ -575,7 +515,6 @@ fn encodeOneRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), row: *con
     try writeU32(allocator, out, row.max_body_bytes);
     try writeU16Bytes(allocator, out, row.on_result_module);
     try writeU32Bytes(allocator, out, row.context_json);
-    try out.append(allocator, @intFromBool(row.is_internal));
 }
 
 fn decodeOneRow(allocator: std.mem.Allocator, r: *Reader) Error!ScheduleRow {
@@ -599,7 +538,6 @@ fn decodeOneRow(allocator: std.mem.Allocator, r: *Reader) Error!ScheduleRow {
     errdefer allocator.free(on_result_module);
     const context_json = try r.bytesU32(allocator);
     errdefer allocator.free(context_json);
-    const is_internal = (try r.byte()) != 0;
     return .{
         .tenant_id = tenant_id,
         .id = id,
@@ -612,7 +550,6 @@ fn decodeOneRow(allocator: std.mem.Allocator, r: *Reader) Error!ScheduleRow {
         .max_body_bytes = max_body_bytes,
         .on_result_module = on_result_module,
         .context_json = context_json,
-        .is_internal = is_internal,
     };
 }
 
@@ -848,7 +785,6 @@ fn testRow(allocator: std.mem.Allocator, tenant: []const u8, id: []const u8, fir
         .max_body_bytes = RESPONSE_BODY_CAP,
         .on_result_module = try allocator.dupe(u8, "stripe_response"),
         .context_json = try allocator.dupe(u8, "{\"order_id\":\"o-42\"}"),
-        .is_internal = false,
     };
 }
 
@@ -858,7 +794,6 @@ test "envelope 8 upsert batch round-trip" {
         try testRow(a, "acme", "reminder-1", 1_700_000_000_000_000_000),
         try testRow(a, "beta", "checkout-99", 0),
     };
-    rows[1].is_internal = true;
     defer for (&rows) |*r| r.deinit(a);
 
     const encoded = try encodeUpsertBatch(a, &rows);
@@ -876,10 +811,8 @@ test "envelope 8 upsert batch round-trip" {
     try testing.expectEqualStrings("acme", decoded[0].tenant_id);
     try testing.expectEqualStrings("reminder-1", decoded[0].id);
     try testing.expectEqual(@as(i64, 1_700_000_000_000_000_000), decoded[0].fire_at_ns);
-    try testing.expect(!decoded[0].is_internal);
     try testing.expectEqualStrings("beta", decoded[1].tenant_id);
     try testing.expectEqualStrings("checkout-99", decoded[1].id);
-    try testing.expect(decoded[1].is_internal);
 }
 
 test "envelope 8 rejects bad version" {
@@ -1135,7 +1068,7 @@ test "ScheduleStore: tenant scoping — same id, different tenants" {
     }
 }
 
-test "ScheduleStore: dueRows returns external rows due now, defers internal until grace" {
+test "ScheduleStore: dueRows returns rows whose fire_at_ns ≤ now" {
     const a = testing.allocator;
     var path_buf: [64]u8 = undefined;
     var store = try openTempStore(a, &path_buf);
@@ -1148,63 +1081,9 @@ test "ScheduleStore: dueRows returns external rows due now, defers internal unti
     defer past.deinit(a);
     var future = try testRow(a, "acme", "future", std.time.ns_per_s * 60);
     defer future.deinit(a);
-    // is_internal=true: this is a fresh row whose fire_at_ns just passed.
-    // The libcurl-flavored dueRows defers it until INTERNAL_FALLBACK_NS
-    // beyond fire_at_ns, leaving the (future) worker phase a window to
-    // dispatch in-process first.
-    var internal_ = try testRow(a, "acme", "internal", 100);
-    internal_.is_internal = true;
-    defer internal_.deinit(a);
-    try store.applyUpsertBatch(&[_]ScheduleRow{ past, future, internal_ }, 0);
+    try store.applyUpsertBatch(&[_]ScheduleRow{ past, future }, 0);
 
-    const due_pre_grace = try store.dueRows(a, 500, 32);
-    defer {
-        for (due_pre_grace) |*r| {
-            var x = r.*;
-            x.deinit(a);
-        }
-        a.free(due_pre_grace);
-    }
-    try testing.expectEqual(@as(usize, 1), due_pre_grace.len);
-    try testing.expectEqualStrings("past", due_pre_grace[0].row.id);
-
-    // After the grace window expires the libcurl path picks the
-    // internal row up too — failsafe for "no node hosts the target".
-    const due_post_grace = try store.dueRows(
-        a,
-        100 + ScheduleStore.INTERNAL_FALLBACK_NS,
-        32,
-    );
-    defer {
-        for (due_post_grace) |*r| {
-            var x = r.*;
-            x.deinit(a);
-        }
-        a.free(due_post_grace);
-    }
-    try testing.expectEqual(@as(usize, 2), due_post_grace.len);
-}
-
-test "ScheduleStore: dueInternalRows returns only is_internal rows" {
-    const a = testing.allocator;
-    var path_buf: [64]u8 = undefined;
-    var store = try openTempStore(a, &path_buf);
-    defer {
-        store.close();
-        cleanupTempStore(&path_buf);
-    }
-
-    var ext = try testRow(a, "acme", "ext", 100);
-    defer ext.deinit(a);
-    var int1 = try testRow(a, "acme", "int1", 100);
-    int1.is_internal = true;
-    defer int1.deinit(a);
-    var int_future = try testRow(a, "acme", "int-future", std.time.ns_per_s * 60);
-    int_future.is_internal = true;
-    defer int_future.deinit(a);
-    try store.applyUpsertBatch(&[_]ScheduleRow{ ext, int1, int_future }, 0);
-
-    const due = try store.dueInternalRows(a, 500, 32);
+    const due = try store.dueRows(a, 500, 32);
     defer {
         for (due) |*r| {
             var x = r.*;
@@ -1213,8 +1092,7 @@ test "ScheduleStore: dueInternalRows returns only is_internal rows" {
         a.free(due);
     }
     try testing.expectEqual(@as(usize, 1), due.len);
-    try testing.expectEqualStrings("int1", due[0].row.id);
-    try testing.expect(due[0].row.is_internal);
+    try testing.expectEqualStrings("past", due[0].row.id);
 }
 
 test "ScheduleStore: dueRows respects max" {

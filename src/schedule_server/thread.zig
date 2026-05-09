@@ -39,10 +39,12 @@
 //! - Tenant-side `_callback/{id}` writes — those happen in the apply
 //!   path on every node when envelope 9 commits.
 //! - Per-tenant rate limiting (plan §13) — future slice.
-//! - Internal-routed schedules — `is_internal=true` rows are skipped
-//!   here and dispatched from the worker phase (future slice). The
-//!   `dueRows` query already filters them out so the libcurl path
-//!   never sees them.
+//! - In-cluster fast-path — when the URL parses as
+//!   `{id}.{public_suffix}` and `{id}` is hosted on this node, the
+//!   (future) worker phase claims the row first via the shared
+//!   inflight set in loop46/main.zig and dispatches in-process. The
+//!   libcurl path here is the failsafe for everything the worker
+//!   phase can't or won't take.
 
 const std = @import("std");
 const kv_mod = @import("rove-kv");
