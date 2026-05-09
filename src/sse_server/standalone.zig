@@ -525,9 +525,26 @@ fn handleEmit(
 
     const tenant = try state.getOrCreateTenant(parsed.tenant_id);
 
+    // Per-connection frame accumulator. `reg.move` is deferred —
+    // doing one set+move per (event, conn) pair would let the second
+    // event's set overwrite the first event's RespBody.data slot
+    // before h2 has picked it up, and the second move would then
+    // error `PendingMove` (use-after-free + double-free territory,
+    // gpa caught it). Mirrors events_pump.zig's writeset accumulator
+    // shape: build the bytes for ALL events targeting a conn, then
+    // one set+move per conn.
+    var conn_buffers: std.AutoHashMapUnmanaged(*Connection, std.ArrayListUnmanaged(u8)) = .empty;
+    var conn_last_event: std.AutoHashMapUnmanaged(*Connection, [EVENT_ID_LEN]u8) = .empty;
+    defer {
+        var it = conn_buffers.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        conn_buffers.deinit(allocator);
+        conn_last_event.deinit(allocator);
+    }
+
     for (parsed.events) |e| {
-        // Cache-then-push: every target sid's ring records the event;
-        // any matching live connection gets the live frame too.
+        // Cache-then-collect: every target sid's ring records the event;
+        // any matching live connection accumulates the wire bytes.
         for (e.target_sids) |target_sid| {
             const ring = try tenant.getOrCreateRing(allocator, target_sid);
             const entry = RingEntry{
@@ -537,16 +554,51 @@ fn handleEmit(
             };
             ring.append(allocator, entry);
 
-            try pushFrameToMatchingConns(
-                server,
-                allocator,
-                tenant,
-                target_sid,
-                &e.event_id,
-                e.event_type,
-                e.data_json,
-            );
+            for (tenant.connections.items) |conn| {
+                if (!std.mem.eql(u8, conn.sid, target_sid)) continue;
+                if (!server.reg.isInCollection(conn.stream_ent, &server.stream_data_out)) continue;
+                const buf_entry = try conn_buffers.getOrPut(allocator, conn);
+                if (!buf_entry.found_existing) buf_entry.value_ptr.* = .empty;
+                try formatEventFrameInto(
+                    buf_entry.value_ptr,
+                    allocator,
+                    &e.event_id,
+                    e.event_type,
+                    e.data_json,
+                );
+                try conn_last_event.put(allocator, conn, e.event_id);
+            }
         }
+    }
+
+    // Flush each conn's accumulated bytes — one set+move per conn.
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var it = conn_buffers.iterator();
+    while (it.next()) |entry| {
+        const conn = entry.key_ptr.*;
+        const buf = entry.value_ptr;
+        if (buf.items.len == 0) continue;
+        const owned = try buf.toOwnedSlice(allocator);
+        // Buf is now empty; the slot below assumes ownership of
+        // `owned`. Errors after `set` need to null the slot before
+        // freeing so the entity's eventual deinit doesn't double-free.
+        server.reg.set(conn.stream_ent, &server.stream_data_out, h2.RespBody, .{
+            .data = owned.ptr,
+            .len = @intCast(owned.len),
+        }) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+        server.reg.move(conn.stream_ent, &server.stream_data_out, &server.stream_data_in) catch |err| {
+            server.reg.set(conn.stream_ent, &server.stream_data_out, h2.RespBody, .{
+                .data = null,
+                .len = 0,
+            }) catch {};
+            allocator.free(owned);
+            return err;
+        };
+        conn.last_send_ns = now_ns;
+        if (conn_last_event.get(conn)) |last_id| conn.last_event_id = last_id;
     }
 
     try setSimpleResponse(server, ent, sid, sess, 204, "");
@@ -634,36 +686,6 @@ fn jsonValueToString(allocator: std.mem.Allocator, v: std.json.Value) ![]const u
     return out.toOwnedSlice(allocator);
 }
 
-fn pushFrameToMatchingConns(
-    server: *SseH2,
-    allocator: std.mem.Allocator,
-    tenant: *TenantState,
-    target_sid: []const u8,
-    event_id: *const [EVENT_ID_LEN]u8,
-    event_type: []const u8,
-    data_json: []const u8,
-) !void {
-    if (tenant.connections.items.len == 0) return;
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    for (tenant.connections.items) |conn| {
-        if (!std.mem.eql(u8, conn.sid, target_sid)) continue;
-        // If h2 hasn't parked the entity in stream_data_out, skip the
-        // live push — the ring caches the event, the next reconnect
-        // (or pump tick) replays it.
-        if (!server.reg.isInCollection(conn.stream_ent, &server.stream_data_out)) continue;
-
-        const frame = try formatEventFrame(allocator, event_id, event_type, data_json);
-        errdefer allocator.free(frame);
-        try server.reg.set(conn.stream_ent, &server.stream_data_out, h2.RespBody, .{
-            .data = frame.ptr,
-            .len = @intCast(frame.len),
-        });
-        try server.reg.move(conn.stream_ent, &server.stream_data_out, &server.stream_data_in);
-        conn.last_send_ns = now_ns;
-        conn.last_event_id = event_id.*;
-    }
-}
-
 // ── EventSource connect ───────────────────────────────────────────
 
 fn handleSseConnect(
@@ -722,13 +744,24 @@ fn handleSseConnect(
         return;
     }
 
-    // Headers: text/event-stream + cache-control: no-store. We do not
-    // need CORS headers — EventSource opens with `withCredentials:
-    // false` which makes it a simple cross-origin request.
+    // Headers: text/event-stream + cache-control: no-store + CORS.
+    //
+    // Browsers DO enforce CORS on EventSource — "withCredentials:
+    // false" only skips the preflight, but the browser still checks
+    // the response's `Access-Control-Allow-Origin` header before
+    // letting JS read the stream. `*` is safe here because:
+    //   - the JWT in `?token=` is the auth boundary (not cookies),
+    //   - withCredentials: false → no cookie / Authorization header
+    //     leaks regardless of origin,
+    //   - the path itself encodes the tenant, and the JWT's
+    //     tenant_id claim must match (validated above).
+    // (sse-plan §4.2 said this wasn't needed; fixing here, doc to
+    // be reconciled.)
     const pairs = [_]HdrPair{
         .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
         .{ .name = "cache-control", .value = "no-store" },
         .{ .name = "x-accel-buffering", .value = "no" },
+        .{ .name = "access-control-allow-origin", .value = "*" },
     };
     const hdrs = try packHeaders(allocator, &pairs);
 

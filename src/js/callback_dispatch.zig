@@ -56,6 +56,7 @@ const tenant_mod = @import("rove-tenant");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const worker_mod = @import("worker.zig");
+const sse_dispatch = @import("sse_dispatch.zig");
 
 const Request = dispatcher_mod.Request;
 const Budget = dispatcher_mod.Budget;
@@ -125,10 +126,22 @@ fn drainTenantCallbacks(
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
+    // Per-batch SSE emit accumulator (sse-plan §3.2). Callbacks can
+    // call `events.emit` to fan a webhook response back to the user's
+    // browser (the Stripe-style RPC-via-notifications recipe in
+    // docs/notifications.md §2). Same lifecycle as worker_dispatch's
+    // pending_emits: appended via DispatchState.emit_buffer, fired
+    // fire-and-forget at sse-server after raft commits the writeset.
+    var pending_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
+    defer {
+        for (pending_emits.items) |*e| e.deinit(allocator);
+        pending_emits.deinit(allocator);
+    }
+
     var visited: usize = 0;
     for (scan.entries) |row| {
         visited += 1;
-        _ = runOneCallback(worker, tc, inst, &txn, &writeset, row.key, row.value) catch |err| {
+        _ = runOneCallback(worker, tc, inst, &txn, &writeset, &pending_emits, row.key, row.value) catch |err| {
             std.log.warn(
                 "rove-js callbacks: {s}/{s}: {s} (kept for retry)",
                 .{ inst.id, row.key, @errorName(err) },
@@ -146,6 +159,9 @@ fn drainTenantCallbacks(
         // without proposing anything.
         txn.rollback() catch {};
         committed = true;
+        // Read-only batch: emits (if any) fire immediately — no raft
+        // hop to wait for. Same posture as worker_dispatch.
+        fireEmitsIfWired(worker, inst.id, &pending_emits);
         return visited;
     }
 
@@ -164,7 +180,38 @@ fn drainTenantCallbacks(
         return err;
     };
 
+    // Raft accepted the batch on this node — fire emits at sse-server.
+    fireEmitsIfWired(worker, inst.id, &pending_emits);
+
     return visited;
+}
+
+/// Fire-and-forget the merged callback-batch emits at sse-server.
+/// No-op when worker isn't configured for SSE delivery or the batch
+/// is empty. Mirrors worker_dispatch.fireEmitsIfWired.
+fn fireEmitsIfWired(
+    worker: anytype,
+    tenant_id: []const u8,
+    pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
+) void {
+    if (pending_emits.items.len == 0) return;
+    const easy = worker.sse_curl orelse return;
+    const base = worker.sse_public_base orelse return;
+    const tok = worker.sse_internal_token orelse return;
+    if (base.len == 0 or tok.len == 0) return;
+    sse_dispatch.fireBatch(
+        worker.allocator,
+        easy,
+        base,
+        tok,
+        tenant_id,
+        // No batch-level request_id breadcrumb in the callback path
+        // (callbacks are platform-driven, not tied to one request).
+        // sse-server doesn't depend on this field; 0 is fine.
+        0,
+        pending_emits.items,
+        worker.sse_insecure_tls,
+    );
 }
 
 /// Outcome of `runOneCallback` from the caller's point of view. Used
@@ -187,6 +234,7 @@ fn runOneCallback(
     inst: *const tenant_mod.Instance,
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *kv_mod.WriteSet,
+    pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
     receipt_key: []const u8,
     envelope_bytes: []const u8,
 ) !CallbackOutcome {
@@ -285,6 +333,7 @@ fn runOneCallback(
         // they share the customer's email bucket via the same limiter.
         .limiter = &worker.limiter,
         .instance_id = inst.id,
+        .emit_buffer = pending_emits,
     };
 
     var budget = Budget.fromNow(Budget.default_duration_ns);

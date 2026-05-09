@@ -234,6 +234,7 @@ fn fireEmitsIfWired(
         anchor_id,
         request_id,
         pending_emits.items,
+        worker.sse_insecure_tls,
     );
 }
 

@@ -433,6 +433,11 @@ pub const WorkerConfig = struct {
     /// on every emit POST. Must match the value sse-server is started
     /// with in `SSE_INTERNAL_TOKEN`. Borrowed; null disables the path.
     sse_internal_token: ?[]const u8 = null,
+    /// Skip TLS peer verification on the worker → sse-server emit
+    /// POST. Set true in dev / smoke clusters where sse-server uses
+    /// a self-signed cert that's not in the worker's system CA
+    /// bundle. Production must leave this false.
+    sse_insecure_tls: bool = false,
     /// Origin allowed to call `/_system/*` with CORS. When set, the
     /// worker answers browser preflight (OPTIONS) requests from this
     /// origin and stamps `Access-Control-Allow-*` headers onto every
@@ -592,6 +597,7 @@ pub fn Worker(comptime opts: Options) type {
         /// in the legacy `_events/{sid}/...` rows.
         sse_public_base: ?[]const u8,
         sse_internal_token: ?[]const u8,
+        sse_insecure_tls: bool,
         sse_curl: ?*blob_mod.curl.Easy,
 
         /// Background log flusher — owns its own thread, sleeps on
@@ -660,6 +666,7 @@ pub fn Worker(comptime opts: Options) type {
                 .files_public_base = config.files_public_base,
                 .sse_public_base = config.sse_public_base,
                 .sse_internal_token = config.sse_internal_token,
+                .sse_insecure_tls = config.sse_insecure_tls,
                 .sse_curl = blk: {
                     if (config.sse_public_base == null or config.sse_internal_token == null) break :blk null;
                     break :blk blob_mod.curl.Easy.init(allocator) catch |err| {

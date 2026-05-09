@@ -285,6 +285,22 @@ pub fn jsEventsEmit(
     const wire_id_slice = formatWireId(&wire_id, state.request_id, state.events_call_index);
     const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
 
+    // Pull the inner `data` JSON bytes once. The legacy kv-row
+    // envelope wraps this inside a `{v, id, type, data, ...}` object;
+    // the new emit_buffer path passes these bytes through verbatim
+    // because sse-server's wire body has its own slots for type +
+    // event_id + created_at_ms — wrapping again would double-nest.
+    var inner_data_bytes: []const u8 = "null";
+    var inner_data_cstr_to_free: ?[*c]const u8 = null;
+    defer if (inner_data_cstr_to_free) |p| c.JS_FreeCString(ctx, p);
+    if (!c.JS_IsNull(data_json)) {
+        var dlen: usize = 0;
+        const dcstr = c.JS_ToCStringLen(ctx, &dlen, data_json);
+        if (dcstr == null) return js_exception;
+        inner_data_cstr_to_free = dcstr;
+        inner_data_bytes = @as([*]const u8, @ptrCast(dcstr))[0..dlen];
+    }
+
     const env = c.JS_NewObject(ctx);
     defer c.JS_FreeValue(ctx, env);
     _ = c.JS_SetPropertyStr(ctx, env, "v", c.JS_NewInt32(ctx, 1));
@@ -294,24 +310,19 @@ pub fn jsEventsEmit(
     } else {
         _ = c.JS_SetPropertyStr(ctx, env, "type", c.JS_NewStringLen(ctx, "message", "message".len));
     }
-    // `data` field. The JS_JSONStringify above produced a JS string
-    // holding the JSON; parse it back into an object/value so the
-    // outer envelope's stringify embeds it as a value, not as a string.
-    if (c.JS_IsNull(data_json)) {
+    // Re-parse the inner data bytes into a JSValue so the envelope's
+    // stringify embeds it as a value (not a string-wrapped JSON).
+    if (inner_data_cstr_to_free == null) {
         _ = c.JS_SetPropertyStr(ctx, env, "data", js_null);
     } else {
-        var json_len: usize = 0;
-        const json_cstr = c.JS_ToCStringLen(ctx, &json_len, data_json);
-        if (json_cstr == null) return js_exception;
-        const parsed = c.JS_ParseJSON(ctx, json_cstr, json_len, "<data>");
-        c.JS_FreeCString(ctx, json_cstr);
+        const parsed = c.JS_ParseJSON(ctx, inner_data_cstr_to_free.?, inner_data_bytes.len, "<data>");
         if (c.JS_IsException(parsed)) return js_exception;
         _ = c.JS_SetPropertyStr(ctx, env, "data", parsed);
     }
     _ = c.JS_SetPropertyStr(ctx, env, "created_at_ms", c.JS_NewInt64(ctx, now_ms));
     _ = c.JS_SetPropertyStr(ctx, env, "parent_request_id", c.JS_NewInt64(ctx, @bitCast(state.request_id)));
 
-    // Serialize envelope → bytes.
+    // Serialize envelope → bytes for the legacy kv-row write.
     const json = c.JS_JSONStringify(ctx, env, js_undefined, js_undefined);
     if (c.JS_IsException(json) or c.JS_IsUndefined(json)) {
         c.JS_FreeValue(ctx, json);
@@ -351,7 +362,7 @@ pub fn jsEventsEmit(
     // at sse-server. The legacy kv-row write above stays in place
     // until the worker's `/_events` route is retired (plan §7 step 7).
     if (state.emit_buffer) |buf| {
-        appendEmitEntry(state, buf, wire_id_slice, type_owned, json_slice, targets, now_ms) catch |err| {
+        appendEmitEntry(state, buf, wire_id_slice, type_owned, inner_data_bytes, targets, now_ms) catch |err| {
             state.pending_kv_error = err;
             return js_exception;
         };

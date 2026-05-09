@@ -142,6 +142,9 @@ pub fn fireBatch(
     tenant_id: []const u8,
     request_id: u64,
     events: []const EmitEntry,
+    /// Skip TLS peer verification for the emit POST. Dev-only —
+    /// production should leave this false and rely on system CA.
+    insecure_tls: bool,
 ) void {
     if (events.len == 0) return;
 
@@ -168,6 +171,12 @@ pub fn fireBatch(
         .{ .name = "Authorization", .value = auth_value },
     };
 
+    // sse-server is h2-only on whichever port the operator gave it.
+    // For plaintext (`http://...`) we force h2c prior-knowledge so
+    // libcurl skips the HTTP/1.1 → 426 dance. For TLS (`https://...`)
+    // ALPN negotiates h2 automatically.
+    const use_h2c = std.mem.startsWith(u8, url, "http://");
+
     var resp = easy.request(allocator, .{
         .method = .POST,
         .url = url,
@@ -179,6 +188,8 @@ pub fn fireBatch(
         // the worker drain.
         .timeout_ms = 1_000,
         .connect_timeout_ms = 500,
+        .http_version = if (use_h2c) .h2c_prior_knowledge else .auto,
+        .verify_tls = !insecure_tls,
     }) catch |err| {
         std.log.warn("sse-emit: POST {s} failed: {s}", .{ url, @errorName(err) });
         return;

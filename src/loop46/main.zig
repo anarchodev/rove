@@ -230,6 +230,10 @@ const WorkerCtx = struct {
     /// Shared bearer the worker stamps on each emit POST. Borrowed
     /// from an env-loaded slice that lives for the worker's lifetime.
     sse_internal_token: ?[]const u8,
+    /// Skip TLS peer verification on the emit POST. Smoke-only; when
+    /// `LOOP46_SSE_INSECURE_TLS=1` in env, sse-server uses a
+    /// self-signed cert outside the system CA bundle.
+    sse_insecure_tls: bool,
     admin_origin: ?[]const u8,
     admin_api_domain: ?[]const u8,
     public_suffix: ?[]const u8,
@@ -371,6 +375,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .files_public_base = args.files_public_base,
         .sse_public_base = args.sse_public_base,
         .sse_internal_token = args.sse_internal_token,
+        .sse_insecure_tls = args.sse_insecure_tls,
         .admin_origin = args.admin_origin,
         .admin_api_domain = args.admin_api_domain,
         .log_worker_id = args.worker_idx,
@@ -1104,6 +1109,18 @@ pub fn main() !void {
     };
     defer if (sse_internal_token) |s| allocator.free(s);
 
+    // LOOP46_SSE_INSECURE_TLS=1 → worker's libcurl emit POST skips
+    // TLS peer verification. Smoke-only; production must leave it
+    // unset so the system CA bundle is enforced.
+    const sse_insecure_tls: bool = blk: {
+        const v = std.process.getEnvVarOwned(allocator, "LOOP46_SSE_INSECURE_TLS") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => break :blk false,
+            else => return err,
+        };
+        defer allocator.free(v);
+        break :blk std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
+    };
+
     // ── Webhook-server thread (Phase 5.5 d) ───────────────────────────
     //
     // Leader-pinned poll loop reading `{data_dir}/webhooks.db`. The
@@ -1165,6 +1182,7 @@ pub fn main() !void {
             .files_public_base = files_public_base,
             .sse_public_base = sse_public_base,
             .sse_internal_token = sse_internal_token,
+            .sse_insecure_tls = sse_insecure_tls,
             .admin_origin = cli.admin_origin,
             .admin_api_domain = cli.admin_api_domain,
             .public_suffix = cli.public_suffix,

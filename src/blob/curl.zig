@@ -39,6 +39,16 @@ pub const Method = enum {
     DELETE,
 };
 
+/// HTTP version selector. Default `auto` lets libcurl pick: HTTP/1.1
+/// for plain HTTP, ALPN-negotiated HTTP/2 (or fallback) for HTTPS.
+/// `h2c_prior_knowledge` forces cleartext HTTP/2 — needed when
+/// talking to a server that's h2-only on a plaintext port (like
+/// `sse-server-standalone` running without TLS).
+pub const HttpVersion = enum {
+    auto,
+    h2c_prior_knowledge,
+};
+
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
@@ -80,6 +90,16 @@ pub const Request = struct {
     /// TLS handshake before giving up. 5 s tolerates real-world
     /// latency without papering over a misconfigured endpoint.
     connect_timeout_ms: u32 = 5_000,
+    /// HTTP version. `auto` (default) keeps the existing S3 behavior
+    /// — libcurl picks based on URL + ALPN. Callers talking to an
+    /// h2-only server on a plaintext port set `h2c_prior_knowledge`.
+    http_version: HttpVersion = .auto,
+    /// TLS peer verification. Default on. Smokes / dev clusters with
+    /// self-signed certs (sse-server in the browser-in-the-loop
+    /// smoke, for instance) flip this to false. Production must
+    /// leave it on; a misconfigured CA bundle will surface as a
+    /// connection error rather than silently MITM-able traffic.
+    verify_tls: bool = true,
 };
 
 pub const Easy = struct {
@@ -148,6 +168,22 @@ pub const Easy = struct {
 
         _ = c.curl_easy_setopt(self.handle, c.CURLOPT_TIMEOUT_MS, @as(c_long, req.timeout_ms));
         _ = c.curl_easy_setopt(self.handle, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_long, req.connect_timeout_ms));
+
+        switch (req.http_version) {
+            .auto => {},
+            .h2c_prior_knowledge => {
+                _ = c.curl_easy_setopt(
+                    self.handle,
+                    c.CURLOPT_HTTP_VERSION,
+                    @as(c_long, c.CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE),
+                );
+            },
+        }
+
+        if (!req.verify_tls) {
+            _ = c.curl_easy_setopt(self.handle, c.CURLOPT_SSL_VERIFYPEER, @as(c_long, 0));
+            _ = c.curl_easy_setopt(self.handle, c.CURLOPT_SSL_VERIFYHOST, @as(c_long, 0));
+        }
 
         switch (req.method) {
             .GET => {
