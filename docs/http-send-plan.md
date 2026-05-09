@@ -1,8 +1,8 @@
-# http.schedule plan — generic scheduled HTTP delivery, customer-JS retry policy
+# http.send plan — outbound HTTP primitive + customer-JS retry policy
 
 This document supersedes `docs/webhook-server-plan.md`'s framing of
 webhook delivery as a webhook-shaped subsystem. It re-grounds the
-design on a single, more general primitive — a scheduled HTTP call
+design on a single, more general primitive — an outbound HTTP call (fired now or at a future time)
 — and moves all webhook-specific policy (retries, signing, dead-
 letter, fanout) into customer JS at a system tenant. The platform
 ships the primitive plus one default policy; advanced customers
@@ -27,13 +27,13 @@ The motivating framing:
   Same pattern that makes `email.send` work — it's a JS wrapper at
   the admin tenant that calls `webhook.send`. Generalizing further:
   `webhook.send` itself becomes a JS wrapper at a system tenant
-  (`webhook.loop46.com`) calling the more primitive `http.schedule`.
+  (`webhook.loop46.com`) calling the more primitive `http.send`.
 
 What stays from today: customer-visible API (`webhook.send` and
 `email.send` keep their shapes), the at-least-once contract, the
 X-Rove-Webhook-Id header, the on-result callback dispatch path.
 What changes: the platform's native outbound surface shrinks to
-exactly two bindings — `http.schedule` and `http.cancel`. Both
+exactly two bindings — `http.send` and `http.cancel`. Both
 `webhook.send` and `email.send` become JS libraries on top
 (client-side polyfills + server-side system tenant). The
 leader-pinned thread becomes generic. Webhook-specific retry /
@@ -42,12 +42,12 @@ signing / dead-letter logic moves to customer-equivalent JS at
 
 ---
 
-## 1. The primitive: `http.schedule`
+## 1. The primitive: `http.send`
 
 JS binding shape:
 
 ```js
-const id = http.schedule({
+const id = http.send({
   // Optional. If provided, this is the row id (scoped to the
   // calling tenant). Same handle re-scheduled = the previous
   // schedule is overwritten. Without a handle, the platform
@@ -71,19 +71,19 @@ const id = http.schedule({
 
 // Cancel a scheduled row before it fires.
 http.cancel({ handle: `reminder-${user_id}` });
-// Or by the id `http.schedule` returned (works whether handle was
+// Or by the id `http.send` returned (works whether handle was
 // customer-provided or platform-derived):
 http.cancel({ id: previously_returned_id });
 ```
 
-`http.schedule` returns the row id — equal to the handle if one was
+`http.send` returns the row id — equal to the handle if one was
 provided, the platform-derived sha256 hex otherwise. Either form is
 accepted by `http.cancel`.
 
 Semantics:
 
 - **Atomic with the calling handler's writeset.** Both
-  `http.schedule` and `http.cancel` accumulate onto the request's
+  `http.send` and `http.cancel` accumulate onto the request's
   execution context (same shape as `events.emit` / `webhook.send`
   already do). At handler commit they ride alongside the kv
   writeset envelope in the same raft entry. By the time the
@@ -96,12 +96,12 @@ Semantics:
   fires once; the result (status + body, capped at
   `max_body_bytes`, or a transport error) routes to `on_result`.
   Customers wanting retries write a callback handler that decides
-  whether to call `http.schedule` again.
+  whether to call `http.send` again.
 - **Apply-side wakeup.** Same shape as today's webhook wakeup: when
   the apply path commits a schedule row whose `fire_at_ns ≤ now`,
   it fires the scheduler's wake event. Future-`fire_at_ns` rows
   schedule a wakeup at that absolute time.
-- **Tape replay.** Replay re-runs the handler. `http.schedule` /
+- **Tape replay.** Replay re-runs the handler. `http.send` /
   `http.cancel` calls are captured; replay synthesizes the
   deterministic id but does NOT re-fire the HTTP call (same posture
   as `webhook.send` today).
@@ -110,7 +110,7 @@ Semantics:
 
 `handle` is a customer-supplied row id, scoped to the calling
 tenant. Same handle = same row — the most recent
-`http.schedule({handle: H, ...})` is the row that fires; everything
+`http.send({handle: H, ...})` is the row that fires; everything
 earlier with that handle is silently replaced.
 
 This collapses cancel + replace + customer-meaningful naming into
@@ -122,7 +122,7 @@ one mechanism:
 - **Cancel**: `http.cancel({handle: "reminder-${user_id}"})` after
   the user does the thing the reminder was about.
 - **Idempotency under replay**: handlers retrying from a transient
-  fault re-call `http.schedule({handle: H, ...})` — converges on
+  fault re-call `http.send({handle: H, ...})` — converges on
   one row regardless of how many times the handler runs. Stronger
   than the platform-derived sha256 id (which can drift if the
   handler's call sequence varies between attempts).
@@ -159,7 +159,7 @@ in-process module dispatch is cheaper than synthesizing HTTP
 shapes around an in-cluster call.
 
 Customers wanting an external (cross-cluster) callback write a
-thin shim module that calls `http.schedule({url: "https://my-aws.../"})`
+thin shim module that calls `http.send({url: "https://my-aws.../"})`
 from their on_result handler. One extra envelope hop; clean
 separation between "the platform invokes my code" (module) and
 "my code invokes an external service" (URL).
@@ -171,7 +171,7 @@ separation between "the platform invokes my code" (module) and
 ```
                    ┌─────────────────────────────────┐
                    │  customer handler at acme.../   │
-                   │  http.schedule({ url:           │
+                   │  http.send({ url:           │
                    │    "https://api.stripe.com/...",│
                    │    on_result: { module:         │
                    │      "stripe_response" } });    │
@@ -314,7 +314,7 @@ fallback timer (5s default) flips `is_internal=false` and the
 scheduler thread takes over via libcurl outbound. Failsafe;
 shouldn't fire under healthy operation.
 
-Hidden-from-customer optimization — `http.schedule` semantics are
+Hidden-from-customer optimization — `http.send` semantics are
 unchanged whether the call routes in-process or via libcurl. The
 on_result event shape is identical. Customer code doesn't know
 which path it took.
@@ -383,7 +383,7 @@ payload (adds `fire_at_ns`, `handle/id`, `version`). Migration: ship
 the new payload shape, leave the type number; old in-flight webhook
 rows are drained before the bump (zero-row cutover).
 
-**Envelope 4 is UPSERT, not insert.** `http.schedule({handle: H,
+**Envelope 4 is UPSERT, not insert.** `http.send({handle: H,
 ...})` for an existing `(tenant_id, H)` overwrites the row and bumps
 `version`. The previous row's stamp (`url`, `body`, etc.) is
 discarded. Any in-flight fire of the previous version sees a
@@ -399,7 +399,7 @@ double-cancel is a no-op).
 attempts + reschedules the next fire. Under the new design, the
 scheduler doesn't retry; it proposes envelope 5 with the result
 and the customer's callback decides whether to call
-`http.schedule` again (which is just another envelope 4). Removes
+`http.send` again (which is just another envelope 4). Removes
 ~150 lines of retry-policy code from the apply path.
 
 ---
@@ -524,7 +524,7 @@ processing.
 
 **Overwrite-while-firing race.** Customer schedules `handle="X"`
 for tomorrow. Tomorrow arrives, leader fires libcurl. Mid-flight,
-the customer's handler runs `http.schedule({handle: "X",
+the customer's handler runs `http.send({handle: "X",
 fire_at_ns: future_2})` to replace. Without protection, the
 in-flight fire's envelope-5 would land AFTER the new row's
 envelope 4 and either delete the new row or write `_callback/{id}`
@@ -544,7 +544,7 @@ The version counter resolves this:
      envelope-5. The newer row stays scheduled; the old fire's
      result is discarded.
 
-Customer-visible contract: the most recent `http.schedule` with a
+Customer-visible contract: the most recent `http.send` with a
 given handle is what fires; everything earlier is silently
 replaced. At-least-once becomes "the most-recently-scheduled
 version is delivered at-least-once." Earlier in-flight fires that
@@ -592,7 +592,7 @@ the customer's callback:
 // Today (webhook.send onResult):
 { webhookId, outcome, attempts, response: {status, body}, error, context }
 
-// Under http.schedule:
+// Under http.send:
 { id, ok: bool, status, body, error, context }
 ```
 
@@ -615,7 +615,7 @@ opaque correlation handle.
 ## 9. `webhook.send` and `email.send` are libraries, not bindings
 
 The platform ships exactly two outbound primitives as native
-bindings: `http.schedule` and `http.cancel`. Everything customers
+bindings: `http.send` and `http.cancel`. Everything customers
 think of as "send a webhook" or "send an email" is JS code on top
 — a library composed of two cooperating pieces:
 
@@ -624,18 +624,18 @@ think of as "send a webhook" or "send an email" is JS code on top
      (`webhook.send`, `email.send`).
   2. **A server-side system tenant** holding the durable
      retry/policy/dead-letter state and running the dispatch
-     loop using `http.schedule`.
+     loop using `http.send`.
 
 Both pieces are customer-equivalent JS. Operators can replace
 either or both without recompiling the engine; advanced customers
 can skip the platform's libraries entirely and compose on
-`http.schedule` directly (§10).
+`http.send` directly (§10).
 
 This is the same pattern `email.js` follows today (built into
 every QJS context at startup as a polyfill that wrapped the C
 `webhook.send` binding). What changes: the C `webhook.send`
 binding is gone. `webhook.js` becomes the new polyfill, calling
-`http.schedule`. `email.js` continues to call `webhook.send`,
+`http.send`. `email.js` continues to call `webhook.send`,
 which now resolves to the polyfill instead of a C binding —
 zero change to email's source.
 
@@ -646,7 +646,7 @@ zero change to email's source.
 // just like email.js + textcodec.js today.
 globalThis.webhook = {
   send(opts) {
-    return http.schedule({
+    return http.send({
       handle: opts.id,           // optional customer-supplied
       url:    "https://webhook.loop46.com/v1/webhooks/send",
       method: "POST",
@@ -679,14 +679,14 @@ implement the "default webhook" experience customers expect:
 
 - POST `/v1/webhooks/send` — receives the spec from the
   client-side polyfill. Persists into its own kv, schedules the
-  first attempt via `http.schedule`.
+  first attempt via `http.send`.
 - on_result module `webhook_result` — receives every fire's
   outcome via the standard envelope-5 → `_callback/{id}` →
   `dispatchCallbacks` path. Decides:
   - 2xx → propagate to the customer's `onResult` handler (one
-    more `http.schedule` call with `on_result.tenant: <calling>`).
+    more `http.send` call with `on_result.tenant: <calling>`).
   - 5xx + retries left → exponential backoff via another
-    `http.schedule` with future `fire_at_ns`, same handle so
+    `http.send` with future `fire_at_ns`, same handle so
     the in-flight row is overwritten cleanly.
   - 4xx OR retries exhausted → write to
     `_failed_webhooks/{id}` in the customer's tenant AND
@@ -700,15 +700,15 @@ HMAC signing — all customer JS. Read it, debug it, replace it.
 
 Today's `src/js/bindings/email.js` calls `webhook.send`; under
 this design, that becomes `webhook.send` (the polyfill) calling
-`http.schedule`. Two-layer composition: `email.send` →
-`webhook.send` → `http.schedule`. The customer-visible
+`http.send`. Two-layer composition: `email.send` →
+`webhook.send` → `http.send`. The customer-visible
 `email.send` API is unchanged; its implementation didn't change
 either, only what `webhook.send` underneath it points at.
 
 If a customer wants different email semantics (different SMTP
 provider, different retry policy, different bounce handling),
 they write their own email library on top of `webhook.send` (or
-even directly on `http.schedule`). Same composition all the way
+even directly on `http.send`). Same composition all the way
 down.
 
 ---
@@ -716,7 +716,7 @@ down.
 ## 10. Customer escape hatch
 
 Advanced customers bypass `webhook.loop46.com` and call
-`http.schedule` directly. Examples this enables (cookbook entries):
+`http.send` directly. Examples this enables (cookbook entries):
 
 ### 10.1 Stripe-style idempotency
 
@@ -731,7 +731,7 @@ export function charge(amount, customer_id) {
   kv.set(`_pending_charges/${idempotency_key}`, JSON.stringify({
     customer_id, amount, started_ms: Date.now(),
   }));
-  http.schedule({
+  http.send({
     url: "https://api.stripe.com/v1/charges",
     method: "POST",
     headers: {
@@ -768,7 +768,7 @@ export default function (event) {
   }
   kv.set(`_pending_charges/${idempotency_key}`, JSON.stringify(pending));
   const backoff_ms = Math.min(60_000, 1000 * Math.pow(2, pending.attempts));
-  http.schedule({
+  http.send({
     url: "https://api.stripe.com/v1/charges",
     method: "POST",
     headers: { ... },
@@ -784,7 +784,7 @@ export default function (event) {
 ```js
 // "send a reminder in 30 days" — handle so the customer can cancel
 // it later if the user does the thing the reminder was about.
-http.schedule({
+http.send({
   handle: `reminder-${user_id}`,
   url: "https://webhook.loop46.com/v1/email/send",  // platform email service
   body: JSON.stringify({ to, subject, html }),
@@ -801,7 +801,7 @@ http.cancel({ handle: `reminder-${user_id}` });
 // User added something to their cart — schedule a reminder for 24h.
 // Handle is keyed by cart_id so re-scheduling on each cart update
 // just pushes the deadline out.
-http.schedule({
+http.send({
   handle: `cart-${cart_id}`,
   url: "https://webhook.loop46.com/v1/email/send",
   body: JSON.stringify({ to: user.email, template: "cart_reminder", cart_id }),
@@ -820,7 +820,7 @@ export default function (event) {
   // ... do periodic work ...
   // Reschedule next tick. Stable handle so concurrent dispatches
   // (rare but possible) don't accidentally double-schedule.
-  http.schedule({
+  http.send({
     handle: `cron-${event.context.job_name}`,
     url: `https://${request.host}/cron/tick`,
     method: "POST",
@@ -830,7 +830,7 @@ export default function (event) {
 }
 ```
 
-Bootstrapping the loop is a one-time `http.schedule` from an admin
+Bootstrapping the loop is a one-time `http.send` from an admin
 handler that uses the same handle — running the bootstrap twice
 just overwrites itself, no parallel cron.
 
@@ -839,7 +839,7 @@ just overwrites itself, no parallel cron.
 ```js
 // Initial: 30-minute timeout to abandon the order.
 function startOrder(order_id) {
-  http.schedule({
+  http.send({
     handle: `order-${order_id}-timeout`,
     url: `https://${request.host}/orders/expire`,
     method: "POST",
@@ -850,7 +850,7 @@ function startOrder(order_id) {
 
 // Any user activity on the order pushes the timeout out:
 function bumpOrderTimeout(order_id) {
-  http.schedule({
+  http.send({
     handle: `order-${order_id}-timeout`,  // same handle — overwrites
     url: `https://${request.host}/orders/expire`,
     method: "POST",
@@ -870,7 +870,7 @@ http.cancel({ handle: `order-${order_id}-timeout` });
 export function publish(topic, payload) {
   const subscribers = JSON.parse(kv.get(`subscribers/${topic}`)) || [];
   for (const sub of subscribers) {
-    http.schedule({
+    http.send({
       url: sub.url,
       method: "POST",
       body: payload,
@@ -886,7 +886,7 @@ export function publish(topic, payload) {
 // signed_send.mjs
 export function send(url, body, secret) {
   const sig = crypto.hmacSha256(secret, body);
-  http.schedule({
+  http.send({
     url, method: "POST",
     headers: { "x-signature": sig },
     body,
@@ -900,7 +900,7 @@ export function send(url, body, secret) {
 ```js
 // step1.mjs
 export function start(order_id) {
-  http.schedule({
+  http.send({
     url: "https://api.shipping/v1/labels",
     on_result: { module: "step2", context: { order_id } },
   });
@@ -910,7 +910,7 @@ export function start(order_id) {
 export default function (event) {
   if (!event.ok) return; // saga aborted
   const { order_id } = event.context;
-  http.schedule({
+  http.send({
     url: "https://api.payments/v1/capture",
     on_result: { module: "step3", context: { order_id, label: event.body } },
   });
@@ -926,13 +926,13 @@ posture today's `webhook.send` enjoys lets us collapse the
 parallel-run phasing the plan-doc'd webhook-server migration would
 otherwise require):
 
-1. **Add `http.schedule` JS binding + scheduler thread, alongside the
+1. **Add `http.send` JS binding + scheduler thread, alongside the
    existing webhook system.** New thread reads from a new
    `schedules.db`; new envelope payload shape under a new envelope
    type (8) until cutover. webhook.send keeps its existing path.
 
 2. **Stand up `webhook.loop46.com` system tenant** with the default
-   policy implemented in JS using `http.schedule`. Tenant boots
+   policy implemented in JS using `http.send`. Tenant boots
    alongside `__admin__` and `__replay__`; deploy is part of the
    files-server bootstrap.
 
@@ -941,7 +941,7 @@ otherwise require):
    `textcodec.js` — `addAnonymousImport` for a new
    `src/js/bindings/webhook.js`, evaluated into every QJS context
    at startup. The polyfill installs `globalThis.webhook.send` and
-   calls `http.schedule` against `webhook.loop46.com`. End-to-end
+   calls `http.send` against `webhook.loop46.com`. End-to-end
    behavior unchanged from the customer's perspective; existing
    `webhook_smoke.sh` passes against the new path.
 
@@ -957,7 +957,7 @@ otherwise require):
    `DispatchState`, drop envelopes 4/5/6's old shape, drop
    `webhook_dispatch.zig`'s retry helpers. The platform's
    outbound surface is now exactly two C bindings:
-   `http.schedule` and `http.cancel`. Everything else is JS.
+   `http.send` and `http.cancel`. Everything else is JS.
 
 6. **Rename envelope 8 → envelope 4.** With the legacy gone, the
    numeric type can take over the freed slot. Pure raft-log
@@ -972,9 +972,9 @@ Decided in conversation, not up for re-litigation without new
 information:
 
 - **One primitive, not two.** "Fire once with callback" and "call
-  with delay" collapse into `http.schedule({ fire_at_ns? })`.
+  with delay" collapse into `http.send({ fire_at_ns? })`.
   Resisted as a separate `delay.call`; it added an API surface
-  that did the same thing as `http.schedule({fire_at_ns: t})`.
+  that did the same thing as `http.send({fire_at_ns: t})`.
 - **Atomicity via envelope, not cross-tenant kv.** §6 above. The
   cross-tenant-kv alternative was considered and rejected as
   larger and sharper than the problem it solves.
@@ -989,7 +989,7 @@ information:
   participate in raft live in the loop46 binary.
 - **Tape-replay does not re-fire the HTTP call.** Same as today's
   webhook.send: replay synthesizes the deterministic id and feeds
-  the captured response from the tape. New `http.schedule` calls
+  the captured response from the tape. New `http.send` calls
   during replay are ignored.
 - **Handles are the cancellation + replacement story.** §1.1.
   Customer-supplied row id; same handle re-scheduled silently
@@ -1002,7 +1002,7 @@ information:
   references survive customer URL refactors; URL-based callbacks
   silently break at fire time when routing changes. Customers
   wanting an external (cross-cluster) callback write a thin shim
-  module that calls `http.schedule({url: ...})` to the external
+  module that calls `http.send({url: ...})` to the external
   endpoint.
 - **Internal routing is auto-detected from the URL, not a separate
   `http.dispatch` primitive.** §3.2. Detection at apply time stamps
@@ -1012,13 +1012,13 @@ information:
   customer-visible semantics identical regardless of route.
 - **`webhook.send` and `email.send` are JS polyfills, not C
   bindings.** §9. The platform's native outbound surface is
-  exactly `http.schedule` + `http.cancel`. Everything customers
+  exactly `http.send` + `http.cancel`. Everything customers
   recognize as "send a webhook" / "send an email" is JS — a
   client-side polyfill (same pattern as today's `email.js` /
   `textcodec.js`) plus a server-side system tenant
   (`webhook.loop46.com`). Both pieces are customer-equivalent
   code; advanced customers can write their own libraries on top
-  of `http.schedule` directly. Operators can replace the default
+  of `http.send` directly. Operators can replace the default
   policy without recompiling the engine.
 
 ---
@@ -1031,9 +1031,9 @@ Handing retry policy to customer JS means a customer's bad retry
 curve becomes the platform's outbound traffic problem. Two
 distinct concerns to cap:
 
-- **Per-tenant rate.** A tight `http.schedule({fire_at_ns: now+10ms,
+- **Per-tenant rate.** A tight `http.send({fire_at_ns: now+10ms,
   on_result: { module: 'self_reschedule' }})` loop can queue
-  thousands of rows per second. Cap calls to `http.schedule`
+  thousands of rows per second. Cap calls to `http.send`
   per-tenant (token bucket on the existing `RateLimiter`, same
   shape as `events_emit` etc). Default: 100/s sustained, 200
   burst. Throws `Error{code:"rate_limited"}` at queue time so the
@@ -1073,7 +1073,7 @@ distinct concerns to cap:
   rows. Default: 10,000 in-flight per tenant. Plan tier knob
   later.
 
-All four enforce at `http.schedule`-queue time, not at fire time —
+All four enforce at `http.send`-queue time, not at fire time —
 keeps the failure mode synchronous and predictable for customer
 code. Customers writing retry policies in JS see the rate-limit
 throw and can react (their retry handler is itself JS that hits
@@ -1098,12 +1098,12 @@ real workload.
 
 `on_result.tenant` defaulting to the calling tenant is the obvious
 shape. Should we allow `on_result.tenant: "<other>"`? Use case:
-`webhook.loop46.com` calls `http.schedule` and wants the result
+`webhook.loop46.com` calls `http.send` and wants the result
 routed back to the customer's tenant, not its own. For the
 internal `webhook.send` shim path this is fine because
 `webhook.loop46.com`'s handler can synthesize the customer-side
 `on_result` itself (do the work in its own dispatch tick, then
-schedule a final `http.schedule` whose URL is the customer's
+schedule a final `http.send` whose URL is the customer's
 tenant). Native cross-tenant `on_result` is a bigger primitive
 (introduces "any tenant can dispatch into any other tenant's
 kv via callbacks"); defer until concrete demand.
@@ -1112,8 +1112,8 @@ kv via callbacks"); defer until concrete demand.
 
 Sim tests run handlers without firing real HTTP. Today's
 `webhook.send` captures into the per-handler list and tests
-inspect it. `http.schedule` gets the same treatment — the sim
-runner provides a stub `http.schedule` that records the call into
+inspect it. `http.send` gets the same treatment — the sim
+runner provides a stub `http.send` that records the call into
 a tape and returns a deterministic id; tests assert on the tape.
 Adjacent change to `docs/sim-test-framework.md` to formalize.
 
@@ -1135,7 +1135,7 @@ debug-checklist entry.
 
 Things that fall out for free that nobody planned for:
 
-- **Cron jobs.** §10.3 — recursive `http.schedule` reschedules itself.
+- **Cron jobs.** §10.3 — recursive `http.send` reschedules itself.
   Customers can build cron without a separate primitive.
 - **Scheduled emails.** §10.2 — "send this email in 30 days" is one
   call.
@@ -1168,6 +1168,6 @@ becomes JS they can read, debug, and customize.
   webhook-specific subsystem this design replaces. Kept in tree for
   history; will be pruned after migration step 5.
 - [`notifications.md`](notifications.md) — the customer-facing
-  notifications channel. `http.schedule` and notifications cover
+  notifications channel. `http.send` and notifications cover
   different jobs (outbound vs inbound; durable scheduled vs
   ephemeral push); both compose well.
