@@ -22,6 +22,7 @@ const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
 const webhook_server = @import("rove-webhook-server");
 const limiter_mod = @import("limiter.zig");
+const sse_dispatch = @import("sse_dispatch.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const webhook_b = @import("bindings/webhook.zig");
 const events_b = @import("bindings/events.zig");
@@ -162,6 +163,14 @@ pub const DispatchState = struct {
     /// (which don't allocate the list) can leave it null and skip
     /// the new path; production worker code always sets it non-null.
     pending_webhooks: ?*std.ArrayListUnmanaged(webhook_server.WebhookRow) = null,
+    /// Per-batch SSE emit accumulator (sse-plan §3.2). `events.emit`
+    /// appends an entry here as it runs; `worker_dispatch.finalizeBatch`
+    /// hands the merged list to `sse_dispatch.fireBatch` after raft
+    /// acks, fire-and-forget. Owned by `worker_dispatch.dispatchOnce`;
+    /// rows' `[]u8` fields are allocator-owned strings freed on the
+    /// list's `EmitEntry.deinit`. Optional so the dispatcher's standalone
+    /// test paths can leave it null and skip the POST path.
+    emit_buffer: ?*std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = null,
     /// Per-worker rate limiter. Used by the `__rove_check_email_rate`
     /// builtin (called from the `email.send` JS wrapper) to take
     /// from the email bucket before queuing the webhook row. Null in

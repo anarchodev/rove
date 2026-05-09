@@ -212,6 +212,28 @@ pub fn build(b: *std.Build) void {
     log_server_mod.addImport("rove-log", log_mod);
     log_server_mod.addImport("rove-jwt", jwt_mod);
 
+    // ── rove-sse-server: centralized SSE notification service ───────
+    //
+    // Replaces the in-worker `_events/{sid}/...` storage + pump model
+    // (sse-plan §1). Standalone process; receives `POST /v1/emit` from
+    // workers and serves long-lived `text/event-stream` connections to
+    // browsers. Per-(tenant, sid) ring cache + per-tenant connection
+    // table live in-memory; failover is "load balancer fails over,
+    // clients reconnect, hit sentinel, refetch."
+    const sse_server_mod = b.addModule("rove-sse-server", .{
+        .root_source_file = b.path("src/sse_server/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sse_server_mod.link_libc = true;
+    sse_server_mod.linkSystemLibrary("nghttp2", .{});
+    sse_server_mod.linkSystemLibrary("ssl", .{});
+    sse_server_mod.linkSystemLibrary("crypto", .{});
+    sse_server_mod.addImport("rove", rove_mod);
+    sse_server_mod.addImport("rove-io", io_mod);
+    sse_server_mod.addImport("rove-h2", h2_mod);
+    sse_server_mod.addImport("rove-jwt", jwt_mod);
+
     // ── rove-webhook-server: cluster-wide webhook subsystem (Phase 5.5 d) ──
     //
     // Schema, wire format, and apply primitives for the
@@ -337,6 +359,10 @@ pub fn build(b: *std.Build) void {
     // rove-webhook-server tests
     const webhook_server_tests = b.addTest(.{ .root_module = webhook_server_mod });
     test_step.dependOn(&b.addRunArtifact(webhook_server_tests).step);
+
+    // rove-sse-server tests
+    const sse_server_tests = b.addTest(.{ .root_module = sse_server_mod });
+    test_step.dependOn(&b.addRunArtifact(sse_server_tests).step);
 
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
@@ -501,6 +527,23 @@ pub fn build(b: *std.Build) void {
         .root_module = cs_standalone_mod,
     });
     b.installArtifact(cs_standalone);
+
+    // sse-server-standalone: runs the centralized SSE notification
+    // service as a separate process. See `docs/sse-plan.md`. v1
+    // ships with the worker still owning the legacy `/_events`
+    // route; this binary stands up alongside (sse-plan §7 step 1).
+    const sse_standalone_mod = b.addModule("sse-server-standalone", .{
+        .root_source_file = b.path("examples/sse_server_standalone.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sse_standalone_mod.addImport("rove-sse-server", sse_server_mod);
+    sse_standalone_mod.addImport("rove-h2", h2_mod);
+    const sse_standalone = b.addExecutable(.{
+        .name = "sse-server-standalone",
+        .root_module = sse_standalone_mod,
+    });
+    b.installArtifact(sse_standalone);
 
     // log-server-standalone: Phase 5.5 (a) step 2 — runs the new
     // S3-direct logs indexer + h2 query API as a standalone process.

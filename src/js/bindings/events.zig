@@ -34,6 +34,7 @@ const c = qjs.c;
 
 const globals = @import("../globals.zig");
 const limiter_mod = @import("../limiter.zig");
+const sse_dispatch = @import("../sse_dispatch.zig");
 
 const js_undefined = globals.js_undefined;
 const js_null = globals.js_null;
@@ -345,8 +346,54 @@ pub fn jsEventsEmit(
         };
     }
 
+    // Plan §3 parallel-run path: append to the per-batch emit buffer
+    // so the worker's post-raft pump can fire a fire-and-forget POST
+    // at sse-server. The legacy kv-row write above stays in place
+    // until the worker's `/_events` route is retired (plan §7 step 7).
+    if (state.emit_buffer) |buf| {
+        appendEmitEntry(state, buf, wire_id_slice, type_owned, json_slice, targets, now_ms) catch |err| {
+            state.pending_kv_error = err;
+            return js_exception;
+        };
+    }
+
     state.events_call_index += 1;
     return c.JS_NewStringLen(ctx, wire_id_slice.ptr, wire_id_slice.len);
+}
+
+/// Allocate one `EmitEntry` (owning copies of type/data/targets) and
+/// push it onto the per-batch buffer. Errors propagate to the caller,
+/// which routes them through `pending_kv_error` like every other
+/// fallible kv-side allocation in this binding.
+fn appendEmitEntry(
+    state: *globals.DispatchState,
+    buf: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
+    wire_id: []const u8,
+    type_owned: ?[]u8,
+    data_json: []const u8,
+    targets: []const []const u8,
+    created_at_ms: i64,
+) !void {
+    const a = state.allocator;
+    var entry: sse_dispatch.EmitEntry = undefined;
+    @memcpy(&entry.event_id, wire_id[0..sse_dispatch.EVENT_ID_LEN]);
+    entry.event_type = if (type_owned) |t| try a.dupe(u8, t) else try a.dupe(u8, "message");
+    errdefer a.free(entry.event_type);
+    entry.data_json = try a.dupe(u8, data_json);
+    errdefer a.free(entry.data_json);
+    entry.target_sids = try a.alloc([]u8, targets.len);
+    errdefer a.free(entry.target_sids);
+    var owned_count: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < owned_count) : (i += 1) a.free(entry.target_sids[i]);
+    }
+    for (targets, 0..) |s, i| {
+        entry.target_sids[i] = try a.dupe(u8, s);
+        owned_count = i + 1;
+    }
+    entry.created_at_ms = created_at_ms;
+    try buf.append(a, entry);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

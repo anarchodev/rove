@@ -222,6 +222,14 @@ const WorkerCtx = struct {
     /// the dashboard can surface a clear error instead of silently
     /// failing on the next files-server fetch.
     files_public_base: ?[]const u8,
+    /// Origin the worker uses for the worker → sse-server emit POST
+    /// (sse-plan §3.2). Null disables the path; emits stay in the
+    /// legacy `_events/{sid}/...` rows + worker pump until the
+    /// migration's step 7 cutover.
+    sse_public_base: ?[]const u8,
+    /// Shared bearer the worker stamps on each emit POST. Borrowed
+    /// from an env-loaded slice that lives for the worker's lifetime.
+    sse_internal_token: ?[]const u8,
     admin_origin: ?[]const u8,
     admin_api_domain: ?[]const u8,
     public_suffix: ?[]const u8,
@@ -361,6 +369,8 @@ fn workerMain(args: *WorkerCtx) !void {
         .services_jwt_secret = args.services_jwt_secret,
         .log_public_base = args.log_public_base,
         .files_public_base = args.files_public_base,
+        .sse_public_base = args.sse_public_base,
+        .sse_internal_token = args.sse_internal_token,
         .admin_origin = args.admin_origin,
         .admin_api_domain = args.admin_api_domain,
         .log_worker_id = args.worker_idx,
@@ -1069,6 +1079,31 @@ pub fn main() !void {
         null;
     defer if (files_public_base) |s| allocator.free(s);
 
+    // ── sse-server (sse-plan §3.2) ────────────────────────────────────
+    //
+    // Operator deploys `sse-server-standalone` and points the worker
+    // at it via `--sse-public-base` (or auto-derived from
+    // `--public-suffix`). `SSE_INTERNAL_TOKEN` env carries the shared
+    // bearer the worker stamps on each emit POST; sse-server is
+    // launched with the same value. Either piece missing → the
+    // worker → sse-server POST path stays disabled, emits live in
+    // the legacy `_events/{sid}/...` rows, and the existing
+    // `/_events` worker route serves them. Cutover lands in plan §7
+    // step 7.
+    const sse_public_base: ?[]u8 = if (cli.sse_public_base) |s|
+        try allocator.dupe(u8, s)
+    else if (cli.public_suffix) |suffix|
+        try std.fmt.allocPrint(allocator, "https://sse.{s}", .{suffix})
+    else
+        null;
+    defer if (sse_public_base) |s| allocator.free(s);
+
+    const sse_internal_token: ?[]u8 = std.process.getEnvVarOwned(allocator, "SSE_INTERNAL_TOKEN") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (sse_internal_token) |s| allocator.free(s);
+
     // ── Webhook-server thread (Phase 5.5 d) ───────────────────────────
     //
     // Leader-pinned poll loop reading `{data_dir}/webhooks.db`. The
@@ -1120,6 +1155,8 @@ pub fn main() !void {
             .services_jwt_secret = &services_jwt_secret,
             .log_public_base = log_public_base,
             .files_public_base = files_public_base,
+            .sse_public_base = sse_public_base,
+            .sse_internal_token = sse_internal_token,
             .admin_origin = cli.admin_origin,
             .admin_api_domain = cli.admin_api_domain,
             .public_suffix = cli.public_suffix,

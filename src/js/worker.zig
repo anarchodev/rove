@@ -424,6 +424,15 @@ pub const WorkerConfig = struct {
     /// Public origin the dashboard / CLI uses to reach files-server.
     /// Returned in the `/_system/services-token` response. Borrowed.
     files_public_base: ?[]const u8 = null,
+    /// Origin the worker uses to deliver `events.emit` payloads to
+    /// the sse-server's `POST /v1/emit`. Plain http://host:port for
+    /// loopback dev, https://sse.{public_suffix} in production.
+    /// Borrowed; null disables the worker → sse-server POST path.
+    sse_public_base: ?[]const u8 = null,
+    /// Shared bearer the worker stamps in `Authorization: Bearer ...`
+    /// on every emit POST. Must match the value sse-server is started
+    /// with in `SSE_INTERNAL_TOKEN`. Borrowed; null disables the path.
+    sse_internal_token: ?[]const u8 = null,
     /// Origin allowed to call `/_system/*` with CORS. When set, the
     /// worker answers browser preflight (OPTIONS) requests from this
     /// origin and stamps `Access-Control-Allow-*` headers onto every
@@ -575,6 +584,15 @@ pub fn Worker(comptime opts: Options) type {
         services_jwt_secret: ?[]const u8,
         log_public_base: ?[]const u8,
         files_public_base: ?[]const u8,
+        /// SSE delivery wiring (sse-plan §3.2). `sse_curl` is a
+        /// libcurl handle owned by the worker, lazily created on
+        /// `create` when both `sse_public_base` and
+        /// `sse_internal_token` are set. Null disables the
+        /// fire-and-forget POST path entirely; emits then live only
+        /// in the legacy `_events/{sid}/...` rows.
+        sse_public_base: ?[]const u8,
+        sse_internal_token: ?[]const u8,
+        sse_curl: ?*blob_mod.curl.Easy,
 
         /// Background log flusher — owns its own thread, sleeps on
         /// `flusher_wake` between ticks, drains the worker's
@@ -640,6 +658,15 @@ pub fn Worker(comptime opts: Options) type {
                 .services_jwt_secret = config.services_jwt_secret,
                 .log_public_base = config.log_public_base,
                 .files_public_base = config.files_public_base,
+                .sse_public_base = config.sse_public_base,
+                .sse_internal_token = config.sse_internal_token,
+                .sse_curl = blk: {
+                    if (config.sse_public_base == null or config.sse_internal_token == null) break :blk null;
+                    break :blk blob_mod.curl.Easy.init(allocator) catch |err| {
+                        std.log.warn("rove-js: sse libcurl init failed: {s}; emit POST disabled", .{@errorName(err)});
+                        break :blk null;
+                    };
+                },
             };
             errdefer self.raft_pending.deinit();
             errdefer self.tenant_files_map.clearAllEntries(allocator);
@@ -713,6 +740,7 @@ pub fn Worker(comptime opts: Options) type {
             self.tenant_files_map.deinit(allocator);
             self.raft_pending.deinit();
             self.dispatcher.deinit();
+            if (self.sse_curl) |easy| easy.deinit();
             self.h2.destroy();
             allocator.destroy(self);
         }

@@ -32,6 +32,8 @@ const worker_mod = @import("worker.zig");
 const session_mod = @import("session.zig");
 const events_mod = @import("events.zig");
 const events_pump = @import("events_pump.zig");
+const sse_dispatch = @import("sse_dispatch.zig");
+const sse_token_mod = @import("sse_token.zig");
 
 const Request = dispatcher_mod.Request;
 const RaftWait = worker_mod.RaftWait;
@@ -82,6 +84,7 @@ fn finalizeBatch(
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *const kv_mod.WriteSet,
     pending_webhooks: *const std.ArrayListUnmanaged(webhook_server_mod.WebhookRow),
+    pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
     successes: *std.ArrayList(SuccessRec),
 ) !usize {
     const server = worker.h2;
@@ -133,6 +136,11 @@ fn finalizeBatch(
             worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
             processed += 1;
         }
+        // No raft hop on read-only batches → emits fire immediately.
+        // Per sse-plan §3.2, the "after kv commit" rule only constrains
+        // emits accompanying writes; emits without writes have nothing
+        // for raft to reject.
+        fireEmitsIfWired(worker, anchor_id, successes, pending_emits);
         successes.clearRetainingCapacity();
         return processed;
     }
@@ -190,8 +198,43 @@ fn finalizeBatch(
         worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
         processed += 1;
     }
+    // Fire SSE emits now that raft accepted the batch. The drain that
+    // applies the writes to followers happens later, but on the leader
+    // the local SQLite writes are already committed (txn.commit ran
+    // above); the propose-success path is the right "successful kv
+    // commit" hook from sse-plan §3.2's perspective.
+    fireEmitsIfWired(worker, anchor_id, successes, pending_emits);
     successes.clearRetainingCapacity();
     return processed;
+}
+
+/// Fire the merged emit batch at sse-server, fire-and-forget. No-op
+/// if the worker isn't configured for SSE delivery, the batch is
+/// empty, or no successful handler is in `successes` (the request_id
+/// for the wire body's outer breadcrumb comes from the first
+/// success). Safe to call from any of `finalizeBatch`'s exit paths
+/// — caller still owns + frees `pending_emits`.
+fn fireEmitsIfWired(
+    worker: anytype,
+    anchor_id: []const u8,
+    successes: *const std.ArrayList(SuccessRec),
+    pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
+) void {
+    if (pending_emits.items.len == 0) return;
+    const easy = worker.sse_curl orelse return;
+    const base = worker.sse_public_base orelse return;
+    const tok = worker.sse_internal_token orelse return;
+    if (base.len == 0 or tok.len == 0) return;
+    const request_id: u64 = if (successes.items.len > 0) successes.items[0].request_id else 0;
+    sse_dispatch.fireBatch(
+        worker.allocator,
+        easy,
+        base,
+        tok,
+        anchor_id,
+        request_id,
+        pending_emits.items,
+    );
 }
 
 /// `/_system/*` route handler — CORS preflight + `services-token`
@@ -824,6 +867,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         pending_webhooks.deinit(allocator);
     }
 
+    // Per-batch SSE emit accumulator (sse-plan §3.2). `events.emit`
+    // appends here; `finalizeBatch` fires the merged batch at
+    // sse-server fire-and-forget after raft propose succeeds. The
+    // legacy kv-row write also still happens (parallel run); cutover
+    // is plan §7 step 7.
+    var pending_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
+    defer {
+        for (pending_emits.items) |*e| e.deinit(allocator);
+        pending_emits.deinit(allocator);
+    }
+
     // Successful handlers awaiting the shared commit + final move.
     // Owns `console_owned` / `exception_owned` until they transfer
     // into a log record after commit.
@@ -904,6 +958,30 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (tc.current_deployment_id == 0) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{});
+            processed += 1;
+            continue;
+        }
+
+        // `/_session/sse-token` — mints the JWT the customer's JS
+        // hands to sse-server's EventSource open (sse-plan §5.1).
+        // Same-origin to whatever domain the app is on; reads
+        // `__Host-rove_sid`, scoping the token to (tenant_id, sid).
+        // Skipped silently when `services_jwt_secret` is unwired —
+        // the handler answers 503 in that case.
+        if (try sse_token_mod.tryHandleSseToken(
+            server,
+            allocator,
+            worker.services_jwt_secret,
+            scope_inst.id,
+            ent,
+            sid,
+            sess,
+            method,
+            path,
+            rh,
+            received_ns,
+        )) {
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 200, .ok, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1148,6 +1226,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             else
                 null,
             .pending_webhooks = &pending_webhooks,
+            .emit_buffer = &pending_emits,
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(
@@ -1339,6 +1418,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // End of walk. If no anchor was opened we're done — all processing
     // was short-circuit (failed) paths.
     if (anchor == null) return processed;
-    processed += try finalizeBatch(worker, anchor.?, &txn.?, &writeset, &pending_webhooks, &successes);
+    processed += try finalizeBatch(worker, anchor.?, &txn.?, &writeset, &pending_webhooks, &pending_emits, &successes);
     return processed;
 }

@@ -136,6 +136,15 @@ pub const Cli = struct {
     /// `/_system/services-token` returns 503 for `files_url` when
     /// neither this nor `--public-suffix` is set.
     files_public_base: ?[]const u8 = null,
+    /// Origin the worker uses to deliver `events.emit` payloads to
+    /// the sse-server's `POST /v1/emit`. Plain http://host:port for
+    /// loopback dev (`scripts/sse_server_smoke.sh`), https://sse.
+    /// {public_suffix} in production. Auto-derived from
+    /// `--public-suffix` when unset, same shape as files / log. Null
+    /// (no auto-derive, no flag) disables the worker → sse-server
+    /// POST path; emits then live only in the legacy `_events/`
+    /// rows the worker pump still drives.
+    sse_public_base: ?[]const u8 = null,
 };
 
 pub fn parseCli(args: []const [:0]u8) !Cli {
@@ -231,6 +240,10 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.files_public_base = args[i];
+        } else if (std.mem.eql(u8, a, "--sse-public-base")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.sse_public_base = args[i];
         } else {
             return error.Usage;
         }

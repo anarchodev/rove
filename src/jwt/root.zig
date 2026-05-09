@@ -153,6 +153,91 @@ pub fn verifyWithCap(secret: []const u8, token: []const u8, now_ms: i64, require
     return verifyAndDecodePayload(secret, token, now_ms, required);
 }
 
+/// Sign an arbitrary payload JSON. Used by callers that need a richer
+/// payload shape than `{exp, caps?}` — e.g. the SSE token mint
+/// (sse-plan §5.1) embeds `{v, tenant_id, sid, caps, exp}`. The caller
+/// builds the JSON bytes; this routine just runs the standard
+/// HEADER + payload base64 + HMAC-SHA256 dance and returns the
+/// three-part token. Caller frees the result with `allocator.free`.
+///
+/// `payload_json` should already include an `"exp"` field — verifiers
+/// (`verify`, `verifyAndCopyPayload`) reject tokens missing it.
+pub fn mintWithPayload(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    payload_json: []const u8,
+) Error![]u8 {
+    var payload_b64_buf: [512]u8 = undefined;
+    const enc_len = B64.Encoder.calcSize(payload_json.len);
+    if (enc_len > payload_b64_buf.len) return Error.OutOfMemory;
+    const payload_b64 = B64.Encoder.encode(payload_b64_buf[0..enc_len], payload_json);
+
+    const signing_input_len = HEADER_B64.len + 1 + payload_b64.len;
+    var signing_input_buf: [768]u8 = undefined;
+    if (signing_input_len > signing_input_buf.len) return Error.OutOfMemory;
+    @memcpy(signing_input_buf[0..HEADER_B64.len], HEADER_B64);
+    signing_input_buf[HEADER_B64.len] = '.';
+    @memcpy(signing_input_buf[HEADER_B64.len + 1 ..][0..payload_b64.len], payload_b64);
+
+    var sig: [32]u8 = undefined;
+    HmacSha256.create(&sig, signing_input_buf[0..signing_input_len], secret);
+    var sig_b64_buf: [SIG_B64_LEN]u8 = undefined;
+    const sig_b64 = B64.Encoder.encode(&sig_b64_buf, &sig);
+
+    const total = signing_input_len + 1 + sig_b64.len;
+    const out = allocator.alloc(u8, total) catch return Error.OutOfMemory;
+    @memcpy(out[0..signing_input_len], signing_input_buf[0..signing_input_len]);
+    out[signing_input_len] = '.';
+    @memcpy(out[signing_input_len + 1 ..], sig_b64);
+    return out;
+}
+
+/// Verify signature + expiry, then copy the decoded payload JSON into
+/// `out_buf` and return the slice. Lets a caller read additional fields
+/// (e.g. `tenant_id`, `sid` for the SSE token shape — see sse-plan §5.1)
+/// without re-implementing the HMAC dance. `out_buf` must be at least
+/// `MAX_PAYLOAD_BYTES` (256) so any well-formed token fits.
+pub fn verifyAndCopyPayload(
+    secret: []const u8,
+    token: []const u8,
+    now_ms: i64,
+    out_buf: []u8,
+) Error![]u8 {
+    const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return Error.Malformed;
+    const header_b64 = token[0..first_dot];
+    const rest = token[first_dot + 1 ..];
+    const second_dot = std.mem.indexOfScalar(u8, rest, '.') orelse return Error.Malformed;
+    const payload_b64 = rest[0..second_dot];
+    const sig_b64 = rest[second_dot + 1 ..];
+
+    if (!std.mem.eql(u8, header_b64, HEADER_B64)) return Error.UnsupportedAlg;
+    if (sig_b64.len != SIG_B64_LEN) return Error.Malformed;
+
+    const signing_input_len = header_b64.len + 1 + payload_b64.len;
+    var signing_input_buf: [512]u8 = undefined;
+    if (signing_input_len > signing_input_buf.len) return Error.Malformed;
+    @memcpy(signing_input_buf[0..header_b64.len], header_b64);
+    signing_input_buf[header_b64.len] = '.';
+    @memcpy(signing_input_buf[header_b64.len + 1 ..][0..payload_b64.len], payload_b64);
+
+    var expected_sig: [32]u8 = undefined;
+    HmacSha256.create(&expected_sig, signing_input_buf[0..signing_input_len], secret);
+    var expected_b64_buf: [SIG_B64_LEN]u8 = undefined;
+    const expected_b64 = B64.Encoder.encode(&expected_b64_buf, &expected_sig);
+
+    if (!std.crypto.timing_safe.eql([SIG_B64_LEN]u8, expected_b64[0..SIG_B64_LEN].*, sig_b64[0..SIG_B64_LEN].*))
+        return Error.BadSignature;
+
+    const payload_json_len = B64.Decoder.calcSizeForSlice(payload_b64) catch return Error.Malformed;
+    if (payload_json_len > out_buf.len) return Error.Malformed;
+    B64.Decoder.decode(out_buf[0..payload_json_len], payload_b64) catch
+        return Error.Malformed;
+
+    const exp_ms = parseExp(out_buf[0..payload_json_len]) orelse return Error.Malformed;
+    if (now_ms >= exp_ms) return Error.Expired;
+    return out_buf[0..payload_json_len];
+}
+
 /// Internal: signature + expiry check, returning the parsed payload.
 /// Separate from `verify` to keep the public function's signature
 /// stable (no capability check).
@@ -369,6 +454,25 @@ test "hasCap delimits on quotes (substring guard)" {
     defer a.free(tok);
     try testing.expectError(Error.MissingCap, verifyWithCap("k", tok, 0, Cap.RELEASE));
     _ = try verifyWithCap("k", tok, 0, "release-foo");
+}
+
+test "mintWithPayload + verifyAndCopyPayload round-trip carries arbitrary fields" {
+    const a = testing.allocator;
+    const payload = "{\"v\":1,\"tenant_id\":\"acme\",\"sid\":\"abc\",\"exp\":1000000}";
+    const tok = try mintWithPayload(a, "k", payload);
+    defer a.free(tok);
+
+    var buf: [256]u8 = undefined;
+    const decoded = try verifyAndCopyPayload("k", tok, 0, &buf);
+    try testing.expectEqualStrings(payload, decoded);
+}
+
+test "mintWithPayload rejects tokens with bad sig under a different secret" {
+    const a = testing.allocator;
+    const tok = try mintWithPayload(a, "k", "{\"exp\":9999999}");
+    defer a.free(tok);
+    var buf: [256]u8 = undefined;
+    try testing.expectError(Error.BadSignature, verifyAndCopyPayload("evil", tok, 0, &buf));
 }
 
 test "mint rejects caps with invalid chars" {

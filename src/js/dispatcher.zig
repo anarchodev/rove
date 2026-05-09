@@ -22,6 +22,7 @@ const webhook_server = @import("rove-webhook-server");
 
 const globals = @import("globals.zig");
 const limiter_mod = @import("limiter.zig");
+const sse_dispatch = @import("sse_dispatch.zig");
 const c = qjs.c;
 
 pub const DispatchError = error{
@@ -182,6 +183,11 @@ pub const Request = struct {
     /// production dispatcher always sets it non-null. `webhook.send`
     /// throws if it's null.
     pending_webhooks: ?*std.ArrayListUnmanaged(webhook_server.WebhookRow) = null,
+    /// sse-plan §3.2. `events.emit` appends an `EmitEntry` here; the
+    /// worker fires the merged batch fire-and-forget at sse-server
+    /// after raft commits the writeset. Optional for the same reason
+    /// `pending_webhooks` is — dispatcher-test paths can leave it null.
+    emit_buffer: ?*std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = null,
 };
 
 /// One `(name, value)` pair extracted from the handler's
@@ -346,6 +352,7 @@ pub const Dispatcher = struct {
             .deploy_starter = request.deploy_starter,
             .deploy_starter_ctx = request.deploy_starter_ctx,
             .pending_webhooks = request.pending_webhooks,
+            .emit_buffer = request.emit_buffer,
         };
 
         // Reset the per-request arena (one cursor write) and reseed
@@ -1569,12 +1576,18 @@ fn runOne(
         for (local_webhooks.items) |*r| r.deinit(testing.allocator);
         local_webhooks.deinit(testing.allocator);
     }
+    var local_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
+    defer {
+        for (local_emits.items) |*e| e.deinit(testing.allocator);
+        local_emits.deinit(testing.allocator);
+    }
 
     // If the caller didn't set a query, force `fn=go` so the
     // dispatcher finds our wrapper export.
     var request = request_in;
     if (request.query == null) request.query = "fn=go";
     if (request.pending_webhooks == null) request.pending_webhooks = &local_webhooks;
+    if (request.emit_buffer == null) request.emit_buffer = &local_emits;
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
     const resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, request, &budget);

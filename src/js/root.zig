@@ -57,6 +57,8 @@ pub const session = @import("session.zig");
 pub const events = @import("events.zig");
 pub const events_pump = @import("events_pump.zig");
 pub const events_sweep = @import("events_sweep.zig");
+pub const sse_dispatch = @import("sse_dispatch.zig");
+pub const sse_token = @import("sse_token.zig");
 pub const release_table = @import("release_table.zig");
 
 pub const ReleaseTable = release_table.ReleaseTable;
@@ -106,5 +108,7 @@ test {
     _ = events;
     _ = events_pump;
     _ = events_sweep;
+    _ = sse_dispatch;
+    _ = sse_token;
     _ = release_table;
 }
