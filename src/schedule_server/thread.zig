@@ -66,10 +66,12 @@ pub const Config = struct {
     /// `{data_dir}` — `schedules.db` lives at the top of this directory.
     data_dir: []const u8,
     raft: *kv_mod.RaftNode,
-    /// Poll cadence when leader and idle. 250ms keeps fire-time error
-    /// under a second even without the apply-side wakeup, which
-    /// matters for "fire ASAP" (`fire_at_ns=0`) deliveries.
-    poll_interval_ms: u32 = 250,
+    /// Cap on idle sleep duration. Reached when the external pool has
+    /// no future work scheduled — the thread still wakes occasionally
+    /// to check `isLeader` and to log liveness. The apply path's
+    /// wake-on-new-work means a cap this high doesn't add fire-time
+    /// latency; rows still ship within an apply tick of arrival.
+    idle_max_ms: u32 = 60_000,
 };
 
 pub const Handle = struct {
@@ -159,10 +161,26 @@ fn runLoop(h: *Handle) !void {
             while (it.next()) |entry| h.allocator.free(entry.key_ptr.*);
             in_flight.clearRetainingCapacity();
         }
-        h.wake.timedWait(@as(u64, h.config.poll_interval_ms) * std.time.ns_per_ms) catch {};
+        // Adaptive sleep: until the soonest external row's fire_at_ns
+        // (capped at `idle_max_ms`). Apply-side wake fires when a
+        // sooner row lands, so we don't oversleep new work. Followers
+        // stay capped at idle_max_ms — they're not firing anything
+        // anyway.
+        const sleep_ns = computeSleepNs(&store, h.config.idle_max_ms) catch
+            @as(u64, h.config.idle_max_ms) * std.time.ns_per_ms;
+        h.wake.timedWait(sleep_ns) catch {};
         h.wake.reset();
     }
     std.log.info("schedule-server: stopped", .{});
+}
+
+fn computeSleepNs(store: *schedule_server.ScheduleStore, idle_max_ms: u32) !u64 {
+    const cap_ns: u64 = @as(u64, idle_max_ms) * std.time.ns_per_ms;
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const next = (try store.nextExternalFireNs(now_ns)) orelse return cap_ns;
+    const delta = next - now_ns;
+    if (delta <= 0) return 0;
+    return @min(@as(u64, @intCast(delta)), cap_ns);
 }
 
 /// Build the in-flight set key: `{tenant_id}\x00{id}`. NUL is a safe

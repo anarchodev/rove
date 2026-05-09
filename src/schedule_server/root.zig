@@ -455,6 +455,62 @@ pub const ScheduleStore = struct {
         return out.toOwnedSlice(allocator) catch return Error.OutOfMemory;
     }
 
+    /// Earliest `fire_at_ns > now_ns` among external rows. Returns
+    /// null when the external pool is empty (or every external row
+    /// is already due — caller should run `dueRows` first to drain
+    /// those, then ask for the next deadline). Used by the libcurl
+    /// scheduler thread to compute its adaptive sleep target instead
+    /// of polling at a fixed cadence.
+    ///
+    /// Same prefix-scan cost as `dueRows`; at the row counts we
+    /// expect at launch, that's a few microseconds. When the store
+    /// grows we'll add a `(fire_at_ns)` index.
+    pub fn nextExternalFireNs(self: *ScheduleStore, now_ns: i64) Error!?i64 {
+        return self.nextFireNs(now_ns, .external);
+    }
+
+    /// Same as `nextExternalFireNs` but for the internal pool.
+    /// Worker phase uses this for its adaptive sleep.
+    pub fn nextInternalFireNs(self: *ScheduleStore, now_ns: i64) Error!?i64 {
+        return self.nextFireNs(now_ns, .internal);
+    }
+
+    fn nextFireNs(self: *ScheduleStore, now_ns: i64, flavor: ScanFlavor) Error!?i64 {
+        var soonest: ?i64 = null;
+        var cursor: []const u8 = "";
+        var cursor_owned: ?[]u8 = null;
+        defer if (cursor_owned) |b| self.allocator.free(b);
+
+        while (true) {
+            var page = self.db.prefix("s/", cursor, 1024) catch return Error.Kv;
+            defer page.deinit();
+            for (page.entries) |entry| {
+                var stored = parseStored(self.allocator, entry.value) catch |err| switch (err) {
+                    Error.OutOfMemory => return Error.OutOfMemory,
+                    else => continue,
+                };
+                defer stored.deinit(self.allocator);
+                if (stored.row.fire_at_ns <= now_ns) continue;
+                const matches = switch (flavor) {
+                    .external => !stored.row.is_internal,
+                    .internal => stored.row.is_internal,
+                };
+                if (!matches) continue;
+                if (soonest == null or stored.row.fire_at_ns < soonest.?) {
+                    soonest = stored.row.fire_at_ns;
+                }
+            }
+            if (page.entries.len < 1024) break;
+            const last_key = page.entries[page.entries.len - 1].key;
+            if (cursor_owned) |b| self.allocator.free(b);
+            const buf = self.allocator.alloc(u8, last_key.len) catch return Error.OutOfMemory;
+            @memcpy(buf, last_key);
+            cursor_owned = buf;
+            cursor = buf;
+        }
+        return soonest;
+    }
+
     /// Whole-store row count. Used by ops dashboards + the
     /// in-flight cap check (plan §13.1).
     pub fn count(self: *ScheduleStore) Error!u64 {
@@ -1352,6 +1408,54 @@ test "ScheduleStore: dueRows respects max" {
         a.free(due);
     }
     try testing.expectEqual(@as(usize, 3), due.len);
+}
+
+test "ScheduleStore: nextExternalFireNs returns soonest future external row" {
+    const a = testing.allocator;
+    var path_buf: [64]u8 = undefined;
+    var store = try openTempStore(a, &path_buf);
+    defer {
+        store.close();
+        cleanupTempStore(&path_buf);
+    }
+
+    var ext_soon = try testRow(a, "acme", "ext-soon", 1_000);
+    defer ext_soon.deinit(a);
+    var ext_later = try testRow(a, "acme", "ext-later", 5_000);
+    defer ext_later.deinit(a);
+    var int_sooner = try testRow(a, "acme", "int-sooner", 500);
+    int_sooner.is_internal = true;
+    defer int_sooner.deinit(a);
+    var ext_past = try testRow(a, "acme", "ext-past", 100);
+    defer ext_past.deinit(a);
+    try store.applyUpsertBatch(&[_]ScheduleRow{ ext_soon, ext_later, int_sooner, ext_past }, 0);
+
+    // now=200: ext-past is already due (excluded from "next future"),
+    // int-sooner is internal (excluded), ext-soon is soonest external
+    // future at 1000.
+    const next_ext = try store.nextExternalFireNs(200);
+    try testing.expectEqual(@as(?i64, 1_000), next_ext);
+
+    const next_int = try store.nextInternalFireNs(200);
+    try testing.expectEqual(@as(?i64, 500), next_int);
+}
+
+test "ScheduleStore: nextExternalFireNs returns null on empty external pool" {
+    const a = testing.allocator;
+    var path_buf: [64]u8 = undefined;
+    var store = try openTempStore(a, &path_buf);
+    defer {
+        store.close();
+        cleanupTempStore(&path_buf);
+    }
+
+    var only_internal = try testRow(a, "acme", "only-int", 1_000);
+    only_internal.is_internal = true;
+    defer only_internal.deinit(a);
+    try store.applyUpsertBatch(&[_]ScheduleRow{only_internal}, 0);
+
+    try testing.expectEqual(@as(?i64, null), try store.nextExternalFireNs(0));
+    try testing.expectEqual(@as(?i64, 1_000), try store.nextInternalFireNs(0));
 }
 
 test "validateId: bounds + NUL rejection" {

@@ -394,11 +394,21 @@ pub const ApplyCtx = struct {
     schedules_store: ?*schedule_server.ScheduleStore = null,
     /// Wake signal for the leader-pinned scheduler thread. Same
     /// shape as `webhook_wake`. Set by loop46/main.zig once the
-    /// scheduler thread spawns. Envelope-8 apply fires it so the
-    /// scheduler picks fresh rows up on the apply tick instead of
-    /// waiting out the next-due-or-poll deadline. Envelope-9 / 10
-    /// don't fire it — completes / cancels reduce work, not add it.
+    /// scheduler thread spawns. Envelope-8 apply fires it when the
+    /// batch contains at least one external row; envelope-11
+    /// (demote) always fires it (the row just landed in the
+    /// external pool). Envelope-9 / 10 don't fire it — completes /
+    /// cancels reduce work, not add it.
     schedule_wake: ?*std.Thread.ResetEvent = null,
+    /// Wake signal for the in-process worker phase
+    /// (`dispatchInternalSchedules`). Symmetric to `schedule_wake`
+    /// but fires when a batch contains at least one internal row.
+    /// Worker phase runs on the dispatch loop, so this is mostly an
+    /// optimization — without it the next dispatch tick (sub-ms
+    /// later) would pick the row up anyway. Mainly useful when the
+    /// worker is idle (no inbound h2 traffic) and the dispatch loop
+    /// is blocked in `io.poll`.
+    worker_phase_wake: ?*std.Thread.ResetEvent = null,
     /// Cluster's public suffix (e.g. `loop46.me`). Used at
     /// envelope-8 apply to stamp `is_internal` on schedule rows
     /// whose URL targets `{id}.{public_suffix}` AND `{id}` has an
@@ -881,12 +891,16 @@ fn applyScheduleUpsertBatch(ctx: *ApplyCtx, env: Envelope) void {
     // detection against the same root-store membership + same suffix,
     // so all replicas agree on `is_internal` for every row. Rows
     // whose URL host is `{id}.{public_suffix}` AND `{id}` exists in
-    // __root__.db get `is_internal=true`; the (future) worker phase
-    // picks those up in-process. For now they still go through the
-    // libcurl scheduler thread — the stamp is informational until
-    // the dispatch hop lands.
+    // __root__.db get `is_internal=true` and land in the internal
+    // pool (drained by `dispatchInternalSchedules`); everyone else
+    // lands in the external pool (drained by the libcurl scheduler
+    // thread). Track which pool got contributions so we only wake
+    // the consumer that has new work.
+    var has_external = false;
+    var has_internal = false;
     for (rows) |*r| {
         r.is_internal = detectInternalTarget(ctx, r.url);
+        if (r.is_internal) has_internal = true else has_external = true;
     }
 
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
@@ -896,7 +910,8 @@ fn applyScheduleUpsertBatch(ctx: *ApplyCtx, env: Envelope) void {
         .{@errorName(err)},
     );
 
-    if (ctx.schedule_wake) |w| w.set();
+    if (has_external) if (ctx.schedule_wake) |w| w.set();
+    if (has_internal) if (ctx.worker_phase_wake) |w| w.set();
 }
 
 /// True when `url` parses as `{id}.{public_suffix}` AND `{id}` has a
