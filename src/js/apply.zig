@@ -381,6 +381,15 @@ pub const ApplyCtx = struct {
     /// waiting out the next-due-or-poll deadline. Envelope-9 / 10
     /// don't fire it — completes / cancels reduce work, not add it.
     schedule_wake: ?*std.Thread.ResetEvent = null,
+    /// Cluster's public suffix (e.g. `loop46.me`). Used at
+    /// envelope-8 apply to stamp `is_internal` on schedule rows
+    /// whose URL targets `{id}.{public_suffix}` AND `{id}` has an
+    /// existence marker in `__root__.db` (http-send-plan §3.2).
+    /// Null / empty disables the stamping; rows stay
+    /// `is_internal=false` and route through the libcurl scheduler
+    /// thread. Borrowed; the loop46 binary owns the storage for
+    /// the process lifetime.
+    public_suffix: ?[]const u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -849,6 +858,18 @@ fn applyScheduleUpsertBatch(ctx: *ApplyCtx, env: Envelope) void {
         ctx.allocator.free(rows);
     }
 
+    // Internal-target stamping (plan §3.2). Each node runs the same
+    // detection against the same root-store membership + same suffix,
+    // so all replicas agree on `is_internal` for every row. Rows
+    // whose URL host is `{id}.{public_suffix}` AND `{id}` exists in
+    // __root__.db get `is_internal=true`; the (future) worker phase
+    // picks those up in-process. For now they still go through the
+    // libcurl scheduler thread — the stamp is informational until
+    // the dispatch hop lands.
+    for (rows) |*r| {
+        r.is_internal = detectInternalTarget(ctx, r.url);
+    }
+
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     store.applyUpsertBatch(rows, now_ns) catch |err| panic_mod.invariantViolated(
         "applyScheduleUpsertBatch.apply",
@@ -857,6 +878,29 @@ fn applyScheduleUpsertBatch(ctx: *ApplyCtx, env: Envelope) void {
     );
 
     if (ctx.schedule_wake) |w| w.set();
+}
+
+/// True when `url` parses as `{id}.{public_suffix}` AND `{id}` has a
+/// registered existence marker in __root__.db. Returns false when
+/// `public_suffix` isn't wired (CLI smokes, single-tenant dev) — that's
+/// the "not running on a cluster" path where every URL is external.
+/// Also returns false on parse / membership errors: detection is
+/// best-effort. False negative cost: one extra libcurl roundtrip.
+/// False positive cost: dispatching against a non-existent tenant
+/// (the worker phase rejects gracefully + the row falls back).
+fn detectInternalTarget(ctx: *ApplyCtx, url: []const u8) bool {
+    const suffix = ctx.public_suffix orelse return false;
+    if (suffix.len == 0) return false;
+    const id = schedule_server.internal_routing.parseInstanceId(url, suffix) orelse return false;
+    const root = ctx.getRootKv() catch return false;
+    var key_buf: [128]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{id}) catch return false;
+    const v = root.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return false,
+    };
+    ctx.allocator.free(v);
+    return true;
 }
 
 /// http.send envelope-9 apply (schedule_complete). Cross-db: on

@@ -53,6 +53,11 @@ const kv = @import("rove-kv");
 /// over libcurl, proposes envelope-9 with the result. See plan §5.
 pub const thread = @import("thread.zig");
 
+/// URL → cluster-tenant detection (plan §3.2). Called at apply time
+/// from `applyScheduleUpsertBatch` to stamp `is_internal` on rows
+/// targeting `{id}.{public_suffix}`.
+pub const internal_routing = @import("internal_routing.zig");
+
 pub const Error = error{
     Truncated,
     InvalidVersion,
@@ -771,6 +776,7 @@ const testing = std.testing;
 // is not enough on its own.
 test {
     _ = thread;
+    _ = internal_routing;
 }
 
 fn testRow(allocator: std.mem.Allocator, tenant: []const u8, id: []const u8, fire_at_ns: i64) !ScheduleRow {
