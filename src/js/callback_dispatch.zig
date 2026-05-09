@@ -1,44 +1,52 @@
-//! Callback dispatch — invokes the tenant's `onResult` handler after
-//! the webhook-server finishes a webhook attempt (delivered or
-//! terminally failed).
+//! Callback dispatch — invokes the tenant's `on_result` handler
+//! after the schedule-server finishes an http.send attempt
+//! (delivered or terminally failed).
 //!
-//! Envelope-5 apply (Phase 5.5 d) writes `_callback/{id}` receipts
-//! into the tenant's app.db when delivery completes. This phase,
-//! driven from the worker
-//! poll loop on the raft leader, scans those receipts, resolves the
-//! customer's `on_result` handler path to bytecode, and invokes it
-//! with a synthetic event object. Each tenant's successful invocations
-//! (plus the receipt deletes) commit atomically in one SQLite txn and
-//! propose through raft as a single writeset — same at-least-once /
-//! deterministic-replay envelope as an HTTP-driven handler.
+//! Envelope-9 apply writes `_callback/{id}` receipts into the
+//! tenant's app.db when a schedule completes. This phase, driven
+//! from the worker poll loop on the raft leader, scans those
+//! receipts, resolves the customer's `on_result` handler path to
+//! bytecode, and invokes it with the event JSON in `request.body`.
+//! Each tenant's successful invocations (plus the receipt deletes)
+//! commit atomically in one SQLite txn and propose through raft
+//! as a single writeset — same at-least-once / deterministic-
+//! replay envelope as an HTTP-driven handler.
 //!
 //! ## Contract with the handler
 //!
-//! The callback handler is an ES module with a `default` export that
-//! takes one argument — the event:
+//! The callback handler is an ES module — same shape as any other
+//! HTTP handler in the tenant. The event JSON arrives in
+//! `request.body`:
 //!
 //! ```js
-//! // stripe/charge_result.mjs
-//! export default function (event) {
-//!   // event.webhookId  - id returned from webhook.send
-//!   // event.outcome    - "delivered" | "failed"
-//!   // event.attempts   - number
-//!   // event.context    - whatever was passed to webhook.send
-//!   // event.response   - { status, body, truncated } (delivered only)
-//!   // event.error      - error name string           (failed only)
-//!   if (event.outcome === "delivered") {
-//!     kv.set(`charges/${event.context.chargeId}`, event.response.body);
+//! // stripe_done.mjs
+//! export default function () {
+//!   const event = JSON.parse(request.body);
+//!   // event.id       - schedule id returned from http.send
+//!   // event.ok       - bool
+//!   // event.status   - HTTP status code
+//!   // event.body     - response body string
+//!   // event.context  - whatever was passed to http.send
+//!   // event.error    - error string ("" / null on success)
+//!   if (event.ok) {
+//!     kv.set(`charges/${event.context.charge_id}`, event.body);
 //!   }
 //! }
 //! ```
 //!
-//! The handler may call `kv.*` and `webhook.send` — its writes go into
-//! the same tenant batch txn as the receipt delete and replicate
-//! through raft together. If the handler throws or hits its budget,
-//! the savepoint rolls back and the receipt is KEPT for retry, so a
-//! fixed redeploy picks up the backlog automatically. If the envelope
-//! is malformed or the handler path is unknown, the receipt is
-//! DROPPED with a warning (otherwise it'd accumulate forever).
+//! When the schedule was queued with `on_result.fn` set, the
+//! synthesized callback request also carries `?fn={fn}&args={...}`
+//! so a named export is invoked with positional args; event JSON
+//! still arrives via `request.body`.
+//!
+//! The handler may call `kv.*` / `http.send` / `events.emit` —
+//! its writes go into the same tenant batch txn as the receipt
+//! delete and replicate through raft together. If the handler
+//! throws or hits its budget, the savepoint rolls back and the
+//! receipt is KEPT for retry, so a fixed redeploy picks up the
+//! backlog automatically. If the envelope is malformed or the
+//! handler path is unknown, the receipt is DROPPED with a warning
+//! (otherwise it'd accumulate forever).
 //!
 //! ## Leader + worker gating
 //!
@@ -129,11 +137,12 @@ fn drainTenantCallbacks(
     defer writeset.deinit();
 
     // Per-batch SSE emit accumulator (sse-plan §3.2). Callbacks can
-    // call `events.emit` to fan a webhook response back to the user's
-    // browser (the Stripe-style RPC-via-notifications recipe in
-    // docs/notifications.md §2). Same lifecycle as worker_dispatch's
-    // pending_emits: appended via DispatchState.emit_buffer, fired
-    // fire-and-forget at sse-server after raft commits the writeset.
+    // call `events.emit` to fan an http.send response back to the
+    // user's browser (the Stripe-style RPC-via-notifications recipe
+    // in docs/notifications.md §2). Same lifecycle as
+    // worker_dispatch's pending_emits: appended via
+    // DispatchState.emit_buffer, fired fire-and-forget at sse-server
+    // after raft commits the writeset.
     var pending_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
     defer {
         for (pending_emits.items) |*e| e.deinit(allocator);
@@ -367,8 +376,8 @@ fn runOneCallback(
         .prng_seed = @bitCast(received_ns),
         .request_id = request_id,
         .platform = inst.platform,
-        // Callbacks are platform-driven (webhook-server fired the
-        // webhook, success/failure routes back through this dispatch);
+        // Callbacks are platform-driven (schedule-server fired the
+        // http.send, success/failure routes back through this dispatch);
         // they share the customer's email bucket via the same limiter.
         .limiter = &worker.limiter,
         .instance_id = inst.id,
@@ -438,9 +447,9 @@ fn findCallbackBytecode(
     tc: *const worker_mod.TenantFiles,
     on_result: []const u8,
 ) !?[]u8 {
-    // Forbid absolute paths / parent-escape. The webhook-server
-    // produces envelopes from what `webhook.send` accepted, but
-    // defense in depth is cheap.
+    // Forbid absolute paths / parent-escape. The http.send binding
+    // already validates `on_result.module`, but defense in depth
+    // is cheap.
     if (on_result.len == 0) return null;
     if (on_result[0] == '/') return null;
     if (std.mem.indexOf(u8, on_result, "..") != null) return null;
@@ -565,27 +574,18 @@ fn urlEncode(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-// Maps fields from either envelope flavor (legacy webhook
-// envelope-5 or new schedule envelope-9) into the camelCase event
-// the handler sees. A given receipt will only carry fields from one
-// flavor; the other flavor's fields silently skip.
-//
-// Schedule envelope-9 fields (id, ok, status, version, body) ride
-// through with the same name they have on the receipt — they're
-// already snake-case-clean.
+// Maps schedule envelope-9 receipt fields into the event the
+// handler sees. Schedule fields are already snake-case-clean, so
+// the source and destination names match. The `outcome` field
+// isn't in envelope-9 (replaced by `ok` bool) but stays in the
+// map — apply could add it back without a callback-dispatch
+// change, and dropping unknown fields is cheap.
 const FIELD_MAP = [_]struct { src: []const u8, dst: []const u8 }{
-    // Legacy webhook envelope-5 only:
-    .{ .src = "webhook_id", .dst = "webhookId" },
-    .{ .src = "attempts", .dst = "attempts" },
-    .{ .src = "response", .dst = "response" },
-    // Schedule envelope-9 only:
     .{ .src = "id", .dst = "id" },
     .{ .src = "ok", .dst = "ok" },
     .{ .src = "status", .dst = "status" },
     .{ .src = "version", .dst = "version" },
     .{ .src = "body", .dst = "body" },
-    // Both flavors:
-    .{ .src = "outcome", .dst = "outcome" },
     .{ .src = "context", .dst = "context" },
     .{ .src = "error", .dst = "error" },
 };
@@ -604,46 +604,15 @@ fn dropReceipt(
 
 const testing = std.testing;
 
-test "buildCallbackEvent: delivered envelope → camelCase event in body" {
-    const envelope_bytes =
-        \\{
-        \\  "webhook_id": "abc123",
-        \\  "on_result": "stripe/charge_result",
-        \\  "outcome": "delivered",
-        \\  "attempts": 2,
-        \\  "context": {"chargeId": "c_1"},
-        \\  "response": {"status": 200, "body": "ok", "truncated": false}
-        \\}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, envelope_bytes, .{});
-    defer parsed.deinit();
-
-    const body = try buildCallbackEvent(testing.allocator, parsed.value);
-    defer testing.allocator.free(body);
-
-    // The body IS the event — no `{fn, args}` wrapping. Customer's
-    // handler reads `request.body` and parses it.
-    var event = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
-    defer event.deinit();
-    const obj = event.value.object;
-    try testing.expectEqualStrings("abc123", obj.get("webhookId").?.string);
-    try testing.expectEqualStrings("delivered", obj.get("outcome").?.string);
-    try testing.expectEqual(@as(i64, 2), obj.get("attempts").?.integer);
-    try testing.expectEqualStrings("c_1", obj.get("context").?.object.get("chargeId").?.string);
-    try testing.expectEqual(@as(i64, 200), obj.get("response").?.object.get("status").?.integer);
-    try testing.expect(obj.get("on_result") == null); // stays on server side
-    // No `fn` key: parseDispatch falls through to `?fn=default`, no JS args.
-    try testing.expect(obj.get("fn") == null);
-    try testing.expect(obj.get("args") == null);
-}
-
 test "buildCallbackEvent: failed envelope → error field passthrough" {
     const envelope_bytes =
         \\{
-        \\  "webhook_id": "xyz",
+        \\  "id": "x",
         \\  "on_result": "my/handler",
-        \\  "outcome": "failed",
-        \\  "attempts": 10,
+        \\  "ok": false,
+        \\  "status": 0,
+        \\  "version": 1,
+        \\  "body": "",
         \\  "context": null,
         \\  "error": "Timeout"
         \\}
@@ -657,12 +626,13 @@ test "buildCallbackEvent: failed envelope → error field passthrough" {
     var event = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer event.deinit();
     const obj = event.value.object;
-    try testing.expectEqualStrings("failed", obj.get("outcome").?.string);
+    try testing.expect(!obj.get("ok").?.bool);
     try testing.expectEqualStrings("Timeout", obj.get("error").?.string);
-    try testing.expect(obj.get("response") == null);
     // Null `context` from the envelope is dropped so the handler sees
     // `event.context === undefined`, not `null`.
     try testing.expect(obj.get("context") == null);
+    // on_result is server-side; never leaked into the event.
+    try testing.expect(obj.get("on_result") == null);
 }
 
 test "buildCallbackEvent: schedule envelope-9 → camelCase event with id/ok/status/version/body" {

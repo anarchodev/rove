@@ -1,5 +1,17 @@
 # Webhook-server plan — consolidated, raft-backed delivery subsystem
 
+> **2026-05-09: SUPERSEDED.** This plan describes a webhook-shaped
+> subsystem (envelope-4/5/6, `webhooks.db`, dedicated webhook-server
+> thread) that no longer exists. Webhook delivery was generalized to
+> `http.send` — see `docs/http-send-plan.md`. The implementation
+> here was deleted in commit `cf375bf` (rove-webhook-server module
+> retirement). Customer-facing `webhook.send` is now a JS polyfill
+> on top of `http.send` (`src/js/bindings/webhook.js`); retries are
+> a customer-side library (`src/js/bindings/retry.js`); the
+> envelope wire shapes + storage live in `src/schedule_server/`.
+>
+> Kept around for historical context. Don't add to it.
+
 This document expands `docs/PLAN.md` §2.6 (Webhooks) and Phase 5.5
 item 4 (Centralized webhook subsystem) into an implementable plan.
 

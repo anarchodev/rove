@@ -476,14 +476,14 @@ fn workerMain(args: *WorkerCtx) !void {
         try reg.flush();
         try rjs.applyPendingReleases(worker);
 
-        // Webhook callback dispatch: on the raft leader, worker 0
+        // Schedule callback dispatch: on the raft leader, worker 0
         // scans every tenant's `_callback/*` rows left by the
-        // webhook-server's envelope-5 apply and invokes the customer's
-        // `onResult` handler in its own transaction. Gated to worker 0
-        // so two threads on
-        // the same node don't race on the same receipt — the inner
-        // SQLite txn would serialize them anyway via SQLITE_BUSY,
-        // but pinning avoids the wasted turnaround.
+        // schedule-server's envelope-9 apply and invokes the
+        // customer's `on_result` handler in its own transaction.
+        // Gated to worker 0 so two threads on the same node don't
+        // race on the same receipt — the inner SQLite txn would
+        // serialize them anyway via SQLITE_BUSY, but pinning avoids
+        // the wasted turnaround.
         if (args.worker_idx == 0) {
             _ = rjs.dispatchCallbacks(worker, rjs.CALLBACK_DEFAULT_MAX_PER_TENANT) catch |err| {
                 std.log.warn("worker {d}: dispatchCallbacks: {s}", .{ args.worker_idx, @errorName(err) });
@@ -1078,7 +1078,7 @@ pub fn main() !void {
     //
     // After Tasks #61 + #62, files-server and log-server run as
     // separate operator-deployed processes; loop46 only carries the
-    // worker, raft, and webhook-server threads. The two URL fields
+    // worker, raft, and schedule-server threads. The two URL fields
     // below are what `/_system/services-token` returns to the
     // dashboard so it knows where to fetch + log queries land.
 

@@ -376,7 +376,7 @@ fn readHandleOrId(ctx: ?*c.JSContext, a: std.mem.Allocator, opts: c.JSValue) ![]
     return a.dupe(u8, bytes);
 }
 
-// ── Generic helpers (mirror src/js/bindings/webhook.zig) ───────────────
+// ── Generic JS-property extraction helpers ─────────────────────────────
 
 fn dupeJsString(
     ctx: ?*c.JSContext,

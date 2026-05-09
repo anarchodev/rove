@@ -24,7 +24,7 @@ const schedule_server = @import("rove-schedule-server");
 const limiter_mod = @import("limiter.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
 const crypto_b = @import("bindings/crypto.zig");
-const webhook_b = @import("bindings/webhook.zig");
+const email_rate_b = @import("bindings/email_rate.zig");
 const events_b = @import("bindings/events.zig");
 const http_b = @import("bindings/http.zig");
 const td = @import("trigger_dispatch.zig");
@@ -1062,7 +1062,7 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // email.send JS wrapper before queuing the webhook row. Throws
     // Error{code:"rate_limited"} on exhaustion; no-op (returns
     // undefined) when state.limiter is null (test paths).
-    .{ .name = "__rove_check_email_rate", .cfunc = webhook_b.jsCheckEmailRate, .argc = 0 },
+    .{ .name = "__rove_check_email_rate", .cfunc = email_rate_b.jsCheckEmailRate, .argc = 0 },
 };
 
 const RETRY_JS = @embedFile("retry_js");

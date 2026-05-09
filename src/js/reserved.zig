@@ -25,8 +25,9 @@ const std = @import("std");
 /// the platform writers that own each namespace:
 ///   `_audit/`           → reserved for future audit log
 ///   `_deploy/`          → reserved for future deploy metadata in app.db
-///   `_callback/`        → webhook envelope-5 apply writes here;
-///                         dispatchCallbacks reads + invokes onResult
+///   `_callback/`        → schedule-complete envelope-9 apply writes
+///                         here; dispatchCallbacks reads + invokes
+///                         on_result
 ///   `_log/`             → per-tenant log metadata in app.db. Today
 ///                         only `_log/next_request_seq` lives here
 ///                         (Phase 5.5 a, A4 — moved off log.db so

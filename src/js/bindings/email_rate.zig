@@ -1,16 +1,13 @@
-//! Hidden builtin `__rove_check_email_rate` called from the email.send
-//! JS wrapper before queuing the row. Lives next to (the legacy)
-//! webhook bindings for historical reasons; this is the only piece
-//! that's still active.
+//! Hidden builtin `__rove_check_email_rate` called from the
+//! email.send JS wrapper (`bindings/email.js`) before queuing the
+//! schedule row. Throws an `rate_limited` JS error when the
+//! per-instance email bucket is exhausted; customer can catch in
+//! their handler.
 //!
-//! The `webhook.send` C binding retired when http.send took over the
-//! outbound surface — the customer-facing `webhook.send` is now a JS
-//! polyfill on top of `http.send` (`bindings/webhook.js`). This file
-//! could be renamed to `email_rate_limit.zig` once we settle on
-//! whether email rate limiting belongs alongside its only caller
-//! (email.js) or as a standalone module. For now: stays here so the
-//! globals.zig namespace registration (`__rove_check_email_rate`)
-//! doesn't churn.
+//! Originally lived in `bindings/webhook.zig` alongside the
+//! `webhook.send` C binding; that binding retired (replaced by the
+//! `bindings/webhook.js` polyfill on http.send), and this hidden
+//! builtin came along to its current name.
 
 const std = @import("std");
 const qjs = @import("rove-qjs");
