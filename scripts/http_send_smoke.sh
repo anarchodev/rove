@@ -62,6 +62,15 @@ if ! command -v python3 >/dev/null; then
     exit 2
 fi
 
+# Per-run S3 prefix. The default helper prefix is hashed off the
+# files-server binary; customer-source changes (the wb tenant's
+# index.mjs) don't bump that hash, so a re-run with the default
+# prefix would reuse stale bytecode via bootstrapTenant's skip-on-
+# existing-manifest fast path. Date-stamping forces a fresh
+# deployment on every run. Old prefixes accumulate in S3 but stay
+# tiny.
+export S3_KEY_PREFIX_BASE="${S3_KEY_PREFIX_BASE:-smoke-http-send-$(date +%s)/}"
+
 . "$(dirname "$0")/_smoke_helpers.sh"
 SMOKE_TAG=http-send-smoke
 SMOKE_PROTO=https
