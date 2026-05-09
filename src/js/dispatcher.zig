@@ -19,6 +19,7 @@ const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
 const webhook_server = @import("rove-webhook-server");
+const schedule_server = @import("rove-schedule-server");
 
 const globals = @import("globals.zig");
 const limiter_mod = @import("limiter.zig");
@@ -188,6 +189,12 @@ pub const Request = struct {
     /// after raft commits the writeset. Optional for the same reason
     /// `pending_webhooks` is — dispatcher-test paths can leave it null.
     emit_buffer: ?*std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = null,
+    /// docs/http-send-plan.md. `http.send` appends a `ScheduleRow`;
+    /// `http.cancel` appends a `CancelTarget`. Both ride alongside
+    /// the writeset envelope at batch commit. Same null-on-test-paths
+    /// posture as the others.
+    pending_schedules: ?*std.ArrayListUnmanaged(schedule_server.ScheduleRow) = null,
+    pending_cancels: ?*std.ArrayListUnmanaged(schedule_server.CancelTarget) = null,
 };
 
 /// One `(name, value)` pair extracted from the handler's
@@ -353,6 +360,8 @@ pub const Dispatcher = struct {
             .deploy_starter_ctx = request.deploy_starter_ctx,
             .pending_webhooks = request.pending_webhooks,
             .emit_buffer = request.emit_buffer,
+            .pending_schedules = request.pending_schedules,
+            .pending_cancels = request.pending_cancels,
         };
 
         // Reset the per-request arena (one cursor write) and reseed
@@ -1581,6 +1590,16 @@ fn runOne(
         for (local_emits.items) |*e| e.deinit(testing.allocator);
         local_emits.deinit(testing.allocator);
     }
+    var local_schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
+    defer {
+        for (local_schedules.items) |*r| r.deinit(testing.allocator);
+        local_schedules.deinit(testing.allocator);
+    }
+    var local_cancels: std.ArrayListUnmanaged(schedule_server.CancelTarget) = .empty;
+    defer {
+        for (local_cancels.items) |*t| t.deinit(testing.allocator);
+        local_cancels.deinit(testing.allocator);
+    }
 
     // If the caller didn't set a query, force `fn=go` so the
     // dispatcher finds our wrapper export.
@@ -1588,6 +1607,8 @@ fn runOne(
     if (request.query == null) request.query = "fn=go";
     if (request.pending_webhooks == null) request.pending_webhooks = &local_webhooks;
     if (request.emit_buffer == null) request.emit_buffer = &local_emits;
+    if (request.pending_schedules == null) request.pending_schedules = &local_schedules;
+    if (request.pending_cancels == null) request.pending_cancels = &local_cancels;
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
     const resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, request, &budget);
@@ -1852,6 +1873,141 @@ test "dispatch: events.emit rejects malformed sid in to:" {
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqualStrings("events_bad_sid", resp.body);
+}
+
+test "dispatch: http.send appends ScheduleRow with derived id" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
+    defer {
+        for (schedules.items) |*r| r.deinit(testing.allocator);
+        schedules.deinit(testing.allocator);
+    }
+
+    var resp = try runOne(&d, kv,
+        \\const id = http.send({ url: "https://api.stripe.com/v1/charges", body: "x" });
+        \\return id;
+    , .{
+        .method = "POST",
+        .path = "/",
+        .request_id = 7,
+        .pending_schedules = &schedules,
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), schedules.items.len);
+    const r = &schedules.items[0];
+    try testing.expectEqualStrings(r.id, resp.body); // returned id matches the row id
+    try testing.expectEqual(@as(usize, 64), r.id.len);
+    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", r.url);
+    try testing.expectEqualStrings("POST", r.method);
+    try testing.expectEqualStrings("x", r.body);
+    try testing.expectEqual(@as(i64, 0), r.fire_at_ns);
+}
+
+test "dispatch: http.send with handle uses handle as id + same handle overwrites the row" {
+    // Note: the dispatcher just appends to the per-batch list. The
+    // "same handle overwrites" semantics live in apply.zig (UPSERT
+    // bumps version). Here we verify the binding accepts a handle
+    // and threads it through unchanged.
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
+    defer {
+        for (schedules.items) |*r| r.deinit(testing.allocator);
+        schedules.deinit(testing.allocator);
+    }
+
+    var resp = try runOne(&d, kv,
+        \\http.send({ handle: "reminder-foo", url: "https://x/" });
+        \\http.send({ handle: "reminder-foo", url: "https://x/", fire_at_ns: 1234 });
+        \\return "ok";
+    , .{
+        .method = "POST",
+        .path = "/",
+        .request_id = 1,
+        .pending_schedules = &schedules,
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), schedules.items.len);
+    try testing.expectEqualStrings("reminder-foo", schedules.items[0].id);
+    try testing.expectEqualStrings("reminder-foo", schedules.items[1].id);
+    try testing.expectEqual(@as(i64, 1234), schedules.items[1].fire_at_ns);
+}
+
+test "dispatch: http.cancel appends a CancelTarget" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var cancels: std.ArrayListUnmanaged(schedule_server.CancelTarget) = .empty;
+    defer {
+        for (cancels.items) |*t| t.deinit(testing.allocator);
+        cancels.deinit(testing.allocator);
+    }
+
+    var resp = try runOne(&d, kv,
+        \\http.cancel({ handle: "reminder-foo" });
+        \\return "ok";
+    , .{
+        .method = "POST",
+        .path = "/",
+        .request_id = 1,
+        .instance_id = "acme",
+        .pending_cancels = &cancels,
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), cancels.items.len);
+    try testing.expectEqualStrings("acme", cancels.items[0].tenant_id);
+    try testing.expectEqualStrings("reminder-foo", cancels.items[0].id);
+}
+
+test "dispatch: http.send rejects empty handle" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\try {
+        \\  http.send({ handle: "", url: "https://x/" });
+        \\  return "no_throw";
+        \\} catch (e) {
+        \\  return e.name + ":" + e.message.split(":")[0];
+        \\}
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("RangeError:http.send", resp.body);
 }
 
 test "dispatch: request.session.id surfaces resolved sid" {

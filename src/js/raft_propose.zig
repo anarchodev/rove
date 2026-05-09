@@ -20,6 +20,7 @@
 const std = @import("std");
 const kv_mod = @import("rove-kv");
 const webhook_server = @import("rove-webhook-server");
+const schedule_server = @import("rove-schedule-server");
 const apply_mod = @import("apply.zig");
 
 fn proposeEncoded(
@@ -105,44 +106,69 @@ pub fn proposeBatchAndWebhooks(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
     webhooks: []const webhook_server.WebhookRow,
+    schedules: []const schedule_server.ScheduleRow,
+    cancels: []const schedule_server.CancelTarget,
     anchor_id: []const u8,
 ) !u64 {
     const allocator = worker.allocator;
     const has_writes = writeset.ops.items.len > 0;
     const has_webhooks = webhooks.len > 0;
-    if (!has_writes and !has_webhooks) return 0;
+    const has_schedules = schedules.len > 0;
+    const has_cancels = cancels.len > 0;
+    const total: usize = @as(usize, @intFromBool(has_writes)) +
+        @as(usize, @intFromBool(has_webhooks)) +
+        @as(usize, @intFromBool(has_schedules)) +
+        @as(usize, @intFromBool(has_cancels));
+    if (total == 0) return 0;
 
-    if (has_writes and has_webhooks) {
-        const ws_bytes = try writeset.encode(allocator);
-        defer allocator.free(ws_bytes);
-        const ws_env = try apply_mod.encodeWriteSetEnvelope(allocator, anchor_id, ws_bytes);
-        defer allocator.free(ws_env);
+    // Build each present envelope; collect into an inner-list. If
+    // exactly one is present, propose it bare; otherwise wrap in
+    // multi. The bare-single path matters for the common case (just
+    // a writeset) — saves the multi-envelope overhead.
+    var inner_envs: [4][]u8 = undefined;
+    var inner_count: usize = 0;
+    defer for (inner_envs[0..inner_count]) |env| allocator.free(env);
 
-        const wh_payload = try webhook_server.encodeEnqueueBatch(allocator, webhooks);
-        defer allocator.free(wh_payload);
-        const wh_env = try apply_mod.encodeWebhookEnqueueBatchEnvelope(allocator, wh_payload);
-        defer allocator.free(wh_env);
-
-        const inner: [2][]const u8 = .{ ws_env, wh_env };
-        const multi = try apply_mod.encodeMultiEnvelope(allocator, &inner);
-        defer allocator.free(multi);
-
-        const seq = worker.raft.highWatermark() + 1;
-        try worker.raft.propose(seq, multi);
-        return seq;
-    }
+    var ws_payload_bytes: ?[]u8 = null;
+    defer if (ws_payload_bytes) |b| allocator.free(b);
 
     if (has_writes) {
-        return proposeWriteSet(worker, writeset, anchor_id);
+        ws_payload_bytes = try writeset.encode(allocator);
+        const env = try apply_mod.encodeWriteSetEnvelope(allocator, anchor_id, ws_payload_bytes.?);
+        inner_envs[inner_count] = env;
+        inner_count += 1;
+    }
+    if (has_webhooks) {
+        const payload = try webhook_server.encodeEnqueueBatch(allocator, webhooks);
+        defer allocator.free(payload);
+        const env = try apply_mod.encodeWebhookEnqueueBatchEnvelope(allocator, payload);
+        inner_envs[inner_count] = env;
+        inner_count += 1;
+    }
+    if (has_schedules) {
+        const payload = try schedule_server.encodeUpsertBatch(allocator, schedules);
+        defer allocator.free(payload);
+        const env = try apply_mod.encodeScheduleUpsertEnvelope(allocator, payload);
+        inner_envs[inner_count] = env;
+        inner_count += 1;
+    }
+    if (has_cancels) {
+        const payload = try schedule_server.encodeCancelBatch(allocator, cancels);
+        defer allocator.free(payload);
+        const env = try apply_mod.encodeScheduleCancelEnvelope(allocator, payload);
+        inner_envs[inner_count] = env;
+        inner_count += 1;
     }
 
-    // Webhooks only.
-    const wh_payload = try webhook_server.encodeEnqueueBatch(allocator, webhooks);
-    defer allocator.free(wh_payload);
-    const wh_env = try apply_mod.encodeWebhookEnqueueBatchEnvelope(allocator, wh_payload);
-    defer allocator.free(wh_env);
-
     const seq = worker.raft.highWatermark() + 1;
-    try worker.raft.propose(seq, wh_env);
+    if (inner_count == 1) {
+        try worker.raft.propose(seq, inner_envs[0]);
+        return seq;
+    }
+    var inner_const: [4][]const u8 = undefined;
+    for (inner_envs[0..inner_count], 0..) |env, i| inner_const[i] = env;
+    const multi = try apply_mod.encodeMultiEnvelope(allocator, inner_const[0..inner_count]);
+    defer allocator.free(multi);
+    try worker.raft.propose(seq, multi);
     return seq;
 }

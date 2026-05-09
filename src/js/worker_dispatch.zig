@@ -21,6 +21,7 @@ const log_mod = @import("rove-log");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
 const webhook_server_mod = @import("rove-webhook-server");
+const schedule_server_mod = @import("rove-schedule-server");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const router_mod = @import("router.zig");
@@ -83,6 +84,8 @@ fn finalizeBatch(
     writeset: *const kv_mod.WriteSet,
     pending_webhooks: *const std.ArrayListUnmanaged(webhook_server_mod.WebhookRow),
     pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
+    pending_schedules: *const std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow),
+    pending_cancels: *const std.ArrayListUnmanaged(schedule_server_mod.CancelTarget),
     successes: *std.ArrayList(SuccessRec),
 ) !usize {
     const server = worker.h2;
@@ -92,6 +95,9 @@ fn finalizeBatch(
     const batch_seq = txn.txn_seq;
     const has_writes = writeset.ops.items.len > 0;
     const has_webhooks = pending_webhooks.items.len > 0;
+    const has_schedules = pending_schedules.items.len > 0;
+    const has_cancels = pending_cancels.items.len > 0;
+    const has_cmds = has_webhooks or has_schedules or has_cancels;
     var processed: usize = 0;
 
     // Commit-fail downgrade path: SQLite has already rolled back, so
@@ -103,7 +109,7 @@ fn finalizeBatch(
         .{ anchor_id, @errorName(err) },
     );
 
-    if (!has_writes and !has_webhooks) {
+    if (!has_writes and !has_cmds) {
         // Pure read-only batch: no raft hop.
         for (successes.items) |*s| {
             server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err| panic_mod.invariantViolated(
@@ -127,14 +133,21 @@ fn finalizeBatch(
         return processed;
     }
 
-    // Writes and/or webhooks present: propose ONE raft entry. The
-    // shape is multi-envelope (env 0 + env 4) when both, or a single
-    // envelope when only one side has content. See
-    // `raft_propose.proposeBatchAndWebhooks` for the wire decision.
-    // On failure: compensating-rollback via undoTxn + downgrade every
-    // success. The webhook accumulator is freed by the caller's
-    // `defer` regardless of which branch we take here.
-    const seq = raft_propose.proposeBatchAndWebhooks(worker, writeset, pending_webhooks.items, anchor_id) catch |err| {
+    // Writes and/or commands (webhooks / schedules / cancels)
+    // present: propose ONE raft entry. The shape is a multi-envelope
+    // when more than one bucket has content, otherwise a bare
+    // envelope. See `raft_propose.proposeBatchAndWebhooks` for the
+    // wire decision. On failure: compensating-rollback via undoTxn +
+    // downgrade every success. The accumulators are freed by the
+    // caller's `defer` regardless of which branch we take here.
+    const seq = raft_propose.proposeBatchAndWebhooks(
+        worker,
+        writeset,
+        pending_webhooks.items,
+        pending_schedules.items,
+        pending_cancels.items,
+        anchor_id,
+    ) catch |err| {
         std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
         store.undoTxn(batch_seq) catch |undo_err| panic_mod.invariantViolated(
             "finalizeBatch.undoTxn(after_propose_fail)",
@@ -850,6 +863,19 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         pending_webhooks.deinit(allocator);
     }
 
+    // Per-batch http.send / http.cancel accumulators (docs/http-
+    // send-plan.md). Same shape + lifecycle as `pending_webhooks`.
+    var pending_schedules: std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow) = .empty;
+    defer {
+        for (pending_schedules.items) |*r| r.deinit(allocator);
+        pending_schedules.deinit(allocator);
+    }
+    var pending_cancels: std.ArrayListUnmanaged(schedule_server_mod.CancelTarget) = .empty;
+    defer {
+        for (pending_cancels.items) |*t| t.deinit(allocator);
+        pending_cancels.deinit(allocator);
+    }
+
     // Per-batch SSE emit accumulator (sse-plan §3.2). `events.emit`
     // appends here; `finalizeBatch` fires the merged batch at
     // sse-server fire-and-forget after raft propose succeeds. The
@@ -1183,6 +1209,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 null,
             .pending_webhooks = &pending_webhooks,
             .emit_buffer = &pending_emits,
+            .pending_schedules = &pending_schedules,
+            .pending_cancels = &pending_cancels,
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(
@@ -1374,6 +1402,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // End of walk. If no anchor was opened we're done — all processing
     // was short-circuit (failed) paths.
     if (anchor == null) return processed;
-    processed += try finalizeBatch(worker, anchor.?, &txn.?, &writeset, &pending_webhooks, &pending_emits, &successes);
+    processed += try finalizeBatch(
+        worker,
+        anchor.?,
+        &txn.?,
+        &writeset,
+        &pending_webhooks,
+        &pending_emits,
+        &pending_schedules,
+        &pending_cancels,
+        &successes,
+    );
     return processed;
 }

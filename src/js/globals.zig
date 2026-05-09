@@ -21,11 +21,13 @@ const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
 const webhook_server = @import("rove-webhook-server");
+const schedule_server = @import("rove-schedule-server");
 const limiter_mod = @import("limiter.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const webhook_b = @import("bindings/webhook.zig");
 const events_b = @import("bindings/events.zig");
+const http_b = @import("bindings/http.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
 
@@ -105,6 +107,11 @@ pub const DispatchState = struct {
     /// invocation. Resets per request. Part of the webhook id derivation
     /// so replays produce the same ids.
     webhook_call_index: u32 = 0,
+    /// 0-based counter of `http.send` calls within this handler
+    /// invocation. Resets per request. Combined with `request_id`
+    /// to derive the platform-default schedule id (sha256(req_id ||
+    /// call_index)) when the customer didn't supply a `handle`.
+    http_call_index: u32 = 0,
     /// 0-based counter of `events.emit` calls within this handler
     /// invocation. Resets per request. Combined with `request_id`
     /// to derive the SSE wire id (`{request_id:020d}-{call_index:06d}`)
@@ -163,6 +170,18 @@ pub const DispatchState = struct {
     /// (which don't allocate the list) can leave it null and skip
     /// the new path; production worker code always sets it non-null.
     pending_webhooks: ?*std.ArrayListUnmanaged(webhook_server.WebhookRow) = null,
+    /// Per-batch http.send accumulator (docs/http-send-plan.md §1).
+    /// `http.send` appends a `ScheduleRow` here; `worker_dispatch.
+    /// finalizeBatch` proposes envelope-8 (schedule_upsert) alongside
+    /// envelope-0 (writeset) in a multi-envelope after raft commits.
+    /// Same lifecycle as `pending_webhooks` — owned by
+    /// `dispatchOnce`, freed by its `defer` regardless of which exit
+    /// path the batch takes.
+    pending_schedules: ?*std.ArrayListUnmanaged(schedule_server.ScheduleRow) = null,
+    /// Per-batch http.cancel accumulator. `http.cancel` appends a
+    /// `CancelTarget`; `finalizeBatch` proposes envelope-10 alongside
+    /// the writeset.
+    pending_cancels: ?*std.ArrayListUnmanaged(schedule_server.CancelTarget) = null,
     /// Per-batch SSE emit accumulator (sse-plan §3.2). `events.emit`
     /// appends an entry here as it runs; `worker_dispatch.finalizeBatch`
     /// hands the merged list to `sse_dispatch.fireBatch` after raft
@@ -1006,6 +1025,16 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // and does the actual HTTP call.
     .{ .path = &.{"webhook"}, .fns = &.{
         .{ .name = "send", .cfunc = webhook_b.jsWebhookSend, .argc = 1 },
+    } },
+    // http.send / http.cancel — the new generic outbound HTTP
+    // primitive (docs/http-send-plan.md). Same lifecycle as
+    // webhook.send: send appends a ScheduleRow to the dispatcher's
+    // per-batch list and returns an id; the leader-pinned scheduler
+    // thread (next slice) reads schedules.db and fires libcurl.
+    // cancel appends a CancelTarget to drop a pending row.
+    .{ .path = &.{"http"}, .fns = &.{
+        .{ .name = "send",   .cfunc = http_b.jsHttpSend,   .argc = 1 },
+        .{ .name = "cancel", .cfunc = http_b.jsHttpCancel, .argc = 1 },
     } },
     // events.emit. Writes _events/{sid}/{seq} rows in the handler tx;
     // the SSE pump (worker.zig) drives connected EventSource clients

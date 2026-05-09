@@ -53,10 +53,13 @@ const std = @import("std");
 const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
+const schedule_server_mod = @import("rove-schedule-server");
+const webhook_server_mod = @import("rove-webhook-server");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const worker_mod = @import("worker.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
+const raft_propose = @import("raft_propose.zig");
 
 const Request = dispatcher_mod.Request;
 const Budget = dispatcher_mod.Budget;
@@ -138,10 +141,24 @@ fn drainTenantCallbacks(
         pending_emits.deinit(allocator);
     }
 
+    // http.send / http.cancel from inside an on_result callback —
+    // sagas, retries, chained workflows. Same lifecycle as the
+    // worker_dispatch accumulators.
+    var pending_schedules: std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow) = .empty;
+    defer {
+        for (pending_schedules.items) |*r| r.deinit(allocator);
+        pending_schedules.deinit(allocator);
+    }
+    var pending_cancels: std.ArrayListUnmanaged(schedule_server_mod.CancelTarget) = .empty;
+    defer {
+        for (pending_cancels.items) |*t| t.deinit(allocator);
+        pending_cancels.deinit(allocator);
+    }
+
     var visited: usize = 0;
     for (scan.entries) |row| {
         visited += 1;
-        _ = runOneCallback(worker, tc, inst, &txn, &writeset, &pending_emits, row.key, row.value) catch |err| {
+        _ = runOneCallback(worker, tc, inst, &txn, &writeset, &pending_emits, &pending_schedules, &pending_cancels, row.key, row.value) catch |err| {
             std.log.warn(
                 "rove-js callbacks: {s}/{s}: {s} (kept for retry)",
                 .{ inst.id, row.key, @errorName(err) },
@@ -154,9 +171,13 @@ fn drainTenantCallbacks(
 
     const batch_seq = txn.txn_seq;
     const has_writes = writeset.ops.items.len > 0;
-    if (!has_writes) {
-        // Every callback failed or was a no-op. Release the txn
-        // without proposing anything.
+    const has_schedules = pending_schedules.items.len > 0;
+    const has_cancels = pending_cancels.items.len > 0;
+    const needs_propose = has_writes or has_schedules or has_cancels;
+    if (!needs_propose) {
+        // Every callback failed or was a no-op (no writes, no
+        // http.send / http.cancel queued). Release the txn without
+        // proposing.
         txn.rollback() catch {};
         committed = true;
         // Read-only batch: emits (if any) fire immediately — no raft
@@ -168,7 +189,18 @@ fn drainTenantCallbacks(
     try txn.commit();
     committed = true;
 
-    _ = worker_mod.proposeWriteSet(worker, &writeset, inst.id) catch |err| {
+    // Empty webhooks slice — callbacks don't fire webhook.send (it's
+    // a future-tightening; today the customer routes through
+    // http.send directly). The proposeBatchAndWebhooks shape handles
+    // any subset of writes + schedules + cancels in one envelope.
+    _ = raft_propose.proposeBatchAndWebhooks(
+        worker,
+        &writeset,
+        &.{},
+        pending_schedules.items,
+        pending_cancels.items,
+        inst.id,
+    ) catch |err| {
         // Local writes already committed; compensating rollback
         // via the undo log mirrors the HTTP dispatch fault path.
         inst.kv.undoTxn(batch_seq) catch |undo_err| {
@@ -235,6 +267,8 @@ fn runOneCallback(
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *kv_mod.WriteSet,
     pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
+    pending_schedules: *std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow),
+    pending_cancels: *std.ArrayListUnmanaged(schedule_server_mod.CancelTarget),
     receipt_key: []const u8,
     envelope_bytes: []const u8,
 ) !CallbackOutcome {
@@ -334,6 +368,8 @@ fn runOneCallback(
         .limiter = &worker.limiter,
         .instance_id = inst.id,
         .emit_buffer = pending_emits,
+        .pending_schedules = pending_schedules,
+        .pending_cancels = pending_cancels,
     };
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
