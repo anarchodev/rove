@@ -20,7 +20,6 @@ const kv_mod = @import("rove-kv");
 const log_mod = @import("rove-log");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
-const webhook_server_mod = @import("rove-webhook-server");
 const schedule_server_mod = @import("rove-schedule-server");
 
 const dispatcher_mod = @import("dispatcher.zig");
@@ -82,7 +81,6 @@ fn finalizeBatch(
     anchor: *const tenant_mod.Instance,
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *const kv_mod.WriteSet,
-    pending_webhooks: *const std.ArrayListUnmanaged(webhook_server_mod.WebhookRow),
     pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
     pending_schedules: *const std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow),
     pending_cancels: *const std.ArrayListUnmanaged(schedule_server_mod.CancelTarget),
@@ -94,10 +92,9 @@ fn finalizeBatch(
     const store = anchor.kv;
     const batch_seq = txn.txn_seq;
     const has_writes = writeset.ops.items.len > 0;
-    const has_webhooks = pending_webhooks.items.len > 0;
     const has_schedules = pending_schedules.items.len > 0;
     const has_cancels = pending_cancels.items.len > 0;
-    const has_cmds = has_webhooks or has_schedules or has_cancels;
+    const has_cmds = has_schedules or has_cancels;
     var processed: usize = 0;
 
     // Commit-fail downgrade path: SQLite has already rolled back, so
@@ -133,17 +130,16 @@ fn finalizeBatch(
         return processed;
     }
 
-    // Writes and/or commands (webhooks / schedules / cancels)
-    // present: propose ONE raft entry. The shape is a multi-envelope
-    // when more than one bucket has content, otherwise a bare
-    // envelope. See `raft_propose.proposeBatchAndWebhooks` for the
-    // wire decision. On failure: compensating-rollback via undoTxn +
-    // downgrade every success. The accumulators are freed by the
-    // caller's `defer` regardless of which branch we take here.
-    const seq = raft_propose.proposeBatchAndWebhooks(
+    // Writes and/or commands (schedules / cancels) present: propose
+    // ONE raft entry. The shape is a multi-envelope when more than
+    // one bucket has content, otherwise a bare envelope. See
+    // `raft_propose.proposeBatch` for the wire decision. On failure:
+    // compensating-rollback via undoTxn + downgrade every success.
+    // The accumulators are freed by the caller's `defer` regardless
+    // of which branch we take here.
+    const seq = raft_propose.proposeBatch(
         worker,
         writeset,
-        pending_webhooks.items,
         pending_schedules.items,
         pending_cancels.items,
         anchor_id,
@@ -852,19 +848,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
-    // Per-batch webhook accumulator. `webhook.send` appends a
-    // `WebhookRow` here; `finalizeBatch` proposes the merged batch as
-    // envelope 4 inside the type-7 multi-envelope alongside envelope
-    // 0 (writeset). Rows own allocator-allocated strings; the defer
-    // frees them regardless of how the batch ends.
-    var pending_webhooks: std.ArrayListUnmanaged(webhook_server_mod.WebhookRow) = .empty;
-    defer {
-        for (pending_webhooks.items) |*r| r.deinit(allocator);
-        pending_webhooks.deinit(allocator);
-    }
-
     // Per-batch http.send / http.cancel accumulators (docs/http-
-    // send-plan.md). Same shape + lifecycle as `pending_webhooks`.
+    // send-plan.md). Rows own allocator-allocated strings; the
+    // defer frees them regardless of how the batch ends.
+    // `finalizeBatch` proposes the merged batch as envelope 8 / 10
+    // inside the type-7 multi-envelope alongside envelope 0
+    // (writeset).
     var pending_schedules: std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow) = .empty;
     defer {
         for (pending_schedules.items) |*r| r.deinit(allocator);
@@ -1207,7 +1196,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 @ptrCast(worker)
             else
                 null,
-            .pending_webhooks = &pending_webhooks,
             .emit_buffer = &pending_emits,
             .pending_schedules = &pending_schedules,
             .pending_cancels = &pending_cancels,
@@ -1407,7 +1395,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         anchor.?,
         &txn.?,
         &writeset,
-        &pending_webhooks,
         &pending_emits,
         &pending_schedules,
         &pending_cancels,

@@ -46,6 +46,8 @@
 //!   the schedule row delete + caller-tenant `_callback/{id}` write.
 //! - Recursively call `http.send` / `http.cancel`. Queued schedules
 //!   ride envelope-8 / envelope-10 in the same multi-envelope.
+//!   `webhook.send` is a JS polyfill on top of `http.send`, so it
+//!   queues there too.
 //! - Call `events.emit`. Emits fire fire-and-forget at sse-server
 //!   *after* raft accepts the multi-envelope, scoped to the target
 //!   tenant — same lifecycle as h2 / callback dispatch.
@@ -61,7 +63,6 @@ const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const schedule_server = @import("rove-schedule-server");
-const webhook_server_mod = @import("rove-webhook-server");
 
 const apply_mod = @import("apply.zig");
 const dispatcher_mod = @import("dispatcher.zig");
@@ -73,7 +74,7 @@ const Request = dispatcher_mod.Request;
 const Budget = dispatcher_mod.Budget;
 
 /// Cap on rows dispatched per tick. Same posture as
-/// `webhook_server`'s `MAX_PER_PASS=64` — enough to drain a
+/// the libcurl scheduler thread's `MAX_PER_PASS=64` — enough to drain a
 /// reasonable burst, small enough that one tenant can't starve
 /// the dispatch loop for inbound h2 traffic.
 pub const DEFAULT_MAX_PER_PASS: u32 = 32;
@@ -194,7 +195,7 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
         // No handler at this path. Surface as a 404 to the caller's
         // on_result; same shape as libcurl would have produced if the
         // ingress routed to the same handler-less path.
-        return proposeResult(worker, stored, target_id, null, null, null, null, .failed, 404, "", "no handler at path");
+        return proposeResult(worker, stored, target_id, null, null, null, .failed, 404, "", "no handler at path");
     };
 
     // 4. Open a write txn against the target tenant's app.db. Mirrors
@@ -219,11 +220,6 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
     // Per-dispatch accumulator buffers — same shape h2 dispatch +
     // callback dispatch use. Target handler appends via the JS
     // bindings; we drain into the multi-envelope after commit.
-    var pending_webhooks: std.ArrayListUnmanaged(webhook_server_mod.WebhookRow) = .empty;
-    defer {
-        for (pending_webhooks.items) |*r| r.deinit(allocator);
-        pending_webhooks.deinit(allocator);
-    }
     var pending_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
     defer {
         for (pending_emits.items) |*e| e.deinit(allocator);
@@ -269,7 +265,6 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
         .platform = inst.platform,
         .limiter = &worker.limiter,
         .instance_id = inst.id,
-        .pending_webhooks = &pending_webhooks,
         .emit_buffer = &pending_emits,
         .pending_schedules = &pending_schedules,
         .pending_cancels = &pending_cancels,
@@ -297,7 +292,6 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
             null,
             null,
             null,
-            null,
             .failed,
             if (err == dispatcher_mod.DispatchError.Interrupted) 504 else 500,
             "",
@@ -317,7 +311,6 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
             null,
             null,
             null,
-            null,
             .failed,
             500,
             "",
@@ -332,7 +325,6 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
             worker,
             stored,
             target_id,
-            null,
             null,
             null,
             null,
@@ -370,7 +362,6 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
         stored,
         target_id,
         &writeset,
-        pending_webhooks.items,
         pending_schedules.items,
         pending_cancels.items,
         outcome,
@@ -441,12 +432,11 @@ fn proposeDemote(worker: anytype, stored: *const schedule_server.StoredSchedule)
 ///   - target writeset (env-0)            — non-empty target.kv writes
 ///   - target's recursive http.send       — env-8 (schedule_upsert)
 ///   - target's recursive http.cancel     — env-10 (schedule_cancel)
-///   - target's recursive webhook.send    — env-4 (webhook_enqueue)
 ///   - this dispatch's complete           — env-9 (schedule_complete)
 ///
 /// Always at least one envelope (the complete). Wraps in env-7
 /// (multi) when ≥2 are present; bare propose otherwise. Same atomicity
-/// shape `proposeBatchAndWebhooks` uses for the inbound h2 path.
+/// shape `raft_propose.proposeBatch` uses for the inbound h2 path.
 ///
 /// On the failure paths (handler threw, kv error, etc.) the caller
 /// passes null/empty for everything except the complete; the propose
@@ -456,7 +446,6 @@ fn proposeResult(
     stored: *const schedule_server.StoredSchedule,
     target_id: []const u8,
     writeset: ?*const kv_mod.WriteSet,
-    webhooks: ?[]const webhook_server_mod.WebhookRow,
     schedules: ?[]const schedule_server.ScheduleRow,
     cancels: ?[]const schedule_server.CancelTarget,
     outcome: schedule_server.Outcome,
@@ -487,7 +476,7 @@ fn proposeResult(
 
     // Collect optional envelopes. Track ownership so we free on
     // every exit, including the bare-propose fast path below.
-    var inner_envs: [5][]u8 = undefined;
+    var inner_envs: [4][]u8 = undefined;
     var inner_count: usize = 0;
     inner_envs[inner_count] = complete_env;
     inner_count += 1;
@@ -500,12 +489,6 @@ fn proposeResult(
         inner_envs[inner_count] = try apply_mod.encodeWriteSetEnvelope(allocator, target_id, ws_bytes);
         inner_count += 1;
     }
-    if (webhooks) |whs| if (whs.len > 0) {
-        const payload = try webhook_server_mod.encodeEnqueueBatch(allocator, whs);
-        defer allocator.free(payload);
-        inner_envs[inner_count] = try apply_mod.encodeWebhookEnqueueBatchEnvelope(allocator, payload);
-        inner_count += 1;
-    };
     if (schedules) |scs| if (scs.len > 0) {
         const payload = try schedule_server.encodeUpsertBatch(allocator, scs);
         defer allocator.free(payload);
@@ -524,7 +507,7 @@ fn proposeResult(
         try worker.raft.propose(seq, inner_envs[0]);
         return;
     }
-    var inner_const: [5][]const u8 = undefined;
+    var inner_const: [4][]const u8 = undefined;
     for (inner_envs[0..inner_count], 0..) |env_bytes, i| inner_const[i] = env_bytes;
     const wrapped = try apply_mod.encodeMultiEnvelope(allocator, inner_const[0..inner_count]);
     defer allocator.free(wrapped);

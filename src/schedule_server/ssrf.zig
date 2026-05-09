@@ -1,4 +1,4 @@
-//! SSRF blocklist for outbound webhook delivery.
+//! SSRF blocklist for outbound HTTP delivery (http.send / scheduler).
 //!
 //! The rule: if ANY address a hostname resolves to lives inside one
 //! of the blocked CIDRs, refuse to connect. Prevents a malicious (or

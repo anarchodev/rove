@@ -18,7 +18,6 @@ const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
-const webhook_server = @import("rove-webhook-server");
 const schedule_server = @import("rove-schedule-server");
 
 const globals = @import("globals.zig");
@@ -176,23 +175,17 @@ pub const Request = struct {
         target_id: []const u8,
     ) anyerror!void = null,
     deploy_starter_ctx: ?*anyopaque = null,
-    /// Phase 5.5 (d). `webhook.send` appends a `WebhookRow` to this
-    /// list; the dispatcher allocates it once per batch and proposes
-    /// it as envelope 4 alongside envelope 0 in a multi-envelope at
-    /// batch commit. Optional only because dispatcher-test paths can
-    /// leave it null (the test helper allocates a local list); the
-    /// production dispatcher always sets it non-null. `webhook.send`
-    /// throws if it's null.
-    pending_webhooks: ?*std.ArrayListUnmanaged(webhook_server.WebhookRow) = null,
     /// sse-plan §3.2. `events.emit` appends an `EmitEntry` here; the
     /// worker fires the merged batch fire-and-forget at sse-server
-    /// after raft commits the writeset. Optional for the same reason
-    /// `pending_webhooks` is — dispatcher-test paths can leave it null.
+    /// after raft commits the writeset. Optional only because
+    /// dispatcher-test paths can leave it null (the test helper
+    /// allocates a local list); the production dispatcher always
+    /// sets it non-null. `events.emit` throws if it's null.
     emit_buffer: ?*std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = null,
     /// docs/http-send-plan.md. `http.send` appends a `ScheduleRow`;
     /// `http.cancel` appends a `CancelTarget`. Both ride alongside
     /// the writeset envelope at batch commit. Same null-on-test-paths
-    /// posture as the others.
+    /// posture as `emit_buffer`.
     pending_schedules: ?*std.ArrayListUnmanaged(schedule_server.ScheduleRow) = null,
     pending_cancels: ?*std.ArrayListUnmanaged(schedule_server.CancelTarget) = null,
 };
@@ -358,7 +351,6 @@ pub const Dispatcher = struct {
             .instance_id = request.instance_id,
             .deploy_starter = request.deploy_starter,
             .deploy_starter_ctx = request.deploy_starter_ctx,
-            .pending_webhooks = request.pending_webhooks,
             .emit_buffer = request.emit_buffer,
             .pending_schedules = request.pending_schedules,
             .pending_cancels = request.pending_cancels,
@@ -1575,16 +1567,9 @@ fn runOne(
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
 
-    // `webhook.send` requires a non-null pending_webhooks list (Phase
-    // 5.5 d step 6 removed the legacy `_outbox/{id}` fallback). Tests
-    // that don't care still need one allocated; ones that DO care
-    // pass their own list in via `request.pending_webhooks` and the
+    // Default-allocate the per-batch accumulators. Tests that DO
+    // care pass their own list in via `request.pending_*` and the
     // local one stays unused.
-    var local_webhooks: std.ArrayListUnmanaged(webhook_server.WebhookRow) = .empty;
-    defer {
-        for (local_webhooks.items) |*r| r.deinit(testing.allocator);
-        local_webhooks.deinit(testing.allocator);
-    }
     var local_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
     defer {
         for (local_emits.items) |*e| e.deinit(testing.allocator);
@@ -1605,7 +1590,6 @@ fn runOne(
     // dispatcher finds our wrapper export.
     var request = request_in;
     if (request.query == null) request.query = "fn=go";
-    if (request.pending_webhooks == null) request.pending_webhooks = &local_webhooks;
     if (request.emit_buffer == null) request.emit_buffer = &local_emits;
     if (request.pending_schedules == null) request.pending_schedules = &local_schedules;
     if (request.pending_cancels == null) request.pending_cancels = &local_cancels;

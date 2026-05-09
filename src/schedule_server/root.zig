@@ -58,6 +58,12 @@ pub const thread = @import("thread.zig");
 /// targeting `{id}.{public_suffix}`.
 pub const internal_routing = @import("internal_routing.zig");
 
+/// SSRF blocklist for outbound HTTP. Used by `thread.zig` to refuse
+/// connections to RFC1918 / loopback / cloud-metadata addresses
+/// before handing the URL to libcurl. Originally vendored from
+/// rove-webhook-server; moved here when that module retired.
+pub const ssrf = @import("ssrf.zig");
+
 pub const Error = error{
     Truncated,
     InvalidVersion,
@@ -949,6 +955,7 @@ const testing = std.testing;
 test {
     _ = thread;
     _ = internal_routing;
+    _ = ssrf;
 }
 
 fn testRow(allocator: std.mem.Allocator, tenant: []const u8, id: []const u8, fire_at_ns: i64) !ScheduleRow {

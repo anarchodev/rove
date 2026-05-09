@@ -33,9 +33,9 @@
 //!
 //! ## What it does NOT own
 //!
-//! - SSRF rules — reuses `webhook_server.ssrf` until that module
-//!   retires (plan §11 step 4). At that point ssrf moves into this
-//!   module.
+//! - SSRF rules — `schedule_server.ssrf`. (Originally vendored in
+//!   from rove-webhook-server; moved here as part of that module's
+//!   retirement.)
 //! - Tenant-side `_callback/{id}` writes — those happen in the apply
 //!   path on every node when envelope 9 commits.
 //! - Per-tenant rate limiting (plan §13) — future slice.
@@ -47,15 +47,15 @@
 const std = @import("std");
 const kv_mod = @import("rove-kv");
 const blob_mod = @import("rove-blob");
-const webhook_server = @import("rove-webhook-server");
 
 const schedule_server = @import("root.zig");
+const ssrf = @import("ssrf.zig");
 
 const MAX_PER_PASS: u32 = 64;
 
 /// **TEST-ONLY** escape hatch that lets the scheduler talk to
 /// `http://` URLs (in addition to `https://`). Paired with
-/// `webhook_server.ssrf.test_allow_loopback` under loop46's
+/// `schedule_server.ssrf.test_allow_loopback` under loop46's
 /// `--dev-webhook-unsafe` flag so smokes can point at on-box echo
 /// servers. **Never set in production** — plaintext outbound leaks
 /// request bodies on any intermediate hop.
@@ -399,7 +399,7 @@ fn checkSsrf(allocator: std.mem.Allocator, url: []const u8) SsrfError!void {
     };
     const port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else @as(u16, 80));
 
-    _ = webhook_server.ssrf.resolveSafe(allocator, host, port) catch |err| switch (err) {
+    _ = ssrf.resolveSafe(allocator, host, port) catch |err| switch (err) {
         error.BlockedAddress => return SsrfError.BlockedAddress,
         error.EmptyHost => return SsrfError.InvalidUrl,
         error.OutOfMemory => return SsrfError.OutOfMemory,

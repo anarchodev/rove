@@ -59,7 +59,6 @@ const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
 const files_server = @import("rove-files-server");
 const log_server = @import("rove-log-server");
-const webhook_server_mod = @import("rove-webhook-server");
 const schedule_server_mod = @import("rove-schedule-server");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
@@ -858,10 +857,9 @@ pub fn main() !void {
     try std.fs.cwd().makePath(cli.data_dir);
 
     if (cli.dev_webhook_unsafe) {
-        webhook_server_mod.ssrf.test_allow_loopback = true;
-        webhook_server_mod.http_client.test_allow_plaintext = true;
+        schedule_server_mod.ssrf.test_allow_loopback = true;
         schedule_server_mod.thread.test_allow_plaintext = true;
-        std.log.warn("*** --dev-webhook-unsafe enabled: webhook.send / http.send may target loopback over http:// — DEV ONLY ***", .{});
+        std.log.warn("*** --dev-webhook-unsafe enabled: http.send may target loopback over http:// — DEV ONLY ***", .{});
     }
 
     try installSignalHandlers();
@@ -1157,38 +1155,15 @@ pub fn main() !void {
         break :blk std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
     };
 
-    // ── Webhook-server thread (Phase 5.5 d) ───────────────────────────
-    //
-    // Leader-pinned poll loop reading `{data_dir}/webhooks.db`. The
-    // dispatcher's `webhook.send` calls accumulate into a per-batch
-    // webhook list which rides atomically with the writeset via the
-    // type-7 multi-envelope; this thread reads the resulting rows
-    // and POSTs them.
-    const webhook_handle = try webhook_server_mod.thread.spawn(.{
-        .allocator = allocator,
-        .data_dir = cli.data_dir,
-        .raft = raft_node,
-    });
-    defer webhook_handle.join();
-    defer webhook_handle.signalStop();
-
-    // Apply-side wakeup. With this pointer set, envelope-4 / envelope-6
-    // apply paths fire `webhook_handle.wake.set()` right after writing
-    // rows, so the delivery loop ships within an apply tick instead of
-    // the next 250ms poll deadline. Followers also fire it — their
-    // (idle) delivery loop wakes, sees `isLeader == false`, returns to
-    // sleep. Cheap.
-    apply_ctx.webhook_wake = &webhook_handle.wake;
-
     // ── Schedule-server thread (http-send-plan §5) ────────────────────
     //
     // Leader-pinned poll loop reading `{data_dir}/schedules.db`. The
     // dispatcher's `http.send` calls accumulate into a per-batch
     // schedule list which rides atomically with the writeset via the
     // type-7 multi-envelope; this thread reads the resulting rows and
-    // fires them over libcurl. Same lifecycle / wake / shutdown shape
-    // as `webhook_handle` above; both will collapse into one when
-    // webhook.send becomes a JS polyfill on top of http.send.
+    // fires them over libcurl. Apply-side wake fires on env-8 / env-11
+    // so deliveries ship within an apply tick instead of waiting out
+    // the next-due-or-poll deadline.
     const schedule_handle = try schedule_server_mod.thread.spawn(.{
         .allocator = allocator,
         .data_dir = cli.data_dir,

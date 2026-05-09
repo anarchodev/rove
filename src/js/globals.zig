@@ -20,7 +20,6 @@ const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
-const webhook_server = @import("rove-webhook-server");
 const schedule_server = @import("rove-schedule-server");
 const limiter_mod = @import("limiter.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
@@ -100,13 +99,9 @@ pub const DispatchState = struct {
     /// present (so the normal path still uses qjs's built-in Math.random).
     prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     /// Per-request identifier, pre-minted by the worker. Combined with
-    /// `webhook_call_index` to derive a deterministic webhook id for
-    /// every `webhook.send` this handler invocation performs.
+    /// `http_call_index` to derive a deterministic schedule id for
+    /// every `http.send` this handler invocation performs.
     request_id: u64 = 0,
-    /// 0-based counter of `webhook.send` calls within this handler
-    /// invocation. Resets per request. Part of the webhook id derivation
-    /// so replays produce the same ids.
-    webhook_call_index: u32 = 0,
     /// 0-based counter of `http.send` calls within this handler
     /// invocation. Resets per request. Combined with `request_id`
     /// to derive the platform-default schedule id (sha256(req_id ||
@@ -160,23 +155,15 @@ pub const DispatchState = struct {
     /// (the snapshot/restore wipes the runtime). Owned values must
     /// be `JS_FreeValue`'d on `deinit`.
     trigger_module_ns: std.StringHashMapUnmanaged(c.JSValue) = .empty,
-    /// Phase 5.5 (d) — per-batch webhook accumulator. `webhook.send`
-    /// appends a `WebhookRow` here; `worker_dispatch.finalizeBatch`
-    /// proposes the merged batch as envelope 4 inside the type-7
-    /// multi-envelope alongside envelope 0 (writeset). Owned by
-    /// `worker_dispatch.dispatchOnce`; rows' `[]const u8` fields are
-    /// allocator-owned strings freed on the list's `WebhookRow.deinit`.
-    /// Optional purely so the dispatcher's standalone test paths
-    /// (which don't allocate the list) can leave it null and skip
-    /// the new path; production worker code always sets it non-null.
-    pending_webhooks: ?*std.ArrayListUnmanaged(webhook_server.WebhookRow) = null,
     /// Per-batch http.send accumulator (docs/http-send-plan.md §1).
     /// `http.send` appends a `ScheduleRow` here; `worker_dispatch.
     /// finalizeBatch` proposes envelope-8 (schedule_upsert) alongside
     /// envelope-0 (writeset) in a multi-envelope after raft commits.
-    /// Same lifecycle as `pending_webhooks` — owned by
-    /// `dispatchOnce`, freed by its `defer` regardless of which exit
-    /// path the batch takes.
+    /// Owned by `dispatchOnce`, freed by its `defer` regardless of
+    /// which exit path the batch takes. Optional purely so the
+    /// dispatcher's standalone test paths (which don't allocate the
+    /// list) can leave it null; production worker code always sets
+    /// it non-null.
     pending_schedules: ?*std.ArrayListUnmanaged(schedule_server.ScheduleRow) = null,
     /// Per-batch http.cancel accumulator. `http.cancel` appends a
     /// `CancelTarget`; `finalizeBatch` proposes envelope-10 alongside
@@ -317,9 +304,9 @@ fn jsKvSet(
     defer state.allocator.free(val_str);
 
     // Reject writes into platform-reserved namespaces. Platform writers
-    // (webhook.send → pending_webhooks accumulator, events.emit →
+    // (http.send → pending_schedules accumulator, events.emit →
     // _events/, etc.) bypass jsKvSet and write through state.txn /
-    // state.writeset directly (or the per-batch webhook list), so
+    // state.writeset directly (or the per-batch schedule list), so
     // this guard only fires when customer JS tries to spoof a
     // platform key.
     if (reserved.isCustomerWriteReserved(key_str)) {

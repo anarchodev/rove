@@ -54,7 +54,6 @@ const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const schedule_server_mod = @import("rove-schedule-server");
-const webhook_server_mod = @import("rove-webhook-server");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const worker_mod = @import("worker.zig");
@@ -189,14 +188,12 @@ fn drainTenantCallbacks(
     try txn.commit();
     committed = true;
 
-    // Empty webhooks slice — callbacks don't fire webhook.send (it's
-    // a future-tightening; today the customer routes through
-    // http.send directly). The proposeBatchAndWebhooks shape handles
-    // any subset of writes + schedules + cancels in one envelope.
-    _ = raft_propose.proposeBatchAndWebhooks(
+    // proposeBatch wraps writes + schedules + cancels into one
+    // multi-envelope (or proposes bare when only one bucket has
+    // content).
+    _ = raft_propose.proposeBatch(
         worker,
         &writeset,
-        &.{},
         pending_schedules.items,
         pending_cancels.items,
         inst.id,

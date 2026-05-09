@@ -19,7 +19,6 @@
 
 const std = @import("std");
 const kv_mod = @import("rove-kv");
-const webhook_server = @import("rove-webhook-server");
 const schedule_server = @import("rove-schedule-server");
 const apply_mod = @import("apply.zig");
 
@@ -39,9 +38,6 @@ fn proposeEncoded(
     const envelope = try switch (kind) {
         .writeset => apply_mod.encodeWriteSetEnvelope(allocator, instance_id, ws_bytes),
         .root_writeset => apply_mod.encodeRootWriteSetEnvelope(allocator, ws_bytes),
-        .webhook_enqueue_batch,
-        .webhook_complete,
-        .webhook_retry_schedule,
         .multi,
         .schedule_upsert,
         .schedule_complete,
@@ -88,36 +84,31 @@ pub fn proposeRootWriteSet(
     return proposeEncoded(worker, writeset, .root_writeset, "", true);
 }
 
-/// Phase 5.5 (d), step 4. Propose the per-batch writeset + webhook
-/// batch as ONE raft entry — the unit of atomicity for the
-/// `webhook.path = direct` cutover. Three shapes:
+/// Propose the per-batch writeset + http.send/cancel batch as ONE
+/// raft entry — the unit of atomicity for the dispatcher path. Three
+/// shapes:
 ///
-///   - both non-empty → type-7 multi-envelope wrapping envelope 0
-///     (writeset, with `instance_id`) + envelope 4 (enqueue batch)
-///   - writes only → a bare type-0 writeset envelope (same as
-///     `proposeWriteSet`)
-///   - webhooks only → a bare type-4 enqueue-batch envelope
+///   - just writes → a bare type-0 writeset envelope
+///   - just one bucket of schedules / cancels → that bucket bare
+///   - 2+ buckets non-empty → type-7 multi-envelope wrapping each
 ///
-/// Empty + empty is unreachable from the caller (worker_dispatch only
-/// calls when `has_writes or has_webhooks`); we still no-op-return
-/// `seq=0` rather than panic so refactoring stays graceful.
+/// Empty everywhere is unreachable from the caller (worker_dispatch
+/// only calls when at least one bucket has content); we still no-op-
+/// return `seq=0` rather than panic so refactoring stays graceful.
 ///
 /// Returns the assigned raft seq for the caller to park on.
-pub fn proposeBatchAndWebhooks(
+pub fn proposeBatch(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
-    webhooks: []const webhook_server.WebhookRow,
     schedules: []const schedule_server.ScheduleRow,
     cancels: []const schedule_server.CancelTarget,
     anchor_id: []const u8,
 ) !u64 {
     const allocator = worker.allocator;
     const has_writes = writeset.ops.items.len > 0;
-    const has_webhooks = webhooks.len > 0;
     const has_schedules = schedules.len > 0;
     const has_cancels = cancels.len > 0;
     const total: usize = @as(usize, @intFromBool(has_writes)) +
-        @as(usize, @intFromBool(has_webhooks)) +
         @as(usize, @intFromBool(has_schedules)) +
         @as(usize, @intFromBool(has_cancels));
     if (total == 0) return 0;
@@ -126,7 +117,7 @@ pub fn proposeBatchAndWebhooks(
     // exactly one is present, propose it bare; otherwise wrap in
     // multi. The bare-single path matters for the common case (just
     // a writeset) — saves the multi-envelope overhead.
-    var inner_envs: [4][]u8 = undefined;
+    var inner_envs: [3][]u8 = undefined;
     var inner_count: usize = 0;
     defer for (inner_envs[0..inner_count]) |env| allocator.free(env);
 
@@ -136,13 +127,6 @@ pub fn proposeBatchAndWebhooks(
     if (has_writes) {
         ws_payload_bytes = try writeset.encode(allocator);
         const env = try apply_mod.encodeWriteSetEnvelope(allocator, anchor_id, ws_payload_bytes.?);
-        inner_envs[inner_count] = env;
-        inner_count += 1;
-    }
-    if (has_webhooks) {
-        const payload = try webhook_server.encodeEnqueueBatch(allocator, webhooks);
-        defer allocator.free(payload);
-        const env = try apply_mod.encodeWebhookEnqueueBatchEnvelope(allocator, payload);
         inner_envs[inner_count] = env;
         inner_count += 1;
     }
@@ -166,7 +150,7 @@ pub fn proposeBatchAndWebhooks(
         try worker.raft.propose(seq, inner_envs[0]);
         return seq;
     }
-    var inner_const: [4][]const u8 = undefined;
+    var inner_const: [3][]const u8 = undefined;
     for (inner_envs[0..inner_count], 0..) |env, i| inner_const[i] = env;
     const multi = try apply_mod.encodeMultiEnvelope(allocator, inner_const[0..inner_count]);
     defer allocator.free(multi);

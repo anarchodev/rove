@@ -234,37 +234,12 @@ pub fn build(b: *std.Build) void {
     sse_server_mod.addImport("rove-h2", h2_mod);
     sse_server_mod.addImport("rove-jwt", jwt_mod);
 
-    // ── rove-webhook-server: cluster-wide webhook subsystem (Phase 5.5 d) ──
+    // ── rove-schedule-server: outbound HTTP via http.send ────────────
     //
-    // Schema, wire format, and apply primitives for the
-    // raft-replicated `webhooks.db` (PLAN §3 Phase 5.5 (d) and
-    // `docs/webhook-server-plan.md`). The leader-pinned delivery
-    // thread + dispatcher integration land in later steps; this
-    // module ships the foundation.
-    const webhook_server_mod = b.addModule("rove-webhook-server", .{
-        .root_source_file = b.path("src/webhook_server/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    webhook_server_mod.link_libc = true;
-    webhook_server_mod.linkSystemLibrary("sqlite3", .{});
-    webhook_server_mod.linkSystemLibrary("ssl", .{});
-    webhook_server_mod.linkSystemLibrary("crypto", .{});
-    webhook_server_mod.addImport("rove-kv", kv_mod);
-    // `webhook_server/ssrf.zig` + `http_client.zig` are the outbound
-    // delivery utilities. They moved here from the deleted rove-outbox
-    // module in Phase 5.5 (d) step 6 — webhook-server is the only
-    // consumer.
-
-    // ── rove-schedule-server: generic scheduled HTTP delivery ────────
-    //
-    // The `http.send` / `http.cancel` storage + envelope layer. See
-    // `docs/http-send-plan.md`. Step 1 of the migration ships just
-    // the schema + wire format; the leader-pinned scheduler thread,
-    // the JS bindings, and the `webhook.loop46.com` default-policy
-    // tenant land in subsequent slices. Same shape as
-    // rove-webhook-server's step-1 module — kv-backed store,
-    // envelope encode/decode, no thread yet.
+    // Storage + wire format + leader-pinned scheduler thread for the
+    // platform's outbound HTTP primitive (docs/http-send-plan.md).
+    // Replaced rove-webhook-server entirely; webhook.send is now a
+    // JS polyfill on top of http.send (src/js/bindings/webhook.js).
     const schedule_server_mod = b.addModule("rove-schedule-server", .{
         .root_source_file = b.path("src/schedule_server/root.zig"),
         .target = target,
@@ -273,12 +248,9 @@ pub fn build(b: *std.Build) void {
     schedule_server_mod.link_libc = true;
     schedule_server_mod.linkSystemLibrary("sqlite3", .{});
     schedule_server_mod.addImport("rove-kv", kv_mod);
-    // The leader-pinned scheduler thread fires schedules over libcurl
-    // (rove-blob's `curl.Easy`) and reuses webhook-server's SSRF
-    // resolver until that module retires (see http-send-plan §11
-    // step 4-5). Both imports drop once the migration completes.
+    // The scheduler thread fires schedules over libcurl
+    // (rove-blob's `curl.Easy`).
     schedule_server_mod.addImport("rove-blob", blob_mod);
-    schedule_server_mod.addImport("rove-webhook-server", webhook_server_mod);
 
     // ── rove-files-server: per-instance code operations (Phase 5) ──
     //
@@ -380,10 +352,6 @@ pub fn build(b: *std.Build) void {
     const jwt_tests = b.addTest(.{ .root_module = jwt_mod });
     test_step.dependOn(&b.addRunArtifact(jwt_tests).step);
 
-    // rove-webhook-server tests
-    const webhook_server_tests = b.addTest(.{ .root_module = webhook_server_mod });
-    test_step.dependOn(&b.addRunArtifact(webhook_server_tests).step);
-
     // rove-sse-server tests
     const sse_server_tests = b.addTest(.{ .root_module = sse_server_mod });
     test_step.dependOn(&b.addRunArtifact(sse_server_tests).step);
@@ -430,7 +398,6 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-jwt", jwt_mod);
     js_mod.addImport("rove-tape", tape_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
-    js_mod.addImport("rove-webhook-server", webhook_server_mod);
     js_mod.addImport("rove-schedule-server", schedule_server_mod);
     // JS-side runtime polyfills evaluated into every dispatcher's QJS
     // context after the native CFunction bindings install. webhook.js
@@ -492,7 +459,6 @@ pub fn build(b: *std.Build) void {
     loop46_mod.addImport("rove-qjs", qjs_mod);
     loop46_mod.addImport("rove-tenant", tenant_mod);
     loop46_mod.addImport("rove-h2", h2_mod);
-    loop46_mod.addImport("rove-webhook-server", webhook_server_mod);
     loop46_mod.addImport("rove-schedule-server", schedule_server_mod);
     // The admin + replay tenant bundles + UI files used to be
     // embedded into the loop46 binary so the worker could
@@ -689,23 +655,6 @@ pub fn build(b: *std.Build) void {
         .root_module = h2_stream_mod,
     });
     b.installArtifact(h2_stream_test);
-
-    // webhook-test-enqueue: tiny helper that opens
-    // `{data_dir}/webhooks.db` directly and inserts one row, simulating
-    // the dispatcher's envelope-4 propose without going through raft.
-    // Used only by `scripts/webhook_server_smoke.sh` to exercise the
-    // delivery thread end-to-end on a single node.
-    const wte_mod = b.addModule("webhook-test-enqueue", .{
-        .root_source_file = b.path("examples/webhook_test_enqueue.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    wte_mod.addImport("rove-webhook-server", webhook_server_mod);
-    const wte_exe = b.addExecutable(.{
-        .name = "webhook-test-enqueue",
-        .root_module = wte_mod,
-    });
-    b.installArtifact(wte_exe);
 
     // s3-blob-smoke: exercise rove-blob's S3BlobStore against any
     // S3-compatible endpoint (default-tested against OVH). Pure
