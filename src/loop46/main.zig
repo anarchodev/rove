@@ -1119,6 +1119,14 @@ pub fn main() !void {
     defer webhook_handle.join();
     defer webhook_handle.signalStop();
 
+    // Apply-side wakeup. With this pointer set, envelope-4 / envelope-6
+    // apply paths fire `webhook_handle.wake.set()` right after writing
+    // rows, so the delivery loop ships within an apply tick instead of
+    // the next 250ms poll deadline. Followers also fire it — their
+    // (idle) delivery loop wakes, sees `isLeader == false`, returns to
+    // sleep. Cheap.
+    apply_ctx.webhook_wake = &webhook_handle.wake;
+
     // ── Spawn worker threads ───────────────────────────────────────────
     const http_addr = try parseHostPort(allocator, cli.http);
 

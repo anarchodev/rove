@@ -305,6 +305,14 @@ pub const ApplyCtx = struct {
     /// to identical state via raft. Applied on BOTH leader and
     /// follower (no leader-skip): the proposer doesn't pre-write.
     webhooks_store: ?*webhook_server.WebhookStore = null,
+    /// Wake signal for the leader-pinned webhook delivery thread. Set
+    /// by `loop46/main.zig` after `webhook_server.thread.spawn`. When
+    /// non-null, envelope-4 / envelope-6 apply paths fire it so the
+    /// delivery loop picks the row up on the same apply tick instead
+    /// of waiting out `poll_interval_ms`. Followers point at their
+    /// own (idle) handle's wake — harmless: an idle thread that wakes,
+    /// checks `isLeader == false`, and goes back to sleep.
+    webhook_wake: ?*std.Thread.ResetEvent = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -594,6 +602,10 @@ fn applyWebhookEnqueueBatch(ctx: *ApplyCtx, env: Envelope) void {
         "err={s}",
         .{@errorName(err)},
     );
+
+    // Wake the delivery thread so it doesn't sit out the rest of its
+    // poll interval. No-op when wake is unwired (test paths).
+    if (ctx.webhook_wake) |w| w.set();
 }
 
 /// Phase 5.5 (d). Cross-db apply: writes `_callback/{id}` into the
@@ -705,6 +717,15 @@ fn applyWebhookRetrySchedule(ctx: *ApplyCtx, env: Envelope) void {
         "err={s}",
         .{@errorName(err)},
     );
+
+    // Wake the delivery thread. Most retry schedules push
+    // `next_attempt_at_ns` out into the future (exponential backoff),
+    // so the immediate wake just lets the loop observe + return to
+    // sleep — but that scan is what advances the in-flight set, and
+    // some retries land with `next_attempt_at_ns ≈ now` (e.g. a peer
+    // races an envelope-6 apply ahead of the leader's own attempt),
+    // which we want to fire promptly.
+    if (ctx.webhook_wake) |w| w.set();
 }
 
 /// Phase 5.5 (d). Multi-envelope wrapper: unwraps inner envelopes and

@@ -15,9 +15,13 @@
 //!   - Lose leadership → next tick the gate closes, thread idles.
 //!   - Process shutdown → `signalStop` flips, loop exits cleanly.
 //! The wasted work on followers is one `isLeader` load every
-//! `poll_interval_ms` (250ms default). Apply-side wakeup
-//! (webhook-server-plan §4.2) is a future-tightening — the v1 cost is
-//! one extra wakeup per quarter-second.
+//! `poll_interval_ms` (250ms default), but the loop also wakes
+//! eagerly: `apply.applyWebhookEnqueueBatch` fires `signalWork()` on
+//! this handle after writing new rows so a fresh enqueue ships within
+//! the apply tick + delivery latency, not the next poll deadline. The
+//! poll cadence stays as a backstop for retry-schedule applies whose
+//! `next_attempt_ns` is in the future and for the leader-acquired
+//! transition where existing rows need a kick.
 //!
 //! ## What this module owns
 //!
@@ -67,10 +71,27 @@ pub const Handle = struct {
     allocator: std.mem.Allocator,
     thread: std.Thread,
     stop_flag: std.atomic.Value(bool),
+    /// Wake signal for early termination of the per-tick sleep. Apply
+    /// path fires `signalWork` after envelope-4 / envelope-6 lands so
+    /// the delivery loop picks the row up immediately instead of
+    /// waiting out the rest of `poll_interval_ms`. `signalStop` also
+    /// sets it so shutdown joins quickly.
+    wake: std.Thread.ResetEvent,
     config: Config,
 
     pub fn signalStop(self: *Handle) void {
         self.stop_flag.store(true, .release);
+        self.wake.set();
+    }
+
+    /// Apply path calls this after writing new rows to webhooks.db so
+    /// the delivery loop wakes from its `timedWait` and processes the
+    /// rows on this tick rather than the next polling deadline.
+    /// Cheap (one futex wakeup); safe to call from any thread; safe to
+    /// call when no thread is waiting (the next `timedWait` returns
+    /// immediately and resets).
+    pub fn signalWork(self: *Handle) void {
+        self.wake.set();
     }
 
     pub fn join(self: *Handle) void {
@@ -86,6 +107,7 @@ pub fn spawn(config: Config) !*Handle {
         .allocator = config.allocator,
         .thread = undefined,
         .stop_flag = .init(false),
+        .wake = .{},
         .config = config,
     };
     h.thread = try std.Thread.spawn(.{}, threadMain, .{h});
@@ -128,7 +150,12 @@ fn runLoop(h: *Handle) !void {
             // future leadership-acquired transition starts fresh.
             in_flight.clearRetainingCapacity();
         }
-        std.Thread.sleep(@as(u64, h.config.poll_interval_ms) * std.time.ns_per_ms);
+        // Wait up to `poll_interval_ms`, but return immediately when
+        // `wake.set()` fires from the apply path. `timedWait` returns
+        // `error.Timeout` on cadence expiry — both branches reset the
+        // event so the next iteration rearms.
+        h.wake.timedWait(@as(u64, h.config.poll_interval_ms) * std.time.ns_per_ms) catch {};
+        h.wake.reset();
     }
     std.log.info("webhook-server: stopped", .{});
 }
