@@ -125,6 +125,14 @@ pub const EnvelopeType = enum(u8) {
     /// schedules.db. Idempotent (missing row is a no-op). Applied
     /// on both leader and follower.
     schedule_cancel = 10,
+    /// Internal-pool → external-pool transfer (plan §3.2). The
+    /// worker phase couldn't serve an `is_internal=true` row
+    /// in-process and is asking apply to flip `is_internal=false`
+    /// so the libcurl thread can fire it. Payload is one
+    /// `schedule_server.DemoteTarget` (tenant_id, id). Idempotent:
+    /// missing row or already-external row is a no-op. Applied on
+    /// both leader and follower.
+    schedule_demote = 11,
 };
 
 /// Build a writeset envelope. `id_len` and `id` plus a leading type=0
@@ -208,6 +216,16 @@ pub fn encodeScheduleCancelEnvelope(
     payload: []const u8,
 ) ![]u8 {
     return encodeTyped(allocator, .schedule_cancel, "", payload);
+}
+
+/// Build a schedule_demote envelope (type=11). `payload` is one
+/// `schedule_server.encodeDemote` blob. instance_id is empty —
+/// the tenant scoping rides in the payload tuple.
+pub fn encodeScheduleDemoteEnvelope(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) ![]u8 {
+    return encodeTyped(allocator, .schedule_demote, "", payload);
 }
 
 /// Build a multi-envelope wrapper (type=7) carrying `inner` as already-
@@ -614,6 +632,7 @@ fn dispatch(ctx: *ApplyCtx, env: Envelope, entry_idx: u64, nesting: NestingLevel
         .schedule_upsert => applyScheduleUpsertBatch(ctx, env),
         .schedule_complete => applyScheduleComplete(ctx, env),
         .schedule_cancel => applyScheduleCancelBatch(ctx, env),
+        .schedule_demote => applyScheduleDemote(ctx, env),
     }
 }
 
@@ -1033,6 +1052,41 @@ fn applyScheduleCancelBatch(ctx: *ApplyCtx, env: Envelope) void {
     }
 }
 
+/// http.send envelope-11 apply (schedule_demote). Plan §3.2: the
+/// worker phase gave up on serving this internal-pool row in-process
+/// (target tenant not hosted on this node). Flip `is_internal=false`
+/// so the libcurl thread can fire it. Wakes the scheduler thread —
+/// the row just became eligible for `dueRows`. Idempotent on missing
+/// row + on already-external row.
+fn applyScheduleDemote(ctx: *ApplyCtx, env: Envelope) void {
+    std.debug.assert(env.instance_id.len == 0);
+
+    var target = schedule_server.decodeDemote(ctx.allocator, env.payload) catch |err|
+        panic_mod.invariantViolated(
+            "applyScheduleDemote.decode",
+            "err={s}",
+            .{@errorName(err)},
+        );
+    defer target.deinit(ctx.allocator);
+
+    const store = ctx.getSchedules() catch |err| panic_mod.invariantViolated(
+        "applyScheduleDemote.getSchedules",
+        "err={s}",
+        .{@errorName(err)},
+    );
+
+    store.applyDemote(target.tenant_id, target.id) catch |err|
+        panic_mod.invariantViolated(
+            "applyScheduleDemote.applyDemote",
+            "tenant={s} id={s} err={s}",
+            .{ target.tenant_id, target.id, @errorName(err) },
+        );
+
+    // The row just transitioned to the external pool — let the
+    // libcurl thread know without waiting out the next poll.
+    if (ctx.schedule_wake) |w| w.set();
+}
+
 fn applyMulti(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
     std.debug.assert(env.instance_id.len == 0);
     const inner = decodeMultiInner(ctx.allocator, env.payload) catch |err|
@@ -1302,6 +1356,16 @@ test "schedule_cancel envelope encode/decode round trip" {
     try testing.expectEqual(EnvelopeType.schedule_cancel, dec.type);
     try testing.expectEqualStrings("", dec.instance_id);
     try testing.expectEqualStrings("fake cancel bytes", dec.payload);
+}
+
+test "schedule_demote envelope encode/decode round trip" {
+    const a = testing.allocator;
+    const enc = try encodeScheduleDemoteEnvelope(a, "fake demote bytes");
+    defer a.free(enc);
+    const dec = try decodeEnvelope(enc);
+    try testing.expectEqual(EnvelopeType.schedule_demote, dec.type);
+    try testing.expectEqualStrings("", dec.instance_id);
+    try testing.expectEqualStrings("fake demote bytes", dec.payload);
 }
 
 test "buildScheduleCallbackJson delivered shape" {
