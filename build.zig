@@ -273,6 +273,12 @@ pub fn build(b: *std.Build) void {
     schedule_server_mod.link_libc = true;
     schedule_server_mod.linkSystemLibrary("sqlite3", .{});
     schedule_server_mod.addImport("rove-kv", kv_mod);
+    // The leader-pinned scheduler thread fires schedules over libcurl
+    // (rove-blob's `curl.Easy`) and reuses webhook-server's SSRF
+    // resolver until that module retires (see http-send-plan §11
+    // step 4-5). Both imports drop once the migration completes.
+    schedule_server_mod.addImport("rove-blob", blob_mod);
+    schedule_server_mod.addImport("rove-webhook-server", webhook_server_mod);
 
     // ── rove-files-server: per-instance code operations (Phase 5) ──
     //

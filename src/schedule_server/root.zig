@@ -49,6 +49,10 @@
 const std = @import("std");
 const kv = @import("rove-kv");
 
+/// Leader-pinned scheduler thread — picks up due rows, fires them
+/// over libcurl, proposes envelope-9 with the result. See plan §5.
+pub const thread = @import("thread.zig");
+
 pub const Error = error{
     Truncated,
     InvalidVersion,
@@ -309,6 +313,67 @@ pub const ScheduleStore = struct {
             Error.OutOfMemory => return Error.OutOfMemory,
             else => return Error.Truncated,
         };
+    }
+
+    /// Scan rows due to fire — `fire_at_ns ≤ now_ns` AND not internal
+    /// AND `inflight_until_ns ≤ now_ns` — and return up to `max` of
+    /// them. Caller owns the returned slice; each element must be
+    /// `deinit`'d (then the slice freed).
+    ///
+    /// V1 implementation: full-prefix scan with in-Zig filtering. Fine
+    /// for the row counts the platform will see at launch. When the
+    /// store grows past ~10k schedules we add a `(fire_at_ns)` index
+    /// table and a top-N query; the public surface stays the same.
+    ///
+    /// Internal-routed schedules are skipped — those are dispatched
+    /// from the worker phase (`dispatchInternalSchedules`, future
+    /// slice), not the libcurl thread.
+    pub fn dueRows(
+        self: *ScheduleStore,
+        allocator: std.mem.Allocator,
+        now_ns: i64,
+        max: usize,
+    ) Error![]StoredSchedule {
+        var out: std.ArrayList(StoredSchedule) = .empty;
+        errdefer {
+            for (out.items) |*r| r.deinit(allocator);
+            out.deinit(allocator);
+        }
+
+        var cursor: []const u8 = "";
+        var cursor_owned: ?[]u8 = null;
+        defer if (cursor_owned) |b| allocator.free(b);
+
+        while (out.items.len < max) {
+            var page = self.db.prefix("s/", cursor, 1024) catch return Error.Kv;
+            defer page.deinit();
+            for (page.entries) |entry| {
+                var stored = parseStored(allocator, entry.value) catch |err| switch (err) {
+                    Error.OutOfMemory => return Error.OutOfMemory,
+                    else => continue,
+                };
+                if (stored.row.is_internal or
+                    stored.row.fire_at_ns > now_ns or
+                    stored.inflight_until_ns > now_ns)
+                {
+                    stored.deinit(allocator);
+                    continue;
+                }
+                out.append(allocator, stored) catch {
+                    stored.deinit(allocator);
+                    return Error.OutOfMemory;
+                };
+                if (out.items.len >= max) break;
+            }
+            if (page.entries.len < 1024) break;
+            const last_key = page.entries[page.entries.len - 1].key;
+            if (cursor_owned) |b| allocator.free(b);
+            const buf = allocator.alloc(u8, last_key.len) catch return Error.OutOfMemory;
+            @memcpy(buf, last_key);
+            cursor_owned = buf;
+            cursor = buf;
+        }
+        return out.toOwnedSlice(allocator) catch return Error.OutOfMemory;
     }
 
     /// Whole-store row count. Used by ops dashboards + the
@@ -700,6 +765,14 @@ fn writeU32Bytes(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []con
 
 const testing = std.testing;
 
+// Pull thread.zig's tests into the schedule_server test binary. Without
+// this Zig only collects tests from the root file plus any file whose
+// declarations are referenced at comptime — `pub const thread = @import`
+// is not enough on its own.
+test {
+    _ = thread;
+}
+
 fn testRow(allocator: std.mem.Allocator, tenant: []const u8, id: []const u8, fire_at_ns: i64) !ScheduleRow {
     return .{
         .tenant_id = try allocator.dupe(u8, tenant),
@@ -998,6 +1071,67 @@ test "ScheduleStore: tenant scoping — same id, different tenants" {
     } else {
         return error.TestUnexpectedResult;
     }
+}
+
+test "ScheduleStore: dueRows returns rows whose fire_at_ns ≤ now" {
+    const a = testing.allocator;
+    var path_buf: [64]u8 = undefined;
+    var store = try openTempStore(a, &path_buf);
+    defer {
+        store.close();
+        cleanupTempStore(&path_buf);
+    }
+
+    var past = try testRow(a, "acme", "past", 100);
+    defer past.deinit(a);
+    var future = try testRow(a, "acme", "future", 1_000_000_000_000);
+    defer future.deinit(a);
+    var internal_ = try testRow(a, "acme", "internal", 100);
+    internal_.is_internal = true;
+    defer internal_.deinit(a);
+    try store.applyUpsertBatch(&[_]ScheduleRow{ past, future, internal_ }, 0);
+
+    const due = try store.dueRows(a, 500, 32);
+    defer {
+        for (due) |*r| {
+            var x = r.*;
+            x.deinit(a);
+        }
+        a.free(due);
+    }
+    try testing.expectEqual(@as(usize, 1), due.len);
+    try testing.expectEqualStrings("past", due[0].row.id);
+}
+
+test "ScheduleStore: dueRows respects max" {
+    const a = testing.allocator;
+    var path_buf: [64]u8 = undefined;
+    var store = try openTempStore(a, &path_buf);
+    defer {
+        store.close();
+        cleanupTempStore(&path_buf);
+    }
+
+    var rows: [5]ScheduleRow = undefined;
+    var ids: [5][]u8 = undefined;
+    for (&rows, &ids, 0..) |*r, *id, i| {
+        const id_str = try std.fmt.allocPrint(a, "row-{d}", .{i});
+        id.* = id_str;
+        r.* = try testRow(a, "acme", id_str, 100);
+    }
+    defer for (&rows) |*r| r.deinit(a);
+    defer for (ids) |id| a.free(id);
+    try store.applyUpsertBatch(&rows, 0);
+
+    const due = try store.dueRows(a, 500, 3);
+    defer {
+        for (due) |*r| {
+            var x = r.*;
+            x.deinit(a);
+        }
+        a.free(due);
+    }
+    try testing.expectEqual(@as(usize, 3), due.len);
 }
 
 test "validateId: bounds + NUL rejection" {

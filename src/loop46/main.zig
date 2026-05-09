@@ -60,6 +60,7 @@ const files_mod = @import("rove-files");
 const files_server = @import("rove-files-server");
 const log_server = @import("rove-log-server");
 const webhook_server_mod = @import("rove-webhook-server");
+const schedule_server_mod = @import("rove-schedule-server");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
 const h2_mod = @import("rove-h2");
@@ -803,7 +804,8 @@ pub fn main() !void {
     if (cli.dev_webhook_unsafe) {
         webhook_server_mod.ssrf.test_allow_loopback = true;
         webhook_server_mod.http_client.test_allow_plaintext = true;
-        std.log.warn("*** --dev-webhook-unsafe enabled: webhook.send may target loopback over http:// — DEV ONLY ***", .{});
+        schedule_server_mod.thread.test_allow_plaintext = true;
+        std.log.warn("*** --dev-webhook-unsafe enabled: webhook.send / http.send may target loopback over http:// — DEV ONLY ***", .{});
     }
 
     try installSignalHandlers();
@@ -1114,6 +1116,24 @@ pub fn main() !void {
     // (idle) delivery loop wakes, sees `isLeader == false`, returns to
     // sleep. Cheap.
     apply_ctx.webhook_wake = &webhook_handle.wake;
+
+    // ── Schedule-server thread (http-send-plan §5) ────────────────────
+    //
+    // Leader-pinned poll loop reading `{data_dir}/schedules.db`. The
+    // dispatcher's `http.send` calls accumulate into a per-batch
+    // schedule list which rides atomically with the writeset via the
+    // type-7 multi-envelope; this thread reads the resulting rows and
+    // fires them over libcurl. Same lifecycle / wake / shutdown shape
+    // as `webhook_handle` above; both will collapse into one when
+    // webhook.send becomes a JS polyfill on top of http.send.
+    const schedule_handle = try schedule_server_mod.thread.spawn(.{
+        .allocator = allocator,
+        .data_dir = cli.data_dir,
+        .raft = raft_node,
+    });
+    defer schedule_handle.join();
+    defer schedule_handle.signalStop();
+    apply_ctx.schedule_wake = &schedule_handle.wake;
 
     // ── Spawn worker threads ───────────────────────────────────────────
     const http_addr = try parseHostPort(allocator, cli.http);
