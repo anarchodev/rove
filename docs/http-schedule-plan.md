@@ -29,13 +29,16 @@ The motivating framing:
   `webhook.send` itself becomes a JS wrapper at a system tenant
   (`webhook.loop46.com`) calling the more primitive `http.schedule`.
 
-What stays from today: the JS API (`webhook.send` keeps its shape),
-the at-least-once contract, the X-Rove-Webhook-Id header, the
-on-result callback dispatch path. What changes: the platform
-primitive flips from "schedule a webhook" to "schedule an HTTP
-call"; the leader-pinned thread becomes generic; the
-webhook-specific retry / signing / dead-letter logic moves to JS
-at `webhook.loop46.com`.
+What stays from today: customer-visible API (`webhook.send` and
+`email.send` keep their shapes), the at-least-once contract, the
+X-Rove-Webhook-Id header, the on-result callback dispatch path.
+What changes: the platform's native outbound surface shrinks to
+exactly two bindings — `http.schedule` and `http.cancel`. Both
+`webhook.send` and `email.send` become JS libraries on top
+(client-side polyfills + server-side system tenant). The
+leader-pinned thread becomes generic. Webhook-specific retry /
+signing / dead-letter logic moves to customer-equivalent JS at
+`webhook.loop46.com`.
 
 ---
 
@@ -609,51 +612,104 @@ opaque correlation handle.
 
 ---
 
-## 9. Default policy: `webhook.loop46.com`
+## 9. `webhook.send` and `email.send` are libraries, not bindings
 
-A new system tenant deployed at `webhook.loop46.com`. Its handlers
-implement the "default webhook" experience customers expect:
+The platform ships exactly two outbound primitives as native
+bindings: `http.schedule` and `http.cancel`. Everything customers
+think of as "send a webhook" or "send an email" is JS code on top
+— a library composed of two cooperating pieces:
 
-- POST `/v1/webhooks/send` — accepts the shape today's `webhook.send`
-  takes (`url`, `method`, `headers`, `body`, `onResult`, `context`,
-  `maxAttempts`, `signing`). Persists the spec into its own kv,
-  schedules the first attempt via `http.schedule`.
-- POST-via-on_result `/v1/webhooks/result` — receives every fire's
-  outcome. Decides:
-  - 2xx → propagate to the customer's `onResult` handler (one more
-    `http.schedule` call routed back to the customer's tenant via
-    a synthesized callback, OR direct module dispatch if the
-    customer-tenant routing supports it natively).
-  - 5xx + retries left → exponential backoff via another
-    `http.schedule` with future `fire_at_ns`.
-  - 4xx OR retries exhausted → write to a customer-visible
-    `_failed_webhooks/{id}` kv prefix in the customer's tenant
-    AND propagate the final outcome to the customer's `onResult`.
+  1. **A client-side polyfill** evaluated into every QJS context
+     at startup, exposing the global API customers call
+     (`webhook.send`, `email.send`).
+  2. **A server-side system tenant** holding the durable
+     retry/policy/dead-letter state and running the dispatch
+     loop using `http.schedule`.
 
-Roughly 150 lines of JS. The retry curve, the dead-letter behavior,
-the X-Rove-Webhook-Id header — all customer JS. Operators can iterate
-on policy without recompiling the engine.
+Both pieces are customer-equivalent JS. Operators can replace
+either or both without recompiling the engine; advanced customers
+can skip the platform's libraries entirely and compose on
+`http.schedule` directly (§10).
 
-The customer-facing JS shim (`webhook.send` in customer code) stays
-identical. Internally it's a thin wrapper:
+This is the same pattern `email.js` follows today (built into
+every QJS context at startup as a polyfill that wrapped the C
+`webhook.send` binding). What changes: the C `webhook.send`
+binding is gone. `webhook.js` becomes the new polyfill, calling
+`http.schedule`. `email.js` continues to call `webhook.send`,
+which now resolves to the polyfill instead of a C binding —
+zero change to email's source.
+
+### 9.1 `webhook.send` polyfill (client-side)
 
 ```js
-// src/js/bindings/webhook.js (replaces the C binding's body)
-export function send(opts) {
-  return http.schedule({
-    url:    "https://webhook.loop46.com/v1/webhooks/send",
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body:   JSON.stringify({
-      tenant_id: __tenant_id,   // platform-set
-      ...opts,
-    }),
-  });
-}
+// src/js/bindings/webhook.js — embedded as runtime polyfill,
+// just like email.js + textcodec.js today.
+globalThis.webhook = {
+  send(opts) {
+    return http.schedule({
+      handle: opts.id,           // optional customer-supplied
+      url:    "https://webhook.loop46.com/v1/webhooks/send",
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body:   JSON.stringify({
+        tenant_id: __tenant_id,  // platform-set, not spoofable
+        target_url:    opts.url,
+        target_method: opts.method,
+        target_headers: opts.headers,
+        target_body:   opts.body,
+        on_result:     opts.onResult,  // module name on customer side
+        context:       opts.context,
+        max_attempts:  opts.maxAttempts ?? 5,
+        signing:       opts.signing,   // hmac config, etc.
+      }),
+    });
+  },
+};
 ```
 
 `__tenant_id` is set by the platform on the dispatch state — the
-customer can't spoof it.
+customer can't spoof it. The polyfill keeps the existing
+`webhook.send` API shape so existing customer code compiles
+unchanged.
+
+### 9.2 `webhook.loop46.com` (server-side)
+
+System tenant deployed at `webhook.loop46.com`. Its handlers
+implement the "default webhook" experience customers expect:
+
+- POST `/v1/webhooks/send` — receives the spec from the
+  client-side polyfill. Persists into its own kv, schedules the
+  first attempt via `http.schedule`.
+- on_result module `webhook_result` — receives every fire's
+  outcome via the standard envelope-5 → `_callback/{id}` →
+  `dispatchCallbacks` path. Decides:
+  - 2xx → propagate to the customer's `onResult` handler (one
+    more `http.schedule` call with `on_result.tenant: <calling>`).
+  - 5xx + retries left → exponential backoff via another
+    `http.schedule` with future `fire_at_ns`, same handle so
+    the in-flight row is overwritten cleanly.
+  - 4xx OR retries exhausted → write to
+    `_failed_webhooks/{id}` in the customer's tenant AND
+    propagate the final outcome to the customer's `onResult`.
+
+Roughly 200 lines of JS. The retry curve, the dead-letter
+behavior, the X-Rove-Webhook-Id header, the customer-supplied
+HMAC signing — all customer JS. Read it, debug it, replace it.
+
+### 9.3 `email.js` keeps composing the same way
+
+Today's `src/js/bindings/email.js` calls `webhook.send`; under
+this design, that becomes `webhook.send` (the polyfill) calling
+`http.schedule`. Two-layer composition: `email.send` →
+`webhook.send` → `http.schedule`. The customer-visible
+`email.send` API is unchanged; its implementation didn't change
+either, only what `webhook.send` underneath it points at.
+
+If a customer wants different email semantics (different SMTP
+provider, different retry policy, different bounce handling),
+they write their own email library on top of `webhook.send` (or
+even directly on `http.schedule`). Same composition all the way
+down.
 
 ---
 
@@ -880,27 +936,33 @@ otherwise require):
    alongside `__admin__` and `__replay__`; deploy is part of the
    files-server bootstrap.
 
-3. **Switch `webhook.send`'s C binding to a JS shim** that calls
-   `webhook.loop46.com/v1/webhooks/send` via `http.schedule`. End-
-   to-end behavior unchanged from the customer's perspective.
-   Existing `webhook_smoke.sh` should pass against the new path.
+3. **Drop the `webhook.send` C binding; ship `webhook.js`
+   polyfill.** Same shape as today's `email.js` /
+   `textcodec.js` — `addAnonymousImport` for a new
+   `src/js/bindings/webhook.js`, evaluated into every QJS context
+   at startup. The polyfill installs `globalThis.webhook.send` and
+   calls `http.schedule` against `webhook.loop46.com`. End-to-end
+   behavior unchanged from the customer's perspective; existing
+   `webhook_smoke.sh` passes against the new path.
 
-4. **Drain webhooks.db.** Run the legacy webhook_server thread until
-   `SELECT count(*) FROM webhooks WHERE state='pending' = 0`. With
-   no new rows arriving (step 3 routed everything through the new
-   path), this completes in the time of the longest in-flight
-   retry curve — minutes at most.
+4. **Drain webhooks.db.** Run the legacy webhook_server thread
+   until `SELECT count(*) FROM webhooks WHERE state='pending' = 0`.
+   With no new rows arriving (step 3 routed everything through
+   the new path), this completes in the time of the longest
+   in-flight retry curve — minutes at most.
 
 5. **Delete the legacy webhook_server.** Drop
-   `src/webhook_server/`, drop envelopes 4/5/6's old shape, drop
-   `webhook_dispatch.zig`'s retry helpers, drop the per-tenant
-   `_outbox/*` reserved-prefix entries (already gone, but the doc
-   reference cleanup happens here too).
+   `src/webhook_server/`, drop the C `jsWebhookSend` binding +
+   `pending_webhooks` plumbing in `dispatcher.Request` /
+   `DispatchState`, drop envelopes 4/5/6's old shape, drop
+   `webhook_dispatch.zig`'s retry helpers. The platform's
+   outbound surface is now exactly two C bindings:
+   `http.schedule` and `http.cancel`. Everything else is JS.
 
 6. **Rename envelope 8 → envelope 4.** With the legacy gone, the
-   numeric type can take over the freed slot. Pure raft-log change;
-   no semantics change. Followers replay the new shape on the next
-   raft restart.
+   numeric type can take over the freed slot. Pure raft-log
+   change; no semantics change. Followers replay the new shape on
+   the next raft restart.
 
 ---
 
@@ -948,6 +1010,16 @@ information:
   cluster-local tenant; `dispatchInternalSchedules` picks them up
   and runs the target handler in-process. Hidden optimization;
   customer-visible semantics identical regardless of route.
+- **`webhook.send` and `email.send` are JS polyfills, not C
+  bindings.** §9. The platform's native outbound surface is
+  exactly `http.schedule` + `http.cancel`. Everything customers
+  recognize as "send a webhook" / "send an email" is JS — a
+  client-side polyfill (same pattern as today's `email.js` /
+  `textcodec.js`) plus a server-side system tenant
+  (`webhook.loop46.com`). Both pieces are customer-equivalent
+  code; advanced customers can write their own libraries on top
+  of `http.schedule` directly. Operators can replace the default
+  policy without recompiling the engine.
 
 ---
 
