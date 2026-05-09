@@ -56,6 +56,7 @@
 const std = @import("std");
 const kv = @import("rove-kv");
 const webhook_server = @import("rove-webhook-server");
+const schedule_server = @import("rove-schedule-server");
 const panic_mod = @import("panic.zig");
 
 pub const Error = error{
@@ -103,6 +104,27 @@ pub const EnvelopeType = enum(u8) {
     /// a `multi`) panics. The standard envelope `instance_id` is empty
     /// for type=7 — per-inner-envelope ids carry the real targets.
     multi = 7,
+    /// http.send (docs/http-send-plan.md). Payload is a
+    /// `schedule_server.encodeUpsertBatch` blob; apply UPSERTs each
+    /// row into `{data_dir}/schedules.db`, bumping `version` on
+    /// existing rows. Applied on both leader and follower (the
+    /// dispatcher proposes without pre-writing). Transitional
+    /// envelope number; collapses to 4 once webhook-server retires
+    /// (plan §11 step 6).
+    schedule_upsert = 8,
+    /// http.send completion. Payload is a
+    /// `schedule_server.encodeComplete` blob; apply checks
+    /// `version_at_fire` matches the row's current `version`. On
+    /// match, writes `_callback/{id}` into the tenant's app.db and
+    /// DELETEs from schedules.db. On mismatch, the envelope is
+    /// silently dropped (the row was overwritten while firing —
+    /// plan §7). Applied on both leader and follower.
+    schedule_complete = 9,
+    /// http.cancel. Payload is a `schedule_server.encodeCancelBatch`
+    /// blob; apply DELETEs each `(tenant_id, id)` from
+    /// schedules.db. Idempotent (missing row is a no-op). Applied
+    /// on both leader and follower.
+    schedule_cancel = 10,
 };
 
 /// Build a writeset envelope. `id_len` and `id` plus a leading type=0
@@ -154,6 +176,38 @@ pub fn encodeWebhookRetryScheduleEnvelope(
     payload: []const u8,
 ) ![]u8 {
     return encodeTyped(allocator, .webhook_retry_schedule, "", payload);
+}
+
+/// Build a schedule_upsert envelope (type=8). `payload` is a
+/// `schedule_server.encodeUpsertBatch` blob. instance_id is empty —
+/// schedules.db is cluster-wide; per-row tenant scoping rides in
+/// the payload.
+pub fn encodeScheduleUpsertEnvelope(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) ![]u8 {
+    return encodeTyped(allocator, .schedule_upsert, "", payload);
+}
+
+/// Build a schedule_complete envelope (type=9). `instance_id` is
+/// the tenant id whose app.db will receive the `_callback/{id}`
+/// write on a version match.
+pub fn encodeScheduleCompleteEnvelope(
+    allocator: std.mem.Allocator,
+    tenant_id: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    return encodeTyped(allocator, .schedule_complete, tenant_id, payload);
+}
+
+/// Build a schedule_cancel envelope (type=10). `payload` is a
+/// `schedule_server.encodeCancelBatch` blob. instance_id is empty —
+/// per-target tenant scoping rides in the payload.
+pub fn encodeScheduleCancelEnvelope(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) ![]u8 {
+    return encodeTyped(allocator, .schedule_cancel, "", payload);
 }
 
 /// Build a multi-envelope wrapper (type=7) carrying `inner` as already-
@@ -313,6 +367,20 @@ pub const ApplyCtx = struct {
     /// own (idle) handle's wake — harmless: an idle thread that wakes,
     /// checks `isLeader == false`, and goes back to sleep.
     webhook_wake: ?*std.Thread.ResetEvent = null,
+    /// Lazy cluster-wide schedule store handle for `type=8/9/10`
+    /// applies (http.send / docs/http-send-plan.md). Opens
+    /// `{data_dir}/schedules.db` on first schedule envelope. Same
+    /// shape as `webhooks_store` above — single store per node,
+    /// raft-replicated to identical state, applied on both leader
+    /// and follower.
+    schedules_store: ?*schedule_server.ScheduleStore = null,
+    /// Wake signal for the leader-pinned scheduler thread. Same
+    /// shape as `webhook_wake`. Set by loop46/main.zig once the
+    /// scheduler thread spawns. Envelope-8 apply fires it so the
+    /// scheduler picks fresh rows up on the apply tick instead of
+    /// waiting out the next-due-or-poll deadline. Envelope-9 / 10
+    /// don't fire it — completes / cancels reduce work, not add it.
+    schedule_wake: ?*std.Thread.ResetEvent = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -344,6 +412,10 @@ pub const ApplyCtx = struct {
             s.close();
             self.allocator.destroy(s);
         }
+        if (self.schedules_store) |s| {
+            s.close();
+            self.allocator.destroy(s);
+        }
     }
 
     /// Lazily open the cluster-wide `webhooks.db`. Returned pointer is
@@ -364,6 +436,26 @@ pub const ApplyCtx = struct {
         errdefer self.allocator.destroy(ptr);
         ptr.* = try webhook_server.WebhookStore.open(self.allocator, path);
         self.webhooks_store = ptr;
+        return ptr;
+    }
+
+    /// Lazily open the cluster-wide `schedules.db`. Same shape as
+    /// `getWebhooks`. Reached on both leader and follower because
+    /// envelope types 8/9/10 don't leader-skip.
+    fn getSchedules(self: *ApplyCtx) !*schedule_server.ScheduleStore {
+        if (self.schedules_store) |existing| return existing;
+        const path = try std.fmt.allocPrintSentinel(
+            self.allocator,
+            "{s}/schedules.db",
+            .{self.data_dir},
+            0,
+        );
+        defer self.allocator.free(path);
+
+        const ptr = try self.allocator.create(schedule_server.ScheduleStore);
+        errdefer self.allocator.destroy(ptr);
+        ptr.* = try schedule_server.ScheduleStore.open(self.allocator, path);
+        self.schedules_store = ptr;
         return ptr;
     }
 
@@ -510,6 +602,9 @@ fn dispatch(ctx: *ApplyCtx, env: Envelope, entry_idx: u64, nesting: NestingLevel
             );
             applyMulti(ctx, env, entry_idx);
         },
+        .schedule_upsert => applyScheduleUpsertBatch(ctx, env),
+        .schedule_complete => applyScheduleComplete(ctx, env),
+        .schedule_cancel => applyScheduleCancelBatch(ctx, env),
     }
 }
 
@@ -731,6 +826,169 @@ fn applyWebhookRetrySchedule(ctx: *ApplyCtx, env: Envelope) void {
 /// Phase 5.5 (d). Multi-envelope wrapper: unwraps inner envelopes and
 /// dispatches each. Inner envelopes apply in order. Nesting (multi
 /// inside multi) panics in `dispatch`.
+/// http.send envelope-8 apply (schedule_upsert). UPSERTs each row
+/// into `schedules.db` (bumping `version` on existing rows) and
+/// wakes the leader-pinned scheduler thread when wired.
+fn applyScheduleUpsertBatch(ctx: *ApplyCtx, env: Envelope) void {
+    std.debug.assert(env.instance_id.len == 0);
+
+    const store = ctx.getSchedules() catch |err| panic_mod.invariantViolated(
+        "applyScheduleUpsertBatch.getSchedules",
+        "err={s}",
+        .{@errorName(err)},
+    );
+
+    const rows = schedule_server.decodeUpsertBatch(ctx.allocator, env.payload) catch |err|
+        panic_mod.invariantViolated(
+            "applyScheduleUpsertBatch.decode",
+            "err={s}",
+            .{@errorName(err)},
+        );
+    defer {
+        for (rows) |*r| r.deinit(ctx.allocator);
+        ctx.allocator.free(rows);
+    }
+
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    store.applyUpsertBatch(rows, now_ns) catch |err| panic_mod.invariantViolated(
+        "applyScheduleUpsertBatch.apply",
+        "err={s}",
+        .{@errorName(err)},
+    );
+
+    if (ctx.schedule_wake) |w| w.set();
+}
+
+/// http.send envelope-9 apply (schedule_complete). Cross-db: on
+/// version match, writes `_callback/{id}` into the tenant's app.db
+/// AND deletes the row from schedules.db. On version mismatch
+/// (the row was overwritten while firing — plan §7), silently
+/// drops the envelope. Idempotent on missing row.
+///
+/// Order matters: tenant write FIRST, then schedules delete. Same
+/// reasoning as `applyWebhookComplete`. Crash between them = the
+/// next apply attempt re-reads the still-present schedule row and
+/// re-issues both writes.
+fn applyScheduleComplete(ctx: *ApplyCtx, env: Envelope) void {
+    const tenant_id = env.instance_id;
+
+    var complete = schedule_server.decodeComplete(ctx.allocator, env.payload) catch |err|
+        panic_mod.invariantViolated(
+            "applyScheduleComplete.decode",
+            "err={s}",
+            .{@errorName(err)},
+        );
+    defer complete.deinit(ctx.allocator);
+
+    const store = ctx.getSchedules() catch |err| panic_mod.invariantViolated(
+        "applyScheduleComplete.getSchedules",
+        "err={s}",
+        .{@errorName(err)},
+    );
+
+    // Pull the row to access on_result_module + context_json. The
+    // version-check happens after we've read these so we don't pay
+    // the JSON-build cost on a stale envelope.
+    var existing_opt = store.get(tenant_id, complete.id) catch |err|
+        panic_mod.invariantViolated(
+            "applyScheduleComplete.get",
+            "tenant={s} err={s}",
+            .{ tenant_id, @errorName(err) },
+        );
+
+    if (existing_opt) |*existing| {
+        defer existing.deinit(ctx.allocator);
+
+        // Version check: the most-recently-scheduled version is
+        // what fires. Stale envelopes from superseded fires are
+        // silently dropped (plan §7).
+        if (existing.version != complete.version_at_fire) return;
+
+        // Skip the callback write when the customer set no
+        // on_result module — fire-and-forget mode. Still falls
+        // through to the schedules.db delete below.
+        if (existing.row.on_result_module.len > 0) {
+            const event_json = buildScheduleCallbackJson(
+                ctx.allocator,
+                &complete,
+                existing,
+            ) catch |err| panic_mod.invariantViolated(
+                "applyScheduleComplete.buildCallback",
+                "err={s}",
+                .{@errorName(err)},
+            );
+            defer ctx.allocator.free(event_json);
+
+            const tenant_kv = ctx.getKv(tenant_id) catch |err|
+                panic_mod.invariantViolated(
+                    "applyScheduleComplete.getKv",
+                    "tenant={s} err={s}",
+                    .{ tenant_id, @errorName(err) },
+                );
+
+            // _callback/{id} — id may be a customer handle (any
+            // utf8 except NUL, up to 256 bytes) so allocate.
+            const key = std.fmt.allocPrint(
+                ctx.allocator,
+                "_callback/{s}",
+                .{complete.id},
+            ) catch |err| panic_mod.invariantViolated(
+                "applyScheduleComplete.allocPrint",
+                "err={s}",
+                .{@errorName(err)},
+            );
+            defer ctx.allocator.free(key);
+            tenant_kv.put(key, event_json) catch |err|
+                panic_mod.invariantViolated(
+                    "applyScheduleComplete.put",
+                    "tenant={s} err={s}",
+                    .{ tenant_id, @errorName(err) },
+                );
+        }
+    }
+
+    _ = store.applyComplete(tenant_id, complete.id, complete.version_at_fire) catch |err|
+        panic_mod.invariantViolated(
+            "applyScheduleComplete.applyComplete",
+            "err={s}",
+            .{@errorName(err)},
+        );
+}
+
+/// http.cancel envelope-10 apply (schedule_cancel). DELETEs each
+/// `(tenant_id, id)` from schedules.db. Idempotent: missing row is
+/// a no-op (already fired or already cancelled — race fine).
+/// Customer's on_result handler does NOT fire on cancel.
+fn applyScheduleCancelBatch(ctx: *ApplyCtx, env: Envelope) void {
+    std.debug.assert(env.instance_id.len == 0);
+
+    const targets = schedule_server.decodeCancelBatch(ctx.allocator, env.payload) catch |err|
+        panic_mod.invariantViolated(
+            "applyScheduleCancelBatch.decode",
+            "err={s}",
+            .{@errorName(err)},
+        );
+    defer {
+        for (targets) |*t| t.deinit(ctx.allocator);
+        ctx.allocator.free(targets);
+    }
+
+    const store = ctx.getSchedules() catch |err| panic_mod.invariantViolated(
+        "applyScheduleCancelBatch.getSchedules",
+        "err={s}",
+        .{@errorName(err)},
+    );
+
+    for (targets) |t| {
+        store.applyCancel(t.tenant_id, t.id) catch |err|
+            panic_mod.invariantViolated(
+                "applyScheduleCancelBatch.applyCancel",
+                "tenant={s} id={s} err={s}",
+                .{ t.tenant_id, t.id, @errorName(err) },
+            );
+    }
+}
+
 fn applyMulti(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
     std.debug.assert(env.instance_id.len == 0);
     const inner = decodeMultiInner(ctx.allocator, env.payload) catch |err|
@@ -813,6 +1071,65 @@ fn buildCallbackJson(
     }
 
     try w.writeAll("}");
+    return aw.toOwnedSlice();
+}
+
+/// Build the `_callback/{id}` JSON event for an http.send delivery.
+/// Schema (docs/http-send-plan.md §8):
+///   { id, on_result, ok, status, body, error, context, version }
+///
+/// `ok` is `status >= 200 and status < 300 and error.len == 0` — the
+/// dispatch consumer in `callback_dispatch.zig` parses with
+/// `ignore_unknown_fields = true`, so customer JS sees this verbatim.
+/// `version` rides through so customers can branch on "this is a
+/// retry of a superseded fire" if they care.
+fn buildScheduleCallbackJson(
+    allocator: std.mem.Allocator,
+    complete: *const schedule_server.CompleteEnvelope,
+    stored: *const schedule_server.StoredSchedule,
+) ![]u8 {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer list.deinit(allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &list);
+    const w = &aw.writer;
+
+    const ok = complete.outcome == .delivered and
+        complete.status >= 200 and
+        complete.status < 300 and
+        complete.error_message.len == 0;
+
+    try w.writeAll("{\"id\":\"");
+    try writeJsonString(w, complete.id);
+    try w.writeAll("\",\"on_result\":");
+    if (stored.row.on_result_module.len == 0) {
+        try w.writeAll("null");
+    } else {
+        try w.writeByte('"');
+        try writeJsonString(w, stored.row.on_result_module);
+        try w.writeByte('"');
+    }
+    try w.print(",\"ok\":{},\"status\":{d},\"version\":{d},\"context\":", .{
+        ok,
+        complete.status,
+        complete.version_at_fire,
+    });
+    if (stored.row.context_json.len == 0) {
+        try w.writeAll("null");
+    } else {
+        try w.writeAll(stored.row.context_json);
+    }
+
+    try w.writeAll(",\"body\":\"");
+    try writeJsonString(w, complete.response_body);
+    try w.writeAll("\",\"error\":");
+    if (complete.error_message.len == 0) {
+        try w.writeAll("null");
+    } else {
+        try w.writeByte('"');
+        try writeJsonString(w, complete.error_message);
+        try w.writeByte('"');
+    }
+    try w.writeByte('}');
     return aw.toOwnedSlice();
 }
 
@@ -911,6 +1228,119 @@ test "webhook_retry_schedule envelope encode/decode round trip" {
     try testing.expectEqual(EnvelopeType.webhook_retry_schedule, dec.type);
     try testing.expectEqualStrings("", dec.instance_id);
     try testing.expectEqualStrings("fake retry bytes", dec.payload);
+}
+
+test "schedule_upsert envelope encode/decode round trip" {
+    const a = testing.allocator;
+    const enc = try encodeScheduleUpsertEnvelope(a, "fake upsert bytes");
+    defer a.free(enc);
+    const dec = try decodeEnvelope(enc);
+    try testing.expectEqual(EnvelopeType.schedule_upsert, dec.type);
+    try testing.expectEqualStrings("", dec.instance_id);
+    try testing.expectEqualStrings("fake upsert bytes", dec.payload);
+}
+
+test "schedule_complete envelope encode/decode round trip" {
+    const a = testing.allocator;
+    const enc = try encodeScheduleCompleteEnvelope(a, "acme", "fake complete bytes");
+    defer a.free(enc);
+    const dec = try decodeEnvelope(enc);
+    try testing.expectEqual(EnvelopeType.schedule_complete, dec.type);
+    try testing.expectEqualStrings("acme", dec.instance_id);
+    try testing.expectEqualStrings("fake complete bytes", dec.payload);
+}
+
+test "schedule_cancel envelope encode/decode round trip" {
+    const a = testing.allocator;
+    const enc = try encodeScheduleCancelEnvelope(a, "fake cancel bytes");
+    defer a.free(enc);
+    const dec = try decodeEnvelope(enc);
+    try testing.expectEqual(EnvelopeType.schedule_cancel, dec.type);
+    try testing.expectEqualStrings("", dec.instance_id);
+    try testing.expectEqualStrings("fake cancel bytes", dec.payload);
+}
+
+test "buildScheduleCallbackJson delivered shape" {
+    const a = testing.allocator;
+    var stored: schedule_server.StoredSchedule = .{
+        .row = .{
+            .tenant_id = "acme",
+            .id = "reminder-1",
+            .fire_at_ns = 0,
+            .url = "https://x/",
+            .method = "POST",
+            .headers_json = "{}",
+            .body = "",
+            .timeout_ms = 30_000,
+            .max_body_bytes = 256 * 1024,
+            .on_result_module = "stripe_response",
+            .context_json = "{\"order\":\"o-42\"}",
+            .is_internal = false,
+        },
+        .version = 3,
+        .inflight_until_ns = 0,
+        .created_at_ns = 0,
+    };
+    const complete: schedule_server.CompleteEnvelope = .{
+        .tenant_id = "acme",
+        .id = "reminder-1",
+        .version_at_fire = 3,
+        .outcome = .delivered,
+        .status = 200,
+        .response_headers_json = "{}",
+        .response_body = "{\"id\":\"ch_123\"}",
+        .error_message = "",
+    };
+    const json = try buildScheduleCallbackJson(a, &complete, &stored);
+    defer a.free(json);
+
+    // Spot-check field shape — `ignore_unknown_fields:true` consumer
+    // tolerates ordering, so just look for substrings.
+    try testing.expect(std.mem.indexOf(u8, json, "\"id\":\"reminder-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"on_result\":\"stripe_response\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"ok\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"status\":200") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"version\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"context\":{\"order\":\"o-42\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"body\":\"{\\\"id\\\":\\\"ch_123\\\"}\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"error\":null") != null);
+}
+
+test "buildScheduleCallbackJson failed shape carries error string + ok=false" {
+    const a = testing.allocator;
+    var stored: schedule_server.StoredSchedule = .{
+        .row = .{
+            .tenant_id = "acme",
+            .id = "x",
+            .fire_at_ns = 0,
+            .url = "https://x/",
+            .method = "POST",
+            .headers_json = "{}",
+            .body = "",
+            .timeout_ms = 30_000,
+            .max_body_bytes = 256 * 1024,
+            .on_result_module = "h",
+            .context_json = "null",
+            .is_internal = false,
+        },
+        .version = 1,
+        .inflight_until_ns = 0,
+        .created_at_ns = 0,
+    };
+    const complete: schedule_server.CompleteEnvelope = .{
+        .tenant_id = "acme",
+        .id = "x",
+        .version_at_fire = 1,
+        .outcome = .failed,
+        .status = 0,
+        .response_headers_json = "",
+        .response_body = "",
+        .error_message = "tls: handshake failed",
+    };
+    const json = try buildScheduleCallbackJson(a, &complete, &stored);
+    defer a.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"ok\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"error\":\"tls: handshake failed\"") != null);
 }
 
 test "multi envelope wraps + unwraps several inner envelopes" {

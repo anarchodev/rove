@@ -42,6 +42,9 @@ fn proposeEncoded(
         .webhook_complete,
         .webhook_retry_schedule,
         .multi,
+        .schedule_upsert,
+        .schedule_complete,
+        .schedule_cancel,
         => unreachable,
     };
     defer allocator.free(envelope);
