@@ -3,14 +3,25 @@
 //! Same-origin to whatever domain the customer's app is on. Reads
 //! `__Host-rove_sid` (mints if missing), then mints a JWT scoped to
 //! `(tenant_id, sid)` plus the per-tier caps. The browser hands this
-//! token to sse-server's EventSource open at
-//! `https://sse.{public_suffix}/v1/{tenant_id}/sse?token=...`.
+//! token to the notifications channel's EventSource open at
+//! `<notifications_url>?token=...`. The full URL is returned in the
+//! response so the browser doesn't have to hardcode the SSE host
+//! (matters for custom-domain customers — their app on `acme.com`
+//! still needs to know to connect to `sse.loop46.me`).
 //!
 //! Wire shape:
 //!
 //!   GET /_session/sse-token
 //!   → 200 application/json
-//!     { "token": "<JWT>", "expires_in": 3600 }
+//!     { "token":             "<JWT>",
+//!       "expires_in":        3600,
+//!       "notifications_url": "https://sse.loop46.me/v1/acme/sse",
+//!       "tenant_id":         "acme" }
+//!
+//! `notifications_url` is null when the worker has no
+//! `sse_public_base` wired (operator hasn't deployed sse-server) —
+//! the browser then has no way to subscribe and should surface a
+//! clear error rather than guess a URL.
 //!
 //! JWT payload (HS256, signed with the cluster's
 //! `LOOP46_SERVICES_JWT_SECRET`):
@@ -48,6 +59,7 @@ pub fn tryHandleSseToken(
     server: anytype,
     allocator: std.mem.Allocator,
     services_jwt_secret: ?[]const u8,
+    sse_public_base: ?[]const u8,
     instance_id: []const u8,
     ent: rove.Entity,
     sid_h2: h2.StreamId,
@@ -103,11 +115,30 @@ pub fn tryHandleSseToken(
     };
     defer allocator.free(token);
 
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "{{\"token\":\"{s}\",\"expires_in\":{d}}}\n",
-        .{ token, @divTrunc(TOKEN_TTL_MS, 1000) },
-    );
+    // Build the full notifications URL (sse_public_base + per-tenant
+    // path) so the browser doesn't have to know either piece. Null
+    // sse_public_base = operator hasn't wired sse-server; we still
+    // mint the token (it's signed by the same key sse-server would
+    // verify with later) but signal "no URL available" so the browser
+    // surfaces the misconfiguration explicitly.
+    const notifications_url: ?[]u8 = if (sse_public_base) |base| blk: {
+        const trimmed = if (base.len > 0 and base[base.len - 1] == '/') base[0 .. base.len - 1] else base;
+        break :blk try std.fmt.allocPrint(allocator, "{s}/v1/{s}/sse", .{ trimmed, instance_id });
+    } else null;
+    defer if (notifications_url) |u| allocator.free(u);
+
+    const body = if (notifications_url) |url|
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"token\":\"{s}\",\"expires_in\":{d},\"notifications_url\":\"{s}\",\"tenant_id\":\"{s}\"}}\n",
+            .{ token, @divTrunc(TOKEN_TTL_MS, 1000), url, instance_id },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"token\":\"{s}\",\"expires_in\":{d},\"notifications_url\":null,\"tenant_id\":\"{s}\"}}\n",
+            .{ token, @divTrunc(TOKEN_TTL_MS, 1000), instance_id },
+        );
     errdefer allocator.free(body);
 
     const platform_cookie: ?[]u8 = if (resolved.mint_set_cookie)

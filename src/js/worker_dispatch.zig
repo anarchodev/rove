@@ -972,6 +972,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             server,
             allocator,
             worker.services_jwt_secret,
+            worker.sse_public_base,
             scope_inst.id,
             ent,
             sid,
