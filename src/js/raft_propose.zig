@@ -46,6 +46,7 @@ fn proposeEncoded(
         .schedule_upsert,
         .schedule_complete,
         .schedule_cancel,
+        .schedule_demote,
         => unreachable,
     };
     defer allocator.free(envelope);

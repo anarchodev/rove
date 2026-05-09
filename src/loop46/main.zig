@@ -281,6 +281,16 @@ const WorkerCtx = struct {
     /// h2 listener — this is what `SO_REUSEPORT` needs before requests
     /// can hit any of them.
     ready: *std.Thread.ResetEvent,
+    /// Per-thread schedules.db connection used by worker 0's
+    /// `dispatchInternalSchedules` (http-send-plan §3.2). Lazy-opened
+    /// on the worker thread (NOMUTEX + WAL means each consumer gets
+    /// its own handle); only worker 0 ever reads this slot. Other
+    /// workers leave it null.
+    internal_schedules_store: ?*schedule_server_mod.ScheduleStore = null,
+    /// In-memory inflight set for the in-process schedule dispatch.
+    /// Owned by worker 0's thread frame (allocated on stack in
+    /// `workerMain`). Other workers leave null.
+    internal_schedules_inflight: ?*std.StringHashMapUnmanaged(void) = null,
 };
 
 fn workerMain(args: *WorkerCtx) !void {
@@ -399,6 +409,31 @@ fn workerMain(args: *WorkerCtx) !void {
     // handful-of-tenants-per-tick workloads we've measured.
     var blocked_tenants: rjs.BlockedTenants = .{};
 
+    // Worker-0 lazy state for in-process schedule dispatch
+    // (http-send-plan §3.2). Other workers skip — the phase is
+    // gated to worker 0 so only one thread on this node makes
+    // dispatch decisions for the internal pool.
+    var internal_sched_store: ?schedule_server_mod.ScheduleStore = null;
+    defer if (internal_sched_store) |*s| s.close();
+    var internal_sched_inflight: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = internal_sched_inflight.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        internal_sched_inflight.deinit(allocator);
+    }
+    if (args.worker_idx == 0) {
+        const sched_path = try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/schedules.db",
+            .{args.data_dir},
+            0,
+        );
+        defer allocator.free(sched_path);
+        internal_sched_store = try schedule_server_mod.ScheduleStore.open(allocator, sched_path);
+        args.internal_schedules_store = &internal_sched_store.?;
+        args.internal_schedules_inflight = &internal_sched_inflight;
+    }
+
     while (!stop_flag.load(.acquire)) {
         // Bounded-wait poll. The worker has multiple pieces of
         // background state that need periodic attention regardless of
@@ -454,6 +489,27 @@ fn workerMain(args: *WorkerCtx) !void {
             _ = rjs.dispatchCallbacks(worker, rjs.CALLBACK_DEFAULT_MAX_PER_TENANT) catch |err| {
                 std.log.warn("worker {d}: dispatchCallbacks: {s}", .{ args.worker_idx, @errorName(err) });
             };
+
+            // Internal-pool schedule dispatch (http-send-plan §3.2):
+            // grab `is_internal=true` rows whose target tenant is
+            // hosted on this node and run the handler in-process.
+            // Rows we can't serve locally get demoted via envelope-11
+            // so the libcurl scheduler thread fires them via cluster
+            // ingress instead. Same worker-0 + leader gating as the
+            // callback path above.
+            if (args.internal_schedules_store) |sched_store| {
+                _ = rjs.dispatchInternalSchedules(
+                    worker,
+                    sched_store,
+                    args.internal_schedules_inflight.?,
+                    rjs.INTERNAL_SCHEDULES_DEFAULT_MAX_PER_PASS,
+                ) catch |err| {
+                    std.log.warn(
+                        "worker {d}: dispatchInternalSchedules: {s}",
+                        .{ args.worker_idx, @errorName(err) },
+                    );
+                };
+            }
         }
 
         // Log batch flush moved to a background thread spawned in
