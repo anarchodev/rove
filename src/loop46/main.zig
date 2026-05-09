@@ -907,6 +907,13 @@ pub fn main() !void {
 
     apply_ctx = rjs.apply.ApplyCtx.init(allocator, cli.data_dir, raft_node);
     defer apply_ctx.deinit();
+    // Internal-target stamping for envelope-8 (http-send-plan §3.2).
+    // When `public_suffix` is set, schedule rows whose URL targets
+    // `{id}.{public_suffix}` and `{id}` has an existence marker in
+    // __root__.db get `is_internal=true`. The (future) worker phase
+    // picks those up in-process; until that lands the stamp is
+    // informational and the libcurl scheduler thread fires every row.
+    apply_ctx.public_suffix = cli.public_suffix;
 
     // ── Optional periodic snapshot (Phase 5.5(c) step B) ──────────────
     //

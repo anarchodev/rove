@@ -3,21 +3,19 @@
 //! Steady-state path: every customer's `webhook.send` routes through
 //! `webhook.loop46.com`, which lives on the cluster as a system tenant.
 //! Outbound libcurl + cluster ingress + a worker's h2 stack is ~10-50ms
-//! that the worker phase can avoid by recognizing the target and
-//! dispatching against the local tenant in-process.
+//! that the scheduler can avoid by recognizing the target and handing
+//! the row to the worker phase that hosts the tenant in-process.
 //!
-//! Pure function of `url` + `public_suffix`. Called at fire time by
-//! both consumers (the scheduler thread, to decide whether to give
-//! internal-shape URLs a brief grace period before libcurl; the
-//! worker phase, to decide whether the row can be served in-process).
-//! No raft state required — `parseInstanceId` returns the tenant id
-//! the URL syntactically implies; consumers do their own follow-up
-//! check (worker phase looks the id up in `tenant_files_map`).
+//! Detection is a pure function of `url`, the cluster's `public_suffix`,
+//! and "does this id have an existence marker in __root__.db". All three
+//! are deterministic across raft replicas, so this can run at apply
+//! time without divergence — every node reaches the same `is_internal`
+//! verdict for every row.
 //!
 //! ## What this module is NOT
 //!
 //! - **Not the dispatch path.** It returns the tenant id; the caller
-//!   decides what to do with it.
+//!   (apply for stamping; worker phase for routing) decides what to do.
 //! - **Not a security gate.** Discovering that a host parses as an
 //!   internal target is *informational*, not authorizing. The handler
 //!   the row eventually runs against still authenticates per its own

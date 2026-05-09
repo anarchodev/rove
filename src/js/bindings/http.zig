@@ -153,6 +153,7 @@ fn buildRow(
         .max_body_bytes = @intCast(@max(max_body_bytes, 1)),
         .on_result_module = owned.on_result_module.?,
         .context_json = owned.context_json.?,
+        .is_internal = false, // apply path detects + stamps
     };
     owned = .{}; // ownership transferred
     return row;
