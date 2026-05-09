@@ -1,20 +1,12 @@
-//! SSE caps + plan-tier defaults + the `/_events` endpoint carve-out.
-//! See docs/sse-plan.md §2.12 / §11d-f.
+//! Per-tenant SSE caps + plan-tier defaults. Used by `sse_token` to
+//! embed limits in the JWT it mints, so sse-server enforces caps at
+//! connect time without a callback to the worker.
 //!
-//! This module owns the shape of the events subsystem's per-tenant
-//! configuration and the front-door routing. The pump (the system
-//! that actually drives connected EventSource streams from
-//! `_events/{sid}/...` rows) lives in worker.zig as a phase, not
-//! here — same shape as `flushLogs`, `dispatchCallbacks`, etc.
+//! After the legacy `/_events` worker route retired (sse-plan §7
+//! step 7), this module no longer carries the route handler — it's
+//! pure config.
 
 const std = @import("std");
-const rove = @import("rove");
-const h2 = @import("rove-h2");
-
-const respb = @import("response_builder.zig");
-const session_mod = @import("session.zig");
-const events_pump = @import("events_pump.zig");
-const limiter_mod = @import("limiter.zig");
 
 /// Per-account plan tier. Lives here for now until the platform-wide
 /// `tenant.PlanTier` lands in Phase 10 (PLAN §3 / §2.4 account model).
@@ -28,8 +20,9 @@ pub const PlanTier = enum { free, paid };
 /// field plus one defaulting line per tier.
 pub const EventsCaps = struct {
     // ── Hard ceilings ─────────────────────────────────────────
-    /// Max simultaneous SSE connections one tenant may hold open.
-    /// Above this, `/_events` returns 503.
+    /// Max simultaneous SSE connections one tenant may hold open
+    /// against sse-server. Above this, the (cap+1)th connect is
+    /// refused 503.
     max_concurrent_connections_per_instance: u32,
     /// Max simultaneous EventSource connections one session may hold.
     /// Multi-tab sanity guard, not plan-tiered. Above this, the
@@ -38,12 +31,10 @@ pub const EventsCaps = struct {
     /// Max `events.emit` calls per handler invocation. Customer JS
     /// gets `Error{code: "events_cap_exceeded"}` on the (cap+1)th call.
     max_emits_per_request: u32,
-    /// Retention window for `_events/{sid}/...` rows. The pump's
-    /// catch-up scan won't find rows older than this; the retention
-    /// sweep removes them.
+    /// Retention window for ring-cache entries on sse-server. The
+    /// catch-up replay won't find events older than this.
     retention_seconds: u32,
-    /// Slow-consumer defense: if a single session has more rows than
-    /// this in retention, oldest are dropped.
+    /// Slow-consumer defense: ring-cache size cap per session.
     max_events_per_session_in_retention: u32,
     /// Max envelope size (the JSON serialization of one emit). Customer
     /// JS gets `Error{code: "events_cap_exceeded"}` on oversize.
@@ -58,10 +49,7 @@ pub const EventsCaps = struct {
     connect_rate_per_sec: u32,
     /// `events_connect` bucket size.
     connect_rate_burst: u32,
-    /// `events_bytes_out` token bucket fill rate (bytes/s). Pump
-    /// consumes from this before each wire write; empty bucket =
-    /// pump skips that connection this tick (events stay in
-    /// retention, deliver next tick).
+    /// Per-connection bytes-out token bucket fill rate (bytes/s).
     bytes_out_per_sec: u32,
     /// `events_bytes_out` bucket size.
     bytes_out_burst: u32,
@@ -108,182 +96,6 @@ pub fn eventsCapsForPlan(plan: PlanTier) EventsCaps {
         .free => FREE,
         .paid => PAID,
     };
-}
-
-// ── /_events endpoint ─────────────────────────────────────────────
-
-/// Front-door for the SSE endpoint. Returns true iff the request
-/// matched (`GET /_events`) and was finalized. Mirrors the
-/// `tryHandleSystem` shape so the worker_dispatch loop's branch
-/// reads naturally.
-///
-/// On match: minted `__Host-rove_sid` if absent, response headers
-/// (text/event-stream + cache-control: no-store + optional
-/// Set-Cookie), entity moved into `stream_response_in`, and a
-/// `SseConnection` record inserted into `tc.sse_connections` so
-/// `events_pump.pumpEvents` can drive it on subsequent ticks.
-///
-/// `tc` is the per-tenant `TenantFiles` resolved by the worker
-/// upstream. Type-erased to break the import cycle (worker.zig
-/// already imports this module).
-pub fn tryHandleEvents(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    tc: anytype,
-    instance_id: []const u8,
-    limiter: ?*limiter_mod.RateLimiter,
-    caps: EventsCaps,
-    ent: rove.Entity,
-    sid_h2: h2.StreamId,
-    sess: h2.Session,
-    method: []const u8,
-    path: []const u8,
-    rh: h2.ReqHeaders,
-    received_ns: i64,
-) !bool {
-    // Match `/_events` exactly (with optional `?query=...`). Sub-paths
-    // like `/_events/foo` are NOT matched — the endpoint is a single
-    // resource, not a tree.
-    const qmark = std.mem.indexOfScalar(u8, path, '?');
-    const path_no_q = if (qmark) |q| path[0..q] else path;
-    if (!std.mem.eql(u8, path_no_q, "/_events")) return false;
-
-    // Method gate. SSE is GET-only by convention; some clients may
-    // try HEAD for readiness probing — answer 200 with no body.
-    if (!std.mem.eql(u8, method, "GET") and !std.mem.eql(u8, method, "HEAD")) {
-        try respb.setSimpleResponse(server, ent, sid_h2, sess, 405, "GET only\n", allocator);
-        return true;
-    }
-
-    // Hard cap: per-instance concurrent connections. At capacity →
-    // 503 immediately so a flooding tenant can't exhaust h2 streams.
-    if (events_pump.countConnections(tc) >= caps.max_concurrent_connections_per_instance) {
-        try respb.setSimpleResponse(server, ent, sid_h2, sess, 503, "events: per-instance connection cap reached\n", allocator);
-        return true;
-    }
-
-    // Connect-rate limit. Defends against churn DoS (open/close
-    // repeatedly to chew CPU). 429 with Retry-After lets honest
-    // clients back off gracefully.
-    if (limiter) |lim| {
-        const allowed = lim.check(instance_id, .events_connect, received_ns) catch true;
-        if (!allowed) {
-            try respb.setRateLimitedResponse(server, ent, sid_h2, sess, allocator, lim.retryAfterSeconds(instance_id, .events_connect));
-            return true;
-        }
-    }
-
-    // Resolve / mint the session cookie. Mint policy + cookie shape
-    // are defined in session.zig.
-    var prng = std.Random.DefaultPrng.init(@bitCast(received_ns));
-    const resolved = session_mod.resolve(rh, prng.random());
-
-    // Per-session concurrent-connection cap. Multi-tab sanity guard —
-    // refuses the (cap+1)th simultaneous connection from one session.
-    if (events_pump.countConnectionsForSid(tc, &resolved.sid) >= caps.max_concurrent_connections_per_session) {
-        try respb.setSimpleResponse(server, ent, sid_h2, sess, 503, "events: per-session connection cap reached\n", allocator);
-        return true;
-    }
-
-    // Last-Event-ID resume cursor: header takes precedence; ?since=
-    // is the non-EventSource fallback (SSE clients send the header
-    // automatically on reconnect).
-    const last_event_id = blk: {
-        if (respb.findHeader(rh, "last-event-id")) |hv| {
-            break :blk events_pump.parseLastEventId(hv);
-        }
-        break :blk events_pump.parseLastEventId(extractSinceQuery(path));
-    };
-
-    // Build response headers: text/event-stream + cache-control: no-store
-    // + (optional) Set-Cookie.
-    const platform_cookie: ?[]u8 = if (resolved.mint_set_cookie)
-        try session_mod.formatSetCookie(allocator, &resolved.sid)
-    else
-        null;
-    defer if (platform_cookie) |pc| allocator.free(pc);
-
-    var pairs_buf: [3]respb.RespHeaderPair = undefined;
-    var n: usize = 0;
-    pairs_buf[n] = .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" };
-    n += 1;
-    pairs_buf[n] = .{ .name = "cache-control", .value = "no-store" };
-    n += 1;
-    if (platform_cookie) |pc| {
-        pairs_buf[n] = .{ .name = "set-cookie", .value = pc };
-        n += 1;
-    }
-    const hdrs = try respb.packRespHeaders(allocator, pairs_buf[0..n]);
-
-    // Stamp response components and move into stream_response_in.
-    // h2 sends headers, then parks the entity in stream_data_out
-    // asking for the first data chunk; the pump picks it up from
-    // there.
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 200 });
-    try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
-    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &server.request_out, h2.StreamId, sid_h2);
-    try server.reg.set(ent, &server.request_out, h2.Session, sess);
-    try server.reg.move(ent, &server.request_out, &server.stream_response_in);
-
-    // Record the connection. The pump uses this to drive frame
-    // delivery on subsequent ticks; cleanupClosedSseConnections
-    // tears it down when h2 retires the entity.
-    const conn = events_pump.SseConnection.newAt(ent, resolved.sid, last_event_id, received_ns);
-    try events_pump.addConnection(tc, conn);
-
-    // Mark the sid dirty so the first pump tick after this
-    // connection reaches stream_data_out scans `_events/{sid}/`
-    // forward from `last_event_id`. Covers two cases the
-    // dirty-marked steady-state path can't:
-    //   1. Reconnect within the cookie window — events emitted
-    //      while no listener was attached sit in kv past the
-    //      retention floor.
-    //   2. Fresh connect carrying `Last-Event-ID: <X>` from a prior
-    //      session — historical events between X and the head of
-    //      the prefix.
-    // The pump retains the dirty mark while the entity is in
-    // stream_response_in (h2 hasn't sent headers yet); on the
-    // following tick it lands in stream_data_out and the scan fires.
-    try events_pump.markSidDirty(tc, &resolved.sid);
-
-    return true;
-}
-
-/// Pull `?since=<value>` (or `&since=<value>`) out of a request
-/// path. Returns null if missing. Stops at the next `&` or end.
-fn extractSinceQuery(path: []const u8) ?[]const u8 {
-    const qmark = std.mem.indexOfScalar(u8, path, '?') orelse return null;
-    var rest = path[qmark + 1 ..];
-    while (rest.len > 0) {
-        const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
-        const seg = rest[0..amp];
-        if (std.mem.startsWith(u8, seg, "since=")) {
-            return seg["since=".len..];
-        }
-        if (amp == rest.len) return null;
-        rest = rest[amp + 1 ..];
-    }
-    return null;
-}
-
-test "extractSinceQuery: present at start" {
-    try std.testing.expectEqualStrings(
-        "00000000000000000042-000007",
-        extractSinceQuery("/_events?since=00000000000000000042-000007").?,
-    );
-}
-
-test "extractSinceQuery: present after another param" {
-    try std.testing.expectEqualStrings(
-        "00000000000000000042-000007",
-        extractSinceQuery("/_events?foo=1&since=00000000000000000042-000007").?,
-    );
-}
-
-test "extractSinceQuery: missing" {
-    try std.testing.expect(extractSinceQuery("/_events") == null);
-    try std.testing.expect(extractSinceQuery("/_events?foo=1&bar=2") == null);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

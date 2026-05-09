@@ -38,7 +38,6 @@ const PLATFORM_KV_PREFIXES_FIRE = [_][]const u8{
     "_callback/",
     "_magic/",
     "_triggers/",
-    "_events/",
     "_sessions/",
 };
 

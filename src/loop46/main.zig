@@ -398,11 +398,6 @@ fn workerMain(args: *WorkerCtx) !void {
     // handful-of-tenants-per-tick workloads we've measured.
     var blocked_tenants: rjs.BlockedTenants = .{};
 
-    // Per-worker SSE retention sweep timer. Wall-clock relative to the
-    // last sweep; not synchronized across workers — overshoot is fine
-    // because the sweep is leader-gated and idempotent.
-    var next_sse_sweep_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + rjs.SSE_SWEEP_INTERVAL_NS;
-
     while (!stop_flag.load(.acquire)) {
         // Bounded-wait poll. The worker has multiple pieces of
         // background state that need periodic attention regardless of
@@ -442,17 +437,6 @@ fn workerMain(args: *WorkerCtx) !void {
         }
         try rjs.drainRaftPending(worker);
         try reg.flush();
-        // SSE: drive connected EventSource clients off newly-emitted
-        // _events/{sid}/... rows. Runs after drainRaftPending so any
-        // dirty marks set during this tick's commits are visible.
-        try rjs.pumpEvents(worker);
-        try reg.flush();
-        // SSE: scrub the per-tenant connection table for any h2
-        // entities that just landed in response_out (client
-        // disconnect, transport error). MUST run before
-        // cleanupResponses or the records would point at destroyed
-        // entities next tick.
-        try rjs.cleanupClosedSseConnections(worker);
         try rjs.cleanupResponses(worker);
         try reg.flush();
         try rjs.applyPendingReleases(worker);
@@ -474,19 +458,6 @@ fn workerMain(args: *WorkerCtx) !void {
         // Log batch flush moved to a background thread spawned in
         // Worker.create — the dispatch loop stays free of S3 RTT.
         // See `Worker.flusherLoop` in src/js/worker.zig.
-
-        // SSE retention sweep — leader-only inside sweepEvents.
-        // Worker 0 runs it (matches the dispatchCallbacks pinning
-        // above for the same reason: avoid two workers racing on the
-        // same tenant txn). Per-tenant work is bounded so this never
-        // stalls the worker.
-        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-        if (args.worker_idx == 0 and now_ns >= next_sse_sweep_ns) {
-            _ = rjs.sweepEvents(worker) catch |err| {
-                std.log.warn("worker {d}: sweepEvents: {s}", .{ args.worker_idx, @errorName(err) });
-            };
-            next_sse_sweep_ns = now_ns + rjs.SSE_SWEEP_INTERVAL_NS;
-        }
     }
 
     std.log.info("worker {d}: shutting down", .{args.worker_idx});

@@ -55,8 +55,6 @@ pub const callback_dispatch = @import("callback_dispatch.zig");
 pub const reserved = @import("reserved.zig");
 pub const session = @import("session.zig");
 pub const events = @import("events.zig");
-pub const events_pump = @import("events_pump.zig");
-pub const events_sweep = @import("events_sweep.zig");
 pub const sse_dispatch = @import("sse_dispatch.zig");
 pub const sse_token = @import("sse_token.zig");
 pub const release_table = @import("release_table.zig");
@@ -88,10 +86,6 @@ pub const CALLBACK_DEFAULT_MAX_PER_TENANT = callback_dispatch.DEFAULT_MAX_PER_TE
 pub const drainRaftPending = worker.drainRaftPending;
 pub const applyPendingReleases = worker.applyPendingReleases;
 pub const cleanupResponses = worker.cleanupResponses;
-pub const pumpEvents = events_pump.pumpEvents;
-pub const cleanupClosedSseConnections = events_pump.cleanupClosedSseConnections;
-pub const sweepEvents = events_sweep.sweepEvents;
-pub const SSE_SWEEP_INTERVAL_NS = events_sweep.SWEEP_INTERVAL_NS;
 pub const flushLogs = worker.flushLogs;
 
 test {
@@ -106,8 +100,6 @@ test {
     _ = reserved;
     _ = session;
     _ = events;
-    _ = events_pump;
-    _ = events_sweep;
     _ = sse_dispatch;
     _ = sse_token;
     _ = release_table;

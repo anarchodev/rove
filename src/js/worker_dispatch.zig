@@ -30,8 +30,6 @@ const raft_propose = @import("raft_propose.zig");
 const panic_mod = @import("panic.zig");
 const worker_mod = @import("worker.zig");
 const session_mod = @import("session.zig");
-const events_mod = @import("events.zig");
-const events_pump = @import("events_pump.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
 const sse_token_mod = @import("sse_token.zig");
 
@@ -104,22 +102,6 @@ fn finalizeBatch(
         "tenant={s} err={s}",
         .{ anchor_id, @errorName(err) },
     );
-
-    // SSE: now that the writes are durable on the leader, mark any
-    // sids touched by `_events/{sid}/...` rows as dirty so the next
-    // pump tick wakes them up. Skip on no-writes (nothing to mark)
-    // and on lookup failure (anchor must exist for us to be here,
-    // but fail-soft if the tenant_files map raced a teardown).
-    if (has_writes) {
-        if (worker.tenant_files_map.get(anchor_id)) |tc| {
-            events_pump.markDirtyFromWriteset(tc, writeset) catch |err| {
-                std.log.warn(
-                    "rove-js: events_pump.markDirtyFromWriteset({s}) failed: {s}",
-                    .{ anchor_id, @errorName(err) },
-                );
-            };
-        }
-    }
 
     if (!has_writes and !has_webhooks) {
         // Pure read-only batch: no raft hop.
@@ -975,34 +957,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             worker.services_jwt_secret,
             worker.sse_public_base,
             scope_inst.id,
-            ent,
-            sid,
-            sess,
-            method,
-            path,
-            rh,
-            received_ns,
-        )) {
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 200, .ok, &.{}, &.{}, .{});
-            processed += 1;
-            continue;
-        }
-
-        // `/_events` — SSE endpoint, scoped to the resolved tenant
-        // (its sse_connections + dirty_sids tables). Mints
-        // `__Host-rove_sid` if absent, sends text/event-stream
-        // headers, moves into stream_response_in for the pump to
-        // drive on subsequent ticks. Caps + connect-rate enforced
-        // here so a flooding tenant can't exhaust resources before
-        // the connection table even sees them. See
-        // docs/sse-plan.md §11d-f.
-        if (try events_mod.tryHandleEvents(
-            server,
-            allocator,
-            tc,
-            scope_inst.id,
-            &worker.limiter,
-            events_mod.FREE,
             ent,
             sid,
             sess,

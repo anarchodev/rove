@@ -1629,73 +1629,7 @@ test "dispatch: kv.set + kv.get round trip" {
     try testing.expectEqualStrings("rove", r2.body);
 }
 
-test "dispatch: cross-tenant events.emit{to:} writes only to caller's kv" {
-    // SSE cross-tenant isolation argument from docs/sse-plan.md §2.2.
-    // events.emit({to: <tenant-A's sid>}) called from tenant B's
-    // handler writes the row into tenant B's app.db, NOT tenant A's.
-    // The pump on tenant A's host never reads from tenant B's db,
-    // so the spoofing attempt is structurally ineffective.
-    //
-    // This test models the per-tenant kv isolation by giving each
-    // "tenant" its own KvStore and confirming the cross-target emit
-    // lands only in the caller's. The actual host→tenant routing
-    // happens upstream in worker_dispatch.resolveRequest; here we
-    // exercise the kv-scope half of the argument.
-    var buf_a: [64]u8 = undefined;
-    const kv_a = try openTempKv(testing.allocator, &buf_a);
-    defer {
-        kv_a.close();
-        cleanupTempKv(&buf_a);
-    }
-
-    var buf_b: [64]u8 = undefined;
-    const kv_b = try openTempKv(testing.allocator, &buf_b);
-    defer {
-        kv_b.close();
-        cleanupTempKv(&buf_b);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    // Tenant A's session id — what tenant B is going to try to spoof
-    // by passing it to events.emit({to: ...}).
-    const sid_a = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
-    const sid_b: [64]u8 = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222".*;
-
-    // Tenant B's handler fires `events.emit({to: <sid_a>, data: "spoof"})`.
-    // Dispatch runs against kv_b (tenant B's app.db).
-    var resp = try runOne(
-        &d,
-        kv_b,
-        \\events.emit({to: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111", data: "spoof"});
-        \\return "ok";
-    ,
-        .{ .method = "POST", .path = "/", .session_id = sid_b, .request_id = 1 },
-    );
-    defer resp.deinit(testing.allocator);
-    try testing.expectEqualStrings("ok", resp.body);
-
-    // Spoof landed in tenant B's kv at the targeted sid prefix —
-    // confirms the JS-level emit went through.
-    const expected_b_key = "_events/" ++ sid_a ++ "/00000000000000000001-000000";
-    const v_in_b = try kv_b.get(expected_b_key);
-    defer testing.allocator.free(v_in_b);
-    try testing.expect(std.mem.indexOf(u8, v_in_b, "\"data\":\"spoof\"") != null);
-
-    // Tenant A's kv has NO _events/ rows — the cross-tenant write
-    // was structurally impossible. This is the load-bearing isolation
-    // claim: the pump on tenant A's host will iterate ONLY tenant
-    // A's kv when delivering to a connected EventSource client, so
-    // even though tenant B successfully wrote a row "addressed" to
-    // sid_a, nobody connected to tenant A's /_events will ever see it.
-    try testing.expectError(error.NotFound, kv_a.get(expected_b_key));
-    var scan_a = try kv_a.prefix("_events/", "", 100);
-    defer scan_a.deinit();
-    try testing.expectEqual(@as(usize, 0), scan_a.entries.len);
-}
-
-test "dispatch: events.emit string form writes to current sid" {
+test "dispatch: events.emit string form populates emit_buffer with current sid" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1705,32 +1639,37 @@ test "dispatch: events.emit string form writes to current sid" {
 
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
+
+    var emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
+    defer {
+        for (emits.items) |*e| e.deinit(testing.allocator);
+        emits.deinit(testing.allocator);
+    }
 
     const sid: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
-    var resp = try runOne(
-        &d,
-        kv,
+    var resp = try runOne(&d, kv,
         \\const id = events.emit("hello");
         \\return id;
-    ,
-        .{ .method = "POST", .path = "/", .session_id = sid, .request_id = 42 },
-    );
+    , .{
+        .method = "POST",
+        .path = "/",
+        .session_id = sid,
+        .request_id = 42,
+        .emit_buffer = &emits,
+    });
     defer resp.deinit(testing.allocator);
 
-    // Returned wire id is request_id-call_index, zero-padded.
     try testing.expectEqualStrings("00000000000000000042-000000", resp.body);
-
-    // The envelope was written to _events/{sid}/{wire_id}.
-    const expected_key = "_events/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/00000000000000000042-000000";
-    const env_bytes = try kv.get(expected_key);
-    defer testing.allocator.free(env_bytes);
-    // The data field should round-trip the string "hello".
-    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"data\":\"hello\"") != null);
-    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"type\":\"message\"") != null);
-    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"v\":1") != null);
+    try testing.expectEqual(@as(usize, 1), emits.items.len);
+    const e = &emits.items[0];
+    try testing.expectEqualStrings("00000000000000000042-000000", &e.event_id);
+    try testing.expectEqualStrings("message", e.event_type);
+    try testing.expectEqualStrings("\"hello\"", e.data_json);
+    try testing.expectEqual(@as(usize, 1), e.target_sids.len);
+    try testing.expectEqualStrings(&sid, e.target_sids[0]);
 }
 
-test "dispatch: events.emit object form with custom type + data" {
+test "dispatch: events.emit object form carries custom type + data" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1740,28 +1679,34 @@ test "dispatch: events.emit object form with custom type + data" {
 
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
+
+    var emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
+    defer {
+        for (emits.items) |*e| e.deinit(testing.allocator);
+        emits.deinit(testing.allocator);
+    }
 
     const sid: [64]u8 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".*;
-    var resp = try runOne(
-        &d,
-        kv,
+    var resp = try runOne(&d, kv,
         \\events.emit({type: "tick", data: {count: 7, label: "foo"}});
         \\return "ok";
-    ,
-        .{ .method = "POST", .path = "/", .session_id = sid, .request_id = 1 },
-    );
+    , .{
+        .method = "POST",
+        .path = "/",
+        .session_id = sid,
+        .request_id = 1,
+        .emit_buffer = &emits,
+    });
     defer resp.deinit(testing.allocator);
-    try testing.expectEqualStrings("ok", resp.body);
 
-    const expected_key = "_events/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789/00000000000000000001-000000";
-    const env_bytes = try kv.get(expected_key);
-    defer testing.allocator.free(env_bytes);
-    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"type\":\"tick\"") != null);
-    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"count\":7") != null);
-    try testing.expect(std.mem.indexOf(u8, env_bytes, "\"label\":\"foo\"") != null);
+    try testing.expectEqual(@as(usize, 1), emits.items.len);
+    const e = &emits.items[0];
+    try testing.expectEqualStrings("tick", e.event_type);
+    try testing.expect(std.mem.indexOf(u8, e.data_json, "\"count\":7") != null);
+    try testing.expect(std.mem.indexOf(u8, e.data_json, "\"label\":\"foo\"") != null);
 }
 
-test "dispatch: events.emit explicit fan-out writes to each sid" {
+test "dispatch: events.emit explicit fan-out lists both sids on the entry" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1772,29 +1717,36 @@ test "dispatch: events.emit explicit fan-out writes to each sid" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
+    var emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
+    defer {
+        for (emits.items) |*e| e.deinit(testing.allocator);
+        emits.deinit(testing.allocator);
+    }
+
     const me: [64]u8 = "1111111111111111111111111111111111111111111111111111111111111111".*;
-    var resp = try runOne(
-        &d,
-        kv,
+    var resp = try runOne(&d, kv,
         \\events.emit({to: ["aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
         \\                  "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"],
         \\             data: "x"});
         \\return "ok";
-    ,
-        .{ .method = "POST", .path = "/", .session_id = me, .request_id = 5 },
-    );
+    , .{
+        .method = "POST",
+        .path = "/",
+        .session_id = me,
+        .request_id = 5,
+        .emit_buffer = &emits,
+    });
     defer resp.deinit(testing.allocator);
 
-    // Both target sids got the envelope. Same wire id, different keys.
-    const a = try kv.get("_events/aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111/00000000000000000005-000000");
-    defer testing.allocator.free(a);
-    const b = try kv.get("_events/bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222/00000000000000000005-000000");
-    defer testing.allocator.free(b);
-    try testing.expectEqualSlices(u8, a, b);
-
-    // The current sid did NOT receive a copy — explicit `to:`
-    // overrides the implicit-target.
-    try testing.expectError(error.NotFound, kv.get("_events/1111111111111111111111111111111111111111111111111111111111111111/00000000000000000005-000000"));
+    try testing.expectEqual(@as(usize, 1), emits.items.len);
+    const e = &emits.items[0];
+    try testing.expectEqual(@as(usize, 2), e.target_sids.len);
+    try testing.expectEqualStrings("aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111", e.target_sids[0]);
+    try testing.expectEqualStrings("bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222", e.target_sids[1]);
+    // Explicit `to:` overrides the implicit-target — `me` doesn't appear.
+    for (e.target_sids) |s| {
+        try testing.expect(!std.mem.eql(u8, s, &me));
+    }
 }
 
 test "dispatch: events.emit increments call_index across calls" {
@@ -1995,16 +1947,16 @@ test "dispatch: kv.delete rejects platform-reserved prefixes" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // Seed an event row directly through the kv (simulating a real
-    // events.emit having written it earlier).
-    try kv.put("_events/sid/0001-000001", "real_event");
+    // Seed a callback row directly through the kv (simulating a real
+    // envelope-5 apply having written it earlier).
+    try kv.put("_callback/abc123", "real_receipt");
 
     // Customer kv.delete against the reserved prefix throws.
     var resp = try runOne(
         &d,
         kv,
         \\try {
-        \\  kv.delete("_events/sid/0001-000001");
+        \\  kv.delete("_callback/abc123");
         \\  return "no_throw";
         \\} catch (e) {
         \\  return e.code;
@@ -2017,9 +1969,9 @@ test "dispatch: kv.delete rejects platform-reserved prefixes" {
     try testing.expectEqualStrings("reserved_key", resp.body);
 
     // The seeded row must still be there.
-    const v = try kv.get("_events/sid/0001-000001");
+    const v = try kv.get("_callback/abc123");
     defer testing.allocator.free(v);
-    try testing.expectEqualStrings("real_event", v);
+    try testing.expectEqualStrings("real_receipt", v);
 }
 
 test "dispatch: kv.set into customer namespace still works" {

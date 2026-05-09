@@ -279,17 +279,13 @@ pub fn jsEventsEmit(
         }
     }
 
-    // Build envelope (JSON). Per emit, not per target — the same
-    // envelope bytes get written under each target's prefix.
+    // Wire id + inner-data extraction. The wire body sse-server
+    // expects has its own slots for type / event_id / created_at_ms,
+    // so we pass `data` verbatim — no wrapping envelope.
     var wire_id: [WIRE_ID_LEN]u8 = undefined;
     const wire_id_slice = formatWireId(&wire_id, state.request_id, state.events_call_index);
     const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
 
-    // Pull the inner `data` JSON bytes once. The legacy kv-row
-    // envelope wraps this inside a `{v, id, type, data, ...}` object;
-    // the new emit_buffer path passes these bytes through verbatim
-    // because sse-server's wire body has its own slots for type +
-    // event_id + created_at_ms — wrapping again would double-nest.
     var inner_data_bytes: []const u8 = "null";
     var inner_data_cstr_to_free: ?[*c]const u8 = null;
     defer if (inner_data_cstr_to_free) |p| c.JS_FreeCString(ctx, p);
@@ -301,66 +297,6 @@ pub fn jsEventsEmit(
         inner_data_bytes = @as([*]const u8, @ptrCast(dcstr))[0..dlen];
     }
 
-    const env = c.JS_NewObject(ctx);
-    defer c.JS_FreeValue(ctx, env);
-    _ = c.JS_SetPropertyStr(ctx, env, "v", c.JS_NewInt32(ctx, 1));
-    _ = c.JS_SetPropertyStr(ctx, env, "id", c.JS_NewStringLen(ctx, wire_id_slice.ptr, wire_id_slice.len));
-    if (type_owned) |t| {
-        _ = c.JS_SetPropertyStr(ctx, env, "type", c.JS_NewStringLen(ctx, t.ptr, t.len));
-    } else {
-        _ = c.JS_SetPropertyStr(ctx, env, "type", c.JS_NewStringLen(ctx, "message", "message".len));
-    }
-    // Re-parse the inner data bytes into a JSValue so the envelope's
-    // stringify embeds it as a value (not a string-wrapped JSON).
-    if (inner_data_cstr_to_free == null) {
-        _ = c.JS_SetPropertyStr(ctx, env, "data", js_null);
-    } else {
-        const parsed = c.JS_ParseJSON(ctx, inner_data_cstr_to_free.?, inner_data_bytes.len, "<data>");
-        if (c.JS_IsException(parsed)) return js_exception;
-        _ = c.JS_SetPropertyStr(ctx, env, "data", parsed);
-    }
-    _ = c.JS_SetPropertyStr(ctx, env, "created_at_ms", c.JS_NewInt64(ctx, now_ms));
-    _ = c.JS_SetPropertyStr(ctx, env, "parent_request_id", c.JS_NewInt64(ctx, @bitCast(state.request_id)));
-
-    // Serialize envelope → bytes for the legacy kv-row write.
-    const json = c.JS_JSONStringify(ctx, env, js_undefined, js_undefined);
-    if (c.JS_IsException(json) or c.JS_IsUndefined(json)) {
-        c.JS_FreeValue(ctx, json);
-        return js_exception;
-    }
-    defer c.JS_FreeValue(ctx, json);
-
-    var json_len: usize = 0;
-    const json_cstr = c.JS_ToCStringLen(ctx, &json_len, json);
-    if (json_cstr == null) return js_exception;
-    defer c.JS_FreeCString(ctx, json_cstr);
-    const json_slice = @as([*]const u8, @ptrCast(json_cstr))[0..json_len];
-
-    // Write `_events/{sid}/{wire_id}` for each target through the
-    // handler's tx + writeset so all events commit (or roll back)
-    // atomically with the rest of the handler's kv writes.
-    var key_buf: [8 + 64 + 1 + WIRE_ID_LEN]u8 = undefined;
-    for (targets) |sid| {
-        const key = std.fmt.bufPrint(
-            &key_buf,
-            "_events/{s}/{s}",
-            .{ sid, wire_id_slice },
-        ) catch unreachable;
-
-        state.txn.put(key, json_slice) catch |err| {
-            state.pending_kv_error = err;
-            return js_exception;
-        };
-        state.writeset.addPut(key, json_slice) catch |err| {
-            state.pending_kv_error = err;
-            return js_exception;
-        };
-    }
-
-    // Plan §3 parallel-run path: append to the per-batch emit buffer
-    // so the worker's post-raft pump can fire a fire-and-forget POST
-    // at sse-server. The legacy kv-row write above stays in place
-    // until the worker's `/_events` route is retired (plan §7 step 7).
     if (state.emit_buffer) |buf| {
         appendEmitEntry(state, buf, wire_id_slice, type_owned, inner_data_bytes, targets, now_ms) catch |err| {
             state.pending_kv_error = err;

@@ -14,7 +14,7 @@
 //!
 //! - `isCustomerWriteReserved` (runtime guard on `kv.set` / `kv.delete`):
 //!   rejects any key starting with a platform prefix. Customer code has
-//!   no business writing into `_events/`, `_callback/`, etc. — those
+//!   no business writing into `_callback/`, `_audit/`, etc. — those
 //!   are platform-write-only. Platform writes bypass `jsKvSet` and
 //!   write directly via `state.txn.put`, so this check catches only
 //!   the spoofing path through `kv.set`.
@@ -33,8 +33,12 @@ const std = @import("std");
 ///                         the worker can drop log.db opens entirely).
 ///   `_magic/`           → magic-link tokens (root.db only, but list-wide)
 ///   `_triggers/`        → trigger module bytecode (manifest, not app.db)
-///   `_events/`          → SSE event rows (events.emit writes)
 ///   `_sessions/`        → reserved for future platform session storage
+///
+/// `_events/` was reserved for SSE event rows under the legacy worker
+/// pump; the centralized sse-server retired that storage layer
+/// (sse-plan §7), so the prefix is no longer special — customer code
+/// is free to use it.
 pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_audit/",
     "_deploy/",
@@ -42,7 +46,6 @@ pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_log/",
     "_magic/",
     "_triggers/",
-    "_events/",
     "_sessions/",
 };
 
@@ -83,15 +86,18 @@ test "isReservedTriggerPrefix: customer prefixes are allowed" {
 test "isReservedTriggerPrefix: exact platform prefix blocked" {
     try std.testing.expect(isReservedTriggerPrefix("_audit/"));
     try std.testing.expect(isReservedTriggerPrefix("_callback/"));
-    try std.testing.expect(isReservedTriggerPrefix("_events/"));
     try std.testing.expect(isReservedTriggerPrefix("_log/"));
     try std.testing.expect(isReservedTriggerPrefix("_sessions/"));
     try std.testing.expect(isReservedTriggerPrefix("_triggers/"));
 }
 
+test "isReservedTriggerPrefix: _events/ no longer reserved" {
+    try std.testing.expect(!isReservedTriggerPrefix("_events/"));
+}
+
 test "isReservedTriggerPrefix: descendant of platform prefix blocked" {
     try std.testing.expect(isReservedTriggerPrefix("_callback/specific_id"));
-    try std.testing.expect(isReservedTriggerPrefix("_events/sid/0001-000001"));
+    try std.testing.expect(isReservedTriggerPrefix("_audit/secrets"));
 }
 
 test "isReservedTriggerPrefix: ancestor catching platform prefix blocked" {
@@ -109,12 +115,15 @@ test "isReservedTriggerPrefix: deeper-than-platform blocked (would catch system 
 }
 
 test "isCustomerWriteReserved: platform prefixes blocked" {
-    try std.testing.expect(isCustomerWriteReserved("_events/sid/0001-000001"));
     try std.testing.expect(isCustomerWriteReserved("_callback/xyz"));
     try std.testing.expect(isCustomerWriteReserved("_audit/anything"));
     try std.testing.expect(isCustomerWriteReserved("_log/next_request_seq"));
     try std.testing.expect(isCustomerWriteReserved("_magic/token"));
     try std.testing.expect(isCustomerWriteReserved("_triggers/users/index.mjs"));
+}
+
+test "isCustomerWriteReserved: _events/ no longer reserved" {
+    try std.testing.expect(!isCustomerWriteReserved("_events/sid/0001-000001"));
 }
 
 test "isCustomerWriteReserved: customer keys allowed" {
