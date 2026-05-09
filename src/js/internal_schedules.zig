@@ -36,36 +36,38 @@
 //! ~10-50ms; dispatch tick is sub-ms). Caller owns the map; we
 //! mutate it and clear on demote.
 //!
-//! ## What the (target tenant's) handler can do today
+//! ## What the (target tenant's) handler can do
+//!
+//! Same surface as an inbound h2 request — full parity with the
+//! libcurl path through cluster ingress:
 //!
 //! - Read + write its own kv. Writes ride envelope-0 alongside the
 //!   schedule_complete envelope-9 in a multi-envelope, atomic with
 //!   the schedule row delete + caller-tenant `_callback/{id}` write.
+//! - Recursively call `http.send` / `http.cancel`. Queued schedules
+//!   ride envelope-8 / envelope-10 in the same multi-envelope.
+//! - Call `events.emit`. Emits fire fire-and-forget at sse-server
+//!   *after* raft accepts the multi-envelope, scoped to the target
+//!   tenant — same lifecycle as h2 / callback dispatch.
 //! - Return a JS response (status, body). Captured into envelope-9
 //!   exactly like the libcurl path captures an HTTP response.
 //!
-//! ## What it can NOT do today (5c initial scope)
-//!
-//! - Recursive `http.send` / `http.cancel` from within the handler.
-//!   The Request's `pending_*` accumulators are null, so the bindings
-//!   throw. Same restriction `dispatchCallbacks` removed in a follow-
-//!   up; we'll do the same here when there's a concrete need.
-//! - `events.emit`. Same reason.
-//!
-//! These are deliberate — `webhook.loop46.com` (the main v1 use
-//! case) is read-only-on-its-own-state; the recursive surface lands
-//! when a concrete customer recipe needs it.
+//! All four accumulator buffers are allocated per-row in
+//! `runOneInternal` and live for the dispatch's lifetime. Same shape
+//! `worker_dispatch` and `callback_dispatch` already use.
 
 const std = @import("std");
 const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const schedule_server = @import("rove-schedule-server");
+const webhook_server_mod = @import("rove-webhook-server");
 
 const apply_mod = @import("apply.zig");
 const dispatcher_mod = @import("dispatcher.zig");
 const router_mod = @import("router.zig");
 const worker_mod = @import("worker.zig");
+const sse_dispatch = @import("sse_dispatch.zig");
 
 const Request = dispatcher_mod.Request;
 const Budget = dispatcher_mod.Budget;
@@ -192,7 +194,7 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
         // No handler at this path. Surface as a 404 to the caller's
         // on_result; same shape as libcurl would have produced if the
         // ingress routed to the same handler-less path.
-        return proposeComplete(worker, stored, target_id, null, .failed, 404, "", "no handler at path");
+        return proposeResult(worker, stored, target_id, null, null, null, null, .failed, 404, "", "no handler at path");
     };
 
     // 4. Open a write txn against the target tenant's app.db. Mirrors
@@ -213,6 +215,30 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
 
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
+
+    // Per-dispatch accumulator buffers — same shape h2 dispatch +
+    // callback dispatch use. Target handler appends via the JS
+    // bindings; we drain into the multi-envelope after commit.
+    var pending_webhooks: std.ArrayListUnmanaged(webhook_server_mod.WebhookRow) = .empty;
+    defer {
+        for (pending_webhooks.items) |*r| r.deinit(allocator);
+        pending_webhooks.deinit(allocator);
+    }
+    var pending_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
+    defer {
+        for (pending_emits.items) |*e| e.deinit(allocator);
+        pending_emits.deinit(allocator);
+    }
+    var pending_schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
+    defer {
+        for (pending_schedules.items) |*r| r.deinit(allocator);
+        pending_schedules.deinit(allocator);
+    }
+    var pending_cancels: std.ArrayListUnmanaged(schedule_server.CancelTarget) = .empty;
+    defer {
+        for (pending_cancels.items) |*t| t.deinit(allocator);
+        pending_cancels.deinit(allocator);
+    }
 
     // 5. Synthesize Request from the schedule row.
     const request_id: u64 = blk: {
@@ -243,12 +269,10 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
         .platform = inst.platform,
         .limiter = &worker.limiter,
         .instance_id = inst.id,
-        // 5c initial scope: target handler can't recursively call
-        // http.send / events.emit. Lifts when there's a concrete need.
-        .pending_webhooks = null,
-        .emit_buffer = null,
-        .pending_schedules = null,
-        .pending_cancels = null,
+        .pending_webhooks = &pending_webhooks,
+        .emit_buffer = &pending_emits,
+        .pending_schedules = &pending_schedules,
+        .pending_cancels = &pending_cancels,
     };
 
     // 6. Run the handler. Same call shape as inbound h2 dispatch.
@@ -266,10 +290,13 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
     ) catch |err| {
         txn.rollback() catch {};
         committed = true; // skip the errdefer rollback
-        return proposeComplete(
+        return proposeResult(
             worker,
             stored,
             target_id,
+            null,
+            null,
+            null,
             null,
             .failed,
             if (err == dispatcher_mod.DispatchError.Interrupted) 504 else 500,
@@ -283,10 +310,13 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
         worker.dispatcher.last_kv_error = null;
         txn.rollback() catch {};
         committed = true;
-        return proposeComplete(
+        return proposeResult(
             worker,
             stored,
             target_id,
+            null,
+            null,
+            null,
             null,
             .failed,
             500,
@@ -298,10 +328,13 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
     if (resp.exception.len > 0) {
         txn.rollback() catch {};
         committed = true;
-        return proposeComplete(
+        return proposeResult(
             worker,
             stored,
             target_id,
+            null,
+            null,
+            null,
             null,
             .failed,
             500,
@@ -327,7 +360,50 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
     else
         .failed;
 
-    try proposeComplete(worker, stored, target_id, &writeset, outcome, status, body_capped, "");
+    try proposeResult(
+        worker,
+        stored,
+        target_id,
+        &writeset,
+        pending_webhooks.items,
+        pending_schedules.items,
+        pending_cancels.items,
+        outcome,
+        status,
+        body_capped,
+        "",
+    );
+
+    // 9. Fire-and-forget SSE emits at sse-server. Only after raft
+    //    accepts the multi-envelope above, mirroring worker_dispatch
+    //    + callback_dispatch lifecycle. Scoped to the *target* tenant
+    //    (whose handler emitted) — that's where the subscribers are.
+    fireEmitsIfWired(worker, target_id, &pending_emits);
+}
+
+fn fireEmitsIfWired(
+    worker: anytype,
+    tenant_id: []const u8,
+    pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
+) void {
+    if (pending_emits.items.len == 0) return;
+    const easy = worker.sse_curl orelse return;
+    const base = worker.sse_public_base orelse return;
+    const tok = worker.sse_internal_token orelse return;
+    if (base.len == 0 or tok.len == 0) return;
+    sse_dispatch.fireBatch(
+        worker.allocator,
+        easy,
+        base,
+        tok,
+        tenant_id,
+        // No batch-level request_id breadcrumb on this path —
+        // schedule dispatch isn't tied to one inbound request. Same
+        // posture as callback_dispatch's emit fire.
+        0,
+        pending_emits.items,
+        worker.sse_insecure_tls,
+    );
 }
 
 /// Build envelope-11 (schedule_demote) and propose. The row stays
@@ -354,14 +430,30 @@ fn proposeDemote(worker: anytype, stored: *const schedule_server.StoredSchedule)
     };
 }
 
-/// Build envelope-9 (schedule_complete) carrying the dispatch result
-/// + optional envelope-0 (target writeset). Wraps in multi when the
-/// writeset is non-null and non-empty; bare envelope-9 otherwise.
-fn proposeComplete(
+/// Build the multi-envelope carrying every state change this
+/// dispatch produces:
+///
+///   - target writeset (env-0)            — non-empty target.kv writes
+///   - target's recursive http.send       — env-8 (schedule_upsert)
+///   - target's recursive http.cancel     — env-10 (schedule_cancel)
+///   - target's recursive webhook.send    — env-4 (webhook_enqueue)
+///   - this dispatch's complete           — env-9 (schedule_complete)
+///
+/// Always at least one envelope (the complete). Wraps in env-7
+/// (multi) when ≥2 are present; bare propose otherwise. Same atomicity
+/// shape `proposeBatchAndWebhooks` uses for the inbound h2 path.
+///
+/// On the failure paths (handler threw, kv error, etc.) the caller
+/// passes null/empty for everything except the complete; the propose
+/// degrades to a single envelope-9.
+fn proposeResult(
     worker: anytype,
     stored: *const schedule_server.StoredSchedule,
     target_id: []const u8,
     writeset: ?*const kv_mod.WriteSet,
+    webhooks: ?[]const webhook_server_mod.WebhookRow,
+    schedules: ?[]const schedule_server.ScheduleRow,
+    cancels: ?[]const schedule_server.CancelTarget,
     outcome: schedule_server.Outcome,
     status: u16,
     response_body: []const u8,
@@ -369,6 +461,7 @@ fn proposeComplete(
 ) !void {
     const allocator = worker.allocator;
 
+    // Build the always-present complete envelope.
     const env: schedule_server.CompleteEnvelope = .{
         .tenant_id = stored.row.tenant_id,
         .id = stored.row.id,
@@ -386,23 +479,50 @@ fn proposeComplete(
         stored.row.tenant_id,
         complete_payload,
     );
-    defer allocator.free(complete_env);
+
+    // Collect optional envelopes. Track ownership so we free on
+    // every exit, including the bare-propose fast path below.
+    var inner_envs: [5][]u8 = undefined;
+    var inner_count: usize = 0;
+    inner_envs[inner_count] = complete_env;
+    inner_count += 1;
+    defer for (inner_envs[0..inner_count]) |env_bytes| allocator.free(env_bytes);
 
     const has_writes = if (writeset) |ws| ws.ops.items.len > 0 else false;
-    if (!has_writes) {
-        const seq = worker.raft.highWatermark() + 1;
-        try worker.raft.propose(seq, complete_env);
+    if (has_writes) {
+        const ws_bytes = try writeset.?.encode(allocator);
+        defer allocator.free(ws_bytes);
+        inner_envs[inner_count] = try apply_mod.encodeWriteSetEnvelope(allocator, target_id, ws_bytes);
+        inner_count += 1;
+    }
+    if (webhooks) |whs| if (whs.len > 0) {
+        const payload = try webhook_server_mod.encodeEnqueueBatch(allocator, whs);
+        defer allocator.free(payload);
+        inner_envs[inner_count] = try apply_mod.encodeWebhookEnqueueBatchEnvelope(allocator, payload);
+        inner_count += 1;
+    };
+    if (schedules) |scs| if (scs.len > 0) {
+        const payload = try schedule_server.encodeUpsertBatch(allocator, scs);
+        defer allocator.free(payload);
+        inner_envs[inner_count] = try apply_mod.encodeScheduleUpsertEnvelope(allocator, payload);
+        inner_count += 1;
+    };
+    if (cancels) |cncs| if (cncs.len > 0) {
+        const payload = try schedule_server.encodeCancelBatch(allocator, cncs);
+        defer allocator.free(payload);
+        inner_envs[inner_count] = try apply_mod.encodeScheduleCancelEnvelope(allocator, payload);
+        inner_count += 1;
+    };
+
+    const seq = worker.raft.highWatermark() + 1;
+    if (inner_count == 1) {
+        try worker.raft.propose(seq, inner_envs[0]);
         return;
     }
-
-    const ws_bytes = try writeset.?.encode(allocator);
-    defer allocator.free(ws_bytes);
-    const ws_env = try apply_mod.encodeWriteSetEnvelope(allocator, target_id, ws_bytes);
-    defer allocator.free(ws_env);
-
-    const wrapped = try apply_mod.encodeMultiEnvelope(allocator, &.{ ws_env, complete_env });
+    var inner_const: [5][]const u8 = undefined;
+    for (inner_envs[0..inner_count], 0..) |env_bytes, i| inner_const[i] = env_bytes;
+    const wrapped = try apply_mod.encodeMultiEnvelope(allocator, inner_const[0..inner_count]);
     defer allocator.free(wrapped);
-    const seq = worker.raft.highWatermark() + 1;
     try worker.raft.propose(seq, wrapped);
 }
 
