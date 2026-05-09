@@ -1,7 +1,9 @@
 // on_result handler for the http.send fast-path smoke. Captures the
 // event into kv keyed by the schedule id so the smoke script can
-// assert end-to-end shape via the admin API.
-export default function (event) {
+// assert end-to-end shape via the admin API. Reads the event from
+// request.body — same shape as any other HTTP handler in the tenant.
+export default function () {
+    const event = JSON.parse(request.body);
     const record = {
         id: event.id,
         ok: event.ok,

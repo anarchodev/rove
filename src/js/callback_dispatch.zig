@@ -326,7 +326,7 @@ fn runOneCallback(
         return .dropped;
     };
 
-    const body = try buildCallbackBody(allocator, parsed.value);
+    const body = try buildCallbackEvent(allocator, parsed.value);
     defer allocator.free(body);
 
     try txn.savepoint();
@@ -447,9 +447,26 @@ fn findCallbackBytecode(
 
 /// Build the dispatcher's POST body — `{fn: "default", args: [event]}`
 /// — from the parsed envelope. Keys in the outer envelope are
-/// snake_case (as written by envelope-5 apply); the event object
-/// exposed to JS uses camelCase, matching PLAN §2.6.
-fn buildCallbackBody(
+/// snake_case (as written by envelope-5/9 apply); the event object
+/// the handler sees uses camelCase, matching PLAN §2.6.
+///
+/// The returned bytes are the request body — a JSON object whose
+/// fields are the camelCased translations of the envelope. The
+/// dispatcher's `parseDispatch` (no `fn` key in the JSON object)
+/// falls through to the query-string path, picks the default export,
+/// invokes it with no JS args. The customer's handler reads the
+/// event via the global `request.body`:
+///
+/// ```js
+/// export default function () {
+///   const event = JSON.parse(request.body);
+///   // ...
+/// }
+/// ```
+///
+/// Same shape as a regular HTTP handler — no special on_result
+/// signature.
+fn buildCallbackEvent(
     allocator: std.mem.Allocator,
     envelope: std.json.Value,
 ) ![]u8 {
@@ -463,7 +480,7 @@ fn buildCallbackBody(
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &list);
     const w = &aw.writer;
 
-    try w.writeAll("{\"fn\":\"default\",\"args\":[{");
+    try w.writeAll("{");
     var first = true;
     for (FIELD_MAP) |fm| {
         const v = obj.get(fm.src) orelse continue;
@@ -475,7 +492,7 @@ fn buildCallbackBody(
         try w.writeAll("\":");
         try std.json.Stringify.value(v, .{}, w);
     }
-    try w.writeAll("}]}");
+    try w.writeAll("}");
     return aw.toOwnedSlice();
 }
 
@@ -518,7 +535,7 @@ fn dropReceipt(
 
 const testing = std.testing;
 
-test "buildCallbackBody: delivered envelope → camelCase event" {
+test "buildCallbackEvent: delivered envelope → camelCase event in body" {
     const envelope_bytes =
         \\{
         \\  "webhook_id": "abc123",
@@ -532,25 +549,26 @@ test "buildCallbackBody: delivered envelope → camelCase event" {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, envelope_bytes, .{});
     defer parsed.deinit();
 
-    const body = try buildCallbackBody(testing.allocator, parsed.value);
+    const body = try buildCallbackEvent(testing.allocator, parsed.value);
     defer testing.allocator.free(body);
 
-    // Re-parse to check structure without depending on key order.
-    var out = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
-    defer out.deinit();
-    try testing.expectEqualStrings("default", out.value.object.get("fn").?.string);
-    const args = out.value.object.get("args").?.array;
-    try testing.expectEqual(@as(usize, 1), args.items.len);
-    const event = args.items[0].object;
-    try testing.expectEqualStrings("abc123", event.get("webhookId").?.string);
-    try testing.expectEqualStrings("delivered", event.get("outcome").?.string);
-    try testing.expectEqual(@as(i64, 2), event.get("attempts").?.integer);
-    try testing.expectEqualStrings("c_1", event.get("context").?.object.get("chargeId").?.string);
-    try testing.expectEqual(@as(i64, 200), event.get("response").?.object.get("status").?.integer);
-    try testing.expect(event.get("on_result") == null); // stays on server side
+    // The body IS the event — no `{fn, args}` wrapping. Customer's
+    // handler reads `request.body` and parses it.
+    var event = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer event.deinit();
+    const obj = event.value.object;
+    try testing.expectEqualStrings("abc123", obj.get("webhookId").?.string);
+    try testing.expectEqualStrings("delivered", obj.get("outcome").?.string);
+    try testing.expectEqual(@as(i64, 2), obj.get("attempts").?.integer);
+    try testing.expectEqualStrings("c_1", obj.get("context").?.object.get("chargeId").?.string);
+    try testing.expectEqual(@as(i64, 200), obj.get("response").?.object.get("status").?.integer);
+    try testing.expect(obj.get("on_result") == null); // stays on server side
+    // No `fn` key: parseDispatch falls through to `?fn=default`, no JS args.
+    try testing.expect(obj.get("fn") == null);
+    try testing.expect(obj.get("args") == null);
 }
 
-test "buildCallbackBody: failed envelope → error field passthrough" {
+test "buildCallbackEvent: failed envelope → error field passthrough" {
     const envelope_bytes =
         \\{
         \\  "webhook_id": "xyz",
@@ -564,22 +582,21 @@ test "buildCallbackBody: failed envelope → error field passthrough" {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, envelope_bytes, .{});
     defer parsed.deinit();
 
-    const body = try buildCallbackBody(testing.allocator, parsed.value);
+    const body = try buildCallbackEvent(testing.allocator, parsed.value);
     defer testing.allocator.free(body);
 
-    var out = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
-    defer out.deinit();
-    const event = out.value.object.get("args").?.array.items[0].object;
-    try testing.expectEqualStrings("failed", event.get("outcome").?.string);
-    try testing.expectEqualStrings("Timeout", event.get("error").?.string);
-    try testing.expect(event.get("response") == null);
-    // Null `context` from the envelope should be dropped so the JS
-    // side sees `event.context === undefined`, not `null`. (Either
-    // is acceptable; dropping keeps the event payload small.)
-    try testing.expect(event.get("context") == null);
+    var event = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer event.deinit();
+    const obj = event.value.object;
+    try testing.expectEqualStrings("failed", obj.get("outcome").?.string);
+    try testing.expectEqualStrings("Timeout", obj.get("error").?.string);
+    try testing.expect(obj.get("response") == null);
+    // Null `context` from the envelope is dropped so the handler sees
+    // `event.context === undefined`, not `null`.
+    try testing.expect(obj.get("context") == null);
 }
 
-test "buildCallbackBody: schedule envelope-9 → camelCase event with id/ok/status/version/body" {
+test "buildCallbackEvent: schedule envelope-9 → camelCase event with id/ok/status/version/body" {
     const envelope_bytes =
         \\{
         \\  "id": "sched-abc",
@@ -595,24 +612,24 @@ test "buildCallbackBody: schedule envelope-9 → camelCase event with id/ok/stat
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, envelope_bytes, .{});
     defer parsed.deinit();
 
-    const body = try buildCallbackBody(testing.allocator, parsed.value);
+    const body = try buildCallbackEvent(testing.allocator, parsed.value);
     defer testing.allocator.free(body);
 
-    var out = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
-    defer out.deinit();
-    const event = out.value.object.get("args").?.array.items[0].object;
-    try testing.expectEqualStrings("sched-abc", event.get("id").?.string);
-    try testing.expectEqual(true, event.get("ok").?.bool);
-    try testing.expectEqual(@as(i64, 200), event.get("status").?.integer);
-    try testing.expectEqual(@as(i64, 3), event.get("version").?.integer);
-    try testing.expectEqualStrings("{\"forwarded\":true}", event.get("body").?.string);
-    try testing.expectEqualStrings("o-42", event.get("context").?.object.get("orderId").?.string);
+    var event = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer event.deinit();
+    const obj = event.value.object;
+    try testing.expectEqualStrings("sched-abc", obj.get("id").?.string);
+    try testing.expectEqual(true, obj.get("ok").?.bool);
+    try testing.expectEqual(@as(i64, 200), obj.get("status").?.integer);
+    try testing.expectEqual(@as(i64, 3), obj.get("version").?.integer);
+    try testing.expectEqualStrings("{\"forwarded\":true}", obj.get("body").?.string);
+    try testing.expectEqualStrings("o-42", obj.get("context").?.object.get("orderId").?.string);
     // No webhook fields leaked through.
-    try testing.expect(event.get("webhookId") == null);
-    try testing.expect(event.get("attempts") == null);
-    try testing.expect(event.get("response") == null);
-    try testing.expect(event.get("on_result") == null); // server-side only
-    try testing.expect(event.get("error") == null); // null in envelope → dropped
+    try testing.expect(obj.get("webhookId") == null);
+    try testing.expect(obj.get("attempts") == null);
+    try testing.expect(obj.get("response") == null);
+    try testing.expect(obj.get("on_result") == null); // server-side only
+    try testing.expect(obj.get("error") == null); // null in envelope → dropped
 }
 
 test "findCallbackBytecode: exact .mjs match wins over .js" {

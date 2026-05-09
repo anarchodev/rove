@@ -19,9 +19,11 @@
 //     context: { charge_id: 42 },
 //   });
 //
-//   // The on_result handler.
+//   // The on_result handler. Same shape as any other HTTP handler
+//   // in the tenant — no args, event arrives in `request.body`.
 //   // charges/handler.mjs
-//   export default function (event) {
+//   export default function () {
+//     const event = JSON.parse(request.body);
 //     if (retry.shouldRetry(event)) {
 //       retry.next(event);
 //       return;

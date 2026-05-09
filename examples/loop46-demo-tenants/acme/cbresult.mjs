@@ -1,9 +1,10 @@
 // on_result handler for the cbfire/webhook.send → polyfill →
-// http.send → schedule_complete pipeline. The receipt event shape
-// is the http-send schedule shape (id/ok/status/version/body/...);
-// the legacy webhook event shape (outcome/attempts/response/...)
-// went away with the C webhook.send binding.
-export default function (event) {
+// http.send → schedule_complete pipeline. Same shape as a regular
+// HTTP request handler — no args, event JSON arrives in
+// `request.body`. The schedule envelope-9 event shape is
+// {id, ok, status, body, context, error}.
+export default function () {
+    const event = JSON.parse(request.body);
     const record = {
         ok: event.ok,
         status: event.status,
