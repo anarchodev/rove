@@ -1970,6 +1970,173 @@ test "dispatch: http.cancel appends a CancelTarget" {
     try testing.expectEqualStrings("reminder-foo", cancels.items[0].id);
 }
 
+test "dispatch: retry.send fires http.send with _retry context wrapper" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
+    defer {
+        for (schedules.items) |*r| r.deinit(testing.allocator);
+        schedules.deinit(testing.allocator);
+    }
+
+    var resp = try runOne(&d, kv,
+        \\return retry.send({
+        \\  url: "https://api.stripe.com/v1/charges",
+        \\  body: "x",
+        \\  on_result_module: "stripe_done",
+        \\  max_attempts: 3,
+        \\  context: { charge_id: 42 },
+        \\});
+    , .{
+        .method = "POST",
+        .path = "/",
+        .request_id = 7,
+        .pending_schedules = &schedules,
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), schedules.items.len);
+    const row = &schedules.items[0];
+    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", row.url);
+    try testing.expectEqualStrings("stripe_done", row.on_result_module);
+
+    // Context carries _retry meta: attempt=1, max_attempts=3, original/etc.
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, row.context_json, .{});
+    defer parsed.deinit();
+    const ctx = parsed.value.object;
+    try testing.expectEqual(@as(i64, 42), ctx.get("charge_id").?.integer);
+    const r = ctx.get("_retry").?.object;
+    try testing.expectEqual(@as(i64, 1), r.get("attempt").?.integer);
+    try testing.expectEqual(@as(i64, 3), r.get("max_attempts").?.integer);
+    try testing.expectEqualStrings("stripe_done", r.get("on_result_module").?.string);
+    const orig = r.get("original").?.object;
+    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", orig.get("url").?.string);
+}
+
+test "dispatch: retry.shouldRetry true on failure with attempts left, false otherwise" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const base = (ctx) => ({ context: ctx });
+        \\const ok = retry.shouldRetry({ ok: true, ...base({ _retry: { attempt: 1, max_attempts: 3 } }) });
+        \\const failed_with_attempts = retry.shouldRetry({ ok: false, ...base({ _retry: { attempt: 1, max_attempts: 3 } }) });
+        \\const failed_exhausted = retry.shouldRetry({ ok: false, ...base({ _retry: { attempt: 3, max_attempts: 3 } }) });
+        \\const no_retry_meta = retry.shouldRetry({ ok: false, context: { charge_id: 42 } });
+        \\return [ok, failed_with_attempts, failed_exhausted, no_retry_meta].join(",");
+    , .{
+        .method = "POST",
+        .path = "/",
+        .request_id = 1,
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("false,true,false,false", resp.body);
+}
+
+test "dispatch: retry.next fires a new http.send with attempt+1" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
+    defer {
+        for (schedules.items) |*r| r.deinit(testing.allocator);
+        schedules.deinit(testing.allocator);
+    }
+
+    var resp = try runOne(&d, kv,
+        \\const event = {
+        \\  ok: false,
+        \\  status: 503,
+        \\  context: {
+        \\    charge_id: 42,
+        \\    _retry: {
+        \\      attempt: 1,
+        \\      max_attempts: 3,
+        \\      on_result_module: "stripe_done",
+        \\      original: { url: "https://stripe.com/x", method: "POST", body: "amount=500" },
+        \\    },
+        \\  },
+        \\};
+        \\return retry.next(event);
+    , .{
+        .method = "POST",
+        .path = "/",
+        .request_id = 1,
+        .pending_schedules = &schedules,
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), schedules.items.len);
+    const row = &schedules.items[0];
+    try testing.expectEqualStrings("https://stripe.com/x", row.url);
+    try testing.expectEqualStrings("amount=500", row.body);
+    try testing.expectEqualStrings("stripe_done", row.on_result_module);
+    // fire_at_ns nonzero — default exponential backoff applies on
+    // the first retry. We don't pin the exact value (depends on
+    // Date.now()); just confirm it's in the future.
+    try testing.expect(row.fire_at_ns > 0);
+
+    // Context carries the bumped attempt + preserved user fields.
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, row.context_json, .{});
+    defer parsed.deinit();
+    const ctx = parsed.value.object;
+    try testing.expectEqual(@as(i64, 42), ctx.get("charge_id").?.integer);
+    const r = ctx.get("_retry").?.object;
+    try testing.expectEqual(@as(i64, 2), r.get("attempt").?.integer);
+}
+
+test "dispatch: retry.stripContext returns user-domain context only" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const ev = { context: { charge_id: 42, _retry: { attempt: 2 } } };
+        \\const stripped = retry.stripContext(ev);
+        \\return JSON.stringify(stripped);
+    , .{
+        .method = "POST",
+        .path = "/",
+        .request_id = 1,
+    });
+    defer resp.deinit(testing.allocator);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqual(@as(i64, 42), obj.get("charge_id").?.integer);
+    try testing.expect(obj.get("_retry") == null);
+}
+
 test "dispatch: http.send rejects empty handle" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

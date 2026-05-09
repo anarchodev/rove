@@ -10,8 +10,10 @@
 //
 // Differences from the legacy webhook.send:
 //   - No built-in retries (`maxAttempts` is ignored). Customers who
-//     want retries arrange them in the `on_result` handler by calling
-//     `http.send` again with the failed row's context.
+//     want retries use `retry.send` directly + `retry.shouldRetry`/
+//     `retry.next` in their on_result handler — same JS surface,
+//     no system tenant, all retry state visible in the customer's
+//     own kv. See `bindings/retry.js`.
 //   - Outbound headers carry `X-Rove-Schedule-Id` (stamped by
 //     http.send) instead of `X-Rove-Webhook-Id`. Same idempotency
 //     semantics; new name.

@@ -1,12 +1,33 @@
 # http.send plan — outbound HTTP primitive + customer-JS retry policy
 
+> **2026-05-09 corrigendum** — sections referring to a system
+> tenant (`webhook.loop46.com`) that runs the default retry policy
+> are **superseded**. Retries are now a pure customer-side
+> JavaScript library (`globalThis.retry` in `src/js/bindings/
+> retry.js`), layered on top of `http.send`. All retry state lives
+> in the customer's tenant kv; there's no system tenant with
+> cross-tenant write privileges. The rest of the doc — the
+> primitive, the in-process fast path (§3.2), the envelope wire
+> shapes (§4), the leader-handover contract (§7) — stays accurate.
+> References to `webhook.loop46.com` should be read as "an
+> example of an in-cluster URL that the in-process fast path
+> optimizes" rather than "a system tenant the platform ships."
+> See `src/js/bindings/retry.js` for the retry library API
+> (`retry.send`, `retry.shouldRetry`, `retry.next`,
+> `retry.stripContext`).
+>
+> What this changed: dropped the cross-tenant `_callback/{id}`
+> write privilege (envelope-9 only writes to the schedule's own
+> tenant), dropped the system-tenant deployment + handler code,
+> dropped the special "webhook.loop46.com" envelope shape.
+
 This document supersedes `docs/webhook-server-plan.md`'s framing of
 webhook delivery as a webhook-shaped subsystem. It re-grounds the
 design on a single, more general primitive — an outbound HTTP call (fired now or at a future time)
 — and moves all webhook-specific policy (retries, signing, dead-
-letter, fanout) into customer JS at a system tenant. The platform
-ships the primitive plus one default policy; advanced customers
-write their own.
+letter, fanout) into customer JS. The platform
+ships the primitive; customers compose retry policy with the
+included `retry.*` JS helper library.
 
 The motivating framing:
 

@@ -400,11 +400,14 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-tenant", tenant_mod);
     js_mod.addImport("rove-schedule-server", schedule_server_mod);
     // JS-side runtime polyfills evaluated into every dispatcher's QJS
-    // context after the native CFunction bindings install. webhook.js
-    // wraps `http.send` (legacy webhook.send compatibility);
+    // context after the native CFunction bindings install.
+    // retry.js provides a customer-side retry helper layered on
+    // http.send (no system tenant, no cross-tenant privileges).
+    // webhook.js wraps `http.send` (legacy webhook.send compatibility);
     // email.js wraps `webhook.send` (which now layers on http.send);
     // textcodec.js polyfills TextEncoder/Decoder.
     const js_runtime_files: []const struct { name: []const u8, path: []const u8 } = &.{
+        .{ .name = "retry_js", .path = "src/js/bindings/retry.js" },
         .{ .name = "webhook_js", .path = "src/js/bindings/webhook.js" },
         .{ .name = "email_js", .path = "src/js/bindings/email.js" },
         .{ .name = "textcodec_js", .path = "src/js/bindings/textcodec.js" },

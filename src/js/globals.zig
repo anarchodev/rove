@@ -956,12 +956,14 @@ pub fn installStatic(ctx: *c.JSContext) void {
     for (GLOBAL_BUILTINS) |fb| attachFn(ctx, global, fb);
 
     // JS-side wrappers/polyfills evaluated last so they can call
-    // into the native bindings installed above. webhook.js layers
-    // a legacy `webhook.send` shim on top of `http.send`; email.js
-    // wraps `webhook.send` for Resend; textcodec.js polyfills
-    // TextEncoder/TextDecoder (UTF-8 only). Order matters —
-    // webhook.js runs before email.js because email.js calls into
-    // the polyfilled `webhook.send`.
+    // into the native bindings installed above. retry.js exposes
+    // `globalThis.retry` (customer-side retry helper layered on
+    // http.send); webhook.js layers a legacy `webhook.send` shim on
+    // top of `http.send`; email.js wraps `webhook.send` for Resend;
+    // textcodec.js polyfills TextEncoder/TextDecoder (UTF-8 only).
+    // Order: retry first (others might use it later), then webhook
+    // (email.js depends on it), then the rest.
+    evalSnippet(ctx, "retry.js", RETRY_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
     evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
@@ -1063,6 +1065,7 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     .{ .name = "__rove_check_email_rate", .cfunc = webhook_b.jsCheckEmailRate, .argc = 0 },
 };
 
+const RETRY_JS = @embedFile("retry_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
