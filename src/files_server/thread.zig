@@ -398,12 +398,88 @@ fn handleOne(
         try handlePutBlob(server, allocator, cfg, ent, sid, sess, instance_id, hash, rb);
     } else if (std.mem.eql(u8, remainder, "deployments") and std.mem.eql(u8, method, "POST")) {
         try handleDeployments(server, allocator, cfg, ent, sid, sess, instance_id, rb);
+    } else if (std.mem.startsWith(u8, remainder, "deployments/") and
+        std.mem.endsWith(u8, remainder, "/manifest.bin") and
+        std.mem.eql(u8, method, "GET"))
+    {
+        // Stripping `"deployments/"` and `"/manifest.bin"` leaves the
+        // hex deployment id. Reads from the local cluster store
+        // (production.md #1.4: manifests live in raft-replicated KV,
+        // not S3). Loop46 worker's manifest_backend uses this route
+        // — see `HttpManifestBackend` (TODO).
+        const id_str = remainder["deployments/".len .. remainder.len - "/manifest.bin".len];
+        try handleGetManifestBin(server, allocator, cfg, ent, sid, sess, instance_id, id_str);
     } else if (std.mem.startsWith(u8, remainder, "deployments/") and std.mem.eql(u8, method, "GET")) {
         const id_str = remainder["deployments/".len..];
         try handleGetDeployment(server, allocator, cfg, ent, sid, sess, instance_id, id_str);
     } else {
         try setResponse(server, cfg, ent, sid, sess, 404, null, "not found\n");
     }
+}
+
+/// `GET /{instance_id}/deployments/{N:hex}/manifest.bin` — returns
+/// the raw `manifest_json.encode` bytes for deployment N from the
+/// local cluster store (the kv key
+/// `deployment/{N:020x}/manifest`). Reads only — no raft round-
+/// trip; whichever node receives the request answers from its own
+/// replicated copy. The leader and followers all serve identical
+/// bytes by raft replication.
+///
+/// Used by loop46 worker's HTTP-backed manifest_backend (#1.4
+/// step 4) to fetch manifests without going to S3. Format: same
+/// bytes that `manifest_json.decode` would have parsed off S3 in
+/// the legacy path.
+///
+/// 404 = not in cluster store (no manifest at this id, or this
+/// node hasn't replicated it yet — caller can retry against a
+/// different replica). 503 = cluster mode not enabled on this
+/// files-server.
+fn handleGetManifestBin(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    instance_id: []const u8,
+    id_str: []const u8,
+) !void {
+    const cluster = cfg.cluster orelse {
+        try setResponse(server, cfg, ent, sid, sess, 503, null, "manifest.bin requires cluster mode (production.md #1.4)\n");
+        return;
+    };
+    if (id_str.len == 0) {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "missing deployment id\n");
+        return;
+    }
+    const dep_id = std.fmt.parseInt(u64, id_str, 16) catch {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "invalid deployment id (want hex)\n");
+        return;
+    };
+
+    // "deployment/" (11) + 20 hex nibbles + "/manifest" (9) = 40.
+    var key_buf: [40]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "deployment/{x:0>20}/manifest", .{dep_id}) catch unreachable;
+
+    const store = cluster.openStore(instance_id) catch {
+        try setResponse(server, cfg, ent, sid, sess, 500, null, "store open failed\n");
+        return;
+    };
+    const value = store.get(key) catch |err| switch (err) {
+        error.NotFound => {
+            try setResponse(server, cfg, ent, sid, sess, 404, null, "manifest not in cluster store\n");
+            return;
+        },
+        else => {
+            try setResponse(server, cfg, ent, sid, sess, 500, null, "store read failed\n");
+            return;
+        },
+    };
+    // Transfer ownership to the response buffer.
+    const out = try allocator.alloc(u8, value.len);
+    @memcpy(out, value);
+    allocator.free(value);
+    try setResponse(server, cfg, ent, sid, sess, 200, out.ptr, out);
 }
 
 /// POST /{instance}/blobs/check — body is JSON `{"hashes":[...]}`,

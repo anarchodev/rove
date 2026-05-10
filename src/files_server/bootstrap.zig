@@ -267,9 +267,12 @@ pub fn bootstrapTenant(
 /// (zero-padded u64 hex) but without the `.json` suffix — kv values
 /// are bytes, not S3 objects, so the file extension doesn't add
 /// anything.
-fn clusterManifestKey(buf: *[31]u8, dep_id: u64) []const u8 {
+fn clusterManifestKey(buf: *[CLUSTER_MANIFEST_KEY_LEN]u8, dep_id: u64) []const u8 {
     return std.fmt.bufPrint(buf, "deployment/{x:0>20}/manifest", .{dep_id}) catch unreachable;
 }
+
+/// "deployment/" (11) + 20 hex nibbles + "/manifest" (9).
+pub const CLUSTER_MANIFEST_KEY_LEN: usize = 40;
 
 /// Write the manifest + current pointer for a tenant through the
 /// cluster's raft consensus. One writeset envelope, two kv ops:
@@ -301,7 +304,7 @@ fn writeManifestThroughCluster(
     defer ws.deinit();
 
     if (manifest_json_bytes.len > 0) {
-        var mk_buf: [31]u8 = undefined;
+        var mk_buf: [CLUSTER_MANIFEST_KEY_LEN]u8 = undefined;
         const manifest_key = clusterManifestKey(&mk_buf, dep_id);
         try ws.addPut(manifest_key, manifest_json_bytes);
     }

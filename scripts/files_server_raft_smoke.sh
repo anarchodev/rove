@@ -268,7 +268,83 @@ for i in 0 1 2; do
 done
 echo "ok  followers reject /_system/cluster-put with 503"
 
+# ── Manifest fetch endpoint (production.md #1.4 step 4 setup) ─────
+#
+# Proves loop46 worker's HTTP-backed manifest_backend will work:
+#   1. Write a manifest-shaped row through the leader's
+#      /_system/cluster-put — store id = tenant id, key =
+#      `deployment/{N:020x}/manifest`, value = arbitrary bytes.
+#   2. After replication, fetch /v1/{tenant}/deployments/{N:hex}/manifest.bin
+#      from EVERY node and verify the bytes round-trip exactly.
+#   3. 404 path: an unknown deployment id returns 404 (not 500),
+#      so the worker can distinguish "this deploy doesn't exist"
+#      from "the cluster is broken."
+#
+# Hex is zero-padded to 20 nibbles to match the
+# `deployment/{x:0>20}/manifest` key the manifest writer uses.
+MANIFEST_TENANT="manifest-test-$(date +%s)"
+MANIFEST_DEP_ID=42
+MANIFEST_KEY=$(printf "deployment/%020x/manifest" "$MANIFEST_DEP_ID")
+# The /_system/cluster-put debug helper has a naive JSON parser
+# (jsonStringField) that doesn't handle escaped quotes — fine for
+# the smoke since manifest.bin's job is byte-fidelity round-trip,
+# not JSON validity. Real callers (writeManifestThroughCluster in
+# files_server/bootstrap.zig) build the WriteSet directly and
+# bypass this parser.
+MANIFEST_BODY="manifest-body-bytes-$(date +%s%N)"
+put_body="{\"store\":\"$MANIFEST_TENANT\",\"key\":\"$MANIFEST_KEY\",\"value\":\"$MANIFEST_BODY\"}"
+put_resp=$(curl -sS --cacert "$CACERT" --max-time 10 \
+    -H "Authorization: Bearer $JWT" \
+    -H "Content-Type: application/json" \
+    -d "$put_body" \
+    "https://127.0.0.1:${LEADER_PORT}/_system/cluster-put" 2>&1)
+if ! echo "$put_resp" | grep -q "committed at seq="; then
+    echo "FAIL: manifest cluster-put response unexpected: $put_resp" >&2
+    exit 1
+fi
+
+# Wait for replication then fetch from every node via the
+# manifest.bin route.
+MANIFEST_HEX=$(printf "%x" "$MANIFEST_DEP_ID")
+for try in $(seq 1 20); do
+    all_match=1
+    for i in 0 1 2; do
+        port="${HTTP_ADDRS[$i]##*:}"
+        got=$(curl -sS --cacert "$CACERT" --max-time 2 \
+            -H "Authorization: Bearer $JWT" \
+            "https://127.0.0.1:${port}/${MANIFEST_TENANT}/deployments/${MANIFEST_HEX}/manifest.bin" 2>/dev/null || echo "")
+        if [[ "$got" != "$MANIFEST_BODY" ]]; then
+            all_match=0
+            break
+        fi
+    done
+    if [[ "$all_match" == "1" ]]; then break; fi
+    sleep 0.2
+done
+if [[ "$all_match" != "1" ]]; then
+    echo "FAIL: not all nodes serve the manifest via manifest.bin route. Per-node:" >&2
+    for i in 0 1 2; do
+        port="${HTTP_ADDRS[$i]##*:}"
+        got=$(curl -sS --cacert "$CACERT" --max-time 2 \
+            -H "Authorization: Bearer $JWT" \
+            "https://127.0.0.1:${port}/${MANIFEST_TENANT}/deployments/${MANIFEST_HEX}/manifest.bin" 2>/dev/null || echo "<error>")
+        echo "  node $i: ${got:0:80}" >&2
+    done
+    exit 1
+fi
+echo "ok  all 3 nodes serve raft-replicated manifest via /v1/{tenant}/deployments/{N:hex}/manifest.bin"
+
+# 404 sanity — same tenant, different (non-existent) deploy id.
+miss_code=$(curl -sS --cacert "$CACERT" --max-time 2 -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $JWT" \
+    "https://127.0.0.1:${LEADER_PORT}/${MANIFEST_TENANT}/deployments/deadbeef/manifest.bin" 2>/dev/null || echo 000)
+if [[ "$miss_code" != "404" ]]; then
+    echo "FAIL: missing-deployment manifest.bin should 404, got $miss_code" >&2
+    exit 1
+fi
+echo "ok  manifest.bin 404s on unknown deployment id"
+
 echo ""
 echo "PASS files-server raft smoke"
 echo "      (init, listeners, leader election, propose-replicate-read,"
-echo "      and follower-reject all verified end-to-end)"
+echo "      manifest.bin fetch, and follower-reject all verified end-to-end)"
