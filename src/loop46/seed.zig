@@ -47,6 +47,20 @@ const SeedFile = struct {
 pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     var data_dir: ?[]const u8 = null;
     var manifest_path: ?[]const u8 = null;
+    // Production.md #1.4 step 4 — when set, seed skips the
+    // S3-bound bootstrapTenant call entirely. The per-tenant dir
+    // gets created and `_deploy/current` is written, but the
+    // manifest itself is expected to live in the files-server's
+    // cluster store (a separate seed step writes it via
+    // `PUT /{tenant}/deployments/{N:hex}/manifest.bin`). For use
+    // with the cluster-backed manifest architecture; without it,
+    // the worker's first deploy fetch returns NoDeployment and
+    // logs a warning.
+    var no_files_bootstrap = false;
+    // Deploy id to record in `_deploy/current` when
+    // `--no-files-bootstrap` is set. The bench harness pairs this
+    // with a manifest-PUT against files-server using the same id.
+    var deploy_id: u64 = 1;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -58,6 +72,12 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
             i += 1;
             if (i >= args.len) return error.Usage;
             manifest_path = args[i];
+        } else if (std.mem.eql(u8, a, "--no-files-bootstrap")) {
+            no_files_bootstrap = true;
+        } else if (std.mem.eql(u8, a, "--deploy-id")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            deploy_id = try std.fmt.parseInt(u64, args[i], 10);
         } else {
             return error.Usage;
         }
@@ -100,6 +120,27 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
 
     const tenant = try tenant_mod.Tenant.create(allocator, root_kv, dd);
     defer tenant.destroy();
+
+    if (no_files_bootstrap) {
+        // Cluster-backed manifest mode: skip the S3 bootstrap, just
+        // create per-tenant dirs, register in __root__.db, and
+        // stamp `_deploy/current = deploy_id`. The bench (or
+        // operator) is responsible for getting the manifest into
+        // files-server's cluster store via the
+        // `PUT /{tenant}/deployments/{N:hex}/manifest.bin` route
+        // before any worker request hits this tenant.
+        for (parsed.value.tenants) |t| {
+            try tenant.createInstance(t.id);
+            for (t.domains) |dom| try tenant.assignDomain(dom, t.id);
+            try writeLocalDeployCurrent(allocator, dd, t.id, deploy_id);
+            if (t.seed_kv) |kvs| try seedAppKv(allocator, dd, t.id, kvs);
+        }
+        std.debug.print(
+            "seed: provisioned {d} tenant(s) into {s} (no-files-bootstrap; deploy_id={d})\n",
+            .{ parsed.value.tenants.len, dd, deploy_id },
+        );
+        return;
+    }
 
     for (parsed.value.tenants) |t| {
         try tenant.createInstance(t.id);
@@ -144,27 +185,34 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
         try writeLocalDeployCurrent(allocator, dd, t.id, dep_id);
         try mirrorConfigFromManifest(allocator, blob_owned.cfg, dd, t.id, dep_id);
 
-        if (t.seed_kv) |kvs| {
-            const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dd, t.id });
-            defer allocator.free(inst_dir);
-            try std.fs.cwd().makePath(inst_dir);
-            const app_db_path = try std.fmt.allocPrintSentinel(
-                allocator,
-                "{s}/app.db",
-                .{inst_dir},
-                0,
-            );
-            defer allocator.free(app_db_path);
-            const app_kv = try kv.KvStore.open(allocator, app_db_path);
-            defer app_kv.close();
-            var it = kvs.map.iterator();
-            while (it.next()) |entry| {
-                try app_kv.put(entry.key_ptr.*, entry.value_ptr.*);
-            }
-        }
+        if (t.seed_kv) |kvs| try seedAppKv(allocator, dd, t.id, kvs);
     }
 
     std.debug.print("seed: provisioned {d} tenant(s) into {s}\n", .{ parsed.value.tenants.len, dd });
+}
+
+fn seedAppKv(
+    allocator: std.mem.Allocator,
+    dd: []const u8,
+    instance_id: []const u8,
+    kvs: std.json.ArrayHashMap([]const u8),
+) !void {
+    const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dd, instance_id });
+    defer allocator.free(inst_dir);
+    try std.fs.cwd().makePath(inst_dir);
+    const app_db_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/app.db",
+        .{inst_dir},
+        0,
+    );
+    defer allocator.free(app_db_path);
+    const app_kv = try kv.KvStore.open(allocator, app_db_path);
+    defer app_kv.close();
+    var it = kvs.map.iterator();
+    while (it.next()) |entry| {
+        try app_kv.put(entry.key_ptr.*, entry.value_ptr.*);
+    }
 }
 
 /// Run the same `_config/` → kv mirror on this node's app.db that
