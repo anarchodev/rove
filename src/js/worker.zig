@@ -522,6 +522,14 @@ pub const WorkerConfig = struct {
     /// skips the prefetch path; per-tenant fetch via
     /// `manifest_http` (or S3 fallback) still works.
     manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest) = null,
+    /// Pre-built libcurl Easy handle the worker's per-tenant
+    /// manifest backends share. Ownership transfers to the
+    /// Worker on `create`. Sharing one Easy across cold-start
+    /// prefetch + every per-tenant manifest fetch keeps libcurl's
+    /// connection + TLS-session cache warm across the whole
+    /// worker lifetime — the only way for per-release manifest
+    /// fetches to land in single-digit milliseconds.
+    manifest_easy: ?*blob_mod.curl.Easy = null,
     /// Phase 5.5 (a) — `BatchStore` the worker flushes log batches
     /// into. loop46 always supplies one — S3 if env wired, in-memory
     /// otherwise. Required because `flushLogs` shouldn't have to
@@ -628,6 +636,18 @@ pub fn Worker(comptime opts: Options) type {
         /// consumes (fetchRemove) per tenant and frees on use.
         /// At Worker.deinit any leftover entries are freed.
         manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest),
+        /// Shared libcurl handle for every per-tenant manifest
+        /// HttpBlobStore on this worker. Created at `create` when
+        /// `manifest_http` is wired; null otherwise. libcurl
+        /// caches connections + TLS sessions per-handle, so
+        /// sharing across tenants keeps the connection warm
+        /// across per-tenant manifest fetches (release handler,
+        /// dispatch tick reload). Without sharing, each tenant's
+        /// own Easy paid a fresh TLS handshake on first call.
+        /// Concurrent calls serialize through libcurl's internal
+        /// mutex; the worker's dispatch loop is single-threaded
+        /// so this never contends.
+        manifest_easy: ?*blob_mod.curl.Easy,
         /// Phase 5.5 (a) — store the worker flushes log batches into.
         /// Lives for the worker's full lifetime; loop46 picks S3 vs
         /// in-memory at startup.
@@ -711,6 +731,7 @@ pub fn Worker(comptime opts: Options) type {
                 .blob_backend_cfg = config.blob_backend,
                 .manifest_http = config.manifest_http,
                 .manifest_prefetch = config.manifest_prefetch,
+                .manifest_easy = config.manifest_easy,
                 .log_batch_store = config.log_batch_store,
                 .services_jwt_secret = config.services_jwt_secret,
                 .log_public_base = config.log_public_base,
@@ -812,6 +833,7 @@ pub fn Worker(comptime opts: Options) type {
             self.raft_pending.deinit();
             self.dispatcher.deinit();
             if (self.sse_curl) |easy| easy.deinit();
+            if (self.manifest_easy) |easy| easy.deinit();
             self.h2.destroy();
             allocator.destroy(self);
         }
@@ -955,6 +977,11 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
             .instance_id = inst.id,
             .mint_jwt = mh.mint_jwt,
             .mint_ctx = mh.mint_ctx,
+            // Shared Easy across all per-tenant manifest backends
+            // on this worker — see `Worker.manifest_easy`. Falls
+            // back to per-tenant Easy when shared init failed at
+            // Worker.create.
+            .easy = worker.manifest_easy,
             .ca_bundle_path = mh.ca_bundle_path,
             .verify_tls = mh.verify_tls,
         })
@@ -2126,6 +2153,7 @@ test "openTenantFiles runs the orphan sweep on startup" {
         blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
         manifest_http: ?ManifestHttpConfig = null,
         manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest) = null,
+        manifest_easy: ?*blob_mod.curl.Easy = null,
     };
     var fake = FakeWorker{ .allocator = allocator };
     const tc = try openTenantFiles(&fake, inst);
@@ -2171,6 +2199,7 @@ test "commitTxn drops the undo row so the next sweep is a no-op" {
         blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
         manifest_http: ?ManifestHttpConfig = null,
         manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest) = null,
+        manifest_easy: ?*blob_mod.curl.Easy = null,
     };
     var fake = FakeWorker{ .allocator = allocator };
     const tc = try openTenantFiles(&fake, inst);

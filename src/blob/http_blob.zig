@@ -68,9 +68,23 @@ pub const MintJwtFn = *const fn (
 
 pub const HttpBlobStore = struct {
     allocator: std.mem.Allocator,
-    /// Owned. One `Easy` (libcurl handle) per `HttpBlobStore` —
-    /// see threading note above.
+    /// libcurl handle. Owned when `easy_owned = true`; borrowed
+    /// otherwise. Sharing one Easy across many `HttpBlobStore`s
+    /// (via `Config.easy`) is the production posture: libcurl's
+    /// internal connection + TLS-session cache is per-handle, so
+    /// reusing one handle across all per-tenant manifest fetches
+    /// on a worker keeps the connection warm. Threading: the
+    /// handle is mutex-locked internally, so concurrent
+    /// `request()` calls serialize at the curl level. Workers
+    /// run their dispatch loop single-threaded, so this never
+    /// contends inside one worker; cross-worker sharing would
+    /// need pool semantics, which isn't a thing yet.
     easy: *curl.Easy,
+    /// True when this HttpBlobStore created its own Easy in
+    /// `init` and owns the lifetime; false when the caller
+    /// supplied one via `Config.easy`. `deinit` skips the curl
+    /// teardown in the borrowed case.
+    easy_owned: bool,
     /// `https://host:port` (no trailing slash). Owned copy so the
     /// caller doesn't have to keep its source slice alive.
     base_url: []const u8,
@@ -97,6 +111,13 @@ pub const HttpBlobStore = struct {
         instance_id: []const u8,
         mint_jwt: MintJwtFn,
         mint_ctx: ?*anyopaque = null,
+        /// Optional borrowed libcurl Easy handle. When non-null,
+        /// the backend uses this instead of creating its own.
+        /// Caller owns the lifetime — the backend's `deinit`
+        /// does NOT close the handle. Sharing one Easy across
+        /// every per-tenant `HttpBlobStore` on a worker is the
+        /// production posture (see field doc above).
+        easy: ?*curl.Easy = null,
         /// Optional CA bundle path. Null = libcurl's default
         /// (system trust store on Linux).
         ca_bundle_path: ?[]const u8 = null,
@@ -116,12 +137,14 @@ pub const HttpBlobStore = struct {
             null;
         errdefer if (ca_owned) |p| allocator.free(p);
 
-        const easy = try curl.Easy.init(allocator);
-        errdefer easy.deinit();
+        const easy_owned = cfg.easy == null;
+        const easy = cfg.easy orelse try curl.Easy.init(allocator);
+        errdefer if (easy_owned) easy.deinit();
 
         return .{
             .allocator = allocator,
             .easy = easy,
+            .easy_owned = easy_owned,
             .base_url = base_url_owned,
             .instance_id = instance_id_owned,
             .mint_jwt = cfg.mint_jwt,
@@ -132,7 +155,7 @@ pub const HttpBlobStore = struct {
     }
 
     pub fn deinit(self: *HttpBlobStore) void {
-        self.easy.deinit();
+        if (self.easy_owned) self.easy.deinit();
         self.allocator.free(self.base_url);
         self.allocator.free(self.instance_id);
         if (self.ca_bundle_path) |p| self.allocator.free(p);

@@ -440,6 +440,20 @@ fn workerMain(args: *WorkerCtx) !void {
     else
         null;
 
+    // Build a shared libcurl Easy handle FIRST when manifest_http
+    // is wired — used by both the cold-start batch fetch AND
+    // every per-tenant manifest backend the worker creates after.
+    // Connection cache + TLS-session resumption are per-handle
+    // in libcurl; sharing one handle keeps the worker → files-
+    // server connection warm across all manifest reads (cold-
+    // start prefetch, per-release config-mirror fetch, dispatch
+    // tick reload). Ownership transfers to Worker.create.
+    const manifest_easy: ?*blob_mod.curl.Easy = if (manifest_http != null)
+        try blob_mod.curl.Easy.init(allocator)
+    else
+        null;
+    errdefer if (manifest_easy) |e| e.deinit();
+
     // Cold-start manifest prefetch — one HTTP roundtrip pulls
     // every tenant's manifest from files-server in a single batch.
     // Without this, each per-tenant `openTenantFiles` would issue
@@ -454,7 +468,7 @@ fn workerMain(args: *WorkerCtx) !void {
     // the connection-storm bug class we're avoiding here. Block
     // until the bulk fetch succeeds.
     const manifest_prefetch_opt: ?std.StringHashMapUnmanaged(rjs.PrefetchedManifest) = if (manifest_http) |mh|
-        try prefetchManifestsWithRetry(allocator, &mh, &manifest_mint_ctx, tenant)
+        try prefetchManifestsWithRetry(allocator, &mh, manifest_easy, tenant)
     else
         null;
 
@@ -491,6 +505,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .blob_backend = args.blob_backend_cfg,
         .manifest_http = manifest_http,
         .manifest_prefetch = manifest_prefetch_opt,
+        .manifest_easy = manifest_easy,
         .log_batch_store = args.log_batch_store,
     });
     defer worker.destroy();
@@ -1365,12 +1380,12 @@ pub fn main() !void {
 fn prefetchManifestsWithRetry(
     allocator: std.mem.Allocator,
     mh: *const rjs.ManifestHttpConfig,
-    mint_ctx: *anyopaque,
+    shared_easy: ?*blob_mod.curl.Easy,
     tenant_registry: *tenant_mod.Tenant,
 ) !std.StringHashMapUnmanaged(rjs.PrefetchedManifest) {
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
-        const result = prefetchManifests(allocator, mh, mint_ctx, tenant_registry) catch |err| {
+        const result = prefetchManifests(allocator, mh, shared_easy, tenant_registry) catch |err| {
             const backoff_ms: u64 = std.math.shl(u64, 1000, @min(attempt, 5));
             std.log.warn(
                 "loop46: manifest prefetch attempt {d} failed: {s} — retry in {d}ms",
@@ -1400,10 +1415,9 @@ fn prefetchManifestsWithRetry(
 fn prefetchManifests(
     allocator: std.mem.Allocator,
     mh: *const rjs.ManifestHttpConfig,
-    mint_ctx: *anyopaque,
+    shared_easy: ?*blob_mod.curl.Easy,
     tenant_registry: *tenant_mod.Tenant,
 ) !std.StringHashMapUnmanaged(rjs.PrefetchedManifest) {
-    _ = mint_ctx; // ManifestHttpConfig already carries it
 
     // Phase 1: gather (tenant_id, dep_id) pairs by reading
     // `_deploy/current` from each tenant's app.db. Skip ones
@@ -1437,6 +1451,10 @@ fn prefetchManifests(
         .instance_id = "_batch", // unused — fetchBatch builds URL from base_url alone
         .mint_jwt = mh.mint_jwt,
         .mint_ctx = mh.mint_ctx,
+        // Borrow the shared Easy so the cold-start TLS handshake
+        // primes the connection cache the per-tenant manifest
+        // backends will reuse.
+        .easy = shared_easy,
         .ca_bundle_path = mh.ca_bundle_path,
         .verify_tls = mh.verify_tls,
     });
