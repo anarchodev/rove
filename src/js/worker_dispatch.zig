@@ -23,6 +23,7 @@ const tenant_mod = @import("rove-tenant");
 const schedule_server_mod = @import("rove-schedule-server");
 const blob_mod = @import("rove-blob");
 const files_server_mod = @import("rove-files-server");
+const files_mod = @import("rove-files");
 const config_mirror = @import("config_mirror.zig");
 
 const dispatcher_mod = @import("dispatcher.zig");
@@ -453,6 +454,25 @@ fn handleServicesTokenMint(
 }
 
 /// Body shape: `{"tenant_id":"<id>","dep_id":<u64>}`. Persists the
+/// Fetch + decode the manifest for `dep_id` using the tenant's
+/// `manifest_backend`. Routes through HTTP/2 to files-server when
+/// the worker is wired with `--files-internal-base`; falls back
+/// to S3 when not. Used by the release-POST handler to surface
+/// `_config/` files for the config-mirror step.
+fn loadManifestThroughTenantBackend(
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    inst: *const tenant_mod.Instance,
+    dep_id: u64,
+) !files_mod.FileStore.Manifest {
+    const tc = try worker_mod.getOrOpenTenantFiles(worker, inst);
+    var key_buf: [25]u8 = undefined;
+    const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+    const json_bytes = try tc.manifest_backend.blobStore().get(key, allocator);
+    defer allocator.free(json_bytes);
+    return try files_mod.manifest_json.decode(allocator, json_bytes);
+}
+
 /// release pointer to the tenant's app.db at `_deploy/current`
 /// (replicated via raft envelope 0 so cold-starts and other nodes
 /// see it), records the release in the process-wide `ReleaseTable`
@@ -536,10 +556,15 @@ fn handleRelease(
     // "no manifest" — the release is still valid; only library
     // `fromConfig(...)` lookups will fail until a fresh deploy fixes
     // the missing config row.
-    var manifest_loaded = files_server_mod.loadDeployment(
+    //
+    // Production.md #1.4 step 4: fetch via the tenant's
+    // `manifest_backend` (HTTP-backed when wired) instead of
+    // hitting S3 directly. Manifests live in raft-replicated KV
+    // inside files-server, not S3.
+    var manifest_loaded = loadManifestThroughTenantBackend(
         allocator,
-        worker.blob_backend_cfg,
-        parsed.value.tenant_id,
+        worker,
+        inst,
         parsed.value.dep_id,
     ) catch |err| blk: {
         std.log.warn(
