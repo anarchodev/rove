@@ -8,7 +8,7 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 
 ## Product direction
 
-`rove` is the engine for **Loop46**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via `webhook.send` / `email.send` / `events.emit`, page-level encryption at rest, etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. Sub-plans in `docs/` (`files-server-plan.md`, `logs-plan.md`, `sse-plan.md`, `snapshot-plan.md`, `webhook-server-plan.md`, `sim-test-framework.md`, `fixture-lifecycle.md`, `agent-surface.md`) elaborate specific PLAN sections.
+`rove` is the engine for **Loop46**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via `http.send` / `events.emit` (with `webhook.send` / `email.send` / `retry.*` as JS libraries on top), page-level encryption at rest, etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. Sub-plans in `docs/` (`files-server-plan.md`, `logs-plan.md`, `sse-plan.md`, `notifications.md`, `snapshot-plan.md`, `http-send-plan.md`, `phase-5.5-rollout.md`, `sim-test-framework.md`, `fixture-lifecycle.md`, `agent-surface.md`) elaborate specific PLAN sections. PLAN §13 is the live process / surface map.
 
 ## Build commands
 
@@ -81,16 +81,19 @@ Local KV writes commit immediately (releasing the lock fast), then a parallel Ra
 
 ### What replicates through raft
 
-Envelopes are typed byte blobs (`src/js/apply.zig`). Current state of the codebase:
+Envelopes are typed byte blobs (`src/js/apply.zig`). Current shape (post-Phase-5.5, post-`http.send` cutover 2026-05-09):
 
 | Type | Target store | Producer |
 |---|---|---|
-| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset |
-| `1` log_batch | `{data_dir}/{id}/log.db` | Worker `flushLogs` |
+| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker rides here too |
 | `2` root_writeset | `{data_dir}/__root__.db` | Signup's `tenant.createInstance`; admin JS `platform.root.*` |
-| `3` files_writeset | `{data_dir}/{id}/files.db` | Signup's `deployStarterContent`; files-server `putFileAndDeploy` |
+| `7` multi | per-inner-envelope target | Worker dispatcher (rides envelope 0 + envelope 8/10 atomically) |
+| `8` schedule_upsert | `{data_dir}/schedules.db` (cluster-wide) | Worker dispatcher (`http.send`) |
+| `9` schedule_complete | `schedules.db` + `_callback/{id}` in tenant `app.db` | schedule-server thread (or worker-0 internal-schedule fast path) |
+| `10` schedule_cancel | `schedules.db` | Worker dispatcher (`http.cancel`) |
+| `11` schedule_demote | `schedules.db` | worker-0 internal-schedule phase when no node hosts the target |
 
-Phase 5.5 retires types 1 and 3 (logs go S3-direct per `docs/logs-plan.md`; files manifest moves to S3 per `docs/files-server-plan.md`) and adds types 4/5/6 for the cluster-wide raft-replicated `webhooks.db` per `docs/webhook-server-plan.md`. Multi-envelope-per-raft-entry support also lands then so envelope 4 (webhook batch) can ride atomically with envelope 0 (writeset). See PLAN.md §10.2 for the full evolution table.
+Types 1 (log_batch) and 3 (files_writeset) retired in Phase 5.5 (a) / (e) — log batches go S3-direct per `docs/logs-plan.md`; per-tenant deployment manifests live in a `deployments/` BlobBackend per `docs/files-server-plan.md`. Types 4/5/6 (the dedicated webhook envelopes that briefly shipped 2026-05-06) retired 2026-05-09 in commit `cf375bf` — `http.send` (envelopes 8/9/10/11) generalizes them. The decoder rejects retired types loudly so any old raft-log entry surfaces instead of silently mis-applying. See PLAN.md §10.2 for the full evolution table and §13 for the live process map.
 
 ### Blob replication (multi-node)
 
