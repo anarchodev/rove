@@ -88,9 +88,29 @@ trap 'rm -f "$SEED_MANIFEST"' EXIT
 } > "$SEED_MANIFEST"
 
 t0=$(date +%s)
-seed_all_dirs "$SEED_MANIFEST"
+# Seed strategy:
+#   - Node 0 first (alone) — its bootstrapTenant pushes the
+#     per-tenant deployment manifest 0001 to S3. Slow path.
+#   - Nodes 1 + 2 in parallel afterwards — their bootstrapTenant
+#     hits the S3 fast-path (manifest exists), so they only do
+#     the local dir + app.db work.
+#
+# Naive parallel-all-3 racing approach hits OVH's
+# OperationAborted (409) on the conditional PUT of the same
+# manifest from 3 different processes; the retries dominate
+# total time.
+echo "  seeding node 0 (creates S3 manifests)…"
+"$BIN" seed --data-dir "${DATA_DIRS[0]}" --manifest "$SEED_MANIFEST" >/dev/null
+t_n0=$(date +%s)
+echo "  node 0 seeded in $((t_n0 - t0))s; nodes 1+2 in parallel (S3 fast-path)…"
+SEED_PIDS=()
+for d in "${DATA_DIRS[@]:1}"; do
+    "$BIN" seed --data-dir "$d" --manifest "$SEED_MANIFEST" >/dev/null &
+    SEED_PIDS+=($!)
+done
+for p in "${SEED_PIDS[@]}"; do wait "$p"; done
 t1=$(date +%s)
-echo "  seeded $N_TOTAL × 3 dirs in $((t1 - t0))s"
+echo "  seeded $N_TOTAL × 3 dirs in $((t1 - t0))s total"
 rm -f "$SEED_MANIFEST"
 
 # ── Phase B: spawn workers ─────────────────────────────────────────
@@ -132,6 +152,14 @@ for h in "${HTTP_ADDRS[@]}"; do
     RESOLVE+=(--resolve "app.loop46.localhost:${p}:127.0.0.1")
 done
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}" --max-time 30)
+# Worker startup walks data_dir and opens every tenant's app.db
+# at boot. At 10k tenants this can take 30-60+ seconds before the
+# /_system/leader endpoint responds 200. Scale leader-discovery
+# timeout proportionally so the bench works at any density.
+# Floor 15s (default) for small clusters, ~1s per 100 tenants
+# above that.
+export LEADER_DISCOVER_TIMEOUT_S=$(( 15 + N_TOTAL / 100 ))
+echo "  leader-discovery timeout: ${LEADER_DISCOVER_TIMEOUT_S}s (scaled for $N_TOTAL tenants)"
 discover_leader "app.loop46.localhost" "$ROOT_TOKEN" || exit 1
 echo "  leader: node $LEADER_IDX at $LEADER_HTTP"
 LEADER_DIR="${DATA_DIRS[$LEADER_IDX]}"

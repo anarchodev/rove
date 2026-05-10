@@ -250,7 +250,13 @@ discover_leader() {
     local token="$2"
     LEADER_HTTP=""
     LEADER_IDX=""
-    for _ in $(seq 1 75); do
+    # Total wait = LEADER_DISCOVER_TIMEOUT_S (default 15s). Smokes
+    # with many tenants want a longer window because workers walk
+    # data_dir + open every tenant's app.db at startup, which
+    # scales linearly with tenant count.
+    local total_s="${LEADER_DISCOVER_TIMEOUT_S:-15}"
+    local tries=$(( total_s * 5 ))
+    for _ in $(seq 1 "$tries"); do
         for i in 0 1 2; do
             local p="${HTTP_ADDRS[$i]##*:}"
             # Use admin_host in the URL (not the raw IP) so TLS smokes
@@ -270,7 +276,7 @@ discover_leader() {
         done
         sleep 0.2
     done
-    echo "FAIL: no leader elected within 15s" >&2
+    echo "FAIL: no leader elected within ${total_s}s" >&2
     for i in 0 1 2; do
         local logf="/tmp/${SMOKE_TAG:-smoke}-worker-${i}.out"
         if [[ -f "$logf" ]]; then

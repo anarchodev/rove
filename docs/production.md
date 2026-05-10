@@ -295,40 +295,87 @@ content collides (rare, but free). Cleaner architecturally
 than Shape A; covers more cases (non-empty default
 bundles like the embedded admin/replay deploys also dedupe).
 
-**Shape C: manifest contents move into the raft-replicated
-app.db; files-server local SQLite is a working-tree cache.**
-~1 week. Same parallel as #1.1: today's deploy writes the
-manifest to two durability fabrics (files-server local +
-S3); drop one and let raft's existing replication be the
-durability story.
+**Shape C: files-server gets its own raft group.** ~1-2 weeks.
+Same structural pattern as the main cluster: files-server
+replicas form their own raft consensus with their own log +
+snapshots. Manifests + deploy index live in files-server's
+own raft-replicated SQLite; bytecodes stay content-addressed
+in S3 (too big for raft entries). Workers fetch manifests
+from files-server via HTTP on `_deploy/current` flips.
 
-Concretely the deploy commit becomes one atomic raft entry
-that writes BOTH:
+What this buys:
+- **Durability via consensus.** Lose any one node's disk →
+  cluster recovers from quorum. No S3 backstop needed for
+  correctness.
+- **Clean separation of concerns.** Customer app.db doesn't
+  carry platform deployment metadata. The retention story for
+  manifests lives in files-server, not in customer kv space.
+- **DR via a learner replica** — same pattern as #1.2 for
+  the main cluster.
+- **S3 narrows to content-addressed bytecodes** only — exactly
+  what S3 is good for.
+
+Cost: a second raft group (two willemt instances, two log
+compactions, two snapshot stories). Most of the plumbing
+exists; RaftNode is already abstracted enough that
+instantiating a second one isn't a deep refactor. But it's
+real ops complexity (sizing, monitoring, the learner story
+multiplied across two clusters).
+
+**Shape D: smart S3 — cross-tenant snapshot + per-deploy
+deltas.** ~1 week. Stay on S3 for durability; restructure the
+storage layout so per-tenant work isn't proportional to
+tenant count:
 
 ```
-  _deploy/current        = N
-  _deploy/{N}/manifest   = <full json bytes — typically 1-10KB>
+snapshots/0001.json    # cross-tenant snapshot: every tenant's
+                       # current {manifest_hash, dep_id}
+deltas/0001-{seq}.json # per-deploy delta (~1KB)
+snapshots/0002.json    # periodic consolidation: snapshot N+1 =
+                       # snapshot N + all deltas in [N, N+1)
+                       # deltas in that range can then be GC'd
 ```
 
-Workers read `_deploy/current` (local cache hit) then fetch
-`_deploy/{N}/manifest` (also local cache hit) — no S3 GET on
-the manifest path. Bytecodes stay content-addressed in S3.
-files-server's local `files.db` becomes a working tree only,
-rebuildable from any worker's app.db if files-server's disk
-dies. Old manifests in app.db get a retention policy ("keep
-the last 50 deployments") same shape as today's S3 manifest
-retention.
+Bootstrapping 10k empty tenants → **one** S3 PUT for the
+snapshot covering all 10k with empty manifests. Per-deploy →
+one small delta PUT. Reads → fetch snapshot + replay deltas
+since.
 
-This eliminates the per-tenant S3 manifest path entirely AND
-folds files-server's durability story into the existing raft
-consensus — no second raft group needed. The snapshot
-capture path (#1.1) already covers app.db, so manifests get
-durability + DR for free.
+Cost shape:
+- O(1) S3 PUTs at bootstrap (vs O(N_tenants) today).
+- O(1) S3 PUTs per customer deploy.
+- Read cost grows with delta count between consolidations;
+  mitigated by frequent enough consolidation.
 
-Recommendation: **Shape A first** (small, immediate; fixes
-the bench pain in ~1 day). Shape C is the right architectural
-end state. Shape B (content-addressed S3 manifests) is a
-middle option if Shape C's app.db growth is unwelcome.
+Wrinkles:
+- **Single-writer discipline required.** All writes go
+  through `files-server-standalone` (the single process) —
+  no more `loop46 seed` calling `bootstrapTenant` directly
+  from N parallel processes. Forces the seed path to submit
+  through files-server's HTTP API instead.
+- **Consolidation is a separate cron-ish job** with its
+  own failure modes.
+
+**Shape B (content-addressed manifests)** stays as a partial
+middle ground: per-tenant keys, but manifest bytes
+deduplicated by hash. Cheaper than today, doesn't fix
+single-writer or O(N_tenants) at scale. Useful if A is too
+small and C/D are too big.
+
+Recommendation: **Shape A first** (~1 day) to unblock the
+bench-pain immediately. **Shape C** (own raft group) is
+the cleanest architectural end state — matches the
+structural pattern we've already committed to elsewhere.
+**Shape D** (smart S3) is the viable middle ground if a
+second raft group feels too heavy operationally. Both C and
+D drop S3 manifests from the per-tenant path, which is the
+load-bearing fix.
+
+(An earlier draft of shape C proposed putting manifest
+bytes directly into the customer's raft-replicated app.db.
+That conflated platform internals with customer kv state
+and added retention concerns inside app.db; rejected
+2026-05-10 in favor of the own-raft-group framing above.)
 
 The bench-seed cost is also operationally meaningful: at
 realistic per-tenant cost ~80-100ms, an operator
