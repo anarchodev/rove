@@ -255,6 +255,15 @@ pub const TenantFiles = struct {
     /// from one HTTP roundtrip instead of N. Null when no
     /// prefetch was wired or this tenant wasn't in the batch.
     prefetched_manifest: ?PrefetchedManifest,
+    /// Raw manifest bytes for `current_deployment_id`. Populated
+    /// in `reloadDeployment` after successful decode (transfers
+    /// ownership from the prefetch slot or the per-tenant fetch
+    /// result). Re-released callers (`handleRelease`) check this
+    /// on dep_id match + re-decode locally, skipping the HTTP
+    /// roundtrip. Cleared + re-populated on every successful
+    /// reloadDeployment with a different dep_id; freed at
+    /// teardown.
+    current_manifest_bytes: ?[]u8,
 
     pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFiles {
         return openTenantFiles(worker, inst);
@@ -1026,6 +1035,7 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
         .statics = .empty,
         .triggers = &.{},
         .prefetched_manifest = prefetched,
+        .current_manifest_bytes = null,
     };
 
     // Best-effort initial load. Read `_deploy/current` from the
@@ -1068,6 +1078,7 @@ fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
     tc.manifest_backend.deinit();
     tc.blob_backend.deinit();
     if (tc.prefetched_manifest) |p| allocator.free(p.bytes);
+    if (tc.current_manifest_bytes) |b| allocator.free(b);
     allocator.free(tc.instance_id);
     allocator.destroy(tc);
 }
@@ -1515,33 +1526,47 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
 /// (cold start / restart) and by `applyPendingReleases` (the
 /// dashboard pushed a new release).
 fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
-    // Cold-start fast path: if we have prefetched manifest bytes
-    // and this is the dep_id they were fetched for, consume them
-    // here (transfer ownership) instead of doing a per-tenant
-    // HTTP fetch. Mismatches (rare — would mean `_deploy/current`
-    // was bumped between prefetch + open) fall through to the
-    // backend; either way the prefetch entry is freed exactly
-    // once.
+    // Three-tier source for the manifest bytes:
+    //   1. Already-cached `current_manifest_bytes` matching this
+    //      dep_id — re-decode locally, no I/O. Common when the
+    //      release handler is doing a re-release of the same
+    //      dep_id (e.g. the bench's warmup phase).
+    //   2. One-shot prefetch from cold-start. Transfer ownership
+    //      out of the prefetch slot.
+    //   3. Per-tenant HTTP / S3 fetch via manifest_backend.
     var json_bytes: []u8 = undefined;
-    var owned_by_prefetch = false;
-    if (tc.prefetched_manifest) |p| {
-        tc.prefetched_manifest = null;
-        if (p.dep_id == dep_id) {
-            json_bytes = p.bytes;
-            owned_by_prefetch = true;
-        } else {
-            tc.allocator.free(p.bytes);
+    var bytes_taken_from_cache = false;
+    if (tc.current_manifest_bytes) |cached| {
+        if (tc.current_deployment_id == dep_id) {
+            json_bytes = try tc.allocator.dupe(u8, cached);
+            bytes_taken_from_cache = true;
         }
     }
-    if (!owned_by_prefetch) {
-        var key_buf: [25]u8 = undefined;
-        const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
-        json_bytes = tc.manifest_backend.blobStore().get(key, tc.allocator) catch |err| switch (err) {
-            error.NotFound => return error.NoDeployment,
-            else => return err,
-        };
+    if (!bytes_taken_from_cache) {
+        var owned_by_prefetch = false;
+        if (tc.prefetched_manifest) |p| {
+            tc.prefetched_manifest = null;
+            if (p.dep_id == dep_id) {
+                json_bytes = p.bytes;
+                owned_by_prefetch = true;
+            } else {
+                tc.allocator.free(p.bytes);
+            }
+        }
+        if (!owned_by_prefetch) {
+            var key_buf: [25]u8 = undefined;
+            const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+            json_bytes = tc.manifest_backend.blobStore().get(key, tc.allocator) catch |err| switch (err) {
+                error.NotFound => return error.NoDeployment,
+                else => return err,
+            };
+        }
     }
-    defer tc.allocator.free(json_bytes);
+    // After the swap below, `json_bytes` becomes the new
+    // `current_manifest_bytes`. We can't free here. The OLD
+    // current_manifest_bytes (if any) frees just before the swap.
+    var json_bytes_consumed = false;
+    errdefer if (!json_bytes_consumed) tc.allocator.free(json_bytes);
 
     var manifest = files_mod.manifest_json.decode(tc.allocator, json_bytes) catch
         return error.InvalidManifest;
@@ -1659,10 +1684,13 @@ fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
     freeSourceHashes(tc);
     freeStatics(tc);
     freeTriggers(tc);
+    if (tc.current_manifest_bytes) |old| tc.allocator.free(old);
     tc.bytecodes = next_bc;
     tc.source_hashes = next_source_hashes;
     tc.statics = next_statics;
     tc.triggers = triggers_slice;
+    tc.current_manifest_bytes = json_bytes;
+    json_bytes_consumed = true;
     tc.current_deployment_id = manifest.id;
 
     std.log.info(
