@@ -142,12 +142,63 @@ for i in 0 1 2; do
 done
 echo "ok  3 raft TCP listeners accepting connections"
 
-# Subsequent commits will:
-# - add a /_system/leader endpoint on files-server-standalone for
-#   leader observability (so this smoke can verify election);
-# - migrate manifest writes through the Cluster (so we can prove
-#   end-to-end raft replication of a per-tenant deploy).
+# ── Mint a JWT to call the /_system/leader endpoint ──────────────
+mint_jwt() {
+    LOOP46_SERVICES_JWT_SECRET="$LOOP46_SERVICES_JWT_SECRET" python3 - <<'PY'
+import base64, hmac, hashlib, json, os, time
+secret = bytes.fromhex(os.environ["LOOP46_SERVICES_JWT_SECRET"])
+header = b'{"alg":"HS256","typ":"JWT"}'
+payload = json.dumps({"exp": int(time.time() * 1000) + 5 * 60 * 1000}).encode()
+def b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+signing_input = b64u(header) + "." + b64u(payload)
+sig = hmac.new(secret, signing_input.encode(), hashlib.sha256).digest()
+print(signing_input + "." + b64u(sig))
+PY
+}
+JWT=$(mint_jwt)
+
+# ── Verify leader election via /_system/leader ──────────────────
+#
+# Probe each node. Exactly one should return 200 ("leader\n");
+# the other two return 503 ("not leader..."). With election
+# timeout 200ms, election lands well within 2s on a clean cluster.
+LEADER_NODE=""
+LEADER_COUNT=0
+FOLLOWER_COUNT=0
+for tries in $(seq 1 30); do
+    LEADER_NODE=""
+    LEADER_COUNT=0
+    FOLLOWER_COUNT=0
+    for i in 0 1 2; do
+        addr="${HTTP_ADDRS[$i]}"
+        port="${addr##*:}"
+        code=$(curl -sS --cacert "$CACERT" --max-time 2 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $JWT" \
+            "https://127.0.0.1:${port}/_system/leader" 2>/dev/null || echo 000)
+        if [[ "$code" == "200" ]]; then
+            LEADER_NODE="$i"
+            LEADER_COUNT=$((LEADER_COUNT + 1))
+        elif [[ "$code" == "503" ]]; then
+            FOLLOWER_COUNT=$((FOLLOWER_COUNT + 1))
+        fi
+    done
+    if [[ "$LEADER_COUNT" == "1" && "$FOLLOWER_COUNT" == "2" ]]; then
+        break
+    fi
+    sleep 0.3
+done
+
+if [[ "$LEADER_COUNT" != "1" ]]; then
+    echo "FAIL: expected 1 leader + 2 followers, got leaders=$LEADER_COUNT followers=$FOLLOWER_COUNT" >&2
+    for i in 0 1 2; do
+        echo "--- node $i log (last 20 lines) ---" >&2
+        tail -20 "/tmp/fs-raft-smoke-worker-${i}.out" >&2
+    done
+    exit 1
+fi
+echo "ok  raft elected node $LEADER_NODE as leader (1 leader + 2 followers via /_system/leader)"
 
 echo ""
-echo "PASS files-server raft smoke (init + listeners only; manifest"
-echo "     migration + leader-status endpoint are subsequent commits)"
+echo "PASS files-server raft smoke"
+echo "      (init, listeners, leader election all verified;"
+echo "      manifest migration through Cluster is the next commit)"

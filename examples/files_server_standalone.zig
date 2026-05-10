@@ -421,6 +421,7 @@ pub fn main() !void {
         .jwt_secret = jwt_secret,
         .cors_origin = cli.cors_origin,
         .max_connections = cli.max_connections,
+        .cluster = cluster_opt,
     });
     defer handle.shutdown();
 

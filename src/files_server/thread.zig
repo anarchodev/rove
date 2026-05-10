@@ -44,6 +44,7 @@ const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 const blob_mod = @import("rove-blob");
 const jwt = @import("rove-jwt");
+const kv = @import("rove-kv");
 
 const files_server = @import("root.zig");
 const files_mod = @import("rove-files");
@@ -83,6 +84,13 @@ pub const Config = struct {
     /// Max concurrent inbound h2 connections this server accepts.
     /// Sized from the worker count at spawn time.
     max_connections: u32 = 64,
+    /// When set, the standalone is part of a files-server raft
+    /// cluster (production.md #1.4). The `/_system/leader` route
+    /// reports `cluster.raft.isLeader()` so dashboards / clients
+    /// know which node accepts manifest writes. Null = single-
+    /// process mode (legacy, pre-#1.4); `/_system/leader` returns
+    /// 501 in that case.
+    cluster: ?*kv.Cluster = null,
 };
 
 /// Handle returned by `spawn`. The caller is expected to hold this
@@ -291,7 +299,26 @@ fn handleOne(
         return;
     }
 
-    // All routes share the shape `/{instance_id}/{op}[/{tail...}]`.
+    // /_system/* routes are platform-internal — handled separately
+    // from the per-tenant route shape below.
+    if (std.mem.eql(u8, path, "/_system/leader") and std.mem.eql(u8, method, "GET")) {
+        if (cfg.cluster) |c| {
+            if (c.raft.isLeader()) {
+                try setResponse(server, cfg, ent, sid, sess, 200, null, "leader\n");
+            } else {
+                try setResponse(server, cfg, ent, sid, sess, 503, null, "not leader; retry against the cluster leader\n");
+            }
+        } else {
+            // Pre-#1.4 / single-process mode. Tools that probe this
+            // endpoint should treat 501 as "this build of files-server
+            // doesn't have raft, treat all writes as accepted by the
+            // single instance."
+            try setResponse(server, cfg, ent, sid, sess, 501, null, "raft not enabled on this files-server\n");
+        }
+        return;
+    }
+
+    // All other routes share the shape `/{instance_id}/{op}[/{tail...}]`.
     if (path.len == 0 or path[0] != '/') {
         try setResponse(server, cfg, ent, sid, sess, 404, null, "not found\n");
         return;
