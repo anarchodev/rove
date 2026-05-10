@@ -156,9 +156,17 @@ fn threadMain(h: *Handle) void {
 fn runThread(h: *Handle) !void {
     const allocator = h.allocator;
 
+    // 1024 was too small at 10k-tenant scalability bench scale —
+    // when loop46 workers fan out parallel manifest reloads through
+    // a release-POST burst, the inbound h2 stream count peaks well
+    // above 1024 and the registry returns `error.Full` from its
+    // entity allocator, crashing the thread. 16384 is large enough
+    // to absorb a 10k-tenant cold-start burst across 3 loop46
+    // workers each pulling parallel fetches; fixed memory cost is
+    // a few MB.
     var reg = rove.Registry.init(allocator, .{
-        .max_entities = 1024,
-        .deferred_queue_capacity = 256,
+        .max_entities = 16384,
+        .deferred_queue_capacity = 1024,
     }) catch |err| {
         h.bind_err = err;
         h.ready.set();
