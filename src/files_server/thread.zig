@@ -405,10 +405,23 @@ fn handleOne(
         // Stripping `"deployments/"` and `"/manifest.bin"` leaves the
         // hex deployment id. Reads from the local cluster store
         // (production.md #1.4: manifests live in raft-replicated KV,
-        // not S3). Loop46 worker's manifest_backend uses this route
-        // — see `HttpManifestBackend` (TODO).
+        // not S3). Loop46 worker's manifest_backend uses this route.
         const id_str = remainder["deployments/".len .. remainder.len - "/manifest.bin".len];
         try handleGetManifestBin(server, allocator, cfg, ent, sid, sess, instance_id, id_str);
+    } else if (std.mem.startsWith(u8, remainder, "deployments/") and
+        std.mem.endsWith(u8, remainder, "/manifest.bin") and
+        std.mem.eql(u8, method, "PUT"))
+    {
+        // Companion write route. Body is the raw manifest bytes (the
+        // same `manifest_json.encode` output the cluster store
+        // holds). Builds a writeset envelope, proposes through raft,
+        // 200 once committed. Followers 503. Used by the bench
+        // harness to seed N tenants without going through the
+        // upload/deploy customer-facing flow (which compiles JS +
+        // PUTs blobs to S3 — far too much per-tenant work for an
+        // empty-tenant bench).
+        const id_str = remainder["deployments/".len .. remainder.len - "/manifest.bin".len];
+        try handlePutManifestBin(server, allocator, cfg, ent, sid, sess, instance_id, id_str, rb);
     } else if (std.mem.startsWith(u8, remainder, "deployments/") and std.mem.eql(u8, method, "GET")) {
         const id_str = remainder["deployments/".len..];
         try handleGetDeployment(server, allocator, cfg, ent, sid, sess, instance_id, id_str);
@@ -1108,6 +1121,111 @@ fn handleClusterPut(
     defer allocator.free(ws_bytes);
 
     const env = kv.encodeEnvelope(allocator, ENVELOPE_FILES_WRITESET, store_id, ws_bytes) catch {
+        try setResponse(server, cfg, ent, sid, sess, 500, null, "envelope encode failed\n");
+        return;
+    };
+    defer allocator.free(env);
+
+    const seq = cluster.proposeAndWait(env, PROPOSE_TIMEOUT_NS) catch |err| {
+        const msg: []const u8 = switch (err) {
+            error.NotLeader => "not leader\n",
+            error.ShuttingDown => "shutting down\n",
+            error.QueueFull => "raft queue full\n",
+            error.ProposalTimedOut => "proposal timed out\n",
+            error.OutOfMemory => "out of memory\n",
+        };
+        try setResponse(server, cfg, ent, sid, sess, 503, null, msg);
+        return;
+    };
+
+    var line_buf: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "committed at seq={d}\n", .{seq}) catch unreachable;
+    const out = try allocator.alloc(u8, line.len);
+    @memcpy(out, line);
+    try setResponse(server, cfg, ent, sid, sess, 200, out.ptr, out);
+}
+
+/// `PUT /{instance_id}/deployments/{N:hex}/manifest.bin` — write the
+/// manifest for deployment N for this tenant through the raft
+/// cluster. Body is the raw manifest bytes (same encoding
+/// `manifest_json.encode` produces and `manifest_json.decode`
+/// parses).
+///
+/// Builds a single writeset envelope with two ops:
+///
+///   `deployment/{N:020x}/manifest = <body>`
+///   `deployment/current             = "{N}"` (ascii decimal)
+///
+/// Wraps in envelope type 2 (ENVELOPE_FILES_WRITESET, registered at
+/// startup with leader_skip = false), proposes, blocks until raft
+/// commit. 200 with `committed at seq=N` on success, 503 on
+/// followers / propose failure, 400 on bad input.
+///
+/// Used by the scalability bench harness to seed N empty-tenant
+/// manifests without going through the upload + deploy customer-
+/// facing flow. The same shape will be used in production once the
+/// upload + deploy paths migrate to write manifests through the
+/// cluster directly (next commit). Different from
+/// `/_system/cluster-put` — that one is a JSON debug helper with a
+/// naive parser; this one takes raw bytes and is part of the
+/// supported customer surface.
+fn handlePutManifestBin(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    instance_id: []const u8,
+    id_str: []const u8,
+    rb: h2.ReqBody,
+) !void {
+    const cluster = cfg.cluster orelse {
+        try setResponse(server, cfg, ent, sid, sess, 503, null, "manifest write requires cluster mode (production.md #1.4)\n");
+        return;
+    };
+    if (!cluster.raft.isLeader()) {
+        try setResponse(server, cfg, ent, sid, sess, 503, null, "not leader; retry against the cluster leader\n");
+        return;
+    }
+    if (id_str.len == 0) {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "missing deployment id\n");
+        return;
+    }
+    const dep_id = std.fmt.parseInt(u64, id_str, 16) catch {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "invalid deployment id (want hex)\n");
+        return;
+    };
+    const body = if (rb.data) |d| d[0..rb.len] else "";
+    if (body.len == 0) {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "empty body — manifest must be at least an empty json object\n");
+        return;
+    }
+
+    var ws = kv.WriteSet.init(allocator);
+    defer ws.deinit();
+
+    var key_buf: [40]u8 = undefined;
+    const manifest_key = std.fmt.bufPrint(&key_buf, "deployment/{x:0>20}/manifest", .{dep_id}) catch unreachable;
+    ws.addPut(manifest_key, body) catch {
+        try setResponse(server, cfg, ent, sid, sess, 500, null, "writeset alloc failed\n");
+        return;
+    };
+
+    var dec_buf: [32]u8 = undefined;
+    const dec = std.fmt.bufPrint(&dec_buf, "{d}", .{dep_id}) catch unreachable;
+    ws.addPut("deployment/current", dec) catch {
+        try setResponse(server, cfg, ent, sid, sess, 500, null, "writeset alloc failed\n");
+        return;
+    };
+
+    const ws_bytes = ws.encode(allocator) catch {
+        try setResponse(server, cfg, ent, sid, sess, 500, null, "writeset encode failed\n");
+        return;
+    };
+    defer allocator.free(ws_bytes);
+
+    const env = kv.encodeEnvelope(allocator, ENVELOPE_FILES_WRITESET, instance_id, ws_bytes) catch {
         try setResponse(server, cfg, ent, sid, sess, 500, null, "envelope encode failed\n");
         return;
     };

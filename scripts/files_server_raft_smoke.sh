@@ -344,6 +344,75 @@ if [[ "$miss_code" != "404" ]]; then
 fi
 echo "ok  manifest.bin 404s on unknown deployment id"
 
+# ── PUT manifest.bin: real-shaped manifest write through raft ─────
+#
+# Productized companion to the GET — takes raw bytes (no JSON
+# escaping needed), proposes through the cluster, returns the
+# committed seq. This is what the bench harness uses to seed N
+# tenants without the full upload + deploy customer flow.
+PUT_TENANT="put-manifest-test-$(date +%s)"
+PUT_DEP_ID=7
+PUT_HEX=$(printf "%x" "$PUT_DEP_ID")
+PUT_BODY='{"version":1,"entries":[{"path":"hello.js","kind":"handler","content_type":"application/javascript","hash":"abc123"}]}'
+
+put_resp=$(curl -sS --cacert "$CACERT" --max-time 10 \
+    -X PUT \
+    -H "Authorization: Bearer $JWT" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "$PUT_BODY" \
+    "https://127.0.0.1:${LEADER_PORT}/${PUT_TENANT}/deployments/${PUT_HEX}/manifest.bin" 2>&1)
+if ! echo "$put_resp" | grep -q "committed at seq="; then
+    echo "FAIL: PUT manifest.bin response unexpected: $put_resp" >&2
+    exit 1
+fi
+echo "ok  PUT manifest.bin: $put_resp"
+
+# Verify the manifest replicated and round-trips byte-for-byte
+# through GET on every node.
+for try in $(seq 1 20); do
+    all_match=1
+    for i in 0 1 2; do
+        port="${HTTP_ADDRS[$i]##*:}"
+        got=$(curl -sS --cacert "$CACERT" --max-time 2 \
+            -H "Authorization: Bearer $JWT" \
+            "https://127.0.0.1:${port}/${PUT_TENANT}/deployments/${PUT_HEX}/manifest.bin" 2>/dev/null || echo "")
+        if [[ "$got" != "$PUT_BODY" ]]; then
+            all_match=0
+            break
+        fi
+    done
+    if [[ "$all_match" == "1" ]]; then break; fi
+    sleep 0.2
+done
+if [[ "$all_match" != "1" ]]; then
+    echo "FAIL: PUT manifest didn't replicate byte-for-byte. Per-node:" >&2
+    for i in 0 1 2; do
+        port="${HTTP_ADDRS[$i]##*:}"
+        got=$(curl -sS --cacert "$CACERT" --max-time 2 \
+            -H "Authorization: Bearer $JWT" \
+            "https://127.0.0.1:${port}/${PUT_TENANT}/deployments/${PUT_HEX}/manifest.bin" 2>/dev/null || echo "<error>")
+        echo "  node $i: ${got:0:80}" >&2
+    done
+    exit 1
+fi
+echo "ok  PUT-then-GET manifest round-trips byte-for-byte across all 3 nodes"
+
+# Followers reject PUT.
+for i in 0 1 2; do
+    [[ "$i" == "$LEADER_NODE" ]] && continue
+    port="${HTTP_ADDRS[$i]##*:}"
+    code=$(curl -sS --cacert "$CACERT" --max-time 2 -o /dev/null -w '%{http_code}' \
+        -X PUT \
+        -H "Authorization: Bearer $JWT" \
+        --data-binary "$PUT_BODY" \
+        "https://127.0.0.1:${port}/${PUT_TENANT}/deployments/${PUT_HEX}/manifest.bin" 2>/dev/null || echo 000)
+    if [[ "$code" != "503" ]]; then
+        echo "FAIL: follower $i accepted PUT manifest.bin (status=$code, want 503)" >&2
+        exit 1
+    fi
+done
+echo "ok  followers reject PUT manifest.bin with 503"
+
 echo ""
 echo "PASS files-server raft smoke"
 echo "      (init, listeners, leader election, propose-replicate-read,"
