@@ -43,43 +43,220 @@ Shipped:
   size are bounded after 120 commits + 4 snapshot passes (was
   unbounded before).
 
-### 1.1 Move snapshot capture off the raft thread — **NEW, surfaced 2026-05-10**
+### 1.1 Decouple log compaction from byte capture — **NEW, design landed 2026-05-10**
 
-The per-tenant VACUUM INTO + S3 PUT + manifest serialize work
-in `tickRaftCapture` runs synchronously on the raft thread.
-For any non-trivial cluster (≥10 active tenants on commodity
-S3, or much more under faster local-fs backends) the pass
-takes longer than the willemt election timeout (default
-250ms). During that window willemt's heartbeat tick can't
-fire, followers time out, and the leader steps down mid-
-capture. The new leader takes over, captures once, loses
-leadership again — a self-reinforcing flap.
+`scripts/snapshot_scalability_bench.sh` surfaced that the
+per-tenant VACUUM INTO + S3 PUT + manifest serialize work in
+`tickRaftCapture` runs synchronously on the raft thread. For any
+non-trivial cluster (≥10 active tenants on commodity S3) the
+pass takes longer than the willemt election timeout (default
+250ms). During that window willemt's heartbeat tick can't fire,
+followers time out, the leader steps down mid-capture, the new
+leader takes over, captures once, loses leadership again — a
+self-reinforcing flap. Each node captures exactly once with
+`reused=0` (cold-start cache discarded by the safety guard
+because the prior leader's `floor` is past where the new leader
+has applied to). Steady-state never reached. Detail in
+`docs/snapshot-bench-results.md`.
 
-Symptom: `scripts/snapshot_scalability_bench.sh` at
-`N_total=100, N_active=100` shows each node capturing exactly
-once with `reused=0` (cold-start cache always discarded by the
-safety guard because the prior leader's `floor` is past where
-the new leader has applied to). Steady-state never reached.
+The first instinct was "move the byte capture to a dedicated
+thread." A subsequent design pass concluded: **the byte capture
+shouldn't be coupled to log compaction at all.** They're two
+different concerns conflated into one S3 upload:
 
-Detail in `docs/snapshot-bench-results.md`.
+- **Log compaction** wants to advance willemt's
+  `snapshot_last_idx` so old log entries can be deleted. It only
+  needs an assertion that "this node's tenant state is consistent
+  through idx N." That assertion is *the on-disk app.db files plus
+  their `_apply_state.last_applied_raft_idx` stamp* — no separate
+  byte copy required.
+- **Catchup** wants to bring a fall-behind follower (or a fresh
+  node) current. willemt's `send_snapshot` callback fires when a
+  follower's `next_idx` is below the leader's snapshot floor;
+  the right answer is peer-to-peer streaming of live app.db
+  files via SQLite's online backup API. No S3 involved.
 
-Fix shape: dedicated snapshot thread that takes a "begin
-snapshot" handoff from the raft thread, does VACUUM + S3 work
-independently, signals "end snapshot" back to the raft thread
-which then drives `endSnapshotOpaque()` + log compaction.
-Pattern: same separation we already use for `flushLogs` (it
-runs on a dedicated `flusherLoop` thread inside `Worker.create`
-specifically because S3 PUTs would block the dispatch hot path).
+The cleaner architecture splits them:
 
-Cost: ~1-2 days of work. Risk: medium — the raft thread already
-hands off through atomics for the apply-side wakeup, so adding
-one more channel is well-trodden ground; but the begin/end
-bracket invariants need careful preservation.
+```
+steady-state log compaction (every N seconds, on raft thread):
+  1. Stamp _apply_state[T] = current commit_idx for every T on
+     this node (always-refresh-all so dormant tenants don't
+     pin retention).
+  2. raft_begin_snapshot + raft_end_snapshot at commit_idx.
+  3. willemt drives cbLogPoll → truncateBefore +
+     incremental_vacuum.
+  Total cost: N small SQLite writes + log compaction.
+  ~100ms for 100 tenants, ~1s for 10000. No S3, no manifest.
+
+far-behind follower / new node (on demand, off raft thread):
+  willemt's send_snapshot callback fires → peer streams its
+  app.dbs via the SQLite backup API. New node atomic-renames
+  into data_dir + tells willemt to load_snapshot at the
+  source's _apply_state idx.
+```
+
+There is **no periodic S3 backup loop** in the new design. See
+#1.2 — DR is handled by a non-voting learner replica, not by
+periodic snapshots in S3. The `loop46 snapshot` operator CLI
+stays available for on-demand "freeze a point in time" use, but
+nothing automated runs it.
+
+**The leader's compaction never needs cluster-wide aggregation.**
+Each node manages its own log + apply state independently.
+willemt's `send_snapshot` callback handles the "follower fell
+behind" case via state transfer instead of log replay — which is
+what makes "compact past my own apply_idx" safe.
+
+**Why the `_apply_state` stamp is enough** for the snapshot bytes:
+on each tenant T, `_apply_state[T] = N` plus the kv rows in the
+file together assert "this file is the result of applying entries
+1..N as they pertain to T." For dormant T (no entries between
+T's last write and N targeted T), the bytes are byte-identical to
+T's state at any prior idx ≤ N — so stamping `_apply_state[T] = N`
+is correct without re-VACUUMing.
+
+Implementation order:
+
+1. Lazy `_apply_state` stamp at compaction time, with always-
+   refresh-all over every tenant in `tenant_apply_idx`. Code
+   already mostly in place (see `tickRaftCapture`); the change
+   is to do the stamp loop *instead of* VACUUM INTO + upload,
+   not in addition to it. (~1 day)
+2. Drop the periodic VACUUM-INTO-to-S3 path from
+   `tickRaftCapture`. Keep the function name; replace the body.
+   The existing `capture()` function + `loop46 snapshot` /
+   `loop46 restore-from-snapshot` operator CLIs stay (cheap to
+   keep, occasionally useful for "freeze a point in time"
+   ops scenarios), they just stop firing on a periodic loop.
+   (~half day)
+3. Wire willemt's `send_snapshot` callback to actually trigger
+   peer-to-peer app.db streaming via SQLite's online backup
+   API instead of just logging a warning. Receiving side
+   stages files in `tmp_dir/{snap_id}/`, atomic-renames into
+   `data_dir/`, calls `raft_load_snapshot`. (~2 days, includes
+   a multi-node smoke that kills + re-adds a follower far
+   behind the leader's snapshot floor.)
+
+Net: ~3.5 days, simpler than the dedicated-snapshot-thread
+approach, eliminates heartbeat starvation by structure, and
+removes the conflation of compaction with backup entirely. DR
+moves to #1.2 (the learner) where it belongs.
 
 **Blocks production at any density above ~5 active tenants per
-snapshot interval** with default raft timing flags + S3 latency.
+snapshot interval** under the current code with default raft
+timing flags + S3 latency.
 
-### 2. By-reference manifest reuse for unchanged tenants — **done 2026-05-09 (with leader-snapshot fix)**
+### 1.2 Non-voting learner replica is the entire DR story — **NEW, design landed 2026-05-10**
+
+When >half the voting cluster fails simultaneously (2 of 3, 3
+of 5), raft loses quorum permanently. Recovering from that
+case from a snapshot in S3 means losing every write between
+the last snapshot and the failure — minutes-to-hours of
+customer state, gone. Making S3 honestly cover this case
+would require streaming the raft log to S3 on every commit
+(continuous log shipping), which adds ~50ms p50 latency to
+every customer write or accepts a loss window that defeats
+the strong-DR claim anyway.
+
+The cleaner answer is **a non-voting raft follower (a learner)**,
+deployed in a different region from the voting cluster. willemt
+already supports it via `raft_add_non_voting_node`:
+
+- Same wire protocol as a voting follower; receives every
+  committed entry within one heartbeat.
+- Same apply path; `_apply_state` and on-disk state stay
+  current.
+- Doesn't count toward quorum. Adding/removing one doesn't
+  change election thresholds. Latency to the learner doesn't
+  gate commits.
+- Can be geographically remote. Voters in one region (low-
+  latency quorum), learner in another region (latency
+  irrelevant for non-quorum).
+- On regional failure: promote the learner via
+  `raft_become_voter` (or rebuild a new voting cluster around
+  the learner's data_dir) → seconds-of-loss recovery instead
+  of minutes-or-more.
+- Bonus: the learner can serve read traffic — dashboard,
+  log queries, anything read-only — reducing voter load.
+
+**The bet this codifies:** simultaneous loss of >half the
+voters in *one* region is a meaningfully-rare event in
+modern cloud infrastructure (correlated AZ failures are most
+of the risk; cross-AZ deploys within a region handle them).
+Region-scale loss IS a real concern, and the learner's
+geographic separation handles it.
+
+**S3 is NOT a Loop46 DR mechanism**, periodic or otherwise.
+Loop46 doesn't promise customer-visible point-in-time
+recovery (different shape from tape replay, which the
+platform does provide). The remaining "would S3 backups be
+useful for" cases all dissolve under inspection:
+
+- *Compliance / N-day historical state retention* — not a
+  platform commitment in PLAN.md. Customer-tier feature if
+  ever needed.
+- *"Oops, customer deleted their data" recovery* — Loop46
+  doesn't promise customer-undo. Customers who need it write
+  their own audit-log pattern in their own kv prefix.
+- *Spawn a staging clone from prod state* — solved by
+  spinning up a new learner pointing at prod, letting it
+  catch up, then disconnecting. Same primitive as live DR;
+  no new machinery.
+- *Cluster-wide bad-write rollback* — a "bad write" reaching
+  kv is by construction a customer handler bug (kv writes go
+  through customer-validated handler code). Fixable by
+  deploying a new handler version, not by rolling the
+  cluster back hours and discarding every other tenant's
+  intervening work.
+
+The `loop46 snapshot` / `loop46 restore-from-snapshot`
+operator CLIs stay shipped — they're useful for "freeze a
+known-good point in time before this risky migration" /
+"clone state to a fresh data_dir for debugging" — but
+nothing automated invokes them.
+
+What needs to ship:
+
+1. CLI: `--peer-mode=voter|learner` per-peer entry, plumbed
+   through to `raft_add_node` vs `raft_add_non_voting_node`.
+   Default voter when unspecified for backward-compatibility.
+   (~1 day)
+2. Confirm willemt's quorum math correctly excludes learners
+   from votes / commits — there are unit tests in willemt
+   already, but our wrapper needs a test that verifies
+   `RaftNode.committedSeq` doesn't move waiting on a learner
+   ack. (~half day)
+3. Promotion path: `raft_become_voter(learner_id)` exposed via
+   an admin endpoint or operator CLI for the failover
+   scenario. (~half day)
+4. Multi-node smoke: 3 voters + 1 learner; drive load; kill 2
+   voters; promote the learner; verify state continuity +
+   cluster health post-promotion. (~1 day)
+
+Total: ~3 days. Independently shippable from #1.1; can be
+done before, after, or alongside.
+
+**The combined story after #1.1 + #1.2**: each cluster node
+manages its own log independently (compaction, catchup via
+`send_snapshot`). DR is handled by live geographic redundancy
+via the learner — promote on regional loss for
+seconds-of-window recovery. S3 holds tenant blobs, log
+batches, and bytecodes (the things it's already good at) but
+is not a DR mechanism. The "halfway S3 DR" architecture is
+gone entirely.
+
+### 2. By-reference manifest reuse for unchanged tenants — **done 2026-05-09, then made vestigial 2026-05-10**
+
+> **Scope dissolved by #1.1 + #1.2 (2026-05-10):** the design
+> conversation that produced #1.1 and #1.2 dropped both the
+> steady-state byte capture (replaced by stamp-and-compact)
+> AND the periodic S3 DR backup loop (replaced by the
+> learner). The reuse logic in `capture()` is now exercised
+> only by the operator-on-demand `loop46 snapshot` CLI —
+> still useful, no longer load-bearing. Implementation
+> stays; the periodic consumer is gone.
+
 
 Naive per-pass capture re-VACUUMed every tenant regardless of
 activity, paying full CPU + S3 PUT cost proportional to *total*
@@ -262,18 +439,22 @@ this is fine, but multi-customer prod with mixed tiers needs it.
 ## Suggested order of attack
 
 1. ~~**#1 raft log compaction.**~~ Done 2026-05-09.
-2. ~~**#2 by-reference reuse.**~~ Done 2026-05-09.
-3. **#1.1 snapshot off the raft thread.** Surfaced 2026-05-10
-   by the scalability bench. Without this, periodic snapshots
-   are limited to ~5 active tenants per interval before
-   leadership flaps. Blocks production at the density Loop46 is
-   designed for.
-4. **#7 leader-failover smoke.** Validates the at-least-once
-   contract you've already designed.
-4. **#4 deployment doc + systemd units.** Afternoon's work; turns
+2. ~~**#2 by-reference reuse.**~~ Done 2026-05-09; made
+   vestigial 2026-05-10 (still works, no longer on a
+   periodic path).
+3. **#1.1 decouple log compaction from byte capture.**
+   ~3.5 days. Compaction becomes ~100ms via stamp-and-compact.
+   Catchup uses peer-to-peer SQLite backup via willemt's
+   `send_snapshot` callback. No periodic S3 backup loop.
+   Eliminates heartbeat starvation by structure.
+4. **#1.2 non-voting learner replica = the entire DR story.**
+   ~3 days. Independently shippable from #1.1; can interleave.
+   Live geographic redundancy. S3 is not a DR mechanism.
+5. **#7 leader-failover smoke.** Validates the at-least-once
+   contract for `http.send` already designed.
+6. **#4 deployment doc + systemd units.** Afternoon's work; turns
    "I know how to start this" into "an operator can start this."
-5. **#4 deployment doc + systemd units.** Afternoon's work; turns
-   "I know how to start this" into "an operator can start this."
-6. **#5 / #6 / #8.** Each an afternoon.
-7. **#9 / #10 / #11 / #12.** Real work but slot after launch
+   Covers the learner-mode peer config (#1.2).
+7. **#3 / #5 / #6 / #8.** Each an afternoon.
+8. **#9 / #10 / #11 / #12.** Real work but slot after launch
    unless a specific customer requirement surfaces.
