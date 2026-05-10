@@ -6,6 +6,21 @@ pub const raft_rpc = @import("raft_rpc.zig");
 pub const raft_net = @import("raft_net.zig");
 pub const raft_node = @import("raft_node.zig");
 const writeset_mod = @import("writeset.zig");
+const cluster_mod = @import("cluster.zig");
+
+/// Multi-store raft library. See `docs/raft-kv-design.md`.
+pub const Cluster = cluster_mod.Cluster;
+pub const ClusterConfig = cluster_mod.Config;
+pub const Envelope = cluster_mod.Envelope;
+pub const EnvelopeRegistration = cluster_mod.EnvelopeRegistration;
+pub const ClusterApplyFn = cluster_mod.ApplyFn;
+pub const ClusterApplyError = cluster_mod.ApplyError;
+pub const ENVELOPE_TYPE_WRITESET = cluster_mod.ENVELOPE_TYPE_WRITESET;
+pub const ENVELOPE_TYPE_MULTI = cluster_mod.ENVELOPE_TYPE_MULTI;
+pub const decodeEnvelope = cluster_mod.decodeEnvelope;
+pub const encodeEnvelope = cluster_mod.encodeEnvelope;
+pub const encodeMulti = cluster_mod.encodeMulti;
+pub const decodeMultiInner = cluster_mod.decodeMultiInner;
 
 pub const RaftNet = raft_net.RaftNet;
 pub const RaftNetConfig = raft_net.RaftNet.Config;
