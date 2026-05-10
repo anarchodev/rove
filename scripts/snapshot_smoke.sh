@@ -206,13 +206,34 @@ for i in $(seq 1 $PRE_BURST); do
 done
 sleep 3
 
-CAPTURE_LOGS=$(grep -c 'snapshot captured ' "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out")
-[[ "$CAPTURE_LOGS" -ge 1 ]] || {
-    echo "FAIL: no 'snapshot captured' log lines on leader" >&2
+# tickRaftCapture now logs `snapshot tick apply_position=N stamped_tenants=K
+# stamped_root=B duration_ms=M` (per docs/production.md #1.1: stamp-and-
+# compact, no byte capture). Verify the leader fired at least one tick.
+TICK_LOGS=$(awk '/snapshot tick apply_position=/ {n++} END {print n+0}' \
+    "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out")
+if (( TICK_LOGS < 1 )); then
+    echo "FAIL: no 'snapshot tick' log lines on leader" >&2
     tail -30 "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out" >&2
     exit 1
-}
-echo "ok  worker logged $CAPTURE_LOGS capture(s) after burst-1"
+fi
+echo "ok  worker logged $TICK_LOGS tick(s) after burst-1"
+
+# Pass duration must be well under the willemt election timeout —
+# that's the load-bearing property of #1.1. Expectation: tens of
+# milliseconds for a few-tenant cluster, never seconds. Check the
+# max across all ticks.
+MAX_DURATION=$(awk '/snapshot tick apply_position=/ {
+    for (i=1;i<=NF;i++) if (substr($i,1,12)=="duration_ms=") {
+        d=substr($i,13)+0; if (d>m) m=d
+    }
+} END {print m+0}' "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out")
+if (( MAX_DURATION > 1000 )); then
+    echo "FAIL: max snapshot tick duration ($MAX_DURATION ms) > 1000 ms" >&2
+    echo "      — pass should be ~ms not seconds; check that nothing is" >&2
+    echo "      doing per-tenant S3 work on the raft thread again." >&2
+    exit 1
+fi
+echo "ok  max snapshot tick duration: ${MAX_DURATION}ms (well under heartbeat budget)"
 
 # ── 6. Verify raft.log.db actually compacts (rows + file size) ────
 #
@@ -279,98 +300,46 @@ AV_MODE=$(sqlite3 "$RAFT_LOG" "PRAGMA auto_vacuum;")
 [[ "$AV_MODE" == "2" ]] || { echo "FAIL: auto_vacuum=$AV_MODE on raft.log.db (want 2 = INCREMENTAL)" >&2; exit 1; }
 echo "ok  raft.log.db auto_vacuum=INCREMENTAL"
 
-# ── 7. Verify by-reference reuse for unchanged tenants ─────────────
+# ── 7. Verify _apply_state stamping is firing on every tenant ────
 #
-# The `quiet` tenant got seeded but never received a release POST
-# during the burst loops. Its tenant_apply_idx mirror stayed at
-# whatever the seed left it (0). Every snapshot pass after the first
-# should reuse the FIRST manifest's quiet/app.db key by reference —
-# no new VACUUM + PUT for quiet.
-#
-# Drive one more release POST (against acme, NOT quiet) so the
-# capture loop has a reason to fire fresh and we know which tenants
-# were touched.
-"${CURL[@]}" \
-    -H "Authorization: Bearer $PERIODIC_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"tenant_id":"acme","dep_id":999}' \
-    "https://app.loop46.localhost:${LEADER_PORT}/_system/release" >/dev/null
-sleep 2
-
-# Pull every manifest_key from the leader's worker log (each emits
-# `snapshot captured {snap_id} vacuumed=N reused=M duration_ms=K manifest_key=...`).
-# Take the last 2 — these will be the most recent snapshots after the
-# acme-only burst. Both must reference the SAME `quiet/app.db`
-# bytes via the same `db_key`.
-WORKER_LOG="/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out"
-MAPPED=$(grep -oE 'manifest_key=cluster/snapshots/[^ ]+' "$WORKER_LOG" | tail -2 || true)
-if [[ -z "$MAPPED" ]]; then
-    echo "FAIL: could not extract recent manifest_key lines from worker log" >&2
-    grep 'snapshot captured' "$WORKER_LOG" | tail -5 >&2
+# Per docs/production.md #1.1: tickRaftCapture stamps
+# _apply_state.last_applied_raft_idx for every tenant (including
+# dormant ones — the always-refresh-all property). After the burst,
+# both the active `acme` and the dormant `quiet` should have a
+# stamp at >= the apply_position the latest tick logged.
+LATEST_APPLY_POS=$(awk '/snapshot tick apply_position=/ {
+    for (i=1;i<=NF;i++) if (substr($i,1,15)=="apply_position=") {
+        a=substr($i,16)+0; if (a>m) m=a
+    }
+} END {print m+0}' "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out")
+if (( LATEST_APPLY_POS == 0 )); then
+    echo "FAIL: could not parse apply_position from snapshot tick logs" >&2
     exit 1
 fi
-KEY_RECENT_1=$(echo "$MAPPED" | sed -n '1p' | sed -E 's/^manifest_key=//')
-KEY_RECENT_2=$(echo "$MAPPED" | sed -n '2p' | sed -E 's/^manifest_key=//')
-[[ -n "$KEY_RECENT_1" && -n "$KEY_RECENT_2" && "$KEY_RECENT_1" != "$KEY_RECENT_2" ]] || {
-    echo "FAIL: need 2 distinct recent manifest keys, got '$KEY_RECENT_1' and '$KEY_RECENT_2'" >&2
+echo "ok  latest snapshot tick apply_position=$LATEST_APPLY_POS"
+
+ACME_DB="$LEADER_DIR/acme/app.db"
+QUIET_DB="$LEADER_DIR/quiet/app.db"
+ACME_STAMP=$(sqlite3 "$ACME_DB" "SELECT v FROM _apply_state WHERE k='last_applied_raft_idx';" 2>/dev/null || echo 0)
+QUIET_STAMP=$(sqlite3 "$QUIET_DB" "SELECT v FROM _apply_state WHERE k='last_applied_raft_idx';" 2>/dev/null || echo 0)
+echo "  acme  _apply_state = $ACME_STAMP"
+echo "  quiet _apply_state = $QUIET_STAMP"
+
+# Both stamps should be >= the most-recent tick's apply_position.
+# Allow a small grace (1 entry) for races where a tick fired AFTER
+# a write committed but BEFORE the stamp loop reached the tenant.
+GRACE=1
+if (( ACME_STAMP + GRACE < LATEST_APPLY_POS )); then
+    echo "FAIL: acme _apply_state ($ACME_STAMP) < latest_apply_position ($LATEST_APPLY_POS)" >&2
     exit 1
-}
-
-# We use the operator CLI's `--snapshot-dir` form to read manifest
-# bytes via S3 (the same backend the periodic loop wrote them to).
-# `aws s3 cp` would be cleanest but isn't a hard requirement of the
-# smoke harness; instead use a small Python helper or fall back to
-# extracting tenants from the raft thread's stderr (we don't have a
-# manifest-show command). The simpler path: walk both manifests by
-# pulling them from the same FsBatchStore-or-S3 backend the worker
-# wrote them to, via a tiny inline Python script that signs an S3
-# GET. To keep dependencies minimal here, just verify reuse via the
-# behavioural property we DO have visibility into: count distinct
-# `cluster/snapshots/*/quiet/app.db` keys created in S3. With reuse
-# working there should be exactly 1 (the first capture's). Without
-# reuse there'd be one per capture pass (4+).
-# We use the AWS CLI if available; skip with a warning otherwise.
-if command -v aws >/dev/null 2>&1 && [[ -n "${S3_BUCKET:-}" && -n "${S3_ENDPOINT:-}" ]]; then
-    # Snapshots use cluster/snapshots/* directly under the bucket
-    # root (or under SNAPSHOT_S3_KEY_PREFIX if set — not used by the
-    # smoke). They do NOT live under S3_KEY_PREFIX_BASE; that prefix
-    # is for tenant blobs (file-blobs / log-blobs).
-    #
-    # Filter by THIS run's snap_ids — the bucket accumulates
-    # snapshots across runs and a raw count would mix in historical
-    # ones, hiding any reuse regression in the current run.
-    THIS_RUN_SNAP_IDS=$(grep -oE 'snapshot captured [0-9a-f]+' "$WORKER_LOG" | awk '{print $3}' | sort -u)
-    if [[ -z "$THIS_RUN_SNAP_IDS" ]]; then
-        echo "FAIL: no snap_ids extracted from worker log; cannot verify reuse" >&2
-        exit 1
-    fi
-    THIS_RUN_PATTERN=$(echo "$THIS_RUN_SNAP_IDS" | paste -sd'|' -)
-
-    QUIET_KEY_COUNT=$(AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
-        aws s3 ls --endpoint-url "$S3_ENDPOINT" \
-        "s3://${S3_BUCKET}/cluster/snapshots/" --recursive 2>/dev/null \
-        | awk '{print $4}' \
-        | grep -E "cluster/snapshots/(${THIS_RUN_PATTERN})/quiet/app.db$" \
-        | wc -l)
-
-    # Want exactly 0 or 1 fresh quiet/app.db keys uploaded under
-    # this run's snap_ids: the first capture VACUUMs + uploads
-    # quiet's db (1 key); every subsequent capture should reuse
-    # that db_key by reference (0 new keys). 0 is also OK if every
-    # capture happened to fall after quiet's release was committed
-    # AND the captured manifest wasn't the FIRST ever — i.e., the
-    # primed cache from a prior cluster lifetime carried quiet
-    # forward. So accept {0, 1}; >1 means reuse broke.
-    if [[ "$QUIET_KEY_COUNT" -gt 1 ]]; then
-        echo "FAIL: $QUIET_KEY_COUNT distinct quiet/app.db keys in S3 (this run's snap_ids only)" >&2
-        echo "      — by-reference reuse is not firing. Every capture is re-VACUUMing +" >&2
-        echo "      re-PUTting an unchanged tenant (expected at most 1 across all passes)." >&2
-        exit 1
-    fi
-    echo "ok  by-reference reuse: $QUIET_KEY_COUNT distinct quiet/app.db key(s) in S3 (this run's snap_ids only; want <=1)"
-else
-    echo "skip  by-reference reuse S3 listing (aws CLI not in PATH or S3 env not set; inline tests cover the contract)"
 fi
+if (( QUIET_STAMP + GRACE < LATEST_APPLY_POS )); then
+    echo "FAIL: quiet (DORMANT) _apply_state ($QUIET_STAMP) < latest_apply_position ($LATEST_APPLY_POS)" >&2
+    echo "      — always-refresh-all property is broken; dormant tenants" >&2
+    echo "      will pin willemt's compaction floor." >&2
+    exit 1
+fi
+echo "ok  always-refresh-all: dormant tenant 'quiet' stamped at $QUIET_STAMP (>=$LATEST_APPLY_POS - $GRACE)"
 
 echo ""
 echo "PASS snapshot smoke"

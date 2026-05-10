@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Snapshot scalability benchmark — verifies by-reference reuse keeps
-# the periodic capture pass cost proportional to the number of
-# *active* tenants, not the total tenant count.
+# Snapshot scalability benchmark — verifies the stamp-and-compact
+# log compaction (docs/production.md #1.1) stays well under the
+# willemt heartbeat budget across tenant scales.
 #
 # The proof point: after warmup (where every tenant gets at least one
-# write so it appears in apply_ctx.tenant_apply_idx), driving writes
-# against only N_active out of N_total tenants must result in
-# steady-state snapshot passes that VACUUM ~N_active tenants and
-# REUSE ~(N_total - N_active). Without the always-refresh-all + reuse
-# property, every pass would VACUUM every tenant — at 10k tenants
-# that's a few orders of magnitude more S3 PUTs per pass.
+# write so it appears in apply_ctx.tenant_apply_idx), drive writes
+# against N_active out of N_total tenants. Steady-state snapshot
+# ticks should:
+#   - fire at the configured cadence (no leadership flap)
+#   - have duration_ms well under the election timeout
+#   - stamp _apply_state for every tenant (always-refresh-all)
+#
+# Pass duration scales linearly with N_total (one small SQLite
+# write per tenant per pass) but with a steep slope: ~1ms per
+# tenant in fs backend. At 10k tenants this is the next bottleneck
+# — to push further we'd batch stamps across multiple ticks.
 #
 # Usage:
 #   N_TOTAL=1000 N_ACTIVE=100 STEADY_S=60 bash scripts/snapshot_scalability_bench.sh
@@ -21,10 +26,10 @@
 #   SNAPSHOT_INTERVAL_MS=3000  --snapshot-interval-ms passed to the worker
 #   WARMUP_PARALLEL=16      curl concurrency for the warmup phase
 #   STEADY_PARALLEL=4       curl concurrency for the steady phase
-#   POST_WARMUP_SETTLE_S=8  wait for ≥2 captures to fire after warmup
+#   POST_WARMUP_SETTLE_S=8  wait for ≥2 ticks to fire after warmup
 #                           before starting the measurement window
 #
-# Requires: aws CLI, sqlite3.
+# Requires: sqlite3.
 
 set -euo pipefail
 
@@ -46,7 +51,7 @@ if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
     exit 2
 fi
-for tool in sqlite3 aws; do
+for tool in sqlite3; do
     command -v "$tool" >/dev/null 2>&1 || { echo "error: $tool not in PATH" >&2; exit 2; }
 done
 
@@ -152,21 +157,19 @@ seq 0 $((N_TOTAL - 1)) | xargs -n1 -P "$WARMUP_PARALLEL" -I{} \
 t_warmup_end=$(date +%s)
 echo "  warmup done in $((t_warmup_end - t_warmup_start))s"
 
-# Wait for at least 2 captures to fire AFTER warmup so prev_manifest
-# covers all N_TOTAL tenants. Without this, the first measurement
-# capture would have no prev → reused=0 + vacuumed=N_total.
-echo "phase C': waiting ${POST_WARMUP_SETTLE_S}s for post-warmup snapshots to settle…"
+# Wait for the warmup writes to settle and a couple of compaction
+# ticks to fire (so tenant_apply_idx has every tenant in it for
+# subsequent ticks).
+echo "phase C': waiting ${POST_WARMUP_SETTLE_S}s for warmup applies to settle…"
 sleep "$POST_WARMUP_SETTLE_S"
 
-# Mark the start of the measurement window: how many captures have
-# fired already?  We'll subtract this from the end count to get
-# steady-state captures. (`grep -c` exits 1 on zero matches; awk
-# is the simpler shape — always exits 0, prints the count
-# directly.)
-START_CAPTURES=$(awk '/snapshot captured/ {n++} END {print n+0}' "$LEADER_LOG")
-echo "  captures before steady phase: $START_CAPTURES"
-if (( START_CAPTURES < 2 )); then
-    echo "  WARN: fewer than 2 captures before steady phase — measurement may be skewed"
+# Mark the start of the measurement window: how many compaction
+# ticks have fired already? Subtract from the end count to get
+# steady-state ticks.
+START_TICKS=$(awk '/snapshot tick apply_position=/ {n++} END {print n+0}' "$LEADER_LOG")
+echo "  ticks before steady phase: $START_TICKS"
+if (( START_TICKS < 2 )); then
+    echo "  WARN: fewer than 2 ticks before steady phase — measurement may be skewed"
 fi
 
 # ── Phase D: steady-state load ────────────────────────────────────
@@ -205,21 +208,21 @@ TOTAL_COMMITS=$(awk '{s+=$1} END {print s}' "/tmp/${SMOKE_TAG}-slots.out")
 sleep $(( (SNAPSHOT_INTERVAL_MS / 1000) + 1 ))
 
 # ── Phase E: parse snapshot stats from the leader log ─────────────
-echo "phase E: parsing snapshot stats from leader log…"
-END_CAPTURES=$(awk '/snapshot captured/ {n++} END {print n+0}' "$LEADER_LOG")
-echo "  captures after steady phase:  $END_CAPTURES (delta = $((END_CAPTURES - START_CAPTURES)))"
+echo "phase E: parsing snapshot tick stats from leader log…"
+END_TICKS=$(awk '/snapshot tick apply_position=/ {n++} END {print n+0}' "$LEADER_LOG")
+echo "  ticks after steady phase:  $END_TICKS (delta = $((END_TICKS - START_TICKS)))"
 
-# Take only captures from the steady-state window (after START_CAPTURES).
-mapfile -t ALL_LINES < <(grep -oE 'snapshot captured [0-9a-f]+ vacuumed=[0-9]+ reused=[0-9]+ duration_ms=[0-9]+' "$LEADER_LOG" || true)
+mapfile -t ALL_LINES < <(grep -oE 'snapshot tick apply_position=[0-9]+ stamped_tenants=[0-9]+ stamped_root=(true|false) duration_ms=[0-9]+' "$LEADER_LOG" || true)
 
-if (( END_CAPTURES <= START_CAPTURES )); then
-    echo "FAIL: no new captures fired during the steady phase" >&2
+if (( END_TICKS <= START_TICKS )); then
+    echo "FAIL: no new compaction ticks fired during the steady phase" >&2
+    echo "      (heartbeat starvation? leadership flap? check leader log)" >&2
     tail -30 "$LEADER_LOG" >&2
     exit 1
 fi
 
 # Slice to steady window. ALL_LINES is in chronological order.
-N_STEADY=$(( END_CAPTURES - START_CAPTURES ))
+N_STEADY=$(( END_TICKS - START_TICKS ))
 N_AVAILABLE=${#ALL_LINES[@]}
 if (( N_AVAILABLE < N_STEADY )); then
     N_STEADY=$N_AVAILABLE
@@ -227,23 +230,20 @@ fi
 STEADY_LINES=("${ALL_LINES[@]: -$N_STEADY}")
 
 # Aggregate.
-TOTAL_VAC=0; TOTAL_REU=0; TOTAL_DUR=0; MAX_DUR=0
+TOTAL_STAMPED=0; TOTAL_DUR=0; MAX_DUR=0
 for line in "${STEADY_LINES[@]}"; do
-    v=$(echo "$line" | grep -oE 'vacuumed=[0-9]+' | cut -d= -f2)
-    r=$(echo "$line" | grep -oE 'reused=[0-9]+' | cut -d= -f2)
+    s=$(echo "$line" | grep -oE 'stamped_tenants=[0-9]+' | cut -d= -f2)
     d=$(echo "$line" | grep -oE 'duration_ms=[0-9]+' | cut -d= -f2)
-    TOTAL_VAC=$((TOTAL_VAC + v))
-    TOTAL_REU=$((TOTAL_REU + r))
+    TOTAL_STAMPED=$((TOTAL_STAMPED + s))
     TOTAL_DUR=$((TOTAL_DUR + d))
     (( d > MAX_DUR )) && MAX_DUR=$d
 done
 
 if (( N_STEADY > 0 )); then
-    AVG_VAC=$(( TOTAL_VAC / N_STEADY ))
-    AVG_REU=$(( TOTAL_REU / N_STEADY ))
+    AVG_STAMPED=$(( TOTAL_STAMPED / N_STEADY ))
     AVG_DUR=$(( TOTAL_DUR / N_STEADY ))
 else
-    AVG_VAC=0; AVG_REU=0; AVG_DUR=0
+    AVG_STAMPED=0; AVG_DUR=0
 fi
 
 # raft.log.db steady-state size on the leader.
@@ -258,6 +258,17 @@ else
     COMMITS_PER_S=0
 fi
 
+# Spot-check the always-refresh-all property: a dormant tenant
+# (one we wrote to ONCE in warmup, never since) must have its
+# _apply_state advance past warmup time. Pick the highest-numbered
+# warmup tenant (the one furthest from the active set 0..N_ACTIVE-1).
+DORMANT_ID=$(printf 't%05d' "$((N_TOTAL - 1))")
+DORMANT_DB="$LEADER_DIR/$DORMANT_ID/app.db"
+DORMANT_STAMP=0
+if [[ -f "$DORMANT_DB" ]]; then
+    DORMANT_STAMP=$(sqlite3 "$DORMANT_DB" "SELECT v FROM _apply_state WHERE k='last_applied_raft_idx';" 2>/dev/null || echo 0)
+fi
+
 # ── Report ─────────────────────────────────────────────────────────
 echo
 echo "═════ snapshot scalability bench results ═════"
@@ -266,26 +277,31 @@ printf '  %-32s %s\n' "N_active"                   "$N_ACTIVE"
 printf '  %-32s %ss\n' "steady_duration"           "$STEADY_S"
 printf '  %-32s %sms\n' "snapshot_interval"        "$SNAPSHOT_INTERVAL_MS"
 echo
-printf '  %-32s %s (across %d steady passes)\n' "avg vacuumed/pass" "$AVG_VAC" "$N_STEADY"
-printf '  %-32s %s\n' "avg reused/pass"            "$AVG_REU"
-printf '  %-32s %sms (max %sms)\n' "avg pass duration" "$AVG_DUR" "$MAX_DUR"
+printf '  %-32s %s (across %d steady ticks)\n' "avg stamped tenants/tick" "$AVG_STAMPED" "$N_STEADY"
+printf '  %-32s %sms (max %sms)\n' "avg tick duration" "$AVG_DUR" "$MAX_DUR"
 echo
 printf '  %-32s %s commits (%s/s)\n' "steady-state apply throughput" "$TOTAL_COMMITS" "$COMMITS_PER_S"
 printf '  %-32s %s bytes (%s rows)\n' "raft.log.db steady-state"     "$RAFT_SIZE" "$RAFT_ROWS"
+printf '  %-32s %s (last warmup tenant)\n' "dormant _apply_state ($DORMANT_ID)" "$DORMANT_STAMP"
 echo
 
-# Sanity check: vacuumed should be much closer to N_active than
-# N_total. Allow up to 2x N_active + 5 for noise.
-EXPECTED_VAC_CEILING=$(( N_ACTIVE * 2 + 5 ))
-if (( AVG_VAC > EXPECTED_VAC_CEILING )); then
-    echo "WARN: avg vacuumed/pass ($AVG_VAC) > $EXPECTED_VAC_CEILING (expected ~N_active=$N_ACTIVE)"
-    echo "      — by-reference reuse may not be amortizing as expected"
+# Sanity: max tick duration must stay well under typical raft
+# election timeout (200-500ms). If it doesn't, the heartbeat-
+# starvation problem is back.
+ELECTION_BUDGET_MS=200
+if (( MAX_DUR > ELECTION_BUDGET_MS )); then
+    echo "WARN: max tick duration ($MAX_DUR ms) > $ELECTION_BUDGET_MS ms"
+    echo "      — risk of heartbeat starvation; pass is doing too much"
+    echo "      raft-thread work. Check that no S3 / VACUUM-INTO crept"
+    echo "      back into tickRaftCapture."
 fi
 
-EXPECTED_REU_FLOOR=$(( N_TOTAL - N_ACTIVE - 5 ))
-if (( EXPECTED_REU_FLOOR > 0 && AVG_REU < EXPECTED_REU_FLOOR )); then
-    echo "WARN: avg reused/pass ($AVG_REU) < $EXPECTED_REU_FLOOR (expected ~N_total-N_active=$EXPECTED_REU_FLOOR)"
-    echo "      — dormant tenants are being re-VACUUMed instead of reused"
+# Always-refresh-all: a dormant tenant's _apply_state should
+# advance every pass even though it's never written to.
+if (( DORMANT_STAMP < START_TICKS )); then
+    echo "WARN: dormant tenant _apply_state ($DORMANT_STAMP) didn't advance"
+    echo "      — always-refresh-all is broken; willemt's compaction"
+    echo "      floor will be pinned by dormant tenants."
 fi
 
 echo "DONE"

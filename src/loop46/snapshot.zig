@@ -611,29 +611,59 @@ pub fn logNeedsSnapshot(
     );
 }
 
-/// In-process periodic capture for the raft thread (Phase 5.5(c)
-/// step B). Designed to be called from the raft thread's main
-/// loop on every tick — checks the elapsed-time gate, and on each
-/// firing brackets the capture with `raft.beginSnapshotOpaque()`
-/// + `raft.endSnapshotOpaque()` so willemt's on-disk log gets
-/// compacted past the new snapshot floor.
+/// Result of a successful `tickRaftCapture` pass — the snapshot
+/// floor we advanced to + counts for ops visibility. Replaces
+/// the `Captured` struct for the periodic-loop path; operator CLI
+/// captures still go through `capture()` and return `Captured`.
+pub const TickResult = struct {
+    /// The willemt apply position we just compacted past. Equal
+    /// to `commit_idx_at_begin_snapshot`.
+    apply_position: u64,
+    /// Tenants whose `_apply_state` we stamped this pass.
+    /// Equal to `apply_ctx.tenant_apply_idx.count()` minus any
+    /// individual stamp failures (logged but not fatal).
+    stamped_tenants: u32,
+    /// True if `__root__.db` was stamped successfully this pass.
+    /// False on a node that's never seen a root_writeset apply.
+    stamped_root: bool,
+    /// Wall-clock duration of the stamp loop + willemt
+    /// begin/end. Excludes the elapsed-time gate.
+    duration_ms: u64,
+};
+
+/// In-process periodic log compaction for the raft thread.
 ///
-/// Capture runs synchronously on the raft thread — no concurrent
-/// applies during the work, so the snapshot bytes match willemt's
-/// `snapshot_last_idx = commit_idx_at_begin`. For low-tenant-count
-/// clusters this is fine; high-scale will eventually want a
-/// dedicated snapshot thread + a different begin/end strategy.
+/// **No byte capture, no S3, no manifest.** Per
+/// `docs/production.md` #1.1: log compaction only needs an
+/// assertion that "this node's tenant state is consistent through
+/// idx N" — the on-disk app.db files plus their
+/// `_apply_state.last_applied_raft_idx` stamp are exactly that
+/// assertion, and no separate byte copy is required.
 ///
-/// Returns the elapsed-since-last-capture time so the caller can
-/// log + observability metrics. `null` means we skipped this tick.
+/// What this pass does:
+///
+///   1. willemt begin_snapshot at current commit_idx.
+///   2. Stamp `_apply_state[T] = commit_idx` for every tenant T
+///      in `apply_ctx.tenant_apply_idx` (always-refresh-all so
+///      dormant tenants don't pin willemt's compaction floor).
+///   3. Same for `__root__.db`.
+///   4. willemt end_snapshot → cbLogPoll truncates raft.log.db
+///      past the new floor. compactLogPages releases freed
+///      pages back to the filesystem.
+///
+/// Falls-behind followers + new-node bootstrap go through
+/// willemt's `send_snapshot` callback (separate item — currently
+/// the `logNeedsSnapshot` warning), NOT through this path.
+///
+/// Returns null when we skipped this tick (interval not elapsed,
+/// not leader, willemt has nothing to snapshot). Otherwise
+/// returns counts + duration for ops visibility.
 pub fn tickRaftCapture(
     state: *RaftCaptureState,
     now_ns: i64,
     raft: *kv.RaftNode,
     apply_ctx: *apply_mod.ApplyCtx,
-    snapshot_store: ls.batch_store.BatchStore,
-    tmp_dir: []const u8,
-) !?Captured {
+) !?TickResult {
     if (state.interval_ns == 0) return null;
     if (!raft.isLeader()) return null;
     if (now_ns - state.last_attempt_ns < state.interval_ns) return null;
@@ -642,64 +672,64 @@ pub fn tickRaftCapture(
     // willemt's begin returns false when there's nothing to
     // snapshot (commit_idx <= snap_last, no log entries past the
     // floor) — completely fine, just means no progress since the
-    // last pass. Stays silent in that case; non-trivial errors
-    // (NONBLOCKING_APPLY rejected, etc) would surface as the
-    // capture itself failing further down.
+    // last pass.
     if (!raft.beginSnapshotOpaque()) return null;
     errdefer raft.endSnapshotOpaque();
 
+    const start_ns = std.time.nanoTimestamp();
     const apply_position = raft.snapshotLastIdx();
-    const willemt_term = raft.currentTerm();
 
-    // Apply the cold-start safety guard against the cache the
-    // caller pre-warmed (see `primeFromSnapshotStore`). If the
-    // cached prev manifest's floor is past our current
-    // apply_position, it's from a later cluster lifetime
-    // (operator wiped data_dir, etc.) — drop it so reuse can't
-    // silently substitute future tenant bytes for empty state.
-    // Cheap: just a u64 compare; no I/O on the raft thread.
-    if (state.last_manifest) |m| {
-        if (m.willemt_compaction_floor > apply_position) {
+    // Per-tenant stamp loop. Each stamp is one prepared-statement
+    // step → small WAL append → fsync (in synchronous=FULL mode).
+    // ~1ms per tenant in fs backend, similar in WAL-mode SQLite.
+    // For dense clusters (10k tenants) this could push >1s; we
+    // accept that for v1 — it's still 100× faster than the prior
+    // VACUUM-INTO + S3 path and operator-tunable via
+    // --snapshot-interval-ms. A dedicated raft-thread budget
+    // optimization (chunked stamping with willemt yield points)
+    // is a future item if needed.
+    var stamped: u32 = 0;
+    var idx_it = apply_ctx.tenant_apply_idx.iterator();
+    while (idx_it.next()) |entry| {
+        const id = entry.key_ptr.*;
+        const store = apply_ctx.getKv(id) catch |err| {
             std.log.warn(
-                "snapshot: cold-start manifest floor={d} > current apply_position={d}; " ++
-                    "discarding (snapshot store contains manifests from a later cluster lifetime).",
-                .{ m.willemt_compaction_floor, apply_position },
+                "snapshot: tickRaftCapture: getKv {s} failed: {s} (tenant skipped)",
+                .{ id, @errorName(err) },
             );
-            var owned = m;
-            owned.deinit();
-            state.last_manifest = null;
-        }
+            continue;
+        };
+        store.setLastAppliedRaftIdx(apply_position) catch |err| {
+            std.log.warn(
+                "snapshot: tickRaftCapture: setLastAppliedRaftIdx for {s} failed: {s}",
+                .{ id, @errorName(err) },
+            );
+            continue;
+        };
+        stamped += 1;
     }
 
-    const sources = try tenantSourcesFromApplyCtx(state.allocator, apply_ctx);
-    defer state.allocator.free(sources);
-
-    // Ensure the root_store is opened for snapshot's use. On the
-    // leader, `applyRootWriteSet` deliberately doesn't open it
-    // (avoids a second writer on `__root__.db`); we pay the open
-    // cost here, once per process lifetime.
+    // Same for __root__.db (singleton). On nodes that have never
+    // seen a root_writeset apply, getRootKv returns no error but
+    // root_apply_idx stays 0; we still stamp to apply_position so
+    // the file's _apply_state matches the snapshot floor.
+    var stamped_root = false;
     const root_store = apply_ctx.getRootKv() catch null;
-
-    const prev_ptr: ?*const Manifest = if (state.last_manifest) |*m| m else null;
-
-    const captured = try capture(
-        state.allocator,
-        sources,
-        root_store,
-        apply_ctx.rootLastApplied(),
-        prev_ptr,
-        snapshot_store,
-        tmp_dir,
-        apply_position,
-        willemt_term,
-    );
+    if (root_store) |rs| {
+        rs.setLastAppliedRaftIdx(apply_position) catch |err| {
+            std.log.warn(
+                "snapshot: tickRaftCapture: setLastAppliedRaftIdx for __root__ failed: {s}",
+                .{@errorName(err)},
+            );
+        };
+        stamped_root = true;
+    }
 
     raft.endSnapshotOpaque();
 
     // Release pages freed by willemt's `cbLogPoll` chain. Without
     // this, `truncateBefore`'s DELETEs leave the pages on the
-    // freelist and `raft.log.db` grows unbounded — defeating the
-    // whole point of bracketing the capture with begin/end.
+    // freelist and `raft.log.db` grows unbounded.
     raft.compactLogPages() catch |err| {
         std.log.warn(
             "snapshot: compactLogPages failed: {s} (raft.log.db will not shrink this pass)",
@@ -707,116 +737,35 @@ pub fn tickRaftCapture(
         );
     };
 
-    // Cache the just-captured manifest so the next tick can reuse
-    // unchanged tenants' db_keys by reference. Decoding from the
-    // bytes we just produced is a few-µs round-trip; cheap on the
-    // raft thread vs another S3 LIST + GET.
-    const new_manifest = decodeManifest(state.allocator, captured.manifest_bytes) catch |err| blk: {
-        std.log.warn(
-            "snapshot: decodeManifest of just-captured manifest failed: {s} " ++
-                "(by-reference reuse skipped on next pass; correct, just expensive)",
-            .{@errorName(err)},
-        );
-        break :blk null;
-    };
-    if (new_manifest) |m| state.setLastManifest(m);
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const duration_ms: u64 = @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
 
-    return captured;
+    return .{
+        .apply_position = apply_position,
+        .stamped_tenants = stamped,
+        .stamped_root = stamped_root,
+        .duration_ms = duration_ms,
+    };
 }
 
-/// Per-raft-node state the periodic snapshot ticker carries. Owned
-/// by the caller (typically loop46/main); passed by mutable
+/// Per-raft-node state the periodic compaction ticker carries.
+/// Owned by the caller (typically loop46/main); passed by mutable
 /// reference into `tickRaftCapture`.
+///
+/// Stores only the elapsed-time gate. The pre-#1.1 design also
+/// cached a prior manifest here for by-reference reuse; under
+/// stamp-and-compact there's nothing to reuse and nothing to
+/// cache. Kept as a struct (not just a u64) so future
+/// observability fields (per-pass histograms, last-success-ns,
+/// etc.) have somewhere to live without churning the public API.
 pub const RaftCaptureState = struct {
-    allocator: std.mem.Allocator,
     interval_ns: i64,
     last_attempt_ns: i64 = 0,
-    /// Decoded manifest from the most recent successful capture
-    /// (or the cold-start lookup pre-warmed via
-    /// `primeFromSnapshotStore` before the raft thread starts).
-    /// Threaded back into the next `tickRaftCapture` call as
-    /// `prev_manifest` so unchanged tenants reuse prior db_keys
-    /// instead of re-VACUUMing. Owns allocator-owned strings.
-    last_manifest: ?Manifest = null,
 
     pub fn deinit(self: *RaftCaptureState) void {
-        if (self.last_manifest) |*m| m.deinit();
-        self.last_manifest = null;
-    }
-
-    /// Replace `last_manifest` with the just-captured manifest.
-    /// Takes ownership of `m`'s allocator-owned strings; deinits
-    /// the prior cached manifest if any.
-    fn setLastManifest(self: *RaftCaptureState, m: Manifest) void {
-        if (self.last_manifest) |*old| old.deinit();
-        self.last_manifest = m;
+        _ = self;
     }
 };
-
-/// Cold-start pre-warm: at worker startup, populate
-/// `RaftCaptureState.last_manifest` from the snapshot store so the
-/// first periodic capture reuses unchanged tenants by reference
-/// instead of VACUUMing everything.
-///
-/// **Caller is the main thread**, BEFORE spawning the raft thread.
-/// The S3 LIST + GET take seconds against a populated bucket, and
-/// running them inside `tickRaftCapture` would starve willemt of
-/// raft-thread time during the call — long enough to trigger
-/// heartbeat timeouts and leader churn. Doing it once at startup
-/// is the cheap, safe place.
-///
-/// Best-effort: any error leaves `state.last_manifest` null;
-/// the first capture re-VACUUMs everything (correct, just
-/// expensive).
-pub fn primeFromSnapshotStore(
-    state: *RaftCaptureState,
-    snapshot_store: ls.batch_store.BatchStore,
-) void {
-    if (state.last_manifest != null) return; // already primed
-    if (loadLatestPriorManifest(state.allocator, snapshot_store) catch null) |m| {
-        state.last_manifest = m;
-    }
-}
-
-/// Cold-start path: scan the snapshot store for the most recent
-/// existing snapshot manifest. Internal helper — callers go
-/// through `primeFromSnapshotStore`.
-///
-/// Best-effort: any LIST/GET/decode error returns null and leaves
-/// the cache empty. Next tick will re-VACUUM everything
-/// (correct, just expensive) — not a correctness concern.
-fn loadLatestPriorManifest(
-    allocator: std.mem.Allocator,
-    snapshot_store: ls.batch_store.BatchStore,
-) !?Manifest {
-    // Snapshot id is a ulid-shape `{ms_hex:14}{rand_hex:12}` (26
-    // chars, lexically-sortable by creation time). Manifest keys
-    // sort the same way; the lexically-greatest key under
-    // `cluster/snapshots/` ending in `/manifest.json` is the
-    // newest snapshot.
-    //
-    // The `list` API returns ascending order with a hard cap on
-    // returned keys. For pagination we'd loop, but for cold-start
-    // a single call with a generous max is enough — the snapshot
-    // retention policy keeps the count bounded (default 24h
-    // worth at e.g. 5min interval = ~288 manifests + their
-    // per-tenant entries).
-    const list_max: u32 = 4096;
-    const keys = snapshot_store.list("cluster/snapshots/", "", list_max, allocator) catch
-        return null;
-    defer ls.batch_store.freeListResult(allocator, keys);
-
-    var best: ?[]const u8 = null;
-    for (keys) |k| {
-        if (!std.mem.endsWith(u8, k, "/manifest.json")) continue;
-        if (best == null or std.mem.lessThan(u8, best.?, k)) best = k;
-    }
-
-    const key = best orelse return null;
-    const bytes = snapshot_store.get(key, allocator) catch return null;
-    defer allocator.free(bytes);
-    return decodeManifest(allocator, bytes) catch null;
-}
 
 /// Build a `[]TenantSource` slice from an already-warmed
 /// `ApplyCtx`, lazy-opening per-tenant `app.db` connections for

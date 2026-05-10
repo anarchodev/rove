@@ -541,11 +541,10 @@ fn workerThreadEntry(args: *WorkerCtx) void {
 const RaftThreadArgs = struct {
     node: *kv.RaftNode,
     apply_ctx: *rjs.apply.ApplyCtx,
-    /// Null disables the periodic capture. The standalone CLI
-    /// `loop46 snapshot` still works against the same data dir.
+    /// Null disables the periodic compaction tick. The standalone
+    /// CLI `loop46 snapshot` still works against the same data
+    /// dir for operator-on-demand DR captures.
     snapshot_state: ?*snapshot_mod.RaftCaptureState = null,
-    snapshot_store: ?log_server.batch_store.BatchStore = null,
-    snapshot_tmp_dir: ?[]const u8 = null,
     stop: *std.atomic.Value(bool),
 };
 
@@ -560,38 +559,35 @@ fn runRaftLoop(args: *RaftThreadArgs) !void {
         const now_ns: i64 = @intCast(std.time.nanoTimestamp());
         try args.node.tick(now_ns);
 
-        // Periodic snapshot capture. Only fires when the operator
-        // wired --snapshot-interval-ms. NONBLOCKING_APPLY in the
-        // begin/end pair lets willemt continue accepting committed
-        // entries logically; on a single thread they queue until
-        // capture returns, which is fine for low-tenant-count
-        // clusters. High scale needs a dedicated snapshot thread —
-        // a future step.
+        // Periodic log compaction tick. Only fires when the
+        // operator wired --snapshot-interval-ms. Per
+        // docs/production.md #1.1: this is stamp-and-compact,
+        // NOT byte capture — no S3 work, no manifest, no VACUUM
+        // INTO. Pass duration scales linearly with active tenant
+        // count at ~1ms/tenant; well under the heartbeat budget
+        // for realistic clusters. High scale (>10k tenants) may
+        // eventually want chunked stamping with willemt yield
+        // points; not needed today.
         if (args.snapshot_state) |state| {
-            const store = args.snapshot_store.?;
-            const tmp = args.snapshot_tmp_dir.?;
             const out = snapshot_mod.tickRaftCapture(
                 state,
                 now_ns,
                 args.node,
                 args.apply_ctx,
-                store,
-                tmp,
             ) catch |err| blk: {
                 std.log.warn("snapshot tick failed: {s}", .{@errorName(err)});
                 break :blk null;
             };
-            if (out) |captured| {
-                var c = captured;
-                // Stable, parseable shape for the scalability bench
-                // (`scripts/snapshot_scalability_bench.sh`) — keep
-                // the field names + ordering. Reuse rate at scale
-                // is the load-bearing scalability property.
+            if (out) |tick| {
+                // Stable, parseable shape for
+                // scripts/snapshot_scalability_bench.sh — keep
+                // the field names + ordering. apply_position is
+                // the new compaction floor; stamped is the count
+                // of tenants whose _apply_state we updated.
                 std.log.info(
-                    "snapshot captured {s} vacuumed={d} reused={d} duration_ms={d} manifest_key={s}",
-                    .{ c.snap_id, c.vacuumed_count, c.reused_count, c.duration_ms, c.manifest_key },
+                    "snapshot tick apply_position={d} stamped_tenants={d} stamped_root={} duration_ms={d}",
+                    .{ tick.apply_position, tick.stamped_tenants, tick.stamped_root, tick.duration_ms },
                 );
-                c.deinit();
             }
         }
 
@@ -984,60 +980,20 @@ pub fn main() !void {
     // would land in S3 / fs but the raft log would grow forever.
     var snap_state: ?snapshot_mod.RaftCaptureState = null;
     defer if (snap_state) |*s| s.deinit();
-    var snap_s3: ?*log_server.batch_store_s3.S3BatchStore = null;
-    defer if (snap_s3) |h| h.deinit();
-    var snap_store: ?log_server.batch_store.BatchStore = null;
-    var snap_tmp: ?[]u8 = null;
-    defer if (snap_tmp) |s| allocator.free(s);
     if (cli.snapshot_interval_ms > 0) {
-        snap_tmp = try std.fmt.allocPrint(allocator, "{s}/.snapshot-stage", .{cli.data_dir});
-        const s3cfg = blob_owned.cfg;
-        const env = blob_mod.env;
-        const key_prefix = (try env.envOpt(allocator, "SNAPSHOT_S3_KEY_PREFIX")) orelse
-            try allocator.dupe(u8, "");
-        defer allocator.free(key_prefix);
-        snap_s3 = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
-            .endpoint = s3cfg.endpoint,
-            .region = s3cfg.region,
-            .bucket = s3cfg.bucket,
-            .key_prefix = key_prefix,
-            .access_key = s3cfg.access_key,
-            .secret_key = s3cfg.secret_key,
-            .use_tls = s3cfg.use_tls,
-        });
-        snap_store = snap_s3.?.batchStore();
-        std.log.info(
-            "snapshot store: s3 endpoint={s} bucket={s} key_prefix='{s}' (interval {d}ms)",
-            .{ s3cfg.endpoint, s3cfg.bucket, key_prefix, cli.snapshot_interval_ms },
-        );
         snap_state = .{
-            .allocator = allocator,
             .interval_ns = @as(i64, cli.snapshot_interval_ms) * std.time.ns_per_ms,
         };
-
-        // Pre-warm the snapshot reuse cache from S3 / fs BEFORE
-        // spawning the raft thread. The LIST + GET take seconds
-        // against a populated bucket; doing them on the raft
-        // thread (inside tickRaftCapture) starves willemt of tick
-        // time and triggers heartbeat timeouts. Once at startup
-        // is the cheap, safe place. Best-effort: any error leaves
-        // the cache empty and the first capture re-VACUUMs every
-        // tenant — correct, just expensive.
-        snapshot_mod.primeFromSnapshotStore(&snap_state.?, snap_store.?);
-        if (snap_state.?.last_manifest) |m| {
-            std.log.info(
-                "snapshot: primed reuse cache from prior snapshot {s} (floor={d}, term={d}, tenants={d})",
-                .{ m.snap_id, m.willemt_compaction_floor, m.willemt_term, m.tenants.len },
-            );
-        }
+        std.log.info(
+            "snapshot: stamp-and-compact tick enabled (interval {d}ms)",
+            .{cli.snapshot_interval_ms},
+        );
     }
 
     var raft_thread_args = RaftThreadArgs{
         .node = raft_node,
         .apply_ctx = &apply_ctx,
         .snapshot_state = if (snap_state) |*s| s else null,
-        .snapshot_store = snap_store,
-        .snapshot_tmp_dir = snap_tmp,
         .stop = &stop_flag,
     };
     var raft_thread = try std.Thread.spawn(.{}, raftThreadMain, .{&raft_thread_args});

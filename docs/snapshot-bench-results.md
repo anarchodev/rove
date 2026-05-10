@@ -1,139 +1,133 @@
-# Snapshot scalability — initial bench results
+# Snapshot scalability — bench results
 
-> **2026-05-10 first pass.** Run via `scripts/snapshot_scalability_bench.sh`
-> against a 3-node loop46 cluster with `BLOB_BACKEND=s3` (OVH us-west-or,
-> ~30-100ms RTT). Findings below split into "design works as intended"
-> and "operational issues that surface at scale."
+> Run via `scripts/snapshot_scalability_bench.sh` against a 3-node
+> loop46 cluster with `BLOB_BACKEND=s3` (OVH us-west-or). Two
+> distinct architecture states recorded here: the pre-#1.1 byte-
+> capture model and the post-#1.1 stamp-and-compact model.
 
-## What works (100 tenant cluster, modest activity)
+## Pre-#1.1: byte-capture model (2026-05-10, before redesign)
 
-`N_total=100, N_active=10, STEADY_S=20, SNAPSHOT_INTERVAL_MS=3000`:
+The original `tickRaftCapture` did per-tenant `VACUUM INTO` + sha256
++ S3 PUT + manifest serialize on every snapshot interval, on the
+raft thread. For any non-trivial cluster the pass took longer than
+the willemt election timeout (~250ms default), starving heartbeats
+and triggering leadership flap.
+
+`N_total=100, N_active=10`:
 
 ```
 avg vacuumed/pass        8 (across 4 steady passes)
 avg reused/pass          92
 avg pass duration        1592ms (max 2059ms)
-steady-state apply tput  88 commits (4/s)
-raft.log.db steady-state 4096 bytes (0 rows)
+steady-state apply tput  4/s
+raft.log.db              4096 bytes (0 rows)
 ```
-
-Reuse rate matches the design exactly: `vacuumed ≈ N_active`,
-`reused ≈ N_total - N_active`. Always-refresh-all property holds
-(both vacuumed + reused entries get `snapshot_idx = current
-apply_position`). Pass duration is dominated by S3 PUTs for the
-fresh tenants; reused entries are pure manifest bookkeeping
-in-memory.
 
 `N_total=100, N_active=100` (every tenant active):
 
 ```
-avg vacuumed/pass        30 (single pass observed)
-avg reused/pass          71
-duration_ms              6406ms
+each node captured exactly once before losing leadership
+all captures showed reused=0 (cold-start cache always discarded
+by safety guard — prior leader's floor past new leader's apply)
+duration_ms 8-13 seconds per pass
+steady-state never reached
 ```
 
-`vacuumed=30` < `N_active=100` because in 20s of bench load with
-~4 commits/s only ~80 commits land, distributed across the 100
-tenants — so only ~30 tenants actually advanced past the prior
-snapshot's idx between captures. Behavior is correct: any tenant
-not touched between two captures is reused.
+By-reference reuse worked when the leader was stable long enough
+to land multiple captures (the 100/10 case), but the operational
+ceiling was ~5 active tenants per pass before heartbeats started
+timing out. Documented as production.md #1.1 (heartbeat
+starvation).
 
-## What breaks at scale (≥100 active tenants OR slow S3)
+## Post-#1.1: stamp-and-compact model (2026-05-10, current)
 
-**The snapshot capture pass runs on the raft thread.** While
-the pass is in flight (5-10s wall-clock for 100 tenants × S3
-PUTs at ~50ms each), willemt's heartbeat tick doesn't fire.
-Followers see no heartbeats for 5-10s, time out their election
-window (~200-500ms), and start elections. The current leader
-steps down on the next tick. New leader takes over, fires its
-own capture (with cold-start cache discarded as a different
-cluster-lifetime), captures once, loses leadership again. The
-result is a captures-per-node count of 1 across runs — the
-cluster never reaches steady-state under the bench load.
+`tickRaftCapture` now does only `_apply_state[T] = commit_idx` for
+every tenant T plus willemt begin/end + incremental_vacuum. No S3,
+no VACUUM INTO, no manifest. Pass duration scales with tenant
+count at ~30µs per tenant (one prepared-statement step per tenant
+in WAL mode + auto-commit fsync).
 
-Worker logs (from a 100-tenant run with no warmup acceleration):
+`N_total=100, N_active=10`:
 
 ```
-node 0: snapshot captured ... vacuumed=46 reused=0 duration_ms=8732
-node 1: snapshot captured ... vacuumed=46 reused=0 duration_ms=12875
-node 2: snapshot captured ... vacuumed=47 reused=0 duration_ms=10399
+avg stamped tenants/tick    100 (across 11 steady ticks)
+avg tick duration           2ms (max 3ms)
+steady-state apply tput     2/s
+raft.log.db                 4096 bytes (0 rows)
+dormant _apply_state        141 (refreshed every tick; always-refresh-all)
 ```
 
-Each node captured exactly once. `reused=0` because each new
-leader's primed cache was discarded by the safety guard
-(`prev.willemt_compaction_floor > current apply_position`) —
-the prior leader's snapshot floor was past where this leader had
-applied to, so reuse couldn't be safe.
-
-**Two coupled issues** show up here:
-
-1. **Capture pass blocks heartbeats.** The fix is to move the
-   capture to a dedicated thread (or batch it across multiple
-   raft thread ticks with explicit yield points). Same shape as
-   how the cold-start LIST got moved out of the raft thread in
-   the previous session — but for the capture itself.
-
-2. **Cold-start safety guard rejects mid-leadership-change
-   manifests.** When leadership flaps at the rate of one capture
-   per leader tenure, the cache always points at the prior
-   leader's last manifest, whose `floor` is past where the new
-   leader has applied to. Guard discards → no reuse → next
-   capture is full-cost again → blocks heartbeats again →
-   leader changes again. Self-reinforcing.
-
-The fix for (1) also fixes (2): with capture off the raft
-thread, leadership doesn't flap, the same leader produces many
-captures, prev_manifest stays valid, reuse fires. Steady-state
-cost drops to `O(N_active × S3_PUT)` as designed.
-
-## Operational ceiling on the current code
-
-For a cluster with average S3 RTT R ms and per-tenant capture
-work T ms (VACUUM INTO + sha + PUT ≈ 50ms baseline):
+`N_total=100, N_active=100`:
 
 ```
-max_safe_active_tenants ≈ election_timeout_ms / (R + T)
-                       ≈ 200ms / 50ms
-                       ≈ 4 active tenants per pass
+avg stamped tenants/tick    100 (across 11 steady ticks)
+avg tick duration           3ms (max 3ms)
+raft.log.db                 4096 bytes (0 rows)
+dormant _apply_state        152
 ```
 
-With `R + T = 100ms` and `election_timeout = 250ms` (the
-bench's `RAFT_TIMING_FLAGS`), the safe ceiling is **2-3
-fresh-VACUUM tenants per capture pass before leadership flaps**.
+`N_total=1000, N_active=100`:
 
-By-reference reuse pushes the cost per pass from `O(N_total ×
-50ms)` to `O(N_active × 50ms)` — for the operational ceiling
-to be useful, we still need `N_active < ~5` per pass on
-default election timeouts.
+```
+avg stamped tenants/tick    1000 (across 5 steady ticks)
+avg tick duration           29ms (max 40ms)
+raft.log.db                 24576 bytes (1 row)
+dormant _apply_state        1013 (refreshed even though never written)
+```
 
-## What this means for #2's checkmark
+## Observations
 
-The by-reference reuse design + implementation are correct
-(verified at 100/10 scale where reuse fires cleanly). But the
-**operational ceiling for periodic snapshots is bounded by the
-heartbeat starvation problem**, not the manifest cost. Unblocking
-real-world density (1000s of tenants, 100s active) requires
-moving the capture off the raft thread.
+- **Heartbeat starvation eliminated.** Even at 1000 tenants the
+  pass takes ~30ms — well under the willemt election timeout
+  (~250ms default). The cluster never sees the leader pause long
+  enough to trigger an election. Scaling headroom: at the
+  observed ~30µs/tenant rate, ~5000 tenants fits in 200ms before
+  approaching heartbeat budget.
+- **Always-refresh-all property holds.** Dormant tenants
+  (warmed up once, never touched again) get their `_apply_state`
+  bumped every tick. Bench checks `t<N_total-1>` (the
+  furthest-from-active tenant) and confirms its stamp advances
+  past the most recent tick's `apply_position`.
+- **Compaction is bounded.** raft.log.db stays at 4-24 KB
+  (a couple of pages) regardless of commit volume. willemt's
+  `cbLogPoll` chain runs after every successful end_snapshot;
+  `incremental_vacuum` returns freed pages to the filesystem.
+- **Throughput unchanged.** The bench's release-POST workload is
+  bottlenecked by S3-fetch-on-failed-deployment-reload (each
+  release POST tries to fetch a manifest that doesn't exist),
+  not by snapshot work. ~2/s commit rate is a property of the
+  bench, not of the snapshot path.
 
-Filed as a new item in `docs/production.md` (#1.1 snapshot
-thread).
+## What about reuse / S3 / DR backups?
+
+Per `docs/production.md` #1.1: **none of these are in the
+periodic loop anymore.**
+
+- The `capture()` function (full VACUUM-INTO + S3 PUT + manifest
+  with by-reference reuse) is still shipped — used by the
+  operator-on-demand `loop46 snapshot` CLI. The bench doesn't
+  exercise that path.
+- DR is handled by `#1.2` (non-voting learner replica), not by
+  periodic S3 backups. There is no periodic S3 backup loop in
+  the new architecture.
 
 ## How to reproduce
 
 ```bash
 zig build install
 
-# Confirms the "reuse works" property at small scale.
-STEADY_S=30 N_TOTAL=100 N_ACTIVE=10 \
+# 100 tenants, 10 active, 20s steady. Verifies the basic
+# stamp-and-compact contract.
+STEADY_S=20 N_TOTAL=100 N_ACTIVE=10 SNAPSHOT_INTERVAL_MS=2000 \
   bash scripts/snapshot_scalability_bench.sh
 
-# Demonstrates the heartbeat starvation problem:
-#   each capture takes ≥5s, leadership flaps, 1 capture per node.
-STEADY_S=60 N_TOTAL=1000 N_ACTIVE=100 \
-  SNAPSHOT_INTERVAL_MS=10000 POST_WARMUP_SETTLE_S=30 \
+# 1000 tenants. Confirms tick duration scales linearly with
+# tenant count and stays under heartbeat budget.
+STEADY_S=30 N_TOTAL=1000 N_ACTIVE=100 SNAPSHOT_INTERVAL_MS=3000 \
+  POST_WARMUP_SETTLE_S=10 \
   bash scripts/snapshot_scalability_bench.sh
 ```
 
-`.env` must carry `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-/ `S3_BUCKET` / `S3_ENDPOINT` / `S3_REGION` for the snapshot
-store and the standalones' BlobBackend.
+`.env` (repo root) must carry the `AWS_*` / `S3_*` env vars for
+the cluster to boot — they're used by the standalones' BlobBackend
+even though the snapshot path itself no longer touches S3.

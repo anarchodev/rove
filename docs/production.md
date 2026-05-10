@@ -43,7 +43,7 @@ Shipped:
   size are bounded after 120 commits + 4 snapshot passes (was
   unbounded before).
 
-### 1.1 Decouple log compaction from byte capture — **NEW, design landed 2026-05-10**
+### 1.1 Decouple log compaction from byte capture — **steps 1+2 done 2026-05-10; step 3 (send_snapshot) pending**
 
 `scripts/snapshot_scalability_bench.sh` surfaced that the
 per-tenant VACUUM INTO + S3 PUT + manifest serialize work in
@@ -118,30 +118,38 @@ is correct without re-VACUUMing.
 
 Implementation order:
 
-1. Lazy `_apply_state` stamp at compaction time, with always-
-   refresh-all over every tenant in `tenant_apply_idx`. Code
-   already mostly in place (see `tickRaftCapture`); the change
-   is to do the stamp loop *instead of* VACUUM INTO + upload,
-   not in addition to it. (~1 day)
-2. Drop the periodic VACUUM-INTO-to-S3 path from
-   `tickRaftCapture`. Keep the function name; replace the body.
-   The existing `capture()` function + `loop46 snapshot` /
-   `loop46 restore-from-snapshot` operator CLIs stay (cheap to
-   keep, occasionally useful for "freeze a point in time"
-   ops scenarios), they just stop firing on a periodic loop.
-   (~half day)
-3. Wire willemt's `send_snapshot` callback to actually trigger
-   peer-to-peer app.db streaming via SQLite's online backup
-   API instead of just logging a warning. Receiving side
-   stages files in `tmp_dir/{snap_id}/`, atomic-renames into
-   `data_dir/`, calls `raft_load_snapshot`. (~2 days, includes
-   a multi-node smoke that kills + re-adds a follower far
-   behind the leader's snapshot floor.)
+1. **Done 2026-05-10**. Lazy `_apply_state` stamp at compaction
+   time, with always-refresh-all over every tenant in
+   `tenant_apply_idx`. `tickRaftCapture` now stamps every
+   tenant + root + calls willemt begin/end + `compactLogPages`
+   — no VACUUM INTO, no S3 PUT, no manifest. Returns a
+   `TickResult` with `apply_position` / `stamped_tenants` /
+   `stamped_root` / `duration_ms`.
+2. **Done 2026-05-10**. Periodic VACUUM-INTO-to-S3 path
+   removed. `RaftCaptureState` simplified (no manifest cache,
+   no cold-start prime). `main.zig`'s snapshot setup
+   correspondingly simpler — just `interval_ns`, no S3 store
+   handle. The `capture()` function + `loop46 snapshot` /
+   `loop46 restore-from-snapshot` CLIs are kept untouched for
+   on-demand operator use. Verified via
+   `scripts/snapshot_smoke.sh` (max tick 18ms) and
+   `scripts/snapshot_scalability_bench.sh` (`N_total=1000`:
+   29ms avg, 40ms max — see
+   `docs/snapshot-bench-results.md`).
+3. **Pending**. Wire willemt's `send_snapshot` callback to
+   trigger peer-to-peer app.db streaming via SQLite's online
+   backup API instead of just logging a warning. Receiving
+   side stages files in `tmp_dir/{snap_id}/`, atomic-renames
+   into `data_dir/`, calls `raft_load_snapshot`. (~2 days,
+   includes a multi-node smoke that kills + re-adds a follower
+   far behind the leader's snapshot floor.)
 
-Net: ~3.5 days, simpler than the dedicated-snapshot-thread
-approach, eliminates heartbeat starvation by structure, and
-removes the conflation of compaction with backup entirely. DR
-moves to #1.2 (the learner) where it belongs.
+Net for steps 1+2 (delivered): heartbeat starvation eliminated
+structurally (3000× faster pass at 1000 tenants), always-refresh-
+all property verified, no S3 work in the periodic path. Step 3
+(send_snapshot) remains for follower-catchup automation —
+without it, far-behind followers still need operator
+intervention via `loop46 restore-from-snapshot`.
 
 **Blocks production at any density above ~5 active tenants per
 snapshot interval** under the current code with default raft
@@ -442,11 +450,13 @@ this is fine, but multi-customer prod with mixed tiers needs it.
 2. ~~**#2 by-reference reuse.**~~ Done 2026-05-09; made
    vestigial 2026-05-10 (still works, no longer on a
    periodic path).
-3. **#1.1 decouple log compaction from byte capture.**
-   ~3.5 days. Compaction becomes ~100ms via stamp-and-compact.
-   Catchup uses peer-to-peer SQLite backup via willemt's
-   `send_snapshot` callback. No periodic S3 backup loop.
-   Eliminates heartbeat starvation by structure.
+3. **#1.1 decouple log compaction from byte capture.** Steps
+   1+2 done 2026-05-10 (heartbeat starvation eliminated
+   structurally; bench-verified at 1000 tenants with 40ms max
+   tick). Step 3 (`send_snapshot` peer-to-peer streaming for
+   follower catchup) is pending — without it, far-behind
+   followers still need operator intervention via
+   `loop46 restore-from-snapshot`. ~2 days remaining.
 4. **#1.2 non-voting learner replica = the entire DR story.**
    ~3 days. Independently shippable from #1.1; can interleave.
    Live geographic redundancy. S3 is not a DR mechanism.
