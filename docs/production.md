@@ -35,7 +35,7 @@ Shipped:
   size are bounded after 120 commits + 4 snapshot passes (was
   unbounded before).
 
-### 2. By-reference manifest reuse for unchanged tenants — **done 2026-05-09**
+### 2. By-reference manifest reuse for unchanged tenants — **done 2026-05-09 (with leader-snapshot fix)**
 
 Naive per-pass capture re-VACUUMed every tenant regardless of
 activity, paying full CPU + S3 PUT cost proportional to *total*
@@ -79,9 +79,37 @@ Shipped:
   not carried forward.
 - `scripts/snapshot_smoke.sh` adds a `quiet` tenant that's
   written once and then never again; subsequent captures
-  exercise the reuse path. (S3-listing assertion that exactly
-  1 `quiet/app.db` key exists is gated on the `aws` CLI being
-  available; inline tests are the rigorous coverage.)
+  exercise the reuse path. The S3-listing assertion (filtered
+  to **this run's** snap_ids so accumulated history doesn't
+  pollute the count) verifies exactly one fresh `quiet/app.db`
+  is uploaded across all capture passes — the rest reuse it
+  by reference.
+
+**Leader-snapshot bug fixed in the same change.** The
+pre-existing `applyWriteSet` leader-skip returned before
+populating `apply_ctx.kv_stores` or `tenant_apply_idx`, so the
+leader (which is the only node that runs the periodic capture
+loop) produced empty manifests every pass. Smoke passed
+historically because it only counted "snapshot captured" log
+lines, not manifest contents. Fix: the leader path now records
+`(tenant_id, idx)` in memory via a new `markTenantApplied`
+helper (no SQLite I/O — keeps a second writer off the same
+app.db file, preserving worker throughput). The on-disk
+`_apply_state` stamp + the kv_store open are deferred to
+`tickRaftCapture`, paid once per snapshot pass instead of
+per-apply.
+
+**Cold-start path also restructured.** `loadLatestPriorManifest`
+LISTs the snapshot store + GETs the most recent manifest to
+seed the reuse cache at worker boot. Originally fired inside
+`tickRaftCapture` from the raft thread — but the multi-second
+LIST against a populated bucket starved willemt of tick time
+and triggered heartbeat timeouts (one capture per smoke run
+instead of five). Moved to `primeFromSnapshotStore`, called
+from `main.zig` before the raft thread spawns. Safety guard
+(refuse manifests with `floor > current apply_position`)
+stays in `tickRaftCapture` as a cheap u64 compare against
+the cached state.
 
 ### 3. Far-behind-follower auto-restore
 

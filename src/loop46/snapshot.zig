@@ -223,6 +223,19 @@ pub fn capture(
         );
         defer allocator.free(tmp_path);
 
+        // Stamp _apply_state to apply_position before VACUUM. On
+        // the leader, the apply path skips writing this stamp from
+        // the raft thread to avoid contending with the worker's
+        // TrackedTxn writer. We pay it here once per snapshot pass:
+        // a single tx that updates one row, on the same raft thread
+        // that's already paused for capture. Brief window where the
+        // worker has new pending commits not reflected in
+        // tenant_apply_idx is fine — those entries are still in the
+        // raft log past `apply_position`, replay will pick them up.
+        if (t.last_applied_idx) |idx| {
+            t.store.setLastAppliedRaftIdx(idx) catch return Error.Sqlite;
+        }
+
         t.store.vacuumInto(tmp_path) catch return Error.Sqlite;
 
         const captured = try uploadDbFile(
@@ -275,6 +288,16 @@ pub fn capture(
                 0,
             );
             defer allocator.free(tmp_path);
+
+            // Same lazy-stamp story as per-tenant: on the leader,
+            // `applyRootWriteSet` doesn't write `_apply_state` from
+            // the raft thread (avoids contending with the worker's
+            // root-write connection). One targeted stamp here per
+            // snapshot pass keeps the captured bytes consistent.
+            if (root_last_applied) |idx| {
+                rs.setLastAppliedRaftIdx(idx) catch return Error.Sqlite;
+            }
+
             rs.vacuumInto(tmp_path) catch return Error.Sqlite;
 
             const root_key = try std.fmt.allocPrint(
@@ -594,52 +617,41 @@ pub fn tickRaftCapture(
     const apply_position = raft.snapshotLastIdx();
     const willemt_term = raft.currentTerm();
 
-    // Cold-start: on the first tick after worker boot, populate
-    // `last_manifest` from S3 / fs so by-reference reuse works
-    // immediately instead of waiting for a fresh local capture.
-    // Fires once per RaftCaptureState lifetime; the flag flips
-    // even when the store is empty so we don't re-LIST every
-    // interval.
-    //
-    // **Safety guard:** discard the loaded manifest if its
-    // `willemt_compaction_floor` is past our current
-    // `apply_position`. That signals the stored manifest is from
-    // a different (later) cluster lifetime — e.g., the operator
-    // wiped `data_dir` but the snapshot store still holds prior
-    // history. Reusing tenant `db_key`s from that history would
-    // silently substitute *future* tenant bytes for whatever
-    // *empty* state our fresh app.db actually contains. Refuse
-    // and re-VACUUM from scratch.
-    if (!state.cold_start_done) {
-        state.cold_start_done = true;
-        if (state.last_manifest == null) {
-            if (try loadLatestPriorManifest(state.allocator, snapshot_store)) |m| {
-                if (m.willemt_compaction_floor <= apply_position) {
-                    state.last_manifest = m;
-                } else {
-                    var owned = m;
-                    std.log.warn(
-                        "snapshot: cold-start manifest floor={d} > current apply_position={d}; " ++
-                            "snapshot store contains manifests from a later cluster lifetime " ++
-                            "(operator wiped data_dir? raft log replayed only partially?). " ++
-                            "Discarding; first capture will VACUUM every tenant.",
-                        .{ m.willemt_compaction_floor, apply_position },
-                    );
-                    owned.deinit();
-                }
-            }
+    // Apply the cold-start safety guard against the cache the
+    // caller pre-warmed (see `primeFromSnapshotStore`). If the
+    // cached prev manifest's floor is past our current
+    // apply_position, it's from a later cluster lifetime
+    // (operator wiped data_dir, etc.) — drop it so reuse can't
+    // silently substitute future tenant bytes for empty state.
+    // Cheap: just a u64 compare; no I/O on the raft thread.
+    if (state.last_manifest) |m| {
+        if (m.willemt_compaction_floor > apply_position) {
+            std.log.warn(
+                "snapshot: cold-start manifest floor={d} > current apply_position={d}; " ++
+                    "discarding (snapshot store contains manifests from a later cluster lifetime).",
+                .{ m.willemt_compaction_floor, apply_position },
+            );
+            var owned = m;
+            owned.deinit();
+            state.last_manifest = null;
         }
     }
 
     const sources = try tenantSourcesFromApplyCtx(state.allocator, apply_ctx);
     defer state.allocator.free(sources);
 
+    // Ensure the root_store is opened for snapshot's use. On the
+    // leader, `applyRootWriteSet` deliberately doesn't open it
+    // (avoids a second writer on `__root__.db`); we pay the open
+    // cost here, once per process lifetime.
+    const root_store = apply_ctx.getRootKv() catch null;
+
     const prev_ptr: ?*const Manifest = if (state.last_manifest) |*m| m else null;
 
     const captured = try capture(
         state.allocator,
         sources,
-        apply_ctx.root_store,
+        root_store,
         apply_ctx.rootLastApplied(),
         prev_ptr,
         snapshot_store,
@@ -685,17 +697,13 @@ pub const RaftCaptureState = struct {
     allocator: std.mem.Allocator,
     interval_ns: i64,
     last_attempt_ns: i64 = 0,
-    /// Decoded manifest from the most recent successful capture (or
-    /// the cold-start S3-LIST lookup). Threaded back into the next
-    /// `tickRaftCapture` call as `prev_manifest` so unchanged
-    /// tenants reuse prior db_keys instead of re-VACUUMing. Owns
-    /// allocator-owned strings; cleared + replaced in
-    /// `setLastManifest`.
+    /// Decoded manifest from the most recent successful capture
+    /// (or the cold-start lookup pre-warmed via
+    /// `primeFromSnapshotStore` before the raft thread starts).
+    /// Threaded back into the next `tickRaftCapture` call as
+    /// `prev_manifest` so unchanged tenants reuse prior db_keys
+    /// instead of re-VACUUMing. Owns allocator-owned strings.
     last_manifest: ?Manifest = null,
-    /// True after the cold-start lookup ran (whether or not it
-    /// found a prior manifest). Prevents the lookup firing every
-    /// tick when no prior exists.
-    cold_start_done: bool = false,
 
     pub fn deinit(self: *RaftCaptureState) void {
         if (self.last_manifest) |*m| m.deinit();
@@ -711,16 +719,38 @@ pub const RaftCaptureState = struct {
     }
 };
 
-/// Cold-start path: when `RaftCaptureState.last_manifest` is null
-/// AND we haven't yet checked the snapshot store, look for the
-/// most recent existing snapshot manifest and seed
-/// `last_manifest` from it. Lets a freshly-restarted worker pick
-/// up the by-reference reuse chain instead of VACUUMing every
-/// tenant on its first periodic capture.
+/// Cold-start pre-warm: at worker startup, populate
+/// `RaftCaptureState.last_manifest` from the snapshot store so the
+/// first periodic capture reuses unchanged tenants by reference
+/// instead of VACUUMing everything.
 ///
-/// Best-effort: any LIST/GET/decode error logs + leaves the cache
-/// empty. Next tick will re-VACUUM everything (correct, just
-/// expensive) — not a correctness concern.
+/// **Caller is the main thread**, BEFORE spawning the raft thread.
+/// The S3 LIST + GET take seconds against a populated bucket, and
+/// running them inside `tickRaftCapture` would starve willemt of
+/// raft-thread time during the call — long enough to trigger
+/// heartbeat timeouts and leader churn. Doing it once at startup
+/// is the cheap, safe place.
+///
+/// Best-effort: any error leaves `state.last_manifest` null;
+/// the first capture re-VACUUMs everything (correct, just
+/// expensive).
+pub fn primeFromSnapshotStore(
+    state: *RaftCaptureState,
+    snapshot_store: ls.batch_store.BatchStore,
+) void {
+    if (state.last_manifest != null) return; // already primed
+    if (loadLatestPriorManifest(state.allocator, snapshot_store) catch null) |m| {
+        state.last_manifest = m;
+    }
+}
+
+/// Cold-start path: scan the snapshot store for the most recent
+/// existing snapshot manifest. Internal helper — callers go
+/// through `primeFromSnapshotStore`.
+///
+/// Best-effort: any LIST/GET/decode error returns null and leaves
+/// the cache empty. Next tick will re-VACUUM everything
+/// (correct, just expensive) — not a correctness concern.
 fn loadLatestPriorManifest(
     allocator: std.mem.Allocator,
     snapshot_store: ls.batch_store.BatchStore,
@@ -755,10 +785,17 @@ fn loadLatestPriorManifest(
 }
 
 /// Build a `[]TenantSource` slice from an already-warmed
-/// `ApplyCtx.kv_stores`. Borrows the keys + store pointers; caller
-/// frees the returned slice with `allocator.free`. Use this from
-/// the raft thread (which owns the connections) — not from a
-/// worker, since SQLite NOMUTEX connections aren't shareable.
+/// `ApplyCtx`, lazy-opening per-tenant `app.db` connections for
+/// any tenant present in `tenant_apply_idx` but not yet in
+/// `kv_stores`. The leader path is the motivating case: its
+/// `applyWriteSet` populates only the in-memory mirror (avoiding
+/// a second SQLite writer per apply); snapshot capture pays the
+/// open cost once, here.
+///
+/// Borrows the keys + store pointers; caller frees the returned
+/// slice with `allocator.free`. Use this from the raft thread
+/// (which owns the connections) — not from a worker, since
+/// SQLite NOMUTEX connections aren't shareable.
 ///
 /// Each `TenantSource.last_applied_idx` is populated from
 /// `ApplyCtx.tenant_apply_idx` so `capture` can do by-reference
@@ -767,18 +804,25 @@ pub fn tenantSourcesFromApplyCtx(
     allocator: std.mem.Allocator,
     apply_ctx: *apply_mod.ApplyCtx,
 ) ![]TenantSource {
-    var list = try allocator.alloc(TenantSource, apply_ctx.kv_stores.count());
-    var idx: usize = 0;
-    var it = apply_ctx.kv_stores.iterator();
-    while (it.next()) |entry| : (idx += 1) {
+    var list: std.ArrayListUnmanaged(TenantSource) = .empty;
+    errdefer list.deinit(allocator);
+
+    var idx_it = apply_ctx.tenant_apply_idx.iterator();
+    while (idx_it.next()) |entry| {
         const id = entry.key_ptr.*;
-        list[idx] = .{
+        // Lazy-open: getKv idempotently opens the kv_store and
+        // returns a pointer to the cached one. On the leader this
+        // is where we pay the open cost (once per tenant for the
+        // process lifetime, since kv_stores caches). On the
+        // follower we pay it inside `applyWriteSet` instead.
+        const store = apply_ctx.getKv(id) catch continue;
+        try list.append(allocator, .{
             .instance_id = id,
-            .store = entry.value_ptr.*,
-            .last_applied_idx = apply_ctx.tenantLastApplied(id),
-        };
+            .store = store,
+            .last_applied_idx = entry.value_ptr.*,
+        });
     }
-    return list;
+    return list.toOwnedSlice(allocator);
 }
 
 /// Capture a snapshot from the on-disk data dir, opening fresh

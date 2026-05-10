@@ -312,12 +312,12 @@ pub const ApplyCtx = struct {
     /// Phase 5.5(c) — in-memory mirror of every per-tenant
     /// `_apply_state.last_applied_raft_idx` row. Seeded from disk on
     /// lazy open in `getKv`; bumped inside `applyWriteSet` after a
-    /// successful apply. Used by the snapshot capture loop (next
-    /// pickup) to decide whether a tenant's db needs re-VACUUM since
-    /// the previous snapshot pass without a per-tenant SQLite query.
-    /// Borrowed keys: each entry's key is the same allocator-owned
-    /// string `kv_stores` holds, so the kv_stores map must outlive
-    /// this one (deinit orders it accordingly).
+    /// successful apply. Used by the snapshot capture loop to
+    /// decide whether a tenant's db needs re-VACUUM since the
+    /// previous snapshot pass without a per-tenant SQLite query.
+    /// Owns its own key allocations (separate from `kv_stores`'s
+    /// keys) — the leader path populates this without ever opening
+    /// the kv_store, so the two maps' lifetimes are independent.
     tenant_apply_idx: std.StringHashMapUnmanaged(u64) = .empty,
     /// Lazy root-store handle for `type=2 root_writeset` applies.
     /// Opens `{data_dir}/__root__.db` on first follower-side root
@@ -377,8 +377,12 @@ pub const ApplyCtx = struct {
     }
 
     pub fn deinit(self: *ApplyCtx) void {
-        // Drop the apply-idx mirror first — its keys are borrowed
-        // from kv_stores entries that follow.
+        // tenant_apply_idx owns its keys independently (per
+        // `markTenantApplied`); on the follower path `getKv` also
+        // populates this map but with a separate allocation, so
+        // deinit can free unconditionally.
+        var idx_it = self.tenant_apply_idx.iterator();
+        while (idx_it.next()) |e| self.allocator.free(e.key_ptr.*);
         self.tenant_apply_idx.deinit(self.allocator);
 
         var kv_it = self.kv_stores.iterator();
@@ -480,23 +484,52 @@ pub const ApplyCtx = struct {
         const store = try kv.KvStore.open(self.allocator, path);
         errdefer store.close();
 
-        const id_copy = try self.allocator.dupe(u8, instance_id);
-        errdefer self.allocator.free(id_copy);
+        const kv_id_copy = try self.allocator.dupe(u8, instance_id);
+        errdefer self.allocator.free(kv_id_copy);
 
-        try self.kv_stores.put(self.allocator, id_copy, store);
-        // Seed the per-tenant mirror from disk. Borrowed key shares
-        // the kv_stores allocation — see the field doc.
-        const seeded = store.lastAppliedRaftIdx() catch 0;
-        try self.tenant_apply_idx.put(self.allocator, id_copy, seeded);
+        try self.kv_stores.put(self.allocator, kv_id_copy, store);
+
+        // Seed the per-tenant mirror from disk if not already
+        // populated by the leader's `markTenantApplied`. Each map
+        // owns its own key allocation — deinit frees both
+        // independently.
+        if (self.tenant_apply_idx.getPtr(instance_id) == null) {
+            const seeded = store.lastAppliedRaftIdx() catch 0;
+            const idx_id_copy = try self.allocator.dupe(u8, instance_id);
+            errdefer self.allocator.free(idx_id_copy);
+            try self.tenant_apply_idx.put(self.allocator, idx_id_copy, seeded);
+        }
         return store;
     }
 
     /// Bump the in-memory mirror after a successful tenant apply.
     /// Keyed by `instance_id`; expects `getKv` to have populated the
-    /// entry already (which it does on first apply, since
-    /// `applyWriteSet` calls `getKv` before this).
+    /// entry already on the follower path (which it does on first
+    /// apply, since `applyWriteSet` calls `getKv` before this).
     fn noteTenantApplied(self: *ApplyCtx, instance_id: []const u8, idx: u64) void {
         if (self.tenant_apply_idx.getPtr(instance_id)) |slot| slot.* = idx;
+    }
+
+    /// Leader-only mirror update WITHOUT opening the tenant's
+    /// kv_store. The leader's worker already wrote the rows via its
+    /// own connection — we don't want a second writer on the same
+    /// app.db (would contend with the worker's TrackedTxn for the
+    /// WAL writer lock). Just record `(tenant_id, idx)` in memory.
+    /// Snapshot capture opens the connection lazily, stamps
+    /// `_apply_state`, and VACUUMs — paying the SQLite open cost
+    /// once per snapshot pass instead of per-apply.
+    ///
+    /// First time we see a tenant id, allocate a stable copy of the
+    /// key (the envelope's id slice points into a transient raft
+    /// entry payload). Subsequent applies just bump in place.
+    pub fn markTenantApplied(self: *ApplyCtx, instance_id: []const u8, idx: u64) !void {
+        if (self.tenant_apply_idx.getPtr(instance_id)) |slot| {
+            slot.* = idx;
+            return;
+        }
+        const id_copy = try self.allocator.dupe(u8, instance_id);
+        errdefer self.allocator.free(id_copy);
+        try self.tenant_apply_idx.put(self.allocator, id_copy, idx);
     }
 
     /// Bump the in-memory root-db mirror.
@@ -564,10 +597,23 @@ fn dispatch(ctx: *ApplyCtx, env: Envelope, entry_idx: u64, nesting: NestingLevel
 }
 
 fn applyWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
-    // Leader-skip: workers already wrote through their own
-    // connections before proposing. On the leader, apply is a no-op
-    // beyond advancing `committed_seq` (done by the caller).
-    if (ctx.raft.isLeader()) return;
+    // Leader path: the worker already wrote via its own TrackedTxn
+    // connection. We don't redo the writes (leader-skip), don't
+    // open a second SQLite connection from this thread (contention
+    // on the WAL writer lock with the worker), and don't stamp
+    // `_apply_state` from here. We DO record `(tenant_id, idx)` in
+    // memory so periodic snapshot capture knows the leader's
+    // tenant set + each tenant's apply position. The on-disk
+    // `_apply_state` stamp + the kv_store open both happen lazily
+    // inside `tickRaftCapture`, exactly once per snapshot pass.
+    if (ctx.raft.isLeader()) {
+        ctx.markTenantApplied(env.instance_id, entry_idx) catch |err| panic_mod.invariantViolated(
+            "applyWriteSet.markTenantApplied[leader]",
+            "tenant={s} err={s}",
+            .{ env.instance_id, @errorName(err) },
+        );
+        return;
+    }
 
     const store = ctx.getKv(env.instance_id) catch |err| panic_mod.invariantViolated(
         "applyWriteSet.getKv",
@@ -594,13 +640,25 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
     ctx.noteTenantApplied(env.instance_id, entry_idx);
 }
 
-/// Follower-only: decode the root writeset and apply it to this
-/// node's copy of `__root__.db`. Leader-skip matches the per-tenant
-/// path — the proposer already wrote locally before proposing, so
-/// the leader's own raft-thread apply is a no-op.
+/// Decode the root writeset and apply it to this node's copy of
+/// `__root__.db`. Same leader/follower split as `applyWriteSet`:
+/// the leader's `__root__.db` writes happened on the worker's own
+/// connection, and apply just bumps the in-memory `root_apply_idx`
+/// mirror; the on-disk `_apply_state` stamp is deferred to
+/// `tickRaftCapture` (one targeted stamp before VACUUM INTO).
+/// Follower path applies the writeset atomically with the
+/// `_apply_state` stamp via `applyEncoded`.
 fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
-    if (ctx.raft.isLeader()) return;
     std.debug.assert(env.instance_id.len == 0);
+
+    // Leader path: just bump the in-memory mirror; on-disk stamp +
+    // root store open both happen lazily in `tickRaftCapture`.
+    // Same rationale as `applyWriteSet`'s leader path — avoid
+    // putting a second writer on `__root__.db` from this thread.
+    if (ctx.raft.isLeader()) {
+        ctx.noteRootApplied(entry_idx);
+        return;
+    }
 
     const store = ctx.getRootKv() catch |err| panic_mod.invariantViolated(
         "applyRootWriteSet.getRootKv",

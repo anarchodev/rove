@@ -1010,6 +1010,22 @@ pub fn main() !void {
             .allocator = allocator,
             .interval_ns = @as(i64, cli.snapshot_interval_ms) * std.time.ns_per_ms,
         };
+
+        // Pre-warm the snapshot reuse cache from S3 / fs BEFORE
+        // spawning the raft thread. The LIST + GET take seconds
+        // against a populated bucket; doing them on the raft
+        // thread (inside tickRaftCapture) starves willemt of tick
+        // time and triggers heartbeat timeouts. Once at startup
+        // is the cheap, safe place. Best-effort: any error leaves
+        // the cache empty and the first capture re-VACUUMs every
+        // tenant — correct, just expensive.
+        snapshot_mod.primeFromSnapshotStore(&snap_state.?, snap_store.?);
+        if (snap_state.?.last_manifest) |m| {
+            std.log.info(
+                "snapshot: primed reuse cache from prior snapshot {s} (floor={d}, term={d}, tenants={d})",
+                .{ m.snap_id, m.willemt_compaction_floor, m.willemt_term, m.tenants.len },
+            );
+        }
     }
 
     var raft_thread_args = RaftThreadArgs{

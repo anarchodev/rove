@@ -331,17 +331,43 @@ KEY_RECENT_2=$(echo "$MAPPED" | sed -n '2p' | sed -E 's/.*manifest_key=([^)]+)\)
 # reuse there'd be one per capture pass (4+).
 # We use the AWS CLI if available; skip with a warning otherwise.
 if command -v aws >/dev/null 2>&1 && [[ -n "${S3_BUCKET:-}" && -n "${S3_ENDPOINT:-}" ]]; then
-    QUIET_KEY_COUNT=$(AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
-        aws s3 ls --endpoint-url "$S3_ENDPOINT" \
-        "s3://${S3_BUCKET}/${S3_KEY_PREFIX_BASE}cluster/snapshots/" --recursive 2>/dev/null \
-        | awk '{print $4}' | grep -c '/quiet/app.db$' || true)
-    if [[ "$QUIET_KEY_COUNT" -gt 1 ]]; then
-        echo "FAIL: found $QUIET_KEY_COUNT distinct quiet/app.db keys in S3 — reuse not firing" >&2
-        echo "      (expected exactly 1: the first capture's; subsequent captures should" >&2
-        echo "      reference it by db_key in the manifest, not re-VACUUM + re-PUT)" >&2
+    # Snapshots use cluster/snapshots/* directly under the bucket
+    # root (or under SNAPSHOT_S3_KEY_PREFIX if set — not used by the
+    # smoke). They do NOT live under S3_KEY_PREFIX_BASE; that prefix
+    # is for tenant blobs (file-blobs / log-blobs).
+    #
+    # Filter by THIS run's snap_ids — the bucket accumulates
+    # snapshots across runs and a raw count would mix in historical
+    # ones, hiding any reuse regression in the current run.
+    THIS_RUN_SNAP_IDS=$(grep -oE 'snapshot captured [0-9a-f]+' "$WORKER_LOG" | awk '{print $3}' | sort -u)
+    if [[ -z "$THIS_RUN_SNAP_IDS" ]]; then
+        echo "FAIL: no snap_ids extracted from worker log; cannot verify reuse" >&2
         exit 1
     fi
-    echo "ok  by-reference reuse: $QUIET_KEY_COUNT distinct quiet/app.db key(s) in S3 (<=1 expected)"
+    THIS_RUN_PATTERN=$(echo "$THIS_RUN_SNAP_IDS" | paste -sd'|' -)
+
+    QUIET_KEY_COUNT=$(AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
+        aws s3 ls --endpoint-url "$S3_ENDPOINT" \
+        "s3://${S3_BUCKET}/cluster/snapshots/" --recursive 2>/dev/null \
+        | awk '{print $4}' \
+        | grep -E "cluster/snapshots/(${THIS_RUN_PATTERN})/quiet/app.db$" \
+        | wc -l)
+
+    # Want exactly 0 or 1 fresh quiet/app.db keys uploaded under
+    # this run's snap_ids: the first capture VACUUMs + uploads
+    # quiet's db (1 key); every subsequent capture should reuse
+    # that db_key by reference (0 new keys). 0 is also OK if every
+    # capture happened to fall after quiet's release was committed
+    # AND the captured manifest wasn't the FIRST ever — i.e., the
+    # primed cache from a prior cluster lifetime carried quiet
+    # forward. So accept {0, 1}; >1 means reuse broke.
+    if [[ "$QUIET_KEY_COUNT" -gt 1 ]]; then
+        echo "FAIL: $QUIET_KEY_COUNT distinct quiet/app.db keys in S3 (this run's snap_ids only)" >&2
+        echo "      — by-reference reuse is not firing. Every capture is re-VACUUMing +" >&2
+        echo "      re-PUTting an unchanged tenant (expected at most 1 across all passes)." >&2
+        exit 1
+    fi
+    echo "ok  by-reference reuse: $QUIET_KEY_COUNT distinct quiet/app.db key(s) in S3 (this run's snap_ids only; want <=1)"
 else
     echo "skip  by-reference reuse S3 listing (aws CLI not in PATH or S3 env not set; inline tests cover the contract)"
 fi
