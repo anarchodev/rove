@@ -132,11 +132,15 @@ test "BlobBackend: s3 init through wrapper (no I/O)" {
     try testing.expect(be.inner == .s3);
 }
 
+fn testFakeMint(_: ?*anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    return allocator.dupe(u8, "fake.jwt");
+}
+
 test "BlobBackend: http variant (no I/O)" {
     var be = try BlobBackend.openHttp(testing.allocator, .{
         .base_url = "https://files.loop46.localhost:9090",
         .instance_id = "acme",
-        .jwt = "fake.jwt",
+        .mint_jwt = testFakeMint,
         .verify_tls = false,
     });
     defer be.deinit();

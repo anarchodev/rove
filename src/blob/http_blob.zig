@@ -27,11 +27,13 @@
 //!
 //! ## Auth
 //!
-//! Every request carries `Authorization: Bearer <jwt>`. The token
-//! is supplied at init time and cached in the
-//! pre-built `auth_header` string so the hot path doesn't re-format
-//! per request. Loop46 worker mints these via the same shared HMAC
-//! it hands the dashboard / CLI.
+//! Every request carries `Authorization: Bearer <jwt>`. The caller
+//! supplies a `mint_jwt` callback at init time; HttpBlobStore
+//! invokes it per fetch to get a fresh token. Keeps secret handling
+//! and JWT crypto out of rove-blob (rove-jwt is application-level)
+//! and means we don't have to manage token refresh windows here —
+//! callers mint with whatever expiry they want; tokens that expire
+//! between fetches are just re-minted on the next call.
 //!
 //! ## TLS
 //!
@@ -54,6 +56,16 @@ const curl = @import("curl.zig");
 
 const Error = root.Error;
 
+/// Mint a fresh JWT (without the `Bearer ` prefix). HttpBlobStore
+/// invokes this for each fetch and frees the result. Returning
+/// `error.OutOfMemory` propagates as `Error.OutOfMemory`; any other
+/// error surfaces as `Error.Io` since the caller has no token-mint
+/// recovery path beyond "fail loud."
+pub const MintJwtFn = *const fn (
+    ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+) anyerror![]u8;
+
 pub const HttpBlobStore = struct {
     allocator: std.mem.Allocator,
     /// Owned. One `Easy` (libcurl handle) per `HttpBlobStore` —
@@ -65,9 +77,11 @@ pub const HttpBlobStore = struct {
     /// Tenant id. Owned copy. Inserted into every URL the backend
     /// builds.
     instance_id: []const u8,
-    /// Pre-built `Bearer <jwt>` header value. Owned. The `Bearer ` prefix
-    /// is part of the value, not the name.
-    auth_header_value: []const u8,
+    /// Per-fetch JWT minter. Borrowed; the caller keeps the
+    /// underlying secret + closure alive for the backend's
+    /// lifetime.
+    mint_jwt: MintJwtFn,
+    mint_ctx: ?*anyopaque,
     /// Path to a CA bundle file (or null for system bundle). Owned
     /// copy when non-null. Smokes against the dev self-signed cert
     /// pass the on-disk `ca-root.pem`.
@@ -81,8 +95,8 @@ pub const HttpBlobStore = struct {
     pub const Config = struct {
         base_url: []const u8,
         instance_id: []const u8,
-        /// JWT, *without* the `Bearer ` prefix — the backend adds it.
-        jwt: []const u8,
+        mint_jwt: MintJwtFn,
+        mint_ctx: ?*anyopaque = null,
         /// Optional CA bundle path. Null = libcurl's default
         /// (system trust store on Linux).
         ca_bundle_path: ?[]const u8 = null,
@@ -95,9 +109,6 @@ pub const HttpBlobStore = struct {
 
         const instance_id_owned = try allocator.dupe(u8, cfg.instance_id);
         errdefer allocator.free(instance_id_owned);
-
-        const auth_header_owned = try std.fmt.allocPrint(allocator, "Bearer {s}", .{cfg.jwt});
-        errdefer allocator.free(auth_header_owned);
 
         const ca_owned: ?[:0]const u8 = if (cfg.ca_bundle_path) |p|
             try allocator.dupeZ(u8, p)
@@ -113,7 +124,8 @@ pub const HttpBlobStore = struct {
             .easy = easy,
             .base_url = base_url_owned,
             .instance_id = instance_id_owned,
-            .auth_header_value = auth_header_owned,
+            .mint_jwt = cfg.mint_jwt,
+            .mint_ctx = cfg.mint_ctx,
             .ca_bundle_path = ca_owned,
             .verify_tls = cfg.verify_tls,
         };
@@ -123,7 +135,6 @@ pub const HttpBlobStore = struct {
         self.easy.deinit();
         self.allocator.free(self.base_url);
         self.allocator.free(self.instance_id);
-        self.allocator.free(self.auth_header_value);
         if (self.ca_bundle_path) |p| self.allocator.free(p);
         self.* = undefined;
     }
@@ -171,8 +182,20 @@ pub const HttpBlobStore = struct {
         ) catch return Error.OutOfMemory;
         defer allocator.free(url);
 
+        // Mint per-fetch — tokens that expired between fetches just
+        // get re-minted next call. Cost is one HMAC-SHA256, dominated
+        // by the network roundtrip.
+        const jwt = self.mint_jwt(self.mint_ctx, allocator) catch |err| switch (err) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            else => return Error.Io,
+        };
+        defer allocator.free(jwt);
+        const auth_header = std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt}) catch
+            return Error.OutOfMemory;
+        defer allocator.free(auth_header);
+
         const headers = [_]curl.Header{
-            .{ .name = "Authorization", .value = self.auth_header_value },
+            .{ .name = "Authorization", .value = auth_header },
         };
 
         var resp = self.easy.request(allocator, .{
@@ -233,16 +256,19 @@ test "parseManifestKey: rejects malformed" {
     try testing.expectEqual(@as(?u64, null), parseManifestKey(""));
 }
 
+fn fakeMint(_: ?*anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    return allocator.dupe(u8, "fake.jwt.token");
+}
+
 test "HttpBlobStore: init + deinit (no I/O, no curl call)" {
     var be = try HttpBlobStore.init(testing.allocator, .{
         .base_url = "https://files.loop46.localhost:9090",
         .instance_id = "acme",
-        .jwt = "fake.jwt.token",
+        .mint_jwt = fakeMint,
         .ca_bundle_path = null,
         .verify_tls = false,
     });
     defer be.deinit();
-    try testing.expectEqualStrings("Bearer fake.jwt.token", be.auth_header_value);
     try testing.expectEqualStrings("acme", be.instance_id);
     try testing.expectEqualStrings("https://files.loop46.localhost:9090", be.base_url);
     _ = be.blobStore();
@@ -252,7 +278,7 @@ test "HttpBlobStore: writes return NotImplemented" {
     var be = try HttpBlobStore.init(testing.allocator, .{
         .base_url = "https://x",
         .instance_id = "t",
-        .jwt = "j",
+        .mint_jwt = fakeMint,
         .verify_tls = false,
     });
     defer be.deinit();
