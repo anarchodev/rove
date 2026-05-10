@@ -230,6 +230,153 @@ pub const HttpBlobStore = struct {
     }
 };
 
+/// One tenant's input to a batch manifest fetch — `(id, dep_id)`.
+pub const BatchTenant = struct {
+    id: []const u8,
+    dep_id: u64,
+};
+
+/// One result row from a batch manifest fetch.
+pub const BatchResult = struct {
+    /// Owned. Caller frees via `BatchResult.deinit` or
+    /// `freeBatchResults`.
+    id: []u8,
+    /// Owned. Null when the cluster store reported the manifest
+    /// was missing for this `(id, dep_id)`. Caller treats null
+    /// as `Error.NotFound` for that tenant + falls back to the
+    /// existing per-tenant retry path.
+    manifest: ?[]u8,
+
+    pub fn deinit(self: *BatchResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        if (self.manifest) |m| allocator.free(m);
+        self.* = undefined;
+    }
+};
+
+/// Free-the-whole-slice helper. Frees each `BatchResult`'s owned
+/// allocations and the outer slice. Use this at the end of cold-
+/// start prefetch.
+pub fn freeBatchResults(allocator: std.mem.Allocator, rows: []BatchResult) void {
+    for (rows) |*r| r.deinit(allocator);
+    allocator.free(rows);
+}
+
+/// Issue one `POST /_system/manifests/batch` call against the
+/// configured files-server. Returns one `BatchResult` per input
+/// tenant, in the order the server emitted them (the server
+/// always echoes ids in the response so callers can map without
+/// preserving index order).
+///
+/// `mint_jwt` is invoked once per call; reuses the same Easy
+/// curl handle across calls for connection-warmth.
+///
+/// Wire format defined in `files_server/thread.zig::handleManifestsBatch`.
+pub fn fetchBatch(
+    self: *HttpBlobStore,
+    allocator: std.mem.Allocator,
+    tenants: []const BatchTenant,
+) Error![]BatchResult {
+    if (tenants.len > std.math.maxInt(u32)) return Error.InvalidKey;
+
+    // Build the request body.
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(allocator);
+
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, @intCast(tenants.len), .little);
+    try req.appendSlice(allocator, &count_buf);
+
+    for (tenants) |t| {
+        if (t.id.len > std.math.maxInt(u16)) return Error.InvalidKey;
+        var id_len_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &id_len_buf, @intCast(t.id.len), .little);
+        try req.appendSlice(allocator, &id_len_buf);
+        try req.appendSlice(allocator, t.id);
+        var dep_id_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &dep_id_buf, t.dep_id, .little);
+        try req.appendSlice(allocator, &dep_id_buf);
+    }
+
+    const url = std.fmt.allocPrint(allocator, "{s}/_system/manifests/batch", .{self.base_url}) catch
+        return Error.OutOfMemory;
+    defer allocator.free(url);
+
+    const jwt = self.mint_jwt(self.mint_ctx, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return Error.OutOfMemory,
+        else => return Error.Io,
+    };
+    defer allocator.free(jwt);
+    const auth_header = std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt}) catch
+        return Error.OutOfMemory;
+    defer allocator.free(auth_header);
+
+    const headers = [_]curl.Header{
+        .{ .name = "Authorization", .value = auth_header },
+        .{ .name = "Content-Type", .value = "application/octet-stream" },
+    };
+
+    var resp = self.easy.request(allocator, .{
+        .method = .POST,
+        .url = url,
+        .headers = &headers,
+        .body = req.items,
+        .verify_tls = self.verify_tls,
+        // Cold-start prefetch can take a while at 10k tenants —
+        // give it generous headroom (~1ms per tenant cluster
+        // store get + protocol overhead). 60s = comfortable.
+        .timeout_ms = 60_000,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return Error.OutOfMemory,
+        else => return Error.Io,
+    };
+    defer resp.deinit(allocator);
+
+    if (resp.status != 200) return Error.Io;
+    const body = resp.body orelse return Error.Io;
+
+    return parseBatchResponse(allocator, body) catch |err| switch (err) {
+        error.OutOfMemory => return Error.OutOfMemory,
+        else => return Error.Io,
+    };
+}
+
+const ParseError = error{ Truncated, OutOfMemory };
+
+fn parseBatchResponse(allocator: std.mem.Allocator, body: []const u8) ParseError![]BatchResult {
+    if (body.len < 4) return ParseError.Truncated;
+    const count = std.mem.readInt(u32, body[0..4], .little);
+    if (count > 1_000_000) return ParseError.Truncated;
+
+    const out = try allocator.alloc(BatchResult, count);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |*r| r.deinit(allocator);
+        allocator.free(out);
+    }
+
+    var pos: usize = 4;
+    while (filled < count) : (filled += 1) {
+        if (body.len < pos + 2) return ParseError.Truncated;
+        const id_len = std.mem.readInt(u16, body[pos..][0..2], .little);
+        pos += 2;
+        if (body.len < pos + id_len + 4) return ParseError.Truncated;
+        const id_owned = try allocator.dupe(u8, body[pos .. pos + id_len]);
+        pos += id_len;
+        const mf_len = std.mem.readInt(u32, body[pos..][0..4], .little);
+        pos += 4;
+        if (body.len < pos + mf_len) {
+            allocator.free(id_owned);
+            return ParseError.Truncated;
+        }
+        const manifest_owned: ?[]u8 = if (mf_len == 0) null else try allocator.dupe(u8, body[pos .. pos + mf_len]);
+        pos += mf_len;
+
+        out[filled] = .{ .id = id_owned, .manifest = manifest_owned };
+    }
+    return out;
+}
+
 /// Parse `{N:020d}.json` (the format `manifest_json.manifestKey`
 /// produces) and return `N`. Returns null on shape mismatch.
 fn parseManifestKey(key: []const u8) ?u64 {
@@ -272,6 +419,46 @@ test "HttpBlobStore: init + deinit (no I/O, no curl call)" {
     try testing.expectEqualStrings("acme", be.instance_id);
     try testing.expectEqualStrings("https://files.loop46.localhost:9090", be.base_url);
     _ = be.blobStore();
+}
+
+test "parseBatchResponse: round-trips count + id + manifest" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+
+    var hdr: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hdr, 2, .little);
+    try buf.appendSlice(testing.allocator, &hdr);
+
+    // Entry 0: id="acme", manifest="HELLO"
+    var u16_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &u16_buf, 4, .little);
+    try buf.appendSlice(testing.allocator, &u16_buf);
+    try buf.appendSlice(testing.allocator, "acme");
+    var u32_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &u32_buf, 5, .little);
+    try buf.appendSlice(testing.allocator, &u32_buf);
+    try buf.appendSlice(testing.allocator, "HELLO");
+
+    // Entry 1: id="missing", manifest absent (mf_len=0)
+    std.mem.writeInt(u16, &u16_buf, 7, .little);
+    try buf.appendSlice(testing.allocator, &u16_buf);
+    try buf.appendSlice(testing.allocator, "missing");
+    std.mem.writeInt(u32, &u32_buf, 0, .little);
+    try buf.appendSlice(testing.allocator, &u32_buf);
+
+    const rows = try parseBatchResponse(testing.allocator, buf.items);
+    defer freeBatchResults(testing.allocator, rows);
+
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("acme", rows[0].id);
+    try testing.expectEqualStrings("HELLO", rows[0].manifest.?);
+    try testing.expectEqualStrings("missing", rows[1].id);
+    try testing.expect(rows[1].manifest == null);
+}
+
+test "parseBatchResponse: rejects truncated body" {
+    const body = [_]u8{ 0x05, 0, 0, 0, 0x03, 0 }; // count=5, then truncated
+    try testing.expectError(error.Truncated, parseBatchResponse(testing.allocator, &body));
 }
 
 test "HttpBlobStore: writes return NotImplemented" {
