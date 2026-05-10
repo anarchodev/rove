@@ -254,7 +254,89 @@ batches, and bytecodes (the things it's already good at) but
 is not a DR mechanism. The "halfway S3 DR" architecture is
 gone entirely.
 
-### 1.3 Files-server: stop writing per-tenant S3 manifests at bootstrap — **NEW, surfaced 2026-05-10 by 10k bench**
+### 1.4 Files-server: own raft group + manifests in cluster KV — **shipping 2026-05-10, Shape C chosen**
+
+Loop46 worker now reads manifests from a colocated files-server
+cluster over HTTP/2 instead of going to S3 directly. Files-server
+is its own raft consumer of the shared `kv.Cluster` library
+(commit `28a7be4` extracted it from loop46's apply.zig); same raft
+machinery, separate raft group from loop46.
+
+**Architecture, today:**
+
+| Layer            | Storage                          | Replication           |
+|------------------|----------------------------------|-----------------------|
+| Manifests        | Per-tenant `kv.Cluster` store    | files-server raft     |
+| File-blobs       | S3 (content-addressed)           | S3                    |
+| Customer app.db  | Per-tenant SQLite                | loop46 raft           |
+| `_deploy/current`| Customer app.db                  | loop46 raft           |
+
+Loop46 worker → files-server flow on a release POST:
+
+1. `_system/release` writes `_deploy/current = N` through loop46
+   raft.
+2. Apply tick fires `reloadDeployment(N)`.
+3. Manifest fetch: `GET /{tenant}/deployments/{N:hex}/manifest.bin`
+   on the colocated files-server. Reads from local cluster store
+   (no raft round-trip on the read side; whichever node serves the
+   request answers from its own replicated copy).
+4. Worker decodes the manifest, fetches handler bytecodes from
+   S3 (file-blobs/), maps update.
+
+**What's wired:**
+
+- `kv.Cluster` library (commit `28a7be4`) — shared by both
+  consumers.
+- Files-server standalone runs its own 3-node raft cluster
+  (`scripts/files_server_raft_smoke.sh` for the integration
+  smoke).
+- `GET /{tenant}/deployments/{N:hex}/manifest.bin` (`c8a2f0b`) +
+  `PUT` companion (`0a77617`) for cluster-replicated manifest
+  reads + writes.
+- `rove-blob.HttpBlobStore` (`6d18c3d`, `137b506`) — read-only
+  BlobStore vtable backed by libcurl with a per-fetch JWT minter
+  callback. Returns owned bytes; 404 → `Error.NotFound` (caller's
+  existing reload-fail path treats this as a soft miss).
+- Loop46 `--files-internal-base` (`5e9eb7e`) flips the worker's
+  per-tenant `manifest_backend` from S3 to HTTP. Default-null
+  preserves the legacy S3 path for any deploy that hasn't
+  migrated yet.
+- Loop46 `seed --no-files-bootstrap` (`b39d994`) — cluster-backed
+  manifest mode for the bench harness. Skips the legacy S3 PUT
+  per-tenant; manifest writes go through files-server's PUT
+  route instead.
+
+**What's NOT yet wired:**
+
+- Files-server's `bootstrap.zig` still does the dual S3 PUT +
+  cluster write (commit `8638253`). The S3 PUT comes off once
+  every loop46 worker in a deployment uses the HTTP backend.
+- Customer-facing `POST /{tenant}/deployments` (compile + deploy
+  flow) still writes manifests to S3. Migration: build the
+  writeset, call `cluster.proposeAndWait` instead. Same shape
+  as `bootstrap.zig::writeManifestThroughCluster`.
+- Loop46 worker still has hand-rolled apply.zig — it doesn't yet
+  use the `kv.Cluster` library. Pure refactor; #29 in the task
+  list. Doesn't block this work landing because loop46's raft
+  group runs the same envelope shapes the library handles.
+
+**What this buys:**
+
+- 10k-tenant seed: was 17min (one S3 PUT per tenant), now 96s
+  (one raft propose per tenant). Whole order of magnitude.
+- Manifest durability via consensus, not S3. Lose any one
+  node's disk → cluster recovers from quorum.
+- S3 narrows to content-addressed bytecode + asset bytes —
+  exactly what S3 is good for.
+- DR via a learner replica per #1.2, applied to either raft
+  cluster.
+
+The original "Shape C: files-server gets its own raft group"
+proposal below described this end state; the work landed faster
+than expected because the extracted `kv.Cluster` library makes
+spinning up a second raft group cheap.
+
+### 1.3 Files-server: stop writing per-tenant S3 manifests at bootstrap — **NEW, surfaced 2026-05-10 by 10k bench, superseded by #1.4**
 
 Same insight as #1.1, applied to files-server. The 10k-tenant
 scalability bench's seed phase took **1012s** for 10,000
