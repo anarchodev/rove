@@ -367,6 +367,22 @@ fn handleOne(
         return;
     }
 
+    // Batch manifest fetch — one request returns all manifests
+    // for a list of (tenant_id, dep_id) pairs. Loop46 worker
+    // uses this at cold-start to avoid N individual TLS+h2
+    // connection bursts against files-server (which previously
+    // tipped over with `AcceptFailed` at 10k tenants). All-binary
+    // wire format keeps both ends parser-light. See
+    // `handleManifestsBatch` for the format.
+    if (std.mem.eql(u8, path, "/_system/manifests/batch") and std.mem.eql(u8, method, "POST")) {
+        const cluster = cfg.cluster orelse {
+            try setResponse(server, cfg, ent, sid, sess, 501, null, "raft not enabled on this files-server\n");
+            return;
+        };
+        try handleManifestsBatch(server, allocator, cfg, ent, sid, sess, cluster, rb);
+        return;
+    }
+
     // All other routes share the shape `/{instance_id}/{op}[/{tail...}]`.
     if (path.len == 0 or path[0] != '/') {
         try setResponse(server, cfg, ent, sid, sess, 404, null, "not found\n");
@@ -1305,6 +1321,147 @@ fn handleClusterGet(
     const out = try allocator.alloc(u8, value.len);
     @memcpy(out, value);
     allocator.free(value);
+    try setResponse(server, cfg, ent, sid, sess, 200, out.ptr, out);
+}
+
+/// `POST /_system/manifests/batch` — fetch many manifests in a
+/// single request. Eliminates the N individual TLS+h2 connection
+/// bursts that loop46 worker's cold-start used to drive against
+/// files-server (which tipped over with `AcceptFailed` at 10k
+/// tenants).
+///
+/// ## Wire format — both directions binary, length-prefixed
+///
+/// Keeps both ends parser-light + bytes-clean (manifests are
+/// arbitrary JSON, can contain anything). All integers
+/// little-endian.
+///
+/// Request body:
+///
+///   `[u32 count]`
+///   for each entry:
+///     `[u16 id_len][id_bytes][u64 dep_id]`
+///
+/// Response body (200):
+///
+///   `[u32 count]`
+///   for each entry:
+///     `[u16 id_len][id_bytes]`
+///     `[u32 manifest_len][manifest_bytes]`
+///
+/// `manifest_len = 0` means "not in cluster store" — caller
+/// treats that as `Error.NotFound` for that tenant + falls back
+/// to its existing per-tenant retry path. Saves a 404 round-trip
+/// on cold-start where some tenants may not have a manifest yet.
+///
+/// Reads from the local cluster store only — no raft round-trip.
+/// Whichever node the worker hits answers from its own
+/// replicated copy. Since this is the cold-start prefetch path,
+/// 503 (cluster mode disabled) and 400 (malformed body) are the
+/// only error codes; partial misses are encoded in the response
+/// body's per-tenant `manifest_len = 0` slots.
+fn handleManifestsBatch(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    cluster: *kv.Cluster,
+    rb: h2.ReqBody,
+) !void {
+    const body = if (rb.data) |d| d[0..rb.len] else "";
+    if (body.len < 4) {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "body too short for [u32 count] header\n");
+        return;
+    }
+
+    const count = std.mem.readInt(u32, body[0..4], .little);
+    // Sanity: caps at 1M tenants so a malformed count doesn't
+    // run us out of memory before we trip on a parse error.
+    if (count > 1_000_000) {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "tenant count exceeds 1M\n");
+        return;
+    }
+
+    // Build the response into an ArrayList. Pre-size assuming
+    // average ~64-byte ids + ~512-byte manifests; resizes are
+    // amortized.
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(allocator);
+    try resp.ensureTotalCapacity(allocator, 4 + count * 600);
+
+    // Reserve count header (filled in at the end with the real
+    // number we processed; mismatched count vs body parse-fail
+    // can't happen since we abort on body shape error).
+    var count_header: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_header, count, .little);
+    try resp.appendSlice(allocator, &count_header);
+
+    var pos: usize = 4;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        if (body.len < pos + 2) {
+            try setResponse(server, cfg, ent, sid, sess, 400, null, "truncated body at id_len header\n");
+            return;
+        }
+        const id_len = std.mem.readInt(u16, body[pos..][0..2], .little);
+        pos += 2;
+        if (body.len < pos + id_len + 8) {
+            try setResponse(server, cfg, ent, sid, sess, 400, null, "truncated body at id+dep_id\n");
+            return;
+        }
+        const tenant_id = body[pos .. pos + id_len];
+        pos += id_len;
+        const dep_id = std.mem.readInt(u64, body[pos..][0..8], .little);
+        pos += 8;
+
+        // Echo the tenant id in the response so the caller
+        // doesn't have to track per-index ordering.
+        var id_len_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &id_len_buf, id_len, .little);
+        try resp.appendSlice(allocator, &id_len_buf);
+        try resp.appendSlice(allocator, tenant_id);
+
+        // Cluster store lookup. Open errors → manifest_len=0,
+        // same as a key miss: the caller falls back to its
+        // single-tenant retry path. Don't fail the whole batch
+        // because one tenant's store can't open.
+        var manifest_len_buf: [4]u8 = undefined;
+
+        const store_opt: ?*kv.KvStore = cluster.openStore(tenant_id) catch null;
+        if (store_opt == null) {
+            std.mem.writeInt(u32, &manifest_len_buf, 0, .little);
+            try resp.appendSlice(allocator, &manifest_len_buf);
+            continue;
+        }
+        const store = store_opt.?;
+
+        var key_buf: [40]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "deployment/{x:0>20}/manifest", .{dep_id}) catch unreachable;
+
+        const value = store.get(key) catch |err| switch (err) {
+            error.NotFound => {
+                std.mem.writeInt(u32, &manifest_len_buf, 0, .little);
+                try resp.appendSlice(allocator, &manifest_len_buf);
+                continue;
+            },
+            else => {
+                // Per-tenant read error — skip this one,
+                // continue the batch.
+                std.mem.writeInt(u32, &manifest_len_buf, 0, .little);
+                try resp.appendSlice(allocator, &manifest_len_buf);
+                continue;
+            },
+        };
+        defer allocator.free(value);
+
+        std.mem.writeInt(u32, &manifest_len_buf, @intCast(value.len), .little);
+        try resp.appendSlice(allocator, &manifest_len_buf);
+        try resp.appendSlice(allocator, value);
+    }
+
+    const out = try resp.toOwnedSlice(allocator);
     try setResponse(server, cfg, ent, sid, sess, 200, out.ptr, out);
 }
 

@@ -413,7 +413,83 @@ for i in 0 1 2; do
 done
 echo "ok  followers reject PUT manifest.bin with 503"
 
+# ── POST /_system/manifests/batch — bulk manifest fetch ──────────
+#
+# Loop46 worker uses this at cold-start. Build a request with 3
+# tenants (2 we just wrote, 1 that doesn't exist) and verify the
+# response contains the right bytes for each + zero-length
+# manifest_len for the missing one.
+echo "batch manifest fetch test:"
+BATCH_REQ=$(mktemp --suffix=.bin)
+python3 - <<PY
+import struct, sys, os
+out = open("$BATCH_REQ", "wb")
+tenants = [
+    ("$MANIFEST_TENANT", $MANIFEST_DEP_ID, True),    # exists, 'manifest body bytes'
+    ("$PUT_TENANT",      $PUT_DEP_ID,      True),    # exists, real-shaped json
+    ("nonexistent-tenant", 99,             False),   # missing
+]
+out.write(struct.pack("<I", len(tenants)))
+for tid, dep_id, _ in tenants:
+    out.write(struct.pack("<H", len(tid)))
+    out.write(tid.encode())
+    out.write(struct.pack("<Q", dep_id))
+out.close()
+PY
+
+BATCH_RESP=$(mktemp --suffix=.bin)
+batch_code=$(curl -sS --cacert "$CACERT" --max-time 10 \
+    -X POST \
+    -H "Authorization: Bearer $JWT" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@$BATCH_REQ" \
+    -o "$BATCH_RESP" -w '%{http_code}' \
+    "https://127.0.0.1:${LEADER_PORT}/_system/manifests/batch" 2>/dev/null || echo 000)
+if [[ "$batch_code" != "200" ]]; then
+    echo "FAIL: batch endpoint returned $batch_code" >&2
+    cat "$BATCH_RESP" >&2
+    exit 1
+fi
+
+# Parse response: [u32 count] then per-tenant [u16 id_len][id][u32 manifest_len][manifest_bytes]
+python3 - <<PY
+import struct, sys
+with open("$BATCH_RESP", "rb") as f:
+    data = f.read()
+pos = 0
+count = struct.unpack_from("<I", data, pos)[0]; pos += 4
+assert count == 3, f"expected 3 entries, got {count}"
+expected = {
+    "$MANIFEST_TENANT": "$MANIFEST_BODY",
+    "$PUT_TENANT": '$PUT_BODY',
+    "nonexistent-tenant": None,
+}
+seen = {}
+for _ in range(count):
+    id_len = struct.unpack_from("<H", data, pos)[0]; pos += 2
+    tid = data[pos:pos+id_len].decode(); pos += id_len
+    mf_len = struct.unpack_from("<I", data, pos)[0]; pos += 4
+    if mf_len == 0:
+        seen[tid] = None
+    else:
+        seen[tid] = data[pos:pos+mf_len].decode()
+        pos += mf_len
+
+for tid, want in expected.items():
+    got = seen.get(tid, "MISSING")
+    if want is None and got is not None:
+        print(f"FAIL: {tid} expected absent, got {got!r}", file=sys.stderr)
+        sys.exit(1)
+    if want is not None and got != want:
+        print(f"FAIL: {tid} expected {want!r}, got {got!r}", file=sys.stderr)
+        sys.exit(1)
+print(f"  parsed {count} entries; 2 manifests + 1 absent verified")
+PY
+rm -f "$BATCH_REQ" "$BATCH_RESP"
+echo "ok  POST /_system/manifests/batch returns binary-packed manifests + handles misses"
+
 echo ""
 echo "PASS files-server raft smoke"
 echo "      (init, listeners, leader election, propose-replicate-read,"
-echo "      manifest.bin fetch, and follower-reject all verified end-to-end)"
+echo "      manifest.bin fetch + PUT, batch fetch, and follower-reject"
+echo "      all verified end-to-end)"
