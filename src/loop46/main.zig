@@ -107,6 +107,49 @@ fn parseHostPort(allocator: std.mem.Allocator, hp: []const u8) !std.net.Address 
     return try std.net.Address.parseIp(host_z, port);
 }
 
+/// Parse a peer-list entry into `(host, port, mode)`.
+///
+/// Wire format: `host:port[:mode]` where `mode` is
+/// `voter` (default) or `learner` (non-voting; see
+/// `docs/production.md` #1.2). Examples:
+///
+///   `127.0.0.1:40100`            → host=127.0.0.1, port=40100, voter
+///   `127.0.0.1:40100:voter`      → same
+///   `dr.example.com:40100:learner` → learner / non-voting
+///
+/// IPv6 host:port forms (`[::1]:40100`) aren't supported; rove-h2
+/// is IPv4-only at the listen layer anyway.
+fn parsePeerEntry(entry: []const u8) !struct {
+    host_end: usize,
+    port: u16,
+    mode: kv.RaftPeerMode,
+} {
+    // Split on `:` from the right so `host:port:mode` works without
+    // confusing colons inside `host` (we don't actually allow them,
+    // but doing it right is cheap).
+    const last_colon = std.mem.lastIndexOfScalar(u8, entry, ':') orelse return error.MalformedPeer;
+    const tail = entry[last_colon + 1 ..];
+
+    // If `tail` parses as an integer, the entry is `host:port` with
+    // no mode suffix → default voter. Otherwise treat `tail` as the
+    // mode and re-split for port.
+    if (std.fmt.parseInt(u16, tail, 10)) |port| {
+        return .{ .host_end = last_colon, .port = port, .mode = .voter };
+    } else |_| {
+        const mode: kv.RaftPeerMode = if (std.mem.eql(u8, tail, "voter"))
+            .voter
+        else if (std.mem.eql(u8, tail, "learner"))
+            .learner
+        else
+            return error.MalformedPeer;
+
+        const head = entry[0..last_colon];
+        const port_colon = std.mem.lastIndexOfScalar(u8, head, ':') orelse return error.MalformedPeer;
+        const port = try std.fmt.parseInt(u16, head[port_colon + 1 ..], 10);
+        return .{ .host_end = port_colon, .port = port, .mode = mode };
+    }
+}
+
 fn parsePeerList(allocator: std.mem.Allocator, peers_str: []const u8) ![]kv.RaftPeerAddr {
     var count: usize = 1;
     for (peers_str) |b| {
@@ -119,11 +162,10 @@ fn parsePeerList(allocator: std.mem.Allocator, peers_str: []const u8) ![]kv.Raft
     var idx: usize = 0;
     var it = std.mem.splitScalar(u8, peers_str, ',');
     while (it.next()) |entry| : (idx += 1) {
-        const colon = std.mem.lastIndexOfScalar(u8, entry, ':') orelse return error.MalformedPeer;
-        const host = try allocator.dupe(u8, entry[0..colon]);
+        const parsed = try parsePeerEntry(entry);
+        const host = try allocator.dupe(u8, entry[0..parsed.host_end]);
         errdefer allocator.free(host);
-        const port = try std.fmt.parseInt(u16, entry[colon + 1 ..], 10);
-        out[idx] = .{ .host = host, .port = port };
+        out[idx] = .{ .host = host, .port = parsed.port, .mode = parsed.mode };
     }
     return out;
 }

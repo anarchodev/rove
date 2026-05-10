@@ -554,9 +554,17 @@ pub const RaftNode = struct {
         c.raft_set_callbacks(raft, &cbs, self);
 
         // Add nodes in id order. Index `node_id` is self.
-        for (cfg.peers, 0..) |_, i| {
+        // Voters go through `raft_add_node`; learners (non-voting,
+        // for read replicas + DR per docs/production.md #1.2) go
+        // through `raft_add_non_voting_node`. willemt's quorum
+        // math automatically excludes non-voting nodes from
+        // election + commit thresholds.
+        for (cfg.peers, 0..) |peer, i| {
             const is_self: c_int = if (i == cfg.node_id) 1 else 0;
-            _ = c.raft_add_node(raft, null, @intCast(i), is_self);
+            switch (peer.mode) {
+                .voter => _ = c.raft_add_node(raft, null, @intCast(i), is_self),
+                .learner => _ = c.raft_add_non_voting_node(raft, null, @intCast(i), is_self),
+            }
         }
 
         c.raft_set_election_timeout(raft, @intCast(cfg.election_timeout_ms));

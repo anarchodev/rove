@@ -19,9 +19,24 @@ pub const MAX_SEND_QUEUE: u32 = 1024;
 pub const RECONNECT_INITIAL_NS: i64 = 100 * std.time.ns_per_ms;
 pub const RECONNECT_MAX_NS: i64 = 5 * std.time.ns_per_s;
 
+pub const PeerMode = enum {
+    /// Counts toward raft quorum. Standard voting follower.
+    voter,
+    /// Receives every committed entry but doesn't count toward
+    /// quorum. willemt calls these "non-voting nodes" — added via
+    /// `raft_add_non_voting_node` instead of `raft_add_node`.
+    /// Used for read replicas and geographic DR replicas
+    /// (`docs/production.md` #1.2). Operator promotes to voter
+    /// via `raft_become_voter` on regional failure.
+    learner,
+};
+
 pub const PeerAddr = struct {
     host: []const u8,
     port: u16,
+    /// Voting / non-voting role in the raft cluster. Default
+    /// voter — preserves existing call sites that don't care.
+    mode: PeerMode = .voter,
 };
 
 pub const RecvFn = *const fn (from_id: u32, payload: []const u8, ctx: ?*anyopaque) void;

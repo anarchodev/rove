@@ -10,6 +10,7 @@ const writeset_mod = @import("writeset.zig");
 pub const RaftNet = raft_net.RaftNet;
 pub const RaftNetConfig = raft_net.RaftNet.Config;
 pub const RaftPeerAddr = raft_net.PeerAddr;
+pub const RaftPeerMode = raft_net.PeerMode;
 pub const RaftRecvFn = raft_net.RecvFn;
 
 pub const RaftNode = raft_node.RaftNode;
