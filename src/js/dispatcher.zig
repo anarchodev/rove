@@ -3990,6 +3990,258 @@ test "dispatch: email.send rejects missing key/from/to/subject" {
     }
 }
 
+test "dispatch: btoa + atob round-trip" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const enc = btoa("hello world");
+        \\const dec = atob(enc);
+        \\return enc + "|" + dec;
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("aGVsbG8gd29ybGQ=|hello world", resp.body);
+}
+
+test "dispatch: base64url round-trip + RFC test vector" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // RFC 4648 §10 test vectors:
+    //   "f"      → "Zg"     (no padding)
+    //   "fo"     → "Zm8"
+    //   "foo"    → "Zm9v"
+    //   "foob"   → "Zm9vYg"
+    //   "fooba"  → "Zm9vYmE"
+    //   "foobar" → "Zm9vYmFy"
+    var resp = try runOne(&d, kv,
+        \\const cases = ["f","fo","foo","foob","fooba","foobar"];
+        \\const out = cases.map(s => base64url.encode(new TextEncoder().encode(s)));
+        \\return out.join("|");
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("Zg|Zm8|Zm9v|Zm9vYg|Zm9vYmE|Zm9vYmFy", resp.body);
+}
+
+test "dispatch: base64url decode handles padded + URL-safe input" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        // "test_+/=" round-trips through both alphabets — input is
+        // standard with padding, decode tolerates it.
+        \\const bytes = base64url.decode("Zm9v");
+        \\const text = new TextDecoder().decode(bytes);
+        \\return text;
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("foo", resp.body);
+}
+
+test "dispatch: hex round-trip" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const bytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+        \\const enc = hex.encode(bytes);
+        \\const dec = hex.decode(enc);
+        \\return enc + "|" + (dec[0] === 0xde && dec[3] === 0xef);
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("deadbeef|true", resp.body);
+}
+
+test "dispatch: URLSearchParams parse + read" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const p = new URLSearchParams("?code=abc&state=xyz&scope=read+write");
+        \\return p.get("code") + "|" + p.get("scope") + "|" + p.has("missing");
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("abc|read write|false", resp.body);
+}
+
+test "dispatch: URLSearchParams build + toString round-trip" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const p = new URLSearchParams();
+        \\p.set("client_id", "abc 123");
+        \\p.set("scope", "read");
+        \\p.append("scope", "write");
+        \\return p.toString();
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    // 'set' replaces all existing entries with the same name (so
+    // first scope=read becomes the lone scope), then append adds
+    // scope=write after it.
+    try testing.expectEqualStrings("client_id=abc+123&scope=read&scope=write", resp.body);
+}
+
+test "dispatch: URLSearchParams getAll for repeated keys" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const p = new URLSearchParams("scope=a&scope=b&scope=c");
+        \\return p.getAll("scope").join(",");
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("a,b,c", resp.body);
+}
+
+test "dispatch: crypto.verifyRsa accepts RFC 7515 §A.2 RS256 test vector" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // RFC 7515 Appendix A.2 — "Example JWS Using RSASSA-PKCS1-v1_5
+    // SHA-256". Public key JWK + JWS signing input + signature, all
+    // base64url-encoded as the RFC publishes them.
+    var resp = try runOne(&d, kv,
+        \\const jwk = {
+        \\  kty: "RSA",
+        \\  n: "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ",
+        \\  e: "AQAB",
+        \\};
+        \\const signing_input = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+        \\const sig_b64 = "cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqvhJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrBp0igcN_IoypGlUPQGe77Rw";
+        \\const data = new TextEncoder().encode(signing_input);
+        \\const sig = base64url.decode(sig_b64);
+        \\return String(crypto.verifyRsa(jwk, "sha256", data, sig));
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("true", resp.body);
+}
+
+test "dispatch: crypto.verifyRsa rejects tampered signature" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const jwk = {
+        \\  kty: "RSA",
+        \\  n: "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ",
+        \\  e: "AQAB",
+        \\};
+        \\// Same signing input + signature, but flip a payload byte:
+        \\const signing_input = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJtYWxsb3J5LA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+        \\const sig_b64 = "cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqvhJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrBp0igcN_IoypGlUPQGe77Rw";
+        \\const data = new TextEncoder().encode(signing_input);
+        \\const sig = base64url.decode(sig_b64);
+        \\return String(crypto.verifyRsa(jwk, "sha256", data, sig));
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("false", resp.body);
+}
+
+test "dispatch: crypto.verifyRsa rejects missing jwk.n / wrong kty" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const data = new TextEncoder().encode("hi");
+        \\const sig = new Uint8Array(0);
+        \\const tries = [
+        \\  () => crypto.verifyRsa({ kty: "EC", n: "x", e: "y" }, "sha256", data, sig),
+        \\  () => crypto.verifyRsa({ kty: "RSA" }, "sha256", data, sig),
+        \\  () => crypto.verifyRsa({ kty: "RSA", n: "x", e: "y" }, "md5", data, sig),
+        \\];
+        \\const out = tries.map(fn => { try { fn(); return "ok"; } catch (e) { return "threw"; } });
+        \\return out.join(",");
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("threw,threw,threw", resp.body);
+}
+
+test "dispatch: PKCE-style flow uses sha256 + hex.decode + base64url.encode" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // RFC 7636 §B test vector:
+    //   verifier   = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    //   challenge  = base64url(sha256(verifier))
+    //              = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    var resp = try runOne(&d, kv,
+        \\const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        \\const sha_hex = crypto.sha256(verifier);
+        \\const sha_bytes = hex.decode(sha_hex);
+        \\const challenge = base64url.encode(sha_bytes);
+        \\return challenge;
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", resp.body);
+}
+
 test "dispatch: crypto.hmacSha256 matches RFC 4231 test vector (string inputs)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

@@ -407,6 +407,8 @@ pub fn build(b: *std.Build) void {
     // email.js wraps `webhook.send` (which now layers on http.send);
     // textcodec.js polyfills TextEncoder/Decoder.
     const js_runtime_files: []const struct { name: []const u8, path: []const u8 } = &.{
+        .{ .name = "base64_js", .path = "src/js/bindings/base64.js" },
+        .{ .name = "urlsearchparams_js", .path = "src/js/bindings/urlsearchparams.js" },
         .{ .name = "retry_js", .path = "src/js/bindings/retry.js" },
         .{ .name = "webhook_js", .path = "src/js/bindings/webhook.js" },
         .{ .name = "email_js", .path = "src/js/bindings/email.js" },

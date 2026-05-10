@@ -956,17 +956,22 @@ pub fn installStatic(ctx: *c.JSContext) void {
     for (GLOBAL_BUILTINS) |fb| attachFn(ctx, global, fb);
 
     // JS-side wrappers/polyfills evaluated last so they can call
-    // into the native bindings installed above. retry.js exposes
-    // `globalThis.retry` (customer-side retry helper layered on
-    // http.send); webhook.js layers a legacy `webhook.send` shim on
-    // top of `http.send`; email.js wraps `webhook.send` for Resend;
-    // textcodec.js polyfills TextEncoder/TextDecoder (UTF-8 only).
-    // Order: retry first (others might use it later), then webhook
-    // (email.js depends on it), then the rest.
+    // into the native bindings installed above. Order matters
+    // because some snippets depend on globals other snippets
+    // install:
+    //   - textcodec.js: TextEncoder/TextDecoder. Used by base64.js
+    //     + urlsearchparams.js for UTF-8 byte handling.
+    //   - base64.js: atob/btoa, globalThis.base64url, globalThis.hex.
+    //   - urlsearchparams.js: URLSearchParams class.
+    //   - retry.js: customer-side retry helper on http.send.
+    //   - webhook.js: legacy webhook.send shim on http.send.
+    //   - email.js: Resend wrapper that calls webhook.send (the shim).
+    evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
+    evalSnippet(ctx, "base64.js", BASE64_JS);
+    evalSnippet(ctx, "urlsearchparams.js", URLSEARCHPARAMS_JS);
     evalSnippet(ctx, "retry.js", RETRY_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
-    evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
 }
 
 const NativeFn = *const fn (
@@ -1010,6 +1015,10 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "randomBytes",     .cfunc = crypto_b.jsCryptoRandomBytes,     .argc = 1 },
         .{ .name = "sha256",          .cfunc = crypto_b.jsCryptoSha256,          .argc = 1 },
         .{ .name = "hmacSha256",      .cfunc = crypto_b.jsCryptoHmacSha256,      .argc = 2 },
+        // RSA-PKCS#1 v1.5 verify (RS256 / RS384 / RS512). Customer
+        // composes JWT/OIDC verification on top — see retry.js +
+        // base64url.* helpers. ECDSA verify is a future addition.
+        .{ .name = "verifyRsa",       .cfunc = crypto_b.jsCryptoVerifyRsa,       .argc = 4 },
     } },
     // http.send / http.cancel — the platform's outbound HTTP
     // primitive (docs/http-send-plan.md). send appends a
@@ -1065,6 +1074,8 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     .{ .name = "__rove_check_email_rate", .cfunc = email_rate_b.jsCheckEmailRate, .argc = 0 },
 };
 
+const BASE64_JS = @embedFile("base64_js");
+const URLSEARCHPARAMS_JS = @embedFile("urlsearchparams_js");
 const RETRY_JS = @embedFile("retry_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
