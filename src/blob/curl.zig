@@ -249,12 +249,13 @@ pub const Easy = struct {
                 rc,
                 std.mem.sliceTo(&self.err_buf, 0),
             });
-            resp_buf.deinit(allocator);
+            // resp_buf is freed by the errdefer above on return.
+            // Do NOT call deinit here — that would double-free.
             return Error.CurlCallFailed;
         }
 
         if (write_ctx.alloc_failed) {
-            resp_buf.deinit(allocator);
+            // Same as above: errdefer frees resp_buf on return.
             return Error.OutOfMemory;
         }
 
