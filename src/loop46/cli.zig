@@ -136,6 +136,19 @@ pub const Cli = struct {
     /// `/_system/services-token` returns 503 for `files_url` when
     /// neither this nor `--public-suffix` is set.
     files_public_base: ?[]const u8 = null,
+    /// Origin loop46 worker hits internally for manifest reads —
+    /// production.md #1.4 step 4. When set, the worker's
+    /// `manifest_backend` opens an HTTP-backed BlobStore that
+    /// fetches `/v1/{tenant}/deployments/{N:hex}/manifest.bin`
+    /// from this base URL, instead of going to S3 directly.
+    /// Typically set to the same value as `files_public_base` (or
+    /// to a private internal URL when prod runs files-server on
+    /// a separate hostname). Null disables the path; manifest
+    /// reads keep going to S3 (legacy).
+    files_internal_base: ?[]const u8 = null,
+    /// Skip TLS peer verification on the loop46 → files-server
+    /// manifest fetch. Smoke / dev only — production must verify.
+    files_internal_insecure_tls: bool = false,
     /// Origin the worker uses to deliver `events.emit` payloads to
     /// the sse-server's `POST /v1/emit`. Plain http://host:port for
     /// loopback dev (`scripts/sse_server_smoke.sh`), https://sse.
@@ -240,6 +253,12 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.files_public_base = args[i];
+        } else if (std.mem.eql(u8, a, "--files-internal-base")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.files_internal_base = args[i];
+        } else if (std.mem.eql(u8, a, "--files-internal-insecure-tls")) {
+            out.files_internal_insecure_tls = true;
         } else if (std.mem.eql(u8, a, "--sse-public-base")) {
             i += 1;
             if (i >= args.len) return error.Usage;

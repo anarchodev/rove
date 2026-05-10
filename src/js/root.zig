@@ -76,6 +76,7 @@ pub const DispatchError = dispatcher.DispatchError;
 
 pub const Worker = worker.Worker;
 pub const WorkerConfig = worker.WorkerConfig;
+pub const ManifestHttpConfig = worker.ManifestHttpConfig;
 pub const WorkerOptions = worker.Options;
 pub const RaftWait = worker.RaftWait;
 pub const TenantFiles = worker.TenantFiles;

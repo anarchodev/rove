@@ -466,6 +466,7 @@ pub fn build(b: *std.Build) void {
     loop46_mod.addImport("rove-js", js_mod);
     loop46_mod.addImport("rove-kv", kv_mod);
     loop46_mod.addImport("rove-blob", blob_mod);
+    loop46_mod.addImport("rove-jwt", jwt_mod);
     loop46_mod.addImport("rove-files", files_mod);
     loop46_mod.addImport("rove-files-server", files_server_mod);
     loop46_mod.addImport("rove-log-server", log_server_mod);

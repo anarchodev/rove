@@ -368,6 +368,25 @@ pub const Options = struct {
     connection_row: type = rove.Row(&.{}),
 };
 
+/// Configuration for routing manifest reads through a files-server
+/// cluster over HTTP/2 instead of fetching from S3 directly. Set
+/// on `WorkerConfig.manifest_http` to opt in. See production.md
+/// #1.4 step 4.
+pub const ManifestHttpConfig = struct {
+    /// Origin like `https://files.loop46.localhost:9090`. Borrowed;
+    /// HttpBlobStore dupes internally so the caller can free
+    /// after `Worker.create` returns.
+    base_url: []const u8,
+    /// Per-fetch JWT minter. Loop46 typically wires this to a
+    /// closure over its `services_jwt_secret`. Borrowed.
+    mint_jwt: blob_mod.http_blob.MintJwtFn,
+    mint_ctx: ?*anyopaque = null,
+    /// Optional CA bundle path for self-signed dev certs. Borrowed.
+    ca_bundle_path: ?[]const u8 = null,
+    /// Production: true. Dev / smoke against self-signed cert: false.
+    verify_tls: bool = true,
+};
+
 pub const WorkerConfig = struct {
     /// Tenant resolver. Every request's `:authority` header is looked
     /// up here to find the owning instance; the handler's `kv.*` global
@@ -469,6 +488,16 @@ pub const WorkerConfig = struct {
     /// the worker's `create` call (S3BlobStore.init dupes them, so
     /// afterwards they can be freed).
     blob_backend: blob_mod.BackendConfig,
+    /// When set, manifest reads route through a colocated files-server
+    /// over HTTP/2 instead of S3 (production.md #1.4 step 4 —
+    /// manifests live in raft-replicated KV inside the files-server
+    /// cluster, not S3). The S3 `blob_backend` above stays in use
+    /// for file-blobs (content-addressed bytecode + static asset
+    /// bytes); only the per-tenant manifest_backend swaps storage
+    /// layer. Null (default) keeps the legacy S3-direct manifest
+    /// path. Borrowed; the loop46 binary owns the storage for the
+    /// process lifetime.
+    manifest_http: ?ManifestHttpConfig = null,
     /// Phase 5.5 (a) — `BatchStore` the worker flushes log batches
     /// into. loop46 always supplies one — S3 if env wired, in-memory
     /// otherwise. Required because `flushLogs` shouldn't have to
@@ -566,6 +595,10 @@ pub fn Worker(comptime opts: Options) type {
         /// Picks fs vs s3 for every per-tenant blob backend this
         /// worker opens. Borrowed from `WorkerConfig.blob_backend`.
         blob_backend_cfg: blob_mod.BackendConfig,
+        /// Borrowed from `WorkerConfig.manifest_http`. When set,
+        /// `openTenantFiles` opens an HTTP-backed manifest_backend
+        /// instead of S3 — see the field doc on WorkerConfig.
+        manifest_http: ?ManifestHttpConfig,
         /// Phase 5.5 (a) — store the worker flushes log batches into.
         /// Lives for the worker's full lifetime; loop46 picks S3 vs
         /// in-memory at startup.
@@ -647,6 +680,7 @@ pub fn Worker(comptime opts: Options) type {
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
                 .blob_backend_cfg = config.blob_backend,
+                .manifest_http = config.manifest_http,
                 .log_batch_store = config.log_batch_store,
                 .services_jwt_secret = config.services_jwt_secret,
                 .log_public_base = config.log_public_base,
@@ -865,12 +899,29 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
     );
     errdefer blob_backend.deinit();
 
-    var manifest_backend = try blob_mod.BlobBackend.openPerTenant(
-        allocator,
-        worker.blob_backend_cfg,
-        inst.id,
-        "deployments",
-    );
+    // Production.md #1.4 step 4 — when manifest_http is wired, open
+    // an HTTP-backed manifest_backend that fetches manifests from a
+    // colocated files-server cluster (where they live in raft-
+    // replicated KV). Otherwise fall back to S3-direct, which still
+    // works as long as files-server's bootstrap path keeps the dual
+    // S3 PUT alive. The S3 PUT goes away once every loop46 worker
+    // in the deployment uses the HTTP backend.
+    var manifest_backend = if (worker.manifest_http) |mh|
+        try blob_mod.BlobBackend.openHttp(allocator, .{
+            .base_url = mh.base_url,
+            .instance_id = inst.id,
+            .mint_jwt = mh.mint_jwt,
+            .mint_ctx = mh.mint_ctx,
+            .ca_bundle_path = mh.ca_bundle_path,
+            .verify_tls = mh.verify_tls,
+        })
+    else
+        try blob_mod.BlobBackend.openPerTenant(
+            allocator,
+            worker.blob_backend_cfg,
+            inst.id,
+            "deployments",
+        );
     errdefer manifest_backend.deinit();
 
     const id_copy = try allocator.dupe(u8, inst.id);
@@ -1979,6 +2030,7 @@ test "openTenantFiles runs the orphan sweep on startup" {
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
         blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
+        manifest_http: ?ManifestHttpConfig = null,
     };
     var fake = FakeWorker{ .allocator = allocator };
     const tc = try openTenantFiles(&fake, inst);
@@ -2022,6 +2074,7 @@ test "commitTxn drops the undo row so the next sweep is a no-op" {
     const FakeWorker = struct {
         allocator: std.mem.Allocator,
         blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
+        manifest_http: ?ManifestHttpConfig = null,
     };
     var fake = FakeWorker{ .allocator = allocator };
     const tc = try openTenantFiles(&fake, inst);

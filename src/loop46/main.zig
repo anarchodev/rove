@@ -56,6 +56,7 @@ const rove = @import("rove");
 const rjs = @import("rove-js");
 const kv = @import("rove-kv");
 const blob_mod = @import("rove-blob");
+const jwt_mod = @import("rove-jwt");
 const files_mod = @import("rove-files");
 const files_server = @import("rove-files-server");
 const log_server = @import("rove-log-server");
@@ -264,6 +265,13 @@ const WorkerCtx = struct {
     /// the dashboard can surface a clear error instead of silently
     /// failing on the next files-server fetch.
     files_public_base: ?[]const u8,
+    /// Production.md #1.4 step 4 — when non-null, the worker's
+    /// per-tenant `manifest_backend` reads via HTTP from this
+    /// base URL (a colocated files-server cluster) instead of
+    /// going to S3 directly. Borrowed; main thread owns the
+    /// allocation.
+    files_internal_base: ?[]const u8,
+    files_internal_insecure_tls: bool,
     /// Origin the worker uses for the worker → sse-server emit POST
     /// (sse-plan §3.2). Null disables the path; emits stay in the
     /// legacy `_events/{sid}/...` rows + worker pump until the
@@ -405,6 +413,33 @@ fn workerMain(args: *WorkerCtx) !void {
         if (tenant.instances.get(id)) |inst| inst.kv.setBusyTimeout(0);
     }
 
+    // Production.md #1.4 step 4 — wire the HTTP-backed manifest
+    // fetcher when the operator pointed us at a files-server
+    // cluster. The mint closure runs per fetch; cost is one HMAC-
+    // SHA256 (microseconds), dominated by the network roundtrip.
+    // Token expiry is 5 minutes — same default loop46 hands the
+    // dashboard at /_system/services-token, so no second secret to
+    // manage.
+    const ManifestMintCtx = struct {
+        secret: []const u8,
+        fn mint(ctx_opaque: ?*anyopaque, allocator_inner: std.mem.Allocator) anyerror![]u8 {
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_opaque.?));
+            const exp_ms: i64 = @as(i64, @intCast(@divFloor(std.time.milliTimestamp(), 1))) + 5 * 60 * 1000;
+            return jwt_mod.mint(allocator_inner, ctx.secret, .{ .exp_ms = exp_ms });
+        }
+    };
+    var manifest_mint_ctx = ManifestMintCtx{ .secret = args.services_jwt_secret };
+    const manifest_http: ?rjs.ManifestHttpConfig = if (args.files_internal_base) |base|
+        .{
+            .base_url = base,
+            .mint_jwt = ManifestMintCtx.mint,
+            .mint_ctx = &manifest_mint_ctx,
+            .ca_bundle_path = null,
+            .verify_tls = !args.files_internal_insecure_tls,
+        }
+    else
+        null;
+
     const worker = try Worker.create(allocator, &reg, .{
         .tenant = tenant,
         .raft = args.raft,
@@ -436,6 +471,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
         .blob_backend = args.blob_backend_cfg,
+        .manifest_http = manifest_http,
         .log_batch_store = args.log_batch_store,
     });
     defer worker.destroy();
@@ -1228,6 +1264,8 @@ pub fn main() !void {
             .services_jwt_secret = &services_jwt_secret,
             .log_public_base = log_public_base,
             .files_public_base = files_public_base,
+            .files_internal_base = cli.files_internal_base,
+            .files_internal_insecure_tls = cli.files_internal_insecure_tls,
             .sse_public_base = sse_public_base,
             .sse_internal_token = sse_internal_token,
             .sse_insecure_tls = sse_insecure_tls,
