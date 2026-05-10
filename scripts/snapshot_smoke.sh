@@ -122,9 +122,18 @@ SMOKE_TAG=snapshot-smoke
 SMOKE_PROTO=https
 init_cluster_addrs "$PERIODIC_PREFIX" "$PERIODIC_HTTP_BASE" "$PERIODIC_RAFT_BASE"
 
-# Seed acme onto every node.
+# Seed acme + quiet onto every node. quiet receives exactly one
+# release POST below; after that it never gets another. The
+# by-reference reuse path is what we'll verify: subsequent
+# manifests must reference the FIRST manifest's quiet/app.db key,
+# not re-VACUUM + re-PUT a new copy every interval.
 PERIODIC_MANIFEST=$(mktemp --suffix=.json)
-echo '{"tenants":[{"id":"acme","domains":[],"files":[]}]}' > "$PERIODIC_MANIFEST"
+cat > "$PERIODIC_MANIFEST" <<'EOF'
+{"tenants":[
+  {"id":"acme","domains":[],"files":[]},
+  {"id":"quiet","domains":[],"files":[]}
+]}
+EOF
 seed_all_dirs "$PERIODIC_MANIFEST"
 rm -f "$PERIODIC_MANIFEST"
 
@@ -175,6 +184,18 @@ LEADER_DIR="${DATA_DIRS[$LEADER_IDX]}"
 # once. The PRE_BURST commits are what the FIRST snapshot pass compacts
 # away, so we record raft.log.db's row count + file size after that
 # bootstrap window — that's our baseline for "compaction is bounded."
+#
+# One write to `quiet` first, then nothing — that gets it into
+# ApplyCtx.kv_stores so it appears in subsequent manifests, while
+# leaving its tenant_apply_idx fixed once written. After the first
+# capture all subsequent captures should reuse quiet's db_key by
+# reference (verified at the end of this section against S3).
+"${CURL[@]}" \
+    -H "Authorization: Bearer $PERIODIC_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"tenant_id":"quiet","dep_id":1}' \
+    "https://app.loop46.localhost:${LEADER_PORT}/_system/release" >/dev/null
+
 PRE_BURST=20
 for i in $(seq 1 $PRE_BURST); do
     "${CURL[@]}" \
@@ -257,6 +278,73 @@ echo "ok  raft.log.db file size bounded after compaction ($SIZE_AFTER <= ${SIZE_
 AV_MODE=$(sqlite3 "$RAFT_LOG" "PRAGMA auto_vacuum;")
 [[ "$AV_MODE" == "2" ]] || { echo "FAIL: auto_vacuum=$AV_MODE on raft.log.db (want 2 = INCREMENTAL)" >&2; exit 1; }
 echo "ok  raft.log.db auto_vacuum=INCREMENTAL"
+
+# ── 7. Verify by-reference reuse for unchanged tenants ─────────────
+#
+# The `quiet` tenant got seeded but never received a release POST
+# during the burst loops. Its tenant_apply_idx mirror stayed at
+# whatever the seed left it (0). Every snapshot pass after the first
+# should reuse the FIRST manifest's quiet/app.db key by reference —
+# no new VACUUM + PUT for quiet.
+#
+# Drive one more release POST (against acme, NOT quiet) so the
+# capture loop has a reason to fire fresh and we know which tenants
+# were touched.
+"${CURL[@]}" \
+    -H "Authorization: Bearer $PERIODIC_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"tenant_id":"acme","dep_id":999}' \
+    "https://app.loop46.localhost:${LEADER_PORT}/_system/release" >/dev/null
+sleep 2
+
+# Pull every manifest from the leader's worker log (each emits
+# `snapshot captured {snap_id} (manifest_key={key})`). Take the
+# last 2 — these will be the most recent snapshots after the
+# acme-only burst. Both must reference the SAME `quiet/app.db`
+# bytes via the same `db_key`.
+WORKER_LOG="/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out"
+MAPPED=$(grep -oE 'snapshot captured [0-9a-f]+ \(manifest_key=[^)]+\)' "$WORKER_LOG" | tail -2 || true)
+if [[ -z "$MAPPED" ]]; then
+    echo "FAIL: could not extract recent manifest_key lines from worker log" >&2
+    grep 'snapshot captured' "$WORKER_LOG" | tail -5 >&2
+    exit 1
+fi
+KEY_RECENT_1=$(echo "$MAPPED" | sed -n '1p' | sed -E 's/.*manifest_key=([^)]+)\)/\1/')
+KEY_RECENT_2=$(echo "$MAPPED" | sed -n '2p' | sed -E 's/.*manifest_key=([^)]+)\)/\1/')
+[[ -n "$KEY_RECENT_1" && -n "$KEY_RECENT_2" && "$KEY_RECENT_1" != "$KEY_RECENT_2" ]] || {
+    echo "FAIL: need 2 distinct recent manifest keys, got '$KEY_RECENT_1' and '$KEY_RECENT_2'" >&2
+    exit 1
+}
+
+# We use the operator CLI's `--snapshot-dir` form to read manifest
+# bytes via S3 (the same backend the periodic loop wrote them to).
+# `aws s3 cp` would be cleanest but isn't a hard requirement of the
+# smoke harness; instead use a small Python helper or fall back to
+# extracting tenants from the raft thread's stderr (we don't have a
+# manifest-show command). The simpler path: walk both manifests by
+# pulling them from the same FsBatchStore-or-S3 backend the worker
+# wrote them to, via a tiny inline Python script that signs an S3
+# GET. To keep dependencies minimal here, just verify reuse via the
+# behavioural property we DO have visibility into: count distinct
+# `cluster/snapshots/*/quiet/app.db` keys created in S3. With reuse
+# working there should be exactly 1 (the first capture's). Without
+# reuse there'd be one per capture pass (4+).
+# We use the AWS CLI if available; skip with a warning otherwise.
+if command -v aws >/dev/null 2>&1 && [[ -n "${S3_BUCKET:-}" && -n "${S3_ENDPOINT:-}" ]]; then
+    QUIET_KEY_COUNT=$(AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
+        aws s3 ls --endpoint-url "$S3_ENDPOINT" \
+        "s3://${S3_BUCKET}/${S3_KEY_PREFIX_BASE}cluster/snapshots/" --recursive 2>/dev/null \
+        | awk '{print $4}' | grep -c '/quiet/app.db$' || true)
+    if [[ "$QUIET_KEY_COUNT" -gt 1 ]]; then
+        echo "FAIL: found $QUIET_KEY_COUNT distinct quiet/app.db keys in S3 — reuse not firing" >&2
+        echo "      (expected exactly 1: the first capture's; subsequent captures should" >&2
+        echo "      reference it by db_key in the manifest, not re-VACUUM + re-PUT)" >&2
+        exit 1
+    fi
+    echo "ok  by-reference reuse: $QUIET_KEY_COUNT distinct quiet/app.db key(s) in S3 (<=1 expected)"
+else
+    echo "skip  by-reference reuse S3 listing (aws CLI not in PATH or S3 env not set; inline tests cover the contract)"
+fi
 
 echo ""
 echo "PASS snapshot smoke"

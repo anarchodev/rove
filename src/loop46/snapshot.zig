@@ -125,6 +125,15 @@ pub const Captured = struct {
 pub const TenantSource = struct {
     instance_id: []const u8,
     store: *kv.KvStore,
+    /// When set, capture compares against `prev_manifest`'s entry for
+    /// this tenant: if `last_applied_idx <= prev.snapshot_idx`, the
+    /// tenant's db is byte-identical to prev's snapshot and capture
+    /// reuses the prior `db_key` / `db_sha256` / `db_size` (just
+    /// bumping `snapshot_idx` to the current `apply_position` —
+    /// the always-refresh-all-tenants property per
+    /// `docs/snapshot-plan.md` §2.2). Null disables reuse and
+    /// always re-VACUUMs (today's operator-CLI default).
+    last_applied_idx: ?u64 = null,
 };
 
 /// Capture a snapshot end-to-end. The caller threads the
@@ -140,10 +149,22 @@ pub const TenantSource = struct {
 /// each capture creates a per-snap_id subdir inside, deletes it
 /// at the end. Files there must NOT collide across concurrent
 /// captures — the snap_id namespace gives that property.
+///
+/// `prev_manifest` enables by-reference reuse for unchanged
+/// tenants per `docs/snapshot-plan.md` §2.2. When set, each
+/// `TenantSource` whose `last_applied_idx <= prev_manifest's
+/// entry's snapshot_idx` skips the VACUUM + upload and reuses the
+/// prior `db_key` (the bytes are byte-identical, so referencing
+/// the same S3 object is correct). Same property for `root_db`
+/// driven by `root_last_applied`. Pass `null` to always re-VACUUM
+/// every tenant (the operator-CLI default; correctness is
+/// trivially the same — just more expensive).
 pub fn capture(
     allocator: std.mem.Allocator,
     tenants_in: []const TenantSource,
     root_store: ?*kv.KvStore,
+    root_last_applied: ?u64,
+    prev_manifest: ?*const Manifest,
     snapshot_store: ls.batch_store.BatchStore,
     tmp_dir: []const u8,
     apply_position: u64,
@@ -162,6 +183,38 @@ pub fn capture(
 
     // ── Per-tenant captures ─────────────────────────────────────
     for (tenants_in) |t| {
+        // By-reference reuse: when prev_manifest has an entry for
+        // this tenant AND no apply has touched it since prev was
+        // captured, reference prev's db_key directly. The bytes are
+        // byte-identical (no apply → no kv writes → no VACUUM
+        // delta), so any object reachable by prev's db_key is also
+        // a correct snapshot for this tenant at the current
+        // apply_position. Manifest entry snapshot_idx is bumped to
+        // current apply_position regardless — that's the
+        // always-refresh-all property that lets the willemt
+        // compaction floor advance every pass without per-tenant
+        // activity gating.
+        if (t.last_applied_idx) |last| {
+            if (prev_manifest) |prev| {
+                if (findTenantInManifest(prev, t.instance_id)) |prev_entry| {
+                    if (last <= prev_entry.snapshot_idx) {
+                        const id_copy = try allocator.dupe(u8, t.instance_id);
+                        errdefer allocator.free(id_copy);
+                        const key_copy = try allocator.dupe(u8, prev_entry.db_key);
+                        errdefer allocator.free(key_copy);
+                        try tenants.append(allocator, .{
+                            .instance_id = id_copy,
+                            .db_key = key_copy,
+                            .db_sha256 = prev_entry.db_sha256,
+                            .db_size = prev_entry.db_size,
+                            .snapshot_idx = apply_position,
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
+
         const tmp_path = try std.fmt.allocPrintSentinel(
             allocator,
             "{s}/{s}.db",
@@ -194,32 +247,54 @@ pub fn capture(
     var root_entry: ?SingletonEntry = null;
     errdefer if (root_entry) |*r| allocator.free(r.db_key);
     if (root_store) |rs| {
-        const tmp_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/__root__.db",
-            .{stage},
-            0,
-        );
-        defer allocator.free(tmp_path);
-        rs.vacuumInto(tmp_path) catch return Error.Sqlite;
-
-        const root_key = try std.fmt.allocPrint(
-            allocator,
-            "cluster/snapshots/{s}/__root__.db",
-            .{snap_id},
-        );
-        const captured = try uploadDbFile(
-            allocator,
-            snapshot_store,
-            tmp_path,
-            root_key,
-        );
-        root_entry = .{
-            .db_key = captured.key,
-            .db_sha256 = captured.sha256_hex,
-            .db_size = captured.size,
-            .snapshot_idx = apply_position,
+        // Same reuse property as per-tenant: when the root db's
+        // last apply hasn't advanced past the prior snapshot's
+        // root snapshot_idx, reuse prev_manifest's root entry.
+        const can_reuse_root = blk: {
+            const last = root_last_applied orelse break :blk false;
+            const prev = prev_manifest orelse break :blk false;
+            const prev_root = prev.root_db orelse break :blk false;
+            break :blk last <= prev_root.snapshot_idx;
         };
+
+        if (can_reuse_root) {
+            const prev_root = prev_manifest.?.root_db.?;
+            const key_copy = try allocator.dupe(u8, prev_root.db_key);
+            errdefer allocator.free(key_copy);
+            root_entry = .{
+                .db_key = key_copy,
+                .db_sha256 = prev_root.db_sha256,
+                .db_size = prev_root.db_size,
+                .snapshot_idx = apply_position,
+            };
+        } else {
+            const tmp_path = try std.fmt.allocPrintSentinel(
+                allocator,
+                "{s}/__root__.db",
+                .{stage},
+                0,
+            );
+            defer allocator.free(tmp_path);
+            rs.vacuumInto(tmp_path) catch return Error.Sqlite;
+
+            const root_key = try std.fmt.allocPrint(
+                allocator,
+                "cluster/snapshots/{s}/__root__.db",
+                .{snap_id},
+            );
+            const captured = try uploadDbFile(
+                allocator,
+                snapshot_store,
+                tmp_path,
+                root_key,
+            );
+            root_entry = .{
+                .db_key = captured.key,
+                .db_sha256 = captured.sha256_hex,
+                .db_size = captured.size,
+                .snapshot_idx = apply_position,
+            };
+        }
     }
 
     // ── Manifest ────────────────────────────────────────────────
@@ -519,13 +594,54 @@ pub fn tickRaftCapture(
     const apply_position = raft.snapshotLastIdx();
     const willemt_term = raft.currentTerm();
 
+    // Cold-start: on the first tick after worker boot, populate
+    // `last_manifest` from S3 / fs so by-reference reuse works
+    // immediately instead of waiting for a fresh local capture.
+    // Fires once per RaftCaptureState lifetime; the flag flips
+    // even when the store is empty so we don't re-LIST every
+    // interval.
+    //
+    // **Safety guard:** discard the loaded manifest if its
+    // `willemt_compaction_floor` is past our current
+    // `apply_position`. That signals the stored manifest is from
+    // a different (later) cluster lifetime — e.g., the operator
+    // wiped `data_dir` but the snapshot store still holds prior
+    // history. Reusing tenant `db_key`s from that history would
+    // silently substitute *future* tenant bytes for whatever
+    // *empty* state our fresh app.db actually contains. Refuse
+    // and re-VACUUM from scratch.
+    if (!state.cold_start_done) {
+        state.cold_start_done = true;
+        if (state.last_manifest == null) {
+            if (try loadLatestPriorManifest(state.allocator, snapshot_store)) |m| {
+                if (m.willemt_compaction_floor <= apply_position) {
+                    state.last_manifest = m;
+                } else {
+                    var owned = m;
+                    std.log.warn(
+                        "snapshot: cold-start manifest floor={d} > current apply_position={d}; " ++
+                            "snapshot store contains manifests from a later cluster lifetime " ++
+                            "(operator wiped data_dir? raft log replayed only partially?). " ++
+                            "Discarding; first capture will VACUUM every tenant.",
+                        .{ m.willemt_compaction_floor, apply_position },
+                    );
+                    owned.deinit();
+                }
+            }
+        }
+    }
+
     const sources = try tenantSourcesFromApplyCtx(state.allocator, apply_ctx);
     defer state.allocator.free(sources);
+
+    const prev_ptr: ?*const Manifest = if (state.last_manifest) |*m| m else null;
 
     const captured = try capture(
         state.allocator,
         sources,
         apply_ctx.root_store,
+        apply_ctx.rootLastApplied(),
+        prev_ptr,
         snapshot_store,
         tmp_dir,
         apply_position,
@@ -545,6 +661,20 @@ pub fn tickRaftCapture(
         );
     };
 
+    // Cache the just-captured manifest so the next tick can reuse
+    // unchanged tenants' db_keys by reference. Decoding from the
+    // bytes we just produced is a few-µs round-trip; cheap on the
+    // raft thread vs another S3 LIST + GET.
+    const new_manifest = decodeManifest(state.allocator, captured.manifest_bytes) catch |err| blk: {
+        std.log.warn(
+            "snapshot: decodeManifest of just-captured manifest failed: {s} " ++
+                "(by-reference reuse skipped on next pass; correct, just expensive)",
+            .{@errorName(err)},
+        );
+        break :blk null;
+    };
+    if (new_manifest) |m| state.setLastManifest(m);
+
     return captured;
 }
 
@@ -555,13 +685,84 @@ pub const RaftCaptureState = struct {
     allocator: std.mem.Allocator,
     interval_ns: i64,
     last_attempt_ns: i64 = 0,
+    /// Decoded manifest from the most recent successful capture (or
+    /// the cold-start S3-LIST lookup). Threaded back into the next
+    /// `tickRaftCapture` call as `prev_manifest` so unchanged
+    /// tenants reuse prior db_keys instead of re-VACUUMing. Owns
+    /// allocator-owned strings; cleared + replaced in
+    /// `setLastManifest`.
+    last_manifest: ?Manifest = null,
+    /// True after the cold-start lookup ran (whether or not it
+    /// found a prior manifest). Prevents the lookup firing every
+    /// tick when no prior exists.
+    cold_start_done: bool = false,
+
+    pub fn deinit(self: *RaftCaptureState) void {
+        if (self.last_manifest) |*m| m.deinit();
+        self.last_manifest = null;
+    }
+
+    /// Replace `last_manifest` with the just-captured manifest.
+    /// Takes ownership of `m`'s allocator-owned strings; deinits
+    /// the prior cached manifest if any.
+    fn setLastManifest(self: *RaftCaptureState, m: Manifest) void {
+        if (self.last_manifest) |*old| old.deinit();
+        self.last_manifest = m;
+    }
 };
+
+/// Cold-start path: when `RaftCaptureState.last_manifest` is null
+/// AND we haven't yet checked the snapshot store, look for the
+/// most recent existing snapshot manifest and seed
+/// `last_manifest` from it. Lets a freshly-restarted worker pick
+/// up the by-reference reuse chain instead of VACUUMing every
+/// tenant on its first periodic capture.
+///
+/// Best-effort: any LIST/GET/decode error logs + leaves the cache
+/// empty. Next tick will re-VACUUM everything (correct, just
+/// expensive) — not a correctness concern.
+fn loadLatestPriorManifest(
+    allocator: std.mem.Allocator,
+    snapshot_store: ls.batch_store.BatchStore,
+) !?Manifest {
+    // Snapshot id is a ulid-shape `{ms_hex:14}{rand_hex:12}` (26
+    // chars, lexically-sortable by creation time). Manifest keys
+    // sort the same way; the lexically-greatest key under
+    // `cluster/snapshots/` ending in `/manifest.json` is the
+    // newest snapshot.
+    //
+    // The `list` API returns ascending order with a hard cap on
+    // returned keys. For pagination we'd loop, but for cold-start
+    // a single call with a generous max is enough — the snapshot
+    // retention policy keeps the count bounded (default 24h
+    // worth at e.g. 5min interval = ~288 manifests + their
+    // per-tenant entries).
+    const list_max: u32 = 4096;
+    const keys = snapshot_store.list("cluster/snapshots/", "", list_max, allocator) catch
+        return null;
+    defer ls.batch_store.freeListResult(allocator, keys);
+
+    var best: ?[]const u8 = null;
+    for (keys) |k| {
+        if (!std.mem.endsWith(u8, k, "/manifest.json")) continue;
+        if (best == null or std.mem.lessThan(u8, best.?, k)) best = k;
+    }
+
+    const key = best orelse return null;
+    const bytes = snapshot_store.get(key, allocator) catch return null;
+    defer allocator.free(bytes);
+    return decodeManifest(allocator, bytes) catch null;
+}
 
 /// Build a `[]TenantSource` slice from an already-warmed
 /// `ApplyCtx.kv_stores`. Borrows the keys + store pointers; caller
 /// frees the returned slice with `allocator.free`. Use this from
 /// the raft thread (which owns the connections) — not from a
 /// worker, since SQLite NOMUTEX connections aren't shareable.
+///
+/// Each `TenantSource.last_applied_idx` is populated from
+/// `ApplyCtx.tenant_apply_idx` so `capture` can do by-reference
+/// reuse (§2.2 always-refresh-all).
 pub fn tenantSourcesFromApplyCtx(
     allocator: std.mem.Allocator,
     apply_ctx: *apply_mod.ApplyCtx,
@@ -570,7 +771,12 @@ pub fn tenantSourcesFromApplyCtx(
     var idx: usize = 0;
     var it = apply_ctx.kv_stores.iterator();
     while (it.next()) |entry| : (idx += 1) {
-        list[idx] = .{ .instance_id = entry.key_ptr.*, .store = entry.value_ptr.* };
+        const id = entry.key_ptr.*;
+        list[idx] = .{
+            .instance_id = id,
+            .store = entry.value_ptr.*,
+            .last_applied_idx = apply_ctx.tenantLastApplied(id),
+        };
     }
     return list;
 }
@@ -646,10 +852,20 @@ pub fn captureFromDataDir(
         try sources.append(allocator, .{ .instance_id = id_copy, .store = ks });
     }
 
+    // Operator CLI default: no in-memory `tenant_apply_idx` state,
+    // so we can't tell which tenants are unchanged since a prior
+    // snapshot. Pass `prev_manifest = null` and `last_applied_idx`
+    // null on every TenantSource — capture re-VACUUMs everything
+    // (correct, just more expensive). This is acceptable for
+    // operator-driven one-shot DR captures; the periodic
+    // raft-thread loop has the apply-idx mirror and uses the
+    // reuse path.
     return capture(
         allocator,
         sources.items,
         root_store,
+        null,
+        null,
         snapshot_store,
         tmp_dir,
         apply_position,
@@ -725,6 +941,17 @@ fn freeTenantList(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(Te
         allocator.free(t.db_key);
     }
     list.deinit(allocator);
+}
+
+/// Linear scan over `manifest.tenants` for the named id. Tenant
+/// counts are bounded by node density (hundreds, not millions) and
+/// this fires once per tenant per capture pass — well within
+/// the budget of an O(N) scan. A hashmap index would be premature.
+fn findTenantInManifest(manifest: *const Manifest, instance_id: []const u8) ?TenantEntry {
+    for (manifest.tenants) |t| {
+        if (std.mem.eql(u8, t.instance_id, instance_id)) return t;
+    }
+    return null;
 }
 
 // ── Manifest JSON ──────────────────────────────────────────────────
@@ -983,6 +1210,8 @@ test "capture + restore: round-trips tenant + root state into a fresh data_dir" 
         allocator,
         sources,
         apply_ctx.root_store,
+        null,
+        null,
         store.batchStore(),
         stage_dir,
         100,
@@ -1215,6 +1444,8 @@ test "capture: end-to-end against FsBatchStore round-trips a tenant db" {
         allocator,
         sources,
         apply_ctx.root_store,
+        null,
+        null,
         store.batchStore(),
         stage_dir,
         100,
@@ -1261,4 +1492,282 @@ test "capture: end-to-end against FsBatchStore round-trips a tenant db" {
     defer allocator.free(v);
     try testing.expectEqualStrings("world", v);
     try testing.expectEqual(@as(u64, 99), try restored.lastAppliedRaftIdx());
+}
+
+test "capture: by-reference reuse for unchanged tenants" {
+    // Two-tenant cluster. Snapshot 1 captures both fresh. Snapshot 2
+    // happens after a write to acme but not beta:
+    //
+    //   - acme MUST be re-VACUUMed (its bytes changed)
+    //   - beta MUST reuse snapshot 1's db_key (no apply touched it)
+    //
+    // The reuse path is what makes always-refresh-all-tenants
+    // affordable at density — verify the bytes-on-store side of
+    // that contract.
+    const allocator = testing.allocator;
+
+    var path_buf: [96]u8 = undefined;
+    const root_path = tmpPath(&path_buf, "reuse");
+    defer std.fs.cwd().deleteTree(root_path) catch {};
+    try std.fs.cwd().makePath(root_path);
+
+    // Plant __root__.db so ApplyCtx.getRootKv works.
+    {
+        const root_db_path = try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/__root__.db",
+            .{root_path},
+            0,
+        );
+        defer allocator.free(root_db_path);
+        const root_kv = try kv.KvStore.open(allocator, root_db_path);
+        root_kv.close();
+    }
+
+    // Stand up a minimal raft node so ApplyCtx.init has a target.
+    const raft_log_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/raft.log.db",
+        .{root_path},
+        0,
+    );
+    defer allocator.free(raft_log_path);
+    const peers = [_]kv.RaftPeerAddr{.{ .host = "127.0.0.1", .port = 39810 }};
+    const node = try kv.RaftNode.init(allocator, .{
+        .node_id = 0,
+        .peers = &peers,
+        .listen_addr = try std.net.Address.parseIp("127.0.0.1", 39810),
+        .apply = .{ .opaque_bytes = .{ .apply_fn = noopApply, .ctx = null } },
+        .raft_log_path = raft_log_path,
+    });
+    defer node.deinit();
+
+    // Plant `acme` and `beta` tenants, each with one row, both
+    // stamped at last_applied_raft_idx = 50.
+    inline for (.{ "acme", "beta" }) |id| {
+        const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_path, id });
+        defer allocator.free(dir);
+        try std.fs.cwd().makePath(dir);
+        const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{dir}, 0);
+        defer allocator.free(db_path);
+        const ks = try kv.KvStore.open(allocator, db_path);
+        defer ks.close();
+        try ks.put(id ++ "-key", id ++ "-value-snapshot1");
+        try ks.setLastAppliedRaftIdx(50);
+    }
+
+    var apply_ctx = apply_mod.ApplyCtx.init(allocator, root_path, node);
+    defer apply_ctx.deinit();
+    _ = try apply_ctx.getKv("acme");
+    _ = try apply_ctx.getKv("beta");
+    _ = try apply_ctx.getRootKv();
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{root_path});
+    defer allocator.free(store_dir);
+    const stage_dir = try std.fmt.allocPrint(allocator, "{s}/.stage", .{root_path});
+    defer allocator.free(stage_dir);
+    const store = try ls.batch_store_fs.FsBatchStore.init(allocator, store_dir);
+    defer store.deinit();
+
+    // ── Snapshot 1: fresh capture of both tenants ───────────────
+    const sources_1 = try tenantSourcesFromApplyCtx(allocator, &apply_ctx);
+    defer allocator.free(sources_1);
+
+    var captured_1 = try capture(
+        allocator,
+        sources_1,
+        apply_ctx.root_store,
+        apply_ctx.rootLastApplied(),
+        null, // no prev — every tenant gets re-VACUUMed
+        store.batchStore(),
+        stage_dir,
+        100,
+        7,
+    );
+    defer captured_1.deinit();
+
+    var manifest_1 = try decodeManifest(allocator, captured_1.manifest_bytes);
+    defer manifest_1.deinit();
+    try testing.expectEqual(@as(usize, 2), manifest_1.tenants.len);
+
+    // Sort manifest_1 entries so the assertions don't depend on
+    // ApplyCtx's hash-iteration order.
+    const acme_1 = findTenantInManifest(&manifest_1, "acme") orelse return error.TestFail;
+    const beta_1 = findTenantInManifest(&manifest_1, "beta") orelse return error.TestFail;
+
+    // Both tenants should reference snap_1's directory in their db_key.
+    try testing.expect(std.mem.indexOf(u8, acme_1.db_key, manifest_1.snap_id) != null);
+    try testing.expect(std.mem.indexOf(u8, beta_1.db_key, manifest_1.snap_id) != null);
+
+    // ── Apply something to acme but not beta. Bumps acme's
+    //    in-memory tenant_apply_idx past beta's; this is what
+    //    drives the reuse decision in snapshot 2.
+    {
+        const acme_kv = try apply_ctx.getKv("acme");
+        try acme_kv.put("acme-key", "acme-value-snapshot2");
+    }
+    apply_ctx.tenant_apply_idx.put(allocator, "acme", 150) catch unreachable;
+    // beta's tenant_apply_idx stays at the seeded value (50, from disk).
+
+    // ── Snapshot 2: should reuse beta, fresh-capture acme ───────
+    const sources_2 = try tenantSourcesFromApplyCtx(allocator, &apply_ctx);
+    defer allocator.free(sources_2);
+
+    var captured_2 = try capture(
+        allocator,
+        sources_2,
+        apply_ctx.root_store,
+        apply_ctx.rootLastApplied(),
+        &manifest_1,
+        store.batchStore(),
+        stage_dir,
+        200,
+        7,
+    );
+    defer captured_2.deinit();
+
+    var manifest_2 = try decodeManifest(allocator, captured_2.manifest_bytes);
+    defer manifest_2.deinit();
+
+    const acme_2 = findTenantInManifest(&manifest_2, "acme") orelse return error.TestFail;
+    const beta_2 = findTenantInManifest(&manifest_2, "beta") orelse return error.TestFail;
+
+    // acme: changed, must be re-captured under snap_2's directory
+    // with a new sha256 (the new value changed the bytes).
+    try testing.expect(std.mem.indexOf(u8, acme_2.db_key, manifest_2.snap_id) != null);
+    try testing.expect(!std.mem.eql(u8, &acme_1.db_sha256, &acme_2.db_sha256));
+
+    // beta: unchanged → must reuse snap_1's db_key BYTE-FOR-BYTE.
+    // Same hash, same size, same key.
+    try testing.expectEqualStrings(beta_1.db_key, beta_2.db_key);
+    try testing.expectEqualSlices(u8, &beta_1.db_sha256, &beta_2.db_sha256);
+    try testing.expectEqual(beta_1.db_size, beta_2.db_size);
+
+    // BOTH entries' snapshot_idx is bumped to apply_position even
+    // though beta's bytes are unchanged — that's the always-refresh
+    // property that lets the willemt compaction floor advance every
+    // pass without per-tenant activity gating.
+    try testing.expectEqual(@as(u64, 200), acme_2.snapshot_idx);
+    try testing.expectEqual(@as(u64, 200), beta_2.snapshot_idx);
+    try testing.expectEqual(@as(u64, 200), manifest_2.willemt_compaction_floor);
+
+    // Sanity: beta's reused db_key actually still resolves to bytes
+    // on the store. Restore-from-snap_2 will need this to work.
+    const beta_bytes = try store.batchStore().get(beta_2.db_key, allocator);
+    defer allocator.free(beta_bytes);
+    try testing.expect(beta_bytes.len > 0);
+}
+
+test "capture: prev_manifest with different tenant set" {
+    // Edge: prev_manifest exists, but contains tenants we no
+    // longer have AND lacks tenants we just added. Must capture
+    // the new tenant fresh; no manifest entry for the dropped one.
+    const allocator = testing.allocator;
+
+    var path_buf: [96]u8 = undefined;
+    const root_path = tmpPath(&path_buf, "newtenant");
+    defer std.fs.cwd().deleteTree(root_path) catch {};
+    try std.fs.cwd().makePath(root_path);
+
+    {
+        const root_db_path = try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/__root__.db",
+            .{root_path},
+            0,
+        );
+        defer allocator.free(root_db_path);
+        const root_kv = try kv.KvStore.open(allocator, root_db_path);
+        root_kv.close();
+    }
+
+    const raft_log_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/raft.log.db",
+        .{root_path},
+        0,
+    );
+    defer allocator.free(raft_log_path);
+    const peers = [_]kv.RaftPeerAddr{.{ .host = "127.0.0.1", .port = 39811 }};
+    const node = try kv.RaftNode.init(allocator, .{
+        .node_id = 0,
+        .peers = &peers,
+        .listen_addr = try std.net.Address.parseIp("127.0.0.1", 39811),
+        .apply = .{ .opaque_bytes = .{ .apply_fn = noopApply, .ctx = null } },
+        .raft_log_path = raft_log_path,
+    });
+    defer node.deinit();
+
+    // Plant only `gamma`, no acme or beta.
+    {
+        const dir = try std.fmt.allocPrint(allocator, "{s}/gamma", .{root_path});
+        defer allocator.free(dir);
+        try std.fs.cwd().makePath(dir);
+        const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{dir}, 0);
+        defer allocator.free(db_path);
+        const ks = try kv.KvStore.open(allocator, db_path);
+        defer ks.close();
+        try ks.put("g", "v");
+    }
+
+    var apply_ctx = apply_mod.ApplyCtx.init(allocator, root_path, node);
+    defer apply_ctx.deinit();
+    _ = try apply_ctx.getKv("gamma");
+    _ = try apply_ctx.getRootKv();
+
+    // Build a synthetic prev_manifest naming acme/beta with stale
+    // snapshot_idx 50. This simulates "previous snapshot covered a
+    // different tenant set."
+    var prev_tenants = try allocator.alloc(TenantEntry, 1);
+    prev_tenants[0] = .{
+        .instance_id = try allocator.dupe(u8, "acme"),
+        .db_key = try allocator.dupe(u8, "cluster/snapshots/old/acme/app.db"),
+        .db_sha256 = [_]u8{'a'} ** 64,
+        .db_size = 4096,
+        .snapshot_idx = 50,
+    };
+    var prev_manifest = Manifest{
+        .allocator = allocator,
+        .snap_id = try allocator.dupe(u8, "old"),
+        .captured_at_ms = 0,
+        .willemt_compaction_floor = 50,
+        .willemt_term = 1,
+        .tenants = prev_tenants,
+        .root_db = null,
+    };
+    defer prev_manifest.deinit();
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{root_path});
+    defer allocator.free(store_dir);
+    const stage_dir = try std.fmt.allocPrint(allocator, "{s}/.stage", .{root_path});
+    defer allocator.free(stage_dir);
+    const store = try ls.batch_store_fs.FsBatchStore.init(allocator, store_dir);
+    defer store.deinit();
+
+    const sources = try tenantSourcesFromApplyCtx(allocator, &apply_ctx);
+    defer allocator.free(sources);
+
+    var captured = try capture(
+        allocator,
+        sources,
+        apply_ctx.root_store,
+        apply_ctx.rootLastApplied(),
+        &prev_manifest,
+        store.batchStore(),
+        stage_dir,
+        300,
+        7,
+    );
+    defer captured.deinit();
+
+    var manifest = try decodeManifest(allocator, captured.manifest_bytes);
+    defer manifest.deinit();
+
+    // Only gamma in the new manifest — acme isn't in our tenant set.
+    try testing.expectEqual(@as(usize, 1), manifest.tenants.len);
+    try testing.expectEqualStrings("gamma", manifest.tenants[0].instance_id);
+
+    // gamma was captured fresh (under the new snap_id, NOT prev's "old").
+    try testing.expect(std.mem.indexOf(u8, manifest.tenants[0].db_key, manifest.snap_id) != null);
+    try testing.expect(std.mem.indexOf(u8, manifest.tenants[0].db_key, "old") == null);
 }

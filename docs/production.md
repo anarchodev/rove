@@ -35,13 +35,53 @@ Shipped:
   size are bounded after 120 commits + 4 snapshot passes (was
   unbounded before).
 
-### 2. By-reference manifest reuse for unchanged tenants
+### 2. By-reference manifest reuse for unchanged tenants — **done 2026-05-09**
 
-Today's snapshot pass VACUUMs every tenant regardless. With many
-dormant tenants per node that's wasted disk + S3 cost on every
-interval. Plan calls for the "always-refresh-all-tenants" trick
-(manifest-bookkeeping refresh, no re-VACUUM for unchanged) — needed
-before periodic snapshots are practical at density. Same sub-plan.
+Naive per-pass capture re-VACUUMed every tenant regardless of
+activity, paying full CPU + S3 PUT cost proportional to *total*
+tenants rather than *active* tenants. The
+always-refresh-all-tenants trick (`docs/snapshot-plan.md` §2.2)
+fixes both halves of that — keeps the willemt compaction floor
+advancing every pass while making the per-pass work proportional
+to recent activity.
+
+Shipped:
+- `TenantSource.last_applied_idx` (optional) lets capture compare
+  the current high-water mark against the prior snapshot's
+  `snapshot_idx`. When `last_applied_idx <= prev.snapshot_idx`,
+  capture reuses the prior `db_key` / `db_sha256` / `db_size`
+  by reference (just bumping `snapshot_idx` to the current
+  `apply_position`). The bytes are byte-identical because no
+  apply touched the tenant, so referencing the same S3 object
+  is correct.
+- Same property for `__root__.db` via `root_last_applied`.
+- `tenantSourcesFromApplyCtx` populates `last_applied_idx` from
+  `ApplyCtx.tenantLastApplied` so the periodic capture loop
+  picks up the reuse path automatically.
+- `RaftCaptureState.last_manifest` caches the most-recent
+  successful capture's manifest; threaded as `prev_manifest`
+  into the next tick.
+- `loadLatestPriorManifest` cold-start path lists the snapshot
+  store on the first tick after worker boot so the in-memory
+  cache primes from S3 even before the leader has captured
+  anything itself. **Safety guarded** by checking
+  `prev.willemt_compaction_floor <= apply_position` — refuses
+  manifests from later cluster lifetimes (operator wiped
+  data_dir, partial replay) so reuse can't silently substitute
+  stale tenant bytes for an empty fresh state.
+- Operator CLI (`loop46 snapshot --data-dir ...`) keeps the
+  always-re-VACUUM path; one-shot DR captures don't have an
+  in-memory `tenant_apply_idx` to compare against.
+- Two inline tests cover the contract: (a) two consecutive
+  captures with one tenant changed → only that tenant gets a
+  fresh `db_key`, the other reuses; (b) prev_manifest with a
+  different tenant set → new tenant captured fresh, old entry
+  not carried forward.
+- `scripts/snapshot_smoke.sh` adds a `quiet` tenant that's
+  written once and then never again; subsequent captures
+  exercise the reuse path. (S3-listing assertion that exactly
+  1 `quiet/app.db` key exists is gated on the `aws` CLI being
+  available; inline tests are the rigorous coverage.)
 
 ### 3. Far-behind-follower auto-restore
 
@@ -150,8 +190,7 @@ this is fine, but multi-customer prod with mixed tiers needs it.
 ## Suggested order of attack
 
 1. ~~**#1 raft log compaction.**~~ Done 2026-05-09.
-2. **#2 by-reference reuse.** Makes the snapshot pass cheap at
-   density (avoids re-VACUUMing dormant tenants every interval).
+2. ~~**#2 by-reference reuse.**~~ Done 2026-05-09.
 3. **#7 leader-failover smoke.** Validates the at-least-once
    contract you've already designed.
 4. **#4 deployment doc + systemd units.** Afternoon's work; turns

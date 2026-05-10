@@ -979,6 +979,7 @@ pub fn main() !void {
     // past each pass — without that bracketing, periodic captures
     // would land in S3 / fs but the raft log would grow forever.
     var snap_state: ?snapshot_mod.RaftCaptureState = null;
+    defer if (snap_state) |*s| s.deinit();
     var snap_s3: ?*log_server.batch_store_s3.S3BatchStore = null;
     defer if (snap_s3) |h| h.deinit();
     var snap_store: ?log_server.batch_store.BatchStore = null;
