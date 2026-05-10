@@ -27,6 +27,7 @@ const std = @import("std");
 const cs = @import("rove-files-server");
 const blob_mod = @import("rove-blob");
 const h2 = @import("rove-h2");
+const kv = @import("rove-kv");
 
 const ENV_JWT_SECRET = "LOOP46_SERVICES_JWT_SECRET";
 
@@ -58,6 +59,31 @@ const Cli = struct {
     /// `--leader-url`.
     bootstrap_kv: [MAX_BOOTSTRAP_KV][]const u8 = undefined,
     bootstrap_kv_count: usize = 0,
+
+    // ── files-server-OWN raft cluster (production.md #1.0/#1.4) ──
+    //
+    // Independent from the loop46 worker raft cluster. files-server
+    // replicas form their own consensus: manifests live in a
+    // raft-replicated KvStore here, durability is via quorum (no S3
+    // backstop needed for correctness), DR via a learner replica.
+    //
+    // Single-node degenerate cluster (--peers <single-self>) is fine
+    // for dev. Production wants ≥3 voters + 1 learner.
+    //
+    // Wire shape: comma-separated `host:port[:voter|:learner]`. Same
+    // format the loop46 worker uses; default voter when no mode
+    // suffix.
+    //
+    // Default node_id 0 + a single-self peer entry lets the existing
+    // smoke harness keep working (it currently doesn't pass raft
+    // args).
+    raft_enabled: bool = false,
+    raft_node_id: u32 = 0,
+    raft_peers: []const u8 = "",
+    raft_listen: []const u8 = "",
+    raft_election_timeout_ms: u32 = 1000,
+    raft_heartbeat_ms: u32 = 200,
+    raft_snapshot_interval_ms: u32 = 0,
 };
 
 fn usage(stderr: *std.fs.File.Writer) !void {
@@ -121,11 +147,83 @@ fn parseCli(argv: [][:0]u8) !Cli {
             if (out.bootstrap_kv_count >= MAX_BOOTSTRAP_KV) return error.Usage;
             out.bootstrap_kv[out.bootstrap_kv_count] = argv[i];
             out.bootstrap_kv_count += 1;
+        } else if (std.mem.eql(u8, a, "--raft-node-id")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.raft_node_id = try std.fmt.parseInt(u32, argv[i], 10);
+            out.raft_enabled = true;
+        } else if (std.mem.eql(u8, a, "--raft-peers")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.raft_peers = argv[i];
+            out.raft_enabled = true;
+        } else if (std.mem.eql(u8, a, "--raft-listen")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.raft_listen = argv[i];
+            out.raft_enabled = true;
+        } else if (std.mem.eql(u8, a, "--raft-election-timeout-ms")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.raft_election_timeout_ms = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--raft-heartbeat-ms")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.raft_heartbeat_ms = try std.fmt.parseInt(u32, argv[i], 10);
+        } else if (std.mem.eql(u8, a, "--raft-snapshot-interval-ms")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.raft_snapshot_interval_ms = try std.fmt.parseInt(u32, argv[i], 10);
         } else {
             return error.Usage;
         }
     }
     if ((out.tls_cert == null) != (out.tls_key == null)) return error.Usage;
+    if (out.raft_enabled) {
+        if (out.raft_peers.len == 0) {
+            std.debug.print("error: --raft-peers required when raft is enabled\n", .{});
+            return error.Usage;
+        }
+        if (out.raft_listen.len == 0) {
+            std.debug.print("error: --raft-listen required when raft is enabled\n", .{});
+            return error.Usage;
+        }
+    }
+    return out;
+}
+
+/// Parse a `--raft-peers` entry. Same `host:port[:voter|:learner]`
+/// shape the loop46 worker uses. See
+/// `src/loop46/main.zig::parsePeerEntry` for the canonical impl.
+fn parsePeerList(allocator: std.mem.Allocator, peers_str: []const u8) ![]kv.RaftPeerAddr {
+    var count: usize = 1;
+    for (peers_str) |b| if (b == ',') { count += 1; };
+    const out = try allocator.alloc(kv.RaftPeerAddr, count);
+    errdefer allocator.free(out);
+
+    var idx: usize = 0;
+    var it = std.mem.splitScalar(u8, peers_str, ',');
+    while (it.next()) |entry| : (idx += 1) {
+        // Try `host:port:mode` first; fall back to `host:port`.
+        const last_colon = std.mem.lastIndexOfScalar(u8, entry, ':') orelse return error.MalformedPeer;
+        const tail = entry[last_colon + 1 ..];
+        if (std.fmt.parseInt(u16, tail, 10)) |port| {
+            const host = try allocator.dupe(u8, entry[0..last_colon]);
+            out[idx] = .{ .host = host, .port = port, .mode = .voter };
+        } else |_| {
+            const mode: kv.RaftPeerMode = if (std.mem.eql(u8, tail, "voter"))
+                .voter
+            else if (std.mem.eql(u8, tail, "learner"))
+                .learner
+            else
+                return error.MalformedPeer;
+            const head = entry[0..last_colon];
+            const port_colon = std.mem.lastIndexOfScalar(u8, head, ':') orelse return error.MalformedPeer;
+            const port = try std.fmt.parseInt(u16, head[port_colon + 1 ..], 10);
+            const host = try allocator.dupe(u8, head[0..port_colon]);
+            out[idx] = .{ .host = host, .port = port, .mode = mode };
+        }
+    }
     return out;
 }
 
@@ -161,6 +259,44 @@ fn loadJwtSecret(allocator: std.mem.Allocator) ![]u8 {
         std.process.exit(2);
     };
     return bytes;
+}
+
+/// Raft thread entry. Drives willemt + the periodic snapshot tick.
+/// Stops when `stop_flag` flips. Same shape as
+/// `loop46/main.zig::raftThreadMain` but for the files-server
+/// cluster.
+fn raftThreadMain(
+    cluster: *kv.Cluster,
+    stop_flag: *std.atomic.Value(bool),
+    snapshot_interval_ms: u32,
+) void {
+    var tick_state: kv.Cluster.TickState = .{};
+    const tick_cfg: kv.Cluster.TickConfig = .{
+        .interval_ns = @as(i64, snapshot_interval_ms) * std.time.ns_per_ms,
+    };
+
+    while (!stop_flag.load(.acquire) and !cluster.raft.stopping.load(.acquire)) {
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        cluster.raft.tick(now_ns) catch |err| {
+            std.log.warn("files-server raft: tick failed: {s}", .{@errorName(err)});
+        };
+
+        if (snapshot_interval_ms > 0) {
+            const out = cluster.tickSnapshot(&tick_state, tick_cfg, now_ns) catch |err| blk: {
+                std.log.warn("files-server raft: snapshot tick failed: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+            if (out) |t| {
+                std.log.info(
+                    "files-server snapshot tick apply_position={d} stamped_stores={d} duration_ms={d}",
+                    .{ t.apply_position, t.stamped_stores, t.duration_ms },
+                );
+            }
+        }
+
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    cluster.raft.drainPending(2 * std.time.ns_per_s) catch {};
 }
 
 fn loadBlobBackend(allocator: std.mem.Allocator) !blob_mod.BlobBackendOwned {
@@ -214,6 +350,67 @@ pub fn main() !void {
         std.debug.print("error: --listen {s}: {s}\n", .{ cli.listen, @errorName(err) });
         std.process.exit(2);
     };
+
+    // ── Optional raft cluster (production.md #1.0/#1.4) ───────
+    //
+    // When --raft-* args are passed, files-server-standalone
+    // brings up its OWN raft consensus group (independent of the
+    // loop46 worker cluster). Manifests will eventually move into
+    // raft-replicated KvStores managed via this Cluster — for now
+    // it stands up alongside the existing HTTP path but doesn't
+    // yet feed manifest writes through it. See
+    // docs/raft-kv-design.md for the consolidation plan.
+    var cluster_opt: ?*kv.Cluster = null;
+    var raft_log_path_buf: ?[:0]u8 = null;
+    defer if (raft_log_path_buf) |p| allocator.free(p);
+    var peers_owned: ?[]kv.RaftPeerAddr = null;
+    defer if (peers_owned) |p| {
+        for (p) |peer| allocator.free(peer.host);
+        allocator.free(p);
+    };
+    if (cli.raft_enabled) {
+        raft_log_path_buf = try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/raft.log.db",
+            .{cli.data_dir},
+            0,
+        );
+        const raft_listen_addr = parseHostPort(allocator, cli.raft_listen) catch |err| {
+            std.debug.print("error: --raft-listen {s}: {s}\n", .{ cli.raft_listen, @errorName(err) });
+            std.process.exit(2);
+        };
+        peers_owned = try parsePeerList(allocator, cli.raft_peers);
+
+        cluster_opt = kv.Cluster.init(.{
+            .allocator = allocator,
+            .data_dir = cli.data_dir,
+            .raft = .{
+                .node_id = cli.raft_node_id,
+                .peers = peers_owned.?,
+                .listen_addr = raft_listen_addr,
+                .raft_log_path = raft_log_path_buf,
+                .election_timeout_ms = cli.raft_election_timeout_ms,
+                .request_timeout_ms = cli.raft_heartbeat_ms,
+            },
+        }) catch |err| {
+            std.debug.print("error: cluster init failed: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+        std.log.info(
+            "files-server: raft enabled — node {d}, peers {s}, listen {s}",
+            .{ cli.raft_node_id, cli.raft_peers, cli.raft_listen },
+        );
+    }
+    defer if (cluster_opt) |c| c.deinit();
+
+    // ── Raft thread (only when --raft-* args set) ─────────────
+    var raft_stop: std.atomic.Value(bool) = .init(false);
+    var raft_thread: ?std.Thread = null;
+    defer if (raft_thread) |t| t.join();
+    if (cluster_opt) |cluster| {
+        raft_thread = try std.Thread.spawn(.{}, raftThreadMain, .{ cluster, &raft_stop, cli.raft_snapshot_interval_ms });
+    }
+    defer raft_stop.store(true, .release);
 
     const handle = try cs.thread.spawn(.{
         .allocator = allocator,

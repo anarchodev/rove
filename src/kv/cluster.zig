@@ -233,18 +233,34 @@ pub const EnvelopeRegistration = struct {
 
 // ── Cluster ────────────────────────────────────────────────────────
 
+/// Subset of `RaftNode.Config` fields the application controls.
+/// Cluster fills in the `apply` callback (so the chicken-and-egg
+/// `cluster→raft→cluster` dependency stays inside the library).
+pub const RaftBootConfig = struct {
+    node_id: u32,
+    peers: []const raft_node_mod.PeerAddr,
+    listen_addr: std.net.Address,
+    raft_log_path: ?[:0]const u8 = null,
+    election_timeout_ms: u32 = 1000,
+    request_timeout_ms: u32 = 200,
+    propose_linger_ns: u64 = 0,
+    propose_linger_max_batch: usize = 128,
+    needs_snapshot: ?raft_node_mod.NeedsSnapshotFn = null,
+    needs_snapshot_ctx: ?*anyopaque = null,
+};
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     /// Root directory for all per-store data. Each store gets its
     /// own subdir at `{data_dir}/{store_id}/`. The raft log lives
     /// at `{data_dir}/raft.log.db`.
     data_dir: []const u8,
-    /// Pre-constructed raft node. The cluster does not own it
-    /// (so the application can wire its own listener / threading).
-    /// Caller must arrange for `RaftNode` to call
-    /// `Cluster.applyOne` as its opaque-bytes apply callback —
-    /// `Cluster.applyCallback` is the ready-to-use function ptr.
-    raft: *RaftNode,
+    /// Raft consensus parameters. Cluster owns the resulting
+    /// `RaftNode` and destroys it on `deinit`. App accesses via
+    /// `cluster.raft`. (Use `initWithExternalRaft` if you need
+    /// to share an externally-owned raft node, e.g. inside a
+    /// test harness.)
+    raft: RaftBootConfig,
     /// Optional user-supplied context pointer threaded through
     /// every `ApplyFn` call. Apps stash their auxiliary state
     /// here (Loop46: schedules_store, schedule_wake, etc.).
@@ -254,7 +270,11 @@ pub const Config = struct {
 pub const Cluster = struct {
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    /// Owned by the cluster (via `init`) OR borrowed (via
+    /// `initWithExternalRaft` for test harnesses). `raft_owned`
+    /// tracks which.
     raft: *RaftNode,
+    raft_owned: bool = true,
     user_ctx: ?*anyopaque,
 
     /// Lazy per-store cache (store_id → *KvStore). Keys are
@@ -276,14 +296,73 @@ pub const Cluster = struct {
     /// `registerEnvelope`.
     handlers: [256]?EnvelopeRegistration = [_]?EnvelopeRegistration{null} ** 256,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: Config) !*Cluster {
+    /// Standard init: cluster owns its RaftNode. The raft node's
+    /// apply ctx points back at this cluster, so apply callbacks
+    /// route through `applyCallback` automatically.
+    pub fn init(cfg: Config) !*Cluster {
+        const self = try cfg.allocator.create(Cluster);
+        errdefer cfg.allocator.destroy(self);
+        self.initFields(cfg.allocator, cfg.data_dir, cfg.user_ctx);
+
+        // Now create the raft node with this cluster as ctx. The
+        // chicken-and-egg dependency is resolved here: `self` is
+        // a stable pointer, the raft node's apply callback uses
+        // it as opaque ctx, but apply doesn't fire until raft.tick
+        // runs (after this function returns).
+        const raft = try RaftNode.init(cfg.allocator, .{
+            .node_id = cfg.raft.node_id,
+            .peers = cfg.raft.peers,
+            .listen_addr = cfg.raft.listen_addr,
+            .raft_log_path = cfg.raft.raft_log_path,
+            .election_timeout_ms = cfg.raft.election_timeout_ms,
+            .request_timeout_ms = cfg.raft.request_timeout_ms,
+            .propose_linger_ns = cfg.raft.propose_linger_ns,
+            .propose_linger_max_batch = cfg.raft.propose_linger_max_batch,
+            .needs_snapshot = cfg.raft.needs_snapshot,
+            .needs_snapshot_ctx = cfg.raft.needs_snapshot_ctx,
+            .apply = .{ .opaque_bytes = .{
+                .apply_fn = applyCallback,
+                .ctx = self,
+            } },
+        });
+        self.raft = raft;
+        self.raft_owned = true;
+        return self;
+    }
+
+    /// Test-only: cluster borrows an externally-owned raft node.
+    /// Caller must arrange for the raft node's apply callback to
+    /// reach `applyCallback(... ctx = self ...)` somehow (or never
+    /// fire). Used by smokes and unit tests that mock raft.
+    pub fn initWithExternalRaft(
+        allocator: std.mem.Allocator,
+        data_dir: []const u8,
+        raft: *RaftNode,
+        user_ctx: ?*anyopaque,
+    ) !*Cluster {
         const self = try allocator.create(Cluster);
         errdefer allocator.destroy(self);
+        self.initFields(allocator, data_dir, user_ctx);
+        self.raft = raft;
+        self.raft_owned = false;
+        return self;
+    }
+
+    fn initFields(
+        self: *Cluster,
+        allocator: std.mem.Allocator,
+        data_dir: []const u8,
+        user_ctx: ?*anyopaque,
+    ) void {
         self.* = .{
             .allocator = allocator,
-            .data_dir = cfg.data_dir,
-            .raft = cfg.raft,
-            .user_ctx = cfg.user_ctx,
+            .data_dir = data_dir,
+            .raft = undefined,
+            .raft_owned = false,
+            .user_ctx = user_ctx,
+            .stores = .empty,
+            .apply_idx = .empty,
+            .handlers = [_]?EnvelopeRegistration{null} ** 256,
         };
         // Built-in handlers.
         self.handlers[ENVELOPE_TYPE_WRITESET] = .{
@@ -294,10 +373,11 @@ pub const Cluster = struct {
             .apply = applyMulti,
             .leader_skip = false,
         };
-        return self;
     }
 
     pub fn deinit(self: *Cluster) void {
+        if (self.raft_owned) self.raft.deinit();
+
         // apply_idx owns its keys independently.
         var idx_it = self.apply_idx.iterator();
         while (idx_it.next()) |e| self.allocator.free(e.key_ptr.*);
@@ -452,6 +532,102 @@ pub const Cluster = struct {
         try reg.apply(self, env, entry_idx, inside_multi, self.user_ctx);
     }
 
+    // ── Snapshot tick (stamp-and-compact) ─────────────────────
+    //
+    // Same shape as `loop46/snapshot.zig::tickRaftCapture` but
+    // generic across whatever stores are registered. Caller
+    // invokes from the raft thread on a periodic timer. See
+    // `docs/production.md` #1.1 for design + bench numbers.
+
+    pub const TickResult = struct {
+        /// willemt commit_idx at the moment of the tick.
+        apply_position: u64,
+        /// Number of stores whose `_apply_state` was stamped
+        /// successfully this tick.
+        stamped_stores: u32,
+        /// Wall-clock duration of the stamp loop + willemt
+        /// begin/end.
+        duration_ms: u64,
+    };
+
+    pub const TickConfig = struct {
+        /// Minimum interval between ticks. Pass 0 to fire on
+        /// every call (typically the caller's own loop already
+        /// rate-limits via this field).
+        interval_ns: i64 = 0,
+    };
+
+    /// Periodic state used by `tickSnapshot`. Caller owns; pass
+    /// the same instance on every tick so the elapsed-time gate
+    /// works.
+    pub const TickState = struct {
+        last_attempt_ns: i64 = 0,
+    };
+
+    /// Per-store stamp loop + willemt begin/end + log compaction.
+    /// Returns null if the tick was skipped (not leader, interval
+    /// not elapsed, or willemt has nothing to snapshot).
+    pub fn tickSnapshot(
+        self: *Cluster,
+        state: *TickState,
+        cfg: TickConfig,
+        now_ns: i64,
+    ) !?TickResult {
+        if (cfg.interval_ns > 0 and now_ns - state.last_attempt_ns < cfg.interval_ns) return null;
+        state.last_attempt_ns = now_ns;
+
+        if (!self.raft.isLeader()) return null;
+        if (!self.raft.beginSnapshotOpaque()) return null;
+        errdefer self.raft.endSnapshotOpaque();
+
+        const start_ns = std.time.nanoTimestamp();
+        const apply_position = self.raft.snapshotLastIdx();
+
+        // Always-refresh-all: stamp every registered store's
+        // `_apply_state` to the current apply_position. Dormant
+        // stores get refreshed too so they don't pin willemt's
+        // compaction floor. Each stamp is one prepared-statement
+        // step in WAL mode + auto-commit fsync (~1ms per store
+        // in fs backend).
+        var stamped: u32 = 0;
+        var idx_it = self.apply_idx.iterator();
+        while (idx_it.next()) |entry| {
+            const store_id = entry.key_ptr.*;
+            const store = self.openStore(store_id) catch |err| {
+                std.log.warn(
+                    "cluster.tickSnapshot: openStore {s} failed: {s}",
+                    .{ store_id, @errorName(err) },
+                );
+                continue;
+            };
+            store.setLastAppliedRaftIdx(apply_position) catch |err| {
+                std.log.warn(
+                    "cluster.tickSnapshot: setLastAppliedRaftIdx for {s} failed: {s}",
+                    .{ store_id, @errorName(err) },
+                );
+                continue;
+            };
+            stamped += 1;
+        }
+
+        self.raft.endSnapshotOpaque();
+        self.raft.compactLogPages() catch |err| {
+            std.log.warn(
+                "cluster.tickSnapshot: compactLogPages failed: {s}",
+                .{@errorName(err)},
+            );
+        };
+
+        const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+        const duration_ms: u64 = @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
+
+        return .{
+            .apply_position = apply_position,
+            .stamped_stores = stamped,
+            .duration_ms = duration_ms,
+        };
+    }
+
     // ── Built-in: writeset envelope ────────────────────────────
 
     fn applyWriteSet(
@@ -502,13 +678,18 @@ pub const Cluster = struct {
             const inner_env = decodeEnvelope(inner_bytes) catch
                 return ApplyError.InvalidEnvelope;
             cluster.dispatch(inner_env, entry_idx, true) catch |err| switch (err) {
-                Error.UnknownEnvelopeType => return ApplyError.InvalidEnvelope,
-                Error.NestedMulti => return ApplyError.InvalidEnvelope,
-                else => |e| {
-                    // Error.Truncated, OutOfMemory, etc. — coerce.
-                    _ = e;
-                    return ApplyError.InvalidEnvelope;
-                },
+                // ApplyError variants pass through unchanged.
+                error.OutOfMemory => return ApplyError.OutOfMemory,
+                error.Sqlite => return ApplyError.Sqlite,
+                error.Io => return ApplyError.Io,
+                error.StoreNotOpen => return ApplyError.StoreNotOpen,
+                error.InvalidEnvelope => return ApplyError.InvalidEnvelope,
+                // Library errors (Truncated, UnknownEnvelopeType,
+                // NestedMulti) coerce to InvalidEnvelope.
+                error.Truncated,
+                error.UnknownEnvelopeType,
+                error.NestedMulti,
+                => return ApplyError.InvalidEnvelope,
             };
         }
     }
@@ -555,14 +736,18 @@ test "multi encode + decode round-trips" {
 }
 
 test "register envelope rejects reserved types" {
-    // Stub Cluster for the test — we only need handlers + raft set.
-    // raft pointer can be undefined here because no apply path runs.
+    // Stub Cluster — raft can stay undefined because we only test
+    // the handler registration table. initFields populates the
+    // built-in writeset + multi handlers.
     var c = Cluster{
         .allocator = testing.allocator,
         .data_dir = "",
         .raft = undefined,
+        .raft_owned = false,
         .user_ctx = null,
     };
+    c.handlers[ENVELOPE_TYPE_WRITESET] = .{ .apply = Cluster.applyWriteSet, .leader_skip = true };
+    c.handlers[ENVELOPE_TYPE_MULTI] = .{ .apply = Cluster.applyMulti, .leader_skip = false };
 
     const fake_handler: ApplyFn = struct {
         fn f(_: *Cluster, _: Envelope, _: u64, _: bool, _: ?*anyopaque) ApplyError!void {}
