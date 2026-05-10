@@ -583,9 +583,13 @@ fn runRaftLoop(args: *RaftThreadArgs) !void {
             };
             if (out) |captured| {
                 var c = captured;
+                // Stable, parseable shape for the scalability bench
+                // (`scripts/snapshot_scalability_bench.sh`) — keep
+                // the field names + ordering. Reuse rate at scale
+                // is the load-bearing scalability property.
                 std.log.info(
-                    "snapshot captured {s} (manifest_key={s})",
-                    .{ c.snap_id, c.manifest_key },
+                    "snapshot captured {s} vacuumed={d} reused={d} duration_ms={d} manifest_key={s}",
+                    .{ c.snap_id, c.vacuumed_count, c.reused_count, c.duration_ms, c.manifest_key },
                 );
                 c.deinit();
             }

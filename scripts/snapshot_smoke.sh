@@ -297,20 +297,20 @@ echo "ok  raft.log.db auto_vacuum=INCREMENTAL"
     "https://app.loop46.localhost:${LEADER_PORT}/_system/release" >/dev/null
 sleep 2
 
-# Pull every manifest from the leader's worker log (each emits
-# `snapshot captured {snap_id} (manifest_key={key})`). Take the
-# last 2 — these will be the most recent snapshots after the
+# Pull every manifest_key from the leader's worker log (each emits
+# `snapshot captured {snap_id} vacuumed=N reused=M duration_ms=K manifest_key=...`).
+# Take the last 2 — these will be the most recent snapshots after the
 # acme-only burst. Both must reference the SAME `quiet/app.db`
 # bytes via the same `db_key`.
 WORKER_LOG="/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out"
-MAPPED=$(grep -oE 'snapshot captured [0-9a-f]+ \(manifest_key=[^)]+\)' "$WORKER_LOG" | tail -2 || true)
+MAPPED=$(grep -oE 'manifest_key=cluster/snapshots/[^ ]+' "$WORKER_LOG" | tail -2 || true)
 if [[ -z "$MAPPED" ]]; then
     echo "FAIL: could not extract recent manifest_key lines from worker log" >&2
     grep 'snapshot captured' "$WORKER_LOG" | tail -5 >&2
     exit 1
 fi
-KEY_RECENT_1=$(echo "$MAPPED" | sed -n '1p' | sed -E 's/.*manifest_key=([^)]+)\)/\1/')
-KEY_RECENT_2=$(echo "$MAPPED" | sed -n '2p' | sed -E 's/.*manifest_key=([^)]+)\)/\1/')
+KEY_RECENT_1=$(echo "$MAPPED" | sed -n '1p' | sed -E 's/^manifest_key=//')
+KEY_RECENT_2=$(echo "$MAPPED" | sed -n '2p' | sed -E 's/^manifest_key=//')
 [[ -n "$KEY_RECENT_1" && -n "$KEY_RECENT_2" && "$KEY_RECENT_1" != "$KEY_RECENT_2" ]] || {
     echo "FAIL: need 2 distinct recent manifest keys, got '$KEY_RECENT_1' and '$KEY_RECENT_2'" >&2
     exit 1

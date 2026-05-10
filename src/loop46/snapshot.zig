@@ -105,10 +105,29 @@ pub const Manifest = struct {
 /// Result of `capture` — the new snapshot's id + the bytes of the
 /// manifest object that landed in the snapshot store. Caller can
 /// log the id, hand the manifest to a follower, etc.
+///
+/// `vacuumed_count` + `reused_count` are populated for benchmark
+/// + ops visibility — they answer "how much work did this pass
+/// do?" Reuse rate at scale is the load-bearing scalability
+/// property (see `scripts/snapshot_scalability_bench.sh`).
 pub const Captured = struct {
     snap_id: []u8,
     manifest_key: []u8,
     manifest_bytes: []u8,
+    /// Tenants whose db was VACUUM-INTO'd + uploaded fresh this
+    /// pass (apply-idx advanced past prev snapshot_idx, OR no
+    /// prev_manifest, OR prev_manifest had no entry for this id).
+    vacuumed_count: u32,
+    /// Tenants whose entry was reused from `prev_manifest` by
+    /// reference (apply-idx unchanged since prev). The
+    /// always-refresh property still bumps their `snapshot_idx`
+    /// to the current `apply_position`, but the bytes don't get
+    /// re-uploaded.
+    reused_count: u32,
+    /// Wall-clock duration of the capture pass — from the start
+    /// of the per-tenant loop to the manifest PUT returning.
+    /// Excludes the willemt begin/end bracket overhead.
+    duration_ms: u64,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Captured) void {
@@ -170,6 +189,8 @@ pub fn capture(
     apply_position: u64,
     willemt_term: u64,
 ) !Captured {
+    const start_ns = std.time.nanoTimestamp();
+
     const snap_id = try mintSnapId(allocator);
     errdefer allocator.free(snap_id);
 
@@ -180,6 +201,9 @@ pub fn capture(
 
     var tenants: std.ArrayListUnmanaged(TenantEntry) = .empty;
     errdefer freeTenantList(allocator, &tenants);
+
+    var vacuumed_count: u32 = 0;
+    var reused_count: u32 = 0;
 
     // ── Per-tenant captures ─────────────────────────────────────
     for (tenants_in) |t| {
@@ -209,11 +233,13 @@ pub fn capture(
                             .db_size = prev_entry.db_size,
                             .snapshot_idx = apply_position,
                         });
+                        reused_count += 1;
                         continue;
                     }
                 }
             }
         }
+        vacuumed_count += 1;
 
         const tmp_path = try std.fmt.allocPrintSentinel(
             allocator,
@@ -280,7 +306,9 @@ pub fn capture(
                 .db_size = prev_root.db_size,
                 .snapshot_idx = apply_position,
             };
+            reused_count += 1;
         } else {
+            vacuumed_count += 1;
             const tmp_path = try std.fmt.allocPrintSentinel(
                 allocator,
                 "{s}/__root__.db",
@@ -346,11 +374,17 @@ pub fn capture(
 
     snapshot_store.put(manifest_key, manifest_bytes) catch return Error.Backend;
 
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const duration_ms: u64 = @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
+
     return .{
         .allocator = allocator,
         .snap_id = snap_id,
         .manifest_key = manifest_key,
         .manifest_bytes = manifest_bytes,
+        .vacuumed_count = vacuumed_count,
+        .reused_count = reused_count,
+        .duration_ms = duration_ms,
     };
 }
 
