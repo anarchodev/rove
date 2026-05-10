@@ -944,9 +944,18 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
 
     // Best-effort initial load. Read `_deploy/current` from the
     // tenant's app.db (set by release POST + replicated via raft);
-    // load that manifest from manifest_backend. If absent, log and
-    // leave `bytecodes` empty — requests get 503 until the dashboard
-    // pushes a release.
+    // load that manifest from manifest_backend. If absent or
+    // unreachable, log and leave `bytecodes` empty — requests get
+    // 503 until either the dashboard pushes a release or the
+    // periodic reload retry succeeds.
+    //
+    // Any error besides NoDeployment / InvalidManifest used to
+    // crash the worker. That's the wrong tradeoff: a transient
+    // network hiccup against the colocated files-server (rc=35
+    // connection-reset, Sqlite contention on a shared backend
+    // during cold-start burst) shouldn't take down the whole
+    // worker thread + every tenant on it. We absorb the failure
+    // here and let the next release POST / reload tick retry.
     reloadAllBytecodes(tc) catch |err| switch (err) {
         error.NoDeployment => {
             std.log.info(
@@ -954,7 +963,12 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
                 .{tc.instance_id},
             );
         },
-        else => return err,
+        else => {
+            std.log.warn(
+                "rove-js: tenant {s} initial manifest load failed: {s} — 503 until next reload tick",
+                .{ tc.instance_id, @errorName(err) },
+            );
+        },
     };
 
     return tc;
