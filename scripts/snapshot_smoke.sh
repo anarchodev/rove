@@ -169,29 +169,94 @@ discover_leader "app.loop46.localhost" "$PERIODIC_TOKEN" || exit 1
 echo "ok  periodic-loop leader: node $LEADER_IDX at $LEADER_HTTP"
 LEADER_DIR="${DATA_DIRS[$LEADER_IDX]}"
 
-# Drive 5 raft commits so willemt has > 1 log entry (begin_snapshot
-# returns -1 below that threshold — willemt's invariant, not ours).
-for i in 1 2 3 4 5; do
+# Drive a first batch of raft commits so willemt has > 1 log entry
+# (begin_snapshot returns -1 below that threshold — willemt's invariant,
+# not ours), then wait for the periodic capture loop to fire at least
+# once. The PRE_BURST commits are what the FIRST snapshot pass compacts
+# away, so we record raft.log.db's row count + file size after that
+# bootstrap window — that's our baseline for "compaction is bounded."
+PRE_BURST=20
+for i in $(seq 1 $PRE_BURST); do
     "${CURL[@]}" \
         -H "Authorization: Bearer $PERIODIC_TOKEN" \
         -H "Content-Type: application/json" \
         -d "{\"tenant_id\":\"acme\",\"dep_id\":$i}" \
         "https://app.loop46.localhost:${LEADER_PORT}/_system/release" >/dev/null
 done
-
-# Wait for at least 2 capture intervals so we can verify the loop
-# actually fires (not just bootstraps once).
 sleep 3
 
-# Snapshots land in S3 — verify via the worker log's "snapshot
-# captured" line which is emitted by the raft thread after each pass.
 CAPTURE_LOGS=$(grep -c 'snapshot captured ' "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out")
 [[ "$CAPTURE_LOGS" -ge 1 ]] || {
     echo "FAIL: no 'snapshot captured' log lines on leader" >&2
     tail -30 "/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out" >&2
     exit 1
 }
-echo "ok  worker logged $CAPTURE_LOGS capture(s)"
+echo "ok  worker logged $CAPTURE_LOGS capture(s) after burst-1"
+
+# ── 6. Verify raft.log.db actually compacts (rows + file size) ────
+#
+# Without `compactLogPages`, willemt's `cbLogPoll` still DELETEs rows
+# but the SQLite file keeps growing forever — the freed pages stay on
+# the freelist. Drive a much larger second burst, wait for snapshots,
+# then verify both row count and file size are bounded.
+RAFT_LOG="$LEADER_DIR/raft.log.db"
+[[ -f "$RAFT_LOG" ]] || { echo "FAIL: $RAFT_LOG missing" >&2; exit 1; }
+
+ROWS_BASELINE=$(sqlite3 "$RAFT_LOG" "SELECT COUNT(*) FROM raft_log;")
+SIZE_BASELINE=$(stat -c %s "$RAFT_LOG" 2>/dev/null || stat -f %z "$RAFT_LOG")
+echo "ok  baseline after burst-1: rows=$ROWS_BASELINE size=$SIZE_BASELINE bytes"
+
+# Drive a much larger second burst — 5x the first. Without
+# compaction, rows + size would grow ~5x.
+POST_BURST=100
+for i in $(seq $((PRE_BURST + 1)) $((PRE_BURST + POST_BURST))); do
+    "${CURL[@]}" \
+        -H "Authorization: Bearer $PERIODIC_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"tenant_id\":\"acme\",\"dep_id\":$i}" \
+        "https://app.loop46.localhost:${LEADER_PORT}/_system/release" >/dev/null
+done
+# Wait long enough for the periodic loop (--snapshot-interval-ms 500)
+# to fire at least 3 more times after the burst settles.
+sleep 4
+
+ROWS_AFTER=$(sqlite3 "$RAFT_LOG" "SELECT COUNT(*) FROM raft_log;")
+SIZE_AFTER=$(stat -c %s "$RAFT_LOG" 2>/dev/null || stat -f %z "$RAFT_LOG")
+echo "ok  after burst-2 (+$POST_BURST commits): rows=$ROWS_AFTER size=$SIZE_AFTER bytes"
+
+# Row count should be bounded — at most a small handful of post-snapshot
+# entries, NOT proportional to total commits (PRE_BURST + POST_BURST = 120).
+# Allow a generous ceiling (~PRE_BURST) to absorb in-flight entries
+# captured between begin_snapshot and end_snapshot on the last pass.
+if [[ "$ROWS_AFTER" -gt $PRE_BURST ]]; then
+    echo "FAIL: raft_log row count ($ROWS_AFTER) > $PRE_BURST after compaction" >&2
+    echo "      compaction is NOT bounded — willemt's log_poll chain or" >&2
+    echo "      RaftLog.truncateBefore is not firing as expected." >&2
+    exit 1
+fi
+echo "ok  raft_log row count bounded after compaction ($ROWS_AFTER <= $PRE_BURST)"
+
+# File size growth should also be bounded. With auto_vacuum=INCREMENTAL +
+# compactPages, the file should be at most ~2x the baseline (some
+# slack for WAL fragmentation between checkpoints). Without
+# auto_vacuum + incremental_vacuum, growth would be roughly proportional
+# to total commits — well past 2x.
+SIZE_CEILING=$((SIZE_BASELINE * 3))
+if [[ "$SIZE_AFTER" -gt "$SIZE_CEILING" ]]; then
+    echo "FAIL: raft.log.db size ($SIZE_AFTER) > ${SIZE_CEILING} (3x baseline $SIZE_BASELINE)" >&2
+    echo "      incremental_vacuum is not releasing freed pages — check" >&2
+    echo "      auto_vacuum=INCREMENTAL was set on the fresh DB and" >&2
+    echo "      RaftNode.compactLogPages() is being called after each" >&2
+    echo "      successful endSnapshotOpaque." >&2
+    exit 1
+fi
+echo "ok  raft.log.db file size bounded after compaction ($SIZE_AFTER <= ${SIZE_CEILING})"
+
+# Confirm the auto_vacuum mode is actually INCREMENTAL on disk — guards
+# against a future regression where someone disables the PRAGMA.
+AV_MODE=$(sqlite3 "$RAFT_LOG" "PRAGMA auto_vacuum;")
+[[ "$AV_MODE" == "2" ]] || { echo "FAIL: auto_vacuum=$AV_MODE on raft.log.db (want 2 = INCREMENTAL)" >&2; exit 1; }
+echo "ok  raft.log.db auto_vacuum=INCREMENTAL"
 
 echo ""
 echo "PASS snapshot smoke"

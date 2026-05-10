@@ -48,6 +48,12 @@ pub const Error = error{
     JournalMode,
     /// `PRAGMA synchronous=FULL` didn't take or failed to report back.
     SynchronousMode,
+    /// `PRAGMA auto_vacuum=INCREMENTAL` didn't stick — the database was
+    /// created before this PRAGMA was set, and converting it requires
+    /// a one-shot `VACUUM`. Operator runs `sqlite3 {data_dir}/raft.log.db
+    /// 'PRAGMA auto_vacuum=INCREMENTAL; VACUUM;'` once with the worker
+    /// stopped; the next worker start will pass this check.
+    AutoVacuumMode,
     OutOfMemory,
 };
 
@@ -113,6 +119,23 @@ pub const RaftLog = struct {
             return Error.Sqlite;
         }
         errdefer _ = c.sqlite3_close(db.?);
+
+        // INCREMENTAL auto_vacuum: when willemt's snapshot pass drives
+        // `cbLogPoll` → `truncateBefore` deletes, the freed pages enter
+        // the freelist instead of staying allocated to the file. A
+        // periodic `incremental_vacuum` (called from the raft thread
+        // after each successful end_snapshot — see `compactPages`)
+        // releases them back to the filesystem so `raft.log.db` doesn't
+        // grow unbounded.
+        //
+        // **Must be set before any other PRAGMA that allocates a page**
+        // (including `journal_mode=WAL`, which creates a -wal sidecar
+        // and writes the first page). Pre-existing databases that
+        // already have auto_vacuum=NONE need a one-shot `VACUUM` to
+        // convert; we surface that via `Error.AutoVacuumMode` rather
+        // than silently running a potentially-multi-second VACUUM at
+        // startup. Operators handle the migration explicitly.
+        try pinAutoVacuum(db.?);
 
         try pinDurability(db.?);
         _ = c.sqlite3_exec(db, "PRAGMA busy_timeout=5000;", null, null, null);
@@ -221,6 +244,42 @@ pub const RaftLog = struct {
         if (rc != c.SQLITE_DONE) return Error.Sqlite;
     }
 
+    /// Release freed pages back to the filesystem after a snapshot
+    /// compaction pass. `truncateBefore` (driven by willemt's
+    /// `cbLogPoll` chain inside `raft_end_snapshot`) deletes rows but
+    /// leaves the pages on the freelist; `incremental_vacuum` returns
+    /// them to the OS so `raft.log.db` doesn't grow unbounded.
+    ///
+    /// `max_pages` caps the work done in this call (each page is the
+    /// db's page size, default 4 KB). Pass 0 to release every free
+    /// page; under the snapshot cadence we'd typically want bounded
+    /// work, but the raft thread is already paused for the
+    /// snapshot capture so a full release fits the same window.
+    pub fn compactPages(self: *RaftLog, max_pages: u32) Error!void {
+        var buf: [64]u8 = undefined;
+        const sql = if (max_pages == 0)
+            "PRAGMA incremental_vacuum;"
+        else
+            std.fmt.bufPrintZ(&buf, "PRAGMA incremental_vacuum({d});", .{max_pages}) catch
+                return Error.Sqlite;
+        if (c.sqlite3_exec(self.db, sql.ptr, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
+    }
+
+    /// Count of currently-live entries in the raft log. After a
+    /// snapshot pass this drops to the number of post-snapshot
+    /// entries; the smoke test uses this to verify compaction is
+    /// actually firing (vs. just the on-disk file shrinking, which
+    /// could also be a noop if no entries were ever there).
+    pub fn rowCount(self: *RaftLog) Error!u64 {
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT COUNT(*) FROM raft_log;", -1, &st, null) != c.SQLITE_OK) {
+            return Error.Sqlite;
+        }
+        defer _ = c.sqlite3_finalize(st);
+        if (c.sqlite3_step(st) != c.SQLITE_ROW) return Error.Sqlite;
+        return @bitCast(c.sqlite3_column_int64(st, 0));
+    }
+
     /// Returns (index, term) of the last entry, or (0, 0) if the log is empty.
     pub fn last(self: *RaftLog) Error!struct { index: u64, term: u64 } {
         const st = self.stmt_last;
@@ -301,6 +360,27 @@ fn pinDurability(db: *c.sqlite3) Error!void {
         const sync_level = c.sqlite3_column_int(st, 0);
         if (sync_level != 2) return Error.SynchronousMode; // 2 = FULL
     }
+}
+
+/// Set INCREMENTAL auto_vacuum and confirm it took. The PRAGMA only
+/// takes effect on a fresh database (before any tables exist) — for
+/// already-populated databases, SQLite reports the existing mode and
+/// silently ignores the SET. We refuse to open in that case so the
+/// caller sees a clear migration signal instead of silently growing
+/// the file forever.
+fn pinAutoVacuum(db: *c.sqlite3) Error!void {
+    // SET first; SQLite's behavior is to ignore the SET on an existing
+    // database while still returning OK. The verify-by-read below is
+    // what catches the silent-ignore case.
+    if (c.sqlite3_exec(db, "PRAGMA auto_vacuum=INCREMENTAL;", null, null, null) != c.SQLITE_OK) {
+        return Error.AutoVacuumMode;
+    }
+    var st: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, "PRAGMA auto_vacuum;", -1, &st, null) != c.SQLITE_OK) return Error.Sqlite;
+    defer _ = c.sqlite3_finalize(st);
+    if (c.sqlite3_step(st) != c.SQLITE_ROW) return Error.AutoVacuumMode;
+    const av_mode = c.sqlite3_column_int(st, 0);
+    if (av_mode != 2) return Error.AutoVacuumMode; // 2 = INCREMENTAL
 }
 
 // ── tests ──────────────────────────────────────────────────────────────

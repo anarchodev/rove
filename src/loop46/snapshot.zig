@@ -23,10 +23,13 @@
 //! - Always re-VACUUMs every tenant. The "by-reference reuse"
 //!   optimization (manifest entry references prior snapshot's
 //!   db_key when nothing changed) lands in step 3b.
-//! - Doesn't touch raft log compaction yet (the
-//!   `raft_begin_snapshot` / `raft_end_snapshot` calls). That
-//!   wiring lands alongside step 4 (follower load + restore CLI)
-//!   so the two pieces ship together.
+//! - **Brackets capture with `raft.beginSnapshotOpaque()` /
+//!   `raft.endSnapshotOpaque()`** so willemt's `cbLogPoll` chain
+//!   deletes compacted entries from `raft.log.db`, then calls
+//!   `raft.compactLogPages()` to release those freed pages back to
+//!   the filesystem (`PRAGMA incremental_vacuum`). Without the
+//!   compactPages call, the DELETEs would just leave free pages
+//!   on the freelist and the file would grow unbounded.
 //!
 //! ## Manifest schema
 //!
@@ -530,6 +533,18 @@ pub fn tickRaftCapture(
     );
 
     raft.endSnapshotOpaque();
+
+    // Release pages freed by willemt's `cbLogPoll` chain. Without
+    // this, `truncateBefore`'s DELETEs leave the pages on the
+    // freelist and `raft.log.db` grows unbounded — defeating the
+    // whole point of bracketing the capture with begin/end.
+    raft.compactLogPages() catch |err| {
+        std.log.warn(
+            "snapshot: compactLogPages failed: {s} (raft.log.db will not shrink this pass)",
+            .{@errorName(err)},
+        );
+    };
+
     return captured;
 }
 

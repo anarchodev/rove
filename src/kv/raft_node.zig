@@ -809,6 +809,30 @@ pub const RaftNode = struct {
         _ = c.raft_end_snapshot(self.raft);
     }
 
+    /// Release pages freed by the prior `endSnapshotOpaque` back to
+    /// the filesystem. `endSnapshotOpaque` drives willemt's
+    /// `raft_poll_entry` loop, which calls our `cbLogPoll` →
+    /// `RaftLog.truncateBefore` → DELETE for each compacted entry.
+    /// The DELETEs leave free pages on the freelist; this call runs
+    /// `PRAGMA incremental_vacuum` to actually shrink `raft.log.db`.
+    ///
+    /// MUST be called from the raft thread (the only thread that owns
+    /// the `RaftLog` connection). Returns silently when there's no
+    /// raft log persistence (the in-memory test path).
+    pub fn compactLogPages(self: *RaftNode) !void {
+        const rl = self.raft_log orelse return;
+        try rl.compactPages(0);
+    }
+
+    /// Live row count in `raft_log`. Used by smoke tests to verify
+    /// compaction actually fired. Same threading rules as
+    /// `compactLogPages`. Returns 0 when there's no raft-log
+    /// persistence.
+    pub fn raftLogRowCount(self: *RaftNode) !u64 {
+        const rl = self.raft_log orelse return 0;
+        return rl.rowCount();
+    }
+
     /// willemt's view of the highest log index covered by the
     /// most recent snapshot. Useful for tests + the
     /// `send_snapshot` callback (step C) which compares against
