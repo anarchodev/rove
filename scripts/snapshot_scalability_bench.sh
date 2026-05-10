@@ -58,6 +58,12 @@ done
 PREFIX="${PREFIX:-/tmp/rove-snap-bench}"
 HTTP_BASE="${HTTP_BASE:-8470}"
 RAFT_BASE="${RAFT_BASE:-40470}"
+# Files-server cluster ports — distinct from loop46's so both can
+# co-exist on the same machine. Production.md #1.4 step 4: loop46
+# fetches manifests from this cluster over HTTP/2 instead of S3.
+FS_HTTP_BASE="${FS_HTTP_BASE:-9090}"
+FS_RAFT_BASE="${FS_RAFT_BASE:-41090}"
+FS_PREFIX="${FS_PREFIX:-/tmp/rove-snap-bench-fs}"
 ROOT_TOKEN=ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -74,10 +80,119 @@ SMOKE_TAG=snap-bench
 SMOKE_PROTO=https
 init_cluster_addrs "$PREFIX" "$HTTP_BASE" "$RAFT_BASE"
 
-# ── Phase A: seed N_TOTAL tenants ──────────────────────────────────
-echo "phase A: seeding $N_TOTAL tenants on each of 3 nodes…"
+# Source .env for AWS / S3 creds — the files-server we're spawning
+# below still needs them at startup (file-blobs go to S3 even
+# though manifests now live in the cluster store). Same approach
+# as scripts/files_server_raft_smoke.sh.
+__bench_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "${__bench_repo_root}/.env" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "${__bench_repo_root}/.env"
+    set +a
+fi
+export S3_KEY_PREFIX_BASE="${S3_KEY_PREFIX_BASE:-snap-bench-$(hostname)-$(id -u)/}"
+
+FS_BIN="${FS_BIN:-./zig-out/bin/files-server-standalone}"
+if [[ ! -x "$FS_BIN" ]]; then
+    echo "error: $FS_BIN missing — run 'zig build install' first" >&2
+    exit 2
+fi
+
+FS_HTTP_ADDRS=(); FS_RAFT_ADDRS=(); FS_DATA_DIRS=()
+for i in 0 1 2; do
+    FS_HTTP_ADDRS+=("127.0.0.1:$((FS_HTTP_BASE + i))")
+    FS_RAFT_ADDRS+=("127.0.0.1:$((FS_RAFT_BASE + i))")
+    FS_DATA_DIRS+=("${FS_PREFIX}-${i}")
+done
+rm -rf "${FS_DATA_DIRS[@]}"
+FS_PEERS_CSV=$(IFS=,; echo "${FS_RAFT_ADDRS[*]}")
+
+# Shared JWT secret across loop46 + files-server (the dashboard +
+# inter-service paths verify with the same key on both sides).
+export LOOP46_SERVICES_JWT_SECRET=$(head -c32 /dev/urandom | xxd -p | tr -d '\n')
+export LOOP46_ROOT_TOKEN="$ROOT_TOKEN"
+
+# ── Phase A: spawn files-server cluster ────────────────────────────
+echo "phase A: starting 3-node files-server cluster on ${FS_PEERS_CSV}…"
+FS_PIDS=()
+for i in 0 1 2; do
+    "$FS_BIN" \
+        --data-dir "${FS_DATA_DIRS[$i]}" \
+        --listen "${FS_HTTP_ADDRS[$i]}" \
+        --tls-cert "$TLS_CERT" \
+        --tls-key "$TLS_KEY" \
+        --raft-node-id "$i" \
+        --raft-peers "$FS_PEERS_CSV" \
+        --raft-listen "${FS_RAFT_ADDRS[$i]}" \
+        --raft-election-timeout-ms 200 \
+        --raft-heartbeat-ms 50 \
+        --max-connections 4096 \
+        >"/tmp/${SMOKE_TAG}-fs-${i}.out" 2>&1 &
+    FS_PIDS+=($!)
+done
+sleep 2
+
+# Mint a JWT for files-server inter-service calls (same secret as
+# loop46's services tokens; same 5-minute expiry shape).
+mint_jwt() {
+    LOOP46_SERVICES_JWT_SECRET="$LOOP46_SERVICES_JWT_SECRET" python3 - <<'PY'
+import base64, hmac, hashlib, json, os, time
+secret = bytes.fromhex(os.environ["LOOP46_SERVICES_JWT_SECRET"])
+header = b'{"alg":"HS256","typ":"JWT"}'
+payload = json.dumps({"exp": int(time.time() * 1000) + 60 * 60 * 1000}).encode()
+def b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+signing_input = b64u(header) + "." + b64u(payload)
+sig = hmac.new(secret, signing_input.encode(), hashlib.sha256).digest()
+print(signing_input + "." + b64u(sig))
+PY
+}
+FS_JWT=$(mint_jwt)
+
+# Find the files-server leader.
+FS_LEADER_IDX=""
+for tries in $(seq 1 30); do
+    for i in 0 1 2; do
+        port="${FS_HTTP_ADDRS[$i]##*:}"
+        code=$(curl -sS --cacert "$CACERT" --max-time 2 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $FS_JWT" \
+            "https://127.0.0.1:${port}/_system/leader" 2>/dev/null || echo 000)
+        if [[ "$code" == "200" ]]; then
+            FS_LEADER_IDX="$i"
+            break 2
+        fi
+    done
+    sleep 0.3
+done
+if [[ -z "$FS_LEADER_IDX" ]]; then
+    echo "FAIL: no files-server leader elected after 9s" >&2
+    for i in 0 1 2; do
+        echo "--- fs node $i log ---" >&2
+        tail -20 "/tmp/${SMOKE_TAG}-fs-${i}.out" >&2
+    done
+    exit 1
+fi
+FS_LEADER_PORT="${FS_HTTP_ADDRS[$FS_LEADER_IDX]##*:}"
+echo "  files-server leader: node $FS_LEADER_IDX at 127.0.0.1:${FS_LEADER_PORT}"
+
+# ── Phase A.1: seed N_TOTAL tenants (no S3 manifest PUTs) ─────────
+echo "phase A.1: seeding $N_TOTAL tenants on each of 3 loop46 nodes…"
 SEED_MANIFEST=$(mktemp --suffix=.json)
-trap 'rm -f "$SEED_MANIFEST"' EXIT
+trap '
+    rm -f "$SEED_MANIFEST"
+    for p in "${PIDS[@]:-}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${PIDS[@]:-}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+    for p in "${FS_PIDS[@]}"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
+    for p in "${FS_PIDS[@]}"; do
+        [ -n "$p" ] && wait "$p" 2>/dev/null || true
+    done
+' EXIT
 {
     echo -n '{"tenants":['
     for (( i = 0; i < N_TOTAL; i++ )); do
@@ -88,37 +203,87 @@ trap 'rm -f "$SEED_MANIFEST"' EXIT
 } > "$SEED_MANIFEST"
 
 t0=$(date +%s)
-# Seed strategy:
-#   - Node 0 first (alone) — its bootstrapTenant pushes the
-#     per-tenant deployment manifest 0001 to S3. Slow path.
-#   - Nodes 1 + 2 in parallel afterwards — their bootstrapTenant
-#     hits the S3 fast-path (manifest exists), so they only do
-#     the local dir + app.db work.
-#
-# Naive parallel-all-3 racing approach hits OVH's
-# OperationAborted (409) on the conditional PUT of the same
-# manifest from 3 different processes; the retries dominate
-# total time.
-echo "  seeding node 0 (creates S3 manifests)…"
-"$BIN" seed --data-dir "${DATA_DIRS[0]}" --manifest "$SEED_MANIFEST" >/dev/null
-t_n0=$(date +%s)
-echo "  node 0 seeded in $((t_n0 - t0))s; nodes 1+2 in parallel (S3 fast-path)…"
+# Cluster-backed manifest mode: --no-files-bootstrap skips the
+# legacy per-tenant S3 PUT entirely. seed just creates per-tenant
+# dirs + writes `_deploy/current = 1`. The manifest goes into
+# files-server's cluster store via the next phase.
 SEED_PIDS=()
-for d in "${DATA_DIRS[@]:1}"; do
-    "$BIN" seed --data-dir "$d" --manifest "$SEED_MANIFEST" >/dev/null &
+for d in "${DATA_DIRS[@]}"; do
+    "$BIN" seed --data-dir "$d" --manifest "$SEED_MANIFEST" --no-files-bootstrap --deploy-id 1 >/dev/null &
     SEED_PIDS+=($!)
 done
 for p in "${SEED_PIDS[@]}"; do wait "$p"; done
 t1=$(date +%s)
-echo "  seeded $N_TOTAL × 3 dirs in $((t1 - t0))s total"
+echo "  seeded $N_TOTAL × 3 dirs in $((t1 - t0))s (no-files-bootstrap)"
 rm -f "$SEED_MANIFEST"
 
+# ── Phase A.2: PUT empty manifest 1 for every tenant ──────────────
+#
+# Each PUT is one raft propose through the files-server cluster.
+# Sequential at first (curl pipelining keeps the TCP+TLS warm),
+# can shard parallelism when N_TOTAL is large.
+echo "phase A.2: PUT empty manifest 1 for $N_TOTAL tenants via files-server leader…"
+# manifest_json.zig schema: {v, deployment_id, entries}. Empty
+# entries = no handlers + no static files → reload returns
+# success with no bytecodes. Worker can boot / reload without
+# logging InvalidManifest warnings.
+#
+# Single curl invocation reads a `--config` file with N requests,
+# each separated by `next`. curl reuses the TLS connection across
+# them — at parallel-curl-per-PUT (xargs) we'd open N fresh TLS
+# handshakes and the rove-h2 server's per-second new-connection
+# accept budget caps out. Persistent connection sidesteps that.
+EMPTY_MANIFEST_FILE=$(mktemp --suffix=.json)
+printf '{"v":1,"deployment_id":1,"entries":[]}' > "$EMPTY_MANIFEST_FILE"
+CURL_CONFIG=$(mktemp --suffix=.curlcfg)
+# `next` separates requests; the last must NOT be followed by
+# `next` or curl errors with "no URL specified". Build with
+# leading `next` (skipped on the first iteration) instead of a
+# trailing one.
+{
+    echo "silent"
+    echo "max-time = 60"
+    echo "connect-timeout = 5"
+    echo "cacert = \"${CACERT}\""
+    for (( i = 0; i < N_TOTAL; i++ )); do
+        if (( i > 0 )); then echo "next"; fi
+        tid=$(printf "t%05d" "$i")
+        cat <<CFG
+url = "https://127.0.0.1:${FS_LEADER_PORT}/${tid}/deployments/1/manifest.bin"
+request = "PUT"
+data-binary = "@${EMPTY_MANIFEST_FILE}"
+header = "Authorization: Bearer ${FS_JWT}"
+header = "Content-Type: application/octet-stream"
+CFG
+    done
+} > "$CURL_CONFIG"
+
+t_mf_start=$(date +%s)
+CURL_OUT="/tmp/${SMOKE_TAG}-put-out.log"
+# Bodies stream to stdout. Each successful PUT's body is exactly
+# `committed at seq=N\n`. Counting those lines = success count.
+# Per-request `-w` write-outs only fire for the LAST request when
+# config-file `next`-separated; bodies are reliable per-request.
+curl -K "$CURL_CONFIG" > "$CURL_OUT" 2>&1 || true
+t_mf_end=$(date +%s)
+rm -f "$EMPTY_MANIFEST_FILE" "$CURL_CONFIG"
+
+ok_count=$(grep -c '^committed at seq=' "$CURL_OUT" || echo 0)
+echo "  $N_TOTAL manifest PUTs (raft-replicated) in $((t_mf_end - t_mf_start))s — $ok_count committed"
+if (( ok_count != N_TOTAL )); then
+    echo "FAIL: $((N_TOTAL - ok_count)) PUTs did not commit (no 'committed at seq=' line)" >&2
+    grep -v '^committed at seq=' "$CURL_OUT" | head -10 >&2
+    exit 1
+fi
+rm -f "$CURL_OUT"
+
 # ── Phase B: spawn workers ─────────────────────────────────────────
-export LOOP46_SERVICES_JWT_SECRET=$(head -c32 /dev/urandom | xxd -p | tr -d '\n')
-export LOOP46_ROOT_TOKEN="$ROOT_TOKEN"
+# (LOOP46_SERVICES_JWT_SECRET + LOOP46_ROOT_TOKEN already exported
+# above so the files-server cluster boot used the same shared
+# secrets.)
 
 PIDS=()
-echo "phase B: starting 3-node cluster, --snapshot-interval-ms=$SNAPSHOT_INTERVAL_MS…"
+echo "phase B: starting 3-node loop46 cluster, --snapshot-interval-ms=$SNAPSHOT_INTERVAL_MS…"
 for i in 0 1 2; do
     "$BIN" worker \
         --node-id "$i" \
@@ -131,19 +296,12 @@ for i in 0 1 2; do
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
         --workers 1 \
+        --files-internal-base "https://${FS_HTTP_ADDRS[0]}" \
+        --files-internal-insecure-tls \
         "${RAFT_TIMING_FLAGS[@]}" \
         >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
     PIDS+=($!)
 done
-trap '
-    for p in "${PIDS[@]}"; do
-        [ -n "$p" ] && kill "$p" 2>/dev/null || true
-    done
-    for p in "${PIDS[@]}"; do
-        [ -n "$p" ] && wait "$p" 2>/dev/null || true
-    done
-    rm -f "$SEED_MANIFEST"
-' EXIT
 sleep 2
 
 RESOLVE=()
