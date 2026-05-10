@@ -52,6 +52,7 @@ pub const penalty = @import("penalty.zig");
 pub const limiter = @import("limiter.zig");
 pub const router = @import("router.zig");
 pub const callback_dispatch = @import("callback_dispatch.zig");
+pub const config_mirror = @import("config_mirror.zig");
 pub const internal_schedules = @import("internal_schedules.zig");
 pub const reserved = @import("reserved.zig");
 pub const session = @import("session.zig");
@@ -100,6 +101,7 @@ test {
     _ = limiter;
     _ = router;
     _ = callback_dispatch;
+    _ = config_mirror;
     _ = internal_schedules;
     _ = reserved;
     _ = session;

@@ -21,6 +21,9 @@ const log_mod = @import("rove-log");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
 const schedule_server_mod = @import("rove-schedule-server");
+const blob_mod = @import("rove-blob");
+const files_server_mod = @import("rove-files-server");
+const config_mirror = @import("config_mirror.zig");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const router_mod = @import("router.zig");
@@ -524,6 +527,70 @@ fn handleRelease(
         try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
         return;
     };
+
+    // Mirror `_config/{...}/{name}.json` files from the deployment
+    // tree into kv at `_config/{...}/{name}`. Stages writes into the
+    // SAME txn + writeset as `_deploy/current` so the release pointer
+    // and config rows commit / replicate together (atomic from the
+    // handler's perspective). Skipped on errors that look like
+    // "no manifest" — the release is still valid; only library
+    // `fromConfig(...)` lookups will fail until a fresh deploy fixes
+    // the missing config row.
+    var manifest_loaded = files_server_mod.loadDeployment(
+        allocator,
+        worker.blob_backend_cfg,
+        parsed.value.tenant_id,
+        parsed.value.dep_id,
+    ) catch |err| blk: {
+        std.log.warn(
+            "release: skipping config mirror for {s}/{x:0>16} — manifest load failed: {s}",
+            .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
+        );
+        break :blk null;
+    };
+    if (manifest_loaded) |*manifest| {
+        defer manifest.deinit();
+        var file_blobs_opt: ?blob_mod.BlobBackend = blob_mod.BlobBackend.openPerTenant(
+            allocator,
+            worker.blob_backend_cfg,
+            parsed.value.tenant_id,
+            "file-blobs",
+        ) catch |err| open_blk: {
+            std.log.warn(
+                "release: skipping config mirror for {s} — file-blobs open failed: {s}",
+                .{ parsed.value.tenant_id, @errorName(err) },
+            );
+            break :open_blk null;
+        };
+        defer if (file_blobs_opt) |*fb| fb.deinit();
+
+        if (file_blobs_opt) |*file_blobs| {
+            const stats = config_mirror.mirrorConfigToKv(
+                allocator,
+                manifest.*,
+                file_blobs.blobStore(),
+                inst.kv,
+                &txn,
+                &ws,
+            ) catch |err| {
+                txn.rollback() catch {};
+                const msg = try std.fmt.allocPrint(
+                    allocator,
+                    "release: config mirror failed: {s}\n",
+                    .{@errorName(err)},
+                );
+                try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+                return;
+            };
+            if (stats.put_count > 0 or stats.delete_count > 0) {
+                std.log.info(
+                    "release: mirrored {d} config put(s) + {d} delete(s) for {s}",
+                    .{ stats.put_count, stats.delete_count, parsed.value.tenant_id },
+                );
+            }
+        }
+    }
+
     txn.commit() catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "release commit failed: {s}\n", .{@errorName(err)});
         try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);

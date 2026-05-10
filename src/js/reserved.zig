@@ -24,6 +24,11 @@ const std = @import("std");
 /// Reserved key prefixes used by both checks below. Keep in sync with
 /// the platform writers that own each namespace:
 ///   `_audit/`           → reserved for future audit log
+///   `_config/`          → file-tree-mirrored library config (deploy
+///                         pipeline writes; handlers read via
+///                         `kv.get`). Source of truth is
+///                         `_config/{lib}/{name}.json` in the
+///                         customer's tree; mirror runs on release.
 ///   `_deploy/`          → reserved for future deploy metadata in app.db
 ///   `_callback/`        → schedule-complete envelope-9 apply writes
 ///                         here; dispatchCallbacks reads + invokes
@@ -42,6 +47,7 @@ const std = @import("std");
 /// is free to use it.
 pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_audit/",
+    "_config/",
     "_deploy/",
     "_callback/",
     "_log/",
@@ -87,6 +93,7 @@ test "isReservedTriggerPrefix: customer prefixes are allowed" {
 test "isReservedTriggerPrefix: exact platform prefix blocked" {
     try std.testing.expect(isReservedTriggerPrefix("_audit/"));
     try std.testing.expect(isReservedTriggerPrefix("_callback/"));
+    try std.testing.expect(isReservedTriggerPrefix("_config/"));
     try std.testing.expect(isReservedTriggerPrefix("_log/"));
     try std.testing.expect(isReservedTriggerPrefix("_sessions/"));
     try std.testing.expect(isReservedTriggerPrefix("_triggers/"));
@@ -118,6 +125,7 @@ test "isReservedTriggerPrefix: deeper-than-platform blocked (would catch system 
 test "isCustomerWriteReserved: platform prefixes blocked" {
     try std.testing.expect(isCustomerWriteReserved("_callback/xyz"));
     try std.testing.expect(isCustomerWriteReserved("_audit/anything"));
+    try std.testing.expect(isCustomerWriteReserved("_config/oauth/google"));
     try std.testing.expect(isCustomerWriteReserved("_log/next_request_seq"));
     try std.testing.expect(isCustomerWriteReserved("_magic/token"));
     try std.testing.expect(isCustomerWriteReserved("_triggers/users/index.mjs"));

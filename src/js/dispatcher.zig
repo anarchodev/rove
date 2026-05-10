@@ -4461,23 +4461,31 @@ test "dispatch: oauth.fromConfig(name) reads from _config/oauth/{name}" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // Seed the config row that a deploy-time mirror would normally
-    // populate from `_config/oauth/google.json`.
+    // Seed the config row directly via the privileged kv path —
+    // handlers can't write `_config/` (it's reserved). In production
+    // the deploy-time mirror (config_mirror.mirrorConfigToKv) does
+    // this on release.
+    {
+        var seed_txn = try kv.beginTrackedImmediate();
+        errdefer seed_txn.rollback() catch {};
+        try seed_txn.put("_config/oauth/google",
+            \\{"authorization_url":"https://accounts.google.com/o/oauth2/v2/auth",
+            \\ "token_url":"https://oauth2.googleapis.com/token",
+            \\ "client_id":"abc.apps.googleusercontent.com",
+            \\ "client_secret":"shh",
+            \\ "redirect_uri":"https://app.example.com/cb",
+            \\ "scopes":["openid","profile"],
+            \\ "on_complete_module":"users/oauth_complete"}
+        );
+        try seed_txn.commit();
+    }
+
     var resp = try runOne(&d, kv,
-        \\kv.set("_config/oauth/google", JSON.stringify({
-        \\  authorization_url: "https://accounts.google.com/o/oauth2/v2/auth",
-        \\  token_url: "https://oauth2.googleapis.com/token",
-        \\  client_id: "abc.apps.googleusercontent.com",
-        \\  client_secret: "shh",
-        \\  redirect_uri: "https://app.example.com/cb",
-        \\  scopes: ["openid", "profile"],
-        \\  on_complete_module: "users/oauth_complete",
-        \\}));
         \\const provider = oauth.fromConfig("google");
         \\provider.startLogin({ return_to: "/" });
         \\// Default state_path is `state/oauth/google`. Pull the state
-        \\// uuid out of the redirect URL and verify the row landed
-        \\// at the expected key.
+        \\// uuid out of the redirect URL and verify the row landed at
+        \\// the expected key.
         \\const loc = response.headers.location;
         \\const m = loc.match(/[?&]state=([^&]+)/);
         \\const state_uuid = m ? m[1] : null;
@@ -4487,6 +4495,28 @@ test "dispatch: oauth.fromConfig(name) reads from _config/oauth/{name}" {
     , .{ .method = "GET", .path = "/", .request_id = 1 });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("true|true|302", resp.body);
+}
+
+test "dispatch: handlers cannot write _config/* (reserved prefix)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\try {
+        \\  kv.set("_config/oauth/evil", "{\"sub\":\"attacker\"}");
+        \\  return "no-throw";
+        \\} catch (e) {
+        \\  return "threw:" + (e.message.includes("reserved") ? "ok" : e.message);
+        \\}
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("threw:ok", resp.body);
 }
 
 test "dispatch: oauth.fromConfig(name) throws when config row missing" {
