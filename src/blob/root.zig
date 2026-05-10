@@ -26,6 +26,8 @@ pub const BlobBackend = backend.BlobBackend;
 pub const BackendConfig = backend.BackendConfig;
 pub const env = @import("env.zig");
 pub const BlobBackendOwned = env.BlobBackendOwned;
+pub const http_blob = @import("http_blob.zig");
+pub const HttpBlobStore = http_blob.HttpBlobStore;
 
 pub const Error = error{
     /// The key contained characters that could escape the blob store's
@@ -148,4 +150,5 @@ test {
     _ = @import("sigv4.zig");
     _ = @import("s3.zig");
     _ = @import("backend.zig");
+    _ = @import("http_blob.zig");
 }

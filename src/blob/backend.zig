@@ -12,6 +12,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const s3_mod = @import("s3.zig");
+const http_blob = @import("http_blob.zig");
 
 const Error = root.Error;
 
@@ -33,17 +34,44 @@ pub const BackendConfig = struct {
     use_tls: bool = true,
 };
 
+/// `BlobBackend` is the per-store handle held by every consumer
+/// that owns a per-tenant `BlobStore`. Two variants:
+///
+/// - `s3` — content-addressed bytes shared across leader +
+///   followers via S3-shaped object storage. Used for file-blobs
+///   (bytecode + static assets) and log-blobs.
+/// - `http` — read-only fetch against a colocated files-server
+///   over HTTP/2. Used by loop46 worker for manifest reads
+///   (production.md #1.4 step 4 — manifests live in raft-replicated
+///   KV inside the files-server cluster, not S3).
+///
+/// Construction picks the variant; the `blobStore()` interface is
+/// uniform so consumers don't branch.
 pub const BlobBackend = struct {
-    inner: s3_mod.S3BlobStore,
+    inner: union(enum) {
+        s3: s3_mod.S3BlobStore,
+        http: http_blob.HttpBlobStore,
+    },
 
-    /// Open a backend with `config`. The config's `key_prefix` scopes
+    /// Open an S3 backend with `config`. The config's `key_prefix` scopes
     /// a shared bucket — e.g. each tenant passes
     /// `key_prefix = "{instance_id}/file-blobs/"`.
     pub fn openS3(allocator: std.mem.Allocator, config: s3_mod.Config) !BlobBackend {
-        return .{ .inner = try s3_mod.S3BlobStore.init(allocator, config) };
+        return .{ .inner = .{ .s3 = try s3_mod.S3BlobStore.init(allocator, config) } };
     }
 
-    /// Open a per-tenant backend for one tenant's `{subdir}` (e.g.
+    /// Open an HTTP-backed backend for one tenant. Read-only: writes
+    /// flow through the files-server's raft cluster, never directly
+    /// from a client. See `http_blob.HttpBlobStore` for the URL
+    /// shape.
+    pub fn openHttp(
+        allocator: std.mem.Allocator,
+        cfg: http_blob.HttpBlobStore.Config,
+    ) !BlobBackend {
+        return .{ .inner = .{ .http = try http_blob.HttpBlobStore.init(allocator, cfg) } };
+    }
+
+    /// Open a per-tenant S3 backend for one tenant's `{subdir}` (e.g.
     /// `"file-blobs"` or `"log-blobs"`). Builds the key prefix
     /// `"{key_prefix_base}{instance_id}/{subdir}/"`. Same factory used
     /// by both `TenantFiles` and `TenantLog` so the per-tenant layout
@@ -72,11 +100,17 @@ pub const BlobBackend = struct {
     }
 
     pub fn deinit(self: *BlobBackend) void {
-        self.inner.deinit();
+        switch (self.inner) {
+            .s3 => |*s| s.deinit(),
+            .http => |*h| h.deinit(),
+        }
     }
 
     pub fn blobStore(self: *BlobBackend) root.BlobStore {
-        return self.inner.blobStore();
+        return switch (self.inner) {
+            .s3 => |*s| s.blobStore(),
+            .http => |*h| h.blobStore(),
+        };
     }
 };
 
@@ -95,6 +129,19 @@ test "BlobBackend: s3 init through wrapper (no I/O)" {
     });
     defer be.deinit();
     _ = be.blobStore();
+    try testing.expect(be.inner == .s3);
+}
+
+test "BlobBackend: http variant (no I/O)" {
+    var be = try BlobBackend.openHttp(testing.allocator, .{
+        .base_url = "https://files.loop46.localhost:9090",
+        .instance_id = "acme",
+        .jwt = "fake.jwt",
+        .verify_tls = false,
+    });
+    defer be.deinit();
+    _ = be.blobStore();
+    try testing.expect(be.inner == .http);
 }
 
 test "openPerTenant: builds {base}{id}/{subdir}/ prefix" {
@@ -107,8 +154,8 @@ test "openPerTenant: builds {base}{id}/{subdir}/ prefix" {
         .secret_key = "sk",
     }, "inst-0001", "file-blobs");
     defer be.deinit();
-    try testing.expectEqualStrings("prod/inst-0001/file-blobs/", be.inner.config.key_prefix);
-    try testing.expectEqualStrings("loop46-shared", be.inner.config.bucket);
+    try testing.expectEqualStrings("prod/inst-0001/file-blobs/", be.inner.s3.config.key_prefix);
+    try testing.expectEqualStrings("loop46-shared", be.inner.s3.config.bucket);
 }
 
 test "openPerTenant: empty key_prefix_base" {
@@ -120,5 +167,5 @@ test "openPerTenant: empty key_prefix_base" {
         .secret_key = "sk",
     }, "inst-abc", "log-blobs");
     defer be.deinit();
-    try testing.expectEqualStrings("inst-abc/log-blobs/", be.inner.config.key_prefix);
+    try testing.expectEqualStrings("inst-abc/log-blobs/", be.inner.s3.config.key_prefix);
 }
