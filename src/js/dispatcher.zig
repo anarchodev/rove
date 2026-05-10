@@ -4217,6 +4217,99 @@ test "dispatch: crypto.verifyRsa rejects missing jwk.n / wrong kty" {
     try testing.expectEqualStrings("threw,threw,threw", resp.body);
 }
 
+test "dispatch: crypto.verifyEcdsa accepts RFC 7515 §A.3 ES256 test vector" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // RFC 7515 Appendix A.3 — "Example JWS Using ECDSA P-256 SHA-256".
+    // JWK + signing input + 64-byte raw R||S signature, all base64url
+    // as the RFC publishes them.
+    var resp = try runOne(&d, kv,
+        \\const jwk = {
+        \\  kty: "EC",
+        \\  crv: "P-256",
+        \\  x: "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+        \\  y: "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+        \\};
+        \\const signing_input = "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+        \\const sig_b64 = "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q";
+        \\const data = new TextEncoder().encode(signing_input);
+        \\const sig = base64url.decode(sig_b64);
+        \\return String(crypto.verifyEcdsa(jwk, "sha256", data, sig));
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("true", resp.body);
+}
+
+test "dispatch: crypto.verifyEcdsa rejects tampered signature" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const jwk = {
+        \\  kty: "EC", crv: "P-256",
+        \\  x: "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+        \\  y: "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+        \\};
+        \\const signing_input = "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+        \\// Flip the last bit of the signature.
+        \\const sig = base64url.decode("DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q");
+        \\sig[sig.length - 1] ^= 0x01;
+        \\const data = new TextEncoder().encode(signing_input);
+        \\return String(crypto.verifyEcdsa(jwk, "sha256", data, sig));
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("false", resp.body);
+}
+
+test "dispatch: crypto.verifyEcdsa rejects wrong sig length / unsupported curve" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const data = new TextEncoder().encode("hi");
+        \\const tries = [
+        \\  // Wrong sig length for P-256 (need 64 bytes).
+        \\  () => crypto.verifyEcdsa(
+        \\    { kty: "EC", crv: "P-256", x: "AA", y: "AA" },
+        \\    "sha256", data, new Uint8Array(32),
+        \\  ),
+        \\  // Unsupported curve.
+        \\  () => crypto.verifyEcdsa(
+        \\    { kty: "EC", crv: "P-128", x: "AA", y: "AA" },
+        \\    "sha256", data, new Uint8Array(64),
+        \\  ),
+        \\  // Wrong kty.
+        \\  () => crypto.verifyEcdsa(
+        \\    { kty: "RSA", crv: "P-256", x: "AA", y: "AA" },
+        \\    "sha256", data, new Uint8Array(64),
+        \\  ),
+        \\];
+        \\const out = tries.map(fn => { try { fn(); return "ok"; } catch (e) { return "threw"; } });
+        \\return out.join(",");
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("threw,threw,threw", resp.body);
+}
+
 test "dispatch: PKCE-style flow uses sha256 + hex.decode + base64url.encode" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

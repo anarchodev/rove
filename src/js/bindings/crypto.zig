@@ -408,6 +408,315 @@ pub fn jsCryptoVerifyRsa(
     return if (rc == 1) globals.js_true else globals.js_false;
 }
 
+/// `crypto.verifyEcdsa(jwk, alg, data, sig) → bool`
+///
+/// Verify a JWS-style ECDSA signature using OpenSSL. Used by
+/// customer JS to validate OIDC id_tokens signed with ES256 / ES384
+/// / ES512 — Apple's "Sign in with Apple", AWS Cognito, Cloudflare
+/// Access, modern OIDC providers.
+///
+/// Arguments:
+///   - `jwk`:  JS object `{kty:"EC", crv, x:base64url, y:base64url}`.
+///             `crv` must be "P-256", "P-384", or "P-521".
+///   - `alg`:  "sha256" / "sha384" / "sha512" (case-insensitive).
+///             Should match the curve (P-256→sha256, P-384→sha384,
+///             P-521→sha512) per JWA — we don't enforce, OpenSSL
+///             will fail-verify on a real mismatch.
+///   - `data`: Uint8Array (JWS signing input: `header_b64.payload_b64`
+///             UTF-8 bytes).
+///   - `sig`:  Uint8Array of the JWS signature — RAW R||S
+///             concatenation (64 bytes for P-256, 96 for P-384, 132
+///             for P-521). NOT DER-encoded; the JWS spec mandates
+///             raw, OpenSSL wants DER, so this binding does the
+///             conversion internally.
+///
+/// Returns `true` on a valid signature, `false` on a verification
+/// failure. Throws on malformed inputs (bad curve name, wrong sig
+/// length for the curve, missing fields).
+///
+/// Does NOT validate JWT claims (iss / aud / exp / iat / nbf) — the
+/// caller is responsible for those after the cryptographic verify
+/// passes.
+pub fn jsCryptoVerifyEcdsa(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 4) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa requires (jwk, alg, data, sig)");
+        return js_exception;
+    }
+
+    const state = globals.getState(ctx);
+    const allocator = state.allocator;
+
+    if (!c.JS_IsObject(argv[0])) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: `jwk` must be an object");
+        return js_exception;
+    }
+
+    const kty_opt = jsObjStringField(ctx, allocator, argv[0], "kty") catch return js_exception;
+    const kty = kty_opt orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: jwk.kty missing");
+        return js_exception;
+    };
+    defer allocator.free(kty);
+    if (!std.mem.eql(u8, kty, "EC")) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: only EC kty supported");
+        return js_exception;
+    }
+
+    const crv_opt = jsObjStringField(ctx, allocator, argv[0], "crv") catch return js_exception;
+    const crv = crv_opt orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: jwk.crv missing");
+        return js_exception;
+    };
+    defer allocator.free(crv);
+    const curve = curveForName(crv) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: jwk.crv must be P-256 / P-384 / P-521");
+        return js_exception;
+    };
+
+    const x_opt = jsObjStringField(ctx, allocator, argv[0], "x") catch return js_exception;
+    const x_b64 = x_opt orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: jwk.x missing");
+        return js_exception;
+    };
+    defer allocator.free(x_b64);
+    const y_opt = jsObjStringField(ctx, allocator, argv[0], "y") catch return js_exception;
+    const y_b64 = y_opt orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: jwk.y missing");
+        return js_exception;
+    };
+    defer allocator.free(y_b64);
+
+    const x_bytes = base64urlDecode(allocator, x_b64) catch {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: jwk.x is not valid base64url");
+        return js_exception;
+    };
+    defer allocator.free(x_bytes);
+    const y_bytes = base64urlDecode(allocator, y_b64) catch {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: jwk.y is not valid base64url");
+        return js_exception;
+    };
+    defer allocator.free(y_bytes);
+
+    // JWA leftpads x and y to coord_size; some JWKs in the wild
+    // emit shorter values when leading bytes are zero. Accept ≤
+    // coord_size (we'll left-pad ourselves below); reject >.
+    if (x_bytes.len > curve.coord_size or y_bytes.len > curve.coord_size) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: jwk.x or jwk.y too large for curve");
+        return js_exception;
+    }
+
+    // Algorithm name → EVP_MD.
+    var alg_cstr_opt: [*c]const u8 = null;
+    defer if (alg_cstr_opt != null) c.JS_FreeCString(ctx, alg_cstr_opt);
+    var alg_len: usize = 0;
+    alg_cstr_opt = c.JS_ToCStringLen(ctx, &alg_len, argv[1]);
+    if (alg_cstr_opt == null) return js_exception;
+    const alg = @as([*]const u8, @ptrCast(alg_cstr_opt))[0..alg_len];
+    const md = mdForAlg(alg) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: alg must be sha256 / sha384 / sha512");
+        return js_exception;
+    };
+
+    var data_len: usize = 0;
+    const data_ptr = c.JS_GetUint8Array(ctx, &data_len, argv[2]);
+    if (data_ptr == null) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: data must be a Uint8Array");
+        return js_exception;
+    }
+    var sig_len: usize = 0;
+    const sig_ptr = c.JS_GetUint8Array(ctx, &sig_len, argv[3]);
+    if (sig_ptr == null) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.verifyEcdsa: sig must be a Uint8Array");
+        return js_exception;
+    }
+
+    // JWS signature is raw R||S, each component coord_size bytes.
+    const expected_sig_len = curve.coord_size * 2;
+    if (sig_len != expected_sig_len) {
+        _ = c.JS_ThrowTypeError(
+            ctx,
+            "crypto.verifyEcdsa: sig length doesn't match curve (R||S concatenation expected)",
+        );
+        return js_exception;
+    }
+
+    // Build uncompressed public-key point: 0x04 || X || Y, with X
+    // and Y left-zero-padded to coord_size.
+    const point_len = 1 + curve.coord_size * 2;
+    const point = allocator.alloc(u8, point_len) catch {
+        _ = c.JS_ThrowOutOfMemory(ctx);
+        return js_exception;
+    };
+    defer allocator.free(point);
+    point[0] = 0x04;
+    @memset(point[1 .. 1 + curve.coord_size], 0);
+    @memcpy(point[1 + curve.coord_size - x_bytes.len ..][0..x_bytes.len], x_bytes);
+    @memset(point[1 + curve.coord_size .. point_len], 0);
+    @memcpy(point[point_len - y_bytes.len ..][0..y_bytes.len], y_bytes);
+
+    // Build EVP_PKEY via fromdata with group + uncompressed pub key.
+    const bld = ssl.OSSL_PARAM_BLD_new();
+    if (bld == null) {
+        _ = c.JS_ThrowInternalError(ctx, "crypto.verifyEcdsa: OSSL_PARAM_BLD_new failed");
+        return js_exception;
+    }
+    defer ssl.OSSL_PARAM_BLD_free(bld);
+    if (ssl.OSSL_PARAM_BLD_push_utf8_string(bld, "group", curve.ossl_name.ptr, curve.ossl_name.len) == 0 or
+        ssl.OSSL_PARAM_BLD_push_octet_string(bld, "pub", point.ptr, point_len) == 0)
+    {
+        _ = c.JS_ThrowInternalError(ctx, "crypto.verifyEcdsa: OSSL_PARAM_BLD_push failed");
+        return js_exception;
+    }
+    const params = ssl.OSSL_PARAM_BLD_to_param(bld);
+    if (params == null) {
+        _ = c.JS_ThrowInternalError(ctx, "crypto.verifyEcdsa: OSSL_PARAM_BLD_to_param failed");
+        return js_exception;
+    }
+    defer ssl.OSSL_PARAM_free(params);
+
+    const pkey_ctx = ssl.EVP_PKEY_CTX_new_from_name(null, "EC", null);
+    if (pkey_ctx == null) {
+        _ = c.JS_ThrowInternalError(ctx, "crypto.verifyEcdsa: EVP_PKEY_CTX_new_from_name failed");
+        return js_exception;
+    }
+    defer ssl.EVP_PKEY_CTX_free(pkey_ctx);
+    if (ssl.EVP_PKEY_fromdata_init(pkey_ctx) <= 0) {
+        _ = c.JS_ThrowInternalError(ctx, "crypto.verifyEcdsa: EVP_PKEY_fromdata_init failed");
+        return js_exception;
+    }
+    var pkey: ?*ssl.EVP_PKEY = null;
+    if (ssl.EVP_PKEY_fromdata(pkey_ctx, &pkey, ssl.EVP_PKEY_PUBLIC_KEY, params) <= 0 or pkey == null) {
+        _ = c.JS_ThrowInternalError(ctx, "crypto.verifyEcdsa: EVP_PKEY_fromdata failed");
+        return js_exception;
+    }
+    defer ssl.EVP_PKEY_free(pkey);
+
+    // JWS sig is raw R||S, OpenSSL EVP_DigestVerify expects DER.
+    // We hand-build the DER (SEQUENCE { INTEGER r, INTEGER s }) to
+    // avoid pulling in <openssl/ecdsa.h> + <openssl/ec.h>, both of
+    // which cascade into header-macro translation errors with our
+    // toolchain. ASN.1 DER for ECDSA-SIG is short + fully spec'd.
+    // Worst-case length for P-521: 1+2+138 = 141 bytes; 256 buffer
+    // covers all curves with margin.
+    var der_buf: [256]u8 = undefined;
+    const der_len = encodeEcdsaSigDer(
+        &der_buf,
+        sig_ptr[0..curve.coord_size],
+        (sig_ptr + curve.coord_size)[0..curve.coord_size],
+    ) catch {
+        _ = c.JS_ThrowInternalError(ctx, "crypto.verifyEcdsa: DER encoding failed");
+        return js_exception;
+    };
+
+    const md_ctx = ssl.EVP_MD_CTX_new();
+    if (md_ctx == null) {
+        _ = c.JS_ThrowInternalError(ctx, "crypto.verifyEcdsa: EVP_MD_CTX_new failed");
+        return js_exception;
+    }
+    defer ssl.EVP_MD_CTX_free(md_ctx);
+
+    if (ssl.EVP_DigestVerifyInit(md_ctx, null, md, null, pkey) <= 0) {
+        _ = c.JS_ThrowInternalError(ctx, "crypto.verifyEcdsa: EVP_DigestVerifyInit failed");
+        return js_exception;
+    }
+    if (ssl.EVP_DigestVerifyUpdate(md_ctx, data_ptr, data_len) <= 0) {
+        _ = c.JS_ThrowInternalError(ctx, "crypto.verifyEcdsa: EVP_DigestVerifyUpdate failed");
+        return js_exception;
+    }
+    const rc = ssl.EVP_DigestVerifyFinal(md_ctx, der_len.ptr, der_len.len);
+    return if (rc == 1) globals.js_true else globals.js_false;
+}
+
+/// Build the DER encoding of an ECDSA-SIG into `out`. Input is the
+/// raw R || S concatenation per JWS — this function handles the
+/// ASN.1 INTEGER rules: strip leading zeros from each component,
+/// then prepend a 0x00 if the high bit of the first remaining byte
+/// is set (so the integer stays positive). Returns the number of
+/// bytes written. Returns error.BufferTooSmall when `out.len`
+/// can't hold the result (callers size at 256).
+fn encodeEcdsaSigDer(out: []u8, r: []const u8, s: []const u8) ![]const u8 {
+    const r_int = trimToInteger(r);
+    const s_int = trimToInteger(s);
+    // Each INTEGER: 1 (tag) + 1 (len, all real-world ECDSA fits in
+    // a single length byte ≤127) + r_int.payload.len + extra-zero
+    // prefix if needed.
+    const r_len = r_int.body.len + @as(usize, if (r_int.needs_pad) 1 else 0);
+    const s_len = s_int.body.len + @as(usize, if (s_int.needs_pad) 1 else 0);
+    if (r_len > 127 or s_len > 127) return error.BufferTooSmall;
+
+    const seq_content_len = 2 + r_len + 2 + s_len;
+    // SEQUENCE length: single byte if ≤127, else 0x81 + 1 byte.
+    const seq_header_len: usize = if (seq_content_len <= 127) 2 else 3;
+    const total_len = seq_header_len + seq_content_len;
+    if (total_len > out.len) return error.BufferTooSmall;
+
+    var pos: usize = 0;
+    out[pos] = 0x30; // SEQUENCE tag
+    pos += 1;
+    if (seq_content_len <= 127) {
+        out[pos] = @intCast(seq_content_len);
+        pos += 1;
+    } else {
+        out[pos] = 0x81;
+        out[pos + 1] = @intCast(seq_content_len);
+        pos += 2;
+    }
+    // R as INTEGER.
+    out[pos] = 0x02; // INTEGER tag
+    out[pos + 1] = @intCast(r_len);
+    pos += 2;
+    if (r_int.needs_pad) {
+        out[pos] = 0x00;
+        pos += 1;
+    }
+    @memcpy(out[pos .. pos + r_int.body.len], r_int.body);
+    pos += r_int.body.len;
+    // S as INTEGER.
+    out[pos] = 0x02;
+    out[pos + 1] = @intCast(s_len);
+    pos += 2;
+    if (s_int.needs_pad) {
+        out[pos] = 0x00;
+        pos += 1;
+    }
+    @memcpy(out[pos .. pos + s_int.body.len], s_int.body);
+    pos += s_int.body.len;
+    return out[0..pos];
+}
+
+const TrimmedInt = struct {
+    body: []const u8,
+    needs_pad: bool,
+};
+
+fn trimToInteger(raw: []const u8) TrimmedInt {
+    var i: usize = 0;
+    while (i < raw.len and raw[i] == 0) i += 1;
+    if (i == raw.len) {
+        // All zeros — represent as a single 0 byte.
+        return .{ .body = raw[raw.len - 1 ..], .needs_pad = false };
+    }
+    const trimmed = raw[i..];
+    return .{ .body = trimmed, .needs_pad = (trimmed[0] & 0x80) != 0 };
+}
+
+const Curve = struct {
+    ossl_name: []const u8,
+    coord_size: usize,
+};
+
+fn curveForName(name: []const u8) ?Curve {
+    if (std.mem.eql(u8, name, "P-256")) return .{ .ossl_name = "P-256", .coord_size = 32 };
+    if (std.mem.eql(u8, name, "P-384")) return .{ .ossl_name = "P-384", .coord_size = 48 };
+    if (std.mem.eql(u8, name, "P-521")) return .{ .ossl_name = "P-521", .coord_size = 66 };
+    return null;
+}
+
 fn mdForAlg(alg: []const u8) ?*const ssl.EVP_MD {
     if (std.ascii.eqlIgnoreCase(alg, "sha256")) return ssl.EVP_sha256();
     if (std.ascii.eqlIgnoreCase(alg, "sha384")) return ssl.EVP_sha384();

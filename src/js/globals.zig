@@ -1017,8 +1017,12 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "hmacSha256",      .cfunc = crypto_b.jsCryptoHmacSha256,      .argc = 2 },
         // RSA-PKCS#1 v1.5 verify (RS256 / RS384 / RS512). Customer
         // composes JWT/OIDC verification on top — see retry.js +
-        // base64url.* helpers. ECDSA verify is a future addition.
+        // base64url.* helpers.
         .{ .name = "verifyRsa",       .cfunc = crypto_b.jsCryptoVerifyRsa,       .argc = 4 },
+        // ECDSA verify (ES256 / ES384 / ES512). Required for Sign in
+        // with Apple, AWS Cognito on EC keys, etc. Sig is JWS raw
+        // R||S concatenation (the binding converts to DER internally).
+        .{ .name = "verifyEcdsa",     .cfunc = crypto_b.jsCryptoVerifyEcdsa,     .argc = 4 },
     } },
     // http.send / http.cancel — the platform's outbound HTTP
     // primitive (docs/http-send-plan.md). send appends a
