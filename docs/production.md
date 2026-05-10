@@ -295,18 +295,40 @@ content collides (rare, but free). Cleaner architecturally
 than Shape A; covers more cases (non-empty default
 bundles like the embedded admin/replay deploys also dedupe).
 
-**Shape C: files-server local SQLite is the source of truth;
-S3 holds only content-addressed bytecodes.** ~1 week. Same
-parallel as #1.1 — the local `files.db` is the deployment
-record; S3 is a blob store, not a manifest store. Manifests
-are served by files-server-standalone via its HTTP API
-(workers fetch on `_deploy/current` flips, one HTTP RT
-instead of one S3 GET). Eliminates the per-tenant S3
-manifest entirely. Biggest payoff but a real refactor.
+**Shape C: manifest contents move into the raft-replicated
+app.db; files-server local SQLite is a working-tree cache.**
+~1 week. Same parallel as #1.1: today's deploy writes the
+manifest to two durability fabrics (files-server local +
+S3); drop one and let raft's existing replication be the
+durability story.
+
+Concretely the deploy commit becomes one atomic raft entry
+that writes BOTH:
+
+```
+  _deploy/current        = N
+  _deploy/{N}/manifest   = <full json bytes — typically 1-10KB>
+```
+
+Workers read `_deploy/current` (local cache hit) then fetch
+`_deploy/{N}/manifest` (also local cache hit) — no S3 GET on
+the manifest path. Bytecodes stay content-addressed in S3.
+files-server's local `files.db` becomes a working tree only,
+rebuildable from any worker's app.db if files-server's disk
+dies. Old manifests in app.db get a retention policy ("keep
+the last 50 deployments") same shape as today's S3 manifest
+retention.
+
+This eliminates the per-tenant S3 manifest path entirely AND
+folds files-server's durability story into the existing raft
+consensus — no second raft group needed. The snapshot
+capture path (#1.1) already covers app.db, so manifests get
+durability + DR for free.
 
 Recommendation: **Shape A first** (small, immediate; fixes
-the bench pain). Shape B/C come later if the bootstrap
-shape stays load-bearing.
+the bench pain in ~1 day). Shape C is the right architectural
+end state. Shape B (content-addressed S3 manifests) is a
+middle option if Shape C's app.db growth is unwelcome.
 
 The bench-seed cost is also operationally meaningful: at
 realistic per-tenant cost ~80-100ms, an operator
