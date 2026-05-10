@@ -318,6 +318,47 @@ fn handleOne(
         return;
     }
 
+    // Debug endpoint — exercises the propose-and-wait path end-to-
+    // end so the smoke can validate raft replication without having
+    // to migrate the real deploy paths first. Body is a JSON object
+    // `{"store":"<store_id>", "key":"<key>", "value":"<value>"}`
+    // (all utf-8). Builds a WriteSet, wraps in the application's
+    // writeset envelope (`ENVELOPE_FILES_WRITESET`), proposes,
+    // waits for raft commit. Returns 200 with the committed seq on
+    // success, 503 on followers, 400 on bad input.
+    //
+    // This is platform-internal and is NOT part of the customer-
+    // facing API. Real manifest writes (deployManifest etc.) get
+    // migrated to use the same proposeAndWait primitive in
+    // subsequent commits.
+    if (std.mem.eql(u8, path, "/_system/cluster-put") and std.mem.eql(u8, method, "POST")) {
+        const cluster = cfg.cluster orelse {
+            try setResponse(server, cfg, ent, sid, sess, 501, null, "raft not enabled on this files-server\n");
+            return;
+        };
+        if (!cluster.raft.isLeader()) {
+            try setResponse(server, cfg, ent, sid, sess, 503, null, "not leader; retry against the cluster leader\n");
+            return;
+        }
+        try handleClusterPut(server, allocator, cfg, ent, sid, sess, cluster, rb);
+        return;
+    }
+
+    // Debug companion — fetches a kv row from the LOCAL cluster
+    // store (no raft round-trip; just reads what's been replicated
+    // here). Path: `/_system/cluster-get/<store>/<key>`. Returns
+    // the value bytes verbatim or 404. Used by the smoke to verify
+    // a `/_system/cluster-put` on the leader replicates to every
+    // follower's local store.
+    if (std.mem.startsWith(u8, path, "/_system/cluster-get/") and std.mem.eql(u8, method, "GET")) {
+        const cluster = cfg.cluster orelse {
+            try setResponse(server, cfg, ent, sid, sess, 501, null, "raft not enabled on this files-server\n");
+            return;
+        };
+        try handleClusterGet(server, allocator, cfg, ent, sid, sess, cluster, path);
+        return;
+    }
+
     // All other routes share the shape `/{instance_id}/{op}[/{tail...}]`.
     if (path.len == 0 or path[0] != '/') {
         try setResponse(server, cfg, ent, sid, sess, 404, null, "not found\n");
@@ -919,6 +960,150 @@ fn handleSource(
         return;
     };
     try setResponse(server, cfg, ent, sid, sess, 200, bytes.ptr, bytes);
+}
+
+/// Application-defined envelope type for files-server's manifest
+/// writeset. Library reserves 0 (writeset, leader-skip) and 1
+/// (multi); files-server uses 2 with `leader_skip = false` so the
+/// leader applies the writeset same as followers — simpler than
+/// loop46's TrackedTxn pre-write pattern, fits deploy-shaped
+/// workloads where commit latency dominates anyway.
+pub const ENVELOPE_FILES_WRITESET: u8 = 2;
+
+/// Default timeout for `proposeAndWait` calls from request handlers.
+/// Deploy commits are bounded by raft commit latency (sub-second
+/// typical, multi-second on bursty clusters); 10s leaves lots of
+/// headroom while still bounding the request handler's wait.
+const PROPOSE_TIMEOUT_NS: u64 = 10 * std.time.ns_per_s;
+
+/// Tiny, robust JSON-object pull-parser for the small handful of
+/// debug-endpoint payloads. Looks for `"<key>":"<value>"` and
+/// returns the unquoted value bytes (no escape handling — caller
+/// passes plain ASCII). Returns null when the key isn't present.
+fn jsonStringField(body: []const u8, key: []const u8) ?[]const u8 {
+    var search_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, body, needle) orelse return null;
+    const value_start = start + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, body, value_start, '"') orelse return null;
+    return body[value_start..end];
+}
+
+/// `POST /_system/cluster-put` — debug helper. Body is JSON
+/// `{"store":..., "key":..., "value":...}`. Builds a WriteSet,
+/// wraps in `ENVELOPE_FILES_WRITESET`, proposes through raft,
+/// waits for commit. Smoke verifies the value lands in every
+/// node's local cluster store.
+fn handleClusterPut(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    cluster: *kv.Cluster,
+    rb: h2.ReqBody,
+) !void {
+    const body = if (rb.data) |d| d[0..rb.len] else "";
+    const store_id = jsonStringField(body, "store") orelse {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "missing 'store' field\n");
+        return;
+    };
+    const key = jsonStringField(body, "key") orelse {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "missing 'key' field\n");
+        return;
+    };
+    const value = jsonStringField(body, "value") orelse {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "missing 'value' field\n");
+        return;
+    };
+
+    var ws = kv.WriteSet.init(allocator);
+    defer ws.deinit();
+    ws.addPut(key, value) catch {
+        try setResponse(server, cfg, ent, sid, sess, 500, null, "writeset alloc failed\n");
+        return;
+    };
+
+    const ws_bytes = ws.encode(allocator) catch {
+        try setResponse(server, cfg, ent, sid, sess, 500, null, "writeset encode failed\n");
+        return;
+    };
+    defer allocator.free(ws_bytes);
+
+    const env = kv.encodeEnvelope(allocator, ENVELOPE_FILES_WRITESET, store_id, ws_bytes) catch {
+        try setResponse(server, cfg, ent, sid, sess, 500, null, "envelope encode failed\n");
+        return;
+    };
+    defer allocator.free(env);
+
+    const seq = cluster.proposeAndWait(env, PROPOSE_TIMEOUT_NS) catch |err| {
+        const msg: []const u8 = switch (err) {
+            error.NotLeader => "not leader\n",
+            error.ShuttingDown => "shutting down\n",
+            error.QueueFull => "raft queue full\n",
+            error.ProposalTimedOut => "proposal timed out\n",
+            error.OutOfMemory => "out of memory\n",
+        };
+        try setResponse(server, cfg, ent, sid, sess, 503, null, msg);
+        return;
+    };
+
+    var line_buf: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "committed at seq={d}\n", .{seq}) catch unreachable;
+    const out = try allocator.alloc(u8, line.len);
+    @memcpy(out, line);
+    try setResponse(server, cfg, ent, sid, sess, 200, out.ptr, out);
+}
+
+/// `GET /_system/cluster-get/<store>/<key>` — debug helper.
+/// Reads from the local cluster store (no raft round-trip). The
+/// store is opened lazily on first read; if no apply has ever
+/// happened for this store on this node, the store doesn't exist
+/// and we return 404 (the kv miss path).
+fn handleClusterGet(
+    server: *CodeH2,
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    cluster: *kv.Cluster,
+    path: []const u8,
+) !void {
+    // Strip prefix.
+    const tail = path["/_system/cluster-get/".len..];
+    const slash = std.mem.indexOfScalar(u8, tail, '/') orelse {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "want path /_system/cluster-get/<store>/<key>\n");
+        return;
+    };
+    const store_id = tail[0..slash];
+    const key = tail[slash + 1 ..];
+    if (store_id.len == 0 or key.len == 0) {
+        try setResponse(server, cfg, ent, sid, sess, 400, null, "empty store or key\n");
+        return;
+    }
+
+    const store = cluster.openStore(store_id) catch {
+        try setResponse(server, cfg, ent, sid, sess, 500, null, "store open failed\n");
+        return;
+    };
+    const value = store.get(key) catch |err| switch (err) {
+        error.NotFound => {
+            try setResponse(server, cfg, ent, sid, sess, 404, null, "key not found\n");
+            return;
+        },
+        else => {
+            try setResponse(server, cfg, ent, sid, sess, 500, null, "store read failed\n");
+            return;
+        },
+    };
+    // KvStore.get returns allocator-owned bytes; transfer to the
+    // response buffer + free the original.
+    const out = try allocator.alloc(u8, value.len);
+    @memcpy(out, value);
+    allocator.free(value);
+    try setResponse(server, cfg, ent, sid, sess, 200, out.ptr, out);
 }
 
 /// Stamp a Status + RespBody + friends onto the entity and move it

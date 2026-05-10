@@ -396,6 +396,21 @@ pub fn main() !void {
             std.debug.print("error: cluster init failed: {s}\n", .{@errorName(err)});
             std.process.exit(2);
         };
+
+        // Register files-server's manifest writeset envelope.
+        // Type 2 (0/1 reserved by the library), `leader_skip = false`
+        // so the leader applies the writeset same as followers
+        // — no TrackedTxn pre-write needed for the deploy-shaped
+        // workload. See ENVELOPE_FILES_WRITESET in
+        // src/files_server/thread.zig.
+        cluster_opt.?.registerEnvelope(2, .{
+            .apply = kv.Cluster.applyWriteSet,
+            .leader_skip = false,
+        }) catch |err| {
+            std.debug.print("error: envelope registration failed: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+
         std.log.info(
             "files-server: raft enabled — node {d}, peers {s}, listen {s}",
             .{ cli.raft_node_id, cli.raft_peers, cli.raft_listen },

@@ -628,9 +628,62 @@ pub const Cluster = struct {
         };
     }
 
-    // ── Built-in: writeset envelope ────────────────────────────
+    // ── Propose path ──────────────────────────────────────────
 
-    fn applyWriteSet(
+    pub const ProposeError = error{
+        NotLeader,
+        ShuttingDown,
+        QueueFull,
+        OutOfMemory,
+        ProposalTimedOut,
+    };
+
+    /// Propose a fully-encoded envelope and block until raft
+    /// commits it (or fails). Returns the raft seq the proposal
+    /// committed at on success.
+    ///
+    /// Caller waits via spinning on `committedSeq()`. For deploy-
+    /// shaped workloads (low-frequency, sub-second commit latency)
+    /// this is fine; for high-throughput hot-path writers, use
+    /// the per-worker watermark protocol on RaftNode directly.
+    pub fn proposeAndWait(
+        self: *Cluster,
+        envelope_bytes: []const u8,
+        timeout_ns: u64,
+    ) ProposeError!u64 {
+        if (!self.raft.isLeader()) return ProposeError.NotLeader;
+
+        const seq = self.raft.highWatermark() + 1;
+        self.raft.propose(seq, envelope_bytes) catch |err| switch (err) {
+            error.NotLeader => return ProposeError.NotLeader,
+            error.ShuttingDown => return ProposeError.ShuttingDown,
+            error.QueueFull => return ProposeError.QueueFull,
+            error.OutOfMemory => return ProposeError.OutOfMemory,
+        };
+
+        const start_ns = std.time.nanoTimestamp();
+        while (true) {
+            if (self.raft.committedSeq() >= seq) return seq;
+            // Faulted seq advances when leadership is lost mid-commit
+            // — the proposal's writeset is logically rolled back.
+            if (self.raft.faultedSeq() >= seq) return ProposeError.NotLeader;
+
+            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - start_ns);
+            if (elapsed >= timeout_ns) return ProposeError.ProposalTimedOut;
+
+            std.Thread.sleep(100 * std.time.ns_per_us);
+        }
+    }
+
+    // ── Built-in: writeset envelope ────────────────────────────
+    //
+    // Public so applications can register a non-leader-skip
+    // variant of the writeset envelope. files-server does this:
+    // its deploy commit runs through propose-then-apply on every
+    // node (simpler than loop46's pre-write-via-TrackedTxn pattern,
+    // because deploy throughput doesn't justify the optimization).
+
+    pub fn applyWriteSet(
         cluster: *Cluster,
         env: Envelope,
         entry_idx: u64,
@@ -639,9 +692,9 @@ pub const Cluster = struct {
     ) ApplyError!void {
         _ = inside_multi;
 
-        // Follower path: open the target store, snapshot-replay
-        // filter, then apply. Stamp `_apply_state` atomically
-        // inside `applyEncodedWriteSet`.
+        // Open the target store, snapshot-replay filter, then
+        // apply. Stamp `_apply_state` atomically inside
+        // `applyEncodedWriteSet`.
         const store = cluster.openStore(env.id) catch |err| switch (err) {
             error.OutOfMemory => return ApplyError.OutOfMemory,
             else => return ApplyError.Sqlite,

@@ -198,7 +198,77 @@ if [[ "$LEADER_COUNT" != "1" ]]; then
 fi
 echo "ok  raft elected node $LEADER_NODE as leader (1 leader + 2 followers via /_system/leader)"
 
+# ── Verify propose-and-wait + replication via /_system/cluster-* ──
+#
+# Write a kv pair through the leader's /_system/cluster-put and
+# read it back from EVERY node's /_system/cluster-get. Validates:
+#   - Leader's writeset envelope round-trips raft commit.
+#   - Apply path runs on every node (no leader-skip on type 2).
+#   - Local cluster store is populated on followers, readable
+#     without a raft round-trip.
+LEADER_PORT="${HTTP_ADDRS[$LEADER_NODE]##*:}"
+TEST_KEY="hello-$(date +%s%N)"
+TEST_VALUE="raft-replicated-$(hostname)"
+PUT_BODY="{\"store\":\"acme\",\"key\":\"$TEST_KEY\",\"value\":\"$TEST_VALUE\"}"
+
+put_resp=$(curl -sS --cacert "$CACERT" --max-time 10 \
+    -H "Authorization: Bearer $JWT" \
+    -H "Content-Type: application/json" \
+    -d "$PUT_BODY" \
+    "https://127.0.0.1:${LEADER_PORT}/_system/cluster-put" 2>&1)
+if ! echo "$put_resp" | grep -q "committed at seq="; then
+    echo "FAIL: cluster-put response unexpected: $put_resp" >&2
+    exit 1
+fi
+echo "ok  leader: $put_resp"
+
+# Followers may need a beat to apply. Loop with a small budget.
+for try in $(seq 1 20); do
+    all_match=1
+    for i in 0 1 2; do
+        port="${HTTP_ADDRS[$i]##*:}"
+        got=$(curl -sS --cacert "$CACERT" --max-time 2 \
+            -H "Authorization: Bearer $JWT" \
+            "https://127.0.0.1:${port}/_system/cluster-get/acme/$TEST_KEY" 2>/dev/null || echo "")
+        if [[ "$got" != "$TEST_VALUE" ]]; then
+            all_match=0
+            break
+        fi
+    done
+    if [[ "$all_match" == "1" ]]; then break; fi
+    sleep 0.2
+done
+
+if [[ "$all_match" != "1" ]]; then
+    echo "FAIL: not all nodes have the replicated key. Per-node values:" >&2
+    for i in 0 1 2; do
+        port="${HTTP_ADDRS[$i]##*:}"
+        got=$(curl -sS --cacert "$CACERT" --max-time 2 \
+            -H "Authorization: Bearer $JWT" \
+            "https://127.0.0.1:${port}/_system/cluster-get/acme/$TEST_KEY" 2>/dev/null || echo "<error>")
+        echo "  node $i: $got" >&2
+    done
+    exit 1
+fi
+echo "ok  all 3 nodes replicated $TEST_KEY (write committed at leader, read from local store on every node)"
+
+# ── Followers must reject writes ──────────────────────────────────
+for i in 0 1 2; do
+    [[ "$i" == "$LEADER_NODE" ]] && continue
+    port="${HTTP_ADDRS[$i]##*:}"
+    code=$(curl -sS --cacert "$CACERT" --max-time 2 -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $JWT" \
+        -H "Content-Type: application/json" \
+        -d "$PUT_BODY" \
+        "https://127.0.0.1:${port}/_system/cluster-put" 2>/dev/null || echo 000)
+    if [[ "$code" != "503" ]]; then
+        echo "FAIL: follower $i accepted cluster-put (status=$code, want 503)" >&2
+        exit 1
+    fi
+done
+echo "ok  followers reject /_system/cluster-put with 503"
+
 echo ""
 echo "PASS files-server raft smoke"
-echo "      (init, listeners, leader election all verified;"
-echo "      manifest migration through Cluster is the next commit)"
+echo "      (init, listeners, leader election, propose-replicate-read,"
+echo "      and follower-reject all verified end-to-end)"
