@@ -440,6 +440,24 @@ fn workerMain(args: *WorkerCtx) !void {
     else
         null;
 
+    // Cold-start manifest prefetch — one HTTP roundtrip pulls
+    // every tenant's manifest from files-server in a single batch.
+    // Without this, each per-tenant `openTenantFiles` would issue
+    // its own GET, hammering files-server's accept queue at scale
+    // (the 10k bench tipped over with `AcceptFailed` before this
+    // path landed).
+    //
+    // No fallback: if the bulk fetch fails (files-server down,
+    // partition, transient TLS hiccup), retry with exponential
+    // backoff. The worker can't usefully serve traffic without
+    // manifests; falling back to per-tenant fetch reintroduces
+    // the connection-storm bug class we're avoiding here. Block
+    // until the bulk fetch succeeds.
+    const manifest_prefetch_opt: ?std.StringHashMapUnmanaged(rjs.PrefetchedManifest) = if (manifest_http) |mh|
+        try prefetchManifestsWithRetry(allocator, &mh, &manifest_mint_ctx, tenant)
+    else
+        null;
+
     const worker = try Worker.create(allocator, &reg, .{
         .tenant = tenant,
         .raft = args.raft,
@@ -472,6 +490,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .compile_ctx = args.compiler,
         .blob_backend = args.blob_backend_cfg,
         .manifest_http = manifest_http,
+        .manifest_prefetch = manifest_prefetch_opt,
         .log_batch_store = args.log_batch_store,
     });
     defer worker.destroy();
@@ -1331,6 +1350,146 @@ pub fn main() !void {
     // shot and we avoid re-implementing a clean teardown graph for
     // every subsystem.
     std.process.exit(0);
+}
+
+/// Retrying wrapper around `prefetchManifests`. Exponential backoff
+/// 1s → 2s → 4s → 8s → 16s → 32s, capped at 32s thereafter. No
+/// fallback to per-tenant fetch — the prefetch IS the way. If the
+/// batch endpoint is unreachable, the worker can't usefully serve
+/// any tenant's traffic, so block until it comes back.
+///
+/// In practice the only realistic failure modes are: files-server
+/// hasn't finished booting yet (one or two retries), files-server
+/// is being rolled, TLS misconfiguration. The first two recover
+/// on their own; the third needs operator intervention regardless.
+fn prefetchManifestsWithRetry(
+    allocator: std.mem.Allocator,
+    mh: *const rjs.ManifestHttpConfig,
+    mint_ctx: *anyopaque,
+    tenant_registry: *tenant_mod.Tenant,
+) !std.StringHashMapUnmanaged(rjs.PrefetchedManifest) {
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        const result = prefetchManifests(allocator, mh, mint_ctx, tenant_registry) catch |err| {
+            const backoff_ms: u64 = std.math.shl(u64, 1000, @min(attempt, 5));
+            std.log.warn(
+                "loop46: manifest prefetch attempt {d} failed: {s} — retry in {d}ms",
+                .{ attempt + 1, @errorName(err), backoff_ms },
+            );
+            std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+            continue;
+        };
+        if (attempt > 0) std.log.info(
+            "loop46: manifest prefetch succeeded on attempt {d}",
+            .{attempt + 1},
+        );
+        return result;
+    }
+}
+
+/// Cold-start manifest prefetch (production.md #1.4 step 4). One
+/// HTTP batch fetch pulls every tenant's deployment manifest from
+/// files-server in one roundtrip. Returns a map of tenant_id →
+/// PrefetchedManifest (keys + value bytes both owned). Worker.create
+/// takes ownership; `openTenantFiles` consumes per-tenant entries.
+///
+/// Tenants without a `_deploy/current` (no real deploy yet) are
+/// skipped — they wouldn't have a manifest in the cluster store.
+/// Per-tenant errors during the gather phase are skipped silently;
+/// they'll fall back to per-tenant fetch on the worker side.
+fn prefetchManifests(
+    allocator: std.mem.Allocator,
+    mh: *const rjs.ManifestHttpConfig,
+    mint_ctx: *anyopaque,
+    tenant_registry: *tenant_mod.Tenant,
+) !std.StringHashMapUnmanaged(rjs.PrefetchedManifest) {
+    _ = mint_ctx; // ManifestHttpConfig already carries it
+
+    // Phase 1: gather (tenant_id, dep_id) pairs by reading
+    // `_deploy/current` from each tenant's app.db. Skip ones
+    // without a current pointer.
+    var tenants: std.ArrayList(blob_mod.http_blob.BatchTenant) = .empty;
+    defer tenants.deinit(allocator);
+
+    var it = tenant_registry.instances.iterator();
+    while (it.next()) |entry| {
+        const inst = entry.value_ptr.*;
+        // Skip __admin__ — its kv aliases root, no manifest
+        // path makes sense for it. Same skip discoverTenantIds
+        // does.
+        if (std.mem.eql(u8, inst.id, tenant_mod.ADMIN_INSTANCE_ID)) continue;
+
+        const cur_bytes = inst.kv.get("_deploy/current") catch |err| switch (err) {
+            error.NotFound => continue,
+            else => continue,
+        };
+        defer allocator.free(cur_bytes);
+        const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch continue;
+
+        try tenants.append(allocator, .{ .id = inst.id, .dep_id = dep_id });
+    }
+
+    if (tenants.items.len == 0) return .empty;
+
+    // Phase 2: one HTTP batch call.
+    var http_be = try blob_mod.HttpBlobStore.init(allocator, .{
+        .base_url = mh.base_url,
+        .instance_id = "_batch", // unused — fetchBatch builds URL from base_url alone
+        .mint_jwt = mh.mint_jwt,
+        .mint_ctx = mh.mint_ctx,
+        .ca_bundle_path = mh.ca_bundle_path,
+        .verify_tls = mh.verify_tls,
+    });
+    defer http_be.deinit();
+
+    const t_start = std.time.milliTimestamp();
+    const rows = try blob_mod.http_blob.fetchBatch(&http_be, allocator, tenants.items);
+    defer allocator.free(rows); // entries' id + manifest moved into the map below
+    const t_ms = std.time.milliTimestamp() - t_start;
+
+    // Phase 3: build the result map. Move owned ids + manifests
+    // out of `rows` into the map; entries with `manifest = null`
+    // (cluster store miss) get freed here so the worker doesn't
+    // see them.
+    var map: std.StringHashMapUnmanaged(rjs.PrefetchedManifest) = .empty;
+    errdefer {
+        var mit = map.iterator();
+        while (mit.next()) |me| {
+            allocator.free(me.key_ptr.*);
+            allocator.free(me.value_ptr.*.bytes);
+        }
+        map.deinit(allocator);
+    }
+
+    var ok: usize = 0;
+    var miss: usize = 0;
+    // We need the dep_id we asked for to stash on the entry —
+    // fetchBatch returns ids but not dep_ids (the request order
+    // is what carries that). Build an id → dep_id sidetable.
+    var dep_for: std.StringHashMapUnmanaged(u64) = .empty;
+    defer dep_for.deinit(allocator);
+    for (tenants.items) |t| try dep_for.put(allocator, t.id, t.dep_id);
+
+    for (rows) |row| {
+        if (row.manifest) |bytes| {
+            const dep_id = dep_for.get(row.id) orelse {
+                allocator.free(row.id);
+                allocator.free(bytes);
+                continue;
+            };
+            try map.put(allocator, row.id, .{ .dep_id = dep_id, .bytes = bytes });
+            ok += 1;
+        } else {
+            allocator.free(row.id);
+            miss += 1;
+        }
+    }
+
+    std.log.info(
+        "loop46: manifest prefetch — {d} tenants, {d} hits, {d} misses, {d}ms",
+        .{ tenants.items.len, ok, miss, t_ms },
+    );
+    return map;
 }
 
 /// Walk `<data_dir>/*` and return every subdirectory containing an

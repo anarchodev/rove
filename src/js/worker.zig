@@ -248,6 +248,13 @@ pub const TenantFiles = struct {
     /// BEFORE chain reverses (outermost-first). See PLAN §2.5 for the
     /// tree-traversal-order rationale.
     triggers: []TriggerEntry,
+    /// One-shot prefetched manifest bytes from the worker's
+    /// cold-start batch fetch (production.md #1.4). Consumed and
+    /// freed on the first `reloadDeployment(dep_id)` call whose
+    /// dep_id matches. Lets startup load every tenant's manifest
+    /// from one HTTP roundtrip instead of N. Null when no
+    /// prefetch was wired or this tenant wasn't in the batch.
+    prefetched_manifest: ?PrefetchedManifest,
 
     pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFiles {
         return openTenantFiles(worker, inst);
@@ -366,6 +373,14 @@ pub const Options = struct {
     /// Application-specific components on h2 connections. Pass-through
     /// to `rove-h2`.
     connection_row: type = rove.Row(&.{}),
+};
+
+/// One pre-fetched manifest from the cold-start bulk fetch.
+/// Owned bytes; freed by the worker after consumption (or at
+/// shutdown if never consumed).
+pub const PrefetchedManifest = struct {
+    dep_id: u64,
+    bytes: []u8,
 };
 
 /// Configuration for routing manifest reads through a files-server
@@ -498,6 +513,15 @@ pub const WorkerConfig = struct {
     /// path. Borrowed; the loop46 binary owns the storage for the
     /// process lifetime.
     manifest_http: ?ManifestHttpConfig = null,
+    /// Cold-start manifest prefetch results, keyed by tenant id.
+    /// When the operator wires `manifest_http` and runs the bulk
+    /// fetch at startup, the resulting bytes land here. Each
+    /// tenant's `TenantFiles.open` consumes its entry on first
+    /// reload + frees the bytes. Ownership of the map + every
+    /// key + value transfers to the Worker on `create`. Null
+    /// skips the prefetch path; per-tenant fetch via
+    /// `manifest_http` (or S3 fallback) still works.
+    manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest) = null,
     /// Phase 5.5 (a) — `BatchStore` the worker flushes log batches
     /// into. loop46 always supplies one — S3 if env wired, in-memory
     /// otherwise. Required because `flushLogs` shouldn't have to
@@ -599,6 +623,11 @@ pub fn Worker(comptime opts: Options) type {
         /// `openTenantFiles` opens an HTTP-backed manifest_backend
         /// instead of S3 — see the field doc on WorkerConfig.
         manifest_http: ?ManifestHttpConfig,
+        /// Cold-start manifest prefetch — see `WorkerConfig`. The
+        /// map's keys + values are worker-owned; openTenantFiles
+        /// consumes (fetchRemove) per tenant and frees on use.
+        /// At Worker.deinit any leftover entries are freed.
+        manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest),
         /// Phase 5.5 (a) — store the worker flushes log batches into.
         /// Lives for the worker's full lifetime; loop46 picks S3 vs
         /// in-memory at startup.
@@ -681,6 +710,7 @@ pub fn Worker(comptime opts: Options) type {
                 .compile_ctx = config.compile_ctx,
                 .blob_backend_cfg = config.blob_backend,
                 .manifest_http = config.manifest_http,
+                .manifest_prefetch = config.manifest_prefetch,
                 .log_batch_store = config.log_batch_store,
                 .services_jwt_secret = config.services_jwt_secret,
                 .log_public_base = config.log_public_base,
@@ -766,6 +796,19 @@ pub fn Worker(comptime opts: Options) type {
             self.tenant_logs.deinit(allocator);
             self.log_buffer.deinit();
             self.tenant_files_map.deinit(allocator);
+            // Free any prefetch entries the worker never consumed
+            // (tenants for which `openTenantFiles` ran without
+            // hitting the prefetch — e.g. concurrent
+            // createInstance during boot, or tenants the bulk
+            // fetch couldn't cover).
+            if (self.manifest_prefetch) |*map| {
+                var pit = map.iterator();
+                while (pit.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*.bytes);
+                }
+                map.deinit(allocator);
+            }
             self.raft_pending.deinit();
             self.dispatcher.deinit();
             if (self.sse_curl) |easy| easy.deinit();
@@ -929,6 +972,21 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
 
     const tc = try allocator.create(TenantFiles);
     errdefer allocator.destroy(tc);
+    // Pull this tenant's prefetched manifest (if any) — transfer
+    // ownership of the bytes from the worker's prefetch map to
+    // `tc`. fetchRemove returns the entry's key + value pair;
+    // we own the value bytes from here and free the key (the
+    // map's key was a copy of the tenant id, not the same alloc
+    // as `id_copy` above).
+    var prefetched: ?PrefetchedManifest = null;
+    if (worker.manifest_prefetch) |*map| {
+        if (map.fetchRemove(inst.id)) |kv| {
+            allocator.free(kv.key);
+            prefetched = kv.value;
+        }
+    }
+    errdefer if (prefetched) |p| allocator.free(p.bytes);
+
     tc.* = .{
         .allocator = allocator,
         .instance_id = id_copy,
@@ -940,6 +998,7 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
         .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
+        .prefetched_manifest = prefetched,
     };
 
     // Best-effort initial load. Read `_deploy/current` from the
@@ -981,6 +1040,7 @@ fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
     freeTriggers(tc);
     tc.manifest_backend.deinit();
     tc.blob_backend.deinit();
+    if (tc.prefetched_manifest) |p| allocator.free(p.bytes);
     allocator.free(tc.instance_id);
     allocator.destroy(tc);
 }
@@ -1428,12 +1488,32 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
 /// (cold start / restart) and by `applyPendingReleases` (the
 /// dashboard pushed a new release).
 fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
-    var key_buf: [25]u8 = undefined;
-    const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
-    const json_bytes = tc.manifest_backend.blobStore().get(key, tc.allocator) catch |err| switch (err) {
-        error.NotFound => return error.NoDeployment,
-        else => return err,
-    };
+    // Cold-start fast path: if we have prefetched manifest bytes
+    // and this is the dep_id they were fetched for, consume them
+    // here (transfer ownership) instead of doing a per-tenant
+    // HTTP fetch. Mismatches (rare — would mean `_deploy/current`
+    // was bumped between prefetch + open) fall through to the
+    // backend; either way the prefetch entry is freed exactly
+    // once.
+    var json_bytes: []u8 = undefined;
+    var owned_by_prefetch = false;
+    if (tc.prefetched_manifest) |p| {
+        tc.prefetched_manifest = null;
+        if (p.dep_id == dep_id) {
+            json_bytes = p.bytes;
+            owned_by_prefetch = true;
+        } else {
+            tc.allocator.free(p.bytes);
+        }
+    }
+    if (!owned_by_prefetch) {
+        var key_buf: [25]u8 = undefined;
+        const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+        json_bytes = tc.manifest_backend.blobStore().get(key, tc.allocator) catch |err| switch (err) {
+            error.NotFound => return error.NoDeployment,
+            else => return err,
+        };
+    }
     defer tc.allocator.free(json_bytes);
 
     var manifest = files_mod.manifest_json.decode(tc.allocator, json_bytes) catch
@@ -2045,6 +2125,7 @@ test "openTenantFiles runs the orphan sweep on startup" {
         allocator: std.mem.Allocator,
         blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
         manifest_http: ?ManifestHttpConfig = null,
+        manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest) = null,
     };
     var fake = FakeWorker{ .allocator = allocator };
     const tc = try openTenantFiles(&fake, inst);
@@ -2089,6 +2170,7 @@ test "commitTxn drops the undo row so the next sweep is a no-op" {
         allocator: std.mem.Allocator,
         blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
         manifest_http: ?ManifestHttpConfig = null,
+        manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest) = null,
     };
     var fake = FakeWorker{ .allocator = allocator };
     const tc = try openTenantFiles(&fake, inst);
