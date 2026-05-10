@@ -969,6 +969,14 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
     evalSnippet(ctx, "base64.js", BASE64_JS);
     evalSnippet(ctx, "urlsearchparams.js", URLSEARCHPARAMS_JS);
+    // jwt depends on base64 + crypto.verifyRsa/Ecdsa.
+    evalSnippet(ctx, "jwt.js", JWT_JS);
+    // oauth depends on base64 + crypto + URLSearchParams.
+    evalSnippet(ctx, "oauth.js", OAUTH_JS);
+    // sessions is standalone (kv + crypto.randomUUID + cookie parsing).
+    evalSnippet(ctx, "sessions.js", SESSIONS_JS);
+    // cron is standalone.
+    evalSnippet(ctx, "cron.js", CRON_JS);
     evalSnippet(ctx, "retry.js", RETRY_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
@@ -1080,6 +1088,10 @@ const GLOBAL_BUILTINS = [_]FnBinding{
 
 const BASE64_JS = @embedFile("base64_js");
 const URLSEARCHPARAMS_JS = @embedFile("urlsearchparams_js");
+const JWT_JS = @embedFile("jwt_js");
+const OAUTH_JS = @embedFile("oauth_js");
+const SESSIONS_JS = @embedFile("sessions_js");
+const CRON_JS = @embedFile("cron_js");
 const RETRY_JS = @embedFile("retry_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");

@@ -409,6 +409,10 @@ pub fn build(b: *std.Build) void {
     const js_runtime_files: []const struct { name: []const u8, path: []const u8 } = &.{
         .{ .name = "base64_js", .path = "src/js/bindings/base64.js" },
         .{ .name = "urlsearchparams_js", .path = "src/js/bindings/urlsearchparams.js" },
+        .{ .name = "jwt_js", .path = "src/js/bindings/jwt.js" },
+        .{ .name = "oauth_js", .path = "src/js/bindings/oauth.js" },
+        .{ .name = "sessions_js", .path = "src/js/bindings/sessions.js" },
+        .{ .name = "cron_js", .path = "src/js/bindings/cron.js" },
         .{ .name = "retry_js", .path = "src/js/bindings/retry.js" },
         .{ .name = "webhook_js", .path = "src/js/bindings/webhook.js" },
         .{ .name = "email_js", .path = "src/js/bindings/email.js" },

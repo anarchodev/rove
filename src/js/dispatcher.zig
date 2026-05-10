@@ -4310,6 +4310,440 @@ test "dispatch: crypto.verifyEcdsa rejects wrong sig length / unsupported curve"
     try testing.expectEqualStrings("threw,threw,threw", resp.body);
 }
 
+test "dispatch: jwt.decode parses valid token" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const token = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJqb2UiLCJleHAiOjEzMDA4MTkzODB9.fakesig";
+        \\const decoded = jwt.decode(token);
+        \\return decoded.header.alg + "|" + decoded.payload.iss + "|" + decoded.payload.exp;
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("RS256|joe|1300819380", resp.body);
+}
+
+test "dispatch: jwt.verify against RFC 7515 §A.2 RS256 vector" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const jwk = {
+        \\  kty: "RSA",
+        \\  n: "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ",
+        \\  e: "AQAB",
+        \\};
+        \\const token = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqvhJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrBp0igcN_IoypGlUPQGe77Rw";
+        \\const result = jwt.verify(token, jwk);
+        \\return result.valid + "|" + result.payload.iss;
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("true|joe", resp.body);
+}
+
+test "dispatch: jwt.verify picks key by kid from JWKS" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Token header includes kid:"k1"; JWKS has one matching + a
+    // decoy. Library picks the right key.
+    var resp = try runOne(&d, kv,
+        \\const jwks = { keys: [
+        \\  { kty:"RSA", kid:"decoy", n:"AQAB", e:"AQAB" },
+        \\  { kty:"RSA", kid:"k1",
+        \\    n:"ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ",
+        \\    e:"AQAB" },
+        \\] };
+        \\// Token header has kid:"k1"; payload doesn't matter. Reusing
+        \\// RFC 7515 §A.2 except header tweaked to add kid.
+        \\// header = base64url('{"alg":"RS256","kid":"k1"}') = eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0
+        \\// (need a fresh signature for the new header — for kid-pick test we
+        \\// just verify decode + select happens; valid bit will be false.)
+        \\const token = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0.eyJpc3MiOiJqb2UifQ.fake";
+        \\try {
+        \\  const result = jwt.verify(token, jwks);
+        \\  // Selection succeeded (no "no key" throw); base64url-decode
+        \\  // of "fake" produces non-RSA-sized garbage so verify is false.
+        \\  return "selected|" + result.valid;
+        \\} catch (e) {
+        \\  return "threw:" + e.message;
+        \\}
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("selected|false", resp.body);
+}
+
+test "dispatch: jwt.validateClaims iss/aud/exp" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\// now = 2_000_000s (well past 1_500_000s, well before 3_000_000s)
+        \\const now_ms = 2_000_000_000;
+        \\const cases = [
+        \\  jwt.validateClaims({ exp: 3_000_000, iss: "google", aud: "myapp" },
+        \\    { now: now_ms, iss: "google", aud: "myapp" }),
+        \\  jwt.validateClaims({ exp: 1_000_000 }, { now: now_ms }),  // expired
+        \\  jwt.validateClaims({ iss: "evil" }, { now: now_ms, iss: "google" }),
+        \\  jwt.validateClaims({ aud: ["a", "b"] }, { now: now_ms, aud: "b" }),
+        \\];
+        \\return cases.map(c => c === null ? "ok" : c).join(",");
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("ok,expired,issuer-mismatch,ok", resp.body);
+}
+
+test "dispatch: oauth.fromConfig(inline).startLogin builds authorize URL + stores state" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Inline-config form — no kv config row needed. Library still
+    // derives default state_path from the inline name field.
+    var resp = try runOne(&d, kv,
+        \\const provider = oauth.fromConfig({
+        \\  name: "google",
+        \\  authorization_url: "https://accounts.google.com/o/oauth2/v2/auth",
+        \\  token_url: "https://oauth2.googleapis.com/token",
+        \\  client_id: "abc.apps.googleusercontent.com",
+        \\  client_secret: "shh",
+        \\  redirect_uri: "https://app.example.com/cb",
+        \\  scopes: ["openid", "email"],
+        \\  on_complete_module: "users/oauth_complete",
+        \\});
+        \\provider.startLogin({ return_to: "/dashboard" });
+        \\const loc = response.headers.location;
+        \\const has_state = loc.includes("&state=") || loc.includes("?state=");
+        \\const has_pkce = loc.includes("code_challenge=") && loc.includes("code_challenge_method=S256");
+        \\const has_scope = loc.includes("scope=openid+email");
+        \\return [response.status, has_state, has_pkce, has_scope].join("|");
+    , .{ .method = "GET", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("302|true|true|true", resp.body);
+}
+
+test "dispatch: oauth.fromConfig(name) reads from _config/oauth/{name}" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Seed the config row that a deploy-time mirror would normally
+    // populate from `_config/oauth/google.json`.
+    var resp = try runOne(&d, kv,
+        \\kv.set("_config/oauth/google", JSON.stringify({
+        \\  authorization_url: "https://accounts.google.com/o/oauth2/v2/auth",
+        \\  token_url: "https://oauth2.googleapis.com/token",
+        \\  client_id: "abc.apps.googleusercontent.com",
+        \\  client_secret: "shh",
+        \\  redirect_uri: "https://app.example.com/cb",
+        \\  scopes: ["openid", "profile"],
+        \\  on_complete_module: "users/oauth_complete",
+        \\}));
+        \\const provider = oauth.fromConfig("google");
+        \\provider.startLogin({ return_to: "/" });
+        \\// Default state_path is `state/oauth/google`. Pull the state
+        \\// uuid out of the redirect URL and verify the row landed
+        \\// at the expected key.
+        \\const loc = response.headers.location;
+        \\const m = loc.match(/[?&]state=([^&]+)/);
+        \\const state_uuid = m ? m[1] : null;
+        \\const stored = state_uuid ? kv.get("state/oauth/google/" + state_uuid) : null;
+        \\const ok_loc = loc.startsWith("https://accounts.google.com/");
+        \\return [stored !== null, ok_loc, response.status].join("|");
+    , .{ .method = "GET", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("true|true|302", resp.body);
+}
+
+test "dispatch: oauth.fromConfig(name) throws when config row missing" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\try {
+        \\  oauth.fromConfig("nonexistent");
+        \\  return "no-throw";
+        \\} catch (e) {
+        \\  return e.message.includes("_config/oauth/nonexistent") ? "threw-correctly" : "wrong-msg:" + e.message;
+        \\}
+    , .{ .method = "GET", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("threw-correctly", resp.body);
+}
+
+test "dispatch: sessions.fromConfig(inline).create writes kv row + queues cookie" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const s = sessions.fromConfig({ name: "default" });
+        \\const id = s.create({ user_sub: "user123", email: "a@b.c" });
+        \\const stored = JSON.parse(kv.get("state/sessions/default/" + id));
+        \\const cookie = response.cookies[0];
+        \\const has_attrs = cookie.includes("HttpOnly") && cookie.includes("Secure")
+        \\  && cookie.includes("SameSite=Lax") && cookie.includes("Path=/");
+        \\return [stored.user_sub, stored.email, has_attrs, cookie.startsWith("session=" + id)].join("|");
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("user123|a@b.c|true|true", resp.body);
+}
+
+test "dispatch: sessions.get reads from request.cookies" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("state/sessions/default/sess-abc", JSON.stringify({
+        \\    user_sub: "user42", email: "x@y.z",
+        \\  }));
+        \\  const s = sessions.fromConfig({ name: "default" });
+        \\  const got = s.get();
+        \\  return got ? (got.user_sub + "|" + got.email) : "null";
+        \\}
+    , "h.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var hdr_buf: [4]h2.HeaderField = undefined;
+    const hdrs = makeReqHeaders(&hdr_buf, &.{
+        .{ ":method", "GET" },
+        .{ ":path", "/" },
+        .{ "cookie", "foo=bar; session=sess-abc; baz=qux" },
+    });
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+        .method = "GET",
+        .path = "/",
+        .headers = hdrs,
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("user42|x@y.z", resp.body);
+}
+
+test "dispatch: sessions.destroy deletes row + clears cookie" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\  kv.set("state/sessions/default/sess-zzz", JSON.stringify({user: "x"}));
+        \\  const s = sessions.fromConfig({ name: "default" });
+        \\  s.destroy();
+        \\  const after = kv.get("state/sessions/default/sess-zzz");
+        \\  const cookie = response.cookies[0];
+        \\  return [
+        \\    after === null,
+        \\    cookie.includes("Max-Age=0"),
+        \\    cookie.startsWith("session=;"),
+        \\  ].join("|");
+        \\}
+    , "h.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var hdr_buf: [4]h2.HeaderField = undefined;
+    const hdrs = makeReqHeaders(&hdr_buf, &.{
+        .{ ":method", "POST" },
+        .{ ":path", "/" },
+        .{ "cookie", "session=sess-zzz" },
+    });
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+        .method = "POST",
+        .path = "/",
+        .headers = hdrs,
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("true|true|true", resp.body);
+}
+
+test "dispatch: sessions.parseCookies handles spaces + missing values" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const c = sessions.parseCookies("a=1; b=2; c = 3 ; nokey;");
+        \\return [c.a, c.b, c.c, c.nokey === undefined].join("|");
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("1|2|3|true", resp.body);
+}
+
+test "dispatch: cron.dailyAt produces a future timestamp" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const ns = cron.dailyAt(3, 0);
+        \\const ms = Number(ns / 1_000_000n);
+        \\const future = ms > Date.now();
+        \\const within_24h = (ms - Date.now()) < 25 * 60 * 60 * 1000;
+        \\return [future, within_24h].join("|");
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("true|true", resp.body);
+}
+
+test "dispatch: cron.fromNow + parseDuration" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\return [
+        \\  cron.parseDuration("30s"),
+        \\  cron.parseDuration("5m"),
+        \\  cron.parseDuration("2h"),
+        \\  cron.parseDuration("1d"),
+        \\  cron.parseDuration("1w"),
+        \\  cron.parseDuration("nope"),
+        \\].join(",");
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("30000,300000,7200000,86400000,604800000,", resp.body);
+}
+
+test "dispatch: cron.next parses crontab expression" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // 2026-05-09 is a Saturday. "0 3 * * *" from now=2026-05-09T00:00Z
+    // → next match is 2026-05-09T03:00Z.
+    var resp = try runOne(&d, kv,
+        \\const now = Date.UTC(2026, 4, 9, 0, 0, 0);  // 2026-05-09 00:00 UTC
+        \\const ns = cron.next("0 3 * * *", now);
+        \\const ms = Number(ns / 1_000_000n);
+        \\const expected = Date.UTC(2026, 4, 9, 3, 0, 0);
+        \\return ms === expected ? "match" : `mismatch: got ${new Date(ms).toISOString()}, want ${new Date(expected).toISOString()}`;
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("match", resp.body);
+}
+
+test "dispatch: cron.next handles step expressions like */15" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // 12:07:30 → next */15 fire is 12:15.
+    var resp = try runOne(&d, kv,
+        \\const now = Date.UTC(2026, 4, 9, 12, 7, 30);
+        \\const ns = cron.next("*/15 * * * *", now);
+        \\const ms = Number(ns / 1_000_000n);
+        \\const dt = new Date(ms);
+        \\return dt.getUTCHours() + ":" + dt.getUTCMinutes();
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("12:15", resp.body);
+}
+
 test "dispatch: PKCE-style flow uses sha256 + hex.decode + base64url.encode" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
