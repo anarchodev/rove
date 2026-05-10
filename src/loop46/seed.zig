@@ -131,12 +131,15 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
         // files-server normally pushes via raft instead lands here
         // as a direct app.db write — same shape as old
         // bootstrapHandler did, just with the deploy half outsourced.
+        // Offline path — no running cluster, so cluster=null. The
+        // S3 PUT is the only durable write here.
         const dep_id = try files_server.bootstrap.bootstrapTenant(
             allocator,
             blob_owned.cfg,
             dd,
             t.id,
             deploy_files.items,
+            null,
         );
         try writeLocalDeployCurrent(allocator, dd, t.id, dep_id);
         try mirrorConfigFromManifest(allocator, blob_owned.cfg, dd, t.id, dep_id);

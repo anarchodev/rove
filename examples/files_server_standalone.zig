@@ -463,6 +463,7 @@ pub fn main() !void {
             leader_url,
             jwt_secret,
             cli.bootstrap_kv[0..cli.bootstrap_kv_count],
+            cluster_opt,
         ) catch |err| {
             std.log.err(
                 "files-server bootstrap failed: {s} (leader_url={s})",

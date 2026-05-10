@@ -142,23 +142,37 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Compile + upload a single tenant's deploy bundle to S3 (idempotent
-/// on warm S3 via the manifest exists-check). Does NOT write
+/// Compile + upload a single tenant's deploy bundle. Does NOT write
 /// `_deploy/current` — that's the worker's job; the caller follows
 /// up with `postRelease` to put the pointer through raft.
 ///
 /// Returns the deployment id (always 1 today; future revisions could
 /// rev the bundle). `data_dir` is files-server's local working dir
 /// for the per-node files.db that holds the deploy index.
+///
+/// `cluster` (production.md #1.4): when set, the manifest JSON is
+/// ALSO written into the per-tenant Cluster store under
+/// `deployment/{N:020d}/manifest` + `deployment/current = {N}` via
+/// `proposeAndWait`. Followers' apply path replicates the same
+/// rows. Today this is a dual-write (S3 PUT stays, until worker
+/// reads migrate to fetch from files-server's HTTP API instead of
+/// S3 directly). Pre-launch the duplicated bytes are acceptable;
+/// subsequent commits drop the S3 PUT once read-side migration
+/// lands. Pass null for the offline `loop46 seed` path (no
+/// running cluster).
 pub fn bootstrapTenant(
     allocator: std.mem.Allocator,
     blob_cfg: blob_mod.BackendConfig,
     data_dir: []const u8,
     instance_id: []const u8,
     files: []const DeployFile,
+    cluster: ?*kv_mod.Cluster,
 ) !u64 {
     // Fast path: if manifest 1 already exists in S3, the cluster has
     // already bootstrapped this tenant. Skip every other step.
+    // (Idempotency check stays S3-side until the manifest fully
+    // moves to the cluster store — keeps the offline `loop46 seed`
+    // path working without a running cluster.)
     var manifest_be = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         blob_cfg,
@@ -169,6 +183,12 @@ pub fn bootstrapTenant(
     var key_buf: [25]u8 = undefined;
     const key = files_mod.manifest_json.manifestKey(&key_buf, 1);
     if (manifest_be.blobStore().exists(key) catch false) {
+        // S3-side idempotent — but if a cluster is supplied AND the
+        // cluster store is missing the entry (operator wiped local
+        // data_dir, brand-new cluster against warm S3), still write
+        // through the cluster so followers / restarts see consistent
+        // state.
+        if (cluster) |c| try writeManifestThroughCluster(allocator, c, instance_id, 1, "");
         return 1;
     }
 
@@ -226,7 +246,91 @@ pub fn bootstrapTenant(
         };
     }
     try store.setCurrentDeploymentId(next_id);
+
+    // Dual-write through the raft cluster (#1.4 step 2). The
+    // cluster store ends up with the same manifest JSON the S3
+    // PUT above just wrote, plus a `deployment/current` pointer.
+    // After read-side migration lands the S3 PUT goes away.
+    if (cluster) |c| try writeManifestThroughCluster(
+        allocator,
+        c,
+        instance_id,
+        next_id,
+        json_bytes,
+    );
+
     return next_id;
+}
+
+/// Per-tenant Cluster store key for a numbered manifest. Mirrors
+/// `manifest_json.manifestKey`'s `00000000000000000001.json` shape
+/// (zero-padded u64 hex) but without the `.json` suffix — kv values
+/// are bytes, not S3 objects, so the file extension doesn't add
+/// anything.
+fn clusterManifestKey(buf: *[31]u8, dep_id: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "deployment/{x:0>20}/manifest", .{dep_id}) catch unreachable;
+}
+
+/// Write the manifest + current pointer for a tenant through the
+/// cluster's raft consensus. One writeset envelope, two kv ops:
+/// `deployment/{N}/manifest = <json>` + `deployment/current =
+/// <ascii decimal>`. Returns the raft seq the proposal committed
+/// at on success.
+///
+/// `manifest_json_bytes` may be empty when the caller is just
+/// re-asserting the current pointer (S3-warm idempotent case);
+/// the manifest write is skipped in that case so we don't
+/// overwrite the real bytes with empty.
+fn writeManifestThroughCluster(
+    allocator: std.mem.Allocator,
+    cluster: *kv_mod.Cluster,
+    instance_id: []const u8,
+    dep_id: u64,
+    manifest_json_bytes: []const u8,
+) !void {
+    if (!cluster.raft.isLeader()) {
+        // Followers / a non-leader at startup just skip the
+        // through-raft write. The leader-side bootstrap path will
+        // populate the cluster store; followers replicate.
+        // Idempotent re-runs are fine — the apply path filters
+        // by `_apply_state.last_applied_raft_idx`.
+        return;
+    }
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+
+    if (manifest_json_bytes.len > 0) {
+        var mk_buf: [31]u8 = undefined;
+        const manifest_key = clusterManifestKey(&mk_buf, dep_id);
+        try ws.addPut(manifest_key, manifest_json_bytes);
+    }
+
+    var dec_buf: [32]u8 = undefined;
+    const dec = std.fmt.bufPrint(&dec_buf, "{d}", .{dep_id}) catch unreachable;
+    try ws.addPut("deployment/current", dec);
+
+    const ws_bytes = try ws.encode(allocator);
+    defer allocator.free(ws_bytes);
+
+    // Envelope type 2 = files-server's manifest writeset (registered
+    // at standalone startup with leader_skip = false). See
+    // ENVELOPE_FILES_WRITESET in src/files_server/thread.zig.
+    const env = try kv_mod.encodeEnvelope(allocator, 2, instance_id, ws_bytes);
+    defer allocator.free(env);
+
+    _ = cluster.proposeAndWait(env, 10 * std.time.ns_per_s) catch |err| switch (err) {
+        // Lost leadership mid-flight. Logged but not fatal — the
+        // S3 PUT above is the load-bearing write today; cluster
+        // store is supplementary until reads migrate.
+        error.NotLeader, error.ProposalTimedOut, error.QueueFull, error.ShuttingDown => {
+            std.log.warn(
+                "files-server bootstrap: through-cluster manifest write for {s} dep={d} failed: {s}",
+                .{ instance_id, dep_id, @errorName(err) },
+            );
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
 }
 
 // ── Release POST + JWT mint ───────────────────────────────────────────
@@ -447,6 +551,7 @@ pub fn bootstrapPlatformDeployments(
     leader_url: []const u8,
     jwt_secret: []const u8,
     bootstrap_kv: []const []const u8,
+    cluster: ?*kv_mod.Cluster,
 ) !void {
     const admin_dep_id = try bootstrapTenant(
         allocator,
@@ -454,6 +559,7 @@ pub fn bootstrapPlatformDeployments(
         data_dir,
         ADMIN_TENANT_ID,
         &ADMIN_DEPLOY_FILES,
+        cluster,
     );
     try postRelease(allocator, leader_url, jwt_secret, ADMIN_TENANT_ID, admin_dep_id);
     std.log.info(
@@ -467,6 +573,7 @@ pub fn bootstrapPlatformDeployments(
         data_dir,
         REPLAY_TENANT_ID,
         &REPLAY_DEPLOY_FILES,
+        cluster,
     );
     try postRelease(allocator, leader_url, jwt_secret, REPLAY_TENANT_ID, replay_dep_id);
     std.log.info(
