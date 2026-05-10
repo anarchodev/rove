@@ -254,6 +254,68 @@ batches, and bytecodes (the things it's already good at) but
 is not a DR mechanism. The "halfway S3 DR" architecture is
 gone entirely.
 
+### 1.3 Files-server: stop writing per-tenant S3 manifests at bootstrap — **NEW, surfaced 2026-05-10 by 10k bench**
+
+Same insight as #1.1, applied to files-server. The 10k-tenant
+scalability bench's seed phase took **1012s** for 10,000
+tenants on node 0 alone (then ~5min more for nodes 1+2 in
+parallel via the S3-fast-path). Almost all of that time was
+`bootstrapTenant` doing one S3 PUT per tenant for an
+essentially-empty deployment manifest. 10,000 nearly byte-
+identical S3 objects.
+
+The waste shape: **per-entity work where most entities are
+equivalent**, just like the raft snapshot story.
+`bootstrapTenant` (`src/files_server/bootstrap.zig:153`)
+unconditionally PUTs `tenants/{id}/deployments/0001.json` for
+every newly-bootstrapped tenant, even when `files = []`. The
+worker uses `_deploy/current` (in the local app.db, not S3)
+to know "there's been a deploy here," so the S3 manifest
+isn't load-bearing for the empty case.
+
+Three solution shapes, in order of scope:
+
+**Shape A: skip S3 for empty bootstraps.** ~1 day. When
+`bootstrapTenant` is called with `files = []`, write
+`_deploy/current = 0` locally as a sentinel "no real deploy
+yet" marker and skip the S3 manifest entirely. First customer
+deploy creates manifest 1 + flips `_deploy/current = 1`.
+Worker bytecode-cache miss path learns to treat 0 as "no
+deployment, return 503 like today's NoDeployment case."
+Drops 10k-tenant seed from 17min to ~30s.
+
+**Shape B: content-address the manifest itself.** ~2 days.
+Instead of `tenants/{id}/deployments/{N}.json` (per-tenant
+key, byte-duplicated when content matches across tenants),
+store at `manifests/{sha256}.json` (content-addressed,
+shared) with the per-tenant deploy pointer becoming a hash
+reference. 10k empty bootstraps share one S3 object;
+customer-deployed manifests dedupe across tenants when
+content collides (rare, but free). Cleaner architecturally
+than Shape A; covers more cases (non-empty default
+bundles like the embedded admin/replay deploys also dedupe).
+
+**Shape C: files-server local SQLite is the source of truth;
+S3 holds only content-addressed bytecodes.** ~1 week. Same
+parallel as #1.1 — the local `files.db` is the deployment
+record; S3 is a blob store, not a manifest store. Manifests
+are served by files-server-standalone via its HTTP API
+(workers fetch on `_deploy/current` flips, one HTTP RT
+instead of one S3 GET). Eliminates the per-tenant S3
+manifest entirely. Biggest payoff but a real refactor.
+
+Recommendation: **Shape A first** (small, immediate; fixes
+the bench pain). Shape B/C come later if the bootstrap
+shape stays load-bearing.
+
+The bench-seed cost is also operationally meaningful: at
+realistic per-tenant cost ~80-100ms, an operator
+provisioning a fresh 10k-tenant cluster pays ~17 minutes
+just on tenant init. Shape A drops that to seconds. New
+nodes joining an existing cluster (which hit the S3
+fast-path because manifests already exist) stay fast as
+they are today.
+
 ### 2. By-reference manifest reuse for unchanged tenants — **done 2026-05-09, then made vestigial 2026-05-10**
 
 > **Scope dissolved by #1.1 + #1.2 (2026-05-10):** the design
@@ -458,13 +520,22 @@ this is fine, but multi-customer prod with mixed tiers needs it.
    followers still need operator intervention via
    `loop46 restore-from-snapshot`. ~2 days remaining.
 4. **#1.2 non-voting learner replica = the entire DR story.**
-   ~3 days. Independently shippable from #1.1; can interleave.
-   Live geographic redundancy. S3 is not a DR mechanism.
-5. **#7 leader-failover smoke.** Validates the at-least-once
+   Step 1 (CLI plumbing + raft_add_node branch) done
+   2026-05-10. Promotion endpoint + multi-node smoke pending,
+   ~2 days remaining. Live geographic redundancy. S3 is not a
+   DR mechanism.
+5. **#1.3 files-server: stop writing per-tenant S3 manifests
+   at empty bootstraps.** Same insight as #1.1, applied to
+   files-server. Surfaced 2026-05-10 by the 10k-tenant
+   scalability bench (17min seed phase, mostly empty manifest
+   PUTs). Shape A (~1 day) is the small surgical fix; Shape
+   C (~1 week) is the architectural cleanup. Operationally
+   meaningful for fresh-cluster provisioning.
+6. **#7 leader-failover smoke.** Validates the at-least-once
    contract for `http.send` already designed.
-6. **#4 deployment doc + systemd units.** Afternoon's work; turns
+7. **#4 deployment doc + systemd units.** Afternoon's work; turns
    "I know how to start this" into "an operator can start this."
    Covers the learner-mode peer config (#1.2).
-7. **#3 / #5 / #6 / #8.** Each an afternoon.
-8. **#9 / #10 / #11 / #12.** Real work but slot after launch
+8. **#3 / #5 / #6 / #8.** Each an afternoon.
+9. **#9 / #10 / #11 / #12.** Real work but slot after launch
    unless a specific customer requirement surfaces.
