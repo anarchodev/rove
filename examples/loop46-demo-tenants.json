@@ -11,7 +11,9 @@
         {"path": "cbfire/index.mjs", "source": "loop46-demo-tenants/acme/cbfire/index.mjs"},
         {"path": "cbresult.mjs", "source": "loop46-demo-tenants/acme/cbresult.mjs"},
         {"path": "httpfire/index.mjs", "source": "loop46-demo-tenants/acme/httpfire/index.mjs"},
-        {"path": "httpresult.mjs", "source": "loop46-demo-tenants/acme/httpresult.mjs"}
+        {"path": "httpresult.mjs", "source": "loop46-demo-tenants/acme/httpresult.mjs"},
+        {"path": "cfg/index.mjs", "source": "loop46-demo-tenants/acme/cfg/index.mjs"},
+        {"path": "_config/oauth/google.json", "source": "loop46-demo-tenants/acme/_config/oauth/google.json", "content_type": "application/json"}
       ]
     },
     {

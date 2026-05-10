@@ -6,8 +6,10 @@
 
 const std = @import("std");
 const kv = @import("rove-kv");
+const blob_mod = @import("rove-blob");
 const tenant_mod = @import("rove-tenant");
 const files_server = @import("rove-files-server");
+const config_mirror = @import("rove-js").config_mirror;
 
 const main_mod = @import("main.zig");
 
@@ -137,6 +139,7 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
             deploy_files.items,
         );
         try writeLocalDeployCurrent(allocator, dd, t.id, dep_id);
+        try mirrorConfigFromManifest(allocator, blob_owned.cfg, dd, t.id, dep_id);
 
         if (t.seed_kv) |kvs| {
             const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dd, t.id });
@@ -159,6 +162,65 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     }
 
     std.debug.print("seed: provisioned {d} tenant(s) into {s}\n", .{ parsed.value.tenants.len, dd });
+}
+
+/// Run the same `_config/` → kv mirror on this node's app.db that
+/// the live release path runs (worker_dispatch.handleRelease). Seed
+/// is offline (no raft yet, runs once per node), so the writeset
+/// gets discarded — followers re-derive identical state from their
+/// own seed pass. Skipped silently when the manifest can't be
+/// loaded (no config files in this deploy → empty manifest is fine,
+/// but a real load failure logs).
+fn mirrorConfigFromManifest(
+    allocator: std.mem.Allocator,
+    blob_cfg: blob_mod.BackendConfig,
+    dd: []const u8,
+    instance_id: []const u8,
+    dep_id: u64,
+) !void {
+    var manifest = files_server.loadDeployment(allocator, blob_cfg, instance_id, dep_id) catch |err| {
+        std.log.warn("seed: skipping config mirror for {s}/{x:0>16} — manifest load failed: {s}", .{ instance_id, dep_id, @errorName(err) });
+        return;
+    };
+    defer manifest.deinit();
+
+    var file_blobs = try blob_mod.BlobBackend.openPerTenant(
+        allocator,
+        blob_cfg,
+        instance_id,
+        "file-blobs",
+    );
+    defer file_blobs.deinit();
+
+    const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dd, instance_id });
+    defer allocator.free(inst_dir);
+    try std.fs.cwd().makePath(inst_dir);
+    const app_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{inst_dir}, 0);
+    defer allocator.free(app_db_path);
+    const app_kv = try kv.KvStore.open(allocator, app_db_path);
+    defer app_kv.close();
+
+    var txn = try app_kv.beginTrackedImmediate();
+    errdefer txn.rollback() catch {};
+    var ws = kv.WriteSet.init(allocator);
+    defer ws.deinit();
+    _ = try config_mirror.mirrorConfigToKv(
+        allocator,
+        manifest,
+        file_blobs.blobStore(),
+        app_kv,
+        &txn,
+        &ws,
+    );
+    const txn_seq = txn.txn_seq;
+    try txn.commit();
+    // Clear the undo row — seed is offline (no raft to confirm
+    // durability), so without this the worker's recoverOrphans
+    // sweep at startup would treat the write as uncommitted and
+    // roll it back. ws is discarded for the same reason: no raft
+    // to propose to. Followers re-derive identical state from
+    // their own seed pass.
+    if (txn_seq != 0) try app_kv.commitTxn(txn_seq);
 }
 
 /// Write `_deploy/current = {dep_id:016x}` to `<dd>/<id>/app.db`.

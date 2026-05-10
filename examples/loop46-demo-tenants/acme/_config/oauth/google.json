@@ -1,0 +1,6 @@
+{
+  "client_id": "smoke-google-client.apps.googleusercontent.com",
+  "redirect_uri": "https://acme.test/oauth/google/callback",
+  "scopes": ["openid", "email"],
+  "marker": "from-config-mirror-smoke"
+}

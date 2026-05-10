@@ -26,9 +26,19 @@ const manifest_json = files_mod.manifest_json;
 const CONFIG_PREFIX = "_config/";
 const JSON_SUFFIX = ".json";
 
+/// Maximum bytes for a single `_config/*.json` file. Matches the
+/// files-server upload cap (per-file 64 KB), so a config file
+/// that uploaded successfully always mirrors successfully — but
+/// stating it explicitly here means a future upload-cap bump
+/// doesn't silently inflate per-tenant raft envelope sizes.
+/// Real-world configs are <1 KB; the headroom is for jwks caches,
+/// large allow-lists, etc.
+pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+
 pub const Error = error{
     Blob,
     Kv,
+    ConfigTooLarge,
     OutOfMemory,
 };
 
@@ -80,6 +90,15 @@ pub fn mirrorConfigToKv(
             return Error.Blob;
         };
         defer allocator.free(bytes);
+
+        if (bytes.len > MAX_CONFIG_BYTES) {
+            std.log.warn(
+                "config_mirror: {s} is {d} bytes, exceeds {d}-byte cap",
+                .{ entry.path, bytes.len, MAX_CONFIG_BYTES },
+            );
+            allocator.free(kv_key);
+            return Error.ConfigTooLarge;
+        }
 
         txn.put(kv_key, bytes) catch {
             allocator.free(kv_key);
@@ -378,6 +397,60 @@ test "mirrorConfigToKv: re-running with same manifest is idempotent" {
 
     try testing.expectEqual(@as(usize, 1), stats.put_count);
     try testing.expectEqual(@as(usize, 0), stats.delete_count);
+}
+
+test "mirrorConfigToKv: rejects oversized config file" {
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_dir_path);
+
+    const db_path = try std.fs.path.joinZ(allocator, &.{ data_dir_path, "app.db" });
+    defer allocator.free(db_path);
+
+    var kv = try kv_mod.KvStore.open(allocator, db_path);
+    defer kv.close();
+
+    var fake = FakeBlobStore{ .allocator = allocator };
+    defer fake.deinit();
+    const blobs = fake.store();
+
+    // 65 KB blob — one byte over the cap.
+    const bloated = try allocator.alloc(u8, MAX_CONFIG_BYTES + 1);
+    defer allocator.free(bloated);
+    @memset(bloated, '{');
+    var hex: [64]u8 = undefined;
+    try writeBlob(&fake, bloated, &hex);
+
+    var entries = [_]files_mod.FileStore.Entry{
+        .{
+            .path = try allocator.dupe(u8, "_config/oauth/google.json"),
+            .kind = .static,
+            .content_type = try allocator.dupe(u8, "application/json"),
+            .source_hex = hex,
+            .bytecode_hex = std.mem.zeroes([64]u8),
+        },
+    };
+    defer for (entries) |e| {
+        allocator.free(e.path);
+        allocator.free(e.content_type);
+    };
+    const manifest: manifest_json.Manifest = .{
+        .id = 1,
+        .entries = &entries,
+        .allocator = allocator,
+    };
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    try testing.expectError(
+        Error.ConfigTooLarge,
+        mirrorConfigToKv(allocator, manifest, blobs, kv, &txn, &ws),
+    );
 }
 
 test "mirrorConfigToKv: ignores handler files even under _config/" {
