@@ -13,6 +13,14 @@
 
 ### 1. Phase 5.5(c) finish: raft log compaction wiring — **done 2026-05-09**
 
+> **Follow-up surfaced 2026-05-10**: see #1.1 below — the capture
+> pass blocks willemt heartbeats and triggers leadership flapping
+> at any scale where the pass takes longer than the election
+> timeout. Filed as a separate item; the compaction wiring itself
+> is done.
+
+
+
 The willemt `raft_begin_snapshot` / `raft_end_snapshot` bracket was
 already wired around `tickRaftCapture` (so willemt's `cbLogPoll`
 chain DELETEs compacted log entries). What was missing: the
@@ -34,6 +42,42 @@ Shipped:
 - `scripts/snapshot_smoke.sh` asserts `raft_log` row count + file
   size are bounded after 120 commits + 4 snapshot passes (was
   unbounded before).
+
+### 1.1 Move snapshot capture off the raft thread — **NEW, surfaced 2026-05-10**
+
+The per-tenant VACUUM INTO + S3 PUT + manifest serialize work
+in `tickRaftCapture` runs synchronously on the raft thread.
+For any non-trivial cluster (≥10 active tenants on commodity
+S3, or much more under faster local-fs backends) the pass
+takes longer than the willemt election timeout (default
+250ms). During that window willemt's heartbeat tick can't
+fire, followers time out, and the leader steps down mid-
+capture. The new leader takes over, captures once, loses
+leadership again — a self-reinforcing flap.
+
+Symptom: `scripts/snapshot_scalability_bench.sh` at
+`N_total=100, N_active=100` shows each node capturing exactly
+once with `reused=0` (cold-start cache always discarded by the
+safety guard because the prior leader's `floor` is past where
+the new leader has applied to). Steady-state never reached.
+
+Detail in `docs/snapshot-bench-results.md`.
+
+Fix shape: dedicated snapshot thread that takes a "begin
+snapshot" handoff from the raft thread, does VACUUM + S3 work
+independently, signals "end snapshot" back to the raft thread
+which then drives `endSnapshotOpaque()` + log compaction.
+Pattern: same separation we already use for `flushLogs` (it
+runs on a dedicated `flusherLoop` thread inside `Worker.create`
+specifically because S3 PUTs would block the dispatch hot path).
+
+Cost: ~1-2 days of work. Risk: medium — the raft thread already
+hands off through atomics for the apply-side wakeup, so adding
+one more channel is well-trodden ground; but the begin/end
+bracket invariants need careful preservation.
+
+**Blocks production at any density above ~5 active tenants per
+snapshot interval** with default raft timing flags + S3 latency.
 
 ### 2. By-reference manifest reuse for unchanged tenants — **done 2026-05-09 (with leader-snapshot fix)**
 
@@ -219,10 +263,17 @@ this is fine, but multi-customer prod with mixed tiers needs it.
 
 1. ~~**#1 raft log compaction.**~~ Done 2026-05-09.
 2. ~~**#2 by-reference reuse.**~~ Done 2026-05-09.
-3. **#7 leader-failover smoke.** Validates the at-least-once
+3. **#1.1 snapshot off the raft thread.** Surfaced 2026-05-10
+   by the scalability bench. Without this, periodic snapshots
+   are limited to ~5 active tenants per interval before
+   leadership flaps. Blocks production at the density Loop46 is
+   designed for.
+4. **#7 leader-failover smoke.** Validates the at-least-once
    contract you've already designed.
 4. **#4 deployment doc + systemd units.** Afternoon's work; turns
    "I know how to start this" into "an operator can start this."
-5. **#5 / #6 / #8.** Each an afternoon.
-6. **#9 / #10 / #11 / #12.** Real work but slot after launch
+5. **#4 deployment doc + systemd units.** Afternoon's work; turns
+   "I know how to start this" into "an operator can start this."
+6. **#5 / #6 / #8.** Each an afternoon.
+7. **#9 / #10 / #11 / #12.** Real work but slot after launch
    unless a specific customer requirement surfaces.
