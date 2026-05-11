@@ -29,6 +29,8 @@ REQUESTS="${1:-50000}"
 CLIENTS="${2:-10}"
 STREAMS="${3:-10}"
 PERF_SECS="${4:-8}"
+WORKERS="${WORKERS:-4}"
+WORKLOAD="${WORKLOAD:-sharded}"  # 'sharded' or 'hot'
 
 OUT_DIR="${OUT_DIR:-$HOME/bench}"
 mkdir -p "$OUT_DIR"
@@ -79,7 +81,7 @@ for i in 0 1 2; do
         --public-suffix "$PUBLIC_SUFFIX" \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
-        --workers 4 \
+        --workers "$WORKERS" \
         --rate-limit-request-capacity 1000000 \
         --rate-limit-request-refill 1000000 \
         "${RAFT_TIMING_FLAGS[@]}" \
@@ -112,14 +114,22 @@ done
 
 H2LOAD=(h2load --connect-to "127.0.0.1:${LEADER_PORT}")
 
-echo "kicking off load on 8 tenants (${REQUESTS} req each)…"
 LOAD_PIDS=()
-for i in 0 1 2 3 4 5 6 7; do
+if [[ "$WORKLOAD" == "hot" ]]; then
+    echo "kicking off hot load (${REQUESTS} req on hot.${PUBLIC_SUFFIX})…"
     "${H2LOAD[@]}" -n "$REQUESTS" -c "$CLIENTS" -m "$STREAMS" \
-        "https://write${i}.${PUBLIC_SUFFIX}:${LEADER_PORT}/?fn=handler" \
-        > "$OUT_DIR/load_${i}.log" 2>&1 &
+        "https://hot.${PUBLIC_SUFFIX}:${LEADER_PORT}/?fn=handler" \
+        > "$OUT_DIR/load_hot.log" 2>&1 &
     LOAD_PIDS+=($!)
-done
+else
+    echo "kicking off load on 8 tenants (${REQUESTS} req each)…"
+    for i in 0 1 2 3 4 5 6 7; do
+        "${H2LOAD[@]}" -n "$REQUESTS" -c "$CLIENTS" -m "$STREAMS" \
+            "https://write${i}.${PUBLIC_SUFFIX}:${LEADER_PORT}/?fn=handler" \
+            > "$OUT_DIR/load_${i}.log" 2>&1 &
+        LOAD_PIDS+=($!)
+    done
+fi
 
 # Give the load a moment to ramp up before sampling.
 sleep 1
@@ -135,17 +145,23 @@ extract_rps() {
     awk '/finished in/ { for (i=1;i<=NF;i++) if ($i ~ /req\/s/) print $(i-1); exit }'
 }
 
-total=0
 echo ""
-echo "── shard throughput (during profile window + tail) ──"
-for i in 0 1 2 3 4 5 6 7; do
-    rps=$(extract_rps < "$OUT_DIR/load_${i}.log")
-    rps_i=${rps%.*}
-    [[ -n "$rps_i" ]] || rps_i=0
-    total=$((total + rps_i))
-    echo "  write${i}: $rps req/s"
-done
-echo "  total:   $total req/s"
+if [[ "$WORKLOAD" == "hot" ]]; then
+    echo "── hot throughput (during profile window + tail) ──"
+    rps=$(extract_rps < "$OUT_DIR/load_hot.log")
+    echo "  hot:     $rps req/s"
+else
+    total=0
+    echo "── shard throughput (during profile window + tail) ──"
+    for i in 0 1 2 3 4 5 6 7; do
+        rps=$(extract_rps < "$OUT_DIR/load_${i}.log")
+        rps_i=${rps%.*}
+        [[ -n "$rps_i" ]] || rps_i=0
+        total=$((total + rps_i))
+        echo "  write${i}: $rps req/s"
+    done
+    echo "  total:   $total req/s"
+fi
 
 echo ""
 echo "── perf report (top self time, ≥0.5%) → $OUT_DIR/top_self.txt ──"

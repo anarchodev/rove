@@ -29,6 +29,7 @@ REQUESTS="${1:-30000}"
 CLIENTS="${2:-10}"
 STREAMS="${3:-10}"
 TENANTS=8
+WORKERS="${WORKERS:-4}"
 
 DATA_DIR_PREFIX="${DATA_DIR_PREFIX:-/tmp/rove-kv-bench}"
 HTTP_PORT_BASE="${HTTP_PORT_BASE:-8265}"
@@ -82,7 +83,7 @@ for i in 0 1 2; do
         --public-suffix "$PUBLIC_SUFFIX" \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
-        --workers 4 \
+        --workers "$WORKERS" \
         --rate-limit-request-capacity 1000000 \
         --rate-limit-request-refill 1000000 \
         "${RAFT_TIMING_FLAGS[@]}" \
