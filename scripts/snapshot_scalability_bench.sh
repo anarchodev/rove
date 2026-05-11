@@ -329,8 +329,6 @@ for i in 0 1 2; do
         --workers 1 \
         --files-internal-base "https://${FS_HTTP_ADDRS[0]}" \
         --files-internal-insecure-tls \
-        --rate-limit-request-capacity 1000 \
-        --rate-limit-request-refill 200 \
         "${RAFT_TIMING_FLAGS[@]}" \
         >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
     PIDS+=($!)
@@ -459,18 +457,8 @@ seq 0 $((STEADY_PARALLEL - 1)) | xargs -n1 -P "$STEADY_PARALLEL" -I{} \
                 -H "Content-Type: application/json" \
                 -d "{\"fn\":\"publishRelease\",\"args\":[\"$tid\",$dep]}" \
                 "https://app.loop46.localhost:${PORT}/" 2>/dev/null || echo 000)
-            # DIAGNOSTIC: tally codes so the bench can show distribution
-            echo "$code" >> "/tmp/'"$SMOKE_TAG"'-slot-${slot}.codes"
             if [[ "$code" == "202" ]]; then
                 cnt=$((cnt + 1))
-            else
-                # Curl failed (TLS / connect / 5xx) — sleep briefly so the
-                # bench does not spin the server with connection storms
-                # while it recovers. Without this, a single failing
-                # iteration causes the slot to fire ~1500 curls/sec at
-                # the server, masking what real per-request latency
-                # would look like.
-                sleep 0.05
             fi
             dep=$((dep + 1))
         done

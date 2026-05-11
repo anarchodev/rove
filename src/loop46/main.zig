@@ -480,7 +480,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .raft = args.raft,
         .addr = args.http_addr,
         .io_opts = .{
-            .max_connections = 65536,
+            .max_connections = 4096,
             .buf_count = 1024,
             .buf_size = 16384,
             .listen_backlog = 4096,
@@ -555,12 +555,6 @@ fn workerMain(args: *WorkerCtx) !void {
         args.internal_schedules_inflight = &internal_sched_inflight;
     }
 
-    // DIAGNOSTIC (task #55): periodic snapshot of the worker's
-    // collection sizes so we can spot O(N_tenants) growth on the
-    // hot path. Fires at most once per second to keep the log
-    // tractable.
-    var last_size_log_ns: i128 = std.time.nanoTimestamp();
-
     while (!stop_flag.load(.acquire)) {
         // Bounded-wait poll. The worker has multiple pieces of
         // background state that need periodic attention regardless of
@@ -579,33 +573,6 @@ fn workerMain(args: *WorkerCtx) !void {
             else => return err,
         };
 
-        // DIAGNOSTIC (task #55): emit collection size snapshot at
-        // ~1Hz so we can spot growth without flooding the log.
-        const _now: i128 = std.time.nanoTimestamp();
-        if (_now - last_size_log_ns >= std.time.ns_per_s) {
-            last_size_log_ns = _now;
-            std.log.info(
-                "colls: io.conns={d} tls_hs={d} conn_active={d} read_in={d} read_pending={d} read_active={d} read_handshake={d} read_init={d} read_errors={d} req_out={d} raft_pending={d} resp_in={d} resp_out={d} write_in={d} write_pending={d} write_results={d}",
-                .{
-                    worker.h2.io.connections.entitySlice().len,
-                    worker.h2._conn_tls_handshake.entitySlice().len,
-                    worker.h2._conn_active.entitySlice().len,
-                    worker.h2.io.read_in.entitySlice().len,
-                    worker.h2.io._read_pending.entitySlice().len,
-                    worker.h2._read_active.entitySlice().len,
-                    worker.h2._read_handshake.entitySlice().len,
-                    worker.h2._read_init.entitySlice().len,
-                    worker.h2._read_errors.entitySlice().len,
-                    worker.h2.request_out.entitySlice().len,
-                    worker.raft_pending.entitySlice().len,
-                    worker.h2.response_in.entitySlice().len,
-                    worker.h2.response_out.entitySlice().len,
-                    worker.h2.io.write_in.entitySlice().len,
-                    worker.h2.io._write_pending.entitySlice().len,
-                    worker.h2.io.write_results.entitySlice().len,
-                },
-            );
-        }
 
         // No /_system/* proxies on the worker anymore — the dashboard
         // hits the standalone services directly (logs.{suffix},
