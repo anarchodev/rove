@@ -73,6 +73,7 @@ const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
 const release_table_mod = @import("release_table.zig");
+const deployment_loader_mod = @import("deployment_loader.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = dispatcher_mod.Request;
 
@@ -690,6 +691,14 @@ pub fn Worker(comptime opts: Options) type {
         flusher_should_stop: std.atomic.Value(bool) = .init(false),
         flusher_wake: std.Thread.ResetEvent = .{},
 
+        /// Background deployment loader (see
+        /// `src/js/deployment_loader.zig`). The hot path enqueues
+        /// loads here; the loader thread runs `reloadDeployment`
+        /// off the dispatch loop so no request thread blocks on
+        /// network I/O. Null when the worker was started without
+        /// the loader wired (unit-test paths that don't need it).
+        deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
+
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
         /// `TenantFiles` for every instance currently registered with
@@ -775,7 +784,52 @@ pub fn Worker(comptime opts: Options) type {
 
             self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
 
+            // Spin up the deployment loader. The hot path enqueues
+            // here when a new release pointer is observed; the
+            // loader thread runs `reloadDeployment` off the dispatch
+            // loop. Failure to init is non-fatal — falls back to
+            // the synchronous reload in `applyPendingReleases`.
+            const loader = deployment_loader_mod.DeploymentLoader.init(
+                allocator,
+                @as(?*anyopaque, @ptrCast(self)),
+                deploymentLoadFn,
+            ) catch |err| blk: {
+                std.log.warn(
+                    "rove-js: deployment loader init failed: {s} — falling back to synchronous reload",
+                    .{@errorName(err)},
+                );
+                break :blk null;
+            };
+            if (loader) |l| {
+                l.start() catch |err| {
+                    std.log.warn(
+                        "rove-js: deployment loader start failed: {s}",
+                        .{@errorName(err)},
+                    );
+                    l.deinit();
+                    self.deployment_loader = null;
+                };
+                self.deployment_loader = l;
+            }
+
             return self;
+        }
+
+        /// `DeploymentLoader.LoadFn` thunk. Casts the opaque
+        /// worker pointer back to `*Self`, looks up the
+        /// requested tenant's `TenantFiles`, and runs
+        /// `reloadDeployment` on the loader thread. Errors are
+        /// logged + swallowed; a failed load is retried on the
+        /// next release that targets this tenant.
+        fn deploymentLoadFn(
+            ctx_opaque: ?*anyopaque,
+            tenant_id: []const u8,
+            dep_id: u64,
+        ) anyerror!void {
+            const worker: *Self = @ptrCast(@alignCast(ctx_opaque.?));
+            const tc = worker.tenant_files_map.get(tenant_id) orelse return;
+            if (tc.current_deployment_id == dep_id) return; // already loaded
+            try reloadDeployment(tc, dep_id);
         }
 
         /// Background log-flusher loop. Wakes every
@@ -809,6 +863,14 @@ pub fn Worker(comptime opts: Options) type {
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            // Stop the deployment loader FIRST — it holds
+            // `TenantFiles` pointers via the load thunk and we
+            // want it quiesced before we free the tenant map.
+            if (self.deployment_loader) |loader| {
+                loader.shutdown();
+                loader.deinit();
+                self.deployment_loader = null;
+            }
             // Signal the flusher thread to stop, wake it, and join.
             // The flusher's only blocking call is libcurl's
             // `curl_easy_perform`, which is bounded by `Easy`'s
@@ -1719,17 +1781,33 @@ pub fn applyPendingReleases(worker: anytype) !void {
         const released = table.get(tc.instance_id) orelse continue;
         if (released == tc.current_deployment_id) continue;
 
-        // Load the manifest the table named — NOT `_deploy/current`
-        // from the kv. The dashboard / CLI is the source of truth at
-        // release time; the kv copy is for cold-start recovery only.
-        // Reading from kv here would let in-flight envelope-0 apply
-        // delays bounce the worker between old and new manifests.
-        reloadDeployment(tc, released) catch |err| {
-            std.log.warn(
-                "rove-js release: tenant {s} reload to {d} failed: {s}",
-                .{ tc.instance_id, released, @errorName(err) },
-            );
-        };
+        // Hot path stays free of network I/O. Hand the load off
+        // to the background DeploymentLoader thread; it fetches
+        // the manifest + bytecodes + mirrors `_config/*` and
+        // swaps `tc`'s state when the load completes. The
+        // dispatch thread that ran this comparison just keeps
+        // moving — no synchronous reload here.
+        //
+        // Fallback: with no loader wired (unit-test FakeWorker,
+        // some smokes), run the load synchronously on this
+        // thread. Behavior matches the pre-loader build.
+        if (@hasField(@TypeOf(worker.*), "deployment_loader") and
+            worker.deployment_loader != null)
+        {
+            worker.deployment_loader.?.enqueue(tc.instance_id, released) catch |err| {
+                std.log.warn(
+                    "rove-js release: enqueue load {s}/{d} failed: {s}",
+                    .{ tc.instance_id, released, @errorName(err) },
+                );
+            };
+        } else {
+            reloadDeployment(tc, released) catch |err| {
+                std.log.warn(
+                    "rove-js release: tenant {s} reload to {d} failed: {s}",
+                    .{ tc.instance_id, released, @errorName(err) },
+                );
+            };
+        }
     }
 }
 

@@ -60,6 +60,8 @@ pub const events = @import("events.zig");
 pub const sse_dispatch = @import("sse_dispatch.zig");
 pub const sse_token = @import("sse_token.zig");
 pub const release_table = @import("release_table.zig");
+pub const deployment_loader = @import("deployment_loader.zig");
+pub const DeploymentLoader = deployment_loader.DeploymentLoader;
 
 pub const ReleaseTable = release_table.ReleaseTable;
 
@@ -111,4 +113,5 @@ test {
     _ = sse_dispatch;
     _ = sse_token;
     _ = release_table;
+    _ = deployment_loader;
 }
