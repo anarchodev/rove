@@ -7,9 +7,13 @@
 //!
 //! 1. A release POST commits `_deploy/current = N` to raft and
 //!    returns 200 immediately. No fetch on the request thread.
-//! 2. The dispatch tick's `applyPendingReleases` observes the new
-//!    release pointer and ENQUEUES a load via `enqueue(tenant_id,
-//!    dep_id)` instead of calling `reloadDeployment` inline.
+//! 2. The proposing trampoline (`releasePublishTrampoline` for
+//!    `platform.releases.publish`, `handleRelease` for the
+//!    bootstrap-only `/_system/release` route) calls `enqueue`
+//!    inline. On follower nodes, `apply.zig`'s envelope-0 apply
+//!    detects `_deploy/current` writes and enqueues there too,
+//!    closing the cross-node propagation loop without an
+//!    in-memory ReleaseTable.
 //! 3. This thread picks up the queued load, calls `load_fn` (a
 //!    worker-supplied callback), which is responsible for:
 //!      - Fetching the manifest from files-server (HTTP).

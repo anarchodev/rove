@@ -59,11 +59,8 @@ pub const session = @import("session.zig");
 pub const events = @import("events.zig");
 pub const sse_dispatch = @import("sse_dispatch.zig");
 pub const sse_token = @import("sse_token.zig");
-pub const release_table = @import("release_table.zig");
 pub const deployment_loader = @import("deployment_loader.zig");
 pub const DeploymentLoader = deployment_loader.DeploymentLoader;
-
-pub const ReleaseTable = release_table.ReleaseTable;
 
 pub const Budget = dispatcher.Budget;
 pub const PenaltyBox = penalty.PenaltyBox;
@@ -92,7 +89,6 @@ pub const CALLBACK_DEFAULT_MAX_PER_TENANT = callback_dispatch.DEFAULT_MAX_PER_TE
 pub const dispatchInternalSchedules = internal_schedules.dispatchInternalSchedules;
 pub const INTERNAL_SCHEDULES_DEFAULT_MAX_PER_PASS = internal_schedules.DEFAULT_MAX_PER_PASS;
 pub const drainRaftPending = worker.drainRaftPending;
-pub const applyPendingReleases = worker.applyPendingReleases;
 pub const cleanupResponses = worker.cleanupResponses;
 pub const flushLogs = worker.flushLogs;
 
@@ -112,6 +108,5 @@ test {
     _ = events;
     _ = sse_dispatch;
     _ = sse_token;
-    _ = release_table;
     _ = deployment_loader;
 }

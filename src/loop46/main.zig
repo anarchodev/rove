@@ -299,13 +299,6 @@ const WorkerCtx = struct {
     /// shared across threads, so each worker owns its own.
     /// Initialized at the top of `workerMain` and destroyed at exit.
     compiler: *QjsCompiler,
-    /// Process-wide push-release table. Every worker thread shares
-    /// the same instance; the system-route handler at
-    /// `/_system/release` writes into it after admin-authed POSTs and
-    /// each worker's dispatch tick reads it via
-    /// `applyPendingReleases`. Phase 5.5(e) F2 replaced the legacy
-    /// `refreshDeployments` polling loop.
-    release_table: *rjs.ReleaseTable,
     /// Picks fs vs s3 for every per-tenant blob backend the worker
     /// opens. Borrowed from the main thread's `BlobBackendOwned`,
     /// which keeps the underlying strings alive for the worker's
@@ -508,7 +501,6 @@ fn workerMain(args: *WorkerCtx) !void {
         .admin_origin = args.admin_origin,
         .admin_api_domain = args.admin_api_domain,
         .log_worker_id = args.worker_idx,
-        .release_table = args.release_table,
         .rate_limit_caps = args.rate_limit_caps,
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
@@ -568,9 +560,6 @@ fn workerMain(args: *WorkerCtx) !void {
         // background state that need periodic attention regardless of
         // incoming I/O:
         //   - parked raft entries (drainRaftPending)
-        //   - released deployments pushed via `/_system/release`
-        //     (applyPendingReleases — Phase 5.5(e) F2 retired the
-        //     2-second `refreshDeployments` polling loop)
         //   - buffered log records waiting on a flush threshold (flushLogs)
         // The cheapest correct shape is: every poll has a deadline,
         // the loop body runs at least that often, idle CPU stays
@@ -604,7 +593,6 @@ fn workerMain(args: *WorkerCtx) !void {
         try reg.flush();
         try rjs.cleanupResponses(worker);
         try reg.flush();
-        try rjs.applyPendingReleases(worker);
 
         // Schedule callback dispatch: on the raft leader, worker 0
         // scans every tenant's `_callback/*` rows left by the
@@ -1299,14 +1287,6 @@ pub fn main() !void {
     var seq_counters = kv.SeqCounterRegistry.init(allocator);
     defer seq_counters.deinit();
 
-    // One ReleaseTable per process. The main thread allocates it once;
-    // every worker borrows the same pointer. Writes happen from the
-    // `/_system/release` system handler (admin-authed POST) on
-    // whichever worker took the request; reads happen from every
-    // worker's `applyPendingReleases` once per tick.
-    var release_table = rjs.ReleaseTable.init(allocator);
-    defer release_table.deinit();
-
     var i: u16 = 0;
     while (i < num_workers) : (i += 1) {
         ctxs[i] = .{
@@ -1338,7 +1318,6 @@ pub fn main() !void {
             // and fills this field before `Worker.create`. The main
             // thread never dereferences it.
             .compiler = undefined,
-            .release_table = &release_table,
             .blob_backend_cfg = blob_owned.cfg,
             .tls_config = tls_config,
             .seq_counters = &seq_counters,

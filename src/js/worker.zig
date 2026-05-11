@@ -72,7 +72,6 @@ const penalty_mod = @import("penalty.zig");
 const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
-const release_table_mod = @import("release_table.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = dispatcher_mod.Request;
@@ -198,9 +197,11 @@ fn triggerPathToPrefix(path: []const u8) ?[]const u8 {
 /// and the customer-write guard counterpart.
 const isReservedTriggerPrefix = reserved.isReservedTriggerPrefix;
 
-/// Reloaded by `applyPendingReleases` whenever the dashboard / CLI
-/// pushes a new deployment id into the process-wide `ReleaseTable`
-/// via `/_system/release`.
+/// Reloaded by the background `DeploymentLoader` thread whenever a
+/// release lands (operator path: __admin__'s `publishRelease` RPC;
+/// platform-bootstrap path: `/_system/release`). The proposing
+/// trampoline enqueues the loader inline on the leader; followers
+/// pick up the enqueue from `apply.zig`'s `_deploy/current` detector.
 pub const TenantFiles = struct {
     allocator: std.mem.Allocator,
     /// Owned copy of the instance id. Used as the key in the worker's
@@ -221,7 +222,8 @@ pub const TenantFiles = struct {
     /// Owned blob backend for per-deployment manifest JSON. Same fs/
     /// s3 picker as `blob_backend`, just a different per-tenant
     /// subdir (`deployments/`). Files-server writes here at deploy
-    /// time; the worker reads here on `applyPendingReleases`.
+    /// time; the deployment loader reads here when fetching the
+    /// manifest for a newly-released `_deploy/current`.
     manifest_backend: blob_mod.BlobBackend,
     /// Deployment id we last loaded. `0` = no deployment observed yet.
     current_deployment_id: u64,
@@ -434,13 +436,6 @@ pub const WorkerConfig = struct {
     /// Upper bound on how long a parked raft proposal can wait before
     /// we compensate-rollback and return 503. See `RaftWait` docs.
     commit_wait_timeout_ns: u64 = 2 * std.time.ns_per_s,
-    /// Process-wide `tenant_id → released_dep_id` table the worker
-    /// reads on every dispatch tick. The dashboard / CLI POST to
-    /// `/_system/release` after each successful files-server deploy
-    /// stamps the new id here; `applyPendingReleases` triggers the
-    /// reload. When null, releases never reach the worker — useful
-    /// only for tests that pre-load every deployment at startup.
-    release_table: ?*release_table_mod.ReleaseTable = null,
     /// Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — HMAC-SHA256
     /// secret used to sign JWTs minted at `/_system/services-token`.
     /// The standalone log-server + files-server (separate threads /
@@ -613,9 +608,6 @@ pub fn Worker(comptime opts: Options) type {
         /// exhausted.
         limiter: limiter_mod.RateLimiter,
         commit_wait_timeout_ns: u64,
-        /// Borrowed from `WorkerConfig.release_table`. See the config
-        /// field for semantics. Null disables the push surface entirely.
-        release_table: ?*release_table_mod.ReleaseTable,
         /// Borrowed from `WorkerConfig.admin_origin`. See the config
         /// field for semantics. Null when CORS is disabled.
         admin_origin: ?[]const u8,
@@ -740,7 +732,6 @@ pub fn Worker(comptime opts: Options) type {
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .limiter = limiter_mod.RateLimiter.init(allocator, config.rate_limit_caps),
                 .commit_wait_timeout_ns = config.commit_wait_timeout_ns,
-                .release_table = config.release_table,
                 .admin_origin = config.admin_origin,
                 .admin_api_domain = config.admin_api_domain,
                 .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
@@ -787,8 +778,8 @@ pub fn Worker(comptime opts: Options) type {
             // Spin up the deployment loader. The hot path enqueues
             // here when a new release pointer is observed; the
             // loader thread runs `reloadDeployment` off the dispatch
-            // loop. Failure to init is non-fatal — falls back to
-            // the synchronous reload in `applyPendingReleases`.
+            // loop. Failure to init is non-fatal — the worker's
+            // tenants stay on whatever deployment they had at boot.
             const loader = deployment_loader_mod.DeploymentLoader.init(
                 allocator,
                 @as(?*anyopaque, @ptrCast(self)),
@@ -1088,18 +1079,6 @@ pub fn Worker(comptime opts: Options) type {
                 };
             }
 
-            // Also stamp the in-memory release table so the
-            // (still-existing-for-now) `applyPendingReleases` path
-            // sees this tenant as needing reload. Once we retire
-            // applyPendingReleases (follow-up), this can drop.
-            if (self.release_table) |table| {
-                table.set(target_id, dep_id) catch |err| {
-                    std.log.warn(
-                        "releases.publish: release_table.set {s}/{d} failed: {s}",
-                        .{ target_id, dep_id, @errorName(err) },
-                    );
-                };
-            }
         }
 
     };
@@ -1111,8 +1090,9 @@ pub fn Worker(comptime opts: Options) type {
 // for source + bytecode bytes, `{inst.dir}/deployments/` for manifest
 // JSON) and load the active deployment from the tenant's app.db
 // `_deploy/current` pointer. Called eagerly during `Worker.create` for
-// every registered instance, and by `applyPendingReleases` whenever
-// the dashboard / CLI pushes a new release into the `ReleaseTable`.
+// every registered instance, and by the background `DeploymentLoader`
+// thread whenever a release lands (leader-side trampoline enqueue or
+// follower-side apply detector).
 
 /// Open (or re-use) a tenant code state. Allocates a `*TenantFiles`
 /// and attempts to load the current deployment's handler bytecode.
@@ -1692,8 +1672,8 @@ fn reloadAllBytecodes(tc: *TenantFiles) !void {
 /// Pull a specific deployment manifest from the per-tenant
 /// `deployments/` BlobBackend, fetch every referenced bytecode, and
 /// atomically swap the maps on `tc`. Used by `reloadAllBytecodes`
-/// (cold start / restart) and by `applyPendingReleases` (the
-/// dashboard pushed a new release).
+/// (cold start / restart) and by the background `DeploymentLoader`
+/// thread (a release landed).
 fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
     // Three-tier source for the manifest bytes:
     //   1. Already-cached `current_manifest_bytes` matching this
@@ -1866,72 +1846,6 @@ fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
         "rove-js: tenant {s} loaded deployment {d} ({d} handler(s), {d} static(s), {d} trigger(s))",
         .{ tc.instance_id, manifest.id, tc.bytecodes.count(), tc.statics.count(), tc.triggers.len },
     );
-}
-
-/// Walk every open tenant once per tick. For each, look up the latest
-/// released dep_id in the process-wide `ReleaseTable`; if it's newer
-/// than what the worker has cached, reload the bytecodes from this
-/// tenant's local files.db.
-///
-/// The push that populates the table comes from `/_system/release`
-/// (POST), driven by the dashboard / CLI right after a successful
-/// files-server deploy. Without the push, this is a no-op — there's
-/// no polling fallback. A new leader / restarted worker will have
-/// already loaded the latest deployment during `Worker.create`'s
-/// eager open, so the no-push baseline is "what was on disk at
-/// startup" rather than "nothing".
-pub fn applyPendingReleases(worker: anytype) !void {
-    const table = worker.release_table orelse return;
-
-    // Iterate the release table — typically << tenant_files_map
-    // at any given moment — instead of every tenant the worker
-    // knows about. Pre-#1.5 the dispatch tick scanned every
-    // open `TenantFiles` (O(N_total) per tick); at 10k tenants
-    // that's real time on the dispatch thread for the common
-    // case where almost no tenants have a pending release. The
-    // release table holds only the tenants the dashboard / CLI
-    // has actually called `/_system/release` on; iterating it
-    // gives us O(N_pending), closer to operator-rate (~handful
-    // per tick) than tenant-count-rate.
-    const W = @TypeOf(worker);
-    const Ctx = struct {
-        w: W,
-        const Self = @This();
-        fn cb(ctx: *Self, tenant_id: []const u8, released: u64) void {
-            const tc = ctx.w.tenant_files_map.get(tenant_id) orelse return;
-            if (released == tc.current_deployment_id) return;
-
-            // Hot path stays free of network I/O. Hand the load
-            // off to the background DeploymentLoader thread; it
-            // fetches the manifest + bytecodes + mirrors
-            // `_config/*` and swaps `tc`'s state when the load
-            // completes. The dispatch thread keeps moving — no
-            // synchronous reload here.
-            //
-            // Fallback: with no loader wired (unit-test
-            // FakeWorker, some smokes), run the load
-            // synchronously on this thread. Behavior matches
-            // the pre-loader build.
-            const HasLoader = @hasField(@typeInfo(W).pointer.child, "deployment_loader");
-            if (HasLoader and ctx.w.deployment_loader != null) {
-                ctx.w.deployment_loader.?.enqueue(tenant_id, released) catch |err| {
-                    std.log.warn(
-                        "rove-js release: enqueue load {s}/{d} failed: {s}",
-                        .{ tenant_id, released, @errorName(err) },
-                    );
-                };
-            } else {
-                reloadDeployment(tc, released) catch |err| {
-                    std.log.warn(
-                        "rove-js release: tenant {s} reload to {d} failed: {s}",
-                        .{ tenant_id, released, @errorName(err) },
-                    );
-                };
-            }
-        }
-    };
-    var ctx: Ctx = .{ .w = worker };
-    table.visit(&ctx, Ctx.cb);
 }
 
 // ── Dispatch system ───────────────────────────────────────────────────

@@ -314,12 +314,14 @@ fn tryHandleSystem(
         return true;
     }
 
-    // Phase 5.5(e) F2 — push-based release. The dashboard / CLI
-    // POSTs `{"tenant_id":"...","dep_id":N}` here right after a
-    // successful files-server deploy; we record the new id in the
-    // process-wide `ReleaseTable` and every worker's next dispatch
-    // tick reloads bytecodes via `applyPendingReleases`. Replaces
-    // the legacy 2-second `refreshDeployments` polling loop.
+    // Platform-bootstrap-only release endpoint. files-server's
+    // bootstrap thread POSTs `{"tenant_id":"...","dep_id":N}` here
+    // for the platform tenants (`__admin__`, `__replay__`) at
+    // startup — that's a chicken-and-egg: __admin__'s own handler
+    // can't be the entry point until `_deploy/current` has been
+    // stamped to point at __admin__'s manifest. Customer release
+    // traffic goes through `__admin__`'s deployed
+    // `publishRelease` RPC instead.
     if (std.mem.eql(u8, sys_rest, "release")) {
         try handleRelease(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
         return true;
@@ -488,12 +490,17 @@ fn loadManifestThroughTenantBackend(
     return try files_mod.manifest_json.decode(allocator, json_bytes);
 }
 
-/// release pointer to the tenant's app.db at `_deploy/current`
-/// (replicated via raft envelope 0 so cold-starts and other nodes
-/// see it), records the release in the process-wide `ReleaseTable`
-/// (so the per-worker dispatch tick observes it without polling),
-/// and returns 204. Idempotent — a repeat with the same dep_id
-/// re-stamps the kv row and re-publishes the table entry.
+/// Stamp `_deploy/current = {dep_id:0>16}` on the tenant's app.db,
+/// propose envelope 0, park the request on raft_pending, and
+/// return 204 once raft commits (or 503 on fault/timeout). Enqueues
+/// the deployment loader inline so the leader's worker starts
+/// fetching bytecodes immediately; the apply path on followers
+/// enqueues on its own when the writeset commits.
+///
+/// Platform-bootstrap only — customer release traffic goes through
+/// __admin__'s deployed `publishRelease` RPC. Kept on the system
+/// route because the admin handler itself can't bootstrap its own
+/// `_deploy/current` (chicken-and-egg at first boot).
 fn handleRelease(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -509,11 +516,6 @@ fn handleRelease(
         try respb.setSystemResponse(server, ent, sid, sess, 405, "POST only\n", allocator, cors_origin, null);
         return;
     }
-    const table = worker.release_table orelse {
-        try respb.setSystemResponse(server, ent, sid, sess, 503, "release table not configured\n", allocator, cors_origin, null);
-        return;
-    };
-
     var parsed = std.json.parseFromSlice(struct {
         tenant_id: []const u8,
         dep_id: u64,
@@ -611,17 +613,19 @@ fn handleRelease(
         return;
     };
 
-    // Stamp the release table now so the dispatch tick's
-    // applyPendingReleases / loader enqueue path sees this tenant
-    // immediately. If raft faults the proposal, the table entry
-    // would be stale until a re-publish — acceptable; the loader
-    // is idempotent on dep_id mismatch.
-    table.set(parsed.value.tenant_id, parsed.value.dep_id) catch |err| {
-        std.log.warn(
-            "release: release_table.set {s}/{d} failed: {s}",
-            .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
-        );
-    };
+    // Enqueue the deployment loader directly — the leader's apply
+    // path is leader-skip for envelope-0, so the apply thread won't
+    // do this for us on this node. On follower nodes, apply.zig's
+    // _deploy/current detector enqueues automatically when the
+    // writeset commits.
+    if (worker.deployment_loader) |loader| {
+        loader.enqueue(parsed.value.tenant_id, parsed.value.dep_id) catch |err| {
+            std.log.warn(
+                "release: deployment loader enqueue {s}/{d} failed: {s}",
+                .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
+            );
+        };
+    }
 
     // Park the request on raft_pending. drainRaftPending will:
     //   - on commit: commitTxn (drop kv_undo) + deliver 204
