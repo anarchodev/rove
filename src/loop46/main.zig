@@ -603,9 +603,11 @@ fn workerMain(args: *WorkerCtx) !void {
         // serialize them anyway via SQLITE_BUSY, but pinning avoids
         // the wasted turnaround.
         if (args.worker_idx == 0) {
-            _ = rjs.dispatchCallbacks(worker, rjs.CALLBACK_DEFAULT_MAX_PER_TENANT) catch |err| {
-                std.log.warn("worker {d}: dispatchCallbacks: {s}", .{ args.worker_idx, @errorName(err) });
-            };
+            if (args.internal_schedules_store) |sched_store| {
+                _ = rjs.dispatchCallbacks(worker, sched_store, rjs.CALLBACK_DEFAULT_MAX_PER_TENANT) catch |err| {
+                    std.log.warn("worker {d}: dispatchCallbacks: {s}", .{ args.worker_idx, @errorName(err) });
+                };
+            }
 
             // Internal-pool schedule dispatch (http-send-plan §3.2):
             // grab `is_internal=true` rows whose target tenant is

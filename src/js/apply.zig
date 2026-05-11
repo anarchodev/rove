@@ -735,7 +735,7 @@ fn applyScheduleComplete(ctx: *ApplyCtx, env: Envelope) void {
         // silently dropped (plan §7).
         if (existing.version != complete.version_at_fire) return;
 
-        // Skip the callback write when the customer set no
+        // Skip the callback stash when the customer set no
         // on_result module — fire-and-forget mode. Still falls
         // through to the schedules.db delete below.
         if (existing.row.on_result_module.len > 0) {
@@ -750,28 +750,14 @@ fn applyScheduleComplete(ctx: *ApplyCtx, env: Envelope) void {
             );
             defer ctx.allocator.free(event_json);
 
-            const tenant_kv = ctx.getKv(tenant_id) catch |err|
+            // Centralized callback row: stamped into `schedules.db`
+            // at `c/{tenant_id}/{id}` instead of the tenant's app.db
+            // at `_callback/{id}`. `dispatchCallbacks` scans the
+            // `c/` prefix once per tick (O(1) regardless of tenant
+            // count); per-tenant scans no longer needed.
+            store.addPendingCallback(tenant_id, complete.id, event_json) catch |err|
                 panic_mod.invariantViolated(
-                    "applyScheduleComplete.getKv",
-                    "tenant={s} err={s}",
-                    .{ tenant_id, @errorName(err) },
-                );
-
-            // _callback/{id} — id may be a customer handle (any
-            // utf8 except NUL, up to 256 bytes) so allocate.
-            const key = std.fmt.allocPrint(
-                ctx.allocator,
-                "_callback/{s}",
-                .{complete.id},
-            ) catch |err| panic_mod.invariantViolated(
-                "applyScheduleComplete.allocPrint",
-                "err={s}",
-                .{@errorName(err)},
-            );
-            defer ctx.allocator.free(key);
-            tenant_kv.put(key, event_json) catch |err|
-                panic_mod.invariantViolated(
-                    "applyScheduleComplete.put",
+                    "applyScheduleComplete.addPendingCallback",
                     "tenant={s} err={s}",
                     .{ tenant_id, @errorName(err) },
                 );

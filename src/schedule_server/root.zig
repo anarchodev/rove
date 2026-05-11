@@ -349,16 +349,130 @@ pub const ScheduleStore = struct {
     /// no-op (already fired or already cancelled). The customer's
     /// on_result handler does NOT fire on cancel — they cancelled,
     /// they don't get a delivery notification.
+    ///
+    /// Also deletes any matching pending-callback row at `c/{tenant}/{id}`
+    /// — same opcode handles both the customer's "cancel this
+    /// scheduled send" path AND the leader's "callback delivered,
+    /// clean up" path. The two paths never race on the same row
+    /// because envelope-9 (complete) is what transitions s/ → c/,
+    /// and a cancel after complete is a no-op for s/ (already gone)
+    /// + a real DELETE for c/.
     pub fn applyCancel(self: *ScheduleStore, tenant_id: []const u8, id: []const u8) Error!void {
         try validateId(id);
-        const key_len = 2 + tenant_id.len + 1 + id.len;
-        const key_buf = self.allocator.alloc(u8, key_len) catch return Error.OutOfMemory;
-        defer self.allocator.free(key_buf);
-        const key = rowKey(key_buf, tenant_id, id);
-        self.db.delete(key) catch |err| switch (err) {
-            error.NotFound => return,
+        const sk_buf = self.allocator.alloc(u8, 2 + tenant_id.len + 1 + id.len) catch return Error.OutOfMemory;
+        defer self.allocator.free(sk_buf);
+        const sk = rowKey(sk_buf, tenant_id, id);
+        self.db.delete(sk) catch |err| switch (err) {
+            error.NotFound => {},
             else => return Error.Kv,
         };
+        const ck_buf = self.allocator.alloc(u8, 2 + tenant_id.len + 1 + id.len) catch return Error.OutOfMemory;
+        defer self.allocator.free(ck_buf);
+        const ck = callbackKey(ck_buf, tenant_id, id);
+        self.db.delete(ck) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return Error.Kv,
+        };
+    }
+
+    /// Build `c/{tenant_id}/{id}` — pending-callback row key. Same
+    /// layout as `s/...` but a different prefix so the dispatch tick
+    /// can scan callbacks without iterating active schedules.
+    fn callbackKey(buf: []u8, tenant_id: []const u8, id: []const u8) []u8 {
+        std.debug.assert(buf.len >= 2 + tenant_id.len + 1 + id.len);
+        var pos: usize = 0;
+        @memcpy(buf[pos..][0..2], "c/");
+        pos += 2;
+        @memcpy(buf[pos..][0..tenant_id.len], tenant_id);
+        pos += tenant_id.len;
+        buf[pos] = '/';
+        pos += 1;
+        @memcpy(buf[pos..][0..id.len], id);
+        pos += id.len;
+        return buf[0..pos];
+    }
+
+    /// Stash a delivered `_callback/{id}` event under
+    /// `c/{tenant_id}/{id}` for the dispatch tick to pick up. Replaces
+    /// the legacy per-tenant `_callback/{id}` write in the customer's
+    /// app.db — centralization here lets `dispatchCallbacks` do one
+    /// SELECT instead of fanning out across every tenant. Apply path
+    /// only (envelope 9 / `applyScheduleComplete`).
+    ///
+    /// Idempotent: re-applying with the same payload overwrites; the
+    /// dispatch tick is keyed by (tenant_id, id) so a re-stamp doesn't
+    /// produce a duplicate delivery.
+    pub fn addPendingCallback(
+        self: *ScheduleStore,
+        tenant_id: []const u8,
+        id: []const u8,
+        payload: []const u8,
+    ) Error!void {
+        try validateId(id);
+        const key_buf = self.allocator.alloc(u8, 2 + tenant_id.len + 1 + id.len) catch return Error.OutOfMemory;
+        defer self.allocator.free(key_buf);
+        const key = callbackKey(key_buf, tenant_id, id);
+        self.db.put(key, payload) catch return Error.Kv;
+    }
+
+    pub const CallbackRow = struct {
+        tenant_id: []const u8,
+        id: []const u8,
+        payload: []const u8,
+
+        pub fn deinit(self: *CallbackRow, allocator: std.mem.Allocator) void {
+            allocator.free(self.tenant_id);
+            allocator.free(self.id);
+            allocator.free(self.payload);
+            self.* = undefined;
+        }
+    };
+
+    /// Scan the `c/` prefix and return up to `max` pending-callback
+    /// rows. Replaces `dispatchCallbacks`'s per-tenant
+    /// `kv.prefix("_callback/", ...)` walk — one scan covers every
+    /// tenant. Caller owns the returned slice; each `CallbackRow`
+    /// must be `deinit`'d (then the slice freed).
+    pub fn dueCallbackRows(
+        self: *ScheduleStore,
+        allocator: std.mem.Allocator,
+        max: usize,
+    ) Error![]CallbackRow {
+        var out: std.ArrayList(CallbackRow) = .empty;
+        errdefer {
+            for (out.items) |*r| r.deinit(allocator);
+            out.deinit(allocator);
+        }
+
+        const limit_per_page: u32 = @intCast(@min(max, 1024));
+        var page = self.db.prefix("c/", "", limit_per_page) catch return Error.Kv;
+        defer page.deinit();
+        for (page.entries) |entry| {
+            // `c/{tenant_id}/{id}` — split on the first `/` after the
+            // prefix. tenant_id has no `/` (validateInstanceId rejects
+            // it), so the first `/` past index 2 is the separator.
+            const key = entry.key;
+            if (!std.mem.startsWith(u8, key, "c/")) continue;
+            const rest = key[2..];
+            const slash = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
+            const tenant = rest[0..slash];
+            const id = rest[slash + 1 ..];
+
+            const t_copy = allocator.dupe(u8, tenant) catch return Error.OutOfMemory;
+            errdefer allocator.free(t_copy);
+            const i_copy = allocator.dupe(u8, id) catch return Error.OutOfMemory;
+            errdefer allocator.free(i_copy);
+            const p_copy = allocator.dupe(u8, entry.value) catch return Error.OutOfMemory;
+            errdefer allocator.free(p_copy);
+
+            out.append(allocator, .{
+                .tenant_id = t_copy,
+                .id = i_copy,
+                .payload = p_copy,
+            }) catch return Error.OutOfMemory;
+            if (out.items.len >= max) break;
+        }
+        return out.toOwnedSlice(allocator) catch return Error.OutOfMemory;
     }
 
     /// Read one stored schedule. Returns null if absent. Caller

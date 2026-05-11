@@ -2,15 +2,21 @@
 //! after the schedule-server finishes an http.send attempt
 //! (delivered or terminally failed).
 //!
-//! Envelope-9 apply writes `_callback/{id}` receipts into the
-//! tenant's app.db when a schedule completes. This phase, driven
-//! from the worker poll loop on the raft leader, scans those
-//! receipts, resolves the customer's `on_result` handler path to
-//! bytecode, and invokes it with the event JSON in `request.body`.
-//! Each tenant's successful invocations (plus the receipt deletes)
-//! commit atomically in one SQLite txn and propose through raft
-//! as a single writeset — same at-least-once / deterministic-
-//! replay envelope as an HTTP-driven handler.
+//! Envelope-9 apply stashes the delivered callback event in the
+//! cluster-wide schedule store at `c/{tenant_id}/{id}` (alongside the
+//! schedule rows at `s/{tenant_id}/{id}`). This phase, driven from
+//! the worker poll loop on the raft leader, scans the `c/` prefix
+//! ONCE per tick, groups the rows by tenant, and invokes the
+//! customer's `on_result` handler with the event JSON in
+//! `request.body`. Each tenant's successful invocations + the
+//! companion `c/` row delete (via envelope-10 cancel) commit
+//! atomically in one tenant txn + one multi-envelope propose.
+//!
+//! The legacy `_callback/{id}` rows in the tenant's own app.db
+//! retired with #52 — at 1k+ tenants the per-tick fan-out SELECT
+//! across every tenant's app.db took longer than the dispatch
+//! tick budget. The centralized `c/` prefix is one prefix scan
+//! regardless of tenant count.
 //!
 //! ## Contract with the handler
 //!
@@ -71,37 +77,89 @@ const raft_propose = @import("raft_propose.zig");
 const Request = dispatcher_mod.Request;
 const Budget = dispatcher_mod.Budget;
 
-/// Default per-tenant cap per pass. Generous at 32 — a tenant with
-/// more pending callbacks than this per tick is almost certainly
-/// backlogged from a prior outage and will drain over subsequent
-/// ticks. Small enough to keep one tenant from starving others.
+/// Per-pass cap on rows fetched from the shared `c/` prefix. Bounds
+/// the dispatch tick's wall time at high callback volumes; the
+/// remainder catches up on subsequent ticks.
 pub const DEFAULT_MAX_PER_TENANT: u32 = 32;
 
-/// One pass over every known tenant's `_callback/*` rows on the raft
-/// leader. Returns the number of receipts visited (visited includes
-/// both delivered and kept-for-retry).
-pub fn dispatchCallbacks(worker: anytype, max_per_tenant: u32) !usize {
+/// Process up to `max_per_tenant * N_tenants_with_pending` rows from
+/// `schedules.db c/` in one pass. Returns the total number of rows
+/// visited (delivered + kept-for-retry). Caller passes the per-node
+/// `ScheduleStore` (same handle `dispatchInternalSchedules` uses);
+/// the dispatch tick is gated to worker 0 on the leader by the
+/// caller.
+pub fn dispatchCallbacks(
+    worker: anytype,
+    schedules_store: *schedule_server_mod.ScheduleStore,
+    max_per_tenant: u32,
+) !usize {
     if (!worker.raft.isLeader()) return 0;
 
+    const allocator = worker.allocator;
+
+    // Cluster-wide single scan of the callback prefix. Replaces the
+    // previous per-tenant fan-out (one SELECT per tenant per tick).
+    // Cap is intentionally generous — at 32 rows × 1k pending tenants
+    // we'd visit 32k rows / tick, but realistic platforms see far
+    // fewer pending callbacks at any instant.
+    const CAP: usize = 4096;
+    var rows = schedules_store.dueCallbackRows(allocator, CAP) catch |err| {
+        std.log.warn("rove-js callbacks: dueCallbackRows: {s}", .{@errorName(err)});
+        return 0;
+    };
+    defer {
+        for (rows) |*r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    if (rows.len == 0) return 0;
+
+    // Group rows by tenant. Sort by tenant_id so contiguous slices
+    // per tenant fall out of one pass.
+    std.sort.pdq(@TypeOf(rows[0]), rows, {}, struct {
+        fn lt(_: void, a: @TypeOf(rows[0]), b: @TypeOf(rows[0])) bool {
+            return std.mem.lessThan(u8, a.tenant_id, b.tenant_id);
+        }
+    }.lt);
+
     var total: usize = 0;
-    var it = worker.tenant_files_map.iterator();
-    while (it.next()) |entry| {
-        const tc = entry.value_ptr.*;
-        if (tc.current_deployment_id == 0) continue; // no code → nothing callable
-        const inst_opt = worker.tenant.getInstance(tc.instance_id) catch |err| {
-            std.log.warn(
-                "rove-js callbacks: getInstance({s}) failed: {s}",
-                .{ tc.instance_id, @errorName(err) },
-            );
+    var start: usize = 0;
+    while (start < rows.len) {
+        var end = start + 1;
+        while (end < rows.len and std.mem.eql(u8, rows[end].tenant_id, rows[start].tenant_id)) : (end += 1) {}
+        defer start = end;
+
+        const tenant_id = rows[start].tenant_id;
+        const slice = rows[start..end];
+
+        const tc = worker.tenant_files_map.get(tenant_id) orelse {
+            // Tenant was deleted between schedule-fire and now; drop
+            // the callback rows so they don't accumulate forever.
+            for (slice) |r| {
+                schedules_store.applyCancel(r.tenant_id, r.id) catch |err| {
+                    std.log.warn(
+                        "rove-js callbacks: orphan-cleanup {s}/{s}: {s}",
+                        .{ r.tenant_id, r.id, @errorName(err) },
+                    );
+                };
+            }
+            continue;
+        };
+        if (tc.current_deployment_id == 0) {
+            // Tenant has no current deployment; the handler isn't
+            // available. Drop rather than retry forever.
+            for (slice) |r| {
+                schedules_store.applyCancel(r.tenant_id, r.id) catch {};
+            }
+            continue;
+        }
+        const inst_opt = worker.tenant.getInstance(tenant_id) catch |err| {
+            std.log.warn("rove-js callbacks: getInstance({s}): {s}", .{ tenant_id, @errorName(err) });
             continue;
         };
         const inst = inst_opt orelse continue;
 
-        const n = drainTenantCallbacks(worker, tc, inst, max_per_tenant) catch |err| {
-            std.log.warn(
-                "rove-js callbacks: tenant {s}: {s}",
-                .{ inst.id, @errorName(err) },
-            );
+        const n = drainTenantCallbacks(worker, tc, inst, slice, @intCast(@min(slice.len, max_per_tenant))) catch |err| {
+            std.log.warn("rove-js callbacks: tenant {s}: {s}", .{ inst.id, @errorName(err) });
             continue;
         };
         total += n;
@@ -113,14 +171,12 @@ fn drainTenantCallbacks(
     worker: anytype,
     tc: *worker_mod.TenantFiles,
     inst: *const tenant_mod.Instance,
+    rows: []schedule_server_mod.ScheduleStore.CallbackRow,
     max_per_tenant: u32,
 ) !usize {
     const allocator = worker.allocator;
-
-    // Cheap peek first — no write txn if there's nothing to do.
-    var scan = try inst.kv.prefix("_callback/", "", max_per_tenant);
-    defer scan.deinit();
-    if (scan.entries.len == 0) return 0;
+    const n_rows = @min(rows.len, max_per_tenant);
+    if (n_rows == 0) return 0;
 
     var txn = try inst.kv.beginTrackedImmediate();
     txn.open() catch |err| {
@@ -164,12 +220,12 @@ fn drainTenantCallbacks(
     }
 
     var visited: usize = 0;
-    for (scan.entries) |row| {
+    for (rows[0..n_rows]) |row| {
         visited += 1;
-        _ = runOneCallback(worker, tc, inst, &txn, &writeset, &pending_emits, &pending_schedules, &pending_cancels, row.key, row.value) catch |err| {
+        _ = runOneCallback(worker, tc, inst, &txn, &writeset, &pending_emits, &pending_schedules, &pending_cancels, row.id, row.payload) catch |err| {
             std.log.warn(
                 "rove-js callbacks: {s}/{s}: {s} (kept for retry)",
-                .{ inst.id, row.key, @errorName(err) },
+                .{ inst.id, row.id, @errorName(err) },
             );
             // savepoint (if any) was already rolled back inside
             // runOneCallback. The outer tenant txn stays healthy.
@@ -275,7 +331,7 @@ fn runOneCallback(
     pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
     pending_schedules: *std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow),
     pending_cancels: *std.ArrayListUnmanaged(schedule_server_mod.CancelTarget),
-    receipt_key: []const u8,
+    callback_id: []const u8,
     envelope_bytes: []const u8,
 ) !CallbackOutcome {
     const allocator = worker.allocator;
@@ -286,9 +342,9 @@ fn runOneCallback(
     }) catch {
         std.log.warn(
             "rove-js callbacks: {s}/{s}: malformed envelope; dropping",
-            .{ inst.id, receipt_key },
+            .{ inst.id, callback_id },
         );
-        try dropReceipt(txn, writeset, receipt_key);
+        try queueCancelDrop(allocator, pending_cancels, inst.id, callback_id);
         return .dropped;
     };
     defer parsed.deinit();
@@ -298,9 +354,9 @@ fn runOneCallback(
         else => {
             std.log.warn(
                 "rove-js callbacks: {s}/{s}: envelope not a JSON object; dropping",
-                .{ inst.id, receipt_key },
+                .{ inst.id, callback_id },
             );
-            try dropReceipt(txn, writeset, receipt_key);
+            try queueCancelDrop(allocator, pending_cancels, inst.id, callback_id);
             return .dropped;
         },
     };
@@ -312,9 +368,9 @@ fn runOneCallback(
             // rather than loop forever.
             std.log.warn(
                 "rove-js callbacks: {s}/{s}: no on_result; dropping",
-                .{ inst.id, receipt_key },
+                .{ inst.id, callback_id },
             );
-            try dropReceipt(txn, writeset, receipt_key);
+            try queueCancelDrop(allocator, pending_cancels, inst.id, callback_id);
             return .dropped;
         },
     };
@@ -322,16 +378,16 @@ fn runOneCallback(
     const bytecode_opt = findCallbackBytecode(tc, on_result) catch |err| {
         std.log.warn(
             "rove-js callbacks: {s}/{s}: handler '{s}' resolve error: {s} (kept)",
-            .{ inst.id, receipt_key, on_result, @errorName(err) },
+            .{ inst.id, callback_id, on_result, @errorName(err) },
         );
         return .kept;
     };
     const bytecode = bytecode_opt orelse {
         std.log.warn(
             "rove-js callbacks: {s}/{s}: handler '{s}' not in current deployment; dropping",
-            .{ inst.id, receipt_key, on_result },
+            .{ inst.id, callback_id, on_result },
         );
-        try dropReceipt(txn, writeset, receipt_key);
+        try queueCancelDrop(allocator, pending_cancels, inst.id, callback_id);
         return .dropped;
     };
 
@@ -401,7 +457,7 @@ fn runOneCallback(
         txn.rollbackTo() catch {};
         std.log.warn(
             "rove-js callbacks: {s}/{s} handler run failed: {s} (kept)",
-            .{ inst.id, receipt_key, @errorName(err) },
+            .{ inst.id, callback_id, @errorName(err) },
         );
         return .kept;
     };
@@ -412,7 +468,7 @@ fn runOneCallback(
         txn.rollbackTo() catch {};
         std.log.warn(
             "rove-js callbacks: {s}/{s} handler hit kv error (kept)",
-            .{ inst.id, receipt_key },
+            .{ inst.id, callback_id },
         );
         return .kept;
     }
@@ -421,22 +477,42 @@ fn runOneCallback(
         txn.rollbackTo() catch {};
         std.log.warn(
             "rove-js callbacks: {s}/{s} handler threw: {s} (kept)",
-            .{ inst.id, receipt_key, resp.exception },
+            .{ inst.id, callback_id, resp.exception },
         );
         return .kept;
     }
 
-    // Success: release the savepoint and queue the receipt delete.
+    // Success: release the savepoint and queue an envelope-10 cancel
+    // for the `c/{tenant}/{id}` row in schedules.db. The handler's
+    // writeset commits below; the cancel rides alongside in the
+    // multi-envelope propose.
     txn.release() catch |err| {
         std.log.warn(
             "rove-js callbacks: {s}/{s} release failed: {s} (kept)",
-            .{ inst.id, receipt_key, @errorName(err) },
+            .{ inst.id, callback_id, @errorName(err) },
         );
         return .kept;
     };
-    try txn.delete(receipt_key);
-    try writeset.addDelete(receipt_key);
+    try queueCancelDrop(allocator, pending_cancels, inst.id, callback_id);
     return .delivered;
+}
+
+/// Append an envelope-10 cancel target for `(tenant_id, callback_id)`.
+/// The applyCancel path deletes both `s/{tenant}/{id}` (no-op when
+/// the schedule already fired) and `c/{tenant}/{id}` (the cleanup
+/// we want here). Uses the pending_cancels accumulator's allocator;
+/// the deferred deinit at drainTenantCallbacks level owns the dupes.
+fn queueCancelDrop(
+    allocator: std.mem.Allocator,
+    pending_cancels: *std.ArrayListUnmanaged(schedule_server_mod.CancelTarget),
+    tenant_id: []const u8,
+    callback_id: []const u8,
+) !void {
+    const t_copy = try allocator.dupe(u8, tenant_id);
+    errdefer allocator.free(t_copy);
+    const i_copy = try allocator.dupe(u8, callback_id);
+    errdefer allocator.free(i_copy);
+    try pending_cancels.append(allocator, .{ .tenant_id = t_copy, .id = i_copy });
 }
 
 /// Direct lookup in the tenant's bytecode map. No walk-up — the
@@ -589,16 +665,6 @@ const FIELD_MAP = [_]struct { src: []const u8, dst: []const u8 }{
     .{ .src = "context", .dst = "context" },
     .{ .src = "error", .dst = "error" },
 };
-
-/// Queue a receipt delete in both local txn + raft writeset.
-fn dropReceipt(
-    txn: *kv_mod.KvStore.TrackedTxn,
-    writeset: *kv_mod.WriteSet,
-    receipt_key: []const u8,
-) !void {
-    try txn.delete(receipt_key);
-    try writeset.addDelete(receipt_key);
-}
 
 // ── Tests ──────────────────────────────────────────────────────────
 
