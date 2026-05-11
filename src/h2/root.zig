@@ -338,7 +338,13 @@ pub const H2Options = struct {
     max_frame_size: u32 = 16384,
     max_header_list_size: u32 = 0,
     max_h2_connections: u32 = 0,
-    idle_timeout_ns: u64 = 0,
+    /// Connections idle for longer than this get destroyed by
+    /// `driveAllSends` so abandoned clients release their registered
+    /// recv buffer back to the pool. 30 s by default — long enough
+    /// for HTTP/2 keep-alive across realistic request gaps, short
+    /// enough that a misbehaving / disappeared client doesn't pin
+    /// resources indefinitely. Set to 0 to disable (legacy behavior).
+    idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
     tls_config: ?*TlsConfig = null,
 };
 
@@ -600,6 +606,16 @@ pub fn H2(comptime opts: Options) type {
         fn resolveFdThunk(ctx: *anyopaque, entity: Entity) ?*rio.Fd {
             const h2: *Self = @ptrCast(@alignCast(ctx));
             return h2.reg.getAny(entity, h2.connColls(), rio.Fd) catch null;
+        }
+
+        /// Extra-conns callback for io's admission control. Returns the
+        /// count of conn entities h2 holds outside `io.connections` —
+        /// i.e. those that have already been promoted past the
+        /// post-accept window. Combined with `io.connections.len` in
+        /// `handleAccept` to estimate total in-flight conns.
+        fn extraConnsThunk(ctx: *anyopaque) usize {
+            const h2: *Self = @ptrCast(@alignCast(ctx));
+            return h2._conn_tls_handshake.entitySlice().len + h2._conn_active.entitySlice().len;
         }
 
         // =============================================================
@@ -1098,6 +1114,10 @@ pub fn H2(comptime opts: Options) type {
             // Register FD resolver with io so that processWriteIn/processReadIn
             // can find connection Fds when h2 has moved them to _conn_active etc.
             self.io.setFdResolver(@ptrCast(self), &resolveFdThunk);
+            // Admission control: io counts conns in `io.connections` +
+            // whatever this callback returns. h2 holds promoted conns
+            // in `_conn_tls_handshake` + `_conn_active`.
+            self.io.setExtraConnsFn(@ptrCast(self), &extraConnsThunk);
 
             return self;
         }

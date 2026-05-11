@@ -243,6 +243,26 @@ pub fn Io(comptime opts: Options) type {
         fd_resolver: ?*const fn (ctx: *anyopaque, entity: Entity) ?*Fd = null,
         fd_resolver_ctx: ?*anyopaque = null,
 
+        /// Optional callback that returns the number of conn entities
+        /// the upper layer (e.g. rove-h2) is currently holding outside
+        /// `self.connections` — for h2 that's
+        /// `_conn_tls_handshake + _conn_active`. `handleAccept` adds
+        /// the result to `self.connections.len` to estimate the
+        /// total in-flight conn count for admission control. When
+        /// unset (or returns 0) the budget check uses only
+        /// `self.connections.len`.
+        extra_conns_fn: ?*const fn (ctx: *anyopaque) usize = null,
+        extra_conns_ctx: ?*anyopaque = null,
+
+        /// Admission-control telemetry. Friendly back-pressure when
+        /// the conn count approaches `buf_count` — we refuse the
+        /// accept rather than letting the conn consume a buffer the
+        /// kernel doesn't have. See the warning surfacing in
+        /// `handleAccept`.
+        admission_denied_total: u64 = 0,
+        admission_denied_logged: bool = false,
+        admission_denied_last_logged_decade: u64 = 0,
+
         reg: *Registry,
         allocator: std.mem.Allocator,
 
@@ -262,6 +282,15 @@ pub fn Io(comptime opts: Options) type {
         pub fn setFdResolver(self: *Self, ctx: *anyopaque, resolver: *const fn (*anyopaque, Entity) ?*Fd) void {
             self.fd_resolver_ctx = ctx;
             self.fd_resolver = resolver;
+        }
+
+        /// Register a callback returning the count of conn entities the
+        /// upper layer holds outside `self.connections`. Used by
+        /// `handleAccept`'s admission-control check to estimate total
+        /// in-flight conn count vs. `buf_count`.
+        pub fn setExtraConnsFn(self: *Self, ctx: *anyopaque, f: *const fn (*anyopaque) usize) void {
+            self.extra_conns_ctx = ctx;
+            self.extra_conns_fn = f;
         }
 
         pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: IoOptions) !*Self {
@@ -592,6 +621,43 @@ pub fn Io(comptime opts: Options) type {
 
             const file_slot: u32 = @intCast(cqe.res);
             if (file_slot >= self.max_connections) return error.FileSlotOutOfRange;
+
+            // Admission control: if the in-flight conn count is close
+            // to `buf_count`, refuse the connection by closing the
+            // file slot immediately. Each conn ultimately holds at
+            // most one registered buffer for its armed recv; accepting
+            // past the pool's headroom guarantees recv ENOBUFS, which
+            // the upper layer now treats as transient (so requests
+            // succeed eventually) but the back-pressure is real. We
+            // surface it loudly to the operator (warning on first
+            // denial + every 10k thereafter) — the right answer is
+            // either bumping `buf_count` or, under attack, putting
+            // a CDN/edge in front. Reserved headroom: 12.5% of
+            // `buf_count`.
+            const io_conns = self.connections.entitySlice().len;
+            const upper_conns: usize = if (self.extra_conns_fn) |f|
+                f(self.extra_conns_ctx.?)
+            else
+                0;
+            const total_conns = io_conns + upper_conns;
+            const budget: usize = @as(usize, self.buf_count) - (@as(usize, self.buf_count) / 8);
+            if (total_conns >= budget) {
+                const close_sqe = try getSqeOrSubmit(&self.ring);
+                close_sqe.prep_close_direct(file_slot);
+                close_sqe.user_data = INTERNAL_SENTINEL;
+
+                self.admission_denied_total += 1;
+                const decade = self.admission_denied_total / 10_000;
+                if (!self.admission_denied_logged or decade != self.admission_denied_last_logged_decade) {
+                    self.admission_denied_logged = true;
+                    self.admission_denied_last_logged_decade = decade;
+                    std.log.warn(
+                        "rove-io: admission denied — in-flight conns ({d}) ≥ {d}/{d} budget (total denials: {d}). Bump `buf_count` or place a CDN/edge in front for sustained burst load.",
+                        .{ total_conns, budget, self.buf_count, self.admission_denied_total },
+                    );
+                }
+                return;
+            }
 
             const nodelay_sqe = try self.ring.setsockopt(
                 INTERNAL_SENTINEL,
