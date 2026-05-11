@@ -43,7 +43,7 @@ Shipped:
   size are bounded after 120 commits + 4 snapshot passes (was
   unbounded before).
 
-### 1.1 Decouple log compaction from byte capture — **steps 1+2 done 2026-05-10; step 3 (send_snapshot) pending**
+### 1.1 Decouple log compaction from byte capture — **done 2026-05-11**
 
 `scripts/snapshot_scalability_bench.sh` surfaced that the
 per-tenant VACUUM INTO + S3 PUT + manifest serialize work in
@@ -136,20 +136,29 @@ Implementation order:
    `scripts/snapshot_scalability_bench.sh` (`N_total=1000`:
    29ms avg, 40ms max — see
    `docs/snapshot-bench-results.md`).
-3. **Pending**. Wire willemt's `send_snapshot` callback to
-   trigger peer-to-peer app.db streaming via SQLite's online
-   backup API instead of just logging a warning. Receiving
-   side stages files in `tmp_dir/{snap_id}/`, atomic-renames
-   into `data_dir/`, calls `raft_load_snapshot`. (~2 days,
-   includes a multi-node smoke that kills + re-adds a follower
-   far behind the leader's snapshot floor.)
+3. **Done 2026-05-11.** Out-of-band peer-to-peer snapshot
+   catchup. The control-plane signal (small `snap_fetch_offer`
+   frame on the raft transport) carries only a fetch URL +
+   `(snap_id, snap_last_term, snap_last_idx)`; the actual bytes
+   stream over a dedicated `/_system/raft-snapshot/{snap_id}`
+   HTTPS endpoint, cap-gated by a new `Cap.RAFT_SNAPSHOT` on the
+   shared services JWT. Pattern follows etcd / CockroachDB /
+   TiKV — keeps a multi-MB transfer off the same TCP socket the
+   50ms heartbeat clock rides on. Receiver dispatches a detached
+   fetcher thread, GETs the bundle, stages each file in
+   `{data_dir}/.snap-in-{snap_id}/` (with an `_install_meta.json`
+   marker), then `std.process.exit(0)`. Next boot scans for the
+   staged dir, atomic-renames into `data_dir`, calls
+   `raft_load_snapshot(snap_last_idx, snap_last_term)` before
+   workers start. End-to-end smoke at
+   `scripts/snap_catchup_smoke.sh` verifies the full cycle:
+   stage → exit → install → load → cleanup.
 
-Net for steps 1+2 (delivered): heartbeat starvation eliminated
+Net for steps 1+2+3 (delivered): heartbeat starvation eliminated
 structurally (3000× faster pass at 1000 tenants), always-refresh-
-all property verified, no S3 work in the periodic path. Step 3
-(send_snapshot) remains for follower-catchup automation —
-without it, far-behind followers still need operator
-intervention via `loop46 restore-from-snapshot`.
+all property verified, no S3 work in the periodic path,
+far-behind-follower recovery is now fully automated — no
+operator restart needed.
 
 **Blocks production at any density above ~5 active tenants per
 snapshot interval** under the current code with default raft
@@ -663,13 +672,12 @@ this is fine, but multi-customer prod with mixed tiers needs it.
 2. ~~**#2 by-reference reuse.**~~ Done 2026-05-09; made
    vestigial 2026-05-10 (still works, no longer on a
    periodic path).
-3. **#1.1 decouple log compaction from byte capture.** Steps
-   1+2 done 2026-05-10 (heartbeat starvation eliminated
-   structurally; bench-verified at 1000 tenants with 40ms max
-   tick). Step 3 (`send_snapshot` peer-to-peer streaming for
-   follower catchup) is pending — without it, far-behind
-   followers still need operator intervention via
-   `loop46 restore-from-snapshot`. ~2 days remaining.
+3. ~~**#1.1 decouple log compaction from byte capture.**~~
+   Done 2026-05-11. Steps 1+2 (compaction restructure) shipped
+   2026-05-10; step 3 (peer-to-peer snapshot catchup via the
+   `snap_fetch_offer` control frame + `/_system/raft-snapshot/{id}`
+   HTTP fetch + boot-time install + `raft_load_snapshot`) shipped
+   2026-05-11. End-to-end smoke at `scripts/snap_catchup_smoke.sh`.
 4. **#1.2 non-voting learner replica = the entire DR story.**
    Step 1 (CLI plumbing + raft_add_node branch) done
    2026-05-10. Promotion endpoint + multi-node smoke pending,
