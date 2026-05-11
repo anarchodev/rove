@@ -812,6 +812,33 @@ pub fn Worker(comptime opts: Options) type {
                 self.deployment_loader = l;
             }
 
+            // Implicit-deploy at cold start. Every tenant whose
+            // app.db has a `_deploy/current` pointer gets its
+            // deployment loaded — via the same background
+            // loader path that runtime releases use. The hot
+            // request path never blocks on fetching bytecodes,
+            // including at boot. `Worker.create` returns
+            // immediately after enqueueing; the loader thread
+            // then processes the queue, decoding the prefetched
+            // manifest bytes when available and pulling
+            // bytecodes from S3 when not.
+            if (self.deployment_loader) |l| {
+                var lit = self.tenant_files_map.iterator();
+                while (lit.next()) |fentry| {
+                    const tc = fentry.value_ptr.*;
+                    const cur_bytes = tc.app_kv.get("_deploy/current") catch continue;
+                    defer allocator.free(cur_bytes);
+                    const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch continue;
+                    if (dep_id == 0) continue;
+                    l.enqueue(tc.instance_id, dep_id) catch |err| {
+                        std.log.warn(
+                            "rove-js: cold-start enqueue {s}/{d} failed: {s}",
+                            .{ tc.instance_id, dep_id, @errorName(err) },
+                        );
+                    };
+                }
+            }
+
             return self;
         }
 
@@ -1195,28 +1222,20 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
     // 503 until either the dashboard pushes a release or the
     // periodic reload retry succeeds.
     //
-    // Any error besides NoDeployment / InvalidManifest used to
-    // crash the worker. That's the wrong tradeoff: a transient
-    // network hiccup against the colocated files-server (rc=35
-    // connection-reset, Sqlite contention on a shared backend
-    // during cold-start burst) shouldn't take down the whole
-    // worker thread + every tenant on it. We absorb the failure
-    // here and let the next release POST / reload tick retry.
-    reloadAllBytecodes(tc) catch |err| switch (err) {
-        error.NoDeployment => {
-            std.log.info(
-                "rove-js: tenant {s} has no deployment yet — 503 until one lands",
-                .{tc.instance_id},
-            );
-        },
-        else => {
-            std.log.warn(
-                "rove-js: tenant {s} initial manifest load failed: {s} — 503 until next reload tick",
-                .{ tc.instance_id, @errorName(err) },
-            );
-        },
-    };
-
+    // Cold-start "implicit deploy" semantics: the synchronous
+    // reload that used to run here is gone. Each tenant's
+    // initial deployment load now goes through the same
+    // background `DeploymentLoader` path runtime releases use
+    // (`Worker.create` enqueues every tenant after the open
+    // loop). The hot request path stays free of network I/O at
+    // cold-start, just like everywhere else.
+    //
+    // Until the loader catches up, the tenant has empty
+    // bytecodes; requests against it return 503. The customer
+    // observes "loading" via SSE (future) or by polling. For
+    // tenants with no `_deploy/current` set, the loader skips
+    // and the tenant stays at 503 forever (until a real release
+    // POST sets the pointer).
     return tc;
 }
 
