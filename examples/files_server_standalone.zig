@@ -455,22 +455,25 @@ pub fn main() !void {
     // applies as no-ops. Skipped when --leader-url isn't set so the
     // operator can run files-server in a "deploy server only, no
     // cluster behind it" mode for development.
+    //
+    // Runs on a background thread so the HTTP listener starts
+    // immediately. The thread retries on connection-refused / 503
+    // until the loop46 cluster leader is reachable (up to 5 min),
+    // which lets operators start files-server before loop46.
+    var bootstrap_thread: ?std.Thread = null;
+    defer if (bootstrap_thread) |t| t.join();
     if (cli.leader_url) |leader_url| {
-        cs.bootstrap.bootstrapPlatformDeployments(
-            allocator,
-            blob_owned.cfg,
-            cli.data_dir,
-            leader_url,
-            jwt_secret,
-            cli.bootstrap_kv[0..cli.bootstrap_kv_count],
-            cluster_opt,
-        ) catch |err| {
-            std.log.err(
-                "files-server bootstrap failed: {s} (leader_url={s})",
-                .{ @errorName(err), leader_url },
-            );
-            std.process.exit(2);
+        const ctx = try allocator.create(BootstrapCtx);
+        ctx.* = .{
+            .allocator = allocator,
+            .blob_cfg = blob_owned.cfg,
+            .data_dir = cli.data_dir,
+            .leader_url = leader_url,
+            .jwt_secret = jwt_secret,
+            .bootstrap_kv = cli.bootstrap_kv[0..cli.bootstrap_kv_count],
+            .cluster = cluster_opt,
         };
+        bootstrap_thread = try std.Thread.spawn(.{}, bootstrapWithRetry, .{ctx});
     } else {
         if (cli.bootstrap_kv_count > 0) {
             std.log.warn("files-server: --bootstrap-kv set but --leader-url is not; admin-kv push skipped", .{});
@@ -480,5 +483,101 @@ pub fn main() !void {
 
     while (true) {
         std.Thread.sleep(1 * std.time.ns_per_s);
+    }
+}
+
+const BootstrapCtx = struct {
+    allocator: std.mem.Allocator,
+    blob_cfg: blob_mod.BackendConfig,
+    data_dir: []const u8,
+    /// Comma-separated list of candidate URLs (e.g.
+    /// "https://app.loop46.localhost:8470,https://app.loop46.localhost:8471").
+    /// Bootstrap rotates through them until one is the elected
+    /// leader (`/_system/release` returns 204) — the others 503
+    /// with "not leader". When operators only have one node
+    /// configured (single-node dev), pass a single URL.
+    leader_url: []const u8,
+    jwt_secret: []const u8,
+    bootstrap_kv: []const []const u8,
+    cluster: ?*kv.Cluster,
+};
+
+fn bootstrapWithRetry(ctx: *BootstrapCtx) void {
+    defer ctx.allocator.destroy(ctx);
+
+    // Split candidate URLs once.
+    var url_list: std.ArrayList([]const u8) = .empty;
+    defer url_list.deinit(ctx.allocator);
+    {
+        var it = std.mem.splitScalar(u8, ctx.leader_url, ',');
+        while (it.next()) |u| {
+            const trimmed = std.mem.trim(u8, u, " \t\r\n");
+            if (trimmed.len > 0) {
+                url_list.append(ctx.allocator, trimmed) catch return;
+            }
+        }
+    }
+    if (url_list.items.len == 0) {
+        std.log.err("files-server bootstrap: no leader URLs configured", .{});
+        return;
+    }
+
+    // 5-minute total budget. The retry handles: loop46 not started
+    // yet (curl: connection-refused), candidate URL hits a follower
+    // (HTTP 503), transient network errors. Idempotent on warm
+    // state — retries are cheap.
+    //
+    // Gating on local FS-cluster leadership matters: bootstrapTenant's
+    // writeManifestThroughCluster silently skips on followers (the
+    // raft proposal path requires the leader). If this node isn't
+    // the FS-cluster leader, sleeping until leadership changes is
+    // the right move — the OTHER FS node that IS the leader has
+    // its own retry thread that will do the work.
+    const start_ns = std.time.nanoTimestamp();
+    const budget_ns: i128 = 5 * 60 * std.time.ns_per_s;
+    var attempt: u32 = 0;
+    while (true) {
+        attempt += 1;
+        if (ctx.cluster) |c| {
+            if (!c.raft.isLeader()) {
+                const now_ns = std.time.nanoTimestamp();
+                if (now_ns - start_ns > budget_ns) {
+                    std.log.err(
+                        "files-server bootstrap: never became FS-cluster leader within {d}s budget",
+                        .{@divTrunc(budget_ns, std.time.ns_per_s)},
+                    );
+                    std.process.exit(2);
+                }
+                std.Thread.sleep(500 * std.time.ns_per_ms);
+                continue;
+            }
+        }
+        const url = url_list.items[(attempt - 1) % url_list.items.len];
+        cs.bootstrap.bootstrapPlatformDeployments(
+            ctx.allocator,
+            ctx.blob_cfg,
+            ctx.data_dir,
+            url,
+            ctx.jwt_secret,
+            ctx.bootstrap_kv,
+            ctx.cluster,
+        ) catch |err| {
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns - start_ns > budget_ns) {
+                std.log.err(
+                    "files-server bootstrap failed after {d} attempts: {s} (last url={s})",
+                    .{ attempt, @errorName(err), url },
+                );
+                std.process.exit(2);
+            }
+            std.log.warn(
+                "files-server bootstrap attempt {d} via {s} failed: {s} — retrying in 1s",
+                .{ attempt, url, @errorName(err) },
+            );
+            std.Thread.sleep(1 * std.time.ns_per_s);
+            continue;
+        };
+        std.log.info("files-server bootstrap done via {s} (attempt {d})", .{ url, attempt });
+        return;
     }
 }

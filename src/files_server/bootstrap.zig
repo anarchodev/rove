@@ -183,12 +183,23 @@ pub fn bootstrapTenant(
     var key_buf: [25]u8 = undefined;
     const key = files_mod.manifest_json.manifestKey(&key_buf, 1);
     if (manifest_be.blobStore().exists(key) catch false) {
-        // S3-side idempotent — but if a cluster is supplied AND the
+        // S3-side idempotent. When a cluster is supplied AND the
         // cluster store is missing the entry (operator wiped local
-        // data_dir, brand-new cluster against warm S3), still write
-        // through the cluster so followers / restarts see consistent
-        // state.
-        if (cluster) |c| try writeManifestThroughCluster(allocator, c, instance_id, 1, "");
+        // data_dir, brand-new cluster against warm S3), re-fetch
+        // the manifest bytes from S3 and write them through the
+        // cluster so loop46 can serve manifest GETs from the
+        // cluster store on every replica.
+        if (cluster) |c| {
+            const json_bytes = manifest_be.blobStore().get(key, allocator) catch |err| {
+                std.log.warn(
+                    "files-server bootstrap: S3-warm fast path could not re-read manifest 1 for {s}: {s}",
+                    .{ instance_id, @errorName(err) },
+                );
+                return 1;
+            };
+            defer allocator.free(json_bytes);
+            try writeManifestThroughCluster(allocator, c, instance_id, 1, json_bytes);
+        }
         return 1;
     }
 

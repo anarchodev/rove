@@ -64,7 +64,11 @@ RAFT_BASE="${RAFT_BASE:-40470}"
 FS_HTTP_BASE="${FS_HTTP_BASE:-9090}"
 FS_RAFT_BASE="${FS_RAFT_BASE:-41090}"
 FS_PREFIX="${FS_PREFIX:-/tmp/rove-snap-bench-fs}"
-ROOT_TOKEN=ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+# Admin handler's _middlewares/index.mjs uses an isHex64 gate that
+# requires EXACTLY 64 hex chars. The legacy /_system/* path was
+# permissive on length; switching the bench to the admin route
+# forces this to be tight.
+ROOT_TOKEN=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     LOOP46_DATA="${LOOP46_DATA:-$HOME/Library/Application Support/loop46}"
@@ -114,9 +118,35 @@ export LOOP46_SERVICES_JWT_SECRET=$(head -c32 /dev/urandom | xxd -p | tr -d '\n'
 export LOOP46_ROOT_TOKEN="$ROOT_TOKEN"
 
 # ── Phase A: spawn files-server cluster ────────────────────────────
+#
+# Node 0 also gets `--leader-url` pointing at the loop46 cluster's
+# admin host so it runs platform-deploy bootstrap once loop46 is up.
+# The bootstrap thread retries on connection-refused for up to 5min
+# — that gives the bench room to start files-server first, PUT
+# manifests, then start loop46 (which is when the leader URL
+# becomes reachable). LOOP46_LEADER_CACERT + LOOP46_LEADER_RESOLVE
+# let bootstrap's curl shell-out hit the dev TLS + .localhost
+# resolution that the rest of the smoke uses.
+export LOOP46_LEADER_CACERT="$CACERT"
+# Bootstrap connects via 127.0.0.1 directly; admin host TLS cert is
+# valid against IPs in this dev setup (loopback SAN). No --resolve
+# entry needed because the URL has no hostname to resolve. Skips the
+# limitation that LOOP46_LEADER_RESOLVE only carries one host:port:ip
+# tuple while we have three different ports.
+unset LOOP46_LEADER_RESOLVE
+LOOP46_LEADER_URLS=()
+for h in "${HTTP_ADDRS[@]}"; do
+    LOOP46_LEADER_URLS+=("https://${h}")
+done
+LOOP46_LEADER_URL=$(IFS=,; echo "${LOOP46_LEADER_URLS[*]}")
 echo "phase A: starting 3-node files-server cluster on ${FS_PEERS_CSV}…"
 FS_PIDS=()
 for i in 0 1 2; do
+    # All three nodes get --leader-url; bootstrap is idempotent (S3-side
+    # exists-check skips repeat work). Only one will actually win the
+    # race; followers' `_system/release` POST will hit a loop46
+    # follower and 503 → retry loop tries again next round.
+    leader_url_args=(--leader-url "$LOOP46_LEADER_URL")
     "$FS_BIN" \
         --data-dir "${FS_DATA_DIRS[$i]}" \
         --listen "${FS_HTTP_ADDRS[$i]}" \
@@ -128,6 +158,7 @@ for i in 0 1 2; do
         --raft-election-timeout-ms 200 \
         --raft-heartbeat-ms 50 \
         --max-connections 4096 \
+        "${leader_url_args[@]}" \
         >"/tmp/${SMOKE_TAG}-fs-${i}.out" 2>&1 &
     FS_PIDS+=($!)
 done
@@ -324,7 +355,47 @@ LEADER_DIR="${DATA_DIRS[$LEADER_IDX]}"
 LEADER_LOG="/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out"
 LEADER_PORT="${LEADER_HTTP##*:}"
 
+# Wait until __admin__'s deployed handler is responsive. files-server's
+# background bootstrap thread races us — it has to win FS-cluster
+# leadership, upload admin's bundle to S3, propose `_deploy/current`
+# to loop46, then loop46's deployment loader has to fetch + load the
+# bytecode. Until that lands, admin's RPC route returns 503
+# `no deployment for this tenant`. Probe `?fn=listInstance` (cheap
+# admin RPC) until it 200s.
+echo "  waiting for __admin__ deployment to land…"
+admin_ready=0
+for tries in $(seq 1 60); do
+    code=$("${CURL[@]}" --max-time 2 -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $ROOT_TOKEN" \
+        "https://app.loop46.localhost:${LEADER_PORT}/?fn=listInstance" 2>/dev/null || echo 000)
+    if [[ "$code" == "200" ]]; then
+        admin_ready=1
+        echo "  __admin__ ready (try=$tries)"
+        break
+    fi
+    sleep 0.5
+done
+if (( admin_ready == 0 )); then
+    echo "FAIL: __admin__ deployment never landed (last HTTP code=$code)" >&2
+    tail -40 "$LEADER_LOG" >&2
+    exit 1
+fi
+
 # ── Phase C: warmup — one release POST per tenant ─────────────────
+#
+# Release flow runs through the __admin__ tenant's deployed JS
+# handler (`web/admin/handler.mjs::publishRelease`), which calls
+# the `platform.releases.publish` Zig trampoline. The trampoline
+# does the local commit + raft propose + deployment loader
+# enqueue, then returns. The admin handler's response is 202 +
+# `{instance_id, dep_id, status: "queued"}`.
+#
+# Replaces the old `/_system/release` system route — that path
+# serialized on a `proposeAndWait` spin which capped the worker's
+# concurrent proposals at one, defeating the proposal_batcher.
+# The admin-handler route inherits the customer-JS dispatch path
+# which already parks on raft_pending and batches via the
+# batcher.
 echo "phase C: warmup — 1 release/tenant × $N_TOTAL (parallel=$WARMUP_PARALLEL)…"
 t_warmup_start=$(date +%s)
 seq 0 $((N_TOTAL - 1)) | xargs -n1 -P "$WARMUP_PARALLEL" -I{} \
@@ -337,8 +408,8 @@ seq 0 $((N_TOTAL - 1)) | xargs -n1 -P "$WARMUP_PARALLEL" -I{} \
             -o /dev/null \
             -H "Authorization: Bearer '"$ROOT_TOKEN"'" \
             -H "Content-Type: application/json" \
-            -d "{\"tenant_id\":\"$tid\",\"dep_id\":1}" \
-            "https://app.loop46.localhost:'"$LEADER_PORT"'/_system/release"
+            -d "{\"fn\":\"publishRelease\",\"args\":[\"$tid\",1]}" \
+            "https://app.loop46.localhost:'"$LEADER_PORT"'/"
     ' _ {} 2>/dev/null || true
 t_warmup_end=$(date +%s)
 echo "  warmup done in $((t_warmup_end - t_warmup_start))s"
@@ -380,13 +451,15 @@ seq 0 $((STEADY_PARALLEL - 1)) | xargs -n1 -P "$STEADY_PARALLEL" -I{} \
             # post-warmup backlog can push individual release
             # commits past 30s. Measuring whether raft makes
             # progress AT ALL, not RPC latency.
-            curl -sS --cacert "'"$CACERT"'" '"${RESOLVE[*]}"' \
-                --max-time 60 -o /dev/null \
+            code=$(curl -sS --cacert "'"$CACERT"'" '"${RESOLVE[*]}"' \
+                --max-time 60 -o /dev/null -w "%{http_code}" \
                 -H "Authorization: Bearer '"$ROOT_TOKEN"'" \
                 -H "Content-Type: application/json" \
-                -d "{\"tenant_id\":\"$tid\",\"dep_id\":$dep}" \
-                "https://app.loop46.localhost:${PORT}/_system/release" 2>/dev/null \
-                && cnt=$((cnt + 1))
+                -d "{\"fn\":\"publishRelease\",\"args\":[\"$tid\",$dep]}" \
+                "https://app.loop46.localhost:${PORT}/" 2>/dev/null || echo 000)
+            if [[ "$code" == "202" ]]; then
+                cnt=$((cnt + 1))
+            fi
             dep=$((dep + 1))
         done
         echo "$cnt"
