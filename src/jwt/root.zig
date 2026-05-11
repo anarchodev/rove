@@ -54,6 +54,13 @@ pub const Cap = struct {
     /// platform-config bootstrap (resend_key, platform_email_from,
     /// etc.).
     pub const ADMIN_KV = "admin-kv";
+    /// Token bearer may GET `/_system/raft-snapshot/{snap_id}` to
+    /// stream a follower-catchup snapshot's bytes from the leader.
+    /// Minted by raft peers themselves (using the shared services
+    /// JWT secret) when they receive a SNAP_OFFER frame and need to
+    /// fetch the offered snapshot. Out-of-band from the consensus
+    /// control plane so the bulk transfer can't starve heartbeats.
+    pub const RAFT_SNAPSHOT = "raft-snapshot";
 };
 
 pub const Payload = struct {

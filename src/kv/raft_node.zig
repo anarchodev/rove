@@ -163,6 +163,27 @@ pub const NeedsSnapshotFn = *const fn (
     peer_id: u32,
 ) void;
 
+/// Follower-side handler for an incoming `snap_fetch_offer` RPC
+/// (production.md #1.1 step 3). When a far-behind follower receives
+/// this frame, the application layer is expected to GET the leader's
+/// `fetch_path`, stage the response bytes into a tmp dir, atomic-
+/// rename into `data_dir`, and call `raft_begin_load_snapshot` /
+/// `raft_end_load_snapshot` at `(snap_last_term, snap_last_idx)`.
+///
+/// Runs on the raft thread — implementations should hand the work
+/// off to a background task and return promptly. `fetch_path` is
+/// borrowed for the duration of the call; copy if you need it
+/// past the callback return.
+pub const SnapFetchOfferFn = *const fn (
+    ctx: ?*anyopaque,
+    raft: *RaftNode,
+    from_id: u32,
+    snap_last_term: u64,
+    snap_last_idx: u64,
+    snap_id: u64,
+    fetch_path: []const u8,
+) void;
+
 pub const Config = struct {
     node_id: u32,
     peers: []const PeerAddr,
@@ -173,6 +194,13 @@ pub const Config = struct {
     /// `NeedsSnapshotFn` doc for the contract.
     needs_snapshot: ?NeedsSnapshotFn = null,
     needs_snapshot_ctx: ?*anyopaque = null,
+    /// Optional. Receives `snap_fetch_offer` frames from peers
+    /// (sent by leaders that compacted past this follower's
+    /// `next_idx`). Wire it on the application layer (worker /
+    /// files-server) to perform the out-of-band HTTP fetch + load
+    /// flow. With no callback wired, frames are logged and dropped.
+    on_snap_fetch_offer: ?SnapFetchOfferFn = null,
+    on_snap_fetch_offer_ctx: ?*anyopaque = null,
     election_timeout_ms: u32 = 1000,
     request_timeout_ms: u32 = 200,
     /// If non-null, raft log + persistent state (term/vote) are backed by a
@@ -1340,6 +1368,32 @@ fn onPeerMessage(from_id: u32, payload: []const u8, ctx: ?*anyopaque) void {
             }
         },
         .ident, .snap_offer, .snap_req, .snap_data => {},
+        .snap_fetch_offer => |offer| {
+            // Out-of-band snapshot fetch offer (production.md #1.1 step
+            // 3). Hand off to the application layer's
+            // `on_snap_fetch_offer` callback if wired; the application
+            // is responsible for issuing the HTTP GET against the
+            // leader's `fetch_path`, staging the bytes, and ultimately
+            // calling `raft_load_snapshot`. With no callback wired we
+            // log + drop — same lossy behavior as the .opaque_bytes
+            // send-side default.
+            if (self.config.on_snap_fetch_offer) |cb| {
+                cb(
+                    self.config.on_snap_fetch_offer_ctx,
+                    self,
+                    from_id,
+                    offer.snap_last_term,
+                    offer.snap_last_idx,
+                    offer.snap_id,
+                    offer.fetch_path,
+                );
+            } else {
+                std.log.warn(
+                    "raft: received snap_fetch_offer from peer {d} (snap_id={x} idx={d}) but no on_snap_fetch_offer callback wired",
+                    .{ from_id, offer.snap_id, offer.snap_last_idx },
+                );
+            }
+        },
     }
 
     self.refreshLeaderState();

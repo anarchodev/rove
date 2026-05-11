@@ -35,6 +35,17 @@ pub const MsgType = enum(u8) {
     snap_offer = 6,
     snap_req = 7,
     snap_data = 8,
+    /// Leader → follower: "I have a snapshot for you; fetch it
+    /// out-of-band at this URL." Carries the snapshot's
+    /// `(snap_last_term, snap_last_idx)` plus a `snap_id` cookie
+    /// the leader uses to identify which offer the follower is
+    /// pulling, plus a fetch path string for the HTTP endpoint
+    /// that serves the bytes. The actual file bytes never travel
+    /// through this control-plane connection — that would block
+    /// heartbeats during a multi-megabyte transfer. See etcd /
+    /// CockroachDB / TiKV for the same pattern; production.md
+    /// #1.1 step 3 for the rove application.
+    snap_fetch_offer = 9,
 };
 
 pub const VoteReq = struct {
@@ -71,6 +82,24 @@ pub const AppendResp = struct {
     first_idx: u64,
 };
 
+/// Leader's offer of a peer-to-peer snapshot. The follower fetches
+/// the actual bytes out-of-band by GET'ing the fetch_path on the
+/// leader's worker HTTP surface. `snap_id` is a u64 cookie the leader
+/// mints per offer so the HTTP handler knows which offer the follower
+/// is pulling (the leader holds a registry keyed by snap_id). The
+/// `(snap_last_term, snap_last_idx)` pair is what the follower
+/// passes to `raft_load_snapshot` after staging the bytes.
+///
+/// `fetch_path` is the path component only — the follower combines it
+/// with the peer's HTTP base URL it already knows from its config.
+/// Owned slice; `WireMsg.deinit` frees.
+pub const SnapFetchOffer = struct {
+    snap_last_term: u64,
+    snap_last_idx: u64,
+    snap_id: u64,
+    fetch_path: []u8,
+};
+
 /// Tagged union of decoded messages. The `append_req` variant owns its
 /// `entries` slice and each entry's `data`; call `deinit` to free them.
 pub const WireMsg = union(MsgType) {
@@ -82,6 +111,7 @@ pub const WireMsg = union(MsgType) {
     snap_offer: void,
     snap_req: void,
     snap_data: void,
+    snap_fetch_offer: SnapFetchOffer,
 
     pub fn deinit(self: *WireMsg, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -89,6 +119,10 @@ pub const WireMsg = union(MsgType) {
                 for (ar.entries) |e| allocator.free(e.data);
                 allocator.free(ar.entries);
                 ar.entries = &.{};
+            },
+            .snap_fetch_offer => |*sfo| {
+                allocator.free(sfo.fetch_path);
+                sfo.fetch_path = &.{};
             },
             else => {},
         }
@@ -154,6 +188,11 @@ const Writer = struct {
     fn w8(self: *Writer, v: u8) void {
         self.buf[self.pos] = v;
         self.pos += 1;
+    }
+
+    fn w16(self: *Writer, v: u16) void {
+        std.mem.writeInt(u16, self.buf[self.pos..][0..2], v, .big);
+        self.pos += 2;
     }
 
     fn w32(self: *Writer, v: u32) void {
@@ -237,6 +276,21 @@ pub fn encodeIdent(allocator: std.mem.Allocator, node_id: u32) Error![]u8 {
     return buf;
 }
 
+pub fn encodeSnapFetchOffer(allocator: std.mem.Allocator, offer: SnapFetchOffer) Error![]u8 {
+    // Layout: [8B term][8B idx][8B snap_id][2B path_len][N B path]
+    if (offer.fetch_path.len > std.math.maxInt(u16)) return Error.OutOfMemory;
+    const payload_size: u32 = @intCast(8 + 8 + 8 + 2 + offer.fetch_path.len);
+    const buf = try frameAlloc(allocator, .snap_fetch_offer, payload_size);
+    var w = Writer{ .buf = buf, .pos = HEADER_SIZE + 1 };
+    w.w64(offer.snap_last_term);
+    w.w64(offer.snap_last_idx);
+    w.w64(offer.snap_id);
+    w.w16(@intCast(offer.fetch_path.len));
+    w.writeBytes(offer.fetch_path);
+    finalizeFrame(buf);
+    return buf;
+}
+
 // ── decode ────────────────────────────────────────────────────────────
 
 const Reader = struct {
@@ -258,6 +312,13 @@ const Reader = struct {
         if (self.rem() < 4) return Error.Truncated;
         const v = std.mem.readInt(u32, self.data[self.pos..][0..4], .big);
         self.pos += 4;
+        return v;
+    }
+
+    fn r16(self: *Reader) Error!u16 {
+        if (self.rem() < 2) return Error.Truncated;
+        const v = std.mem.readInt(u16, self.data[self.pos..][0..2], .big);
+        self.pos += 2;
         return v;
     }
 
@@ -365,6 +426,21 @@ pub fn decode(allocator: std.mem.Allocator, payload: []const u8) Error!WireMsg {
             return .{ .ident = node_id };
         },
         .snap_offer, .snap_req, .snap_data => return Error.UnknownType,
+        .snap_fetch_offer => {
+            const term = try r.r64();
+            const idx = try r.r64();
+            const snap_id = try r.r64();
+            const path_len = try r.r16();
+            const path_src = try r.readBytes(path_len);
+            const path_buf = try allocator.alloc(u8, path_len);
+            @memcpy(path_buf, path_src);
+            return .{ .snap_fetch_offer = .{
+                .snap_last_term = term,
+                .snap_last_idx = idx,
+                .snap_id = snap_id,
+                .fetch_path = path_buf,
+            } };
+        },
     }
 }
 
@@ -533,4 +609,42 @@ test "tampered payload yields a different CRC than the header" {
     const stored = frameCrc(frame[0..HEADER_SIZE]);
     const recomputed = checksum(frame[HEADER_SIZE..]);
     try testing.expect(stored != recomputed);
+}
+
+test "snap_fetch_offer round trip" {
+    const offer = SnapFetchOffer{
+        .snap_last_term = 42,
+        .snap_last_idx = 12345,
+        .snap_id = 0xdeadbeefcafef00d,
+        .fetch_path = @constCast("/_system/raft-snapshot/deadbeefcafef00d"),
+    };
+    const frame = try encodeSnapFetchOffer(testing.allocator, offer);
+    defer testing.allocator.free(frame);
+
+    var msg = try decode(testing.allocator, payloadOf(frame));
+    defer msg.deinit(testing.allocator);
+    try testing.expect(msg == .snap_fetch_offer);
+    try testing.expectEqual(@as(u64, 42), msg.snap_fetch_offer.snap_last_term);
+    try testing.expectEqual(@as(u64, 12345), msg.snap_fetch_offer.snap_last_idx);
+    try testing.expectEqual(@as(u64, 0xdeadbeefcafef00d), msg.snap_fetch_offer.snap_id);
+    try testing.expectEqualStrings(
+        "/_system/raft-snapshot/deadbeefcafef00d",
+        msg.snap_fetch_offer.fetch_path,
+    );
+}
+
+test "snap_fetch_offer truncated payload" {
+    // Build a valid frame, then chop off bytes from the end and confirm
+    // decode rejects with Truncated rather than reading off the buffer.
+    const offer = SnapFetchOffer{
+        .snap_last_term = 1,
+        .snap_last_idx = 2,
+        .snap_id = 3,
+        .fetch_path = @constCast("/snap/3"),
+    };
+    const frame = try encodeSnapFetchOffer(testing.allocator, offer);
+    defer testing.allocator.free(frame);
+
+    const payload = payloadOf(frame);
+    try testing.expectError(Error.Truncated, decode(testing.allocator, payload[0 .. payload.len - 1]));
 }
