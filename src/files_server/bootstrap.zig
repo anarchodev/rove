@@ -168,11 +168,6 @@ pub fn bootstrapTenant(
     files: []const DeployFile,
     cluster: ?*kv_mod.Cluster,
 ) !u64 {
-    // Fast path: if manifest 1 already exists in S3, the cluster has
-    // already bootstrapped this tenant. Skip every other step.
-    // (Idempotency check stays S3-side until the manifest fully
-    // moves to the cluster store — keeps the offline `loop46 seed`
-    // path working without a running cluster.)
     var manifest_be = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         blob_cfg,
@@ -182,14 +177,31 @@ pub fn bootstrapTenant(
     defer manifest_be.deinit();
     var key_buf: [25]u8 = undefined;
     const key = files_mod.manifest_json.manifestKey(&key_buf, 1);
-    if (manifest_be.blobStore().exists(key) catch false) {
-        // S3-side idempotent. When a cluster is supplied AND the
-        // cluster store is missing the entry (operator wiped local
-        // data_dir, brand-new cluster against warm S3), re-fetch
-        // the manifest bytes from S3 and write them through the
-        // cluster so loop46 can serve manifest GETs from the
-        // cluster store on every replica.
-        if (cluster) |c| {
+
+    // Idempotency: don't redo a bootstrap whose manifest already
+    // exists. Two sources of truth depending on which path the
+    // caller is on:
+    //
+    //   - Cluster-supplied path (production): check the cluster
+    //     store. `deployment/current` is the live pointer; if it's
+    //     set, the manifest already replicated and we just return
+    //     that dep_id.
+    //   - Offline `loop46 seed` path (cluster == null): check S3.
+    //     The S3 PUT is the only durable write in offline mode.
+    //
+    // Pre-migration deployments may have manifests in S3 but NOT
+    // in the cluster store (operator wiped data_dir, brought up a
+    // fresh cluster pointed at warm S3). For that case, the
+    // cluster-supplied path also re-hydrates from S3 on the
+    // bootstrap pass so loop46 workers serve manifest reads from
+    // the cluster store on every replica.
+    if (cluster) |c| {
+        if (try clusterCurrentDeployId(c, instance_id)) |cur_id| {
+            return cur_id;
+        }
+        // Cluster store has no record. Try S3-warm fast path before
+        // running a full bootstrap.
+        if (manifest_be.blobStore().exists(key) catch false) {
             const json_bytes = manifest_be.blobStore().get(key, allocator) catch |err| {
                 std.log.warn(
                     "files-server bootstrap: S3-warm fast path could not re-read manifest 1 for {s}: {s}",
@@ -199,8 +211,14 @@ pub fn bootstrapTenant(
             };
             defer allocator.free(json_bytes);
             try writeManifestThroughCluster(allocator, c, instance_id, 1, json_bytes);
+            return 1;
         }
-        return 1;
+        // Truly new tenant — fall through to full bootstrap.
+    } else {
+        // Offline path: S3 idempotency.
+        if (manifest_be.blobStore().exists(key) catch false) {
+            return 1;
+        }
     }
 
     const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, instance_id });
@@ -251,24 +269,31 @@ pub fn bootstrapTenant(
 
     var key_buf2: [25]u8 = undefined;
     const key2 = files_mod.manifest_json.manifestKey(&key_buf2, next_id);
-    if (!(manifest_be.blobStore().exists(key2) catch false)) {
-        manifest_be.blobStore().put(key2, json_bytes) catch {
-            if (!(manifest_be.blobStore().exists(key2) catch false)) return Error.BootstrapFailed;
-        };
+
+    // Manifest durability splits on whether a running cluster is
+    // supplied:
+    //   - cluster != null: write through the raft cluster (production
+    //     path post-#1.4). The cluster store is the source of truth;
+    //     loop46 workers read via `--files-internal-base`. No S3 PUT.
+    //   - cluster == null: offline `loop46 seed` path. No cluster to
+    //     talk to, so the manifest goes to S3 and the (eventual)
+    //     worker boot trusts the S3-warm fast path above to migrate
+    //     it into the cluster store on first contact.
+    //
+    // Dropping the S3 PUT on the cluster-supplied path closes
+    // production.md #1.3 ("stop writing per-tenant S3 manifests at
+    // bootstrap"): one durable write per deploy, no
+    // 10k-S3-PUTs-per-mass-provisioning waste.
+    if (cluster) |c| {
+        try writeManifestThroughCluster(allocator, c, instance_id, next_id, json_bytes);
+    } else {
+        if (!(manifest_be.blobStore().exists(key2) catch false)) {
+            manifest_be.blobStore().put(key2, json_bytes) catch {
+                if (!(manifest_be.blobStore().exists(key2) catch false)) return Error.BootstrapFailed;
+            };
+        }
     }
     try store.setCurrentDeploymentId(next_id);
-
-    // Dual-write through the raft cluster (#1.4 step 2). The
-    // cluster store ends up with the same manifest JSON the S3
-    // PUT above just wrote, plus a `deployment/current` pointer.
-    // After read-side migration lands the S3 PUT goes away.
-    if (cluster) |c| try writeManifestThroughCluster(
-        allocator,
-        c,
-        instance_id,
-        next_id,
-        json_bytes,
-    );
 
     return next_id;
 }
@@ -284,6 +309,30 @@ fn clusterManifestKey(buf: *[CLUSTER_MANIFEST_KEY_LEN]u8, dep_id: u64) []const u
 
 /// "deployment/" (11) + 20 hex nibbles + "/manifest" (9).
 pub const CLUSTER_MANIFEST_KEY_LEN: usize = 40;
+
+/// Read `deployment/current` from the per-tenant cluster store.
+/// Returns the parsed deployment id when present, null when the
+/// key is absent (fresh tenant on this cluster).
+///
+/// Used by `bootstrapTenant` as the post-migration idempotency
+/// check: a non-null result means the cluster has already
+/// replicated the manifest, so a re-run on files-server restart
+/// should skip the full bootstrap.
+fn clusterCurrentDeployId(cluster: *kv_mod.Cluster, instance_id: []const u8) !?u64 {
+    const store = cluster.openStore(instance_id) catch |err| switch (err) {
+        // A truly fresh tenant store opens just fine; an open
+        // failure here is the SQLite layer complaining, which we
+        // surface so the caller can decide.
+        else => return err,
+    };
+    const value = store.get("deployment/current") catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer cluster.allocator.free(value);
+    if (value.len == 0) return null;
+    return std.fmt.parseInt(u64, value, 10) catch null;
+}
 
 /// Write the manifest + current pointer for a tenant through the
 /// cluster's raft consensus. One writeset envelope, two kv ops:

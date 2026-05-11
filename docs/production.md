@@ -316,12 +316,15 @@ Loop46 worker → files-server flow on a release POST:
   manifest mode for the bench harness. Skips the legacy S3 PUT
   per-tenant; manifest writes go through files-server's PUT
   route instead.
+- Files-server `bootstrap.zig` now writes manifests cluster-only
+  when a `kv.Cluster` is supplied (the production / raft-enabled
+  path). The offline `loop46 seed` path (cluster == null) still
+  PUTs to S3 because there's no cluster to talk to; first worker
+  contact migrates that S3 manifest into the cluster store via
+  the S3-warm fast path. Closes #1.3.
 
 **What's NOT yet wired:**
 
-- Files-server's `bootstrap.zig` still does the dual S3 PUT +
-  cluster write (commit `8638253`). The S3 PUT comes off once
-  every loop46 worker in a deployment uses the HTTP backend.
 - Customer-facing `POST /{tenant}/deployments` (compile + deploy
   flow) still writes manifests to S3. Migration: build the
   writeset, call `cluster.proposeAndWait` instead. Same shape
@@ -347,7 +350,7 @@ proposal below described this end state; the work landed faster
 than expected because the extracted `kv.Cluster` library makes
 spinning up a second raft group cheap.
 
-### 1.3 Files-server: stop writing per-tenant S3 manifests at bootstrap — **NEW, surfaced 2026-05-10 by 10k bench, superseded by #1.4**
+### 1.3 Files-server: stop writing per-tenant S3 manifests at bootstrap — **done 2026-05-11 (closed by #1.4)**
 
 Same insight as #1.1, applied to files-server. The 10k-tenant
 scalability bench's seed phase took **1012s** for 10,000
