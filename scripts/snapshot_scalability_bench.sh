@@ -114,7 +114,7 @@ FS_PEERS_CSV=$(IFS=,; echo "${FS_RAFT_ADDRS[*]}")
 
 # Shared JWT secret across loop46 + files-server (the dashboard +
 # inter-service paths verify with the same key on both sides).
-export LOOP46_SERVICES_JWT_SECRET=$(head -c32 /dev/urandom | xxd -p | tr -d '\n')
+export LOOP46_SERVICES_JWT_SECRET="${LOOP46_SERVICES_JWT_SECRET:-$(head -c32 /dev/urandom | xxd -p | tr -d '\n')}"
 export LOOP46_ROOT_TOKEN="$ROOT_TOKEN"
 
 # ── Phase A: spawn files-server cluster ────────────────────────────

@@ -296,6 +296,8 @@ fn tryHandleSystem(
         jwt.Cap.RELEASE
     else if (std.mem.eql(u8, sys_rest, "admin-kv"))
         jwt.Cap.ADMIN_KV
+    else if (std.mem.startsWith(u8, sys_rest, "raft-snapshot/"))
+        jwt.Cap.RAFT_SNAPSHOT
     else
         null;
 
@@ -353,6 +355,17 @@ fn tryHandleSystem(
     // = buf_count` once the right two numbers were paired in one line.
     if (std.mem.eql(u8, sys_rest, "metrics")) {
         try handleMetrics(server, allocator, worker, ent, sid, sess, cors_origin);
+        return true;
+    }
+
+    // Raft snapshot fetch — out-of-band catchup for far-behind
+    // followers (production.md #1.1 step 3). Cap-gated above so any
+    // peer holding the shared services JWT can pull. Streams a
+    // bundle of the leader's app.dbs + __root__.db + schedules.db
+    // captured via VACUUM INTO for consistency. Path:
+    //   /_system/raft-snapshot/{snap_id_hex}
+    if (std.mem.startsWith(u8, sys_rest, "raft-snapshot/")) {
+        try handleRaftSnapshot(server, allocator, worker, ent, sid, sess, method, sys_rest, cors_origin);
         return true;
     }
 
@@ -599,6 +612,186 @@ fn handleMetrics(
     buf = aw.toArrayList();
     const body = try buf.toOwnedSlice(allocator);
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "text/plain; version=0.0.4");
+}
+
+/// Bundle magic + version. Wire layout produced by handleRaftSnapshot:
+///
+///   [8B magic "ROVSNAP1"]
+///   [u32 file_count (big-endian)]
+///   per file:
+///     [u16 name_len (big-endian)]
+///     [name_len bytes — relative path under data_dir, forward slashes]
+///     [u64 file_size (big-endian)]
+///     [file_size bytes — raw VACUUM-INTO'd SQLite file]
+///
+/// The receiver parses files in order and writes each into
+/// `tmp_dir/{snap_id}/<name>` before atomic-renaming into data_dir.
+const SNAP_BUNDLE_MAGIC = "ROVSNAP1";
+
+/// Stream the leader's application-state SQLite files as a single
+/// HTTP response body so a far-behind follower can install them as
+/// its new starting state. Per production.md #1.1 step 3.
+///
+/// Consistency model: each source file is VACUUM-INTO'd to a temp
+/// path before its bytes are read. VACUUM INTO is a single SQLite
+/// transaction — the temp output reflects the source at one
+/// consistent point in time, even if writes are happening
+/// concurrently against the source. The point may differ slightly
+/// across files (each VACUUM INTO snapshots independently), which
+/// is fine: each tenant's `kv_seq` table serves as the per-tenant
+/// monotonicity gate so any subsequent raft log replay safely
+/// skips entries the follower already has.
+///
+/// Files shipped: `__root__.db`, each `{tenant_id}/app.db`,
+/// `schedules.db` if present. NOT shipped: `raft.log.db`, term/
+/// vote state — those are raft-layer concerns the follower
+/// manages on its own (raft_load_snapshot truncates the receiver's
+/// log to the snapshot index regardless).
+///
+/// Memory cost: the whole bundle is buffered in memory before being
+/// handed to h2. Fine for the empty-deployment bench (10k × ~30KB
+/// ≈ 300MB). Real production deployments with non-trivial app.db
+/// sizes will need a streaming variant — left to a follow-up.
+fn handleRaftSnapshot(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    sys_rest: []const u8,
+    cors_origin: ?[]const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET")) {
+        try respb.setSystemResponse(server, ent, sid, sess, 405, "GET only\n", allocator, cors_origin, null);
+        return;
+    }
+
+    // Extract `snap_id` from path (hex-encoded after "raft-snapshot/").
+    // The snap_id is informational only — the handler streams the
+    // current state of data_dir regardless. The follower will pass
+    // the current `raft_get_snapshot_last_idx` it sees to
+    // `raft_load_snapshot` so over-fresh data is fine.
+    const prefix = "raft-snapshot/";
+    const id_str = sys_rest[prefix.len..];
+    const snap_id = std.fmt.parseInt(u64, id_str, 16) catch 0;
+
+    const data_dir = worker.tenant.dir;
+
+    // Make a unique tmp staging dir under data_dir for the
+    // VACUUM-INTO outputs. Cleaned at end (success or failure).
+    var tmp_buf: [256]u8 = undefined;
+    const tmp_subdir = std.fmt.bufPrint(&tmp_buf, ".snap-out-{x}", .{snap_id}) catch return;
+    const tmp_path = try std.fs.path.join(allocator, &.{ data_dir, tmp_subdir });
+    defer allocator.free(tmp_path);
+    std.fs.cwd().deleteTree(tmp_path) catch {};
+    try std.fs.cwd().makePath(tmp_path);
+    defer std.fs.cwd().deleteTree(tmp_path) catch {};
+
+    var bundle: std.ArrayList(u8) = .empty;
+    errdefer bundle.deinit(allocator);
+
+    // Magic + placeholder file_count (we don't know the count until
+    // after the walk; patch the u32 after).
+    try bundle.appendSlice(allocator, SNAP_BUNDLE_MAGIC);
+    const count_off = bundle.items.len;
+    try bundle.appendSlice(allocator, &[_]u8{ 0, 0, 0, 0 });
+    var file_count: u32 = 0;
+
+    // Walk data_dir entries.
+    var dir = try std.fs.cwd().openDir(data_dir, .{ .iterate = true });
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        // Top-level files we care about: __root__.db and schedules.db.
+        if (entry.kind == .file) {
+            const ships = std.mem.eql(u8, entry.name, "__root__.db") or
+                std.mem.eql(u8, entry.name, "schedules.db");
+            if (!ships) continue;
+            try vacuumIntoBundle(allocator, &bundle, data_dir, entry.name, tmp_path, entry.name);
+            file_count += 1;
+            continue;
+        }
+
+        // Subdirectories: tenant dirs. Each one's app.db is the
+        // app-state file we want. Skip anything that isn't a
+        // valid tenant id shape (covers our own tmp staging dirs
+        // and any future sibling-dir scratch space).
+        if (entry.kind != .directory) continue;
+        if (std.mem.startsWith(u8, entry.name, ".")) continue;
+
+        const src_rel = try std.fmt.allocPrint(allocator, "{s}/app.db", .{entry.name});
+        defer allocator.free(src_rel);
+        const src_abs = try std.fs.path.join(allocator, &.{ data_dir, src_rel });
+        defer allocator.free(src_abs);
+        std.fs.cwd().access(src_abs, .{}) catch continue; // no app.db → skip
+
+        // Output goes to `tmp_path/<tenant>__app.db` (flatten so
+        // we don't need to recreate directory structure in tmp).
+        const out_name = try std.fmt.allocPrint(allocator, "{s}__app.db", .{entry.name});
+        defer allocator.free(out_name);
+        try vacuumIntoBundle(allocator, &bundle, data_dir, src_rel, tmp_path, out_name);
+        file_count += 1;
+    }
+
+    // Patch in the file count.
+    std.mem.writeInt(u32, bundle.items[count_off..][0..4], file_count, .big);
+
+    std.log.info(
+        "raft-snapshot: served snap_id={x} files={d} body_size={d}",
+        .{ snap_id, file_count, bundle.items.len },
+    );
+
+    const body = try bundle.toOwnedSlice(allocator);
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/octet-stream");
+}
+
+/// VACUUM the SQLite database at `data_dir/src_rel` into a temp
+/// path, then append the file's bytes to `bundle` framed as
+/// `[u16 name_len][name][u64 file_size][bytes]`. Used by
+/// handleRaftSnapshot for each shipped file.
+fn vacuumIntoBundle(
+    allocator: std.mem.Allocator,
+    bundle: *std.ArrayList(u8),
+    data_dir: []const u8,
+    src_rel: []const u8,
+    tmp_dir: []const u8,
+    bundle_name: []const u8,
+) !void {
+    const src_abs = try std.fs.path.join(allocator, &.{ data_dir, src_rel });
+    defer allocator.free(src_abs);
+    const out_abs = try std.fs.path.join(allocator, &.{ tmp_dir, bundle_name });
+    defer allocator.free(out_abs);
+
+    // Run `VACUUM INTO '<out_abs>'` against the source DB. Single
+    // SQLite transaction = consistent point-in-time copy even while
+    // writes are happening against the source via the WAL.
+    const src_pathz = try std.fmt.allocPrintSentinel(allocator, "{s}", .{src_abs}, 0);
+    defer allocator.free(src_pathz);
+    const out_pathz = try std.fmt.allocPrintSentinel(allocator, "{s}", .{out_abs}, 0);
+    defer allocator.free(out_pathz);
+    var src_kv = try kv_mod.KvStore.open(allocator, src_pathz);
+    defer src_kv.close();
+    try src_kv.vacuumInto(out_pathz);
+
+    // Read the freshly-written file. Cap at 256 MiB per file —
+    // larger than that and we should be streaming, not buffering.
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, out_abs, 256 << 20);
+    defer allocator.free(bytes);
+
+    // Frame into bundle.
+    if (bundle_name.len > std.math.maxInt(u16)) return error.OutOfMemory;
+    var nl_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &nl_buf, @intCast(bundle_name.len), .big);
+    try bundle.appendSlice(allocator, &nl_buf);
+    try bundle.appendSlice(allocator, bundle_name);
+
+    var sz_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &sz_buf, @intCast(bytes.len), .big);
+    try bundle.appendSlice(allocator, &sz_buf);
+    try bundle.appendSlice(allocator, bytes);
 }
 
 /// Stamp `_deploy/current = {dep_id:0>16}` on the tenant's app.db,
