@@ -1070,10 +1070,13 @@ pub fn main() !void {
         },
         // Phase 5.5(c) step C — wire willemt's send_snapshot
         // callback so a far-behind follower's catch-up surfaces
-        // as an actionable log line instead of silent log-replay
-        // loops. Future automation: send SNAP_OFFER + follower
-        // auto-restore.
-        .needs_snapshot = snapshot_mod.logNeedsSnapshot,
+        // Mints a snap_id, builds the fetch path, and sends a
+        // `snap_fetch_offer` frame over the raft transport. The
+        // follower's `on_snap_fetch_offer` callback (wired in
+        // worker.zig) reacts by GETing `/_system/raft-snapshot/{id}`
+        // on the leader's HTTP surface and installing the streamed
+        // app.dbs. See production.md #1.1 step 3.
+        .needs_snapshot = snapshot_mod.sendSnapshotFetchOffer,
         .needs_snapshot_ctx = null,
         .raft_log_path = raft_log_path,
         .worker_count = 0,

@@ -584,17 +584,49 @@ fn deleteWithSuffix(allocator: std.mem.Allocator, path: []const u8, suffix: []co
     std.fs.cwd().deleteFile(buf) catch {};
 }
 
-/// Phase 5.5(c) step C — operator-actionable warning when willemt
-/// asks the leader to ship a snapshot to a far-behind follower
-/// (`raft.cb.send_snapshot`). The current minimum logs the
-/// recovery action: which peer is behind, what willemt's most
-/// recent snapshot is, and the exact `loop46 restore-from-snapshot`
-/// command the operator should run on that node.
+/// Phase 5.5(c) step C / production.md #1.1 step 3 — mint a snap_id
+/// and send a `snap_fetch_offer` frame to the far-behind peer so it
+/// can pull our app.dbs out-of-band via `/_system/raft-snapshot/{id}`
+/// on the worker's HTTP surface. Pure plumbing on this side; the
+/// HTTP handler that actually streams the bytes is in
+/// `worker_dispatch.handleRaftSnapshot`, and the follower-side
+/// receive/install plumbing is in `worker.zig`.
 ///
-/// Future iteration: send a SNAP_OFFER RPC carrying the snap_id;
-/// follower auto-runs the restore. That needs follower-side
-/// download + restore plumbing on the raft thread, which lands
-/// alongside the multi-node smoke harness it requires.
+/// Fire-and-forget. If transport.send fails (peer unreachable,
+/// queue full), willemt will retry by firing `send_snapshot` again
+/// on the next heartbeat tick that observes the peer's next_idx
+/// still behind the snapshot floor — no need to track delivery here.
+pub fn sendSnapshotFetchOffer(
+    ctx: ?*anyopaque,
+    raft: *kv.RaftNode,
+    peer_id: u32,
+) void {
+    _ = ctx;
+    const snap_id = raft.mintSnapId();
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(
+        &path_buf,
+        "/_system/raft-snapshot/{x}",
+        .{snap_id},
+    ) catch return;
+    raft.sendSnapshotFetchOffer(peer_id, snap_id, path) catch |err| {
+        std.log.warn(
+            "raft: sendSnapshotFetchOffer to peer {d} (snap_id={x}) failed: {s}",
+            .{ peer_id, snap_id, @errorName(err) },
+        );
+        return;
+    };
+    std.log.info(
+        "raft: sent snap_fetch_offer to peer {d} (snap_id={x} snap_last_idx={d} snap_last_term={d})",
+        .{ peer_id, snap_id, raft.snapshotLastIdx(), raft.snapshotLastTerm() },
+    );
+}
+
+/// Legacy operator-actionable warning. Retained for callers that
+/// don't have a wired offer-send path yet (e.g. files-server's
+/// kv.Cluster bootstrap when the multi-node smoke isn't exercising
+/// the auto-catchup flow). Workers default to `sendSnapshotFetchOffer`
+/// per `main.zig::workerMain`.
 pub fn logNeedsSnapshot(
     ctx: ?*anyopaque,
     raft: *kv.RaftNode,
@@ -606,7 +638,7 @@ pub fn logNeedsSnapshot(
     std.log.warn(
         "raft: peer {d} needs snapshot (snap_last_idx={d}, term={d}). " ++
             "Run `loop46 restore-from-snapshot --snap-id <latest>` on that " ++
-            "node, then restart the worker. Future automation: SNAP_OFFER RPC.",
+            "node, then restart the worker.",
         .{ peer_id, idx, term },
     );
 }
