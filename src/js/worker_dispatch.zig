@@ -588,28 +588,56 @@ fn handleRelease(
         return;
     };
 
-    _ = raft_propose.proposeWriteSet(worker, &ws, parsed.value.tenant_id) catch |err| {
-        // At-least-once semantics: leader has the write; followers
-        // may not. Same compromise the outbox / root paths take.
-        std.log.warn(
-            "release: propose envelope 0 for {s}/_deploy/current = {x:0>16} failed: {s}",
-            .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
+    // Propose envelope-0 and capture the assigned seq so we can
+    // park this request on raft commit. The proposeBatcher coalesces
+    // any other proposals queued at the next raft tick — multiple
+    // parallel release POSTs become a single consensus round.
+    const seq = raft_propose.proposeWriteSet(worker, &ws, parsed.value.tenant_id) catch |err| {
+        // Propose failed before raft accepted it (queue full,
+        // shutting down, not leader). Undo the local write via
+        // kv_undo and return 503 without parking.
+        inst.kv.undoTxn(txn.txn_seq) catch |undo_err| {
+            std.log.warn(
+                "release: undoTxn after propose-failure for {s} failed: {s}",
+                .{ parsed.value.tenant_id, @errorName(undo_err) },
+            );
+        };
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "release propose failed: {s}\n",
+            .{@errorName(err)},
         );
-    };
-    inst.kv.commitTxn(txn.txn_seq) catch |err| {
-        std.log.warn(
-            "release: commitTxn drop-undo for {s} failed: {s}",
-            .{ parsed.value.tenant_id, @errorName(err) },
-        );
-    };
-
-    table.set(parsed.value.tenant_id, parsed.value.dep_id) catch |err| {
-        const msg = try std.fmt.allocPrint(allocator, "release table failed: {s}\n", .{@errorName(err)});
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 503, msg, allocator, cors_origin, null);
         return;
     };
 
-    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
+    // Stamp the release table now so the dispatch tick's
+    // applyPendingReleases / loader enqueue path sees this tenant
+    // immediately. If raft faults the proposal, the table entry
+    // would be stale until a re-publish — acceptable; the loader
+    // is idempotent on dep_id mismatch.
+    table.set(parsed.value.tenant_id, parsed.value.dep_id) catch |err| {
+        std.log.warn(
+            "release: release_table.set {s}/{d} failed: {s}",
+            .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
+        );
+    };
+
+    // Park the request on raft_pending. drainRaftPending will:
+    //   - on commit: commitTxn (drop kv_undo) + deliver 204
+    //   - on fault / timeout: undoTxn + deliver 503
+    // The worker thread is free to dispatch the next stream
+    // immediately; this is what lets proposeBatcher actually
+    // batch multiple in-flight release POSTs.
+    try respb.stageSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
+    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
+    try server.reg.set(ent, &server.request_out, RaftWait, .{
+        .seq = seq,
+        .txn_seq = txn.txn_seq,
+        .deadline_ns = deadline_ns,
+        .store = inst.kv,
+    });
+    try server.reg.move(ent, &server.request_out, &worker.raft_pending);
 }
 
 /// Body shape: `{"pairs":[{"key":"<k>","value":"<v>"}, ...]}`. Writes

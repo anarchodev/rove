@@ -296,6 +296,33 @@ pub fn setSystemResponse(
     try finalizeResponse(server, ent, sid, sess, status_code, resp_hdrs, copy.ptr, @intCast(copy.len));
 }
 
+/// Like `setSystemResponse`, but stages the response components
+/// on the entity WITHOUT moving it to `response_in`. The caller
+/// then attaches a `RaftWait` component and moves the entity to
+/// `worker.raft_pending`. Used by handlers that want the
+/// dispatch / drain machinery to deliver the response only after
+/// raft has committed the proposed writeset.
+pub fn stageSystemResponse(
+    server: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    status_code: u16,
+    body: []const u8,
+    allocator: std.mem.Allocator,
+    cors_origin: ?[]const u8,
+    content_type: ?[]const u8,
+) !void {
+    const copy = try allocator.dupe(u8, body);
+    const resp_hdrs = try buildSystemRespHeaders(allocator, cors_origin, false, content_type);
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, resp_hdrs);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = copy.ptr, .len = @intCast(copy.len) });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+}
+
 /// Same as `setSystemResponse` but takes ownership of `body` (no
 /// extra dupe). Frees on response completion via the same h2 path.
 pub fn setSystemResponseOwned(
