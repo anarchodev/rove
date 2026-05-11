@@ -177,6 +177,34 @@ pub fn applyEncoded(
     try kv.commit();
 }
 
+/// Scan an encoded writeset for a PUT op against `key` and return
+/// its value, or null if no such op (or the op is a delete). Read-
+/// only — does not commit, does not allocate. Returned slice points
+/// into `payload`; caller must copy if it needs to outlive the
+/// payload buffer.
+///
+/// Used by follower-side apply paths that need to react to specific
+/// keys without re-iterating the whole apply. The decoder bails
+/// silently on truncation (returning null) — the apply path itself
+/// rejects malformed writesets loudly, so by the time this runs
+/// the payload has been validated.
+pub fn scanPutValue(payload: []const u8, key: []const u8) ?[]const u8 {
+    var r: Reader = .{ .data = payload, .pos = 0 };
+    const op_count = r.u32be() catch return null;
+    var i: u32 = 0;
+    while (i < op_count) : (i += 1) {
+        const type_byte = r.byte() catch return null;
+        const key_len = r.u32be() catch return null;
+        const k = r.bytes(key_len) catch return null;
+        const val_len = r.u32be() catch return null;
+        const v = r.bytes(val_len) catch return null;
+
+        const op_type = std.meta.intToEnum(OpType, type_byte) catch return null;
+        if (op_type == .put and std.mem.eql(u8, k, key)) return v;
+    }
+    return null;
+}
+
 const Reader = struct {
     data: []const u8,
     pos: usize,

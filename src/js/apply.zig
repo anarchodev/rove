@@ -57,6 +57,7 @@ const std = @import("std");
 const kv = @import("rove-kv");
 const schedule_server = @import("rove-schedule-server");
 const panic_mod = @import("panic.zig");
+const deployment_loader_mod = @import("deployment_loader.zig");
 
 pub const Error = error{
     Truncated,
@@ -356,6 +357,15 @@ pub const ApplyCtx = struct {
     /// thread. Borrowed; the loop46 binary owns the storage for
     /// the process lifetime.
     public_suffix: ?[]const u8 = null,
+    /// Deployment loader (background thread + dedup-by-tenant
+    /// queue) shared with the worker's dispatch path. When a
+    /// follower applies an envelope-0 writeset containing
+    /// `_deploy/current`, it enqueues a load for that tenant so
+    /// the new bytecode is ready when the local worker thread
+    /// needs it. On the leader, the trampoline that proposed the
+    /// writeset already enqueued; the follower-side detection
+    /// closes the cross-node loop. Borrowed.
+    deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -551,7 +561,9 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
     // Leader path: the worker already wrote via its own TrackedTxn
     // connection. Don't redo the writes (leader-skip), and don't
     // open a second SQLite connection from this thread (contention
-    // on the WAL writer lock with the worker).
+    // on the WAL writer lock with the worker). The leader-side
+    // deployment-loader enqueue happened in the proposing
+    // trampoline (`releasePublishTrampoline`); no work to do here.
     if (ctx.raft.isLeader()) return;
 
     const store = ctx.getKv(env.instance_id) catch |err| panic_mod.invariantViolated(
@@ -565,6 +577,23 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
         "tenant={s} err={s}",
         .{ env.instance_id, @errorName(err) },
     );
+
+    // Follower-side release propagation: if this writeset stamped
+    // `_deploy/current`, the leader just published a new release for
+    // this tenant. Enqueue the deployment loader so the follower's
+    // worker has the new bytecode ready when traffic arrives. The
+    // payload is `{N:0>16}` hex (16 chars); anything else is a
+    // pre-existing kv write happening to use the same key (shouldn't
+    // happen but we tolerate it by silently ignoring).
+    if (ctx.deployment_loader) |loader| {
+        if (kv.scanWriteSetPutValue(env.payload, "_deploy/current")) |hex_bytes| {
+            const dep_id = std.fmt.parseInt(u64, hex_bytes, 16) catch return;
+            loader.enqueue(env.instance_id, dep_id) catch |err| std.log.warn(
+                "applyWriteSet: deployment loader enqueue {s}/{d} failed: {s}",
+                .{ env.instance_id, dep_id, @errorName(err) },
+            );
+        }
+    }
 }
 
 /// Decode the root writeset and apply it to this node's copy of

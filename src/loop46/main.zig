@@ -340,6 +340,16 @@ const WorkerCtx = struct {
     /// Owned by worker 0's thread frame (allocated on stack in
     /// `workerMain`). Other workers leave null.
     internal_schedules_inflight: ?*std.StringHashMapUnmanaged(void) = null,
+    /// Worker thread publishes its `DeploymentLoader` pointer here
+    /// after `Worker.create`. Main reads it (after `ready.set()`)
+    /// and stamps onto `ApplyCtx.deployment_loader` so the apply
+    /// thread's follower-side `_deploy/current` detection can
+    /// enqueue. Worker 0 only — the field exists on every WorkerCtx
+    /// but only worker 0's slot is read. The remaining workers'
+    /// loaders catch up on next request to that tenant when they
+    /// see the new `_deploy/current` value through their own dispatch.
+    /// (Multi-worker fan-out is a follow-up.)
+    deployment_loader_publish: ?*rjs.DeploymentLoader = null,
 };
 
 fn workerMain(args: *WorkerCtx) !void {
@@ -509,6 +519,14 @@ fn workerMain(args: *WorkerCtx) !void {
         .log_batch_store = args.log_batch_store,
     });
     defer worker.destroy();
+
+    // Publish the worker's DeploymentLoader pointer for main to
+    // wire into ApplyCtx (follower-side `_deploy/current` apply
+    // path). Set before `ready.set()` so main can read it
+    // immediately after the wait returns. Worker 0 only — main
+    // currently uses just this slot; other workers' loaders are
+    // independent (see WorkerCtx.deployment_loader_publish docs).
+    @atomicStore(?*rjs.DeploymentLoader, &args.deployment_loader_publish, worker.deployment_loader, .release);
 
     std.log.info("worker {d}: ready, listening on same port via SO_REUSEPORT", .{args.worker_idx});
     args.ready.set();
@@ -1330,6 +1348,13 @@ pub fn main() !void {
         threads[i] = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctxs[i]});
     }
     for (ready_events) |*ev| ev.wait();
+
+    // Wire worker 0's DeploymentLoader into ApplyCtx so the apply
+    // thread can enqueue on follower-side `_deploy/current` writes.
+    // Atomic read pairs with the worker thread's release-store
+    // before `ready.set()`. Other workers' loaders are independent;
+    // multi-worker fan-out is a follow-up.
+    apply_ctx.deployment_loader = @atomicLoad(?*rjs.DeploymentLoader, &ctxs[0].deployment_loader_publish, .acquire);
 
     std.debug.print(
         "loop46 worker node {d} listening on http://{s}\n" ++
