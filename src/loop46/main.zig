@@ -481,7 +481,14 @@ fn workerMain(args: *WorkerCtx) !void {
         .addr = args.http_addr,
         .io_opts = .{
             .max_connections = 4096,
-            .buf_count = 1024,
+            // Each in-flight recv consumes one buffer from this pool.
+            // With a connection burst (e.g. the bench's warmup spawning
+            // hundreds of curls in close succession) the in-flight
+            // count peaks well above what a tenant's steady-state
+            // request rate suggests. 4096 leaves plenty of headroom
+            // before the kernel returns -ENOBUFS on recv (which is
+            // also now handled gracefully — see readsTriage).
+            .buf_count = 4096,
             .buf_size = 16384,
             .listen_backlog = 4096,
             .reuseport = true,

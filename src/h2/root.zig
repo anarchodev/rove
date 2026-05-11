@@ -422,6 +422,17 @@ pub fn H2(comptime opts: Options) type {
         reg: *Registry,
         allocator: std.mem.Allocator,
 
+        // ENOBUFS-on-recv tracking. The kernel returns ENOBUFS when
+        // the io_uring registered buffer pool (`buf_count`) is empty
+        // at recv time. Used to be silently dropped (destroyed the
+        // conn, lost the request); now it's treated as back-pressure
+        // and the connection is re-armed, with a warning on first
+        // occurrence and every 10k events thereafter so the
+        // misconfiguration is visible.
+        recv_enobufs_total: u64 = 0,
+        recv_enobufs_logged: bool = false,
+        recv_enobufs_last_logged_decade: u64 = 0,
+
         // Shared nghttp2 callbacks — one per H2 instantiation
         var ng_callbacks: ?*c.nghttp2_session_callbacks = null;
         var ng_client_callbacks: ?*c.nghttp2_session_callbacks = null;
@@ -1064,6 +1075,9 @@ pub fn H2(comptime opts: Options) type {
             self.h2_opts = h2_opts;
             self.reg = reg;
             self.allocator = allocator;
+            self.recv_enobufs_total = 0;
+            self.recv_enobufs_logged = false;
+            self.recv_enobufs_last_logged_decade = 0;
 
             // Init every collection field. Disabled (client_only with
             // has_client = false) collections have field type `void` —
@@ -1460,9 +1474,26 @@ pub fn H2(comptime opts: Options) type {
             const conn_ents = self.io.read_results.column(rio.ConnEntity);
             const results = self.io.read_results.column(rio.ReadResult);
 
+            // Linux io_uring returns this when no buffer is available
+            // from the registered buffer ring at recv time. Not a
+            // connection-level failure — just back-pressure. Re-arm
+            // the recv (via `read_in`) and the next attempt picks up
+            // a buffer from the ring (recycled by `processReadIn`).
+            const ENOBUFS: i32 = -105;
+
+            var enobufs_this_pass: u32 = 0;
             for (entities, conn_ents, results) |ent, conn_ent, rr| {
                 if (self.reg.isStale(conn_ent.entity) or self.reg.isMoving(conn_ent.entity)) {
                     try self.reg.move(ent, &self.io.read_results, &self._read_errors);
+                    continue;
+                }
+                if (rr.result == ENOBUFS) {
+                    // Transient: route back to read_in so processReadIn
+                    // re-arms recv on this same entity. The buffer ring
+                    // refills as other recvs complete + return their
+                    // buffers via returnBufferToRing.
+                    enobufs_this_pass += 1;
+                    try self.reg.move(ent, &self.io.read_results, &self.io.read_in);
                     continue;
                 }
                 if (rr.result <= 0) {
@@ -1482,6 +1513,24 @@ pub fn H2(comptime opts: Options) type {
                     continue;
                 }
                 try self.reg.move(ent, &self.io.read_results, &self._read_errors);
+            }
+
+            // Loud surfacing of recv back-pressure. The pool size is
+            // operator-controlled (`buf_count`); recurring ENOBUFS
+            // means it's undersized for the workload. We log on first
+            // occurrence (so the misconfiguration is visible right
+            // away) and every 10k subsequent events (so the rate of
+            // back-pressure is visible without flooding the log).
+            if (enobufs_this_pass > 0) {
+                self.recv_enobufs_total += enobufs_this_pass;
+                if (!self.recv_enobufs_logged or self.recv_enobufs_total / 10_000 != self.recv_enobufs_last_logged_decade) {
+                    self.recv_enobufs_logged = true;
+                    self.recv_enobufs_last_logged_decade = self.recv_enobufs_total / 10_000;
+                    std.log.warn(
+                        "rove-h2: recv ENOBUFS — io_uring registered buffer pool exhausted ({d} total, +{d} this pass). Bump `buf_count` if this recurs at a steady rate.",
+                        .{ self.recv_enobufs_total, enobufs_this_pass },
+                    );
+                }
             }
         }
 
