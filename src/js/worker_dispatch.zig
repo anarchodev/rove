@@ -23,7 +23,6 @@ const tenant_mod = @import("rove-tenant");
 const schedule_server_mod = @import("rove-schedule-server");
 const blob_mod = @import("rove-blob");
 const files_server_mod = @import("rove-files-server");
-const files_mod = @import("rove-files");
 const config_mirror = @import("config_mirror.zig");
 
 const dispatcher_mod = @import("dispatcher.zig");
@@ -453,41 +452,6 @@ fn handleServicesTokenMint(
         .{ token, log_base, files_base, exp_ms },
     );
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/json");
-}
-
-/// Body shape: `{"tenant_id":"<id>","dep_id":<u64>}`. Persists the
-/// Fetch + decode the manifest for `dep_id` for use by the release-
-/// POST handler's config-mirror step. Three-tier source:
-///
-///   1. `tc.current_manifest_bytes` cached from the most recent
-///      successful `reloadDeployment` for the SAME dep_id —
-///      decode locally, no HTTP call. Common when handleRelease
-///      runs for a dep_id the worker just loaded.
-///   2. Per-tenant `manifest_backend` over HTTP/2 (when wired),
-///      sharing the worker's `manifest_easy` connection cache —
-///      single-digit ms on a warm connection.
-///   3. S3 fall-through when `manifest_backend` is the legacy
-///      backend (manifest_http unset).
-///
-/// In all cases returns an owned `FileStore.Manifest`; caller
-/// `deinit`s.
-fn loadManifestThroughTenantBackend(
-    allocator: std.mem.Allocator,
-    worker: anytype,
-    inst: *const tenant_mod.Instance,
-    dep_id: u64,
-) !files_mod.FileStore.Manifest {
-    const tc = try worker_mod.getOrOpenTenantFiles(worker, inst);
-    if (tc.current_manifest_bytes) |cached| {
-        if (tc.current_deployment_id == dep_id) {
-            return try files_mod.manifest_json.decode(allocator, cached);
-        }
-    }
-    var key_buf: [25]u8 = undefined;
-    const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
-    const json_bytes = try tc.manifest_backend.blobStore().get(key, allocator);
-    defer allocator.free(json_bytes);
-    return try files_mod.manifest_json.decode(allocator, json_bytes);
 }
 
 /// Stamp `_deploy/current = {dep_id:0>16}` on the tenant's app.db,
