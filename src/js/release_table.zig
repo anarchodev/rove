@@ -65,6 +65,28 @@ pub const ReleaseTable = struct {
         defer self.mu.unlock();
         return self.map.get(tenant_id);
     }
+
+    /// Iterate (tenant_id, dep_id) pairs under the table's mutex.
+    /// `visit` is called once per entry; the tenant_id slice is
+    /// borrowed (valid only for the duration of the visit). The
+    /// callback should keep work cheap — the mutex blocks
+    /// concurrent `set` calls.
+    ///
+    /// Used by the dispatch tick's `applyPendingReleases` so it
+    /// can iterate just the released tenants rather than scanning
+    /// every loaded tenant (production.md #1.5 cleanup).
+    pub fn visit(
+        self: *ReleaseTable,
+        ctx: anytype,
+        comptime cb: fn (@TypeOf(ctx), tenant_id: []const u8, dep_id: u64) void,
+    ) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            cb(ctx, entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
 };
 
 test "set then get round-trips per tenant" {

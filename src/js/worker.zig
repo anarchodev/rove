@@ -1775,40 +1775,56 @@ fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
 /// startup" rather than "nothing".
 pub fn applyPendingReleases(worker: anytype) !void {
     const table = worker.release_table orelse return;
-    var it = worker.tenant_files_map.iterator();
-    while (it.next()) |entry| {
-        const tc = entry.value_ptr.*;
-        const released = table.get(tc.instance_id) orelse continue;
-        if (released == tc.current_deployment_id) continue;
 
-        // Hot path stays free of network I/O. Hand the load off
-        // to the background DeploymentLoader thread; it fetches
-        // the manifest + bytecodes + mirrors `_config/*` and
-        // swaps `tc`'s state when the load completes. The
-        // dispatch thread that ran this comparison just keeps
-        // moving — no synchronous reload here.
-        //
-        // Fallback: with no loader wired (unit-test FakeWorker,
-        // some smokes), run the load synchronously on this
-        // thread. Behavior matches the pre-loader build.
-        if (@hasField(@TypeOf(worker.*), "deployment_loader") and
-            worker.deployment_loader != null)
-        {
-            worker.deployment_loader.?.enqueue(tc.instance_id, released) catch |err| {
-                std.log.warn(
-                    "rove-js release: enqueue load {s}/{d} failed: {s}",
-                    .{ tc.instance_id, released, @errorName(err) },
-                );
-            };
-        } else {
-            reloadDeployment(tc, released) catch |err| {
-                std.log.warn(
-                    "rove-js release: tenant {s} reload to {d} failed: {s}",
-                    .{ tc.instance_id, released, @errorName(err) },
-                );
-            };
+    // Iterate the release table — typically << tenant_files_map
+    // at any given moment — instead of every tenant the worker
+    // knows about. Pre-#1.5 the dispatch tick scanned every
+    // open `TenantFiles` (O(N_total) per tick); at 10k tenants
+    // that's real time on the dispatch thread for the common
+    // case where almost no tenants have a pending release. The
+    // release table holds only the tenants the dashboard / CLI
+    // has actually called `/_system/release` on; iterating it
+    // gives us O(N_pending), closer to operator-rate (~handful
+    // per tick) than tenant-count-rate.
+    const W = @TypeOf(worker);
+    const Ctx = struct {
+        w: W,
+        const Self = @This();
+        fn cb(ctx: *Self, tenant_id: []const u8, released: u64) void {
+            const tc = ctx.w.tenant_files_map.get(tenant_id) orelse return;
+            if (released == tc.current_deployment_id) return;
+
+            // Hot path stays free of network I/O. Hand the load
+            // off to the background DeploymentLoader thread; it
+            // fetches the manifest + bytecodes + mirrors
+            // `_config/*` and swaps `tc`'s state when the load
+            // completes. The dispatch thread keeps moving — no
+            // synchronous reload here.
+            //
+            // Fallback: with no loader wired (unit-test
+            // FakeWorker, some smokes), run the load
+            // synchronously on this thread. Behavior matches
+            // the pre-loader build.
+            const HasLoader = @hasField(@typeInfo(W).pointer.child, "deployment_loader");
+            if (HasLoader and ctx.w.deployment_loader != null) {
+                ctx.w.deployment_loader.?.enqueue(tenant_id, released) catch |err| {
+                    std.log.warn(
+                        "rove-js release: enqueue load {s}/{d} failed: {s}",
+                        .{ tenant_id, released, @errorName(err) },
+                    );
+                };
+            } else {
+                reloadDeployment(tc, released) catch |err| {
+                    std.log.warn(
+                        "rove-js release: tenant {s} reload to {d} failed: {s}",
+                        .{ tenant_id, released, @errorName(err) },
+                    );
+                };
+            }
         }
-    }
+    };
+    var ctx: Ctx = .{ .w = worker };
+    table.visit(&ctx, Ctx.cb);
 }
 
 // ── Dispatch system ───────────────────────────────────────────────────
