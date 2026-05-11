@@ -611,53 +611,35 @@ pub fn logNeedsSnapshot(
     );
 }
 
-/// Result of a successful `tickRaftCapture` pass — the snapshot
-/// floor we advanced to + counts for ops visibility. Replaces
-/// the `Captured` struct for the periodic-loop path; operator CLI
+/// Result of a successful `tickRaftCapture` pass. Replaces the
+/// `Captured` struct for the periodic-loop path; operator CLI
 /// captures still go through `capture()` and return `Captured`.
 pub const TickResult = struct {
     /// The willemt apply position we just compacted past. Equal
     /// to `commit_idx_at_begin_snapshot`.
     apply_position: u64,
-    /// Tenants whose `_apply_state` we stamped this pass.
-    /// Equal to `apply_ctx.tenant_apply_idx.count()` minus any
-    /// individual stamp failures (logged but not fatal).
-    stamped_tenants: u32,
-    /// True if `__root__.db` was stamped successfully this pass.
-    /// False on a node that's never seen a root_writeset apply.
-    stamped_root: bool,
-    /// Wall-clock duration of the stamp loop + willemt
-    /// begin/end. Excludes the elapsed-time gate.
+    /// Wall-clock duration of the tick (single __root__.db stamp
+    /// + willemt begin/end + page-level log compaction).
+    /// Excludes the elapsed-time gate.
     duration_ms: u64,
 };
 
-/// In-process periodic log compaction for the raft thread.
+/// In-process periodic log compaction for the raft thread. O(1):
+/// one row update in `__root__.db._apply_state` records the new
+/// compaction floor, then willemt advances + compactLogPages
+/// reclaims pages from the raft log.
 ///
-/// **No byte capture, no S3, no manifest.** Per
-/// `docs/production.md` #1.1: log compaction only needs an
-/// assertion that "this node's tenant state is consistent through
-/// idx N" — the on-disk app.db files plus their
-/// `_apply_state.last_applied_raft_idx` stamp are exactly that
-/// assertion, and no separate byte copy is required.
-///
-/// What this pass does:
-///
-///   1. willemt begin_snapshot at current commit_idx.
-///   2. Stamp `_apply_state[T] = commit_idx` for every tenant T
-///      in `apply_ctx.tenant_apply_idx` (always-refresh-all so
-///      dormant tenants don't pin willemt's compaction floor).
-///   3. Same for `__root__.db`.
-///   4. willemt end_snapshot → cbLogPoll truncates raft.log.db
-///      past the new floor. compactLogPages releases freed
-///      pages back to the filesystem.
+/// Per `docs/production.md` #1.5: raft idx is globally ordered, so
+/// one cluster-wide apply counter answers the apply filter for
+/// every store. No per-tenant `_apply_state` row to write,
+/// regardless of how many stores live on this node.
 ///
 /// Falls-behind followers + new-node bootstrap go through
 /// willemt's `send_snapshot` callback (separate item — currently
 /// the `logNeedsSnapshot` warning), NOT through this path.
 ///
 /// Returns null when we skipped this tick (interval not elapsed,
-/// not leader, willemt has nothing to snapshot). Otherwise
-/// returns counts + duration for ops visibility.
+/// not leader, willemt has nothing to snapshot).
 pub fn tickRaftCapture(
     state: *RaftCaptureState,
     now_ns: i64,
@@ -679,51 +661,24 @@ pub fn tickRaftCapture(
     const start_ns = std.time.nanoTimestamp();
     const apply_position = raft.snapshotLastIdx();
 
-    // Per-tenant stamp loop. Each stamp is one prepared-statement
-    // step → small WAL append → fsync (in synchronous=FULL mode).
-    // ~1ms per tenant in fs backend, similar in WAL-mode SQLite.
-    // For dense clusters (10k tenants) this could push >1s; we
-    // accept that for v1 — it's still 100× faster than the prior
-    // VACUUM-INTO + S3 path and operator-tunable via
-    // --snapshot-interval-ms. A dedicated raft-thread budget
-    // optimization (chunked stamping with willemt yield points)
-    // is a future item if needed.
-    var stamped: u32 = 0;
-    var idx_it = apply_ctx.tenant_apply_idx.iterator();
-    while (idx_it.next()) |entry| {
-        const id = entry.key_ptr.*;
-        const store = apply_ctx.getKv(id) catch |err| {
-            std.log.warn(
-                "snapshot: tickRaftCapture: getKv {s} failed: {s} (tenant skipped)",
-                .{ id, @errorName(err) },
-            );
-            continue;
-        };
-        store.setLastAppliedRaftIdx(apply_position) catch |err| {
-            std.log.warn(
-                "snapshot: tickRaftCapture: setLastAppliedRaftIdx for {s} failed: {s}",
-                .{ id, @errorName(err) },
-            );
-            continue;
-        };
-        stamped += 1;
-    }
-
-    // Same for __root__.db (singleton). On nodes that have never
-    // seen a root_writeset apply, getRootKv returns no error but
-    // root_apply_idx stays 0; we still stamp to apply_position so
-    // the file's _apply_state matches the snapshot floor.
-    var stamped_root = false;
-    const root_store = apply_ctx.getRootKv() catch null;
-    if (root_store) |rs| {
-        rs.setLastAppliedRaftIdx(apply_position) catch |err| {
-            std.log.warn(
-                "snapshot: tickRaftCapture: setLastAppliedRaftIdx for __root__ failed: {s}",
-                .{@errorName(err)},
-            );
-        };
-        stamped_root = true;
-    }
+    // One stamp: persist the cluster-wide apply idx to
+    // __root__.db so a restart resumes from this floor. Cost
+    // is one row update + WAL append + fsync, independent of
+    // tenant count.
+    const root_store = apply_ctx.getRootKv() catch |err| {
+        std.log.warn(
+            "snapshot: tickRaftCapture: getRootKv failed: {s}",
+            .{@errorName(err)},
+        );
+        return null;
+    };
+    root_store.setLastAppliedRaftIdx(apply_position) catch |err| {
+        std.log.warn(
+            "snapshot: tickRaftCapture: setLastAppliedRaftIdx __root__ failed: {s}",
+            .{@errorName(err)},
+        );
+        return null;
+    };
 
     raft.endSnapshotOpaque();
 
@@ -742,8 +697,6 @@ pub fn tickRaftCapture(
 
     return .{
         .apply_position = apply_position,
-        .stamped_tenants = stamped,
-        .stamped_root = stamped_root,
         .duration_ms = duration_ms,
     };
 }
@@ -790,19 +743,19 @@ pub fn tenantSourcesFromApplyCtx(
     var list: std.ArrayListUnmanaged(TenantSource) = .empty;
     errdefer list.deinit(allocator);
 
-    var idx_it = apply_ctx.tenant_apply_idx.iterator();
-    while (idx_it.next()) |entry| {
-        const id = entry.key_ptr.*;
-        // Lazy-open: getKv idempotently opens the kv_store and
-        // returns a pointer to the cached one. On the leader this
-        // is where we pay the open cost (once per tenant for the
-        // process lifetime, since kv_stores caches). On the
-        // follower we pay it inside `applyWriteSet` instead.
-        const store = apply_ctx.getKv(id) catch continue;
+    // Operator-CLI byte-capture path. Pre-#1.5 this iterated the
+    // (now-removed) `tenant_apply_idx` to surface per-tenant
+    // apply positions for by-reference snapshot reuse. With the
+    // global apply idx, there's just one cluster-wide position;
+    // every TenantSource gets it (or null when capture has no
+    // basis to compare against a previous snapshot). Iterate the
+    // open kv_stores cache for the set of tenants.
+    var it = apply_ctx.kv_stores.iterator();
+    while (it.next()) |entry| {
         try list.append(allocator, .{
-            .instance_id = id,
-            .store = store,
-            .last_applied_idx = entry.value_ptr.*,
+            .instance_id = entry.key_ptr.*,
+            .store = entry.value_ptr.*,
+            .last_applied_idx = apply_ctx.global_apply_idx,
         });
     }
     return list.toOwnedSlice(allocator);
@@ -1518,172 +1471,26 @@ test "capture: end-to-end against FsBatchStore round-trips a tenant db" {
     const v = try restored.get("hello");
     defer allocator.free(v);
     try testing.expectEqualStrings("world", v);
-    try testing.expectEqual(@as(u64, 99), try restored.lastAppliedRaftIdx());
+    // Per-tenant `_apply_state.last_applied_raft_idx` retired in
+    // #1.5 — global apply idx lives in __root__.db. The legacy
+    // byte-capture path no longer carries per-tenant idx, so the
+    // restored per-tenant row stays at 0 (unset). The kv data
+    // itself round-trips as before.
 }
 
-test "capture: by-reference reuse for unchanged tenants" {
-    // Two-tenant cluster. Snapshot 1 captures both fresh. Snapshot 2
-    // happens after a write to acme but not beta:
-    //
-    //   - acme MUST be re-VACUUMed (its bytes changed)
-    //   - beta MUST reuse snapshot 1's db_key (no apply touched it)
-    //
-    // The reuse path is what makes always-refresh-all-tenants
-    // affordable at density — verify the bytes-on-store side of
-    // that contract.
-    const allocator = testing.allocator;
-
-    var path_buf: [96]u8 = undefined;
-    const root_path = tmpPath(&path_buf, "reuse");
-    defer std.fs.cwd().deleteTree(root_path) catch {};
-    try std.fs.cwd().makePath(root_path);
-
-    // Plant __root__.db so ApplyCtx.getRootKv works.
-    {
-        const root_db_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/__root__.db",
-            .{root_path},
-            0,
-        );
-        defer allocator.free(root_db_path);
-        const root_kv = try kv.KvStore.open(allocator, root_db_path);
-        root_kv.close();
-    }
-
-    // Stand up a minimal raft node so ApplyCtx.init has a target.
-    const raft_log_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/raft.log.db",
-        .{root_path},
-        0,
-    );
-    defer allocator.free(raft_log_path);
-    const peers = [_]kv.RaftPeerAddr{.{ .host = "127.0.0.1", .port = 39810 }};
-    const node = try kv.RaftNode.init(allocator, .{
-        .node_id = 0,
-        .peers = &peers,
-        .listen_addr = try std.net.Address.parseIp("127.0.0.1", 39810),
-        .apply = .{ .opaque_bytes = .{ .apply_fn = noopApply, .ctx = null } },
-        .raft_log_path = raft_log_path,
-    });
-    defer node.deinit();
-
-    // Plant `acme` and `beta` tenants, each with one row, both
-    // stamped at last_applied_raft_idx = 50.
-    inline for (.{ "acme", "beta" }) |id| {
-        const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_path, id });
-        defer allocator.free(dir);
-        try std.fs.cwd().makePath(dir);
-        const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{dir}, 0);
-        defer allocator.free(db_path);
-        const ks = try kv.KvStore.open(allocator, db_path);
-        defer ks.close();
-        try ks.put(id ++ "-key", id ++ "-value-snapshot1");
-        try ks.setLastAppliedRaftIdx(50);
-    }
-
-    var apply_ctx = apply_mod.ApplyCtx.init(allocator, root_path, node);
-    defer apply_ctx.deinit();
-    _ = try apply_ctx.getKv("acme");
-    _ = try apply_ctx.getKv("beta");
-    _ = try apply_ctx.getRootKv();
-
-    const store_dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{root_path});
-    defer allocator.free(store_dir);
-    const stage_dir = try std.fmt.allocPrint(allocator, "{s}/.stage", .{root_path});
-    defer allocator.free(stage_dir);
-    const store = try ls.batch_store_fs.FsBatchStore.init(allocator, store_dir);
-    defer store.deinit();
-
-    // ── Snapshot 1: fresh capture of both tenants ───────────────
-    const sources_1 = try tenantSourcesFromApplyCtx(allocator, &apply_ctx);
-    defer allocator.free(sources_1);
-
-    var captured_1 = try capture(
-        allocator,
-        sources_1,
-        apply_ctx.root_store,
-        apply_ctx.rootLastApplied(),
-        null, // no prev — every tenant gets re-VACUUMed
-        store.batchStore(),
-        stage_dir,
-        100,
-        7,
-    );
-    defer captured_1.deinit();
-
-    var manifest_1 = try decodeManifest(allocator, captured_1.manifest_bytes);
-    defer manifest_1.deinit();
-    try testing.expectEqual(@as(usize, 2), manifest_1.tenants.len);
-
-    // Sort manifest_1 entries so the assertions don't depend on
-    // ApplyCtx's hash-iteration order.
-    const acme_1 = findTenantInManifest(&manifest_1, "acme") orelse return error.TestFail;
-    const beta_1 = findTenantInManifest(&manifest_1, "beta") orelse return error.TestFail;
-
-    // Both tenants should reference snap_1's directory in their db_key.
-    try testing.expect(std.mem.indexOf(u8, acme_1.db_key, manifest_1.snap_id) != null);
-    try testing.expect(std.mem.indexOf(u8, beta_1.db_key, manifest_1.snap_id) != null);
-
-    // ── Apply something to acme but not beta. Bumps acme's
-    //    in-memory tenant_apply_idx past beta's; this is what
-    //    drives the reuse decision in snapshot 2.
-    {
-        const acme_kv = try apply_ctx.getKv("acme");
-        try acme_kv.put("acme-key", "acme-value-snapshot2");
-    }
-    apply_ctx.tenant_apply_idx.put(allocator, "acme", 150) catch unreachable;
-    // beta's tenant_apply_idx stays at the seeded value (50, from disk).
-
-    // ── Snapshot 2: should reuse beta, fresh-capture acme ───────
-    const sources_2 = try tenantSourcesFromApplyCtx(allocator, &apply_ctx);
-    defer allocator.free(sources_2);
-
-    var captured_2 = try capture(
-        allocator,
-        sources_2,
-        apply_ctx.root_store,
-        apply_ctx.rootLastApplied(),
-        &manifest_1,
-        store.batchStore(),
-        stage_dir,
-        200,
-        7,
-    );
-    defer captured_2.deinit();
-
-    var manifest_2 = try decodeManifest(allocator, captured_2.manifest_bytes);
-    defer manifest_2.deinit();
-
-    const acme_2 = findTenantInManifest(&manifest_2, "acme") orelse return error.TestFail;
-    const beta_2 = findTenantInManifest(&manifest_2, "beta") orelse return error.TestFail;
-
-    // acme: changed, must be re-captured under snap_2's directory
-    // with a new sha256 (the new value changed the bytes).
-    try testing.expect(std.mem.indexOf(u8, acme_2.db_key, manifest_2.snap_id) != null);
-    try testing.expect(!std.mem.eql(u8, &acme_1.db_sha256, &acme_2.db_sha256));
-
-    // beta: unchanged → must reuse snap_1's db_key BYTE-FOR-BYTE.
-    // Same hash, same size, same key.
-    try testing.expectEqualStrings(beta_1.db_key, beta_2.db_key);
-    try testing.expectEqualSlices(u8, &beta_1.db_sha256, &beta_2.db_sha256);
-    try testing.expectEqual(beta_1.db_size, beta_2.db_size);
-
-    // BOTH entries' snapshot_idx is bumped to apply_position even
-    // though beta's bytes are unchanged — that's the always-refresh
-    // property that lets the willemt compaction floor advance every
-    // pass without per-tenant activity gating.
-    try testing.expectEqual(@as(u64, 200), acme_2.snapshot_idx);
-    try testing.expectEqual(@as(u64, 200), beta_2.snapshot_idx);
-    try testing.expectEqual(@as(u64, 200), manifest_2.willemt_compaction_floor);
-
-    // Sanity: beta's reused db_key actually still resolves to bytes
-    // on the store. Restore-from-snap_2 will need this to work.
-    const beta_bytes = try store.batchStore().get(beta_2.db_key, allocator);
-    defer allocator.free(beta_bytes);
-    try testing.expect(beta_bytes.len > 0);
+test "capture: by-reference reuse for unchanged tenants — RETIRED #1.5" {
+    // Per-tenant apply-idx tracking is gone. The by-reference
+    // reuse path picked unchanged tenants by comparing
+    // source.last_applied_idx to prev_manifest's snapshot_idx
+    // per-tenant. With the global apply idx model, every source
+    // has the same idx in any given pass, so the heuristic can
+    // no longer distinguish changed from unchanged. The operator-
+    // CLI byte-capture path now re-captures every tenant on
+    // every pass; minor efficiency regression for that one path,
+    // pre-launch so no prior captures to preserve.
+    return error.SkipZigTest;
 }
+
 
 test "capture: prev_manifest with different tenant set" {
     // Edge: prev_manifest exists, but contains tenants we no
@@ -1778,7 +1585,7 @@ test "capture: prev_manifest with different tenant set" {
         allocator,
         sources,
         apply_ctx.root_store,
-        apply_ctx.rootLastApplied(),
+        apply_ctx.global_apply_idx,
         &prev_manifest,
         store.batchStore(),
         stage_dir,

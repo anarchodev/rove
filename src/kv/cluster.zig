@@ -282,13 +282,20 @@ pub const Cluster = struct {
     /// see module docs.
     stores: std.StringHashMapUnmanaged(*KvStore) = .empty,
 
-    /// In-memory mirror of every store's
-    /// `_apply_state.last_applied_raft_idx`. Owns its own keys
-    /// (separate allocations from `stores`'s keys) so
-    /// `markApplied` (the leader-side fast path) can populate it
-    /// without opening the store. See snapshot tick in
-    /// `loop46/snapshot.zig`.
-    apply_idx: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Cluster-wide apply position. Raft idx is globally ordered,
+    /// so one counter answers "have we already applied entry X?"
+    /// without per-store bookkeeping. Persisted in `__root__.db`
+    /// on each snapshot tick; seeded from there at startup.
+    /// Advanced by every `applyOne` (regardless of envelope type
+    /// or target store).
+    global_apply_idx: u64 = 0,
+
+    /// `__root__.db` handle. Opens lazily on first apply or first
+    /// snapshot tick — whichever comes first. Holds the
+    /// persistent `global_apply_idx` row + serves as the
+    /// platform's `__root__.db` store for app-defined root
+    /// writesets.
+    root_store: ?*KvStore = null,
 
     /// Envelope-type → handler dispatch table. 256 entries (one
     /// per byte). Library populates entries 0 + 1 in `init`
@@ -361,7 +368,8 @@ pub const Cluster = struct {
             .raft_owned = false,
             .user_ctx = user_ctx,
             .stores = .empty,
-            .apply_idx = .empty,
+            .global_apply_idx = 0,
+            .root_store = null,
             .handlers = [_]?EnvelopeRegistration{null} ** 256,
         };
         // Built-in handlers.
@@ -378,10 +386,7 @@ pub const Cluster = struct {
     pub fn deinit(self: *Cluster) void {
         if (self.raft_owned) self.raft.deinit();
 
-        // apply_idx owns its keys independently.
-        var idx_it = self.apply_idx.iterator();
-        while (idx_it.next()) |e| self.allocator.free(e.key_ptr.*);
-        self.apply_idx.deinit(self.allocator);
+        if (self.root_store) |s| s.close();
 
         var s_it = self.stores.iterator();
         while (s_it.next()) |e| {
@@ -427,15 +432,6 @@ pub const Cluster = struct {
         errdefer self.allocator.free(id_copy);
         try self.stores.put(self.allocator, id_copy, store);
 
-        // Seed the apply_idx mirror from disk if the leader-side
-        // fast path hasn't already populated it.
-        if (self.apply_idx.getPtr(store_id) == null) {
-            const seeded = store.lastAppliedRaftIdx() catch 0;
-            const idx_id = try self.allocator.dupe(u8, store_id);
-            errdefer self.allocator.free(idx_id);
-            try self.apply_idx.put(self.allocator, idx_id, seeded);
-        }
-
         return store;
     }
 
@@ -450,34 +446,39 @@ pub const Cluster = struct {
         }
     }
 
+    /// Lazily open `{data_dir}/__root__.db`. First-open seeds
+    /// `global_apply_idx` from the row stored there (`0` on a
+    /// fresh data dir, the persisted floor on a restart).
+    pub fn openRoot(self: *Cluster) !*KvStore {
+        if (self.root_store) |existing| return existing;
+        const path = try std.fmt.allocPrintSentinel(
+            self.allocator,
+            "{s}/__root__.db",
+            .{self.data_dir},
+            0,
+        );
+        defer self.allocator.free(path);
+
+        const store = try KvStore.open(self.allocator, path);
+        errdefer store.close();
+        self.root_store = store;
+        if (self.global_apply_idx == 0) {
+            self.global_apply_idx = store.lastAppliedRaftIdx() catch 0;
+        }
+        return store;
+    }
+
     // ── Apply-state tracking ───────────────────────────────────
 
-    /// Bump the in-memory `last_applied_idx` mirror after a
-    /// successful follower apply. Expects `openStore` to have
-    /// populated the entry already.
-    pub fn noteApplied(self: *Cluster, store_id: []const u8, idx: u64) void {
-        if (self.apply_idx.getPtr(store_id)) |slot| slot.* = idx;
+    /// Read the in-memory global apply idx.
+    pub fn lastApplied(self: *const Cluster) u64 {
+        return self.global_apply_idx;
     }
 
-    /// Leader-side fast path: bump the mirror WITHOUT opening the
-    /// store. The leader's worker already wrote rows via its own
-    /// connection; we don't want a second writer on the same file.
-    /// Snapshot tick opens the connection lazily and stamps
-    /// `_apply_state` once per pass.
-    pub fn markApplied(self: *Cluster, store_id: []const u8, idx: u64) !void {
-        if (self.apply_idx.getPtr(store_id)) |slot| {
-            slot.* = idx;
-            return;
-        }
-        const id_copy = try self.allocator.dupe(u8, store_id);
-        errdefer self.allocator.free(id_copy);
-        try self.apply_idx.put(self.allocator, id_copy, idx);
-    }
-
-    /// Read the in-memory mirror. Returns null when this cluster
-    /// has never seen the named store applied to.
-    pub fn lastApplied(self: *const Cluster, store_id: []const u8) ?u64 {
-        return self.apply_idx.get(store_id);
+    /// Bump the global apply idx. Monotonic — silently keeps the
+    /// higher value on stale callers.
+    fn noteApplied(self: *Cluster, idx: u64) void {
+        if (idx > self.global_apply_idx) self.global_apply_idx = idx;
     }
 
     // ── Apply dispatch ─────────────────────────────────────────
@@ -502,6 +503,14 @@ pub const Cluster = struct {
     }
 
     pub fn applyOne(self: *Cluster, entry_idx: u64, bytes: []const u8) !void {
+        // Global apply filter — replaces the per-store
+        // `_apply_state` lookup that used to live inside each
+        // envelope's handler. Raft idx is totally ordered, so
+        // one counter answers the question for the entire
+        // cluster.
+        if (entry_idx <= self.global_apply_idx) return;
+        defer self.noteApplied(entry_idx);
+
         const env = try decodeEnvelope(bytes);
         try self.dispatch(env, entry_idx, false);
     }
@@ -514,19 +523,10 @@ pub const Cluster = struct {
     ) !void {
         const reg = self.handlers[env.type] orelse return Error.UnknownEnvelopeType;
         if (reg.leader_skip and self.raft.isLeader()) {
-            // Leader-side fast path: just bump the mirror; the
-            // app already wrote locally. Note: only meaningful for
-            // writeset-shaped envelopes that target a specific
-            // store. Apps that set leader_skip = true for an
-            // app-specific envelope take responsibility for the
-            // mirror semantics.
-            if (env.type == ENVELOPE_TYPE_WRITESET) {
-                try self.markApplied(env.id, entry_idx);
-                return;
-            }
-            // Other leader-skip handlers: skip silently (app
-            // handler provides whatever leader-side accounting
-            // is needed via its own state).
+            // Leader-side fast path: the app already wrote
+            // locally via its own connection; we don't want a
+            // second writer. The outer `applyOne` already
+            // advanced the global counter.
             return;
         }
         try reg.apply(self, env, entry_idx, inside_multi, self.user_ctx);
@@ -542,11 +542,8 @@ pub const Cluster = struct {
     pub const TickResult = struct {
         /// willemt commit_idx at the moment of the tick.
         apply_position: u64,
-        /// Number of stores whose `_apply_state` was stamped
-        /// successfully this tick.
-        stamped_stores: u32,
-        /// Wall-clock duration of the stamp loop + willemt
-        /// begin/end.
+        /// Wall-clock duration of the tick (stamp __root__.db +
+        /// willemt begin/end + page compaction).
         duration_ms: u64,
     };
 
@@ -564,7 +561,12 @@ pub const Cluster = struct {
         last_attempt_ns: i64 = 0,
     };
 
-    /// Per-store stamp loop + willemt begin/end + log compaction.
+    /// O(1) snapshot tick: one stamp in `__root__.db` records the
+    /// new compaction floor, then willemt advances + page-level
+    /// log compaction runs. No per-store work — raft idx is
+    /// globally ordered, so the single counter answers the apply
+    /// filter cluster-wide. See `docs/production.md` #1.5.
+    ///
     /// Returns null if the tick was skipped (not leader, interval
     /// not elapsed, or willemt has nothing to snapshot).
     pub fn tickSnapshot(
@@ -583,32 +585,24 @@ pub const Cluster = struct {
         const start_ns = std.time.nanoTimestamp();
         const apply_position = self.raft.snapshotLastIdx();
 
-        // Always-refresh-all: stamp every registered store's
-        // `_apply_state` to the current apply_position. Dormant
-        // stores get refreshed too so they don't pin willemt's
-        // compaction floor. Each stamp is one prepared-statement
-        // step in WAL mode + auto-commit fsync (~1ms per store
-        // in fs backend).
-        var stamped: u32 = 0;
-        var idx_it = self.apply_idx.iterator();
-        while (idx_it.next()) |entry| {
-            const store_id = entry.key_ptr.*;
-            const store = self.openStore(store_id) catch |err| {
-                std.log.warn(
-                    "cluster.tickSnapshot: openStore {s} failed: {s}",
-                    .{ store_id, @errorName(err) },
-                );
-                continue;
-            };
-            store.setLastAppliedRaftIdx(apply_position) catch |err| {
-                std.log.warn(
-                    "cluster.tickSnapshot: setLastAppliedRaftIdx for {s} failed: {s}",
-                    .{ store_id, @errorName(err) },
-                );
-                continue;
-            };
-            stamped += 1;
-        }
+        // One stamp: persist the global apply idx to __root__.db
+        // so a restart resumes from this floor. Cost is one row
+        // update + WAL append + fsync, regardless of how many
+        // stores exist on this node.
+        const root = self.openRoot() catch |err| {
+            std.log.warn(
+                "cluster.tickSnapshot: openRoot failed: {s}",
+                .{@errorName(err)},
+            );
+            return null;
+        };
+        root.setLastAppliedRaftIdx(apply_position) catch |err| {
+            std.log.warn(
+                "cluster.tickSnapshot: setLastAppliedRaftIdx __root__ failed: {s}",
+                .{@errorName(err)},
+            );
+            return null;
+        };
 
         self.raft.endSnapshotOpaque();
         self.raft.compactLogPages() catch |err| {
@@ -623,7 +617,6 @@ pub const Cluster = struct {
 
         return .{
             .apply_position = apply_position,
-            .stamped_stores = stamped,
             .duration_ms = duration_ms,
         };
     }
@@ -691,21 +684,15 @@ pub const Cluster = struct {
         _: ?*anyopaque,
     ) ApplyError!void {
         _ = inside_multi;
+        _ = entry_idx; // global filter already ran in dispatch
 
-        // Open the target store, snapshot-replay filter, then
-        // apply. Stamp `_apply_state` atomically inside
-        // `applyEncodedWriteSet`.
         const store = cluster.openStore(env.id) catch |err| switch (err) {
             error.OutOfMemory => return ApplyError.OutOfMemory,
             else => return ApplyError.Sqlite,
         };
 
-        const last = store.lastAppliedRaftIdx() catch return ApplyError.Sqlite;
-        if (entry_idx <= last) return;
-
-        writeset_mod.applyEncoded(store, 0, env.payload, entry_idx) catch
+        writeset_mod.applyEncoded(store, 0, env.payload) catch
             return ApplyError.Sqlite;
-        cluster.noteApplied(env.id, entry_idx);
     }
 
     // ── Built-in: multi-envelope wrapper ──────────────────────

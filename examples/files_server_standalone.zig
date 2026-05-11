@@ -288,8 +288,8 @@ fn raftThreadMain(
             };
             if (out) |t| {
                 std.log.info(
-                    "files-server snapshot tick apply_position={d} stamped_stores={d} duration_ms={d}",
-                    .{ t.apply_position, t.stamped_stores, t.duration_ms },
+                    "files-server snapshot tick apply_position={d} duration_ms={d}",
+                    .{ t.apply_position, t.duration_ms },
                 );
             }
         }

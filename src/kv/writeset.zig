@@ -140,11 +140,10 @@ pub const WriteSet = struct {
 /// for every PUT. Wraps the ops in a single begin/commit transaction. On
 /// error, rolls back (on a best-effort basis) and returns the error.
 ///
-/// `apply_idx` is the raft entry index this writeset belongs to. When
-/// non-null (Phase 5.5(c) snapshot path), `_apply_state.last_applied_raft_idx`
-/// is stamped to that value inside the same transaction so the apply is
-/// idempotent under snapshot replay. `.kv`-apply-mode callers pass null
-/// to keep the legacy semantics (no per-store apply tracking).
+/// No per-store apply-idx stamp — raft idx is globally ordered, so the
+/// apply filter lives in the caller's in-memory cluster-wide counter
+/// (with one row in `__root__.db` for restart recovery). Per-tenant
+/// `_apply_state` is no longer written; see `docs/production.md` #1.5.
 ///
 /// No allocation: keys/values are passed by pointer into `payload` directly
 /// to sqlite3_bind_{text,blob} with SQLITE_STATIC, which is safe because the
@@ -153,7 +152,6 @@ pub fn applyEncoded(
     kv: *kvstore.KvStore,
     seq: u64,
     payload: []const u8,
-    apply_idx: ?u64,
 ) !void {
     var r: Reader = .{ .data = payload, .pos = 0 };
     const op_count = try r.u32be();
@@ -175,8 +173,6 @@ pub fn applyEncoded(
             .delete => try kv.delete(key),
         }
     }
-
-    if (apply_idx) |idx| try kv.setLastAppliedRaftIdx(idx);
 
     try kv.commit();
 }
@@ -239,7 +235,7 @@ test "encode/decode round trip via KvStore" {
     // Pre-populate "charlie" so the delete has something to remove.
     try kv.put("charlie", "gone");
 
-    try applyEncoded(kv, 7, encoded, null);
+    try applyEncoded(kv, 7, encoded);
 
     const a = try kv.get("alpha");
     defer allocator.free(a);
@@ -251,32 +247,6 @@ test "encode/decode round trip via KvStore" {
 
     try testing.expectError(kvstore.Error.NotFound, kv.get("charlie"));
     try testing.expectEqual(@as(u64, 7), kv.maxSeq());
-}
-
-test "applyEncoded with apply_idx stamps _apply_state in same tx" {
-    const allocator = testing.allocator;
-
-    var ws = WriteSet.init(allocator);
-    defer ws.deinit();
-    try ws.addPut("k1", "v1");
-    const encoded = try ws.encode(allocator);
-    defer allocator.free(encoded);
-
-    var path_buf: [96]u8 = undefined;
-    const path = tmpDbPath(&path_buf, "ws-apply-idx");
-    defer cleanupDb(path);
-
-    var kv = try kvstore.KvStore.open(allocator, path);
-    defer kv.close();
-
-    try testing.expectEqual(@as(u64, 0), try kv.lastAppliedRaftIdx());
-    try applyEncoded(kv, 1, encoded, 42);
-    try testing.expectEqual(@as(u64, 42), try kv.lastAppliedRaftIdx());
-
-    // Re-apply with a higher idx still works (apply.zig is responsible
-    // for filtering; applyEncoded blindly stamps whatever it's told).
-    try applyEncoded(kv, 1, encoded, 99);
-    try testing.expectEqual(@as(u64, 99), try kv.lastAppliedRaftIdx());
 }
 
 test "decode rejects truncated payload" {
@@ -292,7 +262,7 @@ test "decode rejects truncated payload" {
     var kv = try kvstore.KvStore.open(allocator, path);
     defer kv.close();
 
-    try testing.expectError(DecodeError.Truncated, applyEncoded(kv, 1, &buf, null));
+    try testing.expectError(DecodeError.Truncated, applyEncoded(kv, 1, &buf));
 }
 
 fn tmpDbPath(buf: *[96]u8, tag: []const u8) [:0]const u8 {

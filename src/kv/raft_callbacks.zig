@@ -183,12 +183,12 @@ pub fn cbApplyLog(
                 // txn that assigned the seq, BEFORE proposing. Followers
                 // replay the write-set into their own KvStore.
                 if (!is_leader) {
-                    // .kv apply mode predates the snapshot model;
-                    // pass null `apply_idx` so the per-store
-                    // `_apply_state` stamp doesn't fire. Phase
-                    // 5.5(c)'s snapshot model only targets
-                    // `.opaque_bytes`.
-                    writeset.applyEncoded(kv_cfg.store, seq, body, null) catch |err| {
+                    // .kv apply mode predates the snapshot model
+                    // and the global-apply-idx work (#1.5). No
+                    // per-store stamping — that bookkeeping lives
+                    // exclusively in the .opaque_bytes consumer
+                    // now (loop46 ApplyCtx, kv.Cluster).
+                    writeset.applyEncoded(kv_cfg.store, seq, body) catch |err| {
                         std.log.warn(
                             "raft_node: follower apply failed at idx={d} seq={d}: {s}",
                             .{ entry_idx, seq, @errorName(err) },

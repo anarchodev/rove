@@ -693,12 +693,14 @@ fn runRaftLoop(args: *RaftThreadArgs) !void {
             if (out) |tick| {
                 // Stable, parseable shape for
                 // scripts/snapshot_scalability_bench.sh — keep
-                // the field names + ordering. apply_position is
-                // the new compaction floor; stamped is the count
-                // of tenants whose _apply_state we updated.
+                // the field names + ordering. `apply_position`
+                // is the new compaction floor. Per #1.5 there's
+                // no per-tenant stamp loop anymore, so the old
+                // `stamped_tenants` / `stamped_root` fields
+                // dropped.
                 std.log.info(
-                    "snapshot tick apply_position={d} stamped_tenants={d} stamped_root={} duration_ms={d}",
-                    .{ tick.apply_position, tick.stamped_tenants, tick.stamped_root, tick.duration_ms },
+                    "snapshot tick apply_position={d} duration_ms={d}",
+                    .{ tick.apply_position, tick.duration_ms },
                 );
             }
         }

@@ -309,27 +309,21 @@ pub const ApplyCtx = struct {
     /// Lazy per-tenant KvStore cache (instance_id → *KvStore). Keys
     /// are owned copies of the instance id.
     kv_stores: std.StringHashMapUnmanaged(*kv.KvStore),
-    /// Phase 5.5(c) — in-memory mirror of every per-tenant
-    /// `_apply_state.last_applied_raft_idx` row. Seeded from disk on
-    /// lazy open in `getKv`; bumped inside `applyWriteSet` after a
-    /// successful apply. Used by the snapshot capture loop to
-    /// decide whether a tenant's db needs re-VACUUM since the
-    /// previous snapshot pass without a per-tenant SQLite query.
-    /// Owns its own key allocations (separate from `kv_stores`'s
-    /// keys) — the leader path populates this without ever opening
-    /// the kv_store, so the two maps' lifetimes are independent.
-    tenant_apply_idx: std.StringHashMapUnmanaged(u64) = .empty,
-    /// Lazy root-store handle for `type=2 root_writeset` applies.
-    /// Opens `{data_dir}/__root__.db` on first follower-side root
-    /// apply. Null on the leader path (leader-skip fires before we'd
-    /// open it) and on nodes that never see a root writeset.
+    /// **The** apply position. Raft idx is globally ordered; one
+    /// cluster-wide counter replaces what used to be a per-tenant
+    /// hashmap + a separate root counter. Advanced by every applyOne
+    /// call (regardless of envelope type or target store); persisted
+    /// in `__root__.db._apply_state` by the snapshot tick. On
+    /// startup, seeded from `__root__.db` (the single source of
+    /// truth — per-tenant `_apply_state` rows are no longer written
+    /// or read).
+    global_apply_idx: u64 = 0,
+    /// Lazy root-store handle for `type=2 root_writeset` applies +
+    /// the persistent home for `global_apply_idx`. Opens
+    /// `{data_dir}/__root__.db` on first apply or first snapshot
+    /// tick (whichever comes first). Null on a node that has never
+    /// touched root.
     root_store: ?*kv.KvStore = null,
-    /// In-memory mirror of `__root__.db`'s `_apply_state` row. Seeded
-    /// from disk on `getRootKv`'s first call; bumped after each
-    /// successful root apply. The capture loop uses this to skip
-    /// re-VACUUM-ing the singleton root db when nothing has changed
-    /// since the previous snapshot.
-    root_apply_idx: u64 = 0,
     /// Lazy cluster-wide schedule store handle for `type=8/9/10/11`
     /// applies (http.send / docs/http-send-plan.md). Opens
     /// `{data_dir}/schedules.db` on first schedule envelope. Single
@@ -377,14 +371,6 @@ pub const ApplyCtx = struct {
     }
 
     pub fn deinit(self: *ApplyCtx) void {
-        // tenant_apply_idx owns its keys independently (per
-        // `markTenantApplied`); on the follower path `getKv` also
-        // populates this map but with a separate allocation, so
-        // deinit can free unconditionally.
-        var idx_it = self.tenant_apply_idx.iterator();
-        while (idx_it.next()) |e| self.allocator.free(e.key_ptr.*);
-        self.tenant_apply_idx.deinit(self.allocator);
-
         var kv_it = self.kv_stores.iterator();
         while (kv_it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
@@ -437,19 +423,19 @@ pub const ApplyCtx = struct {
         defer self.allocator.free(path);
         const store = try kv.KvStore.open(self.allocator, path);
         self.root_store = store;
-        // Seed the in-memory mirror from disk so a node restart picks
-        // up where it left off — the snapshot capture loop trusts the
-        // mirror to decide whether root.db needs re-VACUUM.
-        self.root_apply_idx = store.lastAppliedRaftIdx() catch 0;
+        // First opener seeds the global apply idx from disk. After
+        // that, it's bumped in memory per-apply + persisted in
+        // `tickRaftCapture`. Existing non-zero disk value means
+        // this is a restart; resume from there.
+        if (self.global_apply_idx == 0) {
+            self.global_apply_idx = store.lastAppliedRaftIdx() catch 0;
+        }
         return store;
     }
 
     /// Lazily open this tenant's app.db kv store. The returned
     /// pointer is owned by the context and stable for the lifetime
-    /// of the context. Public so the snapshot capture loop can
-    /// warm the cache for tenants the apply path hasn't reached
-    /// yet (e.g. dormant tenants that nonetheless need a snapshot
-    /// entry per the always-refresh property).
+    /// of the context.
     pub fn getKv(self: *ApplyCtx, instance_id: []const u8) !*kv.KvStore {
         if (self.kv_stores.get(instance_id)) |existing| return existing;
 
@@ -488,66 +474,19 @@ pub const ApplyCtx = struct {
         errdefer self.allocator.free(kv_id_copy);
 
         try self.kv_stores.put(self.allocator, kv_id_copy, store);
-
-        // Seed the per-tenant mirror from disk if not already
-        // populated by the leader's `markTenantApplied`. Each map
-        // owns its own key allocation — deinit frees both
-        // independently.
-        if (self.tenant_apply_idx.getPtr(instance_id) == null) {
-            const seeded = store.lastAppliedRaftIdx() catch 0;
-            const idx_id_copy = try self.allocator.dupe(u8, instance_id);
-            errdefer self.allocator.free(idx_id_copy);
-            try self.tenant_apply_idx.put(self.allocator, idx_id_copy, seeded);
-        }
         return store;
     }
 
-    /// Bump the in-memory mirror after a successful tenant apply.
-    /// Keyed by `instance_id`; expects `getKv` to have populated the
-    /// entry already on the follower path (which it does on first
-    /// apply, since `applyWriteSet` calls `getKv` before this).
-    fn noteTenantApplied(self: *ApplyCtx, instance_id: []const u8, idx: u64) void {
-        if (self.tenant_apply_idx.getPtr(instance_id)) |slot| slot.* = idx;
+    /// Snapshot capture loop's read interface.
+    pub fn globalLastApplied(self: *const ApplyCtx) u64 {
+        return self.global_apply_idx;
     }
 
-    /// Leader-only mirror update WITHOUT opening the tenant's
-    /// kv_store. The leader's worker already wrote the rows via its
-    /// own connection — we don't want a second writer on the same
-    /// app.db (would contend with the worker's TrackedTxn for the
-    /// WAL writer lock). Just record `(tenant_id, idx)` in memory.
-    /// Snapshot capture opens the connection lazily, stamps
-    /// `_apply_state`, and VACUUMs — paying the SQLite open cost
-    /// once per snapshot pass instead of per-apply.
-    ///
-    /// First time we see a tenant id, allocate a stable copy of the
-    /// key (the envelope's id slice points into a transient raft
-    /// entry payload). Subsequent applies just bump in place.
-    pub fn markTenantApplied(self: *ApplyCtx, instance_id: []const u8, idx: u64) !void {
-        if (self.tenant_apply_idx.getPtr(instance_id)) |slot| {
-            slot.* = idx;
-            return;
-        }
-        const id_copy = try self.allocator.dupe(u8, instance_id);
-        errdefer self.allocator.free(id_copy);
-        try self.tenant_apply_idx.put(self.allocator, id_copy, idx);
+    /// Bump the in-memory global apply idx. Idempotent / monotonic:
+    /// silently keeps the higher value if called with a stale idx.
+    pub fn noteApplied(self: *ApplyCtx, idx: u64) void {
+        if (idx > self.global_apply_idx) self.global_apply_idx = idx;
     }
-
-    /// Bump the in-memory root-db mirror.
-    fn noteRootApplied(self: *ApplyCtx, idx: u64) void {
-        self.root_apply_idx = idx;
-    }
-
-    /// Snapshot capture loop's read interface. Returns null when this
-    /// node has never opened the named tenant's app.db (the in-memory
-    /// mirror seeds lazily in `getKv`).
-    pub fn tenantLastApplied(self: *const ApplyCtx, instance_id: []const u8) ?u64 {
-        return self.tenant_apply_idx.get(instance_id);
-    }
-
-    pub fn rootLastApplied(self: *const ApplyCtx) u64 {
-        return self.root_apply_idx;
-    }
-
 };
 
 /// The function rove-kv's `RaftNode` calls for every committed entry
@@ -565,6 +504,16 @@ pub fn applyOne(
     ctx_opaque: ?*anyopaque,
 ) void {
     const ctx: *ApplyCtx = @ptrCast(@alignCast(ctx_opaque.?));
+
+    // Global apply filter — replaces the per-store
+    // `_apply_state.last_applied_raft_idx` lookup that lived
+    // inside each envelope's handler. Raft idx is totally
+    // ordered, so one cluster-wide counter answers the
+    // question. Lives here (top-level) so the recursive
+    // multi-envelope dispatch doesn't double-bump or skip
+    // inner envelopes that share the outer entry_idx.
+    if (entry_idx <= ctx.global_apply_idx) return;
+    defer ctx.noteApplied(entry_idx);
 
     const env = decodeEnvelope(payload) catch |err| panic_mod.invariantViolated(
         "applyOne.decodeEnvelope",
@@ -597,23 +546,13 @@ fn dispatch(ctx: *ApplyCtx, env: Envelope, entry_idx: u64, nesting: NestingLevel
 }
 
 fn applyWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
+    _ = entry_idx; // global filter ran in applyOne
+
     // Leader path: the worker already wrote via its own TrackedTxn
-    // connection. We don't redo the writes (leader-skip), don't
+    // connection. Don't redo the writes (leader-skip), and don't
     // open a second SQLite connection from this thread (contention
-    // on the WAL writer lock with the worker), and don't stamp
-    // `_apply_state` from here. We DO record `(tenant_id, idx)` in
-    // memory so periodic snapshot capture knows the leader's
-    // tenant set + each tenant's apply position. The on-disk
-    // `_apply_state` stamp + the kv_store open both happen lazily
-    // inside `tickRaftCapture`, exactly once per snapshot pass.
-    if (ctx.raft.isLeader()) {
-        ctx.markTenantApplied(env.instance_id, entry_idx) catch |err| panic_mod.invariantViolated(
-            "applyWriteSet.markTenantApplied[leader]",
-            "tenant={s} err={s}",
-            .{ env.instance_id, @errorName(err) },
-        );
-        return;
-    }
+    // on the WAL writer lock with the worker).
+    if (ctx.raft.isLeader()) return;
 
     const store = ctx.getKv(env.instance_id) catch |err| panic_mod.invariantViolated(
         "applyWriteSet.getKv",
@@ -621,44 +560,20 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
         .{ env.instance_id, @errorName(err) },
     );
 
-    // Snapshot-replay filter: if this store has already absorbed an
-    // entry at this idx (via snapshot load or earlier apply), skip.
-    // The stamp inside applyEncoded keeps the next write moving the
-    // mark forward atomically with the writeset commit.
-    const last = store.lastAppliedRaftIdx() catch |err| panic_mod.invariantViolated(
-        "applyWriteSet.lastAppliedRaftIdx",
-        "tenant={s} err={s}",
-        .{ env.instance_id, @errorName(err) },
-    );
-    if (entry_idx <= last) return;
-
-    kv.applyEncodedWriteSet(store, 0, env.payload, entry_idx) catch |err| panic_mod.invariantViolated(
+    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
         "applyWriteSet.applyEncodedWriteSet",
         "tenant={s} err={s}",
         .{ env.instance_id, @errorName(err) },
     );
-    ctx.noteTenantApplied(env.instance_id, entry_idx);
 }
 
 /// Decode the root writeset and apply it to this node's copy of
-/// `__root__.db`. Same leader/follower split as `applyWriteSet`:
-/// the leader's `__root__.db` writes happened on the worker's own
-/// connection, and apply just bumps the in-memory `root_apply_idx`
-/// mirror; the on-disk `_apply_state` stamp is deferred to
-/// `tickRaftCapture` (one targeted stamp before VACUUM INTO).
-/// Follower path applies the writeset atomically with the
-/// `_apply_state` stamp via `applyEncoded`.
+/// `__root__.db`. Same leader-skip pattern as `applyWriteSet`.
 fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
     std.debug.assert(env.instance_id.len == 0);
+    _ = entry_idx;
 
-    // Leader path: just bump the in-memory mirror; on-disk stamp +
-    // root store open both happen lazily in `tickRaftCapture`.
-    // Same rationale as `applyWriteSet`'s leader path — avoid
-    // putting a second writer on `__root__.db` from this thread.
-    if (ctx.raft.isLeader()) {
-        ctx.noteRootApplied(entry_idx);
-        return;
-    }
+    if (ctx.raft.isLeader()) return;
 
     const store = ctx.getRootKv() catch |err| panic_mod.invariantViolated(
         "applyRootWriteSet.getRootKv",
@@ -666,19 +581,11 @@ fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
         .{@errorName(err)},
     );
 
-    const last = store.lastAppliedRaftIdx() catch |err| panic_mod.invariantViolated(
-        "applyRootWriteSet.lastAppliedRaftIdx",
-        "err={s}",
-        .{@errorName(err)},
-    );
-    if (entry_idx <= last) return;
-
-    kv.applyEncodedWriteSet(store, 0, env.payload, entry_idx) catch |err| panic_mod.invariantViolated(
+    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
         "applyRootWriteSet.applyEncodedWriteSet",
         "err={s}",
         .{@errorName(err)},
     );
-    ctx.noteRootApplied(entry_idx);
 }
 
 /// http.send envelope-8 apply (schedule_upsert). UPSERTs each row
