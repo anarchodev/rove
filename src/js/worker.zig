@@ -1038,6 +1038,26 @@ pub fn Worker(comptime opts: Options) type {
             var hex_buf: [16]u8 = undefined;
             const hex = std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{dep_id}) catch unreachable;
 
+            // Idempotent fast path: if `_deploy/current` is already
+            // exactly `dep_id`, do nothing. No raft propose, no commit,
+            // no loader enqueue. This is what the 10k snapshot bench's
+            // warmup phase needs — `loop46 seed --deploy-id 1` pre-
+            // stamps `_deploy/current = 1` on every tenant, then
+            // warmup calls publishRelease(tenant, 1) on each one,
+            // every call asking us to activate the dep we just stamped.
+            // Without this fast path, that's 10k raft proposals doing
+            // exactly no work.
+            //
+            // We intentionally do NOT fast-path on `current > dep_id`
+            // — that's a customer-requested rollback to an older
+            // version, semantically a real write. Only exact-match
+            // is a no-op.
+            if (inst.kv.get("_deploy/current")) |current_hex| {
+                defer allocator.free(current_hex);
+                const current_id = std.fmt.parseInt(u64, current_hex, 16) catch 0;
+                if (current_id == dep_id) return;
+            } else |_| {}
+
             var release_ws = kv_mod.WriteSet.init(allocator);
             defer release_ws.deinit();
             try release_ws.addPut("_deploy/current", hex);

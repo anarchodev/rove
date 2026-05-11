@@ -656,6 +656,22 @@ fn handleRelease(
     var hex_buf: [16]u8 = undefined;
     const hex = std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{parsed.value.dep_id}) catch unreachable;
 
+    // Idempotent fast path: matches `releasePublishTrampoline`. If
+    // the target's `_deploy/current` is already exactly `dep_id`,
+    // return 202 without touching raft. The platform-bootstrap
+    // flow (files-server pushing __admin__ / __replay__ at start)
+    // retries on connection-refused — each retry can land here
+    // after the first commit, so without this short-circuit every
+    // retry re-proposes a no-op envelope.
+    if (inst.kv.get("_deploy/current")) |current_hex| {
+        defer allocator.free(current_hex);
+        const current_id = std.fmt.parseInt(u64, current_hex, 16) catch 0;
+        if (current_id == parsed.value.dep_id) {
+            try respb.setSystemResponse(server, ent, sid, sess, 202, "already at dep_id\n", allocator, cors_origin, null);
+            return;
+        }
+    } else |_| {}
+
     var txn = inst.kv.beginTrackedImmediate() catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "release txn open failed: {s}\n", .{@errorName(err)});
         try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
