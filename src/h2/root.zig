@@ -441,6 +441,13 @@ pub fn H2(comptime opts: Options) type {
         recv_enobufs_total: u64 = 0,
         recv_enobufs_logged: bool = false,
         recv_enobufs_last_logged_decade: u64 = 0,
+        /// Consecutive `readsTriage` calls where ENOBUFS fired but
+        /// `outstanding` was below half of `buf_count`. Three in a
+        /// row aborts the process — see the panic check in
+        /// `readsTriage`. Cleared whenever the surfacing condition
+        /// stops holding (so a one-time blip during boot doesn't
+        /// trip the abort).
+        recv_enobufs_low_outstanding_streak: u32 = 0,
 
         // Shared nghttp2 callbacks — one per H2 instantiation
         var ng_callbacks: ?*c.nghttp2_session_callbacks = null;
@@ -1097,6 +1104,7 @@ pub fn H2(comptime opts: Options) type {
             self.recv_enobufs_total = 0;
             self.recv_enobufs_logged = false;
             self.recv_enobufs_last_logged_decade = 0;
+            self.recv_enobufs_low_outstanding_streak = 0;
 
             // Init every collection field. Disabled (client_only with
             // has_client = false) collections have field type `void` —
@@ -1546,23 +1554,84 @@ pub fn H2(comptime opts: Options) type {
             // back-pressure is visible without flooding the log).
             if (enobufs_this_pass > 0) {
                 self.recv_enobufs_total += enobufs_this_pass;
+
+                // Conservation-law surfacing. Pair every "consumed"
+                // with "returned"; if `outstanding` is well below
+                // `buf_count` while ENOBUFS fires at a sustained
+                // rate, the kernel and the ring's userspace
+                // accounting disagree. That's the buffer-leak
+                // signature the postmortem identified — and below,
+                // it's also the abort condition.
+                const consumed = self.io.recv_completions_with_data;
+                const returned_drain = self.io.recv_buffers_returned;
+                const returned_deinit = self.io.cleanup_ctx.recv_buffers_returned_via_deinit;
+                const returned = returned_drain + returned_deinit;
+                const outstanding = consumed -| returned;
+
+                // INVARIANT (impossible by construction): outstanding
+                // strictly less than buf_count. If we ever observe
+                // outstanding > buf_count, our counters lie. This is
+                // the loudest possible signal — abort, don't recover.
+                if (outstanding > self.io.buf_count) {
+                    var buf: [512]u8 = undefined;
+                    const msg = std.fmt.bufPrint(
+                        &buf,
+                        "\n================================================================\n" ++
+                            "ROVE H2: recv buffer accounting broken — outstanding ({d}) > buf_count ({d}).\n" ++
+                            "  consumed={d} returned_drain={d} returned_deinit={d}\n" ++
+                            "  This is impossible by construction; counters or ring management is buggy.\n" ++
+                            "================================================================\n",
+                        .{ outstanding, self.io.buf_count, consumed, returned_drain, returned_deinit },
+                    ) catch buf[0..0];
+                    _ = std.posix.write(2, msg) catch {};
+                    std.process.abort();
+                }
+
+                // INVARIANT (drained-but-busy): if ENOBUFS keeps
+                // firing at a sustained rate while outstanding is
+                // well below `buf_count`, the kernel says "ring is
+                // empty" but our accounting says "ring is far from
+                // empty." That's a buffer leak fingerprint —
+                // buffers handed to userspace and lost via some
+                // destruction path that bypasses the regular
+                // return cycle (the bug fixed in commit 6ee648a
+                // was the canonical case). Abort with the diag
+                // numbers so the next investigator sees the
+                // imbalance directly instead of having to chase
+                // it down by hand.
+                //
+                // Threshold: hit it three consecutive surfacing
+                // attempts to avoid one-off flukes during boot
+                // transients. (Logging cadence is "first + every
+                // 10k", so three surfacings means at least 20k
+                // ENOBUFS events — sustained, not a blip.)
+                if (outstanding * 2 < self.io.buf_count and self.recv_enobufs_total > 1_000) {
+                    self.recv_enobufs_low_outstanding_streak += 1;
+                    if (self.recv_enobufs_low_outstanding_streak >= 3) {
+                        var buf: [512]u8 = undefined;
+                        const msg = std.fmt.bufPrint(
+                            &buf,
+                            "\n================================================================\n" ++
+                                "ROVE H2: recv ENOBUFS with low outstanding — buffer leak suspected.\n" ++
+                                "  enobufs={d} outstanding={d} buf_count={d}\n" ++
+                                "  consumed={d} returned_drain={d} returned_deinit={d}\n" ++
+                                "  Some destruction path is taking buffers out of circulation\n" ++
+                                "  without returning them to the registered ring.\n" ++
+                                "================================================================\n",
+                            .{ self.recv_enobufs_total, outstanding, self.io.buf_count, consumed, returned_drain, returned_deinit },
+                        ) catch buf[0..0];
+                        _ = std.posix.write(2, msg) catch {};
+                        std.process.abort();
+                    }
+                } else {
+                    self.recv_enobufs_low_outstanding_streak = 0;
+                }
+
                 if (!self.recv_enobufs_logged or self.recv_enobufs_total / 10_000 != self.recv_enobufs_last_logged_decade) {
                     self.recv_enobufs_logged = true;
                     self.recv_enobufs_last_logged_decade = self.recv_enobufs_total / 10_000;
-                    // DIAG (task #56): also surface the buffer-ring
-                    // balance. `outstanding` is the kernel's view of
-                    // how many buffers it currently holds (consumed
-                    // by completions minus returned to the ring). If
-                    // `outstanding` is well below `buf_count` while
-                    // ENOBUFS fires, our ring management and the
-                    // kernel's accounting disagree.
-                    const consumed = self.io.recv_completions_with_data;
-                    const returned_drain = self.io.recv_buffers_returned;
-                    const returned_deinit = self.io.cleanup_ctx.recv_buffers_returned_via_deinit;
-                    const returned = returned_drain + returned_deinit;
-                    const outstanding = consumed -| returned;
                     std.log.warn(
-                        "rove-h2: recv ENOBUFS — io_uring registered buffer pool exhausted ({d} total, +{d} this pass; consumed={d} returned_drain={d} returned_deinit={d} outstanding={d} of {d}). Bump `buf_count` if this recurs at a steady rate.",
+                        "rove-h2: recv ENOBUFS — io_uring registered buffer pool exhausted ({d} total, +{d} this pass; consumed={d} returned_drain={d} returned_deinit={d} outstanding={d} of {d}). If `outstanding` is far below `buf_count`, this is a leak — see /_system/metrics for the running balance.",
                         .{ self.recv_enobufs_total, enobufs_this_pass, consumed, returned_drain, returned_deinit, outstanding, self.io.buf_count },
                     );
                 }
