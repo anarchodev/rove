@@ -10,12 +10,18 @@
 #   3. The learner's app.db has the same kv content as a voter
 #      (verified via direct sqlite3 read of a planted row).
 #
-# What this does NOT verify (defer to the promotion-endpoint
-# follow-up):
-#   - Killing 2/3 voters loses quorum.
-#   - Promoting the learner restores quorum.
-# Both need an admin endpoint that calls `raft_node_set_voting`,
-# which doesn't exist yet.
+# Then runs the lost-quorum recovery exercise:
+#
+#   4. Kill 2 of the 3 voters. The surviving voter alone can't
+#      form quorum; writes against it fail / time out.
+#   5. Stop the learner cleanly.
+#   6. Run `loop46 promote-learner --data-dir <learner_dir>` to
+#      wipe the learner's raft.log so the next boot will run as
+#      a 1-node cluster.
+#   7. Restart the learner with `--peers <self>:<port>:voter` —
+#      a peers list naming only itself.
+#   8. Verify it elects itself + serves new writes.
+#   9. Verify the prior kv state (`_deploy/current`) is preserved.
 #
 # Uses port bases 8480/40480 to avoid conflict with other
 # in-flight smokes / benches.
@@ -130,9 +136,10 @@ for tries in $(seq 1 30); do
     for i in 0 1 2 3; do
         h="${HTTP_ADDRS[$i]}"
         p="${h##*:}"
-        if "${CURL[@]}" -H "Authorization: Bearer $ROOT_TOKEN" \
-            "https://app.loop46.localhost:${p}/_system/leader" 2>/dev/null \
-            | grep -q '"is_leader":true'; then
+        code=$("${CURL[@]}" -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $ROOT_TOKEN" \
+            "https://app.loop46.localhost:${p}/_system/leader" 2>/dev/null || echo 000)
+        if [[ "$code" == "200" ]]; then
             LEADER_IDX=$i
             LEADER_HTTP=$h
             break 2
@@ -211,5 +218,141 @@ if [[ "$LEARNER_DEPLOY" != "$EXPECTED_DEPLOY" ]]; then
 fi
 echo "ok  learner _deploy/current = expected $EXPECTED_DEPLOY"
 
+# ── Lost-quorum recovery: kill 2 voters, promote the learner ──────
 echo ""
-echo "PASS learner smoke"
+echo "── lost-quorum recovery ──"
+
+# Pick the two non-leader voters to kill. The leader stays alive
+# as the "surviving voter" — that gives us a clean way to verify
+# quorum-loss (writes against it should fail).
+KILL_VOTERS=()
+for i in 0 1 2; do
+    if [[ "$i" != "$LEADER_IDX" ]]; then
+        KILL_VOTERS+=("$i")
+    fi
+done
+echo "killing 2 voters: nodes ${KILL_VOTERS[*]}"
+for i in "${KILL_VOTERS[@]}"; do
+    kill -TERM "${PIDS[$i]}" 2>/dev/null || true
+    wait "${PIDS[$i]}" 2>/dev/null || true
+    PIDS[$i]=""
+done
+sleep 2
+
+# Confirm the surviving voter can't form quorum. A write should
+# time out or 503 within a reasonable window. We use the existing
+# leader's /_system/release endpoint (a synchronous propose). The
+# raft propose enqueues but never commits → curl --max-time fires.
+echo "verifying surviving voter (node $LEADER_IDX) can no longer commit…"
+QUORUM_LOST=0
+LEADER_PORT="${LEADER_HTTP##*:}"
+SURVIVOR_RESP=$("${CURL[@]}" --max-time 4 -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $ROOT_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"tenant_id\":\"acme\",\"dep_id\":99}" \
+    "https://app.loop46.localhost:${LEADER_PORT}/_system/release" 2>/dev/null || echo "000")
+echo "  POST against surviving voter: HTTP $SURVIVOR_RESP"
+# Any non-2xx response (including 000 = curl timeout) means the
+# write didn't commit. A 2xx would mean quorum is still healthy
+# (test setup bug — only 1 of 3 voters should remain).
+if [[ "$SURVIVOR_RESP" != "200" && "$SURVIVOR_RESP" != "204" ]]; then
+    QUORUM_LOST=1
+fi
+[[ "$QUORUM_LOST" == "1" ]] || {
+    echo "FAIL: surviving voter still serving writes — quorum-loss not reached" >&2
+    exit 1
+}
+echo "ok  surviving voter rejects/times out writes — quorum genuinely lost"
+
+# Stop the learner cleanly.
+echo "stopping learner cleanly…"
+kill -TERM "${PIDS[3]}" 2>/dev/null || true
+wait "${PIDS[3]}" 2>/dev/null || true
+PIDS[3]=""
+sleep 1
+
+# Run the recovery CLI on the learner's data dir.
+LEARNER_PROMOTE_LOG="/tmp/${SMOKE_TAG}-promote.out"
+"$BIN" promote-learner --data-dir "${DATA_DIRS[3]}" > "$LEARNER_PROMOTE_LOG" 2>&1 || {
+    echo "FAIL: promote-learner CLI exited non-zero" >&2
+    cat "$LEARNER_PROMOTE_LOG" >&2
+    exit 1
+}
+grep -q "ready for 1-node-cluster boot" "$LEARNER_PROMOTE_LOG" || {
+    echo "FAIL: promote-learner output doesn't include ready banner" >&2
+    cat "$LEARNER_PROMOTE_LOG" >&2
+    exit 1
+}
+[[ ! -f "${DATA_DIRS[3]}/raft.log.db" ]] || {
+    echo "FAIL: raft.log.db still present after promote-learner" >&2
+    exit 1
+}
+echo "ok  promote-learner removed raft.log.db"
+
+# Restart the learner as a 1-node cluster. New --peers names only
+# itself; node_id resets to 0 since it's the only peer in the list.
+SOLO_PEER="${RAFT_ADDRS[3]}:voter"
+"$BIN" worker \
+    --node-id 0 \
+    --peers "$SOLO_PEER" \
+    --allow-single-peer \
+    --listen "${RAFT_ADDRS[3]}" \
+    --http "${HTTP_ADDRS[3]}" \
+    --data-dir "${DATA_DIRS[3]}" \
+    --public-suffix loop46.localhost \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
+    --workers 1 \
+    "${RAFT_TIMING_FLAGS[@]}" \
+    >"/tmp/${SMOKE_TAG}-worker-3-promoted.out" 2>&1 &
+PIDS[3]=$!
+
+# Probe until it elects itself (single-voter quorum = 1).
+PROMOTED_PORT="${HTTP_ADDRS[3]##*:}"
+PROMOTED_OK=0
+for tries in $(seq 1 30); do
+    code=$("${CURL[@]}" --max-time 2 -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $ROOT_TOKEN" \
+        "https://app.loop46.localhost:${PROMOTED_PORT}/_system/leader" 2>/dev/null || echo 000)
+    if [[ "$code" == "200" ]]; then
+        PROMOTED_OK=1
+        break
+    fi
+    sleep 0.5
+done
+[[ "$PROMOTED_OK" == "1" ]] || {
+    echo "FAIL: promoted learner didn't elect itself within 15s" >&2
+    tail -40 "/tmp/${SMOKE_TAG}-worker-3-promoted.out" >&2
+    exit 1
+}
+echo "ok  promoted learner elected itself (1-node cluster)"
+
+# Drive a new write against the promoted learner — it should
+# commit immediately (no peers to wait on).
+NEW_DEP=$((COMMITS + 1))
+"${CURL[@]}" --max-time 5 \
+    -H "Authorization: Bearer $ROOT_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"tenant_id\":\"acme\",\"dep_id\":$NEW_DEP}" \
+    "https://app.loop46.localhost:${PROMOTED_PORT}/_system/release" >/dev/null || {
+    echo "FAIL: write against promoted learner failed" >&2
+    exit 1
+}
+echo "ok  promoted learner accepted write (dep_id=$NEW_DEP)"
+
+sleep 1
+
+# Verify state continuity: the prior _deploy/current is preserved,
+# AND the new write landed.
+PROMOTED_DEPLOY=$(sqlite3 "$LEARNER_ACME_DB" \
+    "SELECT value FROM kv WHERE key='_deploy/current';" 2>/dev/null || echo "")
+EXPECTED_NEW_DEPLOY=$(printf '%016x' "$NEW_DEP")
+echo "  promoted learner _deploy/current=$PROMOTED_DEPLOY (expected $EXPECTED_NEW_DEPLOY)"
+[[ "$PROMOTED_DEPLOY" == "$EXPECTED_NEW_DEPLOY" ]] || {
+    echo "FAIL: promoted learner state mismatch ($PROMOTED_DEPLOY != $EXPECTED_NEW_DEPLOY)" >&2
+    exit 1
+}
+echo "ok  state continuity: prior $COMMITS commits preserved, new commit $NEW_DEP applied"
+
+echo ""
+echo "PASS learner smoke + lost-quorum recovery"

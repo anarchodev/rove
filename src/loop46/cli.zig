@@ -20,6 +20,14 @@ pub const Cli = struct {
     data_dir: []const u8 = "/tmp/rove-js-data",
     /// If true, wipe the data dir before starting (smoke-test mode).
     fresh: bool = false,
+    /// Opt-in for a single-peer `--peers` list. The default check
+    /// rejects single-peer deploys (production wants ≥3 for raft
+    /// 2/3 quorum), but lost-quorum recovery — a survivor restarting
+    /// as a 1-node cluster after `loop46 promote-learner` —
+    /// legitimately needs this shape. Setting the flag is an
+    /// affirmative "I know what I'm doing, this is the recovery
+    /// path." See production.md #1.2.
+    allow_single_peer: bool = false,
     /// Number of worker threads. Each owns its own Registry/Io/H2/
     /// Tenant/Dispatcher and binds the same HTTP/2 port via
     /// SO_REUSEPORT. Defaults to the number of online CPUs.
@@ -187,6 +195,8 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             out.data_dir = args[i];
         } else if (std.mem.eql(u8, a, "--fresh")) {
             out.fresh = true;
+        } else if (std.mem.eql(u8, a, "--allow-single-peer")) {
+            out.allow_single_peer = true;
         } else if (std.mem.eql(u8, a, "--workers")) {
             i += 1;
             if (i >= args.len) return error.Usage;
@@ -311,20 +321,30 @@ pub fn finalizeCli(allocator: std.mem.Allocator, cli: *Cli) !void {
     // Production deploys are multi-node (1 leader + ≥2 followers
     // for raft 2/3 quorum / 1-failure tolerance). Reject single-
     // node `--peers` so a misconfig surfaces at startup rather than
-    // at first failover.
+    // at first failover. The lost-quorum-recovery flow opts in via
+    // `--allow-single-peer` (see `loop46 promote-learner`).
     var peer_count: usize = 1;
     for (cli.peers) |b| {
         if (b == ',') peer_count += 1;
     }
-    if (peer_count < 2) {
+    if (peer_count < 2 and !cli.allow_single_peer) {
         std.debug.print(
             "error: --peers must list at least 2 entries (got: " ++
                 "\"{s}\"). Production deploys require ≥3 for raft 2/3 " ++
                 "quorum + 1-failure tolerance; 2 is the minimum that " ++
-                "exercises the multi-node code paths.\n",
+                "exercises the multi-node code paths. Pass " ++
+                "--allow-single-peer if this is a lost-quorum recovery.\n",
             .{cli.peers},
         );
         return error.Usage;
+    }
+    if (peer_count < 2 and cli.allow_single_peer) {
+        std.log.warn(
+            "loop46: --allow-single-peer set — booting as a 1-node cluster. " ++
+                "This is the lost-quorum recovery shape; add real peers via " ++
+                "the normal raft path once recovered.",
+            .{},
+        );
     }
 
     if (cli.admin_api_domain == null) {
@@ -351,6 +371,8 @@ pub const USAGE =
     \\                              + __root__.db into the S3 snapshot store
     \\  restore-from-snapshot       install a captured snapshot into a fresh
     \\                              data dir (disaster recovery / rollback)
+    \\  promote-learner             reconfigure a learner data dir as a 1-node
+    \\                              cluster (lost-quorum recovery)
     \\  help                        print this message
     \\
     \\seed flags:

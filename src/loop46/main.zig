@@ -68,6 +68,7 @@ const cli_mod = @import("cli.zig");
 const seed_mod = @import("seed.zig");
 const restore_cli = @import("restore_cli.zig");
 const snapshot_cli = @import("snapshot_cli.zig");
+const promote_cli = @import("promote_cli.zig");
 const snapshot_mod = @import("snapshot.zig");
 
 // Demo + benchmark tenants used to live inline as Zig string literals
@@ -807,6 +808,26 @@ fn dispatchSubcommand(
                 , .{});
             } else {
                 std.debug.print("error: restore-from-snapshot: {s}\n", .{@errorName(err)});
+            }
+            std.process.exit(2);
+        };
+        return .handled;
+    }
+
+    if (std.mem.eql(u8, cmd, "promote-learner")) {
+        promote_cli.runPromote(allocator, sub_args) catch |err| {
+            if (err == error.Usage) {
+                std.debug.print(
+                    \\usage: loop46 promote-learner --data-dir <path>
+                    \\
+                    \\Lost-quorum recovery: wipes the raft log at <path> so a
+                    \\subsequent worker boot with `--peers <self>:<port>:voter`
+                    \\elects itself as a 1-node cluster. App.db state is
+                    \\preserved. See production.md #1.2 for the design.
+                    \\
+                , .{});
+            } else {
+                std.debug.print("error: promote-learner: {s}\n", .{@errorName(err)});
             }
             std.process.exit(2);
         };
