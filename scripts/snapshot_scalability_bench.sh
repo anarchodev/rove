@@ -394,42 +394,51 @@ TOTAL_COMMITS=$(awk '{s+=$1} END {print s}' "/tmp/${SMOKE_TAG}-slots.out")
 sleep $(( (SNAPSHOT_INTERVAL_MS / 1000) + 1 ))
 
 # ── Phase E: parse snapshot stats from the leader log ─────────────
-echo "phase E: parsing snapshot tick stats from leader log…"
-END_TICKS=$(awk '/snapshot tick apply_position=/ {n++} END {print n+0}' "$LEADER_LOG")
-echo "  ticks after steady phase:  $END_TICKS (delta = $((END_TICKS - START_TICKS)))"
+#
+# Pass/fail signal: did the raft compaction floor advance during
+# the steady phase? That's the load-bearing property of the
+# snapshot path. The bench used to count tick log lines, but
+# under the post-#1.5 O(1) tick a tick fires only when commit_idx
+# advances past the previous snapshot floor — so "no new ticks"
+# could mean either the snapshot path is broken (bad) OR the
+# workload didn't generate enough new commits between tick
+# attempts to clear the floor (workload-dependent, not a bug).
+# `apply_position` delta is the unambiguous signal: did the
+# floor move?
+echo "phase E: parsing snapshot stats from leader log…"
 
-mapfile -t ALL_LINES < <(grep -oE 'snapshot tick apply_position=[0-9]+ stamped_tenants=[0-9]+ stamped_root=(true|false) duration_ms=[0-9]+' "$LEADER_LOG" || true)
+mapfile -t ALL_LINES < <(grep -oE 'snapshot tick apply_position=[0-9]+ duration_ms=[0-9]+' "$LEADER_LOG" || true)
 
-if (( END_TICKS <= START_TICKS )); then
-    echo "FAIL: no new compaction ticks fired during the steady phase" >&2
-    echo "      (heartbeat starvation? leadership flap? check leader log)" >&2
-    tail -30 "$LEADER_LOG" >&2
-    exit 1
+END_TICKS=${#ALL_LINES[@]}
+echo "  ticks total: $END_TICKS (delta during steady = $((END_TICKS - START_TICKS)))"
+
+# Pull the most recent apply_position before steady started + the
+# most recent one at the end of the run. Delta tells us whether
+# the compaction floor advanced during steady.
+APPLY_AT_START=0
+APPLY_AT_END=0
+if (( START_TICKS > 0 )) && (( ${#ALL_LINES[@]} >= START_TICKS )); then
+    APPLY_AT_START=$(echo "${ALL_LINES[$((START_TICKS - 1))]}" | grep -oE 'apply_position=[0-9]+' | cut -d= -f2)
 fi
-
-# Slice to steady window. ALL_LINES is in chronological order.
-N_STEADY=$(( END_TICKS - START_TICKS ))
-N_AVAILABLE=${#ALL_LINES[@]}
-if (( N_AVAILABLE < N_STEADY )); then
-    N_STEADY=$N_AVAILABLE
+if (( ${#ALL_LINES[@]} > 0 )); then
+    APPLY_AT_END=$(echo "${ALL_LINES[-1]}" | grep -oE 'apply_position=[0-9]+' | cut -d= -f2)
 fi
-STEADY_LINES=("${ALL_LINES[@]: -$N_STEADY}")
+APPLY_DELTA=$((APPLY_AT_END - APPLY_AT_START))
+echo "  apply_position: $APPLY_AT_START → $APPLY_AT_END (delta = $APPLY_DELTA)"
 
-# Aggregate.
-TOTAL_STAMPED=0; TOTAL_DUR=0; MAX_DUR=0
-for line in "${STEADY_LINES[@]}"; do
-    s=$(echo "$line" | grep -oE 'stamped_tenants=[0-9]+' | cut -d= -f2)
+# Tick duration stats — the heartbeat-starvation indicator.
+# Aggregate ALL ticks, not just steady (the path is the same
+# either side of the steady boundary).
+MAX_DUR=0
+TOTAL_DUR=0
+for line in "${ALL_LINES[@]}"; do
     d=$(echo "$line" | grep -oE 'duration_ms=[0-9]+' | cut -d= -f2)
-    TOTAL_STAMPED=$((TOTAL_STAMPED + s))
     TOTAL_DUR=$((TOTAL_DUR + d))
     (( d > MAX_DUR )) && MAX_DUR=$d
 done
-
-if (( N_STEADY > 0 )); then
-    AVG_STAMPED=$(( TOTAL_STAMPED / N_STEADY ))
-    AVG_DUR=$(( TOTAL_DUR / N_STEADY ))
-else
-    AVG_STAMPED=0; AVG_DUR=0
+AVG_DUR=0
+if (( END_TICKS > 0 )); then
+    AVG_DUR=$(( TOTAL_DUR / END_TICKS ))
 fi
 
 # raft.log.db steady-state size on the leader.
@@ -444,15 +453,13 @@ else
     COMMITS_PER_S=0
 fi
 
-# Spot-check the always-refresh-all property: a dormant tenant
-# (one we wrote to ONCE in warmup, never since) must have its
-# _apply_state advance past warmup time. Pick the highest-numbered
-# warmup tenant (the one furthest from the active set 0..N_ACTIVE-1).
-DORMANT_ID=$(printf 't%05d' "$((N_TOTAL - 1))")
-DORMANT_DB="$LEADER_DIR/$DORMANT_ID/app.db"
-DORMANT_STAMP=0
-if [[ -f "$DORMANT_DB" ]]; then
-    DORMANT_STAMP=$(sqlite3 "$DORMANT_DB" "SELECT v FROM _apply_state WHERE k='last_applied_raft_idx';" 2>/dev/null || echo 0)
+# Compaction floor persisted to __root__.db. With #1.5, this is
+# the single source of truth for the global apply idx — should
+# match the last tick's apply_position.
+ROOT_DB="$LEADER_DIR/__root__.db"
+ROOT_APPLY=0
+if [[ -f "$ROOT_DB" ]]; then
+    ROOT_APPLY=$(sqlite3 "$ROOT_DB" "SELECT v FROM _apply_state WHERE k='last_applied_raft_idx';" 2>/dev/null || echo 0)
 fi
 
 # ── Report ─────────────────────────────────────────────────────────
@@ -463,31 +470,35 @@ printf '  %-32s %s\n' "N_active"                   "$N_ACTIVE"
 printf '  %-32s %ss\n' "steady_duration"           "$STEADY_S"
 printf '  %-32s %sms\n' "snapshot_interval"        "$SNAPSHOT_INTERVAL_MS"
 echo
-printf '  %-32s %s (across %d steady ticks)\n' "avg stamped tenants/tick" "$AVG_STAMPED" "$N_STEADY"
-printf '  %-32s %sms (max %sms)\n' "avg tick duration" "$AVG_DUR" "$MAX_DUR"
+printf '  %-32s %s → %s (delta %s)\n' "apply_position (steady)"   "$APPLY_AT_START" "$APPLY_AT_END" "$APPLY_DELTA"
+printf '  %-32s %sms (max %sms, across %d ticks)\n' "avg tick duration" "$AVG_DUR" "$MAX_DUR" "$END_TICKS"
 echo
 printf '  %-32s %s commits (%s/s)\n' "steady-state apply throughput" "$TOTAL_COMMITS" "$COMMITS_PER_S"
 printf '  %-32s %s bytes (%s rows)\n' "raft.log.db steady-state"     "$RAFT_SIZE" "$RAFT_ROWS"
-printf '  %-32s %s (last warmup tenant)\n' "dormant _apply_state ($DORMANT_ID)" "$DORMANT_STAMP"
+printf '  %-32s %s\n' "__root__.db apply_state" "$ROOT_APPLY"
 echo
 
+# Pass: apply_position advanced during steady. Fail: it didn't,
+# which signals either the snapshot path is broken or the
+# workload generated zero raft commits during steady.
+if (( APPLY_DELTA == 0 )); then
+    echo "FAIL: apply_position did not advance during the steady phase" >&2
+    echo "      ($APPLY_AT_START → $APPLY_AT_END). Either the snapshot" >&2
+    echo "      path is stuck, or the steady-state workload didn't" >&2
+    echo "      generate any new raft commits — check throughput line." >&2
+    tail -30 "$LEADER_LOG" >&2
+    exit 1
+fi
+
 # Sanity: max tick duration must stay well under typical raft
-# election timeout (200-500ms). If it doesn't, the heartbeat-
-# starvation problem is back.
+# election timeout (200-500ms). With the post-#1.5 O(1) tick this
+# should be sub-millisecond — anything > 200ms indicates someone
+# put per-tenant work back into the tick path.
 ELECTION_BUDGET_MS=200
 if (( MAX_DUR > ELECTION_BUDGET_MS )); then
     echo "WARN: max tick duration ($MAX_DUR ms) > $ELECTION_BUDGET_MS ms"
     echo "      — risk of heartbeat starvation; pass is doing too much"
-    echo "      raft-thread work. Check that no S3 / VACUUM-INTO crept"
-    echo "      back into tickRaftCapture."
-fi
-
-# Always-refresh-all: a dormant tenant's _apply_state should
-# advance every pass even though it's never written to.
-if (( DORMANT_STAMP < START_TICKS )); then
-    echo "WARN: dormant tenant _apply_state ($DORMANT_STAMP) didn't advance"
-    echo "      — always-refresh-all is broken; willemt's compaction"
-    echo "      floor will be pinned by dormant tenants."
+    echo "      raft-thread work."
 fi
 
 echo "DONE"
