@@ -500,6 +500,14 @@ pub const RaftNode = struct {
     /// `maybeSnapshot` to space attempts out.
     last_snapshot_attempt_ns: i64,
 
+    /// Monotonic id minted for each `snap_fetch_offer` we send.
+    /// Carried in the offer frame + the HTTP fetch path; primarily a
+    /// debug/tracing correlator since the HTTP handler streams the
+    /// current data_dir state regardless (getting newer state than the
+    /// offer claimed is always safe for snapshot install). Not
+    /// persisted — restarts reset to 0.
+    next_snap_offer_id: std.atomic.Value(u64) = .{ .raw = 0 },
+
     last_tick_ns: i64,
 
     /// Default init: creates a built-in `RaftNet` transport bound to
@@ -875,6 +883,49 @@ pub const RaftNode = struct {
     /// each follower's `next_idx`.
     pub fn snapshotLastIdx(self: *RaftNode) u64 {
         return @intCast(c.raft_get_snapshot_last_idx(self.raft));
+    }
+
+    /// willemt's view of the term of the most recent snapshot.
+    /// Pairs with `snapshotLastIdx` when sending a `snap_fetch_offer`
+    /// or calling `raft_load_snapshot` on the follower.
+    pub fn snapshotLastTerm(self: *RaftNode) u64 {
+        return @intCast(c.raft_get_snapshot_last_term(self.raft));
+    }
+
+    /// Mint a fresh `snap_id` for an outgoing snapshot fetch offer.
+    /// Monotonic across this process lifetime; cheap atomic
+    /// increment. Caller embeds this in the fetch_path it builds
+    /// for `sendSnapshotFetchOffer` so the follower's GET correlates
+    /// to a specific offer in the leader's logs.
+    pub fn mintSnapId(self: *RaftNode) u64 {
+        return self.next_snap_offer_id.fetchAdd(1, .monotonic) + 1;
+    }
+
+    /// Build and send a `snap_fetch_offer` frame to `peer_id`. The
+    /// `snap_last_term` / `snap_last_idx` fields are pulled from
+    /// willemt's current snapshot metadata at call time; the
+    /// application supplies the `snap_id` (typically from
+    /// `mintSnapId`) and the path component the peer should GET to
+    /// stream the actual bytes. Fire-and-forget — transport.send
+    /// errors are caught and logged.
+    ///
+    /// Runs on whatever thread the caller's `needs_snapshot`
+    /// callback runs on (typically the raft thread, since
+    /// `cbSendSnapshot` invokes that callback synchronously).
+    pub fn sendSnapshotFetchOffer(
+        self: *RaftNode,
+        peer_id: u32,
+        snap_id: u64,
+        fetch_path: []const u8,
+    ) !void {
+        const frame = try raft_rpc.encodeSnapFetchOffer(self.allocator, .{
+            .snap_last_term = self.snapshotLastTerm(),
+            .snap_last_idx = self.snapshotLastIdx(),
+            .snap_id = snap_id,
+            .fetch_path = @constCast(fetch_path),
+        });
+        defer self.allocator.free(frame);
+        try self.transport.send(peer_id, frame);
     }
 
     /// When non-zero, leadership was lost with in-flight proposals. Any
