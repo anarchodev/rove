@@ -40,6 +40,8 @@ const std = @import("std");
 const kv = @import("rove-kv");
 const apply_mod = @import("rove-js").apply;
 const ls = @import("rove-log-server");
+const blob_mod = @import("rove-blob");
+const jwt = @import("rove-jwt");
 
 pub const VERSION: u32 = 1;
 
@@ -584,32 +586,46 @@ fn deleteWithSuffix(allocator: std.mem.Allocator, path: []const u8, suffix: []co
     std.fs.cwd().deleteFile(buf) catch {};
 }
 
+/// Context for `sendSnapshotFetchOffer`. Stashed on the kv.RaftNode
+/// Config's `needs_snapshot_ctx` opaque slot at init time; the
+/// callback casts back to read `http_url_prefix`. Caller owns the
+/// underlying string for the process lifetime — RaftNode keeps a
+/// borrowed pointer.
+pub const NeedsSnapshotCtx = struct {
+    /// URL prefix peers should GET against this node, e.g.
+    /// `https://127.0.0.1:8470`. The full fetch URL is
+    /// `{http_url_prefix}/_system/raft-snapshot/{snap_id_hex}`.
+    http_url_prefix: []const u8,
+};
+
 /// Phase 5.5(c) step C / production.md #1.1 step 3 — mint a snap_id
 /// and send a `snap_fetch_offer` frame to the far-behind peer so it
-/// can pull our app.dbs out-of-band via `/_system/raft-snapshot/{id}`
-/// on the worker's HTTP surface. Pure plumbing on this side; the
-/// HTTP handler that actually streams the bytes is in
-/// `worker_dispatch.handleRaftSnapshot`, and the follower-side
-/// receive/install plumbing is in `worker.zig`.
+/// can pull our app.dbs out-of-band via the URL we put in the offer.
+/// Pure plumbing on this side; the HTTP handler that actually
+/// streams the bytes is in `worker_dispatch.handleRaftSnapshot`, and
+/// the follower-side receive/install plumbing is in `worker.zig`.
 ///
 /// Fire-and-forget. If transport.send fails (peer unreachable,
 /// queue full), willemt will retry by firing `send_snapshot` again
 /// on the next heartbeat tick that observes the peer's next_idx
 /// still behind the snapshot floor — no need to track delivery here.
 pub fn sendSnapshotFetchOffer(
-    ctx: ?*anyopaque,
+    ctx_opaque: ?*anyopaque,
     raft: *kv.RaftNode,
     peer_id: u32,
 ) void {
-    _ = ctx;
+    const ctx_ptr: *NeedsSnapshotCtx = @ptrCast(@alignCast(ctx_opaque orelse {
+        std.log.warn("raft: sendSnapshotFetchOffer called with null ctx — dropping offer to peer {d}", .{peer_id});
+        return;
+    }));
     const snap_id = raft.mintSnapId();
-    var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(
-        &path_buf,
-        "/_system/raft-snapshot/{x}",
-        .{snap_id},
+    var url_buf: [256]u8 = undefined;
+    const url = std.fmt.bufPrint(
+        &url_buf,
+        "{s}/_system/raft-snapshot/{x}",
+        .{ ctx_ptr.http_url_prefix, snap_id },
     ) catch return;
-    raft.sendSnapshotFetchOffer(peer_id, snap_id, path) catch |err| {
+    raft.sendSnapshotFetchOffer(peer_id, snap_id, url) catch |err| {
         std.log.warn(
             "raft: sendSnapshotFetchOffer to peer {d} (snap_id={x}) failed: {s}",
             .{ peer_id, snap_id, @errorName(err) },
@@ -617,9 +633,247 @@ pub fn sendSnapshotFetchOffer(
         return;
     };
     std.log.info(
-        "raft: sent snap_fetch_offer to peer {d} (snap_id={x} snap_last_idx={d} snap_last_term={d})",
-        .{ peer_id, snap_id, raft.snapshotLastIdx(), raft.snapshotLastTerm() },
+        "raft: sent snap_fetch_offer to peer {d} (snap_id={x} snap_last_idx={d} snap_last_term={d} url={s})",
+        .{ peer_id, snap_id, raft.snapshotLastIdx(), raft.snapshotLastTerm(), url },
     );
+}
+
+// ── Follower-side receive + stage ─────────────────────────────────────
+
+/// Bundle magic the leader's `handleRaftSnapshot` writes at the head
+/// of the response body. Receiver rejects anything that doesn't lead
+/// with these 8 bytes.
+const SNAP_BUNDLE_MAGIC = "ROVSNAP1";
+
+/// Per-receiver state. One instance per loop46 process; the raft
+/// thread invokes `onSnapFetchOffer` via the kv.RaftNode callback
+/// and the heavy lifting (HTTP fetch + bundle write to disk)
+/// happens on a detached fetcher thread so the raft heartbeat clock
+/// is never blocked. Lives for the process lifetime; no shutdown
+/// dance — the worker process exits to clean up.
+///
+/// Production.md #1.1 step 3, follower half. This commit lands the
+/// staging path only: bytes land in `{data_dir}/.snap-in-{snap_id}/`
+/// and the receiver logs "ready to install." The live install
+/// (drain, close DBs, atomic-rename, `raft_load_snapshot`) is a
+/// separate follow-up because the surgery has to coordinate with
+/// the worker threads.
+pub const SnapReceiver = struct {
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+    /// Shared services-JWT secret. Required: without it the
+    /// receiver can't mint the bearer token the leader's HTTP
+    /// handler will accept. When null, incoming offers are logged
+    /// and dropped.
+    services_jwt_secret: ?[]const u8,
+
+    /// Raft callback: invoked when a `snap_fetch_offer` arrives.
+    /// Copies the borrowed fetch_path, spawns a detached fetcher
+    /// thread, returns immediately. Runs on the raft thread —
+    /// must stay fast.
+    pub fn onSnapFetchOffer(
+        ctx_opaque: ?*anyopaque,
+        raft: *kv.RaftNode,
+        from_id: u32,
+        snap_last_term: u64,
+        snap_last_idx: u64,
+        snap_id: u64,
+        fetch_path: []const u8,
+    ) void {
+        _ = raft;
+        const self: *SnapReceiver = @ptrCast(@alignCast(ctx_opaque orelse {
+            std.log.warn(
+                "raft: on_snap_fetch_offer called with null ctx — dropping offer (peer={d} snap_id={x})",
+                .{ from_id, snap_id },
+            );
+            return;
+        }));
+
+        if (self.services_jwt_secret == null) {
+            std.log.warn(
+                "raft: snap_fetch_offer ignored (peer={d} snap_id={x}) — LOOP46_SERVICES_JWT_SECRET is unset; can't mint the bearer token to fetch the bundle",
+                .{ from_id, snap_id },
+            );
+            return;
+        }
+
+        const args = self.allocator.create(FetcherArgs) catch return;
+        const path_copy = self.allocator.dupe(u8, fetch_path) catch {
+            self.allocator.destroy(args);
+            return;
+        };
+        args.* = .{
+            .receiver = self,
+            .from_id = from_id,
+            .snap_last_term = snap_last_term,
+            .snap_last_idx = snap_last_idx,
+            .snap_id = snap_id,
+            .fetch_path = path_copy,
+        };
+
+        const thread = std.Thread.spawn(.{}, fetcherThreadMain, .{args}) catch |err| {
+            std.log.warn(
+                "raft: snap_fetch_offer (peer={d} snap_id={x}) — thread spawn failed: {s}",
+                .{ from_id, snap_id, @errorName(err) },
+            );
+            self.allocator.free(args.fetch_path);
+            self.allocator.destroy(args);
+            return;
+        };
+        thread.detach();
+
+        std.log.info(
+            "raft: received snap_fetch_offer (peer={d} snap_id={x} snap_last_idx={d} snap_last_term={d}) — fetcher thread dispatched",
+            .{ from_id, snap_id, snap_last_idx, snap_last_term },
+        );
+    }
+};
+
+/// Heap-allocated payload handed to the fetcher thread. Owns the
+/// `fetch_path` copy; freed in `fetcherThreadMain`'s defer.
+const FetcherArgs = struct {
+    receiver: *SnapReceiver,
+    from_id: u32,
+    snap_last_term: u64,
+    snap_last_idx: u64,
+    snap_id: u64,
+    fetch_path: []const u8,
+};
+
+fn fetcherThreadMain(args: *FetcherArgs) void {
+    const receiver = args.receiver;
+    const alloc = receiver.allocator;
+    defer {
+        alloc.free(args.fetch_path);
+        alloc.destroy(args);
+    }
+    fetcherRun(args) catch |err| {
+        std.log.warn(
+            "raft: snap fetcher (peer={d} snap_id={x}) failed: {s}",
+            .{ args.from_id, args.snap_id, @errorName(err) },
+        );
+    };
+}
+
+fn fetcherRun(args: *FetcherArgs) !void {
+    const receiver = args.receiver;
+    const alloc = receiver.allocator;
+    const secret = receiver.services_jwt_secret orelse return error.MissingSecret;
+
+    // Mint a 5-minute services JWT carrying the raft-snapshot cap.
+    const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    const token = try jwt.mint(alloc, secret, .{
+        .exp_ms = now_ms + 5 * 60 * 1000,
+        .caps = &.{jwt.Cap.RAFT_SNAPSHOT},
+    });
+    defer alloc.free(token);
+
+    // Build the Authorization header.
+    const auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+    defer alloc.free(auth_value);
+
+    blob_mod.curl.globalInit();
+    var easy = try blob_mod.curl.Easy.init(alloc);
+    defer easy.deinit();
+
+    // Insecure TLS — inter-peer fetches in a self-signed dev /
+    // private-network production deployment are authenticated via
+    // the cap-gated JWT; TLS is here for encryption only. Mirrors
+    // the `--files-internal-insecure-tls` precedent.
+    const resp = try easy.request(alloc, .{
+        .method = .GET,
+        .url = args.fetch_path,
+        .headers = &.{.{ .name = "Authorization", .value = auth_value }},
+        .timeout_ms = 600_000, // 10 min — large bundles take real time
+        .verify_tls = false,
+    });
+    var resp_mut = resp;
+    defer resp_mut.deinit(alloc);
+
+    if (resp.status != 200) {
+        std.log.warn(
+            "raft: snap fetch (peer={d} snap_id={x}) HTTP {d}: {s}",
+            .{ args.from_id, args.snap_id, resp.status, if (resp.body) |b| b else "" },
+        );
+        return error.HttpStatus;
+    }
+    const body = resp.body orelse return error.EmptyBody;
+
+    if (body.len < SNAP_BUNDLE_MAGIC.len or !std.mem.eql(u8, body[0..SNAP_BUNDLE_MAGIC.len], SNAP_BUNDLE_MAGIC)) {
+        std.log.warn(
+            "raft: snap fetch (peer={d} snap_id={x}) — bad magic, got {x}",
+            .{ args.from_id, args.snap_id, body[0..@min(body.len, 8)] },
+        );
+        return error.BadMagic;
+    }
+
+    // Stage the unbundled files under `{data_dir}/.snap-in-{snap_id}/`.
+    var stage_buf: [256]u8 = undefined;
+    const stage_rel = std.fmt.bufPrint(&stage_buf, ".snap-in-{x}", .{args.snap_id}) catch return error.PathBuf;
+    const stage_dir = try std.fs.path.join(alloc, &.{ receiver.data_dir, stage_rel });
+    defer alloc.free(stage_dir);
+    std.fs.cwd().deleteTree(stage_dir) catch {};
+    try std.fs.cwd().makePath(stage_dir);
+    errdefer std.fs.cwd().deleteTree(stage_dir) catch {};
+
+    var pos: usize = SNAP_BUNDLE_MAGIC.len;
+    if (body.len < pos + 4) return error.Truncated;
+    const file_count = std.mem.readInt(u32, body[pos..][0..4], .big);
+    pos += 4;
+
+    var i: u32 = 0;
+    while (i < file_count) : (i += 1) {
+        if (body.len < pos + 2) return error.Truncated;
+        const name_len = std.mem.readInt(u16, body[pos..][0..2], .big);
+        pos += 2;
+        if (body.len < pos + name_len) return error.Truncated;
+        const name = body[pos .. pos + name_len];
+        pos += name_len;
+        if (body.len < pos + 8) return error.Truncated;
+        const file_size = std.mem.readInt(u64, body[pos..][0..8], .big);
+        pos += 8;
+        if (body.len < pos + file_size) return error.Truncated;
+        const file_bytes = body[pos .. pos + file_size];
+        pos += file_size;
+
+        // Reject name shapes that could escape stage_dir.
+        if (std.mem.indexOfScalar(u8, name, '/') != null or
+            std.mem.indexOfScalar(u8, name, '\\') != null or
+            std.mem.startsWith(u8, name, "."))
+        {
+            return error.UnsafeName;
+        }
+
+        const out_path = try std.fs.path.join(alloc, &.{ stage_dir, name });
+        defer alloc.free(out_path);
+        const f = try std.fs.cwd().createFile(out_path, .{});
+        defer f.close();
+        try f.writeAll(file_bytes);
+    }
+
+    if (pos != body.len) {
+        std.log.warn(
+            "raft: snap fetch (peer={d} snap_id={x}) — bundle leftover bytes (consumed={d} total={d})",
+            .{ args.from_id, args.snap_id, pos, body.len },
+        );
+    }
+
+    std.log.info(
+        "raft: snap fetch (peer={d} snap_id={x}) staged {d} files under {s} — install pending",
+        .{ args.from_id, args.snap_id, file_count, stage_dir },
+    );
+
+    // TODO follow-up: trigger live install:
+    //   1) Drain in-flight requests / pause new accepts.
+    //   2) Close all per-tenant + __root__ KvStore connections.
+    //   3) Atomic-rename staged files over the existing data_dir
+    //      contents (with backup on the side for rollback).
+    //   4) Re-open KvStores.
+    //   5) raft_begin_load_snapshot + raft_end_load_snapshot at
+    //      (args.snap_last_term, args.snap_last_idx).
+    //   6) Resume request acceptance.
+    // For now the staged bundle sits on disk and the next operator
+    // restart can install it via `loop46 restore-from-snapshot`.
 }
 
 /// Legacy operator-actionable warning. Retained for callers that

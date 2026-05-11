@@ -1058,6 +1058,55 @@ pub fn main() !void {
     );
     defer allocator.free(raft_log_path);
 
+    // Build the URL prefix peers should GET against this node when
+    // they need a snapshot. `cli.http` is `host:port` (e.g.
+    // `127.0.0.1:8470`); the prefix is `https://host:port`. Lives in
+    // a heap-allocated buffer the snapshot_ctx points into for the
+    // process lifetime (RaftNode never restarts under us, so no
+    // shutdown lifecycle to manage).
+    const snap_url_prefix = try std.fmt.allocPrint(
+        allocator,
+        "https://{s}",
+        .{cli.http},
+    );
+    defer allocator.free(snap_url_prefix);
+    var needs_snapshot_ctx = snapshot_mod.NeedsSnapshotCtx{
+        .http_url_prefix = snap_url_prefix,
+    };
+
+    // Load the shared services-JWT secret BEFORE raft_node init so
+    // SnapReceiver can borrow a pointer into the same backing array
+    // that the worker threads later read. (Originally set up after
+    // raft_node init alongside the worker-spawn block; moved up
+    // because the receiver registers as a raft callback that needs
+    // the secret to mint the bearer token for the inter-peer
+    // snapshot fetch.)
+    var services_jwt_secret: [32]u8 = undefined;
+    if (try blob_mod.env.envOpt(allocator, ENV_SERVICES_JWT_SECRET)) |hex| {
+        defer allocator.free(hex);
+        if (hex.len != services_jwt_secret.len * 2) failExit(
+            "loop46: {s} must be {d} hex chars (got {d})\n",
+            .{ ENV_SERVICES_JWT_SECRET, services_jwt_secret.len * 2, hex.len },
+        );
+        _ = std.fmt.hexToBytes(&services_jwt_secret, hex) catch failExit(
+            "loop46: {s} is not valid hex\n",
+            .{ENV_SERVICES_JWT_SECRET},
+        );
+        std.log.info("services-jwt-secret: loaded from {s}", .{ENV_SERVICES_JWT_SECRET});
+    } else {
+        std.crypto.random.bytes(&services_jwt_secret);
+        std.log.info(
+            "services-jwt-secret: generated per-process (set {s} to share with external services)",
+            .{ENV_SERVICES_JWT_SECRET},
+        );
+    }
+
+    var snap_receiver = snapshot_mod.SnapReceiver{
+        .allocator = allocator,
+        .data_dir = cli.data_dir,
+        .services_jwt_secret = &services_jwt_secret,
+    };
+
     const raft_node = try kv.RaftNode.init(allocator, .{
         .node_id = cli.node_id,
         .peers = peers,
@@ -1068,16 +1117,19 @@ pub fn main() !void {
                 .ctx = &apply_ctx,
             },
         },
-        // Phase 5.5(c) step C — wire willemt's send_snapshot
-        // callback so a far-behind follower's catch-up surfaces
-        // Mints a snap_id, builds the fetch path, and sends a
-        // `snap_fetch_offer` frame over the raft transport. The
-        // follower's `on_snap_fetch_offer` callback (wired in
-        // worker.zig) reacts by GETing `/_system/raft-snapshot/{id}`
-        // on the leader's HTTP surface and installing the streamed
-        // app.dbs. See production.md #1.1 step 3.
+        // Phase 5.5(c) step C / production.md #1.1 step 3 — when
+        // willemt fires `send_snapshot` (the leader observes a
+        // follower whose next_idx is below the leader's compaction
+        // floor), mint a snap_id and push a `snap_fetch_offer` frame
+        // to the peer carrying the URL this node will serve the
+        // bundle at. The peer side's `on_snap_fetch_offer` callback
+        // dispatches a fetcher thread (`SnapReceiver`) that GETs the
+        // URL, stages the bundle under `{data_dir}/.snap-in-{id}/`,
+        // and (future commit) drives the live install.
         .needs_snapshot = snapshot_mod.sendSnapshotFetchOffer,
-        .needs_snapshot_ctx = null,
+        .needs_snapshot_ctx = @ptrCast(&needs_snapshot_ctx),
+        .on_snap_fetch_offer = snapshot_mod.SnapReceiver.onSnapFetchOffer,
+        .on_snap_fetch_offer_ctx = @ptrCast(&snap_receiver),
         .raft_log_path = raft_log_path,
         .worker_count = 0,
         .propose_linger_ns = cli.propose_linger_us * std.time.ns_per_us,
@@ -1131,34 +1183,10 @@ pub fn main() !void {
     //    `files.` subdomains).
     const tls_config = try resolveTls(allocator, cli);
 
-    // ── HMAC secret used by the standalone services (log-server
-    //    in-process for now, files-server out-of-process post Task #62)
-    //    to verify JWTs minted at `/_system/services-token`.
-    //    `LOOP46_SERVICES_JWT_SECRET` (hex-encoded) is the operator's
-    //    way to pin a known value across both the worker process and
-    //    the external `files-server-standalone` it runs alongside.
-    //    Without the env, we generate a random secret per process —
-    //    fine for in-process subsystems, useless to a separately-
-    //    deployed standalone (its tokens won't verify, by design).
-    var services_jwt_secret: [32]u8 = undefined;
-    if (try blob_mod.env.envOpt(allocator, ENV_SERVICES_JWT_SECRET)) |hex| {
-        defer allocator.free(hex);
-        if (hex.len != services_jwt_secret.len * 2) failExit(
-            "loop46: {s} must be {d} hex chars (got {d})\n",
-            .{ ENV_SERVICES_JWT_SECRET, services_jwt_secret.len * 2, hex.len },
-        );
-        _ = std.fmt.hexToBytes(&services_jwt_secret, hex) catch failExit(
-            "loop46: {s} is not valid hex\n",
-            .{ENV_SERVICES_JWT_SECRET},
-        );
-        std.log.info("services-jwt-secret: loaded from {s}", .{ENV_SERVICES_JWT_SECRET});
-    } else {
-        std.crypto.random.bytes(&services_jwt_secret);
-        std.log.info(
-            "services-jwt-secret: generated per-process (set {s} to share with external services)",
-            .{ENV_SERVICES_JWT_SECRET},
-        );
-    }
+    // `services_jwt_secret` was loaded earlier (above the raft_node
+    // init) so SnapReceiver could borrow into it. The block that
+    // used to live here moved up unchanged; this comment marks where
+    // it WAS so future readers don't double-load.
 
     // Root bearer token for `/_system/*` admin auth. Owned slice
     // lives for the rest of main()'s frame (and therefore the
