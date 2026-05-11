@@ -987,6 +987,94 @@ pub fn Worker(comptime opts: Options) type {
             };
         }
 
+        /// Trampoline for `platform.releases.publish(tenant_id,
+        /// dep_id)`. Stamps `_deploy/current = hex(dep_id)` on
+        /// the target tenant's app.db, proposes envelope-0 (fire-
+        /// and-forget — no spin), enqueues the deployment loader.
+        ///
+        /// Hot path budget: one TrackedTxn begin + one row insert
+        /// + one fsync + one raft queue insert + one loader enqueue.
+        /// All <10ms on local fsync hardware.
+        ///
+        /// Returns `error.InstanceNotFound` if the target doesn't
+        /// resolve; otherwise success regardless of raft outcome.
+        /// Raft consensus + bytecode load happen async. The local
+        /// commit is provisional under the same at-least-once
+        /// semantics `deployStarter` uses: if raft faults, the
+        /// leader's app.db has a `_deploy/current` value that
+        /// followers don't — logged but not compensated. A future
+        /// pass can move this to the `raft_pending` + `RaftWait`
+        /// pattern for strict consensus-before-truth.
+        pub fn releasePublishTrampoline(
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            target_id: []const u8,
+            dep_id: u64,
+        ) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+
+            const inst_opt = self.tenant.getInstance(target_id) catch
+                return error.InstanceNotFound;
+            const inst = inst_opt orelse return error.InstanceNotFound;
+
+            var hex_buf: [16]u8 = undefined;
+            const hex = std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{dep_id}) catch unreachable;
+
+            var release_ws = kv_mod.WriteSet.init(allocator);
+            defer release_ws.deinit();
+            try release_ws.addPut("_deploy/current", hex);
+
+            var txn = try inst.kv.beginTrackedImmediate();
+            errdefer txn.rollback() catch {};
+            try txn.put("_deploy/current", hex);
+            try txn.commit();
+
+            // Fire-and-forget propose. The leader's local commit
+            // is durable; raft consensus settles async.
+            _ = raft_propose.proposeWriteSet(self, &release_ws, target_id) catch |err| {
+                std.log.warn(
+                    "releases.publish: propose envelope 0 for {s} _deploy/current failed: {s}",
+                    .{ target_id, @errorName(err) },
+                );
+            };
+
+            // Drop the undo row now — at-least-once semantics. A
+            // future commit will keep the undo until raft commits.
+            inst.kv.commitTxn(txn.txn_seq) catch |err| {
+                std.log.warn(
+                    "releases.publish: commitTxn for {s} failed: {s}",
+                    .{ target_id, @errorName(err) },
+                );
+            };
+
+            // Enqueue the deployment loader. The leader's worker
+            // starts fetching the manifest + bytecodes; on
+            // commit-replicate to followers, the apply path on
+            // each follower also enqueues the loader (see
+            // `apply.zig::applyWriteSet`, follow-up commit).
+            if (self.deployment_loader) |loader| {
+                loader.enqueue(target_id, dep_id) catch |err| {
+                    std.log.warn(
+                        "releases.publish: enqueue loader for {s}/{d} failed: {s}",
+                        .{ target_id, dep_id, @errorName(err) },
+                    );
+                };
+            }
+
+            // Also stamp the in-memory release table so the
+            // (still-existing-for-now) `applyPendingReleases` path
+            // sees this tenant as needing reload. Once we retire
+            // applyPendingReleases (follow-up), this can drop.
+            if (self.release_table) |table| {
+                table.set(target_id, dep_id) catch |err| {
+                    std.log.warn(
+                        "releases.publish: release_table.set {s}/{d} failed: {s}",
+                        .{ target_id, dep_id, @errorName(err) },
+                    );
+                };
+            }
+        }
+
     };
 }
 

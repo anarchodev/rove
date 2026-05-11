@@ -111,6 +111,40 @@ export function deleteKv(key) {
     return null;
 }
 
+// Publish a release for `instance_id` at `dep_id`. Stamps
+// `_deploy/current = dep_id` on the target tenant + proposes
+// through raft + enqueues the deployment loader. Fire-and-forget
+// — the response returns once the local commit + raft queue
+// insert + loader enqueue are done (typically sub-millisecond).
+// Raft consensus settles in the background; bytecode load
+// happens on the loader thread.
+//
+// Replaces the old `/_system/release` system route. Customer
+// flow: customer pushes manifest to files-server, then calls
+// this with the dep_id it returned.
+export function publishRelease(instance_id, dep_id) {
+    if (!validId(instance_id)) {
+        response.status = 400;
+        return { error: "invalid instance_id" };
+    }
+    const n = parseInt(dep_id, 10);
+    if (!Number.isFinite(n) || n < 1) {
+        response.status = 400;
+        return { error: "dep_id must be a positive integer" };
+    }
+    try {
+        platform.releases.publish(instance_id, n);
+    } catch (e) {
+        if (e && e.code === "InstanceNotFound") {
+            response.status = 404;
+            return { error: "instance not found" };
+        }
+        throw e;
+    }
+    response.status = 202;
+    return { instance_id: instance_id, dep_id: n, status: "queued" };
+}
+
 // ── /v1/* path-routed admin handlers ────────────────────────────────
 //
 // The named exports above are the dashboard's RPC surface

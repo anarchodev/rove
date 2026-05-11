@@ -1254,6 +1254,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 @ptrCast(worker)
             else
                 null,
+            // Release-publish trampoline. Admin-handler only —
+            // customer handlers don't see `platform.releases.publish`
+            // and the JS callable rejects pre-trampoline.
+            .release_publish = if (handler_inst.platform != null)
+                &@TypeOf(worker.*).releasePublishTrampoline
+            else
+                null,
+            .release_publish_ctx = if (handler_inst.platform != null)
+                @ptrCast(worker)
+            else
+                null,
             .emit_buffer = &pending_emits,
             .pending_schedules = &pending_schedules,
             .pending_cancels = &pending_cancels,

@@ -175,6 +175,17 @@ pub const Request = struct {
         target_id: []const u8,
     ) anyerror!void = null,
     deploy_starter_ctx: ?*anyopaque = null,
+    /// Trampoline for `platform.releases.publish(tenant_id,
+    /// dep_id)`. Same admin-only / opaque-worker-ptr pattern as
+    /// `deploy_starter`. Stamps `_deploy/current` + proposes raft
+    /// (fire-and-forget) + enqueues the deployment loader.
+    release_publish: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+        dep_id: u64,
+    ) anyerror!void = null,
+    release_publish_ctx: ?*anyopaque = null,
     /// sse-plan §3.2. `events.emit` appends an `EmitEntry` here; the
     /// worker fires the merged batch fire-and-forget at sse-server
     /// after raft commits the writeset. Optional only because
@@ -351,6 +362,8 @@ pub const Dispatcher = struct {
             .instance_id = request.instance_id,
             .deploy_starter = request.deploy_starter,
             .deploy_starter_ctx = request.deploy_starter_ctx,
+            .release_publish = request.release_publish,
+            .release_publish_ctx = request.release_publish_ctx,
             .emit_buffer = request.emit_buffer,
             .pending_schedules = request.pending_schedules,
             .pending_cancels = request.pending_cancels,

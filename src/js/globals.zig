@@ -199,6 +199,24 @@ pub const DispatchState = struct {
     ) anyerror!void = null,
     deploy_starter_ctx: ?*anyopaque = null,
 
+    /// Trampoline backing `platform.releases.publish(tenant_id,
+    /// dep_id)`. Stamps `_deploy/current = dep_id` on the target
+    /// tenant's app.db, proposes envelope-0 through raft (fire-
+    /// and-forget — does not block on consensus), and enqueues
+    /// the deployment loader so it starts fetching dep_id's
+    /// manifest + bytecodes immediately. The customer-visible
+    /// effect: a release POST returns in <10ms after one local
+    /// fsync + two queue inserts. Raft consensus + bytecode
+    /// load happen async. Null on test paths without a worker;
+    /// the JS callable throws.
+    release_publish: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+        dep_id: u64,
+    ) anyerror!void = null,
+    release_publish_ctx: ?*anyopaque = null,
+
     pub fn deinit(self: *DispatchState, ctx: ?*c.JSContext) void {
         var it = self.trigger_module_ns.iterator();
         while (it.next()) |e| {
@@ -917,6 +935,76 @@ fn jsPlatformInstancesDeployStarter(
     return js_undefined;
 }
 
+/// `platform.releases.publish(tenant_id, dep_id)` — admin-only.
+/// Stamps `_deploy/current = hex(dep_id)` on the target tenant's
+/// app.db, proposes envelope-0 through raft (no spin / no
+/// blocking on consensus), and enqueues the deployment loader
+/// so it starts fetching dep_id's manifest + bytecodes
+/// immediately. Returns `undefined` once the local commit +
+/// raft queue insert + loader enqueue are done — typically
+/// sub-millisecond.
+///
+/// Customer-visible effect: a release POST returns in <10ms.
+/// Raft consensus + bytecode load run async on the background
+/// loader + raft threads. Eventually (SSE work — future) the
+/// customer gets a completion event.
+///
+/// Throws `Error{code:"InstanceNotFound"}` when `tenant_id`
+/// doesn't resolve. Throws `TypeError` when called outside an
+/// admin handler.
+fn jsPlatformReleasesPublish(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 2) {
+        _ = c.JS_ThrowTypeError(ctx, "platform.releases.publish requires (tenant_id, dep_id)");
+        return js_exception;
+    }
+    const state = getState(ctx);
+    if (state.platform == null) {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    }
+    const fn_ptr = state.release_publish orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform.releases.publish is not configured on this worker");
+        return js_exception;
+    };
+    const fn_ctx = state.release_publish_ctx orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform.releases.publish context missing");
+        return js_exception;
+    };
+
+    const tenant_id = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(tenant_id);
+
+    var dep_id_f64: f64 = 0;
+    if (c.JS_ToFloat64(ctx, &dep_id_f64, argv[1]) < 0) return js_exception;
+    if (dep_id_f64 < 1 or dep_id_f64 > @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
+        _ = c.JS_ThrowRangeError(ctx, "platform.releases.publish: dep_id must be a positive integer");
+        return js_exception;
+    }
+    const dep_id: u64 = @intFromFloat(dep_id_f64);
+
+    fn_ptr(fn_ctx, state.allocator, tenant_id, dep_id) catch |err| switch (err) {
+        error.InstanceNotFound => {
+            const err_obj = c.JS_NewError(ctx);
+            if (c.JS_IsException(err_obj)) return err_obj;
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "message",
+                c.JS_NewStringLen(ctx, "instance not found", "instance not found".len));
+            _ = c.JS_SetPropertyStr(ctx, err_obj, "code",
+                c.JS_NewStringLen(ctx, "InstanceNotFound", "InstanceNotFound".len));
+            return c.JS_Throw(ctx, err_obj);
+        },
+        else => {
+            state.pending_kv_error = err;
+            return js_undefined;
+        },
+    };
+    return js_undefined;
+}
+
 // ── Installation ──────────────────────────────────────────────────────
 
 /// Install the pieces of the global surface that do NOT depend on a
@@ -1063,6 +1151,9 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "platform", "instances" }, .fns = &.{
         .{ .name = "create",        .cfunc = jsPlatformInstancesCreate,        .argc = 1 },
         .{ .name = "deployStarter", .cfunc = jsPlatformInstancesDeployStarter, .argc = 1 },
+    } },
+    .{ .path = &.{ "platform", "releases" }, .fns = &.{
+        .{ .name = "publish", .cfunc = jsPlatformReleasesPublish, .argc = 2 },
     } },
     .{ .path = &.{ "platform", "auth" }, .fns = &.{
         .{ .name = "checkRootToken", .cfunc = jsPlatformAuthCheckRootToken, .argc = 1 },
