@@ -1039,25 +1039,27 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             continue;
         }
 
-        // Rate limiter: customer-tenant requests check the per-instance
-        // request bucket. Admin requests bypass entirely (operational
-        // traffic — locking ourselves out would be bad). Runs BEFORE
-        // static dispatch so static file requests count against the
-        // bucket too — they consume worker resources (h2 stream +
-        // memcpy + content-type header build) and are customer-
-        // attributable. On exhaustion: 429 + Retry-After header.
-        if (!is_admin_request) {
-            const allowed = worker.limiter.check(scope_inst.id, .request, received_ns) catch |err| blk: {
-                std.log.warn("rove-js: limiter.check({s}) failed: {s} — fail open", .{ scope_inst.id, @errorName(err) });
-                break :blk true;
-            };
-            if (!allowed) {
-                const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
-                try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 429, .handler_error, &.{}, &.{}, .{});
-                processed += 1;
-                continue;
-            }
+        // Rate limiter: every request — admin AND customer — checks
+        // the per-instance request bucket. Admin used to bypass on
+        // the "operational traffic mustn't lock us out" theory, but a
+        // 1k+ tenant bench then proved that admin traffic without a
+        // limiter can overwhelm the worker's entity/connection
+        // queues. Operators who need higher admin throughput bump
+        // the per-tenant cap via `--rate-limit-request-capacity` /
+        // `--rate-limit-request-refill`; the right answer is to
+        // size the bucket, not to bypass it. Runs BEFORE static
+        // dispatch so static file requests count against the bucket
+        // too. On exhaustion: 429 + Retry-After header.
+        const allowed = worker.limiter.check(scope_inst.id, .request, received_ns) catch |err| blk: {
+            std.log.warn("rove-js: limiter.check({s}) failed: {s} — fail open", .{ scope_inst.id, @errorName(err) });
+            break :blk true;
+        };
+        if (!allowed) {
+            const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
+            try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 429, .handler_error, &.{}, &.{}, .{});
+            processed += 1;
+            continue;
         }
 
         // Static-first dispatch for customer traffic only. Admin

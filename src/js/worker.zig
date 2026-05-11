@@ -1065,11 +1065,6 @@ pub fn Worker(comptime opts: Options) type {
                 );
             };
 
-            // Enqueue the deployment loader. The leader's worker
-            // starts fetching the manifest + bytecodes; on
-            // commit-replicate to followers, the apply path on
-            // each follower also enqueues the loader (see
-            // `apply.zig::applyWriteSet`, follow-up commit).
             if (self.deployment_loader) |loader| {
                 loader.enqueue(target_id, dep_id) catch |err| {
                     std.log.warn(
@@ -1078,7 +1073,6 @@ pub fn Worker(comptime opts: Options) type {
                     );
                 };
             }
-
         }
 
     };

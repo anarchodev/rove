@@ -674,9 +674,30 @@ pub fn H2(comptime opts: Options) type {
 
             const h2 = nctx.h2;
 
-            // Create request entity in request_out
-            const req_entity = h2.reg.create(&h2.request_out) catch
-                return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            // Create request entity in request_out. Capacity is set
+            // at boot via the registry's `max_entities`; the per-tenant
+            // rate limiter is the gate that's supposed to keep entity
+            // counts inside that bound. If we still hit the cap here,
+            // that's a misconfiguration (rate limit too high or cap
+            // too low) — abort with a clear banner so the operator
+            // sees it instead of having streams silently rejected.
+            const req_entity = h2.reg.create(&h2.request_out) catch |err| switch (err) {
+                error.Full => {
+                    var buf: [512]u8 = undefined;
+                    const msg = std.fmt.bufPrint(
+                        &buf,
+                        "\n================================================================\n" ++
+                        "ROVE H2: request_out registry full — bump --rate-limit-* caps\n" ++
+                        "  or increase max_entities. Rejecting silently would lose\n" ++
+                        "  client requests with no operator signal; aborting.\n" ++
+                        "================================================================\n",
+                        .{},
+                    ) catch buf[0..0];
+                    _ = std.posix.write(2, msg) catch {};
+                    std.process.abort();
+                },
+                else => return c.NGHTTP2_ERR_CALLBACK_FAILURE,
+            };
 
             var fields: ?[*]HeaderField = null;
             var count: u32 = 0;
