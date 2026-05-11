@@ -340,11 +340,14 @@ pub const H2Options = struct {
     max_h2_connections: u32 = 0,
     /// Connections idle for longer than this get destroyed by
     /// `driveAllSends` so abandoned clients release their registered
-    /// recv buffer back to the pool. 30 s by default — long enough
-    /// for HTTP/2 keep-alive across realistic request gaps, short
-    /// enough that a misbehaving / disappeared client doesn't pin
-    /// resources indefinitely. Set to 0 to disable (legacy behavior).
-    idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// recv buffer back to the pool. 10 s by default — every well-
+    /// formed request should complete inside 10 ms (handler budget)
+    /// plus at most a couple of raft commit rounds, so 10 s is
+    /// already 1000× the expected end-to-end time. A connection
+    /// silent for 10 s is either an abandoned client or a stuck
+    /// peer; either way, freeing the slot is the right move. Set
+    /// to 0 to disable (legacy behavior).
+    idle_timeout_ns: u64 = 10 * std.time.ns_per_s,
     tls_config: ?*TlsConfig = null,
 };
 
