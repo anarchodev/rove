@@ -1035,6 +1035,28 @@ pub fn main() !void {
         );
     }
 
+    // ── Boot-time snap-catchup install ────────────────────────────────
+    //
+    // If a previous boot's `SnapReceiver` staged a snapshot bundle
+    // and exited (production.md #1.1 step 3, follower half), the
+    // staged dir is on disk under `{data_dir}/.snap-in-{snap_id}/`
+    // with an `_install_meta.json` marker. Install it BEFORE the
+    // raft layer comes up so the catchup is invisible to the
+    // outside world — when we return from this block, data_dir is
+    // already at the leader's `snap_last_idx` and the raft init
+    // below picks up from there.
+    //
+    // The post-init `raft_load_snapshot` call (further down) tells
+    // willemt to treat the current on-disk state as a snapshot at
+    // `(snap_last_term, snap_last_idx)`, truncating the local log.
+    const staged_install: ?snapshot_mod.StagedInstall = snapshot_mod.installStagedSnapshotIfPresent(allocator, cli.data_dir) catch |err| blk: {
+        std.log.warn(
+            "loop46: boot-time staged-snapshot install failed: {s}; continuing with on-disk state as-is",
+            .{@errorName(err)},
+        );
+        break :blk null;
+    };
+
     // ── Raft setup ─────────────────────────────────────────────────────
     //
     // ApplyCtx is raft-thread-local: it owns its own per-tenant sqlite
@@ -1137,6 +1159,26 @@ pub fn main() !void {
         .request_timeout_ms = cli.request_timeout_ms,
     });
     defer raft_node.deinit();
+
+    // Tell willemt about the just-installed staged snapshot, if any.
+    // The on-disk app.dbs reflect state through `snap_last_idx`;
+    // calling `raft_load_snapshot` makes raft's view match. Without
+    // this, willemt would try to replay log entries it doesn't have
+    // (the leader compacted past them — that's why it sent us the
+    // snapshot in the first place).
+    if (staged_install) |inst| {
+        raft_node.loadSnapshot(inst.snap_last_idx, inst.snap_last_term) catch |err| {
+            std.log.err(
+                "loop46: raft_load_snapshot after staged install failed: {s} (snap_last_idx={d} snap_last_term={d})",
+                .{ @errorName(err), inst.snap_last_idx, inst.snap_last_term },
+            );
+            failExit("loop46: cannot continue with inconsistent raft state\n", .{});
+        };
+        std.log.info(
+            "loop46: staged snapshot installed and raft_load_snapshot called (snap_last_idx={d} snap_last_term={d})",
+            .{ inst.snap_last_idx, inst.snap_last_term },
+        );
+    }
 
     apply_ctx = rjs.apply.ApplyCtx.init(allocator, cli.data_dir, raft_node);
     defer apply_ctx.deinit();

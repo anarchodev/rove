@@ -638,6 +638,173 @@ pub fn sendSnapshotFetchOffer(
     );
 }
 
+// ── Follower-side receive + stage + install ───────────────────────────
+
+/// Result of a successful staged-snapshot install at boot. Returned
+/// from `installStagedSnapshotIfPresent` so the caller can pass the
+/// pair to `RaftNode.loadSnapshot` after init.
+pub const StagedInstall = struct {
+    snap_last_idx: u64,
+    snap_last_term: u64,
+};
+
+/// Scan `{data_dir}/.snap-in-*/` for staged-but-uninstalled snapshot
+/// bundles (`SnapReceiver` wrote these and exited; this boot picks
+/// them up). When found:
+///
+///   1. Pick the staged dir with the highest `snap_last_idx` from
+///      its `_install_meta.json`. Stale partial drops without that
+///      file are deleted.
+///   2. For each staged file, rename it into place inside
+///      `data_dir/`. Mapping: `__root__.db` / `schedules.db` go to
+///      top-level; `<tenant>__app.db` goes to `data_dir/<tenant>/app.db`
+///      (with `makePath` creating the parent dir if needed).
+///   3. Delete the now-empty staged dir.
+///   4. Return the (snap_last_idx, snap_last_term) the caller should
+///      pass to `RaftNode.loadSnapshot` after raft init.
+///
+/// Returns null when no staged dir is present (the normal cold-start
+/// case). Returns an error only on filesystem failures — a malformed
+/// staged dir (missing meta, unparseable JSON) is treated as a no-op
+/// and logged loudly so the operator sees the lossage.
+pub fn installStagedSnapshotIfPresent(
+    allocator: std.mem.Allocator,
+    data_dir: []const u8,
+) !?StagedInstall {
+    var dir = std.fs.cwd().openDir(data_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer dir.close();
+
+    // Find the highest-idx staged dir among `.snap-in-*` entries with
+    // an `_install_meta.json`. We don't sort dir entries (Zig iterates
+    // unsorted on Linux); a single linear pass keeps the running max.
+    var best_name_buf: [128]u8 = undefined;
+    var best_name_len: usize = 0;
+    var best_idx: u64 = 0;
+    var best_term: u64 = 0;
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!std.mem.startsWith(u8, entry.name, ".snap-in-")) continue;
+
+        // Stage dirs that never got `_install_meta.json` are partial.
+        // Sweep them so they don't pile up across boots.
+        const stage_path = try std.fs.path.join(allocator, &.{ data_dir, entry.name });
+        defer allocator.free(stage_path);
+        const meta_path = try std.fs.path.join(allocator, &.{ stage_path, "_install_meta.json" });
+        defer allocator.free(meta_path);
+
+        const meta_bytes = std.fs.cwd().readFileAlloc(allocator, meta_path, 1024) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.log.warn(
+                    "loop46: staged dir {s} is partial (no _install_meta.json); deleting",
+                    .{stage_path},
+                );
+                std.fs.cwd().deleteTree(stage_path) catch {};
+                continue;
+            },
+            else => return err,
+        };
+        defer allocator.free(meta_bytes);
+
+        const idx = parseJsonU64(meta_bytes, "\"snap_last_idx\"") orelse {
+            std.log.warn(
+                "loop46: staged dir {s} _install_meta.json missing snap_last_idx; deleting",
+                .{stage_path},
+            );
+            std.fs.cwd().deleteTree(stage_path) catch {};
+            continue;
+        };
+        const term = parseJsonU64(meta_bytes, "\"snap_last_term\"") orelse {
+            std.log.warn(
+                "loop46: staged dir {s} _install_meta.json missing snap_last_term; deleting",
+                .{stage_path},
+            );
+            std.fs.cwd().deleteTree(stage_path) catch {};
+            continue;
+        };
+
+        if (idx > best_idx) {
+            if (entry.name.len > best_name_buf.len) continue; // too long, skip
+            @memcpy(best_name_buf[0..entry.name.len], entry.name);
+            best_name_len = entry.name.len;
+            best_idx = idx;
+            best_term = term;
+        } else {
+            // Older than what we already have — discard.
+            std.log.info(
+                "loop46: discarding older staged dir {s} (snap_last_idx={d} < best={d})",
+                .{ stage_path, idx, best_idx },
+            );
+            std.fs.cwd().deleteTree(stage_path) catch {};
+        }
+    }
+
+    if (best_name_len == 0) return null;
+
+    const best_name = best_name_buf[0..best_name_len];
+    const stage_path = try std.fs.path.join(allocator, &.{ data_dir, best_name });
+    defer allocator.free(stage_path);
+
+    std.log.info(
+        "loop46: installing staged snapshot from {s} (snap_last_idx={d} snap_last_term={d})",
+        .{ stage_path, best_idx, best_term },
+    );
+
+    // Walk the staged dir; rename each non-meta file into place.
+    var stage_dir = try std.fs.cwd().openDir(stage_path, .{ .iterate = true });
+    defer stage_dir.close();
+
+    var sit = stage_dir.iterate();
+    while (try sit.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.eql(u8, entry.name, "_install_meta.json")) continue;
+
+        const src = try std.fs.path.join(allocator, &.{ stage_path, entry.name });
+        defer allocator.free(src);
+
+        // Map bundled name → on-disk path.
+        // - "__root__.db", "schedules.db" → data_dir/<name>
+        // - "<tenant>__app.db"             → data_dir/<tenant>/app.db
+        const dst: []u8 = if (std.mem.endsWith(u8, entry.name, "__app.db")) blk: {
+            const sep = std.mem.indexOf(u8, entry.name, "__app.db") orelse continue;
+            const tenant = entry.name[0..sep];
+            const tenant_dir = try std.fs.path.join(allocator, &.{ data_dir, tenant });
+            defer allocator.free(tenant_dir);
+            try std.fs.cwd().makePath(tenant_dir);
+            break :blk try std.fs.path.join(allocator, &.{ tenant_dir, "app.db" });
+        } else try std.fs.path.join(allocator, &.{ data_dir, entry.name });
+        defer allocator.free(dst);
+
+        // Atomic rename within the same filesystem.
+        try std.fs.cwd().rename(src, dst);
+    }
+
+    // Clean up: meta file + the now-empty stage dir.
+    std.fs.cwd().deleteTree(stage_path) catch |err| {
+        std.log.warn("loop46: cleanup of {s} failed: {s}", .{ stage_path, @errorName(err) });
+    };
+
+    return .{ .snap_last_idx = best_idx, .snap_last_term = best_term };
+}
+
+/// Hand-rolled u64 extractor for the install-meta JSON. We don't
+/// want to depend on std.json here — the schema is two fields, and a
+/// substring search keyed to the field name is enough. Returns null
+/// on any malformation (caller decides whether to skip or fail).
+fn parseJsonU64(json: []const u8, field: []const u8) ?u64 {
+    const idx = std.mem.indexOf(u8, json, field) orelse return null;
+    var i = idx + field.len;
+    while (i < json.len and (json[i] == ' ' or json[i] == ':' or json[i] == '\t')) i += 1;
+    const start = i;
+    while (i < json.len and json[i] >= '0' and json[i] <= '9') i += 1;
+    if (i == start) return null;
+    return std.fmt.parseInt(u64, json[start..i], 10) catch null;
+}
+
 // ── Follower-side receive + stage ─────────────────────────────────────
 
 /// Bundle magic the leader's `handleRaftSnapshot` writes at the head
@@ -858,22 +1025,42 @@ fn fetcherRun(args: *FetcherArgs) !void {
         );
     }
 
+    // Stamp the install metadata. Boot-time install reads this to
+    // know the raft idx/term to call `raft_load_snapshot` at. The
+    // file's presence is ALSO the "complete + ready to install"
+    // marker — a partially-downloaded stage dir won't have it, so
+    // boot-time scan skips it.
+    const meta_path = try std.fs.path.join(alloc, &.{ stage_dir, "_install_meta.json" });
+    defer alloc.free(meta_path);
+    const meta_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"snap_last_idx\":{d},\"snap_last_term\":{d},\"from_peer_id\":{d}}}\n",
+        .{ args.snap_last_idx, args.snap_last_term, args.from_id },
+    );
+    defer alloc.free(meta_body);
+    {
+        const f = try std.fs.cwd().createFile(meta_path, .{});
+        defer f.close();
+        try f.writeAll(meta_body);
+    }
+
     std.log.info(
-        "raft: snap fetch (peer={d} snap_id={x}) staged {d} files under {s} — install pending",
+        "raft: snap fetch (peer={d} snap_id={x}) staged {d} files under {s} — exiting for boot-time install",
         .{ args.from_id, args.snap_id, file_count, stage_dir },
     );
 
-    // TODO follow-up: trigger live install:
-    //   1) Drain in-flight requests / pause new accepts.
-    //   2) Close all per-tenant + __root__ KvStore connections.
-    //   3) Atomic-rename staged files over the existing data_dir
-    //      contents (with backup on the side for rollback).
-    //   4) Re-open KvStores.
-    //   5) raft_begin_load_snapshot + raft_end_load_snapshot at
-    //      (args.snap_last_term, args.snap_last_idx).
-    //   6) Resume request acceptance.
-    // For now the staged bundle sits on disk and the next operator
-    // restart can install it via `loop46 restore-from-snapshot`.
+    // Trigger a process restart. The supervisor (systemd, k8s, or
+    // the bash wrapper used in smoke) is expected to bring us back
+    // up; on the next boot, the install path in `main.zig` detects
+    // the staged dir, atomic-renames the DBs into place, and calls
+    // `raft_load_snapshot(snap_last_idx, snap_last_term)` before
+    // workers start serving.
+    //
+    // Using `std.process.exit(0)` (not abort) so the supervisor
+    // sees a normal exit — abort would log a stack trace + core
+    // dump on every catchup, which is noise. The exit happens on
+    // the fetcher thread; that's fine, `exit(0)` is process-wide.
+    std.process.exit(0);
 }
 
 /// Legacy operator-actionable warning. Retained for callers that

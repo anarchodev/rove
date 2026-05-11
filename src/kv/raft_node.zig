@@ -928,6 +928,35 @@ pub const RaftNode = struct {
         try self.transport.send(peer_id, frame);
     }
 
+    /// Tell willemt to treat the on-disk state as a snapshot at
+    /// `(snap_last_term, snap_last_idx)`. Used at boot after the
+    /// `installStagedSnapshotIfPresent` flow has atomic-renamed the
+    /// fetched DBs into `data_dir` — willemt's log past `snap_last_idx`
+    /// gets truncated; subsequent append_req frames from the leader
+    /// land starting at `snap_last_idx + 1`.
+    ///
+    /// Skip when `snap_last_idx <= raft_get_snapshot_last_idx`: our
+    /// state is already at or past the loaded snapshot, calling load
+    /// would be a no-op or a downgrade.
+    ///
+    /// Wraps `raft_begin_load_snapshot` + `raft_end_load_snapshot`.
+    pub fn loadSnapshot(self: *RaftNode, snap_last_idx: u64, snap_last_term: u64) !void {
+        const current_idx: u64 = @intCast(c.raft_get_snapshot_last_idx(self.raft));
+        if (snap_last_idx <= current_idx) {
+            std.log.info(
+                "raft: loadSnapshot skipped (snap_last_idx={d} <= current snapshot_last_idx={d}); on-disk state is already at or past the staged snapshot",
+                .{ snap_last_idx, current_idx },
+            );
+            return;
+        }
+        if (c.raft_begin_load_snapshot(self.raft, @intCast(snap_last_term), @intCast(snap_last_idx)) != 0) {
+            return error.RaftBeginLoadSnapshot;
+        }
+        if (c.raft_end_load_snapshot(self.raft) != 0) {
+            return error.RaftEndLoadSnapshot;
+        }
+    }
+
     /// When non-zero, leadership was lost with in-flight proposals. Any
     /// worker whose seq is in (committedSeq, faultedSeq()] MUST treat its
     /// write as lost. Cleared back to 0 on the next successful election.
