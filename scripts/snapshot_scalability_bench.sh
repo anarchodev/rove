@@ -376,8 +376,12 @@ seq 0 $((STEADY_PARALLEL - 1)) | xargs -n1 -P "$STEADY_PARALLEL" -I{} \
             idx=$(( cnt % N_ACTIVE ))
             i=$(( (slot + idx * STEADY_PARALLEL) % N_ACTIVE ))
             tid=$(printf "t%05d" "$i")
+            # 60s rather than 30. At 10k tenants the worker
+            # post-warmup backlog can push individual release
+            # commits past 30s. Measuring whether raft makes
+            # progress AT ALL, not RPC latency.
             curl -sS --cacert "'"$CACERT"'" '"${RESOLVE[*]}"' \
-                --max-time 30 -o /dev/null \
+                --max-time 60 -o /dev/null \
                 -H "Authorization: Bearer '"$ROOT_TOKEN"'" \
                 -H "Content-Type: application/json" \
                 -d "{\"tenant_id\":\"$tid\",\"dep_id\":$dep}" \

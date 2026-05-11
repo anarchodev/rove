@@ -563,73 +563,24 @@ fn handleRelease(
         return;
     };
 
-    // Mirror `_config/{...}/{name}.json` files from the deployment
-    // tree into kv at `_config/{...}/{name}`. Stages writes into the
-    // SAME txn + writeset as `_deploy/current` so the release pointer
-    // and config rows commit / replicate together (atomic from the
-    // handler's perspective). Skipped on errors that look like
-    // "no manifest" — the release is still valid; only library
-    // `fromConfig(...)` lookups will fail until a fresh deploy fixes
-    // the missing config row.
+    // No manifest fetch + no config-mirror on this hot path.
+    // The request thread never blocks on the network — release
+    // just records the new pointer + proposes. The deployment
+    // loader (running on a background thread) is responsible
+    // for fetching the manifest, mirroring `_config/*.json`
+    // entries into kv, and swapping the tenant's loaded
+    // bytecodes / statics. See `worker.zig::DeploymentLoader`.
     //
-    // Production.md #1.4 step 4: fetch via the tenant's
-    // `manifest_backend` (HTTP-backed when wired) instead of
-    // hitting S3 directly. Manifests live in raft-replicated KV
-    // inside files-server, not S3.
-    var manifest_loaded = loadManifestThroughTenantBackend(
-        allocator,
-        worker,
-        inst,
-        parsed.value.dep_id,
-    ) catch |err| blk: {
-        std.log.warn(
-            "release: skipping config mirror for {s}/{x:0>16} — manifest load failed: {s}",
-            .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
-        );
-        break :blk null;
-    };
-    if (manifest_loaded) |*manifest| {
-        defer manifest.deinit();
-        var file_blobs_opt: ?blob_mod.BlobBackend = blob_mod.BlobBackend.openPerTenant(
-            allocator,
-            worker.blob_backend_cfg,
-            parsed.value.tenant_id,
-            "file-blobs",
-        ) catch |err| open_blk: {
-            std.log.warn(
-                "release: skipping config mirror for {s} — file-blobs open failed: {s}",
-                .{ parsed.value.tenant_id, @errorName(err) },
-            );
-            break :open_blk null;
-        };
-        defer if (file_blobs_opt) |*fb| fb.deinit();
-
-        if (file_blobs_opt) |*file_blobs| {
-            const stats = config_mirror.mirrorConfigToKv(
-                allocator,
-                manifest.*,
-                file_blobs.blobStore(),
-                inst.kv,
-                &txn,
-                &ws,
-            ) catch |err| {
-                txn.rollback() catch {};
-                const msg = try std.fmt.allocPrint(
-                    allocator,
-                    "release: config mirror failed: {s}\n",
-                    .{@errorName(err)},
-                );
-                try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
-                return;
-            };
-            if (stats.put_count > 0 or stats.delete_count > 0) {
-                std.log.info(
-                    "release: mirrored {d} config put(s) + {d} delete(s) for {s}",
-                    .{ stats.put_count, stats.delete_count, parsed.value.tenant_id },
-                );
-            }
-        }
-    }
+    // Trade-off: `_deploy/current` and the `_config/*` mirror
+    // are no longer atomic in raft. There is a small window
+    // after release commit where `kv.fromConfig(...)` returns
+    // the previous deployment's value. The window closes when
+    // the loader finishes — typically ~tens-of-ms for an empty
+    // manifest, ~hundreds-of-ms for one with bytecodes.
+    //
+    // Customer code that reads `_config/*` immediately after a
+    // release must either accept eventual consistency or wait
+    // on the loader's completion signal (SSE — future work).
 
     txn.commit() catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "release commit failed: {s}\n", .{@errorName(err)});
