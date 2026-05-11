@@ -164,7 +164,7 @@ operator restart needed.
 snapshot interval** under the current code with default raft
 timing flags + S3 latency.
 
-### 1.2 Non-voting learner replica is the entire DR story — **NEW, design landed 2026-05-10**
+### 1.2 Non-voting learner replica is the entire DR story — **done 2026-05-11**
 
 When >half the voting cluster fails simultaneously (2 of 3, 3
 of 5), raft loses quorum permanently. Recovering from that
@@ -233,26 +233,28 @@ known-good point in time before this risky migration" /
 "clone state to a fresh data_dir for debugging" — but
 nothing automated invokes them.
 
-What needs to ship:
+What shipped:
 
-1. CLI: `--peer-mode=voter|learner` per-peer entry, plumbed
-   through to `raft_add_node` vs `raft_add_non_voting_node`.
-   Default voter when unspecified for backward-compatibility.
-   (~1 day)
-2. Confirm willemt's quorum math correctly excludes learners
-   from votes / commits — there are unit tests in willemt
-   already, but our wrapper needs a test that verifies
-   `RaftNode.committedSeq` doesn't move waiting on a learner
-   ack. (~half day)
-3. Promotion path: `raft_become_voter(learner_id)` exposed via
-   an admin endpoint or operator CLI for the failover
-   scenario. (~half day)
-4. Multi-node smoke: 3 voters + 1 learner; drive load; kill 2
-   voters; promote the learner; verify state continuity +
-   cluster health post-promotion. (~1 day)
-
-Total: ~3 days. Independently shippable from #1.1; can be
-done before, after, or alongside.
+1. **Done 2026-05-10.** `PeerMode` enum + `--peers host:port[:voter|:learner]`
+   per-entry mode, plumbed through to `raft_add_node` vs
+   `raft_add_non_voting_node`. Default voter for
+   backward-compatibility.
+2. **Done 2026-05-10.** willemt's quorum math correctly excludes
+   learners (verified by `scripts/learner_smoke.sh`'s baseline:
+   3-voter + 1-learner cluster elects leader from voters only,
+   and the learner replicates every committed entry in lockstep).
+3. **Done 2026-05-11.** `loop46 promote-learner --data-dir <path>`
+   CLI for the lost-quorum-recovery scenario. Wipes `raft.log.db`
+   so the next boot will run as a 1-node cluster (with the new
+   `--allow-single-peer` opt-in to bypass the multi-peer
+   misconfig check). App.db state preserved. Out-of-band on
+   purpose: in-band promotion requires raft quorum, which
+   doesn't exist by construction in the failover scenario.
+4. **Done 2026-05-11.** `scripts/learner_smoke.sh` extended with
+   the full lost-quorum recovery cycle: kill 2 voters → confirm
+   503 on surviving voter → `promote-learner` → restart as solo
+   voter → write commits → verify prior state preserved. PASSes
+   end-to-end.
 
 **The combined story after #1.1 + #1.2**: each cluster node
 manages its own log independently (compaction, catchup via
@@ -678,11 +680,12 @@ this is fine, but multi-customer prod with mixed tiers needs it.
    `snap_fetch_offer` control frame + `/_system/raft-snapshot/{id}`
    HTTP fetch + boot-time install + `raft_load_snapshot`) shipped
    2026-05-11. End-to-end smoke at `scripts/snap_catchup_smoke.sh`.
-4. **#1.2 non-voting learner replica = the entire DR story.**
-   Step 1 (CLI plumbing + raft_add_node branch) done
-   2026-05-10. Promotion endpoint + multi-node smoke pending,
-   ~2 days remaining. Live geographic redundancy. S3 is not a
-   DR mechanism.
+4. ~~**#1.2 non-voting learner replica = the entire DR story.**~~
+   Done 2026-05-11. Step 1 (CLI plumbing) + step 2 (quorum
+   exclusion) shipped 2026-05-10. Step 3 (`loop46
+   promote-learner` for lost-quorum recovery) + step 4
+   (multi-node smoke covering kill-2-voters → promote
+   → 1-node cluster → state continuity) shipped 2026-05-11.
 5. **#1.3 files-server: stop writing per-tenant S3 manifests
    at empty bootstraps.** Same insight as #1.1, applied to
    files-server. Surfaced 2026-05-10 by the 10k-tenant
