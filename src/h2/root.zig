@@ -1549,9 +1549,21 @@ pub fn H2(comptime opts: Options) type {
                 if (!self.recv_enobufs_logged or self.recv_enobufs_total / 10_000 != self.recv_enobufs_last_logged_decade) {
                     self.recv_enobufs_logged = true;
                     self.recv_enobufs_last_logged_decade = self.recv_enobufs_total / 10_000;
+                    // DIAG (task #56): also surface the buffer-ring
+                    // balance. `outstanding` is the kernel's view of
+                    // how many buffers it currently holds (consumed
+                    // by completions minus returned to the ring). If
+                    // `outstanding` is well below `buf_count` while
+                    // ENOBUFS fires, our ring management and the
+                    // kernel's accounting disagree.
+                    const consumed = self.io.recv_completions_with_data;
+                    const returned_drain = self.io.recv_buffers_returned;
+                    const returned_deinit = self.io.cleanup_ctx.recv_buffers_returned_via_deinit;
+                    const returned = returned_drain + returned_deinit;
+                    const outstanding = consumed -| returned;
                     std.log.warn(
-                        "rove-h2: recv ENOBUFS — io_uring registered buffer pool exhausted ({d} total, +{d} this pass). Bump `buf_count` if this recurs at a steady rate.",
-                        .{ self.recv_enobufs_total, enobufs_this_pass },
+                        "rove-h2: recv ENOBUFS — io_uring registered buffer pool exhausted ({d} total, +{d} this pass; consumed={d} returned_drain={d} returned_deinit={d} outstanding={d} of {d}). Bump `buf_count` if this recurs at a steady rate.",
+                        .{ self.recv_enobufs_total, enobufs_this_pass, consumed, returned_drain, returned_deinit, outstanding, self.io.buf_count },
                     );
                 }
             }

@@ -25,12 +25,28 @@ fn getSqeOrSubmit(ring: *linux.IoUring) !*linux.io_uring_sqe {
 // Component types
 // =============================================================================
 
-/// Cleanup context shared by Fd and ReadCycleEntity destructors.
-/// Stored on the Io struct, registered with registry via setDeinitCtx.
+/// Cleanup context shared by Fd, ReadCycleEntity, and ReadResult
+/// destructors. Stored on the Io struct, registered with registry via
+/// setDeinitCtx. `buf_ring` / `buf_base` / `buf_size` / `buf_count`
+/// let ReadResult.deinit return a kernel-held buffer to the ring when
+/// its owning read entity is destroyed (e.g. via the cascade in
+/// ReadCycleEntity.deinit). Without that path, every aborted-mid-recv
+/// connection leaks its buffer permanently — drains the ring to zero
+/// after a few thousand short-lived connections and the kernel
+/// returns ENOBUFS for every subsequent recv.
 pub const IoCleanupCtx = struct {
     ring: *linux.IoUring,
     max_connections: u32,
     reg: *Registry,
+    buf_ring: *align(std.heap.page_size_min) linux.io_uring_buf_ring = undefined,
+    buf_base: []u8 = undefined,
+    buf_size: u32 = 0,
+    buf_count: u16 = 0,
+    /// Cumulative count of buffers returned via the deinit cascade.
+    /// Mirrors `Io.recv_buffers_returned` for the regular drain path —
+    /// kept separate so the source of returns is attributable in the
+    /// diagnostic log.
+    recv_buffers_returned_via_deinit: u64 = 0,
 };
 
 pub const Fd = struct {
@@ -56,6 +72,38 @@ pub const ReadResult = struct {
     result: i32 = 0,
     data: ?[*]u8 = null,
     buf_id: u16 = 0,
+
+    pub const DeinitCtx = IoCleanupCtx;
+
+    /// Return the kernel-held buffer (if any) to the ring when the
+    /// read entity is destroyed. Without this hook, the cascade in
+    /// `ReadCycleEntity.deinit` (which runs `destroyImmediate` on the
+    /// linked read entity when a conn dies) leaks every buffer that
+    /// was attached to a completed recv but had not yet flowed
+    /// through `processReadIn`. At workloads with many short-lived
+    /// connections (e.g. xargs + curl publishing many releases) the
+    /// leak drains the registered buffer ring to zero and recv starts
+    /// returning ENOBUFS even though the connection count is tiny.
+    pub fn deinit(_: std.mem.Allocator, items: []ReadResult, ctx: *DeinitCtx) void {
+        var armed: u16 = 0;
+        const mask = linux.IoUring.buf_ring_mask(ctx.buf_count);
+        for (items) |item| {
+            if (item.data == null) continue;
+            const pos = @as(usize, ctx.buf_size) * item.buf_id;
+            linux.IoUring.buf_ring_add(
+                ctx.buf_ring,
+                ctx.buf_base[pos .. pos + ctx.buf_size],
+                item.buf_id,
+                mask,
+                armed,
+            );
+            armed += 1;
+        }
+        if (armed > 0) {
+            linux.IoUring.buf_ring_advance(ctx.buf_ring, armed);
+            ctx.recv_buffers_returned_via_deinit += armed;
+        }
+    }
 };
 
 pub const WriteBuf = struct {
@@ -263,6 +311,17 @@ pub fn Io(comptime opts: Options) type {
         admission_denied_logged: bool = false,
         admission_denied_last_logged_decade: u64 = 0,
 
+        /// DIAG (task #56 — ENOBUFS-at-low-conn-count investigation):
+        /// per-process counters for the buffer-ring balance. The
+        /// invariant: at any point in time, the kernel-held buffer
+        /// count must be < `buf_count`. If `recv_completions_with_data`
+        /// minus `recv_buffers_returned` ever approaches `buf_count`,
+        /// the ring's running out for a real reason. If ENOBUFS
+        /// fires while that delta is small, the kernel and the ring
+        /// state disagree.
+        recv_completions_with_data: u64 = 0,
+        recv_buffers_returned: u64 = 0,
+
         reg: *Registry,
         allocator: std.mem.Allocator,
 
@@ -368,6 +427,10 @@ pub fn Io(comptime opts: Options) type {
                     .ring = undefined, // set below
                     .max_connections = io_opts.max_connections,
                     .reg = reg,
+                    .buf_ring = br,
+                    .buf_base = buf_base,
+                    .buf_size = io_opts.buf_size,
+                    .buf_count = io_opts.buf_count,
                 },
                 .reg = reg,
                 .allocator = allocator,
@@ -391,9 +454,13 @@ pub fn Io(comptime opts: Options) type {
                 reg.registerCollection(&self._connect_pending);
             }
 
-            // Register deinit contexts
+            // Register deinit contexts. `ReadResult.deinit` returns
+            // the buffer (if any) to the registered ring when its
+            // owning read entity is destroyed — the fix for the
+            // leak that drained the ring at xargs+curl workloads.
             reg.setDeinitCtx(Fd, &self.cleanup_ctx);
             reg.setDeinitCtx(ReadCycleEntity, &self.cleanup_ctx);
+            reg.setDeinitCtx(ReadResult, &self.cleanup_ctx);
 
             return self;
         }
@@ -561,6 +628,7 @@ pub fn Io(comptime opts: Options) type {
 
             if (armed > 0) {
                 linux.IoUring.buf_ring_advance(self.buf_ring, armed);
+                self.recv_buffers_returned += armed;
             }
         }
 
@@ -690,6 +758,7 @@ pub fn Io(comptime opts: Options) type {
                     .data = buf_ptr,
                     .buf_id = buf_id,
                 });
+                self.recv_completions_with_data += 1;
             } else {
                 try self.reg.set(entity, &self._read_pending, ReadResult, .{ .result = cqe.res });
             }
