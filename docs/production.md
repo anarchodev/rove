@@ -600,19 +600,24 @@ rove-h2 is h2-only and 426s plain HTTP/1.x. Need a deployment doc
 + a startup warning when no proxy is detected (today there's no
 warning).
 
-### 7. Multi-node smoke covering leader failover
+### 7. Multi-node smoke covering leader failover — **done 2026-05-11**
 
-`scripts/snapshot_smoke.sh` covers capture/restore. The
-notification + cluster smokes are close but don't specifically
-exercise leader flip during in-flight schedule fires. Need a smoke
-that exercises:
+`scripts/leader_failover_smoke.sh` covers the two bullets that
+need a forced-leader-change harness:
 
-- Leader change with `http.send` rows in flight (validates the
-  at-least-once + version-counter dedup contract in
-  [`http-send-plan.md`](http-send-plan.md) §7).
-- New leader picking up `schedules.db` rows the old leader was
-  firing.
-- sse-server failover triggering `rove:resync` correctly.
+- Leader change with `http.send` rows in flight: acme schedules
+  `http.send → wb` with a 4s `fire_at_ns` delay, the old leader
+  is killed during that window, the new leader picks up the row
+  via `dueInternalRows` and delivers in-process to wb. acme's
+  `on_result` writes `http/result/{id}`; the smoke asserts the
+  durable kv row.
+- New leader picking up `schedules.db` rows: same smoke, same
+  pathway. The pre-failover check confirms the row replicated
+  to every node's schedules.db before the kill.
+
+sse-server `rove:resync` after failover is exercised by the
+existing `scripts/sse_server_smoke.sh` (a separate smoke
+focused on the sse-server process surface).
 
 ### 8. Backup automation
 
@@ -693,8 +698,11 @@ this is fine, but multi-customer prod with mixed tiers needs it.
    PUTs). Shape A (~1 day) is the small surgical fix; Shape
    C (~1 week) is the architectural cleanup. Operationally
    meaningful for fresh-cluster provisioning.
-6. **#7 leader-failover smoke.** Validates the at-least-once
-   contract for `http.send` already designed.
+6. ~~**#7 leader-failover smoke.**~~ Done 2026-05-11.
+   `scripts/leader_failover_smoke.sh` schedules an
+   `http.send` with a 4s `fire_at_ns` delay, kills the leader
+   during the window, asserts the new leader fires and the
+   `on_result` callback lands durably on acme.
 7. **#4 deployment doc + systemd units.** Afternoon's work; turns
    "I know how to start this" into "an operator can start this."
    Covers the learner-mode peer config (#1.2).
