@@ -290,126 +290,54 @@ pub fn decodeEnvelope(payload: []const u8) Error!Envelope {
     };
 }
 
-/// Apply callback context — self-owning, raft-thread-local.
+/// Loop46-specific apply state — auxiliary fields the library's
+/// `kv.Cluster` doesn't know about. The cluster handles raft + per-
+/// store cache + global_apply_idx + root_store; this struct carries
+/// what's left over:
 ///
-/// Holds lazy per-tenant sqlite connections that are opened on first
-/// apply for each instance and cached for subsequent applies. These
-/// are DISTINCT from any worker's connections; they exist solely for
-/// the raft thread's use.
+///   - `schedules_store` — singleton `schedules.db` handle. Custom
+///     ScheduleStore type wraps a KvStore with typed queries; can't
+///     route through `cluster.openStore` which returns raw `*KvStore`.
+///   - Scheduler-wake signals (`schedule_wake`, `worker_phase_wake`)
+///     for the libcurl scheduler thread and the worker-phase dispatch
+///     loop respectively.
+///   - `public_suffix` for `is_internal` tenant detection at
+///     `applyScheduleUpsertBatch` time.
+///   - `deployment_loader` for the follower-side `_deploy/current`
+///     post-write hook in `applyWriteSet`.
 ///
-/// On the leader path, `applyWriteSet` short-circuits via
-/// `raft.isLeader()`, so the cached stores stay idle — workers wrote
-/// locally via their own connections, and the raft thread just
-/// advances `committed_seq`. The caches come alive on followers,
-/// where the raft thread is the sole writer.
-///
-/// Lifecycle: construct before starting the raft thread, `deinit`
-/// after the raft thread has stopped. The caches are grown only by
-/// the raft thread itself (via `applyOne`), so no locking is needed.
-pub const ApplyCtx = struct {
+/// Stash a pointer to this in `Cluster.Config.user_ctx`; handlers
+/// cast back via `loop46Ctx(user_ctx)`.
+pub const Loop46Ctx = struct {
     allocator: std.mem.Allocator,
-    /// Root data dir. Per-tenant stores live at `{data_dir}/{id}/`.
-    data_dir: []const u8,
-    /// Used for the leader-skip check on every envelope type.
-    raft: *kv.RaftNode,
-    /// Lazy per-tenant KvStore cache (instance_id → *KvStore). Keys
-    /// are owned copies of the instance id.
-    kv_stores: std.StringHashMapUnmanaged(*kv.KvStore),
-    /// **The** apply position. Raft idx is globally ordered; one
-    /// cluster-wide counter replaces what used to be a per-tenant
-    /// hashmap + a separate root counter. Advanced by every applyOne
-    /// call (regardless of envelope type or target store); persisted
-    /// in `__root__.db._apply_state` by the snapshot tick. On
-    /// startup, seeded from `__root__.db` (the single source of
-    /// truth — per-tenant `_apply_state` rows are no longer written
-    /// or read).
-    global_apply_idx: u64 = 0,
-    /// Lazy root-store handle for `type=2 root_writeset` applies +
-    /// the persistent home for `global_apply_idx`. Opens
-    /// `{data_dir}/__root__.db` on first apply or first snapshot
-    /// tick (whichever comes first). Null on a node that has never
-    /// touched root.
-    root_store: ?*kv.KvStore = null,
-    /// Lazy cluster-wide schedule store handle for `type=8/9/10/11`
-    /// applies (http.send / docs/http-send-plan.md). Opens
-    /// `{data_dir}/schedules.db` on first schedule envelope. Single
-    /// store per node, raft-replicated to identical state, applied
-    /// on both leader and follower.
+    /// Lazy schedules.db handle. Opens on first envelope-8/9/10/11
+    /// apply.
     schedules_store: ?*schedule_server.ScheduleStore = null,
-    /// Wake signal for the leader-pinned scheduler thread.
-    /// Set by loop46/main.zig once the
-    /// scheduler thread spawns. Envelope-8 apply fires it when the
-    /// batch contains at least one external row; envelope-11
-    /// (demote) always fires it (the row just landed in the
-    /// external pool). Envelope-9 / 10 don't fire it — completes /
-    /// cancels reduce work, not add it.
     schedule_wake: ?*std.Thread.ResetEvent = null,
-    /// Wake signal for the in-process worker phase
-    /// (`dispatchInternalSchedules`). Symmetric to `schedule_wake`
-    /// but fires when a batch contains at least one internal row.
-    /// Worker phase runs on the dispatch loop, so this is mostly an
-    /// optimization — without it the next dispatch tick (sub-ms
-    /// later) would pick the row up anyway. Mainly useful when the
-    /// worker is idle (no inbound h2 traffic) and the dispatch loop
-    /// is blocked in `io.poll`.
     worker_phase_wake: ?*std.Thread.ResetEvent = null,
-    /// Cluster's public suffix (e.g. `loop46.me`). Used at
-    /// envelope-8 apply to stamp `is_internal` on schedule rows
-    /// whose URL targets `{id}.{public_suffix}` AND `{id}` has an
-    /// existence marker in `__root__.db` (http-send-plan §3.2).
-    /// Null / empty disables the stamping; rows stay
-    /// `is_internal=false` and route through the libcurl scheduler
-    /// thread. Borrowed; the loop46 binary owns the storage for
-    /// the process lifetime.
     public_suffix: ?[]const u8 = null,
-    /// Deployment loader (background thread + dedup-by-tenant
-    /// queue) shared with the worker's dispatch path. When a
-    /// follower applies an envelope-0 writeset containing
-    /// `_deploy/current`, it enqueues a load for that tenant so
-    /// the new bytecode is ready when the local worker thread
-    /// needs it. On the leader, the trampoline that proposed the
-    /// writeset already enqueued; the follower-side detection
-    /// closes the cross-node loop. Borrowed.
     deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        data_dir: []const u8,
-        raft: *kv.RaftNode,
-    ) ApplyCtx {
-        return .{
-            .allocator = allocator,
-            .data_dir = data_dir,
-            .raft = raft,
-            .kv_stores = .empty,
-        };
+    pub fn init(allocator: std.mem.Allocator) Loop46Ctx {
+        return .{ .allocator = allocator };
     }
 
-    pub fn deinit(self: *ApplyCtx) void {
-        var kv_it = self.kv_stores.iterator();
-        while (kv_it.next()) |e| {
-            self.allocator.free(e.key_ptr.*);
-            e.value_ptr.*.close();
-        }
-        self.kv_stores.deinit(self.allocator);
-
-        if (self.root_store) |s| s.close();
+    pub fn deinit(self: *Loop46Ctx) void {
         if (self.schedules_store) |s| {
             s.close();
             self.allocator.destroy(s);
         }
     }
 
-    /// Lazily open the cluster-wide `schedules.db`. Returned pointer is
-    /// owned by the context and stable for its lifetime. Reached on
-    /// both leader and follower because envelope types 8/9/10/11
-    /// don't leader-skip.
-    fn getSchedules(self: *ApplyCtx) !*schedule_server.ScheduleStore {
+    /// Lazily open the cluster-wide `schedules.db`. Singleton —
+    /// neither leader-skipped nor library-managed since ScheduleStore
+    /// isn't a raw KvStore.
+    fn getSchedules(self: *Loop46Ctx, data_dir: []const u8) !*schedule_server.ScheduleStore {
         if (self.schedules_store) |existing| return existing;
         const path = try std.fmt.allocPrintSentinel(
             self.allocator,
             "{s}/schedules.db",
-            .{self.data_dir},
+            .{data_dir},
             0,
         );
         defer self.allocator.free(path);
@@ -420,167 +348,50 @@ pub const ApplyCtx = struct {
         self.schedules_store = ptr;
         return ptr;
     }
-
-    /// Lazily open the follower's local copy of `__root__.db`. Returns
-    /// the cached handle on subsequent calls. Reached on the
-    /// follower path (`applyRootWriteSet` leader-skips before
-    /// opening) and from the snapshot capture loop on the leader
-    /// (which needs to VACUUM INTO root.db whether or not any
-    /// follower-side apply has touched it).
-    pub fn getRootKv(self: *ApplyCtx) !*kv.KvStore {
-        if (self.root_store) |existing| return existing;
-        const path = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "{s}/__root__.db",
-            .{self.data_dir},
-            0,
-        );
-        defer self.allocator.free(path);
-        const store = try kv.KvStore.open(self.allocator, path);
-        self.root_store = store;
-        // First opener seeds the global apply idx from disk. After
-        // that, it's bumped in memory per-apply + persisted in
-        // `tickRaftCapture`. Existing non-zero disk value means
-        // this is a restart; resume from there.
-        if (self.global_apply_idx == 0) {
-            self.global_apply_idx = store.lastAppliedRaftIdx() catch 0;
-        }
-        return store;
-    }
-
-    /// Lazily open this tenant's app.db kv store. The returned
-    /// pointer is owned by the context and stable for the lifetime
-    /// of the context.
-    pub fn getKv(self: *ApplyCtx, instance_id: []const u8) !*kv.KvStore {
-        if (self.kv_stores.get(instance_id)) |existing| return existing;
-
-        // Lazy mkpath: on a follower, the per-tenant directory may
-        // not exist yet. The leader's `tenant.createInstance` makes
-        // it locally during signup, but followers only see the
-        // resulting envelope 2 (root_writeset) — they never get a
-        // signal to mkdir the per-tenant subdir. So when envelope
-        // 0 lands here for a tenant whose dir doesn't exist,
-        // SQLite's open fails. Make the dir on demand: it's
-        // idempotent and matches the single-store-per-tenant
-        // contract the worker already assumes.
-        const inst_dir = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{s}",
-            .{ self.data_dir, instance_id },
-        );
-        defer self.allocator.free(inst_dir);
-        std.fs.cwd().makePath(inst_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-
-        const path = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "{s}/app.db",
-            .{inst_dir},
-            0,
-        );
-        defer self.allocator.free(path);
-
-        const store = try kv.KvStore.open(self.allocator, path);
-        errdefer store.close();
-
-        const kv_id_copy = try self.allocator.dupe(u8, instance_id);
-        errdefer self.allocator.free(kv_id_copy);
-
-        try self.kv_stores.put(self.allocator, kv_id_copy, store);
-        return store;
-    }
-
-    /// Snapshot capture loop's read interface.
-    pub fn globalLastApplied(self: *const ApplyCtx) u64 {
-        return self.global_apply_idx;
-    }
-
-    /// Bump the in-memory global apply idx. Idempotent / monotonic:
-    /// silently keeps the higher value if called with a stale idx.
-    pub fn noteApplied(self: *ApplyCtx, idx: u64) void {
-        if (idx > self.global_apply_idx) self.global_apply_idx = idx;
-    }
 };
 
-/// The function rove-kv's `RaftNode` calls for every committed entry
-/// in `.opaque_bytes` apply mode. Dispatches on envelope type byte.
-///
-/// `entry_idx` is the raft log index of this committed entry. Phase
-/// 5.5(c) snapshot model uses it as the per-store
-/// `_apply_state.last_applied_raft_idx` stamp + filter so a follower
-/// loaded from a snapshot at floor F can replay entries F+1..N
-/// without re-applying anything already in the snapshot. Pre-snapshot
-/// stores have `last_applied=0` so the filter is a no-op.
-pub fn applyOne(
+fn loop46Ctx(user_ctx: ?*anyopaque) *Loop46Ctx {
+    return @ptrCast(@alignCast(user_ctx orelse panic_mod.invariantViolated(
+        "apply: missing user_ctx",
+        "expected *Loop46Ctx",
+        .{},
+    )));
+}
+
+// ── Envelope handlers (library `ApplyFn` signature) ──────────────────
+//
+// Each handler is registered via `cluster.registerEnvelope(type, ...)`
+// in loop46/main.zig. The library handles the global apply filter,
+// envelope decode, leader_skip check, and multi-envelope unwrap; these
+// handlers only see envelopes their type was registered for. The
+// returned `ApplyError` (rare — these handlers panic on most errors)
+// surfaces back to library which panics at `applyCallback`. Hot path
+// is panic-free; errors here are invariant violations.
+
+/// Per-tenant writeset (envelope type=0). Registered with
+/// `leader_skip = true` — the worker already wrote locally via its
+/// own TrackedTxn before proposing, so this only runs on followers.
+/// Library opens the per-tenant store at `{data_dir}/{id}/app.db`
+/// (filename pinned via `Cluster.Config.store_filename = "app.db"`).
+pub fn applyWriteSet(
+    cluster: *kv.Cluster,
+    env: kv.Envelope,
     entry_idx: u64,
-    payload: []const u8,
-    ctx_opaque: ?*anyopaque,
-) void {
-    const ctx: *ApplyCtx = @ptrCast(@alignCast(ctx_opaque.?));
+    inside_multi: bool,
+    user_ctx: ?*anyopaque,
+) kv.ClusterApplyError!void {
+    _ = entry_idx;
+    _ = inside_multi;
 
-    // Global apply filter — replaces the per-store
-    // `_apply_state.last_applied_raft_idx` lookup that lived
-    // inside each envelope's handler. Raft idx is totally
-    // ordered, so one cluster-wide counter answers the
-    // question. Lives here (top-level) so the recursive
-    // multi-envelope dispatch doesn't double-bump or skip
-    // inner envelopes that share the outer entry_idx.
-    if (entry_idx <= ctx.global_apply_idx) return;
-    defer ctx.noteApplied(entry_idx);
-
-    const env = decodeEnvelope(payload) catch |err| panic_mod.invariantViolated(
-        "applyOne.decodeEnvelope",
-        "err={s}",
-        .{@errorName(err)},
-    );
-
-    dispatch(ctx, env, entry_idx, .top_level);
-}
-
-const NestingLevel = enum { top_level, inside_multi };
-
-fn dispatch(ctx: *ApplyCtx, env: Envelope, entry_idx: u64, nesting: NestingLevel) void {
-    switch (env.type) {
-        .writeset => applyWriteSet(ctx, env, entry_idx),
-        .root_writeset => applyRootWriteSet(ctx, env, entry_idx),
-        .multi => {
-            if (nesting == .inside_multi) panic_mod.invariantViolated(
-                "applyOne.multi",
-                "nested multi-envelope wrapper",
-                .{},
-            );
-            applyMulti(ctx, env, entry_idx);
-        },
-        .schedule_upsert => applyScheduleUpsertBatch(ctx, env),
-        .schedule_complete => applyScheduleComplete(ctx, env),
-        .schedule_cancel => applyScheduleCancelBatch(ctx, env),
-        .schedule_demote => applyScheduleDemote(ctx, env),
-    }
-}
-
-fn applyWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
-    _ = entry_idx; // global filter ran in applyOne
-
-    // Leader path: the worker already wrote via its own TrackedTxn
-    // connection. Don't redo the writes (leader-skip), and don't
-    // open a second SQLite connection from this thread (contention
-    // on the WAL writer lock with the worker). The leader-side
-    // deployment-loader enqueue happened in the proposing
-    // trampoline (`releasePublishTrampoline`); no work to do here.
-    if (ctx.raft.isLeader()) return;
-
-    const store = ctx.getKv(env.instance_id) catch |err| panic_mod.invariantViolated(
-        "applyWriteSet.getKv",
-        "tenant={s} err={s}",
-        .{ env.instance_id, @errorName(err) },
-    );
+    const store = cluster.openStore(env.id) catch |err| switch (err) {
+        error.OutOfMemory => return kv.ClusterApplyError.OutOfMemory,
+        else => return kv.ClusterApplyError.Sqlite,
+    };
 
     kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
         "applyWriteSet.applyEncodedWriteSet",
         "tenant={s} err={s}",
-        .{ env.instance_id, @errorName(err) },
+        .{ env.id, @errorName(err) },
     );
 
     // Follower-side release propagation: if this writeset stamped
@@ -590,30 +401,39 @@ fn applyWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
     // payload is `{N:0>16}` hex (16 chars); anything else is a
     // pre-existing kv write happening to use the same key (shouldn't
     // happen but we tolerate it by silently ignoring).
+    const ctx = loop46Ctx(user_ctx);
     if (ctx.deployment_loader) |loader| {
         if (kv.scanWriteSetPutValue(env.payload, "_deploy/current")) |hex_bytes| {
             const dep_id = std.fmt.parseInt(u64, hex_bytes, 16) catch return;
-            loader.enqueue(env.instance_id, dep_id) catch |err| std.log.warn(
+            loader.enqueue(env.id, dep_id) catch |err| std.log.warn(
                 "applyWriteSet: deployment loader enqueue {s}/{d} failed: {s}",
-                .{ env.instance_id, dep_id, @errorName(err) },
+                .{ env.id, dep_id, @errorName(err) },
             );
         }
     }
 }
 
-/// Decode the root writeset and apply it to this node's copy of
-/// `__root__.db`. Same leader-skip pattern as `applyWriteSet`.
-fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
-    std.debug.assert(env.instance_id.len == 0);
+/// Root writeset (envelope type=2). Registered with
+/// `leader_skip = true` — same model as the per-tenant writeset: the
+/// worker (signup / admin handler `platform.root.*`) wrote to
+/// `__root__.db` locally before proposing, so this only runs on
+/// followers. Library opens via `cluster.openRoot()`.
+pub fn applyRootWriteSet(
+    cluster: *kv.Cluster,
+    env: kv.Envelope,
+    entry_idx: u64,
+    inside_multi: bool,
+    user_ctx: ?*anyopaque,
+) kv.ClusterApplyError!void {
     _ = entry_idx;
+    _ = inside_multi;
+    _ = user_ctx;
+    std.debug.assert(env.id.len == 0);
 
-    if (ctx.raft.isLeader()) return;
-
-    const store = ctx.getRootKv() catch |err| panic_mod.invariantViolated(
-        "applyRootWriteSet.getRootKv",
-        "err={s}",
-        .{@errorName(err)},
-    );
+    const store = cluster.openRoot() catch |err| switch (err) {
+        error.OutOfMemory => return kv.ClusterApplyError.OutOfMemory,
+        else => return kv.ClusterApplyError.Sqlite,
+    };
 
     kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
         "applyRootWriteSet.applyEncodedWriteSet",
@@ -625,10 +445,23 @@ fn applyRootWriteSet(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
 /// http.send envelope-8 apply (schedule_upsert). UPSERTs each row
 /// into `schedules.db` (bumping `version` on existing rows) and
 /// wakes the leader-pinned scheduler thread when wired.
-fn applyScheduleUpsertBatch(ctx: *ApplyCtx, env: Envelope) void {
-    std.debug.assert(env.instance_id.len == 0);
+/// http.send envelope-8 apply (schedule_upsert). UPSERTs each row
+/// into `schedules.db` (bumping `version` on existing rows) and
+/// wakes the leader-pinned scheduler thread when wired. Applied on
+/// both leader and follower (`leader_skip = false`).
+pub fn applyScheduleUpsertBatch(
+    cluster: *kv.Cluster,
+    env: kv.Envelope,
+    entry_idx: u64,
+    inside_multi: bool,
+    user_ctx: ?*anyopaque,
+) kv.ClusterApplyError!void {
+    _ = entry_idx;
+    _ = inside_multi;
+    std.debug.assert(env.id.len == 0);
 
-    const store = ctx.getSchedules() catch |err| panic_mod.invariantViolated(
+    const ctx = loop46Ctx(user_ctx);
+    const store = ctx.getSchedules(cluster.data_dir) catch |err| panic_mod.invariantViolated(
         "applyScheduleUpsertBatch.getSchedules",
         "err={s}",
         .{@errorName(err)},
@@ -647,17 +480,11 @@ fn applyScheduleUpsertBatch(ctx: *ApplyCtx, env: Envelope) void {
 
     // Internal-target stamping (plan §3.2). Each node runs the same
     // detection against the same root-store membership + same suffix,
-    // so all replicas agree on `is_internal` for every row. Rows
-    // whose URL host is `{id}.{public_suffix}` AND `{id}` exists in
-    // __root__.db get `is_internal=true` and land in the internal
-    // pool (drained by `dispatchInternalSchedules`); everyone else
-    // lands in the external pool (drained by the libcurl scheduler
-    // thread). Track which pool got contributions so we only wake
-    // the consumer that has new work.
+    // so all replicas agree on `is_internal` for every row.
     var has_external = false;
     var has_internal = false;
     for (rows) |*r| {
-        r.is_internal = detectInternalTarget(ctx, r.url);
+        r.is_internal = detectInternalTarget(cluster, ctx, r.url);
         if (r.is_internal) has_internal = true else has_external = true;
     }
 
@@ -677,14 +504,12 @@ fn applyScheduleUpsertBatch(ctx: *ApplyCtx, env: Envelope) void {
 /// `public_suffix` isn't wired (CLI smokes, single-tenant dev) — that's
 /// the "not running on a cluster" path where every URL is external.
 /// Also returns false on parse / membership errors: detection is
-/// best-effort. False negative cost: one extra libcurl roundtrip.
-/// False positive cost: dispatching against a non-existent tenant
-/// (the worker phase rejects gracefully + the row falls back).
-fn detectInternalTarget(ctx: *ApplyCtx, url: []const u8) bool {
+/// best-effort.
+fn detectInternalTarget(cluster: *kv.Cluster, ctx: *Loop46Ctx, url: []const u8) bool {
     const suffix = ctx.public_suffix orelse return false;
     if (suffix.len == 0) return false;
     const id = schedule_server.internal_routing.parseInstanceId(url, suffix) orelse return false;
-    const root = ctx.getRootKv() catch return false;
+    const root = cluster.openRoot() catch return false;
     var key_buf: [128]u8 = undefined;
     const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{id}) catch return false;
     const v = root.get(key) catch |err| switch (err) {
@@ -695,18 +520,22 @@ fn detectInternalTarget(ctx: *ApplyCtx, url: []const u8) bool {
     return true;
 }
 
-/// http.send envelope-9 apply (schedule_complete). Cross-db: on
-/// version match, writes `_callback/{id}` into the tenant's app.db
-/// AND deletes the row from schedules.db. On version mismatch
-/// (the row was overwritten while firing — plan §7), silently
-/// drops the envelope. Idempotent on missing row.
-///
-/// Order matters: tenant write FIRST, then schedules delete. Same
-/// reasoning as `applyWebhookComplete`. Crash between them = the
-/// next apply attempt re-reads the still-present schedule row and
-/// re-issues both writes.
-fn applyScheduleComplete(ctx: *ApplyCtx, env: Envelope) void {
-    const tenant_id = env.instance_id;
+/// http.send envelope-9 apply (schedule_complete). On version match,
+/// stashes a callback row in schedules.db's `c/{tenant_id}/{id}` and
+/// DELETEs the schedule row. Stale envelopes (superseded fires)
+/// silently dropped. Applied on both leader and follower.
+pub fn applyScheduleComplete(
+    cluster: *kv.Cluster,
+    env: kv.Envelope,
+    entry_idx: u64,
+    inside_multi: bool,
+    user_ctx: ?*anyopaque,
+) kv.ClusterApplyError!void {
+    _ = entry_idx;
+    _ = inside_multi;
+
+    const tenant_id = env.id;
+    const ctx = loop46Ctx(user_ctx);
 
     var complete = schedule_server.decodeComplete(ctx.allocator, env.payload) catch |err|
         panic_mod.invariantViolated(
@@ -716,15 +545,12 @@ fn applyScheduleComplete(ctx: *ApplyCtx, env: Envelope) void {
         );
     defer complete.deinit(ctx.allocator);
 
-    const store = ctx.getSchedules() catch |err| panic_mod.invariantViolated(
+    const store = ctx.getSchedules(cluster.data_dir) catch |err| panic_mod.invariantViolated(
         "applyScheduleComplete.getSchedules",
         "err={s}",
         .{@errorName(err)},
     );
 
-    // Pull the row to access on_result_module + context_json. The
-    // version-check happens after we've read these so we don't pay
-    // the JSON-build cost on a stale envelope.
     var existing_opt = store.get(tenant_id, complete.id) catch |err|
         panic_mod.invariantViolated(
             "applyScheduleComplete.get",
@@ -735,14 +561,8 @@ fn applyScheduleComplete(ctx: *ApplyCtx, env: Envelope) void {
     if (existing_opt) |*existing| {
         defer existing.deinit(ctx.allocator);
 
-        // Version check: the most-recently-scheduled version is
-        // what fires. Stale envelopes from superseded fires are
-        // silently dropped (plan §7).
         if (existing.version != complete.version_at_fire) return;
 
-        // Skip the callback stash when the customer set no
-        // on_result module — fire-and-forget mode. Still falls
-        // through to the schedules.db delete below.
         if (existing.row.on_result_module.len > 0) {
             const event_json = buildScheduleCallbackJson(
                 ctx.allocator,
@@ -755,11 +575,6 @@ fn applyScheduleComplete(ctx: *ApplyCtx, env: Envelope) void {
             );
             defer ctx.allocator.free(event_json);
 
-            // Centralized callback row: stamped into `schedules.db`
-            // at `c/{tenant_id}/{id}` instead of the tenant's app.db
-            // at `_callback/{id}`. `dispatchCallbacks` scans the
-            // `c/` prefix once per tick (O(1) regardless of tenant
-            // count); per-tenant scans no longer needed.
             store.addPendingCallback(tenant_id, complete.id, event_json) catch |err|
                 panic_mod.invariantViolated(
                     "applyScheduleComplete.addPendingCallback",
@@ -778,12 +593,20 @@ fn applyScheduleComplete(ctx: *ApplyCtx, env: Envelope) void {
 }
 
 /// http.cancel envelope-10 apply (schedule_cancel). DELETEs each
-/// `(tenant_id, id)` from schedules.db. Idempotent: missing row is
-/// a no-op (already fired or already cancelled — race fine).
-/// Customer's on_result handler does NOT fire on cancel.
-fn applyScheduleCancelBatch(ctx: *ApplyCtx, env: Envelope) void {
-    std.debug.assert(env.instance_id.len == 0);
+/// `(tenant_id, id)` from schedules.db. Idempotent. Applied on both
+/// leader and follower.
+pub fn applyScheduleCancelBatch(
+    cluster: *kv.Cluster,
+    env: kv.Envelope,
+    entry_idx: u64,
+    inside_multi: bool,
+    user_ctx: ?*anyopaque,
+) kv.ClusterApplyError!void {
+    _ = entry_idx;
+    _ = inside_multi;
+    std.debug.assert(env.id.len == 0);
 
+    const ctx = loop46Ctx(user_ctx);
     const targets = schedule_server.decodeCancelBatch(ctx.allocator, env.payload) catch |err|
         panic_mod.invariantViolated(
             "applyScheduleCancelBatch.decode",
@@ -795,7 +618,7 @@ fn applyScheduleCancelBatch(ctx: *ApplyCtx, env: Envelope) void {
         ctx.allocator.free(targets);
     }
 
-    const store = ctx.getSchedules() catch |err| panic_mod.invariantViolated(
+    const store = ctx.getSchedules(cluster.data_dir) catch |err| panic_mod.invariantViolated(
         "applyScheduleCancelBatch.getSchedules",
         "err={s}",
         .{@errorName(err)},
@@ -811,15 +634,21 @@ fn applyScheduleCancelBatch(ctx: *ApplyCtx, env: Envelope) void {
     }
 }
 
-/// http.send envelope-11 apply (schedule_demote). Plan §3.2: the
-/// worker phase gave up on serving this internal-pool row in-process
-/// (target tenant not hosted on this node). Flip `is_internal=false`
-/// so the libcurl thread can fire it. Wakes the scheduler thread —
-/// the row just became eligible for `dueRows`. Idempotent on missing
-/// row + on already-external row.
-fn applyScheduleDemote(ctx: *ApplyCtx, env: Envelope) void {
-    std.debug.assert(env.instance_id.len == 0);
+/// http.send envelope-11 apply (schedule_demote). Flips
+/// `is_internal=false` so the libcurl scheduler thread can fire the
+/// row. Idempotent. Applied on both leader and follower.
+pub fn applyScheduleDemote(
+    cluster: *kv.Cluster,
+    env: kv.Envelope,
+    entry_idx: u64,
+    inside_multi: bool,
+    user_ctx: ?*anyopaque,
+) kv.ClusterApplyError!void {
+    _ = entry_idx;
+    _ = inside_multi;
+    std.debug.assert(env.id.len == 0);
 
+    const ctx = loop46Ctx(user_ctx);
     var target = schedule_server.decodeDemote(ctx.allocator, env.payload) catch |err|
         panic_mod.invariantViolated(
             "applyScheduleDemote.decode",
@@ -828,7 +657,7 @@ fn applyScheduleDemote(ctx: *ApplyCtx, env: Envelope) void {
         );
     defer target.deinit(ctx.allocator);
 
-    const store = ctx.getSchedules() catch |err| panic_mod.invariantViolated(
+    const store = ctx.getSchedules(cluster.data_dir) catch |err| panic_mod.invariantViolated(
         "applyScheduleDemote.getSchedules",
         "err={s}",
         .{@errorName(err)},
@@ -841,35 +670,7 @@ fn applyScheduleDemote(ctx: *ApplyCtx, env: Envelope) void {
             .{ target.tenant_id, target.id, @errorName(err) },
         );
 
-    // The row just transitioned to the external pool — let the
-    // libcurl thread know without waiting out the next poll.
     if (ctx.schedule_wake) |w| w.set();
-}
-
-fn applyMulti(ctx: *ApplyCtx, env: Envelope, entry_idx: u64) void {
-    std.debug.assert(env.instance_id.len == 0);
-    const inner = decodeMultiInner(ctx.allocator, env.payload) catch |err|
-        panic_mod.invariantViolated(
-            "applyMulti.decode",
-            "err={s}",
-            .{@errorName(err)},
-        );
-    defer ctx.allocator.free(inner);
-
-    // Inner envelopes share the wrapper's raft entry idx — they
-    // landed in the log atomically together, so a snapshot loaded
-    // partway through the wrapper would either be missing the whole
-    // multi or have it. Per-store filtering still applies inside
-    // each inner dispatch.
-    for (inner) |bytes| {
-        const inner_env = decodeEnvelope(bytes) catch |err|
-            panic_mod.invariantViolated(
-                "applyMulti.decodeInner",
-                "err={s}",
-                .{@errorName(err)},
-            );
-        dispatch(ctx, inner_env, entry_idx, .inside_multi);
-    }
 }
 
 /// Build the `_callback/{id}` JSON event for an http.send delivery.

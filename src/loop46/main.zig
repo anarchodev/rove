@@ -663,7 +663,7 @@ fn workerThreadEntry(args: *WorkerCtx) void {
 /// in S3 / fs but the willemt log keeps growing forever.
 const RaftThreadArgs = struct {
     node: *kv.RaftNode,
-    apply_ctx: *rjs.apply.ApplyCtx,
+    cluster: *kv.Cluster,
     /// Null disables the periodic compaction tick. The standalone
     /// CLI `loop46 snapshot` still works against the same data
     /// dir for operator-on-demand DR captures.
@@ -695,8 +695,7 @@ fn runRaftLoop(args: *RaftThreadArgs) !void {
             const out = snapshot_mod.tickRaftCapture(
                 state,
                 now_ns,
-                args.node,
-                args.apply_ctx,
+                args.cluster,
             ) catch |err| blk: {
                 std.log.warn("snapshot tick failed: {s}", .{@errorName(err)});
                 break :blk null;
@@ -1062,13 +1061,24 @@ pub fn main() !void {
         break :blk null;
     };
 
-    // ── Raft setup ─────────────────────────────────────────────────────
+    // ── Cluster + apply setup ─────────────────────────────────────────
     //
-    // ApplyCtx is raft-thread-local: it owns its own per-tenant sqlite
-    // connections, opened lazily on follower applies. These are
-    // DISTINCT from any worker's connections, so the raft thread and
-    // the worker threads never share a NOMUTEX sqlite connection.
-    var apply_ctx: rjs.apply.ApplyCtx = undefined;
+    // The shared `kv.Cluster` library owns the raft node, the apply
+    // dispatch table, per-store cache (lazy-opened on first follower
+    // apply), and `__root__.db`. Loop46-specific apply state lives in
+    // `Loop46Ctx`, threaded through `Cluster.Config.user_ctx`. The
+    // per-store cache uses filename `"app.db"` to preserve the
+    // pre-Cluster on-disk layout (raft-kv-design.md migration step 4,
+    // approach A′ — filename config, no file renames).
+    //
+    // Per-tenant SQLite connections live in `cluster.stores` and are
+    // raft-thread-local; workers keep their own per-tenant connections
+    // for dispatch, so the raft thread and worker threads never share
+    // a NOMUTEX sqlite connection.
+    var loop46_ctx = rjs.apply.Loop46Ctx.init(allocator);
+    defer loop46_ctx.deinit();
+    // Internal-target stamping for envelope-8 (http-send-plan §3.2).
+    loop46_ctx.public_suffix = cli.public_suffix;
 
     const peers = try parsePeerList(allocator, cli.peers);
     defer {
@@ -1134,36 +1144,47 @@ pub fn main() !void {
         .services_jwt_secret = &services_jwt_secret,
     };
 
-    const raft_node = try kv.RaftNode.init(allocator, .{
-        .node_id = cli.node_id,
-        .peers = peers,
-        .listen_addr = listen_addr,
-        .apply = .{
-            .opaque_bytes = .{
-                .apply_fn = rjs.apply.applyOne,
-                .ctx = &apply_ctx,
-            },
+    const cluster = try kv.Cluster.init(.{
+        .allocator = allocator,
+        .data_dir = cli.data_dir,
+        .store_filename = "app.db",
+        .user_ctx = @ptrCast(&loop46_ctx),
+        .raft = .{
+            .node_id = cli.node_id,
+            .peers = peers,
+            .listen_addr = listen_addr,
+            // Phase 5.5(c) step C / production.md #1.1 step 3 — when
+            // willemt fires `send_snapshot`, mint a snap_id and push
+            // a `snap_fetch_offer` frame to the peer carrying the URL
+            // this node will serve the bundle at. Receiver side's
+            // `on_snap_fetch_offer` runs the fetcher thread.
+            .needs_snapshot = snapshot_mod.sendSnapshotFetchOffer,
+            .needs_snapshot_ctx = @ptrCast(&needs_snapshot_ctx),
+            .raft_log_path = raft_log_path,
+            .propose_linger_ns = cli.propose_linger_us * std.time.ns_per_us,
+            .election_timeout_ms = cli.election_timeout_ms,
+            .request_timeout_ms = cli.request_timeout_ms,
         },
-        // Phase 5.5(c) step C / production.md #1.1 step 3 — when
-        // willemt fires `send_snapshot` (the leader observes a
-        // follower whose next_idx is below the leader's compaction
-        // floor), mint a snap_id and push a `snap_fetch_offer` frame
-        // to the peer carrying the URL this node will serve the
-        // bundle at. The peer side's `on_snap_fetch_offer` callback
-        // dispatches a fetcher thread (`SnapReceiver`) that GETs the
-        // URL, stages the bundle under `{data_dir}/.snap-in-{id}/`,
-        // and (future commit) drives the live install.
-        .needs_snapshot = snapshot_mod.sendSnapshotFetchOffer,
-        .needs_snapshot_ctx = @ptrCast(&needs_snapshot_ctx),
-        .on_snap_fetch_offer = snapshot_mod.SnapReceiver.onSnapFetchOffer,
-        .on_snap_fetch_offer_ctx = @ptrCast(&snap_receiver),
-        .raft_log_path = raft_log_path,
-        .worker_count = 0,
-        .propose_linger_ns = cli.propose_linger_us * std.time.ns_per_us,
-        .election_timeout_ms = cli.election_timeout_ms,
-        .request_timeout_ms = cli.request_timeout_ms,
     });
-    defer raft_node.deinit();
+    defer cluster.deinit();
+    const raft_node = cluster.raft;
+    // The snap-fetch-offer receiver wiring isn't part of
+    // RaftBootConfig yet; set it directly on the raft node post-init.
+    raft_node.config.on_snap_fetch_offer = snapshot_mod.SnapReceiver.onSnapFetchOffer;
+    raft_node.config.on_snap_fetch_offer_ctx = @ptrCast(&snap_receiver);
+
+    // Register loop46's envelope handlers with the cluster. Library
+    // defaults handle types 0 + 1 (writeset, multi); we override
+    // type 0 because loop46's writeset has follower-side post-
+    // processing (deployment-loader enqueue on `_deploy/current`).
+    // Type 1 (multi) uses the library default — the multi-envelope
+    // wire shape matches.
+    try cluster.registerEnvelope(0, .{ .apply = rjs.apply.applyWriteSet, .leader_skip = true });
+    try cluster.registerEnvelope(2, .{ .apply = rjs.apply.applyRootWriteSet, .leader_skip = true });
+    try cluster.registerEnvelope(8, .{ .apply = rjs.apply.applyScheduleUpsertBatch, .leader_skip = false });
+    try cluster.registerEnvelope(9, .{ .apply = rjs.apply.applyScheduleComplete, .leader_skip = false });
+    try cluster.registerEnvelope(10, .{ .apply = rjs.apply.applyScheduleCancelBatch, .leader_skip = false });
+    try cluster.registerEnvelope(11, .{ .apply = rjs.apply.applyScheduleDemote, .leader_skip = false });
 
     // Tell willemt about the just-installed staged snapshot, if any.
     // The on-disk app.dbs reflect state through `snap_last_idx`;
@@ -1184,16 +1205,6 @@ pub fn main() !void {
             .{ inst.snap_last_idx, inst.snap_last_term },
         );
     }
-
-    apply_ctx = rjs.apply.ApplyCtx.init(allocator, cli.data_dir, raft_node);
-    defer apply_ctx.deinit();
-    // Internal-target stamping for envelope-8 (http-send-plan §3.2).
-    // When `public_suffix` is set, schedule rows whose URL targets
-    // `{id}.{public_suffix}` and `{id}` has an existence marker in
-    // __root__.db get `is_internal=true`. The (future) worker phase
-    // picks those up in-process; until that lands the stamp is
-    // informational and the libcurl scheduler thread fires every row.
-    apply_ctx.public_suffix = cli.public_suffix;
 
     // ── Optional periodic snapshot (Phase 5.5(c) step B) ──────────────
     //
@@ -1218,7 +1229,7 @@ pub fn main() !void {
 
     var raft_thread_args = RaftThreadArgs{
         .node = raft_node,
-        .apply_ctx = &apply_ctx,
+        .cluster = cluster,
         .snapshot_state = if (snap_state) |*s| s else null,
         .stop = &stop_flag,
     };
@@ -1350,7 +1361,7 @@ pub fn main() !void {
     });
     defer schedule_handle.join();
     defer schedule_handle.signalStop();
-    apply_ctx.schedule_wake = &schedule_handle.wake;
+    loop46_ctx.schedule_wake = &schedule_handle.wake;
 
     // ── Spawn worker threads ───────────────────────────────────────────
     const http_addr = try parseHostPort(allocator, cli.http);
@@ -1415,7 +1426,7 @@ pub fn main() !void {
     // Atomic read pairs with the worker thread's release-store
     // before `ready.set()`. Other workers' loaders are independent;
     // multi-worker fan-out is a follow-up.
-    apply_ctx.deployment_loader = @atomicLoad(?*rjs.DeploymentLoader, &ctxs[0].deployment_loader_publish, .acquire);
+    loop46_ctx.deployment_loader = @atomicLoad(?*rjs.DeploymentLoader, &ctxs[0].deployment_loader_publish, .acquire);
 
     std.debug.print(
         "loop46 worker node {d} listening on http://{s}\n" ++

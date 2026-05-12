@@ -1116,10 +1116,10 @@ pub const TickResult = struct {
 pub fn tickRaftCapture(
     state: *RaftCaptureState,
     now_ns: i64,
-    raft: *kv.RaftNode,
-    apply_ctx: *apply_mod.ApplyCtx,
+    cluster: *kv.Cluster,
 ) !?TickResult {
     if (state.interval_ns == 0) return null;
+    const raft = cluster.raft;
     if (!raft.isLeader()) return null;
     if (now_ns - state.last_attempt_ns < state.interval_ns) return null;
     state.last_attempt_ns = now_ns;
@@ -1138,9 +1138,9 @@ pub fn tickRaftCapture(
     // __root__.db so a restart resumes from this floor. Cost
     // is one row update + WAL append + fsync, independent of
     // tenant count.
-    const root_store = apply_ctx.getRootKv() catch |err| {
+    const root_store = cluster.openRoot() catch |err| {
         std.log.warn(
-            "snapshot: tickRaftCapture: getRootKv failed: {s}",
+            "snapshot: tickRaftCapture: openRoot failed: {s}",
             .{@errorName(err)},
         );
         return null;
@@ -1193,42 +1193,27 @@ pub const RaftCaptureState = struct {
     }
 };
 
-/// Build a `[]TenantSource` slice from an already-warmed
-/// `ApplyCtx`, lazy-opening per-tenant `app.db` connections for
-/// any tenant present in `tenant_apply_idx` but not yet in
-/// `kv_stores`. The leader path is the motivating case: its
-/// `applyWriteSet` populates only the in-memory mirror (avoiding
-/// a second SQLite writer per apply); snapshot capture pays the
-/// open cost once, here.
+/// Build a `[]TenantSource` slice from a warmed `Cluster`,
+/// surfacing every store the library opened lazily during apply.
+/// Borrows keys + store pointers; caller frees the returned slice
+/// with `allocator.free`. Use from the raft thread (which owns
+/// the connections) — workers can't share NOMUTEX SQLite handles.
 ///
-/// Borrows the keys + store pointers; caller frees the returned
-/// slice with `allocator.free`. Use this from the raft thread
-/// (which owns the connections) — not from a worker, since
-/// SQLite NOMUTEX connections aren't shareable.
-///
-/// Each `TenantSource.last_applied_idx` is populated from
-/// `ApplyCtx.tenant_apply_idx` so `capture` can do by-reference
-/// reuse (§2.2 always-refresh-all).
-pub fn tenantSourcesFromApplyCtx(
+/// `last_applied_idx` populates from `cluster.global_apply_idx`
+/// so `capture` can do by-reference reuse against a prior snapshot.
+pub fn tenantSourcesFromCluster(
     allocator: std.mem.Allocator,
-    apply_ctx: *apply_mod.ApplyCtx,
+    cluster: *kv.Cluster,
 ) ![]TenantSource {
     var list: std.ArrayListUnmanaged(TenantSource) = .empty;
     errdefer list.deinit(allocator);
 
-    // Operator-CLI byte-capture path. Pre-#1.5 this iterated the
-    // (now-removed) `tenant_apply_idx` to surface per-tenant
-    // apply positions for by-reference snapshot reuse. With the
-    // global apply idx, there's just one cluster-wide position;
-    // every TenantSource gets it (or null when capture has no
-    // basis to compare against a previous snapshot). Iterate the
-    // open kv_stores cache for the set of tenants.
-    var it = apply_ctx.kv_stores.iterator();
+    var it = cluster.stores.iterator();
     while (it.next()) |entry| {
         try list.append(allocator, .{
             .instance_id = entry.key_ptr.*,
             .store = entry.value_ptr.*,
-            .last_applied_idx = apply_ctx.global_apply_idx,
+            .last_applied_idx = cluster.global_apply_idx,
         });
     }
     return list.toOwnedSlice(allocator);
@@ -1642,10 +1627,10 @@ test "capture + restore: round-trips tenant + root state into a fresh data_dir" 
     });
     defer node.deinit();
 
-    var apply_ctx = apply_mod.ApplyCtx.init(allocator, root_path, node);
-    defer apply_ctx.deinit();
-    _ = try apply_ctx.getKv("acme");
-    _ = try apply_ctx.getRootKv();
+    const cluster = try kv.Cluster.initWithExternalRaftAndFilename(allocator, root_path, node, "app.db", null);
+    defer cluster.deinit();
+    _ = try cluster.openStore("acme");
+    _ = try cluster.openRoot();
 
     // ── Capture into an FsBatchStore ────────────────────────────
     const store_dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{root_path});
@@ -1656,13 +1641,13 @@ test "capture + restore: round-trips tenant + root state into a fresh data_dir" 
     const store = try ls.batch_store_fs.FsBatchStore.init(allocator, store_dir);
     defer store.deinit();
 
-    const sources = try tenantSourcesFromApplyCtx(allocator, &apply_ctx);
+    const sources = try tenantSourcesFromCluster(allocator, cluster);
     defer allocator.free(sources);
 
     var captured = try capture(
         allocator,
         sources,
-        apply_ctx.root_store,
+        cluster.root_store,
         null,
         null,
         store.batchStore(),
@@ -1874,11 +1859,11 @@ test "capture: end-to-end against FsBatchStore round-trips a tenant db" {
         try acme_kv.setLastAppliedRaftIdx(99);
     }
 
-    var apply_ctx = apply_mod.ApplyCtx.init(allocator, root_path, node);
-    defer apply_ctx.deinit();
-    // Trigger lazy-open so kv_stores has acme + root_store is set.
-    _ = try apply_ctx.getKv("acme");
-    _ = try apply_ctx.getRootKv();
+    const cluster = try kv.Cluster.initWithExternalRaftAndFilename(allocator, root_path, node, "app.db", null);
+    defer cluster.deinit();
+    // Trigger lazy-open so stores has acme + root_store is set.
+    _ = try cluster.openStore("acme");
+    _ = try cluster.openRoot();
 
     // Snapshot store + tmp stage dir.
     const store_dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{root_path});
@@ -1889,14 +1874,14 @@ test "capture: end-to-end against FsBatchStore round-trips a tenant db" {
     const store = try ls.batch_store_fs.FsBatchStore.init(allocator, store_dir);
     defer store.deinit();
 
-    // Build the (id, store) slice from the warmed ApplyCtx caches.
-    const sources = try tenantSourcesFromApplyCtx(allocator, &apply_ctx);
+    // Build the (id, store) slice from the warmed cluster caches.
+    const sources = try tenantSourcesFromCluster(allocator, cluster);
     defer allocator.free(sources);
 
     var captured = try capture(
         allocator,
         sources,
-        apply_ctx.root_store,
+        cluster.root_store,
         null,
         null,
         store.batchStore(),
@@ -2017,10 +2002,10 @@ test "capture: prev_manifest with different tenant set" {
         try ks.put("g", "v");
     }
 
-    var apply_ctx = apply_mod.ApplyCtx.init(allocator, root_path, node);
-    defer apply_ctx.deinit();
-    _ = try apply_ctx.getKv("gamma");
-    _ = try apply_ctx.getRootKv();
+    const cluster = try kv.Cluster.initWithExternalRaftAndFilename(allocator, root_path, node, "app.db", null);
+    defer cluster.deinit();
+    _ = try cluster.openStore("gamma");
+    _ = try cluster.openRoot();
 
     // Build a synthetic prev_manifest naming acme/beta with stale
     // snapshot_idx 50. This simulates "previous snapshot covered a
@@ -2051,14 +2036,14 @@ test "capture: prev_manifest with different tenant set" {
     const store = try ls.batch_store_fs.FsBatchStore.init(allocator, store_dir);
     defer store.deinit();
 
-    const sources = try tenantSourcesFromApplyCtx(allocator, &apply_ctx);
+    const sources = try tenantSourcesFromCluster(allocator, cluster);
     defer allocator.free(sources);
 
     var captured = try capture(
         allocator,
         sources,
-        apply_ctx.root_store,
-        apply_ctx.global_apply_idx,
+        cluster.root_store,
+        cluster.global_apply_idx,
         &prev_manifest,
         store.batchStore(),
         stage_dir,

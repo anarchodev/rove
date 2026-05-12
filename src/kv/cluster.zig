@@ -356,9 +356,23 @@ pub const Cluster = struct {
         raft: *RaftNode,
         user_ctx: ?*anyopaque,
     ) !*Cluster {
+        return initWithExternalRaftAndFilename(allocator, data_dir, raft, "store.db", user_ctx);
+    }
+
+    /// Same as `initWithExternalRaft` but with a configurable store
+    /// filename — matches `Config.store_filename`. Used by tests that
+    /// stand up an external raft node + want the pre-Cluster `app.db`
+    /// on-disk layout.
+    pub fn initWithExternalRaftAndFilename(
+        allocator: std.mem.Allocator,
+        data_dir: []const u8,
+        raft: *RaftNode,
+        store_filename: []const u8,
+        user_ctx: ?*anyopaque,
+    ) !*Cluster {
         const self = try allocator.create(Cluster);
         errdefer allocator.destroy(self);
-        self.initFields(allocator, data_dir, "store.db", user_ctx);
+        self.initFields(allocator, data_dir, store_filename, user_ctx);
         self.raft = raft;
         self.raft_owned = false;
         return self;
