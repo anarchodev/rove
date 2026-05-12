@@ -1,0 +1,95 @@
+# User-scoped service unit for files-server-standalone.
+#
+# Companion units:
+#   rove-loop46.service       — the worker. Depends on this unit.
+#   rove-log-server.service   — log-server-standalone.
+#   rove-sse-server.service   — sse-server-standalone.
+#
+# Full deployment recipe: docs/deployment.md.
+#
+# ── Install (per host, as the deploy user, no sudo) ──────────────────
+# 1. Place the binary on PATH:
+#      install -D -m 0755 zig-out/bin/files-server-standalone \
+#          ~/.local/bin/files-server-standalone
+#
+# 2. Place the unit file:
+#      install -D -m 0644 scripts/systemd/rove-files-server.service \
+#          ~/.config/systemd/user/rove-files-server.service
+#
+# 3. Drop the env file. files-server shares LOOP46_SERVICES_JWT_SECRET
+#    with the worker (mint at the worker, verify here) and reads S3
+#    creds for its BlobBackend. See docs/deployment.md for the full
+#    list. Minimum:
+#      mkdir -p ~/.config/rove
+#      cat > ~/.config/rove/common.env <<EOF
+#      LOOP46_SERVICES_JWT_SECRET=...        # 64 hex chars
+#      S3_ENDPOINT=s3.us-east-1.amazonaws.com
+#      S3_REGION=us-east-1
+#      S3_BUCKET=...
+#      AWS_ACCESS_KEY_ID=...
+#      AWS_SECRET_ACCESS_KEY=...
+#      BLOB_BACKEND=s3
+#      EOF
+#      cat > ~/.config/rove/files-server.env <<EOF
+#      FILES_LISTEN=127.0.0.1:8444
+#      DATA_DIR=%h/.rove/data
+#      TLS_CERT=%h/.rove/tls/cert.pem
+#      TLS_KEY=%h/.rove/tls/key.pem
+#      ADMIN_ORIGIN=https://app.loop46.me
+#      LEADER_URL=https://app.loop46.me
+#      EOF
+#      chmod 0600 ~/.config/rove/*.env
+#
+#    Note: systemd's EnvironmentFile does NOT expand `%h` — write
+#    absolute paths in the env file. The %h substitution in this
+#    unit's ExecStart works because it's a unit-file specifier.
+#
+# 4. Enable + start:
+#      systemctl --user daemon-reload
+#      systemctl --user enable --now rove-files-server.service
+#      systemctl --user status rove-files-server.service
+#      journalctl --user -u rove-files-server.service -f
+#
+# ── Persistence across logout ────────────────────────────────────────
+# User units stop when the deploy user's last session ends. On a
+# long-running server, enable lingering once:
+#   loginctl enable-linger $USER
+#
+# ── --leader-url and the bootstrap dance ─────────────────────────────
+# When LEADER_URL is set, files-server runs a one-time platform-deploy
+# bootstrap before serving: ensures __admin__ + __replay__ have a
+# deployment in S3, then POSTs /_system/release to the leader so the
+# `_deploy/current` pointer lands via raft. Idempotent on warm S3 —
+# subsequent restarts no-op. The POST will block until the worker
+# becomes leader, so on a fresh cluster you can start either order;
+# this unit will retry.
+
+[Unit]
+Description=Loop46 files-server (per-tenant manifest + bytecode HTTP)
+Documentation=https://github.com/anarchodev/rove/blob/main/docs/files-server-plan.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/rove/common.env
+EnvironmentFile=%h/.config/rove/files-server.env
+ExecStart=%h/.local/bin/files-server-standalone \
+    --data-dir ${DATA_DIR} \
+    --listen ${FILES_LISTEN} \
+    --tls-cert ${TLS_CERT} \
+    --tls-key ${TLS_KEY} \
+    --cors-origin ${ADMIN_ORIGIN} \
+    --leader-url ${LEADER_URL}
+Restart=on-failure
+RestartSec=2
+
+# Hardening.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.rove
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

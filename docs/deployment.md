@@ -1,0 +1,260 @@
+# Deployment runbook
+
+Production Loop46 is four processes per host. This document covers
+installation, env wiring, service order, and common operational checks.
+For the architecture rationale, see [`PLAN.md`](PLAN.md) §13 (live
+process / surface map).
+
+## The four binaries
+
+| Binary | Listens on | Responsibility |
+|---|---|---|
+| `loop46 worker` | `:443` (h2 + TLS) | Client traffic, JS dispatch, raft consensus |
+| `files-server-standalone` | `:8444` (h2 + TLS) | Per-tenant manifests + bytecode |
+| `log-server-standalone` | `:8445` (h2 + TLS) | Per-tenant request log query |
+| `sse-server-standalone` | `:8446` (h2 + TLS) | SSE fan-out from worker emits |
+
+The wildcard cert (`*.loop46.me`) covers all four — each one terminates
+TLS in-process. They share `LOOP46_SERVICES_JWT_SECRET` for service-to-
+service auth (worker mints JWTs at `/_system/services-token`; the three
+standalones verify every request). The worker proposes raft entries
+that the standalones consume; the standalones don't talk to each other.
+
+## Prerequisites
+
+1. **DNS A records** point at the host(s):
+   - `loop46.me`
+   - `*.loop46.me` (wildcard for customer tenants + `app.` + `files.` + `logs.` + `sse.`)
+
+2. **TLS cert** — `scripts/rove-lego-renew.sh` issues a wildcard cert
+   via ACME DNS-01. The systemd timer at `scripts/systemd/rove-cert-renew.timer`
+   keeps it fresh. Cert lives at `~/.rove/tls/{cert,key}.pem`.
+
+3. **S3** — endpoint + region + bucket + access keys. The bucket holds
+   per-tenant blobs, log batches, and snapshots; one bucket per cluster.
+
+4. **Privileged-port bind** — the worker binds `:443`. Either:
+   - lower the kernel threshold once:
+     `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443` (persist
+     under `/etc/sysctl.d/99-rove.conf`), or
+   - grant the cap per-binary:
+     `sudo setcap cap_net_bind_service=+ep ~/.local/bin/loop46`
+     (must re-apply after each `zig build install`)
+
+5. **Edge proxy (optional but recommended).** Per
+   [`http-send-plan.md`](http-send-plan.md) §3.1 rove-h2 is HTTP/2-only
+   and 426s plain HTTP/1.x. A Cloudflare / ALB / nginx in front handles
+   HTTP/1.x clients, h2c, and ALPN negotiation quirks. Direct exposure
+   to the public internet works but rules out older HTTP/1.x clients.
+
+## Install
+
+As the deploy user, **no root**:
+
+```bash
+# Build (Zig 0.15+; system libs nghttp2 + openssl + sqlite3 + libz).
+zig build install -Doptimize=ReleaseFast
+
+# Place binaries on PATH.
+install -D -m 0755 zig-out/bin/loop46                    ~/.local/bin/loop46
+install -D -m 0755 zig-out/bin/files-server-standalone   ~/.local/bin/files-server-standalone
+install -D -m 0755 zig-out/bin/log-server-standalone     ~/.local/bin/log-server-standalone
+install -D -m 0755 zig-out/bin/sse-server-standalone     ~/.local/bin/sse-server-standalone
+
+# If using the per-binary capability path:
+sudo setcap cap_net_bind_service=+ep ~/.local/bin/loop46
+
+# Place the four service units.
+mkdir -p ~/.config/systemd/user
+install -m 0644 scripts/systemd/rove-files-server.service ~/.config/systemd/user/
+install -m 0644 scripts/systemd/rove-log-server.service   ~/.config/systemd/user/
+install -m 0644 scripts/systemd/rove-sse-server.service   ~/.config/systemd/user/
+install -m 0644 scripts/systemd/rove-loop46.service       ~/.config/systemd/user/
+```
+
+## Env files
+
+Five files under `~/.config/rove/`, all `chmod 0600`. The common file
+is read by every service; the others are service-specific.
+
+### `common.env` (shared by all four services)
+
+```ini
+# Shared HMAC for service-to-service JWTs. Generate once, never rotate
+# without simultaneously restarting all four services.
+#   head -c32 /dev/urandom | xxd -p | tr -d '\n'
+LOOP46_SERVICES_JWT_SECRET=<64 hex chars>
+
+# S3 — one bucket per cluster.
+BLOB_BACKEND=s3
+S3_ENDPOINT=s3.us-east-1.amazonaws.com
+S3_REGION=us-east-1
+S3_BUCKET=loop46-prod
+S3_USE_TLS=true
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+# Optional; defaults to empty. Multi-cluster setups use unique prefixes
+# to share a bucket safely.
+S3_KEY_PREFIX_BASE=
+```
+
+### `files-server.env`
+
+```ini
+FILES_LISTEN=127.0.0.1:8444
+DATA_DIR=/home/<user>/.rove/data
+TLS_CERT=/home/<user>/.rove/tls/cert.pem
+TLS_KEY=/home/<user>/.rove/tls/key.pem
+ADMIN_ORIGIN=https://app.loop46.me
+LEADER_URL=https://app.loop46.me
+```
+
+### `log-server.env`
+
+```ini
+LOG_LISTEN=127.0.0.1:8445
+DATA_DIR=/home/<user>/.rove/data
+TLS_CERT=/home/<user>/.rove/tls/cert.pem
+TLS_KEY=/home/<user>/.rove/tls/key.pem
+ADMIN_ORIGIN=https://app.loop46.me
+LOG_S3_KEY_PREFIX=logs/
+LOG_POLL_INTERVAL_MS=500
+```
+
+### `sse-server.env`
+
+```ini
+SSE_LISTEN=127.0.0.1:8446
+TLS_CERT=/home/<user>/.rove/tls/cert.pem
+TLS_KEY=/home/<user>/.rove/tls/key.pem
+# Opaque bearer that the worker stamps on every emit POST. Must match
+# the worker's SSE_INTERNAL_TOKEN in loop46.env.
+SSE_INTERNAL_TOKEN=<32+ random chars>
+```
+
+### `loop46.env`
+
+```ini
+# Raft membership. Single-node: NODE_ID=0, PEERS=<this host>:40146.
+# 3-node cluster: list all three hosts; each NODE_ID is its index.
+NODE_ID=0
+PEERS=10.0.1.10:40146,10.0.1.11:40146,10.0.1.12:40146
+RAFT_LISTEN=10.0.1.10:40146
+
+HTTP_LISTEN=0.0.0.0:443
+DATA_DIR=/home/<user>/.rove/data
+TLS_CERT=/home/<user>/.rove/tls/cert.pem
+TLS_KEY=/home/<user>/.rove/tls/key.pem
+
+PUBLIC_SUFFIX=loop46.me
+ADMIN_API_DOMAIN=app.loop46.me
+ADMIN_ORIGIN=https://app.loop46.me
+
+# The worker tells the dashboard which standalone to hit for files,
+# logs, and SSE. These are the public origins clients connect to —
+# typically the public DNS name + port of each standalone.
+FILES_PUBLIC_BASE=https://files.loop46.me:8444
+LOG_PUBLIC_BASE=https://logs.loop46.me:8445
+SSE_PUBLIC_BASE=https://sse.loop46.me:8446
+
+WORKERS=0          # 0 → nCPU - 1
+LOOP46_ROOT_TOKEN=<64 hex chars>   # bearer for /_system/* + login
+SSE_INTERNAL_TOKEN=<same value as in sse-server.env>
+```
+
+systemd's `EnvironmentFile` does **not** expand `%h`. Write absolute
+paths in env files. The `%h` you see in the unit files is a unit-file
+specifier that systemd substitutes on the unit-file side only.
+
+## Start order
+
+```bash
+# Reload the user manager once after dropping unit files.
+systemctl --user daemon-reload
+
+# Standalones first — the worker has After= on all three.
+systemctl --user enable --now rove-files-server.service
+systemctl --user enable --now rove-log-server.service
+systemctl --user enable --now rove-sse-server.service
+
+# Worker last.
+systemctl --user enable --now rove-loop46.service
+
+# Confirm.
+systemctl --user list-units 'rove-*'
+journalctl --user -u rove-loop46.service -f
+```
+
+If `systemctl --user` returns "Failed to connect to user scope bus" in
+an SSH session, the user manager isn't started for that login. Enable
+linger once so the user manager stays up across logins (required for
+production where you'll log out):
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+## Multi-node cluster
+
+Three nodes is the minimum for raft fault tolerance (one-failure
+quorum). On each host:
+
+- Set `NODE_ID` to that host's index into `PEERS` (0/1/2).
+- Set `RAFT_LISTEN` to that host's address (must be reachable from the
+  other peers — typically a private network address, not loopback).
+- Keep `PEERS` identical on every host.
+- Every host runs all four services. The standalones are not raft
+  members; they're per-host helpers that read shared S3 state.
+
+DNS for `app.` / `files.` / `logs.` / `sse.` should round-robin across
+all three hosts, OR a load balancer should fan out (preferred — handles
+node failure transparently).
+
+A non-voting **learner** can replace one voter for disaster-recovery
+shape (full state, no quorum vote). Add `--node-learner` to the
+worker's args; see `production.md` §1.2 for the lost-quorum recovery
+path via `loop46 promote-learner`.
+
+## Validation
+
+```bash
+# Worker is up and serving:
+curl -sk https://app.loop46.me/_system/leader
+# 200 if this host is leader; 503 + "retry against the cluster leader\n"
+# if it's a follower.
+
+# Standalones return their own /healthz (TLS, JWT-verified for some
+# routes). A bare TCP connect tells you they're listening at all:
+nc -vz localhost 8444
+nc -vz localhost 8445
+nc -vz localhost 8446
+
+# All services running:
+systemctl --user is-active rove-loop46 rove-files-server rove-log-server rove-sse-server
+```
+
+For deeper checks see the smoke scripts in `scripts/*_smoke.sh` —
+they bring up an isolated cluster from scratch and exercise the full
+deploy → fetch → log → SSE round trip.
+
+## Common operational tasks
+
+**Cert rotation.** `rove-cert-renew.timer` runs daily and lego no-ops
+unless within 30 days of expiry. All four binaries stat the cert path
+on each TLS handshake; renewal is picked up without restart.
+
+**Rolling restart.** Restart the standalones any time — they're
+stateless wrt customer traffic. Restart the worker one node at a time
+with `systemctl --user restart rove-loop46` so raft keeps quorum.
+
+**Logs.** Everything goes to journald.
+`journalctl --user -u rove-<unit> --since=-1h` for recent activity.
+
+**Lost quorum.** If you lose ≥2 voters, see `production.md` §1.2 step
+3. `loop46 promote-learner --data-dir ... --allow-single-peer` rebuilds
+a 1-node cluster from a learner's data dir.
+
+**Backup.** `loop46 snapshot --data-dir ...` captures every tenant's
+`app.db` + `__root__.db` into the S3 snapshot store. Restore via
+`loop46 restore-from-snapshot`. Snapshot retention isn't automated yet
+(production.md §8 — TBD).

@@ -577,16 +577,18 @@ without operator hand-holding.
 
 ## Operational gaps
 
-### 4. Operator deployment story for the four binaries
+### 4. Operator deployment story for the four binaries — **done 2026-05-11**
 
-`scripts/rove-loop46-serve.sh` + `scripts/systemd/` exist for the
-loop46 binary. Production also needs systemd units (or equivalent)
-for `files-server-standalone`, `log-server-standalone`,
-`sse-server-standalone`, with the right env wiring
-(`LOOP46_SERVICES_JWT_SECRET`, `SSE_INTERNAL_TOKEN`,
-`BLOB_BACKEND`, S3 creds). Today this is implicit —
-`scripts/dev_serve.sh` fork-execs them for dev; production needs
-documented unit files + a deployment doc.
+Four user-scope systemd units now live under `scripts/systemd/`:
+`rove-loop46.service`, `rove-files-server.service`,
+`rove-log-server.service`, `rove-sse-server.service`. Each reads
+shared env from `~/.config/rove/common.env` (JWT secret, S3 creds,
+blob backend) plus a per-service env file. The worker has `After=`
++ `Wants=` on the three standalones so a clean enable starts them
+in the right order. Full runbook at
+[`deployment.md`](deployment.md) — covers install, env-file shapes,
+multi-node membership, cert rotation, lost-quorum recovery,
+validation curls.
 
 ### 5. TLS reload across all four processes
 
@@ -706,9 +708,8 @@ this is fine, but multi-customer prod with mixed tiers needs it.
    `http.send` with a 4s `fire_at_ns` delay, kills the leader
    during the window, asserts the new leader fires and the
    `on_result` callback lands durably on acme.
-7. **#4 deployment doc + systemd units.** Afternoon's work; turns
-   "I know how to start this" into "an operator can start this."
-   Covers the learner-mode peer config (#1.2).
+7. ~~**#4 deployment doc + systemd units.**~~ Done 2026-05-11.
+   Four user-scope units + `docs/deployment.md` runbook.
 8. **#3 / #5 / #6 / #8.** Each an afternoon.
 9. **#9 / #10 / #11 / #12.** Real work but slot after launch
    unless a specific customer requirement surfaces.
