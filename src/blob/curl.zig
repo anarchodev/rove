@@ -118,6 +118,11 @@ pub const Easy = struct {
     /// background flusher) the mutex acquire is uncontested and
     /// adds nothing measurable.
     mutex: std.Thread.Mutex = .{},
+    /// Set by `EasyPool.init` when this handle is part of a pool.
+    /// `EasyPool.release` reads it back to find the handle's slot
+    /// without a linear scan. Standalone Easies (not from a pool)
+    /// leave this null.
+    pool_index: ?u16 = null,
 
     pub fn init(allocator: std.mem.Allocator) Error!*Easy {
         const handle = c.curl_easy_init() orelse return Error.CurlInitFailed;
@@ -271,6 +276,141 @@ pub const Easy = struct {
         return .{ .status = status, .body = body_owned };
     }
 };
+
+/// Process-wide pool of libcurl `Easy` handles, reused across every
+/// `S3BlobStore` / `HttpBlobStore` in the process. Replaces the
+/// previous one-Easy-per-store pattern: at scale that put a separate
+/// keep-alive TCP+TLS connection in flight for every per-tenant
+/// store × every worker thread × every backend (file-blobs + manifest
+/// + log-blobs), which blew the FD count and the per-connection
+/// libcurl/BoringSSL state into the 8-GB-per-worker range at 1k
+/// active tenants.
+///
+/// Now: one fixed-size pool of N handles. Any caller `acquire()`s a
+/// handle (blocking on a condvar when the pool is exhausted), runs
+/// one request, `release()`s it back. N is the maximum number of
+/// concurrent in-flight S3 requests this process will pipeline.
+///
+/// Default size is 64 (overridable via `ROVE_S3_POOL_SIZE`). That's
+/// large enough to cover the bursty fan-out of the cluster-wide
+/// snapshot tick + the worker-side deployment_loader prefetch, small
+/// enough that 64 × per-Easy memory stays in the low MB.
+pub const EasyPool = struct {
+    allocator: std.mem.Allocator,
+    handles: []*Easy,
+    /// Stack of free indices into `handles`. `free_top` points one
+    /// past the last free entry (free_top == 0 → pool exhausted).
+    free_stack: []u16,
+    free_top: u16,
+    mu: std.Thread.Mutex = .{},
+    cv: std.Thread.Condition = .{},
+
+    pub fn init(allocator: std.mem.Allocator, size: u16) Error!*EasyPool {
+        std.debug.assert(size > 0);
+        const self = try allocator.create(EasyPool);
+        errdefer allocator.destroy(self);
+
+        const handles = try allocator.alloc(*Easy, size);
+        errdefer allocator.free(handles);
+        const free_stack = try allocator.alloc(u16, size);
+        errdefer allocator.free(free_stack);
+
+        var built: u16 = 0;
+        errdefer {
+            var i: u16 = 0;
+            while (i < built) : (i += 1) handles[i].deinit();
+        }
+        while (built < size) : (built += 1) {
+            handles[built] = try Easy.init(allocator);
+            handles[built].pool_index = built;
+            free_stack[built] = built;
+        }
+
+        self.* = .{
+            .allocator = allocator,
+            .handles = handles,
+            .free_stack = free_stack,
+            .free_top = size,
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *EasyPool) void {
+        for (self.handles) |e| e.deinit();
+        self.allocator.free(self.handles);
+        self.allocator.free(self.free_stack);
+        const a = self.allocator;
+        a.destroy(self);
+    }
+
+    /// Block until a handle is free, then return it. Caller MUST
+    /// pair every `acquire` with `release`.
+    pub fn acquire(self: *EasyPool) *Easy {
+        self.mu.lock();
+        defer self.mu.unlock();
+        while (self.free_top == 0) self.cv.wait(&self.mu);
+        self.free_top -= 1;
+        const idx = self.free_stack[self.free_top];
+        return self.handles[idx];
+    }
+
+    pub fn release(self: *EasyPool, easy: *Easy) void {
+        const idx = easy.pool_index orelse @panic("EasyPool.release: Easy not from a pool");
+        self.mu.lock();
+        defer self.mu.unlock();
+        std.debug.assert(self.free_top < self.handles.len);
+        self.free_stack[self.free_top] = idx;
+        self.free_top += 1;
+        self.cv.signal();
+    }
+};
+
+/// Process-wide default pool, lazily initialized on first call. Size
+/// controlled by the `ROVE_S3_POOL_SIZE` environment variable; 64 if
+/// unset.
+var default_pool_done: std.atomic.Value(bool) = .init(false);
+var default_pool_mu: std.Thread.Mutex = .{};
+var default_pool: ?*EasyPool = null;
+var default_pool_err: ?anyerror = null;
+
+fn defaultPoolSize() u16 {
+    const env_str = std.posix.getenv("ROVE_S3_POOL_SIZE") orelse return 64;
+    const trimmed = std.mem.trim(u8, env_str, " \t\n");
+    const parsed = std.fmt.parseInt(u16, trimmed, 10) catch {
+        std.log.warn("rove-blob: invalid ROVE_S3_POOL_SIZE={s}, using default 64", .{trimmed});
+        return 64;
+    };
+    if (parsed == 0) {
+        std.log.warn("rove-blob: ROVE_S3_POOL_SIZE=0 invalid, using default 64", .{});
+        return 64;
+    }
+    return parsed;
+}
+
+/// Return the process-wide default pool. Caller may use a custom
+/// pool instead (passed in via API where supported); the default
+/// keeps the common case zero-config.
+pub fn defaultPool() Error!*EasyPool {
+    if (default_pool_done.load(.acquire)) {
+        if (default_pool) |p| return p;
+        return default_pool_err.? catch Error.CurlInitFailed;
+    }
+    default_pool_mu.lock();
+    defer default_pool_mu.unlock();
+    if (default_pool_done.load(.acquire)) {
+        if (default_pool) |p| return p;
+        return default_pool_err.? catch Error.CurlInitFailed;
+    }
+    globalInit();
+    if (EasyPool.init(std.heap.c_allocator, defaultPoolSize())) |pool| {
+        default_pool = pool;
+    } else |err| {
+        default_pool_err = err;
+    }
+    default_pool_done.store(true, .release);
+    if (default_pool) |p| return p;
+    return Error.CurlInitFailed;
+}
 
 const BodyCursor = struct {
     src: []const u8,

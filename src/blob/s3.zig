@@ -77,11 +77,16 @@ pub const S3BlobStore = struct {
     /// lifetime trap that bites callers who build per-tenant configs
     /// from short-lived allocations (e.g. a per-request key prefix).
     config: Config,
-    /// libcurl handle. One per S3BlobStore instance. Reuse keeps
-    /// the TLS session + TCP connection warm across calls. Not
-    /// thread-safe — callers single-thread access (the worker
-    /// background flusher does this naturally).
-    curl: *curl_mod.Easy,
+    /// Process-wide libcurl handle pool. Each request acquires an
+    /// Easy from the pool, runs the call, returns it. Previous
+    /// design was one Easy per S3BlobStore — at 1k tenants × 4
+    /// worker threads × 2 backends (file-blobs + manifest) per
+    /// tenant that put 8000 persistent S3 connections per process,
+    /// burning FDs + memory. The pool caps total concurrent S3
+    /// requests at its size (default 64, env
+    /// `ROVE_S3_POOL_SIZE`), and the per-request acquire-release
+    /// is uncontended under steady load.
+    pool: *curl_mod.EasyPool,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !S3BlobStore {
         if (config.endpoint.len == 0) {
@@ -137,9 +142,7 @@ pub const S3BlobStore = struct {
         const secret_key_owned = try allocator.dupe(u8, config.secret_key);
         errdefer allocator.free(secret_key_owned);
 
-        curl_mod.globalInit();
-        const curl_easy = curl_mod.Easy.init(allocator) catch return Error.Io;
-        errdefer curl_easy.deinit();
+        const pool = curl_mod.defaultPool() catch return Error.Io;
 
         return .{
             .allocator = allocator,
@@ -152,12 +155,12 @@ pub const S3BlobStore = struct {
                 .secret_key = secret_key_owned,
                 .use_tls = config.use_tls,
             },
-            .curl = curl_easy,
+            .pool = pool,
         };
     }
 
     pub fn deinit(self: *S3BlobStore) void {
-        self.curl.deinit();
+        // Pool is process-wide; not freed here.
         self.allocator.free(self.config.endpoint);
         self.allocator.free(self.config.region);
         self.allocator.free(self.config.bucket);
@@ -319,7 +322,9 @@ pub const S3BlobStore = struct {
 
         std.log.debug("rove-blob s3: → {s} {s}", .{ methodName(method), url });
 
-        const resp = self.curl.request(body_allocator, .{
+        const easy = self.pool.acquire();
+        defer self.pool.release(easy);
+        const resp = easy.request(body_allocator, .{
             .method = method,
             .url = url,
             .headers = &headers,
