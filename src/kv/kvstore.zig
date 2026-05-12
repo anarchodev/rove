@@ -368,13 +368,13 @@ pub const KvStore = struct {
 
         stack.cache = kvexp.PageCache.init(
             allocator,
-            &stack.file,
+            stack.file.api(),
             &stack.pool,
             .{},
         ) catch return Error.OutOfMemory;
         errdefer stack.cache.deinit();
 
-        stack.manifest.init(allocator, &stack.cache, &stack.file) catch return Error.Sqlite;
+        stack.manifest.init(allocator, &stack.cache, stack.file.api()) catch return Error.Sqlite;
         errdefer stack.manifest.deinit();
 
         if (mode == .read_write) {
@@ -488,7 +488,7 @@ pub const KvStore = struct {
     /// Stamp the manifest's last applied raft idx. Cluster-wide on
     /// production loop46.
     pub fn setLastAppliedRaftIdx(self: *KvStore, idx: u64) Error!void {
-        self.manifest.setLastAppliedRaftIdx(idx);
+        self.manifest.setLastAppliedRaftIdx(idx) catch return Error.Sqlite;
     }
 
     /// Prefix scan. Keys whose bytes start with `prefix_bytes`,
@@ -849,14 +849,14 @@ fn writeManifestFile(
 
     var target_cache = kvexp.PageCache.init(
         allocator,
-        &target_file,
+        target_file.api(),
         &target_pool,
         .{},
     ) catch return Error.OutOfMemory;
     defer target_cache.deinit();
 
     var target_manifest: kvexp.Manifest = undefined;
-    target_manifest.init(allocator, &target_cache, &target_file) catch
+    target_manifest.init(allocator, &target_cache, target_file.api()) catch
         return Error.Sqlite;
     defer target_manifest.deinit();
 
@@ -1109,10 +1109,10 @@ test "attached vacuumInto round-trips data via standalone re-open" {
     defer file.close();
     var pool = try kvexp.BufferPool.init(a, kvexp.PAGE_SIZE_DEFAULT, STANDALONE_POOL_PAGES);
     defer pool.deinit(a);
-    var cache = try kvexp.PageCache.init(a, &file, &pool, .{});
+    var cache = try kvexp.PageCache.init(a, file.api(), &pool, .{});
     defer cache.deinit();
     var manifest: kvexp.Manifest = undefined;
-    try manifest.init(a, &cache, &file);
+    try manifest.init(a, &cache, file.api());
     defer manifest.deinit();
 
     const acme_id = hashStoreId("acme");

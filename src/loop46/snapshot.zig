@@ -1164,7 +1164,13 @@ pub fn tickRaftCapture(
     // cluster.kv; intermediate page versions are elided as
     // orphans (kvexp PLAN §7.3). Cost is O(dirty pages),
     // independent of tenant count.
-    cluster.kvexp_manifest.setLastAppliedRaftIdx(apply_position);
+    cluster.kvexp_manifest.setLastAppliedRaftIdx(apply_position) catch |err| {
+        std.log.warn(
+            "snapshot: tickRaftCapture: setLastAppliedRaftIdx failed: {s}",
+            .{@errorName(err)},
+        );
+        return null;
+    };
     cluster.kvexp_manifest.durabilize() catch |err| {
         std.log.warn(
             "snapshot: tickRaftCapture: durabilize failed: {s}",

@@ -440,12 +440,12 @@ pub const Cluster = struct {
 
         const cache_ptr = try allocator.create(kvexp.PageCache);
         errdefer allocator.destroy(cache_ptr);
-        cache_ptr.* = try kvexp.PageCache.init(allocator, file_ptr, pool_ptr, .{});
+        cache_ptr.* = try kvexp.PageCache.init(allocator, file_ptr.api(), pool_ptr, .{});
         errdefer cache_ptr.deinit();
 
         const manifest_ptr = try allocator.create(kvexp.Manifest);
         errdefer allocator.destroy(manifest_ptr);
-        try manifest_ptr.init(allocator, cache_ptr, file_ptr);
+        try manifest_ptr.init(allocator, cache_ptr, file_ptr.api());
         errdefer manifest_ptr.deinit();
 
         self.* = .{
@@ -724,7 +724,13 @@ pub const Cluster = struct {
         // every store; intermediate page versions get elided as
         // orphans (kvexp PLAN §7.3). Cost is O(dirty pages),
         // independent of tenant count.
-        self.kvexp_manifest.setLastAppliedRaftIdx(apply_position);
+        self.kvexp_manifest.setLastAppliedRaftIdx(apply_position) catch |err| {
+            std.log.warn(
+                "cluster.tickSnapshot: setLastAppliedRaftIdx failed: {s}",
+                .{@errorName(err)},
+            );
+            return null;
+        };
         self.kvexp_manifest.durabilize() catch |err| {
             std.log.warn(
                 "cluster.tickSnapshot: durabilize failed: {s}",
