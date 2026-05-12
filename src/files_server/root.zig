@@ -84,10 +84,17 @@ const InstanceCtx = struct {
 
     /// In-place construction. Must be called on a stack-local
     /// `InstanceCtx` — see struct doc for why.
+    ///
+    /// `files_root_kv` is a KvStore handle into the files-server's
+    /// process-wide `files-server.kv` manifest. The per-instance
+    /// files index attaches as a sibling at `hashStoreId(instance_id)`
+    /// — no per-tenant `files.db` file is created (pre-kvexp-cutover
+    /// `{data_dir}/{id}/files.db` files become irrelevant).
     fn init(
         self: *InstanceCtx,
         allocator: std.mem.Allocator,
         data_dir: []const u8,
+        files_root_kv: *kv_mod.KvStore,
         blob_cfg: blob_mod.BackendConfig,
         instance_id: []const u8,
         compile: files_mod.CompileFn,
@@ -95,10 +102,9 @@ const InstanceCtx = struct {
     ) Error!void {
         try validateInstanceId(instance_id);
 
-        // Make sure the instance directory exists. The tenant bootstrap
-        // normally does this, but this module may be asked to upload
-        // into an instance that was created moments ago — don't fail
-        // just because the fs layer is slightly behind.
+        // Instance directory still gets created for sibling
+        // artifacts (file-blobs subdir on fs backend); the per-
+        // instance kv state lives inside files-server.kv though.
         const inst_dir = std.fmt.allocPrint(
             allocator,
             "{s}/{s}",
@@ -107,17 +113,13 @@ const InstanceCtx = struct {
         defer allocator.free(inst_dir);
         std.fs.cwd().makePath(inst_dir) catch return Error.Io;
 
-        const files_db_path = std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/{s}/files.db",
-            .{ data_dir, instance_id },
-            0,
-        ) catch return Error.OutOfMemory;
-        defer allocator.free(files_db_path);
-
         self.allocator = allocator;
-        self.files_kv = kv_mod.KvStore.open(allocator, files_db_path) catch
-            return Error.Kv;
+        self.files_kv = kv_mod.KvStore.attachSibling(
+            allocator,
+            files_root_kv,
+            kv_mod.hashStoreId(instance_id),
+            null,
+        ) catch return Error.Kv;
         errdefer self.files_kv.close();
 
         self.blob_backend = blob_mod.BlobBackend.openPerTenant(
@@ -282,12 +284,13 @@ pub const CheckResult = struct {
 pub fn checkBlobs(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    files_root_kv: *kv_mod.KvStore,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     hashes: []const []const u8,
 ) Error!CheckResult {
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     var list: std.ArrayListUnmanaged([]u8) = .empty;
@@ -317,6 +320,7 @@ pub fn checkBlobs(
 pub fn putBlobByHash(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    files_root_kv: *kv_mod.KvStore,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     claimed_hash: []const u8,
@@ -329,7 +333,7 @@ pub fn putBlobByHash(
     if (!std.mem.eql(u8, claimed_hash, &actual)) return Error.InvalidManifest;
 
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     h.blob_backend.blobStore().put(claimed_hash, bytes) catch return Error.Blob;
@@ -395,6 +399,7 @@ pub const DeployResult = struct {
 pub fn deployManifest(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    files_root_kv: *kv_mod.KvStore,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     entries: []const DeployEntry,
@@ -405,7 +410,7 @@ pub fn deployManifest(
     defer compiler.deinit();
 
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
+    try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
     defer h.deinit();
 
     // ── CAS check: read current deployment pointer BEFORE any write.
@@ -527,6 +532,7 @@ fn openManifestBackend(
 pub fn uploadFile(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    files_root_kv: *kv_mod.KvStore,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     path: []const u8,
@@ -537,7 +543,7 @@ pub fn uploadFile(
     defer compiler.deinit();
 
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
+    try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
     defer h.deinit();
 
     h.store.putSource(path, source) catch |err| return mapCodeError(err);
@@ -549,6 +555,7 @@ pub fn uploadFile(
 pub fn uploadStatic(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    files_root_kv: *kv_mod.KvStore,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     path: []const u8,
@@ -556,7 +563,7 @@ pub fn uploadStatic(
     content_type: []const u8,
 ) Error!void {
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     h.store.putStatic(path, bytes, content_type) catch |err| return mapCodeError(err);
@@ -577,6 +584,7 @@ pub fn uploadStatic(
 pub fn putFileAndDeploy(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    files_root_kv: *kv_mod.KvStore,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     path: []const u8,
@@ -594,14 +602,14 @@ pub fn putFileAndDeploy(
         try compiler.init(allocator);
         defer compiler.deinit();
         var h: InstanceCtx = undefined;
-        try h.init(allocator, data_dir, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
+        try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
         defer h.deinit();
         h.store.putSource(path, body) catch |err| return mapCodeError(err);
         const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
         return writeManifestFromWorkingTree(allocator, &h, blob_cfg, instance_id, cur);
     } else {
         var h: InstanceCtx = undefined;
-        try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
+        try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, stubCompile, null);
         defer h.deinit();
         h.store.putStatic(path, body, content_type) catch |err| return mapCodeError(err);
         const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
@@ -616,6 +624,7 @@ pub fn putFileAndDeploy(
 pub fn deploy(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    files_root_kv: *kv_mod.KvStore,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
 ) Error!u64 {
@@ -623,7 +632,7 @@ pub fn deploy(
     // non-null compile hook. Give it a stub that errors out — if it
     // ever gets called during deploy, something's wrong.
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
@@ -690,11 +699,12 @@ pub fn loadDeployment(
 pub fn loadCurrentManifest(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    files_root_kv: *kv_mod.KvStore,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
 ) Error!files_mod.manifest_json.Manifest {
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
     const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
     if (cur == 0) return Error.NotFound;
@@ -720,12 +730,13 @@ pub const FileContent = struct {
 pub fn readFileByPath(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    files_root_kv: *kv_mod.KvStore,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
     path: []const u8,
 ) Error!FileContent {
     var h: InstanceCtx = undefined;
-    try h.init(allocator, data_dir, blob_cfg, instance_id, stubCompile, null);
+    try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, stubCompile, null);
     defer h.deinit();
 
     var info = h.store.stat(path) catch |err| return mapCodeError(err);

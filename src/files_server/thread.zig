@@ -53,10 +53,18 @@ const CodeH2 = h2.H2(.{});
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    /// Absolute path to `{data_dir}`. Per-tenant `{data_dir}/{id}/files.db`
-    /// + `file-blobs/` open lazily on each request. Borrowed; must
-    /// outlive the handle.
+    /// Absolute path to `{data_dir}`. Holds `{data_dir}/file-blobs/`
+    /// per tenant + (legacy) sibling artifacts; the consolidated
+    /// kvexp manifest lives at `{data_dir}/cluster.kv` (opened
+    /// elsewhere as `files_root_kv`). Borrowed; must outlive the
+    /// handle.
     data_dir: []const u8,
+    /// Process-wide root handle into the files-server's kvexp
+    /// manifest. Every per-instance files-index handle attaches as
+    /// a sibling at `hashStoreId(instance_id)`. Borrowed; the
+    /// spawn caller (files-server-standalone or any in-process
+    /// host) keeps it alive for the handle's lifetime.
+    files_root_kv: *kv.KvStore,
     /// fs / s3 picker for every per-tenant file-blobs backend the
     /// handlers open. Borrowed; must outlive the handle.
     blob_cfg: blob_mod.BackendConfig,
@@ -564,6 +572,7 @@ fn handleBlobsCheck(
     var check = files_server.checkBlobs(
         allocator,
         cfg.data_dir,
+        cfg.files_root_kv,
         cfg.blob_cfg,
         instance_id,
         parsed.value.hashes,
@@ -734,6 +743,7 @@ fn handleDeployments(
     const result = files_server.deployManifest(
         allocator,
         cfg.data_dir,
+        cfg.files_root_kv,
         cfg.blob_cfg,
         instance_id,
         entries.items,
@@ -778,7 +788,7 @@ fn handlePutBlob(
 ) !void {
     const body: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
 
-    files_server.putBlobByHash(allocator, cfg.data_dir, cfg.blob_cfg, instance_id, hash, body) catch |err| {
+    files_server.putBlobByHash(allocator, cfg.data_dir, cfg.files_root_kv, cfg.blob_cfg, instance_id, hash, body) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.InvalidInstanceId, files_server.Error.InvalidManifest => 400,
             else => 500,
@@ -807,7 +817,7 @@ fn handleUpload(
     }
     const source: []const u8 = if (rb.data != null) rb.data.?[0..rb.len] else "";
 
-    files_server.uploadFile(allocator, cfg.data_dir, cfg.blob_cfg, instance_id, x_rove_path, source) catch |err| {
+    files_server.uploadFile(allocator, cfg.data_dir, cfg.files_root_kv, cfg.blob_cfg, instance_id, x_rove_path, source) catch |err| {
         std.log.warn("files-server: uploadFile failed: {s}", .{@errorName(err)});
         const msg = try std.fmt.allocPrint(
             allocator,
@@ -829,7 +839,7 @@ fn handleDeploy(
     sess: h2.Session,
     instance_id: []const u8,
 ) !void {
-    const dep_id = files_server.deploy(allocator, cfg.data_dir, cfg.blob_cfg, instance_id) catch |err| {
+    const dep_id = files_server.deploy(allocator, cfg.data_dir, cfg.files_root_kv, cfg.blob_cfg, instance_id) catch |err| {
         const msg = try std.fmt.allocPrint(
             allocator,
             "deploy failed: {s}\n",
@@ -851,7 +861,7 @@ fn handleList(
     sess: h2.Session,
     instance_id: []const u8,
 ) !void {
-    var manifest = files_server.loadCurrentManifest(allocator, cfg.data_dir, cfg.blob_cfg, instance_id) catch |err| {
+    var manifest = files_server.loadCurrentManifest(allocator, cfg.data_dir, cfg.files_root_kv, cfg.blob_cfg, instance_id) catch |err| {
         if (err == files_server.Error.NotFound) {
             // No deployment yet — empty list, not an error.
             const empty = try std.fmt.allocPrint(
@@ -979,7 +989,7 @@ fn handleGetFile(
         return;
     }
 
-    var content = files_server.readFileByPath(allocator, cfg.data_dir, cfg.blob_cfg, instance_id, file_path) catch |err| {
+    var content = files_server.readFileByPath(allocator, cfg.data_dir, cfg.files_root_kv, cfg.blob_cfg, instance_id, file_path) catch |err| {
         const code: u16 = switch (err) {
             files_server.Error.NotFound => 404,
             files_server.Error.InvalidPath, files_server.Error.InvalidInstanceId => 400,
@@ -1032,6 +1042,7 @@ fn handlePutFile(
     const dep_id = files_server.putFileAndDeploy(
         allocator,
         cfg.data_dir,
+        cfg.files_root_kv,
         cfg.blob_cfg,
         instance_id,
         file_path,

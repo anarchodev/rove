@@ -2186,13 +2186,22 @@ fn deployStarterContent(
     compile_ctx: ?*anyopaque,
     release_ws: *kv_mod.WriteSet,
 ) !void {
+    // Same scratch-only role as bootstrap.zig's
+    // `.bootstrap-scratch.kv` — `files_mod.FileStore.init` demands
+    // a KvStore but nothing persists here (the manifest goes to
+    // S3). Use a per-call tmp kvexp file that gets deleted on
+    // return.
     const files_db_path = try std.fmt.allocPrintSentinel(
         allocator,
-        "{s}/files.db",
+        "{s}/.starter-scratch.kv",
         .{inst_dir},
         0,
     );
-    defer allocator.free(files_db_path);
+    defer {
+        std.fs.cwd().deleteFile(files_db_path) catch {};
+        allocator.free(files_db_path);
+    }
+    std.fs.cwd().deleteFile(files_db_path) catch {};
 
     const files_kv = try kv_mod.KvStore.open(allocator, files_db_path);
     defer files_kv.close();

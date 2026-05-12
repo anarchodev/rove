@@ -443,9 +443,25 @@ pub fn main() !void {
     }
     defer raft_stop.store(true, .release);
 
+    // ── Process-wide files-server kvexp manifest ──────────────
+    //
+    // Cluster mode: the cluster owns its kvexp manifest at
+    // `{data_dir}/cluster.kv`; `cluster.openRoot()` hands out
+    // the root handle the per-instance handlers attach into.
+    // Single-process mode (no --raft-*): open the same file
+    // directly via `openClusterOwned` — when the file is shared
+    // with a future cluster boot, store ids align (both paths
+    // use `hashStoreId("__root__")`).
+    const files_root_kv: *kv.KvStore = if (cluster_opt) |c|
+        try c.openRoot()
+    else
+        try kv.KvStore.openClusterOwned(allocator, cli.data_dir, "__root__");
+    defer if (cluster_opt == null) files_root_kv.close();
+
     const handle = try cs.thread.spawn(.{
         .allocator = allocator,
         .data_dir = cli.data_dir,
+        .files_root_kv = files_root_kv,
         .blob_cfg = blob_owned.cfg,
         .bind_addr = listen_addr,
         .tls_config = tls_config,
