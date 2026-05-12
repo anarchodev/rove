@@ -755,6 +755,12 @@ pub fn installStagedSnapshotIfPresent(
     );
 
     // Walk the staged dir; rename each non-meta file into place.
+    // Under the kvexp consolidation the bundle ships a single
+    // `cluster.kv` entry — it lands at `{data_dir}/cluster.kv`.
+    // The legacy per-tenant `{tenant}__app.db` + `__root__.db` +
+    // `schedules.db` shape is gone; any such files in a stage
+    // dir came from a pre-cutover sender and are skipped with a
+    // warning (raft replay will re-derive their state).
     var stage_dir = try std.fs.cwd().openDir(stage_path, .{ .iterate = true });
     defer stage_dir.close();
 
@@ -766,17 +772,15 @@ pub fn installStagedSnapshotIfPresent(
         const src = try std.fs.path.join(allocator, &.{ stage_path, entry.name });
         defer allocator.free(src);
 
-        // Map bundled name → on-disk path.
-        // - "__root__.db", "schedules.db" → data_dir/<name>
-        // - "<tenant>__app.db"             → data_dir/<tenant>/app.db
-        const dst: []u8 = if (std.mem.endsWith(u8, entry.name, "__app.db")) blk: {
-            const sep = std.mem.indexOf(u8, entry.name, "__app.db") orelse continue;
-            const tenant = entry.name[0..sep];
-            const tenant_dir = try std.fs.path.join(allocator, &.{ data_dir, tenant });
-            defer allocator.free(tenant_dir);
-            try std.fs.cwd().makePath(tenant_dir);
-            break :blk try std.fs.path.join(allocator, &.{ tenant_dir, "app.db" });
-        } else try std.fs.path.join(allocator, &.{ data_dir, entry.name });
+        if (!std.mem.eql(u8, entry.name, "cluster.kv")) {
+            std.log.warn(
+                "loop46: staged file {s} is not cluster.kv — skipping (pre-cutover bundle?)",
+                .{src},
+            );
+            continue;
+        }
+
+        const dst = try std.fs.path.join(allocator, &.{ data_dir, "cluster.kv" });
         defer allocator.free(dst);
 
         // Atomic rename within the same filesystem.
@@ -1134,20 +1138,15 @@ pub fn tickRaftCapture(
     const start_ns = std.time.nanoTimestamp();
     const apply_position = raft.snapshotLastIdx();
 
-    // One stamp: persist the cluster-wide apply idx to
-    // __root__.db so a restart resumes from this floor. Cost
-    // is one row update + WAL append + fsync, independent of
-    // tenant count.
-    const root_store = cluster.openRoot() catch |err| {
+    // Stamp the manifest watermark + durabilize. One fsync
+    // persists every dirty page across every store inside
+    // cluster.kv; intermediate page versions are elided as
+    // orphans (kvexp PLAN §7.3). Cost is O(dirty pages),
+    // independent of tenant count.
+    cluster.kvexp_manifest.setLastAppliedRaftIdx(apply_position);
+    cluster.kvexp_manifest.durabilize() catch |err| {
         std.log.warn(
-            "snapshot: tickRaftCapture: openRoot failed: {s}",
-            .{@errorName(err)},
-        );
-        return null;
-    };
-    root_store.setLastAppliedRaftIdx(apply_position) catch |err| {
-        std.log.warn(
-            "snapshot: tickRaftCapture: setLastAppliedRaftIdx __root__ failed: {s}",
+            "snapshot: tickRaftCapture: durabilize failed: {s}",
             .{@errorName(err)},
         );
         return null;

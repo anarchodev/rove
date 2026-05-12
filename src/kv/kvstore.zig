@@ -617,6 +617,30 @@ pub const KvStore = struct {
     /// file is a single-store kvexp manifest that `KvStore.open`
     /// finds at the conventional location. `target_path` must
     /// not already exist.
+    /// Produce a self-contained copy of this handle's entire
+    /// manifest (every store, not just `self.store_id`) at
+    /// `target_path` as a fresh kvexp file. Used by the raft
+    /// peer-to-peer snapshot transfer — leader dumps cluster.kv
+    /// to a tmp file, ships bytes, follower atomic-renames into
+    /// place. `target_path` must not already exist.
+    pub fn dumpManifestToFile(self: *KvStore, target_path: [:0]const u8) Error!void {
+        // Durabilize source so the manifest tree on disk reflects
+        // every in-memory write. Concurrent durabilize from the
+        // raft thread serializes on `tree_lock`; safe but may
+        // wait.
+        self.manifest.durabilize() catch return Error.Io;
+
+        var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
+        defer snap.close();
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        var w = buf.writer(self.allocator);
+        kvexp.dumpSnapshot(&snap, &w) catch return Error.Sqlite;
+
+        try writeManifestFile(self.allocator, target_path, buf.items);
+    }
+
     pub fn vacuumInto(self: *KvStore, target_path: [:0]const u8) Error!void {
         // Force a durabilize so the manifest tree reflects every
         // in-memory write before we open a snapshot. `Snapshot`'s
@@ -640,39 +664,7 @@ pub const KvStore = struct {
             &buf,
         ) catch return Error.Sqlite;
 
-        // Build a fresh kvexp stack at target_path and replay the
-        // dump into it. Closing the stack runs `durabilize`, leaving
-        // a valid on-disk manifest with one store inside.
-        var target_file = kvexp.PagedFile.open(target_path, .{
-            .create = true,
-            .truncate = true,
-            .page_size = kvexp.PAGE_SIZE_DEFAULT,
-        }) catch return Error.Io;
-        defer target_file.close();
-
-        var target_pool = kvexp.BufferPool.init(
-            self.allocator,
-            kvexp.PAGE_SIZE_DEFAULT,
-            STANDALONE_POOL_PAGES,
-        ) catch return Error.OutOfMemory;
-        defer target_pool.deinit(self.allocator);
-
-        var target_cache = kvexp.PageCache.init(
-            self.allocator,
-            &target_file,
-            &target_pool,
-            .{},
-        ) catch return Error.OutOfMemory;
-        defer target_cache.deinit();
-
-        var target_manifest: kvexp.Manifest = undefined;
-        target_manifest.init(self.allocator, &target_cache, &target_file) catch
-            return Error.Sqlite;
-        defer target_manifest.deinit();
-
-        var stream = std.io.fixedBufferStream(buf.items);
-        _ = kvexp.loadSnapshot(&target_manifest, stream.reader()) catch return Error.Sqlite;
-        target_manifest.durabilize() catch return Error.Io;
+        try writeManifestFile(self.allocator, target_path, buf.items);
     }
 
     // ── Tracked transactions (root-pointer revert) ──────────────
@@ -824,6 +816,48 @@ pub const KvStore = struct {
         // `lastAppliedRaftIdx` reconstructs the rest.
     }
 };
+
+/// Build a fresh kvexp manifest at `target_path` and replay
+/// `dump_bytes` (a kvexp dump-format blob) into it. Closes durabilize
+/// at the end so the file is self-contained. `target_path` must not
+/// already exist. Used by `vacuumInto` and `dumpManifestToFile`.
+fn writeManifestFile(
+    allocator: std.mem.Allocator,
+    target_path: [:0]const u8,
+    dump_bytes: []const u8,
+) Error!void {
+    var target_file = kvexp.PagedFile.open(target_path, .{
+        .create = true,
+        .truncate = true,
+        .page_size = kvexp.PAGE_SIZE_DEFAULT,
+    }) catch return Error.Io;
+    defer target_file.close();
+
+    var target_pool = kvexp.BufferPool.init(
+        allocator,
+        kvexp.PAGE_SIZE_DEFAULT,
+        STANDALONE_POOL_PAGES,
+    ) catch return Error.OutOfMemory;
+    defer target_pool.deinit(allocator);
+
+    var target_cache = kvexp.PageCache.init(
+        allocator,
+        &target_file,
+        &target_pool,
+        .{},
+    ) catch return Error.OutOfMemory;
+    defer target_cache.deinit();
+
+    var target_manifest: kvexp.Manifest = undefined;
+    target_manifest.init(allocator, &target_cache, &target_file) catch
+        return Error.Sqlite;
+    defer target_manifest.deinit();
+
+    var stream = std.io.fixedBufferStream(dump_bytes);
+    _ = kvexp.loadSnapshot(&target_manifest, stream.reader()) catch
+        return Error.Sqlite;
+    target_manifest.durabilize() catch return Error.Io;
+}
 
 /// Write a kvexp-format snapshot dump containing only `src_store_id`'s
 /// records, with the store id rewritten to `dst_store_id` in each KV
