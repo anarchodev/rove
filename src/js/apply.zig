@@ -71,6 +71,17 @@ pub const MAX_ID_LEN: usize = 256;
 
 pub const EnvelopeType = enum(u8) {
     writeset = 0,
+    /// Phase 5.5 (d) — multi-envelope wrapper. Payload is
+    /// `[u8 count][u32 inner_len][inner_envelope_bytes]{count}` where
+    /// each inner envelope is a complete `[type][id_len][id][payload]`
+    /// blob. Inner envelopes apply in order; nesting (a `multi` inside
+    /// a `multi`) panics. The standard envelope `instance_id` is empty
+    /// for type=1 — per-inner-envelope ids carry the real targets.
+    /// Numbered to match `kv.cluster.ENVELOPE_TYPE_MULTI` for the
+    /// migration toward the shared Cluster library (raft-kv-design.md
+    /// step 4). The previous value (7) is retired with the rest of
+    /// the pre-migration types below.
+    multi = 1,
     root_writeset = 2,
     /// Type 3 (`files_writeset`) was retired in Phase 5.5(e)
     /// F2-storage. Manifests live in a per-tenant `deployments/`
@@ -88,14 +99,8 @@ pub const EnvelopeType = enum(u8) {
     /// decoder rejects type=4/5/6 with `UnknownEnvelopeType` so
     /// any old log entries from the pre-retirement window trip the
     /// apply panic at startup — deliberate; the migration window
-    /// predates 1.0.
-    /// Phase 5.5 (d) — multi-envelope wrapper. Payload is
-    /// `[u8 count][u32 inner_len][inner_envelope_bytes]{count}` where
-    /// each inner envelope is a complete `[type][id_len][id][payload]`
-    /// blob. Inner envelopes apply in order; nesting (a `multi` inside
-    /// a `multi`) panics. The standard envelope `instance_id` is empty
-    /// for type=7 — per-inner-envelope ids carry the real targets.
-    multi = 7,
+    /// predates 1.0. Slot 7 (`multi` pre-renumber) is also retired
+    /// here; the new value lives at type 1.
     /// http.send (docs/http-send-plan.md). Payload is a
     /// `schedule_server.encodeUpsertBatch` blob; apply UPSERTs each
     /// row into `{data_dir}/schedules.db`, bumping `version` on
