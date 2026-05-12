@@ -1147,7 +1147,6 @@ pub fn main() !void {
     const cluster = try kv.Cluster.init(.{
         .allocator = allocator,
         .data_dir = cli.data_dir,
-        .store_filename = "app.db",
         .user_ctx = @ptrCast(&loop46_ctx),
         .raft = .{
             .node_id = cli.node_id,

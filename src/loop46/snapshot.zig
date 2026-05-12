@@ -1576,40 +1576,8 @@ test "capture + restore: round-trips tenant + root state into a fresh data_dir" 
     defer std.fs.cwd().deleteTree(root_path) catch {};
     try std.fs.cwd().makePath(root_path);
 
-    // ── Source state: __root__.db + tenant `acme`/app.db ───────
-    {
-        const root_db_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/__root__.db",
-            .{root_path},
-            0,
-        );
-        defer allocator.free(root_db_path);
-        const root_kv = try kv.KvStore.open(allocator, root_db_path);
-        defer root_kv.close();
-        try root_kv.put("tenant/acme", "{}");
-        try root_kv.setLastAppliedRaftIdx(50);
-    }
-
-    const acme_dir = try std.fmt.allocPrint(allocator, "{s}/acme", .{root_path});
-    defer allocator.free(acme_dir);
-    try std.fs.cwd().makePath(acme_dir);
-    const acme_db_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/app.db",
-        .{acme_dir},
-        0,
-    );
-    defer allocator.free(acme_db_path);
-    {
-        const acme_kv = try kv.KvStore.open(allocator, acme_db_path);
-        defer acme_kv.close();
-        try acme_kv.put("greeting", "hello");
-        try acme_kv.put("counter", "42");
-        try acme_kv.setLastAppliedRaftIdx(99);
-    }
-
-    // ── Stand up a raft node + ApplyCtx for the source side ────
+    // ── Stand up a raft node + cluster (kvexp manifest at
+    // {root_path}/cluster.kv) ──
     const raft_log_path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/raft.log.db",
@@ -1627,10 +1595,15 @@ test "capture + restore: round-trips tenant + root state into a fresh data_dir" 
     });
     defer node.deinit();
 
-    const cluster = try kv.Cluster.initWithExternalRaftAndFilename(allocator, root_path, node, "app.db", null);
+    const cluster = try kv.Cluster.initWithExternalRaft(allocator, root_path, node, null);
     defer cluster.deinit();
-    _ = try cluster.openStore("acme");
-    _ = try cluster.openRoot();
+
+    // ── Write source state through the cluster's stores ────────
+    const root_kv = try cluster.openRoot();
+    try root_kv.put("tenant/acme", "{}");
+    const acme_kv = try cluster.openStore("acme");
+    try acme_kv.put("greeting", "hello");
+    try acme_kv.put("counter", "42");
 
     // ── Capture into an FsBatchStore ────────────────────────────
     const store_dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{root_path});
@@ -1809,20 +1782,7 @@ test "capture: end-to-end against FsBatchStore round-trips a tenant db" {
     defer std.fs.cwd().deleteTree(root_path) catch {};
     try std.fs.cwd().makePath(root_path);
 
-    // Plant a `__root__.db` so ApplyCtx can lazy-open it.
-    {
-        const root_db_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/__root__.db",
-            .{root_path},
-            0,
-        );
-        defer allocator.free(root_db_path);
-        const root_kv = try kv.KvStore.open(allocator, root_db_path);
-        root_kv.close();
-    }
-
-    // Stand up a minimal raft node so ApplyCtx.init has something
+    // Stand up a minimal raft node so the cluster has something
     // to point at.
     const raft_log_path = try std.fmt.allocPrintSentinel(
         allocator,
@@ -1841,28 +1801,12 @@ test "capture: end-to-end against FsBatchStore round-trips a tenant db" {
     });
     defer node.deinit();
 
-    // Tenant `acme` with one row.
-    const acme_dir = try std.fmt.allocPrint(allocator, "{s}/acme", .{root_path});
-    defer allocator.free(acme_dir);
-    try std.fs.cwd().makePath(acme_dir);
-    const acme_db_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/app.db",
-        .{acme_dir},
-        0,
-    );
-    defer allocator.free(acme_db_path);
-    {
-        const acme_kv = try kv.KvStore.open(allocator, acme_db_path);
-        defer acme_kv.close();
-        try acme_kv.put("hello", "world");
-        try acme_kv.setLastAppliedRaftIdx(99);
-    }
-
-    const cluster = try kv.Cluster.initWithExternalRaftAndFilename(allocator, root_path, node, "app.db", null);
+    const cluster = try kv.Cluster.initWithExternalRaft(allocator, root_path, node, null);
     defer cluster.deinit();
-    // Trigger lazy-open so stores has acme + root_store is set.
-    _ = try cluster.openStore("acme");
+
+    // Tenant `acme` with one row, written via the cluster.
+    const acme_kv = try cluster.openStore("acme");
+    try acme_kv.put("hello", "world");
     _ = try cluster.openRoot();
 
     // Snapshot store + tmp stage dir.
@@ -1961,18 +1905,6 @@ test "capture: prev_manifest with different tenant set" {
     defer std.fs.cwd().deleteTree(root_path) catch {};
     try std.fs.cwd().makePath(root_path);
 
-    {
-        const root_db_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/__root__.db",
-            .{root_path},
-            0,
-        );
-        defer allocator.free(root_db_path);
-        const root_kv = try kv.KvStore.open(allocator, root_db_path);
-        root_kv.close();
-    }
-
     const raft_log_path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/raft.log.db",
@@ -1990,21 +1922,12 @@ test "capture: prev_manifest with different tenant set" {
     });
     defer node.deinit();
 
-    // Plant only `gamma`, no acme or beta.
-    {
-        const dir = try std.fmt.allocPrint(allocator, "{s}/gamma", .{root_path});
-        defer allocator.free(dir);
-        try std.fs.cwd().makePath(dir);
-        const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{dir}, 0);
-        defer allocator.free(db_path);
-        const ks = try kv.KvStore.open(allocator, db_path);
-        defer ks.close();
-        try ks.put("g", "v");
-    }
-
-    const cluster = try kv.Cluster.initWithExternalRaftAndFilename(allocator, root_path, node, "app.db", null);
+    const cluster = try kv.Cluster.initWithExternalRaft(allocator, root_path, node, null);
     defer cluster.deinit();
-    _ = try cluster.openStore("gamma");
+
+    // Plant only `gamma`, no acme or beta — through the cluster.
+    const gamma_kv = try cluster.openStore("gamma");
+    try gamma_kv.put("g", "v");
     _ = try cluster.openRoot();
 
     // Build a synthetic prev_manifest naming acme/beta with stale

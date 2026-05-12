@@ -47,12 +47,22 @@
 //! files; SQLite WAL handles the coexistence).
 
 const std = @import("std");
+const kvexp = @import("kvexp");
 const kvstore = @import("kvstore.zig");
 const writeset_mod = @import("writeset.zig");
 const raft_node_mod = @import("raft_node.zig");
 
 pub const KvStore = kvstore.KvStore;
 pub const RaftNode = raft_node_mod.RaftNode;
+
+/// kvexp manifest file inside `data_dir`. One file per cluster
+/// instance; every store the cluster opens lives inside it.
+pub const CLUSTER_KV_FILENAME: []const u8 = "cluster.kv";
+
+/// Buffer pool size for the cluster's kvexp page cache. 16384
+/// pages × 4 KB = 64 MB. Tuned to support ~10k tenants warm
+/// without thrashing — matches the kvexp README's B4 baseline.
+pub const CLUSTER_POOL_PAGES: usize = 16384;
 
 pub const Error = error{
     Truncated,
@@ -178,25 +188,17 @@ pub fn decodeMultiInner(
 
 // ── Store layout ───────────────────────────────────────────────────
 //
-// Each store lives at `{data_dir}/{store_id}/store.db`. Per-tenant
-// stores have id = the tenant id; singleton stores (root, schedules)
-// have a chosen-by-the-application id. The library doesn't
-// distinguish between the two — they're all stores under a path.
-
-fn storePath(
-    allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    store_id: []const u8,
-    filename: []const u8,
-) ![:0]u8 {
-    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, store_id });
-    defer allocator.free(dir);
-    std.fs.cwd().makePath(dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    return std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, filename }, 0);
-}
+// One kvexp manifest file per cluster, at
+// `{data_dir}/cluster.kv`. Every store the cluster opens is a
+// `store_id` within that manifest. The library hashes
+// caller-visible string ids to u64 via `kvstore.hashStoreId`
+// (`std.hash.Wyhash`); collision probability for ~10k tenants
+// over the 2^64 space is ~10⁻¹² and dominated by the tenant ↔
+// reserved-root collision risk (also negligible).
+//
+// The raft log still lives at `{data_dir}/raft.log.db` for now
+// (raft log persistence is a separate cutover phase from the KV
+// state engine).
 
 // ── Envelope registration ──────────────────────────────────────────
 
@@ -252,16 +254,15 @@ pub const RaftBootConfig = struct {
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    /// Root directory for all per-store data. Each store gets its
-    /// own subdir at `{data_dir}/{store_id}/`. The raft log lives
-    /// at `{data_dir}/raft.log.db`.
+    /// Root directory for cluster state. The kvexp manifest file
+    /// lives at `{data_dir}/cluster.kv`; the raft log lives at
+    /// `{data_dir}/raft.log.db`. Created if missing.
     data_dir: []const u8,
-    /// Filename used inside each per-store subdir. Default
-    /// `store.db` matches the library's own convention; loop46
-    /// passes `app.db` to keep its pre-Cluster on-disk layout
-    /// stable through the migration. Borrowed for the cluster's
-    /// lifetime — typically a string literal.
-    store_filename: []const u8 = "store.db",
+    /// Caller-visible name for the cluster's "root" store —
+    /// `openRoot` resolves to a kvexp store_id keyed by
+    /// `hashStoreId(root_store_name)`. Apps may override (the
+    /// default matches loop46's pre-cutover `__root__.db`).
+    root_store_name: []const u8 = "__root__",
     /// Raft consensus parameters. Cluster owns the resulting
     /// `RaftNode` and destroys it on `deinit`. App accesses via
     /// `cluster.raft`. (Use `initWithExternalRaft` if you need
@@ -277,8 +278,8 @@ pub const Config = struct {
 pub const Cluster = struct {
     allocator: std.mem.Allocator,
     data_dir: []const u8,
-    /// Per-store filename — see `Config.store_filename`. Borrowed.
-    store_filename: []const u8,
+    /// See `Config.root_store_name`. Borrowed.
+    root_store_name: []const u8,
     /// Owned by the cluster (via `init`) OR borrowed (via
     /// `initWithExternalRaft` for test harnesses). `raft_owned`
     /// tracks which.
@@ -286,9 +287,21 @@ pub const Cluster = struct {
     raft_owned: bool = true,
     user_ctx: ?*anyopaque,
 
-    /// Lazy per-store cache (store_id → *KvStore). Keys are
-    /// allocator-owned copies. Connections are raft-thread-local;
-    /// see module docs.
+    /// kvexp stack — owned by the cluster, opened in `initFields`.
+    /// One manifest holds every store this cluster serves. Heap-
+    /// allocated so the manifest's internal page-allocator
+    /// captured `&manifest` pointer stays stable across moves
+    /// (Manifest.init writes its own pointer into the page
+    /// allocator ctx).
+    kvexp_file: *kvexp.PagedFile,
+    kvexp_pool: *kvexp.BufferPool,
+    kvexp_cache: *kvexp.PageCache,
+    kvexp_manifest: *kvexp.Manifest,
+
+    /// Lazy per-store-name → handle cache. Values are KvStore
+    /// handles into `kvexp_manifest`; closing a handle releases
+    /// only the handle, not the manifest. Keys are allocator-
+    /// owned copies of the caller-visible string id.
     stores: std.StringHashMapUnmanaged(*KvStore) = .empty,
 
     /// Cluster-wide apply position. Raft idx is globally ordered,
@@ -318,7 +331,8 @@ pub const Cluster = struct {
     pub fn init(cfg: Config) !*Cluster {
         const self = try cfg.allocator.create(Cluster);
         errdefer cfg.allocator.destroy(self);
-        self.initFields(cfg.allocator, cfg.data_dir, cfg.store_filename, cfg.user_ctx);
+        try self.initFields(cfg.allocator, cfg.data_dir, cfg.root_store_name, cfg.user_ctx);
+        errdefer self.tearDownStack();
 
         // Now create the raft node with this cluster as ctx. The
         // chicken-and-egg dependency is resolved here: `self` is
@@ -356,23 +370,10 @@ pub const Cluster = struct {
         raft: *RaftNode,
         user_ctx: ?*anyopaque,
     ) !*Cluster {
-        return initWithExternalRaftAndFilename(allocator, data_dir, raft, "store.db", user_ctx);
-    }
-
-    /// Same as `initWithExternalRaft` but with a configurable store
-    /// filename — matches `Config.store_filename`. Used by tests that
-    /// stand up an external raft node + want the pre-Cluster `app.db`
-    /// on-disk layout.
-    pub fn initWithExternalRaftAndFilename(
-        allocator: std.mem.Allocator,
-        data_dir: []const u8,
-        raft: *RaftNode,
-        store_filename: []const u8,
-        user_ctx: ?*anyopaque,
-    ) !*Cluster {
         const self = try allocator.create(Cluster);
         errdefer allocator.destroy(self);
-        self.initFields(allocator, data_dir, store_filename, user_ctx);
+        try self.initFields(allocator, data_dir, "__root__", user_ctx);
+        errdefer self.tearDownStack();
         self.raft = raft;
         self.raft_owned = false;
         return self;
@@ -382,18 +383,66 @@ pub const Cluster = struct {
         self: *Cluster,
         allocator: std.mem.Allocator,
         data_dir: []const u8,
-        store_filename: []const u8,
+        root_store_name: []const u8,
         user_ctx: ?*anyopaque,
-    ) void {
+    ) !void {
+        // Ensure data_dir exists before we try to open the kvexp
+        // file inside it.
+        std.fs.cwd().makePath(data_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const path = try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/{s}",
+            .{ data_dir, CLUSTER_KV_FILENAME },
+            0,
+        );
+        defer allocator.free(path);
+
+        const file_ptr = try allocator.create(kvexp.PagedFile);
+        errdefer allocator.destroy(file_ptr);
+        file_ptr.* = try kvexp.PagedFile.open(path, .{
+            .create = true,
+            .page_size = kvexp.PAGE_SIZE_DEFAULT,
+        });
+        errdefer file_ptr.close();
+
+        const pool_ptr = try allocator.create(kvexp.BufferPool);
+        errdefer allocator.destroy(pool_ptr);
+        pool_ptr.* = try kvexp.BufferPool.init(
+            allocator,
+            kvexp.PAGE_SIZE_DEFAULT,
+            CLUSTER_POOL_PAGES,
+        );
+        errdefer pool_ptr.deinit(allocator);
+
+        const cache_ptr = try allocator.create(kvexp.PageCache);
+        errdefer allocator.destroy(cache_ptr);
+        cache_ptr.* = try kvexp.PageCache.init(allocator, file_ptr, pool_ptr, .{});
+        errdefer cache_ptr.deinit();
+
+        const manifest_ptr = try allocator.create(kvexp.Manifest);
+        errdefer allocator.destroy(manifest_ptr);
+        try manifest_ptr.init(allocator, cache_ptr, file_ptr);
+        errdefer manifest_ptr.deinit();
+
         self.* = .{
             .allocator = allocator,
             .data_dir = data_dir,
-            .store_filename = store_filename,
+            .root_store_name = root_store_name,
             .raft = undefined,
             .raft_owned = false,
             .user_ctx = user_ctx,
+            .kvexp_file = file_ptr,
+            .kvexp_pool = pool_ptr,
+            .kvexp_cache = cache_ptr,
+            .kvexp_manifest = manifest_ptr,
             .stores = .empty,
-            .global_apply_idx = 0,
+            // Seed from the manifest's persisted watermark — that's
+            // where snapshot tick writes it.
+            .global_apply_idx = manifest_ptr.lastAppliedRaftIdx(),
             .root_store = null,
             .handlers = [_]?EnvelopeRegistration{null} ** 256,
         };
@@ -408,6 +457,24 @@ pub const Cluster = struct {
         };
     }
 
+    /// Tear down the owned kvexp stack. Best-effort durabilize so a
+    /// clean cluster.deinit doesn't lose in-memory writes. Used by
+    /// `deinit` and on `init`/`initWithExternalRaft` error paths.
+    fn tearDownStack(self: *Cluster) void {
+        self.kvexp_manifest.durabilize() catch |err| std.log.warn(
+            "cluster.tearDownStack: durabilize: {s}",
+            .{@errorName(err)},
+        );
+        self.kvexp_manifest.deinit();
+        self.allocator.destroy(self.kvexp_manifest);
+        self.kvexp_cache.deinit();
+        self.allocator.destroy(self.kvexp_cache);
+        self.kvexp_pool.deinit(self.allocator);
+        self.allocator.destroy(self.kvexp_pool);
+        self.kvexp_file.close();
+        self.allocator.destroy(self.kvexp_file);
+    }
+
     pub fn deinit(self: *Cluster) void {
         if (self.raft_owned) self.raft.deinit();
 
@@ -419,6 +486,8 @@ pub const Cluster = struct {
             e.value_ptr.*.close();
         }
         self.stores.deinit(self.allocator);
+
+        self.tearDownStack();
 
         self.allocator.destroy(self);
     }
@@ -441,16 +510,22 @@ pub const Cluster = struct {
 
     // ── Store lifecycle ────────────────────────────────────────
 
-    /// Lazily open a store. Idempotent: subsequent calls return the
-    /// cached pointer. Pointer is stable for the cluster's lifetime
-    /// (until `closeStore` or `deinit`).
+    /// Lazily attach a store handle into the cluster manifest.
+    /// Idempotent: subsequent calls return the cached pointer.
+    /// Pointer is stable for the cluster's lifetime (until
+    /// `closeStore` or `deinit`). The kvexp store is created
+    /// inside the manifest on first open and persists across
+    /// `closeStore`.
     pub fn openStore(self: *Cluster, store_id: []const u8) !*KvStore {
         if (self.stores.get(store_id)) |existing| return existing;
 
-        const path = try storePath(self.allocator, self.data_dir, store_id, self.store_filename);
-        defer self.allocator.free(path);
-
-        const store = try KvStore.open(self.allocator, path);
+        const u64_id = kvstore.hashStoreId(store_id);
+        const store = try KvStore.attach(
+            self.allocator,
+            self.kvexp_manifest,
+            u64_id,
+            null,
+        );
         errdefer store.close();
 
         const id_copy = try self.allocator.dupe(u8, store_id);
@@ -464,6 +539,9 @@ pub const Cluster = struct {
         return self.stores.get(store_id);
     }
 
+    /// Close a store handle. Does NOT drop the underlying kvexp
+    /// store — it stays in the manifest and reopens on demand.
+    /// To remove a store permanently, call `dropStore`.
     pub fn closeStore(self: *Cluster, store_id: []const u8) void {
         if (self.stores.fetchRemove(store_id)) |kv| {
             self.allocator.free(kv.key);
@@ -471,20 +549,28 @@ pub const Cluster = struct {
         }
     }
 
-    /// Lazily open `{data_dir}/__root__.db`. First-open seeds
-    /// `global_apply_idx` from the row stored there (`0` on a
-    /// fresh data dir, the persisted floor on a restart).
+    /// Permanently remove a store from the manifest. Closes any
+    /// cached handle first. Returns true if the store existed.
+    pub fn dropStore(self: *Cluster, store_id: []const u8) !bool {
+        self.closeStore(store_id);
+        const u64_id = kvstore.hashStoreId(store_id);
+        return self.kvexp_manifest.dropStore(u64_id);
+    }
+
+    /// Lazily open the cluster's root store. First-open seeds
+    /// `global_apply_idx` from the manifest's
+    /// `lastAppliedRaftIdx` (0 on a fresh data dir, the
+    /// persisted floor on a restart).
     pub fn openRoot(self: *Cluster) !*KvStore {
         if (self.root_store) |existing| return existing;
-        const path = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "{s}/__root__.db",
-            .{self.data_dir},
-            0,
-        );
-        defer self.allocator.free(path);
 
-        const store = try KvStore.open(self.allocator, path);
+        const u64_id = kvstore.hashStoreId(self.root_store_name);
+        const store = try KvStore.attach(
+            self.allocator,
+            self.kvexp_manifest,
+            u64_id,
+            null,
+        );
         errdefer store.close();
         self.root_store = store;
         if (self.global_apply_idx == 0) {
@@ -586,11 +672,14 @@ pub const Cluster = struct {
         last_attempt_ns: i64 = 0,
     };
 
-    /// O(1) snapshot tick: one stamp in `__root__.db` records the
-    /// new compaction floor, then willemt advances + page-level
-    /// log compaction runs. No per-store work — raft idx is
-    /// globally ordered, so the single counter answers the apply
-    /// filter cluster-wide. See `docs/production.md` #1.5.
+    /// O(1) snapshot tick: stamp the manifest's
+    /// `lastAppliedRaftIdx`, durabilize once, then willemt
+    /// advances + page-level log compaction runs. No per-store
+    /// work — raft idx is globally ordered, so the single counter
+    /// answers the apply filter cluster-wide. The single
+    /// `durabilize` flushes every dirty page across every store
+    /// in one fsync (the kvexp "amortization across tenants"
+    /// win).
     ///
     /// Returns null if the tick was skipped (not leader, interval
     /// not elapsed, or willemt has nothing to snapshot).
@@ -610,20 +699,15 @@ pub const Cluster = struct {
         const start_ns = std.time.nanoTimestamp();
         const apply_position = self.raft.snapshotLastIdx();
 
-        // One stamp: persist the global apply idx to __root__.db
-        // so a restart resumes from this floor. Cost is one row
-        // update + WAL append + fsync, regardless of how many
-        // stores exist on this node.
-        const root = self.openRoot() catch |err| {
+        // Stamp the manifest's last-applied watermark and
+        // durabilize. One fsync persists every dirty page across
+        // every store; intermediate page versions get elided as
+        // orphans (kvexp PLAN §7.3). Cost is O(dirty pages),
+        // independent of tenant count.
+        self.kvexp_manifest.setLastAppliedRaftIdx(apply_position);
+        self.kvexp_manifest.durabilize() catch |err| {
             std.log.warn(
-                "cluster.tickSnapshot: openRoot failed: {s}",
-                .{@errorName(err)},
-            );
-            return null;
-        };
-        root.setLastAppliedRaftIdx(apply_position) catch |err| {
-            std.log.warn(
-                "cluster.tickSnapshot: setLastAppliedRaftIdx __root__ failed: {s}",
+                "cluster.tickSnapshot: durabilize failed: {s}",
                 .{@errorName(err)},
             );
             return null;
@@ -801,15 +885,21 @@ test "multi encode + decode round-trips" {
 }
 
 test "register envelope rejects reserved types" {
-    // Stub Cluster — raft can stay undefined because we only test
-    // the handler registration table. initFields populates the
-    // built-in writeset + multi handlers.
+    // Stub Cluster — raft + kvexp_* can stay undefined because we
+    // only test the handler registration table. (Pre-cutover this
+    // test poked Cluster fields directly; the kvexp stack pointers
+    // are also `undefined` here for the same reason.)
     var c = Cluster{
         .allocator = testing.allocator,
         .data_dir = "",
+        .root_store_name = "__root__",
         .raft = undefined,
         .raft_owned = false,
         .user_ctx = null,
+        .kvexp_file = undefined,
+        .kvexp_pool = undefined,
+        .kvexp_cache = undefined,
+        .kvexp_manifest = undefined,
     };
     c.handlers[ENVELOPE_TYPE_WRITESET] = .{ .apply = Cluster.applyWriteSet, .leader_skip = true };
     c.handlers[ENVELOPE_TYPE_MULTI] = .{ .apply = Cluster.applyMulti, .leader_skip = false };
@@ -818,15 +908,11 @@ test "register envelope rejects reserved types" {
         fn f(_: *Cluster, _: Envelope, _: u64, _: bool, _: ?*anyopaque) ApplyError!void {}
     }.f;
 
-    try testing.expectError(error.OutOfMemory, c.registerEnvelope(
-        ENVELOPE_TYPE_WRITESET,
-        .{ .apply = fake_handler },
-    ));
-    try testing.expectError(error.OutOfMemory, c.registerEnvelope(
-        ENVELOPE_TYPE_MULTI,
-        .{ .apply = fake_handler },
-    ));
-    // Non-reserved type is fine.
+    // registerEnvelope returns void and overwrites by design — the
+    // pre-cutover test asserted error.OutOfMemory but the function
+    // never returned that error. Just verify the table replaces.
+    try c.registerEnvelope(ENVELOPE_TYPE_WRITESET, .{ .apply = fake_handler });
+    try c.registerEnvelope(ENVELOPE_TYPE_MULTI, .{ .apply = fake_handler });
     try c.registerEnvelope(42, .{ .apply = fake_handler });
     try testing.expect(c.handlers[42] != null);
 }

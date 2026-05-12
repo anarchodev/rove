@@ -371,8 +371,9 @@ fn loop46Ctx(user_ctx: ?*anyopaque) *Loop46Ctx {
 /// Per-tenant writeset (envelope type=0). Registered with
 /// `leader_skip = true` — the worker already wrote locally via its
 /// own TrackedTxn before proposing, so this only runs on followers.
-/// Library opens the per-tenant store at `{data_dir}/{id}/app.db`
-/// (filename pinned via `Cluster.Config.store_filename = "app.db"`).
+/// Library attaches a store handle for `env.id` (hashed via
+/// `kvstore.hashStoreId`) inside the cluster's node-wide kvexp
+/// manifest at `{data_dir}/cluster.kv`.
 pub fn applyWriteSet(
     cluster: *kv.Cluster,
     env: kv.Envelope,

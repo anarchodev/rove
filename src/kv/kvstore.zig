@@ -531,29 +531,44 @@ pub const KvStore = struct {
     }
 
     /// Produce a self-contained copy of this KvStore's data at
-    /// `target_path` as a fresh kvexp manifest file. Receivers
-    /// open it via `KvStore.open(target_path)` and see the same
-    /// store contents as the source.
+    /// `target_path` as a fresh kvexp manifest file holding one
+    /// store at `STANDALONE_STORE_ID`. Receivers open it via
+    /// `KvStore.open(target_path)` and see the same data as the
+    /// source.
     ///
-    /// Implementation: dump this manifest's snapshot through a
-    /// freshly-initialized manifest at the target path. That
-    /// produces a clean, defragmented file (matches the pre-cutover
-    /// `VACUUM INTO` semantics — no orphan pages, no free-list
-    /// residue). `target_path` must not already exist.
+    /// The dumped bytes are filtered to this handle's `store_id`
+    /// (so an attached KvStore sharing a Cluster's manifest
+    /// captures only its own tenant) and the store_id is remapped
+    /// to `STANDALONE_STORE_ID` in the wire format, so the target
+    /// file is a single-store kvexp manifest that `KvStore.open`
+    /// finds at the conventional location. `target_path` must
+    /// not already exist.
     pub fn vacuumInto(self: *KvStore, target_path: [:0]const u8) Error!void {
+        // Force a durabilize so the manifest tree reflects every
+        // in-memory write before we open a snapshot. `Snapshot`'s
+        // store-root lookups go through the on-disk manifest tree
+        // (not the hot-path `store_root_cache`), so without this
+        // an in-memory-only write would be invisible to the dump.
+        self.manifest.durabilize() catch return Error.Io;
+
         var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
         defer snap.close();
 
-        // Dump source snapshot to an in-memory buffer.
+        // Dump just this store's records, remapped to
+        // STANDALONE_STORE_ID, into an in-memory buffer.
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
-        var w = buf.writer(self.allocator);
-        kvexp.dumpSnapshot(&snap, &w) catch return Error.Sqlite;
+        dumpOneStoreRemapped(
+            self.allocator,
+            &snap,
+            self.store_id,
+            STANDALONE_STORE_ID,
+            &buf,
+        ) catch return Error.Sqlite;
 
         // Build a fresh kvexp stack at target_path and replay the
         // dump into it. Closing the stack runs `durabilize`, leaving
-        // a valid on-disk manifest with one store inside (id =
-        // STANDALONE_STORE_ID, matching `KvStore.open`'s convention).
+        // a valid on-disk manifest with one store inside.
         var target_file = kvexp.PagedFile.open(target_path, .{
             .create = true,
             .truncate = true,
@@ -736,6 +751,46 @@ pub const KvStore = struct {
     }
 };
 
+/// Write a kvexp-format snapshot dump containing only `src_store_id`'s
+/// records, with the store id rewritten to `dst_store_id` in each KV
+/// record. The output is loadable via `kvexp.loadSnapshot` and
+/// produces a manifest with a single store at `dst_store_id`. Used by
+/// `KvStore.vacuumInto` to capture an attached handle's tenant data
+/// without dragging in the rest of the cluster.
+fn dumpOneStoreRemapped(
+    allocator: std.mem.Allocator,
+    snap: *kvexp.Snapshot,
+    src_store_id: u64,
+    dst_store_id: u64,
+    out: *std.ArrayList(u8),
+) !void {
+    const SNAP_TAG_KV: u8 = kvexp.manifest.SNAP_TAG_KV;
+    const SNAP_TAG_END: u8 = kvexp.manifest.SNAP_TAG_END;
+
+    var w = out.writer(allocator);
+    try w.writeInt(u32, kvexp.SNAPSHOT_MAGIC, .little);
+    try w.writeByte(kvexp.SNAPSHOT_VERSION);
+    try w.writeInt(u64, snap.snap_seq, .little);
+    try w.writeInt(u64, snap.manifest.last_applied_raft_idx, .little);
+
+    if (try snap.storeRoot(src_store_id) != null) {
+        var cursor = try snap.scanPrefix(src_store_id, "");
+        defer cursor.deinit();
+        while (try cursor.next()) {
+            const k = cursor.key();
+            const v = cursor.value();
+            try w.writeByte(SNAP_TAG_KV);
+            try w.writeInt(u64, dst_store_id, .little);
+            try w.writeInt(u16, @intCast(k.len), .little);
+            try w.writeInt(u16, @intCast(v.len), .little);
+            try w.writeAll(k);
+            try w.writeAll(v);
+        }
+    }
+
+    try w.writeByte(SNAP_TAG_END);
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -916,6 +971,57 @@ test "tracked txn savepoint + rollbackTo" {
         try testing.expectEqualStrings("first", v);
     }
     try txn.commit();
+}
+
+test "attached vacuumInto round-trips data via standalone re-open" {
+    // Mirrors the snapshot.zig capture+restore pattern: cluster
+    // holds the manifest, attached handle calls vacuumInto, a
+    // fresh standalone KvStore opens the resulting file and reads
+    // the data back.
+    const a = testing.allocator;
+
+    var path_buf: [96]u8 = undefined;
+    const src_path = std.fmt.bufPrintZ(&path_buf, "/tmp/rove-kv-vac-src-{x}.kv", .{
+        @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))),
+    }) catch unreachable;
+    defer cleanupDb(src_path);
+
+    // Build a kvexp stack outside any KvStore so we can attach.
+    var file = try kvexp.PagedFile.open(src_path, .{
+        .create = true,
+        .page_size = kvexp.PAGE_SIZE_DEFAULT,
+    });
+    defer file.close();
+    var pool = try kvexp.BufferPool.init(a, kvexp.PAGE_SIZE_DEFAULT, STANDALONE_POOL_PAGES);
+    defer pool.deinit(a);
+    var cache = try kvexp.PageCache.init(a, &file, &pool, .{});
+    defer cache.deinit();
+    var manifest: kvexp.Manifest = undefined;
+    try manifest.init(a, &cache, &file);
+    defer manifest.deinit();
+
+    const acme_id = hashStoreId("acme");
+    const ks = try KvStore.attach(a, &manifest, acme_id, null);
+    defer ks.close();
+
+    try ks.put("greeting", "hello");
+    try ks.put("counter", "42");
+
+    var dump_path_buf: [96]u8 = undefined;
+    const dump_path = std.fmt.bufPrintZ(&dump_path_buf, "/tmp/rove-kv-vac-dst-{x}.kv", .{
+        @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))),
+    }) catch unreachable;
+    defer cleanupDb(dump_path);
+    try ks.vacuumInto(dump_path);
+
+    var dst = try KvStore.open(a, dump_path);
+    defer dst.close();
+    const v1 = try dst.get("greeting");
+    defer a.free(v1);
+    try testing.expectEqualStrings("hello", v1);
+    const v2 = try dst.get("counter");
+    defer a.free(v2);
+    try testing.expectEqualStrings("42", v2);
 }
 
 test "lastAppliedRaftIdx round-trips through manifest" {
