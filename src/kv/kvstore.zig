@@ -530,14 +530,60 @@ pub const KvStore = struct {
         return .{ .log_pages = 0, .ckpt_pages = 0 };
     }
 
-    /// `VACUUM INTO target` was the SQLite-era snapshot-capture
-    /// primitive. Under kvexp the equivalent is `kvexp.dumpSnapshot`
-    /// against `manifest.openSnapshot()`. Returns `Error.Sqlite` to
-    /// surface unmigrated callers loudly.
+    /// Produce a self-contained copy of this KvStore's data at
+    /// `target_path` as a fresh kvexp manifest file. Receivers
+    /// open it via `KvStore.open(target_path)` and see the same
+    /// store contents as the source.
+    ///
+    /// Implementation: dump this manifest's snapshot through a
+    /// freshly-initialized manifest at the target path. That
+    /// produces a clean, defragmented file (matches the pre-cutover
+    /// `VACUUM INTO` semantics — no orphan pages, no free-list
+    /// residue). `target_path` must not already exist.
     pub fn vacuumInto(self: *KvStore, target_path: [:0]const u8) Error!void {
-        _ = self;
-        _ = target_path;
-        return Error.Sqlite;
+        var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
+        defer snap.close();
+
+        // Dump source snapshot to an in-memory buffer.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        var w = buf.writer(self.allocator);
+        kvexp.dumpSnapshot(&snap, &w) catch return Error.Sqlite;
+
+        // Build a fresh kvexp stack at target_path and replay the
+        // dump into it. Closing the stack runs `durabilize`, leaving
+        // a valid on-disk manifest with one store inside (id =
+        // STANDALONE_STORE_ID, matching `KvStore.open`'s convention).
+        var target_file = kvexp.PagedFile.open(target_path, .{
+            .create = true,
+            .truncate = true,
+            .page_size = kvexp.PAGE_SIZE_DEFAULT,
+        }) catch return Error.Io;
+        defer target_file.close();
+
+        var target_pool = kvexp.BufferPool.init(
+            self.allocator,
+            kvexp.PAGE_SIZE_DEFAULT,
+            STANDALONE_POOL_PAGES,
+        ) catch return Error.OutOfMemory;
+        defer target_pool.deinit(self.allocator);
+
+        var target_cache = kvexp.PageCache.init(
+            self.allocator,
+            &target_file,
+            &target_pool,
+            .{},
+        ) catch return Error.OutOfMemory;
+        defer target_cache.deinit();
+
+        var target_manifest: kvexp.Manifest = undefined;
+        target_manifest.init(self.allocator, &target_cache, &target_file) catch
+            return Error.Sqlite;
+        defer target_manifest.deinit();
+
+        var stream = std.io.fixedBufferStream(buf.items);
+        _ = kvexp.loadSnapshot(&target_manifest, stream.reader()) catch return Error.Sqlite;
+        target_manifest.durabilize() catch return Error.Io;
     }
 
     // ── Tracked transactions (root-pointer revert) ──────────────

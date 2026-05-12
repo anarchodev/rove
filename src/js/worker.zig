@@ -2258,114 +2258,21 @@ fn deployStarterContent(
 
 const testing = std.testing;
 
-test "openTenantFiles runs the orphan sweep on startup" {
-    // Simulates the crash recovery scenario:
-    //   1. A previous worker run did `beginTrackedImmediate` + put + commit
-    //      (the local SQLite txn is durable, the kv_undo row exists).
-    //   2. The previous worker crashed before calling commitTxn — so the
-    //      kv_undo row never got dropped.
-    //   3. New worker starts, openTenantFiles runs, recoverOrphans(0)
-    //      walks kv_undo and rolls back the orphan write.
-    //
-    // This is the durability hole #34 was tracking. Without the sweep,
-    // the orphan write would remain visible in the tenant store even
-    // though raft never committed it — split-brain across nodes.
-
-    const allocator = testing.allocator;
-    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-js-sweep-{x}", .{seed});
-    defer allocator.free(tmp_dir);
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-
-    const root_path = try std.fmt.allocPrintSentinel(allocator, "{s}/__root__.db", .{tmp_dir}, 0);
-    defer allocator.free(root_path);
-    const root_kv = try kv_mod.KvStore.open(allocator, root_path);
-    defer root_kv.close();
-
-    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, tmp_dir);
-    defer tenant.destroy();
-
-    try tenant.createInstance("acme");
-    const inst = tenant.instances.get("acme").?;
-
-    // Plant an orphan: tracked txn + commit + skip commitTxn.
-    {
-        var txn = try inst.kv.beginTrackedImmediate();
-        try txn.put("orphan-key", "orphan-value");
-        try txn.commit();
-        // Intentionally NOT calling inst.kv.commitTxn(txn.txn_seq) —
-        // this is what a crash between local commit and raft commit
-        // would leave behind.
-    }
-
-    // Forward write is currently visible (the orphan).
-    const before = try inst.kv.get("orphan-key");
-    allocator.free(before);
-
-    // Simulate worker startup: openTenantFiles runs the sweep.
-    const FakeWorker = struct {
-        allocator: std.mem.Allocator,
-        blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
-        manifest_http: ?ManifestHttpConfig = null,
-        manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest) = null,
-        manifest_easy: ?*blob_mod.curl.Easy = null,
-    };
-    var fake = FakeWorker{ .allocator = allocator };
-    const tc = try openTenantFiles(&fake, inst);
-    defer freeTenantFiles(allocator, tc);
-
-    // After the sweep, the orphan write is gone.
-    try testing.expectError(error.NotFound, inst.kv.get("orphan-key"));
-}
-
-test "commitTxn drops the undo row so the next sweep is a no-op" {
-    // Inverse of the first test: a write that DID get the commitTxn
-    // call should survive across a Worker.create / openTenantFiles
-    // cycle. Proves the happy-path GC actually clears the undo row.
-    const allocator = testing.allocator;
-    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-js-commit-{x}", .{seed});
-    defer allocator.free(tmp_dir);
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-
-    const root_path = try std.fmt.allocPrintSentinel(allocator, "{s}/__root__.db", .{tmp_dir}, 0);
-    defer allocator.free(root_path);
-    const root_kv = try kv_mod.KvStore.open(allocator, root_path);
-    defer root_kv.close();
-
-    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, tmp_dir);
-    defer tenant.destroy();
-
-    try tenant.createInstance("acme");
-    const inst = tenant.instances.get("acme").?;
-
-    {
-        var txn = try inst.kv.beginTrackedImmediate();
-        try txn.put("durable-key", "durable-value");
-        try txn.commit();
-        try inst.kv.commitTxn(txn.txn_seq); // happy-path GC
-    }
-
-    // Worker startup runs the sweep; should NOT touch durable-key.
-    const FakeWorker = struct {
-        allocator: std.mem.Allocator,
-        blob_backend_cfg: blob_mod.BackendConfig = .{ .endpoint = "x.invalid", .region = "x", .bucket = "x", .access_key = "x", .secret_key = "x" },
-        manifest_http: ?ManifestHttpConfig = null,
-        manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest) = null,
-        manifest_easy: ?*blob_mod.curl.Easy = null,
-    };
-    var fake = FakeWorker{ .allocator = allocator };
-    const tc = try openTenantFiles(&fake, inst);
-    defer freeTenantFiles(allocator, tc);
-
-    const v = try inst.kv.get("durable-key");
-    defer allocator.free(v);
-    try testing.expectEqualStrings("durable-value", v);
-}
+// Pre-cutover this file held two tests:
+//   - "openTenantFiles runs the orphan sweep on startup"
+//   - "commitTxn drops the undo row so the next sweep is a no-op"
+// Both exercised the SQLite-era `kv_undo` table + the recoverOrphans
+// sweep. Under kvexp with deferred-durabilize the orphan scenario is
+// structurally impossible: writes mutate the in-memory page cache
+// only, durabilize is gated on the raft thread's tick, and a crash
+// before durabilize loses the in-memory state entirely. The in-flight
+// rollback case (raft rejects a still-pending proposal) is covered by
+// `TrackedTxn.rollback`'s root-pointer revert — see kvstore.zig's
+// "tracked txn rollback reverts pre_root" test.
+//
+// Tests intentionally removed rather than kept as skipped — they were
+// asserting an invariant that no longer exists, and a "this test is
+// disabled" comment with dead code is misleading.
 
 test "captureLog appends a record to the worker's node-wide buffer" {
     // Verifies the captureLog helper end to end: build a fake worker
