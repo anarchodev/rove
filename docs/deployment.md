@@ -41,11 +41,38 @@ that the standalones consume; the standalones don't talk to each other.
      `sudo setcap cap_net_bind_service=+ep ~/.local/bin/loop46`
      (must re-apply after each `zig build install`)
 
-5. **Edge proxy (optional but recommended).** Per
-   [`http-send-plan.md`](http-send-plan.md) §3.1 rove-h2 is HTTP/2-only
-   and 426s plain HTTP/1.x. A Cloudflare / ALB / nginx in front handles
-   HTTP/1.x clients, h2c, and ALPN negotiation quirks. Direct exposure
-   to the public internet works but rules out older HTTP/1.x clients.
+5. **Edge proxy (required for public-internet deployments).** rove-h2
+   is HTTP/2-only. TLS clients without h2 ALPN fail the handshake
+   silently; plaintext HTTP/1.x clients get a 426 Upgrade Required.
+   An L7 reverse proxy in front of the worker translates HTTP/1.x ↔
+   h2 so old clients work, terminates client TLS, and adds the
+   `X-Forwarded-*` headers the worker uses for client-IP and
+   missing-proxy detection. Any of Cloudflare, AWS ALB, GCP Load
+   Balancer, nginx, or HAProxy works.
+
+   The worker logs a warning at startup-plus-N-requests if no
+   `X-Forwarded-For` header is observed in the first 100 requests —
+   that's the most common "operator forgot the proxy" shape. See
+   [`http-send-plan.md`](http-send-plan.md) §3.1 for the
+   underlying h2-only design rationale.
+
+   **Minimum proxy configuration:**
+
+   - Terminate client TLS at the proxy with a wildcard cert (or your
+     own cert chain).
+   - Speak h2 (or h2c, on the same private network) to the rove
+     worker on port 443. Most managed proxies do this by default.
+     For nginx: `proxy_pass https://worker:443; proxy_http_version 2;`.
+   - Add `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`
+     headers. Cloudflare and ALB do this automatically. For nginx:
+     `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`
+     plus the other two.
+   - Forward to the worker pool (round-robin or sticky-by-IP both
+     work — workers don't keep session state across the request
+     boundary; raft replicates everything that matters).
+
+   For development against `127.0.0.1` the proxy is unnecessary
+   and the missing-XFF warning is informational only.
 
 ## Install
 

@@ -36,6 +36,45 @@ const session_mod = @import("session.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
 const sse_token_mod = @import("sse_token.zig");
 
+// Edge-proxy detection. rove-h2 is HTTP/2-only and TLS deployments
+// rely on ALPN — direct exposure to the public internet silently
+// loses any HTTP/1.x client whose ALPN handshake doesn't pick h2.
+// Production needs an L7 reverse proxy (Cloudflare / ALB / nginx)
+// that terminates client TLS and re-encrypts to rove with h2 ALPN.
+//
+// We can't conclusively detect "no proxy", but we can flag the most
+// common forgotten-proxy shape: every HTTP-aware proxy stamps an
+// `X-Forwarded-For` header. After PROXY_WARN_THRESHOLD requests with
+// zero XFF observed, we log a one-shot warning pointing at the
+// deployment doc. Smoke tests and bench harnesses trip this too —
+// acceptable; "you have no proxy" is technically correct there.
+const PROXY_WARN_THRESHOLD: u64 = 100;
+var proxy_xff_seen: std.atomic.Value(bool) = .{ .raw = false };
+var proxy_request_count: std.atomic.Value(u64) = .{ .raw = 0 };
+var proxy_warning_logged: std.atomic.Value(bool) = .{ .raw = false };
+
+fn checkProxyWarning(rh: h2.ReqHeaders) void {
+    if (proxy_warning_logged.load(.monotonic)) return;
+    if (!proxy_xff_seen.load(.monotonic)) {
+        if (respb.findHeader(rh, "x-forwarded-for") != null) {
+            proxy_xff_seen.store(true, .monotonic);
+            return;
+        }
+    }
+    const n = proxy_request_count.fetchAdd(1, .monotonic) + 1;
+    if (n >= PROXY_WARN_THRESHOLD and !proxy_xff_seen.load(.monotonic)) {
+        if (!proxy_warning_logged.swap(true, .monotonic)) {
+            std.log.warn(
+                "rove-h2: no X-Forwarded-For header seen in {d} requests. " ++
+                    "rove-h2 is HTTP/2-only; if this worker faces the public " ++
+                    "internet you need an edge proxy (Cloudflare / ALB / nginx) " ++
+                    "translating HTTP/1.x → h2. See docs/deployment.md.",
+                .{n},
+            );
+        }
+    }
+}
+
 const Request = dispatcher_mod.Request;
 const RaftWait = worker_mod.RaftWait;
 
@@ -1313,6 +1352,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const path = respb.findHeader(rh, ":path") orelse "/";
         const authority = respb.findHeader(rh, ":authority") orelse "";
         const body: []const u8 = if (req_body.data) |p| p[0..req_body.len] else "";
+
+        checkProxyWarning(rh);
 
         // `/_system/*` — CORS gate, then auth + system route dispatch.
         if (try tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh, body)) {

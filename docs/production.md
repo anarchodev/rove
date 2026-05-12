@@ -618,13 +618,18 @@ Smoke-tested by spawning sse-server with the dev cert, `touch`ing
 the cert, and observing `info: tls: cert/key reloaded` in stderr
 within ~1s.
 
-### 6. Edge proxy requirement documented + verified
+### 6. Edge proxy requirement documented + verified — **done 2026-05-11**
 
-Per [`http-send-plan.md`](http-send-plan.md) §3.1, production needs an
-edge proxy (Cloudflare / ALB / nginx) handling HTTP/1.x ↔ h2 —
-rove-h2 is h2-only and 426s plain HTTP/1.x. Need a deployment doc
-+ a startup warning when no proxy is detected (today there's no
-warning).
+`docs/deployment.md` "Prerequisites" §5 now lists the edge proxy as
+required for public-internet deployments, with minimum proxy config
+(TLS termination, h2 to backend, `X-Forwarded-*` headers).
+
+Worker-side detection: `checkProxyWarning` in `src/js/worker_dispatch.zig`
+watches every dispatched request for an `X-Forwarded-For` header.
+If 100 requests go by without one, it logs a one-shot warning
+pointing at the deployment doc. False positive on smokes / bench
+harnesses is acceptable — they're literally "you have no proxy"
+deployments.
 
 ### 7. Multi-node smoke covering leader failover — **done 2026-05-11**
 
@@ -760,6 +765,8 @@ this is fine, but multi-customer prod with mixed tiers needs it.
    the standalones.
 10. ~~**#8 backup automation.**~~ Done 2026-05-11 (lean version —
     daily timer + leader-only wrapper + S3 lifecycle for retention).
-11. **#6.** Afternoon's work.
+11. ~~**#6 edge proxy doc + startup warning.**~~ Done 2026-05-11.
+    Updated deployment.md prerequisites + missing-XFF detection in
+    `src/js/worker_dispatch.zig`.
 12. **#9 / #10 / #11 / #12.** Real work but slot after launch
    unless a specific customer requirement surfaces.
