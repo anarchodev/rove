@@ -265,7 +265,101 @@ floor. End-to-end smoke at `scripts/snap_catchup_smoke.sh` (which
 simulates the supervisor by re-spawning manually — production has
 systemd do it).
 
-**Backup.** `loop46 snapshot --data-dir ...` captures every tenant's
-`app.db` + `__root__.db` into the S3 snapshot store. Restore via
-`loop46 restore-from-snapshot`. Snapshot retention isn't automated yet
-(production.md §8 — TBD).
+**Backup.** See "Backup automation" below — `rove-snapshot.timer`
+fires `loop46 snapshot` daily; leader-only via wrapper script.
+
+## Backup automation
+
+Daily snapshot capture is wired through a user-scoped systemd timer.
+Each pass:
+
+1. The timer fires `rove-snapshot.service` on every node.
+2. The service runs `rove-snapshot-pass.sh`, which probes
+   `https://127.0.0.1:$PORT/_system/leader`. Followers exit 0 in
+   under a millisecond — only the leader proceeds.
+3. The leader runs `loop46 snapshot --data-dir $DATA_DIR`. Each
+   tenant's `app.db` plus `__root__.db` get `VACUUM INTO`-ed into a
+   staging dir, sha256'd, uploaded to S3 under
+   `cluster/snapshots/{snap_id}/`. A `manifest.json` ties the
+   sha256s together.
+
+**Install:**
+
+```bash
+install -D -m 0755 scripts/rove-snapshot-pass.sh \
+    ~/.local/bin/rove-snapshot-pass.sh
+install -D -m 0644 scripts/systemd/rove-snapshot.service \
+    ~/.config/systemd/user/rove-snapshot.service
+install -D -m 0644 scripts/systemd/rove-snapshot.timer \
+    ~/.config/systemd/user/rove-snapshot.timer
+systemctl --user daemon-reload
+systemctl --user enable --now rove-snapshot.timer
+
+# Force a first capture (also a good wiring smoke):
+systemctl --user start rove-snapshot.service
+journalctl --user -u rove-snapshot.service -n 30
+# expect: "captured snapshot <14hex-12hex>"
+```
+
+Default cadence is daily at 02:00 with 1h jitter. For a tighter
+recovery-point objective, edit `rove-snapshot.timer`:
+
+```ini
+OnCalendar=hourly                        # 24× the S3 PUT count
+OnCalendar=*-*-* 02,14:00:00             # twice-daily
+```
+
+**Retention via S3 lifecycle.** rove doesn't prune snapshots itself.
+Configure the bucket's lifecycle policy to expire old keys under
+`cluster/snapshots/`:
+
+```json
+{
+  "Rules": [{
+    "ID": "loop46-snapshot-retention",
+    "Status": "Enabled",
+    "Filter": { "Prefix": "cluster/snapshots/" },
+    "Expiration": { "Days": 30 }
+  }]
+}
+```
+
+Apply with:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+    --bucket loop46-prod \
+    --lifecycle-configuration file://lifecycle.json
+```
+
+This is a sledgehammer — "anything older than 30 days is dead". For
+graded retention (keep 7 daily + 4 weekly + 12 monthly), you'd need
+either a custom pruner CLI or to write a periodic job that
+selectively deletes by snap_id. Out of scope here; flag if needed.
+
+**Restoring from a snapshot.**
+
+```bash
+# 1. List available snapshots (manifests live at
+#    s3://$S3_BUCKET/cluster/snapshots/{snap_id}/manifest.json):
+aws s3 ls "s3://$S3_BUCKET/cluster/snapshots/" | tail -20
+
+# 2. On a FRESH node (no prior tenant dbs in $DATA_DIR), install:
+loop46 restore-from-snapshot \
+    --snap-id <snap_id_from_step_1> \
+    --data-dir $DATA_DIR
+
+# 3. Start the worker normally. Raft picks up from snap_last_idx
+#    recorded in the manifest. For a full-cluster restore (lost all
+#    nodes), do this on one host and let it become a single-node
+#    cluster via `--peers <self>:40146`, then add learners + promote
+#    per the lost-quorum recovery path.
+```
+
+Manifests carry `apply_position=0` by default (the offline capture
+CLI doesn't have access to the running raft node's commit idx).
+Restored nodes therefore replay every committed raft entry post-
+snapshot — correct but more work than a "live" snapshot would
+require. Not a concern for disaster recovery; would be a concern
+for "promote a follower from a recent snapshot" which isn't a flow
+we expose today.

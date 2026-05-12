@@ -645,12 +645,33 @@ sse-server `rove:resync` after failover is exercised by the
 existing `scripts/sse_server_smoke.sh` (a separate smoke
 focused on the sse-server process surface).
 
-### 8. Backup automation
+### 8. Backup automation — **done 2026-05-11** (lean)
 
-Snapshot CLI exists; no cron-driven invocation, no retention
-policy enforcement, no operator runbook for "S3 snapshot directory
-got too big" or "I need to restore from yesterday's snapshot to a
-fresh cluster."
+Daily `rove-snapshot.timer` invokes `rove-snapshot.service` on every
+node. The wrapper script (`scripts/rove-snapshot-pass.sh`) probes
+`/_system/leader` on loopback; followers exit silently, the leader
+runs `loop46 snapshot --data-dir`. Upload goes to
+`s3://$BUCKET/cluster/snapshots/{snap_id}/` (per-tenant VACUUM-INTO
+copies, sha256-keyed, with a manifest.json tying them together).
+
+Retention: S3 bucket lifecycle policy (sample JSON in
+[`deployment.md`](deployment.md) — "Backup automation") expires
+keys under `cluster/snapshots/` after a configurable window.
+
+Restore runbook: [`deployment.md`](deployment.md) "Restoring from a
+snapshot" — `loop46 restore-from-snapshot --snap-id <id>` against a
+fresh data dir, then start the worker normally.
+
+Not done (intentional, out of scope for "lean"):
+- Graded retention (keep N hourly + M daily + K weekly). Today's
+  story is "everything older than X is dead" — fine for v1 but
+  worth revisiting if customer compliance requires multi-tier.
+- `loop46 prune-snapshots --keep N` CLI. The S3-lifecycle path
+  obviates it, but a custom pruner would be needed if/when graded
+  retention lands.
+- Live-cluster `apply_position` threading into the CLI. Today's
+  captures stamp 0; restored nodes replay every post-snapshot raft
+  entry. Fine for DR.
 
 ## Quality-of-life / risk tightening
 
@@ -737,6 +758,8 @@ this is fine, but multi-customer prod with mixed tiers needs it.
 9. ~~**#5 TLS reload across the four processes.**~~ Done 2026-05-11.
    Shared `h2.TlsConfig.runReloadPoll` helper + signal handlers on
    the standalones.
-10. **#6 / #8.** Each an afternoon.
-11. **#9 / #10 / #11 / #12.** Real work but slot after launch
+10. ~~**#8 backup automation.**~~ Done 2026-05-11 (lean version —
+    daily timer + leader-only wrapper + S3 lifecycle for retention).
+11. **#6.** Afternoon's work.
+12. **#9 / #10 / #11 / #12.** Real work but slot after launch
    unless a specific customer requirement surfaces.
