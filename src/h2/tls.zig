@@ -121,6 +121,38 @@ pub const TlsConfig = struct {
         return true;
     }
 
+    /// Block the calling thread until `stop_flag` flips, periodically
+    /// calling `reloadIfChanged` on `tls_config` (when non-null) so a
+    /// cert renewed on disk (e.g. by lego/certbot rewriting the PEM
+    /// symlinks) gets picked up without restarting the process.
+    ///
+    /// Poll granularity is 50 ms, reload cadence is 1 s — cheap enough
+    /// to keep running unconditionally, fast enough to surface a fresh
+    /// cert within one renewal-tick. Doubles as the "block until
+    /// SIGTERM" primitive each binary's main needs anyway, so the four
+    /// loop46/files-server/log-server/sse-server entry points all hand
+    /// off to this after their listeners are up.
+    pub fn runReloadPoll(
+        tls_config: ?*TlsConfig,
+        stop_flag: *std.atomic.Value(bool),
+    ) void {
+        const reload_interval_ticks: u64 = 20; // 20 × 50ms = 1s
+        var tick: u64 = 0;
+        while (!stop_flag.load(.acquire)) {
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+            tick += 1;
+            if (tls_config) |cfg| {
+                if (tick % reload_interval_ticks == 0) {
+                    const changed = cfg.reloadIfChanged() catch |err| blk: {
+                        std.log.warn("tls: reloadIfChanged failed: {s}", .{@errorName(err)});
+                        break :blk false;
+                    };
+                    if (changed) std.log.info("tls: cert/key reloaded", .{});
+                }
+            }
+        }
+    }
+
     /// Hand out a fresh `*SSL` bound to the current ctx. Bumps the
     /// ctx's refcount before calling `SSL_new` so a concurrent
     /// `reloadIfChanged` can't free the ctx out from under us.

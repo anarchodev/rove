@@ -35,6 +35,22 @@ const log_server = @import("rove-log-server");
 const blob_mod = @import("rove-blob");
 const h2 = @import("rove-h2");
 
+var stop_flag: std.atomic.Value(bool) = .init(false);
+
+fn handleSignal(_: c_int) callconv(.c) void {
+    stop_flag.store(true, .release);
+}
+
+fn installSignalHandlers() !void {
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = handleSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
+
 const ENV_JWT_SECRET = "LOOP46_SERVICES_JWT_SECRET";
 
 const Cli = struct {
@@ -255,5 +271,6 @@ pub fn main() !void {
     });
     try sw.interface.flush();
 
-    while (true) std.Thread.sleep(1 * std.time.ns_per_s);
+    try installSignalHandlers();
+    h2.TlsConfig.runReloadPoll(tls_config, &stop_flag);
 }

@@ -29,6 +29,22 @@ const blob_mod = @import("rove-blob");
 const h2 = @import("rove-h2");
 const kv = @import("rove-kv");
 
+var stop_flag: std.atomic.Value(bool) = .init(false);
+
+fn handleSignal(_: c_int) callconv(.c) void {
+    stop_flag.store(true, .release);
+}
+
+fn installSignalHandlers() !void {
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = handleSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
+
 const ENV_JWT_SECRET = "LOOP46_SERVICES_JWT_SECRET";
 
 /// Maximum number of `--bootstrap-kv` pairs accepted on the command
@@ -267,7 +283,7 @@ fn loadJwtSecret(allocator: std.mem.Allocator) ![]u8 {
 /// cluster.
 fn raftThreadMain(
     cluster: *kv.Cluster,
-    stop_flag: *std.atomic.Value(bool),
+    raft_stop: *std.atomic.Value(bool),
     snapshot_interval_ms: u32,
 ) void {
     var tick_state: kv.Cluster.TickState = .{};
@@ -275,7 +291,7 @@ fn raftThreadMain(
         .interval_ns = @as(i64, snapshot_interval_ms) * std.time.ns_per_ms,
     };
 
-    while (!stop_flag.load(.acquire) and !cluster.raft.stopping.load(.acquire)) {
+    while (!raft_stop.load(.acquire) and !cluster.raft.stopping.load(.acquire)) {
         const now_ns: i64 = @intCast(std.time.nanoTimestamp());
         cluster.raft.tick(now_ns) catch |err| {
             std.log.warn("files-server raft: tick failed: {s}", .{@errorName(err)});
@@ -481,9 +497,8 @@ pub fn main() !void {
         std.log.info("files-server: --leader-url not set, skipping platform-deploy bootstrap", .{});
     }
 
-    while (true) {
-        std.Thread.sleep(1 * std.time.ns_per_s);
-    }
+    try installSignalHandlers();
+    h2.TlsConfig.runReloadPoll(tls_config, &stop_flag);
 }
 
 const BootstrapCtx = struct {

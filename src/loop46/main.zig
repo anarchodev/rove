@@ -946,28 +946,12 @@ fn resolveTls(
     return cfg;
 }
 
-/// Block the main thread until SIGINT/SIGTERM flips `stop_flag`. 50ms
-/// poll granularity is invisible to shutdown perception and costs
-/// nothing. If TLS is on, the main thread also stat()s the PEM files
-/// once per second — the sidecar (scripts/rove-lego-renew.sh)
-/// rewrites these whenever lego renews, and workers pick up the new
-/// cert on the next TLS accept.
+/// Block the main thread until SIGINT/SIGTERM flips `stop_flag`. The
+/// stat()-and-reload polling that picks up a renewed cert is in
+/// `h2.TlsConfig.runReloadPoll` — shared across all four binaries so
+/// they all get the same renewal behavior from the same code.
 fn runUntilStopped(tls_config: ?*h2_mod.TlsConfig) void {
-    const reload_interval_ticks: u64 = 20; // 20 × 50ms = 1s
-    var tick: u64 = 0;
-    while (!stop_flag.load(.acquire)) {
-        std.Thread.sleep(50 * std.time.ns_per_ms);
-        tick += 1;
-        if (tls_config) |cfg| {
-            if (tick % reload_interval_ticks == 0) {
-                const changed = cfg.reloadIfChanged() catch |err| blk: {
-                    std.log.warn("tls: reloadIfChanged failed: {s}", .{@errorName(err)});
-                    break :blk false;
-                };
-                if (changed) std.log.info("tls: cert/key reloaded", .{});
-            }
-        }
-    }
+    h2_mod.TlsConfig.runReloadPoll(tls_config, &stop_flag);
 }
 
 /// Keep `std.log.info` calls live in ReleaseFast so operators can

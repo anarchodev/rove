@@ -604,12 +604,19 @@ in the right order. Full runbook at
 multi-node membership, cert rotation, lost-quorum recovery,
 validation curls.
 
-### 5. TLS reload across all four processes
+### 5. TLS reload across all four processes — **done 2026-05-11**
 
-`loop46` reloads cert/key on mtime change every second. The
-standalones need the same, since the wildcard cert covers
-`files.` / `logs.` / `sse.` subdomains and they each terminate
-their own TLS. Worth confirming each standalone reloads.
+`h2.TlsConfig.runReloadPoll(tls_config, stop_flag)` is the shared
+50ms-poll + 1s-stat-and-reload loop. All four binaries
+(loop46/files-server/log-server/sse-server) now block on it after
+their listeners are up — same code, same renewal behavior. The three
+standalones also gained `installSignalHandlers` so SIGTERM flips
+`stop_flag` and triggers clean shutdown instead of waiting for
+systemd's SIGKILL.
+
+Smoke-tested by spawning sse-server with the dev cert, `touch`ing
+the cert, and observing `info: tls: cert/key reloaded` in stderr
+within ~1s.
 
 ### 6. Edge proxy requirement documented + verified
 
@@ -727,6 +734,9 @@ this is fine, but multi-customer prod with mixed tiers needs it.
 8. ~~**#3 far-behind-follower auto-restore.**~~ Done 2026-05-11.
    `Restart=always` on rove-loop46.service makes the stage+exit
    catchup cycle complete without operator action.
-9. **#5 / #6 / #8.** Each an afternoon.
-10. **#9 / #10 / #11 / #12.** Real work but slot after launch
+9. ~~**#5 TLS reload across the four processes.**~~ Done 2026-05-11.
+   Shared `h2.TlsConfig.runReloadPoll` helper + signal handlers on
+   the standalones.
+10. **#6 / #8.** Each an afternoon.
+11. **#9 / #10 / #11 / #12.** Real work but slot after launch
    unless a specific customer requirement surfaces.
