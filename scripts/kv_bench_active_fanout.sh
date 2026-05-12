@@ -220,17 +220,26 @@ warmup_check() {
 }
 export -f warmup_check
 export CURL LEADER_PORT warmup_log
-# Run up to 64 warmup probes in parallel
+# Run up to 64 warmup probes in parallel. Collect PIDs explicitly
+# so the closing `wait` only blocks on warmup_check children — a
+# bare `wait` would also block on the worker `& PIDS` from earlier
+# in the script and hang forever (workers don't exit).
+warmup_pids=()
 for (( i = 0; i < N_ACTIVE; i++ )); do
     tid=$(printf "fan%05d" "$i")
     warmup_check "$tid" &
-    if (( $(jobs -r -p | wc -l) >= 64 )); then
+    warmup_pids+=($!)
+    if (( ${#warmup_pids[@]} % 64 == 0 )); then
         wait -n 2>/dev/null || true
     fi
 done
-wait
-warmup_ok=$(grep -c "^ok" "$warmup_log" || echo 0)
-warmup_fail=$(grep -c "^fail" "$warmup_log" || echo 0)
+for p in "${warmup_pids[@]}"; do wait "$p" 2>/dev/null || true; done
+# `grep -c` returns nonzero exit when no matches, but already prints "0".
+# Wrapping in `|| echo 0` would APPEND a second "0" line on no-match,
+# corrupting bash arithmetic ("0\n0" → syntax error). Suppress the
+# exit code via grouping instead.
+warmup_ok=$({ grep -c "^ok" "$warmup_log" || true; })
+warmup_fail=$({ grep -c "^fail" "$warmup_log" || true; })
 warmup_elapsed=$(( $(date +%s) - warmup_start ))
 rm -f "$warmup_log"
 echo "  $warmup_ok/$N_ACTIVE tenants warmed in ${warmup_elapsed}s ($warmup_fail failed)"
