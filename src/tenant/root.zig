@@ -561,20 +561,23 @@ pub const Tenant = struct {
             else => return Error.OpenFailed,
         };
 
-        const app_path = std.fmt.allocPrintSentinel(
+        // Under the kvexp cutover, per-instance state lives as a
+        // store inside the same manifest as `self.root` — the
+        // cluster's `cluster.kv` in production, the test's
+        // standalone manifest in unit-test fixtures. `inst_dir`
+        // remains on disk for sibling artifacts (file-blobs etc.)
+        // but no per-instance `app.db` file is created.
+        const counter_opt: ?*kv_mod.SeqCounter = blk: {
+            const reg = self.seq_counters orelse break :blk null;
+            break :blk reg.getOrCreate(id) catch return Error.OutOfMemory;
+        };
+        const u64_id = kv_mod.hashStoreId(id);
+        const store = kv_mod.KvStore.attachSibling(
             self.allocator,
-            "{s}/app.db",
-            .{inst_dir},
-            0,
-        ) catch return Error.OutOfMemory;
-        defer self.allocator.free(app_path);
-
-        const store = if (self.seq_counters) |reg| cblk: {
-            const counter = reg.getOrCreate(id) catch return Error.OutOfMemory;
-            break :cblk kv_mod.KvStore.openWithCounter(self.allocator, app_path, counter) catch
-                return Error.OpenFailed;
-        } else kv_mod.KvStore.open(self.allocator, app_path) catch
-            return Error.OpenFailed;
+            self.root,
+            u64_id,
+            counter_opt,
+        ) catch return Error.OpenFailed;
         errdefer store.close();
 
         const id_copy = self.allocator.dupe(u8, id) catch return Error.OutOfMemory;

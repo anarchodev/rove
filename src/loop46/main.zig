@@ -249,6 +249,11 @@ const WorkerCtx = struct {
     data_dir: []const u8,
     http_addr: std.net.Address,
     raft: *kv.RaftNode,
+    /// Shared cluster — every worker pulls its root + per-tenant
+    /// KvStore handles from here. kvexp's manifest is thread-safe
+    /// (per-store locks, sharded page cache), so one handle is
+    /// safe to share across all workers.
+    cluster: *kv.Cluster,
     /// Phase 5.5(a) Step B — JWT secret shared with the standalone
     /// services (log-server, files-server). Worker mints tokens at
     /// `/_system/services-token` after admin auth; each service
@@ -365,19 +370,13 @@ fn workerMain(args: *WorkerCtx) !void {
     });
     defer reg.deinit();
 
-    // Per-worker tenant. Opens its OWN connection to __root__.db.
-    // Multiple connections to the same sqlite file are fine in WAL
-    // mode, and each worker's connection respects the NOMUTEX
-    // "one thread per connection" rule because it's created here.
-    const root_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/__root__.db",
-        .{args.data_dir},
-        0,
-    );
-    defer allocator.free(root_path);
-    const root_kv = try kv.KvStore.open(allocator, root_path);
-    defer root_kv.close();
+    // Per-worker tenant. Under the kvexp cutover, every worker
+    // shares the cluster's single root handle — kvexp's manifest
+    // is thread-safe (per-store locks + sharded page cache), so a
+    // single `*KvStore` pointer is safe to use from many threads
+    // concurrently. No standalone open here; no `close` here
+    // either (the cluster owns the handle's lifetime).
+    const root_kv = try args.cluster.openRoot();
 
     const tenant = try tenant_mod.Tenant.createWithCounters(
         allocator,
@@ -853,23 +852,16 @@ fn dispatchSubcommand(
 
 /// One-time bootstrap on the main thread before any worker / raft /
 /// subsystem thread starts. Opens root.db, ensures __admin__ exists,
-/// applies any `--bootstrap-kv key=value` entries to admin's app.db,
-/// deploys the embedded admin UI bundle, and prewarms every existing
-/// tenant's app.db + log.db so the WAL-mode upgrade is committed
-/// before workers race to open them. Each worker opens its own
-/// connections to these files later.
+/// applies any `--bootstrap-kv key=value` entries to admin's store,
+/// and creates admin/replay tenants. Runs before the cluster comes
+/// up, so it opens `cluster.kv` directly via `openClusterOwned`;
+/// when the cluster boots later, it sees the same stores at the same
+/// hashed store ids.
 fn bootstrapTenants(
     allocator: std.mem.Allocator,
     cli: cli_mod.Cli,
 ) !void {
-    const root_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/__root__.db",
-        .{cli.data_dir},
-        0,
-    );
-    defer allocator.free(root_path);
-    const root_kv = try kv.KvStore.open(allocator, root_path);
+    const root_kv = try kv.KvStore.openClusterOwned(allocator, cli.data_dir, "__root__");
     defer root_kv.close();
 
     const tenant = try tenant_mod.Tenant.create(allocator, root_kv, cli.data_dir);
@@ -905,14 +897,10 @@ fn bootstrapTenants(
     // `error: JournalMode` because two openers try to upgrade
     // journal_mode=WAL at the same time. `__replay__` is bootstrap-
     // created above but isn't in the explicit list — discoverTenantIds
-    // picks it up like any other on-disk tenant.
-    const prewarm_ids = try discoverTenantIds(allocator, cli.data_dir);
-    defer {
-        for (prewarm_ids) |id| allocator.free(id);
-        allocator.free(prewarm_ids);
-    }
-    try prewarmTenantDbs(allocator, cli.data_dir, &.{tenant_mod.ADMIN_INSTANCE_ID});
-    try prewarmTenantDbs(allocator, cli.data_dir, prewarm_ids);
+    // Under the kvexp cutover the WAL-mode prewarm dance is
+    // unnecessary — there are no per-tenant SQLite files to
+    // upgrade. The cluster's manifest creates per-tenant stores
+    // lazily inside `cluster.kv` on first `openStore`.
 }
 
 /// Build the `TlsConfig` for the worker pool. Both `--tls-cert` and
@@ -1387,6 +1375,7 @@ pub fn main() !void {
             .data_dir = cli.data_dir,
             .http_addr = http_addr,
             .raft = raft_node,
+            .cluster = cluster,
             .services_jwt_secret = &services_jwt_secret,
             .log_public_base = log_public_base,
             .files_public_base = files_public_base,
@@ -1652,28 +1641,6 @@ fn discoverTenantIds(
 /// we observed at `--workers 8`. Prewarming fixes it once and for
 /// all: subsequent openers see the existing WAL mode and skip the
 /// transition.
-fn prewarmTenantDbs(
-    allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    tenant_ids: []const []const u8,
-) !void {
-    for (tenant_ids) |id| {
-        const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, id });
-        defer allocator.free(inst_dir);
-        try std.fs.cwd().makePath(inst_dir);
-
-        const app_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{inst_dir}, 0);
-        defer allocator.free(app_db_path);
-        const app_kv = try kv.KvStore.open(allocator, app_db_path);
-        app_kv.close();
-
-        const log_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/log.db", .{inst_dir}, 0);
-        defer allocator.free(log_db_path);
-        const log_kv = try kv.KvStore.open(allocator, log_db_path);
-        log_kv.close();
-    }
-}
-
 /// Inline qjs compile hook — identical to the one in files_cli.zig.
 /// Duplicating it here keeps the smoke test self-contained; the
 /// production path reuses files_cli's helper.

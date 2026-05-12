@@ -205,6 +205,44 @@ pub const KvStore = struct {
         return openStandalone(allocator, path, .read_write, null);
     }
 
+    /// Open `{data_dir}/cluster.kv` as a self-contained owned
+    /// KvStore handle, attached to the store identified by
+    /// `hashStoreId(store_name)`. Used by offline tools (seed,
+    /// CLI) to access the cluster's manifest without standing up
+    /// a `Cluster` (and its raft node). The returned handle owns
+    /// the whole kvexp stack — close tears it down. Sibling
+    /// handles (via `attachSibling`) share the manifest and must
+    /// close before this one.
+    pub fn openClusterOwned(
+        allocator: std.mem.Allocator,
+        data_dir: []const u8,
+        store_name: []const u8,
+    ) Error!*KvStore {
+        const CLUSTER_KV: []const u8 = "cluster.kv";
+
+        std.fs.cwd().makePath(data_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return Error.Io,
+        };
+
+        const path = std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/{s}",
+            .{ data_dir, CLUSTER_KV },
+            0,
+        ) catch return Error.OutOfMemory;
+        defer allocator.free(path);
+
+        const handle = try openStandaloneWithStoreId(
+            allocator,
+            path,
+            .read_write,
+            null,
+            hashStoreId(store_name),
+        );
+        return handle;
+    }
+
     /// Standalone open in read-only mode. The file must already
     /// exist and carry a valid kvexp manifest; the store must
     /// already exist. (No DDL is run — opening a fresh empty file
@@ -226,6 +264,21 @@ pub const KvStore = struct {
         return openStandalone(allocator, path, .read_write, shared_counter);
     }
 
+    /// Attach a sibling handle into the same manifest as `other`.
+    /// The new handle targets `store_id` (which may equal `other`'s
+    /// or be a different store within the same manifest). Lifetime:
+    /// the new handle must be closed before the manifest owner —
+    /// in standalone mode that's `other`, in cluster mode that's
+    /// the cluster's `deinit`.
+    pub fn attachSibling(
+        allocator: std.mem.Allocator,
+        other: *KvStore,
+        store_id: u64,
+        shared_counter: ?*SeqCounter,
+    ) Error!*KvStore {
+        return attach(allocator, other.manifest, store_id, shared_counter);
+    }
+
     /// Attach a handle to a pre-existing manifest. The caller (cluster
     /// or process-wide owner) keeps the manifest alive; `close`
     /// releases handle state only. Creates the store if it doesn't
@@ -241,7 +294,13 @@ pub const KvStore = struct {
 
         const exists = manifest.hasStore(store_id) catch return Error.Sqlite;
         if (!exists) {
-            manifest.createStore(store_id) catch return Error.Sqlite;
+            // Tolerate the TOCTOU race when multiple threads attach
+            // the same store concurrently — one wins createStore,
+            // the others observe StoreAlreadyExists and proceed.
+            manifest.createStore(store_id) catch |err| switch (err) {
+                error.StoreAlreadyExists => {},
+                else => return Error.Sqlite,
+            };
         }
 
         self.allocator = allocator;
@@ -265,6 +324,21 @@ pub const KvStore = struct {
         path: [:0]const u8,
         mode: OpenMode,
         shared_counter: ?*SeqCounter,
+    ) Error!*KvStore {
+        return openStandaloneWithStoreId(allocator, path, mode, shared_counter, STANDALONE_STORE_ID);
+    }
+
+    /// Standalone open with caller-chosen store_id. Used by
+    /// `openClusterOwned` to land in the same store_id the
+    /// in-cluster `openRoot` would use, so seed-mode writes are
+    /// visible when the cluster comes up later against the same
+    /// file.
+    fn openStandaloneWithStoreId(
+        allocator: std.mem.Allocator,
+        path: [:0]const u8,
+        mode: OpenMode,
+        shared_counter: ?*SeqCounter,
+        store_id: u64,
     ) Error!*KvStore {
         const self = allocator.create(KvStore) catch return Error.OutOfMemory;
         errdefer allocator.destroy(self);
@@ -297,15 +371,15 @@ pub const KvStore = struct {
         errdefer stack.manifest.deinit();
 
         if (mode == .read_write) {
-            const exists = stack.manifest.hasStore(STANDALONE_STORE_ID) catch return Error.Sqlite;
+            const exists = stack.manifest.hasStore(store_id) catch return Error.Sqlite;
             if (!exists) {
-                stack.manifest.createStore(STANDALONE_STORE_ID) catch return Error.Sqlite;
+                stack.manifest.createStore(store_id) catch return Error.Sqlite;
             }
         }
 
         self.allocator = allocator;
         self.manifest = &stack.manifest;
-        self.store_id = STANDALONE_STORE_ID;
+        self.store_id = store_id;
         self.owned = stack;
         if (shared_counter) |sc| {
             self.counter = sc;
