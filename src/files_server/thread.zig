@@ -279,6 +279,16 @@ fn handleOne(
         return;
     }
 
+    // Liveness probe for load balancers / systemd-style supervisors.
+    // No auth — load balancers don't carry the services JWT and a
+    // health probe shouldn't either. Always 200 on a running
+    // listener; the request never reaches this branch if the
+    // process is wedged.
+    if (std.mem.eql(u8, path, "/v1/health") and std.mem.eql(u8, method, "GET")) {
+        try setResponse(server, cfg, ent, sid, sess, 200, null, "ok\n");
+        return;
+    }
+
     // JWT gate. The worker mints these at /_system/services-token
     // after admin auth (cookie or bearer); the standalone trusts the
     // signed `exp` and otherwise treats every token as authorized for

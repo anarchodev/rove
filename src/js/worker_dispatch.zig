@@ -324,6 +324,17 @@ fn tryHandleSystem(
     const path_no_q = if (qmark) |q| path[0..q] else path;
     const sys_rest = path_no_q["/_system/".len..];
 
+    // Liveness probe for load balancers / systemd-style supervisors.
+    // No auth, no leadership-aware semantics — just "this process is
+    // up enough to serve the dispatch loop." Operators wanting a
+    // leader-aware health check should probe `/_system/leader`
+    // instead. Always 200 on a running worker; the request never
+    // arrives here if the listener is wedged.
+    if (std.mem.eql(u8, sys_rest, "health")) {
+        try respb.setSystemResponse(server, ent, sid, sess, 200, "ok\n", allocator, cors_origin, null);
+        return true;
+    }
+
     // Per-endpoint auth. Most `/_system/*` endpoints require admin
     // auth (root bearer or session cookie); a small allow-list of
     // cluster-internal endpoints also accept a services-JWT carrying

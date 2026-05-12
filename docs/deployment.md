@@ -242,19 +242,60 @@ shape (full state, no quorum vote). Add `--node-learner` to the
 worker's args; see `production.md` §1.2 for the lost-quorum recovery
 path via `loop46 promote-learner`.
 
+## Health + observability
+
+Every binary exposes an unauthenticated liveness endpoint that always
+returns `200 ok\n` while the process is serving requests. Wire these
+into your load balancer's health checks; they have no leadership or
+cluster-membership semantics, just "this process is responsive."
+
+| Binary | Endpoint |
+|---|---|
+| `loop46 worker` | `/_system/health` |
+| `files-server-standalone` | `/v1/health` |
+| `log-server-standalone` | `/v1/health` |
+| `sse-server-standalone` | `/v1/health` |
+
+```bash
+curl -sk https://app.loop46.me/_system/health     # → 200 ok
+curl -sk https://files.loop46.me:8444/v1/health   # → 200 ok
+curl -sk https://logs.loop46.me:8445/v1/health    # → 200 ok
+curl -sk https://sse.loop46.me:8446/v1/health     # → 200 ok
+```
+
+For leader-aware probes (e.g., to route writes), use
+`/_system/leader` on the worker — 200 on the leader, 503 (with
+`retry against the cluster leader`) on followers. Auth-gated:
+requires admin bearer or services-JWT.
+
+**Metrics.** The worker exposes Prometheus-text counters at
+`/_system/metrics` (root-token gated). Today's surface includes the
+io_uring buffer pool conservation pair, the h2 collection depths,
+and `raft_is_leader`. Scrape from your Prometheus / Datadog agent.
+The three standalones don't yet emit metrics — slot when alerting
+needs surface for them.
+
+**Recommended alerts:**
+- `/v1/health` (or `/_system/health`) returns non-200 for ≥30s → page.
+- All workers report `raft_is_leader=0` for ≥30s → page (cluster has
+  no leader, writes blocked).
+- io_uring buffer pool conservation pair drifts → investigate (the
+  panic at 3 consecutive surfacings already fires; alert before that).
+
 ## Validation
 
 ```bash
-# Worker is up and serving:
-curl -sk https://app.loop46.me/_system/leader
-# 200 if this host is leader; 503 + "retry against the cluster leader\n"
-# if it's a follower.
+# Quick acceptance check, no auth required:
+curl -sk https://app.loop46.me/_system/health         # → 200 ok
+curl -sk https://files.loop46.me:8444/v1/health       # → 200 ok
+curl -sk https://logs.loop46.me:8445/v1/health        # → 200 ok
+curl -sk https://sse.loop46.me:8446/v1/health         # → 200 ok
 
-# Standalones return their own /healthz (TLS, JWT-verified for some
-# routes). A bare TCP connect tells you they're listening at all:
-nc -vz localhost 8444
-nc -vz localhost 8445
-nc -vz localhost 8446
+# Cluster has a leader:
+for h in 10.0.1.10 10.0.1.11 10.0.1.12; do
+    curl -sk https://$h:443/_system/leader -H "Host: app.loop46.me"
+done
+# Exactly one host should return 200, the others 503.
 
 # All services running:
 systemctl --user is-active rove-loop46 rove-files-server rove-log-server rove-sse-server

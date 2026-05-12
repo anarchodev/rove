@@ -689,13 +689,31 @@ candidate (~5-15ms extra propose per fire — batched amortization
 makes it cheaper). Not a blocker since at-least-once is the
 contract, but tightens the duplicate-delivery rate.
 
-### 10. Cross-process metrics + health
+### 10. Cross-process metrics + health — **partially done 2026-05-11**
 
-sse-server has `/v1/health`. Workers, files-server, log-server,
-schedule-server thread don't. `analytics.track` / `metrics.*` are
-deferred per PLAN §10.15, but operational metrics (worker tick
-latency, raft lag, schedule queue depth, S3 PUT error rate) want a
-Prometheus-shaped surface for alerting.
+Health endpoints added:
+- `loop46 worker` — `/_system/health` (unauthed, always 200 if
+  process is up; separate from the auth-gated leadership probe at
+  `/_system/leader`)
+- `files-server-standalone` — `/v1/health`
+- `log-server-standalone` — `/v1/health`
+- `sse-server-standalone` — `/v1/health` (already existed)
+
+Documented in [`deployment.md`](deployment.md) "Health +
+observability" with the four URLs, the leadership-probe
+distinction, and recommended alerts.
+
+**Metrics surface still single-process.** `/_system/metrics` exists
+on the worker (Prometheus text — `raft_is_leader`, io_uring buffer
+pool conservation pair, h2 collection depths). The three
+standalones don't emit metrics. Slot when alerting needs them —
+the schedule-server thread runs inside the worker process so its
+state shows up there if/when we add `schedule_queue_depth` /
+`http_send_inflight` gauges.
+
+The "real work" tail (worker tick latency, raft lag,
+S3 PUT error rate) lives in the worker's metrics path; adding
+those gauges is mechanical and can land when an alert wants them.
 
 ### 11. Phase 9 encryption at rest
 
