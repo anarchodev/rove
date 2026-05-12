@@ -205,21 +205,28 @@ pub const KvStore = struct {
         return openStandalone(allocator, path, .read_write, null);
     }
 
-    /// Open `{data_dir}/cluster.kv` as a self-contained owned
+    /// Open `{data_dir}/{filename}` as a self-contained owned
     /// KvStore handle, attached to the store identified by
     /// `hashStoreId(store_name)`. Used by offline tools (seed,
-    /// CLI) to access the cluster's manifest without standing up
-    /// a `Cluster` (and its raft node). The returned handle owns
-    /// the whole kvexp stack — close tears it down. Sibling
+    /// CLI) to access a binary's kvexp manifest without standing
+    /// up a `Cluster` (and its raft node). The returned handle
+    /// owns the whole kvexp stack — close tears it down. Sibling
     /// handles (via `attachSibling`) share the manifest and must
     /// close before this one.
+    ///
+    /// `filename` is the manifest filename inside `data_dir`.
+    /// Multiple binaries sharing one `data_dir` (loop46 worker +
+    /// files-server-standalone — see kv_bench_cluster.sh) MUST
+    /// use distinct filenames to avoid racing on the same file
+    /// (kvexp is single-process). loop46 uses "cluster.kv",
+    /// files-server uses "files-server.kv", schedule-server uses
+    /// "schedule-server.kv".
     pub fn openClusterOwned(
         allocator: std.mem.Allocator,
         data_dir: []const u8,
+        filename: []const u8,
         store_name: []const u8,
     ) Error!*KvStore {
-        const CLUSTER_KV: []const u8 = "cluster.kv";
-
         std.fs.cwd().makePath(data_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return Error.Io,
@@ -228,7 +235,7 @@ pub const KvStore = struct {
         const path = std.fmt.allocPrintSentinel(
             allocator,
             "{s}/{s}",
-            .{ data_dir, CLUSTER_KV },
+            .{ data_dir, filename },
             0,
         ) catch return Error.OutOfMemory;
         defer allocator.free(path);

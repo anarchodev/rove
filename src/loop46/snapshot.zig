@@ -1280,7 +1280,7 @@ pub fn captureFromDataDir(
     defer std.fs.cwd().deleteTree(stage) catch {};
 
     // Open cluster.kv just long enough to durabilize + dump.
-    const ks = kv.KvStore.openClusterOwned(allocator, data_dir, "__root__") catch
+    const ks = kv.KvStore.openClusterOwned(allocator, data_dir, "cluster.kv", "__root__") catch
         return Error.Sqlite;
     defer ks.close();
 
@@ -2048,7 +2048,7 @@ test "captureFromDataDir + restore round-trips cluster.kv" {
     // Seed cluster.kv via the offline open path (same shape
     // `loop46 seed` uses).
     {
-        const root_kv = try kv.KvStore.openClusterOwned(allocator, source_dir, "__root__");
+        const root_kv = try kv.KvStore.openClusterOwned(allocator, source_dir, "cluster.kv", "__root__");
         defer root_kv.close();
         try root_kv.put("hello", "from-cluster");
     }
@@ -2099,7 +2099,7 @@ test "captureFromDataDir + restore round-trips cluster.kv" {
     // path — confirms it's a valid kvexp file with the data
     // intact under the same root-store id.
     {
-        const ks = try kv.KvStore.openClusterOwned(allocator, restore_dir, "__root__");
+        const ks = try kv.KvStore.openClusterOwned(allocator, restore_dir, "cluster.kv", "__root__");
         defer ks.close();
         const v = try ks.get("hello");
         defer allocator.free(v);

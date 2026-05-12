@@ -861,7 +861,7 @@ fn bootstrapTenants(
     allocator: std.mem.Allocator,
     cli: cli_mod.Cli,
 ) !void {
-    const root_kv = try kv.KvStore.openClusterOwned(allocator, cli.data_dir, "__root__");
+    const root_kv = try kv.KvStore.openClusterOwned(allocator, cli.data_dir, "cluster.kv", "__root__");
     defer root_kv.close();
 
     const tenant = try tenant_mod.Tenant.create(allocator, root_kv, cli.data_dir);

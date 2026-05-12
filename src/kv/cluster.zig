@@ -55,9 +55,12 @@ const raft_node_mod = @import("raft_node.zig");
 pub const KvStore = kvstore.KvStore;
 pub const RaftNode = raft_node_mod.RaftNode;
 
-/// kvexp manifest file inside `data_dir`. One file per cluster
-/// instance; every store the cluster opens lives inside it.
-pub const CLUSTER_KV_FILENAME: []const u8 = "cluster.kv";
+/// Default kvexp manifest filename inside `data_dir`. Apps that
+/// stand up multiple clusters or KvStores sharing one data_dir
+/// (loop46 worker + files-server-standalone in kv_bench_cluster.sh)
+/// MUST override via `Config.manifest_filename` so they don't
+/// race on the same file — kvexp is single-process.
+pub const DEFAULT_MANIFEST_FILENAME: []const u8 = "cluster.kv";
 
 /// Buffer pool size for the cluster's kvexp page cache. 16384
 /// pages × 4 KB = 64 MB. Tuned to support ~10k tenants warm
@@ -255,9 +258,13 @@ pub const RaftBootConfig = struct {
 pub const Config = struct {
     allocator: std.mem.Allocator,
     /// Root directory for cluster state. The kvexp manifest file
-    /// lives at `{data_dir}/cluster.kv`; the raft log lives at
-    /// `{data_dir}/raft.log.db`. Created if missing.
+    /// lives at `{data_dir}/{manifest_filename}`; the raft log
+    /// lives at `{data_dir}/raft.log.db`. Created if missing.
     data_dir: []const u8,
+    /// Filename for this cluster's kvexp manifest inside
+    /// `data_dir`. Default matches `DEFAULT_MANIFEST_FILENAME`;
+    /// override when multiple binaries share a data_dir.
+    manifest_filename: []const u8 = DEFAULT_MANIFEST_FILENAME,
     /// Caller-visible name for the cluster's "root" store —
     /// `openRoot` resolves to a kvexp store_id keyed by
     /// `hashStoreId(root_store_name)`. Apps may override (the
@@ -331,7 +338,13 @@ pub const Cluster = struct {
     pub fn init(cfg: Config) !*Cluster {
         const self = try cfg.allocator.create(Cluster);
         errdefer cfg.allocator.destroy(self);
-        try self.initFields(cfg.allocator, cfg.data_dir, cfg.root_store_name, cfg.user_ctx);
+        try self.initFields(
+            cfg.allocator,
+            cfg.data_dir,
+            cfg.manifest_filename,
+            cfg.root_store_name,
+            cfg.user_ctx,
+        );
         errdefer self.tearDownStack();
 
         // Now create the raft node with this cluster as ctx. The
@@ -372,7 +385,13 @@ pub const Cluster = struct {
     ) !*Cluster {
         const self = try allocator.create(Cluster);
         errdefer allocator.destroy(self);
-        try self.initFields(allocator, data_dir, "__root__", user_ctx);
+        try self.initFields(
+            allocator,
+            data_dir,
+            DEFAULT_MANIFEST_FILENAME,
+            "__root__",
+            user_ctx,
+        );
         errdefer self.tearDownStack();
         self.raft = raft;
         self.raft_owned = false;
@@ -383,6 +402,7 @@ pub const Cluster = struct {
         self: *Cluster,
         allocator: std.mem.Allocator,
         data_dir: []const u8,
+        manifest_filename: []const u8,
         root_store_name: []const u8,
         user_ctx: ?*anyopaque,
     ) !void {
@@ -396,7 +416,7 @@ pub const Cluster = struct {
         const path = try std.fmt.allocPrintSentinel(
             allocator,
             "{s}/{s}",
-            .{ data_dir, CLUSTER_KV_FILENAME },
+            .{ data_dir, manifest_filename },
             0,
         );
         defer allocator.free(path);

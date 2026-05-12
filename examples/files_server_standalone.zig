@@ -47,6 +47,12 @@ fn installSignalHandlers() !void {
 
 const ENV_JWT_SECRET = "LOOP46_SERVICES_JWT_SECRET";
 
+/// kvexp manifest filename for the files-server process. Distinct
+/// from loop46's "cluster.kv" so the two binaries can share one
+/// data_dir without racing (kv_bench_cluster.sh and the
+/// production deploy both do this).
+const FILES_SERVER_KV_FILENAME: []const u8 = "files-server.kv";
+
 /// Maximum number of `--bootstrap-kv` pairs accepted on the command
 /// line. Plenty for typical platform-config use (resend_key,
 /// platform_email_from, etc.).
@@ -400,6 +406,7 @@ pub fn main() !void {
         cluster_opt = kv.Cluster.init(.{
             .allocator = allocator,
             .data_dir = cli.data_dir,
+            .manifest_filename = FILES_SERVER_KV_FILENAME,
             .raft = .{
                 .node_id = cli.raft_node_id,
                 .peers = peers_owned.?,
@@ -445,17 +452,17 @@ pub fn main() !void {
 
     // ── Process-wide files-server kvexp manifest ──────────────
     //
-    // Cluster mode: the cluster owns its kvexp manifest at
-    // `{data_dir}/cluster.kv`; `cluster.openRoot()` hands out
-    // the root handle the per-instance handlers attach into.
-    // Single-process mode (no --raft-*): open the same file
-    // directly via `openClusterOwned` — when the file is shared
-    // with a future cluster boot, store ids align (both paths
-    // use `hashStoreId("__root__")`).
+    // The manifest lives at `{data_dir}/files-server.kv` —
+    // distinct from loop46's `cluster.kv` so they don't race on
+    // the same file when sharing a data_dir (see
+    // kv_bench_cluster.sh's `spawn_files_server` against the
+    // leader's data_dir). Cluster mode: the cluster owns the
+    // file via Config.manifest_filename. Single-process mode:
+    // open directly via openClusterOwned with the same filename.
     const files_root_kv: *kv.KvStore = if (cluster_opt) |c|
         try c.openRoot()
     else
-        try kv.KvStore.openClusterOwned(allocator, cli.data_dir, "__root__");
+        try kv.KvStore.openClusterOwned(allocator, cli.data_dir, FILES_SERVER_KV_FILENAME, "__root__");
     defer if (cluster_opt == null) files_root_kv.close();
 
     const handle = try cs.thread.spawn(.{

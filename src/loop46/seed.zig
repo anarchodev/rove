@@ -113,7 +113,7 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     // store ids the live Cluster will use — that way the data we
     // write here is visible when `loop46 worker` boots and the
     // Cluster opens the same file.
-    const root_kv = try kv.KvStore.openClusterOwned(allocator, dd, "__root__");
+    const root_kv = try kv.KvStore.openClusterOwned(allocator, dd, "cluster.kv", "__root__");
     defer root_kv.close();
 
     const tenant = try tenant_mod.Tenant.create(allocator, root_kv, dd);
