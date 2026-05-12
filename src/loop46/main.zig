@@ -406,14 +406,15 @@ fn workerMain(args: *WorkerCtx) !void {
     // the root store, and root.db needs normal busy handling so
     // concurrent bootstrap writes across workers (marker + domain
     // updates) serialize instead of racing to SQLITE_BUSY.
-    const discovered_ids = try discoverTenantIds(allocator, args.data_dir);
-    defer {
-        for (discovered_ids) |id| allocator.free(id);
-        allocator.free(discovered_ids);
-    }
-    for (discovered_ids) |id| {
+    // Discover the tenants the seed (or a previous worker run)
+    // registered: under the kvexp consolidation they live as
+    // `instance/{id}` rows in the root store, not as
+    // `{data_dir}/{id}/app.db` files on disk.
+    var instance_list = try tenant.listInstances(std.math.maxInt(u32));
+    defer instance_list.deinit();
+    for (instance_list.ids) |id| {
+        if (std.mem.eql(u8, id, tenant_mod.ADMIN_INSTANCE_ID)) continue;
         try tenant.createInstance(id);
-        if (tenant.instances.get(id)) |inst| inst.kv.setBusyTimeout(0);
     }
 
     // Production.md #1.4 step 4 — wire the HTTP-backed manifest
@@ -1603,35 +1604,6 @@ fn prefetchManifests(
 /// kv aliases the root store, so the on-disk dir is not the source of
 /// truth for its existence). Caller owns the returned slice + the
 /// id strings inside it.
-fn discoverTenantIds(
-    allocator: std.mem.Allocator,
-    data_dir: []const u8,
-) ![][]const u8 {
-    var list: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (list.items) |id| allocator.free(id);
-        list.deinit(allocator);
-    }
-
-    var dir = std.fs.cwd().openDir(data_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return list.toOwnedSlice(allocator),
-        else => return err,
-    };
-    defer dir.close();
-
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        if (entry.kind != .directory) continue;
-        if (std.mem.eql(u8, entry.name, tenant_mod.ADMIN_INSTANCE_ID)) continue;
-        const probe = try std.fmt.allocPrint(allocator, "{s}/{s}/app.db", .{ data_dir, entry.name });
-        defer allocator.free(probe);
-        std.fs.cwd().access(probe, .{}) catch continue;
-        const id = try allocator.dupe(u8, entry.name);
-        try list.append(allocator, id);
-    }
-    return list.toOwnedSlice(allocator);
-}
-
 /// Open + close each tenant's `app.db` and `log.db` once from the
 /// main thread so the `PRAGMA journal_mode=WAL` transition is
 /// committed to disk BEFORE any workers race to open them. Concurrent
