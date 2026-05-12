@@ -195,15 +195,49 @@ echo "leader: node $LEADER_IDX at $LEADER_HTTP"
 FILES_ADDR="${FILES_ADDR:-127.0.0.1:8278}"
 spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/${SMOKE_TAG}-cs.out "$ADMIN_ORIGIN" "$ADMIN_ORIGIN" || exit 1
 
-# Verify tenant 0 responds before kicking off the load.
-for _ in $(seq 1 30); do
-    code=$("${CURL[@]}" --connect-to "fan00000.loop46.localhost:${LEADER_PORT}:127.0.0.1:${LEADER_PORT}" \
-        -o /dev/null -w '%{http_code}' "https://fan00000.loop46.localhost:${LEADER_PORT}/?fn=handler" || echo 000)
-    [[ "$code" == "200" ]] && break
-    sleep 0.2
+# Pre-warm every active tenant so the bench doesn't measure
+# first-touch deployment_loader latency. Each tenant's first
+# request fetches the manifest + bytecode from S3 — without
+# warming, h2load sees a wave of 503s as workers race to load
+# deployments. We probe in parallel batches and require all
+# active tenants to return 200 before kicking off load.
+echo "── pre-warming $N_ACTIVE active tenants ──"
+warmup_start=$(date +%s)
+warmup_ok=0
+warmup_fail=0
+warmup_log=$(mktemp -t rove-kv-fanout-warmup-XXXXXX)
+warmup_check() {
+    local tid="$1"
+    local code
+    for _ in $(seq 1 60); do
+        code=$("${CURL[@]}" --connect-to "${tid}.loop46.localhost:${LEADER_PORT}:127.0.0.1:${LEADER_PORT}" \
+            -o /dev/null -w '%{http_code}' "https://${tid}.loop46.localhost:${LEADER_PORT}/?fn=handler" 2>/dev/null || echo 000)
+        [[ "$code" == "200" ]] && { echo "ok $tid" >> "$warmup_log"; return 0; }
+        sleep 0.5
+    done
+    echo "fail $tid $code" >> "$warmup_log"
+    return 1
+}
+export -f warmup_check
+export CURL LEADER_PORT warmup_log
+# Run up to 64 warmup probes in parallel
+for (( i = 0; i < N_ACTIVE; i++ )); do
+    tid=$(printf "fan%05d" "$i")
+    warmup_check "$tid" &
+    if (( $(jobs -r -p | wc -l) >= 64 )); then
+        wait -n 2>/dev/null || true
+    fi
 done
-[[ "$code" == "200" ]] || { echo "FAIL: fan00000.loop46.localhost never returned 200 (got $code)"; exit 1; }
-echo "fan00000.loop46.localhost ready (HTTP $code)"
+wait
+warmup_ok=$(grep -c "^ok" "$warmup_log" || echo 0)
+warmup_fail=$(grep -c "^fail" "$warmup_log" || echo 0)
+warmup_elapsed=$(( $(date +%s) - warmup_start ))
+rm -f "$warmup_log"
+echo "  $warmup_ok/$N_ACTIVE tenants warmed in ${warmup_elapsed}s ($warmup_fail failed)"
+if (( warmup_fail > 0 )); then
+    echo "FAIL: $warmup_fail tenants did not become ready"
+    exit 1
+fi
 
 H2LOAD=(h2load --connect-to "127.0.0.1:${LEADER_PORT}")
 
