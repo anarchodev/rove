@@ -567,13 +567,27 @@ from `main.zig` before the raft thread spawns. Safety guard
 stays in `tickRaftCapture` as a cheap u64 compare against
 the cached state.
 
-### 3. Far-behind-follower auto-restore
+### 3. Far-behind-follower auto-restore — **done 2026-05-11**
 
-`loop46 restore-from-snapshot` exists as an operator CLI. The
-willemt `needs_snapshot` callback currently just logs. Wiring
-auto-fetch + atomic-rename when a follower is too far behind is
-needed for nodes added after first capture and for crash recovery
-without operator hand-holding.
+The leader-side `needs_snapshot` callback is wired to
+`sendSnapshotFetchOffer` (src/loop46/snapshot.zig), the follower's
+fetcher thread downloads the bundle and stages it under
+`{data_dir}/.snap-in-{snap_id}/`, then `std.process.exit(0)`. Next
+boot calls `installStagedSnapshotIfPresent` → atomic-rename →
+`raft_load_snapshot` at the leader's floor. The piece that closed
+this item: `rove-loop46.service` now uses `Restart=always` (not
+`on-failure`), so the clean exit triggers a systemd restart and the
+catchup completes with no operator action. `scripts/snap_catchup_smoke.sh`
+covers the full cycle.
+
+Note that this is the `.opaque_bytes` snapshot path (per-tenant
+SQLite DB files bundled and shipped through S3). The legacy
+delta-row protocol in `src/kv/raft_snapshot.zig` (`kv.delta()`,
+SNAP_OFFER / SNAP_REQ / SNAP_DATA frames) is dead code in
+`.opaque_bytes` mode — there's nothing to delta against when the
+application state is many separate SQLite DBs. The file header
+documents this; the path stays in tree only so `.kv`-mode tests
+keep compiling.
 
 ## Operational gaps
 
@@ -710,6 +724,9 @@ this is fine, but multi-customer prod with mixed tiers needs it.
    `on_result` callback lands durably on acme.
 7. ~~**#4 deployment doc + systemd units.**~~ Done 2026-05-11.
    Four user-scope units + `docs/deployment.md` runbook.
-8. **#3 / #5 / #6 / #8.** Each an afternoon.
-9. **#9 / #10 / #11 / #12.** Real work but slot after launch
+8. ~~**#3 far-behind-follower auto-restore.**~~ Done 2026-05-11.
+   `Restart=always` on rove-loop46.service makes the stage+exit
+   catchup cycle complete without operator action.
+9. **#5 / #6 / #8.** Each an afternoon.
+10. **#9 / #10 / #11 / #12.** Real work but slot after launch
    unless a specific customer requirement surfaces.

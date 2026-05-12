@@ -76,7 +76,17 @@ ExecStart=%h/.local/bin/loop46 worker \
     --log-public-base ${LOG_PUBLIC_BASE} \
     --sse-public-base ${SSE_PUBLIC_BASE} \
     --workers ${WORKERS}
-Restart=on-failure
+# Restart=always (not on-failure) is load-bearing for far-behind
+# follower auto-recovery. When this node falls behind the leader's
+# raft compaction floor, the leader sends `snap_fetch_offer`; the
+# follower's fetcher thread downloads the snapshot bundle, stages it
+# under `{data_dir}/.snap-in-{snap_id}/`, then calls
+# `std.process.exit(0)` (see src/loop46/snapshot.zig). systemd
+# restarts the process; the next boot's `installStagedSnapshotIfPresent`
+# atomic-renames the staged files into place and `raft_load_snapshot`
+# picks up at the leader's floor. With Restart=on-failure the clean
+# exit wouldn't fire a restart and operators would be on the hook.
+Restart=always
 RestartSec=2
 
 # A worker holding raft state shouldn't be terminated mid-commit.

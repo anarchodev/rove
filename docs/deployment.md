@@ -254,6 +254,17 @@ with `systemctl --user restart rove-loop46` so raft keeps quorum.
 3. `loop46 promote-learner --data-dir ... --allow-single-peer` rebuilds
 a 1-node cluster from a learner's data dir.
 
+**Far-behind follower.** Handled automatically: if a node falls past
+the leader's raft compaction floor, the leader sends a
+`snap_fetch_offer`, the follower's fetcher thread downloads the
+snapshot bundle, stages it under `{data_dir}/.snap-in-{snap_id}/`,
+then exits cleanly. `Restart=always` on `rove-loop46.service`
+restarts the worker; boot picks up the staged bundle via
+`installStagedSnapshotIfPresent` and resumes raft at the leader's
+floor. End-to-end smoke at `scripts/snap_catchup_smoke.sh` (which
+simulates the supervisor by re-spawning manually — production has
+systemd do it).
+
 **Backup.** `loop46 snapshot --data-dir ...` captures every tenant's
 `app.db` + `__root__.db` into the S3 snapshot store. Restore via
 `loop46 restore-from-snapshot`. Snapshot retention isn't automated yet
