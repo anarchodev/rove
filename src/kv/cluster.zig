@@ -187,6 +187,7 @@ fn storePath(
     allocator: std.mem.Allocator,
     data_dir: []const u8,
     store_id: []const u8,
+    filename: []const u8,
 ) ![:0]u8 {
     const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, store_id });
     defer allocator.free(dir);
@@ -194,7 +195,7 @@ fn storePath(
         error.PathAlreadyExists => {},
         else => return err,
     };
-    return std.fmt.allocPrintSentinel(allocator, "{s}/store.db", .{dir}, 0);
+    return std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, filename }, 0);
 }
 
 // ── Envelope registration ──────────────────────────────────────────
@@ -255,6 +256,12 @@ pub const Config = struct {
     /// own subdir at `{data_dir}/{store_id}/`. The raft log lives
     /// at `{data_dir}/raft.log.db`.
     data_dir: []const u8,
+    /// Filename used inside each per-store subdir. Default
+    /// `store.db` matches the library's own convention; loop46
+    /// passes `app.db` to keep its pre-Cluster on-disk layout
+    /// stable through the migration. Borrowed for the cluster's
+    /// lifetime — typically a string literal.
+    store_filename: []const u8 = "store.db",
     /// Raft consensus parameters. Cluster owns the resulting
     /// `RaftNode` and destroys it on `deinit`. App accesses via
     /// `cluster.raft`. (Use `initWithExternalRaft` if you need
@@ -270,6 +277,8 @@ pub const Config = struct {
 pub const Cluster = struct {
     allocator: std.mem.Allocator,
     data_dir: []const u8,
+    /// Per-store filename — see `Config.store_filename`. Borrowed.
+    store_filename: []const u8,
     /// Owned by the cluster (via `init`) OR borrowed (via
     /// `initWithExternalRaft` for test harnesses). `raft_owned`
     /// tracks which.
@@ -309,7 +318,7 @@ pub const Cluster = struct {
     pub fn init(cfg: Config) !*Cluster {
         const self = try cfg.allocator.create(Cluster);
         errdefer cfg.allocator.destroy(self);
-        self.initFields(cfg.allocator, cfg.data_dir, cfg.user_ctx);
+        self.initFields(cfg.allocator, cfg.data_dir, cfg.store_filename, cfg.user_ctx);
 
         // Now create the raft node with this cluster as ctx. The
         // chicken-and-egg dependency is resolved here: `self` is
@@ -349,7 +358,7 @@ pub const Cluster = struct {
     ) !*Cluster {
         const self = try allocator.create(Cluster);
         errdefer allocator.destroy(self);
-        self.initFields(allocator, data_dir, user_ctx);
+        self.initFields(allocator, data_dir, "store.db", user_ctx);
         self.raft = raft;
         self.raft_owned = false;
         return self;
@@ -359,11 +368,13 @@ pub const Cluster = struct {
         self: *Cluster,
         allocator: std.mem.Allocator,
         data_dir: []const u8,
+        store_filename: []const u8,
         user_ctx: ?*anyopaque,
     ) void {
         self.* = .{
             .allocator = allocator,
             .data_dir = data_dir,
+            .store_filename = store_filename,
             .raft = undefined,
             .raft_owned = false,
             .user_ctx = user_ctx,
@@ -399,18 +410,18 @@ pub const Cluster = struct {
     }
 
     /// Register an apply handler for an envelope type byte. Types
-    /// 0 and 1 are reserved for the library (writeset, multi);
-    /// attempting to override them returns `error.OutOfMemory` as
-    /// a stand-in for "reserved" (will refine when the error set
-    /// is more specific).
+    /// 0 (writeset) and 1 (multi) ship with library defaults
+    /// (`Cluster.applyWriteSet` / `applyMulti`); passing them here
+    /// replaces the default. Custom handlers for type 0 are the
+    /// loop46 pattern — they call `Cluster.applyWriteSet` to chain
+    /// to the default behavior, then layer in app-specific post-
+    /// processing (e.g., follower-side deployment loader enqueue
+    /// on a `_deploy/current` write).
     pub fn registerEnvelope(
         self: *Cluster,
         type_byte: u8,
         registration: EnvelopeRegistration,
     ) !void {
-        if (type_byte == ENVELOPE_TYPE_WRITESET or type_byte == ENVELOPE_TYPE_MULTI) {
-            return error.OutOfMemory; // "reserved" — caller picks another type byte
-        }
         self.handlers[type_byte] = registration;
     }
 
@@ -422,7 +433,7 @@ pub const Cluster = struct {
     pub fn openStore(self: *Cluster, store_id: []const u8) !*KvStore {
         if (self.stores.get(store_id)) |existing| return existing;
 
-        const path = try storePath(self.allocator, self.data_dir, store_id);
+        const path = try storePath(self.allocator, self.data_dir, store_id, self.store_filename);
         defer self.allocator.free(path);
 
         const store = try KvStore.open(self.allocator, path);
