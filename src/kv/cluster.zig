@@ -294,15 +294,10 @@ pub const Cluster = struct {
     raft_owned: bool = true,
     user_ctx: ?*anyopaque,
 
-    /// kvexp stack — owned by the cluster, opened in `initFields`.
-    /// One manifest holds every store this cluster serves. Heap-
-    /// allocated so the manifest's internal page-allocator
-    /// captured `&manifest` pointer stays stable across moves
-    /// (Manifest.init writes its own pointer into the page
-    /// allocator ctx).
-    kvexp_file: *kvexp.PagedFile,
-    kvexp_pool: *kvexp.BufferPool,
-    kvexp_cache: *kvexp.PageCache,
+    /// kvexp manifest — owned by the cluster, opened in `initFields`.
+    /// One manifest (LMDB env) holds every store this cluster
+    /// serves. Heap-allocated for pointer stability.
+    kvexp_path: [:0]u8,
     kvexp_manifest: *kvexp.Manifest,
 
     /// Lazy per-store-name → handle cache. Values are KvStore
@@ -406,8 +401,8 @@ pub const Cluster = struct {
         root_store_name: []const u8,
         user_ctx: ?*anyopaque,
     ) !void {
-        // Ensure data_dir exists before we try to open the kvexp
-        // file inside it.
+        // kvexp's LMDB env runs with MDB_NOSUBDIR — `path` is a
+        // single file. Ensure the containing data_dir exists.
         std.fs.cwd().makePath(data_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
@@ -419,33 +414,11 @@ pub const Cluster = struct {
             .{ data_dir, manifest_filename },
             0,
         );
-        defer allocator.free(path);
-
-        const file_ptr = try allocator.create(kvexp.PagedFile);
-        errdefer allocator.destroy(file_ptr);
-        file_ptr.* = try kvexp.PagedFile.open(path, .{
-            .create = true,
-            .page_size = kvexp.PAGE_SIZE_DEFAULT,
-        });
-        errdefer file_ptr.close();
-
-        const pool_ptr = try allocator.create(kvexp.BufferPool);
-        errdefer allocator.destroy(pool_ptr);
-        pool_ptr.* = try kvexp.BufferPool.init(
-            allocator,
-            kvexp.PAGE_SIZE_DEFAULT,
-            CLUSTER_POOL_PAGES,
-        );
-        errdefer pool_ptr.deinit(allocator);
-
-        const cache_ptr = try allocator.create(kvexp.PageCache);
-        errdefer allocator.destroy(cache_ptr);
-        cache_ptr.* = try kvexp.PageCache.init(allocator, file_ptr.api(), pool_ptr, .{});
-        errdefer cache_ptr.deinit();
+        errdefer allocator.free(path);
 
         const manifest_ptr = try allocator.create(kvexp.Manifest);
         errdefer allocator.destroy(manifest_ptr);
-        try manifest_ptr.init(allocator, cache_ptr, file_ptr.api());
+        try manifest_ptr.init(allocator, path, .{});
         errdefer manifest_ptr.deinit();
 
         self.* = .{
@@ -455,9 +428,7 @@ pub const Cluster = struct {
             .raft = undefined,
             .raft_owned = false,
             .user_ctx = user_ctx,
-            .kvexp_file = file_ptr,
-            .kvexp_pool = pool_ptr,
-            .kvexp_cache = cache_ptr,
+            .kvexp_path = path,
             .kvexp_manifest = manifest_ptr,
             .stores = .empty,
             // Seed from the manifest's persisted watermark — that's
@@ -487,12 +458,7 @@ pub const Cluster = struct {
         );
         self.kvexp_manifest.deinit();
         self.allocator.destroy(self.kvexp_manifest);
-        self.kvexp_cache.deinit();
-        self.allocator.destroy(self.kvexp_cache);
-        self.kvexp_pool.deinit(self.allocator);
-        self.allocator.destroy(self.kvexp_pool);
-        self.kvexp_file.close();
-        self.allocator.destroy(self.kvexp_file);
+        self.allocator.free(self.kvexp_path);
     }
 
     pub fn deinit(self: *Cluster) void {
@@ -922,9 +888,7 @@ test "register envelope rejects reserved types" {
         .raft = undefined,
         .raft_owned = false,
         .user_ctx = null,
-        .kvexp_file = undefined,
-        .kvexp_pool = undefined,
-        .kvexp_cache = undefined,
+        .kvexp_path = undefined,
         .kvexp_manifest = undefined,
     };
     c.handlers[ENVELOPE_TYPE_WRITESET] = .{ .apply = Cluster.applyWriteSet, .leader_skip = true };

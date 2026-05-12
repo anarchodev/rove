@@ -160,16 +160,17 @@ pub const SeqCounterRegistry = struct {
 // ── Standalone stack (owned by KvStore in standalone mode) ──────────
 
 const StandaloneStack = struct {
-    file: kvexp.PagedFile,
-    pool: kvexp.BufferPool,
-    cache: kvexp.PageCache,
+    /// `path` is a directory under kvexp's LMDB convention (the env
+    /// dir holds `data.mdb` + `lock.mdb`).
+    path: [:0]u8,
     manifest: kvexp.Manifest,
 };
 
-/// kvexp buffer pool capacity for standalone mode. Conservative; the
-/// pre-cutover SQLite default page cache was 200KB and we don't want
-/// standalone-mode footprint to balloon. 256 pages × 4KB = 1 MB.
-const STANDALONE_POOL_PAGES: usize = 256;
+/// LMDB mmap size cap for standalone-mode KvStores. Sparse — only
+/// touched pages cost memory. Default 1 GiB is plenty for the small
+/// scratch-only consumers (bootstrap.zig, deployStarterContent
+/// transients, tests).
+const STANDALONE_MAP_SIZE: usize = 1 * 1024 * 1024 * 1024;
 
 /// Reserved store_id for standalone-mode KvStores. The file holds
 /// exactly one store (this caller's data).
@@ -197,6 +198,11 @@ pub const KvStore = struct {
     counter: *SeqCounter,
     owned_counter: ?SeqCounter,
     owned: ?*StandaloneStack,
+    /// In-flight tracked txn whose write buffer overlays this store.
+    /// `get`/`prefix` consult the txn's overlay stack before falling
+    /// through to kvexp. Per-tenant serialization means at most one
+    /// active txn per store at any time; no synchronization needed.
+    active_txn: ?*TrackedTxn = null,
 
     /// Open a standalone, self-contained KvStore against `path`. The
     /// file is created if missing; a single store (id =
@@ -314,6 +320,7 @@ pub const KvStore = struct {
         self.manifest = manifest;
         self.store_id = store_id;
         self.owned = null;
+        self.active_txn = null;
         if (shared_counter) |sc| {
             self.counter = sc;
             self.owned_counter = null;
@@ -353,34 +360,33 @@ pub const KvStore = struct {
         const stack = allocator.create(StandaloneStack) catch return Error.OutOfMemory;
         errdefer allocator.destroy(stack);
 
-        stack.file = kvexp.PagedFile.open(path, .{
-            .create = mode == .read_write,
-            .page_size = kvexp.PAGE_SIZE_DEFAULT,
-        }) catch return Error.Io;
-        errdefer stack.file.close();
+        // kvexp's LMDB env runs with MDB_NOSUBDIR — `path` is a
+        // single file. Make sure the parent dir exists before
+        // LMDB tries to open the file there.
+        if (mode == .read_write) {
+            if (std.fs.path.dirname(path)) |parent| {
+                std.fs.cwd().makePath(parent) catch |err| switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return Error.Io,
+                };
+            }
+        }
 
-        stack.pool = kvexp.BufferPool.init(
-            allocator,
-            kvexp.PAGE_SIZE_DEFAULT,
-            STANDALONE_POOL_PAGES,
-        ) catch return Error.OutOfMemory;
-        errdefer stack.pool.deinit(allocator);
-
-        stack.cache = kvexp.PageCache.init(
-            allocator,
-            stack.file.api(),
-            &stack.pool,
-            .{},
-        ) catch return Error.OutOfMemory;
-        errdefer stack.cache.deinit();
-
-        stack.manifest.init(allocator, &stack.cache, stack.file.api()) catch return Error.Sqlite;
+        const path_owned = allocator.dupeZ(u8, path) catch return Error.OutOfMemory;
+        errdefer allocator.free(path_owned);
+        stack.path = path_owned;
+        stack.manifest.init(allocator, path_owned, .{
+            .max_map_size = STANDALONE_MAP_SIZE,
+        }) catch return Error.Sqlite;
         errdefer stack.manifest.deinit();
 
         if (mode == .read_write) {
             const exists = stack.manifest.hasStore(store_id) catch return Error.Sqlite;
             if (!exists) {
                 stack.manifest.createStore(store_id) catch return Error.Sqlite;
+                // durabilize so the store DBI exists on disk;
+                // subsequent attach/open across processes can see it.
+                stack.manifest.durabilize() catch return Error.Io;
             }
         }
 
@@ -388,6 +394,7 @@ pub const KvStore = struct {
         self.manifest = &stack.manifest;
         self.store_id = store_id;
         self.owned = stack;
+        self.active_txn = null;
         if (shared_counter) |sc| {
             self.counter = sc;
             self.owned_counter = null;
@@ -401,16 +408,13 @@ pub const KvStore = struct {
     pub fn close(self: *KvStore) void {
         if (self.owned) |stack| {
             // Final durabilize so a clean close doesn't lose
-            // in-memory writes. Best-effort — if we can't fsync
-            // there's nothing higher up that can do better.
+            // overlay state.
             stack.manifest.durabilize() catch |err| std.log.warn(
                 "kvstore.close: durabilize: {s}",
                 .{@errorName(err)},
             );
             stack.manifest.deinit();
-            stack.cache.deinit();
-            stack.pool.deinit(self.allocator);
-            stack.file.close();
+            self.allocator.free(stack.path);
             self.allocator.destroy(stack);
         }
         const allocator = self.allocator;
@@ -442,6 +446,21 @@ pub const KvStore = struct {
     // ── Core ops ────────────────────────────────────────────────
 
     pub fn get(self: *KvStore, key: []const u8) Error![]u8 {
+        // Tracked-txn overlay: writes during an in-flight txn live
+        // in the txn's overlay stack until commit. Reads must see
+        // those writes (handler's own read-after-write within a
+        // request). Top-of-stack wins; tombstone → NotFound.
+        if (self.active_txn) |txn| {
+            switch (txn.lookupOverlay(key)) {
+                .hit_value => |v| {
+                    const copy = self.allocator.alloc(u8, v.len) catch return Error.OutOfMemory;
+                    if (v.len > 0) @memcpy(copy, v);
+                    return copy;
+                },
+                .hit_tombstone => return Error.NotFound,
+                .miss => {},
+            }
+        }
         var store = kvexp.Store.open(self.manifest, self.store_id) catch return Error.Sqlite;
         defer store.deinit();
         const v = store.get(self.allocator, key) catch |err| switch (err) {
@@ -674,34 +693,50 @@ pub const KvStore = struct {
         try writeManifestFile(self.allocator, target_path, buf.items);
     }
 
-    // ── Tracked transactions (root-pointer revert) ──────────────
+    // ── Tracked transactions (overlay-stack rollback) ──────────────
     //
-    // kvexp's optimistic-write rollback is "capture the store's
-    // root pointer before writing; on raft reject, setStoreRoot
-    // back to it." This replaces the SQLite kv_undo table.
+    // Writes during a tracked txn land in a per-txn overlay rather
+    // than the store memtable. Reads through this KvStore (via the
+    // `active_txn` registration) consult the overlay stack top-down
+    // before falling through to kvexp, so the handler's own write-
+    // then-read within a request sees its pending writes.
     //
-    // The contract: callers must hold the per-store lock for the
-    // life of the tracked txn (no other writer races). kvexp's
-    // `Manifest.storeLock(id)` provides this; the dispatcher
-    // already serializes per-tenant writes.
+    // Lifecycle:
+    //   open       — push base overlay; register as active_txn
+    //   savepoint  — push another overlay onto the stack
+    //   release    — pop top, fold its entries into the level below
+    //   rollbackTo — pop top, discarding its entries
+    //   commit     — flush bottom overlay into store memtable, then
+    //                deinit; clear active_txn
+    //   rollback   — deinit overlays without flushing; clear active_txn
+    //
+    // The per-tenant lock held by the dispatcher batch ensures only
+    // one tracked txn per store at a time, so no synchronization is
+    // needed on the active_txn pointer or the overlays.
+
+    const OverlayEntry = struct {
+        /// null → tombstone (delete). Non-null → put value. Both
+        /// key (HashMap key) and value bytes live in the txn arena.
+        value: ?[]const u8,
+    };
+
+    const TxnOverlay = std.StringHashMapUnmanaged(OverlayEntry);
+
+    pub const OverlayLookup = union(enum) {
+        miss,
+        hit_value: []const u8,
+        hit_tombstone,
+    };
 
     pub const TrackedTxn = struct {
         store: *KvStore,
-        /// Monotonic identifier for this txn. Used by callers as a
-        /// breadcrumb (e.g., correlating raft proposals to
-        /// in-flight writers). Allocated from the store's
-        /// `SeqCounter` on `ensureOpen`.
         txn_seq: u64,
         kind: enum { normal, immediate },
         opened: bool,
-        /// Store root captured at `ensureOpen`. `rollback` reverts
-        /// the store to this root; null while the txn is closed.
-        pre_root: ?u64 = null,
-        /// Savepoint root for the innermost open savepoint. Single
-        /// level (matches the SQLite-era usage which only ever
-        /// stacked one savepoint named `h`). `null` when no
-        /// savepoint is open.
-        save_root: ?u64 = null,
+        /// Arena owns all key/value bytes copied into the overlays.
+        /// Lazily initialized on first push.
+        arena: ?std.heap.ArenaAllocator = null,
+        overlays: std.ArrayListUnmanaged(TxnOverlay) = .empty,
 
         pub fn open(self: *TrackedTxn) Error!void {
             return self.ensureOpen();
@@ -709,76 +744,160 @@ pub const KvStore = struct {
 
         fn ensureOpen(self: *TrackedTxn) Error!void {
             if (self.opened) return;
-            const pre = self.store.manifest.storeRoot(self.store.store_id) catch
-                return Error.Sqlite;
-            self.pre_root = pre orelse 0;
-            // Bump apply seq so subsequent writes CoW into fresh
-            // pages instead of mutating pre_root's pages in place.
-            // Without this, kvexp's same-apply-unit hybrid would
-            // clobber the captured pre-image and `rollback` would
-            // be a silent no-op.
-            _ = self.store.manifest.nextApply();
+            std.debug.assert(self.store.active_txn == null);
             self.txn_seq = self.store.counter.next();
+            try self.pushOverlay();
+            self.store.active_txn = self;
             self.opened = true;
+        }
+
+        fn pushOverlay(self: *TrackedTxn) Error!void {
+            if (self.arena == null) {
+                self.arena = std.heap.ArenaAllocator.init(self.store.allocator);
+            }
+            self.overlays.append(self.store.allocator, .{}) catch
+                return Error.OutOfMemory;
+        }
+
+        /// Lookup `key` in the overlay stack, top-down. Used by
+        /// `KvStore.get` when a tracked txn is active.
+        pub fn lookupOverlay(self: *TrackedTxn, key: []const u8) OverlayLookup {
+            var i: usize = self.overlays.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (self.overlays.items[i].get(key)) |entry| {
+                    return if (entry.value) |v| .{ .hit_value = v } else .hit_tombstone;
+                }
+            }
+            return .miss;
+        }
+
+        fn putOverlay(self: *TrackedTxn, key: []const u8, value: ?[]const u8) Error!void {
+            std.debug.assert(self.overlays.items.len > 0);
+            const arena_alloc = self.arena.?.allocator();
+            // Dup the value first so a failure doesn't leave a
+            // dangling key entry. Dup key only if we're inserting
+            // a new entry (existing entry reuses its key slot).
+            const value_dup: ?[]const u8 = if (value) |v| blk: {
+                const copy = arena_alloc.alloc(u8, v.len) catch return Error.OutOfMemory;
+                if (v.len > 0) @memcpy(copy, v);
+                break :blk copy;
+            } else null;
+
+            const top = &self.overlays.items[self.overlays.items.len - 1];
+            const gop = top.getOrPut(self.store.allocator, key) catch return Error.OutOfMemory;
+            if (!gop.found_existing) {
+                const key_dup = arena_alloc.alloc(u8, key.len) catch return Error.OutOfMemory;
+                if (key.len > 0) @memcpy(key_dup, key);
+                gop.key_ptr.* = key_dup;
+            }
+            gop.value_ptr.* = .{ .value = value_dup };
         }
 
         pub fn put(self: *TrackedTxn, key: []const u8, value: []const u8) Error!void {
             try self.ensureOpen();
-            try self.store.put(key, value);
+            try self.putOverlay(key, value);
         }
 
         pub fn delete(self: *TrackedTxn, key: []const u8) Error!void {
             try self.ensureOpen();
-            try self.store.delete(key);
+            try self.putOverlay(key, null);
         }
 
         pub fn savepoint(self: *TrackedTxn) Error!void {
             try self.ensureOpen();
-            const root = self.store.manifest.storeRoot(self.store.store_id) catch
-                return Error.Sqlite;
-            self.save_root = root orelse 0;
-            // Same reason as `ensureOpen`: fresh apply seq so the
-            // save_root's pages aren't clobbered by subsequent
-            // in-place mutations within this txn.
-            _ = self.store.manifest.nextApply();
+            try self.pushOverlay();
         }
 
+        /// Release the top savepoint: fold its entries into the
+        /// level below. Top wins on key collisions.
         pub fn release(self: *TrackedTxn) Error!void {
-            self.save_root = null;
+            if (!self.opened) return;
+            if (self.overlays.items.len < 2) return;
+            var top = self.overlays.pop().?;
+            defer top.deinit(self.store.allocator);
+            const below = &self.overlays.items[self.overlays.items.len - 1];
+            var it = top.iterator();
+            while (it.next()) |entry| {
+                const gop = below.getOrPut(self.store.allocator, entry.key_ptr.*) catch
+                    return Error.OutOfMemory;
+                // Arena owns the bytes; aliasing the same arena
+                // slice in the lower level is safe — both layers
+                // free together when the txn ends.
+                gop.value_ptr.* = entry.value_ptr.*;
+            }
         }
 
+        /// Discard the top savepoint. Bytes stay in the arena until
+        /// the txn ends — not worth a per-level arena.
         pub fn rollbackTo(self: *TrackedTxn) Error!void {
-            const root = self.save_root orelse return;
-            self.store.manifest.setStoreRoot(self.store.store_id, root) catch
-                return Error.Sqlite;
-            self.save_root = null;
+            if (!self.opened) return;
+            if (self.overlays.items.len < 2) return;
+            var top = self.overlays.pop().?;
+            top.deinit(self.store.allocator);
         }
 
         pub fn commit(self: *TrackedTxn) Error!void {
-            // No-op: kvexp commits each put/delete immediately.
-            // The raft propose follows; if it rejects, the caller
-            // routes to `rollback` which uses `pre_root`.
+            if (!self.opened) return;
+            try self.flushToStore();
+            self.deinitOverlays();
+            self.store.active_txn = null;
             self.opened = false;
         }
 
         pub fn rollback(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
-            const root = self.pre_root orelse 0;
-            self.store.manifest.setStoreRoot(self.store.store_id, root) catch
-                return Error.Sqlite;
+            self.deinitOverlays();
+            self.store.active_txn = null;
             self.opened = false;
+        }
+
+        /// Flush the overlay stack to the store memtable. Walks
+        /// top-down so the first hit per key wins (matches the
+        /// overlay read order); same-key writes lower in the stack
+        /// are skipped.
+        fn flushToStore(self: *TrackedTxn) Error!void {
+            if (self.overlays.items.len == 0) return;
+            var applied: std.StringHashMapUnmanaged(void) = .empty;
+            defer applied.deinit(self.store.allocator);
+            var i: usize = self.overlays.items.len;
+            while (i > 0) {
+                i -= 1;
+                var it = self.overlays.items[i].iterator();
+                while (it.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    const gop = applied.getOrPut(self.store.allocator, key) catch
+                        return Error.OutOfMemory;
+                    if (gop.found_existing) continue;
+                    if (entry.value_ptr.*.value) |v| {
+                        try self.store.put(key, v);
+                    } else {
+                        try self.store.delete(key);
+                    }
+                }
+            }
+        }
+
+        fn deinitOverlays(self: *TrackedTxn) void {
+            for (self.overlays.items) |*o| o.deinit(self.store.allocator);
+            self.overlays.deinit(self.store.allocator);
+            self.overlays = .empty;
+            if (self.arena) |*a| a.deinit();
+            self.arena = null;
         }
     };
 
     pub fn beginTracked(self: *KvStore) Error!TrackedTxn {
-        var txn: TrackedTxn = .{
+        // Lazy ensureOpen: registration of `active_txn` must happen
+        // on the caller's stack slot, not this function's local
+        // (which gets copied on return and the local pointer dies).
+        // First put/delete/savepoint/get triggers ensureOpen.
+        return .{
             .store = self,
             .txn_seq = 0,
             .kind = .normal,
             .opened = false,
         };
-        try txn.ensureOpen();
-        return txn;
     }
 
     pub fn beginTrackedImmediate(self: *KvStore) Error!TrackedTxn {
@@ -833,31 +952,21 @@ fn writeManifestFile(
     target_path: [:0]const u8,
     dump_bytes: []const u8,
 ) Error!void {
-    var target_file = kvexp.PagedFile.open(target_path, .{
-        .create = true,
-        .truncate = true,
-        .page_size = kvexp.PAGE_SIZE_DEFAULT,
-    }) catch return Error.Io;
-    defer target_file.close();
-
-    var target_pool = kvexp.BufferPool.init(
-        allocator,
-        kvexp.PAGE_SIZE_DEFAULT,
-        STANDALONE_POOL_PAGES,
-    ) catch return Error.OutOfMemory;
-    defer target_pool.deinit(allocator);
-
-    var target_cache = kvexp.PageCache.init(
-        allocator,
-        target_file.api(),
-        &target_pool,
-        .{},
-    ) catch return Error.OutOfMemory;
-    defer target_cache.deinit();
+    // target_path is a single LMDB file (MDB_NOSUBDIR). Wipe the
+    // data + lock files so the new manifest starts fresh.
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = std.fmt.bufPrint(&lock_buf, "{s}-lock", .{target_path}) catch
+        return Error.Io;
+    std.fs.cwd().deleteFile(target_path) catch {};
+    std.fs.cwd().deleteFile(lock_path) catch {};
+    if (std.fs.path.dirname(target_path)) |parent| {
+        std.fs.cwd().makePath(parent) catch return Error.Io;
+    }
 
     var target_manifest: kvexp.Manifest = undefined;
-    target_manifest.init(allocator, &target_cache, target_file.api()) catch
-        return Error.Sqlite;
+    target_manifest.init(allocator, target_path, .{
+        .max_map_size = STANDALONE_MAP_SIZE,
+    }) catch return Error.Sqlite;
     defer target_manifest.deinit();
 
     var stream = std.io.fixedBufferStream(dump_bytes);
@@ -917,7 +1026,11 @@ fn tmpDbPath(buf: *[64]u8) [:0]const u8 {
 }
 
 fn cleanupDb(path: [:0]const u8) void {
+    // LMDB (NOSUBDIR) writes `path` and `path-lock`.
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = std.fmt.bufPrint(&lock_buf, "{s}-lock", .{path}) catch return;
     std.fs.cwd().deleteFile(path) catch {};
+    std.fs.cwd().deleteFile(lock_path) catch {};
 }
 
 test "open, put, get, delete" {
@@ -1101,18 +1214,10 @@ test "attached vacuumInto round-trips data via standalone re-open" {
     }) catch unreachable;
     defer cleanupDb(src_path);
 
-    // Build a kvexp stack outside any KvStore so we can attach.
-    var file = try kvexp.PagedFile.open(src_path, .{
-        .create = true,
-        .page_size = kvexp.PAGE_SIZE_DEFAULT,
-    });
-    defer file.close();
-    var pool = try kvexp.BufferPool.init(a, kvexp.PAGE_SIZE_DEFAULT, STANDALONE_POOL_PAGES);
-    defer pool.deinit(a);
-    var cache = try kvexp.PageCache.init(a, file.api(), &pool, .{});
-    defer cache.deinit();
+    // Build a kvexp manifest outside any KvStore so we can attach.
+    cleanupDb(src_path);
     var manifest: kvexp.Manifest = undefined;
-    try manifest.init(a, &cache, file.api());
+    try manifest.init(a, src_path, .{ .max_map_size = STANDALONE_MAP_SIZE });
     defer manifest.deinit();
 
     const acme_id = hashStoreId("acme");

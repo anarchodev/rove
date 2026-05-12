@@ -86,6 +86,7 @@ for i in 0 1 2; do
         --workers "$WORKERS" \
         --rate-limit-request-capacity 1000000 \
         --rate-limit-request-refill 1000000 \
+        --snapshot-interval-ms 1000 \
         "${RAFT_TIMING_FLAGS[@]}" \
         >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
     PIDS+=($!)

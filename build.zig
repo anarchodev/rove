@@ -41,14 +41,17 @@ pub fn build(b: *std.Build) void {
     h2_mod.linkSystemLibrary("crypto", .{});
 
     // ── kvexp: vendored embedded multi-tenant KV (anarchodev/kvexp).
-    // Pure Zig over io_uring + O_DIRECT (uses std.os.linux.IoUring; no
-    // liburing link needed). Replaces SQLite as the per-tenant state
-    // engine. See vendor/kvexp/README.md + vendor/kvexp/PLAN.md.
+    // LMDB-backed durable B-tree fronted by an in-memory per-store
+    // memtable (overlay). Links against system liblmdb. Replaces
+    // SQLite as the per-tenant state engine. See
+    // vendor/kvexp/README.md.
     const kvexp_mod = b.addModule("kvexp", .{
         .root_source_file = b.path("vendor/kvexp/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    kvexp_mod.link_libc = true;
+    kvexp_mod.linkSystemLibrary("lmdb", .{});
 
     // ── rove-kv: KV store + raft. Standalone leaf module — does NOT
     // depend on rove or rove-io. raft_net is a direct liburing wrapper;
