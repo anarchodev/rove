@@ -289,7 +289,8 @@ S3 PUT is the only sink; standalone log-server is the only reader.
 A standalone binary (`rove-log-server`) with two cooperating jobs:
 
 1. **Background indexing task** keeps `log_index.db` in sync with the
-   S3 bucket (the polling loop in §4.3).
+   S3 bucket (the polling loop in §4.3), plus a push endpoint for
+   freshly-written batches (§4.5).
 2. **Public HTTP API** on `logs.{public_suffix}` (own TLS, own h2
    listener) serves dashboard / customer queries against the index
    (§5).
@@ -414,6 +415,54 @@ iteration walks the entire bucket. With embedded-sidecar heads at
 ~90 GB of GETs to rebuild a year (note: only the head bytes per
 object, not the full frames region). Bounded; acceptable for a
 one-shot recovery.
+
+### 4.5 Push endpoint (worker→log-server, commit `a42bb6c`)
+
+The 500ms polling loop is the catch-up path, but on S3-compatible
+providers with eventually-consistent LIST (OVH being the practical
+case), there's a window where a freshly-PUT batch is GET-able but
+not yet visible to LIST. Under sustained S3 load the window can
+stretch from milliseconds to tens of seconds.
+
+The push endpoint closes it: after the worker's flush PUTs a batch,
+it POSTs the resulting S3 key to log-server:
+
+```
+POST https://logs.{public_suffix}/v1/_internal/batch-pushed
+Authorization: Bearer <services-jwt>   (60s-expiry, minted per flush)
+X-Rove-Batch-Key: _logs/{node_hex}/{batch_id}.ndjson
+```
+
+log-server calls `indexer.indexOneKey(key)` — a thin wrapper that
+GETs the named object directly, parses the embedded sidecar, and
+inserts into `log_index.db`. GET-by-key is read-after-write
+consistent on every S3 implementation we care about even when LIST
+isn't, so the indexer sees the record within ~tens of ms of the
+PUT completing.
+
+Failure modes:
+
+- Push dropped (timeout, log-server restart): polling picks the
+  batch up on the next cycle. Push has a 500ms total timeout; the
+  worker doesn't wait or retry.
+- Wrong batch key shape: 400. The endpoint validates
+  `_logs/.../….ndjson` to prevent JWT-authorized attackers from
+  probing arbitrary S3 keys via this surface.
+- S3 fetch fails for a real reason: indexer logs and returns 500;
+  caller can re-push or wait for polling.
+
+Properties:
+- Polling stays as the source of truth for completeness. The push
+  is a latency optimization, not a correctness path.
+- `INSERT OR IGNORE` in `log_index.insertBatch` makes the push
+  idempotent with any subsequent poll.
+- The push is fire-and-forget from the worker; flushLogs's hot path
+  isn't blocked on log-server availability.
+
+Worker-side wiring (`src/js/worker.zig:pushBatchKey`): own libcurl
+Easy handle (`log_push_curl`) so the push works in deployments that
+don't have sse-server configured. Mints a fresh JWT each flush using
+the existing `services_jwt_secret` shared with log-server.
 
 ---
 

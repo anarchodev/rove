@@ -235,6 +235,29 @@ Also dropped the loader thunk's `currentDeploymentId == dep_id`
 short-circuit and `reloadDeployment`'s cached-manifest-bytes path
 — same content-vs-counter mismatch.
 
+#### Follow-up: content-addressed dep_id (commit `70c32c6`)
+
+After phase 2 landed, the three loader workarounds got removed by
+fixing the root cause: dep_ids are no longer sequential local
+counters. `files_mod.manifest_json.computeDeploymentId(entries)`
+takes the first 8 bytes of sha-256 over the canonical (sorted-by-
+path, NUL-separated) entries representation. Same content → same
+id, deterministically, across processes. The loader's short-circuit
+is back (and now sound); `handleRelease`'s fast-path keeps the
+defensive loader-enqueue as belt-and-braces.
+
+Wire format change: manifest's `deployment_id` JSON field is a
+16-char hex string (was a number) so high-bit-set hashes don't trip
+std.json's i64 `.integer` variant. Log-record sidecar parser accepts
+both `.integer` and `.number_string`. SQLite log index uses
+`@bitCast` for the u64 ↔ i64 reinterpret.
+
+Release order: a separate per-tenant `_release/{ts_ms:020}` →
+`{id:016x}` side table records the chronological sequence of
+releases, written through raft alongside `_deploy/current` in the
+same `/_system/release` envelope. Decouples chronology from id so
+the dashboard's Deploys tab can still list newest-first.
+
 Snapshot construction in phase 2 *still re-fetches every bytecode*.
 That's a regression vs phase 1 (which reused the in-memory map). The
 phase 3 cache restores reuse and goes beyond it.
