@@ -1159,19 +1159,10 @@ pub fn tickRaftCapture(
     const start_ns = std.time.nanoTimestamp();
     const apply_position = raft.snapshotLastIdx();
 
-    // Stamp the manifest watermark + durabilize. One fsync
-    // persists every dirty page across every store inside
-    // cluster.kv; intermediate page versions are elided as
-    // orphans (kvexp PLAN §7.3). Cost is O(dirty pages),
-    // independent of tenant count.
-    cluster.kvexp_manifest.setLastAppliedRaftIdx(apply_position) catch |err| {
-        std.log.warn(
-            "snapshot: tickRaftCapture: setLastAppliedRaftIdx failed: {s}",
-            .{@errorName(err)},
-        );
-        return null;
-    };
-    cluster.kvexp_manifest.durabilize() catch |err| {
+    // Atomic durabilize: folds every tenant's main_overlay into
+    // LMDB and stamps the watermark in one write txn. Cost is
+    // O(dirty entries), independent of tenant count.
+    cluster.kvexp_manifest.durabilize(apply_position) catch |err| {
         std.log.warn(
             "snapshot: tickRaftCapture: durabilize failed: {s}",
             .{@errorName(err)},

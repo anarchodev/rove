@@ -433,7 +433,7 @@ pub const Cluster = struct {
             .stores = .empty,
             // Seed from the manifest's persisted watermark — that's
             // where snapshot tick writes it.
-            .global_apply_idx = manifest_ptr.lastAppliedRaftIdx(),
+            .global_apply_idx = manifest_ptr.durableRaftIdx() catch 0,
             .root_store = null,
             .handlers = [_]?EnvelopeRegistration{null} ** 256,
         };
@@ -452,7 +452,10 @@ pub const Cluster = struct {
     /// clean cluster.deinit doesn't lose in-memory writes. Used by
     /// `deinit` and on `init`/`initWithExternalRaft` error paths.
     fn tearDownStack(self: *Cluster) void {
-        self.kvexp_manifest.durabilize() catch |err| std.log.warn(
+        // Stamp the current global_apply_idx so the watermark reflects
+        // everything we've folded into main_overlay. 0 means "don't
+        // touch the watermark" (kvexp aliases that to commit()).
+        self.kvexp_manifest.durabilize(self.global_apply_idx) catch |err| std.log.warn(
             "cluster.tearDownStack: durabilize: {s}",
             .{@errorName(err)},
         );
@@ -545,7 +548,7 @@ pub const Cluster = struct {
 
     /// Lazily open the cluster's root store. First-open seeds
     /// `global_apply_idx` from the manifest's
-    /// `lastAppliedRaftIdx` (0 on a fresh data dir, the
+    /// `durableRaftIdx` (0 on a fresh data dir, the
     /// persisted floor on a restart).
     pub fn openRoot(self: *Cluster) !*KvStore {
         if (self.root_store) |existing| return existing;
@@ -685,19 +688,10 @@ pub const Cluster = struct {
         const start_ns = std.time.nanoTimestamp();
         const apply_position = self.raft.snapshotLastIdx();
 
-        // Stamp the manifest's last-applied watermark and
-        // durabilize. One fsync persists every dirty page across
-        // every store; intermediate page versions get elided as
-        // orphans (kvexp PLAN §7.3). Cost is O(dirty pages),
-        // independent of tenant count.
-        self.kvexp_manifest.setLastAppliedRaftIdx(apply_position) catch |err| {
-            std.log.warn(
-                "cluster.tickSnapshot: setLastAppliedRaftIdx failed: {s}",
-                .{@errorName(err)},
-            );
-            return null;
-        };
-        self.kvexp_manifest.durabilize() catch |err| {
+        // Atomic durabilize: folds every tenant's main_overlay into
+        // LMDB and stamps the raft watermark in the same write txn.
+        // Cost is O(dirty entries), independent of tenant count.
+        self.kvexp_manifest.durabilize(apply_position) catch |err| {
             std.log.warn(
                 "cluster.tickSnapshot: durabilize failed: {s}",
                 .{@errorName(err)},

@@ -184,6 +184,59 @@ pub fn hashStoreId(id_str: []const u8) u64 {
     return std.hash.Wyhash.hash(0, id_str);
 }
 
+/// Process-global per-(manifest, store_id) outer-mutex registry.
+///
+/// Required because kvexp's top-level `Txn.commit` is chain-head-only,
+/// so concurrent TrackedTxns on the same tenant would commit out of
+/// order. Multiple `*KvStore` instances frequently resolve to the same
+/// kvexp store_id (cluster caches one; tenant.Instance attaches its
+/// own; files-server attaches its own); they must share the same
+/// outer mutex to serialize correctly.
+///
+/// Keyed by `(@intFromPtr(manifest), store_id)`. The map and its
+/// per-entry mutexes leak — process lifetime, bounded by the
+/// (manifest × tenant) cardinality.
+const TxnLockKey = struct { manifest: usize, store_id: u64 };
+const TxnLockMap = std.HashMapUnmanaged(
+    TxnLockKey,
+    *std.Thread.Mutex,
+    struct {
+        pub fn hash(_: @This(), k: TxnLockKey) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(std.mem.asBytes(&k.manifest));
+            h.update(std.mem.asBytes(&k.store_id));
+            return h.final();
+        }
+        pub fn eql(_: @This(), a: TxnLockKey, b: TxnLockKey) bool {
+            return a.manifest == b.manifest and a.store_id == b.store_id;
+        }
+    },
+    std.hash_map.default_max_load_percentage,
+);
+
+var txn_lock_registry: TxnLockMap = .empty;
+var txn_lock_registry_mutex: std.Thread.Mutex = .{};
+
+fn lookupTxnLock(
+    manifest: *kvexp.Manifest,
+    store_id: u64,
+) Error!*std.Thread.Mutex {
+    // Use page_allocator for registry entries: they're process-lifetime
+    // and don't belong to any caller's allocator (e.g., the testing
+    // allocator would flag them as leaks).
+    const a = std.heap.page_allocator;
+    txn_lock_registry_mutex.lock();
+    defer txn_lock_registry_mutex.unlock();
+    const key: TxnLockKey = .{ .manifest = @intFromPtr(manifest), .store_id = store_id };
+    const gop = txn_lock_registry.getOrPut(a, key) catch return Error.OutOfMemory;
+    if (!gop.found_existing) {
+        const m = a.create(std.Thread.Mutex) catch return Error.OutOfMemory;
+        m.* = .{};
+        gop.value_ptr.* = m;
+    }
+    return gop.value_ptr.*;
+}
+
 // ── KvStore ────────────────────────────────────────────────────────
 
 pub const KvStore = struct {
@@ -200,9 +253,15 @@ pub const KvStore = struct {
     owned: ?*StandaloneStack,
     /// In-flight tracked txn whose write buffer overlays this store.
     /// `get`/`prefix` consult the txn's overlay stack before falling
-    /// through to kvexp. Per-tenant serialization means at most one
-    /// active txn per store at any time; no synchronization needed.
+    /// through to kvexp. Acquired via `txn_lock` so workers on the
+    /// same tenant serialize on the begin..commit window — required
+    /// because kvexp's top-level `Txn.commit` is gated on chain head,
+    /// so out-of-order commits break.
     active_txn: ?*TrackedTxn = null,
+    /// Process-shared per-(manifest, store_id) outer mutex. All
+    /// `*KvStore` instances for the same store resolve to the same
+    /// pointer via `lookupTxnLock`.
+    txn_lock: *std.Thread.Mutex,
 
     /// Open a standalone, self-contained KvStore against `path`. The
     /// file is created if missing; a single store (id =
@@ -321,6 +380,7 @@ pub const KvStore = struct {
         self.store_id = store_id;
         self.owned = null;
         self.active_txn = null;
+        self.txn_lock = try lookupTxnLock(manifest, store_id);
         if (shared_counter) |sc| {
             self.counter = sc;
             self.owned_counter = null;
@@ -386,7 +446,8 @@ pub const KvStore = struct {
                 stack.manifest.createStore(store_id) catch return Error.Sqlite;
                 // durabilize so the store DBI exists on disk;
                 // subsequent attach/open across processes can see it.
-                stack.manifest.durabilize() catch return Error.Io;
+                // raft_idx=0 → don't touch the watermark on bootstrap.
+                stack.manifest.durabilize(0) catch return Error.Io;
             }
         }
 
@@ -395,6 +456,7 @@ pub const KvStore = struct {
         self.store_id = store_id;
         self.owned = stack;
         self.active_txn = null;
+        self.txn_lock = try lookupTxnLock(&stack.manifest, store_id);
         if (shared_counter) |sc| {
             self.counter = sc;
             self.owned_counter = null;
@@ -408,8 +470,8 @@ pub const KvStore = struct {
     pub fn close(self: *KvStore) void {
         if (self.owned) |stack| {
             // Final durabilize so a clean close doesn't lose
-            // overlay state.
-            stack.manifest.durabilize() catch |err| std.log.warn(
+            // overlay state. raft_idx=0 → leave watermark untouched.
+            stack.manifest.durabilize(0) catch |err| std.log.warn(
                 "kvstore.close: durabilize: {s}",
                 .{@errorName(err)},
             );
@@ -446,22 +508,19 @@ pub const KvStore = struct {
     // ── Core ops ────────────────────────────────────────────────
 
     pub fn get(self: *KvStore, key: []const u8) Error![]u8 {
-        // Tracked-txn overlay: writes during an in-flight txn live
-        // in the txn's overlay stack until commit. Reads must see
-        // those writes (handler's own read-after-write within a
-        // request). Top-of-stack wins; tombstone → NotFound.
-        if (self.active_txn) |txn| {
-            switch (txn.lookupOverlay(key)) {
-                .hit_value => |v| {
-                    const copy = self.allocator.alloc(u8, v.len) catch return Error.OutOfMemory;
-                    if (v.len > 0) @memcpy(copy, v);
-                    return copy;
-                },
-                .hit_tombstone => return Error.NotFound,
-                .miss => {},
-            }
+        // If a tracked txn is open, read through it so the handler
+        // sees its own pending writes. kvexp.Txn.get walks the
+        // savepoint chain, then chain backward, then main_overlay,
+        // then LMDB.
+        if (self.active_txn) |t| {
+            const leaf = t.activeLeaf();
+            const v = leaf.get(self.allocator, key) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            return v orelse return Error.NotFound;
         }
-        var store = kvexp.Store.open(self.manifest, self.store_id) catch return Error.Sqlite;
+        var store = self.manifest.openStore(self.store_id) catch return Error.Sqlite;
         defer store.deinit();
         const v = store.get(self.allocator, key) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
@@ -470,13 +529,29 @@ pub const KvStore = struct {
         return v orelse return Error.NotFound;
     }
 
+    /// Direct put. Acquires the per-tenant lock so the one-shot Txn
+    /// is the only entry in the kvexp chain for the duration — same
+    /// guarantee TrackedTxn relies on. The lock is reentrant-ish:
+    /// if the current thread already owns it via a TrackedTxn, we
+    /// route through that txn instead.
     pub fn put(self: *KvStore, key: []const u8, value: []const u8) Error!void {
-        var store = kvexp.Store.open(self.manifest, self.store_id) catch return Error.Sqlite;
-        defer store.deinit();
-        store.put(key, value) catch |err| switch (err) {
+        if (self.active_txn) |t| {
+            const leaf = t.activeLeaf();
+            leaf.put(key, value) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            return;
+        }
+        self.txn_lock.lock();
+        defer self.txn_lock.unlock();
+        var txn = self.manifest.beginTxn(self.store_id) catch return Error.Sqlite;
+        errdefer txn.rollback();
+        txn.put(key, value) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
             else => return Error.Sqlite,
         };
+        txn.commit() catch return Error.Sqlite;
     }
 
     /// Legacy: SQLite-era version that stamped a seq column with
@@ -488,26 +563,40 @@ pub const KvStore = struct {
     }
 
     pub fn delete(self: *KvStore, key: []const u8) Error!void {
-        var store = kvexp.Store.open(self.manifest, self.store_id) catch return Error.Sqlite;
-        defer store.deinit();
-        _ = store.delete(key) catch |err| switch (err) {
+        if (self.active_txn) |t| {
+            const leaf = t.activeLeaf();
+            _ = leaf.delete(key) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            return;
+        }
+        self.txn_lock.lock();
+        defer self.txn_lock.unlock();
+        var txn = self.manifest.beginTxn(self.store_id) catch return Error.Sqlite;
+        errdefer txn.rollback();
+        _ = txn.delete(key) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
             else => return Error.Sqlite,
         };
+        txn.commit() catch return Error.Sqlite;
     }
 
-    /// Read this *manifest*'s last applied raft idx. Note this is
-    /// per-manifest (cluster-wide on production loop46), not
-    /// per-store — matches the kvexp model. Pre-cutover callers
-    /// that read it from `__root__.db` get the same answer.
+    /// Read this *manifest*'s last *durable* raft idx — the value
+    /// last stamped into LMDB by `durabilize(idx)`. In-memory state
+    /// past this is in the main_overlay / open Txns and isn't
+    /// covered until the next durabilize.
     pub fn lastAppliedRaftIdx(self: *KvStore) Error!u64 {
-        return self.manifest.lastAppliedRaftIdx();
+        return self.manifest.durableRaftIdx() catch return Error.Sqlite;
     }
 
-    /// Stamp the manifest's last applied raft idx. Cluster-wide on
-    /// production loop46.
+    /// Stamp the manifest's last applied raft idx by durabilizing
+    /// at `idx`. Folds main_overlay into LMDB and writes the
+    /// watermark atomically. Use this instead of the pre-cutover
+    /// pattern of `setLastAppliedRaftIdx` + later `durabilize` —
+    /// the new API requires those to be the same call.
     pub fn setLastAppliedRaftIdx(self: *KvStore, idx: u64) Error!void {
-        self.manifest.setLastAppliedRaftIdx(idx) catch return Error.Sqlite;
+        self.manifest.durabilize(idx) catch return Error.Sqlite;
     }
 
     /// Prefix scan. Keys whose bytes start with `prefix_bytes`,
@@ -521,11 +610,8 @@ pub const KvStore = struct {
         cursor: []const u8,
         count: u32,
     ) Error!RangeResult {
-        var store = kvexp.Store.open(self.manifest, self.store_id) catch return Error.Sqlite;
-        defer store.deinit();
-        var pc = store.scanPrefix(prefix_bytes) catch return Error.Sqlite;
-        defer pc.deinit();
-
+        // Route through the active txn when one is open, so the
+        // scan sees the handler's pending writes / tombstones.
         var list: std.ArrayList(Entry) = .empty;
         errdefer {
             for (list.items) |e| {
@@ -535,32 +621,17 @@ pub const KvStore = struct {
             list.deinit(self.allocator);
         }
 
-        var collected: u32 = 0;
-        while (collected < count) {
-            const has = pc.next() catch return Error.Sqlite;
-            if (!has) break;
-
-            const k_slice = pc.key();
-            // Cursor handling: skip keys ≤ cursor when a cursor is
-            // supplied and it sorts at-or-above the prefix.
-            if (cursor.len > 0 and !std.mem.lessThan(u8, cursor, prefix_bytes)) {
-                const cmp = std.mem.order(u8, k_slice, cursor);
-                if (cmp == .lt or cmp == .eq) continue;
-            }
-
-            const v_slice = pc.value();
-
-            const k_copy = self.allocator.alloc(u8, k_slice.len) catch return Error.OutOfMemory;
-            errdefer self.allocator.free(k_copy);
-            if (k_slice.len > 0) @memcpy(k_copy, k_slice);
-
-            const v_copy = self.allocator.alloc(u8, v_slice.len) catch return Error.OutOfMemory;
-            errdefer self.allocator.free(v_copy);
-            if (v_slice.len > 0) @memcpy(v_copy, v_slice);
-
-            list.append(self.allocator, .{ .key = k_copy, .value = v_copy }) catch
-                return Error.OutOfMemory;
-            collected += 1;
+        if (self.active_txn) |t| {
+            const leaf = t.activeLeaf();
+            var pc = leaf.scanPrefix(prefix_bytes) catch return Error.Sqlite;
+            defer pc.deinit();
+            try collectPrefix(self.allocator, &pc, prefix_bytes, cursor, count, &list);
+        } else {
+            var store = self.manifest.openStore(self.store_id) catch return Error.Sqlite;
+            defer store.deinit();
+            var pc = store.scanPrefix(prefix_bytes) catch return Error.Sqlite;
+            defer pc.deinit();
+            try collectPrefix(self.allocator, &pc, prefix_bytes, cursor, count, &list);
         }
 
         return .{
@@ -616,7 +687,7 @@ pub const KvStore = struct {
     /// should route through the cluster's tick.
     pub fn checkpoint(self: *KvStore) Error!void {
         if (self.owned) |stack| {
-            stack.manifest.durabilize() catch return Error.Sqlite;
+            stack.manifest.durabilize(0) catch return Error.Sqlite;
         }
     }
 
@@ -651,10 +722,9 @@ pub const KvStore = struct {
     /// place. `target_path` must not already exist.
     pub fn dumpManifestToFile(self: *KvStore, target_path: [:0]const u8) Error!void {
         // Durabilize source so the manifest tree on disk reflects
-        // every in-memory write. Concurrent durabilize from the
-        // raft thread serializes on `tree_lock`; safe but may
-        // wait.
-        self.manifest.durabilize() catch return Error.Io;
+        // every in-memory write. raft_idx=0 → don't touch the
+        // watermark.
+        self.manifest.durabilize(0) catch return Error.Io;
 
         var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
         defer snap.close();
@@ -668,12 +738,9 @@ pub const KvStore = struct {
     }
 
     pub fn vacuumInto(self: *KvStore, target_path: [:0]const u8) Error!void {
-        // Force a durabilize so the manifest tree reflects every
-        // in-memory write before we open a snapshot. `Snapshot`'s
-        // store-root lookups go through the on-disk manifest tree
-        // (not the hot-path `store_root_cache`), so without this
-        // an in-memory-only write would be invisible to the dump.
-        self.manifest.durabilize() catch return Error.Io;
+        // Force a durabilize so the snapshot reflects every
+        // in-memory write. raft_idx=0 → don't disturb the watermark.
+        self.manifest.durabilize(0) catch return Error.Io;
 
         var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
         defer snap.close();
@@ -693,50 +760,37 @@ pub const KvStore = struct {
         try writeManifestFile(self.allocator, target_path, buf.items);
     }
 
-    // ── Tracked transactions (overlay-stack rollback) ──────────────
+    // ── Tracked transactions (kvexp.Txn-backed) ────────────────────
     //
-    // Writes during a tracked txn land in a per-txn overlay rather
-    // than the store memtable. Reads through this KvStore (via the
-    // `active_txn` registration) consult the overlay stack top-down
-    // before falling through to kvexp, so the handler's own write-
-    // then-read within a request sees its pending writes.
+    // Wraps a top-level `*kvexp.Txn` plus a stack of open savepoint
+    // Txns. Writes/reads on the rove side forward to the deepest
+    // open level (`activeLeaf`). `KvStore.get/put/delete/prefix`
+    // route through this wrapper via the `active_txn` registration
+    // so call sites unchanged.
     //
     // Lifecycle:
-    //   open       — push base overlay; register as active_txn
-    //   savepoint  — push another overlay onto the stack
-    //   release    — pop top, fold its entries into the level below
-    //   rollbackTo — pop top, discarding its entries
-    //   commit     — flush bottom overlay into store memtable, then
-    //                deinit; clear active_txn
-    //   rollback   — deinit overlays without flushing; clear active_txn
+    //   open       — Manifest.beginTxn → top_txn; register as active_txn
+    //   savepoint  — top.savepoint() (or leaf.savepoint() if nested)
+    //   release    — leaf.commit() (savepoint commit folds into parent)
+    //   rollbackTo — leaf.rollback() (savepoint rollback drops self)
+    //   commit     — top.commit() (chain head; folds into main_overlay)
+    //   rollback   — top.rollback() (cascades to chain successors)
     //
     // The per-tenant lock held by the dispatcher batch ensures only
-    // one tracked txn per store at a time, so no synchronization is
-    // needed on the active_txn pointer or the overlays.
-
-    const OverlayEntry = struct {
-        /// null → tombstone (delete). Non-null → put value. Both
-        /// key (HashMap key) and value bytes live in the txn arena.
-        value: ?[]const u8,
-    };
-
-    const TxnOverlay = std.StringHashMapUnmanaged(OverlayEntry);
-
-    pub const OverlayLookup = union(enum) {
-        miss,
-        hit_value: []const u8,
-        hit_tombstone,
-    };
+    // one TrackedTxn per store at a time, so no rove-side sync on
+    // active_txn or the savepoint stack.
 
     pub const TrackedTxn = struct {
         store: *KvStore,
         txn_seq: u64,
         kind: enum { normal, immediate },
         opened: bool,
-        /// Arena owns all key/value bytes copied into the overlays.
-        /// Lazily initialized on first push.
-        arena: ?std.heap.ArenaAllocator = null,
-        overlays: std.ArrayListUnmanaged(TxnOverlay) = .empty,
+        /// Top-level kvexp Txn. Allocated on the kvexp side; we own
+        /// the pointer until commit/rollback.
+        top: ?*kvexp.Txn = null,
+        /// Open savepoint chain — innermost last. Reads/writes go to
+        /// `savepoints.getLastOrNull() orelse top`.
+        savepoints: std.ArrayListUnmanaged(*kvexp.Txn) = .empty,
 
         pub fn open(self: *TrackedTxn) Error!void {
             return self.ensureOpen();
@@ -744,146 +798,123 @@ pub const KvStore = struct {
 
         fn ensureOpen(self: *TrackedTxn) Error!void {
             if (self.opened) return;
+            // Per-tenant serialization: kvexp's top-level commit is
+            // chain-head-only, so concurrent workers on the same
+            // tenant must take turns. `tryLock` surfaces contention
+            // as `Conflict` so the dispatcher's skip-this-tick
+            // machinery (pre-cutover SQLITE_BUSY path) picks it up
+            // and tries a different anchor instead of blocking.
+            if (!self.store.txn_lock.tryLock()) return Error.Conflict;
             std.debug.assert(self.store.active_txn == null);
             self.txn_seq = self.store.counter.next();
-            try self.pushOverlay();
+            self.top = self.store.manifest.beginTxn(self.store.store_id) catch |err| {
+                self.store.txn_lock.unlock();
+                return switch (err) {
+                    error.OutOfMemory => Error.OutOfMemory,
+                    else => Error.Sqlite,
+                };
+            };
             self.store.active_txn = self;
             self.opened = true;
         }
 
-        fn pushOverlay(self: *TrackedTxn) Error!void {
-            if (self.arena == null) {
-                self.arena = std.heap.ArenaAllocator.init(self.store.allocator);
+        /// Deepest open level — where puts/reads land. Caller must
+        /// have already opened the txn (top != null).
+        pub fn activeLeaf(self: *TrackedTxn) *kvexp.Txn {
+            if (self.savepoints.items.len > 0) {
+                return self.savepoints.items[self.savepoints.items.len - 1];
             }
-            self.overlays.append(self.store.allocator, .{}) catch
-                return Error.OutOfMemory;
-        }
-
-        /// Lookup `key` in the overlay stack, top-down. Used by
-        /// `KvStore.get` when a tracked txn is active.
-        pub fn lookupOverlay(self: *TrackedTxn, key: []const u8) OverlayLookup {
-            var i: usize = self.overlays.items.len;
-            while (i > 0) {
-                i -= 1;
-                if (self.overlays.items[i].get(key)) |entry| {
-                    return if (entry.value) |v| .{ .hit_value = v } else .hit_tombstone;
-                }
-            }
-            return .miss;
-        }
-
-        fn putOverlay(self: *TrackedTxn, key: []const u8, value: ?[]const u8) Error!void {
-            std.debug.assert(self.overlays.items.len > 0);
-            const arena_alloc = self.arena.?.allocator();
-            // Dup the value first so a failure doesn't leave a
-            // dangling key entry. Dup key only if we're inserting
-            // a new entry (existing entry reuses its key slot).
-            const value_dup: ?[]const u8 = if (value) |v| blk: {
-                const copy = arena_alloc.alloc(u8, v.len) catch return Error.OutOfMemory;
-                if (v.len > 0) @memcpy(copy, v);
-                break :blk copy;
-            } else null;
-
-            const top = &self.overlays.items[self.overlays.items.len - 1];
-            const gop = top.getOrPut(self.store.allocator, key) catch return Error.OutOfMemory;
-            if (!gop.found_existing) {
-                const key_dup = arena_alloc.alloc(u8, key.len) catch return Error.OutOfMemory;
-                if (key.len > 0) @memcpy(key_dup, key);
-                gop.key_ptr.* = key_dup;
-            }
-            gop.value_ptr.* = .{ .value = value_dup };
+            return self.top.?;
         }
 
         pub fn put(self: *TrackedTxn, key: []const u8, value: []const u8) Error!void {
             try self.ensureOpen();
-            try self.putOverlay(key, value);
+            self.activeLeaf().put(key, value) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
         }
 
         pub fn delete(self: *TrackedTxn, key: []const u8) Error!void {
             try self.ensureOpen();
-            try self.putOverlay(key, null);
+            _ = self.activeLeaf().delete(key) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
         }
 
         pub fn savepoint(self: *TrackedTxn) Error!void {
             try self.ensureOpen();
-            try self.pushOverlay();
+            const child = self.activeLeaf().savepoint() catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            self.savepoints.append(self.store.allocator, child) catch
+                return Error.OutOfMemory;
         }
 
-        /// Release the top savepoint: fold its entries into the
-        /// level below. Top wins on key collisions.
+        /// Commit the innermost savepoint: folds its writes into
+        /// the level below.
         pub fn release(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
-            if (self.overlays.items.len < 2) return;
-            var top = self.overlays.pop().?;
-            defer top.deinit(self.store.allocator);
-            const below = &self.overlays.items[self.overlays.items.len - 1];
-            var it = top.iterator();
-            while (it.next()) |entry| {
-                const gop = below.getOrPut(self.store.allocator, entry.key_ptr.*) catch
-                    return Error.OutOfMemory;
-                // Arena owns the bytes; aliasing the same arena
-                // slice in the lower level is safe — both layers
-                // free together when the txn ends.
-                gop.value_ptr.* = entry.value_ptr.*;
-            }
+            if (self.savepoints.items.len == 0) return;
+            const leaf = self.savepoints.pop().?;
+            leaf.commit() catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
         }
 
-        /// Discard the top savepoint. Bytes stay in the arena until
-        /// the txn ends — not worth a per-level arena.
+        /// Rollback the innermost savepoint: drops its writes.
         pub fn rollbackTo(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
-            if (self.overlays.items.len < 2) return;
-            var top = self.overlays.pop().?;
-            top.deinit(self.store.allocator);
+            if (self.savepoints.items.len == 0) return;
+            const leaf = self.savepoints.pop().?;
+            leaf.rollback();
         }
 
         pub fn commit(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
-            try self.flushToStore();
-            self.deinitOverlays();
+            // Any open savepoints must close before the top-level
+            // commit (kvexp errors with SavepointStillOpen otherwise).
+            // Fold each by commit (last-writer-wins) so they reach
+            // main_overlay together with the top-level writes.
+            while (self.savepoints.pop()) |sp| {
+                sp.commit() catch |err| switch (err) {
+                    error.OutOfMemory => return Error.OutOfMemory,
+                    else => return Error.Sqlite,
+                };
+            }
+            const top = self.top.?;
+            self.top = null;
             self.store.active_txn = null;
             self.opened = false;
+            self.savepoints.deinit(self.store.allocator);
+            self.savepoints = .empty;
+            const result = top.commit();
+            self.store.txn_lock.unlock();
+            result catch |err| {
+                std.log.warn("TrackedTxn.commit: kvexp.Txn.commit failed: {s}", .{@errorName(err)});
+                return switch (err) {
+                    error.OutOfMemory => Error.OutOfMemory,
+                    else => Error.Sqlite,
+                };
+            };
         }
 
         pub fn rollback(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
-            self.deinitOverlays();
+            // kvexp top-level rollback cascades to all open
+            // children (savepoints) on this txn, so we don't need
+            // to roll back the savepoint stack manually.
+            const top = self.top.?;
+            self.top = null;
             self.store.active_txn = null;
             self.opened = false;
-        }
-
-        /// Flush the overlay stack to the store memtable. Walks
-        /// top-down so the first hit per key wins (matches the
-        /// overlay read order); same-key writes lower in the stack
-        /// are skipped.
-        fn flushToStore(self: *TrackedTxn) Error!void {
-            if (self.overlays.items.len == 0) return;
-            var applied: std.StringHashMapUnmanaged(void) = .empty;
-            defer applied.deinit(self.store.allocator);
-            var i: usize = self.overlays.items.len;
-            while (i > 0) {
-                i -= 1;
-                var it = self.overlays.items[i].iterator();
-                while (it.next()) |entry| {
-                    const key = entry.key_ptr.*;
-                    const gop = applied.getOrPut(self.store.allocator, key) catch
-                        return Error.OutOfMemory;
-                    if (gop.found_existing) continue;
-                    if (entry.value_ptr.*.value) |v| {
-                        try self.store.put(key, v);
-                    } else {
-                        try self.store.delete(key);
-                    }
-                }
-            }
-        }
-
-        fn deinitOverlays(self: *TrackedTxn) void {
-            for (self.overlays.items) |*o| o.deinit(self.store.allocator);
-            self.overlays.deinit(self.store.allocator);
-            self.overlays = .empty;
-            if (self.arena) |*a| a.deinit();
-            self.arena = null;
+            self.savepoints.deinit(self.store.allocator);
+            self.savepoints = .empty;
+            top.rollback();
+            self.store.txn_lock.unlock();
         }
     };
 
@@ -943,6 +974,45 @@ pub const KvStore = struct {
     }
 };
 
+/// Collect entries from a kvexp prefix cursor into `list`, honoring
+/// `cursor` (skip ≤ cursor when it sorts inside the prefix range) and
+/// stopping at `count` entries. The cursor's key/value slices alias
+/// kvexp-internal memory, so we copy into freshly-allocated buffers
+/// owned by `allocator`.
+///
+/// Generic over the cursor type because `kvexp.StorePrefixCursor` and
+/// `kvexp.TxnPrefixCursor` happen to be the same underlying type, but
+/// callers go through different methods to obtain them.
+fn collectPrefix(
+    allocator: std.mem.Allocator,
+    pc: anytype,
+    prefix_bytes: []const u8,
+    cursor: []const u8,
+    count: u32,
+    list: *std.ArrayList(Entry),
+) Error!void {
+    var collected: u32 = 0;
+    while (collected < count) {
+        const has = pc.next() catch return Error.Sqlite;
+        if (!has) break;
+        const k_slice = pc.key();
+        if (cursor.len > 0 and !std.mem.lessThan(u8, cursor, prefix_bytes)) {
+            const cmp = std.mem.order(u8, k_slice, cursor);
+            if (cmp == .lt or cmp == .eq) continue;
+        }
+        const v_slice = pc.value();
+        const k_copy = allocator.alloc(u8, k_slice.len) catch return Error.OutOfMemory;
+        errdefer allocator.free(k_copy);
+        if (k_slice.len > 0) @memcpy(k_copy, k_slice);
+        const v_copy = allocator.alloc(u8, v_slice.len) catch return Error.OutOfMemory;
+        errdefer allocator.free(v_copy);
+        if (v_slice.len > 0) @memcpy(v_copy, v_slice);
+        list.append(allocator, .{ .key = k_copy, .value = v_copy }) catch
+            return Error.OutOfMemory;
+        collected += 1;
+    }
+}
+
 /// Build a fresh kvexp manifest at `target_path` and replay
 /// `dump_bytes` (a kvexp dump-format blob) into it. Closes durabilize
 /// at the end so the file is self-contained. `target_path` must not
@@ -970,9 +1040,9 @@ fn writeManifestFile(
     defer target_manifest.deinit();
 
     var stream = std.io.fixedBufferStream(dump_bytes);
-    _ = kvexp.loadSnapshot(&target_manifest, stream.reader()) catch
+    const restored_idx = kvexp.loadSnapshot(&target_manifest, stream.reader()) catch
         return Error.Sqlite;
-    target_manifest.durabilize() catch return Error.Io;
+    target_manifest.durabilize(restored_idx) catch return Error.Io;
 }
 
 /// Write a kvexp-format snapshot dump containing only `src_store_id`'s
@@ -994,22 +1064,26 @@ fn dumpOneStoreRemapped(
     var w = out.writer(allocator);
     try w.writeInt(u32, kvexp.SNAPSHOT_MAGIC, .little);
     try w.writeByte(kvexp.SNAPSHOT_VERSION);
-    try w.writeInt(u64, snap.snap_seq, .little);
-    try w.writeInt(u64, snap.manifest.last_applied_raft_idx, .little);
+    // Header layout mirrors kvexp.dumpSnapshot exactly:
+    //   u64 reserved (was snap_seq; now ignored on load)
+    //   u64 durable raft idx (loader rehydrates it as last_applied)
+    try w.writeInt(u64, 0, .little);
+    try w.writeInt(u64, try snap.manifest.durableRaftIdx(), .little);
 
-    if (try snap.storeRoot(src_store_id) != null) {
-        var cursor = try snap.scanPrefix(src_store_id, "");
-        defer cursor.deinit();
-        while (try cursor.next()) {
-            const k = cursor.key();
-            const v = cursor.value();
-            try w.writeByte(SNAP_TAG_KV);
-            try w.writeInt(u64, dst_store_id, .little);
-            try w.writeInt(u16, @intCast(k.len), .little);
-            try w.writeInt(u16, @intCast(v.len), .little);
-            try w.writeAll(k);
-            try w.writeAll(v);
-        }
+    // Iterate this store's records (returns no entries if the store
+    // doesn't exist in the snapshot — same shape as the storeRoot
+    // existence check that used to gate this block).
+    var cursor = try snap.scanPrefix(src_store_id, "");
+    defer cursor.deinit();
+    while (try cursor.next()) {
+        const k = cursor.key();
+        const v = cursor.value();
+        try w.writeByte(SNAP_TAG_KV);
+        try w.writeInt(u64, dst_store_id, .little);
+        try w.writeInt(u16, @intCast(k.len), .little);
+        try w.writeInt(u16, @intCast(v.len), .little);
+        try w.writeAll(k);
+        try w.writeAll(v);
     }
 
     try w.writeByte(SNAP_TAG_END);

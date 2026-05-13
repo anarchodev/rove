@@ -1472,38 +1472,39 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
             if (skip_blocked) continue;
 
-            var new_txn = scope_inst.kv.beginTrackedImmediate() catch |err| {
+            // Assign the begin-result directly to the outer optional
+            // `txn` so `open()` registers `active_txn` against the
+            // final stable address. The pre-cutover code used an
+            // intermediate `new_txn` local — under the new kvexp
+            // TrackedTxn the registration captures `&new_txn`, which
+            // dies at end-of-iteration and leaves `active_txn`
+            // dangling for the rest of the batch.
+            txn = scope_inst.kv.beginTrackedImmediate() catch |err| {
                 std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
                 worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
             };
-            // Eagerly open the underlying SQLite txn so SQLITE_BUSY
-            // surfaces HERE — if another worker holds RESERVED on
-            // this tenant's app.db we note the tenant as blocked for
-            // the remainder of this tick and skip past it to try a
-            // different anchor (Stage 3: cross-tenant scheduling on
-            // contention).
-            new_txn.open() catch |err| {
+            // Eagerly open so per-tenant lock contention surfaces
+            // as `KvError.Conflict` HERE — under kvexp's chain-head
+            // commit rule, two workers must not have concurrent
+            // open TrackedTxns on the same tenant.
+            txn.?.open() catch |err| {
                 if (err == kv_mod.KvError.Conflict) {
+                    txn = null;
                     blocked.append(scope_inst) catch {
-                        // blocked list is bounded; overflow means this
-                        // tick has already tried more tenants than we
-                        // budgeted for. Leave the entity in place and
-                        // return what we've processed so far — next
-                        // tick gets a fresh blocked list.
                         return processed;
                     };
                     continue;
                 }
                 std.log.warn("rove-js open tracked txn ({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
+                txn = null;
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn open failed\n", allocator);
                 worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
             };
-            txn = new_txn;
             anchor = scope_inst;
         }
 
