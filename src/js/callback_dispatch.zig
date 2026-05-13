@@ -131,7 +131,7 @@ pub fn dispatchCallbacks(
         const tenant_id = rows[start].tenant_id;
         const slice = rows[start..end];
 
-        const tc = worker.node.tenant_files_map.get(tenant_id) orelse {
+        const slot = worker.node.tenant_files_map.get(tenant_id) orelse {
             // Tenant was deleted between schedule-fire and now; drop
             // the callback rows so they don't accumulate forever.
             for (slice) |r| {
@@ -144,14 +144,16 @@ pub fn dispatchCallbacks(
             }
             continue;
         };
-        if (tc.current_deployment_id == 0) {
+        const snap = slot.pinCurrent() orelse {
             // Tenant has no current deployment; the handler isn't
             // available. Drop rather than retry forever.
             for (slice) |r| {
                 schedules_store.applyCancel(r.tenant_id, r.id) catch {};
             }
             continue;
-        }
+        };
+        const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
+        defer tc.release();
         const inst_opt = worker.node.tenant.getInstance(tenant_id) catch |err| {
             std.log.warn("rove-js callbacks: getInstance({s}): {s}", .{ tenant_id, @errorName(err) });
             continue;
@@ -169,7 +171,7 @@ pub fn dispatchCallbacks(
 
 fn drainTenantCallbacks(
     worker: anytype,
-    tc: *worker_mod.TenantFiles,
+    tc: worker_mod.TenantFiles,
     inst: *const tenant_mod.Instance,
     rows: []schedule_server_mod.ScheduleStore.CallbackRow,
     max_per_tenant: u32,
@@ -324,7 +326,7 @@ pub const CallbackOutcome = enum {
 
 fn runOneCallback(
     worker: anytype,
-    tc: *worker_mod.TenantFiles,
+    tc: worker_mod.TenantFiles,
     inst: *const tenant_mod.Instance,
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *kv_mod.WriteSet,
@@ -448,9 +450,9 @@ fn runOneCallback(
         txn,
         writeset,
         bytecode,
-        &tc.bytecodes,
-        &tc.source_hashes,
-        tc.triggers,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
         request,
         &budget,
     ) catch |err| {
@@ -520,7 +522,7 @@ fn queueCancelDrop(
 /// index" would silently run the wrong handler. Tries `.mjs` first
 /// (the modern path), then `.js`.
 fn findCallbackBytecode(
-    tc: *const worker_mod.TenantFiles,
+    tc: worker_mod.TenantFiles,
     on_result: []const u8,
 ) !?[]u8 {
     // Forbid absolute paths / parent-escape. The http.send binding
@@ -532,9 +534,9 @@ fn findCallbackBytecode(
 
     var buf: [256]u8 = undefined;
     const mjs = std.fmt.bufPrint(&buf, "{s}.mjs", .{on_result}) catch return null;
-    if (tc.bytecodes.get(mjs)) |bc| return bc;
+    if (tc.snap.bytecodes.get(mjs)) |bc| return bc;
     const js = std.fmt.bufPrint(&buf, "{s}.js", .{on_result}) catch return null;
-    if (tc.bytecodes.get(js)) |bc| return bc;
+    if (tc.snap.bytecodes.get(js)) |bc| return bc;
     return null;
 }
 
@@ -775,94 +777,129 @@ test "buildSyntheticQuery: receipt with on_result_fn + on_result_args emits ?fn=
     try testing.expectEqualStrings("fn=handleCharge&args=%5B42%2C%22subscription%22%5D", q);
 }
 
+// Phase 2 test fixture: build a `TenantFiles` view from a stack
+// `TenantSlot` + `TenantFilesSnapshot`. The refcount stays at 1 (no
+// retain/release in tests since we don't atomic-swap or pin); the
+// caller frees the maps it added directly.
+fn testTenantFilesView(
+    slot: *worker_mod.TenantSlot,
+    snap: *worker_mod.TenantFilesSnapshot,
+) worker_mod.TenantFiles {
+    return .{ .slot = slot, .snap = snap };
+}
+
 test "findCallbackBytecode: exact .mjs match wins over .js" {
-    var tc: worker_mod.TenantFiles = .{
+    var slot: worker_mod.TenantSlot = .{
         .allocator = testing.allocator,
         .instance_id = @constCast(""),
         .app_kv = undefined,
         .blob_backend = undefined,
         .manifest_backend = undefined,
-        .current_deployment_id = 1,
+        .prefetched_manifest = null,
+        .current = .{ .raw = null },
+    };
+    var snap: worker_mod.TenantFilesSnapshot = .{
+        .allocator = testing.allocator,
+        .deployment_id = 1,
         .bytecodes = .empty,
         .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
-        .prefetched_manifest = null,
-        .current_manifest_bytes = null,
+        .manifest_bytes = &.{},
+        .refcount = .{ .raw = 1 },
     };
-    defer tc.bytecodes.deinit(testing.allocator);
+    defer snap.bytecodes.deinit(testing.allocator);
 
-    try tc.bytecodes.put(testing.allocator, "stripe/charge_result.mjs", @constCast("MJS"));
-    try tc.bytecodes.put(testing.allocator, "stripe/charge_result.js", @constCast("JS"));
+    try snap.bytecodes.put(testing.allocator, "stripe/charge_result.mjs", @constCast("MJS"));
+    try snap.bytecodes.put(testing.allocator, "stripe/charge_result.js", @constCast("JS"));
 
-    const bc = (try findCallbackBytecode(&tc, "stripe/charge_result")).?;
+    const tc = testTenantFilesView(&slot, &snap);
+    const bc = (try findCallbackBytecode(tc, "stripe/charge_result")).?;
     try testing.expectEqualStrings("MJS", bc);
 }
 
 test "findCallbackBytecode: falls back to .js when no .mjs" {
-    var tc: worker_mod.TenantFiles = .{
+    var slot: worker_mod.TenantSlot = .{
         .allocator = testing.allocator,
         .instance_id = @constCast(""),
         .app_kv = undefined,
         .blob_backend = undefined,
         .manifest_backend = undefined,
-        .current_deployment_id = 1,
+        .prefetched_manifest = null,
+        .current = .{ .raw = null },
+    };
+    var snap: worker_mod.TenantFilesSnapshot = .{
+        .allocator = testing.allocator,
+        .deployment_id = 1,
         .bytecodes = .empty,
         .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
-        .prefetched_manifest = null,
-        .current_manifest_bytes = null,
+        .manifest_bytes = &.{},
+        .refcount = .{ .raw = 1 },
     };
-    defer tc.bytecodes.deinit(testing.allocator);
+    defer snap.bytecodes.deinit(testing.allocator);
 
-    try tc.bytecodes.put(testing.allocator, "my/cb.js", @constCast("JS"));
+    try snap.bytecodes.put(testing.allocator, "my/cb.js", @constCast("JS"));
 
-    const bc = (try findCallbackBytecode(&tc, "my/cb")).?;
+    const tc = testTenantFilesView(&slot, &snap);
+    const bc = (try findCallbackBytecode(tc, "my/cb")).?;
     try testing.expectEqualStrings("JS", bc);
 }
 
 test "findCallbackBytecode: rejects absolute + parent-escape paths" {
-    var tc: worker_mod.TenantFiles = .{
+    var slot: worker_mod.TenantSlot = .{
         .allocator = testing.allocator,
         .instance_id = @constCast(""),
         .app_kv = undefined,
         .blob_backend = undefined,
         .manifest_backend = undefined,
-        .current_deployment_id = 1,
+        .prefetched_manifest = null,
+        .current = .{ .raw = null },
+    };
+    var snap: worker_mod.TenantFilesSnapshot = .{
+        .allocator = testing.allocator,
+        .deployment_id = 1,
         .bytecodes = .empty,
         .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
-        .prefetched_manifest = null,
-        .current_manifest_bytes = null,
+        .manifest_bytes = &.{},
+        .refcount = .{ .raw = 1 },
     };
-    defer tc.bytecodes.deinit(testing.allocator);
+    defer snap.bytecodes.deinit(testing.allocator);
 
-    try tc.bytecodes.put(testing.allocator, "/absolute.mjs", @constCast("MJS"));
-    try tc.bytecodes.put(testing.allocator, "../escape.mjs", @constCast("MJS"));
+    try snap.bytecodes.put(testing.allocator, "/absolute.mjs", @constCast("MJS"));
+    try snap.bytecodes.put(testing.allocator, "../escape.mjs", @constCast("MJS"));
 
-    try testing.expect((try findCallbackBytecode(&tc, "/absolute")) == null);
-    try testing.expect((try findCallbackBytecode(&tc, "../escape")) == null);
-    try testing.expect((try findCallbackBytecode(&tc, "")) == null);
+    const tc = testTenantFilesView(&slot, &snap);
+    try testing.expect((try findCallbackBytecode(tc, "/absolute")) == null);
+    try testing.expect((try findCallbackBytecode(tc, "../escape")) == null);
+    try testing.expect((try findCallbackBytecode(tc, "")) == null);
 }
 
 test "findCallbackBytecode: miss returns null" {
-    var tc: worker_mod.TenantFiles = .{
+    var slot: worker_mod.TenantSlot = .{
         .allocator = testing.allocator,
         .instance_id = @constCast(""),
         .app_kv = undefined,
         .blob_backend = undefined,
         .manifest_backend = undefined,
-        .current_deployment_id = 1,
+        .prefetched_manifest = null,
+        .current = .{ .raw = null },
+    };
+    var snap: worker_mod.TenantFilesSnapshot = .{
+        .allocator = testing.allocator,
+        .deployment_id = 1,
         .bytecodes = .empty,
         .source_hashes = .empty,
         .statics = .empty,
         .triggers = &.{},
-        .prefetched_manifest = null,
-        .current_manifest_bytes = null,
+        .manifest_bytes = &.{},
+        .refcount = .{ .raw = 1 },
     };
-    defer tc.bytecodes.deinit(testing.allocator);
+    defer snap.bytecodes.deinit(testing.allocator);
 
-    try testing.expect((try findCallbackBytecode(&tc, "never/here")) == null);
+    const tc = testTenantFilesView(&slot, &snap);
+    try testing.expect((try findCallbackBytecode(tc, "never/here")) == null);
 }

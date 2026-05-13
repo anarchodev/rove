@@ -1169,10 +1169,14 @@ fn resolveRequest(
     if (is_static_method and !has_query) {
         const admin_inst = worker.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
         if (admin_inst) |ai| {
-            const admin_tc = worker_mod.getOrOpenTenantFiles(worker, ai) catch null;
-            if (admin_tc) |tc| {
-                const outcome = try respb.tryServeStatic(server, allocator, ent, sid, sess, tc, method, path, rh);
-                if (outcome != .miss) return .handled;
+            const admin_slot = worker_mod.getOrOpenTenantSlot(worker, ai) catch null;
+            if (admin_slot) |slot| {
+                if (slot.pinCurrent()) |snap| {
+                    const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
+                    defer tc.release();
+                    const outcome = try respb.tryServeStatic(server, allocator, ent, sid, sess, tc, method, path, rh);
+                    if (outcome != .miss) return .handled;
+                }
             }
         }
     }
@@ -1349,19 +1353,26 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
 
         // Lazy-open: instances created at runtime aren't in the map yet.
-        const tc = worker_mod.getOrOpenTenantFiles(worker, handler_inst) catch |err| {
-            std.log.warn("rove-js: lazy openTenantFiles({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
+        const slot = worker_mod.getOrOpenTenantSlot(worker, handler_inst) catch |err| {
+            std.log.warn("rove-js: lazy openTenantSlot({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
             try respb.setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
-        if (tc.current_deployment_id == 0) {
+        // Pin the current deployment snapshot for the duration of this
+        // request. `release` fires at end of iteration (continue or
+        // fall-through). Phase 2: snapshot pinning guarantees a request
+        // sees one deployment version completely.
+        const snap = slot.pinCurrent() orelse {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{});
             processed += 1;
             continue;
-        }
+        };
+        const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
+        defer tc.release();
+        const dep_id = snap.deployment_id;
 
         // `/_session/sse-token` — mints the JWT the customer's JS
         // hands to sse-server's EventSource open (sse-plan §5.1).
@@ -1383,7 +1394,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             rh,
             received_ns,
         )) {
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 200, .ok, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 200, .ok, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1406,7 +1417,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (!allowed) {
             const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
             try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 429, .handler_error, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 429, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1431,7 +1442,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             );
             switch (static_outcome) {
                 .served => |status| {
-                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, status, .ok, &.{}, &.{}, .{});
+                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, status, .ok, &.{}, &.{}, .{});
                     processed += 1;
                     continue;
                 },
@@ -1442,7 +1453,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var route = router_mod.resolveRoute(allocator, path) catch |err| {
             std.log.warn("rove-js router failed: {s}", .{@errorName(err)});
             try respb.setErrorResponse(server, ent, sid, sess);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
@@ -1454,14 +1465,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             if (!try respb.serveConvention404(server, allocator, ent, sid, sess, tc)) {
                 try respb.setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
             }
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 404, .handler_error, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 404, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
 
-        if (worker.penalty_box.isBoxed(handler_inst.id, tc.current_deployment_id, received_ns)) {
+        if (worker.penalty_box.isBoxed(handler_inst.id, dep_id, received_ns)) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "tenant temporarily disabled (cpu budget)\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 503, .timeout, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .timeout, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1491,7 +1502,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // deferred commit at raft confirmation.
             const new_txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch {
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn alloc failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
             };
@@ -1499,7 +1510,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 allocator.destroy(new_txn);
                 std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
             };
@@ -1517,7 +1528,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 }
                 std.log.warn("rove-js open tracked txn ({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn open failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
             };
@@ -1642,9 +1653,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             txn.?,
             &writeset,
             bytecode,
-            &tc.bytecodes,
-            &tc.source_hashes,
-            tc.triggers,
+            &tc.snap.bytecodes,
+            &tc.snap.source_hashes,
+            tc.snap.triggers,
             request,
             &budget,
         ) catch |err| {
@@ -1662,13 +1673,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 try respb.setSimpleResponse(server, ent, sid, sess, 504, "handler exceeded cpu budget\n", allocator);
                 worker.penalty_box.recordKill(
                     handler_inst.id,
-                    tc.current_deployment_id,
+                    dep_id,
                     received_ns,
                 ) catch |pe| std.log.warn("rove-js penalty recordKill failed: {s}", .{@errorName(pe)});
             } else {
                 try respb.setErrorResponse(server, ent, sid, sess);
             }
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, status, outcome, &.{}, &.{}, .{});
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
@@ -1697,7 +1708,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             defer if (ex_body.len > 0) allocator.free(ex_body);
             const ex_body_slice: []const u8 = if (ex_body.len > 0) ex_body else "handler threw\n";
             try respb.setSimpleResponse(server, ent, sid, sess, 500, ex_body_slice, allocator);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .handler_error, console_owned, exception_owned, .{});
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, .{});
             processed += 1;
             continue;
         }
@@ -1711,7 +1722,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .{ scope_inst.id, @errorName(re) },
             );
             try respb.setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1802,7 +1813,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .method = method,
             .path = path,
             .host = host,
-            .deployment_id = tc.current_deployment_id,
+            .deployment_id = dep_id,
             .received_ns = received_ns,
             .tapes = tape_payloads,
             .request_id = request_id,

@@ -461,7 +461,7 @@ fn serveStaticByKey(
     rh: h2.ReqHeaders,
     is_head: bool,
 ) !?u16 {
-    const entry = tc.statics.get(key) orelse return null;
+    const entry = tc.snap.statics.get(key) orelse return null;
 
     // Build the strong ETag value (`"<hex>"`) once; shared by 200 and 304.
     var etag_buf: [files_mod.HASH_HEX_LEN + 2]u8 = undefined;
@@ -488,7 +488,7 @@ fn serveStaticByKey(
         return 304;
     }
 
-    const bytes = tc.blob_backend.blobStore().get(&entry.hash_hex, allocator) catch |err| {
+    const bytes = tc.slot.blob_backend.blobStore().get(&entry.hash_hex, allocator) catch |err| {
         std.log.warn(
             "rove-js: static blob fetch for {s} failed: {s}",
             .{ key, @errorName(err) },
@@ -611,8 +611,8 @@ pub fn serveConvention404(
     sess: h2.Session,
     tc: anytype,
 ) !bool {
-    const entry = tc.statics.get("_static/_404.html") orelse return false;
-    const bytes = tc.blob_backend.blobStore().get(&entry.hash_hex, allocator) catch |err| {
+    const entry = tc.snap.statics.get("_static/_404.html") orelse return false;
+    const bytes = tc.slot.blob_backend.blobStore().get(&entry.hash_hex, allocator) catch |err| {
         std.log.warn("rove-js: _404.html blob fetch failed: {s}", .{@errorName(err)});
         return false;
     };

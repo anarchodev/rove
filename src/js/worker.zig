@@ -203,84 +203,160 @@ const isReservedTriggerPrefix = reserved.isReservedTriggerPrefix;
 /// platform-bootstrap path: `/_system/release`). The proposing
 /// trampoline enqueues the loader inline on the leader; followers
 /// pick up the enqueue from `apply.zig`'s `_deploy/current` detector.
-pub const TenantFiles = struct {
+/// Immutable per-deployment-version snapshot. Refcounted; freed when
+/// the last reference drops (slot reload + any in-flight request).
+///
+/// Phase 2 of `docs/deployment-snapshots-plan.md`: snapshot pinning
+/// guarantees a request sees one deployment version completely or
+/// another completely, never a mid-reload mix.
+pub const TenantFilesSnapshot = struct {
     allocator: std.mem.Allocator,
-    /// Owned copy of the instance id. Used as the key in the worker's
-    /// `tenant_files_map` map; owning it here keeps that map's lifetime
-    /// self-contained.
-    instance_id: []u8,
-    /// Borrowed pointer to the tenant's app.db — used to read
-    /// `_deploy/current` (set by the release POST, replicated via
-    /// envelope 0). Phase 5.5(e) F2-storage retired the per-tenant
-    /// `files.db` on the worker entirely; the worker never opens
-    /// files-server's local working tree.
-    app_kv: *kv_mod.KvStore,
-    /// Owned blob backend for the file-blobs (source + bytecode bytes).
-    /// With `.fs` config: opens at `{inst.dir}/file-blobs/`. With
-    /// `.s3`: shares the bucket with every other tenant on this node,
-    /// scoped by key prefix `{base}{inst.id}/file-blobs/`.
-    blob_backend: blob_mod.BlobBackend,
-    /// Owned blob backend for per-deployment manifest JSON. Same fs/
-    /// s3 picker as `blob_backend`, just a different per-tenant
-    /// subdir (`deployments/`). Files-server writes here at deploy
-    /// time; the deployment loader reads here when fetching the
-    /// manifest for a newly-released `_deploy/current`.
-    manifest_backend: blob_mod.BlobBackend,
-    /// Deployment id we last loaded. `0` = no deployment observed yet.
-    current_deployment_id: u64,
-    /// All handler bytecodes from the active deployment, keyed by the
-    /// full deployment path (e.g. `"index.js"`, `"api/users/index.js"`).
-    /// Both keys and values are owned by `allocator`.
+    /// Deployment id this snapshot represents. Equal to the
+    /// `_deploy/current` hex value at the moment the loader built it.
+    deployment_id: u64,
+    /// All handler bytecodes from this deployment, keyed by full
+    /// deployment path. Keys and values are allocator-owned.
     bytecodes: std.StringHashMapUnmanaged([]u8),
     /// Source-blob hash hex (64 chars) per handler path. Parallel to
-    /// `bytecodes` and refreshed alongside it. Read by the QuickJS
-    /// module loader to populate the per-request module-resolution
-    /// tape — replay needs the source hash to fetch the same bytes
-    /// from the file blob store. Owns its own key copies (allocator-
-    /// duped from manifest entries) so it can be torn down
-    /// independently of `bytecodes`.
+    /// `bytecodes`. Read by the QuickJS module loader for per-request
+    /// module-resolution tapes.
     source_hashes: std.StringHashMapUnmanaged([64]u8),
-    /// Static files in the active deployment, keyed by the stored path
-    /// (e.g. `"_static/index.html"`). Keys and `StaticEntry.content_type`
-    /// are owned by `allocator`; bytes are fetched from `blob_backend`
-    /// on demand.
+    /// Static files keyed by stored path; bytes fetched on demand
+    /// from the slot's `blob_backend`.
     statics: std.StringHashMapUnmanaged(StaticEntry),
-    /// Trigger registry derived from manifest entries matching
-    /// `_triggers/.../index.{mjs,js}`. Sorted by prefix length
-    /// **descending** so a forward scan visits innermost (most-specific)
-    /// triggers first — natural for AFTER chain (innermost-first); the
-    /// BEFORE chain reverses (outermost-first). See PLAN §2.5 for the
-    /// tree-traversal-order rationale.
+    /// Trigger registry. Sorted descending by prefix length so a
+    /// forward scan visits innermost (most-specific) triggers first.
     triggers: []TriggerEntry,
-    /// One-shot prefetched manifest bytes from the worker's
-    /// cold-start batch fetch (production.md #1.4). Consumed and
-    /// freed on the first `reloadDeployment(dep_id)` call whose
-    /// dep_id matches. Lets startup load every tenant's manifest
-    /// from one HTTP roundtrip instead of N. Null when no
-    /// prefetch was wired or this tenant wasn't in the batch.
-    prefetched_manifest: ?PrefetchedManifest,
-    /// Raw manifest bytes for `current_deployment_id`. Populated
-    /// in `reloadDeployment` after successful decode (transfers
-    /// ownership from the prefetch slot or the per-tenant fetch
-    /// result). Re-released callers (`handleRelease`) check this
-    /// on dep_id match + re-decode locally, skipping the HTTP
-    /// roundtrip. Cleared + re-populated on every successful
-    /// reloadDeployment with a different dep_id; freed at
-    /// teardown.
-    current_manifest_bytes: ?[]u8,
+    /// Raw manifest bytes for this deployment. Re-released callers
+    /// re-decode locally on dep_id match, skipping a fetch.
+    manifest_bytes: []u8,
+    /// References to this snapshot. Starts at 1 (slot's reference).
+    /// Per-request retain++ at dispatch entry; release-- on response.
+    /// Reload swaps the slot pointer and drops the slot's reference.
+    refcount: std.atomic.Value(u32),
 
-    /// Open via `NodeState.getOrOpenTenantFiles` — there's no
-    /// per-worker open anymore. This shim is kept for the
-    /// `TenantMap(TenantFiles).getOrOpen(worker, inst)` codepath
-    /// that no longer exists post-cutover; the rove-level
-    /// `Entry.open` interface stays on the type for symmetry with
-    /// `TenantLog.open` (which IS still per-worker).
-    pub fn open(node: *NodeState, inst: *const tenant_mod.Instance) !*TenantFiles {
-        return openTenantFilesNode(node, inst);
+    pub fn retain(self: *TenantFilesSnapshot) void {
+        _ = self.refcount.fetchAdd(1, .acquire);
     }
 
-    pub fn free(allocator: std.mem.Allocator, tc: *TenantFiles) void {
-        freeTenantFiles(allocator, tc);
+    pub fn release(self: *TenantFilesSnapshot) void {
+        if (self.refcount.fetchSub(1, .release) == 1) {
+            self.deinit();
+        }
+    }
+
+    fn deinit(self: *TenantFilesSnapshot) void {
+        const allocator = self.allocator;
+        var bc_it = self.bytecodes.iterator();
+        while (bc_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.bytecodes.deinit(allocator);
+        var sh_it = self.source_hashes.iterator();
+        while (sh_it.next()) |entry| allocator.free(entry.key_ptr.*);
+        self.source_hashes.deinit(allocator);
+        var st_it = self.statics.iterator();
+        while (st_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*.content_type);
+        }
+        self.statics.deinit(allocator);
+        for (self.triggers) |t| {
+            allocator.free(t.prefix);
+            allocator.free(t.module_path);
+        }
+        allocator.free(self.triggers);
+        allocator.free(self.manifest_bytes);
+        allocator.destroy(self);
+    }
+};
+
+/// Per-tenant slot. Persists across deployments; lifetime = tenant
+/// lifetime. Owns the per-tenant blob backends and points at the
+/// current `*TenantFilesSnapshot` via an atomic pointer.
+///
+/// Reload semantics: the loader builds a new snapshot fully, then
+/// `atomicStore`s onto `current` (release ordering), then drops the
+/// old snapshot's lease. In-flight requests that pinned the old
+/// snapshot keep it alive until they release.
+pub const TenantSlot = struct {
+    allocator: std.mem.Allocator,
+    /// Owned copy of the instance id; key in NodeState's slot map.
+    instance_id: []u8,
+    /// Borrowed pointer to the tenant's app.db (for `_deploy/current`
+    /// reads and customer kv ops).
+    app_kv: *kv_mod.KvStore,
+    /// Owned blob backend for file-blobs (source + bytecode bytes).
+    blob_backend: blob_mod.BlobBackend,
+    /// Owned blob backend for per-deployment manifest JSON.
+    manifest_backend: blob_mod.BlobBackend,
+    /// One-shot prefetched manifest from the cold-start batch fetch.
+    /// Drained on the first reload that matches its dep_id.
+    prefetched_manifest: ?PrefetchedManifest,
+    /// Atomic pointer to the current snapshot. Null until first load.
+    current: std.atomic.Value(?*TenantFilesSnapshot),
+    /// Serializes `pinCurrent` (load + retain) against `reloadDeployment`
+    /// (swap + release-old). Without this, a dispatcher could load
+    /// the old pointer, the loader could swap-and-release it to
+    /// refcount 0, and the dispatcher's retain would touch freed
+    /// memory. Held only across the two-instruction critical sections
+    /// — reload's manifest fetch / decode / fetch-bytecodes still
+    /// runs unlocked.
+    pin_lock: std.Thread.Mutex = .{},
+
+    pub fn open(node: *NodeState, inst: *const tenant_mod.Instance) !*TenantSlot {
+        return openTenantSlotNode(node, inst);
+    }
+
+    pub fn free(allocator: std.mem.Allocator, slot: *TenantSlot) void {
+        freeTenantSlot(allocator, slot);
+    }
+
+    /// Try to pin the current snapshot for a request. Returns null
+    /// if no deployment has loaded yet. Caller MUST `snap.release()`
+    /// when done (typically at response time, after the raft drain
+    /// for write requests).
+    pub fn pinCurrent(self: *TenantSlot) ?*TenantFilesSnapshot {
+        self.pin_lock.lock();
+        defer self.pin_lock.unlock();
+        const snap = self.current.load(.acquire) orelse return null;
+        snap.retain();
+        return snap;
+    }
+
+    /// Current snapshot's `deployment_id`, or 0 if no snapshot is
+    /// loaded. Lock-free single-load; doesn't retain. Use for log
+    /// records / metrics where we just want the value, not access.
+    pub fn currentDeploymentId(self: *TenantSlot) u64 {
+        const snap = self.current.load(.acquire) orelse return 0;
+        return snap.deployment_id;
+    }
+};
+
+/// Per-request view: slot pointer plus a pinned snapshot. Captured
+/// at dispatch entry (`slot.pinCurrent()`), released after the
+/// response moves to `response_in` (post-raft-drain for writes).
+/// Field accesses pass through: `tc.slot.X` for tenant-lifetime
+/// fields (app_kv, blob_backend, etc.); `tc.snap.X` for deployment-
+/// version fields (bytecodes, statics, triggers).
+pub const TenantFiles = struct {
+    slot: *TenantSlot,
+    snap: *TenantFilesSnapshot,
+
+    pub fn release(self: TenantFiles) void {
+        self.snap.release();
+    }
+
+    /// Open is no longer a thing — slots are opened, snapshots are
+    /// loaded by the deployment loader. Kept as a compile error to
+    /// surface old call sites that need updating.
+    pub fn open(_: anytype, _: anytype) noreturn {
+        @compileError("TenantFiles is a view; use `slot.pinCurrent()` to construct one");
+    }
+
+    pub fn free(_: std.mem.Allocator, _: *TenantFiles) noreturn {
+        @compileError("TenantFiles is a view; release via `tc.release()`");
     }
 };
 
@@ -457,11 +533,12 @@ pub const NodeState = struct {
     /// Borrowed; owned by `main.zig`.
     tenant: *tenant_mod.Tenant,
 
-    /// Per-tenant deployment cache. `tenant_files_lock` guards
-    /// `getOrOpen` puts; the TenantFiles entries themselves still
-    /// mutate in place under reload — phase 2 makes them immutable
-    /// snapshots, removing that latent race.
-    tenant_files_map: TenantMap(TenantFiles) = .empty,
+    /// Per-tenant slot cache. `tenant_files_lock` guards `getOrOpen`
+    /// puts; the TenantSlot entries' deployment-version content is
+    /// served via an atomic-pointer-swapped `TenantFilesSnapshot`
+    /// (phase 2 of `docs/deployment-snapshots-plan.md`), so reload
+    /// no longer races with the dispatcher.
+    tenant_files_map: TenantMap(TenantSlot) = .empty,
     tenant_files_lock: std.Thread.Mutex = .{},
 
     /// Single deployment loader thread for the whole process.
@@ -534,13 +611,13 @@ pub const NodeState = struct {
     }
 
     /// Lookup-or-lazy-open under `tenant_files_lock`.
-    /// Idempotent: concurrent callers may race on `Entry.open` (slow,
-    /// runs unlocked); the loser frees its in-flight entry and
+    /// Idempotent: concurrent callers may race on `openTenantSlotNode`
+    /// (slow, runs unlocked); the loser frees its in-flight slot and
     /// returns the winner's.
-    pub fn getOrOpenTenantFiles(
+    pub fn getOrOpenTenantSlot(
         self: *NodeState,
         inst: *const tenant_mod.Instance,
-    ) !*TenantFiles {
+    ) !*TenantSlot {
         // Fast path: already cached.
         self.tenant_files_lock.lock();
         if (self.tenant_files_map.get(inst.id)) |existing| {
@@ -552,14 +629,14 @@ pub const NodeState = struct {
         // Slow path: open without holding the lock (libcurl + blob
         // backend init may do I/O). Re-check under the lock before
         // inserting — another worker may have raced ahead.
-        const opened = try openTenantFilesNode(self, inst);
-        errdefer freeTenantFiles(self.allocator, opened);
+        const opened = try openTenantSlotNode(self, inst);
+        errdefer freeTenantSlot(self.allocator, opened);
 
         self.tenant_files_lock.lock();
         defer self.tenant_files_lock.unlock();
         if (self.tenant_files_map.get(inst.id)) |winner| {
             // Lost the race; drop our duplicate and use the winner.
-            freeTenantFiles(self.allocator, opened);
+            freeTenantSlot(self.allocator, opened);
             return winner;
         }
         try self.tenant_files_map.put(self.allocator, opened);
@@ -575,20 +652,20 @@ pub const NodeState = struct {
         var it = self.tenant.instances.iterator();
         while (it.next()) |entry| {
             const inst = entry.value_ptr.*;
-            const tc = try self.getOrOpenTenantFiles(inst);
+            const slot = try self.getOrOpenTenantSlot(inst);
             count += 1;
             // Enqueue a deployment load for any tenant whose
             // `_deploy/current` is set — mirrors the old Worker.create
             // cold-start loop.
             if (self.deployment_loader) |l| {
-                const cur_bytes = tc.app_kv.get("_deploy/current") catch continue;
+                const cur_bytes = slot.app_kv.get("_deploy/current") catch continue;
                 defer self.allocator.free(cur_bytes);
                 const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch continue;
                 if (dep_id == 0) continue;
-                l.enqueue(tc.instance_id, dep_id) catch |err| {
+                l.enqueue(slot.instance_id, dep_id) catch |err| {
                     std.log.warn(
                         "rove-js: cold-start enqueue {s}/{d} failed: {s}",
-                        .{ tc.instance_id, dep_id, @errorName(err) },
+                        .{ slot.instance_id, dep_id, @errorName(err) },
                     );
                 };
             }
@@ -598,14 +675,21 @@ pub const NodeState = struct {
 };
 
 /// Loader thunk for the single per-process loader. `ctx_opaque` is a
-/// `*NodeState`. Looks up the tenant's TenantFiles (skip if absent,
-/// already-loaded, or different dep_id) and calls `reloadDeployment`.
+/// `*NodeState`. Looks up the tenant's TenantSlot (skip if absent),
+/// then runs `reloadDeployment` to fetch + build + swap an immutable
+/// snapshot onto `slot.current`. Phase 2: readers either see the old
+/// snapshot or the new one, never a half-written mix.
 ///
-/// Carries the same in-place-mutate race the per-worker thunk had —
-/// the dispatcher reads `tc.bytecodes` etc. without synchronization
-/// while this writes them. Phase 2's snapshot pinning removes the
-/// race; for phase 1, releases are rare enough that the window is
-/// negligible (same posture as the pre-cutover per-worker model).
+/// No `currentDeploymentId == dep_id` short-circuit: dep_ids are
+/// sequential local counters minted by `writeManifestFromWorkingTree`,
+/// NOT content-addressed. The seed's offline bootstrap and the
+/// runtime files-server can independently mint dep_id=1 against
+/// different content (seed's empty manifest vs the operator's first
+/// real deploy), with the second PUT overwriting the first at S3.
+/// Skipping reload when the integer matches would leave the worker
+/// serving the stale content. Re-fetch on every enqueue; `reloadDeployment`
+/// is idempotent and refusal-side (a NoDeployment error is silently
+/// swallowed by the loader thread).
 fn deploymentLoadFnNode(
     ctx_opaque: ?*anyopaque,
     tenant_id: []const u8,
@@ -613,11 +697,10 @@ fn deploymentLoadFnNode(
 ) anyerror!void {
     const node: *NodeState = @ptrCast(@alignCast(ctx_opaque.?));
     node.tenant_files_lock.lock();
-    const tc_opt = node.tenant_files_map.get(tenant_id);
+    const slot_opt = node.tenant_files_map.get(tenant_id);
     node.tenant_files_lock.unlock();
-    const tc = tc_opt orelse return;
-    if (tc.current_deployment_id == dep_id) return; // already loaded
-    try reloadDeployment(tc, dep_id);
+    const slot = slot_opt orelse return;
+    try reloadDeployment(slot, dep_id);
 }
 
 pub const WorkerConfig = struct {
@@ -1201,7 +1284,7 @@ pub fn Worker(comptime opts: Options) type {
 /// tenant to a pre-crash-consistent state before the worker starts
 /// serving requests. Safe on a clean restart: `kv_undo` is empty and
 /// `recoverOrphans` is a no-op.
-fn openTenantFilesNode(node: *NodeState, inst: *const tenant_mod.Instance) !*TenantFiles {
+fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*TenantSlot {
     const allocator = node.allocator;
 
     // Startup orphan sweep on the tenant's APP store. This belongs
@@ -1257,11 +1340,11 @@ fn openTenantFilesNode(node: *NodeState, inst: *const tenant_mod.Instance) !*Ten
     const id_copy = try allocator.dupe(u8, inst.id);
     errdefer allocator.free(id_copy);
 
-    const tc = try allocator.create(TenantFiles);
-    errdefer allocator.destroy(tc);
+    const slot = try allocator.create(TenantSlot);
+    errdefer allocator.destroy(slot);
     // Pull this tenant's prefetched manifest (if any) — transfer
     // ownership of the bytes from the worker's prefetch map to
-    // `tc`. fetchRemove returns the entry's key + value pair;
+    // `slot`. fetchRemove returns the entry's key + value pair;
     // we own the value bytes from here and free the key (the
     // map's key was a copy of the tenant id, not the same alloc
     // as `id_copy` above).
@@ -1274,19 +1357,14 @@ fn openTenantFilesNode(node: *NodeState, inst: *const tenant_mod.Instance) !*Ten
     }
     errdefer if (prefetched) |p| allocator.free(p.bytes);
 
-    tc.* = .{
+    slot.* = .{
         .allocator = allocator,
         .instance_id = id_copy,
         .app_kv = inst.kv,
         .blob_backend = blob_backend,
         .manifest_backend = manifest_backend,
-        .current_deployment_id = 0,
-        .bytecodes = .empty,
-        .source_hashes = .empty,
-        .statics = .empty,
-        .triggers = &.{},
         .prefetched_manifest = prefetched,
-        .current_manifest_bytes = null,
+        .current = .{ .raw = null },
     };
 
     // Best-effort initial load. Read `_deploy/current` from the
@@ -1304,36 +1382,39 @@ fn openTenantFilesNode(node: *NodeState, inst: *const tenant_mod.Instance) !*Ten
     // loop). The hot request path stays free of network I/O at
     // cold-start, just like everywhere else.
     //
-    // Until the loader catches up, the tenant has empty
-    // bytecodes; requests against it return 503. The customer
-    // observes "loading" via SSE (future) or by polling. For
-    // tenants with no `_deploy/current` set, the loader skips
-    // and the tenant stays at 503 forever (until a real release
-    // POST sets the pointer).
-    return tc;
+    // Until the loader catches up, the tenant has no snapshot;
+    // requests against it return 503. The customer observes
+    // "loading" via SSE (future) or by polling. For tenants with
+    // no `_deploy/current` set, the loader skips and the tenant
+    // stays at 503 forever (until a real release POST sets the
+    // pointer).
+    return slot;
 }
 
-fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
-    freeBytecodes(tc);
-    freeSourceHashes(tc);
-    freeStatics(tc);
-    freeTriggers(tc);
-    tc.manifest_backend.deinit();
-    tc.blob_backend.deinit();
-    if (tc.prefetched_manifest) |p| allocator.free(p.bytes);
-    if (tc.current_manifest_bytes) |b| allocator.free(b);
-    allocator.free(tc.instance_id);
-    allocator.destroy(tc);
+fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
+    // Drop the slot's reference to the current snapshot (if any).
+    // In-flight pinned references keep the old snapshot alive until
+    // they release.
+    if (slot.current.load(.acquire)) |snap| {
+        // Atomically clear so nobody else can pin after teardown.
+        slot.current.store(null, .release);
+        snap.release();
+    }
+    slot.manifest_backend.deinit();
+    slot.blob_backend.deinit();
+    if (slot.prefetched_manifest) |p| allocator.free(p.bytes);
+    allocator.free(slot.instance_id);
+    allocator.destroy(slot);
 }
 
-/// Lookup-or-lazy-open the process-shared TenantFiles for `inst`.
-/// Wraps `worker.node.getOrOpenTenantFiles` for backwards-compat —
-/// callers can use either path.
-pub fn getOrOpenTenantFiles(
+/// Lookup-or-lazy-open the process-shared TenantSlot for `inst`.
+/// Wraps `worker.node.getOrOpenTenantSlot` for callers that only
+/// hold a worker pointer.
+pub fn getOrOpenTenantSlot(
     worker: anytype,
     inst: *const tenant_mod.Instance,
-) !*TenantFiles {
-    return worker.node.getOrOpenTenantFiles(inst);
+) !*TenantSlot {
+    return worker.node.getOrOpenTenantSlot(inst);
 }
 
 // ── Per-tenant log loading ────────────────────────────────────────────
@@ -1700,177 +1781,132 @@ pub fn flushLogs(worker: anytype) !void {
     };
 }
 
-/// Free every key + bytecode value in `tc.bytecodes` and clear the map.
-/// Used both on teardown and before atomically swapping in a newly
-/// loaded deployment.
-fn freeBytecodes(tc: *TenantFiles) void {
-    var it = tc.bytecodes.iterator();
-    while (it.next()) |e| {
-        tc.allocator.free(e.key_ptr.*);
-        tc.allocator.free(e.value_ptr.*);
-    }
-    tc.bytecodes.deinit(tc.allocator);
-    tc.bytecodes = .empty;
-}
-
-/// Free the keys in `tc.source_hashes` and clear the map. Values are
-/// `[64]u8` by-value, no separate free needed.
-fn freeSourceHashes(tc: *TenantFiles) void {
-    var it = tc.source_hashes.iterator();
-    while (it.next()) |e| tc.allocator.free(e.key_ptr.*);
-    tc.source_hashes.deinit(tc.allocator);
-    tc.source_hashes = .empty;
-}
-
-/// Free every key + StaticEntry.content_type in `tc.statics` and clear
-/// the map. Paired with `freeBytecodes` for deployment teardown.
-fn freeStatics(tc: *TenantFiles) void {
-    var it = tc.statics.iterator();
-    while (it.next()) |e| {
-        tc.allocator.free(e.key_ptr.*);
-        tc.allocator.free(e.value_ptr.*.content_type);
-    }
-    tc.statics.deinit(tc.allocator);
-    tc.statics = .empty;
-}
-
-/// Free every owned slice in `tc.triggers` and clear the array.
-/// Paired with `freeBytecodes` / `freeStatics` for deployment teardown.
-fn freeTriggers(tc: *TenantFiles) void {
-    for (tc.triggers) |*e| {
-        tc.allocator.free(e.prefix);
-        tc.allocator.free(e.module_path);
-    }
-    tc.allocator.free(tc.triggers);
-    tc.triggers = &.{};
-}
-
 /// Read the tenant's current deployment manifest, fetch every handler
 /// entry's bytecode blob, stage every static entry's metadata, and
-/// atomically swap both maps on the tenant. Returns `error.NoDeployment`
-/// when no deploy has been made yet — soft failure the caller treats
-/// as "leave the maps empty".
-fn reloadAllBytecodes(tc: *TenantFiles) !void {
+/// build + swap an immutable snapshot onto `slot.current`. Returns
+/// `error.NoDeployment` when no deploy has been made yet — soft
+/// failure the caller treats as "leave the slot snapshotless".
+fn reloadAllBytecodes(slot: *TenantSlot) !void {
     // Read the release pointer from the tenant's app.db. Set by
     // /_system/release (replicated through raft envelope 0); absent
     // for tenants that haven't been released yet.
-    const cur_bytes = tc.app_kv.get("_deploy/current") catch |err| switch (err) {
+    const cur_bytes = slot.app_kv.get("_deploy/current") catch |err| switch (err) {
         error.NotFound => return error.NoDeployment,
         else => return err,
     };
-    defer tc.allocator.free(cur_bytes);
+    defer slot.allocator.free(cur_bytes);
     const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch return error.NoDeployment;
-    return reloadDeployment(tc, dep_id);
+    return reloadDeployment(slot, dep_id);
 }
 
 /// Pull a specific deployment manifest from the per-tenant
 /// `deployments/` BlobBackend, fetch every referenced bytecode, and
-/// atomically swap the maps on `tc`. Used by `reloadAllBytecodes`
-/// (cold start / restart) and by the background `DeploymentLoader`
-/// thread (a release landed).
-fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
-    // Three-tier source for the manifest bytes:
-    //   1. Already-cached `current_manifest_bytes` matching this
-    //      dep_id — re-decode locally, no I/O. Common when the
-    //      release handler is doing a re-release of the same
-    //      dep_id (e.g. the bench's warmup phase).
+/// build a new `TenantFilesSnapshot` that we atomic-swap onto
+/// `slot.current`. The old snapshot's slot-reference drops, but
+/// pinned in-flight readers keep it alive until they release. Used
+/// by `reloadAllBytecodes` (cold start / restart) and by the
+/// background `DeploymentLoader` thread (a release landed).
+fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
+    const allocator = slot.allocator;
+    // Two-tier source for the manifest bytes:
+    //   1. Cached snapshot's `manifest_bytes` matching this dep_id —
+    //      re-decode locally, no I/O. Common when the release
+    //      handler is doing a re-release of the same dep_id (e.g.
+    //      the bench's warmup phase).
     //   2. One-shot prefetch from cold-start. Transfer ownership
     //      out of the prefetch slot.
     //   3. Per-tenant HTTP / S3 fetch via manifest_backend.
     var json_bytes: []u8 = undefined;
     var bytes_taken_from_cache = false;
-    if (tc.current_manifest_bytes) |cached| {
-        if (tc.current_deployment_id == dep_id) {
-            json_bytes = try tc.allocator.dupe(u8, cached);
+    if (slot.current.load(.acquire)) |cur_snap| {
+        if (cur_snap.deployment_id == dep_id) {
+            json_bytes = try allocator.dupe(u8, cur_snap.manifest_bytes);
             bytes_taken_from_cache = true;
         }
     }
     if (!bytes_taken_from_cache) {
         var owned_by_prefetch = false;
-        if (tc.prefetched_manifest) |p| {
-            tc.prefetched_manifest = null;
+        if (slot.prefetched_manifest) |p| {
+            slot.prefetched_manifest = null;
             if (p.dep_id == dep_id) {
                 json_bytes = p.bytes;
                 owned_by_prefetch = true;
             } else {
-                tc.allocator.free(p.bytes);
+                allocator.free(p.bytes);
             }
         }
         if (!owned_by_prefetch) {
             var key_buf: [25]u8 = undefined;
             const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
-            json_bytes = tc.manifest_backend.blobStore().get(key, tc.allocator) catch |err| switch (err) {
+            json_bytes = slot.manifest_backend.blobStore().get(key, allocator) catch |err| switch (err) {
                 error.NotFound => return error.NoDeployment,
                 else => return err,
             };
         }
     }
-    // After the swap below, `json_bytes` becomes the new
-    // `current_manifest_bytes`. We can't free here. The OLD
-    // current_manifest_bytes (if any) frees just before the swap.
     var json_bytes_consumed = false;
-    errdefer if (!json_bytes_consumed) tc.allocator.free(json_bytes);
+    errdefer if (!json_bytes_consumed) allocator.free(json_bytes);
 
-    var manifest = files_mod.manifest_json.decode(tc.allocator, json_bytes) catch
+    var manifest = files_mod.manifest_json.decode(allocator, json_bytes) catch
         return error.InvalidManifest;
     defer manifest.deinit();
 
-    const bs = tc.blob_backend.blobStore();
+    const bs = slot.blob_backend.blobStore();
 
-    // Build the new maps in locals before swapping, so if any fetch
-    // fails mid-way the tenant keeps serving the old deployment.
+    // Build the new maps in locals before installing, so if any fetch
+    // fails mid-way the slot keeps serving the old deployment.
     var next_bc: std.StringHashMapUnmanaged([]u8) = .empty;
     errdefer {
         var it = next_bc.iterator();
         while (it.next()) |e| {
-            tc.allocator.free(e.key_ptr.*);
-            tc.allocator.free(e.value_ptr.*);
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
         }
-        next_bc.deinit(tc.allocator);
+        next_bc.deinit(allocator);
     }
 
     var next_source_hashes: std.StringHashMapUnmanaged([64]u8) = .empty;
     errdefer {
         var it = next_source_hashes.iterator();
-        while (it.next()) |e| tc.allocator.free(e.key_ptr.*);
-        next_source_hashes.deinit(tc.allocator);
+        while (it.next()) |e| allocator.free(e.key_ptr.*);
+        next_source_hashes.deinit(allocator);
     }
 
     var next_statics: std.StringHashMapUnmanaged(StaticEntry) = .empty;
     errdefer {
         var it = next_statics.iterator();
         while (it.next()) |e| {
-            tc.allocator.free(e.key_ptr.*);
-            tc.allocator.free(e.value_ptr.*.content_type);
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*.content_type);
         }
-        next_statics.deinit(tc.allocator);
+        next_statics.deinit(allocator);
     }
 
     var next_triggers: std.ArrayList(TriggerEntry) = .empty;
     errdefer {
         for (next_triggers.items) |*e| {
-            tc.allocator.free(e.prefix);
-            tc.allocator.free(e.module_path);
+            allocator.free(e.prefix);
+            allocator.free(e.module_path);
         }
-        next_triggers.deinit(tc.allocator);
+        next_triggers.deinit(allocator);
     }
 
     for (manifest.entries) |entry| {
-        const path_copy = try tc.allocator.dupe(u8, entry.path);
-        errdefer tc.allocator.free(path_copy);
+        const path_copy = try allocator.dupe(u8, entry.path);
+        errdefer allocator.free(path_copy);
         switch (entry.kind) {
             .handler => {
-                const bytecode = try bs.get(&entry.bytecode_hex, tc.allocator);
-                errdefer tc.allocator.free(bytecode);
-                try next_bc.put(tc.allocator, path_copy, bytecode);
+                const bytecode = try bs.get(&entry.bytecode_hex, allocator);
+                errdefer allocator.free(bytecode);
+                try next_bc.put(allocator, path_copy, bytecode);
 
                 // Mirror the path → source-hash mapping so the per-
                 // request module loader can stamp `appendModule(name,
                 // source_hash)` on each successful import. Owns its
                 // own key copy.
-                const sh_key = try tc.allocator.dupe(u8, entry.path);
-                errdefer tc.allocator.free(sh_key);
-                try next_source_hashes.put(tc.allocator, sh_key, entry.source_hex);
+                const sh_key = try allocator.dupe(u8, entry.path);
+                errdefer allocator.free(sh_key);
+                try next_source_hashes.put(allocator, sh_key, entry.source_hex);
 
                 // If this handler also matches the trigger path
                 // convention (`_triggers/<.../>index.{mjs,js}`), index
@@ -1880,24 +1916,24 @@ fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
                     if (isReservedTriggerPrefix(derived_prefix)) {
                         std.log.warn(
                             "rove-js: tenant {s} trigger {s} rejected — prefix '{s}' overlaps a platform namespace",
-                            .{ tc.instance_id, entry.path, derived_prefix },
+                            .{ slot.instance_id, entry.path, derived_prefix },
                         );
                         return error.ReservedTriggerPrefix;
                     }
-                    const prefix_copy = try tc.allocator.dupe(u8, derived_prefix);
-                    errdefer tc.allocator.free(prefix_copy);
-                    const module_copy = try tc.allocator.dupe(u8, entry.path);
-                    errdefer tc.allocator.free(module_copy);
-                    try next_triggers.append(tc.allocator, .{
+                    const prefix_copy = try allocator.dupe(u8, derived_prefix);
+                    errdefer allocator.free(prefix_copy);
+                    const module_copy = try allocator.dupe(u8, entry.path);
+                    errdefer allocator.free(module_copy);
+                    try next_triggers.append(allocator, .{
                         .prefix = prefix_copy,
                         .module_path = module_copy,
                     });
                 }
             },
             .static => {
-                const ct_copy = try tc.allocator.dupe(u8, entry.content_type);
-                errdefer tc.allocator.free(ct_copy);
-                try next_statics.put(tc.allocator, path_copy, .{
+                const ct_copy = try allocator.dupe(u8, entry.content_type);
+                errdefer allocator.free(ct_copy);
+                try next_statics.put(allocator, path_copy, .{
                     .content_type = ct_copy,
                     .hash_hex = entry.source_hex,
                 });
@@ -1907,14 +1943,14 @@ fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
 
     // Sort triggers by prefix length descending (longest/innermost
     // first). AFTER chain iterates forward; BEFORE chain iterates
-    // reverse. See the field doc on TenantFiles.triggers.
-    const triggers_slice = try next_triggers.toOwnedSlice(tc.allocator);
+    // reverse. See TenantFilesSnapshot.triggers.
+    const triggers_slice = try next_triggers.toOwnedSlice(allocator);
     errdefer {
         for (triggers_slice) |*e| {
-            tc.allocator.free(e.prefix);
-            tc.allocator.free(e.module_path);
+            allocator.free(e.prefix);
+            allocator.free(e.module_path);
         }
-        tc.allocator.free(triggers_slice);
+        allocator.free(triggers_slice);
     }
     std.mem.sort(TriggerEntry, triggers_slice, {}, struct {
         fn lessThan(_: void, a: TriggerEntry, b: TriggerEntry) bool {
@@ -1922,23 +1958,38 @@ fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
         }
     }.lessThan);
 
-    // Swap.
-    freeBytecodes(tc);
-    freeSourceHashes(tc);
-    freeStatics(tc);
-    freeTriggers(tc);
-    if (tc.current_manifest_bytes) |old| tc.allocator.free(old);
-    tc.bytecodes = next_bc;
-    tc.source_hashes = next_source_hashes;
-    tc.statics = next_statics;
-    tc.triggers = triggers_slice;
-    tc.current_manifest_bytes = json_bytes;
+    // Build the new immutable snapshot. Refcount starts at 1 (the
+    // slot's reference).
+    const new_snap = try allocator.create(TenantFilesSnapshot);
+    errdefer allocator.destroy(new_snap);
+    new_snap.* = .{
+        .allocator = allocator,
+        .deployment_id = manifest.id,
+        .bytecodes = next_bc,
+        .source_hashes = next_source_hashes,
+        .statics = next_statics,
+        .triggers = triggers_slice,
+        .manifest_bytes = json_bytes,
+        .refcount = .{ .raw = 1 },
+    };
     json_bytes_consumed = true;
-    tc.current_deployment_id = manifest.id;
+
+    // Atomic swap under `pin_lock` so any concurrent `pinCurrent`
+    // either retains the OLD snapshot before swap (refcount goes
+    // 1→2→1 across loader's release) or sees the NEW pointer
+    // entirely. Without the lock, a load + retain pair could
+    // straddle the swap+release and touch freed memory.
+    slot.pin_lock.lock();
+    const old_snap = slot.current.swap(new_snap, .acq_rel);
+    slot.pin_lock.unlock();
+    // Release-after-unlock is safe: the OLD pointer is no longer
+    // reachable via `slot.current`, so no new pin can find it.
+    // Pre-swap pins already retained.
+    if (old_snap) |old| old.release();
 
     std.log.info(
         "rove-js: tenant {s} loaded deployment {d} ({d} handler(s), {d} static(s), {d} trigger(s))",
-        .{ tc.instance_id, manifest.id, tc.bytecodes.count(), tc.statics.count(), tc.triggers.len },
+        .{ slot.instance_id, manifest.id, new_snap.bytecodes.count(), new_snap.statics.count(), new_snap.triggers.len },
     );
 }
 
@@ -2164,7 +2215,7 @@ pub fn hostOnly(authority: []const u8) []const u8 {
 /// which is exactly what the admin handler needs — one JS module
 /// does its own path-based dispatch.
 pub fn findBytecode(
-    tc: *const TenantFiles,
+    tc: TenantFiles,
     module_base: []const u8,
     allocator: std.mem.Allocator,
 ) !?[]u8 {
@@ -2177,8 +2228,8 @@ pub fn findBytecode(
         defer allocator.free(mjs_key);
         const js_key = try std.fmt.allocPrint(allocator, "{s}.js", .{cur});
         defer allocator.free(js_key);
-        if (tc.bytecodes.get(mjs_key)) |bc| return bc;
-        if (tc.bytecodes.get(js_key)) |bc| return bc;
+        if (tc.snap.bytecodes.get(mjs_key)) |bc| return bc;
+        if (tc.snap.bytecodes.get(js_key)) |bc| return bc;
 
         // At the root? Done — nothing matched.
         if (std.mem.eql(u8, cur, "index")) return null;
