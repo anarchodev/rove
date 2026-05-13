@@ -26,14 +26,23 @@ Requires Zig 0.15.0+. System libraries needed: nghttp2, OpenSSL (ssl + crypto), 
 
 ## Smoke tests
 
-Shell scripts in `scripts/` drive end-to-end tests against running binaries:
+Python scripts in `scripts/` drive end-to-end tests against running binaries.
+Each one spawns its own cluster + standalones and tears them down via
+`atexit` / signal handlers (no `pkill -f` fragility).
 
 ```bash
-scripts/files_server_smoke.sh  # files-server compile/upload/deploy/fetch
-scripts/ctl_smoke.sh           # /_system/* control surface
-scripts/penalty_smoke.sh       # penalty box system
-scripts/proxy_smoke.sh         # proxy/forwarding
+python3 scripts/ctl_smoke.py            # /_system/* control surface
+python3 scripts/files_server_smoke.py   # files-server compile/upload/deploy/fetch
+python3 scripts/penalty_smoke.py        # penalty box system
+python3 scripts/leader_failover_smoke.py  # raft leader change preserves http.send
 ```
+
+`scripts/smoke_lib.py` is the shared harness — `Cluster.spawn` /
+`discover_leader` / `spawn_files_server` / `mint_services_token` /
+process-tracking + cleanup primitives. New smokes should follow the
+existing tier-1 ones (e.g. `cookie_auth_smoke.py`) for the canonical
+shape. The Python harness replaced the bash `_smoke_helpers.sh` flow
+in commits 431722b → 95e53f3.
 
 ## Architecture
 
