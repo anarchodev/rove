@@ -131,7 +131,7 @@ pub fn dispatchCallbacks(
         const tenant_id = rows[start].tenant_id;
         const slice = rows[start..end];
 
-        const tc = worker.tenant_files_map.get(tenant_id) orelse {
+        const tc = worker.node.tenant_files_map.get(tenant_id) orelse {
             // Tenant was deleted between schedule-fire and now; drop
             // the callback rows so they don't accumulate forever.
             for (slice) |r| {
@@ -152,7 +152,7 @@ pub fn dispatchCallbacks(
             }
             continue;
         }
-        const inst_opt = worker.tenant.getInstance(tenant_id) catch |err| {
+        const inst_opt = worker.node.tenant.getInstance(tenant_id) catch |err| {
             std.log.warn("rove-js callbacks: getInstance({s}): {s}", .{ tenant_id, @errorName(err) });
             continue;
         };

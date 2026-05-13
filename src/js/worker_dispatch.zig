@@ -466,7 +466,7 @@ fn authorizeSystemRequest(
     cors_origin: ?[]const u8,
     required_cap: ?[]const u8,
 ) !bool {
-    const auth_ctx = auth.extractAdminAuth(worker.tenant, rh) catch |err| {
+    const auth_ctx = auth.extractAdminAuth(worker.node.tenant, rh) catch |err| {
         std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
         try respb.setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
         return false;
@@ -729,7 +729,7 @@ fn handleRaftSnapshot(
     const id_str = sys_rest[prefix.len..];
     const snap_id = std.fmt.parseInt(u64, id_str, 16) catch 0;
 
-    const data_dir = worker.tenant.dir;
+    const data_dir = worker.node.tenant.dir;
 
     // Dump cluster.kv to a tmp path. dumpManifestToFile durabilizes
     // the source, opens a snapshot, and writes a fresh defragmented
@@ -743,7 +743,7 @@ fn handleRaftSnapshot(
 
     const tmp_pathz = try allocator.dupeZ(u8, tmp_path);
     defer allocator.free(tmp_pathz);
-    try worker.tenant.root.dumpManifestToFile(tmp_pathz);
+    try worker.node.tenant.root.dumpManifestToFile(tmp_pathz);
 
     const bytes = std.fs.cwd().readFileAlloc(allocator, tmp_path, 1 << 32) catch return;
     defer allocator.free(bytes);
@@ -822,7 +822,7 @@ fn handleRelease(
 
     // Reject unknown tenants — keeps stale dashboard sessions from
     // populating the table with garbage that never matches.
-    const inst_opt = worker.tenant.getInstance(parsed.value.tenant_id) catch null;
+    const inst_opt = worker.node.tenant.getInstance(parsed.value.tenant_id) catch null;
     const inst = inst_opt orelse {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown tenant\n", allocator, cors_origin, null);
         return;
@@ -924,7 +924,7 @@ fn handleRelease(
     // do this for us on this node. On follower nodes, apply.zig's
     // _deploy/current detector enqueues automatically when the
     // writeset commits.
-    if (worker.deployment_loader) |loader| {
+    if (worker.node.deployment_loader) |loader| {
         loader.enqueue(parsed.value.tenant_id, parsed.value.dep_id) catch |err| {
             std.log.warn(
                 "release: deployment loader enqueue {s}/{d} failed: {s}",
@@ -990,7 +990,7 @@ fn handleAdminKv(
         return;
     }
 
-    const admin_inst_opt = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+    const admin_inst_opt = worker.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
     const admin_inst = admin_inst_opt orelse {
         try respb.setSystemResponse(server, ent, sid, sess, 503, "__admin__ tenant not initialized\n", allocator, cors_origin, null);
         return;
@@ -1100,13 +1100,13 @@ fn resolveRequest(
         false;
 
     if (!is_admin_host) {
-        const r = worker.tenant.resolveDomain(host) catch |err| {
+        const r = worker.node.tenant.resolveDomain(host) catch |err| {
             std.log.warn("rove-js: tenant.resolveDomain({s}) failed: {s}", .{ host, @errorName(err) });
             try respb.setSimpleResponse(server, ent, sid, sess, 500, "tenant resolution failed\n", allocator);
             return .handled;
         };
         if (r == null) {
-            const ps = worker.tenant.publicSuffix() orelse "(none)";
+            const ps = worker.node.tenant.publicSuffix() orelse "(none)";
             const ad = worker.admin_api_domain orelse "(none)";
             const body_owned = std.fmt.allocPrint(
                 allocator,
@@ -1166,7 +1166,7 @@ fn resolveRequest(
     const has_query = std.mem.indexOfScalar(u8, path, '?') != null;
     const is_static_method = std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD");
     if (is_static_method and !has_query) {
-        const admin_inst = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+        const admin_inst = worker.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
         if (admin_inst) |ai| {
             const admin_tc = worker_mod.getOrOpenTenantFiles(worker, ai) catch null;
             if (admin_tc) |tc| {
@@ -1185,7 +1185,7 @@ fn resolveRequest(
     // `/_system/*` keeps its own auth gate via `tryHandleSystem`
     // until the files-server + log-server detach (PLAN §10.13).
 
-    const admin_opt = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+    const admin_opt = worker.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
     if (admin_opt == null) {
         try respb.setSystemResponse(server, ent, sid, sess, 503, "admin tenant not provisioned\n", allocator, admin_cors, null);
         return .handled;
@@ -1201,7 +1201,7 @@ fn resolveRequest(
     const scope_inst: *const tenant_mod.Instance = if (effective_scope.len == 0)
         handler_inst
     else blk: {
-        const s_opt = worker.tenant.getInstance(effective_scope) catch |err| inner: {
+        const s_opt = worker.node.tenant.getInstance(effective_scope) catch |err| inner: {
             std.log.warn("rove-js: admin getInstance({s}) failed: {s}", .{ effective_scope, @errorName(err) });
             break :inner null;
         };

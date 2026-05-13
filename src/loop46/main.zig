@@ -339,16 +339,10 @@ const WorkerCtx = struct {
     /// Owned by worker 0's thread frame (allocated on stack in
     /// `workerMain`). Other workers leave null.
     internal_schedules_inflight: ?*std.StringHashMapUnmanaged(void) = null,
-    /// Worker thread publishes its `DeploymentLoader` pointer here
-    /// after `Worker.create`. Main reads it (after `ready.set()`)
-    /// and stamps onto `ApplyCtx.deployment_loader` so the apply
-    /// thread's follower-side `_deploy/current` detection can
-    /// enqueue. Worker 0 only — the field exists on every WorkerCtx
-    /// but only worker 0's slot is read. The remaining workers'
-    /// loaders catch up on next request to that tenant when they
-    /// see the new `_deploy/current` value through their own dispatch.
-    /// (Multi-worker fan-out is a follow-up.)
-    deployment_loader_publish: ?*rjs.DeploymentLoader = null,
+    /// Process-shared deployment + tenant state. Owned by main.
+    /// Single loader thread; single tenant_files_map across every
+    /// worker on this node — the per-worker fan-out race is gone.
+    node: *rjs.NodeState,
 };
 
 fn workerMain(args: *WorkerCtx) !void {
@@ -370,114 +364,13 @@ fn workerMain(args: *WorkerCtx) !void {
     });
     defer reg.deinit();
 
-    // Per-worker tenant. Under the kvexp cutover, every worker
-    // shares the cluster's single root handle — kvexp's manifest
-    // is thread-safe (per-store locks + sharded page cache), so a
-    // single `*KvStore` pointer is safe to use from many threads
-    // concurrently. No standalone open here; no `close` here
-    // either (the cluster owns the handle's lifetime).
-    const root_kv = try args.cluster.openRoot();
-
-    const tenant = try tenant_mod.Tenant.createWithCounters(
-        allocator,
-        root_kv,
-        args.data_dir,
-        args.seq_counters,
-    );
-    defer tenant.destroy();
-    try tenant.setPublicSuffix(args.public_suffix);
-    tenant.root_token_secret = args.root_token_secret;
-
-    // The main thread created __admin__ + the root token + any
-    // pre-seeded tenants before spawning us. Promote them into THIS
-    // worker's in-memory cache so `Worker.create` can open their
-    // per-tenant stores eagerly. __admin__ is always present;
-    // additional tenants are discovered by walking the data dir.
-    //
-    // For the per-tenant `app.db` stores we also set `busy_timeout=0`
-    // so BEGIN IMMEDIATE returns SQLITE_BUSY immediately instead of
-    // blocking up to 5s. The batched dispatcher handles that: it
-    // records the tenant as blocked for this tick and moves on to
-    // pick a different anchor. The WAL-transition race startup
-    // happens via the main thread's `prewarmTenantDbs`, so worker
-    // opens never need the original 5s wait anymore.
-    try tenant.createInstance(tenant_mod.ADMIN_INSTANCE_ID);
-    // Skip the busy_timeout=0 hack on __admin__ — its kv ALIASES to
-    // the root store, and root.db needs normal busy handling so
-    // concurrent bootstrap writes across workers (marker + domain
-    // updates) serialize instead of racing to SQLITE_BUSY.
-    // Discover the tenants the seed (or a previous worker run)
-    // registered: under the kvexp consolidation they live as
-    // `instance/{id}` rows in the root store, not as
-    // `{data_dir}/{id}/app.db` files on disk.
-    var instance_list = try tenant.listInstances(std.math.maxInt(u32));
-    defer instance_list.deinit();
-    for (instance_list.ids) |id| {
-        if (std.mem.eql(u8, id, tenant_mod.ADMIN_INSTANCE_ID)) continue;
-        try tenant.createInstance(id);
-    }
-
-    // Production.md #1.4 step 4 — wire the HTTP-backed manifest
-    // fetcher when the operator pointed us at a files-server
-    // cluster. The mint closure runs per fetch; cost is one HMAC-
-    // SHA256 (microseconds), dominated by the network roundtrip.
-    // Token expiry is 5 minutes — same default loop46 hands the
-    // dashboard at /_system/services-token, so no second secret to
-    // manage.
-    const ManifestMintCtx = struct {
-        secret: []const u8,
-        fn mint(ctx_opaque: ?*anyopaque, allocator_inner: std.mem.Allocator) anyerror![]u8 {
-            const ctx: *@This() = @ptrCast(@alignCast(ctx_opaque.?));
-            const exp_ms: i64 = @as(i64, @intCast(@divFloor(std.time.milliTimestamp(), 1))) + 5 * 60 * 1000;
-            return jwt_mod.mint(allocator_inner, ctx.secret, .{ .exp_ms = exp_ms });
-        }
-    };
-    var manifest_mint_ctx = ManifestMintCtx{ .secret = args.services_jwt_secret };
-    const manifest_http: ?rjs.ManifestHttpConfig = if (args.files_internal_base) |base|
-        .{
-            .base_url = base,
-            .mint_jwt = ManifestMintCtx.mint,
-            .mint_ctx = &manifest_mint_ctx,
-            .ca_bundle_path = null,
-            .verify_tls = !args.files_internal_insecure_tls,
-        }
-    else
-        null;
-
-    // Build a shared libcurl Easy handle FIRST when manifest_http
-    // is wired — used by both the cold-start batch fetch AND
-    // every per-tenant manifest backend the worker creates after.
-    // Connection cache + TLS-session resumption are per-handle
-    // in libcurl; sharing one handle keeps the worker → files-
-    // server connection warm across all manifest reads (cold-
-    // start prefetch, per-release config-mirror fetch, dispatch
-    // tick reload). Ownership transfers to Worker.create.
-    const manifest_easy: ?*blob_mod.curl.Easy = if (manifest_http != null)
-        try blob_mod.curl.Easy.init(allocator)
-    else
-        null;
-    errdefer if (manifest_easy) |e| e.deinit();
-
-    // Cold-start manifest prefetch — one HTTP roundtrip pulls
-    // every tenant's manifest from files-server in a single batch.
-    // Without this, each per-tenant `openTenantFiles` would issue
-    // its own GET, hammering files-server's accept queue at scale
-    // (the 10k bench tipped over with `AcceptFailed` before this
-    // path landed).
-    //
-    // No fallback: if the bulk fetch fails (files-server down,
-    // partition, transient TLS hiccup), retry with exponential
-    // backoff. The worker can't usefully serve traffic without
-    // manifests; falling back to per-tenant fetch reintroduces
-    // the connection-storm bug class we're avoiding here. Block
-    // until the bulk fetch succeeds.
-    const manifest_prefetch_opt: ?std.StringHashMapUnmanaged(rjs.PrefetchedManifest) = if (manifest_http) |mh|
-        try prefetchManifestsWithRetry(allocator, &mh, manifest_easy, tenant)
-    else
-        null;
+    // Tenant + manifest setup is now process-shared on NodeState
+    // (main.zig creates one before spawning workers). Worker code
+    // reaches it via `args.node.tenant`, `args.node.manifest_http`,
+    // etc.
 
     const worker = try Worker.create(allocator, &reg, .{
-        .tenant = tenant,
+        .node = args.node,
         .raft = args.raft,
         .addr = args.http_addr,
         .io_opts = .{
@@ -512,21 +405,12 @@ fn workerMain(args: *WorkerCtx) !void {
         .rate_limit_caps = args.rate_limit_caps,
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
-        .blob_backend = args.blob_backend_cfg,
-        .manifest_http = manifest_http,
-        .manifest_prefetch = manifest_prefetch_opt,
-        .manifest_easy = manifest_easy,
         .log_batch_store = args.log_batch_store,
     });
     defer worker.destroy();
 
-    // Publish the worker's DeploymentLoader pointer for main to
-    // wire into ApplyCtx (follower-side `_deploy/current` apply
-    // path). Set before `ready.set()` so main can read it
-    // immediately after the wait returns. Worker 0 only — main
-    // currently uses just this slot; other workers' loaders are
-    // independent (see WorkerCtx.deployment_loader_publish docs).
-    @atomicStore(?*rjs.DeploymentLoader, &args.deployment_loader_publish, worker.deployment_loader, .release);
+    // DeploymentLoader is owned by NodeState (set in main before
+    // workers spawned); no per-worker publish step.
 
     std.log.info("worker {d}: ready, listening on same port via SO_REUSEPORT", .{args.worker_idx});
     args.ready.set();
@@ -1468,6 +1352,89 @@ pub fn main() !void {
     defer schedule_handle.signalStop();
     loop46_ctx.schedule_wake = &schedule_handle.wake;
 
+    // Shared seq-counter registry. Every per-tenant `app.db` KvStore
+    // opened by any worker draws from this, so concurrent worker
+    // threads allocating new seqs for the same tenant never collide.
+    var seq_counters = kv.SeqCounterRegistry.init(allocator);
+    defer seq_counters.deinit();
+
+    // ── Process-shared tenant + deployment state (NodeState) ────────
+    //
+    // Pre-cutover each worker thread built its own Tenant +
+    // tenant_files_map + DeploymentLoader. That's 4× memory on a
+    // 4-worker node, plus a fan-out race: `/_system/release` POSTs
+    // arriving at one worker via SO_REUSEPORT only reloaded that
+    // worker's loader. Hoisting these into a single `NodeState`
+    // owned by main fixes both. See `docs/deployment-snapshots-plan.md`.
+    const root_kv = try cluster.openRoot();
+    const node_tenant = try tenant_mod.Tenant.createWithCounters(
+        allocator,
+        root_kv,
+        cli.data_dir,
+        &seq_counters,
+    );
+    defer node_tenant.destroy();
+    try node_tenant.setPublicSuffix(cli.public_suffix);
+    node_tenant.root_token_secret = root_token_secret;
+    try node_tenant.createInstance(tenant_mod.ADMIN_INSTANCE_ID);
+    var node_instance_list = try node_tenant.listInstances(std.math.maxInt(u32));
+    defer node_instance_list.deinit();
+    for (node_instance_list.ids) |id| {
+        if (std.mem.eql(u8, id, tenant_mod.ADMIN_INSTANCE_ID)) continue;
+        try node_tenant.createInstance(id);
+    }
+
+    // HTTP-backed manifest fetcher + cold-start prefetch — process-
+    // shared. One libcurl Easy serves every tenant on this node and
+    // every release thereafter. Pre-cutover each worker built its
+    // own copy of these.
+    const NodeManifestMintCtx = struct {
+        secret: []const u8,
+        fn mint(ctx_opaque: ?*anyopaque, allocator_inner: std.mem.Allocator) anyerror![]u8 {
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_opaque.?));
+            const exp_ms: i64 = @as(i64, @intCast(@divFloor(std.time.milliTimestamp(), 1))) + 5 * 60 * 1000;
+            return jwt_mod.mint(allocator_inner, ctx.secret, .{ .exp_ms = exp_ms });
+        }
+    };
+    var node_manifest_mint_ctx = NodeManifestMintCtx{ .secret = &services_jwt_secret };
+    const node_manifest_http: ?rjs.ManifestHttpConfig = if (cli.files_internal_base) |base|
+        .{
+            .base_url = base,
+            .mint_jwt = NodeManifestMintCtx.mint,
+            .mint_ctx = &node_manifest_mint_ctx,
+            .ca_bundle_path = null,
+            .verify_tls = !cli.files_internal_insecure_tls,
+        }
+    else
+        null;
+    const node_manifest_easy: ?*blob_mod.curl.Easy = if (node_manifest_http != null)
+        try blob_mod.curl.Easy.init(allocator)
+    else
+        null;
+    defer if (node_manifest_easy) |e| e.deinit();
+    const node_manifest_prefetch: ?rjs.ManifestPrefetchMap = if (node_manifest_http) |mh|
+        try prefetchManifestsWithRetry(allocator, &mh, node_manifest_easy, node_tenant)
+    else
+        null;
+
+    var node_state = rjs.NodeState.init(
+        allocator,
+        node_tenant,
+        blob_owned.cfg,
+        &schedules_store,
+    );
+    node_state.manifest_http = node_manifest_http;
+    node_state.manifest_easy = node_manifest_easy;
+    node_state.manifest_prefetch = node_manifest_prefetch;
+    defer node_state.deinit();
+
+    try node_state.startDeploymentLoader();
+    // Wire the apply path to the shared loader (replaces the
+    // worker-0-publishes-its-loader atomic dance).
+    loop46_ctx.deployment_loader = node_state.deployment_loader;
+
+    _ = try node_state.eagerOpenTenants();
+
     // ── Spawn worker threads ───────────────────────────────────────────
     const http_addr = try parseHostPort(allocator, cli.http);
 
@@ -1478,12 +1445,6 @@ pub fn main() !void {
     const ready_events = try allocator.alloc(std.Thread.ResetEvent, num_workers);
     defer allocator.free(ready_events);
     for (ready_events) |*ev| ev.* = .{};
-
-    // Shared seq-counter registry. Every per-tenant `app.db` KvStore
-    // opened by any worker draws from this, so concurrent worker
-    // threads allocating new seqs for the same tenant never collide.
-    var seq_counters = kv.SeqCounterRegistry.init(allocator);
-    defer seq_counters.deinit();
 
     var i: u16 = 0;
     while (i < num_workers) : (i += 1) {
@@ -1526,17 +1487,13 @@ pub fn main() !void {
             // in-process internal-schedule dispatch tick). Other
             // workers leave null — only worker 0 runs that phase.
             .internal_schedules_store = if (i == 0) &schedules_store else null,
+            .node = &node_state,
         };
         threads[i] = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctxs[i]});
     }
     for (ready_events) |*ev| ev.wait();
-
-    // Wire worker 0's DeploymentLoader into ApplyCtx so the apply
-    // thread can enqueue on follower-side `_deploy/current` writes.
-    // Atomic read pairs with the worker thread's release-store
-    // before `ready.set()`. Other workers' loaders are independent;
-    // multi-worker fan-out is a follow-up.
-    loop46_ctx.deployment_loader = @atomicLoad(?*rjs.DeploymentLoader, &ctxs[0].deployment_loader_publish, .acquire);
+    // (loop46_ctx.deployment_loader was wired to node_state.deployment_loader
+    // before workers spawned — no per-worker publish step needed.)
 
     std.debug.print(
         "loop46 worker node {d} listening on http://{s}\n" ++

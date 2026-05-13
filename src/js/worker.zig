@@ -59,6 +59,7 @@ const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
+const schedule_server_mod = @import("rove-schedule-server");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const globals = @import("globals.zig");
@@ -268,8 +269,14 @@ pub const TenantFiles = struct {
     /// teardown.
     current_manifest_bytes: ?[]u8,
 
-    pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFiles {
-        return openTenantFiles(worker, inst);
+    /// Open via `NodeState.getOrOpenTenantFiles` — there's no
+    /// per-worker open anymore. This shim is kept for the
+    /// `TenantMap(TenantFiles).getOrOpen(worker, inst)` codepath
+    /// that no longer exists post-cutover; the rove-level
+    /// `Entry.open` interface stays on the type for symmetry with
+    /// `TenantLog.open` (which IS still per-worker).
+    pub fn open(node: *NodeState, inst: *const tenant_mod.Instance) !*TenantFiles {
+        return openTenantFilesNode(node, inst);
     }
 
     pub fn free(allocator: std.mem.Allocator, tc: *TenantFiles) void {
@@ -414,12 +421,210 @@ pub const ManifestHttpConfig = struct {
     verify_tls: bool = true,
 };
 
-pub const WorkerConfig = struct {
-    /// Tenant resolver. Every request's `:authority` header is looked
-    /// up here to find the owning instance; the handler's `kv.*` global
-    /// then talks to that instance's dedicated `KvStore` file. Requests
-    /// whose authority doesn't resolve get a 404. Owned by the caller.
+/// Manifest-prefetch slot map. Keys + value bytes are allocator-owned;
+/// consumed at TenantFiles.open time (`fetchRemove` transfers ownership
+/// out). Kept on NodeState so cold-start prefetch persists across the
+/// transition from "main spawns workers" to "each worker boots".
+pub const ManifestPrefetchMap = std.StringHashMapUnmanaged(PrefetchedManifest);
+
+/// Process-wide state shared across every worker on a node.
+/// Owned by `main.zig`; workers borrow `*NodeState`.
+///
+/// Hoisting per-worker fields here fixes three latent bugs the kvexp
+/// cutover surfaced (see `docs/deployment-snapshots-plan.md`):
+///
+///   1. Per-worker bytecode duplication. The deployment cache is
+///      pure read-only bytes between releases; one copy per process
+///      is sufficient.
+///   2. Fan-out race. A `/_system/release` POST goes to one worker
+///      via SO_REUSEPORT; with per-worker `tenant_files_map` only
+///      that worker reloads. Sharing the map means one reload reaches
+///      every dispatcher on the node.
+///   3. Cold-start duplication. Each worker walked `tenant.instances`
+///      and opened its own TenantFiles + libcurl Easies. One process-
+///      wide eager-open replaces N.
+///
+/// Phase 1 of the rollout — sharing the map + single loader fix
+/// (1) and (2). Phase 2 layers in refcounted snapshots so the in-place
+/// reload race goes away too. `tenant_logs` stays per-worker because
+/// `RequestIdMinter` bakes the worker_id into the request id's upper
+/// 16 bits — sharing the minter would alias request ids across
+/// workers.
+pub const NodeState = struct {
+    allocator: std.mem.Allocator,
+
+    /// Shared tenant resolver (instances + domain → instance map).
+    /// Borrowed; owned by `main.zig`.
     tenant: *tenant_mod.Tenant,
+
+    /// Per-tenant deployment cache. `tenant_files_lock` guards
+    /// `getOrOpen` puts; the TenantFiles entries themselves still
+    /// mutate in place under reload — phase 2 makes them immutable
+    /// snapshots, removing that latent race.
+    tenant_files_map: TenantMap(TenantFiles) = .empty,
+    tenant_files_lock: std.Thread.Mutex = .{},
+
+    /// Single deployment loader thread for the whole process.
+    /// `_deploy/current` changes from any worker / apply path enqueue
+    /// here; one reload reaches every worker. Replaces the per-worker
+    /// loader + `deployment_loader_publish` atomic plumbing in
+    /// `main.zig`. Allocated in `NodeState.init`; the load function
+    /// thunk is `deploymentLoadFnNode`.
+    deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
+
+    /// Process-wide config consumed by TenantFiles.open. Shared
+    /// pointers (libcurl Easy, prefetch map) live for the lifetime
+    /// of NodeState.
+    blob_backend_cfg: blob_mod.BackendConfig,
+    manifest_http: ?ManifestHttpConfig = null,
+    manifest_easy: ?*blob_mod.curl.Easy = null,
+    manifest_prefetch: ?ManifestPrefetchMap = null,
+
+    /// Process-shared schedule store. Borrowed; owned by `main.zig`.
+    /// Hoisted here so `/_system/kv-get?store=schedules` (future) and
+    /// any other node-scoped read paths have one handle to ask.
+    schedules_store: *schedule_server_mod.ScheduleStore,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        tenant: *tenant_mod.Tenant,
+        blob_backend_cfg: blob_mod.BackendConfig,
+        schedules_store: *schedule_server_mod.ScheduleStore,
+    ) NodeState {
+        return .{
+            .allocator = allocator,
+            .tenant = tenant,
+            .blob_backend_cfg = blob_backend_cfg,
+            .schedules_store = schedules_store,
+        };
+    }
+
+    pub fn deinit(self: *NodeState) void {
+        if (self.deployment_loader) |l| {
+            l.shutdown();
+            l.deinit();
+            self.deployment_loader = null;
+        }
+        self.tenant_files_map.deinit(self.allocator);
+        if (self.manifest_prefetch) |*map| {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*.bytes);
+            }
+            map.deinit(self.allocator);
+            self.manifest_prefetch = null;
+        }
+    }
+
+    /// Spawn the single deployment loader thread. Idempotent.
+    /// Called once from `main.zig` after NodeState is fully wired
+    /// (tenant + blob backends + schedules_store in place); the
+    /// loader's thunk casts `ctx_opaque` back to `*NodeState`.
+    pub fn startDeploymentLoader(self: *NodeState) !void {
+        if (self.deployment_loader != null) return;
+        const loader = try deployment_loader_mod.DeploymentLoader.init(
+            self.allocator,
+            @as(?*anyopaque, @ptrCast(self)),
+            deploymentLoadFnNode,
+        );
+        errdefer loader.deinit();
+        try loader.start();
+        self.deployment_loader = loader;
+    }
+
+    /// Lookup-or-lazy-open under `tenant_files_lock`.
+    /// Idempotent: concurrent callers may race on `Entry.open` (slow,
+    /// runs unlocked); the loser frees its in-flight entry and
+    /// returns the winner's.
+    pub fn getOrOpenTenantFiles(
+        self: *NodeState,
+        inst: *const tenant_mod.Instance,
+    ) !*TenantFiles {
+        // Fast path: already cached.
+        self.tenant_files_lock.lock();
+        if (self.tenant_files_map.get(inst.id)) |existing| {
+            self.tenant_files_lock.unlock();
+            return existing;
+        }
+        self.tenant_files_lock.unlock();
+
+        // Slow path: open without holding the lock (libcurl + blob
+        // backend init may do I/O). Re-check under the lock before
+        // inserting — another worker may have raced ahead.
+        const opened = try openTenantFilesNode(self, inst);
+        errdefer freeTenantFiles(self.allocator, opened);
+
+        self.tenant_files_lock.lock();
+        defer self.tenant_files_lock.unlock();
+        if (self.tenant_files_map.get(inst.id)) |winner| {
+            // Lost the race; drop our duplicate and use the winner.
+            freeTenantFiles(self.allocator, opened);
+            return winner;
+        }
+        try self.tenant_files_map.put(self.allocator, opened);
+        return opened;
+    }
+
+    /// Cold-start eager-open: walk every known tenant, populate the
+    /// map, enqueue the loader to fetch every deployment in
+    /// parallel. Called once from `main.zig` after the loader is
+    /// up. Returns the count of tenants opened.
+    pub fn eagerOpenTenants(self: *NodeState) !usize {
+        var count: usize = 0;
+        var it = self.tenant.instances.iterator();
+        while (it.next()) |entry| {
+            const inst = entry.value_ptr.*;
+            const tc = try self.getOrOpenTenantFiles(inst);
+            count += 1;
+            // Enqueue a deployment load for any tenant whose
+            // `_deploy/current` is set — mirrors the old Worker.create
+            // cold-start loop.
+            if (self.deployment_loader) |l| {
+                const cur_bytes = tc.app_kv.get("_deploy/current") catch continue;
+                defer self.allocator.free(cur_bytes);
+                const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch continue;
+                if (dep_id == 0) continue;
+                l.enqueue(tc.instance_id, dep_id) catch |err| {
+                    std.log.warn(
+                        "rove-js: cold-start enqueue {s}/{d} failed: {s}",
+                        .{ tc.instance_id, dep_id, @errorName(err) },
+                    );
+                };
+            }
+        }
+        return count;
+    }
+};
+
+/// Loader thunk for the single per-process loader. `ctx_opaque` is a
+/// `*NodeState`. Looks up the tenant's TenantFiles (skip if absent,
+/// already-loaded, or different dep_id) and calls `reloadDeployment`.
+///
+/// Carries the same in-place-mutate race the per-worker thunk had —
+/// the dispatcher reads `tc.bytecodes` etc. without synchronization
+/// while this writes them. Phase 2's snapshot pinning removes the
+/// race; for phase 1, releases are rare enough that the window is
+/// negligible (same posture as the pre-cutover per-worker model).
+fn deploymentLoadFnNode(
+    ctx_opaque: ?*anyopaque,
+    tenant_id: []const u8,
+    dep_id: u64,
+) anyerror!void {
+    const node: *NodeState = @ptrCast(@alignCast(ctx_opaque.?));
+    node.tenant_files_lock.lock();
+    const tc_opt = node.tenant_files_map.get(tenant_id);
+    node.tenant_files_lock.unlock();
+    const tc = tc_opt orelse return;
+    if (tc.current_deployment_id == dep_id) return; // already loaded
+    try reloadDeployment(tc, dep_id);
+}
+
+pub const WorkerConfig = struct {
+    /// Node-wide shared state (tenant resolver, tenant_files_map,
+    /// deployment_loader, blob_backend_cfg, ...). Borrowed; owned by
+    /// `main.zig`. Workers reach shared state via `worker.node`.
+    node: *NodeState,
     /// Raft node for write replication. All writes captured during a
     /// handler are proposed through this node; the worker blocks until
     /// the proposal commits or faults before sending the response.
@@ -501,40 +706,10 @@ pub const WorkerConfig = struct {
     /// each worker thread typically gets its own compiler instance
     /// because QuickJS runtimes aren't shareable across threads.
     compile_ctx: ?*anyopaque = null,
-    /// S3 blob backend each `TenantFiles` / `TenantLog` opens. One
-    /// bucket across all tenants on the node, scoped per-tenant by
-    /// key prefix `{base}{instance_id}/{subdir}/`. Owned by the
-    /// caller — backend strings (endpoint, region, etc.) must outlive
-    /// the worker's `create` call (S3BlobStore.init dupes them, so
-    /// afterwards they can be freed).
-    blob_backend: blob_mod.BackendConfig,
-    /// When set, manifest reads route through a colocated files-server
-    /// over HTTP/2 instead of S3 (production.md #1.4 step 4 —
-    /// manifests live in raft-replicated KV inside the files-server
-    /// cluster, not S3). The S3 `blob_backend` above stays in use
-    /// for file-blobs (content-addressed bytecode + static asset
-    /// bytes); only the per-tenant manifest_backend swaps storage
-    /// layer. Null (default) keeps the legacy S3-direct manifest
-    /// path. Borrowed; the loop46 binary owns the storage for the
-    /// process lifetime.
-    manifest_http: ?ManifestHttpConfig = null,
-    /// Cold-start manifest prefetch results, keyed by tenant id.
-    /// When the operator wires `manifest_http` and runs the bulk
-    /// fetch at startup, the resulting bytes land here. Each
-    /// tenant's `TenantFiles.open` consumes its entry on first
-    /// reload + frees the bytes. Ownership of the map + every
-    /// key + value transfers to the Worker on `create`. Null
-    /// skips the prefetch path; per-tenant fetch via
-    /// `manifest_http` (or S3 fallback) still works.
-    manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest) = null,
-    /// Pre-built libcurl Easy handle the worker's per-tenant
-    /// manifest backends share. Ownership transfers to the
-    /// Worker on `create`. Sharing one Easy across cold-start
-    /// prefetch + every per-tenant manifest fetch keeps libcurl's
-    /// connection + TLS-session cache warm across the whole
-    /// worker lifetime — the only way for per-release manifest
-    /// fetches to land in single-digit milliseconds.
-    manifest_easy: ?*blob_mod.curl.Easy = null,
+    // Process-wide deployment config (blob_backend, manifest_http,
+    // manifest_easy, manifest_prefetch) lives on `NodeState`. Reach
+    // it via `worker.node`.
+
     /// Phase 5.5 (a) — `BatchStore` the worker flushes log batches
     /// into. loop46 always supplies one — S3 if env wired, in-memory
     /// otherwise. Required because `flushLogs` shouldn't have to
@@ -587,16 +762,19 @@ pub fn Worker(comptime opts: Options) type {
         /// downgraded to 503.
         was_leader: bool = false,
         dispatcher: Dispatcher,
-        tenant: *tenant_mod.Tenant,
+        /// Borrowed pointer to the process-wide shared state. Holds
+        /// the tenant resolver, the single `tenant_files_map` (shared
+        /// across all workers — fan-out gone), the single deployment
+        /// loader, and the process-wide deployment config (blob
+        /// backend, manifest_http / manifest_easy / manifest_prefetch).
+        /// Owned by `main.zig`; outlives every worker.
+        node: *NodeState,
         raft: *kv_mod.RaftNode,
-        /// Per-tenant code state. Keyed by instance id (the string the
-        /// `TenantFiles` owns internally — the map slot's key points at
-        /// that allocation, so lifetimes line up).
-        tenant_files_map: TenantMap(TenantFiles),
-        /// Per-tenant log state. Same lifetime + key-stability story
-        /// as `tenant_files_map`. Opened eagerly alongside it. Holds
-        /// each tenant's `RequestIdMinter`; the in-memory record
-        /// buffer is `log_buffer` (per-node, not per-tenant).
+        /// Per-tenant log state. NOT in NodeState because
+        /// `RequestIdMinter` bakes the worker_id into the upper 16
+        /// bits of every minted id — sharing the minter would alias
+        /// ids across workers. Same lazy-open lifecycle as
+        /// `tenant_files_map` but populated per-worker.
         tenant_logs: TenantMap(TenantLog),
         /// Per-node in-memory `LogRecord` buffer. Every tenant's
         /// dispatch tick appends here; `flushLogs` drains the whole
@@ -637,30 +815,10 @@ pub fn Worker(comptime opts: Options) type {
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
         compile_fn: ?files_mod.CompileFn,
         compile_ctx: ?*anyopaque,
-        /// Picks fs vs s3 for every per-tenant blob backend this
-        /// worker opens. Borrowed from `WorkerConfig.blob_backend`.
-        blob_backend_cfg: blob_mod.BackendConfig,
-        /// Borrowed from `WorkerConfig.manifest_http`. When set,
-        /// `openTenantFiles` opens an HTTP-backed manifest_backend
-        /// instead of S3 — see the field doc on WorkerConfig.
-        manifest_http: ?ManifestHttpConfig,
-        /// Cold-start manifest prefetch — see `WorkerConfig`. The
-        /// map's keys + values are worker-owned; openTenantFiles
-        /// consumes (fetchRemove) per tenant and frees on use.
-        /// At Worker.deinit any leftover entries are freed.
-        manifest_prefetch: ?std.StringHashMapUnmanaged(PrefetchedManifest),
-        /// Shared libcurl handle for every per-tenant manifest
-        /// HttpBlobStore on this worker. Created at `create` when
-        /// `manifest_http` is wired; null otherwise. libcurl
-        /// caches connections + TLS sessions per-handle, so
-        /// sharing across tenants keeps the connection warm
-        /// across per-tenant manifest fetches (release handler,
-        /// dispatch tick reload). Without sharing, each tenant's
-        /// own Easy paid a fresh TLS handshake on first call.
-        /// Concurrent calls serialize through libcurl's internal
-        /// mutex; the worker's dispatch loop is single-threaded
-        /// so this never contends.
-        manifest_easy: ?*blob_mod.curl.Easy,
+        // Process-wide deployment config (blob_backend_cfg,
+        // manifest_http, manifest_easy, manifest_prefetch) lives on
+        // `node`. Reach via `worker.node.blob_backend_cfg`, etc.
+
         /// Phase 5.5 (a) — store the worker flushes log batches into.
         /// Lives for the worker's full lifetime; loop46 picks S3 vs
         /// in-memory at startup.
@@ -694,13 +852,9 @@ pub fn Worker(comptime opts: Options) type {
         flusher_should_stop: std.atomic.Value(bool) = .init(false),
         flusher_wake: std.Thread.ResetEvent = .{},
 
-        /// Background deployment loader (see
-        /// `src/js/deployment_loader.zig`). The hot path enqueues
-        /// loads here; the loader thread runs `reloadDeployment`
-        /// off the dispatch loop so no request thread blocks on
-        /// network I/O. Null when the worker was started without
-        /// the loader wired (unit-test paths that don't need it).
-        deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
+        // Background deployment loader lives on `node` (single per
+        // process, shared across workers). Reach via
+        // `worker.node.deployment_loader`.
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -735,9 +889,8 @@ pub fn Worker(comptime opts: Options) type {
                 .h2 = server,
                 .raft_pending = try StreamColl.init(allocator),
                 .dispatcher = try Dispatcher.init(allocator),
-                .tenant = config.tenant,
+                .node = config.node,
                 .raft = config.raft,
-                .tenant_files_map = .empty,
                 .tenant_logs = .empty,
                 .log_buffer = log_mod.NodeLogBuffer.init(allocator),
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
@@ -748,10 +901,6 @@ pub fn Worker(comptime opts: Options) type {
                 .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
-                .blob_backend_cfg = config.blob_backend,
-                .manifest_http = config.manifest_http,
-                .manifest_prefetch = config.manifest_prefetch,
-                .manifest_easy = config.manifest_easy,
                 .log_batch_store = config.log_batch_store,
                 .services_jwt_secret = config.services_jwt_secret,
                 .log_public_base = config.log_public_base,
@@ -768,97 +917,24 @@ pub fn Worker(comptime opts: Options) type {
                 },
             };
             errdefer self.raft_pending.deinit();
-            errdefer self.tenant_files_map.clearAllEntries(allocator);
             errdefer self.tenant_logs.clearAllEntries(allocator);
 
             reg.registerCollection(&self.raft_pending);
 
-            // Eagerly open code AND log state for every known tenant.
-            // The tenant registry's instances map was populated by
-            // the caller before this create() call; we iterate it
-            // once and open both per-tenant stores.
-            var it = config.tenant.instances.iterator();
+            // Eagerly open per-worker tenant_logs (request_id minters
+            // bake the worker_id into the upper 16 bits; can't share).
+            // TenantFiles + deployment loader are populated by main.zig
+            // once in NodeState before workers spawn — no per-worker
+            // duplication and no fan-out race.
+            var it = config.node.tenant.instances.iterator();
             while (it.next()) |entry| {
                 const inst = entry.value_ptr.*;
-                try self.tenant_files_map.put(allocator, try TenantFiles.open(self, inst));
                 try self.tenant_logs.put(allocator, try TenantLog.open(self, inst));
             }
 
             self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
 
-            // Spin up the deployment loader. The hot path enqueues
-            // here when a new release pointer is observed; the
-            // loader thread runs `reloadDeployment` off the dispatch
-            // loop. Failure to init is non-fatal — the worker's
-            // tenants stay on whatever deployment they had at boot.
-            const loader = deployment_loader_mod.DeploymentLoader.init(
-                allocator,
-                @as(?*anyopaque, @ptrCast(self)),
-                deploymentLoadFn,
-            ) catch |err| blk: {
-                std.log.warn(
-                    "rove-js: deployment loader init failed: {s} — falling back to synchronous reload",
-                    .{@errorName(err)},
-                );
-                break :blk null;
-            };
-            if (loader) |l| {
-                l.start() catch |err| {
-                    std.log.warn(
-                        "rove-js: deployment loader start failed: {s}",
-                        .{@errorName(err)},
-                    );
-                    l.deinit();
-                    self.deployment_loader = null;
-                };
-                self.deployment_loader = l;
-            }
-
-            // Implicit-deploy at cold start. Every tenant whose
-            // app.db has a `_deploy/current` pointer gets its
-            // deployment loaded — via the same background
-            // loader path that runtime releases use. The hot
-            // request path never blocks on fetching bytecodes,
-            // including at boot. `Worker.create` returns
-            // immediately after enqueueing; the loader thread
-            // then processes the queue, decoding the prefetched
-            // manifest bytes when available and pulling
-            // bytecodes from S3 when not.
-            if (self.deployment_loader) |l| {
-                var lit = self.tenant_files_map.iterator();
-                while (lit.next()) |fentry| {
-                    const tc = fentry.value_ptr.*;
-                    const cur_bytes = tc.app_kv.get("_deploy/current") catch continue;
-                    defer allocator.free(cur_bytes);
-                    const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch continue;
-                    if (dep_id == 0) continue;
-                    l.enqueue(tc.instance_id, dep_id) catch |err| {
-                        std.log.warn(
-                            "rove-js: cold-start enqueue {s}/{d} failed: {s}",
-                            .{ tc.instance_id, dep_id, @errorName(err) },
-                        );
-                    };
-                }
-            }
-
             return self;
-        }
-
-        /// `DeploymentLoader.LoadFn` thunk. Casts the opaque
-        /// worker pointer back to `*Self`, looks up the
-        /// requested tenant's `TenantFiles`, and runs
-        /// `reloadDeployment` on the loader thread. Errors are
-        /// logged + swallowed; a failed load is retried on the
-        /// next release that targets this tenant.
-        fn deploymentLoadFn(
-            ctx_opaque: ?*anyopaque,
-            tenant_id: []const u8,
-            dep_id: u64,
-        ) anyerror!void {
-            const worker: *Self = @ptrCast(@alignCast(ctx_opaque.?));
-            const tc = worker.tenant_files_map.get(tenant_id) orelse return;
-            if (tc.current_deployment_id == dep_id) return; // already loaded
-            try reloadDeployment(tc, dep_id);
         }
 
         /// Background log-flusher loop. Wakes every
@@ -892,14 +968,9 @@ pub fn Worker(comptime opts: Options) type {
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
-            // Stop the deployment loader FIRST — it holds
-            // `TenantFiles` pointers via the load thunk and we
-            // want it quiesced before we free the tenant map.
-            if (self.deployment_loader) |loader| {
-                loader.shutdown();
-                loader.deinit();
-                self.deployment_loader = null;
-            }
+            // NodeState owns the deployment loader + tenant_files_map
+            // + manifest_prefetch. Tenant-files cleanup runs from
+            // `NodeState.deinit`, not here.
             // Signal the flusher thread to stop, wake it, and join.
             // The flusher's only blocking call is libcurl's
             // `curl_easy_perform`, which is bounded by `Easy`'s
@@ -916,20 +987,6 @@ pub fn Worker(comptime opts: Options) type {
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
             self.log_buffer.deinit();
-            self.tenant_files_map.deinit(allocator);
-            // Free any prefetch entries the worker never consumed
-            // (tenants for which `openTenantFiles` ran without
-            // hitting the prefetch — e.g. concurrent
-            // createInstance during boot, or tenants the bulk
-            // fetch couldn't cover).
-            if (self.manifest_prefetch) |*map| {
-                var pit = map.iterator();
-                while (pit.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    allocator.free(entry.value_ptr.*.bytes);
-                }
-                map.deinit(allocator);
-            }
             // Roll back any leftover pending txns. Should be empty
             // under normal shutdown; non-empty means we're exiting
             // with proposals still in-flight (process kill, fatal
@@ -946,7 +1003,7 @@ pub fn Worker(comptime opts: Options) type {
             self.raft_pending.deinit();
             self.dispatcher.deinit();
             if (self.sse_curl) |easy| easy.deinit();
-            if (self.manifest_easy) |easy| easy.deinit();
+            // `manifest_easy` lives on NodeState — main.zig owns it.
             self.h2.destroy();
             allocator.destroy(self);
         }
@@ -984,7 +1041,7 @@ pub fn Worker(comptime opts: Options) type {
             target_id: []const u8,
         ) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            const inst_opt = self.tenant.getInstance(target_id) catch
+            const inst_opt = self.node.tenant.getInstance(target_id) catch
                 return error.InstanceNotFound;
             const inst = inst_opt orelse return error.InstanceNotFound;
             const compile_fn = self.compile_fn orelse
@@ -1001,7 +1058,7 @@ pub fn Worker(comptime opts: Options) type {
                 allocator,
                 inst.dir,
                 inst.id,
-                self.blob_backend_cfg,
+                self.node.blob_backend_cfg,
                 compile_fn,
                 self.compile_ctx,
                 &release_ws,
@@ -1055,7 +1112,7 @@ pub fn Worker(comptime opts: Options) type {
         ) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(ctx));
 
-            const inst_opt = self.tenant.getInstance(target_id) catch
+            const inst_opt = self.node.tenant.getInstance(target_id) catch
                 return error.InstanceNotFound;
             const inst = inst_opt orelse return error.InstanceNotFound;
 
@@ -1109,7 +1166,7 @@ pub fn Worker(comptime opts: Options) type {
                 );
             };
 
-            if (self.deployment_loader) |loader| {
+            if (self.node.deployment_loader) |loader| {
                 loader.enqueue(target_id, dep_id) catch |err| {
                     std.log.warn(
                         "releases.publish: enqueue loader for {s}/{d} failed: {s}",
@@ -1144,8 +1201,8 @@ pub fn Worker(comptime opts: Options) type {
 /// tenant to a pre-crash-consistent state before the worker starts
 /// serving requests. Safe on a clean restart: `kv_undo` is empty and
 /// `recoverOrphans` is a no-op.
-fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFiles {
-    const allocator = worker.allocator;
+fn openTenantFilesNode(node: *NodeState, inst: *const tenant_mod.Instance) !*TenantFiles {
+    const allocator = node.allocator;
 
     // Startup orphan sweep on the tenant's APP store. This belongs
     // here (not in rove-tenant) because it's specifically about the
@@ -1162,7 +1219,7 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
 
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
-        worker.blob_backend_cfg,
+        node.blob_backend_cfg,
         inst.id,
         "file-blobs",
     );
@@ -1175,24 +1232,23 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
     // works as long as files-server's bootstrap path keeps the dual
     // S3 PUT alive. The S3 PUT goes away once every loop46 worker
     // in the deployment uses the HTTP backend.
-    var manifest_backend = if (worker.manifest_http) |mh|
+    var manifest_backend = if (node.manifest_http) |mh|
         try blob_mod.BlobBackend.openHttp(allocator, .{
             .base_url = mh.base_url,
             .instance_id = inst.id,
             .mint_jwt = mh.mint_jwt,
             .mint_ctx = mh.mint_ctx,
             // Shared Easy across all per-tenant manifest backends
-            // on this worker — see `Worker.manifest_easy`. Falls
-            // back to per-tenant Easy when shared init failed at
-            // Worker.create.
-            .easy = worker.manifest_easy,
+            // on this node — see `NodeState.manifest_easy`. Falls
+            // back to per-tenant Easy when shared init failed.
+            .easy = node.manifest_easy,
             .ca_bundle_path = mh.ca_bundle_path,
             .verify_tls = mh.verify_tls,
         })
     else
         try blob_mod.BlobBackend.openPerTenant(
             allocator,
-            worker.blob_backend_cfg,
+            node.blob_backend_cfg,
             inst.id,
             "deployments",
         );
@@ -1210,7 +1266,7 @@ fn openTenantFiles(worker: anytype, inst: *const tenant_mod.Instance) !*TenantFi
     // map's key was a copy of the tenant id, not the same alloc
     // as `id_copy` above).
     var prefetched: ?PrefetchedManifest = null;
-    if (worker.manifest_prefetch) |*map| {
+    if (node.manifest_prefetch) |*map| {
         if (map.fetchRemove(inst.id)) |kv| {
             allocator.free(kv.key);
             prefetched = kv.value;
@@ -1270,14 +1326,14 @@ fn freeTenantFiles(allocator: std.mem.Allocator, tc: *TenantFiles) void {
     allocator.destroy(tc);
 }
 
-/// Lookup-or-lazy-open: if the worker already has a TenantFiles for
-/// `inst`, return it. Otherwise open a fresh one, cache it, and return.
-/// Callers fall through to 500 on failure — propagates errors up.
+/// Lookup-or-lazy-open the process-shared TenantFiles for `inst`.
+/// Wraps `worker.node.getOrOpenTenantFiles` for backwards-compat —
+/// callers can use either path.
 pub fn getOrOpenTenantFiles(
     worker: anytype,
     inst: *const tenant_mod.Instance,
 ) !*TenantFiles {
-    return worker.tenant_files_map.getOrOpen(worker, inst);
+    return worker.node.getOrOpenTenantFiles(inst);
 }
 
 // ── Per-tenant log loading ────────────────────────────────────────────
