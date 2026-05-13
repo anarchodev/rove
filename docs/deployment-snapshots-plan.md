@@ -197,29 +197,43 @@ response moves to `response_in` (bounded by `commit_wait_timeout_ns`).
 
 ## Migration phases
 
-### Phase 1 — Hoist state into NodeState
+### Phase 1 — Hoist state into NodeState — **shipped 2026-05-13** (`9d75950`)
 
-Refactor without changing semantics. Create `NodeState` owned by
-`main.zig`; move `tenant_files_map`, `tenant_logs`,
+Refactor without changing semantics. Created `NodeState` owned by
+`main.zig`; moved `tenant_files_map`, `tenant_logs`,
 `deployment_loader`, and the schedules-store/loader-publish plumbing
 in. Each `Worker` gets `*NodeState` instead of its own copies.
-`getOrOpenTenantFiles(worker, inst)` becomes
-`node.tenants.getOrOpen(inst)` with a mutex around the map.
 
-At the end of phase 1, all workers share one `TenantFiles` per
-tenant. The fan-out race is *already gone* (single loader, single
-map). Mid-request coherence is *not yet* fixed — `reloadDeployment`
-still mutates in place.
+All workers share one `TenantFiles` per tenant. The fan-out race is
+gone (single loader, single map). Mid-request coherence not yet
+fixed — `reloadDeployment` still mutated in place at this point.
 
-Delete the `Worker 0 only / multi-worker fan-out is a follow-up`
-comment in `main.zig:346-350`.
+### Phase 2 — Refcounted immutable snapshots — **shipped 2026-05-13** (`78b2910`)
 
-### Phase 2 — Refcounted immutable snapshots
+Introduced `TenantFilesSnapshot` (immutable, refcounted) +
+`TenantSlot` (persistent: instance_id, blob backends, atomic
+pointer to current snapshot). `reloadDeployment` builds a fresh
+snapshot outside `pin_lock`, atomic-swaps under it, releases the
+old after unlock so pinned in-flight readers stay valid.
 
-Introduce `TenantFilesSnapshot` (immutable, refcounted). `TenantSlot`
-holds the atomic pointer. `reloadDeployment` builds a new snapshot
-fully, then atomically swaps. Per-request: retain at entry, release
-at exit.
+Three latent loader bugs surfaced + got fixed in the same commit
+(found by the Python smoke rewrite):
+
+  - `deploymentLoadFnNode` lazy-opens the slot for runtime-created
+    tenants. Without this, apply.zig's `_deploy/current` enqueue
+    fires before any request has hit the new tenant, the slot
+    lookup returns null, and the enqueue gets dropped.
+  - `deployStarterTrampoline` enqueues the loader after commit
+    (belt-and-braces with apply.zig).
+  - `handleRelease` idempotent fast-path enqueues the loader on
+    dep_id match. Sequential local counters collide between the
+    seed's offline bootstrap and files-server's runtime PUTs (both
+    mint dep_id=1 against a fresh S3 prefix); without this the
+    worker keeps serving the seed's empty manifest.
+
+Also dropped the loader thunk's `currentDeploymentId == dep_id`
+short-circuit and `reloadDeployment`'s cached-manifest-bytes path
+— same content-vs-counter mismatch.
 
 Snapshot construction in phase 2 *still re-fetches every bytecode*.
 That's a regression vs phase 1 (which reused the in-memory map). The

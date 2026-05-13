@@ -39,7 +39,7 @@ Shipped:
 - `RaftNode.compactLogPages()` calls it from the raft thread.
 - `tickRaftCapture` calls `compactLogPages()` after each successful
   `endSnapshotOpaque()`.
-- `scripts/snapshot_smoke.sh` asserts `raft_log` row count + file
+- `scripts/snapshot_smoke.py` asserts `raft_log` row count + file
   size are bounded after 120 commits + 4 snapshot passes (was
   unbounded before).
 
@@ -132,7 +132,7 @@ Implementation order:
    handle. The `capture()` function + `loop46 snapshot` /
    `loop46 restore-from-snapshot` CLIs are kept untouched for
    on-demand operator use. Verified via
-   `scripts/snapshot_smoke.sh` (max tick 18ms) and
+   `scripts/snapshot_smoke.py` (max tick 18ms) and
    `scripts/snapshot_scalability_bench.sh` (`N_total=1000`:
    29ms avg, 40ms max — see
    `docs/snapshot-bench-results.md`).
@@ -151,7 +151,7 @@ Implementation order:
    staged dir, atomic-renames into `data_dir`, calls
    `raft_load_snapshot(snap_last_idx, snap_last_term)` before
    workers start. End-to-end smoke at
-   `scripts/snap_catchup_smoke.sh` verifies the full cycle:
+   `scripts/snap_catchup_smoke.py` verifies the full cycle:
    stage → exit → install → load → cleanup.
 
 Net for steps 1+2+3 (delivered): heartbeat starvation eliminated
@@ -240,7 +240,7 @@ What shipped:
    `raft_add_non_voting_node`. Default voter for
    backward-compatibility.
 2. **Done 2026-05-10.** willemt's quorum math correctly excludes
-   learners (verified by `scripts/learner_smoke.sh`'s baseline:
+   learners (verified by `scripts/learner_smoke.py`'s baseline:
    3-voter + 1-learner cluster elects leader from voters only,
    and the learner replicates every committed entry in lockstep).
 3. **Done 2026-05-11.** `loop46 promote-learner --data-dir <path>`
@@ -250,7 +250,7 @@ What shipped:
    misconfig check). App.db state preserved. Out-of-band on
    purpose: in-band promotion requires raft quorum, which
    doesn't exist by construction in the failover scenario.
-4. **Done 2026-05-11.** `scripts/learner_smoke.sh` extended with
+4. **Done 2026-05-11.** `scripts/learner_smoke.py` extended with
    the full lost-quorum recovery cycle: kill 2 voters → confirm
    503 on surviving voter → `promote-learner` → restart as solo
    voter → write commits → verify prior state preserved. PASSes
@@ -299,7 +299,7 @@ Loop46 worker → files-server flow on a release POST:
 - `kv.Cluster` library (commit `28a7be4`) — shared by both
   consumers.
 - Files-server standalone runs its own 3-node raft cluster
-  (`scripts/files_server_raft_smoke.sh` for the integration
+  (`scripts/files_server_raft_smoke.py` for the integration
   smoke).
 - `GET /{tenant}/deployments/{N:hex}/manifest.bin` (`c8a2f0b`) +
   `PUT` companion (`0a77617`) for cluster-replicated manifest
@@ -533,7 +533,7 @@ Shipped:
   fresh `db_key`, the other reuses; (b) prev_manifest with a
   different tenant set → new tenant captured fresh, old entry
   not carried forward.
-- `scripts/snapshot_smoke.sh` adds a `quiet` tenant that's
+- `scripts/snapshot_smoke.py` adds a `quiet` tenant that's
   written once and then never again; subsequent captures
   exercise the reuse path. The S3-listing assertion (filtered
   to **this run's** snap_ids so accumulated history doesn't
@@ -577,7 +577,7 @@ boot calls `installStagedSnapshotIfPresent` → atomic-rename →
 `raft_load_snapshot` at the leader's floor. The piece that closed
 this item: `rove-loop46.service` now uses `Restart=always` (not
 `on-failure`), so the clean exit triggers a systemd restart and the
-catchup completes with no operator action. `scripts/snap_catchup_smoke.sh`
+catchup completes with no operator action. `scripts/snap_catchup_smoke.py`
 covers the full cycle.
 
 Note that this is the `.opaque_bytes` snapshot path (per-tenant
@@ -633,7 +633,7 @@ deployments.
 
 ### 7. Multi-node smoke covering leader failover — **done 2026-05-11**
 
-`scripts/leader_failover_smoke.sh` covers the two bullets that
+`scripts/leader_failover_smoke.py` covers the two bullets that
 need a forced-leader-change harness:
 
 - Leader change with `http.send` rows in flight: acme schedules
@@ -647,7 +647,7 @@ need a forced-leader-change harness:
   to every node's schedules.db before the kill.
 
 sse-server `rove:resync` after failover is exercised by the
-existing `scripts/sse_server_smoke.sh` (a separate smoke
+existing `scripts/sse_server_smoke.py` (a separate smoke
 focused on the sse-server process surface).
 
 ### 8. Backup automation — **done 2026-05-11** (lean)
@@ -739,9 +739,9 @@ this is fine, but multi-customer prod with mixed tiers needs it.
 - `http.send` / `schedules.db` / leader-pinned schedule-server
   thread
 - Multi-node tested end-to-end via existing cluster smokes
-  (`notifications_smoke.sh`, `kv_bench_cluster.sh`)
+  (`notifications_smoke.py`, `kv_bench_cluster.sh`)
 - Snapshot capture + restore CLIs against real S3
-  (`scripts/snapshot_smoke.sh`)
+  (`scripts/snapshot_smoke.py`)
 
 ## Suggested order of attack
 
@@ -754,7 +754,7 @@ this is fine, but multi-customer prod with mixed tiers needs it.
    2026-05-10; step 3 (peer-to-peer snapshot catchup via the
    `snap_fetch_offer` control frame + `/_system/raft-snapshot/{id}`
    HTTP fetch + boot-time install + `raft_load_snapshot`) shipped
-   2026-05-11. End-to-end smoke at `scripts/snap_catchup_smoke.sh`.
+   2026-05-11. End-to-end smoke at `scripts/snap_catchup_smoke.py`.
 4. ~~**#1.2 non-voting learner replica = the entire DR story.**~~
    Done 2026-05-11. Step 1 (CLI plumbing) + step 2 (quorum
    exclusion) shipped 2026-05-10. Step 3 (`loop46
@@ -769,7 +769,7 @@ this is fine, but multi-customer prod with mixed tiers needs it.
    C (~1 week) is the architectural cleanup. Operationally
    meaningful for fresh-cluster provisioning.
 6. ~~**#7 leader-failover smoke.**~~ Done 2026-05-11.
-   `scripts/leader_failover_smoke.sh` schedules an
+   `scripts/leader_failover_smoke.py` schedules an
    `http.send` with a 4s `fire_at_ns` delay, kills the leader
    during the window, asserts the new leader fires and the
    `on_result` callback lands durably on acme.

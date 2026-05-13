@@ -964,7 +964,7 @@ otherwise require):
    at startup. The polyfill installs `globalThis.webhook.send` and
    calls `http.send` against `webhook.loop46.com`. End-to-end
    behavior unchanged from the customer's perspective; existing
-   `webhook_smoke.sh` passes against the new path.
+   `webhook_smoke.py` passes against the new path.
 
 4. **Drain webhooks.db.** Run the legacy webhook_server thread
    until `SELECT count(*) FROM webhooks WHERE state='pending' = 0`.

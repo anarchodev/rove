@@ -696,12 +696,12 @@ smoke-testable on its own.
 
 Smokes after each step:
 
-- `files_server_smoke.sh` — exercises compile/upload/deploy/fetch.
+- `files_server_smoke.py` — exercises compile/upload/deploy/fetch.
   Should pass throughout (route may change between worker proxy and
   direct hit in step 5).
-- `ctl_smoke.sh` — uses ctl's deploy path to install a handler and
+- `ctl_smoke.py` — uses ctl's deploy path to install a handler and
   hit it. Should pass throughout.
-- `s3_blob_smoke.sh` — sanity on the S3 backend. Unchanged.
+- `s3_blob_smoke.py` — sanity on the S3 backend. Unchanged.
 
 ---
 

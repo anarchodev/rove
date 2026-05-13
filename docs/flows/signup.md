@@ -628,7 +628,7 @@ exactly as today; admin's JS handler then runs for every path on that
 host (including `/v1/*`), exactly like a customer's handler runs for
 every path on their subdomain.
 
-**Smoke**: `signup_smoke.sh` updates to observe that the customer
+**Smoke**: `signup_smoke.py` updates to observe that the customer
 tenant *doesn't* exist after signup, *does* exist after redemption.
 HTTP-shape assertions stay the same — the change is internal.
 

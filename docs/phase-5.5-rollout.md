@@ -113,7 +113,7 @@ sub-plan's migration order. No big-bang cutovers between them.
   `loop46 restore-from-snapshot --snap-id ...` driven by the
   same `BLOB_BACKEND` env contract as files / logs (S3 with
   `SNAPSHOT_S3_KEY_PREFIX` namespacing or fs at
-  `{data_dir}/.snapshots/`). `scripts/snapshot_smoke.sh`
+  `{data_dir}/.snapshots/`). `scripts/snapshot_smoke.py`
   exercises seed → capture → restore round-trip against
   either backend; verified end-to-end against real OVH S3.
   By-reference reuse for unchanged tenants, an in-process
@@ -239,7 +239,7 @@ sub-plan because the work is contained.
   `_outbox/`, `_outbox_inflight/`, `_dlq/` stay in `reserved.zig`'s
   PLATFORM_KV_PREFIXES list (forward-compat hygiene; nothing writes
   them now). `webhook_direct_smoke.sh` deleted (redundant with
-  `webhook_smoke.sh`, which now exercises the direct path by
+  `webhook_smoke.py`, which now exercises the direct path by
   default). All smokes pass; dispatcher webhook tests rewritten
   against the `pending_webhooks` accumulator.
 
@@ -294,7 +294,7 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
   `LOG_BATCH_STORE_DIR` env (or `{data_dir}/log-batches`). The
   S3-backed `BatchStore` lands in a follow-up before the default
   flips in step 5; fs is enough to validate the worker integration.
-  Smoke (`scripts/log_backend_s3_smoke.sh`) drives the worker's s3
+  Smoke (`scripts/log_backend_s3_smoke.py`) drives the worker's s3
   path end-to-end: 3 acme requests → flush_writer sidecars on disk
   → standalone log-server indexes them → /list returns the records
   → /show round-trips via range-read.
@@ -309,7 +309,7 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
   reads the same env vars as `BLOB_BACKEND=s3` plus an optional
   `LOG_S3_KEY_PREFIX`; standalone log-server CLI dropped
   `--batch-store-dir` for the same env-driven config. Smoke
-  (`scripts/log_backend_s3_smoke.sh`) hits the real OVH `replaykv`
+  (`scripts/log_backend_s3_smoke.py`) hits the real OVH `replaykv`
   bucket end-to-end. Two sigv4/std.http gotchas caught + fixed:
   added `query_canonical` opt-out to sigv4 to avoid double-encoding
   pre-canonicalized query strings; the wire URL must include the
@@ -393,7 +393,7 @@ Drops envelope type 1, per-tenant `log.db`, and the worker's
       (the shift-js spike) deleted — superseded by loop46's
       `--workers N`.
     - Worker.openTenantLog no longer opens `log.db`; old `log.db`
-      files on disk are inert orphans. `replay_smoke.sh` restored
+      files on disk are inert orphans. `replay_smoke.py` restored
       from its SKIP state and rewritten against the v1 wire shape.
     - **No legacy / migration scaffolding kept.** Pre-launch — no
       need to carry old-format readers or one-shot migrations as
@@ -446,7 +446,7 @@ and `files_url`. The HS256 helper extracted from `log_server/auth.zig`
 to a new top-level `rove-jwt` module so both standalone services
 share. Dashboard's `filesFetch()` mirrors `logFetch()`. CLI
 deletion: `rove-js-ctl` removed (legacy h2-client over the proxy);
-`scripts/ctl_smoke.sh` rewritten as curl + Python JWT mint.
+`scripts/ctl_smoke.py` rewritten as curl + Python JWT mint.
 `scripts/proxy_smoke.sh` deleted (its sole purpose — testing the
 proxy — gone). Pre-launch sweep: no parallel-write code, no
 back-compat fallback, no dual auth shape.
@@ -470,9 +470,9 @@ files.db's `deployment/current`), and a worker restart eagerly
 loads the latest deployment in `Worker.create`. Retires:
 `refreshDeployments`, `--refresh-interval-ms` CLI flag,
 `WorkerConfig.refresh_interval_ns`, `TenantFiles.next_refresh_ns`.
-Smokes (`ctl_smoke.sh`, `triggers_smoke.sh`, `replay_smoke.sh`,
-`static_smoke.sh`, `rate_limit_smoke.sh`, `sse_smoke.sh`,
-`signup_smoke.sh`) updated to POST `/_system/release` (via
+Smokes (`ctl_smoke.py`, `triggers_smoke.py`, `replay_smoke.py`,
+`static_smoke.py`, `rate_limit_smoke.py`, `sse_smoke.sh`,
+`signup_smoke.py`) updated to POST `/_system/release` (via
 `release_deployment` helper in `_smoke_helpers.sh`) after each
 files-server deploy. Multi-node propagation deferred; today's
 single-node deployments work as designed.

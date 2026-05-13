@@ -176,7 +176,7 @@ This is the killer "build a new test scenario from production behavior" affordan
 
 ## Verification
 
-- `scripts/kv_admin_smoke.sh` (T1):
+- `scripts/kv_admin_smoke.py` (T1):
   - Seed `app.db` with known keys, hit `/_system/kv/{id}/{key}` → assert value.
   - Hit `/_system/kv/{id}?prefix=...` with paginated key set → assert pages + cursor advance.
   - Count endpoint matches actual count.

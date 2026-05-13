@@ -301,7 +301,7 @@ done
 systemctl --user is-active rove-loop46 rove-files-server rove-log-server rove-sse-server
 ```
 
-For deeper checks see the smoke scripts in `scripts/*_smoke.sh` —
+For deeper checks see the smoke scripts in `scripts/*_smoke.py` —
 they bring up an isolated cluster from scratch and exercise the full
 deploy → fetch → log → SSE round trip.
 
@@ -329,7 +329,7 @@ snapshot bundle, stages it under `{data_dir}/.snap-in-{snap_id}/`,
 then exits cleanly. `Restart=always` on `rove-loop46.service`
 restarts the worker; boot picks up the staged bundle via
 `installStagedSnapshotIfPresent` and resumes raft at the leader's
-floor. End-to-end smoke at `scripts/snap_catchup_smoke.sh` (which
+floor. End-to-end smoke at `scripts/snap_catchup_smoke.py` (which
 simulates the supervisor by re-spawning manually — production has
 systemd do it).
 
