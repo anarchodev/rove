@@ -1105,6 +1105,14 @@ Resolved items moved to §10. Open items:
   authoring tooling + worker dry-run dispatch mode.
 - `docs/agent-surface.md` — §10.10 expansion: skill file, `--json`
   audit, `loop46 doctor`, scoped tokens.
+- `docs/observability-plan.md` — §2.9 expansion on the operator side:
+  Grafana Cloud cutover plan. Inventories today's `/_system/metrics`
+  (15 series, postmortem-shaped) and phases the gap to a fleet
+  scrape — auth via a `scrape` services-JWT cap, node/worker labels,
+  histogram primitive, OpenMetrics exemplars carrying
+  trace_id/tenant_id/request_id. Load-bearing constraint: customer
+  request logs stay in the replay store (`docs/logs-plan.md`); only
+  operator signals go to Grafana.
 - `docs/rove-generalization.md` — speculative, not committed:
   exploration of a programming language built around the
   rove-kernel (row-typed collections + identity). Reference only;
