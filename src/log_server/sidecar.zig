@@ -214,6 +214,12 @@ fn getInt(obj: std.json.ObjectMap, name: []const u8) ParseError!u64 {
     const v = obj.get(name) orelse return ParseError.MissingField;
     return switch (v) {
         .integer => |i| @intCast(i),
+        // `deployment_id` is a content-addressed u64 (truncated
+        // sha-256, see `files_mod.manifest_json.computeDeploymentId`).
+        // Values with the high bit set exceed i64.maxInt and std.json
+        // represents them as `.number_string`. Same can happen for
+        // any other u64 nominally exceeding 2^63-1.
+        .number_string => |s| std.fmt.parseInt(u64, s, 10) catch return ParseError.InvalidJson,
         else => ParseError.InvalidJson,
     };
 }

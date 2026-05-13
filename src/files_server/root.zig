@@ -485,12 +485,16 @@ fn writeManifestFromWorkingTree(
     h: *InstanceCtx,
     blob_cfg: blob_mod.BackendConfig,
     instance_id: []const u8,
-    current_id: u64,
+    _: u64, // parent_id, unused — id is derived from content
 ) Error!u64 {
-    const next_id = current_id + 1;
-
     const entries = h.store.assembleManifest() catch |err| return mapCodeError(err);
     defer h.store.freeEntries(entries);
+
+    // Content-addressed dep_id (truncated sha-256 of canonical
+    // entries). Same content → same id; idempotent re-PUTs at the
+    // same S3 key with identical bytes. See `computeDeploymentId`
+    // doc for the trade-off rationale.
+    const next_id = files_mod.manifest_json.computeDeploymentId(entries);
 
     const json_bytes = files_mod.manifest_json.encode(allocator, next_id, entries) catch
         return Error.OutOfMemory;

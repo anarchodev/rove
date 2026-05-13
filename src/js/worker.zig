@@ -676,20 +676,10 @@ pub const NodeState = struct {
 
 /// Loader thunk for the single per-process loader. `ctx_opaque` is a
 /// `*NodeState`. Looks up the tenant's TenantSlot (skip if absent),
-/// then runs `reloadDeployment` to fetch + build + swap an immutable
-/// snapshot onto `slot.current`. Phase 2: readers either see the old
+/// short-circuits when the current snapshot already has this dep_id
+/// (content-addressed: same id ⇒ same content), and calls
+/// `reloadDeployment` otherwise. Phase 2: readers either see the old
 /// snapshot or the new one, never a half-written mix.
-///
-/// No `currentDeploymentId == dep_id` short-circuit: dep_ids are
-/// sequential local counters minted by `writeManifestFromWorkingTree`,
-/// NOT content-addressed. The seed's offline bootstrap and the
-/// runtime files-server can independently mint dep_id=1 against
-/// different content (seed's empty manifest vs the operator's first
-/// real deploy), with the second PUT overwriting the first at S3.
-/// Skipping reload when the integer matches would leave the worker
-/// serving the stale content. Re-fetch on every enqueue; `reloadDeployment`
-/// is idempotent and refusal-side (a NoDeployment error is silently
-/// swallowed by the loader thread).
 fn deploymentLoadFnNode(
     ctx_opaque: ?*anyopaque,
     tenant_id: []const u8,
@@ -715,6 +705,10 @@ fn deploymentLoadFnNode(
             return;
         };
     };
+    // Content-addressed dep_ids: same id ⇒ same content. Skip the
+    // re-fetch + snapshot rebuild when the current snapshot already
+    // matches.
+    if (slot.currentDeploymentId() == dep_id) return;
     try reloadDeployment(slot, dep_id);
 }
 
@@ -1152,7 +1146,7 @@ pub fn Worker(comptime opts: Options) type {
             // followers see the release pointer too.
             var release_ws = kv_mod.WriteSet.init(allocator);
             defer release_ws.deinit();
-            try deployStarterContent(
+            const starter_dep_id = try deployStarterContent(
                 allocator,
                 inst.dir,
                 inst.id,
@@ -1161,7 +1155,7 @@ pub fn Worker(comptime opts: Options) type {
                 self.compile_ctx,
                 &release_ws,
             );
-            std.log.info("deployStarter: {s} writeset built ({d} ops)", .{ target_id, release_ws.ops.items.len });
+            std.log.info("deployStarter: {s} dep_id={x:0>16} writeset built ({d} ops)", .{ target_id, starter_dep_id, release_ws.ops.items.len });
 
             var txn = try inst.kv.beginTrackedImmediate();
             errdefer txn.rollback() catch {};
@@ -1193,9 +1187,9 @@ pub fn Worker(comptime opts: Options) type {
             // braces: the loader's enqueue is per-tenant dedup'd, so double-
             // enqueue is harmless.
             if (self.node.deployment_loader) |loader| {
-                loader.enqueue(target_id, 1) catch |err| std.log.warn(
-                    "deployStarter: loader.enqueue {s}/1 failed: {s}",
-                    .{ target_id, @errorName(err) },
+                loader.enqueue(target_id, starter_dep_id) catch |err| std.log.warn(
+                    "deployStarter: loader.enqueue {s}/{x:0>16} failed: {s}",
+                    .{ target_id, starter_dep_id, @errorName(err) },
                 );
             }
         }
@@ -1844,13 +1838,11 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     //      out of the prefetch slot when the dep_id matches.
     //   2. Per-tenant HTTP / S3 fetch via manifest_backend.
     //
-    // No "cached manifest matching dep_id" short-circuit: dep_ids
-    // are sequential local counters, not content-addressed, so the
-    // S3 object at the same dep_id can carry different content
-    // over time (e.g. files-server's starter PUT vs a subsequent
-    // PUT-file deploy that both mint dep_id=1 against a fresh
-    // working tree). The bench's hot-reload optimisation was real
-    // but it traded correctness for it.
+    // dep_ids are content-addressed (truncated sha-256, see
+    // `files_mod.manifest_json.computeDeploymentId`), so reaching
+    // this function with `dep_id == slot.currentDeploymentId()` is
+    // already filtered out in `deploymentLoadFnNode`. No in-function
+    // cached-bytes short-circuit needed.
     var json_bytes: []u8 = undefined;
     var owned_by_prefetch = false;
     if (slot.prefetched_manifest) |p| {
@@ -2384,7 +2376,7 @@ fn deployStarterContent(
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
     release_ws: *kv_mod.WriteSet,
-) !void {
+) !u64 {
     // Same scratch-only role as bootstrap.zig's
     // `.bootstrap-scratch.kv` — `files_mod.FileStore.init` demands
     // a KvStore but nothing persists here (the manifest goes to
@@ -2424,11 +2416,15 @@ fn deployStarterContent(
     try store.putSource("index.mjs", STARTER_INDEX_MJS);
     try store.putStatic("_static/index.html", STARTER_STATIC_INDEX_HTML, "text/html; charset=utf-8");
 
-    const cur = try store.currentDeploymentId();
-    const next_id = cur + 1;
-
     const entries = try store.assembleManifest();
     defer store.freeEntries(entries);
+
+    // Content-addressed dep_id (truncated sha-256). The starter content
+    // is byte-identical across every tenant, so every starter deploy
+    // mints the same id — and the per-tenant S3 prefix scopes the
+    // manifest so cross-tenant collisions don't matter at all (each
+    // tenant has its own `{inst_id}/deployments/` namespace).
+    const next_id = files_mod.manifest_json.computeDeploymentId(entries);
 
     const json_bytes = try files_mod.manifest_json.encode(allocator, next_id, entries);
     defer allocator.free(json_bytes);
@@ -2455,6 +2451,7 @@ fn deployStarterContent(
     var hex_buf: [16]u8 = undefined;
     const hex = std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{next_id}) catch unreachable;
     try release_ws.addPut("_deploy/current", hex);
+    return next_id;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

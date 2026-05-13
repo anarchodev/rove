@@ -77,7 +77,13 @@ pub fn encode(
     errdefer buf.deinit(allocator);
     var w = buf.writer(allocator);
 
-    try w.print("{{\"v\":{d},\"deployment_id\":{d},\"entries\":[", .{ VERSION, dep_id });
+    // dep_id is a content-addressed u64 (truncated sha-256). High-
+    // bit-set hashes don't fit cleanly in JSON `integer` (i64 in the
+    // std.json parser) so encode as a 16-char zero-padded hex string.
+    // Wire-incompatible with the pre-2026-05-13 number format —
+    // existing manifests in S3 from before that cutover need a
+    // re-deploy. Acceptable pre-launch.
+    try w.print("{{\"v\":{d},\"deployment_id\":\"{x:0>16}\",\"entries\":[", .{ VERSION, dep_id });
     for (entries, 0..) |e, i| {
         if (i > 0) try w.writeByte(',');
         const kind_str: []const u8 = if (e.kind == .handler) "handler" else "static";
@@ -126,12 +132,11 @@ pub fn decode(
     if (v_num != @as(i64, @intCast(VERSION))) return Error.InvalidManifest;
 
     const id_val = obj.get("deployment_id") orelse return Error.InvalidManifest;
-    const id_i: i64 = switch (id_val) {
-        .integer => |i| i,
+    const id_str = switch (id_val) {
+        .string => |s| s,
         else => return Error.InvalidManifest,
     };
-    if (id_i < 0) return Error.InvalidManifest;
-    const id: u64 = @intCast(id_i);
+    const id: u64 = std.fmt.parseInt(u64, id_str, 16) catch return Error.InvalidManifest;
 
     const entries_val = obj.get("entries") orelse return Error.InvalidManifest;
     const arr = switch (entries_val) {
@@ -236,10 +241,73 @@ fn writeJsonString(w: anytype, s: []const u8) !void {
 }
 
 /// `{dep_id:020d}.json` — the canonical key under each tenant's
-/// `deployments/` BlobBackend prefix. Stable lexicographic order ↔
-/// chronological deploy order (cheap LIST for history).
+/// `deployments/` BlobBackend prefix. With content-addressed dep_ids
+/// (truncated sha-256, see `computeDeploymentId` below), the
+/// lexicographic order is content-bound rather than chronological;
+/// chronology lives in the per-tenant release history side table.
 pub fn manifestKey(buf: *[25]u8, dep_id: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d:0>20}.json", .{dep_id}) catch unreachable;
+}
+
+/// Compute a deploy id from the manifest's entry list.
+///
+/// Pre-launch shift: dep_ids were sequential local counters bumped by
+/// `writeManifestFromWorkingTree(current_id + 1)`. That allowed the
+/// seed's offline bootstrap (counter=0 → mints id=1 with empty
+/// manifest) and a runtime files-server (counter=0 → mints id=1 with
+/// real files) to collide on the same numeric id, masking content
+/// changes from the worker's deployment loader. Three workarounds had
+/// to be added around the loader before that surfaced.
+///
+/// The fix: dep_id is sha-256 of a canonical encoding of the entries
+/// list, truncated to 64 bits. Same content → same id automatically;
+/// re-deploys of identical bytes are no-ops at the storage level (PUT
+/// to the same S3 key with identical bytes). Different content → new
+/// id, no overwrites, no ambiguity for the worker's reload path.
+///
+/// Truncation to 64 bits keeps the wire format unchanged (still 20
+/// hex chars in the manifest key, 16 in `_deploy/current`). Per-
+/// tenant birthday-paradox collision risk for 1B deploys ≈ 5e-2 —
+/// not zero but well below the engineering cost of widening every
+/// dep_id field to a string. Cross-tenant collisions don't matter
+/// (the namespace is per-tenant).
+///
+/// Canonical encoding: entries sorted by path; each entry encoded as
+/// `path|kind|content_type|hash|bytecode_hash` (NUL-separated). NOT
+/// the JSON wire format — JSON ordering is not load-bearing in the
+/// wire format (decoder accepts any order), so two manifests with
+/// the same content but different encode-order would otherwise hash
+/// to different ids.
+pub fn computeDeploymentId(entries: []const root.FileStore.Entry) u64 {
+    var sorted_indices: [256]usize = undefined;
+    const n = entries.len;
+    std.debug.assert(n <= sorted_indices.len);
+    for (0..n) |i| sorted_indices[i] = i;
+    const idx_slice = sorted_indices[0..n];
+    std.mem.sort(usize, idx_slice, entries, struct {
+        fn lt(ctx: []const root.FileStore.Entry, a: usize, b: usize) bool {
+            return std.mem.lessThan(u8, ctx[a].path, ctx[b].path);
+        }
+    }.lt);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (idx_slice) |i| {
+        const e = entries[i];
+        hasher.update(e.path);
+        hasher.update(&.{0});
+        hasher.update(if (e.kind == .handler) "handler" else "static");
+        hasher.update(&.{0});
+        hasher.update(e.content_type);
+        hasher.update(&.{0});
+        hasher.update(&e.source_hex);
+        hasher.update(&.{0});
+        if (e.kind == .handler) hasher.update(&e.bytecode_hex);
+        hasher.update(&.{0});
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    // First 8 bytes, big-endian → u64.
+    return std.mem.readInt(u64, digest[0..8], .big);
 }
 
 const testing = std.testing;
@@ -280,19 +348,19 @@ test "encode + decode round-trip" {
 }
 
 test "decode rejects wrong version" {
-    const bytes = "{\"v\":99,\"deployment_id\":1,\"entries\":[]}";
+    const bytes = "{\"v\":99,\"deployment_id\":\"0000000000000001\",\"entries\":[]}";
     try testing.expectError(Error.InvalidManifest, decode(testing.allocator, bytes));
 }
 
 test "decode rejects missing bytecode_hash on handler" {
-    const bytes = "{\"v\":1,\"deployment_id\":1,\"entries\":[" ++
+    const bytes = "{\"v\":1,\"deployment_id\":\"0000000000000001\",\"entries\":[" ++
         "{\"path\":\"x.mjs\",\"kind\":\"handler\",\"content_type\":\"\"," ++
         "\"hash\":\"" ++ ("a" ** 64) ++ "\"}]}";
     try testing.expectError(Error.InvalidManifest, decode(testing.allocator, bytes));
 }
 
 test "decode allows missing bytecode_hash on static" {
-    const bytes = "{\"v\":1,\"deployment_id\":1,\"entries\":[" ++
+    const bytes = "{\"v\":1,\"deployment_id\":\"0000000000000001\",\"entries\":[" ++
         "{\"path\":\"_static/x.html\",\"kind\":\"static\",\"content_type\":\"text/html\"," ++
         "\"hash\":\"" ++ ("c" ** 64) ++ "\"}]}";
     var m = try decode(testing.allocator, bytes);
@@ -305,4 +373,80 @@ test "manifestKey produces zero-padded {N:020d}.json" {
     var buf: [25]u8 = undefined;
     try testing.expectEqualStrings("00000000000000000001.json", manifestKey(&buf, 1));
     try testing.expectEqualStrings("00000000000000004242.json", manifestKey(&buf, 4242));
+}
+
+test "computeDeploymentId: same entries → same id (idempotent)" {
+    var entries = [_]root.FileStore.Entry{
+        .{
+            .path = @constCast("index.mjs"),
+            .kind = .handler,
+            .content_type = @constCast(""),
+            .source_hex = @splat('a'),
+            .bytecode_hex = @splat('b'),
+        },
+        .{
+            .path = @constCast("_static/x.html"),
+            .kind = .static,
+            .content_type = @constCast("text/html"),
+            .source_hex = @splat('c'),
+            .bytecode_hex = @splat(0),
+        },
+    };
+    const id_a = computeDeploymentId(&entries);
+    const id_b = computeDeploymentId(&entries);
+    try testing.expectEqual(id_a, id_b);
+}
+
+test "computeDeploymentId: entry order doesn't matter (sorts by path)" {
+    var entries_a = [_]root.FileStore.Entry{
+        .{
+            .path = @constCast("a.mjs"), .kind = .handler,
+            .content_type = @constCast(""),
+            .source_hex = @splat('1'), .bytecode_hex = @splat('2'),
+        },
+        .{
+            .path = @constCast("b.mjs"), .kind = .handler,
+            .content_type = @constCast(""),
+            .source_hex = @splat('3'), .bytecode_hex = @splat('4'),
+        },
+    };
+    var entries_b = [_]root.FileStore.Entry{
+        .{
+            .path = @constCast("b.mjs"), .kind = .handler,
+            .content_type = @constCast(""),
+            .source_hex = @splat('3'), .bytecode_hex = @splat('4'),
+        },
+        .{
+            .path = @constCast("a.mjs"), .kind = .handler,
+            .content_type = @constCast(""),
+            .source_hex = @splat('1'), .bytecode_hex = @splat('2'),
+        },
+    };
+    try testing.expectEqual(
+        computeDeploymentId(&entries_a),
+        computeDeploymentId(&entries_b),
+    );
+}
+
+test "computeDeploymentId: changing content yields different id" {
+    var entries_a = [_]root.FileStore.Entry{.{
+        .path = @constCast("index.mjs"), .kind = .handler,
+        .content_type = @constCast(""),
+        .source_hex = @splat('a'), .bytecode_hex = @splat('b'),
+    }};
+    var entries_b = [_]root.FileStore.Entry{.{
+        .path = @constCast("index.mjs"), .kind = .handler,
+        .content_type = @constCast(""),
+        .source_hex = @splat('a'), .bytecode_hex = @splat('c'), // different bytecode
+    }};
+    try testing.expect(
+        computeDeploymentId(&entries_a) != computeDeploymentId(&entries_b),
+    );
+}
+
+test "computeDeploymentId: empty entries is stable" {
+    const empty: []const root.FileStore.Entry = &.{};
+    const id_a = computeDeploymentId(empty);
+    const id_b = computeDeploymentId(empty);
+    try testing.expectEqual(id_a, id_b);
 }

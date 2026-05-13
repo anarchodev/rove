@@ -244,7 +244,11 @@ pub const IndexDb = struct {
                 .host = try dupeColumnText(self.allocator, st.?, 6),
                 .status = @intCast(c.sqlite3_column_int(st, 7)),
                 .outcome = try dupeColumnText(self.allocator, st.?, 8),
-                .deployment_id = @intCast(c.sqlite3_column_int64(st, 9)),
+                // deployment_id is content-addressed u64 (sha-256
+                // truncated); the high bit can be set. SQLite
+                // INTEGER stores all 64 bits; reinterpret without
+                // a sign check.
+                .deployment_id = @bitCast(c.sqlite3_column_int64(st, 9)),
             };
             rows.append(self.allocator, row) catch return Error.OutOfMemory;
         }
@@ -311,7 +315,7 @@ pub const IndexDb = struct {
             .outcome = try dupeColumnText(self.allocator, st.?, 7),
             .received_ns = c.sqlite3_column_int64(st, 8),
             .duration_ns = c.sqlite3_column_int64(st, 9),
-            .deployment_id = @intCast(c.sqlite3_column_int64(st, 10)),
+            .deployment_id = @bitCast(c.sqlite3_column_int64(st, 10)),
         };
     }
 };
@@ -380,7 +384,9 @@ fn execLogIndexInserts(
         bindText(st.?, 7, r.host);
         _ = c.sqlite3_bind_int(st, 8, @intCast(r.status));
         bindText(st.?, 9, r.outcome);
-        _ = c.sqlite3_bind_int64(st, 10, @intCast(r.deployment_id));
+        // u64 → i64 bit-cast (high-bit-set deployment_ids are valid
+        // content hashes).
+        _ = c.sqlite3_bind_int64(st, 10, @bitCast(r.deployment_id));
         bindText(st.?, 11, ndjson_key);
         _ = c.sqlite3_bind_int64(st, 12, @intCast(r.offset + header_size));
         _ = c.sqlite3_bind_int(st, 13, @intCast(r.length));

@@ -843,12 +843,12 @@ fn handleRelease(
     // without this short-circuit every retry re-proposes a no-op
     // envelope.
     //
-    // Still enqueue the deployment loader though: dep_ids are sequential
-    // local counters, not content-addressed, so the same dep_id can
-    // point at different S3 manifests over time (e.g. the bootstrap
-    // path's dep_id=1 and a subsequent files-server PUT-file that also
-    // mints dep_id=1). The loader is per-tenant dedup'd, so an extra
-    // enqueue against unchanged content is a cheap re-fetch.
+    // With content-addressed dep_ids, "same id" genuinely means
+    // "same content", so the snapshot already in place IS the right
+    // one. Still enqueue the loader as belt-and-braces — if the
+    // tenant's slot was lazy-opened but its snapshot never landed
+    // (e.g. a deployment loader crash), this nudges another attempt.
+    // The loader is per-tenant dedup'd, so an extra enqueue is cheap.
     if (inst.kv.get("_deploy/current")) |current_hex| {
         defer allocator.free(current_hex);
         const current_id = std.fmt.parseInt(u64, current_hex, 16) catch 0;
@@ -875,11 +875,35 @@ fn handleRelease(
         try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
         return;
     };
+    // Release history: per-tenant `_release/{ts_ms:020}` → `{id:016x}`.
+    // Lex-ordered by timestamp (millis, zero-padded) so a reverse-
+    // scan returns newest-first — what the dashboard's Deploys tab
+    // needs. Same value gets written for re-releases of the same id;
+    // that's fine, the customer DID hit "deploy" again. Different
+    // releases get different timestamps even if content collides.
+    var ts_buf: [20]u8 = undefined;
+    const ts_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    const ts_str = std.fmt.bufPrint(&ts_buf, "{d:0>20}", .{ts_ms}) catch unreachable;
+    var release_key_buf: [32]u8 = undefined;
+    const release_key = std.fmt.bufPrint(&release_key_buf, "_release/{s}", .{ts_str}) catch unreachable;
+    txn.put(release_key, hex) catch |err| {
+        txn.rollback() catch {};
+        const msg = try std.fmt.allocPrint(allocator, "release history put failed: {s}\n", .{@errorName(err)});
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        return;
+    };
+
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
     ws.addPut("_deploy/current", hex) catch |err| {
         txn.rollback() catch {};
         const msg = try std.fmt.allocPrint(allocator, "release writeset failed: {s}\n", .{@errorName(err)});
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
+        return;
+    };
+    ws.addPut(release_key, hex) catch |err| {
+        txn.rollback() catch {};
+        const msg = try std.fmt.allocPrint(allocator, "release-history writeset failed: {s}\n", .{@errorName(err)});
         try respb.setSystemResponseOwned(server, ent, sid, sess, 500, msg, allocator, cors_origin, null);
         return;
     };

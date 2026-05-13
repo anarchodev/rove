@@ -98,7 +98,7 @@ def main() -> int:
         if r.status != 200:
             sys.exit(f"FAIL fresh tenant GET /: {r.status} {r.body[:200]}")
 
-        def wait_for_record(path_filter: str, *, timeout_s: float = 20.0) -> str:
+        def wait_for_record(path_filter: str, *, timeout_s: float = 30.0) -> str:
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
                 r = curl(
@@ -117,7 +117,7 @@ def main() -> int:
 
         rid = wait_for_record("/")
         if not rid:
-            sys.exit("FAIL fresh-tenant static request not indexed within 12s")
+            sys.exit("FAIL fresh-tenant static request not indexed within 30s")
         print("ok  fresh-tenant static request captured + indexed")
 
         leader_log = Path(f"/tmp/replay-smoke-worker-{c.leader_idx}.out")
@@ -155,10 +155,10 @@ export default function () {
             if r.status not in (201, 204):
                 sys.exit(f"FAIL PUT blob {h}: {r.status} {r.body}")
 
-        # files-server's local next-id counter starts at 0 for runtime-
-        # created tenants — the starter deploy used a scratch kv that
-        # gets deleted, so files-server has no record of dep_id=1.
-        # Omit parent_id (= no CAS check) so this first PUT lands as 1.
+        # Content-addressed dep_id (truncated sha-256 over the
+        # manifest entries). Omit parent_id (= no CAS check) since
+        # files-server's per-tenant local store is fresh — the
+        # starter deploy used a scratch kv that gets deleted.
         manifest = {
             "files": {
                 "index.mjs": {"hash": idx_hash, "kind": "handler"},
@@ -258,7 +258,9 @@ export default function () {
             headers={"Authorization": f"Bearer {c.services_jwt}"},
         )
         v2 = json.loads(r.body)
-        if v2.get("deployment_id") != dep_id_int:
+        # deployment_id in the manifest is hex (16 chars); compare
+        # against v2_id which we already have in hex form.
+        if v2.get("deployment_id") != v2_id:
             sys.exit(f"FAIL v2 deployment_id: {v2!r}")
         paths = sorted(e["path"] for e in v2.get("entries", []))
         if paths != ["index.mjs", "lib/util.mjs"]:

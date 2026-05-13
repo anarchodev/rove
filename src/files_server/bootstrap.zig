@@ -175,49 +175,13 @@ pub fn bootstrapTenant(
         "deployments",
     );
     defer manifest_be.deinit();
-    var key_buf: [25]u8 = undefined;
-    const key = files_mod.manifest_json.manifestKey(&key_buf, 1);
 
-    // Idempotency: don't redo a bootstrap whose manifest already
-    // exists. Two sources of truth depending on which path the
-    // caller is on:
-    //
-    //   - Cluster-supplied path (production): check the cluster
-    //     store. `deployment/current` is the live pointer; if it's
-    //     set, the manifest already replicated and we just return
-    //     that dep_id.
-    //   - Offline `loop46 seed` path (cluster == null): check S3.
-    //     The S3 PUT is the only durable write in offline mode.
-    //
-    // Pre-migration deployments may have manifests in S3 but NOT
-    // in the cluster store (operator wiped data_dir, brought up a
-    // fresh cluster pointed at warm S3). For that case, the
-    // cluster-supplied path also re-hydrates from S3 on the
-    // bootstrap pass so loop46 workers serve manifest reads from
-    // the cluster store on every replica.
+    // Idempotency for the cluster path: if `deployment/current` is
+    // already set, this tenant has been bootstrapped + released.
+    // Skip the rebuild and return the recorded id.
     if (cluster) |c| {
         if (try clusterCurrentDeployId(c, instance_id)) |cur_id| {
             return cur_id;
-        }
-        // Cluster store has no record. Try S3-warm fast path before
-        // running a full bootstrap.
-        if (manifest_be.blobStore().exists(key) catch false) {
-            const json_bytes = manifest_be.blobStore().get(key, allocator) catch |err| {
-                std.log.warn(
-                    "files-server bootstrap: S3-warm fast path could not re-read manifest 1 for {s}: {s}",
-                    .{ instance_id, @errorName(err) },
-                );
-                return 1;
-            };
-            defer allocator.free(json_bytes);
-            try writeManifestThroughCluster(allocator, c, instance_id, 1, json_bytes);
-            return 1;
-        }
-        // Truly new tenant — fall through to full bootstrap.
-    } else {
-        // Offline path: S3 idempotency.
-        if (manifest_be.blobStore().exists(key) catch false) {
-            return 1;
         }
     }
 
@@ -271,11 +235,13 @@ pub fn bootstrapTenant(
         }
     }
 
-    const cur = try store.currentDeploymentId();
-    const next_id = cur + 1;
-
     const entries = try store.assembleManifest();
     defer store.freeEntries(entries);
+
+    // Content-addressed dep_id (truncated sha-256). Same content →
+    // same id; same-content re-bootstraps PUT to the same key with
+    // identical bytes (no-op at the storage level).
+    const next_id = files_mod.manifest_json.computeDeploymentId(entries);
 
     const json_bytes = try files_mod.manifest_json.encode(allocator, next_id, entries);
     defer allocator.free(json_bytes);

@@ -866,7 +866,7 @@ fn handleList(
             // No deployment yet — empty list, not an error.
             const empty = try std.fmt.allocPrint(
                 allocator,
-                "{{\"deployment_id\":0,\"entries\":[]}}",
+                "{{\"deployment_id\":\"0000000000000000\",\"entries\":[]}}",
                 .{},
             );
             try setResponse(server, cfg, ent, sid, sess, 200, empty.ptr, empty);
@@ -942,7 +942,11 @@ fn encodeListJson(
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var w = buf.writer(allocator);
-    try w.print("{{\"deployment_id\":{d},\"entries\":[", .{manifest.id});
+    // dep_id as 16-char hex string (matches the manifest storage
+    // format + /_system/release wire format). High-bit-set content
+    // hashes don't fit cleanly in JSON `integer` for downstream
+    // parsers.
+    try w.print("{{\"deployment_id\":\"{x:0>16}\",\"entries\":[", .{manifest.id});
     for (manifest.entries, 0..) |e, i| {
         if (i > 0) try w.writeByte(',');
         const kind_str: []const u8 = if (e.kind == .handler) "handler" else "static";

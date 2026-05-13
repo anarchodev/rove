@@ -110,11 +110,17 @@ def main() -> int:
                 headers=auth, data="x")
         expect("upload without header", 400, r.status)
 
-        # Deploy.
+        # Deploy. dep_id is content-addressed (truncated sha-256), so
+        # we don't know the exact value upfront — just that it's a
+        # non-zero decimal integer.
         r = h2c(f"http://127.0.0.1:{port}/acme/deploy", method="POST", headers=auth)
         body = r.body.strip()
-        if not body.startswith("1"):
-            sys.exit(f"FAIL deploy expected id 1, got {body!r}")
+        try:
+            dep_int = int(body, 10)
+        except ValueError:
+            sys.exit(f"FAIL deploy non-numeric id: {body!r}")
+        if dep_int == 0:
+            sys.exit(f"FAIL deploy returned zero id")
         print(f"ok  deploy /acme: id={body}")
 
         src_hash = hashlib.sha256(source.encode()).hexdigest()
@@ -194,7 +200,13 @@ def main() -> int:
                 data=json.dumps(manifest))
         if '"id":"' not in r.body:
             sys.exit(f"FAIL /deployments missing id: {r.body}")
-        print(f"ok  POST /deployments commits manifest: {r.body}")
+        # dep_id is now content-addressed (truncated sha-256); parse
+        # it from the response for the parent_id CAS below.
+        m = re.search(r'"id":"([0-9a-f]{16})"', r.body)
+        if not m:
+            sys.exit(f"FAIL couldn't parse dep_id from {r.body}")
+        first_dep_id = m.group(1)
+        print(f"ok  POST /deployments commits manifest: id={first_dep_id}")
 
         r = h2c(f"http://127.0.0.1:{port}/twophase/list", headers=auth)
         if "_static/index.html" not in r.body or "index.mjs" not in r.body:
@@ -210,16 +222,20 @@ def main() -> int:
                 }))
         expect("POST /deployments stale parent_id", 409, r.status)
 
-        # Correct parent → 201.
+        # Correct parent → 201, new id (content changed).
         r = h2c(f"http://127.0.0.1:{port}/twophase/deployments", method="POST",
                 headers={**auth, "Content-Type": "application/json"},
                 data=json.dumps({
-                    "parent_id": "0000000000000001",
+                    "parent_id": first_dep_id,
                     "files": {"index.mjs": {"hash": handler_hash, "kind": "handler"}},
                 }))
-        if '"id":"0000000000000002"' not in r.body:
-            sys.exit(f"FAIL expected deployment id 2: {r.body}")
-        print("ok  POST /deployments with matching parent_id → id=2")
+        m = re.search(r'"id":"([0-9a-f]{16})"', r.body)
+        if not m:
+            sys.exit(f"FAIL second deploy missing id: {r.body}")
+        second_dep_id = m.group(1)
+        if second_dep_id == first_dep_id:
+            sys.exit(f"FAIL second deploy reused first dep_id {first_dep_id}")
+        print(f"ok  POST /deployments with matching parent_id → id={second_dep_id}")
 
         # Missing blob → 400.
         never_hash = hashlib.sha256(b"never uploaded").hexdigest()
