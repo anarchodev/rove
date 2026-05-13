@@ -249,6 +249,11 @@ const WorkerCtx = struct {
     data_dir: []const u8,
     http_addr: std.net.Address,
     raft: *kv.RaftNode,
+    /// Shared cluster — every worker pulls its root + per-tenant
+    /// KvStore handles from here. kvexp's manifest is thread-safe
+    /// (per-store locks, sharded page cache), so one handle is
+    /// safe to share across all workers.
+    cluster: *kv.Cluster,
     /// Phase 5.5(a) Step B — JWT secret shared with the standalone
     /// services (log-server, files-server). Worker mints tokens at
     /// `/_system/services-token` after admin auth; each service
@@ -334,16 +339,10 @@ const WorkerCtx = struct {
     /// Owned by worker 0's thread frame (allocated on stack in
     /// `workerMain`). Other workers leave null.
     internal_schedules_inflight: ?*std.StringHashMapUnmanaged(void) = null,
-    /// Worker thread publishes its `DeploymentLoader` pointer here
-    /// after `Worker.create`. Main reads it (after `ready.set()`)
-    /// and stamps onto `ApplyCtx.deployment_loader` so the apply
-    /// thread's follower-side `_deploy/current` detection can
-    /// enqueue. Worker 0 only — the field exists on every WorkerCtx
-    /// but only worker 0's slot is read. The remaining workers'
-    /// loaders catch up on next request to that tenant when they
-    /// see the new `_deploy/current` value through their own dispatch.
-    /// (Multi-worker fan-out is a follow-up.)
-    deployment_loader_publish: ?*rjs.DeploymentLoader = null,
+    /// Process-shared deployment + tenant state. Owned by main.
+    /// Single loader thread; single tenant_files_map across every
+    /// worker on this node — the per-worker fan-out race is gone.
+    node: *rjs.NodeState,
 };
 
 fn workerMain(args: *WorkerCtx) !void {
@@ -365,119 +364,13 @@ fn workerMain(args: *WorkerCtx) !void {
     });
     defer reg.deinit();
 
-    // Per-worker tenant. Opens its OWN connection to __root__.db.
-    // Multiple connections to the same sqlite file are fine in WAL
-    // mode, and each worker's connection respects the NOMUTEX
-    // "one thread per connection" rule because it's created here.
-    const root_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/__root__.db",
-        .{args.data_dir},
-        0,
-    );
-    defer allocator.free(root_path);
-    const root_kv = try kv.KvStore.open(allocator, root_path);
-    defer root_kv.close();
-
-    const tenant = try tenant_mod.Tenant.createWithCounters(
-        allocator,
-        root_kv,
-        args.data_dir,
-        args.seq_counters,
-    );
-    defer tenant.destroy();
-    try tenant.setPublicSuffix(args.public_suffix);
-    tenant.root_token_secret = args.root_token_secret;
-
-    // The main thread created __admin__ + the root token + any
-    // pre-seeded tenants before spawning us. Promote them into THIS
-    // worker's in-memory cache so `Worker.create` can open their
-    // per-tenant stores eagerly. __admin__ is always present;
-    // additional tenants are discovered by walking the data dir.
-    //
-    // For the per-tenant `app.db` stores we also set `busy_timeout=0`
-    // so BEGIN IMMEDIATE returns SQLITE_BUSY immediately instead of
-    // blocking up to 5s. The batched dispatcher handles that: it
-    // records the tenant as blocked for this tick and moves on to
-    // pick a different anchor. The WAL-transition race startup
-    // happens via the main thread's `prewarmTenantDbs`, so worker
-    // opens never need the original 5s wait anymore.
-    try tenant.createInstance(tenant_mod.ADMIN_INSTANCE_ID);
-    // Skip the busy_timeout=0 hack on __admin__ — its kv ALIASES to
-    // the root store, and root.db needs normal busy handling so
-    // concurrent bootstrap writes across workers (marker + domain
-    // updates) serialize instead of racing to SQLITE_BUSY.
-    const discovered_ids = try discoverTenantIds(allocator, args.data_dir);
-    defer {
-        for (discovered_ids) |id| allocator.free(id);
-        allocator.free(discovered_ids);
-    }
-    for (discovered_ids) |id| {
-        try tenant.createInstance(id);
-        if (tenant.instances.get(id)) |inst| inst.kv.setBusyTimeout(0);
-    }
-
-    // Production.md #1.4 step 4 — wire the HTTP-backed manifest
-    // fetcher when the operator pointed us at a files-server
-    // cluster. The mint closure runs per fetch; cost is one HMAC-
-    // SHA256 (microseconds), dominated by the network roundtrip.
-    // Token expiry is 5 minutes — same default loop46 hands the
-    // dashboard at /_system/services-token, so no second secret to
-    // manage.
-    const ManifestMintCtx = struct {
-        secret: []const u8,
-        fn mint(ctx_opaque: ?*anyopaque, allocator_inner: std.mem.Allocator) anyerror![]u8 {
-            const ctx: *@This() = @ptrCast(@alignCast(ctx_opaque.?));
-            const exp_ms: i64 = @as(i64, @intCast(@divFloor(std.time.milliTimestamp(), 1))) + 5 * 60 * 1000;
-            return jwt_mod.mint(allocator_inner, ctx.secret, .{ .exp_ms = exp_ms });
-        }
-    };
-    var manifest_mint_ctx = ManifestMintCtx{ .secret = args.services_jwt_secret };
-    const manifest_http: ?rjs.ManifestHttpConfig = if (args.files_internal_base) |base|
-        .{
-            .base_url = base,
-            .mint_jwt = ManifestMintCtx.mint,
-            .mint_ctx = &manifest_mint_ctx,
-            .ca_bundle_path = null,
-            .verify_tls = !args.files_internal_insecure_tls,
-        }
-    else
-        null;
-
-    // Build a shared libcurl Easy handle FIRST when manifest_http
-    // is wired — used by both the cold-start batch fetch AND
-    // every per-tenant manifest backend the worker creates after.
-    // Connection cache + TLS-session resumption are per-handle
-    // in libcurl; sharing one handle keeps the worker → files-
-    // server connection warm across all manifest reads (cold-
-    // start prefetch, per-release config-mirror fetch, dispatch
-    // tick reload). Ownership transfers to Worker.create.
-    const manifest_easy: ?*blob_mod.curl.Easy = if (manifest_http != null)
-        try blob_mod.curl.Easy.init(allocator)
-    else
-        null;
-    errdefer if (manifest_easy) |e| e.deinit();
-
-    // Cold-start manifest prefetch — one HTTP roundtrip pulls
-    // every tenant's manifest from files-server in a single batch.
-    // Without this, each per-tenant `openTenantFiles` would issue
-    // its own GET, hammering files-server's accept queue at scale
-    // (the 10k bench tipped over with `AcceptFailed` before this
-    // path landed).
-    //
-    // No fallback: if the bulk fetch fails (files-server down,
-    // partition, transient TLS hiccup), retry with exponential
-    // backoff. The worker can't usefully serve traffic without
-    // manifests; falling back to per-tenant fetch reintroduces
-    // the connection-storm bug class we're avoiding here. Block
-    // until the bulk fetch succeeds.
-    const manifest_prefetch_opt: ?std.StringHashMapUnmanaged(rjs.PrefetchedManifest) = if (manifest_http) |mh|
-        try prefetchManifestsWithRetry(allocator, &mh, manifest_easy, tenant)
-    else
-        null;
+    // Tenant + manifest setup is now process-shared on NodeState
+    // (main.zig creates one before spawning workers). Worker code
+    // reaches it via `args.node.tenant`, `args.node.manifest_http`,
+    // etc.
 
     const worker = try Worker.create(allocator, &reg, .{
-        .tenant = tenant,
+        .node = args.node,
         .raft = args.raft,
         .addr = args.http_addr,
         .io_opts = .{
@@ -512,21 +405,12 @@ fn workerMain(args: *WorkerCtx) !void {
         .rate_limit_caps = args.rate_limit_caps,
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
-        .blob_backend = args.blob_backend_cfg,
-        .manifest_http = manifest_http,
-        .manifest_prefetch = manifest_prefetch_opt,
-        .manifest_easy = manifest_easy,
         .log_batch_store = args.log_batch_store,
     });
     defer worker.destroy();
 
-    // Publish the worker's DeploymentLoader pointer for main to
-    // wire into ApplyCtx (follower-side `_deploy/current` apply
-    // path). Set before `ready.set()` so main can read it
-    // immediately after the wait returns. Worker 0 only — main
-    // currently uses just this slot; other workers' loaders are
-    // independent (see WorkerCtx.deployment_loader_publish docs).
-    @atomicStore(?*rjs.DeploymentLoader, &args.deployment_loader_publish, worker.deployment_loader, .release);
+    // DeploymentLoader is owned by NodeState (set in main before
+    // workers spawned); no per-worker publish step.
 
     std.log.info("worker {d}: ready, listening on same port via SO_REUSEPORT", .{args.worker_idx});
     args.ready.set();
@@ -538,12 +422,11 @@ fn workerMain(args: *WorkerCtx) !void {
     // handful-of-tenants-per-tick workloads we've measured.
     var blocked_tenants: rjs.BlockedTenants = .{};
 
-    // Worker-0 lazy state for in-process schedule dispatch
-    // (http-send-plan §3.2). Other workers skip — the phase is
-    // gated to worker 0 so only one thread on this node makes
-    // dispatch decisions for the internal pool.
-    var internal_sched_store: ?schedule_server_mod.ScheduleStore = null;
-    defer if (internal_sched_store) |*s| s.close();
+    // Worker-0 in-flight bookkeeping for in-process schedule dispatch
+    // (http-send-plan §3.2). The store itself is process-shared and
+    // injected via `args.internal_schedules_store` from main; per-worker
+    // opens would create separate LMDB envs whose main_overlays never
+    // see each other's writes (apply path vs scan path race).
     var internal_sched_inflight: std.StringHashMapUnmanaged(void) = .empty;
     defer {
         var it = internal_sched_inflight.iterator();
@@ -551,15 +434,6 @@ fn workerMain(args: *WorkerCtx) !void {
         internal_sched_inflight.deinit(allocator);
     }
     if (args.worker_idx == 0) {
-        const sched_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/schedules.db",
-            .{args.data_dir},
-            0,
-        );
-        defer allocator.free(sched_path);
-        internal_sched_store = try schedule_server_mod.ScheduleStore.open(allocator, sched_path);
-        args.internal_schedules_store = &internal_sched_store.?;
         args.internal_schedules_inflight = &internal_sched_inflight;
     }
 
@@ -585,6 +459,17 @@ fn workerMain(args: *WorkerCtx) !void {
         // No /_system/* proxies on the worker anymore — the dashboard
         // hits the standalone services directly (logs.{suffix},
         // files.{suffix}). Phase 5.5(a) Step B / Phase 5.5(e) F1.
+
+        // Leadership-loss drain. On true→false transition every
+        // speculative TrackedTxn rolls back (kvexp recipe §2) and
+        // every parked raft_pending entry downgrades to 503. New
+        // leader will re-propose anything raft actually committed.
+        const is_leader_now = worker.raft.isLeader();
+        if (worker.was_leader and !is_leader_now) {
+            try rjs.drainOnLeadershipLoss(worker);
+            try reg.flush();
+        }
+        worker.was_leader = is_leader_now;
 
         blocked_tenants.clear();
         while (true) {
@@ -729,6 +614,99 @@ const SubcommandResult = union(enum) {
     run: cli_mod.Cli,
 };
 
+/// `loop46 kv-get` — offline kv read for smoke verification.
+///
+/// Modes:
+///   --key <k>     print the value at <k>; exit 1 if missing.
+///   --apply-idx   print the manifest's durable raft idx.
+///
+/// Common args:
+///   --data-dir <dd>  directory holding `cluster.kv` / `schedules.db`.
+///   --store <name>   tenant id (e.g. "acme", "__root__") or the
+///                    literal "schedules" to read schedules.db.
+///
+/// Under kvexp the data lives in LMDB inside `cluster.kv` / `schedules.db`;
+/// direct `sqlite3` reads no longer work. This subcommand opens the
+/// file standalone (single-process — caller must shut the cluster
+/// down first). Exits 0 on hit, 1 on missing key, 2 on usage / io
+/// error.
+fn runKvGet(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
+    var data_dir: ?[]const u8 = null;
+    var store_name: ?[]const u8 = null;
+    var key: ?[]const u8 = null;
+    var apply_idx_mode = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--data-dir")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            data_dir = args[i];
+        } else if (std.mem.eql(u8, a, "--store")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            store_name = args[i];
+        } else if (std.mem.eql(u8, a, "--key")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            key = args[i];
+        } else if (std.mem.eql(u8, a, "--apply-idx")) {
+            apply_idx_mode = true;
+        } else {
+            std.debug.print("error: kv-get: unknown arg '{s}'\n", .{a});
+            return error.Usage;
+        }
+    }
+    const dd = data_dir orelse return error.Usage;
+    const sn = store_name orelse return error.Usage;
+    if (!apply_idx_mode and key == null) return error.Usage;
+
+    const is_schedules = std.mem.eql(u8, sn, "schedules");
+    const filename = if (is_schedules) "schedules.db" else "cluster.kv";
+
+    // Schedules.db: standalone file with a single store (no
+    // hashStoreId mapping). cluster.kv: per-tenant stores keyed by
+    // hashStoreId(sn).
+    const store = blk: {
+        if (is_schedules) {
+            const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dd, filename }, 0);
+            defer allocator.free(path);
+            break :blk kv.KvStore.openReadOnly(allocator, path) catch |err| {
+                std.debug.print("error: kv-get: open {s}: {s}\n", .{ path, @errorName(err) });
+                std.process.exit(2);
+            };
+        }
+        break :blk kv.KvStore.openClusterOwned(allocator, dd, filename, sn) catch |err| {
+            std.debug.print("error: kv-get: openClusterOwned {s}/{s} store={s}: {s}\n", .{ dd, filename, sn, @errorName(err) });
+            std.process.exit(2);
+        };
+    };
+    defer store.close();
+
+    if (apply_idx_mode) {
+        const idx = store.lastAppliedRaftIdx() catch |err| {
+            std.debug.print("error: kv-get: lastAppliedRaftIdx: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+        var buf: [32]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "{d}\n", .{idx});
+        _ = try std.posix.write(1, s);
+        return;
+    }
+
+    const k = key.?;
+    const value = store.get(k) catch |err| switch (err) {
+        error.NotFound => std.process.exit(1),
+        else => {
+            std.debug.print("error: kv-get: read {s}: {s}\n", .{ k, @errorName(err) });
+            std.process.exit(2);
+        },
+    };
+    defer allocator.free(value);
+    _ = try std.posix.write(1, value);
+    _ = try std.posix.write(1, "\n");
+}
+
 /// Process argv: dispatch help / seed, validate the subcommand, and
 /// parse the CLI for dev/worker modes. Calls `std.process.exit(2)`
 /// directly on usage errors (matching the existing convention so a
@@ -813,6 +791,11 @@ fn dispatchSubcommand(
         return .handled;
     }
 
+    if (std.mem.eql(u8, cmd, "kv-get")) {
+        try runKvGet(allocator, sub_args);
+        return .handled;
+    }
+
     if (std.mem.eql(u8, cmd, "promote-learner")) {
         promote_cli.runPromote(allocator, sub_args) catch |err| {
             if (err == error.Usage) {
@@ -853,23 +836,16 @@ fn dispatchSubcommand(
 
 /// One-time bootstrap on the main thread before any worker / raft /
 /// subsystem thread starts. Opens root.db, ensures __admin__ exists,
-/// applies any `--bootstrap-kv key=value` entries to admin's app.db,
-/// deploys the embedded admin UI bundle, and prewarms every existing
-/// tenant's app.db + log.db so the WAL-mode upgrade is committed
-/// before workers race to open them. Each worker opens its own
-/// connections to these files later.
+/// applies any `--bootstrap-kv key=value` entries to admin's store,
+/// and creates admin/replay tenants. Runs before the cluster comes
+/// up, so it opens `cluster.kv` directly via `openClusterOwned`;
+/// when the cluster boots later, it sees the same stores at the same
+/// hashed store ids.
 fn bootstrapTenants(
     allocator: std.mem.Allocator,
     cli: cli_mod.Cli,
 ) !void {
-    const root_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/__root__.db",
-        .{cli.data_dir},
-        0,
-    );
-    defer allocator.free(root_path);
-    const root_kv = try kv.KvStore.open(allocator, root_path);
+    const root_kv = try kv.KvStore.openClusterOwned(allocator, cli.data_dir, "cluster.kv", "__root__");
     defer root_kv.close();
 
     const tenant = try tenant_mod.Tenant.create(allocator, root_kv, cli.data_dir);
@@ -905,14 +881,10 @@ fn bootstrapTenants(
     // `error: JournalMode` because two openers try to upgrade
     // journal_mode=WAL at the same time. `__replay__` is bootstrap-
     // created above but isn't in the explicit list — discoverTenantIds
-    // picks it up like any other on-disk tenant.
-    const prewarm_ids = try discoverTenantIds(allocator, cli.data_dir);
-    defer {
-        for (prewarm_ids) |id| allocator.free(id);
-        allocator.free(prewarm_ids);
-    }
-    try prewarmTenantDbs(allocator, cli.data_dir, &.{tenant_mod.ADMIN_INSTANCE_ID});
-    try prewarmTenantDbs(allocator, cli.data_dir, prewarm_ids);
+    // Under the kvexp cutover the WAL-mode prewarm dance is
+    // unnecessary — there are no per-tenant SQLite files to
+    // upgrade. The cluster's manifest creates per-tenant stores
+    // lazily inside `cluster.kv` on first `openStore`.
 }
 
 /// Build the `TlsConfig` for the worker pool. Both `--tls-cert` and
@@ -1080,6 +1052,24 @@ pub fn main() !void {
     // Internal-target stamping for envelope-8 (http-send-plan §3.2).
     loop46_ctx.public_suffix = cli.public_suffix;
 
+    // Process-shared schedule store. Under kvexp/LMDB, opening the
+    // same file as separate envs from multiple threads creates
+    // independent main_overlay buffers — writes from one thread are
+    // invisible to readers on another until durabilize. Pre-cutover
+    // sqlite WAL papered over this; now every consumer (apply
+    // handlers, worker-0 internal-schedule tick, schedule-server
+    // libcurl thread) must share one ScheduleStore handle.
+    const sched_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/schedules.db",
+        .{cli.data_dir},
+        0,
+    );
+    defer allocator.free(sched_path);
+    var schedules_store = try schedule_server_mod.ScheduleStore.open(allocator, sched_path);
+    defer schedules_store.close();
+    loop46_ctx.schedules_store = &schedules_store;
+
     const peers = try parsePeerList(allocator, cli.peers);
     defer {
         for (peers) |p| allocator.free(p.host);
@@ -1147,7 +1137,6 @@ pub fn main() !void {
     const cluster = try kv.Cluster.init(.{
         .allocator = allocator,
         .data_dir = cli.data_dir,
-        .store_filename = "app.db",
         .user_ctx = @ptrCast(&loop46_ctx),
         .raft = .{
             .node_id = cli.node_id,
@@ -1356,12 +1345,95 @@ pub fn main() !void {
     // the next-due-or-poll deadline.
     const schedule_handle = try schedule_server_mod.thread.spawn(.{
         .allocator = allocator,
-        .data_dir = cli.data_dir,
+        .store = &schedules_store,
         .raft = raft_node,
     });
     defer schedule_handle.join();
     defer schedule_handle.signalStop();
     loop46_ctx.schedule_wake = &schedule_handle.wake;
+
+    // Shared seq-counter registry. Every per-tenant `app.db` KvStore
+    // opened by any worker draws from this, so concurrent worker
+    // threads allocating new seqs for the same tenant never collide.
+    var seq_counters = kv.SeqCounterRegistry.init(allocator);
+    defer seq_counters.deinit();
+
+    // ── Process-shared tenant + deployment state (NodeState) ────────
+    //
+    // Pre-cutover each worker thread built its own Tenant +
+    // tenant_files_map + DeploymentLoader. That's 4× memory on a
+    // 4-worker node, plus a fan-out race: `/_system/release` POSTs
+    // arriving at one worker via SO_REUSEPORT only reloaded that
+    // worker's loader. Hoisting these into a single `NodeState`
+    // owned by main fixes both. See `docs/deployment-snapshots-plan.md`.
+    const root_kv = try cluster.openRoot();
+    const node_tenant = try tenant_mod.Tenant.createWithCounters(
+        allocator,
+        root_kv,
+        cli.data_dir,
+        &seq_counters,
+    );
+    defer node_tenant.destroy();
+    try node_tenant.setPublicSuffix(cli.public_suffix);
+    node_tenant.root_token_secret = root_token_secret;
+    try node_tenant.createInstance(tenant_mod.ADMIN_INSTANCE_ID);
+    var node_instance_list = try node_tenant.listInstances(std.math.maxInt(u32));
+    defer node_instance_list.deinit();
+    for (node_instance_list.ids) |id| {
+        if (std.mem.eql(u8, id, tenant_mod.ADMIN_INSTANCE_ID)) continue;
+        try node_tenant.createInstance(id);
+    }
+
+    // HTTP-backed manifest fetcher + cold-start prefetch — process-
+    // shared. One libcurl Easy serves every tenant on this node and
+    // every release thereafter. Pre-cutover each worker built its
+    // own copy of these.
+    const NodeManifestMintCtx = struct {
+        secret: []const u8,
+        fn mint(ctx_opaque: ?*anyopaque, allocator_inner: std.mem.Allocator) anyerror![]u8 {
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_opaque.?));
+            const exp_ms: i64 = @as(i64, @intCast(@divFloor(std.time.milliTimestamp(), 1))) + 5 * 60 * 1000;
+            return jwt_mod.mint(allocator_inner, ctx.secret, .{ .exp_ms = exp_ms });
+        }
+    };
+    var node_manifest_mint_ctx = NodeManifestMintCtx{ .secret = &services_jwt_secret };
+    const node_manifest_http: ?rjs.ManifestHttpConfig = if (cli.files_internal_base) |base|
+        .{
+            .base_url = base,
+            .mint_jwt = NodeManifestMintCtx.mint,
+            .mint_ctx = &node_manifest_mint_ctx,
+            .ca_bundle_path = null,
+            .verify_tls = !cli.files_internal_insecure_tls,
+        }
+    else
+        null;
+    const node_manifest_easy: ?*blob_mod.curl.Easy = if (node_manifest_http != null)
+        try blob_mod.curl.Easy.init(allocator)
+    else
+        null;
+    defer if (node_manifest_easy) |e| e.deinit();
+    const node_manifest_prefetch: ?rjs.ManifestPrefetchMap = if (node_manifest_http) |mh|
+        try prefetchManifestsWithRetry(allocator, &mh, node_manifest_easy, node_tenant)
+    else
+        null;
+
+    var node_state = rjs.NodeState.init(
+        allocator,
+        node_tenant,
+        blob_owned.cfg,
+        &schedules_store,
+    );
+    node_state.manifest_http = node_manifest_http;
+    node_state.manifest_easy = node_manifest_easy;
+    node_state.manifest_prefetch = node_manifest_prefetch;
+    defer node_state.deinit();
+
+    try node_state.startDeploymentLoader();
+    // Wire the apply path to the shared loader (replaces the
+    // worker-0-publishes-its-loader atomic dance).
+    loop46_ctx.deployment_loader = node_state.deployment_loader;
+
+    _ = try node_state.eagerOpenTenants();
 
     // ── Spawn worker threads ───────────────────────────────────────────
     const http_addr = try parseHostPort(allocator, cli.http);
@@ -1374,12 +1446,6 @@ pub fn main() !void {
     defer allocator.free(ready_events);
     for (ready_events) |*ev| ev.* = .{};
 
-    // Shared seq-counter registry. Every per-tenant `app.db` KvStore
-    // opened by any worker draws from this, so concurrent worker
-    // threads allocating new seqs for the same tenant never collide.
-    var seq_counters = kv.SeqCounterRegistry.init(allocator);
-    defer seq_counters.deinit();
-
     var i: u16 = 0;
     while (i < num_workers) : (i += 1) {
         ctxs[i] = .{
@@ -1388,6 +1454,7 @@ pub fn main() !void {
             .data_dir = cli.data_dir,
             .http_addr = http_addr,
             .raft = raft_node,
+            .cluster = cluster,
             .services_jwt_secret = &services_jwt_secret,
             .log_public_base = log_public_base,
             .files_public_base = files_public_base,
@@ -1416,17 +1483,17 @@ pub fn main() !void {
             .seq_counters = &seq_counters,
             .log_batch_store = log_batch_store,
             .ready = &ready_events[i],
+            // Process-shared schedule store (worker 0 uses it for the
+            // in-process internal-schedule dispatch tick). Other
+            // workers leave null — only worker 0 runs that phase.
+            .internal_schedules_store = if (i == 0) &schedules_store else null,
+            .node = &node_state,
         };
         threads[i] = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctxs[i]});
     }
     for (ready_events) |*ev| ev.wait();
-
-    // Wire worker 0's DeploymentLoader into ApplyCtx so the apply
-    // thread can enqueue on follower-side `_deploy/current` writes.
-    // Atomic read pairs with the worker thread's release-store
-    // before `ready.set()`. Other workers' loaders are independent;
-    // multi-worker fan-out is a follow-up.
-    loop46_ctx.deployment_loader = @atomicLoad(?*rjs.DeploymentLoader, &ctxs[0].deployment_loader_publish, .acquire);
+    // (loop46_ctx.deployment_loader was wired to node_state.deployment_loader
+    // before workers spawned — no per-worker publish step needed.)
 
     std.debug.print(
         "loop46 worker node {d} listening on http://{s}\n" ++
@@ -1453,16 +1520,35 @@ pub fn main() !void {
     runUntilStopped(tls_config);
     std.log.info("js-worker: shutdown requested, joining {d} worker(s)", .{num_workers});
     for (threads) |t| t.join();
+
+    // Durabilize the manifest before `_exit` so kvexp's main_overlay
+    // doesn't lose in-memory writes. On the leader the periodic
+    // `tickSnapshot` keeps this current; on followers the snapshot
+    // tick is leader-only and they only durabilize on shutdown. The
+    // subsequent `manifest.deinit` is NOT run — that's the
+    // raft-thread-still-running concern; durabilize alone is safe
+    // because it's a single atomic LMDB commit that doesn't touch
+    // the in-memory state any other thread relies on.
+    cluster.kvexp_manifest.durabilize(cluster.global_apply_idx) catch |err| std.log.warn(
+        "js-worker: shutdown durabilize failed: {s} (in-memory writes since last tick may be lost)",
+        .{@errorName(err)},
+    );
+    schedules_store.db.checkpoint() catch |err| std.log.warn(
+        "js-worker: shutdown checkpoint(schedules_store) failed: {s}",
+        .{@errorName(err)},
+    );
+
     std.log.info("js-worker: bye", .{});
 
-    // Skip the teardown chain. The raft thread is detached and still
-    // inside `node.run()`; running `raft_node.deinit()` out from under
-    // it would segfault. Subsystem threads (files-server, log-server)
-    // would also need a join story before it's safe to free their
-    // handles. The pragmatic answer is `_exit(0)` — same as nginx,
-    // envoy, etc.: the kernel reclaims memory + fds + sockets in one
-    // shot and we avoid re-implementing a clean teardown graph for
-    // every subsystem.
+    // Skip the rest of the teardown chain. The raft thread is
+    // detached and still inside `node.run()`; running
+    // `raft_node.deinit()` out from under it would segfault.
+    // Subsystem threads (files-server, log-server) would also need
+    // a join story before it's safe to free their handles. The
+    // pragmatic answer is `_exit(0)` — same as nginx, envoy, etc.:
+    // the kernel reclaims memory + fds + sockets in one shot and
+    // we avoid re-implementing a clean teardown graph for every
+    // subsystem.
     std.process.exit(0);
 }
 
@@ -1615,35 +1701,6 @@ fn prefetchManifests(
 /// kv aliases the root store, so the on-disk dir is not the source of
 /// truth for its existence). Caller owns the returned slice + the
 /// id strings inside it.
-fn discoverTenantIds(
-    allocator: std.mem.Allocator,
-    data_dir: []const u8,
-) ![][]const u8 {
-    var list: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (list.items) |id| allocator.free(id);
-        list.deinit(allocator);
-    }
-
-    var dir = std.fs.cwd().openDir(data_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return list.toOwnedSlice(allocator),
-        else => return err,
-    };
-    defer dir.close();
-
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        if (entry.kind != .directory) continue;
-        if (std.mem.eql(u8, entry.name, tenant_mod.ADMIN_INSTANCE_ID)) continue;
-        const probe = try std.fmt.allocPrint(allocator, "{s}/{s}/app.db", .{ data_dir, entry.name });
-        defer allocator.free(probe);
-        std.fs.cwd().access(probe, .{}) catch continue;
-        const id = try allocator.dupe(u8, entry.name);
-        try list.append(allocator, id);
-    }
-    return list.toOwnedSlice(allocator);
-}
-
 /// Open + close each tenant's `app.db` and `log.db` once from the
 /// main thread so the `PRAGMA journal_mode=WAL` transition is
 /// committed to disk BEFORE any workers race to open them. Concurrent
@@ -1653,28 +1710,6 @@ fn discoverTenantIds(
 /// we observed at `--workers 8`. Prewarming fixes it once and for
 /// all: subsequent openers see the existing WAL mode and skip the
 /// transition.
-fn prewarmTenantDbs(
-    allocator: std.mem.Allocator,
-    data_dir: []const u8,
-    tenant_ids: []const []const u8,
-) !void {
-    for (tenant_ids) |id| {
-        const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, id });
-        defer allocator.free(inst_dir);
-        try std.fs.cwd().makePath(inst_dir);
-
-        const app_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{inst_dir}, 0);
-        defer allocator.free(app_db_path);
-        const app_kv = try kv.KvStore.open(allocator, app_db_path);
-        app_kv.close();
-
-        const log_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/log.db", .{inst_dir}, 0);
-        defer allocator.free(log_db_path);
-        const log_kv = try kv.KvStore.open(allocator, log_db_path);
-        log_kv.close();
-    }
-}
-
 /// Inline qjs compile hook — identical to the one in files_cli.zig.
 /// Duplicating it here keeps the smoke test self-contained; the
 /// production path reuses files_cli's helper.

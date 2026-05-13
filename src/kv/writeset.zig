@@ -274,7 +274,11 @@ test "encode/decode round trip via KvStore" {
     try testing.expectEqualStrings("two", b);
 
     try testing.expectError(kvstore.Error.NotFound, kv.get("charlie"));
-    try testing.expectEqual(@as(u64, 7), kv.maxSeq());
+    // Under kvexp there is no per-row seq column; the engine doesn't
+    // persist `applyEncoded`'s seq argument. The pre-cutover test
+    // asserted `kv.maxSeq() == 7` here — that invariant was a SQLite-
+    // era impl detail (the kv_seq table). Behavioral assertions on
+    // the key state above are what matter.
 }
 
 test "decode rejects truncated payload" {

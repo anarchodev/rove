@@ -103,19 +103,25 @@ const SuccessRec = struct {
     request_id: u64,
 };
 
-/// End-of-walk: commit the shared batch txn, propose the merged
-/// writeset through raft (unless read-only), then move each success
-/// onward. Three exit paths:
+/// End-of-walk: propose the merged batch through raft, defer the
+/// TrackedTxn commit until raft confirms (kvexp README §1 speculative
+/// apply). The TrackedTxn pointer is moved into
+/// `worker.pending_txns[seq]`; `drainRaftPending` commits it once
+/// `committedSeq` advances past `seq`, or rolls it back on fault.
 ///
-///  - **commit failure**: SQLite already rolled back; every success
-///    downgrades to 503 with `.kv_error` outcome in the log.
-///  - **read-only batch**: no writes → no raft hop → every success
-///    moves straight to `response_in` with its normal status.
-///  - **writes present**: propose the writeset; on success the
-///    entries park in `raft_pending` with a `RaftWait` stamp, and
-///    `drainRaftPending` moves them onward once `committedSeq`
-///    advances past them. On propose failure we `undoTxn` and
-///    downgrade each success to 503 `.fault`.
+/// Three exit paths:
+///  - **read-only batch** (no writes, no commands): commit immediately
+///    (nothing to replicate; the txn has nothing in its overlay), free
+///    the txn, move each success straight to `response_in`.
+///  - **propose failure**: rollback the txn, free it, downgrade every
+///    success to 503 `.fault`.
+///  - **propose success**: stash the txn on `pending_txns[seq]`, park
+///    every success on `raft_pending` with a `RaftWait{seq}` stamp.
+///    The drain commits once raft confirms.
+///
+/// Takes ownership of `txn` (heap-allocated by the dispatcher): it's
+/// either committed+destroyed inline, rolled-back+destroyed inline, or
+/// transferred to `pending_txns` for the drain to handle.
 ///
 /// Returns the number of entries finalized.
 fn finalizeBatch(
@@ -131,7 +137,6 @@ fn finalizeBatch(
     const server = worker.h2;
     const allocator = worker.allocator;
     const anchor_id = anchor.id;
-    const store = anchor.kv;
     const batch_seq = txn.txn_seq;
     const has_writes = writeset.ops.items.len > 0;
     const has_schedules = pending_schedules.items.len > 0;
@@ -139,17 +144,16 @@ fn finalizeBatch(
     const has_cmds = has_schedules or has_cancels;
     var processed: usize = 0;
 
-    // Commit-fail downgrade path: SQLite has already rolled back, so
-    // every success-recorded handler gets its body replaced with 503
-    // and a `.kv_error` log outcome.
-    txn.commit() catch |err| panic_mod.invariantViolated(
-        "finalizeBatch.commit",
-        "tenant={s} err={s}",
-        .{ anchor_id, @errorName(err) },
-    );
-
     if (!has_writes and !has_cmds) {
-        // Pure read-only batch: no raft hop.
+        // Pure read-only batch: no raft hop. The txn overlay is empty
+        // (or only contains reads, which kvexp doesn't record); commit
+        // is a near-no-op that just releases the per-tenant lock.
+        txn.commit() catch |err| panic_mod.invariantViolated(
+            "finalizeBatch.commit(read_only)",
+            "tenant={s} err={s}",
+            .{ anchor_id, @errorName(err) },
+        );
+        allocator.destroy(txn);
         for (successes.items) |*s| {
             server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err| panic_mod.invariantViolated(
                 "finalizeBatch.move(read_only)",
@@ -163,22 +167,20 @@ fn finalizeBatch(
             worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
             processed += 1;
         }
-        // No raft hop on read-only batches → emits fire immediately.
-        // Per sse-plan §3.2, the "after kv commit" rule only constrains
-        // emits accompanying writes; emits without writes have nothing
-        // for raft to reject.
+        // Read-only emits: no raft to gate on.
         fireEmitsIfWired(worker, anchor_id, successes, pending_emits);
         successes.clearRetainingCapacity();
         return processed;
     }
 
-    // Writes and/or commands (schedules / cancels) present: propose
-    // ONE raft entry. The shape is a multi-envelope when more than
-    // one bucket has content, otherwise a bare envelope. See
-    // `raft_propose.proposeBatch` for the wire decision. On failure:
-    // compensating-rollback via undoTxn + downgrade every success.
-    // The accumulators are freed by the caller's `defer` regardless
-    // of which branch we take here.
+    // Writes and/or commands present. Release the dispatch lease NOW
+    // — handler execution is done, the kvexp.Txn is already in the
+    // tenant's chain, and the next worker can acquire the lease +
+    // begin a chain-tail Txn for this tenant while we propose. The
+    // chain orders commits; raft consensus and the next batch's
+    // handler can run in parallel.
+    txn.releaseLease();
+
     const seq = raft_propose.proposeBatch(
         worker,
         writeset,
@@ -187,11 +189,12 @@ fn finalizeBatch(
         anchor_id,
     ) catch |err| {
         std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
-        store.undoTxn(batch_seq) catch |undo_err| panic_mod.invariantViolated(
-            "finalizeBatch.undoTxn(after_propose_fail)",
+        txn.rollback() catch |rb_err| panic_mod.invariantViolated(
+            "finalizeBatch.rollback(after_propose_fail)",
             "tenant={s} txn_seq={d} err={s}",
-            .{ anchor_id, batch_seq, @errorName(undo_err) },
+            .{ anchor_id, batch_seq, @errorName(rb_err) },
         );
+        allocator.destroy(txn);
         for (successes.items) |*s| {
             respb.overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |err2| panic_mod.invariantViolated(
                 "finalizeBatch.respb.overwriteWith503(propose_fail)",
@@ -214,13 +217,18 @@ fn finalizeBatch(
         return processed;
     };
 
+    // Propose succeeded: park the txn on the worker's pending map
+    // keyed by raft seq. drainRaftPending commits it once raft
+    // confirms (forward iteration, so chain head commits first).
+    try worker.pending_txns.put(allocator, seq, txn);
+
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     for (successes.items) |*s| {
         try server.reg.set(s.ent, &server.request_out, RaftWait, .{
             .seq = seq,
             .txn_seq = batch_seq,
             .deadline_ns = deadline_ns,
-            .store = store,
+            .store = anchor.kv,
         });
         try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
 
@@ -231,11 +239,10 @@ fn finalizeBatch(
         worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
         processed += 1;
     }
-    // Fire SSE emits now that raft accepted the batch. The drain that
-    // applies the writes to followers happens later, but on the leader
-    // the local SQLite writes are already committed (txn.commit ran
-    // above); the propose-success path is the right "successful kv
-    // commit" hook from sse-plan §3.2's perspective.
+    // SSE emits fire once raft has *accepted* the batch (after propose
+    // returns successfully). They're still pending the commit watermark
+    // for follower visibility, but the SSE plan §3.2 only requires
+    // ordering relative to the local accept, not the cluster commit.
     fireEmitsIfWired(worker, anchor_id, successes, pending_emits);
     successes.clearRetainingCapacity();
     return processed;
@@ -459,7 +466,7 @@ fn authorizeSystemRequest(
     cors_origin: ?[]const u8,
     required_cap: ?[]const u8,
 ) !bool {
-    const auth_ctx = auth.extractAdminAuth(worker.tenant, rh) catch |err| {
+    const auth_ctx = auth.extractAdminAuth(worker.node.tenant, rh) catch |err| {
         std.log.warn("rove-js: authenticate failed: {s}", .{@errorName(err)});
         try respb.setSystemResponse(server, ent, sid, sess, 500, "auth check failed\n", allocator, cors_origin, null);
         return false;
@@ -678,30 +685,26 @@ fn handleMetrics(
 /// `tmp_dir/{snap_id}/<name>` before atomic-renaming into data_dir.
 const SNAP_BUNDLE_MAGIC = "ROVSNAP1";
 
-/// Stream the leader's application-state SQLite files as a single
-/// HTTP response body so a far-behind follower can install them as
-/// its new starting state. Per production.md #1.1 step 3.
+/// Stream the leader's `cluster.kv` (the consolidated kvexp
+/// manifest holding every store this node serves) as a single HTTP
+/// response body so a far-behind follower can install it as its
+/// new starting state. Per production.md #1.1 step 3, under the
+/// kvexp consolidation.
 ///
-/// Consistency model: each source file is VACUUM-INTO'd to a temp
-/// path before its bytes are read. VACUUM INTO is a single SQLite
-/// transaction — the temp output reflects the source at one
-/// consistent point in time, even if writes are happening
-/// concurrently against the source. The point may differ slightly
-/// across files (each VACUUM INTO snapshots independently), which
-/// is fine: each tenant's `kv_seq` table serves as the per-tenant
-/// monotonicity gate so any subsequent raft log replay safely
-/// skips entries the follower already has.
+/// Consistency model: `KvStore.dumpManifestToFile` durabilizes the
+/// source manifest, opens a kvexp Snapshot, dumps it through a
+/// freshly-initialized manifest at a tmp path. The result is a
+/// self-contained, defragmented kvexp file the follower can adopt
+/// wholesale. NOT shipped: `raft.log.db`, term/vote — those are
+/// raft-layer concerns the follower manages on its own.
 ///
-/// Files shipped: `__root__.db`, each `{tenant_id}/app.db`,
-/// `schedules.db` if present. NOT shipped: `raft.log.db`, term/
-/// vote state — those are raft-layer concerns the follower
-/// manages on its own (raft_load_snapshot truncates the receiver's
-/// log to the snapshot index regardless).
+/// Bundle wire format (unchanged from the pre-consolidation
+/// multi-file shape, just always one entry now):
+///   `ROVSNAP1 [u32 file_count=1] [u16 name_len][name="cluster.kv"]
+///    [u64 file_size][bytes]`
 ///
-/// Memory cost: the whole bundle is buffered in memory before being
-/// handed to h2. Fine for the empty-deployment bench (10k × ~30KB
-/// ≈ 300MB). Real production deployments with non-trivial app.db
-/// sizes will need a streaming variant — left to a follow-up.
+/// Memory cost: the dumped bytes are buffered in memory before h2
+/// hands off. A streaming variant is a follow-up.
 fn handleRaftSnapshot(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -719,130 +722,63 @@ fn handleRaftSnapshot(
     }
 
     // Extract `snap_id` from path (hex-encoded after "raft-snapshot/").
-    // The snap_id is informational only — the handler streams the
-    // current state of data_dir regardless. The follower will pass
-    // the current `raft_get_snapshot_last_idx` it sees to
-    // `raft_load_snapshot` so over-fresh data is fine.
+    // Informational only — the handler always streams the current
+    // cluster.kv. The follower threads the current
+    // `raft_get_snapshot_last_idx` it sees into `raft_load_snapshot`.
     const prefix = "raft-snapshot/";
     const id_str = sys_rest[prefix.len..];
     const snap_id = std.fmt.parseInt(u64, id_str, 16) catch 0;
 
-    const data_dir = worker.tenant.dir;
+    const data_dir = worker.node.tenant.dir;
 
-    // Make a unique tmp staging dir under data_dir for the
-    // VACUUM-INTO outputs. Cleaned at end (success or failure).
+    // Dump cluster.kv to a tmp path. dumpManifestToFile durabilizes
+    // the source, opens a snapshot, and writes a fresh defragmented
+    // file at the target.
     var tmp_buf: [256]u8 = undefined;
-    const tmp_subdir = std.fmt.bufPrint(&tmp_buf, ".snap-out-{x}", .{snap_id}) catch return;
-    const tmp_path = try std.fs.path.join(allocator, &.{ data_dir, tmp_subdir });
+    const tmp_name = std.fmt.bufPrint(&tmp_buf, ".snap-out-{x}.kv", .{snap_id}) catch return;
+    const tmp_path = try std.fs.path.join(allocator, &.{ data_dir, tmp_name });
     defer allocator.free(tmp_path);
-    std.fs.cwd().deleteTree(tmp_path) catch {};
-    try std.fs.cwd().makePath(tmp_path);
-    defer std.fs.cwd().deleteTree(tmp_path) catch {};
+    std.fs.cwd().deleteFile(tmp_path) catch {};
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
+    const tmp_pathz = try allocator.dupeZ(u8, tmp_path);
+    defer allocator.free(tmp_pathz);
+    try worker.node.tenant.root.dumpManifestToFile(tmp_pathz);
+
+    const bytes = std.fs.cwd().readFileAlloc(allocator, tmp_path, 1 << 32) catch return;
+    defer allocator.free(bytes);
+
+    // Frame as a single-entry bundle so the existing receiver-side
+    // parser ("magic + count + [name, size, bytes]+") works
+    // unchanged.
     var bundle: std.ArrayList(u8) = .empty;
     errdefer bundle.deinit(allocator);
 
-    // Magic + placeholder file_count (we don't know the count until
-    // after the walk; patch the u32 after).
     try bundle.appendSlice(allocator, SNAP_BUNDLE_MAGIC);
-    const count_off = bundle.items.len;
-    try bundle.appendSlice(allocator, &[_]u8{ 0, 0, 0, 0 });
-    var file_count: u32 = 0;
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, 1, .big);
+    try bundle.appendSlice(allocator, &count_buf);
 
-    // Walk data_dir entries.
-    var dir = try std.fs.cwd().openDir(data_dir, .{ .iterate = true });
-    defer dir.close();
+    const name = "cluster.kv";
+    var nl_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &nl_buf, @intCast(name.len), .big);
+    try bundle.appendSlice(allocator, &nl_buf);
+    try bundle.appendSlice(allocator, name);
 
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        // Top-level files we care about: __root__.db and schedules.db.
-        if (entry.kind == .file) {
-            const ships = std.mem.eql(u8, entry.name, "__root__.db") or
-                std.mem.eql(u8, entry.name, "schedules.db");
-            if (!ships) continue;
-            try vacuumIntoBundle(allocator, &bundle, data_dir, entry.name, tmp_path, entry.name);
-            file_count += 1;
-            continue;
-        }
-
-        // Subdirectories: tenant dirs. Each one's app.db is the
-        // app-state file we want. Skip anything that isn't a
-        // valid tenant id shape (covers our own tmp staging dirs
-        // and any future sibling-dir scratch space).
-        if (entry.kind != .directory) continue;
-        if (std.mem.startsWith(u8, entry.name, ".")) continue;
-
-        const src_rel = try std.fmt.allocPrint(allocator, "{s}/app.db", .{entry.name});
-        defer allocator.free(src_rel);
-        const src_abs = try std.fs.path.join(allocator, &.{ data_dir, src_rel });
-        defer allocator.free(src_abs);
-        std.fs.cwd().access(src_abs, .{}) catch continue; // no app.db → skip
-
-        // Output goes to `tmp_path/<tenant>__app.db` (flatten so
-        // we don't need to recreate directory structure in tmp).
-        const out_name = try std.fmt.allocPrint(allocator, "{s}__app.db", .{entry.name});
-        defer allocator.free(out_name);
-        try vacuumIntoBundle(allocator, &bundle, data_dir, src_rel, tmp_path, out_name);
-        file_count += 1;
-    }
-
-    // Patch in the file count.
-    std.mem.writeInt(u32, bundle.items[count_off..][0..4], file_count, .big);
+    var sz_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &sz_buf, @intCast(bytes.len), .big);
+    try bundle.appendSlice(allocator, &sz_buf);
+    try bundle.appendSlice(allocator, bytes);
 
     std.log.info(
-        "raft-snapshot: served snap_id={x} files={d} body_size={d}",
-        .{ snap_id, file_count, bundle.items.len },
+        "raft-snapshot: served snap_id={x} cluster.kv bytes={d}",
+        .{ snap_id, bytes.len },
     );
 
     const body = try bundle.toOwnedSlice(allocator);
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/octet-stream");
 }
 
-/// VACUUM the SQLite database at `data_dir/src_rel` into a temp
-/// path, then append the file's bytes to `bundle` framed as
-/// `[u16 name_len][name][u64 file_size][bytes]`. Used by
-/// handleRaftSnapshot for each shipped file.
-fn vacuumIntoBundle(
-    allocator: std.mem.Allocator,
-    bundle: *std.ArrayList(u8),
-    data_dir: []const u8,
-    src_rel: []const u8,
-    tmp_dir: []const u8,
-    bundle_name: []const u8,
-) !void {
-    const src_abs = try std.fs.path.join(allocator, &.{ data_dir, src_rel });
-    defer allocator.free(src_abs);
-    const out_abs = try std.fs.path.join(allocator, &.{ tmp_dir, bundle_name });
-    defer allocator.free(out_abs);
-
-    // Run `VACUUM INTO '<out_abs>'` against the source DB. Single
-    // SQLite transaction = consistent point-in-time copy even while
-    // writes are happening against the source via the WAL.
-    const src_pathz = try std.fmt.allocPrintSentinel(allocator, "{s}", .{src_abs}, 0);
-    defer allocator.free(src_pathz);
-    const out_pathz = try std.fmt.allocPrintSentinel(allocator, "{s}", .{out_abs}, 0);
-    defer allocator.free(out_pathz);
-    var src_kv = try kv_mod.KvStore.open(allocator, src_pathz);
-    defer src_kv.close();
-    try src_kv.vacuumInto(out_pathz);
-
-    // Read the freshly-written file. Cap at 256 MiB per file —
-    // larger than that and we should be streaming, not buffering.
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, out_abs, 256 << 20);
-    defer allocator.free(bytes);
-
-    // Frame into bundle.
-    if (bundle_name.len > std.math.maxInt(u16)) return error.OutOfMemory;
-    var nl_buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &nl_buf, @intCast(bundle_name.len), .big);
-    try bundle.appendSlice(allocator, &nl_buf);
-    try bundle.appendSlice(allocator, bundle_name);
-
-    var sz_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &sz_buf, @intCast(bytes.len), .big);
-    try bundle.appendSlice(allocator, &sz_buf);
-    try bundle.appendSlice(allocator, bytes);
-}
 
 /// Stamp `_deploy/current = {dep_id:0>16}` on the tenant's app.db,
 /// propose envelope 0, park the request on raft_pending, and
@@ -886,7 +822,7 @@ fn handleRelease(
 
     // Reject unknown tenants — keeps stale dashboard sessions from
     // populating the table with garbage that never matches.
-    const inst_opt = worker.tenant.getInstance(parsed.value.tenant_id) catch null;
+    const inst_opt = worker.node.tenant.getInstance(parsed.value.tenant_id) catch null;
     const inst = inst_opt orelse {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown tenant\n", allocator, cors_origin, null);
         return;
@@ -901,16 +837,29 @@ fn handleRelease(
 
     // Idempotent fast path: matches `releasePublishTrampoline`. If
     // the target's `_deploy/current` is already exactly `dep_id`,
-    // return 202 without touching raft. The platform-bootstrap
-    // flow (files-server pushing __admin__ / __replay__ at start)
-    // retries on connection-refused — each retry can land here
-    // after the first commit, so without this short-circuit every
-    // retry re-proposes a no-op envelope.
+    // skip the raft propose. The platform-bootstrap flow (files-server
+    // pushing __admin__ / __replay__ at start) retries on connection-
+    // refused; each retry can land here after the first commit, so
+    // without this short-circuit every retry re-proposes a no-op
+    // envelope.
+    //
+    // Still enqueue the deployment loader though: dep_ids are sequential
+    // local counters, not content-addressed, so the same dep_id can
+    // point at different S3 manifests over time (e.g. the bootstrap
+    // path's dep_id=1 and a subsequent files-server PUT-file that also
+    // mints dep_id=1). The loader is per-tenant dedup'd, so an extra
+    // enqueue against unchanged content is a cheap re-fetch.
     if (inst.kv.get("_deploy/current")) |current_hex| {
         defer allocator.free(current_hex);
         const current_id = std.fmt.parseInt(u64, current_hex, 16) catch 0;
         if (current_id == parsed.value.dep_id) {
-            try respb.setSystemResponse(server, ent, sid, sess, 202, "already at dep_id\n", allocator, cors_origin, null);
+            if (worker.node.deployment_loader) |loader| {
+                loader.enqueue(parsed.value.tenant_id, parsed.value.dep_id) catch |err| std.log.warn(
+                    "release fast-path: loader.enqueue {s}/{d} failed: {s}",
+                    .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
+                );
+            }
+            try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
             return;
         }
     } else |_| {}
@@ -988,7 +937,7 @@ fn handleRelease(
     // do this for us on this node. On follower nodes, apply.zig's
     // _deploy/current detector enqueues automatically when the
     // writeset commits.
-    if (worker.deployment_loader) |loader| {
+    if (worker.node.deployment_loader) |loader| {
         loader.enqueue(parsed.value.tenant_id, parsed.value.dep_id) catch |err| {
             std.log.warn(
                 "release: deployment loader enqueue {s}/{d} failed: {s}",
@@ -1054,7 +1003,7 @@ fn handleAdminKv(
         return;
     }
 
-    const admin_inst_opt = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+    const admin_inst_opt = worker.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
     const admin_inst = admin_inst_opt orelse {
         try respb.setSystemResponse(server, ent, sid, sess, 503, "__admin__ tenant not initialized\n", allocator, cors_origin, null);
         return;
@@ -1164,13 +1113,13 @@ fn resolveRequest(
         false;
 
     if (!is_admin_host) {
-        const r = worker.tenant.resolveDomain(host) catch |err| {
+        const r = worker.node.tenant.resolveDomain(host) catch |err| {
             std.log.warn("rove-js: tenant.resolveDomain({s}) failed: {s}", .{ host, @errorName(err) });
             try respb.setSimpleResponse(server, ent, sid, sess, 500, "tenant resolution failed\n", allocator);
             return .handled;
         };
         if (r == null) {
-            const ps = worker.tenant.publicSuffix() orelse "(none)";
+            const ps = worker.node.tenant.publicSuffix() orelse "(none)";
             const ad = worker.admin_api_domain orelse "(none)";
             const body_owned = std.fmt.allocPrint(
                 allocator,
@@ -1230,12 +1179,16 @@ fn resolveRequest(
     const has_query = std.mem.indexOfScalar(u8, path, '?') != null;
     const is_static_method = std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD");
     if (is_static_method and !has_query) {
-        const admin_inst = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+        const admin_inst = worker.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
         if (admin_inst) |ai| {
-            const admin_tc = worker_mod.getOrOpenTenantFiles(worker, ai) catch null;
-            if (admin_tc) |tc| {
-                const outcome = try respb.tryServeStatic(server, allocator, ent, sid, sess, tc, method, path, rh);
-                if (outcome != .miss) return .handled;
+            const admin_slot = worker_mod.getOrOpenTenantSlot(worker, ai) catch null;
+            if (admin_slot) |slot| {
+                if (slot.pinCurrent()) |snap| {
+                    const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
+                    defer tc.release();
+                    const outcome = try respb.tryServeStatic(server, allocator, ent, sid, sess, tc, method, path, rh);
+                    if (outcome != .miss) return .handled;
+                }
             }
         }
     }
@@ -1249,7 +1202,7 @@ fn resolveRequest(
     // `/_system/*` keeps its own auth gate via `tryHandleSystem`
     // until the files-server + log-server detach (PLAN §10.13).
 
-    const admin_opt = worker.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
+    const admin_opt = worker.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch null;
     if (admin_opt == null) {
         try respb.setSystemResponse(server, ent, sid, sess, 503, "admin tenant not provisioned\n", allocator, admin_cors, null);
         return .handled;
@@ -1265,7 +1218,7 @@ fn resolveRequest(
     const scope_inst: *const tenant_mod.Instance = if (effective_scope.len == 0)
         handler_inst
     else blk: {
-        const s_opt = worker.tenant.getInstance(effective_scope) catch |err| inner: {
+        const s_opt = worker.node.tenant.getInstance(effective_scope) catch |err| inner: {
             std.log.warn("rove-js: admin getInstance({s}) failed: {s}", .{ effective_scope, @errorName(err) });
             break :inner null;
         };
@@ -1304,7 +1257,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // different tenant are left in request_out for a future
     // dispatchOnce call to pick up.
     var anchor: ?*const tenant_mod.Instance = null;
-    var txn: ?kv_mod.KvStore.TrackedTxn = null;
+    // Heap-allocated so the pointer is stable across the dispatch
+    // walk and survives the move into `worker.pending_txns` at
+    // finalizeBatch. ensureOpen registers `active_txn` against this
+    // stable address.
+    var txn: ?*kv_mod.KvStore.TrackedTxn = null;
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
@@ -1408,19 +1365,26 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
 
         // Lazy-open: instances created at runtime aren't in the map yet.
-        const tc = worker_mod.getOrOpenTenantFiles(worker, handler_inst) catch |err| {
-            std.log.warn("rove-js: lazy openTenantFiles({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
+        const slot = worker_mod.getOrOpenTenantSlot(worker, handler_inst) catch |err| {
+            std.log.warn("rove-js: lazy openTenantSlot({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
             try respb.setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
-        if (tc.current_deployment_id == 0) {
+        // Pin the current deployment snapshot for the duration of this
+        // request. `release` fires at end of iteration (continue or
+        // fall-through). Phase 2: snapshot pinning guarantees a request
+        // sees one deployment version completely.
+        const snap = slot.pinCurrent() orelse {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{});
             processed += 1;
             continue;
-        }
+        };
+        const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
+        defer tc.release();
+        const dep_id = snap.deployment_id;
 
         // `/_session/sse-token` — mints the JWT the customer's JS
         // hands to sse-server's EventSource open (sse-plan §5.1).
@@ -1442,7 +1406,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             rh,
             received_ns,
         )) {
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 200, .ok, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 200, .ok, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1465,7 +1429,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (!allowed) {
             const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
             try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 429, .handler_error, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 429, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1490,7 +1454,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             );
             switch (static_outcome) {
                 .served => |status| {
-                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, status, .ok, &.{}, &.{}, .{});
+                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, status, .ok, &.{}, &.{}, .{});
                     processed += 1;
                     continue;
                 },
@@ -1501,7 +1465,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var route = router_mod.resolveRoute(allocator, path) catch |err| {
             std.log.warn("rove-js router failed: {s}", .{@errorName(err)});
             try respb.setErrorResponse(server, ent, sid, sess);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
@@ -1513,14 +1477,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             if (!try respb.serveConvention404(server, allocator, ent, sid, sess, tc)) {
                 try respb.setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
             }
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 404, .handler_error, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 404, .handler_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
 
-        if (worker.penalty_box.isBoxed(handler_inst.id, tc.current_deployment_id, received_ns)) {
+        if (worker.penalty_box.isBoxed(handler_inst.id, dep_id, received_ns)) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "tenant temporarily disabled (cpu budget)\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 503, .timeout, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .timeout, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1543,34 +1507,40 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
             if (skip_blocked) continue;
 
-            var new_txn = scope_inst.kv.beginTrackedImmediate() catch |err| {
-                std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
-                try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            // Heap-allocate the TrackedTxn so the pointer is stable
+            // for the lifetime of the batch — `open()` registers
+            // `active_txn` against this address, and finalizeBatch
+            // hands the same pointer to `worker.pending_txns` for
+            // deferred commit at raft confirmation.
+            const new_txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch {
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn alloc failed\n", allocator);
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
             };
-            // Eagerly open the underlying SQLite txn so SQLITE_BUSY
-            // surfaces HERE — if another worker holds RESERVED on
-            // this tenant's app.db we note the tenant as blocked for
-            // the remainder of this tick and skip past it to try a
-            // different anchor (Stage 3: cross-tenant scheduling on
-            // contention).
+            new_txn.* = scope_inst.kv.beginTrackedImmediate() catch |err| {
+                allocator.destroy(new_txn);
+                std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                processed += 1;
+                continue;
+            };
+            // Eagerly open so per-tenant lock contention surfaces
+            // as `KvError.Conflict` HERE — under kvexp's chain-head
+            // commit rule, two workers must not have concurrent
+            // open TrackedTxns on the same tenant.
             new_txn.open() catch |err| {
+                allocator.destroy(new_txn);
                 if (err == kv_mod.KvError.Conflict) {
                     blocked.append(scope_inst) catch {
-                        // blocked list is bounded; overflow means this
-                        // tick has already tried more tenants than we
-                        // budgeted for. Leave the entity in place and
-                        // return what we've processed so far — next
-                        // tick gets a fresh blocked list.
                         return processed;
                     };
                     continue;
                 }
                 std.log.warn("rove-js open tracked txn ({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn open failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
             };
@@ -1692,12 +1662,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var budget = dispatcher_mod.Budget.fromNow(budget_ns);
         var resp = worker.dispatcher.run(
             scope_inst.kv,
-            &txn.?,
+            txn.?,
             &writeset,
             bytecode,
-            &tc.bytecodes,
-            &tc.source_hashes,
-            tc.triggers,
+            &tc.snap.bytecodes,
+            &tc.snap.source_hashes,
+            tc.snap.triggers,
             request,
             &budget,
         ) catch |err| {
@@ -1715,13 +1685,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 try respb.setSimpleResponse(server, ent, sid, sess, 504, "handler exceeded cpu budget\n", allocator);
                 worker.penalty_box.recordKill(
                     handler_inst.id,
-                    tc.current_deployment_id,
+                    dep_id,
                     received_ns,
                 ) catch |pe| std.log.warn("rove-js penalty recordKill failed: {s}", .{@errorName(pe)});
             } else {
                 try respb.setErrorResponse(server, ent, sid, sess);
             }
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, status, outcome, &.{}, &.{}, .{});
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, .{});
             processed += 1;
             continue;
         };
@@ -1750,7 +1720,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             defer if (ex_body.len > 0) allocator.free(ex_body);
             const ex_body_slice: []const u8 = if (ex_body.len > 0) ex_body else "handler threw\n";
             try respb.setSimpleResponse(server, ent, sid, sess, 500, ex_body_slice, allocator);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .handler_error, console_owned, exception_owned, .{});
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, .{});
             processed += 1;
             continue;
         }
@@ -1764,7 +1734,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .{ scope_inst.id, @errorName(re) },
             );
             try respb.setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
             processed += 1;
             continue;
         }
@@ -1855,7 +1825,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .method = method,
             .path = path,
             .host = host,
-            .deployment_id = tc.current_deployment_id,
+            .deployment_id = dep_id,
             .received_ns = received_ns,
             .tapes = tape_payloads,
             .request_id = request_id,
@@ -1863,12 +1833,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     }
 
     // End of walk. If no anchor was opened we're done — all processing
-    // was short-circuit (failed) paths.
+    // was short-circuit (failed) paths. finalizeBatch takes ownership
+    // of `txn` regardless of outcome (commits + frees, rolls back +
+    // frees, or transfers to `worker.pending_txns`).
     if (anchor == null) return processed;
     processed += try finalizeBatch(
         worker,
         anchor.?,
-        &txn.?,
+        txn.?,
         &writeset,
         &pending_emits,
         &pending_schedules,

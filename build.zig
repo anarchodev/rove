@@ -40,10 +40,27 @@ pub fn build(b: *std.Build) void {
     h2_mod.linkSystemLibrary("ssl", .{});
     h2_mod.linkSystemLibrary("crypto", .{});
 
+    // ── kvexp: vendored embedded multi-tenant KV (anarchodev/kvexp).
+    // LMDB-backed durable B-tree fronted by an in-memory per-store
+    // memtable (overlay). Links against system liblmdb. Replaces
+    // SQLite as the per-tenant state engine. See
+    // vendor/kvexp/README.md.
+    const kvexp_mod = b.addModule("kvexp", .{
+        .root_source_file = b.path("vendor/kvexp/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kvexp_mod.link_libc = true;
+    kvexp_mod.linkSystemLibrary("lmdb", .{});
+
     // ── rove-kv: KV store + raft. Standalone leaf module — does NOT
     // depend on rove or rove-io. raft_net is a direct liburing wrapper;
     // raft itself is vendored willemt/raft. See
     // memory/feedback_raft_net_direct_liburing.md.
+    //
+    // State engine is kvexp (vendored). raft_log persistence is still
+    // sqlite for now (raft log is its own concern, separate from the
+    // KV state path); follow-up cutover will migrate it.
     const kv_mod = b.addModule("rove-kv", .{
         .root_source_file = b.path("src/kv/root.zig"),
         .target = target,
@@ -51,6 +68,7 @@ pub fn build(b: *std.Build) void {
     });
     kv_mod.link_libc = true;
     kv_mod.linkSystemLibrary("sqlite3", .{});
+    kv_mod.addImport("kvexp", kvexp_mod);
 
     // Vendored willemt/raft (BSD-licensed, see vendor/raft/LICENSE).
     kv_mod.addIncludePath(b.path("vendor/raft/include"));

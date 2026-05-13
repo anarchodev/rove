@@ -457,19 +457,40 @@ pub fn restore(
     errdefer manifest.deinit();
 
     // ── Per-tenant restore ──────────────────────────────────────
+    //
+    // Under the kvexp consolidation, an entry whose instance_id is
+    // the reserved `CLUSTER_DB_ID` covers the whole node-wide
+    // `cluster.kv` and is written directly under `data_dir` (not
+    // a per-instance subdir). Pre-cutover entries with real
+    // tenant ids still work — they land at `{data_dir}/{id}/app.db`
+    // — but no new captures produce them.
     var tenants_done: usize = 0;
     for (manifest.tenants) |entry| {
-        try restoreOneDb(
-            allocator,
-            snapshot_store,
-            entry.db_key,
-            &entry.db_sha256,
-            entry.db_size,
-            entry.snapshot_idx,
-            stage,
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, entry.instance_id }),
-            "app.db",
-        );
+        if (std.mem.eql(u8, entry.instance_id, CLUSTER_DB_ID)) {
+            try restoreOneDb(
+                allocator,
+                snapshot_store,
+                entry.db_key,
+                &entry.db_sha256,
+                entry.db_size,
+                entry.snapshot_idx,
+                stage,
+                try allocator.dupe(u8, data_dir),
+                "cluster.kv",
+            );
+        } else {
+            try restoreOneDb(
+                allocator,
+                snapshot_store,
+                entry.db_key,
+                &entry.db_sha256,
+                entry.db_size,
+                entry.snapshot_idx,
+                stage,
+                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, entry.instance_id }),
+                "app.db",
+            );
+        }
         tenants_done += 1;
     }
 
@@ -755,6 +776,12 @@ pub fn installStagedSnapshotIfPresent(
     );
 
     // Walk the staged dir; rename each non-meta file into place.
+    // Under the kvexp consolidation the bundle ships a single
+    // `cluster.kv` entry — it lands at `{data_dir}/cluster.kv`.
+    // The legacy per-tenant `{tenant}__app.db` + `__root__.db` +
+    // `schedules.db` shape is gone; any such files in a stage
+    // dir came from a pre-cutover sender and are skipped with a
+    // warning (raft replay will re-derive their state).
     var stage_dir = try std.fs.cwd().openDir(stage_path, .{ .iterate = true });
     defer stage_dir.close();
 
@@ -766,17 +793,15 @@ pub fn installStagedSnapshotIfPresent(
         const src = try std.fs.path.join(allocator, &.{ stage_path, entry.name });
         defer allocator.free(src);
 
-        // Map bundled name → on-disk path.
-        // - "__root__.db", "schedules.db" → data_dir/<name>
-        // - "<tenant>__app.db"             → data_dir/<tenant>/app.db
-        const dst: []u8 = if (std.mem.endsWith(u8, entry.name, "__app.db")) blk: {
-            const sep = std.mem.indexOf(u8, entry.name, "__app.db") orelse continue;
-            const tenant = entry.name[0..sep];
-            const tenant_dir = try std.fs.path.join(allocator, &.{ data_dir, tenant });
-            defer allocator.free(tenant_dir);
-            try std.fs.cwd().makePath(tenant_dir);
-            break :blk try std.fs.path.join(allocator, &.{ tenant_dir, "app.db" });
-        } else try std.fs.path.join(allocator, &.{ data_dir, entry.name });
+        if (!std.mem.eql(u8, entry.name, "cluster.kv")) {
+            std.log.warn(
+                "loop46: staged file {s} is not cluster.kv — skipping (pre-cutover bundle?)",
+                .{src},
+            );
+            continue;
+        }
+
+        const dst = try std.fs.path.join(allocator, &.{ data_dir, "cluster.kv" });
         defer allocator.free(dst);
 
         // Atomic rename within the same filesystem.
@@ -1134,20 +1159,12 @@ pub fn tickRaftCapture(
     const start_ns = std.time.nanoTimestamp();
     const apply_position = raft.snapshotLastIdx();
 
-    // One stamp: persist the cluster-wide apply idx to
-    // __root__.db so a restart resumes from this floor. Cost
-    // is one row update + WAL append + fsync, independent of
-    // tenant count.
-    const root_store = cluster.openRoot() catch |err| {
+    // Atomic durabilize: folds every tenant's main_overlay into
+    // LMDB and stamps the watermark in one write txn. Cost is
+    // O(dirty entries), independent of tenant count.
+    cluster.kvexp_manifest.durabilize(apply_position) catch |err| {
         std.log.warn(
-            "snapshot: tickRaftCapture: openRoot failed: {s}",
-            .{@errorName(err)},
-        );
-        return null;
-    };
-    root_store.setLastAppliedRaftIdx(apply_position) catch |err| {
-        std.log.warn(
-            "snapshot: tickRaftCapture: setLastAppliedRaftIdx __root__ failed: {s}",
+            "snapshot: tickRaftCapture: durabilize failed: {s}",
             .{@errorName(err)},
         );
         return null;
@@ -1239,77 +1256,102 @@ pub fn captureFromDataDir(
     apply_position: u64,
     willemt_term: u64,
 ) !Captured {
-    var sources: std.ArrayListUnmanaged(TenantSource) = .empty;
-    defer {
-        for (sources.items) |t| {
-            allocator.free(t.instance_id);
-            t.store.close();
-        }
-        sources.deinit(allocator);
-    }
+    // Under the kvexp consolidation the data dir holds one
+    // `cluster.kv` file. Bypass the per-store `capture` loop and
+    // ship the whole manifest via `dumpManifestToFile` — that
+    // preserves every store_id (the per-store `vacuumInto` would
+    // remap them to STANDALONE_STORE_ID, which mismatches what
+    // `KvStore.openClusterOwned` expects on the receive side).
+    //
+    // The manifest carries a single `tenants[]` entry under the
+    // reserved `CLUSTER_DB_ID`; restore writes the bytes to
+    // `{data_dir}/cluster.kv` rather than per-tenant paths.
+    const start_ns = std.time.nanoTimestamp();
 
-    var dir = std.fs.cwd().openDir(data_dir, .{ .iterate = true }) catch
-        return Error.Io;
-    defer dir.close();
+    const snap_id = try mintSnapId(allocator);
+    errdefer allocator.free(snap_id);
 
-    var root_store: ?*kv.KvStore = null;
-    defer if (root_store) |s| s.close();
+    const stage = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_dir, snap_id });
+    defer allocator.free(stage);
+    std.fs.cwd().makePath(stage) catch return Error.Io;
+    defer std.fs.cwd().deleteTree(stage) catch {};
 
-    var it = dir.iterate();
-    while (it.next() catch return Error.Io) |entry| {
-        if (entry.kind == .file and std.mem.eql(u8, entry.name, "__root__.db")) {
-            const path = try std.fmt.allocPrintSentinel(
-                allocator,
-                "{s}/__root__.db",
-                .{data_dir},
-                0,
-            );
-            defer allocator.free(path);
-            root_store = kv.KvStore.open(allocator, path) catch return Error.Sqlite;
-            continue;
-        }
-        if (entry.kind != .directory) continue;
-        // Skip dot-dirs (e.g. `.snapshots`, `.stage`) and any subdir
-        // without an `app.db`.
-        if (entry.name.len == 0 or entry.name[0] == '.') continue;
-        const app_db_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/{s}/app.db",
-            .{ data_dir, entry.name },
-            0,
-        );
-        defer allocator.free(app_db_path);
-        std.fs.cwd().access(app_db_path, .{}) catch continue;
+    // Open cluster.kv just long enough to durabilize + dump.
+    const ks = kv.KvStore.openClusterOwned(allocator, data_dir, "cluster.kv", "__root__") catch
+        return Error.Sqlite;
+    defer ks.close();
 
-        const ks = kv.KvStore.open(allocator, app_db_path) catch return Error.Sqlite;
-        const id_copy = try allocator.dupe(u8, entry.name);
-        errdefer {
-            ks.close();
-            allocator.free(id_copy);
-        }
-        try sources.append(allocator, .{ .instance_id = id_copy, .store = ks });
-    }
+    ks.setLastAppliedRaftIdx(apply_position) catch return Error.Sqlite;
 
-    // Operator CLI default: no in-memory `tenant_apply_idx` state,
-    // so we can't tell which tenants are unchanged since a prior
-    // snapshot. Pass `prev_manifest = null` and `last_applied_idx`
-    // null on every TenantSource — capture re-VACUUMs everything
-    // (correct, just more expensive). This is acceptable for
-    // operator-driven one-shot DR captures; the periodic
-    // raft-thread loop has the apply-idx mirror and uses the
-    // reuse path.
-    return capture(
+    const tmp_path = try std.fmt.allocPrintSentinel(
         allocator,
-        sources.items,
-        root_store,
-        null,
-        null,
-        snapshot_store,
-        tmp_dir,
-        apply_position,
-        willemt_term,
+        "{s}/cluster.kv",
+        .{stage},
+        0,
     );
+    defer allocator.free(tmp_path);
+    ks.dumpManifestToFile(tmp_path) catch return Error.Sqlite;
+
+    // Upload + hash + size.
+    const db_key_base = try snapshotKey(allocator, snap_id, CLUSTER_DB_ID);
+    const uploaded = try uploadDbFile(allocator, snapshot_store, tmp_path, db_key_base);
+
+    // Manifest: one tenant entry under the reserved CLUSTER_DB_ID.
+    var tenants = try allocator.alloc(TenantEntry, 1);
+    errdefer allocator.free(tenants);
+    tenants[0] = .{
+        .instance_id = try allocator.dupe(u8, CLUSTER_DB_ID),
+        .db_key = uploaded.key,
+        .db_sha256 = uploaded.sha256_hex,
+        .db_size = uploaded.size,
+        .snapshot_idx = apply_position,
+    };
+
+    const manifest = Manifest{
+        .allocator = allocator,
+        .snap_id = snap_id,
+        .captured_at_ms = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms)),
+        .willemt_compaction_floor = apply_position,
+        .willemt_term = willemt_term,
+        .tenants = tenants,
+        .root_db = null,
+    };
+    const manifest_bytes = try encodeManifest(allocator, &manifest);
+    errdefer allocator.free(manifest_bytes);
+
+    const manifest_key = try std.fmt.allocPrint(
+        allocator,
+        "cluster/snapshots/{s}/manifest.json",
+        .{snap_id},
+    );
+    errdefer allocator.free(manifest_key);
+    snapshot_store.put(manifest_key, manifest_bytes) catch return Error.Backend;
+
+    // Free the working tenants slice — manifest.deinit isn't
+    // called here (we don't own it as a fresh Manifest, we
+    // hand-rolled it inline).
+    allocator.free(tenants[0].instance_id);
+    allocator.free(tenants[0].db_key);
+    allocator.free(tenants);
+
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const duration_ms: u64 = @intCast(@divTrunc(elapsed_ns, std.time.ns_per_ms));
+
+    return .{
+        .snap_id = snap_id,
+        .manifest_key = manifest_key,
+        .manifest_bytes = manifest_bytes,
+        .vacuumed_count = 1,
+        .reused_count = 0,
+        .duration_ms = duration_ms,
+        .allocator = allocator,
+    };
 }
+
+/// Reserved tenant id used in the snapshot manifest to denote the
+/// consolidated `cluster.kv` file. Both the capture (single-source
+/// case) and restore paths recognize it.
+pub const CLUSTER_DB_ID: []const u8 = "__cluster__";
 
 /// 26-char ULID-ish stamp: `{ms_since_epoch_hex:0>14}{random_hex:12}`.
 /// Sortable by creation time, unique under concurrent calls. Caller
@@ -1576,40 +1618,8 @@ test "capture + restore: round-trips tenant + root state into a fresh data_dir" 
     defer std.fs.cwd().deleteTree(root_path) catch {};
     try std.fs.cwd().makePath(root_path);
 
-    // ── Source state: __root__.db + tenant `acme`/app.db ───────
-    {
-        const root_db_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/__root__.db",
-            .{root_path},
-            0,
-        );
-        defer allocator.free(root_db_path);
-        const root_kv = try kv.KvStore.open(allocator, root_db_path);
-        defer root_kv.close();
-        try root_kv.put("tenant/acme", "{}");
-        try root_kv.setLastAppliedRaftIdx(50);
-    }
-
-    const acme_dir = try std.fmt.allocPrint(allocator, "{s}/acme", .{root_path});
-    defer allocator.free(acme_dir);
-    try std.fs.cwd().makePath(acme_dir);
-    const acme_db_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/app.db",
-        .{acme_dir},
-        0,
-    );
-    defer allocator.free(acme_db_path);
-    {
-        const acme_kv = try kv.KvStore.open(allocator, acme_db_path);
-        defer acme_kv.close();
-        try acme_kv.put("greeting", "hello");
-        try acme_kv.put("counter", "42");
-        try acme_kv.setLastAppliedRaftIdx(99);
-    }
-
-    // ── Stand up a raft node + ApplyCtx for the source side ────
+    // ── Stand up a raft node + cluster (kvexp manifest at
+    // {root_path}/cluster.kv) ──
     const raft_log_path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/raft.log.db",
@@ -1627,10 +1637,15 @@ test "capture + restore: round-trips tenant + root state into a fresh data_dir" 
     });
     defer node.deinit();
 
-    const cluster = try kv.Cluster.initWithExternalRaftAndFilename(allocator, root_path, node, "app.db", null);
+    const cluster = try kv.Cluster.initWithExternalRaft(allocator, root_path, node, null);
     defer cluster.deinit();
-    _ = try cluster.openStore("acme");
-    _ = try cluster.openRoot();
+
+    // ── Write source state through the cluster's stores ────────
+    const root_kv = try cluster.openRoot();
+    try root_kv.put("tenant/acme", "{}");
+    const acme_kv = try cluster.openStore("acme");
+    try acme_kv.put("greeting", "hello");
+    try acme_kv.put("counter", "42");
 
     // ── Capture into an FsBatchStore ────────────────────────────
     const store_dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{root_path});
@@ -1809,20 +1824,7 @@ test "capture: end-to-end against FsBatchStore round-trips a tenant db" {
     defer std.fs.cwd().deleteTree(root_path) catch {};
     try std.fs.cwd().makePath(root_path);
 
-    // Plant a `__root__.db` so ApplyCtx can lazy-open it.
-    {
-        const root_db_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/__root__.db",
-            .{root_path},
-            0,
-        );
-        defer allocator.free(root_db_path);
-        const root_kv = try kv.KvStore.open(allocator, root_db_path);
-        root_kv.close();
-    }
-
-    // Stand up a minimal raft node so ApplyCtx.init has something
+    // Stand up a minimal raft node so the cluster has something
     // to point at.
     const raft_log_path = try std.fmt.allocPrintSentinel(
         allocator,
@@ -1841,28 +1843,12 @@ test "capture: end-to-end against FsBatchStore round-trips a tenant db" {
     });
     defer node.deinit();
 
-    // Tenant `acme` with one row.
-    const acme_dir = try std.fmt.allocPrint(allocator, "{s}/acme", .{root_path});
-    defer allocator.free(acme_dir);
-    try std.fs.cwd().makePath(acme_dir);
-    const acme_db_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/app.db",
-        .{acme_dir},
-        0,
-    );
-    defer allocator.free(acme_db_path);
-    {
-        const acme_kv = try kv.KvStore.open(allocator, acme_db_path);
-        defer acme_kv.close();
-        try acme_kv.put("hello", "world");
-        try acme_kv.setLastAppliedRaftIdx(99);
-    }
-
-    const cluster = try kv.Cluster.initWithExternalRaftAndFilename(allocator, root_path, node, "app.db", null);
+    const cluster = try kv.Cluster.initWithExternalRaft(allocator, root_path, node, null);
     defer cluster.deinit();
-    // Trigger lazy-open so stores has acme + root_store is set.
-    _ = try cluster.openStore("acme");
+
+    // Tenant `acme` with one row, written via the cluster.
+    const acme_kv = try cluster.openStore("acme");
+    try acme_kv.put("hello", "world");
     _ = try cluster.openRoot();
 
     // Snapshot store + tmp stage dir.
@@ -1961,18 +1947,6 @@ test "capture: prev_manifest with different tenant set" {
     defer std.fs.cwd().deleteTree(root_path) catch {};
     try std.fs.cwd().makePath(root_path);
 
-    {
-        const root_db_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/__root__.db",
-            .{root_path},
-            0,
-        );
-        defer allocator.free(root_db_path);
-        const root_kv = try kv.KvStore.open(allocator, root_db_path);
-        root_kv.close();
-    }
-
     const raft_log_path = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/raft.log.db",
@@ -1990,21 +1964,12 @@ test "capture: prev_manifest with different tenant set" {
     });
     defer node.deinit();
 
-    // Plant only `gamma`, no acme or beta.
-    {
-        const dir = try std.fmt.allocPrint(allocator, "{s}/gamma", .{root_path});
-        defer allocator.free(dir);
-        try std.fs.cwd().makePath(dir);
-        const db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{dir}, 0);
-        defer allocator.free(db_path);
-        const ks = try kv.KvStore.open(allocator, db_path);
-        defer ks.close();
-        try ks.put("g", "v");
-    }
-
-    const cluster = try kv.Cluster.initWithExternalRaftAndFilename(allocator, root_path, node, "app.db", null);
+    const cluster = try kv.Cluster.initWithExternalRaft(allocator, root_path, node, null);
     defer cluster.deinit();
-    _ = try cluster.openStore("gamma");
+
+    // Plant only `gamma`, no acme or beta — through the cluster.
+    const gamma_kv = try cluster.openStore("gamma");
+    try gamma_kv.put("g", "v");
     _ = try cluster.openRoot();
 
     // Build a synthetic prev_manifest naming acme/beta with stale
@@ -2062,4 +2027,79 @@ test "capture: prev_manifest with different tenant set" {
     // gamma was captured fresh (under the new snap_id, NOT prev's "old").
     try testing.expect(std.mem.indexOf(u8, manifest.tenants[0].db_key, manifest.snap_id) != null);
     try testing.expect(std.mem.indexOf(u8, manifest.tenants[0].db_key, "old") == null);
+}
+
+test "captureFromDataDir + restore round-trips cluster.kv" {
+    // CLI-shaped scenario: an operator runs `loop46 snapshot
+    // --data-dir D` (`captureFromDataDir`) followed by
+    // `loop46 restore --data-dir D'` (`restore`). Under the
+    // kvexp consolidation the snapshot covers `cluster.kv` as a
+    // single reserved entry under `CLUSTER_DB_ID`.
+    const allocator = testing.allocator;
+
+    var path_buf: [96]u8 = undefined;
+    const source_dir = tmpPath(&path_buf, "cdd-src");
+    defer std.fs.cwd().deleteTree(source_dir) catch {};
+    try std.fs.cwd().makePath(source_dir);
+
+    // Seed cluster.kv via the offline open path (same shape
+    // `loop46 seed` uses).
+    {
+        const root_kv = try kv.KvStore.openClusterOwned(allocator, source_dir, "cluster.kv", "__root__");
+        defer root_kv.close();
+        try root_kv.put("hello", "from-cluster");
+    }
+
+    const store_dir = try std.fmt.allocPrint(allocator, "{s}/.snapshots", .{source_dir});
+    defer allocator.free(store_dir);
+    const stage_dir = try std.fmt.allocPrint(allocator, "{s}/.stage", .{source_dir});
+    defer allocator.free(stage_dir);
+
+    const store = try ls.batch_store_fs.FsBatchStore.init(allocator, store_dir);
+    defer store.deinit();
+
+    var captured = try captureFromDataDir(
+        allocator,
+        source_dir,
+        store.batchStore(),
+        stage_dir,
+        100,
+        7,
+    );
+    defer captured.deinit();
+
+    var manifest = try decodeManifest(allocator, captured.manifest_bytes);
+    defer manifest.deinit();
+    try testing.expectEqual(@as(usize, 1), manifest.tenants.len);
+    try testing.expectEqualStrings(CLUSTER_DB_ID, manifest.tenants[0].instance_id);
+
+    // Restore into a fresh data dir.
+    const restore_dir = try std.fmt.allocPrint(allocator, "{s}-restored", .{source_dir});
+    defer std.fs.cwd().deleteTree(restore_dir) catch {};
+    defer allocator.free(restore_dir);
+    try std.fs.cwd().makePath(restore_dir);
+
+    const restore_stage = try std.fmt.allocPrint(allocator, "{s}/.stage", .{restore_dir});
+    defer allocator.free(restore_stage);
+
+    var restored = try restore(
+        allocator,
+        store.batchStore(),
+        captured.snap_id,
+        restore_dir,
+        restore_stage,
+    );
+    defer restored.manifest.deinit();
+    try testing.expectEqual(@as(usize, 1), restored.tenants_restored);
+
+    // Read the restored cluster.kv back via the standard open
+    // path — confirms it's a valid kvexp file with the data
+    // intact under the same root-store id.
+    {
+        const ks = try kv.KvStore.openClusterOwned(allocator, restore_dir, "cluster.kv", "__root__");
+        defer ks.close();
+        const v = try ks.get("hello");
+        defer allocator.free(v);
+        try testing.expectEqualStrings("from-cluster", v);
+    }
 }

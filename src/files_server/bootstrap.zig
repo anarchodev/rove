@@ -225,10 +225,23 @@ pub fn bootstrapTenant(
     defer allocator.free(inst_dir);
     try std.fs.cwd().makePath(inst_dir);
 
-    const files_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/files.db", .{inst_dir}, 0);
-    defer allocator.free(files_db_path);
+    // Bootstrap's files-index work is scratch only — the durable
+    // state is the manifest JSON we upload to S3 below.
+    // `files_mod.FileStore.init` requires a KvStore handle, so use
+    // a per-call tmp kvexp file that gets deleted on return.
+    const scratch_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/.bootstrap-scratch.kv",
+        .{inst_dir},
+        0,
+    );
+    defer {
+        std.fs.cwd().deleteFile(scratch_path) catch {};
+        allocator.free(scratch_path);
+    }
+    std.fs.cwd().deleteFile(scratch_path) catch {};
 
-    const files_kv = try kv_mod.KvStore.open(allocator, files_db_path);
+    const files_kv = try kv_mod.KvStore.open(allocator, scratch_path);
     defer files_kv.close();
 
     var fs_store = try blob_mod.BlobBackend.openPerTenant(

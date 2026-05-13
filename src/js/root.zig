@@ -77,6 +77,8 @@ pub const Worker = worker.Worker;
 pub const WorkerConfig = worker.WorkerConfig;
 pub const ManifestHttpConfig = worker.ManifestHttpConfig;
 pub const PrefetchedManifest = worker.PrefetchedManifest;
+pub const ManifestPrefetchMap = worker.ManifestPrefetchMap;
+pub const NodeState = worker.NodeState;
 pub const WorkerOptions = worker.Options;
 pub const RaftWait = worker.RaftWait;
 pub const TenantFiles = worker.TenantFiles;
@@ -89,6 +91,7 @@ pub const CALLBACK_DEFAULT_MAX_PER_TENANT = callback_dispatch.DEFAULT_MAX_PER_TE
 pub const dispatchInternalSchedules = internal_schedules.dispatchInternalSchedules;
 pub const INTERNAL_SCHEDULES_DEFAULT_MAX_PER_PASS = internal_schedules.DEFAULT_MAX_PER_PASS;
 pub const drainRaftPending = worker.drainRaftPending;
+pub const drainOnLeadershipLoss = worker.drainOnLeadershipLoss;
 pub const cleanupResponses = worker.cleanupResponses;
 pub const flushLogs = worker.flushLogs;
 

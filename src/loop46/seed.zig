@@ -108,14 +108,12 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     );
     defer parsed.deinit();
 
-    const root_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/__root__.db",
-        .{dd},
-        0,
-    );
-    defer allocator.free(root_path);
-    const root_kv = try kv.KvStore.open(allocator, root_path);
+    // Seed runs offline (before any cluster is up). Open the
+    // cluster's `cluster.kv` manifest directly via the same hashed
+    // store ids the live Cluster will use — that way the data we
+    // write here is visible when `loop46 worker` boots and the
+    // Cluster opens the same file.
+    const root_kv = try kv.KvStore.openClusterOwned(allocator, dd, "cluster.kv", "__root__");
     defer root_kv.close();
 
     const tenant = try tenant_mod.Tenant.create(allocator, root_kv, dd);
@@ -132,8 +130,8 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
         for (parsed.value.tenants) |t| {
             try tenant.createInstance(t.id);
             for (t.domains) |dom| try tenant.assignDomain(dom, t.id);
-            try writeLocalDeployCurrent(allocator, dd, t.id, deploy_id);
-            if (t.seed_kv) |kvs| try seedAppKv(allocator, dd, t.id, kvs);
+            try writeLocalDeployCurrent(tenant, t.id, deploy_id);
+            if (t.seed_kv) |kvs| try seedAppKv(tenant, t.id, kvs);
         }
         std.debug.print(
             "seed: provisioned {d} tenant(s) into {s} (no-files-bootstrap; deploy_id={d})\n",
@@ -182,36 +180,27 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
             deploy_files.items,
             null,
         );
-        try writeLocalDeployCurrent(allocator, dd, t.id, dep_id);
-        try mirrorConfigFromManifest(allocator, blob_owned.cfg, dd, t.id, dep_id);
+        try writeLocalDeployCurrent(tenant, t.id, dep_id);
+        try mirrorConfigFromManifest(allocator, tenant, blob_owned.cfg, t.id, dep_id);
 
-        if (t.seed_kv) |kvs| try seedAppKv(allocator, dd, t.id, kvs);
+        if (t.seed_kv) |kvs| try seedAppKv(tenant, t.id, kvs);
     }
 
     std.debug.print("seed: provisioned {d} tenant(s) into {s}\n", .{ parsed.value.tenants.len, dd });
 }
 
 fn seedAppKv(
-    allocator: std.mem.Allocator,
-    dd: []const u8,
+    tenant: *tenant_mod.Tenant,
     instance_id: []const u8,
     kvs: std.json.ArrayHashMap([]const u8),
 ) !void {
-    const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dd, instance_id });
-    defer allocator.free(inst_dir);
-    try std.fs.cwd().makePath(inst_dir);
-    const app_db_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/app.db",
-        .{inst_dir},
-        0,
-    );
-    defer allocator.free(app_db_path);
-    const app_kv = try kv.KvStore.open(allocator, app_db_path);
-    defer app_kv.close();
+    // Tenant.createInstance has already attached this instance's
+    // store into the cluster's manifest. Write directly through
+    // that handle.
+    const inst = tenant.instances.get(instance_id) orelse return error.UnknownInstance;
     var it = kvs.map.iterator();
     while (it.next()) |entry| {
-        try app_kv.put(entry.key_ptr.*, entry.value_ptr.*);
+        try inst.kv.put(entry.key_ptr.*, entry.value_ptr.*);
     }
 }
 
@@ -224,8 +213,8 @@ fn seedAppKv(
 /// but a real load failure logs).
 fn mirrorConfigFromManifest(
     allocator: std.mem.Allocator,
+    tenant: *tenant_mod.Tenant,
     blob_cfg: blob_mod.BackendConfig,
-    dd: []const u8,
     instance_id: []const u8,
     dep_id: u64,
 ) !void {
@@ -243,13 +232,10 @@ fn mirrorConfigFromManifest(
     );
     defer file_blobs.deinit();
 
-    const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dd, instance_id });
-    defer allocator.free(inst_dir);
-    try std.fs.cwd().makePath(inst_dir);
-    const app_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{inst_dir}, 0);
-    defer allocator.free(app_db_path);
-    const app_kv = try kv.KvStore.open(allocator, app_db_path);
-    defer app_kv.close();
+    // Write through the tenant's instance handle — same kvexp
+    // manifest the cluster will use at boot.
+    const inst = tenant.instances.get(instance_id) orelse return error.UnknownInstance;
+    const app_kv = inst.kv;
 
     var txn = try app_kv.beginTrackedImmediate();
     errdefer txn.rollback() catch {};
@@ -263,15 +249,9 @@ fn mirrorConfigFromManifest(
         &txn,
         &ws,
     );
-    const txn_seq = txn.txn_seq;
     try txn.commit();
-    // Clear the undo row — seed is offline (no raft to confirm
-    // durability), so without this the worker's recoverOrphans
-    // sweep at startup would treat the write as uncommitted and
-    // roll it back. ws is discarded for the same reason: no raft
-    // to propose to. Followers re-derive identical state from
-    // their own seed pass.
-    if (txn_seq != 0) try app_kv.commitTxn(txn_seq);
+    // No raft yet, so the writeset is discarded; followers
+    // re-derive identical state from their own seed pass.
 }
 
 /// Write `_deploy/current = {dep_id:016x}` to `<dd>/<id>/app.db`.
@@ -282,19 +262,12 @@ fn mirrorConfigFromManifest(
 /// instead, which routes through raft so every node sees the same
 /// pointer.)
 fn writeLocalDeployCurrent(
-    allocator: std.mem.Allocator,
-    dd: []const u8,
+    tenant: *tenant_mod.Tenant,
     instance_id: []const u8,
     dep_id: u64,
 ) !void {
-    const inst_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dd, instance_id });
-    defer allocator.free(inst_dir);
-    try std.fs.cwd().makePath(inst_dir);
-    const app_db_path = try std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{inst_dir}, 0);
-    defer allocator.free(app_db_path);
-    const app_kv = try kv.KvStore.open(allocator, app_db_path);
-    defer app_kv.close();
+    const inst = tenant.instances.get(instance_id) orelse return error.UnknownInstance;
     var hex_buf: [16]u8 = undefined;
     const hex = try std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{dep_id});
-    try app_kv.put("_deploy/current", hex);
+    try inst.kv.put("_deploy/current", hex);
 }

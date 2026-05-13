@@ -63,8 +63,11 @@ pub var test_allow_plaintext: bool = false;
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    /// `{data_dir}` — `schedules.db` lives at the top of this directory.
-    data_dir: []const u8,
+    /// Process-shared schedule store. Owned by the caller; we hold a
+    /// pointer. Under kvexp every consumer of schedules.db must share
+    /// one ScheduleStore — separate envs to the same file don't see
+    /// each other's main_overlay writes.
+    store: *schedule_server.ScheduleStore,
     raft: *kv_mod.RaftNode,
     /// Cap on idle sleep duration. Reached when the external pool has
     /// no future work scheduled — the thread still wakes occasionally
@@ -128,16 +131,7 @@ fn runLoop(h: *Handle) !void {
 
     blob_mod.curl.globalInit();
 
-    const db_path = try std.fmt.allocPrintSentinel(
-        h.allocator,
-        "{s}/schedules.db",
-        .{h.config.data_dir},
-        0,
-    );
-    defer h.allocator.free(db_path);
-
-    var store = try schedule_server.ScheduleStore.open(h.allocator, db_path);
-    defer store.close();
+    const store = h.config.store;
 
     var easy = try blob_mod.curl.Easy.init(h.allocator);
     defer easy.deinit();
@@ -151,7 +145,7 @@ fn runLoop(h: *Handle) !void {
 
     while (!h.stop_flag.load(.acquire)) {
         if (h.config.raft.isLeader()) {
-            deliveryPass(h, &store, easy, &in_flight) catch |err| {
+            deliveryPass(h, store, easy, &in_flight) catch |err| {
                 std.log.warn("schedule-server: pass error: {s}", .{@errorName(err)});
             };
         } else {
@@ -166,7 +160,7 @@ fn runLoop(h: *Handle) !void {
         // sooner row lands, so we don't oversleep new work. Followers
         // stay capped at idle_max_ms — they're not firing anything
         // anyway.
-        const sleep_ns = computeSleepNs(&store, h.config.idle_max_ms) catch
+        const sleep_ns = computeSleepNs(store, h.config.idle_max_ms) catch
             @as(u64, h.config.idle_max_ms) * std.time.ns_per_ms;
         h.wake.timedWait(sleep_ns) catch {};
         h.wake.reset();

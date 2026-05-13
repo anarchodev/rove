@@ -150,7 +150,7 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
     // 1. Parse URL → target tenant id. Must succeed since apply
     //    stamped is_internal=true; if it doesn't, the row is in
     //    the wrong pool and the only sane recovery is to demote it.
-    const suffix = worker.tenant.publicSuffix() orelse {
+    const suffix = worker.node.tenant.publicSuffix() orelse {
         std.log.warn("internal-schedules: no public_suffix; demoting", .{});
         return proposeDemote(worker, stored);
     };
@@ -165,17 +165,19 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
     // 2. Look up target tenant locally. If not hosted on this node
     //    (or no deployment yet), demote — libcurl will route through
     //    cluster ingress to whichever node hosts it.
-    const tc = worker.tenant_files_map.get(target_id) orelse {
+    const slot = worker.node.tenant_files_map.get(target_id) orelse {
         std.log.info(
             "internal-schedules: {s}/{s}: target {s} not hosted locally; demoting",
             .{ row.tenant_id, row.id, target_id },
         );
         return proposeDemote(worker, stored);
     };
-    if (tc.current_deployment_id == 0) {
+    const snap = slot.pinCurrent() orelse {
         return proposeDemote(worker, stored);
-    }
-    const inst_opt = worker.tenant.getInstance(target_id) catch null;
+    };
+    const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
+    defer tc.release();
+    const inst_opt = worker.node.tenant.getInstance(target_id) catch null;
     const inst = inst_opt orelse {
         return proposeDemote(worker, stored);
     };
@@ -277,9 +279,9 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
         &txn,
         &writeset,
         bytecode,
-        &tc.bytecodes,
-        &tc.source_hashes,
-        tc.triggers,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
         request,
         &budget,
     ) catch |err| {

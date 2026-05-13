@@ -323,30 +323,22 @@ pub const Loop46Ctx = struct {
     }
 
     pub fn deinit(self: *Loop46Ctx) void {
-        if (self.schedules_store) |s| {
-            s.close();
-            self.allocator.destroy(s);
-        }
+        // `schedules_store` is owned by the caller (main.zig opens it
+        // once and threads the pointer in). We just borrow.
+        _ = self;
     }
 
-    /// Lazily open the cluster-wide `schedules.db`. Singleton —
-    /// neither leader-skipped nor library-managed since ScheduleStore
-    /// isn't a raw KvStore.
+    /// Return the process-shared schedule store. Set once at startup
+    /// in main.zig before any envelope-8/9/10/11 applies can fire.
+    /// `data_dir` is accepted (and unused) so the call site doesn't
+    /// have to change.
     fn getSchedules(self: *Loop46Ctx, data_dir: []const u8) !*schedule_server.ScheduleStore {
-        if (self.schedules_store) |existing| return existing;
-        const path = try std.fmt.allocPrintSentinel(
-            self.allocator,
-            "{s}/schedules.db",
-            .{data_dir},
-            0,
+        _ = data_dir;
+        return self.schedules_store orelse panic_mod.invariantViolated(
+            "apply.getSchedules",
+            "schedules_store not set on Loop46Ctx",
+            .{},
         );
-        defer self.allocator.free(path);
-
-        const ptr = try self.allocator.create(schedule_server.ScheduleStore);
-        errdefer self.allocator.destroy(ptr);
-        ptr.* = try schedule_server.ScheduleStore.open(self.allocator, path);
-        self.schedules_store = ptr;
-        return ptr;
     }
 };
 
@@ -371,8 +363,9 @@ fn loop46Ctx(user_ctx: ?*anyopaque) *Loop46Ctx {
 /// Per-tenant writeset (envelope type=0). Registered with
 /// `leader_skip = true` — the worker already wrote locally via its
 /// own TrackedTxn before proposing, so this only runs on followers.
-/// Library opens the per-tenant store at `{data_dir}/{id}/app.db`
-/// (filename pinned via `Cluster.Config.store_filename = "app.db"`).
+/// Library attaches a store handle for `env.id` (hashed via
+/// `kvstore.hashStoreId`) inside the cluster's node-wide kvexp
+/// manifest at `{data_dir}/cluster.kv`.
 pub fn applyWriteSet(
     cluster: *kv.Cluster,
     env: kv.Envelope,

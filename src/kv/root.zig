@@ -47,6 +47,7 @@ pub const KvError = kvstore.Error;
 pub const TrackedTxn = kvstore.KvStore.TrackedTxn;
 pub const SeqCounter = kvstore.SeqCounter;
 pub const SeqCounterRegistry = kvstore.SeqCounterRegistry;
+pub const hashStoreId = kvstore.hashStoreId;
 
 pub const RaftLog = raft_log.RaftLog;
 pub const RaftLogEntry = raft_log.Entry;

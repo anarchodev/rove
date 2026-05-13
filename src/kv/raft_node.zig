@@ -1928,7 +1928,10 @@ test "3-node cluster replicates a WriteSet to every follower's KvStore" {
         defer allocator.free(b);
         try testing.expectEqualStrings("two", b);
 
-        try testing.expectEqual(seq, kv.maxSeq());
+        // Pre-cutover: also asserted `kv.maxSeq() == seq` to confirm
+        // followers stamped the seq column. Under kvexp there's no
+        // persistent per-row seq; behavioral key-state assertions
+        // above carry the replication invariant.
     }
 }
 

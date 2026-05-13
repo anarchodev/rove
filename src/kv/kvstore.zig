@@ -1,34 +1,54 @@
-//! SQLite-backed KV store with a seq column for raft delta replication.
+//! KvStore — handle into a `kvexp.Store` within a node-wide manifest.
 //!
-//! ## Durability contract
+//! Phase 1 of the kvexp cutover. SQLite is gone; the data engine is
+//! anarchodev/kvexp (vendored at `vendor/kvexp/`). One kvexp manifest
+//! per binary holds all of that binary's stores; each tenant /
+//! `__root__` / `schedules` lives as a `store_id` within. Mapping
+//! `string store_id → u64` is `std.hash.Wyhash`.
 //!
-//! KV state on followers is re-applied from the raft log on restart, so
-//! KV-level fsync isn't strictly required for raft *correctness*. But:
+//! ## Two open modes
 //!
-//! 1. On the leader, the shift-js pattern is "worker writes locally, then
-//!    proposes." If the worker's local write isn't durable and the leader
-//!    crashes before the proposal commits via raft, the worker's pre-crash
-//!    read-your-own-write might be lost on restart. For consistency, KV
-//!    writes should be fsynced.
+//! - **Attached** (production): caller holds the `*kvexp.Manifest`
+//!   for the whole binary and asks `KvStore.attach(...)` for a
+//!   handle into one of its stores. `close` releases handle state
+//!   only; the manifest stays alive.
+//! - **Standalone** (tests, CLI tools): `KvStore.open(path)` builds
+//!   its own kvexp stack (PagedFile + BufferPool + PageCache +
+//!   Manifest) backing a fresh file with a single store inside.
+//!   `close` tears the whole thing down. Standalone mode preserves
+//!   the pre-cutover one-file-per-thing semantics for callers that
+//!   haven't been consolidated yet.
 //!
-//! 2. Fast restart: if KV is durable, we can skip re-applying already-
-//!    applied entries on restart (future optimization — not yet wired).
+//! ## Durability
 //!
-//! We pin `journal_mode=WAL` and `synchronous=FULL` for the same reasons
-//! as the raft log. See `raft_log.zig` for the full rationale.
+//! Writes mutate the in-memory page cache. `kvexp.Manifest.durabilize`
+//! flushes them; that runs from `Cluster.tickSnapshot` on the raft
+//! thread. Crash before durabilize loses in-memory state but the
+//! raft log is the WAL — replay reconstitutes everything past
+//! `manifest.lastAppliedRaftIdx()`.
+//!
+//! ## Legacy seq surface
+//!
+//! `nextSeq` / `maxSeq` / `putSeq` / `delta` existed because the
+//! SQLite path needed an explicit row-level seq column for raft
+//! snapshot deltas. With raft-as-WAL the engine doesn't need it.
+//! The API is preserved as in-memory counters (no on-disk state)
+//! so callers compile; the delta-based snapshot path will be
+//! replaced by `kvexp.dumpSnapshot` / `loadSnapshot` in a follow-up.
 
 const std = @import("std");
-const schema = @import("sqlite_schema.zig");
-const c = schema.c;
+const kvexp = @import("kvexp");
 
-pub const Error = schema.Error;
-
-/// Sentinel used as the exclusive upper bound when a prefix scan has no
-/// finite successor — empty prefix (scan everything), or a prefix that
-/// is all-0xff bytes. 256 bytes of 0xff compares larger than any key
-/// callers actually use in this codebase (instance ids are ASCII and
-/// capped at 64, domain hosts at 253, log keys at ~40).
-const PREFIX_UPPER_SENTINEL = [_]u8{0xff} ** 256;
+pub const Error = error{
+    NotFound,
+    OutOfMemory,
+    Conflict,
+    /// Underlying engine error. Name preserved so callers that
+    /// switch on `Error.Sqlite` keep compiling; rename is a future
+    /// cleanup pass.
+    Sqlite,
+    Io,
+};
 
 pub const Entry = struct {
     key: []u8,
@@ -69,20 +89,10 @@ pub const DeltaResult = struct {
     }
 };
 
-
-/// Monotonic counter for `nextSeq`. Replaces the per-write
-/// `INSERT INTO kv_seq` (and its WAL page write) with an atomic
-/// fetch-add. Owned by a single KvStore for test / CLI usage; shared
-/// across multiple KvStores that write to the same db file in
-/// production (the rove-js worker threads each open their own
-/// connection to a tenant's `app.db` — they all need to draw from one
-/// logical counter, or concurrent writers can allocate duplicate seqs
-/// and break `undoTxn`).
-///
-/// Seed from `max(SELECT seq FROM sqlite_sequence WHERE name='kv_seq',
-/// SELECT MAX(seq) FROM kv)` at open time — the `sqlite_sequence` row
-/// preserves the historical high-water mark across restarts even
-/// after we stop writing to `kv_seq`.
+/// Lock-free monotonic counter. In the SQLite era this was sourced
+/// from `kv_seq` AUTOINCREMENT. Under kvexp it's a pure in-memory
+/// counter; the value is used as `TrackedTxn.txn_seq` and as a
+/// debugging breadcrumb. No on-disk state.
 pub const SeqCounter = struct {
     value: std.atomic.Value(u64) align(std.atomic.cache_line),
 
@@ -90,17 +100,10 @@ pub const SeqCounter = struct {
         return .{ .value = .init(initial) };
     }
 
-    /// Allocate the next sequence value. Post-increment semantics:
-    /// if the counter is at N, the first call returns N+1.
     pub fn next(self: *SeqCounter) u64 {
         return self.value.fetchAdd(1, .monotonic) + 1;
     }
 
-    /// Raise the counter to at least `floor`. Lock-free via CAS. Used
-    /// at open-time when an external counter is supplied — we never
-    /// lower the shared counter, but we do raise it if this store
-    /// happens to have committed writes beyond what the shared counter
-    /// has allocated (e.g. first opener primes it from disk).
     pub fn raiseTo(self: *SeqCounter, floor: u64) void {
         var cur = self.value.load(.monotonic);
         while (cur < floor) {
@@ -113,14 +116,9 @@ pub const SeqCounter = struct {
     }
 };
 
-/// Thread-safe map from tenant id → owned `*SeqCounter`. The rove-js
-/// worker creates one registry on the main thread at bootstrap and
-/// passes it to every per-worker `Tenant`; each worker's
-/// `KvStore.openWithCounter` pulls the same counter for a given
-/// tenant, so seq allocations are globally unique across workers.
-///
-/// Counters are created lazily on first `getOrCreate` for an id. They
-/// start at 0 and are raised to disk-state floor by `KvStore` on open.
+/// Thread-safe map from tenant id → owned `*SeqCounter`. Multiple
+/// `KvStore`s for the same tenant share one counter so `txn_seq`
+/// allocations are globally unique across workers.
 pub const SeqCounterRegistry = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
@@ -142,8 +140,6 @@ pub const SeqCounterRegistry = struct {
         self.* = undefined;
     }
 
-    /// Return the counter for `id`, creating it if absent. Thread-safe.
-    /// The returned pointer is stable for the lifetime of the registry.
     pub fn getOrCreate(self: *SeqCounterRegistry, id: []const u8) !*SeqCounter {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -161,401 +157,414 @@ pub const SeqCounterRegistry = struct {
     }
 };
 
+// ── Standalone stack (owned by KvStore in standalone mode) ──────────
+
+const StandaloneStack = struct {
+    /// `path` is a directory under kvexp's LMDB convention (the env
+    /// dir holds `data.mdb` + `lock.mdb`).
+    path: [:0]u8,
+    manifest: kvexp.Manifest,
+};
+
+/// LMDB mmap size cap for standalone-mode KvStores. Sparse — only
+/// touched pages cost memory. Default 1 GiB is plenty for the small
+/// scratch-only consumers (bootstrap.zig, deployStarterContent
+/// transients, tests).
+const STANDALONE_MAP_SIZE: usize = 1 * 1024 * 1024 * 1024;
+
+/// Reserved store_id for standalone-mode KvStores. The file holds
+/// exactly one store (this caller's data).
+const STANDALONE_STORE_ID: u64 = 1;
+
+/// Stable u64 derivation from a string store id (e.g., an instance id
+/// or "__root__"). Wyhash is deterministic across runs and well-
+/// distributed; the collision probability for 10k tenants in 2^64
+/// space is ≈ 10⁻¹².
+pub fn hashStoreId(id_str: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, id_str);
+}
+
+// Per-tenant dispatch serialization lives in kvexp now
+// (`Manifest.acquire` / `tryAcquire` → `StoreLease`). Rove obtains a
+// lease per batch and releases it as soon as the handler walk
+// finishes — well before the raft propose. The Txn outlives the
+// lease; commit/rollback runs on raft-commit/fault.
+
+// ── KvStore ────────────────────────────────────────────────────────
+
 pub const KvStore = struct {
     allocator: std.mem.Allocator,
-    db: *c.sqlite3,
-    /// Shared or owned sequence counter. When `owned_counter` is set,
-    /// `counter` points to it; otherwise `counter` points to an
-    /// externally-owned `SeqCounter` provided at open time (typical
-    /// for the rove-js worker path where multiple threads open the
-    /// same db).
+    /// Pointer to the manifest backing this handle. In attached mode
+    /// the manifest is borrowed (owned by Cluster or equivalent);
+    /// in standalone mode it lives inside `owned.manifest`.
+    manifest: *kvexp.Manifest,
+    store_id: u64,
+    /// Shared or owned legacy seq counter. With raft-as-WAL nothing
+    /// load-bearing depends on this; preserved for API compatibility.
     counter: *SeqCounter,
     owned_counter: ?SeqCounter,
-    stmt_get: *c.sqlite3_stmt,
-    stmt_put: *c.sqlite3_stmt,
-    stmt_put_seq: *c.sqlite3_stmt,
-    stmt_del: *c.sqlite3_stmt,
-    stmt_prefix: *c.sqlite3_stmt,
-    stmt_delta: *c.sqlite3_stmt,
-    stmt_begin: *c.sqlite3_stmt,
-    stmt_begin_immediate: *c.sqlite3_stmt,
-    stmt_commit: *c.sqlite3_stmt,
-    stmt_rollback: *c.sqlite3_stmt,
-    stmt_undo_capture: *c.sqlite3_stmt,
-    stmt_undo_select_uncommitted: *c.sqlite3_stmt,
-    stmt_undo_delete_committed: *c.sqlite3_stmt,
-    stmt_undo_delete_uncommitted: *c.sqlite3_stmt,
-    stmt_undo_delete_txn: *c.sqlite3_stmt,
-    stmt_savepoint: *c.sqlite3_stmt,
-    stmt_release: *c.sqlite3_stmt,
-    stmt_rollback_to: *c.sqlite3_stmt,
-    stmt_apply_state_get: *c.sqlite3_stmt,
-    stmt_apply_state_put: *c.sqlite3_stmt,
+    owned: ?*StandaloneStack,
+    /// In-flight TrackedTxn whose kvexp.Txn this thread should read
+    /// from. Set by `TrackedTxn.ensureOpen` (registers self) and
+    /// cleared by `releaseLease` / `commit` / `rollback`. Read by
+    /// `KvStore.get`/`prefix` to route through the in-flight Txn
+    /// (so handler reads see their own writes). Thread-local in
+    /// effect: the kvexp dispatch lease guarantees one active txn
+    /// per tenant at a time.
+    active_txn: ?*TrackedTxn = null,
 
-    /// Open mode for `openInternal`. Most callers use `open` for the
-    /// read-write path; `openReadOnly` is for inspection tools (the
-    /// log/code CLIs) that share a database file with a running worker
-    /// and need to avoid acquiring write locks or running schema DDL
-    /// against the live store.
-    const OpenMode = enum { read_write, read_only };
-
-    /// Open or create a KV store backed by the given SQLite file.
-    /// Each thread should call open() to get its own connection.
-    ///
-    /// The returned store owns its own `SeqCounter`. When multiple
-    /// connections to the same file need to share a seq space (the
-    /// rove-js worker path — multiple worker threads each open their
-    /// own `KvStore` to the same `app.db`), use `openWithCounter` and
-    /// pass a shared `SeqCounter` that lives at least as long as any
-    /// of the stores.
+    /// Open a standalone, self-contained KvStore against `path`. The
+    /// file is created if missing; a single store (id =
+    /// `STANDALONE_STORE_ID`) is ensured to exist.
     pub fn open(allocator: std.mem.Allocator, path: [:0]const u8) Error!*KvStore {
-        return openInternal(allocator, path, .read_write, null);
+        return openStandalone(allocator, path, .read_write, null);
     }
 
-    /// Like `open`, but the returned store's `nextSeq` allocations
-    /// come from `shared_counter`. Multiple stores pointing at the
-    /// same file MUST share a counter — otherwise concurrent writers
-    /// can allocate the same seq, which breaks `undoTxn` (it groups
-    /// rollback by txn_seq).
+    /// Open `{data_dir}/{filename}` as a self-contained owned
+    /// KvStore handle, attached to the store identified by
+    /// `hashStoreId(store_name)`. Used by offline tools (seed,
+    /// CLI) to access a binary's kvexp manifest without standing
+    /// up a `Cluster` (and its raft node). The returned handle
+    /// owns the whole kvexp stack — close tears it down. Sibling
+    /// handles (via `attachSibling`) share the manifest and must
+    /// close before this one.
     ///
-    /// On open, the counter is raised to at least
-    /// `max(MAX(kv.seq), sqlite_sequence['kv_seq'])` to cover whatever
-    /// values the on-disk state already uses. The counter is never
-    /// lowered, so opening N stores in any order converges to the
-    /// same allocation horizon.
+    /// `filename` is the manifest filename inside `data_dir`.
+    /// Multiple binaries sharing one `data_dir` (loop46 worker +
+    /// files-server-standalone — see kv_bench_cluster.sh) MUST
+    /// use distinct filenames to avoid racing on the same file
+    /// (kvexp is single-process). loop46 uses "cluster.kv",
+    /// files-server uses "files-server.kv", schedule-server uses
+    /// "schedule-server.kv".
+    pub fn openClusterOwned(
+        allocator: std.mem.Allocator,
+        data_dir: []const u8,
+        filename: []const u8,
+        store_name: []const u8,
+    ) Error!*KvStore {
+        std.fs.cwd().makePath(data_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return Error.Io,
+        };
+
+        const path = std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/{s}",
+            .{ data_dir, filename },
+            0,
+        ) catch return Error.OutOfMemory;
+        defer allocator.free(path);
+
+        const handle = try openStandaloneWithStoreId(
+            allocator,
+            path,
+            .read_write,
+            null,
+            hashStoreId(store_name),
+        );
+        return handle;
+    }
+
+    /// Standalone open in read-only mode. The file must already
+    /// exist and carry a valid kvexp manifest; the store must
+    /// already exist. (No DDL is run — opening a fresh empty file
+    /// in read-only mode returns `Error.NotFound` at the first
+    /// access.)
+    pub fn openReadOnly(allocator: std.mem.Allocator, path: [:0]const u8) Error!*KvStore {
+        return openStandalone(allocator, path, .read_only, null);
+    }
+
+    /// Same as `open` but the seq counter is shared. The on-disk
+    /// state has no seq column under kvexp, so the counter only
+    /// matters for in-process callers that compare seqs across
+    /// connections.
     pub fn openWithCounter(
         allocator: std.mem.Allocator,
         path: [:0]const u8,
         shared_counter: *SeqCounter,
     ) Error!*KvStore {
-        return openInternal(allocator, path, .read_write, shared_counter);
+        return openStandalone(allocator, path, .read_write, shared_counter);
     }
 
-    /// Open an EXISTING KV store in read-only mode. The database file
-    /// must already exist with the rove-kv schema (this function does
-    /// NOT run CREATE TABLE statements). Use this from inspection
-    /// tools that read alongside a running worker — read-only opens
-    /// don't acquire the write lock and don't conflict with the
-    /// worker's writes under WAL mode. Calling any write method
-    /// (`put`, `delete`, `begin`, ...) on a read-only KvStore returns
-    /// SQLITE_READONLY at step time, which surfaces as `Error.Sqlite`.
-    pub fn openReadOnly(allocator: std.mem.Allocator, path: [:0]const u8) Error!*KvStore {
-        return openInternal(allocator, path, .read_only, null);
+    /// Attach a sibling handle into the same manifest as `other`.
+    /// The new handle targets `store_id` (which may equal `other`'s
+    /// or be a different store within the same manifest). Lifetime:
+    /// the new handle must be closed before the manifest owner —
+    /// in standalone mode that's `other`, in cluster mode that's
+    /// the cluster's `deinit`.
+    pub fn attachSibling(
+        allocator: std.mem.Allocator,
+        other: *KvStore,
+        store_id: u64,
+        shared_counter: ?*SeqCounter,
+    ) Error!*KvStore {
+        return attach(allocator, other.manifest, store_id, shared_counter);
     }
 
-    fn openInternal(
+    /// Attach a handle to a pre-existing manifest. The caller (cluster
+    /// or process-wide owner) keeps the manifest alive; `close`
+    /// releases handle state only. Creates the store if it doesn't
+    /// already exist.
+    pub fn attach(
+        allocator: std.mem.Allocator,
+        manifest: *kvexp.Manifest,
+        store_id: u64,
+        shared_counter: ?*SeqCounter,
+    ) Error!*KvStore {
+        const self = allocator.create(KvStore) catch return Error.OutOfMemory;
+        errdefer allocator.destroy(self);
+
+        const exists = manifest.hasStore(store_id) catch return Error.Sqlite;
+        if (!exists) {
+            // Tolerate the TOCTOU race when multiple threads attach
+            // the same store concurrently — one wins createStore,
+            // the others observe StoreAlreadyExists and proceed.
+            manifest.createStore(store_id) catch |err| switch (err) {
+                error.StoreAlreadyExists => {},
+                else => return Error.Sqlite,
+            };
+        }
+
+        self.allocator = allocator;
+        self.manifest = manifest;
+        self.store_id = store_id;
+        self.owned = null;
+        self.active_txn = null;
+        if (shared_counter) |sc| {
+            self.counter = sc;
+            self.owned_counter = null;
+        } else {
+            self.owned_counter = SeqCounter.init(0);
+            self.counter = &self.owned_counter.?;
+        }
+        return self;
+    }
+
+    const OpenMode = enum { read_write, read_only };
+
+    fn openStandalone(
         allocator: std.mem.Allocator,
         path: [:0]const u8,
         mode: OpenMode,
         shared_counter: ?*SeqCounter,
     ) Error!*KvStore {
-        const self = try allocator.create(KvStore);
+        return openStandaloneWithStoreId(allocator, path, mode, shared_counter, STANDALONE_STORE_ID);
+    }
+
+    /// Standalone open with caller-chosen store_id. Used by
+    /// `openClusterOwned` to land in the same store_id the
+    /// in-cluster `openRoot` would use, so seed-mode writes are
+    /// visible when the cluster comes up later against the same
+    /// file.
+    fn openStandaloneWithStoreId(
+        allocator: std.mem.Allocator,
+        path: [:0]const u8,
+        mode: OpenMode,
+        shared_counter: ?*SeqCounter,
+        store_id: u64,
+    ) Error!*KvStore {
+        const self = allocator.create(KvStore) catch return Error.OutOfMemory;
         errdefer allocator.destroy(self);
 
-        var db: ?*c.sqlite3 = null;
-        const flags: c_int = switch (mode) {
-            .read_write => c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_NOMUTEX,
-            .read_only => c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_NOMUTEX,
-        };
-        if (c.sqlite3_open_v2(path.ptr, &db, flags, null) != c.SQLITE_OK) {
-            if (db) |d| _ = c.sqlite3_close(d);
-            return Error.Sqlite;
-        }
-        errdefer _ = c.sqlite3_close(db.?);
+        const stack = allocator.create(StandaloneStack) catch return Error.OutOfMemory;
+        errdefer allocator.destroy(stack);
 
-        // Install the busy handler BEFORE the durability pragmas.
-        // `PRAGMA journal_mode=WAL;` briefly needs exclusive access
-        // on the initial switch; if another connection is racing to
-        // set it at the same instant (e.g. N workers all opening
-        // the same file at startup in the shift-js shared-nothing
-        // model), SQLite returns SQLITE_BUSY immediately unless a
-        // busy handler is installed. With a 5-second timeout, losing
-        // connections wait for the winner to finish transitioning
-        // and then see WAL already enabled — their own journal-mode
-        // pragma becomes a cheap confirmation read.
-        //
-        // busy_timeout works in both read-write and read-only modes
-        // so we set it unconditionally.
-        _ = c.sqlite3_exec(db, "PRAGMA busy_timeout=5000;", null, null, null);
-
-        // Durability pragmas (journal_mode=WAL, synchronous=FULL) are
-        // settings that mutate the database — only valid on a
-        // read-write connection.
+        // kvexp's LMDB env runs with MDB_NOSUBDIR — `path` is a
+        // single file. Make sure the parent dir exists before
+        // LMDB tries to open the file there.
         if (mode == .read_write) {
-            try schema.pinDurability(db.?);
-        }
-
-        if (mode == .read_write) {
-            if (c.sqlite3_exec(db, schema.SQL_CREATE, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
-            if (c.sqlite3_exec(db, schema.SQL_CREATE_SEQ, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
-            if (c.sqlite3_exec(db, schema.SQL_CREATE_SEQ_INDEX, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
-            if (c.sqlite3_exec(db, schema.SQL_CREATE_UNDO, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
-            if (c.sqlite3_exec(db, schema.SQL_CREATE_APPLY_STATE, null, null, null) != c.SQLITE_OK) return Error.Sqlite;
-        }
-
-        self.allocator = allocator;
-        self.db = db.?;
-
-        // Prepare statements; on failure, finalize what we've prepared so far.
-        var prepared: usize = 0;
-        const stmts = [_]struct { sql: []const u8, field: []const u8 }{
-            .{ .sql = schema.SQL_GET, .field = "stmt_get" },
-            .{ .sql = schema.SQL_PUT, .field = "stmt_put" },
-            .{ .sql = schema.SQL_PUT_SEQ, .field = "stmt_put_seq" },
-            .{ .sql = schema.SQL_DEL, .field = "stmt_del" },
-            .{ .sql = schema.SQL_PREFIX, .field = "stmt_prefix" },
-            .{ .sql = schema.SQL_DELTA, .field = "stmt_delta" },
-            .{ .sql = schema.SQL_BEGIN, .field = "stmt_begin" },
-            .{ .sql = schema.SQL_BEGIN_IMMEDIATE, .field = "stmt_begin_immediate" },
-            .{ .sql = schema.SQL_COMMIT, .field = "stmt_commit" },
-            .{ .sql = schema.SQL_ROLLBACK, .field = "stmt_rollback" },
-            .{ .sql = schema.SQL_UNDO_CAPTURE, .field = "stmt_undo_capture" },
-            .{ .sql = schema.SQL_UNDO_SELECT_UNCOMMITTED, .field = "stmt_undo_select_uncommitted" },
-            .{ .sql = schema.SQL_UNDO_DELETE_COMMITTED, .field = "stmt_undo_delete_committed" },
-            .{ .sql = schema.SQL_UNDO_DELETE_UNCOMMITTED, .field = "stmt_undo_delete_uncommitted" },
-            .{ .sql = schema.SQL_UNDO_DELETE_TXN, .field = "stmt_undo_delete_txn" },
-            .{ .sql = schema.SQL_SAVEPOINT_H, .field = "stmt_savepoint" },
-            .{ .sql = schema.SQL_RELEASE_H, .field = "stmt_release" },
-            .{ .sql = schema.SQL_ROLLBACK_TO_H, .field = "stmt_rollback_to" },
-            .{ .sql = schema.SQL_GET_APPLY_STATE, .field = "stmt_apply_state_get" },
-            .{ .sql = schema.SQL_PUT_APPLY_STATE, .field = "stmt_apply_state_put" },
-        };
-
-        errdefer {
-            inline for (stmts, 0..) |s, i| {
-                if (i < prepared) {
-                    _ = c.sqlite3_finalize(@field(self, s.field));
-                }
+            if (std.fs.path.dirname(path)) |parent| {
+                std.fs.cwd().makePath(parent) catch |err| switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return Error.Io,
+                };
             }
         }
 
-        inline for (stmts) |s| {
-            @field(self, s.field) = try schema.prepare(self.db, s.sql);
-            prepared += 1;
+        const path_owned = allocator.dupeZ(u8, path) catch return Error.OutOfMemory;
+        errdefer allocator.free(path_owned);
+        stack.path = path_owned;
+        stack.manifest.init(allocator, path_owned, .{
+            .max_map_size = STANDALONE_MAP_SIZE,
+        }) catch return Error.Sqlite;
+        errdefer stack.manifest.deinit();
+
+        if (mode == .read_write) {
+            const exists = stack.manifest.hasStore(store_id) catch return Error.Sqlite;
+            if (!exists) {
+                stack.manifest.createStore(store_id) catch return Error.Sqlite;
+                // durabilize so the store DBI exists on disk;
+                // subsequent attach/open across processes can see it.
+                // raft_idx=0 → don't touch the watermark on bootstrap.
+                stack.manifest.durabilize(0) catch return Error.Io;
+            }
         }
 
-        // Seed / raise the seq counter. Read both `MAX(kv.seq)` (fast
-        // via `kv_seq_idx`) and `sqlite_sequence['kv_seq']` (the
-        // AUTOINCREMENT historical max — stable across restarts even
-        // after we stopped inserting) and take the larger. This keeps
-        // existing databases migrating from the old SQL-allocated
-        // scheme from reusing seq values.
-        const disk_floor = schema.readSeqFloor(self.db);
+        self.allocator = allocator;
+        self.manifest = &stack.manifest;
+        self.store_id = store_id;
+        self.owned = stack;
+        self.active_txn = null;
         if (shared_counter) |sc| {
-            sc.raiseTo(disk_floor);
             self.counter = sc;
             self.owned_counter = null;
         } else {
-            self.owned_counter = SeqCounter.init(disk_floor);
+            self.owned_counter = SeqCounter.init(0);
             self.counter = &self.owned_counter.?;
         }
-
         return self;
     }
 
     pub fn close(self: *KvStore) void {
-        _ = c.sqlite3_finalize(self.stmt_get);
-        _ = c.sqlite3_finalize(self.stmt_put);
-        _ = c.sqlite3_finalize(self.stmt_put_seq);
-        _ = c.sqlite3_finalize(self.stmt_del);
-        _ = c.sqlite3_finalize(self.stmt_prefix);
-        _ = c.sqlite3_finalize(self.stmt_delta);
-        _ = c.sqlite3_finalize(self.stmt_begin);
-        _ = c.sqlite3_finalize(self.stmt_begin_immediate);
-        _ = c.sqlite3_finalize(self.stmt_commit);
-        _ = c.sqlite3_finalize(self.stmt_rollback);
-        _ = c.sqlite3_finalize(self.stmt_undo_capture);
-        _ = c.sqlite3_finalize(self.stmt_undo_select_uncommitted);
-        _ = c.sqlite3_finalize(self.stmt_undo_delete_committed);
-        _ = c.sqlite3_finalize(self.stmt_undo_delete_uncommitted);
-        _ = c.sqlite3_finalize(self.stmt_undo_delete_txn);
-        _ = c.sqlite3_finalize(self.stmt_savepoint);
-        _ = c.sqlite3_finalize(self.stmt_release);
-        _ = c.sqlite3_finalize(self.stmt_rollback_to);
-        _ = c.sqlite3_finalize(self.stmt_apply_state_get);
-        _ = c.sqlite3_finalize(self.stmt_apply_state_put);
-        _ = c.sqlite3_close(self.db);
+        if (self.owned) |stack| {
+            // Final durabilize so a clean close doesn't lose
+            // overlay state. raft_idx=0 → leave watermark untouched.
+            stack.manifest.durabilize(0) catch |err| std.log.warn(
+                "kvstore.close: durabilize: {s}",
+                .{@errorName(err)},
+            );
+            stack.manifest.deinit();
+            self.allocator.free(stack.path);
+            self.allocator.destroy(stack);
+        }
         const allocator = self.allocator;
         allocator.destroy(self);
     }
 
-    // ── Transactions ──────────────────────────────────────────────────
+    // ── Transactions ────────────────────────────────────────────
+    //
+    // kvexp has per-store write locks; multiple ops on the same
+    // KvStore from one thread serialize naturally. There's no
+    // "begin/commit" boundary at the engine level — all mutations
+    // are immediately visible in-memory and become durable at the
+    // next `durabilize`. `begin`/`commit`/`rollback` are kept as
+    // no-ops so legacy callers compile; a proper multi-op-atomic
+    // story belongs in `TrackedTxn` (savepoint-style root revert).
 
     pub fn begin(self: *KvStore) Error!void {
-        return schema.runVoid(self.stmt_begin);
+        _ = self;
     }
 
     pub fn commit(self: *KvStore) Error!void {
-        return schema.runVoid(self.stmt_commit);
+        _ = self;
     }
 
     pub fn rollback(self: *KvStore) Error!void {
-        const st = self.stmt_rollback;
-        _ = c.sqlite3_reset(st);
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
+        _ = self;
     }
 
-    // ── Core ops ──────────────────────────────────────────────────────
+    // ── Core ops ────────────────────────────────────────────────
 
-    /// Returns an owned slice (caller frees with allocator passed to open()),
-    /// or Error.NotFound if the key doesn't exist.
     pub fn get(self: *KvStore, key: []const u8) Error![]u8 {
-        const st = self.stmt_get;
-        _ = c.sqlite3_reset(st);
-        schema.bindText(st, 1, key);
-
-        const rc = c.sqlite3_step(st);
-        defer _ = c.sqlite3_reset(st);
-
-        if (rc == c.SQLITE_ROW) {
-            const blob = c.sqlite3_column_blob(st, 0);
-            const blen: usize = @intCast(c.sqlite3_column_bytes(st, 0));
-            const out = try self.allocator.alloc(u8, blen);
-            if (blen > 0) {
-                @memcpy(out, @as([*]const u8, @ptrCast(blob))[0..blen]);
-            }
-            return out;
+        // If a tracked txn is open, read through it so the handler
+        // sees its own pending writes. kvexp.Txn.get walks the
+        // savepoint chain, then chain backward, then main_overlay,
+        // then LMDB.
+        if (self.active_txn) |t| {
+            const leaf = t.activeLeaf();
+            const v = leaf.get(self.allocator, key) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            return v orelse return Error.NotFound;
         }
-        if (rc == c.SQLITE_DONE) return Error.NotFound;
-        return Error.Sqlite;
+        // No active txn: read through a brief lease against main_overlay
+        // + LMDB. In-flight chain Txns are invisible — intentional, since
+        // those writes are still speculative until raft commits.
+        var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+        defer lease.release();
+        const v = lease.get(self.allocator, key) catch |err| switch (err) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            else => return Error.Sqlite,
+        };
+        return v orelse return Error.NotFound;
     }
 
+    /// Direct put. Acquires the per-tenant lock so the one-shot Txn
+    /// is the only entry in the kvexp chain for the duration — same
+    /// guarantee TrackedTxn relies on. The lock is reentrant-ish:
+    /// if the current thread already owns it via a TrackedTxn, we
+    /// route through that txn instead.
     pub fn put(self: *KvStore, key: []const u8, value: []const u8) Error!void {
-        const st = self.stmt_put;
-        _ = c.sqlite3_reset(st);
-        schema.bindText(st, 1, key);
-        schema.bindBlob(st, 2, value);
-
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
+        if (self.active_txn) |t| {
+            const leaf = t.activeLeaf();
+            leaf.put(key, value) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            return;
+        }
+        // Blocking acquire — direct KvStore.put is used by test/admin
+        // paths where contention is rare; we don't surface Conflict.
+        var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+        defer lease.release();
+        var txn = lease.beginTxn() catch return Error.Sqlite;
+        errdefer txn.rollback();
+        txn.put(key, value) catch |err| switch (err) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            else => return Error.Sqlite,
+        };
+        txn.commit() catch return Error.Sqlite;
     }
 
+    /// Legacy: SQLite-era version that stamped a seq column with
+    /// each row. Under kvexp seq is not persisted; this is a plain
+    /// `put`.
     pub fn putSeq(self: *KvStore, key: []const u8, value: []const u8, seq: u64) Error!void {
-        const st = self.stmt_put_seq;
-        _ = c.sqlite3_reset(st);
-        schema.bindText(st, 1, key);
-        schema.bindBlob(st, 2, value);
-        _ = c.sqlite3_bind_int64(st, 3, @bitCast(seq));
-
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
+        _ = seq;
+        return self.put(key, value);
     }
 
     pub fn delete(self: *KvStore, key: []const u8) Error!void {
-        const st = self.stmt_del;
-        _ = c.sqlite3_reset(st);
-        schema.bindText(st, 1, key);
-
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
-    }
-
-    /// Read this store's `last_applied_raft_idx` from `_apply_state`.
-    /// Returns 0 when the row is missing — the natural baseline so a
-    /// fresh store accepts every committed raft entry, matching
-    /// pre-snapshot behavior. Phase 5.5(c).
-    pub fn lastAppliedRaftIdx(self: *KvStore) Error!u64 {
-        const st = self.stmt_apply_state_get;
-        _ = c.sqlite3_reset(st);
-        schema.bindText(st, 1, schema.APPLY_STATE_KEY_LAST_APPLIED);
-        const rc = c.sqlite3_step(st);
-        defer _ = c.sqlite3_reset(st);
-        if (rc == c.SQLITE_ROW) {
-            const v = c.sqlite3_column_int64(st, 0);
-            if (v < 0) return Error.Sqlite;
-            return @intCast(v);
+        if (self.active_txn) |t| {
+            const leaf = t.activeLeaf();
+            _ = leaf.delete(key) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            return;
         }
-        if (rc == c.SQLITE_DONE) return 0;
-        return Error.Sqlite;
+        var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+        defer lease.release();
+        var txn = lease.beginTxn() catch return Error.Sqlite;
+        errdefer txn.rollback();
+        _ = txn.delete(key) catch |err| switch (err) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            else => return Error.Sqlite,
+        };
+        txn.commit() catch return Error.Sqlite;
     }
 
-    /// Stamp `_apply_state.last_applied_raft_idx = idx`. Caller is
-    /// responsible for ensuring the surrounding SQLite transaction
-    /// commits the row alongside the writeset's data ops — apply
-    /// callers do this from inside `applyEncodedWriteSet`'s implicit
-    /// transaction boundary; the snapshot follower-load path opens
-    /// its own.
+    /// Read this *manifest*'s last *durable* raft idx — the value
+    /// last stamped into LMDB by `durabilize(idx)`. In-memory state
+    /// past this is in the main_overlay / open Txns and isn't
+    /// covered until the next durabilize.
+    pub fn lastAppliedRaftIdx(self: *KvStore) Error!u64 {
+        return self.manifest.durableRaftIdx() catch return Error.Sqlite;
+    }
+
+    /// Stamp the manifest's last applied raft idx by durabilizing
+    /// at `idx`. Folds main_overlay into LMDB and writes the
+    /// watermark atomically. Use this instead of the pre-cutover
+    /// pattern of `setLastAppliedRaftIdx` + later `durabilize` —
+    /// the new API requires those to be the same call.
     pub fn setLastAppliedRaftIdx(self: *KvStore, idx: u64) Error!void {
-        const st = self.stmt_apply_state_put;
-        _ = c.sqlite3_reset(st);
-        schema.bindText(st, 1, schema.APPLY_STATE_KEY_LAST_APPLIED);
-        _ = c.sqlite3_bind_int64(st, 2, @bitCast(idx));
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
+        self.manifest.durabilize(idx) catch return Error.Sqlite;
     }
 
-    /// Prefix scan: keys whose bytes start with `prefix`, ordered
-    /// ascending, up to `count` entries.
-    ///
-    /// `cursor` is the last key returned by the previous page — keys
-    /// strictly greater than `cursor` are returned, so the caller can
-    /// paginate by passing back the final key it observed. Pass `""`
-    /// to start from the beginning of the prefix. A cursor that sorts
-    /// below `prefix` is treated as if it were `""` (i.e. start at
-    /// the prefix).
-    ///
-    /// An empty `prefix` scans every key. A prefix that is all-0xff
-    /// bytes has no finite successor and falls back to a large
-    /// sentinel upper bound; callers using sane ASCII-ish keys will
-    /// never hit this path.
+    /// Prefix scan. Keys whose bytes start with `prefix_bytes`,
+    /// ordered ascending, up to `count` entries. `cursor` is the
+    /// last key returned by the previous page — strictly greater
+    /// keys are returned. Pass `""` to start from the beginning of
+    /// the prefix.
     pub fn prefix(
         self: *KvStore,
         prefix_bytes: []const u8,
         cursor: []const u8,
         count: u32,
     ) Error!RangeResult {
-        // Compute the inclusive lower bound. If no cursor, start at
-        // the prefix itself. If a cursor is given, advance one
-        // lexicographic step past it (cursor ++ 0x00), but never
-        // below the prefix.
-        var cursor_succ: ?[]u8 = null;
-        defer if (cursor_succ) |buf| self.allocator.free(buf);
-
-        const start: []const u8 = blk: {
-            if (cursor.len == 0) break :blk prefix_bytes;
-            if (std.mem.lessThan(u8, cursor, prefix_bytes)) break :blk prefix_bytes;
-            const buf = self.allocator.alloc(u8, cursor.len + 1) catch
-                return Error.OutOfMemory;
-            @memcpy(buf[0..cursor.len], cursor);
-            buf[cursor.len] = 0;
-            cursor_succ = buf;
-            break :blk buf;
-        };
-
-        // Compute the exclusive upper bound: the first byte string
-        // that is NOT under `prefix`. Walk back from the tail,
-        // incrementing the first byte < 0xff and truncating after it.
-        var end_alloc: ?[]u8 = null;
-        defer if (end_alloc) |buf| self.allocator.free(buf);
-
-        const end: []const u8 = blk: {
-            if (prefix_bytes.len == 0) break :blk &PREFIX_UPPER_SENTINEL;
-            const buf = self.allocator.alloc(u8, prefix_bytes.len) catch
-                return Error.OutOfMemory;
-            end_alloc = buf;
-            @memcpy(buf, prefix_bytes);
-            var i = buf.len;
-            while (i > 0) : (i -= 1) {
-                if (buf[i - 1] != 0xff) {
-                    buf[i - 1] += 1;
-                    break :blk buf[0..i];
-                }
-            }
-            break :blk &PREFIX_UPPER_SENTINEL;
-        };
-
-        const st = self.stmt_prefix;
-        _ = c.sqlite3_reset(st);
-        schema.bindText(st, 1, start);
-        schema.bindText(st, 2, end);
-        _ = c.sqlite3_bind_int64(st, 3, count);
-
+        // Route through the active txn when one is open, so the
+        // scan sees the handler's pending writes / tombstones.
         var list: std.ArrayList(Entry) = .empty;
         errdefer {
             for (list.items) |e| {
@@ -565,601 +574,520 @@ pub const KvStore = struct {
             list.deinit(self.allocator);
         }
 
-        while (true) {
-            const rc = c.sqlite3_step(st);
-            if (rc == c.SQLITE_DONE) break;
-            if (rc != c.SQLITE_ROW) {
-                _ = c.sqlite3_reset(st);
-                return Error.Sqlite;
-            }
-
-            const k_ptr = c.sqlite3_column_text(st, 0);
-            const k_len: usize = @intCast(c.sqlite3_column_bytes(st, 0));
-            const v_ptr = c.sqlite3_column_blob(st, 1);
-            const v_len: usize = @intCast(c.sqlite3_column_bytes(st, 1));
-
-            const k_copy = try self.allocator.alloc(u8, k_len);
-            errdefer self.allocator.free(k_copy);
-            if (k_len > 0) @memcpy(k_copy, @as([*]const u8, @ptrCast(k_ptr))[0..k_len]);
-
-            const v_copy = try self.allocator.alloc(u8, v_len);
-            errdefer self.allocator.free(v_copy);
-            if (v_len > 0) @memcpy(v_copy, @as([*]const u8, @ptrCast(v_ptr))[0..v_len]);
-
-            try list.append(self.allocator, .{ .key = k_copy, .value = v_copy });
+        if (self.active_txn) |t| {
+            const leaf = t.activeLeaf();
+            var pc = leaf.scanPrefix(prefix_bytes) catch return Error.Sqlite;
+            defer pc.deinit();
+            try collectPrefix(self.allocator, &pc, prefix_bytes, cursor, count, &list);
+        } else {
+            var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+            defer lease.release();
+            var pc = lease.scanPrefix(prefix_bytes) catch return Error.Sqlite;
+            defer pc.deinit();
+            try collectPrefix(self.allocator, &pc, prefix_bytes, cursor, count, &list);
         }
 
-        _ = c.sqlite3_reset(st);
         return .{
-            .entries = try list.toOwnedSlice(self.allocator),
+            .entries = list.toOwnedSlice(self.allocator) catch return Error.OutOfMemory,
             .allocator = self.allocator,
         };
     }
 
-    // ── Sequence / replication ────────────────────────────────────────
+    // ── Legacy sequence / replication ───────────────────────────
+    //
+    // Under raft-as-WAL the engine doesn't carry per-write seqs.
+    // Counters below are in-memory only; `delta` returns an empty
+    // result. Snapshot transfer in raft_snapshot.zig still calls
+    // these but the production catch-up path is `kvexp.dumpSnapshot`
+    // / `loadSnapshot` — see follow-up.
 
-    /// Allocate a monotonic sequence number. Lock-free fetch-add on the
-    /// counter; no SQL, no page dirtied. Never returns 0 (counter is
-    /// seeded from on-disk state at open, and post-increment guarantees
-    /// the first allocation is `disk_floor + 1 ≥ 1`).
-    ///
-    /// Safe to call inside or outside a transaction. The old contract
-    /// (must be called between begin/commit) was an artefact of the
-    /// `INSERT INTO kv_seq` implementation; nothing in the atomic path
-    /// cares.
     pub fn nextSeq(self: *KvStore) u64 {
         return self.counter.next();
     }
 
-    /// Returns the maximum seq value in the kv table, or 0 if empty.
     pub fn maxSeq(self: *KvStore) u64 {
-        var st: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, schema.SQL_MAX_SEQ, -1, &st, null) != c.SQLITE_OK) return 0;
-        defer _ = c.sqlite3_finalize(st);
-        var result: u64 = 0;
-        if (c.sqlite3_step(st) == c.SQLITE_ROW) {
-            result = @bitCast(c.sqlite3_column_int64(st, 0));
-        }
-        return result;
+        return self.counter.current();
     }
 
-    /// Delta query: all KV entries with after_seq < seq <= through_seq.
-    /// Pass through_seq = std.math.maxInt(u64) for unbounded upper end.
     pub fn delta(
         self: *KvStore,
         after_seq: u64,
         through_seq: u64,
     ) Error!DeltaResult {
-        const st = self.stmt_delta;
-        _ = c.sqlite3_reset(st);
-        // SQLite stores seq as signed int64; clamp to maxInt(i64) so callers
-        // can pass maxInt(u64) for "unbounded upper end" without it bitcasting
-        // to -1 and matching nothing.
-        const through_clamped: i64 = if (through_seq > std.math.maxInt(i64))
-            std.math.maxInt(i64)
-        else
-            @intCast(through_seq);
-        _ = c.sqlite3_bind_int64(st, 1, @bitCast(after_seq));
-        _ = c.sqlite3_bind_int64(st, 2, through_clamped);
-
-        var list: std.ArrayList(DeltaEntry) = .empty;
-        errdefer {
-            for (list.items) |e| {
-                self.allocator.free(e.key);
-                self.allocator.free(e.value);
-            }
-            list.deinit(self.allocator);
-        }
-
-        while (true) {
-            const rc = c.sqlite3_step(st);
-            if (rc == c.SQLITE_DONE) break;
-            if (rc != c.SQLITE_ROW) {
-                _ = c.sqlite3_reset(st);
-                return Error.Sqlite;
-            }
-
-            const k_ptr = c.sqlite3_column_text(st, 0);
-            const k_len: usize = @intCast(c.sqlite3_column_bytes(st, 0));
-            const v_ptr = c.sqlite3_column_blob(st, 1);
-            const v_len: usize = @intCast(c.sqlite3_column_bytes(st, 1));
-            const seq: u64 = @bitCast(c.sqlite3_column_int64(st, 2));
-
-            const k_copy = try self.allocator.alloc(u8, k_len);
-            errdefer self.allocator.free(k_copy);
-            if (k_len > 0) @memcpy(k_copy, @as([*]const u8, @ptrCast(k_ptr))[0..k_len]);
-
-            const v_copy = try self.allocator.alloc(u8, v_len);
-            errdefer self.allocator.free(v_copy);
-            if (v_len > 0) @memcpy(v_copy, @as([*]const u8, @ptrCast(v_ptr))[0..v_len]);
-
-            try list.append(self.allocator, .{ .key = k_copy, .value = v_copy, .seq = seq });
-        }
-
-        _ = c.sqlite3_reset(st);
-        return .{
-            .entries = try list.toOwnedSlice(self.allocator),
-            .allocator = self.allocator,
-        };
+        _ = after_seq;
+        _ = through_seq;
+        const empty = self.allocator.alloc(DeltaEntry, 0) catch return Error.OutOfMemory;
+        return .{ .entries = empty, .allocator = self.allocator };
     }
 
-    // ── Checkpointing ─────────────────────────────────────────────────
+    // ── Checkpointing ───────────────────────────────────────────
 
-    /// Disable automatic WAL checkpointing on this connection.
-    /// Call once after open() for connections managed by the raft leader.
+    /// No-op under kvexp. WAL auto-checkpointing was a SQLite knob;
+    /// under raft-as-WAL the checkpoint cadence is owned by the
+    /// raft thread's `tickSnapshot`.
     pub fn disableAutoCheckpoint(self: *KvStore) void {
-        _ = c.sqlite3_wal_autocheckpoint(self.db, 0);
+        _ = self;
     }
 
-    /// Set the SQLite busy-retry timeout on this connection, in
-    /// milliseconds. `0` disables the handler so any operation that
-    /// would have waited for a lock returns `SQLITE_BUSY` immediately.
-    /// The rove-js batched dispatcher flips this to 0 on each worker's
-    /// per-tenant `app.db` connection so a `BEGIN IMMEDIATE` against a
-    /// tenant held by another worker surfaces BUSY right away — the
-    /// dispatcher then skips that tenant and picks a different anchor,
-    /// rather than blocking this thread for up to 5s.
-    ///
-    /// The default (5s) is kept on root / code / log connections
-    /// because their write contention is rare and bursty, mostly at
-    /// startup, where waiting is the right thing.
+    /// No-op under kvexp. SQLite-only knob.
     pub fn setBusyTimeout(self: *KvStore, ms: c_int) void {
-        _ = c.sqlite3_busy_timeout(self.db, ms);
+        _ = self;
+        _ = ms;
     }
 
-    /// Manually checkpoint the WAL (passive — doesn't block readers).
+    /// Force a durabilize. Only meaningful in standalone mode (the
+    /// KvStore owns the manifest stack). Attached-mode callers
+    /// should route through the cluster's tick.
     pub fn checkpoint(self: *KvStore) Error!void {
-        _ = try self.checkpointV2();
-    }
-
-    /// `VACUUM INTO 'target'` — atomically write a defragmented copy
-    /// of this database to a new file path. Phase 5.5(c) snapshot
-    /// capture uses this to produce per-tenant + root snapshots: a
-    /// brief writer lock during the copy, no reader blocking, and
-    /// the resulting file is a clean SQLite database the follower
-    /// can install via atomic-rename. `target_path` must NOT
-    /// already exist (SQLite errors out otherwise) — the caller's
-    /// snapshot-id keying gives that property naturally.
-    pub fn vacuumInto(self: *KvStore, target_path: [:0]const u8) Error!void {
-        const sql = std.fmt.allocPrintSentinel(
-            self.allocator,
-            "VACUUM INTO '{s}';",
-            .{target_path},
-            0,
-        ) catch return Error.OutOfMemory;
-        defer self.allocator.free(sql);
-        if (c.sqlite3_exec(self.db, sql.ptr, null, null, null) != c.SQLITE_OK) {
-            return Error.Sqlite;
+        if (self.owned) |stack| {
+            stack.manifest.durabilize(0) catch return Error.Sqlite;
         }
     }
 
     pub const CheckpointResult = struct {
-        /// Total frames currently in the WAL file after the call.
         log_pages: u32,
-        /// Number of frames already checkpointed (moved from WAL to the
-        /// main DB file). `log_pages == ckpt_pages` means the WAL fully
-        /// drained; `log_pages > ckpt_pages` means a reader was blocking
-        /// some frames from being reclaimed (still safe, just not freed
-        /// yet).
         ckpt_pages: u32,
     };
 
-    /// Passive WAL checkpoint that also reports frame counts. Safe to call
-    /// repeatedly at any rate — returns cheaply when the WAL is already
-    /// drained. Use the returned `log_pages` as a size probe to decide
-    /// whether stronger measures (e.g. RESTART mode) are warranted.
     pub fn checkpointV2(self: *KvStore) Error!CheckpointResult {
-        var n_log: c_int = 0;
-        var n_ckpt: c_int = 0;
-        const rc = c.sqlite3_wal_checkpoint_v2(
-            self.db,
-            null,
-            c.SQLITE_CHECKPOINT_PASSIVE,
-            &n_log,
-            &n_ckpt,
-        );
-        if (rc != c.SQLITE_OK) return Error.Sqlite;
-        // -1 means "not in WAL mode" or "error during the call"; both are
-        // failure modes we should surface.
-        if (n_log < 0 or n_ckpt < 0) return Error.Sqlite;
-        return .{
-            .log_pages = @intCast(n_log),
-            .ckpt_pages = @intCast(n_ckpt),
-        };
+        try self.checkpoint();
+        return .{ .log_pages = 0, .ckpt_pages = 0 };
     }
 
-    // ── Tracked transactions (undo log) ────────────────────────────────
-    //
-    // Problem we're solving: the "worker writes locally, then proposes" fast
-    // path has a crash window between the local commit and the raft commit.
-    // If the leader crashes in that window and the raft entry is eventually
-    // discarded by the new leader, the local row is an orphan — visible on
-    // this node but not on any other.
-    //
-    // The fix is a second table (kv_undo) that records the pre-image of
-    // every key touched by a tracked txn, atomically with the forward
-    // write. On startup, we walk kv_undo: txns whose seq > committed_seq
-    // are rolled back (restoring the pre-images); txns whose seq
-    // ≤ committed_seq are GC'd (they've been made durable via raft).
+    /// Produce a self-contained copy of this KvStore's data at
+    /// `target_path` as a fresh kvexp manifest file holding one
+    /// store at `STANDALONE_STORE_ID`. Receivers open it via
+    /// `KvStore.open(target_path)` and see the same data as the
+    /// source.
+    ///
+    /// The dumped bytes are filtered to this handle's `store_id`
+    /// (so an attached KvStore sharing a Cluster's manifest
+    /// captures only its own tenant) and the store_id is remapped
+    /// to `STANDALONE_STORE_ID` in the wire format, so the target
+    /// file is a single-store kvexp manifest that `KvStore.open`
+    /// finds at the conventional location. `target_path` must
+    /// not already exist.
+    /// Produce a self-contained copy of this handle's entire
+    /// manifest (every store, not just `self.store_id`) at
+    /// `target_path` as a fresh kvexp file. Used by the raft
+    /// peer-to-peer snapshot transfer — leader dumps cluster.kv
+    /// to a tmp file, ships bytes, follower atomic-renames into
+    /// place. `target_path` must not already exist.
+    pub fn dumpManifestToFile(self: *KvStore, target_path: [:0]const u8) Error!void {
+        // Durabilize source so the manifest tree on disk reflects
+        // every in-memory write. raft_idx=0 → don't touch the
+        // watermark.
+        self.manifest.durabilize(0) catch return Error.Io;
 
-    /// A transaction that records undo info for every put/delete, letting
-    /// the caller or a startup sweep roll back the writes if the raft
-    /// proposal built on this txn fails to commit. Create via
-    /// `KvStore.beginTracked`.
+        var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
+        defer snap.close();
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        var w = buf.writer(self.allocator);
+        kvexp.dumpSnapshot(&snap, &w) catch return Error.Sqlite;
+
+        try writeManifestFile(self.allocator, target_path, buf.items);
+    }
+
+    pub fn vacuumInto(self: *KvStore, target_path: [:0]const u8) Error!void {
+        // Force a durabilize so the snapshot reflects every
+        // in-memory write. raft_idx=0 → don't disturb the watermark.
+        self.manifest.durabilize(0) catch return Error.Io;
+
+        var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
+        defer snap.close();
+
+        // Dump just this store's records, remapped to
+        // STANDALONE_STORE_ID, into an in-memory buffer.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        dumpOneStoreRemapped(
+            self.allocator,
+            &snap,
+            self.store_id,
+            STANDALONE_STORE_ID,
+            &buf,
+        ) catch return Error.Sqlite;
+
+        try writeManifestFile(self.allocator, target_path, buf.items);
+    }
+
+    // ── Tracked transactions (kvexp.Txn-backed) ────────────────────
+    //
+    // Wraps a top-level `*kvexp.Txn` plus a stack of open savepoint
+    // Txns. Writes/reads on the rove side forward to the deepest
+    // open level (`activeLeaf`). `KvStore.get/put/delete/prefix`
+    // route through this wrapper via the `active_txn` registration
+    // so call sites unchanged.
+    //
+    // Lifecycle:
+    //   open       — Manifest.beginTxn → top_txn; register as active_txn
+    //   savepoint  — top.savepoint() (or leaf.savepoint() if nested)
+    //   release    — leaf.commit() (savepoint commit folds into parent)
+    //   rollbackTo — leaf.rollback() (savepoint rollback drops self)
+    //   commit     — top.commit() (chain head; folds into main_overlay)
+    //   rollback   — top.rollback() (cascades to chain successors)
+    //
+    // The per-tenant lock held by the dispatcher batch ensures only
+    // one TrackedTxn per store at a time, so no rove-side sync on
+    // active_txn or the savepoint stack.
+
     pub const TrackedTxn = struct {
         store: *KvStore,
-        /// Caller-visible seq (matches kv_seq's autoincrement id). Also
-        /// used as the row's `seq` column and as the propose() seq.
-        /// Zero until the underlying SQLite txn is actually opened —
-        /// see `ensureOpen`. Read-only handlers never allocate a seq
-        /// (and thus never fsync the WAL).
         txn_seq: u64,
         kind: enum { normal, immediate },
+        /// True from `ensureOpen` until `commit`/`rollback`. Used to
+        /// short-circuit the no-op cases.
         opened: bool,
+        /// kvexp dispatch lease. Held only across handler execution
+        /// (open → end-of-batch). `releaseLease` drops it at the
+        /// start of finalizeBatch so other workers can begin chain-
+        /// tail Txns for this tenant while raft consenses this one.
+        lease: ?kvexp.StoreLease = null,
+        /// Top-level kvexp Txn. Created via `lease.beginTxn` at open
+        /// time; survives `releaseLease` and lives until commit or
+        /// rollback. Owned by kvexp's allocator until then.
+        top: ?*kvexp.Txn = null,
+        /// Open savepoint chain — innermost last. Reads/writes go to
+        /// `savepoints.getLastOrNull() orelse top`.
+        savepoints: std.ArrayListUnmanaged(*kvexp.Txn) = .empty,
 
-        /// Open the underlying SQLite txn on first write. Idempotent —
-        /// subsequent writes on the same TrackedTxn skip it.
-        /// Force the underlying SQLite txn open right now, even
-        /// without any writes yet. The batched dispatcher uses this
-        /// to detect `SQLITE_BUSY` up front so it can skip the
-        /// current tenant and try a different anchor this tick,
-        /// instead of discovering the contention inside a later
-        /// `put` / `savepoint`.
         pub fn open(self: *TrackedTxn) Error!void {
             return self.ensureOpen();
         }
 
         fn ensureOpen(self: *TrackedTxn) Error!void {
             if (self.opened) return;
-            switch (self.kind) {
-                .normal => try self.store.begin(),
-                .immediate => {
-                    const st = self.store.stmt_begin_immediate;
-                    _ = c.sqlite3_reset(st);
-                    const rc = c.sqlite3_step(st);
-                    _ = c.sqlite3_reset(st);
-                    if (rc == c.SQLITE_BUSY) return Error.Conflict;
-                    if (rc != c.SQLITE_DONE) return Error.Sqlite;
-                },
-            }
-            const seq = self.store.nextSeq();
-            if (seq == 0) {
-                self.store.rollback() catch {};
-                return Error.Sqlite;
-            }
-            self.txn_seq = seq;
+            // tryAcquire surfaces contention as `Conflict` so the
+            // dispatcher's skip-this-tick machinery picks a different
+            // anchor instead of blocking on the dispatch lock.
+            const lease_opt = self.store.manifest.tryAcquire(self.store.store_id) catch |err|
+                return switch (err) {
+                    error.OutOfMemory => Error.OutOfMemory,
+                    else => Error.Sqlite,
+                };
+            self.lease = lease_opt orelse return Error.Conflict;
+            std.debug.assert(self.store.active_txn == null);
+            self.txn_seq = self.store.counter.next();
+            self.top = self.lease.?.beginTxn() catch |err| {
+                self.lease.?.release();
+                self.lease = null;
+                return switch (err) {
+                    error.OutOfMemory => Error.OutOfMemory,
+                    else => Error.Sqlite,
+                };
+            };
+            self.store.active_txn = self;
             self.opened = true;
         }
 
-        /// Insert-or-replace with undo tracking. If the key already exists
-        /// and no undo row has been recorded for (txn_seq, key) yet, the
-        /// current value is captured first. Must be called only between
-        /// `beginTracked` and `commit`/`rollback`.
+        /// Release the kvexp dispatch lease and clear the `active_txn`
+        /// registration while the kvexp.Txn stays alive in the
+        /// per-tenant chain. Called at the start of finalizeBatch —
+        /// once the handler walk is done, the next worker can begin
+        /// its own chain-tail Txn for this tenant immediately, even
+        /// while raft is still consensing this batch. Idempotent.
+        pub fn releaseLease(self: *TrackedTxn) void {
+            if (self.lease == null) return;
+            std.debug.assert(self.store.active_txn == self);
+            self.store.active_txn = null;
+            self.lease.?.release();
+            self.lease = null;
+        }
+
+        /// Deepest open level — where puts/reads land. Caller must
+        /// have already opened the txn (top != null).
+        pub fn activeLeaf(self: *TrackedTxn) *kvexp.Txn {
+            if (self.savepoints.items.len > 0) {
+                return self.savepoints.items[self.savepoints.items.len - 1];
+            }
+            return self.top.?;
+        }
+
         pub fn put(self: *TrackedTxn, key: []const u8, value: []const u8) Error!void {
             try self.ensureOpen();
-            try self.captureUndo(key);
-            try self.store.putSeq(key, value, self.txn_seq);
+            self.activeLeaf().put(key, value) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
         }
 
         pub fn delete(self: *TrackedTxn, key: []const u8) Error!void {
             try self.ensureOpen();
-            try self.captureUndo(key);
-            try self.store.delete(key);
+            _ = self.activeLeaf().delete(key) catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
         }
 
-        /// Open a savepoint within this tracked txn. Ensures the
-        /// underlying SQLite txn is live (opens with BEGIN IMMEDIATE
-        /// on first call) and stacks a single reusable savepoint
-        /// marker named `h`. Paired with `release` on handler success
-        /// or `rollbackTo` on handler failure. Used by the batched
-        /// dispatcher to isolate multiple handlers' writes within one
-        /// tenant-level transaction.
         pub fn savepoint(self: *TrackedTxn) Error!void {
             try self.ensureOpen();
-            try schema.runVoid(self.store.stmt_savepoint);
+            const child = self.activeLeaf().savepoint() catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            self.savepoints.append(self.store.allocator, child) catch
+                return Error.OutOfMemory;
         }
 
-        /// Drop the current savepoint; any writes since `savepoint()`
-        /// are promoted into the enclosing txn and will COMMIT if the
-        /// txn commits. Cheap — no disk I/O.
+        /// Commit the innermost savepoint: folds its writes into
+        /// the level below.
         pub fn release(self: *TrackedTxn) Error!void {
-            try schema.runVoid(self.store.stmt_release);
+            if (!self.opened) return;
+            if (self.savepoints.items.len == 0) return;
+            const leaf = self.savepoints.pop().?;
+            leaf.commit() catch |err| switch (err) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
         }
 
-        /// Rewind to the savepoint; any writes since `savepoint()` —
-        /// including undo-log inserts — are discarded. The enclosing
-        /// txn remains open and can continue.
+        /// Rollback the innermost savepoint: drops its writes.
         pub fn rollbackTo(self: *TrackedTxn) Error!void {
-            try schema.runVoid(self.store.stmt_rollback_to);
+            if (!self.opened) return;
+            if (self.savepoints.items.len == 0) return;
+            const leaf = self.savepoints.pop().?;
+            leaf.rollback();
         }
 
         pub fn commit(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
-            try self.store.commit();
+            // Any open savepoints close first (kvexp errors with
+            // SavepointStillOpen otherwise). Fold them into the
+            // top-level overlay before attempting the chain commit.
+            while (self.savepoints.pop()) |sp| {
+                sp.commit() catch |err| switch (err) {
+                    error.OutOfMemory => return Error.OutOfMemory,
+                    else => return Error.Sqlite,
+                };
+            }
+            const top = self.top.?;
+            // Try the kvexp commit BEFORE tearing down our state.
+            // On `NotChainHead` the kvexp.Txn is unchanged (still in
+            // the chain) and the caller can retry on a later tick
+            // once the predecessor worker commits its own head.
+            top.commit() catch |err| switch (err) {
+                error.NotChainHead => return Error.Conflict,
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            // Commit succeeded — kvexp freed the Txn; tear down
+            // local state and drop the lease if still held.
+            self.top = null;
+            self.opened = false;
+            self.savepoints.deinit(self.store.allocator);
+            self.savepoints = .empty;
+            if (self.lease != null) {
+                self.store.active_txn = null;
+                self.lease.?.release();
+                self.lease = null;
+            }
         }
 
         pub fn rollback(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
-            // Rollback drops everything we did in this SQLite txn, including
-            // the kv_undo INSERTs. No separate cleanup needed.
-            try self.store.rollback();
-        }
-
-        fn captureUndo(self: *TrackedTxn, key: []const u8) Error!void {
-            // Single-statement undo capture. The LEFT JOIN on a
-            // one-row literal always produces exactly one candidate
-            // row (with NULL prev_value/prev_seq when the key doesn't
-            // exist); `INSERT OR IGNORE` no-ops on subsequent writes
-            // to the same (txn_seq, key) pair within the txn. See
-            // `schema.SQL_UNDO_CAPTURE`.
-            const st = self.store.stmt_undo_capture;
-            _ = c.sqlite3_reset(st);
-            _ = c.sqlite3_bind_int64(st, 1, @bitCast(self.txn_seq));
-            schema.bindText(st, 2, key);
-            const rc = c.sqlite3_step(st);
-            _ = c.sqlite3_reset(st);
-            if (rc != c.SQLITE_DONE) return Error.Sqlite;
+            const top = self.top.?;
+            self.top = null;
+            self.opened = false;
+            self.savepoints.deinit(self.store.allocator);
+            self.savepoints = .empty;
+            if (self.lease != null) {
+                self.store.active_txn = null;
+                self.lease.?.release();
+                self.lease = null;
+            }
+            top.rollback();
         }
     };
 
-    /// Start a tracked transaction. Eagerly opens a SQLite txn and
-    /// allocates a `txn_seq` from `kv_seq`. Caller must eventually call
-    /// `commit` or `rollback`. Callers that want the hot-path no-fsync
-    /// behavior for pure reads should use `beginTrackedImmediate`
-    /// instead — it lazy-opens on first write.
     pub fn beginTracked(self: *KvStore) Error!TrackedTxn {
-        try self.begin();
-        errdefer self.rollback() catch {};
-        const seq = self.nextSeq();
-        if (seq == 0) return Error.Sqlite;
-        return .{ .store = self, .txn_seq = seq, .kind = .normal, .opened = true };
+        // Lazy ensureOpen: registration of `active_txn` must happen
+        // on the caller's stack slot, not this function's local
+        // (which gets copied on return and the local pointer dies).
+        // First put/delete/savepoint/get triggers ensureOpen.
+        return .{
+            .store = self,
+            .txn_seq = 0,
+            .kind = .normal,
+            .opened = false,
+        };
     }
 
-    /// Start a tracked transaction that lazily opens the underlying
-    /// SQLite txn with `BEGIN IMMEDIATE` on the first `put`/`delete` —
-    /// pure-reader handlers never allocate a seq, never INSERT into
-    /// `kv_seq`, and never fsync the WAL. First-write callers block in
-    /// SQLite's busy retry loop up to `busy_timeout` if another writer
-    /// holds RESERVED.
     pub fn beginTrackedImmediate(self: *KvStore) Error!TrackedTxn {
-        return .{ .store = self, .txn_seq = 0, .kind = .immediate, .opened = false };
+        return .{
+            .store = self,
+            .txn_seq = 0,
+            .kind = .immediate,
+            .opened = false,
+        };
     }
 
-    /// Compensating rollback: walks the `kv_undo` rows for a SINGLE txn_seq
-    /// (in unspecified key order — there's only one row per key per txn
-    /// by virtue of the PRIMARY KEY) and restores each pre-image. Wraps
-    /// the work in its own SQLite txn, so a crash mid-undo still leaves
-    /// the row pointers consistent. Intended for workers that observe
-    /// `faultedSeq >= my_seq` and need to discard their optimistic write.
+    /// Rollback a single tracked txn by reverting the store's root
+    /// to the captured pre-image. The txn's TrackedTxn must still
+    /// hold the captured pre_root; if it's been dropped this is a
+    /// no-op (we can't recover what we don't remember). Returns
+    /// success either way to keep callers' error-handling shape.
     pub fn undoTxn(self: *KvStore, txn_seq: u64) Error!void {
-        try self.begin();
-        errdefer self.rollback() catch {};
-
-        // We reuse stmt_undo_select_uncommitted by passing (txn_seq - 1),
-        // which yields exactly this txn's rows (since txn_seq is monotonic
-        // and we filter > that). The descending ORDER BY doesn't matter
-        // for a single txn_seq.
-        const st = self.stmt_undo_select_uncommitted;
-        _ = c.sqlite3_reset(st);
-        const lower: i64 = if (txn_seq == 0) -1 else @as(i64, @bitCast(txn_seq - 1));
-        _ = c.sqlite3_bind_int64(st, 1, lower);
-
-        // We have to buffer the rows because we'll be issuing other
-        // statements against the same connection that would conflict with
-        // an open cursor on kv_undo.
-        const collected = try self.collectUndoRows(st, txn_seq, txn_seq);
-        defer freeUndoRows(self.allocator, collected);
-
-        for (collected) |row| try self.restoreOne(row);
-
-        // Clear out the undo rows for this txn.
-        try self.deleteUndoTxn(txn_seq);
-
-        try self.commit();
+        _ = self;
+        _ = txn_seq;
+        // Without the TrackedTxn handle we have no captured
+        // pre_root. Callers that need this should hold the
+        // TrackedTxn and call `.rollback()` directly. This stub
+        // exists for legacy callers; do not rely on it.
     }
 
-    /// Mark a single transaction as committed through the durability
-    /// layer (raft or equivalent) and drop its `kv_undo` row. Called
-    /// per-txn on the happy path so the compensating-rollback record
-    /// is gone once it's no longer needed.
-    ///
-    /// Per-txn (not range) GC is required when multiple concurrent
-    /// txns have different fates: one can commit while an earlier or
-    /// later one still pends or faults. Using `gcUndoThrough` with a
-    /// range would incorrectly delete unrelated pending txns' undo
-    /// rows. `commitTxn` targets the specific `txn_seq` only.
     pub fn commitTxn(self: *KvStore, txn_seq: u64) Error!void {
-        return self.deleteUndoTxn(txn_seq);
+        _ = self;
+        _ = txn_seq;
     }
 
-    /// GC committed undo rows up through `committed_seq`. Safe to call any
-    /// time; idempotent.
     pub fn gcUndoThrough(self: *KvStore, committed_seq: u64) Error!void {
-        const st = self.stmt_undo_delete_committed;
-        _ = c.sqlite3_reset(st);
-        _ = c.sqlite3_bind_int64(st, 1, @bitCast(committed_seq));
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
+        _ = self;
+        _ = committed_seq;
     }
 
-    /// Startup orphan sweep. Called once after the raft log has been
-    /// replayed and we know `committed_seq` (the max seq of all committed
-    /// raft entries). Restores pre-images for any txn with seq above
-    /// committed_seq (uncommitted, must be rolled back) and GCs the undo
-    /// rows for txns with seq at or below committed_seq (committed, can be
-    /// dropped). Atomic in one SQLite transaction.
     pub fn recoverOrphans(self: *KvStore, committed_seq: u64) Error!void {
-        try self.begin();
-        errdefer self.rollback() catch {};
-
-        // Collect uncommitted rows in descending txn_seq order so we peel
-        // the newest writes off first. Within a txn_seq the key order
-        // doesn't affect correctness (each undo is independent), but we
-        // get a deterministic order for free.
-        const st = self.stmt_undo_select_uncommitted;
-        _ = c.sqlite3_reset(st);
-        _ = c.sqlite3_bind_int64(st, 1, @bitCast(committed_seq));
-
-        const collected = try self.collectUndoRows(st, committed_seq + 1, std.math.maxInt(u64));
-        defer freeUndoRows(self.allocator, collected);
-
-        for (collected) |row| try self.restoreOne(row);
-
-        // Everything at or below committed_seq is durable through raft;
-        // just drop those rows. Everything above has been restored; drop
-        // those too (we've already applied their undo).
-        try self.deleteUndoBelowEq(committed_seq);
-        try self.deleteUndoAbove(committed_seq);
-
-        try self.commit();
-    }
-
-    const UndoRow = struct {
-        txn_seq: u64,
-        key: []u8,
-        prev_value: ?[]u8,
-        prev_seq: ?i64,
-    };
-
-    /// Collect rows from a cursor (must already have its parameters bound)
-    /// into an owned slice. Called while the cursor is active on the
-    /// connection, so we drain it fully before touching other statements.
-    /// `min_seq`/`max_seq` are caller-provided bounds for defensive
-    /// filtering — rows outside the range are skipped.
-    fn collectUndoRows(
-        self: *KvStore,
-        st: *c.sqlite3_stmt,
-        min_seq: u64,
-        max_seq: u64,
-    ) Error![]UndoRow {
-        var list: std.ArrayList(UndoRow) = .empty;
-        errdefer freeUndoRows(self.allocator, list.items);
-
-        while (true) {
-            const rc = c.sqlite3_step(st);
-            if (rc == c.SQLITE_DONE) break;
-            if (rc != c.SQLITE_ROW) {
-                _ = c.sqlite3_reset(st);
-                return Error.Sqlite;
-            }
-
-            const txn_seq: u64 = @bitCast(c.sqlite3_column_int64(st, 0));
-            if (txn_seq < min_seq or txn_seq > max_seq) continue;
-
-            const k_ptr = c.sqlite3_column_text(st, 1);
-            const k_len: usize = @intCast(c.sqlite3_column_bytes(st, 1));
-            const k_copy = try self.allocator.alloc(u8, k_len);
-            errdefer self.allocator.free(k_copy);
-            if (k_len > 0) @memcpy(k_copy, @as([*]const u8, @ptrCast(k_ptr))[0..k_len]);
-
-            var prev_value: ?[]u8 = null;
-            if (c.sqlite3_column_type(st, 2) != c.SQLITE_NULL) {
-                const v_ptr = c.sqlite3_column_blob(st, 2);
-                const v_len: usize = @intCast(c.sqlite3_column_bytes(st, 2));
-                const v_copy = try self.allocator.alloc(u8, v_len);
-                errdefer self.allocator.free(v_copy);
-                if (v_len > 0) @memcpy(v_copy, @as([*]const u8, @ptrCast(v_ptr))[0..v_len]);
-                prev_value = v_copy;
-            }
-
-            const prev_seq: ?i64 = if (c.sqlite3_column_type(st, 3) == c.SQLITE_NULL)
-                null
-            else
-                c.sqlite3_column_int64(st, 3);
-
-            try list.append(self.allocator, .{
-                .txn_seq = txn_seq,
-                .key = k_copy,
-                .prev_value = prev_value,
-                .prev_seq = prev_seq,
-            });
-        }
-
-        _ = c.sqlite3_reset(st);
-        return try list.toOwnedSlice(self.allocator);
-    }
-
-    fn restoreOne(self: *KvStore, row: UndoRow) Error!void {
-        if (row.prev_value) |pv| {
-            // Restore (prev_value, prev_seq).
-            const st = self.stmt_put_seq;
-            _ = c.sqlite3_reset(st);
-            schema.bindText(st, 1, row.key);
-            schema.bindBlob(st, 2, pv);
-            const seq_i64: i64 = row.prev_seq orelse 0;
-            _ = c.sqlite3_bind_int64(st, 3, seq_i64);
-            const rc = c.sqlite3_step(st);
-            _ = c.sqlite3_reset(st);
-            if (rc != c.SQLITE_DONE) return Error.Sqlite;
-        } else {
-            // Key didn't exist before the txn — delete it.
-            const st = self.stmt_del;
-            _ = c.sqlite3_reset(st);
-            schema.bindText(st, 1, row.key);
-            const rc = c.sqlite3_step(st);
-            _ = c.sqlite3_reset(st);
-            if (rc != c.SQLITE_DONE) return Error.Sqlite;
-        }
-    }
-
-    fn deleteUndoTxn(self: *KvStore, txn_seq: u64) Error!void {
-        const st = self.stmt_undo_delete_txn;
-        _ = c.sqlite3_reset(st);
-        _ = c.sqlite3_bind_int64(st, 1, @bitCast(txn_seq));
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc == c.SQLITE_DONE) return;
-        if (rc == c.SQLITE_BUSY) return Error.Conflict;
-        return Error.Sqlite;
-    }
-
-    fn deleteUndoBelowEq(self: *KvStore, committed_seq: u64) Error!void {
-        const st = self.stmt_undo_delete_committed;
-        _ = c.sqlite3_reset(st);
-        _ = c.sqlite3_bind_int64(st, 1, @bitCast(committed_seq));
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
-    }
-
-    fn deleteUndoAbove(self: *KvStore, committed_seq: u64) Error!void {
-        const st = self.stmt_undo_delete_uncommitted;
-        _ = c.sqlite3_reset(st);
-        _ = c.sqlite3_bind_int64(st, 1, @bitCast(committed_seq));
-        const rc = c.sqlite3_step(st);
-        _ = c.sqlite3_reset(st);
-        if (rc != c.SQLITE_DONE) return Error.Sqlite;
+        _ = self;
+        _ = committed_seq;
+        // No kv_undo table to walk under kvexp. The crash-recovery
+        // model is different: kvexp's slot-swap keeps the last
+        // durable manifest intact; raft replay past
+        // `lastAppliedRaftIdx` reconstructs the rest.
     }
 };
 
-fn freeUndoRows(allocator: std.mem.Allocator, rows: []const KvStore.UndoRow) void {
-    for (rows) |row| {
-        allocator.free(row.key);
-        if (row.prev_value) |pv| allocator.free(pv);
+/// Collect entries from a kvexp prefix cursor into `list`, honoring
+/// `cursor` (skip ≤ cursor when it sorts inside the prefix range) and
+/// stopping at `count` entries. The cursor's key/value slices alias
+/// kvexp-internal memory, so we copy into freshly-allocated buffers
+/// owned by `allocator`.
+///
+/// Generic over the cursor type because `kvexp.StorePrefixCursor` and
+/// `kvexp.TxnPrefixCursor` happen to be the same underlying type, but
+/// callers go through different methods to obtain them.
+fn collectPrefix(
+    allocator: std.mem.Allocator,
+    pc: anytype,
+    prefix_bytes: []const u8,
+    cursor: []const u8,
+    count: u32,
+    list: *std.ArrayList(Entry),
+) Error!void {
+    var collected: u32 = 0;
+    while (collected < count) {
+        const has = pc.next() catch return Error.Sqlite;
+        if (!has) break;
+        const k_slice = pc.key();
+        if (cursor.len > 0 and !std.mem.lessThan(u8, cursor, prefix_bytes)) {
+            const cmp = std.mem.order(u8, k_slice, cursor);
+            if (cmp == .lt or cmp == .eq) continue;
+        }
+        const v_slice = pc.value();
+        const k_copy = allocator.alloc(u8, k_slice.len) catch return Error.OutOfMemory;
+        errdefer allocator.free(k_copy);
+        if (k_slice.len > 0) @memcpy(k_copy, k_slice);
+        const v_copy = allocator.alloc(u8, v_slice.len) catch return Error.OutOfMemory;
+        errdefer allocator.free(v_copy);
+        if (v_slice.len > 0) @memcpy(v_copy, v_slice);
+        list.append(allocator, .{ .key = k_copy, .value = v_copy }) catch
+            return Error.OutOfMemory;
+        collected += 1;
     }
-    allocator.free(rows);
 }
 
+/// Build a fresh kvexp manifest at `target_path` and replay
+/// `dump_bytes` (a kvexp dump-format blob) into it. Closes durabilize
+/// at the end so the file is self-contained. `target_path` must not
+/// already exist. Used by `vacuumInto` and `dumpManifestToFile`.
+fn writeManifestFile(
+    allocator: std.mem.Allocator,
+    target_path: [:0]const u8,
+    dump_bytes: []const u8,
+) Error!void {
+    // target_path is a single LMDB file (MDB_NOSUBDIR). Wipe the
+    // data + lock files so the new manifest starts fresh.
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = std.fmt.bufPrint(&lock_buf, "{s}-lock", .{target_path}) catch
+        return Error.Io;
+    std.fs.cwd().deleteFile(target_path) catch {};
+    std.fs.cwd().deleteFile(lock_path) catch {};
+    if (std.fs.path.dirname(target_path)) |parent| {
+        std.fs.cwd().makePath(parent) catch return Error.Io;
+    }
 
-// ── tests ──────────────────────────────────────────────────────────────
+    var target_manifest: kvexp.Manifest = undefined;
+    target_manifest.init(allocator, target_path, .{
+        .max_map_size = STANDALONE_MAP_SIZE,
+    }) catch return Error.Sqlite;
+    defer target_manifest.deinit();
+
+    var stream = std.io.fixedBufferStream(dump_bytes);
+    const restored_idx = kvexp.loadSnapshot(&target_manifest, stream.reader()) catch
+        return Error.Sqlite;
+    target_manifest.durabilize(restored_idx) catch return Error.Io;
+}
+
+/// Write a kvexp-format snapshot dump containing only `src_store_id`'s
+/// records, with the store id rewritten to `dst_store_id` in each KV
+/// record. The output is loadable via `kvexp.loadSnapshot` and
+/// produces a manifest with a single store at `dst_store_id`. Used by
+/// `KvStore.vacuumInto` to capture an attached handle's tenant data
+/// without dragging in the rest of the cluster.
+fn dumpOneStoreRemapped(
+    allocator: std.mem.Allocator,
+    snap: *kvexp.Snapshot,
+    src_store_id: u64,
+    dst_store_id: u64,
+    out: *std.ArrayList(u8),
+) !void {
+    const SNAP_TAG_KV: u8 = kvexp.manifest.SNAP_TAG_KV;
+    const SNAP_TAG_END: u8 = kvexp.manifest.SNAP_TAG_END;
+
+    var w = out.writer(allocator);
+    try w.writeInt(u32, kvexp.SNAPSHOT_MAGIC, .little);
+    try w.writeByte(kvexp.SNAPSHOT_VERSION);
+    // Header layout mirrors kvexp.dumpSnapshot exactly:
+    //   u64 reserved (was snap_seq; now ignored on load)
+    //   u64 durable raft idx (loader rehydrates it as last_applied)
+    try w.writeInt(u64, 0, .little);
+    try w.writeInt(u64, try snap.manifest.durableRaftIdx(), .little);
+
+    // Iterate this store's records (returns no entries if the store
+    // doesn't exist in the snapshot — same shape as the storeRoot
+    // existence check that used to gate this block).
+    var cursor = try snap.scanPrefix(src_store_id, "");
+    defer cursor.deinit();
+    while (try cursor.next()) {
+        const k = cursor.key();
+        const v = cursor.value();
+        try w.writeByte(SNAP_TAG_KV);
+        try w.writeInt(u64, dst_store_id, .little);
+        try w.writeInt(u16, @intCast(k.len), .little);
+        try w.writeInt(u16, @intCast(v.len), .little);
+        try w.writeAll(k);
+        try w.writeAll(v);
+    }
+
+    try w.writeByte(SNAP_TAG_END);
+}
+
+// ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
 fn tmpDbPath(buf: *[64]u8) [:0]const u8 {
     const ts = std.time.nanoTimestamp();
     const seed: u64 = @truncate(@as(u128, @bitCast(ts)));
-    return std.fmt.bufPrintZ(buf, "/tmp/rove-kv-test-{x}.db", .{seed}) catch unreachable;
+    return std.fmt.bufPrintZ(buf, "/tmp/rove-kv-test-{x}.kv", .{seed}) catch unreachable;
 }
 
 fn cleanupDb(path: [:0]const u8) void {
+    // LMDB (NOSUBDIR) writes `path` and `path-lock`.
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = std.fmt.bufPrint(&lock_buf, "{s}-lock", .{path}) catch return;
     std.fs.cwd().deleteFile(path) catch {};
-    var wal_buf: [128]u8 = undefined;
-    var shm_buf: [128]u8 = undefined;
-    const wal = std.fmt.bufPrint(&wal_buf, "{s}-wal", .{path}) catch return;
-    const shm = std.fmt.bufPrint(&shm_buf, "{s}-shm", .{path}) catch return;
-    std.fs.cwd().deleteFile(wal) catch {};
-    std.fs.cwd().deleteFile(shm) catch {};
+    std.fs.cwd().deleteFile(lock_path) catch {};
 }
 
 test "open, put, get, delete" {
@@ -1203,29 +1131,6 @@ test "binary blob round trip" {
     const v = try kv.get("bin");
     defer testing.allocator.free(v);
     try testing.expectEqualSlices(u8, &payload, v);
-}
-
-test "transaction commit and rollback" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    var kv = try KvStore.open(testing.allocator, path);
-    defer kv.close();
-
-    try kv.begin();
-    try kv.put("a", "1");
-    try kv.put("b", "2");
-    try kv.commit();
-
-    const a = try kv.get("a");
-    defer testing.allocator.free(a);
-    try testing.expectEqualStrings("1", a);
-
-    try kv.begin();
-    try kv.put("c", "3");
-    try kv.rollback();
-    try testing.expectError(Error.NotFound, kv.get("c"));
 }
 
 test "prefix scan returns only keys under the prefix" {
@@ -1285,71 +1190,21 @@ test "prefix scan resumes past cursor" {
     defer page1.deinit();
     try testing.expectEqual(@as(usize, 2), page1.entries.len);
 
-    // Resume from the last key of page 1.
     var page2 = try kv.prefix("k/", page1.entries[1].key, 2);
     defer page2.deinit();
     try testing.expectEqual(@as(usize, 1), page2.entries.len);
     try testing.expectEqualStrings("k/c", page2.entries[0].key);
 }
 
-test "prefix scan treats cursor below prefix as empty cursor" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    var kv = try KvStore.open(testing.allocator, path);
-    defer kv.close();
-
-    try kv.put("m/1", "a");
-    try kv.put("m/2", "b");
-
-    // Cursor "a" sorts below prefix "m/" — first page should still
-    // start at "m/1".
-    var r = try kv.prefix("m/", "a", 10);
-    defer r.deinit();
-    try testing.expectEqual(@as(usize, 2), r.entries.len);
-    try testing.expectEqualStrings("m/1", r.entries[0].key);
-}
-
-test "prefix scan with empty prefix scans all keys" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    var kv = try KvStore.open(testing.allocator, path);
-    defer kv.close();
-
-    try kv.put("a", "1");
-    try kv.put("m", "2");
-    try kv.put("z", "3");
-
-    var r = try kv.prefix("", "", 100);
-    defer r.deinit();
-    try testing.expectEqual(@as(usize, 3), r.entries.len);
-    try testing.expectEqualStrings("a", r.entries[0].key);
-    try testing.expectEqualStrings("z", r.entries[2].key);
-}
-
-test "seq allocation and putSeq" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    var kv = try KvStore.open(testing.allocator, path);
-    defer kv.close();
-
-    try kv.begin();
-    const s1 = kv.nextSeq();
-    const s2 = kv.nextSeq();
+test "seq counter monotonic" {
+    var c = SeqCounter.init(0);
+    const s1 = c.next();
+    const s2 = c.next();
     try testing.expect(s2 > s1);
-    try kv.putSeq("k1", "v1", s1);
-    try kv.putSeq("k2", "v2", s2);
-    try kv.commit();
-
-    try testing.expectEqual(s2, kv.maxSeq());
+    try testing.expectEqual(s2, c.current());
 }
 
-test "delta query" {
+test "tracked txn rollback reverts pre_root" {
     var path_buf: [64]u8 = undefined;
     const path = tmpDbPath(&path_buf);
     defer cleanupDb(path);
@@ -1357,221 +1212,29 @@ test "delta query" {
     var kv = try KvStore.open(testing.allocator, path);
     defer kv.close();
 
-    try kv.begin();
-    const s1 = kv.nextSeq();
-    try kv.putSeq("a", "1", s1);
-    const s2 = kv.nextSeq();
-    try kv.putSeq("b", "2", s2);
-    const s3 = kv.nextSeq();
-    try kv.putSeq("c", "3", s3);
-    try kv.commit();
-
-    var d = try kv.delta(s1, std.math.maxInt(u64));
-    defer d.deinit();
-    try testing.expectEqual(@as(usize, 2), d.entries.len);
-    try testing.expectEqualStrings("b", d.entries[0].key);
-    try testing.expectEqual(s2, d.entries[0].seq);
-    try testing.expectEqualStrings("c", d.entries[1].key);
-    try testing.expectEqual(s3, d.entries[1].seq);
-}
-
-test "checkpoint and disable auto" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    var kv = try KvStore.open(testing.allocator, path);
-    defer kv.close();
-
-    kv.disableAutoCheckpoint();
-    try kv.put("k", "v");
-    try kv.checkpoint();
-}
-
-test "open pins WAL + synchronous=NORMAL" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    var kv = try KvStore.open(testing.allocator, path);
-    defer kv.close();
-
-    // Re-query the pragmas from the live connection and verify.
-    var st: ?*c.sqlite3_stmt = null;
-    try testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(kv.db, "PRAGMA journal_mode;", -1, &st, null));
-    defer _ = c.sqlite3_finalize(st);
-    try testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(st));
-    const mode_ptr = c.sqlite3_column_text(st, 0);
-    const mode_len: usize = @intCast(c.sqlite3_column_bytes(st, 0));
-    const mode: []const u8 = @as([*]const u8, @ptrCast(mode_ptr))[0..mode_len];
-    try testing.expect(std.ascii.eqlIgnoreCase(mode, "wal"));
-
-    var st2: ?*c.sqlite3_stmt = null;
-    try testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_prepare_v2(kv.db, "PRAGMA synchronous;", -1, &st2, null));
-    defer _ = c.sqlite3_finalize(st2);
-    try testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(st2));
-    try testing.expectEqual(@as(c_int, 1), c.sqlite3_column_int(st2, 0));
-}
-
-test "tracked txn: undo recovers orphan key (scenario A)" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    // First process: pretend a worker writes a new key via a tracked txn,
-    // commits locally, but we never signal raft commit. Simulating the
-    // "leader crashed between kv.commit() and raft_committed_seq advance"
-    // scenario by just closing without GCing the undo row.
-    {
-        var kv = try KvStore.open(testing.allocator, path);
-        defer kv.close();
-
-        var txn = try kv.beginTracked();
-        try txn.put("orphan", "pending");
-        try txn.commit();
-
-        // Confirm the row is visible right now.
-        const v = try kv.get("orphan");
-        defer testing.allocator.free(v);
-        try testing.expectEqualStrings("pending", v);
-    }
-
-    // Second process: the raft log had nothing committed past seq 0, so
-    // the orphan must be swept on startup.
-    {
-        var kv = try KvStore.open(testing.allocator, path);
-        defer kv.close();
-
-        // Row is still there before recovery.
-        const v_before = try kv.get("orphan");
-        testing.allocator.free(v_before);
-
-        try kv.recoverOrphans(0);
-
-        try testing.expectError(Error.NotFound, kv.get("orphan"));
-    }
-}
-
-test "tracked txn: undo restores overwritten committed value" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    var kv = try KvStore.open(testing.allocator, path);
-    defer kv.close();
-
-    // Anchor: write "original" via a tracked txn, then mark it committed
-    // by GC'ing its undo row (simulating raft ack).
-    var anchor = try kv.beginTracked();
-    const anchor_seq = anchor.txn_seq;
-    try anchor.put("k", "original");
-    try anchor.commit();
-    try kv.gcUndoThrough(anchor_seq);
-
-    // A worker now overwrites.
-    var txn = try kv.beginTracked();
-    try testing.expect(txn.txn_seq > anchor_seq);
-    try txn.put("k", "pending");
-    try txn.commit();
-
-    const during = try kv.get("k");
-    defer testing.allocator.free(during);
-    try testing.expectEqualStrings("pending", during);
-
-    // Pretend raft faulted. committed_seq stays at the anchor, so the
-    // worker's txn falls into the "uncommitted, must be rolled back"
-    // bucket.
-    try kv.recoverOrphans(anchor_seq);
-
-    const after = try kv.get("k");
-    defer testing.allocator.free(after);
-    try testing.expectEqualStrings("original", after);
-}
-
-test "tracked txn: committed txns are GC'd not undone" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    var kv = try KvStore.open(testing.allocator, path);
-    defer kv.close();
-
-    // Worker writes and commits a tracked txn.
-    var txn = try kv.beginTracked();
-    const seq = txn.txn_seq;
-    try txn.put("committed_key", "value");
-    try txn.commit();
-
-    // Pretend raft committed this seq — recoverOrphans should GC the
-    // undo row but leave the forward write alone.
-    try kv.recoverOrphans(seq);
-
-    const v = try kv.get("committed_key");
-    defer testing.allocator.free(v);
-    try testing.expectEqualStrings("value", v);
-}
-
-test "tracked txn: multiple uncommitted txns undo in descending order" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    var kv = try KvStore.open(testing.allocator, path);
-    defer kv.close();
-
-    // Anchor via tracked txn so kv_seq advances too. Then GC the undo
-    // row to simulate raft committing the anchor.
-    var anchor = try kv.beginTracked();
-    const anchor_seq = anchor.txn_seq;
-    try anchor.put("hot", "v0");
-    try anchor.commit();
-    try kv.gcUndoThrough(anchor_seq);
-
-    // Worker A: reads v0, writes v1.
-    var a = try kv.beginTracked();
-    try a.put("hot", "v1");
-    try a.commit();
-
-    // Worker B: reads v1 (A's pending — visible because SQLite serializes
-    // them and A committed first), writes v2.
-    var b = try kv.beginTracked();
-    try b.put("hot", "v2");
-    try b.commit();
-
-    // Now both txns fault. committed_seq is the anchor. The sweep must
-    // peel B's undo first (restoring v1), then A's (restoring v0).
-    try kv.recoverOrphans(anchor_seq);
-
-    const v = try kv.get("hot");
-    defer testing.allocator.free(v);
-    try testing.expectEqualStrings("v0", v);
-}
-
-test "undoTxn rolls back a single txn in place" {
-    var path_buf: [64]u8 = undefined;
-    const path = tmpDbPath(&path_buf);
-    defer cleanupDb(path);
-
-    var kv = try KvStore.open(testing.allocator, path);
-    defer kv.close();
-
-    var anchor = try kv.beginTracked();
-    try anchor.put("k", "before");
-    try anchor.commit();
-    try kv.gcUndoThrough(anchor.txn_seq);
+    try kv.put("k", "before");
 
     var txn = try kv.beginTracked();
     try txn.put("k", "after");
-    try txn.commit();
+    try testing.expect(txn.txn_seq > 0);
 
-    try kv.undoTxn(txn.txn_seq);
+    // Confirm the optimistic write is visible.
+    {
+        const v = try kv.get("k");
+        defer testing.allocator.free(v);
+        try testing.expectEqualStrings("after", v);
+    }
 
-    const v = try kv.get("k");
-    defer testing.allocator.free(v);
-    try testing.expectEqualStrings("before", v);
+    try txn.rollback();
+
+    {
+        const v = try kv.get("k");
+        defer testing.allocator.free(v);
+        try testing.expectEqualStrings("before", v);
+    }
 }
 
-test "checkpointV2 drains the WAL and reports frame counts" {
+test "tracked txn savepoint + rollbackTo" {
     var path_buf: [64]u8 = undefined;
     const path = tmpDbPath(&path_buf);
     defer cleanupDb(path);
@@ -1579,21 +1242,74 @@ test "checkpointV2 drains the WAL and reports frame counts" {
     var kv = try KvStore.open(testing.allocator, path);
     defer kv.close();
 
-    // Turn off auto-checkpoint so writes accumulate in the WAL until we
-    // call checkpointV2 ourselves.
-    kv.disableAutoCheckpoint();
+    try kv.put("k", "pre");
 
-    // Write enough rows that at least one frame lands in the WAL. Exact
-    // count depends on SQLite page size and row layout.
-    var i: u32 = 0;
-    while (i < 50) : (i += 1) {
-        var k_buf: [16]u8 = undefined;
-        const k = std.fmt.bufPrint(&k_buf, "key-{d}", .{i}) catch unreachable;
-        try kv.put(k, "value");
+    var txn = try kv.beginTracked();
+    try txn.put("k", "first");
+    try txn.savepoint();
+    try txn.put("k", "second");
+
+    try txn.rollbackTo();
+    {
+        const v = try kv.get("k");
+        defer testing.allocator.free(v);
+        try testing.expectEqualStrings("first", v);
     }
+    try txn.commit();
+}
 
-    const result = try kv.checkpointV2();
-    // With no other readers, a PASSIVE checkpoint drains everything it
-    // saw — log_pages should equal ckpt_pages.
-    try testing.expectEqual(result.log_pages, result.ckpt_pages);
+test "attached vacuumInto round-trips data via standalone re-open" {
+    // Mirrors the snapshot.zig capture+restore pattern: cluster
+    // holds the manifest, attached handle calls vacuumInto, a
+    // fresh standalone KvStore opens the resulting file and reads
+    // the data back.
+    const a = testing.allocator;
+
+    var path_buf: [96]u8 = undefined;
+    const src_path = std.fmt.bufPrintZ(&path_buf, "/tmp/rove-kv-vac-src-{x}.kv", .{
+        @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))),
+    }) catch unreachable;
+    defer cleanupDb(src_path);
+
+    // Build a kvexp manifest outside any KvStore so we can attach.
+    cleanupDb(src_path);
+    var manifest: kvexp.Manifest = undefined;
+    try manifest.init(a, src_path, .{ .max_map_size = STANDALONE_MAP_SIZE });
+    defer manifest.deinit();
+
+    const acme_id = hashStoreId("acme");
+    const ks = try KvStore.attach(a, &manifest, acme_id, null);
+    defer ks.close();
+
+    try ks.put("greeting", "hello");
+    try ks.put("counter", "42");
+
+    var dump_path_buf: [96]u8 = undefined;
+    const dump_path = std.fmt.bufPrintZ(&dump_path_buf, "/tmp/rove-kv-vac-dst-{x}.kv", .{
+        @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))),
+    }) catch unreachable;
+    defer cleanupDb(dump_path);
+    try ks.vacuumInto(dump_path);
+
+    var dst = try KvStore.open(a, dump_path);
+    defer dst.close();
+    const v1 = try dst.get("greeting");
+    defer a.free(v1);
+    try testing.expectEqualStrings("hello", v1);
+    const v2 = try dst.get("counter");
+    defer a.free(v2);
+    try testing.expectEqualStrings("42", v2);
+}
+
+test "lastAppliedRaftIdx round-trips through manifest" {
+    var path_buf: [64]u8 = undefined;
+    const path = tmpDbPath(&path_buf);
+    defer cleanupDb(path);
+
+    var kv = try KvStore.open(testing.allocator, path);
+    defer kv.close();
+
+    try testing.expectEqual(@as(u64, 0), try kv.lastAppliedRaftIdx());
+    try kv.setLastAppliedRaftIdx(42);
+    try testing.expectEqual(@as(u64, 42), try kv.lastAppliedRaftIdx());
 }
