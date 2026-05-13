@@ -180,6 +180,14 @@ pub const Tenant = struct {
     /// are dropped on any `Tenant` write (coarse but fine — root writes
     /// are rare bootstrap ops in M1).
     host_cache: std.StringHashMapUnmanaged(*Instance) = .empty,
+    /// Serializes every read or write of `instances` and `host_cache`.
+    /// Worker threads call `resolveDomain` concurrently with distinct
+    /// hosts and contend on `host_cache.put` (std.HashMap rehashes
+    /// invalidate concurrent reads), so coarse-grained locking is the
+    /// minimum-correct choice. Reads are short — single map.get or
+    /// fixed-size iteration — so contention stays bounded at the
+    /// per-tenant scale we run today.
+    maps_mutex: std.Thread.Mutex = .{},
     /// Operator-supplied root bearer token (the `LOOP46_ROOT_TOKEN`
     /// env var). When non-null, presenting an `Authorization: Bearer
     /// <this>` proves "platform operator." When null, every request
@@ -289,9 +297,13 @@ pub const Tenant = struct {
     /// in a multi-worker process bootstraps the same tenant set.
     pub fn createInstance(self: *Tenant, id: []const u8) Error!void {
         try validateInstanceId(id);
-        if (self.instances.get(id) != null) return;
         const already_exists = try self.instanceExistsInRoot(id);
-        _ = try self.ensureOpen(id);
+        {
+            self.maps_mutex.lock();
+            defer self.maps_mutex.unlock();
+            if (self.instances.get(id) != null) return;
+            _ = try self.ensureOpenLocked(id);
+        }
         if (!already_exists) try self.writeInstanceMarker(id);
     }
 
@@ -304,12 +316,16 @@ pub const Tenant = struct {
     pub fn deleteInstance(self: *Tenant, id: []const u8) Error!void {
         try validateInstanceId(id);
 
-        if (self.instances.fetchRemove(id)) |entry| {
-            const inst = entry.value;
-            inst.kv.close();
-            self.allocator.free(inst.id);
-            self.allocator.free(inst.dir);
-            self.allocator.destroy(inst);
+        {
+            self.maps_mutex.lock();
+            defer self.maps_mutex.unlock();
+            if (self.instances.fetchRemove(id)) |entry| {
+                const inst = entry.value;
+                inst.kv.close();
+                self.allocator.free(inst.id);
+                self.allocator.free(inst.dir);
+                self.allocator.destroy(inst);
+            }
         }
 
         var marker_buf: [16 + MAX_INSTANCE_ID_LEN]u8 = undefined;
@@ -367,7 +383,12 @@ pub const Tenant = struct {
     ///      instance. Explicit aliases always win over the wildcard.
     pub fn resolveDomain(self: *Tenant, host: []const u8) Error!?*const Instance {
         try validateHost(host);
-        if (self.host_cache.get(host)) |inst| return inst;
+        // Fast path: cache hit under a brief lock.
+        {
+            self.maps_mutex.lock();
+            defer self.maps_mutex.unlock();
+            if (self.host_cache.get(host)) |inst| return inst;
+        }
 
         var key_buf: [16 + MAX_HOST_LEN]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "domain/{s}", .{host}) catch
@@ -381,16 +402,23 @@ pub const Tenant = struct {
         };
         defer if (id_bytes_opt) |v| self.allocator.free(v);
 
+        // Slow path: serialize the resolve + insert under one lock.
+        // Re-check the cache first — another thread may have inserted
+        // while we were waiting on root.get.
+        self.maps_mutex.lock();
+        defer self.maps_mutex.unlock();
+        if (self.host_cache.get(host)) |inst| return inst;
+
         const resolved_inst: ?*Instance = if (id_bytes_opt) |id_bytes| inner: {
             if (!try self.instanceExistsInRoot(id_bytes)) break :inner null;
-            break :inner try self.ensureOpen(id_bytes);
+            break :inner try self.ensureOpenLocked(id_bytes);
         } else if (self.wildcardInstanceId(host)) |sub_id| wild: {
             // Wildcard hit: only resolve if the id is a registered
             // instance AND valid (garbage subdomains like `-foo` or
             // overlong labels short-circuit to a 404).
             validateInstanceId(sub_id) catch break :wild null;
             if (!try self.instanceExistsInRoot(sub_id)) break :wild null;
-            break :wild try self.ensureOpen(sub_id);
+            break :wild try self.ensureOpenLocked(sub_id);
         } else null;
 
         if (resolved_inst) |inst| {
@@ -438,9 +466,16 @@ pub const Tenant = struct {
     /// `KvStore` without going through a host → instance lookup.
     pub fn getInstance(self: *Tenant, id: []const u8) Error!?*const Instance {
         try validateInstanceId(id);
-        if (self.instances.get(id)) |inst| return inst;
+        {
+            self.maps_mutex.lock();
+            defer self.maps_mutex.unlock();
+            if (self.instances.get(id)) |inst| return inst;
+        }
         if (!try self.instanceExistsInRoot(id)) return null;
-        return try self.ensureOpen(id);
+        self.maps_mutex.lock();
+        defer self.maps_mutex.unlock();
+        if (self.instances.get(id)) |inst| return inst;
+        return try self.ensureOpenLocked(id);
     }
 
     /// Enumerate every instance registered in the root store (up to
@@ -546,7 +581,12 @@ pub const Tenant = struct {
     /// and picks up the `platform` capability pointer so the admin
     /// JS handler can call platform operations via the `platform.*`
     /// globals.
-    fn ensureOpen(self: *Tenant, id: []const u8) Error!*Instance {
+    /// Caller-locks variant: requires `maps_mutex` to be held. Returns
+    /// the existing `*Instance` for `id` if any, otherwise opens its
+    /// per-tenant store and installs it into `instances`. The check-
+    /// then-insert is atomic under the lock so racing callers don't
+    /// open the same instance twice.
+    fn ensureOpenLocked(self: *Tenant, id: []const u8) Error!*Instance {
         if (self.instances.get(id)) |inst| return inst;
 
         const inst_dir = std.fmt.allocPrint(
@@ -600,6 +640,8 @@ pub const Tenant = struct {
     }
 
     fn invalidateHostCache(self: *Tenant) void {
+        self.maps_mutex.lock();
+        defer self.maps_mutex.unlock();
         var it = self.host_cache.iterator();
         while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.host_cache.clearRetainingCapacity();
@@ -646,6 +688,8 @@ pub const Tenant = struct {
     // expected to `createInstance(ADMIN_INSTANCE_ID)` during bootstrap
     // before any session / magic operation fires.
     fn adminKv(self: *Tenant) Error!*kv_mod.KvStore {
+        self.maps_mutex.lock();
+        defer self.maps_mutex.unlock();
         const inst = self.instances.get(ADMIN_INSTANCE_ID) orelse
             return Error.InstanceNotFound;
         return inst.kv;
