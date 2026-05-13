@@ -54,6 +54,11 @@ pub const RaftLogEntry = raft_log.Entry;
 pub const RaftPersistentState = raft_log.PersistentState;
 pub const RaftLogError = raft_log.Error;
 
+const kvexp = @import("kvexp");
+pub const KvexpMetricsSnapshot = kvexp.MetricsSnapshot;
+pub const KvexpHistogramSnapshot = kvexp.HistogramSnapshot;
+pub const KvexpHistogram = kvexp.Histogram;
+
 test {
     _ = kvstore;
     _ = raft_log;

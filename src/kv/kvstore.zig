@@ -488,10 +488,7 @@ pub const KvStore = struct {
     pub fn put(self: *KvStore, key: []const u8, value: []const u8) Error!void {
         if (self.active_txn) |t| {
             const leaf = t.activeLeaf();
-            leaf.put(key, value) catch |err| switch (err) {
-                error.OutOfMemory => return Error.OutOfMemory,
-                else => return Error.Sqlite,
-            };
+            leaf.put(key, value) catch return Error.Sqlite;
             return;
         }
         // Blocking acquire — direct KvStore.put is used by test/admin
@@ -500,10 +497,7 @@ pub const KvStore = struct {
         defer lease.release();
         var txn = lease.beginTxn() catch return Error.Sqlite;
         errdefer txn.rollback();
-        txn.put(key, value) catch |err| switch (err) {
-            error.OutOfMemory => return Error.OutOfMemory,
-            else => return Error.Sqlite,
-        };
+        txn.put(key, value) catch return Error.Sqlite;
         txn.commit() catch return Error.Sqlite;
     }
 
@@ -635,6 +629,14 @@ pub const KvStore = struct {
         _ = ms;
     }
 
+    /// Snapshot of the underlying kvexp manifest's counters/gauges.
+    /// In attached mode, every KvStore on a node shares the same
+    /// `cluster.kv` manifest, so reading this from any handle yields
+    /// the same node-wide totals.
+    pub fn manifestMetricsSnapshot(self: *KvStore) kvexp.MetricsSnapshot {
+        return self.manifest.metricsSnapshot();
+    }
+
     /// Force a durabilize. Only meaningful in standalone mode (the
     /// KvStore owns the manifest stack). Attached-mode callers
     /// should route through the cluster's tick.
@@ -762,21 +764,15 @@ pub const KvStore = struct {
             // tryAcquire surfaces contention as `Conflict` so the
             // dispatcher's skip-this-tick machinery picks a different
             // anchor instead of blocking on the dispatch lock.
-            const lease_opt = self.store.manifest.tryAcquire(self.store.store_id) catch |err|
-                return switch (err) {
-                    error.OutOfMemory => Error.OutOfMemory,
-                    else => Error.Sqlite,
-                };
+            const lease_opt = self.store.manifest.tryAcquire(self.store.store_id) catch
+                return Error.Sqlite;
             self.lease = lease_opt orelse return Error.Conflict;
             std.debug.assert(self.store.active_txn == null);
             self.txn_seq = self.store.counter.next();
-            self.top = self.lease.?.beginTxn() catch |err| {
+            self.top = self.lease.?.beginTxn() catch {
                 self.lease.?.release();
                 self.lease = null;
-                return switch (err) {
-                    error.OutOfMemory => Error.OutOfMemory,
-                    else => Error.Sqlite,
-                };
+                return Error.Sqlite;
             };
             self.store.active_txn = self;
             self.opened = true;
@@ -807,26 +803,17 @@ pub const KvStore = struct {
 
         pub fn put(self: *TrackedTxn, key: []const u8, value: []const u8) Error!void {
             try self.ensureOpen();
-            self.activeLeaf().put(key, value) catch |err| switch (err) {
-                error.OutOfMemory => return Error.OutOfMemory,
-                else => return Error.Sqlite,
-            };
+            self.activeLeaf().put(key, value) catch return Error.Sqlite;
         }
 
         pub fn delete(self: *TrackedTxn, key: []const u8) Error!void {
             try self.ensureOpen();
-            _ = self.activeLeaf().delete(key) catch |err| switch (err) {
-                error.OutOfMemory => return Error.OutOfMemory,
-                else => return Error.Sqlite,
-            };
+            _ = self.activeLeaf().delete(key) catch return Error.Sqlite;
         }
 
         pub fn savepoint(self: *TrackedTxn) Error!void {
             try self.ensureOpen();
-            const child = self.activeLeaf().savepoint() catch |err| switch (err) {
-                error.OutOfMemory => return Error.OutOfMemory,
-                else => return Error.Sqlite,
-            };
+            const child = self.activeLeaf().savepoint() catch return Error.Sqlite;
             self.savepoints.append(self.store.allocator, child) catch
                 return Error.OutOfMemory;
         }
@@ -837,10 +824,7 @@ pub const KvStore = struct {
             if (!self.opened) return;
             if (self.savepoints.items.len == 0) return;
             const leaf = self.savepoints.pop().?;
-            leaf.commit() catch |err| switch (err) {
-                error.OutOfMemory => return Error.OutOfMemory,
-                else => return Error.Sqlite,
-            };
+            leaf.commit() catch return Error.Sqlite;
         }
 
         /// Rollback the innermost savepoint: drops its writes.
@@ -857,10 +841,7 @@ pub const KvStore = struct {
             // SavepointStillOpen otherwise). Fold them into the
             // top-level overlay before attempting the chain commit.
             while (self.savepoints.pop()) |sp| {
-                sp.commit() catch |err| switch (err) {
-                    error.OutOfMemory => return Error.OutOfMemory,
-                    else => return Error.Sqlite,
-                };
+                sp.commit() catch return Error.Sqlite;
             }
             const top = self.top.?;
             // Try the kvexp commit BEFORE tearing down our state.
@@ -869,7 +850,6 @@ pub const KvStore = struct {
             // once the predecessor worker commits its own head.
             top.commit() catch |err| switch (err) {
                 error.NotChainHead => return Error.Conflict,
-                error.OutOfMemory => return Error.OutOfMemory,
                 else => return Error.Sqlite,
             };
             // Commit succeeded — kvexp freed the Txn; tear down

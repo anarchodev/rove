@@ -54,6 +54,14 @@ pub const Overlay = struct {
     allocator: std.mem.Allocator,
     entries: std.StringHashMapUnmanaged(OverlayEntry) = .empty,
     lock: std.Thread.Mutex = .{},
+    /// Sum of `key.len + value.len` for every `.value` entry, plus
+    /// `key.len` for every `.tombstone`. Tombstones don't count value
+    /// bytes (they don't store any) but they do count their key
+    /// allocation. Maintained inline by put/tombstone/clear/moveInto;
+    /// callers reach for this via `Manifest.max_overlay_bytes_per_store`
+    /// to back-pressure tenants that would otherwise grow the overlay
+    /// unboundedly between durabilizes.
+    bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Overlay {
         return .{ .allocator = allocator };
@@ -77,37 +85,56 @@ pub const Overlay = struct {
             }
         }
         self.entries.clearRetainingCapacity();
+        self.bytes = 0;
     }
 
     /// Insert or replace `key → value`. Both slices are cloned into
     /// overlay-owned memory; the caller retains ownership of its own
     /// buffers. If the key was previously tombstoned, the tombstone
     /// is replaced. Caller must hold `self.lock`.
-    pub fn putLocked(self: *Overlay, key: []const u8, value: []const u8) !void {
-        const gop = try self.entries.getOrPut(self.allocator, key);
+    ///
+    /// Panics on OOM — kvexp's recovery model is raft replay from the
+    /// durable watermark, so failed internal allocations crash the
+    /// host hard and loud rather than silently propagating.
+    pub fn putLocked(self: *Overlay, key: []const u8, value: []const u8) void {
+        const gop = self.entries.getOrPut(self.allocator, key) catch
+            @panic("OOM in Overlay.putLocked.getOrPut");
         if (gop.found_existing) {
             switch (gop.value_ptr.*) {
-                .value => |old| self.allocator.free(old),
+                .value => |old| {
+                    self.bytes -= old.len;
+                    self.allocator.free(old);
+                },
                 .tombstone => {},
             }
         } else {
             // New key: clone the bytes so the hashmap owns them.
-            gop.key_ptr.* = try self.allocator.dupe(u8, key);
+            gop.key_ptr.* = self.allocator.dupe(u8, key) catch
+                @panic("OOM in Overlay.putLocked duping key");
+            self.bytes += key.len;
         }
-        gop.value_ptr.* = .{ .value = try self.allocator.dupe(u8, value) };
+        gop.value_ptr.* = .{ .value = self.allocator.dupe(u8, value) catch
+            @panic("OOM in Overlay.putLocked duping value") };
+        self.bytes += value.len;
     }
 
     /// Mark `key` deleted. Frees any prior value bytes; keeps the key
-    /// allocation. Caller must hold `self.lock`.
-    pub fn tombstoneLocked(self: *Overlay, key: []const u8) !void {
-        const gop = try self.entries.getOrPut(self.allocator, key);
+    /// allocation. Caller must hold `self.lock`. Panics on OOM.
+    pub fn tombstoneLocked(self: *Overlay, key: []const u8) void {
+        const gop = self.entries.getOrPut(self.allocator, key) catch
+            @panic("OOM in Overlay.tombstoneLocked.getOrPut");
         if (gop.found_existing) {
             switch (gop.value_ptr.*) {
-                .value => |old| self.allocator.free(old),
+                .value => |old| {
+                    self.bytes -= old.len;
+                    self.allocator.free(old);
+                },
                 .tombstone => {},
             }
         } else {
-            gop.key_ptr.* = try self.allocator.dupe(u8, key);
+            gop.key_ptr.* = self.allocator.dupe(u8, key) catch
+                @panic("OOM in Overlay.tombstoneLocked duping key");
+            self.bytes += key.len;
         }
         gop.value_ptr.* = .tombstone;
     }
@@ -129,30 +156,41 @@ pub const Overlay = struct {
     /// entries winning collisions (key existed in both → dest gets
     /// src's value, dest's old value/tombstone is freed). Caller must
     /// hold both overlays' locks (or otherwise serialize access).
-    pub fn moveInto(src: *Overlay, dest: *Overlay) !void {
+    pub fn moveInto(src: *Overlay, dest: *Overlay) void {
         std.debug.assert(src.allocator.ptr == dest.allocator.ptr);
         var it = src.entries.iterator();
         while (it.next()) |e| {
             const k = e.key_ptr.*;
             const v = e.value_ptr.*;
-            const gop = try dest.entries.getOrPut(dest.allocator, k);
+            const src_v_bytes: usize = switch (v) {
+                .value => |val| val.len,
+                .tombstone => 0,
+            };
+            const gop = dest.entries.getOrPut(dest.allocator, k) catch
+                @panic("OOM in Overlay.moveInto.getOrPut");
             if (gop.found_existing) {
                 // dest already has this key. Free OUR key bytes (dest
                 // keeps its own copy), free dest's prior value, install
                 // our value.
                 src.allocator.free(k);
                 switch (gop.value_ptr.*) {
-                    .value => |old| dest.allocator.free(old),
+                    .value => |old| {
+                        dest.bytes -= old.len;
+                        dest.allocator.free(old);
+                    },
                     .tombstone => {},
                 }
+                dest.bytes += src_v_bytes;
                 gop.value_ptr.* = v;
             } else {
                 // Transfer src's key and value into dest verbatim.
                 gop.key_ptr.* = k;
                 gop.value_ptr.* = v;
+                dest.bytes += k.len + src_v_bytes;
             }
         }
         src.entries.clearRetainingCapacity();
+        src.bytes = 0;
     }
 
     /// True iff the overlay has no entries (use to skip durabilize-time
@@ -179,7 +217,7 @@ test "Overlay: put then get returns value" {
     defer ov.deinit();
     ov.lock.lock();
     defer ov.lock.unlock();
-    try ov.putLocked("k", "v");
+    ov.putLocked("k", "v");
     const got = ov.getLocked("k").?;
     try testing.expectEqualStrings("v", got.value);
 }
@@ -189,8 +227,8 @@ test "Overlay: put then put overwrites; old value freed" {
     defer ov.deinit();
     ov.lock.lock();
     defer ov.lock.unlock();
-    try ov.putLocked("k", "v1");
-    try ov.putLocked("k", "v2");
+    ov.putLocked("k", "v1");
+    ov.putLocked("k", "v2");
     const got = ov.getLocked("k").?;
     try testing.expectEqualStrings("v2", got.value);
 }
@@ -200,8 +238,8 @@ test "Overlay: tombstone after put marks deleted" {
     defer ov.deinit();
     ov.lock.lock();
     defer ov.lock.unlock();
-    try ov.putLocked("k", "v");
-    try ov.tombstoneLocked("k");
+    ov.putLocked("k", "v");
+    ov.tombstoneLocked("k");
     const got = ov.getLocked("k").?;
     try testing.expect(got == .tombstone);
 }
@@ -211,8 +249,8 @@ test "Overlay: put after tombstone resurrects key" {
     defer ov.deinit();
     ov.lock.lock();
     defer ov.lock.unlock();
-    try ov.tombstoneLocked("k");
-    try ov.putLocked("k", "v");
+    ov.tombstoneLocked("k");
+    ov.putLocked("k", "v");
     const got = ov.getLocked("k").?;
     try testing.expectEqualStrings("v", got.value);
 }
@@ -230,9 +268,9 @@ test "Overlay: clear frees everything" {
     defer ov.deinit();
     ov.lock.lock();
     defer ov.lock.unlock();
-    try ov.putLocked("a", "1");
-    try ov.putLocked("b", "2");
-    try ov.tombstoneLocked("c");
+    ov.putLocked("a", "1");
+    ov.putLocked("b", "2");
+    ov.tombstoneLocked("c");
     try testing.expectEqual(@as(usize, 3), ov.countLocked());
     ov.clear();
     try testing.expectEqual(@as(usize, 0), ov.countLocked());
@@ -250,7 +288,7 @@ test "Overlay: many puts then clear (no leaks under GPA)" {
         const k = try std.fmt.bufPrint(&kb, "key{d}", .{i});
         var vb: [16]u8 = undefined;
         const v = try std.fmt.bufPrint(&vb, "value{d}", .{i});
-        try ov.putLocked(k, v);
+        ov.putLocked(k, v);
     }
     try testing.expectEqual(@as(usize, 100), ov.countLocked());
     ov.clear();

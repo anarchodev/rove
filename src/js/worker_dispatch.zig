@@ -663,12 +663,129 @@ fn handleMetrics(
         \\
     , .{@intFromBool(worker.raft.isLeader())});
 
+    // ── kvexp: per-node manifest counters / histograms ────────────────
+    //
+    // Every KvStore on this node attaches to the same `cluster.kv`
+    // manifest, so the root store's snapshot reports node-wide totals.
+    // Histograms are surfaced with the `_seconds` suffix per Prometheus
+    // convention (kvexp records nanoseconds internally; we convert).
+    try writeKvexpMetrics(w, worker.node.tenant.root.manifestMetricsSnapshot());
+
     // Move the writer's accumulated bytes back into the ArrayList,
     // then transfer ownership to the response body. `toArrayList`
     // does NOT free the writer's buffer — it hands it back to us.
     buf = aw.toArrayList();
     const body = try buf.toOwnedSlice(allocator);
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "text/plain; version=0.0.4");
+}
+
+/// Render a kvexp.MetricsSnapshot as Prometheus text. Counter totals
+/// follow the `*_total` convention; the two duration histograms emit
+/// `_bucket{le="..."}`, `_sum`, and `_count` lines in seconds.
+fn writeKvexpMetrics(
+    w: *std.Io.Writer,
+    snap: kv_mod.KvexpMetricsSnapshot,
+) !void {
+    try w.print(
+        \\# HELP kvexp_put_total puts applied to a tenant txn.
+        \\# TYPE kvexp_put_total counter
+        \\kvexp_put_total {d}
+        \\# HELP kvexp_delete_total deletes applied to a tenant txn.
+        \\# TYPE kvexp_delete_total counter
+        \\kvexp_delete_total {d}
+        \\# HELP kvexp_get_total point reads through Txn / StoreLease.
+        \\# TYPE kvexp_get_total counter
+        \\kvexp_get_total {d}
+        \\# HELP kvexp_bytes_put_total key+value bytes appended via put.
+        \\# TYPE kvexp_bytes_put_total counter
+        \\kvexp_bytes_put_total {d}
+        \\# HELP kvexp_create_store_total stores created (pending or durable).
+        \\# TYPE kvexp_create_store_total counter
+        \\kvexp_create_store_total {d}
+        \\# HELP kvexp_drop_store_total stores dropped.
+        \\# TYPE kvexp_drop_store_total counter
+        \\kvexp_drop_store_total {d}
+        \\# HELP kvexp_acquire_total blocking dispatch-lease acquires.
+        \\# TYPE kvexp_acquire_total counter
+        \\kvexp_acquire_total {d}
+        \\# HELP kvexp_try_acquire_total non-blocking dispatch-lease attempts.
+        \\# TYPE kvexp_try_acquire_total counter
+        \\kvexp_try_acquire_total {d}
+        \\# HELP kvexp_try_acquire_contended_total tryAcquire attempts that returned null (lock held).
+        \\# TYPE kvexp_try_acquire_contended_total counter
+        \\kvexp_try_acquire_contended_total {d}
+        \\# HELP kvexp_txn_commit_total top-level Txn commits.
+        \\# TYPE kvexp_txn_commit_total counter
+        \\kvexp_txn_commit_total {d}
+        \\# HELP kvexp_txn_rollback_total top-level Txn rollbacks.
+        \\# TYPE kvexp_txn_rollback_total counter
+        \\kvexp_txn_rollback_total {d}
+        \\# HELP kvexp_savepoint_commit_total savepoint folds into parent.
+        \\# TYPE kvexp_savepoint_commit_total counter
+        \\kvexp_savepoint_commit_total {d}
+        \\# HELP kvexp_savepoint_rollback_total savepoint drops.
+        \\# TYPE kvexp_savepoint_rollback_total counter
+        \\kvexp_savepoint_rollback_total {d}
+        \\# HELP kvexp_durabilize_total durabilize() calls (fsync boundaries).
+        \\# TYPE kvexp_durabilize_total counter
+        \\kvexp_durabilize_total {d}
+        \\# HELP kvexp_durabilize_failed_total durabilize() calls that returned an error (manifest is now poisoned).
+        \\# TYPE kvexp_durabilize_failed_total counter
+        \\kvexp_durabilize_failed_total {d}
+        \\# HELP kvexp_snapshot_open_total openSnapshot() calls.
+        \\# TYPE kvexp_snapshot_open_total counter
+        \\kvexp_snapshot_open_total {d}
+        \\# HELP kvexp_poison_total times the manifest entered the poisoned state.
+        \\# TYPE kvexp_poison_total counter
+        \\kvexp_poison_total {d}
+        \\# HELP kvexp_active_leases dispatch leases currently outstanding.
+        \\# TYPE kvexp_active_leases gauge
+        \\kvexp_active_leases {d}
+        \\# HELP kvexp_active_snapshots read snapshots currently open.
+        \\# TYPE kvexp_active_snapshots gauge
+        \\kvexp_active_snapshots {d}
+        \\
+    , .{
+        snap.put_total,
+        snap.delete_total,
+        snap.get_total,
+        snap.bytes_put_total,
+        snap.create_store_total,
+        snap.drop_store_total,
+        snap.acquire_total,
+        snap.try_acquire_total,
+        snap.try_acquire_contended_total,
+        snap.txn_commit_total,
+        snap.txn_rollback_total,
+        snap.savepoint_commit_total,
+        snap.savepoint_rollback_total,
+        snap.durabilize_total,
+        snap.durabilize_failed_total,
+        snap.snapshot_open_total,
+        snap.poison_total,
+        snap.active_leases,
+        snap.active_snapshots,
+    });
+
+    try writeKvexpHistogram(w, "kvexp_durabilize_duration_seconds", snap.durabilize_duration);
+    try writeKvexpHistogram(w, "kvexp_snapshot_open_duration_seconds", snap.snapshot_open_duration);
+}
+
+fn writeKvexpHistogram(
+    w: *std.Io.Writer,
+    comptime name: []const u8,
+    h: kv_mod.KvexpHistogramSnapshot,
+) !void {
+    try w.print("# TYPE " ++ name ++ " histogram\n", .{});
+    const bounds = kv_mod.KvexpHistogram.bucket_bounds_nanos;
+    inline for (bounds, 0..) |ns, i| {
+        const seconds: f64 = @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
+        try w.print(name ++ "_bucket{{le=\"{d}\"}} {d}\n", .{ seconds, h.buckets[i] });
+    }
+    try w.print(name ++ "_bucket{{le=\"+Inf\"}} {d}\n", .{h.count});
+    const sum_seconds: f64 = @as(f64, @floatFromInt(h.sum_nanos)) / 1_000_000_000.0;
+    try w.print(name ++ "_sum {d}\n", .{sum_seconds});
+    try w.print(name ++ "_count {d}\n", .{h.count});
 }
 
 /// Bundle magic + version. Wire layout produced by handleRaftSnapshot:
