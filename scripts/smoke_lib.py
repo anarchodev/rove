@@ -486,6 +486,54 @@ class Cluster:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.shutdown()
 
+    def stop_node(self, idx: int) -> None:
+        """SIGTERM node `idx`'s worker process and wait for exit."""
+        p = self.workers[idx]
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+    def start_node(self, idx: int, *, extra_args: Optional[list[str]] = None,
+                   override_args: Optional[list[str]] = None,
+                   log_suffix: str = "") -> None:
+        """Spawn a fresh worker process for node `idx` and replace the
+        Popen entry in `self.workers`. Used by failover / snap-catchup
+        smokes that take a node down and back up.
+
+        `override_args` (if set) replaces the entire argv tail after
+        `worker` — useful for learner-promote-style restarts that need
+        a different --peers / --node-id shape.
+        """
+        bin_loop46 = BIN_DIR / "loop46"
+        log_path = self.log_dir / f"{self.tag}-worker-{idx}{log_suffix}.out"
+        if override_args is not None:
+            args = [str(bin_loop46), "worker"] + override_args
+        else:
+            args = [
+                str(bin_loop46), "worker",
+                "--node-id", str(idx),
+                "--peers", self.addrs.peers_csv,
+                "--listen", self.addrs.raft[idx],
+                "--http", self.addrs.http[idx],
+                "--data-dir", str(self.addrs.data_dirs[idx]),
+                "--public-suffix", self.addrs.public_suffix,
+                "--tls-cert", str(self.tls.cert),
+                "--tls-key", str(self.tls.key),
+                "--workers", "1",
+                "--election-timeout-ms", "200",
+                "--heartbeat-ms", "50",
+            ] + (extra_args or [])
+        f = open(log_path, "ab")
+        p = subprocess.Popen(args, env=os.environ, stdout=f, stderr=subprocess.STDOUT)
+        if idx < len(self.workers):
+            self.workers[idx] = p
+        else:
+            self.workers.append(p)
+        _TRACKED_PROCS.append(p)
+
     def shutdown(self) -> None:
         for p in (self.files_server, self.log_server, self.schedule_server, self.sse_server):
             if p is not None and p.poll() is None:
