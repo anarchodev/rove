@@ -950,6 +950,20 @@ pub fn Worker(comptime opts: Options) type {
         flusher_should_stop: std.atomic.Value(bool) = .init(false),
         flusher_wake: std.Thread.ResetEvent = .{},
 
+        /// Async batched log-server push. Flushers append the S3 batch
+        /// key they just PUT to `push_queue`; the `push_thread` drains
+        /// the queue and POSTs all queued keys as one body to
+        /// `/v1/_internal/batch-pushed`. Decouples the synchronous-
+        /// curl cost from the flusher so a slow / unreachable
+        /// log-server stops back-pressuring the dispatch path.
+        /// `push_queue` owns each `[]u8` (allocator-duped from the
+        /// flusher's local key).
+        push_queue: std.ArrayList([]u8) = .empty,
+        push_queue_mutex: std.Thread.Mutex = .{},
+        push_wake: std.Thread.ResetEvent = .{},
+        push_should_stop: std.atomic.Value(bool) = .init(false),
+        push_thread: ?std.Thread = null,
+
         // Background deployment loader lives on `node` (single per
         // process, shared across workers). Reach via
         // `worker.node.deployment_loader`.
@@ -1039,6 +1053,14 @@ pub fn Worker(comptime opts: Options) type {
 
             self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
 
+            // Spawn the push thread only if a libcurl handle was
+            // built (i.e. `log_public_base` is set). Without it
+            // pushBatchKey would short-circuit anyway; the thread
+            // would just spin.
+            if (self.log_push_curl != null) {
+                self.push_thread = try std.Thread.spawn(.{}, pushLoop, .{self});
+            }
+
             return self;
         }
 
@@ -1088,6 +1110,22 @@ pub fn Worker(comptime opts: Options) type {
                 t.join();
                 self.flusher_thread = null;
             }
+            // Stop the push thread AFTER the flusher: the flusher
+            // enqueues to push_queue, so stopping push first would
+            // leak whatever the flusher emitted on its final tick.
+            if (self.push_thread) |t| {
+                self.push_should_stop.store(true, .release);
+                self.push_wake.set();
+                t.join();
+                self.push_thread = null;
+            }
+            // Free any keys still queued at shutdown. Same
+            // best-effort posture as flushLogs's final partial batch:
+            // log-server will pick them up on its LIST poll.
+            self.push_queue_mutex.lock();
+            for (self.push_queue.items) |k| allocator.free(k);
+            self.push_queue.deinit(allocator);
+            self.push_queue_mutex.unlock();
             self.limiter.deinit();
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
@@ -1840,43 +1878,125 @@ pub fn flushLogs(worker: anytype) !void {
 /// directly. Builds `POST {log_public_base}/v1/_internal/batch-pushed`
 /// with `X-Rove-Batch-Key: <key>` + a freshly-minted services JWT.
 /// Fire-and-forget with a tight timeout — never blocks the worker.
+/// Enqueue a freshly-PUT batch key for the push thread to ship to
+/// log-server. Fast path: dupe + mutex-protected append + event set.
+/// The synchronous curl POST that used to live here now happens on
+/// the `pushLoop` thread, batching every key that queued up between
+/// pushes into one request body.
 fn pushBatchKey(
     worker: anytype,
     allocator: std.mem.Allocator,
     batch_key: []const u8,
 ) !void {
+    if (worker.log_push_curl == null) return;
+    if (worker.log_public_base) |base| {
+        if (base.len == 0) return;
+    } else return;
+    const key_copy = try allocator.dupe(u8, batch_key);
+    worker.push_queue_mutex.lock();
+    defer worker.push_queue_mutex.unlock();
+    worker.push_queue.append(allocator, key_copy) catch |err| {
+        allocator.free(key_copy);
+        return err;
+    };
+    worker.push_wake.set();
+}
+
+/// Cap on keys per outbound request — keeps the body bounded and
+/// matches the log-server's read-buffer expectations. Above this the
+/// loop sends multiple requests in sequence.
+const PUSH_MAX_KEYS_PER_REQUEST: usize = 1024;
+
+/// Background log-server push loop. Wakes on `push_wake` (set by
+/// `pushBatchKey`) or every `PUSH_TICK_NS` regardless. Drains the
+/// queue into a local slice, packs the keys into a newline-separated
+/// body, and POSTs to `/v1/_internal/batch-pushed`. The S3 batch
+/// itself was already PUT by the flusher; this thread only tells
+/// log-server *that the key exists*, so failures are soft — the
+/// indexer's LIST polling is the catch-up.
+fn pushLoop(worker: anytype) void {
+    const PUSH_TICK_NS: u64 = 50 * std.time.ns_per_ms;
+    const allocator = worker.allocator;
+    while (!worker.push_should_stop.load(.acquire)) {
+        worker.push_wake.timedWait(PUSH_TICK_NS) catch {};
+        worker.push_wake.reset();
+
+        // Drain the queue into a local list under the mutex, then
+        // release it before doing curl I/O. Workers append while we
+        // POST; that's fine — they'll show up on the next tick.
+        var drained: std.ArrayList([]u8) = .empty;
+        worker.push_queue_mutex.lock();
+        std.mem.swap(std.ArrayList([]u8), &drained, &worker.push_queue);
+        worker.push_queue_mutex.unlock();
+        if (drained.items.len == 0) continue;
+
+        var sent: usize = 0;
+        while (sent < drained.items.len) {
+            const end = @min(sent + PUSH_MAX_KEYS_PER_REQUEST, drained.items.len);
+            const chunk = drained.items[sent..end];
+            sendPushChunk(worker, allocator, chunk) catch |err| {
+                std.log.warn(
+                    "rove-js push: send {d} keys failed: {s} (LIST polling will catch up)",
+                    .{ chunk.len, @errorName(err) },
+                );
+            };
+            sent = end;
+        }
+        for (drained.items) |k| allocator.free(k);
+        drained.deinit(allocator);
+    }
+}
+
+/// POST a single chunk of newline-separated batch keys.
+fn sendPushChunk(
+    worker: anytype,
+    allocator: std.mem.Allocator,
+    keys: []const []u8,
+) !void {
     const easy = worker.log_push_curl orelse return;
     const log_base = worker.log_public_base orelse return;
     const secret = worker.services_jwt_secret orelse return;
-    if (log_base.len == 0) return;
 
     const url = try std.fmt.allocPrint(allocator, "{s}/v1/_internal/batch-pushed", .{log_base});
     defer allocator.free(url);
 
+    // JWT is minted once per chunk (60 s exp). Reusing it across
+    // multiple chunks in the same tick would be cheaper, but the
+    // chunk loop almost always runs just once.
     const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
     const token = try jwt_mod.mint(allocator, secret, .{ .exp_ms = now_ms + 60 * 1000 });
     defer allocator.free(token);
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
     defer allocator.free(auth_value);
 
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    for (keys, 0..) |k, i| {
+        if (i > 0) try body.append(allocator, '\n');
+        try body.appendSlice(allocator, k);
+    }
+
     const headers = [_]blob_mod.curl.Header{
         .{ .name = "Authorization", .value = auth_value },
-        .{ .name = "X-Rove-Batch-Key", .value = batch_key },
+        .{ .name = "Content-Type", .value = "text/plain" },
     };
     const use_h2c = std.mem.startsWith(u8, url, "http://");
     var resp = try easy.request(allocator, .{
         .method = .POST,
         .url = url,
         .headers = &headers,
-        .body = "",
-        .timeout_ms = 500,
-        .connect_timeout_ms = 200,
+        .body = body.items,
+        .timeout_ms = 2000,
+        .connect_timeout_ms = 500,
         .http_version = if (use_h2c) .h2c_prior_knowledge else .auto,
         .verify_tls = !worker.sse_insecure_tls,
     });
     defer resp.deinit(allocator);
     if (resp.status != 204) {
-        std.log.warn("rove-js push batch: {s} → {d}", .{ url, resp.status });
+        std.log.warn(
+            "rove-js push batch: {s} ({d} keys) → {d}",
+            .{ url, keys.len, resp.status },
+        );
     }
 }
 

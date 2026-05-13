@@ -219,9 +219,10 @@ fn processRequests(
     const sids = server.request_out.column(h2.StreamId);
     const sessions = server.request_out.column(h2.Session);
     const req_hdrs = server.request_out.column(h2.ReqHeaders);
+    const req_bodies = server.request_out.column(h2.ReqBody);
 
-    for (entities, sids, sessions, req_hdrs) |ent, sid, sess, rh| {
-        handleOne(server, allocator, rctx, ent, sid, sess, rh) catch |err| {
+    for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
+        handleOne(server, allocator, rctx, ent, sid, sess, rh, rb) catch |err| {
             std.log.warn("log-server-standalone: handler error: {s}", .{@errorName(err)});
             setResponse(server, ent, sid, sess, 500, "internal error\n", rctx.cfg) catch |se| std.log.err(
                 "log-server-standalone: 500 write failed: {s}",
@@ -239,11 +240,11 @@ fn handleOne(
     sid: h2.StreamId,
     sess: h2.Session,
     rh: h2.ReqHeaders,
+    rb: h2.ReqBody,
 ) !void {
     var method: []const u8 = "";
     var path: []const u8 = "";
     var authz: []const u8 = "";
-    var batch_key: []const u8 = "";
     if (rh.fields != null) {
         const fields = rh.fields.?[0..rh.count];
         for (fields) |f| {
@@ -252,7 +253,6 @@ fn handleOne(
             if (std.mem.eql(u8, name, ":method")) method = value;
             if (std.mem.eql(u8, name, ":path")) path = value;
             if (std.mem.eql(u8, name, "authorization")) authz = value;
-            if (std.mem.eql(u8, name, "x-rove-batch-key")) batch_key = value;
         }
     }
 
@@ -312,7 +312,8 @@ fn handleOne(
     // directly without waiting for the LIST polling cycle to catch
     // up. See `indexer.indexOneKey` for the why.
     if (is_push) {
-        try handleBatchPushed(server, allocator, rctx, ent, sid, sess, batch_key);
+        const body: []const u8 = if (rb.data) |d| d[0..rb.len] else "";
+        try handleBatchPushed(server, allocator, rctx, ent, sid, sess, body);
         return;
     }
 
@@ -327,6 +328,9 @@ fn handleOne(
     }
 }
 
+/// Body is one or more newline-separated batch keys. We index each
+/// in turn; any failure is logged but doesn't fail the whole request
+/// — LIST polling is the catch-up for anything we drop.
 fn handleBatchPushed(
     server: *LogH2,
     allocator: std.mem.Allocator,
@@ -334,32 +338,40 @@ fn handleBatchPushed(
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
-    batch_key: []const u8,
+    body: []const u8,
 ) !void {
-    if (batch_key.len == 0) {
-        try setResponse(server, ent, sid, sess, 400, "missing X-Rove-Batch-Key header\n", rctx.cfg);
-        return;
-    }
-    // Sanity: only accept keys that look like log batches. Prevents
-    // an attacker (already past the JWT gate) from probing arbitrary
-    // S3 keys via this endpoint.
-    if (!std.mem.startsWith(u8, batch_key, "_logs/") or
-        !std.mem.endsWith(u8, batch_key, ".ndjson"))
-    {
-        try setResponse(server, ent, sid, sess, 400, "bad batch key shape\n", rctx.cfg);
+    if (body.len == 0) {
+        try setResponse(server, ent, sid, sess, 400, "empty body — expected newline-separated batch keys\n", rctx.cfg);
         return;
     }
 
-    _ = indexer_mod.indexOneKey(allocator, rctx.store, rctx.db, batch_key) catch |err| {
-        std.log.warn(
-            "log-server: indexOneKey {s}: {s}",
-            .{ batch_key, @errorName(err) },
-        );
-        // Soft-fail — caller can re-push or wait for the next poll
-        // cycle to catch up.
-        try setResponse(server, ent, sid, sess, 500, "indexer failed\n", rctx.cfg);
+    var it = std.mem.splitScalar(u8, body, '\n');
+    var seen: usize = 0;
+    while (it.next()) |raw| {
+        const key = std.mem.trim(u8, raw, " \r\t");
+        if (key.len == 0) continue;
+        seen += 1;
+        // Sanity: only accept keys that look like log batches. Prevents
+        // an attacker (already past the JWT gate) from probing arbitrary
+        // S3 keys via this endpoint.
+        if (!std.mem.startsWith(u8, key, "_logs/") or
+            !std.mem.endsWith(u8, key, ".ndjson"))
+        {
+            std.log.warn("log-server: rejecting bad batch key shape: {s}", .{key});
+            continue;
+        }
+        _ = indexer_mod.indexOneKey(allocator, rctx.store, rctx.db, key) catch |err| {
+            std.log.warn(
+                "log-server: indexOneKey {s}: {s}",
+                .{ key, @errorName(err) },
+            );
+            continue;
+        };
+    }
+    if (seen == 0) {
+        try setResponse(server, ent, sid, sess, 400, "no batch keys in body\n", rctx.cfg);
         return;
-    };
+    }
     try setResponse(server, ent, sid, sess, 204, "", rctx.cfg);
 }
 
