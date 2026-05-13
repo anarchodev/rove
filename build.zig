@@ -312,6 +312,16 @@ pub fn build(b: *std.Build) void {
         .{ .name = "admin_ui_codemirror", .path = "web/admin/codemirror.mjs" },
         .{ .name = "replay_index_html", .path = "web/replay/index.html" },
         .{ .name = "replay_app_js", .path = "web/replay/app.js" },
+        // WASM-driven replay path (PLAN §10.12 follow-on). Same
+        // tenant, different entry point: replay.<suffix>/wasm boots
+        // arenajs-WASM and runs the captured handler through it
+        // instead of stubbing globals in an iframe. The .wasm payload
+        // is ~1 MiB embedded into the worker binary.
+        .{ .name = "replay_wasm_html",     .path = "web/replay/wasm.html" },
+        .{ .name = "replay_wasm_app_mjs",  .path = "web/replay/wasm-app.mjs" },
+        .{ .name = "replay_rtap_mjs",      .path = "web/replay/rtap.mjs" },
+        .{ .name = "replay_qjs_wasm_js",   .path = "web/replay/qjs_arena_wasm.js" },
+        .{ .name = "replay_qjs_wasm_wasm", .path = "web/replay/qjs_arena_wasm.wasm" },
     };
     for (platform_bundle_files) |f| {
         files_server_mod.addAnonymousImport(f.name, .{

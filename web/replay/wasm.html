@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Loop46 replay (WASM)</title>
+<style>
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 0; color: #222; background: #fafafa; }
+  header { padding: 0.75em 1em; border-bottom: 1px solid #ddd; background: #fff; }
+  header h1 { font-size: 1.1em; margin: 0 0 0.25em; }
+  header h1 .tag { font-size: 0.7em; font-weight: normal; color: #888;
+                   border: 1px solid #ccc; padding: 1px 6px; border-radius: 3px;
+                   margin-left: 0.5em; vertical-align: 1px; }
+  .status { font-size: 0.9em; color: #666; }
+  .status.error { color: #b00020; }
+  .status.ok { color: #2e7d32; }
+  main { display: grid; grid-template-columns: 280px 1fr; gap: 0; height: calc(100vh - 64px); }
+  section { padding: 0.75em 1em; overflow: auto; border-right: 1px solid #ddd; }
+  section:last-child { border-right: none; }
+  h2 { font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.04em; color: #888; margin: 0 0 0.5em; }
+  dl { font-family: ui-monospace, monospace; font-size: 12px; margin: 0;
+       display: grid; grid-template-columns: max-content 1fr; gap: 2px 1em; }
+  dt { color: #888; }
+  dd { margin: 0; word-break: break-all; }
+  pre.output { font-family: ui-monospace, monospace; font-size: 12px;
+               background: #fff; border: 1px solid #e0e0e0; padding: 0.75em;
+               border-radius: 4px; margin: 0.25em 0; white-space: pre-wrap;
+               word-break: break-all; max-height: 50%; overflow: auto; }
+  .hint { color: #888; font-size: 12px; padding-top: 0.5em; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Loop46 replay <span class="tag">WASM</span></h1>
+  <div id="status" class="status info">loading…</div>
+</header>
+<main>
+  <section>
+    <h2>Request</h2>
+    <dl id="meta"></dl>
+    <p class="hint">
+      Running the captured handler through arenajs compiled to WASM.
+      Source-level scrubber + variable inspection coming next; v1
+      just runs the handler end-to-end and reports the outcome.
+    </p>
+  </section>
+  <section>
+    <h2>Run</h2>
+    <div id="run-status" class="status info">waiting for bundle…</div>
+    <h2 style="margin-top:1em">Output</h2>
+    <pre id="output" class="output">(none yet)</pre>
+  </section>
+</main>
+<script type="module" src="wasm-app.mjs"></script>
+</body>
+</html>

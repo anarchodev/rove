@@ -82,10 +82,27 @@ pub const ADMIN_DEPLOY_FILES = [_]DeployFile{
 
 const REPLAY_INDEX_HTML = @embedFile("replay_index_html");
 const REPLAY_APP_JS = @embedFile("replay_app_js");
+// WASM-driven replay path — served at replay.<suffix>/wasm. The .wasm
+// payload is the big one (~1 MiB), included once per worker binary.
+const REPLAY_WASM_HTML     = @embedFile("replay_wasm_html");
+const REPLAY_WASM_APP_MJS  = @embedFile("replay_wasm_app_mjs");
+const REPLAY_RTAP_MJS      = @embedFile("replay_rtap_mjs");
+const REPLAY_QJS_WASM_JS   = @embedFile("replay_qjs_wasm_js");
+const REPLAY_QJS_WASM_WASM = @embedFile("replay_qjs_wasm_wasm");
 
 pub const REPLAY_DEPLOY_FILES = [_]DeployFile{
     .{ .path = "_static/index.html", .content = REPLAY_INDEX_HTML, .content_type = "text/html; charset=utf-8" },
     .{ .path = "_static/app.js", .content = REPLAY_APP_JS, .content_type = "application/javascript" },
+    .{ .path = "_static/wasm.html",          .content = REPLAY_WASM_HTML,
+      .content_type = "text/html; charset=utf-8" },
+    .{ .path = "_static/wasm-app.mjs",       .content = REPLAY_WASM_APP_MJS,
+      .content_type = "application/javascript" },
+    .{ .path = "_static/rtap.mjs",           .content = REPLAY_RTAP_MJS,
+      .content_type = "application/javascript" },
+    .{ .path = "_static/qjs_arena_wasm.js",  .content = REPLAY_QJS_WASM_JS,
+      .content_type = "application/javascript" },
+    .{ .path = "_static/qjs_arena_wasm.wasm", .content = REPLAY_QJS_WASM_WASM,
+      .content_type = "application/wasm" },
 };
 
 /// Tenant ids that this module bootstraps. Kept here so the names
