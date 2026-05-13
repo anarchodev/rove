@@ -625,11 +625,12 @@ const SubcommandResult = union(enum) {
 ///   --store <name>   tenant id (e.g. "acme", "__root__") or the
 ///                    literal "schedules" to read schedules.db.
 ///
-/// Under kvexp the data lives in LMDB inside `cluster.kv` / `schedules.db`;
-/// direct `sqlite3` reads no longer work. This subcommand opens the
-/// file standalone (single-process — caller must shut the cluster
-/// down first). Exits 0 on hit, 1 on missing key, 2 on usage / io
-/// error.
+/// Under kvexp the data lives in LMDB inside `cluster.kv` /
+/// `schedules.db`; direct `sqlite3` reads no longer work. This
+/// subcommand opens the file standalone; safe to run against a live
+/// cluster (kvexp's LMDB env uses MDB_NOTLS + the reader table, so
+/// read-only opens from a second process don't conflict with the
+/// writer). Exits 0 on hit, 1 on missing key, 2 on usage / io error.
 fn runKvGet(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     var data_dir: ?[]const u8 = null;
     var store_name: ?[]const u8 = null;
