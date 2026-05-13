@@ -18,11 +18,20 @@
 # Usage:
 #   N_ACTIVE=64 bash scripts/kv_bench_active_fanout.sh
 #   N_ACTIVE=128 N_IDLE=10000 bash scripts/kv_bench_active_fanout.sh
+#   MODE=zipf N_ACTIVE=128 STEADY_S=30 bash scripts/kv_bench_active_fanout.sh
+#   HANDLER=rwbench N_ACTIVE=128 bash scripts/kv_bench_active_fanout.sh
 #
 # Env knobs:
-#   N_ACTIVE=64          parallel write tenants under load
+#   N_ACTIVE=64          parallel tenants under load
 #   N_IDLE=0             extra idle tenants in the pool
-#   PER_REQUESTS=5000    h2load -n per active tenant
+#   HANDLER=write        handler dir under examples/loop46-demo-tenants/
+#                        (write|rwbench|readonly)
+#   MODE=uniform         drive shape; `uniform` = same c×m + h2load -n
+#                        per tenant; `zipf` = Zipf(s)-weighted c×m,
+#                        h2load -D fixed duration
+#   PER_REQUESTS=5000    h2load -n per active tenant (uniform mode only)
+#   STEADY_S=30          drive duration in seconds (zipf mode only)
+#   ZIPF_S=1.0           Zipf exponent; >1 = sharper skew, <1 = flatter
 #   TARGET_INFLIGHT=1024 aggregate in-flight streams; per-tenant
 #                        c×m derived from this
 
@@ -39,6 +48,19 @@ N_ACTIVE="${N_ACTIVE:-64}"
 N_IDLE="${N_IDLE:-0}"
 PER_REQUESTS="${PER_REQUESTS:-5000}"
 TARGET_INFLIGHT="${TARGET_INFLIGHT:-1024}"
+MODE="${MODE:-uniform}"
+STEADY_S="${STEADY_S:-30}"
+ZIPF_S="${ZIPF_S:-1.0}"
+# Handler shape: directory name under examples/loop46-demo-tenants/.
+# `write` = pure kv.set (default, max write throughput).
+# `rwbench` = ~90% kv.get / ~10% kv.set (typical SaaS read-heavy mix).
+# `readonly` = kv.get only.
+HANDLER="${HANDLER:-write}"
+
+case "$MODE" in
+    uniform|zipf) ;;
+    *) echo "error: MODE must be uniform or zipf (got '$MODE')" >&2; exit 2 ;;
+esac
 
 # Derive per-tenant c × m so c*m*N_ACTIVE ≈ TARGET_INFLIGHT, with
 # m at least 2 and c at least 1. Picks m = sqrt(per_tenant) when
@@ -107,7 +129,7 @@ trap 'rm -f "$FANOUT_MANIFEST" "${IDLE_MANIFEST:-}" 2>/dev/null || true' EXIT
     echo -n '{"tenants":['
     for (( i = 0; i < N_ACTIVE; i++ )); do
         (( i > 0 )) && echo -n ','
-        printf '{"id":"fan%05d","domains":["fan%05d.loop46.localhost"],"files":[{"path":"index.mjs","source":"loop46-demo-tenants/write/index.mjs"}]}' "$i" "$i"
+        printf '{"id":"fan%05d","domains":["fan%05d.loop46.localhost"],"files":[{"path":"index.mjs","source":"loop46-demo-tenants/%s/index.mjs"}]}' "$i" "$i" "$HANDLER"
     done
     echo ']}'
 } > "$FANOUT_MANIFEST"
@@ -115,7 +137,7 @@ trap 'rm -f "$FANOUT_MANIFEST" "${IDLE_MANIFEST:-}" 2>/dev/null || true' EXIT
 # relative source path correctly.
 cp "$FANOUT_MANIFEST" examples/.fanout_manifest.json
 trap 'rm -f examples/.fanout_manifest.json "${IDLE_MANIFEST:-}" 2>/dev/null || true' EXIT
-echo "── seeding $N_ACTIVE active write tenants (full bootstrap, content-addressed bytecode) ──"
+echo "── seeding $N_ACTIVE active tenants on handler=$HANDLER (full bootstrap, content-addressed bytecode) ──"
 t0=$(date +%s)
 for d in "${DATA_DIRS[@]}"; do
     "$BIN" seed --data-dir "$d" --manifest examples/.fanout_manifest.json >/dev/null
@@ -257,19 +279,74 @@ extract_rps() {
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo " kv active-fanout bench"
+echo " mode=$MODE  handler=$HANDLER"
 echo " N_ACTIVE=$N_ACTIVE  N_IDLE=$N_IDLE  N_TOTAL=$N_TOTAL"
-echo " per-tenant c=$PT_C  m=$PT_M  (target in-flight ≈ $TARGET_INFLIGHT)"
-echo " requests per tenant: $PER_REQUESTS  (total ≈ $((PER_REQUESTS * N_ACTIVE)))"
+if [[ "$MODE" == "uniform" ]]; then
+    echo " per-tenant c=$PT_C  m=$PT_M  (target in-flight ≈ $TARGET_INFLIGHT)"
+    echo " requests per tenant: $PER_REQUESTS  (total ≈ $((PER_REQUESTS * N_ACTIVE)))"
+else
+    echo " zipf s=$ZIPF_S  steady=${STEADY_S}s  target in-flight ≈ $TARGET_INFLIGHT"
+fi
 echo "═══════════════════════════════════════════════════════════════"
 
 LOG_DIR=$(mktemp -d -t rove-kv-fanout-XXXXXX)
 PID_LIST=()
+declare -a TENANT_C TENANT_M
+
+if [[ "$MODE" == "zipf" ]]; then
+    # Zipf-weighted streams per tenant. Python does the float math
+    # since bash can't (and we want exact-ish proportionality).
+    # Each line: "<c> <m>" for tenant i, sum(c×m) ≈ TARGET_INFLIGHT.
+    # Floor each tenant at 2 streams so even the long-tail draws
+    # *some* traffic (the dispatcher path is what we want to test).
+    mapfile -t SLOTS < <(python3 -c "
+import math
+N = $N_ACTIVE
+s = $ZIPF_S
+T = $TARGET_INFLIGHT
+weights = [1.0 / ((i + 1) ** s) for i in range(N)]
+norm = sum(weights)
+# Floor at 2 streams to keep the tail alive; ceiling = TARGET so the
+# top tenant doesn't drown the loadgen if N is tiny.
+allocated = []
+for w in weights:
+    n = round(T * w / norm)
+    n = max(2, min(T, n))
+    allocated.append(n)
+for n in allocated:
+    if n <= 4:
+        print(f'1 {n}')
+    elif n <= 16:
+        print(f'2 {n // 2}')
+    else:
+        c = max(1, int(round(math.sqrt(n))))
+        m = max(1, n // c)
+        print(f'{c} {m}')
+")
+    for i in $(seq 0 $((N_ACTIVE - 1))); do
+        read -r ci mi <<< "${SLOTS[$i]}"
+        TENANT_C[$i]=$ci
+        TENANT_M[$i]=$mi
+    done
+    echo " head:  c=${TENANT_C[0]} m=${TENANT_M[0]} (rank 1)"
+    mid=$(( N_ACTIVE / 2 ))
+    echo " mid:   c=${TENANT_C[$mid]} m=${TENANT_M[$mid]} (rank $((mid + 1)))"
+    echo " tail:  c=${TENANT_C[$((N_ACTIVE - 1))]} m=${TENANT_M[$((N_ACTIVE - 1))]} (rank $N_ACTIVE)"
+    echo "═══════════════════════════════════════════════════════════════"
+fi
+
 t_start=$(date +%s.%N)
 for i in $(seq 0 $((N_ACTIVE - 1))); do
     tid=$(printf "fan%05d" "$i")
-    "${H2LOAD[@]}" -n "$PER_REQUESTS" -c "$PT_C" -m "$PT_M" \
-        "https://${tid}.loop46.localhost:${LEADER_PORT}/?fn=handler" \
-        > "$LOG_DIR/${tid}.log" 2>&1 &
+    if [[ "$MODE" == "zipf" ]]; then
+        "${H2LOAD[@]}" -D "$STEADY_S" -c "${TENANT_C[$i]}" -m "${TENANT_M[$i]}" \
+            "https://${tid}.loop46.localhost:${LEADER_PORT}/?fn=handler" \
+            > "$LOG_DIR/${tid}.log" 2>&1 &
+    else
+        "${H2LOAD[@]}" -n "$PER_REQUESTS" -c "$PT_C" -m "$PT_M" \
+            "https://${tid}.loop46.localhost:${LEADER_PORT}/?fn=handler" \
+            > "$LOG_DIR/${tid}.log" 2>&1 &
+    fi
     PID_LIST+=($!)
 done
 for p in "${PID_LIST[@]}"; do wait "$p"; done
@@ -280,6 +357,7 @@ ok_count=0
 fail_count=0
 slowest=0
 fastest=999999999
+declare -a TENANT_RPS
 for i in $(seq 0 $((N_ACTIVE - 1))); do
     tid=$(printf "fan%05d" "$i")
     f="$LOG_DIR/${tid}.log"
@@ -287,8 +365,9 @@ for i in $(seq 0 $((N_ACTIVE - 1))); do
     rps=$(extract_rps < "$f")
     rps_i=${rps%.*}
     [[ -n "$rps_i" ]] || rps_i=0
+    TENANT_RPS[$i]=$rps_i
     shard_total=$((shard_total + rps_i))
-    if grep -q "succeeded, .*$PER_REQUESTS succeeded" "$f" 2>/dev/null; then
+    if [[ "$MODE" == "uniform" ]] && grep -q "succeeded, .*$PER_REQUESTS succeeded" "$f" 2>/dev/null; then
         ok_count=$((ok_count + 1))
     fi
     if (( rps_i > slowest )); then slowest=$rps_i; fi
@@ -296,16 +375,31 @@ for i in $(seq 0 $((N_ACTIVE - 1))); do
 done
 
 elapsed=$(awk "BEGIN {printf \"%.2f\", $t_end - $t_start}")
-total_req=$((PER_REQUESTS * N_ACTIVE))
-total_rps=$(awk "BEGIN {printf \"%.0f\", $total_req / ($t_end - $t_start)}")
+if [[ "$MODE" == "uniform" ]]; then
+    total_req=$((PER_REQUESTS * N_ACTIVE))
+    total_rps=$(awk "BEGIN {printf \"%.0f\", $total_req / ($t_end - $t_start)}")
+else
+    # In zipf mode no `-n` cap; total_rps == shard_total / wall_s, but
+    # h2load -D's own clock approximates wall_s well enough. Use the
+    # sum-of-per-tenant as the headline aggregate.
+    total_rps=$shard_total
+fi
 mean_rps=$(( shard_total / N_ACTIVE ))
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 printf " elapsed:                %ss\n" "$elapsed"
 printf " sum of per-tenant rps:  %s req/s (sum across $N_ACTIVE tenants)\n" "$shard_total"
-printf " wall-clock rps:         %s req/s (total_req / elapsed)\n" "$total_rps"
+printf " aggregate rps:          %s req/s\n" "$total_rps"
 printf " per-tenant mean:        %s req/s\n" "$mean_rps"
 printf " per-tenant min..max:    %s..%s req/s\n" "$fastest" "$slowest"
+if [[ "$MODE" == "zipf" ]]; then
+    head_rps=${TENANT_RPS[0]}
+    tail_rps=${TENANT_RPS[$((N_ACTIVE - 1))]}
+    mid_rps=${TENANT_RPS[$((N_ACTIVE / 2))]}
+    printf " head/mid/tail rps:      %s / %s / %s (rank 1, %s, %s)\n" \
+        "$head_rps" "$mid_rps" "$tail_rps" \
+        "$((N_ACTIVE / 2 + 1))" "$N_ACTIVE"
+fi
 echo "═══════════════════════════════════════════════════════════════"
 rm -rf "$LOG_DIR"

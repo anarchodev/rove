@@ -146,10 +146,15 @@ fn finalizeBatch(
 
     if (!has_writes and !has_cmds) {
         // Pure read-only batch: no raft hop. The txn overlay is empty
-        // (or only contains reads, which kvexp doesn't record); commit
-        // is a near-no-op that just releases the per-tenant lock.
-        txn.commit() catch |err| panic_mod.invariantViolated(
-            "finalizeBatch.commit(read_only)",
+        // (kv.get doesn't record anything), so we rollback rather than
+        // commit — kvexp Txn.commit requires this txn to be the chain
+        // head, but under cross-tenant load a predecessor write txn on
+        // the same tenant may still be chain-head waiting on raft to
+        // apply. Rollback works at any chain position and drops the
+        // (empty) overlay either way, with no semantic difference for
+        // read-only.
+        txn.rollback() catch |err| panic_mod.invariantViolated(
+            "finalizeBatch.rollback(read_only)",
             "tenant={s} err={s}",
             .{ anchor_id, @errorName(err) },
         );
