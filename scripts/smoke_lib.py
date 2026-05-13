@@ -603,6 +603,46 @@ class Cluster:
         if leader_url:
             self._wait_for_log(log_path, "__replay__ deploy", 15.0, "files-server bootstrap")
 
+    def spawn_sse_server(
+        self,
+        *,
+        listen: str,
+        internal_token: str,
+        startup_timeout_s: float = 3.0,
+    ) -> None:
+        """Spawn `sse-server-standalone` on `listen` (h2c). Sets
+        `SSE_INTERNAL_TOKEN` + `LOOP46_SERVICES_JWT_SECRET` in env so
+        the worker's emit POST verifies."""
+        bin_path = BIN_DIR / "sse-server-standalone"
+        log_path = self.log_dir / f"{self.tag}-sse-server.out"
+        env = os.environ.copy()
+        env["SSE_INTERNAL_TOKEN"] = internal_token
+        f = open(log_path, "wb")
+        self.sse_server = subprocess.Popen(
+            [str(bin_path), "--listen", listen],
+            env=env, stdout=f, stderr=subprocess.STDOUT,
+        )
+        _TRACKED_PROCS.append(self.sse_server)
+        port = int(listen.rsplit(":", 1)[1])
+        deadline = time.monotonic() + startup_timeout_s
+        while time.monotonic() < deadline:
+            try:
+                r = subprocess.run(
+                    ["curl", "-sf", "--http2-prior-knowledge",
+                     f"http://127.0.0.1:{port}/v1/health"],
+                    capture_output=True, timeout=2.0,
+                )
+                if r.returncode == 0:
+                    return
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(0.1)
+        sys.stderr.write(
+            f"sse-server: didn't answer /v1/health within {startup_timeout_s}s\n"
+        )
+        sys.stderr.write(log_path.read_text(errors="replace"))
+        raise RuntimeError("sse-server startup timeout")
+
     def spawn_log_server(
         self,
         *,
