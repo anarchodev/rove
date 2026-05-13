@@ -538,12 +538,11 @@ fn workerMain(args: *WorkerCtx) !void {
     // handful-of-tenants-per-tick workloads we've measured.
     var blocked_tenants: rjs.BlockedTenants = .{};
 
-    // Worker-0 lazy state for in-process schedule dispatch
-    // (http-send-plan §3.2). Other workers skip — the phase is
-    // gated to worker 0 so only one thread on this node makes
-    // dispatch decisions for the internal pool.
-    var internal_sched_store: ?schedule_server_mod.ScheduleStore = null;
-    defer if (internal_sched_store) |*s| s.close();
+    // Worker-0 in-flight bookkeeping for in-process schedule dispatch
+    // (http-send-plan §3.2). The store itself is process-shared and
+    // injected via `args.internal_schedules_store` from main; per-worker
+    // opens would create separate LMDB envs whose main_overlays never
+    // see each other's writes (apply path vs scan path race).
     var internal_sched_inflight: std.StringHashMapUnmanaged(void) = .empty;
     defer {
         var it = internal_sched_inflight.iterator();
@@ -551,15 +550,6 @@ fn workerMain(args: *WorkerCtx) !void {
         internal_sched_inflight.deinit(allocator);
     }
     if (args.worker_idx == 0) {
-        const sched_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/schedules.db",
-            .{args.data_dir},
-            0,
-        );
-        defer allocator.free(sched_path);
-        internal_sched_store = try schedule_server_mod.ScheduleStore.open(allocator, sched_path);
-        args.internal_schedules_store = &internal_sched_store.?;
         args.internal_schedules_inflight = &internal_sched_inflight;
     }
 
@@ -1080,6 +1070,24 @@ pub fn main() !void {
     // Internal-target stamping for envelope-8 (http-send-plan §3.2).
     loop46_ctx.public_suffix = cli.public_suffix;
 
+    // Process-shared schedule store. Under kvexp/LMDB, opening the
+    // same file as separate envs from multiple threads creates
+    // independent main_overlay buffers — writes from one thread are
+    // invisible to readers on another until durabilize. Pre-cutover
+    // sqlite WAL papered over this; now every consumer (apply
+    // handlers, worker-0 internal-schedule tick, schedule-server
+    // libcurl thread) must share one ScheduleStore handle.
+    const sched_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/schedules.db",
+        .{cli.data_dir},
+        0,
+    );
+    defer allocator.free(sched_path);
+    var schedules_store = try schedule_server_mod.ScheduleStore.open(allocator, sched_path);
+    defer schedules_store.close();
+    loop46_ctx.schedules_store = &schedules_store;
+
     const peers = try parsePeerList(allocator, cli.peers);
     defer {
         for (peers) |p| allocator.free(p.host);
@@ -1355,7 +1363,7 @@ pub fn main() !void {
     // the next-due-or-poll deadline.
     const schedule_handle = try schedule_server_mod.thread.spawn(.{
         .allocator = allocator,
-        .data_dir = cli.data_dir,
+        .store = &schedules_store,
         .raft = raft_node,
     });
     defer schedule_handle.join();
@@ -1416,6 +1424,10 @@ pub fn main() !void {
             .seq_counters = &seq_counters,
             .log_batch_store = log_batch_store,
             .ready = &ready_events[i],
+            // Process-shared schedule store (worker 0 uses it for the
+            // in-process internal-schedule dispatch tick). Other
+            // workers leave null — only worker 0 runs that phase.
+            .internal_schedules_store = if (i == 0) &schedules_store else null,
         };
         threads[i] = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctxs[i]});
     }
