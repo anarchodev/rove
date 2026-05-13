@@ -459,9 +459,12 @@ class Cluster:
                 "--heartbeat-ms", "50",
             ]
             if with_log_files_bases:
+                # Hostname form (logs.{public_suffix}, files.{public_suffix})
+                # rather than 127.0.0.1:port — keeps the TLS SAN matching
+                # the cert and matches what production deployments emit.
                 args += [
-                    "--log-public-base", f"https://{addrs.log_addr}",
-                    "--files-public-base", f"https://{addrs.files_addr}",
+                    "--log-public-base", f"https://logs.{public_suffix}:{addrs.log_port}",
+                    "--files-public-base", f"https://files.{public_suffix}:{addrs.files_port}",
                 ]
             if admin_origin_per_node:
                 port = http_base + i
