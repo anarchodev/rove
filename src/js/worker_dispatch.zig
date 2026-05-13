@@ -837,16 +837,28 @@ fn handleRelease(
 
     // Idempotent fast path: matches `releasePublishTrampoline`. If
     // the target's `_deploy/current` is already exactly `dep_id`,
-    // return 204 without touching raft — same code the post-commit
-    // path returns, so callers don't need to branch on 202 vs 204.
-    // The platform-bootstrap flow (files-server pushing __admin__ /
-    // __replay__ at start) retries on connection-refused; each retry
-    // can land here after the first commit, so without this short-
-    // circuit every retry re-proposes a no-op envelope.
+    // skip the raft propose. The platform-bootstrap flow (files-server
+    // pushing __admin__ / __replay__ at start) retries on connection-
+    // refused; each retry can land here after the first commit, so
+    // without this short-circuit every retry re-proposes a no-op
+    // envelope.
+    //
+    // Still enqueue the deployment loader though: dep_ids are sequential
+    // local counters, not content-addressed, so the same dep_id can
+    // point at different S3 manifests over time (e.g. the bootstrap
+    // path's dep_id=1 and a subsequent files-server PUT-file that also
+    // mints dep_id=1). The loader is per-tenant dedup'd, so an extra
+    // enqueue against unchanged content is a cheap re-fetch.
     if (inst.kv.get("_deploy/current")) |current_hex| {
         defer allocator.free(current_hex);
         const current_id = std.fmt.parseInt(u64, current_hex, 16) catch 0;
         if (current_id == parsed.value.dep_id) {
+            if (worker.node.deployment_loader) |loader| {
+                loader.enqueue(parsed.value.tenant_id, parsed.value.dep_id) catch |err| std.log.warn(
+                    "release fast-path: loader.enqueue {s}/{d} failed: {s}",
+                    .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
+                );
+            }
             try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
             return;
         }

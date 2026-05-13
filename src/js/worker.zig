@@ -699,7 +699,22 @@ fn deploymentLoadFnNode(
     node.tenant_files_lock.lock();
     const slot_opt = node.tenant_files_map.get(tenant_id);
     node.tenant_files_lock.unlock();
-    const slot = slot_opt orelse return;
+    const slot = slot_opt orelse blk: {
+        // Runtime-created tenant (signup, admin createInstance):
+        // the apply.zig enqueue fires before any request has
+        // lazy-opened the slot. Open it here so the snapshot
+        // lands; otherwise the first request to the new tenant
+        // 503s until the next reload event.
+        const inst_opt = node.tenant.getInstance(tenant_id) catch null;
+        const inst = inst_opt orelse return; // tenant not on this node
+        break :blk node.getOrOpenTenantSlot(inst) catch |err| {
+            std.log.warn(
+                "rove-js: lazy slot-open for runtime tenant {s} failed: {s}",
+                .{ tenant_id, @errorName(err) },
+            );
+            return;
+        };
+    };
     try reloadDeployment(slot, dep_id);
 }
 
@@ -1146,6 +1161,7 @@ pub fn Worker(comptime opts: Options) type {
                 self.compile_ctx,
                 &release_ws,
             );
+            std.log.info("deployStarter: {s} writeset built ({d} ops)", .{ target_id, release_ws.ops.items.len });
 
             var txn = try inst.kv.beginTrackedImmediate();
             errdefer txn.rollback() catch {};
@@ -1167,6 +1183,21 @@ pub fn Worker(comptime opts: Options) type {
                     .{ target_id, @errorName(err) },
                 );
             };
+            std.log.info("deployStarter: {s} committed locally + proposed envelope 0", .{target_id});
+
+            // Eagerly enqueue the deployment loader so the runtime-created
+            // tenant's snapshot lands without waiting for the next reload
+            // event. apply.zig also enqueues on the envelope-0 _deploy/current
+            // observation, but that runs on a different thread and may race
+            // the first customer request to this fresh tenant. Belt-and-
+            // braces: the loader's enqueue is per-tenant dedup'd, so double-
+            // enqueue is harmless.
+            if (self.node.deployment_loader) |loader| {
+                loader.enqueue(target_id, 1) catch |err| std.log.warn(
+                    "deployStarter: loader.enqueue {s}/1 failed: {s}",
+                    .{ target_id, @errorName(err) },
+                );
+            }
         }
 
         /// Trampoline for `platform.releases.publish(tenant_id,
@@ -1809,40 +1840,35 @@ fn reloadAllBytecodes(slot: *TenantSlot) !void {
 fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     const allocator = slot.allocator;
     // Two-tier source for the manifest bytes:
-    //   1. Cached snapshot's `manifest_bytes` matching this dep_id —
-    //      re-decode locally, no I/O. Common when the release
-    //      handler is doing a re-release of the same dep_id (e.g.
-    //      the bench's warmup phase).
-    //   2. One-shot prefetch from cold-start. Transfer ownership
-    //      out of the prefetch slot.
-    //   3. Per-tenant HTTP / S3 fetch via manifest_backend.
+    //   1. One-shot prefetch from cold-start. Transfer ownership
+    //      out of the prefetch slot when the dep_id matches.
+    //   2. Per-tenant HTTP / S3 fetch via manifest_backend.
+    //
+    // No "cached manifest matching dep_id" short-circuit: dep_ids
+    // are sequential local counters, not content-addressed, so the
+    // S3 object at the same dep_id can carry different content
+    // over time (e.g. files-server's starter PUT vs a subsequent
+    // PUT-file deploy that both mint dep_id=1 against a fresh
+    // working tree). The bench's hot-reload optimisation was real
+    // but it traded correctness for it.
     var json_bytes: []u8 = undefined;
-    var bytes_taken_from_cache = false;
-    if (slot.current.load(.acquire)) |cur_snap| {
-        if (cur_snap.deployment_id == dep_id) {
-            json_bytes = try allocator.dupe(u8, cur_snap.manifest_bytes);
-            bytes_taken_from_cache = true;
+    var owned_by_prefetch = false;
+    if (slot.prefetched_manifest) |p| {
+        slot.prefetched_manifest = null;
+        if (p.dep_id == dep_id) {
+            json_bytes = p.bytes;
+            owned_by_prefetch = true;
+        } else {
+            allocator.free(p.bytes);
         }
     }
-    if (!bytes_taken_from_cache) {
-        var owned_by_prefetch = false;
-        if (slot.prefetched_manifest) |p| {
-            slot.prefetched_manifest = null;
-            if (p.dep_id == dep_id) {
-                json_bytes = p.bytes;
-                owned_by_prefetch = true;
-            } else {
-                allocator.free(p.bytes);
-            }
-        }
-        if (!owned_by_prefetch) {
-            var key_buf: [25]u8 = undefined;
-            const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
-            json_bytes = slot.manifest_backend.blobStore().get(key, allocator) catch |err| switch (err) {
-                error.NotFound => return error.NoDeployment,
-                else => return err,
-            };
-        }
+    if (!owned_by_prefetch) {
+        var key_buf: [25]u8 = undefined;
+        const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+        json_bytes = slot.manifest_backend.blobStore().get(key, allocator) catch |err| switch (err) {
+            error.NotFound => return error.NoDeployment,
+            else => return err,
+        };
     }
     var json_bytes_consumed = false;
     errdefer if (!json_bytes_consumed) allocator.free(json_bytes);

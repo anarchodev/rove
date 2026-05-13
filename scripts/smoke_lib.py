@@ -338,14 +338,36 @@ class Cluster:
         tag: str,
         http_base: int,
         raft_base: int,
-        files_port: int,
-        log_port: int,
+        files_port: int = 0,
+        log_port: int = 0,
         public_suffix: str = "loop46.localhost",
         workers_per_node: int = 2,
-        seed_manifest: Optional[dict] = None,
+        seed_manifest: Optional[dict | Path] = None,
         seed_extra_args: Optional[list[str]] = None,
         worker_extra_args: Optional[list[str]] = None,
+        root_token: Optional[str] = None,
+        admin_origin_per_node: bool = False,
+        admin_api_domain: Optional[str] = None,
+        with_log_files_bases: bool = True,
     ) -> "Cluster":
+        """Spawn 3-node loop46 cluster.
+
+        - `seed_manifest`: dict or Path to manifest JSON; runs `loop46 seed`
+          against every data dir before workers start.
+        - `worker_extra_args`: appended to every worker's argv.
+        - `root_token`: override LOOP46_ROOT_TOKEN (defaults to a fresh
+          random 32-hex secret); pass an explicit one when the smoke
+          script bakes the token into curl commands.
+        - `admin_origin_per_node`: stamp `--admin-origin https://{admin_host}:{port}`
+          on each worker (admin-API-on-public-suffix mode used by
+          cookie_auth/admin smokes).
+        - `admin_api_domain`: pass `--admin-api-domain {value}` to enable
+          subdomain-scoped admin API.
+        - `with_log_files_bases`: pass `--log-public-base` + `--files-public-base`;
+          skip for smokes that don't run standalones.
+        - `files_port` / `log_port`: zero → arbitrary unused port (still
+          allocated but no standalone spawned by default).
+        """
         _load_dotenv()
         _require_env(
             "AWS_ACCESS_KEY_ID",
@@ -389,7 +411,8 @@ class Cluster:
         # files-server, log-server, schedule-server). The bash smokes
         # `export`ed these for the same reason.
         os.environ["LOOP46_SERVICES_JWT_SECRET"] = gen_jwt_secret()
-        root_token = secrets.token_hex(16)
+        if root_token is None:
+            root_token = secrets.token_hex(16)
         os.environ["LOOP46_ROOT_TOKEN"] = root_token
         env = os.environ
 
@@ -403,8 +426,11 @@ class Cluster:
 
         # Seed every data dir if a manifest was supplied.
         if seed_manifest is not None:
-            seed_path = Path(f"/tmp/{tag}-seed.json")
-            seed_path.write_text(json.dumps(seed_manifest))
+            if isinstance(seed_manifest, Path):
+                seed_path = seed_manifest
+            else:
+                seed_path = Path(f"/tmp/{tag}-seed.json")
+                seed_path.write_text(json.dumps(seed_manifest))
             for d in addrs.data_dirs:
                 d.mkdir(parents=True, exist_ok=True)
                 args = [
@@ -423,8 +449,6 @@ class Cluster:
                 "--peers", addrs.peers_csv,
                 "--listen", addrs.raft[i],
                 "--http", addrs.http[i],
-                "--log-public-base", f"https://{addrs.log_addr}",
-                "--files-public-base", f"https://{addrs.files_addr}",
                 "--data-dir", str(addrs.data_dirs[i]),
                 "--public-suffix", public_suffix,
                 "--tls-cert", str(tls.cert),
@@ -433,7 +457,18 @@ class Cluster:
                 # Match the bash default RAFT_TIMING_FLAGS.
                 "--election-timeout-ms", "200",
                 "--heartbeat-ms", "50",
-            ] + (worker_extra_args or [])
+            ]
+            if with_log_files_bases:
+                args += [
+                    "--log-public-base", f"https://{addrs.log_addr}",
+                    "--files-public-base", f"https://{addrs.files_addr}",
+                ]
+            if admin_origin_per_node:
+                port = http_base + i
+                args += ["--admin-origin", f"https://{addrs.admin_host}:{port}"]
+            if admin_api_domain:
+                args += ["--admin-api-domain", admin_api_domain]
+            args += worker_extra_args or []
             f = open(log_path, "wb")
             p = subprocess.Popen(args, env=env, stdout=f, stderr=subprocess.STDOUT)
             c.workers.append(p)
@@ -628,6 +663,153 @@ class Cluster:
         self.services_jwt = parsed["token"]
         self.log_base = parsed.get("log_url")
         self.files_base = parsed.get("files_url")
+
+    # ── Files-server convenience ────────────────────────────────────────
+
+    def files_url(self) -> str:
+        return f"https://files.{self.addrs.public_suffix}:{self.addrs.files_port}"
+
+    def log_url(self) -> str:
+        return f"https://logs.{self.addrs.public_suffix}:{self.addrs.log_port}"
+
+    def upload_source(self, tenant: str, path: str, content: bytes | str) -> None:
+        """POST {files_url}/{tenant}/upload with X-Rove-Path."""
+        if isinstance(content, str):
+            content = content.encode()
+        r = curl(
+            self.curl_ctx(f"{tenant}.{self.addrs.public_suffix}"),
+            f"{self.files_url()}/{tenant}/upload",
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.services_jwt}",
+                "X-Rove-Path": path,
+            },
+            data=content,
+        )
+        if r.status != 204:
+            raise RuntimeError(f"upload {tenant}/{path}: {r.status} {r.body}")
+
+    def upload_static(self, tenant: str, path: str, content: bytes | str, content_type: str) -> None:
+        """POST {files_url}/{tenant}/upload-static."""
+        if isinstance(content, str):
+            content = content.encode()
+        r = curl(
+            self.curl_ctx(f"{tenant}.{self.addrs.public_suffix}"),
+            f"{self.files_url()}/{tenant}/upload-static",
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.services_jwt}",
+                "X-Rove-Path": path,
+                "X-Rove-Content-Type": content_type,
+            },
+            data=content,
+        )
+        if r.status != 204:
+            raise RuntimeError(f"upload-static {tenant}/{path}: {r.status} {r.body}")
+
+    def deploy(self, tenant: str) -> str:
+        """POST {files_url}/{tenant}/deploy → returns dep_id (decimal string)."""
+        r = curl(
+            self.curl_ctx(f"{tenant}.{self.addrs.public_suffix}"),
+            f"{self.files_url()}/{tenant}/deploy",
+            method="POST",
+            headers={"Authorization": f"Bearer {self.services_jwt}"},
+        )
+        if r.status != 200:
+            raise RuntimeError(f"deploy {tenant}: {r.status} {r.body}")
+        dep_id = r.body.strip()
+        if not dep_id:
+            raise RuntimeError(f"deploy {tenant}: empty body")
+        return dep_id
+
+    def release(self, tenant: str, dep_id: str | int) -> None:
+        """POST /_system/release — flip `_deploy/current` to `dep_id`."""
+        r = curl(
+            self.curl_ctx(),
+            f"{self.admin_origin()}/_system/release",
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.root_token}",
+                "Content-Type": "application/json",
+            },
+            data=f'{{"tenant_id":"{tenant}","dep_id":{dep_id}}}',
+        )
+        if r.status != 204:
+            raise RuntimeError(f"release {tenant}/{dep_id}: {r.status} {r.body}")
+
+    def deploy_handlers(self, tenant: str, files: dict[str, str]) -> str:
+        """Upload + deploy + release in one shot. Returns dep_id."""
+        for path, content in files.items():
+            self.upload_source(tenant, path, content)
+        dep_id = self.deploy(tenant)
+        self.release(tenant, dep_id)
+        return dep_id
+
+    def put_file(self, tenant: str, path: str, content: bytes | str, *, content_type: str = "application/javascript") -> str:
+        """PUT {files_url}/{tenant}/file/{path} — single-file commit shortcut.
+        Returns dep_id from the response body (201 status)."""
+        if isinstance(content, str):
+            content = content.encode()
+        r = curl(
+            self.curl_ctx(f"{tenant}.{self.addrs.public_suffix}"),
+            f"{self.files_url()}/{tenant}/file/{path}",
+            method="PUT",
+            headers={
+                "Authorization": f"Bearer {self.services_jwt}",
+                "Content-Type": content_type,
+            },
+            data=content,
+        )
+        if r.status != 201:
+            raise RuntimeError(f"PUT file {tenant}/{path}: {r.status} {r.body}")
+        return r.body.strip()
+
+    def respawn_files_server(self, **kwargs) -> None:
+        """Kill the current files-server and start a new one (with possibly
+        different args, e.g. --bootstrap-kv). Re-mints services_jwt
+        automatically because the old token may have expired."""
+        if self.files_server is not None and self.files_server.poll() is None:
+            self.files_server.terminate()
+            try:
+                self.files_server.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.files_server.kill()
+            self.files_server = None
+        self.spawn_files_server(**kwargs)
+        self.mint_services_token()
+
+    def wait_for_handler(
+        self,
+        tenant: str,
+        path: str = "/",
+        *,
+        expected_status: int = 200,
+        expected_body_prefix: Optional[str] = None,
+        timeout_s: float = 5.0,
+        method: str = "GET",
+        headers: Optional[dict[str, str]] = None,
+    ) -> HttpResponse:
+        """Poll a tenant handler until it stops returning 503 (no_deployment).
+
+        Phase 2's deployment loader is async — the release POST returns 204
+        as soon as the kv write replicates through raft, but the worker's
+        snapshot swap happens on the loader thread. Polling avoids the
+        flakes the bash smokes had with a fixed `sleep 2`.
+        """
+        cc = self.curl_ctx(f"{tenant}.{self.addrs.public_suffix}")
+        url = f"https://{tenant}.{self.addrs.public_suffix}:{self.leader_port()}{path}"
+        deadline = time.monotonic() + timeout_s
+        last: HttpResponse = HttpResponse(status=0, body="", headers={})
+        while time.monotonic() < deadline:
+            last = curl(cc, url, method=method, headers=headers or {})
+            if last.status == expected_status:
+                if expected_body_prefix is None or last.body.startswith(expected_body_prefix):
+                    return last
+            elif last.status != 503:
+                # Stop polling on a non-deployment-related failure.
+                return last
+            time.sleep(0.1)
+        return last
 
     # ── Assertion helper ───────────────────────────────────────────────
 
