@@ -837,16 +837,17 @@ fn handleRelease(
 
     // Idempotent fast path: matches `releasePublishTrampoline`. If
     // the target's `_deploy/current` is already exactly `dep_id`,
-    // return 202 without touching raft. The platform-bootstrap
-    // flow (files-server pushing __admin__ / __replay__ at start)
-    // retries on connection-refused — each retry can land here
-    // after the first commit, so without this short-circuit every
-    // retry re-proposes a no-op envelope.
+    // return 204 without touching raft — same code the post-commit
+    // path returns, so callers don't need to branch on 202 vs 204.
+    // The platform-bootstrap flow (files-server pushing __admin__ /
+    // __replay__ at start) retries on connection-refused; each retry
+    // can land here after the first commit, so without this short-
+    // circuit every retry re-proposes a no-op envelope.
     if (inst.kv.get("_deploy/current")) |current_hex| {
         defer allocator.free(current_hex);
         const current_id = std.fmt.parseInt(u64, current_hex, 16) catch 0;
         if (current_id == parsed.value.dep_id) {
-            try respb.setSystemResponse(server, ent, sid, sess, 202, "already at dep_id\n", allocator, cors_origin, null);
+            try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
             return;
         }
     } else |_| {}
