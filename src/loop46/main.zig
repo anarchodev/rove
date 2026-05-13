@@ -730,6 +730,99 @@ const SubcommandResult = union(enum) {
     run: cli_mod.Cli,
 };
 
+/// `loop46 kv-get` — offline kv read for smoke verification.
+///
+/// Modes:
+///   --key <k>     print the value at <k>; exit 1 if missing.
+///   --apply-idx   print the manifest's durable raft idx.
+///
+/// Common args:
+///   --data-dir <dd>  directory holding `cluster.kv` / `schedules.db`.
+///   --store <name>   tenant id (e.g. "acme", "__root__") or the
+///                    literal "schedules" to read schedules.db.
+///
+/// Under kvexp the data lives in LMDB inside `cluster.kv` / `schedules.db`;
+/// direct `sqlite3` reads no longer work. This subcommand opens the
+/// file standalone (single-process — caller must shut the cluster
+/// down first). Exits 0 on hit, 1 on missing key, 2 on usage / io
+/// error.
+fn runKvGet(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
+    var data_dir: ?[]const u8 = null;
+    var store_name: ?[]const u8 = null;
+    var key: ?[]const u8 = null;
+    var apply_idx_mode = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--data-dir")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            data_dir = args[i];
+        } else if (std.mem.eql(u8, a, "--store")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            store_name = args[i];
+        } else if (std.mem.eql(u8, a, "--key")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            key = args[i];
+        } else if (std.mem.eql(u8, a, "--apply-idx")) {
+            apply_idx_mode = true;
+        } else {
+            std.debug.print("error: kv-get: unknown arg '{s}'\n", .{a});
+            return error.Usage;
+        }
+    }
+    const dd = data_dir orelse return error.Usage;
+    const sn = store_name orelse return error.Usage;
+    if (!apply_idx_mode and key == null) return error.Usage;
+
+    const is_schedules = std.mem.eql(u8, sn, "schedules");
+    const filename = if (is_schedules) "schedules.db" else "cluster.kv";
+
+    // Schedules.db: standalone file with a single store (no
+    // hashStoreId mapping). cluster.kv: per-tenant stores keyed by
+    // hashStoreId(sn).
+    const store = blk: {
+        if (is_schedules) {
+            const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dd, filename }, 0);
+            defer allocator.free(path);
+            break :blk kv.KvStore.openReadOnly(allocator, path) catch |err| {
+                std.debug.print("error: kv-get: open {s}: {s}\n", .{ path, @errorName(err) });
+                std.process.exit(2);
+            };
+        }
+        break :blk kv.KvStore.openClusterOwned(allocator, dd, filename, sn) catch |err| {
+            std.debug.print("error: kv-get: openClusterOwned {s}/{s} store={s}: {s}\n", .{ dd, filename, sn, @errorName(err) });
+            std.process.exit(2);
+        };
+    };
+    defer store.close();
+
+    if (apply_idx_mode) {
+        const idx = store.lastAppliedRaftIdx() catch |err| {
+            std.debug.print("error: kv-get: lastAppliedRaftIdx: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+        var buf: [32]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "{d}\n", .{idx});
+        _ = try std.posix.write(1, s);
+        return;
+    }
+
+    const k = key.?;
+    const value = store.get(k) catch |err| switch (err) {
+        error.NotFound => std.process.exit(1),
+        else => {
+            std.debug.print("error: kv-get: read {s}: {s}\n", .{ k, @errorName(err) });
+            std.process.exit(2);
+        },
+    };
+    defer allocator.free(value);
+    _ = try std.posix.write(1, value);
+    _ = try std.posix.write(1, "\n");
+}
+
 /// Process argv: dispatch help / seed, validate the subcommand, and
 /// parse the CLI for dev/worker modes. Calls `std.process.exit(2)`
 /// directly on usage errors (matching the existing convention so a
@@ -811,6 +904,11 @@ fn dispatchSubcommand(
             }
             std.process.exit(2);
         };
+        return .handled;
+    }
+
+    if (std.mem.eql(u8, cmd, "kv-get")) {
+        try runKvGet(allocator, sub_args);
         return .handled;
     }
 
@@ -1465,16 +1563,35 @@ pub fn main() !void {
     runUntilStopped(tls_config);
     std.log.info("js-worker: shutdown requested, joining {d} worker(s)", .{num_workers});
     for (threads) |t| t.join();
+
+    // Durabilize the manifest before `_exit` so kvexp's main_overlay
+    // doesn't lose in-memory writes. On the leader the periodic
+    // `tickSnapshot` keeps this current; on followers the snapshot
+    // tick is leader-only and they only durabilize on shutdown. The
+    // subsequent `manifest.deinit` is NOT run — that's the
+    // raft-thread-still-running concern; durabilize alone is safe
+    // because it's a single atomic LMDB commit that doesn't touch
+    // the in-memory state any other thread relies on.
+    cluster.kvexp_manifest.durabilize(cluster.global_apply_idx) catch |err| std.log.warn(
+        "js-worker: shutdown durabilize failed: {s} (in-memory writes since last tick may be lost)",
+        .{@errorName(err)},
+    );
+    schedules_store.db.checkpoint() catch |err| std.log.warn(
+        "js-worker: shutdown checkpoint(schedules_store) failed: {s}",
+        .{@errorName(err)},
+    );
+
     std.log.info("js-worker: bye", .{});
 
-    // Skip the teardown chain. The raft thread is detached and still
-    // inside `node.run()`; running `raft_node.deinit()` out from under
-    // it would segfault. Subsystem threads (files-server, log-server)
-    // would also need a join story before it's safe to free their
-    // handles. The pragmatic answer is `_exit(0)` — same as nginx,
-    // envoy, etc.: the kernel reclaims memory + fds + sockets in one
-    // shot and we avoid re-implementing a clean teardown graph for
-    // every subsystem.
+    // Skip the rest of the teardown chain. The raft thread is
+    // detached and still inside `node.run()`; running
+    // `raft_node.deinit()` out from under it would segfault.
+    // Subsystem threads (files-server, log-server) would also need
+    // a join story before it's safe to free their handles. The
+    // pragmatic answer is `_exit(0)` — same as nginx, envoy, etc.:
+    // the kernel reclaims memory + fds + sockets in one shot and
+    // we avoid re-implementing a clean teardown graph for every
+    // subsystem.
     std.process.exit(0);
 }
 

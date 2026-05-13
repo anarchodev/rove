@@ -132,28 +132,23 @@ print(json.dumps(json.loads(sys.argv[1])))
     || fail "leader /cfg returned $GOT_LEADER, want $EXPECTED"
 ok "leader has _config/oauth/google row mirrored from the file tree"
 
-# ── 2. Verify each follower's app.db has the row too ──────────────────
+# ── 2. Verify each node's cluster.kv has the row mirrored ─────────────
 #
-# Followers 503 customer requests ("not leader; retry against the
-# cluster leader") so we can't ask the handler. Direct sqlite read
-# is more diagnostic anyway — it proves the per-node seed wrote the
-# row independently rather than relying on raft to replicate it
-# (seed runs once per data dir, before any cluster is up).
-if ! command -v sqlite3 >/dev/null; then
-    echo "skip follower app.db check — sqlite3 not installed"
-else
-    for IDX in 0 1 2; do
-        [[ "$IDX" == "$LEADER_IDX" ]] && continue
-        DB="${DATA_DIRS[$IDX]}/acme/app.db"
-        ROW=$(sqlite3 "$DB" "SELECT value FROM kv WHERE key = '_config/oauth/google';")
-        [[ -n "$ROW" ]] || fail "node $IDX app.db missing _config/oauth/google"
-        # Compare normalized JSON to handle whitespace differences.
-        GOT=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])))" "$ROW")
-        [[ "$GOT" == "$EXPECTED" ]] \
-            || fail "node $IDX app.db has wrong value: $GOT"
-        ok "node $IDX app.db has matching _config/oauth/google row"
-    done
-fi
+# Under kvexp the per-tenant data lives inside `cluster.kv` (LMDB,
+# MDB_NOLOCK = single-process). Shut every node down so the offline
+# `loop46 kv-get` reader can open the env cleanly.
+for p in "${PIDS[@]}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
+for p in "${PIDS[@]}"; do [ -n "$p" ] && wait "$p" 2>/dev/null || true; done
+PIDS=()
+
+for IDX in 0 1 2; do
+    ROW=$("$BIN" kv-get --data-dir "${DATA_DIRS[$IDX]}" --store acme --key "_config/oauth/google") \
+        || fail "node $IDX cluster.kv missing _config/oauth/google"
+    GOT=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])))" "$ROW")
+    [[ "$GOT" == "$EXPECTED" ]] \
+        || fail "node $IDX cluster.kv has wrong value: $GOT"
+    ok "node $IDX cluster.kv has matching _config/oauth/google row"
+done
 
 # ── 3. Verify the marker field round-tripped (sanity on the bytes) ────
 MARKER=$(echo "$LEADER_BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["marker"])')

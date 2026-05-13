@@ -59,10 +59,13 @@ pub fn runPromote(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     const parsed = try parseArgs(args);
 
     // Confirm the data_dir looks like a worker home — at minimum it
-    // should have a `__root__.db`. We deliberately don't require a
-    // `raft.log.db` to exist (a fresh learner that's never persisted
-    // would still benefit from this command running without error).
-    const root_path = try std.fmt.allocPrint(allocator, "{s}/__root__.db", .{parsed.data_dir});
+    // should have a `cluster.kv` (the consolidated kvexp manifest
+    // holding __root__ + every tenant's store; replaced the
+    // per-tenant `__root__.db` SQLite file post-cutover). We
+    // deliberately don't require a `raft.log.db` to exist (a fresh
+    // learner that's never persisted would still benefit from this
+    // command running without error).
+    const root_path = try std.fmt.allocPrint(allocator, "{s}/cluster.kv", .{parsed.data_dir});
     defer allocator.free(root_path);
     std.fs.cwd().access(root_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {

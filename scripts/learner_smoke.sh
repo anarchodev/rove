@@ -107,6 +107,7 @@ for i in 0 1 2 3; do
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
         --workers 1 \
+        --snapshot-interval-ms 500 \
         "${RAFT_TIMING_FLAGS[@]}" \
         >"/tmp/${SMOKE_TAG}-worker-${i}.out" 2>&1 &
     PIDS+=($!)
@@ -169,54 +170,12 @@ done
 echo "ok  drove $COMMITS release POSTs through the leader"
 
 # Give applies time to land on every node (including learner).
+# Online verification isn't possible mid-run — kvexp's MDB_NOLOCK
+# means we can't open cluster.kv from a second process while the
+# worker holds it. The end-of-smoke offline verify below covers
+# both replication AND the post-promote state continuity.
 sleep 3
-
-# ── Verify learner's app.db reflects the same state ───────────────
-LEARNER_DIR="${DATA_DIRS[3]}"
-LEARNER_ACME_DB="$LEARNER_DIR/acme/app.db"
-[[ -f "$LEARNER_ACME_DB" ]] || {
-    echo "FAIL: learner's acme/app.db missing — applies didn't land on the learner" >&2
-    exit 1
-}
-
-LEARNER_DEPLOY=$(sqlite3 "$LEARNER_ACME_DB" \
-    "SELECT value FROM kv WHERE key='_deploy/current';" 2>/dev/null || echo "")
-LEARNER_APPLY_IDX=$(sqlite3 "$LEARNER_ACME_DB" \
-    "SELECT v FROM _apply_state WHERE k='last_applied_raft_idx';" 2>/dev/null || echo 0)
-
-# Pick any voter that's not the leader to compare against.
-COMPARE_IDX=0
-[[ "$LEADER_IDX" == "0" ]] && COMPARE_IDX=1
-COMPARE_DB="${DATA_DIRS[$COMPARE_IDX]}/acme/app.db"
-COMPARE_DEPLOY=$(sqlite3 "$COMPARE_DB" \
-    "SELECT value FROM kv WHERE key='_deploy/current';" 2>/dev/null || echo "")
-COMPARE_APPLY_IDX=$(sqlite3 "$COMPARE_DB" \
-    "SELECT v FROM _apply_state WHERE k='last_applied_raft_idx';" 2>/dev/null || echo 0)
-
-echo "  voter   $COMPARE_IDX: _deploy/current=$COMPARE_DEPLOY apply_idx=$COMPARE_APPLY_IDX"
-echo "  learner 3: _deploy/current=$LEARNER_DEPLOY apply_idx=$LEARNER_APPLY_IDX"
-
-if [[ "$LEARNER_DEPLOY" != "$COMPARE_DEPLOY" ]]; then
-    echo "FAIL: learner's _deploy/current ($LEARNER_DEPLOY) != voter's ($COMPARE_DEPLOY)" >&2
-    exit 1
-fi
-
-# Apply idx may be slightly behind on the learner (no quorum
-# pressure to catch it up immediately) but should be close.
-if (( LEARNER_APPLY_IDX + 5 < COMPARE_APPLY_IDX )); then
-    echo "FAIL: learner apply_idx ($LEARNER_APPLY_IDX) significantly behind voter ($COMPARE_APPLY_IDX)" >&2
-    exit 1
-fi
-
-echo "ok  learner replicated $COMMITS releases (deploy_id matches; apply_idx within 5 of voter)"
-
-# Last expected dep_id is the COMMITS value padded to 16 hex.
-EXPECTED_DEPLOY=$(printf '%016x' "$COMMITS")
-if [[ "$LEARNER_DEPLOY" != "$EXPECTED_DEPLOY" ]]; then
-    echo "FAIL: learner _deploy/current ($LEARNER_DEPLOY) != expected ($EXPECTED_DEPLOY)" >&2
-    exit 1
-fi
-echo "ok  learner _deploy/current = expected $EXPECTED_DEPLOY"
+echo "ok  drove $COMMITS releases through the leader; waited 3s for raft apply"
 
 # ── Lost-quorum recovery: kill 2 voters, promote the learner ──────
 echo ""
@@ -342,10 +301,19 @@ echo "ok  promoted learner accepted write (dep_id=$NEW_DEP)"
 
 sleep 1
 
-# Verify state continuity: the prior _deploy/current is preserved,
-# AND the new write landed.
-PROMOTED_DEPLOY=$(sqlite3 "$LEARNER_ACME_DB" \
-    "SELECT value FROM kv WHERE key='_deploy/current';" 2>/dev/null || echo "")
+# Shut the promoted learner down so the offline `loop46 kv-get`
+# can open cluster.kv. The graceful kill drives our shutdown-time
+# `durabilize` (main.zig), flushing main_overlay → LMDB.
+kill -TERM "${PIDS[3]}" 2>/dev/null || true
+wait "${PIDS[3]}" 2>/dev/null || true
+PIDS[3]=""
+
+# Verify state continuity: the prior _deploy/current advanced
+# through all $COMMITS replicated releases AND the post-promote
+# write ($NEW_DEP) landed. Both live in the same cluster.kv across
+# the promote (which only wipes raft.log.db).
+LEARNER_DIR="${DATA_DIRS[3]}"
+PROMOTED_DEPLOY=$("$BIN" kv-get --data-dir "$LEARNER_DIR" --store acme --key "_deploy/current")
 EXPECTED_NEW_DEPLOY=$(printf '%016x' "$NEW_DEP")
 echo "  promoted learner _deploy/current=$PROMOTED_DEPLOY (expected $EXPECTED_NEW_DEPLOY)"
 [[ "$PROMOTED_DEPLOY" == "$EXPECTED_NEW_DEPLOY" ]] || {

@@ -20,11 +20,6 @@ if [[ ! -x "$BIN" ]]; then
     echo "error: $BIN missing — run 'zig build install' first" >&2
     exit 2
 fi
-if ! command -v sqlite3 >/dev/null 2>&1; then
-    echo "skip: sqlite3 CLI not in PATH (this smoke needs it to plant test rows)"
-    exit 0
-fi
-
 # Source .env early so the standalone `loop46 snapshot` /
 # `restore-from-snapshot` CLI calls below see S3 creds.
 __snap_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,22 +33,17 @@ export S3_KEY_PREFIX_BASE="${S3_KEY_PREFIX_BASE:-smoke-snapshot-$(hostname)-$(id
 
 rm -rf "$DATA_DIR" "$RESTORE_DIR"
 
-# ── 1. Seed a tenant via the manifest path ─────────────────────────
+# ── 1. Seed a tenant + plant kv state via the manifest ─────────────
+# `seed_kv` stamps strings into the tenant's app.db. Under kvexp these
+# land inside cluster.kv as `acme` store entries; `loop46 kv-get`
+# reads them back.
 SEED_MANIFEST=$(mktemp --suffix=.json)
 trap 'rm -f "$SEED_MANIFEST"' EXIT
 cat > "$SEED_MANIFEST" <<'EOF'
-{"tenants": [{"id": "acme", "domains": [], "files": []}]}
+{"tenants": [{"id": "acme", "domains": [], "files": [],
+              "seed_kv": {"greeting": "hello-from-smoke", "counter": "42"}}]}
 EOF
 "$BIN" seed --data-dir "$DATA_DIR" --manifest "$SEED_MANIFEST"
-
-# Plant some kv state in acme's app.db (seed leaves it empty + no
-# bytecodes, which would also be a valid capture target — but
-# planting rows lets us verify the restore round-trips real data).
-sqlite3 "$DATA_DIR/acme/app.db" <<'SQL'
-INSERT INTO kv (key, value, seq) VALUES ('greeting', 'hello-from-smoke', 100);
-INSERT INTO kv (key, value, seq) VALUES ('counter',  '42',               101);
-INSERT INTO _apply_state (k, v) VALUES ('last_applied_raft_idx', 99);
-SQL
 
 # ── 2. Capture via `loop46 snapshot` ───────────────────────────────
 SNAP_OUT=$("$BIN" snapshot --data-dir "$DATA_DIR" --apply-position 100 --willemt-term 7 2>&1)
@@ -69,28 +59,21 @@ echo "ok  loop46 snapshot captured snap_id=$SNAP_ID"
 # ── 3. Restore into a fresh data dir ───────────────────────────────
 "$BIN" restore-from-snapshot --snap-id "$SNAP_ID" --data-dir "$RESTORE_DIR" 2>&1 | tee /tmp/snapshot-smoke-restore.out
 
-# ── 4. Verify the restored state ───────────────────────────────────
-RESTORED_DB="$RESTORE_DIR/acme/app.db"
-[[ -f "$RESTORED_DB" ]] || { echo "FAIL: restored acme/app.db missing" >&2; exit 1; }
-
-got_greeting=$(sqlite3 "$RESTORED_DB" "SELECT value FROM kv WHERE key='greeting';")
-got_counter=$(sqlite3 "$RESTORED_DB"  "SELECT value FROM kv WHERE key='counter';")
-got_apply=$(sqlite3 "$RESTORED_DB"    "SELECT v FROM _apply_state WHERE k='last_applied_raft_idx';")
+# ── 4. Verify the restored state via `loop46 kv-get` ───────────────
+# Under kvexp the restored data lives in cluster.kv; verify via the
+# standalone offline reader since no cluster is running here.
+got_greeting=$("$BIN" kv-get --data-dir "$RESTORE_DIR" --store acme --key greeting)
+got_counter=$( "$BIN" kv-get --data-dir "$RESTORE_DIR" --store acme --key counter)
+got_apply=$(   "$BIN" kv-get --data-dir "$RESTORE_DIR" --store acme --apply-idx)
 
 [[ "$got_greeting" == "hello-from-smoke" ]] || { echo "FAIL: greeting='$got_greeting'" >&2; exit 1; }
 [[ "$got_counter"  == "42" ]]               || { echo "FAIL: counter='$got_counter'"  >&2; exit 1; }
-# `restore` stamps _apply_state to manifest's snapshot_idx (= --apply-position),
-# overriding the source's 99. That's the contract: post-restore, the
-# apply path replays from snapshot_idx + 1.
-[[ "$got_apply"    == "100" ]]              || { echo "FAIL: _apply_state='$got_apply'" >&2; exit 1; }
+# `restore` stamps the manifest's durable raft idx to
+# `--apply-position`; replay resumes from idx + 1.
+[[ "$got_apply"    == "100" ]]              || { echo "FAIL: durable raft idx='$got_apply'" >&2; exit 1; }
 
 echo "ok  greeting='$got_greeting' counter='$got_counter'"
-echo "ok  _apply_state.last_applied_raft_idx = $got_apply (== --apply-position)"
-
-# Restored __root__.db should also exist and have the seeded tenant.
-RESTORED_ROOT="$RESTORE_DIR/__root__.db"
-[[ -f "$RESTORED_ROOT" ]] || { echo "FAIL: restored __root__.db missing" >&2; exit 1; }
-echo "ok  __root__.db restored"
+echo "ok  durable raft idx = $got_apply (== --apply-position)"
 
 echo ""
 echo "ok  capture + restore round-trip (operator CLI)"
@@ -300,13 +283,13 @@ AV_MODE=$(sqlite3 "$RAFT_LOG" "PRAGMA auto_vacuum;")
 [[ "$AV_MODE" == "2" ]] || { echo "FAIL: auto_vacuum=$AV_MODE on raft.log.db (want 2 = INCREMENTAL)" >&2; exit 1; }
 echo "ok  raft.log.db auto_vacuum=INCREMENTAL"
 
-# ── 7. Verify _apply_state stamping is firing on every tenant ────
+# ── 7. Verify the snapshot tick is stamping the durable raft idx ──
 #
-# Per docs/production.md #1.1: tickRaftCapture stamps
-# _apply_state.last_applied_raft_idx for every tenant (including
-# dormant ones — the always-refresh-all property). After the burst,
-# both the active `acme` and the dormant `quiet` should have a
-# stamp at >= the apply_position the latest tick logged.
+# Under kvexp the per-tenant `_apply_state` is gone — the cluster has
+# a single durable raft idx in `cluster.kv`, stamped atomically by
+# `Manifest.durabilize(apply_position)`. After the burst the latest
+# tick's apply_position should be reflected on disk. Shut the
+# cluster down so the standalone `loop46 kv-get` can open the env.
 LATEST_APPLY_POS=$(awk '/snapshot tick apply_position=/ {
     for (i=1;i<=NF;i++) if (substr($i,1,15)=="apply_position=") {
         a=substr($i,16)+0; if (a>m) m=a
@@ -318,28 +301,25 @@ if (( LATEST_APPLY_POS == 0 )); then
 fi
 echo "ok  latest snapshot tick apply_position=$LATEST_APPLY_POS"
 
-ACME_DB="$LEADER_DIR/acme/app.db"
-QUIET_DB="$LEADER_DIR/quiet/app.db"
-ACME_STAMP=$(sqlite3 "$ACME_DB" "SELECT v FROM _apply_state WHERE k='last_applied_raft_idx';" 2>/dev/null || echo 0)
-QUIET_STAMP=$(sqlite3 "$QUIET_DB" "SELECT v FROM _apply_state WHERE k='last_applied_raft_idx';" 2>/dev/null || echo 0)
-echo "  acme  _apply_state = $ACME_STAMP"
-echo "  quiet _apply_state = $QUIET_STAMP"
+# Shut down all nodes — kvexp's MDB_NOLOCK means we can't open
+# cluster.kv from a second process while the cluster is running.
+for p in "${PIDS[@]}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
+for p in "${PIDS[@]}"; do [ -n "$p" ] && wait "$p" 2>/dev/null || true; done
+# Clear PIDS so the EXIT trap doesn't try again.
+PIDS=()
 
-# Both stamps should be >= the most-recent tick's apply_position.
-# Allow a small grace (1 entry) for races where a tick fired AFTER
-# a write committed but BEFORE the stamp loop reached the tenant.
+DURABLE_IDX=$("$BIN" kv-get --data-dir "$LEADER_DIR" --store __root__ --apply-idx)
+echo "  cluster.kv durable raft idx = $DURABLE_IDX"
+
+# The durable idx should be at or above the latest tick's
+# apply_position. A small grace covers the race where a tick fires
+# between the burst's last commit and our log parse.
 GRACE=1
-if (( ACME_STAMP + GRACE < LATEST_APPLY_POS )); then
-    echo "FAIL: acme _apply_state ($ACME_STAMP) < latest_apply_position ($LATEST_APPLY_POS)" >&2
+if (( DURABLE_IDX + GRACE < LATEST_APPLY_POS )); then
+    echo "FAIL: durable raft idx ($DURABLE_IDX) < latest_apply_position ($LATEST_APPLY_POS)" >&2
     exit 1
 fi
-if (( QUIET_STAMP + GRACE < LATEST_APPLY_POS )); then
-    echo "FAIL: quiet (DORMANT) _apply_state ($QUIET_STAMP) < latest_apply_position ($LATEST_APPLY_POS)" >&2
-    echo "      — always-refresh-all property is broken; dormant tenants" >&2
-    echo "      will pin willemt's compaction floor." >&2
-    exit 1
-fi
-echo "ok  always-refresh-all: dormant tenant 'quiet' stamped at $QUIET_STAMP (>=$LATEST_APPLY_POS - $GRACE)"
+echo "ok  durable raft idx ($DURABLE_IDX) >= latest tick apply_position ($LATEST_APPLY_POS - $GRACE)"
 
 echo ""
 echo "PASS snapshot smoke"
