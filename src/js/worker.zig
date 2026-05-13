@@ -575,6 +575,17 @@ pub fn Worker(comptime opts: Options) type {
         /// Uses the same row as every other h2 stream collection so
         /// moves in and out preserve every component.
         raft_pending: StreamColl,
+        /// Deferred TrackedTxn commits keyed by raft seq. Per kvexp
+        /// README §1 (speculative apply): `txn.commit` runs after raft
+        /// confirms the batch's seq, not before propose. On propose
+        /// failure or raft fault, the txn is `rollback`'d instead.
+        /// Single-threaded per worker (the dispatch loop owns it).
+        pending_txns: std.AutoHashMapUnmanaged(u64, *kv_mod.KvStore.TrackedTxn) = .empty,
+        /// Last-tick leader state. A true→false transition triggers
+        /// the leadership-loss drain: every pending txn rolls back
+        /// (kvexp recipe §2) and every `raft_pending` entry gets
+        /// downgraded to 503.
+        was_leader: bool = false,
         dispatcher: Dispatcher,
         tenant: *tenant_mod.Tenant,
         raft: *kv_mod.RaftNode,
@@ -919,6 +930,19 @@ pub fn Worker(comptime opts: Options) type {
                 }
                 map.deinit(allocator);
             }
+            // Roll back any leftover pending txns. Should be empty
+            // under normal shutdown; non-empty means we're exiting
+            // with proposals still in-flight (process kill, fatal
+            // error, etc.) — best-effort cleanup.
+            var ptn_it = self.pending_txns.iterator();
+            while (ptn_it.next()) |entry| {
+                entry.value_ptr.*.rollback() catch |err| std.log.warn(
+                    "worker.destroy: pending_txn rollback: {s}",
+                    .{@errorName(err)},
+                );
+                allocator.destroy(entry.value_ptr.*);
+            }
+            self.pending_txns.deinit(allocator);
             self.raft_pending.deinit();
             self.dispatcher.deinit();
             if (self.sse_curl) |easy| easy.deinit();
@@ -1917,22 +1941,22 @@ fn reloadDeployment(tc: *TenantFiles, dep_id: u64) !void {
 /// this call and the calls that follow within the tick.
 
 /// Iterate `raft_pending`, check each entity's `RaftWait.seq` against
-/// the raft node's committed and faulted watermarks. Committed
-/// entries just drain to `response_in` — the local writes already
-/// happened in `dispatchPending` before parking, so there's nothing
-/// more to do here. Faulted or timed-out entries invoke
-/// `store.undoTxn(txn_seq)` to compensating-rollback the already-
-/// committed local writes via the kv_undo log, overwrite the response
-/// with 503, and move. Caller must follow with a `reg.flush()`.
+/// the raft node's committed and faulted watermarks, and run the
+/// deferred TrackedTxn commit/rollback for each batch as it crosses
+/// the watermark.
 ///
-/// **Iteration order is REVERSE.** kv_undo entries record pre-images
-/// relative to the state each txn observed, so when two concurrent
-/// same-tenant txns both need compensating rollback, the later one
-/// must be undone first (its pre-image is the earlier one's post).
-/// Because `beginTrackedImmediate` serializes the begin→commit window
-/// per tenant, entries park into `raft_pending` in txn_seq order;
-/// reverse index iteration = reverse txn_seq order per tenant. Cross-
-/// tenant interleaving is safe — their kv_undo tables are disjoint.
+/// Per kvexp README §1 (speculative apply): `txn.commit` happens HERE,
+/// after raft confirms the batch's seq, not in `finalizeBatch`. Many
+/// `raft_pending` entries share one TrackedTxn (one batch → one
+/// propose → one seq → many entries); `worker.pending_txns[seq]`
+/// holds the single owning pointer. The first entry for each seq that
+/// crosses the watermark performs the commit; subsequent entries find
+/// the seq missing from the map and just drain.
+///
+/// On fault or timeout we rollback the txn (kvexp `Txn.rollback`
+/// cascades chain successors — fine for our model since the per-
+/// tenant lock means at most one in-flight txn per tenant). The
+/// response body is overwritten with 503.
 pub fn drainRaftPending(worker: anytype) !void {
     const server = worker.h2;
     const allocator = worker.allocator;
@@ -1941,40 +1965,47 @@ pub fn drainRaftPending(worker: anytype) !void {
     const faulted = worker.raft.faultedSeq();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
+    // FORWARD iteration: entities entered raft_pending in propose
+    // order, which is per-tenant chain order. kvexp.Txn.commit must
+    // run on the chain head; forward iteration ensures the oldest
+    // (chain-head) seq for each tenant commits first. Many entries
+    // share one seq (one propose → many requests in a batch); only
+    // the first to cross the watermark performs the txn commit /
+    // rollback, subsequent ones for the same seq find the map empty.
+    //
+    // `move` queues the transfer; the collection's slice is stable
+    // across the loop body and only compacts after `reg.flush`. So
+    // we walk by index forward and increment unconditionally.
     const entities = worker.raft_pending.entitySlice();
     const waits = worker.raft_pending.column(RaftWait);
     const resp_bodies = worker.raft_pending.column(h2.RespBody);
-
-    var i: usize = entities.len;
-    while (i > 0) {
-        i -= 1;
+    var i: usize = 0;
+    while (i < entities.len) : (i += 1) {
         const ent = entities[i];
         const wait = waits[i];
         const resp_body = resp_bodies[i];
 
         if (committed >= wait.seq) {
-            // Happy path: raft committed, local writes already durable.
-            // Drop the per-txn undo row now that the write is proven
-            // durable — otherwise it would survive in kv_undo as an
-            // "orphan" and get rolled back by the next startup sweep,
-            // silently corrupting state.
-            if (wait.store) |store| {
-                store.commitTxn(wait.txn_seq) catch |err| switch (err) {
-                    // Per-tenant app.db connections run with
-                    // busy_timeout=0 (so the dispatcher's BEGIN IMMEDIATE
-                    // surfaces BUSY immediately for the anchor-skip
-                    // dance); a different worker holding the writer lock
-                    // briefly is expected contention, not a broken
-                    // invariant. Leave the entity in raft_pending and
-                    // try again on the next tick — the undo row is
-                    // harmless to leave around for a few ms.
+            // First entry for this seq to cross the watermark
+            // commits the txn. Subsequent entries for the same seq
+            // find the map empty and just queue the move.
+            if (worker.pending_txns.get(wait.seq)) |tracked| {
+                tracked.commit() catch |err| switch (err) {
+                    // Chain head belongs to a different worker's
+                    // in-flight batch. Leave both the pending_txn
+                    // entry and the raft_pending entry in place;
+                    // when the other worker drains its head, ours
+                    // becomes chain head and this retries OK on a
+                    // later tick.
                     error.Conflict => continue,
                     else => panic_mod.invariantViolated(
-                        "drainRaftPending.commitTxn",
-                        "txn_seq={d} err={s}",
-                        .{ wait.txn_seq, @errorName(err) },
+                        "drainRaftPending.commit",
+                        "seq={d} err={s}",
+                        .{ wait.seq, @errorName(err) },
                     ),
                 };
+                _ = worker.pending_txns.remove(wait.seq);
+                allocator.destroy(tracked);
             }
             try server.reg.move(ent, &worker.raft_pending, &server.response_in);
             continue;
@@ -1984,23 +2015,18 @@ pub fn drainRaftPending(worker: anytype) !void {
         const is_timed_out = now_ns >= wait.deadline_ns;
         if (!is_faulted and !is_timed_out) continue; // still waiting
 
-        // Fault / timeout: compensating-rollback via undoTxn. The
-        // local writes from the handler were already committed to
-        // SQLite, so we walk the kv_undo log to restore the pre-images.
-        // Reverse iteration ensures correct ordering for same-tenant
-        // stacks of faulted writes.
-        if (wait.store) |store| {
-            store.undoTxn(wait.txn_seq) catch |err| switch (err) {
-                // Same reasoning as the commitTxn branch: another worker
-                // briefly holds the writer lock; defer this entity to
-                // the next tick instead of aborting.
-                error.Conflict => continue,
-                else => panic_mod.invariantViolated(
-                    "drainRaftPending.undoTxn",
-                    "txn_seq={d} err={s}",
-                    .{ wait.txn_seq, @errorName(err) },
-                ),
-            };
+        // Fault / timeout: rollback the deferred txn. kvexp.Txn
+        // rollback on a chain head cascades to its open child + any
+        // chain successors; later-seq entries that share a tenant
+        // see their own pending_txns slot already null after the
+        // cascade, so we still iterate them and queue the 503 move.
+        if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
+            kv.value.rollback() catch |err| panic_mod.invariantViolated(
+                "drainRaftPending.rollback",
+                "seq={d} err={s}",
+                .{ wait.seq, @errorName(err) },
+            );
+            allocator.destroy(kv.value);
         }
 
         const old_body_ptr: ?[*]u8 = resp_body.data;
@@ -2008,6 +2034,46 @@ pub fn drainRaftPending(worker: anytype) !void {
         try respb.overwrite503InPending(worker, ent, allocator);
         if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
 
+        try server.reg.move(ent, &worker.raft_pending, &server.response_in);
+    }
+}
+
+/// Leadership-loss drain. Called from the dispatch loop on a
+/// leader→follower transition. Rolls back every pending TrackedTxn
+/// (kvexp recipe §2) and downgrades every `raft_pending` entry to
+/// 503. The follower can't honor those raft seqs — the new leader
+/// will re-propose anything that was actually durable.
+pub fn drainOnLeadershipLoss(worker: anytype) !void {
+    const server = worker.h2;
+    const allocator = worker.allocator;
+
+    // Rollback every pending TrackedTxn. Each lives at a unique seq;
+    // each is in its own per-tenant chain (kvexp dispatch lease
+    // guarantees one in-flight at a time). Rollback order doesn't
+    // matter — different tenants are independent chains and within a
+    // tenant we have exactly one entry.
+    var ptn_it = worker.pending_txns.iterator();
+    while (ptn_it.next()) |entry| {
+        entry.value_ptr.*.rollback() catch |err| std.log.warn(
+            "drainOnLeadershipLoss: rollback seq={d} err={s}",
+            .{ entry.key_ptr.*, @errorName(err) },
+        );
+        allocator.destroy(entry.value_ptr.*);
+    }
+    worker.pending_txns.clearRetainingCapacity();
+
+    // Downgrade every raft_pending entry to 503 and move to response_in.
+    const entities = worker.raft_pending.entitySlice();
+    const resp_bodies = worker.raft_pending.column(h2.RespBody);
+    var i: usize = entities.len;
+    while (i > 0) {
+        i -= 1;
+        const ent = entities[i];
+        const resp_body = resp_bodies[i];
+        const old_body_ptr: ?[*]u8 = resp_body.data;
+        const old_body_len: u32 = resp_body.len;
+        try respb.overwrite503InPending(worker, ent, allocator);
+        if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
         try server.reg.move(ent, &worker.raft_pending, &server.response_in);
     }
 }

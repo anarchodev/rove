@@ -184,58 +184,11 @@ pub fn hashStoreId(id_str: []const u8) u64 {
     return std.hash.Wyhash.hash(0, id_str);
 }
 
-/// Process-global per-(manifest, store_id) outer-mutex registry.
-///
-/// Required because kvexp's top-level `Txn.commit` is chain-head-only,
-/// so concurrent TrackedTxns on the same tenant would commit out of
-/// order. Multiple `*KvStore` instances frequently resolve to the same
-/// kvexp store_id (cluster caches one; tenant.Instance attaches its
-/// own; files-server attaches its own); they must share the same
-/// outer mutex to serialize correctly.
-///
-/// Keyed by `(@intFromPtr(manifest), store_id)`. The map and its
-/// per-entry mutexes leak — process lifetime, bounded by the
-/// (manifest × tenant) cardinality.
-const TxnLockKey = struct { manifest: usize, store_id: u64 };
-const TxnLockMap = std.HashMapUnmanaged(
-    TxnLockKey,
-    *std.Thread.Mutex,
-    struct {
-        pub fn hash(_: @This(), k: TxnLockKey) u64 {
-            var h = std.hash.Wyhash.init(0);
-            h.update(std.mem.asBytes(&k.manifest));
-            h.update(std.mem.asBytes(&k.store_id));
-            return h.final();
-        }
-        pub fn eql(_: @This(), a: TxnLockKey, b: TxnLockKey) bool {
-            return a.manifest == b.manifest and a.store_id == b.store_id;
-        }
-    },
-    std.hash_map.default_max_load_percentage,
-);
-
-var txn_lock_registry: TxnLockMap = .empty;
-var txn_lock_registry_mutex: std.Thread.Mutex = .{};
-
-fn lookupTxnLock(
-    manifest: *kvexp.Manifest,
-    store_id: u64,
-) Error!*std.Thread.Mutex {
-    // Use page_allocator for registry entries: they're process-lifetime
-    // and don't belong to any caller's allocator (e.g., the testing
-    // allocator would flag them as leaks).
-    const a = std.heap.page_allocator;
-    txn_lock_registry_mutex.lock();
-    defer txn_lock_registry_mutex.unlock();
-    const key: TxnLockKey = .{ .manifest = @intFromPtr(manifest), .store_id = store_id };
-    const gop = txn_lock_registry.getOrPut(a, key) catch return Error.OutOfMemory;
-    if (!gop.found_existing) {
-        const m = a.create(std.Thread.Mutex) catch return Error.OutOfMemory;
-        m.* = .{};
-        gop.value_ptr.* = m;
-    }
-    return gop.value_ptr.*;
-}
+// Per-tenant dispatch serialization lives in kvexp now
+// (`Manifest.acquire` / `tryAcquire` → `StoreLease`). Rove obtains a
+// lease per batch and releases it as soon as the handler walk
+// finishes — well before the raft propose. The Txn outlives the
+// lease; commit/rollback runs on raft-commit/fault.
 
 // ── KvStore ────────────────────────────────────────────────────────
 
@@ -251,17 +204,14 @@ pub const KvStore = struct {
     counter: *SeqCounter,
     owned_counter: ?SeqCounter,
     owned: ?*StandaloneStack,
-    /// In-flight tracked txn whose write buffer overlays this store.
-    /// `get`/`prefix` consult the txn's overlay stack before falling
-    /// through to kvexp. Acquired via `txn_lock` so workers on the
-    /// same tenant serialize on the begin..commit window — required
-    /// because kvexp's top-level `Txn.commit` is gated on chain head,
-    /// so out-of-order commits break.
+    /// In-flight TrackedTxn whose kvexp.Txn this thread should read
+    /// from. Set by `TrackedTxn.ensureOpen` (registers self) and
+    /// cleared by `releaseLease` / `commit` / `rollback`. Read by
+    /// `KvStore.get`/`prefix` to route through the in-flight Txn
+    /// (so handler reads see their own writes). Thread-local in
+    /// effect: the kvexp dispatch lease guarantees one active txn
+    /// per tenant at a time.
     active_txn: ?*TrackedTxn = null,
-    /// Process-shared per-(manifest, store_id) outer mutex. All
-    /// `*KvStore` instances for the same store resolve to the same
-    /// pointer via `lookupTxnLock`.
-    txn_lock: *std.Thread.Mutex,
 
     /// Open a standalone, self-contained KvStore against `path`. The
     /// file is created if missing; a single store (id =
@@ -380,7 +330,6 @@ pub const KvStore = struct {
         self.store_id = store_id;
         self.owned = null;
         self.active_txn = null;
-        self.txn_lock = try lookupTxnLock(manifest, store_id);
         if (shared_counter) |sc| {
             self.counter = sc;
             self.owned_counter = null;
@@ -456,7 +405,6 @@ pub const KvStore = struct {
         self.store_id = store_id;
         self.owned = stack;
         self.active_txn = null;
-        self.txn_lock = try lookupTxnLock(&stack.manifest, store_id);
         if (shared_counter) |sc| {
             self.counter = sc;
             self.owned_counter = null;
@@ -520,9 +468,12 @@ pub const KvStore = struct {
             };
             return v orelse return Error.NotFound;
         }
-        var store = self.manifest.openStore(self.store_id) catch return Error.Sqlite;
-        defer store.deinit();
-        const v = store.get(self.allocator, key) catch |err| switch (err) {
+        // No active txn: read through a brief lease against main_overlay
+        // + LMDB. In-flight chain Txns are invisible — intentional, since
+        // those writes are still speculative until raft commits.
+        var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+        defer lease.release();
+        const v = lease.get(self.allocator, key) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
             else => return Error.Sqlite,
         };
@@ -543,9 +494,11 @@ pub const KvStore = struct {
             };
             return;
         }
-        self.txn_lock.lock();
-        defer self.txn_lock.unlock();
-        var txn = self.manifest.beginTxn(self.store_id) catch return Error.Sqlite;
+        // Blocking acquire — direct KvStore.put is used by test/admin
+        // paths where contention is rare; we don't surface Conflict.
+        var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+        defer lease.release();
+        var txn = lease.beginTxn() catch return Error.Sqlite;
         errdefer txn.rollback();
         txn.put(key, value) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
@@ -571,9 +524,9 @@ pub const KvStore = struct {
             };
             return;
         }
-        self.txn_lock.lock();
-        defer self.txn_lock.unlock();
-        var txn = self.manifest.beginTxn(self.store_id) catch return Error.Sqlite;
+        var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+        defer lease.release();
+        var txn = lease.beginTxn() catch return Error.Sqlite;
         errdefer txn.rollback();
         _ = txn.delete(key) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
@@ -627,9 +580,9 @@ pub const KvStore = struct {
             defer pc.deinit();
             try collectPrefix(self.allocator, &pc, prefix_bytes, cursor, count, &list);
         } else {
-            var store = self.manifest.openStore(self.store_id) catch return Error.Sqlite;
-            defer store.deinit();
-            var pc = store.scanPrefix(prefix_bytes) catch return Error.Sqlite;
+            var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+            defer lease.release();
+            var pc = lease.scanPrefix(prefix_bytes) catch return Error.Sqlite;
             defer pc.deinit();
             try collectPrefix(self.allocator, &pc, prefix_bytes, cursor, count, &list);
         }
@@ -784,9 +737,17 @@ pub const KvStore = struct {
         store: *KvStore,
         txn_seq: u64,
         kind: enum { normal, immediate },
+        /// True from `ensureOpen` until `commit`/`rollback`. Used to
+        /// short-circuit the no-op cases.
         opened: bool,
-        /// Top-level kvexp Txn. Allocated on the kvexp side; we own
-        /// the pointer until commit/rollback.
+        /// kvexp dispatch lease. Held only across handler execution
+        /// (open → end-of-batch). `releaseLease` drops it at the
+        /// start of finalizeBatch so other workers can begin chain-
+        /// tail Txns for this tenant while raft consenses this one.
+        lease: ?kvexp.StoreLease = null,
+        /// Top-level kvexp Txn. Created via `lease.beginTxn` at open
+        /// time; survives `releaseLease` and lives until commit or
+        /// rollback. Owned by kvexp's allocator until then.
         top: ?*kvexp.Txn = null,
         /// Open savepoint chain — innermost last. Reads/writes go to
         /// `savepoints.getLastOrNull() orelse top`.
@@ -798,17 +759,20 @@ pub const KvStore = struct {
 
         fn ensureOpen(self: *TrackedTxn) Error!void {
             if (self.opened) return;
-            // Per-tenant serialization: kvexp's top-level commit is
-            // chain-head-only, so concurrent workers on the same
-            // tenant must take turns. `tryLock` surfaces contention
-            // as `Conflict` so the dispatcher's skip-this-tick
-            // machinery (pre-cutover SQLITE_BUSY path) picks it up
-            // and tries a different anchor instead of blocking.
-            if (!self.store.txn_lock.tryLock()) return Error.Conflict;
+            // tryAcquire surfaces contention as `Conflict` so the
+            // dispatcher's skip-this-tick machinery picks a different
+            // anchor instead of blocking on the dispatch lock.
+            const lease_opt = self.store.manifest.tryAcquire(self.store.store_id) catch |err|
+                return switch (err) {
+                    error.OutOfMemory => Error.OutOfMemory,
+                    else => Error.Sqlite,
+                };
+            self.lease = lease_opt orelse return Error.Conflict;
             std.debug.assert(self.store.active_txn == null);
             self.txn_seq = self.store.counter.next();
-            self.top = self.store.manifest.beginTxn(self.store.store_id) catch |err| {
-                self.store.txn_lock.unlock();
+            self.top = self.lease.?.beginTxn() catch |err| {
+                self.lease.?.release();
+                self.lease = null;
                 return switch (err) {
                     error.OutOfMemory => Error.OutOfMemory,
                     else => Error.Sqlite,
@@ -816,6 +780,20 @@ pub const KvStore = struct {
             };
             self.store.active_txn = self;
             self.opened = true;
+        }
+
+        /// Release the kvexp dispatch lease and clear the `active_txn`
+        /// registration while the kvexp.Txn stays alive in the
+        /// per-tenant chain. Called at the start of finalizeBatch —
+        /// once the handler walk is done, the next worker can begin
+        /// its own chain-tail Txn for this tenant immediately, even
+        /// while raft is still consensing this batch. Idempotent.
+        pub fn releaseLease(self: *TrackedTxn) void {
+            if (self.lease == null) return;
+            std.debug.assert(self.store.active_txn == self);
+            self.store.active_txn = null;
+            self.lease.?.release();
+            self.lease = null;
         }
 
         /// Deepest open level — where puts/reads land. Caller must
@@ -875,10 +853,9 @@ pub const KvStore = struct {
 
         pub fn commit(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
-            // Any open savepoints must close before the top-level
-            // commit (kvexp errors with SavepointStillOpen otherwise).
-            // Fold each by commit (last-writer-wins) so they reach
-            // main_overlay together with the top-level writes.
+            // Any open savepoints close first (kvexp errors with
+            // SavepointStillOpen otherwise). Fold them into the
+            // top-level overlay before attempting the chain commit.
             while (self.savepoints.pop()) |sp| {
                 sp.commit() catch |err| switch (err) {
                     error.OutOfMemory => return Error.OutOfMemory,
@@ -886,35 +863,41 @@ pub const KvStore = struct {
                 };
             }
             const top = self.top.?;
+            // Try the kvexp commit BEFORE tearing down our state.
+            // On `NotChainHead` the kvexp.Txn is unchanged (still in
+            // the chain) and the caller can retry on a later tick
+            // once the predecessor worker commits its own head.
+            top.commit() catch |err| switch (err) {
+                error.NotChainHead => return Error.Conflict,
+                error.OutOfMemory => return Error.OutOfMemory,
+                else => return Error.Sqlite,
+            };
+            // Commit succeeded — kvexp freed the Txn; tear down
+            // local state and drop the lease if still held.
             self.top = null;
-            self.store.active_txn = null;
             self.opened = false;
             self.savepoints.deinit(self.store.allocator);
             self.savepoints = .empty;
-            const result = top.commit();
-            self.store.txn_lock.unlock();
-            result catch |err| {
-                std.log.warn("TrackedTxn.commit: kvexp.Txn.commit failed: {s}", .{@errorName(err)});
-                return switch (err) {
-                    error.OutOfMemory => Error.OutOfMemory,
-                    else => Error.Sqlite,
-                };
-            };
+            if (self.lease != null) {
+                self.store.active_txn = null;
+                self.lease.?.release();
+                self.lease = null;
+            }
         }
 
         pub fn rollback(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
-            // kvexp top-level rollback cascades to all open
-            // children (savepoints) on this txn, so we don't need
-            // to roll back the savepoint stack manually.
             const top = self.top.?;
             self.top = null;
-            self.store.active_txn = null;
             self.opened = false;
             self.savepoints.deinit(self.store.allocator);
             self.savepoints = .empty;
+            if (self.lease != null) {
+                self.store.active_txn = null;
+                self.lease.?.release();
+                self.lease = null;
+            }
             top.rollback();
-            self.store.txn_lock.unlock();
         }
     };
 

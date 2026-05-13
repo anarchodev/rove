@@ -89,6 +89,7 @@ pub const CALLBACK_DEFAULT_MAX_PER_TENANT = callback_dispatch.DEFAULT_MAX_PER_TE
 pub const dispatchInternalSchedules = internal_schedules.dispatchInternalSchedules;
 pub const INTERNAL_SCHEDULES_DEFAULT_MAX_PER_PASS = internal_schedules.DEFAULT_MAX_PER_PASS;
 pub const drainRaftPending = worker.drainRaftPending;
+pub const drainOnLeadershipLoss = worker.drainOnLeadershipLoss;
 pub const cleanupResponses = worker.cleanupResponses;
 pub const flushLogs = worker.flushLogs;
 

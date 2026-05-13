@@ -586,6 +586,17 @@ fn workerMain(args: *WorkerCtx) !void {
         // hits the standalone services directly (logs.{suffix},
         // files.{suffix}). Phase 5.5(a) Step B / Phase 5.5(e) F1.
 
+        // Leadership-loss drain. On true→false transition every
+        // speculative TrackedTxn rolls back (kvexp recipe §2) and
+        // every parked raft_pending entry downgrades to 503. New
+        // leader will re-propose anything raft actually committed.
+        const is_leader_now = worker.raft.isLeader();
+        if (worker.was_leader and !is_leader_now) {
+            try rjs.drainOnLeadershipLoss(worker);
+            try reg.flush();
+        }
+        worker.was_leader = is_leader_now;
+
         blocked_tenants.clear();
         while (true) {
             const processed = try rjs.dispatchOnce(worker, &blocked_tenants);

@@ -103,19 +103,25 @@ const SuccessRec = struct {
     request_id: u64,
 };
 
-/// End-of-walk: commit the shared batch txn, propose the merged
-/// writeset through raft (unless read-only), then move each success
-/// onward. Three exit paths:
+/// End-of-walk: propose the merged batch through raft, defer the
+/// TrackedTxn commit until raft confirms (kvexp README §1 speculative
+/// apply). The TrackedTxn pointer is moved into
+/// `worker.pending_txns[seq]`; `drainRaftPending` commits it once
+/// `committedSeq` advances past `seq`, or rolls it back on fault.
 ///
-///  - **commit failure**: SQLite already rolled back; every success
-///    downgrades to 503 with `.kv_error` outcome in the log.
-///  - **read-only batch**: no writes → no raft hop → every success
-///    moves straight to `response_in` with its normal status.
-///  - **writes present**: propose the writeset; on success the
-///    entries park in `raft_pending` with a `RaftWait` stamp, and
-///    `drainRaftPending` moves them onward once `committedSeq`
-///    advances past them. On propose failure we `undoTxn` and
-///    downgrade each success to 503 `.fault`.
+/// Three exit paths:
+///  - **read-only batch** (no writes, no commands): commit immediately
+///    (nothing to replicate; the txn has nothing in its overlay), free
+///    the txn, move each success straight to `response_in`.
+///  - **propose failure**: rollback the txn, free it, downgrade every
+///    success to 503 `.fault`.
+///  - **propose success**: stash the txn on `pending_txns[seq]`, park
+///    every success on `raft_pending` with a `RaftWait{seq}` stamp.
+///    The drain commits once raft confirms.
+///
+/// Takes ownership of `txn` (heap-allocated by the dispatcher): it's
+/// either committed+destroyed inline, rolled-back+destroyed inline, or
+/// transferred to `pending_txns` for the drain to handle.
 ///
 /// Returns the number of entries finalized.
 fn finalizeBatch(
@@ -131,7 +137,6 @@ fn finalizeBatch(
     const server = worker.h2;
     const allocator = worker.allocator;
     const anchor_id = anchor.id;
-    const store = anchor.kv;
     const batch_seq = txn.txn_seq;
     const has_writes = writeset.ops.items.len > 0;
     const has_schedules = pending_schedules.items.len > 0;
@@ -139,17 +144,16 @@ fn finalizeBatch(
     const has_cmds = has_schedules or has_cancels;
     var processed: usize = 0;
 
-    // Commit-fail downgrade path: SQLite has already rolled back, so
-    // every success-recorded handler gets its body replaced with 503
-    // and a `.kv_error` log outcome.
-    txn.commit() catch |err| panic_mod.invariantViolated(
-        "finalizeBatch.commit",
-        "tenant={s} err={s}",
-        .{ anchor_id, @errorName(err) },
-    );
-
     if (!has_writes and !has_cmds) {
-        // Pure read-only batch: no raft hop.
+        // Pure read-only batch: no raft hop. The txn overlay is empty
+        // (or only contains reads, which kvexp doesn't record); commit
+        // is a near-no-op that just releases the per-tenant lock.
+        txn.commit() catch |err| panic_mod.invariantViolated(
+            "finalizeBatch.commit(read_only)",
+            "tenant={s} err={s}",
+            .{ anchor_id, @errorName(err) },
+        );
+        allocator.destroy(txn);
         for (successes.items) |*s| {
             server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err| panic_mod.invariantViolated(
                 "finalizeBatch.move(read_only)",
@@ -163,22 +167,20 @@ fn finalizeBatch(
             worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
             processed += 1;
         }
-        // No raft hop on read-only batches → emits fire immediately.
-        // Per sse-plan §3.2, the "after kv commit" rule only constrains
-        // emits accompanying writes; emits without writes have nothing
-        // for raft to reject.
+        // Read-only emits: no raft to gate on.
         fireEmitsIfWired(worker, anchor_id, successes, pending_emits);
         successes.clearRetainingCapacity();
         return processed;
     }
 
-    // Writes and/or commands (schedules / cancels) present: propose
-    // ONE raft entry. The shape is a multi-envelope when more than
-    // one bucket has content, otherwise a bare envelope. See
-    // `raft_propose.proposeBatch` for the wire decision. On failure:
-    // compensating-rollback via undoTxn + downgrade every success.
-    // The accumulators are freed by the caller's `defer` regardless
-    // of which branch we take here.
+    // Writes and/or commands present. Release the dispatch lease NOW
+    // — handler execution is done, the kvexp.Txn is already in the
+    // tenant's chain, and the next worker can acquire the lease +
+    // begin a chain-tail Txn for this tenant while we propose. The
+    // chain orders commits; raft consensus and the next batch's
+    // handler can run in parallel.
+    txn.releaseLease();
+
     const seq = raft_propose.proposeBatch(
         worker,
         writeset,
@@ -187,11 +189,12 @@ fn finalizeBatch(
         anchor_id,
     ) catch |err| {
         std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
-        store.undoTxn(batch_seq) catch |undo_err| panic_mod.invariantViolated(
-            "finalizeBatch.undoTxn(after_propose_fail)",
+        txn.rollback() catch |rb_err| panic_mod.invariantViolated(
+            "finalizeBatch.rollback(after_propose_fail)",
             "tenant={s} txn_seq={d} err={s}",
-            .{ anchor_id, batch_seq, @errorName(undo_err) },
+            .{ anchor_id, batch_seq, @errorName(rb_err) },
         );
+        allocator.destroy(txn);
         for (successes.items) |*s| {
             respb.overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |err2| panic_mod.invariantViolated(
                 "finalizeBatch.respb.overwriteWith503(propose_fail)",
@@ -214,13 +217,18 @@ fn finalizeBatch(
         return processed;
     };
 
+    // Propose succeeded: park the txn on the worker's pending map
+    // keyed by raft seq. drainRaftPending commits it once raft
+    // confirms (forward iteration, so chain head commits first).
+    try worker.pending_txns.put(allocator, seq, txn);
+
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     for (successes.items) |*s| {
         try server.reg.set(s.ent, &server.request_out, RaftWait, .{
             .seq = seq,
             .txn_seq = batch_seq,
             .deadline_ns = deadline_ns,
-            .store = store,
+            .store = anchor.kv,
         });
         try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
 
@@ -231,11 +239,10 @@ fn finalizeBatch(
         worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
         processed += 1;
     }
-    // Fire SSE emits now that raft accepted the batch. The drain that
-    // applies the writes to followers happens later, but on the leader
-    // the local SQLite writes are already committed (txn.commit ran
-    // above); the propose-success path is the right "successful kv
-    // commit" hook from sse-plan §3.2's perspective.
+    // SSE emits fire once raft has *accepted* the batch (after propose
+    // returns successfully). They're still pending the commit watermark
+    // for follower visibility, but the SSE plan §3.2 only requires
+    // ordering relative to the local accept, not the cluster commit.
     fireEmitsIfWired(worker, anchor_id, successes, pending_emits);
     successes.clearRetainingCapacity();
     return processed;
@@ -1233,7 +1240,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // different tenant are left in request_out for a future
     // dispatchOnce call to pick up.
     var anchor: ?*const tenant_mod.Instance = null;
-    var txn: ?kv_mod.KvStore.TrackedTxn = null;
+    // Heap-allocated so the pointer is stable across the dispatch
+    // walk and survives the move into `worker.pending_txns` at
+    // finalizeBatch. ensureOpen registers `active_txn` against this
+    // stable address.
+    var txn: ?*kv_mod.KvStore.TrackedTxn = null;
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
@@ -1472,14 +1483,19 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
             if (skip_blocked) continue;
 
-            // Assign the begin-result directly to the outer optional
-            // `txn` so `open()` registers `active_txn` against the
-            // final stable address. The pre-cutover code used an
-            // intermediate `new_txn` local — under the new kvexp
-            // TrackedTxn the registration captures `&new_txn`, which
-            // dies at end-of-iteration and leaves `active_txn`
-            // dangling for the rest of the batch.
-            txn = scope_inst.kv.beginTrackedImmediate() catch |err| {
+            // Heap-allocate the TrackedTxn so the pointer is stable
+            // for the lifetime of the batch — `open()` registers
+            // `active_txn` against this address, and finalizeBatch
+            // hands the same pointer to `worker.pending_txns` for
+            // deferred commit at raft confirmation.
+            const new_txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch {
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn alloc failed\n", allocator);
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                processed += 1;
+                continue;
+            };
+            new_txn.* = scope_inst.kv.beginTrackedImmediate() catch |err| {
+                allocator.destroy(new_txn);
                 std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
                 worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
@@ -1490,21 +1506,21 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // as `KvError.Conflict` HERE — under kvexp's chain-head
             // commit rule, two workers must not have concurrent
             // open TrackedTxns on the same tenant.
-            txn.?.open() catch |err| {
+            new_txn.open() catch |err| {
+                allocator.destroy(new_txn);
                 if (err == kv_mod.KvError.Conflict) {
-                    txn = null;
                     blocked.append(scope_inst) catch {
                         return processed;
                     };
                     continue;
                 }
                 std.log.warn("rove-js open tracked txn ({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
-                txn = null;
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn open failed\n", allocator);
                 worker_mod.captureLog(worker, scope_inst.id, method, path, host, tc.current_deployment_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
                 processed += 1;
                 continue;
             };
+            txn = new_txn;
             anchor = scope_inst;
         }
 
@@ -1622,7 +1638,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var budget = dispatcher_mod.Budget.fromNow(budget_ns);
         var resp = worker.dispatcher.run(
             scope_inst.kv,
-            &txn.?,
+            txn.?,
             &writeset,
             bytecode,
             &tc.bytecodes,
@@ -1793,12 +1809,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     }
 
     // End of walk. If no anchor was opened we're done — all processing
-    // was short-circuit (failed) paths.
+    // was short-circuit (failed) paths. finalizeBatch takes ownership
+    // of `txn` regardless of outcome (commits + frees, rolls back +
+    // frees, or transfers to `worker.pending_txns`).
     if (anchor == null) return processed;
     processed += try finalizeBatch(
         worker,
         anchor.?,
-        &txn.?,
+        txn.?,
         &writeset,
         &pending_emits,
         &pending_schedules,
