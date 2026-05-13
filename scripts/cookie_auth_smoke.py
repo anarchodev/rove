@@ -52,8 +52,14 @@ def main() -> int:
 
         cc = c.curl_ctx()
 
-        # 1. UI bundle public.
+        # 1. UI bundle public. Poll because admin's snapshot loads
+        # async via the loader thread after files-server's bootstrap.
+        import time as _t
+        deadline = _t.monotonic() + 15.0
         r = curl(cc, f"{origin}/")
+        while _t.monotonic() < deadline and r.status == 503:
+            _t.sleep(0.2)
+            r = curl(cc, f"{origin}/")
         expect_status("GET / serves the UI bundle without auth", 200, r)
         if "<!doctype html>" not in r.body.lower():
             sys.exit(f"FAIL GET / body not HTML: {r.body[:200]}")
