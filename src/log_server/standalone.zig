@@ -243,6 +243,7 @@ fn handleOne(
     var method: []const u8 = "";
     var path: []const u8 = "";
     var authz: []const u8 = "";
+    var batch_key: []const u8 = "";
     if (rh.fields != null) {
         const fields = rh.fields.?[0..rh.count];
         for (fields) |f| {
@@ -251,6 +252,7 @@ fn handleOne(
             if (std.mem.eql(u8, name, ":method")) method = value;
             if (std.mem.eql(u8, name, ":path")) path = value;
             if (std.mem.eql(u8, name, "authorization")) authz = value;
+            if (std.mem.eql(u8, name, "x-rove-batch-key")) batch_key = value;
         }
     }
 
@@ -262,7 +264,9 @@ fn handleOne(
         try setPreflight(server, ent, sid, sess, rctx.cfg);
         return;
     }
-    if (!std.mem.eql(u8, method, "GET")) {
+    const is_push = std.mem.eql(u8, method, "POST") and
+        std.mem.eql(u8, path, "/v1/_internal/batch-pushed");
+    if (!std.mem.eql(u8, method, "GET") and !is_push) {
         try setResponse(server, ent, sid, sess, 405, "method not allowed\n", rctx.cfg);
         return;
     }
@@ -304,6 +308,14 @@ fn handleOne(
         return;
     }
 
+    // Worker → log-server push: indexer fetches the named batch
+    // directly without waiting for the LIST polling cycle to catch
+    // up. See `indexer.indexOneKey` for the why.
+    if (is_push) {
+        try handleBatchPushed(server, allocator, rctx, ent, sid, sess, batch_key);
+        return;
+    }
+
     const route = parseRoute(path) orelse {
         try setResponse(server, ent, sid, sess, 404, "not found\n", rctx.cfg);
         return;
@@ -313,6 +325,42 @@ fn handleOne(
         .show => try handleShow(server, allocator, rctx.store, rctx.db, ent, sid, sess, route.tenant_id, route.tail, rctx.cfg),
         .count => try handleCount(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, rctx.cfg),
     }
+}
+
+fn handleBatchPushed(
+    server: *LogH2,
+    allocator: std.mem.Allocator,
+    rctx: ReqCtx,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    batch_key: []const u8,
+) !void {
+    if (batch_key.len == 0) {
+        try setResponse(server, ent, sid, sess, 400, "missing X-Rove-Batch-Key header\n", rctx.cfg);
+        return;
+    }
+    // Sanity: only accept keys that look like log batches. Prevents
+    // an attacker (already past the JWT gate) from probing arbitrary
+    // S3 keys via this endpoint.
+    if (!std.mem.startsWith(u8, batch_key, "_logs/") or
+        !std.mem.endsWith(u8, batch_key, ".ndjson"))
+    {
+        try setResponse(server, ent, sid, sess, 400, "bad batch key shape\n", rctx.cfg);
+        return;
+    }
+
+    _ = indexer_mod.indexOneKey(allocator, rctx.store, rctx.db, batch_key) catch |err| {
+        std.log.warn(
+            "log-server: indexOneKey {s}: {s}",
+            .{ batch_key, @errorName(err) },
+        );
+        // Soft-fail — caller can re-push or wait for the next poll
+        // cycle to catch up.
+        try setResponse(server, ent, sid, sess, 500, "indexer failed\n", rctx.cfg);
+        return;
+    };
+    try setResponse(server, ent, sid, sess, 204, "", rctx.cfg);
 }
 
 const RouteKind = enum { list, show, count };

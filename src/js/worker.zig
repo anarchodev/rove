@@ -57,6 +57,7 @@ const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
+const jwt_mod = @import("rove-jwt");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const schedule_server_mod = @import("rove-schedule-server");
@@ -931,6 +932,11 @@ pub fn Worker(comptime opts: Options) type {
         sse_internal_token: ?[]const u8,
         sse_insecure_tls: bool,
         sse_curl: ?*blob_mod.curl.Easy,
+        /// libcurl handle for log-server push (`POST /v1/_internal/
+        /// batch-pushed`). Lazily created when `log_public_base` is
+        /// set. Null disables the push path; the indexer's 500ms
+        /// LIST polling is the catch-up.
+        log_push_curl: ?*blob_mod.curl.Easy,
 
         /// Background log flusher — owns its own thread, sleeps on
         /// `flusher_wake` between ticks, drains the worker's
@@ -1004,6 +1010,13 @@ pub fn Worker(comptime opts: Options) type {
                     if (config.sse_public_base == null or config.sse_internal_token == null) break :blk null;
                     break :blk blob_mod.curl.Easy.init(allocator) catch |err| {
                         std.log.warn("rove-js: sse libcurl init failed: {s}; emit POST disabled", .{@errorName(err)});
+                        break :blk null;
+                    };
+                },
+                .log_push_curl = blk: {
+                    if (config.log_public_base == null) break :blk null;
+                    break :blk blob_mod.curl.Easy.init(allocator) catch |err| {
+                        std.log.warn("rove-js: log-push libcurl init failed: {s}; batch push disabled", .{@errorName(err)});
                         break :blk null;
                     };
                 },
@@ -1095,6 +1108,7 @@ pub fn Worker(comptime opts: Options) type {
             self.raft_pending.deinit();
             self.dispatcher.deinit();
             if (self.sse_curl) |easy| easy.deinit();
+            if (self.log_push_curl) |easy| easy.deinit();
             // `manifest_easy` lives on NodeState — main.zig owns it.
             self.h2.destroy();
             allocator.destroy(self);
@@ -1792,18 +1806,78 @@ pub fn flushLogs(worker: anytype) !void {
     const node_id_hex = std.fmt.bufPrint(&node_buf, "{x:0>8}", .{worker.raft.config.node_id}) catch unreachable;
     const flush_unix_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
 
-    log_server_mod.flush_writer.writeBatch(
+    const batch_key_opt = log_server_mod.flush_writer.writeBatch(
         allocator,
         worker.log_batch_store,
         node_id_hex,
         records,
         flush_unix_ms,
-    ) catch |err| {
+    ) catch |err| blk: {
         std.log.warn(
             "rove-js flushLogs: writeBatch ({d} records) failed: {s}",
             .{ records.len, @errorName(err) },
         );
+        break :blk null;
     };
+    const batch_key = batch_key_opt orelse return;
+    defer allocator.free(batch_key);
+
+    // Push the batch key to log-server so its indexer can GET the
+    // object directly (read-after-write consistent on S3 even when
+    // list-after-write isn't). Fire-and-forget — if it fails, the
+    // indexer's 500ms LIST polling picks the batch up on the next
+    // cycle. The push just collapses the typical worst-case
+    // visibility window from ~seconds to ~tens of ms.
+    pushBatchKey(worker, allocator, batch_key) catch |err| {
+        std.log.warn(
+            "rove-js flushLogs: pushBatchKey({s}) failed: {s}",
+            .{ batch_key, @errorName(err) },
+        );
+    };
+}
+
+/// Tell log-server about a freshly-PUT batch so it indexes the key
+/// directly. Builds `POST {log_public_base}/v1/_internal/batch-pushed`
+/// with `X-Rove-Batch-Key: <key>` + a freshly-minted services JWT.
+/// Fire-and-forget with a tight timeout — never blocks the worker.
+fn pushBatchKey(
+    worker: anytype,
+    allocator: std.mem.Allocator,
+    batch_key: []const u8,
+) !void {
+    const easy = worker.log_push_curl orelse return;
+    const log_base = worker.log_public_base orelse return;
+    const secret = worker.services_jwt_secret orelse return;
+    if (log_base.len == 0) return;
+
+    const url = try std.fmt.allocPrint(allocator, "{s}/v1/_internal/batch-pushed", .{log_base});
+    defer allocator.free(url);
+
+    const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    const token = try jwt_mod.mint(allocator, secret, .{ .exp_ms = now_ms + 60 * 1000 });
+    defer allocator.free(token);
+    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+    defer allocator.free(auth_value);
+
+    const headers = [_]blob_mod.curl.Header{
+        .{ .name = "Authorization", .value = auth_value },
+        .{ .name = "X-Rove-Batch-Key", .value = batch_key },
+    };
+    const use_h2c = std.mem.startsWith(u8, url, "http://");
+    var resp = try easy.request(allocator, .{
+        .method = .POST,
+        .url = url,
+        .headers = &headers,
+        .body = "",
+        .timeout_ms = 500,
+        .connect_timeout_ms = 200,
+        .http_version = if (use_h2c) .h2c_prior_knowledge else .auto,
+        .verify_tls = !worker.sse_insecure_tls,
+    });
+    defer resp.deinit(allocator);
+    if (resp.status != 204) {
+        std.log.warn("rove-js push batch: {s} → {d}", .{ url, resp.status });
+    }
 }
 
 /// Read the tenant's current deployment manifest, fetch every handler

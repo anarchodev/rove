@@ -53,14 +53,20 @@ pub const Error = error{
 /// `flush_unix_ms` is millis-since-epoch at flush time, used to
 /// disambiguate batch_ids if a node's request_id allocator ever
 /// resets.
+/// Caller frees the returned `[]u8` (the batch's S3 key, e.g.
+/// `_logs/{node_hex}/{batch_id}.ndjson`). Returns null if the batch
+/// was empty. The key is the same value just PUT into `store` — the
+/// caller can push it to log-server (`/v1/_internal/batch-pushed`)
+/// so the indexer fetches it directly without waiting for the LIST
+/// polling cycle to converge.
 pub fn writeBatch(
     allocator: std.mem.Allocator,
     store: batch_store_mod.BatchStore,
     node_id_hex: []const u8,
     records: []const log_mod.LogRecord,
     flush_unix_ms: i64,
-) Error!void {
-    if (records.len == 0) return;
+) Error!?[]u8 {
+    if (records.len == 0) return null;
 
     // Per `docs/logs-plan.md` §2.2: records ordered by ascending
     // received_ns. The buffer is appended in dispatch order, which
@@ -130,7 +136,9 @@ pub fn writeBatch(
         "_logs/{s}/{s}.ndjson",
         .{ node_id_hex, batch_id },
     ) catch return Error.OutOfMemory;
-    defer allocator.free(obj_key);
+    // NOT freed on the happy path — returned to caller. Caller owns
+    // it from here.
+    errdefer allocator.free(obj_key);
 
     const idx_file = sidecar.IdxFile{
         .node_id = node_id_hex,
@@ -154,6 +162,7 @@ pub fn writeBatch(
     @memcpy(obj[4 + sidecar_bytes.len ..], frames.items);
 
     store.put(obj_key, obj) catch return Error.Io;
+    return obj_key;
 }
 
 fn lessByReceivedNs(_: void, a: log_mod.LogRecord, b: log_mod.LogRecord) bool {
@@ -362,7 +371,12 @@ test "writeBatch emits one object with embedded sidecar + frames" {
     defer r1.deinit(a);
     const records = [_]log_mod.LogRecord{ r0, r1 };
 
-    try writeBatch(a, store, "00000001", &records, 1730764800000);
+    const returned_key = (try writeBatch(a, store, "00000001", &records, 1730764800000)).?;
+    defer a.free(returned_key);
+    try testing.expectEqualStrings(
+        "_logs/00000001/00000000000000000001-1730764800000.ndjson",
+        returned_key,
+    );
 
     // Single object exists at the .ndjson key — no separate .idx.json.
     const obj_key = "_logs/00000001/00000000000000000001-1730764800000.ndjson";
@@ -427,7 +441,8 @@ test "writeBatch with empty records is a no-op (no PUTs)" {
     defer m.deinit();
     const store = m.batchStore();
 
-    try writeBatch(a, store, "00000001", &.{}, 0);
+    const k = try writeBatch(a, store, "00000001", &.{}, 0);
+    try testing.expect(k == null);
 
     const list = try store.list("", "", 16, a);
     defer batch_store_mod.freeListResult(a, list);
@@ -449,7 +464,8 @@ test "writeBatch sorts records by received_ns before encoding" {
     defer lo.deinit(a);
     const records = [_]log_mod.LogRecord{ hi, lo };
 
-    try writeBatch(a, store, "00000001", &records, 1730764800000);
+    const k = (try writeBatch(a, store, "00000001", &records, 1730764800000)).?;
+    defer a.free(k);
 
     // batch_id = first_request_id (after sort) → record at received=1000 → request_id=6.
     const obj = try store.get("_logs/00000001/00000000000000000006-1730764800000.ndjson", a);

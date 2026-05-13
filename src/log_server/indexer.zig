@@ -126,6 +126,51 @@ pub fn pollOnce(
     return stats;
 }
 
+/// Index a single batch key by direct GET (no LIST roundtrip).
+///
+/// Used by the worker→log-server push path: after the worker PUTs
+/// a batch to S3, it POSTs the resulting key to log-server's
+/// `/v1/_internal/batch-pushed`, which calls this. Lets us bypass
+/// LIST's eventual-consistency window on S3-compatible providers
+/// where read-after-write is strong but list-after-write isn't
+/// (OVH being the practical case). The 500ms polling cycle remains
+/// the catch-up path for batches we missed (push dropped, log-server
+/// restart, batches that pre-date the running log-server).
+///
+/// Returns `Stats{ sidecars_seen=1, batches_indexed=1 }` on success.
+/// Non-fatal errors (S3 not-found, invalid sidecar) are logged + the
+/// per-error stats bumped; the function still returns ok so the
+/// caller can ack the push without retrying.
+pub fn indexOneKey(
+    allocator: std.mem.Allocator,
+    store: batch_store_mod.BatchStore,
+    db: *index_db_mod.IndexDb,
+    key: []const u8,
+) Error!Stats {
+    var stats: Stats = .{};
+    if (!std.mem.endsWith(u8, key, NDJSON_SUFFIX)) {
+        stats.skipped_non_sidecars += 1;
+        return stats;
+    }
+    stats.sidecars_seen += 1;
+
+    const parsed = readEmbeddedSidecar(allocator, store, key) catch |err| {
+        std.log.warn("log-indexer: push read {s}: {s}", .{ key, @errorName(err) });
+        stats.skipped_invalid += 1;
+        return stats;
+    };
+    var idx = parsed.idx;
+    defer idx.deinit(allocator);
+
+    db.insertBatch(&idx, key, parsed.header_size) catch |err| {
+        std.log.warn("log-indexer: push insert {s}: {s}", .{ key, @errorName(err) });
+        return Error.Sqlite;
+    };
+    stats.batches_indexed += 1;
+    stats.records_indexed += @intCast(idx.records.len);
+    return stats;
+}
+
 const ParsedSidecar = struct {
     idx: sidecar.IdxFile,
     /// `4 + sidecar_size`. Indexer adds this to per-record offsets
