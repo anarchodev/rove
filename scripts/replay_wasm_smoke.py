@@ -46,20 +46,32 @@ def _ls(jwt: str, url: str, *, timeout_s: float = 10.0) -> str:
     return subprocess.run(args, capture_output=True, timeout=timeout_s + 5.0).stdout.decode()
 
 
-def _run_wasm_driver(bundle_path: Path, *, stop_at: int | None = None) -> dict:
-    """Invoke scripts/replay_wasm_smoke.mjs, parse its JSON summary."""
+def _run_wasm_driver(bundle_path: Path, *, stop_at: int | None = None, expect_throw: bool = False) -> dict:
+    """Invoke scripts/replay_wasm_smoke.mjs, parse its JSON summary.
+
+    The driver writes its summary JSON to stdout BEFORE process.exit,
+    so we always try to parse it — a captured throw means the
+    arena_run_module call returned -1 and the driver exits non-zero
+    with `ok: false` in the summary. Callers that expect a throw
+    pass `expect_throw=True`.
+    """
     args = ["node", str(REPO_ROOT / "scripts" / "replay_wasm_smoke.mjs"), str(bundle_path)]
     if stop_at is not None:
         args.append(str(stop_at))
     proc = subprocess.run(args, capture_output=True, timeout=60, cwd=REPO_ROOT)
-    if proc.returncode != 0:
-        sys.stderr.write(proc.stderr.decode(errors="replace"))
-        sys.exit(f"FAIL WASM driver exited {proc.returncode} (stop_at={stop_at})")
     try:
-        return json.loads(proc.stdout.decode())
+        summary = json.loads(proc.stdout.decode())
     except json.JSONDecodeError:
         sys.stderr.write(proc.stdout.decode(errors="replace"))
-        sys.exit("FAIL WASM driver stdout was not JSON")
+        sys.stderr.write(proc.stderr.decode(errors="replace"))
+        sys.exit(f"FAIL WASM driver stdout was not JSON (rc={proc.returncode}, stop_at={stop_at})")
+    if expect_throw:
+        # rc=1 expected, summary.ok=false. Don't gate on returncode.
+        return summary
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr.decode(errors="replace"))
+        sys.exit(f"FAIL WASM driver exited {proc.returncode} (stop_at={stop_at}): {summary}")
+    return summary
 
 
 def main() -> int:
@@ -417,6 +429,91 @@ def main() -> int:
         if hv2["at"] != hv3["at"]:
             sys.exit(f"FAIL at differs across reruns: step2={hv2['at']} vs step3={hv3['at']}")
         print("ok  three stops, same bundle, deterministic — salt/at match across reruns")
+
+        # ── Pass 4: THROW capture ──────────────────────────────────────
+        # replay_demo's handler throws on request.path containing
+        # "/throw". Drive that path once, fetch the 500'd record from
+        # log-server, replay it in WASM, and assert a THROW event
+        # surfaces with the right message.
+        r = curl(cc, f"{leader_origin}/throw?fn=handler")
+        if r.status != 500:
+            sys.exit(f"FAIL /throw expected 500, got {r.status}: {r.body[:200]}")
+        print(f"ok  drove /throw request — worker responded {r.status} as expected")
+
+        throw_rec = None
+        for _ in range(60):
+            body = _ls(jwt, f"{c.log_url()}/v1/{TENANT_ID}/list?limit=20")
+            try:
+                d = json.loads(body)
+            except json.JSONDecodeError:
+                d = {}
+            for rec_summary in d.get("records", []):
+                # 500 + path that includes "/throw" identifies our request.
+                if rec_summary.get("status") == 500 and "/throw" in (rec_summary.get("path") or ""):
+                    throw_rec = rec_summary
+                    break
+            if throw_rec is not None:
+                break
+            time.sleep(0.5)
+        if throw_rec is None:
+            sys.exit("FAIL no 500/throw record surfaced in log-server")
+
+        throw_rid = throw_rec["request_id"]
+        throw_show = json.loads(_ls(jwt, f"{c.log_url()}/v1/{TENANT_ID}/show/{throw_rid}"))["record"]
+        throw_tapes = throw_show.get("tapes", {})
+        # The handler throws BEFORE crypto.getRandomValues / kv / etc.
+        # so the throw record only has the date tape (Date.now() is
+        # evaluated as part of the throw message). That date entry
+        # MUST survive: worker_dispatch.zig::dispatchOnce now calls
+        # captureTapes on the handler-throw path so replay re-consumes
+        # the same captured timestamp.
+        if not throw_tapes.get("date_tape_b64"):
+            sys.exit(f"FAIL throw record missing date tape — worker is dropping fault-time tapes: keys={list(throw_tapes.keys())}")
+        print(f"ok  throw record carries date_tape_b64 ({len(throw_tapes['date_tape_b64'])} b64 chars)")
+
+        throw_req_body = ""
+        if throw_tapes.get("request_body_b64"):
+            try:
+                throw_req_body = base64.b64decode(throw_tapes["request_body_b64"]).decode("utf-8", errors="replace")
+            except Exception:
+                throw_req_body = ""
+        throw_bundle = {
+            "request_id": throw_rid,
+            "deployment_id": throw_show["deployment_id"],
+            "entry_path": entry_path,
+            "entry_source": entry_source,
+            "entry_fn": "handler",
+            "request": {
+                "method": throw_show.get("method", "GET"),
+                "path": throw_show.get("path", "/throw"),
+                "host": throw_show.get("host", ""),
+                "body": throw_req_body,
+            },
+            "modules": modules,
+            "tape_blobs": {
+                "kv": throw_tapes.get("kv_tape_b64") or None,
+                "date": throw_tapes.get("date_tape_b64") or None,
+                "math_random": throw_tapes.get("math_random_tape_b64") or None,
+                "crypto_random": throw_tapes.get("crypto_random_tape_b64") or None,
+                "module": throw_tapes.get("module_tree_b64") or None,
+            },
+        }
+        throw_bundle_path = Path("/tmp/replay-wasm-smoke-throw-bundle.json")
+        throw_bundle_path.write_text(json.dumps(throw_bundle))
+
+        throw_summary = _run_wasm_driver(throw_bundle_path, expect_throw=True)
+        if throw_summary.get("ok"):
+            sys.exit(f"FAIL throw bundle should have rc != 0 in WASM: {throw_summary}")
+        if throw_summary["throw_count"] < 1:
+            sys.exit(f"FAIL no THROW events captured: {throw_summary}")
+        throw_event = next((e for e in throw_summary["events"] if e.get("kind") == "throw"), None)
+        if not throw_event:
+            sys.exit(f"FAIL no throw entry in events log: {throw_summary['events']}")
+        msg = throw_event.get("message") or ""
+        if "intentional replay-demo throw" not in msg:
+            sys.exit(f"FAIL throw message mismatch: {msg!r}")
+        print(f"ok  WASM replay captured THROW at {throw_event['file']}:{throw_event['line']} — "
+              f"message: {msg!r}")
 
         print()
         print("all replay-wasm smoke checks passed")

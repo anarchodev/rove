@@ -33,6 +33,11 @@ function rollDie() {
 
 export function handler() {
     if (request && request.path && request.path.includes("/throw")) {
+        // Date.now() in the throw message verifies that
+        // worker_dispatch.zig preserves tape state captured BEFORE
+        // the throw: production records the date entry, replay
+        // re-consumes it (returning the same captured timestamp),
+        // and the user `throw` reaches OP_throw → THROW event.
         throw new Error("intentional replay-demo throw at " + Date.now());
     }
 

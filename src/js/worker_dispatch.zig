@@ -1852,7 +1852,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             } else {
                 try respb.setErrorResponse(server, ent, sid, sess);
             }
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, .{});
+            // Preserve whatever tapes the handler produced before the
+            // dispatcher kill / error. The captured prefix is what the
+            // replay shell uses to re-run the request up to the same
+            // failure mode (e.g. step through the same kv reads to see
+            // why the handler hit the CPU budget).
+            const tape_payloads = worker_mod.captureTapes(worker, &tapes, body, &.{});
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads);
             processed += 1;
             continue;
         };
@@ -1881,7 +1887,15 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             defer if (ex_body.len > 0) allocator.free(ex_body);
             const ex_body_slice: []const u8 = if (ex_body.len > 0) ex_body else "handler threw\n";
             try respb.setSimpleResponse(server, ent, sid, sess, 500, ex_body_slice, allocator);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, .{});
+            // Preserve the tape prefix the handler captured before
+            // throwing. Replay can re-execute the handler with the
+            // same kv/date/random sequence — the user `throw` itself
+            // hits OP_throw → arena trace emits a THROW event, and
+            // any tape-consuming expression baked into the throw
+            // message (e.g. `Date.now()`) resolves to the same value
+            // it did originally.
+            const tape_payloads = worker_mod.captureTapes(worker, &tapes, body, &.{});
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads);
             processed += 1;
             continue;
         }
@@ -1895,7 +1909,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .{ scope_inst.id, @errorName(re) },
             );
             try respb.setSimpleResponse(server, ent, sid, sess, 500, "kv error during handler\n", allocator);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+            // Preserve whatever tapes the handler captured before
+            // the kv error — lets replay reach the same failure
+            // point with the same prior reads.
+            const tape_payloads = worker_mod.captureTapes(worker, &tapes, body, &.{});
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads);
             processed += 1;
             continue;
         }
