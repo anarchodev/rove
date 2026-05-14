@@ -109,8 +109,25 @@ if (!entry_path) {
 }
 if (!entry_path || !entry_source) fail("no entry module in bundle");
 
+// arena_run_module only EVALUATES the module body — it doesn't
+// invoke any export. To exercise the captured handler (and consume
+// the tapes the way production did), append a stamp-and-call epilogue
+// to the entry source: set globalThis.request the way the worker does
+// per request, then call the named export. The injected lines show up
+// in the trace too, but they're at module-top scope, so they don't
+// confuse the call-tree timeline.
+const entry_fn = raw.entry_fn || "handler";
+const req_json = JSON.stringify(raw.request || { method: "GET", path: "/", host: "", body: "" });
+const wrapped_source =
+    entry_source +
+    "\n;(() => {" +
+    "  globalThis.request = " + req_json + ";" +
+    "  globalThis.response = { status: 200, headers: {}, cookies: [] };" +
+    "  globalThis.__replay_result = " + entry_fn + "();" +
+    "})();\n";
+
 arena_set_trace_mode(TRACE_SCAN);
-const rc = arena_run_module(entry_path, entry_source);
+const rc = arena_run_module(entry_path, wrapped_source);
 arena_set_trace_mode(0);
 arena_destroy();
 

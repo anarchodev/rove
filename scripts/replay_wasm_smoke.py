@@ -32,7 +32,8 @@ from smoke_lib import Cluster, CurlContext, curl, mint_jwt  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PUBLIC_SUFFIX = "loop46.localhost"
-ACME_HOST = f"acme.{PUBLIC_SUFFIX}"
+TENANT_ID = "replay_demo"
+TENANT_HOST = f"replay-demo.{PUBLIC_SUFFIX}"
 TOKEN = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 
 
@@ -64,17 +65,21 @@ def main() -> int:
         c.mint_services_token()
         print(f"ok  cluster up: leader={c.addrs.http[c.leader_idx]} log={c.log_url()} files={c.files_url()}")
 
-        cc = c.curl_ctx(ACME_HOST)
-        leader_origin = f"https://{ACME_HOST}:{c.leader_port()}"
+        cc = c.curl_ctx(TENANT_HOST)
+        leader_origin = f"https://{TENANT_HOST}:{c.leader_port()}"
 
-        # Drive a few requests through acme. The handler does kv.get
-        # + kv.set ("hits" counter) so we get non-empty kv tapes.
-        c.wait_for_handler("acme", "/?fn=handler", expected_status=200, timeout_s=15.0)
+        # Drive a few requests through the demo handler. It exercises
+        # every captured tape channel: kv.get + kv.set (kv), Date.now
+        # (date), Math.random (math_random), crypto.getRandomValues
+        # (crypto_random), and one local import (module).
+        c.wait_for_handler(TENANT_ID, "/?fn=handler", expected_status=200, timeout_s=15.0)
+        last_body = ""
         for _ in range(3):
             r = curl(cc, f"{leader_origin}/?fn=handler")
             if r.status != 200:
-                sys.exit(f"FAIL acme GET /?fn=handler: {r.status} {r.body[:200]}")
-        print("ok  drove 3 acme requests")
+                sys.exit(f"FAIL {TENANT_ID} GET /?fn=handler: {r.status} {r.body[:200]}")
+            last_body = r.body
+        print(f"ok  drove 3 {TENANT_ID} requests — last response: {last_body.strip()!r}")
 
         # Mint a services JWT for log-server + files-server (both
         # accept the same secret per smoke_lib's setup).
@@ -83,7 +88,7 @@ def main() -> int:
         # Poll log-server for the records.
         recs = []
         for _ in range(60):
-            body = _ls(jwt, f"{c.log_url()}/v1/acme/list?limit=20")
+            body = _ls(jwt, f"{c.log_url()}/v1/{TENANT_ID}/list?limit=20")
             try:
                 d = json.loads(body)
             except json.JSONDecodeError:
@@ -93,23 +98,28 @@ def main() -> int:
                 break
             time.sleep(0.5)
         if not recs:
-            sys.exit("FAIL no acme records surfaced in log-server")
+            sys.exit(f"FAIL no {TENANT_ID} records surfaced in log-server")
         rec_summary = recs[0]
         rid = rec_summary["request_id"]
-        print(f"ok  log-server surfaced acme record {rid}")
+        print(f"ok  log-server surfaced {TENANT_ID} record {rid}")
 
         # Fetch the full record (carries the base64 tape fields).
-        show_body = _ls(jwt, f"{c.log_url()}/v1/acme/show/{rid}")
+        show_body = _ls(jwt, f"{c.log_url()}/v1/{TENANT_ID}/show/{rid}")
         rec = json.loads(show_body)["record"]
         tapes_field = rec.get("tapes", {})
-        if not tapes_field.get("kv_tape_b64"):
+        present = [
+            ch for ch in ("kv_tape_b64", "date_tape_b64", "math_random_tape_b64",
+                          "crypto_random_tape_b64", "module_tree_b64")
+            if tapes_field.get(ch)
+        ]
+        if "kv_tape_b64" not in present:
             sys.exit(f"FAIL kv_tape_b64 missing from record: tapes keys={list(tapes_field.keys())}")
-        print("ok  fetched full log record with kv tape inline")
+        print(f"ok  fetched full log record — tape channels present: {present}")
 
         # Fetch the historical deployment manifest by hex id.
         dep_id = rec["deployment_id"]
         dep_hex = f"{dep_id:016x}"
-        mf_body = _ls(jwt, f"{c.files_url()}/acme/deployments/{dep_hex}")
+        mf_body = _ls(jwt, f"{c.files_url()}/{TENANT_ID}/deployments/{dep_hex}")
         manifest = json.loads(mf_body)
         entries = manifest.get("entries", [])
         handler_entries = [e for e in entries if e.get("kind") == "handler"]
@@ -121,7 +131,7 @@ def main() -> int:
         # so multi-file imports resolve at replay time).
         modules = []
         for e in handler_entries:
-            src_url = f"{c.files_url()}/acme/source/{e['hash']}"
+            src_url = f"{c.files_url()}/{TENANT_ID}/source/{e['hash']}"
             args = [
                 "curl", "-sS", "--http2-prior-knowledge", "--max-time", "10",
                 "-H", f"Authorization: Bearer {jwt}", src_url,
@@ -153,11 +163,28 @@ def main() -> int:
         def get_b64(key: str) -> str | None:
             return tapes_field.get(key) or None
 
+        # Reconstruct the request object the handler reads. The
+        # driver stamps globalThis.request before calling handler()
+        # so handlers that read request.path / request.body don't
+        # diverge from the captured execution.
+        req_body = ""
+        if tapes_field.get("request_body_b64"):
+            try:
+                req_body = base64.b64decode(tapes_field["request_body_b64"]).decode("utf-8", errors="replace")
+            except Exception:
+                req_body = ""
         bundle = {
             "request_id": rid,
             "deployment_id": dep_id,
             "entry_path": entry_path,
             "entry_source": entry_source,
+            "entry_fn": "handler",
+            "request": {
+                "method": rec.get("method", "GET"),
+                "path": rec.get("path", "/"),
+                "host": rec.get("host", ""),
+                "body": req_body,
+            },
             "modules": modules,
             "tape_blobs": {
                 "kv": get_b64("kv_tape_b64"),
@@ -190,10 +217,27 @@ def main() -> int:
 
         if not summary.get("ok"):
             sys.exit(f"FAIL WASM rc={summary['rc']} summary={summary}")
-        if summary["func_enter_count"] < 1:
-            sys.exit(f"FAIL no FUNC_ENTER events in trace: {summary}")
-        if summary["name_count"] < 1:
-            sys.exit(f"FAIL no NAME events (atom resolution missing): {summary}")
+        # Module body enter + handler() + at least one of rollDie /
+        # bumpCount / fmtSalt called inside handler ⇒ 3+ FUNC_ENTERs.
+        # Tighter than the earlier acme-based 1-enter floor; catches
+        # a regression where the trace emitter drops nested-call
+        # events.
+        if summary["func_enter_count"] < 3:
+            sys.exit(f"FAIL want >=3 FUNC_ENTER events (module body + handler + inner call): {summary}")
+        if summary["name_count"] < 2:
+            sys.exit(f"FAIL want >=2 NAME entries (function + file atoms): {summary}")
+        # We exercised 4 channels in the original capture (kv, date,
+        # math_random, crypto_random). Assert they all reached the
+        # log record so the bundle composer has something to feed
+        # into the WASM replay's tape readers.
+        expected_channels = {"kv_tape_b64", "date_tape_b64", "math_random_tape_b64", "crypto_random_tape_b64"}
+        missing = expected_channels - set(present)
+        if missing:
+            sys.exit(f"FAIL captured record missing channels: {missing}. Present: {present}")
+        # The handler returns a non-empty string — output_lines tracks
+        # printf/stderr lines, NOT the handler return value, so it's
+        # expected to be 0 here. Still a useful smoke for when a
+        # future handler logs something.
         print(f"ok  WASM replay ran handler {entry_path}: "
               f"rc={summary['rc']} events={summary['event_count']} "
               f"enters={summary['func_enter_count']} names={summary['name_count']} "
