@@ -1596,7 +1596,6 @@ pub const RequestTapes = struct {
 /// `*_truncated` flag set on the log record's tape payloads. Mirrors
 /// PLAN §2.4's body-cap default.
 pub const REQUEST_BODY_CAP: usize = 256 * 1024;
-pub const RESPONSE_BODY_CAP: usize = 256 * 1024;
 
 /// Serialize each non-empty tape into the request's `TapePayloads`,
 /// owned by the caller's allocator. The bytes ride inline in the
@@ -1618,7 +1617,6 @@ pub fn captureTapes(
     worker: anytype,
     tapes: *RequestTapes,
     request_body: []const u8,
-    response_body: []const u8,
 ) log_mod.TapePayloads {
     const allocator = worker.allocator;
 
@@ -1649,6 +1647,11 @@ pub fn captureTapes(
     // Bodies bigger than `REQUEST_BODY_CAP` get truncated to that
     // prefix; the truncation flag is preserved so the simulator (and
     // the replay shell) know the captured bytes are a prefix.
+    //
+    // Response body is intentionally NOT captured: deterministic
+    // replay re-produces the response by re-running the handler with
+    // the same request body + tapes, so storing the original would
+    // be pure duplication on every S3 batch PUT.
     if (request_body.len > 0) {
         const captured_len = @min(request_body.len, REQUEST_BODY_CAP);
         if (allocator.dupe(u8, request_body[0..captured_len])) |captured| {
@@ -1656,19 +1659,6 @@ pub fn captureTapes(
             payloads.request_body_truncated = captured_len < request_body.len;
         } else |err| {
             std.log.warn("rove-js request-body capture failed: {s}", .{@errorName(err)});
-        }
-    }
-
-    // Response body — same capture pattern. Captured AFTER content-
-    // type sniffing / JSON serialization (the worker has already
-    // turned `resp.body` into the bytes that go out on the wire).
-    if (response_body.len > 0) {
-        const captured_len = @min(response_body.len, RESPONSE_BODY_CAP);
-        if (allocator.dupe(u8, response_body[0..captured_len])) |captured| {
-            payloads.response_body_bytes = captured;
-            payloads.response_body_truncated = captured_len < response_body.len;
-        } else |err| {
-            std.log.warn("rove-js response-body capture failed: {s}", .{@errorName(err)});
         }
     }
 

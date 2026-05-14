@@ -78,11 +78,10 @@ pub const TapePayloads = struct {
     /// still feeds the captured bytes — the handler's view is what
     /// was captured, even if that's less than the original.
     request_body_truncated: bool = false,
-    /// Captured response body (handler return value after content-
-    /// type sniffing / JSON serialization, truncated to 256 KB).
-    response_body_bytes: []const u8 = &.{},
-    /// True iff `response_body_bytes` is a truncated prefix.
-    response_body_truncated: bool = false,
+    // Response body is NOT captured — deterministic replay
+    // re-produces it from (request body, tapes, source). Storing
+    // it on every batch PUT would be pure duplication on the S3
+    // bill.
 
     pub fn deinit(self: *TapePayloads, allocator: std.mem.Allocator) void {
         if (self.kv_tape_bytes.len != 0) allocator.free(self.kv_tape_bytes);
@@ -91,7 +90,6 @@ pub const TapePayloads = struct {
         if (self.math_random_tape_bytes.len != 0) allocator.free(self.math_random_tape_bytes);
         if (self.module_tree_bytes.len != 0) allocator.free(self.module_tree_bytes);
         if (self.request_body_bytes.len != 0) allocator.free(self.request_body_bytes);
-        if (self.response_body_bytes.len != 0) allocator.free(self.response_body_bytes);
         self.* = .{};
     }
 };
@@ -348,7 +346,6 @@ fn estimateRecordBytes(r: *const LogRecord) usize {
     n += r.tapes.math_random_tape_bytes.len;
     n += r.tapes.module_tree_bytes.len;
     n += r.tapes.request_body_bytes.len;
-    n += r.tapes.response_body_bytes.len;
     return n;
 }
 

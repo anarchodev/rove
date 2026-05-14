@@ -210,24 +210,25 @@ export default function () {
         )
         rec = json.loads(r.body)["record"]
         tapes = rec.get("tapes", {})
-        for key in ["kv_tape_b64", "date_tape_b64", "module_tree_b64", "request_body_b64", "response_body_b64"]:
+        for key in ["kv_tape_b64", "date_tape_b64", "module_tree_b64", "request_body_b64"]:
             if not tapes.get(key):
                 sys.exit(f"FAIL {key} missing on log record")
         if tapes.get("request_body_truncated"):
             sys.exit(f"FAIL request_body_truncated should be false: {tapes!r}")
-        if tapes.get("response_body_truncated"):
-            sys.exit(f"FAIL response_body_truncated should be false: {tapes!r}")
-        print("ok  log record carries kv + date + module + req-body + resp-body tape payloads")
+        # Response body is intentionally not captured — replay
+        # re-produces it deterministically. Assert the field stays
+        # absent so a regression that reintroduces server-side
+        # response capture fails this smoke.
+        if "response_body_b64" in tapes:
+            sys.exit(f"FAIL response_body_b64 should not be persisted: {tapes!r}")
+        print("ok  log record carries kv + date + module + req-body tape payloads (no resp body)")
 
         body_text = base64.b64decode(tapes["request_body_b64"]).decode()
         if body_text != "first-visit":
             sys.exit(f"FAIL request body content: {body_text!r}")
         print("ok  request body inline content round-trips")
 
-        resp_text = base64.b64decode(tapes["response_body_b64"]).decode()
-        if resp_text != handler_body:
-            sys.exit(f"FAIL response body inline: expected {handler_body!r}, got {resp_text!r}")
-        print("ok  response body inline content round-trips")
+        _ = handler_body  # response body no longer captured server-side
 
         # 5. Historical deployment manifest.
         new_idx = 'export default function () { return "v3"; }'

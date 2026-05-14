@@ -389,8 +389,8 @@ LogRecordSummary & {
     module_tree_b64?: string,
     request_body_b64?: string,
     request_body_truncated?: boolean,
-    response_body_b64?: string,
-    response_body_truncated?: boolean,
+    // No response_body field — replay re-produces the response
+    // deterministically from (request body + tapes + source).
   },
 }
 ```
