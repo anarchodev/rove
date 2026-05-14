@@ -46,18 +46,27 @@ def _ls(jwt: str, url: str, *, timeout_s: float = 10.0) -> str:
     return subprocess.run(args, capture_output=True, timeout=timeout_s + 5.0).stdout.decode()
 
 
-def _run_wasm_driver(bundle_path: Path, *, stop_at: int | None = None, expect_throw: bool = False) -> dict:
+def _run_wasm_driver(
+    bundle_path: Path,
+    *,
+    stop_at: int | None = None,
+    trace_mode: int = 1,
+    expect_throw: bool = False,
+) -> dict:
     """Invoke scripts/replay_wasm_smoke.mjs, parse its JSON summary.
 
     The driver writes its summary JSON to stdout BEFORE process.exit,
     so we always try to parse it — a captured throw means the
     arena_run_module call returned -1 and the driver exits non-zero
     with `ok: false` in the summary. Callers that expect a throw
-    pass `expect_throw=True`.
+    pass `expect_throw=True`. `trace_mode` is 1 (SCAN) by default;
+    pass 2 for DRILL to enable per-source-line LINE events.
     """
     args = ["node", str(REPO_ROOT / "scripts" / "replay_wasm_smoke.mjs"), str(bundle_path)]
-    if stop_at is not None:
-        args.append(str(stop_at))
+    # The .mjs driver reads argv[3] = stop_at_event, argv[4] = trace_mode.
+    # If we want to set trace_mode without a stop, pass `-1` as stop_at.
+    args.append(str(stop_at if stop_at is not None else -1))
+    args.append(str(trace_mode))
     proc = subprocess.run(args, capture_output=True, timeout=60, cwd=REPO_ROOT)
     try:
         summary = json.loads(proc.stdout.decode())
@@ -514,6 +523,43 @@ def main() -> int:
             sys.exit(f"FAIL throw message mismatch: {msg!r}")
         print(f"ok  WASM replay captured THROW at {throw_event['file']}:{throw_event['line']} — "
               f"message: {msg!r}")
+
+        # ── Pass 5: DRILL mode (per-source-line LINE events) ──────────
+        # Re-run the *normal* (non-throw) bundle with trace_mode=2
+        # (DRILL). LINE events fire on every pc2line transition;
+        # source view + line-breakpoint UI in §8.3 / §8.4 keys off
+        # exactly this stream.
+        drill = _run_wasm_driver(bundle_path, trace_mode=2)
+        if not drill.get("ok"):
+            sys.exit(f"FAIL DRILL run rc={drill['rc']}: {drill}")
+        if drill["line_count"] < 5:
+            sys.exit(f"FAIL DRILL expected several LINE events, got {drill['line_count']}: events sample={drill['events'][:10]}")
+        # Spot-check that LINE events landed inside the handler
+        # function body proper, not just the module top-level or the
+        # injected IIFE wrapper. `export function handler()` opens at
+        # line 34 and closes at line 65 in replay_demo/index.mjs;
+        # anything in [35, 65) is inside the handler body.
+        in_handler_body = [
+            e for e in drill["events"]
+            if e.get("kind") == "line"
+            and "index.mjs" in (e.get("file") or "")
+            and 35 <= (e.get("line") or 0) < 65
+        ]
+        if not in_handler_body:
+            sys.exit(
+                f"FAIL no LINE events fell inside handler() body (35..65):\n"
+                f"  line_count={drill['line_count']}\n"
+                f"  line events seen: {[e for e in drill['events'] if e.get('kind') == 'line'][:10]}"
+            )
+        # Sanity: SCAN baseline had 0 LINE events; DRILL has many.
+        # Catches an arenajs build that ships with trace_mode=2 not
+        # actually emitting LINEs.
+        if baseline["line_count"] != 0:
+            sys.exit(f"FAIL SCAN baseline emitted LINE events ({baseline['line_count']}) — trace-mode wiring is off")
+        body_lines = sorted({e["line"] for e in in_handler_body})
+        print(f"ok  DRILL mode: {drill['line_count']} LINE events total "
+              f"(SCAN had 0); {len(in_handler_body)} inside handler body, "
+              f"covering source lines {body_lines[:8]}{' …' if len(body_lines) > 8 else ''}")
 
         print()
         print("all replay-wasm smoke checks passed")

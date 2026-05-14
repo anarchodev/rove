@@ -80,8 +80,12 @@ Module.printErr = (s) => captured.push("[stderr] " + s);
 // set, host_trace returns 2 at that event index so the WASM runtime
 // walks live frames and ships a JSON snapshot via host_state. Used by
 // the orchestrator's second pass to validate the stack walker on a
-// real captured run.
+// real captured run. Pass 0 / -1 / nothing to disable.
 const stop_at_event = process.argv[3] ? parseInt(process.argv[3], 10) : -1;
+// Optional argv[4]: trace mode (1 = SCAN, 2 = DRILL). DRILL adds
+// per-source-line LINE events between FUNC_ENTER / FUNC_EXIT pairs;
+// SCAN omits them (zero overhead per opcode tick). Defaults to SCAN.
+const trace_mode_arg = process.argv[4] ? parseInt(process.argv[4], 10) : 1;
 
 // Trace collection: count events by kind; record names for later
 // diagnostic output. When stop_at_event is set, also build an
@@ -119,7 +123,7 @@ Module.host_trace = (kind, ptr, len) => {
     event_count++;
     if (kind === K_FUNC_ENTER) {
         func_enter_count++;
-        if (events.length < 64) {
+        if (events.length < 1024) {
             events.push({
                 idx: event_count,
                 kind: "enter",
@@ -130,10 +134,10 @@ Module.host_trace = (kind, ptr, len) => {
         }
     } else if (kind === K_FUNC_EXIT) {
         func_exit_count++;
-        if (events.length < 64) events.push({ idx: event_count, kind: "exit" });
+        if (events.length < 1024) events.push({ idx: event_count, kind: "exit" });
     } else if (kind === K_LINE) {
         line_count++;
-        if (events.length < 64) {
+        if (events.length < 1024) {
             events.push({
                 idx: event_count,
                 kind: "line",
@@ -143,7 +147,7 @@ Module.host_trace = (kind, ptr, len) => {
         }
     } else if (kind === K_THROW) {
         throw_count++;
-        if (events.length < 64) {
+        if (events.length < 1024) {
             const mlen = Module.HEAPU16[(ptr + 8) >> 1];
             events.push({
                 idx: event_count,
@@ -183,7 +187,7 @@ const wrapped_source =
     "  globalThis.__replay_result = " + entry_fn + "();" +
     "})();\n";
 
-arena_set_trace_mode(TRACE_SCAN);
+arena_set_trace_mode(trace_mode_arg);
 const rc = arena_run_module(entry_path, wrapped_source);
 arena_set_trace_mode(0);
 arena_destroy();
@@ -202,6 +206,7 @@ const summary = {
     output_sample: captured.slice(0, 8),
     events,
     stop_at_event: stop_at_event > 0 ? stop_at_event : null,
+    trace_mode: trace_mode_arg,
     snapshot,
 };
 console.log(JSON.stringify(summary));
