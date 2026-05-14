@@ -46,6 +46,22 @@ def _ls(jwt: str, url: str, *, timeout_s: float = 10.0) -> str:
     return subprocess.run(args, capture_output=True, timeout=timeout_s + 5.0).stdout.decode()
 
 
+def _run_wasm_driver(bundle_path: Path, *, stop_at: int | None = None) -> dict:
+    """Invoke scripts/replay_wasm_smoke.mjs, parse its JSON summary."""
+    args = ["node", str(REPO_ROOT / "scripts" / "replay_wasm_smoke.mjs"), str(bundle_path)]
+    if stop_at is not None:
+        args.append(str(stop_at))
+    proc = subprocess.run(args, capture_output=True, timeout=60, cwd=REPO_ROOT)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr.decode(errors="replace"))
+        sys.exit(f"FAIL WASM driver exited {proc.returncode} (stop_at={stop_at})")
+    try:
+        return json.loads(proc.stdout.decode())
+    except json.JSONDecodeError:
+        sys.stderr.write(proc.stdout.decode(errors="replace"))
+        sys.exit("FAIL WASM driver stdout was not JSON")
+
+
 def main() -> int:
     cluster = Cluster.spawn(
         tag="replay-wasm-smoke",
@@ -203,29 +219,15 @@ def main() -> int:
         print(f"ok  composed bundle ({bundle_path.stat().st_size} bytes, "
               f"{sum(1 for v in bundle['tape_blobs'].values() if v)} tape channel(s))")
 
-        # Hand off to the Node-runnable WASM driver.
-        node_args = ["node", str(REPO_ROOT / "scripts" / "replay_wasm_smoke.mjs"), str(bundle_path)]
-        proc = subprocess.run(node_args, capture_output=True, timeout=60, cwd=REPO_ROOT)
-        if proc.returncode != 0:
-            sys.stderr.write(proc.stderr.decode(errors="replace"))
-            sys.exit(f"FAIL WASM driver exited {proc.returncode}")
-        try:
-            summary = json.loads(proc.stdout.decode())
-        except json.JSONDecodeError:
-            sys.stderr.write(proc.stdout.decode(errors="replace"))
-            sys.exit("FAIL WASM driver stdout was not JSON")
-
-        if not summary.get("ok"):
-            sys.exit(f"FAIL WASM rc={summary['rc']} summary={summary}")
-        # Module body enter + handler() + at least one of rollDie /
-        # bumpCount / fmtSalt called inside handler ⇒ 3+ FUNC_ENTERs.
-        # Tighter than the earlier acme-based 1-enter floor; catches
-        # a regression where the trace emitter drops nested-call
-        # events.
-        if summary["func_enter_count"] < 3:
-            sys.exit(f"FAIL want >=3 FUNC_ENTER events (module body + handler + inner call): {summary}")
-        if summary["name_count"] < 2:
-            sys.exit(f"FAIL want >=2 NAME entries (function + file atoms): {summary}")
+        # Pass 1: no stop — establish baseline + harvest the event log
+        # so we can pick a meaningful stop point for pass 2.
+        baseline = _run_wasm_driver(bundle_path)
+        if not baseline.get("ok"):
+            sys.exit(f"FAIL WASM rc={baseline['rc']} summary={baseline}")
+        if baseline["func_enter_count"] < 3:
+            sys.exit(f"FAIL want >=3 FUNC_ENTER events (module body + handler + inner call): {baseline}")
+        if baseline["name_count"] < 2:
+            sys.exit(f"FAIL want >=2 NAME entries (function + file atoms): {baseline}")
         # We exercised 4 channels in the original capture (kv, date,
         # math_random, crypto_random). Assert they all reached the
         # log record so the bundle composer has something to feed
@@ -234,16 +236,82 @@ def main() -> int:
         missing = expected_channels - set(present)
         if missing:
             sys.exit(f"FAIL captured record missing channels: {missing}. Present: {present}")
-        # The handler returns a non-empty string — output_lines tracks
-        # printf/stderr lines, NOT the handler return value, so it's
-        # expected to be 0 here. Still a useful smoke for when a
-        # future handler logs something.
         print(f"ok  WASM replay ran handler {entry_path}: "
-              f"rc={summary['rc']} events={summary['event_count']} "
-              f"enters={summary['func_enter_count']} names={summary['name_count']} "
-              f"output_lines={summary['output_lines']}")
-        if summary["output_sample"]:
-            print(f"    sample output: {summary['output_sample'][0]!r}")
+              f"rc={baseline['rc']} events={baseline['event_count']} "
+              f"enters={baseline['func_enter_count']} names={baseline['name_count']} "
+              f"output_lines={baseline['output_lines']}")
+
+        # Pass 2: stop at the FUNC_ENTER of bumpCount and inspect.
+        # That point sits deep enough that handler has populated all
+        # of its locals (salt, at, die, r, prior) and rollDie has
+        # already run once (so totalRolls == 1). bumpCount's own
+        # frame should carry the `n` arg matching `prior`.
+        bump_event = next(
+            (e for e in baseline["events"] if e.get("kind") == "enter" and e.get("name") == "bumpCount"),
+            None,
+        )
+        if not bump_event:
+            sys.exit(f"FAIL no bumpCount FUNC_ENTER in baseline events:\n{json.dumps(baseline['events'], indent=2)}")
+        stop_idx = bump_event["idx"]
+        print(f"ok  picked stop point: event #{stop_idx} = FUNC_ENTER bumpCount "
+              f"at {bump_event['file']}:{bump_event['line']}")
+
+        paused = _run_wasm_driver(bundle_path, stop_at=stop_idx)
+        if not paused.get("ok"):
+            sys.exit(f"FAIL paused-run rc={paused['rc']}: {paused}")
+        snap = paused.get("snapshot")
+        if not snap:
+            sys.exit(f"FAIL no snapshot captured at stop_at={stop_idx}: {paused}")
+        if not isinstance(snap, list) or len(snap) < 1:
+            sys.exit(f"FAIL snapshot is not a non-empty frame array: {snap!r}")
+
+        # Top-of-stack frame should be the function we stopped just
+        # before entering. The stack walker emits frames top-down, so
+        # snap[0] is bumpCount. Its single arg is named `prior`
+        # (function bumpCount(prior) in the source), and it closes
+        # over the module-level `totalCalls` — both should land in
+        # `vars`. The merged-arg+local+closure shape is exactly what
+        # §6 of replay-wasm-plan.md describes.
+        top = snap[0]
+        if top.get("func") != "bumpCount":
+            sys.exit(f"FAIL snapshot[0].func != 'bumpCount':\n{json.dumps(snap, indent=2)}")
+        top_vars = top.get("vars") or {}
+        if "prior" not in top_vars:
+            sys.exit(f"FAIL bumpCount frame missing arg 'prior': {top}")
+        prior_at_call = top_vars["prior"]
+        if not isinstance(prior_at_call, (int, float)):
+            sys.exit(f"FAIL bumpCount arg 'prior' is not numeric: {top_vars!r}")
+        # totalCalls is closed over for write (bumpCount does
+        # `totalCalls++`). Before the function body runs, it should
+        # still be 0 (bumpCount hasn't bumped yet at FUNC_ENTER).
+        if top_vars.get("totalCalls") != 0:
+            sys.exit(f"FAIL bumpCount.totalCalls expected 0 at entry: got {top_vars.get('totalCalls')!r}")
+        print(f"ok  snapshot[0]: func=bumpCount prior={prior_at_call} totalCalls=0 at line {top.get('line')}")
+
+        # Find handler's frame deeper in the stack and validate its
+        # locals include the names the source uses.
+        handler_frame = next((f for f in snap if f.get("func") == "handler"), None)
+        if not handler_frame:
+            sys.exit(f"FAIL no 'handler' frame in snapshot:\n{json.dumps(snap, indent=2)}")
+        handler_vars = handler_frame.get("vars") or {}
+        missing_vars = [v for v in ("salt", "at", "die", "r", "prior") if v not in handler_vars]
+        if missing_vars:
+            sys.exit(f"FAIL handler frame missing locals {missing_vars}: have {list(handler_vars.keys())}")
+        if handler_vars["prior"] != prior_at_call:
+            sys.exit(f"FAIL bumpCount(prior) ≠ handler's `prior`: {prior_at_call} vs {handler_vars['prior']}")
+        print(f"ok  snapshot handler frame: prior={handler_vars['prior']} "
+              f"salt={handler_vars['salt']!r} die={handler_vars['die']} "
+              f"r≈{handler_vars['r']:.4f}")
+
+        # Module-level `totalCalls` / `totalRolls` should be visible
+        # via closure on the handler frame (closure-referenced names).
+        # rollDie has fired once by this point → totalRolls == 1;
+        # bumpCount hasn't entered yet → totalCalls == 0.
+        if handler_vars.get("totalCalls") != 0:
+            sys.exit(f"FAIL handler.totalCalls expected 0 at bumpCount entry: got {handler_vars.get('totalCalls')!r}")
+        if handler_vars.get("totalRolls") != 1:
+            sys.exit(f"FAIL handler.totalRolls expected 1 at bumpCount entry: got {handler_vars.get('totalRolls')!r}")
+        print("ok  module-level closure vars on handler frame: totalCalls=0, totalRolls=1")
 
         print()
         print("all replay-wasm smoke checks passed")

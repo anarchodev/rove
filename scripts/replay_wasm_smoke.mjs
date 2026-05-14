@@ -76,15 +76,38 @@ const captured = [];
 Module.print    = (s) => captured.push(s);
 Module.printErr = (s) => captured.push("[stderr] " + s);
 
+// Optional argv[3]: stop_at_event (1-based, non-NAME events). When
+// set, host_trace returns 2 at that event index so the WASM runtime
+// walks live frames and ships a JSON snapshot via host_state. Used by
+// the orchestrator's second pass to validate the stack walker on a
+// real captured run.
+const stop_at_event = process.argv[3] ? parseInt(process.argv[3], 10) : -1;
+
 // Trace collection: count events by kind; record names for later
-// diagnostic output. Match the wire-format decode in wasm-app.mjs.
+// diagnostic output. When stop_at_event is set, also build an
+// `events` array with resolved file/name strings so the host can
+// confirm which point we paused at.
 let event_count = 0;
 let func_enter_count = 0;
 let func_exit_count = 0;
 let line_count = 0;
 let throw_count = 0;
+let snapshot = null;
 const names = new Map();
+const events = [];   // resolved event log (only the first ~32 entries)
 const decoder = new TextDecoder();
+
+function resolveAtom(atom) {
+    return names.get(atom) || `<atom:${atom}>`;
+}
+
+Module.host_state = (ptr, len) => {
+    try {
+        snapshot = JSON.parse(decoder.decode(Module.HEAPU8.subarray(ptr, ptr + len)));
+    } catch (err) {
+        snapshot = { __parse_error: err.message };
+    }
+};
 
 Module.host_trace = (kind, ptr, len) => {
     if (kind === K_NAME) {
@@ -94,10 +117,44 @@ Module.host_trace = (kind, ptr, len) => {
         return 0;
     }
     event_count++;
-    if (kind === K_FUNC_ENTER) func_enter_count++;
-    else if (kind === K_FUNC_EXIT) func_exit_count++;
-    else if (kind === K_LINE) line_count++;
-    else if (kind === K_THROW) throw_count++;
+    if (kind === K_FUNC_ENTER) {
+        func_enter_count++;
+        if (events.length < 64) {
+            events.push({
+                idx: event_count,
+                kind: "enter",
+                name: resolveAtom(Module.HEAPU32[ptr >> 2]),
+                file: resolveAtom(Module.HEAPU32[(ptr + 4) >> 2]),
+                line: Module.HEAPU32[(ptr + 8) >> 2],
+            });
+        }
+    } else if (kind === K_FUNC_EXIT) {
+        func_exit_count++;
+        if (events.length < 64) events.push({ idx: event_count, kind: "exit" });
+    } else if (kind === K_LINE) {
+        line_count++;
+        if (events.length < 64) {
+            events.push({
+                idx: event_count,
+                kind: "line",
+                file: resolveAtom(Module.HEAPU32[ptr >> 2]),
+                line: Module.HEAPU32[(ptr + 4) >> 2],
+            });
+        }
+    } else if (kind === K_THROW) {
+        throw_count++;
+        if (events.length < 64) {
+            const mlen = Module.HEAPU16[(ptr + 8) >> 1];
+            events.push({
+                idx: event_count,
+                kind: "throw",
+                file: resolveAtom(Module.HEAPU32[ptr >> 2]),
+                line: Module.HEAPU32[(ptr + 4) >> 2],
+                message: decoder.decode(Module.HEAPU8.subarray(ptr + 10, ptr + 10 + mlen)),
+            });
+        }
+    }
+    if (stop_at_event > 0 && event_count === stop_at_event) return 2;
     return 0;
 };
 
@@ -143,6 +200,9 @@ const summary = {
     name_count: names.size,
     output_lines: captured.length,
     output_sample: captured.slice(0, 8),
+    events,
+    stop_at_event: stop_at_event > 0 ? stop_at_event : null,
+    snapshot,
 };
 console.log(JSON.stringify(summary));
 process.exit(rc === 0 ? 0 : 1);
