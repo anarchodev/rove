@@ -137,10 +137,10 @@ trap 'rm -f "$FANOUT_MANIFEST" "${IDLE_MANIFEST:-}" 2>/dev/null || true' EXIT
 # relative source path correctly.
 cp "$FANOUT_MANIFEST" examples/.fanout_manifest.json
 trap 'rm -f examples/.fanout_manifest.json "${IDLE_MANIFEST:-}" 2>/dev/null || true' EXIT
-echo "── seeding $N_ACTIVE active tenants on handler=$HANDLER (full bootstrap, content-addressed bytecode) ──"
+echo "── seeding $N_ACTIVE active tenants on handler=$HANDLER (full bootstrap, parallel=${SEED_PARALLEL:-32}) ──"
 t0=$(date +%s)
 for d in "${DATA_DIRS[@]}"; do
-    "$BIN" seed --data-dir "$d" --manifest examples/.fanout_manifest.json >/dev/null
+    "$BIN" seed --data-dir "$d" --manifest examples/.fanout_manifest.json --parallel "${SEED_PARALLEL:-32}" >/dev/null
 done
 t1=$(date +%s)
 echo "  $N_ACTIVE active write tenants × ${#DATA_DIRS[@]} dirs seeded in $((t1 - t0))s"

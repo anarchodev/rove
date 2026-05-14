@@ -61,6 +61,13 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     // `--no-files-bootstrap` is set. The bench harness pairs this
     // with a manifest-PUT against files-server using the same id.
     var deploy_id: u64 = 1;
+    // Number of worker threads that bootstrap tenants in parallel.
+    // Full-bootstrap mode does one S3 manifest PUT per tenant
+    // (sequential = ~200ms × N at typical RTT); parallelizing
+    // saturates the S3 endpoint and cuts wallclock proportionally
+    // until the per-thread root-kv write serialization becomes the
+    // floor. No effect on --no-files-bootstrap mode (already <1s).
+    var parallel: usize = 1;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -78,6 +85,12 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
             i += 1;
             if (i >= args.len) return error.Usage;
             deploy_id = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--parallel")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            parallel = try std.fmt.parseInt(usize, args[i], 10);
+            if (parallel == 0) parallel = 1;
+            if (parallel > 64) parallel = 64;
         } else {
             return error.Usage;
         }
@@ -140,53 +153,150 @@ pub fn runSeed(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
         return;
     }
 
-    for (parsed.value.tenants) |t| {
-        try tenant.createInstance(t.id);
-        for (t.domains) |dom| {
-            try tenant.assignDomain(dom, t.id);
+    if (parallel <= 1) {
+        for (parsed.value.tenants) |t| {
+            try bootstrapOneTenant(allocator, tenant, blob_owned.cfg, dd, manifest_dir, &t);
         }
-
-        var deploy_files: std.ArrayList(files_server.bootstrap.DeployFile) = .empty;
-        defer {
-            for (deploy_files.items) |f| allocator.free(f.content);
-            deploy_files.deinit(allocator);
-        }
-
-        for (t.files) |entry| {
-            const full = try std.fs.path.join(allocator, &.{ manifest_dir, entry.source });
-            defer allocator.free(full);
-            const bytes = try std.fs.cwd().readFileAlloc(allocator, full, 1 << 20);
-            errdefer allocator.free(bytes);
-            try deploy_files.append(allocator, .{
-                .path = entry.path,
-                .content = bytes,
-                .content_type = entry.content_type,
-            });
-        }
-
-        // Deploy the tenant's bundle to S3 via files-server's
-        // bootstrapTenant. seed is offline (runs before any cluster
-        // is up) so the per-node `_deploy/current` write that
-        // files-server normally pushes via raft instead lands here
-        // as a direct app.db write — same shape as old
-        // bootstrapHandler did, just with the deploy half outsourced.
-        // Offline path — no running cluster, so cluster=null. The
-        // S3 PUT is the only durable write here.
-        const dep_id = try files_server.bootstrap.bootstrapTenant(
-            allocator,
-            blob_owned.cfg,
-            dd,
-            t.id,
-            deploy_files.items,
-            null,
-        );
-        try writeLocalDeployCurrent(tenant, t.id, dep_id);
-        try mirrorConfigFromManifest(allocator, tenant, blob_owned.cfg, t.id, dep_id);
-
-        if (t.seed_kv) |kvs| try seedAppKv(tenant, t.id, kvs);
+    } else {
+        try parallelBootstrap(allocator, tenant, blob_owned.cfg, dd, manifest_dir, parsed.value.tenants, parallel);
     }
 
-    std.debug.print("seed: provisioned {d} tenant(s) into {s}\n", .{ parsed.value.tenants.len, dd });
+    std.debug.print("seed: provisioned {d} tenant(s) into {s} (parallel={d})\n", .{ parsed.value.tenants.len, dd, parallel });
+}
+
+/// Per-tenant bootstrap: register the tenant + domains in the root
+/// store, read the source files from disk, run `bootstrapTenant` (the
+/// expensive step — manifest + bytecode PUTs to S3), then stamp the
+/// `_deploy/current` pointer and mirror any `_config/*` rows. Safe
+/// to call concurrently from many threads for *distinct* tenants:
+/// the root-kv writes go through KvStore's per-store lease lock
+/// (serialized), the tenant-map updates go through Tenant.maps_mutex,
+/// and the S3 PUTs each open their own per-tenant blob backend.
+fn bootstrapOneTenant(
+    allocator: std.mem.Allocator,
+    tenant: *tenant_mod.Tenant,
+    blob_cfg: blob_mod.BackendConfig,
+    dd: []const u8,
+    manifest_dir: []const u8,
+    t: *const SeedTenant,
+) !void {
+    try tenant.createInstance(t.id);
+    for (t.domains) |dom| {
+        try tenant.assignDomain(dom, t.id);
+    }
+
+    var deploy_files: std.ArrayList(files_server.bootstrap.DeployFile) = .empty;
+    defer {
+        for (deploy_files.items) |f| allocator.free(f.content);
+        deploy_files.deinit(allocator);
+    }
+
+    for (t.files) |entry| {
+        const full = try std.fs.path.join(allocator, &.{ manifest_dir, entry.source });
+        defer allocator.free(full);
+        const bytes = try std.fs.cwd().readFileAlloc(allocator, full, 1 << 20);
+        errdefer allocator.free(bytes);
+        try deploy_files.append(allocator, .{
+            .path = entry.path,
+            .content = bytes,
+            .content_type = entry.content_type,
+        });
+    }
+
+    // Deploy the tenant's bundle to S3 via files-server's
+    // bootstrapTenant. seed is offline (runs before any cluster
+    // is up) so the per-node `_deploy/current` write that
+    // files-server normally pushes via raft instead lands here
+    // as a direct app.db write — same shape as old
+    // bootstrapHandler did, just with the deploy half outsourced.
+    // Offline path — no running cluster, so cluster=null. The
+    // S3 PUT is the only durable write here.
+    const dep_id = try files_server.bootstrap.bootstrapTenant(
+        allocator,
+        blob_cfg,
+        dd,
+        t.id,
+        deploy_files.items,
+        null,
+    );
+    try writeLocalDeployCurrent(tenant, t.id, dep_id);
+    try mirrorConfigFromManifest(allocator, tenant, blob_cfg, t.id, dep_id);
+
+    if (t.seed_kv) |kvs| try seedAppKv(tenant, t.id, kvs);
+}
+
+/// Worker-thread shared context for `parallelBootstrap`.
+const SeedWorkerCtx = struct {
+    allocator: std.mem.Allocator,
+    tenant: *tenant_mod.Tenant,
+    blob_cfg: blob_mod.BackendConfig,
+    dd: []const u8,
+    manifest_dir: []const u8,
+    tenants: []const SeedTenant,
+    next_idx: std.atomic.Value(usize),
+    first_err: std.atomic.Value(usize), // 0 = no error, otherwise tenant index + 1
+    first_err_name_mutex: std.Thread.Mutex,
+    first_err_name: ?[]const u8,
+};
+
+fn parallelBootstrap(
+    allocator: std.mem.Allocator,
+    tenant: *tenant_mod.Tenant,
+    blob_cfg: blob_mod.BackendConfig,
+    dd: []const u8,
+    manifest_dir: []const u8,
+    tenants: []const SeedTenant,
+    n: usize,
+) !void {
+    var ctx: SeedWorkerCtx = .{
+        .allocator = allocator,
+        .tenant = tenant,
+        .blob_cfg = blob_cfg,
+        .dd = dd,
+        .manifest_dir = manifest_dir,
+        .tenants = tenants,
+        .next_idx = .init(0),
+        .first_err = .init(0),
+        .first_err_name_mutex = .{},
+        .first_err_name = null,
+    };
+
+    const workers = try allocator.alloc(std.Thread, n);
+    defer allocator.free(workers);
+    for (workers) |*w| w.* = try std.Thread.spawn(.{}, seedWorker, .{&ctx});
+    for (workers) |w| w.join();
+
+    if (ctx.first_err.load(.acquire) != 0) {
+        // Surface the same error name the worker saw. Generic
+        // `error.SeedFailed` keeps the caller's signature simple;
+        // the worker also logged the specific @errorName.
+        return error.SeedFailed;
+    }
+}
+
+fn seedWorker(ctx: *SeedWorkerCtx) void {
+    while (ctx.first_err.load(.acquire) == 0) {
+        const i = ctx.next_idx.fetchAdd(1, .seq_cst);
+        if (i >= ctx.tenants.len) return;
+        bootstrapOneTenant(
+            ctx.allocator,
+            ctx.tenant,
+            ctx.blob_cfg,
+            ctx.dd,
+            ctx.manifest_dir,
+            &ctx.tenants[i],
+        ) catch |err| {
+            // Record only the first failure so the log doesn't
+            // smear. Subsequent workers see first_err != 0 and
+            // bail out of the dispatch loop without claiming more
+            // tenants.
+            _ = ctx.first_err.cmpxchgStrong(0, i + 1, .acq_rel, .acquire) orelse {
+                std.log.warn("seed worker: tenant {s} failed: {s}", .{ ctx.tenants[i].id, @errorName(err) });
+                return;
+            };
+            return;
+        };
+    }
 }
 
 fn seedAppKv(
