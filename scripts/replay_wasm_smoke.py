@@ -313,6 +313,111 @@ def main() -> int:
             sys.exit(f"FAIL handler.totalRolls expected 1 at bumpCount entry: got {handler_vars.get('totalRolls')!r}")
         print("ok  module-level closure vars on handler frame: totalCalls=0, totalRolls=1")
 
+        # Pass 3: stepping. Same captured bundle, stop at three
+        # consecutive call sites inside handler — fmtSalt, then
+        # rollDie, then bumpCount — and verify the snapshot evolves
+        # the way the source dictates. Each stop is a fresh
+        # arena_run_module from the same tape; the orchestrator
+        # plays the part of a "step into" user clicking forward.
+        # This is the deterministic-rerun foundation §8.5 needs.
+        step_targets = []
+        for fn_name in ("fmtSalt", "rollDie", "bumpCount"):
+            ev = next(
+                (e for e in baseline["events"]
+                 if e.get("kind") == "enter" and e.get("name") == fn_name),
+                None,
+            )
+            if not ev:
+                sys.exit(f"FAIL no FUNC_ENTER {fn_name} in baseline events")
+            step_targets.append((fn_name, ev["idx"]))
+
+        # Run each stop point and collect handler-frame vars at that
+        # moment. The smoke asserts a specific evolution shape: which
+        # locals are defined, what totalRolls is, etc.
+        step_snapshots = []
+        for fn_name, idx in step_targets:
+            res = _run_wasm_driver(bundle_path, stop_at=idx)
+            if not res.get("ok"):
+                sys.exit(f"FAIL step stop_at={idx} rc={res['rc']}")
+            snap_i = res.get("snapshot")
+            if not snap_i:
+                sys.exit(f"FAIL step stop_at={idx} no snapshot")
+            hf = next((f for f in snap_i if f.get("func") == "handler"), None)
+            if not hf:
+                sys.exit(f"FAIL step stop_at={idx} no handler frame")
+            step_snapshots.append((fn_name, idx, snap_i[0], hf.get("vars") or {}))
+
+        # Assertions per stop point. The source layout is:
+        #   const buf = new Uint8Array(4);
+        #   crypto.getRandomValues(buf);
+        #   const salt = fmtSalt(buf);          // ← step 1 stops just before
+        #   const at = Date.now();
+        #   const die = rollDie();              // ← step 2 stops just before
+        #   const r = Math.random();
+        #   const prior = parseInt(kv.get("count") ?? "0", 10);
+        #   const next = bumpCount(prior);      // ← step 3 stops just before
+        #
+        # The §6 stop semantics ("before the opcode at cur_pc") means
+        # at each FUNC_ENTER, every const/let declared on a prior line
+        # in handler is already bound. Cross-checks verify that.
+
+        # Step 1: at fmtSalt entry — buf is set but salt is not yet.
+        # Module-level totalRolls is still 0 (rollDie hasn't run).
+        fn1, idx1, top1, hv1 = step_snapshots[0]
+        assert fn1 == "fmtSalt"
+        if "buf" not in hv1:
+            sys.exit(f"FAIL step1: handler.buf should be set at fmtSalt entry: {list(hv1.keys())}")
+        # salt is declared on the SAME line as the fmtSalt call —
+        # const salt = fmtSalt(buf). At the FUNC_ENTER for fmtSalt,
+        # salt hasn't received the return value yet, so it should be
+        # in TDZ ("[uninitialized]") OR simply absent from vars.
+        # Both are acceptable; we just require it's not the eventual
+        # string value.
+        salt1 = hv1.get("salt")
+        if isinstance(salt1, str) and len(salt1) == 8 and all(c in "0123456789abcdef" for c in salt1):
+            sys.exit(f"FAIL step1: handler.salt looks already-resolved at fmtSalt entry: {salt1!r}")
+        if hv1.get("totalRolls") != 0:
+            sys.exit(f"FAIL step1: totalRolls expected 0 at fmtSalt entry: got {hv1.get('totalRolls')!r}")
+        print(f"ok  step 1: stop at fmtSalt (event #{idx1}) — buf set, salt unresolved, totalRolls=0")
+
+        # Step 2: at rollDie entry — fmtSalt has returned, so handler
+        # has salt + at. die not yet set. totalRolls still 0.
+        fn2, idx2, top2, hv2 = step_snapshots[1]
+        assert fn2 == "rollDie"
+        if "salt" not in hv2 or not isinstance(hv2["salt"], str) or len(hv2["salt"]) != 8:
+            sys.exit(f"FAIL step2: handler.salt should be the 8-hex result at rollDie entry: {hv2.get('salt')!r}")
+        if "at" not in hv2 or not isinstance(hv2["at"], (int, float)):
+            sys.exit(f"FAIL step2: handler.at should be a number: {hv2.get('at')!r}")
+        if hv2.get("totalRolls") != 0:
+            sys.exit(f"FAIL step2: totalRolls expected 0 at rollDie entry: got {hv2.get('totalRolls')!r}")
+        print(f"ok  step 2: stop at rollDie  (event #{idx2}) — salt={hv2['salt']!r}, at set, totalRolls=0")
+
+        # Step 3: at bumpCount entry — rollDie has bumped totalRolls
+        # to 1. handler has die set. totalCalls still 0. This is the
+        # same point Pass 2 inspected, used here only to confirm the
+        # stepping sequence converges.
+        fn3, idx3, top3, hv3 = step_snapshots[2]
+        assert fn3 == "bumpCount"
+        if not isinstance(hv3.get("die"), (int, float)) or not (1 <= hv3["die"] <= 6):
+            sys.exit(f"FAIL step3: handler.die should be 1..6: got {hv3.get('die')!r}")
+        if hv3.get("totalRolls") != 1:
+            sys.exit(f"FAIL step3: totalRolls expected 1 at bumpCount entry: got {hv3.get('totalRolls')!r}")
+        if hv3.get("totalCalls") != 0:
+            sys.exit(f"FAIL step3: totalCalls expected 0 at bumpCount entry: got {hv3.get('totalCalls')!r}")
+        print(f"ok  step 3: stop at bumpCount (event #{idx3}) — die={hv3['die']}, totalRolls=1, totalCalls=0")
+
+        # Sanity check: the three stops are strictly increasing
+        # (we stepped FORWARD), and the same captured bundle
+        # produced consistent values across all three reruns
+        # (deterministic replay).
+        if not (idx1 < idx2 < idx3):
+            sys.exit(f"FAIL step indices not monotonically increasing: {idx1}, {idx2}, {idx3}")
+        if hv2["salt"] != hv3["salt"]:
+            sys.exit(f"FAIL salt differs across reruns: step2={hv2['salt']!r} vs step3={hv3['salt']!r}")
+        if hv2["at"] != hv3["at"]:
+            sys.exit(f"FAIL at differs across reruns: step2={hv2['at']} vs step3={hv3['at']}")
+        print("ok  three stops, same bundle, deterministic — salt/at match across reruns")
+
         print()
         print("all replay-wasm smoke checks passed")
         return 0
