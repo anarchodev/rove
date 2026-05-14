@@ -32,8 +32,8 @@ from smoke_lib import Cluster, CurlContext, curl, mint_jwt  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PUBLIC_SUFFIX = "loop46.localhost"
-TENANT_ID = "replay_demo"
-TENANT_HOST = f"replay-demo.{PUBLIC_SUFFIX}"
+TENANT_ID = "replay-demo"
+TENANT_HOST = f"{TENANT_ID}.{PUBLIC_SUFFIX}"
 TOKEN = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 
 

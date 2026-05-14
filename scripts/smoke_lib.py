@@ -309,6 +309,7 @@ class Cluster:
     log_base: Optional[str] = None
     files_base: Optional[str] = None
     log_dir: Path = field(default_factory=lambda: Path("/tmp"))
+    bind_host: str = "127.0.0.1"
 
     @classmethod
     def alloc_addrs(
@@ -349,6 +350,8 @@ class Cluster:
         admin_origin_per_node: bool = False,
         admin_api_domain: Optional[str] = None,
         with_log_files_bases: bool = True,
+        bind_host: str = "127.0.0.1",
+        tls_bundle: Optional["TlsBundle"] = None,
     ) -> "Cluster":
         """Spawn 3-node loop46 cluster.
 
@@ -378,7 +381,7 @@ class Cluster:
         )
         _install_signal_handlers()
 
-        tls = TlsBundle.from_env()
+        tls = tls_bundle if tls_bundle is not None else TlsBundle.from_env()
         bin_loop46 = BIN_DIR / "loop46"
         if not bin_loop46.exists():
             sys.exit(f"error: {bin_loop46} missing — run 'zig build install' first")
@@ -422,6 +425,7 @@ class Cluster:
             tls=tls,
             root_token=root_token,
             services_jwt_secret=env["LOOP46_SERVICES_JWT_SECRET"],
+            bind_host=bind_host,
         )
 
         # Seed every data dir if a manifest was supplied.
@@ -440,6 +444,19 @@ class Cluster:
                 ] + (seed_extra_args or [])
                 subprocess.run(args, check=True, env=env, capture_output=True)
 
+        # `bind_host` rewrites the loopback host in the --http /
+        # files-server --listen / log-server --listen strings the
+        # workers pass to their listening sockets. Internal probing
+        # (discover_leader, mint_services_token, etc.) keeps
+        # dialing 127.0.0.1 — `addrs.http[i]` stays loopback so
+        # cross-node raft peers + the harness itself can still reach
+        # the cluster from this host.
+        def listen_addr(internal: str) -> str:
+            if bind_host == "127.0.0.1":
+                return internal
+            _, _, port = internal.rpartition(":")
+            return f"{bind_host}:{port}"
+
         # Spawn workers.
         for i in range(3):
             log_path = c.log_dir / f"{tag}-worker-{i}.out"
@@ -448,7 +465,7 @@ class Cluster:
                 "--node-id", str(i),
                 "--peers", addrs.peers_csv,
                 "--listen", addrs.raft[i],
-                "--http", addrs.http[i],
+                "--http", listen_addr(addrs.http[i]),
                 "--data-dir", str(addrs.data_dirs[i]),
                 "--public-suffix", public_suffix,
                 "--tls-cert", str(tls.cert),
@@ -630,10 +647,13 @@ class Cluster:
             env["LOOP46_LEADER_CACERT"] = str(self.tls.cacert)
             host_port = leader_url.split("://", 1)[1]
             env["LOOP46_LEADER_RESOLVE"] = f"{host_port}:127.0.0.1"
+        files_listen = self.addrs.files_addr
+        if self.bind_host != "127.0.0.1":
+            files_listen = f"{self.bind_host}:{self.addrs.files_port}"
         args = [
             str(bin_path),
             "--data-dir", str(self.addrs.data_dirs[self.leader_idx]),
-            "--listen", self.addrs.files_addr,
+            "--listen", files_listen,
             "--tls-cert", str(self.tls.cert),
             "--tls-key", str(self.tls.key),
         ]
@@ -703,10 +723,13 @@ class Cluster:
     ) -> None:
         bin_path = BIN_DIR / "log-server-standalone"
         log_path = self.log_dir / f"{self.tag}-log-server.out"
+        log_listen = self.addrs.log_addr
+        if self.bind_host != "127.0.0.1":
+            log_listen = f"{self.bind_host}:{self.addrs.log_port}"
         args = [
             str(bin_path),
             "--data-dir", str(self.addrs.data_dirs[self.leader_idx]),
-            "--listen", self.addrs.log_addr,
+            "--listen", log_listen,
             "--poll-interval-ms", "100",
             "--tls-cert", str(self.tls.cert),
             "--tls-key", str(self.tls.key),

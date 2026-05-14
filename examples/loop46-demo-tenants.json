@@ -17,9 +17,8 @@
       ]
     },
     {
-      "_comment": "Target tenant for scripts/replay_wasm_smoke.py — exercises 4 of the 5 captured tape channels (kv, date, math_random, crypto_random) in a single handler with a non-trivial call tree (rollDie, bumpCount, fmtSalt) and a `/throw` path that fires THROW. One file by design — cross-module imports don't survive offline seed; that path is covered by scripts/replay_smoke.py via the files-server deploy route.",
-      "id": "replay_demo",
-      "domains": ["replay-demo.loop46.localhost"],
+      "_comment": "Target tenant for scripts/replay_wasm_smoke.py — exercises 4 of the 5 captured tape channels (kv, date, math_random, crypto_random) in a single handler with a non-trivial call tree (rollDie, bumpCount, fmtSalt) and a `/throw` path that fires THROW. ID matches the subdomain (replay-demo) so the *.{public_suffix} wildcard route auto-binds: replay-demo.loop46.localhost AND replay-demo.loop46.com both resolve without an explicit assignDomain.",
+      "id": "replay-demo",
       "files": [
         {"path": "index.mjs", "source": "loop46-demo-tenants/replay_demo/index.mjs"}
       ]
