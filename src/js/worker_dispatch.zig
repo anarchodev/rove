@@ -145,19 +145,34 @@ fn finalizeBatch(
     var processed: usize = 0;
 
     if (!has_writes and !has_cmds) {
-        // Pure read-only batch: no raft hop. The txn overlay is empty
-        // (kv.get doesn't record anything), so we rollback rather than
-        // commit — kvexp Txn.commit requires this txn to be the chain
-        // head, but under cross-tenant load a predecessor write txn on
-        // the same tenant may still be chain-head waiting on raft to
-        // apply. Rollback works at any chain position and drops the
-        // (empty) overlay either way, with no semantic difference for
-        // read-only.
-        txn.rollback() catch |err| panic_mod.invariantViolated(
-            "finalizeBatch.rollback(read_only)",
-            "tenant={s} err={s}",
-            .{ anchor_id, @errorName(err) },
-        );
+        // Pure read-only batch: no raft hop. kvexp's commit fast-paths
+        // when the txn wrote nothing AND no read crossed a chain-
+        // predecessor's overlay (Txn.saw_speculation == false). The
+        // fast path just splices the txn out of the chain at any
+        // position — no chain-head requirement.
+        //
+        // When a read DID cross a predecessor's overlay, commit takes
+        // the slow path which requires chain head; under cross-tenant
+        // load it can return Conflict (NotChainHead) because earlier
+        // batches' writes are still waiting on raft to apply. For
+        // those we rollback to release the txn cleanly. The customer
+        // sees the response based on speculative state that hasn't
+        // been confirmed yet — same linearizability posture as
+        // pre-kvexp-bump (the bigger fix is to park such read-only
+        // batches on raft apply, which needs new plumbing).
+        txn.commit() catch |err| switch (err) {
+            kv_mod.KvError.Conflict => txn.rollback() catch |rb_err|
+                panic_mod.invariantViolated(
+                    "finalizeBatch.rollback(read_only_speculative)",
+                    "tenant={s} err={s}",
+                    .{ anchor_id, @errorName(rb_err) },
+                ),
+            else => panic_mod.invariantViolated(
+                "finalizeBatch.commit(read_only)",
+                "tenant={s} err={s}",
+                .{ anchor_id, @errorName(err) },
+            ),
+        };
         allocator.destroy(txn);
         for (successes.items) |*s| {
             server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err| panic_mod.invariantViolated(
