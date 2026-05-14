@@ -295,39 +295,12 @@ pub fn build(b: *std.Build) void {
     files_server_mod.addImport("rove-files", files_mod);
     files_server_mod.addImport("rove-qjs", qjs_mod);
     files_server_mod.addImport("rove-jwt", jwt_mod);
-    // Embed admin + replay tenant bundles into files-server. The
-    // `bootstrap.zig` module reads them via `@embedFile` and ships
-    // them as `__admin__` / `__replay__` deployments at startup. See
-    // src/files_server/bootstrap.zig for the deploy file lists.
-    const platform_bundle_files: []const struct { name: []const u8, path: []const u8 } = &.{
-        .{ .name = "admin_handler_mjs", .path = "web/admin/handler.mjs" },
-        .{ .name = "admin_middleware_mjs", .path = "web/admin/middleware.mjs" },
-        .{ .name = "admin_ui_index_html", .path = "web/admin/index.html" },
-        .{ .name = "admin_ui_app_js", .path = "web/admin/app.js" },
-        .{ .name = "admin_ui_api_js", .path = "web/admin/api.js" },
-        .{ .name = "admin_ui_app_css", .path = "web/admin/app.css" },
-        .{ .name = "admin_ui_page_login", .path = "web/admin/pages/login.js" },
-        .{ .name = "admin_ui_page_instances", .path = "web/admin/pages/instances.js" },
-        .{ .name = "admin_ui_page_instance", .path = "web/admin/pages/instance.js" },
-        .{ .name = "admin_ui_codemirror", .path = "web/admin/codemirror.mjs" },
-        .{ .name = "replay_index_html", .path = "web/replay/index.html" },
-        .{ .name = "replay_app_js", .path = "web/replay/app.js" },
-        // WASM-driven replay path (PLAN §10.12 follow-on). Same
-        // tenant, different entry point: replay.<suffix>/wasm boots
-        // arenajs-WASM and runs the captured handler through it
-        // instead of stubbing globals in an iframe. The .wasm payload
-        // is ~1 MiB embedded into the worker binary.
-        .{ .name = "replay_wasm_html",     .path = "web/replay/wasm.html" },
-        .{ .name = "replay_wasm_app_mjs",  .path = "web/replay/wasm-app.mjs" },
-        .{ .name = "replay_rtap_mjs",      .path = "web/replay/rtap.mjs" },
-        .{ .name = "replay_qjs_wasm_js",   .path = "web/replay/qjs_arena_wasm.js" },
-        .{ .name = "replay_qjs_wasm_wasm", .path = "web/replay/qjs_arena_wasm.wasm" },
-    };
-    for (platform_bundle_files) |f| {
-        files_server_mod.addAnonymousImport(f.name, .{
-            .root_source_file = b.path(f.path),
-        });
-    }
+    // Admin + replay tenant bundles are NOT embedded — they're read
+    // from disk at bootstrap by files-server-standalone via its
+    // `--web-root <path>` flag (see src/files_server/bootstrap.zig
+    // and examples/files_server_standalone.zig). Production deploys
+    // ship `web/` alongside the binary; dev iteration is "restart
+    // files-server-standalone, no rebuild required."
 
     // ── Tests ──
     const test_step = b.step("test", "Run all unit tests");

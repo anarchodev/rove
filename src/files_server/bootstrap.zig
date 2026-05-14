@@ -48,62 +48,115 @@ pub const DeployFile = struct {
     content_type: ?[]const u8 = null,
 };
 
-// ── Embedded admin + replay tenant bundles ────────────────────────────
+// ── Admin + replay tenant bundles (read from disk at bootstrap) ───────
 //
-// The admin UI bundle ships in the binary so a fresh cluster has a
-// working dashboard at `app.{public_suffix}/` after the first
-// files-server boot. Each file lands as a `_static/<path>` (or the
-// JS `index.mjs` / `_middlewares/index.mjs`) entry in __admin__'s
-// initial deployment.
+// The admin / replay UI source lives under <web_root>/{admin,replay}/.
+// `loadPlatformDeployFiles` reads the listed paths into an owned
+// slice of DeployFile at bootstrap time and we ship them as
+// `__admin__` / `__replay__` deployments via the same files-server
+// route customer tenants use. The bytes are NOT compiled into the
+// binary — production images need to ship `web/` alongside the
+// binary (or pass `--web-root <path>` pointing at wherever it lives).
+//
+// Trade-off vs the old `@embedFile` approach: the binary is smaller
+// and dashboard / replay-UI edits ship without a rebuild (just
+// restart files-server-standalone with the same data dir); cost is
+// one extra path argument and one disk read per file at bootstrap.
 
-const ADMIN_HANDLER_SRC = @embedFile("admin_handler_mjs");
-const ADMIN_MIDDLEWARE_SRC = @embedFile("admin_middleware_mjs");
-const ADMIN_UI_INDEX_HTML = @embedFile("admin_ui_index_html");
-const ADMIN_UI_APP_JS = @embedFile("admin_ui_app_js");
-const ADMIN_UI_API_JS = @embedFile("admin_ui_api_js");
-const ADMIN_UI_APP_CSS = @embedFile("admin_ui_app_css");
-const ADMIN_UI_PAGE_LOGIN = @embedFile("admin_ui_page_login");
-const ADMIN_UI_PAGE_INSTANCES = @embedFile("admin_ui_page_instances");
-const ADMIN_UI_PAGE_INSTANCE = @embedFile("admin_ui_page_instance");
-const ADMIN_UI_CODEMIRROR = @embedFile("admin_ui_codemirror");
-
-pub const ADMIN_DEPLOY_FILES = [_]DeployFile{
-    .{ .path = "index.mjs", .content = ADMIN_HANDLER_SRC },
-    .{ .path = "_middlewares/index.mjs", .content = ADMIN_MIDDLEWARE_SRC },
-    .{ .path = "_static/index.html", .content = ADMIN_UI_INDEX_HTML, .content_type = "text/html; charset=utf-8" },
-    .{ .path = "_static/app.js", .content = ADMIN_UI_APP_JS, .content_type = "application/javascript" },
-    .{ .path = "_static/api.js", .content = ADMIN_UI_API_JS, .content_type = "application/javascript" },
-    .{ .path = "_static/app.css", .content = ADMIN_UI_APP_CSS, .content_type = "text/css" },
-    .{ .path = "_static/pages/login.js", .content = ADMIN_UI_PAGE_LOGIN, .content_type = "application/javascript" },
-    .{ .path = "_static/pages/instances.js", .content = ADMIN_UI_PAGE_INSTANCES, .content_type = "application/javascript" },
-    .{ .path = "_static/pages/instance.js", .content = ADMIN_UI_PAGE_INSTANCE, .content_type = "application/javascript" },
-    .{ .path = "_static/codemirror.mjs", .content = ADMIN_UI_CODEMIRROR, .content_type = "application/javascript" },
+/// Compile-time list of every file the admin + replay tenants ship.
+/// `disk_subpath` is resolved against `web_root`; `tenant_path` is
+/// where the file lands inside the tenant's deployment.
+const PlatformFile = struct {
+    tenant: enum { admin, replay },
+    disk_subpath: []const u8,
+    tenant_path: []const u8,
+    content_type: ?[]const u8,
 };
 
-const REPLAY_INDEX_HTML = @embedFile("replay_index_html");
-const REPLAY_APP_JS = @embedFile("replay_app_js");
-// WASM-driven replay path — served at replay.<suffix>/wasm. The .wasm
-// payload is the big one (~1 MiB), included once per worker binary.
-const REPLAY_WASM_HTML     = @embedFile("replay_wasm_html");
-const REPLAY_WASM_APP_MJS  = @embedFile("replay_wasm_app_mjs");
-const REPLAY_RTAP_MJS      = @embedFile("replay_rtap_mjs");
-const REPLAY_QJS_WASM_JS   = @embedFile("replay_qjs_wasm_js");
-const REPLAY_QJS_WASM_WASM = @embedFile("replay_qjs_wasm_wasm");
-
-pub const REPLAY_DEPLOY_FILES = [_]DeployFile{
-    .{ .path = "_static/index.html", .content = REPLAY_INDEX_HTML, .content_type = "text/html; charset=utf-8" },
-    .{ .path = "_static/app.js", .content = REPLAY_APP_JS, .content_type = "application/javascript" },
-    .{ .path = "_static/wasm.html",          .content = REPLAY_WASM_HTML,
-      .content_type = "text/html; charset=utf-8" },
-    .{ .path = "_static/wasm-app.mjs",       .content = REPLAY_WASM_APP_MJS,
-      .content_type = "application/javascript" },
-    .{ .path = "_static/rtap.mjs",           .content = REPLAY_RTAP_MJS,
-      .content_type = "application/javascript" },
-    .{ .path = "_static/qjs_arena_wasm.js",  .content = REPLAY_QJS_WASM_JS,
-      .content_type = "application/javascript" },
-    .{ .path = "_static/qjs_arena_wasm.wasm", .content = REPLAY_QJS_WASM_WASM,
-      .content_type = "application/wasm" },
+const PLATFORM_FILES = [_]PlatformFile{
+    // __admin__ tenant
+    .{ .tenant = .admin, .disk_subpath = "admin/handler.mjs",            .tenant_path = "index.mjs",                  .content_type = null },
+    .{ .tenant = .admin, .disk_subpath = "admin/middleware.mjs",         .tenant_path = "_middlewares/index.mjs",     .content_type = null },
+    .{ .tenant = .admin, .disk_subpath = "admin/index.html",             .tenant_path = "_static/index.html",         .content_type = "text/html; charset=utf-8" },
+    .{ .tenant = .admin, .disk_subpath = "admin/app.js",                 .tenant_path = "_static/app.js",             .content_type = "application/javascript" },
+    .{ .tenant = .admin, .disk_subpath = "admin/api.js",                 .tenant_path = "_static/api.js",             .content_type = "application/javascript" },
+    .{ .tenant = .admin, .disk_subpath = "admin/app.css",                .tenant_path = "_static/app.css",            .content_type = "text/css" },
+    .{ .tenant = .admin, .disk_subpath = "admin/pages/login.js",         .tenant_path = "_static/pages/login.js",     .content_type = "application/javascript" },
+    .{ .tenant = .admin, .disk_subpath = "admin/pages/instances.js",     .tenant_path = "_static/pages/instances.js", .content_type = "application/javascript" },
+    .{ .tenant = .admin, .disk_subpath = "admin/pages/instance.js",      .tenant_path = "_static/pages/instance.js",  .content_type = "application/javascript" },
+    .{ .tenant = .admin, .disk_subpath = "admin/codemirror.mjs",         .tenant_path = "_static/codemirror.mjs",     .content_type = "application/javascript" },
+    // __replay__ tenant (iframe + WASM shells)
+    .{ .tenant = .replay, .disk_subpath = "replay/index.html",           .tenant_path = "_static/index.html",         .content_type = "text/html; charset=utf-8" },
+    .{ .tenant = .replay, .disk_subpath = "replay/app.js",               .tenant_path = "_static/app.js",             .content_type = "application/javascript" },
+    .{ .tenant = .replay, .disk_subpath = "replay/wasm.html",            .tenant_path = "_static/wasm.html",          .content_type = "text/html; charset=utf-8" },
+    .{ .tenant = .replay, .disk_subpath = "replay/wasm-app.mjs",         .tenant_path = "_static/wasm-app.mjs",       .content_type = "application/javascript" },
+    .{ .tenant = .replay, .disk_subpath = "replay/rtap.mjs",             .tenant_path = "_static/rtap.mjs",           .content_type = "application/javascript" },
+    .{ .tenant = .replay, .disk_subpath = "replay/qjs_arena_wasm.js",    .tenant_path = "_static/qjs_arena_wasm.js",  .content_type = "application/javascript" },
+    .{ .tenant = .replay, .disk_subpath = "replay/qjs_arena_wasm.wasm",  .tenant_path = "_static/qjs_arena_wasm.wasm", .content_type = "application/wasm" },
 };
+
+/// Read every file the admin + replay deployments need from disk.
+/// Returns `{ admin, replay }` — each a freshly-allocated slice of
+/// `DeployFile` whose `content` bytes are owned by `allocator`. Caller
+/// frees via `freePlatformDeployFiles`.
+pub const LoadedPlatformFiles = struct {
+    admin: []DeployFile,
+    replay: []DeployFile,
+};
+
+pub fn loadPlatformDeployFiles(
+    allocator: std.mem.Allocator,
+    web_root: []const u8,
+) !LoadedPlatformFiles {
+    var admin: std.ArrayList(DeployFile) = .empty;
+    errdefer {
+        for (admin.items) |f| allocator.free(f.content);
+        admin.deinit(allocator);
+    }
+    var replay: std.ArrayList(DeployFile) = .empty;
+    errdefer {
+        for (replay.items) |f| allocator.free(f.content);
+        replay.deinit(allocator);
+    }
+
+    // Generous per-file cap — the largest current asset is
+    // qjs_arena_wasm.wasm at ~1 MiB; 8 MiB leaves room for codemirror
+    // and a moderately bloated UI before this needs revisiting.
+    const MAX_FILE: usize = 8 * 1024 * 1024;
+
+    for (PLATFORM_FILES) |pf| {
+        const full_path = try std.fs.path.join(allocator, &.{ web_root, pf.disk_subpath });
+        defer allocator.free(full_path);
+
+        const bytes = std.fs.cwd().readFileAlloc(allocator, full_path, MAX_FILE) catch |err| {
+            std.log.err("bootstrap: read {s} failed: {s}", .{ full_path, @errorName(err) });
+            return err;
+        };
+        errdefer allocator.free(bytes);
+
+        const df: DeployFile = .{
+            .path = pf.tenant_path,
+            .content = bytes,
+            .content_type = pf.content_type,
+        };
+        switch (pf.tenant) {
+            .admin => try admin.append(allocator, df),
+            .replay => try replay.append(allocator, df),
+        }
+    }
+
+    return .{
+        .admin = try admin.toOwnedSlice(allocator),
+        .replay = try replay.toOwnedSlice(allocator),
+    };
+}
+
+pub fn freePlatformDeployFiles(allocator: std.mem.Allocator, loaded: LoadedPlatformFiles) void {
+    for (loaded.admin) |f| allocator.free(f.content);
+    allocator.free(loaded.admin);
+    for (loaded.replay) |f| allocator.free(f.content);
+    allocator.free(loaded.replay);
+}
 
 /// Tenant ids that this module bootstraps. Kept here so the names
 /// are colocated with the deploy file lists; consumers wanting the
@@ -611,19 +664,23 @@ pub fn bootstrapPlatformDeployments(
     jwt_secret: []const u8,
     bootstrap_kv: []const []const u8,
     cluster: ?*kv_mod.Cluster,
+    web_root: []const u8,
 ) !void {
+    const loaded = try loadPlatformDeployFiles(allocator, web_root);
+    defer freePlatformDeployFiles(allocator, loaded);
+
     const admin_dep_id = try bootstrapTenant(
         allocator,
         blob_cfg,
         data_dir,
         ADMIN_TENANT_ID,
-        &ADMIN_DEPLOY_FILES,
+        loaded.admin,
         cluster,
     );
     try postRelease(allocator, leader_url, jwt_secret, ADMIN_TENANT_ID, admin_dep_id);
     std.log.info(
-        "files-server bootstrap: __admin__ deploy {d} released",
-        .{admin_dep_id},
+        "files-server bootstrap: __admin__ deploy {d} released (web_root={s})",
+        .{ admin_dep_id, web_root },
     );
 
     const replay_dep_id = try bootstrapTenant(
@@ -631,7 +688,7 @@ pub fn bootstrapPlatformDeployments(
         blob_cfg,
         data_dir,
         REPLAY_TENANT_ID,
-        &REPLAY_DEPLOY_FILES,
+        loaded.replay,
         cluster,
     );
     try postRelease(allocator, leader_url, jwt_secret, REPLAY_TENANT_ID, replay_dep_id);

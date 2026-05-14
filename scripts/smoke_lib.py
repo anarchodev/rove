@@ -641,6 +641,10 @@ class Cluster:
             args += ["--cors-origin", cors_origin]
         if leader_url:
             args += ["--leader-url", leader_url]
+            # --web-root points at the source tree the bootstrap reads
+            # admin/ and replay/ source from. The smokes run from the
+            # repo root, so `web` is always next to the script.
+            args += ["--web-root", str(REPO_ROOT / "web")]
         args += extra_args or []
         f = open(log_path, "wb")
         self.files_server = subprocess.Popen(

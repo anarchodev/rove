@@ -73,6 +73,13 @@ const Cli = struct {
     /// `_deploy/current` pointer lands via raft. Idempotent on warm
     /// S3.
     leader_url: ?[]const u8 = null,
+    /// Path to the source tree containing `admin/` and `replay/`
+    /// subdirectories. Required when `--leader-url` is set (i.e.
+    /// when the bootstrap path runs). The admin + replay tenant
+    /// deployments are read from disk at every boot rather than
+    /// embedded into the binary, so dashboard / replay-shell edits
+    /// ship by restarting this process — no rebuild needed.
+    web_root: ?[]const u8 = null,
     /// Repeatable `--bootstrap-kv key=value` pairs pushed into
     /// `__admin__/app.db` via the worker's `/_system/admin-kv`
     /// endpoint at platform-bootstrap time. Replaces the worker's
@@ -163,6 +170,10 @@ fn parseCli(argv: [][:0]u8) !Cli {
             i += 1;
             if (i >= argv.len) return error.Usage;
             out.leader_url = argv[i];
+        } else if (std.mem.eql(u8, a, "--web-root")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            out.web_root = argv[i];
         } else if (std.mem.eql(u8, a, "--bootstrap-kv")) {
             i += 1;
             if (i >= argv.len) return error.Usage;
@@ -502,6 +513,10 @@ pub fn main() !void {
     var bootstrap_thread: ?std.Thread = null;
     defer if (bootstrap_thread) |t| t.join();
     if (cli.leader_url) |leader_url| {
+        const web_root = cli.web_root orelse {
+            std.log.err("files-server: --leader-url set but --web-root is missing (required for platform deploy)", .{});
+            std.process.exit(2);
+        };
         const ctx = try allocator.create(BootstrapCtx);
         ctx.* = .{
             .allocator = allocator,
@@ -511,6 +526,7 @@ pub fn main() !void {
             .jwt_secret = jwt_secret,
             .bootstrap_kv = cli.bootstrap_kv[0..cli.bootstrap_kv_count],
             .cluster = cluster_opt,
+            .web_root = web_root,
         };
         bootstrap_thread = try std.Thread.spawn(.{}, bootstrapWithRetry, .{ctx});
     } else {
@@ -538,6 +554,7 @@ const BootstrapCtx = struct {
     jwt_secret: []const u8,
     bootstrap_kv: []const []const u8,
     cluster: ?*kv.Cluster,
+    web_root: []const u8,
 };
 
 fn bootstrapWithRetry(ctx: *BootstrapCtx) void {
@@ -599,6 +616,7 @@ fn bootstrapWithRetry(ctx: *BootstrapCtx) void {
             ctx.jwt_secret,
             ctx.bootstrap_kv,
             ctx.cluster,
+            ctx.web_root,
         ) catch |err| {
             const now_ns = std.time.nanoTimestamp();
             if (now_ns - start_ns > budget_ns) {
