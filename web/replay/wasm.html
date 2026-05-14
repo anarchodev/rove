@@ -14,7 +14,7 @@
   .status { font-size: 0.9em; color: #666; }
   .status.error { color: #b00020; }
   .status.ok { color: #2e7d32; }
-  main { display: grid; grid-template-columns: 280px 1fr; gap: 0; height: calc(100vh - 64px); }
+  main { display: grid; grid-template-columns: 280px 1fr 360px; gap: 0; height: calc(100vh - 64px); }
   section { padding: 0.75em 1em; overflow: auto; border-right: 1px solid #ddd; }
   section:last-child { border-right: none; }
   h2 { font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.04em; color: #888; margin: 0 0 0.5em; }
@@ -27,6 +27,22 @@
                border-radius: 4px; margin: 0.25em 0; white-space: pre-wrap;
                word-break: break-all; max-height: 50%; overflow: auto; }
   .hint { color: #888; font-size: 12px; padding-top: 0.5em; }
+
+  /* Timeline */
+  ol.timeline { list-style: none; padding: 0; margin: 0;
+                font-family: ui-monospace, monospace; font-size: 12px; }
+  ol.timeline li { padding: 0.15em 0.25em; border-radius: 2px;
+                   cursor: default; white-space: nowrap; }
+  ol.timeline li:hover { background: #eef; }
+  ol.timeline .idx { color: #aaa; display: inline-block; width: 3ch;
+                     text-align: right; margin-right: 0.5em; }
+  ol.timeline .nest { color: #ccc; }
+  ol.timeline .fn { color: #2e7d32; }
+  ol.timeline .loc { color: #888; margin-left: 0.5em; }
+  ol.timeline li.throw { background: #fff0f0; }
+  ol.timeline li.throw .fn { color: #b00020; }
+  ol.timeline li.throw .msg { color: #b00020; margin-left: 0.5em; }
+  .timeline-empty { color: #888; font-style: italic; }
 </style>
 </head>
 <body>
@@ -45,9 +61,14 @@
     </p>
   </section>
   <section>
-    <h2>Run</h2>
+    <h2>Timeline</h2>
     <div id="run-status" class="status info">waiting for bundle…</div>
-    <h2 style="margin-top:1em">Output</h2>
+    <ol id="timeline" class="timeline" style="margin-top:0.5em">
+      <li class="timeline-empty">(waiting for handler to run…)</li>
+    </ol>
+  </section>
+  <section>
+    <h2>Output</h2>
     <pre id="output" class="output">(none yet)</pre>
   </section>
 </main>

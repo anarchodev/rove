@@ -2,23 +2,25 @@
 //
 // Runs at `replay.{public_suffix}/wasm`. Same opener/postMessage
 // handshake as the existing iframe replay (web/replay/app.js) so the
-// dashboard's Replay button can target either by URL — what differs
-// is what we DO with the bundle once we have it.
+// dashboard's Replay button can target either URL — what differs is
+// what we do with the bundle once we have it.
 //
 // Pipeline:
 //   1. Receive `replay:bundle` from the dashboard
 //   2. Parse the captured tape blobs via rtap.mjs (mirrors
 //      src/tape/root.zig encoding rule-for-rule)
-//   3. Install the parsed tapes + per-path module sources on the
+//   3. Install parsed tapes + per-path module sources on the
 //      Emscripten Module object
-//   4. Boot arenajs-WASM and call arena_run_module(entry, source)
-//   5. Display whether the handler ran to completion and what (if
-//      anything) it threw
+//   4. Install Module.host_trace to collect FUNC_ENTER / FUNC_EXIT /
+//      THROW events as the handler runs
+//   5. Boot arenajs-WASM, set trace mode to SCAN, call
+//      arena_run_module(entry, source)
+//   6. Render the captured event stream as a call-tree timeline
 //
-// V1 stops here — no timeline / scrubber / variable panel yet. Those
-// layer on top of the same Module.host_trace + Module.host_state hooks
-// the arenajs trace emitter already provides; this file just doesn't
-// install them yet.
+// V1 stops here — no scrubbing controls, no source view, no variable
+// panel. The DRILL-mode + host_state (stack-walker) hooks the arenajs
+// runtime already exposes are what those features will hang off in
+// follow-ups; this file just doesn't drive them yet.
 
 import { buildTapesFromBlobs } from "./rtap.mjs";
 import getArenaJs from "./qjs_arena_wasm.js";
@@ -27,11 +29,24 @@ const $status    = document.getElementById("status");
 const $runStatus = document.getElementById("run-status");
 const $meta      = document.getElementById("meta");
 const $output    = document.getElementById("output");
+const $timeline  = document.getElementById("timeline");
 
 function setStatus(el, text, kind) {
     el.textContent = text;
     el.className = "status " + (kind || "info");
 }
+
+// ── Trace mode constants ─────────────────────────────────────────────
+const TRACE_OFF   = 0;
+const TRACE_SCAN  = 1;
+const TRACE_DRILL = 2;
+
+// Event kinds (binary wire format — see qjs-arena-trace.c).
+const K_NAME       = 0;
+const K_FUNC_ENTER = 1;
+const K_FUNC_EXIT  = 2;
+const K_LINE       = 3;
+const K_THROW      = 4;
 
 // ── postMessage handshake ────────────────────────────────────────────
 //
@@ -90,10 +105,160 @@ function renderMeta(bundle) {
     if (w.exception) row("exception (original)", w.exception);
 }
 
-// ── Entry path resolution ────────────────────────────────────────────
+// ── Trace event collection + decode ──────────────────────────────────
 //
-// Same fallback the existing iframe replay uses: explicit entry_path
-// in the bundle wins; otherwise look for index.mjs in the module set.
+// Binary layouts (see qjs-arena-trace.c):
+//   NAME       [u32 atom][u16 len][len bytes]
+//   FUNC_ENTER [u32 name_atom][u32 file_atom][u32 line]
+//   FUNC_EXIT  (empty)
+//   LINE       [u32 file_atom][u32 line]
+//   THROW      [u32 file_atom][u32 line][u16 msg_len][msg bytes]
+
+class TraceCollector {
+    constructor(Module) {
+        this.Module = Module;
+        this.events = [];
+        this.names = new Map();  // atom u32 → string
+        this.decoder = new TextDecoder();
+    }
+
+    install() {
+        // Module.host_trace runs synchronously inside arena_run_module.
+        // Return 0 to continue; we never stop in v1.
+        this.Module.host_trace = (kind, ptr, len) => {
+            this._handle(kind, ptr, len);
+            return 0;
+        };
+    }
+
+    _handle(kind, ptr, len) {
+        const M = this.Module;
+        switch (kind) {
+            case K_NAME: {
+                const atom = M.HEAPU32[ptr >> 2];
+                const slen = M.HEAPU16[(ptr + 4) >> 1];
+                const s = this.decoder.decode(M.HEAPU8.subarray(ptr + 6, ptr + 6 + slen));
+                this.names.set(atom, s);
+                return;  // NAME is out-of-band, not appended to events
+            }
+            case K_FUNC_ENTER:
+                this.events.push({
+                    kind: "enter",
+                    name_atom: M.HEAPU32[ptr >> 2],
+                    file_atom: M.HEAPU32[(ptr + 4) >> 2],
+                    line:      M.HEAPU32[(ptr + 8) >> 2],
+                });
+                return;
+            case K_FUNC_EXIT:
+                this.events.push({ kind: "exit" });
+                return;
+            case K_LINE:
+                this.events.push({
+                    kind: "line",
+                    file_atom: M.HEAPU32[ptr >> 2],
+                    line:      M.HEAPU32[(ptr + 4) >> 2],
+                });
+                return;
+            case K_THROW: {
+                const fileAtom = M.HEAPU32[ptr >> 2];
+                const line     = M.HEAPU32[(ptr + 4) >> 2];
+                const mlen     = M.HEAPU16[(ptr + 8) >> 1];
+                const msg = this.decoder.decode(M.HEAPU8.subarray(ptr + 10, ptr + 10 + mlen));
+                this.events.push({ kind: "throw", file_atom: fileAtom, line, message: msg });
+                return;
+            }
+        }
+    }
+
+    resolveName(atom) { return this.names.get(atom) || `<atom:${atom}>`; }
+}
+
+// ── Timeline rendering ───────────────────────────────────────────────
+//
+// One <li> per FUNC_ENTER and THROW, indented by the call depth at
+// that moment. FUNC_EXIT is implicit — used only to track depth so
+// the next enter renders at the right indent. Each row carries its
+// event index in a data attribute so future drill-into-state can
+// re-run with stopAtEvent = idx.
+
+function renderTimeline(collector) {
+    $timeline.innerHTML = "";
+    if (collector.events.length === 0) {
+        const li = document.createElement("li");
+        li.className = "timeline-empty";
+        li.textContent = "(no events — try running in DRILL mode for line-level detail)";
+        $timeline.appendChild(li);
+        return;
+    }
+
+    let depth = 0;
+    let eventIdx = 0;
+    for (const e of collector.events) {
+        eventIdx++;
+        if (e.kind === "exit") { depth--; continue; }
+
+        const li = document.createElement("li");
+        li.dataset.eventIndex = String(eventIdx);
+
+        const idx = document.createElement("span");
+        idx.className = "idx";
+        idx.textContent = String(eventIdx);
+        li.appendChild(idx);
+
+        if (depth > 0) {
+            const nest = document.createElement("span");
+            nest.className = "nest";
+            nest.textContent = "│ ".repeat(depth);
+            li.appendChild(nest);
+        }
+
+        if (e.kind === "enter") {
+            const fn = document.createElement("span");
+            fn.className = "fn";
+            fn.textContent = "▸ " + collector.resolveName(e.name_atom);
+            li.appendChild(fn);
+
+            const loc = document.createElement("span");
+            loc.className = "loc";
+            loc.textContent = collector.resolveName(e.file_atom) + ":" + e.line;
+            li.appendChild(loc);
+
+            depth++;
+        } else if (e.kind === "throw") {
+            li.classList.add("throw");
+            const fn = document.createElement("span");
+            fn.className = "fn";
+            fn.textContent = "⚠ throw";
+            li.appendChild(fn);
+
+            const loc = document.createElement("span");
+            loc.className = "loc";
+            loc.textContent = collector.resolveName(e.file_atom) + ":" + e.line;
+            li.appendChild(loc);
+
+            const msg = document.createElement("span");
+            msg.className = "msg";
+            msg.textContent = e.message || "";
+            li.appendChild(msg);
+        } else if (e.kind === "line") {
+            // DRILL-mode only — not visible in default v1 scan mode,
+            // but render compactly when present so toggling drill is
+            // useful as soon as we expose a control.
+            const fn = document.createElement("span");
+            fn.className = "fn";
+            fn.textContent = "·";
+            li.appendChild(fn);
+            const loc = document.createElement("span");
+            loc.className = "loc";
+            loc.textContent = collector.resolveName(e.file_atom) + ":" + e.line;
+            li.appendChild(loc);
+        }
+
+        $timeline.appendChild(li);
+    }
+}
+
+// ── Entry path resolution ────────────────────────────────────────────
 function resolveEntry(bundle) {
     if (bundle.entry_path) return bundle.entry_path;
     const idx = (bundle.modules || []).find(m => m.path === "index.mjs");
@@ -121,8 +286,6 @@ async function main() {
     setStatus($status, "running handler in arenajs-WASM…", "info");
     setStatus($runStatus, "booting WASM module…", "info");
 
-    // Boot the WASM module. Pre-allocate 8 MiB per arena for now —
-    // matches the rove worker default; we can tighten or expose later.
     let Module;
     try {
         Module = await getArenaJs();
@@ -130,25 +293,28 @@ async function main() {
         setStatus($status, "error loading WASM: " + err.message, "error");
         return;
     }
-    const arena_init       = Module.cwrap("arena_init",       "number", ["number","number"]);
-    const arena_run_module = Module.cwrap("arena_run_module", "number", ["string","string"]);
-    const arena_destroy    = Module.cwrap("arena_destroy",    null,     []);
+    const arena_init           = Module.cwrap("arena_init",           "number", ["number","number"]);
+    const arena_run_module     = Module.cwrap("arena_run_module",     "number", ["string","string"]);
+    const arena_set_trace_mode = Module.cwrap("arena_set_trace_mode", null,     ["number"]);
+    const arena_destroy        = Module.cwrap("arena_destroy",        null,     []);
 
     if (arena_init(8192, 8192) !== 0) {
         setStatus($status, "error: arena_init failed", "error");
         return;
     }
 
-    // Capture printf/fprintf output so we can show what the handler
-    // logged or what exception text the reactor surfaced. Emscripten
-    // routes stdout/stderr to console.* by default — hook print and
-    // printErr on the Module before any execution.
+    // Capture printf/fprintf so handler logging + exception text are
+    // visible in the Output panel.
     const captured = [];
     const origPrint = Module.print, origErr = Module.printErr;
     Module.print    = (s) => { captured.push(s); origPrint?.(s); };
     Module.printErr = (s) => { captured.push("[stderr] " + s); origErr?.(s); };
 
-    // Install tapes + sources from the bundle.
+    // Install trace collector BEFORE setting tapes / running; the
+    // trace mode is read once at each arena_run_module start.
+    const trace = new TraceCollector(Module);
+    trace.install();
+
     try {
         Module.tapes = buildTapesFromBlobs(bundle.tape_blobs || {});
     } catch (err) {
@@ -158,7 +324,6 @@ async function main() {
     }
     Module.module_sources = buildModuleSources(bundle);
 
-    // Find the entry module + its source.
     let entryPath, entrySrc;
     try {
         entryPath = resolveEntry(bundle);
@@ -171,15 +336,21 @@ async function main() {
     }
 
     setStatus($runStatus, "running " + entryPath + "…", "info");
+    arena_set_trace_mode(TRACE_SCAN);
     const rc = arena_run_module(entryPath, entrySrc);
+    arena_set_trace_mode(TRACE_OFF);
     arena_destroy();
+
+    renderTimeline(trace);
 
     if (rc === 0) {
         setStatus($status, "handler completed", "ok");
-        setStatus($runStatus, "ran to completion (rc=0)", "ok");
+        setStatus($runStatus,
+            `ran to completion — ${trace.events.length} trace event(s)`, "ok");
     } else {
         setStatus($status, "handler error (see output)", "error");
-        setStatus($runStatus, "exited with rc=" + rc, "error");
+        setStatus($runStatus,
+            `exited with rc=${rc} — ${trace.events.length} trace event(s)`, "error");
     }
     $output.textContent = captured.length ? captured.join("\n") : "(no output)";
 }
