@@ -69,6 +69,82 @@ const $ = {
     transportTime:   document.getElementById("transport-time"),
 };
 
+// ── JavaScript syntax tokenizer ──────────────────────────────────────
+//
+// Per-line regex tokenizer for source highlighting. Maps to the
+// canonical `tok-*` classes in rewind.css: tok-kw / tok-str /
+// tok-num / tok-comm. Identifiers and punctuation render neutrally
+// (no class), which keeps the source readable without going
+// rainbow-noisy.
+//
+// Known limitations (acceptable for replay's source viewer):
+//   - Block comments that span multiple lines render the body
+//     lines uncolored (the open `/*` line gets the comment tint).
+//   - Regex literals and JSX aren't recognized — both are rare in
+//     handler code and would need full parser context.
+//   - Template-literal substitutions (`${expr}`) render as one
+//     opaque string, not as nested syntax.
+
+const TOK_PATTERNS = [
+    { type: "comment", re: /^\/\/.*/ },
+    { type: "comment", re: /^\/\*[\s\S]*?\*\// },
+    { type: "string",  re: /^"(?:[^"\\]|\\.)*"/ },
+    { type: "string",  re: /^'(?:[^'\\]|\\.)*'/ },
+    { type: "string",  re: /^`(?:[^`\\]|\\.)*`/ },
+    { type: "number",  re: /^\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/ },
+    { type: "keyword", re: /^(?:const|let|var|function|async|await|return|throw|new|if|else|for|while|of|in|import|export|from|class|extends|try|catch|finally|typeof|instanceof|break|continue|switch|case|default|null|true|false|undefined|this|do|delete|void|yield|static|get|set)\b/ },
+    { type: "ident",   re: /^[a-zA-Z_$][a-zA-Z0-9_$]*/ },
+    { type: "punc",    re: /^[+\-*/%=<>!&|^~?:.,;()[\]{}]+/ },
+    { type: "space",   re: /^\s+/ },
+];
+
+const TOK_CLASS = {
+    keyword: "tok-kw",
+    string:  "tok-str",
+    number:  "tok-num",
+    comment: "tok-comm",
+};
+
+function tokenize(src) {
+    const tokens = [];
+    let pos = 0;
+    while (pos < src.length) {
+        let matched = false;
+        const rest = src.slice(pos);
+        for (const { type, re } of TOK_PATTERNS) {
+            const m = rest.match(re);
+            if (m && m.index === 0) {
+                tokens.push({ type, text: m[0] });
+                pos += m[0].length;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            tokens.push({ type: "other", text: src[pos] });
+            pos++;
+        }
+    }
+    return tokens;
+}
+
+// Append a tokenized JS line into `parent`. Token classes are
+// inserted as spans; identifiers / punctuation / whitespace render
+// as bare text nodes.
+function appendTokenized(parent, lineSrc) {
+    for (const tok of tokenize(lineSrc)) {
+        const cls = TOK_CLASS[tok.type];
+        if (cls) {
+            const span = document.createElement("span");
+            span.className = cls;
+            span.textContent = tok.text;
+            parent.appendChild(span);
+        } else {
+            parent.appendChild(document.createTextNode(tok.text));
+        }
+    }
+}
+
 // ── Small helpers ────────────────────────────────────────────────────
 
 function el(tag, opts = {}) {
@@ -303,8 +379,9 @@ function renderSourceView(bundle, modulePath, highlightLine) {
         gutter.appendChild(el("span", { className: "ln", text: String(lineNo) }));
         const lineSpan = el("span", {
             className: "line" + (lineNo === highlightLine ? " is-current" : ""),
-            text: lines[i] + "\n",
         });
+        appendTokenized(lineSpan, lines[i]);
+        lineSpan.appendChild(document.createTextNode("\n"));
         body.appendChild(lineSpan);
     }
     $.sourceCode.appendChild(gutter);

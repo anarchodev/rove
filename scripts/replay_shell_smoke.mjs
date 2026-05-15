@@ -148,11 +148,12 @@ const FIXTURE = {
 // for the trace stream to have content.
 function processItem(x) { return x * 2; }
 function compute(items, taxRate) {
+  const label = "subtotal";
   let subtotal = 0;
   for (const item of items) {
     subtotal += processItem(item);
   }
-  return subtotal * (1 + taxRate);
+  return { [label]: subtotal, total: subtotal * (1 + taxRate) };
 }
 compute([10, 20, 30], 0.0875);
 `,
@@ -297,6 +298,15 @@ async function checkPopulatedState(ctx) {
     const gutterLines = await popup.locator(".code__gutter .ln").count();
     if (gutterLines >= 10) ok(`source gutter rendered ${gutterLines} lines`);
     else                   bad(`source gutter only ${gutterLines} lines (expected ≥ 10)`);
+
+    // Syntax highlighting applied (the fixture's source has keywords,
+    // strings, numbers, and comments — all four tok-* classes should
+    // appear at least once).
+    for (const cls of ["tok-kw", "tok-str", "tok-num", "tok-comm"]) {
+        const n = await popup.locator(`.code__body .${cls}`).count();
+        if (n > 0) ok(`syntax tokens: ${cls} × ${n}`);
+        else       bad(`expected at least one .${cls} in source body`);
+    }
 
     const evCount = await popup.locator("#event-stream .ev").count();
     if (evCount > 0) ok(`event stream has ${evCount} entries`);
