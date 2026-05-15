@@ -68,7 +68,10 @@ const { chromium } = pw;
 // ── Paths + URLs ─────────────────────────────────────────────────────
 const SCRIPT_DIR  = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT   = resolve(SCRIPT_DIR, "..");
-const REPLAY_DIR  = resolve(REPO_ROOT, "web/replay");
+// The static server serves the deployed `_static/` subdir so URL
+// paths match what production files-server resolves under `_static/`
+// (a request for `/wasm.html` ↔ `_static/wasm.html` on disk).
+const REPLAY_DIR  = resolve(REPO_ROOT, "web/replay/_static");
 
 const PORT   = Number(process.env.REPLAY_SMOKE_PORT) || 8731;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
