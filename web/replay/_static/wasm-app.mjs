@@ -51,6 +51,25 @@ const $ = {
     transportTime:   document.getElementById("transport-time"),
 };
 
+// Transport buttons by aria-label. The HTML names them via aria-label
+// instead of ids because the natural reading is "the button labelled
+// Step over" — these JS-side bindings are the implementation of that
+// affordance.
+function btn(label) {
+    return document.querySelector(`.transport__controls button[aria-label="${label}"]`);
+}
+const T = {
+    jumpStart: btn("Jump to start"),
+    stepBack:  btn("Step back"),
+    play:      btn("Play"),
+    stepOver:  btn("Step over"),
+    stepIn:    btn("Step into"),
+    stepOut:   btn("Step out"),
+    stepLine:  btn("Step line"),
+    jumpEnd:   btn("Jump to end"),
+};
+const $scrubber = document.querySelector(".scrubber");
+
 // ── JavaScript syntax tokenizer ──────────────────────────────────────
 // Per-line regex tokenizer for source highlighting. Maps to the
 // canonical `tok-*` classes in rewind.css: tok-kw / tok-str /
@@ -539,6 +558,177 @@ function renderError(err) {
     );
 }
 
+// ── Stepping actions ─────────────────────────────────────────────────
+//
+// All step verbs converge on setPlayhead(); rendering is a function of
+// (mat, playhead), so a single setter is enough. Granularity falls out
+// of which verb the user invoked (per the scrub-vs-step memory rule).
+
+function setPlayhead(idx) {
+    if (!state.mat) return;
+    const n = state.mat.events.length;
+    if (n === 0) return;
+    const clamped = Math.max(0, Math.min(n - 1, idx));
+    if (clamped === state.playhead) return;
+    state.playhead = clamped;
+    renderAll();
+}
+
+function jumpStart() { setPlayhead(0); }
+function jumpEnd()   { if (state.mat) setPlayhead(state.mat.events.length - 1); }
+function stepLine()  { setPlayhead(state.playhead + 1); }
+function stepBack()  { setPlayhead(state.playhead - 1); }
+
+// step-over: if currently at a FUNC_ENTER, jump past its matching exit
+// (skip the whole subcall). Otherwise advance one event.
+function stepOver() {
+    if (!state.mat) return;
+    const events = state.mat.events;
+    const cur = events[state.playhead];
+    if (cur?.kind === "FUNC_ENTER") {
+        const exitIdx = state.mat.matchingExit[state.playhead];
+        if (exitIdx > 0) {
+            setPlayhead(exitIdx + 1 <= events.length - 1 ? exitIdx + 1 : exitIdx);
+            return;
+        }
+    }
+    setPlayhead(state.playhead + 1);
+}
+
+// step-in: jump to the next FUNC_ENTER after the playhead.
+function stepIn() {
+    if (!state.mat) return;
+    const events = state.mat.events;
+    for (let i = state.playhead + 1; i < events.length; i++) {
+        if (events[i].kind === "FUNC_ENTER") return setPlayhead(i);
+    }
+    setPlayhead(events.length - 1);
+}
+
+// step-out: jump to the matching FUNC_EXIT of the frame containing the
+// playhead. If we're not inside a frame, advance to end.
+function stepOut() {
+    if (!state.mat) return;
+    const events = state.mat.events;
+    // Walk back to find the most recent unmatched FUNC_ENTER.
+    let depth = 0;
+    let enterIdx = -1;
+    for (let i = state.playhead; i >= 0; i--) {
+        const e = events[i];
+        if (e.kind === "FUNC_EXIT") depth++;
+        else if (e.kind === "FUNC_ENTER") {
+            if (depth === 0) { enterIdx = i; break; }
+            depth--;
+        }
+    }
+    if (enterIdx < 0) return setPlayhead(events.length - 1);
+    const exitIdx = state.mat.matchingExit[enterIdx];
+    if (exitIdx > 0) setPlayhead(exitIdx);
+    else             setPlayhead(events.length - 1);
+}
+
+// next-error: jump to the next THROW after the playhead; wrap to the
+// first throw if past all of them.
+function nextError() {
+    if (!state.mat) return;
+    const events = state.mat.events;
+    for (let i = state.playhead + 1; i < events.length; i++) {
+        if (events[i].kind === "THROW") return setPlayhead(i);
+    }
+    for (let i = 0; i < events.length; i++) {
+        if (events[i].kind === "THROW") return setPlayhead(i);
+    }
+}
+
+// Play / pause — autoplay through events at ~300ms each (no wall-clock
+// "speed" concept; the model is keyframes).
+let playInterval = null;
+const PLAY_INTERVAL_MS = 300;
+function isPlaying() { return playInterval !== null; }
+function pause() {
+    if (playInterval) clearInterval(playInterval);
+    playInterval = null;
+    if (T.play) T.play.textContent = "▶";
+}
+function playPause() {
+    if (!state.mat) return;
+    if (isPlaying()) return pause();
+    if (state.playhead >= state.mat.events.length - 1) {
+        setPlayhead(0);
+    }
+    playInterval = setInterval(() => {
+        if (!state.mat || state.playhead >= state.mat.events.length - 1) {
+            pause();
+            return;
+        }
+        setPlayhead(state.playhead + 1);
+    }, PLAY_INTERVAL_MS);
+    if (T.play) T.play.textContent = "❚❚";
+}
+
+// Wire transport button clicks + a click on the scrubber track that
+// snaps to the nearest scan event.
+function wireTransport() {
+    if (T.jumpStart) T.jumpStart.addEventListener("click", jumpStart);
+    if (T.stepBack)  T.stepBack .addEventListener("click", stepBack);
+    if (T.play)      T.play     .addEventListener("click", playPause);
+    if (T.stepOver)  T.stepOver .addEventListener("click", stepOver);
+    if (T.stepIn)    T.stepIn   .addEventListener("click", stepIn);
+    if (T.stepOut)   T.stepOut  .addEventListener("click", stepOut);
+    if (T.stepLine)  T.stepLine .addEventListener("click", stepLine);
+    if (T.jumpEnd)   T.jumpEnd  .addEventListener("click", jumpEnd);
+    if ($.nextErrorBtn) $.nextErrorBtn.addEventListener("click", nextError);
+
+    if ($scrubber) $scrubber.addEventListener("click", (e) => {
+        if (!state.mat) return;
+        const scans = scanEventsOf(state.mat);
+        if (scans.length === 0) return;
+        const rect = $scrubber.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const frac = Math.max(0, Math.min(1, x / rect.width));
+        const k = Math.max(0, Math.min(scans.length - 1, Math.floor(frac * scans.length)));
+        // Map the k-th scan event back to its index in mat.events.
+        const eventIdx = state.mat.scanOrdinalToEventIdx[k];
+        if (eventIdx != null) setPlayhead(eventIdx);
+    });
+
+    // Keyboard. Skip when typing in inputs.
+    window.addEventListener("keydown", (ev) => {
+        const tag = ev.target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA") return;
+        if (ev.metaKey || ev.ctrlKey) return;
+        switch (ev.key) {
+            case " ":          ev.preventDefault(); playPause(); break;
+            case "ArrowRight": ev.preventDefault(); stepLine();  break;
+            case "ArrowLeft":  ev.preventDefault(); stepBack();  break;
+            case "Home":       ev.preventDefault(); jumpStart(); break;
+            case "End":        ev.preventDefault(); jumpEnd();   break;
+            case "F10":        ev.preventDefault(); stepOver();  break;
+            case "F11":        ev.preventDefault();
+                                ev.shiftKey ? stepOut() : stepIn();
+                                break;
+            case "b": case "B": stepBack(); break;
+            case "e": case "E": nextError(); break;
+        }
+    });
+}
+
+// Enable / disable transport based on whether the playhead can go
+// further in each direction. Called from renderAll().
+function renderTransport(mat, playhead) {
+    const last = mat.events.length - 1;
+    const atStart = playhead <= 0;
+    const atEnd   = playhead >= last;
+    if (T.jumpStart) T.jumpStart.disabled = atStart;
+    if (T.stepBack)  T.stepBack .disabled = atStart;
+    if (T.play)      T.play     .disabled = mat.events.length === 0;
+    if (T.stepOver)  T.stepOver .disabled = atEnd;
+    if (T.stepIn)    T.stepIn   .disabled = atEnd;
+    if (T.stepOut)   T.stepOut  .disabled = atEnd;
+    if (T.stepLine)  T.stepLine .disabled = atEnd;
+    if (T.jumpEnd)   T.jumpEnd  .disabled = atEnd;
+}
+
 // ── App state + entry ────────────────────────────────────────────────
 
 const state = {
@@ -552,10 +742,9 @@ function renderAll() {
     if (!state.mat) return;
     const src = currentSourceForPlayhead(state.mat, state.playhead);
     // Auto-follow source: when the playhead lands in a module other
-    // than the one the user is browsing, switch to it. The user can
-    // override by clicking another module in the rail (we just stop
-    // auto-following until a step lands somewhere else again — for
-    // now we always auto-follow, the toggle is a phase-B follow-up).
+    // than the one the user is browsing, switch to it. Click in the
+    // modules rail to break auto-follow for the current module (we
+    // re-follow on the next step that lands in a different file).
     if (src.file && src.file !== state.currentModule) {
         state.currentModule = src.file;
         renderModulesRail(state.bundle, state.currentModule, selectModule);
@@ -565,6 +754,7 @@ function renderAll() {
     renderEventStream(state.mat, state.playhead);
     renderScrubber(state.mat, state.playhead);
     renderNextError(state.mat, state.playhead);
+    renderTransport(state.mat, state.playhead);
 }
 
 function selectModule(path) {
@@ -657,11 +847,10 @@ async function main() {
 
     state.mat = mat;
     // Park the playhead at the throw if there is one, else at the
-    // end. Matches the destination the previous (non-cursor) shell
-    // landed on by default. Step buttons in phase B will let the
-    // user walk forward/back from anywhere.
+    // end. The user can step / scrub from anywhere.
     const throwIdx = mat.events.findIndex(e => e.kind === "THROW");
     state.playhead = throwIdx >= 0 ? throwIdx : Math.max(0, mat.events.length - 1);
+    wireTransport();
     renderAll();
 
     $.sourceState.textContent = `completed · ${mat.events.length} event(s)`;

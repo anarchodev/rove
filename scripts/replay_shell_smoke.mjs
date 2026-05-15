@@ -327,6 +327,37 @@ async function checkPopulatedState(ctx) {
     else
         bad("stack breadcrumb missing exit placeholder: " + JSON.stringify(stackTxt));
 
+    // Step buttons enable based on playhead position. Clean-exit
+    // fixture parks the playhead at the end, so reverse controls are
+    // live and forward controls are disabled.
+    const stepBackDisabled = await popup.locator('button[aria-label="Step back"]').isDisabled();
+    const stepLineDisabled = await popup.locator('button[aria-label="Step line"]').isDisabled();
+    if (!stepBackDisabled) ok("step-back enabled (playhead at end has somewhere to go back)");
+    else                   bad("step-back disabled at end-of-run — expected enabled");
+    if (stepLineDisabled)  ok("step-line disabled (already at end)");
+    else                   bad("step-line enabled at end-of-run — expected disabled");
+
+    // Step-back moves the playhead. Verify the transport time changes.
+    const timeBefore = (await popup.locator("#transport-time").innerText()).trim();
+    await popup.locator('button[aria-label="Step back"]').click();
+    await popup.waitForFunction(
+        (prev) => {
+            const t = document.getElementById("transport-time");
+            return t && t.innerText.trim() !== prev;
+        },
+        timeBefore,
+        { timeout: 2000 },
+    ).then(
+        () => ok("step-back advances the playhead"),
+        () => bad("step-back did not change transport time"),
+    );
+
+    // Jump-to-start lands on event 1 of N.
+    await popup.locator('button[aria-label="Jump to start"]').click();
+    const startTxt = (await popup.locator("#transport-time").innerText()).replace(/\s+/g, " ").trim();
+    if (/^event 1 of \d+$/.test(startTxt)) ok("jump-to-start lands on event 1: " + JSON.stringify(startTxt));
+    else                                   bad("jump-to-start unexpected: " + JSON.stringify(startTxt));
+
     // Module-click navigation: clicking a non-current module in the
     // rail should swap the source viewport and move the is-current
     // marker.
