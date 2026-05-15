@@ -46,10 +46,11 @@
 #include "list.h"
 #include "quickjs.h"
 #include "qjs-arena.h"
+#include "qjs-arena-trace.h"
 #include "libregexp.h"
 #include "dtoa.h"
 
-#if defined(EMSCRIPTEN) || defined(_MSC_VER)
+#if defined(EMSCRIPTEN) || defined(__EMSCRIPTEN__) || defined(_MSC_VER)
 #define DIRECT_DISPATCH  0
 #else
 #define DIRECT_DISPATCH  1
@@ -8345,6 +8346,134 @@ fail:
     /* should never happen */
     return b->line_num;
 }
+
+#if ARENA_TRACE_ENABLED
+/* Trace-emitter callbacks: tiny accessors so qjs-arena-trace.c (which
+   doesn't see JSFunctionBytecode internals) can fish out fields it needs
+   to populate FUNC_ENTER / LINE / THROW payloads. Compiled out when
+   tracing is disabled — trace.c won't reference them either. */
+JSAtom js_arena_trace_bc_filename(JSFunctionBytecode *b)  { return b->filename; }
+JSAtom js_arena_trace_bc_func_name(JSFunctionBytecode *b) { return b->func_name; }
+int js_arena_trace_bc_resolve_line(JSContext *ctx, JSFunctionBytecode *b,
+                                   const uint8_t *pc)
+{
+    int col;
+    if (!pc) return b->line_num;
+    if (pc < b->byte_code_buf) return -1;
+    uint32_t off = (uint32_t)(pc - b->byte_code_buf);
+    if (off > (uint32_t)b->byte_code_len) return -1;
+    return find_line_num(ctx, b, off, &col);
+}
+
+/* Stack walker accessors. Used by trace.c's emit_state to enumerate
+   live frames + locals when the host requests inspection. */
+JSStackFrame *js_arena_trace_top_frame(JSContext *ctx)
+{
+    return ctx->rt->req->current_stack_frame;
+}
+JSStackFrame *js_arena_trace_prev_frame(JSStackFrame *sf)
+{
+    return sf ? sf->prev_frame : NULL;
+}
+JSFunctionBytecode *js_arena_trace_frame_bytecode(JSStackFrame *sf)
+{
+    if (!sf) return NULL;
+    JSValue cf = sf->cur_func;
+    if (JS_VALUE_GET_TAG(cf) != JS_TAG_OBJECT) return NULL;
+    JSObject *p = JS_VALUE_GET_OBJ(cf);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION) return NULL;
+    return p->u.func.function_bytecode;
+}
+const uint8_t *js_arena_trace_frame_pc(JSStackFrame *sf)
+{
+    return sf ? sf->cur_pc : NULL;
+}
+int js_arena_trace_frame_var_count(JSStackFrame *sf, JSFunctionBytecode *b)
+{
+    (void)sf;
+    if (!b) return 0;
+    return (int)b->arg_count + (int)b->var_count;
+}
+JSAtom js_arena_trace_frame_var_name(JSStackFrame *sf, JSFunctionBytecode *b, int idx)
+{
+    (void)sf;
+    if (!b || !b->vardefs) return JS_ATOM_NULL;
+    if (idx < 0 || idx >= (int)b->arg_count + (int)b->var_count) return JS_ATOM_NULL;
+    return b->vardefs[idx].var_name;
+}
+/* Args live in sf->arg_buf[0..arg_count); locals in sf->var_buf[0..var_count).
+   The vardefs[] array layout is args first (matching arg_buf) then locals
+   (matching var_buf). When `is_captured` is set on a vardef the value
+   actually lives in sf->var_refs[vd->var_ref_idx]->pvalue — that's the
+   case for any local that an inner closure references AND for the
+   module top-level `let`/`const` bindings (because the module body is
+   itself a function and its inner scopes can capture those). */
+JSValueConst js_arena_trace_frame_var_value(JSStackFrame *sf,
+                                            JSFunctionBytecode *b, int idx)
+{
+    if (!sf || !b) return JS_UNDEFINED;
+    int ac = (int)b->arg_count;
+    if (idx < 0) return JS_UNDEFINED;
+    if (b->vardefs && idx < ac + (int)b->var_count) {
+        JSVarDef *vd = &b->vardefs[idx];
+        if (vd->is_captured) {
+            int ri = (int)vd->var_ref_idx;
+            if (ri >= 0 && ri < (int)sf->var_ref_count && sf->var_refs[ri]) {
+                JSValue *pv = sf->var_refs[ri]->pvalue;
+                if (pv) return *pv;
+            }
+            return JS_UNDEFINED;
+        }
+    }
+    if (idx < ac) {
+        if (idx >= (int)sf->arg_count) return JS_UNDEFINED;
+        return sf->arg_buf[idx];
+    }
+    int lidx = idx - ac;
+    if (lidx >= (int)b->var_count) return JS_UNDEFINED;
+    return sf->var_buf[lidx];
+}
+
+/* Closure variables: names this function references from an enclosing
+   scope (the parent function, or further up). At runtime they live at
+   sf->var_refs[0..closure_var_count), one per b->closure_var[i] — the
+   mapping is i:i, set up by js_closure2 when the closure is created.
+
+   This is what makes module-top-level `let`/`const` visible to inner
+   functions: the inner function's closure_var[i] references the
+   outer's captured-local slot, and that slot's value is the module
+   binding's current value. */
+int js_arena_trace_frame_closure_count(JSFunctionBytecode *b)
+{
+    return b ? (int)b->closure_var_count : 0;
+}
+JSAtom js_arena_trace_frame_closure_name(JSFunctionBytecode *b, int idx)
+{
+    if (!b || !b->closure_var) return JS_ATOM_NULL;
+    if (idx < 0 || idx >= (int)b->closure_var_count) return JS_ATOM_NULL;
+    return b->closure_var[idx].var_name;
+}
+JSValueConst js_arena_trace_frame_closure_value(JSStackFrame *sf,
+                                                JSFunctionBytecode *b, int idx)
+{
+    if (!sf || !b) return JS_UNDEFINED;
+    if (idx < 0 || idx >= (int)b->closure_var_count) return JS_UNDEFINED;
+    /* Closure var refs live on the function-object that was called,
+       not on the stack frame's var_refs (which is for capturing
+       THIS frame's locals for inner closures). Same array the
+       dispatch loop reads via `var_refs[idx]` after assigning
+       `var_refs = p->u.func.var_refs` at frame setup. */
+    JSValue cf = sf->cur_func;
+    if (JS_VALUE_GET_TAG(cf) != JS_TAG_OBJECT) return JS_UNDEFINED;
+    JSObject *p = JS_VALUE_GET_OBJ(cf);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION) return JS_UNDEFINED;
+    JSVarRef **refs = p->u.func.var_refs;
+    if (!refs) return JS_UNDEFINED;
+    JSVarRef *vr = refs[idx];
+    if (!vr || !vr->pvalue) return JS_UNDEFINED;
+    return *vr->pvalue;
+}
+#endif
 
 /* in order to avoid executing arbitrary code during the stack trace
    generation, we only look at simple 'name' properties containing a
@@ -18423,6 +18552,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             pc = sf->cur_pc;
             sf->prev_frame = rt->req->current_stack_frame;
             rt->req->current_stack_frame = sf;
+            /* Async/generator resume re-enters JS_CallInternal without
+               going through the normal frame-setup path that fires
+               FUNC_ENTER below; fire it here too so events stay
+               balanced 1:1 with FUNC_EXIT. The user sees a separate
+               ENTER/EXIT pair for each physical suspend/resume cycle —
+               that's accurate to how the engine actually executes. */
+            if (unlikely(arena_trace_mode != ARENA_TRACE_OFF))
+                arena_trace_func_enter(ctx, b);
             if (s->throw_flag)
                 goto exception;
             else
@@ -18497,10 +18634,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         print_func_name(b);
 #endif
 
+    if (unlikely(arena_trace_mode != ARENA_TRACE_OFF))
+        arena_trace_func_enter(ctx, b);
+
  restart:
     for(;;) {
         int call_argc;
         JSValue *call_argv;
+
+        if (unlikely(arena_trace_mode != ARENA_TRACE_OFF)) {
+            /* If a trace hook raised a stop-sentinel (or any other
+               exception fired between opcodes for that matter), unwind
+               immediately rather than continuing to execute user code
+               with a pending exception. Only checked when tracing is
+               on so the non-tracing hot path stays unchanged. */
+            if (JS_HasException(ctx))
+                goto exception;
+            if (arena_trace_mode >= ARENA_TRACE_DRILL)
+                arena_trace_check_line(ctx, b, pc);
+        }
 
         SWITCH(pc) {
         CASE(OP_push_i32):
@@ -19003,6 +19155,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_throw):
+            if (unlikely(arena_trace_mode != ARENA_TRACE_OFF))
+                arena_trace_op_throw(ctx, b, pc, sp[-1]);
             JS_Throw(ctx, *--sp);
             goto exception;
 
@@ -21090,6 +21244,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
     rt->req->current_stack_frame = sf->prev_frame;
+    if (unlikely(arena_trace_mode != ARENA_TRACE_OFF))
+        arena_trace_func_exit(ctx);
     return ret_val;
 }
 

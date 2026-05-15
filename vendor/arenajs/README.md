@@ -8,9 +8,37 @@ cursor write (~9 ns) instead of a memcpy of the whole image.
 ## Snapshot
 
 - Upstream: <https://github.com/anarchodev/arenajs>
-- Branch: `master`
-- Commit: `10b1beb5cf85af2ea8d643d6b6a98660465b9693`
-- License: MIT (see `LICENSE`)
+- Tag:      `v0.1.0` (2026-05-15)
+- Commit:   `9a22a55` (`release: 0.1.0`)
+- License:  MIT (see `LICENSE`)
+
+### v0.1.0 highlights
+
+First tracked version of arenajs's embedder contract. Two engine
+additions land in this bump:
+
+- **⚠ Contract — `arena_run` / `arena_run_module` return-code split.**
+  Previously any failure returned `-1`. Now: `0` success or clean
+  host-requested stop, `-1` JS exception (user error), `-2` request
+  arena exhausted (capacity — result is void). Safe consumer pattern
+  is unchanged (`rc !== 0` still means "didn't complete cleanly");
+  rove-qjs can now distinguish OOM from user-thrown at the boundary
+  if it wants.
+- **`arena_snapshot_here()`** — a reactor export that walks the live
+  stack and ships inspection JSON via `_arena_host_state` WITHOUT
+  raising the stop sentinel. Callable synchronously from a
+  `host_trace` callback. Unlocks variable snapshots during a single
+  replay pass.
+- **`arena_oom_hit/requested/used/limit()`** — query whether the
+  request arena was exhausted and the numbers to act on it.
+
+The WASM-only sources (`qjs-arena-trace.c`,
+`qjs-arena-replay-bindings.c`, `qjs-arena-reactor.c`) live in the
+upstream tree and are compiled into
+`web/replay/_static/qjs_arena_wasm.{js,wasm}` outside rove's
+`build.zig` — they don't ship as part of this vendor list. Updating
+those is a separate step (rebuild in arenajs's tree, copy the
+emscripten output into `web/replay/_static/`).
 
 ## What changed vs upstream quickjs-ng
 
@@ -48,7 +76,12 @@ cursor write (~9 ns) instead of a memcpy of the whole image.
 
 ## Updating
 
-To bump to a newer arenajs commit, fetch the upstream files listed
-in arenajs's README "Migrating from a memcpy-restore vendor"
-section, copy them into this directory, and update the commit SHA
-above.
+To bump to a newer arenajs version: clone the upstream repo, check
+out the desired tag, copy the files listed in arenajs's README
+"Migrating from a memcpy-restore vendor" section into this
+directory, and update the snapshot block above with the new tag +
+commit SHA. Run `zig build` and `zig build test`; if the WASM
+shell needs the bump, also rebuild
+`web/replay/_static/qjs_arena_wasm.{js,wasm}` from the same
+upstream tree (out-of-scope for `build.zig` — emscripten target,
+driven from arenajs's own `Makefile`).

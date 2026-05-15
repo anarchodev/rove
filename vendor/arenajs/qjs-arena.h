@@ -45,6 +45,24 @@ JS_EXTERN bool js_dual_arena_in_request(const JSDualArena *da, const void *ptr);
 JS_EXTERN size_t js_dual_arena_base_used(const JSDualArena *da);
 JS_EXTERN size_t js_dual_arena_request_used(const JSDualArena *da);
 
+/* Request-arena exhaustion record. The bump allocator is the only
+ * component that knows for certain we hit the ceiling — by the time
+ * the resulting OOM propagates, QJS may have mangled it into a bare
+ * `null` exception (it can't allocate the Error object). So we record
+ * the FIRST refused request-mode allocation at the source. Cleared by
+ * js_dual_arena_reset_request, so it is strictly per-request.
+ *
+ * Embedders use this to distinguish "the JS code threw" (user error)
+ * from "we ran out of arena" (capacity — resize / retry / 503) and to
+ * surface an actionable message with real numbers. */
+JS_EXTERN bool js_dual_arena_oom_hit(const JSDualArena *da);
+/* Bytes the refused allocation asked for (0 if no OOM this request). */
+JS_EXTERN size_t js_dual_arena_oom_requested(const JSDualArena *da);
+/* Request-arena bytes in use at the moment of refusal. */
+JS_EXTERN size_t js_dual_arena_oom_used(const JSDualArena *da);
+/* Request-arena total capacity. */
+JS_EXTERN size_t js_dual_arena_oom_limit(const JSDualArena *da);
+
 /* Thread-local list of registered base-arena address ranges. One entry
  * per arena-backed runtime that has been frozen on this thread. Used by
  * the refcount chokepoints (and a few other per-pointer checks) to

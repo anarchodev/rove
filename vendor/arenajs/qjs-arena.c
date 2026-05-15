@@ -18,14 +18,22 @@
 #include "qjs-arena.h"
 
 #include <assert.h>
-#include <execinfo.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__wasm__)
+/* WASM has no signals, no page protection, no backtrace. The thermometer
+   (mprotect+SIGSEGV based) is compiled out entirely; the arena buffer
+   uses aligned_alloc instead of mmap since page alignment was only ever
+   a thermometer requirement. */
+#else
+#include <execinfo.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 #define ARENA_ALIGN          16
 #define ARENA_HEADER_SIZE    16   /* 8B size + 8B pad, keeps payload 16B-aligned */
@@ -44,10 +52,21 @@ typedef enum {
     JS_ARENA_MODE_REQUEST = 1,
 } JSArenaMode;
 
+/* First request-mode allocation refused for lack of arena space.
+   `hit` latches on the FIRST refusal (most informative — later ones
+   are cascade). Cleared every js_dual_arena_reset_request. */
+typedef struct {
+    int    hit;
+    size_t requested;
+    size_t used;
+    size_t limit;
+} JSArenaOOM;
+
 struct JSDualArena {
     JSArena base;
     JSArena request;
     JSArenaMode mode;
+    JSArenaOOM  oom;
 };
 
 /* Per-thread list of registered arena base ranges; see qjs-arena.h. */
@@ -94,6 +113,17 @@ static int arena_init(JSArena *a, size_t capacity)
 {
     if (capacity == 0)
         capacity = ARENA_DEFAULT_SIZE;
+#if defined(__wasm__)
+    /* No mprotect on WASM, so the buffer doesn't need page-aligned starts.
+       Round capacity to ARENA_ALIGN and grab a 16-byte-aligned block. */
+    capacity = (capacity + ARENA_ALIGN - 1) & ~(size_t)(ARENA_ALIGN - 1);
+    if (capacity < ARENA_PREFIX_LEN + ARENA_HEADER_SIZE + ARENA_ALIGN)
+        return -1;
+    void *buf = aligned_alloc(ARENA_ALIGN, capacity);
+    if (!buf)
+        return -1;
+    memset(buf, 0, capacity);
+#else
     /* round capacity up to page size — we use mmap for page-aligned starts
        so the thermometer can mprotect this buffer without affecting any
        neighbouring allocation. */
@@ -108,6 +138,7 @@ static int arena_init(JSArena *a, size_t capacity)
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (buf == MAP_FAILED)
         return -1;
+#endif
     a->buf = buf;
     a->capacity = capacity;
     a->last_alloc_ptr = NULL;
@@ -118,8 +149,13 @@ static int arena_init(JSArena *a, size_t capacity)
 
 static void arena_destroy(JSArena *a)
 {
-    if (a->buf)
+    if (a->buf) {
+#if defined(__wasm__)
+        free(a->buf);
+#else
         munmap(a->buf, a->capacity);
+#endif
+    }
     memset(a, 0, sizeof(*a));
 }
 
@@ -251,6 +287,43 @@ void js_dual_arena_freeze(JSDualArena *da)
 void js_dual_arena_reset_request(JSDualArena *da)
 {
     arena_reset(&da->request);
+    da->oom.hit = 0;
+    da->oom.requested = 0;
+    da->oom.used = 0;
+    da->oom.limit = 0;
+}
+
+/* Latch the first request-mode allocation refusal. Base-mode refusals
+   are a build-the-snapshot problem, not a per-request capacity signal,
+   so they're deliberately not recorded here. */
+static void note_oom(JSDualArena *da, size_t requested)
+{
+    if (da->mode != JS_ARENA_MODE_REQUEST || da->oom.hit)
+        return;
+    da->oom.hit = 1;
+    da->oom.requested = requested;
+    da->oom.used = arena_cursor(&da->request) - ARENA_PREFIX_LEN;
+    da->oom.limit = da->request.capacity - ARENA_PREFIX_LEN;
+}
+
+bool js_dual_arena_oom_hit(const JSDualArena *da)
+{
+    return da->oom.hit != 0;
+}
+
+size_t js_dual_arena_oom_requested(const JSDualArena *da)
+{
+    return da->oom.requested;
+}
+
+size_t js_dual_arena_oom_used(const JSDualArena *da)
+{
+    return da->oom.used;
+}
+
+size_t js_dual_arena_oom_limit(const JSDualArena *da)
+{
+    return da->oom.limit;
 }
 
 bool js_dual_arena_is_frozen(const JSDualArena *da)
@@ -295,12 +368,17 @@ static void *jda_calloc(void *opaque, size_t count, size_t size)
     void *p = arena_alloc(active_arena(opaque), total);
     if (p)
         memset(p, 0, total);
+    else
+        note_oom(opaque, total);
     return p;
 }
 
 static void *jda_malloc(void *opaque, size_t size)
 {
-    return arena_alloc(active_arena(opaque), size);
+    void *p = arena_alloc(active_arena(opaque), size);
+    if (!p)
+        note_oom(opaque, size);
+    return p;
 }
 
 static void jda_free(void *opaque, void *ptr)
@@ -311,7 +389,10 @@ static void jda_free(void *opaque, void *ptr)
 
 static void *jda_realloc(void *opaque, void *ptr, size_t size)
 {
-    return arena_realloc(active_arena(opaque), ptr, size);
+    void *p = arena_realloc(active_arena(opaque), ptr, size);
+    if (!p && size != 0)
+        note_oom(opaque, size);
+    return p;
 }
 
 static size_t jda_usable_size(const void *ptr)
@@ -397,7 +478,14 @@ void JS_ResetRequestArena(JSRuntime *rt)
  * The signal handler is process-singleton (sigaction is process-wide).
  * Two threads frobbing the same arena's counters race; that's an
  * embedder error since arena ownership is per-thread.
+ *
+ * WASM: thermometer is compiled out (no mprotect, no signals). All
+ * public symbols are stubbed at the bottom of the #else block so
+ * embedders still link; thermometer_enable returns -1 on WASM so
+ * callers see "not supported" cleanly.
  */
+
+#if !defined(__wasm__)
 
 struct therm_state {
     const uint8_t *lo;
@@ -736,3 +824,27 @@ size_t js_arena_thermometer_changed_byte_offsets(
     }
     return found;
 }
+
+#else /* defined(__wasm__) — thermometer stubs */
+
+int  js_arena_thermometer_enable(void)                    { return -1; }
+void js_arena_thermometer_disable(void)                   { }
+void js_arena_thermometer_reset(void)                     { }
+int  js_arena_thermometer_enable_range(const uint8_t *lo, const uint8_t *hi)
+                                                          { (void)lo; (void)hi; return -1; }
+void js_arena_thermometer_disable_range(const uint8_t *lo, const uint8_t *hi)
+                                                          { (void)lo; (void)hi; }
+size_t js_arena_thermometer_pages(void)                   { return 0; }
+size_t js_arena_thermometer_writes(void)                  { return 0; }
+size_t js_arena_thermometer_dirty_offsets(size_t *out, size_t cap)
+                                                          { (void)out; (void)cap; return 0; }
+size_t js_arena_thermometer_page_size(void)               { return 0; }
+size_t js_arena_thermometer_changed_bytes(void)           { return 0; }
+size_t js_arena_thermometer_changed_in_page(size_t off)   { (void)off; return 0; }
+size_t js_arena_thermometer_changed_byte_offsets(size_t off, size_t *out, size_t cap)
+                                                          { (void)off; (void)out; (void)cap; return 0; }
+const void *js_arena_thermometer_baseline_at(size_t off)  { (void)off; return NULL; }
+void js_arena_thermometer_trace_range(size_t lo, size_t hi)
+                                                          { (void)lo; (void)hi; }
+
+#endif /* !defined(__wasm__) */
