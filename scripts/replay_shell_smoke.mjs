@@ -474,6 +474,25 @@ async function checkThrowState(ctx) {
     if (nextErrorDisabled === null) ok("next-error button enabled");
     else                            bad("next-error button still disabled despite throw");
 
+    // Variables drawer populated via engine.inspectAt — the throw
+    // happens inside declineCharge, whose top-of-stack frame should
+    // appear in the drawer's section title and produce at least one
+    // kv row (the closure-visible function declarations).
+    try {
+        await popup.waitForFunction(() => {
+            const body = document.querySelector(".vars__body");
+            if (!body) return false;
+            const txt = body.innerText || "";
+            return /declineCharge|processCheckout|<eval>/i.test(txt)
+                && !/loading…/.test(txt);
+        }, { timeout: 5000 });
+        const varsTxt = (await popup.locator(".vars__body").innerText()).replace(/\s+/g, " ").trim();
+        ok("variables drawer populated: " + JSON.stringify(varsTxt.slice(0, 120)));
+    } catch {
+        const varsTxt = await popup.locator(".vars__body").innerText().catch(() => "");
+        bad("variables drawer never populated within 5s: " + JSON.stringify(varsTxt.trim()));
+    }
+
     await popup.screenshot({ path: "/tmp/replay-shell-throw.png" });
     ok("screenshot → /tmp/replay-shell-throw.png");
 

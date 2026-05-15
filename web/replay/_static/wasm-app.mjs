@@ -572,6 +572,7 @@ function setPlayhead(idx) {
     if (clamped === state.playhead) return;
     state.playhead = clamped;
     renderAll();
+    inspectAndRenderVars(clamped);
 }
 
 function jumpStart() { setPlayhead(0); }
@@ -729,11 +730,147 @@ function renderTransport(mat, playhead) {
     if (T.jumpEnd)   T.jumpEnd  .disabled = atEnd;
 }
 
+// ── Variables drawer ─────────────────────────────────────────────────
+//
+// engine.inspectAt(mat, playhead, { cluster: 0 }) re-runs the replay
+// bounded to one event and snapshots the live stack via the v0.1.0
+// `_arena_host_state` reactor. Result shape per frame:
+//
+//   [{ func, file, line, vars: { name: <json>, ... } }, ...]
+//
+// Top-of-stack last. We render the deepest frame's vars by default —
+// that's the "where am I" inspection the user almost always wants.
+// Switching to ancestor frames via the stack-breadcrumb buttons is a
+// follow-up.
+
+const $vars     = document.querySelector(".vars");
+const $varsBody = document.querySelector(".vars__body");
+let inspectSeq = 0;  // serialise rapid stepping; drop stale results
+
+async function inspectAndRenderVars(eventOrdinal) {
+    if (!state.engine || !state.mat) return;
+    const ev = state.mat.events[eventOrdinal];
+    // No frame is alive at FUNC_EXIT (already left) or before the first
+    // FUNC_ENTER. Show an empty-state and skip the engine round-trip.
+    if (!ev || (ev.kind === "FUNC_EXIT" && eventOrdinal === state.mat.events.length - 1)) {
+        renderVariablesEmpty("(no frame alive)");
+        return;
+    }
+    const seq = ++inspectSeq;
+    renderVariablesLoading();
+    let snapshots;
+    try {
+        snapshots = await state.engine.inspectAt(state.mat, eventOrdinal, { cluster: 0 });
+    } catch (err) {
+        if (seq !== inspectSeq) return;
+        renderVariablesEmpty("(inspect failed: " + (err.message || err) + ")");
+        return;
+    }
+    if (seq !== inspectSeq) return;  // stale — newer step fired
+    const snap = snapshots.find(s => s.eventOrdinal === eventOrdinal) || snapshots[0];
+    if (!snap || !snap.frames || snap.frames.length === 0) {
+        renderVariablesEmpty("(no frames)");
+        return;
+    }
+    renderVariablesFrames(snap.frames);
+}
+
+function renderVariablesLoading() {
+    $varsBody.replaceChildren(el("div", {
+        className: "t-meta t-dim",
+        text: "loading…",
+    }));
+}
+
+function renderVariablesEmpty(msg) {
+    $varsBody.replaceChildren(el("div", {
+        className: "t-meta t-dim",
+        text: msg,
+    }));
+}
+
+// Render one frame's vars as a kv block. The snapshot's `frames`
+// array runs top-of-stack first (deepest frame at index 0, root
+// caller at the end) — that's the order qjs-arena-trace.c walks
+// via top_frame() + prev_frame(). The deepest frame is the
+// "current" frame the user is inspecting.
+function renderVariablesFrames(frames) {
+    const top = frames[0];
+    $varsBody.replaceChildren();
+
+    const section = el("div", { className: "vars__section" });
+    section.appendChild(el("span", {
+        className: "t-eyebrow vars__section-title",
+        text: (top.func || "<frame>") + " · " + (top.file || "?") + ":" + (top.line || "?"),
+    }));
+    const kv = el("div", { className: "kv" });
+    const vars = top.vars || {};
+    const names = Object.keys(vars);
+    if (names.length === 0) {
+        kv.appendChild(el("span", {
+            className: "t-meta t-dim",
+            text: "(no locals at this point)",
+            style: { gridColumn: "1 / -1" },
+        }));
+    } else {
+        for (const name of names) {
+            kv.appendChild(el("span", { className: "kv__k", text: name }));
+            kv.appendChild(el("span", {
+                className: "kv__v " + varValueClass(vars[name]),
+                text: formatValue(vars[name]),
+            }));
+        }
+    }
+    section.appendChild(kv);
+    $varsBody.appendChild(section);
+
+    // If there are deeper frames, append a hint row pointing at the
+    // stack breadcrumb. Switching which frame's vars are shown
+    // (clicking a non-current breadcrumb frame) is a follow-up.
+    if (frames.length > 1) {
+        $varsBody.appendChild(el("div", {
+            className: "t-meta t-dim",
+            text: `(${frames.length - 1} ancestor frame${frames.length === 2 ? "" : "s"} above — click in the stack breadcrumb to inspect them, coming next)`,
+            style: { marginTop: "var(--sp-4)" },
+        }));
+    }
+    if ($vars && !$vars.open) $vars.open = true;
+}
+
+// Classify a JSON-decoded var value for color hinting. The snapshot
+// JSON uses bracketed-string placeholders for non-serialisable values
+// (`[undefined]`, `[uninitialized]`, `[function]`, …). Plain strings
+// from the source render as c-read, numbers as c-write — matches the
+// design system's semantic color cues.
+function varValueClass(v) {
+    if (v === null) return "t-dim";
+    const t = typeof v;
+    if (t === "string") {
+        if (v.startsWith("[") && v.endsWith("]")) return "t-dimmer";
+        return "c-read";
+    }
+    if (t === "number" || t === "bigint" || t === "boolean") return "c-write";
+    return "";
+}
+
+function formatValue(v) {
+    if (v === null) return "null";
+    const t = typeof v;
+    if (t === "string") return v;  // includes the [placeholder] forms
+    if (t === "number" || t === "boolean") return String(v);
+    if (t === "object") {
+        if (Array.isArray(v)) return `Array(${v.length})`;
+        return "Object";
+    }
+    return String(v);
+}
+
 // ── App state + entry ────────────────────────────────────────────────
 
 const state = {
     bundle: null,
     mat: null,
+    engine: null,
     playhead: 0,
     currentModule: null,
 };
@@ -832,12 +969,11 @@ async function main() {
     Module.printErr = (s) => { captured.push("[stderr] " + s); origErr?.(s); };
 
     $.sourceState.textContent = "running…";
-    const engine = new CursorEngine(Module);
+    state.engine = new CursorEngine(Module);
     let mat;
     try {
-        mat = await engine.materialise(
+        mat = await state.engine.materialise(
             { entry: { name: entryPath, src: entrySrc }, tapes, module_sources: moduleSources },
-            { targetSnapshots: 0 },  // var snapshots come in phase C
         );
     } catch (err) {
         renderError(new Error("materialise failed: " + err.message));
@@ -852,6 +988,7 @@ async function main() {
     state.playhead = throwIdx >= 0 ? throwIdx : Math.max(0, mat.events.length - 1);
     wireTransport();
     renderAll();
+    inspectAndRenderVars(state.playhead);
 
     $.sourceState.textContent = `completed · ${mat.events.length} event(s)`;
 }
