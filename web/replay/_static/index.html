@@ -119,6 +119,14 @@
 
   </div>
 
+  <!-- Resize handle for the bottom region (transport + variables
+       drawer). Sits at the top edge of the transport so it reads as
+       "drag to make the bottom area bigger." Drags adjust
+       .vars__body height; the transport itself is fixed-size and
+       just rides along. -->
+  <div class="bottom-resize" role="separator" aria-orientation="horizontal"
+       aria-label="Resize bottom region" title="Drag to resize"></div>
+
   <!-- ============================================================
        TRANSPORT BAR
        Scrubber + step controls. Buttons are visual stubs this pass;
@@ -172,8 +180,6 @@
         <span class="t-h3">Variables</span>
       </span>
     </summary>
-    <div class="vars__resize" role="separator" aria-orientation="horizontal"
-         aria-label="Resize variables drawer" title="Drag to resize"></div>
     <div class="vars__body">
       <div class="t-meta t-dim">
         Variables at the current scan record will appear here once

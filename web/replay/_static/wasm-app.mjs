@@ -789,18 +789,18 @@ function renderTransport(mat, playhead) {
 // Switching to ancestor frames via the stack-breadcrumb buttons is a
 // follow-up.
 
-const $vars       = document.querySelector(".vars");
-const $varsBody   = document.querySelector(".vars__body");
-const $varsResize = document.querySelector(".vars__resize");
+const $vars         = document.querySelector(".vars");
+const $varsBody     = document.querySelector(".vars__body");
+const $bottomResize = document.querySelector(".bottom-resize");
 let inspectSeq = 0;  // serialise rapid stepping; drop stale results
 
-// ── Variables drawer resize ──────────────────────────────────────────
+// ── Bottom-region resize ─────────────────────────────────────────────
 //
-// Drag the .vars__resize handle vertically to grow/shrink the drawer
-// body. The body has fixed height + overflow-y: auto, so the rest of
-// the page (including the scrubber the user might be dragging) stays
-// put. Height persists in localStorage so the preference sticks
-// across reloads.
+// The .bottom-resize handle sits in its own row of the page grid,
+// just above the transport bar. Dragging it adjusts the
+// .vars__body height — the transport is fixed and rides along, the
+// 1fr main grid absorbs the change. Height persists in localStorage
+// so the preference sticks across reloads.
 
 const VARS_HEIGHT_STORAGE_KEY = "rewind.replay.varsHeight";
 const VARS_MIN_HEIGHT = 80;
@@ -824,27 +824,27 @@ try {
     }
 } catch { /* localStorage blocked — keep CSS default */ }
 
-if ($varsResize) {
+if ($bottomResize) {
     let dragging = false;
     let startY = 0;
     let startHeight = 0;
 
-    $varsResize.addEventListener("mousedown", (e) => {
+    $bottomResize.addEventListener("mousedown", (e) => {
         dragging = true;
         startY = e.clientY;
         startHeight = $varsBody.getBoundingClientRect().height;
-        $varsResize.classList.add("is-dragging");
+        $bottomResize.classList.add("is-dragging");
         e.preventDefault();
     });
     window.addEventListener("mousemove", (e) => {
         if (!dragging) return;
-        // Drag UP (clientY decreases) grows the drawer.
+        // Drag UP (clientY decreases) grows the bottom region.
         setVarsHeight(startHeight + (startY - e.clientY));
     });
     window.addEventListener("mouseup", () => {
         if (!dragging) return;
         dragging = false;
-        $varsResize.classList.remove("is-dragging");
+        $bottomResize.classList.remove("is-dragging");
     });
 }
 

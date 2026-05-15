@@ -29,9 +29,25 @@
 .replay {
   height: 100vh;
   display: grid;
-  grid-template-rows: 48px 36px 1fr auto auto;
+  /* appbar / stack / main / [resize handle] / transport / vars */
+  grid-template-rows: 48px 36px 1fr 6px auto auto;
   background: var(--base);
   overflow: hidden;
+}
+
+/* Resize handle for the bottom region. Sits as its own row in the
+   page grid, just above the transport bar. Drag adjusts the
+   .vars__body height (the transport is fixed-size and rides
+   along); main-grid 1fr absorbs the change. */
+.bottom-resize {
+  cursor: ns-resize;
+  background: transparent;
+  border-top: var(--border-1);
+  transition: background var(--motion-fast) var(--ease-out);
+}
+.bottom-resize:hover,
+.bottom-resize.is-dragging {
+  background: rgba(203, 166, 247, 0.4);  /* mauve hint */
 }
 
 .replay__appbar { /* inherits .appbar */ }
@@ -595,23 +611,6 @@
   transition: transform var(--motion-fast) var(--ease-out);
 }
 .vars:not([open]) .vars__chev { transform: rotate(-90deg); }
-
-/* Resize handle. Thin horizontal strip between the summary head
-   and the body — drag vertically to grow/shrink the drawer body.
-   The body has overflow scroll, so the drawer never pushes the
-   rest of the page around during a scrub. Height persists in
-   localStorage. */
-.vars__resize {
-  height: 6px;
-  cursor: ns-resize;
-  background: transparent;
-  border-top: var(--border-1);
-  transition: background var(--motion-fast) var(--ease-out);
-}
-.vars__resize:hover,
-.vars__resize.is-dragging {
-  background: rgba(203, 166, 247, 0.4);  /* mauve hint */
-}
 
 .vars__body {
   display: grid;
