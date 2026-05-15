@@ -1,9 +1,9 @@
-// Loop46 replay — WASM-driven path (PLAN §10.12, beta scope).
+// rewind.js replay shell — WASM-driven path.
 //
 // Runs at `replay.{public_suffix}/wasm`. Same opener/postMessage
-// handshake as the existing iframe replay (web/replay/app.js) so the
-// dashboard's Replay button can target either URL — what differs is
-// what we do with the bundle once we have it.
+// handshake as the iframe replay (web/replay/app.js) so the
+// dashboard's Replay button can target either URL — what differs
+// is what we do with the bundle once we have it.
 //
 // Pipeline:
 //   1. Receive `replay:bundle` from the dashboard
@@ -15,26 +15,29 @@
 //      THROW events as the handler runs
 //   5. Boot arenajs-WASM, set trace mode to SCAN, call
 //      arena_run_module(entry, source)
-//   6. Render the captured event stream as a call-tree timeline
+//   6. Render the shell — appbar / modules rail / source viewport /
+//      event stream / scrubber — populated from the bundle + trace.
 //
-// V1 stops here — no scrubbing controls, no source view, no variable
-// panel. The DRILL-mode + host_state (stack-walker) hooks the arenajs
-// runtime already exposes are what those features will hang off in
-// follow-ups; this file just doesn't drive them yet.
+// This pass renders the full mockup chrome but only drives the
+// pieces the current engine supports:
+//   ✓ appbar identity + outcome badge
+//   ✓ modules rail with path-prefix + basename
+//   ✓ source viewport (entry module by default; click a module to
+//     switch); throw lines highlighted
+//   ✓ event stream (function enters + throws)
+//   ✓ scrubber ticks (one per scan event)
+//   ✓ next-error button (jump to next throw)
+//   ✗ stack breadcrumb     — needs host_state stack-walker
+//   ✗ variables drawer     — needs DRILL-mode + host_state
+//   ✗ step buttons / play  — needs the arenajs cursor API
+//   ✗ scrubber drag        — needs cursor API for snap-to-scan
+//
+// The disabled controls are part of the chrome so the contract for
+// future passes is visible. Wiring them up is mechanical once the
+// cursor API lands.
 
 import { buildTapesFromBlobs } from "./rtap.mjs";
 import getArenaJs from "./qjs_arena_wasm.js";
-
-const $status    = document.getElementById("status");
-const $runStatus = document.getElementById("run-status");
-const $meta      = document.getElementById("meta");
-const $output    = document.getElementById("output");
-const $timeline  = document.getElementById("timeline");
-
-function setStatus(el, text, kind) {
-    el.textContent = text;
-    el.className = "status " + (kind || "info");
-}
 
 // ── Trace mode constants ─────────────────────────────────────────────
 const TRACE_OFF   = 0;
@@ -48,25 +51,79 @@ const K_FUNC_EXIT  = 2;
 const K_LINE       = 3;
 const K_THROW      = 4;
 
+// ── DOM refs (lookup once at module load) ────────────────────────────
+const $ = {
+    crumb:           document.getElementById("appbar-crumb"),
+    meta:            document.getElementById("appbar-meta"),
+    stack:           document.getElementById("stack-frames"),
+    nextErrorBtn:    document.getElementById("next-error-btn"),
+    nextErrorLabel:  document.getElementById("next-error-label"),
+    modTree:         document.getElementById("mod-tree"),
+    sourceHeader:    document.getElementById("source-header"),
+    sourceState:     document.getElementById("source-state"),
+    sourceCode:      document.getElementById("source-code"),
+    stream:          document.getElementById("event-stream"),
+    scrubberTicks:   document.getElementById("scrubber-ticks"),
+    scrubberPlayed:  document.getElementById("scrubber-played"),
+    scrubberPlayhead: document.getElementById("scrubber-playhead"),
+    transportTime:   document.getElementById("transport-time"),
+};
+
+// ── Small helpers ────────────────────────────────────────────────────
+
+function el(tag, opts = {}) {
+    const e = document.createElement(tag);
+    if (opts.className) e.className = opts.className;
+    if (opts.text != null) e.textContent = String(opts.text);
+    if (opts.title) e.title = opts.title;
+    if (opts.style) Object.assign(e.style, opts.style);
+    if (opts.attrs) for (const [k, v] of Object.entries(opts.attrs)) e.setAttribute(k, v);
+    return e;
+}
+
+// Split "src/lib/pricing.mjs" → { dir: "src/lib/", base: "pricing.mjs" }
+// "index.mjs" → { dir: "", base: "index.mjs" }
+function splitPath(p) {
+    const i = p.lastIndexOf("/");
+    return i < 0 ? { dir: "", base: p } : { dir: p.slice(0, i + 1), base: p.slice(i + 1) };
+}
+
+// Short content-hash for the modules rail. The bundle doesn't carry
+// per-module hashes today, so derive a stable 4-char fingerprint from
+// the source bytes. Same source → same fingerprint, so duplicate
+// modules dedup visually.
+function shortHash(s) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = (h * 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0").slice(0, 4);
+}
+
+function badgeKindFor(status) {
+    if (status == null) return "";
+    if (status >= 200 && status < 300) return "badge--ok";
+    if (status >= 300 && status < 400) return "badge--info";
+    if (status >= 400 && status < 500) return "badge--warn";
+    return "badge--error";
+}
+
 // ── postMessage handshake ────────────────────────────────────────────
 //
-// Mirrors web/replay/app.js: opener is the dashboard at `app.<suffix>`,
-// we're at `replay.<suffix>`. Origin check derives the expected origin
-// from our own so it works across loop46.me / loop46.localhost / any
-// future suffix.
+// Opener is the dashboard at `app.<suffix>`, we're at `replay.<suffix>`.
+// Origin check derives the expected origin from our own so it works
+// across loop46.me / loop46.localhost / any future suffix.
 function expectedDashboardOrigin() {
     return window.location.origin.replace("://replay.", "://app.");
 }
 
 function awaitBundle() {
     if (!window.opener) {
-        setStatus($status,
-            "error: open this page from the dashboard's Replay button",
-            "error");
-        return Promise.reject(new Error("no opener"));
+        return Promise.reject(new Error(
+            "open this page from the dashboard's Replay button"));
     }
     const expectedOrigin = expectedDashboardOrigin();
-    setStatus($status, "waiting for bundle from dashboard…", "info");
     window.opener.postMessage({ kind: "replay:ready" }, expectedOrigin);
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -85,27 +142,7 @@ function awaitBundle() {
     });
 }
 
-// ── Metadata rendering ───────────────────────────────────────────────
-function renderMeta(bundle) {
-    const r = bundle.request || {};
-    const w = bundle.response || {};
-    $meta.innerHTML = "";
-    const row = (k, v) => {
-        const dt = document.createElement("dt"); dt.textContent = k;
-        const dd = document.createElement("dd"); dd.textContent = v;
-        $meta.appendChild(dt);
-        $meta.appendChild(dd);
-    };
-    row("method", r.method || "?");
-    row("path",   r.path || "?");
-    row("host",   r.host || "?");
-    row("status (original)", String(w.status ?? "?"));
-    row("outcome",           w.outcome || "?");
-    row("deployment",        String(bundle.deployment_id ?? "?"));
-    if (w.exception) row("exception (original)", w.exception);
-}
-
-// ── Trace event collection + decode ──────────────────────────────────
+// ── Trace collector ──────────────────────────────────────────────────
 //
 // Binary layouts (see qjs-arena-trace.c):
 //   NAME       [u32 atom][u16 len][len bytes]
@@ -118,13 +155,11 @@ class TraceCollector {
     constructor(Module) {
         this.Module = Module;
         this.events = [];
-        this.names = new Map();  // atom u32 → string
+        this.names = new Map();
         this.decoder = new TextDecoder();
     }
 
     install() {
-        // Module.host_trace runs synchronously inside arena_run_module.
-        // Return 0 to continue; we never stop in v1.
         this.Module.host_trace = (kind, ptr, len) => {
             this._handle(kind, ptr, len);
             return 0;
@@ -139,7 +174,7 @@ class TraceCollector {
                 const slen = M.HEAPU16[(ptr + 4) >> 1];
                 const s = this.decoder.decode(M.HEAPU8.subarray(ptr + 6, ptr + 6 + slen));
                 this.names.set(atom, s);
-                return;  // NAME is out-of-band, not appended to events
+                return;
             }
             case K_FUNC_ENTER:
                 this.events.push({
@@ -173,92 +208,225 @@ class TraceCollector {
     resolveName(atom) { return this.names.get(atom) || `<atom:${atom}>`; }
 }
 
-// ── Timeline rendering ───────────────────────────────────────────────
-//
-// One <li> per FUNC_ENTER and THROW, indented by the call depth at
-// that moment. FUNC_EXIT is implicit — used only to track depth so
-// the next enter renders at the right indent. Each row carries its
-// event index in a data attribute so future drill-into-state can
-// re-run with stopAtEvent = idx.
+// ── Rendering ────────────────────────────────────────────────────────
 
-function renderTimeline(collector) {
-    $timeline.innerHTML = "";
-    if (collector.events.length === 0) {
-        const li = document.createElement("li");
-        li.className = "timeline-empty";
-        li.textContent = "(no events — try running in DRILL mode for line-level detail)";
-        $timeline.appendChild(li);
-        return;
+// Appbar: tenant crumb + outcome badge + method/path. Tenant is
+// derived from the request host ("acme.foo.com" → "acme"); falls
+// back to the full host when host can't be parsed.
+function renderAppbar(bundle) {
+    const req = bundle.request || {};
+    const res = bundle.response || {};
+
+    const tenant = (req.host || "").split(".")[0] || req.host || "—";
+    const recId = bundle.recording_id || bundle.deployment_id || "—";
+
+    $.crumb.replaceChildren(
+        el("span", { text: tenant }),
+        el("span", { className: "crumb__sep", text: "/" }),
+        el("span", { text: "recordings" }),
+        el("span", { className: "crumb__sep", text: "/" }),
+        el("span", { className: "c-brand t-mono", text: String(recId).slice(0, 14) }),
+    );
+
+    $.meta.replaceChildren();
+    if (res.status != null) {
+        $.meta.appendChild(el("span", {
+            className: "badge " + badgeKindFor(res.status),
+            text: String(res.status),
+        }));
     }
-
-    let depth = 0;
-    let eventIdx = 0;
-    for (const e of collector.events) {
-        eventIdx++;
-        if (e.kind === "exit") { depth--; continue; }
-
-        const li = document.createElement("li");
-        li.dataset.eventIndex = String(eventIdx);
-
-        const idx = document.createElement("span");
-        idx.className = "idx";
-        idx.textContent = String(eventIdx);
-        li.appendChild(idx);
-
-        if (depth > 0) {
-            const nest = document.createElement("span");
-            nest.className = "nest";
-            nest.textContent = "│ ".repeat(depth);
-            li.appendChild(nest);
-        }
-
-        if (e.kind === "enter") {
-            const fn = document.createElement("span");
-            fn.className = "fn";
-            fn.textContent = "▸ " + collector.resolveName(e.name_atom);
-            li.appendChild(fn);
-
-            const loc = document.createElement("span");
-            loc.className = "loc";
-            loc.textContent = collector.resolveName(e.file_atom) + ":" + e.line;
-            li.appendChild(loc);
-
-            depth++;
-        } else if (e.kind === "throw") {
-            li.classList.add("throw");
-            const fn = document.createElement("span");
-            fn.className = "fn";
-            fn.textContent = "⚠ throw";
-            li.appendChild(fn);
-
-            const loc = document.createElement("span");
-            loc.className = "loc";
-            loc.textContent = collector.resolveName(e.file_atom) + ":" + e.line;
-            li.appendChild(loc);
-
-            const msg = document.createElement("span");
-            msg.className = "msg";
-            msg.textContent = e.message || "";
-            li.appendChild(msg);
-        } else if (e.kind === "line") {
-            // DRILL-mode only — not visible in default v1 scan mode,
-            // but render compactly when present so toggling drill is
-            // useful as soon as we expose a control.
-            const fn = document.createElement("span");
-            fn.className = "fn";
-            fn.textContent = "·";
-            li.appendChild(fn);
-            const loc = document.createElement("span");
-            loc.className = "loc";
-            loc.textContent = collector.resolveName(e.file_atom) + ":" + e.line;
-            li.appendChild(loc);
-        }
-
-        $timeline.appendChild(li);
+    if (req.method || req.path) {
+        $.meta.appendChild(el("span", {
+            className: "t-mono",
+            text: `${req.method || "?"} ${req.path || "?"}`,
+        }));
+    }
+    if (res.outcome) {
+        $.meta.appendChild(el("span", { className: "t-mute", text: "·" }));
+        $.meta.appendChild(el("span", { text: res.outcome }));
     }
 }
 
-// ── Entry path resolution ────────────────────────────────────────────
+// Modules rail: one row per bundle module. Path prefix dim, basename
+// bright. Entry path gets is-current. Click switches the source view.
+function renderModulesRail(bundle, currentPath, onSelect) {
+    const modules = bundle.modules || [];
+    $.modTree.replaceChildren();
+    if (modules.length === 0) {
+        $.modTree.appendChild(el("li", {
+            className: "t-meta t-dim",
+            text: "(no modules in bundle)",
+            style: { padding: "var(--sp-2) var(--sp-4)" },
+        }));
+        return;
+    }
+    for (const m of modules) {
+        const li = el("li", {
+            className: "mod-tree__item" + (m.path === currentPath ? " is-current" : ""),
+        });
+        const { dir, base } = splitPath(m.path);
+        const file = el("span", { className: "mod-tree__file t-mono" });
+        if (dir) file.appendChild(el("span", { className: "mod-tree__dir", text: dir }));
+        file.appendChild(document.createTextNode(base));
+        li.appendChild(file);
+        li.appendChild(el("span", {
+            className: "mod-tree__hash t-dimmer t-mono-sm",
+            text: shortHash(m.source || ""),
+            title: "Content fingerprint — same value means byte-identical source",
+        }));
+        li.addEventListener("click", () => onSelect(m.path));
+        $.modTree.appendChild(li);
+    }
+}
+
+// Source viewport: gutter with line numbers + code body. If a
+// highlightLine is given, that line gets is-current styling.
+function renderSourceView(bundle, modulePath, highlightLine) {
+    const mod = (bundle.modules || []).find(m => m.path === modulePath);
+    const src = mod?.source || "";
+
+    const { dir, base } = splitPath(modulePath);
+    $.sourceHeader.replaceChildren();
+    if (dir) $.sourceHeader.appendChild(el("span", { className: "t-dim", text: dir }));
+    $.sourceHeader.appendChild(el("span", { className: "c-info", text: base }));
+    if (highlightLine != null) {
+        $.sourceHeader.appendChild(el("span", { className: "t-dim", text: " · line" }));
+        $.sourceHeader.appendChild(el("span", { className: "c-brand", text: " " + highlightLine }));
+    }
+
+    const lines = src.split("\n");
+    $.sourceCode.replaceChildren();
+    const gutter = el("div", { className: "code__gutter" });
+    const body   = el("div", { className: "code__body" });
+    for (let i = 0; i < lines.length; i++) {
+        const lineNo = i + 1;
+        gutter.appendChild(el("span", { className: "ln", text: String(lineNo) }));
+        const lineSpan = el("span", {
+            className: "line" + (lineNo === highlightLine ? " is-current" : ""),
+            text: lines[i] + "\n",
+        });
+        body.appendChild(lineSpan);
+    }
+    $.sourceCode.appendChild(gutter);
+    $.sourceCode.appendChild(body);
+}
+
+// Event stream: function enters and throws as cards. Function exits
+// are skipped (they're depth-tracking only). Line events are skipped
+// unless we're in DRILL mode (later pass).
+function renderEventStream(collector) {
+    $.stream.replaceChildren();
+    const scanEvents = collector.events.filter(e => e.kind !== "exit" && e.kind !== "line");
+    if (scanEvents.length === 0) {
+        $.stream.appendChild(el("li", {
+            className: "stream__empty t-meta t-dim",
+            text: "(no events captured — handler exited at module load?)",
+        }));
+        return;
+    }
+    let idx = 0;
+    for (const e of scanEvents) {
+        idx++;
+        const li = el("li", { className: "ev ev--past" });
+        const rail = el("div", { className: "ev__rail" });
+        rail.appendChild(el("span", {
+            className: "ev__dot " + (e.kind === "throw" ? "c-error" : "c-info"),
+            attrs: { "aria-hidden": "true" },
+        }));
+        li.appendChild(rail);
+
+        const body = el("div", { className: "ev__body" });
+        const head = el("div", { className: "ev__head" });
+        const kindEl = el("span", {
+            className: "t-mono-sm " + (e.kind === "throw" ? "c-error" : "c-info"),
+            text: e.kind === "throw" ? "throw" : "fn enter",
+        });
+        head.appendChild(kindEl);
+        head.appendChild(el("span", {
+            className: "ev__t t-mono-sm t-dimmer",
+            text: String(idx),
+        }));
+        body.appendChild(head);
+
+        if (e.kind === "enter") {
+            body.appendChild(el("div", {
+                className: "t-mono-sm t-dim",
+                text: collector.resolveName(e.name_atom),
+            }));
+            body.appendChild(el("div", {
+                className: "ev__detail t-mono-sm t-dimmer",
+                text: collector.resolveName(e.file_atom) + ":" + e.line,
+            }));
+        } else if (e.kind === "throw") {
+            body.appendChild(el("div", {
+                className: "t-mono-sm c-error",
+                text: e.message || "(no message)",
+            }));
+            body.appendChild(el("div", {
+                className: "ev__detail t-mono-sm t-dimmer",
+                text: collector.resolveName(e.file_atom) + ":" + e.line,
+            }));
+        }
+        li.appendChild(body);
+        $.stream.appendChild(li);
+    }
+}
+
+// Scrubber ticks: one per scan event, evenly spaced. Throws get the
+// "big tick" treatment. Playhead is hidden in this pass (no
+// stepping yet); the played-portion gradient is also hidden.
+function renderScrubber(collector) {
+    $.scrubberTicks.replaceChildren();
+    const scanEvents = collector.events.filter(e => e.kind !== "exit" && e.kind !== "line");
+    if (scanEvents.length === 0) return;
+
+    const n = scanEvents.length;
+    scanEvents.forEach((e, i) => {
+        const pct = ((i + 0.5) / n) * 100;  // center each tick in its slot
+        const tick = el("span", {
+            className: "scrubber__tick" + (e.kind === "throw" ? " scrubber__tick--big" : ""),
+            style: {
+                left: pct.toFixed(2) + "%",
+                background: e.kind === "throw" ? "var(--c-error)" : "var(--c-info)",
+            },
+            title: `${i + 1} · ${e.kind === "throw" ? "throw" : "fn enter " + collector.resolveName(e.name_atom)}`,
+        });
+        $.scrubberTicks.appendChild(tick);
+    });
+
+    $.transportTime.replaceChildren(
+        el("span", { className: "c-brand", text: "event " + n }),
+        el("span", { className: "t-dim", text: " of " + n }),
+    );
+}
+
+// Next-error: enable if any throws exist; count throws total.
+// Wiring it to actually jump comes with the cursor API; for now
+// the button is decorative-but-honest.
+function renderNextError(collector) {
+    const throws = collector.events.filter(e => e.kind === "throw");
+    if (throws.length === 0) {
+        $.nextErrorBtn.disabled = true;
+        $.nextErrorLabel.textContent = "No throws in this recording";
+        $.nextErrorBtn.title = "No throws in this recording.";
+        return;
+    }
+    $.nextErrorBtn.disabled = false;
+    $.nextErrorLabel.textContent = `Next throw · ${throws.length}`;
+    $.nextErrorBtn.title = `${throws.length} throw(s) in this recording (E)`;
+}
+
+// Surface a load/run error in the appbar meta strip and bail out
+// of the normal render flow.
+function renderError(err) {
+    $.meta.replaceChildren(
+        el("span", { className: "badge badge--error", text: "load error" }),
+        el("span", { className: "t-mono", text: err.message || String(err) }),
+    );
+}
+
+// ── Bundle helpers ───────────────────────────────────────────────────
+
 function resolveEntry(bundle) {
     if (bundle.entry_path) return bundle.entry_path;
     const idx = (bundle.modules || []).find(m => m.path === "index.mjs");
@@ -273,24 +441,40 @@ function buildModuleSources(bundle) {
 }
 
 // ── Driver ───────────────────────────────────────────────────────────
+
 async function main() {
     let bundle;
     try {
         bundle = await awaitBundle();
     } catch (err) {
-        setStatus($status, "error: " + err.message, "error");
+        renderError(err);
         return;
     }
 
-    renderMeta(bundle);
-    setStatus($status, "running handler in arenajs-WASM…", "info");
-    setStatus($runStatus, "booting WASM module…", "info");
+    renderAppbar(bundle);
+
+    let currentModule;
+    try {
+        currentModule = resolveEntry(bundle);
+    } catch (err) {
+        renderError(err);
+        return;
+    }
+    const selectModule = (path) => {
+        currentModule = path;
+        renderModulesRail(bundle, currentModule, selectModule);
+        renderSourceView(bundle, currentModule, null);
+    };
+    renderModulesRail(bundle, currentModule, selectModule);
+    renderSourceView(bundle, currentModule, null);
+
+    $.sourceState.textContent = "booting WASM…";
 
     let Module;
     try {
         Module = await getArenaJs();
     } catch (err) {
-        setStatus($status, "error loading WASM: " + err.message, "error");
+        renderError(new Error("WASM load failed: " + err.message));
         return;
     }
     const arena_init           = Module.cwrap("arena_init",           "number", ["number","number"]);
@@ -299,60 +483,61 @@ async function main() {
     const arena_destroy        = Module.cwrap("arena_destroy",        null,     []);
 
     if (arena_init(8192, 8192) !== 0) {
-        setStatus($status, "error: arena_init failed", "error");
+        renderError(new Error("arena_init failed"));
         return;
     }
 
-    // Capture printf/fprintf so handler logging + exception text are
-    // visible in the Output panel.
     const captured = [];
     const origPrint = Module.print, origErr = Module.printErr;
     Module.print    = (s) => { captured.push(s); origPrint?.(s); };
     Module.printErr = (s) => { captured.push("[stderr] " + s); origErr?.(s); };
 
-    // Install trace collector BEFORE setting tapes / running; the
-    // trace mode is read once at each arena_run_module start.
     const trace = new TraceCollector(Module);
     trace.install();
 
     try {
         Module.tapes = buildTapesFromBlobs(bundle.tape_blobs || {});
     } catch (err) {
-        setStatus($status, "error parsing tape blobs: " + err.message, "error");
+        renderError(new Error("tape parse failed: " + err.message));
         arena_destroy();
         return;
     }
     Module.module_sources = buildModuleSources(bundle);
 
-    let entryPath, entrySrc;
-    try {
-        entryPath = resolveEntry(bundle);
-        entrySrc = Module.module_sources[entryPath];
-        if (!entrySrc) throw new Error("entry source not in bundle modules: " + entryPath);
-    } catch (err) {
-        setStatus($status, "error: " + err.message, "error");
+    const entrySrc = Module.module_sources[currentModule];
+    if (!entrySrc) {
+        renderError(new Error("entry source not in bundle: " + currentModule));
         arena_destroy();
         return;
     }
 
-    setStatus($runStatus, "running " + entryPath + "…", "info");
+    $.sourceState.textContent = "running…";
     arena_set_trace_mode(TRACE_SCAN);
-    const rc = arena_run_module(entryPath, entrySrc);
+    const rc = arena_run_module(currentModule, entrySrc);
     arena_set_trace_mode(TRACE_OFF);
     arena_destroy();
 
-    renderTimeline(trace);
-
-    if (rc === 0) {
-        setStatus($status, "handler completed", "ok");
-        setStatus($runStatus,
-            `ran to completion — ${trace.events.length} trace event(s)`, "ok");
-    } else {
-        setStatus($status, "handler error (see output)", "error");
-        setStatus($runStatus,
-            `exited with rc=${rc} — ${trace.events.length} trace event(s)`, "error");
+    // If any throw was captured, jump the source view to that line.
+    const firstThrow = trace.events.find(e => e.kind === "throw");
+    if (firstThrow) {
+        const throwFile = trace.resolveName(firstThrow.file_atom);
+        // Only swap the source if the throw is in the current module;
+        // otherwise leave the user on their selected file. Future pass
+        // will move the playhead and pull the view along with it.
+        if (throwFile === currentModule) {
+            renderSourceView(bundle, currentModule, firstThrow.line);
+        } else {
+            renderSourceView(bundle, currentModule, null);
+        }
     }
-    $output.textContent = captured.length ? captured.join("\n") : "(no output)";
+
+    renderEventStream(trace);
+    renderScrubber(trace);
+    renderNextError(trace);
+
+    $.sourceState.textContent = rc === 0
+        ? `completed · ${trace.events.length} trace event(s)`
+        : `exited rc=${rc} · ${trace.events.length} trace event(s)`;
 }
 
 main();
