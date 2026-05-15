@@ -609,20 +609,38 @@ function jumpEnd()   { if (state.mat) setPlayhead(state.mat.events.length - 1); 
 function stepLine()  { setPlayhead(state.playhead + 1); }
 function stepBack()  { setPlayhead(state.playhead - 1); }
 
-// step-over: if currently at a FUNC_ENTER, jump past its matching exit
-// (skip the whole subcall). Otherwise advance one event.
+// step-over: advance to the next event in the playhead's OWN frame,
+// skipping over (descending into and emerging from) any nested
+// function calls that happen in between. Stops on whichever comes
+// first: the next LINE / THROW back in the original frame, or the
+// FUNC_EXIT that ends the original frame.
+//
+// Walks events tracking a depth offset (0 at start). FUNC_ENTERs in
+// between drive it positive; FUNC_EXITs bring it back. depth < 0
+// signals "we just exited the original frame" — that's our stop.
+// depth === 0 LINE/THROW means "back in the original frame, this is
+// the next thing that happens here" — also a stop.
 function stepOver() {
     if (!state.mat) return;
     const events = state.mat.events;
-    const cur = events[state.playhead];
-    if (cur?.kind === "FUNC_ENTER") {
-        const exitIdx = state.mat.matchingExit[state.playhead];
-        if (exitIdx > 0) {
-            setPlayhead(exitIdx + 1 <= events.length - 1 ? exitIdx + 1 : exitIdx);
+    const n = events.length;
+    let depth = 0;
+    for (let i = state.playhead + 1; i < n; i++) {
+        const e = events[i];
+        if (e.kind === "FUNC_ENTER") {
+            depth++;
+        } else if (e.kind === "FUNC_EXIT") {
+            depth--;
+            if (depth < 0) {
+                setPlayhead(i);
+                return;
+            }
+        } else if (depth === 0) {
+            setPlayhead(i);
             return;
         }
     }
-    setPlayhead(state.playhead + 1);
+    setPlayhead(n - 1);
 }
 
 // step-in: jump to the next FUNC_ENTER after the playhead.
