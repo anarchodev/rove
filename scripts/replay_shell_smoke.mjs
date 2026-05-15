@@ -1,0 +1,336 @@
+// scripts/replay_shell_smoke.mjs
+//
+// Playwright-driven smoke test for the WASM replay shell at
+// web/replay/wasm.html. Self-contained: spawns its own static HTTP
+// server against web/replay/, drives chromium headless through two
+// paths (no-opener empty state + synthetic-bundle populated state),
+// and tears the server down on exit.
+//
+// Setup (one-time):
+//
+//   mkdir -p ~/.cache/playwright-rove
+//   cd ~/.cache/playwright-rove
+//   npm i playwright
+//   npx playwright install chromium
+//
+// Run from anywhere:
+//
+//   node scripts/replay_shell_smoke.mjs
+//
+// Or with a non-default playwright install location:
+//
+//   PLAYWRIGHT_DIR=/path/to/dir node scripts/replay_shell_smoke.mjs
+//
+// The smoke is independent of the dev cluster — it doesn't touch
+// loop46, files-server, or any Zig binary. It exercises the
+// front-end's rendering paths against synthetic fixtures so we
+// catch chrome / wiring regressions without needing the full
+// cluster bringup. Cluster-integration smokes (driving real
+// recordings end-to-end) belong in a future companion script.
+//
+// Exit code 0 = all checks pass; 1 = one or more failed; 2 = setup
+// missing (playwright not installed).
+
+import { spawn } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { connect } from "node:net";
+
+// ── playwright resolution ─────────────────────────────────────────────
+//
+// ES-module `import()` doesn't consult NODE_PATH, so we try standard
+// resolution first (works if playwright is in a sibling node_modules)
+// then fall back to an absolute-file-URL import from the conventional
+// setup location at ~/.cache/playwright-rove.
+
+const PW_HOME = process.env.PLAYWRIGHT_DIR
+    || resolve(homedir(), ".cache", "playwright-rove");
+
+async function tryImport(spec) {
+    try { return await import(spec); } catch { return null; }
+}
+
+const pw =
+    await tryImport("playwright") ||
+    await tryImport(pathToFileURL(resolve(PW_HOME, "node_modules", "playwright", "index.mjs")).href);
+
+if (!pw) {
+    console.error("playwright is not installed. One-time setup:");
+    console.error("  mkdir -p " + PW_HOME);
+    console.error("  cd " + PW_HOME);
+    console.error("  npm i playwright && npx playwright install chromium");
+    console.error("Then re-run: node " + process.argv[1]);
+    process.exit(2);
+}
+const { chromium } = pw;
+
+// ── Paths + URLs ─────────────────────────────────────────────────────
+const SCRIPT_DIR  = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT   = resolve(SCRIPT_DIR, "..");
+const REPLAY_DIR  = resolve(REPO_ROOT, "web/replay");
+
+const PORT   = Number(process.env.REPLAY_SMOKE_PORT) || 8731;
+const ORIGIN = `http://127.0.0.1:${PORT}`;
+const TARGET = `${ORIGIN}/wasm.html`;
+
+// ── Pass/fail counter shared across checks ───────────────────────────
+let pass = 0, fail = 0;
+const ok  = (m) => { console.log("\x1b[32m✓\x1b[0m " + m); pass++; };
+const bad = (m) => { console.error("\x1b[31m✗\x1b[0m " + m); fail++; };
+
+async function assertSelectors(page, selectors) {
+    for (const sel of selectors) {
+        try {
+            await page.waitForSelector(sel, { timeout: 2000 });
+            ok("selector " + sel);
+        } catch {
+            bad("missing selector " + sel);
+        }
+    }
+}
+
+// ── Static server lifecycle ──────────────────────────────────────────
+async function waitForPort(port, host = "127.0.0.1", timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const ok = await new Promise((res) => {
+            const s = connect({ port, host }, () => { s.end(); res(true); });
+            s.on("error", () => res(false));
+        });
+        if (ok) return;
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error(`port ${port} did not open within ${timeoutMs}ms`);
+}
+
+async function startStaticServer() {
+    const server = spawn(
+        "python3",
+        ["-m", "http.server", String(PORT), "--bind", "127.0.0.1", "--directory", REPLAY_DIR],
+        { stdio: ["ignore", "ignore", "ignore"] },
+    );
+    server.on("exit", (code) => {
+        if (code !== null && code !== 0 && !server.__expectedExit) {
+            console.error(`static server exited unexpectedly (code ${code})`);
+        }
+    });
+    await waitForPort(PORT);
+    return server;
+}
+
+function stopStaticServer(server) {
+    if (!server) return;
+    server.__expectedExit = true;
+    server.kill("SIGTERM");
+}
+
+// ── Synthetic bundle for the populated path ──────────────────────────
+//
+// Shape matches what the dashboard sends in production (see
+// web/replay/app.js for the live producer). Tape blobs are empty;
+// the synthetic handler is pure JS with no kv / fetch / date access
+// so the deterministic re-execution doesn't need captured tapes.
+
+const FIXTURE = {
+    request:        { method: "POST", path: "/api/checkout", host: "acme.app.example.com" },
+    response:       { status: 202, outcome: "ok", exception: null },
+    deployment_id:  "dep_aaae3d8c1f4d",
+    recording_id:   "rec_aaae3d8c1f4d",
+    entry_path:     "src/index.mjs",
+    modules: [
+        {
+            path: "src/index.mjs",
+            source:
+`// Entry handler — inline, no imports (so this smoke doesn't depend
+// on arenajs's relative-import resolver). The other modules in the
+// bundle exist to populate the rail; they don't need to be invoked
+// for the trace stream to have content.
+function processItem(x) { return x * 2; }
+function compute(items, taxRate) {
+  let subtotal = 0;
+  for (const item of items) {
+    subtotal += processItem(item);
+  }
+  return subtotal * (1 + taxRate);
+}
+compute([10, 20, 30], 0.0875);
+`,
+        },
+        {
+            path: "src/lib/processCheckout.mjs",
+            source:
+`export function processCheckout(total, validUser) {
+  if (!validUser) throw new Error("invalid user");
+  return { status: 202, total };
+}
+`,
+        },
+        {
+            path: "src/util/validate.mjs",
+            source:
+`export function isValidEmail(e) {
+  return /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(e);
+}
+`,
+        },
+    ],
+    tape_blobs: {},
+};
+
+// ── Path 1: empty / no-opener ────────────────────────────────────────
+async function checkEmptyState(ctx) {
+    console.log("\n— empty / no-opener path —");
+    const page = await ctx.newPage();
+    page.setViewportSize({ width: 1440, height: 900 });
+    const errors = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+
+    await page.goto(TARGET, { waitUntil: "domcontentloaded" });
+    ok("page reachable");
+
+    await assertSelectors(page, [
+        ".replay",
+        ".appbar__brand",
+        ".brand-mark",
+        ".stack",
+        ".replay__modules .mod-tree",
+        ".replay__source .code",
+        ".stream__list",
+        ".transport__controls .drill-group",
+        ".scrubber__track",
+        ".vars",
+    ]);
+
+    try {
+        await page.waitForSelector("#appbar-meta .badge--error", { timeout: 3000 });
+        ok("error badge surfaced (no-opener case)");
+    } catch {
+        bad("expected #appbar-meta .badge--error within 3s");
+    }
+
+    const total    = await page.locator(".transport__controls button").count();
+    const disabled = await page.locator(".transport__controls button[disabled]").count();
+    if (total > 0 && disabled === total) ok(`all ${total} transport buttons disabled`);
+    else                                 bad(`expected all transport disabled; got ${disabled}/${total}`);
+
+    if (errors.length === 0) ok("no page-level JS errors");
+    else                     bad("page errors: " + errors.join(" | "));
+
+    await page.screenshot({ path: "/tmp/replay-shell-empty.png" });
+    ok("screenshot → /tmp/replay-shell-empty.png");
+    await page.close();
+}
+
+// ── Path 2: populated via fake opener ────────────────────────────────
+//
+// Loads a same-origin "opener" page first (the static server's
+// directory listing at /), installs the bundle handshake handler on
+// it, then window.open()s the replay shell as a popup. The opener
+// responds to replay:ready with the synthetic FIXTURE.
+
+async function checkPopulatedState(ctx) {
+    console.log("\n— populated path / synthetic bundle —");
+
+    const opener = await ctx.newPage();
+    await opener.goto(ORIGIN + "/", { waitUntil: "domcontentloaded" });
+
+    await opener.evaluate((fixture) => {
+        window.__fixture__ = fixture;
+        window.addEventListener("message", (e) => {
+            if (e.data?.kind === "replay:ready") {
+                e.source.postMessage(
+                    { kind: "replay:bundle", bundle: window.__fixture__ },
+                    e.origin,
+                );
+            }
+        });
+    }, FIXTURE);
+
+    const [popup] = await Promise.all([
+        ctx.waitForEvent("page"),
+        opener.evaluate((url) => window.open(url, "replayShell"), TARGET),
+    ]);
+    await popup.setViewportSize({ width: 1440, height: 900 });
+
+    const errors = [];
+    popup.on("pageerror", (e) => errors.push(e.message));
+    await popup.waitForLoadState("domcontentloaded");
+
+    // Source-state goes terminal after the handler runs. Two-wave
+    // render: appbar / modules first (pre-WASM), events / scrubber
+    // after handler exit.
+    try {
+        await popup.waitForFunction(() => {
+            const s = document.getElementById("source-state");
+            return s && /completed|exited/.test(s.textContent || "");
+        }, { timeout: 15_000 });
+        ok("source-state reached terminal");
+    } catch {
+        bad("source-state never reached terminal — handler hung or failed silently");
+    }
+
+    const crumbTxt = (await popup.locator("#appbar-crumb").innerText()).trim();
+    if (crumbTxt.includes("acme") && crumbTxt.includes("rec_"))
+        ok("appbar crumb: " + JSON.stringify(crumbTxt));
+    else
+        bad("appbar crumb missing tenant/rec: " + JSON.stringify(crumbTxt));
+
+    const badgeTxt = (await popup.locator("#appbar-meta .badge").first().innerText()).trim();
+    if (badgeTxt === "202") ok("outcome badge: 202");
+    else                    bad("outcome badge wrong: " + JSON.stringify(badgeTxt));
+
+    const modCount = await popup.locator("#mod-tree .mod-tree__item").count();
+    if (modCount === 3) ok("modules rail has 3 entries");
+    else                bad(`modules rail count: ${modCount} (expected 3)`);
+
+    const currentText = (await popup.locator(".mod-tree__item.is-current").innerText()).trim();
+    if (currentText.includes("index.mjs"))
+        ok("entry module flagged is-current");
+    else
+        bad("entry module not marked is-current: " + JSON.stringify(currentText));
+
+    const headerTxt = (await popup.locator("#source-header").innerText()).trim();
+    if (headerTxt.includes("index.mjs")) ok("source header: " + JSON.stringify(headerTxt));
+    else                                  bad("source header missing entry: " + JSON.stringify(headerTxt));
+
+    const gutterLines = await popup.locator(".code__gutter .ln").count();
+    if (gutterLines >= 10) ok(`source gutter rendered ${gutterLines} lines`);
+    else                   bad(`source gutter only ${gutterLines} lines (expected ≥ 10)`);
+
+    const evCount = await popup.locator("#event-stream .ev").count();
+    if (evCount > 0) ok(`event stream has ${evCount} entries`);
+    else             bad("event stream rendered no entries");
+
+    const tickCount = await popup.locator("#scrubber-ticks .scrubber__tick").count();
+    if (tickCount > 0) ok(`scrubber has ${tickCount} ticks`);
+    else               bad("scrubber has no ticks");
+
+    if (errors.length === 0) ok("no page-level JS errors");
+    else                     bad("page errors: " + errors.join(" | "));
+
+    await popup.screenshot({ path: "/tmp/replay-shell-populated.png" });
+    ok("screenshot → /tmp/replay-shell-populated.png");
+
+    await popup.close();
+    await opener.close();
+}
+
+// ── Main ─────────────────────────────────────────────────────────────
+let server;
+let browser;
+try {
+    server = await startStaticServer();
+    browser = await chromium.launch();
+    const ctx = await browser.newContext();
+    await checkEmptyState(ctx);
+    await checkPopulatedState(ctx);
+} catch (err) {
+    bad("uncaught: " + (err.stack || err.message || err));
+} finally {
+    if (browser) await browser.close();
+    stopStaticServer(server);
+}
+
+console.log(`\n${pass} pass · ${fail} fail`);
+process.exit(fail === 0 ? 0 : 1);
