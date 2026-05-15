@@ -824,6 +824,23 @@ try {
     }
 } catch { /* localStorage blocked — keep CSS default */ }
 
+// Restore + persist the drawer's open/closed state. HTML default is
+// open; the toggle event fires whenever the user clicks the summary
+// to open or close.
+const VARS_OPEN_STORAGE_KEY = "rewind.replay.varsOpen";
+try {
+    const saved = localStorage.getItem(VARS_OPEN_STORAGE_KEY);
+    if (saved === "0") $vars.open = false;
+    else if (saved === "1") $vars.open = true;
+    // null/undefined → leave HTML default (open)
+} catch { /* localStorage blocked — keep HTML default */ }
+if ($vars) {
+    $vars.addEventListener("toggle", () => {
+        try { localStorage.setItem(VARS_OPEN_STORAGE_KEY, $vars.open ? "1" : "0"); }
+        catch { /* fine */ }
+    });
+}
+
 if ($bottomResize) {
     let dragging = false;
     let startY = 0;
@@ -974,7 +991,6 @@ function renderVariablesFrames(frames) {
             style: { marginTop: "var(--sp-4)" },
         }));
     }
-    if ($vars && !$vars.open) $vars.open = true;
 }
 
 // Classify a JSON-decoded var value for color hinting. The snapshot
