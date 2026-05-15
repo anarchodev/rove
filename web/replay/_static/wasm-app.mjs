@@ -267,12 +267,6 @@ function currentSourceForPlayhead(mat, playhead) {
 // consistently for tick positions, the chip, the transport time, and
 // the past/current/future styling on the stream.
 //
-// Also filtered: the leading `<eval>` FUNC_ENTERs that QuickJS emits
-// to wrap module-load code. These produce no LINE events and have no
-// counterpart in the customer's source; they're indistinguishable
-// noise. Once a non-`<eval>` scan event appears we stop filtering, so
-// a customer-invoked `eval(...)` mid-handler still shows up.
-//
 // Returns { items, current }:
 //   items[i] = { event, eventIdx } — i-th visible event in document order
 //   current  = index in items of the most recent visible event at or
@@ -281,26 +275,13 @@ function currentSourceForPlayhead(mat, playhead) {
 function visibleScans(mat, playhead) {
     const items = [];
     let current = -1;
-    let inModuleInit = true;
     for (let i = 0; i < mat.events.length; i++) {
         const e = mat.events[i];
         if (e.kind !== "FUNC_ENTER" && e.kind !== "THROW") continue;
-        if (inModuleInit) {
-            if (e.kind === "FUNC_ENTER" && e.name === "<eval>") continue;
-            inModuleInit = false;
-        }
         if (i <= playhead) current = items.length;
         items.push({ event: e, eventIdx: i });
     }
     return { items, current };
-}
-
-// Lowest eventIdx that's actually visible — the playhead never moves
-// back past this. Returns 0 if there are no visible scans (an entirely
-// module-init recording — vanishingly rare but defined).
-function firstVisibleEventIdx(mat) {
-    const { items } = visibleScans(mat, -1);
-    return items.length > 0 ? items[0].eventIdx : 0;
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
@@ -608,25 +589,15 @@ function setPlayhead(idx) {
     if (!state.mat) return;
     const n = state.mat.events.length;
     if (n === 0) return;
-    let clamped = Math.max(0, Math.min(n - 1, idx));
-    // Don't allow the playhead before the first visible scan — that
-    // region is the module-init wrapper(s) we filter out of the UI;
-    // landing there would show a blank stack and confuse the chip.
-    const lo = firstVisibleEventIdx(state.mat);
-    if (clamped < lo) clamped = lo;
+    const clamped = Math.max(0, Math.min(n - 1, idx));
     if (clamped === state.playhead) return;
     state.playhead = clamped;
     renderAll();
     inspectAndRenderVars(clamped);
 }
 
-function jumpStart() {
-    if (!state.mat) return;
-    setPlayhead(firstVisibleEventIdx(state.mat));
-}
-function jumpEnd() {
-    if (state.mat) setPlayhead(state.mat.events.length - 1);
-}
+function jumpStart() { setPlayhead(0); }
+function jumpEnd()   { if (state.mat) setPlayhead(state.mat.events.length - 1); }
 function stepLine()  { setPlayhead(state.playhead + 1); }
 function stepBack()  { setPlayhead(state.playhead - 1); }
 
