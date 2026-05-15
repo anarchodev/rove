@@ -1,34 +1,24 @@
 # Replay-WASM plan — browser-side scrubbing via arenajs compiled to WebAssembly
 
-The existing replay UI under `web/replay/` boots the captured handler
-in a sandboxed iframe with stubbed Loop46 globals and drops a
-`debugger;` so the user steps through with the browser's own
-DevTools. It works, but it's hostage to whatever JS engine the
-browser ships (V8 / SpiderMonkey / JSCore), and the only navigation
-primitive is "step forward in DevTools" — no scrubbing, no
-keyframes, no custom UI.
+> **2026-05-15 status update.** The iframe-debugger shell described
+> below (`web/replay/_static/app.js` + iframe `index.html`) has been
+> retired. The WASM-driven shell is now the single replay surface,
+> served from `replay.{public_suffix}/` (formerly `/wasm`). The
+> dashboard's two Replay buttons have collapsed into one. Sections
+> below that still talk about "the iframe path" or `/wasm` as a
+> distinct URL describe the pre-cutover state and are kept for
+> historical context — read with that in mind.
 
-This document describes the replacement path: serve a second URL,
-`replay.{public_suffix}/wasm`, which boots **arenajs compiled to
-WebAssembly** and runs the captured handler through the same engine
-that ran it in production. The browser gets a programmable
-execution surface (trace events, stop sentinels, stack-state
-snapshots) and the UI is whatever we render on top — initially a
-call-tree timeline, eventually a full source-level scrubber with
-breakpoints + variable panel.
-
-The arenajs side is feature-complete for v1. The rove side has the
-WASM payload, the wire-format parser, the entry-point HTML, and a
-JS driver that boots the engine and renders a basic timeline.
-Everything beyond that — interactive scrubbing, source view,
-breakpoints, stepping, variable inspection — is unbuilt and is what
-this document plans out.
-
-The existing iframe path at `replay.{public_suffix}/` stays in
-place until the WASM path is feature-complete. They share the same
-`__replay__` tenant, the same opener/postMessage handshake, and the
-same captured-bundle format; nothing about the dashboard's Replay
-button changes for either.
+The replay UI under `web/replay/_static/` boots the captured
+handler through **arenajs compiled to WebAssembly** — the same
+engine that ran the handler in production. The browser gets a
+programmable execution surface (trace events, stop sentinels,
+stack-state snapshots) and the UI is whatever we render on top:
+appbar, modules rail, source viewport with line highlighting,
+event stream, scrubber with event-indexed ticks, stack breadcrumb
+derived from FUNC_ENTER/EXIT events. Everything beyond that —
+interactive scrubbing, full variable inspection, stepping via the
+cursor API — is the next set of milestones.
 
 ---
 

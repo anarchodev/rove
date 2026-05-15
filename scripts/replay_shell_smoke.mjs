@@ -75,7 +75,7 @@ const REPLAY_DIR  = resolve(REPO_ROOT, "web/replay/_static");
 
 const PORT   = Number(process.env.REPLAY_SMOKE_PORT) || 8731;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
-const TARGET = `${ORIGIN}/wasm.html`;
+const TARGET = `${ORIGIN}/`;
 
 // ── Pass/fail counter shared across checks ───────────────────────────
 let pass = 0, fail = 0;

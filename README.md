@@ -39,7 +39,6 @@ zig build install -Doptimize=ReleaseFast   # production binaries under zig-out/b
 # Each smoke spawns its own 3-node cluster + standalones and tears
 # them down via signal handlers / atexit on exit.
 python3 scripts/replay_wasm_smoke.py    # WASM replay path end-to-end
-python3 scripts/replay_smoke.py         # iframe replay path + signup flow
 python3 scripts/files_server_smoke.py   # compile / upload / deploy / fetch
 python3 scripts/ctl_smoke.py            # /_system/* control surface
 python3 scripts/penalty_smoke.py        # CPU-budget penalty box
@@ -92,7 +91,7 @@ vendor/
   kvexp         embedded multi-tenant LMDB-backed KV
 web/
   admin/        dashboard SPA (served by __admin__ tenant)
-  replay/       replay shells (iframe debugger + WASM scrubber)
+  replay/       replay shell (WASM scrubber)
 scripts/        Python smokes + dev cluster bringup
 docs/           PLAN.md (canonical), sub-plans, design briefs
 examples/       loop46-demo-tenants/ + bench drivers + standalones

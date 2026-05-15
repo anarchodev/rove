@@ -1,9 +1,12 @@
-// rewind.js replay shell — WASM-driven path.
+// rewind.js replay shell — WASM-driven.
 //
-// Runs at `replay.{public_suffix}/wasm`. Same opener/postMessage
-// handshake as the iframe replay (web/replay/app.js) so the
-// dashboard's Replay button can target either URL — what differs
-// is what we do with the bundle once we have it.
+// Runs at `replay.{public_suffix}/`. The dashboard's Replay button
+// opens this URL in a popup and posts a `replay:bundle` message
+// once we send back `replay:ready`.
+//
+// The previous iframe-debugger shell (web/replay/_static/app.js +
+// index.html) was retired 2026-05-15 — that file is gone, and the
+// dashboard now opens this shell from the single Replay button.
 //
 // Pipeline:
 //   1. Receive `replay:bundle` from the dashboard

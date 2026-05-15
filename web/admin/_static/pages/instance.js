@@ -210,8 +210,7 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
       <td class="duration">${formatDuration(r.duration_ns)}</td>
       <td class="outcome outcome-${escapeHtml(r.outcome)}">${escapeHtml(r.outcome)}</td>
       <td class="actions">
-        <button type="button" class="row-act replay" title="Replay this request in the iframe debugger (DevTools)">Replay</button>
-        <button type="button" class="row-act replay-wasm" title="Replay this request in the arenajs-WASM scrubber (timeline + variable panel)">⚙</button>
+        <button type="button" class="row-act replay" title="Open this request in the replay shell (scrubber, source view, variables)">Replay</button>
         <button type="button" class="row-act copy-id" title="Copy request ID">⎘</button>
       </td>
     `;
@@ -228,11 +227,7 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
     });
     tr.querySelector(".replay").addEventListener("click", (ev) => {
       ev.stopPropagation();
-      void replayRequest(r.request_id, ev.currentTarget, { wasm: false });
-    });
-    tr.querySelector(".replay-wasm").addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      void replayRequest(r.request_id, ev.currentTarget, { wasm: true });
+      void replayRequest(r.request_id, ev.currentTarget);
     });
     tr.querySelector(".copy-id").addEventListener("click", async (ev) => {
       ev.stopPropagation();
@@ -249,14 +244,14 @@ function renderLogs(root, { instanceId, api, showError, clearError }) {
     return tr;
   }
 
-  async function replayRequest(requestId, btn, opts) {
+  async function replayRequest(requestId, btn) {
     btn.disabled = true;
     const orig = btn.textContent;
     btn.textContent = "…";
     clearError();
     try {
       const bundle = await api.composeReplayBundle(instanceId, requestId);
-      api.replayOpen(bundle, opts);
+      api.replayOpen(bundle);
     } catch (err) {
       showError(`Replay failed: ${err.message}`);
     } finally {

@@ -567,15 +567,9 @@ export const api = {
   /// postMessage. The shell is at `replay.<suffix>` — derived from
   /// the dashboard's own origin by replacing the `app.` label.
   /// Returns the opened window (caller can close it on error).
-  ///
-  /// `opts.wasm` opens `replay.<suffix>/wasm` instead of `/`, which
-  /// boots the arenajs-WASM-backed driver (web/replay/wasm.html +
-  /// wasm-app.mjs) rather than the iframe debugger. Both shells
-  /// consume the same bundle shape; what differs is the rendering.
-  replayOpen(bundle, opts) {
+  replayOpen(bundle) {
     const replayOrigin = window.location.origin.replace("://app.", "://replay.");
-    const path = opts && opts.wasm ? "/wasm" : "/";
-    const popup = window.open(replayOrigin + path, "_blank");
+    const popup = window.open(replayOrigin + "/", "_blank");
     if (!popup) {
       throw new Error("popup blocked — allow popups for the dashboard");
     }

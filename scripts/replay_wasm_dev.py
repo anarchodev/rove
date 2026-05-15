@@ -5,9 +5,8 @@ dashboard has captured records to replay, signs up an admin user
 (prints the magic-link URL), and blocks until Ctrl-C.
 
 Browse to the printed dashboard URL. Click an instance to see the
-replay_demo records, then either:
-  - "Replay" → opens the iframe debugger (DevTools)
-  - "⚙"      → opens the WASM scrubber at replay.<suffix>/wasm
+replay_demo records, click "Replay" on any row to open the WASM
+replay shell (scrubber, source viewport, variables drawer).
 
 Iteration loop:
   1. Edit any file under web/admin/ or web/replay/
@@ -194,9 +193,8 @@ def main() -> int:
             print(f"  signup didn't return a magic link (status={r.status})", flush=True)
             print(f"  visit {admin_origin}/ and sign up by hand", flush=True)
         print("", flush=True)
-        print("  replay shells (opened automatically by the Replay buttons):", flush=True)
-        print(f"    iframe: https://replay.{public_suffix}:{leader_port}/", flush=True)
-        print(f"    wasm:   https://replay.{public_suffix}:{leader_port}/wasm", flush=True)
+        print("  replay shell (opened automatically by the Replay button):", flush=True)
+        print(f"    https://replay.{public_suffix}:{leader_port}/", flush=True)
         print("", flush=True)
         print("  tenant + sample request:", flush=True)
         print(f"    {tenant_origin}/?fn=handler", flush=True)
