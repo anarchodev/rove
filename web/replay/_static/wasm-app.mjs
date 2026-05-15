@@ -865,6 +865,60 @@ if ($bottomResize) {
     });
 }
 
+// ── Events pane width resize ─────────────────────────────────────────
+//
+// Same shape as the bottom-region handle, but horizontal. Drives a
+// CSS custom property on .replay__main so the grid column responds.
+// Persisted under rewind.replay.eventsWidth.
+
+const $eventsResize = document.querySelector(".events-resize");
+const $replayMain   = document.querySelector(".replay__main");
+const EVENTS_WIDTH_STORAGE_KEY = "rewind.replay.eventsWidth";
+const EVENTS_MIN_WIDTH = 200;
+function eventsMaxWidth() { return Math.floor(window.innerWidth * 0.6); }
+
+function setEventsWidth(px, { persist = true } = {}) {
+    if (!$replayMain) return;
+    const clamped = Math.max(EVENTS_MIN_WIDTH, Math.min(eventsMaxWidth(), Math.round(px)));
+    $replayMain.style.setProperty("--events-width", clamped + "px");
+    if (persist) {
+        try { localStorage.setItem(EVENTS_WIDTH_STORAGE_KEY, String(clamped)); }
+        catch { /* fine */ }
+    }
+}
+
+try {
+    const saved = parseInt(localStorage.getItem(EVENTS_WIDTH_STORAGE_KEY) ?? "", 10);
+    if (!Number.isNaN(saved) && saved >= EVENTS_MIN_WIDTH) {
+        setEventsWidth(saved, { persist: false });
+    }
+} catch { /* fine */ }
+
+if ($eventsResize && $replayMain) {
+    let dragging = false;
+    let startX = 0;
+    let startWidth = 0;
+    const $stream = document.querySelector(".stream");
+
+    $eventsResize.addEventListener("mousedown", (e) => {
+        dragging = true;
+        startX = e.clientX;
+        startWidth = $stream.getBoundingClientRect().width;
+        $eventsResize.classList.add("is-dragging");
+        e.preventDefault();
+    });
+    window.addEventListener("mousemove", (e) => {
+        if (!dragging) return;
+        // Drag LEFT (clientX decreases) grows the events column.
+        setEventsWidth(startWidth + (startX - e.clientX));
+    });
+    window.addEventListener("mouseup", () => {
+        if (!dragging) return;
+        dragging = false;
+        $eventsResize.classList.remove("is-dragging");
+    });
+}
+
 // Find the nearest varSnapshot at or before `eventIdx`. Binary search
 // since varSnapshots is sorted by eventOrdinal.
 function nearestVarSnapshot(mat, eventIdx) {

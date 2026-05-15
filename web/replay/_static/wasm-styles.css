@@ -90,10 +90,25 @@
 .cmdk-hint__label { font-size: var(--fs-meta); }
 
 .replay__main {
+  /* events column width is controllable via the .events-resize
+     handle (JS sets --events-width as the user drags). */
+  --events-width: 360px;
   display: grid;
-  grid-template-columns: 240px 1fr 360px;
+  grid-template-columns: 240px 1fr 6px var(--events-width);
   min-height: 0;  /* prevents grid blowing past viewport */
   overflow: hidden;
+}
+
+/* Resize handle between source viewport and events stream. */
+.events-resize {
+  cursor: ew-resize;
+  background: transparent;
+  border-left: var(--border-1);
+  transition: background var(--motion-fast) var(--ease-out);
+}
+.events-resize:hover,
+.events-resize.is-dragging {
+  background: rgba(203, 166, 247, 0.4);  /* mauve hint */
 }
 
 /* ---------- Stack-trace breadcrumb ----------
@@ -641,11 +656,11 @@
    page from breaking when someone resizes. */
 
 @media (max-width: 1280px) {
-  .replay__main { grid-template-columns: 200px 1fr 320px; }
+  .replay__main { grid-template-columns: 200px 1fr 6px var(--events-width); }
   .vars__body   { grid-template-columns: repeat(2, 1fr); gap: var(--sp-6); }
 }
 @media (max-width: 1024px) {
-  .replay__main { grid-template-columns: 1fr 320px; }
+  .replay__main { grid-template-columns: 1fr 6px var(--events-width); }
   .replay__modules { display: none; }
   .vars__body   { grid-template-columns: 1fr; }
 }
