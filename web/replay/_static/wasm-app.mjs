@@ -258,9 +258,30 @@ function currentSourceForPlayhead(mat, playhead) {
     return { file: null, line: null };
 }
 
-// Scan-grain events only — for the event stream + scrubber.
-function scanEventsOf(mat) {
-    return mat.events.filter(e => e.kind !== "FUNC_EXIT" && e.kind !== "LINE");
+// "Visible scan" events — the events we show on the scrubber and as
+// cards in the event stream. cursor.mjs's `scanOrdinal` counts every
+// engine-side scan record (ENTER + EXIT + THROW), but FUNC_EXIT
+// doesn't earn a tick or a card in the UI per the scrub-vs-step rule
+// (function boundaries are walkable but not scrubber-jumpable). So we
+// maintain our own derived index over (ENTER + THROW) and use it
+// consistently for tick positions, the chip, the transport time, and
+// the past/current/future styling on the stream.
+//
+// Returns { items, current }:
+//   items[i] = { event, eventIdx } — i-th visible event in document order
+//   current  = index in items of the most recent visible event at or
+//              before `playhead` (-1 if playhead is before any
+//              visible event)
+function visibleScans(mat, playhead) {
+    const items = [];
+    let current = -1;
+    for (let i = 0; i < mat.events.length; i++) {
+        const e = mat.events[i];
+        if (e.kind !== "FUNC_ENTER" && e.kind !== "THROW") continue;
+        if (i <= playhead) current = items.length;
+        items.push({ event: e, eventIdx: i });
+    }
+    return { items, current };
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
@@ -360,33 +381,31 @@ function renderSourceView(bundle, modulePath, highlightLine) {
     $.sourceCode.appendChild(body);
 }
 
-// Event stream: render scan-grain events as cards, mark past / current
-// / future based on the playhead's scan ordinal.
+// Event stream: render visible-scan events as cards, mark past /
+// current / future based on the playhead's visible index.
 function renderEventStream(mat, playhead) {
     $.stream.replaceChildren();
-    const events = mat.events;
-    if (events.length === 0) {
+    if (mat.events.length === 0) {
         $.stream.appendChild(el("li", {
             className: "stream__empty t-meta t-dim",
             text: "(no events captured — handler exited at module load?)",
         }));
         return;
     }
-    // Map each scan event's idx-in-events to past/current/future.
-    let scanOrd = 0;
-    const playheadEvent = events[playhead];
-    const playheadScanOrd = playheadEvent && playheadEvent.scanOrdinal != null
-        ? playheadEvent.scanOrdinal
-        : -1;
+    const { items, current } = visibleScans(mat, playhead);
+    if (items.length === 0) {
+        $.stream.appendChild(el("li", {
+            className: "stream__empty t-meta t-dim",
+            text: "(no function calls or throws — handler had no observable scan events)",
+        }));
+        return;
+    }
 
-    for (let i = 0; i < events.length; i++) {
-        const e = events[i];
-        if (e.kind === "FUNC_EXIT" || e.kind === "LINE") continue;
-        // FUNC_ENTER + THROW = scan events.
-
-        const cls = (e.scanOrdinal === playheadScanOrd) ? "ev--current"
-                  : (e.scanOrdinal <  playheadScanOrd) ? "ev--past"
-                  :                                      "ev--future";
+    items.forEach((item, i) => {
+        const e = item.event;
+        const cls = i === current ? "ev--current"
+                  : i <  current ? "ev--past"
+                  :                "ev--future";
         const li = el("li", { className: "ev " + cls });
 
         const rail = el("div", { className: "ev__rail" });
@@ -411,7 +430,7 @@ function renderEventStream(mat, playhead) {
         head.appendChild(el("span", {
             className: "ev__t t-mono-sm "
                 + (cls === "ev--current" ? "c-brand" : "t-dimmer"),
-            text: String(e.scanOrdinal + 1),
+            text: String(i + 1),
         }));
         body.appendChild(head);
 
@@ -436,20 +455,20 @@ function renderEventStream(mat, playhead) {
         }
         li.appendChild(body);
         $.stream.appendChild(li);
-        scanOrd++;
-    }
+    });
 }
 
-// Scrubber ticks: one per scan event, evenly spaced. Throws get the
-// big-tick treatment. Playhead chip + played-gradient track the
-// playhead's scan ordinal.
+// Scrubber ticks: one per visible-scan event, evenly spaced. Throws
+// get the big-tick treatment. Chip + played-gradient + transport time
+// all use the same visible-scan index so the displayed number stays
+// consistent ("event 4 of 7" means tick #4 of 7 visible scans).
 function renderScrubber(mat, playhead) {
     $.scrubberTicks.replaceChildren();
-    const scans = scanEventsOf(mat);
-    if (scans.length === 0) return;
+    const { items, current } = visibleScans(mat, playhead);
+    if (items.length === 0) return;
 
-    const n = scans.length;
-    scans.forEach((e, i) => {
+    const n = items.length;
+    items.forEach(({ event: e }, i) => {
         const pct = ((i + 0.5) / n) * 100;
         const tick = el("span", {
             className: "scrubber__tick" + (e.kind === "THROW" ? " scrubber__tick--big" : ""),
@@ -462,18 +481,17 @@ function renderScrubber(mat, playhead) {
         $.scrubberTicks.appendChild(tick);
     });
 
-    const ev = mat.events[playhead];
-    const scanOrd = ev?.scanOrdinal ?? 0;
-    const pct = ((scanOrd + 0.5) / n) * 100;
+    const shown = current < 0 ? 0 : current;
+    const pct = ((shown + 0.5) / n) * 100;
 
     $.scrubberPlayed.style.width = pct.toFixed(2) + "%";
     $.scrubberPlayhead.style.display = "";
     $.scrubberPlayhead.style.left = pct.toFixed(2) + "%";
     const chip = $.scrubberPlayhead.querySelector(".scrubber__playhead-chip");
-    if (chip) chip.textContent = `${scanOrd + 1} / ${n}`;
+    if (chip) chip.textContent = `${shown + 1} / ${n}`;
 
     $.transportTime.replaceChildren(
-        el("span", { className: "c-brand", text: "event " + (scanOrd + 1) }),
+        el("span", { className: "c-brand", text: "event " + (shown + 1) }),
         el("span", { className: "t-dim", text: " of " + n }),
     );
 }
@@ -682,15 +700,16 @@ function wireTransport() {
 
     if ($scrubber) $scrubber.addEventListener("click", (e) => {
         if (!state.mat) return;
-        const scans = scanEventsOf(state.mat);
-        if (scans.length === 0) return;
+        // visibleScans is the same index basis as the rendered ticks +
+        // chip, so a click maps fraction → tick → eventIdx without
+        // going through cursor.mjs's broader scanOrdinalToEventIdx.
+        const { items } = visibleScans(state.mat, -1);
+        if (items.length === 0) return;
         const rect = $scrubber.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const frac = Math.max(0, Math.min(1, x / rect.width));
-        const k = Math.max(0, Math.min(scans.length - 1, Math.floor(frac * scans.length)));
-        // Map the k-th scan event back to its index in mat.events.
-        const eventIdx = state.mat.scanOrdinalToEventIdx[k];
-        if (eventIdx != null) setPlayhead(eventIdx);
+        const k = Math.max(0, Math.min(items.length - 1, Math.floor(frac * items.length)));
+        setPlayhead(items[k].eventIdx);
     });
 
     // Keyboard. Skip when typing in inputs.

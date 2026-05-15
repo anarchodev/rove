@@ -337,19 +337,24 @@ async function checkPopulatedState(ctx) {
     if (stepLineDisabled)  ok("step-line disabled (already at end)");
     else                   bad("step-line enabled at end-of-run — expected disabled");
 
-    // Step-back moves the playhead. Verify the transport time changes.
-    const timeBefore = (await popup.locator("#transport-time").innerText()).trim();
+    // Step-back moves the playhead. Verify via the source header
+    // (which tracks the playhead's current line) rather than the
+    // transport time — the transport time uses visible-scan
+    // granularity (FUNC_ENTER + THROW), so stepping back through an
+    // internal FUNC_EXIT or LINE event leaves it unchanged. The
+    // source line updates on every step.
+    const headerBefore = (await popup.locator("#source-header").innerText()).trim();
     await popup.locator('button[aria-label="Step back"]').click();
     await popup.waitForFunction(
         (prev) => {
-            const t = document.getElementById("transport-time");
-            return t && t.innerText.trim() !== prev;
+            const h = document.getElementById("source-header");
+            return h && h.innerText.trim() !== prev;
         },
-        timeBefore,
+        headerBefore,
         { timeout: 2000 },
     ).then(
-        () => ok("step-back advances the playhead"),
-        () => bad("step-back did not change transport time"),
+        () => ok("step-back advances the playhead (source header changed)"),
+        () => bad("step-back did not change source header: was " + JSON.stringify(headerBefore)),
     );
 
     // Jump-to-start lands on event 1 of N.
