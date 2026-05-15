@@ -363,6 +363,38 @@ async function checkPopulatedState(ctx) {
     if (/^event 1 of \d+$/.test(startTxt)) ok("jump-to-start lands on event 1: " + JSON.stringify(startTxt));
     else                                   bad("jump-to-start unexpected: " + JSON.stringify(startTxt));
 
+    // varSnapshots populated by materialise() and visible to the page.
+    const snapCount = await popup.evaluate(() =>
+        window.__mat_varSnapshots_count__ ?? -1);
+    if (snapCount > 0) ok(`varSnapshots populated: ${snapCount}`);
+    else                bad(`expected varSnapshots from materialise; got ${snapCount}`);
+
+    // Drag the scrubber: mousedown near the left edge, move to the
+    // middle, mouseup. The playhead should land on an event other
+    // than where it started.
+    const headerPreDrag = (await popup.locator("#source-header").innerText()).trim();
+    const scrubberBox = await popup.locator(".scrubber").boundingBox();
+    if (scrubberBox) {
+        const y = scrubberBox.y + scrubberBox.height / 2;
+        await popup.mouse.move(scrubberBox.x + 10, y);
+        await popup.mouse.down();
+        await popup.mouse.move(scrubberBox.x + scrubberBox.width * 0.7, y, { steps: 8 });
+        await popup.mouse.up();
+        await popup.waitForFunction(
+            (prev) => {
+                const h = document.getElementById("source-header");
+                return h && h.innerText.trim() !== prev;
+            },
+            headerPreDrag,
+            { timeout: 2000 },
+        ).then(
+            () => ok("scrubber drag moves the playhead"),
+            () => bad("scrubber drag did not change source header"),
+        );
+    } else {
+        bad("scrubber not measurable");
+    }
+
     // Module-click navigation: clicking a non-current module in the
     // rail should swap the source viewport and move the is-current
     // marker.

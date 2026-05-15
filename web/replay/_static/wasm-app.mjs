@@ -458,25 +458,32 @@ function renderEventStream(mat, playhead) {
     });
 }
 
-// Scrubber ticks: one per visible-scan event, distributed evenly
-// across the track — first tick at 0%, last at 100%. Single-event
-// recordings center the tick at 50%. Throws get the big-tick
-// treatment. Chip + played-gradient + transport time all share the
-// same visible-scan index so "event 4 of 7" means tick #4 of 7.
+// Scrubber rail in EVENT-INDEX space: the rail represents
+// [0, mat.events.length - 1]. Each visible-scan event renders as a
+// tick at its true event-index position, so ticks are irregularly
+// spaced (clusters during tight loops, gaps across function-body
+// runs). The playhead can drag continuously across the rail.
+//
+// The chip + transport time stay in visible-scan grain — the
+// rail-position is "where am I in the recording," the chip is
+// "which named scan event am I past."
+function pctForEventIdx(mat, eventIdx) {
+    const total = mat.events.length;
+    if (total <= 1) return 50;
+    const e = Math.max(0, Math.min(total - 1, eventIdx));
+    return (e / (total - 1)) * 100;
+}
+
 function renderScrubber(mat, playhead) {
     $.scrubberTicks.replaceChildren();
     const { items, current } = visibleScans(mat, playhead);
-    if (items.length === 0) return;
 
-    const n = items.length;
-    const pctFor = (i) => n === 1 ? 50 : (i / (n - 1)) * 100;
-
-    items.forEach(({ event: e }, i) => {
-        const pct = pctFor(i);
+    items.forEach(({ event: e, eventIdx }, i) => {
+        const pct = pctForEventIdx(mat, eventIdx);
         const tick = el("span", {
             className: "scrubber__tick" + (e.kind === "THROW" ? " scrubber__tick--big" : ""),
             style: {
-                left: pct.toFixed(2) + "%",
+                left: pct.toFixed(3) + "%",
                 background: e.kind === "THROW" ? "var(--c-error)" : "var(--c-info)",
             },
             title: `${i + 1} · ${e.kind === "THROW" ? "throw" : "fn enter " + (e.name ?? "")}`,
@@ -484,12 +491,13 @@ function renderScrubber(mat, playhead) {
         $.scrubberTicks.appendChild(tick);
     });
 
-    const shown = current < 0 ? 0 : current;
-    const pct = pctFor(shown);
-
-    $.scrubberPlayed.style.width = pct.toFixed(2) + "%";
+    const pct = pctForEventIdx(mat, playhead);
+    $.scrubberPlayed.style.width = pct.toFixed(3) + "%";
     $.scrubberPlayhead.style.display = "";
-    $.scrubberPlayhead.style.left = pct.toFixed(2) + "%";
+    $.scrubberPlayhead.style.left = pct.toFixed(3) + "%";
+
+    const shown = current < 0 ? 0 : current;
+    const n = items.length || 1;
     const chip = $.scrubberPlayhead.querySelector(".scrubber__playhead-chip");
     if (chip) chip.textContent = `${shown + 1} / ${n}`;
 
@@ -701,24 +709,35 @@ function wireTransport() {
     if (T.jumpEnd)   T.jumpEnd  .addEventListener("click", jumpEnd);
     if ($.nextErrorBtn) $.nextErrorBtn.addEventListener("click", nextError);
 
-    if ($scrubber) $scrubber.addEventListener("click", (e) => {
-        if (!state.mat) return;
-        // visibleScans is the same index basis as the rendered ticks +
-        // chip, so a click maps fraction → tick → eventIdx without
-        // going through cursor.mjs's broader scanOrdinalToEventIdx.
-        // Ticks distribute first-at-0% / last-at-100%, so the inverse
-        // is k = round(frac * (n-1)); clicking the very right edge of
-        // the track snaps to the last tick, the left edge to the first.
-        const { items } = visibleScans(state.mat, -1);
-        if (items.length === 0) return;
-        const rect = $scrubber.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const frac = Math.max(0, Math.min(1, x / rect.width));
-        const n = items.length;
-        const k = n === 1 ? 0
-                          : Math.max(0, Math.min(n - 1, Math.round(frac * (n - 1))));
-        setPlayhead(items[k].eventIdx);
-    });
+    // Scrubber drag — mousedown anywhere on the rail, drag continuously
+    // through event-index space. Each pixel maps to an event index,
+    // not a visible-scan tick. The variables drawer + source viewport
+    // follow live; the playhead chip text (visible-scan grain) ticks
+    // only when crossing a tick.
+    if ($scrubber) {
+        let dragging = false;
+
+        const eventIdxAt = (clientX) => {
+            const rect = $scrubber.getBoundingClientRect();
+            const frac = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+            const total = state.mat.events.length;
+            if (total <= 1) return 0;
+            return Math.round(frac * (total - 1));
+        };
+
+        $scrubber.addEventListener("mousedown", (ev) => {
+            if (!state.mat) return;
+            dragging = true;
+            pause();  // bail out of autoplay so we don't fight the user
+            ev.preventDefault();
+            setPlayhead(eventIdxAt(ev.clientX));
+        });
+        window.addEventListener("mousemove", (ev) => {
+            if (!dragging || !state.mat) return;
+            setPlayhead(eventIdxAt(ev.clientX));
+        });
+        window.addEventListener("mouseup", () => { dragging = false; });
+    }
 
     // Keyboard. Skip when typing in inputs.
     window.addEventListener("keydown", (ev) => {
@@ -774,32 +793,71 @@ const $vars     = document.querySelector(".vars");
 const $varsBody = document.querySelector(".vars__body");
 let inspectSeq = 0;  // serialise rapid stepping; drop stale results
 
+// Find the nearest varSnapshot at or before `eventIdx`. Binary search
+// since varSnapshots is sorted by eventOrdinal.
+function nearestVarSnapshot(mat, eventIdx) {
+    const snaps = mat.varSnapshots;
+    if (!snaps || snaps.length === 0) return null;
+    let lo = 0, hi = snaps.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (snaps[mid].eventOrdinal <= eventIdx) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo > 0 ? snaps[lo - 1] : null;
+}
+
 async function inspectAndRenderVars(eventOrdinal) {
     if (!state.engine || !state.mat) return;
     const ev = state.mat.events[eventOrdinal];
-    // No frame is alive at FUNC_EXIT (already left) or before the first
-    // FUNC_ENTER. Show an empty-state and skip the engine round-trip.
+    // No frame is alive at the trailing FUNC_EXIT. Show an empty-state
+    // and skip the engine round-trip.
     if (!ev || (ev.kind === "FUNC_EXIT" && eventOrdinal === state.mat.events.length - 1)) {
         renderVariablesEmpty("(no frame alive)");
         return;
     }
+
     const seq = ++inspectSeq;
-    renderVariablesLoading();
+
+    // Layer 1: exact hit in the inspectCache (a previous inspectAt
+    // landed on this event). O(1), no round-trip, exact values.
+    const cached = state.mat.inspectCache.get(eventOrdinal);
+    if (cached && cached.frames && cached.frames.length > 0) {
+        renderVariablesFrames(cached.frames);
+        return;
+    }
+
+    // Layer 2: nearest varSnapshot from materialise's pre-computed
+    // pass. With targetSnapshots ≈ rail width, the nearest snapshot
+    // is at most a few events away and renders instantly. If we hit
+    // the exact event, no need to follow up. Otherwise queue an
+    // inspectAt below to refine.
+    const snap = nearestVarSnapshot(state.mat, eventOrdinal);
+    if (snap && snap.frames && snap.frames.length > 0) {
+        renderVariablesFrames(snap.frames);
+        if (snap.eventOrdinal === eventOrdinal) return;  // exact hit
+    } else {
+        renderVariablesLoading();
+    }
+
+    // Layer 3: engine round-trip for the exact answer. Fires async;
+    // result replaces the snapshot render when it lands. Stale calls
+    // (newer step fired) drop via the seq counter.
     let snapshots;
     try {
         snapshots = await state.engine.inspectAt(state.mat, eventOrdinal, { cluster: 0 });
     } catch (err) {
         if (seq !== inspectSeq) return;
-        renderVariablesEmpty("(inspect failed: " + (err.message || err) + ")");
+        if (!snap) renderVariablesEmpty("(inspect failed: " + (err.message || err) + ")");
         return;
     }
-    if (seq !== inspectSeq) return;  // stale — newer step fired
-    const snap = snapshots.find(s => s.eventOrdinal === eventOrdinal) || snapshots[0];
-    if (!snap || !snap.frames || snap.frames.length === 0) {
+    if (seq !== inspectSeq) return;
+    const exact = snapshots.find(s => s.eventOrdinal === eventOrdinal) || snapshots[0];
+    if (exact && exact.frames && exact.frames.length > 0) {
+        renderVariablesFrames(exact.frames);
+    } else if (!snap) {
         renderVariablesEmpty("(no frames)");
-        return;
     }
-    renderVariablesFrames(snap.frames);
 }
 
 function renderVariablesLoading() {
@@ -997,10 +1055,21 @@ async function main() {
 
     $.sourceState.textContent = "running…";
     state.engine = new CursorEngine(Module);
+
+    // Pick varSnapshot density to roughly match the scrubber's pixel
+    // width, so drag-scrubbing has near-snapshot-per-pixel resolution
+    // and the variables drawer can render instantly from
+    // mat.varSnapshots without an inspectAt round-trip mid-drag. Cap
+    // at 800 to bound the pathological deep-stack × many-events case;
+    // small recordings end up with one snapshot per event (cheap).
+    const railWidth = Math.max(200, Math.floor($scrubber?.getBoundingClientRect().width ?? 800));
+    const targetSnapshots = Math.min(railWidth, 800);
+
     let mat;
     try {
         mat = await state.engine.materialise(
             { entry: { name: entryPath, src: entrySrc }, tapes, module_sources: moduleSources },
+            { targetSnapshots },
         );
     } catch (err) {
         renderError(new Error("materialise failed: " + err.message));
@@ -1009,6 +1078,12 @@ async function main() {
     }
 
     state.mat = mat;
+    // Diagnostic hook for the playwright smoke (and anyone poking
+    // around in DevTools): the smoke can assert that varSnapshots
+    // was actually populated by materialise() without us having to
+    // expose `state.mat` itself on window.
+    window.__mat_varSnapshots_count__ = mat.varSnapshots ? mat.varSnapshots.length : 0;
+
     // Park the playhead at the throw if there is one, else at the
     // end. The user can step / scrub from anywhere.
     const throwIdx = mat.events.findIndex(e => e.kind === "THROW");
