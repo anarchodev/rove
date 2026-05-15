@@ -477,18 +477,21 @@ function renderEventStream(mat, playhead) {
     });
 }
 
-// Scrubber ticks: one per visible-scan event, evenly spaced. Throws
-// get the big-tick treatment. Chip + played-gradient + transport time
-// all use the same visible-scan index so the displayed number stays
-// consistent ("event 4 of 7" means tick #4 of 7 visible scans).
+// Scrubber ticks: one per visible-scan event, distributed evenly
+// across the track — first tick at 0%, last at 100%. Single-event
+// recordings center the tick at 50%. Throws get the big-tick
+// treatment. Chip + played-gradient + transport time all share the
+// same visible-scan index so "event 4 of 7" means tick #4 of 7.
 function renderScrubber(mat, playhead) {
     $.scrubberTicks.replaceChildren();
     const { items, current } = visibleScans(mat, playhead);
     if (items.length === 0) return;
 
     const n = items.length;
+    const pctFor = (i) => n === 1 ? 50 : (i / (n - 1)) * 100;
+
     items.forEach(({ event: e }, i) => {
-        const pct = ((i + 0.5) / n) * 100;
+        const pct = pctFor(i);
         const tick = el("span", {
             className: "scrubber__tick" + (e.kind === "THROW" ? " scrubber__tick--big" : ""),
             style: {
@@ -501,7 +504,7 @@ function renderScrubber(mat, playhead) {
     });
 
     const shown = current < 0 ? 0 : current;
-    const pct = ((shown + 0.5) / n) * 100;
+    const pct = pctFor(shown);
 
     $.scrubberPlayed.style.width = pct.toFixed(2) + "%";
     $.scrubberPlayhead.style.display = "";
@@ -732,12 +735,17 @@ function wireTransport() {
         // visibleScans is the same index basis as the rendered ticks +
         // chip, so a click maps fraction → tick → eventIdx without
         // going through cursor.mjs's broader scanOrdinalToEventIdx.
+        // Ticks distribute first-at-0% / last-at-100%, so the inverse
+        // is k = round(frac * (n-1)); clicking the very right edge of
+        // the track snaps to the last tick, the left edge to the first.
         const { items } = visibleScans(state.mat, -1);
         if (items.length === 0) return;
         const rect = $scrubber.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const frac = Math.max(0, Math.min(1, x / rect.width));
-        const k = Math.max(0, Math.min(items.length - 1, Math.floor(frac * items.length)));
+        const n = items.length;
+        const k = n === 1 ? 0
+                          : Math.max(0, Math.min(n - 1, Math.round(frac * (n - 1))));
         setPlayhead(items[k].eventIdx);
     });
 
