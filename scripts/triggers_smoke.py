@@ -22,8 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib import Cluster, curl, expect_status  # noqa: E402
 
 TOKEN = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-PUBLIC_SUFFIX = "loop46.localhost"
-ADMIN_HOST = f"app.{PUBLIC_SUFFIX}"
+PUBLIC_SUFFIX = "rewindjsapp.localhost"
+SYSTEM_SUFFIX = "rewindjscom.localhost"
+ADMIN_HOST = f"app.{SYSTEM_SUFFIX}"
 
 
 TRIGGER_SRC = '''export function beforePut(event) {

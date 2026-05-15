@@ -1,9 +1,28 @@
 # Auth + domain layout plan
 
-**Status:** §5 decisions accepted 2026-05-15 (Phase 0 complete; Phase 1
-unblocked and may start). Not yet reflected in `PLAN.md` §7/§13 or
+**Status:** Phase 0 complete; **Phase 1 landed + smoke-verified
+2026-05-15** (see §6). §5 decisions accepted 2026-05-15. Key-rotation
+design pass added 2026-05-15 (§4.6 — resolves the former §9
+highest-risk item). Phases 2–3 not yet started. Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
 Phases 1–3 land (see §6, §7).
+
+> **2026-05-15 ground-truth corrigendum** (Phase 1 code grounding).
+> Three premises in the original draft were wrong against the
+> codebase and are corrected in §1, §2, §6: (a) there is **no**
+> reserved-label / `__admin__`-blocklist "hack" anywhere —
+> `validateInstanceId` (src/tenant/root.zig:805) only checks charset,
+> and a 2026-05-15 sweep of `src/tenant`, `src/js`, `web/` found only
+> reserved *kv-key* logic (`src/js/reserved.zig`), no tenant-name
+> guard; collision-safety is a *free consequence* of the domain
+> split, nothing to delete; (b)
+> `public_suffix` is a **required CLI flag** with no hardcoded default,
+> so "flipping" it is deployment config, not code; (c) the real Phase
+> 1 code change is **decoupling worker-hosted system surfaces
+> (`__admin__`/`__replay__`/future `__auth__`) from the customer
+> `public_suffix`** — today `replay.{public_suffix}` is hardcoded in
+> bootstrap and `admin_api_domain` defaults to `app.{public_suffix}`,
+> conflating the two domains the split exists to separate.
 
 This sub-plan elaborates the auth and domain-layout shift discussed
 2026-05-15: a two-registrable-domain split, full OIDC shipped as a
@@ -14,10 +33,12 @@ unspecified as to mechanism) and adds a superseding entry candidate
 for `PLAN.md` §7.
 
 The customer-facing product is `rewind.js`; the engine library stays
-`rove`; in-tree identifiers (`loop46` binary, `LOOP46_*` env vars,
-`docs/PLAN.md` text) remain unchanged until the separately-tracked
-rename cutover. This doc uses the in-tree names for code/config and
-`rewind.js` only for customer-facing copy.
+`rove`; in-tree code identifiers (`loop46` binary, `LOOP46_*` env
+vars, `src/loop46/`, `loop46.json`) remain unchanged until the
+separately-tracked rename cutover. Doc prose (including `docs/PLAN.md`)
+has been swept to `rewind.js` + `rewindjs.app`/`rewindjs.com` as of
+2026-05-15; this doc uses the in-tree names only for code/config and
+`rewind.js` for everything else.
 
 ---
 
@@ -60,11 +81,15 @@ for the `PLAN.md` §7 Safari-ITP / third-party-cookie worry — better
 than the bearer-token fallback, because a customer on their own custom
 domain is same-site with their own API.
 
-System surfaces stop being reserved wildcard labels and become custom
-domains on system tenants (`assignDomain("auth.rewindjs.com",
-"__auth__")`, etc.). Consequence: **the reserved-label /
-`__admin__`-blocklist hack is deleted** — namespace collision becomes
-structurally impossible, and the control plane onboards through the
+System surfaces stop being keyed off the customer `public_suffix` and
+become explicit `domain/{host}` entries on system tenants
+(`assignDomain("auth.rewindjs.com", "__auth__")`, etc.). Consequence:
+**namespace collision becomes structurally impossible without any
+blocklist** — there was never a reserved-name guard (a customer can
+register `__admin__` today; it is simply unguarded), and the split
+makes a guard unnecessary because system surfaces resolve via explicit
+map entries on `rewindjs.com` while customers only ever land on the
+`*.rewindjs.app` wildcard. The control plane onboards through the
 exact mechanism a customer uses for `acme.com` (maximum dogfooding;
 you cannot ship a broken custom-domain flow without breaking your own
 control plane).
@@ -83,11 +108,21 @@ thing in the right order:
 "`acme.{suffix}` or `acme.com` — same flow either way." So this layer
 needs **no new routing logic**. What changes is configuration + seeding:
 
-- `public_suffix` flips from `loop46.me` → `rewindjs.app`.
-- System surfaces are seeded as explicit `domain/{host}` entries on
-  system tenants (`__admin__`, a new `__auth__`, plus the existing
-  replay/logs/files/sse surfaces keyed by `*.rewindjs.com` hosts).
-- The reserved-label validation path is removed.
+- `public_suffix` (the **customer** wildcard) is set to `rewindjs.app`
+  at deploy via the existing required `--public-suffix` flag — config,
+  not code.
+- A **separate system domain** is introduced (it must not be the
+  customer `public_suffix`; that conflation is the bug). Worker-hosted
+  system surfaces — `__admin__` (`app.`), `__replay__` (`replay.`),
+  and the future `__auth__` (`auth.`) — are seeded as explicit
+  `domain/{host}` entries under it via `assignDomain`. Today bootstrap
+  hardcodes `replay.{public_suffix}` and `admin_api_domain` defaults
+  to `app.{public_suffix}`; both must derive from the system domain
+  instead. (The files/log/sse standalones are separate binaries with
+  their own listeners — not the worker's `resolveDomain`, out of
+  scope here.)
+- No reserved-label validation path exists or is added — collision
+  safety is the free consequence above.
 
 This is the cheap, high-signal Phase 1 below — fully testable with a
 smoke before any OIDC or cert code exists.
@@ -326,10 +361,8 @@ broken; there is no privileged platform-only auth code path.
   existing `oauth.fromConfig` library already writes
   `state/oauth/...`). For the platform IdP that is `__auth__`'s
   app.db; for a customer IdP it is their own app.db.
-- The subtle part is **per-issuer signing keypair + JWKS published per
-  request host**, with key rotation (publish next key in JWKS before
-  signing with it; retire after max token lifetime). This is the
-  trickiest correctness surface — call it out for review.
+- Key rotation is the trickiest correctness surface — fully designed
+  in **§4.6** (this resolves the §9 highest-risk item).
 
 ### 4.4 Platform dashboards as relying parties
 
@@ -352,6 +385,124 @@ else explicitly deferred. **Decision in §5.**
 | Authorization-code + PKCE | Token revocation endpoint (RFC 7009) |
 | `id_token` + `access_token` + refresh | `userinfo` beyond core claims |
 | HS-not-used: RS256/ES256 asymmetric signing | Front/back-channel logout |
+
+### 4.6 Key rotation (design pass 2026-05-15)
+
+Resolves the §9 highest-risk item. RS256 (§5.2); rotation is library
+code that runs purely-functionally in the owning tenant (platform
+`__auth__` or a customer), so it must work with **no background
+thread**.
+
+**Issuer is one configured host per tenant** — not "every host that
+routes here." The library reads the issuer host from `_config/oidc/...`
+(default: the tenant's primary domain); `iss` is that host, JWKS is
+served only when the request host equals it. This stays §0-compliant
+(the host comes from tenant config, never a *platform* literal) while
+avoiding per-host keyset sprawl, and matches how real IdPs expose a
+single issuer URL.
+
+**Keyset state machine.** One keyset row per issuer in the owning
+tenant's app.db (page-encrypted at rest like all kv — no separate
+secret store; consistent with the §7-rejected write-only-env
+decision). Each key carries a thumbprint `kid` (RFC 7638 JWK
+thumbprint — deterministic, collision-free across regenerations) and
+is in exactly one phase:
+
+| Phase | In JWKS? | Signs? | Min dwell |
+|---|---|---|---|
+| `next` | yes | no | T_publish = JWKS `max-age` + raft apply lag + schedule jitter + skew |
+| `current` | yes | yes (exactly one) | rotation period |
+| `retiring` | yes | no | T_retire = max access-token TTL + skew |
+| `retired` | no | no | — (row deleted) |
+
+JWKS publishes the public half of every `next`/`current`/`retiring`
+key; RPs match by `kid` and never need to know which is `current`.
+
+**Scheduled rotation drives all keyset mutation** (verified against
+`docs/http-send-plan.md` 2026-05-15). One serialized path: a
+self-rescheduling timer using the §10.4-cron / §10.5-order-timeout
+cookbook pattern — `http.send({ handle: "oidc-rot-<issuer>", url:
+"https://<issuer-host>/_oidc/rotate", fire_at_ns: <next deadline>
+})`. The issuer host resolves cluster-local, so apply stamps
+`is_internal` and `dispatchInternalSchedules` runs the rotate handler
+**in-process** at fire time — no outbound HTTP (http.send-plan §3.2).
+The stable `handle` makes re-arming an idempotent overwrite
+(http.send-plan §1.1); arming the next timer rides the rotate
+handler's own writeset and commits atomically with the new keyset in
+one type-7 multi-envelope (http.send-plan §6). Envelope numbering:
+schedule_upsert / schedule_complete are **8/9** per PLAN §10.2
+(http.send-plan §4.2 shows the *pre-migration* 4/5 — use the current
+8/9/10/11).
+
+`advance(keyset, now)` is deadline-gated and reads the keyset fresh,
+so a *sequential* double-fire self-heals: the second fire sees the
+state the first already advanced and the next deadline not yet
+reached, and no-ops. A *concurrent* double-fire does **not** self-heal
+on its own — http.send-plan §7 makes leadership-change double-fire
+explicitly possible for internal-routed rows, and RSA keygen is
+random, so two simultaneous fires would mint two different `K_new`.
+Per §7's mandate for internal-routed handlers, the rotate handler
+gates on the schedule row's `version` counter (§7): it writes a
+`_processed/oidc-rot/<version>` marker **atomically with** the keyset
+write and the next-timer arm (one type-7 multi), and a fire whose
+`version` is already marked is a no-op. This is the §7
+`webhook.loop46.com` idempotency pattern applied verbatim — it is what
+makes "duplicate fire is a no-op" actually true, and what lets a
+long-overdue fire catch up multiple phases at once. Emergency rotation
+(below) is a fresh upsert → fresh `version` → never suppressed by a
+prior marker.
+
+Scheduled-rotation sequence:
+
+1. Generate K_new → `next`. JWKS now serves current + next.
+2. Dwell T_publish. Every well-behaved RP refetches JWKS and learns
+   K_new *before* it is ever used to sign.
+3. Promote: K_old `current`→`retiring`, K_new `next`→`current`.
+   Signing now uses K_new; JWKS still serves K_old.
+4. Dwell T_retire. The longest-lived token signed by K_old at step 3
+   expires.
+5. Retire K_old: drop from JWKS, delete the row.
+
+**Refresh tokens are opaque, kv-stored, never JWTs.** A design rule,
+not an accident: it bounds T_retire by the *access*-token TTL (short)
+instead of the much longer refresh lifetime, and it makes hard
+revocation possible (you cannot revoke a stateless JWT). Access/id
+tokens are RS256 JWTs; refresh tokens are random kv rows validated
+server-side.
+
+**Lazy backstop (read-only).** Keyset/JWKS reads happen on every OIDC
+request anyway. If a request observes a transition deadline already
+passed (schedule lost — shouldn't happen, `schedules.db` is
+raft-replicated, but defense in depth), it does **not** mutate the
+keyset; it idempotently re-arms the rotation schedule to fire now.
+This preserves the single-writer invariant while self-healing a
+dropped schedule and covering cold-start of a long-dormant issuer.
+
+**Genesis.** First request to a fresh issuer: create one `current` key
+(no `next`/`retiring`), serve JWKS, arm the first rotation at
+now + period. Signing immediately with the genesis key is safe — there
+is no prior key and therefore no stale RP cache to contradict.
+
+**Emergency rotation (compromise) — a deliberately different policy.**
+An admin action enqueues an immediate-fire rotate callback that
+(a) generates K_new straight to `current`, (b) moves the compromised
+key directly to `retired` (dropped from JWKS — *not* via `retiring`),
+and (c) bumps a per-issuer `min_iat`: refresh tokens/sessions older
+than now are rejected (possible *only* because refresh tokens are
+opaque). This intentionally accepts that access tokens signed by the
+compromised key stop verifying immediately — brief RP disruption is
+the correct trade vs. letting an attacker keep minting. The normal
+sign-before-publish safety is intentionally skipped; that asymmetry is
+the whole point of a separate emergency path.
+
+**Parameter defaults (all per-issuer configurable, none compiled-in
+constants — §0):** rotation period 90d; JWKS `Cache-Control: max-age`
+10m; T_publish default 24h (tolerates misbehaving RP caches — the
+platform's *own* dashboards are controlled RPs that implement
+unknown-`kid` refetch and can run a far tighter cadence); access/id
+token TTL ≤15m (align with the existing 5-min services-token order of
+magnitude); T_retire = token TTL + 5m skew. Conservative defaults
+ship; operators/customers tune down when their RP population allows.
 
 ---
 
@@ -382,11 +533,30 @@ Phase 3  OIDC build ............................... 3c needs 1 + 2 + 3ab
 Phase 4  Cutover + PLAN/deployment.md docs ....... after 3
 ```
 
-**Phase 1 — two-domain split (cheap, high-signal).** Flip
-`public_suffix` → `rewindjs.app`; seed system surfaces as explicit
-`domain/{host}` entries on system tenants; delete the reserved-label
-hack. Smoke: `foo.rewindjs.app` → tenant `foo`; `app.rewindjs.com` →
-admin tenant; reserved-label path gone. No OIDC, no cert code.
+**Phase 1 — two-domain split (cheap, high-signal).** Introduce the
+system-domain config; decouple `__admin__`/`__replay__`(/future
+`__auth__`) bootstrap seeding + `admin_api_domain` default from the
+customer `public_suffix`; seed them as explicit `domain/{host}`
+entries under the system domain. No reserved-label code (none exists).
+Smoke: with distinct customer + system suffixes, `foo.{customer}` →
+tenant `foo` (wildcard) and `app.{system}` / `replay.{system}` →
+system tenants (explicit map); the two suffixes do not cross-resolve.
+No OIDC, no cert code.
+
+**Landed 2026-05-15.** `--system-suffix` (required, must differ from
+`--public-suffix`); `finalizeCli` enforces both + derives
+`admin_api_domain` = `app.{system_suffix}`; replay bootstrap seeds
+`replay.{system_suffix}`. 4 inline `finalizeCli` tests. Test domains
+mirror prod: `rewindjsapp.localhost` (customer) / `rewindjscom.localhost`
+(system); `loop46.localhost` retired repo-wide in `scripts/`. New
+committed `scripts/gen-dev-cert.sh` (one cert, both wildcard SANs —
+rove-h2 is single-`SSL_CTX` until §3.3). Verified end-to-end:
+`zig build` + 4 cli tests green; `cookie_auth_smoke` (admin on
+`app.rewindjscom.localhost`), `signup_smoke` (customer tenants on
+`rewindjsapp.localhost`), `ctl_smoke` (3-node `/_system/*`) all pass.
+`deployment.md` has no literal worker invocation, so its prose stays
+Phase 4; the actual invocation scripts (`rove-loop46-serve.sh`,
+`systemd/rove-loop46.service`) carry the new required flag.
 
 **Phase 2 — edge/DNS/TLS + in-tree ACME.**
 (a) `*.rewindjs.app` + `*.rewindjs.com` wildcard via existing lego flow
@@ -399,8 +569,10 @@ every per-host `SSL_CTX` built in (c) (§3.5). Off-by-default; gated by
 (c) — the verify config attaches to the same context objects, so doing
 them together is strictly less code motion than sequencing them.
 
-**Phase 3 — OIDC.** (a) discovery + JWKS (smallest; unblocks RP
-testing). (b) authorization-code + PKCE, state in `__auth__` kv.
+**Phase 3 — OIDC.** (a) discovery + JWKS serving `next`/`current`/
+`retiring` (smallest; unblocks RP testing). (b) authorization-code +
+PKCE, state in `__auth__` kv; implements the §4.6 keyset state machine
++ scheduled-rotation callback + opaque refresh tokens.
 (c) wire dashboards as RPs, admin first; retire human-path
 services-token dance. (d) ship as the `oidc.provider(...)` customer
 library. 3a/3b can build concurrently with Phases 1–2; 3c needs Phase
@@ -468,9 +640,15 @@ sub-plan index. Hold until Phases 1–3 land.
 
 ## 9. Open questions
 
-- Key rotation cadence + JWKS publish/retire window (§4.3) — the
-  highest-risk correctness surface; wants its own design pass before
-  Phase 3b.
+- Key rotation: **resolved in §4.6**. Self-scheduling **verified
+  against `docs/http-send-plan.md` 2026-05-15** — it is the §10.4-cron
+  / §10.5-order-timeout cookbook pattern (stable handle +
+  internal-routed self-`url` + future `fire_at_ns`; arm atomic with
+  the keyset writeset per §6). One correctness finding folded into
+  §4.6: "duplicate fire is a no-op" only holds with a §7-style
+  `version`-keyed `_processed` dedupe marker, because a
+  leadership-change concurrent double-fire would otherwise mint two
+  RSA keys. No remaining blocker for Phase 3b.
 - Custom-domain onboarding UX: how the dashboard surfaces "add this
   CNAME → status: verifying → issued" (ties into `PLAN.md` Phase 10
   domain-assignment UI + per-account custom-domain caps).

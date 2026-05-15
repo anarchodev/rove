@@ -21,8 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib import BIN_DIR, Cluster, curl, mint_jwt  # noqa: E402
 
 TOKEN = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-PUBLIC_SUFFIX = "loop46.localhost"
-ADMIN_HOST = f"app.{PUBLIC_SUFFIX}"
+PUBLIC_SUFFIX = "rewindjsapp.localhost"
+SYSTEM_SUFFIX = "rewindjscom.localhost"
+ADMIN_HOST = f"app.{SYSTEM_SUFFIX}"
 ACME_HOST = f"acme.{PUBLIC_SUFFIX}"
 
 

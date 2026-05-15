@@ -322,7 +322,8 @@ for i in 0 1 2; do
         --listen "${RAFT_ADDRS[$i]}" \
         --http "${HTTP_ADDRS[$i]}" \
         --data-dir "${DATA_DIRS[$i]}" \
-        --public-suffix loop46.localhost \
+        --public-suffix rewindjsapp.localhost \
+        --system-suffix rewindjscom.localhost \
         --snapshot-interval-ms "$SNAPSHOT_INTERVAL_MS" \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
@@ -338,7 +339,7 @@ sleep 2
 RESOLVE=()
 for h in "${HTTP_ADDRS[@]}"; do
     p="${h##*:}"
-    RESOLVE+=(--resolve "app.loop46.localhost:${p}:127.0.0.1")
+    RESOLVE+=(--resolve "app.rewindjscom.localhost:${p}:127.0.0.1")
 done
 CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}" --max-time 30)
 # Worker startup walks data_dir and opens every tenant's app.db
@@ -349,7 +350,7 @@ CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}" --max-time 30)
 # above that.
 export LEADER_DISCOVER_TIMEOUT_S=$(( 15 + N_TOTAL / 100 ))
 echo "  leader-discovery timeout: ${LEADER_DISCOVER_TIMEOUT_S}s (scaled for $N_TOTAL tenants)"
-discover_leader "app.loop46.localhost" "$ROOT_TOKEN" || exit 1
+discover_leader "app.rewindjscom.localhost" "$ROOT_TOKEN" || exit 1
 echo "  leader: node $LEADER_IDX at $LEADER_HTTP"
 LEADER_DIR="${DATA_DIRS[$LEADER_IDX]}"
 LEADER_LOG="/tmp/${SMOKE_TAG}-worker-${LEADER_IDX}.out"
@@ -367,7 +368,7 @@ admin_ready=0
 for tries in $(seq 1 60); do
     code=$("${CURL[@]}" --max-time 2 -o /dev/null -w '%{http_code}' \
         -H "Authorization: Bearer $ROOT_TOKEN" \
-        "https://app.loop46.localhost:${LEADER_PORT}/?fn=listInstance" 2>/dev/null || echo 000)
+        "https://app.rewindjscom.localhost:${LEADER_PORT}/?fn=listInstance" 2>/dev/null || echo 000)
     if [[ "$code" == "200" ]]; then
         admin_ready=1
         echo "  __admin__ ready (try=$tries)"
@@ -409,7 +410,7 @@ seq 0 $((N_TOTAL - 1)) | xargs -n1 -P "$WARMUP_PARALLEL" -I{} \
             -H "Authorization: Bearer '"$ROOT_TOKEN"'" \
             -H "Content-Type: application/json" \
             -d "{\"fn\":\"publishRelease\",\"args\":[\"$tid\",1]}" \
-            "https://app.loop46.localhost:'"$LEADER_PORT"'/"
+            "https://app.rewindjscom.localhost:'"$LEADER_PORT"'/"
     ' _ {} 2>/dev/null || true
 t_warmup_end=$(date +%s)
 echo "  warmup done in $((t_warmup_end - t_warmup_start))s"
@@ -456,7 +457,7 @@ seq 0 $((STEADY_PARALLEL - 1)) | xargs -n1 -P "$STEADY_PARALLEL" -I{} \
                 -H "Authorization: Bearer '"$ROOT_TOKEN"'" \
                 -H "Content-Type: application/json" \
                 -d "{\"fn\":\"publishRelease\",\"args\":[\"$tid\",$dep]}" \
-                "https://app.loop46.localhost:${PORT}/" 2>/dev/null || echo 000)
+                "https://app.rewindjscom.localhost:${PORT}/" 2>/dev/null || echo 000)
             if [[ "$code" == "202" ]]; then
                 cnt=$((cnt + 1))
             fi

@@ -41,7 +41,8 @@ HTTP_PORT_BASE="${HTTP_PORT_BASE:-8265}"
 RAFT_PORT_BASE="${RAFT_PORT_BASE:-40365}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
-PUBLIC_SUFFIX="loop46.localhost"
+PUBLIC_SUFFIX="rewindjsapp.localhost"
+SYSTEM_SUFFIX="rewindjscom.localhost"
 ADMIN_HOST="app.${PUBLIC_SUFFIX}"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -109,6 +110,7 @@ for i in 0 1 2; do
         --admin-origin "https://${ADMIN_HOST}:${P}" \
         --admin-api-domain "$ADMIN_HOST" \
         --public-suffix "$PUBLIC_SUFFIX" \
+        --system-suffix "$SYSTEM_SUFFIX" \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
         --workers 4 \
@@ -148,13 +150,13 @@ FILES_ADDR="${FILES_ADDR:-127.0.0.1:8278}"
 spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/${SMOKE_TAG}-cs.out "$ADMIN_ORIGIN" "$ADMIN_ORIGIN" || exit 1
 
 for _ in $(seq 1 30); do
-    code=$("${CURL[@]}" --connect-to "hot.loop46.localhost:${LEADER_PORT}:127.0.0.1:${LEADER_PORT}" \
-        -o /dev/null -w '%{http_code}' "https://hot.loop46.localhost:${LEADER_PORT}/?fn=handler" || echo 000)
+    code=$("${CURL[@]}" --connect-to "hot.rewindjsapp.localhost:${LEADER_PORT}:127.0.0.1:${LEADER_PORT}" \
+        -o /dev/null -w '%{http_code}' "https://hot.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" || echo 000)
     [[ "$code" == "200" ]] && break
     sleep 0.2
 done
-[[ "$code" == "200" ]] || { echo "FAIL: hot.loop46.localhost never returned 200 (got $code)"; exit 1; }
-echo "hot.loop46.localhost ready (HTTP $code)"
+[[ "$code" == "200" ]] || { echo "FAIL: hot.rewindjsapp.localhost never returned 200 (got $code)"; exit 1; }
+echo "hot.rewindjsapp.localhost ready (HTTP $code)"
 
 H2LOAD=(h2load --connect-to "127.0.0.1:${LEADER_PORT}")
 
@@ -166,25 +168,25 @@ echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo " kv contention benchmark with $N_IDLE idle tenants in pool"
 echo " requests=$REQUESTS  clients=$CLIENTS  streams=$STREAMS"
-echo " leader=https://hot.loop46.localhost:${LEADER_PORT} (via 127.0.0.1)"
+echo " leader=https://hot.rewindjsapp.localhost:${LEADER_PORT} (via 127.0.0.1)"
 echo "═══════════════════════════════════════════════════════════════"
 
 echo ""
-echo "── warmup: spread.loop46.localhost 1000-key keyspace ──"
+echo "── warmup: spread.rewindjsapp.localhost 1000-key keyspace ──"
 "${H2LOAD[@]}" -n 5000 -c 20 -m 10 \
-    "https://spread.loop46.localhost:${LEADER_PORT}/?fn=handler" 2>&1 | grep -E "finished|req/s" || true
+    "https://spread.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" 2>&1 | grep -E "finished|req/s" || true
 
 echo ""
-echo "── (1) hot.loop46.localhost — single tenant, single key 'k' ──"
+echo "── (1) hot.rewindjsapp.localhost — single tenant, single key 'k' ──"
 hot_out=$("${H2LOAD[@]}" -n "$REQUESTS" -c "$CLIENTS" -m "$STREAMS" \
-    "https://hot.loop46.localhost:${LEADER_PORT}/?fn=handler" 2>&1)
+    "https://hot.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" 2>&1)
 echo "$hot_out" | grep -E "finished in|req/s|status codes"
 hot_rps=$(echo "$hot_out" | extract_rps)
 
 echo ""
-echo "── (2) spread.loop46.localhost — single tenant, 1000 keys, same payload ──"
+echo "── (2) spread.rewindjsapp.localhost — single tenant, 1000 keys, same payload ──"
 spread_out=$("${H2LOAD[@]}" -n "$REQUESTS" -c "$CLIENTS" -m "$STREAMS" \
-    "https://spread.loop46.localhost:${LEADER_PORT}/?fn=handler" 2>&1)
+    "https://spread.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" 2>&1)
 echo "$spread_out" | grep -E "finished in|req/s|status codes"
 spread_rps=$(echo "$spread_out" | extract_rps)
 
@@ -194,7 +196,7 @@ LOG_DIR=$(mktemp -d -t rove-kv-idle-bench-XXXXXX)
 PID_LIST=()
 for i in $(seq 0 $((TENANTS - 1))); do
     "${H2LOAD[@]}" -n "$REQUESTS" -c "$CLIENTS" -m "$STREAMS" \
-        "https://write${i}.loop46.localhost:${LEADER_PORT}/?fn=handler" \
+        "https://write${i}.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" \
         > "$LOG_DIR/w${i}.log" 2>&1 &
     PID_LIST+=($!)
 done
@@ -205,7 +207,7 @@ for i in $(seq 0 $((TENANTS - 1))); do
     rps_i=${rps%.*}
     [[ -n "$rps_i" ]] || rps_i=0
     shard_total=$((shard_total + rps_i))
-    echo "  write${i}.loop46.localhost: $rps req/s"
+    echo "  write${i}.rewindjsapp.localhost: $rps req/s"
 done
 rm -rf "$LOG_DIR"
 

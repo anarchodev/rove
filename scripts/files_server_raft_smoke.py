@@ -65,7 +65,7 @@ def main() -> int:
             "--listen", http_addrs[i],
             "--tls-cert", str(tls.cert),
             "--tls-key", str(tls.key),
-            "--cors-origin", "https://app.loop46.localhost",
+            "--cors-origin", "https://app.rewindjscom.localhost",
             "--raft-node-id", str(i),
             "--raft-peers", peers_csv,
             "--raft-listen", raft_addrs[i],

@@ -40,7 +40,8 @@ HTTP_PORT_BASE="${HTTP_PORT_BASE:-8285}"
 RAFT_PORT_BASE="${RAFT_PORT_BASE:-40385}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
-PUBLIC_SUFFIX="loop46.localhost"
+PUBLIC_SUFFIX="rewindjsapp.localhost"
+SYSTEM_SUFFIX="rewindjscom.localhost"
 ADMIN_HOST="app.${PUBLIC_SUFFIX}"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -79,6 +80,7 @@ for i in 0 1 2; do
         --admin-origin "https://${ADMIN_HOST}:${P}" \
         --admin-api-domain "$ADMIN_HOST" \
         --public-suffix "$PUBLIC_SUFFIX" \
+        --system-suffix "$SYSTEM_SUFFIX" \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
         --workers "$WORKERS" \

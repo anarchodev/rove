@@ -17,8 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib import Cluster, curl, expect_status  # noqa: E402
 
 TOKEN = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-PUBLIC_SUFFIX = "loop46.localhost"
-API_HOST = f"app.{PUBLIC_SUFFIX}"
+PUBLIC_SUFFIX = "rewindjsapp.localhost"
+SYSTEM_SUFFIX = "rewindjscom.localhost"
+API_HOST = f"app.{SYSTEM_SUFFIX}"
 CUSTOMER_HOST = f"demo.{PUBLIC_SUFFIX}"
 
 

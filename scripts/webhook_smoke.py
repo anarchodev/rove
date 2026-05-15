@@ -23,8 +23,9 @@ from smoke_lib import Cluster, curl, _TRACKED_PROCS  # noqa: E402
 import subprocess  # noqa: E402
 
 TOKEN = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc1"
-PUBLIC_SUFFIX = "loop46.localhost"
-ADMIN_HOST = f"app.{PUBLIC_SUFFIX}"
+PUBLIC_SUFFIX = "rewindjsapp.localhost"
+SYSTEM_SUFFIX = "rewindjscom.localhost"
+ADMIN_HOST = f"app.{SYSTEM_SUFFIX}"
 ACME_HOST = f"acme.{PUBLIC_SUFFIX}"
 ECHO_PORT = 9197
 

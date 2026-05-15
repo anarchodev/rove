@@ -26,8 +26,9 @@ from smoke_lib import (  # noqa: E402
 )
 
 ROOT_TOKEN = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-PUBLIC_SUFFIX = "loop46.localhost"
-ADMIN_HOST = f"app.{PUBLIC_SUFFIX}"
+PUBLIC_SUFFIX = "rewindjsapp.localhost"
+SYSTEM_SUFFIX = "rewindjscom.localhost"
+ADMIN_HOST = f"app.{SYSTEM_SUFFIX}"
 
 
 def main() -> int:
@@ -88,6 +89,7 @@ def main() -> int:
             "--http", http_addrs[i],
             "--data-dir", str(data_dirs[i]),
             "--public-suffix", PUBLIC_SUFFIX,
+            "--system-suffix", SYSTEM_SUFFIX,
             "--tls-cert", str(tls.cert),
             "--tls-key", str(tls.key),
             "--workers", "1",
@@ -219,6 +221,7 @@ def main() -> int:
             "--http", http_addrs[3],
             "--data-dir", str(data_dirs[3]),
             "--public-suffix", PUBLIC_SUFFIX,
+            "--system-suffix", SYSTEM_SUFFIX,
             "--tls-cert", str(tls.cert),
             "--tls-key", str(tls.key),
             "--workers", "1",

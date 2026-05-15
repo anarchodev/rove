@@ -102,8 +102,9 @@ class TlsBundle:
         cacert = d / "ca-root.pem"
         if not cert.exists() or not key.exists():
             sys.exit(
-                f"error: missing TLS at {d}. Run mkcert once to generate "
-                "dev-cert.pem + dev-key.pem."
+                f"error: missing TLS at {d}. Run scripts/gen-dev-cert.sh "
+                "once to generate dev-cert.pem + dev-key.pem + ca-root.pem "
+                "(SANs cover *.rewindjsapp.localhost + *.rewindjscom.localhost)."
             )
         return cls(cert=cert, key=key, cacert=cacert)
 
@@ -259,7 +260,8 @@ class ClusterAddrs:
     http: list[str]
     raft: list[str]
     data_dirs: list[Path]
-    public_suffix: str
+    public_suffix: str   # customer tenant wildcard (rewindjsapp.localhost)
+    system_suffix: str   # system surfaces — admin/replay (rewindjscom.localhost)
     admin_host: str
     files_addr: str
     log_addr: str
@@ -320,14 +322,18 @@ class Cluster:
         raft_base: int,
         files_port: int,
         log_port: int,
-        public_suffix: str = "loop46.localhost",
+        public_suffix: str = "rewindjsapp.localhost",
+        system_suffix: str = "rewindjscom.localhost",
     ) -> ClusterAddrs:
         return ClusterAddrs(
             http=[f"127.0.0.1:{http_base + i}" for i in range(3)],
             raft=[f"127.0.0.1:{raft_base + i}" for i in range(3)],
             data_dirs=[Path(f"/tmp/rove-{tag}-{i}") for i in range(3)],
             public_suffix=public_suffix,
-            admin_host=f"app.{public_suffix}",
+            system_suffix=system_suffix,
+            # Admin is a system surface → derived from system_suffix,
+            # never the customer public_suffix (the two-domain split).
+            admin_host=f"app.{system_suffix}",
             files_addr=f"127.0.0.1:{files_port}",
             log_addr=f"127.0.0.1:{log_port}",
         )
@@ -341,7 +347,8 @@ class Cluster:
         raft_base: int,
         files_port: int = 0,
         log_port: int = 0,
-        public_suffix: str = "loop46.localhost",
+        public_suffix: str = "rewindjsapp.localhost",
+        system_suffix: str = "rewindjscom.localhost",
         workers_per_node: int = 2,
         seed_manifest: Optional[dict | Path] = None,
         seed_extra_args: Optional[list[str]] = None,
@@ -393,6 +400,7 @@ class Cluster:
             files_port=files_port,
             log_port=log_port,
             public_suffix=public_suffix,
+            system_suffix=system_suffix,
         )
         for d in addrs.data_dirs:
             if d.exists():
@@ -468,6 +476,7 @@ class Cluster:
                 "--http", listen_addr(addrs.http[i]),
                 "--data-dir", str(addrs.data_dirs[i]),
                 "--public-suffix", public_suffix,
+                "--system-suffix", system_suffix,
                 "--tls-cert", str(tls.cert),
                 "--tls-key", str(tls.key),
                 "--workers", str(workers_per_node),
@@ -537,6 +546,7 @@ class Cluster:
                 "--http", self.addrs.http[idx],
                 "--data-dir", str(self.addrs.data_dirs[idx]),
                 "--public-suffix", self.addrs.public_suffix,
+                "--system-suffix", self.addrs.system_suffix,
                 "--tls-cert", str(self.tls.cert),
                 "--tls-key", str(self.tls.key),
                 "--workers", "1",

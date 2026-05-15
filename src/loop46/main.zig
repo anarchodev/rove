@@ -864,8 +864,13 @@ fn bootstrapTenants(
 
     try tenant.createInstance("__admin__");
     try tenant.createInstance(tenant_mod.REPLAY_INSTANCE_ID);
-    if (cli.public_suffix) |ps| {
-        const replay_host = try std.fmt.allocPrint(allocator, "replay.{s}", .{ps});
+    // Replay is a system surface — it resolves on the system domain,
+    // never the customer public_suffix. Admin needs no explicit entry
+    // here: it routes via admin_api_domain (also system-derived, see
+    // cli.finalizeCli). system_suffix is required+distinct by
+    // finalizeCli, so the unwrap is guaranteed.
+    if (cli.system_suffix) |ss| {
+        const replay_host = try std.fmt.allocPrint(allocator, "replay.{s}", .{ss});
         defer allocator.free(replay_host);
         tenant.assignDomain(replay_host, tenant_mod.REPLAY_INSTANCE_ID) catch |err| {
             failExit(

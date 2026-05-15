@@ -31,9 +31,11 @@
 #      DATA_DIR=%h/.rove/data
 #      TLS_CERT=%h/.rove/tls/cert.pem
 #      TLS_KEY=%h/.rove/tls/key.pem
-#      PUBLIC_SUFFIX=loop46.me
-#      ADMIN_API_DOMAIN=app.loop46.me
-#      ADMIN_ORIGIN=https://app.loop46.me
+#      PUBLIC_SUFFIX=rewindjs.app          (customer wildcard)
+#      SYSTEM_SUFFIX=rewindjs.com          (system surfaces; MUST
+#                                            differ from PUBLIC_SUFFIX)
+#      ADMIN_API_DOMAIN=app.rewindjs.com   (admin = system surface)
+#      ADMIN_ORIGIN=https://app.rewindjs.com
 #      FILES_PUBLIC_BASE=https://files.loop46.me:8444
 #      LOG_PUBLIC_BASE=https://logs.loop46.me:8445
 #      SSE_PUBLIC_BASE=https://sse.loop46.me:8446
@@ -70,6 +72,7 @@ ExecStart=%h/.local/bin/loop46 worker \
     --tls-cert ${TLS_CERT} \
     --tls-key ${TLS_KEY} \
     --public-suffix ${PUBLIC_SUFFIX} \
+    --system-suffix ${SYSTEM_SUFFIX} \
     --admin-api-domain ${ADMIN_API_DOMAIN} \
     --admin-origin ${ADMIN_ORIGIN} \
     --files-public-base ${FILES_PUBLIC_BASE} \

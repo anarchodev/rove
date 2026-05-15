@@ -41,9 +41,10 @@ pub const Cli = struct {
     /// UI must be served same-origin or go through a proxy.
     admin_origin: ?[]const u8 = null,
     /// Hostname of the admin API + dashboard. Auto-derived to
-    /// `app.{public_suffix}` when only `--public-suffix` is passed
-    /// (the common case); this flag is the escape hatch for serving
-    /// admin on a non-`app.` host.
+    /// `app.{system_suffix}` (admin is a system surface, so it lives
+    /// on the system domain, never the customer `public_suffix`);
+    /// this flag is the escape hatch for serving admin on a non-`app.`
+    /// host.
     ///
     /// When set, any request whose Host matches `admin_api_domain`
     /// runs the `__admin__` tenant's handler. `kv` defaults to
@@ -52,14 +53,22 @@ pub const Cli = struct {
     /// Requires a root bearer token (or session cookie minted via
     /// `/v1/login`).
     admin_api_domain: ?[]const u8 = null,
-    /// Wildcard customer-app suffix. Enables `{id}.{public_suffix}` →
-    /// instance `{id}` resolution without needing `assignDomain` per
-    /// tenant. Explicit domain aliases still win.
-    ///
-    /// Also drives the default `admin_api_domain` (`app.{public_suffix}`).
-    /// Example: `--public-suffix loop46.me` →
-    /// admin at `app.loop46.me`, customers at `{id}.loop46.me`.
+    /// Wildcard **customer**-app suffix. Enables
+    /// `{id}.{public_suffix}` → instance `{id}` resolution without
+    /// needing `assignDomain` per tenant. Explicit domain aliases
+    /// still win. Customer traffic only — system surfaces live on
+    /// `--system-suffix`, a *different* registrable domain (the
+    /// security-isolation boundary; see docs/auth-domain-plan.md §1).
+    /// Example: `--public-suffix rewindjs.app` → customers at
+    /// `{id}.rewindjs.app`.
     public_suffix: ?[]const u8 = null,
+    /// System-surface suffix. Worker-hosted system tenants resolve
+    /// here, never on the customer `public_suffix`: admin at
+    /// `app.{system_suffix}` (drives the default `admin_api_domain`),
+    /// replay at `replay.{system_suffix}`. Required, and MUST differ
+    /// from `--public-suffix` — that's the whole point of the split.
+    /// Example: `--system-suffix rewindjs.com`.
+    system_suffix: ?[]const u8 = null,
     /// TLS certificate path (PEM, full chain). When both this and
     /// `tls_key` are set, the `--http` listener speaks HTTPS (h2 over
     /// TLS) instead of plaintext h2c. Changes to either file on disk
@@ -213,6 +222,10 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.public_suffix = args[i];
+        } else if (std.mem.eql(u8, a, "--system-suffix")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.system_suffix = args[i];
         } else if (std.mem.eql(u8, a, "--tls-cert")) {
             i += 1;
             if (i >= args.len) return error.Usage;
@@ -292,13 +305,15 @@ pub fn portFromAddr(addr: []const u8) ?u16 {
 /// passed explicitly — explicit flags always win.
 ///
 /// Derivations:
-///   --admin-api-domain    → "app.{public_suffix}"
+///   --admin-api-domain    → "app.{system_suffix}"
 ///
-/// Production deploys mirror `app.{public-suffix}` admin host +
-/// `{id}.{public-suffix}` customer hosts; a single 3-label wildcard
-/// SAN `*.{public-suffix}` covers both. `app` is in the signup
-/// reserved-name list so customers can't claim it as their instance
-/// name.
+/// Production deploys put customer hosts on `{id}.{public-suffix}`
+/// (one wildcard cert for `*.{public-suffix}`) and system surfaces
+/// on a *separate* registrable domain `{system-suffix}` (admin at
+/// `app.{system-suffix}`, replay at `replay.{system-suffix}`). The
+/// two suffixes MUST differ — customer JS on the customer eTLD+1 can
+/// then never reach the control-plane cookie/storage scope. See
+/// docs/auth-domain-plan.md §1.
 pub fn finalizeCli(allocator: std.mem.Allocator, cli: *Cli) !void {
     // Worker mode requires --public-suffix. Without it, wildcard
     // customer-subdomain resolution is disabled and admin_api_domain
@@ -310,10 +325,36 @@ pub fn finalizeCli(allocator: std.mem.Allocator, cli: *Cli) !void {
     if (cli.public_suffix == null) {
         std.debug.print(
             "error: --public-suffix is required " ++
-                "(without it, customer subdomains cannot resolve and " ++
-                "admin_api_domain cannot default to app.{{public-suffix}}).\n" ++
-                "       pass e.g. --public-suffix loop46.me\n",
+                "(without it, customer subdomains cannot resolve).\n" ++
+                "       pass e.g. --public-suffix rewindjs.app\n",
             .{},
+        );
+        return error.Usage;
+    }
+
+    // System surfaces (admin, replay) live on a separate registrable
+    // domain from customer traffic — that separation is the
+    // security-isolation boundary (different eTLD+1 → customer JS
+    // can't reach the control-plane cookie/storage scope). Required,
+    // and required to *differ* from --public-suffix: equal suffixes
+    // would silently re-collapse the split, defeating the point.
+    if (cli.system_suffix == null) {
+        std.debug.print(
+            "error: --system-suffix is required " ++
+                "(system surfaces must resolve on their own domain, " ++
+                "not the customer public_suffix).\n" ++
+                "       pass e.g. --system-suffix rewindjs.com\n",
+            .{},
+        );
+        return error.Usage;
+    }
+    if (std.mem.eql(u8, cli.public_suffix.?, cli.system_suffix.?)) {
+        std.debug.print(
+            "error: --system-suffix must differ from --public-suffix " ++
+                "(got \"{s}\" for both). Customer and system surfaces " ++
+                "must be different registrable domains; see " ++
+                "docs/auth-domain-plan.md \u{00A7}1.\n",
+            .{cli.public_suffix.?},
         );
         return error.Usage;
     }
@@ -348,13 +389,14 @@ pub fn finalizeCli(allocator: std.mem.Allocator, cli: *Cli) !void {
     }
 
     if (cli.admin_api_domain == null) {
-        if (cli.public_suffix) |ps| {
-            cli.admin_api_domain = try std.fmt.allocPrint(
-                allocator,
-                "app.{s}",
-                .{ps},
-            );
-        }
+        // Admin is a system surface → derive from system_suffix, not
+        // the customer public_suffix. Guaranteed non-null by the
+        // required-check above.
+        cli.admin_api_domain = try std.fmt.allocPrint(
+            allocator,
+            "app.{s}",
+            .{cli.system_suffix.?},
+        );
     }
 
 }
@@ -437,4 +479,52 @@ pub fn parseAndFinalize(allocator: std.mem.Allocator, args: []const [:0]u8) !Cli
     var cli = try parseCli(args);
     try finalizeCli(allocator, &cli);
     return cli;
+}
+
+test "finalizeCli: --system-suffix is required" {
+    var cli = Cli{
+        .public_suffix = "rewindjs.app",
+        .system_suffix = null,
+        .allow_single_peer = true, // bypass the ≥2-peers gate
+    };
+    try std.testing.expectError(
+        error.Usage,
+        finalizeCli(std.testing.allocator, &cli),
+    );
+}
+
+test "finalizeCli: --system-suffix must differ from --public-suffix" {
+    var cli = Cli{
+        .public_suffix = "rewindjs.app",
+        .system_suffix = "rewindjs.app",
+        .allow_single_peer = true,
+    };
+    try std.testing.expectError(
+        error.Usage,
+        finalizeCli(std.testing.allocator, &cli),
+    );
+}
+
+test "finalizeCli: admin_api_domain derives from system_suffix" {
+    var cli = Cli{
+        .public_suffix = "rewindjs.app",
+        .system_suffix = "rewindjs.com",
+        .admin_api_domain = null,
+        .allow_single_peer = true,
+    };
+    try finalizeCli(std.testing.allocator, &cli);
+    defer std.testing.allocator.free(cli.admin_api_domain.?);
+    // Derived from the SYSTEM suffix, not the customer public_suffix.
+    try std.testing.expectEqualStrings("app.rewindjs.com", cli.admin_api_domain.?);
+}
+
+test "finalizeCli: explicit --admin-api-domain is not overwritten" {
+    var cli = Cli{
+        .public_suffix = "rewindjs.app",
+        .system_suffix = "rewindjs.com",
+        .admin_api_domain = "admin.example.test",
+        .allow_single_peer = true,
+    };
+    try finalizeCli(std.testing.allocator, &cli);
+    try std.testing.expectEqualStrings("admin.example.test", cli.admin_api_domain.?);
 }

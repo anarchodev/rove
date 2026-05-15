@@ -72,9 +72,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--public-suffix",
-        default="loop46.localhost",
-        help="domain to use for tenant URLs (default: loop46.localhost — "
-             "loopback-only). Pass `loop46.com` plus --bind 0.0.0.0 to "
+        default="rewindjsapp.localhost",
+        help="domain to use for tenant URLs (default: rewindjsapp.localhost — "
+             "loopback-only). Pass `rewindjs.app` plus --bind 0.0.0.0 to "
              "expose externally.",
     )
     ap.add_argument(
@@ -89,7 +89,7 @@ def main() -> int:
     public_suffix = args.public_suffix
     bind_host = args.bind
     tenant_host = f"replay-demo.{public_suffix}"
-    is_public = bind_host != "127.0.0.1" or public_suffix != "loop46.localhost"
+    is_public = bind_host != "127.0.0.1" or public_suffix != "rewindjsapp.localhost"
 
     print("== replay-wasm dev bringup ==", flush=True)
     if is_public:

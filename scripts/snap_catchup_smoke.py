@@ -20,8 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib import BIN_DIR, Cluster, curl  # noqa: E402
 
 TOKEN = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-PUBLIC_SUFFIX = "loop46.localhost"
-ADMIN_HOST = f"app.{PUBLIC_SUFFIX}"
+PUBLIC_SUFFIX = "rewindjsapp.localhost"
+SYSTEM_SUFFIX = "rewindjscom.localhost"
+ADMIN_HOST = f"app.{SYSTEM_SUFFIX}"
 WRITE_BURSTS = 30
 TICK_INTERVAL_MS = 500
 

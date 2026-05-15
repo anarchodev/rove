@@ -83,7 +83,8 @@ HTTP_PORT_BASE="${HTTP_PORT_BASE:-8265}"
 RAFT_PORT_BASE="${RAFT_PORT_BASE:-40365}"
 BIN="${BIN:-./zig-out/bin/loop46}"
 TOKEN="${ROVE_TOKEN:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
-PUBLIC_SUFFIX="loop46.localhost"
+PUBLIC_SUFFIX="rewindjsapp.localhost"
+SYSTEM_SUFFIX="rewindjscom.localhost"
 ADMIN_HOST="app.${PUBLIC_SUFFIX}"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -129,7 +130,7 @@ trap 'rm -f "$FANOUT_MANIFEST" "${IDLE_MANIFEST:-}" 2>/dev/null || true' EXIT
     echo -n '{"tenants":['
     for (( i = 0; i < N_ACTIVE; i++ )); do
         (( i > 0 )) && echo -n ','
-        printf '{"id":"fan%05d","domains":["fan%05d.loop46.localhost"],"files":[{"path":"index.mjs","source":"loop46-demo-tenants/%s/index.mjs"}]}' "$i" "$i" "$HANDLER"
+        printf '{"id":"fan%05d","domains":["fan%05d.rewindjsapp.localhost"],"files":[{"path":"index.mjs","source":"loop46-demo-tenants/%s/index.mjs"}]}' "$i" "$i" "$HANDLER"
     done
     echo ']}'
 } > "$FANOUT_MANIFEST"
@@ -181,6 +182,7 @@ for i in 0 1 2; do
         --admin-origin "https://${ADMIN_HOST}:${P}" \
         --admin-api-domain "$ADMIN_HOST" \
         --public-suffix "$PUBLIC_SUFFIX" \
+        --system-suffix "$SYSTEM_SUFFIX" \
         --tls-cert "$TLS_CERT" \
         --tls-key "$TLS_KEY" \
         --workers "${WORKERS:-4}" \
@@ -232,8 +234,8 @@ warmup_check() {
     local tid="$1"
     local code
     for _ in $(seq 1 60); do
-        code=$("${CURL[@]}" --connect-to "${tid}.loop46.localhost:${LEADER_PORT}:127.0.0.1:${LEADER_PORT}" \
-            -o /dev/null -w '%{http_code}' "https://${tid}.loop46.localhost:${LEADER_PORT}/?fn=handler" 2>/dev/null || echo 000)
+        code=$("${CURL[@]}" --connect-to "${tid}.rewindjsapp.localhost:${LEADER_PORT}:127.0.0.1:${LEADER_PORT}" \
+            -o /dev/null -w '%{http_code}' "https://${tid}.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" 2>/dev/null || echo 000)
         [[ "$code" == "200" ]] && { echo "ok $tid" >> "$warmup_log"; return 0; }
         sleep 0.5
     done
@@ -340,11 +342,11 @@ for i in $(seq 0 $((N_ACTIVE - 1))); do
     tid=$(printf "fan%05d" "$i")
     if [[ "$MODE" == "zipf" ]]; then
         "${H2LOAD[@]}" -D "$STEADY_S" -c "${TENANT_C[$i]}" -m "${TENANT_M[$i]}" \
-            "https://${tid}.loop46.localhost:${LEADER_PORT}/?fn=handler" \
+            "https://${tid}.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" \
             > "$LOG_DIR/${tid}.log" 2>&1 &
     else
         "${H2LOAD[@]}" -n "$PER_REQUESTS" -c "$PT_C" -m "$PT_M" \
-            "https://${tid}.loop46.localhost:${LEADER_PORT}/?fn=handler" \
+            "https://${tid}.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" \
             > "$LOG_DIR/${tid}.log" 2>&1 &
     fi
     PID_LIST+=($!)

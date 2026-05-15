@@ -25,8 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib import Cluster, curl  # noqa: E402
 
 TOKEN = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-PUBLIC_SUFFIX = "loop46.localhost"
-ADMIN_HOST = f"app.{PUBLIC_SUFFIX}"
+PUBLIC_SUFFIX = "rewindjsapp.localhost"
+SYSTEM_SUFFIX = "rewindjscom.localhost"
+ADMIN_HOST = f"app.{SYSTEM_SUFFIX}"
 TENANT_A = "notifsmokea"
 TENANT_B = "notifsmokeb"
 SSE_PORT = 8268

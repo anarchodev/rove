@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib import Cluster, curl, expect_eq  # noqa: E402
 
-PUBLIC_SUFFIX = "loop46.localhost"
+PUBLIC_SUFFIX = "rewindjsapp.localhost"
+SYSTEM_SUFFIX = "rewindjscom.localhost"
 HOST = f"penalty.{PUBLIC_SUFFIX}"
 
 

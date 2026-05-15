@@ -22,7 +22,11 @@
 #
 # ── Overrides ────────────────────────────────────────────────────────
 # All env vars below are optional; defaults match this deployment.
-#   BIND_ADDR, BASE_DOMAIN, TLS_CERT, TLS_KEY, DATA_DIR, WORKERS
+#   BIND_ADDR, BASE_DOMAIN, SYSTEM_DOMAIN, TLS_CERT, TLS_KEY,
+#   DATA_DIR, WORKERS
+#   (BASE_DOMAIN = customer wildcard; SYSTEM_DOMAIN = system surfaces
+#    — admin/replay. They MUST be different registrable domains; see
+#    docs/auth-domain-plan.md §1.)
 #   ROVE_TOKEN  (optional; if set, (re-)installs a root bearer token)
 
 set -euo pipefail
@@ -31,7 +35,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 BIND_ADDR="${BIND_ADDR:-15.204.47.158:443}"
-BASE_DOMAIN="${BASE_DOMAIN:-loop46.me}"
+BASE_DOMAIN="${BASE_DOMAIN:-rewindjs.app}"
+SYSTEM_DOMAIN="${SYSTEM_DOMAIN:-rewindjs.com}"
 TLS_CERT="${TLS_CERT:-$HOME/.rove/tls/cert.pem}"
 TLS_KEY="${TLS_KEY:-$HOME/.rove/tls/key.pem}"
 DATA_DIR="${DATA_DIR:-$HOME/.rove/data}"
@@ -60,9 +65,10 @@ fi
 
 mkdir -p "$DATA_DIR"
 
-# The admin UI + API both dogfood the customer experience at
-# app.$BASE_DOMAIN — `__admin__` handler routes internally.
-ADMIN_API_DOMAIN="app.${BASE_DOMAIN}"
+# The admin UI + API both dogfood the customer experience, but admin
+# is a *system* surface → it lives on the system domain, never the
+# customer BASE_DOMAIN. `__admin__` handler routes internally.
+ADMIN_API_DOMAIN="app.${SYSTEM_DOMAIN}"
 ADMIN_ORIGIN="https://${ADMIN_API_DOMAIN}"
 
 # Bootstrap plumbing.
@@ -82,7 +88,8 @@ fi
 cat <<EOF
 rove-js: starting
   bind       : https://${BIND_ADDR}
-  base domain: ${BASE_DOMAIN}  (wildcard + apex)
+  base domain: ${BASE_DOMAIN}  (customer wildcard + apex)
+  system dom : ${SYSTEM_DOMAIN}  (admin/replay)
   admin      : ${ADMIN_ORIGIN}
   cert       : ${TLS_CERT}
   key        : ${TLS_KEY}
@@ -146,6 +153,7 @@ trap 'kill $CS_PID $LS_PID 2>/dev/null || true; wait $CS_PID $LS_PID 2>/dev/null
     --tls-cert "$TLS_CERT" \
     --tls-key "$TLS_KEY" \
     --public-suffix "$BASE_DOMAIN" \
+    --system-suffix "$SYSTEM_DOMAIN" \
     --admin-api-domain "$ADMIN_API_DOMAIN" \
     --admin-origin "$ADMIN_ORIGIN" \
     --files-public-base "https://files.${BASE_DOMAIN}:${FILES_PORT}" \
