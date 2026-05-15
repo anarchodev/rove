@@ -78,6 +78,12 @@ pub const Cli = struct {
     tls_cert: ?[]const u8 = null,
     /// TLS private key path (PEM). See `tls_cert`.
     tls_key: ?[]const u8 = null,
+    /// Optional per-host custom-domain cert directory:
+    /// `{dir}/{host}/{cert,key}.pem`. SNI = `{host}` selects that
+    /// cert; absent/unknown SNI falls back to the `--tls-cert`
+    /// wildcard. Rescanned on the 1s reload poll (ACME writes here
+    /// later — auth-domain-plan.md §3.2/§3.3). Unset = inert.
+    custom_cert_dir: ?[]const u8 = null,
     /// Raft proposal linger budget, in microseconds. Hold pending
     /// proposals up to this long so the raft thread can pack more
     /// into a single `raft_log.db` commit + fsync. Under heavy write
@@ -234,6 +240,10 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.tls_key = args[i];
+        } else if (std.mem.eql(u8, a, "--custom-cert-dir")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.custom_cert_dir = args[i];
         } else if (std.mem.eql(u8, a, "--propose-linger-us")) {
             i += 1;
             if (i >= args.len) return error.Usage;

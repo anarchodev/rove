@@ -920,6 +920,13 @@ fn resolveTls(
         .{ @errorName(err), cert_path, key_path },
     );
     std.log.info("tls: loaded {s} + {s}", .{ cert_path, key_path });
+    if (cli.custom_cert_dir) |dir| {
+        cfg.setCustomCertDir(dir) catch |err| failExit(
+            "error: tls: custom-cert-dir {s}: {s}\n",
+            .{ dir, @errorName(err) },
+        );
+        std.log.info("tls: custom-cert dir {s} (per-host SNI)", .{dir});
+    }
     return cfg;
 }
 

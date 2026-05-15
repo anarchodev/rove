@@ -13,9 +13,33 @@ const c = @cImport({
 // TLS config (user-facing)
 // =============================================================================
 
+/// One custom-domain cert: its own `SSL_CTX` (built by `buildSslCtx`,
+/// so it inherits the ALPN-h2 cb + TLS1.2-min like the default ctx)
+/// plus the on-disk mtimes that drive per-host reload.
+const HostEntry = struct {
+    ctx: *c.SSL_CTX,
+    cert_mtime: i128,
+    key_mtime: i128,
+};
+
 pub const TlsConfig = struct {
+    /// The default / fallback context, built from `--tls-cert`/`--tls-key`
+    /// (the wildcard). Serves every connection whose SNI is absent or
+    /// not in `host_store` — i.e. unchanged behavior for the common
+    /// case. The servername callback only ever *overrides* this.
     ssl_ctx: *c.SSL_CTX,
     allocator: std.mem.Allocator,
+
+    /// Custom-domain certs, keyed by exact SNI host. Read on every
+    /// handshake (servername cb, worker threads — hot path), written
+    /// only by the main-thread reload poll → `RwLock`, not `mu`.
+    /// Keys + entry ctxs are owned. Empty (and `custom_cert_dir`
+    /// null) ⇒ this whole subsystem is inert and TLS behaves exactly
+    /// as before Phase 2c.
+    host_store: std.StringHashMapUnmanaged(HostEntry) = .{},
+    store_rw: std.Thread.RwLock = .{},
+    /// `{dir}/{host}/{cert,key}.pem`. Owned. Null ⇒ no custom certs.
+    custom_cert_dir: ?[]u8 = null,
 
     /// Paths to the PEM files on disk. Owned. Null when the config
     /// was built via `create` (in-memory bytes) — file-path-based
@@ -40,6 +64,7 @@ pub const TlsConfig = struct {
 
         const cfg = try allocator.create(TlsConfig);
         cfg.* = .{ .ssl_ctx = ssl_ctx, .allocator = allocator };
+        installServernameCb(ssl_ctx, cfg);
         return cfg;
     }
 
@@ -78,6 +103,7 @@ pub const TlsConfig = struct {
             .cached_cert_mtime = cert_stat.mtime,
             .cached_key_mtime = key_stat.mtime,
         };
+        installServernameCb(ssl_ctx, cfg);
         return cfg;
     }
 
@@ -110,6 +136,10 @@ pub const TlsConfig = struct {
         defer self.allocator.free(key_pem);
 
         const new_ctx = try buildSslCtx(cert_pem, key_pem);
+        // The servername cb is registered per-ctx; the rebuilt default
+        // ctx needs it re-installed or SNI override stops working
+        // after the first wildcard-cert renewal.
+        installServernameCb(new_ctx, self);
         const old_ctx = self.ssl_ctx;
         self.ssl_ctx = new_ctx;
         self.cached_cert_mtime = cert_stat.mtime;
@@ -148,6 +178,10 @@ pub const TlsConfig = struct {
                         break :blk false;
                     };
                     if (changed) std.log.info("tls: cert/key reloaded", .{});
+                    // Independent of the default-cert reload above
+                    // (which no-ops for in-memory configs): pick up
+                    // newly-issued / renewed per-host custom certs.
+                    cfg.reloadCustomCerts();
                 }
             }
         }
@@ -171,9 +205,177 @@ pub const TlsConfig = struct {
 
     pub fn destroy(self: *TlsConfig) void {
         c.SSL_CTX_free(self.ssl_ctx);
+        {
+            self.store_rw.lock();
+            var it = self.host_store.iterator();
+            while (it.next()) |e| {
+                c.SSL_CTX_free(e.value_ptr.ctx);
+                self.allocator.free(e.key_ptr.*);
+            }
+            self.host_store.deinit(self.allocator);
+            self.store_rw.unlock();
+        }
+        if (self.custom_cert_dir) |p| self.allocator.free(p);
         if (self.cert_path) |p| self.allocator.free(p);
         if (self.key_path) |p| self.allocator.free(p);
         self.allocator.destroy(self);
+    }
+
+    /// Point the per-host store at `{dir}/{host}/{cert,key}.pem` and
+    /// do an initial load. Idempotent; safe before listeners are up.
+    /// When never called, `host_store` stays empty and TLS behaves
+    /// exactly as it did pre-Phase-2c (default ctx for every conn).
+    pub fn setCustomCertDir(self: *TlsConfig, dir: []const u8) !void {
+        if (self.custom_cert_dir) |old| self.allocator.free(old);
+        self.custom_cert_dir = try self.allocator.dupe(u8, dir);
+        self.reloadCustomCerts();
+    }
+
+    /// Rescan `custom_cert_dir`: build a fresh `SSL_CTX` for any new
+    /// host dir, rebuild one whose cert/key mtime moved, drop entries
+    /// whose dir vanished. Error-tolerant by contract — it runs from
+    /// the reload poll, so a single malformed host must not abort the
+    /// sweep or kill the poll. Never returns an error.
+    pub fn reloadCustomCerts(self: *TlsConfig) void {
+        const dir = self.custom_cert_dir orelse return;
+        self.reloadCustomCertsImpl(dir) catch |err|
+            std.log.warn("tls: custom-cert rescan failed: {s}", .{@errorName(err)});
+    }
+
+    fn reloadCustomCertsImpl(self: *TlsConfig, dir: []const u8) !void {
+        var seen: std.StringHashMapUnmanaged(void) = .{};
+        defer seen.deinit(self.allocator);
+
+        var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return, // dir not created yet — fine
+            else => return err,
+        };
+        defer d.close();
+
+        var it = d.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            const host = entry.name;
+
+            var cbuf: [std.fs.max_path_bytes]u8 = undefined;
+            var kbuf: [std.fs.max_path_bytes]u8 = undefined;
+            const cpath = std.fmt.bufPrint(&cbuf, "{s}/{s}/cert.pem", .{ dir, host }) catch continue;
+            const kpath = std.fmt.bufPrint(&kbuf, "{s}/{s}/key.pem", .{ dir, host }) catch continue;
+
+            const cst = std.fs.cwd().statFile(cpath) catch continue; // no cert.pem yet
+            const kst = std.fs.cwd().statFile(kpath) catch continue;
+
+            try seen.put(self.allocator, host, {});
+
+            // Up-to-date already? (read lock — cheap, off the write path)
+            {
+                self.store_rw.lockShared();
+                const cur = self.host_store.get(host);
+                self.store_rw.unlockShared();
+                if (cur) |e| {
+                    if (e.cert_mtime == cst.mtime and e.key_mtime == kst.mtime) continue;
+                }
+            }
+
+            // Build the new ctx OUTSIDE the lock (slow: file IO + parse).
+            const cpem = std.fs.cwd().readFileAlloc(self.allocator, cpath, 1024 * 1024) catch continue;
+            defer self.allocator.free(cpem);
+            const kpem = std.fs.cwd().readFileAlloc(self.allocator, kpath, 1024 * 1024) catch continue;
+            defer self.allocator.free(kpem);
+            const new_ctx = buildSslCtx(cpem, kpem) catch |err| {
+                std.log.warn("tls: custom host {s}: bad cert/key: {s}", .{ host, @errorName(err) });
+                continue;
+            };
+
+            self.store_rw.lock();
+            const gop = self.host_store.getOrPut(self.allocator, host) catch {
+                self.store_rw.unlock();
+                c.SSL_CTX_free(new_ctx);
+                continue;
+            };
+            var old_ctx: ?*c.SSL_CTX = null;
+            if (gop.found_existing) {
+                old_ctx = gop.value_ptr.ctx;
+            } else {
+                gop.key_ptr.* = self.allocator.dupe(u8, host) catch {
+                    _ = self.host_store.remove(host);
+                    self.store_rw.unlock();
+                    c.SSL_CTX_free(new_ctx);
+                    continue;
+                };
+            }
+            gop.value_ptr.* = .{ .ctx = new_ctx, .cert_mtime = cst.mtime, .key_mtime = kst.mtime };
+            self.store_rw.unlock();
+            // Drop the store's old ref. Any in-flight handshake that
+            // already did SSL_set_SSL_CTX holds its own ref (that call
+            // up-refs), so the ctx survives until those conns die —
+            // same discipline as reloadIfChanged for the default ctx.
+            if (old_ctx) |o| c.SSL_CTX_free(o);
+            std.log.info("tls: custom host {s} loaded", .{host});
+        }
+
+        // Sweep: drop entries whose host dir disappeared.
+        self.store_rw.lock();
+        var rm: std.ArrayListUnmanaged([]const u8) = .{};
+        defer rm.deinit(self.allocator);
+        var sit = self.host_store.iterator();
+        while (sit.next()) |e| {
+            if (!seen.contains(e.key_ptr.*)) rm.append(self.allocator, e.key_ptr.*) catch {};
+        }
+        for (rm.items) |key| {
+            if (self.host_store.fetchRemove(key)) |kv| {
+                c.SSL_CTX_free(kv.value.ctx);
+                self.allocator.free(kv.key);
+            }
+        }
+        self.store_rw.unlock();
+    }
+
+    /// Register the SNI servername callback on `ctx` (per-ctx, so it
+    /// must be re-applied whenever the default ctx is rebuilt). `cfg`
+    /// is passed as the callback arg — a stable `*TlsConfig`.
+    fn installServernameCb(ctx: *c.SSL_CTX, cfg: *TlsConfig) void {
+        // SSL_CTX_set_tlsext_servername_{callback,arg} are macros over
+        // SSL_CTX_callback_ctrl / SSL_CTX_ctrl; translate-c can't see
+        // macros, so call the underlying ctrls with the stable tls1.h
+        // command numbers (unchanged across OpenSSL 1.1.x / 3.x).
+        const SSL_CTRL_SET_TLSEXT_SERVERNAME_CB: c_int = 53;
+        const SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG: c_int = 54;
+        _ = c.SSL_CTX_callback_ctrl(
+            ctx,
+            SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
+            @ptrCast(&servernameCb),
+        );
+        _ = c.SSL_CTX_ctrl(
+            ctx,
+            SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG,
+            0,
+            cfg,
+        );
+    }
+
+    /// Runs during ClientHello on the default ctx. If the SNI host is
+    /// in the store, switch this connection to that host's ctx (its
+    /// cert + chain + key). `SSL_set_SSL_CTX` up-refs the new ctx, so
+    /// holding the read lock only across the lookup+switch is enough:
+    /// a concurrent rescan can't free the ctx mid-switch (writer is
+    /// excluded), and afterwards the SSL owns its own ref. No SNI, or
+    /// unknown host → leave the default ctx (serves the wildcard).
+    fn servernameCb(ssl: ?*c.SSL, al: ?*c_int, arg: ?*anyopaque) callconv(.c) c_int {
+        _ = al;
+        const cfg: *TlsConfig = @ptrCast(@alignCast(arg orelse return c.SSL_TLSEXT_ERR_OK));
+        const s = ssl orelse return c.SSL_TLSEXT_ERR_OK;
+        // TLSEXT_NAMETYPE_host_name == 0 (tls1.h; not a translate-c
+        // macro). Returns NULL when the client sent no SNI.
+        const name = c.SSL_get_servername(s, 0) orelse return c.SSL_TLSEXT_ERR_OK;
+        const host = std.mem.span(name);
+
+        cfg.store_rw.lockShared();
+        defer cfg.store_rw.unlockShared();
+        if (cfg.host_store.get(host)) |entry| {
+            _ = c.SSL_set_SSL_CTX(s, entry.ctx);
+        }
+        return c.SSL_TLSEXT_ERR_OK;
     }
 
     fn buildSslCtx(cert_pem: []const u8, key_pem: []const u8) !*c.SSL_CTX {

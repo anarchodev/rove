@@ -1,7 +1,9 @@
 # Auth + domain layout plan
 
-**Status:** Phase 0 complete; **Phase 1 landed + smoke-verified
-2026-05-15** (see §6). §5 decisions accepted 2026-05-15. Key-rotation
+**Status:** Phase 0 complete; **Phase 1 + Phase 2c landed +
+smoke-verified 2026-05-15** (see §6 / §3.3). Phase 2 remaining: 2a
+(lego wildcard, unchanged), 2b (in-tree :80 HTTP-01 ACME), 2d
+(operator mTLS) — 2b/2d bolt onto the 2c store. §5 decisions accepted 2026-05-15. Key-rotation
 design pass added 2026-05-15 (§4.6 — resolves the former §9
 highest-risk item). Phases 2–3 not yet started. Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
@@ -186,18 +188,76 @@ ACME — their opt-in, never required.
 cert/key pair, no `SSL_CTX_set_tlsext_servername_callback`;
 `reloadIfChanged` (`tls.zig:94-122`) swaps the *entire* context.
 
-Required change (independent of challenge type, so tracked as its own
-workstream):
+**Concrete design (grounded against the code 2026-05-15).** Current
+shape (`src/h2/tls.zig`): `TlsConfig` holds one `*SSL_CTX`, shared
+process-wide across all worker threads; one `mu` mutex serializes
+`newSsl()` (per-connection `SSL_new`, refcount-bumped) against
+`reloadIfChanged()` (rebuilds the whole ctx, atomically swaps the
+pointer, frees the old ctx — in-flight `SSL`s keep it alive via their
+own ref). Per-connection `SSL` is created in `TlsConn.create`
+(`tls.zig:261`), memory-BIO + `SSL_set_accept_state`; handshake driven
+in `TlsConn.feed` (`SSL_do_handshake`) on the **worker thread**. ALPN
+cb is ctx-level; no servername cb today.
 
-- An SNI `servername` callback on the server `SSL_CTX` that selects a
-  per-host `SSL_CTX` (or per-host cert via `SSL_use_certificate` on the
-  connection's `SSL`).
-- A cert store keyed by SNI host: the wildcard ctx for
-  `*.rewindjs.{app,com}` plus a map of custom-domain hosts →
-  ctx/cert, populated from `~/.rove/tls/custom/` and refreshed when the
-  ACME client writes a new cert (extend the existing mtime-poll, now
-  per-entry instead of whole-context).
-- ALPN callback stays h2-only (no `acme-tls/1` — we chose HTTP-01).
+Chosen approach — **per-host `SSL_CTX` store + ctx-level servername
+callback doing `SSL_set_SSL_CTX`** (the standard nginx-shaped pattern;
+rejected the per-`SSL` `SSL_use_certificate` swap as fiddlier — chain
++ key + options must all be re-applied per connection):
+
+- The existing `--tls-cert`/`--tls-key` wildcard ctx stays the
+  **default/fallback** ctx — unchanged behavior for no-SNI or
+  unknown-SNI connections (Phase 1's single cert with both wildcard
+  SANs keeps working untouched). The store is purely *additive*.
+- A store: `host → *SSL_CTX`, each built via the existing `buildSslCtx`
+  (so every per-host ctx inherits the ALPN-h2 cb + TLS1.2-min — no
+  ALPN regression; `acme-tls/1` still not offered, we chose HTTP-01).
+- `SSL_CTX_set_tlsext_servername_callback` on the **default** ctx: on
+  ClientHello, `SSL_get_servername` → store lookup → on hit,
+  `SSL_set_SSL_CTX(ssl, host_ctx)`; on miss, leave the default ctx
+  (serves the wildcard). Runs on the worker thread inside the existing
+  handshake path — no new thread, no handoff.
+- Concurrency: the store is read on **every** handshake (worker
+  threads, hot path) and written rarely (main-thread reload poll /
+  ACME issue). An `RwLock` (many readers, rare writer); the
+  servername cb takes the read lock for the pointer lookup only — the
+  `*SSL_CTX` itself is refcount-stable for the connection's life
+  exactly like `newSsl` does today (`SSL_CTX_up_ref` in the cb before
+  `SSL_set_SSL_CTX`, drop our ref after the handshake — mirror the
+  existing `newSsl` discipline so a concurrent per-host reload can't
+  free a ctx out from under an in-flight handshake).
+- Reload: the single `cached_{cert,key}_mtime` pair generalizes to
+  per-host mtimes; the existing 1 s poll additionally scans
+  `~/.rove/tls/custom/` (one `{cert,key}.pem` pair per host dir),
+  rebuilding only the changed host's ctx and swapping that store
+  entry (same atomic-swap-then-free-old pattern as today, per entry).
+- Composes with §3.5: each per-host ctx is a `buildSslCtx` product, so
+  the `--require-client-cert-ca` `SSL_CTX_set_verify` applies to every
+  store entry + the default ctx uniformly (one code path).
+
+First increment + gate: the store + servername cb + default-fallback,
+loadable from `~/.rove/tls/custom/`, with a **per-host TLS smoke**
+(extend `gen-dev-cert.sh` to mint a second cert for a non-wildcard
+host; assert SNI to that host serves cert A and SNI elsewhere serves
+the wildcard). ACME (§3.2) writes into the same dir later — store is
+agnostic to who wrote the files.
+
+**Landed 2026-05-15.** `src/h2/tls.zig`: `host_store`
+(`StringHashMapUnmanaged` under `RwLock`), `installServernameCb` (via
+`SSL_CTX_callback_ctrl`/`SSL_CTX_ctrl` — the `_set_tlsext_servername_*`
+setters are macros translate-c can't see; cmd nums 53/54 hardcoded
+with a note), `servernameCb` does `SSL_get_servername` → store lookup
+→ `SSL_set_SSL_CTX` under the read lock (that call up-refs, mirroring
+`newSsl`'s refcount discipline so a concurrent rescan can't free a ctx
+mid-switch). Default `--tls-cert` ctx untouched as fallback; cb
+re-installed on the rebuilt default ctx in `reloadIfChanged`.
+`reloadCustomCerts` scans `{dir}/{host}/{cert,key}.pem` on the
+existing 1 s poll (per-host mtime; build off-lock, swap under write
+lock, sweep vanished hosts). CLI `--custom-cert-dir` (inert when
+unset → pre-2c behavior exactly). Gate: `scripts/custom_domain_tls_smoke.py`
+(SNI=custom→per-host cert, SNI=wildcard→default, SNI=miss→default) +
+`cookie_auth_smoke` regression green (servername cb on every conn
+doesn't perturb the wildcard path). 2b (ACME :80) / 2d (mTLS) bolt
+onto this next.
 
 ### 3.4 Customer wildcard custom domains — deferred
 

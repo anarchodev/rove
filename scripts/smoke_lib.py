@@ -265,6 +265,7 @@ class ClusterAddrs:
     admin_host: str
     files_addr: str
     log_addr: str
+    custom_cert_dir: Optional[str] = None  # --custom-cert-dir (per-host SNI)
 
     @property
     def peers_csv(self) -> str:
@@ -324,6 +325,7 @@ class Cluster:
         log_port: int,
         public_suffix: str = "rewindjsapp.localhost",
         system_suffix: str = "rewindjscom.localhost",
+        custom_cert_dir: Optional[str] = None,
     ) -> ClusterAddrs:
         return ClusterAddrs(
             http=[f"127.0.0.1:{http_base + i}" for i in range(3)],
@@ -336,6 +338,7 @@ class Cluster:
             admin_host=f"app.{system_suffix}",
             files_addr=f"127.0.0.1:{files_port}",
             log_addr=f"127.0.0.1:{log_port}",
+            custom_cert_dir=custom_cert_dir,
         )
 
     @classmethod
@@ -349,6 +352,7 @@ class Cluster:
         log_port: int = 0,
         public_suffix: str = "rewindjsapp.localhost",
         system_suffix: str = "rewindjscom.localhost",
+        custom_cert_dir: Optional[str] = None,
         workers_per_node: int = 2,
         seed_manifest: Optional[dict | Path] = None,
         seed_extra_args: Optional[list[str]] = None,
@@ -401,6 +405,7 @@ class Cluster:
             log_port=log_port,
             public_suffix=public_suffix,
             system_suffix=system_suffix,
+            custom_cert_dir=custom_cert_dir,
         )
         for d in addrs.data_dirs:
             if d.exists():
@@ -484,6 +489,8 @@ class Cluster:
                 "--election-timeout-ms", "200",
                 "--heartbeat-ms", "50",
             ]
+            if custom_cert_dir:
+                args += ["--custom-cert-dir", custom_cert_dir]
             if with_log_files_bases:
                 # Hostname form (logs.{public_suffix}, files.{public_suffix})
                 # rather than 127.0.0.1:port — keeps the TLS SAN matching
@@ -552,7 +559,10 @@ class Cluster:
                 "--workers", "1",
                 "--election-timeout-ms", "200",
                 "--heartbeat-ms", "50",
-            ] + (extra_args or [])
+            ] + (
+                ["--custom-cert-dir", self.addrs.custom_cert_dir]
+                if self.addrs.custom_cert_dir else []
+            ) + (extra_args or [])
         f = open(log_path, "ab")
         p = subprocess.Popen(args, env=os.environ, stdout=f, stderr=subprocess.STDOUT)
         if idx < len(self.workers):
