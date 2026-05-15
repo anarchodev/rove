@@ -865,59 +865,91 @@ if ($bottomResize) {
     });
 }
 
-// ── Events pane width resize ─────────────────────────────────────────
+// ── Modules / events column width resizes ──────────────────────────
 //
-// Same shape as the bottom-region handle, but horizontal. Drives a
-// CSS custom property on .replay__main so the grid column responds.
-// Persisted under rewind.replay.eventsWidth.
+// Two horizontal handles flanking the source viewport. Both drive a
+// CSS custom property on .replay__main so the grid columns respond
+// instantly. Persisted under rewind.replay.{modulesWidth,eventsWidth}.
 
-const $eventsResize = document.querySelector(".events-resize");
-const $replayMain   = document.querySelector(".replay__main");
-const EVENTS_WIDTH_STORAGE_KEY = "rewind.replay.eventsWidth";
-const EVENTS_MIN_WIDTH = 200;
-function eventsMaxWidth() { return Math.floor(window.innerWidth * 0.6); }
+const $replayMain    = document.querySelector(".replay__main");
+const $modulesResize = document.querySelector(".modules-resize");
+const $eventsResize  = document.querySelector(".events-resize");
 
-function setEventsWidth(px, { persist = true } = {}) {
-    if (!$replayMain) return;
-    const clamped = Math.max(EVENTS_MIN_WIDTH, Math.min(eventsMaxWidth(), Math.round(px)));
-    $replayMain.style.setProperty("--events-width", clamped + "px");
-    if (persist) {
-        try { localStorage.setItem(EVENTS_WIDTH_STORAGE_KEY, String(clamped)); }
-        catch { /* fine */ }
-    }
+function clampColWidth(px, min, max) {
+    return Math.max(min, Math.min(max, Math.round(px)));
 }
 
-try {
-    const saved = parseInt(localStorage.getItem(EVENTS_WIDTH_STORAGE_KEY) ?? "", 10);
-    if (!Number.isNaN(saved) && saved >= EVENTS_MIN_WIDTH) {
-        setEventsWidth(saved, { persist: false });
-    }
-} catch { /* fine */ }
+// `cfg` describes one resizable column. `direction` is "right" for
+// columns that grow when the mouse drags RIGHT (modules rail, on the
+// left of the source), or "left" for columns that grow when the
+// mouse drags LEFT (events stream, on the right of the source).
+function wireColResize({
+    handle,
+    measureEl,            // DOM element whose current width is the start
+    cssVar,               // custom property name on .replay__main
+    storageKey,
+    min,
+    maxFrac,              // fraction of window.innerWidth
+    direction,            // "right" | "left"
+}) {
+    if (!handle || !$replayMain || !measureEl) return;
 
-if ($eventsResize && $replayMain) {
+    const apply = (px, { persist = true } = {}) => {
+        const max = Math.floor(window.innerWidth * maxFrac);
+        const clamped = clampColWidth(px, min, max);
+        $replayMain.style.setProperty(cssVar, clamped + "px");
+        if (persist) {
+            try { localStorage.setItem(storageKey, String(clamped)); }
+            catch { /* fine */ }
+        }
+    };
+
+    try {
+        const saved = parseInt(localStorage.getItem(storageKey) ?? "", 10);
+        if (!Number.isNaN(saved) && saved >= min) apply(saved, { persist: false });
+    } catch { /* fine */ }
+
     let dragging = false;
     let startX = 0;
     let startWidth = 0;
-    const $stream = document.querySelector(".stream");
 
-    $eventsResize.addEventListener("mousedown", (e) => {
+    handle.addEventListener("mousedown", (e) => {
         dragging = true;
         startX = e.clientX;
-        startWidth = $stream.getBoundingClientRect().width;
-        $eventsResize.classList.add("is-dragging");
+        startWidth = measureEl.getBoundingClientRect().width;
+        handle.classList.add("is-dragging");
         e.preventDefault();
     });
     window.addEventListener("mousemove", (e) => {
         if (!dragging) return;
-        // Drag LEFT (clientX decreases) grows the events column.
-        setEventsWidth(startWidth + (startX - e.clientX));
+        const delta = direction === "right" ? (e.clientX - startX) : (startX - e.clientX);
+        apply(startWidth + delta);
     });
     window.addEventListener("mouseup", () => {
         if (!dragging) return;
         dragging = false;
-        $eventsResize.classList.remove("is-dragging");
+        handle.classList.remove("is-dragging");
     });
 }
+
+wireColResize({
+    handle:    $modulesResize,
+    measureEl: document.querySelector(".replay__modules"),
+    cssVar:    "--modules-width",
+    storageKey: "rewind.replay.modulesWidth",
+    min:       140,
+    maxFrac:   0.4,
+    direction: "right",
+});
+wireColResize({
+    handle:    $eventsResize,
+    measureEl: document.querySelector(".stream"),
+    cssVar:    "--events-width",
+    storageKey: "rewind.replay.eventsWidth",
+    min:       200,
+    maxFrac:   0.6,
+    direction: "left",
+});
 
 // Find the nearest varSnapshot at or before `eventIdx`. Binary search
 // since varSnapshots is sorted by eventOrdinal.
