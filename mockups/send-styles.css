@@ -1,0 +1,191 @@
+/* ============================================================
+   send-styles.css — send dashboard detail page
+   AGPL-3.0
+   ------------------------------------------------------------
+   Loaded AFTER rewind.css (canonical design system) and
+   wasm-styles.css (which contributes the .cmdk-hint chip
+   reused in the appbar).
+
+   The send dashboard's job is to be the canonical hub for
+   "what happened with this http.send" — its row carries the
+   response status, captured body, which callback recording
+   fired, and when. Every http.send event card in the replay
+   shell links here, and from here the user navigates into
+   either the caller or callback recording. So the page is
+   a pivot, not a destination.
+   ============================================================ */
+
+/* ---------- 1. Page shell ---------- */
+
+.send-page {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--base);
+  overflow: hidden;
+}
+.send-page__main {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--sp-6) var(--sp-8) var(--sp-12);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+  max-width: 1280px;
+  width: 100%;
+  margin: 0 auto;
+  min-width: 0;
+}
+
+/* ---------- 2. Section heads (shared) ----------
+   Used by the lifecycle pipeline since it's not a .panel — its
+   visual weight needs to be different (full-bleed, no card chrome). */
+
+.send-section__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: var(--sp-3);
+}
+
+/* ---------- 3. Lifecycle pipeline ----------
+   Five stages of the send's life, left-to-right. Each stage
+   card carries: a colored dot encoding what happened (info /
+   effect / error), a label, and two detail lines for context.
+   Between stages: a gap rendered with the inter-stage duration
+   — the only wall-clock that exists for a send, since
+   intra-recording time isn't captured.
+
+   The stages always render in the same order; "is-error" /
+   "is-done" classes change the dot color only. Failed stages
+   (e.g. transport timeout) would replace later stages with a
+   single "is-failed" terminator card and drop the rest. */
+
+.send-pipeline {
+  background: var(--mantle);
+  border: var(--border-1);
+  border-radius: var(--r-lg);
+  padding: var(--sp-4) var(--sp-5);
+}
+.pipeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  align-items: stretch;
+  gap: var(--sp-2);
+  overflow-x: auto;
+}
+.pipeline__step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-3) var(--sp-4);
+  min-width: 180px;
+  background: var(--crust);
+  border: var(--border-1);
+  border-radius: var(--r-md);
+  flex-shrink: 0;
+}
+.pipeline__step.is-error {
+  border-color: rgba(243, 139, 168, 0.25);
+  background: rgba(243, 139, 168, 0.04);
+}
+.pipeline__row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.pipeline__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+.pipeline__label {
+  font-weight: 500;
+  font-size: var(--fs-body);
+  color: var(--text-0);
+}
+.pipeline__detail {
+  line-height: 1.4;
+  margin-left: 16px;  /* aligns with the label text past the dot */
+}
+
+/* Gap between stages: shows the inter-stage duration. Centered
+   vertically so it reads as a connector, not a stage. */
+.pipeline__gap {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 2px;
+  padding: 0 var(--sp-1);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.pipeline__arrow {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  letter-spacing: -1px;
+}
+
+/* ---------- 4. Caller / callback grid ----------
+   Two equal-width panels side-by-side. At narrow widths they
+   stack. Each ends with a one-click jump into the corresponding
+   replay shell — that's the load-bearing affordance for this
+   page (cross-recording nav). */
+
+.send-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-4);
+}
+@media (max-width: 900px) {
+  .send-grid { grid-template-columns: 1fr; }
+}
+
+.panel__cta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-3);
+  border-top: var(--border-1);
+}
+
+/* ---------- 5. Request / response panels ----------
+   Headers as a kv block, body as a pre block with a thin head
+   strip naming the content-type and capture status (truncated /
+   captured in full). */
+
+.send-section { padding: var(--sp-4) var(--sp-5); }
+
+.send-bytes {
+  margin-top: var(--sp-4);
+  border: var(--border-1);
+  border-radius: var(--r-md);
+  background: var(--crust);
+  overflow: hidden;
+}
+.send-bytes__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: var(--border-1);
+  background: var(--crust);
+}
+.send-bytes__pre {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  line-height: 1.65;
+  color: var(--text-0);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}

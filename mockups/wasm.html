@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rec_8f2a91c4d3 · POST /api/checkout · rewind.js</title>
+  <link rel="stylesheet" href="rewind.css">
+  <link rel="stylesheet" href="wasm-styles.css">
+</head>
+<body>
+  <div class="replay">
+
+    <!-- ============================================================
+         APPBAR
+         The persistent identity strip. The breadcrumb here is the
+         *navigational* one (where in the dashboard am I?), distinct
+         from the stack-trace breadcrumb below (where in the
+         execution am I?).
+         ============================================================ -->
+    <header class="appbar replay__appbar">
+      <span class="appbar__brand">
+        <span class="brand-mark" aria-hidden="true">
+          <span class="brand-mark__tri"></span>
+          <span class="brand-mark__tri"></span>
+        </span>
+        rewind.js
+      </span>
+      <span class="crumb">
+        acme
+        <span class="crumb__sep">/</span>
+        recordings
+        <span class="crumb__sep">/</span>
+        <span class="c-brand">rec_8f2a91c4d3</span>
+      </span>
+      <span class="row-c gap-2 t-meta">
+        <!-- This invocation's outcome — NOT the thread's. Each handler
+             invocation is its own request: returns its own response,
+             commits its own transaction, gets its own 10ms CPU
+             envelope. The entry returned 202 immediately; whether a
+             downstream callback eventually threw is a different
+             recording's story, reachable through the send dashboard
+             via the http.send rows in the event stream. -->
+        <span class="badge badge--ok">202</span>
+        <span class="t-mono">POST /api/checkout</span>
+        <span class="t-mute">·</span>
+        <span title="JS handler CPU consumed (10ms cap per request)"><span class="t-mono">3ms</span> cpu</span>
+      </span>
+      <span class="grow"></span>
+
+      <!-- ⌘K palette hint: the palette itself doesn't exist yet, but the
+           affordance lives here so users learn the keystroke from chrome
+           that's always visible. When the palette ships, the shortcut is
+           already in muscle memory. -->
+      <button class="cmdk-hint" aria-label="Open command palette">
+        <kbd>⌘ K</kbd>
+        <span class="cmdk-hint__label">actions</span>
+      </button>
+      <button class="btn btn--ghost btn--sm">Share</button>
+      <button class="btn btn--sm">Open in iframe shell</button>
+    </header>
+
+    <!-- ============================================================
+         STACK BREADCRUMB
+         The single most important navigational element on this page.
+         Each segment is a frame in the captured call stack. Click a
+         frame to jump the source view, variables drawer, and
+         scrubber context to that frame.
+
+         The rightmost frame is the *current* one (where the playhead
+         is paused). Earlier frames are ancestors. The chevrons read
+         left-to-right because that's the call direction — handler()
+         CALLED processCheckout() which CALLED computeTotal(). The
+         current frame's `:14` suffix is the line the playhead is
+         paused on — always shown, no separate mode toggle.
+         ============================================================ -->
+    <nav class="stack" aria-label="Call stack">
+      <button class="stack__frame">
+        <span class="stack__frame-file t-mono-sm t-dim">src/index.mjs</span>
+        <span class="stack__frame-fn t-mono">handler</span>
+      </button>
+      <span class="stack__chev" aria-hidden="true">›</span>
+      <button class="stack__frame">
+        <span class="stack__frame-file t-mono-sm t-dim">src/lib/checkout.mjs</span>
+        <span class="stack__frame-fn t-mono">processCheckout</span>
+      </button>
+      <span class="stack__chev" aria-hidden="true">›</span>
+      <button class="stack__frame is-current">
+        <span class="stack__frame-file t-mono-sm t-dim">src/lib/pricing.mjs</span>
+        <span class="stack__frame-fn t-mono">computeTotal</span>
+        <span class="stack__frame-line t-mono-sm">:14</span>
+      </button>
+
+      <span class="grow"></span>
+
+      <!-- Highest-leverage debug action: jump to the next throw in
+           THIS invocation. Strictly intra-recording — cross-recording
+           investigation goes through the send dashboard, which is the
+           single source of truth for "what happened with this
+           http.send". This entry recording contains no throws, so the
+           button is disabled with a hint pointing to the send
+           dashboard. -->
+      <button class="next-error" disabled
+              title="No throws in this invocation. Downstream failures are reachable through the send dashboard (click an http.send row).">
+        <span class="next-error__dot" aria-hidden="true"></span>
+        No errors here
+      </button>
+    </nav>
+
+    <!-- ============================================================
+         MAIN GRID
+         Three columns:
+           - Modules rail (collapsible, narrow)
+           - Source viewport (the main act)
+           - Event stream (the "chat alongside the video")
+
+         Beneath: transport bar, then variables drawer.
+         ============================================================ -->
+    <div class="replay__main">
+
+      <!-- ============ MODULES RAIL ============ -->
+      <aside class="rail replay__modules">
+        <div class="rail__head row-sb">
+          <span class="t-eyebrow">Modules</span>
+          <button class="btn btn--ghost btn--icon btn--sm" aria-label="Collapse">‹</button>
+        </div>
+        <ul class="mod-tree">
+          <li class="mod-tree__item">
+            <span class="mod-tree__file t-mono"><span class="mod-tree__dir">src/</span>index.mjs</span>
+            <span class="mod-tree__hash t-dimmer t-mono-sm" title="Content hash — same hash means byte-identical file">8f2a</span>
+          </li>
+          <li class="mod-tree__item">
+            <span class="mod-tree__file t-mono"><span class="mod-tree__dir">src/lib/</span>checkout.mjs</span>
+            <span class="mod-tree__hash t-dimmer t-mono-sm" title="Content hash — same hash means byte-identical file">4c1d</span>
+          </li>
+          <li class="mod-tree__item is-current">
+            <span class="mod-tree__file t-mono"><span class="mod-tree__dir">src/lib/</span>pricing.mjs</span>
+            <span class="mod-tree__hash t-dimmer t-mono-sm" title="Content hash — same hash means byte-identical file">a91b</span>
+          </li>
+          <li class="mod-tree__item">
+            <span class="mod-tree__file t-mono"><span class="mod-tree__dir">src/svc/</span>payments.mjs</span>
+            <span class="mod-tree__hash t-dimmer t-mono-sm" title="Content hash — same hash means byte-identical file">3e07</span>
+          </li>
+          <li class="mod-tree__item">
+            <span class="mod-tree__file t-mono"><span class="mod-tree__dir">src/util/</span>validate.mjs</span>
+            <span class="mod-tree__hash t-dimmer t-mono-sm" title="Content hash — same hash means byte-identical file">d2f5</span>
+          </li>
+        </ul>
+      </aside>
+
+      <!-- ============ SOURCE VIEWPORT ============ -->
+      <main class="replay__source">
+        <div class="source__head">
+          <span class="t-mono-lg">
+            <span class="t-dim">src/lib/</span><span class="c-info">pricing.mjs</span>
+            <span class="t-dim">· line</span>
+            <span class="c-brand">14</span>
+          </span>
+          <span class="grow"></span>
+          <span class="t-meta">paused</span>
+        </div>
+
+        <!-- The source itself. Current line highlighted; breakpoint on
+             line 11. Line numbers in a dimmer gutter; tokens in three
+             accent colors over a recessed surface. -->
+        <div class="code source__code">
+          <div class="code__gutter">
+            <span class="ln">1</span>
+            <span class="ln">2</span>
+            <span class="ln">3</span>
+            <span class="ln">4</span>
+            <span class="ln">5</span>
+            <span class="ln">6</span>
+            <span class="ln">7</span>
+            <span class="ln">8</span>
+            <span class="ln">9</span>
+            <span class="ln">10</span>
+            <span class="ln">11</span>
+            <span class="ln">12</span>
+            <span class="ln">13</span>
+            <span class="ln">14</span>
+            <span class="ln">15</span>
+            <span class="ln">16</span>
+            <span class="ln">17</span>
+            <span class="ln">18</span>
+            <span class="ln">19</span>
+          </div>
+          <div class="code__body"><span class="line"><span class="tok-comm">// pricing.mjs — line-item subtotal + tax math</span></span><span class="line"></span><span class="line"><span class="tok-kw">import</span> { roundCents } <span class="tok-kw">from</span> <span class="tok-str">"./util.mjs"</span>;</span><span class="line"></span><span class="line"><span class="tok-kw">export function</span> <span class="tok-fn">computeTotal</span>(items, taxRate) {</span><span class="line">  <span class="tok-kw">if</span> (!Array.<span class="tok-fn">isArray</span>(items)) {</span><span class="line">    <span class="tok-kw">throw new</span> <span class="tok-fn">TypeError</span>(<span class="tok-str">"items must be an array"</span>);</span><span class="line">  }</span><span class="line"></span><span class="line">  <span class="tok-kw">let</span> subtotal = <span class="tok-num">0</span>;</span><span class="line has-breakpoint">  <span class="tok-kw">for</span> (<span class="tok-kw">const</span> item <span class="tok-kw">of</span> items) {</span><span class="line">    subtotal += item.price * item.qty;</span><span class="line">  }</span><span class="line is-current">  <span class="tok-kw">const</span> tax = <span class="tok-fn">roundCents</span>(subtotal * taxRate);</span><span class="line">  <span class="tok-kw">const</span> total = subtotal + tax;</span><span class="line"></span><span class="line">  <span class="tok-kw">return</span> { subtotal, tax, total };</span><span class="line">}</span><span class="line"></span></div>
+        </div>
+      </main>
+
+      <!-- ============ EVENT STREAM (right rail) ============
+           Every keyframe in this invocation flows down this rail.
+           Auto-scrolls to follow the playhead unless the user
+           manually scrolls, then pauses (YouTube live-chat pattern).
+           A "Resume following" button appears when paused.
+
+           Each event card is clickable: click → playhead jumps to
+           that event. The card near the playhead has a thicker mauve
+           left border ("you are here").
+
+           Color coding tracks the engine's semantic accents:
+             blue=info/control, green=kv read, peach=kv write,
+             rosewater=external effect (http.send),
+             pink=error (throw), yellow=warning.
+
+           NB: every event in this list happens within ONE handler
+           invocation — synchronous, sub-ms, no I/O wait. There are
+           no `fetch` ticks because http.send is an emission, not an
+           awaitable; the response arrives on a separate callback
+           recording (see thread strip above).
+           ================================================ -->
+      <aside class="stream">
+        <div class="stream__head row-sb">
+          <span class="t-eyebrow">Events</span>
+          <span class="row-c gap-2">
+            <button class="chip is-on"><span class="chip__dot c-read"></span>kv</button>
+            <button class="chip is-on"><span class="chip__dot c-effect"></span>http.send</button>
+            <button class="chip is-on"><span class="chip__dot c-info"></span>flow</button>
+          </span>
+        </div>
+
+        <ol class="stream__list">
+          <!-- Earlier events (already played) -->
+          <li class="ev ev--past">
+            <div class="ev__rail">
+              <span class="ev__dot c-info" aria-hidden="true"></span>
+            </div>
+            <div class="ev__body">
+              <div class="ev__head">
+                <span class="t-mono-sm c-info">request</span>
+                <span class="ev__t t-mono-sm t-dimmer">1</span>
+              </div>
+              <div class="t-mono-sm t-dim">POST /api/checkout</div>
+              <div class="ev__detail t-mono-sm t-dimmer">order_id "o-42" · user u_NfX1k2</div>
+            </div>
+          </li>
+
+          <li class="ev ev--past">
+            <div class="ev__rail">
+              <span class="ev__dot c-read" aria-hidden="true"></span>
+            </div>
+            <div class="ev__body">
+              <div class="ev__head">
+                <span class="t-mono-sm c-read">kv.get</span>
+                <span class="ev__t t-mono-sm t-dimmer">2</span>
+              </div>
+              <div class="t-mono-sm t-dim">cart/u_NfX1k2</div>
+              <div class="ev__detail t-mono-sm t-dimmer">→ Array(3) · $42.50 subtotal</div>
+            </div>
+          </li>
+
+          <li class="ev ev--past">
+            <div class="ev__rail">
+              <span class="ev__dot c-read" aria-hidden="true"></span>
+            </div>
+            <div class="ev__body">
+              <div class="ev__head">
+                <span class="t-mono-sm c-read">kv.get</span>
+                <span class="ev__t t-mono-sm t-dimmer">3</span>
+              </div>
+              <div class="t-mono-sm t-dim">user/u_NfX1k2</div>
+              <div class="ev__detail t-mono-sm t-dimmer">→ "jess@acme.io" · region US-CA</div>
+            </div>
+          </li>
+
+          <!-- The current event (playhead is here) -->
+          <li class="ev ev--current">
+            <div class="ev__rail">
+              <span class="ev__dot c-read" aria-hidden="true"></span>
+              <span class="ev__playhead" aria-hidden="true"></span>
+            </div>
+            <div class="ev__body">
+              <div class="ev__head">
+                <span class="t-mono-sm c-read">kv.get</span>
+                <span class="ev__t t-mono-sm c-brand">4</span>
+              </div>
+              <div class="t-mono-sm">tax_rates/US-CA</div>
+              <div class="ev__detail t-mono-sm t-dim">→ 0.0875</div>
+            </div>
+          </li>
+
+          <!-- Future events (not yet played) — dimmed.
+               http.send rows are emissions. The actual HTTP call fires
+               from the scheduler thread; the response (and any chained
+               on_result callback) is its own recording — see the thread
+               strip up top. -->
+          <li class="ev ev--future">
+            <div class="ev__rail">
+              <span class="ev__dot c-effect" aria-hidden="true"></span>
+            </div>
+            <div class="ev__body">
+              <div class="ev__head">
+                <span class="t-mono-sm c-effect">http.send</span>
+                <span class="ev__t t-mono-sm t-dimmer">5</span>
+              </div>
+              <div class="t-mono-sm t-dim">POST api.stripe.com/v1/charges</div>
+              <div class="ev__detail t-mono-sm t-dimmer">
+                on_result: stripe/charge_result
+                <a class="ev__send-link" href="send.html" title="Open this send on the send dashboard">open send ↗</a>
+              </div>
+            </div>
+          </li>
+
+          <li class="ev ev--future">
+            <div class="ev__rail">
+              <span class="ev__dot c-effect" aria-hidden="true"></span>
+            </div>
+            <div class="ev__body">
+              <div class="ev__head">
+                <span class="t-mono-sm c-effect">http.send</span>
+                <span class="ev__t t-mono-sm t-dimmer">6</span>
+              </div>
+              <div class="t-mono-sm t-dim">POST analytics.acme.io/checkout</div>
+              <div class="ev__detail t-mono-sm t-dimmer">
+                on_result: log_charge_event
+                <a class="ev__send-link" href="send.html" title="Open this send on the send dashboard">open send ↗</a>
+              </div>
+            </div>
+          </li>
+
+          <li class="ev ev--future">
+            <div class="ev__rail">
+              <span class="ev__dot c-info" aria-hidden="true"></span>
+            </div>
+            <div class="ev__body">
+              <div class="ev__head">
+                <span class="t-mono-sm c-info">return</span>
+                <span class="ev__t t-mono-sm t-dimmer">7</span>
+              </div>
+              <div class="t-mono-sm t-dim">202 Accepted</div>
+              <div class="ev__detail t-mono-sm t-dimmer">{ order_id: "o-42", status: "processing" }</div>
+            </div>
+          </li>
+        </ol>
+
+        <!-- When user scrolls manually, this banner appears so they
+             can return to live-follow. -->
+        <div class="stream__resume" hidden>
+          <button class="btn btn--sm">↓ Resume following playhead</button>
+        </div>
+      </aside>
+
+    </div>
+
+    <!-- ============================================================
+         TRANSPORT BAR
+         The scrubber doubles as the timeline: event ticks live ON
+         the scrubber track, colored by event type. This kills the
+         need for a separate timeline view and matches the YouTube-
+         chapters-on-the-scrubber pattern users already understand.
+
+         Control sequence (left to right):
+           [⟪]  Jump to start
+           [◀]  Step back one event
+           [▶]  Play/pause
+           [▶]  Step forward one event
+           [⟫]  Jump to end
+         ============================================================ -->
+    <div class="transport">
+
+      <!-- Controls layout:
+             [⟪]  jump to first keyframe
+             [◀]  step back one keyframe (inverse of the last forward step)
+             [▶]  play — autoplay forward through keyframes (~300ms/step;
+                  no wall-clock speed concept, the engine model is a
+                  sequence of keyframes, not continuous time)
+             [drill-group]  the four-button step-forward family;
+                  granularity falls out of which button you click:
+                    ↷  step over   (next sibling event, skip past calls)
+                    ↓  step into   (descend into the next call)
+                    ↑  step out    (return up one stack frame)
+                    →  step line   (single line within current frame —
+                                    resolved by deterministic re-execution
+                                    from the previous keyframe, not stored)
+             [⟫]  jump to last keyframe                                    -->
+      <div class="transport__controls">
+        <button class="btn btn--ghost btn--icon" aria-label="Jump to start" title="Jump to start (Home)">⟪</button>
+        <button class="btn btn--ghost btn--icon" aria-label="Step back" title="Step back (B)">◀</button>
+        <button class="btn btn--icon transport__play" aria-label="Play" title="Play / pause (Space)">▶</button>
+        <div class="drill-group" role="group" aria-label="Step forward — drill family">
+          <button class="btn btn--ghost btn--icon" aria-label="Step over" title="Step over · skip past calls (F10)">↷</button>
+          <button class="btn btn--ghost btn--icon" aria-label="Step into" title="Step into next call (F11)">↓</button>
+          <button class="btn btn--ghost btn--icon" aria-label="Step out" title="Step out of frame (Shift+F11)">↑</button>
+          <button class="btn btn--ghost btn--icon" aria-label="Step line" title="Step one line (→)">→</button>
+        </div>
+        <button class="btn btn--ghost btn--icon" aria-label="Jump to end" title="Jump to end (End)">⟫</button>
+      </div>
+
+      <!-- The scrubber. The played-portion gradient ends at the
+           playhead. Event ticks sit on the rail with subtle vertical
+           offsets to avoid overlap; key events (error, current) get
+           larger marks. The playhead is a mauve vertical line with a
+           chip beneath it showing the current keyframe index.
+
+           The mauve playhead chip echoes the logo's brand mark
+           pill — same shape, same color. The logo's rewind gesture
+           lives on every replay page as the playhead.
+
+           Drag = scan (snap to event ticks). Click step buttons = drill
+           (line-grain). Granularity falls out of which interaction the
+           user picks; there is no mode toggle.
+
+           Note: spatial position of each tick is still time-proportional
+           (so clusters and gaps tell you "lots happened here" / "slow
+           call ran here"), but the chip + transport time read in event
+           counts because the navigable axis is keyframes, not seconds.
+           Per-event wall-clock time is available as the chip's title. -->
+      <!-- aria values track the keyframe index. Ticks are evenly
+           spaced because the navigable axis is event-count: within
+           one invocation, every keyframe is sub-ms apart (synchronous
+           handler, no I/O wait), so time-proportional spacing would
+           just bunch every tick at the same position. -->
+      <div class="scrubber" role="slider" aria-label="Replay timeline"
+           aria-valuemin="1" aria-valuemax="7" aria-valuenow="4">
+        <div class="scrubber__track">
+          <div class="scrubber__played" style="width: 50%;"></div>
+
+          <!-- Event ticks. Evenly spaced (event-indexed). -->
+          <span class="scrubber__tick" style="left: 5%;   background: var(--c-info);"   title="1 · request POST /api/checkout"></span>
+          <span class="scrubber__tick" style="left: 20%;  background: var(--c-read);"   title="2 · kv.get cart/u_NfX1k2"></span>
+          <span class="scrubber__tick" style="left: 35%;  background: var(--c-read);"   title="3 · kv.get user/u_NfX1k2"></span>
+          <span class="scrubber__tick" style="left: 50%;  background: var(--c-read);"   title="4 · kv.get tax_rates/US-CA (current)"></span>
+          <span class="scrubber__tick" style="left: 65%;  background: var(--c-effect);" title="5 · http.send /v1/charges → charge_result"></span>
+          <span class="scrubber__tick" style="left: 80%;  background: var(--c-effect);" title="6 · http.send /analytics → log_charge_event"></span>
+          <span class="scrubber__tick" style="left: 95%;  background: var(--c-info);"   title="7 · return 202 Accepted"></span>
+
+          <!-- Playhead. Chip shows event index (4 / 7) — the navigable
+               axis. Hover for event name. -->
+          <div class="scrubber__playhead" style="left: 50%;">
+            <div class="scrubber__playhead-line"></div>
+            <div class="scrubber__playhead-chip t-mono-sm"
+                 title="event 4 · kv.get tax_rates/US-CA">4 / 7</div>
+          </div>
+        </div>
+      </div>
+
+      <span class="transport__time t-mono">
+        <span class="c-brand">event 4</span>
+        <span class="t-dim">of 7</span>
+      </span>
+
+    </div>
+
+    <!-- ============================================================
+         VARIABLES DRAWER
+         Bottom drawer, like DevTools Scope panel. Default state
+         remembers last user preference per-recording (we marked the
+         demo state as expanded so you can see what it looks like;
+         in production this would respect localStorage).
+
+         Three sections: Locals, Arguments, Closure. The "changed
+         this frame" annotation is the killer detail — it shows
+         exactly what mutation just happened.
+         ============================================================ -->
+    <details class="vars" open>
+      <summary class="vars__head">
+        <span class="row-c gap-3">
+          <span class="vars__chev" aria-hidden="true">▾</span>
+          <span class="t-h3">Variables</span>
+        </span>
+      </summary>
+
+      <div class="vars__body">
+        <div class="vars__section">
+          <span class="t-eyebrow vars__section-title">Arguments</span>
+          <div class="kv">
+            <span class="kv__k">items</span>
+            <span class="kv__v">Array(3) <span class="t-dim t-meta">[{sku:"ABC-123",price:14.00,qty:2}, …]</span></span>
+            <span class="kv__k">taxRate</span>
+            <span class="kv__v c-write">0.0875</span>
+          </div>
+        </div>
+
+        <div class="vars__section">
+          <span class="t-eyebrow vars__section-title">Locals</span>
+          <div class="kv">
+            <span class="kv__k">subtotal</span>
+            <span class="kv__v c-write">42.50</span>
+            <span class="kv__k">tax</span>
+            <span class="kv__v c-write">3.72 <span class="t-dim t-meta">← just computed</span></span>
+            <span class="kv__k">total</span>
+            <span class="kv__v t-dimmer">undefined <span class="t-dim t-meta">(line 15, not yet assigned)</span></span>
+          </div>
+        </div>
+
+        <div class="vars__section">
+          <span class="t-eyebrow vars__section-title">Closure · pricing.mjs</span>
+          <div class="kv">
+            <span class="kv__k">roundCents</span>
+            <span class="kv__v c-info">fn util.mjs:8</span>
+          </div>
+        </div>
+      </div>
+    </details>
+
+  </div>
+</body>
+</html>

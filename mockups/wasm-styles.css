@@ -1,0 +1,618 @@
+/* ============================================================
+   wasm-styles.css — replay-WASM page component styles
+   Extends rewind.css. Loaded second.
+   ------------------------------------------------------------
+   This file owns the components that only the WASM replay page
+   needs: the stack-trace breadcrumb, the source viewport chrome,
+   the event-stream right rail, the scrubber-as-timeline, and the
+   bottom variables drawer.
+
+   Everything else (typography, surface tokens, semantic accents,
+   buttons, chips, panels, code styles) comes from rewind.css.
+   ============================================================ */
+
+/* ---------- Page grid ----------
+   The whole replay page is a vertical stack:
+     [ appbar       ] 48px fixed
+     [ stack        ] 36px fixed  — call stack within this invocation
+     [ main grid    ] 1fr  flexible
+     [ transport    ] 56px fixed
+     [ vars drawer  ] auto (collapses to 32px)
+   The main grid is its own three-column layout (modules / source / stream).
+
+   Cross-recording navigation (parent / children in the request tree)
+   is delegated to the send dashboard — every http.send row in the
+   event stream links there. The replay shell stays focused on the
+   one invocation it's replaying.
+*/
+
+.replay {
+  height: 100vh;
+  display: grid;
+  grid-template-rows: 48px 36px 1fr auto auto;
+  background: var(--base);
+  overflow: hidden;
+}
+
+.replay__appbar { /* inherits .appbar */ }
+
+/* ---------- ⌘K palette hint ----------
+   Discoverability surface for the (not-yet-built) command palette. The
+   shortcut chip lives in chrome that's always visible so users learn
+   it from passive exposure. When the palette ships, the muscle memory
+   is already there. */
+
+.cmdk-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 24px;
+  padding: 0 var(--sp-2) 0 var(--sp-1);
+  border: var(--border-1);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: background var(--motion-fast) var(--ease-out),
+              border-color var(--motion-fast) var(--ease-out),
+              color var(--motion-fast) var(--ease-out);
+}
+.cmdk-hint:hover {
+  background: var(--surface-0);
+  border-color: var(--surface-1);
+  color: var(--text-1);
+}
+.cmdk-hint kbd {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  background: var(--mantle);
+  padding: 1px var(--sp-1);
+  border-radius: var(--r-sm);
+  color: var(--text-1);
+}
+.cmdk-hint__label { font-size: var(--fs-meta); }
+
+.replay__main {
+  display: grid;
+  grid-template-columns: 240px 1fr 360px;
+  min-height: 0;  /* prevents grid blowing past viewport */
+  overflow: hidden;
+}
+
+/* ---------- Stack-trace breadcrumb ----------
+   This is the navigational hero of the page. Three frames here:
+   each is a button (clicking jumps the source view, variables,
+   and playhead context). The chevron between frames reads left to
+   right because that's the call direction.
+
+   The current frame has a faint rosewater background tint and a
+   line-number suffix in drill mode. */
+
+.stack {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 36px;
+  padding: 0 var(--sp-6);
+  background: var(--crust);
+  border-bottom: var(--border-1);
+}
+
+.stack__frame {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  height: 24px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-sm);
+  color: var(--text-1);
+  transition: background var(--motion-fast) var(--ease-out),
+              color var(--motion-fast) var(--ease-out);
+}
+.stack__frame:hover { background: var(--surface-0); color: var(--text-0); }
+
+.stack__frame.is-current {
+  background: rgba(203, 166, 247, 0.08);
+  color: var(--text-0);
+}
+.stack__frame.is-current .stack__frame-fn { color: var(--c-brand); }
+
+.stack__frame-file { /* the .mjs name */ }
+.stack__frame-fn   { font-weight: 500; }
+.stack__frame-line { color: var(--c-brand); }
+
+.stack__chev {
+  color: var(--text-4);
+  font-size: 14px;
+  user-select: none;
+}
+
+/* Next-error jump — highest-leverage debug action. Sits in the right
+   slot of the stack-breadcrumb strip (where the pulled Scan/Drill
+   toggle used to live). Pink-tinted to signal "things that went
+   wrong"; count badge shows how many errors remain ahead. */
+
+.next-error {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 24px;
+  padding: 0 var(--sp-3);
+  background: rgba(243, 139, 168, 0.08);
+  border: 1px solid rgba(243, 139, 168, 0.25);
+  border-radius: var(--r-md);
+  color: var(--c-error);
+  font-family: var(--font-sans);
+  font-size: var(--fs-meta);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--motion-fast) var(--ease-out);
+}
+.next-error:hover { background: rgba(243, 139, 168, 0.14); }
+.next-error:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.next-error__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--c-error);
+  flex-shrink: 0;
+}
+.next-error__count {
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-sm);
+  background: rgba(243, 139, 168, 0.2);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Modules rail (left column) ---------- */
+
+.replay__modules {
+  min-width: 0;
+}
+
+.mod-tree {
+  list-style: none;
+  margin: 0;
+  padding: var(--sp-2) 0;
+}
+.mod-tree__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-4);
+  cursor: pointer;
+  transition: background var(--motion-fast) var(--ease-out);
+}
+.mod-tree__item:hover { background: var(--mantle); }
+.mod-tree__item.is-current {
+  background: rgba(203, 166, 247, 0.08);
+  box-shadow: inset 2px 0 0 var(--c-brand);
+}
+.mod-tree__item.is-current .mod-tree__file { color: var(--c-brand); }
+.mod-tree__file {
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+/* Dim path prefix inside the filename — basename remains the bright,
+   scan-anchoring part; the directory gives context without competing. */
+.mod-tree__dir { color: var(--text-4); }
+.mod-tree__hash { flex-shrink: 0; }
+
+/* ---------- Source viewport (middle column) ---------- */
+
+.replay__source {
+  display: flex;
+  flex-direction: column;
+  background: var(--base);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.source__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-5);
+  border-bottom: var(--border-1);
+  background: var(--mantle);
+  flex-shrink: 0;
+}
+
+/* Reuse the .code container from rewind.css; just make it fill the
+   remaining space and scroll. */
+.source__code {
+  flex: 1;
+  min-height: 0;
+  border: none;
+}
+
+/* ---------- Event stream (right column / the "chat") ---------- */
+
+.stream {
+  display: flex;
+  flex-direction: column;
+  background: var(--mantle);
+  border-left: var(--border-1);
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.stream__head {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: var(--border-1);
+  background: var(--crust);
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.stream__list {
+  list-style: none;
+  margin: 0;
+  padding: var(--sp-2) 0;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Event card. Three columns inside: rail (with dot + maybe playhead
+   line), body (head + detail), and a flexible spacer.
+
+   Past events: full opacity.
+   Future events: dimmed to 0.45, signaling "not yet played."
+   Current event: rosewater left border, slight surface tint. */
+
+.ev {
+  display: grid;
+  grid-template-columns: 20px 1fr;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  position: relative;
+  cursor: pointer;
+  transition: background var(--motion-fast) var(--ease-out);
+}
+.ev:hover { background: var(--surface-0); }
+
+.ev__rail {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  padding-top: 4px;
+}
+/* The continuous vertical line that connects event dots into a
+   visual stream. Stops at the dot, resumes below it. */
+.ev__rail::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  margin-left: -0.5px;
+  background: var(--surface-0);
+  z-index: 0;
+}
+.ev:first-child .ev__rail::before { top: 8px; }
+.ev:last-child  .ev__rail::before { bottom: calc(100% - 14px); }
+
+.ev__dot {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-3);
+  box-shadow: 0 0 0 3px var(--mantle);
+  z-index: 1;
+  margin-top: 3px;
+}
+
+.ev__body { min-width: 0; }
+
+.ev__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-bottom: 1px;
+}
+
+.ev__t {
+  font-variant-numeric: tabular-nums;
+}
+
+.ev__detail {
+  margin-top: 2px;
+  line-height: 1.45;
+}
+
+/* Per-event "open on send dashboard" link. Appears on http.send rows.
+   The send dashboard is the canonical hub for "what happened with
+   this send" — its row carries the response status, captured body,
+   which callback recording fired (and when). Cross-recording
+   navigation flows through that surface rather than through the
+   replay shell's chrome. */
+.ev__send-link {
+  display: inline-block;
+  margin-left: var(--sp-2);
+  padding: 0 var(--sp-1);
+  border: var(--border-1);
+  border-radius: var(--r-sm);
+  color: var(--c-effect);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-sm);
+  text-decoration: none;
+  transition: background var(--motion-fast) var(--ease-out);
+}
+.ev__send-link:hover {
+  background: rgba(245, 224, 220, 0.1);
+}
+
+/* State variants */
+.ev--future { opacity: 0.45; }
+.ev--future:hover { opacity: 1; }
+
+.ev--current {
+  background: rgba(203, 166, 247, 0.06);
+  box-shadow: inset 2px 0 0 var(--c-brand);
+}
+.ev--current .ev__dot {
+  box-shadow: 0 0 0 3px var(--mantle), 0 0 0 5px var(--c-brand);
+}
+
+/* The faint horizontal playhead line that crosses the rail at the
+   current event — echoes the playhead line on the scrubber. */
+.ev--current .ev__playhead {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--c-brand);
+  opacity: 0.3;
+  pointer-events: none;
+}
+
+.ev--error .ev__head .t-mono-sm { font-weight: 500; }
+
+/* Resume-following banner — appears when user has scrolled the
+   stream away from auto-follow position. Floats above the list. */
+.stream__resume {
+  position: absolute;
+  bottom: var(--sp-4);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  box-shadow: var(--shadow-popover);
+}
+
+/* ---------- Transport bar ---------- */
+
+.transport {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: var(--sp-5);
+  padding: 0 var(--sp-6);
+  height: 56px;
+  background: var(--crust);
+  border-top: var(--border-1);
+  flex-shrink: 0;
+}
+
+.transport__controls {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+/* Drill group — the four-button step-forward family (over / in / out /
+   line). Visually grouped (shared background + tight spacing) so it
+   reads as one widget, separate from the play button and the
+   jump-to-anchor buttons flanking it.
+
+   No mode toggle: the granularity comes from which button you press.
+   Pressing one of these is what makes the playhead snap line-grain
+   instead of event-grain. */
+
+.drill-group {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  background: var(--mantle);
+  border: var(--border-1);
+  border-radius: var(--r-md);
+  margin-left: var(--sp-2);
+}
+.drill-group .btn--icon {
+  height: 22px;
+  width: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+}
+.drill-group .btn--icon:hover {
+  background: var(--surface-0);
+  color: var(--text-0);
+  border: none;
+}
+
+.transport__play {
+  background: var(--c-brand);
+  color: var(--crust);
+  border-color: var(--c-brand);
+}
+.transport__play:hover { background: #d5abfb; }
+
+.transport__time {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---------- Scrubber (the rich timeline) ---------- */
+
+.scrubber {
+  position: relative;
+  height: 32px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+}
+
+.scrubber__track {
+  position: relative;
+  height: 4px;
+  width: 100%;
+  background: var(--surface-0);
+  border-radius: 2px;
+}
+
+/* The played portion — a brand-tinted gradient from the start to the
+   playhead. */
+.scrubber__played {
+  position: absolute;
+  top: 0; left: 0; bottom: 0;
+  background: linear-gradient(
+    to right,
+    var(--c-brand) 0%,
+    color-mix(in oklab, var(--c-brand) 70%, var(--c-error) 30%) 100%
+  );
+  border-radius: 2px 0 0 2px;
+  opacity: 0.7;
+}
+
+/* Event ticks — colored marks on the rail. They sit slightly above
+   the track so they don't get hidden by the played fill. */
+.scrubber__tick {
+  position: absolute;
+  top: -3px;
+  width: 2px;
+  height: 10px;
+  border-radius: 1px;
+  transform: translateX(-1px);
+  transition: transform var(--motion-fast) var(--ease-out),
+              opacity var(--motion-fast) var(--ease-out);
+  cursor: pointer;
+}
+.scrubber__tick:hover {
+  transform: translateX(-1px) scaleY(1.4);
+}
+.scrubber__tick--big {
+  top: -5px;
+  width: 3px;
+  height: 14px;
+  transform: translateX(-1.5px);
+}
+.scrubber__tick--big:hover {
+  transform: translateX(-1.5px) scaleY(1.3);
+}
+
+/* Playhead — vertical line + chip beneath. The chip echoes the
+   logo's brand-mark pill (same color, same pill shape) so the
+   product's signature gesture lives on the scrubber. */
+.scrubber__playhead {
+  position: absolute;
+  top: -10px;
+  bottom: -10px;
+  width: 0;
+  transform: translateX(-1px);
+  pointer-events: none;
+}
+.scrubber__playhead-line {
+  position: absolute;
+  top: 0;
+  bottom: 14px;
+  left: 0;
+  width: 2px;
+  background: var(--c-brand);
+  border-radius: 1px;
+  box-shadow: 0 0 0 1px rgba(203, 166, 247, 0.2);
+}
+.scrubber__playhead-chip {
+  position: absolute;
+  bottom: -6px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--c-brand);
+  color: var(--crust);
+  padding: 1px var(--sp-2);
+  border-radius: var(--r-pill);
+  white-space: nowrap;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Variables drawer (bottom) ---------- */
+
+/* <details>-based so it's keyboard-accessible and remembers state.
+   In production, the `open` attribute would be hydrated from
+   localStorage per-recording-id. */
+
+.vars {
+  background: var(--mantle);
+  border-top: var(--border-1);
+  flex-shrink: 0;
+}
+.vars summary { list-style: none; cursor: pointer; }
+.vars summary::-webkit-details-marker { display: none; }
+
+.vars__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--sp-3) var(--sp-6);
+  user-select: none;
+  transition: background var(--motion-fast) var(--ease-out);
+}
+.vars__head:hover { background: var(--surface-0); }
+
+.vars__chev {
+  display: inline-block;
+  width: 12px;
+  color: var(--text-3);
+  transition: transform var(--motion-fast) var(--ease-out);
+}
+.vars:not([open]) .vars__chev { transform: rotate(-90deg); }
+
+.vars__body {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-8);
+  padding: var(--sp-4) var(--sp-6) var(--sp-6);
+  border-top: var(--border-1);
+}
+
+.vars__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+.vars__section-title { color: var(--text-2); }
+
+/* ---------- Responsive cutoffs ----------
+   At narrow widths, the right rail collapses to icons; below
+   1100px the modules rail tucks behind a toggle. We won't ship a
+   mobile layout for the prototype but these guards prevent the
+   page from breaking when someone resizes. */
+
+@media (max-width: 1280px) {
+  .replay__main { grid-template-columns: 200px 1fr 320px; }
+  .vars__body   { grid-template-columns: repeat(2, 1fr); gap: var(--sp-6); }
+}
+@media (max-width: 1024px) {
+  .replay__main { grid-template-columns: 1fr 320px; }
+  .replay__modules { display: none; }
+  .vars__body   { grid-template-columns: 1fr; }
+}
