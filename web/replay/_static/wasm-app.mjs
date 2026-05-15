@@ -61,7 +61,7 @@ function btn(label) {
 const T = {
     jumpStart: btn("Jump to start"),
     stepBack:  btn("Step back"),
-    play:      btn("Play"),
+    play:      btn("Step forward"),    // ▶ — now the forward sibling of ◀
     stepOver:  btn("Step over"),
     stepIn:    btn("Step into"),
     stepOut:   btn("Step out"),
@@ -688,38 +688,17 @@ function nextError() {
     }
 }
 
-// Play / pause — autoplay through events at ~300ms each (no wall-clock
-// "speed" concept; the model is keyframes).
-let playInterval = null;
-const PLAY_INTERVAL_MS = 300;
-function isPlaying() { return playInterval !== null; }
-function pause() {
-    if (playInterval) clearInterval(playInterval);
-    playInterval = null;
-    if (T.play) T.play.textContent = "▶";
-}
-function playPause() {
-    if (!state.mat) return;
-    if (isPlaying()) return pause();
-    if (state.playhead >= state.mat.events.length - 1) {
-        setPlayhead(0);
-    }
-    playInterval = setInterval(() => {
-        if (!state.mat || state.playhead >= state.mat.events.length - 1) {
-            pause();
-            return;
-        }
-        setPlayhead(state.playhead + 1);
-    }, PLAY_INTERVAL_MS);
-    if (T.play) T.play.textContent = "❚❚";
-}
+// Forward / back pair: ◀ and ▶ are symmetric single-event steppers.
+// Autoplay had its day and got retired — the model is keyframes, not
+// wall-clock time, so "play at 300 ms/event" was neither obvious nor
+// useful. Keyboard Space mirrors the ▶ button.
 
 // Wire transport button clicks + a click on the scrubber track that
 // snaps to the nearest scan event.
 function wireTransport() {
     if (T.jumpStart) T.jumpStart.addEventListener("click", jumpStart);
     if (T.stepBack)  T.stepBack .addEventListener("click", stepBack);
-    if (T.play)      T.play     .addEventListener("click", playPause);
+    if (T.play)      T.play     .addEventListener("click", stepLine);
     if (T.stepOver)  T.stepOver .addEventListener("click", stepOver);
     if (T.stepIn)    T.stepIn   .addEventListener("click", stepIn);
     if (T.stepOut)   T.stepOut  .addEventListener("click", stepOut);
@@ -746,7 +725,6 @@ function wireTransport() {
         $scrubber.addEventListener("mousedown", (ev) => {
             if (!state.mat) return;
             dragging = true;
-            pause();  // bail out of autoplay so we don't fight the user
             ev.preventDefault();
             setPlayhead(eventIdxAt(ev.clientX));
         });
@@ -763,7 +741,7 @@ function wireTransport() {
         if (tag === "INPUT" || tag === "TEXTAREA") return;
         if (ev.metaKey || ev.ctrlKey) return;
         switch (ev.key) {
-            case " ":          ev.preventDefault(); playPause(); break;
+            case " ":          ev.preventDefault(); stepLine();  break;
             case "ArrowRight": ev.preventDefault(); stepLine();  break;
             case "ArrowLeft":  ev.preventDefault(); stepBack();  break;
             case "Home":       ev.preventDefault(); jumpStart(); break;
