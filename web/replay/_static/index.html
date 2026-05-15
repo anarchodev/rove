@@ -160,8 +160,10 @@
 
   <!-- ============================================================
        VARIABLES DRAWER
-       Closed by default until we have DRILL-mode + a stack-walker
-       to populate it.
+       Body is a fixed-height, resizable scroll region so different
+       frames bringing different numbers of vars during a scrub
+       doesn't reflow the rest of the page. Drag the thin handle at
+       the top to adjust; height persists in localStorage.
        ============================================================ -->
   <details class="vars">
     <summary class="vars__head">
@@ -170,6 +172,8 @@
         <span class="t-h3">Variables</span>
       </span>
     </summary>
+    <div class="vars__resize" role="separator" aria-orientation="horizontal"
+         aria-label="Resize variables drawer" title="Drag to resize"></div>
     <div class="vars__body">
       <div class="t-meta t-dim">
         Variables at the current scan record will appear here once

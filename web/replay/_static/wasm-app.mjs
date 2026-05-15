@@ -789,9 +789,64 @@ function renderTransport(mat, playhead) {
 // Switching to ancestor frames via the stack-breadcrumb buttons is a
 // follow-up.
 
-const $vars     = document.querySelector(".vars");
-const $varsBody = document.querySelector(".vars__body");
+const $vars       = document.querySelector(".vars");
+const $varsBody   = document.querySelector(".vars__body");
+const $varsResize = document.querySelector(".vars__resize");
 let inspectSeq = 0;  // serialise rapid stepping; drop stale results
+
+// ── Variables drawer resize ──────────────────────────────────────────
+//
+// Drag the .vars__resize handle vertically to grow/shrink the drawer
+// body. The body has fixed height + overflow-y: auto, so the rest of
+// the page (including the scrubber the user might be dragging) stays
+// put. Height persists in localStorage so the preference sticks
+// across reloads.
+
+const VARS_HEIGHT_STORAGE_KEY = "rewind.replay.varsHeight";
+const VARS_MIN_HEIGHT = 80;
+function varsMaxHeight() { return Math.floor(window.innerHeight * 0.7); }
+
+function setVarsHeight(px, { persist = true } = {}) {
+    if (!$varsBody) return;
+    const clamped = Math.max(VARS_MIN_HEIGHT, Math.min(varsMaxHeight(), Math.round(px)));
+    $varsBody.style.height = clamped + "px";
+    if (persist) {
+        try { localStorage.setItem(VARS_HEIGHT_STORAGE_KEY, String(clamped)); }
+        catch { /* private mode etc — fine */ }
+    }
+}
+
+// Restore saved height on load.
+try {
+    const saved = parseInt(localStorage.getItem(VARS_HEIGHT_STORAGE_KEY) ?? "", 10);
+    if (!Number.isNaN(saved) && saved >= VARS_MIN_HEIGHT) {
+        setVarsHeight(saved, { persist: false });
+    }
+} catch { /* localStorage blocked — keep CSS default */ }
+
+if ($varsResize) {
+    let dragging = false;
+    let startY = 0;
+    let startHeight = 0;
+
+    $varsResize.addEventListener("mousedown", (e) => {
+        dragging = true;
+        startY = e.clientY;
+        startHeight = $varsBody.getBoundingClientRect().height;
+        $varsResize.classList.add("is-dragging");
+        e.preventDefault();
+    });
+    window.addEventListener("mousemove", (e) => {
+        if (!dragging) return;
+        // Drag UP (clientY decreases) grows the drawer.
+        setVarsHeight(startHeight + (startY - e.clientY));
+    });
+    window.addEventListener("mouseup", () => {
+        if (!dragging) return;
+        dragging = false;
+        $varsResize.classList.remove("is-dragging");
+    });
+}
 
 // Find the nearest varSnapshot at or before `eventIdx`. Binary search
 // since varSnapshots is sorted by eventOrdinal.

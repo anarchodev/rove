@@ -596,16 +596,33 @@
 }
 .vars:not([open]) .vars__chev { transform: rotate(-90deg); }
 
+/* Resize handle. Thin horizontal strip between the summary head
+   and the body — drag vertically to grow/shrink the drawer body.
+   The body has overflow scroll, so the drawer never pushes the
+   rest of the page around during a scrub. Height persists in
+   localStorage. */
+.vars__resize {
+  height: 6px;
+  cursor: ns-resize;
+  background: transparent;
+  border-top: var(--border-1);
+  transition: background var(--motion-fast) var(--ease-out);
+}
+.vars__resize:hover,
+.vars__resize.is-dragging {
+  background: rgba(203, 166, 247, 0.4);  /* mauve hint */
+}
+
 .vars__body {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: var(--sp-8);
   padding: var(--sp-4) var(--sp-6) var(--sp-6);
-  border-top: var(--border-1);
   /* Fixed visible height with internal scrolling — keeps the
      drawer from resizing the rest of the page (and the scrubber
      under your mouse) as different frames bring different numbers
-     of vars in and out during a scrub. */
+     of vars in and out during a scrub. Height adjusts via the
+     .vars__resize handle above. */
   height: 240px;
   overflow-y: auto;
 }
