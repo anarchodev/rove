@@ -49,10 +49,12 @@
        the *end-state* stack (empty after return); full stepping
        requires the cursor API a later pass will drive.
        ============================================================ -->
-  <nav class="stack" aria-label="Call stack" id="stack-frames">
-    <span class="t-meta t-dim" style="padding: 0 var(--sp-2);">
-      (call stack appears after handler runs)
-    </span>
+  <nav class="stack" aria-label="Call stack">
+    <div class="stack__frames" id="stack-frames">
+      <span class="t-meta t-dim" style="padding: 0 var(--sp-2);">
+        (call stack populates after handler runs)
+      </span>
+    </div>
 
     <span class="grow"></span>
 

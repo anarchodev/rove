@@ -477,6 +477,88 @@ function renderScrubber(collector) {
     );
 }
 
+// Stack breadcrumb: derive a call-stack snapshot from FUNC_ENTER /
+// FUNC_EXIT events. Two cases we can usefully render today:
+//
+//   1. Recording threw → snapshot the stack AT the throw event
+//      (the throw happens inside the deepest frame, no exits yet).
+//      Render the throw line as the rightmost frame's `:N` suffix
+//      with c-error styling.
+//
+//   2. Recording exited cleanly → final stack is empty. Render a
+//      placeholder explaining that mid-run frames need stepping
+//      (which itself needs the cursor API, not yet wired).
+//
+// Once stepping lands, this function gets a `currentEventIdx`
+// argument that bounds the walk — the snapshot becomes "stack at
+// scan record N" rather than "stack at throw" or "stack at end".
+
+function renderStackBreadcrumb(collector) {
+    const stack = [];
+    let throwInfo = null;
+    for (const e of collector.events) {
+        if (e.kind === "enter") {
+            stack.push({
+                name: collector.resolveName(e.name_atom),
+                file: collector.resolveName(e.file_atom),
+                line: e.line,
+            });
+        } else if (e.kind === "exit") {
+            stack.pop();
+        } else if (e.kind === "throw") {
+            throwInfo = {
+                file: collector.resolveName(e.file_atom),
+                line: e.line,
+                message: e.message,
+            };
+            break;  // snapshot at throw; don't unwind
+        }
+    }
+
+    $.stack.replaceChildren();
+    if (stack.length === 0) {
+        $.stack.appendChild(el("span", {
+            className: "t-meta t-dim",
+            text: throwInfo
+                ? "(throw at module top-level — no frames to walk)"
+                : "(handler exited cleanly — mid-run frames need stepping)",
+            style: { padding: "0 var(--sp-2)" },
+        }));
+        return;
+    }
+
+    for (let i = 0; i < stack.length; i++) {
+        const frame = stack[i];
+        const isLast = i === stack.length - 1;
+        if (i > 0) {
+            $.stack.appendChild(el("span", {
+                className: "stack__chev",
+                text: "›",
+                attrs: { "aria-hidden": "true" },
+            }));
+        }
+        const btn = el("button", {
+            className: "stack__frame" + (isLast ? " is-current" : ""),
+        });
+        btn.appendChild(el("span", {
+            className: "stack__frame-file t-mono-sm t-dim",
+            text: frame.file,
+        }));
+        btn.appendChild(el("span", {
+            className: "stack__frame-fn t-mono",
+            text: frame.name,
+        }));
+        if (isLast) {
+            const lineText = ":" + (throwInfo ? throwInfo.line : frame.line);
+            btn.appendChild(el("span", {
+                className: "stack__frame-line t-mono-sm" + (throwInfo ? " c-error" : ""),
+                text: lineText,
+            }));
+        }
+        $.stack.appendChild(btn);
+    }
+}
+
 // Next-error: enable if any throws exist; count throws total.
 // Wiring it to actually jump comes with the cursor API; for now
 // the button is decorative-but-honest.
@@ -608,6 +690,7 @@ async function main() {
         }
     }
 
+    renderStackBreadcrumb(trace);
     renderEventStream(trace);
     renderScrubber(trace);
     renderNextError(trace);

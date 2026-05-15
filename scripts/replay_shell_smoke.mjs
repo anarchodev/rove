@@ -316,11 +316,113 @@ async function checkPopulatedState(ctx) {
     if (tickCount > 0) ok(`scrubber has ${tickCount} ticks`);
     else               bad("scrubber has no ticks");
 
+    // Clean exit ⇒ no captured throw ⇒ stack breadcrumb shows its
+    // "exited cleanly" placeholder.
+    const stackTxt = (await popup.locator("#stack-frames").innerText()).trim();
+    if (stackTxt.includes("exited cleanly"))
+        ok("stack breadcrumb: " + JSON.stringify(stackTxt));
+    else
+        bad("stack breadcrumb missing exit placeholder: " + JSON.stringify(stackTxt));
+
     if (errors.length === 0) ok("no page-level JS errors");
     else                     bad("page errors: " + errors.join(" | "));
 
     await popup.screenshot({ path: "/tmp/replay-shell-populated.png" });
     ok("screenshot → /tmp/replay-shell-populated.png");
+
+    await popup.close();
+    await opener.close();
+}
+
+// ── Path 3: throw case ───────────────────────────────────────────────
+//
+// Fixture whose entry throws inside a nested call. Stack breadcrumb
+// should populate with the call chain at the throw, next-error
+// button should enable, and the source viewport should jump to the
+// throw line.
+
+const FIXTURE_THROW = {
+    request:        { method: "POST", path: "/api/decline", host: "acme.app.example.com" },
+    response:       { status: 500, outcome: "handler_error", exception: "PaymentError" },
+    deployment_id:  "dep_throw1234",
+    recording_id:   "rec_throw1234abcd",
+    entry_path:     "src/index.mjs",
+    modules: [
+        {
+            path: "src/index.mjs",
+            source:
+`function declineCharge() {
+  throw new Error("card_declined");
+}
+function processCheckout() {
+  declineCharge();
+}
+processCheckout();
+`,
+        },
+    ],
+    tape_blobs: {},
+};
+
+async function checkThrowState(ctx) {
+    console.log("\n— throw path / handler throws —");
+    const opener = await ctx.newPage();
+    await opener.goto(ORIGIN + "/", { waitUntil: "domcontentloaded" });
+    await opener.evaluate((fixture) => {
+        window.__fixture__ = fixture;
+        window.addEventListener("message", (e) => {
+            if (e.data?.kind === "replay:ready") {
+                e.source.postMessage(
+                    { kind: "replay:bundle", bundle: window.__fixture__ },
+                    e.origin,
+                );
+            }
+        });
+    }, FIXTURE_THROW);
+
+    const [popup] = await Promise.all([
+        ctx.waitForEvent("page"),
+        opener.evaluate((url) => window.open(url, "replayThrow"), TARGET),
+    ]);
+    await popup.setViewportSize({ width: 1440, height: 900 });
+    await popup.waitForLoadState("domcontentloaded");
+
+    try {
+        await popup.waitForFunction(() => {
+            const s = document.getElementById("source-state");
+            return s && /completed|exited/.test(s.textContent || "");
+        }, { timeout: 15_000 });
+        ok("source-state reached terminal");
+    } catch {
+        bad("source-state never reached terminal");
+    }
+
+    // Stack breadcrumb populated with frames at the throw.
+    const stackFrames = await popup.locator("#stack-frames .stack__frame").count();
+    if (stackFrames >= 2)
+        ok(`stack breadcrumb has ${stackFrames} frames`);
+    else
+        bad(`stack breadcrumb has only ${stackFrames} frames (expected ≥ 2)`);
+
+    // Current (last) frame's :line should carry the c-error tint.
+    const errLineCount = await popup.locator("#stack-frames .stack__frame.is-current .c-error").count();
+    if (errLineCount > 0) ok("throw-line tinted c-error in current frame");
+    else                  bad("expected c-error on the current frame's :line");
+
+    // Source viewport should jump to the throw line.
+    const sourceHeader = (await popup.locator("#source-header").innerText()).trim();
+    if (sourceHeader.includes("line"))
+        ok("source header shows throw line: " + JSON.stringify(sourceHeader));
+    else
+        bad("source header missing throw line: " + JSON.stringify(sourceHeader));
+
+    // Next-error button enabled.
+    const nextErrorDisabled = await popup.locator("#next-error-btn").getAttribute("disabled");
+    if (nextErrorDisabled === null) ok("next-error button enabled");
+    else                            bad("next-error button still disabled despite throw");
+
+    await popup.screenshot({ path: "/tmp/replay-shell-throw.png" });
+    ok("screenshot → /tmp/replay-shell-throw.png");
 
     await popup.close();
     await opener.close();
@@ -335,6 +437,7 @@ try {
     const ctx = await browser.newContext();
     await checkEmptyState(ctx);
     await checkPopulatedState(ctx);
+    await checkThrowState(ctx);
 } catch (err) {
     bad("uncaught: " + (err.stack || err.message || err));
 } finally {
