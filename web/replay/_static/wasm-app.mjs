@@ -4,55 +4,34 @@
 // opens this URL in a popup and posts a `replay:bundle` message
 // once we send back `replay:ready`.
 //
-// The previous iframe-debugger shell (web/replay/_static/app.js +
-// index.html) was retired 2026-05-15 — that file is gone, and the
-// dashboard now opens this shell from the single Replay button.
-//
 // Pipeline:
-//   1. Receive `replay:bundle` from the dashboard
-//   2. Parse the captured tape blobs via rtap.mjs (mirrors
-//      src/tape/root.zig encoding rule-for-rule)
-//   3. Install parsed tapes + per-path module sources on the
-//      Emscripten Module object
-//   4. Install Module.host_trace to collect FUNC_ENTER / FUNC_EXIT /
-//      THROW events as the handler runs
-//   5. Boot arenajs-WASM, set trace mode to SCAN, call
-//      arena_run_module(entry, source)
-//   6. Render the shell — appbar / modules rail / source viewport /
-//      event stream / scrubber — populated from the bundle + trace.
+//   1. Receive `replay:bundle` from the dashboard.
+//   2. Parse captured tape blobs via rtap.mjs (mirrors
+//      src/tape/root.zig encoding rule-for-rule).
+//   3. Boot arenajs-WASM once.
+//   4. Drive the run through CursorEngine.materialise() (one drill
+//      pass, caches events + sidecar indexes).
+//   5. Render the shell from `mat` + `playhead`. Re-rendering is
+//      cheap; everything we need is O(1) addressable in `mat`.
 //
-// This pass renders the full mockup chrome but only drives the
-// pieces the current engine supports:
+// What's wired this pass:
 //   ✓ appbar identity + outcome badge
 //   ✓ modules rail with path-prefix + basename
-//   ✓ source viewport (entry module by default; click a module to
-//     switch); throw lines highlighted
-//   ✓ event stream (function enters + throws)
-//   ✓ scrubber ticks (one per scan event)
-//   ✓ next-error button (jump to next throw)
-//   ✗ stack breadcrumb     — needs host_state stack-walker
-//   ✗ variables drawer     — needs DRILL-mode + host_state
-//   ✗ step buttons / play  — needs the arenajs cursor API
-//   ✗ scrubber drag        — needs cursor API for snap-to-scan
+//   ✓ source viewport (entry by default; click switches; current line
+//     tracks the playhead)
+//   ✓ event stream (past/current/future styling based on playhead)
+//   ✓ scrubber ticks for scan events; playhead chip
+//   ✓ stack breadcrumb derived from events up to playhead
+//   ✓ next-error count
 //
-// The disabled controls are part of the chrome so the contract for
-// future passes is visible. Wiring them up is mechanical once the
-// cursor API lands.
+// Still stubbed (controls disabled — coming next pass):
+//   ✗ step buttons / play
+//   ✗ scrubber drag
+//   ✗ variables drawer (needs engine.inspectAt — wired in phase C)
 
 import { buildTapesFromBlobs } from "./rtap.mjs";
+import { CursorEngine } from "./cursor.mjs";
 import getArenaJs from "./qjs_arena_wasm.js";
-
-// ── Trace mode constants ─────────────────────────────────────────────
-const TRACE_OFF   = 0;
-const TRACE_SCAN  = 1;
-const TRACE_DRILL = 2;
-
-// Event kinds (binary wire format — see qjs-arena-trace.c).
-const K_NAME       = 0;
-const K_FUNC_ENTER = 1;
-const K_FUNC_EXIT  = 2;
-const K_LINE       = 3;
-const K_THROW      = 4;
 
 // ── DOM refs (lookup once at module load) ────────────────────────────
 const $ = {
@@ -73,20 +52,9 @@ const $ = {
 };
 
 // ── JavaScript syntax tokenizer ──────────────────────────────────────
-//
 // Per-line regex tokenizer for source highlighting. Maps to the
 // canonical `tok-*` classes in rewind.css: tok-kw / tok-str /
-// tok-num / tok-comm. Identifiers and punctuation render neutrally
-// (no class), which keeps the source readable without going
-// rainbow-noisy.
-//
-// Known limitations (acceptable for replay's source viewer):
-//   - Block comments that span multiple lines render the body
-//     lines uncolored (the open `/*` line gets the comment tint).
-//   - Regex literals and JSX aren't recognized — both are rare in
-//     handler code and would need full parser context.
-//   - Template-literal substitutions (`${expr}`) render as one
-//     opaque string, not as nested syntax.
+// tok-num / tok-comm. Identifiers and punctuation render neutrally.
 
 const TOK_PATTERNS = [
     { type: "comment", re: /^\/\/.*/ },
@@ -131,9 +99,6 @@ function tokenize(src) {
     return tokens;
 }
 
-// Append a tokenized JS line into `parent`. Token classes are
-// inserted as spans; identifiers / punctuation / whitespace render
-// as bare text nodes.
 function appendTokenized(parent, lineSrc) {
     for (const tok of tokenize(lineSrc)) {
         const cls = TOK_CLASS[tok.type];
@@ -160,17 +125,11 @@ function el(tag, opts = {}) {
     return e;
 }
 
-// Split "src/lib/pricing.mjs" → { dir: "src/lib/", base: "pricing.mjs" }
-// "index.mjs" → { dir: "", base: "index.mjs" }
 function splitPath(p) {
     const i = p.lastIndexOf("/");
     return i < 0 ? { dir: "", base: p } : { dir: p.slice(0, i + 1), base: p.slice(i + 1) };
 }
 
-// Short content-hash for the modules rail. The bundle doesn't carry
-// per-module hashes today, so derive a stable 4-char fingerprint from
-// the source bytes. Same source → same fingerprint, so duplicate
-// modules dedup visually.
 function shortHash(s) {
     let h = 0x811c9dc5;
     for (let i = 0; i < s.length; i++) {
@@ -189,10 +148,7 @@ function badgeKindFor(status) {
 }
 
 // ── postMessage handshake ────────────────────────────────────────────
-//
-// Opener is the dashboard at `app.<suffix>`, we're at `replay.<suffix>`.
-// Origin check derives the expected origin from our own so it works
-// across loop46.me / loop46.localhost / any future suffix.
+
 function expectedDashboardOrigin() {
     return window.location.origin.replace("://replay.", "://app.");
 }
@@ -221,77 +177,75 @@ function awaitBundle() {
     });
 }
 
-// ── Trace collector ──────────────────────────────────────────────────
+// ── Bundle helpers ───────────────────────────────────────────────────
+
+function resolveEntry(bundle) {
+    if (bundle.entry_path) return bundle.entry_path;
+    const idx = (bundle.modules || []).find(m => m.path === "index.mjs");
+    if (idx) return idx.path;
+    throw new Error("bundle has no entry_path and no index.mjs");
+}
+
+function buildModuleSources(bundle) {
+    const out = {};
+    for (const m of (bundle.modules || [])) out[m.path] = m.source;
+    return out;
+}
+
+// ── Derived helpers over materialised data ───────────────────────────
 //
-// Binary layouts (see qjs-arena-trace.c):
-//   NAME       [u32 atom][u16 len][len bytes]
-//   FUNC_ENTER [u32 name_atom][u32 file_atom][u32 line]
-//   FUNC_EXIT  (empty)
-//   LINE       [u32 file_atom][u32 line]
-//   THROW      [u32 file_atom][u32 line][u16 msg_len][msg bytes]
+// `mat.events` is the full drill stream (FUNC_ENTER / FUNC_EXIT /
+// LINE / THROW). Most rendering is parameterised on a `playhead`
+// index into this array.
 
-class TraceCollector {
-    constructor(Module) {
-        this.Module = Module;
-        this.events = [];
-        this.names = new Map();
-        this.decoder = new TextDecoder();
-    }
-
-    install() {
-        this.Module.host_trace = (kind, ptr, len) => {
-            this._handle(kind, ptr, len);
-            return 0;
-        };
-    }
-
-    _handle(kind, ptr, len) {
-        const M = this.Module;
-        switch (kind) {
-            case K_NAME: {
-                const atom = M.HEAPU32[ptr >> 2];
-                const slen = M.HEAPU16[(ptr + 4) >> 1];
-                const s = this.decoder.decode(M.HEAPU8.subarray(ptr + 6, ptr + 6 + slen));
-                this.names.set(atom, s);
-                return;
-            }
-            case K_FUNC_ENTER:
-                this.events.push({
-                    kind: "enter",
-                    name_atom: M.HEAPU32[ptr >> 2],
-                    file_atom: M.HEAPU32[(ptr + 4) >> 2],
-                    line:      M.HEAPU32[(ptr + 8) >> 2],
-                });
-                return;
-            case K_FUNC_EXIT:
-                this.events.push({ kind: "exit" });
-                return;
-            case K_LINE:
-                this.events.push({
-                    kind: "line",
-                    file_atom: M.HEAPU32[ptr >> 2],
-                    line:      M.HEAPU32[(ptr + 4) >> 2],
-                });
-                return;
-            case K_THROW: {
-                const fileAtom = M.HEAPU32[ptr >> 2];
-                const line     = M.HEAPU32[(ptr + 4) >> 2];
-                const mlen     = M.HEAPU16[(ptr + 8) >> 1];
-                const msg = this.decoder.decode(M.HEAPU8.subarray(ptr + 10, ptr + 10 + mlen));
-                this.events.push({ kind: "throw", file_atom: fileAtom, line, message: msg });
-                return;
-            }
+// Stack snapshot at the moment the playhead event fired. Cheap to
+// recompute (one O(events) walk) — and once we have mat.stackSnapshots
+// from materialise() this becomes O(stackSnapshotStep). For now we
+// walk linearly, which is fine for handler-scale traces.
+function stackAtPlayhead(mat, playhead) {
+    const stack = [];
+    let throwInfo = null;
+    for (let i = 0; i <= playhead && i < mat.events.length; i++) {
+        const e = mat.events[i];
+        if (e.kind === "FUNC_ENTER") {
+            stack.push({ name: e.name, file: e.file, line: e.line });
+        } else if (e.kind === "FUNC_EXIT") {
+            stack.pop();
+        } else if (e.kind === "LINE" && stack.length > 0) {
+            stack[stack.length - 1].line = e.line;
+        } else if (e.kind === "THROW") {
+            throwInfo = { file: e.file, line: e.line, message: e.message };
+            // Throws don't pop frames on their own.
         }
     }
+    return { stack, throwInfo };
+}
 
-    resolveName(atom) { return this.names.get(atom) || `<atom:${atom}>`; }
+// (file, line) for the source viewport based on the current playhead.
+function currentSourceForPlayhead(mat, playhead) {
+    const { stack, throwInfo } = stackAtPlayhead(mat, playhead);
+    if (throwInfo && playhead === mat.events.length - 1) {
+        return { file: throwInfo.file, line: throwInfo.line };
+    }
+    if (stack.length > 0) {
+        const top = stack[stack.length - 1];
+        return { file: top.file, line: top.line };
+    }
+    // Outside any frame: fall back to the last seen event's file/line.
+    for (let i = Math.min(playhead, mat.events.length - 1); i >= 0; i--) {
+        const e = mat.events[i];
+        if (e.file) return { file: e.file, line: e.line };
+    }
+    return { file: null, line: null };
+}
+
+// Scan-grain events only — for the event stream + scrubber.
+function scanEventsOf(mat) {
+    return mat.events.filter(e => e.kind !== "FUNC_EXIT" && e.kind !== "LINE");
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
 
-// Appbar: tenant crumb + outcome badge + method/path. Tenant is
-// derived from the request host ("acme.foo.com" → "acme"); falls
-// back to the full host when host can't be parsed.
 function renderAppbar(bundle) {
     const req = bundle.request || {};
     const res = bundle.response || {};
@@ -326,8 +280,6 @@ function renderAppbar(bundle) {
     }
 }
 
-// Modules rail: one row per bundle module. Path prefix dim, basename
-// bright. Entry path gets is-current. Click switches the source view.
 function renderModulesRail(bundle, currentPath, onSelect) {
     const modules = bundle.modules || [];
     $.modTree.replaceChildren();
@@ -358,8 +310,6 @@ function renderModulesRail(bundle, currentPath, onSelect) {
     }
 }
 
-// Source viewport: gutter with line numbers + code body. If a
-// highlightLine is given, that line gets is-current styling.
 function renderSourceView(bundle, modulePath, highlightLine) {
     const mod = (bundle.modules || []).find(m => m.path === modulePath);
     const src = mod?.source || "";
@@ -391,140 +341,144 @@ function renderSourceView(bundle, modulePath, highlightLine) {
     $.sourceCode.appendChild(body);
 }
 
-// Event stream: function enters and throws as cards. Function exits
-// are skipped (they're depth-tracking only). Line events are skipped
-// unless we're in DRILL mode (later pass).
-function renderEventStream(collector) {
+// Event stream: render scan-grain events as cards, mark past / current
+// / future based on the playhead's scan ordinal.
+function renderEventStream(mat, playhead) {
     $.stream.replaceChildren();
-    const scanEvents = collector.events.filter(e => e.kind !== "exit" && e.kind !== "line");
-    if (scanEvents.length === 0) {
+    const events = mat.events;
+    if (events.length === 0) {
         $.stream.appendChild(el("li", {
             className: "stream__empty t-meta t-dim",
             text: "(no events captured — handler exited at module load?)",
         }));
         return;
     }
-    let idx = 0;
-    for (const e of scanEvents) {
-        idx++;
-        const li = el("li", { className: "ev ev--past" });
+    // Map each scan event's idx-in-events to past/current/future.
+    let scanOrd = 0;
+    const playheadEvent = events[playhead];
+    const playheadScanOrd = playheadEvent && playheadEvent.scanOrdinal != null
+        ? playheadEvent.scanOrdinal
+        : -1;
+
+    for (let i = 0; i < events.length; i++) {
+        const e = events[i];
+        if (e.kind === "FUNC_EXIT" || e.kind === "LINE") continue;
+        // FUNC_ENTER + THROW = scan events.
+
+        const cls = (e.scanOrdinal === playheadScanOrd) ? "ev--current"
+                  : (e.scanOrdinal <  playheadScanOrd) ? "ev--past"
+                  :                                      "ev--future";
+        const li = el("li", { className: "ev " + cls });
+
         const rail = el("div", { className: "ev__rail" });
         rail.appendChild(el("span", {
-            className: "ev__dot " + (e.kind === "throw" ? "c-error" : "c-info"),
+            className: "ev__dot " + (e.kind === "THROW" ? "c-error" : "c-info"),
             attrs: { "aria-hidden": "true" },
         }));
+        if (cls === "ev--current") {
+            rail.appendChild(el("span", {
+                className: "ev__playhead",
+                attrs: { "aria-hidden": "true" },
+            }));
+        }
         li.appendChild(rail);
 
         const body = el("div", { className: "ev__body" });
         const head = el("div", { className: "ev__head" });
-        const kindEl = el("span", {
-            className: "t-mono-sm " + (e.kind === "throw" ? "c-error" : "c-info"),
-            text: e.kind === "throw" ? "throw" : "fn enter",
-        });
-        head.appendChild(kindEl);
         head.appendChild(el("span", {
-            className: "ev__t t-mono-sm t-dimmer",
-            text: String(idx),
+            className: "t-mono-sm " + (e.kind === "THROW" ? "c-error" : "c-info"),
+            text: e.kind === "THROW" ? "throw" : "fn enter",
+        }));
+        head.appendChild(el("span", {
+            className: "ev__t t-mono-sm "
+                + (cls === "ev--current" ? "c-brand" : "t-dimmer"),
+            text: String(e.scanOrdinal + 1),
         }));
         body.appendChild(head);
 
-        if (e.kind === "enter") {
+        if (e.kind === "FUNC_ENTER") {
             body.appendChild(el("div", {
                 className: "t-mono-sm t-dim",
-                text: collector.resolveName(e.name_atom),
+                text: e.name,
             }));
             body.appendChild(el("div", {
                 className: "ev__detail t-mono-sm t-dimmer",
-                text: collector.resolveName(e.file_atom) + ":" + e.line,
+                text: e.file + ":" + e.line,
             }));
-        } else if (e.kind === "throw") {
+        } else if (e.kind === "THROW") {
             body.appendChild(el("div", {
                 className: "t-mono-sm c-error",
                 text: e.message || "(no message)",
             }));
             body.appendChild(el("div", {
                 className: "ev__detail t-mono-sm t-dimmer",
-                text: collector.resolveName(e.file_atom) + ":" + e.line,
+                text: e.file + ":" + e.line,
             }));
         }
         li.appendChild(body);
         $.stream.appendChild(li);
+        scanOrd++;
     }
 }
 
 // Scrubber ticks: one per scan event, evenly spaced. Throws get the
-// "big tick" treatment. Playhead is hidden in this pass (no
-// stepping yet); the played-portion gradient is also hidden.
-function renderScrubber(collector) {
+// big-tick treatment. Playhead chip + played-gradient track the
+// playhead's scan ordinal.
+function renderScrubber(mat, playhead) {
     $.scrubberTicks.replaceChildren();
-    const scanEvents = collector.events.filter(e => e.kind !== "exit" && e.kind !== "line");
-    if (scanEvents.length === 0) return;
+    const scans = scanEventsOf(mat);
+    if (scans.length === 0) return;
 
-    const n = scanEvents.length;
-    scanEvents.forEach((e, i) => {
-        const pct = ((i + 0.5) / n) * 100;  // center each tick in its slot
+    const n = scans.length;
+    scans.forEach((e, i) => {
+        const pct = ((i + 0.5) / n) * 100;
         const tick = el("span", {
-            className: "scrubber__tick" + (e.kind === "throw" ? " scrubber__tick--big" : ""),
+            className: "scrubber__tick" + (e.kind === "THROW" ? " scrubber__tick--big" : ""),
             style: {
                 left: pct.toFixed(2) + "%",
-                background: e.kind === "throw" ? "var(--c-error)" : "var(--c-info)",
+                background: e.kind === "THROW" ? "var(--c-error)" : "var(--c-info)",
             },
-            title: `${i + 1} · ${e.kind === "throw" ? "throw" : "fn enter " + collector.resolveName(e.name_atom)}`,
+            title: `${i + 1} · ${e.kind === "THROW" ? "throw" : "fn enter " + (e.name ?? "")}`,
         });
         $.scrubberTicks.appendChild(tick);
     });
 
+    const ev = mat.events[playhead];
+    const scanOrd = ev?.scanOrdinal ?? 0;
+    const pct = ((scanOrd + 0.5) / n) * 100;
+
+    $.scrubberPlayed.style.width = pct.toFixed(2) + "%";
+    $.scrubberPlayhead.style.display = "";
+    $.scrubberPlayhead.style.left = pct.toFixed(2) + "%";
+    const chip = $.scrubberPlayhead.querySelector(".scrubber__playhead-chip");
+    if (chip) chip.textContent = `${scanOrd + 1} / ${n}`;
+
     $.transportTime.replaceChildren(
-        el("span", { className: "c-brand", text: "event " + n }),
+        el("span", { className: "c-brand", text: "event " + (scanOrd + 1) }),
         el("span", { className: "t-dim", text: " of " + n }),
     );
 }
 
-// Stack breadcrumb: derive a call-stack snapshot from FUNC_ENTER /
-// FUNC_EXIT events. Two cases we can usefully render today:
-//
-//   1. Recording threw → snapshot the stack AT the throw event
-//      (the throw happens inside the deepest frame, no exits yet).
-//      Render the throw line as the rightmost frame's `:N` suffix
-//      with c-error styling.
-//
-//   2. Recording exited cleanly → final stack is empty. Render a
-//      placeholder explaining that mid-run frames need stepping
-//      (which itself needs the cursor API, not yet wired).
-//
-// Once stepping lands, this function gets a `currentEventIdx`
-// argument that bounds the walk — the snapshot becomes "stack at
-// scan record N" rather than "stack at throw" or "stack at end".
-
-function renderStackBreadcrumb(collector) {
-    const stack = [];
-    let throwInfo = null;
-    for (const e of collector.events) {
-        if (e.kind === "enter") {
-            stack.push({
-                name: collector.resolveName(e.name_atom),
-                file: collector.resolveName(e.file_atom),
-                line: e.line,
-            });
-        } else if (e.kind === "exit") {
-            stack.pop();
-        } else if (e.kind === "throw") {
-            throwInfo = {
-                file: collector.resolveName(e.file_atom),
-                line: e.line,
-                message: e.message,
-            };
-            break;  // snapshot at throw; don't unwind
-        }
-    }
-
+// Stack breadcrumb at the playhead. Replaces the previous "snapshot
+// at throw or end" rendering — now we know the stack at any event.
+function renderStackBreadcrumb(mat, playhead) {
+    const { stack, throwInfo } = stackAtPlayhead(mat, playhead);
     $.stack.replaceChildren();
+
     if (stack.length === 0) {
+        const ev = mat.events[playhead];
+        let msg;
+        if (throwInfo && ev?.kind === "THROW") {
+            msg = "(throw at module top-level — no frames to walk)";
+        } else if (playhead >= mat.events.length - 1) {
+            // Playhead is at end of run, no throw, all frames exited.
+            msg = "(handler exited cleanly — mid-run frames need stepping)";
+        } else {
+            msg = "(outside any frame)";
+        }
         $.stack.appendChild(el("span", {
             className: "t-meta t-dim",
-            text: throwInfo
-                ? "(throw at module top-level — no frames to walk)"
-                : "(handler exited cleanly — mid-run frames need stepping)",
+            text: msg,
             style: { padding: "0 var(--sp-2)" },
         }));
         return;
@@ -552,34 +506,32 @@ function renderStackBreadcrumb(collector) {
             text: frame.name,
         }));
         if (isLast) {
-            const lineText = ":" + (throwInfo ? throwInfo.line : frame.line);
+            const errOnTop = throwInfo && mat.events[playhead]?.kind === "THROW";
             btn.appendChild(el("span", {
-                className: "stack__frame-line t-mono-sm" + (throwInfo ? " c-error" : ""),
-                text: lineText,
+                className: "stack__frame-line t-mono-sm" + (errOnTop ? " c-error" : ""),
+                text: ":" + (errOnTop ? throwInfo.line : frame.line),
             }));
         }
         $.stack.appendChild(btn);
     }
 }
 
-// Next-error: enable if any throws exist; count throws total.
-// Wiring it to actually jump comes with the cursor API; for now
-// the button is decorative-but-honest.
-function renderNextError(collector) {
-    const throws = collector.events.filter(e => e.kind === "throw");
-    if (throws.length === 0) {
+function renderNextError(mat, playhead) {
+    const throwsTotal = mat.events.filter(e => e.kind === "THROW").length;
+    if (throwsTotal === 0) {
         $.nextErrorBtn.disabled = true;
         $.nextErrorLabel.textContent = "No throws in this recording";
         $.nextErrorBtn.title = "No throws in this recording.";
         return;
     }
+    // Always enable if there are throws in the recording. The button's
+    // click handler (phase B) jumps to the next throw after the
+    // playhead, wrapping to the first throw if past all of them.
     $.nextErrorBtn.disabled = false;
-    $.nextErrorLabel.textContent = `Next throw · ${throws.length}`;
-    $.nextErrorBtn.title = `${throws.length} throw(s) in this recording (E)`;
+    $.nextErrorLabel.textContent = `Next throw · ${throwsTotal}`;
+    $.nextErrorBtn.title = `${throwsTotal} throw(s) in this recording (E)`;
 }
 
-// Surface a load/run error in the appbar meta strip and bail out
-// of the normal render flow.
 function renderError(err) {
     $.meta.replaceChildren(
         el("span", { className: "badge badge--error", text: "load error" }),
@@ -587,22 +539,43 @@ function renderError(err) {
     );
 }
 
-// ── Bundle helpers ───────────────────────────────────────────────────
+// ── App state + entry ────────────────────────────────────────────────
 
-function resolveEntry(bundle) {
-    if (bundle.entry_path) return bundle.entry_path;
-    const idx = (bundle.modules || []).find(m => m.path === "index.mjs");
-    if (idx) return idx.path;
-    throw new Error("bundle has no entry_path and no index.mjs");
+const state = {
+    bundle: null,
+    mat: null,
+    playhead: 0,
+    currentModule: null,
+};
+
+function renderAll() {
+    if (!state.mat) return;
+    const src = currentSourceForPlayhead(state.mat, state.playhead);
+    // Auto-follow source: when the playhead lands in a module other
+    // than the one the user is browsing, switch to it. The user can
+    // override by clicking another module in the rail (we just stop
+    // auto-following until a step lands somewhere else again — for
+    // now we always auto-follow, the toggle is a phase-B follow-up).
+    if (src.file && src.file !== state.currentModule) {
+        state.currentModule = src.file;
+        renderModulesRail(state.bundle, state.currentModule, selectModule);
+    }
+    renderSourceView(state.bundle, state.currentModule, src.line);
+    renderStackBreadcrumb(state.mat, state.playhead);
+    renderEventStream(state.mat, state.playhead);
+    renderScrubber(state.mat, state.playhead);
+    renderNextError(state.mat, state.playhead);
 }
 
-function buildModuleSources(bundle) {
-    const out = {};
-    for (const m of (bundle.modules || [])) out[m.path] = m.source;
-    return out;
+function selectModule(path) {
+    state.currentModule = path;
+    renderModulesRail(state.bundle, state.currentModule, selectModule);
+    // Don't reach into the playhead's line when the user is browsing
+    // a non-current module; show the file without a line highlight.
+    const src = currentSourceForPlayhead(state.mat || { events: [] }, state.playhead);
+    const lineForView = (path === src.file) ? src.line : null;
+    renderSourceView(state.bundle, path, lineForView);
 }
-
-// ── Driver ───────────────────────────────────────────────────────────
 
 async function main() {
     let bundle;
@@ -612,23 +585,20 @@ async function main() {
         renderError(err);
         return;
     }
+    state.bundle = bundle;
 
     renderAppbar(bundle);
 
-    let currentModule;
+    let entryPath;
     try {
-        currentModule = resolveEntry(bundle);
+        entryPath = resolveEntry(bundle);
     } catch (err) {
         renderError(err);
         return;
     }
-    const selectModule = (path) => {
-        currentModule = path;
-        renderModulesRail(bundle, currentModule, selectModule);
-        renderSourceView(bundle, currentModule, null);
-    };
-    renderModulesRail(bundle, currentModule, selectModule);
-    renderSourceView(bundle, currentModule, null);
+    state.currentModule = entryPath;
+    renderModulesRail(bundle, state.currentModule, selectModule);
+    renderSourceView(bundle, state.currentModule, null);
 
     $.sourceState.textContent = "booting WASM…";
 
@@ -639,68 +609,62 @@ async function main() {
         renderError(new Error("WASM load failed: " + err.message));
         return;
     }
-    const arena_init           = Module.cwrap("arena_init",           "number", ["number","number"]);
-    const arena_run_module     = Module.cwrap("arena_run_module",     "number", ["string","string"]);
-    const arena_set_trace_mode = Module.cwrap("arena_set_trace_mode", null,     ["number"]);
-    const arena_destroy        = Module.cwrap("arena_destroy",        null,     []);
+
+    const arena_init    = Module.cwrap("arena_init",    "number", ["number","number"]);
+    const arena_destroy = Module.cwrap("arena_destroy", null,     []);
 
     if (arena_init(8192, 8192) !== 0) {
         renderError(new Error("arena_init failed"));
         return;
     }
 
-    const captured = [];
-    const origPrint = Module.print, origErr = Module.printErr;
-    Module.print    = (s) => { captured.push(s); origPrint?.(s); };
-    Module.printErr = (s) => { captured.push("[stderr] " + s); origErr?.(s); };
-
-    const trace = new TraceCollector(Module);
-    trace.install();
-
+    let tapes;
     try {
-        Module.tapes = buildTapesFromBlobs(bundle.tape_blobs || {});
+        tapes = buildTapesFromBlobs(bundle.tape_blobs || {});
     } catch (err) {
         renderError(new Error("tape parse failed: " + err.message));
         arena_destroy();
         return;
     }
-    Module.module_sources = buildModuleSources(bundle);
 
-    const entrySrc = Module.module_sources[currentModule];
+    const moduleSources = buildModuleSources(bundle);
+    const entrySrc = moduleSources[entryPath];
     if (!entrySrc) {
-        renderError(new Error("entry source not in bundle: " + currentModule));
+        renderError(new Error("entry source not in bundle: " + entryPath));
         arena_destroy();
         return;
     }
 
-    $.sourceState.textContent = "running…";
-    arena_set_trace_mode(TRACE_SCAN);
-    const rc = arena_run_module(currentModule, entrySrc);
-    arena_set_trace_mode(TRACE_OFF);
-    arena_destroy();
+    // Surface engine output in case the handler prints / errors.
+    const captured = [];
+    const origPrint = Module.print, origErr = Module.printErr;
+    Module.print    = (s) => { captured.push(s); origPrint?.(s); };
+    Module.printErr = (s) => { captured.push("[stderr] " + s); origErr?.(s); };
 
-    // If any throw was captured, jump the source view to that line.
-    const firstThrow = trace.events.find(e => e.kind === "throw");
-    if (firstThrow) {
-        const throwFile = trace.resolveName(firstThrow.file_atom);
-        // Only swap the source if the throw is in the current module;
-        // otherwise leave the user on their selected file. Future pass
-        // will move the playhead and pull the view along with it.
-        if (throwFile === currentModule) {
-            renderSourceView(bundle, currentModule, firstThrow.line);
-        } else {
-            renderSourceView(bundle, currentModule, null);
-        }
+    $.sourceState.textContent = "running…";
+    const engine = new CursorEngine(Module);
+    let mat;
+    try {
+        mat = await engine.materialise(
+            { entry: { name: entryPath, src: entrySrc }, tapes, module_sources: moduleSources },
+            { targetSnapshots: 0 },  // var snapshots come in phase C
+        );
+    } catch (err) {
+        renderError(new Error("materialise failed: " + err.message));
+        arena_destroy();
+        return;
     }
 
-    renderStackBreadcrumb(trace);
-    renderEventStream(trace);
-    renderScrubber(trace);
-    renderNextError(trace);
+    state.mat = mat;
+    // Park the playhead at the throw if there is one, else at the
+    // end. Matches the destination the previous (non-cursor) shell
+    // landed on by default. Step buttons in phase B will let the
+    // user walk forward/back from anywhere.
+    const throwIdx = mat.events.findIndex(e => e.kind === "THROW");
+    state.playhead = throwIdx >= 0 ? throwIdx : Math.max(0, mat.events.length - 1);
+    renderAll();
 
-    $.sourceState.textContent = rc === 0
-        ? `completed · ${trace.events.length} trace event(s)`
-        : `exited rc=${rc} · ${trace.events.length} trace event(s)`;
+    $.sourceState.textContent = `completed · ${mat.events.length} event(s)`;
 }
 
 main();
