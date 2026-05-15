@@ -324,6 +324,25 @@ async function checkPopulatedState(ctx) {
     else
         bad("stack breadcrumb missing exit placeholder: " + JSON.stringify(stackTxt));
 
+    // Module-click navigation: clicking a non-current module in the
+    // rail should swap the source viewport and move the is-current
+    // marker.
+    await popup.locator("#mod-tree .mod-tree__item")
+        .filter({ hasText: "processCheckout" })
+        .click();
+    await popup.waitForFunction(() => {
+        const h = document.getElementById("source-header");
+        return h && h.textContent.includes("processCheckout");
+    }, { timeout: 2000 }).then(
+        () => ok("clicking module switches source viewport"),
+        () => bad("source viewport did not switch on module click"),
+    );
+    const newCurrent = (await popup.locator(".mod-tree__item.is-current").innerText()).trim();
+    if (newCurrent.includes("processCheckout"))
+        ok("is-current moved to clicked module");
+    else
+        bad("is-current did not move: " + JSON.stringify(newCurrent));
+
     if (errors.length === 0) ok("no page-level JS errors");
     else                     bad("page errors: " + errors.join(" | "));
 
