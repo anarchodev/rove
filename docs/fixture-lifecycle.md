@@ -46,7 +46,10 @@ loop46 kv list-prefix <prefix> [--instance <id>] [--limit N] [--json]
 loop46 kv count <prefix> [--instance <id>]
 ```
 
-Default `--instance` from `LOOP46_SCOPE` env var. JSON output mode for agent consumption.
+Default `--instance` from `LOOP46_SCOPE` env var. JSON output mode
+for agent consumption. (Note: an unrelated operator-debug
+`loop46 kv-get` subcommand already exists; the Phase 13
+`loop46 kv` family is distinct.)
 
 ### T3. `loop46 fixture` CLI subcommands
 

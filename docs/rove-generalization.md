@@ -138,7 +138,7 @@ set**, returning writes and commands. Replay determinism is
 structural; time-travel debugging is a primitive operation, not a
 special feature. Given the inputs and the command list, you can
 rerun any system and get bit-identical output. The whole architecture
-is what Loop46's purely-functional handler model already commits to,
+is what rewind.js's purely-functional handler model already commits to,
 lifted from "we hand-write pure handlers and the runtime helps" to
 "the language enforces purity and the runtime gives you replay as a
 guarantee."

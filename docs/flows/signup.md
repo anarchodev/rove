@@ -120,7 +120,7 @@ over in this window, the new leader has no record of the new tenant. The
 customer would see their signup succeed (202) but find their domain 404.
 Window is small (single raft round trip) but real.
 
-No domain alias is written. `acme.loop46.me` resolves via the
+No domain alias is written. `acme.rewindjs.app` resolves via the
 public-suffix wildcard path in `tenant.resolveDomain` — the wildcard
 extracts `acme` and looks up `instance/acme`. Custom domains (Phase 10)
 will add explicit `domain/{host}` aliases.
@@ -208,7 +208,7 @@ receivers must dedup on `X-Rove-Webhook-Id`.
 (`handleAdminAuth`, `src/js/worker.zig:4222`; `tenant.redeemMagic`,
 `src/tenant/root.zig:901`)
 
-User clicks `https://app.loop46.me/v1/auth?mt={opaque}`.
+User clicks `https://app.rewindjs.com/v1/auth?mt={opaque}`.
 
 `redeemMagic` hashes the token, looks up `magic/{hash_hex}` in admin
 app.db, checks expiry, **deletes the row before returning** (`root.zig:981`)
@@ -372,7 +372,7 @@ A few choices that aren't obvious from the code:
    infallibility framework.
 
 3. **No domain alias is written at signup.** Routing relies on the
-   public-suffix wildcard for `{id}.loop46.me`. Phase 10 will add custom
+   public-suffix wildcard for `{id}.rewindjs.app`. Phase 10 will add custom
    domains with explicit `domain/{host}` aliases, but should signup *also*
    write a `domain/{id}.{public_suffix}` alias today so the routing path
    has one shape regardless of customisation? Currently the wildcard path
@@ -588,7 +588,7 @@ that §10.1 already established):
   (`globals.zig:921`).
 
 **New JS handler in admin** (deployed bundle, served on
-`app.loop46.me`): owns `/v1/signup`, `/v1/auth`, `/v1/login`,
+`app.rewindjs.com`): owns `/v1/signup`, `/v1/auth`, `/v1/login`,
 `/v1/logout`, `/v1/session`, plus the existing dashboard routes. Auth
 check (cookie → session lookup) runs at handler entry, replacing
 `requireAdminAuth`. Mint/redeem/session become `crypto.randomBytes` +
@@ -623,7 +623,7 @@ starter knob on `platform.instances.create`.
   index below).
 
 **Routing** is unchanged. Host→tenant fast path stays Zig.
-`app.loop46.me` resolves to the admin tenant via `tenant.resolveDomain`
+`app.rewindjs.com` resolves to the admin tenant via `tenant.resolveDomain`
 exactly as today; admin's JS handler then runs for every path on that
 host (including `/v1/*`), exactly like a customer's handler runs for
 every path on their subdomain.

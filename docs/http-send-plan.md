@@ -1,7 +1,7 @@
 # http.send plan — outbound HTTP primitive + customer-JS retry policy
 
 > **2026-05-09 corrigendum** — sections referring to a system
-> tenant (`webhook.loop46.com`) that runs the default retry policy
+> tenant (`webhook.rewindjs.com`) that runs the default retry policy
 > are **superseded**. Retries are now a pure customer-side
 > JavaScript library (`globalThis.retry` in `src/js/bindings/
 > retry.js`), layered on top of `http.send`. All retry state lives
@@ -9,7 +9,7 @@
 > cross-tenant write privileges. The rest of the doc — the
 > primitive, the in-process fast path (§3.2), the envelope wire
 > shapes (§4), the leader-handover contract (§7) — stays accurate.
-> References to `webhook.loop46.com` should be read as "an
+> References to `webhook.rewindjs.com` should be read as "an
 > example of an in-cluster URL that the in-process fast path
 > optimizes" rather than "a system tenant the platform ships."
 > See `src/js/bindings/retry.js` for the retry library API
@@ -19,7 +19,7 @@
 > What this changed: dropped the cross-tenant `_callback/{id}`
 > write privilege (envelope-9 only writes to the schedule's own
 > tenant), dropped the system-tenant deployment + handler code,
-> dropped the special "webhook.loop46.com" envelope shape.
+> dropped the special "webhook.rewindjs.com" envelope shape.
 
 This document supersedes `docs/webhook-server-plan.md`'s framing of
 webhook delivery as a webhook-shaped subsystem. It re-grounds the
@@ -48,7 +48,7 @@ The motivating framing:
   Same pattern that makes `email.send` work — it's a JS wrapper at
   the admin tenant that calls `webhook.send`. Generalizing further:
   `webhook.send` itself becomes a JS wrapper at a system tenant
-  (`webhook.loop46.com`) calling the more primitive `http.send`.
+  (`webhook.rewindjs.com`) calling the more primitive `http.send`.
 
 What stays from today: customer-visible API (`webhook.send` and
 `email.send` keep their shapes), the at-least-once contract, the
@@ -59,7 +59,7 @@ exactly two bindings — `http.send` and `http.cancel`. Both
 (client-side polyfills + server-side system tenant). The
 leader-pinned thread becomes generic. Webhook-specific retry /
 signing / dead-letter logic moves to customer-equivalent JS at
-`webhook.loop46.com`.
+`webhook.rewindjs.com`.
 
 ---
 
@@ -197,7 +197,7 @@ separation between "the platform invokes my code" (module) and
                    │    on_result: { module:         │
                    │      "stripe_response" } });    │
                    └──────────────┬──────────────────┘
-                                  │ rides as raft envelope 4
+                                  │ rides as raft envelope 8
                                   │ (alongside writeset env 0)
                                   ▼
                    ┌─────────────────────────────────┐
@@ -210,9 +210,9 @@ separation between "the platform invokes my code" (module) and
                    │  leader-pinned scheduler thread │
                    │  - poll for fire_at_ns ≤ now    │
                    │  - libcurl request              │
-                   │  - propose envelope 5 (result)  │
+                   │  - propose envelope 9 (result)  │
                    └──────────────┬──────────────────┘
-                                  │ envelope 5 → apply path
+                                  │ envelope 9 → apply path
                                   │ writes _callback/{id} to
                                   │ tenant's app.db, deletes
                                   │ schedule row from schedules.db
@@ -249,9 +249,9 @@ worth being explicit about which protocol carries which:
 |---|---|---|---|
 | Browser / webhook sender → cluster | inbound | h2 (or whatever the edge proxy negotiates) | Operator runs an edge proxy (Cloudflare, AWS ALB, Fastly, nginx/Caddy/Envoy) that handles HTTP/1.x and HTTP/3 from the public internet, speaks h2 to origin. See §3.1. |
 | Cluster ingress → worker | inbound | h2 over TLS via ALPN, OR h2c if the proxy is co-located | rove-h2 listener; customer-tenant subdomain routing. |
-| Scheduler / worker → in-cluster target (e.g. `webhook.loop46.com`) | in-process | n/a | Detected at apply time (host matches a known cluster tenant); the worker hosting that tenant picks the row up directly via `dispatchInternalSchedules` and runs the handler in its own QJS runtime. No HTTP at all. Falls back to libcurl outbound (the row below) if no worker hosts the target locally. See §3.2. |
+| Scheduler / worker → in-cluster target (e.g. `webhook.rewindjs.com`) | in-process | n/a | Detected at apply time (host matches a known cluster tenant); the worker hosting that tenant picks the row up directly via `dispatchInternalSchedules` and runs the handler in its own QJS runtime. No HTTP at all. Falls back to libcurl outbound (the row below) if no worker hosts the target locally. See §3.2. |
 | Scheduler thread → external target | outbound | h2 over TLS via libcurl + ALPN, falls back to 1.1 if upstream is 1.1-only | The scheduler picks rows whose `is_internal` is false. libcurl negotiates whatever the upstream supports. Stripe / Slack / GitHub all speak h2; long-tail upstreams may not. |
-| Scheduler thread → on_result callback | none — in-process | n/a | NOT an HTTP call. Envelope-5 from the scheduler writes `_callback/{id}` into the tenant's `app.db`; `dispatchCallbacks` reads it on the leader's next tick and invokes the customer's module directly in the leader-worker's QJS runtime. Same in-process JS dispatch as any other handler invocation, just triggered by a kv row instead of an h2 request. |
+| Scheduler thread → on_result callback | none — in-process | n/a | NOT an HTTP call. Envelope-9 from the scheduler writes `_callback/{id}` into the tenant's `app.db`; `dispatchCallbacks` reads it on the leader's next tick and invokes the customer's module directly in the leader-worker's QJS runtime. Same in-process JS dispatch as any other handler invocation, just triggered by a kv row instead of an h2 request. |
 
 ### 3.1 Edge proxy as a deployment requirement
 
@@ -279,7 +279,7 @@ investment.
 
 ### 3.2 Internal routing for in-cluster targets (v1, in-scope)
 
-The default-policy hop (scheduler → `webhook.loop46.com`) is
+The default-policy hop (scheduler → `webhook.rewindjs.com`) is
 expensive if it goes outbound: libcurl issues an HTTPS request to
 the cluster's ingress, ingress routes back to a worker hosting
 the system tenant — a TLS round-trip + h2 frame exchange + worker
@@ -288,14 +288,14 @@ process. Empirically ~10-50ms same-AZ, which compounds in chained
 sagas (step1 → step2 → step3).
 
 This hits the *steady-state* path: every customer's
-`webhook.send` goes through `webhook.loop46.com`. The optimization
+`webhook.send` goes through `webhook.rewindjs.com`. The optimization
 isn't for a few advanced customers — it's how the default works.
 **Ship in v1.**
 
 Detection runs once at apply time, not per-fire:
 
 ```zig
-// when envelope-4 (schedule_enqueue) commits, stamp is_internal
+// when envelope-8 (schedule_upsert) commits, stamp is_internal
 const is_internal = blk: {
     const uri = std.Uri.parse(row.url) catch break :blk false;
     const host = stripPort(uri.host orelse break :blk false);
@@ -322,7 +322,7 @@ dispatchInternalSchedules (every worker, every tick):
   5. Run dispatcher.run() against the target tenant's bytecode + kv,
      same as any inbound h2 request would.
   6. Capture response (status, body, error).
-  7. Propose envelope-5 with the result — identical wire shape to
+  7. Propose envelope-9 with the result — identical wire shape to
      the libcurl path. Apply writes _callback/{id} on the caller
      tenant; dispatchCallbacks invokes the customer's on_result
      module unchanged.
@@ -360,7 +360,7 @@ CREATE TABLE schedules (
   id              TEXT NOT NULL,       -- customer handle (1-256 utf8) OR
                                        -- platform-derived sha256 hex (64 chars)
   version         INTEGER NOT NULL,    -- bumped on every overwrite-by-handle;
-                                       -- envelope 5 carries the version it
+                                       -- envelope 9 carries the version it
                                        -- saw at fire time so apply can drop
                                        -- stale results (see §7).
   fire_at_ns      INTEGER NOT NULL,    -- absolute ns; 0 = ASAP
@@ -392,36 +392,36 @@ Generalizes today's webhook envelope:
 |------|-------------------|----------------------------------------|-------------------------|
 | 0    | writeset          | tenant kv writes                       | dispatcher              |
 | 2    | root_writeset     | __root__.db writes                     | admin / signup          |
-| 4    | schedule_upsert   | one or more rows (UPSERT on (tenant, id), bumps version) | dispatcher (rides w/ 0) |
-| 5    | schedule_complete | (tenant, id, version, result)          | scheduler / worker      |
-| 6    | schedule_retry    | id + new fire_at_ns + attempts++       | (deprecated — see §8)   |
-| 7    | multi             | container for env 0 + env 4/8 atomically | dispatcher            |
-| 8    | schedule_cancel   | one or more (tenant, id) tuples; deletes | dispatcher (rides w/ 0) |
+| 7    | multi             | container for env 0 + env 8/10 atomically | dispatcher           |
+| 8    | schedule_upsert   | one or more rows (UPSERT on (tenant, id), bumps version) | dispatcher (rides w/ 0) |
+| 9    | schedule_complete | (tenant, id, version, result)          | scheduler / worker      |
+| 10   | schedule_cancel   | one or more (tenant, id) tuples; deletes | dispatcher (rides w/ 0) |
+| 11   | schedule_demote   | (tenant, id) — no node hosts the target; demote to libcurl outbound | worker (§3.2 fallback) |
 
-**Envelope 4 is the renamed-and-generalized envelope 4.** Existing
-`webhook_enqueue` becomes `schedule_upsert` with a strictly-larger
-payload (adds `fire_at_ns`, `handle/id`, `version`). Migration: ship
-the new payload shape, leave the type number; old in-flight webhook
-rows are drained before the bump (zero-row cutover).
+Note: types 4/5/6 are retired webhook envelopes; the decoder rejects
+them loudly so any stale raft-log entry surfaces instead of
+silently mis-applying.
 
-**Envelope 4 is UPSERT, not insert.** `http.send({handle: H,
-...})` for an existing `(tenant_id, H)` overwrites the row and bumps
-`version`. The previous row's stamp (`url`, `body`, etc.) is
-discarded. Any in-flight fire of the previous version sees a
-version mismatch when it tries to apply envelope 5 — its result is
-silently dropped (see §7).
+**Envelope 8 (`schedule_upsert`) is the permanent slot** (8/9/10/11
+are the shipped numbers). `http.send({handle: H, ...})` for an
+existing `(tenant_id, H)` overwrites the row and bumps `version`.
+The previous row's stamp (`url`, `body`, etc.) is discarded. Any
+in-flight fire of the previous version sees a version mismatch when
+it tries to apply envelope 9 — its result is silently dropped (see §7).
 
-**Envelope 8 (`schedule_cancel`) is new.** Rides with the writeset
-the same way envelope 4 does. Apply path looks up
-`(tenant_id, id)` and deletes the row if present (idempotent — a
-double-cancel is a no-op).
+**Envelope 10 (`schedule_cancel`) rides with the writeset** the same
+way envelope 8 does. Apply path looks up `(tenant_id, id)` and
+deletes the row if present (idempotent — a double-cancel is a no-op).
 
-**Envelope 6 retires.** Today's `webhook_retry_schedule` advances
-attempts + reschedules the next fire. Under the new design, the
-scheduler doesn't retry; it proposes envelope 5 with the result
-and the customer's callback decides whether to call
-`http.send` again (which is just another envelope 4). Removes
-~150 lines of retry-policy code from the apply path.
+**No retry envelope exists.** There is no envelope for retry
+scheduling; the scheduler proposes schedule_complete (envelope 9)
+and the customer callback decides whether to call `http.send` again.
+Removes ~150 lines of retry-policy code from the apply path.
+
+**Envelope 11 (`schedule_demote`)** signals that no node currently
+hosts the internal target; the worker-side fallback timer (§3.2)
+proposes this to flip `is_internal=false` so the scheduler thread
+picks the row up via libcurl outbound instead.
 
 ---
 
@@ -440,9 +440,9 @@ while (!stop) {
             store.leaseUntil(row.id, now_ns + LEASE_NS);
             // libcurl POST/GET/etc; SSRF check; bounded body capture.
             const result = http_client.deliver(row);
-            // Propose envelope 5 — apply path writes _callback/{id}
+            // Propose envelope 9 — apply path writes _callback/{id}
             // to tenant's app.db AND deletes this schedule row.
-            raft.propose(env5(row.id, result));
+            raft.propose(env9(row.id, result));
         }
     }
     wake.timedWait(next_due_or_default);  // apply-side wakeup signals
@@ -451,11 +451,11 @@ while (!stop) {
 
 Differences from today's webhook thread:
 
-- **No retry logic.** Whatever the result, we propose envelope 5 and
+- **No retry logic.** Whatever the result, we propose envelope 9 and
   drop the row. Customer callback decides what's next.
 - **No webhook-specific headers stamped.** Today the worker stamps
   `X-Rove-Webhook-Id` + `X-Rove-Webhook-Attempt` on the outbound
-  call. Under the new design, customer JS at `webhook.loop46.com`
+  call. Under the new design, customer JS at `webhook.rewindjs.com`
   stamps whatever it wants — including platform-default headers if
   the customer wants the same shape.
 - **Sleep-until-next-due, not poll.** Today's thread polls every
@@ -480,18 +480,18 @@ This is the load-bearing concern. Today's invariant:
 > window in which the kv update succeeded but the webhook never
 > queued.
 
-Preserved by riding envelope 4 alongside envelope 0 in a type-7
+Preserved by riding envelope 8 alongside envelope 0 in a type-7
 multi-envelope. The dispatcher proposes one raft entry containing
 both; apply path replays both atomically.
 
 **The new design preserves this exactly** — the only change is
-generalizing what envelope 4's payload describes (any HTTP call, not
+generalizing what envelope 8's payload describes (any HTTP call, not
 just a customer-shaped webhook). The atomicity argument doesn't
 change.
 
 **Rejected alternative: cross-tenant atomic kv writes.** Would let
 the customer handler write a "schedule this" row into
-`webhook.loop46.com`'s kv as part of the customer's writeset.
+`webhook.rewindjs.com`'s kv as part of the customer's writeset.
 Cleaner-feeling — schedule storage is "just kv" — but introduces a
 new primitive (cross-tenant raft writes) bigger than the one it
 replaces, and exposes a sharp footgun (any tenant scribbling on
@@ -511,20 +511,20 @@ one demote/promote cycle.
 
 1. **Steady state.** Leader holds an in-memory `in_flight`
    hashset of `(schedule_id)`s it has fired but not yet seen
-   envelope-5 commit for. Used to skip same-tick re-firing.
+   envelope-9 commit for. Used to skip same-tick re-firing.
 2. **Demote.** Next tick's gate closes; thread idles. In-memory
    `in_flight` cleared. Any libcurl call already in flight
    finishes naturally — libcurl doesn't know about leadership.
-   When it returns, the thread tries to propose envelope-5;
+   When it returns, the thread tries to propose envelope-9;
    raft rejects (not leader). **The result is lost.**
 3. **Promote.** Next tick the gate opens. Scan rows with
    `fire_at_ns ≤ now`. The new leader has no idea what the old
    leader was working on; it just fires whatever's due:
-   - Rows the old leader successfully fired AND whose envelope-5
+   - Rows the old leader successfully fired AND whose envelope-9
      reached quorum before the leadership change: row was
      already deleted by `applyScheduleComplete`, scan misses
      them. No double-fire.
-   - Rows the old leader fired but whose envelope-5 didn't reach
+   - Rows the old leader fired but whose envelope-9 didn't reach
      quorum: row still pending. New leader fires again.
      **Double-fire window — at-least-once.**
 
@@ -547,8 +547,8 @@ processing.
 for tomorrow. Tomorrow arrives, leader fires libcurl. Mid-flight,
 the customer's handler runs `http.send({handle: "X",
 fire_at_ns: future_2})` to replace. Without protection, the
-in-flight fire's envelope-5 would land AFTER the new row's
-envelope 4 and either delete the new row or write `_callback/{id}`
+in-flight fire's envelope-9 would land AFTER the new row's
+envelope 8 and either delete the new row or write `_callback/{id}`
 with the old fire's data — both wrong.
 
 The version counter resolves this:
@@ -556,13 +556,13 @@ The version counter resolves this:
 1. Each row carries a monotonic `version`. Fresh insert: 1.
    Same-handle UPSERT: bump.
 2. Scheduler's `in_flight` set tracks `(id, version_at_fire)`.
-3. When libcurl returns, scheduler proposes envelope 5 with
+3. When libcurl returns, scheduler proposes envelope 9 with
    `(id, version, result)`.
 4. Apply path checks the row's CURRENT `version`:
    - Match → write `_callback/{id}` with the result, delete the
      row, deliver `on_result`.
    - Mismatch (newer version exists) → silently drop the
-     envelope-5. The newer row stays scheduled; the old fire's
+     envelope-9. The newer row stays scheduled; the old fire's
      result is discarded.
 
 Customer-visible contract: the most recent `http.send` with a
@@ -573,7 +573,7 @@ get superseded just disappear — usually what the customer wanted
 when they overwrote in the first place.
 
 **Cancel during firing.** Same shape: `http.cancel({handle: "X"})`
-deletes the row. If a fire was in-flight, its envelope-5 finds no
+deletes the row. If a fire was in-flight, its envelope-9 finds no
 matching row at apply time and is dropped. Customer's `on_result`
 does NOT fire — they cancelled, they don't get a delivery
 notification. Documented behavior.
@@ -594,9 +594,9 @@ instead of per-row).
 contract, with one extra wrinkle. Double-fire of an in-cluster
 target means the target handler runs twice — its kv writes may
 land twice. Customer-built system handlers (the cookbook
-examples in §10, and `webhook.loop46.com` itself) MUST be
+examples in §10, and `webhook.rewindjs.com` itself) MUST be
 idempotent in their kv writes, using the schedule id as dedupe
-key. The default-policy implementation at `webhook.loop46.com`
+key. The default-policy implementation at `webhook.rewindjs.com`
 does this — `kv.get("_processed/" + schedule_id)` gate before
 the actual delivery scheduling, atomic with the kv write that
 records "this schedule_id has been seen."
@@ -605,7 +605,7 @@ records "this schedule_id has been seen."
 
 ## 8. The on_result callback path
 
-Reuses today's envelope-5 → `_callback/{id}` → `dispatchCallbacks`
+Reuses today's envelope-9 → `_callback/{id}` → `dispatchCallbacks`
 machinery unchanged. The only shape change is the event handed to
 the customer's callback:
 
@@ -621,7 +621,7 @@ Differences:
 
 - `outcome` and `attempts` go away. The callback runs ONCE per
   schedule row. Retry semantics are the customer's problem (or
-  `webhook.loop46.com`'s, for customers using the default policy).
+  `webhook.rewindjs.com`'s, for customers using the default policy).
 - `id` is exposed (was `webhookId`); same value, less webhook-
   specific name.
 - `ok: bool` is a convenience: `status >= 200 && status < 300 &&
@@ -669,7 +669,7 @@ globalThis.webhook = {
   send(opts) {
     return http.send({
       handle: opts.id,           // optional customer-supplied
-      url:    "https://webhook.loop46.com/v1/webhooks/send",
+      url:    "https://webhook.rewindjs.com/v1/webhooks/send",
       method: "POST",
       headers: { "content-type": "application/json" },
       body:   JSON.stringify({
@@ -693,16 +693,16 @@ customer can't spoof it. The polyfill keeps the existing
 `webhook.send` API shape so existing customer code compiles
 unchanged.
 
-### 9.2 `webhook.loop46.com` (server-side)
+### 9.2 `webhook.rewindjs.com` (server-side)
 
-System tenant deployed at `webhook.loop46.com`. Its handlers
+System tenant deployed at `webhook.rewindjs.com`. Its handlers
 implement the "default webhook" experience customers expect:
 
 - POST `/v1/webhooks/send` — receives the spec from the
   client-side polyfill. Persists into its own kv, schedules the
   first attempt via `http.send`.
 - on_result module `webhook_result` — receives every fire's
-  outcome via the standard envelope-5 → `_callback/{id}` →
+  outcome via the standard envelope-9 → `_callback/{id}` →
   `dispatchCallbacks` path. Decides:
   - 2xx → propagate to the customer's `onResult` handler (one
     more `http.send` call with `on_result.tenant: <calling>`).
@@ -736,7 +736,7 @@ down.
 
 ## 10. Customer escape hatch
 
-Advanced customers bypass `webhook.loop46.com` and call
+Advanced customers bypass `webhook.rewindjs.com` and call
 `http.send` directly. Examples this enables (cookbook entries):
 
 ### 10.1 Stripe-style idempotency
@@ -807,7 +807,7 @@ export default function (event) {
 // it later if the user does the thing the reminder was about.
 http.send({
   handle: `reminder-${user_id}`,
-  url: "https://webhook.loop46.com/v1/email/send",  // platform email service
+  url: "https://webhook.rewindjs.com/v1/email/send",  // platform email service
   body: JSON.stringify({ to, subject, html }),
   fire_at_ns: BigInt(Date.now() + 30 * 24 * 60 * 60 * 1000) * 1_000_000n,
 });
@@ -824,7 +824,7 @@ http.cancel({ handle: `reminder-${user_id}` });
 // just pushes the deadline out.
 http.send({
   handle: `cart-${cart_id}`,
-  url: "https://webhook.loop46.com/v1/email/send",
+  url: "https://webhook.rewindjs.com/v1/email/send",
   body: JSON.stringify({ to: user.email, template: "cart_reminder", cart_id }),
   fire_at_ns: BigInt(Date.now() + 24 * 60 * 60 * 1000) * 1_000_000n,
 });
@@ -952,7 +952,7 @@ otherwise require):
    `schedules.db`; new envelope payload shape under a new envelope
    type (8) until cutover. webhook.send keeps its existing path.
 
-2. **Stand up `webhook.loop46.com` system tenant** with the default
+2. **Stand up `webhook.rewindjs.com` system tenant** with the default
    policy implemented in JS using `http.send`. Tenant boots
    alongside `__admin__` and `__replay__`; deploy is part of the
    files-server bootstrap.
@@ -962,7 +962,7 @@ otherwise require):
    `textcodec.js` — `addAnonymousImport` for a new
    `src/js/bindings/webhook.js`, evaluated into every QJS context
    at startup. The polyfill installs `globalThis.webhook.send` and
-   calls `http.send` against `webhook.loop46.com`. End-to-end
+   calls `http.send` against `webhook.rewindjs.com`. End-to-end
    behavior unchanged from the customer's perspective; existing
    `webhook_smoke.py` passes against the new path.
 
@@ -975,15 +975,15 @@ otherwise require):
 5. **Delete the legacy webhook_server.** Drop
    `src/webhook_server/`, drop the C `jsWebhookSend` binding +
    `pending_webhooks` plumbing in `dispatcher.Request` /
-   `DispatchState`, drop envelopes 4/5/6's old shape, drop
-   `webhook_dispatch.zig`'s retry helpers. The platform's
-   outbound surface is now exactly two C bindings:
+   `DispatchState`, drop retired envelopes 4/5/6 (the decoder must
+   reject them loudly), drop `webhook_dispatch.zig`'s retry helpers.
+   The platform's outbound surface is now exactly two C bindings:
    `http.send` and `http.cancel`. Everything else is JS.
 
-6. **Rename envelope 8 → envelope 4.** With the legacy gone, the
-   numeric type can take over the freed slot. Pure raft-log
-   change; no semantics change. Followers replay the new shape on
-   the next raft restart.
+6. **Not done — superseded; 8/9/10/11 are the permanent slots.**
+   The planned "Rename envelope 8 → envelope 4" step was not taken.
+   The decoder must reject retired types 4/5/6 loudly so any old
+   raft-log entry surfaces instead of silently mis-applying.
 
 ---
 
@@ -1000,7 +1000,7 @@ information:
   cross-tenant-kv alternative was considered and rejected as
   larger and sharper than the problem it solves.
 - **Retry policy lives in customer JS.** The platform ships zero
-  retry policy. `webhook.loop46.com` is a *default* policy
+  retry policy. `webhook.rewindjs.com` is a *default* policy
   implemented in customer-equivalent JS — operators can replace it
   without recompiling the engine, customers can bypass it
   entirely. (Saved feedback note: "compose from primitives, defer
@@ -1037,7 +1037,7 @@ information:
   recognize as "send a webhook" / "send an email" is JS — a
   client-side polyfill (same pattern as today's `email.js` /
   `textcodec.js`) plus a server-side system tenant
-  (`webhook.loop46.com`). Both pieces are customer-equivalent
+  (`webhook.rewindjs.com`). Both pieces are customer-equivalent
   code; advanced customers can write their own libraries on top
   of `http.send` directly. Operators can replace the default
   policy without recompiling the engine.
@@ -1119,10 +1119,10 @@ real workload.
 
 `on_result.tenant` defaulting to the calling tenant is the obvious
 shape. Should we allow `on_result.tenant: "<other>"`? Use case:
-`webhook.loop46.com` calls `http.send` and wants the result
+`webhook.rewindjs.com` calls `http.send` and wants the result
 routed back to the customer's tenant, not its own. For the
 internal `webhook.send` shim path this is fine because
-`webhook.loop46.com`'s handler can synthesize the customer-side
+`webhook.rewindjs.com`'s handler can synthesize the customer-side
 `on_result` itself (do the work in its own dispatch tick, then
 schedule a final `http.send` whose URL is the customer's
 tenant). Native cross-tenant `on_result` is a bigger primitive
@@ -1138,9 +1138,9 @@ runner provides a stub `http.send` that records the call into
 a tape and returns a deterministic id; tests assert on the tape.
 Adjacent change to `docs/sim-test-framework.md` to formalize.
 
-### 13.5 What happens when `webhook.loop46.com` itself is down
+### 13.5 What happens when `webhook.rewindjs.com` itself is down
 
-`webhook.loop46.com` is a normal tenant — if it can't be dispatched
+`webhook.rewindjs.com` is a normal tenant — if it can't be dispatched
 (deployment broken, panic loop, etc.), `webhook.send` calls fail.
 That's actually the correct behavior: if the platform's *default*
 webhook policy is broken, customer code should see the failure

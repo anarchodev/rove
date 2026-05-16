@@ -2,13 +2,13 @@
 
 Implements [`docs/PLAN.md`](PLAN.md) §10.10.
 
-**Scope**: make Loop46 a first-class target for AI agents (Claude Code, Codex, Cursor, future runtimes) without building an MCP protocol server in v1. The local-agent path is fully served by:
+**Scope**: make rewind.js a first-class target for AI agents (Claude Code, Codex, Cursor, future runtimes) without building an MCP protocol server in v1. The local-agent path is fully served by:
 
 1. A skill file teaching the workflow.
 2. A polished CLI with consistent JSON output.
 3. Scoped tokens for security-isolated agent integrations.
 
-**Hosted MCP at `mcp.loop46.me` is deferred** until concrete remote-agent demand surfaces (third-party integrations, cloud agents that don't run on the customer's machine). Until then, no MCP protocol code in the repo.
+**Hosted MCP at `mcp.rewindjs.com` is deferred** until concrete remote-agent demand surfaces (third-party integrations, cloud agents that don't run on the customer's machine). Until then, no MCP protocol code in the repo.
 
 **Why this is the right v1**: agents in the customer's working tree (the dominant case) already have shell access, can read `--help`, can parse JSON. The MCP wins (typed schemas, server-side rate limiting, token isolation, cross-machine access) only matter for remote scenarios. Token isolation is worth building anyway as an independent security primitive — it's not MCP-specific.
 
@@ -114,10 +114,10 @@ loop46 revoke-token <hash>
 
 ### T5. Skill file
 
-New file at `docs/skills/loop46.md` (final path TBD when Anthropic skill conventions stabilize; for now committed to the repo, published on the Loop46 docs site for agent discovery).
+New file at `docs/skills/loop46.md` (final path TBD when Anthropic skill conventions stabilize; for now committed to the repo, published on the rewind.js docs site for agent discovery).
 
 Sections:
-- **Overview**: what Loop46 is in one paragraph from an agent's POV.
+- **Overview**: what rewind.js is in one paragraph from an agent's POV.
 - **Workflow**: edit handler → `loop46 test` → fix fixtures via `loop46 fixture *` → `loop46 deploy`. Concrete examples.
 - **Tool catalog**: every CLI subcommand with a one-line purpose, expected args, and a JSON-output example.
 - **Auth setup**: `LOOP46_TOKEN`, `LOOP46_SCOPE`, `LOOP46_HOST`. How to mint a scoped token.
@@ -160,14 +160,14 @@ The skill file should be small enough for Claude to load fully (~500-1500 lines)
   - **Mint scoped token**: `loop46 mint-token --capabilities deploy,test --instances acme` → emits a token. List shows it. Use it for a deploy → succeeds. Use it for a `simulate` call → 403 (capability not granted).
   - **Revoke**: revoke the token, retry the deploy → 401.
   - **Capability gate**: scoped token with only `read` cannot deploy or fixture.
-- Manual: configure Claude Code with the skill file in a Loop46 source tree → ask "find the most recent failing request and propose a fix" → confirm the agent reads the skill, runs `loop46 logs`, finds the failure, runs `loop46 export-fixture`, edits the handler, runs `loop46 test`, iterates.
+- Manual: configure Claude Code with the skill file in a rewind.js source tree → ask "find the most recent failing request and propose a fix" → confirm the agent reads the skill, runs `loop46 logs`, finds the failure, runs `loop46 export-fixture`, edits the handler, runs `loop46 test`, iterates.
 - Inline Zig tests for scoped token install/authenticate roundtrip + capability validation.
 
 ## Open questions
 
-1. **Skill file location**: `docs/skills/loop46.md` in the repo plus published at `loop46.me/skills/`? Bundled with the CLI binary as a `loop46 skill` subcommand? Anthropic's skill convention is still settling; for v1, just commit it to the repo and document it on the website.
+1. **Skill file location**: `docs/skills/loop46.md` in the repo plus published at `rewindjs.com/skills/`? Bundled with the CLI binary as a `loop46 skill` subcommand? Anthropic's skill convention is still settling; for v1, just commit it to the repo and document it on the website.
 2. **Token format prefix**: `loop46_scoped_<hex>` distinguishes scoped tokens from root tokens visually; or just hex with the kind stored at the lookup site. Prefix is more grep-friendly but couples format to logic. Probably prefix, since git scanners (GitHub secret scanning) match on prefix patterns.
 3. **Capability hierarchy**: `read` should imply log read, kv read, manifest read. Should it also imply `fixture`? Or are they independent? Likely `read` is a base, others are additive. Document explicit relationships.
 4. **Audit log for token use**: should every scoped-token-authenticated request log to a security-audit channel? Useful for "what did this CI bot's token do this week?" Defer until usage shows demand.
 5. **Token expiration**: support `expires_at` from day one (yes, planned). What's the default? No expiration (caller must explicitly request one)? Or default 30 days? Probably no default — explicit is safer.
-6. **Hosted MCP timeline**: when do we revisit? Concrete signals — third-party integration request, customer asking "can my Cursor instance running on a friend's laptop manage my account," remote-CI vendor wanting to wrap Loop46. None imminent; revisit at the 6-month mark with usage data.
+6. **Hosted MCP timeline**: when do we revisit? Concrete signals — third-party integration request, customer asking "can my Cursor instance running on a friend's laptop manage my account," remote-CI vendor wanting to wrap rewind.js. None imminent; revisit at the 6-month mark with usage data.

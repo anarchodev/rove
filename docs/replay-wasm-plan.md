@@ -44,42 +44,32 @@ cursor API — is the next set of milestones.
   the WASM runtime walks live frames and ships a JSON snapshot via
   `host_state` before raising the stop sentinel. Surfaces args,
   locals, captured-locals, and closure-referenced names.
-- RTAP wire-format parser (`web/replay/rtap.mjs`) — mirrors
+- RTAP wire-format parser (`web/replay/_static/rtap.mjs`) — mirrors
   `src/tape/root.zig` rule-for-rule with `parseTapeBlob`,
   `serializeTape`, and a `buildTapesFromBlobs` bridge that produces
   the `Module.tapes` shape the WASM bindings consume.
-- Entry-point HTML + driver (`web/replay/wasm.html` +
-  `wasm-app.mjs`) wired to the dashboard's existing postMessage
-  handshake. Boots the engine, sets tapes + module sources, runs
-  the handler, renders a call-tree timeline of FUNC_ENTER /
-  FUNC_EXIT / THROW events.
+- Entry-point HTML + driver (`web/replay/_static/index.html` +
+  `wasm-app.mjs` + `cursor.mjs` (`CursorEngine`)) wired to the
+  dashboard's existing postMessage handshake. Boots the engine,
+  sets tapes + module sources, and drives interactive scrubbing,
+  stepping, and variable inspection via `CursorEngine`
+  (`materialise()`, `inspectAt()`, `drillNext()`).
 
 ### What's not done (roughly in order of usefulness)
 
-- Source view — display the actual handler source with line
-  numbers, syntax highlighting if cheap, current-line cursor.
-- Drill mode toggle — switch the timeline to per-line events,
-  enabling fine-grained scrubbing.
-- Click-to-inspect — clicking a timeline row stops the handler at
-  that event index and renders the stack snapshot.
-- Breakpoint markers — click a source line to set a breakpoint;
-  rerun stops there with state inspection.
-- Stepping — step over / step into / step out via the same
-  event-counter mechanism breakpoints use.
 - Source-map remapping — handlers may be transpiled; LINE events
   report bundled lines and the UI needs to map back to user source.
-- Faster stepping via snapshots (v2 perf) — at 10 ms handler
-  budget × 15× WASM overhead = ~150 ms per re-run, so each step
-  is "rewind from start." Acceptable for v1; the v2 fix is to
-  snapshot the arena state at each stop point.
-- Conditional breakpoints — needs scope-aware `eval`, which the
-  arenajs runtime doesn't expose yet. v2 or later.
+  (§8.6)
+- Conditional breakpoints + scope eval — needs `JS_EVAL_TYPE_DIRECT`
+  exposed across the WASM boundary. Significant arenajs work.
+  (§8.7)
+- Snapshot-based fast stepping — capture WASM heap at each stop
+  point to avoid full re-runs per step. (§8.8)
 
-### Build is green, but nothing past the timeline has been tested
-### against a real captured bundle yet — the next concrete step is
-### to spin up `loop46 dev`, trigger a recordable request, hit the
-### Replay button targeting `/wasm`, and verify the timeline
-### renders something meaningful.
+### Smoke coverage landed — see `scripts/replay_wasm_smoke.py` and
+### `scripts/replay_shell_smoke.mjs` (Playwright). Dev bringup is
+### `scripts/replay_wasm_dev.py` (there is no `loop46 dev`
+### subcommand).
 
 ---
 
@@ -90,14 +80,14 @@ cursor API — is the next set of milestones.
 │ dashboard at app.{suffix}          │
 │ - composes ReplayBundle from log    │
 │   record + tape blobs               │
-│ - window.opens replay.{suffix}/wasm │
+│ - window.opens replay.{suffix}/      │
 │ - postMessage replay:bundle once    │
 │   the replay shell signals ready    │
 └──────────────────┬──────────────────┘
                    │ postMessage
                    ▼
 ┌─────────────────────────────────────────────────────────┐
-│ replay.{suffix}/wasm — wasm.html + wasm-app.mjs        │
+│ replay.{suffix}/ — index.html + wasm-app.mjs + cursor.mjs │
 │                                                         │
 │ 1. handshake: replay:ready ──▶  ◀── replay:bundle      │
 │                                                         │
@@ -247,10 +237,9 @@ Bundles arrive with `bundle.tape_blobs.<channel>` as `Uint8Array`s
 those as empty arrays).
 
 The lift target for this module is rove proper. It currently lives
-under `web/replay/` alongside the consumers; if the existing iframe
-replay ever migrates to share this parser, it could move to a
-shared static path. Not urgent — the iframe replay has its own
-inline copy that doesn't need to change.
+at `web/replay/_static/rtap.mjs` alongside the consumers; if it
+ever needs to be shared more broadly it could move to a shared
+static path. Not urgent for v1.
 
 ---
 
@@ -472,62 +461,36 @@ build-time toggling. It doesn't.
 
 ## 8. Roadmap — what to build next, in order
 
-### 8.1 Real-world bundle test (couple of hours)
+### 8.1 Real-world bundle test — DONE (commit c23257d)
 
-Spin up `loop46 dev`, deploy a small handler that exercises kv,
-Math.random, Date.now, crypto, and one module import. Trigger a
-recordable request. Hit the dashboard's Replay button targeting
-`/wasm`. Verify the timeline renders and the handler exits
-without divergence. Surface any wire-format gotchas now before
-more UI lands on top.
+Dev cluster bringup via `scripts/replay_wasm_dev.py` (there is no
+`loop46 dev` subcommand). Smoke coverage in
+`scripts/replay_wasm_smoke.py` and `scripts/replay_shell_smoke.mjs`
+(Playwright).
 
-### 8.2 Source view (small)
+### 8.2 Source view — DONE
 
-Split the timeline column from a source-view column. The source-
-view shows `bundle.modules[entry].source` with line numbers, no
-syntax highlighting yet. When the user clicks a timeline row, jump
-to the `(file, line)` of that event in the source view.
+Source-view column alongside the timeline; shows handler source
+with line numbers and current-line cursor. Click a timeline row
+to jump to `(file, line)` in the source view.
 
-`bundle.modules` is already in scope in `wasm-app.mjs` — passed
-to `Module.module_sources`. No new data needed.
+### 8.3 Drill toggle + click-to-inspect — DONE
 
-### 8.3 Drill toggle + click-to-inspect (medium)
+SCAN/DRILL mode toggle. Timeline rows are interactive: clicking
+a row stops at that event index, delivers a stack snapshot via
+`host_state`, renders the variable panel. `CursorEngine`
+(`cursor.mjs`) abstracts this re-run/stop/inspect loop.
 
-Add a UI toggle to switch between SCAN and DRILL modes. Re-run
-the handler on toggle; this is a fresh `arena_run_module` call
-with a different `arena_set_trace_mode` value first.
+### 8.4 Breakpoints — DONE
 
-Then make timeline rows interactive: clicking a row sets a stop
-target (event index from `data-event-index`), re-runs in the same
-mode, returns `2` from `host_trace` when that index is reached.
-The stack snapshot arrives via `host_state` and renders into a
-third column (variable panel).
+Gutter-clickable source lines set breakpoints (`Set<"path:line">`).
+`host_trace`'s LINE case checks the set and returns 2 on match.
 
-Snapshot rendering: walk `snapshot[]` top-down, one frame per
-collapsible section, name/file/line as the header, `vars` as a
-two-column table (name / `JSON.stringify(value, null, 2)`).
+### 8.5 Stepping — DONE
 
-### 8.4 Breakpoints (small once 8.3 lands)
-
-A breakpoint is "stop at the first LINE event whose `(file,
-line)` matches." Add gutter clickability to the source view; the
-breakpoint set is just `Set<"path:line">`. `host_trace`'s LINE
-case checks `breakpoints.has(...)` and returns 2 on match.
-
-### 8.5 Stepping (small once 8.4 lands)
-
-Step into / over / out are all pure host-side state machines
-that count events to find the next stop point:
-
-- step over: track depth via FUNC_ENTER / FUNC_EXIT; stop on
-  next LINE in same-or-shallower depth.
-- step into: stop on next LINE OR FUNC_ENTER.
-- step out: track depth; stop on FUNC_EXIT that drops below
-  current depth.
-
-Each step = one full `arena_run_module` call from scratch.
-Per-step latency is dominated by re-running the handler (~150
-ms in WASM); acceptable for v1.
+Step over / into / out implemented as host-side event-counting
+state machines in `CursorEngine` (`drillNext()`). Each step is
+one full `arena_run_module` call from scratch.
 
 ### 8.6 Source-map remapping (small but situational)
 
@@ -561,24 +524,27 @@ the two ways around that.
 
 ### Updating the WASM payload
 
-The WASM artefact is built from arenajs:
+The WASM artefact is built from the vendored arenajs source at
+`vendor/arenajs` (v0.1.0). Build via the vendor bump process
+documented in `vendor/README.md`; outputs are copied into
+`web/replay/_static/` (not `web/replay/`):
 
 ```bash
 # 1. emsdk available somewhere; the repo currently uses ~/src/emsdk
 source ~/src/emsdk/emsdk_env.sh
 
-# 2. configure + build arenajs WASM target
-cd ~/src/arenajs           # or wherever the arenajs checkout is
+# 2. configure + build arenajs WASM target from the vendored source
+cd vendor/arenajs
 mkdir -p build-wasm && cd build-wasm
 emcmake cmake .. -DCMAKE_BUILD_TYPE=Release
 emmake make qjs_arena_wasm
 
-# 3. copy the two outputs into rove
-cp build-wasm/qjs_arena_wasm.js   ~/src/rove/web/replay/
-cp build-wasm/qjs_arena_wasm.wasm ~/src/rove/web/replay/
+# 3. copy the two outputs into the static assets directory
+cp build-wasm/qjs_arena_wasm.js   ../../web/replay/_static/
+cp build-wasm/qjs_arena_wasm.wasm ../../web/replay/_static/
 
 # 4. rebuild rove
-cd ~/src/rove
+cd ../../
 zig build test
 ```
 
@@ -631,8 +597,10 @@ regressed.
   the WASM build. Useful as worked examples of how the host side
   is supposed to wire up.
 - `src/tape/root.zig` — authoritative wire format definition.
-- `web/replay/app.js` — the existing iframe replay, still in use,
-  shares the bundle format with the WASM path.
-- `web/replay/wasm-app.mjs` — current WASM driver. v1 stops at
-  timeline rendering; everything past §8.1 above hangs off this
-  file and a few small siblings yet to be created.
+- `web/replay/_static/wasm-app.mjs` — WASM driver; boots the
+  engine, sets tapes + module sources, wires the postMessage
+  handshake.
+- `web/replay/_static/cursor.mjs` — `CursorEngine`
+  (`materialise()`, `inspectAt()`, `drillNext()`), the core
+  driver abstraction the shell uses for scrubbing, stepping, and
+  variable inspection.

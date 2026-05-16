@@ -1,4 +1,8 @@
-# SSE plan — notification only, centralized service, response-attached emits
+# SSE plan — notification only, centralized server, response-attached emits
+
+**Status:** Implemented + smoke-covered (commits 7c5b949, e056bea, 2026-05).
+Design-of-record; future-tense passages (§7 migration order, 'gets removed',
+'new phase') are retrospective.
 
 An earlier draft (deleted 2026-05) treated SSE events as source-of-
 truth state living in customer `app.db` under reserved prefix
@@ -12,12 +16,12 @@ of that with a much simpler model:
 - **Events live on the response, not in storage.** `events.emit()`
   appends to an in-memory buffer on the request's execution context.
   After the kv writeset commits, the worker fires the buffer to a
-  centralized sse-service.
-- **sse-service is its own subsystem on its own subdomain
+  centralized sse-server.
+- **sse-server is its own subsystem on its own subdomain
   (`sse.{public_suffix}`).** It owns every EventSource connection,
   the per-(tenant, sid) recent-event cache, and per-tenant
   connection caps. The worker has zero SSE connection state.
-- **Single sse-service process per cluster** (the bet locked in
+- **Single sse-server process per cluster** (the bet locked in
   conversation: customers fit on dedicated bare metal; multiraft is
   a future-problem horizon). Failover is "load balancer picks a new
   node, clients reconnect." Lost in-flight events are acceptable; a
@@ -38,40 +42,40 @@ replication of SSE state, the persistent catch-up window.
 ```
 ┌──────────────────┐  EventSource  ┌────────────────────────────────┐
 │ customer browser │──────────────▶│ sse.{public_suffix}            │
-│ (Last-Event-ID   │  with token   │  (sse-service — single process,│
+│ (Last-Event-ID   │  with token   │  (sse-server — single process, │
 │  on reconnect)   │  query param  │   own h2 listener, own TLS,    │
 └──────────────────┘               │   per-(tenant, sid) ring cache)│
                                    └─────────────▲──────────────────┘
                                                  │ POST /v1/emit
                                                  │ {tenant, events[]}
                                                  │ (fire-and-forget,
-                                                 │  worker → sse-service,
+                                                 │  worker → sse-server,
                                                  │  internal token)
                                                  │
 ┌──────────────────┐  HTTPS req    ┌──────────────┴─────────────────┐
-│ customer browser │──────────────▶│ acme.loop46.me (worker)        │
+│ customer browser │──────────────▶│ acme.rewindjs.app (worker)     │
 │ (regular API)    │               │  - runs handler                │
 └──────────────────┘               │  - events.emit() → emit_buffer │
                                    │  - kv writeset commits         │
-                                   │  - POST emit_buffer to sse-svc │
+                                   │  - POST emit_buffer to sse-srv │
                                    │  - returns response            │
                                    └────────────────────────────────┘
 ```
 
 Three coupling channels, no cross-coupling between worker and
-sse-service beyond the one outbound POST:
+sse-server beyond the one outbound POST:
 
-1. **Worker → sse-service:** `POST sse-internal/v1/emit`. Best-effort
+1. **Worker → sse-server:** `POST sse-internal/v1/emit`. Best-effort
    fire-and-forget after kv commit. Worker doesn't block the response
    on it.
 2. **Customer browser → worker:** regular HTTPS requests on the
    customer subdomain. Worker terminates TLS, runs handler, returns
    response.
-3. **Customer browser → sse-service:** EventSource on
-   `sse.{public_suffix}`. sse-service terminates TLS, validates the
+3. **Customer browser → sse-server:** EventSource on
+   `sse.{public_suffix}`. sse-server terminates TLS, validates the
    token, holds the long-lived h2 stream.
 
-Worker has no SSE connection state. sse-service has no kv access.
+Worker has no SSE connection state. sse-server has no kv access.
 Neither knows the other's address beyond the outbound emit POST URL
 (configured at worker startup).
 
@@ -100,7 +104,7 @@ const EmitEntry = struct {
     /// Target sids: defaults to [request.session.id]; can be a
     /// customer-supplied list of sids.
     target_sids: []const []const u8,
-    /// Wall-clock at emit, for the sse-service ring cache.
+    /// Wall-clock at emit, for the sse-server ring cache.
     created_at_ms: i64,
 };
 ```
@@ -108,7 +112,7 @@ const EmitEntry = struct {
 The buffer is allocator-owned by the request's arena and freed when
 the request completes. No persistence; no cross-request lifetime.
 
-### 2.2 Wire format: worker → sse-service
+### 2.2 Wire format: worker → sse-server
 
 `POST sse-internal/v1/emit` with `Authorization: Bearer <internal-token>`:
 
@@ -133,12 +137,12 @@ the request completes. No persistence; no cross-request lifetime.
 Response: 204 No Content on success; non-204 is logged and ignored
 by the worker (best-effort).
 
-The internal token is a shared secret between worker and sse-service,
+The internal token is a shared secret between worker and sse-server,
 configured via env (`SSE_INTERNAL_TOKEN`) at startup. Rotated by
 restarting both with a new value. mTLS is a possible future upgrade
 when an operator wants stronger boundaries.
 
-### 2.3 Recent-event ring cache (sse-service, in-memory)
+### 2.3 Recent-event ring cache (sse-server, in-memory)
 
 Per-(tenant, sid) bounded ring:
 
@@ -175,7 +179,7 @@ Memory bounds:
 Comfortable on bare metal at any v1 scale. Revisit only if
 measurement shows the ring eating real memory.
 
-### 2.4 Connection table (sse-service, in-memory)
+### 2.4 Connection table (sse-server, in-memory)
 
 Per-tenant:
 
@@ -230,7 +234,7 @@ flushed to the client:
 ```
 For each just-completed request:
     if ctx.emit_buffer.items.len > 0:
-        spawn fire-and-forget POST to sse-service:
+        spawn fire-and-forget POST to sse-server:
             body = {tenant_id, request_id, events: emit_buffer}
             timeout = 1s (cap on how long the worker will wait
                           before logging + moving on)
@@ -238,7 +242,7 @@ For each just-completed request:
 ```
 
 Implementation: an h2 client connection from the worker to
-sse-service, parking the POST request in a `sse_emit_pending` queue
+sse-server, parking the POST request in a `sse_emit_pending` queue
 that drains independently of the request response. Worker sends the
 client response immediately; the emit POST completes (or fails) on
 its own timeline.
@@ -254,7 +258,7 @@ Key invariants:
 - **Triggers and webhook callbacks fire too.** Their execution
   contexts also have emit_buffers; their completion paths invoke
   the same `pumpEmitsForResponse` (renamed `pumpEmitsForContext`
-  if that's clearer).
+  if that is clearer).
 
 ### 3.3 What the worker no longer does
 
@@ -263,14 +267,14 @@ Key invariants:
 - `events_sweep.zig` (365 lines) — gone. No retention sweep.
 - `_events/` reserved prefix — removed from `reserved.zig`.
 - `markDirtyFromWriteset` no longer scans for `_events/` keys.
-- `/_events` route on the customer subdomain — moved to sse-service
+- `/_events` route on the customer subdomain — moved to sse-server
   on `sse.{public_suffix}`.
-- `EventsCaps` per-tenant config — moves to sse-service (the entity
+- `EventsCaps` per-tenant config — moves to sse-server (the entity
   that enforces them). Caps stay; their enforcer changes.
 
 ---
 
-## 4. sse-service
+## 4. sse-server
 
 New module: `src/sse_server/` (mirrors `files_server/` and
 `log_server/` shape). One process; own h2 server; own TLS listener
@@ -283,7 +287,7 @@ GET  /v1/{tenant_id}/sse?token=<jwt>              ← EventSource connect
                        [?last_event_id=<id>]      (optional cursor)
                        [Last-Event-ID: <id>]      (header, EventSource standard)
 
-POST /v1/emit                                     ← worker → sse-service
+POST /v1/emit                                     ← worker → sse-server
      Authorization: Bearer <internal-token>
      body: {v, tenant_id, request_id, events[]}
 
@@ -304,7 +308,7 @@ GET  /v1/health                                   ← LB health check
      X-Accel-Buffering: no
 4. If Last-Event-ID present:
      if id in this sid's ring: replay events after id, then stream future
-     if id not in ring (evicted, or sse-service restarted since):
+     if id not in ring (evicted, or sse-server restarted since):
         emit sentinel:
           event: rove:resync
           data:  {"reason": "events_evicted"}
@@ -318,10 +322,10 @@ No CORS headers needed — EventSource opens with `withCredentials:
 false` (auth is the JWT, not cookies), which makes it a "simple"
 cross-origin request: no preflight, no `Access-Control-*` response
 headers required, browser accepts events from any origin. Same code
-path for `acme.loop46.me` customers and `acme.com` custom-domain
-customers; sse-service doesn't need to know the origin.
+path for `acme.rewindjs.app` customers and `acme.com` custom-domain
+customers; sse-server doesn't need to know the origin.
 
-**Token leakage hardening:** sse-service MUST strip `?token=` from
+**Token leakage hardening:** sse-server MUST strip `?token=` from
 its access-log query string before logging. Standard concern with
 token-in-query; bounded for SSE because EventSource URLs aren't
 stored in browser navigation history and SSE responses don't
@@ -346,7 +350,7 @@ trigger sub-resource fetches (no Referer leaks). 1h token TTL +
 ```
 
 The ring cache is updated regardless of whether a connection is
-currently open — that's how a brief connect-window race is handled
+currently open — that is how a brief connect-window race is handled
 (events posted before the connect arrives are cached and replayed
 on catch-up). The cache update happens *before* the push attempt so
 a slow consumer doesn't lose events from the ring; they only lose
@@ -381,7 +385,7 @@ pattern; documented as part of the SSE getting-started guide.
 ### 4.5 Per-tenant cap enforcement
 
 Existing `EventsCaps` (in PLAN §2.12 and the original sse-plan) move
-to sse-service:
+to sse-server:
 
 - `max_concurrent_connections_per_instance` — checked at connect.
 - `max_concurrent_connections_per_session` — checked at connect.
@@ -399,13 +403,13 @@ Single process. If it dies:
 
 - All EventSource connections die (TCP reset). Browsers auto-reconnect
   (EventSource standard behavior; default 3s reconnect delay).
-- Reconnect lands on whatever sse-service is now answering the LB.
+- Reconnect lands on whatever sse-server is now answering the LB.
 - New process has empty ring cache → any Last-Event-ID hits the
   sentinel path → clients refetch state → catch up.
 - Worker emit POSTs during the dead window fail with connection
   refused → worker logs and drops → events lost (acceptable).
 
-No election protocol, no state migration, no raft for sse-service.
+No election protocol, no state migration, no raft for sse-server.
 Operator (or k8s, or systemd) handles "process died, restart it."
 
 ---
@@ -414,11 +418,11 @@ Operator (or k8s, or systemd) handles "process died, restart it."
 
 ### 5.1 EventSource auth: token handoff (cross-origin)
 
-The customer's app on `acme.loop46.me` (or `acme.com`, custom
+The customer's app on `acme.rewindjs.app` (or `acme.com`, custom
 domain — same flow either way) opens an EventSource to a single
-platform-managed hostname `sse.loop46.me`. **One TLS cert, one DNS
-record, no per-tenant SSE subdomains, no SSE in custom-domain TLS
-provisioning.** The JWT carries identity; `withCredentials` is
+platform-managed hostname `sse.rewindjs.com`. **One TLS cert, one
+DNS record, no per-tenant SSE subdomains, no SSE in custom-domain
+TLS provisioning.** The JWT carries identity; `withCredentials` is
 false, so no cookies cross origins and `__Host-` cookies stay
 safely pinned to the customer's app domain.
 
@@ -441,10 +445,10 @@ safely pinned to the customer's app domain.
 
 2. Customer's JS code:
      const es = new EventSource(
-       'https://sse.loop46.me/v1/acme/sse?token=' + token
+       'https://sse.rewindjs.com/v1/acme/sse?token=' + token
      );
 
-3. sse-service validates token signature + expiry + tenant_id ==
+3. sse-server validates token signature + expiry + tenant_id ==
    URL path tenant. Opens stream.
 
 4. Customer's JS code refreshes the token before expiry (e.g.,
@@ -463,17 +467,17 @@ session's plan tier, mints a JWT scoped to
 
 **Caps embedded in JWT, not queried per-connect.** Cap changes
 propagate within `token_ttl` (1h default) when clients refresh.
-Saves an HTTP roundtrip per connect; removes a sse-service →
+Saves an HTTP roundtrip per connect; removes a sse-server →
 worker dependency on the connect path (one fewer failure mode).
 The 1h propagation delay is acceptable — caps are not a security
 boundary that needs instant revocation; for emergency cap
 tightening (e.g., abuse), revoking the session itself drops the
 token's effective scope on next refresh.
 
-### 5.2 Worker → sse-service auth: shared internal token
+### 5.2 Worker → sse-server auth: shared internal token
 
 The internal `Authorization: Bearer <token>` between worker and
-sse-service uses a static shared secret from `SSE_INTERNAL_TOKEN`
+sse-server uses a static shared secret from `SSE_INTERNAL_TOKEN`
 env, set identically on both. mTLS is a future upgrade when an
 operator wants stronger isolation; v1 doesn't need it given the
 internal-network deployment context.
@@ -486,7 +490,7 @@ internal-network deployment context.
 - `src/js/events_sweep.zig` — entire file.
 - `src/js/events.zig` — replaced by a much smaller stub if anything
   remains (the `/_events` route definition is gone; `EventsCaps`
-  moves to sse-service).
+  moves to sse-server).
 - `src/js/bindings/events.zig` — rewritten to append-to-buffer
   instead of writing kv rows. ~80% smaller.
 - `TenantFiles.sse_connections` field + supporting code.
@@ -502,42 +506,19 @@ internal-network deployment context.
 
 ## 7. Migration order
 
-Because v1 SSE is shipping on the existing model, this is a rip-and-
-replace rather than a blue-green migration. Suggested sequence:
+Shipped as a clean rip-and-replace (no feature flag); legacy
+events_pump/events_sweep and the `_events/*` prefix were removed in
+the same change. The staged sequence below was the plan, not what
+executed.
 
-1. **Stand up sse-service skeleton** (new module, new subdomain, TLS
-   listener, just /v1/health responding). No behavior change in the
-   worker yet.
-2. **Implement the emit POST endpoint** + ring cache + connection
-   table on sse-service. Add `/v1/{tenant}/sse` with token validation
-   and basic streaming. Smoke: hand-craft an emit POST + open an
-   EventSource against sse-service standalone.
-3. **Add the worker → sse-service POST path** behind a feature flag
-   (`sse.deliver_via = legacy | service`). Default stays `legacy`.
-   Worker writes both kv rows AND fires the POST when `service` is
-   selected (parallel run for safety).
-4. **Add the token-handoff endpoint** `/_session/sse-token` on the
-   worker. Customer admin UI updated to use it for SSE connects.
-5. **Switch worker default to `service`**. Existing customers'
-   EventSource clients continue hitting `/_events` on the customer
-   subdomain (legacy worker route still wired) but new code paths
-   are recommended to use the sse-service endpoint.
-6. **Deprecate the worker `/_events` route** + the legacy code paths.
-   Customers migrate over a deprecation window.
-7. **Delete legacy code:** events_pump, events_sweep, kv-write path
-   in the binding, reserved-prefix entry, dirty_sids machinery,
-   sse_connections table, retention sweep timer, the
-   `/_events` route handler.
-
-Smokes at each step:
-- Existing SSE smokes (cross-tenant isolation, end-to-end emit-and-
-  receive, reconnect catch-up) get rewritten in step 2 to target
-  sse-service directly. The reconnect-catch-up smoke specifically
-  rewrites to "Last-Event-ID hits sentinel when ring is empty;
+Smokes that exist:
+- Cross-tenant isolation, end-to-end emit-and-receive, reconnect
+  catch-up — targeting sse-server directly. The reconnect-catch-up
+  smoke covers "Last-Event-ID hits sentinel when ring is empty;
   hits replay when ring has the id."
-- New smoke for the fire-and-forget worker → sse-service POST
-  failure mode (sse-service down → worker continues serving requests
-  fine, emits silently dropped).
+- Fire-and-forget worker → sse-server POST failure mode (sse-server
+  down → worker continues serving requests fine, emits silently
+  dropped).
 
 ---
 
@@ -555,24 +536,24 @@ Both have execution contexts; both can emit. Their completion paths
 need to invoke `pumpEmitsForContext` the same way the request
 handler path does. Concrete wiring is mechanical; the data model
 (buffer on the context, fire POST after commit) is identical to the
-request path. Implementation will likely live alongside
-`trigger_dispatch.zig` and `dispatchCallbacks` — one call to the
-pump after each successful commit.
+request path. Implementation lives alongside `trigger_dispatch.zig`
+and `dispatchCallbacks` — one call to the pump after each
+successful commit.
 
 ### 8.2 Replay UI capture mode
 
 Tape replay re-runs the handler, which means `events.emit` calls
 happen during replay. The binding needs a "capture, don't fire"
 mode for replay context — appends to a captured-emits list visible
-in the replay UI sidebar but doesn't POST to sse-service. Hook
+in the replay UI sidebar but doesn't POST to sse-server. Hook
 point is the same place tape replay already swaps in stub
 implementations of other side-effect bindings (webhook.send, etc.).
 Implementation detail; design is fine as is.
 
 ### 8.3 Future: pluggable emit transport
 
-The worker-to-sse-service POST is a hard-coded HTTP call. If a
-future deployment wants to skip sse-service entirely (single-binary
+The worker-to-sse-server POST is a hard-coded HTTP call. If a
+future deployment wants to skip sse-server entirely (single-binary
 mode, embedded test mode, or a custom delivery target), the emit
 sink could become an interface with HTTP as the v1 implementation.
 Not needed for v1; flagged so the binding doesn't bake the URL

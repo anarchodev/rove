@@ -1,16 +1,17 @@
 # Phase 5.5 rollout — multi-node production readiness
 
 This document is the **orchestration plan** across the five Phase 5.5
-sub-plans. Each sub-plan (`logs-plan.md`, `webhook-server-plan.md`,
-`snapshot-plan.md`, `files-server-plan.md`, plus the in-PLAN tape body
-capture work) describes the implementable detail for one subsystem.
+sub-plans. Each sub-plan (`logs-plan.md`, `http-send-plan.md`
+(supersedes `webhook-server-plan.md`), `snapshot-plan.md`,
+`files-server-plan.md`, plus the in-PLAN tape body capture work)
+describes the implementable detail for one subsystem.
 This doc tracks ordering, dependencies, status, and the cross-cutting
 "definition of production-ready" so future sessions can pick up the
 work without re-deriving the sequence.
 
 The motivating context: PLAN.md commits to a "first customer can take
 real production traffic" boundary at the end of Phase 5.5. Specifically
-that means a node operator (loop46-the-project, in the v1 case) is
+that means a node operator (rewind.js-the-project, in the v1 case) is
 willing to take responsibility for paying customer data. Today the
 shipped code can run multi-node, but not without operational gaps that
 would bite under sustained traffic or leader failover (see PLAN §12
@@ -27,12 +28,14 @@ The five pieces are ordered by **dependency × risk × value**:
    old request IDs after leader change, which is the most user-visible
    gap.
 
-2. **Webhook subsystem (d)** next — biggest engineering risk because
-   it touches the raft entry layout (multi-envelope-per-raft-entry),
-   the apply path (envelopes 4/5/6), the dispatcher (envelope-4 rides
-   with envelope-0 atomically), AND adds a new leader-pinned thread.
-   Should land second so its testing pressure validates the
-   raft-entry-layout change before more subsystems depend on it.
+2. **Webhook/http.send subsystem (d)** next — biggest engineering risk
+   because it touches the raft entry layout (multi-envelope-per-raft-
+   entry), the apply path (shipped as envelopes 4/5/6; then superseded
+   2026-05-09 by envelopes 8/9/10/11 + `schedules.db`), the dispatcher
+   (envelope-8 rides with envelope-0 atomically), AND adds a new
+   leader-pinned thread. Should land second so its testing pressure
+   validates the raft-entry-layout change before more subsystems depend
+   on it.
 
 3. **Logs (a)** — log-server moves to its own subdomain with TLS,
    batches to S3 directly, sidecar-indexed. Drops envelope type 1.
@@ -103,7 +106,8 @@ sub-plan's migration order. No big-bang cutovers between them.
   `--files-listen` retired from `loop46`. Dev (`scripts/dev_serve.sh`)
   + production (`scripts/rove-loop46-serve.sh`) helpers fork-exec
   the standalone alongside the worker for one-command startup.
-- **(c) snapshot — steps 1-4 done; periodic loop deferred.**
+- **(c) snapshot — steps 1-4 + periodic loop done; by-reference
+  reuse + willemt log-compaction deferred.**
   `_apply_state` per-store table + per-entry idempotency filter
   (step 1), in-memory `ApplyCtx.tenant_apply_idx` mirror
   (step 2), end-to-end capture orchestrator + manifest JSON
@@ -116,11 +120,11 @@ sub-plan's migration order. No big-bang cutovers between them.
   `{data_dir}/.snapshots/`). `scripts/snapshot_smoke.py`
   exercises seed → capture → restore round-trip against
   either backend; verified end-to-end against real OVH S3.
-  By-reference reuse for unchanged tenants, an in-process
-  periodic capture loop, and the willemt
+  An in-process periodic capture loop has shipped
+  (`--snapshot-interval-ms` flag in `src/loop46/main.zig`).
+  By-reference reuse for unchanged tenants and the willemt
   `raft_begin_snapshot` / `raft_end_snapshot` log compaction
-  wiring all stay deferred — the operator-CLI form is enough
-  for crontab-driven captures pre-launch.
+  wiring stay deferred.
 
 **Next pickup:**
 1. **(c) snapshot — see `docs/snapshot-plan.md`.** With (a) and
@@ -164,6 +168,15 @@ multi-node gap (replay-after-failover).
 sub-plan because the work is contained.
 
 ### 2. Webhook subsystem — **done 2026-05-06**
+
+> **Corrigendum:** piece (d) shipped 2026-05-06 then was
+> **SUPERSEDED 2026-05-09** by the more general `http.send`
+> primitive — see `docs/http-send-plan.md`. envelopes 4/5/6,
+> `webhooks.db`, `src/webhook_server/`, and `src/outbox/` were
+> deleted; the live design is envelopes 8/9/10/11 +
+> `schedules.db` + `src/schedule_server/`. The sub-plan
+> `webhook-server-plan.md` no longer exists; its replacement is
+> `http-send-plan.md`.
 
 - **Step 1 — done.** `src/webhook_server/root.zig` ships: `WebhookRow`,
   `WebhookStore` (kv-backed at `{data_dir}/webhooks.db`), apply
@@ -258,9 +271,11 @@ do, but the option to use it stays open).
 
 **Definition of done**: see `docs/webhook-server-plan.md` §7
 "Migration order." The 6 steps land independently; smoke tests in
-each step.
+each step. (Note: webhook-server-plan.md is superseded by
+`docs/http-send-plan.md` — see corrigendum above.)
 
-**Sub-plan**: `docs/webhook-server-plan.md`.
+**Sub-plan**: `docs/http-send-plan.md` (supersedes
+`docs/webhook-server-plan.md`).
 
 ### 3. Logs — **done 2026-05-06 (Steps A + B both shipped)**
 
@@ -505,7 +520,7 @@ the trampoline commits + proposes via envelope 0.
 
 **Sub-plan**: `docs/files-server-plan.md`.
 
-### 5. Snapshot — **not started**
+### 5. Snapshot — **partial — operator-CLI + periodic loop done; by-reference reuse + willemt log-compaction deferred**
 
 **What it delivers**: per-tenant snapshot indices with
 always-refresh-all-tenants discipline. Snapshots transport via S3

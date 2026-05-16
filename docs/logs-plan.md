@@ -32,12 +32,14 @@ Stated semantics for logs in this design:
 ┌──────────┐  flush batch  ┌─────────────────────────────────────────┐
 │  worker  │──────────────▶│  S3 bucket                              │
 │ (any     │   .ndjson     │   _logs/{node_id}/{batch_id}.ndjson     │
-│  node)   │   .idx.json   │   _logs/{node_id}/{batch_id}.idx.json   │
+│  node)   │  (sidecar     │   (sidecar embedded at head; one        │
+│          │   embedded)   │    object per flush)                    │
 └──────────┘               └─────────────────────────────────────────┘
                                   ▲                          ▲
                                   │ poll LIST + GET          │ ranged GET
-                                  │ (.idx files only,        │ (on record show
-                                  │  background task)        │  click-through)
+                                  │ (head bytes for          │ (on record show
+                                  │  sidecar; background     │  click-through)
+                                  │  task)                   │
                                   │                          │
                                   └────────┬─────────────────┘
                                            │
@@ -84,8 +86,9 @@ optimization, not a crash-recovery dependency.
 ### 2.1 Object naming
 
 ```
-_logs/{node_id}/{batch_id}.ndjson     ← record bodies (per-record raw-deflate frames)
-_logs/{node_id}/{batch_id}.idx.json   ← index sidecar
+_logs/{node_id}/{batch_id}.ndjson     ← sidecar (embedded at head) + record bodies
+                                        (per-record raw-deflate frames); one object
+                                        per flush; no separate .idx.json
 ```
 
 - `_logs/` is a cluster-scoped top-level prefix (the batch store also
@@ -183,7 +186,7 @@ Sidecar JSON shape:
       "duration_ns":  3100000,
       "method":       "GET",
       "path":         "/api/foo",
-      "host":         "acme.loop46.me",
+      "host":         "acme.rewindjs.app",
       "status":       200,
       "outcome":      "ok",
       "deployment_id": 7,
@@ -597,8 +600,8 @@ agnostic — encrypted bytes go in `.ndjson` exactly like plaintext.
 
 ### 6.6 Janitor pass for orphan `.ndjson`
 
-A weekly process that lists `.ndjson` files without a matching
-`.idx.json` and deletes them after a 24h grace period (avoids racing
+A weekly process that lists `.ndjson` files with no matching row in
+`batches` and deletes them after a 24h grace period (avoids racing
 in-flight uploads). Trivial; defer until orphan accumulation matters.
 
 ### 6.7 Embedded sidecar — *shipped*
@@ -653,9 +656,9 @@ A periodic compactor (sibling to the indexer in the log-server
 process — same access pattern, opposite direction) walks
 `log_index.batches` and classifies each batch:
 
-- **All records expired** → DELETE both objects (`.ndjson` +
-  `.idx.json`); DELETE the `batches` row + every `log_index` row
-  pointing at that `ndjson_key`. Free.
+- **All records expired** → DELETE the `.ndjson` object (sidecar
+  embedded; one object to delete); DELETE the `batches` row + every
+  `log_index` row pointing at that `ndjson_key`. Free.
 - **No records expired** → skip.
 - **Partially expired, below rewrite threshold** (e.g., <50% of the
   batch's bytes are dead) → skip; revisit next pass once more has
@@ -704,17 +707,17 @@ to a system-wide default (operator config, default 30d). Avoids
 The dangerous moment is the partial-rewrite case. Sequence:
 
 ```
-1. PUT _logs/{node}/{new_batch}.ndjson         ← new payload
-2. PUT _logs/{node}/{new_batch}.idx.json       ← new sidecar
-3. SQLite txn:
+1. PUT _logs/{node}/{new_batch}.ndjson         ← new payload (embedded sidecar at head
+                                                  + raw-deflate frames; single object)
+2. SQLite txn:
      INSERT new batches row
      UPDATE log_index SET ndjson_key=new, offset=new, length=new
        WHERE (tenant, request_id) IN <surviving records>
      DELETE old batches row
-4. DELETE old _logs/{node}/{old_batch}.ndjson + .idx.json
+3. DELETE old _logs/{node}/{old_batch}.ndjson
 ```
 
-Crash between 2 and 3 = orphan new batch with no index pointer.
+Crash between 1 and 2 = orphan new batch with no index pointer.
 Indexer's full-scan pass will pick it up on its next loop and
 re-index — at which point the SQLite txn either succeeds (now we
 have *both* batches indexed; both contain the surviving records;
@@ -724,13 +727,13 @@ old batch; the new orphan needs a janitor pass to clean up).
 
 To keep this clean, the compactor takes a per-batch lock (a row in
 a small `compaction_inflight` table) before step 1 and clears it
-after step 4. The indexer skips any batch with an inflight
+after step 3. The indexer skips any batch with an inflight
 compaction. A crash leaves the lock row stale; a recovery pass on
 log-server startup either resumes (re-detect surviving records, re-
-issue step 3 onward) or rolls back (DELETE the new batch from S3,
+issue step 2 onward) or rolls back (DELETE the new batch from S3,
 clear the lock).
 
-Crash between 3 and 4 = old objects still in S3 with no `batches`
+Crash between 2 and 3 = old object still in S3 with no `batches`
 row. Indistinguishable from §3.2's "orphan ndjson" case from the
 indexer's POV (no sidecar would still be matched), which is fine
 because the sidecar IS present — but `log_index` no longer

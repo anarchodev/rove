@@ -5,13 +5,15 @@
 > doc covers metrics + traces aimed at oncall, not at customers.
 >
 > Status as of 2026-05-13: pre-implementation. Today's surface is a
-> single `/_system/metrics` endpoint on the worker (15 series, root-
-> token gated, postmortem-investigation shaped) — see §1 for the
-> inventory. Nothing scrapes it.
+> single `/_system/metrics` endpoint on the worker (the io/h2/raft
+> conservation+depth series in §1, plus ~15 kvexp_* counters and two
+> kvexp_*_duration_seconds histograms added by the kvexp re-vendor —
+> commit 4ea5dd0; root-token gated, postmortem-investigation shaped)
+> — see §1 for the inventory. Nothing scrapes it.
 
 ## 0. Goal + non-goals
 
-**Goal:** ship enough operator telemetry to launch Loop46 and run an
+**Goal:** ship enough operator telemetry to launch rewind.js and run an
 on-call rotation against Grafana Cloud (free tier: Prometheus + Loki +
 Tempo).
 
@@ -47,13 +49,17 @@ universes stay joined.
 
 ## 1. Current surface (inventory, 2026-05-13)
 
-Single emitter at `/_system/metrics` (`src/js/worker_dispatch.zig:556`,
-routed at `:413`). Auth: root-bearer or services-JWT — the same gate as
+Single emitter at `/_system/metrics` (`src/js/worker_dispatch.zig:576`,
+routed at `:434`). Auth: root-bearer or services-JWT — the same gate as
 the rest of `/_system/*`. Format: Prometheus text v0.0.4. Stated
 purpose in the doc-comment: *"not a dashboard — making the math visible
 [so the next investigator can read the imbalance at a glance]."*
 Pattern is conservation-pair counters + pipeline-depth gauges, born of
-the io-buffer-leak postmortem.
+the io-buffer-leak postmortem. Plus a kvexp engine block
+(kvexp_put_total / _get_total / _txn_commit_total / _durabilize_total /
+… and kvexp_durabilize_duration_seconds +
+kvexp_snapshot_open_duration_seconds histograms) added with the kvexp
+cutover.
 
 | metric | type | what it tells you |
 |---|---|---|
@@ -72,6 +78,13 @@ the io-buffer-leak postmortem.
 | `h2_conn_tls_handshake_size` | gauge | connections still in TLS handshake |
 | `h2_io_connections_size` | gauge | raw tcp conns owned by io layer |
 | `raft_is_leader` | gauge | 1 if this node is leader, else 0 |
+| `kvexp_put_total` | counter | kvexp engine put operations |
+| `kvexp_get_total` | counter | kvexp engine get operations |
+| `kvexp_txn_commit_total` | counter | kvexp engine transaction commits |
+| `kvexp_durabilize_total` | counter | kvexp engine durabilize calls |
+| *(~15 kvexp_* counters total — commit 4ea5dd0)* | counter | various kvexp engine operation counts |
+| `kvexp_durabilize_duration_seconds` | histogram | kvexp durabilize latency (`_bucket{le=…}` / `_sum` / `_count`, in seconds) |
+| `kvexp_snapshot_open_duration_seconds` | histogram | kvexp snapshot open latency (`_bucket{le=…}` / `_sum` / `_count`, in seconds) |
 
 **What's good about this surface (keep + adopt):**
 
@@ -92,7 +105,9 @@ the io-buffer-leak postmortem.
 - Worker-only. Files-server, log-server, sse-server expose nothing.
 - No `node_id` / `worker_id` labels — a fleet scrape can't distinguish
   nodes, much less workers within a node.
-- No histograms. No latency SLIs.
+- No rove_*-shaped histograms; the only histograms today are the two
+  kvexp_*_duration_seconds engine histograms. No request/handler latency
+  SLIs.
 - No raft signals beyond `is_leader` (no term, commit index, apply
   lag, follower lag, proposal counts, propose→commit latency).
 - No blob backend, schedule server, snapshot, or JS-runtime metrics.
@@ -149,6 +164,11 @@ through 10s) covers every SLI we'll add in P1/P2:
 Same buckets across all sub-second SLIs so one set of recording rules
 covers them. Blob ops get a longer tail (geometric out to 60s).
 
+NB: a private bucketed-histogram emitter (`writeKvexpHistogram`, fixed
+nanosecond bucket bounds from `kv_mod.KvexpHistogram`) already exists in
+`worker_dispatch.zig` — the shared `metrics.zig` should generalize/absorb
+it, not introduce a parallel primitive.
+
 ### 2.4 Exemplar plumbing
 
 The pivot enabler. Switch the metrics endpoint's `Content-Type` to
@@ -186,7 +206,7 @@ P0.
 
 | metric | type | source | labels |
 |---|---|---|---|
-| `rove_build_info` | gauge=1 | loop46 main | version, commit, zig_version |
+| `rove_build_info` | gauge=1 | rewind.js main | version, commit, zig_version |
 | `rove_panics_total` | counter | `std.builtin.Panic` shim | subsystem |
 | `rove_raft_apply_lag_entries` | gauge | rove-kv (commit_index − last_applied) | — |
 | `rove_raft_leader_changes_total` | counter | rove-kv (bump on raft\_become\_leader) | — |

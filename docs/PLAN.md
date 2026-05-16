@@ -1,4 +1,4 @@
-# Loop46 product plan
+# rewind.js product plan
 
 > **Status**: canonical plan, last reconciled 2026-05-09 against the
 > code on `main`. Supersedes any earlier admin-UI-only roadmap.
@@ -7,9 +7,9 @@
 >
 > **Navigation**: §1–§8 are the original plan (2026-04-17). §9 onward was appended on 2026-04-21 and captures what's shipped, what we considered, audit findings against rove-library principles, and pre-release surprises customers may hit. **§13 (added 2026-05-09)** is the live "servers and surfaces" map — the right place to start if you just want to know which process owns what.
 
-## 1. What Loop46 is
+## 1. What rewind.js is
 
-Loop46 is the productized face of `rove`. It sells the rove substrate as:
+rewind.js is the productized face of `rove`. It sells the rove substrate as:
 
 > "A backend in 30 seconds. JS handlers, KV store, free static hosting."
 
@@ -24,11 +24,11 @@ The deeper product identity — the thing nobody else is offering:
 
 ### Onboarding promise
 
-1. User visits `app.loop46.me`.
+1. User visits `app.rewindjs.com`.
 2. Types a preferred API name + email, clicks Create.
 3. Receives magic-link email; clicks through.
 4. Lands in dashboard with a working code editor, KV viewer, log tail.
-5. Their API is already live at `{name}.loop46.me` with starter code.
+5. Their API is already live at `{name}.rewindjs.app` with starter code.
 
 ## 2. Locked architecture decisions
 
@@ -36,28 +36,28 @@ Each decision includes the **why**, often with notes on alternatives that were c
 
 ### 2.1 Domain + origin layout
 
-- **Register and own `loop46.me`.** `.site` is already a public suffix (real TLD).
-- **`loop46.com`**: marketing site only. No auth, no API, no cookies.
-- **`{name}.loop46.me`**: each customer's instance. **Single origin** hosts both static files and handler API. Static served by path (e.g. `/index.html`); handler dispatch covers everything else. Same-origin by construction → first-party cookies work, no CORS for customer UIs talking to their own API.
-- **`app.loop46.me`**: admin UI. Same path layout as a customer subdomain — **dogfooded**.
-- Wildcard TLS `*.loop46.me` terminated in-process by rove-js. Cert obtained via Let's Encrypt DNS-01 (`scripts/rove-lego-renew.sh`). Cloudflare sits in front as CDN/WAF; origin still presents a valid cert (Full/Strict).
+- **Register and own `rewindjs.app`.** `.app` is already a public suffix (real TLD).
+- **`rewindjs.com`**: marketing site only. No auth, no API, no cookies.
+- **`{name}.rewindjs.app`**: each customer's instance. **Single origin** hosts both static files and handler API. Static served by path (e.g. `/index.html`); handler dispatch covers everything else. Same-origin by construction → first-party cookies work, no CORS for customer UIs talking to their own API.
+- **`app.rewindjs.com`**: admin UI. Same path layout as a customer subdomain — **dogfooded**.
+- Wildcard TLS `*.rewindjs.app` terminated in-process by rove-js. Cert obtained via Let's Encrypt DNS-01 (`scripts/rove-lego-renew.sh`). Cloudflare sits in front as CDN/WAF; origin still presents a valid cert (Full/Strict).
 
-**Why a separate `.site` TLD?** Originally explored `{name}.api.loop46.com` for the API and a separate host for static. That required Public Suffix List registration for `site.loop46.com` before browsers would isolate tenants' cookies, and PSL propagation takes weeks-to-months — a launch blocker. Using `loop46.me` as a distinct registered domain puts `{name}.loop46.me` one level below an existing public suffix (`.site`), so default host-only cookies work immediately. PSL submission for `loop46.me` still happens in parallel for defense-in-depth but is not a launch blocker.
+**Why a separate `.app` TLD?** Originally explored `{name}.api.rewindjs.com` for the API and a separate host for static. That required Public Suffix List registration for `site.rewindjs.com` before browsers would isolate tenants' cookies, and PSL propagation takes weeks-to-months — a launch blocker. Using `rewindjs.app` as a distinct registered domain puts `{name}.rewindjs.app` one level below an existing public suffix (`.app`), so default host-only cookies work immediately. PSL submission for `rewindjs.app` still happens in parallel for defense-in-depth but is not a launch blocker.
 
-**Why one origin per tenant, not separate static + API origins?** To make first-party cookies work without PSL. Split origins (`{name}.loop46.me` + `api.{name}.loop46.me`) need `loop46.me` to be on the PSL *and* require per-customer wildcard TLS (two labels deep). Collapsing to one origin gives first-party cookies trivially and a single wildcard cert covers everyone.
+**Why one origin per tenant, not separate static + API origins?** To make first-party cookies work without PSL. Split origins (`{name}.rewindjs.app` + `api.{name}.rewindjs.app`) need `rewindjs.app` to be on the PSL *and* require per-customer wildcard TLS (two labels deep). Collapsing to one origin gives first-party cookies trivially and a single wildcard cert covers everyone.
 
 **Why dogfood the admin UI?** If the auth model must work cross-origin for our customers (e.g. Safari ITP, third-party cookie deprecation), then proving it by hosting the admin UI the same way a customer would is the cleanest test. If the admin UI needs a privileged carve-out, something is wrong with the customer story.
 
-**Defense against cross-tenant cookie injection**: the response layer sanitizes `Set-Cookie` `Domain=` attributes. A handler attempting `Set-Cookie: foo=bar; Domain=loop46.me` gets stripped to host-only. This protects against a malicious customer pushing cookies onto other tenants. PSL gives the same guarantee at the browser level once it propagates.
+**Defense against cross-tenant cookie injection**: the response layer sanitizes `Set-Cookie` `Domain=` attributes. A handler attempting `Set-Cookie: foo=bar; Domain=rewindjs.app` gets stripped to host-only. This protects against a malicious customer pushing cookies onto other tenants. PSL gives the same guarantee at the browser level once it propagates.
 
 ### 2.2 Auth model
 
-- **C1 auth (admin)**: HttpOnly + Secure + SameSite=Lax session cookies on `app.loop46.me`. Opaque session tokens, stored server-side in root.db, revocable.
+- **C1 auth (admin)**: HttpOnly + Secure + SameSite=Lax session cookies on `app.rewindjs.com`. Opaque session tokens, stored server-side in root.db, revocable.
 - **C2 auth (customer's end users)**: customer's problem. We expose primitives (HMAC helper, cookie parse/serialize, encrypted KV). Customer's handler code mints and verifies whatever token/cookie shape it wants. Because customer UI and customer API share one origin, cookies are first-party out of the box.
 - **C2 sessions for SSE (`_rove_sess`)**: a separate platform-managed cookie (HttpOnly + Secure + SameSite=Lax) eagerly minted on handler invocations to give every browser a stable identity for the SSE/events stream (§2.12). NOT an auth claim — just an opaque id. Customer binds session→user themselves if they need that link. Distinct namespace from the customer's own auth cookies above.
 - **Magic-link signup**:
   1. `POST /v1/signup` with name + email.
-  2. Server validates name available, creates instance, deploys starter content, assigns `{name}.loop46.me`, mints magic token (32 bytes, 15-min TTL, single-use, hashed under `_magic/{hash}`), fires `email.send`.
+  2. Server validates name available, creates instance, deploys starter content, assigns `{name}.rewindjs.app`, mints magic token (32 bytes, 15-min TTL, single-use, hashed under `_magic/{hash}`), fires `email.send`.
   3. User clicks `GET /v1/auth?mt=...` → server validates, sets session cookie, 302 to `/dashboard#{name}`.
 
 **Why cookies, not bearer tokens?** Bearer tokens work on every browser and every origin, but they require customers to write `headers: { Authorization: 'Bearer ' + token }` on every fetch and manage token storage themselves. Cookies, made first-party by the one-origin-per-tenant layout, recover the "simple fetch" developer story with no setup. Bearer tokens remain as a documented fallback for customers whose UI lives on a genuinely external host (Neocities, GitHub Pages, etc.).
@@ -74,7 +74,7 @@ Each decision includes the **why**, often with notes on alternatives that were c
 - Every request gets a fresh QuickJS context via snapshot-restore (existing mechanism in `src/js/worker.zig`).
 - **CPU budget: one 10ms envelope covers the whole request — handler body + every trigger it fires (BEFORE and AFTER) + every cascade those triggers trigger.** No per-trigger or per-cascade sub-budgets. Exceeding 10ms terminates the request and rolls back the transaction. Callbacks run as independent handler invocations in their own transactions and get their own fresh 10ms envelope when they fire.
 
-**Why so strict?** Determinism is what lets us offer the replay-with-breakpoints story that differentiates Loop46. The moment a handler can `await fetch(...)` inline, replay has to either re-execute the fetch (loses determinism) or fake it (diverges from prod). Forcing all external I/O through Cmds means replay is exact, always — the captured response that drove the original callback drives the callback on replay too.
+**Why so strict?** Determinism is what lets us offer the replay-with-breakpoints story that differentiates rewind.js. The moment a handler can `await fetch(...)` inline, replay has to either re-execute the fetch (loses determinism) or fake it (diverges from prod). Forcing all external I/O through Cmds means replay is exact, always — the captured response that drove the original callback drives the callback on replay too.
 
 The cost: "call an external API and use the result inline" is impossible. Customers rewrite as "fire webhook → return 'accepted' → callback updates state → client observes via poll/SSE." This is where modern serverless is going anyway (every SaaS backend is full of async job queues), so it's a calculated bet.
 
@@ -84,8 +84,9 @@ The cost: "call an external API and use the result inline" is impossible. Custom
 > files-server moves to `files.{public_suffix}` with its own TLS,
 > manifest moves from per-tenant `files.db` to S3
 > (`tenants/{id}/deployments/{dep_id}.json`), runtime release signal is
-> a `_deploy/active` kv marker observed via the existing
-> writeset-scan path (no polling), worker reads bytecodes/statics on
+> a `_deploy/current` kv marker written by a `POST /_system/release` worker
+> route and picked up via apply.zig's writeset-value scan into a
+> process-wide ReleaseTable (no polling), worker reads bytecodes/statics on
 > demand from S3 with content-hash ETags + Cloudflare in front. Worker
 > drops the entire `/_system/files/*` proxy and the `files.db` per-
 > tenant store. The §2.4 routing/cache/path-validation/size-cap rules
@@ -201,7 +202,7 @@ Two-phase content-addressed upload matches `docker push`. CLI (`loop46 deploy ./
 
 #### Drafts
 
-A draft is a pending deployment with `status: draft`. Editor saves write to draft, compile-on-save validates. "Deploy" button CAS-swaps `current`. Drafts are per-user, expire after N days if unpromoted. Preview URL `{name}.loop46.me?__draft={id}` serves from draft manifest (session-gated).
+A draft is a pending deployment with `status: draft`. Editor saves write to draft, compile-on-save validates. "Deploy" button CAS-swaps `current`. Drafts are per-user, expire after N days if unpromoted. Preview URL `{name}.rewindjs.app?__draft={id}` serves from draft manifest (session-gated).
 
 #### Concurrent-deploy safety
 
@@ -323,7 +324,7 @@ Triggers are part of the deployment manifest — versioned with code, rolled bac
 
 #### Backfill / reapply (advanced technique, no new primitive)
 
-Common need: customer adds an index trigger (or changes one), wants to apply it to existing data so the index is populated before reads start hitting it. Loop46 ships no `batch.*` API for this — composes from existing primitives.
+Common need: customer adds an index trigger (or changes one), wants to apply it to existing data so the index is populated before reads start hitting it. rewind.js ships no `batch.*` API for this — composes from existing primitives.
 
 **Synchronous one-shot (small data):** customer writes a regular handler that scans a page via `kv.prefix(prefix, cursor, limit)` and applies the trigger logic to each key. Trigger logic should be extracted to a shared module the trigger module and the backfill handler both import — single source of truth.
 
@@ -509,8 +510,8 @@ Wraps `webhook.send` with platform-provided URL + creds.
 ```javascript
 email.send({
   to: "user@example.com",
-  subject: "Verify your Loop46 account",
-  text: "Click: https://app.loop46.me/v1/auth?mt=...",
+  subject: "Verify your rewind.js account",
+  text: "Click: https://app.rewindjs.com/v1/auth?mt=...",
   onResult: "signup/email_sent",
   context: { user_id: 42 },
 });
@@ -594,7 +595,7 @@ Designed as a general primitive from day one — also the knob used to different
 ### 2.11 CLI (v1 scope)
 
 - `loop46 deploy ./dir` only.
-- `loop46.json` at project root: `{ instance: "foo", apiBase: "https://app.loop46.me" }`. Defaults `apiBase` to prod.
+- `loop46.json` at project root: `{ instance: "foo", apiBase: "https://app.rewindjs.com" }`. Defaults `apiBase` to prod.
 - Auth: token copy-paste. Dashboard has "Create deploy token" button; prints plaintext once.
 - Wire protocol: content-addressed two-phase (see 2.4). Incremental deploys upload only changed bytes.
 - **Future**: `loop46 kv get/put`, `loop46 logs tail`, `loop46 init`, `loop46 dev` (local mini-rove).
@@ -746,13 +747,13 @@ node" density.
 
 ### Phase 1 — Domain infrastructure
 
-- Register `loop46.me`.
-- DNS: apex + wildcard `*.loop46.me` pointed at server IP, proxied through Cloudflare.
+- Register `rewindjs.app`.
+- DNS: apex + wildcard `*.rewindjs.app` pointed at server IP, proxied through Cloudflare.
 - Wildcard LE cert via `scripts/rove-lego-renew.sh` (ACME DNS-01). rove-js reads `cert.pem`/`key.pem` directly and terminates TLS in-process; Cloudflare fronts with Full/Strict.
-- Host routing lives in the worker (`*.loop46.me` + `app.loop46.me` both hit js-worker; dispatcher splits by host). No reverse proxy.
+- Host routing lives in the worker (`*.rewindjs.app` + `app.rewindjs.com` both hit js-worker; dispatcher splits by host). No reverse proxy.
 - Response layer: sanitize `Set-Cookie` `Domain=` attribute (strip).  **Done**: `sanitizeSetCookie` in `src/js/dispatcher.zig:819`, applied in `extractResponseMetadata` on every JS handler response. Covered by 9 inline tests.
-- `rove-tenant` wildcard domain resolution — accept any `*.loop46.me` matching a registered instance id.
-- PSL submission (`loop46.me` → `publicsuffix/list`) **deferred to Phase 10**. Server-side Domain stripping above is the authoritative defense; PSL is defense-in-depth at the browser level and its propagation lag makes it unsuitable for the launch path.
+- `rove-tenant` wildcard domain resolution — accept any `*.rewindjs.app` matching a registered instance id.
+- PSL submission (`rewindjs.app` → `publicsuffix/list`) **deferred to Phase 10**. Server-side Domain stripping above is the authoritative defense; PSL is defense-in-depth at the browser level and its propagation lag makes it unsuitable for the launch path.
 
 ### Phase 2 — File API + static serving
 
@@ -792,13 +793,13 @@ node" density.
 - `POST /v1/signup`: validate, **reserve the name** via `pending/{name}` in admin app.db, mint magic, enqueue magic-link email — does **not** allocate the customer tenant yet (abuse-prevention amendment, see below).
 - `GET /v1/auth?mt=...`: validate, **create instance + deploy starter content as part of redemption**, mint session, 302 to dashboard.
 - `POST /v1/logout`: clear cookie, revoke session.
-- Starter content: one `index.mjs` (uses `kv`, returns JSON), one `_static/index.html` that fetches it and shows "your API is live at `{name}.loop46.me`".
+- Starter content: one `index.mjs` (uses `kv`, returns JSON), one `_static/index.html` that fetches it and shows "your API is live at `{name}.rewindjs.app`".
 - **Lazy-creation-on-redeem (abuse prevention).** The customer tenant is *not* created at signup — only a `pending/{name}` reservation in admin app.db. Tenant creation, root_writeset propose, and starter-content deploy all happen inside `redeemMagic`, atomically with the session mint. A periodic sweep deletes expired `pending/*` entries to free the name. Without this, an unredeemed signup squats the name and leaks `{id}/app.db`, `{id}/files.db`, and the file-blob directory indefinitely. Detailed flow in [`docs/flows/signup.md`](flows/signup.md).
 - **Per-account instance limit.** Email is the account identity. New `account/{sha256(email)}/...` namespace in admin app.db owns the plan tier (`account/{hash}/plan`) and the instance ownership index (`account/{hash}/instances/{instance_id}`). Signup-time check counts owned instances *plus* non-expired `pending/*` reservations against the account's `max_instances` — both count, otherwise the free tier is trivially evadable by squatting names via incomplete signups. Same check repeats at redeem-time as the authoritative gate (two simultaneous signups by one email could both pass at signup time; only the second to redeem hits the limit). v1 hardcodes `max_instances = 1` for free; Phase 10 wires the value from a per-tier config keyed on `account/{hash}/plan`. Seed-manifest tenants stay outside the account model entirely — operator-provisioned, no associated email, no `account/*` record. The same `account/{hash}/plan` lookup will eventually drive *all* per-account caps (request/email rate limits, DLQ retention, blob storage caps, custom-domain counts, plus Stripe customer linkage in Phase 10).
 
 ### Phase 5 — Minimal admin UI
 
-- Deploy admin UI to `app.loop46.me` **using Phase 2's file API**. Dogfood.
+- Deploy admin UI to `app.rewindjs.com` **using Phase 2's file API**. Dogfood.
 - Pages: signup/login, dashboard home, instance detail with tabs (Code, KV, Logs, Deploys).
 - CodeMirror 6 in Code tab. Save-draft + Deploy buttons.
 - Deploy history with diff view.
@@ -887,8 +888,9 @@ state moves out of raft where stronger guarantees aren't needed):
    Replace with: files-server moves to its own subdomain
    (`files.{public_suffix}`) with its own TLS, manifest moves to S3
    (`tenants/{id}/deployments/{dep_id}.json` + `tenants/{id}/blobs/{hash}`),
-   runtime release signal becomes a `_deploy/active` kv marker observed
-   via the existing post-commit writeset scan (no polling), worker reads
+   runtime release signal becomes a `_deploy/current` kv marker written by
+   a `POST /_system/release` worker route and picked up via apply.zig's
+   writeset-value scan into a process-wide ReleaseTable (no polling), worker reads
    bytecodes/statics on demand from S3 with content-hash ETags +
    Cloudflare in front. Worker drops the entire `/_system/files/*` proxy
    and the `files.db` per-tenant store (envelope type 3 retires); the §2.4
@@ -939,12 +941,12 @@ the worker proxying) is **post-1.0** — see §10.13 + `files-server-plan.md`
 
 ### Phase 10 — Custom domains + polish
 
-- Customer CNAME `api.myapp.com` → `foo.loop46.me`.
+- Customer CNAME `api.myapp.com` → `foo.rewindjs.app`.
 - Per-custom-domain Let's Encrypt cert provisioning. Watch ACME rate limits at signup surges.
 - Domain assignment UI in dashboard.
 - Plan tiers wired to all per-account caps via the `account/{sha256(email)}/plan` namespace introduced in Phase 4. Single lookup drives `max_instances` (Phase 4 hardcode goes away), `request` / `email` rate-limit caps, DLQ retention, blob storage caps, custom-domain counts, and Stripe customer-id linkage below.
 - Billing hookup (Stripe) — implement via `webhook.send` + callbacks to dogfood the Cmd path. Customer id stored at `account/{hash}/stripe_customer_id`.
-- **PSL submission** for `loop46.me` (GitHub PR to `publicsuffix/list`). Fire-and-wait; propagation can take weeks-to-months across browser releases. Defense-in-depth only — server-side `Set-Cookie Domain=` stripping from Phase 1 is the authoritative guard.
+- **PSL submission** for `rewindjs.app` (GitHub PR to `publicsuffix/list`). Fire-and-wait; propagation can take weeks-to-months across browser releases. Defense-in-depth only — server-side `Set-Cookie Domain=` stripping from Phase 1 is the authoritative guard.
 
 ### Phase 11 — Server-sent events (§2.12)
 
@@ -1014,7 +1016,7 @@ Skill file + CLI polish + scoped tokens. **No MCP server in v1.** Hosted MCP def
 - `/_system/scoped_tokens` admin routes (mint/list/revoke).
 - Dashboard "Tokens" tab.
 
-What's deferred (not in v1): hosted HTTP MCP at `mcp.loop46.me`, `loop46-mcp` binary, MCP wire-format code. Build when a real remote-agent use case shows up.
+What's deferred (not in v1): hosted HTTP MCP at `mcp.rewindjs.com`, `loop46-mcp` binary, MCP wire-format code. Build when a real remote-agent use case shows up.
 
 Detailed plan: `docs/agent-surface.md`.
 
@@ -1116,7 +1118,7 @@ Resolved items moved to §10. Open items:
 - `docs/rove-generalization.md` — speculative, not committed:
   exploration of a programming language built around the
   rove-kernel (row-typed collections + identity). Reference only;
-  not a direction loop46 itself takes.
+  not a direction rewind.js itself takes.
 
 ## 6b. Architectural principle: separability follows raft participation
 
@@ -1165,13 +1167,13 @@ because nothing in their architecture requires co-location.
 
 The following were explored during the 2026-04-17 design conversation and ruled out. Captured here so future sessions don't re-derive them.
 
-- **`admin.loop46.com` + bearer tokens** as the admin UI origin. Rejected: wanted to dogfood the customer auth path, and bearer tokens force customers into `headers: Authorization` plumbing.
-- **`{name}.api.loop46.com` + `site.loop46.com` (PSL)** for separate static/API origins. Rejected: PSL propagation is a launch blocker, and per-customer wildcard TLS for two-label-deep API hosts is operational pain. Single origin per tenant with path routing is simpler.
-- **Admin UI served by the root JS instance.** Rejected: violates dogfooding — we should host the admin UI the same way a customer hosts theirs (static bundle + cross-origin to its API is actually not needed here either, since same-origin on `app.loop46.me`).
+- **`admin.rewindjs.com` + bearer tokens** as the admin UI origin. Rejected: wanted to dogfood the customer auth path, and bearer tokens force customers into `headers: Authorization` plumbing.
+- **`{name}.api.rewindjs.com` + `site.rewindjs.com` (PSL)** for separate static/API origins. Rejected: PSL propagation is a launch blocker, and per-customer wildcard TLS for two-label-deep API hosts is operational pain. Single origin per tenant with path routing is simpler.
+- **Admin UI served by the root JS instance.** Rejected: violates dogfooding — we should host the admin UI the same way a customer hosts theirs (static bundle + cross-origin to its API is actually not needed here either, since same-origin on `app.rewindjs.com`).
 - **Write-only `env` / secrets primitive.** Rejected: ceremony without defense (handler code can exfiltrate any value it can read). Replaced by page-level encryption for all KV.
 - **Value-level encryption for secrets.** Rejected: unified page-level encryption covers more surface with one code path.
 - **Redact env values from replay tapes.** Rejected: breaks determinism (downstream captures derive from env values, can't be recomputed). Replaced by encrypting tapes at rest and access-gating admin reads.
-- **Cookie-based auth for C2 API calls by default.** Rejected for customers whose UI is on a third-party host — Safari ITP eats third-party cookies. Same-origin on `{name}.loop46.me` via path routing recovers the cookie path for the default layout; bearer tokens remain as a third-party-host fallback.
+- **Cookie-based auth for C2 API calls by default.** Rejected for customers whose UI is on a third-party host — Safari ITP eats third-party cookies. Same-origin on `{name}.rewindjs.app` via path routing recovers the cookie path for the default layout; bearer tokens remain as a third-party-host fallback.
 - **Admin UI auto-detecting `.ejs` / `.ts` file extensions and running a built-in transform** (as shift-js did). Rejected: platform-not-framework. Transforms are libraries customers import, not platform primitives.
 - **Synthetic "deploy" event in the request log stream.** Rejected: misleading across the transition window. Per-request `deployment_id` tagging is accurate and more useful.
 - **Per-worker polling of `deployment/current` for cache invalidation.** Rejected: doesn't scale to thousands of instances. Raft apply hook is the correct notification channel.
@@ -1180,7 +1182,7 @@ The following were explored during the 2026-04-17 design conversation and ruled 
 - **Auto-resend on expired-but-recent magic-link click** (15-min validity + 15-min grace window with `resend_grace_until_ns`, `magic_resend` rate-limit action, "we sent a fresh link" UI page). Rejected: trades a friendly page for an extra email round-trip that's strictly worse than just bumping the magic TTL. Replaced by 30-minute flat validity + an `email` URL hint on the signup form pre-fill for the 401-page case. Also avoids a name-squat amplification in the original design — the resend chain renews `pending/{name}` lifecycle, letting one signup hold a name for hours within the 3/hr per-email rate limit; flat TTL caps the reservation at 30 min.
 - **SSE rows in customer's `app.db` under reserved prefix `_events/{sid}/{seq}`**, replicated through raft envelope 0, with a per-tenant retention sweep + Last-Event-ID catch-up over the persisted rows. Rejected (2026-05): SSE is a notification channel, not a source-of-truth state store; the reserved-prefix storage entangled SSE state with customer kv writesets, raft replication, the markDirtyFromWriteset scan, and a 365-line retention sweep — for semantics that are explicitly losable and recoverable via replay. Replaced by `docs/sse-plan.md`: centralized sse-service singleton, response-attached emit buffers, in-memory ring cache with sentinel-on-eviction.
 - **Log batches replicated through raft (envelope type 1) + per-tenant `log.db` apply on every node.** Rejected (2026-05): logs are best-effort and lossy by design (PLAN §2.9), don't need raft's strong durability, and forcing them through the raft log dominates cluster bandwidth at scale. Replaced by `docs/logs-plan.md`: per-node S3-direct batch upload + a single log-server process polling S3 to maintain a local SQLite index.
-- **Per-tenant `files.db` on every worker mirroring the manifest via raft envelope type 3.** Rejected (2026-05): worker-as-read-only-consumer model is cleaner. Replaced by `docs/files-server-plan.md`: manifest lives in S3, runtime release signal is a `_deploy/active` kv marker on the customer's app.db, worker reads on demand.
+- **Per-tenant `files.db` on every worker mirroring the manifest via raft envelope type 3.** Rejected (2026-05): worker-as-read-only-consumer model is cleaner. Replaced by `docs/files-server-plan.md`: manifest lives in S3, runtime release signal is a `_deploy/current` kv marker written by a `POST /_system/release` worker route and picked up via apply.zig's writeset-value scan into a process-wide ReleaseTable, worker reads on demand.
 - **Worker hairpin proxy `/_system/files/*` and `/_system/log/*`.** Rejected (2026-05): these subsystems should be on their own subdomains (`files.{public_suffix}`, `logs.{public_suffix}`), terminating their own TLS, with token-handoff auth from the customer's app domain. Worker stops mediating their traffic entirely. Per `docs/files-server-plan.md` and `docs/logs-plan.md`.
 - **Webhook subsystem leader-local in v1 with per-tenant `_outbox/*` scan recovery on leader change.** Rejected (2026-05): the per-tenant scan is exactly the cost we're trying to eliminate; replicating recovery state via raft from day one removes it. Replaced first by a cluster-wide `webhooks.db` raft-replicated via envelope types 4/5/6 (shipped 2026-05-06), then 2026-05-09 by the more general `http.send` primitive with `schedules.db` and envelope types 8/9/10/11 (`docs/http-send-plan.md`).
 - **Per-tenant `_outbox/{id}` as the transactional handoff point, with an apply-hook forwarding committed outbox rows into `webhooks.db`.** Rejected (2026-05): the only thing the per-tenant row could buy was customer-visible kv inspection of pending webhooks, which isn't a real customer benefit (customers observe webhook state via callbacks, not by peeking kv). And once envelope 4 can ride in the same raft entry as envelope 0 (the writeset), the handoff happens atomically at propose time — by the time the customer response gates on raft commit, `webhooks.db` is already durable cluster-wide. Replaced by direct envelope 0 + envelope 4 propose at handler-batch commit; the dispatcher accumulates `webhook.send` calls in a per-handler list parallel to the writeset, and the per-tenant `_outbox/*` prefix is gone entirely.
@@ -1188,7 +1190,7 @@ The following were explored during the 2026-04-17 design conversation and ruled 
 - **Webhook-server as a separate binary `rove-webhook-server`.** Considered (2026-05) and rejected. Webhook-server participates in raft (reads `webhooks.db`, proposes envelopes, leader-pinned) — separating across a process boundary forces RPC for proposes and file-share or learner-replication for `webhooks.db` reads, re-introducing the very plumbing the consolidation was supposed to eliminate. The right separability axis is raft participation, not public-TLS-surface presence. Webhook-server lives as a leader-pinned thread inside the loop46 binary; the cluster-wide `webhooks.db` design (envelope types 4/5/6) stays. Architectural principle captured in §6.
 - **Pause-and-snapshot raft snapshot strategy** (briefly stopping all applies during VACUUM pass to capture every tenant's `app.db` at a single global raft index). Rejected (2026-05): contradicts the worker-kv-path north star — even a few seconds of cluster-wide write pause every snapshot interval is unacceptable at the "many tenants per node" density. Replaced by per-tenant snapshot indices with always-refresh-all-tenants discipline (`docs/snapshot-plan.md`). The slow-tenant pinning concern is mitigated by the always-refresh trick (dormant tenants get manifest-bookkeeping refresh without re-VACUUM).
 - **Static file serving via 302-to-S3 redirect (public bucket or pre-signed).** Rejected (2026-05): considered as a way to take the worker entirely out of the static bytes path, but Cloudflare in front already absorbs essentially all repeat traffic. The marginal further reduction isn't worth a per-deployment flag, public-bucket security model, CSP friction, or per-request HMAC signing. Worker proxies with hash ETag + immutable Cache-Control; Cloudflare does the heavy lifting.
-- **Polling `current.json` (or per-tenant `latest.json`) for files-server release detection.** Rejected (2026-05): adds per-tenant LIST/GET cost to every worker every interval. Replaced by `_deploy/active` kv marker observed via the existing `markDirtyFromWriteset` post-commit scan path — no polling, no new envelope type, marker rides through the customer kv writeset that the customer's deploy CLI writes.
+- **Polling `current.json` (or per-tenant `latest.json`) for files-server release detection.** Rejected (2026-05): adds per-tenant LIST/GET cost to every worker every interval. Replaced by `_deploy/current` kv marker written by a `POST /_system/release` worker route and picked up via apply.zig's writeset-value scan into a process-wide ReleaseTable — no polling, no new envelope type, marker rides through the customer kv writeset that the customer's deploy CLI writes.
 
 ## 8. Why this is a compelling product
 
@@ -1205,6 +1207,8 @@ The uniqueness isn't any single feature — it's the coherence of the set:
 Nobody is offering this combination. The marketing headline is the functional core + replay; the developer hook is the one-minute demo. The rest of the plan is making both of those true.
 
 ## 9. Implementation status (as of 2026-04-30)
+
+*Note: this section is a 2026-04-30 snapshot. Post-2026-04-30 deltas (Phase 5.5(c), kvexp cutover, SSE, WASM replay shell) are folded forward inline below; see `docs/production.md` and the sub-plans for authoritative current status.*
 
 Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 (narrow scope), restructured several architectural decisions (flagged in §10), and locked the beta-first launch sequencing in §10.16/§10.17. Current status against the §3 phase list:
 
@@ -1250,12 +1254,12 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 - Log pagination: `LogStore.list` accepts `after: u64` (a `request_id`); `ListResult` returns `next_cursor: u64`. Wire endpoint `/_system/log/{id}/list?limit=N&after=<hex>` returns `{records: [...], next_cursor: "<hex>" | null}`. Admin UI tracks the cursor and appends pages on Load older — **done 2026-04-27**
 - NOT yet: Logs auto-refresh / live tail, Logs filtering (by status / outcome / deployment / path), nested-thread display under `parent_request_id` (waits on Phase 6 trigger / callback log emits), Deploys tab with history + diff, CodeMirror 6 upgrade, draft workflow, signup form on the login page, tape replay click-through (waits on Phase 4 tape capture)
 
-### Phase 5.5 — Storage scalability — **mostly shipped (a/b/d/e done; c partial)**
+### Phase 5.5 — Storage scalability — **shipped (a/b/c/d/e done)**
 - (b) **tape body capture — done 2026-05-05.** `LogRecord.tape_refs` carries request + response body hashes + truncation flags. `uploadTapes` writes the bytes to the per-tenant `log-blobs/` BlobBackend after kv commit. Bundle JSON (`src/tape/bundle.zig`) emits `request.body_b64` / `response.body_b64`. Log-server show endpoint serves bytes via range GET on the inline `.ndjson` blob (Phase 5.5 (a) Step B-2 `66861d1`). Smoke `scripts/replay_smoke.py` covers it.
 - (d) **webhook subsystem — done 2026-05-06, then superseded 2026-05-09.** Phase 5.5 (d) shipped exactly as planned: cluster-wide `webhooks.db`, envelopes 4/5/6, multi-envelope wrapper (envelope 7), leader-pinned `webhook-server` thread, dispatcher cutover. The customer-facing `webhook.send` API was preserved. **2026-05-09 generalization** (commits `deb5bba` → `cf375bf`): the dedicated webhook subsystem was deleted in favor of a more general `http.send` / `http.cancel` primitive (`src/schedule_server/`, envelopes 8/9/10/11, `schedules.db`) — same architectural shape (cluster-wide raft-replicated row store, leader-pinned thread, atomic with the writeset via the type-7 multi), broader semantics (arbitrary scheduled HTTP, not just webhook delivery). `webhook.send` is now a JS polyfill (`src/js/bindings/webhook.js`); retry policy is a customer-side library (`src/js/bindings/retry.js`). `webhooks.db` and the `webhook_server` module are gone. The customer-visible API is preserved by composition. See `docs/http-send-plan.md`.
 - (a) **logs — done 2026-05-06.** `log-server-standalone` runs on `logs.{public_suffix}` with TLS + JWT-handoff auth. Workers batch in memory and PUT `.ndjson` (gzip-deflated + sidecar prefixed) directly to the configured `BatchStore` (S3 or fs). The standalone polls + maintains a local SQLite `log_index.db`. Per-tenant `log.db`, envelope type 1, and the worker's `/_system/log/*` proxy all gone. Tape body GETs land via range read on the inline ndjson blob (`66861d1`). Detail in `docs/logs-plan.md`.
 - (e) **files-server — done 2026-05-06 (F1 + F2-push + F2-storage + process split).** `files-server-standalone` runs on `https://files.{public_suffix}` with TLS + JWT-gated routes. Manifest JSON lives in a per-tenant `deployments/` BlobBackend; runtime release pointer (`_deploy/current`) lands in the tenant's app.db and rides envelope 0 through raft. Worker has no `files.db`, no `/_system/files/*` proxy, no `code_proxy`. Dashboard / CLI POST `/_system/release {tenant_id, dep_id}` on the worker after a deploy; a process-wide `ReleaseTable` carries the signal across worker threads and `applyPendingReleases` triggers bytecode reload on next dispatch tick. files-server-standalone owns the **admin + replay deploys** too — bootstrap PUTs the embedded JS to S3 + raft-replicates `_deploy/current` via a JWT with `cap=release`. Envelope type 3 retired. Detail in `docs/files-server-plan.md`.
-- (c) **snapshot — partial; operator-CLI form done.** `_apply_state` per-store table + idempotency filter, in-memory `ApplyCtx.tenant_apply_idx` mirror, end-to-end capture orchestrator + manifest JSON shape, follower `restore()` + atomic-rename + `_apply_state` stamp, operator CLIs `loop46 snapshot` / `loop46 restore-from-snapshot` driven by `BLOB_BACKEND` (fs at `{data_dir}/.snapshots/` or s3 with `SNAPSHOT_S3_KEY_PREFIX`). `scripts/snapshot_smoke.py` exercises end-to-end against real OVH S3. **In-process periodic capture loop** is wired into the raft thread (`--snapshot-interval-ms`) but by-reference reuse for unchanged tenants and the willemt `raft_begin_snapshot` / `raft_end_snapshot` log-compaction wiring are still deferred. Detail in `docs/snapshot-plan.md` and `docs/phase-5.5-rollout.md` §"(c) snapshot".
+- (c) **snapshot — done 2026-05-11.** Operator CLIs, in-process periodic capture loop (`--snapshot-interval-ms`), by-reference reuse for unchanged tenants, willemt raft log-compaction (+ incremental_vacuum), stamp-and-compact replacing byte-capture, and peer-to-peer catchup + boot-time install all shipped. See `docs/production.md` §1.1/§1.2/§3 and `docs/phase-5.5-rollout.md`.
 
 **The big architectural payoff from Phase 5.5**: the loop46 binary now ships only what *participates in raft* (workers + raft node + schedule-server thread + the snapshot capture loop). Three external services run as separate processes on their own subdomains (`files-server-standalone`, `log-server-standalone`, `sse-server-standalone`); none of them participate in raft, all of them carry their state in S3 (or in-memory for sse-service). This matches §6b's separability principle, and §10.13's "post-1.0 detach" is now mostly *complete* — see §13 for the live process map.
 
@@ -1280,9 +1284,11 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 
 ### Phases 7, 9, 10 — **not started**
 
+### Phase 11 — Server-sent events — **done.** sse-server standalone process + worker emit POST + JWT token mint shipped (commits 7c5b949, e056bea); see §13 and `docs/sse-plan.md`.
+
 ### Phase 12 — Sim test framework + simulator library — **not started; partially absorbed into beta + 1.0**
 - Locked in §10.7 + §10.8 (2026-04-28); scope narrowed by the §10.12 two-path replay wedge (2026-04-30) and the beta-first sequencing in §10.16 / §10.17 (2026-04-30). Detailed plan in `docs/sim-test-framework.md`. **Pure client-side**: simulator module (`src/simulator/`) library-linked into the `loop46` CLI; `ReplaySource`; bundle module extraction; bundle JSON additions; module tape wiring; request body capture; `_tests/` directory + `loop46 test` and `loop46 simulate` CLI subcommands; snapshot machinery; sibling-file fixture export; production strip of `_tests/`. **No server endpoints, no thread pool, no rate-limit action** — worker is unchanged.
-- **Beta absorbs**: bundle JSON shape (extracted into `src/tape/bundle.zig`), stubs-library shape (Loop46 globals reading from tape, shared with the `replay.loop46.me` browser-replay page), request body capture into the tape. Beta-path prerequisites for §10.12's Story 1 path and stop being Phase-12-specific work.
+- **Beta absorbs**: bundle JSON shape (extracted into `src/tape/bundle.zig`), stubs-library shape (rewind.js globals reading from tape, shared with the `replay.rewindjs.com` browser-replay page), request body capture into the tape. Beta-path prerequisites for §10.12's Story 1 path and stop being Phase-12-specific work.
 - **1.0 absorbs**: nothing additional from Phase 12 — the DAP CLI reuses the beta stubs library directly.
 - **Stays post-1.0**: Zig + QuickJS `ReplaySource` (the strict-determinism authority — distinct from the V8-based launch interactive-replay paths), sim test framework + assertions, snapshot machinery, fixture lifecycle, `_tests/` directory + `loop46 test` / `loop46 simulate` subcommands.
 
@@ -1292,14 +1298,14 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 ### Phase 14 — AI agent surface — **not started**
 - Locked in §10.10 (2026-04-28). Detailed plan in `docs/agent-surface.md`. Pieces: skill file at `docs/skills/loop46.md`, `--json` output audit across CLI, `loop46 doctor` env-check subcommand, scoped tokens at `scoped_token/{hash}` with capability + instance subsets, `/_system/scoped_tokens` admin routes, dashboard "Tokens" tab. **No MCP server in v1** — hosted MCP deferred until remote-agent demand surfaces.
 
-### Tape-replay wedge (browser page for Story 1 in beta + DAP CLI for Story 2 at 1.0) — **launch path** as of 2026-04-30
+### Tape-replay wedge (browser page for Story 1 in beta + DAP CLI for Story 2 at 1.0) — **launch path** as of 2026-04-30 **— superseded.** The iframe shell was retired; the replay UI is now a WASM/arenajs shell. See `docs/replay-wasm-plan.md`.
 - Locked architecturally in §10.12 (2026-04-28; two-path split 2026-04-30). Beta-first sequencing per §10.16 / §10.17 (decided 2026-04-30): browser page (Story 1) ships in beta; DAP CLI (Story 2) ships at 1.0. Two paths share bundle JSON shape, tape blob format, and stubs library — beta lands all three plus the browser-side consumer; 1.0 adds the CLI orchestration on top.
-- **Beta scope**: bundle endpoint + `replay.loop46.me` page + sandboxed iframe + stubs library + `debugger;` injection + "Replay" button + "copy request ID" affordance. ~1-2 weeks.
+- **Beta scope**: bundle endpoint + `replay.rewindjs.com` page + sandboxed iframe + stubs library + `debugger;` injection + "Replay" button + "copy request ID" affordance. ~1-2 weeks.
 - **1.0 adds**: `loop46 replay <id>` CLI spawning Node under `--inspect-brk` for DAP-aware editor attach (VS Code / JetBrains / nvim-dap / dap-mode). ~1-2 weeks.
 - No Chrome extension, no in-dashboard debugger UI. CodeMirror 6 lands in beta but only for syntax highlighting in the Code tab, not for an integrated debugger view (see §10.12 closing note + §10.16 beta launch list item 3).
 
 ### Blob replication (multi-node prerequisite) — **done**
-- Raft envelopes include `type=3` files_writeset replicating `{id}/files.db` across nodes — **done**
+- Envelope type 3 (files_writeset) was **retired** in Phase 5.5(e); per-tenant deployment manifests now live in a `deployments/` BlobBackend (see `docs/files-server-plan.md`). Blob bytes (`file-blobs/*`) are still not raft-carried; multi-node uses a shared `BlobStore` backend via `BLOB_BACKEND=fs|s3`.
 - Blob bytes (`{id}/file-blobs/*`) are not carried through raft envelopes (a 1MB static per envelope would blow raft-log size/latency budget). Multi-node setups configure a shared `BlobStore` backend via `BLOB_BACKEND=fs|s3`:
   - **`fs`** (`FilesystemBlobStore`) — points at `{data_dir}` on every node, expects a shared mount (NFS / EFS / Ceph). Zero new code; ops responsibility.
   - **`s3`** (`S3BlobStore`) — **shipped**. Path-style + SigV4-signed; works against AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces, MinIO, OVH Object Storage. Configured via `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_KEY_PREFIX_BASE` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `S3_USE_TLS`. Smoke-tested via `scripts/s3_blob_smoke.py` (env vars sourced from repo-root `.env` per `reference_s3_smoke_env.md`).
@@ -1390,7 +1396,7 @@ The 750-line `dispatchOnce` loop body was split into named helpers:
 The simulator is a **client-side library only** — no `/_system/simulate/{id}` endpoint, no thread pool, no `simulate` rate-limit action. The worker's job is dispatch (live or dry-run, §10.11) + observation (recording tapes); simulation is purely a client concern. Two implementations share a contract (bundle JSON shape + tape blob format):
 
 - **CLI simulator** (Zig + QuickJS, `src/simulator/`) — linked into `loop46 test` and `loop46 simulate`. Hermetic, deterministic, used in CI and inner-loop dev. Authoritative for strict-determinism replay.
-- **Browser-replay page** (V8 in browser, launch-path per §10.12) — interactive replay for Story 1 in a sandboxed iframe at `replay.loop46.me`. Stubs Loop46 globals from the tape, injects `debugger;` at handler entry. Engine differences with QuickJS apply uniformly.
+- **Browser-replay page** (V8 in browser, launch-path per §10.12) — interactive replay for Story 1 in a sandboxed iframe at `replay.rewindjs.com`. Stubs rewind.js globals from the tape, injects `debugger;` at handler entry. Engine differences with QuickJS apply uniformly.
 
 `ReplaySource` is **KV-less** — the dependency surface deliberately excludes `rove-kv` / SQLite. Modes (`strict`, `what_if`, `isolated`) are layer combinations over write-buffer / overlay / tape / miss-policy. **No live-KV pass-through layer**: live-state mixing was rejected as conceptually muddy. Writes go to the buffer only; outbox effects (`webhook.send`, `email.send`) are recorded as "would-have-enqueued" rows, never delivered.
 
@@ -1412,7 +1418,7 @@ Detail in `docs/fixture-lifecycle.md`.
 
 ### 10.10 AI agent surface — CLI + skill file in v1, hosted MCP deferred
 
-Loop46's primary AI agent surface in v1 is **the CLI itself**, taught to agents via a skill file. **No MCP protocol server, no `loop46-mcp` binary.** Hosted MCP at `mcp.loop46.me` is deferred until concrete remote-agent demand surfaces — the dominant case (Claude Code, Codex, Cursor in the customer's working tree) already has shell access, and the MCP wins (typed schemas, server-side rate limiting, cross-machine) only matter for remote/hosted scenarios.
+rewind.js's primary AI agent surface in v1 is **the CLI itself**, taught to agents via a skill file. **No MCP protocol server, no `loop46-mcp` binary.** Hosted MCP at `mcp.rewindjs.com` is deferred until concrete remote-agent demand surfaces — the dominant case (Claude Code, Codex, Cursor in the customer's working tree) already has shell access, and the MCP wins (typed schemas, server-side rate limiting, cross-machine) only matter for remote/hosted scenarios.
 
 What ships in v1: skill file at `docs/skills/loop46.md`, `--json` output on every CLI subcommand, `loop46 doctor` readiness check, and **scoped tokens** at `scoped_token/{sha256_hex}` (capability subset + instance scope). Scoped tokens are independent of MCP — a security primitive worth having for any agent integration.
 
@@ -1429,17 +1435,17 @@ Detail in `docs/fixture-lifecycle.md`.
 ### 10.12 Replay — two paths, one per audience: browser page (Story 1) + DAP CLI (Story 2) (PROMOTED to launch path 2026-04-30; two-path split 2026-04-30)
 
 **Change**: tape replay ships as **two paths sharing bundle JSON, tape blob format, and the stubs library** — one optimized for each launch audience (§10.16).
-- **Story 1 (new programmer)**: dashboard "Replay" button → new tab on `replay.loop46.me` (sandboxed iframe + global stubs + `debugger;` injection at handler entry). User opens F12 to step through using their browser's own DevTools.
+- **Story 1 (new programmer)**: dashboard "Replay" button → new tab on `replay.rewindjs.com` (sandboxed iframe + global stubs + `debugger;` injection at handler entry). User opens F12 to step through using their browser's own DevTools.
 - **Story 2 (engineering team)**: `loop46 replay <request_id>` CLI in the engineer's terminal. Spawns Node.js under `--inspect-brk` with stubs preloaded; their DAP-aware editor (VS Code / JetBrains / Neovim with nvim-dap / Emacs with dap-mode) attaches via V8 Inspector Protocol. They debug in the editor they already live in. **Story 2 is expected to never use the browser path** — the dashboard Logs view's job for them is request-ID discovery (one-click copy on each row → paste into terminal).
 
-**Promoted into the launch path** — see §10.16 for sequencing. The original "deferred until Phase 5 admin UI is mature" stance flipped because tape replay is the load-bearing differentiator: every other Loop46 capability has a competitor that does it better, but **nobody else can let you click a failed request and step through the actual reproducer in your usual debugger**. Story 1 hears "click any 500, hit replay, step through it in F12"; Story 2 hears "`loop46 replay <id>` in your terminal, attach VS Code, step through it in your editor."
+**Promoted into the launch path** — see §10.16 for sequencing. The original "deferred until Phase 5 admin UI is mature" stance flipped because tape replay is the load-bearing differentiator: every other rewind.js capability has a competitor that does it better, but **nobody else can let you click a failed request and step through the actual reproducer in your usual debugger**. Story 1 hears "click any 500, hit replay, step through it in F12"; Story 2 hears "`loop46 replay <id>` in your terminal, attach VS Code, step through it in your editor."
 
-**Story 1 path — `replay.loop46.me` page (page-only, "use real DevTools, free")**:
-1. Dashboard ships a "Replay" button on each Logs row → opens `https://replay.loop46.me/{request_id}` in a new tab.
+**Story 1 path — `replay.rewindjs.com` page (page-only, "use real DevTools, free")**:
+1. Dashboard ships a "Replay" button on each Logs row → opens `https://replay.rewindjs.com/{request_id}` in a new tab.
 2. The replay page hosts an iframe sandboxed with `sandbox="allow-scripts"`, served from a separate origin so dashboard cookies / localStorage stay out of the handler's reach.
 3. The iframe page:
    - Fetches bundle + tape from server endpoints (compose, or use a new `/_system/replay/bundle/{request_id}` aggregator).
-   - Sets up Loop46 global stubs (`globalThis.kv`, `webhook`, `email`, `Date.now`, `Math.random`, `crypto.*`) that read from the tape.
+   - Sets up rewind.js global stubs (`globalThis.kv`, `webhook`, `email`, `Date.now`, `Math.random`, `crypto.*`) that read from the tape.
    - Loads handler modules via `<script type="module">` (with `//# sourceURL=...` for synthesized cases) so source shows up as a real file in DevTools' Sources panel — module imports resolve through an import map populated from the bundle.
    - Injects `debugger;` at handler entry (and optionally at the recorded throw site).
    - Calls the handler with the replay request.
@@ -1471,8 +1477,8 @@ Why this for Story 2: Story 2 engineers live in their editor 8 hours a day. Send
 **What ships at launch**:
 - Bundle JSON shape on the worker (deployment + module dependency graph + source per module). New `/_system/replay/bundle/{request_id}` aggregator or composed from existing endpoints.
 - Tape blob format consumed as-is from existing tape capture.
-- **Stubs library** (Loop46 globals reading from tape) shared between both paths — same JS module, served to the iframe and required from the Node entry script.
-- **Browser path**: replay page on `replay.loop46.me` (sandboxed iframe + module loader + `debugger;` injection). Dashboard "Replay" button on each Logs row.
+- **Stubs library** (rewind.js globals reading from tape) shared between both paths — same JS module, served to the iframe and required from the Node entry script.
+- **Browser path**: replay page on `replay.rewindjs.com` (sandboxed iframe + module loader + `debugger;` injection). Dashboard "Replay" button on each Logs row.
 - **CLI path**: `loop46 replay <request_id>` subcommand on the existing `loop46` binary. Loads bundle + tape, writes Node entry script, spawns under `--inspect-brk`, prints editor-specific attach instructions.
 - **Logs row affordance**: one-click copy of request ID for terminal paste — equally useful to Story 1 ("can I just send my friend the failing request?") and Story 2.
 
@@ -1480,7 +1486,7 @@ Why this for Story 2: Story 2 engineers live in their editor 8 hours a day. Send
 The bundle JSON shape, stubs-library design, and request body capture into the tape all land at launch as part of this work. Phase 12's *Zig + QuickJS deterministic CLI simulator* (`loop46 test`, `loop46 simulate`, `_tests/` directory, snapshot machinery, fixture lifecycle) is **still post-launch** — different engine, different purpose (deterministic CI authority, not interactive debug). What Phase 12 absorbs at launch: bundle module extraction (`src/tape/bundle.zig`), stubs-library shape, request body capture wiring. What stays post-launch: the Zig + QuickJS `ReplaySource`, the test framework + assertions, fixture tooling.
 
 **Side effects**:
-- New origin to provision (`replay.loop46.me`) under the existing `*.loop46.me` wildcard cert.
+- New origin to provision (`replay.rewindjs.com`) under the existing `*.rewindjs.app` wildcard cert.
 - The bundle JSON + tape format become a semi-public contract (consumed by browser page, CLI, eventually Phase 12 simulator).
 - `loop46 replay` is the first launch-path CLI subcommand. Phase 7 (`loop46 deploy`, `kv`, `logs`) is still post-launch, but the `loop46` binary growing subcommands incrementally is fine — `loop46 dev` / `loop46 worker` already exist.
 
@@ -1501,9 +1507,9 @@ Detail in `docs/files-server-plan.md` §11 + `docs/phase-5.5-rollout.md` §"(a) 
 
 ### 10.14 Distributed Elm ports: webhook + callback + SSE (decided 2026-04-30)
 
-**Framing**: Loop46's customer model is **Elm with distribution**. Pure handler functions (`request × kv → response × cmds`); explicit Cmd-shaped side effects via `webhook.send` and `email.send`; Sub-shaped reactive intake via triggers (kv-write subscriptions), callback handlers (webhook-result subscriptions), and SSE (server-pushed events to client). The combination is **distributed Elm ports** — typed channels between pure-functional handlers and the imperative world.
+**Framing**: rewind.js's customer model is **Elm with distribution**. Pure handler functions (`request × kv → response × cmds`); explicit Cmd-shaped side effects via `webhook.send` and `email.send`; Sub-shaped reactive intake via triggers (kv-write subscriptions), callback handlers (webhook-result subscriptions), and SSE (server-pushed events to client). The combination is **distributed Elm ports** — typed channels between pure-functional handlers and the imperative world.
 
-This isn't just a metaphor. The architectural claim is: real-world reactive applications can be expressed in Loop46's pure-functional handler model *without escape hatches*, because every imperative concern (HTTP I/O, time, retries, browser updates, third-party integrations) has a port-shaped primitive.
+This isn't just a metaphor. The architectural claim is: real-world reactive applications can be expressed in rewind.js's pure-functional handler model *without escape hatches*, because every imperative concern (HTTP I/O, time, retries, browser updates, third-party integrations) has a port-shaped primitive.
 
 **Cmd taxonomy: two axes, four quadrants.** The handler's outputs are governed by two axes — whether deliveries are **batched** (combined with sibling Cmds before going out) or **unbatched** (one delivery per emit), and whether they're **guaranteed** (at-least-once with retry / commit-with-writeset) or **best-effort** (lost on crash / backpressure / eviction). The four quadrants each have a named platform verb today or in the speculative-post-1.0 sketch:
 
@@ -1527,7 +1533,7 @@ A literal unified `send({batched, guaranteed, ...})` API was considered and drop
 - `crypto.hmacSha1(key, data) → hex`. AWS SigV2 (legacy), Twilio request signing. ~10 lines, mirrors `hmacSha256`.
 - **Deferred**: RSA/ECDSA signing (GitHub Apps, Google service accounts, Apple Push). Bigger surface; HMAC-signed JWTs cover a meaningful subset.
 
-**Editor auth (dashboard-internal)** is orthogonal to the customer third-party auth toolkit — the cookie-to-bearer flow only makes sense for clients that *have* a Loop46 cookie session. The flow specifics (`/v1/files-token` endpoint, HMAC-signed bearer, 5-minute TTL, files-server-side validation without admin round-trip) live in `docs/files-server-plan.md` §11.4.
+**Editor auth (dashboard-internal)** is orthogonal to the customer third-party auth toolkit — the cookie-to-bearer flow only makes sense for clients that *have* a rewind.js cookie session. The flow specifics (`/v1/files-token` endpoint, HMAC-signed bearer, 5-minute TTL, files-server-side validation without admin round-trip) live in `docs/files-server-plan.md` §11.4.
 
 ### 10.15 `analytics.track` and `metrics.*` — speculative, post-1.0
 
@@ -1544,8 +1550,8 @@ Two future observability primitives are explicitly held back per `feedback_compo
 
 **Two audiences served by one product**, both motivating the build from day one:
 
-- **"Story 1 — the new programmer"**: brand-new dev, helped by a friend, currently stuck composing Firebase = Google account + billing account + Firebase console + Firestore + Cloud Functions IAM + three different log views just to add a persistent leaderboard. Loop46 collapses all of that to magic-link signup + one dashboard + kv-comes-free + zero permissions to configure. When her app breaks (it will), she has zero mental model for `gcloud logs read` — she just clicks the failed request in her dashboard. Tape replay is what turns "I give up" into "oh, I see what happened."
-- **"Story 2 — the engineering team"**: small team, junior-to-senior, perpetually rebuilding ad-hoc observability stacks (Sentry + Datadog + LogRocket + a homegrown webhook outbox), and shipping the same classic transaction-boundary / read-modify-write race bugs every quarter. Loop46's writeset model serializes those races structurally (SQLite IMMEDIATE locking serializes concurrent r-m-w on the same kv keys; the writeset's all-or-nothing commit eliminates "I forgot to wrap this in a transaction"). The observability stack is built in, the webhook outbox is durable by default, the senior engineer's accumulated wisdom about "things teams keep messing up" is baked into the platform.
+- **"Story 1 — the new programmer"**: brand-new dev, helped by a friend, currently stuck composing Firebase = Google account + billing account + Firebase console + Firestore + Cloud Functions IAM + three different log views just to add a persistent leaderboard. rewind.js collapses all of that to magic-link signup + one dashboard + kv-comes-free + zero permissions to configure. When her app breaks (it will), she has zero mental model for `gcloud logs read` — she just clicks the failed request in her dashboard. Tape replay is what turns "I give up" into "oh, I see what happened."
+- **"Story 2 — the engineering team"**: small team, junior-to-senior, perpetually rebuilding ad-hoc observability stacks (Sentry + Datadog + LogRocket + a homegrown webhook outbox), and shipping the same classic transaction-boundary / read-modify-write race bugs every quarter. rewind.js's writeset model serializes those races structurally (SQLite IMMEDIATE locking serializes concurrent r-m-w on the same kv keys; the writeset's all-or-nothing commit eliminates "I forgot to wrap this in a transaction"). The observability stack is built in, the webhook outbox is durable by default, the senior engineer's accumulated wisdom about "things teams keep messing up" is baked into the platform.
 
 The framings differ but the product is identical: **Story 1 hears "ship in minutes"; Story 2 hears "step through it in your browser"**; same launch sentence ("Build a working app in minutes. When it breaks, you can see exactly why and step through the reproducer in your browser") serves both.
 
@@ -1556,9 +1562,9 @@ The framings differ but the product is identical: **Story 1 hears "ship in minut
 **Beta launch path** (Story 1 audience):
 
 1. **Phase 5 dashboard polish** — instance health indicators, logs view discoverability for Story 1, "Replay" button on Logs rows, "copy request ID" affordance. ~2 weeks.
-2. **Tape-replay browser page** (§10.12 Story 1 path) — bundle JSON shape on the worker (compose from existing endpoints, or new `/_system/replay/bundle/{request_id}` aggregator), sandboxed iframe replay page on `replay.loop46.me`, stubs library (Loop46 globals reading from tape), `<script type="module">` source loading, `debugger;` injection at handler entry. ~1-2 weeks.
+2. **Tape-replay browser page** (§10.12 Story 1 path) — bundle JSON shape on the worker (compose from existing endpoints, or new `/_system/replay/bundle/{request_id}` aggregator), sandboxed iframe replay page on `replay.rewindjs.com`, stubs library (rewind.js globals reading from tape), `<script type="module">` source loading, `debugger;` injection at handler entry. ~1-2 weeks.
 3. **CodeMirror 6 syntax-highlighting upgrade for the Code tab** — replaces the existing `<textarea>` with a CM6 `EditorView`. Language modes by file extension: `.mjs` / `.js` → `@codemirror/lang-javascript`, `.html` → `@codemirror/lang-html`, `.css` → `@codemirror/lang-css`; default plain text. Line numbers + basic editing extensions. **Out of scope for beta**: autocomplete, lint, fold gutter, breakpoint gutter, draft workflow integration. Vendored bundle (no third-party CDN at runtime). ~½ week.
-4. **Phase 14 LLM skill file** (`docs/skills/loop46.md`) — AI-assisted Loop46 coding. Without it, LLMs default to imperative `await fetch()` patterns that don't compile. ~1 week.
+4. **Phase 14 LLM skill file** (`docs/skills/loop46.md`) — AI-assisted rewind.js coding. Without it, LLMs default to imperative `await fetch()` patterns that don't compile. ~1 week.
 5. **Story 1 leaderboard example tenant** — the literal Firebase-pain demo, 5 lines of handler + one HTML page. ~½ day. Pairs with the beta launch post.
 6. **Beta operational** — free-tier caps wired to existing rate limiter defaults, beta banner in dashboard, data-continuity promise visible at signup, feedback channel link, per-account storage cap enforcement. ~3-5 days. Detail in §10.17.
 
@@ -1568,7 +1574,7 @@ The framings differ but the product is identical: **Story 1 hears "ship in minut
 
 1. **SSE primitive (Phase 11 / §2.12).** Single sse-service process on its own subdomain (`sse.{public_suffix}`); long-lived HTTP/2 streams from customer browsers; per-(tenant, sid) ring cache for reconnect catch-up. Worker `events.emit(...)` appends to an in-memory emit buffer; after kv commit, worker fire-and-forget POSTs the buffer to sse-service. JWT token handoff from the customer's app domain (`/_session/sse-token`) keeps `__Host-` cookies pinned. Browser uses native `EventSource`. Single-process v1: failover is "process dies, LB swap, clients reconnect, sentinel triggers refetch." Detail in `docs/sse-plan.md`. ~3 weeks. **The "first patterns sticky" risk dissolves under beta sequencing**: beta docs deliberately omit live use cases (Stripe Checkout, OAuth, AI-agent results, slow API calls) entirely, so SSE arrives at 1.0 as the *first* answer for those flows, not as a replacement for established polling.
 2. **Tape-replay DAP CLI** (§10.12 Story 2 path) — `loop46 replay <request_id>` CLI fetching bundle + tape, writing a Node entry script with stubs preloaded, spawning under `--inspect-brk`, printing attach instructions for VS Code / JetBrains / nvim-dap / dap-mode. Reuses the stubs library shipped in beta. ~1-2 weeks.
-3. **Loop46-the-project Stripe integration for supporter payments** — *the real production integration that doubles as the customer-facing docs example.* Loop46's admin handler exposes a "support Loop46" page that creates a Stripe Checkout session via `webhook.send`, returns a tiny shell page that subscribes via SSE, the callback `events.emit`s the session URL to the connected client, browser navigates. Receives `checkout.session.completed` webhook with timing-safe HMAC signature verification, writes a `supporter/{email}` row in admin's app.db, fires another SSE event so the originating tab updates to "Thanks!" without a refresh. **Docs example is extracted from this**: the patterns we actually use become the patterns we teach. ~1.5-2 weeks, plus the small primitives audit (`crypto.timingSafeEqual` confirmed; `base64Encode/Decode` and `hmacSha1` if needed).
+3. **rewind.js-the-project Stripe integration for supporter payments** — *the real production integration that doubles as the customer-facing docs example.* rewind.js's admin handler exposes a "support rewind.js" page that creates a Stripe Checkout session via `webhook.send`, returns a tiny shell page that subscribes via SSE, the callback `events.emit`s the session URL to the connected client, browser navigates. Receives `checkout.session.completed` webhook with timing-safe HMAC signature verification, writes a `supporter/{email}` row in admin's app.db, fires another SSE event so the originating tab updates to "Thanks!" without a refresh. **Docs example is extracted from this**: the patterns we actually use become the patterns we teach. ~1.5-2 weeks, plus the small primitives audit (`crypto.timingSafeEqual` confirmed; `base64Encode/Decode` and `hmacSha1` if needed).
 4. **Phase 7 `loop46 deploy` CLI** subset — content-addressed two-phase upload, `loop46.json` parsing, deploy-token issuance UI in dashboard. ~1-2 weeks for v1 scope; later CLI subcommands (`kv`, `logs`, `init`) deferred.
 5. **Plan tiers + paid pricing** — first paid tier, plan-tier branching in rate limiter caps, billing wiring via Stripe (uses item 3's primitives). ~1-2 weeks.
 6. **Custom domains** (Phase 10) — customer CNAME + per-domain Let's Encrypt. ~2 weeks.
@@ -1580,15 +1586,15 @@ The framings differ but the product is identical: **Story 1 hears "ship in minut
 Phase 9 encryption at rest joins the 1.0 path only if B2B compliance demand surfaces during beta — otherwise it stays post-1.0.
 
 **Why dogfooding Stripe (item 2) matters beyond the credibility argument**:
-- **Authenticity**: every "Loop46 + Stripe" code snippet in the docs is code we actually run in production. No theoretical-best-practice patterns that fall apart on first contact with real Stripe API quirks (idempotency keys, webhook ordering, test-vs-live mode handling, the dual-redirect dance for Connect onboarding).
-- **Funding**: Loop46 the project costs money to operate (hosting, domain, eventual TLS, mkcert isn't forever). A supporter model lets people who get value from the platform contribute, sustaining the project without VC dependence.
+- **Authenticity**: every "rewind.js + Stripe" code snippet in the docs is code we actually run in production. No theoretical-best-practice patterns that fall apart on first contact with real Stripe API quirks (idempotency keys, webhook ordering, test-vs-live mode handling, the dual-redirect dance for Connect onboarding).
+- **Funding**: rewind.js the project costs money to operate (hosting, domain, eventual TLS, mkcert isn't forever). A supporter model lets people who get value from the platform contribute, sustaining the project without VC dependence.
 - **Forces us to think like a customer**: building Stripe integration *as a customer of our own platform* is the cleanest possible test of "does this primitive set actually work for a real production integration." If we hit friction, we fix the platform — and customers benefit. The friction we don't fix becomes the friction we document. Either way customers win.
 - **Failure-mode audit**: real money is real stakes. The webhook signature timing-safe-equal becomes load-bearing when it's *our* customers' card charges flowing through it. We'll discover the actual gaps in the toolkit far faster than a contrived example would surface them.
 
 **What's NOT in beta but lands at 1.0**:
 - SSE primitive
 - DAP CLI replay (`loop46 replay`)
-- Stripe-on-Loop46 supporter payments
+- Stripe-on-rewind.js supporter payments
 - `loop46 deploy` CLI
 - Plan tiers + paid pricing
 - Custom domains
@@ -1615,13 +1621,13 @@ All four variants are TRUE — they're not different products, they're different
 
 ### 10.17 Beta launch operational specifics (decided 2026-04-30)
 
-Operational items required to open Loop46 beta to external Story 1 users. All small, all needed before the dashboard URL gets shared publicly.
+Operational items required to open rewind.js beta to external Story 1 users. All small, all needed before the dashboard URL gets shared publicly.
 
 **Free tier scope**:
 - Existing per-instance rate-limiter defaults (`request` + `email`) become the free-tier caps. Operator-tunable via `WorkerConfig.rate_limit_caps` from §8.
 - Per-account instance cap visible to customers (the Phase 4 hardcode becomes an explicit displayed cap).
 - Per-account total-storage cap (sum across all that account's instances) — enforced at deploy time, small addition over Phase 2's per-instance caps.
-- No paid tier in beta. Stripe-on-Loop46 supporter payments ships at 1.0.
+- No paid tier in beta. Stripe-on-rewind.js supporter payments ships at 1.0.
 
 **Data-continuity promise**:
 - Visible at signup and in the beta banner: *"Your data carries forward to 1.0. Beta data will not be wiped."*
@@ -1629,7 +1635,7 @@ Operational items required to open Loop46 beta to external Story 1 users. All sm
 - If a migration becomes prohibitively expensive, the framing has to change to "preview" without that promise — don't break the commitment silently.
 
 **Beta banner**:
-- Persistent banner in `app.loop46.me` shell: *"Loop46 is in beta. [Feedback]."* Click opens the feedback channel.
+- Persistent banner in `app.rewindjs.com` shell: *"rewind.js is in beta. [Feedback]."* Click opens the feedback channel.
 - Dismissible per-session (so users see it again next visit).
 - Removed at 1.0 launch.
 
@@ -1649,7 +1655,7 @@ Operational items required to open Loop46 beta to external Story 1 users. All sm
 **Beta-open checklist** (items to complete before public URL):
 - Beta banner + feedback link in dashboard shell
 - Per-account storage cap enforcement
-- Free-tier caps documented at `app.loop46.me/docs/limits`
+- Free-tier caps documented at `app.rewindjs.com/docs/limits`
 - Data-continuity promise text in signup flow
 - End-to-end smoke test: signup → magic link via prod Resend → deploy starter via Code tab → trigger a 500 → click Replay → step through in browser DevTools
 
@@ -1750,7 +1756,7 @@ Not available:
 - Tape bodies (Phase 5.5 b) write through `LogStore.blob` to the configured `BlobStore`. With `BLOB_BACKEND=s3` or a shared FS mount, all nodes serve the same bytes; with single-host `fs`, bodies are leader-local and replay 404s after leader change for old request IDs.
 - On leader failover, the new leader has full manifests but may 503 on any blob not yet served by the shared backend (FS mount serves them transparently; S3 backend serves them on first read).
 - Outbound HTTP delivery (`http.send`): leader-pinned schedule-server thread reads `schedules.db` (raft-replicated). On leader change, the new leader inherits committed state with no per-tenant scan — at-least-once with version-counter dedup of duplicate fires, per `docs/http-send-plan.md` §7.
-- `raft.log.db` grows unbounded under sustained traffic until Phase 5.5 (c) ships its compaction wiring (the willemt `raft_begin_snapshot` / `raft_end_snapshot` brackets are still deferred — operator-CLI `loop46 snapshot` works for capture today, but doesn't bracket).
+- `raft.log.db` is compacted by Phase 5.5 (c) (done 2026-05-11): `--snapshot-interval-ms` triggers periodic capture + willemt `raft_begin_snapshot` / `raft_end_snapshot` log-compaction. Operators should set this flag in production to bound log growth.
 
 ### Operational
 
@@ -1763,18 +1769,18 @@ Not available:
 - `--snapshot-interval-ms <N>` enables the periodic raft-thread snapshot capture loop (off by default). Captures land in S3 (or fs at `{data_dir}/.snapshots/`) per `BLOB_BACKEND` and `SNAPSHOT_S3_KEY_PREFIX`.
 - `--dev-webhook-unsafe` enables loopback + plaintext targets for local smokes — applies to schedule-server's outbound HTTP path (`http.send`) and is the only knob that bypasses SSRF / HTTPS-only. NEVER set in production.
 
-## 13. Servers and surfaces (live as of 2026-05-09)
+## 13. Servers and surfaces (live as of 2026-05-15)
 
 This section is the canonical map of "which process owns what." Future sessions should use it before §3's phased build plan to orient — much of §3 is now historical.
 
 ### 13.1 Process inventory
 
-Loop46 ships as **four binaries**, all built from this repo:
+rewind.js ships as **four binaries**, all built from this repo:
 
 | Binary | Source | Public hostname | Owns |
 |---|---|---|---|
 | `loop46` | `src/loop46/main.zig` | `*.{public_suffix}`, `app.{public_suffix}`, `replay.{public_suffix}` | Customer + admin + replay HTTP traffic; raft node; per-worker QJS dispatcher; schedule-server thread; signup; `/_system/release`, `/_system/services-token`, `/_system/admin-kv` admin endpoints |
-| `files-server-standalone` | `examples/files_server_standalone.zig` (wraps `src/files_server/`) | `files.{public_suffix}` | Compile + content-addressed deploy + manifest writes to S3; deploys the embedded admin + replay JS bundles; pushes platform config (`_config/*`, resend key, etc.) into `__admin__/app.db` via `/_system/admin-kv`; flips `_deploy/current` via `/_system/release` |
+| `files-server-standalone` | `examples/files_server_standalone.zig` (wraps `src/files_server/`) | `files.{public_suffix}` | Compile + content-addressed deploy + manifest writes to S3; deploys the embedded admin + replay JS bundles; pushes platform config (`_config/*`, resend key, etc.) into `__admin__/app.db` via `/_system/admin-kv`; flips `_deploy/current` via `/_system/release`. Runs its own raft cluster (not shared with `loop46`). `dep_id` is content-addressed; manifests are keyed `{dep_id}.json` where `dep_id` is a content hash. |
 | `log-server-standalone` | `examples/log_server_standalone.zig` (wraps `src/log_server/`) | `logs.{public_suffix}` | Polls S3 for `.ndjson` log batches + sidecars; maintains local `log_index.db`; serves `/v1/{tenant}/{list,show,count,blob}` to the dashboard |
 | `sse-server-standalone` | `examples/sse_server_standalone.zig` (wraps `src/sse_server/`) | `sse.{public_suffix}` | Holds every long-lived `EventSource` connection; receives worker emit POSTs at `/v1/emit`; per-(tenant, sid) ring cache (30 entries) for reconnect catch-up; emits `rove:resync` sentinel on cache miss |
 
@@ -1798,7 +1804,7 @@ What lives where, after Phase 5.5:
 | `schedules.db` | Cluster-wide | Raft envelopes 8/9/10/11 | Schedule-server thread (writes via worker dispatch + apply); workers read for in-process fast path |
 | `raft.log.db` | Per-node | n/a (it's the log) | willemt raft |
 | `{id}/file-blobs/{hash}` | Per-tenant, in `BlobBackend` (fs or s3) | shared backend across nodes | files-server-standalone writes; worker reads on bytecode cache miss |
-| `tenants/{id}/deployments/{dep_id}.json` (S3 / fs) | Per-tenant deploy manifest | shared backend | files-server-standalone writes; worker fetches on `_deploy/current` flip |
+| `tenants/{id}/deployments/{dep_id}.json` (S3 / fs) | Per-tenant deploy manifest | shared backend | files-server-standalone writes; worker fetches on `_deploy/current` flip. `dep_id` is a content hash; manifests are immutable once written. |
 | `_logs/{node_id}/{batch_id}.ndjson` (+ sidecar) | Per-node, in S3 / fs | n/a (log-server polls) | Worker batches; log-server-standalone polls + indexes |
 | `log_index.db` | log-server-local | rebuildable from S3 | log-server-standalone |
 | `cluster/snapshots/{snap_id}/...` | Cluster-wide, in S3 | n/a | `loop46 snapshot` capture / `loop46 restore-from-snapshot` |
@@ -1845,7 +1851,7 @@ This is what makes `oauth.fromConfig("google")` and `sessions.fromConfig("defaul
 The phased plan in §3 still describes the *content* of each phase, but several phases have been substantially restructured by Phase 5.5 + the 2026-05 schedule-server cutover. Pointers for orientation:
 
 - **§3 Phase 3 (Webhooks + email)** — the on-disk shape (`_outbox/*`, `_outbox_inflight/*`, `_dlq/*`, `webhooks.db`, envelopes 4/5/6) is gone. The customer-visible API survived two cutovers (drainer → webhook-server → http.send-polyfill).
-- **§3 Phase 5.5 (a)/(d)/(e)** — done; (b) done; (c) partial (operator CLIs done, in-process compaction wiring deferred). See §9 Phase 5.5 status.
+- **§3 Phase 5.5 (a)/(b)/(c)/(d)/(e)** — all done. See §9 Phase 5.5 status.
 - **§3 Phase 7 (CLI)** — deferred to 1.0 per §10.16. Beta is dashboard-only.
 - **§3 Phase 11 (SSE)** — done as a standalone process from inception (no in-worker phase). See `docs/notifications.md` for the customer-facing reference and `docs/sse-plan.md` for the design.
 

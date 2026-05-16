@@ -1,6 +1,6 @@
 # Production readiness — what's left
 
-> **2026-05-09 punch list.** What's left to ship a multi-node loop46
+> **2026-05-09 punch list.** What's left to ship a multi-node rewind.js
 > cluster running the four binaries (`loop46`, `files-server-standalone`,
 > `log-server-standalone`, `sse-server-standalone`) under sustained
 > production traffic with full raft. Ordered by "actually blocks
@@ -204,8 +204,8 @@ of the risk; cross-AZ deploys within a region handle them).
 Region-scale loss IS a real concern, and the learner's
 geographic separation handles it.
 
-**S3 is NOT a Loop46 DR mechanism**, periodic or otherwise.
-Loop46 doesn't promise customer-visible point-in-time
+**S3 is NOT a rewind.js DR mechanism**, periodic or otherwise.
+rewind.js doesn't promise customer-visible point-in-time
 recovery (different shape from tape replay, which the
 platform does provide). The remaining "would S3 backups be
 useful for" cases all dissolve under inspection:
@@ -213,7 +213,7 @@ useful for" cases all dissolve under inspection:
 - *Compliance / N-day historical state retention* — not a
   platform commitment in PLAN.md. Customer-tier feature if
   ever needed.
-- *"Oops, customer deleted their data" recovery* — Loop46
+- *"Oops, customer deleted their data" recovery* — rewind.js
   doesn't promise customer-undo. Customers who need it write
   their own audit-log pattern in their own kv prefix.
 - *Spawn a staging clone from prod state* — solved by
@@ -267,7 +267,7 @@ gone entirely.
 
 ### 1.4 Files-server: own raft group + manifests in cluster KV — **shipping 2026-05-10, Shape C chosen**
 
-Loop46 worker now reads manifests from a colocated files-server
+The rewind.js worker now reads manifests from a colocated files-server
 cluster over HTTP/2 instead of going to S3 directly. Files-server
 is its own raft consumer of the shared `kv.Cluster` library
 (commit `28a7be4` extracted it from loop46's apply.zig); same raft
@@ -282,7 +282,7 @@ machinery, separate raft group from loop46.
 | Customer app.db  | Per-tenant SQLite                | loop46 raft           |
 | `_deploy/current`| Customer app.db                  | loop46 raft           |
 
-Loop46 worker → files-server flow on a release POST:
+rewind.js worker → files-server flow on a release POST:
 
 1. `_system/release` writes `_deploy/current = N` through loop46
    raft.
@@ -308,11 +308,11 @@ Loop46 worker → files-server flow on a release POST:
   BlobStore vtable backed by libcurl with a per-fetch JWT minter
   callback. Returns owned bytes; 404 → `Error.NotFound` (caller's
   existing reload-fail path treats this as a soft miss).
-- Loop46 `--files-internal-base` (`5e9eb7e`) flips the worker's
+- rewind.js `--files-internal-base` (`5e9eb7e`) flips the worker's
   per-tenant `manifest_backend` from S3 to HTTP. Default-null
   preserves the legacy S3 path for any deploy that hasn't
   migrated yet.
-- Loop46 `seed --no-files-bootstrap` (`b39d994`) — cluster-backed
+- rewind.js `seed --no-files-bootstrap` (`b39d994`) — cluster-backed
   manifest mode for the bench harness. Skips the legacy S3 PUT
   per-tenant; manifest writes go through files-server's PUT
   route instead.
@@ -329,10 +329,9 @@ Loop46 worker → files-server flow on a release POST:
   flow) still writes manifests to S3. Migration: build the
   writeset, call `cluster.proposeAndWait` instead. Same shape
   as `bootstrap.zig::writeManifestThroughCluster`.
-- Loop46 worker still has hand-rolled apply.zig — it doesn't yet
-  use the `kv.Cluster` library. Pure refactor; #29 in the task
-  list. Doesn't block this work landing because loop46's raft
-  group runs the same envelope shapes the library handles.
+- Worker apply.zig now runs on the kv.Cluster / kvexp library
+  (cutover 2026-05-13, commits ef64867/4ea5dd0); the hand-rolled
+  apply path is gone.
 
 **What this buys:**
 

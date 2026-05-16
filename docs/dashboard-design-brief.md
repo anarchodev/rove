@@ -1,4 +1,4 @@
-# Loop46 dashboard + replay-shell design brief
+# rewind.js dashboard + replay-shell design brief
 
 This document exists so a design pass — paste it into a fresh
 Claude conversation, sketch in HTML/CSS — can produce mockups that
@@ -18,11 +18,15 @@ If you're the rove Claude: this is a **living** brief — when the
 real implementation lands and shapes a decision, update the
 relevant section so the next design pass doesn't fight the code.
 
+**Status:** Living brief; some anchors predate the WASM-only replay
+shell (commit 8565634), the `web/*/_static/` path move (commits
+3c0f456/df83636), and the rewind.js rename.
+
 ---
 
 ## 1. Product context (the one-paragraph version)
 
-**Loop46** sells the rove substrate as: *a backend in 30 seconds —
+**rewind.js** sells the rove substrate as: *a backend in 30 seconds —
 JS handlers, KV store, free static hosting.* The deeper identity:
 **purely functional serverless**. Every customer handler is a pure
 function of `(request, kv_snapshot)`. Every external effect is a
@@ -32,13 +36,13 @@ with breakpoints, deterministically, against the same code path
 that ran in production.
 
 The dashboard is the developer's window into all of that. It is
-also dogfooded — `app.loop46.me` is itself an instance, served the
-same way customer instances are.
+also dogfooded — `app.rewindjs.com` is itself an instance, served
+the same way customer instances are.
 
 Customer-facing identity primitives the dashboard surfaces:
 
 - **C1** — the developer who signed up.
-- **C2** — the developer's end users hitting `{name}.loop46.me`.
+- **C2** — the developer's end users hitting `{name}.rewindjs.app`.
 - **Instance** — a single deployment unit. C1 typically owns one
   (`{name}`) and the special singleton `__admin__` (the dashboard
   itself).
@@ -99,14 +103,14 @@ one piece. Everything else is open.
 ## 4. Existing pages (where the code is today)
 
 The dashboard is a hash-routed SPA served by the `__admin__`
-tenant at `app.<public_suffix>/`. The replay shells are served by
-the `__replay__` tenant at `replay.<public_suffix>/{,/wasm}` and
-receive their bundle via `postMessage` from the dashboard tab.
-Source: `web/admin/` and `web/replay/`.
+tenant at `app.<public_suffix>/`. The replay shell is served by
+the `__replay__` tenant at `replay.<public_suffix>/` and receives
+its bundle via `postMessage` from the dashboard tab.
+Source: `web/admin/_static/` and `web/replay/_static/`.
 
 ### 4.1 `#/login` — login / signup
 
-File: `web/admin/pages/login.js`
+File: `web/admin/_static/pages/login.js`
 
 Two-mode landing:
 
@@ -123,7 +127,7 @@ seconds" guarantee. The two-mode toggle pattern can change.
 
 ### 4.2 `#/instances` — instance list + admin actions
 
-File: `web/admin/pages/instances.js`
+File: `web/admin/_static/pages/instances.js`
 
 What's there:
 
@@ -137,7 +141,7 @@ What it doesn't yet have but should: live status per instance
 
 ### 4.3 `#/instance/<id>` — per-instance dashboard
 
-File: `web/admin/pages/instance.js`. Three tabs:
+File: `web/admin/_static/pages/instance.js`. Three tabs:
 
 #### 4.3.1 Logs tab
 
@@ -146,8 +150,7 @@ Recent request log, newest-first. Each row:
 | time (rel) | dep_id | method | path | status | duration | outcome | actions |
 
 Actions per row:
-- **Replay** — opens the iframe DevTools debugger in a new tab.
-- **⚙ (replay-wasm)** — opens the WASM scrubber.
+- **Replay** — opens the WASM scrubber in a new tab.
 - **⎘** — copy request id.
 
 Row click opens a side drawer with the full record JSON, console
@@ -187,31 +190,25 @@ content-addressed and reachable forever via files-server's
 `/<inst>/deployments/<hex>`), a static-asset uploader for the
 `_static/*` paths.
 
-### 4.4 Replay shells
+### 4.4 Replay shell
 
-Two share the same `replay.<suffix>` tenant; different entry paths.
+The replay shell lives at `replay.<suffix>/` under the `__replay__`
+tenant.
 
-#### 4.4.1 `/` — iframe debugger
+#### 4.4.1 `/` — WASM scrubber
 
-File: `web/replay/app.js`. Boots the captured handler in a sandboxed
-iframe with stubbed Loop46 globals (kv, Date, Math, crypto), drops
-a `debugger;` statement so the browser's DevTools is the stepper.
-Works today but the UI is hostage to whatever the browser provides.
+Files: `web/replay/_static/index.html` + `web/replay/_static/wasm-app.mjs`
++ `web/replay/_static/rtap.mjs` + `web/replay/_static/cursor.mjs`
+(CursorEngine) + `web/replay/_static/qjs_arena_wasm.{js,wasm}`.
+Boots arenajs compiled to WebAssembly and runs the captured handler
+through the SAME engine that ran it in production. The runtime
+exposes a trace stream (`FUNC_ENTER` / `FUNC_EXIT` / `LINE` /
+`THROW`) and a stack walker (`host_state` returns frame snapshots
+with args / locals / closure-referenced vars). The page renders a
+call-tree timeline (left rail = modules, middle = timeline, right =
+output) with source view, variable panel, and stepping controls.
 
-#### 4.4.2 `/wasm` — WASM scrubber (in progress)
-
-Files: `web/replay/wasm.html` + `wasm-app.mjs` + `rtap.mjs` +
-`qjs_arena_wasm.{js,wasm}`. Boots arenajs compiled to WebAssembly
-and runs the captured handler through the SAME engine that ran it
-in production. The runtime exposes a trace stream
-(`FUNC_ENTER` / `FUNC_EXIT` / `LINE` / `THROW`) and a stack walker
-(`host_state` returns frame snapshots with args / locals /
-closure-referenced vars). Today the page renders a call-tree
-timeline (left rail = modules, middle = timeline, right = output).
-
-What's not built yet (these are the design opportunities — see
-[`replay-wasm-plan.md`](replay-wasm-plan.md) §8 for the
-implementation-side roadmap):
+**Landed** (design can treat as present):
 
 - **Source view** — third column showing `bundle.modules[entry].source`
   with line numbers, syntax highlighting; current-line cursor that
@@ -222,10 +219,15 @@ implementation-side roadmap):
 - **Drill toggle** — switch between SCAN mode (function-level
   timeline) and DRILL mode (per-line). The data is the same wire
   format; UI just renders denser.
-- **Breakpoints** — gutter clicks on source lines; the next replay
-  rerun stops there.
 - **Stepping** — step-into / step-over / step-out; works by
   re-running from start with a different stop predicate.
+
+**Still open** (design opportunities — see
+[`replay-wasm-plan.md`](replay-wasm-plan.md) §8 for the
+implementation-side roadmap):
+
+- **Breakpoints** — gutter clicks on source lines; the next replay
+  rerun stops there.
 - **Side-effect inspector** — visualize every `webhook.send` /
   `email.send` / `events.emit` the handler queued, since this is
   the differentiator (these never executed inline; they're listed
@@ -240,14 +242,14 @@ beyond the minimum data shape listed.
 
 ### 5.1 Marketing site at the apex
 
-`loop46.com` is for marketing only — no auth, no API. It needs:
+`rewindjs.com` is for marketing only — no auth, no API. It needs:
 
 - A hero that conveys "purely functional serverless" + "step
   through your production requests" without sounding like every
   other serverless landing page.
 - A live `<iframe>` showing the WASM scrubber stepping through a
   canned sample request. This is the "show, don't tell" pitch.
-- A signup CTA that drops the user into `app.loop46.com/#/login`
+- A signup CTA that drops the user into `app.rewindjs.com/#/login`
   in signup mode.
 - Pricing — a section is fine, real pricing TBD.
 - Docs link to a dedicated docs site or a `/docs` subpath.
@@ -256,9 +258,9 @@ beyond the minimum data shape listed.
 
 After magic-link redemption, the user lands at `#/instances`. The
 better landing is a guided one-shot: "your API is at
-`{name}.loop46.me/`, here's the starter code, click 'open in code
-editor' to start editing." Possibly inline with `#/instances` for
-returning users.
+`{name}.rewindjs.app/`, here's the starter code, click 'open in
+code editor' to start editing." Possibly inline with `#/instances`
+for returning users.
 
 ### 5.3 Domains page
 
@@ -268,7 +270,7 @@ domain". For users with multiple custom domains, a separate
 better:
 
 - All registered domain aliases for an instance.
-- Wildcard suffix (`{id}.loop46.me`) shown as the always-on
+- Wildcard suffix (`{id}.rewindjs.app`) shown as the always-on
   default.
 - "Add domain" + cert / DNS hints.
 
@@ -292,7 +294,7 @@ This is a UI flag on the existing KV tab, not a new storage shape.
 
 ### 5.5 Scheduled tasks / cron
 
-Loop46 has a `schedule.upsert(id, when, payload)` primitive. There's
+rewind.js has a `schedule.upsert(id, when, payload)` primitive. There's
 no UI today. What it should show:
 
 - Active schedules (id, next-fire, cron expression if any, target
@@ -326,8 +328,9 @@ the provider (Resend), bounce reason if any.
 
 ### 5.8 Live event stream / SSE preview
 
-The platform mints a `_rove_sess` cookie for every browser hitting
-a tenant; `events.emit(session_id, event)` pushes to that session.
+The platform mints a `__Host-rove_sid` cookie for every browser
+hitting a tenant; `events.emit(session_id, event)` pushes to that
+session.
 The dashboard could expose a "tail the live event stream for this
 instance" mode — useful when building real-time features.
 
@@ -476,8 +479,9 @@ explicitly in the mockup notes and the rove side will follow up.
 
 If you want a list of next deliverables in priority order:
 
-1. **Replay-WASM source view + variable panel** (4.4.2). The whole
-   product pitch lives here. Get this right and the rest follows.
+1. **Replay-WASM side-effect inspector + breakpoints** (4.4.1). The
+   remaining open items; source view + variable panel + stepping are
+   landed. Get these right and the pitch is complete.
 2. **Logs tab visual refresh** (4.3.1) — the page the most
    customer time is spent on; sparkline + filter chips would land
    well.

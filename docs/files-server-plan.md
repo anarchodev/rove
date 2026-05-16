@@ -19,7 +19,7 @@ state that lives in S3.
 Stated end state:
 
 - **Customer pushes code to a separate subdomain** (e.g.
-  `files.{public_suffix}` or `api.loop46.com/files/...`). Worker
+  `files.{public_suffix}` or `api.rewindjs.com/files/...`). Worker
   doesn't see those requests; doesn't know files-server's address.
 - **Manifest lives in S3**, not per-node SQLite. Files-server writes
   it; worker reads it. Raft envelope type 3 goes away.
@@ -27,7 +27,7 @@ Stated end state:
   `BLOB_BACKEND=s3`). Worker reads on cache miss.
 - **Deploy and release are separate steps.** Files-server writing a
   new manifest to S3 is the *deploy*. Activating it on workers is the
-  *release* — an explicit `_deploy/active = {target_dep_id}` write
+  *release* — an explicit `_deploy/current = {target_dep_id}` write
   through the customer's kv that rides existing raft replication.
   Workers observe the marker via the same writeset-scan path SSE
   uses (`markDirtyFromWriteset`), load the new manifest + bytecodes
@@ -52,7 +52,6 @@ Stated end state:
                                     │ - QuickJS compile│
                                     │ - SHA + PUT blob │
                                     │ - PUT manifest   │
-                                    │ - swap `current` │
                                     └────────┬─────────┘
                                              │ S3 PUTs
                                              ▼
@@ -62,25 +61,25 @@ Stated end state:
                   │   tenants/{id}/deployments/{dep_id}.json    │
                   └─────────────────────────────────────────────┘
                                              ▲
-                                             │ GET (on release marker)
+                                             │ GET (on release signal)
                                              │ manifest + new blobs
                                              │
                                     ┌────────┴─────────┐
                                     │     worker       │       ┌──────────────┐
                                     │ (per-tenant      │◀──────│ raft apply   │
                                     │  TenantFiles     │ kv    │ envelope 0   │
-                                    │  with active +   │ marker│ (the release │
-                                    │  pending pointers│       │  signal)     │
+                                    │  with active +   │ marker│ (_deploy/    │
+                                    │  pending pointers│       │  current)    │
                                     │  no files.db,    │       └──────────────┘
                                     │  no proxy)       │              ▲
                                     └────────┬─────────┘              │
-                                             │ HTTPS                  │ kv.put
-                                             ▼                        │ _deploy/active
-                                    ┌─────────────────┐               │
+                                             │ HTTPS                  │ kv write via
+                                             ▼                        │ POST /_system/
+                                    ┌─────────────────┐               │ release
                                     │ end-user browser│       ┌───────┴──────┐
-                                    └─────────────────┘       │ admin call   │
-                                                              │ POST .../_   │
-                                                              │ admin/release│
+                                    └─────────────────┘       │ dashboard/   │
+                                                              │ CLI release  │
+                                                              │ call         │
                                                               └──────────────┘
 ```
 
@@ -89,7 +88,7 @@ worker↔files-server RPC:
 
 1. **S3** carries the bytes (blobs, manifests). Files-server writes;
    worker reads.
-2. **Raft kv** carries the release signal (`_deploy/active`). The
+2. **Raft kv** carries the release signal (`_deploy/current`). The
    admin call writes; the worker observes via the same
    writeset-scan path SSE uses.
 
@@ -105,9 +104,9 @@ Customer / CLI hits files-server at a dedicated origin. Two reasonable
 choices:
 
 - **`files.{public_suffix}`** — symmetric with the existing pattern
-  (`app.loop46.me`, `replay.loop46.me`). Same TLS cert (wildcard or
-  per-host). Files-server terminates TLS itself; no worker hairpin.
-- **`api.loop46.com/v1/files/...`** — share a `api.` host with other
+  (`app.rewindjs.com`, `replay.rewindjs.com`). Same TLS cert (wildcard
+  or per-host). Files-server terminates TLS itself; no worker hairpin.
+- **`api.rewindjs.com/v1/files/...`** — share a `api.` host with other
   control-plane endpoints later. More routing logic on the api host
   (path-based dispatch); needs an api-router that's not yet built.
 
@@ -186,61 +185,75 @@ max+1 of the new listing. Bounded retry loop; in practice rare.
 This replaces today's `expected_parent_id` CAS that runs against
 `files.db`.
 
-### 3.5 `_deploy/active` kv marker (the release signal)
+### 3.5 `_deploy/current` kv marker (the release signal)
 
 The runtime "what should the workers run" pointer is a single key in
 the customer's `app.db`:
 
 ```
-key:   _deploy/active
+key:   _deploy/current
 value: {"v": 1, "target_deployment_id": 42, "set_at_ms": 1730764800000}
 ```
 
 - Reserved-prefix `_deploy/` (added to `reserved.zig` alongside
   `_events/`, `_outbox/`, etc.). Customer JS cannot write it.
-- Written by the admin handler in response to a `POST .../_admin/release`
-  call. Replicates through raft envelope type 0 (the standard
-  customer kv writeset) — same machinery as every other kv write.
-- Workers observe new values via `markDirtyFromWriteset`-style scans
-  on the post-commit hook (existing pattern from SSE).
+- Written by the worker's `/_system/release` system route (accepts
+  `{"tenant_id": "...", "dep_id": N}`; root-bearer or cookie auth).
+  The route commits `_deploy/current` locally and proposes it via
+  envelope 0 (the standard kv writeset path) so every follower's
+  apply path picks it up. The process-wide `ReleaseTable` carries
+  the signal across all worker threads; `applyPendingReleases` scans
+  the table on each dispatch tick and triggers bytecode reloads.
+- The apply path picks up `_deploy/current` via
+  `scanWriteSetPutValue(env.payload, "_deploy/current")` into the
+  `ReleaseTable`; `applyPendingReleases` handles the actual reload.
+- Files-server does NOT touch this key. The release is a separate,
+  explicit step performed by the dashboard or CLI, via
+  `POST /_system/release` on the worker.
 - "Target" semantics: the value names the deployment_id the worker
   *should* be running. The worker's TenantFiles tracks what it's
-  *currently* running (`active.deployment_id`). When target ≠ active,
-  a load is in flight or queued.
+  *currently* running (`current_deployment_id`). When target ≠
+  current, the reload is triggered on the next dispatch tick.
 
-The marker IS the source of truth at runtime. `latest.json` is
-informational. Most of the time they match (deploy → release
-immediately); they can intentionally diverge for "uploaded but not
-released" workflows (canary deploys, scheduled rollouts).
+The marker IS the source of truth at runtime. Most of the time the
+dashboard/CLI does deploy → release immediately in sequence; they
+can intentionally diverge for "uploaded but not released" workflows
+(canary deploys, scheduled rollouts).
 
 ---
 
 ## 4. Worker load path
 
-### 4.1 Trigger: marker observation, not polling
+### 4.1 Trigger: push-from-dashboard/CLI via `/_system/release`
 
-Workers do not poll S3. The trigger to load a new deployment is an
-observed change to `_deploy/active` in the tenant's kv. The
-observation path is a post-commit writeset scan
-(`markDirtyFromWriteset`) — the same machinery the v1 SSE pump
-used before sse-plan.md moved SSE state out of the worker. After
-SSE detaches, the deploy-marker observer is the only remaining
-consumer of this scan path:
+Workers do not poll S3. The trigger to load a new deployment is a
+`POST /_system/release {"tenant_id": "...", "dep_id": N}` call
+from the dashboard or CLI, after a successful deploy to files-server.
+
+Shipped release path:
 
 ```
-1. customer admin writes _deploy/active = {target: 42}  (via admin handler)
-2. writeset commits locally + proposes through raft
-3. worker (every node, every worker thread): post-commit hook
-   scans the just-committed writeset for keys under `_deploy/`
-4. if `_deploy/active` is in the set, parse the value, compare
-   target_deployment_id against TenantFiles.active.deployment_id
-5. if different and no matching pending load: kick off async load
+1. dashboard/CLI calls POST /_system/release {tenant_id, dep_id}
+   (root-bearer or cookie auth; any worker node accepts it)
+2. worker's /_system/release handler writes _deploy/current into
+   the tenant's app.db and proposes it via envelope 0 through raft
+3. apply path: scanWriteSetPutValue(env.payload, "_deploy/current")
+   populates the process-wide ReleaseTable (mutex-guarded map of
+   tenant_id → dep_id)
+4. every worker's dispatch tick calls applyPendingReleases, which
+   walks tenant_files_map, looks up the ReleaseTable, and reloads
+   bytecodes for any tenant whose released id advanced past the
+   cached current_deployment_id
+5. cold-load on first request to a fresh tenant: lazy-open hits
+   _deploy/current from inst.kv; Worker.create eagerly loads the
+   latest deployment on startup
 ```
 
-The hook is a 5-line scan; adds nothing measurable to commit latency.
-Quiet tenants impose zero S3 cost (no kv writes → no scan → no
-load). Active tenants only do S3 work when a release actually
-happens.
+Multi-worker propagation comes free via the shared `ReleaseTable`
+(every worker thread reads the same table on every tick). Cold
+starts and follower nodes recover the active deployment from
+`_deploy/current` in the raft-replicated kv without contacting
+files-server or polling S3.
 
 ### 4.2 Async load + atomic pointer swap
 
@@ -335,6 +348,17 @@ deployment keeps serving regardless.
 
 ### 4.5 Parking requests during a cold load
 
+> **Not implemented — superseded by the push model.** The
+> `pending_deploy_load: StreamColl` parking collection and
+> `deploy_load_timeout_ns` config described below were planned but
+> not shipped. Cold-load is handled by lazy `getOrOpenTenantFiles`
+> (which reads `_deploy/current` from kv and loads bytecodes
+> synchronously on the first request) and by `Worker.create`'s
+> eager load of the latest deployment at startup.
+> `applyPendingReleases` handles all subsequent release reloads on
+> each dispatch tick. The description below is preserved for
+> historical reference.
+
 A request that arrives while its tenant's `active` manifest is null
 (first request after worker boot, before the load completes) needs
 to wait. This is the same parking-collection pattern the worker
@@ -383,7 +407,7 @@ microseconds).
 ### 4.6 Cold start
 
 Worker startup does **zero** S3 work for files. The kv markers
-(`_deploy/active`) live in each tenant's `app.db`, which is replicated
+(`_deploy/current`) live in each tenant's `app.db`, which is replicated
 through raft — a fresh node joining the cluster gets every tenant's
 marker via raft state transfer; a hot restart re-opens the local
 stores with markers already present. TenantFiles is opened lazily on
@@ -391,16 +415,16 @@ the first request per tenant (existing `getOrOpenTenantFiles`
 pattern); on that open, the worker reads the in-memory marker, kicks
 off the load, and parks the request per §4.5.
 
-If a tenant has never had a release call (`_deploy/active` absent),
+If a tenant has never had a release call (`_deploy/current` absent),
 the worker returns 503 "no deployment yet" — the existing behavior
 for fresh tenants. There is no cold-start fallback to S3 listing;
 the kv marker is the only runtime pointer.
 
 Disaster recovery (kv lost but S3 intact) is handled by a separate
-one-shot `loop46 reconcile-kv-from-s3` tool that walks
-`tenants/*/deployments/`, picks the highest `dep_id` per tenant, and
-writes the kv marker. Run once on recovery, not in the steady-state
-boot path.
+one-shot `loop46 reconcile-kv-from-s3` tool (not implemented) that
+walks `tenants/*/deployments/`, picks the highest `dep_id` per
+tenant, and writes the kv marker. Run once on recovery, not in the
+steady-state boot path.
 
 ### 4.7 Bytecode cache hit rate
 
@@ -436,20 +460,18 @@ the fetch list small. A typical release loads only 1-3 new blobs.
 - Source-hashes map for tape replay.
 - **New:** `TenantFiles.{active, pending}` pointer pair for the
   atomic-swap model.
-- **New:** `markDirtyFromWriteset` extension that scans the
-  committed writeset for `_deploy/active` keys. (`_events/` scan
-  in this same path is being removed by `docs/sse-plan.md` —
-  worker no longer mediates SSE writes — so by the time
-  files-server detach lands, the only consumer of the writeset
-  scan is the deploy-marker observer.)
+- **New (shipped):** process-wide `ReleaseTable` (mutex-guarded
+  `StringHashMapUnmanaged(u64)`) written by `/_system/release` and
+  read by `applyPendingReleases` on each dispatch tick.
+  `scanWriteSetPutValue(env.payload, "_deploy/current")` in the
+  apply path populates it from raft-replicated envelope 0 writes.
 - **New:** Per-worker loader (one-shot threads or small pool) for
   async manifest + bytecode fetches.
-- **New:** `pending_deploy_load: StreamColl` — parking collection
-  for requests that arrived during a cold load (§4.5). Same shape
-  and lifecycle as `raft_pending`.
-- **New:** `deploy_load_timeout_ns` config (mirror of
-  `commit_wait_timeout_ns`, default 5s) for parked-request
-  expiration.
+- **Not implemented:** `pending_deploy_load: StreamColl` — parking
+  collection for cold-load requests (§4.5 — superseded by push
+  model; see §4.5 note).
+- **Not implemented:** `deploy_load_timeout_ns` config (§4.5 —
+  superseded).
 
 The shape of `TenantFiles` changes more than it shrinks.
 
@@ -560,8 +582,9 @@ are unchanged.
 Files-server returns the new `deployment_id` to the caller. **It does
 NOT touch the kv release marker.** The release is a separate,
 explicit step performed by the caller (admin UI, CI tool, or an
-automated post-deploy hook), via `POST {tenant}/_admin/release` —
-which is just a kv write through the customer's admin handler.
+automated post-deploy hook), via `POST /_system/release` on the
+worker — which writes `_deploy/current` and proposes it via envelope
+0 through raft (see §3.5).
 
 This split is intentional. Deploy and release have different
 authorization boundaries (deploy = "I can write code for this
@@ -619,7 +642,7 @@ performed directly against S3 + the root kv:
 2. build manifest JSON referencing the hashes
 3. PUT tenants/__admin__/deployments/00000000000000000001.json
    with If-None-Match: * (skip if already exists)
-4. write _deploy/active = {target: 1} into __admin__'s app.db
+4. write _deploy/current = {target: 1} into __admin__'s app.db
    (this rides through the regular kv path so workers observe it)
 ```
 
@@ -668,6 +691,13 @@ proxy module if no other subsystem remains using it.
 ---
 
 ## 9. Migration order
+
+> **Historical/superseded** — the dual-write
+> (`files.manifest_backend` / `files.read_from` flags) phased
+> rollout described below was not the path taken; the cutover
+> shipped with no parallel-write or back-compat fallback. See the
+> Phase 5.5 rollout doc (F1/F2-push/F2-storage entries) for the
+> actual sequence used.
 
 Same staging philosophy as `logs-plan.md`: each step shippable +
 smoke-testable on its own.
@@ -789,7 +819,7 @@ captures the post-1.0 detach work originally drafted in PLAN §10.13 +
 ### 11.1 Integration shape — webhook-call from admin's JS handler
 
 `rove-files-server` (and `rove-log-server`) stop being in-process
-worker threads and become **external HTTP services that loop46
+worker threads and become **external HTTP services that rewind.js
 integrates with the same way it integrates with Resend or Stripe**.
 Admin's JS handler calls them via `webhook.send`, receives results
 via the existing callback dispatch (`_callback/*` rows +
@@ -797,14 +827,14 @@ via the existing callback dispatch (`_callback/*` rows +
 via SSE (PLAN §2.12). The dashboard never talks to files-server
 directly — admin's JS is the integration seam.
 
-Earlier sketches treated files-server / log-server as Loop46 tenants
-with their own deployed handlers. Wrong shape — they have their own
-storage layer, their own data model, no need for QJS or the
+Earlier sketches treated files-server / log-server as rewind.js
+tenants with their own deployed handlers. Wrong shape — they have
+their own storage layer, their own data model, no need for QJS or the
 per-tenant kv-undo machinery. Treating them as third-party HTTP
-services preserves Loop46's purely-functional handler model AND
+services preserves rewind.js's purely-functional handler model AND
 keeps files-server / log-server as **standalone, swappable HTTP
 servers**: an operator can replace them with S3 + a managed log
-aggregator without touching loop46.
+aggregator without touching the loop46 binary.
 
 ### 11.2 What deletes from the worker
 
@@ -857,7 +887,7 @@ to confirmed result, even on 50-file bulk operations.
 ### 11.4 Editor bearer-auth flow
 
 The cookie-to-bearer flow only makes sense for clients that *have*
-a Loop46 cookie session — i.e., the dashboard. Stripe / GitHub /
+a rewind.js cookie session — i.e., the dashboard. Stripe / GitHub /
 AWS don't have access to that cookie; customer integrations with
 them use the kv-stored-keys + arbitrary-headers + crypto-signing
 toolkit (PLAN §10.14). The two paths are orthogonal and don't

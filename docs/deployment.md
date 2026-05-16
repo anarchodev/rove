@@ -1,6 +1,11 @@
 # Deployment runbook
 
-Production Loop46 is four processes per host. This document covers
+> Domains shown below are the rewind.js production names
+> (`*.rewindjs.app` customer tenants; `*.rewindjs.com` system surfaces).
+> The actual values are operator-set via `PUBLIC_SUFFIX` /
+> `ADMIN_API_DOMAIN`, not baked into the binary.
+
+Production rewind.js is four processes per host. This document covers
 installation, env wiring, service order, and common operational checks.
 For the architecture rationale, see [`PLAN.md`](PLAN.md) §13 (live
 process / surface map).
@@ -14,17 +19,19 @@ process / surface map).
 | `log-server-standalone` | `:8445` (h2 + TLS) | Per-tenant request log query |
 | `sse-server-standalone` | `:8446` (h2 + TLS) | SSE fan-out from worker emits |
 
-The wildcard cert (`*.loop46.me`) covers all four — each one terminates
-TLS in-process. They share `LOOP46_SERVICES_JWT_SECRET` for service-to-
-service auth (worker mints JWTs at `/_system/services-token`; the three
-standalones verify every request). The worker proposes raft entries
-that the standalones consume; the standalones don't talk to each other.
+The wildcard cert (`*.rewindjs.com`) covers all four — each one
+terminates TLS in-process. They share `LOOP46_SERVICES_JWT_SECRET` for
+service-to-service auth (worker mints JWTs at `/_system/services-token`;
+the three standalones verify every request). The worker proposes raft
+entries that the standalones consume; the standalones don't talk to each
+other.
 
 ## Prerequisites
 
 1. **DNS A records** point at the host(s):
-   - `loop46.me`
-   - `*.loop46.me` (wildcard for customer tenants + `app.` + `files.` + `logs.` + `sse.`)
+   - `rewindjs.com`
+   - `*.rewindjs.com` (wildcard for system surfaces: `app.` + `files.` + `logs.` + `sse.`)
+   - `*.rewindjs.app` (wildcard for customer tenants)
 
 2. **TLS cert** — `scripts/rove-lego-renew.sh` issues a wildcard cert
    via ACME DNS-01. The systemd timer at `scripts/systemd/rove-cert-renew.timer`
@@ -116,7 +123,7 @@ LOOP46_SERVICES_JWT_SECRET=<64 hex chars>
 BLOB_BACKEND=s3
 S3_ENDPOINT=s3.us-east-1.amazonaws.com
 S3_REGION=us-east-1
-S3_BUCKET=loop46-prod
+S3_BUCKET=rewindjs-prod
 S3_USE_TLS=true
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
@@ -132,8 +139,8 @@ FILES_LISTEN=127.0.0.1:8444
 DATA_DIR=/home/<user>/.rove/data
 TLS_CERT=/home/<user>/.rove/tls/cert.pem
 TLS_KEY=/home/<user>/.rove/tls/key.pem
-ADMIN_ORIGIN=https://app.loop46.me
-LEADER_URL=https://app.loop46.me
+ADMIN_ORIGIN=https://app.rewindjs.com
+LEADER_URL=https://app.rewindjs.com
 ```
 
 ### `log-server.env`
@@ -143,7 +150,7 @@ LOG_LISTEN=127.0.0.1:8445
 DATA_DIR=/home/<user>/.rove/data
 TLS_CERT=/home/<user>/.rove/tls/cert.pem
 TLS_KEY=/home/<user>/.rove/tls/key.pem
-ADMIN_ORIGIN=https://app.loop46.me
+ADMIN_ORIGIN=https://app.rewindjs.com
 LOG_S3_KEY_PREFIX=logs/
 LOG_POLL_INTERVAL_MS=500
 ```
@@ -173,16 +180,16 @@ DATA_DIR=/home/<user>/.rove/data
 TLS_CERT=/home/<user>/.rove/tls/cert.pem
 TLS_KEY=/home/<user>/.rove/tls/key.pem
 
-PUBLIC_SUFFIX=loop46.me
-ADMIN_API_DOMAIN=app.loop46.me
-ADMIN_ORIGIN=https://app.loop46.me
+PUBLIC_SUFFIX=rewindjs.app
+ADMIN_API_DOMAIN=app.rewindjs.com
+ADMIN_ORIGIN=https://app.rewindjs.com
 
 # The worker tells the dashboard which standalone to hit for files,
 # logs, and SSE. These are the public origins clients connect to —
 # typically the public DNS name + port of each standalone.
-FILES_PUBLIC_BASE=https://files.loop46.me:8444
-LOG_PUBLIC_BASE=https://logs.loop46.me:8445
-SSE_PUBLIC_BASE=https://sse.loop46.me:8446
+FILES_PUBLIC_BASE=https://files.rewindjs.com:8444
+LOG_PUBLIC_BASE=https://logs.rewindjs.com:8445
+SSE_PUBLIC_BASE=https://sse.rewindjs.com:8446
 
 WORKERS=0          # 0 → nCPU - 1
 LOOP46_ROOT_TOKEN=<64 hex chars>   # bearer for /_system/* + login
@@ -233,9 +240,10 @@ quorum). On each host:
 - Every host runs all four services. The standalones are not raft
   members; they're per-host helpers that read shared S3 state.
 
-DNS for `app.` / `files.` / `logs.` / `sse.` should round-robin across
-all three hosts, OR a load balancer should fan out (preferred — handles
-node failure transparently).
+DNS for `app.rewindjs.com` / `files.rewindjs.com` / `logs.rewindjs.com`
+/ `sse.rewindjs.com` should round-robin across all three hosts, OR a
+load balancer should fan out (preferred — handles node failure
+transparently).
 
 A non-voting **learner** can replace one voter for disaster-recovery
 shape (full state, no quorum vote). Add `--node-learner` to the
@@ -257,10 +265,10 @@ cluster-membership semantics, just "this process is responsive."
 | `sse-server-standalone` | `/v1/health` |
 
 ```bash
-curl -sk https://app.loop46.me/_system/health     # → 200 ok
-curl -sk https://files.loop46.me:8444/v1/health   # → 200 ok
-curl -sk https://logs.loop46.me:8445/v1/health    # → 200 ok
-curl -sk https://sse.loop46.me:8446/v1/health     # → 200 ok
+curl -sk https://app.rewindjs.com/_system/health     # → 200 ok
+curl -sk https://files.rewindjs.com:8444/v1/health   # → 200 ok
+curl -sk https://logs.rewindjs.com:8445/v1/health    # → 200 ok
+curl -sk https://sse.rewindjs.com:8446/v1/health     # → 200 ok
 ```
 
 For leader-aware probes (e.g., to route writes), use
@@ -271,9 +279,10 @@ requires admin bearer or services-JWT.
 **Metrics.** The worker exposes Prometheus-text counters at
 `/_system/metrics` (root-token gated). Today's surface includes the
 io_uring buffer pool conservation pair, the h2 collection depths,
-and `raft_is_leader`. Scrape from your Prometheus / Datadog agent.
-The three standalones don't yet emit metrics — slot when alerting
-needs surface for them.
+and `raft_is_leader`, plus kvexp engine counters and two
+kvexp_*_duration_seconds histograms (kvexp cutover). Scrape from your
+Prometheus / Datadog agent. The three standalones don't yet emit
+metrics — slot when alerting needs surface for them.
 
 **Recommended alerts:**
 - `/v1/health` (or `/_system/health`) returns non-200 for ≥30s → page.
@@ -286,14 +295,14 @@ needs surface for them.
 
 ```bash
 # Quick acceptance check, no auth required:
-curl -sk https://app.loop46.me/_system/health         # → 200 ok
-curl -sk https://files.loop46.me:8444/v1/health       # → 200 ok
-curl -sk https://logs.loop46.me:8445/v1/health        # → 200 ok
-curl -sk https://sse.loop46.me:8446/v1/health         # → 200 ok
+curl -sk https://app.rewindjs.com/_system/health         # → 200 ok
+curl -sk https://files.rewindjs.com:8444/v1/health       # → 200 ok
+curl -sk https://logs.rewindjs.com:8445/v1/health        # → 200 ok
+curl -sk https://sse.rewindjs.com:8446/v1/health         # → 200 ok
 
 # Cluster has a leader:
 for h in 10.0.1.10 10.0.1.11 10.0.1.12; do
-    curl -sk https://$h:443/_system/leader -H "Host: app.loop46.me"
+    curl -sk https://$h:443/_system/leader -H "Host: app.rewindjs.com"
 done
 # Exactly one host should return 200, the others 503.
 
@@ -384,7 +393,7 @@ Configure the bucket's lifecycle policy to expire old keys under
 ```json
 {
   "Rules": [{
-    "ID": "loop46-snapshot-retention",
+    "ID": "rewindjs-snapshot-retention",
     "Status": "Enabled",
     "Filter": { "Prefix": "cluster/snapshots/" },
     "Expiration": { "Days": 30 }
@@ -396,7 +405,7 @@ Apply with:
 
 ```bash
 aws s3api put-bucket-lifecycle-configuration \
-    --bucket loop46-prod \
+    --bucket rewindjs-prod \
     --lifecycle-configuration file://lifecycle.json
 ```
 

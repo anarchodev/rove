@@ -8,7 +8,7 @@ Implements [`docs/PLAN.md`](PLAN.md) §10.7 (simulator primitive) and §10.8 (si
 
 **No dependencies on other Phase 12+ work.** Builds on tape capture (already done) + h2 dispatch (Phase 1, done). Independently shippable.
 
-**Public-contract note**: once Phase 12 ships, the **bundle JSON shape** (`src/tape/bundle.zig`) and the **tape blob format** (`src/tape/root.zig`) become external contracts — consumed by the CLI sim, the launch-path browser-replay page on `replay.loop46.me`, and the launch-path DAP-attach CLI (`loop46 replay <id>`) per PLAN.md §10.12. Changes to either are coordination points across the test runner, the export-fixture tool, the dashboard, and both replay paths. Treat them as versioned interfaces from the start (T4's `replay_available` flag exists partly for forward-compat signaling).
+**Public-contract note**: once Phase 12 ships, the **bundle JSON shape** (`src/tape/bundle.zig`) and the **tape blob format** (`src/tape/root.zig`) become external contracts — consumed by the CLI sim, the launch-path browser-replay page on `replay.rewindjs.com`, and the launch-path DAP-attach CLI (`loop46 replay <id>`) per PLAN.md §10.12. Changes to either are coordination points across the test runner, the export-fixture tool, the dashboard, and both replay paths. Treat them as versioned interfaces from the start (T4's `replay_available` flag exists partly for forward-compat signaling).
 
 ## What already exists
 
@@ -24,7 +24,7 @@ Implements [`docs/PLAN.md`](PLAN.md) §10.7 (simulator primitive) and §10.8 (si
 
 ### T1. Bundle module extraction
 
-Move `runBundle` and friends out of `examples/log_cli.zig` into `src/tape/bundle.zig`. CLI keeps a thin wrapper. The simulator library and the test runner both import the module.
+Move `runBundle` and friends out of `examples/log_cli.zig` into `src/tape/bundle.zig`. CLI keeps a thin wrapper. The simulator library and the test runner both import the module. (Note: `examples/log_cli.zig` no longer exists; bundle JSON now rides inline in the log-server ndjson record — adjust extraction target accordingly.)
 
 ### T2. Request body capture (new tape channel)
 

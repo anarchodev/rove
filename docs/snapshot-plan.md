@@ -4,8 +4,12 @@ This document expands `docs/PLAN.md` Phase 5.5 item 3 ("Raft snapshot
 + log compaction") into an implementable plan. It supersedes the
 delta-row snapshot wire protocol that exists in
 `src/kv/raft_snapshot.zig` today (which only fires meaningfully in
-`.kv` apply mode; loop46 uses `.opaque_bytes` mode where snapshots
-currently capture no application state).
+`.kv` apply mode; the loop46 binary uses `.opaque_bytes` mode where
+snapshots currently capture no application state).
+
+Note: post-kvexp-cutover loop46 uses `kv.Cluster`, not
+`RaftNode`+`ApplyCtx`; `raft_snapshot.zig` is no longer the loop46
+snapshot path.
 
 The motivating framing is the worker-kv-path north star: keep the
 worker fast, consistent, and uninterrupted. A snapshot strategy
@@ -24,11 +28,11 @@ Stated semantics:
 - **Snapshots transport via S3**, not over the raft RPC channel.
   Multi-follower parallelism, durable artifacts for disaster
   recovery, no GB-of-data through raft messages.
-- **Snapshot bytes are SQLite database files**, captured via SQLite's
-  Online Backup API or `VACUUM INTO`. Replaces the current row-level
-  delta protocol.
+- **Post-kvexp-cutover the snapshot unit is the single LMDB-backed
+  `cluster.kv` manifest shipped whole (commit d0a63ad).**
 - **`.opaque_bytes` apply mode is the target.** The existing `.kv`
-  mode delta protocol is left in place but is irrelevant for loop46.
+  mode delta protocol is left in place but is irrelevant for the
+  loop46 binary.
 
 ---
 
@@ -122,6 +126,10 @@ touch T. Declaring `snapshot_idx[T] = current` is just acknowledging
 
 ### 2.3 Why S3 transport
 
+Note: post-kvexp-cutover loop46 uses `kv.Cluster`, not
+`RaftNode`+`ApplyCtx`; `raft_snapshot.zig` is no longer the loop46
+snapshot path.
+
 The wire protocol in the existing `raft_snapshot.zig`
 (SNAP_OFFER/SNAP_REQ/SNAP_DATA) ships row-level deltas over the raft
 RPC channel — fine in `.kv` mode where rows have seqs and the kv
@@ -184,6 +192,7 @@ the prefix gives chronological history.
     "snapshot_idx": 105
   }
 }
+
 ```
 
 Notes:
@@ -228,9 +237,11 @@ bytes; a future janitor pass garbage-collects unreferenced files).
 ### 4.1 Trigger
 
 Periodic, e.g., every 10 minutes (configurable). The current
-`raft_snapshot.zig` has a 500ms interval — far too aggressive for
-file-shipping. 5-15 minutes is the right ballpark for the storage /
-recovery-time tradeoff.
+`raft_snapshot.zig` has a 500ms `SNAPSHOT_INTERVAL_NS` constant
+(constant still exists but is irrelevant — the periodic path is
+`cluster.tickSnapshot` driven by `--snapshot-interval-ms`) — far too
+aggressive for file-shipping. 5-15 minutes is the right ballpark for
+the storage / recovery-time tradeoff.
 
 Also triggered on-demand via an admin endpoint for "I want to take a
 snapshot right now before this risky deploy."
@@ -294,6 +305,9 @@ Key properties:
 
 ### 4.3 Capturing `last_apply_idx` per tenant
 
+ApplyCtx was removed in the kvexp cutover; the `_apply_state` stamp
+now lives in `src/kv/cluster.zig`.
+
 The apply loop already runs through `applyOne` in `apply.zig`. Add a
 per-tenant `last_apply_idx` map in `ApplyCtx`:
 
@@ -322,71 +336,25 @@ and their target stores are:
 |---|---|---|
 | 0 writeset | `{tenant}/app.db` | per-tenant `_apply_state` row |
 | 2 root_writeset | `__root__.db` | singleton `_apply_state` row in root.db |
-| 4 webhook_enqueue | `webhooks.db` | singleton `_apply_state` row in webhooks.db |
-| 5 webhook_complete | `webhooks.db` AND `{tenant}/app.db` (cross-db) | per-store check at apply time |
-| 6 webhook_retry_schedule | `webhooks.db` | singleton `_apply_state` row in webhooks.db |
+| 8 schedule_upsert | `schedules.db` | singleton `_apply_state` row in schedules.db |
+| 9 schedule_complete | `schedules.db` AND `{tenant}/app.db` (cross-db) | per-store check at apply time |
+| 10 schedule_cancel | `schedules.db` | singleton `_apply_state` row in schedules.db |
+| 11 schedule_demote | `schedules.db` | singleton `_apply_state` row in schedules.db |
 
 (Envelope types 1 `log_batch` and 3 `files_writeset` go away per
-`logs-plan.md` and `files-server-plan.md` respectively.)
+`logs-plan.md` and `files-server-plan.md` respectively. Envelope
+types 4 `webhook_enqueue`, 5 `webhook_complete`, and 6
+`webhook_retry_schedule` were retired 2026-05-09 — see
+`docs/http-send-plan.md`.)
 
-`webhooks.db` is the cluster-wide consolidated webhook state from
-`webhook-server-plan.md` — a new singleton store joining
-`__root__.db` in the snapshot model. The snapshot manifest gains a
-`webhooks_db` entry mirroring the `root_db` entry shape:
-
-```json
-{
-  "tenants": { ... },
-  "root_db": { "db_key": ..., "snapshot_idx": 105 },
-  "webhooks_db": { "db_key": ..., "snapshot_idx": 105 }
-}
-```
-
+`schedules.db` is the cluster-wide consolidated schedule state.
 The compaction floor is `min(snapshot_idx)` across all entries —
-tenants + root + webhooks. Always-refresh applies to webhooks_db
-the same way it does to a dormant tenant: if no envelope 4/5/6
-fired since the last pass, the manifest entry references the
-previous snapshot's file. In practice webhooks.db usually has
-activity per pass, so it'll be re-VACUUMed most snapshot intervals.
+tenants + root + schedules.
 
 ### 4.5 Cross-db apply for envelope 5
 
-Envelope 5 `webhook_complete` is the only envelope that touches more
-than one store. Apply-time semantics:
-
-```
-on apply(envelope_5, idx I):
-  payload = parse(envelope_5)
-  webhooks_db.last_applied = SELECT v FROM webhooks.db._apply_state ...
-  tenant_db.last_applied   = SELECT v FROM tenant_T.app.db._apply_state ...
-
-  BEGIN ATTACH-spanning transaction across webhooks.db + tenant T's app.db
-    if I > webhooks_db.last_applied:
-      DELETE FROM webhooks WHERE webhook_id = payload.webhook_id
-      UPDATE webhooks.db._apply_state SET v = I
-
-    if I > tenant_db.last_applied:
-      INSERT OR REPLACE INTO kv (key, value)
-        VALUES ('_callback/' || payload.webhook_id, serialize(payload.result))
-      DELETE FROM kv WHERE key = '_outbox/' || payload.webhook_id
-      UPDATE tenant T's app.db._apply_state SET v = I
-  COMMIT
-```
-
-The per-store check makes envelope 5 **splittable**: a follower
-loading a snapshot where the two stores are at different indices
-(because they were captured at different wall-clock moments during a
-non-pausing snapshot pass) does only the parts of envelope 5 that
-hadn't already been applied to each store. The kv operations are
-idempotent (`INSERT OR REPLACE`, `DELETE` is a no-op on missing
-rows), so even an over-apply is safe.
-
-This is the one piece of cross-db plumbing the snapshot model has to
-accommodate — flagged because it's where the per-store-snapshot-
-index property and the cross-db-atomic-apply property meet. The
-implementation is mechanical (per-target-store conditional inside
-the existing apply transaction); the correctness reasoning lives
-here.
+Superseded — see `docs/http-send-plan.md` for the `schedules.db`
+cross-db apply (envelopes 9/11).
 
 ---
 
@@ -395,7 +363,7 @@ here.
 ### 5.1 Apply state table
 
 Every raft-applied store (each `{tenant}/app.db`, `__root__.db`,
-and `webhooks.db`) gains a small bookkeeping table:
+and `schedules.db`) gains a small bookkeeping table:
 
 ```sql
 CREATE TABLE _apply_state (
@@ -409,9 +377,10 @@ Read on apply-loop startup. Updated inside every apply transaction
 (same SQLite tx as the writeset). The follower uses this to filter
 applies: "only apply entry I to store S if I > S.last_applied".
 
-For envelopes that target multiple stores (envelope 5; see §4.5),
-each target store's `_apply_state` is checked independently — the
-apply does only the parts that haven't been done yet.
+For envelopes that target multiple stores (envelope 9; see
+`docs/http-send-plan.md`), each target store's `_apply_state` is
+checked independently — the apply does only the parts that haven't
+been done yet.
 
 ### 5.2 Snapshot load flow
 
@@ -428,12 +397,10 @@ follower receives a SNAP_OFFER with snap_id (S3 path) from the leader:
        Open the new app.db, INSERT INTO _apply_state
          (k='last_applied_raft_idx', v=manifest.tenants[T].snapshot_idx)
   5. Same for __root__.db (using manifest.root_db).
-  6. Same for webhooks.db (using manifest.webhooks_db).
+  6. Same for schedules.db (using manifest.schedules_db).
   7. raft_begin_load_snapshot(willemt_term, willemt_compaction_floor)
      raft_end_load_snapshot()
   8. Resume the apply loop from (willemt_compaction_floor + 1).
-     Webhook-server (when it next opens webhooks.db) sees the
-     restored pending entries and resumes its delivery loop.
 ```
 
 ### 5.3 Apply rule (post-snapshot or steady-state)
@@ -503,25 +470,20 @@ operator error, restoring to a new region):
    - For each tenant: downloads db file, places in data_dir/{T}/app.db,
      populates _apply_state with snapshot_idx
    - Same for __root__.db
-   - Same for webhooks.db (cluster-wide consolidated webhook state)
+   - Same for schedules.db
    - Initializes willemt's raft state to the snapshot's term + floor
 5. Cluster is online at the snapshot's state.
 6. Subsequent followers join via normal SNAP_OFFER flow.
-7. Webhook-server starts up, opens the restored webhooks.db, sees
-   pending entries, resumes delivery.
 ```
 
 The on-disk state of any node IS recoverable from the most recent
 S3 snapshot plus any raft entries past the floor that haven't been
 ingested. With raft entries past floor lost (cluster-wide failure),
 the cluster is at the snapshot's point. Customers' kv state is
-"last snapshot." Webhook state survives via the restored
-webhooks.db; some in-flight deliveries may be re-attempted (the
-X-Rove-Webhook-Id idempotency contract handles dupes on the
-customer side). Per-tenant `_outbox/{id}` rows that were in
-limbo (worker handed off to webhook-server but envelope 5 hadn't
-fired yet) ride the snapshot; the drainer's safety-net pass
-re-POSTs them to webhook-server.
+"last snapshot." Schedule state survives via the restored
+schedules.db; some in-flight schedule callbacks may be re-attempted
+(idempotency is the customer's responsibility per the http.send
+contract).
 
 ### 6.3 Point-in-time recovery
 
@@ -539,14 +501,20 @@ past the snapshot's floor is discarded (operator confirms).
 
 ## 7. What gets removed
 
+Note: post-kvexp-cutover loop46 uses `kv.Cluster`, not
+`RaftNode`+`ApplyCtx`; `raft_snapshot.zig` is no longer the loop46
+snapshot path.
+
 After this lands:
 
 - The current `raft_snapshot.zig` delta-row protocol
   (`buildSnapData` / `applySnapData` / `kv.delta()`) becomes
-  irrelevant for `.opaque_bytes` mode (the only mode loop46 uses).
-  It can stay in place for any future `.kv`-mode user, but it's not
-  exercised by loop46.
-- The 500ms `SNAPSHOT_INTERVAL_NS` in `raft_snapshot.zig:31` —
+  irrelevant for `.opaque_bytes` mode (the only mode the loop46
+  binary uses). It can stay in place for any future `.kv`-mode user,
+  but it's not exercised by loop46.
+- The 500ms `SNAPSHOT_INTERVAL_NS` in `raft_snapshot.zig:31`
+  (constant still exists but is irrelevant — the periodic path is
+  `cluster.tickSnapshot` driven by `--snapshot-interval-ms`) —
   replaced by a longer interval (5-15 min) appropriate for file
   shipping.
 - The `kv_store.checkpoint()` call in `doSnapshot` — replaced by the
@@ -569,6 +537,10 @@ What's added:
 ## 8. Migration order
 
 Each step independently shippable + testable.
+
+Steps 1–7 (operator CLIs, follower load, `_apply_state` filter) are
+done. Only by-reference reuse for unchanged tenants and willemt
+log-compaction wiring remain deferred.
 
 1. **Add `_apply_state` table to KvStore schema** + the per-entry
    filter in `applyOne`. Default behavior unchanged because the table

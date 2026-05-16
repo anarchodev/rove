@@ -3,7 +3,7 @@
 > Design note for the consolidation discussed 2026-05-10 in
 > `docs/production.md` #1.0 + #1.4. Replaces the de facto
 > "one KvStore + one raft group" framing of `rove-kv` with
-> the abstraction Loop46 already uses in practice and that
+> the abstraction rewind.js already uses in practice and that
 > files-server will adopt as the second consumer.
 
 ## Motivation
@@ -11,17 +11,17 @@
 The original `rove-kv` framing was "kv store + raft group."
 Reality has diverged:
 
-- Loop46's leader runs **one** raft group servicing **N**
+- rewind.js's leader runs **one** raft group servicing **N**
   SQLite stores (per-tenant `app.db`, singleton
   `__root__.db`, singleton `schedules.db`). Routing between
-  them lives in `src/js/apply.zig` — leaking Loop46-specific
+  them lives in `src/js/apply.zig` — leaking rewind.js-specific
   mechanics into the rove-kv namespace.
 - files-server-standalone has **no** raft group today: it
   writes manifests to S3 with no replication, no consensus,
   no DR. Its bootstrap path takes 1012s to seed 10k tenants
   (one S3 PUT per tenant). Real production blocker.
 
-The library should expose what Loop46 already does — one
+The library should expose what rewind.js already does — one
 raft group, N stores, multi-envelope-per-entry atomicity —
 as a clean primitive that any application can build against.
 files-server is the second consumer; the two of them
@@ -54,9 +54,12 @@ Out:
 ## Naming
 
 The package becomes `raft-kv` (drop the "rove-" prefix —
-it's a generic library, not a Loop46 thing). Internal
+it's a generic library, not a rewind.js thing). Internal
 public type is `Cluster`. Existing imports of `rove-kv`
 get rewritten as a separate cleanup; semantics carry over.
+
+Note: Not done — build.zig still exports `rove-kv`; the
+rename remains an optional, deferred migration step.
 
 ## API sketch
 
@@ -64,7 +67,7 @@ get rewritten as a separate cleanup; semantics carry over.
 const raftkv = @import("raft-kv");
 
 // A raft cluster + N stores. The application instantiates
-// one of these per process (Loop46 has one; files-server
+// one of these per process (rewind.js has one; files-server
 // has its own). Independent — they don't share consensus.
 pub const Cluster = struct {
     pub const Config = struct {
@@ -127,6 +130,11 @@ pub const Cluster = struct {
 
 ## Backend interface
 
+**Superseded by the kvexp cutover (commits f2a0d2a→ccde36c,
+2026-05-13):** there is no storage vtable. `kvexp.Store`
+(LMDB-backed) is wrapped by `KvStore` directly; the pluggable-
+SQLite-backend abstraction below was not built.
+
 ```zig
 pub const Backend = struct {
     ptr: *anyopaque,
@@ -157,8 +165,8 @@ pub const Backend = struct {
         stampApplied: *const fn (ptr, store: *Store, idx: u64) anyerror!void,
 
         // Stream the store's bytes for send_snapshot / restore.
-        // SQLite backend: SQLite online backup API. In-memory-pending
-        // backend: serialize the persistent commit log.
+        // Ships the LMDB `cluster.kv` file whole (commit d0a63ad /
+        // 39ee170), not a SQLite backup stream.
         streamForSnapshot: *const fn (ptr, store: *Store, writer) anyerror!void,
         loadFromSnapshotStream: *const fn (ptr, allocator, store_id, root_dir, reader) anyerror!*Store,
     };
@@ -232,14 +240,14 @@ Inherited from #1.1 (already shipped):
 
 ## Send-snapshot
 
-Inherited from #1.1 step 3 (planned):
+Inherited from #1.1 step 3 (shipped — commits dc31c1e/12f9fae/0f2935b):
 
 - willemt `send_snapshot` callback fires → library streams
   bytes from each registered store via
   `Backend.streamForSnapshot` to the receiving peer.
 - Receiver calls `Backend.loadFromSnapshotStream` to install.
-- For SQLite: uses SQLite online backup API. For
-  in-memory-pending: serialize commit log.
+- Ships the LMDB `cluster.kv` file whole (commit d0a63ad /
+  39ee170), not a SQLite backup stream.
 
 ## Learner
 
@@ -251,12 +259,12 @@ Inherited from #1.2 step 1 (already shipped):
 
 ## Two consumers
 
-**Loop46** (the existing application):
+**rewind.js** (the existing application):
 - Stores: `__admin__/app.db`, per-tenant `app.db` (lazy-opened),
   `__root__.db`, `schedules.db`.
 - Envelopes: 0 (writeset, leader_skip), 2 (root_writeset,
-  leader_skip), 7 (multi), 8/9/10/11 (schedule_*).
-- Loop46's `apply.zig` shrinks to envelope-handler
+  leader_skip), 1 (multi), 8/9/10/11 (schedule_*).
+- rewind.js's `apply.zig` shrinks to envelope-handler
   registrations + tenant lifecycle policy.
 
 **files-server** (the new consumer):
@@ -274,12 +282,12 @@ Inherited from #1.2 step 1 (already shipped):
 ## Migration order
 
 1. Survey current `src/js/apply.zig` + `src/kv/raft_node.zig`.
-   Identify what moves to library vs stays in Loop46.
+   Identify what moves to library vs stays in rewind.js.
 2. Introduce `Cluster` type in raft-kv. Move generic apply
    dispatch + snapshot tick + multi-envelope wrapper.
 3. Define `Backend` interface + ship `SqliteBackend` as the
    default (wraps existing kvstore.zig).
-4. Migrate Loop46 to the new API. Loop46's apply.zig shrinks
+4. Migrate rewind.js to the new API. rewind.js's apply.zig shrinks
    to handler registrations. Existing snapshot smoke +
    scalability bench should pass unchanged.
 5. files-server adopts a Cluster instance. Its
@@ -293,7 +301,7 @@ Inherited from #1.2 step 1 (already shipped):
 
 - The future custom in-memory-pending backend. Backend
   interface keeps the door open; implementation is later.
-- Cross-cluster coordination (Loop46 ↔ files-server). They
+- Cross-cluster coordination (rewind.js ↔ files-server). They
   remain independent raft groups with their own elections.
   Workers reach files-server via its HTTP API the same way
   they do today.
