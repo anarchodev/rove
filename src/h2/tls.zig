@@ -40,6 +40,12 @@ pub const TlsConfig = struct {
     store_rw: std.Thread.RwLock = .{},
     /// `{dir}/{host}/{cert,key}.pem`. Owned. Null ⇒ no custom certs.
     custom_cert_dir: ?[]u8 = null,
+    /// Operator mTLS (§3.5): PEM CA path. When non-null, EVERY ctx —
+    /// the default and every per-host store entry — requires a client
+    /// cert chaining to this CA (`SSL_VERIFY_PEER |
+    /// FAIL_IF_NO_PEER_CERT`). Owned. Null ⇒ no client-cert demand,
+    /// behavior identical to pre-2d.
+    client_ca_path: ?[]u8 = null,
 
     /// Paths to the PEM files on disk. Owned. Null when the config
     /// was built via `create` (in-memory bytes) — file-path-based
@@ -60,7 +66,7 @@ pub const TlsConfig = struct {
     mu: std.Thread.Mutex = .{},
 
     pub fn create(allocator: std.mem.Allocator, cert_pem: []const u8, key_pem: []const u8) !*TlsConfig {
-        const ssl_ctx = try buildSslCtx(cert_pem, key_pem);
+        const ssl_ctx = try buildSslCtx(cert_pem, key_pem, null);
 
         const cfg = try allocator.create(TlsConfig);
         cfg.* = .{ .ssl_ctx = ssl_ctx, .allocator = allocator };
@@ -77,6 +83,7 @@ pub const TlsConfig = struct {
         allocator: std.mem.Allocator,
         cert_path: []const u8,
         key_path: []const u8,
+        client_ca_path: ?[]const u8,
     ) !*TlsConfig {
         const cert_stat = try std.fs.cwd().statFile(cert_path);
         const key_stat = try std.fs.cwd().statFile(key_path);
@@ -86,13 +93,18 @@ pub const TlsConfig = struct {
         const key_pem = try std.fs.cwd().readFileAlloc(allocator, key_path, 1024 * 1024);
         defer allocator.free(key_pem);
 
-        const ssl_ctx = try buildSslCtx(cert_pem, key_pem);
+        const ssl_ctx = try buildSslCtx(cert_pem, key_pem, client_ca_path);
         errdefer c.SSL_CTX_free(ssl_ctx);
 
         const cert_path_copy = try allocator.dupe(u8, cert_path);
         errdefer allocator.free(cert_path_copy);
         const key_path_copy = try allocator.dupe(u8, key_path);
         errdefer allocator.free(key_path_copy);
+        const ca_copy: ?[]u8 = if (client_ca_path) |p|
+            try allocator.dupe(u8, p)
+        else
+            null;
+        errdefer if (ca_copy) |p| allocator.free(p);
 
         const cfg = try allocator.create(TlsConfig);
         cfg.* = .{
@@ -100,6 +112,7 @@ pub const TlsConfig = struct {
             .allocator = allocator,
             .cert_path = cert_path_copy,
             .key_path = key_path_copy,
+            .client_ca_path = ca_copy,
             .cached_cert_mtime = cert_stat.mtime,
             .cached_key_mtime = key_stat.mtime,
         };
@@ -135,7 +148,7 @@ pub const TlsConfig = struct {
         const key_pem = try std.fs.cwd().readFileAlloc(self.allocator, kp, 1024 * 1024);
         defer self.allocator.free(key_pem);
 
-        const new_ctx = try buildSslCtx(cert_pem, key_pem);
+        const new_ctx = try buildSslCtx(cert_pem, key_pem, self.client_ca_path);
         // The servername cb is registered per-ctx; the rebuilt default
         // ctx needs it re-installed or SNI override stops working
         // after the first wildcard-cert renewal.
@@ -216,6 +229,7 @@ pub const TlsConfig = struct {
             self.store_rw.unlock();
         }
         if (self.custom_cert_dir) |p| self.allocator.free(p);
+        if (self.client_ca_path) |p| self.allocator.free(p);
         if (self.cert_path) |p| self.allocator.free(p);
         if (self.key_path) |p| self.allocator.free(p);
         self.allocator.destroy(self);
@@ -282,7 +296,7 @@ pub const TlsConfig = struct {
             defer self.allocator.free(cpem);
             const kpem = std.fs.cwd().readFileAlloc(self.allocator, kpath, 1024 * 1024) catch continue;
             defer self.allocator.free(kpem);
-            const new_ctx = buildSslCtx(cpem, kpem) catch |err| {
+            const new_ctx = buildSslCtx(cpem, kpem, self.client_ca_path) catch |err| {
                 std.log.warn("tls: custom host {s}: bad cert/key: {s}", .{ host, @errorName(err) });
                 continue;
             };
@@ -378,12 +392,35 @@ pub const TlsConfig = struct {
         return c.SSL_TLSEXT_ERR_OK;
     }
 
-    fn buildSslCtx(cert_pem: []const u8, key_pem: []const u8) !*c.SSL_CTX {
+    fn buildSslCtx(
+        cert_pem: []const u8,
+        key_pem: []const u8,
+        client_ca_path: ?[]const u8,
+    ) !*c.SSL_CTX {
         const ssl_ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.SslCtxFailed;
         errdefer c.SSL_CTX_free(ssl_ctx);
 
         _ = c.SSL_CTX_set_min_proto_version(ssl_ctx, c.TLS1_2_VERSION);
         c.SSL_CTX_set_alpn_select_cb(ssl_ctx, &alpnSelectCb, null);
+
+        // Operator mTLS (§3.5). Applied uniformly here so the default
+        // ctx and every per-host store ctx demand a client cert via
+        // the one code path. Connections without a cert, or with one
+        // not chaining to this CA, fail the handshake (bad_certificate
+        // / unknown_ca) before any application code runs.
+        if (client_ca_path) |ca| {
+            var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+            if (ca.len >= pbuf.len) return error.InvalidClientCa;
+            @memcpy(pbuf[0..ca.len], ca);
+            pbuf[ca.len] = 0;
+            if (c.SSL_CTX_load_verify_locations(ssl_ctx, &pbuf, null) != 1)
+                return error.InvalidClientCa;
+            c.SSL_CTX_set_verify(
+                ssl_ctx,
+                c.SSL_VERIFY_PEER | c.SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                null,
+            );
+        }
 
         const cbio = c.BIO_new_mem_buf(cert_pem.ptr, @intCast(cert_pem.len)) orelse return error.OutOfMemory;
         defer _ = c.BIO_free(cbio);

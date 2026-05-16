@@ -912,15 +912,22 @@ fn resolveTls(
         .{},
     );
 
+    // Operator mTLS (§3.5): flag wins, else env fallback.
+    const client_ca = cli.require_client_cert_ca orelse
+        std.posix.getenv("LOOP46_REQUIRE_CLIENT_CERT_CA");
+
     const cfg = h2_mod.TlsConfig.createFromFiles(
         allocator,
         cert_path,
         key_path,
+        client_ca,
     ) catch |err| failExit(
         "error: tls: {s} (cert={s}, key={s})\n",
         .{ @errorName(err), cert_path, key_path },
     );
     std.log.info("tls: loaded {s} + {s}", .{ cert_path, key_path });
+    if (client_ca) |ca|
+        std.log.info("tls: mTLS on — client cert required, CA {s}", .{ca});
     if (cli.custom_cert_dir) |dir| {
         cfg.setCustomCertDir(dir) catch |err| failExit(
             "error: tls: custom-cert-dir {s}: {s}\n",

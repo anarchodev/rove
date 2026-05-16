@@ -84,6 +84,12 @@ pub const Cli = struct {
     /// wildcard. Rescanned on the 1s reload poll (ACME writes here
     /// later — auth-domain-plan.md §3.2/§3.3). Unset = inert.
     custom_cert_dir: ?[]const u8 = null,
+    /// Operator mTLS (auth-domain-plan.md §3.5): PEM CA path. When
+    /// set, EVERY TLS connection (default + per-host SNI ctxs) must
+    /// present a client cert chaining to this CA, else the handshake
+    /// fails before any handler runs. Off by default = unchanged.
+    /// Env fallback: `LOOP46_REQUIRE_CLIENT_CERT_CA`.
+    require_client_cert_ca: ?[]const u8 = null,
     /// ACME directory URL. Set ⇒ enable in-tree HTTP-01 issuance for
     /// custom domains (auth-domain-plan.md §3.2). Requires
     /// `--custom-cert-dir`. Unset ⇒ ACME inert. e.g.
@@ -260,6 +266,10 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.custom_cert_dir = args[i];
+        } else if (std.mem.eql(u8, a, "--require-client-cert-ca")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.require_client_cert_ca = args[i];
         } else if (std.mem.eql(u8, a, "--acme-directory")) {
             i += 1;
             if (i >= args.len) return error.Usage;

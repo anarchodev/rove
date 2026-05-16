@@ -163,7 +163,7 @@ pub fn main() !void {
     var tls_config: ?*h2.TlsConfig = null;
     defer if (tls_config) |c| c.destroy();
     if (cli.tls_cert) |cert| {
-        tls_config = h2.TlsConfig.createFromFiles(allocator, cert, cli.tls_key.?) catch |err| {
+        tls_config = h2.TlsConfig.createFromFiles(allocator, cert, cli.tls_key.?, null) catch |err| {
             std.debug.print("error: tls: {s} (cert={s}, key={s})\n", .{ @errorName(err), cert, cli.tls_key.? });
             std.process.exit(2);
         };
