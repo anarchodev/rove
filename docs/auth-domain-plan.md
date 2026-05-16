@@ -21,11 +21,15 @@ OIDC RP (no Bearer human path); the X-Rove-Scope primitive fixed
 (3a), Option B (internal dispatch carries the routed authority), §0
 `${ISSUER_PARENT}` redirect templating, and the full smoke-harness
 migration to OIDC-only admin all shipped. **Phase 3 (OIDC) is
-complete.** Only Phase 4 remains (PLAN.md §7/§13 + deployment.md
-sweep — deliberately parked). Phase-2 follow-up tracked: ACME renewal /
-expiry-driven reissue (§3.2). Not yet reflected in `PLAN.md` §7/§13 or
-`deployment.md` — those edits are deliberately parked as Phase 4 until
-Phases 1–3 land (see §6, §7).
+complete.** **Phase 4 (canonical-docs sweep) DONE 2026-05-16:**
+`PLAN.md` §7 superseding note + §13.1/§13.2 (two-domain split,
+`__auth__` IdP, OIDC-RP dashboards, `platform.scope`, storage rows),
+`docs/deployment.md` (two cert flows, `--system-suffix` /
+`LOOP46_OPERATOR_EMAILS`, `:80` responder, edge note), `CLAUDE.md`
+sub-plan index (already listed) + envelope-2 row corrected.
+**All of `auth-domain-plan.md` (Phases 0–4) is now landed.** Sole
+tracked follow-up: ACME renewal / expiry-driven reissue (§3.2 — v1
+issues only when `cert/{host}` absent).
 
 > **2026-05-15 ground-truth corrigendum** (Phase 1 code grounding).
 > Three premises in the original draft were wrong against the
@@ -1272,11 +1276,14 @@ services-token dance. (d) ship as the `oidc.provider(...)` customer
 library. 3a/3b can build concurrently with Phases 1–2; 3c needs Phase
 1 (cookie domains) + Phase 2 (TLS for `auth.rewindjs.com`) + 3ab.
 
-**Phase 4 — cutover + docs.** `deployment.md` (two cert flows, :80
-responder, edge note), `PLAN.md` §7 superseding entry (so the OIDC
-`auth.` origin is not pattern-matched to the rejected
-`admin.loop46.com`), `PLAN.md` §13 process/surface map, `CLAUDE.md`
-sub-plan index. Hold until Phases 1–3 land.
+**Phase 4 — cutover + docs. DONE 2026-05-16.** `deployment.md` (two
+cert flows, `:80` responder, two-domain `--system-suffix` /
+`LOOP46_OPERATOR_EMAILS` env, edge note), `PLAN.md` §7 superseding
+note (the OIDC `auth.` origin *satisfies* the §7 dogfooding
+objection, isn't the rejected `admin.*`+bearer), `PLAN.md` §13.1/§13.2
+process + storage map (`__auth__` IdP, OIDC-RP dashboards,
+`platform.scope`), `CLAUDE.md` sub-plan index (already listed) +
+envelope-2 row. Was held until Phases 1–3 landed.
 
 ---
 

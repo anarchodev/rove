@@ -1192,6 +1192,15 @@ The following were explored during the 2026-04-17 design conversation and ruled 
 - **Static file serving via 302-to-S3 redirect (public bucket or pre-signed).** Rejected (2026-05): considered as a way to take the worker entirely out of the static bytes path, but Cloudflare in front already absorbs essentially all repeat traffic. The marginal further reduction isn't worth a per-deployment flag, public-bucket security model, CSP friction, or per-request HMAC signing. Worker proxies with hash ETag + immutable Cache-Control; Cloudflare does the heavy lifting.
 - **Polling `current.json` (or per-tenant `latest.json`) for files-server release detection.** Rejected (2026-05): adds per-tenant LIST/GET cost to every worker every interval. Replaced by `_deploy/current` kv marker written by a `POST /_system/release` worker route and picked up via apply.zig's writeset-value scan into a process-wide ReleaseTable — no polling, no new envelope type, marker rides through the customer kv writeset that the customer's deploy CLI writes.
 
+**Superseding note (2026-05-16 — `docs/auth-domain-plan.md` Phases 1–3 landed).** The first and last *admin/auth* bullets of this section (`admin.rewindjs.com`+bearer; cookie-auth-for-C2) objected to *specific shapes*, not the underlying need. They are now **resolved, not re-proposed**, by the landed auth/domain architecture — read `auth-domain-plan.md` before touching auth:
+
+- System surfaces live on a **second registrable domain** (`*.rewindjs.com`: `app.`/`replay.`/`logs.`/`auth.`), distinct from the customer wildcard (`*.rewindjs.app`). Different eTLD+1 *is* the security-isolation boundary. The worker now requires both `--public-suffix` and a distinct `--system-suffix`.
+- `auth.rewindjs.com` is **not** the rejected `admin.rewindjs.com`+bearer: it is a tenant (`__auth__`) running the *customer-facing* `oidc.provider()` library — a full OIDC IdP. admin/replay/logs are pure OIDC **relying parties** of it. This *satisfies* the dogfooding objection (auth is just a tenant running the customer auth lib; no privileged platform-only auth path) instead of violating it.
+- The admin dashboard has **no bearer/root-token human path** anymore (OIDC-only). `/_system/*` keeps its root-token gate as the separate machine-to-machine surface (§4.1 of the sub-plan; consistent with the worker→standalone HS256 decision). Operator `is_root` = an OIDC `sub` in the `_admin/operator/*` allowlist, seeded from `LOOP46_OPERATOR_EMAILS`.
+- §0 host-relative invariant: `iss` / JWKS / endpoints / `redirect_uris` derive from the request host (or host-relative `${ISSUER_*}` config templating), never a compiled platform-domain literal — this is what lets `rewindjs.com` be "just a custom domain" and lets customers run their own IdP from the same library.
+
+The `{name}.api.rewindjs.com` **PSL** bullet still stands and is *not* contradicted: the two-domain split is two separate single-label wildcards (no PSL dependency, no two-label-deep wildcard).
+
 ## 8. Why this is a compelling product
 
 The uniqueness isn't any single feature — it's the coherence of the set:
@@ -1779,12 +1788,14 @@ rewind.js ships as **four binaries**, all built from this repo:
 
 | Binary | Source | Public hostname | Owns |
 |---|---|---|---|
-| `loop46` | `src/loop46/main.zig` | `*.{public_suffix}`, `app.{public_suffix}`, `replay.{public_suffix}` | Customer + admin + replay HTTP traffic; raft node; per-worker QJS dispatcher; schedule-server thread; signup; `/_system/release`, `/_system/services-token`, `/_system/admin-kv` admin endpoints |
+| `loop46` | `src/loop46/main.zig` | `*.{public_suffix}` (customer wildcard); `app.`/`replay.`/`auth.{system_suffix}` (system surfaces — **second registrable domain**, `--system-suffix`) | Customer HTTP traffic; the `__admin__` / `__replay__` / `__auth__` system tenants; raft node; per-worker QJS dispatcher; schedule-server thread; per-tenant `provisionInstance` (self-serve signup retired — `auth-domain-plan.md` §4.7); `/_system/release`, `/_system/services-token`, `/_system/admin-kv` machine-to-machine endpoints |
 | `files-server-standalone` | `examples/files_server_standalone.zig` (wraps `src/files_server/`) | `files.{public_suffix}` | Compile + content-addressed deploy + manifest writes to S3; deploys the embedded admin + replay JS bundles; pushes platform config (`_config/*`, resend key, etc.) into `__admin__/app.db` via `/_system/admin-kv`; flips `_deploy/current` via `/_system/release`. Runs its own raft cluster (not shared with `loop46`). `dep_id` is content-addressed; manifests are keyed `{dep_id}.json` where `dep_id` is a content hash. |
 | `log-server-standalone` | `examples/log_server_standalone.zig` (wraps `src/log_server/`) | `logs.{public_suffix}` | Polls S3 for `.ndjson` log batches + sidecars; maintains local `log_index.db`; serves `/v1/{tenant}/{list,show,count,blob}` to the dashboard |
 | `sse-server-standalone` | `examples/sse_server_standalone.zig` (wraps `src/sse_server/`) | `sse.{public_suffix}` | Holds every long-lived `EventSource` connection; receives worker emit POSTs at `/v1/emit`; per-(tenant, sid) ring cache (30 entries) for reconnect catch-up; emits `rove:resync` sentinel on cache miss |
 
 The three standalones are each a single process per cluster (single-process bet, §10.16). Failover is "LB picks a new node, clients reconnect"; sse-server's reconnect path triggers `rove:resync` so the client refetches on cache miss. None of them participates in raft — that's the §6b principle that lets them live outside the loop46 binary. operator-deployed; they're typically co-located with a `loop46` worker on each node, but can scale independently.
+
+**Auth/domain (Phases 1–3 of `docs/auth-domain-plan.md`, landed 2026-05-16).** Customer tenants resolve on `*.{public_suffix}` (`rewindjs.app`); platform surfaces resolve on a **distinct registrable domain** `{system_suffix}` (`rewindjs.com`): `app.` → `__admin__`, `replay.` → `__replay__`, `auth.` → `__auth__`, plus the `files./logs./sse.` standalones. The different eTLD+1 is the security-isolation boundary (§7 superseding note). **`__auth__` is a full OIDC IdP** — an ordinary tenant running the customer-facing `oidc.provider()` library; **admin/replay/logs are pure OIDC relying parties** of it (`oidc.rp()`), so there is no privileged platform-only auth path and no bearer/root-token *human* login (the admin RPC surface is OIDC-session-only; `/_system/*` keeps root-token for M2M). Operator `is_root` = an OIDC `sub` in the `_admin/operator/*` allowlist (seeded from `LOOP46_OPERATOR_EMAILS`). Cross-tenant admin reads/writes are the explicit `platform.scope(id).kv` accessor — `X-Rove-Scope` no longer rebinds the global `kv` (so admin's own home store, incl. sessions, is scope-independent). §0 host-relative invariant holds throughout: `iss`/JWKS/endpoints/`redirect_uris` derive from the request host, never a compiled platform literal.
 
 Inside `loop46` itself there are three threading roles:
 
@@ -1798,9 +1809,10 @@ What lives where, after Phase 5.5:
 
 | Store | Per-tenant or cluster-wide | Replicated via | Owner |
 |---|---|---|---|
-| `__root__.db` | Cluster-wide | Raft envelope 2 | All workers; routing + tenant registry; admin auth bearer |
+| `__root__.db` | Cluster-wide | Raft envelope 2 | All workers; routing + tenant registry (`domain/{host}`, `instance/{id}`); ACME `cert/{host}` (auth-domain-plan §3.2). (Root-token is a process-env M2M secret, not stored here.) |
 | `{id}/app.db` | Per-tenant | Raft envelope 0 | Customer kv writes; `_deploy/current`; `_callback/{id}`; `_config/*` (deploy-time-mirrored, customers cannot write) |
-| `__admin__/app.db` | Cluster-wide (admin tenant) | Raft envelope 0 | Admin sessions, magic-link rows, platform config (resend key, etc.) |
+| `__admin__/app.db` | Cluster-wide (admin tenant) | Raft envelope 0 | Admin **OIDC-RP** sessions (`_rp/sess/{sid}`), operator allowlist (`_admin/operator/*`), RP config (`_oidc/rp/*`), account/instance ownership, platform config (resend key, etc.). **No `rove_session`/magic-link** — admin is OIDC-only (auth-domain-plan §4.7). Always admin's own home store on dispatch (`X-Rove-Scope` no longer rebinds `kv`; cross-tenant via `platform.scope(id)`). |
+| `__auth__/app.db` | Cluster-wide (IdP tenant) | Raft envelope 0 | OIDC IdP state: signing keyset (`_oidc/keyset/*`, RSA priv as opaque blobs — §4.7 Fork A), IdP sessions (`_oidc/session/{sid}`), auth codes / refresh / magic-link (`_oidc/*`); client registry `_oidc/config/*` (+ deploy-mirrored `_config/oidc/*` fallback) |
 | `schedules.db` | Cluster-wide | Raft envelopes 8/9/10/11 | Schedule-server thread (writes via worker dispatch + apply); workers read for in-process fast path |
 | `raft.log.db` | Per-node | n/a (it's the log) | willemt raft |
 | `{id}/file-blobs/{hash}` | Per-tenant, in `BlobBackend` (fs or s3) | shared backend across nodes | files-server-standalone writes; worker reads on bytecode cache miss |

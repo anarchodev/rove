@@ -8,7 +8,7 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 
 ## Product direction
 
-`rove` is the engine for **rewind.js**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via `http.send` / `events.emit` (with `webhook.send` / `email.send` / `retry.*` as JS libraries on top), page-level encryption at rest, etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. Sub-plans in `docs/` (`files-server-plan.md`, `logs-plan.md`, `sse-plan.md`, `notifications.md`, `snapshot-plan.md`, `http-send-plan.md`, `phase-5.5-rollout.md`, `sim-test-framework.md`, `fixture-lifecycle.md`, `agent-surface.md`, `observability-plan.md`, `replay-wasm-plan.md`, `dashboard-design-brief.md`, `auth-domain-plan.md`) elaborate specific PLAN sections. PLAN §13 is the live process / surface map.
+`rove` is the engine for **rewind.js**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via `http.send` / `events.emit` (with `webhook.send` / `email.send` / `retry.*` as JS libraries on top), page-level encryption at rest, etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. Sub-plans in `docs/` (`files-server-plan.md`, `logs-plan.md`, `sse-plan.md`, `notifications.md`, `snapshot-plan.md`, `http-send-plan.md`, `phase-5.5-rollout.md`, `sim-test-framework.md`, `fixture-lifecycle.md`, `agent-surface.md`, `observability-plan.md`, `replay-wasm-plan.md`, `dashboard-design-brief.md`, `auth-domain-plan.md`, `builtin-libs-docs-plan.md`) elaborate specific PLAN sections. PLAN §13 is the live process / surface map.
 
 ## Build commands
 
@@ -95,7 +95,7 @@ Envelopes are typed byte blobs (`src/js/apply.zig`). Current shape (post-Phase-5
 | Type | Target store | Producer |
 |---|---|---|
 | `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker rides here too |
-| `2` root_writeset | `{data_dir}/__root__.db` | Signup's `tenant.createInstance`; admin JS `platform.root.*` |
+| `2` root_writeset | `{data_dir}/__root__.db` | `provisionInstance` / admin `createInstance`'s `tenant.createInstance`; admin JS `platform.root.*`; ACME `cert/{host}` (auth-domain-plan §3.2) |
 | `7` multi | per-inner-envelope target | Worker dispatcher (rides envelope 0 + envelope 8/10 atomically) |
 | `8` schedule_upsert | `{data_dir}/schedules.db` (cluster-wide) | Worker dispatcher (`http.send`) |
 | `9` schedule_complete | `schedules.db` + `_callback/{id}` in tenant `app.db` | schedule-server thread (or worker-0 internal-schedule fast path) |

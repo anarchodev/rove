@@ -19,23 +19,47 @@ process / surface map).
 | `log-server-standalone` | `:8445` (h2 + TLS) | Per-tenant request log query |
 | `sse-server-standalone` | `:8446` (h2 + TLS) | SSE fan-out from worker emits |
 
-The wildcard cert (`*.rewindjs.com`) covers all four — each one
-terminates TLS in-process. They share `LOOP46_SERVICES_JWT_SECRET` for
+Two registrable domains are in play (the auth/domain split,
+`docs/auth-domain-plan.md`): **`*.rewindjs.app`** is the customer
+tenant wildcard; **`*.rewindjs.com`** is the platform/system surfaces
+(`app.`/`replay.`/`auth.` on the worker; `files.`/`logs.`/`sse.` on
+the standalones). The different eTLD+1 is the security-isolation
+boundary, so the worker requires **both** `--public-suffix
+rewindjs.app` and a distinct `--system-suffix rewindjs.com`.
+`auth.rewindjs.com` is the OIDC IdP (the `__auth__` tenant); the
+admin/replay/logs dashboards are OIDC relying parties of it.
+
+The standalones share `LOOP46_SERVICES_JWT_SECRET` for
 service-to-service auth (worker mints JWTs at `/_system/services-token`;
 the three standalones verify every request). The worker proposes raft
 entries that the standalones consume; the standalones don't talk to each
 other.
 
+**Two cert provisioning flows** (`auth-domain-plan.md` §3.1–§3.2),
+not mutually exclusive: (a) **operator wildcards** —
+`scripts/rove-lego-renew.sh` ACME DNS-01 for `*.rewindjs.app` and
+`*.rewindjs.com`, the simple default; (b) **in-tree per-host ACME
+HTTP-01** for custom domains a customer points at the cluster
+(leader-gated issuance, the cert replicated to followers via raft
+`cert/{host}` and served by SNI). Flow (b) needs the worker's `:80`
+HTTP-01 responder reachable from the internet (or the edge proxy
+forwarding `/.well-known/acme-challenge/*` to it).
+
 ## Prerequisites
 
 1. **DNS A records** point at the host(s):
    - `rewindjs.com`
-   - `*.rewindjs.com` (wildcard for system surfaces: `app.` + `files.` + `logs.` + `sse.`)
+   - `*.rewindjs.com` (wildcard for system surfaces: `app.` + `replay.` + `auth.` + `files.` + `logs.` + `sse.`)
    - `*.rewindjs.app` (wildcard for customer tenants)
 
-2. **TLS cert** — `scripts/rove-lego-renew.sh` issues a wildcard cert
-   via ACME DNS-01. The systemd timer at `scripts/systemd/rove-cert-renew.timer`
-   keeps it fresh. Cert lives at `~/.rove/tls/{cert,key}.pem`.
+2. **TLS cert** — `scripts/rove-lego-renew.sh` issues the operator
+   wildcard cert(s) via ACME DNS-01 (run it once per registrable
+   domain — `*.rewindjs.app` and `*.rewindjs.com`). The systemd timer
+   at `scripts/systemd/rove-cert-renew.timer` keeps them fresh; the
+   default/wildcard cert lives at `~/.rove/tls/{cert,key}.pem`.
+   Per-host custom-domain certs (in-tree ACME HTTP-01, flow (b)
+   above) land in `--custom-cert-dir` and are served by SNI — for
+   that, expose the worker's `:80` responder (`--acme-http-port`).
 
 3. **S3** — endpoint + region + bucket + access keys. The bucket holds
    per-tenant blobs, log batches, and snapshots; one bucket per cluster.
@@ -180,9 +204,19 @@ DATA_DIR=/home/<user>/.rove/data
 TLS_CERT=/home/<user>/.rove/tls/cert.pem
 TLS_KEY=/home/<user>/.rove/tls/key.pem
 
+# Customer tenant wildcard + the DISTINCT system-surfaces domain.
+# Both required; must differ (different eTLD+1 = the isolation
+# boundary). admin/replay/auth derive from SYSTEM_SUFFIX.
 PUBLIC_SUFFIX=rewindjs.app
-ADMIN_API_DOMAIN=app.rewindjs.com
+SYSTEM_SUFFIX=rewindjs.com
+ADMIN_API_DOMAIN=app.rewindjs.com          # = app.{SYSTEM_SUFFIX}
 ADMIN_ORIGIN=https://app.rewindjs.com
+# OIDC operator allowlist (auth-domain-plan §4.7): comma-separated
+# emails. An IdP-authenticated session whose `sub` is in this set
+# gets is_root on the admin dashboard. This REPLACES the root-token
+# human login (admin is OIDC-only); rove-loop46-serve.sh translates
+# it to the _admin/operator/* allowlist via --bootstrap-kv.
+LOOP46_OPERATOR_EMAILS=ops@example.com
 
 # The worker tells the dashboard which standalone to hit for files,
 # logs, and SSE. These are the public origins clients connect to —
@@ -192,7 +226,8 @@ LOG_PUBLIC_BASE=https://logs.rewindjs.com:8445
 SSE_PUBLIC_BASE=https://sse.rewindjs.com:8446
 
 WORKERS=0          # 0 → nCPU - 1
-LOOP46_ROOT_TOKEN=<64 hex chars>   # bearer for /_system/* + login
+LOOP46_ROOT_TOKEN=<64 hex chars>   # /_system/* M2M only — NOT a
+                                   # human login (admin is OIDC-only)
 SSE_INTERNAL_TOKEN=<same value as in sse-server.env>
 ```
 
