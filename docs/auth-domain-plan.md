@@ -5,9 +5,11 @@ smoke-verified (2026-05-15/16).** Phase 1 + 2c (§6/§3.3); 2a (lego
 wildcard, unchanged); 2b in-tree ACME end-to-end verified against
 Pebble (`fd3c53c`/`927fd88`/`38147f9`/`c39ab26`, §3.2 "Landed"); 2d
 operator mTLS verified (`779e482`, §3.5 "Landed"). §5 decisions
-accepted 2026-05-15; key-rotation design pass §4.6. **Next: Phase 3
-(OIDC) — not yet started.** One Phase-2 follow-up tracked: ACME
-renewal / expiry-driven reissue (§3.2). Not yet reflected in `PLAN.md` §7/§13 or
+accepted 2026-05-15; key-rotation design pass §4.6. **Phase 3 (OIDC):
+grounded + concrete design landed §4.7 (2026-05-16) — awaiting
+§5-style sign-off on forks A (key custody) + B (dashboards→pure RPs)
+before code.** One Phase-2 follow-up tracked: ACME renewal /
+expiry-driven reissue (§3.2). Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
 Phases 1–3 land (see §6, §7).
 
@@ -719,6 +721,90 @@ unknown-`kid` refetch and can run a far tighter cadence); access/id
 token TTL ≤15m (align with the existing 5-min services-token order of
 magnitude); T_retire = token TTL + 5m skew. Conservative defaults
 ship; operators/customers tune down when their RP population allows.
+
+### 4.7 Concrete design (grounded against the code 2026-05-16)
+
+*Reuse (no reinvention):* the request/response handler surface
+(`src/js/dispatcher.zig` Request: `method/path/host/query/body/
+headers/cookies/session`; `response.status/headers/cookies`;
+`src/js/globals.zig`), per-tenant `kv.*`, the embedded-JS-library
+shipping path (`evalSnippet` of `src/js/bindings/*.js` into every QJS
+context — `oidc.js` ships exactly like `oauth.js`/`retry.js`), the
+per-request opaque sid (`__Host-rove_sid`, `src/js/session.zig` —
+*the* documented "bind the sid to your user in your own kv" model),
+`http.send` with a stable `handle` + `on_result` module for the §4.6
+rotation callback, `request.host` for the §0 host-relative
+derivation, and `src/acme/crypto.zig`'s OpenSSL patterns
+(keygen/PEM/JWK-thumbprint) as the template for the RSA equivalents.
+
+*Shape — the IdP is the `__auth__` system tenant.* `oidc.provider(cfg)`
+mirrors `oauth.fromConfig` (config from `_config/oidc/{name}`, state
+under `state/oidc/...`); the IdP is a bootstrapped system tenant
+(`createInstance("__auth__")` + `assignDomain("auth.{system_suffix}",
+"__auth__")` — the exact Phase-1 `__replay__` pattern) whose
+`web/auth/index.mjs` deployment routes `/.well-known/openid-
+configuration`, `/.well-known/jwks.json`, `/authorize`, `/token` by
+`request.path`. `iss` + every endpoint derive from `request.host`
+(§0). Dashboards (admin/replay/logs) stop doing their own auth and
+become pure relying parties: redirect unauthenticated users to
+`auth.{system_suffix}/authorize`, exchange the code, establish their
+**own host-only session** (§5.3) bound to the `id_token`.
+
+*Clarification the grounding forced — cookies are host-only, so the
+IdP runs its own magic-link.* `__Host-rove_sid` has no `Domain=` and
+the §5.3 decision keeps it host-only, so the dashboard's cookie on
+`app.{sys}` is **not** sent to `auth.{sys}`. That is the *correct*
+OIDC shape: the human authenticates **to the IdP** at
+`auth.{system_suffix}`. So magic-link (email OTP → bind the
+per-request sid to a user in **`__auth__`'s** kv via the standard
+`session.zig` model) is the IdP's authN step — "magic-link stays the
+authN primitive, OIDC wraps it" (§4.1) is satisfied with the
+magic-link logic *living in the `__auth__` IdP*, not `__admin__`.
+`authenticateSession` (admin-app.db-specific) is **not** what OIDC
+uses; the IdP manages its own `session/{sid}` rows in `__auth__` kv —
+fully dogfooded, no platform change to `session.zig`.
+
+*Must-build:* an **RS256 signer + RSA keygen + RSA JWK/JWKS + RFC 7638
+RSA thumbprint in Zig** — `crypto.zig` exposes RSA *verify* only
+(signing a private key from customer JS is the thing we won't do);
+`jwt/root.zig` is HS256-only. Port `src/acme/crypto.zig`'s OpenSSL
+approach (RSA via `evp.h`/`rsa.h`/`bn.h`, already in that cImport).
+Plus the `web/auth/` deployment + the `oidc.js` library + the
+discovery/JWKS/authorize/token route logic + PKCE + the §4.6 rotation
+wiring.
+
+*Decisions needed before code (§5-style):*
+
+- **A — RS256 key custody.** Fully platform-managed (Zig generates /
+  stores / signs; the RSA private key never enters JS) vs. tenant-kv
+  keys readable by the IdP JS (max dogfooding, but private bytes
+  transit customer-controlled JS). *Recommendation: hybrid —*
+  generation + signing are Zig bindings; the keyset is stored in
+  `__auth__` kv as **opaque blobs the JS never parses** (so it still
+  replicates via the normal writeset and the §4.6 rotation
+  state-machine works unchanged — dogfooded *storage* and *rotation*),
+  while RSA private bytes stay inside Zig. JS calls
+  `crypto.oidcSign(kid, signing_input)`-style; never holds the key.
+- **B — admin/replay/logs become pure RPs.** Today admin runs its own
+  magic-link + session in `__admin__`. Phase 3 moves the authN to the
+  `__auth__` IdP and makes the dashboards RPs (the point of one SSO
+  origin). *Recommendation: yes* — reuse the existing magic-link JS
+  by relocating it into the `__auth__` IdP tenant (it is
+  customer-equivalent JS), and replace each dashboard's auth with a
+  thin RP shim. This is a behavior change to the current admin login
+  and the largest blast-radius item in Phase 3.
+- **C (decided, not a fork): RS256 signer placement** — extend the
+  `src/acme/crypto.zig` OpenSSL approach (add an `rsa`/`oidc_crypto`
+  sibling) rather than the HS256 `jwt` module; reuse its PEM/JWK
+  scaffolding.
+
+First increment + gate: discovery + JWKS + the RSA keygen/sign Zig
+binding, behind a Pebble-style **OIDC conformance smoke** — a scripted
+RP that runs the full authorization-code + PKCE flow against the
+`__auth__` IdP and validates the `id_token` signature against the
+published JWKS (proves host-relative `iss`, RS256, and the
+magic-link→code→token chain end-to-end), then a follower/second-host
+check that the same `iss`/JWKS works there (host-relative invariant).
 
 ---
 
