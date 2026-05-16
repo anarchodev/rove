@@ -14,8 +14,10 @@ design + forks A/B accepted. Implementation in progress —
 (3-1→3-5) is conformance-verified end-to-end — `scripts/oidc_smoke.py`
 passes twice non-flaky incl. pure-Python RS256-vs-JWKS, §0, §4.6
 rotation (see §4.7 "Landed").** Remaining: 3-6 part 2 — the Fork-B
-dashboard→RP migration (admin last); now safe since the IdP is
-proven. Phase-2 follow-up tracked: ACME renewal /
+dashboard→RP migration. **Grounded + decided 2026-05-16** (user chose
+the maximal-dogfooding fork: admin OIDC-only / full signup refactor /
+replay-logs N/A — see §4.7 "3-6 part 2 design"); implementation
+pending. Now safe since the IdP is proven. Phase-2 follow-up tracked: ACME renewal /
 expiry-driven reissue (§3.2). Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
 Phases 1–3 land (see §6, §7).
@@ -860,6 +862,186 @@ Two grounded corrections the gate forced:
 (relocate admin's magic-link into `__auth__`; replay/logs/admin become
 RPs; **admin last** — the live-auth-regression risk). Sequenced after
 the gate deliberately: it is now *safe* because the IdP is proven.
+
+#### 3-6 part 2 design (grounded + decided 2026-05-16)
+
+Three grounding facts reshaped the step (the earlier framing was
+imprecise):
+
+1. **The live admin-auth path is JS, not Zig.** `web/admin/index.mjs`'s
+   header comment ("Zig still serves `/v1/*`; this code is dormant") is
+   **stale doc-rot**. `worker_dispatch.zig:1360-1368` is authoritative:
+   *"Zig is no longer in the admin auth path."* `web/admin/
+   _middlewares/index.mjs` gates every dispatch (default export **and**
+   `?fn=` RPCs); `handleLogin/handleAuth/handleSession/handleLogout`
+   are **live on the wire**. So Fork B mutates exactly these JS files —
+   **no Zig auth change** — and the stale comment is fixed in the same
+   pass. `auth.zig::extractAdminAuth` serves a *different* surface
+   (`/_system/*` via `tryHandleSystem`), untouched here.
+2. **The IdP magic-link already exists and is conformance-verified**
+   (`web/auth/index.mjs`, `oidc_smoke.py`). What admin's
+   `handleSignup/handleAuth` do that the IdP does *not* is **not
+   authentication** — it is account/instance **provisioning**
+   (`PLAN_LIMITS`, `countAccountUsage`, `platform.instances.create`,
+   `account/{sha256(email)}/instances/*`). That must **not** move to
+   `__auth__` (the IdP must not know about instances/plans). It stays
+   in admin, relocated *behind* the RP session.
+3. **replay/logs have nothing to migrate.** `web/replay` is
+   static-only (no handler; embedded via admin `postMessage`); there
+   is no `web/logs` (logs = standalone log-server, JWT-authed through
+   admin's token-mint). They have no independent per-user entry point.
+
+**Decisions (user, 2026-05-16) — the maximal-dogfooding fork on all
+three:**
+
+- **D1 — admin human auth is OIDC-only.** No non-OIDC human path.
+  `handleLogin` (root-token → session) is **deleted**. The `/_system/*`
+  root-token gate is a **separate M2M surface** (`tryHandleSystem`;
+  §4.1 keeps worker→standalone HS256 / `LOOP46_ROOT_TOKEN`
+  unchanged) — *out of scope*, unaffected, so the smoke harness's
+  `mint_services_token` keeps working. "OIDC-only" is precisely
+  scoped to the admin **dashboard** path (`/v1/*`, `_middlewares`,
+  `?fn=` RPCs).
+- **D2 — full signup refactor in this step.** One hard cutover. No
+  `/v1/signup`+`/v1/auth` magic-link in admin. Auth = the IdP;
+  provisioning = a *post-login authenticated* admin endpoint.
+- **D3 — replay/logs N/A.** Documented above; `replay-dashboard`/
+  `logs-dashboard` in `_config/oidc/default.json` stay as
+  forward-looking placeholders. 3-6 part 2 = **admin only**.
+
+**Consequence of D1 — where does operator `is_root` come from?** The
+root token was the *only* source of `is_root` besides
+magic-link-signup (which also set `is_root:true`). With the human
+root-token path deleted, `is_root` derives from the OIDC `sub`
+(email) being on an **operator allowlist** in `__admin__` kv:
+`_admin/operator/{sha256(email)}` → `""`. Seeded at bootstrap from an
+operator-supplied env `LOOP46_OPERATOR_EMAILS` (comma-separated) via
+the **existing raft-seed-into-`__admin__`-kv seam** in
+`bootstrap.zig` (the same path that already replicates an `__admin__`
+pair cluster-wide). An authenticated email **not** on the allowlist
+gets a **non-root** session scoped to the instances it owns
+(`account/{sha256(email)}/instances/*`) — which is also the natural
+home for refactored provisioning (D2): authenticated + owns nothing ⇒
+the provisioning page. (`_admin/` is non-reserved — verified against
+`reserved.zig` `PLATFORM_KV_PREFIXES`; admin handler writes allowed.)
+This is *more* dogfooded than the root token, not less: operator
+identity becomes "an IdP-authenticated email on an allowlist," no
+shared bearer secret on the human path.
+
+**The RP shim (admin = pure relying party).** A small **`oidc.rp()`
+client helper added to `oidc.js`** — the issuance library already
+ships the *provider*; the RP is its client analog, mirroring how
+`oauth.js` is a generic client. Shipped as a dogfooded library so
+replay/logs/customers reuse it later (D3 placeholders). Surface:
+
+- `oidc.rp(cfg)` reads `_oidc/rp/{name}` (client_id, issuer host,
+  redirect_uri, post-login landing). §0: the issuer is *config*, not
+  a literal — the RP's own host comes from `request.host`.
+- `rp.guard()` — in `_middlewares/index.mjs`: read
+  `_rp/sess/{request.session.id}` (the RP session bound to the
+  platform `__Host-rove_sid`); valid+unexpired ⇒ set
+  `request.auth = {sub, is_root}` and continue; else **401**
+  (unchanged from today's middleware contract — the SPA's existing
+  401-handler routes to login, which navigates to `/_rp/login`).
+- `GET /_rp/login` (pre-auth, `rp.beginLogin()`) — generate
+  `state`+PKCE verifier, stash `_rp/state/{state}` =
+  `{verifier, sid, return_to, created_at}` (the **sid is captured
+  here**, on a real browser request), 302 → IdP `/authorize`
+  (client_id, redirect_uri, response_type=code, scope=openid, state,
+  S256 challenge). Issuer host from config (§0 — config, not literal).
+- `GET /_rp/callback` (pre-auth, `rp.handleCallback()`) — validate +
+  consume `_rp/state/{state}` (TTL); `http.send` POST the IdP
+  `/token` (`oauth.js handleCallback` pattern) with
+  `on_result:{ module:"_rp/complete", context:{ sid, return_to } }`;
+  return **202 + a "Signing in…" page that polls `/_rp/poll`**.
+- **Grounded correction (2026-05-16, before code).** `on_result`
+  modules run platform-driven in `dispatchCallbacks` with a
+  *synthesized* request — **no browser response**, so the token
+  completion cannot set a cookie or 302 (oauth.js has the identical
+  constraint). And token-exchange + JWKS-verify are **two** async
+  `http.send` hops. So: (1) **no new `__Host-rove_adm` cookie** —
+  the RP session anchors on the platform's already-host-only
+  `__Host-rove_sid` via `_rp/sess/{sid}`, exactly `session.zig`'s
+  "bind the sid to your user in your own kv" model that
+  `web/auth/index.mjs` itself uses (more dogfooded, §5.3-consistent —
+  `__Host-` is host-only per surface by construction). (2) Completion
+  is a 2-module background chain that writes the session row keyed by
+  the captured `sid`; the browser sits on a **`/_rp/poll`** page
+  (pre-auth, returns `{authed}` once `_rp/sess/{sid}` exists) then
+  JS-navigates to `return_to`. The poll is *required* (the IdP's own
+  magic-link has no such hop, so `web/auth` needs none; the RP's
+  async token exchange does).
+- `_rp/complete` module (`rp.completeToken()`) — on_result of the
+  `/token` send: `{ok,status,body,context}`; parse the `id_token`
+  JWS. If its `kid` is in the cached `_rp/jwks` ⇒ verify + finish
+  synchronously here. Else `http.send` GET the IdP
+  `/.well-known/jwks.json`, `on_result:{ module:"_rp/jwks",
+  context:{ id_token, sid, return_to } }` (the §4.6-mandated
+  controlled-RP unknown-`kid` refetch).
+- `_rp/jwks` module (`rp.completeJwks()`) — cache `_rp/jwks`
+  `{keys,fetched_at}`; find key by `kid`; **`crypto.verifyRsa(jwk,
+  "sha256", utf8(signing_input), base64url.decode(sig))`**; validate
+  `iss`(==configured issuer)/`aud`(==client_id)/`exp`/`iat`(+skew)/
+  `nonce`; on success write `_rp/sess/{sid}` =
+  `{sub, is_root: (sha256(sub) ∈ _admin/operator/*), exp}`.
+- `rp.logout()` — deletes `_rp/sess/{sid}` (IdP session is the IdP's
+  concern; v1 has no front/back-channel logout — §4.5 deferred).
+
+**Provisioning after the refactor (D2).** `/v1/signup` + `/v1/auth`
+deleted. New authenticated `?fn=provisionInstance` (named-export RPC,
+so it rides the existing auth gate): body `{name}`; identity is
+`request.auth.sub` (the verified id_token email) — **not** a
+client-supplied email, closing the old signup's trust-the-body gap.
+Body = the old `handleAuth` provisioning core (`validInstanceName`/
+`isReserved`/duplicate check, `PLAN_LIMITS`/`countAccountUsage`
+limit gate, `platform.instances.create` + `deployStarter`,
+`account/{sha256(sub)}/instances/{name}` ownership). The name-picker
+UI moves from the IdP-less old signup page into a post-login admin
+SPA state ("you're signed in, you have no instance — name one").
+`pending/*` reservations + the `magic/*` rows disappear (the IdP
+owns the email round-trip now; provisioning is synchronous behind a
+proven-authenticated session, so there is no unredeemed-reservation
+abuse vector to rate-limit against).
+
+**Bootstrap seeding (replaces the smoke's manual `setKv`).**
+`bootstrap.zig` gains two raft-seeded `__auth__`/`__admin__` kv
+writes alongside the existing deploy: (a) `_oidc/config/default`
+client registry on `__auth__` registering `admin-dashboard` →
+`https://app.{system_suffix}/_rp/callback` (host derived from the
+`--system-suffix` already in `CliConfig`, §0-compliant — config, not
+literal); (b) the `_admin/operator/*` allowlist on `__admin__` from
+`LOOP46_OPERATOR_EMAILS`. The smoke stops hand-registering the
+client; it asserts the bootstrap seed instead (stronger — proves the
+prod path).
+
+**Safe sequence (admin is the live-auth-regression risk).**
+
+1. Add `oidc.rp()` to `oidc.js` + inline Zig test of the JWS-verify
+   bridge (no live wiring yet — pure addition, zero blast radius).
+2. Bootstrap seeds (`_oidc/config/default`, `_admin/operator/*`) +
+   `LOOP46_OPERATOR_EMAILS` CLI/env wiring + `oidc.rp` config seed
+   `_oidc/rp/default`. Still no admin behavior change (new keys,
+   unused).
+3. **The cutover commit** (atomic, single deploy — D2 is a hard
+   cutover by decision): `_middlewares/index.mjs` → `rp.guard()`;
+   add `/_rp/callback`; delete `handleLogin`/`handleSignup`/
+   `handleAuth` + the `rove_session`/`magic/*`/`pending/*` machinery;
+   add `?fn=provisionInstance`; SPA `login.js`/`api.js`/`app.js` →
+   "redirect to IdP" + post-login provisioning state; fix the stale
+   `index.mjs` header comment.
+4. Extend `oidc_smoke.py` into the **RP gate**: scripted browser-shaped
+   flow hitting `app.{system}` unauthenticated → follows 302 → IdP
+   magic-link → `/_rp/callback` → asserts admin session works, an
+   operator-allowlisted email gets `is_root`, a non-allowlisted email
+   provisions an instance and does **not** get `is_root`. Green twice,
+   non-flaky, before the step is called done.
+
+Rollback note: D1+D2 are a deliberate hard cutover (user-chosen over
+the parallel-run option), so the safety net is **git revert of the
+cutover commit**, not a runtime flag — steps 1-2 are inert until 3,
+so a revert of 3 alone restores the proven-good login. The
+`/_system/*` root-token path is independent and always available for
+operator recovery.
 
 ---
 

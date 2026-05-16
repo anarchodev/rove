@@ -472,6 +472,311 @@ class OIDCProvider {
   }
 }
 
+// ── OIDC Relying Party (the client analog of OIDCProvider) ──────────
+//
+// `oidc.rp()` is to `oidc.provider()` what `oauth.js` is to a generic
+// OAuth2 server: the dogfooded client. The platform's own admin
+// dashboard uses it (auth-domain-plan §4.7 "3-6 part 2"); customers
+// and the future replay/logs RPs reuse the same code.
+//
+// Grounded constraints this shape encodes (auth-domain-plan §4.7
+// "Grounded correction 2026-05-16"):
+//   - `on_result` modules run platform-driven in dispatchCallbacks
+//     with a SYNTHESIZED request: no browser response (can't set a
+//     cookie / 302), and crucially NO `request.session`. So the
+//     session anchor (`sid`) is captured on the real browser request
+//     in beginLogin and threaded through state → http.send context →
+//     the completion modules. The RP session binds to the platform's
+//     already-host-only `__Host-rove_sid` via `_rp/sess/{sid}` —
+//     the session.zig "bind the sid to your user in your own kv"
+//     model that web/auth/index.mjs itself uses (no new cookie).
+//   - Token exchange + JWKS verify are TWO async http.send hops; the
+//     browser sits on a poll page until `_rp/sess/{sid}` lands.
+//
+// Config at `_oidc/rp/{name}` (a normal kv key — operational, like
+// the provider's `_oidc/config/*`):
+//   { "issuer":      "https://auth.rewindjs.com",  // the IdP host
+//     "client_id":   "admin-dashboard",
+//     "redirect_uri":"https://app.rewindjs.com/_rp/callback",
+//     "post_login":  "/",                  // default return_to
+//     "operator_prefix": "_admin/operator/" }  // is_root allowlist
+// `issuer`/`redirect_uri` are config, NOT compiled-in literals — §0
+// is about no *platform* literal in library code; per-deploy config
+// is the §0-compliant carrier (same as oidc.provider's issuer host).
+class OIDCRelyingParty {
+  constructor(config, name) {
+    if (!config.issuer || !config.client_id || !config.redirect_uri) {
+      throw new TypeError(
+        "oidc.rp: config needs issuer, client_id, redirect_uri");
+    }
+    this.cfg = {
+      issuer: config.issuer.replace(/\/+$/, ""), // no trailing slash
+      client_id: config.client_id,
+      redirect_uri: config.redirect_uri,
+      post_login: config.post_login || "/",
+      // Empty ⇒ no email is ever operator (is_root always false).
+      operator_prefix: config.operator_prefix || "",
+      state_path: config.state_path || ("_rp/state/" + name),
+      sess_path: config.sess_path || "_rp/sess",
+      jwks_path: config.jwks_path || ("_rp/jwks/" + name),
+      complete_module: config.complete_module || "_rp/complete",
+      jwks_module: config.jwks_module || "_rp/jwks",
+      state_ttl_ms: config.state_ttl_ms || 10 * 60 * 1000,
+      session_ttl_ms: config.session_ttl_ms || 7 * 24 * 60 * 60 * 1000,
+      // jwt.validateClaims clock-skew tolerance.
+      leeway_s: config.leeway_s != null ? config.leeway_s : 30,
+    };
+  }
+
+  // return_to must be a same-origin absolute PATH (open-redirect
+  // defense — the login is otherwise an attacker-aimable redirector).
+  // Reject protocol-relative `//evil` and anything not starting `/`.
+  _safePath(p) {
+    if (typeof p === "string" && p.length > 0 && p[0] === "/" &&
+        !(p.length > 1 && p[1] === "/")) {
+      return p;
+    }
+    return this.cfg.post_login;
+  }
+
+  // GET /_rp/login — capture the platform sid HERE (real browser
+  // request; the on_result completion has none), stash PKCE state,
+  // 302 to the IdP /authorize.
+  beginLogin() {
+    const sid = request.session && request.session.id;
+    if (!sid) {
+      response.status = 400;
+      return "no session context";
+    }
+    const q = new URLSearchParams(request.query || "");
+    const return_to = this._safePath(q.get("return_to"));
+
+    const state = _b64urlRandom(32);
+    const verifier = _b64urlRandom(32);
+    const challenge = _s256(verifier);
+
+    kv.set(this.cfg.state_path + "/" + state, JSON.stringify({
+      verifier, sid, return_to, created_at: Date.now(),
+    }));
+
+    const p = new URLSearchParams({
+      client_id: this.cfg.client_id,
+      redirect_uri: this.cfg.redirect_uri,
+      response_type: "code",
+      scope: "openid",
+      state,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    response.status = 302;
+    response.headers = {
+      location: this.cfg.issuer + "/authorize?" + p.toString(),
+    };
+    return null;
+  }
+
+  // The "Signing in…" page: polls /_rp/poll until the background
+  // completion chain has written `_rp/sess/{sid}`, then navigates to
+  // the (already same-origin-validated) return_to. return_to is
+  // embedded server-side, escaped — never echoed into an attribute.
+  _pollPage(return_to) {
+    response.status = 202;
+    response.headers = { "content-type": "text/html; charset=utf-8" };
+    const rt = JSON.stringify(return_to); // safe JS string literal
+    return "<!doctype html><meta charset=utf-8><title>Signing in…</title>" +
+      "<p>Completing sign-in…</p><script>" +
+      "var rt=" + rt + ";" +
+      "function p(){fetch('/_rp/poll',{credentials:'same-origin'})" +
+      ".then(function(r){return r.json()}).then(function(j){" +
+      "if(j&&j.authed){location.replace(rt)}else{setTimeout(p,600)}})" +
+      ".catch(function(){setTimeout(p,1200)})}p();</script>";
+  }
+
+  // GET /_rp/callback?code&state — validate+consume state, kick the
+  // async token exchange, park the browser on the poll page.
+  handleCallback() {
+    const q = new URLSearchParams(request.query || "");
+    const state = q.get("state");
+    const code = q.get("code");
+    const err = q.get("error");
+    if (err) {
+      response.status = 400;
+      return "sign-in failed at identity provider: " + err;
+    }
+    if (!state || !code) {
+      response.status = 400;
+      return "missing code or state";
+    }
+    const skey = this.cfg.state_path + "/" + state;
+    const raw = kv.get(skey);
+    kv.delete(skey); // single-use: consume before any check
+    if (raw == null) {
+      response.status = 400;
+      return "unknown or used sign-in state";
+    }
+    const st = JSON.parse(raw);
+    if (Date.now() - st.created_at > this.cfg.state_ttl_ms) {
+      response.status = 400;
+      return "sign-in state expired";
+    }
+
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: this.cfg.redirect_uri,
+      client_id: this.cfg.client_id,
+      code_verifier: st.verifier,
+    });
+    http.send({
+      url: this.cfg.issuer + "/token",
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      on_result: {
+        module: this.cfg.complete_module,
+        context: { sid: st.sid, return_to: st.return_to },
+      },
+    });
+    return this._pollPage(st.return_to);
+  }
+
+  // The callback event the on_result modules receive (synthesized
+  // request, body = the http-send-plan §8 event).
+  _event() {
+    try { return JSON.parse(request.body || "{}"); } catch (_) { return {}; }
+  }
+
+  // on_result of the /token send. We have the id_token but need the
+  // IdP JWKS to verify it. Verify synchronously if the signing kid
+  // is already cached; otherwise refetch JWKS (the §4.6-mandated
+  // controlled-RP unknown-kid refetch) and finish in completeJwks.
+  completeToken() {
+    const ev = this._event();
+    const ctx = ev.context || {};
+    if (!ev.ok) {
+      // Token exchange failed; nothing to do — the poll page keeps
+      // polling and the user can retry login. Log via response body
+      // (callback responses are dropped, but tape/logs capture it).
+      response.status = 200;
+      return "token exchange failed: " + (ev.status || "?");
+    }
+    let tok = null;
+    try { tok = JSON.parse(ev.body || "{}"); } catch (_) {}
+    const id_token = tok && tok.id_token;
+    if (!id_token) { response.status = 200; return "no id_token"; }
+
+    const dec = jwt.decode(id_token);
+    if (!dec) { response.status = 200; return "malformed id_token"; }
+
+    const cachedRaw = kv.get(this.cfg.jwks_path);
+    if (cachedRaw != null) {
+      const cached = JSON.parse(cachedRaw);
+      const kid = dec.header && dec.header.kid;
+      const have = (cached.keys || []).some((k) => k.kid === kid);
+      if (have) {
+        return this._finish(id_token, cached, ctx.sid, ctx.return_to);
+      }
+    }
+    // Unknown/absent kid → refetch JWKS, finish in completeJwks.
+    http.send({
+      url: this.cfg.issuer + "/.well-known/jwks.json",
+      method: "GET",
+      on_result: {
+        module: this.cfg.jwks_module,
+        context: {
+          sid: ctx.sid, return_to: ctx.return_to, id_token,
+        },
+      },
+    });
+    response.status = 200;
+    return "fetching jwks";
+  }
+
+  // on_result of the JWKS fetch: cache it, then verify + mint.
+  completeJwks() {
+    const ev = this._event();
+    const ctx = ev.context || {};
+    if (!ev.ok) { response.status = 200; return "jwks fetch failed"; }
+    let jwks = null;
+    try { jwks = JSON.parse(ev.body || "{}"); } catch (_) {}
+    if (!jwks || !Array.isArray(jwks.keys)) {
+      response.status = 200;
+      return "malformed jwks";
+    }
+    kv.set(this.cfg.jwks_path, JSON.stringify({
+      keys: jwks.keys, fetched_at: Date.now(),
+    }));
+    return this._finish(ctx.id_token, jwks, ctx.sid, ctx.return_to);
+  }
+
+  // Cryptographic verify + claim validation + session mint. Runs in
+  // a background callback (no browser response) — it ONLY writes
+  // `_rp/sess/{sid}`; the poll page picks the session up.
+  _finish(id_token, jwks, sid, return_to) {
+    if (!id_token || !sid) { response.status = 200; return "missing inputs"; }
+    let v = null;
+    try { v = jwt.verify(id_token, jwks); }
+    catch (_) { response.status = 200; return "verify error"; }
+    if (!v.valid) { response.status = 200; return "bad id_token signature"; }
+    const claim_err = jwt.validateClaims(v.payload, {
+      iss: this.cfg.issuer,
+      aud: this.cfg.client_id,
+      leeway_s: this.cfg.leeway_s,
+    });
+    if (claim_err) { response.status = 200; return "id_token " + claim_err; }
+
+    const sub = v.payload.sub;
+    if (!sub) { response.status = 200; return "id_token has no sub"; }
+
+    // is_root iff the verified subject is on the operator allowlist.
+    // Empty operator_prefix ⇒ never root (safe default for non-admin
+    // RPs that have no operator concept).
+    let is_root = false;
+    if (this.cfg.operator_prefix) {
+      is_root = kv.get(this.cfg.operator_prefix + crypto.sha256(sub)) != null;
+    }
+    kv.set(this.cfg.sess_path + "/" + sid, JSON.stringify({
+      sub, is_root,
+      exp: Date.now() + this.cfg.session_ttl_ms,
+    }));
+    response.status = 200;
+    return "ok";
+  }
+
+  // Called from `_middlewares/index.mjs`: returns the auth payload
+  // for this request's sid, or null. Expired rows are swept.
+  guard() {
+    const sid = request.session && request.session.id;
+    if (!sid) return null;
+    const key = this.cfg.sess_path + "/" + sid;
+    const raw = kv.get(key);
+    if (raw == null) return null;
+    let s = null;
+    try { s = JSON.parse(raw); } catch (_) {}
+    if (!s) { kv.delete(key); return null; }
+    if (Date.now() >= s.exp) { kv.delete(key); return null; }
+    return { sub: s.sub, is_root: !!s.is_root };
+  }
+
+  // GET /_rp/poll — the poll page asks "am I signed in yet?".
+  pollStatus() {
+    const a = this.guard();
+    response.status = 200;
+    response.headers = { "content-type": "application/json" };
+    return JSON.stringify({ authed: !!a });
+  }
+
+  // POST /_rp/logout — drop this sid's RP session. The IdP session
+  // is the IdP's own concern (v1: no front/back-channel logout, §4.5).
+  logout() {
+    const sid = request.session && request.session.id;
+    if (sid) kv.delete(this.cfg.sess_path + "/" + sid);
+    response.status = 200;
+    response.headers = { "content-type": "application/json" };
+    return JSON.stringify({ ok: true });
+  }
+}
+
 globalThis.oidc = {
   // oidc.provider("name") → reads `_oidc/config/name`
   // oidc.provider()       → `_oidc/config/default`
@@ -502,5 +807,25 @@ globalThis.oidc = {
       return new OIDCProvider(arg, arg.name || "_inline");
     }
     throw new TypeError("oidc.provider: expected string name or config object");
+  },
+
+  // oidc.rp("name") → reads `_oidc/rp/name`  (the client analog of
+  // oidc.provider). oidc.rp() → `_oidc/rp/default`. oidc.rp({...}) →
+  // inline config. See OIDCRelyingParty for the (grounded) flow.
+  rp(arg) {
+    if (arg == null || typeof arg === "string") {
+      const name = arg || "default";
+      const raw = kv.get("_oidc/rp/" + name);
+      if (raw == null) {
+        throw new Error(
+          "oidc.rp: no RP config at _oidc/rp/" + name +
+          " (seeded at bootstrap; or set via admin setKv).");
+      }
+      return new OIDCRelyingParty(JSON.parse(raw), name);
+    }
+    if (typeof arg === "object") {
+      return new OIDCRelyingParty(arg, arg.name || "_inline");
+    }
+    throw new TypeError("oidc.rp: expected string name or config object");
   },
 };
