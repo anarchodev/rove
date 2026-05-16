@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -21,25 +22,23 @@ TOKEN = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 PUBLIC_SUFFIX = "rewindjsapp.localhost"
 SYSTEM_SUFFIX = "rewindjscom.localhost"
 ADMIN_HOST = f"app.{SYSTEM_SUFFIX}"
+OPERATOR_EMAIL = "operator@example.com"
+# Per-instance request-bucket capacity. Sized for headroom: the
+# operator OIDC handshake (Fork B — admin is a pure RP, no Bearer) is
+# ~15-20 __admin__/__auth__ requests incl. the poll loop, and admin is
+# NOT limiter-exempt anymore (worker_dispatch.zig: "size the bucket,
+# not bypass it"). rl1's bucket is per-instance + independent, so the
+# exhaustion test just sends REQ_CAP then one more → 429.
+REQ_CAP = 40
 
 
-def signup_and_redeem(c: Cluster, cc, name: str) -> None:
-    admin_origin = c.admin_origin()
-    r = curl(
-        cc, f"{admin_origin}/v1/signup",
-        method="POST",
-        headers={"Content-Type": "application/json"},
-        data=json.dumps({"name": name, "email": f"{name}@example.com"}),
-    )
-    if r.status != 202:
-        sys.exit(f"FAIL signup {name}: {r.status} {r.body}")
-    parsed = json.loads(r.body)
-    if not parsed.get("ok"):
-        sys.exit(f"FAIL signup {name}: {r.body}")
-    mt = parsed["magic_link"].split("mt=")[-1]
-    r = curl(cc, f"{admin_origin}/v1/auth?mt={mt}")
-    if r.status != 302:
-        sys.exit(f"FAIL redeem {name}: {r.status}")
+def provision(c: Cluster, cc, op_cookie: str, name: str) -> None:
+    """Create a test tenant via the operator OIDC session (Fork B)."""
+    args = urllib.parse.quote(json.dumps([name]))
+    r = curl(cc, f"{c.admin_origin()}/?fn=createInstance&args={args}",
+             headers={"Cookie": op_cookie})
+    if r.status not in (200, 201):
+        sys.exit(f"FAIL createInstance {name}: {r.status} {r.body}")
 
 
 def main() -> int:
@@ -54,7 +53,7 @@ def main() -> int:
         admin_origin_per_node=True,
         workers_per_node=1,  # buckets are per-worker; one worker keeps the count predictable
         worker_extra_args=[
-            "--rate-limit-request-capacity", "5",
+            "--rate-limit-request-capacity", str(REQ_CAP),
             "--rate-limit-request-refill", "0",
             "--rate-limit-email-capacity", "2",
             "--rate-limit-email-refill", "0",
@@ -65,19 +64,23 @@ def main() -> int:
         print(f"ok  leader elected: node {c.leader_idx} at {c.addrs.http[c.leader_idx]}")
 
         admin_origin = c.admin_origin()
-        c.spawn_files_server(cors_origin=admin_origin, leader_url=admin_origin)
+        c.spawn_files_server(
+            cors_origin=admin_origin, leader_url=admin_origin,
+            extra_args=c.admin_oidc_kv(OPERATOR_EMAIL),
+        )
         c.spawn_log_server(cors_origin=admin_origin)
         c.mint_services_token()
 
         cc = c.curl_ctx(
+            f"auth.{SYSTEM_SUFFIX}",
             f"rl1.{PUBLIC_SUFFIX}",
             f"rl2.{PUBLIC_SUFFIX}",
         )
 
         # Wait for admin tenant to be loaded — via log tail, not HTTP,
-        # because each HTTP request consumes a token from admin's
-        # capacity-5 bucket and the test relies on admin still having
-        # spare tokens for /v1/session at the end.
+        # to keep rl1's bucket pristine for the exhaustion test (the
+        # operator OIDC handshake below hits __admin__/__auth__, NOT
+        # rl1, so rl1's per-instance bucket stays untouched).
         leader_log = Path(f"/tmp/rate-limit-smoke-worker-{c.leader_idx}.out")
         deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline:
@@ -87,13 +90,24 @@ def main() -> int:
                     break
             time.sleep(0.1)
 
-        # 1. Sign up rl1 + rl2.
-        signup_and_redeem(c, cc, "rl1")
-        signup_and_redeem(c, cc, "rl2")
-        print("ok  POST /v1/signup + /v1/auth redeem rl1 + rl2")
+        # __auth__ readiness, then create rl1 + rl2 via the operator
+        # OIDC session and deploy a trivial 200 handler to each
+        # (createInstance only sets the routing marker — unlike the
+        # retired signup it does NOT deployStarter, so the bucket test
+        # gets an explicit handler instead of relying on starter HTML).
+        for _ in range(80):
+            if curl(cc, c.auth_base() + "/login").status == 200:
+                break
+            time.sleep(0.25)
+        op = c.oidc_login(cc, OPERATOR_EMAIL)
+        H = 'export default function () { return { ok: true }; }'
+        for t in ("rl1", "rl2"):
+            provision(c, cc, op, t)
+            c.release(t, c.put_file(t, "index.mjs", H))
+        print("ok  provisioned + deployed rl1 + rl2 (operator OIDC session)")
 
-        # 2. Per-instance request bucket. Wait for rl1's starter deploy
-        # by tailing the leader's worker log — probing via HTTP would
+        # 2. Per-instance request bucket. Wait for rl1's deploy by
+        # tailing the leader's worker log — probing via HTTP would
         # consume a token from the bucket we're about to test.
         rl1 = f"https://rl1.{PUBLIC_SUFFIX}:{c.leader_port()}"
         rl2 = f"https://rl2.{PUBLIC_SUFFIX}:{c.leader_port()}"
@@ -105,14 +119,14 @@ def main() -> int:
                     break
             time.sleep(0.1)
 
-        # Hit rl1 5 times.
-        for i in range(1, 6):
+        # Hit rl1 REQ_CAP times (within capacity).
+        for i in range(1, REQ_CAP + 1):
             r = curl(cc, f"{rl1}/")
             expect_status(f"request {i} (within capacity)", 200, r)
 
-        # 6th: bucket exhausted.
+        # Next one: bucket exhausted.
         r = curl(cc, f"{rl1}/")
-        expect_status("request 6 → 429 (bucket exhausted)", 429, r)
+        expect_status(f"request {REQ_CAP + 1} → 429 (bucket exhausted)", 429, r)
         if "retry-after" not in r.headers:
             sys.exit(f"FAIL Retry-After header missing: {r.headers}")
         if "rate limit exceeded" not in r.body:
@@ -131,12 +145,11 @@ def main() -> int:
         r = curl(cc, f"{rl2}/")
         expect_status("rl2 not affected by rl1's exhaustion", 200, r)
 
-        # 4. Admin bypasses limit.
-        r = curl(
-            cc, f"{admin_origin}/v1/session",
-            headers={"Authorization": f"Bearer {TOKEN}"},
-        )
-        expect_status("admin requests bypass the rate limit", 200, r)
+        # (The retired "admin bypasses the limit" step tested behavior
+        # that no longer exists — admin is bucketed like any tenant
+        # now; see worker_dispatch.zig "size the bucket, not bypass
+        # it". The per-instance independence above is the real
+        # coverage.)
 
         # 5. Email bucket: catchable rate_limited.
         email_handler = '''export default function () {

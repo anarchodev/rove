@@ -18,6 +18,7 @@ import secrets
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -34,19 +35,17 @@ SSE_PORT = 8268
 SSE_HOST = f"sse.{PUBLIC_SUFFIX}"
 
 
-def signup_redeem(c: Cluster, cc, name: str) -> None:
-    r = curl(
-        cc, f"{c.admin_origin()}/v1/signup",
-        method="POST",
-        headers={"Content-Type": "application/json"},
-        data=json.dumps({"name": name, "email": f"{name}@example.com"}),
-    )
-    if '"ok":true' not in r.body:
-        sys.exit(f"FAIL signup {name}: {r.body}")
-    mt = json.loads(r.body)["magic_link"].split("mt=")[-1]
-    r = curl(cc, f"{c.admin_origin()}/v1/auth?mt={mt}")
-    if r.status != 302:
-        sys.exit(f"FAIL redeem {name}: {r.status}")
+OPERATOR_EMAIL = "operator@example.com"
+
+
+def provision(c: Cluster, cc, op_cookie: str, name: str) -> None:
+    """Create a test tenant via the operator OIDC session (self-serve
+    signup is gone — Fork B; admin is a pure OIDC RP)."""
+    args = urllib.parse.quote(json.dumps([name]))
+    r = curl(cc, f"{c.admin_origin()}/?fn=createInstance&args={args}",
+             headers={"Cookie": op_cookie})
+    if r.status not in (200, 201):
+        sys.exit(f"FAIL createInstance {name}: {r.status} {r.body}")
 
 
 HANDLER_SRC = '''export default function () {
@@ -97,11 +96,15 @@ def main() -> int:
         print(f"ok  leader elected: node {c.leader_idx} at {c.addrs.http[c.leader_idx]}")
 
         admin_origin = c.admin_origin()
-        c.spawn_files_server(cors_origin=admin_origin, leader_url=admin_origin)
+        c.spawn_files_server(
+            cors_origin=admin_origin, leader_url=admin_origin,
+            extra_args=c.admin_oidc_kv(OPERATOR_EMAIL),
+        )
         c.spawn_log_server(cors_origin=admin_origin)
         c.mint_services_token()
 
         cc = c.curl_ctx(
+            f"auth.{SYSTEM_SUFFIX}",
             f"{TENANT_A}.{PUBLIC_SUFFIX}",
             f"{TENANT_B}.{PUBLIC_SUFFIX}",
         )
@@ -109,15 +112,26 @@ def main() -> int:
         tenant_b_origin = f"https://{TENANT_B}.{PUBLIC_SUFFIX}:{c.leader_port()}"
 
         leader_log = Path(f"/tmp/notifications-smoke-worker-{c.leader_idx}.out")
-        deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline:
-            if leader_log.exists() and "tenant __admin__ loaded deployment" in leader_log.read_text(errors="replace"):
-                break
-            time.sleep(0.1)
 
-        signup_redeem(c, cc, TENANT_A)
-        signup_redeem(c, cc, TENANT_B)
-        print(f"ok  signed up two tenants ({TENANT_A}, {TENANT_B})")
+        # Readiness: unauthenticated admin RPC 401s once the admin
+        # deploy loaded AND `_oidc/rp/default` is seeded (RP middleware
+        # 500s until the bootstrap-kv lands), then the IdP is up.
+        deadline = time.monotonic() + 20.0
+        r = curl(cc, f"{admin_origin}/?fn=listInstance",
+                 headers={"Origin": admin_origin})
+        while time.monotonic() < deadline and r.status != 401:
+            time.sleep(0.25)
+            r = curl(cc, f"{admin_origin}/?fn=listInstance",
+                     headers={"Origin": admin_origin})
+        for _ in range(80):
+            if curl(cc, c.auth_base() + "/login").status == 200:
+                break
+            time.sleep(0.25)
+
+        op = c.oidc_login(cc, OPERATOR_EMAIL)
+        provision(c, cc, op, TENANT_A)
+        provision(c, cc, op, TENANT_B)
+        print(f"ok  provisioned two tenants ({TENANT_A}, {TENANT_B})")
 
         # Deploy events.emit handler to both tenants.
         for tenant in (TENANT_A, TENANT_B):

@@ -69,12 +69,18 @@ HANDLER_SRC = '''export default function () {
 }'''
 
 
+OPERATOR_EMAIL = "operator@example.com"
+# Operator OIDC session cookie, set in main() (Fork B — admin is a
+# pure RP, no Bearer). kv_get reads it for the scoped admin call.
+_OP: dict = {}
+
+
 def kv_get(c: Cluster, cc, key: str) -> str:
     args = urllib.parse.quote(json.dumps([key, "", 100]))
     r = curl(
         cc, f"{c.admin_origin()}/?fn=listKv&args={args}",
         headers={
-            "Authorization": f"Bearer {TOKEN}",
+            "Cookie": _OP["cookie"],
             "X-Rove-Scope": "trigsmoke",
         },
     )
@@ -85,19 +91,13 @@ def kv_get(c: Cluster, cc, key: str) -> str:
     return ""
 
 
-def signup_redeem(c: Cluster, cc, name: str, email: str) -> None:
-    r = curl(
-        cc, f"{c.admin_origin()}/v1/signup",
-        method="POST",
-        headers={"Content-Type": "application/json"},
-        data=json.dumps({"name": name, "email": email}),
-    )
-    if '"ok":true' not in r.body:
-        sys.exit(f"FAIL signup: {r.body}")
-    mt = json.loads(r.body)["magic_link"].split("mt=")[-1]
-    r = curl(cc, f"{c.admin_origin()}/v1/auth?mt={mt}")
-    if r.status != 302:
-        sys.exit(f"FAIL redeem: {r.status}")
+def provision(c: Cluster, cc, name: str) -> None:
+    """Create a test tenant via the operator OIDC session (Fork B)."""
+    args = urllib.parse.quote(json.dumps([name]))
+    r = curl(cc, f"{c.admin_origin()}/?fn=createInstance&args={args}",
+             headers={"Cookie": _OP["cookie"]})
+    if r.status not in (200, 201):
+        sys.exit(f"FAIL createInstance {name}: {r.status} {r.body}")
 
 
 def main() -> int:
@@ -116,11 +116,14 @@ def main() -> int:
         print(f"ok  leader elected: node {c.leader_idx} at {c.addrs.http[c.leader_idx]}")
 
         admin_origin = c.admin_origin()
-        c.spawn_files_server(cors_origin=admin_origin, leader_url=admin_origin)
+        c.spawn_files_server(
+            cors_origin=admin_origin, leader_url=admin_origin,
+            extra_args=c.admin_oidc_kv(OPERATOR_EMAIL),
+        )
         c.spawn_log_server(cors_origin=admin_origin)
         c.mint_services_token()
 
-        cc = c.curl_ctx(f"trigsmoke.{PUBLIC_SUFFIX}")
+        cc = c.curl_ctx(f"auth.{SYSTEM_SUFFIX}", f"trigsmoke.{PUBLIC_SUFFIX}")
         tenant_origin = f"https://trigsmoke.{PUBLIC_SUFFIX}:{c.leader_port()}"
 
         # Wait for admin tenant.
@@ -132,17 +135,24 @@ def main() -> int:
                     break
             time.sleep(0.1)
 
-        signup_redeem(c, cc, "trigsmoke", "trigsmoke@example.com")
-        print("ok  POST /v1/signup + /v1/auth redeem trigsmoke")
-
-        # Wait for trigsmoke starter to load (one of the dispatcher's
-        # async paths) before we PUT files — files-server's deploy is
-        # independent but the worker's snapshot needs to exist.
-        deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline:
-            if "tenant trigsmoke loaded deployment" in leader_log.read_text(errors="replace"):
+        # RP-config-seeded + IdP readiness, then operator login →
+        # createInstance (Fork B; createInstance only sets the routing
+        # marker — no starter — so the put_file/release below is what
+        # gives trigsmoke its first deployment).
+        deadline = time.monotonic() + 20.0
+        r = curl(cc, f"{admin_origin}/?fn=listInstance",
+                 headers={"Origin": admin_origin})
+        while time.monotonic() < deadline and r.status != 401:
+            time.sleep(0.25)
+            r = curl(cc, f"{admin_origin}/?fn=listInstance",
+                     headers={"Origin": admin_origin})
+        for _ in range(80):
+            if curl(cc, c.auth_base() + "/login").status == 200:
                 break
-            time.sleep(0.1)
+            time.sleep(0.25)
+        _OP["cookie"] = c.oidc_login(cc, OPERATOR_EMAIL)
+        provision(c, cc, "trigsmoke")
+        print("ok  provisioned trigsmoke (operator OIDC session)")
 
         dep_id = c.put_file("trigsmoke", "_triggers/users/sessions/index.mjs", TRIGGER_SRC)
         c.release("trigsmoke", dep_id)

@@ -29,6 +29,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -133,7 +134,10 @@ def main() -> int:
         c.discover_leader()
         admin_origin = c.admin_origin()
         leader_port = c.leader_port()
-        c.spawn_files_server(cors_origin=admin_origin, leader_url=admin_origin)
+        c.spawn_files_server(
+            cors_origin=admin_origin, leader_url=admin_origin,
+            extra_args=c.admin_oidc_kv("dev@example.com"),  # operator
+        )
         c.spawn_log_server(cors_origin=admin_origin)
         c.mint_services_token()
         print(f"  leader:       {c.addrs.http[c.leader_idx]}", flush=True)
@@ -157,41 +161,25 @@ def main() -> int:
                 print(f"  warn: {TENANT_ID} /throw → {r.status} (expected 500)", flush=True)
         print(f"  drove 5 ok + 2 throw requests through {TENANT_ID}", flush=True)
 
-        # Sign up an admin user so there's a session to log into the
-        # dashboard with. In dev (no email backend) /v1/signup
-        # returns the magic-link inline; click it once to mint the
-        # cookie, then the dashboard works like normal.
-        admin_cc = c.curl_ctx()
-        r = curl(
-            admin_cc,
-            f"{admin_origin}/v1/signup",
-            method="POST",
-            headers={"Content-Type": "application/json"},
-            data='{"name":"dev","email":"dev@example.com"}',
-        )
-        # Signup returns 202 (accepted) in dev. When no Resend key is
-        # configured, the response body carries `magic_link` inline so
-        # we can paste it; otherwise the link was emailed and we'd
-        # have to read the user's inbox.
-        magic_link = None
-        if r.status in (200, 202):
-            try:
-                magic_link = json.loads(r.body).get("magic_link")
-            except json.JSONDecodeError:
-                pass
+        # Fork B: admin is a pure OIDC relying party. To log into the
+        # dashboard the human visits /_rp/login, which bounces to the
+        # __auth__ IdP; entering an email there returns the magic-link
+        # inline in dev (no email backend). `dev@example.com` is seeded
+        # into the operator allowlist above, so that login is is_root.
+        rp_login = (admin_origin
+                    + "/_rp/login?return_to="
+                    + urllib.parse.quote("/#/instances"))
 
         print("", flush=True)
         print("══════════════════════════════════════════════════════════════", flush=True)
         print(" dashboard URLs (paste into your browser)", flush=True)
         print("══════════════════════════════════════════════════════════════", flush=True)
-        if magic_link:
-            print(f"  1. one-click login (mints the session cookie):", flush=True)
-            print(f"     {magic_link}", flush=True)
-            print(f"  2. dashboard root after login:", flush=True)
-            print(f"     {admin_origin}/", flush=True)
-        else:
-            print(f"  signup didn't return a magic link (status={r.status})", flush=True)
-            print(f"  visit {admin_origin}/ and sign up by hand", flush=True)
+        print("  1. sign in (OIDC RP → IdP magic-link, inline in dev):", flush=True)
+        print(f"     {rp_login}", flush=True)
+        print("     → enter  dev@example.com  (seeded operator),", flush=True)
+        print("       click the inline magic link, you land logged in.", flush=True)
+        print("  2. dashboard root after login:", flush=True)
+        print(f"     {admin_origin}/", flush=True)
         print("", flush=True)
         print("  replay shell (opened automatically by the Replay button):", flush=True)
         print(f"    https://replay.{public_suffix}:{leader_port}/", flush=True)

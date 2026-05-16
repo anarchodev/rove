@@ -747,6 +747,45 @@ class Cluster:
     def admin_origin(self) -> str:
         return f"https://{self.addrs.admin_host}:{self.leader_port()}"
 
+    # ── Admin OIDC (Fork B): the admin surface is a pure OIDC RP.
+    # Smokes that drive admin RPCs seed the RP config + an operator
+    # allowlist via these two helpers (the rove-loop46-serve.sh prod
+    # channel) and authenticate with a real RP handshake. ──
+
+    def auth_base(self) -> str:
+        return f"https://auth.{self.addrs.system_suffix}:{self.leader_port()}"
+
+    def admin_oidc_kv(self, *operator_emails: str) -> list[str]:
+        """`--bootstrap-kv` args seeding `_oidc/rp/default` (admin RP
+        config, host-derived) + an `_admin/operator/{sha256(email)}`
+        allowlist entry per operator. Call AFTER `discover_leader`
+        (needs the leader port). Pass to `spawn_files_server(extra_args=…)`.
+        """
+        rp_cfg = json.dumps({
+            "issuer": self.auth_base(),
+            "client_id": "admin-dashboard",
+            "redirect_uri": f"{self.admin_origin()}/_rp/callback",
+            "post_login": "/",
+            "operator_prefix": "_admin/operator/",
+        }, separators=(",", ":"))
+        args = ["--bootstrap-kv", "_oidc/rp/default=" + rp_cfg]
+        for em in operator_emails:
+            h = hashlib.sha256(em.encode()).hexdigest()
+            args += ["--bootstrap-kv", f"_admin/operator/{h}="]
+        return args
+
+    def oidc_login(self, cc: "CurlContext", email: str) -> str:
+        """Full OIDC RP handshake as `email`; returns the app session
+        cookie for authenticated admin calls. is_root iff `email` was
+        seeded via `admin_oidc_kv`. `cc` must --resolve the IdP host
+        (`auth.{system_suffix}`) — pass it to `curl_ctx`."""
+        return idp_login(
+            cc,
+            email=email,
+            app_origin=self.admin_origin(),
+            auth_base=self.auth_base(),
+        )
+
     # ── Standalones (files-server, log-server) ─────────────────────────
 
     def spawn_files_server(

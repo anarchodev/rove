@@ -34,6 +34,7 @@ PUBLIC_SUFFIX = "rewindjsapp.localhost"
 SYSTEM_SUFFIX = "rewindjscom.localhost"
 ADMIN_HOST = f"app.{SYSTEM_SUFFIX}"
 TENANT = "notifbrowsmoke"
+OPERATOR_EMAIL = "operator@example.com"
 SSE_HOST = f"sse.{PUBLIC_SUFFIX}"
 SSE_PORT = 8278
 STRIPE_PORT = 9202
@@ -333,11 +334,14 @@ def main() -> int:
             print(f"ok  leader elected: node {c.leader_idx} at {c.addrs.http[c.leader_idx]}")
 
             admin_origin = c.admin_origin()
-            c.spawn_files_server(cors_origin=admin_origin, leader_url=admin_origin)
+            c.spawn_files_server(
+                cors_origin=admin_origin, leader_url=admin_origin,
+                extra_args=c.admin_oidc_kv(OPERATOR_EMAIL),
+            )
             c.spawn_log_server(cors_origin=admin_origin)
             c.mint_services_token()
 
-            cc = c.curl_ctx(f"{TENANT}.{PUBLIC_SUFFIX}")
+            cc = c.curl_ctx(f"auth.{SYSTEM_SUFFIX}", f"{TENANT}.{PUBLIC_SUFFIX}")
             tenant_origin = f"https://{TENANT}.{PUBLIC_SUFFIX}:{c.leader_port()}"
 
             # Wait for admin tenant.
@@ -348,20 +352,27 @@ def main() -> int:
                     break
                 time.sleep(0.1)
 
-            # Signup.
-            r = curl(
-                cc, f"{admin_origin}/v1/signup",
-                method="POST",
-                headers={"Content-Type": "application/json"},
-                data=json.dumps({"name": TENANT, "email": f"{TENANT}@example.com"}),
-            )
-            if '"ok":true' not in r.body:
-                sys.exit(f"FAIL signup: {r.body}")
-            mt = json.loads(r.body)["magic_link"].split("mt=")[-1]
-            r = curl(cc, f"{admin_origin}/v1/auth?mt={mt}")
-            if r.status != 302:
-                sys.exit(f"FAIL redeem: {r.status}")
-            print(f"ok  signed up tenant {TENANT}")
+            # Operator OIDC session → createInstance (Fork B: admin
+            # is a pure RP, no Bearer/signup). RP-config + IdP
+            # readiness first.
+            deadline = time.monotonic() + 20.0
+            rr = curl(cc, f"{admin_origin}/?fn=listInstance",
+                      headers={"Origin": admin_origin})
+            while time.monotonic() < deadline and rr.status != 401:
+                time.sleep(0.25)
+                rr = curl(cc, f"{admin_origin}/?fn=listInstance",
+                          headers={"Origin": admin_origin})
+            for _ in range(80):
+                if curl(cc, c.auth_base() + "/login").status == 200:
+                    break
+                time.sleep(0.25)
+            op = c.oidc_login(cc, OPERATOR_EMAIL)
+            ci_args = urllib.parse.quote(json.dumps([TENANT]))
+            r = curl(cc, f"{admin_origin}/?fn=createInstance&args={ci_args}",
+                     headers={"Cookie": op})
+            if r.status not in (200, 201):
+                sys.exit(f"FAIL createInstance: {r.status} {r.body}")
+            print(f"ok  provisioned tenant {TENANT} (operator OIDC session)")
 
             # Wait for starter to land first.
             deadline = time.monotonic() + 15.0
@@ -418,7 +429,7 @@ def main() -> int:
                 r = curl(
                     cc, f"{admin_origin}/?fn=listKv&args={list_args}",
                     headers={
-                        "Authorization": f"Bearer {TOKEN}",
+                        "Cookie": op,
                         "X-Rove-Scope": TENANT,
                     },
                 )
