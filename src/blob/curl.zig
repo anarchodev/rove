@@ -61,9 +61,33 @@ pub const Response = struct {
     /// allocate). For other methods this is always non-null even on
     /// non-2xx — error bodies are useful for diagnostics.
     body: ?[]u8,
+    /// Response headers, name+value allocator-owned. Captured for
+    /// every method (ACME is header-driven: `Replay-Nonce` on every
+    /// POST, `Location` for account/order URLs). Existing callers
+    /// (S3) simply ignore this. Use `header()` for a case-insensitive
+    /// lookup of the last occurrence.
+    headers: []Header = &.{},
+
+    /// Case-insensitive lookup (HTTP header names are case-insensitive;
+    /// returns the last match — fine for the single-valued headers
+    /// ACME reads).
+    pub fn header(self: *const Response, name: []const u8) ?[]const u8 {
+        var i: usize = self.headers.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.ascii.eqlIgnoreCase(self.headers[i].name, name))
+                return self.headers[i].value;
+        }
+        return null;
+    }
 
     pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
         if (self.body) |b| allocator.free(b);
+        for (self.headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        allocator.free(self.headers);
         self.* = undefined;
     }
 };
@@ -246,6 +270,20 @@ pub const Easy = struct {
             _ = c.curl_easy_setopt(self.handle, c.CURLOPT_WRITEDATA, @as(*anyopaque, @ptrCast(&write_ctx)));
         }
 
+        // Response-header capture (always — cheap; ACME needs it,
+        // S3 ignores it).
+        var hdr_list: std.ArrayListUnmanaged(Header) = .empty;
+        errdefer {
+            for (hdr_list.items) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            hdr_list.deinit(allocator);
+        }
+        var hdr_ctx: HeaderCtx = .{ .allocator = allocator, .list = &hdr_list };
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_HEADERFUNCTION, @as(*const fn (*anyopaque, usize, usize, *anyopaque) callconv(.c) usize, &headerResp));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_HEADERDATA, @as(*anyopaque, @ptrCast(&hdr_ctx)));
+
         const rc = c.curl_easy_perform(self.handle);
         if (rc != c.CURLE_OK) {
             std.log.warn("curl: {s} {s} failed: rc={d} msg={s}", .{
@@ -263,6 +301,7 @@ pub const Easy = struct {
             // Same as above: errdefer frees resp_buf on return.
             return Error.OutOfMemory;
         }
+        if (hdr_ctx.alloc_failed) return Error.OutOfMemory;
 
         var status_long: c_long = 0;
         _ = c.curl_easy_getinfo(self.handle, c.CURLINFO_RESPONSE_CODE, &status_long);
@@ -273,7 +312,11 @@ pub const Easy = struct {
             break :blk null;
         } else try resp_buf.toOwnedSlice(allocator);
 
-        return .{ .status = status, .body = body_owned };
+        return .{
+            .status = status,
+            .body = body_owned,
+            .headers = try hdr_list.toOwnedSlice(allocator),
+        };
     }
 };
 
@@ -444,6 +487,45 @@ fn writeResp(ptr: *anyopaque, size: usize, nmemb: usize, userdata: *anyopaque) c
     ctx.buf.appendSlice(ctx.allocator, src[0..n]) catch {
         ctx.alloc_failed = true;
         return 0;
+    };
+    return n;
+}
+
+const HeaderCtx = struct {
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(Header),
+    alloc_failed: bool = false,
+};
+
+/// CURLOPT_HEADERFUNCTION: one call per header line, including the
+/// `HTTP/x NNN` status line and the terminating blank line (and one
+/// such block per intermediate response on redirects/100-continue).
+/// We keep only `Name: value` lines; the status line (no colon) and
+/// blank lines are skipped. Last-occurrence wins via `Response.header`.
+fn headerResp(ptr: *anyopaque, size: usize, nmemb: usize, userdata: *anyopaque) callconv(.c) usize {
+    const ctx: *HeaderCtx = @ptrCast(@alignCast(userdata));
+    const n = size * nmemb;
+    if (ctx.alloc_failed) return n; // keep consuming; fail at the call site
+    const src: [*]const u8 = @ptrCast(ptr);
+    const line = std.mem.trimRight(u8, src[0..n], "\r\n");
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return n;
+    const name = std.mem.trim(u8, line[0..colon], " \t");
+    const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+    if (name.len == 0) return n;
+    const name_copy = ctx.allocator.dupe(u8, name) catch {
+        ctx.alloc_failed = true;
+        return n;
+    };
+    const value_copy = ctx.allocator.dupe(u8, value) catch {
+        ctx.allocator.free(name_copy);
+        ctx.alloc_failed = true;
+        return n;
+    };
+    ctx.list.append(ctx.allocator, .{ .name = name_copy, .value = value_copy }) catch {
+        ctx.allocator.free(name_copy);
+        ctx.allocator.free(value_copy);
+        ctx.alloc_failed = true;
+        return n;
     };
     return n;
 }

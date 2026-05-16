@@ -270,6 +270,21 @@ pub fn build(b: *std.Build) void {
     // (rove-blob's `curl.Easy`).
     schedule_server_mod.addImport("rove-blob", blob_mod);
 
+    // ── rove-acme: in-tree ACME (RFC 8555) HTTP-01 client + :80
+    //    challenge responder (auth-domain-plan.md §3.2). Issues
+    //    per-host certs into the Phase-2c custom-cert dir. OpenSSL
+    //    for EC keygen / ES256 / CSR (same libs as rove-h2); libcurl
+    //    (rove-blob) for the CA HTTP calls.
+    const acme_mod = b.addModule("rove-acme", .{
+        .root_source_file = b.path("src/acme/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    acme_mod.link_libc = true;
+    acme_mod.linkSystemLibrary("ssl", .{});
+    acme_mod.linkSystemLibrary("crypto", .{});
+    acme_mod.addImport("rove-blob", blob_mod);
+
     // ── rove-files-server: per-instance code operations (Phase 5) ──
     //
     // Compile + upload + deploy + source fetch, wrapping rove-files.
@@ -475,6 +490,7 @@ pub fn build(b: *std.Build) void {
     loop46_mod.addImport("rove-tenant", tenant_mod);
     loop46_mod.addImport("rove-h2", h2_mod);
     loop46_mod.addImport("rove-schedule-server", schedule_server_mod);
+    loop46_mod.addImport("rove-acme", acme_mod);
     // The admin + replay tenant bundles + UI files used to be
     // embedded into the loop46 binary so the worker could
     // bootstrap-deploy them at startup. Phase 5.5(e) step 3 moved
