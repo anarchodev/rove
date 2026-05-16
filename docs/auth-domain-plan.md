@@ -10,11 +10,12 @@ design + forks A/B accepted. Implementation in progress —
 3-1/3-2 RSA-RS256 crypto + JS bindings (`eb0f823`, unit-tested),
 3-3 `oidc.js` provider (`1e32329`),
 3-4 `__auth__` IdP tenant + web/auth (`d144977`), 3-5 §4.6 rotation
-wiring + grounded dedupe correction (`cfa4014`). All build +
-suite-green, **but no request has yet flowed through the OIDC flow —
-NOT behaviorally verified.** Remaining: 3-6 dashboards→RP shims
-(admin last) + the OIDC conformance smoke that behaviorally gates it
-all (the only end-to-end proof).** One Phase-2 follow-up tracked: ACME renewal /
+(`cfa4014`), 3-6 OIDC conformance gate (`2e6faa3`). **The OIDC chain
+(3-1→3-5) is conformance-verified end-to-end — `scripts/oidc_smoke.py`
+passes twice non-flaky incl. pure-Python RS256-vs-JWKS, §0, §4.6
+rotation (see §4.7 "Landed").** Remaining: 3-6 part 2 — the Fork-B
+dashboard→RP migration (admin last); now safe since the IdP is
+proven. Phase-2 follow-up tracked: ACME renewal /
 expiry-driven reissue (§3.2). Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
 Phases 1–3 land (see §6, §7).
@@ -829,6 +830,37 @@ published JWKS (proves host-relative `iss`, RS256, and the
 magic-link→code→token chain end-to-end), then a follower/second-host
 check that the same `iss`/JWKS works there (host-relative invariant).
 
+**Landed + conformance-verified 2026-05-16** (`scripts/oidc_smoke.py`,
+commits `eb0f823` 3-1/3-2 · `1e32329` 3-3 · `d144977` 3-4 · `cfa4014`
+3-5 · `2e6faa3` 3-6 gate). The smoke passes **twice, non-flaky**:
+discovery → magic-link → `/authorize`(PKCE) → `/token` → `id_token`
+**cryptographically RS256-verified (pure-Python) against the published
+JWKS** → refresh grant → §0 (2nd host ⇒ `iss` reflects it) → §4.6
+rotation (`next`→promoted; a pre-rotation token still verifies against
+the retiring key). This is the behavioral proof of the whole 3-1→3-5
+chain.
+
+Two grounded corrections the gate forced:
+- **Client registry lives at `_oidc/config/{name}`, not
+  `_config/oidc/*`.** `_config/` is a platform-reserved prefix
+  (handlers/admin can't write it; `reserved.zig`), and its only
+  writer — `config_mirror` via `loop46 seed` — is **not wired into
+  the files-server release/loader path** (the loader's doc claims it;
+  the code doesn't). This is a *pre-existing platform gap that also
+  affects `oauth.js`'s `_config/oauth/*`* — flagged as a separate
+  follow-up, not OIDC's to fix. The IdP's registry is operational
+  data (operators add/remove RP clients without a redeploy), so a
+  normal admin-managed kv key is the more correct model anyway.
+- The `__auth__` IdP's own state (`_oidc/keyset|session|code|magic`)
+  is under the **non-reserved** `_oidc/` prefix — verified against
+  `reserved.zig`'s `PLATFORM_KV_PREFIXES` — so the handler writes are
+  allowed.
+
+**Remaining (3-6 part 2):** the Fork-B dashboard→RP migration
+(relocate admin's magic-link into `__auth__`; replay/logs/admin become
+RPs; **admin last** — the live-auth-regression risk). Sequenced after
+the gate deliberately: it is now *safe* because the IdP is proven.
+
 ---
 
 ## 5. Decisions (accepted 2026-05-15)
@@ -1006,3 +1038,14 @@ sub-plan index. Hold until Phases 1–3 land.
   encryption before the envelope-2 write. Bounds the "private keys in
   raft log/snapshots/backups" caveat. Decide during 2b implementation;
   does not block the architecture.
+- **Pre-existing platform gap (found during 3-6):** `config_mirror`
+  (`_config/**.json` → kv) is only called by `loop46 seed`; the
+  files-server release/loader path does **not** invoke it, though
+  `deployment_loader.zig`'s doc-comment claims it does. So
+  `_config/*` from a files-server-deployed bundle never reaches kv.
+  This affects `oauth.js`'s `_config/oauth/*` (customer OAuth config
+  via the normal deploy path), not just OIDC — OIDC sidestepped it by
+  using the admin-managed `_oidc/config/*` key. Either wire
+  `mirrorConfigToKv` into the loader (matching its doc) or update the
+  doc + define the supported config-provisioning path. Not OIDC's to
+  fix; tracked here so it isn't lost.
