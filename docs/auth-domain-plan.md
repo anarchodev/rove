@@ -1,14 +1,13 @@
 # Auth + domain layout plan
 
-**Status:** Phase 0 complete; **Phase 1 + Phase 2c landed +
-smoke-verified 2026-05-15** (see §6 / §3.3). Phase 2: 2a (lego
-wildcard, unchanged) and **2b in-tree ACME — landed + end-to-end
-verified against Pebble 2026-05-16** (`fd3c53c`/`927fd88`/`38147f9`/
-`c39ab26`; see §3.2 "Landed"); **2d (operator mTLS) is the only
-Phase-2 item left** — bolts onto the 2c store. §5 decisions accepted
-2026-05-15. Key-rotation design pass added 2026-05-15 (§4.6 —
-resolves the former §9 highest-risk item). Phase 3 (OIDC) not yet
-started. Not yet reflected in `PLAN.md` §7/§13 or
+**Status:** Phase 0 complete. **Phases 1, 2 fully landed +
+smoke-verified (2026-05-15/16).** Phase 1 + 2c (§6/§3.3); 2a (lego
+wildcard, unchanged); 2b in-tree ACME end-to-end verified against
+Pebble (`fd3c53c`/`927fd88`/`38147f9`/`c39ab26`, §3.2 "Landed"); 2d
+operator mTLS verified (`779e482`, §3.5 "Landed"). §5 decisions
+accepted 2026-05-15; key-rotation design pass §4.6. **Next: Phase 3
+(OIDC) — not yet started.** One Phase-2 follow-up tracked: ACME
+renewal / expiry-driven reissue (§3.2). Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
 Phases 1–3 land (see §6, §7).
 
@@ -523,6 +522,18 @@ status / error matches the contract above. New smoke; not part of
 - `docs/deployment.md` (Phase 4 docs sweep). One section on minting
   a CA, generating a client cert, installing the P12 into a
   browser, and the `--require-client-cert-ca` flag.
+
+**Landed + smoke-verified 2026-05-16** (`779e482`). `buildSslCtx`
+applies `SSL_CTX_load_verify_locations` + `SSL_CTX_set_verify(PEER |
+FAIL_IF_NO_PEER_CERT)` when `client_ca_path` is set, threaded through
+`createFromFiles`/`reloadIfChanged`/`reloadCustomCertsImpl` so it
+covers the default ctx and every per-host SNI ctx via the one code
+path. `--require-client-cert-ca` + env `LOOP46_REQUIRE_CLIENT_CERT_CA`.
+Off by default — `zig build test` + cookie_auth + custom_domain_tls
+green, no regression. `scripts/client_cert_smoke.py` proves the
+contract (valid CA cert → TLS ok / no cert → refused / wrong CA →
+refused). Out-of-v1 deferrals (per-host CA, JS APIs, CRL/OCSP)
+unchanged.
 
 ---
 
