@@ -1,13 +1,14 @@
 # Auth + domain layout plan
 
 **Status:** Phase 0 complete; **Phase 1 + Phase 2c landed +
-smoke-verified 2026-05-15** (see §6 / §3.3). Phase 2 remaining: 2a
-(lego wildcard, unchanged), **2b in-tree ACME — code-complete +
-committed 2026-05-15 (`fd3c53c`/`927fd88`/`38147f9`), builds + unit
-green; end-to-end Pebble run still pending (see §3.2 "Landed")**, 2d
-(operator mTLS) — bolts onto the 2c store. §5 decisions accepted 2026-05-15. Key-rotation
-design pass added 2026-05-15 (§4.6 — resolves the former §9
-highest-risk item). Phases 2–3 not yet started. Not yet reflected in `PLAN.md` §7/§13 or
+smoke-verified 2026-05-15** (see §6 / §3.3). Phase 2: 2a (lego
+wildcard, unchanged) and **2b in-tree ACME — landed + end-to-end
+verified against Pebble 2026-05-16** (`fd3c53c`/`927fd88`/`38147f9`/
+`c39ab26`; see §3.2 "Landed"); **2d (operator mTLS) is the only
+Phase-2 item left** — bolts onto the 2c store. §5 decisions accepted
+2026-05-15. Key-rotation design pass added 2026-05-15 (§4.6 —
+resolves the former §9 highest-risk item). Phase 3 (OIDC) not yet
+started. Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
 Phases 1–3 land (see §6, §7).
 
@@ -305,19 +306,24 @@ required `mkcert`. Production readiness additionally gated by a manual
 run against LE *staging* before prod-endpoint cutover (mirrors
 `rove-lego-renew.sh`'s `ACME_STAGING` switch).
 
-**Landed 2026-05-15 (code-complete; end-to-end unverified).** Commits
+**Landed + end-to-end verified against Pebble 2026-05-16.** Commits
 `fd3c53c` (curl header capture + `src/acme/{crypto,responder,client}`),
 `927fd88` (`src/loop46/acme.zig` leader-gated issuance + every-node
 materializer + envelope-2 replication + CLI), `38147f9`
-(`scripts/acme_issue_smoke.py`). Builds clean; crypto + responder
-inline tests green; full `zig build test` + cli tests no regression;
-inert unless `--acme-directory` + `--custom-cert-dir` both set.
-**Caveat:** the Pebble gate's *skip path* is verified, but the
-end-to-end ACME flow has **not** been executed (no `pebble` in the dev
-sandbox) — it is the one remaining verification, to run wherever
-Pebble is installed, before 2b is trusted in production. Renewal /
-expiry-driven reissue is not yet implemented (v1 issues when
-`cert/{host}` is absent only) — a follow-up.
+(`scripts/acme_issue_smoke.py`), `c39ab26` (the fixes the gate
+surfaced). `scripts/acme_issue_smoke.py` ran to completion **twice
+(non-flaky)**: the leader issues via real RFC 8555, the cert
+replicates via envelope-2, and a **follower** serves the
+Pebble-issued cert by SNI (the raft distribution path proven, not
+just issuance). Full `zig build test` + cli/crypto/responder unit
+tests green; inert unless `--acme-directory` + `--custom-cert-dir`
+both set. Bugs the gate caught + fixed (`c39ab26`): missing
+User-Agent (CAs 400 a UA-less request — was a latent bug for *all*
+HTTP), no `badNonce` retry (RFC 8555 §6.5; Pebble rejects ~5% of
+nonces deliberately), responder bound on every node (collided on a
+single host) → now leader-only + lazily bound. **Remaining
+follow-up:** renewal / expiry-driven reissue (v1 issues only when
+`cert/{host}` is absent).
 
 ### 3.3 SNI cert selection in rove-h2 — separate workstream (serving)
 
