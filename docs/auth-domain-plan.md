@@ -2,8 +2,10 @@
 
 **Status:** Phase 0 complete; **Phase 1 + Phase 2c landed +
 smoke-verified 2026-05-15** (see §6 / §3.3). Phase 2 remaining: 2a
-(lego wildcard, unchanged), 2b (in-tree :80 HTTP-01 ACME), 2d
-(operator mTLS) — 2b/2d bolt onto the 2c store. §5 decisions accepted 2026-05-15. Key-rotation
+(lego wildcard, unchanged), **2b in-tree ACME — code-complete +
+committed 2026-05-15 (`fd3c53c`/`927fd88`/`38147f9`), builds + unit
+green; end-to-end Pebble run still pending (see §3.2 "Landed")**, 2d
+(operator mTLS) — bolts onto the 2c store. §5 decisions accepted 2026-05-15. Key-rotation
 design pass added 2026-05-15 (§4.6 — resolves the former §9
 highest-risk item). Phases 2–3 not yet started. Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
@@ -72,7 +74,7 @@ Two registrable domains, both operator-owned (acquired 2026-05-15):
 | Domain | Purpose | Cert | Resolution |
 |---|---|---|---|
 | `*.rewindjs.app` | Customer tenants (`{id}.rewindjs.app`) | wildcard, DNS-01 (operator zone) | `{id}.{public_suffix}` fallback in `resolveDomain` |
-| `rewindjs.com` | System surfaces (`app.`, `replay.`, `auth.`, `logs.`, `files.`, `sse.`) | wildcard, DNS-01 (operator zone) | explicit `domain/{host}` map entries on system tenants |
+| `rewindjs.com` (apex + `*.rewindjs.com`) | Marketing landing on apex (`__marketing__`) + system surfaces on subdomains (`app.`, `replay.`, `auth.`, `logs.`, `files.`, `sse.`) | apex + wildcard SAN, DNS-01 (operator zone) — `rove-lego-renew.sh` already co-issues both | explicit `domain/{host}` map entries on system tenants (including the apex) |
 | customer custom domains (`acme.com`) | Customer-brought specific FQDNs | per-FQDN, HTTP-01 (in-tree) | explicit `domain/{host}` map entries |
 
 The split is a **security boundary**, not cosmetics: customer JS runs
@@ -95,6 +97,19 @@ map entries on `rewindjs.com` while customers only ever land on the
 exact mechanism a customer uses for `acme.com` (maximum dogfooding;
 you cannot ship a broken custom-domain flow without breaking your own
 control plane).
+
+**Apex `rewindjs.com` (marketing).** Same mechanism, one extra
+detail: the wildcard fallback structurally cannot reach the apex
+(`wildcardInstanceId` at `src/tenant/root.zig:438` requires
+`host.len > suffix.len + 1`), so `assignDomain("rewindjs.com",
+"__marketing__")` is the only resolution path — explicit map entry on
+a dedicated `__marketing__` system tenant serving the static landing
+site. Kept on its own tenant rather than folded into `__admin__` so
+the "no auth, no API, no cookies" posture from `PLAN.md` §2.1 is
+structural rather than aspirational: the marketing tenant deploys no
+handler that reads sessions or sets `Set-Cookie`, and the cookie
+scoping decided in §5 (host-only `__Host-` cookies per surface) means
+nothing on `app.`/`replay.`/`auth.` ever leaks to the apex regardless.
 
 ---
 
@@ -149,6 +164,20 @@ flow **unchanged**. DNS-01 here is not the lock-in we're avoiding — it
 is the operator pointing lego at their *own* DNS once at deploy, not a
 per-customer provider dependency.
 
+**Apex SAN, no script change.** Wildcards match exactly one label, so
+`*.rewindjs.com` does **not** cover the bare apex `rewindjs.com` —
+relevant because the apex hosts the marketing landing (§1).
+`rove-lego-renew.sh:89-90` already requests `$BASE_DOMAIN` and
+`*.$BASE_DOMAIN` as SANs on a single cert (the script header comment
+names this explicitly), so the operator simply runs it twice — once
+per registered domain — with `BASE_DOMAIN=rewindjs.app` (customer
+wildcard; no public apex content) and `BASE_DOMAIN=rewindjs.com`
+(system wildcard **plus** the marketing apex). The two resulting
+certs land under distinct `LEGO_PATH/certificates/` files; the §3.3
+SNI store picks each by SNI (apex hits the `rewindjs.com` cert, all
+`*.rewindjs.com` subdomains hit the same cert via the wildcard SAN,
+customer subdomains hit the `rewindjs.app` cert).
+
 ### 3.2 Customer custom domains — HTTP-01 via a dedicated :80 responder
 
 Customer-brought domains are *specific FQDNs* (`acme.com`,
@@ -179,6 +208,116 @@ binds directly. Behind nginx/HAProxy → one documented line routes
 `/.well-known/acme-challenge/*` on :80 to it. Only if an operator
 chooses Cloudflare do they use Cloudflare's certs and skip in-tree
 ACME — their opt-in, never required.
+
+**Concrete design (grounded against the code 2026-05-15.)**
+
+*Reuse (no reinvention):* `src/blob/curl.zig` — a libcurl `Easy`
++ process-wide `EasyPool` (`defaultPool()`), synchronous
+`request(alloc, .{method,url,headers,body,timeout}) → {status, body}`,
+TLS-verified, the same client S3 uses. Zig-stdlib `Sha256` +
+`std.base64.url_safe_no_pad` (jwt/sigv4 already use them) + the
+hand-rolled `base64urlDecode` (crypto.zig). OpenSSL via the existing
+`@cImport`. `std.net.Address.listen()` + `server.accept()` for the
+:80 loop; `std.Thread.spawn` + the shared `stop_flag` for its
+lifecycle (slots in next to `runReloadPoll` in `loop46/main.zig`).
+`Tenant.listDomains(max)` (root.zig:516) already enumerates every
+`domain/{host}` entry → the issuance worklist; no new enumerator.
+The Phase-2c seam is exact: ACME writes `{custom_cert_dir}/{host}/
+{cert,key}.pem`; `reloadCustomCerts` picks it up within ≤1 s. No new
+wiring between issuance and serving.
+
+*Must build:* EC P-256 keygen + `PEM_write_bio_PrivateKey` (only
+`PEM_read` exists today); ES256 `EVP_DigestSign*` (only verify
+exists); `X509_REQ` CSR build+sign (absent); RFC 7638 JWK thumbprint
+(compose Sha256 + b64url); the :80 responder + in-mem `token→keyauth`
+map; the RFC 8555 state machine (directory → newNonce → newAccount →
+newOrder → authz → http-01 → finalize → download).
+
+*Gap found:* `curl.zig`'s `Response` is `{status, body}` only — it
+**drops response headers**. ACME is header-driven (`Replay-Nonce` on
+every POST, `Location` for the account/order URLs). Phase 2b must
+extend `curl.zig` with a `CURLOPT_HEADERFUNCTION` capture (additive —
+S3 ignores it). Small, contained, but a prerequisite, not optional.
+
+*Architectural fork the original §3.2 glossed (decision needed, §5):*
+HTTP-01 in a **multi-node** cluster. The CA fetches
+`http://{host}/.well-known/acme-challenge/{tok}` via the customer's
+DNS → the edge → **one** origin; the duplicate-cert rate limit
+(5/exact-cert/week) punishes N nodes racing the same order. So
+issuance must be **leader-pinned** — the exact pattern PLAN §6 /
+http-send-plan §7 already use for the scheduler/webhook subsystems
+(`if (raft.isLeader())`). That yields the real question: the issued
+cert must end up on **every** node that terminates TLS for `{host}`,
+but `--custom-cert-dir` is a node-local path.
+
+**v1 (decided 2026-05-15): replicate the issued cert through raft.**
+The leader issues, then writes `cert/{host} → {cert_pem,key_pem}`
+into `__root__.db` via the **existing envelope 2 (root_writeset)** —
+right next to the `domain/{host}` registry that already lives there.
+No new envelope type, no new store, no external dependency. Every
+follower applies it; a small materializer task writes
+`{custom_cert_dir}/{host}/{cert,key}.pem` to that node's local disk,
+and the Phase-2c poll then serves it by SNI within ≤1 s. Single-node
+is a raft-of-1 — identical path, trivially correct. This is *more*
+self-contained than a shared-FS mount (which would be exactly the
+kind of external/proprietary-ish dependency the rest of this plan
+rejects — cf. Cloudflare-for-SaaS) and survives follower restarts /
+new-node joins via log replay + snapshot like all other raft state.
+
+Sizing / precedent: a cert chain + key is ~2–8 KB, reissued every
+~60–90 days per host — negligible raft traffic. **This is not the
+size-based "blobs don't go through raft" decision in CLAUDE.md** (that
+bans ~1 MB per-request static blobs from the log budget); certs are
+three orders of magnitude smaller and rare. Called out so a future
+reader doesn't pattern-match it to the rejected case.
+
+Caveat (named, not fatal): this puts TLS **private keys into the raft
+log history + snapshots + any log backup**. The keys are on every
+node's disk *anyway* (inherent to multi-node TLS — true for any
+distribution scheme); the delta raft adds is key *history* +
+snapshots + backups. Bounded by: raft compaction dropping superseded
+`cert/{host}` writes, and encrypting the envelope-2 cert payload at
+rest (decide alongside whether `__root__.db` pages are encrypted —
+implementation detail, tracked in §9). The :80 responder runs on
+every node but the `token→keyauth` map is leader-only; the edge must
+route `/.well-known/acme-challenge/*` to the leader (a documented
+deploy constraint — same shape as "edge speaks h2 to origin").
+
+Deferred: S3/blob-backed distribution is unnecessary given the above
+— dropped, not merely postponed.
+
+*Account key:* one long-lived EC account key (RFC 8555 best practice
+— re-registering hits new-account limits) at
+`{data_dir}/acme/account.key` (PEM, leader-owned, alongside the other
+cluster-owned state). Order/nonce state stays purely ephemeral
+per-issuance as the original §3.2 said — only the *account key*
+persists.
+
+*Test gate (decided 2026-05-15): Pebble.* No public DNS / external CA
+in a hermetic localhost smoke, so the gate runs **Pebble** (Let's
+Encrypt's official test CA — single binary, localhost, its own test
+root): drives a real RFC 8555 flow against the :80 responder, asserts
+the leader issues, the cert replicates via envelope 2, and a
+*follower's* 2c store then serves it by SNI (proves the raft
+distribution path, not just issuance). Pebble is a new test-only
+dependency a contributor installs — same posture as the already-
+required `mkcert`. Production readiness additionally gated by a manual
+run against LE *staging* before prod-endpoint cutover (mirrors
+`rove-lego-renew.sh`'s `ACME_STAGING` switch).
+
+**Landed 2026-05-15 (code-complete; end-to-end unverified).** Commits
+`fd3c53c` (curl header capture + `src/acme/{crypto,responder,client}`),
+`927fd88` (`src/loop46/acme.zig` leader-gated issuance + every-node
+materializer + envelope-2 replication + CLI), `38147f9`
+(`scripts/acme_issue_smoke.py`). Builds clean; crypto + responder
+inline tests green; full `zig build test` + cli tests no regression;
+inert unless `--acme-directory` + `--custom-cert-dir` both set.
+**Caveat:** the Pebble gate's *skip path* is verified, but the
+end-to-end ACME flow has **not** been executed (no `pebble` in the dev
+sandbox) — it is the one remaining verification, to run wherever
+Pebble is installed, before 2b is trusted in production. Renewal /
+expiry-driven reissue is not yet implemented (v1 issues when
+`cert/{host}` is absent only) — a follow-up.
 
 ### 3.3 SNI cert selection in rove-h2 — separate workstream (serving)
 
@@ -618,6 +757,16 @@ rove-h2 is single-`SSL_CTX` until §3.3). Verified end-to-end:
 Phase 4; the actual invocation scripts (`rove-loop46-serve.sh`,
 `systemd/rove-loop46.service`) carry the new required flag.
 
+**Pending follow-up (apex marketing).** Seed a `__marketing__` system
+tenant + `assignDomain("rewindjs.com", "__marketing__")` for the apex
+landing site (§1). Trivial extension of the bootstrap that already
+seeds `__admin__`/`__replay__`; not blocking — slots in alongside the
+marketing content + a second invocation of `rove-lego-renew.sh` with
+`BASE_DOMAIN=rewindjs.com` (§3.1). Test: explicit-map entry for the
+apex coexists with the wildcard subdomain entries on the same system
+domain; `curl https://rewindjs.com/` hits the marketing tenant,
+`curl https://app.rewindjs.com/` still hits `__admin__`.
+
 **Phase 2 — edge/DNS/TLS + in-tree ACME.**
 (a) `*.rewindjs.app` + `*.rewindjs.com` wildcard via existing lego flow
 (unchanged). (b) :80 HTTP-01 responder + in-process ACME client (§3.2).
@@ -726,3 +875,8 @@ sub-plan index. Hold until Phases 1–3 land.
   existing instance pointer or in a sibling `domain_tls/{host}` row is
   a decision for the v2 pass. Open until a customer needs per-host
   mTLS.
+- §3.2 cert-at-rest: whether `__root__.db` pages are encrypted, and if
+  not, whether the `cert/{host}` private-key payload gets its own
+  encryption before the envelope-2 write. Bounds the "private keys in
+  raft log/snapshots/backups" caveat. Decide during 2b implementation;
+  does not block the architecture.
