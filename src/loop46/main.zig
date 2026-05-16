@@ -1490,6 +1490,7 @@ pub fn main() !void {
         node_tenant,
         blob_owned.cfg,
         &schedules_store,
+        raft_node,
     );
     node_state.manifest_http = node_manifest_http;
     node_state.manifest_easy = node_manifest_easy;

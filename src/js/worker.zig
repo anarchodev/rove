@@ -66,6 +66,7 @@ const dispatcher_mod = @import("dispatcher.zig");
 const globals = @import("globals.zig");
 const apply_mod = @import("apply.zig");
 const raft_propose = @import("raft_propose.zig");
+const config_mirror = @import("config_mirror.zig");
 const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
@@ -288,6 +289,13 @@ pub const TenantSlot = struct {
     /// Borrowed pointer to the tenant's app.db (for `_deploy/current`
     /// reads and customer kv ops).
     app_kv: *kv_mod.KvStore,
+    /// Borrowed process raft node. The loader's `reloadDeployment`
+    /// uses it to leader-gate + propose the `_config/**.json` mirror
+    /// (auth-domain-plan §9: the release/loader path must mirror
+    /// per-deploy config to kv — fixes the `7eb70ed` regression).
+    /// Optional/`null` only in unit-test slot literals — a slot with
+    /// no raft handle just skips the config mirror.
+    raft: ?*kv_mod.RaftNode = null,
     /// Owned blob backend for file-blobs (source + bytecode bytes).
     blob_backend: blob_mod.BlobBackend,
     /// Owned blob backend for per-deployment manifest JSON.
@@ -563,17 +571,24 @@ pub const NodeState = struct {
     /// any other node-scoped read paths have one handle to ask.
     schedules_store: *schedule_server_mod.ScheduleStore,
 
+    /// Process raft node (= `cluster.raft`). Borrowed; owned by
+    /// `main.zig`. Copied into each `TenantSlot` so the loader's
+    /// `reloadDeployment` can leader-gate + propose the config mirror.
+    raft: *kv_mod.RaftNode,
+
     pub fn init(
         allocator: std.mem.Allocator,
         tenant: *tenant_mod.Tenant,
         blob_backend_cfg: blob_mod.BackendConfig,
         schedules_store: *schedule_server_mod.ScheduleStore,
+        raft: *kv_mod.RaftNode,
     ) NodeState {
         return .{
             .allocator = allocator,
             .tenant = tenant,
             .blob_backend_cfg = blob_backend_cfg,
             .schedules_store = schedules_store,
+            .raft = raft,
         };
     }
 
@@ -1438,6 +1453,7 @@ fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*Tena
         .allocator = allocator,
         .instance_id = id_copy,
         .app_kv = inst.kv,
+        .raft = node.raft,
         .blob_backend = blob_backend,
         .manifest_backend = manifest_backend,
         .prefetched_manifest = prefetched,
@@ -2008,6 +2024,49 @@ fn reloadAllBytecodes(slot: *TenantSlot) !void {
     return reloadDeployment(slot, dep_id);
 }
 
+/// Stage the manifest's `_config/**.json` into the tenant's app.db
+/// (local commit) and propose it as an envelope-0 writeset so
+/// followers replicate. Skips the raft entry when nothing changed
+/// (the common case — most tenants ship no `_config/`). Caller
+/// leader-gates this; see the call site in `reloadDeployment`.
+fn mirrorDeployConfig(
+    allocator: std.mem.Allocator,
+    slot: *TenantSlot,
+    raft: *kv_mod.RaftNode,
+    manifest: files_mod.manifest_json.Manifest,
+    file_blobs: blob_mod.BlobStore,
+) !void {
+    var txn = try slot.app_kv.beginTrackedImmediate();
+    errdefer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const stats = try config_mirror.mirrorConfigToKv(
+        allocator,
+        manifest,
+        file_blobs,
+        slot.app_kv,
+        &txn,
+        &ws,
+    );
+    if (stats.put_count == 0 and stats.delete_count == 0) {
+        txn.rollback() catch {};
+        return; // no `_config/*` churn → don't burn a raft entry
+    }
+    try txn.commit();
+    if (raft_propose.proposeWriteSet(
+        .{ .allocator = allocator, .raft = raft },
+        &ws,
+        slot.instance_id,
+    )) |_| {} else |err| {
+        // Local commit is already durable on the leader; followers
+        // re-derive on their next reload. Log, don't fail the deploy.
+        std.log.warn(
+            "config mirror: propose {s} failed: {s}",
+            .{ slot.instance_id, @errorName(err) },
+        );
+    }
+}
+
 /// Pull a specific deployment manifest from the per-tenant
 /// `deployments/` BlobBackend, fetch every referenced bytecode, and
 /// build a new `TenantFilesSnapshot` that we atomic-swap onto
@@ -2054,6 +2113,26 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     defer manifest.deinit();
 
     const bs = slot.blob_backend.blobStore();
+
+    // Mirror `_config/**.json` → tenant kv (auth-domain-plan §9: the
+    // release/loader path MUST mirror per-deploy user config; fixes
+    // the `7eb70ed` regression where this promise was made but never
+    // wired). Leader-gated + proposed exactly like `_deploy/current`:
+    // the leader writes locally + proposes an envelope-0 writeset
+    // (leader-skip on apply), so followers receive `_config/*` purely
+    // via that raft apply and their own (non-leader) reloadDeployment
+    // correctly skips it. Best-effort — a failure logs and still lets
+    // the deployment load (missing config is visible + self-heals on
+    // the next reload).
+    if (slot.raft) |raft| {
+        if (raft.isLeader()) {
+            mirrorDeployConfig(allocator, slot, raft, manifest, bs) catch |err|
+                std.log.warn(
+                    "reloadDeployment: config mirror {s}/{d} failed: {s}",
+                    .{ slot.instance_id, dep_id, @errorName(err) },
+                );
+        }
+    }
 
     // Build the new maps in locals before installing, so if any fetch
     // fails mid-way the slot keeps serving the old deployment.

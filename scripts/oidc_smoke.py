@@ -111,6 +111,23 @@ def main() -> int:
             time.sleep(0.25)
         expect_status("__auth__ deployed (GET /login)", 200, r)
 
+        # ── §9 regression: the deploy-time config mirror must run on
+        # the RELEASE path (the `7eb70ed` bug). web/auth ships
+        # _config/oidc/default.json; if the loader's reloadDeployment
+        # mirrored it, `_config/oidc/default` is now in __auth__ kv.
+        # Read it back via admin getKv (reserved prefix is a *write*
+        # guard; reads are allowed). This proves a release-path
+        # (files-server bootstrap) deploy mirrored a `_config/**.json`
+        # into kv — the fix for the gap that also broke oauth.js.
+        admin_h = {"Authorization": f"Bearer {TOKEN}", "X-Rove-Scope": "__auth__"}
+        gk = urllib.parse.quote(json.dumps(["_config/oidc/default"]))
+        r = curl(cc, f"{origin}/?fn=getKv&args={gk}", headers=admin_h)
+        expect_status("getKv _config/oidc/default (release-mirrored)", 200, r)
+        assert "admin-dashboard" in r.body and "app.rewindjs.com" in r.body, \
+            f"§9 config-mirror NOT wired into release path: {r.body[:300]}"
+        print("ok  §9: web/auth/_config/oidc/default.json mirrored to kv "
+              "via the release path (loader reloadDeployment)")
+
         # Register the conformance client + shrunk rotation windows
         # at `_oidc/config/default` (a normal kv key — the IdP client
         # registry is operational data, admin-managed, NOT the
@@ -123,7 +140,6 @@ def main() -> int:
             "publish_window_ms": 1500,
             "retire_window_ms": 60000,
         }
-        admin_h = {"Authorization": f"Bearer {TOKEN}", "X-Rove-Scope": "__auth__"}
         args = urllib.parse.quote(json.dumps(
             ["_oidc/config/default", json.dumps(cfg)]))
         r = curl(cc, f"{origin}/?fn=setKv&args={args}", headers=admin_h)

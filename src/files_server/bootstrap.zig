@@ -120,6 +120,12 @@ fn classify(rel_path: []const u8) DeployClass {
     if (std.mem.eql(u8, rel_path, "index.mjs")) return .handler;
     if (std.mem.startsWith(u8, rel_path, "_middlewares/")) return .middleware;
     if (std.mem.startsWith(u8, rel_path, "_static/")) return .static;
+    // `_config/**.json` deploys as a static manifest entry so the
+    // deploy-time mirror (`config_mirror`, now wired into the loader's
+    // reloadDeployment — auth-domain-plan §9) replicates it to kv.
+    // The customer upload path already treats `_config/` this way;
+    // the platform-bundle walker matches it now too.
+    if (std.mem.startsWith(u8, rel_path, "_config/")) return .static;
     return .ignore;
 }
 
