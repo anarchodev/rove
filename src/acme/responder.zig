@@ -130,6 +130,9 @@ pub const Responder = struct {
             const token = path[prefix.len..];
             self.mu.lock();
             const ka = self.tokens.get(token);
+            std.log.info("acme-responder: challenge {s} → {s}", .{
+                token, if (ka != null) "HIT" else "MISS",
+            });
             // Copy out under lock so the socket write doesn't hold it.
             var stackbuf: [512]u8 = undefined;
             const body: ?[]const u8 = if (ka) |v| blk: {

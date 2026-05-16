@@ -19,8 +19,8 @@ Flow:
      path, not just issuance) — peer cert SAN == acmecorp.test and
      issuer is Pebble's intermediate, not the dev wildcard CA.
 
-NOTE: authored against documented Pebble behavior; not executed in the
-dev sandbox (no pebble binary there). The skip path IS exercised.
+Requires `pebble` + `pebble-challtestsrv` on PATH (e.g. `go install
+github.com/letsencrypt/pebble/v2/cmd/{pebble,pebble-challtestsrv}`).
 """
 
 from __future__ import annotations
@@ -30,9 +30,11 @@ import os
 import shutil
 import signal
 import subprocess
+import ssl
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,6 +50,28 @@ def _need(bin_name: str) -> str | None:
     return shutil.which(bin_name)
 
 
+def _kill_stragglers() -> None:
+    # `pebble-challtestsrv` exceeds the 15-char kernel comm limit →
+    # pkill -x must match the truncated name.
+    for n in ("pebble", "pebble-challtes"):
+        subprocess.run(["pkill", "-x", n], capture_output=True)
+
+
+def _wait_dir(timeout_s: float = 20.0) -> bool:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(PEBBLE_DIR_URL, context=ctx, timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.3)
+    return False
+
+
 def main() -> int:
     pebble = _need("pebble")
     challsrv = _need("pebble-challtestsrv")
@@ -58,13 +82,28 @@ def main() -> int:
 
     tmp = tempfile.mkdtemp(prefix="rove-acme-")
     procs: list[subprocess.Popen] = []
+    _kill_stragglers()  # a leftover pebble on :14000 → stale CA state
+    time.sleep(1.0)
     try:
+        # Pebble's own ACME HTTPS listener needs a cert/key file (it
+        # self-generates its CA hierarchy, but not the API cert). We
+        # don't verify it (rove uses --acme-insecure-tls), so any
+        # self-signed cert for 127.0.0.1 works.
+        pk = Path(tmp) / "pebble-key.pem"
+        pc = Path(tmp) / "pebble-cert.pem"
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(pk), "-out", str(pc), "-days", "1",
+             "-subj", "/CN=localhost",
+             "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"],
+            check=True, capture_output=True, timeout=30)
+
         cfg = {
             "pebble": {
                 "listenAddress": "127.0.0.1:14000",
                 "managementListenAddress": "127.0.0.1:15000",
-                "certificate": "",
-                "privateKey": "",
+                "certificate": str(pc),
+                "privateKey": str(pk),
                 "httpPort": ACME_HTTP_PORT,
                 "tlsPort": 5001,
                 "ocspResponderURL": "",
@@ -73,23 +112,40 @@ def main() -> int:
         cfg_path = Path(tmp) / "pebble.json"
         cfg_path.write_text(json.dumps(cfg))
 
-        # Mock DNS: every name → 127.0.0.1 so Pebble's validator hits
-        # our :ACME_HTTP_PORT responder.
+        # challtestsrv = mock DNS only (every name → 127.0.0.1 so
+        # Pebble's validator hits OUR :ACME_HTTP_PORT responder). Its
+        # own challenge listeners are disabled — rove answers HTTP-01.
         procs.append(subprocess.Popen(
-            [challsrv, "-defaultIPv4", "127.0.0.1", "-dns01", ":8053",
-             "-http01", "", "-https01", "", "-tlsalpn01", ""],
+            # -defaultIPv6 "" → answer only A (127.0.0.1); else Pebble
+            # may try the default ::1 AAAA first and our IPv4-only
+            # responder refuses → spurious invalid.
+            [challsrv, "-defaultIPv4", "127.0.0.1", "-defaultIPv6", "",
+             "-dnsserver", ":8053",
+             "-http01", "", "-https01", "", "-tlsalpn01", "",
+             "-doh", "", "-management", ":8055"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         procs.append(subprocess.Popen(
             [pebble, "-config", str(cfg_path), "-dnsserver", "127.0.0.1:8053"],
-            env={**os.environ, "PEBBLE_VA_NOSLEEP": "1"},
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        time.sleep(2.0)  # let pebble bind
+            env={**os.environ, "PEBBLE_VA_NOSLEEP": "1",
+                 "PEBBLE_AUTHZREUSE": "0"},
+            stdout=open("/tmp/acme-smoke-pebble.log", "wb"),
+            stderr=subprocess.STDOUT))
+        if not _wait_dir():
+            tail = ""
+            try:
+                tail = Path("/tmp/acme-smoke-pebble.log").read_text()[-600:]
+            except OSError:
+                pass
+            raise AssertionError(
+                f"pebble directory never came up at {PEBBLE_DIR_URL}\n"
+                f"--- pebble.log tail ---\n{tail}")
 
-        manifest = {"instances": [{
+        # Only the domain registration matters for issuance (the ACME
+        # loop reads listDomains); no handler needed.
+        manifest = {"tenants": [{
             "id": "acme",
             "domains": [CUSTOM_HOST],
-            "files": [{"path": "index.mjs",
-                       "source": "loop46-demo-tenants/hello/index.mjs"}],
+            "files": [],
         }]}
 
         cluster = Cluster.spawn(
@@ -143,6 +199,7 @@ def main() -> int:
         for p in procs:
             with __import__("contextlib").suppress(ProcessLookupError):
                 p.send_signal(signal.SIGTERM)
+        _kill_stragglers()  # belt-and-suspenders: never leak :14000
         shutil.rmtree(tmp, ignore_errors=True)
 
 

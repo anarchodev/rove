@@ -49,6 +49,11 @@ pub const Handle = struct {
     responder_stop: std.atomic.Value(bool),
     config: Config,
     responder: acme.Responder,
+    /// The HTTP-01 responder is **leader-only** and lazily bound:
+    /// followers have no tokens to serve, and binding it everywhere
+    /// would collide on a single host (smoke) for zero benefit. The
+    /// edge routes challenge traffic to the leader anyway (§3.2).
+    responder_started: bool = false,
 
     pub fn signalStop(self: *Handle) void {
         self.stop_flag.store(true, .release);
@@ -57,7 +62,7 @@ pub const Handle = struct {
 
     pub fn join(self: *Handle) void {
         self.thread.join();
-        self.responder.join();
+        if (self.responder_started) self.responder.join();
         self.allocator.destroy(self);
     }
 };
@@ -74,13 +79,9 @@ pub fn spawn(config: Config) !*Handle {
         .responder = acme.Responder.init(config.allocator, undefined, config.http_port),
     };
     // Point the responder at our own stop flag (can't take &h before
-    // it exists; fix it up now that it does).
+    // it exists; fix it up now that it does). It is *not* bound here
+    // — `tick` lazily binds it the first time this node is leader.
     h.responder.stop = &h.responder_stop;
-    try h.responder.start();
-    errdefer {
-        h.responder_stop.store(true, .release);
-        h.responder.join();
-    }
     h.thread = try std.Thread.spawn(.{}, threadMain, .{h});
     return h;
 }
@@ -117,6 +118,21 @@ fn tick(h: *Handle) !void {
     defer domains.deinit();
 
     const is_leader = cfg.raft.isLeader();
+
+    // Lazily bind the HTTP-01 responder the first time we're leader
+    // (leader-only — see Handle.responder_started). If the bind
+    // fails, skip issuance this tick rather than crash the thread.
+    if (is_leader and !h.responder_started) {
+        h.responder.start() catch |err| {
+            std.log.warn("acme: responder bind :{d} failed: {s}", .{
+                cfg.http_port, @errorName(err),
+            });
+            return;
+        };
+        h.responder_started = true;
+        std.log.info("acme: HTTP-01 responder bound :{d} (leader)", .{cfg.http_port});
+    }
+
     var acme_client: ?acme.Client = null;
     var account_key: ?acme.crypto.Key = null;
     defer if (account_key) |*k| k.deinit();

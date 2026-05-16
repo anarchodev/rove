@@ -187,6 +187,10 @@ pub const Easy = struct {
         _ = c.curl_easy_setopt(self.handle, c.CURLOPT_ERRORBUFFER, &self.err_buf);
         _ = c.curl_easy_setopt(self.handle, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 0));
         _ = c.curl_easy_setopt(self.handle, c.CURLOPT_TCP_KEEPALIVE, @as(c_long, 1));
+        // A UA-less client is a latent bug against strict peers (ACME
+        // CAs reject "no User-Agent" with 400 malformed). A caller
+        // that adds its own `User-Agent:` header still overrides this.
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_USERAGENT, "rove");
 
         // URL needs a NUL-terminated C string. Stack buffer is fine
         // for our paths (S3 keys never exceed a few KB even with

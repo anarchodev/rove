@@ -104,6 +104,7 @@ pub const Client = struct {
         defer self.allocator.free(tp);
         const keyauth = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ chal.token, tp });
         defer self.allocator.free(keyauth);
+        std.log.info("acme: publish challenge token={s} keyauth={s}", .{ chal.token, keyauth });
         try self.responder.put(chal.token, keyauth);
         defer self.responder.remove(chal.token);
 
@@ -147,7 +148,7 @@ pub const Client = struct {
         if (self.dir_new_order.len != 0) return; // cached
         var resp = try self.get(self.directory_url);
         defer resp.deinit(self.allocator);
-        if (resp.status != 200) return Error.Http;
+        if (resp.status != 200) return rejectHttp("directory", self.directory_url, &resp);
         var p = Json.parseFromSlice(Json.Value, self.allocator, resp.body orelse return Error.BadResponse, .{}) catch
             return Error.BadResponse;
         defer p.deinit();
@@ -176,13 +177,13 @@ pub const Client = struct {
                 "{{\"termsOfServiceAgreed\":true,\"contact\":[\"mailto:{s}\"]}}", .{e})
         else
             try self.allocator.dupe(u8, "{\"termsOfServiceAgreed\":true}");
-        var resp = try self.jws(self.dir_new_account, payload, true);
+        var resp = try self.jwsRetry(self.dir_new_account, payload, true);
         self.allocator.free(payload);
         defer resp.deinit(self.allocator);
-        if (resp.status != 200 and resp.status != 201) return Error.Http;
+        if (resp.status != 200 and resp.status != 201)
+            return rejectHttp("newAccount", self.dir_new_account, &resp);
         const loc = resp.header("location") orelse return Error.BadResponse;
         self.kid = try self.allocator.dupe(u8, loc);
-        try self.takeNonce(&resp);
     }
 
     // ── JWS POST helpers ──────────────────────────────────────────
@@ -203,13 +204,37 @@ pub const Client = struct {
 
     const PayloadOwn = enum { free_payload, keep_payload };
 
+    /// Send a JWS, always refreshing the nonce from the response
+    /// (every ACME reply carries a fresh `Replay-Nonce`), and retry
+    /// on `badNonce` — RFC 8555 §6.5. Real CAs (and Pebble, which
+    /// rejects ~5% of nonces deliberately) require this; without it a
+    /// single rejected nonce fails the whole issuance and can poison
+    /// retries via authz reuse. Caller owns the returned response and
+    /// the payload.
+    fn jwsRetry(self: *Client, url: []const u8, payload: []const u8, use_jwk: bool) Error!curl.Response {
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            if (self.nonce.len == 0) try self.freshNonce();
+            var resp = try self.jws(url, payload, use_jwk);
+            self.takeNonce(&resp) catch {}; // best-effort; freshNonce recovers
+            if (resp.status == 400 and attempt < 5) {
+                const b = resp.body orelse "";
+                if (std.mem.indexOf(u8, b, "badNonce") != null) {
+                    std.log.info("acme: badNonce on {s}, retrying ({d})", .{ url, attempt + 1 });
+                    resp.deinit(self.allocator); // fresh nonce already taken above
+                    continue;
+                }
+            }
+            return resp;
+        }
+    }
+
     /// JWS POST with a JSON body, then parse the JSON response.
     fn postJson(self: *Client, url: []const u8, payload: []u8, own: PayloadOwn) Error!Parsed {
-        var resp = try self.jws(url, payload, false);
+        var resp = try self.jwsRetry(url, payload, false);
         if (own == .free_payload) self.allocator.free(payload);
         errdefer resp.deinit(self.allocator);
-        try self.takeNonce(&resp);
-        if (resp.status >= 400) return Error.Http;
+        if (resp.status >= 400) return rejectHttp("acme-post", url, &resp);
         const p = Json.parseFromSlice(Json.Value, self.allocator, resp.body orelse "{}", .{}) catch
             return Error.BadResponse;
         return .{ .resp = resp, .json = p.value, ._p = p, .client = self };
@@ -217,10 +242,9 @@ pub const Client = struct {
 
     /// POST-as-GET (empty payload) + parse JSON.
     fn postAsGet(self: *Client, url: []const u8) Error!Parsed {
-        var resp = try self.jws(url, "", false);
+        var resp = try self.jwsRetry(url, "", false);
         errdefer resp.deinit(self.allocator);
-        try self.takeNonce(&resp);
-        if (resp.status >= 400) return Error.Http;
+        if (resp.status >= 400) return rejectHttp("acme-post", url, &resp);
         const p = Json.parseFromSlice(Json.Value, self.allocator, resp.body orelse "{}", .{}) catch
             return Error.BadResponse;
         return .{ .resp = resp, .json = p.value, ._p = p, .client = self };
@@ -230,10 +254,9 @@ pub const Client = struct {
     /// POST-as-GET returning the raw body (the cert chain is PEM,
     /// not JSON).
     fn postAsGetRaw(self: *Client, url: []const u8) Error!Raw {
-        var resp = try self.jws(url, "", false);
+        var resp = try self.jwsRetry(url, "", false);
         errdefer resp.deinit(self.allocator);
-        try self.takeNonce(&resp);
-        if (resp.status >= 400) return Error.Http;
+        if (resp.status >= 400) return rejectHttp("acme-post", url, &resp);
         return .{ .resp = resp };
     }
 
@@ -273,18 +296,38 @@ pub const Client = struct {
             .headers = &[_]curl.Header{.{ .name = "Content-Type", .value = "application/jose+json" }},
             .body = body,
             .verify_tls = !self.insecure_tls,
-        }) catch Error.Http;
+        }) catch |e| {
+            std.log.warn("acme: POST {s} transport error: {s}", .{ url, @errorName(e) });
+            return Error.Http;
+        };
     }
 
     fn get(self: *Client, url: []const u8) Error!curl.Response {
         return self.easy.request(self.allocator, .{
             .method = .GET, .url = url, .verify_tls = !self.insecure_tls,
-        }) catch Error.Http;
+        }) catch |e| {
+            std.log.warn("acme: GET {s} transport error: {s}", .{ url, @errorName(e) });
+            return Error.Http;
+        };
     }
     fn head(self: *Client, url: []const u8) Error!curl.Response {
         return self.easy.request(self.allocator, .{
             .method = .HEAD, .url = url, .verify_tls = !self.insecure_tls,
-        }) catch Error.Http;
+        }) catch |e| {
+            std.log.warn("acme: HEAD {s} transport error: {s}", .{ url, @errorName(e) });
+            return Error.Http;
+        };
+    }
+
+    /// Diagnostic: an ACME error that only says "Http" is undebuggable
+    /// in production too — always log status + a body snippet at the
+    /// point we reject a response.
+    fn rejectHttp(what: []const u8, url: []const u8, resp: *const curl.Response) Error {
+        const b = resp.body orelse "";
+        std.log.warn("acme: {s} {s} → HTTP {d}: {s}", .{
+            what, url, resp.status, b[0..@min(b.len, 400)],
+        });
+        return Error.Http;
     }
 
     // ── polling + JSON helpers ────────────────────────────────────
