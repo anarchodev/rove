@@ -13,11 +13,16 @@ design + forks A/B accepted. Implementation in progress —
 (`cfa4014`), 3-6 OIDC conformance gate (`2e6faa3`). **The OIDC chain
 (3-1→3-5) is conformance-verified end-to-end — `scripts/oidc_smoke.py`
 passes twice non-flaky incl. pure-Python RS256-vs-JWKS, §0, §4.6
-rotation (see §4.7 "Landed").** Remaining: 3-6 part 2 — the Fork-B
-dashboard→RP migration. **Grounded + decided 2026-05-16** (user chose
-the maximal-dogfooding fork: admin OIDC-only / full signup refactor /
-replay-logs N/A — see §4.7 "3-6 part 2 design"); implementation
-pending. Now safe since the IdP is proven. Phase-2 follow-up tracked: ACME renewal /
+rotation (see §4.7 "Landed").** **3-6 part 2 (the Fork-B admin
+OIDC-RP cutover) LANDED + gate-verified 2026-05-16** — `oidc_smoke.py`
+is the full RP gate (operator→is_root, non-operator→provision, §9+§0
+mirror, full OIDC conformance), green ×2 non-flaky; admin is a pure
+OIDC RP (no Bearer human path); the X-Rove-Scope primitive fixed
+(3a), Option B (internal dispatch carries the routed authority), §0
+`${ISSUER_PARENT}` redirect templating, and the full smoke-harness
+migration to OIDC-only admin all shipped. **Phase 3 (OIDC) is
+complete.** Only Phase 4 remains (PLAN.md §7/§13 + deployment.md
+sweep — deliberately parked). Phase-2 follow-up tracked: ACME renewal /
 expiry-driven reissue (§3.2). Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
 Phases 1–3 land (see §6, §7).
