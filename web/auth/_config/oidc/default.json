@@ -1,0 +1,12 @@
+{
+  "_comment": "Deployed file mirrored read-only to kv at _config/oidc/default (config_mirror.zig strips .json). oidc.provider(\"default\") reads it. redirect_uris must be exact-match; the conformance smoke registers its own localhost client by overriding this kv key. Production dashboard clients (Fork B RP shims, step 3-6):",
+  "login_path": "/login",
+  "clients": [
+    { "client_id": "admin-dashboard",
+      "redirect_uris": ["https://app.rewindjs.com/_rp/callback"] },
+    { "client_id": "replay-dashboard",
+      "redirect_uris": ["https://replay.rewindjs.com/_rp/callback"] },
+    { "client_id": "logs-dashboard",
+      "redirect_uris": ["https://logs.rewindjs.com/_rp/callback"] }
+  ]
+}

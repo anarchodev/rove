@@ -101,6 +101,13 @@ pub const ADMIN_INSTANCE_ID = "__admin__";
 /// existing `assignDomain` machinery.
 pub const REPLAY_INSTANCE_ID = "__replay__";
 
+/// Reserved tenant id for the OIDC identity provider
+/// (auth-domain-plan.md §4). Same shape as `__replay__`: a regular
+/// instance, no `platform` capability, reached via the
+/// `auth.{system_suffix}` host alias added in bootstrap. Runs the
+/// `oidc.provider()` library + a magic-link login.
+pub const AUTH_INSTANCE_ID = "__auth__";
+
 pub const InstanceList = struct {
     ids: [][]u8,
     allocator: std.mem.Allocator,

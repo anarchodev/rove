@@ -183,6 +183,7 @@ fn walkTenantDir(
 pub const LoadedPlatformFiles = struct {
     admin: []DeployFile,
     replay: []DeployFile,
+    auth: []DeployFile,
 };
 
 pub fn loadPlatformDeployFiles(
@@ -205,13 +206,23 @@ pub fn loadPlatformDeployFiles(
         }
         replay.deinit(allocator);
     }
+    var auth: std.ArrayList(DeployFile) = .empty;
+    errdefer {
+        for (auth.items) |f| {
+            allocator.free(f.content);
+            allocator.free(f.path);
+        }
+        auth.deinit(allocator);
+    }
 
     try walkTenantDir(allocator, web_root, "admin", &admin);
     try walkTenantDir(allocator, web_root, "replay", &replay);
+    try walkTenantDir(allocator, web_root, "auth", &auth);
 
     return .{
         .admin = try admin.toOwnedSlice(allocator),
         .replay = try replay.toOwnedSlice(allocator),
+        .auth = try auth.toOwnedSlice(allocator),
     };
 }
 
@@ -226,6 +237,11 @@ pub fn freePlatformDeployFiles(allocator: std.mem.Allocator, loaded: LoadedPlatf
         allocator.free(f.path);
     }
     allocator.free(loaded.replay);
+    for (loaded.auth) |f| {
+        allocator.free(f.content);
+        allocator.free(f.path);
+    }
+    allocator.free(loaded.auth);
 }
 
 /// Tenant ids that this module bootstraps. Kept here so the names
@@ -233,6 +249,7 @@ pub fn freePlatformDeployFiles(allocator: std.mem.Allocator, loaded: LoadedPlatf
 /// full tenant model use `rove-tenant` directly.
 pub const ADMIN_TENANT_ID: []const u8 = "__admin__";
 pub const REPLAY_TENANT_ID: []const u8 = "__replay__";
+pub const AUTH_TENANT_ID: []const u8 = "__auth__";
 
 // ── QuickJS compiler used during bootstrap ────────────────────────────
 //
@@ -765,6 +782,20 @@ pub fn bootstrapPlatformDeployments(
     std.log.info(
         "files-server bootstrap: __replay__ deploy {d} released",
         .{replay_dep_id},
+    );
+
+    const auth_dep_id = try bootstrapTenant(
+        allocator,
+        blob_cfg,
+        data_dir,
+        AUTH_TENANT_ID,
+        loaded.auth,
+        cluster,
+    );
+    try postRelease(allocator, leader_url, jwt_secret, AUTH_TENANT_ID, auth_dep_id);
+    std.log.info(
+        "files-server bootstrap: __auth__ deploy {d} released",
+        .{auth_dep_id},
     );
 
     if (bootstrap_kv.len > 0) {
