@@ -53,6 +53,13 @@ class OIDCProvider {
       code_ttl_ms: config.code_ttl_ms || 60 * 1000,
       id_token_ttl_ms: config.id_token_ttl_ms || 15 * 60 * 1000, // §4.6
       refresh_ttl_ms: config.refresh_ttl_ms || 30 * 24 * 60 * 60 * 1000,
+      // §4.6 rotation windows (per-issuer configurable; conservative
+      // defaults — the conformance smoke shrinks them).
+      rotation_period_ms: config.rotation_period_ms || 90 * 24 * 60 * 60 * 1000,
+      publish_window_ms: config.publish_window_ms || 24 * 60 * 60 * 1000,
+      retire_window_ms: config.retire_window_ms ||
+        ((config.id_token_ttl_ms || 15 * 60 * 1000) + 5 * 60 * 1000),
+      rot_handle: "oidc-rot/" + name, // stable → http.send overwrite
     };
   }
 
@@ -68,29 +75,139 @@ class OIDCProvider {
     return null;
   }
 
-  // ── keyset (§4.6; full rotation state machine is wired in 3-5,
-  //    here: lazy genesis + read current + publish public JWKs) ──
+  // ── keyset (§4.6 state machine: next → current → retiring → drop).
+  //    Single kv key ⇒ raft serializes writes last-write-wins; we
+  //    only ever SIGN with `current`; the re-arm uses a stable
+  //    http.send handle — together that makes a concurrent
+  //    leadership double-fire dedup-safe with no schedule-version
+  //    header (see §4.6 "Grounded correction 2026-05-16"). ──
   _keyset() {
     const raw = kv.get(this.cfg.keyset_path);
     if (raw != null) return JSON.parse(raw);
     // Genesis: first request to a fresh issuer mints one `current`
-    // key. Signing it immediately is safe — no prior key, so no
-    // stale RP JWKS cache to contradict (§4.6).
+    // key. Safe to sign immediately — no prior key, no stale RP
+    // JWKS cache to contradict (§4.6). Capture the issuer host NOW
+    // (genesis always runs on a real wire request; the internal
+    // rotate fire has request.host === "").
+    const now = Date.now();
     const k = crypto.oidcGenerateKey(); // { priv, jwk, kid }
     const keyset = {
       min_iat: 0, // emergency-revocation floor (§4.6)
+      issuer_host: request.host || "",
       keys: [{
         kid: k.kid, status: "current", priv: k.priv, jwk: k.jwk,
-        created_ns: Date.now() * 1e6,
+        since: now,
       }],
     };
     kv.set(this.cfg.keyset_path, JSON.stringify(keyset));
+    // Arm the first scheduled rotation (only if we know our host).
+    if (keyset.issuer_host) {
+      this._armRotation(keyset.issuer_host, now + this.cfg.rotation_period_ms);
+    }
     return keyset;
   }
 
   _currentKey(keyset) {
     for (const e of keyset.keys) if (e.status === "current") return e;
     return null;
+  }
+
+  // Self-scheduled rotation tick (§4.6 / http-send-plan §10.5
+  // order-timeout pattern): stable handle ⇒ a re-arm overwrites the
+  // prior row; the issuer host can't come from request.host on the
+  // internal fire so it's threaded explicitly.
+  _armRotation(host, fire_at_ms) {
+    http.send({
+      handle: this.cfg.rot_handle,
+      url: "https://" + host + "/_oidc/rotate",
+      method: "POST",
+      body: "",
+      fire_at_ns: BigInt(Math.floor(fire_at_ms)) * 1000000n,
+    });
+  }
+
+  // Pure-ish deadline-gated state machine. Loops so a long-overdue
+  // fire converges (catches up multiple transitions). Returns the
+  // soonest future deadline (ms) to re-arm at.
+  _advance(keyset, now) {
+    const cfg = this.cfg;
+    for (;;) {
+      let nextK = null, curK = null;
+      const retiring = [];
+      for (const e of keyset.keys) {
+        if (e.status === "next") nextK = e;
+        else if (e.status === "current") curK = e;
+        else if (e.status === "retiring") retiring.push(e);
+      }
+      // Drop fully-retired keys (no token signed by them can still
+      // be live: retire_window ≥ id_token TTL + skew).
+      const live = keyset.keys.filter((e) =>
+        !(e.status === "retiring" && now - e.since >= cfg.retire_window_ms));
+      if (live.length !== keyset.keys.length) {
+        keyset.keys = live;
+        continue;
+      }
+      // current aged out and no next yet → mint next (published in
+      // JWKS immediately; NOT signed with until promoted).
+      if (curK && !nextK && now - curK.since >= cfg.rotation_period_ms) {
+        const k = crypto.oidcGenerateKey();
+        keyset.keys.push({
+          kid: k.kid, status: "next", priv: k.priv, jwk: k.jwk, since: now,
+        });
+        continue;
+      }
+      // next published long enough → promote (current → retiring).
+      if (nextK && now - nextK.since >= cfg.publish_window_ms) {
+        if (curK) { curK.status = "retiring"; curK.since = now; }
+        nextK.status = "current"; nextK.since = now;
+        continue;
+      }
+      // No transition fired → compute the soonest upcoming deadline.
+      let soonest = now + cfg.rotation_period_ms;
+      if (curK && !nextK) {
+        soonest = Math.min(soonest, curK.since + cfg.rotation_period_ms);
+      }
+      if (nextK) {
+        soonest = Math.min(soonest, nextK.since + cfg.publish_window_ms);
+      }
+      for (const r of retiring) {
+        soonest = Math.min(soonest, r.since + cfg.retire_window_ms);
+      }
+      return soonest;
+    }
+  }
+
+  // POST /_oidc/rotate — the scheduled fire. Deadline-gated + single
+  // kv key (last-write-wins) ⇒ a concurrent leadership double-fire
+  // is safe with no header dedupe (§4.6 grounded correction). kv.set
+  // + the http.send re-arm commit atomically (http-send-plan §6).
+  handleRotate() {
+    const keyset = this._keyset(); // genesis if somehow absent
+    const host = keyset.issuer_host;
+    const now = Date.now();
+    const next_deadline = this._advance(keyset, now);
+    kv.set(this.cfg.keyset_path, JSON.stringify(keyset));
+    if (host) this._armRotation(host, next_deadline);
+    response.status = 200;
+    response.headers = { "content-type": "application/json" };
+    return JSON.stringify({ ok: true, keys: keyset.keys.length });
+  }
+
+  // Emergency rotation (§4.6 distinct path): mint a fresh `current`,
+  // drop ALL prior keys immediately (skip the publish/retire
+  // windows — accept that tokens signed by the old key stop
+  // verifying), and bump `min_iat` so every refresh token / session
+  // older than now is rejected. Operator-triggered; intentionally
+  // NOT exposed as an unauthenticated route — the trigger lands with
+  // the admin/operator surface in step 3-6.
+  _emergencyRotate(keyset, now, host) {
+    const k = crypto.oidcGenerateKey();
+    keyset.keys = [{
+      kid: k.kid, status: "current", priv: k.priv, jwk: k.jwk, since: now,
+    }];
+    keyset.min_iat = Math.floor(now / 1000);
+    kv.set(this.cfg.keyset_path, JSON.stringify(keyset));
+    if (host) this._armRotation(host, now + this.cfg.rotation_period_ms);
   }
 
   handle() {
@@ -107,6 +224,13 @@ class OIDCProvider {
     }
     if (m === "POST" && path === "/token") {
       return this._token();
+    }
+    // Internal-routed scheduled key-rotation tick (§4.6). Reached
+    // only via the in-cluster http.send self-fire; an external POST
+    // here is benign — _advance is deadline-gated, so it can't force
+    // a premature rotation (worst case: a no-op extra tick).
+    if (m === "POST" && path === "/_oidc/rotate") {
+      return this.handleRotate();
     }
     response.status = 404;
     return "not found";

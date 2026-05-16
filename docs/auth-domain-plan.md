@@ -660,20 +660,43 @@ schedule_upsert / schedule_complete are **8/9** per PLAN §10.2
 `advance(keyset, now)` is deadline-gated and reads the keyset fresh,
 so a *sequential* double-fire self-heals: the second fire sees the
 state the first already advanced and the next deadline not yet
-reached, and no-ops. A *concurrent* double-fire does **not** self-heal
-on its own — http.send-plan §7 makes leadership-change double-fire
-explicitly possible for internal-routed rows, and RSA keygen is
-random, so two simultaneous fires would mint two different `K_new`.
-Per §7's mandate for internal-routed handlers, the rotate handler
-gates on the schedule row's `version` counter (§7): it writes a
-`_processed/oidc-rot/<version>` marker **atomically with** the keyset
-write and the next-timer arm (one type-7 multi), and a fire whose
-`version` is already marked is a no-op. This is the §7
-`webhook.loop46.com` idempotency pattern applied verbatim — it is what
-makes "duplicate fire is a no-op" actually true, and what lets a
-long-overdue fire catch up multiple phases at once. Emergency rotation
-(below) is a fresh upsert → fresh `version` → never suppressed by a
-prior marker.
+reached, and no-ops.
+
+> **Grounded correction (2026-05-16, step 3-5).** The original
+> design above made a *concurrent* (leadership-change) double-fire
+> safe via a schedule-`version`-keyed `_processed/oidc-rot/<version>`
+> marker, citing http-send-plan §7. Grounding the implementation
+> showed `X-Rove-Schedule-Id`/`-Version` are stamped **only on the
+> libcurl/external path** — the internal-routed in-process fire
+> (`internal_schedules.zig`) synthesizes a Request with **no headers
+> at all**, so the version is not observable by the rotate handler.
+> The `_processed` marker is therefore unimplementable as designed —
+> **and also unnecessary.** Concurrent-double-fire safety actually
+> comes for free from three properties: (1) the keyset is a *single*
+> kv key, so raft serializes the two writesets last-write-wins — no
+> split-brain, exactly one keyset persists; (2) we only ever *sign*
+> with the `current` key, never `next`, so a briefly-published-then-
+> overwritten `next` is harmless (no token is ever signed by it);
+> (3) the re-arm uses a stable `http.send` `handle`, whose
+> overwrite/version semantics collapse two concurrent re-arms into
+> one row. So the rotate handler needs no header and no `_processed`
+> marker: deadline-gated `advance` + single-key last-write-wins
+> keyset + sign-only-`current` + handle-overwrite re-arm is
+> dedup-safe. (No platform change to add internal-path headers — not
+> needed for rotation; left as a possible future consistency fix for
+> other internal-routed consumers.)
+>
+> Second grounding fact folded in: on internal-routed dispatch
+> `request.host` is **empty**, so the rotate handler can't derive
+> `iss`/the self-URL from it. The issuer host is captured into the
+> keyset at **genesis** (which always runs on a real wire request
+> where `request.host` is populated) and read from there by the
+> rotate re-arm — consistent with §4.6's "one configured issuer host
+> per tenant".
+
+Emergency rotation (below) skips the publish window and bumps
+`min_iat`; with the single-key keyset it likewise just last-write-wins
+against any concurrent scheduled fire.
 
 Scheduled-rotation sequence:
 
