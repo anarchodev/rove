@@ -1,16 +1,20 @@
 // rove admin entry point. Hash-based router — no build step required.
 //
 // Routes:
-//   #/login       → token entry
-//   #/instances   → list + create + delete + assign-domain
+//   #/login        → OIDC RP redirect (no form)
+//   #/provision    → name your first instance (post-login, 0 owned)
+//   #/instances    → list + create + delete + assign-domain
 //   #/instance/:id → per-instance dashboard
 //
-// Auth: cookie-based. Every route except #/login calls `api.whoami()`
-// before rendering. On 401, we bounce to #/login. On success, the
-// cookie carries auth for every subsequent fetch in the session.
+// Auth: OIDC relying party. Every route except #/login calls
+// `api.whoami()` before rendering. 401 → #/login (full-page redirect
+// to the IdP). A signed-in account that owns no instance and isn't
+// an operator is routed to #/provision. On success the platform sid
+// cookie carries auth for every subsequent fetch.
 
 import { api, ApiError } from "./api.js";
 import * as login from "./pages/login.js";
+import * as provision from "./pages/provision.js";
 import * as instances from "./pages/instances.js";
 import * as instance from "./pages/instance.js";
 
@@ -18,6 +22,7 @@ import * as instance from "./pages/instance.js";
 // parameterized route so we match its prefix.
 function resolveRoute(hash) {
   if (hash === "#/login") return { page: login, params: {} };
+  if (hash === "#/provision") return { page: provision, params: {} };
   if (hash === "#/instances") return { page: instances, params: {} };
   if (hash.startsWith("#/instance/")) {
     const id = decodeURIComponent(hash.slice("#/instance/".length));
@@ -32,18 +37,29 @@ async function route() {
   const hash = location.hash || "#/instances";
   const { page, params } = resolveRoute(hash);
 
-  // Auth gate: every page except login requires a live session.
-  // /v1/session 401 → redirect to login; 200 → proceed.
-  if (page !== login) {
-    const who = await api.whoami();
+  // Auth gate (one whoami per navigation). /v1/session →
+  // {is_root,sub,owned} or null (401).
+  const who = await api.whoami();
+  if (page === login) {
+    // Don't strand already-authed users on the login interstitial.
+    if (who) {
+      location.hash = "#/instances";
+      return;
+    }
+  } else {
     if (!who) {
       location.hash = "#/login";
       return;
     }
-  } else {
-    // Don't strand already-authed users on the login page.
-    const who = await api.whoami();
-    if (who) {
+    // A signed-in non-operator that owns no instance must provision
+    // one first; everyone else is kept off the provisioning page.
+    const needsProvision =
+      !who.is_root && (!who.owned || who.owned.length === 0);
+    if (needsProvision && page !== provision) {
+      location.hash = "#/provision";
+      return;
+    }
+    if (!needsProvision && page === provision) {
       location.hash = "#/instances";
       return;
     }

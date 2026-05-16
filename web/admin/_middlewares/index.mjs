@@ -1,55 +1,27 @@
-const SESSION_COOKIE = "rove_session";
+// Admin auth gate. Fork B (auth-domain-plan §4.7 "3-6 part 2"):
+// admin is a pure OIDC relying party — no rove_session cookie, no
+// root-token human path. Authentication moved to the __auth__ IdP;
+// this gate just resolves the RP session `oidc.rp` minted.
+//
+// `kv` here is ALWAYS __admin__-home (the 3a primitive fix —
+// X-Rove-Scope no longer rebinds it), so the RP session lookup is
+// naturally scope-independent and correct on every dispatch. The
+// /_system/* root-token surface is separate and unaffected.
 
 const PRE_AUTH_PATHS = [
-    "/v1/signup", "/v1/auth", "/v1/login", "/v1/logout",
+    // The browser-facing RP handshake endpoints.
+    "/_rp/login", "/_rp/callback", "/_rp/poll",
+    // Logout must work without a live session.
+    "/v1/logout",
+    // The async-completion on_result modules. callback_dispatch runs
+    // dispatcher.run → _middlewares BEFORE the module, and a
+    // synthesized callback request has NO request.session — so
+    // guard() would 401 and the login chain would never complete.
+    // Safe to pre-auth: these are bare `_rp/*.mjs` files, NOT
+    // HTTP-routable (only invokable as on_result modules); the real
+    // gate is the cryptographic jwt.verify inside oidc.rp._finish.
+    "/_rp/complete", "/_rp/jwks",
 ];
-
-function isHex64(s) {
-    if (typeof s !== "string" || s.length !== 64) return false;
-    for (let i = 0; i < 64; i++) {
-        const c = s.charCodeAt(i);
-        if (!((c >= 48 && c <= 57)
-           || (c >= 97 && c <= 102)
-           || (c >= 65 && c <= 70))) return false;
-    }
-    return true;
-}
-
-// Cookie path: hash, kv.get session/{hash}, sweep on expiry.
-// Bearer path: constant-time compare against LOOP46_ROOT_TOKEN
-// (read by the worker at startup; surfaced via
-// `platform.auth.checkRootToken`).
-// Bearer-authed callers always get is_root=true; the dashboard's
-// RPC path uses cookies, the operator's curl/CLI uses bearer.
-function checkSession() {
-    const opaque = request.cookies[SESSION_COOKIE];
-    if (isHex64(opaque)) {
-        const hash = crypto.sha256(opaque);
-        const raw = kv.get("session/" + hash);
-        if (raw) {
-            let row = null;
-            try { row = JSON.parse(raw); } catch (_) {}
-            const nowNs = Date.now() * 1_000_000;
-            if (!row) { kv.delete("session/" + hash); }
-            else if (nowNs >= row.expires_at_ns) {
-                kv.delete("session/" + hash);
-            } else {
-                return { is_root: !!row.is_root };
-            }
-        }
-    }
-    const auth = request.headers.authorization;
-    if (typeof auth === "string" && auth.length > 7) {
-        const lower = auth.slice(0, 7).toLowerCase();
-        if (lower === "bearer ") {
-            const token = auth.slice(7).trim();
-            if (isHex64(token) && platform.auth.checkRootToken(token)) {
-                return { is_root: true };
-            }
-        }
-    }
-    return null;
-}
 
 export function before() {
     const fullPath = request.path;
@@ -58,11 +30,11 @@ export function before() {
 
     if (PRE_AUTH_PATHS.indexOf(path) !== -1) return; // continue
 
-    const auth = checkSession();
+    const auth = oidc.rp("default").guard();
     if (!auth) {
         response.status = 401;
         return { error: "unauthenticated" };
     }
-    request.auth = auth;
+    request.auth = auth; // { sub, is_root }
     // fall through (undefined return) → continue to handler
 }

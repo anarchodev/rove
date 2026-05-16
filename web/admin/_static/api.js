@@ -1,8 +1,11 @@
 // Typed wrapper around the rove admin API.
 //
-// Auth is cookie-based: the server mints a `rove_session` cookie after
-// POST /v1/login, and every subsequent fetch replays it automatically
-// (we send `credentials: "include"`). No tokens in localStorage.
+// Auth is OIDC: the admin dashboard is a pure relying party of the
+// __auth__ IdP. Login is a full-page redirect to `/_rp/login`; the
+// server binds a session to the platform `__Host-rove_sid` cookie
+// (oidc.rp), which every subsequent fetch replays automatically
+// (`credentials: "include"`). No tokens in localStorage, no
+// rove_session cookie, no client-held credential.
 //
 // Every RPC call is still a named function on the `__admin__` handler:
 // `?fn=<name>` (GET, URL-encoded JSON args) or `POST {fn, args}`.
@@ -174,21 +177,20 @@ export async function hashBytes(bytes) {
 
 export const api = {
   // ── Auth ─────────────────────────────────────────────────────────
-  login(token) {
-    return postJson(adminBase() + "/v1/login", { token });
-  },
+  // Login is the OIDC RP handshake: a full-page navigation to
+  // `/_rp/login` (see pages/login.js) — there is no token/signup
+  // form and no client-held credential.
   logout() {
     return postJson(adminBase() + "/v1/logout", {});
   },
-  /// Magic-link signup. Returns `{ok:true, name, magic_link?}` on
-  /// success — `magic_link` is present only when no Resend key is
-  /// configured (dev/MVP mode); in production the link is delivered
-  /// via email and the customer follows it to /v1/auth.
-  /// Errors: 409 = name unavailable / reserved, 400 = invalid email.
-  signup(name, email) {
-    return postJson(adminBase() + "/v1/signup", { name, email });
+  /// Provision the caller's first instance. Identity is the
+  /// OIDC-verified session `sub` server-side — `name` is the only
+  /// arg. Errors: 409 = name unavailable / reserved, 400 = invalid
+  /// name, 403 = account_limit_reached.
+  provisionInstance(name) {
+    return rpc("provisionInstance", [name], { method: "POST" });
   },
-  /// Returns `{is_root}` on a valid session, null on 401.
+  /// Returns `{is_root, sub, owned}` on a valid session, null on 401.
   async whoami() {
     try {
       const res = await fetch(adminBase() + "/v1/session", {
