@@ -84,6 +84,22 @@ pub const Cli = struct {
     /// wildcard. Rescanned on the 1s reload poll (ACME writes here
     /// later — auth-domain-plan.md §3.2/§3.3). Unset = inert.
     custom_cert_dir: ?[]const u8 = null,
+    /// ACME directory URL. Set ⇒ enable in-tree HTTP-01 issuance for
+    /// custom domains (auth-domain-plan.md §3.2). Requires
+    /// `--custom-cert-dir`. Unset ⇒ ACME inert. e.g.
+    /// `https://acme-v02.api.letsencrypt.org/directory`, or a Pebble
+    /// URL in tests.
+    acme_directory: ?[]const u8 = null,
+    /// Optional ACME account contact (`mailto:`); for CA expiry mail.
+    acme_email: ?[]const u8 = null,
+    /// Skip TLS verification of the ACME *directory/API* endpoint.
+    /// ONLY for the Pebble test CA (its root is throwaway). Never in
+    /// production.
+    acme_insecure_tls: bool = false,
+    /// Port for the HTTP-01 challenge responder. Default 80 (what a
+    /// CA reaches via the customer's DNS → edge). Tests use a high
+    /// port to avoid the privileged-bind / :80-in-use.
+    acme_http_port: u16 = 80,
     /// Raft proposal linger budget, in microseconds. Hold pending
     /// proposals up to this long so the raft thread can pack more
     /// into a single `raft_log.db` commit + fsync. Under heavy write
@@ -244,6 +260,20 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             i += 1;
             if (i >= args.len) return error.Usage;
             out.custom_cert_dir = args[i];
+        } else if (std.mem.eql(u8, a, "--acme-directory")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.acme_directory = args[i];
+        } else if (std.mem.eql(u8, a, "--acme-email")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.acme_email = args[i];
+        } else if (std.mem.eql(u8, a, "--acme-insecure-tls")) {
+            out.acme_insecure_tls = true;
+        } else if (std.mem.eql(u8, a, "--acme-http-port")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.acme_http_port = try std.fmt.parseInt(u16, args[i], 10);
         } else if (std.mem.eql(u8, a, "--propose-linger-us")) {
             i += 1;
             if (i >= args.len) return error.Usage;

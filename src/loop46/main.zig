@@ -70,6 +70,7 @@ const restore_cli = @import("restore_cli.zig");
 const snapshot_cli = @import("snapshot_cli.zig");
 const promote_cli = @import("promote_cli.zig");
 const snapshot_mod = @import("snapshot.zig");
+const acme_mod = @import("acme.zig");
 
 // Demo + benchmark tenants used to live inline as Zig string literals
 // here. They now live as real `.mjs` files under
@@ -1395,6 +1396,44 @@ pub fn main() !void {
     for (node_instance_list.ids) |id| {
         if (std.mem.eql(u8, id, tenant_mod.ADMIN_INSTANCE_ID)) continue;
         try node_tenant.createInstance(id);
+    }
+
+    // ── ACME issuance (auth-domain-plan.md §3.2) ───────────────────
+    // Leader-gated HTTP-01 issuance for custom domains + every-node
+    // materialization of replicated certs into --custom-cert-dir
+    // (Phase-2c then serves them by SNI). Inert unless BOTH
+    // --acme-directory and --custom-cert-dir are set → zero change
+    // for existing deploys. Defers: signalStop then join run before
+    // node_tenant.destroy / cluster teardown (registered earlier →
+    // LIFO runs them later).
+    var acme_handle: ?*acme_mod.Handle = null;
+    defer if (acme_handle) |h| h.join();
+    defer if (acme_handle) |h| h.signalStop();
+    if (cli.acme_directory) |dir_url| {
+        if (cli.custom_cert_dir) |ccd| {
+            acme_handle = acme_mod.spawn(.{
+                .allocator = allocator,
+                .raft = raft_node,
+                .cluster = cluster,
+                .tenant = node_tenant,
+                .data_dir = cli.data_dir,
+                .custom_cert_dir = ccd,
+                .public_suffix = cli.public_suffix.?,
+                .system_suffix = cli.system_suffix.?,
+                .directory_url = dir_url,
+                .contact_email = cli.acme_email,
+                .insecure_tls = cli.acme_insecure_tls,
+                .http_port = cli.acme_http_port,
+            }) catch |err| blk: {
+                std.log.err("acme: spawn failed: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+        } else {
+            std.log.warn(
+                "acme: --acme-directory set but --custom-cert-dir missing; ACME disabled",
+                .{},
+            );
+        }
     }
 
     // HTTP-backed manifest fetcher + cold-start prefetch — process-
