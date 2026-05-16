@@ -773,4 +773,47 @@ pub fn build(b: *std.Build) void {
         .root_module = h2_limit_mod,
     });
     b.installArtifact(h2_limit_test);
+
+    // ── rust-ffi-smoke: V2 vendoring spike (docs/v2-vendoring-spike.md).
+    // Step 1 — prove `cargo build → linkSystemLibrary` works end-to-end
+    // before vendoring raft-rs's full dep tree. The Rust staticlib at
+    // examples/rust_ffi_smoke/ exports three C ABI fns (arithmetic,
+    // static C string, Rust-fires-Zig-callback) mirroring the shape of
+    // the eventual raft-rs FFI.
+    const cargo_smoke = b.addSystemCommand(&.{ "cargo", "build", "--release", "--manifest-path" });
+    cargo_smoke.addFileArg(b.path("examples/rust_ffi_smoke/Cargo.toml"));
+
+    const rust_ffi_smoke_mod = b.addModule("rust-ffi-smoke", .{
+        .root_source_file = b.path("examples/rust_ffi_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rust_ffi_smoke_mod.link_libc = true;
+    rust_ffi_smoke_mod.addIncludePath(b.path("examples/rust_ffi_smoke/include"));
+    rust_ffi_smoke_mod.addLibraryPath(b.path("examples/rust_ffi_smoke/target/release"));
+    rust_ffi_smoke_mod.linkSystemLibrary("rust_ffi_smoke", .{});
+    // Native libs required by Rust's std even when the crate is
+    // compiled with `panic = "abort"` (eh_personality + backtrace
+    // machinery still get pulled in). Order matches the output of
+    // `cargo rustc --release --lib -- --print native-static-libs`.
+    rust_ffi_smoke_mod.linkSystemLibrary("gcc_s", .{});
+    rust_ffi_smoke_mod.linkSystemLibrary("util", .{});
+    rust_ffi_smoke_mod.linkSystemLibrary("rt", .{});
+    rust_ffi_smoke_mod.linkSystemLibrary("pthread", .{});
+    rust_ffi_smoke_mod.linkSystemLibrary("m", .{});
+    rust_ffi_smoke_mod.linkSystemLibrary("dl", .{});
+
+    const rust_ffi_smoke_exe = b.addExecutable(.{
+        .name = "rust-ffi-smoke",
+        .root_module = rust_ffi_smoke_mod,
+    });
+    rust_ffi_smoke_exe.step.dependOn(&cargo_smoke.step);
+    // Deliberately NOT `b.installArtifact`: keeps cargo out of the
+    // default `zig build` so V1 contributors don't need a Rust
+    // toolchain. Reach the spike via `zig build rust-ffi-smoke`.
+
+    const run_rust_ffi_smoke = b.addRunArtifact(rust_ffi_smoke_exe);
+    run_rust_ffi_smoke.step.dependOn(&cargo_smoke.step);
+    const rust_ffi_smoke_step = b.step("rust-ffi-smoke", "Run the Rust-FFI hello-world smoke (V2 spike)");
+    rust_ffi_smoke_step.dependOn(&run_rust_ffi_smoke.step);
 }

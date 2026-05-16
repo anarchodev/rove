@@ -1,0 +1,16 @@
+[package]
+name = "rust_ffi_smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "rust_ffi_smoke"
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
