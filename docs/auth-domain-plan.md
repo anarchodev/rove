@@ -1003,16 +1003,39 @@ owns the email round-trip now; provisioning is synchronous behind a
 proven-authenticated session, so there is no unredeemed-reservation
 abuse vector to rate-limit against).
 
-**Bootstrap seeding (replaces the smoke's manual `setKv`).**
-`bootstrap.zig` gains two raft-seeded `__auth__`/`__admin__` kv
-writes alongside the existing deploy: (a) `_oidc/config/default`
-client registry on `__auth__` registering `admin-dashboard` →
-`https://app.{system_suffix}/_rp/callback` (host derived from the
-`--system-suffix` already in `CliConfig`, §0-compliant — config, not
-literal); (b) the `_admin/operator/*` allowlist on `__admin__` from
-`LOOP46_OPERATOR_EMAILS`. The smoke stops hand-registering the
-client; it asserts the bootstrap seed instead (stronger — proves the
-prod path).
+**Bootstrap seeding — grounded approach correction (2026-05-16, no
+new Zig).** The original "`bootstrap.zig` gains two raft-seeded
+writes" plan was over-built. Grounding the seam:
+
+- `_admin/operator/*` and `_oidc/rp/default` are **`__admin__`** keys
+  (the RP runs *in* the admin tenant). The existing
+  `--bootstrap-kv key=value → postAdminKv → /_system/admin-kv →
+  raft into __admin__` seam (`examples/files_server_standalone.zig`,
+  `bootstrap.zig::postAdminKv`) already does exactly this and is the
+  established precedent (`resend_key`, `platform_email_from` seed
+  this way via `scripts/rove-loop46-serve.sh`'s `ROVE_*` → flag
+  translation). So: **reuse it, add no Zig.** `rove-loop46-serve.sh`
+  translates `LOOP46_OPERATOR_EMAILS` (comma list) into
+  `--bootstrap-kv _admin/operator/{sha256hex(email)}=` pairs (sha256
+  in shell via `sha256sum`; the RP checks `kv.get("_admin/operator/"
+  + crypto.sha256(sub))` and `crypto.sha256` returns hex) plus one
+  `--bootstrap-kv _oidc/rp/default={json}` pair (issuer/redirect from
+  the system suffix the script already knows — §0-compliant config,
+  not a library literal). The smoke harness seeds the same way.
+- `_oidc/config/default` (the IdP client registry) is an **`__auth__`**
+  key, which the `__admin__`-only seam can't reach. But the
+  config-mirror fix (`fd1b37b`) already deploy-mirrors
+  `web/auth/_config/oidc/default.json` → `__auth__` kv at
+  `_config/oidc/default`. So add a **read-through fallback in
+  `oidc.provider`**: live admin-managed `_oidc/config/{name}` wins
+  (runtime-mutable, operators add RP clients without redeploy); when
+  absent, fall back to the deploy-mirrored `_config/oidc/{name}`
+  template. This is precisely the precedence §4.7 already describes
+  ("`_oidc/config/*` operational override; `_config/oidc/*` per-deploy
+  template") — a read-through fallback *is* that relationship in
+  code. ~4 lines; zero new infra; uses the proven config-mirror path;
+  removes the smoke's hand-registration of the IdP client (it relies
+  on the mirrored template instead — stronger, proves the prod path).
 
 **Safe sequence (admin is the live-auth-regression risk).**
 

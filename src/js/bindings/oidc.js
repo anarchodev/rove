@@ -795,11 +795,22 @@ globalThis.oidc = {
   provider(arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
-      const raw = kv.get("_oidc/config/" + name);
+      // Precedence (auth-domain-plan §4.7): the live admin-managed
+      // `_oidc/config/{name}` wins (runtime-mutable — operators add
+      // RP clients without a redeploy). When absent, fall through to
+      // the per-deploy template `_config/oidc/{name}`, which the
+      // config-mirror release path (commit fd1b37b) populates from
+      // `web/auth/_config/oidc/{name}.json`. The fallback IS that
+      // documented override/template relationship in code — it makes
+      // the prod path work with zero bootstrap glue.
+      let raw = kv.get("_oidc/config/" + name);
+      if (raw == null) raw = kv.get("_config/oidc/" + name);
       if (raw == null) {
         throw new Error(
           "oidc.provider: no client registry at _oidc/config/" + name +
-          " (register via admin setKv, X-Rove-Scope: __auth__).");
+          " or _config/oidc/" + name + " (register via admin setKv " +
+          "X-Rove-Scope: __auth__, or deploy web/auth/_config/oidc/" +
+          name + ".json).");
       }
       return new OIDCProvider(JSON.parse(raw), name);
     }

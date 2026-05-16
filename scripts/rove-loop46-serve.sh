@@ -74,15 +74,46 @@ ADMIN_ORIGIN="https://${ADMIN_API_DOMAIN}"
 # Bootstrap plumbing.
 #   ROVE_TOKEN       → LOOP46_ROOT_TOKEN env (worker reads at startup;
 #                       constant-time compared against the bearer on
-#                       /_system/* and /v1/login).
+#                       the /_system/* M2M surface — files-server /
+#                       log-server / services-token. NOT a human-login
+#                       path: admin dashboard auth is OIDC-only as of
+#                       auth-domain-plan §4.7 "3-6 part 2".)
 #   ROVE_RESEND_KEY  → files-server --bootstrap-kv resend_key=... (one-shot
 #                       admin-kv push at standalone startup).
+#   LOOP46_OPERATOR_EMAILS → comma-separated operator emails. Each is
+#                       seeded as `_admin/operator/{sha256hex(email)}=`
+#                       into __admin__ kv (raft-replicated). The OIDC
+#                       RP (oidc.rp / web/admin) stamps is_root iff the
+#                       verified id_token `sub` hashes into this set —
+#                       this REPLACES the root-token human login path
+#                       (§4.7 D1). sha256 here must match the rove JS
+#                       `crypto.sha256` (UTF-8 bytes → lowercase hex),
+#                       so `printf '%s'` (no newline) piped to
+#                       `sha256sum`.
 if [[ -n "${ROVE_TOKEN:-}" ]]; then
     export LOOP46_ROOT_TOKEN="$ROVE_TOKEN"
 fi
 FILES_BOOTSTRAP_ARGS=()
 if [[ -n "${ROVE_RESEND_KEY:-}" ]]; then
     FILES_BOOTSTRAP_ARGS+=(--bootstrap-kv "resend_key=$ROVE_RESEND_KEY")
+fi
+# OIDC RP config for the admin dashboard (§4.7 "3-6 part 2").
+# issuer/redirect derive from SYSTEM_DOMAIN — config, not a library
+# literal (§0). operator_prefix points the RP at the allowlist seeded
+# just below. The JSON value carries no `=`, so the admin-kv
+# `key=value` split stays unambiguous.
+FILES_BOOTSTRAP_ARGS+=(--bootstrap-kv \
+  "_oidc/rp/default={\"issuer\":\"https://auth.${SYSTEM_DOMAIN}\",\"client_id\":\"admin-dashboard\",\"redirect_uri\":\"https://app.${SYSTEM_DOMAIN}/_rp/callback\",\"post_login\":\"/\",\"operator_prefix\":\"_admin/operator/\"}")
+if [[ -n "${LOOP46_OPERATOR_EMAILS:-}" ]]; then
+    IFS=',' read -ra _ops <<< "$LOOP46_OPERATOR_EMAILS"
+    for _op in "${_ops[@]}"; do
+        _op="${_op#"${_op%%[![:space:]]*}"}"   # ltrim
+        _op="${_op%"${_op##*[![:space:]]}"}"   # rtrim
+        [[ -z "$_op" ]] && continue
+        _oph="$(printf '%s' "$_op" | sha256sum | cut -d' ' -f1)"
+        FILES_BOOTSTRAP_ARGS+=(--bootstrap-kv "_admin/operator/${_oph}=")
+    done
+    unset _ops _op _oph
 fi
 
 cat <<EOF
