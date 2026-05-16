@@ -1119,6 +1119,12 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         // with Apple, AWS Cognito on EC keys, etc. Sig is JWS raw
         // R||S concatenation (the binding converts to DER internally).
         .{ .name = "verifyEcdsa",     .cfunc = crypto_b.jsCryptoVerifyEcdsa,     .argc = 4 },
+        // OIDC RS256 key custody (auth-domain-plan §4.7, fork A
+        // HYBRID): keygen + sign are Zig/OpenSSL; the IdP JS holds
+        // the private key only as an opaque PEM string it never
+        // parses.
+        .{ .name = "oidcGenerateKey", .cfunc = crypto_b.jsCryptoOidcGenerateKey, .argc = 0 },
+        .{ .name = "oidcSign",        .cfunc = crypto_b.jsCryptoOidcSign,        .argc = 2 },
     } },
     // http.send / http.cancel — the platform's outbound HTTP
     // primitive (docs/http-send-plan.md). send appends a

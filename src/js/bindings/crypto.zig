@@ -15,6 +15,8 @@ const ssl = @cImport({
     @cInclude("openssl/err.h");
     @cInclude("openssl/core_names.h");
     @cInclude("openssl/param_build.h");
+    @cInclude("openssl/pem.h");
+    @cInclude("openssl/bio.h");
 });
 
 const globals = @import("../globals.zig");
@@ -802,4 +804,232 @@ fn b64Lookup(ch: u8) ?u8 {
         '/', '_' => 63,
         else => null,
     };
+}
+
+// =============================================================================
+// OIDC RS256 key custody (auth-domain-plan §4.7 fork A: HYBRID).
+//
+// Generation + signing are Zig/OpenSSL; the RSA private key is handed
+// to JS only as an opaque PKCS#8 PEM string it stores in kv and passes
+// back verbatim — JS never does private-key math. (Implementation
+// refinement of §4.7's "by kid" phrasing: a pure binding with no kv
+// coupling; the IdP JS keeps the opaque blob.)
+// =============================================================================
+
+const B64URL = std.base64.url_safe_no_pad;
+
+fn b64urlEnc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, B64URL.Encoder.calcSize(bytes.len));
+    _ = B64URL.Encoder.encode(out, bytes);
+    return out;
+}
+
+fn bioDrain(allocator: std.mem.Allocator, bio: *ssl.BIO) ![]u8 {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer list.deinit(allocator);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = ssl.BIO_read(bio, &tmp, @as(c_int, tmp.len));
+        if (n <= 0) break;
+        try list.appendSlice(allocator, tmp[0..@intCast(n)]);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// An RSA-2048 keypair. `priv_pem` is the opaque blob the IdP stores.
+const RsaKey = struct {
+    pkey: *ssl.EVP_PKEY,
+
+    fn generate() !RsaKey {
+        const ty: [*c]const u8 = "RSA";
+        const pkey = ssl.EVP_PKEY_Q_keygen(null, null, ty, @as(usize, 2048)) orelse
+            return error.RsaKeygen;
+        return .{ .pkey = pkey };
+    }
+
+    fn fromPem(pem: []const u8) !RsaKey {
+        const bio = ssl.BIO_new_mem_buf(pem.ptr, @intCast(pem.len)) orelse
+            return error.OutOfMemory;
+        defer _ = ssl.BIO_free(bio);
+        const pkey = ssl.PEM_read_bio_PrivateKey(bio, null, null, null) orelse
+            return error.RsaBadPem;
+        return .{ .pkey = pkey };
+    }
+
+    fn deinit(self: *RsaKey) void {
+        ssl.EVP_PKEY_free(self.pkey);
+    }
+
+    fn privatePem(self: *const RsaKey, allocator: std.mem.Allocator) ![]u8 {
+        const bio = ssl.BIO_new(ssl.BIO_s_mem()) orelse return error.OutOfMemory;
+        defer _ = ssl.BIO_free(bio);
+        if (ssl.PEM_write_bio_PrivateKey(bio, self.pkey, null, null, 0, null, null) != 1)
+            return error.RsaPemWrite;
+        return bioDrain(allocator, bio);
+    }
+
+    fn bnParam(self: *const RsaKey, allocator: std.mem.Allocator, name: [*c]const u8) ![]u8 {
+        var bn: ?*ssl.BIGNUM = null;
+        if (ssl.EVP_PKEY_get_bn_param(self.pkey, name, &bn) != 1 or bn == null)
+            return error.RsaParam;
+        defer ssl.BN_free(bn);
+        const len = ssl.BN_num_bytes(bn);
+        if (len <= 0) return error.RsaParam;
+        const buf = try allocator.alloc(u8, @intCast(len));
+        errdefer allocator.free(buf);
+        if (ssl.BN_bn2bin(bn, buf.ptr) != len) return error.RsaParam;
+        return buf;
+    }
+
+    /// Public JWK members (n,e base64url) + RFC 7638 kid. Caller frees.
+    const Jwk = struct {
+        n: []u8,
+        e: []u8,
+        kid: []u8,
+        fn deinit(self: *Jwk, a: std.mem.Allocator) void {
+            a.free(self.n);
+            a.free(self.e);
+            a.free(self.kid);
+        }
+    };
+
+    fn publicJwk(self: *const RsaKey, allocator: std.mem.Allocator) !Jwk {
+        const n_raw = try self.bnParam(allocator, "n");
+        defer allocator.free(n_raw);
+        const e_raw = try self.bnParam(allocator, "e");
+        defer allocator.free(e_raw);
+        const n_b64 = try b64urlEnc(allocator, n_raw);
+        errdefer allocator.free(n_b64);
+        const e_b64 = try b64urlEnc(allocator, e_raw);
+        errdefer allocator.free(e_b64);
+        // RFC 7638: members in lexicographic order, no whitespace.
+        const canon = try std.fmt.allocPrint(
+            allocator,
+            "{{\"e\":\"{s}\",\"kty\":\"RSA\",\"n\":\"{s}\"}}",
+            .{ e_b64, n_b64 },
+        );
+        defer allocator.free(canon);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(canon, &digest, .{});
+        const kid = try b64urlEnc(allocator, &digest);
+        return .{ .n = n_b64, .e = e_b64, .kid = kid };
+    }
+
+    /// RS256 (RSASSA-PKCS1-v1_5 + SHA-256 — the EVP default for RSA).
+    /// Returns base64url(signature). Caller frees.
+    fn signRs256(self: *const RsaKey, allocator: std.mem.Allocator, msg: []const u8) ![]u8 {
+        const mdctx = ssl.EVP_MD_CTX_new() orelse return error.OutOfMemory;
+        defer ssl.EVP_MD_CTX_free(mdctx);
+        if (ssl.EVP_DigestSignInit(mdctx, null, ssl.EVP_sha256(), null, self.pkey) != 1)
+            return error.RsaSign;
+        var siglen: usize = 0;
+        if (ssl.EVP_DigestSign(mdctx, null, &siglen, msg.ptr, msg.len) != 1)
+            return error.RsaSign;
+        const sig = try allocator.alloc(u8, siglen);
+        defer allocator.free(sig);
+        if (ssl.EVP_DigestSign(mdctx, sig.ptr, &siglen, msg.ptr, msg.len) != 1)
+            return error.RsaSign;
+        return b64urlEnc(allocator, sig[0..siglen]);
+    }
+};
+
+/// `crypto.oidcGenerateKey()` → `{ priv, jwk:{kty,n,e,alg,use,kid}, kid }`.
+/// `priv` is an opaque PKCS#8 PEM the IdP stores in kv and never parses.
+pub fn jsCryptoOidcGenerateKey(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    _: c_int,
+    _: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const allocator = globals.getState(ctx).allocator;
+    var key = RsaKey.generate() catch {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.oidcGenerateKey: keygen failed");
+        return js_exception;
+    };
+    defer key.deinit();
+    const pem = key.privatePem(allocator) catch return js_exception;
+    defer allocator.free(pem);
+    var jwk = key.publicJwk(allocator) catch return js_exception;
+    defer jwk.deinit(allocator);
+
+    const obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, obj, "priv", c.JS_NewStringLen(ctx, pem.ptr, pem.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "kid", c.JS_NewStringLen(ctx, jwk.kid.ptr, jwk.kid.len));
+    const jwk_obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, jwk_obj, "kty", c.JS_NewStringLen(ctx, "RSA", 3));
+    _ = c.JS_SetPropertyStr(ctx, jwk_obj, "alg", c.JS_NewStringLen(ctx, "RS256", 5));
+    _ = c.JS_SetPropertyStr(ctx, jwk_obj, "use", c.JS_NewStringLen(ctx, "sig", 3));
+    _ = c.JS_SetPropertyStr(ctx, jwk_obj, "n", c.JS_NewStringLen(ctx, jwk.n.ptr, jwk.n.len));
+    _ = c.JS_SetPropertyStr(ctx, jwk_obj, "e", c.JS_NewStringLen(ctx, jwk.e.ptr, jwk.e.len));
+    _ = c.JS_SetPropertyStr(ctx, jwk_obj, "kid", c.JS_NewStringLen(ctx, jwk.kid.ptr, jwk.kid.len));
+    _ = c.JS_SetPropertyStr(ctx, obj, "jwk", jwk_obj);
+    return obj;
+}
+
+/// `crypto.oidcSign(priv_pem, signing_input)` → base64url(RS256 sig).
+pub fn jsCryptoOidcSign(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 2) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.oidcSign requires (priv_pem, signing_input)");
+        return js_exception;
+    }
+    const allocator = globals.getState(ctx).allocator;
+    var pem_len: usize = 0;
+    const pem_c = c.JS_ToCStringLen(ctx, &pem_len, argv[0]);
+    if (pem_c == null) return js_exception;
+    defer c.JS_FreeCString(ctx, pem_c);
+    var msg_len: usize = 0;
+    const msg_c = c.JS_ToCStringLen(ctx, &msg_len, argv[1]);
+    if (msg_c == null) return js_exception;
+    defer c.JS_FreeCString(ctx, msg_c);
+
+    var key = RsaKey.fromPem(pem_c[0..pem_len]) catch {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.oidcSign: bad private PEM");
+        return js_exception;
+    };
+    defer key.deinit();
+    const sig = key.signRs256(allocator, msg_c[0..msg_len]) catch {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.oidcSign: sign failed");
+        return js_exception;
+    };
+    defer allocator.free(sig);
+    return c.JS_NewStringLen(ctx, sig.ptr, sig.len);
+}
+
+test "RSA keygen → RS256 sign verifies; JWK + kid well-formed" {
+    const a = std.testing.allocator;
+    var k = try RsaKey.generate();
+    defer k.deinit();
+
+    const pem = try k.privatePem(a);
+    defer a.free(pem);
+    try std.testing.expect(std.mem.indexOf(u8, pem, "PRIVATE KEY") != null);
+
+    const sig_b64 = try k.signRs256(a, "oidc id_token signing input");
+    defer a.free(sig_b64);
+    const sig = try base64urlDecode(a, sig_b64);
+    defer a.free(sig);
+    // Verify with OpenSSL directly (proves the sig is real RS256).
+    const mdctx = ssl.EVP_MD_CTX_new().?;
+    defer ssl.EVP_MD_CTX_free(mdctx);
+    try std.testing.expect(ssl.EVP_DigestVerifyInit(mdctx, null, ssl.EVP_sha256(), null, k.pkey) == 1);
+    const msg = "oidc id_token signing input";
+    try std.testing.expect(ssl.EVP_DigestVerify(mdctx, sig.ptr, sig.len, msg, msg.len) == 1);
+
+    var jwk = try k.publicJwk(a);
+    defer jwk.deinit(a);
+    try std.testing.expect(jwk.n.len > 300); // 2048-bit modulus, b64url
+    try std.testing.expectEqualStrings("AQAB", jwk.e); // 65537
+    try std.testing.expectEqual(@as(usize, 43), jwk.kid.len); // sha256 b64url
+
+    // PEM round-trips and yields the same public JWK (same key).
+    var k2 = try RsaKey.fromPem(pem);
+    defer k2.deinit();
+    var jwk2 = try k2.publicJwk(a);
+    defer jwk2.deinit(a);
+    try std.testing.expectEqualStrings(jwk.kid, jwk2.kid);
 }
