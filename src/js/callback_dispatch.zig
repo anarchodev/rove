@@ -465,6 +465,22 @@ fn runOneCallback(
     };
     defer resp.deinit(allocator);
 
+    // on_result outcome — the callback path otherwise logs only
+    // failures, which hides "ran fine but the handler reports a
+    // problem in its body" (e.g. an RP completion that rejects an
+    // id_token). One info line per invocation; cheap, and the
+    // breadcrumb the next investigator needs.
+    std.log.info(
+        "rove-js callbacks: {s}/{s} module={s} status={d} body={s}",
+        .{
+            inst.id,
+            callback_id,
+            on_result,
+            resp.status,
+            resp.body[0..@min(resp.body.len, 160)],
+        },
+    );
+
     if (worker.dispatcher.last_kv_error != null) {
         worker.dispatcher.last_kv_error = null;
         txn.rollbackTo() catch {};

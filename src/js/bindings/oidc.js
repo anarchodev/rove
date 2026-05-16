@@ -648,15 +648,15 @@ class OIDCRelyingParty {
       client_id: this.cfg.client_id,
       code_verifier: st.verifier,
     });
+    // `context` is a TOP-LEVEL http.send field (jsHttpSend reads
+    // opts.context), NOT nested in on_result — matches oauth.js.
     http.send({
       url: this.cfg.issuer + "/token",
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
-      on_result: {
-        module: this.cfg.complete_module,
-        context: { sid: st.sid, return_to: st.return_to },
-      },
+      on_result: { module: this.cfg.complete_module },
+      context: { sid: st.sid, return_to: st.return_to },
     });
     return this._pollPage(st.return_to);
   }
@@ -702,12 +702,8 @@ class OIDCRelyingParty {
     http.send({
       url: this.cfg.issuer + "/.well-known/jwks.json",
       method: "GET",
-      on_result: {
-        module: this.cfg.jwks_module,
-        context: {
-          sid: ctx.sid, return_to: ctx.return_to, id_token,
-        },
-      },
+      on_result: { module: this.cfg.jwks_module },
+      context: { sid: ctx.sid, return_to: ctx.return_to, id_token },
     });
     response.status = 200;
     return "fetching jwks";

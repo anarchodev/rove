@@ -135,13 +135,6 @@ def main() -> int:
             time.sleep(0.25)
         expect_status("__auth__ deployed (GET /login)", 200, r)
 
-        # DEBUG: discovery iss (shows the IdP's request.host incl port)
-        # + the RP redirect we seeded, so a redirect mismatch is legible.
-        dr = curl(cc, auth + "/.well-known/openid-configuration")
-        print(f"DEBUG discovery {dr.status} iss="
-              f"{json.loads(dr.body).get('issuer') if dr.status==200 else dr.body[:200]}")
-        print(f"DEBUG seeded rp redirect_uri={origin}/_rp/callback")
-
         # ── 1. RP GATE ────────────────────────────────────────────────
 
         # Operator: in the allowlist ⇒ is_root. No Bearer, no

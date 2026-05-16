@@ -8,18 +8,25 @@ POST {"fn":"<name>","args":[...]}.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib import Cluster, curl, expect_status  # noqa: E402
+from smoke_lib import Cluster, curl, expect_status, idp_login  # noqa: E402
 
 TOKEN = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 PUBLIC_SUFFIX = "rewindjsapp.localhost"
 SYSTEM_SUFFIX = "rewindjscom.localhost"
 API_HOST = f"app.{SYSTEM_SUFFIX}"
+OPERATOR_EMAIL = "operator@example.com"
+
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
 
 
 def main() -> int:
@@ -41,13 +48,30 @@ def main() -> int:
         print(f"ok  leader elected: node {c.leader_idx} at {c.addrs.http[c.leader_idx]}")
 
         origin = c.admin_origin()
-        c.spawn_files_server(cors_origin=origin, leader_url=origin)
+        port = c.leader_port()
+        auth_host = f"auth.{SYSTEM_SUFFIX}"
+        auth_base = f"https://{auth_host}:{port}"
 
-        # Pre-resolve every tenant subdomain the smoke uses.
+        # Admin auth is OIDC-only (Fork B). Seed the admin RP config +
+        # the operator allowlist into __admin__ via --bootstrap-kv (the
+        # rove-loop46-serve.sh prod channel); the IdP admin-dashboard
+        # client comes from the config-mirrored web/auth template.
+        rp_cfg = json.dumps({
+            "issuer": auth_base,
+            "client_id": "admin-dashboard",
+            "redirect_uri": f"{origin}/_rp/callback",
+            "post_login": "/",
+            "operator_prefix": "_admin/operator/",
+        }, separators=(",", ":"))
+        c.spawn_files_server(cors_origin=origin, leader_url=origin, extra_args=[
+            "--bootstrap-kv", "_oidc/rp/default=" + rp_cfg,
+            "--bootstrap-kv", f"_admin/operator/{sha256_hex(OPERATOR_EMAIL)}=",
+        ])
+
+        # Pre-resolve every tenant subdomain the smoke uses + the IdP.
         extra = ["acme", "randwrite"]
-        cc = c.curl_ctx(*(f"{t}.{PUBLIC_SUFFIX}" for t in extra))
+        cc = c.curl_ctx(auth_host, *(f"{t}.{PUBLIC_SUFFIX}" for t in extra))
         api = f"{origin}"
-        auth = {"Authorization": f"Bearer {TOKEN}", "Origin": origin}
 
         # 1. CORS preflight (allowed origin).
         r = curl(
@@ -74,24 +98,44 @@ def main() -> int:
         )
         expect_status("preflight rejects wrong origin", 403, r)
 
-        # 3. Missing bearer → 401. Poll until admin's deployment snapshot
-        # is loaded (deployment loader is async after files-server's
-        # bootstrap release POST).
+        # 3. No session → 401 (admin is a pure OIDC RP — no Bearer
+        # human path). Two async startup steps must settle: the admin
+        # deployment snapshot loads (503 until then) AND the
+        # --bootstrap-kv push lands `_oidc/rp/default` in __admin__ kv
+        # (the RP middleware 500s "no RP config" until then). Poll
+        # until a clean unauthenticated 401.
         import time as _t
-        deadline = _t.monotonic() + 10.0
+        deadline = _t.monotonic() + 20.0
         r = curl(cc, f"{api}/?fn=listInstance", headers={"Origin": origin})
-        while _t.monotonic() < deadline and r.status == 503:
-            _t.sleep(0.1)
+        while _t.monotonic() < deadline and r.status != 401:
+            _t.sleep(0.25)
             r = curl(cc, f"{api}/?fn=listInstance", headers={"Origin": origin})
-        expect_status("missing bearer token returns 401", 401, r)
+        expect_status("no session returns 401", 401, r)
 
-        # 4. Bad bearer → 401.
+        # 4. Garbage session cookie → 401 (no _rp/sess row for it).
         bad = "0" * 64
         r = curl(
             cc, f"{api}/?fn=listInstance",
-            headers={"Origin": origin, "Authorization": f"Bearer {bad}"},
+            headers={"Origin": origin, "Cookie": f"__Host-rove_sid={bad}"},
         )
-        expect_status("bad bearer token returns 401", 401, r)
+        expect_status("bogus session cookie returns 401", 401, r)
+
+        # __auth__ readiness: GET /login renders without touching
+        # oidc.provider()/_config, so it 200s as soon as the IdP
+        # bundle is deployed (a beat after __admin__).
+        for _ in range(80):
+            rr = curl(cc, auth_base + "/login")
+            if rr.status == 200:
+                break
+            _t.sleep(0.25)
+
+        # Authenticate as the operator via the real OIDC RP handshake;
+        # the seeded allowlist makes this session is_root. Every admin
+        # RPC below carries this cookie instead of a Bearer token.
+        op_cookie = idp_login(cc, email=OPERATOR_EMAIL,
+                              app_origin=origin, auth_base=auth_base)
+        auth = {"Cookie": op_cookie, "Origin": origin}
+        print("ok  operator authenticated via OIDC RP (is_root session)")
 
         # 5. listInstance includes acme + __admin__. Poll because the
         # admin tenant deploy lands async via the leader's bootstrap.
