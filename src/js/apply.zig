@@ -501,8 +501,32 @@ pub fn applyScheduleUpsertBatch(
 fn detectInternalTarget(cluster: *kv.Cluster, ctx: *Loop46Ctx, url: []const u8) bool {
     const suffix = ctx.public_suffix orelse return false;
     if (suffix.len == 0) return false;
-    const id = schedule_server.internal_routing.parseInstanceId(url, suffix) orelse return false;
     const root = cluster.openRoot() catch return false;
+
+    // (a) `{id}.{public_suffix}` customer wildcard.
+    if (schedule_server.internal_routing.parseInstanceId(url, suffix)) |id| {
+        return rootInstanceExists(root, ctx, id);
+    }
+    // (b) Explicit `assignDomain` host — system tenants
+    //     (`auth./replay.{system_suffix}`) + any operator-assigned
+    //     domain. The `domain/{host}` map is raft-replicated __root__
+    //     state, so this stays deterministic across replicas. Closes
+    //     the §4.6 "the issuer resolves cluster-local" gap for the
+    //     platform IdP (auth-domain-plan §4.7): without it `http.send`
+    //     to `auth.{system_suffix}` (RP token/jwks, key-rotation)
+    //     demoted to a real outbound call.
+    const host = schedule_server.internal_routing.targetHost(url) orelse return false;
+    var dkey_buf: [16 + 253]u8 = undefined;
+    const dkey = std.fmt.bufPrint(&dkey_buf, "domain/{s}", .{host}) catch return false;
+    const id_v = root.get(dkey) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return false,
+    };
+    defer ctx.allocator.free(id_v);
+    return rootInstanceExists(root, ctx, id_v);
+}
+
+fn rootInstanceExists(root: *kv.KvStore, ctx: *Loop46Ctx, id: []const u8) bool {
     var key_buf: [128]u8 = undefined;
     const key = std.fmt.bufPrint(&key_buf, "instance/{s}", .{id}) catch return false;
     const v = root.get(key) catch |err| switch (err) {

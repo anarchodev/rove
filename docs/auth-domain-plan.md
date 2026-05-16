@@ -1148,6 +1148,41 @@ with the other privileged cross-tenant ops `platform.root.*` /
 4. Extend `oidc_smoke.py` into the full RP gate (operator→`is_root`;
    non-operator→provisions, not root); green twice non-flaky.
 
+#### redirect_uri templating (2026-05-16) — the §0 fix step 4 forced
+
+Step 4 surfaced that the cutover removed the `Bearer` admin-`setKv`
+crutch that hid a pre-existing **§0 violation**: the IdP client
+template hardcoded `https://app.rewindjs.com/_rp/callback`. A
+compiled prod literal is exactly what §0 forbids, and it's why every
+non-prod deployment needed out-of-band hand-registration.
+
+User constraint: the fix must be **a general primitive customers
+configure identically — not a platform special-case** (dogfooding,
+§4.2). Resolution: `oidc.js` substitutes host-relative placeholders
+in a client's registered `redirect_uris` (and the `/token`
+`redirect_uri` check) before exact-match, derived from the IdP's
+own `request.host` (§0-pure — never a compiled literal):
+
+| Placeholder | Resolves to | For |
+|---|---|---|
+| `${ISSUER_ORIGIN}` | `https://{request.host}` | RP same-host as IdP |
+| `${ISSUER_HOST}` | `{request.host}` | host in a larger URL |
+| `${ISSUER_PARENT}` | `request.host` minus its first DNS label (port preserved) | sibling-subdomain dashboards (the platform's `auth.`/`app.`/`replay.`/`logs.` under one suffix) |
+
+Exact-match is preserved (still a closed set; just computed, not a
+literal). `web/auth/_config/oidc/default.json` becomes
+`https://app.${ISSUER_PARENT}/_rp/callback` (+ replay/logs) — prod →
+`app.rewindjs.com`, every smoke → `app.rewindjscom.localhost:PORT`,
+a customer's own IdP → their host, **all from the same config a
+customer writes**. Plain absolute URLs still work (third-party RPs).
+Net: the §0-violating literal is gone, zero per-env registration,
+and `oidc_smoke.py` no longer hand-registers — it relies on the
+config-mirrored template exactly as prod does (stronger gate).
+Smokes that drove the admin RPC surface via `Bearer` (admin_smoke,
+oidc_smoke) gain a `smoke_lib` IdP-login helper (magic-link →
+`/_rp/callback` → poll → session) since D1 removed the Bearer
+admin path; `/_system/*` M2M Bearer is unaffected.
+
 ---
 
 ## 5. Decisions (accepted 2026-05-15)

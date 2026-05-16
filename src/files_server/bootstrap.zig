@@ -57,12 +57,22 @@ pub const DeployFile = struct {
 //   index.mjs               → handler entrypoint (compiled at bootstrap;
 //                             `content_type = null` is the signal).
 //   _middlewares/<...>.mjs  → middleware handler (compiled).
+//   <other>.mjs             → handler bytecode (compiled). Reached
+//                             not by HTTP routing (only `index.mjs`
+//                             is the path entrypoint) but as an
+//                             `on_result` / callback module —
+//                             e.g. `_rp/complete.mjs` /
+//                             `_rp/jwks.mjs` (the Fork-B OIDC RP
+//                             completion chain). Matches the
+//                             customer upload path, which already
+//                             compiles every `.mjs`.
 //   _static/<...>           → static asset (served verbatim with a
 //                             content-type derived from extension).
 //
-// Anything outside those three locations is ignored — e.g.
-// `admin/codemirror-entry.mjs` is a build-time source for the
-// codemirror bundle, not deployed. The disk layout under
+// The only `.mjs` exception is `codemirror-entry.mjs` at the tenant
+// root: a build-time source bundled into `_static/codemirror.mjs`,
+// never deployed. Anything else outside these locations is ignored.
+// The disk layout under
 // `web/<tenant>/` is intentionally one-to-one with the deployed
 // tenant path: dropping a new asset is `cp foo.svg
 // web/admin/_static/icons/` plus a files-server restart, no Zig
@@ -126,6 +136,17 @@ fn classify(rel_path: []const u8) DeployClass {
     // The customer upload path already treats `_config/` this way;
     // the platform-bundle walker matches it now too.
     if (std.mem.startsWith(u8, rel_path, "_config/")) return .static;
+    // Build-time source for the codemirror bundle (compiled into
+    // _static/codemirror.mjs by a separate step) — never deployed.
+    if (std.mem.eql(u8, rel_path, "codemirror-entry.mjs")) return .ignore;
+    // Any other `.mjs` is compiled to handler bytecode. It is NOT
+    // HTTP-routed (only `index.mjs` is the path entrypoint) — it is
+    // reached as an `on_result`/callback module via callback_dispatch
+    // (`findCallbackBytecode` looks it up by `{rel_path}` in the
+    // bytecodes map). This is what makes the Fork-B RP completion
+    // modules `_rp/complete.mjs` / `_rp/jwks.mjs` deployable, and
+    // matches the customer upload path (which compiles every `.mjs`).
+    if (std.mem.endsWith(u8, rel_path, ".mjs")) return .handler;
     return .ignore;
 }
 

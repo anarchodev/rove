@@ -32,6 +32,7 @@ import hmac
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import signal
@@ -39,6 +40,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -220,6 +222,101 @@ def curl(
             k, _, v = line.partition(":")
             headers_out[k.strip().lower()] = v.strip()
     return HttpResponse(status=status, body=body, headers=headers_out)
+
+
+# ── OIDC relying-party login (admin is a pure RP, Fork B) ──────────────
+
+
+def _sid_cookie(resp: "HttpResponse") -> Optional[str]:
+    m = re.search(r"__Host-rove_sid=[^;]+", resp.headers.get("set-cookie", ""))
+    return m.group(0) if m else None
+
+
+def idp_login(
+    cc: "CurlContext",
+    *,
+    email: str,
+    app_origin: str,
+    auth_base: str,
+) -> str:
+    """Drive the full OIDC relying-party handshake as `email` and
+    return the app `__Host-rove_sid` cookie for authenticated admin
+    calls. Operator-ness (is_root) is decided server-side by the
+    `_admin/operator/*` allowlist — the flow is identical either way.
+
+    `cc` must --resolve both the app (admin) host and the IdP host.
+    `app_origin` = https://app.<sfx>:<port>; `auth_base` =
+    https://auth.<sfx>:<port>. Mirrors the browser: app /_rp/login →
+    IdP /authorize → /login(POST, dev magic_link) → verify → /authorize
+    → app /_rp/callback → poll until the async completion lands.
+    """
+    def _abs(base: str, loc: str) -> str:
+        return loc if loc.startswith("http") else base + loc
+
+    # 1. app /_rp/login → 302 to the IdP /authorize (mints app sid).
+    r = curl(cc, app_origin + "/_rp/login?return_to="
+                 + urllib.parse.quote("/#/instances"))
+    if r.status != 302:
+        raise RuntimeError(f"/_rp/login {r.status}: {r.body[:200]}")
+    app_cookie = _sid_cookie(r)
+    if not app_cookie:
+        raise RuntimeError(f"/_rp/login minted no app sid: {r.headers}")
+    authorize = r.headers["location"]
+
+    # 2. IdP /authorize, no IdP session → 302 to /login (mints auth sid).
+    r = curl(cc, authorize)
+    if r.status != 302:
+        raise RuntimeError(
+            f"/authorize#1 {r.status}: {r.body[:200]}\n  authorize={authorize}")
+    auth_cookie = _sid_cookie(r)
+    if not auth_cookie:
+        raise RuntimeError("/authorize#1 minted no auth sid")
+    login_loc = _abs(auth_base, r.headers["location"])
+    return_to = urllib.parse.parse_qs(
+        urllib.parse.urlparse(login_loc).query)["return_to"][0]
+
+    # 3. POST IdP /login (dev: no resend key → magic_link in JSON).
+    r = curl(cc, auth_base + "/login", method="POST",
+             headers={"content-type": "application/x-www-form-urlencoded",
+                      "Cookie": auth_cookie},
+             data="email=" + urllib.parse.quote(email)
+                  + "&return_to=" + urllib.parse.quote(return_to))
+    if r.status != 200:
+        raise RuntimeError(f"/login POST {r.status}: {r.body[:200]}")
+    magic_link = json.loads(r.body)["magic_link"]
+
+    # 4. Follow the magic link (carry auth sid) → binds the IdP
+    #    session, 302s back to /authorize.
+    r = curl(cc, magic_link, headers={"Cookie": auth_cookie})
+    if r.status != 302:
+        raise RuntimeError(f"/login/verify {r.status}: {r.body[:200]}")
+
+    # 5. /authorize again (now authenticated) → 302 to app /_rp/callback.
+    r = curl(cc, _abs(auth_base, r.headers["location"]),
+             headers={"Cookie": auth_cookie})
+    if r.status != 302:
+        raise RuntimeError(f"/authorize#2 {r.status}: {r.body[:200]}")
+    callback = r.headers["location"]
+
+    # 6. app /_rp/callback (carry app sid) → 202 poll page; this fires
+    #    the async token exchange + jwks verify completion chain.
+    r = curl(cc, callback, headers={"Cookie": app_cookie})
+    if r.status != 202:
+        raise RuntimeError(f"/_rp/callback {r.status}: {r.body[:200]}")
+
+    # 7. Poll until the background completion writes _rp/sess/{sid}.
+    last = ""
+    for _ in range(160):
+        r = curl(cc, app_origin + "/_rp/poll", headers={"Cookie": app_cookie})
+        last = r.body
+        if r.status == 200:
+            try:
+                if json.loads(r.body).get("authed"):
+                    return app_cookie
+            except Exception:
+                pass
+        time.sleep(0.25)
+    raise RuntimeError(f"RP login never completed for {email}: {last[:200]}")
 
 
 # ── JWT mint (matches the bash `WRONG_JWT` recipe) ─────────────────────

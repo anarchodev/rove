@@ -154,7 +154,20 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
         std.log.warn("internal-schedules: no public_suffix; demoting", .{});
         return proposeDemote(worker, stored);
     };
-    const target_id = schedule_server.internal_routing.parseInstanceId(row.url, suffix) orelse {
+    const target_id = blk: {
+        // (a) `{id}.{public_suffix}` customer wildcard.
+        if (schedule_server.internal_routing.parseInstanceId(row.url, suffix)) |id|
+            break :blk id;
+        // (b) Explicit `assignDomain` host — system tenants
+        //     (`auth./replay.{system_suffix}`). Mirrors apply's
+        //     deterministic `domain/{host}` resolution so the
+        //     leader's in-process dispatch agrees with the
+        //     apply-time `is_internal` verdict (auth-domain-plan
+        //     §4.7 — the platform IdP / §4.6 self-rotate path).
+        if (schedule_server.internal_routing.targetHost(row.url)) |host| {
+            if (worker.node.tenant.resolveDomain(host) catch null) |inst|
+                break :blk inst.id;
+        }
         std.log.warn(
             "internal-schedules: {s}/{s}: URL {s} doesn't parse as internal; demoting",
             .{ row.tenant_id, row.id, row.url },
@@ -255,6 +268,15 @@ fn runOneInternal(worker: anytype, stored: *const schedule_server.StoredSchedule
     const request: Request = .{
         .method = row.method,
         .path = route_path,
+        // Option B (auth-domain-plan §4.7): the synthesized request
+        // carries the routed authority verbatim (host:port as the
+        // caller wrote it) — NOT empty. A host-relative handler (the
+        // IdP's `iss`, the §4.6 self-rotate URL, any customer
+        // dogfooding their own cluster-local domain) now sees the
+        // exact issuer the caller addressed. row.url is
+        // raft-replicated schedule state ⇒ deterministic across
+        // replicas, matching apply's `is_internal` verdict.
+        .host = schedule_server.internal_routing.targetAuthority(row.url) orelse "",
         .query = query_str,
         .body = row.body,
         .kv_tape = &tapes.kv,

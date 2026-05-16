@@ -1,12 +1,12 @@
 {
-  "_comment": "Per-deploy IdP template. Deployed under web/auth/_config/ and mirrored to kv `_config/oidc/default` at release (auth-domain-plan §9 / config_mirror in reloadDeployment). The live, runtime-mutable client registry oidc.provider() actually reads is `_oidc/config/{name}` (admin-managed, X-Rove-Scope: __auth__) — operators add/remove RP clients without a redeploy. This file documents the production dashboard clients (the Fork-B RP shims, step 3-6 part 2) and serves as the deploy-mirror test vector.",
+  "_comment": "Per-deploy IdP client registry. Deployed under web/auth/_config/ and mirrored to kv _config/oidc/default at release (config_mirror, fd1b37b); oidc.provider() reads the live _oidc/config/{name} and falls back to this mirrored template, so this IS the registry in prod — no hand-registration. redirect_uris use the §0 host-relative ${ISSUER_PARENT} placeholder (request.host minus its first DNS label, port preserved): IdP at auth.<suffix> => app/replay/logs.<suffix>. Resolves to app.rewindjs.com in prod and app.rewindjscom.localhost:PORT in smokes from the SAME config — exactly what a customer writes for their own multi-env IdP (auth-domain-plan §4.7 'redirect_uri templating'). Operators still add/remove clients at runtime via admin-managed _oidc/config/*.",
   "login_path": "/login",
   "clients": [
     { "client_id": "admin-dashboard",
-      "redirect_uris": ["https://app.rewindjs.com/_rp/callback"] },
+      "redirect_uris": ["https://app.${ISSUER_PARENT}/_rp/callback"] },
     { "client_id": "replay-dashboard",
-      "redirect_uris": ["https://replay.rewindjs.com/_rp/callback"] },
+      "redirect_uris": ["https://replay.${ISSUER_PARENT}/_rp/callback"] },
     { "client_id": "logs-dashboard",
-      "redirect_uris": ["https://logs.rewindjs.com/_rp/callback"] }
+      "redirect_uris": ["https://logs.${ISSUER_PARENT}/_rp/callback"] }
   ]
 }

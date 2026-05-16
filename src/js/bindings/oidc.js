@@ -77,6 +77,28 @@ class OIDCProvider {
     return null;
   }
 
+  // §0: a registered redirect_uri may use host-relative placeholders
+  // resolved from the IdP's OWN request host — never a compiled
+  // literal. The SAME config a customer writes for their own IdP
+  // (auth-domain-plan §4.7 "redirect_uri templating"):
+  //   ${ISSUER_ORIGIN} → https://{host}      (RP same-host as IdP)
+  //   ${ISSUER_HOST}    → {host}             (host inside a URL)
+  //   ${ISSUER_PARENT}  → {host} minus its first DNS label, port
+  //                       preserved (sibling-subdomain dashboards:
+  //                       IdP auth.<sfx> ⇒ app.<sfx>/replay.<sfx>/…)
+  // Plain absolute URLs pass through unchanged. Exact-match is
+  // preserved — the set is computed, not literal.
+  _resolveRedirects(client) {
+    const host = request.host || "";
+    const dot = host.indexOf(".");
+    const parent = dot >= 0 ? host.slice(dot + 1) : host;
+    const uris = Array.isArray(client.redirect_uris) ? client.redirect_uris : [];
+    return uris.map((u) =>
+      u.split("${ISSUER_ORIGIN}").join("https://" + host)
+        .split("${ISSUER_PARENT}").join(parent)
+        .split("${ISSUER_HOST}").join(host));
+  }
+
   // ── keyset (§4.6 state machine: next → current → retiring → drop).
   //    Single kv key ⇒ raft serializes writes last-write-wins; we
   //    only ever SIGN with `current`; the re-arm uses a stable
@@ -88,24 +110,22 @@ class OIDCProvider {
     if (raw != null) return JSON.parse(raw);
     // Genesis: first request to a fresh issuer mints one `current`
     // key. Safe to sign immediately — no prior key, no stale RP
-    // JWKS cache to contradict (§4.6). Capture the issuer host NOW
-    // (genesis always runs on a real wire request; the internal
-    // rotate fire has request.host === "").
+    // JWKS cache to contradict (§4.6). No issuer-host capture: the
+    // §4.6 genesis-capture workaround is retired — `request.host` is
+    // now the issuer on EVERY path, including the internal rotate
+    // fire (the platform sets the synthesized request's authority
+    // to the routed host — auth-domain-plan §4.7 "Option B").
     const now = Date.now();
     const k = crypto.oidcGenerateKey(); // { priv, jwk, kid }
     const keyset = {
       min_iat: 0, // emergency-revocation floor (§4.6)
-      issuer_host: request.host || "",
       keys: [{
         kid: k.kid, status: "current", priv: k.priv, jwk: k.jwk,
         since: now,
       }],
     };
     kv.set(this.cfg.keyset_path, JSON.stringify(keyset));
-    // Arm the first scheduled rotation (only if we know our host).
-    if (keyset.issuer_host) {
-      this._armRotation(keyset.issuer_host, now + this.cfg.rotation_period_ms);
-    }
+    this._armRotation(now + this.cfg.rotation_period_ms);
     return keyset;
   }
 
@@ -116,12 +136,14 @@ class OIDCProvider {
 
   // Self-scheduled rotation tick (§4.6 / http-send-plan §10.5
   // order-timeout pattern): stable handle ⇒ a re-arm overwrites the
-  // prior row; the issuer host can't come from request.host on the
-  // internal fire so it's threaded explicitly.
-  _armRotation(host, fire_at_ms) {
+  // prior row. Self-URL is host-relative — `request.host` is the
+  // issuer on a real wire request AND on the internal fire (Option B
+  // sets the synthesized request's authority to the routed host), so
+  // no explicitly-threaded host / genesis capture is needed.
+  _armRotation(fire_at_ms) {
     http.send({
       handle: this.cfg.rot_handle,
-      url: "https://" + host + "/_oidc/rotate",
+      url: "https://" + request.host + "/_oidc/rotate",
       method: "POST",
       body: "",
       fire_at_ns: BigInt(Math.floor(fire_at_ms)) * 1000000n,
@@ -185,11 +207,10 @@ class OIDCProvider {
   // + the http.send re-arm commit atomically (http-send-plan §6).
   handleRotate() {
     const keyset = this._keyset(); // genesis if somehow absent
-    const host = keyset.issuer_host;
     const now = Date.now();
     const next_deadline = this._advance(keyset, now);
     kv.set(this.cfg.keyset_path, JSON.stringify(keyset));
-    if (host) this._armRotation(host, next_deadline);
+    this._armRotation(next_deadline);
     response.status = 200;
     response.headers = { "content-type": "application/json" };
     return JSON.stringify({ ok: true, keys: keyset.keys.length });
@@ -202,14 +223,14 @@ class OIDCProvider {
   // older than now is rejected. Operator-triggered; intentionally
   // NOT exposed as an unauthenticated route — the trigger lands with
   // the admin/operator surface in step 3-6.
-  _emergencyRotate(keyset, now, host) {
+  _emergencyRotate(keyset, now) {
     const k = crypto.oidcGenerateKey();
     keyset.keys = [{
       kid: k.kid, status: "current", priv: k.priv, jwk: k.jwk, since: now,
     }];
     keyset.min_iat = Math.floor(now / 1000);
     kv.set(this.cfg.keyset_path, JSON.stringify(keyset));
-    if (host) this._armRotation(host, now + this.cfg.rotation_period_ms);
+    this._armRotation(now + this.cfg.rotation_period_ms);
   }
 
   handle() {
@@ -311,7 +332,7 @@ class OIDCProvider {
       response.status = 400;
       return "invalid_request: unknown client_id";
     }
-    const uris = Array.isArray(client.redirect_uris) ? client.redirect_uris : [];
+    const uris = this._resolveRedirects(client);
     if (!redirect_uri || uris.indexOf(redirect_uri) === -1) {
       response.status = 400;
       return "invalid_request: redirect_uri not registered for this client";

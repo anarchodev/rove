@@ -62,6 +62,54 @@ pub fn parseInstanceId(url: []const u8, public_suffix: []const u8) ?[]const u8 {
     return id;
 }
 
+/// Port-stripped host of `url`, or null if it doesn't parse / has no
+/// host. For the **explicit `assignDomain` internal path**: a system
+/// tenant (`auth.{system_suffix}`, `replay.{system_suffix}`, …) is
+/// NOT a `{id}.{public_suffix}` wildcard host, so `parseInstanceId`
+/// correctly rejects it — the caller instead resolves this host
+/// against the raft-replicated `domain/{host}` map (still
+/// deterministic across replicas; that map is __root__.db state, the
+/// same class of input this module's doc already sanctions). Without
+/// this, `http.send` to the platform IdP (`auth.{system_suffix}`)
+/// was demoted to a real outbound call, defeating §4.6's "the issuer
+/// resolves cluster-local" and breaking the Fork-B RP token/jwks
+/// completion in any deployment.
+pub fn targetHost(url: []const u8) ?[]const u8 {
+    const uri = std.Uri.parse(url) catch return null;
+    const host_raw = switch (uri.host orelse return null) {
+        .raw => |h| h,
+        .percent_encoded => |h| h,
+    };
+    const h = stripPort(host_raw);
+    return if (h.len == 0) null else h;
+}
+
+/// The URL's authority **verbatim** — `host` or `host:port` exactly
+/// as written, userinfo stripped. Unlike `targetHost` (port-stripped,
+/// for domain-map *matching*), this is what the internal-dispatch
+/// path sets as the synthesized request's `:authority` so a
+/// host-relative handler (the IdP's `iss`, the §4.6 self-rotate URL)
+/// sees the SAME issuer the caller addressed — which, for the
+/// dogfooded RP↔IdP pair, is by construction the issuer the RP
+/// validates against (auth-domain-plan §4.7 "Option B"). Slice into
+/// `url`; null if there's no `://` or the authority is empty.
+pub fn targetAuthority(url: []const u8) ?[]const u8 {
+    const sep = std.mem.indexOf(u8, url, "://") orelse return null;
+    const rest = url[sep + 3 ..];
+    var end: usize = rest.len;
+    for (rest, 0..) |ch, i| {
+        if (ch == '/' or ch == '?' or ch == '#') {
+            end = i;
+            break;
+        }
+    }
+    var authority = rest[0..end];
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| {
+        authority = authority[at + 1 ..];
+    }
+    return if (authority.len == 0) null else authority;
+}
+
 /// Strip a `:port` suffix if present. Returns the host as-is when no
 /// port was specified. We don't validate the port digits — Uri.parse
 /// already did that; we just need the host portion for suffix matching.
@@ -133,4 +181,24 @@ test "stripPort handles bracketed ipv6" {
 test "stripPort handles plain host with port" {
     try testing.expectEqualStrings("acme.loop46.me", stripPort("acme.loop46.me:443"));
     try testing.expectEqualStrings("acme.loop46.me", stripPort("acme.loop46.me"));
+}
+
+test "targetHost strips port + survives non-wildcard system hosts" {
+    try testing.expectEqualStrings(
+        "auth.rewindjscom.localhost",
+        targetHost("https://auth.rewindjscom.localhost:8295/token").?);
+    try testing.expectEqualStrings(
+        "auth.rewindjs.com", targetHost("https://auth.rewindjs.com/token").?);
+    try testing.expect(targetHost("not a url") == null);
+}
+
+test "targetAuthority keeps the port verbatim" {
+    try testing.expectEqualStrings(
+        "auth.rewindjscom.localhost:8295",
+        targetAuthority("https://auth.rewindjscom.localhost:8295/token?x=1").?);
+    try testing.expectEqualStrings(
+        "auth.rewindjs.com", targetAuthority("https://auth.rewindjs.com/_oidc/rotate").?);
+    try testing.expectEqualStrings(
+        "h:1", targetAuthority("https://u@h:1/p").?); // userinfo stripped
+    try testing.expect(targetAuthority("not a url") == null);
 }
