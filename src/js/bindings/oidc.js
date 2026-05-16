@@ -7,8 +7,10 @@
 // `request.host` — NO compiled-in domain. The same deployment serves
 // dev/staging/prod/custom-domain issuers identically.
 //
-// Config at `_config/oidc/{name}` (JSON, deployed file mirrored to
-// kv, exactly like oauth.js's `_config/oauth/{name}`):
+// Client registry at `_oidc/config/{name}` (JSON, a normal kv key —
+// NOT the reserved `_config/` prefix; see provider() for why). It's
+// operational data: operators register/rotate RP clients via admin
+// (X-Rove-Scope: __auth__) without a redeploy:
 //
 //   { "clients": [ { "client_id": "admin-dashboard",
 //                     "redirect_uris": ["https://app.rewindjs.com/_rp/cb"] } ],
@@ -471,17 +473,28 @@ class OIDCProvider {
 }
 
 globalThis.oidc = {
-  // oidc.provider("name") → reads `_config/oidc/name`
-  // oidc.provider()       → `_config/oidc/default`
+  // oidc.provider("name") → reads `_oidc/config/name`
+  // oidc.provider()       → `_oidc/config/default`
   // oidc.provider({...})  → inline config object
+  //
+  // The client registry lives at `_oidc/config/{name}` — a normal
+  // (non-reserved) kv key, NOT `_config/oidc/*`. Grounded reasons
+  // (auth-domain-plan §4.7 correction): `_config/` is a
+  // platform-reserved prefix handlers/admin can't write, and its
+  // only writer (`config_mirror` via `loop46 seed`) is not wired
+  // into the files-server release/loader path anyway (same gap
+  // affects oauth.js). And a client registry is *operational* data —
+  // operators add/remove RP clients without a redeploy — so an
+  // admin-managed kv key is the more correct model than a
+  // deploy-mirrored static file.
   provider(arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
-      const raw = kv.get("_config/oidc/" + name);
+      const raw = kv.get("_oidc/config/" + name);
       if (raw == null) {
         throw new Error(
-          "oidc.provider: config not found at _config/oidc/" + name +
-          ". Did you deploy the file?");
+          "oidc.provider: no client registry at _oidc/config/" + name +
+          " (register via admin setKv, X-Rove-Scope: __auth__).");
       }
       return new OIDCProvider(JSON.parse(raw), name);
     }
