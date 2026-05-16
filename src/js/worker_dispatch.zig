@@ -1370,29 +1370,20 @@ fn resolveRequest(
     }
     const handler_inst = admin_opt.?;
 
-    // Scope resolution: every cross-tenant admin call carries the
-    // target tenant in `X-Rove-Scope: <id>`. Empty header → admin
-    // operates on its own app.db. (The dashboard JS sets this header
-    // explicitly — see `web/admin/api.js`.)
-    const effective_scope = respb.findHeader(rh, "x-rove-scope") orelse "";
-
-    const scope_inst: *const tenant_mod.Instance = if (effective_scope.len == 0)
-        handler_inst
-    else blk: {
-        const s_opt = worker.node.tenant.getInstance(effective_scope) catch |err| inner: {
-            std.log.warn("rove-js: admin getInstance({s}) failed: {s}", .{ effective_scope, @errorName(err) });
-            break :inner null;
-        };
-        if (s_opt == null) {
-            try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown instance\n", allocator, admin_cors, null);
-            return .handled;
-        }
-        break :blk s_opt.?;
-    };
-
+    // X-Rove-Scope no longer rebinds the dispatch tenant. The admin
+    // handler ALWAYS dispatches on its own `__admin__`-home kv — auth,
+    // sessions, and all of admin's own state must be scope-independent
+    // (the old rebind made the cookie/session path silently
+    // unvalidated under scope; only the scope-independent Bearer token
+    // ever worked there). Cross-tenant data access is now the explicit
+    // `platform.scope(id).kv` accessor, which resolves the target
+    // itself and throws a coded `InstanceNotFound` (→ admin handler
+    // 404) on an unknown id, preserving the old dispatch-level
+    // 404-on-unknown-scope behavior at the JS layer. See
+    // auth-domain-plan §4.7 "Primitive-fix pivot (2026-05-16)".
     return .{ .dispatch = .{
         .handler_inst = handler_inst,
-        .scope_inst = scope_inst,
+        .scope_inst = handler_inst,
         .is_admin = true,
     } };
 }
@@ -1799,6 +1790,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             else
                 null,
             .release_publish_ctx = if (handler_inst.platform != null)
+                @ptrCast(worker)
+            else
+                null,
+            // platform.scope(id).kv.{set,delete} cross-tenant write
+            // trampoline. Admin-handler only (gated same as the
+            // others). Reads go direct in globals.zig, no trampoline.
+            .scope_kv_write = if (handler_inst.platform != null)
+                &@TypeOf(worker.*).scopeKvWriteTrampoline
+            else
+                null,
+            .scope_kv_ctx = if (handler_inst.platform != null)
                 @ptrCast(worker)
             else
                 null,

@@ -1066,6 +1066,88 @@ so a revert of 3 alone restores the proven-good login. The
 `/_system/*` root-token path is independent and always available for
 operator recovery.
 
+#### Primitive-fix pivot (2026-05-16) — `X-Rove-Scope` was wrong
+
+Grounding step 3 surfaced a deeper problem and the user's call was to
+**fix the primitive, not work around it in `oidc.rp`**.
+
+*Diagnosis.* `X-Rove-Scope` rebinds the **global `kv`** to an
+arbitrary target tenant's app.db for the whole dispatch — middleware
+included (`worker_dispatch.zig:1379` → `dispatcher.run(scope_inst.kv,
+…)`). That conflates two orthogonal things: *who is the authenticated
+principal* (stable per request, lives in `__admin__`) and *which
+tenant's data this call operates on*. Auth therefore cannot be
+expressed in a scoped dispatch via `kv`. The only reason admin auth
+worked was the **Bearer root token** (`platform.auth.checkRootToken`
+— scope-independent *by accident*: a process-env compare touching no
+kv). The cookie/session path (`kv.get("session/")`) was **already a
+latent broken-under-scope bug** — it only ever worked unscoped;
+unnoticed because every scoped caller (operator/CLI/smoke) is Bearer.
+Removing Bearer (D1, the correct goal) merely *exposes* that
+`X-Rove-Scope` was load-bearing for auth in a way it never should
+have been. Same lesson as "state is a collection, not a flag":
+don't hide *which store* behind a global rebind — make the
+cross-tenant target an explicit, named handle. The control plane
+modeled "act on tenant X" as "*become* X", destroying its own
+identity mid-request.
+
+*Blast radius (small, contained).* Only 4 admin exports consume the
+rebind: `listKv/getKv/setKv/deleteKv`. Every other `kv.*` in
+`web/admin` (`session/* account/* magic/* pending/* resend_key`,
+middleware) is `__admin__`-home state that *only works unscoped* —
+the rebind would corrupt it if ever scoped. Non-admin tenants always
+have `handler_inst == scope_inst` (`:1299`) → never rebind. Entire
+fix is in the `is_admin` branch.
+
+*Decision + accessor shape (user, 2026-05-16).* Admin's dispatch
+`kv` is **always `handler_inst.kv` (`__admin__`-home)**. Cross-tenant
+access is an explicit, additive, naturally-gated control-plane
+accessor **`platform.scope(id).kv.{get,prefix,set,delete}`** (sits
+with the other privileged cross-tenant ops `platform.root.*` /
+`platform.instances.*`; `platform` is null for customer handlers).
+
+*Implementation model — all by existing precedent (no novel raft).*
+- Resolve `id` → Instance via `state.platform` (the `Tenant`).
+- `get/prefix`: direct read on the target store (mirrors
+  `tenant.root.get/prefix`).
+- `set/delete`: a **per-call** self-contained
+  `target.kv.beginTrackedImmediate() → put/delete → commit →
+  raft_propose.proposeWriteSet(worker, &ws, id)` (envelope-0 to that
+  tenant) — *exactly* the proven `handleAdminKv` shape
+  (`worker_dispatch.zig:1173`), deliberately *outside* the batch txn
+  so there is no two-open-txns-in-one-dispatch hazard. Bridged
+  JS→worker by a `scope_kv` trampoline gated on `platform != null`
+  (the `release_publish` trampoline pattern). Scoped writes are
+  low-volume admin ops — correctness over a txn-per-write
+  micro-cost. `proposeWriteSet(worker, ws, tenant_id)` already
+  exists and takes an arbitrary tenant id.
+- Side-effect win: the latent broken-under-scope auth bug is *fixed*
+  (auth never again depends on the scoped handle), and `oidc.rp`
+  needs **zero** workarounds — `guard()` reads `kv` = `__admin__`,
+  the `_rp/jwks` callback writes the same `__admin__` store it reads
+  (callback dispatch has no scope concept), fully symmetric.
+
+*Revised step sequence (supersedes the 4-step list above):*
+1. ✅ `oidc.rp()` library (committed `480159f`).
+2. ✅ bootstrap seeds + provider fallback (committed `d1e682a`).
+3a. **Fix the `X-Rove-Scope` primitive** — `kv`=`__admin__`-home in
+   the `is_admin` branch; add `platform.scope(id).kv`; rewrite the 4
+   browse exports. **Behavior-preserving for the 4 browsers**
+   (assertable by `admin_smoke.py` scoped `listKv` + `oidc_smoke.py`
+   scoped `setKv`→`__auth__`) and **independently landable before any
+   auth change** — it does not touch the live cookie/Bearer
+   middleware, it just makes `kv` what it always should have been.
+   Gated: `zig build test` + `admin_smoke.py` + `oidc_smoke.py`.
+3b. The admin OIDC cutover — now *trivial*: `_middlewares` →
+   `oidc.rp().guard()`; `/_rp/*` routes + `_rp/{complete,jwks}.mjs`;
+   delete `handleLogin/Signup/Auth` + `rove_session/magic/pending`;
+   `?fn=provisionInstance` (id = verified `request.auth.sub`); SPA
+   → IdP redirect + `#/provision`. `git revert` of this one commit
+   is the rollback; `/_system/*` root token is the independent
+   operator-recovery surface.
+4. Extend `oidc_smoke.py` into the full RP gate (operator→`is_root`;
+   non-operator→provisions, not root); green twice non-flaky.
+
 ---
 
 ## 5. Decisions (accepted 2026-05-15)

@@ -1351,6 +1351,64 @@ pub fn Worker(comptime opts: Options) type {
             }
         }
 
+        /// Trampoline for `platform.scope(id).kv.{set,delete}`. A
+        /// self-contained cross-tenant write to `target_id`'s app.db:
+        /// local commit + fire-and-forget envelope-0 propose, exactly
+        /// the proven `handleAdminKv` / `releasePublishTrampoline`
+        /// shape. Deliberately its own txn (NOT the dispatch batch
+        /// txn) so the admin handler's home-`__admin__` dispatch and a
+        /// cross-tenant write never hold two open txns at once
+        /// (auth-domain-plan §4.7 "Primitive-fix pivot").
+        pub fn scopeKvWriteTrampoline(
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            target_id: []const u8,
+            op: globals.ScopeKvOp,
+            key: []const u8,
+            value: []const u8,
+        ) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+
+            const inst_opt = self.node.tenant.getInstance(target_id) catch
+                return error.InstanceNotFound;
+            const inst = inst_opt orelse return error.InstanceNotFound;
+
+            var ws = kv_mod.WriteSet.init(allocator);
+            defer ws.deinit();
+
+            var txn = try inst.kv.beginTrackedImmediate();
+            errdefer txn.rollback() catch {};
+            switch (op) {
+                .put => {
+                    try ws.addPut(key, value);
+                    try txn.put(key, value);
+                },
+                .delete => {
+                    // TrackedTxn.delete is idempotent (discards the
+                    // presence bool); the writeset entry still
+                    // replicates the delete so followers converge.
+                    try ws.addDelete(key);
+                    try txn.delete(key);
+                },
+            }
+            try txn.commit();
+
+            // Fire-and-forget: local commit is durable; raft settles
+            // async (same posture as releasePublishTrampoline).
+            _ = raft_propose.proposeWriteSet(self, &ws, target_id) catch |err| {
+                std.log.warn(
+                    "platform.scope kv {s} propose envelope 0 for {s} failed: {s}",
+                    .{ @tagName(op), target_id, @errorName(err) },
+                );
+            };
+            inst.kv.commitTxn(txn.txn_seq) catch |err| {
+                std.log.warn(
+                    "platform.scope kv: commitTxn for {s} failed: {s}",
+                    .{ target_id, @errorName(err) },
+                );
+            };
+        }
+
     };
 }
 

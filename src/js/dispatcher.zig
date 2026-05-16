@@ -186,6 +186,18 @@ pub const Request = struct {
         dep_id: u64,
     ) anyerror!void = null,
     release_publish_ctx: ?*anyopaque = null,
+    /// `platform.scope(id).kv.{set,delete}` cross-tenant write
+    /// trampoline (the explicit accessor that replaced the
+    /// X-Rove-Scope global-kv rebind — auth-domain-plan §4.7).
+    scope_kv_write: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+        op: globals.ScopeKvOp,
+        key: []const u8,
+        value: []const u8,
+    ) anyerror!void = null,
+    scope_kv_ctx: ?*anyopaque = null,
     /// sse-plan §3.2. `events.emit` appends an `EmitEntry` here; the
     /// worker fires the merged batch fire-and-forget at sse-server
     /// after raft commits the writeset. Optional only because
@@ -364,6 +376,8 @@ pub const Dispatcher = struct {
             .deploy_starter_ctx = request.deploy_starter_ctx,
             .release_publish = request.release_publish,
             .release_publish_ctx = request.release_publish_ctx,
+            .scope_kv_write = request.scope_kv_write,
+            .scope_kv_ctx = request.scope_kv_ctx,
             .emit_buffer = request.emit_buffer,
             .pending_schedules = request.pending_schedules,
             .pending_cancels = request.pending_cancels,

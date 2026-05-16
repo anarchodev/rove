@@ -61,11 +61,35 @@ export function assignDomain(host, instance_id) {
     return { host: host, instance_id: instance_id };
 }
 
+// X-Rove-Scope no longer rebinds the global `kv` (that conflated
+// "which principal" with "which store" and made auth impossible to
+// validate in a scoped dispatch — auth-domain-plan §4.7 "Primitive-
+// fix pivot"). `kv` is now ALWAYS __admin__-home. A scoped KV browse
+// reaches the target explicitly via the `platform.scope(id).kv`
+// control-plane accessor; an unscoped browse uses __admin__'s own kv.
+// Returns the kv-like store, or null after stamping a 4xx (unknown
+// instance → 404, mirroring the old dispatch-level behavior).
+function scopedKvStore() {
+    const tgt = request.headers["x-rove-scope"];
+    if (!tgt || tgt.length === 0) return kv;
+    try {
+        return platform.scope(tgt).kv;
+    } catch (e) {
+        if (e && e.code === "InstanceNotFound") {
+            response.status = 404;
+            return null;
+        }
+        throw e;
+    }
+}
+
 export function listKv(prefix, cursor, limit) {
+    const store = scopedKvStore();
+    if (store === null) return { error: "unknown instance" };
     const p = prefix || "";
     const c = cursor || "";
     const l = Math.max(1, Math.min(parseInt(limit ?? 100, 10) || 100, 1000));
-    const entries = kv.prefix(p, c, l);
+    const entries = store.prefix(p, c, l);
     const body = {
         entries: entries.map((e) => ({ key: e.key, value: e.value })),
     };
@@ -80,7 +104,9 @@ export function getKv(key) {
         response.status = 400;
         return { error: "missing key" };
     }
-    const v = kv.get(key);
+    const store = scopedKvStore();
+    if (store === null) return { error: "unknown instance" };
+    const v = store.get(key);
     if (v === null) {
         response.status = 404;
         return { error: "not found" };
@@ -97,7 +123,9 @@ export function setKv(key, value) {
         response.status = 400;
         return { error: "value must be a string" };
     }
-    kv.set(key, value);
+    const store = scopedKvStore();
+    if (store === null) return { error: "unknown instance" };
+    store.set(key, value);
     return { key: key };
 }
 
@@ -106,7 +134,9 @@ export function deleteKv(key) {
         response.status = 400;
         return { error: "missing key" };
     }
-    kv.delete(key);
+    const store = scopedKvStore();
+    if (store === null) return { error: "unknown instance" };
+    store.delete(key);
     response.status = 204;
     return null;
 }

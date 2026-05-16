@@ -57,6 +57,10 @@ pub const TriggerEntry = struct {
     module_path: []u8,
 };
 
+/// Write op for the `platform.scope(id).kv` cross-tenant accessor
+/// trampoline. Reads (get/prefix) go direct and need no trampoline.
+pub const ScopeKvOp = enum { put, delete };
+
 pub const DispatchState = struct {
     allocator: std.mem.Allocator,
     /// Per-request KV store. `kv.get("x")` reads from this handle,
@@ -216,6 +220,25 @@ pub const DispatchState = struct {
         dep_id: u64,
     ) anyerror!void = null,
     release_publish_ctx: ?*anyopaque = null,
+
+    /// Trampoline backing `platform.scope(id).kv.{set,delete}` — a
+    /// self-contained cross-tenant write+commit+raft-propose to the
+    /// target tenant (envelope-0), mirroring releasePublishTrampoline.
+    /// Deliberately OUTSIDE the dispatch batch txn so there is no
+    /// two-open-txns-in-one-dispatch hazard (auth-domain-plan §4.7
+    /// "Primitive-fix pivot"; the proven `handleAdminKv` shape).
+    /// Reads (get/prefix) go direct via `state.platform.getInstance`
+    /// and need no trampoline. Null on test/non-admin paths; the JS
+    /// callable throws a clear error then.
+    scope_kv_write: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+        op: ScopeKvOp,
+        key: []const u8,
+        value: []const u8,
+    ) anyerror!void = null,
+    scope_kv_ctx: ?*anyopaque = null,
 
     pub fn deinit(self: *DispatchState, ctx: ?*c.JSContext) void {
         var it = self.trigger_module_ns.iterator();
@@ -1005,6 +1028,211 @@ fn jsPlatformReleasesPublish(
     return js_undefined;
 }
 
+// ── platform.scope(id).kv.* (admin singleton only) ────────────────
+//
+// Explicit, additive cross-tenant accessor. Replaces the old
+// `X-Rove-Scope`→global-`kv`-rebind (which conflated "who is the
+// principal" with "which store" and made auth impossible to express
+// in a scoped dispatch — auth-domain-plan §4.7 "Primitive-fix
+// pivot"). `platform.scope("acme").kv.get/prefix` read the target
+// store directly; `.set/.delete` go through the worker trampoline
+// (per-call txn + envelope-0 propose, the proven `handleAdminKv`
+// shape). Gated on `state.platform != null` like the rest of
+// `platform.*`. Unknown instance → a coded `InstanceNotFound` JS
+// error so the admin handler can map it to 404 (preserves the old
+// dispatch-level 404-on-unknown-scope behavior).
+
+fn jsThrowInstanceNotFound(ctx: ?*c.JSContext) c.JSValue {
+    const err_obj = c.JS_NewError(ctx);
+    if (c.JS_IsException(err_obj)) return err_obj;
+    _ = c.JS_SetPropertyStr(ctx, err_obj, "message", c.JS_NewStringLen(ctx, "instance not found", "instance not found".len));
+    _ = c.JS_SetPropertyStr(ctx, err_obj, "code", c.JS_NewStringLen(ctx, "InstanceNotFound", "InstanceNotFound".len));
+    return c.JS_Throw(ctx, err_obj);
+}
+
+/// Read the `_scope_id` the `platform.scope(id)` factory stamped on
+/// the returned `.kv` object (`this_val` for these methods). Caller
+/// owns the returned slice.
+fn scopeIdFromThis(state: *DispatchState, ctx: ?*c.JSContext, this: c.JSValue) ![]u8 {
+    const v = c.JS_GetPropertyStr(ctx, this, "_scope_id");
+    defer c.JS_FreeValue(ctx, v);
+    return valueToOwnedString(state, ctx, v);
+}
+
+fn scopeResolve(state: *DispatchState, id: []const u8) ?*const tenant_mod.Instance {
+    const tenant = state.platform orelse return null;
+    const inst_opt = tenant.getInstance(id) catch return null;
+    return inst_opt;
+}
+
+fn jsPlatformScope(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) {
+        _ = c.JS_ThrowTypeError(ctx, "platform.scope requires (instance_id)");
+        return js_exception;
+    }
+    const state = getState(ctx);
+    if (state.platform == null) {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    }
+    const id = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(id);
+    if (id.len == 0) {
+        _ = c.JS_ThrowTypeError(ctx, "platform.scope: instance_id must be non-empty");
+        return js_exception;
+    }
+    // Resolve eagerly so `platform.scope("ghost")` throws at the
+    // call site (→ admin handler 404), matching the old behavior.
+    if (scopeResolve(state, id) == null) return jsThrowInstanceNotFound(ctx);
+
+    const kv_obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, kv_obj, "_scope_id", c.JS_NewStringLen(ctx, id.ptr, id.len));
+    _ = c.JS_SetPropertyStr(ctx, kv_obj, "get", c.JS_NewCFunction2(ctx, jsScopeKvGet, "get", 1, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, kv_obj, "prefix", c.JS_NewCFunction2(ctx, jsScopeKvPrefix, "prefix", 3, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, kv_obj, "set", c.JS_NewCFunction2(ctx, jsScopeKvSet, "set", 2, c.JS_CFUNC_generic, 0));
+    _ = c.JS_SetPropertyStr(ctx, kv_obj, "delete", c.JS_NewCFunction2(ctx, jsScopeKvDelete, "delete", 1, c.JS_CFUNC_generic, 0));
+    const scope_obj = c.JS_NewObject(ctx);
+    _ = c.JS_SetPropertyStr(ctx, scope_obj, "kv", kv_obj);
+    return scope_obj;
+}
+
+fn jsScopeKvGet(
+    ctx: ?*c.JSContext,
+    this: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) return js_undefined;
+    const state = getState(ctx);
+    const id = scopeIdFromThis(state, ctx, this) catch return js_exception;
+    defer state.allocator.free(id);
+    const inst = scopeResolve(state, id) orelse return jsThrowInstanceNotFound(ctx);
+
+    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(key);
+
+    const value = inst.kv.get(key) catch |err| switch (err) {
+        error.NotFound => return js_null,
+        else => {
+            state.pending_kv_error = err;
+            return js_null;
+        },
+    };
+    defer state.allocator.free(value);
+    return c.JS_NewStringLen(ctx, value.ptr, value.len);
+}
+
+fn jsScopeKvPrefix(
+    ctx: ?*c.JSContext,
+    this: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) return js_undefined;
+    const state = getState(ctx);
+    const id = scopeIdFromThis(state, ctx, this) catch return js_exception;
+    defer state.allocator.free(id);
+    const inst = scopeResolve(state, id) orelse return jsThrowInstanceNotFound(ctx);
+
+    const prefix_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(prefix_str);
+    const cursor_str = if (argc >= 2 and !c.JS_IsUndefined(argv[1]) and !c.JS_IsNull(argv[1]))
+        valueToOwnedString(state, ctx, argv[1]) catch return js_exception
+    else
+        state.allocator.dupe(u8, "") catch return js_exception;
+    defer state.allocator.free(cursor_str);
+
+    const SCOPE_PREFIX_MAX: u32 = 1000;
+    const SCOPE_PREFIX_DEFAULT: u32 = 100;
+    const limit: u32 = if (argc >= 3 and !c.JS_IsUndefined(argv[2]) and !c.JS_IsNull(argv[2])) blk: {
+        var n: i32 = 0;
+        _ = c.JS_ToInt32(ctx, &n, argv[2]);
+        if (n <= 0) break :blk SCOPE_PREFIX_DEFAULT;
+        break :blk @min(@as(u32, @intCast(n)), SCOPE_PREFIX_MAX);
+    } else SCOPE_PREFIX_DEFAULT;
+
+    var scan = inst.kv.prefix(prefix_str, cursor_str, limit) catch |err| {
+        state.pending_kv_error = err;
+        return js_null;
+    };
+    defer scan.deinit();
+
+    const arr = c.JS_NewArray(ctx);
+    for (scan.entries, 0..) |e, i| {
+        const obj = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, obj, "key", c.JS_NewStringLen(ctx, e.key.ptr, e.key.len));
+        _ = c.JS_SetPropertyStr(ctx, obj, "value", c.JS_NewStringLen(ctx, e.value.ptr, e.value.len));
+        _ = c.JS_SetPropertyUint32(ctx, arr, @intCast(i), obj);
+    }
+    return arr;
+}
+
+fn scopeKvWrite(
+    ctx: ?*c.JSContext,
+    this: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+    op: ScopeKvOp,
+) c.JSValue {
+    const state = getState(ctx);
+    if (state.platform == null) {
+        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
+        return js_exception;
+    }
+    const min_args: c_int = if (op == .put) 2 else 1;
+    if (argc < min_args) return js_undefined;
+
+    const fn_ptr = state.scope_kv_write orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform.scope().kv writes are not configured on this worker");
+        return js_exception;
+    };
+    const fn_ctx = state.scope_kv_ctx orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform.scope().kv write context missing");
+        return js_exception;
+    };
+
+    const id = scopeIdFromThis(state, ctx, this) catch return js_exception;
+    defer state.allocator.free(id);
+    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(key);
+    const val = if (op == .put) blk: {
+        break :blk valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
+    } else state.allocator.dupe(u8, "") catch return js_exception;
+    defer state.allocator.free(val);
+
+    fn_ptr(fn_ctx, state.allocator, id, op, key, val) catch |err| switch (err) {
+        error.InstanceNotFound => return jsThrowInstanceNotFound(ctx),
+        else => {
+            state.pending_kv_error = err;
+            return js_undefined;
+        },
+    };
+    return js_undefined;
+}
+
+fn jsScopeKvSet(
+    ctx: ?*c.JSContext,
+    this: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    return scopeKvWrite(ctx, this, argc, argv, .put);
+}
+
+fn jsScopeKvDelete(
+    ctx: ?*c.JSContext,
+    this: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    return scopeKvWrite(ctx, this, argc, argv, .delete);
+}
+
 // ── Installation ──────────────────────────────────────────────────────
 
 /// Install the pieces of the global surface that do NOT depend on a
@@ -1150,7 +1378,12 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // platform = { root, instances }. Installed on every context;
     // the C callbacks check `state.platform` and throw for non-admin
     // handlers.
-    .{ .path = &.{"platform"}, .fns = &.{} },
+    .{ .path = &.{"platform"}, .fns = &.{
+        // platform.scope(id) → { kv: { get, prefix, set, delete } }
+        // bound to instance `id`. The explicit cross-tenant accessor
+        // that replaced the X-Rove-Scope global-kv rebind.
+        .{ .name = "scope", .cfunc = jsPlatformScope, .argc = 1 },
+    } },
     .{ .path = &.{ "platform", "root" }, .fns = &.{
         .{ .name = "get",    .cfunc = jsPlatformRootGet,    .argc = 1 },
         .{ .name = "set",    .cfunc = jsPlatformRootSet,    .argc = 2 },
