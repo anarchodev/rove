@@ -1061,6 +1061,9 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "jwt.js", JWT_JS);
     // oauth depends on base64 + crypto + URLSearchParams.
     evalSnippet(ctx, "oauth.js", OAUTH_JS);
+    // oidc.js is the IdP/provider analog of oauth.js; needs
+    // crypto.oidc* + base64url + hex + URLSearchParams (all above).
+    evalSnippet(ctx, "oidc.js", OIDC_JS);
     // sessions is standalone (kv + crypto.randomUUID + cookie parsing).
     evalSnippet(ctx, "sessions.js", SESSIONS_JS);
     // cron is standalone.
@@ -1187,6 +1190,7 @@ const BASE64_JS = @embedFile("base64_js");
 const URLSEARCHPARAMS_JS = @embedFile("urlsearchparams_js");
 const JWT_JS = @embedFile("jwt_js");
 const OAUTH_JS = @embedFile("oauth_js");
+const OIDC_JS = @embedFile("oidc_js");
 const SESSIONS_JS = @embedFile("sessions_js");
 const CRON_JS = @embedFile("cron_js");
 const RETRY_JS = @embedFile("retry_js");

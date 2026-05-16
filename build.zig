@@ -431,6 +431,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "urlsearchparams_js", .path = "src/js/bindings/urlsearchparams.js" },
         .{ .name = "jwt_js", .path = "src/js/bindings/jwt.js" },
         .{ .name = "oauth_js", .path = "src/js/bindings/oauth.js" },
+        .{ .name = "oidc_js", .path = "src/js/bindings/oidc.js" },
         .{ .name = "sessions_js", .path = "src/js/bindings/sessions.js" },
         .{ .name = "cron_js", .path = "src/js/bindings/cron.js" },
         .{ .name = "retry_js", .path = "src/js/bindings/retry.js" },
