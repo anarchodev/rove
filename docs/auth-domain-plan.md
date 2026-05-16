@@ -843,13 +843,13 @@ chain.
 Two grounded corrections the gate forced:
 - **Client registry lives at `_oidc/config/{name}`, not
   `_config/oidc/*`.** `_config/` is a platform-reserved prefix
-  (handlers/admin can't write it; `reserved.zig`), and its only
-  writer — `config_mirror` via `loop46 seed` — is **not wired into
-  the files-server release/loader path** (the loader's doc claims it;
-  the code doesn't). This is a *pre-existing platform gap that also
-  affects `oauth.js`'s `_config/oauth/*`* — flagged as a separate
-  follow-up, not OIDC's to fix. The IdP's registry is operational
-  data (operators add/remove RP clients without a redeploy), so a
+  (handlers/admin can't write it; `reserved.zig`). At the time, its
+  only writer — `config_mirror` via `loop46 seed` — was not wired
+  into the files-server release path; **that platform gap is now
+  FIXED (`fd1b37b`, §9)**, so `_config/oidc/*` works too. The IdP's
+  registry nonetheless stays the admin-managed `_oidc/config/*`:
+  it's operational data (operators add/remove RP clients without a
+  redeploy), runtime-mutable, so a
   normal admin-managed kv key is the more correct model anyway.
 - The `__auth__` IdP's own state (`_oidc/keyset|session|code|magic`)
   is under the **non-reserved** `_oidc/` prefix — verified against
@@ -1038,14 +1038,20 @@ sub-plan index. Hold until Phases 1–3 land.
   encryption before the envelope-2 write. Bounds the "private keys in
   raft log/snapshots/backups" caveat. Decide during 2b implementation;
   does not block the architecture.
-- **Pre-existing platform gap (found during 3-6):** `config_mirror`
-  (`_config/**.json` → kv) is only called by `loop46 seed`; the
-  files-server release/loader path does **not** invoke it, though
-  `deployment_loader.zig`'s doc-comment claims it does. So
-  `_config/*` from a files-server-deployed bundle never reaches kv.
-  This affects `oauth.js`'s `_config/oauth/*` (customer OAuth config
-  via the normal deploy path), not just OIDC — OIDC sidestepped it by
-  using the admin-managed `_oidc/config/*` key. Either wire
-  `mirrorConfigToKv` into the loader (matching its doc) or update the
-  doc + define the supported config-provisioning path. Not OIDC's to
-  fix; tracked here so it isn't lost.
+- **Pre-existing platform gap (found during 3-6) — FIXED `fd1b37b`,
+  2026-05-16.** `config_mirror` (`_config/**.json` → kv) was only
+  called by `loop46 seed`; the files-server release/loader path
+  never invoked it (commit `7eb70ed` removed it from `handleRelease`
+  and promised the loader would do it — the follow-up never wired
+  it). `_config/*` from a files-server-deployed bundle never reached
+  kv, silently breaking `oauth.js`'s `_config/oauth/*` for every
+  customer using the normal deploy path. **Fix:** wired
+  `mirrorConfigToKv` into the loader's `reloadDeployment`,
+  leader-gated + envelope-0-proposed exactly like `_deploy/current`
+  (followers get it via raft apply; no off-path write); platform
+  `classify()` now deploys `_config/`. Verified on the real release
+  path by `oidc_smoke.py` (asserts `_config/oidc/default` is in
+  `__auth__` kv post-bootstrap-deploy) + full suite green. OIDC's
+  live registry stays the admin-managed `_oidc/config/*`
+  (operational, runtime-mutable); `_config/oidc/*` now also works as
+  the per-deploy template.
