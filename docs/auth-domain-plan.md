@@ -5,9 +5,13 @@ smoke-verified (2026-05-15/16).** Phase 1 + 2c (§6/§3.3); 2a (lego
 wildcard, unchanged); 2b in-tree ACME end-to-end verified against
 Pebble (`fd3c53c`/`927fd88`/`38147f9`/`c39ab26`, §3.2 "Landed"); 2d
 operator mTLS verified (`779e482`, §3.5 "Landed"). §5 decisions
-accepted 2026-05-15; key-rotation design pass §4.6. **Phase 3 (OIDC):
-grounded concrete design §4.7 + forks A/B accepted (2026-05-16) —
-ready to implement; not yet started.** One Phase-2 follow-up tracked: ACME renewal /
+accepted 2026-05-15; key-rotation design pass §4.6. **Phase 3 (OIDC): §4.7
+design + forks A/B accepted. Implementation in progress —
+3-1/3-2 RSA-RS256 crypto + JS bindings (`eb0f823`, unit-tested),
+3-3 `oidc.js` provider library (`1e32329`, builds + parses, NOT yet
+behaviorally verified). Remaining: 3-4 `__auth__` tenant + web/auth
+bundle, 3-5 §4.6 rotation wiring, 3-6 dashboards→RP shims (admin
+last) + the OIDC conformance smoke that behaviorally gates it all.** One Phase-2 follow-up tracked: ACME renewal /
 expiry-driven reissue (§3.2). Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
 Phases 1–3 land (see §6, §7).
