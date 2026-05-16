@@ -6,9 +6,8 @@ wildcard, unchanged); 2b in-tree ACME end-to-end verified against
 Pebble (`fd3c53c`/`927fd88`/`38147f9`/`c39ab26`, §3.2 "Landed"); 2d
 operator mTLS verified (`779e482`, §3.5 "Landed"). §5 decisions
 accepted 2026-05-15; key-rotation design pass §4.6. **Phase 3 (OIDC):
-grounded + concrete design landed §4.7 (2026-05-16) — awaiting
-§5-style sign-off on forks A (key custody) + B (dashboards→pure RPs)
-before code.** One Phase-2 follow-up tracked: ACME renewal /
+grounded concrete design §4.7 + forks A/B accepted (2026-05-16) —
+ready to implement; not yet started.** One Phase-2 follow-up tracked: ACME renewal /
 expiry-driven reissue (§3.2). Not yet reflected in `PLAN.md` §7/§13 or
 `deployment.md` — those edits are deliberately parked as Phase 4 until
 Phases 1–3 land (see §6, §7).
@@ -773,30 +772,24 @@ Plus the `web/auth/` deployment + the `oidc.js` library + the
 discovery/JWKS/authorize/token route logic + PKCE + the §4.6 rotation
 wiring.
 
-*Decisions needed before code (§5-style):*
+*Decisions (accepted 2026-05-16):*
 
-- **A — RS256 key custody.** Fully platform-managed (Zig generates /
-  stores / signs; the RSA private key never enters JS) vs. tenant-kv
-  keys readable by the IdP JS (max dogfooding, but private bytes
-  transit customer-controlled JS). *Recommendation: hybrid —*
-  generation + signing are Zig bindings; the keyset is stored in
-  `__auth__` kv as **opaque blobs the JS never parses** (so it still
-  replicates via the normal writeset and the §4.6 rotation
-  state-machine works unchanged — dogfooded *storage* and *rotation*),
-  while RSA private bytes stay inside Zig. JS calls
-  `crypto.oidcSign(kid, signing_input)`-style; never holds the key.
-- **B — admin/replay/logs become pure RPs.** Today admin runs its own
-  magic-link + session in `__admin__`. Phase 3 moves the authN to the
-  `__auth__` IdP and makes the dashboards RPs (the point of one SSO
-  origin). *Recommendation: yes* — reuse the existing magic-link JS
-  by relocating it into the `__auth__` IdP tenant (it is
-  customer-equivalent JS), and replace each dashboard's auth with a
-  thin RP shim. This is a behavior change to the current admin login
-  and the largest blast-radius item in Phase 3.
-- **C (decided, not a fork): RS256 signer placement** — extend the
-  `src/acme/crypto.zig` OpenSSL approach (add an `rsa`/`oidc_crypto`
-  sibling) rather than the HS256 `jwt` module; reuse its PEM/JWK
-  scaffolding.
+- **A — RS256 key custody: HYBRID.** Generation + signing are Zig
+  bindings; the keyset is stored in `__auth__` kv as **opaque blobs
+  the JS never parses** (so it replicates via the normal writeset and
+  the §4.6 rotation state-machine works unchanged — dogfooded storage
+  + rotation), while RSA private bytes stay inside Zig. JS calls a
+  `crypto.oidcSign(kid, signing_input)`-style binding; never holds the
+  key.
+- **B — admin/replay/logs become pure RPs: YES.** authN moves to the
+  `__auth__` IdP; the existing magic-link/session JS is *relocated*
+  into the IdP tenant (customer-equivalent JS), each dashboard gets a
+  thin RP shim (redirect→authorize→code→own host-only session). This
+  is a behavior change to today's admin login and the largest
+  blast-radius item — sequence it carefully (see roadmap).
+- **C — RS256 signer placement:** extend the `src/acme/crypto.zig`
+  OpenSSL approach (RSA via the `rsa.h`/`bn.h` already in scope) — a
+  sibling of the EC code — not the HS256 `jwt` module.
 
 First increment + gate: discovery + JWKS + the RSA keygen/sign Zig
 binding, behind a Pebble-style **OIDC conformance smoke** — a scripted
