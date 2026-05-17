@@ -1311,6 +1311,22 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "retry.js", RETRY_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
+    // users is standalone (kv + crypto.{randomBytes,sha256}).
+    evalSnippet(ctx, "users.js", USERS_JS);
+
+    // Phase A reachability hardening (docs/builtin-libs-docs-plan.md).
+    // Every native shim above captured its slice as
+    // `const sys = _system.X` at eval time, so the `_system.*` objects
+    // stay alive through those closures — the global holder is dead
+    // weight now. Delete it so customer handler code (loaded per
+    // request into the restored snapshot) cannot name the internal
+    // ABI even by accident. Baked into the base snapshot: zero
+    // per-request cost. NOT a privilege boundary (the natives
+    // self-gate, e.g. platform.* checks state.platform) — this is API
+    // hygiene: keep `_system.*` free to change. Pairs with
+    // scripts/globals_lint.py (catches refs in-tree; this makes the
+    // global physically absent at runtime).
+    evalSnippet(ctx, "_harden.js", "delete globalThis._system;");
 }
 
 const NativeFn = *const fn (
@@ -1457,6 +1473,7 @@ const RETRY_JS = @embedFile("retry_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
+const USERS_JS = @embedFile("users_js");
 
 /// (public name, embedded source) for every `globals/*.js` file. The
 /// single list the Phase-A lints below pivot on: each `.src` is an
@@ -1483,6 +1500,7 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "webhook", .src = WEBHOOK_JS },
     .{ .name = "email", .src = EMAIL_JS },
     .{ .name = "textcodec", .src = TEXTCODEC_JS },
+    .{ .name = "users", .src = USERS_JS },
 };
 
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
@@ -1849,4 +1867,42 @@ test "lint(b): every globals/*.js export carries a JSDoc block (Phase A)" {
             }
         }
     }
+}
+
+test "harden: _system unreachable post-installStatic, shims still bound (Phase A)" {
+    // Builds the base snapshot the way a worker does (installStatic),
+    // then asserts customer scope can't see `_system` while the shims
+    // — which captured their `_system.X` slice in a closure before
+    // the delete — are still wired. A regression here means either
+    // the delete moved before the shim evals or a shim started
+    // reading `_system` lazily instead of via its captured `sys`.
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    installStatic(ctx.raw);
+
+    const assertion =
+        \\(function () {
+        \\  if (typeof globalThis._system !== "undefined")
+        \\    throw new Error("_system still reachable from customer scope");
+        \\  if (typeof kv !== "object" || typeof kv.get !== "function")
+        \\    throw new Error("kv shim broke (closure lost its _system slice)");
+        \\  if (typeof crypto !== "object" || typeof crypto.sha256 !== "function")
+        \\    throw new Error("crypto shim broke");
+        \\  if (typeof platform !== "object" ||
+        \\      typeof platform.root.get !== "function")
+        \\    throw new Error("platform nested shim broke");
+        \\  return true;
+        \\})();
+    ;
+    var result = ctx.eval(assertion, "_harden_test.js", .{}) catch |e| {
+        if (ctx.takeExceptionMessage(std.testing.allocator)) |m| {
+            defer std.testing.allocator.free(m);
+            std.debug.print("\nharden regression: {s}\n", .{m});
+        } else |_| {}
+        return e;
+    };
+    defer result.deinit();
 }
