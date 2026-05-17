@@ -14,11 +14,30 @@
 // included; HMAC-shaped tokens are vulnerable to alg-confusion
 // attacks and `crypto.verifyEcdsa` doesn't yet support PSS variants.
 
+/**
+ * JWS/JWT decode + verification, layered on
+ * {@link crypto.verifyRsa}/{@link crypto.verifyEcdsa} +
+ * {@link base64url}. Supports RS256/384/512 and ES256/384/512. PS\*
+ * (RSA-PSS) and HS\* (HMAC) are intentionally excluded — HMAC tokens
+ * enable alg-confusion attacks.
+ *
+ * @namespace jwt
+ * @example
+ * const { valid, payload } = jwt.verify(token, jwksSet);
+ * if (!valid) return reject();
+ * if (jwt.validateClaims(payload, { iss, aud })) return reject();
+ */
 globalThis.jwt = {
-  /// Split a JWT into header + payload + raw signature (base64url
-  /// string). Does NOT verify. Returns null on malformed input
-  /// (wrong number of dots, invalid base64url, non-JSON header /
-  /// payload). Use `jwt.verify` for the verifying path.
+  /**
+   * Split a JWT into its parts. Does NOT verify the signature.
+   *
+   * @param {string} token - Compact JWS (`header.payload.sig`).
+   * @returns {{header:object, payload:object, signature_b64:string,
+   *   signing_input:string}|null} `null` on malformed input (wrong
+   *   dot count, bad base64url, non-JSON header/payload).
+   * @example
+   * const kid = jwt.decode(token)?.header.kid;
+   */
   decode(token) {
     if (typeof token !== "string") return null;
     const parts = token.split(".");
@@ -41,22 +60,24 @@ globalThis.jwt = {
     }
   },
 
-  /// Verify a JWT signature against a single JWK or a JWKS document
-  /// (`{keys: [...]}` or a bare array of keys).
-  ///
-  ///   - When given a JWKS, picks the key whose `kid` matches the
-  ///     token header's `kid` (or the only key when no kid hints
-  ///     are present). Falls back to ignoring kid when only one key
-  ///     is in the set.
-  ///   - Dispatches to `crypto.verifyRsa` / `crypto.verifyEcdsa`
-  ///     based on the token header's `alg`.
-  ///   - Throws on malformed token, unsupported alg, missing
-  ///     matching key. Returns `{valid:bool, header, payload}` on
-  ///     a successful dispatch (valid=false means cryptographic
-  ///     verify failed — sig mismatch).
-  ///
-  /// Does NOT validate claims (iss / aud / exp / iat / nbf) — call
-  /// `jwt.validateClaims` on the returned payload.
+  /**
+   * Verify a JWT signature. Does NOT validate claims — call
+   * {@link jwt.validateClaims} on the returned `payload` next.
+   *
+   * Key selection: a bare JWK is used directly; from a JWKS the key
+   * matching the header `kid` is chosen, or the sole key when there
+   * is exactly one. Algorithm comes from the header `alg`.
+   *
+   * @param {object} token - Compact JWS string.
+   * @param {object|object[]} jwks_or_jwk - A bare JWK, a JWKS
+   *   (`{keys:[…]}`), or a bare array of JWKs.
+   * @returns {{valid:boolean, header:object, payload:object}}
+   *   `valid:false` means the signature did not match.
+   * @throws {TypeError} Malformed token / unsupported `alg`.
+   * @throws {Error} No key in the JWKS matches the header.
+   * @example
+   * const { valid, payload } = jwt.verify(idToken, jwks);
+   */
   verify(token, jwks_or_jwk) {
     const decoded = jwt.decode(token);
     if (!decoded) throw new TypeError("jwt.verify: malformed token");
@@ -82,22 +103,26 @@ globalThis.jwt = {
     return { valid, header, payload };
   },
 
-  /// Validate standard JWT claims. Returns null when all checks
-  /// pass; returns an error string identifying the first failed
-  /// check otherwise. Customer calls AFTER a successful
-  /// `jwt.verify`.
-  ///
-  /// Accepted opts:
-  ///   - iss (string): expected issuer (`payload.iss`).
-  ///   - aud (string): expected audience. `payload.aud` may be a
-  ///     string or array; check passes if `aud` appears.
-  ///   - now (ms since epoch): defaults to `Date.now()`.
-  ///   - leeway_s (number): clock-skew tolerance for exp/nbf.
-  ///     Defaults to 30s.
-  ///
-  /// Returns errors as the strings "expired" / "not-yet-valid" /
-  /// "issuer-mismatch" / "audience-mismatch" so callers can branch
-  /// on the failure mode without parsing.
+  /**
+   * Validate standard JWT claims. Call AFTER a successful
+   * {@link jwt.verify}.
+   *
+   * @param {object} payload - The verified token payload.
+   * @param {object} [opts]
+   * @param {string} [opts.iss] - Expected issuer.
+   * @param {string} [opts.aud] - Expected audience; passes if it
+   *   appears in `payload.aud` (string or array).
+   * @param {number} [opts.now] - Now, ms since epoch (default
+   *   `Date.now()`).
+   * @param {number} [opts.leeway_s=30] - Clock-skew tolerance for
+   *   `exp`/`nbf`.
+   * @returns {string|null} `null` if all checks pass, else the first
+   *   failure: `"no-payload"` | `"expired"` | `"not-yet-valid"` |
+   *   `"issuer-mismatch"` | `"audience-mismatch"`.
+   * @example
+   * const err = jwt.validateClaims(payload, { iss, aud: clientId });
+   * if (err) return new Response(err, { status: 401 });
+   */
   validateClaims(payload, opts) {
     if (!payload || typeof payload !== "object") return "no-payload";
     opts = opts || {};

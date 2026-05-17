@@ -41,7 +41,19 @@ const SESSION_DEFAULTS = {
   path: "/",
 };
 
+/**
+ * A cookie-backed session store bound to one config. Obtain via
+ * {@link sessions.fromConfig}; state rows live in this tenant's kv
+ * at `state/sessions/{name}/{id}`.
+ *
+ * @class Sessions
+ */
 class Sessions {
+  /**
+   * @param {object} config - Merged over the defaults
+   *   (cookie_name/max_age_s/same_site/secure/http_only/path).
+   *   `state_path` is required (set by {@link sessions.fromConfig}).
+   */
   constructor(config) {
     this.cfg = Object.assign({}, SESSION_DEFAULTS, config);
     if (!this.cfg.state_path) {
@@ -49,7 +61,15 @@ class Sessions {
     }
   }
 
-  /// Create a session row, set the cookie on the response, return the id.
+  /**
+   * Create a session: write the row, set the cookie on the
+   * response, return the new id. `created_at` (ms) is stamped in.
+   *
+   * @param {object} data - Arbitrary session payload.
+   * @returns {string} The new session id.
+   * @example
+   * sessions.fromConfig().create({ user_sub: payload.sub });
+   */
   create(data) {
     const id = crypto.randomUUID();
     kv.set(this.cfg.state_path + "/" + id, JSON.stringify(Object.assign({}, data, {
@@ -59,7 +79,15 @@ class Sessions {
     return id;
   }
 
-  /// Read the current request's session payload, or null if absent.
+  /**
+   * Read the current request's session payload.
+   *
+   * @returns {object|null} The stored payload (incl. `created_at`),
+   *   or `null` if there is no/unknown session cookie.
+   * @example
+   * const sess = sessions.fromConfig().get();
+   * if (!sess) { response.status = 401; return "no session"; }
+   */
   get() {
     const id = this._currentId();
     if (!id) return null;
@@ -68,8 +96,17 @@ class Sessions {
     return JSON.parse(raw);
   }
 
-  /// Merge `patch` into the current session row (or pass a function for
-  /// (current) → next). Returns the updated payload, or null if no session.
+  /**
+   * Update the current session row.
+   *
+   * @param {object|function(object): object} patch - An object
+   *   shallow-merged into the current payload, or a
+   *   `(current) => next` function.
+   * @returns {object|null} The updated payload, or `null` if there
+   *   is no session.
+   * @example
+   * sessions.fromConfig().update({ last_seen: Date.now() });
+   */
   update(patch) {
     const id = this._currentId();
     if (!id) return null;
@@ -81,15 +118,30 @@ class Sessions {
     return next;
   }
 
-  /// Delete the current session and clear the cookie.
+  /**
+   * Delete the current session row and clear the cookie (logout).
+   * No-op if there is no session.
+   *
+   * @returns {void}
+   * @example
+   * sessions.fromConfig().destroy();
+   */
   destroy() {
     const id = this._currentId();
     if (id) kv.delete(this.cfg.state_path + "/" + id);
     _appendSetCookie(this._cookieHeader("", 0));
   }
 
-  /// Rotate session id, keeping the data. Use after privilege change
-  /// (login, role grant) to defend against fixation attacks.
+  /**
+   * Rotate the session id, keeping the data and refreshing the
+   * cookie. Use after a privilege change (login, role grant) to
+   * defend against session-fixation.
+   *
+   * @returns {string|null} The new id, or `null` if there is no
+   *   session.
+   * @example
+   * sessions.fromConfig().rotate(); // call right after login
+   */
   rotate() {
     const old_id = this._currentId();
     if (!old_id) return null;
@@ -121,7 +173,13 @@ class Sessions {
   }
 }
 
-/// Parse a `Cookie:` header value into a `{name: value}` object.
+/**
+ * Parse a `Cookie:` header value into a `{name: value}` map.
+ *
+ * @param {string} header - Raw `Cookie:` header value.
+ * @returns {Object<string,string>} Empty object when `header` is
+ *   falsy or has no valid pairs.
+ */
 function parseCookies(header) {
   const out = {};
   if (!header) return out;
@@ -144,12 +202,28 @@ function _appendSetCookie(value) {
   response.cookies.push(value);
 }
 
+/**
+ * Cookie-backed session storage on top of {@link kv}. Config lives
+ * at `_config/sessions/{name}` (a JSON file in your tree, mirrored
+ * read-only to kv at deploy); state at `state/sessions/{name}/{id}`.
+ *
+ * @namespace sessions
+ */
 globalThis.sessions = {
-  /// Resolve a config and return a sessions instance.
-  ///   - sessions.fromConfig("admin") → reads `_config/sessions/admin`
-  ///   - sessions.fromConfig()        → reads `_config/sessions/default`
-  ///   - sessions.fromConfig({...})   → inline config
-  /// state_path defaults to `state/sessions/{name}`.
+  /**
+   * Resolve a config and return a {@link Sessions} instance.
+   * `state_path` defaults to `state/sessions/{name}`.
+   *
+   * @param {string|object} [arg] - A name (reads
+   *   `_config/sessions/{name}`; default `"default"`) or an inline
+   *   config object.
+   * @returns {Sessions}
+   * @throws {Error} Named config not found (file not deployed).
+   * @throws {TypeError} `arg` is neither string nor object.
+   * @example
+   * const s = sessions.fromConfig();          // "default"
+   * const a = sessions.fromConfig("admin");
+   */
   fromConfig(arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";

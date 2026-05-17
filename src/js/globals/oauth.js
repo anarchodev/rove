@@ -33,7 +33,23 @@
 // `cache/oauth/{name}`. Override either via `state_path`/`cache_path`
 // keys in the config file if you want different layouts.
 
+/**
+ * An OAuth 2.0 / OIDC authorization-code client bound to one
+ * provider config. Obtain via {@link oauth.fromConfig}. PKCE is on
+ * unless `pkce:false`. Transient state lives in this tenant's kv at
+ * `state/oauth/{name}`.
+ *
+ * @class OAuthProvider
+ */
 class OAuthProvider {
+  /**
+   * @param {object} config - Provider config. Required:
+   *   `authorization_url`, `token_url`, `client_id`, `redirect_uri`,
+   *   `on_complete_module`, and `scopes` (array). Optional:
+   *   `client_secret`, `pkce`, `state_ttl_ms`, `state_path`,
+   *   `cache_path`, `extra_authorize_params`.
+   * @throws {TypeError} Missing/invalid required key.
+   */
   constructor(config) {
     for (const k of ["authorization_url", "token_url", "client_id", "redirect_uri", "on_complete_module"]) {
       if (typeof config[k] !== "string" || !config[k]) {
@@ -59,6 +75,21 @@ class OAuthProvider {
     };
   }
 
+  /**
+   * Begin the login flow: store transient state (+ PKCE verifier),
+   * set a 302 to the provider's authorization URL. Return its result
+   * from your start handler.
+   *
+   * @param {object} [opts]
+   * @param {string} [opts.return_to] - Where to send the user after
+   *   completion (echoed to the on_complete module).
+   * @param {object} [opts.context] - Arbitrary data echoed to the
+   *   on_complete module.
+   * @returns {null} (the redirect is on `response`).
+   * @example
+   * export default () => oauth.fromConfig("google")
+   *   .startLogin({ return_to: "/" });
+   */
   startLogin(opts) {
     opts = opts || {};
     const state = crypto.randomUUID();
@@ -101,6 +132,18 @@ class OAuthProvider {
     return null;
   }
 
+  /**
+   * Handle the provider redirect: validate `state` (single-use,
+   * TTL'd), exchange `code` at the token endpoint via
+   * {@link http.send}, and invoke `on_complete_module` with the
+   * token result (context carries `return_to`). Returns an interim
+   * HTML page; sets 4xx on validation failure.
+   *
+   * @returns {string} HTML body (200/202 interstitial, or 400 text
+   *   on error).
+   * @example
+   * export default () => oauth.fromConfig("google").handleCallback();
+   */
   handleCallback() {
     const params = new URLSearchParams(request.query || "");
     const state = params.get("state");
@@ -154,6 +197,18 @@ class OAuthProvider {
     return "<!doctype html><meta charset=utf-8><title>Signing in…</title><p>Completing sign-in…</p>";
   }
 
+  /**
+   * Redeem a refresh token for new tokens. Fires the token request
+   * via {@link http.send}; the `on_complete_module` receives the
+   * result with `context.refresh === true`.
+   *
+   * @param {string} refresh_token - The stored refresh token.
+   * @param {object} [extra_context] - Merged into the result
+   *   context.
+   * @returns {string} The {@link http.send} schedule id.
+   * @example
+   * oauth.fromConfig("google").refresh(tok, { user_sub });
+   */
   refresh(refresh_token, extra_context) {
     const body_params = new URLSearchParams({
       grant_type: "refresh_token",
@@ -172,16 +227,29 @@ class OAuthProvider {
   }
 }
 
+/**
+ * OAuth 2.0 / OIDC authorization-code helper. The library owns no
+ * namespace — every kv path is derived from the config. Config lives
+ * at `_config/oauth/{name}` (a JSON file in your tree, mirrored
+ * read-only to kv at deploy); one file per provider.
+ *
+ * @namespace oauth
+ */
 globalThis.oauth = {
-  /// Resolve a config and return a provider instance.
-  ///   - oauth.fromConfig("google")  → reads `_config/oauth/google` from kv
-  ///   - oauth.fromConfig()          → reads `_config/oauth/default`
-  ///   - oauth.fromConfig({...})     → uses the inline object as the config
-  ///
-  /// Defaults derived from the instance name:
-  ///   state_path = `state/oauth/{name}`
-  ///   cache_path = `cache/oauth/{name}`
-  /// Override either by setting the key in the config row.
+  /**
+   * Resolve a config and return an {@link OAuthProvider}.
+   * `state_path`/`cache_path` default to `state|cache/oauth/{name}`
+   * (override via config keys).
+   *
+   * @param {string|object} [arg] - A provider name (reads
+   *   `_config/oauth/{name}`; default `"default"`) or an inline
+   *   config object.
+   * @returns {OAuthProvider}
+   * @throws {Error} Named config not found (file not deployed).
+   * @throws {TypeError} `arg` is neither string nor object.
+   * @example
+   * const g = oauth.fromConfig("google");
+   */
   fromConfig(arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
