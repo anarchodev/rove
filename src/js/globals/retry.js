@@ -56,11 +56,61 @@ function backoffMsFor(retry_state, next_attempt) {
   return Math.min(60_000, 1_000 * Math.pow(4, next_attempt - 2));
 }
 
+/**
+ * Customer-side retry policy layered on {@link http.send}. All retry
+ * state lives in this tenant's own context — no platform retry loop,
+ * no cross-tenant privileges. The chain only advances when the
+ * on_result handler explicitly calls {@link retry.next}.
+ *
+ * @namespace retry
+ * @example
+ * // Fire with a policy.
+ * retry.send({
+ *   url: "https://stripe.com/charge",
+ *   on_result_module: "charges/handler",
+ *   max_attempts: 3,
+ *   backoff_ms: [1000, 5000, 30000], // or a number, or omit
+ *   context: { charge_id: 42 },
+ * });
+ *
+ * // charges/handler.mjs — the on_result handler.
+ * export default function () {
+ *   const event = JSON.parse(request.body);
+ *   if (retry.shouldRetry(event)) { retry.next(event); return; }
+ *   const ctx = retry.stripContext(event);
+ *   if (event.ok) kv.set(`charge/${ctx.charge_id}`, event.body);
+ * }
+ */
 globalThis.retry = {
-  // Fire a one-shot http.send wrapped with retry policy. Returns the
-  // schedule id from http.send. The on_result module receives events
-  // with `event.context._retry` populated; use `retry.shouldRetry` /
-  // `retry.next` / `retry.stripContext` from inside the handler.
+  /**
+   * Fire a one-shot `http.send` wrapped with a retry policy. The
+   * on_result module receives events with `event.context._retry`
+   * populated; drive the chain with the helpers below.
+   *
+   * @param {object} opts
+   * @param {string} opts.url - Target URL.
+   * @param {string} opts.on_result_module - Result handler module
+   *   path in this tenant (non-empty).
+   * @param {number} [opts.max_attempts=1] - Total attempts incl. the
+   *   first (positive integer).
+   * @param {number|number[]} [opts.backoff_ms] - Constant delay, a
+   *   per-attempt schedule, or omit for exponential 1s/4s/16s…
+   *   capped at 60s.
+   * @param {string} [opts.method] - HTTP method.
+   * @param {Object<string,string>} [opts.headers] - Request headers.
+   * @param {string} [opts.body] - Request body.
+   * @param {number} [opts.timeout_ms] - Per-request timeout.
+   * @param {number} [opts.max_body_bytes] - Response body cap.
+   * @param {bigint} [opts.fire_at_ns] - Delay the first attempt.
+   * @param {string} [opts.on_result_fn] - Export name on the result
+   *   module (default export if omitted).
+   * @param {Array} [opts.on_result_args] - Positional args for it.
+   * @param {*} [opts.context] - Echoed back (under your own keys;
+   *   `_retry` is reserved).
+   * @returns {string} The {@link http.send} schedule id.
+   * @throws {TypeError} On missing/invalid `url`/`on_result_module`/
+   *   `max_attempts`.
+   */
   send(opts) {
     if (!opts || typeof opts !== "object") {
       throw new TypeError("retry.send: requires an options object");
@@ -111,8 +161,15 @@ globalThis.retry = {
     return http.send(send_opts);
   },
 
-  // True when the event was a failure AND there are attempts left.
-  // Always false on success or when retry context is missing.
+  /**
+   * Whether `event` should be retried: a failure with attempts
+   * remaining. Always `false` on success or when retry context is
+   * absent.
+   *
+   * @param {object} event - The result event (`request.body`
+   *   parsed).
+   * @returns {boolean}
+   */
   shouldRetry(event) {
     if (!event || event.ok) return false;
     const r = event.context && event.context[RETRY_KEY];
@@ -120,9 +177,14 @@ globalThis.retry = {
     return (r.attempt || 1) < (r.max_attempts || 1);
   },
 
-  // Schedule the next attempt. Caller should have checked
-  // `shouldRetry` first; calling on a non-retryable event is a no-op
-  // returning null. Returns the new schedule id otherwise.
+  /**
+   * Schedule the next attempt (applies the backoff). No-op returning
+   * `null` if the event isn't retryable — check {@link
+   * retry.shouldRetry} first.
+   *
+   * @param {object} event - The result event.
+   * @returns {string|null} New schedule id, or `null`.
+   */
   next(event) {
     if (!retry.shouldRetry(event)) return null;
     const r = event.context[RETRY_KEY];
@@ -153,9 +215,14 @@ globalThis.retry = {
     });
   },
 
-  // Return event.context with the platform's _retry meta removed.
-  // Doesn't mutate; returns a fresh object. Idempotent on events
-  // that weren't routed through `retry.send`.
+  /**
+   * `event.context` with the reserved `_retry` meta removed. Returns
+   * a fresh object (no mutation); idempotent on events that never
+   * went through {@link retry.send}.
+   *
+   * @param {object} event - The result event.
+   * @returns {object|null} Your original context, or `null`.
+   */
   stripContext(event) {
     if (!event || !event.context || !event.context[RETRY_KEY]) {
       return event ? event.context : null;
@@ -165,8 +232,13 @@ globalThis.retry = {
     return out;
   },
 
-  // Current attempt number (1-based). 1 on the first fire, 2 on the
-  // first retry, etc. Returns null when retry context is missing.
+  /**
+   * Current 1-based attempt number (1 on the first fire, 2 on the
+   * first retry, …). `null` when retry context is missing.
+   *
+   * @param {object} event - The result event.
+   * @returns {number|null}
+   */
   attempt(event) {
     const r = event && event.context && event.context[RETRY_KEY];
     return r ? (r.attempt || 1) : null;

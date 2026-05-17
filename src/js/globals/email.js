@@ -1,4 +1,45 @@
+// `email.send` — transactional email via Resend, layered on
+// `webhook.send` (→ `http.send`). Per-instance rate-limited.
+
+/**
+ * Transactional email through Resend.
+ *
+ * @namespace email
+ */
 globalThis.email = {
+  /**
+   * Send an email. Builds the Resend API request and dispatches it
+   * via {@link webhook.send} (durable; fires after the handler
+   * commits).
+   *
+   * @param {object} opts
+   * @param {string} opts.key - Resend API key (sent as
+   *   `Authorization: Bearer`).
+   * @param {string} opts.from - Sender address.
+   * @param {string|string[]} opts.to - Recipient(s).
+   * @param {string} opts.subject - Subject line.
+   * @param {string} [opts.text] - Plain-text body.
+   * @param {string} [opts.html] - HTML body.
+   * @param {string} [opts.reply_to] - Reply-To address.
+   * @param {string|string[]} [opts.cc] - CC recipient(s).
+   * @param {string|string[]} [opts.bcc] - BCC recipient(s).
+   * @param {string} [opts.onResult] - Result handler module in this
+   *   tenant (forwarded to `webhook.send`).
+   * @param {*} [opts.context] - Echoed back on the result event.
+   * @returns {string} The schedule id from {@link webhook.send}.
+   * @throws {Error} `code:"rate_limited"` when the per-instance
+   *   email bucket is exhausted.
+   * @throws {TypeError} On missing/invalid `key`/`from`/`subject`/`to`.
+   *
+   * @example
+   * email.send({
+   *   key: kv.get("secret/resend"),
+   *   from: "noreply@acme.dev",
+   *   to: user.email,
+   *   subject: "Welcome",
+   *   html: `<h1>Hi ${user.name}</h1>`,
+   * });
+   */
   send(opts) {
     __rove_check_email_rate();
     if (!opts || typeof opts !== "object")

@@ -13,13 +13,43 @@
 //     want retries use `retry.send` directly + `retry.shouldRetry`/
 //     `retry.next` in their on_result handler — same JS surface,
 //     no system tenant, all retry state visible in the customer's
-//     own kv. See `bindings/retry.js`.
+//     own kv. See `globals/retry.js`.
 //   - Outbound headers carry `X-Rove-Schedule-Id` (stamped by
 //     http.send) instead of `X-Rove-Webhook-Id`. Same idempotency
 //     semantics; new name.
 //   - `onResult` becomes `on_result.module`. Same module-name
 //     resolution rules.
+/**
+ * Convenience wrapper for one-shot outbound webhooks, layered on
+ * {@link http.send}. No built-in retries — use {@link retry} for
+ * that. Outbound requests carry `X-Rove-Schedule-Id` for idempotency.
+ *
+ * @namespace webhook
+ */
 globalThis.webhook = {
+  /**
+   * Send a webhook. Durable: fires after the handler commits, with
+   * an optional result callback module in this tenant.
+   *
+   * @param {object} opts
+   * @param {string} opts.url - Target URL.
+   * @param {string} [opts.method="POST"] - HTTP method.
+   * @param {string} [opts.body=""] - Request body.
+   * @param {Object<string,string>} [opts.headers] - Extra headers.
+   * @param {string} [opts.onResult] - Module path of a result
+   *   handler in this tenant (becomes `on_result.module`).
+   * @param {*} [opts.context] - Echoed back on the result event.
+   * @param {number} [opts.timeout_ms] - Per-request timeout.
+   * @returns {string} The {@link http.send} schedule id.
+   * @throws {TypeError} If `opts` or `opts.url` is missing/wrong type.
+   *
+   * @example
+   * webhook.send({
+   *   url: "https://hooks.example.com/x",
+   *   body: JSON.stringify({ event: "order.paid", id }),
+   *   onResult: "hooks/onDelivered",
+   * });
+   */
   send(opts) {
     if (!opts || typeof opts !== "object")
       throw new TypeError("webhook.send requires an options object");
