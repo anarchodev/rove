@@ -1,0 +1,11 @@
+{
+  "_comment": "Minimal seed manifest for scripts/chain_fusion_bench.py — a single tenant whose handler builds pure same-tenant immediate self-schedule chains (the internal_schedules.zig fusion shape). Consumed via Cluster.spawn(seed_manifest=...). Sources resolve relative to this file's directory.",
+  "tenants": [
+    {
+      "id": "chainbench",
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/chainbench/index.mjs"}
+      ]
+    }
+  ]
+}

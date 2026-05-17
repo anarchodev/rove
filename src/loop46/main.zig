@@ -339,7 +339,15 @@ const WorkerCtx = struct {
     /// In-memory inflight set for the in-process schedule dispatch.
     /// Owned by worker 0's thread frame (allocated on stack in
     /// `workerMain`). Other workers leave null.
-    internal_schedules_inflight: ?*std.StringHashMapUnmanaged(void) = null,
+    /// Value = the raft seq the row's schedule_complete / demote rode.
+    /// The row stays gated (not re-dispatched) until `committedSeq()`
+    /// reaches that seq — i.e. until the completion is applied + visible
+    /// — closing the propose→apply re-dispatch window that otherwise
+    /// makes recursive/under-load internal schedules re-fire and
+    /// compound. Conceptually the same "hold until seq applied" gate the
+    /// H2 path implements via `raft_pending`/`RaftWait` (a richer,
+    /// resource-parking cousin — not shared code).
+    internal_schedules_inflight: ?*std.StringHashMapUnmanaged(u64) = null,
     /// Process-shared deployment + tenant state. Owned by main.
     /// Single loader thread; single tenant_files_map across every
     /// worker on this node — the per-worker fan-out race is gone.
@@ -428,7 +436,7 @@ fn workerMain(args: *WorkerCtx) !void {
     // injected via `args.internal_schedules_store` from main; per-worker
     // opens would create separate LMDB envs whose main_overlays never
     // see each other's writes (apply path vs scan path race).
-    var internal_sched_inflight: std.StringHashMapUnmanaged(void) = .empty;
+    var internal_sched_inflight: std.StringHashMapUnmanaged(u64) = .empty;
     defer {
         var it = internal_sched_inflight.iterator();
         while (it.next()) |entry| allocator.free(entry.key_ptr.*);

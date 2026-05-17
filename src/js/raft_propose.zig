@@ -97,6 +97,50 @@ pub fn proposeRootWriteSet(
 /// return `seq=0` rather than panic so refactoring stays graceful.
 ///
 /// Returns the assigned raft seq for the caller to park on.
+/// Propose a dynamic list of already-encoded, **non-multi** inner
+/// envelopes. Replaces the per-producer fixed `[N][]u8` arrays — the
+/// multi wire format already supports up to 255 inners (u8 count) and
+/// apply already loops them; the old `[3]`/`[4]` caps were just stack
+/// arrays sized for the then-current producers.
+///
+///  - 0 inners      → no-op, returns seq 0
+///  - 1 inner        → bare propose (no multi-wrapper overhead — the
+///                      common case, e.g. just a writeset)
+///  - 2..255 inners  → one multi-envelope propose (atomic)
+///  - >255 inners    → ⌈N/255⌉ multi proposes. By caller convention
+///    the writeset rides `inner[0]` so it lands in chunk 0. Each
+///    chunk applies atomically; **cross-chunk is NOT atomic**. This
+///    is reachable only in the extreme >255-ops-for-one-tenant-in-
+///    one-pass case: a mid-chunk leader change can re-fire the not-
+///    yet-completed schedules, which `schedule_complete`'s
+///    `version_at_fire` guard makes idempotent — the same
+///    at-least-once posture as the existing http.send contract.
+///
+/// Returns the LAST propose's seq (the batch watermark). The H2
+/// dispatch path parks its txn on this seq and never exceeds the
+/// cap, so it always sees a single-propose seq exactly as before.
+pub fn proposeMulti(worker: anytype, inner: []const []const u8) !u64 {
+    if (inner.len == 0) return 0;
+    const allocator = worker.allocator;
+    const CHUNK: usize = 255;
+    var seq: u64 = 0;
+    var i: usize = 0;
+    while (i < inner.len) {
+        const end = @min(i + CHUNK, inner.len);
+        const slice = inner[i..end];
+        seq = worker.raft.highWatermark() + 1;
+        if (slice.len == 1) {
+            try worker.raft.propose(seq, slice[0]);
+        } else {
+            const multi = try apply_mod.encodeMultiEnvelope(allocator, slice);
+            defer allocator.free(multi);
+            try worker.raft.propose(seq, multi);
+        }
+        i = end;
+    }
+    return seq;
+}
+
 pub fn proposeBatch(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
@@ -105,55 +149,34 @@ pub fn proposeBatch(
     anchor_id: []const u8,
 ) !u64 {
     const allocator = worker.allocator;
-    const has_writes = writeset.ops.items.len > 0;
-    const has_schedules = schedules.len > 0;
-    const has_cancels = cancels.len > 0;
-    const total: usize = @as(usize, @intFromBool(has_writes)) +
-        @as(usize, @intFromBool(has_schedules)) +
-        @as(usize, @intFromBool(has_cancels));
-    if (total == 0) return 0;
 
-    // Build each present envelope; collect into an inner-list. If
-    // exactly one is present, propose it bare; otherwise wrap in
-    // multi. The bare-single path matters for the common case (just
-    // a writeset) — saves the multi-envelope overhead.
-    var inner_envs: [3][]u8 = undefined;
-    var inner_count: usize = 0;
-    defer for (inner_envs[0..inner_count]) |env| allocator.free(env);
-
-    var ws_payload_bytes: ?[]u8 = null;
-    defer if (ws_payload_bytes) |b| allocator.free(b);
-
-    if (has_writes) {
-        ws_payload_bytes = try writeset.encode(allocator);
-        const env = try apply_mod.encodeWriteSetEnvelope(allocator, anchor_id, ws_payload_bytes.?);
-        inner_envs[inner_count] = env;
-        inner_count += 1;
+    // Build each present envelope into a dynamic inner-list, then
+    // hand off to proposeMulti. encodeTyped @memcpy's the payload so
+    // each env owns its bytes — transient payload buffers are freed
+    // immediately after encoding. proposeBatch never produces >3
+    // inners, so it never chunks: behavior is identical to the prior
+    // fixed-[3] bare-single / one-multi version.
+    var inner: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (inner.items) |env| allocator.free(env);
+        inner.deinit(allocator);
     }
-    if (has_schedules) {
+
+    if (writeset.ops.items.len > 0) {
+        const ws_bytes = try writeset.encode(allocator);
+        defer allocator.free(ws_bytes);
+        try inner.append(allocator, try apply_mod.encodeWriteSetEnvelope(allocator, anchor_id, ws_bytes));
+    }
+    if (schedules.len > 0) {
         const payload = try schedule_server.encodeUpsertBatch(allocator, schedules);
         defer allocator.free(payload);
-        const env = try apply_mod.encodeScheduleUpsertEnvelope(allocator, payload);
-        inner_envs[inner_count] = env;
-        inner_count += 1;
+        try inner.append(allocator, try apply_mod.encodeScheduleUpsertEnvelope(allocator, payload));
     }
-    if (has_cancels) {
+    if (cancels.len > 0) {
         const payload = try schedule_server.encodeCancelBatch(allocator, cancels);
         defer allocator.free(payload);
-        const env = try apply_mod.encodeScheduleCancelEnvelope(allocator, payload);
-        inner_envs[inner_count] = env;
-        inner_count += 1;
+        try inner.append(allocator, try apply_mod.encodeScheduleCancelEnvelope(allocator, payload));
     }
 
-    const seq = worker.raft.highWatermark() + 1;
-    if (inner_count == 1) {
-        try worker.raft.propose(seq, inner_envs[0]);
-        return seq;
-    }
-    var inner_const: [3][]const u8 = undefined;
-    for (inner_envs[0..inner_count], 0..) |env, i| inner_const[i] = env;
-    const multi = try apply_mod.encodeMultiEnvelope(allocator, inner_const[0..inner_count]);
-    defer allocator.free(multi);
-    try worker.raft.propose(seq, multi);
-    return seq;
+    return proposeMulti(worker, inner.items);
 }

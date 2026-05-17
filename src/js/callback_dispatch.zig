@@ -73,6 +73,7 @@ const dispatcher_mod = @import("dispatcher.zig");
 const worker_mod = @import("worker.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
 const raft_propose = @import("raft_propose.zig");
+const tenant_batch = @import("tenant_batch.zig");
 
 const Request = dispatcher_mod.Request;
 const Budget = dispatcher_mod.Budget;
@@ -169,6 +170,53 @@ pub fn dispatchCallbacks(
     return total;
 }
 
+/// Callback-path policy for `tenant_batch.drainTenantBatch`: bind the
+/// shared per-tenant batch skeleton to the callback row shape, the
+/// proposeBatch tail, and the writeset/schedules/cancels "needs
+/// propose" predicate. Stateless.
+const CallbackPolicy = struct {
+    pub fn runOne(
+        _: *CallbackPolicy,
+        worker: anytype,
+        tc: anytype,
+        inst: *const tenant_mod.Instance,
+        txn: anytype,
+        ws: anytype,
+        pe: anytype,
+        ps: anytype,
+        pc: anytype,
+        row: schedule_server_mod.ScheduleStore.CallbackRow,
+    ) !void {
+        // savepoint (if any) is rolled back inside runOneCallback on
+        // failure; the outer tenant txn stays healthy. The skeleton
+        // logs + keeps-for-retry on the propagated error.
+        _ = try runOneCallback(worker, tc, inst, txn, ws, pe, ps, pc, row.id, row.payload);
+    }
+
+    pub fn needsPropose(_: *CallbackPolicy, ws: anytype, ps: anytype, pc: anytype) bool {
+        return ws.ops.items.len > 0 or ps.items.len > 0 or pc.items.len > 0;
+    }
+
+    pub fn propose(
+        _: *CallbackPolicy,
+        worker: anytype,
+        inst: *const tenant_mod.Instance,
+        ws: anytype,
+        ps: anytype,
+        pc: anytype,
+    ) !void {
+        // proposeBatch wraps writes + schedules + cancels into one
+        // multi-envelope (or proposes bare when only one bucket has
+        // content). undoTxn-on-failure lives in the skeleton.
+        _ = try raft_propose.proposeBatch(worker, ws, ps.items, pc.items, inst.id);
+    }
+};
+
+/// Per-tenant callback drain. The txn / accumulator / read-only-fast-
+/// path / commit-propose-undo / emit-fire discipline now lives in
+/// `tenant_batch.drainTenantBatch`; this binds it to the callback
+/// row + proposeBatch tail. Behavior is unchanged from the
+/// pre-extraction inline version.
 fn drainTenantCallbacks(
     worker: anytype,
     tc: worker_mod.TenantFiles,
@@ -176,139 +224,12 @@ fn drainTenantCallbacks(
     rows: []schedule_server_mod.ScheduleStore.CallbackRow,
     max_per_tenant: u32,
 ) !usize {
-    const allocator = worker.allocator;
-    const n_rows = @min(rows.len, max_per_tenant);
-    if (n_rows == 0) return 0;
-
-    var txn = try inst.kv.beginTrackedImmediate();
-    txn.open() catch |err| {
-        if (err == kv_mod.KvError.Conflict) return 0; // another worker got here first
-        return err;
-    };
-    // Track whether we've committed; on error path we must roll back.
-    var committed = false;
-    errdefer if (!committed) {
-        txn.rollback() catch {};
-    };
-
-    var writeset = kv_mod.WriteSet.init(allocator);
-    defer writeset.deinit();
-
-    // Per-batch SSE emit accumulator (sse-plan §3.2). Callbacks can
-    // call `events.emit` to fan an http.send response back to the
-    // user's browser (the Stripe-style RPC-via-notifications recipe
-    // in docs/notifications.md §2). Same lifecycle as
-    // worker_dispatch's pending_emits: appended via
-    // DispatchState.emit_buffer, fired fire-and-forget at sse-server
-    // after raft commits the writeset.
-    var pending_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
-    defer {
-        for (pending_emits.items) |*e| e.deinit(allocator);
-        pending_emits.deinit(allocator);
-    }
-
-    // http.send / http.cancel from inside an on_result callback —
-    // sagas, retries, chained workflows. Same lifecycle as the
-    // worker_dispatch accumulators.
-    var pending_schedules: std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow) = .empty;
-    defer {
-        for (pending_schedules.items) |*r| r.deinit(allocator);
-        pending_schedules.deinit(allocator);
-    }
-    var pending_cancels: std.ArrayListUnmanaged(schedule_server_mod.CancelTarget) = .empty;
-    defer {
-        for (pending_cancels.items) |*t| t.deinit(allocator);
-        pending_cancels.deinit(allocator);
-    }
-
-    var visited: usize = 0;
-    for (rows[0..n_rows]) |row| {
-        visited += 1;
-        _ = runOneCallback(worker, tc, inst, &txn, &writeset, &pending_emits, &pending_schedules, &pending_cancels, row.id, row.payload) catch |err| {
-            std.log.warn(
-                "rove-js callbacks: {s}/{s}: {s} (kept for retry)",
-                .{ inst.id, row.id, @errorName(err) },
-            );
-            // savepoint (if any) was already rolled back inside
-            // runOneCallback. The outer tenant txn stays healthy.
-            continue;
-        };
-    }
-
-    const batch_seq = txn.txn_seq;
-    const has_writes = writeset.ops.items.len > 0;
-    const has_schedules = pending_schedules.items.len > 0;
-    const has_cancels = pending_cancels.items.len > 0;
-    const needs_propose = has_writes or has_schedules or has_cancels;
-    if (!needs_propose) {
-        // Every callback failed or was a no-op (no writes, no
-        // http.send / http.cancel queued). Release the txn without
-        // proposing.
-        txn.rollback() catch {};
-        committed = true;
-        // Read-only batch: emits (if any) fire immediately — no raft
-        // hop to wait for. Same posture as worker_dispatch.
-        fireEmitsIfWired(worker, inst.id, &pending_emits);
-        return visited;
-    }
-
-    try txn.commit();
-    committed = true;
-
-    // proposeBatch wraps writes + schedules + cancels into one
-    // multi-envelope (or proposes bare when only one bucket has
-    // content).
-    _ = raft_propose.proposeBatch(
-        worker,
-        &writeset,
-        pending_schedules.items,
-        pending_cancels.items,
-        inst.id,
-    ) catch |err| {
-        // Local writes already committed; compensating rollback
-        // via the undo log mirrors the HTTP dispatch fault path.
-        inst.kv.undoTxn(batch_seq) catch |undo_err| {
-            std.log.err(
-                "rove-js callbacks: undoTxn after propose error failed: {s}",
-                .{@errorName(undo_err)},
-            );
-        };
-        return err;
-    };
-
-    // Raft accepted the batch on this node — fire emits at sse-server.
-    fireEmitsIfWired(worker, inst.id, &pending_emits);
-
-    return visited;
+    var pol = CallbackPolicy{};
+    return tenant_batch.drainTenantBatch(worker, tc, inst, rows, max_per_tenant, &pol);
 }
 
-/// Fire-and-forget the merged callback-batch emits at sse-server.
-/// No-op when worker isn't configured for SSE delivery or the batch
-/// is empty. Mirrors worker_dispatch.fireEmitsIfWired.
-fn fireEmitsIfWired(
-    worker: anytype,
-    tenant_id: []const u8,
-    pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
-) void {
-    if (pending_emits.items.len == 0) return;
-    const easy = worker.sse_curl orelse return;
-    const base = worker.sse_public_base orelse return;
-    const tok = worker.sse_internal_token orelse return;
-    if (base.len == 0 or tok.len == 0) return;
-    sse_dispatch.fireBatch(
-        worker.allocator,
-        easy,
-        base,
-        tok,
-        tenant_id,
-        // No batch-level request_id breadcrumb in the callback path
-        // (callbacks are platform-driven, not tied to one request).
-        // sse-server doesn't depend on this field; 0 is fine.
-        0,
-        pending_emits.items,
-        worker.sse_insecure_tls,
-    );
-}
+// (fireEmitsIfWired removed — emit-firing now lives in
+//  tenant_batch.zig, shared across the batched-dispatch paths.)
 
 /// Outcome of `runOneCallback` from the caller's point of view. Used
 /// only internally by tests — `drainTenantCallbacks` just cares about
