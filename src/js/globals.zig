@@ -1282,6 +1282,18 @@ pub fn installStatic(ctx: *c.JSContext) void {
     //   - retry.js: customer-side retry helper on http.send.
     //   - webhook.js: legacy webhook.send shim on http.send.
     //   - email.js: Resend wrapper that calls webhook.send (the shim).
+    //   - kv/console/crypto/http/events/platform .js: public shims
+    //     over `_system.*` (docs/builtin-libs-docs-plan.md Phase A).
+    //     Evaluated FIRST so the dependent snippets below (jwt/oauth/
+    //     oidc/sessions use `crypto`; retry/webhook/email use `http`)
+    //     and customer handlers see the documented top-level names
+    //     rather than the raw natives.
+    evalSnippet(ctx, "kv.js", KV_JS);
+    evalSnippet(ctx, "console.js", CONSOLE_JS);
+    evalSnippet(ctx, "crypto.js", CRYPTO_JS);
+    evalSnippet(ctx, "http.js", HTTP_JS);
+    evalSnippet(ctx, "events.js", EVENTS_JS);
+    evalSnippet(ctx, "platform.js", PLATFORM_JS);
     evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
     evalSnippet(ctx, "base64.js", BASE64_JS);
     evalSnippet(ctx, "urlsearchparams.js", URLSEARCHPARAMS_JS);
@@ -1322,13 +1334,20 @@ const NamespaceBindings = struct {
 };
 
 const STATIC_NAMESPACES = [_]NamespaceBindings{
-    .{ .path = &.{"kv"}, .fns = &.{
+    // `_system` is the internal native ABI (docs/builtin-libs-docs-plan.md
+    // Phase A). Unstable, undocumented, never referenced by customer
+    // code — every public name is a doc-commented JS shim in
+    // `globals/*.js` layered over `_system.*`. Empty holder so the
+    // parent JSObject exists before `_system.kv` populates it (same
+    // parent-before-child rule as `platform`).
+    .{ .path = &.{"_system"}, .fns = &.{} },
+    .{ .path = &.{ "_system", "kv" }, .fns = &.{
         .{ .name = "get",    .cfunc = jsKvGet,    .argc = 1 },
         .{ .name = "set",    .cfunc = jsKvSet,    .argc = 2 },
         .{ .name = "delete", .cfunc = jsKvDelete, .argc = 1 },
         .{ .name = "prefix", .cfunc = jsKvPrefix, .argc = 3 },
     } },
-    .{ .path = &.{"console"}, .fns = &.{
+    .{ .path = &.{ "_system", "console" }, .fns = &.{
         .{ .name = "log", .cfunc = jsConsoleLog, .argc = 1 },
     } },
     // crypto. No crypto global in qjs-ng by default, so we fabricate
@@ -1336,7 +1355,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // Stripe / Slack / AWS style signatures (PLAN §2.6); randomBytes +
     // sha256 are what admin's JS handler composes into magic-link /
     // session token mint and hash-at-rest.
-    .{ .path = &.{"crypto"}, .fns = &.{
+    .{ .path = &.{ "_system", "crypto" }, .fns = &.{
         .{ .name = "getRandomValues", .cfunc = crypto_b.jsCryptoGetRandomValues, .argc = 1 },
         .{ .name = "randomUUID",      .cfunc = crypto_b.jsCryptoRandomUuid,      .argc = 0 },
         .{ .name = "randomBytes",     .cfunc = crypto_b.jsCryptoRandomBytes,     .argc = 1 },
@@ -1364,7 +1383,7 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // and fires libcurl. cancel appends a CancelTarget to drop a
     // pending row. webhook.send + email.send polyfill on top
     // (see webhook.js + email.js).
-    .{ .path = &.{"http"}, .fns = &.{
+    .{ .path = &.{ "_system", "http" }, .fns = &.{
         .{ .name = "send",   .cfunc = http_b.jsHttpSend,   .argc = 1 },
         .{ .name = "cancel", .cfunc = http_b.jsHttpCancel, .argc = 1 },
     } },
@@ -1372,32 +1391,32 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // the SSE pump (worker.zig) drives connected EventSource clients
     // off those rows. Cross-tenant integrity is structural — each
     // tenant's events live only in that tenant's app.db.
-    .{ .path = &.{"events"}, .fns = &.{
+    .{ .path = &.{ "_system", "events" }, .fns = &.{
         .{ .name = "emit", .cfunc = events_b.jsEventsEmit, .argc = 1 },
     } },
     // platform = { root, instances }. Installed on every context;
     // the C callbacks check `state.platform` and throw for non-admin
     // handlers.
-    .{ .path = &.{"platform"}, .fns = &.{
+    .{ .path = &.{ "_system", "platform" }, .fns = &.{
         // platform.scope(id) → { kv: { get, prefix, set, delete } }
         // bound to instance `id`. The explicit cross-tenant accessor
         // that replaced the X-Rove-Scope global-kv rebind.
         .{ .name = "scope", .cfunc = jsPlatformScope, .argc = 1 },
     } },
-    .{ .path = &.{ "platform", "root" }, .fns = &.{
+    .{ .path = &.{ "_system", "platform", "root" }, .fns = &.{
         .{ .name = "get",    .cfunc = jsPlatformRootGet,    .argc = 1 },
         .{ .name = "set",    .cfunc = jsPlatformRootSet,    .argc = 2 },
         .{ .name = "delete", .cfunc = jsPlatformRootDelete, .argc = 1 },
         .{ .name = "prefix", .cfunc = jsPlatformRootPrefix, .argc = 3 },
     } },
-    .{ .path = &.{ "platform", "instances" }, .fns = &.{
+    .{ .path = &.{ "_system", "platform", "instances" }, .fns = &.{
         .{ .name = "create",        .cfunc = jsPlatformInstancesCreate,        .argc = 1 },
         .{ .name = "deployStarter", .cfunc = jsPlatformInstancesDeployStarter, .argc = 1 },
     } },
-    .{ .path = &.{ "platform", "releases" }, .fns = &.{
+    .{ .path = &.{ "_system", "platform", "releases" }, .fns = &.{
         .{ .name = "publish", .cfunc = jsPlatformReleasesPublish, .argc = 2 },
     } },
-    .{ .path = &.{ "platform", "auth" }, .fns = &.{
+    .{ .path = &.{ "_system", "platform", "auth" }, .fns = &.{
         .{ .name = "checkRootToken", .cfunc = jsPlatformAuthCheckRootToken, .argc = 1 },
     } },
 };
@@ -1419,6 +1438,14 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     .{ .name = "__rove_check_email_rate", .cfunc = email_rate_b.jsCheckEmailRate, .argc = 0 },
 };
 
+// Public shims (docs/builtin-libs-docs-plan.md Phase A). JSDoc-carrying
+// JS over `_system.*`; this is the documentation source of truth.
+const KV_JS = @embedFile("kv_js");
+const CONSOLE_JS = @embedFile("console_js");
+const CRYPTO_JS = @embedFile("crypto_js");
+const HTTP_JS = @embedFile("http_js");
+const EVENTS_JS = @embedFile("events_js");
+const PLATFORM_JS = @embedFile("platform_js");
 const BASE64_JS = @embedFile("base64_js");
 const URLSEARCHPARAMS_JS = @embedFile("urlsearchparams_js");
 const JWT_JS = @embedFile("jwt_js");

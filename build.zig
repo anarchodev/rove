@@ -427,6 +427,14 @@ pub fn build(b: *std.Build) void {
     // email.js wraps `webhook.send` (which now layers on http.send);
     // textcodec.js polyfills TextEncoder/Decoder.
     const js_runtime_files: []const struct { name: []const u8, path: []const u8 } = &.{
+        // Public doc-carrying shims over `_system.*`
+        // (docs/builtin-libs-docs-plan.md Phase A).
+        .{ .name = "kv_js", .path = "src/js/globals/kv.js" },
+        .{ .name = "console_js", .path = "src/js/globals/console.js" },
+        .{ .name = "crypto_js", .path = "src/js/globals/crypto.js" },
+        .{ .name = "http_js", .path = "src/js/globals/http.js" },
+        .{ .name = "events_js", .path = "src/js/globals/events.js" },
+        .{ .name = "platform_js", .path = "src/js/globals/platform.js" },
         .{ .name = "base64_js", .path = "src/js/bindings/base64.js" },
         .{ .name = "urlsearchparams_js", .path = "src/js/bindings/urlsearchparams.js" },
         .{ .name = "jwt_js", .path = "src/js/bindings/jwt.js" },
