@@ -265,7 +265,127 @@ globalThis.oauth = {
     }
     throw new TypeError("oauth.fromConfig: expected string name or inline config object");
   },
+
+  /**
+   * Verify a third-party `id_token` against the cached JWKS only
+   * (synchronous — there is no sync HTTP). `jwt.*` is
+   * alg-confusion-safe (RS/ES only). On a cache miss / unknown `kid`
+   * the caller must run the async {@link oauth.fetchJwks} hop and
+   * retry; this mirrors `oidc.rp`'s `completeToken → completeJwks →
+   * _finish` chain (auth-domain-plan §4.8).
+   *
+   * @param {string} id_token - The compact JWS from the token
+   *   endpoint response.
+   * @param {object} opts - `{issuer, client_id, jwks_uri}` required;
+   *   optional `nonce` (checked manually — `validateClaims` doesn't
+   *   cover it), `leeway_s` (default 30), `algs` (extra allow-list on
+   *   top of jwt.js's RS/ES set), `cache_path`.
+   * @returns {object} One of `{ok:true, claims}` /
+   *   `{ok:false, error}` (hard reject — do NOT retry) /
+   *   `{ok:false, need_jwks:true, jwks_uri}` (caller does the async
+   *   refetch hop, then retries).
+   * @throws {TypeError} Missing `issuer`/`client_id`/`jwks_uri`.
+   * @example
+   * let r = oauth.verifyIdToken(tok.id_token, {
+   *   issuer: "https://accounts.google.com",
+   *   client_id: cfg.client_id,
+   *   jwks_uri: "https://www.googleapis.com/oauth2/v3/certs",
+   *   nonce: ctx.nonce, cache_path: "cache/oauth/google" });
+   */
+  verifyIdToken(id_token, opts) {
+    if (typeof id_token !== "string" || id_token.length === 0) {
+      return { ok: false, error: "missing id_token" };
+    }
+    if (!opts || !opts.issuer || !opts.client_id || !opts.jwks_uri) {
+      throw new TypeError(
+        "oauth.verifyIdToken: opts needs issuer, client_id, jwks_uri");
+    }
+    const cache_key =
+      (opts.cache_path || "cache/oauth/_idtok") + "/jwks";
+    const raw = kv.get(cache_key);
+    if (raw == null) {
+      return { ok: false, need_jwks: true, jwks_uri: opts.jwks_uri };
+    }
+    let jwks = null;
+    try { jwks = JSON.parse(raw); } catch (_) { jwks = null; }
+    if (!jwks || !Array.isArray(jwks.keys)) {
+      return { ok: false, need_jwks: true, jwks_uri: opts.jwks_uri };
+    }
+    const r = _verifyWithJwks(id_token, jwks, opts);
+    if (r.need_jwks) r.jwks_uri = opts.jwks_uri;
+    return r;
+  },
+
+  /**
+   * Kick the async JWKS fetch. `on_result` lands in a module that
+   * re-runs {@link oauth.verifyIdToken} (now a cache hit) after
+   * calling {@link oauth.cacheJwksFromEvent}.
+   *
+   * @param {object} opts - Must carry `jwks_uri`.
+   * @param {string} on_result_module - Module to receive the fetch
+   *   event (http-send-plan §8 shape).
+   * @param {object} [context] - Threaded back on the event (carry
+   *   `id_token`, `sid`, `return_to`, …).
+   * @example
+   * oauth.fetchJwks(opts, "users/oauth_jwks",
+   *   { id_token, sid: ctx.sid, return_to: ctx.return_to });
+   */
+  fetchJwks(opts, on_result_module, context) {
+    http.send({
+      url: opts.jwks_uri,
+      method: "GET",
+      on_result: { module: on_result_module },
+      context: context,
+    });
+  },
+
+  /**
+   * Cache a JWKS fetch event's body. Call from the fetch `on_result`
+   * module, then re-run {@link oauth.verifyIdToken}.
+   *
+   * @param {object} event - The http-send result event
+   *   (`{ok,status,body}`).
+   * @param {string} [cache_path] - Same `cache_path` passed to
+   *   {@link oauth.verifyIdToken}.
+   * @returns {boolean} `true` when a well-formed JWKS was cached.
+   */
+  cacheJwksFromEvent(event, cache_path) {
+    if (!event || !event.ok) return false;
+    let jwks = null;
+    try { jwks = JSON.parse(event.body || "{}"); } catch (_) {}
+    if (!jwks || !Array.isArray(jwks.keys)) return false;
+    kv.set((cache_path || "cache/oauth/_idtok") + "/jwks",
+      JSON.stringify({ keys: jwks.keys, fetched_at: Date.now() }));
+    return true;
+  },
 };
+
+// Verify `id_token` against an in-hand JWKS. "No matching kid" is a
+// stale-cache signal (→ refetch), NOT a forgery — correct during IdP
+// key rotation, matching oidc.rp / §4.6 controlled-RP behavior.
+function _verifyWithJwks(id_token, jwks, opts) {
+  let v;
+  try { v = jwt.verify(id_token, jwks); }
+  catch (e) {
+    const msg = String(e && e.message);
+    if (msg.indexOf("no key") !== -1) return { ok: false, need_jwks: true };
+    return { ok: false, error: "verify: " + msg };
+  }
+  if (!v.valid) return { ok: false, error: "bad signature" };
+  if (opts.algs && opts.algs.indexOf(v.header.alg) === -1) {
+    return { ok: false, error: "alg not allowed: " + v.header.alg };
+  }
+  const claim_err = jwt.validateClaims(v.payload, {
+    iss: opts.issuer,
+    aud: opts.client_id,
+    leeway_s: opts.leeway_s != null ? opts.leeway_s : 30,
+  });
+  if (claim_err) return { ok: false, error: "id_token " + claim_err };
+  if (opts.nonce != null && v.payload.nonce !== opts.nonce) {
+    return { ok: false, error: "nonce mismatch" };
+  }
+  return { ok: true, claims: v.payload };
+}
 
 function _oauthDefaults(cfg, name) {
   return Object.assign({}, cfg, {

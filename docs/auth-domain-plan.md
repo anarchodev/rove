@@ -27,9 +27,11 @@ complete.** **Phase 4 (canonical-docs sweep) DONE 2026-05-16:**
 `docs/deployment.md` (two cert flows, `--system-suffix` /
 `LOOP46_OPERATOR_EMAILS`, `:80` responder, edge note), `CLAUDE.md`
 sub-plan index (already listed) + envelope-2 row corrected.
-**All of `auth-domain-plan.md` (Phases 0–4) is now landed.** Sole
-tracked follow-up: ACME renewal / expiry-driven reissue (§3.2 — v1
-issues only when `cert/{host}` absent).
+**All of `auth-domain-plan.md` (Phases 0–4) is now landed.** Tracked
+follow-ups (neither v1-blocking): (1) ACME renewal / expiry-driven
+reissue (§3.2 — v1 issues only when `cert/{host}` absent); (2)
+`oauth.verifyIdToken` — third-party-RP `id_token` signature
+verification gap (§4.8).
 
 > **2026-05-15 ground-truth corrigendum** (Phase 1 code grounding).
 > Three premises in the original draft were wrong against the
@@ -1191,6 +1193,81 @@ Smokes that drove the admin RPC surface via `Bearer` (admin_smoke,
 oidc_smoke) gain a `smoke_lib` IdP-login helper (magic-link →
 `/_rp/callback` → poll → session) since D1 removed the Bearer
 admin path; `/_system/*` M2M Bearer is unaffected.
+
+### 4.8 Follow-up — `oauth.verifyIdToken` (RP id_token verification gap)
+
+**Status: tracked follow-up, not v1-blocking.** Found 2026-05-16
+reviewing third-party-RP coverage.
+
+`oauth.js` (`src/js/globals/oauth.js`) is the generic client most
+customers use for "log in with Google/Okta/Auth0". It stops at the
+token exchange: `handleCallback` does the `/token` `http.send` and
+hands the **raw, unverified** token response to the customer's
+`on_complete_module` (no JWKS fetch, no `id_token` signature check, no
+`iss`/`aud`/`exp`/`nonce` validation, no `userinfo`). A customer doing
+the obvious thing gets an *authenticated* but not *verified* identity
+and won't necessarily notice — the exact error-prone crypto an OIDC
+library exists to remove. The correct implementation already exists,
+in `oidc.rp()._finish` (`oidc.js`), but is wired only to a rove-shaped
+IdP, not exposed for the third-party case. Adjacent to the §4.5
+`userinfo`/logout deferrals but distinct: this is RP-side *signature
+trust*, not a protocol-surface cut.
+
+**Hard constraint shaping the fix.** No synchronous HTTP (Cmd-pattern
+`http.send` only) and the `on_complete_module` runs as a synthesized
+callback. So a single blocking `verifyIdToken()` is impossible on a
+JWKS cache miss — fetching JWKS is an extra async hop. The helper must
+mirror `oidc.rp`'s 3-stage chain (`completeToken → completeJwks →
+_finish`), not hide it.
+
+**Proposed surface** (sketch reviewed 2026-05-16):
+
+- `oauth.verifyIdToken(id_token, {issuer, client_id, jwks_uri, nonce,
+  leeway_s, algs, cache_path})` — *synchronous*, verifies against the
+  cached JWKS only. Returns one of `{ok:true, claims}` /
+  `{ok:false, error}` (hard reject — do not retry) /
+  `{ok:false, need_jwks:true, jwks_uri}` (caller does the async
+  refetch, then retries). `jwt.*` is already alg-confusion-safe
+  (RS/ES only); `algs` is an optional extra pin. `nonce` is checked
+  manually (`jwt.validateClaims` doesn't cover it) — requires
+  `startLogin` to generate + stash a nonce in `state`, mirroring how
+  it already stashes the PKCE verifier (~3 LOC).
+- `oauth.fetchJwks(opts, on_result_module, context)` +
+  `oauth.cacheJwksFromEvent(event, cache_path)` — the refetch hop.
+  "No matching kid" is treated as *refetch*, not forgery (correct
+  during IdP key rotation; matches §4.6 controlled-RP behavior).
+
+**Productized form (recommended, ~120 LOC, defer until demand).** Add
+config keys `verify_id_token:true` / `issuer` / `jwks_uri`; point
+`handleCallback`'s `on_result` at a **library-owned** `_oauth/verify`
+module (analog of `web/admin/_rp/complete.mjs`) that runs verify +
+the JWKS hop transparently and only then invokes the customer's
+`on_complete_module` with `event.id_token_claims` already verified.
+Customer writes zero crypto and zero extra modules; the
+unverified-identity footgun disappears by default. Reuses the
+`oidc.rp` chain almost verbatim (two module files + the `startLogin`
+nonce thread).
+
+**Two open design points.** (1) Unknown-kid refetch can be abused to
+force repeated JWKS fetches with junk kids — bound with a per-sid
+refetch count or a min-refetch-interval on the cache row. (2)
+`jwks_uri` taken as direct config (Google/Okta/Auth0 URLs are
+stable); auto-deriving via `issuer/.well-known/openid-configuration`
+is a clean add but a third hop — defer until a customer needs an IdP
+whose JWKS URL isn't static.
+
+### 4.9 "Make your own Clerk" tutorial → `docs/users-lib-plan.md`
+
+A credible "Make your own Clerk" tutorial needs more than the IdP
+spine: a managed user store, account linking, session
+list/revocation, social login, and TOTP MFA. Scoped 2026-05-16 to
+**B2C, passwordless-only** (no passwords ⇒ no native KDF; no
+Organizations; no SMS). The full phased plan, kv layout, security
+edges, and the P1a–P5 task map live in
+[`docs/users-lib-plan.md`](users-lib-plan.md). Its only native
+dependencies are §4.8 (`oauth.verifyIdToken`) and a ~10-line
+`crypto.hmacSha1` binding for interoperable TOTP; everything else is
+a dogfooded `users.js` library, the §4.2 model.
 
 ---
 

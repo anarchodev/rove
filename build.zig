@@ -446,6 +446,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "webhook_js", .path = "src/js/globals/webhook.js" },
         .{ .name = "email_js", .path = "src/js/globals/email.js" },
         .{ .name = "textcodec_js", .path = "src/js/globals/textcodec.js" },
+        .{ .name = "users_js", .path = "src/js/globals/users.js" },
     };
     for (js_runtime_files) |f| {
         js_mod.addAnonymousImport(f.name, .{
