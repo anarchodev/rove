@@ -27,6 +27,7 @@ PUBLIC_SUFFIX = "rewindjsapp.localhost"
 SYSTEM_SUFFIX = "rewindjscom.localhost"
 ADMIN_HOST = f"app.{SYSTEM_SUFFIX}"
 ACME_HOST = f"acme.{PUBLIC_SUFFIX}"
+OPERATOR_EMAIL = "operator@example.com"
 ECHO_PORT = 9197
 
 
@@ -109,10 +110,38 @@ def main() -> int:
             print(f"ok  leader elected: node {c.leader_idx} at {c.addrs.http[c.leader_idx]}")
 
             admin_origin = c.admin_origin()
-            c.spawn_files_server(cors_origin=admin_origin, leader_url=admin_origin)
+            # Admin is a pure OIDC relying party (Fork B,
+            # auth-domain-plan §4.7): no Bearer human path. Seed the RP
+            # config + operator allowlist via --bootstrap-kv and
+            # authenticate the admin listKv calls below with a real
+            # operator session.
+            c.spawn_files_server(
+                cors_origin=admin_origin,
+                leader_url=admin_origin,
+                extra_args=c.admin_oidc_kv(OPERATOR_EMAIL),
+            )
 
-            cc = c.curl_ctx(ACME_HOST)
+            cc = c.curl_ctx(ACME_HOST, f"auth.{SYSTEM_SUFFIX}")
             acme_origin = f"https://{ACME_HOST}:{c.leader_port()}"
+
+            # Wait for the bootstrap-kv push (`_oidc/rp/default`) + the
+            # __admin__ deploy to settle (RP middleware 500s "no RP
+            # config" until then → clean 401 is the readiness signal),
+            # then the IdP /login surface, then authenticate.
+            deadline = time.monotonic() + 20.0
+            r = curl(cc, f"{admin_origin}/?fn=listKv", headers={"Origin": admin_origin})
+            while time.monotonic() < deadline and r.status != 401:
+                time.sleep(0.25)
+                r = curl(cc, f"{admin_origin}/?fn=listKv", headers={"Origin": admin_origin})
+            for _ in range(80):
+                if curl(cc, c.auth_base() + "/login").status == 200:
+                    break
+                time.sleep(0.25)
+            admin_auth = {
+                "Cookie": c.oidc_login(cc, OPERATOR_EMAIL),
+                "Origin": admin_origin,
+            }
+            print("ok  operator authenticated via OIDC RP")
 
             # 3. Fire the webhook through acme's cbfire handler. Poll
             # for the handler to be loaded.
@@ -160,10 +189,7 @@ def main() -> int:
             while time.monotonic() < deadline:
                 r = curl(
                     cc, f"{admin_origin}/?fn=listKv&args={qs}",
-                    headers={
-                        "Authorization": f"Bearer {TOKEN}",
-                        "X-Rove-Scope": "acme",
-                    },
+                    headers={**admin_auth, "X-Rove-Scope": "acme"},
                 )
                 if '"key":"cb/result/' in r.body:
                     result_body = r.body
@@ -196,10 +222,7 @@ def main() -> int:
             qs = urllib.parse.quote(json.dumps(["_callback/", "", 100]))
             r = curl(
                 cc, f"{admin_origin}/?fn=listKv&args={qs}",
-                headers={
-                    "Authorization": f"Bearer {TOKEN}",
-                    "X-Rove-Scope": "acme",
-                },
+                headers={**admin_auth, "X-Rove-Scope": "acme"},
             )
             if '"key":"_callback/' in r.body:
                 sys.exit(f"FAIL _callback/* receipt not deleted: {r.body}")

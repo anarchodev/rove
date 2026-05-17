@@ -21,6 +21,7 @@ PUBLIC_SUFFIX = "rewindjsapp.localhost"
 SYSTEM_SUFFIX = "rewindjscom.localhost"
 API_HOST = f"app.{SYSTEM_SUFFIX}"
 CUSTOMER_HOST = f"demo.{PUBLIC_SUFFIX}"
+OPERATOR_EMAIL = "operator@example.com"
 
 
 def main() -> int:
@@ -39,22 +40,41 @@ def main() -> int:
         print(f"ok  leader elected: node {c.leader_idx} at {c.addrs.http[c.leader_idx]}")
 
         admin_origin = c.admin_origin()
-        c.spawn_files_server(cors_origin=admin_origin, leader_url=admin_origin)
+        # Admin is a pure OIDC relying party (Fork B, auth-domain-plan
+        # §4.7): the createInstance/assignDomain RPCs below need a real
+        # is_root operator session, not a Bearer token. Seed the RP
+        # config + operator allowlist via --bootstrap-kv.
+        c.spawn_files_server(
+            cors_origin=admin_origin,
+            leader_url=admin_origin,
+            extra_args=c.admin_oidc_kv(OPERATOR_EMAIL),
+        )
         c.spawn_log_server(cors_origin=admin_origin)
         c.mint_services_token()
 
-        cc = c.curl_ctx(CUSTOMER_HOST)
+        cc = c.curl_ctx(CUSTOMER_HOST, f"auth.{SYSTEM_SUFFIX}")
         port = c.leader_port()
         customer = f"https://{CUSTOMER_HOST}:{port}"
-        auth = {"Authorization": f"Bearer {TOKEN}", "Origin": admin_origin}
-
-        # Wait for admin to be loaded.
         leader_log = Path(f"/tmp/static-smoke-worker-{c.leader_idx}.out")
-        deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline:
-            if leader_log.exists() and "tenant __admin__ loaded deployment" in leader_log.read_text(errors="replace"):
+
+        # Wait for the bootstrap-kv push (`_oidc/rp/default`) + the
+        # __admin__ deploy to settle (RP middleware 500s "no RP config"
+        # until then → clean 401 is the readiness signal), then the IdP
+        # /login surface, then authenticate as the is_root operator.
+        deadline = time.monotonic() + 20.0
+        r = curl(cc, f"{admin_origin}/?fn=listInstance", headers={"Origin": admin_origin})
+        while time.monotonic() < deadline and r.status != 401:
+            time.sleep(0.25)
+            r = curl(cc, f"{admin_origin}/?fn=listInstance", headers={"Origin": admin_origin})
+        for _ in range(80):
+            if curl(cc, c.auth_base() + "/login").status == 200:
                 break
-            time.sleep(0.1)
+            time.sleep(0.25)
+        auth = {
+            "Cookie": c.oidc_login(cc, OPERATOR_EMAIL),
+            "Origin": admin_origin,
+        }
+        print("ok  operator authenticated via OIDC RP")
 
         # Create the demo customer instance.
         r = curl(

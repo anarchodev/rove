@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib import Cluster, curl  # noqa: E402
 
 TOKEN = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+OPERATOR_EMAIL = "operator@example.com"
 PUBLIC_SUFFIX = "rewindjsapp.localhost"
 SYSTEM_SUFFIX = "rewindjscom.localhost"
 ADMIN_HOST = f"app.{SYSTEM_SUFFIX}"
@@ -49,11 +50,39 @@ def main() -> int:
         print(f"ok  leader elected: node {c.leader_idx} at {c.addrs.http[c.leader_idx]}")
 
         admin_origin = c.admin_origin()
-        c.spawn_files_server(cors_origin=admin_origin, leader_url=admin_origin)
+        # Admin is a pure OIDC relying party (Fork B, auth-domain-plan
+        # §4.7): no Bearer human path. Seed the RP config + operator
+        # allowlist via --bootstrap-kv and authenticate the admin
+        # listKv/getKv calls below with a real operator session.
+        c.spawn_files_server(
+            cors_origin=admin_origin,
+            leader_url=admin_origin,
+            extra_args=c.admin_oidc_kv(OPERATOR_EMAIL),
+        )
 
-        cc = c.curl_ctx(ACME_HOST, WB_HOST)
+        cc = c.curl_ctx(ACME_HOST, WB_HOST, f"auth.{SYSTEM_SUFFIX}")
         leader_port = c.leader_port()
         acme_origin = f"https://{ACME_HOST}:{leader_port}"
+
+        # Wait for the bootstrap-kv push (`_oidc/rp/default`) + the
+        # __admin__ deploy to settle — the RP middleware 500s
+        # "no RP config" until then, so an unauthenticated call
+        # reaching a clean 401 is the readiness signal. Then wait for
+        # the IdP /login surface and authenticate as the operator.
+        deadline = time.monotonic() + 20.0
+        r = curl(cc, f"{admin_origin}/?fn=listKv", headers={"Origin": admin_origin})
+        while time.monotonic() < deadline and r.status != 401:
+            time.sleep(0.25)
+            r = curl(cc, f"{admin_origin}/?fn=listKv", headers={"Origin": admin_origin})
+        for _ in range(80):
+            if curl(cc, c.auth_base() + "/login").status == 200:
+                break
+            time.sleep(0.25)
+        admin_auth = {
+            "Cookie": c.oidc_login(cc, OPERATOR_EMAIL),
+            "Origin": admin_origin,
+        }
+        print("ok  operator authenticated via OIDC RP")
 
         # 1. Sanity: wb tenant is reachable. Poll because acme/wb load
         # async after seed.
@@ -93,10 +122,7 @@ def main() -> int:
         while time.monotonic() < deadline:
             r = curl(
                 cc, f"{admin_origin}/?fn=listKv&args={qs}",
-                headers={
-                    "Authorization": f"Bearer {TOKEN}",
-                    "X-Rove-Scope": "acme",
-                },
+                headers={**admin_auth, "X-Rove-Scope": "acme"},
             )
             if '"key":"http/result/' in r.body:
                 result_body = r.body
@@ -132,10 +158,7 @@ def main() -> int:
         qs = urllib.parse.quote(json.dumps(["wb/last_tag"]))
         r = curl(
             cc, f"{admin_origin}/?fn=getKv&args={qs}",
-            headers={
-                "Authorization": f"Bearer {TOKEN}",
-                "X-Rove-Scope": "wb",
-            },
+            headers={**admin_auth, "X-Rove-Scope": "wb"},
         )
         if "optimization-win" not in r.body:
             sys.exit(f"FAIL wb/last_tag missing: {r.body}")
@@ -161,10 +184,7 @@ def main() -> int:
         qs = urllib.parse.quote(json.dumps(["_callback/", "", 100]))
         r = curl(
             cc, f"{admin_origin}/?fn=listKv&args={qs}",
-            headers={
-                "Authorization": f"Bearer {TOKEN}",
-                "X-Rove-Scope": "acme",
-            },
+            headers={**admin_auth, "X-Rove-Scope": "acme"},
         )
         if '"key":"_callback/' in r.body:
             sys.exit(f"FAIL _callback/{{id}} receipt not cleared: {r.body}")
