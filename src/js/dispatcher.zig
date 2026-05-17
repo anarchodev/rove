@@ -3807,7 +3807,7 @@ test "dispatch: webhook.send (polyfill) appends ScheduleRow to pending_schedules
     }
 
     // The legacy webhook.send is now a JS polyfill on top of
-    // http.send (src/js/bindings/webhook.js). Same call shape from
+    // http.send (src/js/globals/webhook.js). Same call shape from
     // customer code, but rows land in pending_schedules.
     var resp = try runOne(
         &d,

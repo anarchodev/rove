@@ -1,12 +1,12 @@
 //! Hidden builtin `__rove_check_email_rate` called from the
-//! email.send JS wrapper (`bindings/email.js`) before queuing the
+//! email.send JS wrapper (`globals/email.js`) before queuing the
 //! schedule row. Throws an `rate_limited` JS error when the
 //! per-instance email bucket is exhausted; customer can catch in
 //! their handler.
 //!
 //! Originally lived in `bindings/webhook.zig` alongside the
 //! `webhook.send` C binding; that binding retired (replaced by the
-//! `bindings/webhook.js` polyfill on http.send), and this hidden
+//! `globals/webhook.js` polyfill on http.send), and this hidden
 //! builtin came along to its current name.
 
 const std = @import("std");

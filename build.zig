@@ -257,7 +257,7 @@ pub fn build(b: *std.Build) void {
     // Storage + wire format + leader-pinned scheduler thread for the
     // platform's outbound HTTP primitive (docs/http-send-plan.md).
     // Replaced rove-webhook-server entirely; webhook.send is now a
-    // JS polyfill on top of http.send (src/js/bindings/webhook.js).
+    // JS polyfill on top of http.send (src/js/globals/webhook.js).
     const schedule_server_mod = b.addModule("rove-schedule-server", .{
         .root_source_file = b.path("src/schedule_server/root.zig"),
         .target = target,
@@ -435,17 +435,17 @@ pub fn build(b: *std.Build) void {
         .{ .name = "http_js", .path = "src/js/globals/http.js" },
         .{ .name = "events_js", .path = "src/js/globals/events.js" },
         .{ .name = "platform_js", .path = "src/js/globals/platform.js" },
-        .{ .name = "base64_js", .path = "src/js/bindings/base64.js" },
-        .{ .name = "urlsearchparams_js", .path = "src/js/bindings/urlsearchparams.js" },
-        .{ .name = "jwt_js", .path = "src/js/bindings/jwt.js" },
-        .{ .name = "oauth_js", .path = "src/js/bindings/oauth.js" },
-        .{ .name = "oidc_js", .path = "src/js/bindings/oidc.js" },
-        .{ .name = "sessions_js", .path = "src/js/bindings/sessions.js" },
-        .{ .name = "cron_js", .path = "src/js/bindings/cron.js" },
-        .{ .name = "retry_js", .path = "src/js/bindings/retry.js" },
-        .{ .name = "webhook_js", .path = "src/js/bindings/webhook.js" },
-        .{ .name = "email_js", .path = "src/js/bindings/email.js" },
-        .{ .name = "textcodec_js", .path = "src/js/bindings/textcodec.js" },
+        .{ .name = "base64_js", .path = "src/js/globals/base64.js" },
+        .{ .name = "urlsearchparams_js", .path = "src/js/globals/urlsearchparams.js" },
+        .{ .name = "jwt_js", .path = "src/js/globals/jwt.js" },
+        .{ .name = "oauth_js", .path = "src/js/globals/oauth.js" },
+        .{ .name = "oidc_js", .path = "src/js/globals/oidc.js" },
+        .{ .name = "sessions_js", .path = "src/js/globals/sessions.js" },
+        .{ .name = "cron_js", .path = "src/js/globals/cron.js" },
+        .{ .name = "retry_js", .path = "src/js/globals/retry.js" },
+        .{ .name = "webhook_js", .path = "src/js/globals/webhook.js" },
+        .{ .name = "email_js", .path = "src/js/globals/email.js" },
+        .{ .name = "textcodec_js", .path = "src/js/globals/textcodec.js" },
     };
     for (js_runtime_files) |f| {
         js_mod.addAnonymousImport(f.name, .{
