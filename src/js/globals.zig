@@ -1458,6 +1458,33 @@ const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
 
+/// (public name, embedded source) for every `globals/*.js` file. The
+/// single list the Phase-A lints below pivot on: each `.src` is an
+/// `@embedFile`'d const, so a build.zig embed that loses its file
+/// fails to compile here; lint(c) enforces the inverse (every native
+/// `_system.*` namespace has an entry) and lint(b) enforces every
+/// export in `.src` carries a JSDoc block. Adding a `globals/*.js`
+/// shim means adding it here too (and to build.zig + installStatic).
+const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
+    .{ .name = "kv", .src = KV_JS },
+    .{ .name = "console", .src = CONSOLE_JS },
+    .{ .name = "crypto", .src = CRYPTO_JS },
+    .{ .name = "http", .src = HTTP_JS },
+    .{ .name = "events", .src = EVENTS_JS },
+    .{ .name = "platform", .src = PLATFORM_JS },
+    .{ .name = "base64", .src = BASE64_JS },
+    .{ .name = "urlsearchparams", .src = URLSEARCHPARAMS_JS },
+    .{ .name = "jwt", .src = JWT_JS },
+    .{ .name = "oauth", .src = OAUTH_JS },
+    .{ .name = "oidc", .src = OIDC_JS },
+    .{ .name = "sessions", .src = SESSIONS_JS },
+    .{ .name = "cron", .src = CRON_JS },
+    .{ .name = "retry", .src = RETRY_JS },
+    .{ .name = "webhook", .src = WEBHOOK_JS },
+    .{ .name = "email", .src = EMAIL_JS },
+    .{ .name = "textcodec", .src = TEXTCODEC_JS },
+};
+
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
     const leaf = c.JS_NewObject(ctx);
     for (ns.fns) |fb| attachFn(ctx, leaf, fb);
@@ -1683,4 +1710,143 @@ pub fn install(
 ) void {
     installStatic(ctx);
     installRequest(ctx, state, request);
+}
+
+// ── Phase A documentation lints (docs/builtin-libs-docs-plan.md) ──
+//
+// Run under `zig build test`. (a) — "no customer code references
+// `_system`" — is a repo-tree scan and lives in
+// scripts/globals_lint.py: a unit test can't robustly walk
+// examples/ + web/ without coupling to cwd/layout. (b) and (c) are
+// hermetic here — they pivot on GLOBALS_FILES + the native-binding
+// arrays in this file, so they need no filesystem and fail at the
+// source the moment a binding is added without its shim/doc.
+
+/// True when the text immediately before `decl_start` (ignoring
+/// trailing whitespace) closes a `/** … */` JSDoc block. Comments
+/// don't nest in JS, so the nearest preceding `/*` is the opener.
+fn lintPrecededByJsdoc(src: []const u8, decl_start: usize) bool {
+    var i = decl_start;
+    while (i > 0) : (i -= 1) {
+        const ch = src[i - 1];
+        if (ch != ' ' and ch != '\t' and ch != '\r' and ch != '\n') break;
+    }
+    if (i < 2 or src[i - 2] != '*' or src[i - 1] != '/') return false;
+    const close = i - 2; // index of '*' in the closing '*/'
+    const opener = std.mem.lastIndexOf(u8, src[0..close], "/*") orelse return false;
+    return opener + 2 < close and src[opener + 2] == '*'; // "/**"
+}
+
+test "lint(c): every native binding has a globals/ shim (Phase A)" {
+    // Documented exceptions (builtin-libs-docs-plan.md): Date.now /
+    // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
+    // determinism overrides); __rove_check_email_rate is an internal
+    // GLOBAL_BUILTIN (called only by globals/email.js).
+    const builtin_exceptions = [_][]const u8{"__rove_check_email_rate"};
+
+    for (STATIC_NAMESPACES) |ns| {
+        // The `_system` holder itself + nested paths
+        // (`_system.platform.root`) are covered by their top-level
+        // shim (globals/platform.js). Pivot on the public segment.
+        if (ns.path.len < 2 or !std.mem.eql(u8, ns.path[0], "_system")) continue;
+        const public = ns.path[1];
+        var found = false;
+        for (GLOBALS_FILES) |g| {
+            if (std.mem.eql(u8, g.name, public)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print(
+                "\nlint(c): native `_system.{s}` has no globals/ shim — add " ++
+                    "globals/{s}.js + build.zig embed + GLOBALS_FILES entry\n",
+                .{ public, public },
+            );
+            return error.MissingGlobalsShim;
+        }
+    }
+
+    for (GLOBAL_BUILTINS) |fb| {
+        var ok = false;
+        for (builtin_exceptions) |e| {
+            if (std.mem.eql(u8, e, fb.name)) {
+                ok = true;
+                break;
+            }
+        }
+        if (ok) continue;
+        for (GLOBALS_FILES) |g| {
+            if (std.mem.eql(u8, g.name, fb.name)) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            std.debug.print(
+                "\nlint(c): GLOBAL_BUILTIN `{s}` is neither a documented " ++
+                    "exception nor shimmed in globals/\n",
+                .{fb.name},
+            );
+            return error.UndocumentedBuiltin;
+        }
+    }
+}
+
+test "lint(b): every globals/*.js export carries a JSDoc block (Phase A)" {
+    // Heuristic, namespace + class level (the plan's accepted scope:
+    // "catches *missing* ones, can't validate signatures"). A
+    // `globalThis.X = Ident;` alias is documented at its definition,
+    // so only `= {` / `= function` definitions and `class` decls are
+    // required to carry a preceding /** … */.
+    for (GLOBALS_FILES) |g| {
+        const src = g.src;
+
+        var idx: usize = 0;
+        while (std.mem.indexOfPos(u8, src, idx, "class ")) |p| {
+            idx = p + 6;
+            if (p + 6 >= src.len or !std.ascii.isUpper(src[p + 6])) continue;
+            // `class` must open a statement: only whitespace between
+            // the line start and it (else it's prose/substring).
+            var only_ws = true;
+            var s = p;
+            while (s > 0 and src[s - 1] != '\n') : (s -= 1) {
+                if (src[s - 1] != ' ' and src[s - 1] != '\t') {
+                    only_ws = false;
+                    break;
+                }
+            }
+            if (!only_ws) continue;
+            if (!lintPrecededByJsdoc(src, p)) {
+                std.debug.print(
+                    "\nlint(b): globals/{s}.js — `class` at offset {d} has " ++
+                        "no preceding /** JSDoc */\n",
+                    .{ g.name, p },
+                );
+                return error.UndocumentedExport;
+            }
+        }
+
+        idx = 0;
+        while (std.mem.indexOfPos(u8, src, idx, "globalThis.")) |p| {
+            idx = p + 11;
+            var j = p + 11;
+            while (j < src.len and (std.ascii.isAlphanumeric(src[j]) or src[j] == '_')) : (j += 1) {}
+            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
+            if (j >= src.len or src[j] != '=') continue;
+            j += 1;
+            while (j < src.len and (src[j] == ' ' or src[j] == '\t')) : (j += 1) {}
+            if (j >= src.len) continue;
+            const is_def = src[j] == '{' or std.mem.startsWith(u8, src[j..], "function");
+            if (!is_def) continue; // alias / re-export
+            if (!lintPrecededByJsdoc(src, p)) {
+                std.debug.print(
+                    "\nlint(b): globals/{s}.js — `globalThis.` export at " ++
+                        "offset {d} has no preceding /** JSDoc */\n",
+                    .{ g.name, p },
+                );
+                return error.UndocumentedExport;
+            }
+        }
+    }
 }
