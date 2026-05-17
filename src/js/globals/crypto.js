@@ -173,5 +173,69 @@
     oidcSign(privPem, signingInput) {
       return sys.oidcSign(privPem, signingInput);
     },
+
+    /**
+     * Generate a raw ECDSA keypair over `secp256k1` or `P-256` — the
+     * two signing curves the AT Protocol (Bluesky) uses for repo
+     * signing keys and `did:plc` rotation keys.
+     *
+     * Distinct from {@link crypto.oidcGenerateKey} (RSA, JOSE) and the
+     * JWK {@link crypto.verifyEcdsa} path (JOSE, DER-tolerant): this
+     * surface is raw bytes, SHA-256, compact `R‖S` signatures, with
+     * **low-S enforced** — the malleability rule the atproto data
+     * model requires. Multibase/multicodec `did:key` encoding of the
+     * public key is pure JS (done in the `atproto` library).
+     *
+     * @param {string} curve - `"secp256k1"` | `"P-256"`.
+     * @returns {{privateKey:Uint8Array, publicKey:Uint8Array}}
+     *   `privateKey` is the 32-byte scalar; `publicKey` is the
+     *   33-byte compressed SEC1 point (`0x02`/`0x03 ‖ X`).
+     *
+     * @example
+     * const { privateKey, publicKey } = crypto.ecdsaGenerateKey("secp256k1");
+     * kv.set("repo/signing-key", base64url.encode(privateKey));
+     */
+    ecdsaGenerateKey(curve) {
+      return sys.ecdsaGenerateKey(curve);
+    },
+
+    /**
+     * ECDSA-sign `data` (SHA-256 digest) with a raw private scalar
+     * from {@link crypto.ecdsaGenerateKey}. The signature is the
+     * 64-byte compact `R‖S` form atproto stores in signed commits,
+     * always low-S normalized.
+     *
+     * @param {string} curve - `"secp256k1"` | `"P-256"`.
+     * @param {Uint8Array} privateKey - 32-byte scalar.
+     * @param {Uint8Array} data - Message bytes (e.g. the dag-cbor
+     *   encoding of an unsigned commit).
+     * @returns {Uint8Array} 64-byte raw `R‖S` signature.
+     *
+     * @example
+     * const sig = crypto.ecdsaSign("secp256k1", priv, dagCborBytes);
+     */
+    ecdsaSign(curve, privateKey, data) {
+      return sys.ecdsaSign(curve, privateKey, data);
+    },
+
+    /**
+     * Verify a 64-byte compact ECDSA signature (SHA-256). A high-S
+     * signature returns `false` even if it is mathematically valid —
+     * atproto rejects malleable signatures, so this primitive enforces
+     * the rule rather than leaving it to callers.
+     *
+     * @param {string} curve - `"secp256k1"` | `"P-256"`.
+     * @param {Uint8Array} publicKey - SEC1 point: 33-byte compressed
+     *   or 65-byte uncompressed.
+     * @param {Uint8Array} data - Message bytes that were signed.
+     * @param {Uint8Array} sig - 64-byte raw `R‖S` signature.
+     * @returns {boolean} `true` iff valid and low-S.
+     *
+     * @example
+     * const ok = crypto.ecdsaVerify("secp256k1", pub, commitBytes, sig);
+     */
+    ecdsaVerify(curve, publicKey, data, sig) {
+      return sys.ecdsaVerify(curve, publicKey, data, sig);
+    },
   };
 })();

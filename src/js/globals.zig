@@ -1391,6 +1391,13 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         // parses.
         .{ .name = "oidcGenerateKey", .cfunc = crypto_b.jsCryptoOidcGenerateKey, .argc = 0 },
         .{ .name = "oidcSign",        .cfunc = crypto_b.jsCryptoOidcSign,        .argc = 2 },
+        // Raw-key ECDSA over secp256k1 / P-256: keygen + sign + verify
+        // with SHA-256, 64-byte compact R||S, low-S enforced. The
+        // primitive atproto.js builds did:key/did:plc + signed repo
+        // commits on (separate from the JOSE verifyEcdsa path above).
+        .{ .name = "ecdsaGenerateKey", .cfunc = crypto_b.jsCryptoEcdsaGenerateKey, .argc = 1 },
+        .{ .name = "ecdsaSign",        .cfunc = crypto_b.jsCryptoEcdsaSign,        .argc = 3 },
+        .{ .name = "ecdsaVerify",      .cfunc = crypto_b.jsCryptoEcdsaVerify,      .argc = 4 },
     } },
     // http.send / http.cancel — the platform's outbound HTTP
     // primitive (docs/http-send-plan.md). send appends a

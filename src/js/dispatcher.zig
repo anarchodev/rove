@@ -4337,6 +4337,32 @@ test "dispatch: crypto.verifyEcdsa rejects wrong sig length / unsupported curve"
     try testing.expectEqualStrings("threw,threw,threw", resp.body);
 }
 
+test "dispatch: crypto.ecdsa keygen→sign→verify roundtrip (secp256k1)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Exercises the full JS boundary: crypto.js shim → _system.crypto
+    // → OpenSSL, on atproto's primary curve. Proves wiring + that a
+    // fresh signature is low-S (ecdsaVerify rejects high-S).
+    var resp = try runOne(&d, kv,
+        \\const { privateKey, publicKey } = crypto.ecdsaGenerateKey("secp256k1");
+        \\const msg = new TextEncoder().encode("atproto signed commit");
+        \\const sig = crypto.ecdsaSign("secp256k1", privateKey, msg);
+        \\const ok = crypto.ecdsaVerify("secp256k1", publicKey, msg, sig);
+        \\const bad = crypto.ecdsaVerify("secp256k1", publicKey,
+        \\  new TextEncoder().encode("tampered"), sig);
+        \\return `${privateKey.length},${publicKey.length},${sig.length},${ok},${bad}`;
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("32,33,64,true,false", resp.body);
+}
+
 test "dispatch: jwt.decode parses valid token" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
