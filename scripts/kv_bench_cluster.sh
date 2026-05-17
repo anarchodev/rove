@@ -113,12 +113,12 @@ CURL=(curl -sS --cacert "$CACERT" "${RESOLVE[@]}")
 discover_leader "$ADMIN_HOST" "$TOKEN" || exit 1
 echo "leader: node $LEADER_IDX at $LEADER_HTTP"
 
-# files-server-standalone — needed for admin/replay deploys to land
-# on the leader (matches what every cluster smoke does). We don't
-# benchmark through admin; this is just to keep the cluster in a
-# representative state.
-FILES_ADDR="${FILES_ADDR:-127.0.0.1:8278}"
-spawn_files_server "$FILES_ADDR" "${DATA_DIRS[$LEADER_IDX]}" /tmp/kv-bench-cs.out "$ADMIN_ORIGIN" "$ADMIN_ORIGIN" || exit 1
+# No files-server: tenants are seeded directly into app.db + S3 by
+# seed_all_dirs above, so deployments are already live. The
+# files-server is only for runtime admin/replay deploys (never
+# benchmarked here), and its bootstrap POSTs to https://127.0.0.1
+# which the dev cert (no IP SAN) rejects — it would fail the whole
+# run. Matches kv_read_profile.sh / kv_read_timeseries.sh.
 
 # Verify a bench tenant is reachable before kicking off load. h2load
 # floods open connections; if hot.rewindjsapp.localhost isn't dispatched yet we'd

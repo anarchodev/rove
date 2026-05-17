@@ -835,6 +835,18 @@ pub const KvStore = struct {
             leaf.rollback();
         }
 
+        /// Open a batch-scoped LMDB read view: point reads then reuse
+        /// one parked MDB_RDONLY txn instead of begin/abort per `get`
+        /// (the 31%-CPU `mdb_txn_begin` memset). Best effort — a
+        /// failure only forgoes the optimization (reads fall back to
+        /// one-shot read txns); it must never fail the batch. kvexp
+        /// tears the view down automatically on commit/rollback, so
+        /// there is no matching end call here.
+        pub fn beginReadView(self: *TrackedTxn) void {
+            const t = self.top orelse return;
+            t.beginReadView() catch {};
+        }
+
         pub fn commit(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
             // Any open savepoints close first (kvexp errors with

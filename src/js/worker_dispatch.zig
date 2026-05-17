@@ -1697,6 +1697,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 continue;
             };
             txn = new_txn;
+            // Batch-scoped LMDB read view: every point read in this
+            // batch reuses one parked MDB_RDONLY txn instead of
+            // begin/abort per `get`. Best effort; torn down by kvexp
+            // on the batch's commit/rollback in finalizeBatch.
+            new_txn.beginReadView();
             anchor = scope_inst;
         }
 
