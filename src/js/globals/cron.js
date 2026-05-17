@@ -23,14 +23,33 @@
 
 const NS_PER_MS = 1_000_000n;
 
+/**
+ * Time helpers that convert human inputs (durations, daily/weekly
+ * slots, crontab strings) into the BigInt nanoseconds-since-epoch
+ * that `http.send({fire_at_ns})` expects. All slot math is UTC.
+ *
+ * @namespace cron
+ * @example
+ * // Daily 03:00 UTC cleanup, self-rescheduling.
+ * http.send({ url, fire_at_ns: cron.dailyAt(3, 0) });
+ * @example
+ * http.send({ url, fire_at_ns: cron.fromNow("30m") }); // in 30 min
+ * http.send({ url, fire_at_ns: cron.next("0 3 * * *") }); // daily 3am
+ */
 globalThis.cron = {
-  /// Coerce a number / string / Date into BigInt ns-since-epoch.
-  /// Numbers/Dates are taken as ms-since-epoch. Strings can be:
-  ///   - ISO-8601 ("2026-06-01T03:00:00Z")
-  ///   - duration suffix ("30s", "5m", "2h", "1d", "1w") — relative
-  ///     to `now()` at call time.
-  ///   - already-parsed Date.
-  /// Throws TypeError on unrecognized input.
+  /**
+   * Coerce a time input to BigInt nanoseconds-since-epoch.
+   *
+   * @param {bigint|number|Date|string|null} input - BigInt (ns,
+   *   passed through); number/Date (ms-since-epoch); string
+   *   (duration suffix like `"30s"`/`"5m"`/`"2h"`/`"1d"`/`"1w"`
+   *   relative to now, or ISO-8601); `null` → `0n` (fire ASAP).
+   * @returns {bigint} Nanoseconds since epoch.
+   * @throws {TypeError} On unrecognized input.
+   * @example
+   * cron.toFireAtNs("2h");                     // 2 hours from now
+   * cron.toFireAtNs("2026-06-01T03:00:00Z");   // absolute
+   */
   toFireAtNs(input) {
     if (input == null) return 0n;
     if (typeof input === "bigint") return input;
@@ -45,24 +64,47 @@ globalThis.cron = {
     throw new TypeError("cron.toFireAtNs: unrecognized time input");
   },
 
-  /// "5m" / "30s" / "2h" / "1d" / "1w" → milliseconds. Returns null
-  /// when the string isn't a duration (caller falls back to ISO
-  /// parsing).
+  /**
+   * Parse a duration string to milliseconds.
+   *
+   * @param {string} s - `<n><unit>`, unit ∈ `s|m|h|d|w`
+   *   (e.g. `"5m"`, `"1w"`).
+   * @returns {number|null} Milliseconds, or `null` if `s` isn't a
+   *   duration (callers fall back to ISO parsing).
+   * @example
+   * cron.parseDuration("2h"); // 7200000
+   */
   parseDuration(s) {
     return _parseDuration(s);
   },
 
-  /// `Date.now() + parseDuration(s)` as fire_at_ns. Convenience for
-  /// the common case.
+  /**
+   * `now + parseDuration(s)` as a fire time.
+   *
+   * @param {string} s - Duration string (see
+   *   {@link cron.parseDuration}).
+   * @returns {bigint} Nanoseconds since epoch.
+   * @throws {TypeError} If `s` isn't a duration.
+   * @example
+   * http.send({ url, fire_at_ns: cron.fromNow("30m") });
+   */
   fromNow(s) {
     const dur_ms = _parseDuration(s);
     if (dur_ms == null) throw new TypeError("cron.fromNow: not a duration: " + s);
     return BigInt(Date.now() + dur_ms) * NS_PER_MS;
   },
 
-  /// Next occurrence of `hour:minute` (UTC). If today's slot has
-  /// already passed, returns tomorrow's. Use `cron.dailyAt(3, 0)` for
-  /// "next 3am UTC".
+  /**
+   * Next occurrence of `hour:minute` UTC; tomorrow's slot if today's
+   * has passed.
+   *
+   * @param {number} hour - 0–23.
+   * @param {number} minute - 0–59.
+   * @returns {bigint} Nanoseconds since epoch.
+   * @throws {RangeError} If `hour`/`minute` are out of range.
+   * @example
+   * cron.dailyAt(3, 0); // next 03:00 UTC
+   */
   dailyAt(hour, minute) {
     if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
       throw new RangeError("cron.dailyAt: hour must be 0..23");
@@ -81,8 +123,17 @@ globalThis.cron = {
     return BigInt(target.getTime()) * NS_PER_MS;
   },
 
-  /// Next occurrence of `dayOfWeek` at `hour:minute` (UTC).
-  /// dayOfWeek: 0=Sunday, 1=Monday, ..., 6=Saturday.
+  /**
+   * Next occurrence of `dayOfWeek` at `hour:minute` UTC.
+   *
+   * @param {number} dayOfWeek - 0=Sunday … 6=Saturday.
+   * @param {number} hour - 0–23.
+   * @param {number} minute - 0–59.
+   * @returns {bigint} Nanoseconds since epoch.
+   * @throws {RangeError} If `dayOfWeek` is out of range.
+   * @example
+   * cron.weeklyAt(1, 9, 0); // next Monday 09:00 UTC
+   */
   weeklyAt(dayOfWeek, hour, minute) {
     if (!Number.isInteger(dayOfWeek) || dayOfWeek < 0 || dayOfWeek > 6) {
       throw new RangeError("cron.weeklyAt: dayOfWeek must be 0..6");
@@ -98,7 +149,13 @@ globalThis.cron = {
     return BigInt(target.getTime()) * NS_PER_MS;
   },
 
-  /// Top of the next hour.
+  /**
+   * Top of the next hour (UTC).
+   *
+   * @returns {bigint} Nanoseconds since epoch.
+   * @example
+   * http.send({ url, fire_at_ns: cron.hourly() });
+   */
   hourly() {
     const now = new Date();
     const next = new Date(now.getTime());
@@ -107,20 +164,26 @@ globalThis.cron = {
     return BigInt(next.getTime()) * NS_PER_MS;
   },
 
-  /// Compute the next occurrence of a 5-field crontab expression
-  /// (minute hour day-of-month month day-of-week, all UTC). Each
-  /// field accepts:
-  ///   - `*`        any value
-  ///   - `N`        a specific value
-  ///   - `N,M,...`  list of specific values
-  ///   - `N-M`      inclusive range
-  ///   - `*/N`      step
-  /// Examples:
-  ///   "0 3 * * *"    → daily at 03:00
-  ///   "*/15 * * * *" → every 15 minutes
-  ///   "0 9 * * 1-5"  → weekdays 09:00
-  ///
-  /// Returns BigInt ns. Throws on unparseable expression.
+  /**
+   * Next match of a 5-field crontab expression (UTC), at minute
+   * granularity. Day-of-month / day-of-week follow Vixie cron: when
+   * both are restricted, a match on *either* counts.
+   *
+   * Fields: `minute hour day-of-month month day-of-week`. Each
+   * accepts `*` (any), `N`, `N,M,...` (list), `N-M` (range), or a
+   * trailing `/N` step on `*` or a range (e.g. a star then slash-15
+   * in the minute field = every 15 minutes).
+   *
+   * @param {string} expr - e.g. `"0 3 * * *"` (daily 03:00) or
+   *   `"0 9 * * 1-5"` (weekdays 09:00).
+   * @param {number} [now_ms] - Base time (ms since epoch); defaults
+   *   to `Date.now()`. Mainly for testing.
+   * @returns {bigint} Nanoseconds since epoch of the next match.
+   * @throws {TypeError} On a malformed expression/field.
+   * @throws {Error} If no match within a 4-year window.
+   * @example
+   * http.send({ url, fire_at_ns: cron.next("0 3 * * *") });
+   */
   next(expr, now_ms) {
     const fields = String(expr).trim().split(/\s+/);
     if (fields.length !== 5) {

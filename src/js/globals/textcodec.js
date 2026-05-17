@@ -1,6 +1,26 @@
+// UTF-8 `TextEncoder` / `TextDecoder` polyfills (QuickJS-ng ships
+// neither). WHATWG Encoding-standard shaped; UTF-8 only. Used by
+// base64url / URLSearchParams for byte-accurate handling.
+
 (function () {
+  /**
+   * Encodes a JS string to UTF-8 bytes. WHATWG `TextEncoder` subset
+   * (UTF-8 only).
+   *
+   * @class TextEncoder
+   */
   class TextEncoder {
+    /** @returns {string} Always `"utf-8"`. */
     get encoding() { return "utf-8"; }
+    /**
+     * Encode a string as UTF-8.
+     *
+     * @param {string} input - Coerced to a string; nullish → `""`.
+     * @returns {Uint8Array} The UTF-8 bytes.
+     *
+     * @example
+     * const bytes = new TextEncoder().encode("héllo"); // 6 bytes
+     */
     encode(input) {
       const s = String(input ?? "");
       const out = [];
@@ -31,7 +51,20 @@
       return new Uint8Array(out);
     }
   }
+  /**
+   * Decodes UTF-8 bytes to a JS string. WHATWG `TextDecoder` subset
+   * (UTF-8 only).
+   *
+   * @class TextDecoder
+   */
   class TextDecoder {
+    /**
+     * @param {string} [label="utf-8"] - Encoding label. Only
+     *   `"utf-8"`/`"utf8"` accepted; anything else throws
+     *   `RangeError`.
+     * @param {{fatal?: boolean}} [options] - `fatal: true` throws
+     *   `TypeError` on malformed UTF-8 instead of substituting U+FFFD.
+     */
     constructor(label, options) {
       const enc = String(label ?? "utf-8").toLowerCase();
       if (enc !== "utf-8" && enc !== "utf8") {
@@ -39,7 +72,21 @@
       }
       this._fatal = !!(options && options.fatal);
     }
+    /** @returns {string} Always `"utf-8"`. */
     get encoding() { return "utf-8"; }
+    /**
+     * Decode UTF-8 bytes to a string.
+     *
+     * @param {Uint8Array|ArrayBuffer|ArrayBufferView} [buffer] -
+     *   Bytes to decode; nullish → `""`. Non-BufferSource →
+     *   `TypeError`.
+     * @returns {string} The decoded string. Malformed sequences
+     *   become U+FFFD unless `fatal` was set.
+     *
+     * @example
+     * const s = new TextDecoder().decode(new Uint8Array([104, 105]));
+     * // "hi"
+     */
     decode(buffer) {
       if (buffer === undefined || buffer === null) return "";
       let bytes;

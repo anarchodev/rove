@@ -118,19 +118,53 @@ function _bytesToString(bytes) {
   return s;
 }
 
+/**
+ * Encode a binary string to padded standard base64 (browser `btoa`).
+ *
+ * @function btoa
+ * @param {string} s - Binary string; each char is one byte
+ *   (0–255). Non-Latin-1 chars throw.
+ * @returns {string} Standard-alphabet base64 with `=` padding.
+ * @example
+ * btoa("hello"); // "aGVsbG8="
+ */
 globalThis.btoa = function (s) {
   if (typeof s !== "string") s = String(s);
   return _encodeBase(_stringToBytes(s), STD_ALPHABET, true);
 };
 
+/**
+ * Decode standard base64 to a binary string (browser `atob`).
+ * Tolerates padding and whitespace.
+ *
+ * @function atob
+ * @param {string} s - Standard-alphabet base64.
+ * @returns {string} Binary string (one char per byte). Use
+ *   `TextDecoder` for UTF-8 interpretation. Invalid input throws.
+ * @example
+ * atob("aGVsbG8="); // "hello"
+ */
 globalThis.atob = function (s) {
   if (typeof s !== "string") s = String(s);
   return _bytesToString(_decodeBase(s, STD_LOOKUP));
 };
 
+/**
+ * URL-safe base64 (no padding) over bytes — the shape PKCE / JWT
+ * verification needs.
+ *
+ * @namespace base64url
+ */
 globalThis.base64url = {
-  // Encode Uint8Array (or array-like of bytes) as URL-safe base64,
-  // no padding. Strings are interpreted as UTF-8 bytes via TextEncoder.
+  /**
+   * Encode bytes as URL-safe base64, no padding.
+   *
+   * @param {Uint8Array|string|number[]} input - Bytes; a string is
+   *   first UTF-8 encoded.
+   * @returns {string} URL-safe base64 (`-`/`_`, no `=`).
+   * @example
+   * base64url.encode(crypto.randomBytes(32)); // PKCE verifier
+   */
   encode(input) {
     let bytes;
     if (typeof input === "string") {
@@ -143,16 +177,38 @@ globalThis.base64url = {
     return _encodeBase(bytes, URL_ALPHABET, false);
   },
 
-  // Decode URL-safe base64 (with or without padding) to Uint8Array.
-  // Tolerates the standard alphabet too.
+  /**
+   * Decode URL-safe base64 to bytes. Tolerates padding and the
+   * standard (`+`/`/`) alphabet too (liberal in what it accepts).
+   *
+   * @param {string} s - base64url (or standard) text.
+   * @returns {Uint8Array} Decoded bytes. Invalid input throws.
+   * @example
+   * const sig = base64url.decode(jwt.split(".")[2]);
+   */
   decode(s) {
     if (typeof s !== "string") s = String(s);
     return _decodeBase(s, ANY_LOOKUP);
   },
 };
 
+/**
+ * Hex string ⇄ bytes. Bridges the platform's hex-returning crypto
+ * APIs to the byte-oriented base64url surface — e.g.
+ * `base64url.encode(hex.decode(crypto.sha256(x)))` is a PKCE
+ * code_challenge in two calls.
+ *
+ * @namespace hex
+ */
 globalThis.hex = {
-  // Uint8Array → lowercase hex string.
+  /**
+   * Encode bytes as a lowercase hex string.
+   *
+   * @param {Uint8Array|number[]} bytes - Bytes to encode.
+   * @returns {string} Lowercase hex, 2 chars per byte.
+   * @example
+   * hex.encode(new Uint8Array([255, 0])); // "ff00"
+   */
   encode(bytes) {
     if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
     const tab = "0123456789abcdef";
@@ -164,8 +220,15 @@ globalThis.hex = {
     return out;
   },
 
-  // Hex string → Uint8Array. Accepts upper or lower case; throws on
-  // odd-length input or non-hex chars.
+  /**
+   * Decode a hex string to bytes. Accepts upper or lower case.
+   *
+   * @param {string} s - Even-length hex string.
+   * @returns {Uint8Array} Decoded bytes. Odd length or non-hex
+   *   chars throw.
+   * @example
+   * hex.decode("ff00"); // Uint8Array([255, 0])
+   */
   decode(s) {
     if (typeof s !== "string") throw new TypeError("hex.decode: input must be a string");
     if ((s.length & 1) !== 0) throw new Error("hex.decode: odd-length input");
