@@ -41,7 +41,25 @@ function _s256(verifier) {
   return base64url.encode(hex.decode(crypto.sha256(verifier)));
 }
 
+/**
+ * An OIDC authorization-code + PKCE **identity provider** (the
+ * issuance analog of {@link oauth}). The platform's own `__auth__`
+ * IdP runs this exact class; customers can run their own. The issuer
+ * and all endpoints are derived from `request.host` — no compiled-in
+ * domain. v1: discovery, JWKS, authorization-code, mandatory PKCE
+ * (S256), RS256 id/access/refresh; no implicit flow, consent screen,
+ * client secrets, or userinfo. Obtain via {@link oidc.provider}.
+ *
+ * @class OIDCProvider
+ */
 class OIDCProvider {
+  /**
+   * @param {object} config - Client registry. `clients` is an array
+   *   of `{client_id, redirect_uris}`; `login_path` is the IdP's own
+   *   login UI route. kv-layout / TTL / key-rotation-window keys are
+   *   optional and default sensibly.
+   * @param {string} name - Config name; namespaces the kv key paths.
+   */
   constructor(config, name) {
     this.cfg = {
       clients: Array.isArray(config.clients) ? config.clients : [],
@@ -205,6 +223,15 @@ class OIDCProvider {
   // kv key (last-write-wins) ⇒ a concurrent leadership double-fire
   // is safe with no header dedupe (§4.6 grounded correction). kv.set
   // + the http.send re-arm commit atomically (http-send-plan §6).
+  /**
+   * Scheduled key-rotation tick (§4.6). Reached only via the
+   * in-cluster `http.send` self-fire routed through {@link
+   * OIDCProvider#handle}; not a customer entry point. Deadline-gated
+   * and last-write-wins, so a double-fire is safe.
+   *
+   * @internal
+   * @returns {string} JSON status body.
+   */
   handleRotate() {
     const keyset = this._keyset(); // genesis if somehow absent
     const now = Date.now();
@@ -233,6 +260,19 @@ class OIDCProvider {
     this._armRotation(now + this.cfg.rotation_period_ms);
   }
 
+  /**
+   * The IdP front controller. Routes the current request to the
+   * standard OIDC endpoints — `/.well-known/openid-configuration`,
+   * `/.well-known/jwks.json`, `/authorize`, `/token` — plus the
+   * internal key-rotation tick. Wire it as your IdP handler's
+   * default export; sets the response and returns its body.
+   *
+   * @returns {string|null} The response body (or `null` for a
+   *   redirect set on `response`); 404 text for unknown paths.
+   * @example
+   * // web/auth/index.mjs
+   * export default () => oidc.provider().handle();
+   */
   handle() {
     const path = (request.path || "").split("?")[0];
     const m = request.method;
@@ -524,7 +564,24 @@ class OIDCProvider {
 // `issuer`/`redirect_uri` are config, NOT compiled-in literals — §0
 // is about no *platform* literal in library code; per-deploy config
 // is the §0-compliant carrier (same as oidc.provider's issuer host).
+/**
+ * An OIDC **relying party** (client) — the consumer side of
+ * {@link OIDCProvider}. Drives login/callback/poll, verifies the
+ * id_token against the IdP JWKS, and mints a local `_rp/sess/{sid}`
+ * session. Obtain via {@link oidc.rp}; the platform's admin
+ * dashboard is itself an RP built on this class.
+ *
+ * @class OIDCRelyingParty
+ */
 class OIDCRelyingParty {
+  /**
+   * @param {object} config - Required: `issuer`, `client_id`,
+   *   `redirect_uri`. Optional: `post_login` (default `/`),
+   *   `operator_prefix` (empty ⇒ `is_root` always false), kv-path /
+   *   TTL / `leeway_s` overrides.
+   * @param {string} name - Config name; namespaces the kv key paths.
+   * @throws {TypeError} Missing `issuer`/`client_id`/`redirect_uri`.
+   */
   constructor(config, name) {
     if (!config.issuer || !config.client_id || !config.redirect_uri) {
       throw new TypeError(
@@ -560,9 +617,18 @@ class OIDCRelyingParty {
     return this.cfg.post_login;
   }
 
-  // GET /_rp/login — capture the platform sid HERE (real browser
-  // request; the on_result completion has none), stash PKCE state,
-  // 302 to the IdP /authorize.
+  /**
+   * `GET /_rp/login` handler. Captures the platform sid (must be a
+   * real browser request), stashes single-use PKCE state, and 302s
+   * to the IdP `/authorize`. Honors a same-origin `?return_to=`
+   * path (open-redirect safe).
+   *
+   * @returns {null} (the redirect is set on `response`); 400 text
+   *   when there is no session context.
+   * @example
+   * // _rp/login/index.mjs
+   * export default () => oidc.rp("default").beginLogin();
+   */
   beginLogin() {
     const sid = request.session && request.session.id;
     if (!sid) {
@@ -613,8 +679,18 @@ class OIDCRelyingParty {
       ".catch(function(){setTimeout(p,1200)})}p();</script>";
   }
 
-  // GET /_rp/callback?code&state — validate+consume state, kick the
-  // async token exchange, park the browser on the poll page.
+  /**
+   * `GET /_rp/callback?code&state` handler. Validates and
+   * single-use-consumes the state, fires the async token exchange
+   * (completed by {@link OIDCRelyingParty#completeToken}), and parks
+   * the browser on a self-polling "Signing in…" page.
+   *
+   * @returns {string} The interim HTML page, or 400 error text on
+   *   bad/expired/used state or a provider error.
+   * @example
+   * // _rp/callback/index.mjs
+   * export default () => oidc.rp("default").handleCallback();
+   */
   handleCallback() {
     const q = new URLSearchParams(request.query || "");
     const state = q.get("state");
@@ -667,10 +743,19 @@ class OIDCRelyingParty {
     try { return JSON.parse(request.body || "{}"); } catch (_) { return {}; }
   }
 
-  // on_result of the /token send. We have the id_token but need the
-  // IdP JWKS to verify it. Verify synchronously if the signing kid
-  // is already cached; otherwise refetch JWKS (the §4.6-mandated
-  // controlled-RP unknown-kid refetch) and finish in completeJwks.
+  /**
+   * `on_result` module for the `/token` exchange. Verifies the
+   * id_token against cached JWKS if the signing `kid` is known;
+   * otherwise refetches JWKS and defers to {@link
+   * OIDCRelyingParty#completeJwks}. Runs in a background callback —
+   * no browser response.
+   *
+   * @returns {string} A diagnostic status string (callback responses
+   *   are dropped but captured in logs/tape).
+   * @example
+   * // _rp/complete.mjs
+   * export default () => oidc.rp("default").completeToken();
+   */
   completeToken() {
     const ev = this._event();
     const ctx = ev.context || {};
@@ -709,7 +794,16 @@ class OIDCRelyingParty {
     return "fetching jwks";
   }
 
-  // on_result of the JWKS fetch: cache it, then verify + mint.
+  /**
+   * `on_result` module for the JWKS refetch. Caches the keys, then
+   * verifies the id_token and mints the session. Background
+   * callback — no browser response.
+   *
+   * @returns {string} A diagnostic status string.
+   * @example
+   * // _rp/jwks.mjs
+   * export default () => oidc.rp("default").completeJwks();
+   */
   completeJwks() {
     const ev = this._event();
     const ctx = ev.context || {};
@@ -760,8 +854,17 @@ class OIDCRelyingParty {
     return "ok";
   }
 
-  // Called from `_middlewares/index.mjs`: returns the auth payload
-  // for this request's sid, or null. Expired rows are swept.
+  /**
+   * Resolve the authenticated subject for this request's sid.
+   * Typically called from an auth middleware. Sweeps expired rows.
+   *
+   * @returns {{sub:string, is_root:boolean}|null} The session
+   *   payload, or `null` if unauthenticated/expired.
+   * @example
+   * // _middlewares/index.mjs
+   * const auth = oidc.rp("default").guard();
+   * if (!auth) { response.status = 401; return { error: "unauth" }; }
+   */
   guard() {
     const sid = request.session && request.session.id;
     if (!sid) return null;
@@ -775,7 +878,15 @@ class OIDCRelyingParty {
     return { sub: s.sub, is_root: !!s.is_root };
   }
 
-  // GET /_rp/poll — the poll page asks "am I signed in yet?".
+  /**
+   * `GET /_rp/poll` handler — the "Signing in…" page asks whether
+   * the background completion has minted the session yet.
+   *
+   * @returns {string} JSON `{authed: boolean}`.
+   * @example
+   * // _rp/poll/index.mjs
+   * export default () => oidc.rp("default").pollStatus();
+   */
   pollStatus() {
     const a = this.guard();
     response.status = 200;
@@ -783,8 +894,16 @@ class OIDCRelyingParty {
     return JSON.stringify({ authed: !!a });
   }
 
-  // POST /_rp/logout — drop this sid's RP session. The IdP session
-  // is the IdP's own concern (v1: no front/back-channel logout, §4.5).
+  /**
+   * `POST /_rp/logout` handler — drop this sid's RP session. The IdP
+   * session is the IdP's own concern (v1: no front/back-channel
+   * logout).
+   *
+   * @returns {string} JSON `{ok: true}`.
+   * @example
+   * // _rp/logout/index.mjs
+   * export default () => oidc.rp("default").logout();
+   */
   logout() {
     const sid = request.session && request.session.id;
     if (sid) kv.delete(this.cfg.sess_path + "/" + sid);
@@ -794,21 +913,31 @@ class OIDCRelyingParty {
   }
 }
 
+/**
+ * OIDC provider (IdP) + relying-party (client) helpers. The same
+ * library the platform's own `__auth__` IdP and admin RP run;
+ * customers can run either side. All issuer/endpoint URLs are
+ * host-relative — no compiled-in domain.
+ *
+ * @namespace oidc
+ */
 globalThis.oidc = {
-  // oidc.provider("name") → reads `_oidc/config/name`
-  // oidc.provider()       → `_oidc/config/default`
-  // oidc.provider({...})  → inline config object
-  //
-  // The client registry lives at `_oidc/config/{name}` — a normal
-  // (non-reserved) kv key, NOT `_config/oidc/*`. Grounded reasons
-  // (auth-domain-plan §4.7 correction): `_config/` is a
-  // platform-reserved prefix handlers/admin can't write, and its
-  // only writer (`config_mirror` via `loop46 seed`) is not wired
-  // into the files-server release/loader path anyway (same gap
-  // affects oauth.js). And a client registry is *operational* data —
-  // operators add/remove RP clients without a redeploy — so an
-  // admin-managed kv key is the more correct model than a
-  // deploy-mirrored static file.
+  /**
+   * Resolve a client registry and return an {@link OIDCProvider}.
+   * The registry is *operational* data — operators add/remove RP
+   * clients without a redeploy — so it lives at the admin-managed
+   * kv key `_oidc/config/{name}` (which wins), falling back to the
+   * per-deploy template `_config/oidc/{name}`.
+   *
+   * @param {string|object} [arg] - A registry name (default
+   *   `"default"`) or an inline config object.
+   * @returns {OIDCProvider}
+   * @throws {Error} No registry at either key (register via admin
+   *   `setKv` `X-Rove-Scope: __auth__`, or deploy the template).
+   * @throws {TypeError} `arg` is neither string nor object.
+   * @example
+   * export default () => oidc.provider().handle();
+   */
   provider(arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
@@ -837,9 +966,20 @@ globalThis.oidc = {
     throw new TypeError("oidc.provider: expected string name or config object");
   },
 
-  // oidc.rp("name") → reads `_oidc/rp/name`  (the client analog of
-  // oidc.provider). oidc.rp() → `_oidc/rp/default`. oidc.rp({...}) →
-  // inline config. See OIDCRelyingParty for the (grounded) flow.
+  /**
+   * Resolve an RP config and return an {@link OIDCRelyingParty} —
+   * the client analog of {@link oidc.provider}. Config lives at the
+   * kv key `_oidc/rp/{name}`.
+   *
+   * @param {string|object} [arg] - An RP config name (default
+   *   `"default"`) or an inline config object.
+   * @returns {OIDCRelyingParty}
+   * @throws {Error} No config at `_oidc/rp/{name}` (seed at
+   *   bootstrap, or set via admin `setKv`).
+   * @throws {TypeError} `arg` is neither string nor object.
+   * @example
+   * const auth = oidc.rp("default").guard();
+   */
   rp(arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
