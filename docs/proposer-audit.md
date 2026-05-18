@@ -433,3 +433,79 @@ mechanism justified). It is blocked on a **design step**
 **product call** (gate vs. formalise at-least-once). Neither is a
 mechanical port; both are tracked here rather than implemented
 speculatively.
+
+---
+
+## Addendum 3 — idiom-3 (`platform.root.*`) scoping + the Option A/B fork, 2026-05-17
+
+> Scoping pass after idiom-0 shipped and the undo-machinery
+> cleanup. Read-only analysis; identifies the decision, does not
+> implement it (the correct fix is the documented Option-A
+> refactor, which the discipline says to do deliberately, not at
+> the tail of a long session).
+
+### The site
+
+`worker_dispatch.zig:2031-2040`. An admin JS handler's
+`platform.root.set/delete` calls land **locally on `root.db`**
+inside the JS callbacks during handler execution; after the
+handler returns, `dispatchOnce` does
+`_ = raft_propose.proposeRootWriteSet(worker, root_ws) catch …warn
+"leader wrote, followers may diverge"` — **fire-and-forget, seq
+discarded**. The request's HTTP response then proceeds through the
+normal `finalizeBatch` path, parked on the handler's **own batch
+seq** (the tenant app.db writeset) — or, if the handler did no
+app.db writes (a root-only admin op), released **immediately**
+(read-only batch). Either way the response is never gated on the
+`root_writeset` propose seq.
+
+### The escaped effect
+
+The admin client is told "platform config updated" (2xx) while
+the `root.db` writeset may never reach quorum. Per the kvexp
+volatility finding this is **not on-disk divergence** (a
+pre-quorum crash loses the local `root.put`, no `__root__.db`
+divergence — the warn string "followers may diverge" is itself
+stale pre-kvexp framing); it is the **caller-response** escaped
+effect, same class as idiom-0 / admin-kv / the idiom-2
+trampolines. The parkable, justified entity is the **admin
+request itself** (it is a real H2 entity in the dispatch
+lifecycle — unlike the ACME case, idiom-3's other half, which has
+no entity; see below).
+
+### The fork
+
+| | **Option A — envelope-merge (the documented destination)** | **Option B — secondary-seq park** |
+|---|---|---|
+| Shape | The per-request root writeset rides the **same atomic raft entry** as the batch (a type-2 inner in the existing type-7 multi — `apply` already routes inners per-target). One seq, parked by the existing `finalizeBatch` machinery verbatim. Removes the fire-and-forget entirely. | Capture the `proposeRootWriteSet` seq; gate the request's response on `max(batch_seq, root_seq)`. |
+| Correctness | Atomic admin op (all-or-nothing), single gate, **zero** `drainRaftPending` change. | Correct, but needs a second seq on `RaftWait` + drain logic to wait on both. |
+| Blast radius | Touches batch **accumulation** — per-request root writesets must accumulate into a batch-level root writeset parallel to the app.db writeset (multiple admin requests per batch). This *is* the "one-request-lifecycle" / envelope-merge refactor `unified-effect-gating.md` §4 calls Option A. | Touches the **core `RaftWait`/`drainRaftPending` park struct** every H2 request depends on — the "dragon" §7 warns against (Stage-5-class). |
+| Verdict | **Recommended.** Strictly better correctness and removes code, but it is a *deliberate* refactor, not a session-tail patch. Subsumes idiom-2's caller-seq-threading and idiom-2-scopeKv for free (same accumulate-into-the-batch mechanism). | Smaller-looking but modifies the most sensitive shared machinery for a narrower win; not recommended as the primary path. |
+
+### ACME (idiom-3's other half) is a different animal
+
+`acme.zig` (the cert `cert/{host}` propose) runs on a
+**background ACME thread with no request entity** — there is no
+caller response to park. It is structurally the determination's
+"no justified entity" case (like the trampolines pre-analysis).
+Its escaped effect is the **on-disk cert materialisation** + the
+served challenge; per kvexp volatility a pre-quorum crash loses
+the local `root.put`, and the next ACME renew pass re-derives —
+i.e. it self-heals like idiom-4. Likely reclassifies toward
+**contracted at-least-once / self-healing** rather than needing a
+park; warrants its own determination, not the Option-A entity
+fix.
+
+### Net
+
+idiom-3 splits: **`platform.root.*`** → Option A envelope-merge
+(recommended; the deliberate refactor that also closes
+idiom-2-scopeKv and the idiom-2 deploy paths if the product call
+goes "gate"); **ACME cert** → separate determination, probably
+self-healing (idiom-4 class). idiom-4 (config-mirror) remains
+lowest priority (idempotently re-derived). The single highest-
+leverage next step for the whole escaped-effect surface is the
+**Option-A batch-accumulation refactor**, done deliberately and
+H2-reference-first with a paired fault test — it is the common
+fix for idiom-2-scopeKv + idiom-2-deploy + idiom-3-root at once,
+not three separate ports.
