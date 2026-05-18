@@ -2,9 +2,9 @@
 
 > **Status**: design, 2026-05-17. Resolves the bug class in
 > `docs/proposer-audit.md` (premature external-effect release at
-> *accept*). Design only — no implementation. Depends on / must be
-> reconciled with the parallel `docs/connection-actor-plan.md` (SSE
-> delivery model) — see §7.
+> *accept*). Design only — no implementation. Reconciled with the
+> parallel `docs/connection-actor-plan.md` (convergent — both treat
+> `events.emit` as a post-commit effect; see §7). idiom-1 unblocked.
 
 ## 1. Problem (one paragraph)
 
@@ -134,12 +134,19 @@ path. **This is exactly the surface `connection-actor-plan.md` owns**
   generalise the drain with H2 behaviour *byte-identical* (prove via
   existing `http_send` / `leader_failover` / kv-bench smokes), *then*
   add non-H2 registrants one idiom-cluster at a time.
-- **Connection-actor overlap (load-bearing).** `connection-actor-plan
-  .md` (parallel work, commit `92b26e6`) designs the SSE/WS delivery
-  model. §6's emit-gating and that doc's delivery model **must be
-  designed together** — gating emits at commit changes when the
-  connection actor sees them. Reconcile before implementing §6; do
-  not ship two SSE delivery models.
+- **Connection-actor overlap — RECONCILED (2026-05-17, convergent).**
+  `connection-actor-plan.md` (parallel, commit `92b26e6`) already
+  canonicalizes `events.emit` as a **post-commit effect, same class
+  as the kv writeset and `http.send`**, delivered in commit order
+  (its lines 72, 90, 102, 156). That *is* §6's mandated gate — the
+  two designs are convergent, not conflicting; the live
+  `fireEmits`-at-accept (sse-plan §3.2) is the legacy deviation both
+  correct toward. connection-actor explicitly does **not** migrate or
+  touch current SSE (its lines 206–207) and is unimplemented, so
+  there is no live two-models collision. **Resolution:** §6's
+  emit-gating aligns to connection-actor's post-commit-effect class;
+  connection-actor owns *delivery* (when built), this reconciler owns
+  the *commit-gate trigger*; they compose. §6 is unblocked.
 - **Effect-buffer location.** Where does the emit/`on_result` buffer
   live between accept and the drain? H2 stages the response on the
   ECS entity. Non-H2 paths have no entity (until Option A). For
@@ -160,9 +167,11 @@ path. **This is exactly the surface `connection-actor-plan.md` owns**
 
 ## 8. Scope
 
-Design only. Follow-on (not this session): generalise the drain
-(H2-reference-first); build the SSE-escaped-effect fault gate
-(task 14, paired with idiom-1); migrate idioms 1→4, each gated by
-that test; reconcile §6 with `connection-actor-plan.md`. The
-correctness fix (B mechanism) is mandatory and incremental; the
-Option-A collapse is the deliberate architectural follow-up.
+Design only. §6↔connection-actor reconciled (§7, convergent) — no
+longer a blocker. Follow-on: generalise the drain (H2-reference-
+first, additive `pending_units` registry — H2 path untouched); build
+the SSE-escaped-effect fault gate (task 14, paired with idiom-1);
+rewire `tenant_batch`'s `fireEmits` onto the gate (idiom-1); migrate
+idioms 2→4, each gated by that test. The correctness fix (B
+mechanism) is mandatory and incremental; the Option-A collapse is
+the deliberate architectural follow-up.
