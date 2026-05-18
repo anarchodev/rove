@@ -1313,6 +1313,9 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "email.js", EMAIL_JS);
     // users is standalone (kv + crypto.{randomBytes,sha256}).
     evalSnippet(ctx, "users.js", USERS_JS);
+    // activitypub depends on base64url/hex/btoa + crypto + http +
+    // kv + URLSearchParams + TextEncoder (all evaluated above).
+    evalSnippet(ctx, "activitypub.js", ACTIVITYPUB_JS);
 
     // Phase A reachability hardening (docs/builtin-libs-docs-plan.md).
     // Every native shim above captured its slice as
@@ -1481,6 +1484,7 @@ const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
 const USERS_JS = @embedFile("users_js");
+const ACTIVITYPUB_JS = @embedFile("activitypub_js");
 
 /// (public name, embedded source) for every `globals/*.js` file. The
 /// single list the Phase-A lints below pivot on: each `.src` is an
@@ -1508,6 +1512,7 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "email", .src = EMAIL_JS },
     .{ .name = "textcodec", .src = TEXTCODEC_JS },
     .{ .name = "users", .src = USERS_JS },
+    .{ .name = "activitypub", .src = ACTIVITYPUB_JS },
 };
 
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
