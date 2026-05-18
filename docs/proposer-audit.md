@@ -56,15 +56,31 @@ splits:
   there.
 - **Notify-then-read effects** — SSE `events.emit` ("something
   changed → go read"), an `on_result` that makes a client/handler
-  re-fetch: gate on **apply**, not merely commit. The recipient
-  *immediately reads*, and "committed in the raft log" ≠ "applied to
-  the store about to be queried" — commit-but-pre-apply reintroduces
-  a read-your-writes race on the reading node.
+  re-fetch: in principle gate on **apply**, not merely commit (the
+  recipient *immediately reads*, and "committed in the raft log" ≠
+  "applied to the store about to be queried").
+
+> **kvexp collapse (note 2026-05-17):** for kvexp-backed effects —
+> i.e. KV writesets **and** the schedule store, which is the dominant
+> case here — commit ≈ apply for *read-visibility*. kvexp's
+> speculative `main_overlay` serves reads on the committing node from
+> local-commit time, and loop46 reads are leader-only (§6c), so once
+> `committedSeq >= seq` the value is already read-visible on the
+> leader via the overlay; the apply→LMDB step is a *durability*
+> concern, not a read-visibility one. So the apply-vs-commit split
+> largely **collapses to a single gate, `committedSeq >= seq`
+> (commit)**, for essentially every effect in this codebase. A true
+> apply gate would only matter for a non-overlay-backed or
+> genuinely-cross-node-read effect, which loop46 does not have. Net:
+> the reconciler needs **one** gate, not a per-effect-kind branch —
+> a useful simplification for task 15. The accept-vs-commit invariant
+> is unchanged; only the commit-vs-apply sub-distinction evaporates.
 
 **§3.2 resolved (decision 2026-05-17):** accept-time SSE emit is a
-**bug**, unconditionally in scope — accept isn't even commit, and SSE
-needs *apply*, not just commit. The `rove:resync` reconciliation
-sub-question is moot: the window is being closed, not papered over.
+**bug**, unconditionally in scope — accept isn't even commit. "SSE on
+apply" is correct in principle but, per the kvexp-collapse note, in
+practice means "SSE on commit" (`committedSeq >= seq`) here. The
+`rove:resync` sub-question is moot: the window is being closed.
 
 ## Classification
 
