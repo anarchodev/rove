@@ -145,21 +145,93 @@ fn finalizeBatch(
     var processed: usize = 0;
 
     if (!has_writes and !has_cmds) {
-        // Pure read-only batch: no raft hop. kvexp's commit fast-paths
-        // when the txn wrote nothing AND no read crossed a chain-
-        // predecessor's overlay (Txn.saw_speculation == false). The
-        // fast path just splices the txn out of the chain at any
-        // position — no chain-head requirement.
-        //
-        // When a read DID cross a predecessor's overlay, commit takes
-        // the slow path which requires chain head; under cross-tenant
-        // load it can return Conflict (NotChainHead) because earlier
-        // batches' writes are still waiting on raft to apply. For
-        // those we rollback to release the txn cleanly. The customer
-        // sees the response based on speculative state that hasn't
-        // been confirmed yet — same linearizability posture as
-        // pre-kvexp-bump (the bigger fix is to park such read-only
-        // batches on raft apply, which needs new plumbing).
+        // idiom-0 read-side gate (docs/proposer-audit.md Addendum,
+        // docs/unified-effect-gating.md §2 scope clarification). If a
+        // read in this batch crossed a chain predecessor's still-
+        // uncommitted speculative overlay (kvexp set
+        // `Txn.saw_speculation`), the value read is NOT durable:
+        // releasing the response at local commit would escape a
+        // result the cluster may truncate on leader change — the
+        // read-side dual of the proposer escaped-effect bug. Take an
+        // empty-writeset BARRIER propose + park instead, reusing the
+        // H2 write-path machinery verbatim: `drainRaftPending`
+        // releases the response only once `txn.commit()` succeeds
+        // (chain head = every predecessor committed+applied) and 503s
+        // on fault/timeout. The barrier seq is `highWatermark()+1` so
+        // it never collides with a real proposer's `pending_txns`
+        // slot. Correctness is robust even under the release-lease-
+        // before-propose ordering hazard (worker_dispatch.zig:202
+        // precedes :204): the chain-head `commit()` gate is causally
+        // tied to predecessor *detachment*, not to seq arithmetic;
+        // the borrowed seq only governs poll-start + the fault/timeout
+        // downgrade, both bounded by `commit_wait_timeout_ns`.
+        if (txn.sawSpeculation()) {
+            const seq = raft_propose.proposeWriteSet(worker, writeset, anchor_id) catch |perr| {
+                std.log.warn("rove-js idiom-0 barrier propose (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
+                txn.rollback() catch |rb_err| panic_mod.invariantViolated(
+                    "finalizeBatch.rollback(idiom0_barrier_fail)",
+                    "tenant={s} err={s}",
+                    .{ anchor_id, @errorName(rb_err) },
+                );
+                allocator.destroy(txn);
+                for (successes.items) |*s| {
+                    respb.overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |e2| panic_mod.invariantViolated(
+                        "finalizeBatch.respb.overwriteWith503(idiom0_barrier_fail)",
+                        "tenant={s} err={s}",
+                        .{ anchor_id, @errorName(e2) },
+                    );
+                    server.reg.move(s.ent, &server.request_out, &server.response_in) catch |e2| panic_mod.invariantViolated(
+                        "finalizeBatch.move(idiom0_barrier_fail)",
+                        "tenant={s} err={s}",
+                        .{ anchor_id, @errorName(e2) },
+                    );
+                    const co = s.console_owned;
+                    const eo = s.exception_owned;
+                    s.console_owned = &.{};
+                    s.exception_owned = &.{};
+                    worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .fault, co, eo, s.tapes);
+                    processed += 1;
+                }
+                successes.clearRetainingCapacity();
+                return processed;
+            };
+            // Propose accepted: transfer txn ownership to the drain
+            // (parked on the barrier seq), park each success entity
+            // on raft_pending exactly as the write path does.
+            try worker.pending_txns.put(allocator, seq, txn);
+            const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
+            for (successes.items) |*s| {
+                try server.reg.set(s.ent, &server.request_out, RaftWait, .{
+                    .seq = seq,
+                    .txn_seq = batch_seq,
+                    .deadline_ns = deadline_ns,
+                    .store = anchor.kv,
+                });
+                try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
+                const console_owned = s.console_owned;
+                const exception_owned = s.exception_owned;
+                s.console_owned = &.{};
+                s.exception_owned = &.{};
+                worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
+                processed += 1;
+            }
+            // Any emits from this tainted batch gate on the same
+            // commit (idiom-1 consistency — they announce the same
+            // not-yet-durable state).
+            worker_mod.parkEmits(worker, seq, anchor_id, pending_emits) catch |perr|
+                std.log.warn("rove-js idiom-0 parkEmits (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
+            successes.clearRetainingCapacity();
+            return processed;
+        }
+
+        // Clean read-only batch (`saw_speculation == false`): no raft
+        // hop. kvexp's commit fast-paths when the txn wrote nothing
+        // AND no read crossed a chain-predecessor's overlay — it
+        // splices the txn out of the chain at any position, no
+        // chain-head requirement, so it does not return Conflict.
+        // (The speculation case is handled by the idiom-0 branch
+        // above; the Conflict arm below is retained as defensive
+        // belt-and-braces.)
         txn.commit() catch |err| switch (err) {
             kv_mod.KvError.Conflict => txn.rollback() catch |rb_err|
                 panic_mod.invariantViolated(
