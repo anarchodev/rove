@@ -1,0 +1,11 @@
+{
+  "_comment": "Minimal seed manifest for scripts/readonly_speculation_faultinj_smoke.py — one self-contained tenant: `?fn=write` speculative-commits a key into the per-tenant kvexp chain then proposes; `?fn=read` is a non-proposing read-only batch that crosses that chain-predecessor overlay (saw_speculation). No acme/OIDC needed. docs/proposer-audit.md Addendum (idiom-0).",
+  "tenants": [
+    {
+      "id": "specread",
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/specread/index.mjs"}
+      ]
+    }
+  ]
+}
