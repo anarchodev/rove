@@ -1,48 +1,88 @@
 # Raft proposer audit (divergence workstream — keystone)
 
-> **Status**: scoping artifact, 2026-05-17. Enumerates every
+> **Status**: scoping artifact, 2026-05-17 (revised — bug class
+> re-framed after empirical fault-injection). Enumerates every
 > application-level raft proposer and classifies each by whether it
-> can leave the leader's local durable state diverged from the cluster
-> on a post-propose fault. Read-only analysis; feeds the
-> fault-injection test and the unified-reconciler design.
+> releases an externally-visible effect before the entry is durable.
+> Read-only analysis; feeds the fault-injection test and the
+> unified-reconciler design.
 
-## The bug class
+## The bug class (revised)
 
-The H2 request lifecycle and several side paths all mutate replicated
-state by proposing a raft entry. The divergence bug is specific:
+**Superseded framing (kept per the §7-superseded discipline):** the
+first cut of this doc called the bug *on-disk KV divergence* — a
+proposer commits a local `TrackedTxn` then proposes, and on a
+post-propose fault the leader keeps a write the cluster truncates.
+**Empirical fault-injection (`scripts/divergence_faultinj_smoke.py`)
+disproved that:** kvexp's `txn.commit()` is a **speculative, volatile
+in-memory overlay** that only persists to LMDB at raft-*apply*. A
+crash before quorum loses the overlay entirely → **no on-disk KV
+divergence.** That half of the original premise was wrong.
 
-> A proposer is **unsafe** iff it makes a **local durable state
-> mutation** (commits a kvexp `TrackedTxn`, `root.put`, materialises a
-> file, …) **before or independent of** the raft propose, **and** has
-> **no post-propose fault reconciler** — nothing that, if the leader
-> loses leadership *after* `propose()` returns but *before* the entry
-> reaches quorum, rolls back / reconciles that local mutation.
+**The actual bug — premature effect release.** kvexp volatility keeps
+the *KV store* consistent, but it does not unsend an
+**externally-observable, irreversible effect** that was released
+against the speculative state:
 
-On such a fault the proposing node has applied a write the rest of the
-cluster never will; when it rejoins as a follower, raft truncates the
-uncommitted log entry but the local commit is **not** undone →
-permanent divergence until a snapshot resync overwrites it.
+> A proposer is **unsafe** iff it releases an external effect — the
+> synthesized/HTTP response, an SSE `events.emit`, an `on_result`
+> callback with external side effects, `email.send`, `webhook.send` —
+> at **accept** (`propose()` returned) rather than at the effect's
+> correct durability gate. On a post-propose fault raft truncates the
+> entry (it never happened, by raft's own rules) but the effect
+> already escaped: the outside world believes X; the durable system
+> has no X.
 
-`cluster.propose` returning `NotLeader` (incl. `faultedSeq() >= seq`)
-only covers *synchronous* "lost leadership **before** propose". The
-**post-propose** window (propose returned ok, then no quorum) is the
-gap. Only the H2 path closes it (`pending_txns` + `RaftWait{seq}` +
-`drainRaftPending`: commit-on-`committedSeq≥S` / `undoTxn`-on-fault).
+`propose()` returning ok = **appended to the leader's local log**
+(accept), **not** quorum. Raft's safety rule is *act only on
+*committed* entries*; releasing an effect at accept is acting on a
+merely-appended entry that raft may discard on leader change.
+`cluster.propose` → `NotLeader`/`faultedSeq()` only covers the
+*synchronous* "lost leadership **before** propose"; the post-propose
+window is the gap. Only the H2 path closes it **for the response**
+(`pending_txns`+`RaftWait`+`drainRaftPending` release the response at
+`committedSeq≥seq`) — and **not even H2 closes it for SSE** (§3.2
+fires emits at accept by an explicit, now-overruled tradeoff).
+
+## The release gate is per-effect-kind
+
+The invariant is *effects only on committed entries*, but the trigger
+splits:
+
+- **Self-contained effects** — HTTP response with the result inline,
+  `email.send`/`webhook.send` with a full payload: gate on **commit**
+  (`committedSeq >= seq`). Durable, no follow-on read. H2's
+  `drainRaftPending` already does exactly this; it is sufficient
+  there.
+- **Notify-then-read effects** — SSE `events.emit` ("something
+  changed → go read"), an `on_result` that makes a client/handler
+  re-fetch: gate on **apply**, not merely commit. The recipient
+  *immediately reads*, and "committed in the raft log" ≠ "applied to
+  the store about to be queried" — commit-but-pre-apply reintroduces
+  a read-your-writes race on the reading node.
+
+**§3.2 resolved (decision 2026-05-17):** accept-time SSE emit is a
+**bug**, unconditionally in scope — accept isn't even commit, and SSE
+needs *apply*, not just commit. The `rove:resync` reconciliation
+sub-question is moot: the window is being closed, not papered over.
 
 ## Classification
 
-- **Class A** — propose-only; **apply is the sole writer**. No local
-  durable mutation precedes the propose. A fault just means the entry
-  never applies anywhere → no divergence (at most an at-least-once
-  re-fire, which is an inherent, contracted property).
-- **Class B-correct** — commits local state speculatively but **does
-  the dance**: parks the txn, finalises on raft-commit, `undoTxn` on
-  fault. Safe.
-- **Class B-broken** — commits local state then proposes with **no
-  post-propose reconciler**. Divergence window. *(self-healing)* =
-  the diverged state is idempotently re-derived by a periodic pass,
-  so the window is transient rather than permanent — lower severity,
-  still a window.
+(The site inventory below is unchanged — the same proposers are the
+offenders — but read "commit vs propose" as *effect-release vs the
+per-effect gate above*, and "divergence" as *escaped-effect /
+state mismatch*, not on-disk KV divergence.)
+
+- **Class A** — propose-only; **apply is the sole writer**; releases
+  no external effect against speculative state. A fault → the entry
+  never applies anywhere → at most an at-least-once re-fire (a
+  contracted property). Safe.
+- **Class B-correct** — releases its effect only at the correct gate
+  (H2 response: `drainRaftPending` at `committedSeq≥seq`).
+- **Class B-broken** — releases an external effect at **accept**
+  (propose-returns), before its gate. *(self-healing)* = the only
+  escaped effect is an idempotently re-derived state write with no
+  external observer, so the window is benign — still mis-gated.
 
 ## Per-site classification (evidence)
 
@@ -104,9 +144,13 @@ park a unit instead of fire-and-forgetting.
 
 - **Fault-injection test (task 14)** should target idiom 1 (internal-
   schedule + callback — `tenant_batch`) first: highest traffic, the
-  divergence is permanent (not self-healing), and it is the cleanest
-  single fix point. Kill the proposing leader after propose-returns
-  but before quorum; assert app.db divergence on the demoted node.
+  effect is externally observable, cleanest single fix point. Subscribe
+  SSE to the target tenant; trigger the internal schedule; freeze
+  followers so it cannot reach quorum; **assert the SSE subscriber
+  receives the emit** (effect escaped at accept); kill the leader
+  pre-commit → the writeset that emit announced never durably exists.
+  Asserting on-disk KV is wrong (kvexp volatility → no KV divergence);
+  the observable is the *escaped effect*, not the store.
 - **Design doc (task 15)**: the user's one-request-lifecycle model
   (every request an entity in `request_out`, origin-tagged finalize)
   is the leading option — it makes the dance automatic for all 9 by
