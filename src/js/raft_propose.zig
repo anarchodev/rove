@@ -63,26 +63,11 @@ pub fn proposeWriteSet(
     return proposeEncoded(worker, writeset, .writeset, instance_id, false);
 }
 
-/// Root writeset (envelope type=2). Followers apply to their own
-/// `__root__.db` in `applyRootWriteSet`. Used by signup (instance
-/// marker + domain assignment) and by the admin JS handler's
-/// `platform.root.*` writes.
-///
-/// No-op fast path for empty writesets — saves a raft entry for
-/// admin requests that only read platform state.
-///
-/// **Divergence note**: if the caller already wrote to root locally
-/// and this propose fails, the leader's root.db has state that
-/// followers don't. Current code logs and moves on (at-least-once
-/// semantics consistent with the webhook / callback layers). A future
-/// iteration can wrap root writes in a TrackedTxn with undo
-/// semantics so propose failure triggers a compensating rollback.
-pub fn proposeRootWriteSet(
-    worker: anytype,
-    writeset: *const kv_mod.WriteSet,
-) !u64 {
-    return proposeEncoded(worker, writeset, .root_writeset, "", true);
-}
+// (proposeRootWriteSet removed 2026-05-17: Option-A folds
+// platform.root.* writes into the batch multi-envelope via
+// proposeBatch, so there is no standalone root-writeset proposer.
+// The type-2 encoder `apply.encodeRootWriteSetEnvelope` stays —
+// proposeBatch and acme.zig use it directly.)
 
 /// Propose the per-batch writeset + http.send/cancel batch as ONE
 /// raft entry — the unit of atomicity for the dispatcher path. Three

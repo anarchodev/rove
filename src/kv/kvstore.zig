@@ -614,20 +614,9 @@ pub const KvStore = struct {
         return .{ .entries = empty, .allocator = self.allocator };
     }
 
-    // ── Checkpointing ───────────────────────────────────────────
-
-    /// No-op under kvexp. WAL auto-checkpointing was a SQLite knob;
-    /// under raft-as-WAL the checkpoint cadence is owned by the
-    /// raft thread's `tickSnapshot`.
-    pub fn disableAutoCheckpoint(self: *KvStore) void {
-        _ = self;
-    }
-
-    /// No-op under kvexp. SQLite-only knob.
-    pub fn setBusyTimeout(self: *KvStore, ms: c_int) void {
-        _ = self;
-        _ = ms;
-    }
+    // (disableAutoCheckpoint / setBusyTimeout removed 2026-05-17 —
+    // no-op SQLite-knob stubs with zero callers, same dead-stub
+    // class as the deleted undo machinery.)
 
     /// Snapshot of the underlying kvexp manifest's counters/gauges.
     /// In attached mode, every KvStore on a node shares the same

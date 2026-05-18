@@ -213,9 +213,7 @@ fn finalizeBatch(
             for (successes.items) |*s| {
                 try server.reg.set(s.ent, &server.request_out, RaftWait, .{
                     .seq = seq,
-                    .txn_seq = batch_seq,
                     .deadline_ns = deadline_ns,
-                    .store = anchor.kv,
                 });
                 try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
                 const console_owned = s.console_owned;
@@ -328,9 +326,7 @@ fn finalizeBatch(
     for (successes.items) |*s| {
         try server.reg.set(s.ent, &server.request_out, RaftWait, .{
             .seq = seq,
-            .txn_seq = batch_seq,
             .deadline_ns = deadline_ns,
-            .store = anchor.kv,
         });
         try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
 
@@ -1197,9 +1193,7 @@ fn handleRelease(
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     try server.reg.set(ent, &server.request_out, RaftWait, .{
         .seq = seq,
-        .txn_seq = txn.txn_seq,
         .deadline_ns = deadline_ns,
-        .store = inst.kv,
     });
     try server.reg.move(ent, &server.request_out, &worker.raft_pending);
 }
@@ -1319,9 +1313,7 @@ fn handleAdminKv(
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     try server.reg.set(ent, &server.request_out, RaftWait, .{
         .seq = seq,
-        .txn_seq = txn.txn_seq,
         .deadline_ns = deadline_ns,
-        .store = admin_inst.kv,
     });
     try server.reg.move(ent, &server.request_out, &worker.raft_pending);
 }

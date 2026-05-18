@@ -97,24 +97,18 @@ const Request = dispatcher_mod.Request;
 /// detach, retried on `Conflict`); on fault/timeout it runs
 /// `TrackedTxn.rollback()` on the pointer held in
 /// `worker.pending_txns[seq]`. (The legacy `KvStore.undoTxn` /
-/// `commitTxn` / `kv_undo`-log path was pre-kvexp SQLite machinery —
-/// now no-op stubs; rollback is `TrackedTxn.rollback()` + kvexp
+/// `commitTxn` / `kv_undo`-log path was pre-kvexp SQLite machinery,
+/// since deleted; rollback is `TrackedTxn.rollback()` + kvexp
 /// volatility, not an undo-log walk.)
 ///
 /// Fields:
 /// - `seq`: raft-side sequence from `raft.highWatermark()+1`, tracked
 ///   by `committedSeq()` / `faultedSeq()`; the key into
 ///   `worker.pending_txns` that owns the parked `TrackedTxn`.
-/// - `txn_seq`: kv-side counter from `beginTrackedImmediate`
-///   (diagnostic / log correlation; no longer drives any undo).
 /// - `deadline_ns`: absolute `std.time.nanoTimestamp()` deadline.
-/// - `store`: pointer to the tenant's KvStore (diagnostic; the
-///   rollback goes through the `pending_txns` TrackedTxn pointer).
 pub const RaftWait = struct {
     seq: u64 = 0,
-    txn_seq: u64 = 0,
     deadline_ns: i64 = 0,
-    store: ?*kv_mod.KvStore = null,
 };
 
 /// A non-entity post-propose parked unit (divergence workstream,
@@ -2703,8 +2697,9 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
     }
 }
 
-pub const proposeWriteSet = raft_propose.proposeWriteSet;
-pub const proposeRootWriteSet = raft_propose.proposeRootWriteSet;
+// (proposeWriteSet/proposeRootWriteSet re-exports removed
+// 2026-05-17 — unused; callers use raft_propose.* directly and
+// proposeRootWriteSet itself is gone post-Option-A.)
 
 
 /// Destroy entities sitting in `response_out` (h2 has finished
