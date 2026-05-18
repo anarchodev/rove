@@ -566,23 +566,31 @@ already fault-proven for; it only adds inners to the existing
 multi and flips the read-only gate when side effects exist — the
 gating mechanism is unchanged.
 
-### The one paired gate still owed (teed up, not vague)
+### The paired gate — shipped + validated
 
-A frozen-quorum fault test asserting the **admin caller's 2xx
-does not escape** before the side write commits. Precise spec:
-operator-OIDC session (smoke_lib RP-login helper, as
-`notifications_smoke`) → 3-node cluster → SIGSTOP both followers
-(no quorum) → `{admin_origin}/?fn=createInstance&args=["spec-N"]`
-(or `?fn=publishRelease` for the target-trampoline arm) →
-**assert the response is NOT a 2xx carrying the created/published
-marker in the frozen window** (pre-Option-A it escapes
-immediately; post it is parked → 503/timeout). Negative control:
-force `has_side=false` in `finalizeBatch` (revert the gate) → the
-2xx must escape → test FAILs. Same shape/discipline as
-`readonly_speculation_faultinj`; deferred only because the
-operator-OIDC + freeze + timing harness is its own
-test-engineering piece (cf. `notifications_smoke`'s
-"advisory — untested plumbing"), not because the fix is unproven.
+`scripts/optiona_caller_gate_faultinj_smoke.py`. operator-OIDC
+session (smoke_lib RP-login, as `notifications_smoke`) → 3-node
+cluster + files/log servers → `createInstance "specpub"` while
+quorum is HEALTHY (commits; also exercises the Option-A
+**happy path** end-to-end) → SIGSTOP both followers (no quorum) →
+`{admin_origin}/?fn=publishRelease&args=["specpub",43981]` (43981
+≠ the starter dep 1, so the idempotent fast-path is bypassed —
+`releasePublishTrampoline` writes only the target's
+`_deploy/current`, no anchor write, the clean discriminator) →
+**assert the response is NOT a 2xx in the frozen window**.
+
+Validated:
+
+- **Option-A on** → `publishRelease` returns **503 "raft commit
+  failed"** (parked on the batch seq, no quorum) → PASS.
+- **Negative control** (`has_side = false` in `finalizeBatch`,
+  rebuilt) → **202 `{"instance_id":"specpub","dep_id":43981,
+  "status":"queued"}`** immediately in the frozen window (escaped)
+  → test FAILs (rc=1). Reverted after.
+
+A textbook regression gate: fails loudly on the bug, passes on
+the fix. Same shape/discipline as `readonly_speculation_faultinj`
+(idiom-0) and `divergence_faultinj` (idiom-1).
 
 ### Residual escaped-effect surface
 
