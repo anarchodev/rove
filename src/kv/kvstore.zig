@@ -847,6 +847,23 @@ pub const KvStore = struct {
             t.beginReadView() catch {};
         }
 
+        /// True iff a read in this txn crossed a chain predecessor's
+        /// still-uncommitted overlay (kvexp `Txn.saw_speculation`,
+        /// set by `markSawSpeculationLocked` on the top-level Txn).
+        /// A read-only batch for which this is true must NOT release
+        /// its response at local commit — the value it read is not
+        /// durable yet (docs/proposer-audit.md Addendum, idiom-0).
+        ///
+        /// Read post-handler-walk on the owning worker thread; the
+        /// per-tenant dispatch lease serialised every writer to this
+        /// txn, and the flag is monotone (only ever set true), so an
+        /// unlocked field read is stable here. False if the txn was
+        /// never opened (no reads happened → no speculation).
+        pub fn sawSpeculation(self: *TrackedTxn) bool {
+            const top = self.top orelse return false;
+            return top.saw_speculation;
+        }
+
         pub fn commit(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
             // Any open savepoints close first (kvexp errors with
