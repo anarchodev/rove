@@ -48,10 +48,12 @@ Two pieces, both already present in the H2 path — generalise them:
    `pending_txns[seq]` + `RaftWait{seq}` + `drainRaftPending` into a
    single reconciler keyed by propose seq. The drain, each tick:
    - `committedSeq() >= seq` → **commit**: finalise the txn
-     (drop-undo) and **release the buffered effects**.
+     (`TrackedTxn.commit()` — kvexp chain-head detach) and
+     **release the buffered effects**.
    - fault / `faultedSeq() >= seq` / timeout → **rollback**:
-     `undoTxn` (where a local speculative commit exists) and
-     **discard the buffered effects** (they never escaped).
+     `TrackedTxn.rollback()` (where a local speculative commit
+     exists) and **discard the buffered effects** (they never
+     escaped).
 
 This is exactly what `drainRaftPending` does for the H2 *response*
 today. The fix is (a) extend it to release the *emit/callback*
@@ -107,12 +109,20 @@ bounded:
 
 | Origin | on_commit (release) | on_fault (discard) |
 |---|---|---|
-| H2 (reference) | deliver response + buffered emits | `undoTxn` + 503 (existing) |
+| H2 (reference) | deliver response + buffered emits | `TrackedTxn.rollback()` + 503 (existing) |
 | internal-schedule (`tenant_batch`) | release `schedule_complete` + emits + `on_result` trigger | discard; schedule stays due → re-fires on new leader (at-least-once; nothing escaped) |
 | callback (`tenant_batch`) | release receipt-delete + emits | discard; receipt stays → re-runs |
-| idiom-2 (deployStarter / releases.publish / `platform.scope.kv` / admin-kv) | drop-undo | `undoTxn` (undo log already present) |
-| idiom-3 (`platform.root.*` / ACME cert) | drop-undo | `undoTxn` / re-derive on next ACME pass |
-| idiom-4 (config-mirror) | drop-undo | none needed (idempotently re-derived) |
+| idiom-2 (deployStarter / releases.publish / `platform.scope.kv` / admin-kv) | — (kvexp speculative commit; no local finalize step) | kvexp volatility — no on-disk divergence; the real fix is the **caller-response** gate, see Addendum 2 |
+| idiom-3 (`platform.root.*` / ACME cert) | — | kvexp volatility / re-derive on next ACME pass |
+| idiom-4 (config-mirror) | — | none needed (idempotently re-derived) |
+
+> Terminology note (2026-05-17): earlier drafts wrote "drop-undo"
+> / "`undoTxn`" — pre-kvexp SQLite `kv_undo`-log terms. Those
+> `KvStore` methods were no-op stubs and have been deleted. The
+> live primitives are `TrackedTxn.commit()` (kvexp chain-head
+> detach) and `TrackedTxn.rollback()`; a pre-quorum crash needs
+> no explicit undo (the speculative overlay is volatile → no
+> on-disk divergence). See `docs/proposer-audit.md`.
 
 ## 6. The §3.2 systemic SSE fix
 

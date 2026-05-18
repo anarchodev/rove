@@ -112,7 +112,8 @@ pub const Cluster = struct {
     // via TrackedTxn (read-your-writes inside the application's
     // request scope), then proposes a multi-envelope on commit.
     // On failure (proposal rejected, leader changed mid-commit):
-    // every store's TrackedTxn rolls back via its undo log.
+    // every store's TrackedTxn.rollback() discards its kvexp
+    // speculative overlay (volatile — never reached LMDB).
     pub fn beginLeaderTxn(self) !*LeaderTxn;
 
     // Snapshot tick. Caller invokes from the raft thread on a
@@ -213,7 +214,7 @@ pub const LeaderTxn = struct {
     pub fn delete(self, store_id, key) !void;
     pub fn proposeAndWait(self) !u64;  // builds multi-envelope, proposes,
                                        // waits for raft commit
-    pub fn rollback(self) !void;       // undo log on every touched store
+    pub fn rollback(self) !void;       // TrackedTxn.rollback() on each touched store
 };
 ```
 
@@ -221,9 +222,11 @@ Local pre-writes happen on every store the LeaderTxn touched
 (via that store's backend-provided TrackedTxn equivalent).
 On `proposeAndWait` success: the raft commit guarantees every
 node has applied the multi-envelope atomically. On failure:
-`rollback` walks each touched store's undo log and reverts
-the local pre-writes. Same crash-safety property today's
-single-store TrackedTxn provides, generalized to N stores.
+`rollback` calls `TrackedTxn.rollback()` on each touched store,
+discarding its kvexp speculative overlay (volatile — the
+pre-writes never reached LMDB, so a crash needs no explicit
+undo either). Same crash-safety property today's single-store
+TrackedTxn provides, generalized to N stores.
 
 ## Snapshot mechanics
 

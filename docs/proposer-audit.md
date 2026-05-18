@@ -102,6 +102,18 @@ state mismatch*, not on-disk KV divergence.)
 
 ## Per-site classification (evidence)
 
+> **Stale terminology, kept per the §7-superseded discipline.** The
+> `commit vs propose` / `Reconciler` columns below use pre-kvexp
+> SQLite `kv_undo` terms (`commitTxn` "drops undo", `undoTxn` on
+> fault, "kvexp undo-log"). Those `KvStore` methods were no-op
+> stubs and were **deleted 2026-05-17**; the live primitives are
+> `TrackedTxn.commit()` (kvexp chain-head detach) /
+> `TrackedTxn.rollback()`, and a pre-quorum crash needs no undo
+> (volatile overlay → no on-disk divergence). Read those cells as
+> *effect-release-vs-gate*, not literal undo-log ops — see
+> Addendum 2 Finding 1. The site inventory + classifications are
+> unaffected.
+
 | Site | What it writes | commit vs propose | Reconciler | Class |
 |---|---|---|---|---|
 | `worker_dispatch.zig:204` proposeBatch (H2 hot path) | tenant app.db writeset | txn **parked** (`pending_txns[seq]`), not committed until raft confirms | `RaftWait`+`drainRaftPending` (commit / `undoTxn`+503) | **B-correct** |
@@ -152,11 +164,13 @@ The 9 collapse into **a few idioms, each fixable once**:
 ## Conclusion → next steps
 
 The proven template is the H2 lifecycle's `RaftWait` +
-`drainRaftPending` + kvexp undo-log: *propose, park the
-speculatively-committed txn keyed by seq, finalise (drop-undo) when
-`committedSeq() >= seq`, `undoTxn` on fault/timeout.* The unified
-reconciler generalises exactly this so the 9 Class-B-broken sites
-park a unit instead of fire-and-forgetting.
+`drainRaftPending` + kvexp speculative overlay: *propose, park the
+speculatively-committed txn keyed by seq, finalise it
+(`TrackedTxn.commit()` — kvexp chain-head detach) when
+`committedSeq() >= seq`, `TrackedTxn.rollback()` on fault/timeout
+(no undo log — the overlay is volatile).* The unified reconciler
+generalises exactly this so the 9 Class-B-broken sites park a unit
+instead of fire-and-forgetting.
 
 - **Fault-injection test (task 14)** should target idiom 1 (internal-
   schedule + callback — `tenant_batch`) first: highest traffic, the
