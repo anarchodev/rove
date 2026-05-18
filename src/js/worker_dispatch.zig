@@ -138,13 +138,23 @@ fn finalizeBatch(
     const allocator = worker.allocator;
     const anchor_id = anchor.id;
     const batch_seq = txn.txn_seq;
+    // Option-A: the batch's accumulated admin side effects
+    // (`platform.root.*` + cross-tenant trampolines) are folded into
+    // this batch's single raft entry by `proposeBatch`. Freed on
+    // every exit path once proposeBatch has consumed them.
+    defer worker.batch_side.reset(allocator);
+    const has_side = !worker.batch_side.isEmpty();
     const has_writes = writeset.ops.items.len > 0;
     const has_schedules = pending_schedules.items.len > 0;
     const has_cancels = pending_cancels.items.len > 0;
     const has_cmds = has_schedules or has_cancels;
     var processed: usize = 0;
 
-    if (!has_writes and !has_cmds) {
+    // A batch with only side effects (e.g. an admin handler that did
+    // nothing but `platform.root.set` or `platform.releases.publish`)
+    // must NOT take the read-only fast path — its response has to be
+    // parked until the side-effect inners commit.
+    if (!has_writes and !has_cmds and !has_side) {
         // idiom-0 read-side gate (docs/proposer-audit.md Addendum,
         // docs/unified-effect-gating.md §2 scope clarification). If a
         // read in this batch crossed a chain predecessor's still-
@@ -1483,6 +1493,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     const server = worker.h2;
     const allocator = worker.allocator;
 
+    // Belt-and-braces: clear any side-effect accumulation a prior
+    // tick left behind (finalizeBatch frees it on the normal path;
+    // an error return before finalize would otherwise carry it).
+    worker.batch_side.reset(allocator);
+
     const entities = server.request_out.entitySlice();
     const sids = server.request_out.column(h2.StreamId);
     const sessions = server.request_out.column(h2.Session);
@@ -1819,17 +1834,18 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             };
         };
 
-        // Admin-handler requests get a root writeset allocated for
-        // them so any `platform.root.set/delete` the handler issues
-        // can be proposed through raft after commit. Customer-tenant
-        // requests never have `platform` set, so they skip this.
-        var root_ws_storage: kv_mod.WriteSet = undefined;
-        var root_ws_ptr: ?*kv_mod.WriteSet = null;
-        if (handler_inst.platform != null) {
-            root_ws_storage = kv_mod.WriteSet.init(allocator);
-            root_ws_ptr = &root_ws_storage;
-        }
-        defer if (root_ws_ptr) |ws| ws.deinit();
+        // Admin-handler `platform.root.set/delete` writes accumulate
+        // into the *batch* root writeset (Option-A,
+        // docs/proposer-audit.md Addendum 3) so they ride the
+        // batch's single atomic raft entry and the caller is parked
+        // on that seq — no per-request fire-and-forget. Stable
+        // pointer for the whole walk (worker-owned, reset at
+        // finalizeBatch). Customer-tenant requests have no
+        // `platform`, so they get null and skip this.
+        const root_ws_ptr: ?*kv_mod.WriteSet = if (handler_inst.platform != null)
+            worker.batch_side.rootWs(allocator)
+        else
+            null;
 
         // Resolve (or eagerly mint) the platform session cookie. Static
         // assets and /_system/* short-circuited above, so reaching here
@@ -2022,22 +2038,15 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .{ scope_inst.id, @errorName(err) },
         );
 
-        // Propose the root writeset (if the admin handler made any
-        // `platform.root.*` writes). The local writes already landed
-        // on `root.db` inside the callbacks; this step just replicates
-        // them to followers. Proposed per-handler rather than batched
-        // because there's only one admin-tenant anchor at a time —
-        // batching wouldn't save anything.
-        if (root_ws_ptr) |root_ws| {
-            if (root_ws.ops.items.len > 0) {
-                _ = raft_propose.proposeRootWriteSet(worker, root_ws) catch |err| {
-                    std.log.warn(
-                        "rove-js: platform.root writeset propose failed: {s} (leader wrote, followers may diverge)",
-                        .{@errorName(err)},
-                    );
-                };
-            }
-        }
+        // (Option-A: the `platform.root.*` writes accumulated into
+        // worker.batch_side.root_ws and are proposed by
+        // finalizeBatch as a type-2 inner of the batch's single
+        // atomic raft entry — the calling admin request is parked on
+        // that seq, so its response is gated on the root write
+        // committing. The old per-request fire-and-forget
+        // proposeRootWriteSet (caller never gated on it; "followers
+        // may diverge" was stale pre-kvexp framing anyway) is gone.
+        // docs/proposer-audit.md Addendum 3.)
 
         // Stamp response components on the entity. They ride through
         // `raft_pending` → `response_in` (or straight to `response_in`

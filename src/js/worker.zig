@@ -141,6 +141,76 @@ pub const ParkedUnit = struct {
     }
 };
 
+/// One cross-tenant target's accumulated writeset within a batch.
+/// `id` is an owned dup of the target instance id.
+const TargetWrite = struct {
+    id: []u8,
+    ws: kv_mod.WriteSet,
+};
+
+/// Per-dispatch-tick accumulator for the *side* effects an admin
+/// handler triggers beyond its own anchor app.db writeset:
+/// `platform.root.*` (→ `root_ws`, a type-2 root writeset) and the
+/// cross-tenant trampolines `platform.scope(id).kv.*` /
+/// `platform.releases.publish` / signup→`deployStarter` (→ a
+/// per-target type-0 writeset). Option-A (docs/proposer-audit.md
+/// Addendum 3): these ride the **same atomic raft entry** as the
+/// batch and the caller is parked on that one seq, instead of
+/// fire-and-forget proposes the caller never gated on. Lives on the
+/// worker (single-threaded per tick, like `pending_txns`); reset at
+/// `dispatchOnce` entry and at `finalizeBatch` exit. WriteSet copies
+/// bytes in, so accumulation is safe and `reset` frees everything.
+pub const BatchSideEffects = struct {
+    root_ws: ?kv_mod.WriteSet = null,
+    targets: std.ArrayListUnmanaged(TargetWrite) = .empty,
+
+    /// Stable pointer to the batch root writeset, lazily created.
+    /// Called once per tick when the anchor is an admin handler so
+    /// `Request.root_writeset` has a stable address for the walk.
+    pub fn rootWs(self: *BatchSideEffects, allocator: std.mem.Allocator) *kv_mod.WriteSet {
+        if (self.root_ws == null) self.root_ws = kv_mod.WriteSet.init(allocator);
+        return &self.root_ws.?;
+    }
+
+    /// Find-or-create the accumulator for `target_id` (writes to the
+    /// same target across a batch merge into one inner). `target_id`
+    /// is duped on first sight.
+    pub fn targetWs(
+        self: *BatchSideEffects,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+    ) !*kv_mod.WriteSet {
+        for (self.targets.items) |*t| {
+            if (std.mem.eql(u8, t.id, target_id)) return &t.ws;
+        }
+        const id_dup = try allocator.dupe(u8, target_id);
+        errdefer allocator.free(id_dup);
+        try self.targets.append(allocator, .{
+            .id = id_dup,
+            .ws = kv_mod.WriteSet.init(allocator),
+        });
+        return &self.targets.items[self.targets.items.len - 1].ws;
+    }
+
+    /// True iff nothing was accumulated this tick (so `finalizeBatch`
+    /// may still take the read-only fast path).
+    pub fn isEmpty(self: *const BatchSideEffects) bool {
+        if (self.root_ws) |rw| if (rw.ops.items.len > 0) return false;
+        for (self.targets.items) |t| if (t.ws.ops.items.len > 0) return false;
+        return true;
+    }
+
+    pub fn reset(self: *BatchSideEffects, allocator: std.mem.Allocator) void {
+        if (self.root_ws) |*rw| rw.deinit();
+        self.root_ws = null;
+        for (self.targets.items) |*t| {
+            t.ws.deinit();
+            allocator.free(t.id);
+        }
+        self.targets.clearRetainingCapacity();
+    }
+};
+
 /// Default handler entry path. Each tenant's deployment must have a
 /// file at this path — it's the script the worker runs per request.
 /// Name of the single handler file the old single-bytecode path
@@ -901,6 +971,12 @@ pub fn Worker(comptime opts: Options) type {
         /// alongside (but independently of) the H2 `raft_pending`
         /// entity path. Single-threaded per worker.
         pending_units: std.ArrayListUnmanaged(ParkedUnit) = .empty,
+        /// Per-tick accumulator for admin-handler side effects
+        /// (`platform.root.*` + cross-tenant trampolines). Folded
+        /// into the batch's single raft entry by `finalizeBatch`
+        /// (Option-A, docs/proposer-audit.md Addendum 3). Reset at
+        /// `dispatchOnce` entry and `finalizeBatch` exit.
+        batch_side: BatchSideEffects = .{},
         /// Last-tick leader state. A true→false transition triggers
         /// the leadership-loss drain: every pending txn rolls back
         /// (kvexp recipe §2) and every `raft_pending` entry gets
@@ -1197,6 +1273,8 @@ pub fn Worker(comptime opts: Options) type {
             self.pending_txns.deinit(allocator);
             for (self.pending_units.items) |*pu| pu.deinit(allocator);
             self.pending_units.deinit(allocator);
+            self.batch_side.reset(allocator);
+            self.batch_side.targets.deinit(allocator);
             self.raft_pending.deinit();
             self.dispatcher.deinit();
             if (self.sse_curl) |easy| easy.deinit();
@@ -1271,13 +1349,18 @@ pub fn Worker(comptime opts: Options) type {
             };
             try txn.commit();
 
-            _ = raft_propose.proposeWriteSet(self, &release_ws, target_id) catch |err| {
-                std.log.warn(
-                    "deployStarter: propose envelope 0 for {s} _deploy/current failed: {s}",
-                    .{ target_id, @errorName(err) },
-                );
+            // Option-A (docs/proposer-audit.md Addendum 3): instead
+            // of a fire-and-forget propose the caller never gated
+            // on, fold this target writeset into the batch's single
+            // atomic raft entry. `finalizeBatch` parks the calling
+            // admin request on that seq, so its 2xx is released only
+            // once this `_deploy/current` write commits.
+            const batch_ws = try self.batch_side.targetWs(allocator, target_id);
+            for (release_ws.ops.items) |op| switch (op) {
+                .put => |p| try batch_ws.addPut(p.key, p.value),
+                .delete => |d| try batch_ws.addDelete(d.key),
             };
-            std.log.info("deployStarter: {s} speculative-committed + proposed envelope 0", .{target_id});
+            std.log.info("deployStarter: {s} speculative-committed + folded into batch entry", .{target_id});
 
             // Eagerly enqueue the deployment loader so the runtime-created
             // tenant's snapshot lands without waiting for the next reload
@@ -1356,13 +1439,16 @@ pub fn Worker(comptime opts: Options) type {
             try txn.put("_deploy/current", hex);
             try txn.commit();
 
-            // Fire-and-forget propose. The leader's local commit
-            // is durable; raft consensus settles async.
-            _ = raft_propose.proposeWriteSet(self, &release_ws, target_id) catch |err| {
-                std.log.warn(
-                    "releases.publish: propose envelope 0 for {s} _deploy/current failed: {s}",
-                    .{ target_id, @errorName(err) },
-                );
+            // Option-A: fold into the batch's single atomic raft
+            // entry; the calling admin request (parked by
+            // finalizeBatch on that seq) releases its 2xx only once
+            // this `_deploy/current` write commits — no more
+            // fire-and-forget the caller never gated on
+            // (docs/proposer-audit.md Addendum 3).
+            const batch_ws = try self.batch_side.targetWs(allocator, target_id);
+            for (release_ws.ops.items) |op| switch (op) {
+                .put => |p| try batch_ws.addPut(p.key, p.value),
+                .delete => |d| try batch_ws.addDelete(d.key),
             };
 
             if (self.node.deployment_loader) |loader| {
@@ -1417,13 +1503,16 @@ pub fn Worker(comptime opts: Options) type {
             }
             try txn.commit();
 
-            // Fire-and-forget: local commit is durable; raft settles
-            // async (same posture as releasePublishTrampoline).
-            _ = raft_propose.proposeWriteSet(self, &ws, target_id) catch |err| {
-                std.log.warn(
-                    "platform.scope kv {s} propose envelope 0 for {s} failed: {s}",
-                    .{ @tagName(op), target_id, @errorName(err) },
-                );
+            // Option-A: fold into the batch's single atomic raft
+            // entry instead of a fire-and-forget the caller never
+            // gated on. The calling admin request is parked by
+            // finalizeBatch on that seq, so its 2xx releases only
+            // once this cross-tenant write commits
+            // (docs/proposer-audit.md Addendum 3).
+            const batch_ws = try self.batch_side.targetWs(allocator, target_id);
+            for (ws.ops.items) |wop| switch (wop) {
+                .put => |p| try batch_ws.addPut(p.key, p.value),
+                .delete => |d| try batch_ws.addDelete(d.key),
             };
         }
 

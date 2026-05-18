@@ -153,9 +153,11 @@ pub fn proposeBatch(
     // Build each present envelope into a dynamic inner-list, then
     // hand off to proposeMulti. encodeTyped @memcpy's the payload so
     // each env owns its bytes — transient payload buffers are freed
-    // immediately after encoding. proposeBatch never produces >3
-    // inners, so it never chunks: behavior is identical to the prior
-    // fixed-[3] bare-single / one-multi version.
+    // immediately after encoding. Inner order keeps the writes
+    // contiguous and early (anchor at inner[0], then the Option-A
+    // side writes) so the atomic-critical set lands in chunk 0 in
+    // the realistic <255-inner case (proposeMulti's cross-chunk
+    // non-atomicity only bites in the extreme >255 path).
     var inner: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (inner.items) |env| allocator.free(env);
@@ -166,6 +168,26 @@ pub fn proposeBatch(
         const ws_bytes = try writeset.encode(allocator);
         defer allocator.free(ws_bytes);
         try inner.append(allocator, try apply_mod.encodeWriteSetEnvelope(allocator, anchor_id, ws_bytes));
+    }
+    // Option-A (docs/proposer-audit.md Addendum 3): the admin
+    // handler's cross-tenant trampoline writes (per target, type-0
+    // with the target id) and `platform.root.*` writes (type-2)
+    // ride the SAME multi-envelope → one raft seq the calling admin
+    // request is parked on by finalizeBatch. Replaces the per-site
+    // fire-and-forget proposes the caller never gated on. `apply`
+    // routes each inner to its per-target store atomically.
+    for (worker.batch_side.targets.items) |*t| {
+        if (t.ws.ops.items.len == 0) continue;
+        const tb = try t.ws.encode(allocator);
+        defer allocator.free(tb);
+        try inner.append(allocator, try apply_mod.encodeWriteSetEnvelope(allocator, t.id, tb));
+    }
+    if (worker.batch_side.root_ws) |*rw| {
+        if (rw.ops.items.len > 0) {
+            const rb = try rw.encode(allocator);
+            defer allocator.free(rb);
+            try inner.append(allocator, try apply_mod.encodeRootWriteSetEnvelope(allocator, rb));
+        }
     }
     if (schedules.len > 0) {
         const payload = try schedule_server.encodeUpsertBatch(allocator, schedules);
