@@ -1,0 +1,11 @@
+{
+  "_comment": "Minimal seed manifest for scripts/divergence_faultinj_smoke.py — a single self-contained tenant: `?fn=arm` delayed-self-schedules an internal http.send; the default route events.emit's. No acme/OIDC needed. docs/unified-effect-gating.md idiom-1 regression gate.",
+  "tenants": [
+    {
+      "id": "divtest",
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/divtest/index.mjs"}
+      ]
+    }
+  ]
+}
