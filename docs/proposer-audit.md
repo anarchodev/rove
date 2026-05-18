@@ -174,3 +174,148 @@ park a unit instead of fire-and-forgetting.
   it; the narrower `ParkedUnit{seq,txn,on_commit,on_fault}` reconciler
   is the fallback if full migration proves too invasive. Stage
   H2-reference-first, each migration gated by the fault test.
+
+---
+
+## Addendum — the read-side dual (idiom-0), 2026-05-17
+
+> Added after a fresh-eyes pass asked the broader question this
+> doc's title scopes away: not "which *proposer* releases early"
+> but "which *externally-visible result* is derived from state
+> that has not committed." A proposer audit is structurally blind
+> to one path, because that path **never proposes**.
+
+### The hole
+
+A **read-only batch** (`worker_dispatch.zig:147-194`,
+`finalizeBatch`'s `!has_writes and !has_cmds` branch) does no raft
+hop: it commits its txn locally and immediately moves its entities
+`request_out → response_in` — the HTTP response escapes. kvexp's
+chain model lets a reader walk *backward through chain
+predecessors* (`manifest.zig:1258-1307`, `getLocked`); if this
+batch read a key an earlier, still-raft-pending batch wrote, it
+observed that predecessor's **speculative, not-yet-committed**
+value and kvexp set `Txn.saw_speculation = true`
+(`manifest.zig:1245-1249`). On commit the txn takes the chain-head
+slow path and returns `Conflict` (the predecessor has not
+applied); the code `rollback()`s it — **but still externalises the
+response anyway** (the `for (successes.items)` move runs
+regardless of the commit/rollback outcome). The in-code comment
+already states the defect verbatim:
+
+> *"The customer sees the response based on speculative state that
+> hasn't been confirmed yet — same linearizability posture as
+> pre-kvexp-bump (the bigger fix is to park such read-only batches
+> on raft apply, which needs new plumbing)."*
+
+If the leader crashes before that predecessor's entry reaches
+quorum, raft truncates it (it never happened, by raft's own
+rules) — but a client was already told a value the durable system
+never held. This is exactly the escaped-effect class §"The bug
+class" defines; the read-only batch is simply not in the
+per-site table because it issues no `propose()`.
+
+### Why the writer dual is already safe and this one is not
+
+A *writing* reader that crossed speculation **is** safe for free:
+it parks on its **own** propose seq, raft's commit index is
+monotonic, and per-tenant chain order = propose order, so its
+commit implies every predecessor it read also committed (and its
+txn applies after them). It needs no extra gate — `drainRaftPending`
+already covers it.
+
+A **read-only** batch has no seq of its own to park on. It is the
+*only* effect class with no native gate, which is precisely why
+it is the residual the proposer framing cannot enumerate. (Note
+`kvstore.zig:471-473` — "in-flight chain Txns are invisible …
+speculative until raft commits" — guards the *no-active-txn lease*
+read, which is safe; the leak is the *active-txn chain-backward*
+read in a non-proposing batch, a different path than that comment
+covers.)
+
+### The engine already exposes the exact predicate
+
+kvexp's `Txn.canSkipRaftPropose()` (`manifest.zig:1456-1462`)
+returns `overlay.count() == 0 and !saw_speculation` — i.e. it
+*already* answers "is this read-only batch safe to release without
+raft." `finalizeBatch` does not consult it; it gates the fast path
+on `has_writes`/`has_cmds` (writeset emptiness) **alone**, ignoring
+`saw_speculation`. The fix is to honour the predicate the engine
+is already computing.
+
+### Classification
+
+| Site | What it externalises | Gate today | Reconciler | Class |
+|---|---|---|---|---|
+| `worker_dispatch.zig:147` finalizeBatch read-only branch | HTTP response carrying a value read from a chain predecessor's speculative overlay (`saw_speculation`) | none — released at local commit/rollback, independent of predecessor durability | **none** | **B-broken (read-derived)** |
+
+This does not change the proposer tally (it is not a proposer);
+it adds one **read-derived** escaped-effect site that the
+invariant must also cover. `unified-effect-gating.md` §2's
+invariant is hereby read to bind **effects derived from a read of
+speculative state**, not only effects released by their own
+proposer. The clean-read path (`saw_speculation == false`, the
+overwhelming common case — a clean read of applied state) is
+unaffected and keeps its zero-cost fast path; the ~100k-req/s
+single-tenant readonly floor does not regress.
+
+### The fix (idiom-0)
+
+Minimal, robust, reuses the proven machinery verbatim. In
+`finalizeBatch`'s read-only branch, when
+`!txn.top.?.canSkipRaftPropose()` (i.e. `saw_speculation` — there
+are no writes by construction here):
+
+1. Do **not** take the immediate-release fast path.
+2. Issue an empty-writeset **barrier propose**
+   (`raft_propose.proposeWriteSet` already always proposes even
+   for an empty writeset — its own doc: *"the seq stamp is still
+   meaningful as a synchronization point for downstream
+   parking"*). This yields a unique gating seq `B =
+   highWatermark()+1`, never colliding with any real proposer's
+   `pending_txns[seq]` slot. It applies as a no-op type-0 envelope
+   on every node.
+3. Mirror the H2 write path **exactly** (`worker_dispatch.zig:243-261`):
+   `pending_txns.put(B, txn)`; stamp `RaftWait{B,…}`; move the
+   entities `request_out → raft_pending`.
+4. No `drainRaftPending` change. Its existing entity loop already
+   gates the *entity release* on `tracked.commit()` **succeeding**
+   (`error.Conflict => continue`, retry next tick), not merely on
+   `committed >= seq`. So the response is released only when the
+   read-only txn becomes chain head — i.e. every predecessor it
+   read has committed **and** applied. Fault / timeout → existing
+   rollback + 503. The predecessor-fault **cascade** that frees
+   successor txns and nulls their `pending_txns` slots
+   (`drainRaftPending.zig` fault branch, the documented
+   "later-seq entries … slot already null" path) covers our
+   read-only txn for free.
+
+Correctness is therefore robust **even under the
+release-lease-before-propose ordering hazard**
+(`worker_dispatch.zig:202` releaseLease precedes `:204`
+proposeBatch, so propose order need not match chain order): the
+chain-head `commit()` gate is causally tied to predecessor
+*detachment*, not to seq arithmetic. The borrowed seq `B` only
+governs *when polling starts* and the fault/timeout downgrade —
+both bounded by the existing `commit_wait_timeout_ns` deadline.
+
+Cost: one extra empty raft entry per *speculation-tainted*
+read-only batch only — rare (a read crossing an in-flight
+predecessor's overlay under concurrent cross-tenant write load).
+`proposeWriteSet` was explicitly designed to carry exactly this
+barrier.
+
+### Migration slot
+
+This is **idiom-0**: a precondition-class fix (the read-side dual
+of the §"bug class" invariant), independent of idioms 1–4 and
+landed the same way — additive, H2-reference-first, gated by its
+own paired fault-injection test
+(`scripts/readonly_speculation_faultinj_smoke.py`): a read-only
+request reads a frozen-follower predecessor's speculative write;
+the leader is killed pre-commit; the regression observable is the
+escaped read response (the value the client was told, which the
+durable cluster never held). Same shape as the idiom-1 gate
+(`scripts/divergence_faultinj_smoke.py`), asserting on the
+escaped *effect*, not on-disk KV (kvexp volatility → no KV
+divergence).

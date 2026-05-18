@@ -175,3 +175,16 @@ rewire `tenant_batch`'s `fireEmits` onto the gate (idiom-1); migrate
 idioms 2→4, each gated by that test. The correctness fix (B
 mechanism) is mandatory and incremental; the Option-A collapse is
 the deliberate architectural follow-up.
+
+**§2 invariant scope clarification (2026-05-17, idiom-0).** §2
+binds not only effects *released by their own proposer* but also
+effects *derived from a read of speculative state*. A non-
+proposing read-only batch that crossed a chain predecessor's
+uncommitted overlay (`saw_speculation`) and externalised the
+result is in scope — see `proposer-audit.md` Addendum (idiom-0).
+That fix reuses this same park/drain machinery via an empty-
+writeset barrier propose; the clean-read fast path
+(`saw_speculation == false`) is untouched, so the readonly
+throughput floor does not regress. idiom-0 is a precondition-
+class fix landed independently of idioms 1–4, gated by
+`scripts/readonly_speculation_faultinj_smoke.py`.
