@@ -251,23 +251,21 @@ fn finalizeBatch(
         // hop. kvexp's commit fast-paths when the txn wrote nothing
         // AND no read crossed a chain-predecessor's overlay — it
         // splices the txn out of the chain at any position, no
-        // chain-head requirement, so it does not return Conflict.
-        // (The speculation case is handled by the idiom-0 branch
-        // above; the Conflict arm below is retained as defensive
-        // belt-and-braces.)
-        txn.commit() catch |err| switch (err) {
-            kv_mod.KvError.Conflict => txn.rollback() catch |rb_err|
-                panic_mod.invariantViolated(
-                    "finalizeBatch.rollback(read_only_speculative)",
-                    "tenant={s} err={s}",
-                    .{ anchor_id, @errorName(rb_err) },
-                ),
-            else => panic_mod.invariantViolated(
-                "finalizeBatch.commit(read_only)",
-                "tenant={s} err={s}",
-                .{ anchor_id, @errorName(err) },
-            ),
-        };
+        // chain-head requirement, so it CANNOT return Conflict. The
+        // speculation case is handled by the idiom-0 barrier branch
+        // above. Any error here (incl. Conflict) is therefore a
+        // broken invariant — panic, do NOT soft-rollback: the prior
+        // `Conflict => txn.rollback()` arm fell through to a `.ok`
+        // response, i.e. a false 2xx after a rollback (the exact
+        // escaped-effect class this path exists to prevent). Fail
+        // loud (feedback_infallibility_violations).
+        txn.commit() catch |err| panic_mod.invariantViolated(
+            "finalizeBatch.commit(read_only)",
+            "tenant={s} err={s} — clean read-only commit cannot fault " ++
+                "(no writes, no speculation); Conflict/other here is a " ++
+                "broken invariant, not a soft-retry",
+            .{ anchor_id, @errorName(err) },
+        );
         allocator.destroy(txn);
         for (successes.items) |*s| {
             server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err| panic_mod.invariantViolated(
