@@ -124,6 +124,27 @@ const SuccessRec = struct {
 /// transferred to `pending_txns` for the drain to handle.
 ///
 /// Returns the number of entries finalized.
+///
+/// Shared tail of every `finalizeBatch` exit loop: move
+/// console/exception ownership out of `s` (so the SuccessRec
+/// teardown can't double-free) and emit the commit-time log
+/// record. The only per-path variance is `(status, outcome)`; the
+/// caller keeps its own `processed += 1`. Behavior-identical to
+/// the five hand-inlined copies it replaced.
+fn captureSuccess(
+    worker: anytype,
+    anchor_id: []const u8,
+    s: *SuccessRec,
+    status: u16,
+    outcome: log_mod.Outcome,
+) void {
+    const console_owned = s.console_owned;
+    const exception_owned = s.exception_owned;
+    s.console_owned = &.{};
+    s.exception_owned = &.{};
+    worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, status, outcome, console_owned, exception_owned, s.tapes);
+}
+
 fn finalizeBatch(
     worker: anytype,
     anchor: *const tenant_mod.Instance,
@@ -197,11 +218,7 @@ fn finalizeBatch(
                         "tenant={s} err={s}",
                         .{ anchor_id, @errorName(e2) },
                     );
-                    const co = s.console_owned;
-                    const eo = s.exception_owned;
-                    s.console_owned = &.{};
-                    s.exception_owned = &.{};
-                    worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .fault, co, eo, s.tapes);
+                    captureSuccess(worker, anchor_id, s, 503, .fault);
                     processed += 1;
                 }
                 successes.clearRetainingCapacity();
@@ -218,11 +235,7 @@ fn finalizeBatch(
                     .deadline_ns = deadline_ns,
                 });
                 try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
-                const console_owned = s.console_owned;
-                const exception_owned = s.exception_owned;
-                s.console_owned = &.{};
-                s.exception_owned = &.{};
-                worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
+                captureSuccess(worker, anchor_id, s, s.status_code, .ok);
                 processed += 1;
             }
             // Any emits from this tainted batch gate on the same
@@ -262,11 +275,7 @@ fn finalizeBatch(
                 "tenant={s} err={s}",
                 .{ anchor_id, @errorName(err) },
             );
-            const console_owned = s.console_owned;
-            const exception_owned = s.exception_owned;
-            s.console_owned = &.{};
-            s.exception_owned = &.{};
-            worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
+            captureSuccess(worker, anchor_id, s, s.status_code, .ok);
             processed += 1;
         }
         // Read-only emits: no raft to gate on.
@@ -308,11 +317,7 @@ fn finalizeBatch(
                 "tenant={s} err={s}",
                 .{ anchor_id, @errorName(err2) },
             );
-            const console_owned = s.console_owned;
-            const exception_owned = s.exception_owned;
-            s.console_owned = &.{};
-            s.exception_owned = &.{};
-            worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, 503, .fault, console_owned, exception_owned, s.tapes);
+            captureSuccess(worker, anchor_id, s, 503, .fault);
             processed += 1;
         }
         successes.clearRetainingCapacity();
@@ -332,11 +337,7 @@ fn finalizeBatch(
         });
         try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
 
-        const console_owned = s.console_owned;
-        const exception_owned = s.exception_owned;
-        s.console_owned = &.{};
-        s.exception_owned = &.{};
-        worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
+        captureSuccess(worker, anchor_id, s, s.status_code, .ok);
         processed += 1;
     }
     // KNOWN DEVIATION: this H2 propose-success path still fires SSE
