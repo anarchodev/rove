@@ -204,11 +204,15 @@ const CallbackPolicy = struct {
         ws: anytype,
         ps: anytype,
         pc: anytype,
+        pe: anytype,
     ) !void {
         // proposeBatch wraps writes + schedules + cancels into one
         // multi-envelope (or proposes bare when only one bucket has
         // content). undoTxn-on-failure lives in the skeleton.
-        _ = try raft_propose.proposeBatch(worker, ws, ps.items, pc.items, inst.id);
+        const seq = try raft_propose.proposeBatch(worker, ws, ps.items, pc.items, inst.id);
+        // Gate SSE emits on commit, not accept: park them keyed by
+        // `seq` (docs/unified-effect-gating.md idiom-1, step 2).
+        try worker_mod.parkEmits(worker, seq, inst.id, pe);
     }
 };
 

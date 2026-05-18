@@ -2561,6 +2561,35 @@ fn firePendingEmits(worker: anytype, unit: *ParkedUnit) void {
     );
 }
 
+/// Register a tenant-batch dispatch's SSE emits as a post-propose
+/// parked unit (docs/unified-effect-gating.md idiom-1, step 2).
+/// Moves the emit buffer + an owned copy of `tenant_id` into
+/// `worker.pending_units` keyed by the propose `seq`;
+/// `drainRaftPending` releases them at commit / discards on fault.
+/// Empties `*emits` so the caller's defer is a no-op. On a pre-move
+/// error the emits stay with the caller (its defer drops them —
+/// degraded but safe: nothing escaped, no double-free).
+pub fn parkEmits(
+    worker: anytype,
+    seq: u64,
+    tenant_id: []const u8,
+    emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
+) !void {
+    if (emits.items.len == 0) return; // nothing to gate
+    const allocator = worker.allocator;
+    try worker.pending_units.ensureUnusedCapacity(allocator, 1);
+    const tid = try allocator.dupe(u8, tenant_id);
+    const moved = emits.*;
+    emits.* = .empty;
+    worker.pending_units.appendAssumeCapacity(.{
+        .seq = seq,
+        .deadline_ns = @intCast(std.time.nanoTimestamp() +
+            @as(i128, @intCast(worker.commit_wait_timeout_ns))),
+        .tenant_id = tid,
+        .emits = moved,
+    });
+}
+
 /// Leadership-loss drain. Called from the dispatch loop on a
 /// leader→follower transition. Rolls back every pending TrackedTxn
 /// (kvexp recipe §2) and downgrades every `raft_pending` entry to

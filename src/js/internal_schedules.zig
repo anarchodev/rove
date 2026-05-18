@@ -501,8 +501,8 @@ const InternalPolicy = struct {
         ws: anytype,
         ps: anytype,
         pc: anytype,
+        pe: anytype,
     ) !void {
-        _ = inst;
         const allocator = self.allocator;
         var inner: std.ArrayListUnmanaged([]u8) = .empty;
         defer {
@@ -538,6 +538,9 @@ const InternalPolicy = struct {
             .{ self.target_id, self.delivered, self.failed, inner.items.len },
         );
         self.proposed_seq = try raft_propose.proposeMulti(worker, inner.items);
+        // Gate SSE emits on commit, not accept: park them keyed by
+        // the propose seq (docs/unified-effect-gating.md idiom-1).
+        try worker_mod.parkEmits(worker, self.proposed_seq, inst.id, pe);
     }
 };
 

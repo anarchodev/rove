@@ -105,9 +105,12 @@ pub fn drainTenantBatch(
     try txn.commit();
     committed = true;
 
-    policy.propose(worker, inst, &writeset, &pending_schedules, &pending_cancels) catch |err| {
+    policy.propose(worker, inst, &writeset, &pending_schedules, &pending_cancels, &pending_emits) catch |err| {
         // Local writes already committed; compensating rollback via
-        // the undo log mirrors the HTTP dispatch fault path.
+        // the undo log mirrors the HTTP dispatch fault path. On this
+        // path propose failed BEFORE parkEmits, so pending_emits is
+        // intact and the defer discards it (correct: nothing
+        // committed → the emit must not fire).
         inst.kv.undoTxn(batch_seq) catch |undo_err|
             std.log.err(
                 "tenant-batch {s}: undoTxn after propose error failed: {s}",
@@ -116,8 +119,11 @@ pub fn drainTenantBatch(
         return err;
     };
 
-    // Raft accepted the batch on this node — fire emits at sse-server.
-    fireEmits(worker, inst.id, &pending_emits);
+    // Emits are NOT fired here (accept). policy.propose parked them
+    // on worker.pending_units keyed by the propose seq; the drain
+    // releases them at commit (committedSeq>=seq) / discards on
+    // fault — docs/unified-effect-gating.md idiom-1. (pending_emits
+    // is now emptied; its defer is a no-op.)
     return visited;
 }
 
