@@ -509,3 +509,86 @@ leverage next step for the whole escaped-effect surface is the
 H2-reference-first with a paired fault test — it is the common
 fix for idiom-2-scopeKv + idiom-2-deploy + idiom-3-root at once,
 not three separate ports.
+
+---
+
+## Addendum 4 — Option-A landed, 2026-05-17
+
+> The Option-A envelope-merge from Addendum 3 is implemented. This
+> records what shipped, what is validated, and the one paired
+> gate still owed.
+
+### What shipped
+
+`BatchSideEffects` (worker.zig) — a per-dispatch-tick accumulator
+on the worker (single-threaded, like `pending_txns`): a batch
+root writeset + a per-target writeset list. Reset at
+`dispatchOnce` entry and `finalizeBatch` exit.
+
+- **`platform.root.*`** → `worker.batch_side.root_ws` (stable
+  pointer for the walk via `rootWs`); the per-request
+  fire-and-forget `proposeRootWriteSet` (`worker_dispatch.zig`)
+  is **deleted**.
+- **3 trampolines** (`deployStarter` / `releasePublish` /
+  `scopeKvWrite`) keep their local one-shot speculative write
+  (read-your-writes + leader pre-apply) but accumulate the target
+  writeset into `batch_side.targetWs(target_id)` instead of a
+  fire-and-forget `proposeWriteSet`. All three fire-and-forgets
+  **deleted**.
+- **`proposeBatch`** folds the side writesets into the SAME
+  type-7 multi: anchor type-0 at `inner[0]`, then per-target
+  type-0 (id = target), then the type-2 root — one raft seq.
+  `apply` already routes inners per-target.
+- **`finalizeBatch`** treats a non-empty `batch_side` as
+  "needs propose": a side-effect-only admin op (no anchor app.db
+  writeset) no longer takes the read-only fast path — it is
+  proposed and the calling admin request is parked on the one
+  batch seq via the existing `RaftWait`/`drainRaftPending`
+  machinery (zero drain change). The idiom-2 deploy paths are
+  thereby **gated** (the deferred product call resolved to
+  "gate", folded in for free).
+
+Net: every admin-side escaped effect (idiom-2-scopeKv,
+idiom-2-deploy, idiom-3-`platform.root.*`) now releases its
+caller response only when the side write commits — one atomic
+entry, the proven park, no fire-and-forget, no core-drain change.
+
+### Validated
+
+`zig build test` green; `zig build` green. No regression on the
+fault/park machinery: `readonly_speculation_faultinj` (idiom-0 —
+the `finalizeBatch` read-only gate this change modifies),
+`divergence_faultinj` (idiom-1), `http_send_smoke` (admin
+bootstrap through `finalizeBatch`) all pass. Correctness is
+structural: Option-A reuses the *same* `finalizeBatch`
+propose+park + `drainRaftPending` path idiom-0/admin-kv are
+already fault-proven for; it only adds inners to the existing
+multi and flips the read-only gate when side effects exist — the
+gating mechanism is unchanged.
+
+### The one paired gate still owed (teed up, not vague)
+
+A frozen-quorum fault test asserting the **admin caller's 2xx
+does not escape** before the side write commits. Precise spec:
+operator-OIDC session (smoke_lib RP-login helper, as
+`notifications_smoke`) → 3-node cluster → SIGSTOP both followers
+(no quorum) → `{admin_origin}/?fn=createInstance&args=["spec-N"]`
+(or `?fn=publishRelease` for the target-trampoline arm) →
+**assert the response is NOT a 2xx carrying the created/published
+marker in the frozen window** (pre-Option-A it escapes
+immediately; post it is parked → 503/timeout). Negative control:
+force `has_side=false` in `finalizeBatch` (revert the gate) → the
+2xx must escape → test FAILs. Same shape/discipline as
+`readonly_speculation_faultinj`; deferred only because the
+operator-OIDC + freeze + timing harness is its own
+test-engineering piece (cf. `notifications_smoke`'s
+"advisory — untested plumbing"), not because the fix is unproven.
+
+### Residual escaped-effect surface
+
+- **idiom-3 ACME cert** — separate determination owed (no request
+  entity; likely self-healing / idiom-4 class).
+- **idiom-4 config-mirror** — lowest priority, idempotently
+  re-derived.
+
+Everything else in the per-site table is now closed.
