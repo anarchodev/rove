@@ -72,6 +72,7 @@ const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
 const panic_mod = @import("panic.zig");
 const penalty_mod = @import("penalty.zig");
+const sse_dispatch = @import("sse_dispatch.zig");
 const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
@@ -107,6 +108,30 @@ pub const RaftWait = struct {
     txn_seq: u64 = 0,
     deadline_ns: i64 = 0,
     store: ?*kv_mod.KvStore = null,
+};
+
+/// A non-entity post-propose parked unit (divergence workstream,
+/// `docs/unified-effect-gating.md` idiom-1). The H2 path parks ECS
+/// entities in `raft_pending`; the non-H2 `tenant_batch` paths have
+/// no entity, so they register one of these instead of releasing
+/// their SSE emits at *accept*. `drainRaftPending` releases the
+/// buffered emits at commit (`committedSeq >= seq`) and discards
+/// them on fault/timeout/leadership-loss (the effect never escaped).
+/// Purely additive — the H2 entity path is untouched.
+pub const ParkedUnit = struct {
+    seq: u64,
+    deadline_ns: i64,
+    /// Owned copy — must outlive the proposing dispatch across ticks.
+    tenant_id: []u8,
+    /// Owned; released by `sse_dispatch.fireBatch` on commit or
+    /// `deinit`'d (discarded) on fault.
+    emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty,
+
+    pub fn deinit(self: *ParkedUnit, allocator: std.mem.Allocator) void {
+        for (self.emits.items) |*e| e.deinit(allocator);
+        self.emits.deinit(allocator);
+        allocator.free(self.tenant_id);
+    }
 };
 
 /// Default handler entry path. Each tenant's deployment must have a
@@ -864,6 +889,11 @@ pub fn Worker(comptime opts: Options) type {
         /// failure or raft fault, the txn is `rollback`'d instead.
         /// Single-threaded per worker (the dispatch loop owns it).
         pending_txns: std.AutoHashMapUnmanaged(u64, *kv_mod.KvStore.TrackedTxn) = .empty,
+        /// Non-entity post-propose parked units (divergence
+        /// workstream idiom-1). Serviced by `drainRaftPending`
+        /// alongside (but independently of) the H2 `raft_pending`
+        /// entity path. Single-threaded per worker.
+        pending_units: std.ArrayListUnmanaged(ParkedUnit) = .empty,
         /// Last-tick leader state. A true→false transition triggers
         /// the leadership-loss drain: every pending txn rolls back
         /// (kvexp recipe §2) and every `raft_pending` entry gets
@@ -1158,6 +1188,8 @@ pub fn Worker(comptime opts: Options) type {
                 allocator.destroy(entry.value_ptr.*);
             }
             self.pending_txns.deinit(allocator);
+            for (self.pending_units.items) |*pu| pu.deinit(allocator);
+            self.pending_units.deinit(allocator);
             self.raft_pending.deinit();
             self.dispatcher.deinit();
             if (self.sse_curl) |easy| easy.deinit();
@@ -2482,6 +2514,51 @@ pub fn drainRaftPending(worker: anytype) !void {
 
         try server.reg.move(ent, &worker.raft_pending, &server.response_in);
     }
+
+    // ── Additive: non-entity parked units (idiom-1 SSE-emit gating,
+    //    docs/unified-effect-gating.md). The H2 entity path above is
+    //    untouched — H2 behaviour is byte-identical. Release buffered
+    //    emits at commit; discard on fault/timeout (the effect never
+    //    escaped — same posture as the entity 503 path). Reuses the
+    //    `committed`/`faulted`/`now_ns` watermarks computed above.
+    var u: usize = 0;
+    while (u < worker.pending_units.items.len) {
+        const unit = &worker.pending_units.items[u];
+        if (committed >= unit.seq) {
+            firePendingEmits(worker, unit);
+            unit.deinit(allocator);
+            _ = worker.pending_units.swapRemove(u);
+            continue;
+        }
+        if ((faulted > 0 and faulted >= unit.seq) or now_ns >= unit.deadline_ns) {
+            unit.deinit(allocator); // discard — never committed, never escaped
+            _ = worker.pending_units.swapRemove(u);
+            continue;
+        }
+        u += 1;
+    }
+}
+
+/// Fire a committed parked unit's buffered SSE emits. No-op (caller
+/// still discards the buffer) when the worker isn't wired for SSE.
+/// Mirrors `tenant_batch`'s emit-fire wiring, but gated on commit
+/// instead of accept — the idiom-1 correctness fix.
+fn firePendingEmits(worker: anytype, unit: *ParkedUnit) void {
+    if (unit.emits.items.len == 0) return;
+    const easy = worker.sse_curl orelse return;
+    const base = worker.sse_public_base orelse return;
+    const tok = worker.sse_internal_token orelse return;
+    if (base.len == 0 or tok.len == 0) return;
+    sse_dispatch.fireBatch(
+        worker.allocator,
+        easy,
+        base,
+        tok,
+        unit.tenant_id,
+        0,
+        unit.emits.items,
+        worker.sse_insecure_tls,
+    );
 }
 
 /// Leadership-loss drain. Called from the dispatch loop on a
@@ -2507,6 +2584,12 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
         allocator.destroy(entry.value_ptr.*);
     }
     worker.pending_txns.clearRetainingCapacity();
+
+    // Discard parked units — their seqs won't commit on this now-
+    // follower; the buffered emits MUST NOT fire (the new leader
+    // re-fires anything that was actually durable).
+    for (worker.pending_units.items) |*pu| pu.deinit(allocator);
+    worker.pending_units.clearRetainingCapacity();
 
     // Downgrade every raft_pending entry to 503 and move to response_in.
     const entities = worker.raft_pending.entitySlice();
