@@ -319,3 +319,103 @@ durable cluster never held). Same shape as the idiom-1 gate
 (`scripts/divergence_faultinj_smoke.py`), asserting on the
 escaped *effect*, not on-disk KV (kvexp volatility → no KV
 divergence).
+
+---
+
+## Addendum 2 — idiom-2 remainder: the trampoline determination, 2026-05-17
+
+> Resolves the empirical question commit `01a9592` (admin-kv
+> idiom-2) explicitly gated the 3 cross-tenant trampolines on:
+> *"parkUndo would be a speculative mechanism without a justified
+> caller; their fix shape is gated on resolving the empirical
+> kvexp-volatility harm question."* Read-only analysis; no code.
+
+### The three sites
+
+`deployStarter` (`worker.zig:1259-1279`), `releasePublishTrampoline`
+(`:1353-1374`), `scopeKvWriteTrampoline` (`:1411-1441`). Identical
+shape: `beginTrackedImmediate()` → `txn.put` → `txn.commit()` →
+fire-and-forget `proposeWriteSet(target_id)` → `inst.kv.commitTxn(
+txn_seq)`. Each writes a **different** tenant's app.db than the
+calling handler's dispatch batch, on its **own** txn (deliberate —
+`worker.zig:1391-1393`), so it has no entity in the dispatch
+lifecycle.
+
+### Finding 1 — the "drop-undo" framing is vacuous under kvexp
+
+`KvStore.commitTxn()` is a **complete no-op**
+(`kvstore.zig:949-952`: `_ = self; _ = txn_seq;`).
+`KvStore.undoTxn()` is a **no-op stub** (`:940-947`, "do not rely
+on it; callers that need this should hold the TrackedTxn and call
+`.rollback()` directly"). There is no `kv_undo` table under kvexp
+(`recoverOrphans` `:959-966`). So the per-site table's "commit →
+fire-and-forget → `commitTxn` **drops undo immediately**" column
+describes the **pre-kvexp SQLite undo-log world** and is *stale*:
+post-kvexp there is no drop-undo step and no force-durable step —
+`commitTxn` does nothing. `txn.commit()` is purely the kvexp
+speculative-overlay commit (→ LMDB only at raft-**apply**, per the
+§"bug class" empirical finding).
+
+### Finding 2 — zero on-disk divergence; the prior deferral was right
+
+Because `commitTxn`/`undoTxn` are no-ops and the only durability
+path is raft-apply, a post-propose pre-quorum fault on a
+trampoline behaves **exactly** like every other kvexp-backed
+write: the speculative overlay is volatile, a crash/truncation
+before apply discards it, and the target tenant's app.db shows
+**no divergence**. A trampoline-side parkUndo would therefore be
+**dead code** — there is nothing to undo (kvexp already "undoes"
+by losing the volatile overlay) and nothing to keep-durable-until-
+commit (`commitTxn` is a no-op). Commit `01a9592`'s refusal to
+port the admin-kv park onto the trampolines is **confirmed
+correct**; the question it gated on is hereby resolved: *no
+trampoline-side mechanism is justified*.
+
+### Finding 3 — the only real escaped effect is the *caller's* response
+
+What still escapes is the **calling handler's success response**:
+`platform.releases.publish(...)` / `platform.scope(id).kv.set(...)`
+/ signup→`deployStarter` returns, the handler's HTTP response is
+released, and the client believes the cross-tenant write is
+durable — while the trampoline's `target_id` propose may never
+reach quorum. The handler's own response parks on the handler's
+**own** batch seq (or releases immediately if read-only); it does
+**not** wait on the trampoline's `target_id` seq. That is a
+genuine premature external effect — but the parkable, justified
+caller is the **handler entity** (which exists in the dispatch
+lifecycle), *not* the trampoline. The correct fix is to thread the
+trampoline's propose seq back up to `finalizeBatch` and gate the
+caller's `RaftWait` on `max(own_seq, trampoline_seq)` — an
+extension of the idiom-0 / admin-kv entity-park to "the calling
+request also waits on a secondary seq from a trampoline it
+invoked." This needs the handler→trampoline→finalize seq-threading
+plumbing (a deliberate design step, the kind `unified-effect-
+gating.md` Option A subsumes), **not** a mechanical port.
+
+### Severity split (drives priority, not correctness)
+
+| Site | Effect on caller-response escape | Disposition |
+|---|---|---|
+| `scopeKvWriteTrampoline` | client told a cross-tenant **data write** succeeded; it may not have. A real linearizability break. | **gate the caller** (seq-threading); highest priority of the three |
+| `releasePublishTrampoline` / `deployStarter` | client told a **deploy pointer** activated; idempotent, operator-initiated, the `deployment_loader` re-converges, and the in-code contract already says "success regardless of raft outcome; raft settles async" (`worker.zig:1306-1313`). Closer to the **contracted at-least-once** Class-A posture (cf. the external scheduler) than to a silent data loss. | either gate the caller *or* formalise the at-least-once contract in the API docs — a **product/API decision**, not a pure correctness one (cf. the "workarounds are API design signals" discipline) |
+
+### Reclassification
+
+The per-site table's `deployStarter` / `releases.publish` /
+`platform.scope.kv` rows: keep **B-broken**, but the broken effect
+is the **caller's response**, not a trampoline-side divergence
+(Findings 1–2 retire that). Reconciler = caller-seq-threading
+(shared with the idiom-0/admin-kv entity-park), gated by a paired
+fault test (a frozen-quorum trampoline call; assert the caller's
+2xx does not escape). `scopeKvWriteTrampoline` first. No
+trampoline-side parkUndo is ever built.
+
+### Net
+
+idiom-2 remainder is **not blocked on an unresolved empirical
+question** any longer (resolved: no divergence, no trampoline
+mechanism justified). It is blocked on a **design step**
+(caller-seq-threading) plus, for the two deploy paths, a
+**product call** (gate vs. formalise at-least-once). Neither is a
+mechanical port; both are tracked here rather than implemented
+speculatively.
