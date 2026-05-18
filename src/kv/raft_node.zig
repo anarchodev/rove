@@ -610,19 +610,11 @@ pub const RaftNode = struct {
         // callbacks so willemt's internal structures are ready to accept
         // log_offer calls during replay.
         if (raft_log) |rl| try self.restoreFromLog(rl);
-
-        // In kv-apply mode, sweep any orphan kv_undo rows left behind by a
-        // previous crash. willemt's commit_idx isn't persisted across
-        // restarts (starts at 0 and advances as the cluster sends us
-        // append_entries), so we treat committed_seq as 0 at startup:
-        // undo every tracked txn. Any entries that were actually committed
-        // will be re-applied via cbApplyLog during normal operation, which
-        // uses `putSeq` (not the tracked path) to overwrite the rolled-back
-        // rows back to the authoritative values.
-        switch (cfg.apply) {
-            .kv => |kv_cfg| try kv_cfg.store.recoverOrphans(0),
-            .opaque_bytes => {},
-        }
+        // (No startup orphan sweep: kvexp has no kv_undo table. A
+        // pre-quorum crash loses the speculative overlay entirely —
+        // no on-disk divergence — and raft replay past
+        // lastAppliedRaftIdx reconstructs the rest. The pre-kvexp
+        // SQLite recoverOrphans path was removed.)
 
         return self;
     }
@@ -746,11 +738,6 @@ pub const RaftNode = struct {
         c.raft_set_request_timeout(raft, @intCast(cfg.request_timeout_ms));
 
         if (raft_log) |rl| try self.restoreFromLog(rl);
-
-        switch (cfg.apply) {
-            .kv => |kv_cfg| try kv_cfg.store.recoverOrphans(0),
-            .opaque_bytes => {},
-        }
 
         return self;
     }

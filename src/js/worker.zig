@@ -86,23 +86,30 @@ const Request = dispatcher_mod.Request;
 ///
 /// ## Flow
 ///
-/// The dispatcher commits the TrackedTxn on the local tenant store
-/// BEFORE parking — the writes are durable and the write lock is
-/// released immediately, so other concurrent requests on the same
-/// tenant can proceed. The raft propose happens in parallel to the
-/// parking. On fault or timeout, `drainRaftPending` uses
-/// `store.undoTxn(txn_seq)` to walk the kv_undo log and
-/// compensating-rollback the writes that were already committed
-/// locally. This is the pattern rove-kv's TrackedTxn + undo log was
-/// built for.
+/// The dispatcher does a kvexp speculative `TrackedTxn.commit()` on
+/// the local tenant store BEFORE parking and releases the dispatch
+/// lease, so other concurrent requests on the same tenant can
+/// proceed while raft consenses in parallel. kvexp's commit is a
+/// *volatile overlay* — it persists to LMDB only at raft-apply, so
+/// a crash/truncation before quorum loses it (no on-disk
+/// divergence). `drainRaftPending` finalises each parked txn by its
+/// raft `seq`: on commit it runs `TrackedTxn.commit()` (chain-head
+/// detach, retried on `Conflict`); on fault/timeout it runs
+/// `TrackedTxn.rollback()` on the pointer held in
+/// `worker.pending_txns[seq]`. (The legacy `KvStore.undoTxn` /
+/// `commitTxn` / `kv_undo`-log path was pre-kvexp SQLite machinery —
+/// now no-op stubs; rollback is `TrackedTxn.rollback()` + kvexp
+/// volatility, not an undo-log walk.)
 ///
 /// Fields:
 /// - `seq`: raft-side sequence from `raft.highWatermark()+1`, tracked
-///   by `committedSeq()` / `faultedSeq()`.
-/// - `txn_seq`: kv-side sequence from `beginTrackedImmediate`, used
-///   as the key to `undoTxn` on fault or timeout.
+///   by `committedSeq()` / `faultedSeq()`; the key into
+///   `worker.pending_txns` that owns the parked `TrackedTxn`.
+/// - `txn_seq`: kv-side counter from `beginTrackedImmediate`
+///   (diagnostic / log correlation; no longer drives any undo).
 /// - `deadline_ns`: absolute `std.time.nanoTimestamp()` deadline.
-/// - `store`: pointer to the tenant's KvStore (for the undoTxn call).
+/// - `store`: pointer to the tenant's KvStore (diagnostic; the
+///   rollback goes through the `pending_txns` TrackedTxn pointer).
 pub const RaftWait = struct {
     seq: u64 = 0,
     txn_seq: u64 = 0,
@@ -1270,13 +1277,7 @@ pub fn Worker(comptime opts: Options) type {
                     .{ target_id, @errorName(err) },
                 );
             };
-            inst.kv.commitTxn(txn.txn_seq) catch |err| {
-                std.log.warn(
-                    "deployStarter: commitTxn for {s} failed: {s}",
-                    .{ target_id, @errorName(err) },
-                );
-            };
-            std.log.info("deployStarter: {s} committed locally + proposed envelope 0", .{target_id});
+            std.log.info("deployStarter: {s} speculative-committed + proposed envelope 0", .{target_id});
 
             // Eagerly enqueue the deployment loader so the runtime-created
             // tenant's snapshot lands without waiting for the next reload
@@ -1364,15 +1365,6 @@ pub fn Worker(comptime opts: Options) type {
                 );
             };
 
-            // Drop the undo row now — at-least-once semantics. A
-            // future commit will keep the undo until raft commits.
-            inst.kv.commitTxn(txn.txn_seq) catch |err| {
-                std.log.warn(
-                    "releases.publish: commitTxn for {s} failed: {s}",
-                    .{ target_id, @errorName(err) },
-                );
-            };
-
             if (self.node.deployment_loader) |loader| {
                 loader.enqueue(target_id, dep_id) catch |err| {
                     std.log.warn(
@@ -1433,12 +1425,6 @@ pub fn Worker(comptime opts: Options) type {
                     .{ @tagName(op), target_id, @errorName(err) },
                 );
             };
-            inst.kv.commitTxn(txn.txn_seq) catch |err| {
-                std.log.warn(
-                    "platform.scope kv: commitTxn for {s} failed: {s}",
-                    .{ target_id, @errorName(err) },
-                );
-            };
         }
 
     };
@@ -1469,18 +1455,10 @@ pub fn Worker(comptime opts: Options) type {
 fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*TenantSlot {
     const allocator = node.allocator;
 
-    // Startup orphan sweep on the tenant's APP store. This belongs
-    // here (not in rove-tenant) because it's specifically about the
-    // raft-vs-local-commit durability pattern that rove-js drives —
-    // rove-tenant just opens the store. A future files-server or
-    // log-server with its own durability layer would run its own
-    // sweep against its own stores.
-    inst.kv.recoverOrphans(0) catch |err| {
-        std.log.warn(
-            "rove-js: recoverOrphans({s}) failed: {s}",
-            .{ inst.id, @errorName(err) },
-        );
-    };
+    // (No startup orphan sweep: kvexp has no kv_undo table — a
+    // pre-quorum crash loses the volatile speculative overlay, so
+    // there are no orphan rows to recover. The pre-kvexp SQLite
+    // sweep was removed.)
 
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,

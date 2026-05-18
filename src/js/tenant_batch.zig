@@ -92,7 +92,6 @@ pub fn drainTenantBatch(
         };
     }
 
-    const batch_seq = txn.txn_seq;
     if (!policy.needsPropose(&writeset, &pending_schedules, &pending_cancels)) {
         // Nothing to replicate — release the txn without proposing.
         // Read-only emits fire immediately; no raft hop to gate on.
@@ -106,16 +105,13 @@ pub fn drainTenantBatch(
     committed = true;
 
     policy.propose(worker, inst, &writeset, &pending_schedules, &pending_cancels, &pending_emits) catch |err| {
-        // Local writes already committed; compensating rollback via
-        // the undo log mirrors the HTTP dispatch fault path. On this
-        // path propose failed BEFORE parkEmits, so pending_emits is
-        // intact and the defer discards it (correct: nothing
-        // committed → the emit must not fire).
-        inst.kv.undoTxn(batch_seq) catch |undo_err|
-            std.log.err(
-                "tenant-batch {s}: undoTxn after propose error failed: {s}",
-                .{ inst.id, @errorName(undo_err) },
-            );
+        // The local write was a kvexp *speculative* commit (volatile
+        // — LMDB only at raft-apply); a propose that never reached
+        // raft leaves nothing durable, so there is no local undo to
+        // perform (kvexp has no kv_undo table — proposer-audit.md
+        // volatility). propose failed BEFORE parkEmits, so
+        // pending_emits is intact and the defer discards it
+        // (correct: nothing committed → the emit must not fire).
         return err;
     };
 

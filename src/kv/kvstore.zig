@@ -932,38 +932,14 @@ pub const KvStore = struct {
         };
     }
 
-    /// Rollback a single tracked txn by reverting the store's root
-    /// to the captured pre-image. The txn's TrackedTxn must still
-    /// hold the captured pre_root; if it's been dropped this is a
-    /// no-op (we can't recover what we don't remember). Returns
-    /// success either way to keep callers' error-handling shape.
-    pub fn undoTxn(self: *KvStore, txn_seq: u64) Error!void {
-        _ = self;
-        _ = txn_seq;
-        // Without the TrackedTxn handle we have no captured
-        // pre_root. Callers that need this should hold the
-        // TrackedTxn and call `.rollback()` directly. This stub
-        // exists for legacy callers; do not rely on it.
-    }
-
-    pub fn commitTxn(self: *KvStore, txn_seq: u64) Error!void {
-        _ = self;
-        _ = txn_seq;
-    }
-
-    pub fn gcUndoThrough(self: *KvStore, committed_seq: u64) Error!void {
-        _ = self;
-        _ = committed_seq;
-    }
-
-    pub fn recoverOrphans(self: *KvStore, committed_seq: u64) Error!void {
-        _ = self;
-        _ = committed_seq;
-        // No kv_undo table to walk under kvexp. The crash-recovery
-        // model is different: kvexp's slot-swap keeps the last
-        // durable manifest intact; raft replay past
-        // `lastAppliedRaftIdx` reconstructs the rest.
-    }
+    // (Pre-kvexp `undoTxn` / `commitTxn` / `gcUndoThrough` /
+    // `recoverOrphans` removed 2026-05-17 — they were SQLite
+    // kv_undo-log machinery and had degenerated to no-op stubs.
+    // Under kvexp the speculative overlay is volatile (→ LMDB only
+    // at raft-apply), so a pre-quorum crash loses it with no
+    // on-disk divergence and nothing to recover; the live rollback
+    // primitive is `TrackedTxn.rollback()`. See
+    // docs/proposer-audit.md.)
 };
 
 /// Collect entries from a kvexp prefix cursor into `list`, honoring

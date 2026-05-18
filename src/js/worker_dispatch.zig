@@ -1148,14 +1148,12 @@ fn handleRelease(
     // parallel release POSTs become a single consensus round.
     const seq = raft_propose.proposeWriteSet(worker, &ws, parsed.value.tenant_id) catch |err| {
         // Propose failed before raft accepted it (queue full,
-        // shutting down, not leader). Undo the local write via
-        // kv_undo and return 503 without parking.
-        inst.kv.undoTxn(txn.txn_seq) catch |undo_err| {
-            std.log.warn(
-                "release: undoTxn after propose-failure for {s} failed: {s}",
-                .{ parsed.value.tenant_id, @errorName(undo_err) },
-            );
-        };
+        // shutting down, not leader). The local write was a kvexp
+        // *speculative* commit (volatile — LMDB only at raft-apply);
+        // a propose that never reached raft leaves nothing durable,
+        // so there is no local undo to perform (kvexp has no
+        // kv_undo table). Return 503 without parking;
+        // docs/proposer-audit.md (kvexp volatility).
         const msg = try std.fmt.allocPrint(
             allocator,
             "release propose failed: {s}\n",
@@ -1293,11 +1291,11 @@ fn handleAdminKv(
     // accept-time 204.)
     const seq = raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID) catch |err| {
         // Synchronous propose failure (queue full / shutting down /
-        // not leader): undo the speculative write + 503, no parking.
-        admin_inst.kv.undoTxn(txn.txn_seq) catch |undo_err| std.log.warn(
-            "admin-kv: undoTxn after propose-failure failed: {s}",
-            .{@errorName(undo_err)},
-        );
+        // not leader). The local write was a kvexp *speculative*
+        // commit (volatile — LMDB only at raft-apply); a propose
+        // that never reached raft leaves nothing durable to undo
+        // (kvexp has no kv_undo table). Return 503 without parking;
+        // docs/proposer-audit.md (kvexp volatility).
         const msg = try std.fmt.allocPrint(
             allocator,
             "admin-kv propose failed: {s}\n",
