@@ -140,9 +140,10 @@ pub fn proposeBatch(
     // each env owns its bytes — transient payload buffers are freed
     // immediately after encoding. Inner order keeps the writes
     // contiguous and early (anchor at inner[0], then the Option-A
-    // side writes) so the atomic-critical set lands in chunk 0 in
-    // the realistic <255-inner case (proposeMulti's cross-chunk
-    // non-atomicity only bites in the extreme >255 path).
+    // side writes) so the atomic-critical set lands in the first
+    // chunk in the realistic case (proposeMulti splits at its
+    // `CHUNK` = 255; cross-chunk non-atomicity only bites in the
+    // extreme >255-inners-for-one-batch path).
     var inner: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (inner.items) |env| allocator.free(env);

@@ -12,9 +12,12 @@
 //!    and kept for retry — the receipt isn't consumed);
 //!  - take the read-only fast path (rollback, no raft hop) when the
 //!    policy says nothing needs replicating;
-//!  - else commit-then-propose-once, with compensating `undoTxn` on
-//!    propose failure (mirrors the HTTP dispatch fault path);
-//!  - fire SSE emits after raft accept.
+//!  - else speculative-commit-then-propose-once; a synchronous
+//!    propose failure needs no compensation (kvexp volatility —
+//!    the overlay is lost, no on-disk divergence), mirroring the
+//!    HTTP dispatch fault path;
+//!  - SSE emits are parked on the propose seq and released at
+//!    commit (idiom-1), not fired at accept.
 //!
 //! Row shape, per-row run, the "needs propose" predicate, and the
 //! propose tail are injected via `policy` (see

@@ -145,9 +145,10 @@ pub const WriteSet = struct {
 /// (with one row in `__root__.db` for restart recovery). Per-tenant
 /// `_apply_state` is no longer written; see `docs/production.md` #1.5.
 ///
-/// No allocation: keys/values are passed by pointer into `payload` directly
-/// to sqlite3_bind_{text,blob} with SQLITE_STATIC, which is safe because the
-/// transaction runs entirely within this function's stack frame.
+/// No allocation: keys/values are borrowed by pointer straight out
+/// of `payload` into the kvexp txn (which copies them into its
+/// overlay on `put`), safe because `payload` outlives the txn here.
+/// (Pre-kvexp this fed sqlite3_bind_* with SQLITE_STATIC.)
 pub fn applyEncoded(
     kv: *kvstore.KvStore,
     seq: u64,

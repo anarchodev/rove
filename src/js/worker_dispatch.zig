@@ -140,8 +140,10 @@ fn finalizeBatch(
     const batch_seq = txn.txn_seq;
     // Option-A: the batch's accumulated admin side effects
     // (`platform.root.*` + cross-tenant trampolines) are folded into
-    // this batch's single raft entry by `proposeBatch`. Freed on
-    // every exit path once proposeBatch has consumed them.
+    // this batch's single raft entry by `proposeBatch`. Reset on
+    // every exit: on the write/side paths proposeBatch has already
+    // encoded+consumed `targets`/`root_ws`; on the read-only path
+    // `has_side` is false so there is nothing to free.
     defer worker.batch_side.reset(allocator);
     const has_side = !worker.batch_side.isEmpty();
     const has_writes = writeset.ops.items.len > 0;
@@ -337,10 +339,16 @@ fn finalizeBatch(
         worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, s.status_code, .ok, console_owned, exception_owned, s.tapes);
         processed += 1;
     }
-    // SSE emits fire once raft has *accepted* the batch (after propose
-    // returns successfully). They're still pending the commit watermark
-    // for follower visibility, but the SSE plan §3.2 only requires
-    // ordering relative to the local accept, not the cluster commit.
+    // KNOWN DEVIATION: this H2 propose-success path still fires SSE
+    // emits at *accept* (propose returned), not at commit. The old
+    // "sse-plan §3.2 only needs accept ordering" rationale was
+    // OVERRULED (docs/unified-effect-gating.md §6: emits must gate
+    // on commit). idiom-1 closed this for the tenant_batch path
+    // (parkEmits, released by drainRaftPending at commit) and the
+    // idiom-0 barrier path here parks too; gating this H2 path is
+    // the remaining §6 step (tracked, not a correctness regression
+    // introduced here — a pre-existing deviation, scoped separately
+    // from this comment pass).
     fireEmitsIfWired(worker, anchor_id, successes, pending_emits);
     successes.clearRetainingCapacity();
     return processed;

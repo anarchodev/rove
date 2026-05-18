@@ -215,8 +215,10 @@ pub const BatchSideEffects = struct {
 /// point lives by default.
 pub const DEFAULT_HANDLER_PATH = "index.js";
 
-/// Tick-local scratch list of tenants that refused `BEGIN IMMEDIATE`
-/// with `SQLITE_BUSY` during the current tick. Owned by the caller
+/// Tick-local scratch list of tenants whose kvexp dispatch lease
+/// `tryAcquire` returned contended (surfaced as `error.Conflict`)
+/// during the current tick — the kvexp successor of the pre-cutover
+/// `SQLITE_BUSY`-on-`BEGIN IMMEDIATE` skip. Owned by the caller
 /// (the worker main loop), cleared at the top of each tick, passed
 /// by-pointer into `dispatchOnce` so a blocked tenant doesn't get
 /// picked as anchor again until the tick ends and the list is
@@ -1372,23 +1374,20 @@ pub fn Worker(comptime opts: Options) type {
         }
 
         /// Trampoline for `platform.releases.publish(tenant_id,
-        /// dep_id)`. Stamps `_deploy/current = hex(dep_id)` on
-        /// the target tenant's app.db, proposes envelope-0 (fire-
-        /// and-forget — no spin), enqueues the deployment loader.
-        ///
-        /// Hot path budget: one TrackedTxn begin + one row insert
-        /// + one fsync + one raft queue insert + one loader enqueue.
-        /// All <10ms on local fsync hardware.
+        /// dep_id)`. Stamps `_deploy/current = hex(dep_id)` on the
+        /// target tenant's app.db (one-shot kvexp speculative
+        /// commit) and folds that writeset into the batch's single
+        /// atomic raft entry (Option-A, docs/proposer-audit.md
+        /// Addendum 3), then enqueues the deployment loader.
         ///
         /// Returns `error.InstanceNotFound` if the target doesn't
-        /// resolve; otherwise success regardless of raft outcome.
-        /// Raft consensus + bytecode load happen async. The local
-        /// commit is provisional under the same at-least-once
-        /// semantics `deployStarter` uses: if raft faults, the
-        /// leader's app.db has a `_deploy/current` value that
-        /// followers don't — logged but not compensated. A future
-        /// pass can move this to the `raft_pending` + `RaftWait`
-        /// pattern for strict consensus-before-truth.
+        /// resolve. The caller's response is **gated on commit**:
+        /// `finalizeBatch` parks the calling admin request on the
+        /// batch seq, so the 2xx releases only once the
+        /// `_deploy/current` write reaches quorum (a pre-quorum
+        /// fault → 503, no escaped effect). No fire-and-forget; the
+        /// old "logged but not compensated" divergence note is
+        /// obsolete (kvexp volatility + the Option-A gate).
         pub fn releasePublishTrampoline(
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
@@ -1456,10 +1455,11 @@ pub fn Worker(comptime opts: Options) type {
         }
 
         /// Trampoline for `platform.scope(id).kv.{set,delete}`. A
-        /// self-contained cross-tenant write to `target_id`'s app.db:
-        /// local commit + fire-and-forget envelope-0 propose, exactly
-        /// the proven `handleAdminKv` / `releasePublishTrampoline`
-        /// shape. Deliberately its own txn (NOT the dispatch batch
+        /// cross-tenant write to `target_id`'s app.db: one-shot kvexp
+        /// speculative commit, then folded into the batch's single
+        /// atomic raft entry (Option-A) so the calling admin
+        /// request's response is gated on the write committing.
+        /// Deliberately its own txn (NOT the dispatch batch
         /// txn) so the admin handler's home-`__admin__` dispatch and a
         /// cross-tenant write never hold two open txns at once
         /// (auth-domain-plan §4.7 "Primitive-fix pivot").
@@ -1528,13 +1528,10 @@ pub fn Worker(comptime opts: Options) type {
 /// If the tenant has no deployment yet, the `handler_bytecode` stays
 /// `null` and requests against this tenant return 503.
 ///
-/// Also runs `recoverOrphans(0)` on the tenant's APP store — any
-/// `kv_undo` rows surviving from a previous run are orphans from a
-/// crash between local commit and raft commit (or from a drain that
-/// didn't get to call `commitTxn`). Rolling them back restores the
-/// tenant to a pre-crash-consistent state before the worker starts
-/// serving requests. Safe on a clean restart: `kv_undo` is empty and
-/// `recoverOrphans` is a no-op.
+/// (No startup orphan sweep: kvexp has no `kv_undo` table — a
+/// pre-quorum crash loses the volatile speculative overlay, so
+/// there are no orphan rows to recover. The pre-kvexp SQLite sweep
+/// was removed.)
 fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*TenantSlot {
     const allocator = node.allocator;
 
@@ -2454,9 +2451,8 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
 //
 // Skipped entities (different tenant than this tick's anchor) stay in
 // `request_out`; the caller's next `dispatchOnce` call picks a fresh
-// anchor from whoever is still there. Stage 3 will add a
-// blocked-tenant set so a SQLITE_BUSY anchor doesn't block other
-// tenants within a single tick.
+// anchor from whoever is still there. The `blocked` set keeps a
+// lease-contended anchor from blocking other tenants within a tick.
 
 /// Process one tenant's batch of requests from `request_out`. Returns
 /// the number of entities moved out of `request_out` (to
@@ -2472,12 +2468,12 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
 ///
 /// `blocked` is any value with `.slice()` returning a slice of
 /// `*const tenant_mod.Instance` and a fallible `append(*const
-/// tenant_mod.Instance)` (e.g. `std.BoundedArray`). When
-/// `beginTrackedImmediate` surfaces `error.Conflict` (SQLite
-/// `SQLITE_BUSY` — set `busy_timeout=0` on app.db connections or you
-/// will wait instead), the current anchor candidate is appended; the
-/// linear walk then ignores that tenant's entities for the rest of
-/// this call and the calls that follow within the tick.
+/// tenant_mod.Instance)` (e.g. `std.BoundedArray`). When the kvexp
+/// dispatch-lease `tryAcquire` is contended (surfaced as
+/// `error.Conflict` from `beginTrackedImmediate`/`ensureOpen` — a
+/// non-blocking try, never a wait), the current anchor candidate is
+/// appended; the linear walk then ignores that tenant's entities for
+/// the rest of this call and the calls that follow within the tick.
 
 /// Iterate `raft_pending`, check each entity's `RaftWait.seq` against
 /// the raft node's committed and faulted watermarks, and run the
