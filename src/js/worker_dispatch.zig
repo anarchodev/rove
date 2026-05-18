@@ -1209,20 +1209,41 @@ fn handleAdminKv(
         return;
     };
 
-    _ = raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID) catch |err| {
-        std.log.warn(
-            "admin-kv: propose envelope 0 for {d} pair(s) failed: {s}",
-            .{ parsed.value.pairs.len, @errorName(err) },
+    // Propose envelope-0 and PARK the request on raft commit — the
+    // 204 must not be released at accept (files-server-standalone
+    // proceeds assuming the bootstrap kv is durable; a pre-quorum
+    // fault would leave it acting on a write the cluster rolled
+    // back). Mirrors the Class-B-correct release handler above:
+    // drainRaftPending delivers the staged 204 at committedSeq>=seq
+    // / 503 on fault/timeout. docs/proposer-audit.md idiom-2,
+    // docs/unified-effect-gating.md. (Replaces the prior
+    // fire-and-forget propose + immediate commitTxn(drop-undo) +
+    // accept-time 204.)
+    const seq = raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID) catch |err| {
+        // Synchronous propose failure (queue full / shutting down /
+        // not leader): undo the speculative write + 503, no parking.
+        admin_inst.kv.undoTxn(txn.txn_seq) catch |undo_err| std.log.warn(
+            "admin-kv: undoTxn after propose-failure failed: {s}",
+            .{@errorName(undo_err)},
         );
-    };
-    admin_inst.kv.commitTxn(txn.txn_seq) catch |err| {
-        std.log.warn(
-            "admin-kv: commitTxn drop-undo failed: {s}",
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "admin-kv propose failed: {s}\n",
             .{@errorName(err)},
         );
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 503, msg, allocator, cors_origin, null);
+        return;
     };
 
-    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
+    try respb.stageSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
+    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
+    try server.reg.set(ent, &server.request_out, RaftWait, .{
+        .seq = seq,
+        .txn_seq = txn.txn_seq,
+        .deadline_ns = deadline_ns,
+        .store = admin_inst.kv,
+    });
+    try server.reg.move(ent, &server.request_out, &worker.raft_pending);
 }
 
 /// Outcome of `resolveRequest`: either the request was finalized
