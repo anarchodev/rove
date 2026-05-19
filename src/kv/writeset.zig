@@ -206,6 +206,37 @@ pub fn scanPutValue(payload: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Decode an encoded writeset payload into its ops, appending to
+/// `out`. Key/value slices BORROW into `payload` (valid as long as
+/// it is) — zero-copy, like `scanPutValue`. The apply path already
+/// rejected malformed payloads loudly before any consumer of this
+/// runs; truncation/bad-type returns the error after a partial fill
+/// (callers may treat best-effort). Used by the Option (b) follower
+/// feed (`send_dispatch.classifyPayload`) to mirror the leader-side
+/// `classify(*WriteSet)` over the replicated bytes.
+pub fn decodeOps(
+    payload: []const u8,
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(Op),
+) !void {
+    var r: Reader = .{ .data = payload, .pos = 0 };
+    const op_count = try r.u32be();
+    var i: u32 = 0;
+    while (i < op_count) : (i += 1) {
+        const type_byte = try r.byte();
+        const key_len = try r.u32be();
+        const k = try r.bytes(key_len);
+        const val_len = try r.u32be();
+        const v = try r.bytes(val_len);
+        const op_type = std.meta.intToEnum(OpType, type_byte) catch
+            return DecodeError.UnknownOpType;
+        switch (op_type) {
+            .put => try out.append(allocator, .{ .put = .{ .key = k, .value = v } }),
+            .delete => try out.append(allocator, .{ .delete = .{ .key = k } }),
+        }
+    }
+}
+
 const Reader = struct {
     data: []const u8,
     pos: usize,

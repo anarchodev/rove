@@ -18,11 +18,12 @@ const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
-const schedule_server = @import("rove-schedule-server");
+const send_outbox = @import("send_outbox.zig");
 
 const globals = @import("globals.zig");
 const limiter_mod = @import("limiter.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
+const continuation_mod = @import("bindings/continuation.zig");
 const c = qjs.c;
 
 pub const DispatchError = error{
@@ -205,12 +206,6 @@ pub const Request = struct {
     /// allocates a local list); the production dispatcher always
     /// sets it non-null. `events.emit` throws if it's null.
     emit_buffer: ?*std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = null,
-    /// docs/http-send-plan.md. `http.send` appends a `ScheduleRow`;
-    /// `http.cancel` appends a `CancelTarget`. Both ride alongside
-    /// the writeset envelope at batch commit. Same null-on-test-paths
-    /// posture as `emit_buffer`.
-    pending_schedules: ?*std.ArrayListUnmanaged(schedule_server.ScheduleRow) = null,
-    pending_cancels: ?*std.ArrayListUnmanaged(schedule_server.CancelTarget) = null,
 };
 
 /// One `(name, value)` pair extracted from the handler's
@@ -260,6 +255,19 @@ pub const Response = struct {
         if (self.headers.len > 0) allocator.free(self.headers);
         self.* = undefined;
     }
+};
+
+/// Outcome of a dispatch run. A *transient* function result the
+/// caller consumes immediately to choose the next collection move —
+/// NOT a discriminant persisted on a per-entity record (that would be
+/// the `feedback_state_is_collection` antipattern). `.terminal` is
+/// today's behavior verbatim; `.continuation` means the handler
+/// returned `next(...)` and the request is mid-trampoline (the h2
+/// entity moves to `parked_continuations` — Phase 3b-ii — not a
+/// `kind` field read later).
+pub const RunOutcome = union(enum) {
+    terminal: Response,
+    continuation: continuation_mod.Continuation,
 };
 
 pub const Dispatcher = struct {
@@ -335,7 +343,13 @@ pub const Dispatcher = struct {
     /// used by the module loader to resolve `import` statements the
     /// entry module pulls in. `null` is valid if the entry has no
     /// imports.
-    pub fn run(
+    /// The dispatch core. `run` (back-compat: returns `Response`,
+    /// collapses `.continuation`→501) wraps this; the
+    /// continuation-aware worker path (Phase 3b-ii/iii) calls
+    /// `runOutcome` directly. Splitting here keeps every existing
+    /// `run` call site (≈30 tests + 3 production callers) unchanged
+    /// while exposing the trampoline outcome where it's needed.
+    pub fn runOutcome(
         self: *Dispatcher,
         kv: *kv_mod.KvStore,
         txn: *kv_mod.TrackedTxn,
@@ -346,7 +360,7 @@ pub const Dispatcher = struct {
         triggers: ?[]const globals.TriggerEntry,
         request: Request,
         budget: *Budget,
-    ) DispatchError!Response {
+    ) DispatchError!RunOutcome {
         self.last_kv_error = null;
 
         var console_buf: std.ArrayList(u8) = .empty;
@@ -379,8 +393,6 @@ pub const Dispatcher = struct {
             .scope_kv_write = request.scope_kv_write,
             .scope_kv_ctx = request.scope_kv_ctx,
             .emit_buffer = request.emit_buffer,
-            .pending_schedules = request.pending_schedules,
-            .pending_cancels = request.pending_cancels,
         };
 
         // Reset the per-request arena (one cursor write) and reseed
@@ -461,6 +473,43 @@ pub const Dispatcher = struct {
 
         return finishResponse(self, &state, &pending, &console_buf);
     }
+
+    /// Back-compat dispatch: run, and collapse a `.continuation` to a
+    /// terminal 501. Every existing caller uses this unchanged until
+    /// Phase 3b-iii wires the worker-local park + resume. A
+    /// continuation arriving here is an EXPECTED condition (a customer
+    /// used `next(...)` before the resume path exists), not an
+    /// infallibility violation — graceful 501, never panic
+    /// (`feedback_infallibility_violations`).
+    pub fn run(
+        self: *Dispatcher,
+        kv: *kv_mod.KvStore,
+        txn: *kv_mod.TrackedTxn,
+        writeset: *kv_mod.WriteSet,
+        bytecode: []const u8,
+        bytecodes: ?*const std.StringHashMapUnmanaged([]u8),
+        source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
+        triggers: ?[]const globals.TriggerEntry,
+        request: Request,
+        budget: *Budget,
+    ) DispatchError!Response {
+        var outcome = try self.runOutcome(kv, txn, writeset, bytecode, bytecodes, source_hashes, triggers, request, budget);
+        switch (outcome) {
+            .terminal => |r| return r,
+            .continuation => |*cont| {
+                cont.deinit(self.allocator);
+                return .{
+                    .status = 501,
+                    .body = try self.allocator.dupe(u8, "continuations not yet supported on this path\n"),
+                    .body_is_json = false,
+                    .console = try self.allocator.dupe(u8, ""),
+                    .exception = try self.allocator.dupe(u8, ""),
+                    .set_cookies = &.{},
+                    .headers = &.{},
+                };
+            },
+        }
+    }
 };
 
 const RunError = error{ Interrupted, OutOfMemory, JsException };
@@ -482,8 +531,15 @@ const PendingResponse = struct {
     /// undefined/null value (or a malformed module) — the caller
     /// skips the handler and goes straight to `finishResponse`.
     short_circuit: bool = false,
+    /// Set by the handler path when the return value is a branded
+    /// `next(...)` descriptor. Transient (consumed by `finishResponse`
+    /// into the `RunOutcome.continuation` arm); never travels with an
+    /// h2 entity. Handler-path only — middleware may not return a
+    /// continuation in v1 (plan §3b B6).
+    continuation: ?continuation_mod.Continuation = null,
 
     fn deinit(self: *PendingResponse, allocator: std.mem.Allocator) void {
+        if (self.continuation) |*cont| cont.deinit(allocator);
         allocator.free(self.body);
         allocator.free(self.exception);
         for (self.cookies.items) |c2| allocator.free(c2);
@@ -791,6 +847,18 @@ fn runModule(
 
     const result = try awaitAndUnwrap(d, rt, ctx, ret_val, budget, pending);
     defer if (result.owns) c.JS_FreeValue(ctx.raw, result.val);
+
+    // Trampoline classification — handler path ONLY (middleware may
+    // not return a continuation in v1, plan §3b B6, so this is not in
+    // the shared `extractBodyAndMeta`). A branded `next(...)` return
+    // short-circuits the body path; `finishResponse` hands it up as
+    // `RunOutcome.continuation` and the entity moves to
+    // `parked_continuations` upstream (collection membership, not a
+    // persisted discriminant).
+    if (try continuation_mod.tryExtract(d.allocator, ctx.raw, result.val)) |cont| {
+        pending.continuation = cont;
+        return;
+    }
 
     // Body from return value. Status / cookies from the ambient
     // `response` global.
@@ -1395,13 +1463,22 @@ fn finishResponse(
     state: *globals.DispatchState,
     pending: *PendingResponse,
     console_buf: *std.ArrayList(u8),
-) DispatchError!Response {
+) DispatchError!RunOutcome {
     if (state.pending_kv_error) |err| {
         d.last_kv_error = err;
         // pending.deinit fires via the caller's errdefer when we
         // return an error — don't double-free here.
         console_buf.deinit(d.allocator);
         return DispatchError.KvFailed;
+    }
+
+    // Trampoline: the handler returned `next(...)`. Hand the
+    // descriptor up; the (unused) response accumulators stay empty.
+    // Move ownership out of `pending` so its deinit can't double-free.
+    if (pending.continuation) |cont| {
+        pending.continuation = null;
+        console_buf.deinit(d.allocator);
+        return .{ .continuation = cont };
     }
 
     const console_bytes = console_buf.toOwnedSlice(d.allocator) catch
@@ -1425,7 +1502,7 @@ fn finishResponse(
         }
     }
 
-    return .{
+    return .{ .terminal = .{
         .status = pending.status,
         .body = pending.body,
         .body_is_json = effective_body_is_json,
@@ -1433,7 +1510,7 @@ fn finishResponse(
         .exception = pending.exception,
         .set_cookies = set_cookies,
         .headers = headers_slice,
-    };
+    } };
 }
 
 fn jsValueToOwned(
@@ -1572,12 +1649,12 @@ test "dispatch: kv.get on missing key returns null" {
 /// Test harness: wrap a statement-level snippet in a named export
 /// named `go`, compile as .mjs, dispatch with `?fn=go`. Matches the
 /// production contract — named-export modules only, positional args.
-fn runOne(
+fn runOneOutcome(
     d: *Dispatcher,
     kv: *kv_mod.KvStore,
     body: []const u8,
     request_in: Request,
-) !Response {
+) !RunOutcome {
     const wrapped = try std.fmt.allocPrint(testing.allocator,
         "export function go() {{ {s} }}\n", .{body});
     defer testing.allocator.free(wrapped);
@@ -1602,29 +1679,115 @@ fn runOne(
         for (local_emits.items) |*e| e.deinit(testing.allocator);
         local_emits.deinit(testing.allocator);
     }
-    var local_schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (local_schedules.items) |*r| r.deinit(testing.allocator);
-        local_schedules.deinit(testing.allocator);
-    }
-    var local_cancels: std.ArrayListUnmanaged(schedule_server.CancelTarget) = .empty;
-    defer {
-        for (local_cancels.items) |*t| t.deinit(testing.allocator);
-        local_cancels.deinit(testing.allocator);
-    }
-
     // If the caller didn't set a query, force `fn=go` so the
     // dispatcher finds our wrapper export.
     var request = request_in;
     if (request.query == null) request.query = "fn=go";
     if (request.emit_buffer == null) request.emit_buffer = &local_emits;
-    if (request.pending_schedules == null) request.pending_schedules = &local_schedules;
-    if (request.pending_cancels == null) request.pending_cancels = &local_cancels;
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    const resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, request, &budget);
+    const outcome = try d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, request, &budget);
     try txn.commit();
-    return resp;
+    return outcome;
+}
+
+/// Back-compat harness: collapses to `Response`. All existing
+/// `runOne`-based tests use this unchanged; continuation tests call
+/// `runOneOutcome`.
+fn runOne(
+    d: *Dispatcher,
+    kv: *kv_mod.KvStore,
+    body: []const u8,
+    request_in: Request,
+) !Response {
+    var outcome = try runOneOutcome(d, kv, body, request_in);
+    switch (outcome) {
+        .terminal => |r| return r,
+        .continuation => |*cont| {
+            cont.deinit(testing.allocator);
+            @panic("runOne: handler returned a continuation; use runOneOutcome");
+        },
+    }
+}
+
+/// 5b-1 test helper. http.send no longer appends a `ScheduleRow`
+/// (env-8 retired) — its only durable record is `_send/owed/{id}` in
+/// the tenant kv (`runOneOutcome` commits the txn, so `kv.get` sees
+/// it). Decode it; caller asserts the same fields the old tests
+/// asserted on the ScheduleRow (OwedSend is exactly that relocatable
+/// subset) and `deinitOwned`s the result.
+fn expectOwed(kv: *kv_mod.KvStore, id: []const u8) !send_outbox.OwedSend {
+    var kbuf: [send_outbox.KEY_BUF]u8 = undefined;
+    const enc = try kv.get(send_outbox.owedKey(&kbuf, id));
+    defer testing.allocator.free(enc);
+    return send_outbox.OwedSend.decode(testing.allocator, enc);
+}
+
+/// http.cancel tombstones `_send/owed/{id}` — assert it is gone.
+fn expectNoOwed(kv: *kv_mod.KvStore, id: []const u8) !void {
+    var kbuf: [send_outbox.KEY_BUF]u8 = undefined;
+    try testing.expectError(error.NotFound, kv.get(send_outbox.owedKey(&kbuf, id)));
+}
+
+test "dispatch: next(...) return is classified as a continuation" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var outcome = try runOneOutcome(
+        &d,
+        kv,
+        \\return __rove_next("handlers/login", { fn: "onToken", ctx: { u: "alice", tries: 0 } });
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    switch (outcome) {
+        .terminal => return error.TestExpectedContinuation,
+        .continuation => |*cont| {
+            defer cont.deinit(testing.allocator);
+            try testing.expectEqualStrings("handlers/login", cont.path);
+            try testing.expectEqualStrings("onToken", cont.fn_name.?);
+            // ctx is JSON-serialized verbatim.
+            try testing.expect(std.mem.indexOf(u8, cont.ctx_json, "\"u\":\"alice\"") != null);
+            try testing.expect(std.mem.indexOf(u8, cont.ctx_json, "\"tries\":0") != null);
+        },
+    }
+}
+
+test "dispatch: ordinary return stays terminal (trampoline does not engage)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Verbatim pre-trampoline behavior: a normal value is the body.
+    var r = try runOne(&d, kv, "return \"hi\";", .{ .method = "GET", .path = "/" });
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 200), r.status);
+    try testing.expectEqualStrings("hi", r.body);
+
+    // And a continuation through the back-compat `run` collapses to
+    // 501 (Phase 3b-i: resume path not wired yet), never hangs/panics.
+    var outcome = try runOneOutcome(
+        &d,
+        kv,
+        \\return __rove_next("m", { ctx: {} });
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    switch (outcome) {
+        .terminal => return error.TestExpectedContinuation,
+        .continuation => |*cont| cont.deinit(testing.allocator),
+    }
 }
 
 test "dispatch: kv.set + kv.get round trip" {
@@ -1886,7 +2049,7 @@ test "dispatch: events.emit rejects malformed sid in to:" {
     try testing.expectEqualStrings("events_bad_sid", resp.body);
 }
 
-test "dispatch: http.send appends ScheduleRow with derived id" {
+test "dispatch: http.send writes _send/owed/{derived id}" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1896,39 +2059,27 @@ test "dispatch: http.send appends ScheduleRow with derived id" {
 
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
-
-    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (schedules.items) |*r| r.deinit(testing.allocator);
-        schedules.deinit(testing.allocator);
-    }
 
     var resp = try runOne(&d, kv,
         \\const id = http.send({ url: "https://api.stripe.com/v1/charges", body: "x" });
         \\return id;
-    , .{
-        .method = "POST",
-        .path = "/",
-        .request_id = 7,
-        .pending_schedules = &schedules,
-    });
+    , .{ .method = "POST", .path = "/", .request_id = 7 });
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 1), schedules.items.len);
-    const r = &schedules.items[0];
-    try testing.expectEqualStrings(r.id, resp.body); // returned id matches the row id
-    try testing.expectEqual(@as(usize, 64), r.id.len);
-    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", r.url);
-    try testing.expectEqualStrings("POST", r.method);
-    try testing.expectEqualStrings("x", r.body);
-    try testing.expectEqual(@as(i64, 0), r.fire_at_ns);
+    try testing.expectEqual(@as(usize, 64), resp.body.len); // derived sha256 hex
+    var owed = try expectOwed(kv, resp.body);
+    defer owed.deinitOwned(testing.allocator);
+    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", owed.url);
+    try testing.expectEqualStrings("POST", owed.method);
+    try testing.expectEqualStrings("x", owed.body);
+    try testing.expectEqual(@as(i64, 0), owed.fire_at_ns);
 }
 
-test "dispatch: http.send with handle uses handle as id + same handle overwrites the row" {
-    // Note: the dispatcher just appends to the per-batch list. The
-    // "same handle overwrites" semantics live in apply.zig (UPSERT
-    // bumps version). Here we verify the binding accepts a handle
-    // and threads it through unchanged.
+test "dispatch: http.send with handle uses handle as id; same handle overwrites _send/owed" {
+    // The handle IS the `_send/owed/{id}` key. Two sends with the
+    // same handle in one hop write the same key — the second
+    // overwrites the first (last-write-wins; resolve-once is
+    // proof-presence + id-dedup, no version counter).
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1938,29 +2089,17 @@ test "dispatch: http.send with handle uses handle as id + same handle overwrites
 
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
-
-    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (schedules.items) |*r| r.deinit(testing.allocator);
-        schedules.deinit(testing.allocator);
-    }
 
     var resp = try runOne(&d, kv,
         \\http.send({ handle: "reminder-foo", url: "https://x/" });
         \\http.send({ handle: "reminder-foo", url: "https://x/", fire_at_ns: 1234 });
         \\return "ok";
-    , .{
-        .method = "POST",
-        .path = "/",
-        .request_id = 1,
-        .pending_schedules = &schedules,
-    });
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 2), schedules.items.len);
-    try testing.expectEqualStrings("reminder-foo", schedules.items[0].id);
-    try testing.expectEqualStrings("reminder-foo", schedules.items[1].id);
-    try testing.expectEqual(@as(i64, 1234), schedules.items[1].fire_at_ns);
+    var owed = try expectOwed(kv, "reminder-foo"); // handle == id
+    defer owed.deinitOwned(testing.allocator);
+    try testing.expectEqual(@as(i64, 1234), owed.fire_at_ns); // 2nd send won
 }
 
 test "dispatch: http.send accepts on_result.fn + on_result.args" {
@@ -1974,14 +2113,8 @@ test "dispatch: http.send accepts on_result.fn + on_result.args" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (schedules.items) |*r| r.deinit(testing.allocator);
-        schedules.deinit(testing.allocator);
-    }
-
     var resp = try runOne(&d, kv,
-        \\http.send({
+        \\return http.send({
         \\  url: "https://stripe.com/x",
         \\  on_result: {
         \\    module: "stripe",
@@ -1989,20 +2122,14 @@ test "dispatch: http.send accepts on_result.fn + on_result.args" {
         \\    args: [42, "subscription"],
         \\  },
         \\});
-        \\return "ok";
-    , .{
-        .method = "POST",
-        .path = "/",
-        .request_id = 7,
-        .pending_schedules = &schedules,
-    });
+    , .{ .method = "POST", .path = "/", .request_id = 7 });
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 1), schedules.items.len);
-    const row = &schedules.items[0];
-    try testing.expectEqualStrings("stripe", row.on_result_module);
-    try testing.expectEqualStrings("handleCharge", row.on_result_fn);
-    try testing.expectEqualStrings("[42,\"subscription\"]", row.on_result_args_json);
+    var owed = try expectOwed(kv, resp.body);
+    defer owed.deinitOwned(testing.allocator);
+    try testing.expectEqualStrings("stripe", owed.on_result_module);
+    try testing.expectEqualStrings("handleCharge", owed.on_result_fn);
+    try testing.expectEqualStrings("[42,\"subscription\"]", owed.on_result_args_json);
 }
 
 test "dispatch: http.send rejects non-array on_result.args" {
@@ -2046,29 +2173,18 @@ test "dispatch: http.send omitted on_result.fn defaults to empty" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (schedules.items) |*r| r.deinit(testing.allocator);
-        schedules.deinit(testing.allocator);
-    }
-
     var resp = try runOne(&d, kv,
-        \\http.send({ url: "https://x/", on_result: { module: "m" } });
-        \\return "ok";
-    , .{
-        .method = "POST",
-        .path = "/",
-        .request_id = 1,
-        .pending_schedules = &schedules,
-    });
+        \\return http.send({ url: "https://x/", on_result: { module: "m" } });
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 1), schedules.items.len);
-    try testing.expectEqualStrings("", schedules.items[0].on_result_fn);
-    try testing.expectEqualStrings("", schedules.items[0].on_result_args_json);
+    var owed = try expectOwed(kv, resp.body);
+    defer owed.deinitOwned(testing.allocator);
+    try testing.expectEqualStrings("", owed.on_result_fn);
+    try testing.expectEqualStrings("", owed.on_result_args_json);
 }
 
-test "dispatch: http.cancel appends a CancelTarget" {
+test "dispatch: http.cancel tombstones _send/owed/{id}" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2079,27 +2195,25 @@ test "dispatch: http.cancel appends a CancelTarget" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    var cancels: std.ArrayListUnmanaged(schedule_server.CancelTarget) = .empty;
-    defer {
-        for (cancels.items) |*t| t.deinit(testing.allocator);
-        cancels.deinit(testing.allocator);
+    // Send (creates `_send/owed/reminder-foo`), then cancel it in a
+    // later hop: the owed marker is gone (the only cancel mechanism
+    // now — env-10 retired).
+    var s1 = try runOne(&d, kv,
+        \\http.send({ handle: "reminder-foo", url: "https://x/" });
+        \\return "ok";
+    , .{ .method = "POST", .path = "/", .request_id = 1, .instance_id = "acme" });
+    s1.deinit(testing.allocator);
+    {
+        var owed = try expectOwed(kv, "reminder-foo");
+        owed.deinitOwned(testing.allocator);
     }
 
-    var resp = try runOne(&d, kv,
+    var s2 = try runOne(&d, kv,
         \\http.cancel({ handle: "reminder-foo" });
         \\return "ok";
-    , .{
-        .method = "POST",
-        .path = "/",
-        .request_id = 1,
-        .instance_id = "acme",
-        .pending_cancels = &cancels,
-    });
-    defer resp.deinit(testing.allocator);
-
-    try testing.expectEqual(@as(usize, 1), cancels.items.len);
-    try testing.expectEqualStrings("acme", cancels.items[0].tenant_id);
-    try testing.expectEqualStrings("reminder-foo", cancels.items[0].id);
+    , .{ .method = "POST", .path = "/", .request_id = 2, .instance_id = "acme" });
+    s2.deinit(testing.allocator);
+    try expectNoOwed(kv, "reminder-foo");
 }
 
 test "dispatch: retry.send fires http.send with _retry context wrapper" {
@@ -2113,12 +2227,6 @@ test "dispatch: retry.send fires http.send with _retry context wrapper" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (schedules.items) |*r| r.deinit(testing.allocator);
-        schedules.deinit(testing.allocator);
-    }
-
     var resp = try runOne(&d, kv,
         \\return retry.send({
         \\  url: "https://api.stripe.com/v1/charges",
@@ -2127,21 +2235,16 @@ test "dispatch: retry.send fires http.send with _retry context wrapper" {
         \\  max_attempts: 3,
         \\  context: { charge_id: 42 },
         \\});
-    , .{
-        .method = "POST",
-        .path = "/",
-        .request_id = 7,
-        .pending_schedules = &schedules,
-    });
+    , .{ .method = "POST", .path = "/", .request_id = 7 });
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 1), schedules.items.len);
-    const row = &schedules.items[0];
-    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", row.url);
-    try testing.expectEqualStrings("stripe_done", row.on_result_module);
+    var owed = try expectOwed(kv, resp.body);
+    defer owed.deinitOwned(testing.allocator);
+    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", owed.url);
+    try testing.expectEqualStrings("stripe_done", owed.on_result_module);
 
     // Context carries _retry meta: attempt=1, max_attempts=3, original/etc.
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, row.context_json, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, owed.context_json, .{});
     defer parsed.deinit();
     const ctx = parsed.value.object;
     try testing.expectEqual(@as(i64, 42), ctx.get("charge_id").?.integer);
@@ -2192,12 +2295,6 @@ test "dispatch: retry.next fires a new http.send with attempt+1" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (schedules.items) |*r| r.deinit(testing.allocator);
-        schedules.deinit(testing.allocator);
-    }
-
     var resp = try runOne(&d, kv,
         \\const event = {
         \\  ok: false,
@@ -2213,26 +2310,21 @@ test "dispatch: retry.next fires a new http.send with attempt+1" {
         \\  },
         \\};
         \\return retry.next(event);
-    , .{
-        .method = "POST",
-        .path = "/",
-        .request_id = 1,
-        .pending_schedules = &schedules,
-    });
+    , .{ .method = "POST", .path = "/", .request_id = 1 });
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 1), schedules.items.len);
-    const row = &schedules.items[0];
-    try testing.expectEqualStrings("https://stripe.com/x", row.url);
-    try testing.expectEqualStrings("amount=500", row.body);
-    try testing.expectEqualStrings("stripe_done", row.on_result_module);
+    var owed = try expectOwed(kv, resp.body);
+    defer owed.deinitOwned(testing.allocator);
+    try testing.expectEqualStrings("https://stripe.com/x", owed.url);
+    try testing.expectEqualStrings("amount=500", owed.body);
+    try testing.expectEqualStrings("stripe_done", owed.on_result_module);
     // fire_at_ns nonzero — default exponential backoff applies on
     // the first retry. We don't pin the exact value (depends on
     // Date.now()); just confirm it's in the future.
-    try testing.expect(row.fire_at_ns > 0);
+    try testing.expect(owed.fire_at_ns > 0);
 
     // Context carries the bumped attempt + preserved user fields.
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, row.context_json, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, owed.context_json, .{});
     defer parsed.deinit();
     const ctx = parsed.value.object;
     try testing.expectEqual(@as(i64, 42), ctx.get("charge_id").?.integer);
@@ -3789,7 +3881,7 @@ test "dispatch: request.query exposes raw query string" {
 }
 
 
-test "dispatch: webhook.send (polyfill) appends ScheduleRow to pending_schedules" {
+test "dispatch: webhook.send (polyfill) writes _send/owed/{id} markers" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -3800,15 +3892,9 @@ test "dispatch: webhook.send (polyfill) appends ScheduleRow to pending_schedules
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (schedules.items) |*r| r.deinit(testing.allocator);
-        schedules.deinit(testing.allocator);
-    }
-
     // The legacy webhook.send is now a JS polyfill on top of
     // http.send (src/js/globals/webhook.js). Same call shape from
-    // customer code, but rows land in pending_schedules.
+    // customer code; each writes a `_send/owed/{id}` marker.
     var resp = try runOne(
         &d,
         kv,
@@ -3824,32 +3910,25 @@ test "dispatch: webhook.send (polyfill) appends ScheduleRow to pending_schedules
         \\});
         \\return id1 + "|" + id2;
     ,
-        .{
-            .method = "GET",
-            .path = "/hook",
-            .request_id = 0xdeadbeef,
-            .pending_schedules = &schedules,
-        },
+        .{ .method = "GET", .path = "/hook", .request_id = 0xdeadbeef },
     );
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 2), schedules.items.len);
-
-    // Insertion order preserved.
-    try testing.expectEqualStrings("https://example.test/a", schedules.items[0].url);
-    try testing.expectEqualStrings("POST", schedules.items[0].method);
-    try testing.expectEqualStrings("one", schedules.items[0].body);
-    try testing.expectEqualStrings("cb/a", schedules.items[0].on_result_module);
-    try testing.expectEqualStrings("{\"x\":1}", schedules.items[0].context_json);
-
-    try testing.expectEqualStrings("https://example.test/b", schedules.items[1].url);
-    try testing.expectEqualStrings("GET", schedules.items[1].method);
-
-    // Schedule ids (64-hex sha256 hex) match the response body.
     const id1 = resp.body[0..64];
     const id2 = resp.body[65..];
-    try testing.expectEqualSlices(u8, id1, schedules.items[0].id);
-    try testing.expectEqualSlices(u8, id2, schedules.items[1].id);
+
+    var o1 = try expectOwed(kv, id1);
+    defer o1.deinitOwned(testing.allocator);
+    try testing.expectEqualStrings("https://example.test/a", o1.url);
+    try testing.expectEqualStrings("POST", o1.method);
+    try testing.expectEqualStrings("one", o1.body);
+    try testing.expectEqualStrings("cb/a", o1.on_result_module);
+    try testing.expectEqualStrings("{\"x\":1}", o1.context_json);
+
+    var o2 = try expectOwed(kv, id2);
+    defer o2.deinitOwned(testing.allocator);
+    try testing.expectEqualStrings("https://example.test/b", o2.url);
+    try testing.expectEqualStrings("GET", o2.method);
 }
 
 test "dispatch: webhook.send (polyfill) ids are deterministic under replay" {
@@ -3922,12 +4001,8 @@ test "dispatch: email.send wraps webhook.send (polyfill) with Resend shape" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // email.send → webhook.send (JS polyfill) → http.send → ScheduleRow.
-    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (schedules.items) |*r| r.deinit(testing.allocator);
-        schedules.deinit(testing.allocator);
-    }
+    // email.send → webhook.send (JS polyfill) → http.send →
+    // `_send/owed/{id}`.
     var resp = try runOne(
         &d,
         kv,
@@ -3941,18 +4016,13 @@ test "dispatch: email.send wraps webhook.send (polyfill) with Resend shape" {
         \\  context: { user_id: 42 },
         \\});
     ,
-        .{
-            .method = "POST",
-            .path = "/",
-            .request_id = 7,
-            .pending_schedules = &schedules,
-        },
+        .{ .method = "POST", .path = "/", .request_id = 7 },
     );
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 64), resp.body.len); // id hex
 
-    try testing.expectEqual(@as(usize, 1), schedules.items.len);
-    const row = schedules.items[0];
+    var row = try expectOwed(kv, resp.body);
+    defer row.deinitOwned(testing.allocator);
 
     try testing.expectEqualStrings("https://api.resend.com/emails", row.url);
     try testing.expectEqualStrings("POST", row.method);
@@ -5445,11 +5515,6 @@ test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    var schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (schedules.items) |*r| r.deinit(testing.allocator);
-        schedules.deinit(testing.allocator);
-    }
     var resp = try runOne(
         &d,
         kv,
@@ -5463,17 +5528,13 @@ test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
         \\  text: "t",
         \\});
     ,
-        .{
-            .method = "POST",
-            .path = "/",
-            .request_id = 2,
-            .pending_schedules = &schedules,
-        },
+        .{ .method = "POST", .path = "/", .request_id = 2 },
     );
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 1), schedules.items.len);
-    var body = try std.json.parseFromSlice(std.json.Value, testing.allocator, schedules.items[0].body, .{});
+    var owed = try expectOwed(kv, resp.body);
+    defer owed.deinitOwned(testing.allocator);
+    var body = try std.json.parseFromSlice(std.json.Value, testing.allocator, owed.body, .{});
     defer body.deinit();
 
     try testing.expectEqual(@as(usize, 2), body.value.object.get("to").?.array.items.len);

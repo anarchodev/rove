@@ -20,13 +20,13 @@ const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
-const schedule_server = @import("rove-schedule-server");
 const limiter_mod = @import("limiter.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const email_rate_b = @import("bindings/email_rate.zig");
 const events_b = @import("bindings/events.zig");
 const http_b = @import("bindings/http.zig");
+const cont_b = @import("bindings/continuation.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
 
@@ -159,20 +159,6 @@ pub const DispatchState = struct {
     /// (the snapshot/restore wipes the runtime). Owned values must
     /// be `JS_FreeValue`'d on `deinit`.
     trigger_module_ns: std.StringHashMapUnmanaged(c.JSValue) = .empty,
-    /// Per-batch http.send accumulator (docs/http-send-plan.md §1).
-    /// `http.send` appends a `ScheduleRow` here; `worker_dispatch.
-    /// finalizeBatch` proposes envelope-8 (schedule_upsert) alongside
-    /// envelope-0 (writeset) in a multi-envelope after raft commits.
-    /// Owned by `dispatchOnce`, freed by its `defer` regardless of
-    /// which exit path the batch takes. Optional purely so the
-    /// dispatcher's standalone test paths (which don't allocate the
-    /// list) can leave it null; production worker code always sets
-    /// it non-null.
-    pending_schedules: ?*std.ArrayListUnmanaged(schedule_server.ScheduleRow) = null,
-    /// Per-batch http.cancel accumulator. `http.cancel` appends a
-    /// `CancelTarget`; `finalizeBatch` proposes envelope-10 alongside
-    /// the writeset.
-    pending_cancels: ?*std.ArrayListUnmanaged(schedule_server.CancelTarget) = null,
     /// Per-batch SSE emit accumulator (sse-plan §3.2). `events.emit`
     /// appends an entry here as it runs; `worker_dispatch.finalizeBatch`
     /// hands the merged list to `sse_dispatch.fireBatch` after raft
@@ -345,11 +331,10 @@ fn jsKvSet(
     defer state.allocator.free(val_str);
 
     // Reject writes into platform-reserved namespaces. Platform writers
-    // (http.send → pending_schedules accumulator, events.emit →
-    // _events/, etc.) bypass jsKvSet and write through state.txn /
-    // state.writeset directly (or the per-batch schedule list), so
-    // this guard only fires when customer JS tries to spoof a
-    // platform key.
+    // (http.send → `_send/owed/` marker, events.emit → _events/, etc.)
+    // bypass jsKvSet and write through state.txn / state.writeset
+    // directly, so this guard only fires when customer JS tries to
+    // spoof a platform key.
     if (reserved.isCustomerWriteReserved(key_str)) {
         return throwReservedKey(ctx, key_str);
     }
@@ -1403,11 +1388,11 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "ecdsaVerify",      .cfunc = crypto_b.jsCryptoEcdsaVerify,      .argc = 4 },
     } },
     // http.send / http.cancel — the platform's outbound HTTP
-    // primitive (docs/http-send-plan.md). send appends a
-    // ScheduleRow to the dispatcher's per-batch list and returns
-    // an id; the leader-pinned scheduler thread reads schedules.db
-    // and fires libcurl. cancel appends a CancelTarget to drop a
-    // pending row. webhook.send + email.send polyfill on top
+    // primitive (docs/http-send-plan.md). send writes a
+    // `_send/owed/{id}` marker (Option (b)) and returns an id; the
+    // leader-local per-node SendDispatch fires libcurl off that
+    // marker. cancel tombstones the marker so recovery never
+    // re-fires it. webhook.send + email.send polyfill on top
     // (see webhook.js + email.js).
     .{ .path = &.{ "_system", "http" }, .fns = &.{
         .{ .name = "send",   .cfunc = http_b.jsHttpSend,   .argc = 1 },
@@ -1462,6 +1447,12 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // Error{code:"rate_limited"} on exhaustion; no-op (returns
     // undefined) when state.limiter is null (test paths).
     .{ .name = "__rove_check_email_rate", .cfunc = email_rate_b.jsCheckEmailRate, .argc = 0 },
+    // Trampoline continuation primitive (connection-actor §6.1/§6.4
+    // unified return-as-continuation model). Pure constructor of a
+    // branded descriptor; classified on the handler's return path,
+    // not an effect. Internal builtin for now — the public `next`
+    // JS shim over this lands in Phase 3b-iii.
+    .{ .name = "__rove_next", .cfunc = cont_b.jsNext, .argc = 2 },
 };
 
 // Public shims (docs/builtin-libs-docs-plan.md Phase A). JSDoc-carrying
@@ -1772,7 +1763,7 @@ test "lint(c): every native binding has a globals/ shim (Phase A)" {
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
     // determinism overrides); __rove_check_email_rate is an internal
     // GLOBAL_BUILTIN (called only by globals/email.js).
-    const builtin_exceptions = [_][]const u8{"__rove_check_email_rate"};
+    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next" };
 
     for (STATIC_NAMESPACES) |ns| {
         // The `_system` holder itself + nested paths

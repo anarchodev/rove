@@ -21,12 +21,11 @@
 //!
 //! Row shape, per-row run, the "needs propose" predicate, and the
 //! propose tail are injected via `policy` (see
-//! `callback_dispatch.CallbackPolicy`). `tc` is passed through opaque
-//! to keep this file free of a `worker.zig` import cycle.
+//! `callback_dispatch.SendCompletionPolicy`). `tc` is passed through
+//! opaque to keep this file free of a `worker.zig` import cycle.
 const std = @import("std");
 const kv_mod = @import("rove-kv");
 const tenant_mod = @import("rove-tenant");
-const schedule_server = @import("rove-schedule-server");
 const sse_dispatch = @import("sse_dispatch.zig");
 
 /// Run one tenant's contiguous row slice as a single batched txn.
@@ -62,17 +61,6 @@ pub fn drainTenantBatch(
         for (pending_emits.items) |*e| e.deinit(allocator);
         pending_emits.deinit(allocator);
     }
-    var pending_schedules: std.ArrayListUnmanaged(schedule_server.ScheduleRow) = .empty;
-    defer {
-        for (pending_schedules.items) |*r| r.deinit(allocator);
-        pending_schedules.deinit(allocator);
-    }
-    var pending_cancels: std.ArrayListUnmanaged(schedule_server.CancelTarget) = .empty;
-    defer {
-        for (pending_cancels.items) |*t| t.deinit(allocator);
-        pending_cancels.deinit(allocator);
-    }
-
     var visited: usize = 0;
     for (rows[0..n]) |row| {
         visited += 1;
@@ -83,8 +71,6 @@ pub fn drainTenantBatch(
             &txn,
             &writeset,
             &pending_emits,
-            &pending_schedules,
-            &pending_cancels,
             row,
         ) catch |err| {
             std.log.warn(
@@ -95,7 +81,7 @@ pub fn drainTenantBatch(
         };
     }
 
-    if (!policy.needsPropose(&writeset, &pending_schedules, &pending_cancels)) {
+    if (!policy.needsPropose(&writeset)) {
         // Nothing to replicate — release the txn without proposing.
         // Read-only emits fire immediately; no raft hop to gate on.
         txn.rollback() catch {};
@@ -107,7 +93,7 @@ pub fn drainTenantBatch(
     try txn.commit();
     committed = true;
 
-    policy.propose(worker, inst, &writeset, &pending_schedules, &pending_cancels, &pending_emits) catch |err| {
+    policy.propose(worker, inst, &writeset, &pending_emits) catch |err| {
         // The local write was a kvexp *speculative* commit (volatile
         // — LMDB only at raft-apply); a propose that never reached
         // raft leaves nothing durable, so there is no local undo to

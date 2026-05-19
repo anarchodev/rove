@@ -17,15 +17,16 @@ const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
+const send_outbox = @import("send_outbox.zig");
 const log_mod = @import("rove-log");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
-const schedule_server_mod = @import("rove-schedule-server");
 const blob_mod = @import("rove-blob");
 const files_server_mod = @import("rove-files-server");
 const config_mirror = @import("config_mirror.zig");
 
 const dispatcher_mod = @import("dispatcher.zig");
+const continuation_mod = @import("bindings/continuation.zig");
 const router_mod = @import("router.zig");
 const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
@@ -101,7 +102,70 @@ const SuccessRec = struct {
     /// record shares its id with any webhook rows `webhook.send`
     /// wrote during this request's handler.
     request_id: u64,
+    /// Set when the handler returned `next(...)` (connection-actor
+    /// trampoline). The txn/writeset/raft path is IDENTICAL to a
+    /// terminal success; the only divergence is the final entity
+    /// destination — `parked_continuations` instead of `response_in`,
+    /// no response stamped. Transient (consumed in `finalizeBatch` /
+    /// `drainRaftPending` into `worker.parked_meta`); never a
+    /// persisted per-entity discriminant.
+    cont: ?continuation_mod.Continuation = null,
+    /// Absolute §6.4 mandatory-timeout deadline for the parked
+    /// stream; meaningful only when `cont != null`.
+    cont_deadline_ns: i64 = 0,
+    /// §6.4 binding: the id of the single `http.send` this hop fired,
+    /// captured by scanning the batch writeset for the lone
+    /// `_send/owed/{id}` put at the run-site (the customer never
+    /// receives it — `http.send` returns undefined — so the binding
+    /// is runtime-internal). Borrows the writeset put key; duped into
+    /// `ParkedCont` by the cont helpers. null = hop fired 0 or >1
+    /// sends → deadline-only resume.
+    cont_bound_sched_id: ?[]const u8 = null,
 };
+
+// ── Trampoline (connection-actor §6.1/§6.4) finalize helpers ───────
+// The txn/writeset/raft machinery is identical for a continuation;
+// these only redirect the FINAL entity destination + own the
+// descriptor handoff into `worker.parked_meta` (data side-store;
+// lifecycle stays collection membership — `feedback_state_is_collection`).
+
+/// Committed read-only success that is a continuation → park (not
+/// `response_in`), no response stamped. Returns true iff it parked
+/// (caller skips its own move + captures as parked).
+fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator, tenant_id: []const u8, s: *SuccessRec) !bool {
+    const cont = s.cont orelse return false;
+    const tid = try allocator.dupe(u8, tenant_id);
+    errdefer allocator.free(tid);
+    const bsid: ?[]u8 = if (s.cont_bound_sched_id) |b| try allocator.dupe(u8, b) else null;
+    errdefer if (bsid) |x| allocator.free(x);
+    try worker.parked_meta.put(allocator, s.ent, .{ .cont = cont, .deadline_ns = s.cont_deadline_ns, .tenant_id = tid, .bound_schedule_id = bsid });
+    s.cont = null; // ownership moved into parked_meta
+    try server.reg.move(s.ent, &server.request_out, &worker.parked_continuations);
+    return true;
+}
+
+/// Continuation success parked on `raft_pending` (write/barrier
+/// path): record the descriptor so `drainRaftPending` redirects it to
+/// `parked_continuations` on commit. Entity still → `raft_pending`.
+fn contRecordIfAny(worker: anytype, allocator: std.mem.Allocator, tenant_id: []const u8, s: *SuccessRec) !void {
+    const cont = s.cont orelse return;
+    const tid = try allocator.dupe(u8, tenant_id);
+    errdefer allocator.free(tid);
+    const bsid: ?[]u8 = if (s.cont_bound_sched_id) |b| try allocator.dupe(u8, b) else null;
+    errdefer if (bsid) |x| allocator.free(x);
+    try worker.parked_meta.put(allocator, s.ent, .{ .cont = cont, .deadline_ns = s.cont_deadline_ns, .tenant_id = tid, .bound_schedule_id = bsid });
+    s.cont = null;
+}
+
+/// 503 path: the open hop didn't durably commit → can't hold.
+/// Discard the descriptor; the entity gets the same 503 a terminal
+/// success would (client retries — best-effort / moot-on-loss).
+fn contDiscardIfAny(allocator: std.mem.Allocator, s: *SuccessRec) void {
+    if (s.cont) |*cptr| {
+        cptr.deinit(allocator);
+        s.cont = null;
+    }
+}
 
 /// End-of-walk: propose the merged batch through raft, defer the
 /// TrackedTxn commit until raft confirms (kvexp README §1 speculative
@@ -151,8 +215,6 @@ fn finalizeBatch(
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *const kv_mod.WriteSet,
     pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
-    pending_schedules: *const std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow),
-    pending_cancels: *const std.ArrayListUnmanaged(schedule_server_mod.CancelTarget),
     successes: *std.ArrayList(SuccessRec),
 ) !usize {
     const server = worker.h2;
@@ -168,16 +230,13 @@ fn finalizeBatch(
     defer worker.batch_side.reset(allocator);
     const has_side = !worker.batch_side.isEmpty();
     const has_writes = writeset.ops.items.len > 0;
-    const has_schedules = pending_schedules.items.len > 0;
-    const has_cancels = pending_cancels.items.len > 0;
-    const has_cmds = has_schedules or has_cancels;
     var processed: usize = 0;
 
     // A batch with only side effects (e.g. an admin handler that did
     // nothing but `platform.root.set` or `platform.releases.publish`)
     // must NOT take the read-only fast path — its response has to be
     // parked until the side-effect inners commit.
-    if (!has_writes and !has_cmds and !has_side) {
+    if (!has_writes and !has_side) {
         // idiom-0 read-side gate (docs/proposer-audit.md Addendum,
         // docs/unified-effect-gating.md §2 scope clarification). If a
         // read in this batch crossed a chain predecessor's still-
@@ -208,6 +267,7 @@ fn finalizeBatch(
                 );
                 allocator.destroy(txn);
                 for (successes.items) |*s| {
+                    contDiscardIfAny(allocator, s); // open hop didn't commit → 503, not held
                     respb.overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |e2| panic_mod.invariantViolated(
                         "finalizeBatch.respb.overwriteWith503(idiom0_barrier_fail)",
                         "tenant={s} err={s}",
@@ -230,6 +290,7 @@ fn finalizeBatch(
             try worker.pending_txns.put(allocator, seq, txn);
             const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
             for (successes.items) |*s| {
+                try contRecordIfAny(worker, allocator, anchor_id, s); // drain redirects to parked_continuations
                 try server.reg.set(s.ent, &server.request_out, RaftWait, .{
                     .seq = seq,
                     .deadline_ns = deadline_ns,
@@ -268,6 +329,13 @@ fn finalizeBatch(
         );
         allocator.destroy(txn);
         for (successes.items) |*s| {
+            // Trampoline: committed read-only continuation → park,
+            // not respond. captured as parked (status 0).
+            if (try contParkIfAny(worker, server, allocator, anchor_id, s)) {
+                captureSuccess(worker, anchor_id, s, 0, .ok);
+                processed += 1;
+                continue;
+            }
             server.reg.move(s.ent, &server.request_out, &server.response_in) catch |err| panic_mod.invariantViolated(
                 "finalizeBatch.move(read_only)",
                 "tenant={s} err={s}",
@@ -293,8 +361,6 @@ fn finalizeBatch(
     const seq = raft_propose.proposeBatch(
         worker,
         writeset,
-        pending_schedules.items,
-        pending_cancels.items,
         anchor_id,
     ) catch |err| {
         std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
@@ -305,6 +371,7 @@ fn finalizeBatch(
         );
         allocator.destroy(txn);
         for (successes.items) |*s| {
+            contDiscardIfAny(allocator, s); // open hop didn't commit → 503, not held
             respb.overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |err2| panic_mod.invariantViolated(
                 "finalizeBatch.respb.overwriteWith503(propose_fail)",
                 "tenant={s} err={s}",
@@ -327,8 +394,17 @@ fn finalizeBatch(
     // confirms (forward iteration, so chain head commits first).
     try worker.pending_txns.put(allocator, seq, txn);
 
+    // Option (b) 4b-ii-B: gate `_send/owed/` arm + `_send/owed/`
+    // delete/`_send/proof/` resolve on this batch's commit, keyed by
+    // the same `seq` the entities wait on. No-op when the batch wrote
+    // no `_send/*` keys. Discarded with the parked unit on
+    // fault/timeout/leadership-loss → FORK-6 leader-side-at-commit.
+    worker_mod.parkSendOps(worker, seq, anchor_id, writeset) catch |perr|
+        std.log.warn("rove-js parkSendOps (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
+
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     for (successes.items) |*s| {
+        try contRecordIfAny(worker, allocator, anchor_id, s); // drain redirects to parked_continuations
         try server.reg.set(s.ent, &server.request_out, RaftWait, .{
             .seq = seq,
             .deadline_ns = deadline_ns,
@@ -1522,22 +1598,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
-    // Per-batch http.send / http.cancel accumulators (docs/http-
-    // send-plan.md). Rows own allocator-allocated strings; the
-    // defer frees them regardless of how the batch ends.
-    // `finalizeBatch` proposes the merged batch as envelope 8 / 10
-    // inside the type-7 multi-envelope alongside envelope 0
-    // (writeset).
-    var pending_schedules: std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow) = .empty;
-    defer {
-        for (pending_schedules.items) |*r| r.deinit(allocator);
-        pending_schedules.deinit(allocator);
-    }
-    var pending_cancels: std.ArrayListUnmanaged(schedule_server_mod.CancelTarget) = .empty;
-    defer {
-        for (pending_cancels.items) |*t| t.deinit(allocator);
-        pending_cancels.deinit(allocator);
-    }
 
     // Per-batch SSE emit accumulator (sse-plan §3.2). `events.emit`
     // appends here; `finalizeBatch` fires the merged batch at
@@ -1558,6 +1618,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         for (successes.items) |*s| {
             if (s.console_owned.len > 0) allocator.free(s.console_owned);
             if (s.exception_owned.len > 0) allocator.free(s.exception_owned);
+            // Safety net: a continuation descriptor still here means an
+            // early-error exit before finalizeBatch consumed it. The
+            // finalize helpers null `s.cont` after transfer, so this
+            // only fires on the unwound path (no leak either way).
+            if (s.cont) |*c| c.deinit(allocator);
         }
         successes.deinit(allocator);
     }
@@ -1916,8 +1981,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             else
                 null,
             .emit_buffer = &pending_emits,
-            .pending_schedules = &pending_schedules,
-            .pending_cancels = &pending_cancels,
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(
@@ -1934,7 +1997,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         else
             dispatcher_mod.Budget.default_duration_ns;
         var budget = dispatcher_mod.Budget.fromNow(budget_ns);
-        var resp = worker.dispatcher.run(
+        // §6.4 binding (5b-1): a continuation hop binds to the single
+        // `_send/owed/{id}` it wrote — derived from `writeset` after
+        // the hop (see `cont_bound_sched_id` below). The customer
+        // never sees the id (`http.send`'s value is unused by §6.4),
+        // so the binding is runtime-internal.
+        const run_oc = worker.dispatcher.runOutcome(
             scope_inst.kv,
             txn.?,
             &writeset,
@@ -1974,6 +2042,59 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads);
             processed += 1;
             continue;
+        };
+        // Trampoline: `.continuation` rides the SAME txn/writeset/raft
+        // path as a terminal success — only the final entity
+        // destination differs (`parked_continuations`, no response
+        // stamped), decided at the success-move sites + drain via
+        // `s.cont`. A benign empty placeholder `resp` lets the
+        // unchanged ~150-line response/SuccessRec block below run
+        // verbatim (empty body/console/exception is already a
+        // supported terminal shape — handlers may return nothing).
+        var cont_opt: ?continuation_mod.Continuation = null;
+        var resp: dispatcher_mod.Response = switch (run_oc) {
+            .terminal => |r| r,
+            .continuation => |cval| ctblk: {
+                cont_opt = cval;
+                break :ctblk dispatcher_mod.Response{
+                    .body = &.{},
+                    .console = &.{},
+                    .exception = &.{},
+                    .set_cookies = &.{},
+                    .headers = &.{},
+                };
+            },
+        };
+        // §6.4 binding: a continuation hop that fired EXACTLY one
+        // http.send binds to that schedule's id (its completion is
+        // the resume outcome — 3c increment 2). 0 or >1 sends → null
+        // (deadline-only resume; >1 is ambiguous, no implicit pick).
+        // Borrowed from the pending ScheduleRow; the cont helpers dupe
+        // it into ParkedCont before finalizeBatch consumes the list.
+        const cont_bound_sched_id: ?[]const u8 = blk: {
+            _ = cont_opt orelse break :blk null;
+            // 5b-1: §6.4 binding source is the single `_send/owed/{id}`
+            // this hop wrote — env-8 `ScheduleRow`/`pending_schedules`
+            // is retired (so is apply.zig's `c/` emission via the
+            // on_result stamp; Part-B resolves §6.4 by matching
+            // `bound_schedule_id`, not via on_result). Exactly one
+            // owed put ⇒ bind the continuation to that send id; 0 or
+            // >1 ⇒ null (deadline-only resume; >1 is ambiguous, no
+            // implicit pick — same semantics as the old ScheduleRow
+            // rule). The id borrows into the writeset put key — valid
+            // through finalizeBatch; the cont helper dupes it into
+            // `ParkedCont`.
+            var only: ?[]const u8 = null;
+            var n: usize = 0;
+            for (writeset.ops.items) |op| switch (op) {
+                .put => |p| if (std.mem.startsWith(u8, p.key, send_outbox.OWED_PREFIX)) {
+                    n += 1;
+                    only = p.key[send_outbox.OWED_PREFIX.len..];
+                },
+                .delete => {},
+            };
+            if (n != 1) break :blk null;
+            break :blk only;
         };
         // `resp.console` / `resp.exception` are freed here unless we
         // transfer them into a SuccessRec below.
@@ -2113,6 +2234,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .received_ns = received_ns,
             .tapes = tape_payloads,
             .request_id = request_id,
+            .cont = cont_opt,
+            .cont_deadline_ns = if (cont_opt != null)
+                @as(i64, @intCast(std.time.nanoTimestamp())) + worker_mod.CONT_HOLD_DEADLINE_NS
+            else
+                0,
+            .cont_bound_sched_id = cont_bound_sched_id,
         });
     }
 
@@ -2127,8 +2254,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         txn.?,
         &writeset,
         &pending_emits,
-        &pending_schedules,
-        &pending_cancels,
         &successes,
     );
     return processed;

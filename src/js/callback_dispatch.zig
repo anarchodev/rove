@@ -67,185 +67,271 @@ const std = @import("std");
 const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
-const schedule_server_mod = @import("rove-schedule-server");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const worker_mod = @import("worker.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
 const raft_propose = @import("raft_propose.zig");
 const tenant_batch = @import("tenant_batch.zig");
+const send_outbox = @import("send_outbox.zig");
+const send_dispatch = @import("send_dispatch.zig");
 
 const Request = dispatcher_mod.Request;
 const Budget = dispatcher_mod.Budget;
 
-/// Per-pass cap on rows fetched from the shared `c/` prefix. Bounds
-/// the dispatch tick's wall time at high callback volumes; the
-/// remainder catches up on subsequent ticks.
+/// Per-tenant per-pass cap on completions resolved from
+/// `SendDispatch.drainCompletion()`. Bounds the resolution tick's
+/// wall time at high send volumes; the remainder catches up on
+/// subsequent ticks.
 pub const DEFAULT_MAX_PER_TENANT: u32 = 32;
 
-/// Process up to `max_per_tenant * N_tenants_with_pending` rows from
-/// `schedules.db c/` in one pass. Returns the total number of rows
-/// visited (delivered + kept-for-retry). Caller passes the per-node
-/// `ScheduleStore` (same handle `dispatchInternalSchedules` uses);
-/// the dispatch tick is gated to worker 0 on the leader by the
-/// caller.
-pub fn dispatchCallbacks(
-    worker: anytype,
-    schedules_store: *schedule_server_mod.ScheduleStore,
-    max_per_tenant: u32,
-) !usize {
-    if (!worker.raft.isLeader()) return 0;
+// (fireEmitsIfWired removed — emit-firing now lives in
+//  tenant_batch.zig, shared across the batched-dispatch paths.)
 
-    const allocator = worker.allocator;
+// ── Option (b): the leader-worker resolution phase ──────────────────
+//
+// 7-A: the dissolved schedule.db's work-queue role. Input is
+// `SendDispatch.drainCompletion()` (the old schedules.db `c/`-row
+// dispatchCallbacks scan is retired — deleted in 5b-2-c). §6.4
+// Part-B continuation peel resumes parked continuations bound to a
+// completion before the per-tenant batch txn opens.
 
-    // Cluster-wide single scan of the callback prefix. Replaces the
-    // previous per-tenant fan-out (one SELECT per tenant per tick).
-    // Cap is intentionally generous — at 32 rows × 1k pending tenants
-    // we'd visit 32k rows / tick, but realistic platforms see far
-    // fewer pending callbacks at any instant.
-    const CAP: usize = 4096;
-    var rows = schedules_store.dueCallbackRows(allocator, CAP) catch |err| {
-        std.log.warn("rove-js callbacks: dueCallbackRows: {s}", .{@errorName(err)});
-        return 0;
-    };
-    defer {
-        for (rows) |*r| r.deinit(allocator);
-        allocator.free(rows);
-    }
-    if (rows.len == 0) return 0;
+/// `tenant_batch.drainTenantBatch` policy for the resolution phase.
+/// Resolution closes via the `_send/proof/` commit → 4b-ii →
+/// `resolve` (no schedules.db / no env-10 coupling). It captures
+/// each row's outcome: `.kept`/`.dropped` ids are accumulated so the
+/// phase can `enqueueRequeue` them (cross-thread → SendDispatch
+/// thread → `resolving→completed`, re-pushed next tick — the
+/// at-least-once retry the old `c/`-row gave). `.delivered` ⇒ proof
+/// written ⇒ removed via the 4b-ii feed (nothing to do here).
+/// Borrowed `{tenant_id, id, payload}` row view passed to
+/// `drainTenantBatch`. Replaces the deleted
+/// `schedule_server.ScheduleStore.CallbackRow` (5b-2-d) — fields
+/// borrow the owning `send_dispatch.Completion`'s memory, so there
+/// is no per-row deinit (the phase frees the Completions in bulk).
+const CompletionRow = struct {
+    tenant_id: []const u8,
+    id: []const u8,
+    payload: []const u8,
+};
 
-    // Group rows by tenant. Sort by tenant_id so contiguous slices
-    // per tenant fall out of one pass.
-    std.sort.pdq(@TypeOf(rows[0]), rows, {}, struct {
-        fn lt(_: void, a: @TypeOf(rows[0]), b: @TypeOf(rows[0])) bool {
-            return std.mem.lessThan(u8, a.tenant_id, b.tenant_id);
-        }
-    }.lt);
+const SendCompletionPolicy = struct {
+    /// Borrowed row.id slices for `.kept`/`.dropped` (valid until the
+    /// phase frees the Completions, after it drains `requeued`).
+    requeued: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    var total: usize = 0;
-    var start: usize = 0;
-    while (start < rows.len) {
-        var end = start + 1;
-        while (end < rows.len and std.mem.eql(u8, rows[end].tenant_id, rows[start].tenant_id)) : (end += 1) {}
-        defer start = end;
-
-        const tenant_id = rows[start].tenant_id;
-        const slice = rows[start..end];
-
-        const slot = worker.node.tenant_files_map.get(tenant_id) orelse {
-            // Tenant was deleted between schedule-fire and now; drop
-            // the callback rows so they don't accumulate forever.
-            for (slice) |r| {
-                schedules_store.applyCancel(r.tenant_id, r.id) catch |err| {
-                    std.log.warn(
-                        "rove-js callbacks: orphan-cleanup {s}/{s}: {s}",
-                        .{ r.tenant_id, r.id, @errorName(err) },
-                    );
-                };
-            }
-            continue;
-        };
-        const snap = slot.pinCurrent() orelse {
-            // Tenant has no current deployment; the handler isn't
-            // available. Drop rather than retry forever.
-            for (slice) |r| {
-                schedules_store.applyCancel(r.tenant_id, r.id) catch {};
-            }
-            continue;
-        };
-        const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
-        defer tc.release();
-        const inst_opt = worker.node.tenant.getInstance(tenant_id) catch |err| {
-            std.log.warn("rove-js callbacks: getInstance({s}): {s}", .{ tenant_id, @errorName(err) });
-            continue;
-        };
-        const inst = inst_opt orelse continue;
-
-        const n = drainTenantCallbacks(worker, tc, inst, slice, @intCast(@min(slice.len, max_per_tenant))) catch |err| {
-            std.log.warn("rove-js callbacks: tenant {s}: {s}", .{ inst.id, @errorName(err) });
-            continue;
-        };
-        total += n;
-    }
-    return total;
-}
-
-/// Callback-path policy for `tenant_batch.drainTenantBatch`: bind the
-/// shared per-tenant batch skeleton to the callback row shape, the
-/// proposeBatch tail, and the writeset/schedules/cancels "needs
-/// propose" predicate. Stateless.
-const CallbackPolicy = struct {
     pub fn runOne(
-        _: *CallbackPolicy,
+        self: *SendCompletionPolicy,
         worker: anytype,
         tc: anytype,
         inst: *const tenant_mod.Instance,
         txn: anytype,
         ws: anytype,
         pe: anytype,
-        ps: anytype,
-        pc: anytype,
-        row: schedule_server_mod.ScheduleStore.CallbackRow,
+        row: CompletionRow,
     ) !void {
-        // savepoint (if any) is rolled back inside runOneCallback on
-        // failure; the outer tenant txn stays healthy. The skeleton
-        // logs + keeps-for-retry on the propagated error.
-        _ = try runOneCallback(worker, tc, inst, txn, ws, pe, ps, pc, row.id, row.payload);
+        const oc = try runOneCallback(worker, tc, inst, txn, ws, pe, row.id, row.payload);
+        switch (oc) {
+            .delivered => {}, // proof written → 4b-ii feed → resolve
+            .kept, .dropped => try self.requeued.append(worker.allocator, row.id),
+        }
     }
 
-    pub fn needsPropose(_: *CallbackPolicy, ws: anytype, ps: anytype, pc: anytype) bool {
-        return ws.ops.items.len > 0 or ps.items.len > 0 or pc.items.len > 0;
+    pub fn needsPropose(_: *SendCompletionPolicy, ws: anytype) bool {
+        return ws.ops.items.len > 0;
     }
 
     pub fn propose(
-        _: *CallbackPolicy,
+        _: *SendCompletionPolicy,
         worker: anytype,
         inst: *const tenant_mod.Instance,
         ws: anytype,
-        ps: anytype,
-        pc: anytype,
         pe: anytype,
     ) !void {
-        // proposeBatch wraps writes + schedules + cancels into one
-        // multi-envelope (or proposes bare when only one bucket has
-        // content). undoTxn-on-failure lives in the skeleton.
-        const seq = try raft_propose.proposeBatch(worker, ws, ps.items, pc.items, inst.id);
-        // Gate SSE emits on commit, not accept: park them keyed by
-        // `seq` (docs/unified-effect-gating.md idiom-1, step 2).
+        // The on_result handler's writes + Seam-A `_send/proof/`
+        // commit in one batch; parkSendOps gates the proof on commit
+        // → 4b-ii → resolve.
+        const seq = try raft_propose.proposeBatch(worker, ws, inst.id);
         try worker_mod.parkEmits(worker, seq, inst.id, pe);
+        worker_mod.parkSendOps(worker, seq, inst.id, ws) catch |perr|
+            std.log.warn("rove-js sendcompl parkSendOps (tenant={s}): {s}", .{ inst.id, @errorName(perr) });
     }
 };
 
-/// Per-tenant callback drain. The txn / accumulator / read-only-fast-
-/// path / commit-propose-undo / emit-fire discipline now lives in
-/// `tenant_batch.drainTenantBatch`; this binds it to the callback
-/// row + proposeBatch tail. Behavior is unchanged from the
-/// pre-extraction inline version.
-fn drainTenantCallbacks(
+/// Leader-worker resolution drain (7-A). Caller pins to worker 0 on
+/// the leader; the leader gate is here. Drains `SendDispatch`
+/// completions, groups by tenant, and runs each through the
+/// per-tenant batch machinery (`runOneCallback`/`drainTenantBatch`).
+/// `.kept`/`.dropped` (incl. tenant-not-loaded / batch error) →
+/// `enqueueRequeue` (retry). Returns rows processed.
+pub fn dispatchSendCompletions(
     worker: anytype,
-    tc: worker_mod.TenantFiles,
-    inst: *const tenant_mod.Instance,
-    rows: []schedule_server_mod.ScheduleStore.CallbackRow,
+    sd: *send_dispatch.SendDispatch,
     max_per_tenant: u32,
 ) !usize {
-    var pol = CallbackPolicy{};
-    return tenant_batch.drainTenantBatch(worker, tc, inst, rows, max_per_tenant, &pol);
+    if (!worker.raft.isLeader()) return 0;
+    const a = worker.allocator;
+
+    const CAP: usize = 4096;
+    var comps: std.ArrayListUnmanaged(send_dispatch.Completion) = .empty;
+    defer {
+        for (comps.items) |*c| c.deinit(a);
+        comps.deinit(a);
+    }
+    while (comps.items.len < CAP) {
+        const c = sd.drainCompletion() orelse break;
+        comps.append(a, c) catch {
+            var cc = c;
+            cc.deinit(a);
+            break;
+        };
+    }
+    if (comps.items.len == 0) return 0;
+    std.log.info("rove-js sendpath: dispatchSendCompletions drained={d}", .{comps.items.len});
+
+    std.sort.pdq(send_dispatch.Completion, comps.items, {}, struct {
+        fn lt(_: void, x: send_dispatch.Completion, y: send_dispatch.Completion) bool {
+            return std.mem.lessThan(u8, x.tenant_id, y.tenant_id);
+        }
+    }.lt);
+
+    var total: usize = 0;
+    var start: usize = 0;
+    while (start < comps.items.len) {
+        var end = start + 1;
+        while (end < comps.items.len and std.mem.eql(u8, comps.items[end].tenant_id, comps.items[start].tenant_id)) : (end += 1) {}
+        defer start = end;
+
+        const tenant_id = comps.items[start].tenant_id;
+        const group = comps.items[start..end];
+
+        // Tenant not loaded / no current deployment / unknown:
+        // requeue the whole group (retry when the deploy lands —
+        // at-least-once; the entries sit in `resolving`, requeue
+        // moves them back to `completed` for re-push).
+        const slot = worker.node.tenant_files_map.get(tenant_id) orelse {
+            for (group) |g| sd.enqueueRequeue(g.callback_id) catch {};
+            continue;
+        };
+        const snap = slot.pinCurrent() orelse {
+            for (group) |g| sd.enqueueRequeue(g.callback_id) catch {};
+            continue;
+        };
+        const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
+        defer tc.release();
+        const inst_opt = worker.node.tenant.getInstance(tenant_id) catch {
+            for (group) |g| sd.enqueueRequeue(g.callback_id) catch {};
+            continue;
+        };
+        const inst = inst_opt orelse {
+            for (group) |g| sd.enqueueRequeue(g.callback_id) catch {};
+            continue;
+        };
+
+        // §6.4 Part-B peel: resume parked continuations bound to a
+        // completion before the per-tenant batch txn opens.
+        // A completion whose send is bound to a parked continuation
+        // on THIS worker resolves by resuming it (flush the held
+        // socket), NOT by running on_result. resumeBoundContinuation
+        // opens its own txn → must run BEFORE drainTenantBatch's
+        // per-tenant batch txn (double-BEGIN deadlock class). Resumed
+        // sends are resolved with a STANDALONE `_send/proof/` propose
+        // (the new-path analogue of the old env-10 cancel-drop:
+        // durable so a future leader's boot-scan skips owed-with-proof
+        // — §6.4 is moot-on-loss, a stray re-fire would just hit a
+        // dead socket → f&f-proof self-resolve) + an explicit
+        // enqueueResolve (this standalone propose bypasses the
+        // worker-side parkSendOps 4b-ii feed). Survivors swap-compact
+        // to the front for the on_result path below.
+        var proof_ws = kv_mod.WriteSet.init(a);
+        defer proof_ws.deinit();
+        var resumed_ids: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer resumed_ids.deinit(a);
+        var rest: usize = 0;
+        var ci: usize = 0;
+        while (ci < group.len) : (ci += 1) {
+            const g = group[ci];
+            const resumed = blk: {
+                var parsed = std.json.parseFromSlice(std.json.Value, a, g.receipt, .{
+                    .ignore_unknown_fields = true,
+                    .allocate = .alloc_always,
+                }) catch break :blk false;
+                defer parsed.deinit();
+                const obj = switch (parsed.value) {
+                    .object => |o| o,
+                    else => break :blk false,
+                };
+                const event = buildCallbackEvent(a, parsed.value) catch break :blk false;
+                defer a.free(event);
+                const matched = worker_mod.resumeBoundContinuation(worker, inst.id, g.callback_id, event);
+                std.log.info("rove-js sendpath: sendcompl §6.4 resume id={s} matched={}", .{ g.callback_id, matched });
+                if (!matched) break :blk false;
+                // Resumed: stage the durable proof (borrows obj
+                // strings — encode before `parsed.deinit`). callback_id
+                // borrowed from `comps` (freed at fn end, after the
+                // standalone propose + enqueueResolve below).
+                const enc = (proofFromReceipt(obj)).encode(a) catch break :blk true;
+                defer a.free(enc);
+                var kbuf: [send_outbox.KEY_BUF]u8 = undefined;
+                proof_ws.addPut(send_outbox.proofKey(&kbuf, g.callback_id), enc) catch {};
+                resumed_ids.append(a, g.callback_id) catch {};
+                break :blk true;
+            };
+            if (!resumed) {
+                // SWAP (not copy): every Completion stays in the
+                // backing array exactly once so the caller's bulk
+                // deinit frees each exactly once (resumed ones live
+                // in group[rest..], still owned, freed there).
+                if (rest != ci) std.mem.swap(send_dispatch.Completion, &group[rest], &group[ci]);
+                rest += 1;
+            }
+        }
+        if (proof_ws.ops.items.len > 0) {
+            if (raft_propose.proposeBatch(worker, &proof_ws, inst.id)) |_| {
+                for (resumed_ids.items) |id| sd.enqueueResolve(id) catch {};
+            } else |e| std.log.warn(
+                "rove-js sendcompl: §6.4 proof propose ({s}): {s} (left for recovery)",
+                .{ inst.id, @errorName(e) },
+            );
+        }
+        if (rest == 0) continue;
+        const survivors = group[0..rest];
+
+        const rows = a.alloc(CompletionRow, survivors.len) catch {
+            for (survivors) |g| sd.enqueueRequeue(g.callback_id) catch {};
+            continue;
+        };
+        defer a.free(rows);
+        for (survivors, 0..) |g, i| rows[i] = .{ .tenant_id = g.tenant_id, .id = g.callback_id, .payload = g.receipt };
+
+        var pol = SendCompletionPolicy{};
+        defer pol.requeued.deinit(a);
+        const n = tenant_batch.drainTenantBatch(worker, tc, inst, rows, @min(rows.len, max_per_tenant), &pol) catch |err| {
+            std.log.warn("rove-js sendcompl: tenant {s}: {s}", .{ inst.id, @errorName(err) });
+            for (group) |g| sd.enqueueRequeue(g.callback_id) catch {};
+            continue;
+        };
+        for (pol.requeued.items) |id| sd.enqueueRequeue(id) catch |e|
+            std.log.warn("rove-js sendcompl: requeue {s}: {s}", .{ id, @errorName(e) });
+        total += n;
+    }
+    return total;
 }
 
-// (fireEmitsIfWired removed — emit-firing now lives in
-//  tenant_batch.zig, shared across the batched-dispatch paths.)
-
-/// Outcome of `runOneCallback` from the caller's point of view. Used
-/// only internally by tests — `drainTenantCallbacks` just cares about
-/// whether writeset.ops grew.
+/// Outcome of `runOneCallback`. `SendCompletionPolicy.runOne`
+/// switches on it: `.delivered` ⇒ the `_send/proof/` write committed
+/// (4b-ii feed → `resolve` closes the send, nothing more to do);
+/// `.kept`/`.dropped` ⇒ `enqueueRequeue` (retry next tick — Option
+/// (b) at-least-once).
 pub const CallbackOutcome = enum {
-    /// Receipt queued for delete + handler writes captured.
+    /// `_send/proof/{id}` staged + handler writes captured (on the
+    /// fire-and-forget path, proof only). Commit closes the send.
     delivered,
-    /// Envelope was bad / handler missing; receipt queued for drop
-    /// with a warning so it doesn't re-run forever.
+    /// Envelope was bad / handler missing — proof NOT written;
+    /// requeued (a redeploy that adds the handler picks it up).
     dropped,
-    /// Handler ran but threw / timed out / hit a kv error. Receipt
-    /// left in place for the next tick to retry.
+    /// Handler ran but threw / timed out / hit a kv error. Proof NOT
+    /// written; requeued for the next tick to retry.
     kept,
 };
 
@@ -256,8 +342,6 @@ fn runOneCallback(
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *kv_mod.WriteSet,
     pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
-    pending_schedules: *std.ArrayListUnmanaged(schedule_server_mod.ScheduleRow),
-    pending_cancels: *std.ArrayListUnmanaged(schedule_server_mod.CancelTarget),
     callback_id: []const u8,
     envelope_bytes: []const u8,
 ) !CallbackOutcome {
@@ -271,7 +355,6 @@ fn runOneCallback(
             "rove-js callbacks: {s}/{s}: malformed envelope; dropping",
             .{ inst.id, callback_id },
         );
-        try queueCancelDrop(allocator, pending_cancels, inst.id, callback_id);
         return .dropped;
     };
     defer parsed.deinit();
@@ -283,7 +366,6 @@ fn runOneCallback(
                 "rove-js callbacks: {s}/{s}: envelope not a JSON object; dropping",
                 .{ inst.id, callback_id },
             );
-            try queueCancelDrop(allocator, pending_cancels, inst.id, callback_id);
             return .dropped;
         },
     };
@@ -291,14 +373,21 @@ fn runOneCallback(
     const on_result: []const u8 = switch (obj.get("on_result") orelse std.json.Value{ .null = {} }) {
         .string => |s| s,
         else => {
-            // No callback path on the envelope — apply-side bug; drop
-            // rather than loop forever.
-            std.log.warn(
-                "rove-js callbacks: {s}/{s}: no on_result; dropping",
-                .{ inst.id, callback_id },
-            );
-            try queueCancelDrop(allocator, pending_cancels, inst.id, callback_id);
-            return .dropped;
+            // Option (b) FIRE-AND-FORGET: no on_result handler — the
+            // send is resolved by recording its outcome. Identical
+            // Seam-A `_send/proof/` the on_result success path writes;
+            // its commit → 4b-ii feed → `resolve` closes it.
+            // (runOneCallback can't reuse the handler path here, but
+            // the proof write is the same.) On kv failure: `.kept` →
+            // requeued, retried.
+            writeSendProof(allocator, txn, writeset, callback_id, obj) catch |err| {
+                std.log.warn(
+                    "rove-js sendcompl: {s}/{s} fire-and-forget proof: {s} (kept)",
+                    .{ inst.id, callback_id, @errorName(err) },
+                );
+                return .kept;
+            };
+            return .delivered;
         },
     };
 
@@ -314,7 +403,6 @@ fn runOneCallback(
             "rove-js callbacks: {s}/{s}: handler '{s}' not in current deployment; dropping",
             .{ inst.id, callback_id, on_result },
         );
-        try queueCancelDrop(allocator, pending_cancels, inst.id, callback_id);
         return .dropped;
     };
 
@@ -365,8 +453,6 @@ fn runOneCallback(
         .limiter = &worker.limiter,
         .instance_id = inst.id,
         .emit_buffer = pending_emits,
-        .pending_schedules = pending_schedules,
-        .pending_cancels = pending_cancels,
     };
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
@@ -425,10 +511,10 @@ fn runOneCallback(
         return .kept;
     }
 
-    // Success: release the savepoint and queue an envelope-10 cancel
-    // for the `c/{tenant}/{id}` row in schedules.db. The handler's
-    // writeset commits below; the cancel rides alongside in the
-    // multi-envelope propose.
+    // Success: release the savepoint. The handler's writeset (+ the
+    // `_send/proof/` write below) commits in the multi-envelope
+    // propose; the proof's commit → 4b-ii feed → `resolve` closes
+    // the send (Option (b) — no schedules.db cancel).
     txn.release() catch |err| {
         std.log.warn(
             "rove-js callbacks: {s}/{s} release failed: {s} (kept)",
@@ -436,26 +522,78 @@ fn runOneCallback(
         );
         return .kept;
     };
-    try queueCancelDrop(allocator, pending_cancels, inst.id, callback_id);
+    // Option-(b) increment 3(a) / FORK-2 Seam A: the send's result is
+    // now durably delivered to the customer's on_result. Only NOW is
+    // an on_result send "proven done" — recording proof at envelope-9
+    // send-completion instead would let a crash between completion and
+    // this commit silently drop the result delivery (Meaning-1
+    // violation). Write `_send/proof/{id}` into THIS batch's writeset
+    // so it commits atomically (envelope-0) with the handler effects +
+    // the `c/` cancel-drop; `callback_id` == send id == the
+    // `_send/owed/{id}` id. Proof presence ⇒ Option-(b) recovery may
+    // GC the owed row + skip re-fire. Inert until recovery consumes it
+    // (increment 4) — additive. On failure: keep the receipt so the
+    // next tick retries — no-silent-loss; the callback re-runs under
+    // the existing at-least-once semantic.
+    writeSendProof(allocator, txn, writeset, callback_id, obj) catch |err| {
+        std.log.warn(
+            "rove-js callbacks: {s}/{s} send-proof write failed: {s} (kept)",
+            .{ inst.id, callback_id, @errorName(err) },
+        );
+        return .kept;
+    };
     return .delivered;
 }
 
-/// Append an envelope-10 cancel target for `(tenant_id, callback_id)`.
-/// The applyCancel path deletes both `s/{tenant}/{id}` (no-op when
-/// the schedule already fired) and `c/{tenant}/{id}` (the cleanup
-/// we want here). Uses the pending_cancels accumulator's allocator;
-/// the deferred deinit at drainTenantCallbacks level owns the dupes.
-fn queueCancelDrop(
+/// Build `send_outbox.Proof` from the callback `receipt` (the
+/// envelope-9 JSON: `{ id, on_result, ok, status, body, error, ... }`,
+/// docs/http-send-plan.md §8) and write `_send/proof/{callback_id}`
+/// into the callback batch's txn + raft writeset — the same worker-
+/// side platform-direct-write pattern increment 2's `writeOwedMarker`
+/// uses. Tolerant decode: any missing/mistyped receipt field falls
+/// back to the failure-shaped default (ok=false / status=0 / "") so a
+/// malformed receipt still records *a* terminal proof rather than
+/// looping recovery forever. `txn.put` / `addPut` copy key+value, so
+/// the stack key buffer + freed `enc` are safe.
+/// Tolerant `_send/proof/` payload from a receipt object — shared by
+/// the Seam-A on_result path (`writeSendProof`) and the §6.4 resumed-
+/// continuation resolution (5a standalone proof propose). Borrows the
+/// receipt's string slices (valid for the caller's parse scope).
+fn proofFromReceipt(receipt: std.json.ObjectMap) send_outbox.Proof {
+    return .{
+        .ok = switch (receipt.get("ok") orelse std.json.Value{ .null = {} }) {
+            .bool => |b| b,
+            else => false,
+        },
+        .status = switch (receipt.get("status") orelse std.json.Value{ .null = {} }) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(u16)) @intCast(i) else 0,
+            else => 0,
+        },
+        .body = switch (receipt.get("body") orelse std.json.Value{ .null = {} }) {
+            .string => |s| s,
+            else => "",
+        },
+        .err = switch (receipt.get("error") orelse std.json.Value{ .null = {} }) {
+            .string => |s| s,
+            else => "",
+        },
+    };
+}
+
+fn writeSendProof(
     allocator: std.mem.Allocator,
-    pending_cancels: *std.ArrayListUnmanaged(schedule_server_mod.CancelTarget),
-    tenant_id: []const u8,
+    txn: *kv_mod.KvStore.TrackedTxn,
+    writeset: *kv_mod.WriteSet,
     callback_id: []const u8,
+    receipt: std.json.ObjectMap,
 ) !void {
-    const t_copy = try allocator.dupe(u8, tenant_id);
-    errdefer allocator.free(t_copy);
-    const i_copy = try allocator.dupe(u8, callback_id);
-    errdefer allocator.free(i_copy);
-    try pending_cancels.append(allocator, .{ .tenant_id = t_copy, .id = i_copy });
+    const proof = proofFromReceipt(receipt);
+    const enc = try proof.encode(allocator);
+    defer allocator.free(enc);
+    var kbuf: [send_outbox.KEY_BUF]u8 = undefined;
+    const key = send_outbox.proofKey(&kbuf, callback_id);
+    try txn.put(key, enc);
+    try writeset.addPut(key, enc);
 }
 
 /// Direct lookup in the tenant's bytecode map. No walk-up — the

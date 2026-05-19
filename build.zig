@@ -252,6 +252,31 @@ pub fn build(b: *std.Build) void {
     sse_server_mod.addImport("rove-h2", h2_mod);
     sse_server_mod.addImport("rove-jwt", jwt_mod);
 
+    // ── rove-connection-holder: held-socket subsystem ───────────────
+    //
+    // The plan §9 sibling of sse-server: owns long-lived held sockets
+    // so handlers never do (`docs/connection-actor-plan.md`). Phase 1
+    // is the subsystem skeleton — listener, connection table keyed by
+    // a serializable connection-id, readiness queue, accept + park
+    // with a holder-level deadline. Wakes into the JS handler land in
+    // Phase 2; the held-synchronous projection (§6.4) in Phase 3.
+    const conn_holder_mod = b.addModule("rove-connection-holder", .{
+        .root_source_file = b.path("src/connection_holder/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    conn_holder_mod.link_libc = true;
+    conn_holder_mod.linkSystemLibrary("nghttp2", .{});
+    conn_holder_mod.linkSystemLibrary("ssl", .{});
+    conn_holder_mod.linkSystemLibrary("crypto", .{});
+    conn_holder_mod.addImport("rove", rove_mod);
+    conn_holder_mod.addImport("rove-io", io_mod);
+    conn_holder_mod.addImport("rove-h2", h2_mod);
+    // Phase 2b: the holder forwards the parked request to a worker
+    // (the §6.1 degenerate wake) over libcurl, mirroring
+    // `src/js/sse_dispatch.zig` — reverse direction.
+    conn_holder_mod.addImport("rove-blob", blob_mod);
+
     // ── rove-schedule-server: outbound HTTP via http.send ────────────
     //
     // Storage + wire format + leader-pinned scheduler thread for the
@@ -371,6 +396,10 @@ pub fn build(b: *std.Build) void {
     // rove-sse-server tests
     const sse_server_tests = b.addTest(.{ .root_module = sse_server_mod });
     test_step.dependOn(&b.addRunArtifact(sse_server_tests).step);
+
+    // rove-connection-holder tests
+    const conn_holder_tests = b.addTest(.{ .root_module = conn_holder_mod });
+    test_step.dependOn(&b.addRunArtifact(conn_holder_tests).step);
 
     // rove-schedule-server tests
     const schedule_server_tests = b.addTest(.{ .root_module = schedule_server_mod });
@@ -553,6 +582,24 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(qjs_bench);
 
+    // owed-recovery-scan-bench: Option (b) 3(b) measurement — cost of
+    // reconstructing the `_send/owed/` recovery set at restart.
+    const owed_bench_mod = b.addModule("owed-recovery-scan-bench", .{
+        .root_source_file = b.path("examples/owed_recovery_scan_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    owed_bench_mod.addImport("rove-kv", kv_mod);
+    owed_bench_mod.addImport("kvexp", kvexp_mod);
+    const owed_bench = b.addExecutable(.{
+        .name = "owed-recovery-scan-bench",
+        .root_module = owed_bench_mod,
+    });
+    b.installArtifact(owed_bench);
+    const owed_bench_run = b.addRunArtifact(owed_bench);
+    b.step("owed-recovery-scan-bench", "Option (b) 3(b): recovery-set scan cost")
+        .dependOn(&owed_bench_run.step);
+
     // files-server-standalone: spawns the rove-files-server thread and
     // idles. Exists so the smoke test can drive it from curl.
     const cs_standalone_mod = b.addModule("files-server-standalone", .{
@@ -586,6 +633,23 @@ pub fn build(b: *std.Build) void {
         .root_module = sse_standalone_mod,
     });
     b.installArtifact(sse_standalone);
+
+    // connection-holder-standalone: Phase 1 — runs the held-socket
+    // subsystem as a separate process. See
+    // `docs/connection-actor-plan.md` §9. Stands up alongside the
+    // other standalones; does not participate in raft.
+    const ch_standalone_mod = b.addModule("connection-holder-standalone", .{
+        .root_source_file = b.path("examples/connection_holder_standalone.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ch_standalone_mod.addImport("rove-connection-holder", conn_holder_mod);
+    ch_standalone_mod.addImport("rove-h2", h2_mod);
+    const ch_standalone = b.addExecutable(.{
+        .name = "connection-holder-standalone",
+        .root_module = ch_standalone_mod,
+    });
+    b.installArtifact(ch_standalone);
 
     // log-server-standalone: Phase 5.5 (a) step 2 — runs the new
     // S3-direct logs indexer + h2 query API as a standalone process.

@@ -51,7 +51,6 @@ const blob_mod = @import("rove-blob");
 const schedule_server = @import("root.zig");
 const ssrf = @import("ssrf.zig");
 
-const MAX_PER_PASS: u32 = 64;
 
 /// **TEST-ONLY** escape hatch that lets the scheduler talk to
 /// `http://` URLs (in addition to `https://`). Paired with
@@ -61,221 +60,71 @@ const MAX_PER_PASS: u32 = 64;
 /// request bodies on any intermediate hop.
 pub var test_allow_plaintext: bool = false;
 
-pub const Config = struct {
-    allocator: std.mem.Allocator,
-    /// Process-shared schedule store. Owned by the caller; we hold a
-    /// pointer. Under kvexp every consumer of schedules.db must share
-    /// one ScheduleStore — separate envs to the same file don't see
-    /// each other's main_overlay writes.
-    store: *schedule_server.ScheduleStore,
-    raft: *kv_mod.RaftNode,
-    /// Cap on idle sleep duration. Reached when the external pool has
-    /// no future work scheduled — the thread still wakes occasionally
-    /// to check `isLeader` and to log liveness. The apply path's
-    /// wake-on-new-work means a cap this high doesn't add fire-time
-    /// latency; rows still ship within an apply tick of arrival.
-    idle_max_ms: u32 = 60_000,
+
+/// The fields a single outbound fire needs — exactly the intersection
+/// of `schedule_server.ScheduleRow` (the live env-8 path) and
+/// `send_outbox.OwedSend` (Option (b)'s `_send/owed/` path), so one
+/// transport serves both. `id`/`version_str` are the
+/// `X-Rove-Schedule-Id` / `-Version` header-meta values.
+pub const FireParams = struct {
+    url: []const u8,
+    method: []const u8,
+    headers_json: []const u8,
+    body: []const u8,
+    timeout_ms: u32,
+    max_body_bytes: u32,
+    id: []const u8,
+    version_str: []const u8,
 };
 
-pub const Handle = struct {
-    allocator: std.mem.Allocator,
-    thread: std.Thread,
-    stop_flag: std.atomic.Value(bool),
-    /// Wake signal for early termination of the per-tick sleep. Apply
-    /// path fires `signalWork` after envelope-8 lands so the delivery
-    /// loop picks the row up immediately instead of waiting out the
-    /// rest of `poll_interval_ms`. `signalStop` also sets it so
-    /// shutdown joins quickly.
-    wake: std.Thread.ResetEvent,
-    config: Config,
+/// Outcome of one fire. `body` is allocator-OWNED (the caller frees
+/// via `deinit`) and capped to `max_body_bytes`; `null` on failure /
+/// no body. `err` is a static reason string on `.failed`, `""` on
+/// `.delivered` — never owned, safe to copy.
+pub const FireResult = struct {
+    outcome: schedule_server.Outcome,
+    status: u16,
+    body: ?[]u8,
+    err: []const u8,
 
-    pub fn signalStop(self: *Handle) void {
-        self.stop_flag.store(true, .release);
-        self.wake.set();
+    pub fn bodyOr(self: *const FireResult, fallback: []const u8) []const u8 {
+        return self.body orelse fallback;
     }
-
-    /// Cheap futex wakeup; safe from any thread; safe when nobody is
-    /// waiting (next `timedWait` returns immediately and resets).
-    pub fn signalWork(self: *Handle) void {
-        self.wake.set();
-    }
-
-    pub fn join(self: *Handle) void {
-        self.thread.join();
-        self.allocator.destroy(self);
+    pub fn deinit(self: *FireResult, a: std.mem.Allocator) void {
+        if (self.body) |b| a.free(b);
     }
 };
 
-pub fn spawn(config: Config) !*Handle {
-    const h = try config.allocator.create(Handle);
-    errdefer config.allocator.destroy(h);
-    h.* = .{
-        .allocator = config.allocator,
-        .thread = undefined,
-        .stop_flag = .init(false),
-        .wake = .{},
-        .config = config,
-    };
-    h.thread = try std.Thread.spawn(.{}, threadMain, .{h});
-    return h;
-}
-
-fn threadMain(h: *Handle) void {
-    runLoop(h) catch |err| {
-        std.log.err("schedule-server thread exited: {s}", .{@errorName(err)});
-    };
-}
-
-fn runLoop(h: *Handle) !void {
-    std.log.info("schedule-server: started", .{});
-
-    blob_mod.curl.globalInit();
-
-    const store = h.config.store;
-
-    var easy = try blob_mod.curl.Easy.init(h.allocator);
-    defer easy.deinit();
-
-    var in_flight: std.StringHashMapUnmanaged(void) = .empty;
-    defer {
-        var it = in_flight.iterator();
-        while (it.next()) |entry| h.allocator.free(entry.key_ptr.*);
-        in_flight.deinit(h.allocator);
-    }
-
-    while (!h.stop_flag.load(.acquire)) {
-        if (h.config.raft.isLeader()) {
-            deliveryPass(h, store, easy, &in_flight) catch |err| {
-                std.log.warn("schedule-server: pass error: {s}", .{@errorName(err)});
-            };
-        } else {
-            // Drop in-flight bookkeeping when we're not leader — a
-            // future leadership-acquired transition starts fresh.
-            var it = in_flight.iterator();
-            while (it.next()) |entry| h.allocator.free(entry.key_ptr.*);
-            in_flight.clearRetainingCapacity();
-        }
-        // Adaptive sleep: until the soonest external row's fire_at_ns
-        // (capped at `idle_max_ms`). Apply-side wake fires when a
-        // sooner row lands, so we don't oversleep new work. Followers
-        // stay capped at idle_max_ms — they're not firing anything
-        // anyway.
-        const sleep_ns = computeSleepNs(store, h.config.idle_max_ms) catch
-            @as(u64, h.config.idle_max_ms) * std.time.ns_per_ms;
-        h.wake.timedWait(sleep_ns) catch {};
-        h.wake.reset();
-    }
-    std.log.info("schedule-server: stopped", .{});
-}
-
-fn computeSleepNs(store: *schedule_server.ScheduleStore, idle_max_ms: u32) !u64 {
-    const cap_ns: u64 = @as(u64, idle_max_ms) * std.time.ns_per_ms;
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const next = (try store.nextExternalFireNs(now_ns)) orelse return cap_ns;
-    const delta = next - now_ns;
-    if (delta <= 0) return 0;
-    return @min(@as(u64, @intCast(delta)), cap_ns);
-}
-
-/// Build the in-flight set key: `{tenant_id}\x00{id}`. NUL is a safe
-/// separator — `validateId` rejects ids containing NUL, so the
-/// concatenation is unambiguous.
-fn buildInflightKey(allocator: std.mem.Allocator, tenant_id: []const u8, id: []const u8) ![]u8 {
-    const buf = try allocator.alloc(u8, tenant_id.len + 1 + id.len);
-    @memcpy(buf[0..tenant_id.len], tenant_id);
-    buf[tenant_id.len] = 0;
-    @memcpy(buf[tenant_id.len + 1 ..], id);
-    return buf;
-}
-
-fn deliveryPass(
-    h: *Handle,
-    store: *schedule_server.ScheduleStore,
+/// Option (b) 4c-i: the reusable outbound-HTTP transport, extracted
+/// behavior-identically from `deliverOne` (minus the env-9
+/// `proposeComplete`, which is the schedule-path's result delivery).
+/// SSRF gate → header-meta render → method parse → libcurl request →
+/// 2xx/cap outcome. Pure transport: no raft, no logging, no tenant
+/// context — the caller maps the `FireResult` to its own resolution
+/// (schedule path → `proposeComplete`; Option (b) 4c-iii → 7-A). The
+/// SSRF resolve is racy vs rebinding (libcurl re-resolves) but
+/// catches the common literals, same as before.
+pub fn fireOnce(
+    a: std.mem.Allocator,
     easy: *blob_mod.curl.Easy,
-    in_flight: *std.StringHashMapUnmanaged(void),
-) !void {
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const ready = try store.dueRows(h.allocator, now_ns, MAX_PER_PASS);
-    defer {
-        for (ready) |*r| {
-            var x = r.*;
-            x.deinit(h.allocator);
-        }
-        h.allocator.free(ready);
-    }
-
-    for (ready) |stored| {
-        const probe = try buildInflightKey(h.allocator, stored.row.tenant_id, stored.row.id);
-        if (in_flight.contains(probe)) {
-            h.allocator.free(probe);
-            continue;
-        }
-        // `probe` is the stored key — owned by the hashmap until we
-        // remove it below.
-        try in_flight.put(h.allocator, probe, {});
-        defer {
-            const removed = in_flight.fetchRemove(probe);
-            if (removed) |kv| h.allocator.free(kv.key);
-        }
-
-        deliverOne(h, easy, &stored) catch |err| {
-            std.log.warn(
-                "schedule-server: deliver {s}/{s}: {s}",
-                .{ stored.row.tenant_id, stored.row.id, @errorName(err) },
-            );
-        };
-    }
-}
-
-fn deliverOne(
-    h: *Handle,
-    easy: *blob_mod.curl.Easy,
-    stored: *const schedule_server.StoredSchedule,
-) !void {
-    const a = h.allocator;
-    const row = &stored.row;
-
-    // SSRF check: resolve + reject blocked addresses BEFORE handing
-    // the URL to libcurl. libcurl re-resolves internally so this is
-    // racy against rebinding, but the hot-path check still catches
-    // the common cases (literal RFC1918, EC2 metadata, loopback).
-    checkSsrf(a, row.url) catch |err| switch (err) {
-        error.BlockedAddress => {
-            std.log.warn(
-                "schedule-server: {s}/{s}: blocked address",
-                .{ row.tenant_id, row.id },
-            );
-            try proposeComplete(h, stored, .failed, 0, "", "blocked address (SSRF)");
-            return;
-        },
-        error.HttpsRequired => {
-            try proposeComplete(h, stored, .failed, 0, "", "https required");
-            return;
-        },
-        error.InvalidUrl => {
-            try proposeComplete(h, stored, .failed, 0, "", "invalid url");
-            return;
-        },
-        else => {
-            // Network / OOM — propose a transport failure so the
-            // customer's on_result handler sees it. (OOM here would
-            // also fail the propose; the warn covers both.)
-            try proposeComplete(h, stored, .failed, 0, "", @errorName(err));
-            return;
+    p: FireParams,
+) FireResult {
+    checkSsrf(a, p.url) catch |err| return .{
+        .outcome = .failed,
+        .status = 0,
+        .body = null,
+        .err = switch (err) {
+            error.BlockedAddress => "blocked address (SSRF)",
+            error.HttpsRequired => "https required",
+            error.InvalidUrl => "invalid url",
+            // Network / OOM resolving — surface as a transport failure
+            // so the customer's on_result sees it.
+            else => @errorName(err),
         },
     };
 
-    var version_buf: [12]u8 = undefined;
-    const version_str = try std.fmt.bufPrint(&version_buf, "{d}", .{stored.version});
-
-    const headers = renderHeadersWithMeta(a, row.headers_json, row.id, version_str) catch |err| {
-        std.log.warn(
-            "schedule-server: {s}/{s}: bad headers ({s})",
-            .{ row.tenant_id, row.id, @errorName(err) },
-        );
-        try proposeComplete(h, stored, .failed, 0, "", "invalid headers");
-        return;
-    };
+    const headers = renderHeadersWithMeta(a, p.headers_json, p.id, p.version_str) catch
+        return .{ .outcome = .failed, .status = 0, .body = null, .err = "invalid headers" };
     defer {
         for (headers) |hdr| {
             a.free(hdr.name);
@@ -284,33 +133,28 @@ fn deliverOne(
         a.free(headers);
     }
 
-    const method = parseMethod(row.method) orelse {
-        try proposeComplete(h, stored, .failed, 0, "", "invalid method");
-        return;
-    };
+    const method = parseMethod(p.method) orelse
+        return .{ .outcome = .failed, .status = 0, .body = null, .err = "invalid method" };
 
-    const verify_tls = !test_allow_plaintext;
     const resp = easy.request(a, .{
         .method = method,
-        .url = row.url,
+        .url = p.url,
         .headers = headers,
-        .body = if (method == .PUT or method == .POST) row.body else &.{},
-        .timeout_ms = row.timeout_ms,
-        .verify_tls = verify_tls,
-    }) catch |err| {
-        std.log.warn(
-            "schedule-server: {s}/{s}: transport {s}",
-            .{ row.tenant_id, row.id, @errorName(err) },
-        );
-        try proposeComplete(h, stored, .failed, 0, "", @errorName(err));
-        return;
+        .body = if (method == .PUT or method == .POST) p.body else &.{},
+        .timeout_ms = p.timeout_ms,
+        .verify_tls = !test_allow_plaintext,
+    }) catch |err| return .{
+        .outcome = .failed,
+        .status = 0,
+        .body = null,
+        .err = @errorName(err),
     };
     var resp_owned = resp;
     defer resp_owned.deinit(a);
 
     const body_full = resp_owned.body orelse "";
-    const body_capped = if (body_full.len > row.max_body_bytes)
-        body_full[0..row.max_body_bytes]
+    const body_capped = if (body_full.len > p.max_body_bytes)
+        body_full[0..p.max_body_bytes]
     else
         body_full;
 
@@ -319,58 +163,17 @@ fn deliverOne(
     else
         .failed;
 
-    std.log.info(
-        "schedule-server: {s}/{s}: status={d} outcome={s}",
-        .{ row.tenant_id, row.id, resp_owned.status, @tagName(outcome) },
-    );
-    try proposeComplete(h, stored, outcome, resp_owned.status, body_capped, "");
-}
-
-fn proposeComplete(
-    h: *Handle,
-    stored: *const schedule_server.StoredSchedule,
-    outcome: schedule_server.Outcome,
-    status: u16,
-    response_body: []const u8,
-    error_message: []const u8,
-) !void {
-    const a = h.allocator;
-    const env: schedule_server.CompleteEnvelope = .{
-        .tenant_id = stored.row.tenant_id,
-        .id = stored.row.id,
-        .version_at_fire = stored.version,
-        .outcome = outcome,
-        .status = status,
-        .response_headers_json = "",
-        .response_body = response_body,
-        .error_message = error_message,
+    // Own the capped body past `resp_owned.deinit`. The only added
+    // alloc vs the pre-extraction inline path; an OOM here degrades
+    // to a transport-style failure (on_result sees it) rather than
+    // crashing — strictly safer.
+    const owned = a.dupe(u8, body_capped) catch return .{
+        .outcome = .failed,
+        .status = resp_owned.status,
+        .body = null,
+        .err = "oom capturing response body",
     };
-    const inner = try schedule_server.encodeComplete(a, &env);
-    defer a.free(inner);
-
-    // Wrap in the typed envelope (type=9). schedule_server doesn't
-    // know about apply.zig's envelope wrapper format, so we
-    // hand-assemble: `[1B type][2B id_len BE][id bytes][payload]`.
-    // tenant_id rides in the wrapper header so the apply path can
-    // use it without decoding the inner payload twice.
-    const tenant_id = stored.row.tenant_id;
-    if (tenant_id.len > 0xffff) return error.InvalidEnvelope;
-    const wrapped_len = 1 + 2 + tenant_id.len + inner.len;
-    const wrapped = try a.alloc(u8, wrapped_len);
-    defer a.free(wrapped);
-    wrapped[0] = schedule_server.ENVELOPE_TYPE_COMPLETE;
-    std.mem.writeInt(u16, wrapped[1..3], @intCast(tenant_id.len), .big);
-    @memcpy(wrapped[3..][0..tenant_id.len], tenant_id);
-    @memcpy(wrapped[3 + tenant_id.len ..][0..inner.len], inner);
-
-    const seq = h.config.raft.highWatermark() + 1;
-    h.config.raft.propose(seq, wrapped) catch |err| {
-        std.log.warn(
-            "schedule-server: {s}/{s}: propose envelope-9 failed: {s}",
-            .{ tenant_id, stored.row.id, @errorName(err) },
-        );
-        return err;
-    };
+    return .{ .outcome = outcome, .status = resp_owned.status, .body = owned, .err = "" };
 }
 
 const SsrfError = error{
@@ -540,5 +343,38 @@ test "parseMethod recognizes the http verbs" {
     try testing.expect(parseMethod("put").? == .PUT);
     try testing.expect(parseMethod("DELETE").? == .DELETE);
     try testing.expect(parseMethod("FOO") == null);
+}
+
+test "fireOnce: offline failure mappings (the extracted checkSsrf branch)" {
+    const a = testing.allocator;
+    const easy = try blob_mod.curl.Easy.init(a); // unused on these paths
+    defer easy.deinit();
+
+    const base = FireParams{
+        .url = undefined,
+        .method = "POST",
+        .headers_json = "{}",
+        .body = "",
+        .timeout_ms = 1000,
+        .max_body_bytes = 1024,
+        .id = "sid",
+        .version_str = "1",
+    };
+
+    for ([_]struct { url: []const u8, err: []const u8 }{
+        .{ .url = "not a url", .err = "invalid url" },
+        .{ .url = "http://example.com/", .err = "https required" },
+        .{ .url = "https://127.0.0.1/", .err = "blocked address (SSRF)" },
+    }) |c| {
+        var p = base;
+        p.url = c.url;
+        var r = fireOnce(a, easy, p);
+        defer r.deinit(a);
+        try testing.expectEqual(schedule_server.Outcome.failed, r.outcome);
+        try testing.expectEqual(@as(u16, 0), r.status);
+        try testing.expect(r.body == null);
+        try testing.expectEqualStrings(c.err, r.err);
+        try testing.expectEqualStrings("", r.bodyOr("")); // null → fallback
+    }
 }
 

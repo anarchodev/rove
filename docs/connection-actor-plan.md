@@ -1,8 +1,14 @@
 # Connection-actor — one primitive under SSE, WebSockets, held-synchronous calls, and the firehose
 
-**Status:** Proposed. Design-of-record for the connection-actor primitive;
-**not implemented**. The shipped sse-service (`docs/sse-plan.md`, PLAN §13)
-is unchanged by this doc. Relationship to the three PLAN-locked decisions this
+**Status:** **Implemented (Phases 1–3c, 2026-05-18) with locked
+refinements — see the Freeze Addendum at the end of this doc.** §1–§11
+below are the original *design exploration*; the addendum is the
+authoritative record of what shipped and where it deliberately
+diverged (the unified trampoline+trigger model superseded the §4
+copyable-handle fan-in; the holder collapsed *into* the worker rather
+than the §9 standalone sibling; single-tenant + node-local). The
+shipped sse-service (`docs/sse-plan.md`, PLAN §13) is unchanged by
+this doc. Relationship to the three PLAN-locked decisions this
 touches — §7-rejected durable SSE storage, the v2 WebSocket deferral (PLAN
 "Why SSE not WebSockets"), and the Cmd-model "external result inline is
 impossible" bet — is reconciled explicitly in §10. Nothing here re-proposes
@@ -404,3 +410,94 @@ since internally that is all there ever is.)
 - **Wake fairness.** Scheduling policy when many connections are
   simultaneously ready (per-connection fairness vs throughput) — a
   dispatcher-tuning question, not a model question.
+
+---
+
+## 12. Freeze Addendum (2026-05-18) — what shipped, and the locked deltas
+
+§1–§11 are the design exploration. This section is authoritative for
+the implemented primitive (Phases 1, 2a, 2b, 3a, 3b-i/ii/iii, 3c).
+
+### 12.1 What shipped
+
+The §6.1 degenerate case and the §6.4 held-synchronous third-party
+call. A handler returns `__rove_next(path, {fn?, ctx?})` instead of a
+response value → its h2 **stream entity** moves `request_out →
+worker.parked_continuations` (held; no response stamped). A hop that
+fired exactly one `http.send` is bound to that schedule (Part A
+stamps the schedule's `on_result` = the continuation so `apply.zig`
+emits the `c/` callback row); on completion `dispatchCallbacks`
+partitions the bound row out *before* the per-tenant batch txn opens
+and the resume engine re-enters dispatch with `{ctx, outcome}`,
+flushing the terminal return to the still-open socket — one
+synchronous request from the caller. The §6.4 mandatory timeout is a
+deadline sweep that resumes the hop with a `{ok:false,
+reason:"deadline"}` outcome so the **handler authors** the timeout
+response. Resolve-once falls out of `reg.move` happening once.
+End-to-end validated by `scripts/heldsync_smoke.py` (happy / failure
+/ effectful-resume-boundary); in-situ non-regression by
+`scripts/conn_actor_bench.py` (8w sharded ≈187k vs the ~158k
+baseline) and the `ROVE_BENCH` microbench (per-request tax ≈61 ns).
+
+### 12.2 Locked deltas from §1–§11 (these supersede the design above)
+
+- **No exposed handle, anywhere (supersedes §1's "serializable id"
+  and §4's copyable-handle fan-in).** The unified model is the
+  *return-as-continuation trampoline* + a coalesced multi-source
+  trigger; fan-in lives on the trigger and the state store, never on
+  the connection writer (always single-owner/affine). Consequently
+  security layers 1 (unguessable handle) and 5 (no foreign-id JS
+  surface) are **mooted by construction** — there is no customer-
+  visible connection reference to attack. The §4 "shared/copyable
+  handle ⇒ fan-in + external sequencer" branch is dissolved.
+- **The holder collapsed INTO the worker (supersedes §9's standalone
+  sibling).** There is **no new process** — no `connection-holder-
+  standalone`, no `/v1/_internal/*` route, no internal bearer for it.
+  The parked connection *is* the worker's own h2 stream entity sitting
+  in the `parked_continuations` sibling collection; "park" is a
+  `reg.move`. (The Phase-1/2 standalone `src/connection_holder/` was
+  the experimental scaffold; the shipped path is worker-internal.)
+- **Single-tenant + node-local.** Everything that can touch a
+  connection-actor belongs to its tenant; the actor + its triggers
+  are node-local (the socket is node-local by physics anyway). Push
+  projections delegate cross-node fan-out to the existing sse-service
+  bus rather than reinventing it (resolves §11 "sse-service
+  convergence": they *stack*, not merge).
+- **Affine enforcement = by construction** (resolves the §11 open
+  question): you can't copy a continuation you returned, so the
+  move/affine discipline is structural, not a convention.
+- **`http.send` stays at-least-once *here*.** As originally written,
+  §6.4 rode the envelope-8/9 schedule machinery. That re-platform
+  (task #8, the **Option (b)** N-way migration) **shipped 2026-05-19**:
+  §6.4 now binds the parked continuation to the send's
+  `_send/owed/{id}` marker (envelope-0); the leader-local per-node
+  `SendDispatch` fires it; `dispatchSendCompletions`' Part-B peel
+  resumes the continuation by matching `bound_schedule_id == send_id`
+  (a resume-search, not a routed handle). The at-least-once guarantee
+  is unchanged; only the machinery moved. Cross-worker §6.4 (callback
+  on the leader, continuation on another worker) requeues until the
+  owning worker resolves it; single-worker is the unit-tested
+  functional scope.
+- **Read-only resume hops only (3b-iii scope).** A resume hop that
+  writes kv, or re-issues `http.send` (recipe-1 real retry / re-park),
+  is an *effectful resume hop* — explicitly deferred (task #9); it
+  yields a defined 5xx, never silent corruption (the freeze caught +
+  fixed a false-200-on-thrown-hop bug). The §6.4 core value (held
+  3rd-party call → handler-authored response; failure-outcome →
+  handler error) is fully shipped without it.
+- **§6.2 SSE / §6.3 WS / §6.5 firehose** are *not* shipped here — the
+  trampoline+trigger model covers them (per §6/the unified design)
+  but only §6.1/§6.4 are implemented. WS transport remains the
+  PLAN-documented v2 cost (§10.2, unchanged).
+
+### 12.3 §7 / locked-decision reconciliation (unchanged stance)
+
+No §7 rejection is reopened. Durable SSE stays rejected (§10.1); the
+Cmd "external result inline is impossible" bet is preserved verbatim
+internally (§10.3) — §6.4 is purely an external mask over the
+unchanged two-request Cmd. The unified trigger model *strengthens*
+the §7/§10.1 "notify, don't store; refetch, don't replay" thesis by
+making it the universal mechanism. PLAN §13 surface-map note added
+(the connection-actor adds no process). Memory of record:
+`project_connection_actor_unified_trigger`,
+`project_callback_execution_model`, `project_connection_holder_security`.

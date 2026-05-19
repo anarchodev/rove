@@ -1338,26 +1338,25 @@ Architectural calls captured here so future sessions don't re-derive them. §10.
 
 ### 10.2 Root replication via raft envelope type 2
 
-Envelopes today (in shipped code, as of 2026-05-09):
+Envelopes today (in shipped code, as of 2026-05-19 — post the
+http.send Option (b) N-way re-platform; see `docs/http-send-plan.md`
+§15):
 
 | Type | Target store | Producer | Status |
 |---|---|---|---|
-| `0` writeset | `{id}/app.db` | Customer handler `kv.*` via TrackedTxn + writeset; release POST's `_deploy/current` write also rides here (Phase 5.5(e) F2-storage) | active |
+| `0` writeset | `{id}/app.db` | Customer handler `kv.*` via TrackedTxn + writeset; release POST's `_deploy/current` write also rides here; **`http.send`/`http.cancel` now ride here too** as `_send/owed/{id}` puts/deletes (Option (b)) | active |
 | `1` log_batch | — | (retired) | retired in Phase 5.5 (a) — log batches now go S3-direct per `docs/logs-plan.md`; decoder rejects type=1 with `UnknownEnvelopeType` |
 | `2` root_writeset | `__root__.db` | Signup's `tenant.createInstance`; admin JS `platform.root.*` | active |
 | `3` files_writeset | — | (retired) | retired in Phase 5.5 (e) F2-storage — manifest moved to a per-tenant `deployments/` BlobBackend; decoder rejects type=3 |
 | `4`–`6` webhook_* | — | (retired) | retired 2026-05-09 in commit `cf375bf` along with the `webhook_server` module — `http.send` superseded the dedicated webhook envelope shapes; decoder rejects type=4/5/6 |
-| `7` multi | per-inner-envelope target | Worker dispatcher (rides envelope 0 + envelope 8/10 atomically) | active (shipped 2026-05-05) |
-| `8` schedule_upsert | `schedules.db` (cluster-wide) | Worker dispatcher (`http.send`, rides with envelope 0 in a type-7 multi) | active (shipped 2026-05 with the schedule-server cutover) |
-| `9` schedule_complete | `schedules.db` + tenant `app.db` (`_callback/{id}`) | schedule-server thread (or `dispatchInternalSchedules` worker phase for in-cluster targets) | active |
-| `10` schedule_cancel | `schedules.db` | Worker dispatcher (`http.cancel`) | active |
-| `11` schedule_demote | `schedules.db` (flips `is_internal=false`) | `dispatchInternalSchedules` when no node hosts the target tenant locally — the libcurl scheduler picks the row up | active |
+| `7` multi | per-inner-envelope target | Worker dispatcher (rides envelope 0 + admin-side envelope 2 atomically) | active (shipped 2026-05-05) |
+| `8`–`11` schedule_* | — | (retired) | retired 2026-05-19 in the http.send **Option (b)** N-way re-platform (5b-2 sweep). `schedules.db`, the leader-pinned schedule-server thread, `dispatchCallbacks`/`dispatchInternalSchedules`, and `ScheduleStore`/`ScheduleRow`/`CallbackRow` are deleted. A send's only firing record is the per-tenant `_send/owed/{id}` marker riding envelope-0, fired by a leader-local per-node in-memory `SendDispatch`. Decoder rejects type=8/9/10/11. See `docs/http-send-plan.md` §15. |
 
-Multi-envelope-per-raft-entry support shipped in Phase 5.5 (d) step 2 (envelope type 7); the dispatcher uses it to propose the customer's writeset (envelope 0) atomically with `http.send` upsert (envelope 8) and `http.cancel` deletes (envelope 10) in one raft entry — same atomicity property the retired envelope-4 webhook path had, generalized to any HTTP call.
+Multi-envelope-per-raft-entry support shipped in Phase 5.5 (d) step 2 (envelope type 7); the dispatcher uses it to propose the customer's writeset (envelope 0) atomically with the admin handler's cross-tenant trampoline + `platform.root.*` side writes (Option-A; envelope 2) in one raft entry. (It also carried the now-retired `http.send` schedule envelopes 8/10 before Option (b).)
 
-Number choice was deliberate: types 4/5/6 are reserved-and-rejected so any old raft log entry from the pre-`cf375bf` window panics on apply instead of silently mis-routing into the schedule-server path. The migration window predates 1.0 and is acceptable to break loudly.
+Number choice was deliberate: retired types (1, 3, 4/5/6, 8/9/10/11) are reserved-and-rejected so any old raft log entry from before each cutover panics on apply instead of silently mis-routing. The migration windows predate 1.0 and are acceptable to break loudly.
 
-Type-2 writes come from two producers: the signup HTTP handler (mirrors `tenant.createInstance`'s local write into a root writeset) and the admin JS handler's `platform.root.set/delete` calls (collected into a per-request root writeset, proposed after commit). **Divergence on propose failure is logged, not compensated** — at-least-once semantics consistent with the Cmd/callback layers. A future iteration wraps root writes in a TrackedTxn with undo semantics.
+Type-2 writes come from two producers: the signup HTTP handler (mirrors `tenant.createInstance`'s local write into a root writeset) and the admin JS handler's `platform.root.set/delete` calls (collected into a per-request root writeset, proposed after commit). **Divergence on propose failure is logged, not compensated** — at-least-once semantics consistent with the Cmd/callback layers. (kvexp volatility means a pre-quorum crash loses the speculative write with no on-disk divergence; the residual escaped effect — the caller's success response — is tracked as idiom-3 in `docs/proposer-audit.md`. The earlier "wrap root writes in a TrackedTxn with undo semantics" direction is obsolete: the pre-kvexp `kv_undo` machinery was deleted.)
 
 ### 10.3 Two-phase deploy protocol on FS backend
 
@@ -1756,7 +1755,7 @@ Not available:
 
 - `platform.*` JS globals exist only on the `__admin__` handler. Other tenants' handlers see `platform === undefined` and get a `TypeError` if they try to call `platform.root.*`.
 - **`X-Rove-Scope: <instance_id>` header** rebinds the admin handler's `kv` to the target tenant's `app.db`. Without it, `kv.*` on the admin handler operates on admin's own `app.db` (NOT root — that's the §10.1 change).
-- **Admin JS writes to `platform.root.*` are replicated via type-2 root writeset**, but they land locally on the leader first and propose-on-commit. A propose failure leaves leader/follower divergence (logged, not compensated).
+- **Admin JS writes to `platform.root.*` are replicated via type-2 root writeset**, but they land locally on the leader first and propose-on-commit. A propose failure is logged, not compensated (kvexp volatility → no on-disk divergence on crash; the residual is the caller-response escaped effect, tracked as idiom-3 in `docs/proposer-audit.md`).
 
 ### Multi-node setup
 
@@ -1788,20 +1787,22 @@ rewind.js ships as **four binaries**, all built from this repo:
 
 | Binary | Source | Public hostname | Owns |
 |---|---|---|---|
-| `loop46` | `src/loop46/main.zig` | `*.{public_suffix}` (customer wildcard); `app.`/`replay.`/`auth.{system_suffix}` (system surfaces — **second registrable domain**, `--system-suffix`) | Customer HTTP traffic; the `__admin__` / `__replay__` / `__auth__` system tenants; raft node; per-worker QJS dispatcher; schedule-server thread; per-tenant `provisionInstance` (self-serve signup retired — `auth-domain-plan.md` §4.7); `/_system/release`, `/_system/services-token`, `/_system/admin-kv` machine-to-machine endpoints |
+| `loop46` | `src/loop46/main.zig` | `*.{public_suffix}` (customer wildcard); `app.`/`replay.`/`auth.{system_suffix}` (system surfaces — **second registrable domain**, `--system-suffix`) | Customer HTTP traffic; the `__admin__` / `__replay__` / `__auth__` system tenants; raft node; per-worker QJS dispatcher; leader-local per-node `SendDispatch` (the `http.send` fire path, Option (b) — replaced the schedule-server thread 2026-05-19); per-tenant `provisionInstance` (self-serve signup retired — `auth-domain-plan.md` §4.7); `/_system/release`, `/_system/services-token`, `/_system/admin-kv` machine-to-machine endpoints |
 | `files-server-standalone` | `examples/files_server_standalone.zig` (wraps `src/files_server/`) | `files.{public_suffix}` | Compile + content-addressed deploy + manifest writes to S3; deploys the embedded admin + replay JS bundles; pushes platform config (`_config/*`, resend key, etc.) into `__admin__/app.db` via `/_system/admin-kv`; flips `_deploy/current` via `/_system/release`. Runs its own raft cluster (not shared with `loop46`). `dep_id` is content-addressed; manifests are keyed `{dep_id}.json` where `dep_id` is a content hash. |
 | `log-server-standalone` | `examples/log_server_standalone.zig` (wraps `src/log_server/`) | `logs.{public_suffix}` | Polls S3 for `.ndjson` log batches + sidecars; maintains local `log_index.db`; serves `/v1/{tenant}/{list,show,count,blob}` to the dashboard |
 | `sse-server-standalone` | `examples/sse_server_standalone.zig` (wraps `src/sse_server/`) | `sse.{public_suffix}` | Holds every long-lived `EventSource` connection; receives worker emit POSTs at `/v1/emit`; per-(tenant, sid) ring cache (30 entries) for reconnect catch-up; emits `rove:resync` sentinel on cache miss |
 
 The three standalones are each a single process per cluster (single-process bet, §10.16). Failover is "LB picks a new node, clients reconnect"; sse-server's reconnect path triggers `rove:resync` so the client refetches on cache miss. None of them participates in raft — that's the §6b principle that lets them live outside the loop46 binary. operator-deployed; they're typically co-located with a `loop46` worker on each node, but can scale independently.
 
+**Connection-actor (held-synchronous §6.4, `docs/connection-actor-plan.md`, shipped 2026-05-18) adds NO process.** Unlike sse/files/log, it is **worker-internal**: a handler that returns `__rove_next(...)` parks its own h2 stream entity in a `parked_continuations` sibling collection (a `reg.move`, not a socket handoff); the bound `http.send` completion routes through `dispatchSendCompletions`' §6.4 Part-B peel into an in-worker resume that flushes to the still-open socket. The original plan §9 envisioned a standalone sibling; the unified trampoline model (no exposed handle, single-tenant, node-local) collapsed it into the worker — see that doc's §12 Freeze Addendum. `src/connection_holder/` is the now-superseded experimental scaffold, not a deployed process. The `http.send` best-effort / cross-worker node-affinity re-platform (Option (b), task #8) **shipped 2026-05-19** — see `docs/http-send-plan.md` §15.
+
 **Auth/domain (Phases 1–3 of `docs/auth-domain-plan.md`, landed 2026-05-16).** Customer tenants resolve on `*.{public_suffix}` (`rewindjs.app`); platform surfaces resolve on a **distinct registrable domain** `{system_suffix}` (`rewindjs.com`): `app.` → `__admin__`, `replay.` → `__replay__`, `auth.` → `__auth__`, plus the `files./logs./sse.` standalones. The different eTLD+1 is the security-isolation boundary (§7 superseding note). **`__auth__` is a full OIDC IdP** — an ordinary tenant running the customer-facing `oidc.provider()` library; **admin/replay/logs are pure OIDC relying parties** of it (`oidc.rp()`), so there is no privileged platform-only auth path and no bearer/root-token *human* login (the admin RPC surface is OIDC-session-only; `/_system/*` keeps root-token for M2M). Operator `is_root` = an OIDC `sub` in the `_admin/operator/*` allowlist (seeded from `LOOP46_OPERATOR_EMAILS`). Cross-tenant admin reads/writes are the explicit `platform.scope(id).kv` accessor — `X-Rove-Scope` no longer rebinds the global `kv` (so admin's own home store, incl. sessions, is scope-independent). §0 host-relative invariant holds throughout: `iss`/JWKS/endpoints/`redirect_uris` derive from the request host, never a compiled platform literal.
 
 Inside `loop46` itself there are three threading roles:
 
-- **Worker threads** (one per `--workers`, default `cpus-1`). Each owns a per-worker QJS `Dispatcher`, a per-worker `Tenant` (with its own root.db connection), and a per-worker rove `Registry`. All bind the same h2 listen port via `SO_REUSEPORT`. Any worker handles any tenant — there is no tenant pinning. Worker 0 has two extra duties: `dispatchCallbacks` (fires `_callback/{id}` rows from envelope-9 applies) and `dispatchInternalSchedules` (the in-process fast path for in-cluster `http.send` targets, per `docs/http-send-plan.md` §3.2).
+- **Worker threads** (one per `--workers`, default `cpus-1`). Each owns a per-worker QJS `Dispatcher`, a per-worker `Tenant` (with its own root.db connection), and a per-worker rove `Registry`. All bind the same h2 listen port via `SO_REUSEPORT`. Any worker handles any tenant — there is no tenant pinning. Worker 0 has one extra duty: `dispatchSendCompletions` (leader+worker-0) — drains `SendDispatch` completions, runs the customer's `on_result` / writes the `_send/proof/{id}` marker, and resumes any §6.4-bound parked continuation (Part-B peel). Replaced the retired `dispatchCallbacks`/`dispatchInternalSchedules` duties 2026-05-19.
 - **Raft thread**. Owns the willemt raft node, the `ApplyCtx`, and the periodic snapshot capture (when `--snapshot-interval-ms` is set). Maintains its own per-tenant SQLite connections in `ApplyCtx.kv_stores` so it never shares a NOMUTEX connection with worker threads.
-- **Schedule-server thread**. Leader-pinned. Reads `schedules.db` for due rows where `is_internal=false`, fires libcurl, proposes envelope-9 with the result. Apply-side wake on envelope 8/11 means deliveries ship within an apply tick instead of polling. Replaces what was a separate `webhook-server` thread before commit `cf375bf`. Also handles the 5s libcurl fallback for in-cluster targets that no node hosts locally (envelope-11 `schedule_demote`).
+- **`SendDispatch` threads** (Option (b), leader-local per node; replaced the leader-pinned schedule-server thread 2026-05-19). One dispatch thread drains the arm/resolve op queue + the in-memory `SendInflightSet`; a dedicated `EasyPool(8)` + 8 fire threads run the blocking libcurl `fireOnce` for due `_send/owed/{id}` markers. The set is reconstructed from the durable per-tenant `_send/owed/` on leader promotion (boot-scan safety-net) — no per-tenant scan on the hot path.
 
 ### 13.2 Storage map
 

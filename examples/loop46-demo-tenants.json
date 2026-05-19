@@ -12,6 +12,8 @@
         {"path": "cbresult.mjs", "source": "loop46-demo-tenants/acme/cbresult.mjs"},
         {"path": "httpfire/index.mjs", "source": "loop46-demo-tenants/acme/httpfire/index.mjs"},
         {"path": "httpresult.mjs", "source": "loop46-demo-tenants/acme/httpresult.mjs"},
+        {"path": "heldsync/index.mjs", "source": "loop46-demo-tenants/acme/heldsync/index.mjs"},
+        {"path": "heldsync/onresult.mjs", "source": "loop46-demo-tenants/acme/heldsync/onresult.mjs"},
         {"path": "cfg/index.mjs", "source": "loop46-demo-tenants/acme/cfg/index.mjs"},
         {"path": "_config/oauth/google.json", "source": "loop46-demo-tenants/acme/_config/oauth/google.json", "content_type": "application/json"}
       ]

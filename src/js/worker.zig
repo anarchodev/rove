@@ -60,9 +60,10 @@ const log_server_mod = @import("rove-log-server");
 const jwt_mod = @import("rove-jwt");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
-const schedule_server_mod = @import("rove-schedule-server");
 
 const dispatcher_mod = @import("dispatcher.zig");
+const continuation_mod = @import("bindings/continuation.zig");
+const Continuation = continuation_mod.Continuation;
 const globals = @import("globals.zig");
 const apply_mod = @import("apply.zig");
 const raft_propose = @import("raft_propose.zig");
@@ -77,6 +78,8 @@ const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
+const send_dispatch_mod = @import("send_dispatch.zig");
+const send_outbox_mod = @import("send_outbox.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = dispatcher_mod.Request;
 
@@ -127,11 +130,58 @@ pub const ParkedUnit = struct {
     /// Owned; released by `sse_dispatch.fireBatch` on commit or
     /// `deinit`'d (discarded) on fault.
     emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty,
+    /// Option (b) 4b-ii-B: owned commit-gated send arm/resolve intents
+    /// (`_send/owed/` put → arm, `_send/proof/` put / `_send/owed/`
+    /// delete → resolve). Fired into the leader-local SendDispatch on
+    /// commit (`firePendingSendOps`), discarded with the rest of the
+    /// unit on fault/timeout/leadership-loss — the durable per-tenant
+    /// `_send/owed/` + new-leader boot-scan covers a discard, so no
+    /// silent loss. Separate `ParkedUnit` from any emit unit (a hop
+    /// can have sends but no emits); both ride `pending_units`.
+    send_ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty,
 
     pub fn deinit(self: *ParkedUnit, allocator: std.mem.Allocator) void {
         for (self.emits.items) |*e| e.deinit(allocator);
         self.emits.deinit(allocator);
+        for (self.send_ops.items) |*o| o.deinit(allocator);
+        self.send_ops.deinit(allocator);
         allocator.free(self.tenant_id);
+    }
+};
+
+/// DATA side-store value for a continuation-parked stream
+/// (connection-actor §6.1/§6.4). The *lifecycle* discriminant is
+/// membership in the worker's `parked_continuations` collection, NOT
+/// this struct (`feedback_state_is_collection`); this is the
+/// principle-compliant data that rides alongside: the trampoline
+/// descriptor + the §6.4 mandatory-timeout deadline. `sid`/`sess`
+/// are NOT here — they are read back from the parked entity's own
+/// h2 components at resolve time.
+/// §6.4 mandatory-timeout for a continuation-parked stream — a real
+/// 504 must go out before any browser/LB/CDN intermediary gives up.
+/// Fixed for 3b-ii (config knob is a later refinement); mirrors the
+/// connection-holder's `default_hold_deadline_ms` (25 s).
+pub const CONT_HOLD_DEADLINE_NS: i64 = 25 * std.time.ns_per_s;
+
+pub const ParkedCont = struct {
+    cont: Continuation,
+    deadline_ns: i64,
+    /// Owned tenant id — the parked entity outlives the dispatch that
+    /// created it, so the resume engine resolves the deployment from
+    /// this rather than any borrowed request state.
+    tenant_id: []u8,
+    /// Owned schedule id this continuation is bound to (§6.4): the
+    /// single `http.send` the open/repark hop fired. When that
+    /// schedule completes, its result is the resume outcome (3c
+    /// increment 2 — the completion redirect). null = no bound
+    /// http.send (e.g. a deadline-only / no-call hop); only the
+    /// deadline can resume it.
+    bound_schedule_id: ?[]u8 = null,
+
+    pub fn deinit(self: *ParkedCont, allocator: std.mem.Allocator) void {
+        self.cont.deinit(allocator);
+        allocator.free(self.tenant_id);
+        if (self.bound_schedule_id) |s| allocator.free(s);
     }
 };
 
@@ -656,6 +706,15 @@ pub const NodeState = struct {
     /// thunk is `deploymentLoadFnNode`.
     deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
 
+    /// Single leader-local http.send dispatch component for the whole
+    /// process (Option (b), FORK-6). Owns the in-memory in-flight set
+    /// fed worker-side at commit (4b-ii) and reconstructed via
+    /// boot-scan on raft promotion (4b-iii); the dedicated thread
+    /// fires due owed sends (4c). NOT replicated/durable — the
+    /// durable truth is the per-tenant `_send/owed/` kv. Allocated in
+    /// `startSendDispatch`; null until then and after `deinit`.
+    send_dispatch: ?*send_dispatch_mod.SendDispatch = null,
+
     /// Process-wide config consumed by TenantFiles.open. Shared
     /// pointers (libcurl Easy, prefetch map) live for the lifetime
     /// of NodeState.
@@ -663,11 +722,6 @@ pub const NodeState = struct {
     manifest_http: ?ManifestHttpConfig = null,
     manifest_easy: ?*blob_mod.curl.Easy = null,
     manifest_prefetch: ?ManifestPrefetchMap = null,
-
-    /// Process-shared schedule store. Borrowed; owned by `main.zig`.
-    /// Hoisted here so `/_system/kv-get?store=schedules` (future) and
-    /// any other node-scoped read paths have one handle to ask.
-    schedules_store: *schedule_server_mod.ScheduleStore,
 
     /// Process raft node (= `cluster.raft`). Borrowed; owned by
     /// `main.zig`. Copied into each `TenantSlot` so the loader's
@@ -678,14 +732,12 @@ pub const NodeState = struct {
         allocator: std.mem.Allocator,
         tenant: *tenant_mod.Tenant,
         blob_backend_cfg: blob_mod.BackendConfig,
-        schedules_store: *schedule_server_mod.ScheduleStore,
         raft: *kv_mod.RaftNode,
     ) NodeState {
         return .{
             .allocator = allocator,
             .tenant = tenant,
             .blob_backend_cfg = blob_backend_cfg,
-            .schedules_store = schedules_store,
             .raft = raft,
         };
     }
@@ -695,6 +747,11 @@ pub const NodeState = struct {
             l.shutdown();
             l.deinit();
             self.deployment_loader = null;
+        }
+        if (self.send_dispatch) |sd| {
+            sd.shutdown();
+            sd.deinit();
+            self.send_dispatch = null;
         }
         self.tenant_files_map.deinit(self.allocator);
         if (self.manifest_prefetch) |*map| {
@@ -710,8 +767,8 @@ pub const NodeState = struct {
 
     /// Spawn the single deployment loader thread. Idempotent.
     /// Called once from `main.zig` after NodeState is fully wired
-    /// (tenant + blob backends + schedules_store in place); the
-    /// loader's thunk casts `ctx_opaque` back to `*NodeState`.
+    /// (tenant + blob backends in place); the loader's thunk casts
+    /// `ctx_opaque` back to `*NodeState`.
     pub fn startDeploymentLoader(self: *NodeState) !void {
         if (self.deployment_loader != null) return;
         const loader = try deployment_loader_mod.DeploymentLoader.init(
@@ -722,6 +779,25 @@ pub const NodeState = struct {
         errdefer loader.deinit();
         try loader.start();
         self.deployment_loader = loader;
+    }
+
+    /// Spawn the single leader-local send-dispatch thread. Idempotent.
+    /// Called once from `main.zig` after NodeState is wired, alongside
+    /// `startDeploymentLoader`. The dedicated thread drains arm/resolve
+    /// ops into the in-flight set (4b); leader-gating + boot-scan
+    /// (4b-iii) and firing (4c) land on top. Inert until then.
+    pub fn startSendDispatch(self: *NodeState) !void {
+        if (self.send_dispatch != null) return;
+        const sd = try send_dispatch_mod.SendDispatch.init(self.allocator);
+        errdefer sd.deinit();
+        // FORK-6 leader gating + promotion boot-scan (4b-iii-B).
+        // Still inert: the set is fed (4b-ii) + reconstructed on
+        // promotion, dropped on demotion — but nothing fires until
+        // 4c flips the guard.
+        const self_ctx = @as(?*anyopaque, @ptrCast(self));
+        sd.configure(self_ctx, sendDispatchIsLeaderNode, self_ctx, sendDispatchRecoverFnNode);
+        try sd.start();
+        self.send_dispatch = sd;
     }
 
     /// Lookup-or-lazy-open under `tenant_files_lock`.
@@ -794,6 +870,101 @@ pub const NodeState = struct {
 /// (content-addressed: same id ⇒ same content), and calls
 /// `reloadDeployment` otherwise. Phase 2: readers either see the old
 /// snapshot or the new one, never a half-written mix.
+/// `SendDispatch.LeaderFn` thunk — casts ctx back to `*NodeState`
+/// and reports raft leadership. The leader-local in-flight set is
+/// gated on this (FORK-6): promotion → boot-scan (4b-iii-B),
+/// demotion → drop.
+fn sendDispatchIsLeaderNode(ctx_opaque: ?*anyopaque) bool {
+    const node: *NodeState = @ptrCast(@alignCast(ctx_opaque.?));
+    return node.raft.isLeader();
+}
+
+/// Cap on the promotion boot-scan's instance enumeration. Far above
+/// the ~50k/node architectural ceiling (3(b) / Manifest.max_stores);
+/// `listInstances` allocs proportional to the actual count, not this.
+/// Hitting it is the same escalation trigger as the 3(b) mitigation
+/// ([[project_owed_recovery_strategy]]).
+const RECOVER_MAX_TENANTS: u32 = 1 << 20;
+/// Per-tenant `_send/owed/` scan page. Owed-per-tenant is normally ~0
+/// (sends resolve fast); pagination rarely loops.
+const RECOVER_PAGE: u32 = 1024;
+
+/// `SendDispatch.RecoverFn` thunk (Option (b) 4b-iii-B). On raft
+/// promotion, reconstruct the leader-local in-flight set from the
+/// durable per-tenant `_send/owed/` (3(b) boot-scan): enumerate every
+/// instance from the durable root store, scan each tenant app.db's
+/// `_send/owed/`, skip ids that already have a `_send/proof/`
+/// (proven done), arm the rest. Runs ON the dispatch thread (sole
+/// owner of `sd.set`) — armFromParts dedups vs concurrent live-feed
+/// ops the same iteration's later `drainAll` applies. Best-effort:
+/// any failure drops just that send/tenant (logged); the live feed +
+/// the next promotion still cover it — no silent loss for the set.
+fn sendDispatchRecoverFnNode(ctx_opaque: ?*anyopaque, sd: *send_dispatch_mod.SendDispatch) void {
+    const node: *NodeState = @ptrCast(@alignCast(ctx_opaque.?));
+    const a = node.allocator;
+    var list = node.tenant.listInstances(RECOVER_MAX_TENANTS) catch |err| {
+        std.log.warn("send-dispatch recover: listInstances failed: {s} " ++
+            "(no reconstruct; live feed + next promotion cover)", .{@errorName(err)});
+        return;
+    };
+    defer list.deinit();
+    if (list.ids.len == RECOVER_MAX_TENANTS) std.log.warn(
+        "send-dispatch recover: hit RECOVER_MAX_TENANTS ({d}); some tenants " ++
+            "unscanned — escalate per 3(b) mitigation",
+        .{RECOVER_MAX_TENANTS},
+    );
+
+    var scanned: usize = 0;
+    var armed: usize = 0;
+    for (list.ids) |id| {
+        const inst = (node.tenant.getInstance(id) catch continue) orelse continue;
+        const slot = node.getOrOpenTenantSlot(inst) catch |err| {
+            std.log.warn("send-dispatch recover: slot {s}: {s}", .{ id, @errorName(err) });
+            continue;
+        };
+        scanned += 1;
+        var cursor_buf: [send_outbox_mod.KEY_BUF]u8 = undefined;
+        var cursor: []const u8 = "";
+        while (true) {
+            var rr = slot.app_kv.prefix(send_outbox_mod.OWED_PREFIX, cursor, RECOVER_PAGE) catch |err| {
+                std.log.warn("send-dispatch recover: scan {s}: {s}", .{ id, @errorName(err) });
+                break;
+            };
+            const n = rr.entries.len;
+            for (rr.entries) |e| {
+                if (e.key.len <= send_outbox_mod.OWED_PREFIX.len) continue;
+                const sid = e.key[send_outbox_mod.OWED_PREFIX.len..];
+                var pkbuf: [send_outbox_mod.KEY_BUF]u8 = undefined;
+                const pk = send_outbox_mod.proofKey(&pkbuf, sid);
+                if (slot.app_kv.get(pk)) |pv| {
+                    a.free(pv);
+                    continue; // proven done — not owed
+                } else |gerr| switch (gerr) {
+                    error.NotFound => {},
+                    else => {
+                        std.log.warn("send-dispatch recover: proof {s}: {s}", .{ sid, @errorName(gerr) });
+                        continue;
+                    },
+                }
+                sd.armFromParts(sid, slot.instance_id, e.value);
+                armed += 1;
+            }
+            if (n < RECOVER_PAGE) {
+                rr.deinit();
+                break;
+            }
+            // start-after cursor past the last key (collectPrefix is
+            // exclusive of `cursor`). Owed key ≤ 11+256 ≤ KEY_BUF.
+            const last = rr.entries[n - 1].key;
+            const clen = @min(last.len, cursor_buf.len);
+            @memcpy(cursor_buf[0..clen], last[0..clen]);
+            cursor = cursor_buf[0..clen];
+            rr.deinit();
+        }
+    }
+    std.log.info("send-dispatch recover: armed {d} owed across {d} tenants", .{ armed, scanned });
+}
+
 fn deploymentLoadFnNode(
     ctx_opaque: ?*anyopaque,
     tenant_id: []const u8,
@@ -956,6 +1127,20 @@ pub fn Worker(comptime opts: Options) type {
         /// Uses the same row as every other h2 stream collection so
         /// moves in and out preserve every component.
         raft_pending: StreamColl,
+        /// Continuation-trampoline parked streams (connection-actor
+        /// §6.1/§6.4). A handler that returned `next(...)` parks here
+        /// instead of `response_in`; collection membership IS the
+        /// "held" lifecycle (`feedback_state_is_collection`), and
+        /// `reg.move` out is both the resolve AND the resolve-once
+        /// guard (a stream can leave a collection only once — a
+        /// double-delivered outcome / deadline race finds it gone).
+        /// Worker-owned sibling, same StreamRow as every h2
+        /// collection so moves preserve all components — mirrors
+        /// `raft_pending` exactly.
+        parked_continuations: StreamColl,
+        /// DATA side-store for `parked_continuations` (descriptor +
+        /// §6.4 deadline). Lifecycle is the collection, not this map.
+        parked_meta: std.AutoHashMapUnmanaged(rove.Entity, ParkedCont) = .empty,
         /// Deferred TrackedTxn commits keyed by raft seq. Per kvexp
         /// README §1 (speculative apply): `txn.commit` runs after raft
         /// confirms the batch's seq, not before propose. On propose
@@ -1124,6 +1309,7 @@ pub fn Worker(comptime opts: Options) type {
                 .reg = reg,
                 .h2 = server,
                 .raft_pending = try StreamColl.init(allocator),
+                .parked_continuations = try StreamColl.init(allocator),
                 .dispatcher = try Dispatcher.init(allocator),
                 .node = config.node,
                 .raft = config.raft,
@@ -1160,9 +1346,11 @@ pub fn Worker(comptime opts: Options) type {
                 },
             };
             errdefer self.raft_pending.deinit();
+            errdefer self.parked_continuations.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
 
             reg.registerCollection(&self.raft_pending);
+            reg.registerCollection(&self.parked_continuations);
 
             // Eagerly open per-worker tenant_logs (request_id minters
             // bake the worker_id into the upper 16 bits; can't share).
@@ -1271,6 +1459,12 @@ pub fn Worker(comptime opts: Options) type {
             self.pending_units.deinit(allocator);
             self.batch_side.reset(allocator);
             self.batch_side.targets.deinit(allocator);
+            {
+                var pit = self.parked_meta.valueIterator();
+                while (pit.next()) |pc| pc.deinit(allocator);
+                self.parked_meta.deinit(allocator);
+            }
+            self.parked_continuations.deinit();
             self.raft_pending.deinit();
             self.dispatcher.deinit();
             if (self.sse_curl) |easy| easy.deinit();
@@ -2519,7 +2713,21 @@ pub fn drainRaftPending(worker: anytype) !void {
                 _ = worker.pending_txns.remove(wait.seq);
                 allocator.destroy(tracked);
             }
-            try server.reg.move(ent, &worker.raft_pending, &server.response_in);
+            // Trampoline: a committed continuation parks (no response)
+            // instead of going to `response_in`; the §6.4 deadline
+            // sweep or a 3b-iii callback resolves it. `parked_meta`
+            // membership is the data signal (descriptor + deadline
+            // recorded by `contRecordIfAny`); the lifecycle is the
+            // collection move. The `count() != 0` short-circuit keeps
+            // the universal no-continuations case to one usize compare
+            // per entity instead of a hashmap probe — the write-path
+            // hot loop pays nothing for a feature it isn't using
+            // (`feedback_no_n_tenants_hot_path`).
+            if (worker.parked_meta.count() != 0 and worker.parked_meta.contains(ent)) {
+                try server.reg.move(ent, &worker.raft_pending, &worker.parked_continuations);
+            } else {
+                try server.reg.move(ent, &worker.raft_pending, &server.response_in);
+            }
             continue;
         }
 
@@ -2541,6 +2749,16 @@ pub fn drainRaftPending(worker: anytype) !void {
             allocator.destroy(kv.value);
         }
 
+        // Trampoline: open hop's commit faulted/timed out → cannot
+        // hold. Discard the descriptor; the entity gets the same 503
+        // a terminal success would (client retries — moot-on-loss).
+        if (worker.parked_meta.count() != 0) {
+            if (worker.parked_meta.fetchRemove(ent)) |kvp| {
+                var pc = kvp.value;
+                pc.deinit(allocator);
+            }
+        }
+
         const old_body_ptr: ?[*]u8 = resp_body.data;
         const old_body_len: u32 = resp_body.len;
         try respb.overwrite503InPending(worker, ent, allocator);
@@ -2560,6 +2778,7 @@ pub fn drainRaftPending(worker: anytype) !void {
         const unit = &worker.pending_units.items[u];
         if (committed >= unit.seq) {
             firePendingEmits(worker, unit);
+            firePendingSendOps(worker, unit);
             unit.deinit(allocator);
             _ = worker.pending_units.swapRemove(u);
             continue;
@@ -2570,6 +2789,308 @@ pub fn drainRaftPending(worker: anytype) !void {
             continue;
         }
         u += 1;
+    }
+}
+
+/// §6.4 mandatory-timeout sweep for continuation-parked streams
+/// (connection-actor 3b-ii). A stream that returned `next(...)` and
+/// has no resume by its deadline gets a real 504 — before any
+/// intermediary gives up. The `reg.move` out of `parked_continuations`
+/// is simultaneously the resolve AND the resolve-once guard: a stream
+/// leaves a collection exactly once, so a racing 3b-iii callback
+/// finds it gone (expected, not an error). O(parked) per tick, gated
+/// by `parked_meta.count() == 0`.
+/// Remove + free a parked stream's data side-store entry.
+fn freeContMeta(worker: anytype, ent: rove.Entity) void {
+    if (worker.parked_meta.fetchRemove(ent)) |kvp| {
+        var pc = kvp.value;
+        pc.deinit(worker.allocator);
+    }
+}
+
+/// Resolve a parked stream: stamp the response on the
+/// `parked_continuations` collection and move it to `response_in`.
+/// The move is the resolve-ONCE guard — `isInCollection` gates it, so
+/// a racing trigger (3b-iii callback vs deadline) that already moved
+/// it out is a silent no-op (expected, not an error). Body is duped
+/// into an entity-owned buffer (freed by h2's RespBody teardown).
+fn resolveParked(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    status: u16,
+    body: []const u8,
+) !void {
+    const server = worker.h2;
+    const allocator = worker.allocator;
+    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return; // already resolved
+    const owned = try allocator.dupe(u8, body);
+    var owned_taken = false;
+    errdefer if (!owned_taken) allocator.free(owned);
+    try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = status });
+    try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, .{ .fields = null, .count = 0 });
+    try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = owned.ptr, .len = @intCast(owned.len) });
+    owned_taken = true;
+    try server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid);
+    try server.reg.set(ent, &worker.parked_continuations, h2.Session, sess);
+    server.reg.move(ent, &worker.parked_continuations, &server.response_in) catch |err| {
+        server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
+        allocator.free(owned);
+        return err;
+    };
+}
+
+/// The trampoline resume engine (connection-actor 3b-iii). Given an
+/// outcome for a parked stream, re-enter the SAME dispatch path a
+/// request takes (a continuation IS a request) with body = ctx +
+/// outcome, then: terminal → flush to the held socket (resolve);
+/// continuation → re-park (only if `allow_repark`). 3b-iii scope is
+/// **read-only resume hops** — a hop that wrote kv is rejected (its
+/// raft-gated socket resolve is the documented write-resume
+/// follow-on). The deadline trigger passes `allow_repark = false`
+/// (the §6.4 mandatory timeout must terminate, not extend).
+/// `error.Resume*` → caller falls back to a hard 504.
+fn resumeContinuation(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    outcome_json: []const u8,
+    allow_repark: bool,
+) !void {
+    const allocator = worker.allocator;
+    const meta = worker.parked_meta.getPtr(ent) orelse return; // resolve-once: already gone
+
+    const slot = worker.node.tenant_files_map.get(meta.tenant_id) orelse return error.ResumeNoTenant;
+    const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
+    const tc = TenantFiles{ .slot = slot, .snap = snap };
+    defer tc.release();
+    const inst = (worker.node.tenant.getInstance(meta.tenant_id) catch return error.ResumeNoInstance) orelse
+        return error.ResumeNoInstance;
+
+    const path = meta.cont.path;
+    const bc = blk: {
+        if (tc.snap.bytecodes.get(path)) |b| break :blk b;
+        const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{path});
+        defer allocator.free(mjs);
+        if (tc.snap.bytecodes.get(mjs)) |b| break :blk b;
+        const js = try std.fmt.allocPrint(allocator, "{s}.js", .{path});
+        defer allocator.free(js);
+        if (tc.snap.bytecodes.get(js)) |b| break :blk b;
+        return error.ResumeNoBytecode;
+    };
+
+    // A continuation is an internal request: named export → RPC
+    // envelope `{fn,args:[ctx,outcome]}`; default export → body
+    // object `{ctx,outcome}`. ctx_json/outcome_json are JSON text
+    // embedded verbatim.
+    const body = if (meta.cont.fn_name) |fnname|
+        try std.fmt.allocPrint(allocator, "{{\"fn\":\"{s}\",\"args\":[{s},{s}]}}", .{ fnname, meta.cont.ctx_json, outcome_json })
+    else
+        try std.fmt.allocPrint(allocator, "{{\"ctx\":{s},\"outcome\":{s}}}", .{ meta.cont.ctx_json, outcome_json });
+    defer allocator.free(body);
+    const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
+    defer allocator.free(spath);
+
+    var txn = inst.kv.beginTrackedImmediate() catch return error.ResumeTxn;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    var tapes = RequestTapes.init(allocator);
+    defer tapes.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .kv_tape = &tapes.kv,
+        .date_tape = &tapes.date,
+        .math_random_tape = &tapes.math_random,
+        .crypto_random_tape = &tapes.crypto_random,
+        .module_tape = &tapes.module,
+        .prng_seed = @bitCast(now_ns),
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+    };
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    var oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        &txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        request,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        try resolveParked(worker, ent, sid, sess, 500, "continuation handler error\n");
+        freeContMeta(worker, ent);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            // A thrown resume hop is an EXPECTED condition (author
+            // error, or use of an effectful primitive a read-only
+            // resume hop doesn't support — e.g. `http.send`, which
+            // throws "dispatcher did not allocate pending_schedules"
+            // since resume hops are effect-free in 3b-iii's scope).
+            // It must be a defined 5xx, never a flushed 200-empty
+            // (that masked the recipe-1 effectful-resume gap)
+            // — feedback_infallibility_violations.
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                try resolveParked(worker, ent, sid, sess, 500, "continuation handler error\n");
+                freeContMeta(worker, ent);
+                return;
+            }
+            if (wrote) {
+                txn.rollback() catch {};
+                txn_done = true;
+                try resolveParked(worker, ent, sid, sess, 500, "continuation kv writes not yet supported (3b-iii read-only)\n");
+                freeContMeta(worker, ent);
+                return;
+            }
+            // Clean read-only commit cannot fault (mirrors
+            // finalizeBatch read-only invariant) — panic, never soft.
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeContinuation.commit(read_only)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            try resolveParked(worker, ent, sid, sess, st, r.body);
+            freeContMeta(worker, ent);
+        },
+        .continuation => |c2| {
+            var c2m = c2;
+            if (!allow_repark or wrote) {
+                c2m.deinit(allocator);
+                txn.rollback() catch {};
+                txn_done = true;
+                const code: u16 = if (!allow_repark) 504 else 500;
+                const msg = if (!allow_repark)
+                    "hold deadline exceeded\n"
+                else
+                    "continuation kv writes not yet supported (3b-iii read-only)\n";
+                try resolveParked(worker, ent, sid, sess, code, msg);
+                freeContMeta(worker, ent);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeContinuation.commit(repark_ro)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            // Re-park: swap the descriptor in place, refresh the
+            // deadline; the entity stays in `parked_continuations`.
+            meta.cont.deinit(allocator);
+            meta.cont = c2m;
+            meta.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
+        },
+    }
+}
+
+/// §6.4 mandatory-timeout sweep. A past-deadline parked stream is
+/// resumed with a `timeout` outcome so the handler authors the
+/// response (plan §6.4: "the handler gets the last word on the
+/// body"); `allow_repark = false` forces termination. If the resume
+/// engine itself fails (no deployment / bytecode / txn), fall back to
+/// a hard 504 so the socket never hangs past its deadline.
+/// §6.4 Part B: an `http.send` bound to a parked continuation
+/// completed — resume the held stream with the result as the outcome
+/// (the call's success/failure IS the resume input). Returns true iff
+/// a parked continuation on THIS worker matched (caller then deletes
+/// the `c/` receipt); false → not here (cross-worker is task #8;
+/// caller falls through to the normal callback path). MUST be called
+/// with no tenant batch txn open — `resumeContinuation` opens its own
+/// `beginTrackedImmediate`; nesting it inside the callback batch txn
+/// would double-BEGIN the same kvexp env. `allow_repark = true`: the
+/// hop may re-issue `http.send` + return another continuation
+/// (recipe-1 retry) — unlike the deadline path which must terminate.
+pub fn resumeBoundContinuation(
+    worker: anytype,
+    tenant_id: []const u8,
+    sched_id: []const u8,
+    outcome_json: []const u8,
+) bool {
+    if (worker.parked_meta.count() == 0) return false;
+    const ents = worker.parked_continuations.entitySlice();
+    const sids = worker.parked_continuations.column(h2.StreamId);
+    const sesss = worker.parked_continuations.column(h2.Session);
+    for (ents, sids, sesss) |ent, sid, sess| {
+        const pc = worker.parked_meta.getPtr(ent) orelse continue;
+        const bsid = pc.bound_schedule_id orelse continue;
+        if (!std.mem.eql(u8, pc.tenant_id, tenant_id)) continue;
+        if (!std.mem.eql(u8, bsid, sched_id)) continue;
+        // Matched. resumeContinuation either flushes+drops (terminal)
+        // or re-parks (keeps the entity) — either way we return
+        // immediately, so iterating the now-possibly-mutated slice is
+        // not a hazard. Infra failure → 502 + drop (the call result
+        // is lost, but the held socket must not hang).
+        resumeContinuation(worker, ent, sid, sess, outcome_json, true) catch |err| {
+            std.log.warn(
+                "rove-js cont-resume: {s}/{s}: {s}; 502",
+                .{ tenant_id, sched_id, @errorName(err) },
+            );
+            resolveParked(worker, ent, sid, sess, 502, "continuation resume failed\n") catch {};
+            freeContMeta(worker, ent);
+        };
+        return true;
+    }
+    return false;
+}
+
+pub fn sweepParkedContinuations(worker: anytype) !void {
+    if (worker.parked_meta.count() == 0) return;
+    std.log.info("rove-js sendpath: sweepParkedContinuations tick parked={d}", .{worker.parked_meta.count()});
+    const allocator = worker.allocator;
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+
+    // Collect expired first — resume/resolve mutate the collection,
+    // so snapshot (ent,sid,sess) while the slice is stable.
+    const Expired = struct { ent: rove.Entity, sid: h2.StreamId, sess: h2.Session };
+    var expired: std.ArrayListUnmanaged(Expired) = .empty;
+    defer expired.deinit(allocator);
+    {
+        const ents = worker.parked_continuations.entitySlice();
+        const sids = worker.parked_continuations.column(h2.StreamId);
+        const sesss = worker.parked_continuations.column(h2.Session);
+        for (ents, sids, sesss) |ent, sid, sess| {
+            const pc = worker.parked_meta.getPtr(ent) orelse continue;
+            if (now_ns >= pc.deadline_ns)
+                try expired.append(allocator, .{ .ent = ent, .sid = sid, .sess = sess });
+        }
+    }
+
+    for (expired.items) |e| {
+        resumeContinuation(worker, e.ent, e.sid, e.sess, "{\"ok\":false,\"reason\":\"deadline\"}", false) catch |err| {
+            std.log.warn(
+                "rove-js continuation: deadline resume failed ({s}); hard 504",
+                .{@errorName(err)},
+            );
+            resolveParked(worker, e.ent, e.sid, e.sess, 504, "hold deadline exceeded\n") catch {};
+            freeContMeta(worker, e.ent);
+        };
     }
 }
 
@@ -2593,6 +3114,59 @@ fn firePendingEmits(worker: anytype, unit: *ParkedUnit) void {
         unit.emits.items,
         worker.sse_insecure_tls,
     );
+}
+
+/// Fire commit-gated send arm/resolve intents into the leader-local
+/// SendDispatch. Mirrors `firePendingEmits`: gated on commit, no-op
+/// on an empty set. `worker.node.send_dispatch` is null until
+/// `startSendDispatch` (and never wired on a non-leader path that
+/// matters); `OwnedIntent.fire` tolerates null (a dropped intent is
+/// re-derived by the promotion boot-scan — no silent loss).
+fn firePendingSendOps(worker: anytype, unit: *ParkedUnit) void {
+    if (unit.send_ops.items.len == 0) return;
+    const sd = worker.node.send_dispatch;
+    std.log.info("rove-js sendpath: firePendingSendOps seq={d} n={d} sd_null={}", .{ unit.seq, unit.send_ops.items.len, sd == null });
+    for (unit.send_ops.items) |*o| o.fire(sd);
+}
+
+/// Register a committed batch's `_send/*` arm/resolve intents as a
+/// post-propose parked unit, keyed by the propose `seq` — the
+/// `parkEmits` idiom for the Option (b) feed. Classifies + dups owned
+/// intents from the live `writeset` (valid here; freed by its owner
+/// after propose). No-op when the batch wrote no `_send/*` keys, so
+/// it's free to call on every write-path / tenant-batch propose.
+/// §6.4 resolution routes by the send-id resume-search (Part-B
+/// matches `bound_schedule_id == send_id`), not a stored locator —
+/// the owning worker is hash(tenant)→worker. On a pre-append error
+/// the partial owned list is freed here (nothing parked, escaped).
+pub fn parkSendOps(
+    worker: anytype,
+    seq: u64,
+    tenant_id: []const u8,
+    writeset: *const kv_mod.WriteSet,
+) !void {
+    const allocator = worker.allocator;
+    var ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty;
+    errdefer {
+        for (ops.items) |*o| o.deinit(allocator);
+        ops.deinit(allocator);
+    }
+    try send_dispatch_mod.materialize(writeset, tenant_id, allocator, &ops);
+    if (ops.items.len == 0) {
+        ops.deinit(allocator);
+        return; // nothing to gate
+    }
+    std.log.info("rove-js sendpath: parkSendOps tenant={s} seq={d} send_ops={d}", .{ tenant_id, seq, ops.items.len });
+    try worker.pending_units.ensureUnusedCapacity(allocator, 1);
+    const tid = try allocator.dupe(u8, tenant_id);
+    errdefer allocator.free(tid);
+    worker.pending_units.appendAssumeCapacity(.{
+        .seq = seq,
+        .deadline_ns = @intCast(std.time.nanoTimestamp() +
+            @as(i128, @intCast(worker.commit_wait_timeout_ns))),
+        .tenant_id = tid,
+        .send_ops = ops,
+    });
 }
 
 /// Register a tenant-batch dispatch's SSE emits as a post-propose
@@ -2662,6 +3236,15 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
         i -= 1;
         const ent = entities[i];
         const resp_body = resp_bodies[i];
+        // Trampoline: leadership lost before the open hop committed →
+        // cannot hold. Discard the descriptor; 503 like any other
+        // pending entry (client retries — moot-on-loss).
+        if (worker.parked_meta.count() != 0) {
+            if (worker.parked_meta.fetchRemove(ent)) |kvp| {
+                var pc = kvp.value;
+                pc.deinit(allocator);
+            }
+        }
         const old_body_ptr: ?[*]u8 = resp_body.data;
         const old_body_len: u32 = resp_body.len;
         try respb.overwrite503InPending(worker, ent, allocator);

@@ -37,6 +37,7 @@ pub const WriteSet = writeset_mod.WriteSet;
 pub const WriteSetOp = writeset_mod.Op;
 pub const applyEncodedWriteSet = writeset_mod.applyEncoded;
 pub const scanWriteSetPutValue = writeset_mod.scanPutValue;
+pub const decodeWriteSetOps = writeset_mod.decodeOps;
 
 pub const KvStore = kvstore.KvStore;
 pub const KvEntry = kvstore.Entry;

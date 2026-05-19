@@ -1,5 +1,18 @@
 # http.send plan — outbound HTTP primitive + customer-JS retry policy
 
+> **2026-05-19 corrigendum (read this first)** — the N-way
+> re-platform (**Option (b)**, §15) is **SHIPPED**. §§1–14 below
+> describe the *historical* pre-Option-(b) design (cluster-wide
+> `schedules.db`, raft envelopes 8/9/10/11, the single leader-pinned
+> schedule-server thread, worker-0 `dispatchCallbacks` /
+> `dispatchInternalSchedules`). **All of that machinery was deleted**
+> in the 5b-2 cutover (2026-05-19). The shipped reality is in **§15**:
+> a send's only firing record is the per-tenant `_send/owed/{id}`
+> marker riding envelope-0, fired by a leader-local per-node
+> in-memory `SendDispatch`, resolved by `dispatchSendCompletions`.
+> Read §§1–14 for design rationale/history only; §15 is authoritative
+> for current behavior.
+>
 > **2026-05-09 corrigendum** — sections referring to a system
 > tenant (`webhook.rewindjs.com`) that runs the default retry policy
 > are **superseded**. Retries are now a pure customer-side
@@ -1180,6 +1193,209 @@ HTTP-going-out (delays, retries, fanout, signing, workflows)
 becomes JS they can read, debug, and customize.
 
 ---
+
+## 15. Addendum (2026-05-18) — N-way re-platform, **Option (b)** (SHIPPED 2026-05-19)
+
+**Status: SHIPPED.** Ratified and built across increments 1–6; the
+schedule-server / `schedules.db` / envelopes 8/9/10/11 cutover-and-
+delete landed in the 5b-2 sweep (2026-05-19). This addendum
+supersedes the *implementation* of §7's at-least-once (and, with it,
+§§1–14's `schedules.db` + leader-pinned-thread machinery — read those
+as the historical pre-Option-(b) design), not the *guarantee*. The
+shipped reality: a send's only firing record is the per-tenant
+`_send/owed/{id}` marker riding envelope-0, fired by a leader-local
+per-node in-memory `SendDispatch` (`src/js/send_dispatch.zig`) +
+`SendInflightSet` (`src/js/send_inflight.zig`), resolved by
+`dispatchSendCompletions` (`src/js/callback_dispatch.zig`). Driven by
+the connection-actor work: the callback / continuation-resume path
+graduated from a "send optimization" to a co-equal execution lane,
+and its scaling ceiling was this design's own machinery.
+
+### 15.1 Problem
+
+At-least-once delivery is implemented as a **dedicated cluster-wide
+schedule store** (envelopes 8/9) fired by a **single leader-pinned
+schedule-server thread**, with `dispatchCallbacks` running `on_result`
+**worker-0-only**. That triad forces a leader+worker-0 funnel: three
+of the four JS-execution lanes (callbacks, internal-schedules,
+continuation-completion-resume) bottleneck through one worker on the
+leader. The high-volume immediate-send path cannot scale across the N
+workers.
+
+### 15.2 Two meanings of "at-least-once" (do not conflate)
+
+- **Meaning-1 — no-silent-loss / at-least-once *attempt*.** A send is
+  *owed* until durable proof it was attempted and its outcome
+  recorded (proof = the callback committed). No proof (a crash
+  between fire and callback-commit) ⇒ re-attempt. Permits a duplicate
+  at the target ⇒ **requires resolve-once**. The valuable property:
+  *a send is never silently lost.*
+- **Meaning-2 — retry-to-2xx / auto-retry-on-failure.** An
+  opinionated application retry policy. **Never platform** — it is
+  the customer `retry.*` library composed on top. Not in scope to
+  remove; it isn't platform.
+
+### 15.3 The tradeoff triangle — pick two
+
+`{ no-silent-loss (M1) · no resolve-once complexity · N-way (no funnel) }`
+
+| | M1 | resolve-once | N-way |
+|---|---|---|---|
+| Current | ✓ | needed | ✗ (centralized) |
+| Pure best-effort *(rejected default)* | ✗ | none ✓ | ✓ |
+| **Option (b) — chosen** | ✓ | needed | ✓ |
+
+Pure best-effort loses no-silent-loss: on issuing-node loss the send
+vanishes and the handler gets *nothing* (recovery only via §6.4
+caller-retry, or a customer-hand-rolled kv outbox). That discards a
+guarantee fire-and-forget (transactional email / must-fire webhook)
+genuinely needs. **Option (b) keeps no-silent-loss AND gets N-way;
+the irreducible cost vs pure-best-effort is retaining resolve-once.**
+
+### 15.4 Option (b) mechanism
+
+The centralization is the *dedicated cluster-wide schedule store +
+single leader-pinned firer* — **not Meaning-1 itself**. Re-implement
+Meaning-1 on the **per-tenant kv/raft path (envelope-0 — the normal
+write path every handler write already takes; no central store, no
+pinned thread):**
+
+- the **"owed" marker** is part of the issuing hop's own writeset
+  (already committed before the send fires, per the §-post-commit
+  discipline);
+- the **"proof"** is a per-tenant write on callback-commit;
+- **steady-state dispatch** = an **apply-time set** (add on
+  `_send/owed/` apply, remove on `_send/proof/` apply; entry carries
+  the issuing `(node,worker)` locator → callback runs on the worker
+  housing the parked stream). **Never a per-tick scan** — that
+  invariant is *architectural and engine-independent* (per-tick
+  O(growing) = latent scaling bug; two durable-lifecycle
+  representations drift), not a SQLite-perf artifact.
+- **recovery (set reconstruction at restart)** = a
+  **measurement-gated** choice, *not* a baked one: lazy
+  recover-on-tenant-open *vs* a one-time boot scan to seed the set.
+  The earlier "per-tenant scan / lazy-on-open + recipe-2" framing
+  carried an unstated **SQLite-era** premise (separate per-tenant
+  DBs, per-conn locks, query-setup ×N). Under kvexp/LMDB a one-time
+  range scan of `_send/owed/` may be cheap enough to prefer
+  boot-scan-to-seed (removing lazy-on-open's fire-and-forget-cold-
+  tenant latency + the recipe-2 dependency for that case) — but
+  kvexp can hit the `Manifest.dbis_lock` convoy across many tenant
+  DBIs (a counterintuitive finding caught only by controlled A/B).
+  Decide in increment 3 by **measuring an actual all-`_send/owed/`
+  scan at the real kvexp layout**, not engine intuition either way
+  (the codebase's measure-don't-conclude lesson). Re-fired on the
+  owning tenant's worker.
+
+N-way by construction. **Delete:** the central schedule subsystem —
+*both* its leader-pinned single firer + worker-0 callback (that is
+the execution **funnel**) *and* its central durable store (that is a
+cross-tenant **write hot spot**; see §15.7 — these are two distinct
+costs, not one) — and any Meaning-2 platform retry (was never
+platform).
+**Keep:** resolve-once (re-send ⇒ duplicates), and §7's no-silent-loss
+guarantee (only its implementation changes — hence a *smaller*
+ratification surface than pure-best-effort, but still gated).
+
+### 15.5 Semantics
+
+- **Immediate send:** has a per-tenant durable owed-marker
+  (raft-replicated via the hop's normal envelope-0). Bare leadership
+  change = no-op (worker-local in-flight; the issuing worker
+  completes it). **Node loss does NOT silently lose it** — the
+  recovery scan on the owning tenant's worker re-fires it (callback
+  dedups via resolve-once). Caveat: a §6.4 *held socket* is
+  physically node-local and still dies on node loss (orthogonal — for
+  held-sync the caller retries the whole request anyway); but a
+  *fire-and-forget* send survives node loss. That survival is exactly
+  what Option (b) preserves and pure-best-effort would have lost.
+- **Delayed / cron:** a special case of the per-tenant owed-marker
+  carrying `fire_at_ns`; survives 7d + N leadership changes (the
+  durable timer); degrades to the immediate-send model when due. A
+  customer kv outbox is *not* the default for delayed durability —
+  only for durability of the *delivered effect* beyond best-effort.
+
+### 15.6 Constraint
+
+Introduces **no peer-to-peer cross-node operation** — raft consensus
+(the existing commit log every write already uses) is the only
+cross-node coordination; sse-service stays a centralized side-process,
+not cross-node. (See `docs/connection-actor-plan.md` §12 and the
+`project_callback_execution_model` / `project_connection_actor_unified_trigger`
+memory of record; tracked as the http.send-evolution work, explicitly
+**not** folded into the connection-actor phases.)
+
+### 15.7 Considered & rejected — Option (c): central send-index + N-way execution
+
+A central raft-replicated send-index (s/{tenant}/{id}-style),
+**keeping it** for durability/recovery but making execution
+locator-routed and N-way (each record carries the owning
+`(node,worker)`; the apply-time set is unchanged; the owning worker
+fires/runs-callback for its rows; **no** leader-pinned firer, **no**
+worker-0). This forced a correction: *"central store" ≠ "the
+funnel"* — the funnel is the single firer + worker-0; you can keep a
+central store and still be N-way. Option (c) **wins recovery
+decisively**: one central-prefix scan, no per-tenant walk, no lazy
+recover-on-open latency, no recipe-2 needed.
+
+**Rejected** because it loses the property this entire re-platform
+exists for — write throughput. A central send-index = *every*
+`http.send` writes one shared structure = a cross-tenant shared
+**write hot spot**, exactly the contention per-tenant app.db
+isolation is *measured* to remove (`kv_shard_bench`, the
+tenant-affinity work, the ~158k 8w-sharded baseline). It removes the
+execution funnel and adds a write funnel. The tension is irreducible:
+**you cannot have one place to scan for recovery and N independent
+places to write the same records** — any all-sends-central structure
+is a write hot spot unless sharded, and sharded-by-tenant *is* the
+per-tenant model. It also reintroduces an owner-death re-home
+coordination question that per-tenant recover-on-open makes implicit.
+Net: Option (b) stands; the rejection reason is *"central index =
+the cross-tenant write hot spot per-tenant isolation provably
+eliminates,"* **not** "central store = funnel" (that conflation was
+wrong). Do not re-litigate without new throughput evidence.
+
+### 15.8 Considered & rejected — Option (d): per-worker schedule stores
+
+Shard the send store **by worker** (N = workers) instead of by
+tenant: each worker writes only its own store (no cross-tenant write
+hot spot — kills (c)'s flaw via a different sharding axis) and
+recovery scans a fixed small N, not N_tenants (kills (b)'s
+lazy-recovery latency). Real and tempting; **rejected** on three
+concrete axes, decisive-first:
+
+1. **(b)'s owed-marker is free + atomic; (d)'s cannot be.** Option
+   (b)'s `_send/owed/{id}` is one more key in the issuing hop's
+   *already-committing* per-tenant envelope-0 writeset — atomic with
+   the state change that justified the send, zero extra raft entry,
+   zero extra lock (txn already held). A per-worker store is a
+   separate keyspace → a separate write needing a **multi-envelope
+   batch** to stay atomic with the hop = exactly the coupling this
+   re-platform deletes. (d) is *worse* than (b) on writes; "no lock
+   contention" holds only vs (c)'s central store — (b) already has
+   zero cross-tenant contention *and* zero marginal write.
+2. **Durable state keyed by an unstable runtime fan-out parameter.**
+   `--workers` changes across deploys; real key (node_id,
+   worker_index); a shrink orphans stores. The system deliberately
+   makes workers interchangeable (PLAN §13.1 "any worker any tenant,
+   no pinning"; tenant-affinity is *soft* lock-locality, not hard
+   pinning). (d) reverses that for a whole class of durable state.
+   Stabilizing via fixed shard-ids + a shard-manager/rebalancer
+   ("Option (d')") reinvents a consumer-group/partition-rebalancer —
+   heavyweight, and the coordination the no-cross-node-op invariant
+   exists to avoid.
+3. **Re-home on node/worker loss has no natural routing.** Which
+   surviving worker adopts a dead worker's store? → coordination /
+   liveness scan. (b) makes re-home *implicit*: whoever next serves
+   tenant T recovers T's owed sends, and tenant→worker is the
+   already-solved routing. Worker-index is not a routing key; tenant
+   is.
+
+Same shape as (c): wins only the recovery axis vs (b); (b) already
+bounds that cost narrowly (lazy-on-open + recipe-2, fire-and-forget
+in never-reopened tenants only), whereas (d)'s costs (worse writes,
+worker-pinned durable state, re-home coordination) are broad and
+always-on. Do not re-litigate without new evidence.
 
 ## See also
 

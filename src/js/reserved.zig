@@ -30,9 +30,11 @@ const std = @import("std");
 ///                         `_config/{lib}/{name}.json` in the
 ///                         customer's tree; mirror runs on release.
 ///   `_deploy/`          → reserved for future deploy metadata in app.db
-///   `_callback/`        → schedule-complete envelope-9 apply writes
-///                         here; dispatchCallbacks reads + invokes
-///                         on_result
+///   `_callback/`        → retired receipt prefix (Option (b)
+///                         resolves sends via in-memory Completions
+///                         + `_send/proof/`, not `_callback/` rows).
+///                         Stays reserved so customer JS can't spoof
+///                         a legacy receipt key.
 ///   `_log/`             → per-tenant log metadata in app.db. Today
 ///                         only `_log/next_request_seq` lives here
 ///                         (Phase 5.5 a, A4 — moved off log.db so
@@ -40,6 +42,15 @@ const std = @import("std");
 ///   `_magic/`           → magic-link tokens (root.db only, but list-wide)
 ///   `_triggers/`        → trigger module bytecode (manifest, not app.db)
 ///   `_sessions/`        → reserved for future platform session storage
+///   `_send/`            → http.send Option-(b) per-tenant outbox:
+///                         `_send/owed/{id}` (the re-fireable send,
+///                         written into the issuing hop's writeset,
+///                         envelope-0) + `_send/proof/{id}` (outcome
+///                         recorded on callback-commit). Recovery =
+///                         owed-without-proof scan, re-fired N-way on
+///                         the owning tenant's worker. Replaces the
+///                         central schedule store (env-8/9). See
+///                         docs/http-send-plan.md §15.
 ///
 /// `_events/` was reserved for SSE event rows under the legacy worker
 /// pump; the centralized sse-server retired that storage layer
@@ -54,6 +65,7 @@ pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_magic/",
     "_triggers/",
     "_sessions/",
+    "_send/",
 };
 
 /// Customer trigger registration prefix collides with a platform
@@ -96,6 +108,7 @@ test "isReservedTriggerPrefix: exact platform prefix blocked" {
     try std.testing.expect(isReservedTriggerPrefix("_config/"));
     try std.testing.expect(isReservedTriggerPrefix("_log/"));
     try std.testing.expect(isReservedTriggerPrefix("_sessions/"));
+    try std.testing.expect(isReservedTriggerPrefix("_send/"));
     try std.testing.expect(isReservedTriggerPrefix("_triggers/"));
 }
 

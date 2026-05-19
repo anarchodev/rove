@@ -22,6 +22,7 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const c = qjs.c;
 const schedule_server = @import("rove-schedule-server");
+const send_outbox = @import("../send_outbox.zig");
 
 const globals = @import("../globals.zig");
 
@@ -41,11 +42,6 @@ pub fn jsHttpSend(
     }
     const opts = argv[0];
 
-    const list = state.pending_schedules orelse {
-        _ = c.JS_ThrowInternalError(ctx, "http.send: dispatcher did not allocate pending_schedules");
-        return js_exception;
-    };
-
     var row = buildRow(ctx, state, opts) catch |err| switch (err) {
         error.JsException => return js_exception,
         else => {
@@ -53,16 +49,21 @@ pub fn jsHttpSend(
             return js_exception;
         },
     };
-    errdefer row.deinit(state.allocator);
-
-    list.append(state.allocator, row) catch |err| {
+    // Option (b): the send's only firing record is `_send/owed/{id}`
+    // (the env-8 ScheduleRow → pending_schedules → schedule-server
+    // path retired 5b-1, its types deleted 5b-2-d). `row` is just
+    // the local `BuiltSend` carrier for the id + OwedSend projection,
+    // owned here and freed on every return (no list transfer; the
+    // errdefer is inert in a `c`-returning fn so frees are explicit).
+    state.http_call_index += 1;
+    writeOwedMarker(state, &row) catch |err| {
         row.deinit(state.allocator);
         state.pending_kv_error = err;
         return js_exception;
     };
-    state.http_call_index += 1;
-
-    return c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
+    const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len); // copies
+    row.deinit(state.allocator);
+    return res;
 }
 
 pub fn jsHttpCancel(
@@ -78,11 +79,6 @@ pub fn jsHttpCancel(
     }
     const opts = argv[0];
 
-    const list = state.pending_cancels orelse {
-        _ = c.JS_ThrowInternalError(ctx, "http.cancel: dispatcher did not allocate pending_cancels");
-        return js_exception;
-    };
-
     // `handle` and `id` are equivalent for the cancel API — both
     // resolve to the row id. Customers using a customer-supplied
     // handle pass `handle`; customers holding the value http.send
@@ -95,35 +91,117 @@ pub fn jsHttpCancel(
             return js_exception;
         },
     };
-    errdefer state.allocator.free(id_owned);
-
-    const tenant_owned = state.allocator.dupe(u8, state.instance_id) catch {
+    // 5b-1 go-live: env-10 (CancelTarget → pending_cancels → the
+    // schedule-server applyCancel) is RETIRED along with env-8. The
+    // ONLY cancel mechanism is tombstoning `_send/owed/{id}` — the
+    // delete-mirror of `writeOwedMarker` — so Option (b) recovery
+    // never re-fires a deliberately-cancelled send. `id_owned` is
+    // local now (no `target` transfer); freed on every return (the
+    // errdefer is inert in a `c`-returning fn — frees are explicit).
+    deleteOwedMarker(state, id_owned) catch |err| {
         state.allocator.free(id_owned);
-        state.pending_kv_error = error.OutOfMemory;
+        state.pending_kv_error = err;
         return js_exception;
     };
-    errdefer state.allocator.free(tenant_owned);
-
-    const target: schedule_server.CancelTarget = .{
-        .tenant_id = tenant_owned,
-        .id = id_owned,
-    };
-    list.append(state.allocator, target) catch {
-        state.allocator.free(id_owned);
-        state.allocator.free(tenant_owned);
-        state.pending_kv_error = error.OutOfMemory;
-        return js_exception;
-    };
+    state.allocator.free(id_owned);
     return js_undefined;
 }
 
-// ── Build a ScheduleRow from the JS options object ─────────────────────
+/// Local carrier for a just-built send: the JS-returned `id` plus the
+/// fields buildRow extracts, all owned here. 5b-2-d retired the
+/// `schedule_server.ScheduleRow` path (env-8 → pending_schedules →
+/// schedule-server); the send's only firing record is the relocatable
+/// `send_outbox.OwedSend` projection written by `writeOwedMarker`.
+/// `tenant_id` is implicit (it IS this tenant's app.db) and
+/// `is_internal` is apply-time-derived, so neither is part of the
+/// projection — see `send_outbox.OwedSend`. `deinit` frees every
+/// owned slice once (same set the old ScheduleRow.deinit freed).
+const BuiltSend = struct {
+    tenant_id: []u8,
+    id: []u8,
+    fire_at_ns: i64,
+    url: []u8,
+    method: []u8,
+    headers_json: []u8,
+    body: []u8,
+    timeout_ms: u32,
+    max_body_bytes: u32,
+    on_result_module: []u8,
+    on_result_fn: []u8,
+    on_result_args_json: []u8,
+    context_json: []u8,
+
+    fn deinit(self: *BuiltSend, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
+        allocator.free(self.id);
+        allocator.free(self.url);
+        allocator.free(self.method);
+        allocator.free(self.headers_json);
+        allocator.free(self.body);
+        allocator.free(self.on_result_module);
+        allocator.free(self.on_result_fn);
+        allocator.free(self.on_result_args_json);
+        allocator.free(self.context_json);
+        self.* = undefined;
+    }
+};
+
+/// Project the just-built `BuiltSend` into its relocatable
+/// `OwedSend` subset and write `_send/owed/{id}` into the issuing
+/// hop's txn + raft writeset (the platform-direct-write pattern
+/// `jsKvSet` uses for reserved keys: local chain via `state.txn`,
+/// envelope-0 via `state.writeset`). `state.txn.put` / `addPut`
+/// copy key+value (jsKvSet frees its key/val right after the same
+/// calls), so the stack key buffer + freed `enc` are safe.
+fn writeOwedMarker(
+    state: *globals.DispatchState,
+    row: *const BuiltSend,
+) !void {
+    const a = state.allocator;
+    const owed = send_outbox.OwedSend{
+        .url = row.url,
+        .method = row.method,
+        .headers_json = row.headers_json,
+        .body = row.body,
+        .context_json = row.context_json,
+        .on_result_module = row.on_result_module,
+        .on_result_fn = row.on_result_fn,
+        .on_result_args_json = row.on_result_args_json,
+        .timeout_ms = row.timeout_ms,
+        .max_body_bytes = row.max_body_bytes,
+        .fire_at_ns = row.fire_at_ns,
+    };
+    const enc = try owed.encode(a);
+    defer a.free(enc);
+    var kbuf: [send_outbox.KEY_BUF]u8 = undefined;
+    const key = send_outbox.owedKey(&kbuf, row.id);
+    try state.txn.put(key, enc);
+    try state.writeset.addPut(key, enc);
+}
+
+/// Option-(b) increment 3(d): the delete-mirror of `writeOwedMarker`.
+/// Cancelling a send must also tombstone its `_send/owed/{id}` row so
+/// Option-(b) recovery never re-fires a deliberately-cancelled send.
+/// Same worker-side platform-direct-write pattern (`state.txn.delete`
+/// + `state.writeset.addDelete`, as `jsKvDelete` uses for reserved
+/// keys). Delete of a missing key is tolerated by design: a send
+/// issued before increment 2, or a fire-and-forget already proven +
+/// GC'd, has no owed row — mirrors how the schedule cancel path
+/// no-ops a missing `s/`/`c/`.
+fn deleteOwedMarker(state: *globals.DispatchState, id: []const u8) !void {
+    var kbuf: [send_outbox.KEY_BUF]u8 = undefined;
+    const key = send_outbox.owedKey(&kbuf, id);
+    try state.txn.delete(key);
+    try state.writeset.addDelete(key);
+}
+
+// ── Build a BuiltSend from the JS options object ───────────────────────
 
 fn buildRow(
     ctx: ?*c.JSContext,
     state: *globals.DispatchState,
     opts: c.JSValue,
-) !schedule_server.ScheduleRow {
+) !BuiltSend {
     const a = state.allocator;
     var owned: ExtractedStrings = .{};
     errdefer owned.deinit(a);
@@ -143,7 +221,7 @@ fn buildRow(
     const timeout_ms = try getIntField(ctx, opts, "timeout_ms", 30_000);
     const max_body_bytes = try getIntField(ctx, opts, "max_body_bytes", schedule_server.RESPONSE_BODY_CAP);
 
-    const row: schedule_server.ScheduleRow = .{
+    const row: BuiltSend = .{
         .tenant_id = owned.tenant_id.?,
         .id = owned.id.?,
         .fire_at_ns = fire_at_ns_i64,
@@ -157,7 +235,6 @@ fn buildRow(
         .on_result_fn = owned.on_result_fn.?,
         .on_result_args_json = owned.on_result_args_json.?,
         .context_json = owned.context_json.?,
-        .is_internal = false, // apply path detects + stamps
     };
     owned = .{}; // ownership transferred
     return row;

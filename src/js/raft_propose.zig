@@ -19,7 +19,6 @@
 
 const std = @import("std");
 const kv_mod = @import("rove-kv");
-const schedule_server = @import("rove-schedule-server");
 const apply_mod = @import("apply.zig");
 
 fn proposeEncoded(
@@ -38,12 +37,7 @@ fn proposeEncoded(
     const envelope = try switch (kind) {
         .writeset => apply_mod.encodeWriteSetEnvelope(allocator, instance_id, ws_bytes),
         .root_writeset => apply_mod.encodeRootWriteSetEnvelope(allocator, ws_bytes),
-        .multi,
-        .schedule_upsert,
-        .schedule_complete,
-        .schedule_cancel,
-        .schedule_demote,
-        => unreachable,
+        .multi => unreachable,
     };
     defer allocator.free(envelope);
 
@@ -69,19 +63,6 @@ pub fn proposeWriteSet(
 // The type-2 encoder `apply.encodeRootWriteSetEnvelope` stays —
 // proposeBatch and acme.zig use it directly.)
 
-/// Propose the per-batch writeset + http.send/cancel batch as ONE
-/// raft entry — the unit of atomicity for the dispatcher path. Three
-/// shapes:
-///
-///   - just writes → a bare type-0 writeset envelope
-///   - just one bucket of schedules / cancels → that bucket bare
-///   - 2+ buckets non-empty → type-7 multi-envelope wrapping each
-///
-/// Empty everywhere is unreachable from the caller (worker_dispatch
-/// only calls when at least one bucket has content); we still no-op-
-/// return `seq=0` rather than panic so refactoring stays graceful.
-///
-/// Returns the assigned raft seq for the caller to park on.
 /// Propose a dynamic list of already-encoded, **non-multi** inner
 /// envelopes. Replaces the per-producer fixed `[N][]u8` arrays — the
 /// multi wire format already supports up to 255 inners (u8 count) and
@@ -96,10 +77,10 @@ pub fn proposeWriteSet(
 ///    the writeset rides `inner[0]` so it lands in chunk 0. Each
 ///    chunk applies atomically; **cross-chunk is NOT atomic**. This
 ///    is reachable only in the extreme >255-ops-for-one-tenant-in-
-///    one-pass case: a mid-chunk leader change can re-fire the not-
-///    yet-completed schedules, which `schedule_complete`'s
-///    `version_at_fire` guard makes idempotent — the same
-///    at-least-once posture as the existing http.send contract.
+///    one-pass case: a mid-chunk leader change can re-apply the not-
+///    yet-resolved `_send/owed/` markers, which Option-(b) resolve-
+///    once (proof-presence + send-id dedup) makes idempotent — the
+///    same at-least-once posture as the existing http.send contract.
 ///
 /// Returns the LAST propose's seq (the batch watermark). The H2
 /// dispatch path parks its txn on this seq and never exceeds the
@@ -129,8 +110,6 @@ pub fn proposeMulti(worker: anytype, inner: []const []const u8) !u64 {
 pub fn proposeBatch(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
-    schedules: []const schedule_server.ScheduleRow,
-    cancels: []const schedule_server.CancelTarget,
     anchor_id: []const u8,
 ) !u64 {
     const allocator = worker.allocator;
@@ -175,16 +154,5 @@ pub fn proposeBatch(
             try inner.append(allocator, try apply_mod.encodeRootWriteSetEnvelope(allocator, rb));
         }
     }
-    if (schedules.len > 0) {
-        const payload = try schedule_server.encodeUpsertBatch(allocator, schedules);
-        defer allocator.free(payload);
-        try inner.append(allocator, try apply_mod.encodeScheduleUpsertEnvelope(allocator, payload));
-    }
-    if (cancels.len > 0) {
-        const payload = try schedule_server.encodeCancelBatch(allocator, cancels);
-        defer allocator.free(payload);
-        try inner.append(allocator, try apply_mod.encodeScheduleCancelEnvelope(allocator, payload));
-    }
-
     return proposeMulti(worker, inner.items);
 }

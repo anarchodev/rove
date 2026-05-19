@@ -330,24 +330,6 @@ const WorkerCtx = struct {
     /// h2 listener — this is what `SO_REUSEPORT` needs before requests
     /// can hit any of them.
     ready: *std.Thread.ResetEvent,
-    /// Per-thread schedules.db connection used by worker 0's
-    /// `dispatchInternalSchedules` (http-send-plan §3.2). Lazy-opened
-    /// on the worker thread (NOMUTEX + WAL means each consumer gets
-    /// its own handle); only worker 0 ever reads this slot. Other
-    /// workers leave it null.
-    internal_schedules_store: ?*schedule_server_mod.ScheduleStore = null,
-    /// In-memory inflight set for the in-process schedule dispatch.
-    /// Owned by worker 0's thread frame (allocated on stack in
-    /// `workerMain`). Other workers leave null.
-    /// Value = the raft seq the row's schedule_complete / demote rode.
-    /// The row stays gated (not re-dispatched) until `committedSeq()`
-    /// reaches that seq — i.e. until the completion is applied + visible
-    /// — closing the propose→apply re-dispatch window that otherwise
-    /// makes recursive/under-load internal schedules re-fire and
-    /// compound. Conceptually the same "hold until seq applied" gate the
-    /// H2 path implements via `raft_pending`/`RaftWait` (a richer,
-    /// resource-parking cousin — not shared code).
-    internal_schedules_inflight: ?*std.StringHashMapUnmanaged(u64) = null,
     /// Process-shared deployment + tenant state. Owned by main.
     /// Single loader thread; single tenant_files_map across every
     /// worker on this node — the per-worker fan-out race is gone.
@@ -431,21 +413,6 @@ fn workerMain(args: *WorkerCtx) !void {
     // handful-of-tenants-per-tick workloads we've measured.
     var blocked_tenants: rjs.BlockedTenants = .{};
 
-    // Worker-0 in-flight bookkeeping for in-process schedule dispatch
-    // (http-send-plan §3.2). The store itself is process-shared and
-    // injected via `args.internal_schedules_store` from main; per-worker
-    // opens would create separate LMDB envs whose main_overlays never
-    // see each other's writes (apply path vs scan path race).
-    var internal_sched_inflight: std.StringHashMapUnmanaged(u64) = .empty;
-    defer {
-        var it = internal_sched_inflight.iterator();
-        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
-        internal_sched_inflight.deinit(allocator);
-    }
-    if (args.worker_idx == 0) {
-        args.internal_schedules_inflight = &internal_sched_inflight;
-    }
-
     while (!stop_flag.load(.acquire)) {
         // Bounded-wait poll. The worker has multiple pieces of
         // background state that need periodic attention regardless of
@@ -488,6 +455,8 @@ fn workerMain(args: *WorkerCtx) !void {
         }
         try rjs.drainRaftPending(worker);
         try reg.flush();
+        try rjs.sweepParkedContinuations(worker);
+        try reg.flush();
         try rjs.cleanupResponses(worker);
         try reg.flush();
 
@@ -500,30 +469,15 @@ fn workerMain(args: *WorkerCtx) !void {
         // serialize them anyway via SQLITE_BUSY, but pinning avoids
         // the wasted turnaround.
         if (args.worker_idx == 0) {
-            if (args.internal_schedules_store) |sched_store| {
-                _ = rjs.dispatchCallbacks(worker, sched_store, rjs.CALLBACK_DEFAULT_MAX_PER_TENANT) catch |err| {
-                    std.log.warn("worker {d}: dispatchCallbacks: {s}", .{ args.worker_idx, @errorName(err) });
-                };
-            }
-
-            // Internal-pool schedule dispatch (http-send-plan §3.2):
-            // grab `is_internal=true` rows whose target tenant is
-            // hosted on this node and run the handler in-process.
-            // Rows we can't serve locally get demoted via envelope-11
-            // so the libcurl scheduler thread fires them via cluster
-            // ingress instead. Same worker-0 + leader gating as the
-            // callback path above.
-            if (args.internal_schedules_store) |sched_store| {
-                _ = rjs.dispatchInternalSchedules(
-                    worker,
-                    sched_store,
-                    args.internal_schedules_inflight.?,
-                    rjs.INTERNAL_SCHEDULES_DEFAULT_MAX_PER_PASS,
-                ) catch |err| {
-                    std.log.warn(
-                        "worker {d}: dispatchInternalSchedules: {s}",
-                        .{ args.worker_idx, @errorName(err) },
-                    );
+            // Option (b) 5b-2: the ONLY resolution phase. The retired
+            // schedule subsystem's `dispatchCallbacks` (env-9 `c/`
+            // rows) and `dispatchInternalSchedules` (env-8 is_internal
+            // rows, §3.2 in-process shortcut — deferred post-cutover)
+            // are gone; everything flows `_send/owed/` → SendDispatch
+            // → here. Worker-0 pin + inner leader gate as before.
+            if (worker.node.send_dispatch) |sd| {
+                _ = rjs.dispatchSendCompletions(worker, sd, rjs.CALLBACK_DEFAULT_MAX_PER_TENANT) catch |err| {
+                    std.log.warn("worker {d}: dispatchSendCompletions: {s}", .{ args.worker_idx, @errorName(err) });
                 };
             }
         }
@@ -1090,23 +1044,10 @@ pub fn main() !void {
     // Internal-target stamping for envelope-8 (http-send-plan §3.2).
     loop46_ctx.public_suffix = cli.public_suffix;
 
-    // Process-shared schedule store. Under kvexp/LMDB, opening the
-    // same file as separate envs from multiple threads creates
-    // independent main_overlay buffers — writes from one thread are
-    // invisible to readers on another until durabilize. Pre-cutover
-    // sqlite WAL papered over this; now every consumer (apply
-    // handlers, worker-0 internal-schedule tick, schedule-server
-    // libcurl thread) must share one ScheduleStore handle.
-    const sched_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/schedules.db",
-        .{cli.data_dir},
-        0,
-    );
-    defer allocator.free(sched_path);
-    var schedules_store = try schedule_server_mod.ScheduleStore.open(allocator, sched_path);
-    defer schedules_store.close();
-    loop46_ctx.schedules_store = &schedules_store;
+    // schedules.db / ScheduleStore fully retired in the http.send
+    // N-way re-platform (5b-2-d): a send's only firing record is the
+    // per-tenant `_send/owed/{id}` marker (envelope-0), fired by the
+    // leader-local SendDispatch. No on-disk schedule store remains.
 
     const peers = try parsePeerList(allocator, cli.peers);
     defer {
@@ -1208,10 +1149,11 @@ pub fn main() !void {
     // wire shape matches.
     try cluster.registerEnvelope(0, .{ .apply = rjs.apply.applyWriteSet, .leader_skip = true });
     try cluster.registerEnvelope(2, .{ .apply = rjs.apply.applyRootWriteSet, .leader_skip = true });
-    try cluster.registerEnvelope(8, .{ .apply = rjs.apply.applyScheduleUpsertBatch, .leader_skip = false });
-    try cluster.registerEnvelope(9, .{ .apply = rjs.apply.applyScheduleComplete, .leader_skip = false });
-    try cluster.registerEnvelope(10, .{ .apply = rjs.apply.applyScheduleCancelBatch, .leader_skip = false });
-    try cluster.registerEnvelope(11, .{ .apply = rjs.apply.applyScheduleDemote, .leader_skip = false });
+    // Envelopes 8/9/10/11 (schedule_upsert/complete/cancel/demote)
+    // RETIRED (Option (b) 5b-2): the schedule subsystem is gone;
+    // `_send/owed/`/`_send/proof/` ride envelope-0. The decoder
+    // rejects 8-11 as UnknownEnvelopeType so any stale raft-log entry
+    // surfaces loudly instead of silently mis-applying.
 
     // Tell willemt about the just-installed staged snapshot, if any.
     // The on-disk app.dbs reflect state through `snap_last_idx`;
@@ -1372,23 +1314,16 @@ pub fn main() !void {
         break :blk std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
     };
 
-    // ── Schedule-server thread (http-send-plan §5) ────────────────────
+    // ── Schedule-server thread: RETIRED (Option (b) 5b-2) ─────────────
     //
-    // Leader-pinned poll loop reading `{data_dir}/schedules.db`. The
-    // dispatcher's `http.send` calls accumulate into a per-batch
-    // schedule list which rides atomically with the writeset via the
-    // type-7 multi-envelope; this thread reads the resulting rows and
-    // fires them over libcurl. Apply-side wake fires on env-8 / env-11
-    // so deliveries ship within an apply tick instead of waiting out
-    // the next-due-or-poll deadline.
-    const schedule_handle = try schedule_server_mod.thread.spawn(.{
-        .allocator = allocator,
-        .store = &schedules_store,
-        .raft = raft_node,
-    });
-    defer schedule_handle.join();
-    defer schedule_handle.signalStop();
-    loop46_ctx.schedule_wake = &schedule_handle.wake;
+    // The leader-pinned libcurl poll loop over `schedules.db` is gone.
+    // `http.send` now writes per-tenant `_send/owed/{id}` (env-0) and
+    // the per-node `SendDispatch` (leader-gated dedicated EasyPool)
+    // fires + resolves it. `schedule_server.thread` retains only the
+    // reusable transport (`fireOnce`/`checkSsrf`/header-render/method/
+    // `test_allow_plaintext`) the new path calls; no thread is
+    // spawned. `loop46_ctx.schedule_wake` is no longer wired (apply
+    // never wakes a scheduler thread).
 
     // Shared seq-counter registry. Every per-tenant `app.db` KvStore
     // opened by any worker draws from this, so concurrent worker
@@ -1497,7 +1432,6 @@ pub fn main() !void {
         allocator,
         node_tenant,
         blob_owned.cfg,
-        &schedules_store,
         raft_node,
     );
     node_state.manifest_http = node_manifest_http;
@@ -1509,6 +1443,15 @@ pub fn main() !void {
     // Wire the apply path to the shared loader (replaces the
     // worker-0-publishes-its-loader atomic dance).
     loop46_ctx.deployment_loader = node_state.deployment_loader;
+
+    // Option (b) FORK-6': the single leader-local send-dispatch
+    // component. Leader is fed worker-side at commit (4b-ii);
+    // FOLLOWERS feed it via the apply path (4b-iv) so `armed` stays
+    // warm for instant failover — hence it IS wired to `loop46_ctx`
+    // (revised from FORK-6's leader-only model). Still inert: nothing
+    // fires until the 4c guard flips.
+    try node_state.startSendDispatch();
+    loop46_ctx.send_dispatch = node_state.send_dispatch;
 
     _ = try node_state.eagerOpenTenants();
 
@@ -1560,10 +1503,6 @@ pub fn main() !void {
             .seq_counters = &seq_counters,
             .log_batch_store = log_batch_store,
             .ready = &ready_events[i],
-            // Process-shared schedule store (worker 0 uses it for the
-            // in-process internal-schedule dispatch tick). Other
-            // workers leave null — only worker 0 runs that phase.
-            .internal_schedules_store = if (i == 0) &schedules_store else null,
             .node = &node_state,
         };
         threads[i] = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctxs[i]});
@@ -1608,10 +1547,6 @@ pub fn main() !void {
     // the in-memory state any other thread relies on.
     cluster.kvexp_manifest.durabilize(cluster.global_apply_idx) catch |err| std.log.warn(
         "js-worker: shutdown durabilize failed: {s} (in-memory writes since last tick may be lost)",
-        .{@errorName(err)},
-    );
-    schedules_store.db.checkpoint() catch |err| std.log.warn(
-        "js-worker: shutdown checkpoint(schedules_store) failed: {s}",
         .{@errorName(err)},
     );
 

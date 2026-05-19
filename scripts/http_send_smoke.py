@@ -164,21 +164,31 @@ def main() -> int:
             sys.exit(f"FAIL wb/last_tag missing: {r.body}")
         print("ok  wb tenant writeset round-tripped: wb/last_tag=optimization-win")
 
-        # 6. Verify the worker phase took the in-process path.
+        # 6. Verify the Option (b) fire path delivered THIS send.
+        #    (The §3.2 in-process same-node-target shortcut is
+        #    DEFERRED post-cutover: Option (b) uses one uniform
+        #    EasyPool fire path — correctness is unchanged, only a
+        #    localhost-RTT optimization is postponed. Checks 4-5
+        #    already prove on_result ran + the result row written;
+        #    this asserts the leader's SendDispatch fired this exact
+        #    send via the new path, not the retired schedule-server.)
         leader_log = Path(f"/tmp/http-send-smoke-worker-{c.leader_idx}.out")
         deadline = time.monotonic() + 5.0
         saw = False
         while time.monotonic() < deadline:
             if leader_log.exists():
                 content = leader_log.read_text(errors="replace")
-                if re.search(r"internal-schedules:.*dispatched in-process to wb status=200", content):
+                if re.search(
+                    rf"rove-js sendpath: fireThread fired id={re.escape(send_id)} ok=true status=200",
+                    content,
+                ):
                     saw = True
                     break
             time.sleep(0.2)
         if not saw:
             tail = leader_log.read_text(errors="replace")[-2000:] if leader_log.exists() else ""
-            sys.exit(f"FAIL no in-process dispatch logged:\n{tail}")
-        print("ok  leader took the in-process fast path (no libcurl roundtrip)")
+            sys.exit(f"FAIL Option (b) fire not logged for {send_id}:\n{tail}")
+        print("ok  Option (b) SendDispatch fired this send (in-process shortcut deferred)")
 
         # 7. Verify _callback/{id} receipt was cleared.
         qs = urllib.parse.quote(json.dumps(["_callback/", "", 100]))
