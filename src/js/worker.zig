@@ -3106,17 +3106,19 @@ pub fn drainRaftPending(worker: anytype) !void {
                     continue;
                 }
             }
-            // Trampoline: a committed continuation parks (no response)
-            // instead of going to `response_in`; the §6.4 deadline
-            // sweep or a 3b-iii callback resolves it. `parked_meta`
-            // membership is the data signal (descriptor + deadline
-            // recorded by `contRecordIfAny`); the lifecycle is the
-            // collection move. The `count() != 0` short-circuit keeps
-            // the universal no-continuations case to one usize compare
-            // per entity instead of a hashmap probe — the write-path
-            // hot loop pays nothing for a feature it isn't using
-            // (`feedback_no_n_tenants_hot_path`).
-            if (worker.parked_meta.count() != 0 and worker.parked_meta.contains(ent)) {
+            // Phase 2d: trampoline-vs-response dispatch reads
+            // `ContDescriptor.cont` on the entity instead of the
+            // `parked_meta` side table. A non-null cont means this
+            // entity wanted to park (set by `contRecordIfAny` in
+            // worker_dispatch.zig); the default-initialized
+            // ContDescriptor on non-cont entities has `cont == null`,
+            // routing them to response_in as before. The principle-
+            // #1 cleaner form is Phase 5's `raft_pending_cont` /
+            // `raft_pending_response` split — there the collection
+            // IS the discriminant; this commit is the tactical step
+            // before that.
+            const desc = try server.reg.get(ent, &worker.raft_pending, components_mod.ContDescriptor);
+            if (desc.cont != null) {
                 try server.reg.move(ent, &worker.raft_pending, &worker.parked_continuations);
             } else {
                 try server.reg.move(ent, &worker.raft_pending, &server.response_in);
