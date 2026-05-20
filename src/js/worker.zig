@@ -3071,6 +3071,49 @@ pub fn drainRaftPending(worker: anytype) !void {
             if (worker.pending_stream_meta.count() != 0) {
                 if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
                     const meta = kvp.value;
+                    // Handler-cmds Phase 3: populate stream components
+                    // BEFORE registerStreamCell. The component clones
+                    // are independent of the meta's owned slices — meta
+                    // still feeds the side-table cell, the component
+                    // is the post-Phase-7 single owner. If either
+                    // setStreamComponents or registerStreamCell fails,
+                    // we free the meta's still-owned slices below.
+                    setStreamComponents(
+                        server,
+                        &worker.raft_pending,
+                        ent,
+                        allocator,
+                        meta.tenant_id,
+                        meta.correlation_id,
+                        meta.deployment_id,
+                        meta.module_path,
+                        meta.ctx_json,
+                        meta.chunks,
+                        meta.kv_prefixes,
+                        meta.interval_ms,
+                    ) catch |serr| {
+                        // setStreamComponents failed mid-way: the
+                        // entity may carry partial components. They'll
+                        // reap structurally when the entity is
+                        // destroyed (or via moveStrip when it moves
+                        // to a Row that lacks them — none in our
+                        // current chain). Free meta's owned slices —
+                        // setStreamComponents only ever borrowed them.
+                        if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
+                        if (meta.correlation_id) |c| allocator.free(c);
+                        allocator.free(meta.module_path);
+                        allocator.free(meta.ctx_json);
+                        for (meta.chunks) |c| allocator.free(c);
+                        if (meta.chunks.len > 0) allocator.free(meta.chunks);
+                        for (meta.kv_prefixes) |p| allocator.free(p);
+                        if (meta.kv_prefixes.len > 0) allocator.free(meta.kv_prefixes);
+                        std.log.warn(
+                            "drainRaftPending: setStreamComponents ent={} err={s}; routing to response_in with empty body",
+                            .{ ent, @errorName(serr) },
+                        );
+                        try server.reg.move(ent, &worker.raft_pending, &server.response_in);
+                        continue;
+                    };
                     registerStreamCell(
                         worker,
                         ent,
@@ -3085,7 +3128,9 @@ pub fn drainRaftPending(worker: anytype) !void {
                     ) catch |rerr| {
                         // registerStreamCell freed the transferred
                         // slices on failure; only meta.tenant_id and
-                        // meta.correlation_id stay with us.
+                        // meta.correlation_id stay with us. Stream
+                        // components are already set on the entity;
+                        // they'll deinit structurally on destroy.
                         if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
                         if (meta.correlation_id) |c| allocator.free(c);
                         std.log.warn(
@@ -3881,6 +3926,104 @@ fn freeStreamCell(worker: anytype, ent: rove.Entity) void {
     }
 }
 
+/// Handler-cmds Phase 3: populate the four stream-side components on
+/// the entity. Mirror of `registerStreamCell` for the component side
+/// of the dual-write — the cell holds owned originals of every slice,
+/// the components hold owned clones, both deinit independently. Phase
+/// 7 deletes the cell side and the clones become the only copies.
+///
+/// `current_coll` must be the collection the entity is in NOW (the
+/// caller is about to move it into the stream pipeline; the
+/// components ride along via `merged_request_row`). Inputs are
+/// borrowed — every slice gets duped for the component-side owners.
+pub fn setStreamComponents(
+    server: anytype,
+    current_coll: anytype,
+    ent: rove.Entity,
+    allocator: std.mem.Allocator,
+    tenant_id: []const u8,
+    correlation_id: ?[]const u8,
+    deployment_id: u64,
+    module_path: []const u8,
+    ctx_json: []const u8,
+    initial_chunks: []const []const u8,
+    kv_prefixes: []const []const u8,
+    interval_ms: i64,
+) !void {
+    // Each block builds clones for one component then transfers
+    // ownership via `reg.set`. The errdefer inside each block fires
+    // only if a try BEFORE the set fails; once we exit the block,
+    // ownership is the component's. If a LATER block's reg.set
+    // fails, the earlier components stay set on the entity — when
+    // the caller destroys the entity (or it survives into a
+    // collection that doesn't carry the components), the
+    // structural deinit runs and frees them. No double-free, no
+    // leak.
+
+    {
+        const tid = try allocator.dupe(u8, tenant_id);
+        errdefer allocator.free(tid);
+        const corr: ?[]u8 = if (correlation_id) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (corr) |c| allocator.free(c);
+        try server.reg.set(ent, current_coll, components_mod.ChainContext, .{
+            .tenant_id = tid,
+            .correlation_id = corr,
+            .deployment_id = deployment_id,
+        });
+    }
+
+    {
+        const mp = try allocator.dupe(u8, module_path);
+        errdefer allocator.free(mp);
+        const cj = try allocator.dupe(u8, ctx_json);
+        errdefer allocator.free(cj);
+        try server.reg.set(ent, current_coll, components_mod.StreamChain, .{
+            .module_path = mp,
+            .ctx_json = cj,
+            .activation_count = 1,
+        });
+    }
+
+    {
+        var queue: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (queue.items) |c| allocator.free(c);
+            queue.deinit(allocator);
+        }
+        try queue.ensureUnusedCapacity(allocator, initial_chunks.len);
+        for (initial_chunks) |c| {
+            const cl = try allocator.dupe(u8, c);
+            queue.appendAssumeCapacity(cl);
+        }
+        try server.reg.set(ent, current_coll, components_mod.StreamChunks, .{ .queue = queue });
+        queue = .empty; // ownership transferred — block-exit errdefer is a no-op
+    }
+
+    {
+        const spine: [][]u8 = if (kv_prefixes.len > 0)
+            try allocator.alloc([]u8, kv_prefixes.len)
+        else
+            &.{};
+        errdefer if (kv_prefixes.len > 0) allocator.free(spine);
+        var built: usize = 0;
+        errdefer for (spine[0..built]) |p| allocator.free(p);
+        for (kv_prefixes, 0..) |p, i| {
+            spine[i] = try allocator.dupe(u8, p);
+            built = i + 1;
+        }
+        const next_wake_ns: i64 = if (interval_ms > 0)
+            @as(i64, @intCast(std.time.nanoTimestamp())) + interval_ms * std.time.ns_per_ms
+        else
+            std.math.maxInt(i64);
+        try server.reg.set(ent, current_coll, components_mod.StreamWakes, .{
+            .interval_ms = interval_ms,
+            .next_wake_ns = next_wake_ns,
+            .kv_prefixes = spine,
+            .pending_wake = null,
+        });
+    }
+}
+
 /// Phase 2b-ii: install the chain cell for a `__rove_stream(...)`
 /// first-hop. Caller has already stamped `h2.Status` / `h2.RespHeaders`
 /// / `h2.StreamId` / `h2.Session` on the entity in `request_out` and
@@ -4011,12 +4154,20 @@ pub fn serviceParkedStreams(worker: anytype) !void {
     }
 
     for (buf[0..n]) |p| {
+        // Handler-cmds Phase 3: reads land on the entity's components
+        // instead of the side-table cell. `close_pending` still rides
+        // on the cell — Phase 6 turns it into a sibling-collection
+        // (`parked_streams_draining`) and the cell goes write-only.
         const cell = worker.parked_streams_meta.getPtr(p.ent) orelse continue;
+        const chunks_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamChunks) catch continue;
+        const wakes_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamWakes) catch continue;
+        const chain_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamChain) catch continue;
+        const ctx_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.ChainContext) catch continue;
 
         // Drain one chunk per tick — h2 cycles the entity back to
         // `stream_data_out` after each DATA frame ships.
-        if (cell.chunks.items.len > 0) {
-            const chunk = cell.chunks.orderedRemove(0);
+        if (chunks_comp.queue.items.len > 0) {
+            const chunk = chunks_comp.queue.orderedRemove(0);
             // RespBody takes ownership; h2's onDataSourceReadCb frees
             // the buffer after consuming it (h2/root.zig:818).
             try server.reg.set(p.ent, &server.stream_data_out, h2.RespBody, .{
@@ -4038,11 +4189,11 @@ pub fn serviceParkedStreams(worker: anytype) !void {
         // the no-timer close) — a watched prefix that just changed
         // is more interesting than a heartbeat or a passive close.
         // `pending_wake` was set by `drainKvWakeInbox` above.
-        if (cell.pending_wake != null) {
-            if (cell.activation_count >= MAX_STREAM_ACTIVATIONS) {
+        if (wakes_comp.pending_wake != null) {
+            if (chain_comp.activation_count >= MAX_STREAM_ACTIVATIONS) {
                 std.log.warn(
                     "rove-js stream: tenant={s} corr={s} hit activation cap; closing",
-                    .{ cell.tenant_id, cell.correlation_id orelse "(none)" },
+                    .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)" },
                 );
                 cell.close_pending = true;
                 try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
@@ -4052,7 +4203,7 @@ pub fn serviceParkedStreams(worker: anytype) !void {
             resumeStream(worker, p.ent, p.sid, p.sess, .kv_wake) catch |err| {
                 std.log.warn(
                     "rove-js stream-resume (kv): tenant={s} corr={s}: {s}; closing",
-                    .{ cell.tenant_id, cell.correlation_id orelse "(none)", @errorName(err) },
+                    .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)", @errorName(err) },
                 );
                 if (worker.parked_streams_meta.contains(p.ent)) {
                     var c = worker.parked_streams_meta.getPtr(p.ent).?;
@@ -4068,20 +4219,20 @@ pub fn serviceParkedStreams(worker: anytype) !void {
         // the chain was "stream a finite batch + close" (the §3.3
         // degenerate shape — `acme/stream/index.mjs`). Close now
         // that the initial chunks have shipped.
-        if (cell.interval_ms == 0 and cell.kv_prefixes.len == 0) {
+        if (wakes_comp.interval_ms == 0 and wakes_comp.kv_prefixes.len == 0) {
             try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
             freeStreamCell(worker, p.ent);
             continue;
         }
 
         // Timer wake due?
-        if (cell.interval_ms > 0 and now_ns >= cell.next_wake_ns) {
-            if (cell.activation_count >= MAX_STREAM_ACTIVATIONS) {
+        if (wakes_comp.interval_ms > 0 and now_ns >= wakes_comp.next_wake_ns) {
+            if (chain_comp.activation_count >= MAX_STREAM_ACTIVATIONS) {
                 // §9.2 strike: misbehaving handler can't run a stream
                 // forever. Close cleanly.
                 std.log.warn(
                     "rove-js stream: tenant={s} corr={s} hit activation cap; closing",
-                    .{ cell.tenant_id, cell.correlation_id orelse "(none)" },
+                    .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)" },
                 );
                 cell.close_pending = true;
                 try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
@@ -4091,7 +4242,7 @@ pub fn serviceParkedStreams(worker: anytype) !void {
             resumeStream(worker, p.ent, p.sid, p.sess, .timer) catch |err| {
                 std.log.warn(
                     "rove-js stream-resume: tenant={s} corr={s}: {s}; closing",
-                    .{ cell.tenant_id, cell.correlation_id orelse "(none)", @errorName(err) },
+                    .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)", @errorName(err) },
                 );
                 if (worker.parked_streams_meta.contains(p.ent)) {
                     var c = worker.parked_streams_meta.getPtr(p.ent).?;
@@ -4126,10 +4277,39 @@ fn drainKvWakeInbox(worker: anytype) !void {
     try worker.wake_inbox.drainInto(&events);
     if (events.items.len == 0) return;
 
+    const server = worker.h2;
+    // Iterate the side-table key set for the entity universe; the
+    // wake registration + pending_wake mutation land on the entity's
+    // `StreamWakes` component (handler-cmds Phase 3). Side table
+    // stays the entity index until Phase 7 (when the sibling-
+    // collection split lets us iterate `parked_streams_active`
+    // directly).
     var it = worker.parked_streams_meta.iterator();
     while (it.next()) |entry| {
-        const cell = entry.value_ptr;
-        if (cell.kv_prefixes.len == 0) continue;
+        const ent = entry.key_ptr.*;
+        const wakes = server.reg.getAny(
+            ent,
+            .{
+                &server.stream_response_in,
+                &server.stream_data_out,
+                &server.stream_data_in,
+                &server.stream_close_in,
+                &server._stream_data_sending,
+            },
+            components_mod.StreamWakes,
+        ) catch continue;
+        if (wakes.kv_prefixes.len == 0) continue;
+        const chain_ctx = server.reg.getAny(
+            ent,
+            .{
+                &server.stream_response_in,
+                &server.stream_data_out,
+                &server.stream_data_in,
+                &server.stream_close_in,
+                &server._stream_data_sending,
+            },
+            components_mod.ChainContext,
+        ) catch continue;
         // Walk events newest-first so "most-recent-wins" matches the
         // intuitive notion of "this stream's pending wake is the
         // latest fired write."
@@ -4137,10 +4317,10 @@ fn drainKvWakeInbox(worker: anytype) !void {
         while (i > 0) {
             i -= 1;
             const ev = events.items[i];
-            if (!std.mem.eql(u8, ev.tenant_id, cell.tenant_id)) continue;
+            if (!std.mem.eql(u8, ev.tenant_id, chain_ctx.tenant_id)) continue;
             // Prefix match against any registered prefix.
             var matched: bool = false;
-            for (cell.kv_prefixes) |pfx| {
+            for (wakes.kv_prefixes) |pfx| {
                 if (std.mem.startsWith(u8, ev.key, pfx)) {
                     matched = true;
                     break;
@@ -4151,12 +4331,12 @@ fn drainKvWakeInbox(worker: anytype) !void {
             // to consume it yet — newest wake wins). The handler's
             // job is to re-read kv state holistically, so older
             // wakes are redundant.
-            if (cell.pending_wake) |*w| {
+            if (wakes.pending_wake) |*w| {
                 w.deinit(allocator);
-                cell.pending_wake = null;
+                wakes.pending_wake = null;
             }
             const key_dup = try allocator.dupe(u8, ev.key);
-            cell.pending_wake = .{ .key = key_dup, .op = ev.op };
+            wakes.pending_wake = .{ .key = key_dup, .op = ev.op };
             break;
         }
     }
@@ -4192,16 +4372,25 @@ fn resumeStream(
     // mirror when the activation may not start from `stream_data_out`.
 
     const allocator = worker.allocator;
+    // Handler-cmds Phase 3: chain identity + chunks + wakes ride on
+    // the entity's components. `cell` still holds `close_pending`
+    // (Phase 6 fixes that with a sibling collection) and serves as
+    // the side-table presence marker until Phase 7 deletes it.
+    const server = worker.h2;
     const cell = worker.parked_streams_meta.getPtr(ent) orelse return;
+    const chain_ctx = server.reg.get(ent, &server.stream_data_out, components_mod.ChainContext) catch return error.ResumeNoChainCtx;
+    const chain_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChain) catch return error.ResumeNoChainState;
+    const chunks_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChunks) catch return error.ResumeNoChunks;
+    const wakes_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamWakes) catch return error.ResumeNoWakes;
 
-    const slot = worker.node.tenant_files_map.get(cell.tenant_id) orelse return error.ResumeNoTenant;
+    const slot = worker.node.tenant_files_map.get(chain_ctx.tenant_id) orelse return error.ResumeNoTenant;
     const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
     const tc = TenantFiles{ .slot = slot, .snap = snap };
     defer tc.release();
-    const inst = (worker.node.tenant.getInstance(cell.tenant_id) catch return error.ResumeNoInstance) orelse
+    const inst = (worker.node.tenant.getInstance(chain_ctx.tenant_id) catch return error.ResumeNoInstance) orelse
         return error.ResumeNoInstance;
 
-    const path = cell.module_path;
+    const path = chain_st.module_path;
     const bc = blk: {
         if (tc.snap.bytecodes.get(path)) |b| break :blk b;
         const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{path});
@@ -4218,7 +4407,7 @@ fn resumeStream(
     // field (a timer wake has no callee result). Handlers read
     // `request.activation` (set via the dispatcher's
     // `activation_source` field, exposed in globals) to branch.
-    const body = try std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{cell.ctx_json});
+    const body = try std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json});
     defer allocator.free(body);
     const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
     defer allocator.free(spath);
@@ -4243,17 +4432,18 @@ fn resumeStream(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
-    // kv_wake activation: pop the pending wake off the cell (single
-    // outstanding match in v1; wake-accumulator §9.4 is later) and
-    // attach the key/op to the synthesized request.
-    var kv_wake_taken: ?PendingKvWake = null;
+    // kv_wake activation: pop the pending wake off the StreamWakes
+    // component (single outstanding match in v1; wake-accumulator
+    // §9.4 is later) and attach the key/op to the synthesized
+    // request.
+    var kv_wake_taken: ?components_mod.PendingKvWake = null;
     defer if (kv_wake_taken) |*w| w.deinit(allocator);
     var activation_kv_key: ?[]const u8 = null;
     var activation_kv_op: u8 = 0;
     if (activation == .kv_wake) {
-        if (cell.pending_wake) |_| {
-            const w = cell.pending_wake.?;
-            cell.pending_wake = null;
+        if (wakes_st.pending_wake) |_| {
+            const w = wakes_st.pending_wake.?;
+            wakes_st.pending_wake = null;
             kv_wake_taken = w;
             activation_kv_key = kv_wake_taken.?.key;
             activation_kv_op = kv_wake_taken.?.op;
@@ -4274,7 +4464,7 @@ fn resumeStream(
         .platform = inst.platform,
         .limiter = &worker.limiter,
         .instance_id = inst.id,
-        .correlation_id = cell.correlation_id,
+        .correlation_id = chain_ctx.correlation_id,
         .activation_source = activation,
         .activation_kv_key = activation_kv_key,
         .activation_kv_op = activation_kv_op,
@@ -4294,7 +4484,7 @@ fn resumeStream(
         txn.rollback() catch {};
         txn_done = true;
         cell.close_pending = true;
-        captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, activation);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
         return;
     };
 
@@ -4307,7 +4497,7 @@ fn resumeStream(
                 txn.rollback() catch {};
                 txn_done = true;
                 cell.close_pending = true;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, cell.correlation_id, activation);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -4321,12 +4511,12 @@ fn resumeStream(
             // authoritative state on every activation, so a spurious
             // frame on a raft fault is recoverable.
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, cell.tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id) catch |perr| {
                     std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
                     cell.close_pending = true;
-                    captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, cell.correlation_id, activation);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -4335,15 +4525,15 @@ fn resumeStream(
                 txn_done = true;
                 if (r.body.len > 0) {
                     const owned = try allocator.dupe(u8, r.body);
-                    cell.chunks.append(allocator, owned) catch |e| {
+                    chunks_st.queue.append(allocator, owned) catch |e| {
                         allocator.free(owned);
                         return e;
                     };
                 }
                 cell.close_pending = true;
-                cell.activation_count += 1;
+                chain_st.activation_count += 1;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, cell.correlation_id, activation);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -4359,15 +4549,15 @@ fn resumeStream(
             txn_done = true;
             if (r.body.len > 0) {
                 const owned = try allocator.dupe(u8, r.body);
-                cell.chunks.append(allocator, owned) catch |e| {
+                chunks_st.queue.append(allocator, owned) catch |e| {
                     allocator.free(owned);
                     return e;
                 };
             }
             cell.close_pending = true;
-            cell.activation_count += 1;
+            chain_st.activation_count += 1;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, cell.correlation_id, activation);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -4381,19 +4571,19 @@ fn resumeStream(
             txn.rollback() catch {};
             txn_done = true;
             cell.close_pending = true;
-            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, activation);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
         },
         .stream => |*s2| {
             // Phase 4b: stream + writes. Eager-fire as in the
             // terminal+writes branch.
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, cell.tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id) catch |perr| {
                     std.log.warn("rove-js stream-resume (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     s2.deinit(allocator);
                     txn_owned = false;
                     txn_done = true;
                     cell.close_pending = true;
-                    captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, cell.correlation_id, activation);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
                     return;
                 };
                 txn_owned = false;
@@ -4410,36 +4600,38 @@ fn resumeStream(
             // initial response headers already shipped); free them.
             if (s2.headers) |h| allocator.free(h);
             s2.headers = null;
-            // Transfer chunks into the cell's queue. Each chunk
-            // pointer is still allocator-owned; ownership moves into
-            // `cell.chunks.items`.
-            for (s2.chunks) |c| try cell.chunks.append(allocator, c);
+            // Transfer chunks into the StreamChunks component's
+            // queue. Each chunk pointer is still allocator-owned;
+            // ownership moves into `chunks_st.queue.items`.
+            for (s2.chunks) |c| try chunks_st.queue.append(allocator, c);
             if (s2.chunks.len > 0) allocator.free(s2.chunks);
             s2.chunks = &.{};
-            // Replace ctx + interval. Old ctx_json is freed; new one
-            // is taken from the descriptor (transfer ownership).
-            allocator.free(cell.ctx_json);
-            cell.ctx_json = s2.ctx_json;
+            // Replace ctx + interval on the component. Old ctx_json
+            // is freed; new one is taken from the descriptor
+            // (transfer ownership).
+            if (chain_st.ctx_json.len > 0) allocator.free(chain_st.ctx_json);
+            chain_st.ctx_json = s2.ctx_json;
             s2.ctx_json = &.{};
             if (s2.interval_ms) |iv| {
-                cell.interval_ms = iv;
-                cell.next_wake_ns = now_ns + iv * std.time.ns_per_ms;
+                wakes_st.interval_ms = iv;
+                wakes_st.next_wake_ns = now_ns + iv * std.time.ns_per_ms;
             } else {
-                cell.interval_ms = 0;
-                cell.next_wake_ns = std.math.maxInt(i64);
+                wakes_st.interval_ms = 0;
+                wakes_st.next_wake_ns = std.math.maxInt(i64);
             }
-            // Replace the cell's kv-wake registration with whatever
-            // the handler returned. Phase 3 v1 keeps re-registration
-            // simple: free old prefixes, take ownership of the new
-            // ones. The (tenant, prefix) registry is a derived view
-            // recomputed on every match scan, so there's no separate
-            // unregister/re-register step needed.
-            for (cell.kv_prefixes) |p| allocator.free(p);
-            if (cell.kv_prefixes.len > 0) allocator.free(cell.kv_prefixes);
-            cell.kv_prefixes = s2.kv_prefixes;
+            // Replace the StreamWakes' kv-wake registration with
+            // whatever the handler returned. Phase 3 v1 keeps
+            // re-registration simple: free old prefixes, take
+            // ownership of the new ones. The (tenant, prefix)
+            // registry is a derived view recomputed on every match
+            // scan, so there's no separate unregister/re-register
+            // step needed.
+            for (wakes_st.kv_prefixes) |p| allocator.free(p);
+            if (wakes_st.kv_prefixes.len > 0) allocator.free(wakes_st.kv_prefixes);
+            wakes_st.kv_prefixes = s2.kv_prefixes;
             s2.kv_prefixes = &.{};
-            cell.activation_count += 1;
-            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, activation);
+            chain_st.activation_count += 1;
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
         },
     }
 }
@@ -4464,29 +4656,37 @@ fn resumeStream(
 /// invokes `freeStreamCell` after we return.
 fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     const allocator = worker.allocator;
-    const cell = worker.parked_streams_meta.getPtr(ent) orelse return;
+    // Handler-cmds Phase 3: reads come from the entity's components
+    // (the entity is in `response_out` at this point — same
+    // `merged_request_row` covers it). The side-table cell only
+    // confirms the entity HAS a stream (the `.contains` check in
+    // `cleanupResponses` is the gate that drove us here).
+    const server = worker.h2;
+    _ = worker.parked_streams_meta.getPtr(ent) orelse return;
+    const chain_ctx = server.reg.get(ent, &server.response_out, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(ent, &server.response_out, components_mod.StreamChain) catch return;
     std.log.info(
         "rove-js stream-disconnect: tenant={s} corr={s} activations={d}",
-        .{ cell.tenant_id, cell.correlation_id orelse "(none)", cell.activation_count },
+        .{ chain_ctx.tenant_id, chain_ctx.correlation_id orelse "(none)", chain_st.activation_count },
     );
 
-    const slot = worker.node.tenant_files_map.get(cell.tenant_id) orelse {
-        std.log.warn("rove-js stream-disconnect: tenant={s} no slot; skipping activation", .{cell.tenant_id});
+    const slot = worker.node.tenant_files_map.get(chain_ctx.tenant_id) orelse {
+        std.log.warn("rove-js stream-disconnect: tenant={s} no slot; skipping activation", .{chain_ctx.tenant_id});
         return;
     };
     const snap = slot.pinCurrent() orelse {
-        std.log.warn("rove-js stream-disconnect: tenant={s} no deployment; skipping activation", .{cell.tenant_id});
+        std.log.warn("rove-js stream-disconnect: tenant={s} no deployment; skipping activation", .{chain_ctx.tenant_id});
         return;
     };
     const tc = TenantFiles{ .slot = slot, .snap = snap };
     defer tc.release();
-    const inst_opt = worker.node.tenant.getInstance(cell.tenant_id) catch {
-        std.log.warn("rove-js stream-disconnect: tenant={s} getInstance failed; skipping activation", .{cell.tenant_id});
+    const inst_opt = worker.node.tenant.getInstance(chain_ctx.tenant_id) catch {
+        std.log.warn("rove-js stream-disconnect: tenant={s} getInstance failed; skipping activation", .{chain_ctx.tenant_id});
         return;
     };
     const inst = inst_opt orelse return;
 
-    const path = cell.module_path;
+    const path = chain_st.module_path;
     const bc = blk: {
         if (tc.snap.bytecodes.get(path)) |b| break :blk b;
         const mjs = std.fmt.allocPrint(allocator, "{s}.mjs", .{path}) catch return;
@@ -4498,7 +4698,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         return;
     };
 
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{cell.ctx_json}) catch return;
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
@@ -4538,7 +4738,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .platform = inst.platform,
         .limiter = &worker.limiter,
         .instance_id = inst.id,
-        .correlation_id = cell.correlation_id,
+        .correlation_id = chain_ctx.correlation_id,
         .activation_source = .disconnect,
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -4555,7 +4755,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     ) catch {
         txn.rollback() catch {};
         txn_done = true;
-        captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
         return;
     };
 
@@ -4574,17 +4774,17 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, cell.correlation_id, .disconnect);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
             }
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, cell.tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id) catch |perr| {
                     std.log.warn("rove-js stream-disconnect: propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false; // helper destroyed it
                     txn_done = true;
-                    captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, cell.correlation_id, .disconnect);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -4592,7 +4792,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                 txn_owned = false;
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, cell.correlation_id, .disconnect);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -4604,7 +4804,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
             );
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, cell.correlation_id, .disconnect);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -4616,35 +4816,35 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
             // §4.6 wakes) materialize for other observers.
             cval.deinit(allocator);
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, cell.tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id) catch |perr| {
                     std.log.warn("rove-js stream-disconnect (cont return): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
                 return;
             }
             txn.rollback() catch {};
             txn_done = true;
-            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
         },
         .stream => |*s2| {
             s2.deinit(allocator);
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, cell.tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id) catch |perr| {
                     std.log.warn("rove-js stream-disconnect (stream return): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -4653,7 +4853,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                 .{@errorName(e)},
             );
             txn_done = true;
-            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
         },
     }
 }

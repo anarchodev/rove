@@ -397,6 +397,25 @@ fn streamParkIfAny(
 ) !bool {
     const meta = s.stream orelse return false;
     s.stream = null;
+    // Handler-cmds Phase 3: dual-write the chain identity + chunks +
+    // wakes to the entity's components BEFORE the cell registration.
+    // Both sides survive until Phase 7 deletes the cell — and on any
+    // error along the chain the partial-set components are reaped
+    // structurally when the entity is destroyed (no manual cleanup).
+    try worker_mod.setStreamComponents(
+        server,
+        &server.request_out,
+        s.ent,
+        worker.allocator,
+        tenant_id,
+        s.correlation_id,
+        s.deployment_id,
+        meta.module_path,
+        meta.ctx_json,
+        meta.chunks,
+        meta.kv_prefixes,
+        meta.interval_ms,
+    );
     // registerStreamCell's all-or-nothing contract: on success it
     // took ownership of every transferred slice; on failure it freed
     // them all and meta is a husk either way.
