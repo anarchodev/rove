@@ -204,33 +204,9 @@ pub const KvWakeOp = struct {
 /// connection-holder's `default_hold_deadline_ms` (25 s).
 pub const CONT_HOLD_DEADLINE_NS: i64 = 25 * std.time.ns_per_s;
 
-pub const ParkedCont = struct {
-    cont: Continuation,
-    deadline_ns: i64,
-    /// Owned tenant id — the parked entity outlives the dispatch that
-    /// created it, so the resume engine resolves the deployment from
-    /// this rather than any borrowed request state.
-    tenant_id: []u8,
-    /// Owned schedule id this continuation is bound to (§6.4): the
-    /// single `http.send` the open/repark hop fired. When that
-    /// schedule completes, its result is the resume outcome (3c
-    /// increment 2 — the completion redirect). null = no bound
-    /// http.send (e.g. a deadline-only / no-call hop); only the
-    /// deadline can resume it.
-    bound_schedule_id: ?[]u8 = null,
-    /// Owned correlation id (streaming-handlers-plan §6). Copied
-    /// from the parking request; resumed activations inherit it so
-    /// every tape row in the chain shares one id. Null when the
-    /// parking request didn't carry one (test paths).
-    correlation_id: ?[]u8 = null,
-
-    pub fn deinit(self: *ParkedCont, allocator: std.mem.Allocator) void {
-        self.cont.deinit(allocator);
-        allocator.free(self.tenant_id);
-        if (self.bound_schedule_id) |s| allocator.free(s);
-        if (self.correlation_id) |s| allocator.free(s);
-    }
-};
+// Phase 7: `ParkedCont` struct removed — cont state lives on the
+// entity's `ContDescriptor` + `ChainContext` components, which
+// deinit structurally on entity destroy.
 
 /// Streaming-handlers Phase 2b-ii: per-active-stream state held
 /// alongside the entity's `stream_data_out` membership. The cell
@@ -1433,9 +1409,6 @@ pub fn Worker(comptime opts: Options) type {
         /// collection so moves preserve all components — mirrors
         /// `raft_pending` exactly.
         parked_continuations: StreamColl,
-        /// DATA side-store for `parked_continuations` (descriptor +
-        /// §6.4 deadline). Lifecycle is the collection, not this map.
-        parked_meta: std.AutoHashMapUnmanaged(rove.Entity, ParkedCont) = .empty,
         /// Streaming-handlers Phase 2b-ii: per-entity DATA side-store
         /// for active `__rove_stream(...)` chains. The entity lives
         /// in the h2 module's `stream_data_out` collection (h2 owns
@@ -1791,11 +1764,10 @@ pub fn Worker(comptime opts: Options) type {
             self.pending_units.deinit(allocator);
             self.batch_side.reset(allocator);
             self.batch_side.targets.deinit(allocator);
-            {
-                var pit = self.parked_meta.valueIterator();
-                while (pit.next()) |pc| pc.deinit(allocator);
-                self.parked_meta.deinit(allocator);
-            }
+            // Phase 7: cont side-table (parked_meta) is gone; the
+            // entity's ContDescriptor deinits structurally when the
+            // entity is destroyed during the parked_continuations
+            // walk below.
             // Phase 2b-ii + Phase 3: free any streaming-chain cells
             // still parked at shutdown. The cells own strings, queues,
             // kv_prefixes, and an optional pending_wake — all owned
@@ -3153,15 +3125,9 @@ fn drainContPending(
         }
 
         // Trampoline: open hop's commit faulted/timed out → cannot
-        // hold. Discard the side-table descriptor; the on-entity
-        // ContDescriptor deinit fires when cleanupResponses destroys
-        // the entity.
-        if (worker.parked_meta.count() != 0) {
-            if (worker.parked_meta.fetchRemove(ent)) |kvp| {
-                var pc = kvp.value;
-                pc.deinit(allocator);
-            }
-        }
+        // hold. The on-entity ContDescriptor deinits structurally
+        // when cleanupResponses destroys the entity — no manual
+        // cleanup site needed (Phase 7).
 
         const old_body_ptr: ?[*]u8 = resp_body.data;
         const old_body_len: u32 = resp_body.len;
@@ -3359,14 +3325,6 @@ pub fn drainRaftPending(worker: anytype) !void {
 /// leaves a collection exactly once, so a racing 3b-iii callback
 /// finds it gone (expected, not an error). O(parked) per tick, gated
 /// by `parked_meta.count() == 0`.
-/// Remove + free a parked stream's data side-store entry.
-fn freeContMeta(worker: anytype, ent: rove.Entity) void {
-    if (worker.parked_meta.fetchRemove(ent)) |kvp| {
-        var pc = kvp.value;
-        pc.deinit(worker.allocator);
-    }
-}
-
 /// Resolve a parked stream: stamp the response on the
 /// `parked_continuations` collection and move it to `response_in`.
 /// The move is the resolve-ONCE guard — `isInCollection` gates it, so
@@ -3460,17 +3418,12 @@ fn proposeAndParkContResume(
     const seq = raft_propose.proposeBatch(worker, writeset, tenant_id) catch |err| {
         // On propose failure: rollback txn, destroy it (caller's
         // ownership is implicit — we promised to consume it on
-        // success OR free it on failure), free meta, free any owned
-        // resources in `next`. Caller's catch path handles the 500
-        // flush + log.
+        // success OR free it on failure), free any owned resources in
+        // `next`. Phase 7: ContDescriptor on the entity deinits
+        // structurally when the entity is destroyed; no side-table
+        // free here. Caller's catch path handles the 500 flush + log.
         txn.rollback() catch {};
         allocator.destroy(txn);
-        if (worker.parked_meta.fetchRemove(ent)) |kvp| {
-            var pc = kvp.value;
-            pc.deinit(allocator);
-        }
-        // Free `next`-owned resources so the caller doesn't double-
-        // free in its catch path.
         switch (next) {
             .terminal => {}, // caller still owns `body`; caller's catch frees.
             .repark => |*r| {
@@ -3498,16 +3451,21 @@ fn proposeAndParkContResume(
 
     switch (next) {
         .terminal => |t| {
-            // Free the cont meta so drainRaftPending routes to
-            // response_in (normal flush) at commit.
-            if (worker.parked_meta.fetchRemove(ent)) |kvp| {
-                var pc = kvp.value;
-                pc.deinit(allocator);
-            }
-            // Stamp the response components on the entity while
-            // it's still in `parked_continuations` — `reg.set`
-            // works against the entity's current collection. Body
-            // ownership transfers in (we won't free `t.body`).
+            // Phase 7: clear the entity's ContDescriptor so the
+            // drainContPending commit branch's "the collection IS
+            // the destination" routing — wait, no, this is the
+            // cont-resume WRITE path that lands the entity on
+            // `raft_pending_cont`, NOT `raft_pending_response`,
+            // because the resume was driven by an entity in
+            // `parked_continuations`. The commit branch will route
+            // back to `parked_continuations`; then the terminal
+            // resolve happens (resolveParked moves it out). We
+            // need ContDescriptor cleared so a later sweep doesn't
+            // re-interpret this as a held cont — but actually,
+            // the entity moves OUT of parked_continuations before
+            // the next sweep tick (sweep checks isInCollection
+            // first). So we can leave ContDescriptor populated;
+            // it deinits when the entity destroys.
             try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = t.status });
             try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, .{ .fields = null, .count = 0 });
             try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = t.body.ptr, .len = @intCast(t.body.len) });
@@ -3523,39 +3481,22 @@ fn proposeAndParkContResume(
             try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
         },
         .repark => |r| {
-            // Update parked_meta in place: replace cont + refresh
-            // bound_schedule_id + deadline. drainRaftPending sees
-            // the updated entry at commit and routes back to
-            // parked_continuations.
-            const meta = worker.parked_meta.getPtr(ent) orelse {
-                // Shouldn't happen — the resume was driven from a
-                // parked entity. If it did, surface loud.
-                var c = r.new_cont;
-                c.deinit(allocator);
-                if (r.new_bound_sched_id) |b| allocator.free(b);
-                return error.ResumeMetaMissing;
-            };
-            meta.cont.deinit(allocator);
-            meta.cont = r.new_cont;
-            if (meta.bound_schedule_id) |old_b| allocator.free(old_b);
-            meta.bound_schedule_id = r.new_bound_sched_id;
+            // Phase 7: update the entity's ContDescriptor in place —
+            // replace cont, refresh bound_schedule_id, refresh
+            // deadline. drainContPending sees the entity in
+            // raft_pending_cont at commit and routes back to
+            // parked_continuations. Ownership of r.new_cont and
+            // r.new_bound_sched_id transfers directly into the
+            // component (no clone — the side table is gone).
+            const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
+            if (desc.cont) |*old_c| old_c.deinit(allocator);
+            desc.cont = r.new_cont;
+            if (desc.bound_schedule_id) |old_b| allocator.free(old_b);
+            desc.bound_schedule_id = r.new_bound_sched_id;
             // §6.4 mandatory-timeout refresh: each new hop gets the
             // standard hold deadline, identical to the inbound
             // trampoline open hop's parking.
             const refreshed_deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + CONT_HOLD_DEADLINE_NS;
-            meta.deadline_ns = refreshed_deadline_ns;
-            // Phase 2b dual-write: mirror cont + bound_schedule_id +
-            // deadline_ns onto the entity's ContDescriptor. r.new_cont
-            // and r.new_bound_sched_id are now in the side table
-            // (meta.cont = r.new_cont consumed them); the component
-            // gets its own clone via `meta.cont.clone(allocator)`
-            // (reading back through the side table is fine — we know
-            // it's authoritative until Phase 7).
-            const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
-            if (desc.cont) |*old_c| old_c.deinit(allocator);
-            desc.cont = try meta.cont.clone(allocator);
-            if (desc.bound_schedule_id) |old_b| allocator.free(old_b);
-            desc.bound_schedule_id = if (meta.bound_schedule_id) |b| try allocator.dupe(u8, b) else null;
             desc.deadline_ns = refreshed_deadline_ns;
             try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
                 .seq = seq,
@@ -3613,11 +3554,6 @@ fn resumeContinuation(
     const cont_path = c.path;
     const cont_fn_name = c.fn_name;
     const cont_ctx_json = c.ctx_json;
-    // Still need the side-table meta pointer for the in-place
-    // mutation sites below — Phase 2d removes the side table; until
-    // then meta writes happen alongside component writes.
-    const meta = worker.parked_meta.getPtr(ent) orelse return;
-
     const slot = worker.node.tenant_files_map.get(tenant_id) orelse return error.ResumeNoTenant;
     const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
     const tc = TenantFiles{ .slot = slot, .snap = snap };
@@ -3706,7 +3642,6 @@ fn resumeContinuation(
         txn.rollback() catch {};
         txn_done = true;
         try resolveParked(worker, ent, sid, sess, 500, "continuation handler error\n");
-        freeContMeta(worker, ent);
         return;
     };
 
@@ -3729,7 +3664,6 @@ fn resumeContinuation(
                 captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .send_callback);
                 r.console = &.{};
                 r.exception = &.{};
-                freeContMeta(worker, ent);
                 return;
             }
             if (wrote) {
@@ -3793,7 +3727,6 @@ fn resumeContinuation(
             captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .send_callback);
             r.console = &.{};
             r.exception = &.{};
-            freeContMeta(worker, ent);
         },
         .continuation => |c2| {
             var c2m = c2;
@@ -3805,7 +3738,6 @@ fn resumeContinuation(
                 txn.rollback() catch {};
                 txn_done = true;
                 try resolveParked(worker, ent, sid, sess, 504, "hold deadline exceeded\n");
-                freeContMeta(worker, ent);
                 return;
             }
             if (wrote) {
@@ -3872,23 +3804,16 @@ fn resumeContinuation(
                 .{@errorName(e)},
             );
             txn_done = true;
-            // Re-park: swap the descriptor in place, refresh the
-            // deadline; the entity stays in `parked_continuations`.
-            meta.cont.deinit(allocator);
-            meta.cont = c2m;
+            // Re-park: swap the descriptor in place on the entity's
+            // ContDescriptor component, refresh the deadline; the
+            // entity stays in `parked_continuations`. Phase 7:
+            // ownership of c2m transfers directly to the component;
+            // bound_schedule_id is untouched on the read-only path
+            // (only the write-batch repark in
+            // `proposeAndParkContResume` rewrites it).
             const refreshed_deadline_ns: i64 = now_ns + CONT_HOLD_DEADLINE_NS;
-            meta.deadline_ns = refreshed_deadline_ns;
-            // Phase 2b dual-write: mirror cont + deadline_ns onto
-            // the component. The read-only repark path doesn't
-            // touch bound_schedule_id (only the write-batch repark
-            // in `proposeAndParkContResume` does — the new
-            // `_send/owed/` write would've sent us down that path
-            // instead). ChainContext is already on the entity from
-            // the initial park; we don't rewrite it here.
-            // (`desc` from the top of resumeContinuation is the
-            // same component pointer — mutate it in place.)
             if (desc.cont) |*old_c| old_c.deinit(allocator);
-            desc.cont = try meta.cont.clone(allocator);
+            desc.cont = c2m;
             desc.deadline_ns = refreshed_deadline_ns;
         },
         .stream => |*s| {
@@ -3901,7 +3826,6 @@ fn resumeContinuation(
             txn_done = true;
             try resolveParked(worker, ent, sid, sess, 501, "streams not yet wired in the resume path (Phase 2b)\n");
             captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, correlation_id, .send_callback);
-            freeContMeta(worker, ent);
         },
     }
 }
@@ -3955,7 +3879,6 @@ pub fn resumeBoundContinuation(
                 .{ tenant_id, sched_id, @errorName(err) },
             );
             resolveParked(worker, ent, sid, sess, 502, "continuation resume failed\n") catch {};
-            freeContMeta(worker, ent);
         };
         return true;
     }
@@ -3996,7 +3919,6 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
                 .{@errorName(err)},
             );
             resolveParked(worker, e.ent, e.sid, e.sess, 504, "hold deadline exceeded\n") catch {};
-            freeContMeta(worker, e.ent);
         };
     }
 }
@@ -5204,18 +5126,13 @@ fn drainLeadershipLossColl(
         i -= 1;
         const ent = entities[i];
         const resp_body = resp_bodies[i];
+        // Phase 7: no per-kind side-table cleanup needed —
+        // ContDescriptor / stream components on the entity deinit
+        // structurally on destroy. (Stream pending_stream_meta is
+        // still alive in 7b; cont parked_meta is gone in 7a. The
+        // stream branch will lose its switch arm in 7b.)
         switch (kind) {
-            .response => {},
-            .cont => {
-                // Trampoline: leadership lost before the open hop
-                // committed → cannot hold. Discard the side-table
-                // descriptor; 503 like any other pending entry
-                // (client retries — moot-on-loss).
-                if (worker.parked_meta.fetchRemove(ent)) |kvp| {
-                    var pc = kvp.value;
-                    pc.deinit(allocator);
-                }
-            },
+            .response, .cont => {},
             .stream => {
                 if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
                     var sm = kvp.value;
@@ -5660,43 +5577,7 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
     try testing.expectEqual(log_mod.ActivationSource.send_callback, buffered.activation);
 }
 
-test "ParkedCont owns correlation_id; deinit frees it (streaming-handlers Phase 1)" {
-    // Construct a ParkedCont with every owned slice present (incl.
-    // the new correlation_id field) and run deinit under
-    // testing.allocator. Verifies the new field is freed exactly
-    // once and the existing fields' lifetimes are unaffected.
-    const a = testing.allocator;
-
-    var pc: ParkedCont = .{
-        .cont = .{
-            .path = try a.dupe(u8, "handlers/resume"),
-            .fn_name = null,
-            .ctx_json = try a.dupe(u8, "{\"x\":1}"),
-        },
-        .deadline_ns = 0,
-        .tenant_id = try a.dupe(u8, "acme"),
-        .bound_schedule_id = try a.dupe(u8, "sched-abc"),
-        .correlation_id = try a.dupe(u8, "deadbeefcafef00d"),
-    };
-    pc.deinit(a);
-    // If correlation_id leaks, testing.allocator's tracking would
-    // fail the test on the suite's tear-down check; reaching here is
-    // the pass condition.
-}
-
-test "ParkedCont with null correlation_id is a no-op on that field's free" {
-    const a = testing.allocator;
-    var pc: ParkedCont = .{
-        .cont = .{
-            .path = try a.dupe(u8, "handlers/resume"),
-            .fn_name = null,
-            .ctx_json = try a.dupe(u8, "{}"),
-        },
-        .deadline_ns = 0,
-        .tenant_id = try a.dupe(u8, "acme"),
-        .bound_schedule_id = null,
-        .correlation_id = null,
-    };
-    pc.deinit(a);
-}
+// Phase 7: ParkedCont deinit tests removed — ContDescriptor +
+// ChainContext components have their own deinit tests in
+// components.zig.
 
