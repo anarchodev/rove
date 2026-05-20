@@ -72,6 +72,11 @@ def main() -> int:
         with_log_files_bases=False,
         seed_manifest=repo_root / "examples" / "chain-bench-tenant.json",
         workers_per_node=1,
+        # Each chain link http.sends to the tenant's own URL
+        # (chainbench.{PUBLIC_SUFFIX}, resolves to loopback via
+        # nss-myhostname). Default SSRF gate blocks loopback — same
+        # flag the http.send / heldsync / webhook smokes pass.
+        worker_extra_args=["--dev-webhook-unsafe"],
     )
     with cluster as c:
         discover_leader(c)
