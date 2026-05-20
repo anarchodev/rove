@@ -66,11 +66,17 @@ pub const Stream = struct {
     /// fine; SSE framing is the customer's responsibility). On
     /// terminal-close, the last chunks ride the END_STREAM frame.
     chunks: [][]u8,
-    /// Next wake (Phase 2 v1 — single timer interval). null = wake
-    /// only on client disconnect (which is implicit on every held
-    /// stream). Multi-condition `waitFor` arrays + kv-write wakes
-    /// arrive in later phases.
+    /// Timer-wake interval in ms. null = no timer wake (chain ends
+    /// after chunks drain unless a kv-prefix wake fires first).
     interval_ms: ?i64 = null,
+    /// streaming-handlers-plan §4.6: prefix-only kv-write wakes.
+    /// Each entry is a tenant-scoped key prefix; when any key with
+    /// that prefix is `put`/`delete`'d by ANY request on the cell's
+    /// owning tenant, the apply-time hook fires a `kv_wake`
+    /// activation. Empty slice = no kv wakes registered.
+    /// Allocator-owned: each prefix is its own dup'd buffer, and
+    /// the spine `[][]u8` is allocator-owned too.
+    kv_prefixes: [][]u8 = &.{},
     /// Author's `ctx`, JSON-serialized. Threaded forward to the next
     /// activation as `request.ctx`.
     ctx_json: []u8,
@@ -79,6 +85,8 @@ pub const Stream = struct {
         if (self.headers) |h| allocator.free(h);
         for (self.chunks) |ch| allocator.free(ch);
         allocator.free(self.chunks);
+        for (self.kv_prefixes) |p| allocator.free(p);
+        if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
         allocator.free(self.ctx_json);
     }
 };
@@ -191,25 +199,45 @@ pub fn tryExtract(
         }
     }
 
-    // waitFor.timer.intervalMs (optional).
+    // waitFor — accepted in two shapes:
+    //   - object: { timer: { intervalMs }, kv: { prefix } }
+    //   - array:  [{ timer: {...} }, { kv: { prefix } }, ...]
+    // (streaming-handlers-plan §3.3 prescribes the array form; we
+    // accept the singular-object form too for ergonomics.) Each
+    // condition is parsed independently — multiple kv prefixes are
+    // accumulated into `kv_prefixes`; at most one timer interval is
+    // honored (last-wins).
     var interval_ms: ?i64 = null;
+    var prefixes_list: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (prefixes_list.items) |p| allocator.free(p);
+        prefixes_list.deinit(allocator);
+    }
     {
         const wf = c.JS_GetPropertyStr(ctx, val, "waitFor");
         defer c.JS_FreeValue(ctx, wf);
-        if (c.JS_IsObject(wf)) {
-            const tv = c.JS_GetPropertyStr(ctx, wf, "timer");
-            defer c.JS_FreeValue(ctx, tv);
-            if (c.JS_IsObject(tv)) {
-                const iv = c.JS_GetPropertyStr(ctx, tv, "intervalMs");
-                defer c.JS_FreeValue(ctx, iv);
-                if (c.JS_IsNumber(iv)) {
-                    var n: f64 = 0;
-                    if (c.JS_ToFloat64(ctx, &n, iv) == 0 and n > 0) {
-                        interval_ms = @intFromFloat(n);
+        if (c.JS_IsArray(wf)) {
+            const lv = c.JS_GetPropertyStr(ctx, wf, "length");
+            defer c.JS_FreeValue(ctx, lv);
+            var n: i32 = 0;
+            if (c.JS_ToInt32(ctx, &n, lv) == 0 and n > 0) {
+                var i: u32 = 0;
+                while (i < n) : (i += 1) {
+                    const elt = c.JS_GetPropertyUint32(ctx, wf, i);
+                    defer c.JS_FreeValue(ctx, elt);
+                    if (c.JS_IsObject(elt)) {
+                        try parseWaitForCondition(allocator, ctx, elt, &interval_ms, &prefixes_list);
                     }
                 }
             }
+        } else if (c.JS_IsObject(wf)) {
+            try parseWaitForCondition(allocator, ctx, wf, &interval_ms, &prefixes_list);
         }
+    }
+    const kv_prefixes = try prefixes_list.toOwnedSlice(allocator);
+    errdefer {
+        for (kv_prefixes) |p| allocator.free(p);
+        if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
     }
 
     // ctx (any → JSON string; default "null").
@@ -232,8 +260,51 @@ pub fn tryExtract(
         .headers = headers,
         .chunks = chunks,
         .interval_ms = interval_ms,
+        .kv_prefixes = kv_prefixes,
         .ctx_json = ctx_json,
     };
+}
+
+/// Read one waitFor condition `{ timer: {...} }` or `{ kv: { prefix } }`
+/// (or both, on the same object) and accumulate into the caller's
+/// `interval_ms` / `prefixes_list`. Unknown keys are ignored — keeps
+/// forward-compat with future condition variants. OOM propagates;
+/// malformed condition shapes (missing `prefix`, bad types) are silent
+/// no-ops (same accidental-collision posture as `tryExtract`).
+fn parseWaitForCondition(
+    allocator: std.mem.Allocator,
+    ctx: ?*c.JSContext,
+    obj: c.JSValue,
+    interval_ms: *?i64,
+    prefixes_list: *std.ArrayListUnmanaged([]u8),
+) error{OutOfMemory}!void {
+    {
+        const tv = c.JS_GetPropertyStr(ctx, obj, "timer");
+        defer c.JS_FreeValue(ctx, tv);
+        if (c.JS_IsObject(tv)) {
+            const iv = c.JS_GetPropertyStr(ctx, tv, "intervalMs");
+            defer c.JS_FreeValue(ctx, iv);
+            if (c.JS_IsNumber(iv)) {
+                var n: f64 = 0;
+                if (c.JS_ToFloat64(ctx, &n, iv) == 0 and n > 0) {
+                    interval_ms.* = @intFromFloat(n);
+                }
+            }
+        }
+    }
+    {
+        const kv = c.JS_GetPropertyStr(ctx, obj, "kv");
+        defer c.JS_FreeValue(ctx, kv);
+        if (c.JS_IsObject(kv)) {
+            const pv = c.JS_GetPropertyStr(ctx, kv, "prefix");
+            defer c.JS_FreeValue(ctx, pv);
+            if (c.JS_IsString(pv)) {
+                const dup = try jsValueAsOwnedBytes(allocator, ctx, pv);
+                errdefer allocator.free(dup);
+                try prefixes_list.append(allocator, dup);
+            }
+        }
+    }
 }
 
 fn jsStrEql(ctx: ?*c.JSContext, v: c.JSValue, want: []const u8) bool {
@@ -330,6 +401,22 @@ test "Stream.deinit frees all owned slices" {
         .chunks = chunks,
         .interval_ms = 30_000,
         .ctx_json = try a.dupe(u8, "{\"n\":1}"),
+    };
+    s.deinit(a);
+}
+
+test "Stream.deinit frees kv_prefixes (streaming-handlers Phase 3)" {
+    const a = testing.allocator;
+    const prefixes = try a.alloc([]u8, 2);
+    prefixes[0] = try a.dupe(u8, "orders/alice/");
+    prefixes[1] = try a.dupe(u8, "notifications/");
+    var s: Stream = .{
+        .status = 200,
+        .headers = null,
+        .chunks = try a.alloc([]u8, 0),
+        .interval_ms = null,
+        .kv_prefixes = prefixes,
+        .ctx_json = try a.dupe(u8, "null"),
     };
     s.deinit(a);
 }

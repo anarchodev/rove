@@ -1621,21 +1621,33 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, req_obj, "session", js_null);
     }
 
-    // request.activation = { kind: "inbound" | "send_callback" |
-    //                              "timer"   | "disconnect" }
+    // request.activation = { kind, ...payload }
     // — streaming-handlers-plan §2: every handler run is a recorded
     // "request," and the activation source is one field on the
-    // request shape the handler can branch on. v1 carries only the
-    // discriminant; the kv-wake variant lands in Phase 3 with its
-    // `{ key, op }` data payload.
+    // request shape the handler can branch on. The kv_wake variant
+    // (§4.6) carries `{ key, op }`; the others are bare `{ kind }`.
     const activation_obj = c.JS_NewObject(ctx);
     const kind: []const u8 = switch (request.activation_source) {
         .inbound => "inbound",
         .send_callback => "send_callback",
         .timer => "timer",
         .disconnect => "disconnect",
+        .kv_wake => "kv",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
+    if (request.activation_source == .kv_wake) {
+        if (request.activation_kv_key) |k| {
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "key", c.JS_NewStringLen(ctx, k.ptr, k.len));
+        }
+        const op_str: []const u8 = switch (request.activation_kv_op) {
+            'p' => "put",
+            'd' => "delete",
+            else => "",
+        };
+        if (op_str.len > 0) {
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
+        }
+    }
     _ = c.JS_SetPropertyStr(ctx, req_obj, "activation", activation_obj);
 
     _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);

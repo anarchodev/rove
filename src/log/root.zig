@@ -72,6 +72,14 @@ pub const ActivationSource = enum(u8) {
     /// tape but no bytes reach the wire — the socket is already
     /// gone.
     disconnect = 3,
+    /// kv-write match wake on a held stream (streaming-handlers-plan
+    /// §4.6). The cell registered one or more tenant-scoped prefixes
+    /// via `waitFor: { kv: { prefix } }`; `apply.zig`'s writeset
+    /// hook fired on a matching `put`/`delete` and `resumeStream`
+    /// runs the handler with `request.activation = { kind: "kv",
+    /// key, op }`. Prefix-only — predicate filters out of scope
+    /// (§4.6 + §11.1).
+    kv_wake = 4,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`

@@ -226,6 +226,15 @@ pub const Request = struct {
     /// `send_callback` covers both `__rove_next` resumes (§6.4) and
     /// the plain on_result callback. Recorded on the tape.
     activation_source: ActivationSource = .inbound,
+    /// kv_wake activation payload (streaming-handlers-plan §4.6).
+    /// Set only when `activation_source == .kv_wake`; surfaces as
+    /// `request.activation.key` / `request.activation.op` on the JS
+    /// side. Borrowed slice — caller (resumeStream) owns the bytes
+    /// for the duration of the dispatch.
+    activation_kv_key: ?[]const u8 = null,
+    /// `'p'` for put, `'d'` for delete. Only meaningful when
+    /// `activation_source == .kv_wake`.
+    activation_kv_op: u8 = 0,
 };
 
 /// One `(name, value)` pair extracted from the handler's

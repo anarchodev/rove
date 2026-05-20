@@ -156,12 +156,18 @@ const StreamFirstHopMeta = struct {
     /// Derived from the dispatch route's `module_base` so the resume
     /// reaches the same handler that returned `__rove_stream(...)`.
     module_path: []u8,
+    /// Owned. Tenant-scoped kv-key prefixes registered as wake
+    /// conditions (streaming-handlers-plan §4.6). Each entry is one
+    /// allocator-owned dup; the outer spine is owned too.
+    kv_prefixes: [][]u8,
 
     pub fn deinit(self: *StreamFirstHopMeta, allocator: std.mem.Allocator) void {
         for (self.chunks) |c| allocator.free(c);
         if (self.chunks.len > 0) allocator.free(self.chunks);
         allocator.free(self.ctx_json);
         allocator.free(self.module_path);
+        for (self.kv_prefixes) |p| allocator.free(p);
+        if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
         self.* = undefined;
     }
 };
@@ -298,6 +304,7 @@ fn streamParkIfAny(
         meta.module_path,
         meta.ctx_json,
         meta.chunks,
+        meta.kv_prefixes,
         meta.interval_ms,
         s.deployment_id,
     );
@@ -2332,17 +2339,20 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // Module path for resume — duped now so route's
                 // defer-deinit doesn't take it out from under us.
                 const mp_dup = try allocator.dupe(u8, route.module_base);
-                // Transfer chunks + ctx_json ownership out of s and
-                // into stream_meta_opt; clear s's fields so its
-                // (unused, see no-defer) deinit would no-op.
+                // Transfer chunks + ctx_json + kv_prefixes ownership
+                // out of s and into stream_meta_opt; clear s's
+                // fields so its (unused, see no-defer) deinit would
+                // no-op.
                 stream_meta_opt = .{
                     .chunks = s.chunks,
                     .interval_ms = s.interval_ms orelse 0,
                     .ctx_json = s.ctx_json,
                     .module_path = mp_dup,
+                    .kv_prefixes = s.kv_prefixes,
                 };
                 s.chunks = &.{};
                 s.ctx_json = &.{};
+                s.kv_prefixes = &.{};
                 // s is now a husk — no slices left to free; skip deinit.
                 break :stblk dispatcher_mod.Response{
                     .status = @intCast(status_u16),

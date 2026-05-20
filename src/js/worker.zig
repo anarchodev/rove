@@ -226,6 +226,20 @@ pub const StreamCell = struct {
     /// meaningful when `interval_ms > 0` AND `chunks.items.len == 0`.
     /// On chunk drain we set this to `now + interval_ms*ns_per_ms`.
     next_wake_ns: i64,
+    /// streaming-handlers-plan §4.6: prefix-only kv-write wakes.
+    /// Each entry is a tenant-scoped key prefix; `apply.zig` scans
+    /// the just-committed writeset for matches and enqueues a
+    /// `pending_wake_event` on the cell. Owned: spine + entries.
+    kv_prefixes: [][]u8,
+    /// Most recent kv-write event waiting to drive the next handler
+    /// activation. `null` ⇒ no pending kv-wake (either timer-only
+    /// or already serviced). Set by `apply.zig`'s wake hook;
+    /// consumed by `serviceParkedStreams` → `resumeStream`. Phase 3
+    /// v1 collapses concurrent matches to "most recent" (the
+    /// notify-don't-carry §7 thesis: the handler re-reads the
+    /// authoritative state from kv on activation). Wake-accumulator
+    /// debounce (§9.4) is a later refinement.
+    pending_wake: ?PendingKvWake,
     /// Number of activations the chain has had so far (inbound +
     /// every timer wake that re-ran the handler). Hard-capped to
     /// `MAX_STREAM_ACTIVATIONS` to bound a misbehaving handler.
@@ -247,6 +261,27 @@ pub const StreamCell = struct {
         allocator.free(self.ctx_json);
         for (self.chunks.items) |ch| allocator.free(ch);
         self.chunks.deinit(allocator);
+        for (self.kv_prefixes) |p| allocator.free(p);
+        if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
+        if (self.pending_wake) |*w| w.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// A pending kv-write match destined for the next activation of a
+/// streaming chain. Both fields are allocator-owned dup's of the
+/// observed write's key (the writeset's key buffer doesn't outlive
+/// the apply call). v1 collapses to most-recent; the wake-accumulator
+/// in §9.4 (deferred) batches.
+pub const PendingKvWake = struct {
+    /// Owned. The full kv key that matched a registered prefix.
+    key: []u8,
+    /// `'p'` for put, `'d'` for delete — exposed to JS as
+    /// `request.activation.op === "put"` / `"delete"`.
+    op: u8,
+
+    pub fn deinit(self: *PendingKvWake, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
         self.* = undefined;
     }
 };
@@ -3256,23 +3291,27 @@ pub fn registerStreamCell(
     module_path: []u8, // ownership transferred in
     ctx_json: []u8, // ownership transferred in
     initial_chunks: [][]u8, // ownership transferred in (slice + bytes)
+    kv_prefixes: [][]u8, // ownership transferred in (slice + bytes)
     interval_ms: i64,
     deployment_id: u64,
 ) !void {
     const allocator = worker.allocator;
     // The caller transferred ownership of `module_path` / `ctx_json`
-    // / `initial_chunks` (slice + bytes). On ANY error along the
-    // pre-flight chain we free them — the function is all-or-nothing
-    // so the caller can rely on "succeeded ⇒ transfer complete,
-    // failed ⇒ nothing leaked." Last allocation (chunks_list capacity)
-    // is the last `try`; the final `putAssumeCapacity` is infallible,
-    // so the errdefer below never sees a state where ownership has
-    // been split between the inputs and the cell.
+    // / `initial_chunks` / `kv_prefixes` (slice + bytes). On ANY
+    // error along the pre-flight chain we free them — the function
+    // is all-or-nothing so the caller can rely on "succeeded ⇒
+    // transfer complete, failed ⇒ nothing leaked." Last allocation
+    // (chunks_list capacity) is the last `try`; the final
+    // `putAssumeCapacity` is infallible, so the errdefer below never
+    // sees a state where ownership has been split between the inputs
+    // and the cell.
     errdefer {
         allocator.free(module_path);
         allocator.free(ctx_json);
         for (initial_chunks) |c| allocator.free(c);
         if (initial_chunks.len > 0) allocator.free(initial_chunks);
+        for (kv_prefixes) |p| allocator.free(p);
+        if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
     }
 
     try worker.parked_streams_meta.ensureUnusedCapacity(allocator, 1);
@@ -3304,6 +3343,8 @@ pub fn registerStreamCell(
         .chunks = chunks_list,
         .interval_ms = interval_ms,
         .next_wake_ns = next_wake,
+        .kv_prefixes = kv_prefixes,
+        .pending_wake = null,
         .activation_count = 1, // the inbound activation that produced the cell
         .close_pending = false,
         .deployment_id = deployment_id,
@@ -3399,7 +3440,7 @@ pub fn serviceParkedStreams(worker: anytype) !void {
                 freeStreamCell(worker, p.ent);
                 continue;
             }
-            resumeStream(worker, p.ent, p.sid, p.sess) catch |err| {
+            resumeStream(worker, p.ent, p.sid, p.sess, .timer) catch |err| {
                 std.log.warn(
                     "rove-js stream-resume: tenant={s} corr={s}: {s}; closing",
                     .{ cell.tenant_id, cell.correlation_id orelse "(none)", @errorName(err) },
@@ -3443,12 +3484,12 @@ fn resumeStream(
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
+    activation: log_mod.ActivationSource,
 ) !void {
     _ = sid;
     _ = sess; // Reserved for Phase 3 cross-collection resolves; see
     // resumeContinuation's signature for the call-site shape we'll
-    // mirror when kv-write wakes land and the activation may not
-    // start from `stream_data_out`.
+    // mirror when the activation may not start from `stream_data_out`.
 
     const allocator = worker.allocator;
     const cell = worker.parked_streams_meta.getPtr(ent) orelse return;
@@ -3495,6 +3536,22 @@ fn resumeStream(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
+    // kv_wake activation: pop the pending wake off the cell (single
+    // outstanding match in v1; wake-accumulator §9.4 is later) and
+    // attach the key/op to the synthesized request.
+    var kv_wake_taken: ?PendingKvWake = null;
+    defer if (kv_wake_taken) |*w| w.deinit(allocator);
+    var activation_kv_key: ?[]const u8 = null;
+    var activation_kv_op: u8 = 0;
+    if (activation == .kv_wake) {
+        if (cell.pending_wake) |_| {
+            const w = cell.pending_wake.?;
+            cell.pending_wake = null;
+            kv_wake_taken = w;
+            activation_kv_key = kv_wake_taken.?.key;
+            activation_kv_op = kv_wake_taken.?.op;
+        }
+    }
     const request: Request = .{
         .method = "POST",
         .path = spath,
@@ -3511,7 +3568,9 @@ fn resumeStream(
         .limiter = &worker.limiter,
         .instance_id = inst.id,
         .correlation_id = cell.correlation_id,
-        .activation_source = .timer,
+        .activation_source = activation,
+        .activation_kv_key = activation_kv_key,
+        .activation_kv_op = activation_kv_op,
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
@@ -3528,7 +3587,7 @@ fn resumeStream(
         txn.rollback() catch {};
         txn_done = true;
         cell.close_pending = true;
-        captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, .timer);
+        captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, activation);
         return;
     };
 
@@ -3541,7 +3600,7 @@ fn resumeStream(
                 txn.rollback() catch {};
                 txn_done = true;
                 cell.close_pending = true;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, cell.correlation_id, .timer);
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, cell.correlation_id, activation);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -3550,7 +3609,7 @@ fn resumeStream(
                 txn.rollback() catch {};
                 txn_done = true;
                 cell.close_pending = true;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, r.console, r.exception, .{}, cell.correlation_id, .timer);
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, r.console, r.exception, .{}, cell.correlation_id, activation);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -3574,7 +3633,7 @@ fn resumeStream(
             cell.close_pending = true;
             cell.activation_count += 1;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, cell.correlation_id, .timer);
+            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, cell.correlation_id, activation);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -3583,7 +3642,7 @@ fn resumeStream(
             txn.rollback() catch {};
             txn_done = true;
             cell.close_pending = true;
-            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, .timer);
+            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, activation);
         },
         .stream => |*s2| {
             if (wrote) {
@@ -3591,7 +3650,7 @@ fn resumeStream(
                 txn.rollback() catch {};
                 txn_done = true;
                 cell.close_pending = true;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, &.{}, &.{}, .{}, cell.correlation_id, .timer);
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, &.{}, &.{}, .{}, cell.correlation_id, activation);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -3622,8 +3681,18 @@ fn resumeStream(
                 cell.interval_ms = 0;
                 cell.next_wake_ns = std.math.maxInt(i64);
             }
+            // Replace the cell's kv-wake registration with whatever
+            // the handler returned. Phase 3 v1 keeps re-registration
+            // simple: free old prefixes, take ownership of the new
+            // ones. The (tenant, prefix) registry is a derived view
+            // recomputed on every match scan, so there's no separate
+            // unregister/re-register step needed.
+            for (cell.kv_prefixes) |p| allocator.free(p);
+            if (cell.kv_prefixes.len > 0) allocator.free(cell.kv_prefixes);
+            cell.kv_prefixes = s2.kv_prefixes;
+            s2.kv_prefixes = &.{};
             cell.activation_count += 1;
-            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .timer);
+            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, activation);
         },
     }
 }

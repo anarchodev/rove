@@ -187,6 +187,7 @@ fn activationName(a: log_mod.ActivationSource) []const u8 {
         .send_callback => "send_callback",
         .timer => "timer",
         .disconnect => "disconnect",
+        .kv_wake => "kv_wake",
     };
 }
 
