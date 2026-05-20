@@ -22,6 +22,7 @@
         {"path": "disc_writer/index.mjs", "source": "loop46-demo-tenants/acme/disc_writer/index.mjs"},
         {"path": "watchwrite/index.mjs", "source": "loop46-demo-tenants/acme/watchwrite/index.mjs"},
         {"path": "writekv/index.mjs", "source": "loop46-demo-tenants/acme/writekv/index.mjs"},
+        {"path": "sessions_sse/index.mjs", "source": "loop46-demo-tenants/acme/sessions_sse/index.mjs"},
         {"path": "cfg/index.mjs", "source": "loop46-demo-tenants/acme/cfg/index.mjs"},
         {"path": "_config/oauth/google.json", "source": "loop46-demo-tenants/acme/_config/oauth/google.json", "content_type": "application/json"}
       ]

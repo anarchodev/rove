@@ -1443,6 +1443,16 @@ pub fn Worker(comptime opts: Options) type {
         /// the entity moves to `stream_close_in` (h2 sends END_STREAM)
         /// and the map entry is removed.
         parked_streams_meta: std.AutoHashMapUnmanaged(rove.Entity, StreamCell) = .empty,
+        /// Phase 4d: side-store for stream-first-hops that wrote
+        /// (and therefore went through raft). Keyed by entity; the
+        /// `StreamFirstHopMeta` carries the chunks / interval /
+        /// ctx_json / module_path / kv_prefixes the handler emitted.
+        /// `drainRaftPending`'s entity loop detects an entry here on
+        /// commit, registers the chain cell, and moves the entity to
+        /// `stream_response_in` instead of `response_in`. On
+        /// fault/timeout, the entry is freed alongside the entity's
+        /// 503 downgrade — same posture as `parked_meta`.
+        pending_stream_meta: std.AutoHashMapUnmanaged(rove.Entity, dispatch.StreamFirstHopMeta) = .empty,
         /// Per-worker kv-wake inbox (streaming-handlers-plan §4.6).
         /// Producers (apply.zig + leader-side worker_dispatch) push
         /// events here via `worker.node.broadcastKvWake`;
@@ -1785,6 +1795,16 @@ pub fn Worker(comptime opts: Options) type {
                 var sit = self.parked_streams_meta.valueIterator();
                 while (sit.next()) |cell| cell.deinit(allocator);
                 self.parked_streams_meta.deinit(allocator);
+            }
+            // Phase 4d: free any stream-first-hop meta that didn't
+            // make it through drainRaftPending before shutdown
+            // (degenerate case — the entity in raft_pending will
+            // also be cleaned up by drainOnLeadershipLoss or the
+            // entity destroy in cleanupResponses).
+            {
+                var pit = self.pending_stream_meta.valueIterator();
+                while (pit.next()) |m| m.deinit(allocator);
+                self.pending_stream_meta.deinit(allocator);
             }
             // Unregister + tear down the kv-wake inbox. Order
             // matters: unregister FIRST so no producer can still
@@ -3056,6 +3076,50 @@ pub fn drainRaftPending(worker: anytype) !void {
                 _ = worker.pending_txns.remove(wait.seq);
                 allocator.destroy(tracked);
             }
+            // Phase 4d: committed stream-first-hop → register the
+            // chain cell + redirect to `stream_response_in`. Check
+            // BEFORE the cont/parked_meta branch because a single
+            // entity is never both a cont and a stream (the
+            // dispatch outcome is a tagged union — `.continuation`
+            // OR `.stream`, never both).
+            if (worker.pending_stream_meta.count() != 0) {
+                if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
+                    const meta = kvp.value;
+                    registerStreamCell(
+                        worker,
+                        ent,
+                        meta.tenant_id,
+                        meta.correlation_id,
+                        meta.module_path,
+                        meta.ctx_json,
+                        meta.chunks,
+                        meta.kv_prefixes,
+                        meta.interval_ms,
+                        meta.deployment_id,
+                    ) catch |rerr| {
+                        // registerStreamCell freed the transferred
+                        // slices on failure; only meta.tenant_id and
+                        // meta.correlation_id stay with us.
+                        if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
+                        if (meta.correlation_id) |c| allocator.free(c);
+                        std.log.warn(
+                            "drainRaftPending: registerStreamCell ent={} err={s}; routing to response_in with empty body",
+                            .{ ent, @errorName(rerr) },
+                        );
+                        try server.reg.move(ent, &worker.raft_pending, &server.response_in);
+                        continue;
+                    };
+                    // registerStreamCell consumed chunks / ctx_json /
+                    // module_path / kv_prefixes; the meta's
+                    // tenant_id and correlation_id are still ours
+                    // to free (the cell dupes them internally for
+                    // its own ownership).
+                    if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
+                    if (meta.correlation_id) |c| allocator.free(c);
+                    try server.reg.move(ent, &worker.raft_pending, &server.stream_response_in);
+                    continue;
+                }
+            }
             // Trampoline: a committed continuation parks (no response)
             // instead of going to `response_in`; the §6.4 deadline
             // sweep or a 3b-iii callback resolves it. `parked_meta`
@@ -3099,6 +3163,15 @@ pub fn drainRaftPending(worker: anytype) !void {
             if (worker.parked_meta.fetchRemove(ent)) |kvp| {
                 var pc = kvp.value;
                 pc.deinit(allocator);
+            }
+        }
+        // Phase 4d: same posture for stream-first-hop meta — discard
+        // it so the entity ships the already-stamped 503 body
+        // through `response_in` without trying to start the stream.
+        if (worker.pending_stream_meta.count() != 0) {
+            if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
+                var sm = kvp.value;
+                sm.deinit(allocator);
             }
         }
 
@@ -4810,6 +4883,13 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
             if (worker.parked_meta.fetchRemove(ent)) |kvp| {
                 var pc = kvp.value;
                 pc.deinit(allocator);
+            }
+        }
+        // Phase 4d: same posture for stream-first-hop meta.
+        if (worker.pending_stream_meta.count() != 0) {
+            if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
+                var sm = kvp.value;
+                sm.deinit(allocator);
             }
         }
         const old_body_ptr: ?[*]u8 = resp_body.data;

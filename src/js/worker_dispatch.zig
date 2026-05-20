@@ -138,8 +138,17 @@ const SuccessRec = struct {
 
 /// Stream first-hop chain metadata held on a `SuccessRec` between the
 /// `.stream` dispatch outcome and `finalizeBatch`. All slices are
-/// owned; `deinit` frees them in the discard path.
-const StreamFirstHopMeta = struct {
+/// owned; `deinit` frees them in the discard path. Public so
+/// `worker.zig`'s `pending_stream_meta` side-store (Phase 4d) can
+/// reference the same type when threading through the raft propose
+/// path.
+///
+/// `tenant_id` / `correlation_id` / `deployment_id` are populated by
+/// `streamRecordIfAny` (Phase 4d) right before the meta moves into
+/// `pending_stream_meta`. The fields are unused on the read-only
+/// commit fast path where `streamParkIfAny` reads them off the
+/// caller's local context instead.
+pub const StreamFirstHopMeta = struct {
     /// Owned. Initial chunks the chain emits before the first wake.
     /// Each chunk byte buffer is allocator-owned; the outer spine
     /// (the `[][]u8`) is too.
@@ -160,6 +169,17 @@ const StreamFirstHopMeta = struct {
     /// conditions (streaming-handlers-plan §4.6). Each entry is one
     /// allocator-owned dup; the outer spine is owned too.
     kv_prefixes: [][]u8,
+    /// Owned. Tenant id the chain is scoped to. Set by
+    /// `streamRecordIfAny` before the meta enters
+    /// `pending_stream_meta`. Empty on the read-only commit
+    /// fast path (`streamParkIfAny` reads tenant_id off the
+    /// SuccessRec / anchor_id directly).
+    tenant_id: []u8 = &.{},
+    /// Owned. Correlation id from the originating inbound request.
+    /// Same population rule as `tenant_id`.
+    correlation_id: ?[]u8 = null,
+    /// Deployment id the chain is bound to.
+    deployment_id: u64 = 0,
 
     pub fn deinit(self: *StreamFirstHopMeta, allocator: std.mem.Allocator) void {
         for (self.chunks) |c| allocator.free(c);
@@ -168,6 +188,8 @@ const StreamFirstHopMeta = struct {
         allocator.free(self.module_path);
         for (self.kv_prefixes) |p| allocator.free(p);
         if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
+        if (self.tenant_id.len > 0) allocator.free(self.tenant_id);
+        if (self.correlation_id) |c| allocator.free(c);
         self.* = undefined;
     }
 };
@@ -316,16 +338,49 @@ fn streamParkIfAny(
     return true;
 }
 
-/// 500 path: the first-hop wrote kv. Phase 2b-ii is read-only-only
-/// (mirror of `resumeContinuation`'s 3b-iii read-only restriction);
-/// the write-stream path lands when Phase 4 lifts the asymmetry. For
-/// now, terminate with a defined 500 + drop the descriptor; the
-/// caller stamps the response.
+/// 500 path: drop a SuccessRec's stream meta (free the owned
+/// slices) without registering or parking. Used in propose-fail
+/// branches and other "first-hop never reached the wire" cleanup.
 fn streamDiscardIfAny(allocator: std.mem.Allocator, s: *SuccessRec) void {
     if (s.stream) |*m| {
         m.deinit(allocator);
         s.stream = null;
     }
+}
+
+/// Phase 4d: stream-first-hop success on a write batch. Move the
+/// `StreamFirstHopMeta` into `worker.pending_stream_meta` keyed by
+/// entity — `drainRaftPending` consumes it on commit, calling
+/// `worker.registerStreamCell` + moving the entity to
+/// `stream_response_in` (instead of `response_in`). On
+/// fault/timeout `drainRaftPending` discards the entry alongside
+/// the 503 downgrade. Symmetric to `contRecordIfAny`.
+///
+/// The chain context fields (tenant_id, correlation_id,
+/// deployment_id) are populated here from the SuccessRec because
+/// `drainRaftPending` only has access to the entity + its h2
+/// components; the tenant/chain identity has to ride with the
+/// meta. The allocator-owned dups are freed by the meta's deinit
+/// (`pending_stream_meta` cleanup or `registerStreamCell`'s
+/// transfer).
+/// Caller-supplied-tenant variant. The `anchor_id` argument is the
+/// finalizeBatch tenant; we dup it onto the meta so
+/// `drainRaftPending` (which has no direct tenant context) can
+/// register the cell properly. Phase 4d.
+fn streamRecordIfAnyAt(
+    worker: anytype,
+    allocator: std.mem.Allocator,
+    anchor_id: []const u8,
+    s: *SuccessRec,
+) !void {
+    var meta_opt = s.stream orelse return;
+    s.stream = null; // ownership flows into pending_stream_meta on success
+    errdefer meta_opt.deinit(allocator);
+    // Populate chain context from the SuccessRec.
+    meta_opt.tenant_id = try allocator.dupe(u8, anchor_id);
+    meta_opt.correlation_id = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
+    meta_opt.deployment_id = s.deployment_id;
+    try worker.pending_stream_meta.put(allocator, s.ent, meta_opt);
 }
 
 /// End-of-walk: propose the merged batch through raft, defer the
@@ -453,22 +508,7 @@ fn finalizeBatch(
             const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
             for (successes.items) |*s| {
                 try contRecordIfAny(worker, allocator, anchor_id, s); // drain redirects to parked_continuations
-                // Phase 2b-ii: stream-park alongside a raft propose
-                // isn't wired (drainRaftPending only redirects to
-                // `parked_continuations`, not into the stream
-                // pipeline). Log loud + discard the chain meta —
-                // the entity ships its already-stamped empty body
-                // through the normal raft_pending → response_in
-                // path. Mixed read-only-stream / write batches are
-                // rare; lifting this lands with Phase 4's read-only
-                // restriction.
-                if (s.stream != null) {
-                    std.log.warn(
-                        "rove-js stream: tenant={s} idiom-0 barrier-batch contained a __rove_stream return — discarded; ships empty 200 instead of streaming",
-                        .{anchor_id},
-                    );
-                    streamDiscardIfAny(allocator, s);
-                }
+                try streamRecordIfAnyAt(worker, allocator, anchor_id, s); // drain redirects to stream_response_in (Phase 4d)
                 try server.reg.set(s.ent, &server.request_out, RaftWait, .{
                     .seq = seq,
                     .deadline_ns = deadline_ns,
@@ -604,20 +644,7 @@ fn finalizeBatch(
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     for (successes.items) |*s| {
         try contRecordIfAny(worker, allocator, anchor_id, s); // drain redirects to parked_continuations
-        // Phase 2b-ii: drainRaftPending only knows how to redirect a
-        // committed entry to `parked_continuations`. A stream-first-
-        // hop alongside a raft propose would land in
-        // `response_in` with the empty placeholder body — visibly
-        // wrong. Log loud + discard the chain meta. Phase 4 wires
-        // drain-time stream parking (alongside lifting the read-
-        // only restriction).
-        if (s.stream != null) {
-            std.log.warn(
-                "rove-js stream: tenant={s} write-batch contained a __rove_stream return — discarded; ships empty 200 instead of streaming",
-                .{anchor_id},
-            );
-            streamDiscardIfAny(allocator, s);
-        }
+        try streamRecordIfAnyAt(worker, allocator, anchor_id, s); // drain redirects to stream_response_in (Phase 4d)
         try server.reg.set(s.ent, &server.request_out, RaftWait, .{
             .seq = seq,
             .deadline_ns = deadline_ns,
@@ -2216,22 +2243,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         else
             dispatcher_mod.Budget.default_duration_ns;
         var budget = dispatcher_mod.Budget.fromNow(budget_ns);
-        // Streaming-handlers Phase 2b-ii read-only first-hop
-        // restriction: snapshot the writeset length before running
-        // the handler so we can detect "this handler wrote AND
-        // returned `__rove_stream(...)`" — that combination is
-        // rejected with a defined 500 (Phase 4 lifts the restriction
-        // alongside the cont resume's 3b-iii branch). The batched
-        // writeset (`&writeset` is shared across the anchor tenant's
-        // batch) means a prior request's writes carry forward; the
-        // delta is what THIS handler contributed.
-        const ws_pre_len = writeset.ops.items.len;
         // §6.4 binding (5b-1): a continuation hop binds to the single
         // `_send/owed/{id}` it wrote — derived from `writeset` after
         // the hop (see `cont_bound_sched_id` below). The customer
         // never sees the id (`http.send`'s value is unused by §6.4),
         // so the binding is runtime-internal.
-        var run_oc = worker.dispatcher.runOutcome(
+        const run_oc = worker.dispatcher.runOutcome(
             scope_inst.kv,
             txn.?,
             &writeset,
@@ -2280,33 +2297,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // unchanged ~150-line response/SuccessRec block below run
         // verbatim (empty body/console/exception is already a
         // supported terminal shape — handlers may return nothing).
-        // Streaming-handlers Phase 2b-ii read-only first-hop guard:
-        // if the handler returned `__rove_stream(...)` AND wrote to
-        // kv on this hop, rewrite the run outcome to a defined 500
-        // before the response-build switch sees it. Mirrors the
-        // `resumeContinuation` 3b-iii read-only rejection — Phase 4
-        // lifts both restrictions together. Per-handler write
-        // detection compares the shared `writeset.ops` length
-        // before/after the run (a previous batched handler's writes
-        // accumulate but aren't this handler's responsibility).
-        if (writeset.ops.items.len > ws_pre_len) {
-            switch (run_oc) {
-                .stream => |sval| {
-                    var s_to_drop = sval;
-                    s_to_drop.deinit(allocator);
-                    run_oc = .{ .terminal = .{
-                        .status = 500,
-                        .body = try allocator.dupe(u8, "streaming + kv writes not yet supported (Phase 2b-ii read-only)\n"),
-                        .body_is_json = false,
-                        .console = try allocator.dupe(u8, ""),
-                        .exception = try allocator.dupe(u8, ""),
-                        .set_cookies = &.{},
-                        .headers = &.{},
-                    } };
-                },
-                else => {},
-            }
-        }
+        // Phase 4d: `stream + writes` IS supported. The
+        // `pending_stream_meta` side-store (set by
+        // `streamRecordIfAny` in finalizeBatch's write path) lets
+        // `drainRaftPending` redirect the committed entity into
+        // `stream_response_in`. The old read-only guard that
+        // rewrote `.stream + wrote` into a 500 is gone.
 
         var cont_opt: ?continuation_mod.Continuation = null;
         var stream_meta_opt: ?StreamFirstHopMeta = null;
