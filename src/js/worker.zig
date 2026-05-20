@@ -153,6 +153,17 @@ pub const ParkedUnit = struct {
     /// also didn't escape, and the §9.4 "spurious + overflow"
     /// thesis tolerates dropped wakes.
     kv_wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty,
+    /// Phase 4c: entity-less commit-gated `TrackedTxn` pointer
+    /// when this unit represents a "forgetful writes" propose —
+    /// the §4.4 disconnect activation's kv side effects. No entity
+    /// in `raft_pending` waits on this seq, so the entity-loop in
+    /// `drainRaftPending` would never commit it; the pending_units
+    /// sweep does instead. On commit: `tracked.commit() + destroy`;
+    /// on fault: `tracked.rollback() + destroy`. Null on the
+    /// historical entity-backed units (`parkSendOps` / `parkEmits`
+    /// from the inbound dispatch path) — the entity loop already
+    /// owns those.
+    txn: ?*kv_mod.KvStore.TrackedTxn = null,
 
     pub fn deinit(self: *ParkedUnit, allocator: std.mem.Allocator) void {
         for (self.emits.items) |*e| e.deinit(allocator);
@@ -161,6 +172,15 @@ pub const ParkedUnit = struct {
         self.send_ops.deinit(allocator);
         for (self.kv_wakes.items) |*w| w.deinit(allocator);
         self.kv_wakes.deinit(allocator);
+        // Phase 4c: if a forgetful-writes txn is still attached
+        // (drained without commit / fault, e.g. on shutdown),
+        // rollback + destroy. The pending_units sweep clears this
+        // pointer when it commits or rolls back.
+        if (self.txn) |t| {
+            t.rollback() catch {};
+            allocator.destroy(t);
+            self.txn = null;
+        }
         allocator.free(self.tenant_id);
     }
 };
@@ -3100,6 +3120,20 @@ pub fn drainRaftPending(worker: anytype) !void {
     while (u < worker.pending_units.items.len) {
         const unit = &worker.pending_units.items[u];
         if (committed >= unit.seq) {
+            // Phase 4c: forgetful-writes units carry their own
+            // `TrackedTxn` (no entity in raft_pending waiting on
+            // this seq — see `proposeForgetfulWrites`). Commit it
+            // here; the firePending* helpers run alongside, same
+            // post-commit firing order as the entity-backed path.
+            if (unit.txn) |t| {
+                t.commit() catch |cerr| panic_mod.invariantViolated(
+                    "drainRaftPending.pending_units.commit",
+                    "seq={d} tenant={s} err={s}",
+                    .{ unit.seq, unit.tenant_id, @errorName(cerr) },
+                );
+                allocator.destroy(t);
+                unit.txn = null;
+            }
             firePendingEmits(worker, unit);
             firePendingSendOps(worker, unit);
             firePendingKvWakes(worker, unit);
@@ -3108,6 +3142,19 @@ pub fn drainRaftPending(worker: anytype) !void {
             continue;
         }
         if ((faulted > 0 and faulted >= unit.seq) or now_ns >= unit.deadline_ns) {
+            // Phase 4c: rollback the attached txn before discarding
+            // the unit. `ParkedUnit.deinit` also does this as a
+            // safety net (shutdown path), but doing it here keeps
+            // the fault/timeout discard ordering symmetric with
+            // commit's destroy-then-clear pattern.
+            if (unit.txn) |t| {
+                t.rollback() catch |rerr| std.log.warn(
+                    "rove-js drainRaftPending.pending_units.rollback seq={d} tenant={s}: {s}",
+                    .{ unit.seq, unit.tenant_id, @errorName(rerr) },
+                );
+                allocator.destroy(t);
+                unit.txn = null;
+            }
             unit.deinit(allocator); // discard — never committed, never escaped
             _ = worker.pending_units.swapRemove(u);
             continue;
@@ -4292,7 +4339,14 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
 
-    var txn = inst.kv.beginTrackedImmediate() catch return;
+    // Heap-allocate the txn so the pointer is stable across an
+    // optional `pending_txns[seq]` parking (Phase 4c — writes on
+    // a disconnect hop). `txn_owned` flips to false once ownership
+    // transfers to the pending map.
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
     var txn_done = false;
     defer if (!txn_done) txn.rollback() catch {};
 
@@ -4326,7 +4380,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
         inst.kv,
-        &txn,
+        txn,
         &ws,
         bc,
         &tc.snap.bytecodes,
@@ -4345,15 +4399,36 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     var oc = run_oc;
     // The handler's return shape is moot — the socket is closed.
     // We deinit whatever it produced, then record the outcome on
-    // the tape with the appropriate status.
+    // the tape with the appropriate status. If the hop WROTE,
+    // Phase 4c parks the txn on `pending_txns[seq]` so
+    // `drainRaftPending` commits it asynchronously (no entity is
+    // waiting; the kv writes + any `_send/owed/*` / §4.6 wakes
+    // become durable on their own).
     switch (oc) {
         .terminal => |*r| {
             defer r.deinit(allocator);
-            if (r.exception.len > 0 or wrote) {
+            if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;
-                const outcome: log_mod.Outcome = if (r.exception.len > 0) .handler_error else .kv_error;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, outcome, r.console, r.exception, .{}, cell.correlation_id, .disconnect);
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, cell.correlation_id, .disconnect);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, cell.tenant_id) catch |perr| {
+                    std.log.warn("rove-js stream-disconnect: propose failed: {s}", .{@errorName(perr)});
+                    txn_owned = false; // helper destroyed it
+                    txn_done = true;
+                    captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, cell.correlation_id, .disconnect);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, cell.correlation_id, .disconnect);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -4371,9 +4446,24 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         },
         .continuation => |*cval| {
             // `__rove_next` from a disconnect hop is futile (no
-            // socket to hold). Log loud, treat as terminal — same
-            // posture as `__rove_stream` below.
+            // socket to hold) — drop the descriptor. The hop's
+            // writes (if any) still commit asynchronously so any
+            // observable side effects (kv state, http.send fire,
+            // §4.6 wakes) materialize for other observers.
             cval.deinit(allocator);
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, cell.tenant_id) catch |perr| {
+                    std.log.warn("rove-js stream-disconnect (cont return): propose failed: {s}", .{@errorName(perr)});
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+                return;
+            }
             txn.rollback() catch {};
             txn_done = true;
             captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
@@ -4381,9 +4471,16 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .stream => |*s2| {
             s2.deinit(allocator);
             if (wrote) {
-                txn.rollback() catch {};
+                proposeForgetfulWrites(worker, &ws, txn, cell.tenant_id) catch |perr| {
+                    std.log.warn("rove-js stream-disconnect (stream return): propose failed: {s}", .{@errorName(perr)});
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+                    return;
+                };
+                txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -4395,6 +4492,81 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
             captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
         },
     }
+}
+
+/// Phase 4c: propose a write batch that nobody is waiting on. The
+/// txn rides a `ParkedUnit.txn` field that the pending_units sweep
+/// in `drainRaftPending` commits at the seq — same gate as the
+/// entity-backed path's `pending_txns[seq]`, just routed through
+/// the unit drain so we don't need an entity in `raft_pending`.
+/// On commit, the unit's `_send/owed/*` arms + §4.6 kv-wakes
+/// also fire (the existing `firePendingSendOps` / `firePendingKvWakes`
+/// already iterate at the same point).
+///
+/// Used by `fireDisconnectActivation` — the socket is gone, so
+/// we can't gate the held-response on commit, but we still want
+/// the writes + their side effects to land durably.
+///
+/// On success the helper consumes the txn pointer (moved into
+/// the ParkedUnit). On failure it rolls back + destroys it, so
+/// the caller's `txn_owned` flag should flip to false either way.
+fn proposeForgetfulWrites(
+    worker: anytype,
+    writeset: *const kv_mod.WriteSet,
+    txn: *kv_mod.KvStore.TrackedTxn,
+    tenant_id: []const u8,
+) !void {
+    const allocator = worker.allocator;
+    txn.releaseLease();
+    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id) catch |err| {
+        txn.rollback() catch {};
+        allocator.destroy(txn);
+        return err;
+    };
+    // Build a ParkedUnit carrying the txn AND the send_ops /
+    // kv_wakes intents extracted from the writeset. drainRaftPending's
+    // pending_units sweep handles all three at commit (or
+    // discards all three on fault/timeout).
+    var unit_send_ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty;
+    errdefer {
+        for (unit_send_ops.items) |*o| o.deinit(allocator);
+        unit_send_ops.deinit(allocator);
+    }
+    send_dispatch_mod.materialize(writeset, tenant_id, allocator, &unit_send_ops) catch |perr|
+        std.log.warn("rove-js forgetful-writes materialize send_ops (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
+
+    var unit_kv_wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty;
+    errdefer {
+        for (unit_kv_wakes.items) |*w| w.deinit(allocator);
+        unit_kv_wakes.deinit(allocator);
+    }
+    if (writeset.ops.items.len > 0) {
+        unit_kv_wakes.ensureUnusedCapacity(allocator, writeset.ops.items.len) catch |perr|
+            std.log.warn("rove-js forgetful-writes kv_wakes ensureCapacity (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
+        for (writeset.ops.items) |op| switch (op) {
+            .put => |p| {
+                const k = allocator.dupe(u8, p.key) catch break;
+                unit_kv_wakes.appendAssumeCapacity(.{ .key = k, .op = 'p' });
+            },
+            .delete => |d| {
+                const k = allocator.dupe(u8, d.key) catch break;
+                unit_kv_wakes.appendAssumeCapacity(.{ .key = k, .op = 'd' });
+            },
+        };
+    }
+
+    try worker.pending_units.ensureUnusedCapacity(allocator, 1);
+    const tid = try allocator.dupe(u8, tenant_id);
+    errdefer allocator.free(tid);
+    worker.pending_units.appendAssumeCapacity(.{
+        .seq = seq,
+        .deadline_ns = @intCast(std.time.nanoTimestamp() +
+            @as(i128, @intCast(worker.commit_wait_timeout_ns))),
+        .tenant_id = tid,
+        .send_ops = unit_send_ops,
+        .kv_wakes = unit_kv_wakes,
+        .txn = txn,
+    });
 }
 
 /// Fire a committed parked unit's buffered SSE emits. No-op (caller
