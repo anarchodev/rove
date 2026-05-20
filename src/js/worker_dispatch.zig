@@ -468,8 +468,16 @@ fn streamDiscardIfAny(allocator: std.mem.Allocator, s: *SuccessRec) void {
 /// finalizeBatch tenant; we dup it onto the meta so
 /// `drainRaftPending` (which has no direct tenant context) can
 /// register the cell properly. Phase 4d.
+///
+/// Handler-cmds Phase 4a: ALSO populate the stream components on the
+/// entity in `request_out` so they survive the raft_pending park
+/// and arrive on the entity by the time `drainRaftPending` routes
+/// the entity to `stream_response_in`. The meta-on-side-table
+/// remains, owning its own clones, because `registerStreamCell`
+/// still consumes them for the cell write through Phase 7.
 fn streamRecordIfAnyAt(
     worker: anytype,
+    server: anytype,
     allocator: std.mem.Allocator,
     anchor_id: []const u8,
     s: *SuccessRec,
@@ -477,7 +485,27 @@ fn streamRecordIfAnyAt(
     var meta_opt = s.stream orelse return;
     s.stream = null; // ownership flows into pending_stream_meta on success
     errdefer meta_opt.deinit(allocator);
-    // Populate chain context from the SuccessRec.
+    // Phase 4a: stream components on the entity. Failure here leaves
+    // partial component data on the entity; deinit reaps it
+    // structurally when the entity later destroys (no manual
+    // cleanup site). The components hold INDEPENDENT clones from
+    // the meta — both sides deinit safely.
+    try worker_mod.setStreamComponents(
+        server,
+        &server.request_out,
+        s.ent,
+        allocator,
+        anchor_id,
+        s.correlation_id,
+        s.deployment_id,
+        meta_opt.module_path,
+        meta_opt.ctx_json,
+        meta_opt.chunks,
+        meta_opt.kv_prefixes,
+        meta_opt.interval_ms,
+    );
+    // Populate chain context on the meta for the cell registration
+    // in drainRaftPending.
     meta_opt.tenant_id = try allocator.dupe(u8, anchor_id);
     meta_opt.correlation_id = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
     meta_opt.deployment_id = s.deployment_id;
@@ -608,7 +636,7 @@ fn finalizeBatch(
             const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
             for (successes.items) |*s| {
                 try contRecordIfAny(worker, server, allocator, anchor_id, s); // drain redirects to parked_continuations
-                try streamRecordIfAnyAt(worker, allocator, anchor_id, s); // drain redirects to stream_response_in (Phase 4d)
+                try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // drain redirects to stream_response_in (Phase 4d)
                 try server.reg.set(s.ent, &server.request_out, RaftWait, .{
                     .seq = seq,
                     .deadline_ns = deadline_ns,
@@ -737,7 +765,7 @@ fn finalizeBatch(
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     for (successes.items) |*s| {
         try contRecordIfAny(worker, server, allocator, anchor_id, s); // drain redirects to parked_continuations
-        try streamRecordIfAnyAt(worker, allocator, anchor_id, s); // drain redirects to stream_response_in (Phase 4d)
+        try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // drain redirects to stream_response_in (Phase 4d)
         try server.reg.set(s.ent, &server.request_out, RaftWait, .{
             .seq = seq,
             .deadline_ns = deadline_ns,
