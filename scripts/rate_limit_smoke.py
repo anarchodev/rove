@@ -57,6 +57,9 @@ def main() -> int:
             "--rate-limit-request-refill", "0",
             "--rate-limit-email-capacity", "2",
             "--rate-limit-email-refill", "0",
+            # OIDC token-exchange + JWKS hops http.send to loopback IdP;
+            # bypass SSRF gate.
+            "--dev-webhook-unsafe",
         ],
     )
     with cluster as c:

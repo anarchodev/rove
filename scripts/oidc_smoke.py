@@ -96,6 +96,9 @@ def main() -> int:
         files_port=8299,
         log_port=8300,
         root_token=TOKEN,
+        # OIDC token-exchange + JWKS hops http.send to loopback IdP;
+        # bypass SSRF gate.
+        worker_extra_args=["--dev-webhook-unsafe"],
     )
     with cluster as c:
         c.discover_leader()

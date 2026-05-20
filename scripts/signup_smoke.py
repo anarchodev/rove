@@ -52,6 +52,9 @@ def main() -> int:
         public_suffix=PUBLIC_SUFFIX,
         root_token=TOKEN,
         admin_origin_per_node=True,
+        # OIDC token-exchange + JWKS hops http.send to loopback IdP;
+        # bypass SSRF gate.
+        worker_extra_args=["--dev-webhook-unsafe"],
     )
     with cluster as c:
         c.discover_leader()

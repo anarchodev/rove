@@ -84,6 +84,9 @@ def main() -> int:
         public_suffix=PUBLIC_SUFFIX,
         root_token=TOKEN,
         workers_per_node=1,
+        # OIDC token-exchange + JWKS hops http.send to loopback IdP;
+        # bypass SSRF gate.
+        worker_extra_args=["--dev-webhook-unsafe"],
     )
 
     leaked = True  # fail-closed until proven otherwise

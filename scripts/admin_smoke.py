@@ -42,6 +42,12 @@ def main() -> int:
         admin_origin_per_node=True,
         with_log_files_bases=False,
         seed_manifest=repo_root / "examples" / "loop46-demo-tenants.json",
+        # OIDC token-exchange + JWKS http.send hops target the local
+        # IdP at https://auth.{SYSTEM_SUFFIX}:PORT (127.0.0.1 via
+        # nss-myhostname). The default SSRF gate blocks loopback —
+        # this is the same dev-mode flag http_send / webhook / heldsync
+        # / leader_failover smokes already pass.
+        worker_extra_args=["--dev-webhook-unsafe"],
     )
     with cluster as c:
         c.discover_leader()
