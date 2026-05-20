@@ -3459,16 +3459,39 @@ fn resumeContinuation(
     allow_repark: bool,
 ) !void {
     const allocator = worker.allocator;
-    const meta = worker.parked_meta.getPtr(ent) orelse return; // resolve-once: already gone
+    const server = worker.h2;
+    // Phase 2c: resolve-once guard becomes collection membership +
+    // ContDescriptor presence. Cont state (path / fn_name / ctx_json /
+    // tenant_id / correlation_id) read from the entity's components
+    // instead of `parked_meta`. The slices borrow into the
+    // component's heap allocations; they stay valid across moves
+    // (`merged_request_row` carries the components on every
+    // destination collection) and across in-place mutations
+    // (`proposeAndParkContResume` deinits the old cont before
+    // installing a new one — but only AFTER capturing these locals,
+    // and the function never reuses them after the mutation site).
+    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return; // resolve-once
+    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
+    const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
+    const c = desc.cont orelse return;
+    const tenant_id = chain.tenant_id;
+    const correlation_id = chain.correlation_id;
+    const cont_path = c.path;
+    const cont_fn_name = c.fn_name;
+    const cont_ctx_json = c.ctx_json;
+    // Still need the side-table meta pointer for the in-place
+    // mutation sites below — Phase 2d removes the side table; until
+    // then meta writes happen alongside component writes.
+    const meta = worker.parked_meta.getPtr(ent) orelse return;
 
-    const slot = worker.node.tenant_files_map.get(meta.tenant_id) orelse return error.ResumeNoTenant;
+    const slot = worker.node.tenant_files_map.get(tenant_id) orelse return error.ResumeNoTenant;
     const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
     const tc = TenantFiles{ .slot = slot, .snap = snap };
     defer tc.release();
-    const inst = (worker.node.tenant.getInstance(meta.tenant_id) catch return error.ResumeNoInstance) orelse
+    const inst = (worker.node.tenant.getInstance(tenant_id) catch return error.ResumeNoInstance) orelse
         return error.ResumeNoInstance;
 
-    const path = meta.cont.path;
+    const path = cont_path;
     const bc = blk: {
         if (tc.snap.bytecodes.get(path)) |b| break :blk b;
         const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{path});
@@ -3484,10 +3507,10 @@ fn resumeContinuation(
     // envelope `{fn,args:[ctx,outcome]}`; default export → body
     // object `{ctx,outcome}`. ctx_json/outcome_json are JSON text
     // embedded verbatim.
-    const body = if (meta.cont.fn_name) |fnname|
-        try std.fmt.allocPrint(allocator, "{{\"fn\":\"{s}\",\"args\":[{s},{s}]}}", .{ fnname, meta.cont.ctx_json, outcome_json })
+    const body = if (cont_fn_name) |fnname|
+        try std.fmt.allocPrint(allocator, "{{\"fn\":\"{s}\",\"args\":[{s},{s}]}}", .{ fnname, cont_ctx_json, outcome_json })
     else
-        try std.fmt.allocPrint(allocator, "{{\"ctx\":{s},\"outcome\":{s}}}", .{ meta.cont.ctx_json, outcome_json });
+        try std.fmt.allocPrint(allocator, "{{\"ctx\":{s},\"outcome\":{s}}}", .{ cont_ctx_json, outcome_json });
     defer allocator.free(body);
     const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
     defer allocator.free(spath);
@@ -3530,10 +3553,10 @@ fn resumeContinuation(
         // tape row of this chain shares one correlation_id; mark
         // this activation as a send-callback resume (streaming-
         // handlers-plan §6).
-        .correlation_id = meta.correlation_id,
+        .correlation_id = correlation_id,
         .activation_source = .send_callback,
     };
-    std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ meta.correlation_id orelse "(none)", request_id, inst.id });
+    std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     var oc = worker.dispatcher.runOutcome(
         inst.kv,
@@ -3569,7 +3592,7 @@ fn resumeContinuation(
                 // freeing meta. Activation source = send_callback so
                 // the row shares the chain id with the inbound entry
                 // and the replay UX groups them.
-                captureLogWithId(worker, meta.tenant_id, request_id, "POST", meta.cont.path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, meta.correlation_id, .send_callback);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .send_callback);
                 r.console = &.{};
                 r.exception = &.{};
                 freeContMeta(worker, ent);
@@ -3582,10 +3605,8 @@ fn resumeContinuation(
                 // drop the parked_meta entry so `drainRaftPending`
                 // routes the committed entity to `response_in`
                 // (normal flush path, not the repark).
-                const tenant_id = meta.tenant_id;
-                const corr_id = meta.correlation_id;
+                const corr_id = correlation_id;
                 const dep_id = tc.snap.deployment_id;
-                const cont_path = meta.cont.path;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
                 const body_dup = try allocator.dupe(u8, r.body);
                 errdefer allocator.free(body_dup);
@@ -3635,7 +3656,7 @@ fn resumeContinuation(
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             try resolveParked(worker, ent, sid, sess, st, r.body);
-            captureLogWithId(worker, meta.tenant_id, request_id, "POST", meta.cont.path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, meta.correlation_id, .send_callback);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .send_callback);
             r.console = &.{};
             r.exception = &.{};
             freeContMeta(worker, ent);
@@ -3662,10 +3683,8 @@ fn resumeContinuation(
                 // hop wrote, if exactly one) becomes the wake the
                 // next callback resolves on. Same fail-fast posture
                 // as the terminal+writes branch.
-                const tenant_id = meta.tenant_id;
-                const corr_id = meta.correlation_id;
+                const corr_id = correlation_id;
                 const dep_id = tc.snap.deployment_id;
-                const cont_path = meta.cont.path;
                 // §6.4 binding for the repark: scan the writeset
                 // for the single _send/owed/{id} put. 0 / >1 → null
                 // (deadline-only resume).
@@ -3732,7 +3751,8 @@ fn resumeContinuation(
             // `_send/owed/` write would've sent us down that path
             // instead). ChainContext is already on the entity from
             // the initial park; we don't rewrite it here.
-            const desc = try worker.h2.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
+            // (`desc` from the top of resumeContinuation is the
+            // same component pointer — mutate it in place.)
             if (desc.cont) |*old_c| old_c.deinit(allocator);
             desc.cont = try meta.cont.clone(allocator);
             desc.deadline_ns = refreshed_deadline_ns;
@@ -3746,7 +3766,7 @@ fn resumeContinuation(
             txn.rollback() catch {};
             txn_done = true;
             try resolveParked(worker, ent, sid, sess, 501, "streams not yet wired in the resume path (Phase 2b)\n");
-            captureLogWithId(worker, meta.tenant_id, request_id, "POST", meta.cont.path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, meta.correlation_id, .send_callback);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, correlation_id, .send_callback);
             freeContMeta(worker, ent);
         },
     }
@@ -3775,14 +3795,20 @@ pub fn resumeBoundContinuation(
     sched_id: []const u8,
     outcome_json: []const u8,
 ) bool {
-    if (worker.parked_meta.count() == 0) return false;
+    // Phase 2c: bound_schedule_id + tenant_id read from the entity's
+    // components instead of `parked_meta`. The `count() == 0` probe
+    // becomes an empty-collection check — membership in
+    // `parked_continuations` IS the cont-state discriminant
+    // (principle #1).
     const ents = worker.parked_continuations.entitySlice();
+    if (ents.len == 0) return false;
     const sids = worker.parked_continuations.column(h2.StreamId);
     const sesss = worker.parked_continuations.column(h2.Session);
-    for (ents, sids, sesss) |ent, sid, sess| {
-        const pc = worker.parked_meta.getPtr(ent) orelse continue;
-        const bsid = pc.bound_schedule_id orelse continue;
-        if (!std.mem.eql(u8, pc.tenant_id, tenant_id)) continue;
+    const descs = worker.parked_continuations.column(components_mod.ContDescriptor);
+    const chains = worker.parked_continuations.column(components_mod.ChainContext);
+    for (ents, sids, sesss, descs, chains) |ent, sid, sess, desc, chain| {
+        const bsid = desc.bound_schedule_id orelse continue;
+        if (!std.mem.eql(u8, chain.tenant_id, tenant_id)) continue;
         if (!std.mem.eql(u8, bsid, sched_id)) continue;
         // Matched. resumeContinuation either flushes+drops (terminal)
         // or re-parks (keeps the entity) — either way we return
