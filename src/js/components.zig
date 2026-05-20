@@ -144,6 +144,27 @@ pub const StreamWakes = struct {
     }
 };
 
+/// Phase 7: replaces the Phase-6 `parked_streams_active` /
+/// `parked_streams_draining` map split — the entity stays in h2's
+/// `stream_data_out` (h2 owns the chunk-shipping pipeline, so we
+/// can't move the entity to a worker-owned sibling collection),
+/// and this component encodes "chunks-drain-then-close" instead.
+///
+/// Caveat (commit message reiterates): this is a bool flag, the
+/// strictest reading of rove-library principle #1 would prefer a
+/// sibling collection. The architectural constraint (h2 watches
+/// its own collections, not the worker's) prevents that without
+/// reshaping h2's stream pipeline — out of scope for this
+/// refactor. The shift from "side-table map membership"
+/// (Phase 6) to "component bool" (Phase 7) is principle-neutral;
+/// the real win of this phase is the side-table deletion + the
+/// structural deinit (no manual cleanup sites).
+pub const StreamDraining = struct {
+    is_draining: bool = false,
+
+    pub fn deinit(_: std.mem.Allocator, _: []StreamDraining) void {}
+};
+
 /// One pending kv-write match destined for the next activation of a
 /// streaming chain. Allocator-owned `key`; `op` is `'p'`
 /// (put) or `'d'` (delete). v1 keeps "most recent wins" (Phase 3

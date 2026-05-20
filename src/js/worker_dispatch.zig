@@ -358,13 +358,16 @@ fn streamParkIfAny(
     tenant_id: []const u8,
     s: *SuccessRec,
 ) !bool {
-    const meta = s.stream orelse return false;
+    var meta = s.stream orelse return false;
     s.stream = null;
-    // Handler-cmds Phase 3: dual-write the chain identity + chunks +
-    // wakes to the entity's components BEFORE the cell registration.
-    // Both sides survive until Phase 7 deletes the cell — and on any
-    // error along the chain the partial-set components are reaped
-    // structurally when the entity is destroyed (no manual cleanup).
+    // Phase 7: the entity's components are the sole home for stream
+    // state. setStreamComponents clones every slice into its
+    // component-side owners; we then free the originals via the
+    // SuccessRec's StreamFirstHopMeta.deinit. (A future "transfer-
+    // ownership" rewrite of setStreamComponents would skip this
+    // round-trip; the clone is small and bounded by initial chunk
+    // count, so the wallclock cost is negligible.)
+    errdefer meta.deinit(worker.allocator);
     try worker_mod.setStreamComponents(
         server,
         &server.request_out,
@@ -379,21 +382,7 @@ fn streamParkIfAny(
         meta.kv_prefixes,
         meta.interval_ms,
     );
-    // registerStreamCell's all-or-nothing contract: on success it
-    // took ownership of every transferred slice; on failure it freed
-    // them all and meta is a husk either way.
-    try worker_mod.registerStreamCell(
-        worker,
-        s.ent,
-        tenant_id,
-        s.correlation_id,
-        meta.module_path,
-        meta.ctx_json,
-        meta.chunks,
-        meta.kv_prefixes,
-        meta.interval_ms,
-        s.deployment_id,
-    );
+    meta.deinit(worker.allocator);
     // Move into the streaming pipeline. h2's `consumeStreamResponses`
     // submits the response headers we already stamped (Status +
     // RespHeaders) on the entity, then transitions it to
@@ -412,32 +401,12 @@ fn streamDiscardIfAny(allocator: std.mem.Allocator, s: *SuccessRec) void {
     }
 }
 
-/// Phase 4d: stream-first-hop success on a write batch. Move the
-/// `StreamFirstHopMeta` into `worker.pending_stream_meta` keyed by
-/// entity — `drainRaftPending` consumes it on commit, calling
-/// `worker.registerStreamCell` + moving the entity to
-/// `stream_response_in` (instead of `response_in`). On
-/// fault/timeout `drainRaftPending` discards the entry alongside
-/// the 503 downgrade. Symmetric to `contRecordIfAny`.
-///
-/// The chain context fields (tenant_id, correlation_id,
-/// deployment_id) are populated here from the SuccessRec because
-/// `drainRaftPending` only has access to the entity + its h2
-/// components; the tenant/chain identity has to ride with the
-/// meta. The allocator-owned dups are freed by the meta's deinit
-/// (`pending_stream_meta` cleanup or `registerStreamCell`'s
-/// transfer).
-/// Caller-supplied-tenant variant. The `anchor_id` argument is the
-/// finalizeBatch tenant; we dup it onto the meta so
-/// `drainRaftPending` (which has no direct tenant context) can
-/// register the cell properly. Phase 4d.
-///
-/// Handler-cmds Phase 4a: ALSO populate the stream components on the
-/// entity in `request_out` so they survive the raft_pending park
-/// and arrive on the entity by the time `drainRaftPending` routes
-/// the entity to `stream_response_in`. The meta-on-side-table
-/// remains, owning its own clones, because `registerStreamCell`
-/// still consumes them for the cell write through Phase 7.
+/// Phase 4d / 7: stream-first-hop success on a write batch. Populates
+/// the entity's stream components in `request_out` so they ride the
+/// raft park into `raft_pending_stream` and onward to
+/// `stream_response_in` on commit. Phase 7: no side table; the
+/// SuccessRec's StreamFirstHopMeta is freed inline after the clones
+/// land on the components. Symmetric to `contRecordIfAny`.
 fn streamRecordIfAnyAt(
     worker: anytype,
     server: anytype,
@@ -445,14 +414,10 @@ fn streamRecordIfAnyAt(
     anchor_id: []const u8,
     s: *SuccessRec,
 ) !void {
+    _ = worker;
     var meta_opt = s.stream orelse return;
-    s.stream = null; // ownership flows into pending_stream_meta on success
+    s.stream = null;
     errdefer meta_opt.deinit(allocator);
-    // Phase 4a: stream components on the entity. Failure here leaves
-    // partial component data on the entity; deinit reaps it
-    // structurally when the entity later destroys (no manual
-    // cleanup site). The components hold INDEPENDENT clones from
-    // the meta — both sides deinit safely.
     try worker_mod.setStreamComponents(
         server,
         &server.request_out,
@@ -467,12 +432,7 @@ fn streamRecordIfAnyAt(
         meta_opt.kv_prefixes,
         meta_opt.interval_ms,
     );
-    // Populate chain context on the meta for the cell registration
-    // in drainRaftPending.
-    meta_opt.tenant_id = try allocator.dupe(u8, anchor_id);
-    meta_opt.correlation_id = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
-    meta_opt.deployment_id = s.deployment_id;
-    try worker.pending_stream_meta.put(allocator, s.ent, meta_opt);
+    meta_opt.deinit(allocator);
 }
 
 /// End-of-walk: propose the merged batch through raft, defer the
