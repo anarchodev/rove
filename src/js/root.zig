@@ -47,6 +47,7 @@ const std = @import("std");
 pub const dispatcher = @import("dispatcher.zig");
 pub const globals = @import("globals.zig");
 pub const worker = @import("worker.zig");
+pub const components = @import("components.zig");
 pub const apply = @import("apply.zig");
 pub const penalty = @import("penalty.zig");
 pub const limiter = @import("limiter.zig");
@@ -98,6 +99,7 @@ test {
     _ = dispatcher;
     _ = globals;
     _ = worker;
+    _ = components;
     _ = apply;
     _ = penalty;
     _ = limiter;

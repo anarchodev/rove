@@ -65,6 +65,7 @@ const dispatcher_mod = @import("dispatcher.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const Continuation = continuation_mod.Continuation;
 const stream_mod = @import("bindings/stream.zig");
+const components_mod = @import("components.zig");
 const globals = @import("globals.zig");
 const apply_mod = @import("apply.zig");
 const raft_propose = @import("raft_propose.zig");
@@ -1369,7 +1370,25 @@ pub fn Worker(comptime opts: Options) type {
     // No proxy components anymore — Phase 5.5 retired all `/_system/*`
     // proxies (logs Step B, files Step F1) in favor of standalone
     // services on their own subdomains.
-    const merged_request_row = rove.Row(&.{RaftWait}).merge(opts.request_row);
+    //
+    // Phase 1 of the handler-cmds refactor
+    // (`docs/handler-cmds-refactor-plan.md`): cont + stream state
+    // components ride on every h2 stream collection + worker
+    // `parked_continuations` + worker `raft_pending`. Non-cont /
+    // non-stream entities carry default-empty instances; the SoA
+    // cost is the per-entity overhead the open question in the plan
+    // doc bounded at ~324 bytes (≈3 MB at 10k concurrent). Phase 2-4
+    // flips readers from the side stores to these components; Phase
+    // 5 splits raft_pending into siblings + Phase 7 deletes the side
+    // stores.
+    const merged_request_row = rove.Row(&.{
+        RaftWait,
+        components_mod.ChainContext,
+        components_mod.ContDescriptor,
+        components_mod.StreamChain,
+        components_mod.StreamChunks,
+        components_mod.StreamWakes,
+    }).merge(opts.request_row);
 
     const H2Type = h2.H2(.{
         .request_row = merged_request_row,
