@@ -3184,6 +3184,50 @@ pub fn drainRaftPending(worker: anytype) !void {
 /// leaves a collection exactly once, so a racing 3b-iii callback
 /// finds it gone (expected, not an error). O(parked) per tick, gated
 /// by `parked_meta.count() == 0`.
+/// Handler-cmds Phase 8: the deployment + bytecode resolution that
+/// every resume engine shares (the only truly-shared block across
+/// `resumeContinuation` / `resumeStream` / `fireDisconnectActivation`
+/// after Phase 7 deletions). Caller defers `dep.tc.release()` on
+/// success; on error the helper releases internally.
+///
+/// Why only this one helper: the engines' outcome-application logic
+/// is intrinsically divergent (cont reparks + bound_schedule_id +
+/// 6.4 deadline / stream appends chunks to a component queue +
+/// marks draining / disconnect ignores output entirely). Forcing a
+/// unified outcome-switch obscures rather than clarifies, so each
+/// engine keeps its tail. See the doc comment on each engine for
+/// the prep / run / apply phase structure.
+const ChainDeployment = struct {
+    inst: *const tenant_mod.Instance,
+    tc: TenantFiles,
+    bc: []u8,
+};
+
+fn resolveDeployment(
+    worker: anytype,
+    allocator: std.mem.Allocator,
+    tenant_id: []const u8,
+    module_path: []const u8,
+) !ChainDeployment {
+    const slot = worker.node.tenant_files_map.get(tenant_id) orelse return error.ResumeNoTenant;
+    const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
+    var tc = TenantFiles{ .slot = slot, .snap = snap };
+    errdefer tc.release();
+    const inst = (worker.node.tenant.getInstance(tenant_id) catch return error.ResumeNoInstance) orelse
+        return error.ResumeNoInstance;
+    const bc = blk: {
+        if (tc.snap.bytecodes.get(module_path)) |b| break :blk b;
+        const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{module_path});
+        defer allocator.free(mjs);
+        if (tc.snap.bytecodes.get(mjs)) |b| break :blk b;
+        const js = try std.fmt.allocPrint(allocator, "{s}.js", .{module_path});
+        defer allocator.free(js);
+        if (tc.snap.bytecodes.get(js)) |b| break :blk b;
+        return error.ResumeNoBytecode;
+    };
+    return .{ .inst = inst, .tc = tc, .bc = bc };
+}
+
 /// Resolve a parked stream: stamp the response on the
 /// `parked_continuations` collection and move it to `response_in`.
 /// The move is the resolve-ONCE guard — `isInCollection` gates it, so
@@ -3369,19 +3413,26 @@ fn proposeAndParkContResume(
 }
 
 /// The trampoline resume engine (connection-actor 3b-iii post-Phase-4).
-/// Given an outcome for a parked stream, re-enter the SAME dispatch
-/// path a request takes (a continuation IS a request) with body =
-/// ctx + outcome, then:
-///   • terminal + no writes → flush to the held socket immediately.
-///   • terminal + writes → propose, park on raft_pending, flush on
-///     commit (`proposeAndParkContResume(.terminal)`).
-///   • continuation + no writes → re-park (only if `allow_repark`);
-///     speculative commit is durable enough — no raft hop.
-///   • continuation + writes (allow_repark) → propose, park on
-///     raft_pending; drainRaftPending re-parks on commit
-///     (`proposeAndParkContResume(.repark)` — recipe-1 real-retry).
-///   • continuation + !allow_repark → defined 504 (deadline).
-///   • stream → defined 501 (`cont → stream` is a later phase).
+///
+/// Handler-cmds Phase 8 TEA-framing:
+///   - **Msg**:   `(send_callback outcome, parked-cont entity)`.
+///   - **prep**:  read `ContDescriptor + ChainContext` on the entity in
+///                `parked_continuations`; resolveDeployment; build
+///                request body = `{fn?, args:[ctx, outcome]}` or
+///                `{ctx, outcome}` with `.send_callback` activation.
+///   - **run**:   `dispatcher.runOutcome` against the chain-tail txn.
+///   - **apply (Cmd-list)**: switch on outcome ×
+///                {writes? × allow_repark?}:
+///       • terminal + no writes → flush to the held socket immediately.
+///       • terminal + writes → propose, park on raft_pending_cont,
+///         flush on commit (`proposeAndParkContResume(.terminal)`).
+///       • continuation + no writes → re-park (only if `allow_repark`);
+///         speculative commit is durable enough — no raft hop.
+///       • continuation + writes (allow_repark) → propose, park on
+///         raft_pending_cont; drainContPending re-parks on commit
+///         (`proposeAndParkContResume(.repark)` — recipe-1 real-retry).
+///       • continuation + !allow_repark → defined 504 (deadline).
+///       • stream → defined 501 (`cont → stream` is a later phase).
 /// The deadline trigger passes `allow_repark = false`.
 /// `error.Resume*` → caller falls back to a hard 504.
 fn resumeContinuation(
@@ -3413,24 +3464,12 @@ fn resumeContinuation(
     const cont_path = c.path;
     const cont_fn_name = c.fn_name;
     const cont_ctx_json = c.ctx_json;
-    const slot = worker.node.tenant_files_map.get(tenant_id) orelse return error.ResumeNoTenant;
-    const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
-    const tc = TenantFiles{ .slot = slot, .snap = snap };
-    defer tc.release();
-    const inst = (worker.node.tenant.getInstance(tenant_id) catch return error.ResumeNoInstance) orelse
-        return error.ResumeNoInstance;
-
     const path = cont_path;
-    const bc = blk: {
-        if (tc.snap.bytecodes.get(path)) |b| break :blk b;
-        const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{path});
-        defer allocator.free(mjs);
-        if (tc.snap.bytecodes.get(mjs)) |b| break :blk b;
-        const js = try std.fmt.allocPrint(allocator, "{s}.js", .{path});
-        defer allocator.free(js);
-        if (tc.snap.bytecodes.get(js)) |b| break :blk b;
-        return error.ResumeNoBytecode;
-    };
+    var dep = try resolveDeployment(worker, allocator, tenant_id, path);
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
 
     // A continuation is an internal request: named export → RPC
     // envelope `{fn,args:[ctx,outcome]}`; default export → body
@@ -4130,22 +4169,30 @@ fn matchEventsToWakes(
 }
 
 /// Phase 2b-ii: run the next handler activation for a parked stream.
-/// Structural twin of `resumeContinuation` — the dispatch surface is
-/// the same (re-enter `Dispatcher.runOutcome` with a synthesized
-/// `Request`); the differences are activation_source (`.timer`), the
-/// success contract (no `parked_continuations` move — the entity stays
-/// in the stream pipeline), and the return-shape vocabulary
-/// (`.stream` appends chunks + repark; `.terminal` flushes the body
-/// as a final chunk + flags `close_pending`; `.continuation` is
-/// rejected with close — `__rove_next` from a stream-resume hop is
-/// out of scope until Phase 4 lifts the §3b-iii restriction).
+/// Structural twin of `resumeContinuation` — same dispatch surface
+/// (re-enter `Dispatcher.runOutcome` with a synthesized `Request`),
+/// divergent in the outcome-application tail.
 ///
-/// Phase 2b-ii constraint: read-only resumes only. A resume hop that
-/// writes kv terminates the stream with a defined 500-equivalent
-/// (recorded on the tape) — same posture as `resumeContinuation`'s
-/// 3b-iii read-only branch. The first-hop write rejection lives in
-/// `worker_dispatch.zig` so it's caught BEFORE the cell is even
-/// registered.
+/// Handler-cmds Phase 8 TEA-framing:
+///   - **Msg**:   `(timer-tick or kv-wake, entity in stream_data_out
+///                with non-empty StreamChain.module_path)`.
+///   - **prep**:  read four stream components on the entity; resolve
+///                deployment; build request body = `{ctx}` with
+///                `.timer` or `.kv_wake` activation; for kv_wake, pop
+///                `StreamWakes.pending_wake` into `activation_kv_*`.
+///   - **run**:   `dispatcher.runOutcome` (chain-tail txn).
+///   - **apply (Cmd-list)**: switch on outcome:
+///       • terminal → append body to StreamChunks + markStreamDraining
+///         (eager-fire writes via proposeForgetfulWrites if any).
+///       • stream → update StreamChain.ctx_json + StreamWakes
+///         (kv_prefixes / interval / next_wake) + append new chunks +
+///         increment activation_count. Eager-fire writes.
+///       • continuation → 501 + markStreamDraining (`__rove_next`
+///         from a stream-resume hop is out of scope).
+///
+/// Phase 4b lifted the read-only constraint — write-path resumes
+/// `proposeForgetfulWrites` the txn (no entity awaiting commit; the
+/// writes + their `_send/owed/` arms + §4.6 wakes fire on commit).
 fn resumeStream(
     worker: anytype,
     ent: rove.Entity,
@@ -4171,24 +4218,12 @@ fn resumeStream(
     const chunks_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChunks) catch return error.ResumeNoChunks;
     const wakes_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamWakes) catch return error.ResumeNoWakes;
 
-    const slot = worker.node.tenant_files_map.get(chain_ctx.tenant_id) orelse return error.ResumeNoTenant;
-    const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
-    const tc = TenantFiles{ .slot = slot, .snap = snap };
-    defer tc.release();
-    const inst = (worker.node.tenant.getInstance(chain_ctx.tenant_id) catch return error.ResumeNoInstance) orelse
-        return error.ResumeNoInstance;
-
     const path = chain_st.module_path;
-    const bc = blk: {
-        if (tc.snap.bytecodes.get(path)) |b| break :blk b;
-        const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{path});
-        defer allocator.free(mjs);
-        if (tc.snap.bytecodes.get(mjs)) |b| break :blk b;
-        const js = try std.fmt.allocPrint(allocator, "{s}.js", .{path});
-        defer allocator.free(js);
-        if (tc.snap.bytecodes.get(js)) |b| break :blk b;
-        return error.ResumeNoBytecode;
-    };
+    var dep = try resolveDeployment(worker, allocator, chain_ctx.tenant_id, path);
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
 
     // Synthesized resume body: `{ctx: <ctx_json>}` — same JSON shape
     // resumeContinuation's deadline path uses, minus the outcome
@@ -4426,22 +4461,32 @@ fn resumeStream(
 
 /// Streaming-handlers-plan §4.4: client disconnect on a held stream.
 /// h2's `serverStreamClose` routed the entity to `response_out`
-/// (FIN/RST observed) without our `close_pending` path firing —
-/// `cleanupResponses` notices the orphaned chain cell and calls this
-/// before destroying the entity. Runs the handler one last time with
-/// `activation_source = .disconnect` so the customer can do cleanup
-/// (release resources, log a "session ended" event). The handler's
-/// return is recorded on the tape but no bytes reach the wire —
-/// `Response` / `__rove_stream` / `__rove_next` are all moot (the
-/// socket is gone). Write-path returns are still rejected with a
-/// defined 500 outcome (Phase 2b-ii read-only restriction, same as
-/// `resumeStream`).
+/// (FIN/RST observed) without our drain-then-close path firing —
+/// `cleanupResponses` notices the populated StreamChain on the
+/// entity and calls this before destroying it.
 ///
-/// Errors return `void` — we're called from `cleanupResponses` which
-/// is about to destroy the entity regardless; the worst case is the
-/// disconnect activation gets logged as 500 rather than skipped. The
-/// chain cell is NOT freed here — caller (`cleanupResponses`)
-/// invokes `freeStreamCell` after we return.
+/// Handler-cmds Phase 8 TEA-framing:
+///   - **Msg**:   `(client-disconnect, entity in response_out with
+///                non-empty StreamChain.module_path)`.
+///   - **prep**:  read ChainContext + StreamChain; resolveDeployment;
+///                build request body = `{ctx}` with `.disconnect`
+///                activation.
+///   - **run**:   `dispatcher.runOutcome` (the writes commit
+///                asynchronously via `proposeForgetfulWrites` since
+///                there's no entity awaiting commit — Phase 4c).
+///   - **apply (Cmd-list)**: outcome IS moot (socket gone) — we
+///                deinit whatever variant the handler returned and
+///                record the outcome on the tape with the
+///                appropriate status. Writes that fire commit; the
+///                customer's cleanup observable effects (`_send/owed/`,
+///                kv writes, kv-wakes) materialize for other
+///                observers.
+///
+/// Errors return `void` — caller (`cleanupResponses`) is about to
+/// destroy the entity regardless; the worst case is the disconnect
+/// activation gets logged as 500 rather than skipped. Stream
+/// components on the entity deinit structurally when destroy fires
+/// (no manual cleanup site needed since Phase 7).
 fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     const allocator = worker.allocator;
     // Handler-cmds Phase 3: reads come from the entity's components
@@ -4461,33 +4506,15 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .{ chain_ctx.tenant_id, chain_ctx.correlation_id orelse "(none)", chain_st.activation_count },
     );
 
-    const slot = worker.node.tenant_files_map.get(chain_ctx.tenant_id) orelse {
-        std.log.warn("rove-js stream-disconnect: tenant={s} no slot; skipping activation", .{chain_ctx.tenant_id});
-        return;
-    };
-    const snap = slot.pinCurrent() orelse {
-        std.log.warn("rove-js stream-disconnect: tenant={s} no deployment; skipping activation", .{chain_ctx.tenant_id});
-        return;
-    };
-    const tc = TenantFiles{ .slot = slot, .snap = snap };
-    defer tc.release();
-    const inst_opt = worker.node.tenant.getInstance(chain_ctx.tenant_id) catch {
-        std.log.warn("rove-js stream-disconnect: tenant={s} getInstance failed; skipping activation", .{chain_ctx.tenant_id});
-        return;
-    };
-    const inst = inst_opt orelse return;
-
     const path = chain_st.module_path;
-    const bc = blk: {
-        if (tc.snap.bytecodes.get(path)) |b| break :blk b;
-        const mjs = std.fmt.allocPrint(allocator, "{s}.mjs", .{path}) catch return;
-        defer allocator.free(mjs);
-        if (tc.snap.bytecodes.get(mjs)) |b| break :blk b;
-        const js = std.fmt.allocPrint(allocator, "{s}.js", .{path}) catch return;
-        defer allocator.free(js);
-        if (tc.snap.bytecodes.get(js)) |b| break :blk b;
+    var dep = resolveDeployment(worker, allocator, chain_ctx.tenant_id, path) catch |err| {
+        std.log.warn("rove-js stream-disconnect: tenant={s} resolveDeployment failed: {s}; skipping activation", .{ chain_ctx.tenant_id, @errorName(err) });
         return;
     };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
 
     const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
     defer allocator.free(body);
