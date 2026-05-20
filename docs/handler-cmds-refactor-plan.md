@@ -1,5 +1,16 @@
 # Streaming-handlers structural refactor — kill the side tables
 
+> **Status: DONE 2026-05-20.** Phases 1–8 shipped across 12 commits
+> on `streaming-handlers-foundation` (`f231a8e` → `6c3f60a`). All
+> three entity-keyed side stores are gone (`parked_meta` /
+> `parked_streams_meta` / `pending_stream_meta`); state lives on the
+> entity's components (`ChainContext` / `ContDescriptor` /
+> `StreamChain` / `StreamChunks` / `StreamWakes` / `StreamDraining`);
+> manual cleanup sites are replaced by structural deinit via rove
+> `Collection.deinit`; `raft_pending` is split into three siblings
+> per commit destination. Final outcome notes below the original
+> plan (§Outcome).
+>
 > **Supersedes the earlier "Terminal type" draft of this doc (commit
 > sibling).** That plan unified three entity-keyed `AutoHashMap`
 > side stores (`parked_meta` / `parked_streams_meta` /
@@ -428,3 +439,115 @@ manual `freeStreamCell` call, every `parked_meta.count() != 0`
 short-circuit, every `discardIfAny` helper exists because the
 data isn't living on the entity where it belongs. Fixing the
 shape eliminates the helpers categorically, not one at a time.
+
+---
+
+## Outcome (post-completion notes — 2026-05-20)
+
+### What shipped
+
+Twelve commits on `streaming-handlers-foundation`:
+
+| Commit | Phase | Net LOC | What |
+|---|---|---|---|
+| `f231a8e` | 1 | +696 | Components defined + Row extension |
+| `fedeaa7` | 2a | +47 −11 | `sweepParkedContinuations` reads `ContDescriptor` |
+| `522f7bc` | 2b | +111 −18 | Cont state mirrored on components |
+| `4ee4b6a` | 2c | +51 −25 | Resume engines read components |
+| `5d67603` | 2d | +13 −11 | `drainRaftPending` dispatch reads ContDescriptor |
+| `f639750` | 3 | +310 −91 | Stream state on 4 components |
+| `40bbd0c` | 4 | +38 −46 | Stream components set at record time |
+| `9422dce` | 5 | +330 −162 | `raft_pending` split into 3 siblings |
+| `ec3bf88` | 6 | +87 −67 | parked_streams_meta split into active/draining |
+| `0f8ccad` | 7a | +121 −277 | Delete `parked_meta` + `ParkedCont` |
+| `bd7ff34` | 7b+c | +180 −437 | Delete stream side tables + structs |
+| `6c3f60a` | 8 | +128 −101 | Extract `resolveDeployment` + TEA-framing docs |
+
+Cumulative diff: ~+2200 / −1500 = +700 LOC net (additive — the
+components + new structure exceed the side-table machinery they
+replaced; the value isn't LOC reduction, it's structural compliance).
+
+### Principle compliance
+
+- **Principle #2 (data lifetime through components, never side
+  tables)** — fully achieved. Three side stores gone; component
+  deinit handles cleanup via rove `Collection.deinit`. The four
+  manual cleanup sites (`cleanupResponses`, `drainRaftPending`
+  fault branches, `drainOnLeadershipLoss`, `Worker.destroy`)
+  no longer walk per-entity maps.
+
+- **Principle #1 (state is collection membership, never an
+  enum/bool flag)** — achieved for the cont+stream dispatch
+  discriminant (Phase 5's `raft_pending_*` sibling split). Mostly
+  achieved for the stream draining state (Phase 6+7 replaced
+  `cell.close_pending` with `StreamDraining.is_draining` — still a
+  bool, but on the entity, not in a side store).
+  - **Caveat:** the strictest reading of principle #1 would prefer
+    a sibling rove collection over `StreamDraining.is_draining`.
+    The architectural constraint blocking that: h2 owns the
+    `stream_data_out` collection (it watches its own collections
+    for chunk-shipping; it doesn't watch worker-owned ones), so
+    the entity can't be moved to a worker-side `stream_draining`
+    sibling without h2 surgery. The shift "side-table map
+    membership → component bool" is principle-neutral but removes
+    ~500 LOC of cleanup machinery, which is the real win.
+
+### Phase 8 reality vs plan
+
+The plan budgeted ~400 LOC consolidation for Phase 8 (collapse the
+three resume engines into one `runWakeActivation` with thin
+wrappers). After Phases 1–7 absorbed the side-table cruft, the
+remaining engine divergence is **intrinsic** — cont reparks +
+proposes + carries `bound_schedule_id` + has 6.4 deadlines; stream
+appends to component queues + marks draining; disconnect ignores
+output entirely. Forcing unification produces a 300-line function
+with conditional branches that obscure rather than clarify.
+
+Pragmatic Phase 8 (commit `6c3f60a`): extract `resolveDeployment`
+(the only block truly duplicated across all three) + add
+TEA-framing doc comments to each engine identifying the
+prep / run / apply phases. The framing makes the structural
+sameness visible without forcing collapses that hurt readability.
+
+### Handler-as-TEA-update framing
+
+The eventual conceptual win that motivated this refactor: a
+handler is `update : (Msg, Ctx) → (Effects, Cmd Msg)`. The Msg is
+the activation (inbound request / `send_callback` / timer /
+kv-wake / disconnect); the Cmd Msg is the return value
+(`Response` | `__rove_next` | `__rove_stream`); the Effects are
+the writeset accumulated via `kv.set` + `http.send` calls during
+the run. Each resume engine has the same prep / run / apply shape
+in its docstring now (see `src/js/worker.zig`'s
+`resumeContinuation` / `resumeStream` / `fireDisconnectActivation`
+TEA-framing blocks).
+
+The runtime IS the Elm runtime: it ferries Msgs to the handler,
+applies Effects (writeset + raft), routes the Cmd to the next
+state (response_in / parked_continuations / stream pipeline / no
+state for disconnect). The principle-#2 fix (data on components,
+not side tables) is what makes "the entity carries its own
+state" the literal architecture — the conceptual framing maps
+1:1 to the entity-component model now.
+
+### Files of record
+
+- `src/js/components.zig` — the six component types
+  (`ChainContext`, `ContDescriptor`, `StreamChain`,
+  `StreamChunks`, `StreamWakes`, `StreamDraining`, plus the
+  `PendingKvWake` sub-component) with their structural deinits.
+- `src/js/worker.zig` — the three resume engines, the three
+  `raft_pending_*` drain helpers (`drainResponsePending` /
+  `drainContPending` / `drainStreamPending`), `resolveDeployment`,
+  `setStreamComponents`, `markStreamDraining`.
+- `src/js/worker_dispatch.zig` — `contParkIfAny` /
+  `contRecordIfAny` / `streamParkIfAny` / `streamRecordIfAnyAt`
+  (each now ~30 LOC, no side-table writes).
+
+### Smokes
+
+All 7 streaming smokes + heldsync_smoke gated every phase. Plus
+ctl_smoke + penalty_smoke + files_server_smoke at the end.
+`leader_failover_smoke` fails identically on this branch and on
+the pre-refactor commit — pre-existing curl-call flake unrelated
+to this work.

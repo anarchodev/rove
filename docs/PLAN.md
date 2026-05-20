@@ -1871,6 +1871,20 @@ Curated `@rove`-style libraries for higher-level recipes (also JS, also embedded
 
 Composition shape: customer's OAuth start handler is `return oauth.fromConfig("google").startLogin({ return_to: "/" })` (3 lines), the callback is `return oauth.fromConfig("google").handleCallback()` (3 lines). The handlers run pure-functional; the library mints state into kv + builds a redirect; the platform's `http.send` does the token exchange via callback.
 
+#### A handler is `update : (Msg, Ctx) → (Effects, Cmd Msg)`
+
+The handler model maps to The Elm Architecture's `update` 1:1. The **Msg** is the activation that triggered this hop — an inbound request, a `send_callback` outcome (an `http.send` completed), a timer tick on a held stream, a kv-wake match on a `__rove_stream`'s watched prefix, or a client disconnect on a held socket. The **Ctx** is the chain-level state threaded across activations — the customer's `ctx` JSON from the parent return, the chain's `correlation_id`, the bound deployment. The handler reads kv + Ctx + Msg, writes via `kv.set` / `http.send` (the **Effects** — accumulated into the writeset and the `_send/owed/` arms), and **returns** one of three values:
+
+- **`Response`** — `Cmd.terminate(response)`. Flush the response to the held socket (or fresh stream), end the chain.
+- **`__rove_next(...)`** — `Cmd.continuation(next-Msg-source)`. One-shot resume: the runtime invokes `path` with `{ctx, outcome}` once the bound condition fires (an `http.send` completes by default, or the §6.4 deadline expires).
+- **`__rove_stream(...)`** — `Cmd.stream(initial-chunks, wake-conditions)`. Iterative chain: ship `write` chunks, park awaiting `waitFor`, re-enter the handler on each wake.
+
+The runtime IS the Elm runtime. It ferries Msgs to the handler, applies Effects (writeset → raft → kv + `_send/owed/` arms; broadcast kv-write events match registered prefixes on held streams), routes the Cmd to the next state (`response_in` / `parked_continuations` / `stream_*` pipeline / structural cleanup for disconnect). The dispatch surface is *one* function — `Dispatcher.runOutcome` — re-entered for every activation across cont chains, stream chains, and disconnect activations.
+
+The principle-#2 fix that landed in the handler-cmds refactor (2026-05-20, `docs/handler-cmds-refactor-plan.md`) is what makes "the entity carries its own state" the literal architecture: the cont's `Continuation` + `bound_schedule_id` + `deadline_ns` live on a `ContDescriptor` component on the entity; the stream's chain identity + chunks + wakes live on `ChainContext` + `StreamChain` + `StreamChunks` + `StreamWakes`; rove's `Collection.deinit` invokes each component's `deinit` on entity destroy. The handler-as-`update` framing maps 1:1 to the entity-component model — no side stores, no manual cleanup per Msg type.
+
+The Cmd-shape return is the single customer-visible API that determines all the runtime's downstream behavior. Customer code never sees the chain-level state on the entity, never calls a "park me" function, never registers a wake — the return value IS the registration.
+
 ### 13.4 Deploy-time `_config/*` mirror
 
 Shipped 2026-05-09 (commits `3179996`, `5fdb210`). At deploy release-time, the worker walks the new manifest for entries matching `_config/{...}.json`, fetches each blob, and stages writes to `_config/{path-without-.json}` in the customer's app.db inside the same TrackedTxn that flips `_deploy/current`. Stale `_config/*` rows present in kv but absent from the new manifest are staged for delete — the file tree is the authoritative source. Customers cannot write `_config/*` from handlers (the prefix is reserved); handlers read via `kv.get("_config/...")`. Per-file cap 64 KB; total bounded by the existing per-instance handler-source cap.

@@ -146,6 +146,59 @@ wait for it before writing the next chunk"), then `__rove_stream` again,
 then a terminal `Response`. The chain carries one held socket through
 the whole sequence.
 
+### 3.4 The Cmd-shaped return value (framing)
+
+The three return shapes ARE the customer's Cmd vocabulary. The
+handler is `update : (Msg, Ctx) → (Effects, Cmd Msg)` (the Elm
+Architecture's central type), where:
+
+- **Msg** = the activation. Five variants today:
+  `.inbound_request`, `.send_callback`, `.timer`, `.kv_wake`,
+  `.disconnect`. Each carries the relevant payload (request body,
+  http.send outcome, the matched kv key, etc.).
+- **Ctx** = the chain-level state threaded across activations.
+  Customer-visible: their `ctx` JSON from the parent return,
+  `request.correlation_id`, the activation-specific
+  `request.activation` payload. Runtime-internal but customer-
+  observable through replay: the `bound_schedule_id`, the
+  deployment, the cell's lifecycle.
+- **Effects** = the writeset accumulated via `kv.set` (committed
+  through raft for write batches; immediate for read-only chains)
+  + the `_send/owed/` arms for `http.send` (commit-gated;
+  schedule-server fires after the txn lands).
+- **Cmd Msg** = the **return value**:
+  - **`Response`** — `Cmd.terminate(response)`. Flush + close.
+  - **`__rove_next(...)`** — `Cmd.continuation(next-Msg-source)`.
+    The bound condition (default: the `http.send` this hop fired;
+    or `waitFor: send.byId(...)` / explicit) IS the next Msg's
+    source. One activation will fire when the condition is met.
+  - **`__rove_stream(...)`** — `Cmd.stream(initial chunks, wake
+    conditions)`. The `write` chunks ship now; the `waitFor` list
+    enumerates the wake sources that will produce subsequent
+    Msgs. Each wake → one re-entry of the handler.
+
+The runtime IS the Elm runtime. It pumps Msgs through, applies the
+Effects (kv + raft + http.send), and routes the Cmd to its
+downstream state (response/cont-park/stream-park/disconnect-cleanup).
+
+**Why this framing matters here.** It explains the §4 wake-source
+proliferation without ad-hoc-ery: each wake source is "another
+Msg variant the runtime can deliver." Adding a new one (e.g., a
+SSE-from-upstream subscription) is structural — define the Msg
+shape, define how the runtime detects the trigger, route to the
+handler — not a new return-value variant. Adding a new return
+shape (which we don't anticipate) would be a new Cmd — those are
+the customer-facing surface and are deliberately capped at three.
+
+The handler-cmds structural refactor (`docs/handler-cmds-refactor-plan.md`,
+shipped 2026-05-20) made this framing the literal architecture:
+chain-level state lives on the entity's components (no side
+tables), the entity's collection IS the dispatch state (no enum
+flags), and the runtime's three resume engines (`resumeContinuation`
+/ `resumeStream` / `fireDisconnectActivation`) each have the same
+prep / run / apply phases — they differ only in how they apply the
+Cmd, which is intrinsic to the activation type.
+
 ---
 
 ## 4. Wake sources
