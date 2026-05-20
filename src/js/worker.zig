@@ -3166,15 +3166,170 @@ fn resolveParked(
     };
 }
 
-/// The trampoline resume engine (connection-actor 3b-iii). Given an
-/// outcome for a parked stream, re-enter the SAME dispatch path a
-/// request takes (a continuation IS a request) with body = ctx +
-/// outcome, then: terminal → flush to the held socket (resolve);
-/// continuation → re-park (only if `allow_repark`). 3b-iii scope is
-/// **read-only resume hops** — a hop that wrote kv is rejected (its
-/// raft-gated socket resolve is the documented write-resume
-/// follow-on). The deadline trigger passes `allow_repark = false`
-/// (the §6.4 mandatory timeout must terminate, not extend).
+/// Phase 4: post-handler-write path for a continuation-resume hop.
+/// Takes ownership of `txn` (heap-allocated by the caller); on
+/// success the txn is parked on `pending_txns[seq]` for
+/// `drainRaftPending` to commit; on failure the helper rolls it
+/// back, destroys it, and frees `meta` so the caller can degrade
+/// to a defined 500.
+///
+/// The post-commit move depends on `next`:
+///   • `.terminal` — `parked_meta` is freed, h2 response components
+///     are stamped on the entity, RaftWait is set, entity moves to
+///     `raft_pending`. `drainRaftPending` commits → `response_in`
+///     (the normal flush path, since parked_meta is gone).
+///   • `.repark` — `parked_meta` is UPDATED with the new
+///     continuation + bound_schedule_id; RaftWait is set; entity
+///     moves to `raft_pending`. `drainRaftPending` commits → sees
+///     parked_meta → moves back to `parked_continuations` (the new
+///     park, waiting for the new send / deadline).
+///
+/// Also parks the send / kv-wake commit gates (parkSendOps +
+/// parkKvWakes) on the same seq so any `_send/owed/*` arm /
+/// `_send/proof/*` resolve and any §4.6 wake fan-outs fire
+/// AFTER commit, alongside the entity's state transition.
+const ContResumeNext = union(enum) {
+    /// Terminal flush. `body` is allocator-owned; ownership
+    /// transferred into the entity's RespBody on success.
+    terminal: struct { status: u16, body: []u8 },
+    /// Re-park with a new continuation. `new_cont` is owned
+    /// (transferred into parked_meta). `new_bound_sched_id` is
+    /// allocator-owned if non-null (the lone `_send/owed/{id}`
+    /// this hop wrote — same §6.4 inferred-bind rule as the
+    /// inbound trampoline open hop).
+    repark: struct {
+        new_cont: Continuation,
+        new_bound_sched_id: ?[]u8,
+    },
+};
+
+fn proposeAndParkContResume(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    writeset: *const kv_mod.WriteSet,
+    txn: *kv_mod.KvStore.TrackedTxn,
+    tenant_id: []const u8,
+    next: ContResumeNext,
+) !void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+
+    // Release the dispatch lease BEFORE proposing — same posture as
+    // worker_dispatch.zig's write path. The chain orders commits;
+    // the next per-tenant batch's open lease isn't blocked on raft
+    // here.
+    txn.releaseLease();
+
+    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id) catch |err| {
+        // On propose failure: rollback txn, destroy it (caller's
+        // ownership is implicit — we promised to consume it on
+        // success OR free it on failure), free meta, free any owned
+        // resources in `next`. Caller's catch path handles the 500
+        // flush + log.
+        txn.rollback() catch {};
+        allocator.destroy(txn);
+        if (worker.parked_meta.fetchRemove(ent)) |kvp| {
+            var pc = kvp.value;
+            pc.deinit(allocator);
+        }
+        // Free `next`-owned resources so the caller doesn't double-
+        // free in its catch path.
+        switch (next) {
+            .terminal => {}, // caller still owns `body`; caller's catch frees.
+            .repark => |*r| {
+                if (r.new_bound_sched_id) |b| allocator.free(b);
+                var c = r.new_cont;
+                c.deinit(allocator);
+            },
+        }
+        return err;
+    };
+    // Propose accepted. From here we own the parked-side
+    // bookkeeping; if it fails the chain is in a half-state we can't
+    // gracefully roll back (the raft entry is committed-pending).
+    try worker.pending_txns.put(allocator, seq, txn);
+    // parkSendOps + parkKvWakes ride the same seq so the wakes /
+    // arm-resolve fire AFTER commit. Best-effort: log and continue
+    // if parking fails — same posture as the inbound write path.
+    parkSendOps(worker, seq, tenant_id, writeset) catch |perr|
+        std.log.warn("rove-js cont-resume parkSendOps (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
+    parkKvWakes(worker, seq, tenant_id, writeset) catch |perr|
+        std.log.warn("rove-js cont-resume parkKvWakes (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
+
+    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() +
+        @as(i128, @intCast(worker.commit_wait_timeout_ns)));
+
+    switch (next) {
+        .terminal => |t| {
+            // Free the cont meta so drainRaftPending routes to
+            // response_in (normal flush) at commit.
+            if (worker.parked_meta.fetchRemove(ent)) |kvp| {
+                var pc = kvp.value;
+                pc.deinit(allocator);
+            }
+            // Stamp the response components on the entity while
+            // it's still in `parked_continuations` — `reg.set`
+            // works against the entity's current collection. Body
+            // ownership transfers in (we won't free `t.body`).
+            try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = t.status });
+            try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, .{ .fields = null, .count = 0 });
+            try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = t.body.ptr, .len = @intCast(t.body.len) });
+            try server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
+            try server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid);
+            try server.reg.set(ent, &worker.parked_continuations, h2.Session, sess);
+            try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
+                .seq = seq,
+                .deadline_ns = deadline_ns,
+            });
+            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending);
+        },
+        .repark => |r| {
+            // Update parked_meta in place: replace cont + refresh
+            // bound_schedule_id + deadline. drainRaftPending sees
+            // the updated entry at commit and routes back to
+            // parked_continuations.
+            const meta = worker.parked_meta.getPtr(ent) orelse {
+                // Shouldn't happen — the resume was driven from a
+                // parked entity. If it did, surface loud.
+                var c = r.new_cont;
+                c.deinit(allocator);
+                if (r.new_bound_sched_id) |b| allocator.free(b);
+                return error.ResumeMetaMissing;
+            };
+            meta.cont.deinit(allocator);
+            meta.cont = r.new_cont;
+            if (meta.bound_schedule_id) |old_b| allocator.free(old_b);
+            meta.bound_schedule_id = r.new_bound_sched_id;
+            // §6.4 mandatory-timeout refresh: each new hop gets the
+            // standard hold deadline, identical to the inbound
+            // trampoline open hop's parking.
+            meta.deadline_ns = @as(i64, @intCast(std.time.nanoTimestamp())) + CONT_HOLD_DEADLINE_NS;
+            try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
+                .seq = seq,
+                .deadline_ns = deadline_ns,
+            });
+            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending);
+        },
+    }
+}
+
+/// The trampoline resume engine (connection-actor 3b-iii post-Phase-4).
+/// Given an outcome for a parked stream, re-enter the SAME dispatch
+/// path a request takes (a continuation IS a request) with body =
+/// ctx + outcome, then:
+///   • terminal + no writes → flush to the held socket immediately.
+///   • terminal + writes → propose, park on raft_pending, flush on
+///     commit (`proposeAndParkContResume(.terminal)`).
+///   • continuation + no writes → re-park (only if `allow_repark`);
+///     speculative commit is durable enough — no raft hop.
+///   • continuation + writes (allow_repark) → propose, park on
+///     raft_pending; drainRaftPending re-parks on commit
+///     (`proposeAndParkContResume(.repark)` — recipe-1 real-retry).
+///   • continuation + !allow_repark → defined 504 (deadline).
+///   • stream → defined 501 (`cont → stream` is a later phase).
+/// The deadline trigger passes `allow_repark = false`.
 /// `error.Resume*` → caller falls back to a hard 504.
 fn resumeContinuation(
     worker: anytype,
@@ -3218,7 +3373,13 @@ fn resumeContinuation(
     const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
     defer allocator.free(spath);
 
-    var txn = inst.kv.beginTrackedImmediate() catch return error.ResumeTxn;
+    // Heap-allocate the txn so its pointer can be parked on
+    // `pending_txns[seq]` if this hop wrote (Phase 4). Same stable-
+    // address pattern the inbound dispatch path uses.
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return error.ResumeTxnAlloc;
+    var txn_owned = true; // we destroy unless ownership transfers to pending_txns
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return error.ResumeTxn;
     var txn_done = false;
     defer if (!txn_done) txn.rollback() catch {};
 
@@ -3257,7 +3418,7 @@ fn resumeContinuation(
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     var oc = worker.dispatcher.runOutcome(
         inst.kv,
-        &txn,
+        txn,
         &ws,
         bc,
         &tc.snap.bytecodes,
@@ -3278,13 +3439,9 @@ fn resumeContinuation(
         .terminal => |*r| {
             defer r.deinit(allocator);
             // A thrown resume hop is an EXPECTED condition (author
-            // error, or use of an effectful primitive a read-only
-            // resume hop doesn't support — e.g. `http.send`, which
-            // throws "dispatcher did not allocate pending_schedules"
-            // since resume hops are effect-free in 3b-iii's scope).
-            // It must be a defined 5xx, never a flushed 200-empty
-            // (that masked the recipe-1 effectful-resume gap)
-            // — feedback_infallibility_violations.
+            // error). It must be a defined 5xx, never a flushed
+            // 200-empty (that masked the recipe-1 effectful-resume
+            // gap) — feedback_infallibility_violations.
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;
@@ -3300,13 +3457,53 @@ fn resumeContinuation(
                 return;
             }
             if (wrote) {
-                txn.rollback() catch {};
-                txn_done = true;
-                try resolveParked(worker, ent, sid, sess, 500, "continuation kv writes not yet supported (3b-iii read-only)\n");
-                captureLogWithId(worker, meta.tenant_id, request_id, "POST", meta.cont.path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, r.console, r.exception, .{}, meta.correlation_id, .send_callback);
+                // Phase 4: terminal + writes — propose the writes
+                // through raft, park the entity on `raft_pending`
+                // with the response components staged on it, and
+                // drop the parked_meta entry so `drainRaftPending`
+                // routes the committed entity to `response_in`
+                // (normal flush path, not the repark).
+                const tenant_id = meta.tenant_id;
+                const corr_id = meta.correlation_id;
+                const dep_id = tc.snap.deployment_id;
+                const cont_path = meta.cont.path;
+                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+                const body_dup = try allocator.dupe(u8, r.body);
+                errdefer allocator.free(body_dup);
+                const console_owned = r.console;
+                const exception_owned = r.exception;
                 r.console = &.{};
                 r.exception = &.{};
-                freeContMeta(worker, ent);
+                proposeAndParkContResume(
+                    worker,
+                    ent,
+                    sid,
+                    sess,
+                    &ws,
+                    txn,
+                    tenant_id,
+                    .{ .terminal = .{
+                        .status = st,
+                        .body = body_dup,
+                    } },
+                ) catch |perr| {
+                    // Propose-fail / pre-park alloc failure: degrade
+                    // to a 500 over the held socket. The txn was
+                    // rolled back + destroyed inside the helper;
+                    // meta was freed.
+                    std.log.warn("rove-js cont-resume: propose failed: {s}", .{@errorName(perr)});
+                    allocator.free(body_dup);
+                    txn_owned = false; // helper destroyed it
+                    txn_done = true;
+                    resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, .send_callback);
+                    return;
+                };
+                // proposeAndParkContResume took ownership of txn (moved
+                // into pending_txns) and body_dup (stamped onto entity).
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, .send_callback);
                 return;
             }
             // Clean read-only commit cannot fault (mirrors
@@ -3326,17 +3523,75 @@ fn resumeContinuation(
         },
         .continuation => |c2| {
             var c2m = c2;
-            if (!allow_repark or wrote) {
+            if (!allow_repark) {
+                // Deadline path: §6.4 mandatory timeout must
+                // terminate, not extend. Reject any new cont with
+                // a defined 504 over the held socket.
                 c2m.deinit(allocator);
                 txn.rollback() catch {};
                 txn_done = true;
-                const code: u16 = if (!allow_repark) 504 else 500;
-                const msg = if (!allow_repark)
-                    "hold deadline exceeded\n"
-                else
-                    "continuation kv writes not yet supported (3b-iii read-only)\n";
-                try resolveParked(worker, ent, sid, sess, code, msg);
+                try resolveParked(worker, ent, sid, sess, 504, "hold deadline exceeded\n");
                 freeContMeta(worker, ent);
+                return;
+            }
+            if (wrote) {
+                // Phase 4: continuation + writes — propose, park
+                // on raft_pending, and on commit `drainRaftPending`
+                // sees the (updated) parked_meta entry and re-parks
+                // by moving to `parked_continuations`.  The new
+                // bound_schedule_id (the lone `_send/owed/` this
+                // hop wrote, if exactly one) becomes the wake the
+                // next callback resolves on. Same fail-fast posture
+                // as the terminal+writes branch.
+                const tenant_id = meta.tenant_id;
+                const corr_id = meta.correlation_id;
+                const dep_id = tc.snap.deployment_id;
+                const cont_path = meta.cont.path;
+                // §6.4 binding for the repark: scan the writeset
+                // for the single _send/owed/{id} put. 0 / >1 → null
+                // (deadline-only resume).
+                const new_bound_sched_id: ?[]u8 = blk: {
+                    var only: ?[]const u8 = null;
+                    var nputs: usize = 0;
+                    for (ws.ops.items) |op| switch (op) {
+                        .put => |p| if (std.mem.startsWith(u8, p.key, send_outbox_mod.OWED_PREFIX)) {
+                            nputs += 1;
+                            only = p.key[send_outbox_mod.OWED_PREFIX.len..];
+                        },
+                        .delete => {},
+                    };
+                    if (nputs != 1) break :blk null;
+                    break :blk try allocator.dupe(u8, only.?);
+                };
+                proposeAndParkContResume(
+                    worker,
+                    ent,
+                    sid,
+                    sess,
+                    &ws,
+                    txn,
+                    tenant_id,
+                    .{ .repark = .{
+                        .new_cont = c2m,
+                        .new_bound_sched_id = new_bound_sched_id,
+                    } },
+                ) catch |perr| {
+                    // Helper rolled back + destroyed txn + freed
+                    // c2m + new_bound_sched_id + meta on failure;
+                    // we just log + degrade.
+                    std.log.warn("rove-js cont-resume (repark): propose failed: {s}", .{@errorName(perr)});
+                    txn_owned = false;
+                    txn_done = true;
+                    resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, .send_callback);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                // Log the repark hop's tape row. status=0 (parked,
+                // same as the inbound trampoline open hop's
+                // captureSuccess shape).
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, .send_callback);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(

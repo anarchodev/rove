@@ -140,26 +140,20 @@ def main() -> int:
             sys.exit(f"FAIL failure-variant took {el:.1f}s — not the fast failure path")
         print(f"ok  failure outcome → handler-authored 502 in {el:.2f}s: '{r.body}'")
 
-        # 5. Effectful-resume-hop boundary. Recipe-1 ("compose retry
-        #    yourself") requires the resume hop to RE-ISSUE http.send +
-        #    re-park — an *effectful* resume hop. 3b-iii's scope is
-        #    explicitly read-only resume hops (it already 500s
-        #    kv-writes-in-resume); http.send-in-resume is the same
-        #    deferred class (the effectful-resume follow-on, sibling of
-        #    write-resume). The CONTRACT today is: that boundary is
-        #    DEFINED and SAFE — a clean 500, never the silent 200-empty
-        #    corruption this smoke caught (now fixed: a thrown resume
-        #    hop → 500, feedback_infallibility_violations). Assert the
-        #    safe boundary, not the deferred capability.
+        # 5. Recipe-1 real-retry — effectful resume hop. The resume
+        #    hop fires another http.send (to a working target) and
+        #    re-parks via `__rove_next`. Phase 4 of
+        #    docs/streaming-handlers-plan.md lifted the read-only-
+        #    resume restriction (formerly "3b-iii read-only"); the
+        #    pattern composes end-to-end:
+        #      1. Open hop fires to dead → resume with failure.
+        #      2. Resume fires to working target → repark.
+        #      3. Resume fires with success → terminal flush
+        #         carrying the working target's echo body.
         #
-        #    Option (b) cutover (5b): the old env-9 path wrapped this as
-        #    "continuation handler error"; the new path returns the
-        #    3b-iii read-only-resume guard's own message ("continuation
-        #    kv writes not yet supported (3b-iii read-only)") — a MORE
-        #    precise defined-500 for the same #9-deferred class. Same
-        #    contract (defined + safe, not silent corruption); the
-        #    assertion pins the defined-boundary signature, not the old
-        #    wrapper string (the old path is deleted in 5b-2).
+        #    The new contract: status=200, body echoes the retry
+        #    target's response. Pre-Phase-4 this was a defined 500
+        #    ("3b-iii read-only") — that boundary is gone.
         t0 = time.monotonic()
         r = curl(
             cc, f"{acme_origin}/heldsync",
@@ -169,17 +163,17 @@ def main() -> int:
             timeout=30.0,
         )
         el = time.monotonic() - t0
-        if r.status != 500 or "3b-iii read-only" not in r.body:
+        if r.status != 200 or r.body != "heldsync:vr:echoed:vr":
             sys.exit(
-                f"FAIL effectful-resume boundary status={r.status} body={r.body!r} "
-                f"({el:.1f}s) — expected the defined 3b-iii read-only-resume "
-                f"500 boundary, not silent corruption / undefined error"
+                f"FAIL recipe-1 real-retry status={r.status} body={r.body!r} "
+                f"({el:.1f}s) — Phase 4 should chain dead→retry_to and flush "
+                f"'heldsync:vr:echoed:vr' from the working target"
             )
         if el >= 15.0:
-            sys.exit(f"FAIL effectful-resume boundary took {el:.1f}s — not the fast path")
+            sys.exit(f"FAIL recipe-1 real-retry took {el:.1f}s — not the fast path")
         print(
-            f"ok  effectful-resume-hop boundary: defined 500 (not 200-empty) "
-            f"in {el:.2f}s — recipe-1 real-retry is the deferred effectful-resume follow-on"
+            f"ok  recipe-1 real-retry: chained dead→retry_to, terminal 200 in "
+            f"{el:.2f}s — body='{r.body}' (Phase 4 effectful-resume lift live)"
         )
 
         print()
