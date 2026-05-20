@@ -137,6 +137,43 @@ def main() -> int:
             sys.exit(f"FAIL post-disconnect ping status={r.status}")
         print(f"ok  worker still serves after disconnect (cell cleanup ran; ping={r.status})")
 
+        # The §4.4 disconnect activation runs in `cleanupResponses`
+        # when h2's `serverStreamClose` routes the entity to
+        # `response_out` without our `close_pending` path firing.
+        # `fireDisconnectActivation` logs the tenant + correlation
+        # at info level on entry — tail every worker's stderr for
+        # that line. We loop because the cleanup tick after the
+        # disconnect may not have flushed by the time the post-
+        # disconnect ping completed.
+        needle = "rove-js stream-disconnect: tenant=acme"
+        seen = False
+        deadline = time.monotonic() + 3.0
+        log_dir = c.log_dir
+        log_paths = list(log_dir.glob(f"{c.tag}-worker-*.out"))
+        while time.monotonic() < deadline and not seen:
+            for lp in log_paths:
+                try:
+                    if needle in lp.read_text(errors="replace"):
+                        seen = True
+                        break
+                except FileNotFoundError:
+                    continue
+            if not seen:
+                time.sleep(0.05)
+        if not seen:
+            for lp in log_paths:
+                try:
+                    contents = lp.read_text(errors="replace")
+                except FileNotFoundError:
+                    continue
+                tail = "\n".join(contents.splitlines()[-40:])
+                sys.stderr.write(f"--- tail {lp} ---\n{tail}\n")
+            sys.exit(
+                f"FAIL §4.4 disconnect activation never logged "
+                f"({needle!r} not in any worker stderr within 3s)"
+            )
+        print("ok  §4.4 disconnect activation fired (cleanup hook ran)")
+
         print()
         print("streaming-handlers Phase 2b-ii heartbeat smoke passed "
               "(chunked DATA frames + timer-wake re-activation + cell cleanup)")

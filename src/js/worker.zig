@@ -3628,6 +3628,170 @@ fn resumeStream(
     }
 }
 
+/// Streaming-handlers-plan §4.4: client disconnect on a held stream.
+/// h2's `serverStreamClose` routed the entity to `response_out`
+/// (FIN/RST observed) without our `close_pending` path firing —
+/// `cleanupResponses` notices the orphaned chain cell and calls this
+/// before destroying the entity. Runs the handler one last time with
+/// `activation_source = .disconnect` so the customer can do cleanup
+/// (release resources, log a "session ended" event). The handler's
+/// return is recorded on the tape but no bytes reach the wire —
+/// `Response` / `__rove_stream` / `__rove_next` are all moot (the
+/// socket is gone). Write-path returns are still rejected with a
+/// defined 500 outcome (Phase 2b-ii read-only restriction, same as
+/// `resumeStream`).
+///
+/// Errors return `void` — we're called from `cleanupResponses` which
+/// is about to destroy the entity regardless; the worst case is the
+/// disconnect activation gets logged as 500 rather than skipped. The
+/// chain cell is NOT freed here — caller (`cleanupResponses`)
+/// invokes `freeStreamCell` after we return.
+fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
+    const allocator = worker.allocator;
+    const cell = worker.parked_streams_meta.getPtr(ent) orelse return;
+    std.log.info(
+        "rove-js stream-disconnect: tenant={s} corr={s} activations={d}",
+        .{ cell.tenant_id, cell.correlation_id orelse "(none)", cell.activation_count },
+    );
+
+    const slot = worker.node.tenant_files_map.get(cell.tenant_id) orelse {
+        std.log.warn("rove-js stream-disconnect: tenant={s} no slot; skipping activation", .{cell.tenant_id});
+        return;
+    };
+    const snap = slot.pinCurrent() orelse {
+        std.log.warn("rove-js stream-disconnect: tenant={s} no deployment; skipping activation", .{cell.tenant_id});
+        return;
+    };
+    const tc = TenantFiles{ .slot = slot, .snap = snap };
+    defer tc.release();
+    const inst_opt = worker.node.tenant.getInstance(cell.tenant_id) catch {
+        std.log.warn("rove-js stream-disconnect: tenant={s} getInstance failed; skipping activation", .{cell.tenant_id});
+        return;
+    };
+    const inst = inst_opt orelse return;
+
+    const path = cell.module_path;
+    const bc = blk: {
+        if (tc.snap.bytecodes.get(path)) |b| break :blk b;
+        const mjs = std.fmt.allocPrint(allocator, "{s}.mjs", .{path}) catch return;
+        defer allocator.free(mjs);
+        if (tc.snap.bytecodes.get(mjs)) |b| break :blk b;
+        const js = std.fmt.allocPrint(allocator, "{s}.js", .{path}) catch return;
+        defer allocator.free(js);
+        if (tc.snap.bytecodes.get(js)) |b| break :blk b;
+        return;
+    };
+
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{cell.ctx_json}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
+    defer allocator.free(spath);
+
+    var txn = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    var tapes = RequestTapes.init(allocator);
+    defer tapes.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .kv_tape = &tapes.kv,
+        .date_tape = &tapes.date,
+        .math_random_tape = &tapes.math_random,
+        .crypto_random_tape = &tapes.crypto_random,
+        .module_tape = &tapes.module,
+        .prng_seed = @bitCast(now_ns),
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = cell.correlation_id,
+        .activation_source = .disconnect,
+    };
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        &txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        request,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    var oc = run_oc;
+    // The handler's return shape is moot — the socket is closed.
+    // We deinit whatever it produced, then record the outcome on
+    // the tape with the appropriate status.
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0 or wrote) {
+                txn.rollback() catch {};
+                txn_done = true;
+                const outcome: log_mod.Outcome = if (r.exception.len > 0) .handler_error else .kv_error;
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, outcome, r.console, r.exception, .{}, cell.correlation_id, .disconnect);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireDisconnectActivation.commit(terminal)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, cell.correlation_id, .disconnect);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            // `__rove_next` from a disconnect hop is futile (no
+            // socket to hold). Log loud, treat as terminal — same
+            // posture as `__rove_stream` below.
+            cval.deinit(allocator);
+            txn.rollback() catch {};
+            txn_done = true;
+            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+        },
+        .stream => |*s2| {
+            s2.deinit(allocator);
+            if (wrote) {
+                txn.rollback() catch {};
+                txn_done = true;
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireDisconnectActivation.commit(stream)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .disconnect);
+        },
+    }
+}
+
 /// Fire a committed parked unit's buffered SSE emits. No-op (caller
 /// still discards the buffer) when the worker isn't wired for SSE.
 /// Mirrors `tenant_batch`'s emit-fire wiring, but gated on commit
@@ -3784,15 +3948,22 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
 /// flushing them to the wire). Same pattern as the echo example's
 /// `cleanupResponses`.
 ///
-/// Phase 2b-ii: also free any orphaned streaming-chain cell whose
-/// entity landed here without the normal close path (e.g. client
-/// disconnect routed through `onStreamCloseCb` → `serverStreamClose`,
-/// which bypasses our `serviceParkedStreams` close-pending sweep).
+/// Phase 2b-ii: also reap streaming-chain state. An entity in
+/// `response_out` that still has a `parked_streams_meta` entry is a
+/// **client-disconnect** — h2's `serverStreamClose` routed it here
+/// without our `close_pending` path firing (which would have freed
+/// the cell in `serviceParkedStreams`). Fire one last handler
+/// activation (§4.4 `activation: { kind: "disconnect" }`) so the
+/// customer's cleanup runs, then free the cell, then destroy the
+/// entity.
 pub fn cleanupResponses(worker: anytype) !void {
     const server = worker.h2;
     const entities = server.response_out.entitySlice();
     for (entities) |ent| {
-        if (worker.parked_streams_meta.count() != 0) freeStreamCell(worker, ent);
+        if (worker.parked_streams_meta.count() != 0 and worker.parked_streams_meta.contains(ent)) {
+            fireDisconnectActivation(worker, ent);
+            freeStreamCell(worker, ent);
+        }
         try server.reg.destroy(ent);
     }
 }

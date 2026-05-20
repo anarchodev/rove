@@ -63,6 +63,15 @@ pub const ActivationSource = enum(u8) {
     /// fires this when its `intervalMs` (or absMs) reaches the
     /// sweep's check.
     timer = 2,
+    /// Client disconnect on a held stream (streaming-handlers-plan
+    /// §4.4). Implicit on every parked chain — h2 detects FIN/RST,
+    /// routes the entity to `response_out`, and `cleanupResponses`
+    /// fires one final handler run with this activation so the
+    /// customer can do cleanup (release resources, log a "session
+    /// ended" event, etc.). The handler's return is recorded on the
+    /// tape but no bytes reach the wire — the socket is already
+    /// gone.
+    disconnect = 3,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`

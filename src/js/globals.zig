@@ -1621,17 +1621,19 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, req_obj, "session", js_null);
     }
 
-    // request.activation = { kind: "inbound" | "send_callback" | "timer" }
+    // request.activation = { kind: "inbound" | "send_callback" |
+    //                              "timer"   | "disconnect" }
     // — streaming-handlers-plan §2: every handler run is a recorded
     // "request," and the activation source is one field on the
     // request shape the handler can branch on. v1 carries only the
-    // discriminant; the kv-wake / disconnect variants land in Phase 3
-    // with their data payloads.
+    // discriminant; the kv-wake variant lands in Phase 3 with its
+    // `{ key, op }` data payload.
     const activation_obj = c.JS_NewObject(ctx);
     const kind: []const u8 = switch (request.activation_source) {
         .inbound => "inbound",
         .send_callback => "send_callback",
         .timer => "timer",
+        .disconnect => "disconnect",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "activation", activation_obj);
