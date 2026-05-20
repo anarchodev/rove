@@ -263,18 +263,55 @@ fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator,
     errdefer if (bsid) |x| allocator.free(x);
     const corr: ?[]u8 = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
     errdefer if (corr) |x| allocator.free(x);
+
+    // Phase 2b dual-write: clone the cont + bsid + ChainContext
+    // slices BEFORE `parked_meta.put` takes ownership of the
+    // originals. Both the side table and the entity's components
+    // hold independent copies until Phase 7 drops the side table.
+    // The errdefer flag pattern handles the "reg.set already moved
+    // these into the component but a later op failed" window:
+    // once `component_owned_by_us` flips false, the entity's
+    // deinit on destroy/move handles cleanup.
+    var component_cont = try cont.clone(allocator);
+    errdefer { var c = component_cont; c.deinit(allocator); }
+    var component_bsid: ?[]u8 = if (s.cont_bound_sched_id) |b| try allocator.dupe(u8, b) else null;
+    errdefer if (component_bsid) |b| allocator.free(b);
+    var component_tid: []u8 = try allocator.dupe(u8, tenant_id);
+    errdefer allocator.free(component_tid);
+    var component_corr: ?[]u8 = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
+    errdefer if (component_corr) |c| allocator.free(c);
+    var component_owned_by_us = true;
+    errdefer if (!component_owned_by_us) {
+        // Once reg.set succeeded, the slices are owned by the
+        // entity's components; the above errdefers must NOT fire.
+        // Setting these to neutral values is the cleanest cancel:
+        // the dupe-free errdefers above all check the optional
+        // form, and clearing them prevents the double-free.
+        component_bsid = null;
+        component_corr = null;
+        component_cont = .{ .path = &.{}, .fn_name = null, .ctx_json = &.{} };
+        // component_tid (a slice) — set to empty so the
+        // `allocator.free(component_tid)` errdefer above no-ops.
+        component_tid = &.{};
+    };
+
     try worker.parked_meta.put(allocator, s.ent, .{ .cont = cont, .deadline_ns = s.cont_deadline_ns, .tenant_id = tid, .bound_schedule_id = bsid, .correlation_id = corr });
     s.cont = null; // ownership moved into parked_meta
-    // Phase 2a dual-write: deadline_ns onto the entity's
-    // ContDescriptor so `sweepParkedContinuations` can read it from
-    // the component instead of the side table. Set on request_out
-    // BEFORE the move — the merged_request_row carries
-    // ContDescriptor in both Rows, so the move propagates the
-    // value to the destination. Phase 2b will populate the cont +
-    // bound_schedule_id fields; Phase 2c will set ChainContext.
+
+    // Set components on the entity in request_out so the move
+    // propagates them to parked_continuations.
     try server.reg.set(s.ent, &server.request_out, components_mod.ContDescriptor, .{
+        .cont = component_cont,
         .deadline_ns = s.cont_deadline_ns,
+        .bound_schedule_id = component_bsid,
     });
+    try server.reg.set(s.ent, &server.request_out, components_mod.ChainContext, .{
+        .tenant_id = component_tid,
+        .correlation_id = component_corr,
+        .deployment_id = s.deployment_id,
+    });
+    component_owned_by_us = false; // entity now owns the clones via the components
+
     try server.reg.move(s.ent, &server.request_out, &worker.parked_continuations);
     return true;
 }
@@ -290,17 +327,44 @@ fn contRecordIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocato
     errdefer if (bsid) |x| allocator.free(x);
     const corr: ?[]u8 = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
     errdefer if (corr) |x| allocator.free(x);
+
+    // Phase 2b dual-write: same shape as contParkIfAny — clone
+    // up front, mirror onto the entity, side table keeps the
+    // originals.
+    var component_cont = try cont.clone(allocator);
+    errdefer { var c = component_cont; c.deinit(allocator); }
+    var component_bsid: ?[]u8 = if (s.cont_bound_sched_id) |b| try allocator.dupe(u8, b) else null;
+    errdefer if (component_bsid) |b| allocator.free(b);
+    var component_tid: []u8 = try allocator.dupe(u8, tenant_id);
+    errdefer allocator.free(component_tid);
+    var component_corr: ?[]u8 = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
+    errdefer if (component_corr) |c| allocator.free(c);
+    var component_owned_by_us = true;
+    errdefer if (!component_owned_by_us) {
+        component_bsid = null;
+        component_corr = null;
+        component_cont = .{ .path = &.{}, .fn_name = null, .ctx_json = &.{} };
+        component_tid = &.{};
+    };
+
     try worker.parked_meta.put(allocator, s.ent, .{ .cont = cont, .deadline_ns = s.cont_deadline_ns, .tenant_id = tid, .bound_schedule_id = bsid, .correlation_id = corr });
     s.cont = null;
-    // Phase 2a dual-write: deadline_ns onto the entity. The entity
-    // is still in request_out; the caller moves it to raft_pending
-    // next, and `drainRaftPending`'s commit branch eventually moves
-    // it to parked_continuations. The component rides the move
-    // chain since every collection in the chain shares
-    // `merged_request_row`.
+
+    // Entity is in request_out; the caller moves it to raft_pending
+    // and `drainRaftPending` later moves it to parked_continuations.
+    // The component rides the whole chain because every collection
+    // shares `merged_request_row`.
     try server.reg.set(s.ent, &server.request_out, components_mod.ContDescriptor, .{
+        .cont = component_cont,
         .deadline_ns = s.cont_deadline_ns,
+        .bound_schedule_id = component_bsid,
     });
+    try server.reg.set(s.ent, &server.request_out, components_mod.ChainContext, .{
+        .tenant_id = component_tid,
+        .correlation_id = component_corr,
+        .deployment_id = s.deployment_id,
+    });
+    component_owned_by_us = false;
 }
 
 /// 503 path: the open hop didn't durably commit → can't hold.

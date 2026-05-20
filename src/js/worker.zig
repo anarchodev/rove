@@ -3412,10 +3412,18 @@ fn proposeAndParkContResume(
             // trampoline open hop's parking.
             const refreshed_deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + CONT_HOLD_DEADLINE_NS;
             meta.deadline_ns = refreshed_deadline_ns;
-            // Phase 2a dual-write: mirror onto the entity's
-            // ContDescriptor so the post-2b reader-flip sees the
-            // refreshed deadline.
+            // Phase 2b dual-write: mirror cont + bound_schedule_id +
+            // deadline_ns onto the entity's ContDescriptor. r.new_cont
+            // and r.new_bound_sched_id are now in the side table
+            // (meta.cont = r.new_cont consumed them); the component
+            // gets its own clone via `meta.cont.clone(allocator)`
+            // (reading back through the side table is fine — we know
+            // it's authoritative until Phase 7).
             const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
+            if (desc.cont) |*old_c| old_c.deinit(allocator);
+            desc.cont = try meta.cont.clone(allocator);
+            if (desc.bound_schedule_id) |old_b| allocator.free(old_b);
+            desc.bound_schedule_id = if (meta.bound_schedule_id) |b| try allocator.dupe(u8, b) else null;
             desc.deadline_ns = refreshed_deadline_ns;
             try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
                 .seq = seq,
@@ -3717,9 +3725,16 @@ fn resumeContinuation(
             meta.cont = c2m;
             const refreshed_deadline_ns: i64 = now_ns + CONT_HOLD_DEADLINE_NS;
             meta.deadline_ns = refreshed_deadline_ns;
-            // Phase 2a dual-write: mirror onto the entity's
-            // ContDescriptor.
+            // Phase 2b dual-write: mirror cont + deadline_ns onto
+            // the component. The read-only repark path doesn't
+            // touch bound_schedule_id (only the write-batch repark
+            // in `proposeAndParkContResume` does — the new
+            // `_send/owed/` write would've sent us down that path
+            // instead). ChainContext is already on the entity from
+            // the initial park; we don't rewrite it here.
             const desc = try worker.h2.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
+            if (desc.cont) |*old_c| old_c.deinit(allocator);
+            desc.cont = try meta.cont.clone(allocator);
             desc.deadline_ns = refreshed_deadline_ns;
         },
         .stream => |*s| {
