@@ -53,12 +53,20 @@ def main() -> int:
         c.discover_leader()
         orig_leader = c.leader_idx
         orig_port = c.addrs.http_port(orig_leader)
+        # Pick a node we WON'T kill — its port stays alive across the
+        # failover so the delayed http.send the new leader fires can
+        # actually reach wb. Hardcoding `orig_port` (as before) meant
+        # the curl hit the dead port and reported CurlCallFailed.
+        survivor_node = (orig_leader + 1) % 3
+        survivor_port = c.addrs.http_port(survivor_node)
         print(f"ok  initial leader: node {orig_leader} at {c.addrs.http[orig_leader]}")
 
         cc = c.curl_ctx(ACME_HOST, WB_HOST)
 
         # Fire delayed http.send. Wait for acme's handler first.
-        wb_url = f"https://{WB_HOST}:{orig_port}/"
+        # Schedule fires the curl from the NEW leader (post-failover) —
+        # target the survivor port so libcurl reaches a live listener.
+        wb_url = f"https://{WB_HOST}:{survivor_port}/"
         acme_origin = f"https://{ACME_HOST}:{orig_port}"
 
         deadline = time.monotonic() + 20.0

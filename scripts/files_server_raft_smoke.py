@@ -116,7 +116,15 @@ def main() -> int:
         # Mint JWT.
         jwt = mint_jwt(jwt_secret, {"exp": int(time.time() * 1000) + 5 * 60 * 1000})
 
-        cc = CurlContext(cacert=tls.cacert)
+        # Map files.rewindjscom.localhost (a system-suffix subdomain
+        # covered by the dev cert's *.rewindjscom.localhost SAN) to
+        # 127.0.0.1 on each node's HTTP port. The dev cert has no
+        # IP-literal SAN; routing through this hostname keeps the
+        # TLS verification path clean.
+        cc = CurlContext(
+            cacert=tls.cacert,
+            resolves=[("files.rewindjscom.localhost", http_base + i) for i in range(3)],
+        )
 
         # 4. Leader election.
         leader_idx = None
@@ -128,7 +136,7 @@ def main() -> int:
             for i in range(3):
                 port = int(http_addrs[i].rsplit(":", 1)[1])
                 r = curl(
-                    cc, f"https://127.0.0.1:{port}/_system/leader",
+                    cc, f"https://files.rewindjscom.localhost:{port}/_system/leader",
                     headers={"Authorization": f"Bearer {jwt}"},
                     timeout=2.0,
                 )
@@ -153,7 +161,7 @@ def main() -> int:
         test_value = f"raft-replicated-{socket.gethostname()}"
         put_body = f'{{"store":"acme","key":"{test_key}","value":"{test_value}"}}'
         r = curl(
-            cc, f"https://127.0.0.1:{leader_port}/_system/cluster-put",
+            cc, f"https://files.rewindjscom.localhost:{leader_port}/_system/cluster-put",
             method="POST",
             headers={
                 "Authorization": f"Bearer {jwt}",
@@ -170,7 +178,7 @@ def main() -> int:
             for i in range(3):
                 port = int(http_addrs[i].rsplit(":", 1)[1])
                 r = curl(
-                    cc, f"https://127.0.0.1:{port}/_system/cluster-get/acme/{test_key}",
+                    cc, f"https://files.rewindjscom.localhost:{port}/_system/cluster-get/acme/{test_key}",
                     headers={"Authorization": f"Bearer {jwt}"},
                     timeout=2.0,
                 )
@@ -190,7 +198,7 @@ def main() -> int:
                 continue
             port = int(http_addrs[i].rsplit(":", 1)[1])
             r = curl(
-                cc, f"https://127.0.0.1:{port}/_system/cluster-put",
+                cc, f"https://files.rewindjscom.localhost:{port}/_system/cluster-put",
                 method="POST",
                 headers={
                     "Authorization": f"Bearer {jwt}",
@@ -209,7 +217,7 @@ def main() -> int:
         manifest_body = f"manifest-body-bytes-{int(_t.time_ns())}"
         put_body = f'{{"store":"{manifest_tenant}","key":"{manifest_key}","value":"{manifest_body}"}}'
         r = curl(
-            cc, f"https://127.0.0.1:{leader_port}/_system/cluster-put",
+            cc, f"https://files.rewindjscom.localhost:{leader_port}/_system/cluster-put",
             method="POST",
             headers={
                 "Authorization": f"Bearer {jwt}",
@@ -226,7 +234,7 @@ def main() -> int:
             for i in range(3):
                 port = int(http_addrs[i].rsplit(":", 1)[1])
                 r = curl(
-                    cc, f"https://127.0.0.1:{port}/{manifest_tenant}/deployments/{manifest_hex}/manifest.bin",
+                    cc, f"https://files.rewindjscom.localhost:{port}/{manifest_tenant}/deployments/{manifest_hex}/manifest.bin",
                     headers={"Authorization": f"Bearer {jwt}"},
                     timeout=2.0,
                 )
@@ -242,7 +250,7 @@ def main() -> int:
 
         # 404 sanity.
         r = curl(
-            cc, f"https://127.0.0.1:{leader_port}/{manifest_tenant}/deployments/deadbeef/manifest.bin",
+            cc, f"https://files.rewindjscom.localhost:{leader_port}/{manifest_tenant}/deployments/deadbeef/manifest.bin",
             headers={"Authorization": f"Bearer {jwt}"},
             timeout=2.0,
         )
@@ -256,7 +264,7 @@ def main() -> int:
         put_hex = f"{put_dep_id:x}"
         put_body_str = '{"version":1,"entries":[{"path":"hello.js","kind":"handler","content_type":"application/javascript","hash":"abc123"}]}'
         r = curl(
-            cc, f"https://127.0.0.1:{leader_port}/{put_tenant}/deployments/{put_hex}/manifest.bin",
+            cc, f"https://files.rewindjscom.localhost:{leader_port}/{put_tenant}/deployments/{put_hex}/manifest.bin",
             method="PUT",
             headers={
                 "Authorization": f"Bearer {jwt}",
@@ -273,7 +281,7 @@ def main() -> int:
             for i in range(3):
                 port = int(http_addrs[i].rsplit(":", 1)[1])
                 r = curl(
-                    cc, f"https://127.0.0.1:{port}/{put_tenant}/deployments/{put_hex}/manifest.bin",
+                    cc, f"https://files.rewindjscom.localhost:{port}/{put_tenant}/deployments/{put_hex}/manifest.bin",
                     headers={"Authorization": f"Bearer {jwt}"},
                     timeout=2.0,
                 )
@@ -292,7 +300,7 @@ def main() -> int:
                 continue
             port = int(http_addrs[i].rsplit(":", 1)[1])
             r = curl(
-                cc, f"https://127.0.0.1:{port}/{put_tenant}/deployments/{put_hex}/manifest.bin",
+                cc, f"https://files.rewindjscom.localhost:{port}/{put_tenant}/deployments/{put_hex}/manifest.bin",
                 method="PUT",
                 headers={"Authorization": f"Bearer {jwt}"},
                 data=put_body_str, timeout=2.0,
@@ -324,7 +332,7 @@ def main() -> int:
              "--data-binary", f"@{batch_req_path}",
              "-o", "/tmp/fs-raft-batch-resp.bin",
              "-w", "%{http_code}",
-             f"https://127.0.0.1:{leader_port}/_system/manifests/batch"],
+             f"https://files.rewindjscom.localhost:{leader_port}/_system/manifests/batch"],
             capture_output=True, timeout=15.0,
         )
         code = r.stdout.decode().strip()
