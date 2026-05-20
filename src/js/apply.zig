@@ -58,6 +58,7 @@ const kv = @import("rove-kv");
 const panic_mod = @import("panic.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const send_dispatch_mod = @import("send_dispatch.zig");
+const worker_mod = @import("worker.zig");
 
 pub const Error = error{
     Truncated,
@@ -253,6 +254,14 @@ pub const Loop46Ctx = struct {
     /// cold reconstruction). Null until `main.zig` wires it; null ⇒
     /// no follower feed (leader still fed worker-side via 4b-ii).
     send_dispatch: ?*send_dispatch_mod.SendDispatch = null,
+    /// streaming-handlers-plan §4.6: pointer to the process-wide
+    /// `NodeState` so `applyWriteSet` can broadcast kv-write events
+    /// to every worker's `KvWakeInbox` after a follower-side apply.
+    /// Borrowed; null on test paths that don't run the full worker
+    /// stack. Type-erased to `*anyopaque` because `NodeState` is
+    /// inside the rove-js module and apply.zig is part of the same
+    /// module — the cast is local.
+    node_state: ?*anyopaque = null,
 
     pub fn init(allocator: std.mem.Allocator) Loop46Ctx {
         return .{ .allocator = allocator };
@@ -347,6 +356,52 @@ pub fn applyWriteSet(
             loader.enqueue(env.id, dep_id) catch |err| std.log.warn(
                 "applyWriteSet: deployment loader enqueue {s}/{d} failed: {s}",
                 .{ env.id, dep_id, @errorName(err) },
+            );
+        }
+    }
+
+    // streaming-handlers-plan §4.6: kv-write wake fan-out (follower
+    // path). Decode the just-applied writeset's ops and broadcast
+    // each `put`/`delete` to every worker's `KvWakeInbox`. The
+    // worker's tick drain scans its `parked_streams_meta` for
+    // prefix matches and sets `pending_wake` so the next
+    // `serviceParkedStreams` pass fires `resumeStream(.kv_wake)`.
+    // Best-effort: a per-event decode/push failure logs and we
+    // continue — §9.4 "spurious + overflow" allows dropped wakes
+    // (handler refetches authoritative state on its next run).
+    //
+    // The leader-skipped property of `applyWriteSet` means this
+    // hook only fires on followers; the leader-side mirror lives
+    // in `worker_dispatch.zig`'s `finalizeBatch` (eager-fire on
+    // local commit). Both paths broadcast to the SAME registry, so
+    // single-node deployments and cross-node deployments converge
+    // on identical wake semantics.
+    if (ctx.node_state) |opaque_node| {
+        var ops: std.ArrayListUnmanaged(kv.WriteSetOp) = .empty;
+        defer ops.deinit(ctx.allocator);
+        kv.decodeWriteSetOps(env.payload, ctx.allocator, &ops) catch |derr| {
+            std.log.warn(
+                "applyWriteSet: kv-wake decode tenant={s}: {s}; skipping wake fan-out",
+                .{ env.id, @errorName(derr) },
+            );
+            return;
+        };
+        const ns: *worker_mod.NodeState = @ptrCast(@alignCast(opaque_node));
+        var fired: usize = 0;
+        for (ops.items) |op| switch (op) {
+            .put => |p| {
+                ns.broadcastKvWake(env.id, p.key, 'p');
+                fired += 1;
+            },
+            .delete => |d| {
+                ns.broadcastKvWake(env.id, d.key, 'd');
+                fired += 1;
+            },
+        };
+        if (fired > 0) {
+            std.log.info(
+                "rove-js kv-wake apply: tenant={s} fanned out {d} op(s) on follower",
+                .{ env.id, fired },
             );
         }
     }

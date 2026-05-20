@@ -1491,6 +1491,15 @@ pub fn main() !void {
     try node_state.startSendDispatch();
     loop46_ctx.send_dispatch = node_state.send_dispatch;
 
+    // streaming-handlers-plan §4.6: hand the apply path a pointer
+    // to NodeState so `applyWriteSet` can `broadcastKvWake` across
+    // every worker's `KvWakeInbox`. Type-erased through `?*anyopaque`
+    // because apply.zig declares the field outside the module-private
+    // worker.zig — both sides agree on the cast (same module). Wired
+    // here, AFTER `startSendDispatch` (no ordering coupling — just
+    // grouped with the other apply-feed wires).
+    loop46_ctx.node_state = @ptrCast(&node_state);
+
     _ = try node_state.eagerOpenTenants();
 
     // ── Spawn worker threads ───────────────────────────────────────────

@@ -590,6 +590,17 @@ fn finalizeBatch(
     worker_mod.parkSendOps(worker, seq, anchor_id, writeset) catch |perr|
         std.log.warn("rove-js parkSendOps (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
 
+    // streaming-handlers-plan §4.6: park kv-wake intents on the
+    // same `seq` so `drainRaftPending` fires them at commit time,
+    // not before. The TrackedTxn.commit happens in drainRaftPending
+    // — until then the writes aren't visible to local readers
+    // (kvexp's per-txn overlay), so a pre-commit wake would have
+    // the handler see stale state. parkKvWakes captures owned
+    // (key, op) pairs from the writeset and rides the existing
+    // ParkedUnit; firePendingKvWakes broadcasts them on commit.
+    worker_mod.parkKvWakes(worker, seq, anchor_id, writeset) catch |perr|
+        std.log.warn("rove-js parkKvWakes (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
+
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     for (successes.items) |*s| {
         try contRecordIfAny(worker, allocator, anchor_id, s); // drain redirects to parked_continuations

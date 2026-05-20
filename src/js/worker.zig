@@ -142,13 +142,40 @@ pub const ParkedUnit = struct {
     /// silent loss. Separate `ParkedUnit` from any emit unit (a hop
     /// can have sends but no emits); both ride `pending_units`.
     send_ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty,
+    /// Streaming-handlers-plan §4.6: commit-gated kv-wake intents.
+    /// Captured from the batch's writeset at propose time;
+    /// `drainRaftPending` calls `node.broadcastKvWake` for each
+    /// once `committedSeq >= seq` so the wakes fire AFTER the
+    /// writes are durably visible to local readers (the kv.get
+    /// on the wake-driven handler then returns the new state, not
+    /// stale pre-write state). Discarded on fault/timeout — same
+    /// posture as `send_ops`: no silent loss because the writes
+    /// also didn't escape, and the §9.4 "spurious + overflow"
+    /// thesis tolerates dropped wakes.
+    kv_wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty,
 
     pub fn deinit(self: *ParkedUnit, allocator: std.mem.Allocator) void {
         for (self.emits.items) |*e| e.deinit(allocator);
         self.emits.deinit(allocator);
         for (self.send_ops.items) |*o| o.deinit(allocator);
         self.send_ops.deinit(allocator);
+        for (self.kv_wakes.items) |*w| w.deinit(allocator);
+        self.kv_wakes.deinit(allocator);
         allocator.free(self.tenant_id);
+    }
+};
+
+/// Owned (key, op) pair captured from a write batch's writeset at
+/// propose time. Survives until `drainRaftPending` fires the wake
+/// (`node.broadcastKvWake`) or the unit is discarded on
+/// fault/timeout/leadership-loss.
+pub const KvWakeOp = struct {
+    key: []u8,
+    op: u8,
+
+    pub fn deinit(self: *KvWakeOp, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        self.* = undefined;
     }
 };
 
@@ -283,6 +310,73 @@ pub const PendingKvWake = struct {
     pub fn deinit(self: *PendingKvWake, allocator: std.mem.Allocator) void {
         allocator.free(self.key);
         self.* = undefined;
+    }
+};
+
+/// One kv-write event that crossed the apply boundary (either via
+/// `applyWriteSet` on a follower or via the leader-side eager fire
+/// in `worker_dispatch.zig`). `tenant_id` + `key` are allocator-
+/// owned dup's because the source bytes (the writeset payload or
+/// the in-flight `WriteSet.ops` buffer) don't outlive the producer
+/// site. `op` is a single byte: `'p'` for put, `'d'` for delete.
+pub const KvWakeEvent = struct {
+    tenant_id: []u8,
+    key: []u8,
+    op: u8,
+
+    pub fn deinit(self: *KvWakeEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
+        allocator.free(self.key);
+        self.* = undefined;
+    }
+};
+
+/// Thread-safe per-worker inbox of kv-write events awaiting prefix-
+/// match scan against the worker's local `parked_streams_meta`.
+/// Producers (apply thread + leader-side worker_dispatch) call
+/// `push`; the owning worker drains at the start of every
+/// `serviceParkedStreams` tick. Mutex held only during enqueue /
+/// drain — the worker's per-tick scan runs on local snapshots.
+pub const KvWakeInbox = struct {
+    mutex: std.Thread.Mutex = .{},
+    events: std.ArrayListUnmanaged(KvWakeEvent) = .empty,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) KvWakeInbox {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *KvWakeInbox) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.events.items) |*e| e.deinit(self.allocator);
+        self.events.deinit(self.allocator);
+    }
+
+    /// Enqueue one event. Dups `tenant_id` + `key` so the caller
+    /// can free the source bytes immediately. Errors propagate to
+    /// the caller (apply-thread path logs and continues — losing a
+    /// wake is preferable to crashing the apply loop; the §9.4
+    /// "spurious + overflow" thesis allows this).
+    pub fn push(self: *KvWakeInbox, tenant_id: []const u8, key: []const u8, op: u8) !void {
+        const tid = try self.allocator.dupe(u8, tenant_id);
+        errdefer self.allocator.free(tid);
+        const k = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(k);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.events.append(self.allocator, .{ .tenant_id = tid, .key = k, .op = op });
+    }
+
+    /// Move all queued events into the caller's local list (the
+    /// caller now owns each event's slices). Inbox is empty after
+    /// the call. Mutex held briefly.
+    pub fn drainInto(self: *KvWakeInbox, out: *std.ArrayListUnmanaged(KvWakeEvent)) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.events.items.len == 0) return;
+        try out.appendSlice(self.allocator, self.events.items);
+        self.events.clearRetainingCapacity();
     }
 };
 
@@ -835,6 +929,17 @@ pub const NodeState = struct {
     /// `reloadDeployment` can leader-gate + propose the config mirror.
     raft: *kv_mod.RaftNode,
 
+    /// streaming-handlers-plan §4.6: registry of per-worker kv-wake
+    /// inboxes. Workers register their inbox at startup; producers
+    /// (apply.zig writeset apply on followers + worker_dispatch.zig
+    /// leader-side eager fire) call `broadcastKvWake` to fan out.
+    /// Per-worker (not node-wide) so each worker only scans cells it
+    /// owns — matches plan §4.1's "registry is per-worker" rule. The
+    /// `mutex` guards the registry vector itself (registration races
+    /// at worker startup); individual inboxes have their own mutex.
+    wake_inboxes_mutex: std.Thread.Mutex = .{},
+    wake_inboxes: std.ArrayListUnmanaged(*KvWakeInbox) = .empty,
+
     pub fn init(
         allocator: std.mem.Allocator,
         tenant: *tenant_mod.Tenant,
@@ -849,7 +954,61 @@ pub const NodeState = struct {
         };
     }
 
+    /// Register a worker's wake inbox at worker startup. Worker
+    /// keeps the inbox; this registry just borrows the pointer so
+    /// producers can fan out. The pointer must outlive every
+    /// `broadcastKvWake` call — workers must `unregisterWakeInbox`
+    /// from their destroy path before tearing down.
+    pub fn registerWakeInbox(self: *NodeState, inbox: *KvWakeInbox) !void {
+        self.wake_inboxes_mutex.lock();
+        defer self.wake_inboxes_mutex.unlock();
+        try self.wake_inboxes.append(self.allocator, inbox);
+    }
+
+    pub fn unregisterWakeInbox(self: *NodeState, inbox: *KvWakeInbox) void {
+        self.wake_inboxes_mutex.lock();
+        defer self.wake_inboxes_mutex.unlock();
+        var i: usize = 0;
+        while (i < self.wake_inboxes.items.len) : (i += 1) {
+            if (self.wake_inboxes.items[i] == inbox) {
+                _ = self.wake_inboxes.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Fan out one kv-write event to every registered worker
+    /// inbox. Called from `apply.zig` (follower path) and
+    /// `worker_dispatch.zig` (leader path) so a write on any node
+    /// reaches every locally-held stream regardless of which node
+    /// + worker hosts it. A per-inbox push failure is logged and
+    /// swallowed — the §9.4 "spurious + overflow" thesis lets us
+    /// drop a wake; the worker that lost it will refetch authoritative
+    /// state on its next activation anyway.
+    pub fn broadcastKvWake(
+        self: *NodeState,
+        tenant_id: []const u8,
+        key: []const u8,
+        op: u8,
+    ) void {
+        self.wake_inboxes_mutex.lock();
+        defer self.wake_inboxes_mutex.unlock();
+        for (self.wake_inboxes.items) |inbox| {
+            inbox.push(tenant_id, key, op) catch |err| {
+                std.log.warn(
+                    "rove-js kv-wake broadcast: push tenant={s} key={s}: {s}",
+                    .{ tenant_id, key, @errorName(err) },
+                );
+            };
+        }
+    }
+
     pub fn deinit(self: *NodeState) void {
+        // Drop the inbox registry first — workers destroy their
+        // inboxes in their own deinit, so by the time NodeState
+        // tears down, every inbox should already be unregistered.
+        // The list itself is owned by NodeState's allocator.
+        self.wake_inboxes.deinit(self.allocator);
         if (self.deployment_loader) |l| {
             l.shutdown();
             l.deinit();
@@ -1264,6 +1423,15 @@ pub fn Worker(comptime opts: Options) type {
         /// the entity moves to `stream_close_in` (h2 sends END_STREAM)
         /// and the map entry is removed.
         parked_streams_meta: std.AutoHashMapUnmanaged(rove.Entity, StreamCell) = .empty,
+        /// Per-worker kv-wake inbox (streaming-handlers-plan §4.6).
+        /// Producers (apply.zig + leader-side worker_dispatch) push
+        /// events here via `worker.node.broadcastKvWake`;
+        /// `serviceParkedStreams` drains it at the start of each
+        /// tick and matches events against `parked_streams_meta`
+        /// cells' `kv_prefixes`. Pointer registered with
+        /// `worker.node.registerWakeInbox` in `Worker.create`;
+        /// unregistered + deinit'd in `Worker.destroy`.
+        wake_inbox: KvWakeInbox,
         /// Deferred TrackedTxn commits keyed by raft seq. Per kvexp
         /// README §1 (speculative apply): `txn.commit` runs after raft
         /// confirms the batch's seq, not before propose. On propose
@@ -1460,13 +1628,22 @@ pub fn Worker(comptime opts: Options) type {
                         break :blk null;
                     };
                 },
+                .wake_inbox = KvWakeInbox.init(allocator),
             };
             errdefer self.raft_pending.deinit();
             errdefer self.parked_continuations.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
+            errdefer self.wake_inbox.deinit();
 
             reg.registerCollection(&self.raft_pending);
             reg.registerCollection(&self.parked_continuations);
+
+            // Register the inbox with the node so apply.zig +
+            // worker_dispatch.zig can broadcast kv-write events to
+            // this worker's locally-held streams. Address is stable
+            // (`self` is heap-allocated above).
+            try config.node.registerWakeInbox(&self.wake_inbox);
+            errdefer config.node.unregisterWakeInbox(&self.wake_inbox);
 
             // Eagerly open per-worker tenant_logs (request_id minters
             // bake the worker_id into the upper 16 bits; can't share).
@@ -1580,6 +1757,20 @@ pub fn Worker(comptime opts: Options) type {
                 while (pit.next()) |pc| pc.deinit(allocator);
                 self.parked_meta.deinit(allocator);
             }
+            // Phase 2b-ii + Phase 3: free any streaming-chain cells
+            // still parked at shutdown. The cells own strings, queues,
+            // kv_prefixes, and an optional pending_wake — all owned
+            // by `allocator` via `StreamCell.deinit`.
+            {
+                var sit = self.parked_streams_meta.valueIterator();
+                while (sit.next()) |cell| cell.deinit(allocator);
+                self.parked_streams_meta.deinit(allocator);
+            }
+            // Unregister + tear down the kv-wake inbox. Order
+            // matters: unregister FIRST so no producer can still
+            // be pushing into it while we walk + free the queue.
+            self.node.unregisterWakeInbox(&self.wake_inbox);
+            self.wake_inbox.deinit();
             self.parked_continuations.deinit();
             self.raft_pending.deinit();
             self.dispatcher.deinit();
@@ -2911,6 +3102,7 @@ pub fn drainRaftPending(worker: anytype) !void {
         if (committed >= unit.seq) {
             firePendingEmits(worker, unit);
             firePendingSendOps(worker, unit);
+            firePendingKvWakes(worker, unit);
             unit.deinit(allocator);
             _ = worker.pending_units.swapRemove(u);
             continue;
@@ -3368,6 +3560,12 @@ pub fn registerStreamCell(
 /// O(parked) per call, gated by `count() == 0` so the worker hot
 /// path (no streams) pays nothing.
 pub fn serviceParkedStreams(worker: anytype) !void {
+    // Drain the inbox UNCONDITIONALLY — even when no cells are
+    // parked locally a producer may have just pushed an event that
+    // matches the next inbound stream's prefix. Cheap: empty inbox
+    // is one mutex lock + a length check.
+    try drainKvWakeInbox(worker);
+
     if (worker.parked_streams_meta.count() == 0) return;
     const server = worker.h2;
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
@@ -3416,18 +3614,49 @@ pub fn serviceParkedStreams(worker: anytype) !void {
             freeStreamCell(worker, p.ent);
             continue;
         }
-        // No wake registered (interval_ms == 0): the chain was
-        // "stream a finite batch + close" (the §3.3 degenerate
-        // shape — `acme/stream/index.mjs`). Close now that the
-        // initial chunks have shipped.
-        if (cell.interval_ms == 0) {
+
+        // kv-wake match? Takes priority over the timer (and over
+        // the no-timer close) — a watched prefix that just changed
+        // is more interesting than a heartbeat or a passive close.
+        // `pending_wake` was set by `drainKvWakeInbox` above.
+        if (cell.pending_wake != null) {
+            if (cell.activation_count >= MAX_STREAM_ACTIVATIONS) {
+                std.log.warn(
+                    "rove-js stream: tenant={s} corr={s} hit activation cap; closing",
+                    .{ cell.tenant_id, cell.correlation_id orelse "(none)" },
+                );
+                cell.close_pending = true;
+                try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
+                freeStreamCell(worker, p.ent);
+                continue;
+            }
+            resumeStream(worker, p.ent, p.sid, p.sess, .kv_wake) catch |err| {
+                std.log.warn(
+                    "rove-js stream-resume (kv): tenant={s} corr={s}: {s}; closing",
+                    .{ cell.tenant_id, cell.correlation_id orelse "(none)", @errorName(err) },
+                );
+                if (worker.parked_streams_meta.contains(p.ent)) {
+                    var c = worker.parked_streams_meta.getPtr(p.ent).?;
+                    c.close_pending = true;
+                    server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in) catch {};
+                    freeStreamCell(worker, p.ent);
+                }
+            };
+            continue;
+        }
+
+        // No wake registered (interval_ms == 0 AND no kv match):
+        // the chain was "stream a finite batch + close" (the §3.3
+        // degenerate shape — `acme/stream/index.mjs`). Close now
+        // that the initial chunks have shipped.
+        if (cell.interval_ms == 0 and cell.kv_prefixes.len == 0) {
             try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
             freeStreamCell(worker, p.ent);
             continue;
         }
 
         // Timer wake due?
-        if (now_ns >= cell.next_wake_ns) {
+        if (cell.interval_ms > 0 and now_ns >= cell.next_wake_ns) {
             if (cell.activation_count >= MAX_STREAM_ACTIVATIONS) {
                 // §9.2 strike: misbehaving handler can't run a stream
                 // forever. Close cleanly.
@@ -3445,10 +3674,6 @@ pub fn serviceParkedStreams(worker: anytype) !void {
                     "rove-js stream-resume: tenant={s} corr={s}: {s}; closing",
                     .{ cell.tenant_id, cell.correlation_id orelse "(none)", @errorName(err) },
                 );
-                // Cell may have been freed inside resumeStream
-                // (some error paths flip close_pending and let the
-                // next pass do the close). Best-effort: ensure the
-                // close lands now.
                 if (worker.parked_streams_meta.contains(p.ent)) {
                     var c = worker.parked_streams_meta.getPtr(p.ent).?;
                     c.close_pending = true;
@@ -3458,7 +3683,63 @@ pub fn serviceParkedStreams(worker: anytype) !void {
             };
             continue;
         }
-        // No wake due yet — idle.
+        // No wake due yet — idle, waiting for either a kv match or
+        // the timer.
+    }
+}
+
+/// Drain the worker's `wake_inbox` of kv-write events and apply
+/// each one against `parked_streams_meta`: for every cell whose
+/// `kv_prefixes` includes a prefix of the event's key, set
+/// `pending_wake = .{ key, op }` (most-recent-wins per v1's §9.4
+/// collapse posture). Events whose tenant_id matches no held
+/// stream are simply dropped — the per-tenant scoping § 4.6
+/// invariant lives at REGISTRATION time (a cell only registers
+/// prefixes for its own tenant), so a stale event against an old
+/// tenant just doesn't match anything.
+fn drainKvWakeInbox(worker: anytype) !void {
+    const allocator = worker.allocator;
+    var events: std.ArrayListUnmanaged(KvWakeEvent) = .empty;
+    defer {
+        for (events.items) |*e| e.deinit(allocator);
+        events.deinit(allocator);
+    }
+    try worker.wake_inbox.drainInto(&events);
+    if (events.items.len == 0) return;
+
+    var it = worker.parked_streams_meta.iterator();
+    while (it.next()) |entry| {
+        const cell = entry.value_ptr;
+        if (cell.kv_prefixes.len == 0) continue;
+        // Walk events newest-first so "most-recent-wins" matches the
+        // intuitive notion of "this stream's pending wake is the
+        // latest fired write."
+        var i: usize = events.items.len;
+        while (i > 0) {
+            i -= 1;
+            const ev = events.items[i];
+            if (!std.mem.eql(u8, ev.tenant_id, cell.tenant_id)) continue;
+            // Prefix match against any registered prefix.
+            var matched: bool = false;
+            for (cell.kv_prefixes) |pfx| {
+                if (std.mem.startsWith(u8, ev.key, pfx)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) continue;
+            // Replace any earlier pending_wake (the cell didn't get
+            // to consume it yet — newest wake wins). The handler's
+            // job is to re-read kv state holistically, so older
+            // wakes are redundant.
+            if (cell.pending_wake) |*w| {
+                w.deinit(allocator);
+                cell.pending_wake = null;
+            }
+            const key_dup = try allocator.dupe(u8, ev.key);
+            cell.pending_wake = .{ .key = key_dup, .op = ev.op };
+            break;
+        }
     }
 }
 
@@ -3884,6 +4165,20 @@ fn firePendingSendOps(worker: anytype, unit: *ParkedUnit) void {
     for (unit.send_ops.items) |*o| o.fire(sd);
 }
 
+/// streaming-handlers-plan §4.6: fire commit-gated kv-wake intents.
+/// `drainRaftPending` calls us once `committedSeq >= unit.seq`,
+/// guaranteeing the writes are durably visible to local readers
+/// (kvexp's `TrackedTxn.commit` already ran on this node). Each
+/// intent fans out via `node.broadcastKvWake` to every worker's
+/// `KvWakeInbox` — `serviceParkedStreams` then picks up matched
+/// cells. No-op on empty.
+fn firePendingKvWakes(worker: anytype, unit: *ParkedUnit) void {
+    if (unit.kv_wakes.items.len == 0) return;
+    for (unit.kv_wakes.items) |w| {
+        worker.node.broadcastKvWake(unit.tenant_id, w.key, w.op);
+    }
+}
+
 /// Register a committed batch's `_send/*` arm/resolve intents as a
 /// post-propose parked unit, keyed by the propose `seq` — the
 /// `parkEmits` idiom for the Option (b) feed. Classifies + dups owned
@@ -3932,6 +4227,49 @@ pub fn parkSendOps(
 /// Empties `*emits` so the caller's defer is a no-op. On a pre-move
 /// error the emits stay with the caller (its defer drops them —
 /// degraded but safe: nothing escaped, no double-free).
+/// streaming-handlers-plan §4.6: register a batch's kv-writes as
+/// commit-gated wake intents. Extracts `(key, op)` from each put /
+/// delete in the writeset (key bytes dup'd so the caller can
+/// release the writeset bytes), parks them on a `ParkedUnit` keyed
+/// by the propose `seq`. `drainRaftPending` fires them at commit
+/// via `firePendingKvWakes` — same shape as `parkSendOps` /
+/// `parkEmits`. No-op when the writeset has no ops.
+pub fn parkKvWakes(
+    worker: anytype,
+    seq: u64,
+    tenant_id: []const u8,
+    writeset: *const kv_mod.WriteSet,
+) !void {
+    if (writeset.ops.items.len == 0) return;
+    const allocator = worker.allocator;
+    var wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty;
+    errdefer {
+        for (wakes.items) |*w| w.deinit(allocator);
+        wakes.deinit(allocator);
+    }
+    try wakes.ensureUnusedCapacity(allocator, writeset.ops.items.len);
+    for (writeset.ops.items) |op| switch (op) {
+        .put => |p| {
+            const k = try allocator.dupe(u8, p.key);
+            wakes.appendAssumeCapacity(.{ .key = k, .op = 'p' });
+        },
+        .delete => |d| {
+            const k = try allocator.dupe(u8, d.key);
+            wakes.appendAssumeCapacity(.{ .key = k, .op = 'd' });
+        },
+    };
+    try worker.pending_units.ensureUnusedCapacity(allocator, 1);
+    const tid = try allocator.dupe(u8, tenant_id);
+    errdefer allocator.free(tid);
+    worker.pending_units.appendAssumeCapacity(.{
+        .seq = seq,
+        .deadline_ns = @intCast(std.time.nanoTimestamp() +
+            @as(i128, @intCast(worker.commit_wait_timeout_ns))),
+        .tenant_id = tid,
+        .kv_wakes = wakes,
+    });
+}
+
 pub fn parkEmits(
     worker: anytype,
     seq: u64,

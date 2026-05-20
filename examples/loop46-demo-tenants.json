@@ -16,6 +16,8 @@
         {"path": "heldsync/onresult.mjs", "source": "loop46-demo-tenants/acme/heldsync/onresult.mjs"},
         {"path": "stream/index.mjs", "source": "loop46-demo-tenants/acme/stream/index.mjs"},
         {"path": "heartbeat/index.mjs", "source": "loop46-demo-tenants/acme/heartbeat/index.mjs"},
+        {"path": "watch/index.mjs", "source": "loop46-demo-tenants/acme/watch/index.mjs"},
+        {"path": "writekey/index.mjs", "source": "loop46-demo-tenants/acme/writekey/index.mjs"},
         {"path": "cfg/index.mjs", "source": "loop46-demo-tenants/acme/cfg/index.mjs"},
         {"path": "_config/oauth/google.json", "source": "loop46-demo-tenants/acme/_config/oauth/google.json", "content_type": "application/json"}
       ]
