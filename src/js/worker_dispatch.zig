@@ -34,6 +34,7 @@ const auth = @import("auth.zig");
 const raft_propose = @import("raft_propose.zig");
 const panic_mod = @import("panic.zig");
 const worker_mod = @import("worker.zig");
+const components_mod = @import("components.zig");
 const session_mod = @import("session.zig");
 
 // Edge-proxy detection. rove-h2 is HTTP/2-only and TLS deployments
@@ -264,6 +265,16 @@ fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator,
     errdefer if (corr) |x| allocator.free(x);
     try worker.parked_meta.put(allocator, s.ent, .{ .cont = cont, .deadline_ns = s.cont_deadline_ns, .tenant_id = tid, .bound_schedule_id = bsid, .correlation_id = corr });
     s.cont = null; // ownership moved into parked_meta
+    // Phase 2a dual-write: deadline_ns onto the entity's
+    // ContDescriptor so `sweepParkedContinuations` can read it from
+    // the component instead of the side table. Set on request_out
+    // BEFORE the move — the merged_request_row carries
+    // ContDescriptor in both Rows, so the move propagates the
+    // value to the destination. Phase 2b will populate the cont +
+    // bound_schedule_id fields; Phase 2c will set ChainContext.
+    try server.reg.set(s.ent, &server.request_out, components_mod.ContDescriptor, .{
+        .deadline_ns = s.cont_deadline_ns,
+    });
     try server.reg.move(s.ent, &server.request_out, &worker.parked_continuations);
     return true;
 }
@@ -271,7 +282,7 @@ fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator,
 /// Continuation success parked on `raft_pending` (write/barrier
 /// path): record the descriptor so `drainRaftPending` redirects it to
 /// `parked_continuations` on commit. Entity still → `raft_pending`.
-fn contRecordIfAny(worker: anytype, allocator: std.mem.Allocator, tenant_id: []const u8, s: *SuccessRec) !void {
+fn contRecordIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator, tenant_id: []const u8, s: *SuccessRec) !void {
     const cont = s.cont orelse return;
     const tid = try allocator.dupe(u8, tenant_id);
     errdefer allocator.free(tid);
@@ -281,6 +292,15 @@ fn contRecordIfAny(worker: anytype, allocator: std.mem.Allocator, tenant_id: []c
     errdefer if (corr) |x| allocator.free(x);
     try worker.parked_meta.put(allocator, s.ent, .{ .cont = cont, .deadline_ns = s.cont_deadline_ns, .tenant_id = tid, .bound_schedule_id = bsid, .correlation_id = corr });
     s.cont = null;
+    // Phase 2a dual-write: deadline_ns onto the entity. The entity
+    // is still in request_out; the caller moves it to raft_pending
+    // next, and `drainRaftPending`'s commit branch eventually moves
+    // it to parked_continuations. The component rides the move
+    // chain since every collection in the chain shares
+    // `merged_request_row`.
+    try server.reg.set(s.ent, &server.request_out, components_mod.ContDescriptor, .{
+        .deadline_ns = s.cont_deadline_ns,
+    });
 }
 
 /// 503 path: the open hop didn't durably commit → can't hold.
@@ -504,7 +524,7 @@ fn finalizeBatch(
             try worker.pending_txns.put(allocator, seq, txn);
             const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
             for (successes.items) |*s| {
-                try contRecordIfAny(worker, allocator, anchor_id, s); // drain redirects to parked_continuations
+                try contRecordIfAny(worker, server, allocator, anchor_id, s); // drain redirects to parked_continuations
                 try streamRecordIfAnyAt(worker, allocator, anchor_id, s); // drain redirects to stream_response_in (Phase 4d)
                 try server.reg.set(s.ent, &server.request_out, RaftWait, .{
                     .seq = seq,
@@ -633,7 +653,7 @@ fn finalizeBatch(
 
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     for (successes.items) |*s| {
-        try contRecordIfAny(worker, allocator, anchor_id, s); // drain redirects to parked_continuations
+        try contRecordIfAny(worker, server, allocator, anchor_id, s); // drain redirects to parked_continuations
         try streamRecordIfAnyAt(worker, allocator, anchor_id, s); // drain redirects to stream_response_in (Phase 4d)
         try server.reg.set(s.ent, &server.request_out, RaftWait, .{
             .seq = seq,

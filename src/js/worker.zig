@@ -3410,7 +3410,13 @@ fn proposeAndParkContResume(
             // §6.4 mandatory-timeout refresh: each new hop gets the
             // standard hold deadline, identical to the inbound
             // trampoline open hop's parking.
-            meta.deadline_ns = @as(i64, @intCast(std.time.nanoTimestamp())) + CONT_HOLD_DEADLINE_NS;
+            const refreshed_deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + CONT_HOLD_DEADLINE_NS;
+            meta.deadline_ns = refreshed_deadline_ns;
+            // Phase 2a dual-write: mirror onto the entity's
+            // ContDescriptor so the post-2b reader-flip sees the
+            // refreshed deadline.
+            const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
+            desc.deadline_ns = refreshed_deadline_ns;
             try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
                 .seq = seq,
                 .deadline_ns = deadline_ns,
@@ -3709,7 +3715,12 @@ fn resumeContinuation(
             // deadline; the entity stays in `parked_continuations`.
             meta.cont.deinit(allocator);
             meta.cont = c2m;
-            meta.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
+            const refreshed_deadline_ns: i64 = now_ns + CONT_HOLD_DEADLINE_NS;
+            meta.deadline_ns = refreshed_deadline_ns;
+            // Phase 2a dual-write: mirror onto the entity's
+            // ContDescriptor.
+            const desc = try worker.h2.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
+            desc.deadline_ns = refreshed_deadline_ns;
         },
         .stream => |*s| {
             // Phase 2a: a resume hop returning `__rove_stream(...)` is
@@ -3777,8 +3788,14 @@ pub fn resumeBoundContinuation(
 }
 
 pub fn sweepParkedContinuations(worker: anytype) !void {
-    if (worker.parked_meta.count() == 0) return;
-    std.log.info("rove-js sendpath: sweepParkedContinuations tick parked={d}", .{worker.parked_meta.count()});
+    // Phase 2a: deadline read switched from `parked_meta` (side table)
+    // to the entity's `ContDescriptor` component. The empty-loop
+    // short-circuit replaces the `parked_meta.count() == 0` probe —
+    // membership in `parked_continuations` IS the cont-state
+    // discriminant (principle #1), no separate count check needed.
+    const ents = worker.parked_continuations.entitySlice();
+    if (ents.len == 0) return;
+    std.log.info("rove-js sendpath: sweepParkedContinuations tick parked={d}", .{ents.len});
     const allocator = worker.allocator;
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
@@ -3788,12 +3805,11 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
     var expired: std.ArrayListUnmanaged(Expired) = .empty;
     defer expired.deinit(allocator);
     {
-        const ents = worker.parked_continuations.entitySlice();
         const sids = worker.parked_continuations.column(h2.StreamId);
         const sesss = worker.parked_continuations.column(h2.Session);
-        for (ents, sids, sesss) |ent, sid, sess| {
-            const pc = worker.parked_meta.getPtr(ent) orelse continue;
-            if (now_ns >= pc.deadline_ns)
+        const descs = worker.parked_continuations.column(components_mod.ContDescriptor);
+        for (ents, sids, sesss, descs) |ent, sid, sess, desc| {
+            if (now_ns >= desc.deadline_ns)
                 try expired.append(allocator, .{ .ent = ent, .sid = sid, .sess = sess });
         }
     }
