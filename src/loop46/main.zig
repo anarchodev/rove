@@ -61,7 +61,6 @@ const files_mod = @import("rove-files");
 const files_server = @import("rove-files-server");
 const log_server = @import("rove-log-server");
 const schedule_server_mod = @import("rove-schedule-server");
-const sse_server_mod = @import("rove-sse-server");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
 const h2_mod = @import("rove-h2");
@@ -280,18 +279,9 @@ const WorkerCtx = struct {
     /// allocation.
     files_internal_base: ?[]const u8,
     files_internal_insecure_tls: bool,
-    /// In-process SSE thread (task #10 Phase 2). Worker `events.emit`
-    /// batches are enqueued here post-commit; null = no in-process
-    /// SSE (`--sse-listen` unset). Owned by main; borrowed here.
-    sse_handle: ?*sse_server_mod.thread.Handle,
-    /// Browser-facing SSE base for the `/_session/sse-token` mint
-    /// (NOT a POST target). `https://sse.{public_suffix}` when
-    /// in-process SSE is enabled, else null.
-    sse_public_base: ?[]const u8,
     /// Insecure-TLS toggle for the worker's **internal-service**
-    /// POSTs. Now gates only the log-server push (`sendPushChunk`);
-    /// SSE no longer does HTTP. `LOOP46_INTERNAL_INSECURE_TLS=1` in env.
-    /// (Misnomer — rename deferred to Phase 4.)
+    /// POSTs. Currently gates only the log-server push
+    /// (`sendPushChunk`). `LOOP46_INTERNAL_INSECURE_TLS=1` in env.
     internal_insecure_tls: bool,
     admin_origin: ?[]const u8,
     admin_api_domain: ?[]const u8,
@@ -389,8 +379,6 @@ fn workerMain(args: *WorkerCtx) !void {
         .services_jwt_secret = args.services_jwt_secret,
         .log_public_base = args.log_public_base,
         .files_public_base = args.files_public_base,
-        .sse_handle = args.sse_handle,
-        .sse_public_base = args.sse_public_base,
         .internal_insecure_tls = args.internal_insecure_tls,
         .admin_origin = args.admin_origin,
         .admin_api_domain = args.admin_api_domain,
@@ -1281,19 +1269,9 @@ pub fn main() !void {
         null;
     defer if (files_public_base) |s| allocator.free(s);
 
-    // ── SSE (task #10 Phase 2) ────────────────────────────────────────
-    //
-    // The worker→sse-server HTTP emit POST is retired. SSE runs as an
-    // in-process loop46 thread (`sse_handle`, spawned below behind the
-    // single-node `--sse-listen` guard); workers hand emit batches to
-    // it via `Handle.enqueueEmit` after commit. No `--sse-public-base`,
-    // no `SSE_INTERNAL_TOKEN` — there is no cross-process emit hop.
-    //
-    // `LOOP46_INTERNAL_INSECURE_TLS=1` survives only as the insecure-TLS
-    // toggle for the worker's remaining internal-service POST (the
-    // log-server push, `sendPushChunk`). Smoke-only; production leaves
-    // it unset so the system CA bundle is enforced. (Misnomer now —
-    // rename deferred to Phase 4.)
+    // Worker insecure-TLS toggle for internal-service POSTs.
+    // Currently gates only the log-server push (`sendPushChunk`).
+    // Smoke-only; production leaves it unset.
     const internal_insecure_tls: bool = blk: {
         const v = std.process.getEnvVarOwned(allocator, "LOOP46_INTERNAL_INSECURE_TLS") catch |err| switch (err) {
             error.EnvironmentVariableNotFound => break :blk false,
@@ -1302,21 +1280,6 @@ pub fn main() !void {
         defer allocator.free(v);
         break :blk std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
     };
-
-    // Browser-facing SSE base for the `/_session/sse-token` mint's
-    // `notifications_url` (so the customer page knows where to open
-    // its EventSource). Only meaningful when in-process SSE is
-    // enabled (`--sse-listen`) and we know the public suffix; the
-    // public host is `sse.{public_suffix}` (operator points that DNS
-    // at this single node). NOT a worker POST target.
-    const sse_public_base: ?[]u8 = if (cli.sse_listen != null)
-        if (cli.public_suffix) |suffix|
-            try std.fmt.allocPrint(allocator, "https://sse.{s}", .{suffix})
-        else
-            null
-    else
-        null;
-    defer if (sse_public_base) |s| allocator.free(s);
 
     // ── Schedule-server thread: RETIRED (Option (b) 5b-2) ─────────────
     //
@@ -1328,40 +1291,18 @@ pub fn main() !void {
     // `test_allow_plaintext`) the new path calls; no thread is
     // spawned. `loop46_ctx.schedule_wake` is no longer wired (apply
     // never wakes a scheduler thread).
-
-    // ── SSE notification thread: in-process (task #10, Phase 1) ───────
     //
-    // sse-server-standalone retired — collapsed into a loop46 sibling
-    // thread (sse-plan / connection-actor-plan §6.2; the SSE analogue
-    // of "the holder collapsed INTO the worker, no new process").
-    // Owns its own `sse.{public_suffix}` TLS/h2 listener + the
-    // per-(tenant,sid) ring cache; the worker→SSE bridge stays the
-    // existing emit POST for now (the in-process queue lands in
-    // Phase 2). **Single-node only for v1**: in-process SSE has no
-    // cross-node fan-out, so multi-node `--peers` + `--sse-listen` is
-    // a hard misconfig caught here, not a silent lossy mode.
-    const sse_handle: ?*sse_server_mod.thread.Handle =
-        if (cli.sse_listen) |sl| blk: {
-            if (peers.len > 1) failExit(
-                "error: --sse-listen is single-node only for v1 ({d} " ++
-                    "peers in --peers). In-process SSE has no cross-node " ++
-                    "fan-out; run single-node or drop --sse-listen.\n",
-                .{peers.len},
-            );
-            const sse_addr = try parseHostPort(allocator, sl);
-            const h = try sse_server_mod.thread.spawn(.{
-                .allocator = allocator,
-                .bind_addr = sse_addr,
-                .tls_config = tls_config,
-                .jwt_secret = &services_jwt_secret,
-            });
-            std.log.info("sse: in-process thread on {s} (single-node)", .{sl});
-            break :blk h;
-        } else null;
-    // The end-of-main _exit(0) reclaims the thread; this defer
-    // mirrors raft_thread.join()'s consistent-posture teardown
-    // (skipped by process.exit, like every other subsystem).
-    defer if (sse_handle) |h| h.shutdown();
+    // ── SSE notification thread: RETIRED (streaming-handlers Phase 5)
+    //
+    // The platform-managed SSE pipe (in-process sse-server thread,
+    // `_session/sse-token` mint, `events.emit` global) is gone.
+    // Customer-arbitrary SSE composes on top of the §4.6 kv-write
+    // wake + `__rove_stream`: customers write their own SSE endpoint,
+    // emit events by writing to their own kv under a watched prefix,
+    // and the wake-driven handler renders frames. Cross-node
+    // correctness rides raft (every node's apply scans the writeset
+    // against its locally-held streams) instead of the previous
+    // single-node in-process fan-out. See docs/streaming-handlers-plan.md §8.
 
     // Shared seq-counter registry. Every per-tenant `app.db` KvStore
     // opened by any worker draws from this, so concurrent worker
@@ -1527,8 +1468,6 @@ pub fn main() !void {
             .files_public_base = files_public_base,
             .files_internal_base = cli.files_internal_base,
             .files_internal_insecure_tls = cli.files_internal_insecure_tls,
-            .sse_handle = sse_handle,
-            .sse_public_base = sse_public_base,
             .internal_insecure_tls = internal_insecure_tls,
             .admin_origin = cli.admin_origin,
             .admin_api_domain = cli.admin_api_domain,

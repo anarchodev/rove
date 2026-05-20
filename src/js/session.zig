@@ -235,16 +235,11 @@ test "cross-host isolation: malformed cross-host cookie is rejected and remints"
     // hex; if it parses, we accept the sid as the request's
     // session identity.
     //
-    // Critically, this is OK because: even if the attacker manages
-    // to make tenant B see "sid_a" as the request's sid,
-    // events.emit on tenant B writes into tenant B's app.db. Tenant
-    // A's pump never reads from tenant B's app.db — so the spoof
-    // produces a write nobody reads. See the dispatcher test
-    // "dispatch: cross-tenant events.emit{to:} writes only to
-    // caller's kv" for the kv-scope confirmation.
-    //
-    // The session resolve here just needs to be deterministic —
-    // accept valid sids regardless of which tenant they're sent to.
+    // Critically, this is OK because: every tenant's state lives in
+    // its own app.db. Tenant A's handlers never read from tenant B's
+    // store, so a spoof produces a write nobody reads. The session
+    // resolve here just needs to be deterministic — accept valid
+    // sids regardless of which tenant they're sent to.
     var prng = std.Random.DefaultPrng.init(0);
     const sid_a = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
     var cookie_buf: [128]u8 = undefined;

@@ -15,9 +15,7 @@
 //!  - else speculative-commit-then-propose-once; a synchronous
 //!    propose failure needs no compensation (kvexp volatility —
 //!    the overlay is lost, no on-disk divergence), mirroring the
-//!    HTTP dispatch fault path;
-//!  - SSE emits are parked on the propose seq and released at
-//!    commit (idiom-1), not fired at accept.
+//!    HTTP dispatch fault path.
 //!
 //! Row shape, per-row run, the "needs propose" predicate, and the
 //! propose tail are injected via `policy` (see
@@ -26,7 +24,6 @@
 const std = @import("std");
 const kv_mod = @import("rove-kv");
 const tenant_mod = @import("rove-tenant");
-const sse_dispatch = @import("sse_dispatch.zig");
 
 /// Run one tenant's contiguous row slice as a single batched txn.
 /// Processes at most `max_rows` (the remainder catches up next pass).
@@ -40,6 +37,7 @@ pub fn drainTenantBatch(
     policy: anytype,
 ) !usize {
     const allocator = worker.allocator;
+    _ = allocator;
     const n = @min(rows.len, max_rows);
     if (n == 0) return 0;
 
@@ -53,14 +51,9 @@ pub fn drainTenantBatch(
         txn.rollback() catch {};
     };
 
-    var writeset = kv_mod.WriteSet.init(allocator);
+    var writeset = kv_mod.WriteSet.init(worker.allocator);
     defer writeset.deinit();
 
-    var pending_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
-    defer {
-        for (pending_emits.items) |*e| e.deinit(allocator);
-        pending_emits.deinit(allocator);
-    }
     var visited: usize = 0;
     for (rows[0..n]) |row| {
         visited += 1;
@@ -70,7 +63,6 @@ pub fn drainTenantBatch(
             inst,
             &txn,
             &writeset,
-            &pending_emits,
             row,
         ) catch |err| {
             std.log.warn(
@@ -83,44 +75,22 @@ pub fn drainTenantBatch(
 
     if (!policy.needsPropose(&writeset)) {
         // Nothing to replicate — release the txn without proposing.
-        // Read-only emits fire immediately; no raft hop to gate on.
         txn.rollback() catch {};
         committed = true;
-        fireEmits(worker, inst.id, &pending_emits);
         return visited;
     }
 
     try txn.commit();
     committed = true;
 
-    policy.propose(worker, inst, &writeset, &pending_emits) catch |err| {
+    policy.propose(worker, inst, &writeset) catch |err| {
         // The local write was a kvexp *speculative* commit (volatile
         // — LMDB only at raft-apply); a propose that never reached
         // raft leaves nothing durable, so there is no local undo to
         // perform (kvexp has no kv_undo table — proposer-audit.md
-        // volatility). propose failed BEFORE parkEmits, so
-        // pending_emits is intact and the defer discards it
-        // (correct: nothing committed → the emit must not fire).
+        // volatility).
         return err;
     };
 
-    // Emits are NOT fired here (accept). policy.propose parked them
-    // on worker.pending_units keyed by the propose seq; the drain
-    // releases them at commit (committedSeq>=seq) / discards on
-    // fault — docs/unified-effect-gating.md idiom-1. (pending_emits
-    // is now emptied; its defer is a no-op.)
     return visited;
-}
-
-/// Hand the merged batch emits to the in-process SSE thread. No-op
-/// when there's no in-process SSE or the batch produced none
-/// (best-effort — SSE is lossy by design).
-fn fireEmits(
-    worker: anytype,
-    tenant_id: []const u8,
-    pe: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
-) void {
-    if (pe.items.len == 0) return;
-    const h = worker.sse_handle orelse return;
-    h.enqueueEmit(tenant_id, pe.items);
 }

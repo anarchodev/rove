@@ -21,10 +21,8 @@ const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
 const limiter_mod = @import("limiter.zig");
-const sse_dispatch = @import("sse_dispatch.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const email_rate_b = @import("bindings/email_rate.zig");
-const events_b = @import("bindings/events.zig");
 const http_b = @import("bindings/http.zig");
 const cont_b = @import("bindings/continuation.zig");
 const stream_b = @import("bindings/stream.zig");
@@ -112,14 +110,6 @@ pub const DispatchState = struct {
     /// to derive the platform-default schedule id (sha256(req_id ||
     /// call_index)) when the customer didn't supply a `handle`.
     http_call_index: u32 = 0,
-    /// 0-based counter of `events.emit` calls within this handler
-    /// invocation. Resets per request. Combined with `request_id`
-    /// to derive the SSE wire id (`{request_id:020d}-{call_index:06d}`)
-    /// so replays produce the same ids and lexical sort = numeric sort.
-    /// One emit increments by one regardless of fan-out cardinality
-    /// (`{to: [a, b, c]}` is one emit, three writes — all share the
-    /// same wire id).
-    events_call_index: u32 = 0,
     /// Resolved session id (see `Request.session_id`). 64 lowercase hex
     /// chars when set; null in non-browser dispatch paths. Surfaced as
     /// `request.session = {id: ...}` (or `request.session = null`).
@@ -160,15 +150,6 @@ pub const DispatchState = struct {
     /// (the snapshot/restore wipes the runtime). Owned values must
     /// be `JS_FreeValue`'d on `deinit`.
     trigger_module_ns: std.StringHashMapUnmanaged(c.JSValue) = .empty,
-    /// Per-batch SSE emit accumulator (sse-plan §3.2). `events.emit`
-    /// appends an entry here as it runs; after raft acks the batch
-    /// the merged list is handed to the in-process SSE thread via
-    /// `sse_server.thread.Handle.enqueueEmit` (task #10 Phase 2 —
-    /// fire-and-forget, best-effort). Owned by `worker_dispatch.dispatchOnce`;
-    /// rows' `[]u8` fields are allocator-owned strings freed on the
-    /// list's `EmitEntry.deinit`. Optional so the dispatcher's standalone
-    /// test paths can leave it null and skip the POST path.
-    emit_buffer: ?*std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = null,
     /// Per-worker rate limiter. Used by the `__rove_check_email_rate`
     /// builtin (called from the `email.send` JS wrapper) to take
     /// from the email bucket before queuing the webhook row. Null in
@@ -333,10 +314,9 @@ fn jsKvSet(
     defer state.allocator.free(val_str);
 
     // Reject writes into platform-reserved namespaces. Platform writers
-    // (http.send → `_send/owed/` marker, events.emit → _events/, etc.)
-    // bypass jsKvSet and write through state.txn / state.writeset
-    // directly, so this guard only fires when customer JS tries to
-    // spoof a platform key.
+    // (http.send → `_send/owed/` marker, etc.) bypass jsKvSet and write
+    // through state.txn / state.writeset directly, so this guard only
+    // fires when customer JS tries to spoof a platform key.
     if (reserved.isCustomerWriteReserved(key_str)) {
         return throwReservedKey(ctx, key_str);
     }
@@ -1279,7 +1259,6 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "console.js", CONSOLE_JS);
     evalSnippet(ctx, "crypto.js", CRYPTO_JS);
     evalSnippet(ctx, "http.js", HTTP_JS);
-    evalSnippet(ctx, "events.js", EVENTS_JS);
     evalSnippet(ctx, "platform.js", PLATFORM_JS);
     evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
     evalSnippet(ctx, "base64.js", BASE64_JS);
@@ -1400,13 +1379,6 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "send",   .cfunc = http_b.jsHttpSend,   .argc = 1 },
         .{ .name = "cancel", .cfunc = http_b.jsHttpCancel, .argc = 1 },
     } },
-    // events.emit. Writes _events/{sid}/{seq} rows in the handler tx;
-    // the SSE pump (worker.zig) drives connected EventSource clients
-    // off those rows. Cross-tenant integrity is structural — each
-    // tenant's events live only in that tenant's app.db.
-    .{ .path = &.{ "_system", "events" }, .fns = &.{
-        .{ .name = "emit", .cfunc = events_b.jsEventsEmit, .argc = 1 },
-    } },
     // platform = { root, instances }. Installed on every context;
     // the C callbacks check `state.platform` and throw for non-admin
     // handlers.
@@ -1470,7 +1442,6 @@ const KV_JS = @embedFile("kv_js");
 const CONSOLE_JS = @embedFile("console_js");
 const CRYPTO_JS = @embedFile("crypto_js");
 const HTTP_JS = @embedFile("http_js");
-const EVENTS_JS = @embedFile("events_js");
 const PLATFORM_JS = @embedFile("platform_js");
 const BASE64_JS = @embedFile("base64_js");
 const URLSEARCHPARAMS_JS = @embedFile("urlsearchparams_js");
@@ -1498,7 +1469,6 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "console", .src = CONSOLE_JS },
     .{ .name = "crypto", .src = CRYPTO_JS },
     .{ .name = "http", .src = HTTP_JS },
-    .{ .name = "events", .src = EVENTS_JS },
     .{ .name = "platform", .src = PLATFORM_JS },
     .{ .name = "base64", .src = BASE64_JS },
     .{ .name = "urlsearchparams", .src = URLSEARCHPARAMS_JS },

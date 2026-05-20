@@ -825,33 +825,59 @@ defined 500 now succeeds (the resume hop fires another http.send,
 chains a wake on its completion, eventually flushes a 200). The full
 unit + smoke suite passes.
 
-### Phase 5 — Dissolution: delete `src/sse_server/` + `events.emit`
+### Phase 5 — Dissolution: delete `src/sse_server/` + `events.emit` — **DONE 2026-05-19**
 
-The final dissolution (§8 — clean break, no back-compat). One phase
-instead of two — there's no JS-shim intermediary because there's no
-back-compat shim.
+The final dissolution (§8 — clean break, no back-compat). Shipped
+as a single phase with no JS-shim intermediary.
 
-- Remove `events.emit(...)` from the globals JS surface entirely.
-  Customer code using it is broken at the deploy boundary (pre-release;
-  no migration period). Docs called this out as upcoming.
-- Delete `src/sse_server/` (the in-process thread, ring cache,
-  connection table, JWT verify, h2 listener) — ~1100 LOC.
-- Remove the `--sse-listen` flag + the spawn block in `loop46/main.zig`.
-- Remove the `/_session/sse-token` worker route (no platform SSE pipe
-  to mint tokens for).
-- Drop the `internal_insecure_tls` flag (renamed from `sse_insecure_tls`
-  in task #10 Phase 4) if its log-push consumer is the only remaining
-  user — confirm at delete time.
-- The single-node restriction from task #10 is lifted (kv-write wakes
-  ride raft → multi-node correctness via §9.3, no rendezvous needed).
-- docs/sse-plan.md becomes a pure historical record; PLAN §13 / §2.12
-  reconciled; connection-actor-plan §6.2 / §12.4 reconciled (§12.4's
-  reversal now reaches its conclusion).
+Shipped:
+- `events.emit(...)` removed from the globals JS surface entirely.
+  Customer code using it breaks at the deploy boundary
+  (pre-release; no migration period).
+- `src/sse_server/` deleted (in-process thread, ring cache,
+  connection table, JWT verify, h2 listener).
+- `--sse-listen` flag + spawn block in `loop46/main.zig` removed.
+- `/_session/sse-token` worker route + `src/js/sse_token.zig`
+  deleted (no platform SSE pipe to mint tokens for).
+- `src/js/bindings/events.zig` (the native binding),
+  `src/js/globals/events.js` (the JS shim), `src/js/sse_dispatch.zig`
+  (the EmitEntry / Handle types), `src/js/events.zig` (SSE caps
+  config) all deleted.
+- `events_emit` / `events_connect` / `events_bytes_out` enum
+  variants + bucket caps in `src/js/limiter.zig` removed.
+- `ParkedUnit.emits` field + `parkEmits` + `firePendingEmits`
+  removed from worker.zig + tenant_batch.zig + callback_dispatch.zig
+  + worker_dispatch.zig.
+- Stale smokes deleted: `sse_server_smoke.py`,
+  `notifications_smoke.py`, `notifications_browser_smoke.py`,
+  `divergence_faultinj_smoke.py`. Stale fixture deleted:
+  `examples/divtest-tenant.json` +
+  `examples/loop46-demo-tenants/divtest/`.
+- Single-node restriction from task #10 lifted (kv-write wakes
+  ride raft → multi-node correctness via §9.3, no rendezvous
+  needed; `loop46` no longer rejects multi-node + SSE at startup
+  because the multi-node + SSE combination no longer goes through
+  loop46 in the first place — it goes through the customer's own
+  `__rove_stream` handler).
+- `docs/sse-plan.md` → pure historical record with retirement
+  banner at the top.
+- `docs/PLAN.md` §2.12 / §13 reconciled (§2.12 archival banner;
+  §13 process map drops sse-server row; §13.3 JS surface drops
+  `events.emit`, adds `__rove_stream`).
+- `docs/connection-actor-plan.md` §6.2 / §12.4 reconciled (§12.4
+  gains a retirement-supersession banner above the task #10
+  collapse archival content; §6.2 now points at this plan as the
+  implementation venue rather than at the deleted sse-service).
 
-Gate: multi-node SSE smoke green (customer SSE endpoint on a 3-node
-cluster, kv-write on node B reaches stream on node A's worker); the
-~1100 LOC deletion shows in the diff; no `sse_server`/`events.emit`
-references remain in `src/`.
+Gates (all green): `zig build` clean; `zig build test` 0 failures;
+the seven streaming-handlers + heldsync smokes (`streaming_smoke`,
+`streaming_heartbeat_smoke`, `streaming_kv_wake_smoke`,
+`streaming_disconnect_writes_smoke`, `streaming_kv_wake_writes_smoke`,
+`streaming_first_hop_writes_smoke`, `heldsync_smoke`) pass; the
+~3950-LOC net deletion (~1100 of which is `src/sse_server/`) shows
+in the diff; no `sse_server`/`events.emit` references remain in
+`src/` (the one residual ref in `loop46/main.zig` is a historical
+"what was retired" comment, not active code).
 
 ---
 

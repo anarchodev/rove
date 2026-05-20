@@ -23,7 +23,6 @@ const send_outbox = @import("send_outbox.zig");
 
 const globals = @import("globals.zig");
 const limiter_mod = @import("limiter.zig");
-const sse_dispatch = @import("sse_dispatch.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const stream_mod = @import("bindings/stream.zig");
 const c = qjs.c;
@@ -207,13 +206,6 @@ pub const Request = struct {
         value: []const u8,
     ) anyerror!void = null,
     scope_kv_ctx: ?*anyopaque = null,
-    /// sse-plan §3.2. `events.emit` appends an `EmitEntry` here; the
-    /// worker fires the merged batch fire-and-forget at sse-server
-    /// after raft commits the writeset. Optional only because
-    /// dispatcher-test paths can leave it null (the test helper
-    /// allocates a local list); the production dispatcher always
-    /// sets it non-null. `events.emit` throws if it's null.
-    emit_buffer: ?*std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = null,
     /// Per-chain identifier; the same string on every activation of
     /// one logical interaction (streaming-handlers-plan §5/§6). Set
     /// by the runtime — inbound mints it (accepts an inbound
@@ -430,7 +422,6 @@ pub const Dispatcher = struct {
             .release_publish_ctx = request.release_publish_ctx,
             .scope_kv_write = request.scope_kv_write,
             .scope_kv_ctx = request.scope_kv_ctx,
-            .emit_buffer = request.emit_buffer,
         };
 
         // Reset the per-request arena (one cursor write) and reseed
@@ -1749,19 +1740,10 @@ fn runOneOutcome(
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
 
-    // Default-allocate the per-batch accumulators. Tests that DO
-    // care pass their own list in via `request.pending_*` and the
-    // local one stays unused.
-    var local_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
-    defer {
-        for (local_emits.items) |*e| e.deinit(testing.allocator);
-        local_emits.deinit(testing.allocator);
-    }
     // If the caller didn't set a query, force `fn=go` so the
     // dispatcher finds our wrapper export.
     var request = request_in;
     if (request.query == null) request.query = "fn=go";
-    if (request.emit_buffer == null) request.emit_buffer = &local_emits;
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
     const outcome = try d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, request, &budget);
@@ -1914,230 +1896,6 @@ test "dispatch: kv.set + kv.get round trip" {
     try testing.expectEqualStrings("rove", r2.body);
 }
 
-test "dispatch: events.emit string form populates emit_buffer with current sid" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
-    defer {
-        for (emits.items) |*e| e.deinit(testing.allocator);
-        emits.deinit(testing.allocator);
-    }
-
-    const sid: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
-    var resp = try runOne(&d, kv,
-        \\const id = events.emit("hello");
-        \\return id;
-    , .{
-        .method = "POST",
-        .path = "/",
-        .session_id = sid,
-        .request_id = 42,
-        .emit_buffer = &emits,
-    });
-    defer resp.deinit(testing.allocator);
-
-    try testing.expectEqualStrings("00000000000000000042-000000", resp.body);
-    try testing.expectEqual(@as(usize, 1), emits.items.len);
-    const e = &emits.items[0];
-    try testing.expectEqualStrings("00000000000000000042-000000", &e.event_id);
-    try testing.expectEqualStrings("message", e.event_type);
-    try testing.expectEqualStrings("\"hello\"", e.data_json);
-    try testing.expectEqual(@as(usize, 1), e.target_sids.len);
-    try testing.expectEqualStrings(&sid, e.target_sids[0]);
-}
-
-test "dispatch: events.emit object form carries custom type + data" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
-    defer {
-        for (emits.items) |*e| e.deinit(testing.allocator);
-        emits.deinit(testing.allocator);
-    }
-
-    const sid: [64]u8 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".*;
-    var resp = try runOne(&d, kv,
-        \\events.emit({type: "tick", data: {count: 7, label: "foo"}});
-        \\return "ok";
-    , .{
-        .method = "POST",
-        .path = "/",
-        .session_id = sid,
-        .request_id = 1,
-        .emit_buffer = &emits,
-    });
-    defer resp.deinit(testing.allocator);
-
-    try testing.expectEqual(@as(usize, 1), emits.items.len);
-    const e = &emits.items[0];
-    try testing.expectEqualStrings("tick", e.event_type);
-    try testing.expect(std.mem.indexOf(u8, e.data_json, "\"count\":7") != null);
-    try testing.expect(std.mem.indexOf(u8, e.data_json, "\"label\":\"foo\"") != null);
-}
-
-test "dispatch: events.emit explicit fan-out lists both sids on the entry" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
-    defer {
-        for (emits.items) |*e| e.deinit(testing.allocator);
-        emits.deinit(testing.allocator);
-    }
-
-    const me: [64]u8 = "1111111111111111111111111111111111111111111111111111111111111111".*;
-    var resp = try runOne(&d, kv,
-        \\events.emit({to: ["aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
-        \\                  "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"],
-        \\             data: "x"});
-        \\return "ok";
-    , .{
-        .method = "POST",
-        .path = "/",
-        .session_id = me,
-        .request_id = 5,
-        .emit_buffer = &emits,
-    });
-    defer resp.deinit(testing.allocator);
-
-    try testing.expectEqual(@as(usize, 1), emits.items.len);
-    const e = &emits.items[0];
-    try testing.expectEqual(@as(usize, 2), e.target_sids.len);
-    try testing.expectEqualStrings("aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111", e.target_sids[0]);
-    try testing.expectEqualStrings("bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222", e.target_sids[1]);
-    // Explicit `to:` overrides the implicit-target — `me` doesn't appear.
-    for (e.target_sids) |s| {
-        try testing.expect(!std.mem.eql(u8, s, &me));
-    }
-}
-
-test "dispatch: events.emit increments call_index across calls" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    const sid: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
-    var resp = try runOne(
-        &d,
-        kv,
-        \\const a = events.emit("first");
-        \\const b = events.emit("second");
-        \\const c = events.emit("third");
-        \\return a + "|" + b + "|" + c;
-    ,
-        .{ .method = "POST", .path = "/", .session_id = sid, .request_id = 9 },
-    );
-    defer resp.deinit(testing.allocator);
-
-    // Call indices 0, 1, 2 — all under the same request_id.
-    try testing.expectEqualStrings(
-        "00000000000000000009-000000|00000000000000000009-000001|00000000000000000009-000002",
-        resp.body,
-    );
-}
-
-test "dispatch: events.emit throws when no session and no to:" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var resp = try runOne(
-        &d,
-        kv,
-        \\try { events.emit("hi"); return "no_throw"; }
-        \\catch (e) { return e.code; }
-    ,
-        .{ .method = "POST", .path = "/" }, // no session_id
-    );
-    defer resp.deinit(testing.allocator);
-
-    try testing.expectEqualStrings("no_session", resp.body);
-}
-
-test "dispatch: events.emit rejects customer-supplied id" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    const sid: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
-    var resp = try runOne(
-        &d,
-        kv,
-        \\try { events.emit({id: "cheat", data: "x"}); return "no_throw"; }
-        \\catch (e) { return e.code; }
-    ,
-        .{ .method = "POST", .path = "/", .session_id = sid, .request_id = 1 },
-    );
-    defer resp.deinit(testing.allocator);
-
-    try testing.expectEqualStrings("events_id_reserved", resp.body);
-}
-
-test "dispatch: events.emit rejects malformed sid in to:" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    const sid: [64]u8 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".*;
-    var resp = try runOne(
-        &d,
-        kv,
-        \\try { events.emit({to: "not-a-sid", data: "x"}); return "no_throw"; }
-        \\catch (e) { return e.code; }
-    ,
-        .{ .method = "POST", .path = "/", .session_id = sid, .request_id = 1 },
-    );
-    defer resp.deinit(testing.allocator);
-
-    try testing.expectEqualStrings("events_bad_sid", resp.body);
-}
 
 test "dispatch: http.send writes _send/owed/{derived id}" {
     var buf: [64]u8 = undefined;

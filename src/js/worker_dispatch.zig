@@ -35,8 +35,6 @@ const raft_propose = @import("raft_propose.zig");
 const panic_mod = @import("panic.zig");
 const worker_mod = @import("worker.zig");
 const session_mod = @import("session.zig");
-const sse_dispatch = @import("sse_dispatch.zig");
-const sse_token_mod = @import("sse_token.zig");
 
 // Edge-proxy detection. rove-h2 is HTTP/2-only and TLS deployments
 // rely on ALPN — direct exposure to the public internet silently
@@ -430,7 +428,6 @@ fn finalizeBatch(
     anchor: *const tenant_mod.Instance,
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *const kv_mod.WriteSet,
-    pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
     successes: *std.ArrayList(SuccessRec),
 ) !usize {
     const server = worker.h2;
@@ -517,11 +514,6 @@ fn finalizeBatch(
                 captureSuccess(worker, anchor_id, s, s.status_code, .ok);
                 processed += 1;
             }
-            // Any emits from this tainted batch gate on the same
-            // commit (idiom-1 consistency — they announce the same
-            // not-yet-durable state).
-            worker_mod.parkEmits(worker, seq, anchor_id, pending_emits) catch |perr|
-                std.log.warn("rove-js idiom-0 parkEmits (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
             successes.clearRetainingCapacity();
             return processed;
         }
@@ -572,8 +564,6 @@ fn finalizeBatch(
             captureSuccess(worker, anchor_id, s, s.status_code, .ok);
             processed += 1;
         }
-        // Read-only emits: no raft to gate on.
-        fireEmitsIfWired(worker, anchor_id, pending_emits);
         successes.clearRetainingCapacity();
         return processed;
     }
@@ -654,35 +644,8 @@ fn finalizeBatch(
         captureSuccess(worker, anchor_id, s, s.status_code, .ok);
         processed += 1;
     }
-    // KNOWN DEVIATION: this H2 propose-success path still fires SSE
-    // emits at *accept* (propose returned), not at commit. The old
-    // "sse-plan §3.2 only needs accept ordering" rationale was
-    // OVERRULED (docs/unified-effect-gating.md §6: emits must gate
-    // on commit). idiom-1 closed this for the tenant_batch path
-    // (parkEmits, released by drainRaftPending at commit) and the
-    // idiom-0 barrier path here parks too; gating this H2 path is
-    // the remaining §6 step (tracked, not a correctness regression
-    // introduced here — a pre-existing deviation, scoped separately
-    // from this comment pass).
-    fireEmitsIfWired(worker, anchor_id, pending_emits);
     successes.clearRetainingCapacity();
     return processed;
-}
-
-/// Fire the merged emit batch at sse-server, fire-and-forget. No-op
-/// if the worker isn't configured for SSE delivery, the batch is
-/// empty, or no successful handler is in `successes` (the request_id
-/// for the wire body's outer breadcrumb comes from the first
-/// success). Safe to call from any of `finalizeBatch`'s exit paths
-/// — caller still owns + frees `pending_emits`.
-fn fireEmitsIfWired(
-    worker: anytype,
-    anchor_id: []const u8,
-    pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
-) void {
-    if (pending_emits.items.len == 0) return;
-    const h = worker.sse_handle orelse return;
-    h.enqueueEmit(anchor_id, pending_emits.items);
 }
 
 /// `/_system/*` route handler — CORS preflight + `services-token`
@@ -1825,17 +1788,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     defer writeset.deinit();
 
 
-    // Per-batch SSE emit accumulator (sse-plan §3.2). `events.emit`
-    // appends here; `finalizeBatch` fires the merged batch at
-    // sse-server fire-and-forget after raft propose succeeds. The
-    // legacy kv-row write also still happens (parallel run); cutover
-    // is plan §7 step 7.
-    var pending_emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty;
-    defer {
-        for (pending_emits.items) |*e| e.deinit(allocator);
-        pending_emits.deinit(allocator);
-    }
-
     // Successful handlers awaiting the shared commit + final move.
     // Owns `console_owned` / `exception_owned` until they transfer
     // into a log record after commit.
@@ -1933,31 +1885,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
         defer tc.release();
         const dep_id = snap.deployment_id;
-
-        // `/_session/sse-token` — mints the JWT the customer's JS
-        // hands to sse-server's EventSource open (sse-plan §5.1).
-        // Same-origin to whatever domain the app is on; reads
-        // `__Host-rove_sid`, scoping the token to (tenant_id, sid).
-        // Skipped silently when `services_jwt_secret` is unwired —
-        // the handler answers 503 in that case.
-        if (try sse_token_mod.tryHandleSseToken(
-            server,
-            allocator,
-            worker.services_jwt_secret,
-            worker.sse_public_base,
-            scope_inst.id,
-            ent,
-            sid,
-            sess,
-            method,
-            path,
-            rh,
-            received_ns,
-        )) {
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 200, .ok, &.{}, &.{}, .{}, null, .inbound);
-            processed += 1;
-            continue;
-        }
 
         // Rate limiter: every request — admin AND customer — checks
         // the per-instance request bucket. Admin used to bypass on
@@ -2226,7 +2153,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 @ptrCast(worker)
             else
                 null,
-            .emit_buffer = &pending_emits,
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(
@@ -2565,7 +2491,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         anchor.?,
         txn.?,
         &writeset,
-        &pending_emits,
         &successes,
     );
     return processed;

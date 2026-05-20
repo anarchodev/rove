@@ -3,10 +3,13 @@
 //! for the full design; this is the primitive under SSE, WebSockets,
 //! held-synchronous third-party calls, and the atproto firehose.
 //!
-//! The shipped sse-service (`src/sse_server/`) is unchanged by this —
-//! the connection-holder is a *sibling* subsystem (plan §9), mirroring
-//! its isolation discipline: own h2 listener, own connection table,
-//! zero handler-side connection state. The worker pends writes / reads
+//! The platform-managed sse-service has been retired
+//! (streaming-handlers-plan §8); customer-arbitrary SSE composes on
+//! top of `__rove_stream` + the §4.6 kv-write wake (worker-resident
+//! held streams). The connection-holder remains a *sibling*
+//! subsystem (plan §9) for non-SSE long-lived sockets (WebSockets,
+//! atproto firehose) — own h2 listener, own connection table, zero
+//! handler-side connection state. The worker pends writes / reads
 //! handles; it never owns a socket.
 //!
 //! Build phasing (tracked outside the tree):

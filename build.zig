@@ -230,28 +230,6 @@ pub fn build(b: *std.Build) void {
     log_server_mod.addImport("rove-log", log_mod);
     log_server_mod.addImport("rove-jwt", jwt_mod);
 
-    // ── rove-sse-server: centralized SSE notification service ───────
-    //
-    // Replaces the in-worker `_events/{sid}/...` storage + pump model
-    // (sse-plan §1). Standalone process; receives `POST /v1/emit` from
-    // workers and serves long-lived `text/event-stream` connections to
-    // browsers. Per-(tenant, sid) ring cache + per-tenant connection
-    // table live in-memory; failover is "load balancer fails over,
-    // clients reconnect, hit sentinel, refetch."
-    const sse_server_mod = b.addModule("rove-sse-server", .{
-        .root_source_file = b.path("src/sse_server/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    sse_server_mod.link_libc = true;
-    sse_server_mod.linkSystemLibrary("nghttp2", .{});
-    sse_server_mod.linkSystemLibrary("ssl", .{});
-    sse_server_mod.linkSystemLibrary("crypto", .{});
-    sse_server_mod.addImport("rove", rove_mod);
-    sse_server_mod.addImport("rove-io", io_mod);
-    sse_server_mod.addImport("rove-h2", h2_mod);
-    sse_server_mod.addImport("rove-jwt", jwt_mod);
-
     // ── rove-connection-holder: held-socket subsystem ───────────────
     //
     // The plan §9 sibling of sse-server: owns long-lived held sockets
@@ -393,10 +371,6 @@ pub fn build(b: *std.Build) void {
     const jwt_tests = b.addTest(.{ .root_module = jwt_mod });
     test_step.dependOn(&b.addRunArtifact(jwt_tests).step);
 
-    // rove-sse-server tests
-    const sse_server_tests = b.addTest(.{ .root_module = sse_server_mod });
-    test_step.dependOn(&b.addRunArtifact(sse_server_tests).step);
-
     // rove-connection-holder tests
     const conn_holder_tests = b.addTest(.{ .root_module = conn_holder_mod });
     test_step.dependOn(&b.addRunArtifact(conn_holder_tests).step);
@@ -440,7 +414,6 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-files", files_mod);
     js_mod.addImport("rove-log", log_mod);
     js_mod.addImport("rove-log-server", log_server_mod);
-    js_mod.addImport("rove-sse-server", sse_server_mod);
     js_mod.addImport("rove-jwt", jwt_mod);
     js_mod.addImport("rove-tape", tape_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
@@ -463,7 +436,6 @@ pub fn build(b: *std.Build) void {
         .{ .name = "console_js", .path = "src/js/globals/console.js" },
         .{ .name = "crypto_js", .path = "src/js/globals/crypto.js" },
         .{ .name = "http_js", .path = "src/js/globals/http.js" },
-        .{ .name = "events_js", .path = "src/js/globals/events.js" },
         .{ .name = "platform_js", .path = "src/js/globals/platform.js" },
         .{ .name = "base64_js", .path = "src/js/globals/base64.js" },
         .{ .name = "urlsearchparams_js", .path = "src/js/globals/urlsearchparams.js" },
@@ -531,7 +503,6 @@ pub fn build(b: *std.Build) void {
     loop46_mod.addImport("rove-tenant", tenant_mod);
     loop46_mod.addImport("rove-h2", h2_mod);
     loop46_mod.addImport("rove-schedule-server", schedule_server_mod);
-    loop46_mod.addImport("rove-sse-server", sse_server_mod);
     loop46_mod.addImport("rove-acme", acme_mod);
     // The admin + replay tenant bundles + UI files used to be
     // embedded into the loop46 binary so the worker could

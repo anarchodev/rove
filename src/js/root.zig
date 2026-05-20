@@ -58,9 +58,6 @@ pub const send_outbox = @import("send_outbox.zig");
 pub const send_inflight = @import("send_inflight.zig");
 pub const send_dispatch = @import("send_dispatch.zig");
 pub const session = @import("session.zig");
-pub const events = @import("events.zig");
-pub const sse_dispatch = @import("sse_dispatch.zig");
-pub const sse_token = @import("sse_token.zig");
 pub const deployment_loader = @import("deployment_loader.zig");
 pub const DeploymentLoader = deployment_loader.DeploymentLoader;
 
@@ -112,8 +109,5 @@ test {
     _ = send_inflight;
     _ = send_dispatch;
     _ = session;
-    _ = events;
-    _ = sse_dispatch;
-    _ = sse_token;
     _ = deployment_loader;
 }

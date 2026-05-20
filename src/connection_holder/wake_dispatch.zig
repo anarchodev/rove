@@ -1,20 +1,19 @@
 //! Holder → worker wake delivery (plan §6.1 degenerate case).
 //!
-//! The mirror image of `src/js/sse_dispatch.zig`: there the worker
-//! POSTs the sse-server; here the holder forwards a parked request to
-//! a worker. A wake is "an ordinary replayable request" (plan §1) —
-//! for the `open` wake at chain-length-one that means: replay the
-//! captured connect request to a worker, let the worker's normal
-//! pipeline run the owning tenant's handler (its response is already
-//! gated on the raft propose by the existing data-durability model),
-//! and hand the response back so the holder can flush it to the held
-//! socket and close.
+//! The holder forwards a parked request to a worker. A wake is "an
+//! ordinary replayable request" (plan §1) — for the `open` wake at
+//! chain-length-one that means: replay the captured connect request
+//! to a worker, let the worker's normal pipeline run the owning
+//! tenant's handler (its response is already gated on the raft
+//! propose by the existing data-durability model), and hand the
+//! response back so the holder can flush it to the held socket and
+//! close.
 //!
-//! The forward carries the internal bearer so the worker can treat it
-//! as platform-originated (layer 3). Synchronous inside the holder's
-//! drain for 2b — same v1 tradeoff `sse_dispatch` documents; the
-//! async apply→notify path is Phase 3's concern, forced there by
-//! cross-wake fan-in, not by the degenerate case.
+//! The forward carries the internal bearer so the worker can treat
+//! it as platform-originated (layer 3). Synchronous inside the
+//! holder's drain for 2b; the async apply→notify path is Phase 3's
+//! concern, forced there by cross-wake fan-in, not by the
+//! degenerate case.
 
 const std = @import("std");
 const blob_curl = @import("rove-blob").curl;

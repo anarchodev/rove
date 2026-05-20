@@ -74,8 +74,6 @@ const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
 const panic_mod = @import("panic.zig");
 const penalty_mod = @import("penalty.zig");
-const sse_dispatch = @import("sse_dispatch.zig");
-const sse_server_mod = @import("rove-sse-server");
 const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
@@ -129,18 +127,13 @@ pub const ParkedUnit = struct {
     deadline_ns: i64,
     /// Owned copy — must outlive the proposing dispatch across ticks.
     tenant_id: []u8,
-    /// Owned; handed to the in-process SSE thread via
-    /// `Handle.enqueueEmit` on commit (it deep-copies, so this list
-    /// is freed right after) or `deinit`'d (discarded) on fault.
-    emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty,
     /// Option (b) 4b-ii-B: owned commit-gated send arm/resolve intents
     /// (`_send/owed/` put → arm, `_send/proof/` put / `_send/owed/`
     /// delete → resolve). Fired into the leader-local SendDispatch on
     /// commit (`firePendingSendOps`), discarded with the rest of the
     /// unit on fault/timeout/leadership-loss — the durable per-tenant
     /// `_send/owed/` + new-leader boot-scan covers a discard, so no
-    /// silent loss. Separate `ParkedUnit` from any emit unit (a hop
-    /// can have sends but no emits); both ride `pending_units`.
+    /// silent loss.
     send_ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty,
     /// Streaming-handlers-plan §4.6: commit-gated kv-wake intents.
     /// Captured from the batch's writeset at propose time;
@@ -160,14 +153,11 @@ pub const ParkedUnit = struct {
     /// `drainRaftPending` would never commit it; the pending_units
     /// sweep does instead. On commit: `tracked.commit() + destroy`;
     /// on fault: `tracked.rollback() + destroy`. Null on the
-    /// historical entity-backed units (`parkSendOps` / `parkEmits`
-    /// from the inbound dispatch path) — the entity loop already
-    /// owns those.
+    /// historical entity-backed units (`parkSendOps` from the
+    /// inbound dispatch path) — the entity loop already owns those.
     txn: ?*kv_mod.KvStore.TrackedTxn = null,
 
     pub fn deinit(self: *ParkedUnit, allocator: std.mem.Allocator) void {
-        for (self.emits.items) |*e| e.deinit(allocator);
-        self.emits.deinit(allocator);
         for (self.send_ops.items) |*o| o.deinit(allocator);
         self.send_ops.deinit(allocator);
         for (self.kv_wakes.items) |*w| w.deinit(allocator);
@@ -1318,24 +1308,10 @@ pub const WorkerConfig = struct {
     /// Public origin the dashboard / CLI uses to reach files-server.
     /// Returned in the `/_system/services-token` response. Borrowed.
     files_public_base: ?[]const u8 = null,
-    /// In-process SSE thread (task #10 Phase 2). `events.emit`
-    /// batches are handed to it via `Handle.enqueueEmit` after the
-    /// writeset commits — replaces the retired worker→sse-server
-    /// HTTP POST. Borrowed (owned by `main.zig`); null = no
-    /// in-process SSE (emits are dropped, SSE being best-effort).
-    sse_handle: ?*sse_server_mod.thread.Handle = null,
-    /// Browser-facing SSE base (`https://sse.{public_suffix}`) the
-    /// `/_session/sse-token` mint embeds in the token's
-    /// `notifications_url` so the customer's page knows where to open
-    /// its `EventSource`. NOT a worker POST target (that path is
-    /// retired). Derived from `--public-suffix` when in-process SSE
-    /// is enabled; null = no notifications_url in the token.
-    sse_public_base: ?[]const u8 = null,
     /// Skip TLS peer verification on the worker's **internal-service**
-    /// POSTs. Despite the name this now gates only the log-server
-    /// push path (`sendPushChunk`); SSE no longer does HTTP. Set true
-    /// in dev / smoke clusters with self-signed internal certs;
-    /// production must leave this false. (Rename deferred to Phase 4.)
+    /// POSTs. Currently gates only the log-server push path
+    /// (`sendPushChunk`). Set true in dev / smoke clusters with
+    /// self-signed internal certs; production must leave this false.
     internal_insecure_tls: bool = false,
     /// Origin allowed to call `/_system/*` with CORS. When set, the
     /// worker answers browser preflight (OPTIONS) requests from this
@@ -1552,13 +1528,6 @@ pub fn Worker(comptime opts: Options) type {
         services_jwt_secret: ?[]const u8,
         log_public_base: ?[]const u8,
         files_public_base: ?[]const u8,
-        /// In-process SSE thread (task #10 Phase 2). `events.emit`
-        /// batches are enqueued here post-commit; null = no
-        /// in-process SSE (emits dropped — SSE is best-effort).
-        sse_handle: ?*sse_server_mod.thread.Handle,
-        /// Browser-facing SSE base for the `/_session/sse-token`
-        /// mint's `notifications_url` (NOT a POST target).
-        sse_public_base: ?[]const u8,
         /// Internal-service POST insecure-TLS toggle (now log-push
         /// only — see the worker struct field doc).
         internal_insecure_tls: bool,
@@ -1648,8 +1617,6 @@ pub fn Worker(comptime opts: Options) type {
                 .services_jwt_secret = config.services_jwt_secret,
                 .log_public_base = config.log_public_base,
                 .files_public_base = config.files_public_base,
-                .sse_handle = config.sse_handle,
-                .sse_public_base = config.sse_public_base,
                 .internal_insecure_tls = config.internal_insecure_tls,
                 .log_push_curl = blk: {
                     if (config.log_public_base == null) break :blk null;
@@ -3207,7 +3174,6 @@ pub fn drainRaftPending(worker: anytype) !void {
                 allocator.destroy(t);
                 unit.txn = null;
             }
-            firePendingEmits(worker, unit);
             firePendingSendOps(worker, unit);
             firePendingKvWakes(worker, unit);
             unit.deinit(allocator);
@@ -4689,22 +4655,12 @@ fn proposeForgetfulWrites(
     });
 }
 
-/// Fire a committed parked unit's buffered SSE emits. No-op (caller
-/// still discards the buffer) when the worker isn't wired for SSE.
-/// Mirrors `tenant_batch`'s emit-fire wiring, but gated on commit
-/// instead of accept — the idiom-1 correctness fix.
-fn firePendingEmits(worker: anytype, unit: *ParkedUnit) void {
-    if (unit.emits.items.len == 0) return;
-    const h = worker.sse_handle orelse return;
-    h.enqueueEmit(unit.tenant_id, unit.emits.items);
-}
-
 /// Fire commit-gated send arm/resolve intents into the leader-local
-/// SendDispatch. Mirrors `firePendingEmits`: gated on commit, no-op
-/// on an empty set. `worker.node.send_dispatch` is null until
-/// `startSendDispatch` (and never wired on a non-leader path that
-/// matters); `OwnedIntent.fire` tolerates null (a dropped intent is
-/// re-derived by the promotion boot-scan — no silent loss).
+/// SendDispatch. Gated on commit, no-op on an empty set.
+/// `worker.node.send_dispatch` is null until `startSendDispatch`
+/// (and never wired on a non-leader path that matters);
+/// `OwnedIntent.fire` tolerates null (a dropped intent is re-derived
+/// by the promotion boot-scan — no silent loss).
 fn firePendingSendOps(worker: anytype, unit: *ParkedUnit) void {
     if (unit.send_ops.items.len == 0) return;
     const sd = worker.node.send_dispatch;
@@ -4814,27 +4770,6 @@ pub fn parkKvWakes(
             @as(i128, @intCast(worker.commit_wait_timeout_ns))),
         .tenant_id = tid,
         .kv_wakes = wakes,
-    });
-}
-
-pub fn parkEmits(
-    worker: anytype,
-    seq: u64,
-    tenant_id: []const u8,
-    emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
-) !void {
-    if (emits.items.len == 0) return; // nothing to gate
-    const allocator = worker.allocator;
-    try worker.pending_units.ensureUnusedCapacity(allocator, 1);
-    const tid = try allocator.dupe(u8, tenant_id);
-    const moved = emits.*;
-    emits.* = .empty;
-    worker.pending_units.appendAssumeCapacity(.{
-        .seq = seq,
-        .deadline_ns = @intCast(std.time.nanoTimestamp() +
-            @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .tenant_id = tid,
-        .emits = moved,
     });
 }
 

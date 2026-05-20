@@ -31,18 +31,6 @@ const std = @import("std");
 pub const Action = enum(u8) {
     request,
     email,
-    /// Per `events.emit` call (one token per call, regardless of
-    /// fan-out cardinality — `{to: [a,b,c]}` is one emit, three
-    /// writes, one token).
-    events_emit,
-    /// Per `GET /_events` connection establishment. Defends against
-    /// connection-churn DoS (open/close/open/close).
-    events_connect,
-    /// One token per byte the SSE pump writes to wire. Pump consumes
-    /// from this before each frame; empty bucket = pump skips that
-    /// connection this tick (events stay in retention, deliver next
-    /// tick).
-    events_bytes_out,
 };
 
 const ACTION_COUNT: usize = std.meta.fields(Action).len;
@@ -57,15 +45,6 @@ pub const RateLimitCaps = struct {
     email_capacity: u32 = 10,
     /// 1/sec → 60/min sustained — well under any sane Resend quota.
     email_refill_per_sec: u32 = 1,
-    // SSE caps. Defaults are the free-tier numbers from
-    // docs/sse-plan.md §4.2 + src/js/events.zig:FREE; paid-tier
-    // workers can override via the events.PAID profile.
-    events_emit_capacity: u32 = 200,
-    events_emit_refill_per_sec: u32 = 100,
-    events_connect_capacity: u32 = 20,
-    events_connect_refill_per_sec: u32 = 5,
-    events_bytes_out_capacity: u32 = 256 * 1024,
-    events_bytes_out_refill_per_sec: u32 = 64 * 1024,
 };
 
 pub fn defaultCaps() RateLimitCaps {
@@ -143,21 +122,6 @@ const InstanceBuckets = struct {
             caps.email_refill_per_sec,
             now_ns,
         );
-        bs[@intFromEnum(Action.events_emit)] = TokenBucket.init(
-            caps.events_emit_capacity,
-            caps.events_emit_refill_per_sec,
-            now_ns,
-        );
-        bs[@intFromEnum(Action.events_connect)] = TokenBucket.init(
-            caps.events_connect_capacity,
-            caps.events_connect_refill_per_sec,
-            now_ns,
-        );
-        bs[@intFromEnum(Action.events_bytes_out)] = TokenBucket.init(
-            caps.events_bytes_out_capacity,
-            caps.events_bytes_out_refill_per_sec,
-            now_ns,
-        );
         return .{ .buckets = bs };
     }
 };
@@ -196,11 +160,9 @@ pub const RateLimiter = struct {
         return self.checkN(instance_id, action, 1, now_ns);
     }
 
-    /// Take `n` tokens from `(instance_id, action)`. The
-    /// `events_bytes_out` action uses 1 token = 1 byte and consumes
-    /// the wire-frame length per push. Returns true iff the bucket
-    /// had `n` tokens (decremented); false if not (bucket unchanged
-    /// beyond the refill).
+    /// Take `n` tokens from `(instance_id, action)`. Returns true
+    /// iff the bucket had `n` tokens (decremented); false if not
+    /// (bucket unchanged beyond the refill).
     pub fn checkN(
         self: *RateLimiter,
         instance_id: []const u8,
@@ -289,68 +251,6 @@ test "bucket: secondsUntil returns 0 when bucket has enough" {
     try testing.expectEqual(@as(f64, 0), b.secondsUntil(10));
 }
 
-test "RateLimiter: events_emit action takes one token per call" {
-    var lim = RateLimiter.init(testing.allocator, .{
-        .events_emit_capacity = 3,
-        .events_emit_refill_per_sec = 0,
-    });
-    defer lim.deinit();
-
-    try testing.expect(try lim.check("acme", .events_emit, 0));
-    try testing.expect(try lim.check("acme", .events_emit, 0));
-    try testing.expect(try lim.check("acme", .events_emit, 0));
-    try testing.expect(!try lim.check("acme", .events_emit, 0));
-}
-
-test "RateLimiter: events_connect bucket independent of events_emit" {
-    var lim = RateLimiter.init(testing.allocator, .{
-        .events_emit_capacity = 1,
-        .events_connect_capacity = 5,
-    });
-    defer lim.deinit();
-
-    try testing.expect(try lim.check("acme", .events_emit, 0));
-    try testing.expect(!try lim.check("acme", .events_emit, 0));
-    // Connect bucket still full.
-    try testing.expect(try lim.check("acme", .events_connect, 0));
-}
-
-test "RateLimiter: events_bytes_out takes N tokens at once" {
-    var lim = RateLimiter.init(testing.allocator, .{
-        .events_bytes_out_capacity = 1024,
-        .events_bytes_out_refill_per_sec = 0,
-    });
-    defer lim.deinit();
-
-    try testing.expect(try lim.checkN("acme", .events_bytes_out, 512, 0));
-    try testing.expect(try lim.checkN("acme", .events_bytes_out, 512, 0));
-    try testing.expect(!try lim.checkN("acme", .events_bytes_out, 1, 0));
-}
-
-test "RateLimiter: events_bytes_out refills over time" {
-    var lim = RateLimiter.init(testing.allocator, .{
-        .events_bytes_out_capacity = 1024,
-        .events_bytes_out_refill_per_sec = 1024, // 1 KiB/sec
-    });
-    defer lim.deinit();
-
-    try testing.expect(try lim.checkN("acme", .events_bytes_out, 1024, 0));
-    try testing.expect(!try lim.checkN("acme", .events_bytes_out, 1, 0));
-    // After 1 second, 1024 bytes refilled.
-    try testing.expect(try lim.checkN("acme", .events_bytes_out, 1024, std.time.ns_per_s));
-}
-
-test "RateLimiter: per-instance independence" {
-    var lim = RateLimiter.init(testing.allocator, .{
-        .events_emit_capacity = 1,
-    });
-    defer lim.deinit();
-
-    try testing.expect(try lim.check("acme", .events_emit, 0));
-    try testing.expect(!try lim.check("acme", .events_emit, 0));
-    // Different instance — its own bucket.
-    try testing.expect(try lim.check("beta", .events_emit, 0));
-}
 
 test "bucket: secondsUntil = inf when refill rate is 0" {
     var b = TokenBucket.init(10, 0, 0);

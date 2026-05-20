@@ -45,7 +45,7 @@
 //! so a named export is invoked with positional args; event JSON
 //! still arrives via `request.body`.
 //!
-//! The handler may call `kv.*` / `http.send` / `events.emit` —
+//! The handler may call `kv.*` / `http.send` —
 //! its writes go into the same tenant batch txn as the receipt
 //! delete and replicate through raft together. If the handler
 //! throws or hits its budget, the savepoint rolls back and the
@@ -70,7 +70,6 @@ const tenant_mod = @import("rove-tenant");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const worker_mod = @import("worker.zig");
-const sse_dispatch = @import("sse_dispatch.zig");
 const raft_propose = @import("raft_propose.zig");
 const tenant_batch = @import("tenant_batch.zig");
 const send_outbox = @import("send_outbox.zig");
@@ -127,10 +126,9 @@ const SendCompletionPolicy = struct {
         inst: *const tenant_mod.Instance,
         txn: anytype,
         ws: anytype,
-        pe: anytype,
         row: CompletionRow,
     ) !void {
-        const oc = try runOneCallback(worker, tc, inst, txn, ws, pe, row.id, row.payload);
+        const oc = try runOneCallback(worker, tc, inst, txn, ws, row.id, row.payload);
         switch (oc) {
             .delivered => {}, // proof written → 4b-ii feed → resolve
             .kept, .dropped => try self.requeued.append(worker.allocator, row.id),
@@ -146,15 +144,15 @@ const SendCompletionPolicy = struct {
         worker: anytype,
         inst: *const tenant_mod.Instance,
         ws: anytype,
-        pe: anytype,
     ) !void {
         // The on_result handler's writes + Seam-A `_send/proof/`
         // commit in one batch; parkSendOps gates the proof on commit
         // → 4b-ii → resolve.
         const seq = try raft_propose.proposeBatch(worker, ws, inst.id);
-        try worker_mod.parkEmits(worker, seq, inst.id, pe);
         worker_mod.parkSendOps(worker, seq, inst.id, ws) catch |perr|
             std.log.warn("rove-js sendcompl parkSendOps (tenant={s}): {s}", .{ inst.id, @errorName(perr) });
+        worker_mod.parkKvWakes(worker, seq, inst.id, ws) catch |perr|
+            std.log.warn("rove-js sendcompl parkKvWakes (tenant={s}): {s}", .{ inst.id, @errorName(perr) });
     }
 };
 
@@ -341,7 +339,6 @@ fn runOneCallback(
     inst: *const tenant_mod.Instance,
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *kv_mod.WriteSet,
-    pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
     callback_id: []const u8,
     envelope_bytes: []const u8,
 ) !CallbackOutcome {
@@ -452,7 +449,6 @@ fn runOneCallback(
         // they share the customer's email bucket via the same limiter.
         .limiter = &worker.limiter,
         .instance_id = inst.id,
-        .emit_buffer = pending_emits,
     };
 
     var budget = Budget.fromNow(Budget.default_duration_ns);

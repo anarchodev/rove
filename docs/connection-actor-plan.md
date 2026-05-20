@@ -206,13 +206,16 @@ on.
 
 ### 6.2 SSE (unidirectional, ephemeral projection)
 
-> **Update (2026-05-19, task #10):** the "sse-service as built stays
-> as built" sentence below was reversed — SSE collapsed into a
-> loop46 in-process thread, single-node only, cross-node fan-out
-> dropped. **See §12.4 for the authoritative current state.** §6.2's
-> projection contract (empty inbound frontier, ephemeral durability,
-> reconnect→refetch) is unchanged; only the implementation venue
-> moved.
+> **Update (2026-05-19, streaming-handlers Phase 5).** §6.2 is now
+> **implemented** — the platform-managed sse-service has been
+> dissolved (§12.4 retirement notice) and replaced by
+> customer-arbitrary SSE on `__rove_stream` + the §4.6 kv-write
+> wake. The §6.2 projection contract (empty inbound frontier,
+> ephemeral durability, reconnect→refetch) carries forward
+> verbatim — only the implementation venue moved, from a platform
+> bus to a customer-JS layer over `__rove_stream`. See
+> `docs/streaming-handlers-plan.md` §7 for the worked example and
+> §8 for the dissolution.
 
 A connection-actor with an empty inbound frontier (server→client only) and
 ephemeral application durability (handler persists nothing; reconnect → the
@@ -512,7 +515,29 @@ making it the universal mechanism. PLAN §13 surface-map note added
 `project_connection_actor_unified_trigger`,
 `project_callback_execution_model`, `project_connection_holder_security`.
 
-### 12.4 SSE collapsed in-process (2026-05-19) — supersedes §12.2 "stack, not merge"
+### 12.4 SSE dissolved entirely (2026-05-19) — supersedes 12.4-prior-revision
+
+**Status update.** The task #10 collapse described in this section
+(in-process SSE thread, single-node only) is **itself retired** by
+streaming-handlers Phase 5 (also 2026-05-19, same day, second
+move). The platform-managed SSE pipe no longer exists — no
+`events.emit`, no `_session/sse-token`, no `--sse-listen`, no
+`Handle.enqueueEmit`, no `src/sse_server/`. The streaming-handlers
+§7 worked example shows what replaces it: customers write their
+own SSE endpoint, emit events by writing to their own kv under a
+watched prefix, and the §4.6 kv-write wake fires the wake-driven
+handler to render frames. Cross-node correctness rides raft (every
+node's apply sees the writeset → fires its locally-held streams).
+The single-node restriction this section imposed is lifted with
+the dissolution.
+
+The §6.2 projection contract (notification ≠ state store;
+ephemeral; reconnect → state-refetch) carries forward unchanged
+into streaming-handlers-plan §10.3. Everything below this notice
+is the pre-dissolution design-of-record; the supersession is
+authoritative.
+
+#### 12.4 pre-dissolution (archival) — SSE collapsed in-process (2026-05-19)
 
 **§12.2's "Push projections delegate cross-node fan-out to the
 existing sse-service bus … they *stack*, not merge" lock is
