@@ -631,17 +631,27 @@ fn finalizeBatch(
             };
             // Propose accepted: transfer txn ownership to the drain
             // (parked on the barrier seq), park each success entity
-            // on raft_pending exactly as the write path does.
+            // on the right raft-pending sibling. Phase 5: the entity's
+            // collection encodes its commit destination (no
+            // discriminator field check in drainRaftPending).
             try worker.pending_txns.put(allocator, seq, txn);
             const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
             for (successes.items) |*s| {
-                try contRecordIfAny(worker, server, allocator, anchor_id, s); // drain redirects to parked_continuations
-                try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // drain redirects to stream_response_in (Phase 4d)
+                const is_stream = s.stream != null;
+                const is_cont = s.cont != null;
+                try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets ContDescriptor + parked_meta entry
+                try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets stream components + pending_stream_meta
                 try server.reg.set(s.ent, &server.request_out, RaftWait, .{
                     .seq = seq,
                     .deadline_ns = deadline_ns,
                 });
-                try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
+                if (is_stream) {
+                    try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_stream);
+                } else if (is_cont) {
+                    try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_cont);
+                } else {
+                    try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_response);
+                }
                 captureSuccess(worker, anchor_id, s, s.status_code, .ok);
                 processed += 1;
             }
@@ -764,13 +774,24 @@ fn finalizeBatch(
 
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     for (successes.items) |*s| {
-        try contRecordIfAny(worker, server, allocator, anchor_id, s); // drain redirects to parked_continuations
-        try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // drain redirects to stream_response_in (Phase 4d)
+        const is_stream = s.stream != null;
+        const is_cont = s.cont != null;
+        try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets ContDescriptor + parked_meta entry
+        try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets stream components + pending_stream_meta
         try server.reg.set(s.ent, &server.request_out, RaftWait, .{
             .seq = seq,
             .deadline_ns = deadline_ns,
         });
-        try server.reg.move(s.ent, &server.request_out, &worker.raft_pending);
+        // Phase 5: park on the right raft-pending sibling so
+        // drainRaftPending's dispatch is collection-membership, not a
+        // discriminator field-check.
+        if (is_stream) {
+            try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_stream);
+        } else if (is_cont) {
+            try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_cont);
+        } else {
+            try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_response);
+        }
 
         captureSuccess(worker, anchor_id, s, s.status_code, .ok);
         processed += 1;
@@ -1145,7 +1166,9 @@ fn handleMetrics(
         \\
     , .{
         h2_srv.request_out.entitySlice().len,
-        worker.raft_pending.entitySlice().len,
+        // Phase 5: sum the three siblings; the gauge is "how many
+        // entities are parked on raft commit," not which destination.
+        worker.raft_pending_response.entitySlice().len + worker.raft_pending_cont.entitySlice().len + worker.raft_pending_stream.entitySlice().len,
         h2_srv.response_in.entitySlice().len,
         h2_srv.response_out.entitySlice().len,
         h2_srv._conn_active.entitySlice().len,
@@ -1586,7 +1609,9 @@ fn handleRelease(
         };
     }
 
-    // Park the request on raft_pending. drainRaftPending will:
+    // Park the request on the response-sibling of raft-pending —
+    // release POST is always terminal (no cont / stream).
+    // drainRaftPending will:
     //   - on commit: commitTxn (drop kv_undo) + deliver 204
     //   - on fault / timeout: undoTxn + deliver 503
     // The worker thread is free to dispatch the next stream
@@ -1598,7 +1623,7 @@ fn handleRelease(
         .seq = seq,
         .deadline_ns = deadline_ns,
     });
-    try server.reg.move(ent, &server.request_out, &worker.raft_pending);
+    try server.reg.move(ent, &server.request_out, &worker.raft_pending_response);
 }
 
 /// Body shape: `{"pairs":[{"key":"<k>","value":"<v>"}, ...]}`. Writes
@@ -1718,7 +1743,8 @@ fn handleAdminKv(
         .seq = seq,
         .deadline_ns = deadline_ns,
     });
-    try server.reg.move(ent, &server.request_out, &worker.raft_pending);
+    // Phase 5: admin kv-write is always terminal — response sibling.
+    try server.reg.move(ent, &server.request_out, &worker.raft_pending_response);
 }
 
 /// Outcome of `resolveRequest`: either the request was finalized

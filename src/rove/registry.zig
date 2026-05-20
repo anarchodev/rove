@@ -316,6 +316,7 @@ pub const Registry = struct {
 
         // Comptime validation: src row must be subset of dst row
         comptime {
+            @setEvalBranchQuota(4000);
             if (!SrcColl.RowType.isSubsetOf(DstColl.RowType)) {
                 @compileError("move: source row is not a subset of destination row");
             }

@@ -1408,11 +1408,25 @@ pub fn Worker(comptime opts: Options) type {
         allocator: std.mem.Allocator,
         reg: *rove.Registry,
         h2: *H2Type,
-        /// Entities waiting on raft commit. Stored on the Worker (not
-        /// inside h2) because this is rove-js state, not h2 state.
-        /// Uses the same row as every other h2 stream collection so
-        /// moves in and out preserve every component.
-        raft_pending: StreamColl,
+        /// Entities waiting on raft commit, destined for `response_in`
+        /// (terminal response, no cont/stream chain). Stored on the
+        /// Worker (not inside h2) because this is rove-js state, not
+        /// h2 state. Uses the same row as every other h2 stream
+        /// collection so moves in and out preserve every component.
+        ///
+        /// Handler-cmds Phase 5: `raft_pending` was split into three
+        /// siblings (`raft_pending_response` / `raft_pending_cont` /
+        /// `raft_pending_stream`) — the entity's collection IS the
+        /// dispatch state, no `desc.cont != null` or
+        /// `pending_stream_meta.contains` field-check needed
+        /// (principle #1, state-via-collection-membership).
+        raft_pending_response: StreamColl,
+        /// Continuation-bound raft park. Commits route to
+        /// `parked_continuations`. Same Row as `raft_pending_response`.
+        raft_pending_cont: StreamColl,
+        /// Stream-first-hop raft park. Commits route to
+        /// `stream_response_in` (after registerStreamCell). Same Row.
+        raft_pending_stream: StreamColl,
         /// Continuation-trampoline parked streams (connection-actor
         /// §6.1/§6.4). A handler that returned `next(...)` parks here
         /// instead of `response_in`; collection membership IS the
@@ -1617,7 +1631,9 @@ pub fn Worker(comptime opts: Options) type {
                 .allocator = allocator,
                 .reg = reg,
                 .h2 = server,
-                .raft_pending = try StreamColl.init(allocator),
+                .raft_pending_response = try StreamColl.init(allocator),
+                .raft_pending_cont = try StreamColl.init(allocator),
+                .raft_pending_stream = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .dispatcher = try Dispatcher.init(allocator),
                 .node = config.node,
@@ -1646,12 +1662,16 @@ pub fn Worker(comptime opts: Options) type {
                 },
                 .wake_inbox = KvWakeInbox.init(allocator),
             };
-            errdefer self.raft_pending.deinit();
+            errdefer self.raft_pending_response.deinit();
+            errdefer self.raft_pending_cont.deinit();
+            errdefer self.raft_pending_stream.deinit();
             errdefer self.parked_continuations.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
-            reg.registerCollection(&self.raft_pending);
+            reg.registerCollection(&self.raft_pending_response);
+            reg.registerCollection(&self.raft_pending_cont);
+            reg.registerCollection(&self.raft_pending_stream);
             reg.registerCollection(&self.parked_continuations);
 
             // Register the inbox with the node so apply.zig +
@@ -1798,7 +1818,9 @@ pub fn Worker(comptime opts: Options) type {
             self.node.unregisterWakeInbox(&self.wake_inbox);
             self.wake_inbox.deinit();
             self.parked_continuations.deinit();
-            self.raft_pending.deinit();
+            self.raft_pending_response.deinit();
+            self.raft_pending_cont.deinit();
+            self.raft_pending_stream.deinit();
             self.dispatcher.deinit();
             if (self.log_push_curl) |easy| easy.deinit();
             // `manifest_easy` lives on NodeState — main.zig owns it.
@@ -3012,6 +3034,244 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
 /// cascades chain successors — fine for our model since the per-
 /// tenant lock means at most one in-flight txn per tenant). The
 /// response body is overwritten with 503.
+/// Phase 5: response-bound raft park drain. Entity in
+/// `raft_pending_response` → `response_in` on commit / fault.
+fn drainResponsePending(
+    worker: anytype,
+    server: anytype,
+    allocator: std.mem.Allocator,
+    committed: u64,
+    faulted: u64,
+    now_ns: i64,
+) !void {
+    const entities = worker.raft_pending_response.entitySlice();
+    const waits = worker.raft_pending_response.column(RaftWait);
+    const resp_bodies = worker.raft_pending_response.column(h2.RespBody);
+    var i: usize = 0;
+    while (i < entities.len) : (i += 1) {
+        const ent = entities[i];
+        const wait = waits[i];
+        const resp_body = resp_bodies[i];
+
+        if (committed >= wait.seq) {
+            if (worker.pending_txns.get(wait.seq)) |tracked| {
+                tracked.commit() catch |err| switch (err) {
+                    error.Conflict => continue,
+                    else => panic_mod.invariantViolated(
+                        "drainResponsePending.commit",
+                        "seq={d} err={s}",
+                        .{ wait.seq, @errorName(err) },
+                    ),
+                };
+                _ = worker.pending_txns.remove(wait.seq);
+                allocator.destroy(tracked);
+            }
+            try server.reg.move(ent, &worker.raft_pending_response, &server.response_in);
+            continue;
+        }
+
+        const is_faulted = faulted > 0 and faulted >= wait.seq;
+        const is_timed_out = now_ns >= wait.deadline_ns;
+        if (!is_faulted and !is_timed_out) continue;
+
+        if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
+            kv.value.rollback() catch |err| panic_mod.invariantViolated(
+                "drainResponsePending.rollback",
+                "seq={d} err={s}",
+                .{ wait.seq, @errorName(err) },
+            );
+            allocator.destroy(kv.value);
+        }
+
+        const old_body_ptr: ?[*]u8 = resp_body.data;
+        const old_body_len: u32 = resp_body.len;
+        try respb.overwrite503InPending(worker, &worker.raft_pending_response, ent, allocator);
+        if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+
+        try server.reg.move(ent, &worker.raft_pending_response, &server.response_in);
+    }
+}
+
+/// Phase 5: continuation-bound raft park drain. Entity in
+/// `raft_pending_cont` → `parked_continuations` on commit; → 503
+/// `response_in` on fault (with parked_meta cleanup until Phase 7
+/// deletes that side store).
+fn drainContPending(
+    worker: anytype,
+    server: anytype,
+    allocator: std.mem.Allocator,
+    committed: u64,
+    faulted: u64,
+    now_ns: i64,
+) !void {
+    const entities = worker.raft_pending_cont.entitySlice();
+    const waits = worker.raft_pending_cont.column(RaftWait);
+    const resp_bodies = worker.raft_pending_cont.column(h2.RespBody);
+    var i: usize = 0;
+    while (i < entities.len) : (i += 1) {
+        const ent = entities[i];
+        const wait = waits[i];
+        const resp_body = resp_bodies[i];
+
+        if (committed >= wait.seq) {
+            if (worker.pending_txns.get(wait.seq)) |tracked| {
+                tracked.commit() catch |err| switch (err) {
+                    error.Conflict => continue,
+                    else => panic_mod.invariantViolated(
+                        "drainContPending.commit",
+                        "seq={d} err={s}",
+                        .{ wait.seq, @errorName(err) },
+                    ),
+                };
+                _ = worker.pending_txns.remove(wait.seq);
+                allocator.destroy(tracked);
+            }
+            // Phase 5: the entity's collection (raft_pending_cont)
+            // IS the discriminant — straight to parked_continuations,
+            // no `ContDescriptor.cont != null` field check needed.
+            try server.reg.move(ent, &worker.raft_pending_cont, &worker.parked_continuations);
+            continue;
+        }
+
+        const is_faulted = faulted > 0 and faulted >= wait.seq;
+        const is_timed_out = now_ns >= wait.deadline_ns;
+        if (!is_faulted and !is_timed_out) continue;
+
+        if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
+            kv.value.rollback() catch |err| panic_mod.invariantViolated(
+                "drainContPending.rollback",
+                "seq={d} err={s}",
+                .{ wait.seq, @errorName(err) },
+            );
+            allocator.destroy(kv.value);
+        }
+
+        // Trampoline: open hop's commit faulted/timed out → cannot
+        // hold. Discard the side-table descriptor; the on-entity
+        // ContDescriptor deinit fires when cleanupResponses destroys
+        // the entity.
+        if (worker.parked_meta.count() != 0) {
+            if (worker.parked_meta.fetchRemove(ent)) |kvp| {
+                var pc = kvp.value;
+                pc.deinit(allocator);
+            }
+        }
+
+        const old_body_ptr: ?[*]u8 = resp_body.data;
+        const old_body_len: u32 = resp_body.len;
+        try respb.overwrite503InPending(worker, &worker.raft_pending_cont, ent, allocator);
+        if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+
+        try server.reg.move(ent, &worker.raft_pending_cont, &server.response_in);
+    }
+}
+
+/// Phase 5: stream-first-hop raft park drain. Entity in
+/// `raft_pending_stream` → `stream_response_in` on commit (after
+/// registerStreamCell consumes pending_stream_meta); → 503
+/// `response_in` on fault.
+fn drainStreamPending(
+    worker: anytype,
+    server: anytype,
+    allocator: std.mem.Allocator,
+    committed: u64,
+    faulted: u64,
+    now_ns: i64,
+) !void {
+    const entities = worker.raft_pending_stream.entitySlice();
+    const waits = worker.raft_pending_stream.column(RaftWait);
+    const resp_bodies = worker.raft_pending_stream.column(h2.RespBody);
+    var i: usize = 0;
+    while (i < entities.len) : (i += 1) {
+        const ent = entities[i];
+        const wait = waits[i];
+        const resp_body = resp_bodies[i];
+
+        if (committed >= wait.seq) {
+            if (worker.pending_txns.get(wait.seq)) |tracked| {
+                tracked.commit() catch |err| switch (err) {
+                    error.Conflict => continue,
+                    else => panic_mod.invariantViolated(
+                        "drainStreamPending.commit",
+                        "seq={d} err={s}",
+                        .{ wait.seq, @errorName(err) },
+                    ),
+                };
+                _ = worker.pending_txns.remove(wait.seq);
+                allocator.destroy(tracked);
+            }
+            // Stream-first-hop commit: register the side-table cell
+            // (consumes meta's owned slices) + move to
+            // stream_response_in. On registerStreamCell failure the
+            // entity downgrades to response_in (components on the
+            // entity reap structurally on destroy).
+            if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
+                const meta = kvp.value;
+                registerStreamCell(
+                    worker,
+                    ent,
+                    meta.tenant_id,
+                    meta.correlation_id,
+                    meta.module_path,
+                    meta.ctx_json,
+                    meta.chunks,
+                    meta.kv_prefixes,
+                    meta.interval_ms,
+                    meta.deployment_id,
+                ) catch |rerr| {
+                    if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
+                    if (meta.correlation_id) |c| allocator.free(c);
+                    std.log.warn(
+                        "drainStreamPending: registerStreamCell ent={} err={s}; routing to response_in with empty body",
+                        .{ ent, @errorName(rerr) },
+                    );
+                    try server.reg.move(ent, &worker.raft_pending_stream, &server.response_in);
+                    continue;
+                };
+                if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
+                if (meta.correlation_id) |c| allocator.free(c);
+                try server.reg.move(ent, &worker.raft_pending_stream, &server.stream_response_in);
+                continue;
+            }
+            // No pending_stream_meta entry: should be impossible
+            // (Phase 4a populates it alongside the components when
+            // parking on raft_pending_stream). Fall through to a
+            // 503-like response so we don't strand the entity.
+            try server.reg.move(ent, &worker.raft_pending_stream, &server.response_in);
+            continue;
+        }
+
+        const is_faulted = faulted > 0 and faulted >= wait.seq;
+        const is_timed_out = now_ns >= wait.deadline_ns;
+        if (!is_faulted and !is_timed_out) continue;
+
+        if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
+            kv.value.rollback() catch |err| panic_mod.invariantViolated(
+                "drainStreamPending.rollback",
+                "seq={d} err={s}",
+                .{ wait.seq, @errorName(err) },
+            );
+            allocator.destroy(kv.value);
+        }
+
+        // Discard pending_stream_meta so the entity ships the
+        // 503-stamped body via response_in without trying to start
+        // the stream. Stream components on the entity reap
+        // structurally on destroy.
+        if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
+            var sm = kvp.value;
+            sm.deinit(allocator);
+        }
+
+        const old_body_ptr: ?[*]u8 = resp_body.data;
+        const old_body_len: u32 = resp_body.len;
+        try respb.overwrite503InPending(worker, &worker.raft_pending_stream, ent, allocator);
+        if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+
+        try server.reg.move(ent, &worker.raft_pending_stream, &server.response_in);
+    }
+}
+
 pub fn drainRaftPending(worker: anytype) !void {
     const server = worker.h2;
     const allocator = worker.allocator;
@@ -3020,165 +3280,18 @@ pub fn drainRaftPending(worker: anytype) !void {
     const faulted = worker.raft.faultedSeq();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
-    // FORWARD iteration: entities entered raft_pending in propose
-    // order, which is per-tenant chain order. kvexp.Txn.commit must
-    // run on the chain head; forward iteration ensures the oldest
-    // (chain-head) seq for each tenant commits first. Many entries
-    // share one seq (one propose → many requests in a batch); only
-    // the first to cross the watermark performs the txn commit /
-    // rollback, subsequent ones for the same seq find the map empty.
-    //
-    // `move` queues the transfer; the collection's slice is stable
-    // across the loop body and only compacts after `reg.flush`. So
-    // we walk by index forward and increment unconditionally.
-    const entities = worker.raft_pending.entitySlice();
-    const waits = worker.raft_pending.column(RaftWait);
-    const resp_bodies = worker.raft_pending.column(h2.RespBody);
-    var i: usize = 0;
-    while (i < entities.len) : (i += 1) {
-        const ent = entities[i];
-        const wait = waits[i];
-        const resp_body = resp_bodies[i];
-
-        if (committed >= wait.seq) {
-            // First entry for this seq to cross the watermark
-            // commits the txn. Subsequent entries for the same seq
-            // find the map empty and just queue the move.
-            if (worker.pending_txns.get(wait.seq)) |tracked| {
-                tracked.commit() catch |err| switch (err) {
-                    // Chain head belongs to a different worker's
-                    // in-flight batch. Leave both the pending_txn
-                    // entry and the raft_pending entry in place;
-                    // when the other worker drains its head, ours
-                    // becomes chain head and this retries OK on a
-                    // later tick.
-                    error.Conflict => continue,
-                    else => panic_mod.invariantViolated(
-                        "drainRaftPending.commit",
-                        "seq={d} err={s}",
-                        .{ wait.seq, @errorName(err) },
-                    ),
-                };
-                _ = worker.pending_txns.remove(wait.seq);
-                allocator.destroy(tracked);
-            }
-            // Phase 4d: committed stream-first-hop → register the
-            // chain cell + redirect to `stream_response_in`. Check
-            // BEFORE the cont/parked_meta branch because a single
-            // entity is never both a cont and a stream (the
-            // dispatch outcome is a tagged union — `.continuation`
-            // OR `.stream`, never both).
-            if (worker.pending_stream_meta.count() != 0) {
-                if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
-                    const meta = kvp.value;
-                    // Handler-cmds Phase 4b: stream components are
-                    // already set on the entity by Phase 4a's
-                    // `streamRecordIfAnyAt` (back in finalizeBatch
-                    // before the raft park) — drainRaftPending only
-                    // needs to register the side-table cell and move
-                    // the entity. The components rode here on
-                    // `merged_request_row`.
-                    registerStreamCell(
-                        worker,
-                        ent,
-                        meta.tenant_id,
-                        meta.correlation_id,
-                        meta.module_path,
-                        meta.ctx_json,
-                        meta.chunks,
-                        meta.kv_prefixes,
-                        meta.interval_ms,
-                        meta.deployment_id,
-                    ) catch |rerr| {
-                        // registerStreamCell freed the transferred
-                        // slices on failure; only meta.tenant_id and
-                        // meta.correlation_id stay with us. Stream
-                        // components are already set on the entity;
-                        // they'll deinit structurally on destroy.
-                        if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
-                        if (meta.correlation_id) |c| allocator.free(c);
-                        std.log.warn(
-                            "drainRaftPending: registerStreamCell ent={} err={s}; routing to response_in with empty body",
-                            .{ ent, @errorName(rerr) },
-                        );
-                        try server.reg.move(ent, &worker.raft_pending, &server.response_in);
-                        continue;
-                    };
-                    // registerStreamCell consumed chunks / ctx_json /
-                    // module_path / kv_prefixes; the meta's
-                    // tenant_id and correlation_id are still ours
-                    // to free (the cell dupes them internally for
-                    // its own ownership).
-                    if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
-                    if (meta.correlation_id) |c| allocator.free(c);
-                    try server.reg.move(ent, &worker.raft_pending, &server.stream_response_in);
-                    continue;
-                }
-            }
-            // Phase 2d: trampoline-vs-response dispatch reads
-            // `ContDescriptor.cont` on the entity instead of the
-            // `parked_meta` side table. A non-null cont means this
-            // entity wanted to park (set by `contRecordIfAny` in
-            // worker_dispatch.zig); the default-initialized
-            // ContDescriptor on non-cont entities has `cont == null`,
-            // routing them to response_in as before. The principle-
-            // #1 cleaner form is Phase 5's `raft_pending_cont` /
-            // `raft_pending_response` split — there the collection
-            // IS the discriminant; this commit is the tactical step
-            // before that.
-            const desc = try server.reg.get(ent, &worker.raft_pending, components_mod.ContDescriptor);
-            if (desc.cont != null) {
-                try server.reg.move(ent, &worker.raft_pending, &worker.parked_continuations);
-            } else {
-                try server.reg.move(ent, &worker.raft_pending, &server.response_in);
-            }
-            continue;
-        }
-
-        const is_faulted = faulted > 0 and faulted >= wait.seq;
-        const is_timed_out = now_ns >= wait.deadline_ns;
-        if (!is_faulted and !is_timed_out) continue; // still waiting
-
-        // Fault / timeout: rollback the deferred txn. kvexp.Txn
-        // rollback on a chain head cascades to its open child + any
-        // chain successors; later-seq entries that share a tenant
-        // see their own pending_txns slot already null after the
-        // cascade, so we still iterate them and queue the 503 move.
-        if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
-            kv.value.rollback() catch |err| panic_mod.invariantViolated(
-                "drainRaftPending.rollback",
-                "seq={d} err={s}",
-                .{ wait.seq, @errorName(err) },
-            );
-            allocator.destroy(kv.value);
-        }
-
-        // Trampoline: open hop's commit faulted/timed out → cannot
-        // hold. Discard the descriptor; the entity gets the same 503
-        // a terminal success would (client retries — moot-on-loss).
-        if (worker.parked_meta.count() != 0) {
-            if (worker.parked_meta.fetchRemove(ent)) |kvp| {
-                var pc = kvp.value;
-                pc.deinit(allocator);
-            }
-        }
-        // Phase 4d: same posture for stream-first-hop meta — discard
-        // it so the entity ships the already-stamped 503 body
-        // through `response_in` without trying to start the stream.
-        if (worker.pending_stream_meta.count() != 0) {
-            if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
-                var sm = kvp.value;
-                sm.deinit(allocator);
-            }
-        }
-
-        const old_body_ptr: ?[*]u8 = resp_body.data;
-        const old_body_len: u32 = resp_body.len;
-        try respb.overwrite503InPending(worker, ent, allocator);
-        if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-
-        try server.reg.move(ent, &worker.raft_pending, &server.response_in);
-    }
+    // Handler-cmds Phase 5: raft_pending is THREE sibling collections.
+    // Each entity is parked on the sibling matching its commit
+    // destination, so the dispatch in each loop is direct — no
+    // `desc.cont != null` field check, no `pending_stream_meta.contains`
+    // probe. Whichever loop processes a given seq first commits the
+    // shared TrackedTxn; later siblings find the map empty and just
+    // queue moves. Forward-iter preserves per-tenant chain order
+    // (entities enter the siblings in propose-seq order from
+    // finalizeBatch).
+    try drainResponsePending(worker, server, allocator, committed, faulted, now_ns);
+    try drainContPending(worker, server, allocator, committed, faulted, now_ns);
+    try drainStreamPending(worker, server, allocator, committed, faulted, now_ns);
 
     // ── Additive: non-entity parked units (idiom-1 SSE-emit gating,
     //    docs/unified-effect-gating.md). The H2 entity path above is
@@ -3399,7 +3512,9 @@ fn proposeAndParkContResume(
                 .seq = seq,
                 .deadline_ns = deadline_ns,
             });
-            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending);
+            // Cont-resume that wrote: park on the cont sibling so the
+            // drain routes back to parked_continuations on commit.
+            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
         },
         .repark => |r| {
             // Update parked_meta in place: replace cont + refresh
@@ -3440,7 +3555,9 @@ fn proposeAndParkContResume(
                 .seq = seq,
                 .deadline_ns = deadline_ns,
             });
-            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending);
+            // Cont-resume that wrote: park on the cont sibling so the
+            // drain routes back to parked_continuations on commit.
+            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
         },
     }
 }
@@ -5045,35 +5162,55 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
     for (worker.pending_units.items) |*pu| pu.deinit(allocator);
     worker.pending_units.clearRetainingCapacity();
 
-    // Downgrade every raft_pending entry to 503 and move to response_in.
-    const entities = worker.raft_pending.entitySlice();
-    const resp_bodies = worker.raft_pending.column(h2.RespBody);
+    // Phase 5: downgrade every entry across the three raft-pending
+    // siblings to 503 + move to response_in.
+    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_response, .response);
+    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_cont, .cont);
+    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_stream, .stream);
+}
+
+/// Phase 5 helper: walk one raft-pending sibling, 503 every entry,
+/// move to response_in. `kind` tells us which side-table to clean —
+/// cont needs `parked_meta`, stream needs `pending_stream_meta`;
+/// response has no side store to free.
+fn drainLeadershipLossColl(
+    worker: anytype,
+    server: anytype,
+    allocator: std.mem.Allocator,
+    coll: anytype,
+    kind: enum { response, cont, stream },
+) !void {
+    const entities = coll.entitySlice();
+    const resp_bodies = coll.column(h2.RespBody);
     var i: usize = entities.len;
     while (i > 0) {
         i -= 1;
         const ent = entities[i];
         const resp_body = resp_bodies[i];
-        // Trampoline: leadership lost before the open hop committed →
-        // cannot hold. Discard the descriptor; 503 like any other
-        // pending entry (client retries — moot-on-loss).
-        if (worker.parked_meta.count() != 0) {
-            if (worker.parked_meta.fetchRemove(ent)) |kvp| {
-                var pc = kvp.value;
-                pc.deinit(allocator);
-            }
-        }
-        // Phase 4d: same posture for stream-first-hop meta.
-        if (worker.pending_stream_meta.count() != 0) {
-            if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
-                var sm = kvp.value;
-                sm.deinit(allocator);
-            }
+        switch (kind) {
+            .response => {},
+            .cont => {
+                // Trampoline: leadership lost before the open hop
+                // committed → cannot hold. Discard the side-table
+                // descriptor; 503 like any other pending entry
+                // (client retries — moot-on-loss).
+                if (worker.parked_meta.fetchRemove(ent)) |kvp| {
+                    var pc = kvp.value;
+                    pc.deinit(allocator);
+                }
+            },
+            .stream => {
+                if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
+                    var sm = kvp.value;
+                    sm.deinit(allocator);
+                }
+            },
         }
         const old_body_ptr: ?[*]u8 = resp_body.data;
         const old_body_len: u32 = resp_body.len;
-        try respb.overwrite503InPending(worker, ent, allocator);
+        try respb.overwrite503InPending(worker, coll, ent, allocator);
         if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-        try server.reg.move(ent, &worker.raft_pending, &server.response_in);
+        try server.reg.move(ent, coll, &server.response_in);
     }
 }
 

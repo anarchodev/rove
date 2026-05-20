@@ -227,15 +227,19 @@ pub fn overwriteWith503(
 
 /// Overwrite a parked entity's response with a 503. Caller is
 /// responsible for freeing the old body (done in `drainRaftPending`
-/// where the column access lives).
+/// where the column access lives). Handler-cmds Phase 5: takes the
+/// owning collection explicitly — the worker has three sibling
+/// raft-pending collections now (response / cont / stream), each
+/// reachable via its own pointer.
 pub fn overwrite503InPending(
     worker: anytype,
+    coll: anytype,
     ent: rove.Entity,
     allocator: std.mem.Allocator,
 ) !void {
     const body = try allocator.dupe(u8, "raft commit failed\n");
-    try worker.reg.set(ent, &worker.raft_pending, h2.Status, .{ .code = 503 });
-    try worker.reg.set(ent, &worker.raft_pending, h2.RespBody, .{
+    try worker.reg.set(ent, coll, h2.Status, .{ .code = 503 });
+    try worker.reg.set(ent, coll, h2.RespBody, .{
         .data = body.ptr,
         .len = @intCast(body.len),
     });
