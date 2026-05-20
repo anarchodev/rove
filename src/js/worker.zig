@@ -4106,7 +4106,14 @@ fn resumeStream(
     const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
     defer allocator.free(spath);
 
-    var txn = inst.kv.beginTrackedImmediate() catch return error.ResumeTxn;
+    // Heap-allocate the txn so its pointer can park on a
+    // pending_units `ParkedUnit.txn` if the hop wrote (Phase 4b).
+    // Same stable-pointer pattern as resumeContinuation (4a) +
+    // fireDisconnectActivation (4c).
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return error.ResumeTxnAlloc;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return error.ResumeTxn;
     var txn_done = false;
     defer if (!txn_done) txn.rollback() catch {};
 
@@ -4158,7 +4165,7 @@ fn resumeStream(
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
         inst.kv,
-        &txn,
+        txn,
         &ws,
         bc,
         &tc.snap.bytecodes,
@@ -4188,11 +4195,38 @@ fn resumeStream(
                 r.exception = &.{};
                 return;
             }
+            // Phase 4b: terminal + writes. Eager-fire: queue the
+            // body as the last chunk, flag close_pending, and propose
+            // the writes asynchronously via the pending_units sweep
+            // (same path as the §4.4 disconnect activation's writes).
+            // The chunks may ship to the client BEFORE raft commits —
+            // a §7/§9.4 trade-off the plan accepts: handlers refetch
+            // authoritative state on every activation, so a spurious
+            // frame on a raft fault is recoverable.
             if (wrote) {
-                txn.rollback() catch {};
+                proposeForgetfulWrites(worker, &ws, txn, cell.tenant_id) catch |perr| {
+                    std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
+                    txn_owned = false;
+                    txn_done = true;
+                    cell.close_pending = true;
+                    captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, cell.correlation_id, activation);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                txn_owned = false;
                 txn_done = true;
+                if (r.body.len > 0) {
+                    const owned = try allocator.dupe(u8, r.body);
+                    cell.chunks.append(allocator, owned) catch |e| {
+                        allocator.free(owned);
+                        return e;
+                    };
+                }
                 cell.close_pending = true;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, r.console, r.exception, .{}, cell.correlation_id, activation);
+                cell.activation_count += 1;
+                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, cell.correlation_id, activation);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -4221,6 +4255,11 @@ fn resumeStream(
             r.exception = &.{};
         },
         .continuation => |*cval| {
+            // Stream-resume → __rove_next: would transition the
+            // chain from a stream into a one-shot continuation,
+            // which requires moving the entity out of the stream
+            // pipeline and into parked_continuations. Out of scope
+            // for Phase 4 — close with a defined 501.
             cval.deinit(allocator);
             txn.rollback() catch {};
             txn_done = true;
@@ -4228,20 +4267,28 @@ fn resumeStream(
             captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, activation);
         },
         .stream => |*s2| {
+            // Phase 4b: stream + writes. Eager-fire as in the
+            // terminal+writes branch.
             if (wrote) {
-                s2.deinit(allocator);
-                txn.rollback() catch {};
+                proposeForgetfulWrites(worker, &ws, txn, cell.tenant_id) catch |perr| {
+                    std.log.warn("rove-js stream-resume (stream + writes): propose failed: {s}", .{@errorName(perr)});
+                    s2.deinit(allocator);
+                    txn_owned = false;
+                    txn_done = true;
+                    cell.close_pending = true;
+                    captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, cell.correlation_id, activation);
+                    return;
+                };
+                txn_owned = false;
                 txn_done = true;
-                cell.close_pending = true;
-                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, &.{}, &.{}, .{}, cell.correlation_id, activation);
-                return;
+            } else {
+                txn.commit() catch |e| panic_mod.invariantViolated(
+                    "resumeStream.commit(stream)",
+                    "err={s}",
+                    .{@errorName(e)},
+                );
+                txn_done = true;
             }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeStream.commit(stream)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
             // Headers on subsequent hops are ignored (the stream's
             // initial response headers already shipped); free them.
             if (s2.headers) |h| allocator.free(h);
