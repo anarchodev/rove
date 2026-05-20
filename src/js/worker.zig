@@ -208,92 +208,16 @@ pub const CONT_HOLD_DEADLINE_NS: i64 = 25 * std.time.ns_per_s;
 // entity's `ContDescriptor` + `ChainContext` components, which
 // deinit structurally on entity destroy.
 
-/// Streaming-handlers Phase 2b-ii: per-active-stream state held
-/// alongside the entity's `stream_data_out` membership. The cell
-/// stays alive while the chain runs; deinit frees every owned slice.
-pub const StreamCell = struct {
-    /// Owned. Tenant scoping the chain — same value across every
-    /// activation, for tape capture and re-resolving the deployment.
-    tenant_id: []u8,
-    /// Owned. Correlation id from the originating inbound request.
-    /// Threaded forward so every resume's tape row carries it.
-    correlation_id: ?[]u8,
-    /// Owned. Module path the handler dispatches to on each resume
-    /// — same module that returned `__rove_stream(...)` initially
-    /// (the inbound request's `route.module_base` from
-    /// `worker_dispatch.zig`).
-    module_path: []u8,
-    /// Owned. The customer's `ctx` JSON, threaded into the next
-    /// resume's synthetic request body. Replaced on each
-    /// `__rove_stream(...)` return.
-    ctx_json: []u8,
-    /// FIFO queue of chunks remaining to write to the held socket.
-    /// Each chunk is one DATA frame on the wire. Drained one entry
-    /// per worker tick (when h2 reports the entity back in
-    /// `stream_data_out`). Owned: each chunk is an allocator slice.
-    chunks: std.ArrayListUnmanaged([]u8),
-    /// `>0` ⇒ this stream has a periodic timer wake; the cell
-    /// re-runs the handler every `interval_ms` once chunks drain.
-    /// `0` ⇒ no timer (chunks drain then the stream closes).
-    interval_ms: i64,
-    /// Absolute monotonic ns when the timer-wake next fires. Only
-    /// meaningful when `interval_ms > 0` AND `chunks.items.len == 0`.
-    /// On chunk drain we set this to `now + interval_ms*ns_per_ms`.
-    next_wake_ns: i64,
-    /// streaming-handlers-plan §4.6: prefix-only kv-write wakes.
-    /// Each entry is a tenant-scoped key prefix; `apply.zig` scans
-    /// the just-committed writeset for matches and enqueues a
-    /// `pending_wake_event` on the cell. Owned: spine + entries.
-    kv_prefixes: [][]u8,
-    /// Most recent kv-write event waiting to drive the next handler
-    /// activation. `null` ⇒ no pending kv-wake (either timer-only
-    /// or already serviced). Set by `apply.zig`'s wake hook;
-    /// consumed by `serviceParkedStreams` → `resumeStream`. Phase 3
-    /// v1 collapses concurrent matches to "most recent" (the
-    /// notify-don't-carry §7 thesis: the handler re-reads the
-    /// authoritative state from kv on activation). Wake-accumulator
-    /// debounce (§9.4) is a later refinement.
-    pending_wake: ?PendingKvWake,
-    /// Number of activations the chain has had so far (inbound +
-    /// every timer wake that re-ran the handler). Hard-capped to
-    /// `MAX_STREAM_ACTIVATIONS` to bound a misbehaving handler.
-    activation_count: u32,
-    /// Deployment id the stream is bound to. Stays fixed across
-    /// activations of one chain (a redeploy mid-stream doesn't yank
-    /// the handler).
-    deployment_id: u64,
+// Phase 7: `StreamCell` removed — stream state lives on the entity's
+// `ChainContext` + `StreamChain` + `StreamChunks` + `StreamWakes`
+// components (defined in components.zig); each has its own
+// component-style deinit that rove `Collection.deinit` invokes
+// structurally on every entity in the collection on shutdown.
 
-    pub fn deinit(self: *StreamCell, allocator: std.mem.Allocator) void {
-        allocator.free(self.tenant_id);
-        if (self.correlation_id) |c| allocator.free(c);
-        allocator.free(self.module_path);
-        allocator.free(self.ctx_json);
-        for (self.chunks.items) |ch| allocator.free(ch);
-        self.chunks.deinit(allocator);
-        for (self.kv_prefixes) |p| allocator.free(p);
-        if (self.kv_prefixes.len > 0) allocator.free(self.kv_prefixes);
-        if (self.pending_wake) |*w| w.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-/// A pending kv-write match destined for the next activation of a
-/// streaming chain. Both fields are allocator-owned dup's of the
-/// observed write's key (the writeset's key buffer doesn't outlive
-/// the apply call). v1 collapses to most-recent; the wake-accumulator
-/// in §9.4 (deferred) batches.
-pub const PendingKvWake = struct {
-    /// Owned. The full kv key that matched a registered prefix.
-    key: []u8,
-    /// `'p'` for put, `'d'` for delete — exposed to JS as
-    /// `request.activation.op === "put"` / `"delete"`.
-    op: u8,
-
-    pub fn deinit(self: *PendingKvWake, allocator: std.mem.Allocator) void {
-        allocator.free(self.key);
-        self.* = undefined;
-    }
-};
+// Phase 7: `PendingKvWake` (worker.zig copy) removed — the one
+// in components.zig (referenced by `StreamWakes.pending_wake`) is
+// authoritative now.
+pub const PendingKvWake = components_mod.PendingKvWake;
 
 /// One kv-write event that crossed the apply boundary (either via
 /// `applyWriteSet` on a follower or via the leader-side eager fire
@@ -1359,6 +1283,7 @@ pub fn Worker(comptime opts: Options) type {
         components_mod.StreamChain,
         components_mod.StreamChunks,
         components_mod.StreamWakes,
+        components_mod.StreamDraining,
     }).merge(opts.request_row);
 
     const H2Type = h2.H2(.{
@@ -1419,25 +1344,17 @@ pub fn Worker(comptime opts: Options) type {
         /// alive; on close (handler returns `Response` or cap hits),
         /// the entity moves to `stream_close_in` (h2 sends END_STREAM)
         /// and the map entry is removed.
-        /// Phase 6: split into two maps — `parked_streams_active` holds
-        /// streams in the read/wake/chunk-emit phase;
-        /// `parked_streams_draining` holds streams that have flagged
-        /// chunks-drain-then-close. Cell membership in the latter map
-        /// IS the "no more activations, just ship what's queued"
-        /// state — replaces the principle-#1-violating
-        /// `cell.close_pending` bool.
-        parked_streams_active: std.AutoHashMapUnmanaged(rove.Entity, StreamCell) = .empty,
-        parked_streams_draining: std.AutoHashMapUnmanaged(rove.Entity, StreamCell) = .empty,
-        /// Phase 4d: side-store for stream-first-hops that wrote
-        /// (and therefore went through raft). Keyed by entity; the
-        /// `StreamFirstHopMeta` carries the chunks / interval /
-        /// ctx_json / module_path / kv_prefixes the handler emitted.
-        /// `drainRaftPending`'s entity loop detects an entry here on
-        /// commit, registers the chain cell, and moves the entity to
-        /// `stream_response_in` instead of `response_in`. On
-        /// fault/timeout, the entry is freed alongside the entity's
-        /// 503 downgrade — same posture as `parked_meta`.
-        pending_stream_meta: std.AutoHashMapUnmanaged(rove.Entity, dispatch.StreamFirstHopMeta) = .empty,
+        // Phase 7: `parked_streams_active` + `parked_streams_draining`
+        // side tables removed. Stream state lives on the entity's
+        // `ChainContext` / `StreamChain` / `StreamChunks` /
+        // `StreamWakes` components; the "drain-and-close" flag lives
+        // on `StreamDraining.is_draining`.
+        // Phase 7: `pending_stream_meta` removed — stream components
+        // are populated in `streamRecordIfAnyAt` (Phase 4a) before
+        // the entity moves into `raft_pending_stream`; the meta's
+        // owned slices are freed there too. drainStreamPending just
+        // moves the entity to stream_response_in on commit; no
+        // side-table consume.
         /// Per-worker kv-wake inbox (streaming-handlers-plan §4.6).
         /// Producers (apply.zig + leader-side worker_dispatch) push
         /// events here via `worker.node.broadcastKvWake`;
@@ -1764,32 +1681,12 @@ pub fn Worker(comptime opts: Options) type {
             self.pending_units.deinit(allocator);
             self.batch_side.reset(allocator);
             self.batch_side.targets.deinit(allocator);
-            // Phase 7: cont side-table (parked_meta) is gone; the
-            // entity's ContDescriptor deinits structurally when the
-            // entity is destroyed during the parked_continuations
-            // walk below.
-            // Phase 2b-ii + Phase 3: free any streaming-chain cells
-            // still parked at shutdown. The cells own strings, queues,
-            // kv_prefixes, and an optional pending_wake — all owned
-            // by `allocator` via `StreamCell.deinit`.
-            {
-                var sit = self.parked_streams_active.valueIterator();
-                while (sit.next()) |cell| cell.deinit(allocator);
-                self.parked_streams_active.deinit(allocator);
-                var dit = self.parked_streams_draining.valueIterator();
-                while (dit.next()) |cell| cell.deinit(allocator);
-                self.parked_streams_draining.deinit(allocator);
-            }
-            // Phase 4d: free any stream-first-hop meta that didn't
-            // make it through drainRaftPending before shutdown
-            // (degenerate case — the entity in raft_pending will
-            // also be cleaned up by drainOnLeadershipLoss or the
-            // entity destroy in cleanupResponses).
-            {
-                var pit = self.pending_stream_meta.valueIterator();
-                while (pit.next()) |m| m.deinit(allocator);
-                self.pending_stream_meta.deinit(allocator);
-            }
+            // Phase 7: side tables (parked_meta, parked_streams_active,
+            // parked_streams_draining, pending_stream_meta) are gone.
+            // All stream/cont state lives on the entities themselves;
+            // rove `Collection.deinit` invokes each component's deinit
+            // on shutdown (parked_continuations + the three
+            // raft_pending_* siblings walked below).
             // Unregister + tear down the kv-wake inbox. Order
             // matters: unregister FIRST so no producer can still
             // be pushing into it while we walk + free the queue.
@@ -3172,44 +3069,12 @@ fn drainStreamPending(
                 _ = worker.pending_txns.remove(wait.seq);
                 allocator.destroy(tracked);
             }
-            // Stream-first-hop commit: register the side-table cell
-            // (consumes meta's owned slices) + move to
-            // stream_response_in. On registerStreamCell failure the
-            // entity downgrades to response_in (components on the
-            // entity reap structurally on destroy).
-            if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
-                const meta = kvp.value;
-                registerStreamCell(
-                    worker,
-                    ent,
-                    meta.tenant_id,
-                    meta.correlation_id,
-                    meta.module_path,
-                    meta.ctx_json,
-                    meta.chunks,
-                    meta.kv_prefixes,
-                    meta.interval_ms,
-                    meta.deployment_id,
-                ) catch |rerr| {
-                    if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
-                    if (meta.correlation_id) |c| allocator.free(c);
-                    std.log.warn(
-                        "drainStreamPending: registerStreamCell ent={} err={s}; routing to response_in with empty body",
-                        .{ ent, @errorName(rerr) },
-                    );
-                    try server.reg.move(ent, &worker.raft_pending_stream, &server.response_in);
-                    continue;
-                };
-                if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
-                if (meta.correlation_id) |c| allocator.free(c);
-                try server.reg.move(ent, &worker.raft_pending_stream, &server.stream_response_in);
-                continue;
-            }
-            // No pending_stream_meta entry: should be impossible
-            // (Phase 4a populates it alongside the components when
-            // parking on raft_pending_stream). Fall through to a
-            // 503-like response so we don't strand the entity.
-            try server.reg.move(ent, &worker.raft_pending_stream, &server.response_in);
+            // Phase 7: stream components were populated in
+            // `streamRecordIfAnyAt` BEFORE the entity entered
+            // raft_pending_stream — they ride the entity here via
+            // merged_request_row. Just move to stream_response_in;
+            // h2 picks the entity up from there.
+            try server.reg.move(ent, &worker.raft_pending_stream, &server.stream_response_in);
             continue;
         }
 
@@ -3226,14 +3091,8 @@ fn drainStreamPending(
             allocator.destroy(kv.value);
         }
 
-        // Discard pending_stream_meta so the entity ships the
-        // 503-stamped body via response_in without trying to start
-        // the stream. Stream components on the entity reap
-        // structurally on destroy.
-        if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
-            var sm = kvp.value;
-            sm.deinit(allocator);
-        }
+        // Phase 7: stream components on the entity reap structurally
+        // when cleanupResponses destroys it; no side-table cleanup.
 
         const old_body_ptr: ?[*]u8 = resp_body.data;
         const old_body_len: u32 = resp_body.len;
@@ -3926,34 +3785,21 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
 // ── Streaming-handlers Phase 2b-ii: state machine over h2's
 //    stream_data_out / stream_data_in / stream_close_in pipeline ────
 
-/// Remove + free a parked stream's chain cell. Safe to call when the
-/// entity has no cell (no-op).
-fn freeStreamCell(worker: anytype, ent: rove.Entity) void {
-    if (worker.parked_streams_active.fetchRemove(ent)) |kvp| {
-        var cell = kvp.value;
-        cell.deinit(worker.allocator);
-        return;
-    }
-    if (worker.parked_streams_draining.fetchRemove(ent)) |kvp| {
-        var cell = kvp.value;
-        cell.deinit(worker.allocator);
-    }
-}
-
-/// Phase 6: flip a parked stream's cell from active to draining.
-/// Atomic w.r.t. the per-tick iteration order: serviceParkedStreams
-/// checks active first then draining, so a stream that drained-and-
-/// closed in this tick won't get a wake on the same tick.
-fn moveStreamCellToDraining(worker: anytype, ent: rove.Entity) !void {
-    const kvp = worker.parked_streams_active.fetchRemove(ent) orelse return;
-    try worker.parked_streams_draining.put(worker.allocator, ent, kvp.value);
+/// Phase 7: flag the stream's draining state via the entity's
+/// StreamDraining component. Replaces Phase 6's
+/// `moveStreamCellToDraining` (active/draining-map flip). Tolerant
+/// to "entity not in stream_data_out" because the resumeStream error
+/// branches call this defensively after error logging — if the
+/// component fetch fails, the entity was never a stream anyway.
+fn markStreamDraining(server: anytype, ent: rove.Entity) void {
+    const drain_ptr = server.reg.get(ent, &server.stream_data_out, components_mod.StreamDraining) catch return;
+    drain_ptr.is_draining = true;
 }
 
 /// Handler-cmds Phase 3: populate the four stream-side components on
-/// the entity. Mirror of `registerStreamCell` for the component side
-/// of the dual-write — the cell holds owned originals of every slice,
-/// the components hold owned clones, both deinit independently. Phase
-/// 7 deletes the cell side and the clones become the only copies.
+/// the entity. After Phase 7, this is the SOLE site that allocates
+/// the stream-chain slices; ownership stays on the components for
+/// the chain's lifetime.
 ///
 /// `current_coll` must be the collection the entity is in NOW (the
 /// caller is about to move it into the stream pipeline; the
@@ -4053,79 +3899,11 @@ pub fn setStreamComponents(
 /// is about to move it into `h2.stream_response_in` (the streaming
 /// twin of `response_in`). We own the chain-level state alone:
 /// `chunks` (drained one frame at a time by `serviceParkedStreams`),
-/// `interval_ms` / `next_wake_ns` (the §4.5 timer wake — `0` means
-/// "drain chunks then close" — `acme/stream/index.mjs` shape), and
-/// the `ctx_json` / `module_path` / `correlation_id` / `deployment_id`
-/// threaded into every resume activation. Takes ownership of every
-/// slice argument (we dup what the caller still holds; chunks are
-/// moved in via the descriptor's `chunks` slice transferred by
-/// `worker_dispatch.zig`'s `.stream` branch).
-pub fn registerStreamCell(
-    worker: anytype,
-    ent: rove.Entity,
-    tenant_id: []const u8,
-    correlation_id: ?[]const u8,
-    module_path: []u8, // ownership transferred in
-    ctx_json: []u8, // ownership transferred in
-    initial_chunks: [][]u8, // ownership transferred in (slice + bytes)
-    kv_prefixes: [][]u8, // ownership transferred in (slice + bytes)
-    interval_ms: i64,
-    deployment_id: u64,
-) !void {
-    const allocator = worker.allocator;
-    // The caller transferred ownership of `module_path` / `ctx_json`
-    // / `initial_chunks` / `kv_prefixes` (slice + bytes). On ANY
-    // error along the pre-flight chain we free them — the function
-    // is all-or-nothing so the caller can rely on "succeeded ⇒
-    // transfer complete, failed ⇒ nothing leaked." Last allocation
-    // (chunks_list capacity) is the last `try`; the final
-    // `putAssumeCapacity` is infallible, so the errdefer below never
-    // sees a state where ownership has been split between the inputs
-    // and the cell.
-    errdefer {
-        allocator.free(module_path);
-        allocator.free(ctx_json);
-        for (initial_chunks) |c| allocator.free(c);
-        if (initial_chunks.len > 0) allocator.free(initial_chunks);
-        for (kv_prefixes) |p| allocator.free(p);
-        if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
-    }
-
-    try worker.parked_streams_active.ensureUnusedCapacity(allocator, 1);
-
-    const tid = try allocator.dupe(u8, tenant_id);
-    errdefer allocator.free(tid);
-    const corr: ?[]u8 = if (correlation_id) |c| try allocator.dupe(u8, c) else null;
-    errdefer if (corr) |c| allocator.free(c);
-
-    // Build the ArrayList that will own the chunks. Reserving the
-    // capacity here is the LAST `try` — after this every step is
-    // infallible, so we can mass-transfer ownership without
-    // resurrecting the errdefer-vs-aliased-bytes hazard.
-    var chunks_list: std.ArrayListUnmanaged([]u8) = .empty;
-    try chunks_list.ensureUnusedCapacity(allocator, initial_chunks.len);
-    for (initial_chunks) |c| chunks_list.appendAssumeCapacity(c);
-    if (initial_chunks.len > 0) allocator.free(initial_chunks);
-
-    const next_wake = if (interval_ms > 0)
-        @as(i64, @intCast(std.time.nanoTimestamp())) + interval_ms * std.time.ns_per_ms
-    else
-        std.math.maxInt(i64);
-
-    worker.parked_streams_active.putAssumeCapacity(ent, .{
-        .tenant_id = tid,
-        .correlation_id = corr,
-        .module_path = module_path,
-        .ctx_json = ctx_json,
-        .chunks = chunks_list,
-        .interval_ms = interval_ms,
-        .next_wake_ns = next_wake,
-        .kv_prefixes = kv_prefixes,
-        .pending_wake = null,
-        .activation_count = 1, // the inbound activation that produced the cell
-        .deployment_id = deployment_id,
-    });
-}
+// Phase 7: `registerStreamCell` removed — stream state lives on
+// the entity's components (set by `setStreamComponents` in
+// streamRecordIfAnyAt / streamParkIfAny); no side-table cell.
+// `Collection.deinit` invokes each component's deinit on shutdown,
+// so the per-shutdown manual cleanup site is gone.
 
 /// Phase 2b-ii: per-tick driver for active streaming chains. For each
 /// entity currently in `stream_data_out` (h2's "ready for the next
@@ -4150,40 +3928,39 @@ pub fn serviceParkedStreams(worker: anytype) !void {
     // is one mutex lock + a length check.
     try drainKvWakeInbox(worker);
 
-    if (worker.parked_streams_active.count() == 0 and worker.parked_streams_draining.count() == 0) return;
     const server = worker.h2;
+    // Phase 7: empty stream_data_out → nothing to do (was guarded by
+    // the side-table counts).
+    if (server.stream_data_out.entitySlice().len == 0) return;
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
-    // Snapshot (entity, sid, sess, draining?) for every entity in
-    // stream_data_out that has a chain cell. `move` is queued, so the
-    // slice itself stays stable across the loop body, but
-    // `fetchRemove` + sub-resume both mutate the active/draining
-    // maps; the snapshot keeps the per-iter lookups self-contained.
-    const Pending = struct { ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, draining: bool };
+    // Snapshot (entity, sid, sess) for every entity in stream_data_out
+    // that holds a stream chain (non-empty StreamChain.module_path).
+    // `move` is queued, so the slice itself stays stable across the
+    // loop body. The snapshot keeps per-iter lookups self-contained
+    // across resume mutations.
+    const Pending = struct { ent: rove.Entity, sid: h2.StreamId, sess: h2.Session };
     var buf: [256]Pending = undefined;
     var n: usize = 0;
     {
         const ents = server.stream_data_out.entitySlice();
         const sids = server.stream_data_out.column(h2.StreamId);
         const sesss = server.stream_data_out.column(h2.Session);
-        for (ents, sids, sesss) |ent, sid, sess| {
-            const draining = worker.parked_streams_draining.contains(ent);
-            const active = worker.parked_streams_active.contains(ent);
-            if (!draining and !active) continue;
+        const chains = server.stream_data_out.column(components_mod.StreamChain);
+        for (ents, sids, sesss, chains) |ent, sid, sess, chain| {
+            if (chain.module_path.len == 0) continue; // non-stream entity
             if (n >= buf.len) break;
-            buf[n] = .{ .ent = ent, .sid = sid, .sess = sess, .draining = draining };
+            buf[n] = .{ .ent = ent, .sid = sid, .sess = sess };
             n += 1;
         }
     }
 
     for (buf[0..n]) |p| {
-        // Phase 6: cell map membership encodes draining state —
-        // `parked_streams_draining` ⇒ ship queued chunks then close;
-        // `parked_streams_active`   ⇒ full active behavior (wakes,
-        // resumes, chunk drain).
-        const cell = (if (p.draining) worker.parked_streams_draining.getPtr(p.ent)
-                       else worker.parked_streams_active.getPtr(p.ent)) orelse continue;
-        _ = cell; // kept for symmetry; reads come from components below
+        // Phase 7: draining state lives on the entity's StreamDraining
+        // component instead of a side-table map split. Reads of
+        // chunks/wakes/chain identity come from the four stream
+        // components.
+        const draining_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamDraining) catch continue;
         const chunks_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamChunks) catch continue;
         const wakes_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamWakes) catch continue;
         const chain_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamChain) catch continue;
@@ -4204,11 +3981,10 @@ pub fn serviceParkedStreams(worker: anytype) !void {
             continue;
         }
 
-        // Chunks drained. If the entity is in the draining map, close
-        // now (END_STREAM) and reap the cell.
-        if (p.draining) {
+        // Chunks drained. If StreamDraining flagged the chain, close
+        // now (END_STREAM); component deinit cleans up on destroy.
+        if (draining_comp.is_draining) {
             try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
-            freeStreamCell(worker, p.ent);
             continue;
         }
 
@@ -4223,7 +3999,6 @@ pub fn serviceParkedStreams(worker: anytype) !void {
                     .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)" },
                 );
                 try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
-                freeStreamCell(worker, p.ent);
                 continue;
             }
             resumeStream(worker, p.ent, p.sid, p.sess, .kv_wake) catch |err| {
@@ -4232,7 +4007,6 @@ pub fn serviceParkedStreams(worker: anytype) !void {
                     .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)", @errorName(err) },
                 );
                 server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in) catch {};
-                freeStreamCell(worker, p.ent);
             };
             continue;
         }
@@ -4243,7 +4017,6 @@ pub fn serviceParkedStreams(worker: anytype) !void {
         // that the initial chunks have shipped.
         if (wakes_comp.interval_ms == 0 and wakes_comp.kv_prefixes.len == 0) {
             try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
-            freeStreamCell(worker, p.ent);
             continue;
         }
 
@@ -4257,7 +4030,6 @@ pub fn serviceParkedStreams(worker: anytype) !void {
                     .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)" },
                 );
                 try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
-                freeStreamCell(worker, p.ent);
                 continue;
             }
             resumeStream(worker, p.ent, p.sid, p.sess, .timer) catch |err| {
@@ -4266,7 +4038,6 @@ pub fn serviceParkedStreams(worker: anytype) !void {
                     .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)", @errorName(err) },
                 );
                 server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in) catch {};
-                freeStreamCell(worker, p.ent);
             };
             continue;
         }
@@ -4275,15 +4046,19 @@ pub fn serviceParkedStreams(worker: anytype) !void {
     }
 }
 
-/// Drain the worker's `wake_inbox` of kv-write events and apply
-/// each one against `parked_streams_meta`: for every cell whose
-/// `kv_prefixes` includes a prefix of the event's key, set
-/// `pending_wake = .{ key, op }` (most-recent-wins per v1's §9.4
-/// collapse posture). Events whose tenant_id matches no held
-/// stream are simply dropped — the per-tenant scoping § 4.6
-/// invariant lives at REGISTRATION time (a cell only registers
-/// prefixes for its own tenant), so a stale event against an old
-/// tenant just doesn't match anything.
+/// Drain the worker's `wake_inbox` of kv-write events. For every
+/// stream entity (in one of the h2 stream-pipeline collections,
+/// not draining) whose `kv_prefixes` includes a prefix of the
+/// event's key, set `pending_wake = .{ key, op }`
+/// (most-recent-wins per v1's §9.4 collapse posture). Events whose
+/// tenant_id matches no held stream are simply dropped — the
+/// per-tenant scoping § 4.6 invariant lives at REGISTRATION time
+/// (a cell only registers prefixes for its own tenant), so a
+/// stale event against an old tenant just doesn't match anything.
+///
+/// Phase 7: side-table iteration replaced by an in-place sweep of
+/// the five h2 stream-pipeline collections. Empty collections cost
+/// one length check each (no allocator pressure).
 fn drainKvWakeInbox(worker: anytype) !void {
     const allocator = worker.allocator;
     var events: std.ArrayListUnmanaged(KvWakeEvent) = .empty;
@@ -4295,37 +4070,33 @@ fn drainKvWakeInbox(worker: anytype) !void {
     if (events.items.len == 0) return;
 
     const server = worker.h2;
-    // Phase 6: only `parked_streams_active` gets wake matches —
-    // draining streams are flushing buffered chunks then closing,
-    // they don't activate again. Side table stays the entity index
-    // until Phase 7 (when the entities directly track their parked
-    // state).
-    var it = worker.parked_streams_active.iterator();
-    while (it.next()) |entry| {
-        const ent = entry.key_ptr.*;
-        const wakes = server.reg.getAny(
-            ent,
-            .{
-                &server.stream_response_in,
-                &server.stream_data_out,
-                &server.stream_data_in,
-                &server.stream_close_in,
-                &server._stream_data_sending,
-            },
-            components_mod.StreamWakes,
-        ) catch continue;
-        if (wakes.kv_prefixes.len == 0) continue;
-        const chain_ctx = server.reg.getAny(
-            ent,
-            .{
-                &server.stream_response_in,
-                &server.stream_data_out,
-                &server.stream_data_in,
-                &server.stream_close_in,
-                &server._stream_data_sending,
-            },
-            components_mod.ChainContext,
-        ) catch continue;
+    inline for (.{
+        &server.stream_response_in,
+        &server.stream_data_out,
+        &server.stream_data_in,
+        &server.stream_close_in,
+        &server._stream_data_sending,
+    }) |coll| {
+        const wakes_col = coll.column(components_mod.StreamWakes);
+        const chains_col = coll.column(components_mod.ChainContext);
+        const drain_col = coll.column(components_mod.StreamDraining);
+        for (wakes_col, chains_col, drain_col) |*wakes, chain_ctx, drain| {
+            if (drain.is_draining) continue;
+            if (wakes.kv_prefixes.len == 0) continue;
+            try matchEventsToWakes(allocator, &events, wakes, chain_ctx);
+        }
+    }
+}
+
+/// Walk events newest-first; install the freshest matching event on
+/// `wakes.pending_wake`, freeing any prior pending key.
+fn matchEventsToWakes(
+    allocator: std.mem.Allocator,
+    events: *std.ArrayListUnmanaged(KvWakeEvent),
+    wakes: *components_mod.StreamWakes,
+    chain_ctx: components_mod.ChainContext,
+) !void {
+    {
         // Walk events newest-first so "most-recent-wins" matches the
         // intuitive notion of "this stream's pending wake is the
         // latest fired write."
@@ -4389,13 +4160,12 @@ fn resumeStream(
 
     const allocator = worker.allocator;
     // Handler-cmds Phase 3: chain identity + chunks + wakes ride on
-    // the entity's components. Phase 6: draining-state is encoded by
-    // the cell's map-membership — `resumeStream` only fires for
-    // entities in `parked_streams_active`; the terminal/cap-hit
-    // branches `moveStreamCellToDraining(...)` instead of mutating
-    // a `close_pending` field.
+    // the entity's components. Phase 7: draining-state is encoded
+    // by `StreamDraining.is_draining` — `resumeStream` only fires
+    // for non-draining entities (the caller filters); the terminal /
+    // cap-hit branches `markStreamDraining(server, ent)` instead of
+    // mutating a `close_pending` field.
     const server = worker.h2;
-    _ = worker.parked_streams_active.getPtr(ent) orelse return;
     const chain_ctx = server.reg.get(ent, &server.stream_data_out, components_mod.ChainContext) catch return error.ResumeNoChainCtx;
     const chain_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChain) catch return error.ResumeNoChainState;
     const chunks_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChunks) catch return error.ResumeNoChunks;
@@ -4501,7 +4271,7 @@ fn resumeStream(
     ) catch {
         txn.rollback() catch {};
         txn_done = true;
-        moveStreamCellToDraining(worker, ent) catch {};
+        markStreamDraining(server, ent);
         captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
         return;
     };
@@ -4514,7 +4284,7 @@ fn resumeStream(
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;
-                moveStreamCellToDraining(worker, ent) catch {};
+                markStreamDraining(server, ent);
                 captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
                 r.console = &.{};
                 r.exception = &.{};
@@ -4533,7 +4303,7 @@ fn resumeStream(
                     std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
-                    moveStreamCellToDraining(worker, ent) catch {};
+                    markStreamDraining(server, ent);
                     captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
                     r.console = &.{};
                     r.exception = &.{};
@@ -4548,7 +4318,7 @@ fn resumeStream(
                         return e;
                     };
                 }
-                moveStreamCellToDraining(worker, ent) catch {};
+                markStreamDraining(server, ent);
                 chain_st.activation_count += 1;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
                 captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
@@ -4572,7 +4342,7 @@ fn resumeStream(
                     return e;
                 };
             }
-            moveStreamCellToDraining(worker, ent) catch {};
+            markStreamDraining(server, ent);
             chain_st.activation_count += 1;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
@@ -4588,7 +4358,7 @@ fn resumeStream(
             cval.deinit(allocator);
             txn.rollback() catch {};
             txn_done = true;
-            moveStreamCellToDraining(worker, ent) catch {};
+            markStreamDraining(server, ent);
             captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
         },
         .stream => |*s2| {
@@ -4600,7 +4370,7 @@ fn resumeStream(
                     s2.deinit(allocator);
                     txn_owned = false;
                     txn_done = true;
-                    moveStreamCellToDraining(worker, ent) catch {};
+                    markStreamDraining(server, ent);
                     captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
                     return;
                 };
@@ -4680,11 +4450,12 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     // confirms the entity HAS a stream (the `.contains` check in
     // `cleanupResponses` is the gate that drove us here).
     const server = worker.h2;
-    // Phase 6: presence in either map means the entity holds a
-    // stream chain — drain activation fires either way.
-    if (!worker.parked_streams_active.contains(ent) and !worker.parked_streams_draining.contains(ent)) return;
-    const chain_ctx = server.reg.get(ent, &server.response_out, components_mod.ChainContext) catch return;
+    // Phase 7: entity has a stream chain iff StreamChain.module_path
+    // is non-empty. Component presence replaces the parked_streams_*
+    // map membership check.
     const chain_st = server.reg.get(ent, &server.response_out, components_mod.StreamChain) catch return;
+    if (chain_st.module_path.len == 0) return;
+    const chain_ctx = server.reg.get(ent, &server.response_out, components_mod.ChainContext) catch return;
     std.log.info(
         "rove-js stream-disconnect: tenant={s} corr={s} activations={d}",
         .{ chain_ctx.tenant_id, chain_ctx.correlation_id orelse "(none)", chain_st.activation_count },
@@ -5126,20 +4897,10 @@ fn drainLeadershipLossColl(
         i -= 1;
         const ent = entities[i];
         const resp_body = resp_bodies[i];
-        // Phase 7: no per-kind side-table cleanup needed —
-        // ContDescriptor / stream components on the entity deinit
-        // structurally on destroy. (Stream pending_stream_meta is
-        // still alive in 7b; cont parked_meta is gone in 7a. The
-        // stream branch will lose its switch arm in 7b.)
-        switch (kind) {
-            .response, .cont => {},
-            .stream => {
-                if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
-                    var sm = kvp.value;
-                    sm.deinit(allocator);
-                }
-            },
-        }
+        // Phase 7: no per-kind side-table cleanup — all cont and
+        // stream state lives on the entity's components and deinits
+        // structurally when cleanupResponses destroys the entity.
+        _ = kind;
         const old_body_ptr: ?[*]u8 = resp_body.data;
         const old_body_len: u32 = resp_body.len;
         try respb.overwrite503InPending(worker, coll, ent, allocator);
@@ -5169,12 +4930,13 @@ fn drainLeadershipLossColl(
 pub fn cleanupResponses(worker: anytype) !void {
     const server = worker.h2;
     const entities = server.response_out.entitySlice();
-    for (entities) |ent| {
-        const has_stream = worker.parked_streams_active.contains(ent) or
-            worker.parked_streams_draining.contains(ent);
-        if (has_stream) {
+    const chains = server.response_out.column(components_mod.StreamChain);
+    for (entities, chains) |ent, chain| {
+        // Phase 7: an entity in response_out with a populated
+        // StreamChain.module_path is a client-disconnect on a held
+        // stream — fire the disconnect activation before destroy.
+        if (chain.module_path.len > 0) {
             fireDisconnectActivation(worker, ent);
-            freeStreamCell(worker, ent);
         }
         try server.reg.destroy(ent);
     }
