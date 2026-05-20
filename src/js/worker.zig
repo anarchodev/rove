@@ -3071,49 +3071,13 @@ pub fn drainRaftPending(worker: anytype) !void {
             if (worker.pending_stream_meta.count() != 0) {
                 if (worker.pending_stream_meta.fetchRemove(ent)) |kvp| {
                     const meta = kvp.value;
-                    // Handler-cmds Phase 3: populate stream components
-                    // BEFORE registerStreamCell. The component clones
-                    // are independent of the meta's owned slices — meta
-                    // still feeds the side-table cell, the component
-                    // is the post-Phase-7 single owner. If either
-                    // setStreamComponents or registerStreamCell fails,
-                    // we free the meta's still-owned slices below.
-                    setStreamComponents(
-                        server,
-                        &worker.raft_pending,
-                        ent,
-                        allocator,
-                        meta.tenant_id,
-                        meta.correlation_id,
-                        meta.deployment_id,
-                        meta.module_path,
-                        meta.ctx_json,
-                        meta.chunks,
-                        meta.kv_prefixes,
-                        meta.interval_ms,
-                    ) catch |serr| {
-                        // setStreamComponents failed mid-way: the
-                        // entity may carry partial components. They'll
-                        // reap structurally when the entity is
-                        // destroyed (or via moveStrip when it moves
-                        // to a Row that lacks them — none in our
-                        // current chain). Free meta's owned slices —
-                        // setStreamComponents only ever borrowed them.
-                        if (meta.tenant_id.len > 0) allocator.free(meta.tenant_id);
-                        if (meta.correlation_id) |c| allocator.free(c);
-                        allocator.free(meta.module_path);
-                        allocator.free(meta.ctx_json);
-                        for (meta.chunks) |c| allocator.free(c);
-                        if (meta.chunks.len > 0) allocator.free(meta.chunks);
-                        for (meta.kv_prefixes) |p| allocator.free(p);
-                        if (meta.kv_prefixes.len > 0) allocator.free(meta.kv_prefixes);
-                        std.log.warn(
-                            "drainRaftPending: setStreamComponents ent={} err={s}; routing to response_in with empty body",
-                            .{ ent, @errorName(serr) },
-                        );
-                        try server.reg.move(ent, &worker.raft_pending, &server.response_in);
-                        continue;
-                    };
+                    // Handler-cmds Phase 4b: stream components are
+                    // already set on the entity by Phase 4a's
+                    // `streamRecordIfAnyAt` (back in finalizeBatch
+                    // before the raft park) — drainRaftPending only
+                    // needs to register the side-table cell and move
+                    // the entity. The components rode here on
+                    // `merged_request_row`.
                     registerStreamCell(
                         worker,
                         ent,
