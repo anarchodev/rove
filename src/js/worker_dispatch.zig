@@ -126,94 +126,97 @@ const SuccessRec = struct {
     /// from the dispatch `Request`; duped into `ParkedCont` by the
     /// cont helpers so the resume inherits the same chain id.
     correlation_id: ?[]const u8 = null,
+    /// Set when the handler returned `__rove_stream(...)` (streaming-
+    /// handlers-plan §3.3). Carries the chain-level state forward to
+    /// `finalizeBatch`, which redirects the entity into h2's stream
+    /// pipeline (`stream_response_in` instead of `response_in`) and
+    /// hands ownership to `worker.parked_streams_meta` via
+    /// `worker.registerStreamCell`. Transient — consumed in
+    /// finalizeBatch; never persisted on the entity.
+    stream: ?StreamFirstHopMeta = null,
 };
 
-/// Phase 2b-i: build a `Response` from a `Stream` descriptor.
-/// Concatenates `chunks` into the body, parses the wire-format
-/// `headers` string (`Key: Val\r\nKey2: Val2\r\n`) into
-/// `[]ResponseHeader`, and stamps `status`. Single-DATA-frame
-/// degenerate streaming — the real multi-frame chunked lifecycle
-/// lands in Phase 2b-ii together with timer-wake re-activation.
-/// Caller owns `s` and is responsible for deinit on success / error.
-fn streamToResponse(
-    allocator: std.mem.Allocator,
-    s: *stream_mod.Stream,
-) !dispatcher_mod.Response {
-    // Concatenate chunks into one owned body buffer.
-    var total: usize = 0;
-    for (s.chunks) |ch| total += ch.len;
-    const body = try allocator.alloc(u8, total);
-    errdefer allocator.free(body);
-    var off: usize = 0;
-    for (s.chunks) |ch| {
-        @memcpy(body[off .. off + ch.len], ch);
-        off += ch.len;
-    }
+/// Stream first-hop chain metadata held on a `SuccessRec` between the
+/// `.stream` dispatch outcome and `finalizeBatch`. All slices are
+/// owned; `deinit` frees them in the discard path.
+const StreamFirstHopMeta = struct {
+    /// Owned. Initial chunks the chain emits before the first wake.
+    /// Each chunk byte buffer is allocator-owned; the outer spine
+    /// (the `[][]u8`) is too.
+    chunks: [][]u8,
+    /// 0 = no timer wake registered — the chain ends after the
+    /// initial chunks drain (the degenerate "stream a finite batch"
+    /// shape — `acme/stream/index.mjs`). >0 = re-run the handler
+    /// every `interval_ms` ms.
+    interval_ms: i64,
+    /// Owned. Customer `ctx` JSON, threaded forward into the next
+    /// activation's synthesized request body.
+    ctx_json: []u8,
+    /// Owned. Module path the resume engine invokes on each wake.
+    /// Derived from the dispatch route's `module_base` so the resume
+    /// reaches the same handler that returned `__rove_stream(...)`.
+    module_path: []u8,
 
-    // Parse `headers` (`Key: Val\r\nKey2: Val2\r\n`) into
-    // `[]ResponseHeader`. Empty headers slice when null/empty.
-    var headers: []dispatcher_mod.ResponseHeader = &.{};
+    pub fn deinit(self: *StreamFirstHopMeta, allocator: std.mem.Allocator) void {
+        for (self.chunks) |c| allocator.free(c);
+        if (self.chunks.len > 0) allocator.free(self.chunks);
+        allocator.free(self.ctx_json);
+        allocator.free(self.module_path);
+        self.* = undefined;
+    }
+};
+
+/// Parse a `__rove_stream(...)` wire-format headers buffer
+/// (`Key: Val\r\nKey2: Val2\r\n`) into a `[]ResponseHeader`. Names
+/// are lowercased per RFC 7540 §8.1.2 — same posture as
+/// `extractResponseMetadata`. Returns an empty slice for an empty /
+/// no-pairs input. Caller owns the returned slice + every entry.
+fn parseStreamHeaders(
+    allocator: std.mem.Allocator,
+    hbuf: []const u8,
+) ![]dispatcher_mod.ResponseHeader {
+    // First pass: count lines.
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < hbuf.len) {
+        const nl = std.mem.indexOfScalarPos(u8, hbuf, i, '\n') orelse hbuf.len;
+        const line_end = if (nl > i and hbuf[nl - 1] == '\r') nl - 1 else nl;
+        if (line_end > i) count += 1;
+        i = nl + 1;
+    }
+    if (count == 0) return &.{};
+
+    const headers = try allocator.alloc(dispatcher_mod.ResponseHeader, count);
+    var built: usize = 0;
     errdefer {
-        for (headers) |h| {
+        for (headers[0..built]) |h| {
             allocator.free(h.name);
             allocator.free(h.value);
         }
-        if (headers.len > 0) allocator.free(headers);
+        allocator.free(headers);
     }
-    if (s.headers) |hbuf| {
-        // First pass: count lines.
-        var count: usize = 0;
-        var i: usize = 0;
-        while (i < hbuf.len) {
-            const nl = std.mem.indexOfScalarPos(u8, hbuf, i, '\n') orelse hbuf.len;
-            const line_end = if (nl > i and hbuf[nl - 1] == '\r') nl - 1 else nl;
-            if (line_end > i) count += 1;
-            i = nl + 1;
-        }
-        if (count > 0) {
-            headers = try allocator.alloc(dispatcher_mod.ResponseHeader, count);
-            var built: usize = 0;
-            errdefer for (headers[0..built]) |h| {
-                allocator.free(h.name);
-                allocator.free(h.value);
-            };
-            i = 0;
-            while (i < hbuf.len) {
-                const nl = std.mem.indexOfScalarPos(u8, hbuf, i, '\n') orelse hbuf.len;
-                const line_end = if (nl > i and hbuf[nl - 1] == '\r') nl - 1 else nl;
-                if (line_end > i) {
-                    const line = hbuf[i..line_end];
-                    const colon = std.mem.indexOfScalar(u8, line, ':');
-                    if (colon) |c| {
-                        var v_start = c + 1;
-                        while (v_start < line.len and line[v_start] == ' ') : (v_start += 1) {}
-                        // HTTP/2 requires lowercase header field
-                        // names (RFC 7540 §8.1.2); mirror the existing
-                        // `extractResponseMetadata` posture for
-                        // `response.headers = { Name: ... }`.
-                        const name_src = line[0..c];
-                        const name = try allocator.alloc(u8, name_src.len);
-                        errdefer allocator.free(name);
-                        for (name_src, 0..) |b, j| name[j] = std.ascii.toLower(b);
-                        const value = try allocator.dupe(u8, line[v_start..]);
-                        headers[built] = .{ .name = name, .value = value };
-                        built += 1;
-                    }
-                }
-                i = nl + 1;
+    i = 0;
+    while (i < hbuf.len) {
+        const nl = std.mem.indexOfScalarPos(u8, hbuf, i, '\n') orelse hbuf.len;
+        const line_end = if (nl > i and hbuf[nl - 1] == '\r') nl - 1 else nl;
+        if (line_end > i) {
+            const line = hbuf[i..line_end];
+            const colon = std.mem.indexOfScalar(u8, line, ':');
+            if (colon) |c| {
+                var v_start = c + 1;
+                while (v_start < line.len and line[v_start] == ' ') : (v_start += 1) {}
+                const name_src = line[0..c];
+                const name = try allocator.alloc(u8, name_src.len);
+                errdefer allocator.free(name);
+                for (name_src, 0..) |b, j| name[j] = std.ascii.toLower(b);
+                const value = try allocator.dupe(u8, line[v_start..]);
+                headers[built] = .{ .name = name, .value = value };
+                built += 1;
             }
         }
+        i = nl + 1;
     }
-
-    return dispatcher_mod.Response{
-        .status = @intCast(s.status),
-        .body = body,
-        .body_is_json = false,
-        .console = try allocator.dupe(u8, ""),
-        .exception = try allocator.dupe(u8, ""),
-        .set_cookies = &.{},
-        .headers = headers,
-    };
+    return headers;
 }
 
 // ── Trampoline (connection-actor §6.1/§6.4) finalize helpers ───────
@@ -261,6 +264,60 @@ fn contDiscardIfAny(allocator: std.mem.Allocator, s: *SuccessRec) void {
     if (s.cont) |*cptr| {
         cptr.deinit(allocator);
         s.cont = null;
+    }
+}
+
+// ── Streaming-handlers Phase 2b-ii finalize helpers ────────────────
+// Symmetric to the cont helpers: redirect the FINAL entity
+// destination (`stream_response_in` instead of `response_in`) and
+// hand the chain-level descriptor to `worker.registerStreamCell` —
+// `parked_streams_meta` is the data side-store, the entity's
+// membership in the stream pipeline is the lifecycle discriminant
+// (`feedback_state_is_collection`).
+
+/// Committed read-only first-hop success that is a stream → register
+/// the chain cell + move the entity into h2's stream pipeline.
+/// Returns true iff it parked (caller skips its own move + captures
+/// as parked with status 0, same shape as `contParkIfAny`).
+fn streamParkIfAny(
+    worker: anytype,
+    server: anytype,
+    tenant_id: []const u8,
+    s: *SuccessRec,
+) !bool {
+    const meta = s.stream orelse return false;
+    s.stream = null;
+    // registerStreamCell's all-or-nothing contract: on success it
+    // took ownership of every transferred slice; on failure it freed
+    // them all and meta is a husk either way.
+    try worker_mod.registerStreamCell(
+        worker,
+        s.ent,
+        tenant_id,
+        s.correlation_id,
+        meta.module_path,
+        meta.ctx_json,
+        meta.chunks,
+        meta.interval_ms,
+        s.deployment_id,
+    );
+    // Move into the streaming pipeline. h2's `consumeStreamResponses`
+    // submits the response headers we already stamped (Status +
+    // RespHeaders) on the entity, then transitions it to
+    // `stream_data_out` where `serviceParkedStreams` takes over.
+    try server.reg.move(s.ent, &server.request_out, &server.stream_response_in);
+    return true;
+}
+
+/// 500 path: the first-hop wrote kv. Phase 2b-ii is read-only-only
+/// (mirror of `resumeContinuation`'s 3b-iii read-only restriction);
+/// the write-stream path lands when Phase 4 lifts the asymmetry. For
+/// now, terminate with a defined 500 + drop the descriptor; the
+/// caller stamps the response.
+fn streamDiscardIfAny(allocator: std.mem.Allocator, s: *SuccessRec) void {
+    if (s.stream) |*m| {
+        m.deinit(allocator);
+        s.stream = null;
     }
 }
 
@@ -365,6 +422,7 @@ fn finalizeBatch(
                 allocator.destroy(txn);
                 for (successes.items) |*s| {
                     contDiscardIfAny(allocator, s); // open hop didn't commit → 503, not held
+                    streamDiscardIfAny(allocator, s); // stream-first-hop never reached the wire → drop chain meta
                     respb.overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |e2| panic_mod.invariantViolated(
                         "finalizeBatch.respb.overwriteWith503(idiom0_barrier_fail)",
                         "tenant={s} err={s}",
@@ -388,6 +446,22 @@ fn finalizeBatch(
             const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
             for (successes.items) |*s| {
                 try contRecordIfAny(worker, allocator, anchor_id, s); // drain redirects to parked_continuations
+                // Phase 2b-ii: stream-park alongside a raft propose
+                // isn't wired (drainRaftPending only redirects to
+                // `parked_continuations`, not into the stream
+                // pipeline). Log loud + discard the chain meta —
+                // the entity ships its already-stamped empty body
+                // through the normal raft_pending → response_in
+                // path. Mixed read-only-stream / write batches are
+                // rare; lifting this lands with Phase 4's read-only
+                // restriction.
+                if (s.stream != null) {
+                    std.log.warn(
+                        "rove-js stream: tenant={s} idiom-0 barrier-batch contained a __rove_stream return — discarded; ships empty 200 instead of streaming",
+                        .{anchor_id},
+                    );
+                    streamDiscardIfAny(allocator, s);
+                }
                 try server.reg.set(s.ent, &server.request_out, RaftWait, .{
                     .seq = seq,
                     .deadline_ns = deadline_ns,
@@ -429,6 +503,16 @@ fn finalizeBatch(
             // Trampoline: committed read-only continuation → park,
             // not respond. captured as parked (status 0).
             if (try contParkIfAny(worker, server, allocator, anchor_id, s)) {
+                captureSuccess(worker, anchor_id, s, 0, .ok);
+                processed += 1;
+                continue;
+            }
+            // Streaming-handlers Phase 2b-ii: committed read-only
+            // first-hop that returned `__rove_stream(...)` → register
+            // the chain cell + redirect into h2's stream pipeline.
+            // captured as parked (status 0, same shape as the cont
+            // park).
+            if (try streamParkIfAny(worker, server, anchor_id, s)) {
                 captureSuccess(worker, anchor_id, s, 0, .ok);
                 processed += 1;
                 continue;
@@ -502,6 +586,20 @@ fn finalizeBatch(
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     for (successes.items) |*s| {
         try contRecordIfAny(worker, allocator, anchor_id, s); // drain redirects to parked_continuations
+        // Phase 2b-ii: drainRaftPending only knows how to redirect a
+        // committed entry to `parked_continuations`. A stream-first-
+        // hop alongside a raft propose would land in
+        // `response_in` with the empty placeholder body — visibly
+        // wrong. Log loud + discard the chain meta. Phase 4 wires
+        // drain-time stream parking (alongside lifting the read-
+        // only restriction).
+        if (s.stream != null) {
+            std.log.warn(
+                "rove-js stream: tenant={s} write-batch contained a __rove_stream return — discarded; ships empty 200 instead of streaming",
+                .{anchor_id},
+            );
+            streamDiscardIfAny(allocator, s);
+        }
         try server.reg.set(s.ent, &server.request_out, RaftWait, .{
             .seq = seq,
             .deadline_ns = deadline_ns,
@@ -2100,12 +2198,22 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         else
             dispatcher_mod.Budget.default_duration_ns;
         var budget = dispatcher_mod.Budget.fromNow(budget_ns);
+        // Streaming-handlers Phase 2b-ii read-only first-hop
+        // restriction: snapshot the writeset length before running
+        // the handler so we can detect "this handler wrote AND
+        // returned `__rove_stream(...)`" — that combination is
+        // rejected with a defined 500 (Phase 4 lifts the restriction
+        // alongside the cont resume's 3b-iii branch). The batched
+        // writeset (`&writeset` is shared across the anchor tenant's
+        // batch) means a prior request's writes carry forward; the
+        // delta is what THIS handler contributed.
+        const ws_pre_len = writeset.ops.items.len;
         // §6.4 binding (5b-1): a continuation hop binds to the single
         // `_send/owed/{id}` it wrote — derived from `writeset` after
         // the hop (see `cont_bound_sched_id` below). The customer
         // never sees the id (`http.send`'s value is unused by §6.4),
         // so the binding is runtime-internal.
-        const run_oc = worker.dispatcher.runOutcome(
+        var run_oc = worker.dispatcher.runOutcome(
             scope_inst.kv,
             txn.?,
             &writeset,
@@ -2154,7 +2262,42 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // unchanged ~150-line response/SuccessRec block below run
         // verbatim (empty body/console/exception is already a
         // supported terminal shape — handlers may return nothing).
+        // Streaming-handlers Phase 2b-ii read-only first-hop guard:
+        // if the handler returned `__rove_stream(...)` AND wrote to
+        // kv on this hop, rewrite the run outcome to a defined 500
+        // before the response-build switch sees it. Mirrors the
+        // `resumeContinuation` 3b-iii read-only rejection — Phase 4
+        // lifts both restrictions together. Per-handler write
+        // detection compares the shared `writeset.ops` length
+        // before/after the run (a previous batched handler's writes
+        // accumulate but aren't this handler's responsibility).
+        if (writeset.ops.items.len > ws_pre_len) {
+            switch (run_oc) {
+                .stream => |sval| {
+                    var s_to_drop = sval;
+                    s_to_drop.deinit(allocator);
+                    run_oc = .{ .terminal = .{
+                        .status = 500,
+                        .body = try allocator.dupe(u8, "streaming + kv writes not yet supported (Phase 2b-ii read-only)\n"),
+                        .body_is_json = false,
+                        .console = try allocator.dupe(u8, ""),
+                        .exception = try allocator.dupe(u8, ""),
+                        .set_cookies = &.{},
+                        .headers = &.{},
+                    } };
+                },
+                else => {},
+            }
+        }
+
         var cont_opt: ?continuation_mod.Continuation = null;
+        var stream_meta_opt: ?StreamFirstHopMeta = null;
+        // `defer` (not errdefer) so the exception / kv-error /
+        // `continue` paths below also drop the metadata if the
+        // SuccessRec append never reached. Cleared to null right
+        // after the transfer (below) so the defer becomes a no-op
+        // on the success path.
+        defer if (stream_meta_opt) |*m| m.deinit(allocator);
         var resp: dispatcher_mod.Response = switch (run_oc) {
             .terminal => |r| r,
             .continuation => |cval| ctblk: {
@@ -2168,19 +2311,48 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 };
             },
             .stream => |sval| stblk: {
-                // Phase 2b-i: build a `Response` from the Stream
-                // descriptor — concatenate chunks into the body,
-                // parse the wire-format `headers` string into
-                // `[]ResponseHeader`, status as-is. This is a single
-                // DATA frame (not yet truly chunked); the real
-                // multi-frame `stream_response_in` → `stream_data_out`
-                // lifecycle + timer-wake re-activation lands in Phase
-                // 2b-ii. Until then, the customer's JS shape reaches
-                // the wire correctly and the smoke verifies headers +
-                // concatenated body. Stream is consumed here.
+                // Phase 2b-ii: park the chain. The handler's
+                // `__rove_stream(...)` becomes (a) an empty-body
+                // first-hop Response carrying the customer status +
+                // parsed headers (the shared response-stamp block
+                // below stamps Status / RespHeaders on the entity)
+                // and (b) a `StreamFirstHopMeta` recorded on the
+                // SuccessRec — `finalizeBatch` redirects the entity
+                // into `stream_response_in` (instead of
+                // `response_in`) after commit and hands chunks /
+                // interval / ctx to `worker.registerStreamCell`.
+                // `worker.serviceParkedStreams` then drives the
+                // chunked-write lifecycle + timer-wake re-activation.
                 var s = sval;
-                defer s.deinit(allocator);
-                break :stblk try streamToResponse(allocator, &s);
+                const status_u16: u16 = @intCast(@max(@min(s.status, 599), 100));
+                const parsed_hdrs: []dispatcher_mod.ResponseHeader =
+                    if (s.headers) |hbuf| try parseStreamHeaders(allocator, hbuf) else &.{};
+                if (s.headers) |h| allocator.free(h);
+                s.headers = null;
+                // Module path for resume — duped now so route's
+                // defer-deinit doesn't take it out from under us.
+                const mp_dup = try allocator.dupe(u8, route.module_base);
+                // Transfer chunks + ctx_json ownership out of s and
+                // into stream_meta_opt; clear s's fields so its
+                // (unused, see no-defer) deinit would no-op.
+                stream_meta_opt = .{
+                    .chunks = s.chunks,
+                    .interval_ms = s.interval_ms orelse 0,
+                    .ctx_json = s.ctx_json,
+                    .module_path = mp_dup,
+                };
+                s.chunks = &.{};
+                s.ctx_json = &.{};
+                // s is now a husk — no slices left to free; skip deinit.
+                break :stblk dispatcher_mod.Response{
+                    .status = @intCast(status_u16),
+                    .body = try allocator.alloc(u8, 0),
+                    .body_is_json = false,
+                    .console = try allocator.dupe(u8, ""),
+                    .exception = try allocator.dupe(u8, ""),
+                    .set_cookies = &.{},
+                    .headers = parsed_hdrs,
+                };
             },
         };
         // §6.4 binding: a continuation hop that fired EXACTLY one
@@ -2359,7 +2531,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 0,
             .cont_bound_sched_id = cont_bound_sched_id,
             .correlation_id = correlation_id,
+            .stream = stream_meta_opt,
         });
+        // Ownership transferred onto the SuccessRec; the outer
+        // errdefer must not deinit it again.
+        stream_meta_opt = null;
     }
 
     // End of walk. If no anchor was opened we're done — all processing

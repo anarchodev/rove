@@ -459,6 +459,8 @@ fn workerMain(args: *WorkerCtx) !void {
         try reg.flush();
         try rjs.sweepParkedContinuations(worker);
         try reg.flush();
+        try rjs.serviceParkedStreams(worker);
+        try reg.flush();
         try rjs.cleanupResponses(worker);
         try reg.flush();
 

@@ -92,6 +92,7 @@ pub const dispatchSendCompletions = callback_dispatch.dispatchSendCompletions;
 pub const CALLBACK_DEFAULT_MAX_PER_TENANT = callback_dispatch.DEFAULT_MAX_PER_TENANT;
 pub const drainRaftPending = worker.drainRaftPending;
 pub const sweepParkedContinuations = worker.sweepParkedContinuations;
+pub const serviceParkedStreams = worker.serviceParkedStreams;
 pub const drainOnLeadershipLoss = worker.drainOnLeadershipLoss;
 pub const cleanupResponses = worker.cleanupResponses;
 pub const flushLogs = worker.flushLogs;

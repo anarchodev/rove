@@ -64,6 +64,7 @@ const tenant_mod = @import("rove-tenant");
 const dispatcher_mod = @import("dispatcher.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const Continuation = continuation_mod.Continuation;
+const stream_mod = @import("bindings/stream.zig");
 const globals = @import("globals.zig");
 const apply_mod = @import("apply.zig");
 const raft_propose = @import("raft_propose.zig");
@@ -3222,6 +3223,411 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
     }
 }
 
+// ── Streaming-handlers Phase 2b-ii: state machine over h2's
+//    stream_data_out / stream_data_in / stream_close_in pipeline ────
+
+/// Remove + free a parked stream's chain cell. Safe to call when the
+/// entity has no cell (no-op).
+fn freeStreamCell(worker: anytype, ent: rove.Entity) void {
+    if (worker.parked_streams_meta.fetchRemove(ent)) |kvp| {
+        var cell = kvp.value;
+        cell.deinit(worker.allocator);
+    }
+}
+
+/// Phase 2b-ii: install the chain cell for a `__rove_stream(...)`
+/// first-hop. Caller has already stamped `h2.Status` / `h2.RespHeaders`
+/// / `h2.StreamId` / `h2.Session` on the entity in `request_out` and
+/// is about to move it into `h2.stream_response_in` (the streaming
+/// twin of `response_in`). We own the chain-level state alone:
+/// `chunks` (drained one frame at a time by `serviceParkedStreams`),
+/// `interval_ms` / `next_wake_ns` (the §4.5 timer wake — `0` means
+/// "drain chunks then close" — `acme/stream/index.mjs` shape), and
+/// the `ctx_json` / `module_path` / `correlation_id` / `deployment_id`
+/// threaded into every resume activation. Takes ownership of every
+/// slice argument (we dup what the caller still holds; chunks are
+/// moved in via the descriptor's `chunks` slice transferred by
+/// `worker_dispatch.zig`'s `.stream` branch).
+pub fn registerStreamCell(
+    worker: anytype,
+    ent: rove.Entity,
+    tenant_id: []const u8,
+    correlation_id: ?[]const u8,
+    module_path: []u8, // ownership transferred in
+    ctx_json: []u8, // ownership transferred in
+    initial_chunks: [][]u8, // ownership transferred in (slice + bytes)
+    interval_ms: i64,
+    deployment_id: u64,
+) !void {
+    const allocator = worker.allocator;
+    // The caller transferred ownership of `module_path` / `ctx_json`
+    // / `initial_chunks` (slice + bytes). On ANY error along the
+    // pre-flight chain we free them — the function is all-or-nothing
+    // so the caller can rely on "succeeded ⇒ transfer complete,
+    // failed ⇒ nothing leaked." Last allocation (chunks_list capacity)
+    // is the last `try`; the final `putAssumeCapacity` is infallible,
+    // so the errdefer below never sees a state where ownership has
+    // been split between the inputs and the cell.
+    errdefer {
+        allocator.free(module_path);
+        allocator.free(ctx_json);
+        for (initial_chunks) |c| allocator.free(c);
+        if (initial_chunks.len > 0) allocator.free(initial_chunks);
+    }
+
+    try worker.parked_streams_meta.ensureUnusedCapacity(allocator, 1);
+
+    const tid = try allocator.dupe(u8, tenant_id);
+    errdefer allocator.free(tid);
+    const corr: ?[]u8 = if (correlation_id) |c| try allocator.dupe(u8, c) else null;
+    errdefer if (corr) |c| allocator.free(c);
+
+    // Build the ArrayList that will own the chunks. Reserving the
+    // capacity here is the LAST `try` — after this every step is
+    // infallible, so we can mass-transfer ownership without
+    // resurrecting the errdefer-vs-aliased-bytes hazard.
+    var chunks_list: std.ArrayListUnmanaged([]u8) = .empty;
+    try chunks_list.ensureUnusedCapacity(allocator, initial_chunks.len);
+    for (initial_chunks) |c| chunks_list.appendAssumeCapacity(c);
+    if (initial_chunks.len > 0) allocator.free(initial_chunks);
+
+    const next_wake = if (interval_ms > 0)
+        @as(i64, @intCast(std.time.nanoTimestamp())) + interval_ms * std.time.ns_per_ms
+    else
+        std.math.maxInt(i64);
+
+    worker.parked_streams_meta.putAssumeCapacity(ent, .{
+        .tenant_id = tid,
+        .correlation_id = corr,
+        .module_path = module_path,
+        .ctx_json = ctx_json,
+        .chunks = chunks_list,
+        .interval_ms = interval_ms,
+        .next_wake_ns = next_wake,
+        .activation_count = 1, // the inbound activation that produced the cell
+        .close_pending = false,
+        .deployment_id = deployment_id,
+    });
+}
+
+/// Phase 2b-ii: per-tick driver for active streaming chains. For each
+/// entity currently in `stream_data_out` (h2's "ready for the next
+/// DATA frame" state):
+///   • chunks pending  → pop one, stamp `RespBody`, move to
+///                       `stream_data_in` (h2 frames + sends it,
+///                       cycles the entity back here).
+///   • chunks drained, timer due → run the next handler activation
+///                                 (`resumeStream`). The handler may
+///                                 enqueue more chunks or terminate.
+///   • chunks drained, `close_pending`
+///                       → move to `stream_close_in` (END_STREAM)
+///                         and free the chain cell.
+///   • chunks drained, no wake yet → idle, wait for the next tick.
+///
+/// O(parked) per call, gated by `count() == 0` so the worker hot
+/// path (no streams) pays nothing.
+pub fn serviceParkedStreams(worker: anytype) !void {
+    if (worker.parked_streams_meta.count() == 0) return;
+    const server = worker.h2;
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+
+    // Snapshot (entity, sid, sess) for every entity in stream_data_out
+    // that has a chain cell. `move` is queued, so the slice itself
+    // stays stable across the loop body, but `fetchRemove` + sub-
+    // resume both mutate parked_streams_meta which invalidates
+    // map pointers — the snapshot keeps the per-iter lookups
+    // self-contained.
+    const Pending = struct { ent: rove.Entity, sid: h2.StreamId, sess: h2.Session };
+    var buf: [256]Pending = undefined;
+    var n: usize = 0;
+    {
+        const ents = server.stream_data_out.entitySlice();
+        const sids = server.stream_data_out.column(h2.StreamId);
+        const sesss = server.stream_data_out.column(h2.Session);
+        for (ents, sids, sesss) |ent, sid, sess| {
+            if (!worker.parked_streams_meta.contains(ent)) continue;
+            if (n >= buf.len) break;
+            buf[n] = .{ .ent = ent, .sid = sid, .sess = sess };
+            n += 1;
+        }
+    }
+
+    for (buf[0..n]) |p| {
+        const cell = worker.parked_streams_meta.getPtr(p.ent) orelse continue;
+
+        // Drain one chunk per tick — h2 cycles the entity back to
+        // `stream_data_out` after each DATA frame ships.
+        if (cell.chunks.items.len > 0) {
+            const chunk = cell.chunks.orderedRemove(0);
+            // RespBody takes ownership; h2's onDataSourceReadCb frees
+            // the buffer after consuming it (h2/root.zig:818).
+            try server.reg.set(p.ent, &server.stream_data_out, h2.RespBody, .{
+                .data = chunk.ptr,
+                .len = @intCast(chunk.len),
+            });
+            try server.reg.move(p.ent, &server.stream_data_out, &server.stream_data_in);
+            continue;
+        }
+
+        // Chunks drained.
+        if (cell.close_pending) {
+            try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
+            freeStreamCell(worker, p.ent);
+            continue;
+        }
+        // No wake registered (interval_ms == 0): the chain was
+        // "stream a finite batch + close" (the §3.3 degenerate
+        // shape — `acme/stream/index.mjs`). Close now that the
+        // initial chunks have shipped.
+        if (cell.interval_ms == 0) {
+            try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
+            freeStreamCell(worker, p.ent);
+            continue;
+        }
+
+        // Timer wake due?
+        if (now_ns >= cell.next_wake_ns) {
+            if (cell.activation_count >= MAX_STREAM_ACTIVATIONS) {
+                // §9.2 strike: misbehaving handler can't run a stream
+                // forever. Close cleanly.
+                std.log.warn(
+                    "rove-js stream: tenant={s} corr={s} hit activation cap; closing",
+                    .{ cell.tenant_id, cell.correlation_id orelse "(none)" },
+                );
+                cell.close_pending = true;
+                try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
+                freeStreamCell(worker, p.ent);
+                continue;
+            }
+            resumeStream(worker, p.ent, p.sid, p.sess) catch |err| {
+                std.log.warn(
+                    "rove-js stream-resume: tenant={s} corr={s}: {s}; closing",
+                    .{ cell.tenant_id, cell.correlation_id orelse "(none)", @errorName(err) },
+                );
+                // Cell may have been freed inside resumeStream
+                // (some error paths flip close_pending and let the
+                // next pass do the close). Best-effort: ensure the
+                // close lands now.
+                if (worker.parked_streams_meta.contains(p.ent)) {
+                    var c = worker.parked_streams_meta.getPtr(p.ent).?;
+                    c.close_pending = true;
+                    server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in) catch {};
+                    freeStreamCell(worker, p.ent);
+                }
+            };
+            continue;
+        }
+        // No wake due yet — idle.
+    }
+}
+
+/// Phase 2b-ii: run the next handler activation for a parked stream.
+/// Structural twin of `resumeContinuation` — the dispatch surface is
+/// the same (re-enter `Dispatcher.runOutcome` with a synthesized
+/// `Request`); the differences are activation_source (`.timer`), the
+/// success contract (no `parked_continuations` move — the entity stays
+/// in the stream pipeline), and the return-shape vocabulary
+/// (`.stream` appends chunks + repark; `.terminal` flushes the body
+/// as a final chunk + flags `close_pending`; `.continuation` is
+/// rejected with close — `__rove_next` from a stream-resume hop is
+/// out of scope until Phase 4 lifts the §3b-iii restriction).
+///
+/// Phase 2b-ii constraint: read-only resumes only. A resume hop that
+/// writes kv terminates the stream with a defined 500-equivalent
+/// (recorded on the tape) — same posture as `resumeContinuation`'s
+/// 3b-iii read-only branch. The first-hop write rejection lives in
+/// `worker_dispatch.zig` so it's caught BEFORE the cell is even
+/// registered.
+fn resumeStream(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+) !void {
+    _ = sid;
+    _ = sess; // Reserved for Phase 3 cross-collection resolves; see
+    // resumeContinuation's signature for the call-site shape we'll
+    // mirror when kv-write wakes land and the activation may not
+    // start from `stream_data_out`.
+
+    const allocator = worker.allocator;
+    const cell = worker.parked_streams_meta.getPtr(ent) orelse return;
+
+    const slot = worker.node.tenant_files_map.get(cell.tenant_id) orelse return error.ResumeNoTenant;
+    const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
+    const tc = TenantFiles{ .slot = slot, .snap = snap };
+    defer tc.release();
+    const inst = (worker.node.tenant.getInstance(cell.tenant_id) catch return error.ResumeNoInstance) orelse
+        return error.ResumeNoInstance;
+
+    const path = cell.module_path;
+    const bc = blk: {
+        if (tc.snap.bytecodes.get(path)) |b| break :blk b;
+        const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{path});
+        defer allocator.free(mjs);
+        if (tc.snap.bytecodes.get(mjs)) |b| break :blk b;
+        const js = try std.fmt.allocPrint(allocator, "{s}.js", .{path});
+        defer allocator.free(js);
+        if (tc.snap.bytecodes.get(js)) |b| break :blk b;
+        return error.ResumeNoBytecode;
+    };
+
+    // Synthesized resume body: `{ctx: <ctx_json>}` — same JSON shape
+    // resumeContinuation's deadline path uses, minus the outcome
+    // field (a timer wake has no callee result). Handlers read
+    // `request.activation` (set via the dispatcher's
+    // `activation_source` field, exposed in globals) to branch.
+    const body = try std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{cell.ctx_json});
+    defer allocator.free(body);
+    const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
+    defer allocator.free(spath);
+
+    var txn = inst.kv.beginTrackedImmediate() catch return error.ResumeTxn;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    var tapes = RequestTapes.init(allocator);
+    defer tapes.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .kv_tape = &tapes.kv,
+        .date_tape = &tapes.date,
+        .math_random_tape = &tapes.math_random,
+        .crypto_random_tape = &tapes.crypto_random,
+        .module_tape = &tapes.module,
+        .prng_seed = @bitCast(now_ns),
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = cell.correlation_id,
+        .activation_source = .timer,
+    };
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        &txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        request,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        cell.close_pending = true;
+        captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, .timer);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    var oc = run_oc;
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                cell.close_pending = true;
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, cell.correlation_id, .timer);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            if (wrote) {
+                txn.rollback() catch {};
+                txn_done = true;
+                cell.close_pending = true;
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, r.console, r.exception, .{}, cell.correlation_id, .timer);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            // Clean read-only terminal: flush the body as one last
+            // chunk + flag close_pending. Empty body = close
+            // immediately on the next service tick.
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeStream.commit(terminal)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            if (r.body.len > 0) {
+                const owned = try allocator.dupe(u8, r.body);
+                cell.chunks.append(allocator, owned) catch |e| {
+                    allocator.free(owned);
+                    return e;
+                };
+            }
+            cell.close_pending = true;
+            cell.activation_count += 1;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, cell.correlation_id, .timer);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            cval.deinit(allocator);
+            txn.rollback() catch {};
+            txn_done = true;
+            cell.close_pending = true;
+            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, cell.correlation_id, .timer);
+        },
+        .stream => |*s2| {
+            if (wrote) {
+                s2.deinit(allocator);
+                txn.rollback() catch {};
+                txn_done = true;
+                cell.close_pending = true;
+                captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, &.{}, &.{}, .{}, cell.correlation_id, .timer);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeStream.commit(stream)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            // Headers on subsequent hops are ignored (the stream's
+            // initial response headers already shipped); free them.
+            if (s2.headers) |h| allocator.free(h);
+            s2.headers = null;
+            // Transfer chunks into the cell's queue. Each chunk
+            // pointer is still allocator-owned; ownership moves into
+            // `cell.chunks.items`.
+            for (s2.chunks) |c| try cell.chunks.append(allocator, c);
+            if (s2.chunks.len > 0) allocator.free(s2.chunks);
+            s2.chunks = &.{};
+            // Replace ctx + interval. Old ctx_json is freed; new one
+            // is taken from the descriptor (transfer ownership).
+            allocator.free(cell.ctx_json);
+            cell.ctx_json = s2.ctx_json;
+            s2.ctx_json = &.{};
+            if (s2.interval_ms) |iv| {
+                cell.interval_ms = iv;
+                cell.next_wake_ns = now_ns + iv * std.time.ns_per_ms;
+            } else {
+                cell.interval_ms = 0;
+                cell.next_wake_ns = std.math.maxInt(i64);
+            }
+            cell.activation_count += 1;
+            captureLogWithId(worker, cell.tenant_id, request_id, "POST", cell.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, cell.correlation_id, .timer);
+        },
+    }
+}
+
 /// Fire a committed parked unit's buffered SSE emits. No-op (caller
 /// still discards the buffer) when the worker isn't wired for SSE.
 /// Mirrors `tenant_batch`'s emit-fire wiring, but gated on commit
@@ -3377,10 +3783,16 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
 /// Destroy entities sitting in `response_out` (h2 has finished
 /// flushing them to the wire). Same pattern as the echo example's
 /// `cleanupResponses`.
+///
+/// Phase 2b-ii: also free any orphaned streaming-chain cell whose
+/// entity landed here without the normal close path (e.g. client
+/// disconnect routed through `onStreamCloseCb` → `serverStreamClose`,
+/// which bypasses our `serviceParkedStreams` close-pending sweep).
 pub fn cleanupResponses(worker: anytype) !void {
     const server = worker.h2;
     const entities = server.response_out.entitySlice();
     for (entities) |ent| {
+        if (worker.parked_streams_meta.count() != 0) freeStreamCell(worker, ent);
         try server.reg.destroy(ent);
     }
 }
