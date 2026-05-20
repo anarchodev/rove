@@ -13,12 +13,9 @@
 //!   GET  /v1/health
 //!         → 200 plain "ok\n". Used by the LB health check.
 //!
-//!   POST /v1/emit                                (worker → sse-server)
-//!         Authorization: Bearer <SSE_INTERNAL_TOKEN>
-//!         body: {v, tenant_id, request_id, events:[{event_id,type,
-//!                                                     data,target_sids,
-//!                                                     created_at_ms}]}
-//!         → 204 on success.
+//!   (Emits arrive in-process via `Handle.enqueueEmit` — task #10
+//!    Phase 2; the worker→sse-server HTTP `POST /v1/emit` route was
+//!    deleted with the standalone in Phase 3.)
 //!
 //!   GET  /v1/{tenant_id}/sse?token=<jwt>         (browser EventSource)
 //!         [Last-Event-ID: <id>]
@@ -73,14 +70,77 @@ pub const Config = struct {
     /// `?token=...` query param (sse-plan §5.1). Null = `/v1/{t}/sse`
     /// returns 401 (lets a smoke spin up without auth).
     jwt_secret: ?[]const u8 = null,
-    /// Shared secret in `Authorization: Bearer ...` for the worker →
-    /// sse-server emit POST. Null = `/v1/emit` returns 401.
-    internal_token: ?[]const u8 = null,
     /// Per-tenant connection cap. The (cap+1)th simultaneous connect
     /// is refused 503. Defends a single tenant from exhausting h2
     /// streams.
     max_connections_per_tenant: u32 = 1_000,
 };
+
+/// SSE-thread-owned deep copy of one emitted event (task #10
+/// Phase 2). The worker's `sse_dispatch.EmitEntry` is freed right
+/// after `enqueueEmit` returns, so the queue can't borrow it.
+const QueuedEvent = struct {
+    event_id: [EVENT_ID_LEN]u8,
+    event_type: []u8,
+    data_json: []u8,
+    target_sids: [][]u8,
+
+    fn deinit(self: *QueuedEvent, a: std.mem.Allocator) void {
+        a.free(self.event_type);
+        a.free(self.data_json);
+        for (self.target_sids) |s| a.free(s);
+        a.free(self.target_sids);
+    }
+};
+
+const QueuedEmit = struct {
+    tenant_id: []u8,
+    events: []QueuedEvent,
+
+    fn deinit(self: *QueuedEmit, a: std.mem.Allocator) void {
+        a.free(self.tenant_id);
+        for (self.events) |*e| e.deinit(a);
+        a.free(self.events);
+    }
+};
+
+/// Deep-copy a duck-typed worker emit batch into SSE-owned memory.
+/// Strict errdefer so a partial OOM frees everything (no leak on the
+/// best-effort drop path).
+fn buildQueuedEmit(
+    a: std.mem.Allocator,
+    tenant_id: []const u8,
+    events: anytype,
+) !QueuedEmit {
+    const tid = try a.dupe(u8, tenant_id);
+    errdefer a.free(tid);
+    const evs = try a.alloc(QueuedEvent, events.len);
+    errdefer a.free(evs);
+    var built: usize = 0;
+    errdefer for (evs[0..built]) |*e| e.deinit(a);
+    for (events, 0..) |src, idx| {
+        const et = try a.dupe(u8, src.event_type);
+        errdefer a.free(et);
+        const dj = try a.dupe(u8, src.data_json);
+        errdefer a.free(dj);
+        const sids = try a.alloc([]u8, src.target_sids.len);
+        errdefer a.free(sids);
+        var sn: usize = 0;
+        errdefer for (sids[0..sn]) |s| a.free(s);
+        for (src.target_sids) |ss| {
+            sids[sn] = try a.dupe(u8, ss);
+            sn += 1;
+        }
+        evs[idx] = .{
+            .event_id = src.event_id,
+            .event_type = et,
+            .data_json = dj,
+            .target_sids = sids,
+        };
+        built = idx + 1;
+    }
+    return .{ .tenant_id = tid, .events = evs };
+}
 
 pub const Handle = struct {
     allocator: std.mem.Allocator,
@@ -90,13 +150,66 @@ pub const Handle = struct {
     ready: std.Thread.ResetEvent,
     bind_err: ?anyerror,
     config: Config,
+    /// In-process emit queue (task #10 Phase 2): worker threads
+    /// (producers) hand owned emit batches to the SSE thread (single
+    /// consumer) instead of the retired worker→sse HTTP POST. The
+    /// mutex is the only cross-thread point; `applyEmitBatch` runs
+    /// solely on the SSE thread.
+    emit_q_mutex: std.Thread.Mutex = .{},
+    emit_q: std.ArrayListUnmanaged(QueuedEmit) = .empty,
+
+    /// Worker → SSE in-process handoff. Deep-copies the batch (the
+    /// caller frees its `EmitEntry` list right after) and enqueues.
+    /// Best-effort by contract (SSE is lossy; reconnect + state
+    /// refetch covers loss) — OOM logs and drops, never propagates.
+    /// `events` is duck-typed so the worker passes `[]const
+    /// sse_dispatch.EmitEntry` with no shared type / no rove-js dep.
+    pub fn enqueueEmit(self: *Handle, tenant_id: []const u8, events: anytype) void {
+        if (events.len == 0) return;
+        const a = self.allocator;
+        var qe = buildQueuedEmit(a, tenant_id, events) catch |err| {
+            std.log.warn("sse: enqueueEmit drop ({s}): {s}", .{ tenant_id, @errorName(err) });
+            return;
+        };
+        self.emit_q_mutex.lock();
+        defer self.emit_q_mutex.unlock();
+        self.emit_q.append(a, qe) catch |err| {
+            qe.deinit(a);
+            std.log.warn("sse: enqueueEmit append drop: {s}", .{@errorName(err)});
+        };
+    }
 
     pub fn shutdown(self: *Handle) void {
         self.stop.store(true, .release);
         self.thread.join();
+        for (self.emit_q.items) |*qe| qe.deinit(self.allocator);
+        self.emit_q.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
+
+/// SSE-thread consumer: swap the queue out under the mutex (minimal
+/// hold), then apply + free outside it. Best-effort: an apply error
+/// is logged, the batch dropped (SSE is lossy by design).
+fn drainEmitQueue(
+    h: *Handle,
+    server: *SseH2,
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+) void {
+    h.emit_q_mutex.lock();
+    var batch = h.emit_q;
+    h.emit_q = .empty;
+    h.emit_q_mutex.unlock();
+    defer {
+        for (batch.items) |*qe| qe.deinit(allocator);
+        batch.deinit(allocator);
+    }
+    for (batch.items) |*qe| {
+        applyEmitBatch(server, allocator, state, qe.tenant_id, qe.events) catch |err|
+            std.log.warn("sse: drainEmitQueue apply ({s}): {s}", .{ qe.tenant_id, @errorName(err) });
+    }
+}
 
 pub fn spawn(config: Config) !*Handle {
     const h = try config.allocator.create(Handle);
@@ -165,6 +278,11 @@ fn runThread(h: *Handle) !void {
 
     while (!h.stop.load(.acquire)) {
         try server.pollWithTimeout(100 * std.time.ns_per_ms);
+        // Worker→SSE in-process emits (task #10 Phase 2) — applied
+        // before the request pass so a same-tick emit + connect race
+        // resolves identically to the old POST ordering.
+        drainEmitQueue(h, server, allocator, &state);
+        try reg.flush();
         try processRequests(server, allocator, &state, &h.config);
         try reg.flush();
         try pumpKeepalives(server, allocator, &state);
@@ -365,10 +483,9 @@ fn processRequests(
     const sids = server.request_out.column(h2.StreamId);
     const sessions = server.request_out.column(h2.Session);
     const req_hdrs = server.request_out.column(h2.ReqHeaders);
-    const req_bodies = server.request_out.column(h2.ReqBody);
 
-    for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
-        handleOne(server, allocator, state, cfg, ent, sid, sess, rh, rb) catch |err| {
+    for (entities, sids, sessions, req_hdrs) |ent, sid, sess, rh| {
+        handleOne(server, allocator, state, cfg, ent, sid, sess, rh) catch |err| {
             std.log.warn("sse-server: handler error: {s}", .{@errorName(err)});
             setSimpleResponse(server, ent, sid, sess, 500, "internal error\n") catch |se| std.log.err(
                 "sse-server: 500 write failed: {s}",
@@ -387,11 +504,9 @@ fn handleOne(
     sid: h2.StreamId,
     sess: h2.Session,
     rh: h2.ReqHeaders,
-    rb: h2.ReqBody,
 ) !void {
     var method: []const u8 = "";
     var path: []const u8 = "";
-    var authz: []const u8 = "";
     var last_event_id_hdr: []const u8 = "";
     if (rh.fields != null) {
         const fields = rh.fields.?[0..rh.count];
@@ -400,7 +515,6 @@ fn handleOne(
             const value = f.value[0..f.value_len];
             if (std.mem.eql(u8, name, ":method")) method = value;
             if (std.mem.eql(u8, name, ":path")) path = value;
-            if (std.mem.eql(u8, name, "authorization")) authz = value;
             if (std.mem.eql(u8, name, "last-event-id")) last_event_id_hdr = value;
         }
     }
@@ -417,13 +531,6 @@ fn handleOne(
                 return;
             }
             try setSimpleResponse(server, ent, sid, sess, 200, "ok\n");
-        },
-        .emit => {
-            if (!std.mem.eql(u8, method, "POST")) {
-                try setSimpleResponse(server, ent, sid, sess, 405, "POST only\n");
-                return;
-            }
-            try handleEmit(server, allocator, state, cfg, ent, sid, sess, authz, rb);
         },
         .sse => {
             if (!std.mem.eql(u8, method, "GET")) {
@@ -446,11 +553,11 @@ fn handleOne(
     }
 }
 
-const RouteKind = enum { health, emit, sse };
+const RouteKind = enum { health, sse };
 
 const ParsedRoute = struct {
     kind: RouteKind,
-    /// Empty for `health` and `emit`.
+    /// Empty for `health`.
     tenant_id: []const u8 = "",
     /// Raw query string (after `?`); empty if absent.
     query: []const u8 = "",
@@ -463,9 +570,6 @@ fn parseRoute(path: []const u8) ?ParsedRoute {
 
     if (std.mem.eql(u8, path_no_q, "/v1/health")) {
         return .{ .kind = .health };
-    }
-    if (std.mem.eql(u8, path_no_q, "/v1/emit")) {
-        return .{ .kind = .emit, .query = query };
     }
     const v1_prefix = "/v1/";
     if (std.mem.startsWith(u8, path_no_q, v1_prefix)) {
@@ -481,49 +585,25 @@ fn parseRoute(path: []const u8) ?ParsedRoute {
     return null;
 }
 
-// ── Emit POST ─────────────────────────────────────────────────────
 
-fn handleEmit(
+/// Apply one tenant's emit batch to the ring caches + live
+/// connections. Fed by the in-process emit queue (`enqueueEmit` →
+/// `drainEmitQueue`, task #10 Phase 2 — the HTTP `POST /v1/emit`
+/// path was deleted with the standalone in Phase 3). `events` is
+/// duck-typed (`.event_id`/`.event_type`/`.data_json`/
+/// `.target_sids`) so the worker's `sse_dispatch.EmitEntry` (via
+/// the queue's `QueuedEvent` copy) feeds it without a shared type
+/// or a rove-js dependency. Runs ONLY on the SSE thread (touches
+/// `server.reg` / `state`); the queue's mutex is the cross-thread
+/// boundary, not this.
+fn applyEmitBatch(
     server: *SseH2,
     allocator: std.mem.Allocator,
     state: *ServerState,
-    cfg: *const Config,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    authz: []const u8,
-    rb: h2.ReqBody,
+    tenant_id: []const u8,
+    events: anytype,
 ) !void {
-    const expected = cfg.internal_token orelse {
-        try setSimpleResponse(server, ent, sid, sess, 401, "auth not configured\n");
-        return;
-    };
-    if (!std.mem.startsWith(u8, authz, "Bearer ")) {
-        try setSimpleResponse(server, ent, sid, sess, 401, "missing bearer token\n");
-        return;
-    }
-    const token = authz["Bearer ".len..];
-    if (!constantTimeEql(token, expected)) {
-        try setSimpleResponse(server, ent, sid, sess, 401, "bad internal token\n");
-        return;
-    }
-
-    if (rb.data == null or rb.len == 0) {
-        try setSimpleResponse(server, ent, sid, sess, 400, "missing body\n");
-        return;
-    }
-    const body = rb.data.?[0..rb.len];
-
-    const parsed = parseEmitBody(allocator, body) catch |err| switch (err) {
-        error.MalformedBody => {
-            try setSimpleResponse(server, ent, sid, sess, 400, "malformed body\n");
-            return;
-        },
-        else => return err,
-    };
-    defer parsed.deinit(allocator);
-
-    const tenant = try state.getOrCreateTenant(parsed.tenant_id);
+    const tenant = try state.getOrCreateTenant(tenant_id);
 
     // Per-connection frame accumulator. `reg.move` is deferred —
     // doing one set+move per (event, conn) pair would let the second
@@ -542,7 +622,7 @@ fn handleEmit(
         conn_last_event.deinit(allocator);
     }
 
-    for (parsed.events) |e| {
+    for (events) |e| {
         // Cache-then-collect: every target sid's ring records the event;
         // any matching live connection accumulates the wire bytes.
         for (e.target_sids) |target_sid| {
@@ -600,90 +680,6 @@ fn handleEmit(
         conn.last_send_ns = now_ns;
         if (conn_last_event.get(conn)) |last_id| conn.last_event_id = last_id;
     }
-
-    try setSimpleResponse(server, ent, sid, sess, 204, "");
-}
-
-const ParsedEvent = struct {
-    event_id: [EVENT_ID_LEN]u8,
-    event_type: []const u8,
-    data_json: []const u8,
-    target_sids: []const []const u8,
-};
-
-const ParsedEmit = struct {
-    tenant_id: []const u8,
-    events: []const ParsedEvent,
-    /// Backing buffer for all the borrowed slices above.
-    arena: std.heap.ArenaAllocator,
-
-    fn deinit(self: *const ParsedEmit, _: std.mem.Allocator) void {
-        var arena = self.arena;
-        arena.deinit();
-    }
-};
-
-/// Decode the worker → sse-server emit body. v1 wire format
-/// (sse-plan §2.2) is small and stable; we use std.json.parseFromSlice
-/// so the schema can grow without us hand-rolling everything.
-fn parseEmitBody(allocator: std.mem.Allocator, body: []const u8) !ParsedEmit {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const arena_allocator = arena.allocator();
-
-    const Wire = struct {
-        v: u32 = 1,
-        tenant_id: []const u8 = "",
-        request_id: u64 = 0,
-        events: []const struct {
-            event_id: []const u8 = "",
-            type: []const u8 = "message",
-            data: std.json.Value = .null,
-            target_sids: []const []const u8 = &.{},
-            created_at_ms: i64 = 0,
-        } = &.{},
-    };
-
-    const parsed = std.json.parseFromSliceLeaky(Wire, arena_allocator, body, .{
-        .ignore_unknown_fields = true,
-    }) catch return error.MalformedBody;
-    if (parsed.tenant_id.len == 0) return error.MalformedBody;
-
-    var events = try arena_allocator.alloc(ParsedEvent, parsed.events.len);
-    for (parsed.events, 0..) |w, i| {
-        if (w.event_id.len != EVENT_ID_LEN) return error.MalformedBody;
-        var ev: ParsedEvent = .{
-            .event_id = undefined,
-            .event_type = w.type,
-            .data_json = try jsonValueToString(arena_allocator, w.data),
-            .target_sids = w.target_sids,
-        };
-        @memcpy(&ev.event_id, w.event_id[0..EVENT_ID_LEN]);
-        events[i] = ev;
-    }
-    return .{
-        .tenant_id = parsed.tenant_id,
-        .events = events,
-        .arena = arena,
-    };
-}
-
-/// Render a parsed `data` field back to compact JSON for the wire
-/// `data:` line. Strings stay as JSON strings (with surrounding quotes)
-/// so `data: "hello"` is wire-valid; objects/arrays render compact.
-fn jsonValueToString(allocator: std.mem.Allocator, v: std.json.Value) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    {
-        // Block scope so the writer's internal list syncs back into
-        // `out` BEFORE `toOwnedSlice` reads from it. Without this the
-        // returned slice is empty and the bytes leak (the same bug
-        // sse_dispatch.encodeBatch fixed).
-        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &out);
-        defer out = aw.toArrayList();
-        try std.json.Stringify.value(v, .{}, &aw.writer);
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 // ── EventSource connect ───────────────────────────────────────────
@@ -1004,12 +1000,6 @@ fn extractJsonStringField(json: []const u8, key: []const u8) ?[]const u8 {
     return json[start..i];
 }
 
-fn constantTimeEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var diff: u8 = 0;
-    for (a, b) |x, y| diff |= x ^ y;
-    return diff == 0;
-}
 
 // ── h2 response helpers ───────────────────────────────────────────
 
@@ -1071,11 +1061,6 @@ test "parseRoute matches /v1/health" {
     try testing.expectEqual(RouteKind.health, r.kind);
 }
 
-test "parseRoute matches /v1/emit" {
-    const r = parseRoute("/v1/emit").?;
-    try testing.expectEqual(RouteKind.emit, r.kind);
-}
-
 test "parseRoute matches /v1/{tenant}/sse with query" {
     const r = parseRoute("/v1/acme/sse?token=abc").?;
     try testing.expectEqual(RouteKind.sse, r.kind);
@@ -1130,26 +1115,6 @@ test "Ring append + eviction + contains" {
     var probe_present: [EVENT_ID_LEN]u8 = undefined;
     _ = std.fmt.bufPrint(&probe_present, "{:0>20}-{:0>6}", .{ 5, 0 }) catch unreachable;
     try testing.expect(ring.contains(&probe_present));
-}
-
-test "parseEmitBody round-trips data field as compact JSON" {
-    const a = testing.allocator;
-    const body =
-        \\{"v":1,"tenant_id":"acme","request_id":42,"events":[
-        \\  {"event_id":"00000000000000000042-000000",
-        \\   "type":"comment_added",
-        \\   "data":{"id":99},
-        \\   "target_sids":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
-        \\   "created_at_ms":1730764800000}
-        \\]}
-    ;
-    var parsed = try parseEmitBody(a, body);
-    defer parsed.deinit(a);
-    try testing.expectEqual(@as(usize, 1), parsed.events.len);
-    // The smoke caught a bug here once: jsonValueToString returned ""
-    // because the writer-list sync defer ran after toOwnedSlice. Keep
-    // this expectation tight so it can't silently regress.
-    try testing.expectEqualStrings("{\"id\":99}", parsed.events[0].data_json);
 }
 
 test "formatEventFrame shape" {

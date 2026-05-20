@@ -62,6 +62,9 @@ rove-qjs (arenajs JS engine wrapper) ──┤          │
                               rove-js (worker dispatcher) ──┘
                               rove-files-server (compile/deploy HTTP surface)
                               rove-log-server (log query HTTP surface)
+                              rove-sse-server (SSE notifications — runs as a
+                                               loop46 thread, single-node;
+                                               imported by loop46 + rove-js)
 ```
 
 **rove-kv is a standalone leaf module** — it does NOT depend on rove or rove-io. Its raft networking (`raft_net`) uses io_uring directly via liburing, bypassing the rove-io abstraction.

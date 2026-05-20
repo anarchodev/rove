@@ -1,8 +1,33 @@
-# SSE plan — notification only, centralized server, response-attached emits
+# SSE plan — notification only, in-process loop46 thread, response-attached emits
+
+> **2026-05-19 corrigendum (read this first).** This doc was
+> written for the **centralized-separate-process** shape: a
+> `sse-server-standalone` binary on `sse.{public_suffix}` that
+> workers POST emits to over HTTP, with `SSE_INTERNAL_TOKEN` shared
+> bearer auth and cross-node fan-out built in. **Task #10 (Phases
+> 1–5, 2026-05-19) collapsed that into a loop46 in-process thread,
+> single-node only, with cross-node fan-out explicitly dropped.**
+> The architecture diagram (§1), the worker pump (§3.2), the
+> sse-server section (§4), the auth model (§5.2 worker→sse
+> internal token), and the failover story (§4.6) are **historical**
+> as written. `docs/connection-actor-plan.md` **§12.4** is
+> authoritative for current behavior. What survives unchanged from
+> this doc: the projection contract (notification ≠ state store;
+> ephemeral; reconnect → state-refetch), the wire shape per emit
+> (`event_id`, `type`, `data`, `target_sids`, `created_at_ms`),
+> the deterministic event-id format (`{request_id:020d}-{call_index:06d}`),
+> the per-(tenant,sid) ring cache (30 entries), the `Last-Event-ID`
+> resume + sentinel-on-miss path, the JWT mint at
+> `/_session/sse-token` and EventSource connect contract (§5.1).
+> What's deleted: `sse-server-standalone` the binary, `POST /v1/emit`,
+> `SSE_INTERNAL_TOKEN`, `--sse-public-base` as an operator flag, the
+> worker→sse curl POST. Worker→SSE handoff is now an in-process MPSC
+> queue (`Handle.enqueueEmit`); see connection-actor-plan §12.4.
 
 **Status:** Implemented + smoke-covered (commits 7c5b949, e056bea, 2026-05).
-Design-of-record; future-tense passages (§7 migration order, 'gets removed',
-'new phase') are retrospective.
+Design-of-record (pre-collapse); future-tense passages (§7 migration order,
+'gets removed', 'new phase') are retrospective. **Post-collapse deployment
+shape lives in connection-actor-plan §12.4 (2026-05-19).**
 
 An earlier draft (deleted 2026-05) treated SSE events as source-of-
 truth state living in customer `app.db` under reserved prefix

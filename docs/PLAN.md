@@ -602,13 +602,27 @@ Designed as a general primitive from day one — also the knob used to different
 
 ### 2.12 Server-sent events (live UI updates)
 
+> **2026-05-19 corrigendum (read this first).** Task #10 collapsed
+> `sse-server-standalone` INTO the `loop46` process as an in-process
+> sibling thread (`Handle.spawn`, single-node only, gated on
+> `--sse-listen`). The worker→sse HTTP `POST /v1/emit` route, the
+> `SSE_INTERNAL_TOKEN` shared bearer, `--sse-public-base` as an
+> operator flag, and the cross-process emit hop are **deleted**.
+> Worker `events.emit` batches now reach the SSE thread via an
+> in-process MPSC queue (`Handle.enqueueEmit`); the JWT mint at
+> `/_session/sse-token` and the `Last-Event-ID` resume model are
+> unchanged. **Cross-node fan-out is explicitly dropped** —
+> multi-node SSE is out of scope for v1. The §2.12 body below is the
+> historical (pre-collapse) design narrative — `docs/sse-plan.md`'s
+> top corrigendum + `docs/connection-actor-plan.md` §12.4 are
+> authoritative for current behavior.
+>
 > **See `docs/sse-plan.md`** for the implementation detail and
-> `docs/notifications.md` for the customer-facing reference. SSE
-> shipped as a separate `sse-server-standalone` process on
-> `sse.{public_suffix}`; the legacy `_events/{sid}/...` worker route +
-> retention sweep + apply-time pump were retired in commit `59ab3d6`.
-> The §2.12 sections below mirror the locked decisions; the sub-plans
-> have the implementation detail.
+> `docs/notifications.md` for the customer-facing reference. The
+> legacy `_events/{sid}/...` worker route + retention sweep +
+> apply-time pump were retired in commit `59ab3d6`. The §2.12
+> sections below mirror the (now-superseded-on-deployment-shape)
+> locked decisions; the sub-plans have the implementation detail.
 
 
 The companion to webhooks (§2.6): handlers fire events from inside their transaction, connected clients receive them over a long-lived SSE stream. Same Cmd / replay / determinism story; same "pure handler + declarative side effects" model. Different direction — webhooks push out to the world, events push out to *this customer's clients*.
@@ -1783,16 +1797,17 @@ This section is the canonical map of "which process owns what." Future sessions 
 
 ### 13.1 Process inventory
 
-rewind.js ships as **four binaries**, all built from this repo:
+rewind.js ships as **three binaries**, all built from this repo
+(sse-server-standalone retired 2026-05-19 in task #10 — the SSE
+notification service now runs as a thread inside `loop46`):
 
 | Binary | Source | Public hostname | Owns |
 |---|---|---|---|
-| `loop46` | `src/loop46/main.zig` | `*.{public_suffix}` (customer wildcard); `app.`/`replay.`/`auth.{system_suffix}` (system surfaces — **second registrable domain**, `--system-suffix`) | Customer HTTP traffic; the `__admin__` / `__replay__` / `__auth__` system tenants; raft node; per-worker QJS dispatcher; leader-local per-node `SendDispatch` (the `http.send` fire path, Option (b) — replaced the schedule-server thread 2026-05-19); per-tenant `provisionInstance` (self-serve signup retired — `auth-domain-plan.md` §4.7); `/_system/release`, `/_system/services-token`, `/_system/admin-kv` machine-to-machine endpoints |
+| `loop46` | `src/loop46/main.zig` | `*.{public_suffix}` (customer wildcard); `app.`/`replay.`/`auth.{system_suffix}` (system surfaces — **second registrable domain**, `--system-suffix`); `sse.{public_suffix}` (in-process SSE thread, single-node only) | Customer HTTP traffic; the `__admin__` / `__replay__` / `__auth__` system tenants; raft node; per-worker QJS dispatcher; leader-local per-node `SendDispatch` (the `http.send` fire path, Option (b) — replaced the schedule-server thread 2026-05-19); **in-process SSE thread** (`Handle.spawn` on `sse.{public_suffix}`, gated on `--sse-listen`, single-node only — replaced sse-server-standalone 2026-05-19, task #10); per-tenant `provisionInstance` (self-serve signup retired — `auth-domain-plan.md` §4.7); `/_system/release`, `/_system/services-token`, `/_system/admin-kv`, `/_session/sse-token` machine-to-machine endpoints |
 | `files-server-standalone` | `examples/files_server_standalone.zig` (wraps `src/files_server/`) | `files.{public_suffix}` | Compile + content-addressed deploy + manifest writes to S3; deploys the embedded admin + replay JS bundles; pushes platform config (`_config/*`, resend key, etc.) into `__admin__/app.db` via `/_system/admin-kv`; flips `_deploy/current` via `/_system/release`. Runs its own raft cluster (not shared with `loop46`). `dep_id` is content-addressed; manifests are keyed `{dep_id}.json` where `dep_id` is a content hash. |
 | `log-server-standalone` | `examples/log_server_standalone.zig` (wraps `src/log_server/`) | `logs.{public_suffix}` | Polls S3 for `.ndjson` log batches + sidecars; maintains local `log_index.db`; serves `/v1/{tenant}/{list,show,count,blob}` to the dashboard |
-| `sse-server-standalone` | `examples/sse_server_standalone.zig` (wraps `src/sse_server/`) | `sse.{public_suffix}` | Holds every long-lived `EventSource` connection; receives worker emit POSTs at `/v1/emit`; per-(tenant, sid) ring cache (30 entries) for reconnect catch-up; emits `rove:resync` sentinel on cache miss |
 
-The three standalones are each a single process per cluster (single-process bet, §10.16). Failover is "LB picks a new node, clients reconnect"; sse-server's reconnect path triggers `rove:resync` so the client refetches on cache miss. None of them participates in raft — that's the §6b principle that lets them live outside the loop46 binary. operator-deployed; they're typically co-located with a `loop46` worker on each node, but can scale independently.
+The two standalones (files-server, log-server) are each a single process per cluster (single-process bet, §10.16). Failover is "LB picks a new node, clients reconnect". None of them participates in raft — that's the §6b principle that lets them live outside the loop46 binary. Operator-deployed; they're typically co-located with a `loop46` worker on each node, but can scale independently. **SSE no longer fits this stack-of-standalones model** — collapsing it INTO `loop46` (task #10, single-node v1) explicitly trades cross-node fan-out for the elimination of the cross-process bus, the internal-token bearer, and the standalone failover story (`docs/connection-actor-plan.md` §12.4 records the reversal of §12.2's earlier "stack, not merge" lock).
 
 **Connection-actor (held-synchronous §6.4, `docs/connection-actor-plan.md`, shipped 2026-05-18) adds NO process.** Unlike sse/files/log, it is **worker-internal**: a handler that returns `__rove_next(...)` parks its own h2 stream entity in a `parked_continuations` sibling collection (a `reg.move`, not a socket handoff); the bound `http.send` completion routes through `dispatchSendCompletions`' §6.4 Part-B peel into an in-worker resume that flushes to the still-open socket. The original plan §9 envisioned a standalone sibling; the unified trampoline model (no exposed handle, single-tenant, node-local) collapsed it into the worker — see that doc's §12 Freeze Addendum. `src/connection_holder/` is the now-superseded experimental scaffold, not a deployed process. The `http.send` best-effort / cross-worker node-affinity re-platform (Option (b), task #8) **shipped 2026-05-19** — see `docs/http-send-plan.md` §15.
 

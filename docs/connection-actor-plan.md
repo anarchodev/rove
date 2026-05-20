@@ -206,6 +206,14 @@ on.
 
 ### 6.2 SSE (unidirectional, ephemeral projection)
 
+> **Update (2026-05-19, task #10):** the "sse-service as built stays
+> as built" sentence below was reversed — SSE collapsed into a
+> loop46 in-process thread, single-node only, cross-node fan-out
+> dropped. **See §12.4 for the authoritative current state.** §6.2's
+> projection contract (empty inbound frontier, ephemeral durability,
+> reconnect→refetch) is unchanged; only the implementation venue
+> moved.
+
 A connection-actor with an empty inbound frontier (server→client only) and
 ephemeral application durability (handler persists nothing; reconnect → the
 client refetches authoritative state). **This is exactly the shipped
@@ -395,9 +403,11 @@ since internally that is all there ever is.)
 
 ## 11. Open questions / deferred
 
-- **sse-service convergence.** Whether the shipped sse-service is ever
+- **sse-service convergence.** ~~Whether the shipped sse-service is ever
   re-expressed on a shared connection-holder, or the two subsystems coexist
-  permanently. v1: coexist; sse-service untouched.
+  permanently. v1: coexist; sse-service untouched.~~ **RESOLVED 2026-05-19
+  by collapse, not stacking (task #10)** — sse-service is now a loop46
+  in-process thread, single-node v1, cross-node dropped. See §12.4.
 - **PLAN §13 / §7 wiring.** This doc should get a PLAN §13 surface-map entry
   and a §7/§4 cross-reference once the primitive is accepted — not done here
   (a judgment-heavy PLAN edit, flagged for follow-up).
@@ -501,3 +511,64 @@ making it the universal mechanism. PLAN §13 surface-map note added
 (the connection-actor adds no process). Memory of record:
 `project_connection_actor_unified_trigger`,
 `project_callback_execution_model`, `project_connection_holder_security`.
+
+### 12.4 SSE collapsed in-process (2026-05-19) — supersedes §12.2 "stack, not merge"
+
+**§12.2's "Push projections delegate cross-node fan-out to the
+existing sse-service bus … they *stack*, not merge" lock is
+consciously reversed by task #10 (Phases 1–5, 2026-05-19).** The
+new lock:
+
+- **sse-service is no longer a separate process.** `loop46` now
+  hosts the SSE thread (`src/sse_server/`, `Handle.spawn`, sibling
+  to the raft thread, gated on `--sse-listen`). The
+  `sse-server-standalone` binary is deleted; so is the
+  worker→sse-server HTTP `POST /v1/emit` route, the
+  `SSE_INTERNAL_TOKEN` shared bearer, the `sse_dispatch.fireBatch`
+  curl POST, and the `--sse-public-base` operator wiring.
+
+- **Worker→SSE handoff is in-process.** `events.emit` batches reach
+  the SSE thread via `Handle.enqueueEmit` (an MPSC queue — workers
+  produce, the SSE thread drains each poll tick, deep-copies once,
+  applies via the shared `applyEmitBatch` core). No HTTP, no
+  internal bearer, no curl handle. `parkEmits`/commit-gating is
+  unchanged: emits still fire post-commit, just via the queue.
+
+- **Cross-node fan-out is dropped.** **Single-node only for v1.**
+  The single-node guard (`--peers > 1` + `--sse-listen` → hard
+  fail-fast at startup) makes the model strictly correct rather
+  than knowingly-lossy: with one node the EventSource and any
+  emitting worker both live in the same process, so an in-process
+  queue is the entire delivery path. Multi-node SSE is explicitly
+  out of scope — a later phase, not yet scoped.
+
+- **§6.2 "ephemeral, no durability" stays.** Nothing here restores
+  `_events/` storage; the §7/§10.1 durable-SSE rejection is
+  untouched. The collapse is purely about *who runs the bus*, not
+  *what it remembers*. SSE remains best-effort; `enqueueEmit` drops
+  on OOM and the reconnect → state-refetch model covers loss.
+
+- **`/_session/sse-token` mint is unchanged.** Worker-served,
+  stateless, reads `_rove_sess` cookie, mints the EventSource JWT
+  the SSE thread verifies on connect. The token's
+  `notifications_url` is derived from `--public-suffix` as
+  `https://sse.{public_suffix}`, gated on `--sse-listen`.
+
+- **The collapse mirrors §12.2's own precedent.** §12.2 collapsed
+  the §9 "standalone connection-holder sibling" INTO the worker
+  ("no new process"). This is the same move for SSE — same
+  rationale (the standalone added nothing the in-process thread
+  doesn't cover, and the cross-process boundary was paying
+  coordination overhead for capability we don't actually need
+  yet).
+
+What this is NOT: durable SSE (§10.1, still rejected). A v2
+multi-node SSE story (deferred). A blocking primitive. A change to
+the §6.2 *projection* itself — only its *implementation venue*.
+
+§6.2 and §11's "sse-service convergence" deferral above should be
+read with this in mind: **task #10 resolved the convergence by
+collapse, not by stacking**, with the cross-node capability
+explicitly dropped. The two earlier framings ("stay separate" /
+"v1: coexist") are the pre-collapse design record; this section is
+authoritative for current behavior.

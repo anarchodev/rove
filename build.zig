@@ -440,6 +440,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-files", files_mod);
     js_mod.addImport("rove-log", log_mod);
     js_mod.addImport("rove-log-server", log_server_mod);
+    js_mod.addImport("rove-sse-server", sse_server_mod);
     js_mod.addImport("rove-jwt", jwt_mod);
     js_mod.addImport("rove-tape", tape_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
@@ -530,6 +531,7 @@ pub fn build(b: *std.Build) void {
     loop46_mod.addImport("rove-tenant", tenant_mod);
     loop46_mod.addImport("rove-h2", h2_mod);
     loop46_mod.addImport("rove-schedule-server", schedule_server_mod);
+    loop46_mod.addImport("rove-sse-server", sse_server_mod);
     loop46_mod.addImport("rove-acme", acme_mod);
     // The admin + replay tenant bundles + UI files used to be
     // embedded into the loop46 binary so the worker could
@@ -617,22 +619,13 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cs_standalone);
 
-    // sse-server-standalone: runs the centralized SSE notification
-    // service as a separate process. See `docs/sse-plan.md`. v1
-    // ships with the worker still owning the legacy `/_events`
-    // route; this binary stands up alongside (sse-plan §7 step 1).
-    const sse_standalone_mod = b.addModule("sse-server-standalone", .{
-        .root_source_file = b.path("examples/sse_server_standalone.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    sse_standalone_mod.addImport("rove-sse-server", sse_server_mod);
-    sse_standalone_mod.addImport("rove-h2", h2_mod);
-    const sse_standalone = b.addExecutable(.{
-        .name = "sse-server-standalone",
-        .root_module = sse_standalone_mod,
-    });
-    b.installArtifact(sse_standalone);
+    // sse-server-standalone: RETIRED (task #10 Phase 3). The SSE
+    // notification service now runs as a loop46-internal thread
+    // (`sse_server.standalone.spawn`, sibling to the raft thread,
+    // gated on `--sse-listen`; single-node only). Workers hand emits
+    // via the in-process `Handle.enqueueEmit` queue — no cross-process
+    // rendezvous, no `--sse-public-base`, no `SSE_INTERNAL_TOKEN`.
+    // See `docs/sse-plan.md` + `docs/connection-actor-plan.md` §6.2.
 
     // connection-holder-standalone: Phase 1 — runs the held-socket
     // subsystem as a separate process. See

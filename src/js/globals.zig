@@ -27,6 +27,7 @@ const email_rate_b = @import("bindings/email_rate.zig");
 const events_b = @import("bindings/events.zig");
 const http_b = @import("bindings/http.zig");
 const cont_b = @import("bindings/continuation.zig");
+const stream_b = @import("bindings/stream.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
 
@@ -160,9 +161,10 @@ pub const DispatchState = struct {
     /// be `JS_FreeValue`'d on `deinit`.
     trigger_module_ns: std.StringHashMapUnmanaged(c.JSValue) = .empty,
     /// Per-batch SSE emit accumulator (sse-plan §3.2). `events.emit`
-    /// appends an entry here as it runs; `worker_dispatch.finalizeBatch`
-    /// hands the merged list to `sse_dispatch.fireBatch` after raft
-    /// acks, fire-and-forget. Owned by `worker_dispatch.dispatchOnce`;
+    /// appends an entry here as it runs; after raft acks the batch
+    /// the merged list is handed to the in-process SSE thread via
+    /// `sse_server.thread.Handle.enqueueEmit` (task #10 Phase 2 —
+    /// fire-and-forget, best-effort). Owned by `worker_dispatch.dispatchOnce`;
     /// rows' `[]u8` fields are allocator-owned strings freed on the
     /// list's `EmitEntry.deinit`. Optional so the dispatcher's standalone
     /// test paths can leave it null and skip the POST path.
@@ -1453,6 +1455,13 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // not an effect. Internal builtin for now — the public `next`
     // JS shim over this lands in Phase 3b-iii.
     .{ .name = "__rove_next", .cfunc = cont_b.jsNext, .argc = 2 },
+    // Iterative streaming primitive (streaming-handlers-plan §3.3).
+    // Same shape/posture as `__rove_next`: pure constructor of a
+    // branded descriptor; classified on the handler's return path.
+    // Phase 2a (this commit) wires the type-plumbing only — the
+    // worker temporarily 503s `.stream` returns until Phase 2b lands
+    // the chunked-write flow + timer-wake re-activation.
+    .{ .name = "__rove_stream", .cfunc = stream_b.jsStream, .argc = 1 },
 };
 
 // Public shims (docs/builtin-libs-docs-plan.md Phase A). JSDoc-carrying
@@ -1763,7 +1772,7 @@ test "lint(c): every native binding has a globals/ shim (Phase A)" {
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
     // determinism overrides); __rove_check_email_rate is an internal
     // GLOBAL_BUILTIN (called only by globals/email.js).
-    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next" };
+    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next", "__rove_stream" };
 
     for (STATIC_NAMESPACES) |ns| {
         // The `_system` holder itself + nested paths

@@ -50,6 +50,21 @@ pub const Outcome = enum(u8) {
     unknown_domain = 6,
 };
 
+/// What caused this handler activation (streaming-handlers-plan §2,
+/// shared by `dispatcher.Request.activation_source` and
+/// `LogRecord.activation`). v1 has the two implemented variants; the
+/// enum grows (`kv_wake`, `timer`, `disconnect`) when `__rove_stream`
+/// lands.
+pub const ActivationSource = enum(u8) {
+    inbound = 0,
+    send_callback = 1,
+    /// Timer wake on a held stream (streaming-handlers-plan §4.5).
+    /// Phase 2b-ii: the streaming-handler primitive's `waitFor.timer`
+    /// fires this when its `intervalMs` (or absMs) reaches the
+    /// sweep's check.
+    timer = 2,
+};
+
 /// Inline tape + body byte payloads for one request. Each `_bytes`
 /// field is allocator-owned; empty (`&.{}`) for channels the handler
 /// didn't touch. Tape capture stores these directly in the LogRecord
@@ -120,6 +135,17 @@ pub const LogRecord = struct {
     /// JS exception message if the handler threw. Empty otherwise.
     exception: []const u8,
     tapes: TapePayloads = .{},
+    /// Per-chain identifier (streaming-handlers-plan §6). Empty
+    /// string when the record has no chain context (pre-Phase-1
+    /// records, or paths where the runtime couldn't synthesize one
+    /// — early-error captures before request handling started).
+    /// Allocator-owned alongside the other `[]const u8` fields.
+    correlation_id: []const u8 = "",
+    /// What caused this activation (streaming-handlers-plan §2).
+    /// Defaults to `.inbound` for back-compat with code paths that
+    /// haven't been updated to set it explicitly; the inbound case
+    /// is by far the dominant one historically.
+    activation: ActivationSource = .inbound,
 
     pub fn deinit(self: *LogRecord, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);
@@ -128,6 +154,7 @@ pub const LogRecord = struct {
         allocator.free(self.host);
         allocator.free(self.console);
         allocator.free(self.exception);
+        if (self.correlation_id.len > 0) allocator.free(self.correlation_id);
         self.tapes.deinit(allocator);
         self.* = undefined;
     }

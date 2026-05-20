@@ -74,6 +74,7 @@ const dispatch = @import("worker_dispatch.zig");
 const panic_mod = @import("panic.zig");
 const penalty_mod = @import("penalty.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
+const sse_server_mod = @import("rove-sse-server");
 const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
@@ -127,8 +128,9 @@ pub const ParkedUnit = struct {
     deadline_ns: i64,
     /// Owned copy — must outlive the proposing dispatch across ticks.
     tenant_id: []u8,
-    /// Owned; released by `sse_dispatch.fireBatch` on commit or
-    /// `deinit`'d (discarded) on fault.
+    /// Owned; handed to the in-process SSE thread via
+    /// `Handle.enqueueEmit` on commit (it deep-copies, so this list
+    /// is freed right after) or `deinit`'d (discarded) on fault.
     emits: std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = .empty,
     /// Option (b) 4b-ii-B: owned commit-gated send arm/resolve intents
     /// (`_send/owed/` put → arm, `_send/proof/` put / `_send/owed/`
@@ -177,13 +179,82 @@ pub const ParkedCont = struct {
     /// http.send (e.g. a deadline-only / no-call hop); only the
     /// deadline can resume it.
     bound_schedule_id: ?[]u8 = null,
+    /// Owned correlation id (streaming-handlers-plan §6). Copied
+    /// from the parking request; resumed activations inherit it so
+    /// every tape row in the chain shares one id. Null when the
+    /// parking request didn't carry one (test paths).
+    correlation_id: ?[]u8 = null,
 
     pub fn deinit(self: *ParkedCont, allocator: std.mem.Allocator) void {
         self.cont.deinit(allocator);
         allocator.free(self.tenant_id);
         if (self.bound_schedule_id) |s| allocator.free(s);
+        if (self.correlation_id) |s| allocator.free(s);
     }
 };
+
+/// Streaming-handlers Phase 2b-ii: per-active-stream state held
+/// alongside the entity's `stream_data_out` membership. The cell
+/// stays alive while the chain runs; deinit frees every owned slice.
+pub const StreamCell = struct {
+    /// Owned. Tenant scoping the chain — same value across every
+    /// activation, for tape capture and re-resolving the deployment.
+    tenant_id: []u8,
+    /// Owned. Correlation id from the originating inbound request.
+    /// Threaded forward so every resume's tape row carries it.
+    correlation_id: ?[]u8,
+    /// Owned. Module path the handler dispatches to on each resume
+    /// — same module that returned `__rove_stream(...)` initially
+    /// (the inbound request's `route.module_base` from
+    /// `worker_dispatch.zig`).
+    module_path: []u8,
+    /// Owned. The customer's `ctx` JSON, threaded into the next
+    /// resume's synthetic request body. Replaced on each
+    /// `__rove_stream(...)` return.
+    ctx_json: []u8,
+    /// FIFO queue of chunks remaining to write to the held socket.
+    /// Each chunk is one DATA frame on the wire. Drained one entry
+    /// per worker tick (when h2 reports the entity back in
+    /// `stream_data_out`). Owned: each chunk is an allocator slice.
+    chunks: std.ArrayListUnmanaged([]u8),
+    /// `>0` ⇒ this stream has a periodic timer wake; the cell
+    /// re-runs the handler every `interval_ms` once chunks drain.
+    /// `0` ⇒ no timer (chunks drain then the stream closes).
+    interval_ms: i64,
+    /// Absolute monotonic ns when the timer-wake next fires. Only
+    /// meaningful when `interval_ms > 0` AND `chunks.items.len == 0`.
+    /// On chunk drain we set this to `now + interval_ms*ns_per_ms`.
+    next_wake_ns: i64,
+    /// Number of activations the chain has had so far (inbound +
+    /// every timer wake that re-ran the handler). Hard-capped to
+    /// `MAX_STREAM_ACTIVATIONS` to bound a misbehaving handler.
+    activation_count: u32,
+    /// When `true`, no more handler resumes happen — chunks drain
+    /// then the entity moves to `stream_close_in` (END_STREAM). Set
+    /// by `resumeStream` when the handler returns `Response` or by
+    /// the cap-hit path.
+    close_pending: bool,
+    /// Deployment id the stream is bound to. Stays fixed across
+    /// activations of one chain (a redeploy mid-stream doesn't yank
+    /// the handler).
+    deployment_id: u64,
+
+    pub fn deinit(self: *StreamCell, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
+        if (self.correlation_id) |c| allocator.free(c);
+        allocator.free(self.module_path);
+        allocator.free(self.ctx_json);
+        for (self.chunks.items) |ch| allocator.free(ch);
+        self.chunks.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Phase 2b-ii: per-stream caps (hard, no operator config yet). A
+/// misbehaving handler can't run a stream forever; once these hit,
+/// `serviceParkedStreams` forces `close_pending` and the entity
+/// shuts down cleanly. Configurable per-tenant lands in Phase 2c.
+pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
 
 /// One cross-tenant target's accumulated writeset within a batch.
 /// `id` is an owned dup of the target instance id.
@@ -1032,20 +1103,25 @@ pub const WorkerConfig = struct {
     /// Public origin the dashboard / CLI uses to reach files-server.
     /// Returned in the `/_system/services-token` response. Borrowed.
     files_public_base: ?[]const u8 = null,
-    /// Origin the worker uses to deliver `events.emit` payloads to
-    /// the sse-server's `POST /v1/emit`. Plain http://host:port for
-    /// loopback dev, https://sse.{public_suffix} in production.
-    /// Borrowed; null disables the worker → sse-server POST path.
+    /// In-process SSE thread (task #10 Phase 2). `events.emit`
+    /// batches are handed to it via `Handle.enqueueEmit` after the
+    /// writeset commits — replaces the retired worker→sse-server
+    /// HTTP POST. Borrowed (owned by `main.zig`); null = no
+    /// in-process SSE (emits are dropped, SSE being best-effort).
+    sse_handle: ?*sse_server_mod.thread.Handle = null,
+    /// Browser-facing SSE base (`https://sse.{public_suffix}`) the
+    /// `/_session/sse-token` mint embeds in the token's
+    /// `notifications_url` so the customer's page knows where to open
+    /// its `EventSource`. NOT a worker POST target (that path is
+    /// retired). Derived from `--public-suffix` when in-process SSE
+    /// is enabled; null = no notifications_url in the token.
     sse_public_base: ?[]const u8 = null,
-    /// Shared bearer the worker stamps in `Authorization: Bearer ...`
-    /// on every emit POST. Must match the value sse-server is started
-    /// with in `SSE_INTERNAL_TOKEN`. Borrowed; null disables the path.
-    sse_internal_token: ?[]const u8 = null,
-    /// Skip TLS peer verification on the worker → sse-server emit
-    /// POST. Set true in dev / smoke clusters where sse-server uses
-    /// a self-signed cert that's not in the worker's system CA
-    /// bundle. Production must leave this false.
-    sse_insecure_tls: bool = false,
+    /// Skip TLS peer verification on the worker's **internal-service**
+    /// POSTs. Despite the name this now gates only the log-server
+    /// push path (`sendPushChunk`); SSE no longer does HTTP. Set true
+    /// in dev / smoke clusters with self-signed internal certs;
+    /// production must leave this false. (Rename deferred to Phase 4.)
+    internal_insecure_tls: bool = false,
     /// Origin allowed to call `/_system/*` with CORS. When set, the
     /// worker answers browser preflight (OPTIONS) requests from this
     /// origin and stamps `Access-Control-Allow-*` headers onto every
@@ -1141,6 +1217,17 @@ pub fn Worker(comptime opts: Options) type {
         /// DATA side-store for `parked_continuations` (descriptor +
         /// §6.4 deadline). Lifecycle is the collection, not this map.
         parked_meta: std.AutoHashMapUnmanaged(rove.Entity, ParkedCont) = .empty,
+        /// Streaming-handlers Phase 2b-ii: per-entity DATA side-store
+        /// for active `__rove_stream(...)` chains. The entity lives
+        /// in the h2 module's `stream_data_out` collection (h2 owns
+        /// its in-flight state); this map holds the chain-level
+        /// state the worker's tick loop needs (chunks queue, next
+        /// wake time, activation count, ctx-for-resume, etc.).
+        /// Lifecycle: the entity's `stream_data_out` membership IS
+        /// alive; on close (handler returns `Response` or cap hits),
+        /// the entity moves to `stream_close_in` (h2 sends END_STREAM)
+        /// and the map entry is removed.
+        parked_streams_meta: std.AutoHashMapUnmanaged(rove.Entity, StreamCell) = .empty,
         /// Deferred TrackedTxn commits keyed by raft seq. Per kvexp
         /// README §1 (speculative apply): `txn.commit` runs after raft
         /// confirms the batch's seq, not before propose. On propose
@@ -1231,16 +1318,16 @@ pub fn Worker(comptime opts: Options) type {
         services_jwt_secret: ?[]const u8,
         log_public_base: ?[]const u8,
         files_public_base: ?[]const u8,
-        /// SSE delivery wiring (sse-plan §3.2). `sse_curl` is a
-        /// libcurl handle owned by the worker, lazily created on
-        /// `create` when both `sse_public_base` and
-        /// `sse_internal_token` are set. Null disables the
-        /// fire-and-forget POST path entirely; emits then live only
-        /// in the legacy `_events/{sid}/...` rows.
+        /// In-process SSE thread (task #10 Phase 2). `events.emit`
+        /// batches are enqueued here post-commit; null = no
+        /// in-process SSE (emits dropped — SSE is best-effort).
+        sse_handle: ?*sse_server_mod.thread.Handle,
+        /// Browser-facing SSE base for the `/_session/sse-token`
+        /// mint's `notifications_url` (NOT a POST target).
         sse_public_base: ?[]const u8,
-        sse_internal_token: ?[]const u8,
-        sse_insecure_tls: bool,
-        sse_curl: ?*blob_mod.curl.Easy,
+        /// Internal-service POST insecure-TLS toggle (now log-push
+        /// only — see the worker struct field doc).
+        internal_insecure_tls: bool,
         /// libcurl handle for log-server push (`POST /v1/_internal/
         /// batch-pushed`). Lazily created when `log_public_base` is
         /// set. Null disables the push path; the indexer's 500ms
@@ -1327,16 +1414,9 @@ pub fn Worker(comptime opts: Options) type {
                 .services_jwt_secret = config.services_jwt_secret,
                 .log_public_base = config.log_public_base,
                 .files_public_base = config.files_public_base,
+                .sse_handle = config.sse_handle,
                 .sse_public_base = config.sse_public_base,
-                .sse_internal_token = config.sse_internal_token,
-                .sse_insecure_tls = config.sse_insecure_tls,
-                .sse_curl = blk: {
-                    if (config.sse_public_base == null or config.sse_internal_token == null) break :blk null;
-                    break :blk blob_mod.curl.Easy.init(allocator) catch |err| {
-                        std.log.warn("rove-js: sse libcurl init failed: {s}; emit POST disabled", .{@errorName(err)});
-                        break :blk null;
-                    };
-                },
+                .internal_insecure_tls = config.internal_insecure_tls,
                 .log_push_curl = blk: {
                     if (config.log_public_base == null) break :blk null;
                     break :blk blob_mod.curl.Easy.init(allocator) catch |err| {
@@ -1467,7 +1547,6 @@ pub fn Worker(comptime opts: Options) type {
             self.parked_continuations.deinit();
             self.raft_pending.deinit();
             self.dispatcher.deinit();
-            if (self.sse_curl) |easy| easy.deinit();
             if (self.log_push_curl) |easy| easy.deinit();
             // `manifest_easy` lives on NodeState — main.zig owns it.
             self.h2.destroy();
@@ -2013,6 +2092,8 @@ pub fn captureLog(
     console_owned: []u8,
     exception_owned: []u8,
     tapes: log_mod.TapePayloads,
+    correlation_id: ?[]const u8,
+    activation: log_mod.ActivationSource,
 ) void {
     captureLogWithId(
         worker,
@@ -2028,6 +2109,8 @@ pub fn captureLog(
         console_owned,
         exception_owned,
         tapes,
+        correlation_id,
+        activation,
     );
 }
 
@@ -2052,6 +2135,8 @@ pub fn captureLogWithId(
     console_owned: []u8,
     exception_owned: []u8,
     tapes: log_mod.TapePayloads,
+    correlation_id: ?[]const u8,
+    activation: log_mod.ActivationSource,
 ) void {
     captureLogInner(
         worker,
@@ -2067,6 +2152,8 @@ pub fn captureLogWithId(
         console_owned,
         exception_owned,
         tapes,
+        correlation_id,
+        activation,
     ) catch |err| {
         std.log.warn("rove-js: log capture failed for {s}: {s}", .{ instance_id, @errorName(err) });
         // The transferred buffers must still be freed.
@@ -2091,6 +2178,8 @@ fn captureLogInner(
     console_owned: []u8,
     exception_owned: []u8,
     tapes: log_mod.TapePayloads,
+    correlation_id: ?[]const u8,
+    activation: log_mod.ActivationSource,
 ) !void {
     const tl = worker.tenant_logs.get(instance_id) orelse return error.NoTenantLog;
     const allocator = worker.allocator;
@@ -2106,6 +2195,11 @@ fn captureLogInner(
     errdefer allocator.free(a_path);
     const a_host = try allocator.dupe(u8, host);
     errdefer allocator.free(a_host);
+    const a_corr: []const u8 = if (correlation_id) |c|
+        if (c.len > 0) try allocator.dupe(u8, c) else ""
+    else
+        "";
+    errdefer if (a_corr.len > 0) allocator.free(a_corr);
 
     const id = request_id orelse try tl.id_minter.nextRequestId();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
@@ -2124,6 +2218,8 @@ fn captureLogInner(
         .console = console_owned,
         .exception = exception_owned,
         .tapes = tapes,
+        .correlation_id = a_corr,
+        .activation = activation,
     });
 }
 
@@ -2314,7 +2410,7 @@ fn sendPushChunk(
         .timeout_ms = 2000,
         .connect_timeout_ms = 500,
         .http_version = if (use_h2c) .h2c_prior_knowledge else .auto,
-        .verify_tls = !worker.sse_insecure_tls,
+        .verify_tls = !worker.internal_insecure_tls,
     });
     defer resp.deinit(allocator);
     if (resp.status != 204) {
@@ -2922,7 +3018,14 @@ fn resumeContinuation(
         .platform = inst.platform,
         .limiter = &worker.limiter,
         .instance_id = inst.id,
+        // Inherit the chain id from the parking request so every
+        // tape row of this chain shares one correlation_id; mark
+        // this activation as a send-callback resume (streaming-
+        // handlers-plan §6).
+        .correlation_id = meta.correlation_id,
+        .activation_source = .send_callback,
     };
+    std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ meta.correlation_id orelse "(none)", request_id, inst.id });
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     var oc = worker.dispatcher.runOutcome(
         inst.kv,
@@ -2958,6 +3061,13 @@ fn resumeContinuation(
                 txn.rollback() catch {};
                 txn_done = true;
                 try resolveParked(worker, ent, sid, sess, 500, "continuation handler error\n");
+                // Phase 1b: record the resume's tape entry before
+                // freeing meta. Activation source = send_callback so
+                // the row shares the chain id with the inbound entry
+                // and the replay UX groups them.
+                captureLogWithId(worker, meta.tenant_id, request_id, "POST", meta.cont.path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, meta.correlation_id, .send_callback);
+                r.console = &.{};
+                r.exception = &.{};
                 freeContMeta(worker, ent);
                 return;
             }
@@ -2965,6 +3075,9 @@ fn resumeContinuation(
                 txn.rollback() catch {};
                 txn_done = true;
                 try resolveParked(worker, ent, sid, sess, 500, "continuation kv writes not yet supported (3b-iii read-only)\n");
+                captureLogWithId(worker, meta.tenant_id, request_id, "POST", meta.cont.path, "", tc.snap.deployment_id, now_ns, 500, .kv_error, r.console, r.exception, .{}, meta.correlation_id, .send_callback);
+                r.console = &.{};
+                r.exception = &.{};
                 freeContMeta(worker, ent);
                 return;
             }
@@ -2978,6 +3091,9 @@ fn resumeContinuation(
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             try resolveParked(worker, ent, sid, sess, st, r.body);
+            captureLogWithId(worker, meta.tenant_id, request_id, "POST", meta.cont.path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, meta.correlation_id, .send_callback);
+            r.console = &.{};
+            r.exception = &.{};
             freeContMeta(worker, ent);
         },
         .continuation => |c2| {
@@ -3006,6 +3122,18 @@ fn resumeContinuation(
             meta.cont.deinit(allocator);
             meta.cont = c2m;
             meta.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
+        },
+        .stream => |*s| {
+            // Phase 2a: a resume hop returning `__rove_stream(...)` is
+            // not yet wired — Phase 2b lands chunked-write resume.
+            // Treat as a defined 501 so the held socket releases
+            // cleanly rather than hanging.
+            s.deinit(allocator);
+            txn.rollback() catch {};
+            txn_done = true;
+            try resolveParked(worker, ent, sid, sess, 501, "streams not yet wired in the resume path (Phase 2b)\n");
+            captureLogWithId(worker, meta.tenant_id, request_id, "POST", meta.cont.path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, meta.correlation_id, .send_callback);
+            freeContMeta(worker, ent);
         },
     }
 }
@@ -3100,20 +3228,8 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
 /// instead of accept — the idiom-1 correctness fix.
 fn firePendingEmits(worker: anytype, unit: *ParkedUnit) void {
     if (unit.emits.items.len == 0) return;
-    const easy = worker.sse_curl orelse return;
-    const base = worker.sse_public_base orelse return;
-    const tok = worker.sse_internal_token orelse return;
-    if (base.len == 0 or tok.len == 0) return;
-    sse_dispatch.fireBatch(
-        worker.allocator,
-        easy,
-        base,
-        tok,
-        unit.tenant_id,
-        0,
-        unit.emits.items,
-        worker.sse_insecure_tls,
-    );
+    const h = worker.sse_handle orelse return;
+    h.enqueueEmit(unit.tenant_id, unit.emits.items);
 }
 
 /// Fire commit-gated send arm/resolve intents into the leader-local
@@ -3588,6 +3704,8 @@ test "captureLog appends a record to the worker's node-wide buffer" {
         empty,
         empty,
         .{},
+        "test-correlation-id",
+        .inbound,
     );
 
     try testing.expectEqual(@as(usize, 1), fake.log_buffer.buffer.items.len);
@@ -3596,5 +3714,111 @@ test "captureLog appends a record to the worker's node-wide buffer" {
     try testing.expectEqualStrings("/test", buffered.path);
     try testing.expectEqual(@as(u64, 42), buffered.deployment_id);
     try testing.expectEqual(log_mod.Outcome.ok, buffered.outcome);
+    // Phase 1b: the new tape fields make the round-trip.
+    try testing.expectEqualStrings("test-correlation-id", buffered.correlation_id);
+    try testing.expectEqual(log_mod.ActivationSource.inbound, buffered.activation);
+}
+
+test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
+    // Same fixture as the test above, asserting the new tape fields
+    // round-trip when the activation source is a §6.4 resume.
+    const allocator = testing.allocator;
+    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/rove-js-logcap-rsm-{x}", .{seed});
+    defer allocator.free(tmp_dir);
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const root_path = try std.fmt.allocPrintSentinel(allocator, "{s}/__root__.db", .{tmp_dir}, 0);
+    defer allocator.free(root_path);
+    const root_kv = try kv_mod.KvStore.open(allocator, root_path);
+    defer root_kv.close();
+
+    const tenant = try tenant_mod.Tenant.create(allocator, root_kv, tmp_dir);
+    defer tenant.destroy();
+
+    try tenant.createInstance("acme");
+    const inst = tenant.instances.get("acme").?;
+
+    const FakeWorker = struct {
+        allocator: std.mem.Allocator,
+        tenant_logs: std.StringHashMapUnmanaged(*TenantLog),
+        log_buffer: log_mod.NodeLogBuffer,
+    };
+    var fake = FakeWorker{
+        .allocator = allocator,
+        .tenant_logs = .empty,
+        .log_buffer = log_mod.NodeLogBuffer.init(allocator),
+    };
+    defer fake.tenant_logs.deinit(allocator);
+    defer fake.log_buffer.deinit();
+
+    const tl = try openTenantLog(&fake, inst, 9);
+    defer freeTenantLog(allocator, tl);
+    try fake.tenant_logs.put(allocator, tl.instance_id, tl);
+
+    const empty: []u8 = &.{};
+    captureLog(
+        &fake,
+        "acme",
+        "POST",
+        "handlers/resume",
+        "",
+        42,
+        1_000_000_000,
+        200,
+        .ok,
+        empty,
+        empty,
+        .{},
+        "chain-abc-123",
+        .send_callback,
+    );
+
+    try testing.expectEqual(@as(usize, 1), fake.log_buffer.buffer.items.len);
+    const buffered = &fake.log_buffer.buffer.items[0];
+    try testing.expectEqualStrings("chain-abc-123", buffered.correlation_id);
+    try testing.expectEqual(log_mod.ActivationSource.send_callback, buffered.activation);
+}
+
+test "ParkedCont owns correlation_id; deinit frees it (streaming-handlers Phase 1)" {
+    // Construct a ParkedCont with every owned slice present (incl.
+    // the new correlation_id field) and run deinit under
+    // testing.allocator. Verifies the new field is freed exactly
+    // once and the existing fields' lifetimes are unaffected.
+    const a = testing.allocator;
+
+    var pc: ParkedCont = .{
+        .cont = .{
+            .path = try a.dupe(u8, "handlers/resume"),
+            .fn_name = null,
+            .ctx_json = try a.dupe(u8, "{\"x\":1}"),
+        },
+        .deadline_ns = 0,
+        .tenant_id = try a.dupe(u8, "acme"),
+        .bound_schedule_id = try a.dupe(u8, "sched-abc"),
+        .correlation_id = try a.dupe(u8, "deadbeefcafef00d"),
+    };
+    pc.deinit(a);
+    // If correlation_id leaks, testing.allocator's tracking would
+    // fail the test on the suite's tear-down check; reaching here is
+    // the pass condition.
+}
+
+test "ParkedCont with null correlation_id is a no-op on that field's free" {
+    const a = testing.allocator;
+    var pc: ParkedCont = .{
+        .cont = .{
+            .path = try a.dupe(u8, "handlers/resume"),
+            .fn_name = null,
+            .ctx_json = try a.dupe(u8, "{}"),
+        },
+        .deadline_ns = 0,
+        .tenant_id = try a.dupe(u8, "acme"),
+        .bound_schedule_id = null,
+        .correlation_id = null,
+    };
+    pc.deinit(a);
 }
 

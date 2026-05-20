@@ -18,12 +18,14 @@ const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
+const log_mod = @import("rove-log");
 const send_outbox = @import("send_outbox.zig");
 
 const globals = @import("globals.zig");
 const limiter_mod = @import("limiter.zig");
 const sse_dispatch = @import("sse_dispatch.zig");
 const continuation_mod = @import("bindings/continuation.zig");
+const stream_mod = @import("bindings/stream.zig");
 const c = qjs.c;
 
 pub const DispatchError = error{
@@ -86,6 +88,12 @@ fn interruptHandler(_: ?*c.JSRuntime, opaque_ctx: ?*anyopaque) callconv(.c) c_in
     const now: i64 = @intCast(std.time.nanoTimestamp());
     return if (now >= budget.deadline_ns) 1 else 0;
 }
+
+/// Re-export so handlers/dispatch code can refer to it as
+/// `dispatcher.ActivationSource` without taking a separate import.
+/// Canonical definition lives in `log_mod` (it's metadata for the
+/// log record).
+pub const ActivationSource = log_mod.ActivationSource;
 
 pub const Request = struct {
     method: []const u8,
@@ -206,6 +214,18 @@ pub const Request = struct {
     /// allocates a local list); the production dispatcher always
     /// sets it non-null. `events.emit` throws if it's null.
     emit_buffer: ?*std.ArrayListUnmanaged(sse_dispatch.EmitEntry) = null,
+    /// Per-chain identifier; the same string on every activation of
+    /// one logical interaction (streaming-handlers-plan §5/§6). Set
+    /// by the runtime — inbound mints it (accepts an inbound
+    /// `X-Rove-Correlation-Id` header when present) and resumes
+    /// inherit. Null on test paths that don't care. Customer-visible
+    /// surface (`request.correlation_id`) lands when JS exposure does
+    /// (later phase); for now it is platform metadata for the tape.
+    correlation_id: ?[]const u8 = null,
+    /// What caused this activation. Inbound is the wire-request case;
+    /// `send_callback` covers both `__rove_next` resumes (§6.4) and
+    /// the plain on_result callback. Recorded on the tape.
+    activation_source: ActivationSource = .inbound,
 };
 
 /// One `(name, value)` pair extracted from the handler's
@@ -268,6 +288,15 @@ pub const Response = struct {
 pub const RunOutcome = union(enum) {
     terminal: Response,
     continuation: continuation_mod.Continuation,
+    /// Iterative streaming descriptor (streaming-handlers-plan §3.3,
+    /// Phase 2). The handler returned `__rove_stream(...)`. The
+    /// worker's success path drives the held h2 entity through the
+    /// chunked-write lifecycle (`stream_response_in` → repeated
+    /// `stream_data_out`/`stream_data_in` → `stream_close_in` on
+    /// terminal close). Phase 2a (foundation) classifies the return
+    /// value; Phase 2b lands the worker wiring + timer wakes;
+    /// Phase 2c lands disconnect detection + caps.
+    stream: stream_mod.Stream,
 };
 
 pub const Dispatcher = struct {
@@ -508,6 +537,23 @@ pub const Dispatcher = struct {
                     .headers = &.{},
                 };
             },
+            .stream => |*s| {
+                // Phase 2a: streaming-handlers type plumbing only;
+                // the worker's chunked-write wiring lands in Phase 2b.
+                // Paths that don't yet support streams degrade to a
+                // defined 501 — mirrors the `.continuation` posture on
+                // call sites that can't handle the trampoline.
+                s.deinit(self.allocator);
+                return .{
+                    .status = 501,
+                    .body = try self.allocator.dupe(u8, "streams not yet supported on this path (Phase 2b)\n"),
+                    .body_is_json = false,
+                    .console = try self.allocator.dupe(u8, ""),
+                    .exception = try self.allocator.dupe(u8, ""),
+                    .set_cookies = &.{},
+                    .headers = &.{},
+                };
+            },
         }
     }
 };
@@ -537,9 +583,17 @@ const PendingResponse = struct {
     /// h2 entity. Handler-path only — middleware may not return a
     /// continuation in v1 (plan §3b B6).
     continuation: ?continuation_mod.Continuation = null,
+    /// Set by the handler path when the return value is a branded
+    /// `__rove_stream(...)` descriptor (streaming-handlers-plan
+    /// §3.3, Phase 2). Transient (consumed by `finishResponse` into
+    /// the `RunOutcome.stream` arm). Mutually exclusive with
+    /// `continuation` — a handler return can be at most one of
+    /// `{ Response, Continuation, Stream }`.
+    stream: ?stream_mod.Stream = null,
 
     fn deinit(self: *PendingResponse, allocator: std.mem.Allocator) void {
         if (self.continuation) |*cont| cont.deinit(allocator);
+        if (self.stream) |*s| s.deinit(allocator);
         allocator.free(self.body);
         allocator.free(self.exception);
         for (self.cookies.items) |c2| allocator.free(c2);
@@ -857,6 +911,13 @@ fn runModule(
     // persisted discriminant).
     if (try continuation_mod.tryExtract(d.allocator, ctx.raw, result.val)) |cont| {
         pending.continuation = cont;
+        return;
+    }
+    // Streaming-handlers-plan §3.3 Phase 2: `__rove_stream(...)` is
+    // the iterative-resume sibling of `next(...)`. Same accidental-
+    // collision-resistance posture; same handler-path-only restriction.
+    if (try stream_mod.tryExtract(d.allocator, ctx.raw, result.val)) |stream| {
+        pending.stream = stream;
         return;
     }
 
@@ -1480,6 +1541,14 @@ fn finishResponse(
         console_buf.deinit(d.allocator);
         return .{ .continuation = cont };
     }
+    // Streaming-handlers Phase 2: handler returned `__rove_stream(...)`.
+    // Same ownership-move-out shape as `.continuation`; consumed by
+    // the worker's `.stream` handling.
+    if (pending.stream) |s| {
+        pending.stream = null;
+        console_buf.deinit(d.allocator);
+        return .{ .stream = s };
+    }
 
     const console_bytes = console_buf.toOwnedSlice(d.allocator) catch
         return DispatchError.OutOfMemory;
@@ -1707,6 +1776,10 @@ fn runOne(
             cont.deinit(testing.allocator);
             @panic("runOne: handler returned a continuation; use runOneOutcome");
         },
+        .stream => |*s| {
+            s.deinit(testing.allocator);
+            @panic("runOne: handler returned a stream; use runOneOutcome");
+        },
     }
 }
 
@@ -1748,6 +1821,10 @@ test "dispatch: next(...) return is classified as a continuation" {
     );
     switch (outcome) {
         .terminal => return error.TestExpectedContinuation,
+        .stream => |*s| {
+            s.deinit(testing.allocator);
+            return error.TestExpectedContinuation;
+        },
         .continuation => |*cont| {
             defer cont.deinit(testing.allocator);
             try testing.expectEqualStrings("handlers/login", cont.path);
@@ -1786,6 +1863,10 @@ test "dispatch: ordinary return stays terminal (trampoline does not engage)" {
     );
     switch (outcome) {
         .terminal => return error.TestExpectedContinuation,
+        .stream => |*s| {
+            s.deinit(testing.allocator);
+            return error.TestExpectedContinuation;
+        },
         .continuation => |*cont| cont.deinit(testing.allocator),
     }
 }

@@ -181,6 +181,14 @@ fn outcomeName(o: log_mod.Outcome) []const u8 {
     };
 }
 
+fn activationName(a: log_mod.ActivationSource) []const u8 {
+    return switch (a) {
+        .inbound => "inbound",
+        .send_callback => "send_callback",
+        .timer => "timer",
+    };
+}
+
 /// Emit one record as a single JSON object (no trailing newline —
 /// the per-record deflate framing replaces ndjson line framing).
 /// Schema mirrors what `log_server/thread.zig`'s `writeRecordJson`
@@ -210,6 +218,10 @@ fn encodeRecordJson(
     try writeJsonString(w, r.console);
     try w.writeAll(",\"exception\":");
     try writeJsonString(w, r.exception);
+    try w.writeAll(",\"correlation_id\":");
+    try writeJsonString(w, r.correlation_id);
+    try w.writeAll(",\"activation\":");
+    try writeJsonString(w, activationName(r.activation));
     try w.writeAll(",\"tapes\":");
     try writeTapePayloads(allocator, w, &r.tapes);
     try w.writeAll("}");

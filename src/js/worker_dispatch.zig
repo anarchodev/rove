@@ -27,6 +27,7 @@ const config_mirror = @import("config_mirror.zig");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const continuation_mod = @import("bindings/continuation.zig");
+const stream_mod = @import("bindings/stream.zig");
 const router_mod = @import("router.zig");
 const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
@@ -121,7 +122,99 @@ const SuccessRec = struct {
     /// `ParkedCont` by the cont helpers. null = hop fired 0 or >1
     /// sends → deadline-only resume.
     cont_bound_sched_id: ?[]const u8 = null,
+    /// Per-chain correlation id (streaming-handlers-plan §6). Borrows
+    /// from the dispatch `Request`; duped into `ParkedCont` by the
+    /// cont helpers so the resume inherits the same chain id.
+    correlation_id: ?[]const u8 = null,
 };
+
+/// Phase 2b-i: build a `Response` from a `Stream` descriptor.
+/// Concatenates `chunks` into the body, parses the wire-format
+/// `headers` string (`Key: Val\r\nKey2: Val2\r\n`) into
+/// `[]ResponseHeader`, and stamps `status`. Single-DATA-frame
+/// degenerate streaming — the real multi-frame chunked lifecycle
+/// lands in Phase 2b-ii together with timer-wake re-activation.
+/// Caller owns `s` and is responsible for deinit on success / error.
+fn streamToResponse(
+    allocator: std.mem.Allocator,
+    s: *stream_mod.Stream,
+) !dispatcher_mod.Response {
+    // Concatenate chunks into one owned body buffer.
+    var total: usize = 0;
+    for (s.chunks) |ch| total += ch.len;
+    const body = try allocator.alloc(u8, total);
+    errdefer allocator.free(body);
+    var off: usize = 0;
+    for (s.chunks) |ch| {
+        @memcpy(body[off .. off + ch.len], ch);
+        off += ch.len;
+    }
+
+    // Parse `headers` (`Key: Val\r\nKey2: Val2\r\n`) into
+    // `[]ResponseHeader`. Empty headers slice when null/empty.
+    var headers: []dispatcher_mod.ResponseHeader = &.{};
+    errdefer {
+        for (headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        if (headers.len > 0) allocator.free(headers);
+    }
+    if (s.headers) |hbuf| {
+        // First pass: count lines.
+        var count: usize = 0;
+        var i: usize = 0;
+        while (i < hbuf.len) {
+            const nl = std.mem.indexOfScalarPos(u8, hbuf, i, '\n') orelse hbuf.len;
+            const line_end = if (nl > i and hbuf[nl - 1] == '\r') nl - 1 else nl;
+            if (line_end > i) count += 1;
+            i = nl + 1;
+        }
+        if (count > 0) {
+            headers = try allocator.alloc(dispatcher_mod.ResponseHeader, count);
+            var built: usize = 0;
+            errdefer for (headers[0..built]) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            };
+            i = 0;
+            while (i < hbuf.len) {
+                const nl = std.mem.indexOfScalarPos(u8, hbuf, i, '\n') orelse hbuf.len;
+                const line_end = if (nl > i and hbuf[nl - 1] == '\r') nl - 1 else nl;
+                if (line_end > i) {
+                    const line = hbuf[i..line_end];
+                    const colon = std.mem.indexOfScalar(u8, line, ':');
+                    if (colon) |c| {
+                        var v_start = c + 1;
+                        while (v_start < line.len and line[v_start] == ' ') : (v_start += 1) {}
+                        // HTTP/2 requires lowercase header field
+                        // names (RFC 7540 §8.1.2); mirror the existing
+                        // `extractResponseMetadata` posture for
+                        // `response.headers = { Name: ... }`.
+                        const name_src = line[0..c];
+                        const name = try allocator.alloc(u8, name_src.len);
+                        errdefer allocator.free(name);
+                        for (name_src, 0..) |b, j| name[j] = std.ascii.toLower(b);
+                        const value = try allocator.dupe(u8, line[v_start..]);
+                        headers[built] = .{ .name = name, .value = value };
+                        built += 1;
+                    }
+                }
+                i = nl + 1;
+            }
+        }
+    }
+
+    return dispatcher_mod.Response{
+        .status = @intCast(s.status),
+        .body = body,
+        .body_is_json = false,
+        .console = try allocator.dupe(u8, ""),
+        .exception = try allocator.dupe(u8, ""),
+        .set_cookies = &.{},
+        .headers = headers,
+    };
+}
 
 // ── Trampoline (connection-actor §6.1/§6.4) finalize helpers ───────
 // The txn/writeset/raft machinery is identical for a continuation;
@@ -138,7 +231,9 @@ fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator,
     errdefer allocator.free(tid);
     const bsid: ?[]u8 = if (s.cont_bound_sched_id) |b| try allocator.dupe(u8, b) else null;
     errdefer if (bsid) |x| allocator.free(x);
-    try worker.parked_meta.put(allocator, s.ent, .{ .cont = cont, .deadline_ns = s.cont_deadline_ns, .tenant_id = tid, .bound_schedule_id = bsid });
+    const corr: ?[]u8 = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
+    errdefer if (corr) |x| allocator.free(x);
+    try worker.parked_meta.put(allocator, s.ent, .{ .cont = cont, .deadline_ns = s.cont_deadline_ns, .tenant_id = tid, .bound_schedule_id = bsid, .correlation_id = corr });
     s.cont = null; // ownership moved into parked_meta
     try server.reg.move(s.ent, &server.request_out, &worker.parked_continuations);
     return true;
@@ -153,7 +248,9 @@ fn contRecordIfAny(worker: anytype, allocator: std.mem.Allocator, tenant_id: []c
     errdefer allocator.free(tid);
     const bsid: ?[]u8 = if (s.cont_bound_sched_id) |b| try allocator.dupe(u8, b) else null;
     errdefer if (bsid) |x| allocator.free(x);
-    try worker.parked_meta.put(allocator, s.ent, .{ .cont = cont, .deadline_ns = s.cont_deadline_ns, .tenant_id = tid, .bound_schedule_id = bsid });
+    const corr: ?[]u8 = if (s.correlation_id) |c| try allocator.dupe(u8, c) else null;
+    errdefer if (corr) |x| allocator.free(x);
+    try worker.parked_meta.put(allocator, s.ent, .{ .cont = cont, .deadline_ns = s.cont_deadline_ns, .tenant_id = tid, .bound_schedule_id = bsid, .correlation_id = corr });
     s.cont = null;
 }
 
@@ -206,7 +303,7 @@ fn captureSuccess(
     const exception_owned = s.exception_owned;
     s.console_owned = &.{};
     s.exception_owned = &.{};
-    worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, status, outcome, console_owned, exception_owned, s.tapes);
+    worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, status, outcome, console_owned, exception_owned, s.tapes, s.correlation_id, .inbound);
 }
 
 fn finalizeBatch(
@@ -345,7 +442,7 @@ fn finalizeBatch(
             processed += 1;
         }
         // Read-only emits: no raft to gate on.
-        fireEmitsIfWired(worker, anchor_id, successes, pending_emits);
+        fireEmitsIfWired(worker, anchor_id, pending_emits);
         successes.clearRetainingCapacity();
         return processed;
     }
@@ -424,7 +521,7 @@ fn finalizeBatch(
     // the remaining §6 step (tracked, not a correctness regression
     // introduced here — a pre-existing deviation, scoped separately
     // from this comment pass).
-    fireEmitsIfWired(worker, anchor_id, successes, pending_emits);
+    fireEmitsIfWired(worker, anchor_id, pending_emits);
     successes.clearRetainingCapacity();
     return processed;
 }
@@ -438,25 +535,11 @@ fn finalizeBatch(
 fn fireEmitsIfWired(
     worker: anytype,
     anchor_id: []const u8,
-    successes: *const std.ArrayList(SuccessRec),
     pending_emits: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
 ) void {
     if (pending_emits.items.len == 0) return;
-    const easy = worker.sse_curl orelse return;
-    const base = worker.sse_public_base orelse return;
-    const tok = worker.sse_internal_token orelse return;
-    if (base.len == 0 or tok.len == 0) return;
-    const request_id: u64 = if (successes.items.len > 0) successes.items[0].request_id else 0;
-    sse_dispatch.fireBatch(
-        worker.allocator,
-        easy,
-        base,
-        tok,
-        anchor_id,
-        request_id,
-        pending_emits.items,
-        worker.sse_insecure_tls,
-    );
+    const h = worker.sse_handle orelse return;
+    h.enqueueEmit(anchor_id, pending_emits.items);
 }
 
 /// `/_system/*` route handler — CORS preflight + `services-token`
@@ -1690,7 +1773,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const slot = worker_mod.getOrOpenTenantSlot(worker, handler_inst) catch |err| {
             std.log.warn("rove-js: lazy openTenantSlot({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
             try respb.setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{}, null, .inbound);
             processed += 1;
             continue;
         };
@@ -1700,7 +1783,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // sees one deployment version completely.
         const snap = slot.pinCurrent() orelse {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{}, null, .inbound);
             processed += 1;
             continue;
         };
@@ -1728,7 +1811,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             rh,
             received_ns,
         )) {
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 200, .ok, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 200, .ok, &.{}, &.{}, .{}, null, .inbound);
             processed += 1;
             continue;
         }
@@ -1751,7 +1834,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (!allowed) {
             const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
             try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 429, .handler_error, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 429, .handler_error, &.{}, &.{}, .{}, null, .inbound);
             processed += 1;
             continue;
         }
@@ -1776,7 +1859,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             );
             switch (static_outcome) {
                 .served => |status| {
-                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, status, .ok, &.{}, &.{}, .{});
+                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, status, .ok, &.{}, &.{}, .{}, null, .inbound);
                     processed += 1;
                     continue;
                 },
@@ -1787,7 +1870,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var route = router_mod.resolveRoute(allocator, path) catch |err| {
             std.log.warn("rove-js router failed: {s}", .{@errorName(err)});
             try respb.setErrorResponse(server, ent, sid, sess);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, .{}, null, .inbound);
             processed += 1;
             continue;
         };
@@ -1799,14 +1882,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             if (!try respb.serveConvention404(server, allocator, ent, sid, sess, tc)) {
                 try respb.setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
             }
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 404, .handler_error, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 404, .handler_error, &.{}, &.{}, .{}, null, .inbound);
             processed += 1;
             continue;
         };
 
         if (worker.penalty_box.isBoxed(handler_inst.id, dep_id, received_ns)) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "tenant temporarily disabled (cpu budget)\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .timeout, &.{}, &.{}, .{});
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .timeout, &.{}, &.{}, .{}, null, .inbound);
             processed += 1;
             continue;
         }
@@ -1836,7 +1919,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // deferred commit at raft confirmation.
             const new_txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch {
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn alloc failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{}, null, .inbound);
                 processed += 1;
                 continue;
             };
@@ -1844,7 +1927,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 allocator.destroy(new_txn);
                 std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{}, null, .inbound);
                 processed += 1;
                 continue;
             };
@@ -1862,7 +1945,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 }
                 std.log.warn("rove-js open tracked txn ({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn open failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{});
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{}, null, .inbound);
                 processed += 1;
                 continue;
             };
@@ -1921,6 +2004,24 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var sid_prng = std.Random.DefaultPrng.init(@bitCast(received_ns));
         const session_resolved = session_mod.resolve(rh, sid_prng.random());
 
+        // Per-chain correlation id (streaming-handlers-plan §6).
+        // Honor `X-Rove-Correlation-Id` from the wire when present
+        // (≤256 bytes, no NUL — distributed-tracing posture); else
+        // synthesize the 16-char hex of `request_id` so the id is
+        // stable, deterministic under tape replay, and unique per
+        // activation when no upstream chain id is supplied. Backing
+        // buffer lives in this loop iteration alongside the Request.
+        var correlation_id_buf: [16]u8 = undefined;
+        const correlation_id: []const u8 = blk: {
+            if (respb.findHeader(rh, "x-rove-correlation-id")) |h| {
+                if (h.len > 0 and h.len <= 256 and std.mem.indexOfScalar(u8, h, 0) == null) {
+                    break :blk h;
+                }
+            }
+            break :blk std.fmt.bufPrint(&correlation_id_buf, "{x:0>16}", .{request_id}) catch unreachable;
+        };
+        std.log.info("rove-js corr: inbound corr={s} request_id={d} tenant={s}", .{ correlation_id, request_id, scope_inst.id });
+
         const request: Request = .{
             .method = method,
             .path = path,
@@ -1935,6 +2036,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .module_tape = &tapes.module,
             .prng_seed = @bitCast(received_ns),
             .request_id = request_id,
+            .correlation_id = correlation_id,
+            .activation_source = .inbound,
             .session_id = session_resolved.sid,
             // Non-null only when the handler-tenant is the admin
             // singleton — gates installation of `platform.root.*`.
@@ -2039,7 +2142,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // failure mode (e.g. step through the same kv reads to see
             // why the handler hit the CPU budget).
             const tape_payloads = worker_mod.captureTapes(worker, &tapes, body);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads);
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, correlation_id, .inbound);
             processed += 1;
             continue;
         };
@@ -2063,6 +2166,21 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     .set_cookies = &.{},
                     .headers = &.{},
                 };
+            },
+            .stream => |sval| stblk: {
+                // Phase 2b-i: build a `Response` from the Stream
+                // descriptor — concatenate chunks into the body,
+                // parse the wire-format `headers` string into
+                // `[]ResponseHeader`, status as-is. This is a single
+                // DATA frame (not yet truly chunked); the real
+                // multi-frame `stream_response_in` → `stream_data_out`
+                // lifecycle + timer-wake re-activation lands in Phase
+                // 2b-ii. Until then, the customer's JS shape reaches
+                // the wire correctly and the smoke verifies headers +
+                // concatenated body. Stream is consumed here.
+                var s = sval;
+                defer s.deinit(allocator);
+                break :stblk try streamToResponse(allocator, &s);
             },
         };
         // §6.4 binding: a continuation hop that fired EXACTLY one
@@ -2129,7 +2247,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // message (e.g. `Date.now()`) resolves to the same value
             // it did originally.
             const tape_payloads = worker_mod.captureTapes(worker, &tapes, body);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads);
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads, correlation_id, .inbound);
             processed += 1;
             continue;
         }
@@ -2147,7 +2265,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // the kv error — lets replay reach the same failure
             // point with the same prior reads.
             const tape_payloads = worker_mod.captureTapes(worker, &tapes, body);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads);
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, correlation_id, .inbound);
             processed += 1;
             continue;
         }
@@ -2240,6 +2358,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             else
                 0,
             .cont_bound_sched_id = cont_bound_sched_id,
+            .correlation_id = correlation_id,
         });
     }
 

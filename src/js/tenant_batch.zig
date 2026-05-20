@@ -112,28 +112,15 @@ pub fn drainTenantBatch(
     return visited;
 }
 
-/// Fire-and-forget the merged batch emits at sse-server. No-op when
-/// the worker isn't wired for SSE or the batch produced none.
+/// Hand the merged batch emits to the in-process SSE thread. No-op
+/// when there's no in-process SSE or the batch produced none
+/// (best-effort — SSE is lossy by design).
 fn fireEmits(
     worker: anytype,
     tenant_id: []const u8,
     pe: *std.ArrayListUnmanaged(sse_dispatch.EmitEntry),
 ) void {
     if (pe.items.len == 0) return;
-    const easy = worker.sse_curl orelse return;
-    const base = worker.sse_public_base orelse return;
-    const tok = worker.sse_internal_token orelse return;
-    if (base.len == 0 or tok.len == 0) return;
-    sse_dispatch.fireBatch(
-        worker.allocator,
-        easy,
-        base,
-        tok,
-        tenant_id,
-        // No batch-level request_id breadcrumb — batched dispatch
-        // isn't tied to one inbound request. sse-server ignores it.
-        0,
-        pe.items,
-        worker.sse_insecure_tls,
-    );
+    const h = worker.sse_handle orelse return;
+    h.enqueueEmit(tenant_id, pe.items);
 }

@@ -194,15 +194,15 @@ pub const Cli = struct {
     /// Skip TLS peer verification on the loop46 → files-server
     /// manifest fetch. Smoke / dev only — production must verify.
     files_internal_insecure_tls: bool = false,
-    /// Origin the worker uses to deliver `events.emit` payloads to
-    /// the sse-server's `POST /v1/emit`. Plain http://host:port for
-    /// loopback dev (`scripts/sse_server_smoke.sh`), https://sse.
-    /// {public_suffix} in production. Auto-derived from
-    /// `--public-suffix` when unset, same shape as files / log. Null
-    /// (no auto-derive, no flag) disables the worker → sse-server
-    /// POST path; emits then live only in the legacy `_events/`
-    /// rows the worker pump still drives.
-    sse_public_base: ?[]const u8 = null,
+    /// `host:port` to bind the **in-process** SSE notification thread
+    /// (task #10: sse-server-standalone retired, collapsed into a
+    /// loop46 thread — sse-plan, connection-actor-plan §6.2). When
+    /// set, loop46 spawns the SSE thread on this address (own
+    /// listener on `sse.{public_suffix}`, shares the worker TLS +
+    /// services-JWT). **Single-node only for v1**: refused at startup
+    /// if `--peers` lists more than one node (in-process SSE has no
+    /// cross-node fan-out by design). Null = no in-process SSE.
+    sse_listen: ?[]const u8 = null,
 };
 
 pub fn parseCli(args: []const [:0]u8) !Cli {
@@ -332,10 +332,10 @@ pub fn parseCli(args: []const [:0]u8) !Cli {
             out.files_internal_base = args[i];
         } else if (std.mem.eql(u8, a, "--files-internal-insecure-tls")) {
             out.files_internal_insecure_tls = true;
-        } else if (std.mem.eql(u8, a, "--sse-public-base")) {
+        } else if (std.mem.eql(u8, a, "--sse-listen")) {
             i += 1;
             if (i >= args.len) return error.Usage;
-            out.sse_public_base = args[i];
+            out.sse_listen = args[i];
         } else {
             return error.Usage;
         }
@@ -489,6 +489,9 @@ pub const USAGE =
     \\  --peers <h:p,h:p,...>       raft peer list — must list ≥2 entries
     \\  --listen <host:port>        raft RPC listen
     \\  --http <host:port>          HTTP/2 listen
+    \\  --sse-listen <host:port>    bind the in-process SSE thread (sse.<suffix>).
+    \\                              Single-node only (refused if --peers > 1);
+    \\                              unset = no in-process SSE
     \\  --data-dir <path>           per-node data dir
     \\  --fresh                     wipe data dir before start
     \\  --public-suffix <domain>    customer wildcard suffix (e.g. loop46.me).
