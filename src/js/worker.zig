@@ -123,11 +123,17 @@ pub const RaftWait = struct {
 /// buffered emits at commit (`committedSeq >= seq`) and discards
 /// them on fault/timeout/leadership-loss (the effect never escaped).
 /// Purely additive — the H2 entity path is untouched.
+/// Component-compatible: default-init produces an "empty" unit
+/// (seq=0, no tenant, no ops, no txn) so rove SoA columns can
+/// zero-init. The slice-based `deinit` is what rove calls on
+/// entity destroy / collection shutdown; safe to invoke on an
+/// empty unit (every field has a benign empty default).
 pub const ParkedUnit = struct {
-    seq: u64,
-    deadline_ns: i64,
+    seq: u64 = 0,
+    deadline_ns: i64 = 0,
     /// Owned copy — must outlive the proposing dispatch across ticks.
-    tenant_id: []u8,
+    /// Empty slice when default-init (no tenant yet set).
+    tenant_id: []u8 = &.{},
     /// Option (b) 4b-ii-B: owned commit-gated send arm/resolve intents
     /// (`_send/owed/` put → arm, `_send/proof/` put / `_send/owed/`
     /// delete → resolve). Fired into the leader-local SendDispatch on
@@ -151,28 +157,33 @@ pub const ParkedUnit = struct {
     /// when this unit represents a "forgetful writes" propose —
     /// the §4.4 disconnect activation's kv side effects. No entity
     /// in `raft_pending` waits on this seq, so the entity-loop in
-    /// `drainRaftPending` would never commit it; the pending_units
+    /// `drainRaftPending` would never commit it; the parked-units
     /// sweep does instead. On commit: `tracked.commit() + destroy`;
     /// on fault: `tracked.rollback() + destroy`. Null on the
     /// historical entity-backed units (`parkSendOps` from the
     /// inbound dispatch path) — the entity loop already owns those.
     txn: ?*kv_mod.KvStore.TrackedTxn = null,
 
-    pub fn deinit(self: *ParkedUnit, allocator: std.mem.Allocator) void {
-        for (self.send_ops.items) |*o| o.deinit(allocator);
-        self.send_ops.deinit(allocator);
-        for (self.kv_wakes.items) |*w| w.deinit(allocator);
-        self.kv_wakes.deinit(allocator);
-        // Phase 4c: if a forgetful-writes txn is still attached
-        // (drained without commit / fault, e.g. on shutdown),
-        // rollback + destroy. The pending_units sweep clears this
-        // pointer when it commits or rolls back.
-        if (self.txn) |t| {
-            t.rollback() catch {};
-            allocator.destroy(t);
-            self.txn = null;
+    /// Rove component deinit: invoked by `Collection.deinit` on
+    /// entity destroy / shutdown. Releases every owned field; safe
+    /// on a default-init unit (empty slices / null txn short-
+    /// circuit). The drainRaftPending sweep clears `txn` before
+    /// destroying the entity on a clean commit so the txn isn't
+    /// rolled back here.
+    pub fn deinit(allocator: std.mem.Allocator, items: []ParkedUnit) void {
+        for (items) |*item| {
+            for (item.send_ops.items) |*o| o.deinit(allocator);
+            item.send_ops.deinit(allocator);
+            for (item.kv_wakes.items) |*w| w.deinit(allocator);
+            item.kv_wakes.deinit(allocator);
+            if (item.txn) |t| {
+                t.rollback() catch {};
+                allocator.destroy(t);
+                item.txn = null;
+            }
+            if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
+            item.* = .{};
         }
-        allocator.free(self.tenant_id);
     }
 };
 
@@ -1749,6 +1760,17 @@ pub fn Worker(comptime opts: Options) type {
     const SubFireRow = rove.Row(&.{components_mod.SubscriptionFireDescriptor});
     const SubFireColl = rove.Collection(SubFireRow, .{});
 
+    // Worker-only collection for entity-less post-propose parked
+    // units (`parkSendOps` / `parkKvWakes` / `proposeForgetfulWrites`).
+    // The flat `ArrayList<ParkedUnit>` predecessor required manual
+    // iterate-then-swapRemove inside drainRaftPending, which bit us
+    // with the iterate-while-modify GPE during Gap 2.1 Phase E.
+    // Collection-as-state gives deferred-destroy re-entrancy safety
+    // by construction (rove principle #1) + structural deinit
+    // (principle #2: data lifetime through components).
+    const ParkedUnitRow = rove.Row(&.{ParkedUnit});
+    const ParkedUnitColl = rove.Collection(ParkedUnitRow, .{});
+
     return struct {
         const Self = @This();
 
@@ -1827,8 +1849,12 @@ pub fn Worker(comptime opts: Options) type {
         /// Non-entity post-propose parked units (divergence
         /// workstream idiom-1). Serviced by `drainRaftPending`
         /// alongside (but independently of) the H2 `raft_pending`
-        /// entity path. Single-threaded per worker.
-        pending_units: std.ArrayListUnmanaged(ParkedUnit) = .empty,
+        /// entity path. Each unit is a fresh entity in the
+        /// collection with a `ParkedUnit` component; `reg.destroy`
+        /// (deferred to `reg.flush`) removes it on commit/fault.
+        /// State-as-membership: presence in the collection IS the
+        /// "awaiting raft commit" state.
+        parked_units: ParkedUnitColl,
         /// Gap 2.1 Phase E (refactored): per-worker rove collection
         /// of pending subscription-fire chain origins. Producers
         /// (the kv-react site in `firePendingKvWakes`, plus future
@@ -2010,6 +2036,7 @@ pub fn Worker(comptime opts: Options) type {
                 .raft_pending_stream = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .subscription_fire_pending = try SubFireColl.init(allocator),
+                .parked_units = try ParkedUnitColl.init(allocator),
                 .sub_fire_inbox = SubscriptionFireInbox.init(allocator),
                 .dispatcher = try Dispatcher.init(allocator),
                 .node = config.node,
@@ -2043,6 +2070,7 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.raft_pending_stream.deinit();
             errdefer self.parked_continuations.deinit();
             errdefer self.subscription_fire_pending.deinit();
+            errdefer self.parked_units.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
@@ -2051,6 +2079,7 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.raft_pending_stream);
             reg.registerCollection(&self.parked_continuations);
             reg.registerCollection(&self.subscription_fire_pending);
+            reg.registerCollection(&self.parked_units);
 
             // Register the inbox with the node so apply.zig +
             // worker_dispatch.zig can broadcast kv-write events to
@@ -2169,8 +2198,9 @@ pub fn Worker(comptime opts: Options) type {
                 allocator.destroy(entry.value_ptr.*);
             }
             self.pending_txns.deinit(allocator);
-            for (self.pending_units.items) |*pu| pu.deinit(allocator);
-            self.pending_units.deinit(allocator);
+            // parked_units is a rove Collection; its deinit fires
+            // each entity's `ParkedUnit.deinit` component-style,
+            // then drops the collection.
             self.batch_side.reset(allocator);
             self.batch_side.targets.deinit(allocator);
             // Phase 7: side tables (parked_meta, parked_streams_active,
@@ -2190,6 +2220,7 @@ pub fn Worker(comptime opts: Options) type {
             self.sub_fire_inbox.deinit();
             self.parked_continuations.deinit();
             self.subscription_fire_pending.deinit();
+            self.parked_units.deinit();
             self.raft_pending_response.deinit();
             self.raft_pending_cont.deinit();
             self.raft_pending_stream.deinit();
@@ -3829,55 +3860,72 @@ pub fn drainRaftPending(worker: anytype) !void {
     //    emits at commit; discard on fault/timeout (the effect never
     //    escaped — same posture as the entity 503 path). Reuses the
     //    `committed`/`faulted`/`now_ns` watermarks computed above.
-    var u: usize = 0;
-    while (u < worker.pending_units.items.len) {
-        const unit = &worker.pending_units.items[u];
-        if (committed >= unit.seq) {
-            // Phase 4c: forgetful-writes units carry their own
-            // `TrackedTxn` (no entity in raft_pending waiting on
-            // this seq — see `proposeForgetfulWrites`). Commit it
-            // here; the firePending* helpers run alongside, same
-            // post-commit firing order as the entity-backed path.
-            if (unit.txn) |t| {
-                t.commit() catch |cerr| panic_mod.invariantViolated(
-                    "drainRaftPending.pending_units.commit",
-                    "seq={d} tenant={s} err={s}",
-                    .{ unit.seq, unit.tenant_id, @errorName(cerr) },
+    //
+    // Iterates a snapshot of entity ids so that re-entrant park-*
+    // calls (e.g. via firePendingKvWakes → kv-react fire path) that
+    // create new parked_units entities land in the deferred-create
+    // queue and process next tick — no iterate-while-modify trap
+    // (the v1 flat ArrayList bit us with a GPE here in Phase E;
+    // collection + reg.destroy fixes it by construction).
+    {
+        const slice = worker.parked_units.entitySlice();
+        var buf: [256]rove.Entity = undefined;
+        const n = @min(slice.len, buf.len);
+        std.mem.copyForwards(rove.Entity, buf[0..n], slice[0..n]);
+        for (buf[0..n]) |ent| {
+            const unit = server.reg.get(ent, &worker.parked_units, ParkedUnit) catch continue;
+            if (committed >= unit.seq) {
+                // Phase 4c: forgetful-writes units carry their own
+                // `TrackedTxn` (no entity in raft_pending waiting on
+                // this seq — see `proposeForgetfulWrites`). Commit
+                // it here; the firePending* helpers run alongside,
+                // same post-commit firing order as the entity-backed
+                // path. Null `txn` after commit so ParkedUnit.deinit
+                // doesn't try to rollback on destroy.
+                if (unit.txn) |t| {
+                    t.commit() catch |cerr| panic_mod.invariantViolated(
+                        "drainRaftPending.parked_units.commit",
+                        "seq={d} tenant={s} err={s}",
+                        .{ unit.seq, unit.tenant_id, @errorName(cerr) },
+                    );
+                    allocator.destroy(t);
+                    unit.txn = null;
+                }
+                firePendingSendOps(worker, unit);
+                firePendingKvWakes(worker, unit);
+                server.reg.destroy(ent) catch |err| std.log.warn(
+                    "rove-js parked_units commit destroy: {s}",
+                    .{@errorName(err)},
                 );
-                allocator.destroy(t);
-                unit.txn = null;
+                continue;
             }
-            firePendingSendOps(worker, unit);
-            firePendingKvWakes(worker, unit);
-            unit.deinit(allocator);
-            _ = worker.pending_units.swapRemove(u);
-            continue;
-        }
-        if ((faulted > 0 and faulted >= unit.seq) or now_ns >= unit.deadline_ns) {
-            // Phase 4c: rollback the attached txn before discarding
-            // the unit. `ParkedUnit.deinit` also does this as a
-            // safety net (shutdown path), but doing it here keeps
-            // the fault/timeout discard ordering symmetric with
-            // commit's destroy-then-clear pattern.
-            if (unit.txn) |t| {
-                t.rollback() catch |rerr| std.log.warn(
-                    "rove-js drainRaftPending.pending_units.rollback seq={d} tenant={s}: {s}",
-                    .{ unit.seq, unit.tenant_id, @errorName(rerr) },
+            if ((faulted > 0 and faulted >= unit.seq) or now_ns >= unit.deadline_ns) {
+                // Phase 4c: rollback the attached txn before
+                // discarding. `ParkedUnit.deinit` is the structural
+                // safety net (shutdown path); doing it here keeps
+                // the fault/timeout discard ordering symmetric with
+                // commit's destroy-then-clear pattern.
+                if (unit.txn) |t| {
+                    t.rollback() catch |rerr| std.log.warn(
+                        "rove-js drainRaftPending.parked_units.rollback seq={d} tenant={s}: {s}",
+                        .{ unit.seq, unit.tenant_id, @errorName(rerr) },
+                    );
+                    allocator.destroy(t);
+                    unit.txn = null;
+                }
+                server.reg.destroy(ent) catch |err| std.log.warn(
+                    "rove-js parked_units fault destroy: {s}",
+                    .{@errorName(err)},
                 );
-                allocator.destroy(t);
-                unit.txn = null;
             }
-            unit.deinit(allocator); // discard — never committed, never escaped
-            _ = worker.pending_units.swapRemove(u);
-            continue;
+            // else: still awaiting commit; leave in collection for next tick.
         }
-        u += 1;
     }
 
     // Gap 2.1 Phase E (refactored): dispatch any subscription
     // fires that the kv-react site enqueued into the worker's
     // `subscription_fire_pending` collection during the
-    // pending_units loop. The collection-as-state shape means
+    // parked_units loop. The collection-as-state shape means
     // re-entrant fires append via the deferred-create queue and
     // process next tick — no iterate-while-modify trap.
     dispatchSubscriptionFires(worker);
@@ -4935,7 +4983,7 @@ fn resumeStream(
     defer allocator.free(spath);
 
     // Heap-allocate the txn so its pointer can park on a
-    // pending_units `ParkedUnit.txn` if the hop wrote (Phase 4b).
+    // parked_units `ParkedUnit.txn` if the hop wrote (Phase 4b).
     // Same stable-pointer pattern as resumeContinuation (4a) +
     // fireDisconnectActivation (4c).
     const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return error.ResumeTxnAlloc;
@@ -5031,7 +5079,7 @@ fn resumeStream(
             }
             // Phase 4b: terminal + writes. Eager-fire: queue the
             // body as the last chunk, flag close_pending, and propose
-            // the writes asynchronously via the pending_units sweep
+            // the writes asynchronously via the parked_units sweep
             // (same path as the §4.4 disconnect activation's writes).
             // The chunks may ship to the client BEFORE raft commits —
             // a §7/§9.4 trade-off the plan accepts: handlers refetch
@@ -5660,7 +5708,7 @@ pub fn fireSubscriptionActivation(
 }
 
 /// Phase 4c: propose a write batch that nobody is waiting on. The
-/// txn rides a `ParkedUnit.txn` field that the pending_units sweep
+/// txn rides a `ParkedUnit.txn` field that the parked_units sweep
 /// in `drainRaftPending` commits at the seq — same gate as the
 /// entity-backed path's `pending_txns[seq]`, just routed through
 /// the unit drain so we don't need an entity in `raft_pending`.
@@ -5690,7 +5738,7 @@ fn proposeForgetfulWrites(
     };
     // Build a ParkedUnit carrying the txn AND the send_ops /
     // kv_wakes intents extracted from the writeset. drainRaftPending's
-    // pending_units sweep handles all three at commit (or
+    // parked_units sweep handles all three at commit (or
     // discards all three on fault/timeout).
     var unit_send_ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty;
     errdefer {
@@ -5720,18 +5768,35 @@ fn proposeForgetfulWrites(
         };
     }
 
-    try worker.pending_units.ensureUnusedCapacity(allocator, 1);
-    const tid = try allocator.dupe(u8, tenant_id);
-    errdefer allocator.free(tid);
-    worker.pending_units.appendAssumeCapacity(.{
+    // Build the unit, transferring ownership of every owned field
+    // (send_ops, kv_wakes, txn, tenant_id). The staging pattern
+    // mirrors StreamChunks / SubscriptionFireDescriptor: assign
+    // owned slices into the unit, IMMEDIATELY clear the caller-side
+    // locals to invalidate their errdefers, arm the unit-deinit
+    // errdefer, then `reg.set` (copies bitwise; column takes the
+    // pointers) + clear the unit to invalidate its own errdefer.
+    var unit: ParkedUnit = .{
         .seq = seq,
         .deadline_ns = @intCast(std.time.nanoTimestamp() +
             @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .tenant_id = tid,
         .send_ops = unit_send_ops,
         .kv_wakes = unit_kv_wakes,
         .txn = txn,
-    });
+    };
+    unit_send_ops = .empty;
+    unit_kv_wakes = .empty;
+    errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
+
+    // Allocate tenant_id AFTER arming the unit errdefer so a dupe
+    // failure leaves the unit's `.tenant_id` as default `&.{}`,
+    // and ParkedUnit.deinit's `if (tenant_id.len > 0)` skips
+    // freeing it (no double-free).
+    unit.tenant_id = try allocator.dupe(u8, tenant_id);
+
+    const ent = try worker.h2.reg.create(&worker.parked_units);
+    errdefer worker.h2.reg.destroy(ent) catch {};
+    try worker.h2.reg.set(ent, &worker.parked_units, ParkedUnit, unit);
+    unit = .{}; // ownership transferred to the column
 }
 
 /// Fire commit-gated send arm/resolve intents into the leader-local
@@ -5779,12 +5844,14 @@ fn firePendingKvWakes(worker: anytype, unit: *ParkedUnit) void {
 /// worker's `subscription_fire_pending` collection with a populated
 /// `SubscriptionFireDescriptor`. The `dispatchSubscriptionFires`
 /// system iterates + fires + destroys on each worker tick.
-/// Direct firing here would invalidate the
+/// Direct firing here would invalidate the v1
 /// `drainRaftPending` loop's `&worker.pending_units.items[u]`
 /// pointer because the recursive dispatch's
-/// `parkSendOps`/`parkKvWakes` grow the slice — collection
-/// membership IS the queue (principle #1) and dispatch happens
-/// outside the iterate-then-mutate window.
+/// `parkSendOps`/`parkKvWakes` grew the slice — that's why
+/// `pending_units` was lifted to the `parked_units` rove
+/// collection. Collection membership IS the queue (principle #1)
+/// and dispatch happens outside the iterate-then-mutate window
+/// via `reg.destroy`'s deferred semantics.
 ///
 /// Leader-only by caller convention (`firePendingKvWakes` only
 /// runs on the worker that committed the write).
@@ -6003,22 +6070,27 @@ pub fn parkSendOps(
         return; // nothing to gate
     }
     std.log.info("rove-js sendpath: parkSendOps tenant={s} seq={d} send_ops={d}", .{ tenant_id, seq, ops.items.len });
-    try worker.pending_units.ensureUnusedCapacity(allocator, 1);
-    const tid = try allocator.dupe(u8, tenant_id);
-    errdefer allocator.free(tid);
-    worker.pending_units.appendAssumeCapacity(.{
+    // Transfer ownership of `ops` into the unit; clear local
+    // immediately to invalidate the earlier errdefer.
+    var unit: ParkedUnit = .{
         .seq = seq,
         .deadline_ns = @intCast(std.time.nanoTimestamp() +
             @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .tenant_id = tid,
         .send_ops = ops,
-    });
+    };
+    ops = .empty;
+    errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
+    unit.tenant_id = try allocator.dupe(u8, tenant_id);
+    const ent = try worker.h2.reg.create(&worker.parked_units);
+    errdefer worker.h2.reg.destroy(ent) catch {};
+    try worker.h2.reg.set(ent, &worker.parked_units, ParkedUnit, unit);
+    unit = .{};
 }
 
 /// Register a tenant-batch dispatch's SSE emits as a post-propose
 /// parked unit (docs/unified-effect-gating.md idiom-1, step 2).
 /// Moves the emit buffer + an owned copy of `tenant_id` into
-/// `worker.pending_units` keyed by the propose `seq`;
+/// `worker.parked_units` keyed by the propose `seq`;
 /// `drainRaftPending` releases them at commit / discards on fault.
 /// Empties `*emits` so the caller's defer is a no-op. On a pre-move
 /// error the emits stay with the caller (its defer drops them —
@@ -6054,16 +6126,21 @@ pub fn parkKvWakes(
             wakes.appendAssumeCapacity(.{ .key = k, .op = 'd' });
         },
     };
-    try worker.pending_units.ensureUnusedCapacity(allocator, 1);
-    const tid = try allocator.dupe(u8, tenant_id);
-    errdefer allocator.free(tid);
-    worker.pending_units.appendAssumeCapacity(.{
+    // Transfer ownership of `wakes` into the unit; clear local
+    // immediately to invalidate the earlier errdefer.
+    var unit: ParkedUnit = .{
         .seq = seq,
         .deadline_ns = @intCast(std.time.nanoTimestamp() +
             @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .tenant_id = tid,
         .kv_wakes = wakes,
-    });
+    };
+    wakes = .empty;
+    errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
+    unit.tenant_id = try allocator.dupe(u8, tenant_id);
+    const ent = try worker.h2.reg.create(&worker.parked_units);
+    errdefer worker.h2.reg.destroy(ent) catch {};
+    try worker.h2.reg.set(ent, &worker.parked_units, ParkedUnit, unit);
+    unit = .{};
 }
 
 /// Leadership-loss drain. Called from the dispatch loop on a
@@ -6092,9 +6169,28 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
 
     // Discard parked units — their seqs won't commit on this now-
     // follower; the buffered emits MUST NOT fire (the new leader
-    // re-fires anything that was actually durable).
-    for (worker.pending_units.items) |*pu| pu.deinit(allocator);
-    worker.pending_units.clearRetainingCapacity();
+    // re-fires anything that was actually durable). Destroy every
+    // entity in the parked_units collection; `reg.destroy` (deferred)
+    // fires `ParkedUnit.deinit` structurally on each — rollback any
+    // attached txn, free owned slices.
+    {
+        const slice = worker.parked_units.entitySlice();
+        // Copy to a stable buffer because destroy is deferred and
+        // entitySlice reflects the current pre-flush state.
+        var buf: [256]rove.Entity = undefined;
+        var idx: usize = 0;
+        while (idx < slice.len) {
+            const n = @min(slice.len - idx, buf.len);
+            std.mem.copyForwards(rove.Entity, buf[0..n], slice[idx .. idx + n]);
+            for (buf[0..n]) |ent| {
+                server.reg.destroy(ent) catch |err| std.log.warn(
+                    "drainOnLeadershipLoss: parked_units destroy: {s}",
+                    .{@errorName(err)},
+                );
+            }
+            idx += n;
+        }
+    }
 
     // Phase 5: downgrade every entry across the three raft-pending
     // siblings to 503 + move to response_in.
