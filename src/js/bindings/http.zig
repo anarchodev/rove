@@ -201,6 +201,15 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
     const tid_dup = try a.dupe(u8, state.instance_id);
     errdefer a.free(tid_dup);
 
+    // Gap 2.3 Phase E: a pipe_to fetch carries the issuing chain's
+    // correlation_id so the upstream bytes can be routed to the
+    // held stream entity later. Empty for Pattern A.
+    const pipe_corr_dup = if (row.pipe_to_held)
+        try a.dupe(u8, state.correlation_id)
+    else
+        try a.alloc(u8, 0);
+    errdefer a.free(pipe_corr_dup);
+
     try out.ensureUnusedCapacity(a, 1);
     out.appendAssumeCapacity(.{
         .tenant_id = tid_dup,
@@ -214,6 +223,7 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
         .on_done_module = row.on_done_module,
         .ctx_json = row.ctx_json,
         .pipe_to_held = row.pipe_to_held,
+        .pipe_correlation_id = pipe_corr_dup,
         .headers_passthrough = row.headers_passthrough,
         .max_response_chunk_bytes = row.max_response_chunk_bytes,
         .max_total_response_bytes = row.max_total_response_bytes,

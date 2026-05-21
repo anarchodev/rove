@@ -257,6 +257,20 @@ pub const UpstreamFetchEvent = struct {
     /// Allocator-owned; empty when the customer set no `on_done`.
     on_done_module: []u8 = &.{},
 
+    /// Gap 2.3 Phase E: true when the originating `http.fetch` set
+    /// `pipe_to: "held_response"` (Pattern B). The worker routes a
+    /// `pipe_to_held` event's bytes straight to the held client's
+    /// `StreamChunks` — no handler activation, so the bytes are
+    /// never taped ([[project_pipe_to_untaped]]). `on_chunk_module`
+    /// is empty in this mode (binding rejects on_chunk + pipe_to).
+    pipe_to_held: bool = false,
+
+    /// Gap 2.3 Phase E: correlation_id of the chain that called
+    /// `http.fetch({pipe_to})`. The held stream the bytes pipe into
+    /// is the entity whose `ChainContext.correlation_id` matches.
+    /// Allocator-owned; empty for Pattern A events.
+    pipe_correlation_id: []u8 = &.{},
+
     // ── send_chunk variant ────────────────────────────────────
     /// Per-send monotonic chunk index, 0-based. Surfaces as
     /// `request.activation.seq`.
@@ -299,11 +313,43 @@ pub const UpstreamFetchEvent = struct {
             if (item.ctx_json.len > 0) allocator.free(item.ctx_json);
             if (item.on_chunk_module.len > 0) allocator.free(item.on_chunk_module);
             if (item.on_done_module.len > 0) allocator.free(item.on_done_module);
+            if (item.pipe_correlation_id.len > 0) allocator.free(item.pipe_correlation_id);
             if (item.bytes.len > 0) allocator.free(item.bytes);
             if (item.fetch_headers) |h| allocator.free(h);
             item.* = .{};
         }
     }
+};
+
+/// Gap 2.3 Phase E: per-held-stream pipe-target state. Present on
+/// every stream entity (the StreamRow carries it), inert by
+/// default — only a stream that returned `__rove_stream` with a
+/// `fetch_pipe_done` `waitFor` flips `awaiting_pipe`.
+///
+/// `awaiting_pipe` keeps `serviceParkedStreams` from closing the
+/// stream after its initial chunks drain — the upstream `http.fetch`
+/// is still feeding `StreamChunks` from outside any handler run.
+/// `bytes_piped` accumulates as the pipe-routing system appends
+/// chunks. `done` + the terminal fields are set when the pipe's
+/// `.end` event arrives; `serviceParkedStreams` then fires the
+/// one `fetch_pipe_done` activation and the stream closes.
+///
+/// No owned slices — `deinit` is a no-op (kept for component
+/// uniformity).
+pub const PipeState = struct {
+    /// Stream is a `pipe_to` target; stay open until `done`.
+    awaiting_pipe: bool = false,
+    /// Cumulative bytes appended to `StreamChunks` from the pipe
+    /// (after §9.4 cap drops). Surfaces as
+    /// `request.activation.bytes_piped` on `fetch_pipe_done`.
+    bytes_piped: u64 = 0,
+    /// Upstream closed — the `.end` pipe event has been applied.
+    done: bool = false,
+    /// Terminal upstream state, valid once `done`.
+    terminal_ok: bool = false,
+    terminal_status: u16 = 0,
+
+    pub fn deinit(_: std.mem.Allocator, _: []PipeState) void {}
 };
 
 /// Gap 2.1 Phase E (refactored): a pending subscription-fire chain

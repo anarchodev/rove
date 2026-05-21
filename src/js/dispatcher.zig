@@ -295,6 +295,10 @@ pub const Request = struct {
     /// transport error / upstream non-2xx.
     activation_fetch_terminal_status: u16 = 0,
     activation_fetch_terminal_ok: bool = false,
+    /// `.fetch_pipe_done` only: total bytes the pipe wrote into
+    /// the held client's `StreamChunks` (after §9.4 cap drops).
+    /// Surfaces as `request.activation.bytes_piped`.
+    activation_fetch_bytes_piped: u64 = 0,
 };
 
 /// One `(name, value)` pair extracted from the handler's
@@ -484,6 +488,7 @@ pub const Dispatcher = struct {
             .bytecodes = bytecodes,
             .limiter = request.limiter,
             .instance_id = request.instance_id,
+            .correlation_id = request.correlation_id orelse "",
             .deploy_starter = request.deploy_starter,
             .deploy_starter_ctx = request.deploy_starter_ctx,
             .release_publish = request.release_publish,
