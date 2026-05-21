@@ -130,15 +130,6 @@ const BuiltSend = struct {
     on_result_fn: []u8,
     on_result_args_json: []u8,
     context_json: []u8,
-    // Gap 2.3 Phase B: upstream-streaming options (V2 of OwedSend
-    // wire format). All default off / 0; the binding validates
-    // exclusivity (`stream_response` vs `pipe_to_held_response`)
-    // before this struct is built.
-    stream_response: bool = false,
-    pipe_to_held_response: bool = false,
-    headers_passthrough: bool = false,
-    max_response_chunk_bytes: u32 = 0,
-    max_total_response_bytes: u64 = 0,
 
     fn deinit(self: *BuiltSend, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);
@@ -179,11 +170,6 @@ fn writeOwedMarker(
         .timeout_ms = row.timeout_ms,
         .max_body_bytes = row.max_body_bytes,
         .fire_at_ns = row.fire_at_ns,
-        .stream_response = row.stream_response,
-        .pipe_to_held_response = row.pipe_to_held_response,
-        .headers_passthrough = row.headers_passthrough,
-        .max_response_chunk_bytes = row.max_response_chunk_bytes,
-        .max_total_response_bytes = row.max_total_response_bytes,
     };
     const enc = try owed.encode(a);
     defer a.free(enc);
@@ -235,40 +221,6 @@ fn buildRow(
     const timeout_ms = try getIntField(ctx, opts, "timeout_ms", 30_000);
     const max_body_bytes = try getIntField(ctx, opts, "max_body_bytes", schedule_server.RESPONSE_BODY_CAP);
 
-    // Gap 2.3 Phase B: upstream-streaming options + exclusivity
-    // validation. `stream_response: true` opts into per-chunk
-    // handler activations; `pipe_to: "held_response"` opts into
-    // transparent proxy (bypasses handler). Both true is incoherent
-    // — reject at the binding.
-    const stream_response = try getBoolField(ctx, opts, "stream_response", false);
-    const pipe_to_held = blk: {
-        const v = c.JS_GetPropertyStr(ctx, opts, "pipe_to");
-        defer c.JS_FreeValue(ctx, v);
-        if (c.JS_IsUndefined(v) or c.JS_IsNull(v)) break :blk false;
-        if (!c.JS_IsString(v)) {
-            _ = c.JS_ThrowTypeError(ctx, "http.send: `pipe_to` must be a string or null");
-            return error.JsException;
-        }
-        var len: usize = 0;
-        const cstr = c.JS_ToCStringLen(ctx, &len, v);
-        if (cstr == null) return error.JsException;
-        defer c.JS_FreeCString(ctx, cstr);
-        const s = @as([*]const u8, @ptrCast(cstr))[0..len];
-        if (std.mem.eql(u8, s, "held_response")) break :blk true;
-        _ = c.JS_ThrowRangeError(ctx, "http.send: `pipe_to` must be \"held_response\" (the only valid value in v1)");
-        return error.JsException;
-    };
-    if (stream_response and pipe_to_held) {
-        _ = c.JS_ThrowTypeError(ctx, "http.send: `stream_response` and `pipe_to` are mutually exclusive");
-        return error.JsException;
-    }
-    const headers_passthrough = try getBoolField(ctx, opts, "headers_passthrough", false);
-    const max_resp_chunk_i32 = try getIntField(ctx, opts, "max_response_chunk_bytes", 0);
-    const max_resp_chunk: u32 = @intCast(@max(max_resp_chunk_i32, 0));
-    // max_total_response_bytes accepts numbers up to ~9 EB via i64.
-    const max_total_i64 = try getInt64Field(ctx, opts, "max_total_response_bytes", 0);
-    const max_total: u64 = if (max_total_i64 < 0) 0 else @intCast(max_total_i64);
-
     const row: BuiltSend = .{
         .tenant_id = owned.tenant_id.?,
         .id = owned.id.?,
@@ -283,11 +235,6 @@ fn buildRow(
         .on_result_fn = owned.on_result_fn.?,
         .on_result_args_json = owned.on_result_args_json.?,
         .context_json = owned.context_json.?,
-        .stream_response = stream_response,
-        .pipe_to_held_response = pipe_to_held,
-        .headers_passthrough = headers_passthrough,
-        .max_response_chunk_bytes = max_resp_chunk,
-        .max_total_response_bytes = max_total,
     };
     owned = .{}; // ownership transferred
     return row;
