@@ -23,6 +23,9 @@
         {"path": "watchwrite/index.mjs", "source": "loop46-demo-tenants/acme/watchwrite/index.mjs"},
         {"path": "writekv/index.mjs", "source": "loop46-demo-tenants/acme/writekv/index.mjs"},
         {"path": "sessions_sse/index.mjs", "source": "loop46-demo-tenants/acme/sessions_sse/index.mjs"},
+        {"path": "overflow_watch/index.mjs", "source": "loop46-demo-tenants/acme/overflow_watch/index.mjs"},
+        {"path": "overflow_burst/index.mjs", "source": "loop46-demo-tenants/acme/overflow_burst/index.mjs"},
+        {"path": "big_chunks/index.mjs", "source": "loop46-demo-tenants/acme/big_chunks/index.mjs"},
         {"path": "cfg/index.mjs", "source": "loop46-demo-tenants/acme/cfg/index.mjs"},
         {"path": "_config/oauth/google.json", "source": "loop46-demo-tenants/acme/_config/oauth/google.json", "content_type": "application/json"}
       ]

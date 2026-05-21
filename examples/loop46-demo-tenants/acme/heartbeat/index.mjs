@@ -1,9 +1,10 @@
-// Streaming-handlers Phase 2b-ii — multi-frame timer-wake exerciser.
+// Streaming-handlers — multi-frame timer-wake exerciser.
 // The handler returns `__rove_stream({...})` with a single SSE
 // `:heartbeat\n\n` chunk and a `waitFor.timer.intervalMs` of 200ms.
 // The runtime ships the chunk, parks the chain, then re-invokes the
-// handler every 200ms (`request.activation.kind === "timer"`) which
-// emits another `:heartbeat\n\n`. The smoke (scripts/streaming_heartbeat_smoke.py)
+// handler every 200ms (`request.activation.kind === "wake_batch"`,
+// with a timer entry in `activation.wakes`) which emits another
+// `:heartbeat\n\n`. The smoke (scripts/streaming_heartbeat_smoke.py)
 // opens the stream, reads at least three heartbeats over ~700ms,
 // then closes — verifying the chunked-DATA + timer-wake lifecycle
 // end-to-end.

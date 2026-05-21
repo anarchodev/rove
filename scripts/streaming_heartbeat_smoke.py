@@ -11,8 +11,9 @@ machine:
   2. Tick loop: `serviceParkedStreams` pops the queued chunk → frame
      out via `stream_data_in`. With chunks drained + an interval set,
      the next tick after `next_wake_ns` calls `resumeStream` — the
-     handler re-runs with `request.activation.kind === "timer"`,
-     returns another chunk, the loop iterates.
+     handler re-runs with `request.activation.kind === "wake_batch"`
+     (a timer entry in `activation.wakes`), returns another chunk,
+     the loop iterates.
   3. Client disconnect: `serverStreamClose` routes the entity to
      `response_out`; `cleanupResponses` frees the orphaned cell.
 

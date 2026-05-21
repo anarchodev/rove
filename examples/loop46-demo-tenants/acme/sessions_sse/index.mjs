@@ -35,9 +35,14 @@ export default function () {
     // plan exposes it conceptually but the surface remains the
     // request body for now.)
     const ctx = JSON.parse(request.body || "{}").ctx || {};
-    if (a.kind === "timer") {
+    if (a.kind === "wake_batch") {
+        // Timer-driven tick; one frame per fire.
+        const frames = [];
+        for (const w of a.wakes) {
+            if (w.kind === "timer") frames.push(`event: tick\ndata: ${ctx.session_id}\n\n`);
+        }
         return __rove_stream({
-            write: [`event: tick\ndata: ${ctx.session_id}\n\n`],
+            write: frames,
             waitFor: { timer: { intervalMs: 100 } },
             ctx: ctx,
         });

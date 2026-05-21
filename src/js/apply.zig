@@ -363,12 +363,14 @@ pub fn applyWriteSet(
     // streaming-handlers-plan §4.6: kv-write wake fan-out (follower
     // path). Decode the just-applied writeset's ops and broadcast
     // each `put`/`delete` to every worker's `KvWakeInbox`. The
-    // worker's tick drain scans its `parked_streams_meta` for
-    // prefix matches and sets `pending_wake` so the next
-    // `serviceParkedStreams` pass fires `resumeStream(.kv_wake)`.
+    // worker's tick drain scans its stream-pipeline collections for
+    // prefix matches and pushes a `WakeEntry` onto the §9.4
+    // `pending_wakes` ring; the next `serviceParkedStreams` pass
+    // fires `resumeStream(.wake_batch)` which drains the ring.
     // Best-effort: a per-event decode/push failure logs and we
     // continue — §9.4 "spurious + overflow" allows dropped wakes
-    // (handler refetches authoritative state on its next run).
+    // (handler refetches authoritative state on its next run when
+    // `lost_oldest > 0`).
     //
     // The leader-skipped property of `applyWriteSet` means this
     // hook only fires on followers; the leader-side mirror lives

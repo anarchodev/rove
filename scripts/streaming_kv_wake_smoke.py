@@ -28,9 +28,10 @@ producers of kv-wake events both fire:
 Gates:
   1. Watcher receives SSE frames carrying the written key+value+op
      (`event: update\\ndata: watch/<id>=<v> (put)\\n\\n`).
-  2. `request.activation.kind === "kv"` — wrong kind would emit a
-     different frame; the body assertion picks that up.
-  3. `request.activation.key` + `.op` — frame payload echoes them.
+  2. `request.activation.kind === "wake_batch"` — wrong kind would
+     emit a different frame; the body assertion picks that up.
+  3. `request.activation.wakes[i].key` + `.op` — frame payload
+     echoes them (one frame per kv entry in the batch).
   4. Multiple consecutive wakes — verifies the cell re-registers
      its prefix on each `__rove_stream` return.
   5. The follower's apply-thread fan-out fires for each write

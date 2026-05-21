@@ -214,11 +214,6 @@ pub const CONT_HOLD_DEADLINE_NS: i64 = 25 * std.time.ns_per_s;
 // component-style deinit that rove `Collection.deinit` invokes
 // structurally on every entity in the collection on shutdown.
 
-// Phase 7: `PendingKvWake` (worker.zig copy) removed — the one
-// in components.zig (referenced by `StreamWakes.pending_wake`) is
-// authoritative now.
-pub const PendingKvWake = components_mod.PendingKvWake;
-
 /// One kv-write event that crossed the apply boundary (either via
 /// `applyWriteSet` on a follower or via the leader-side eager fire
 /// in `worker_dispatch.zig`). `tenant_id` + `key` are allocator-
@@ -3893,18 +3888,19 @@ pub fn setStreamComponents(
     }
 
     {
-        var queue: std.ArrayListUnmanaged([]u8) = .empty;
-        errdefer {
-            for (queue.items) |c| allocator.free(c);
-            queue.deinit(allocator);
-        }
-        try queue.ensureUnusedCapacity(allocator, initial_chunks.len);
+        // Stage chunks through a temporary StreamChunks so the §9.4
+        // cap check + dropped_chunks counter applies on the first
+        // hop too. The component is then `reg.set` onto the entity
+        // (rove takes ownership of the queue+counters).
+        var staged: components_mod.StreamChunks = .{};
+        errdefer components_mod.StreamChunks.deinit(allocator, (&staged)[0..1]);
+        try staged.queue.ensureUnusedCapacity(allocator, initial_chunks.len);
         for (initial_chunks) |c| {
             const cl = try allocator.dupe(u8, c);
-            queue.appendAssumeCapacity(cl);
+            try staged.tryAppend(allocator, cl);
         }
-        try server.reg.set(ent, current_coll, components_mod.StreamChunks, .{ .queue = queue });
-        queue = .empty; // ownership transferred — block-exit errdefer is a no-op
+        try server.reg.set(ent, current_coll, components_mod.StreamChunks, staged);
+        staged = .{}; // ownership transferred — errdefer is a no-op
     }
 
     {
@@ -3927,7 +3923,6 @@ pub fn setStreamComponents(
             .interval_ms = interval_ms,
             .next_wake_ns = next_wake_ns,
             .kv_prefixes = spine,
-            .pending_wake = null,
         });
     }
 }
@@ -4007,9 +4002,9 @@ pub fn serviceParkedStreams(worker: anytype) !void {
 
         // Drain one chunk per tick — h2 cycles the entity back to
         // `stream_data_out` after each DATA frame ships. Same for
-        // both active and draining streams.
-        if (chunks_comp.queue.items.len > 0) {
-            const chunk = chunks_comp.queue.orderedRemove(0);
+        // both active and draining streams. `popOldest` keeps the
+        // `queue_bytes` byte tracker in lockstep with the queue.
+        if (chunks_comp.popOldest()) |chunk| {
             // RespBody takes ownership; h2's onDataSourceReadCb frees
             // the buffer after consuming it (h2/root.zig:818).
             try server.reg.set(p.ent, &server.stream_data_out, h2.RespBody, .{
@@ -4027,11 +4022,24 @@ pub fn serviceParkedStreams(worker: anytype) !void {
             continue;
         }
 
-        // kv-wake match? Takes priority over the timer (and over
-        // the no-timer close) — a watched prefix that just changed
-        // is more interesting than a heartbeat or a passive close.
-        // `pending_wake` was set by `drainKvWakeInbox` above.
-        if (wakes_comp.pending_wake != null) {
+        // Gap 2.2 Phase D: timer-due → push timer entry to the
+        // §9.4 ring + advance next_wake_ns; the wake-batch
+        // activation below fires from the ring (kv + timer
+        // unified). next_wake_ns is reset relative to now
+        // (drift-on-each-fire, matching the existing pattern in
+        // resumeStream's outcome handler at ~4472).
+        if (wakes_comp.interval_ms > 0 and now_ns >= wakes_comp.next_wake_ns) {
+            wakes_comp.pending_wakes.push(worker.allocator, .{
+                .tag = .timer,
+                .fired_at_ns = now_ns,
+            });
+            wakes_comp.next_wake_ns = now_ns + wakes_comp.interval_ms * std.time.ns_per_ms;
+        }
+
+        // Any wakes in the ring? Fire one wake_batch activation
+        // (drains kv + timer entries in temporal order; surfaces
+        // `lost_oldest` as the §9.4 rate-limit signal).
+        if (wakes_comp.pending_wakes.len > 0) {
             if (chain_comp.activation_count >= MAX_STREAM_ACTIVATIONS) {
                 std.log.warn(
                     "rove-js stream: tenant={s} corr={s} hit activation cap; closing",
@@ -4040,9 +4048,9 @@ pub fn serviceParkedStreams(worker: anytype) !void {
                 try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
                 continue;
             }
-            resumeStream(worker, p.ent, p.sid, p.sess, .kv_wake) catch |err| {
+            resumeStream(worker, p.ent, p.sid, p.sess, .wake_batch) catch |err| {
                 std.log.warn(
-                    "rove-js stream-resume (kv): tenant={s} corr={s}: {s}; closing",
+                    "rove-js stream-resume (wake_batch): tenant={s} corr={s}: {s}; closing",
                     .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)", @errorName(err) },
                 );
                 server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in) catch {};
@@ -4058,28 +4066,6 @@ pub fn serviceParkedStreams(worker: anytype) !void {
             try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
             continue;
         }
-
-        // Timer wake due?
-        if (wakes_comp.interval_ms > 0 and now_ns >= wakes_comp.next_wake_ns) {
-            if (chain_comp.activation_count >= MAX_STREAM_ACTIVATIONS) {
-                // §9.2 strike: misbehaving handler can't run a stream
-                // forever. Close cleanly.
-                std.log.warn(
-                    "rove-js stream: tenant={s} corr={s} hit activation cap; closing",
-                    .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)" },
-                );
-                try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
-                continue;
-            }
-            resumeStream(worker, p.ent, p.sid, p.sess, .timer) catch |err| {
-                std.log.warn(
-                    "rove-js stream-resume: tenant={s} corr={s}: {s}; closing",
-                    .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)", @errorName(err) },
-                );
-                server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in) catch {};
-            };
-            continue;
-        }
         // No wake due yet — idle, waiting for either a kv match or
         // the timer.
     }
@@ -4088,12 +4074,14 @@ pub fn serviceParkedStreams(worker: anytype) !void {
 /// Drain the worker's `wake_inbox` of kv-write events. For every
 /// stream entity (in one of the h2 stream-pipeline collections,
 /// not draining) whose `kv_prefixes` includes a prefix of the
-/// event's key, set `pending_wake = .{ key, op }`
-/// (most-recent-wins per v1's §9.4 collapse posture). Events whose
-/// tenant_id matches no held stream are simply dropped — the
-/// per-tenant scoping § 4.6 invariant lives at REGISTRATION time
-/// (a cell only registers prefixes for its own tenant), so a
-/// stale event against an old tenant just doesn't match anything.
+/// event's key, push a `WakeEntry` into the §9.4 `pending_wakes`
+/// ring (oldest-first, ring drops oldest + bumps `lost_oldest`
+/// on overflow — surfaces to the handler as the rate-limit signal).
+/// Events whose tenant_id matches no held stream are simply
+/// dropped — the per-tenant scoping § 4.6 invariant lives at
+/// REGISTRATION time (a cell only registers prefixes for its own
+/// tenant), so a stale event against an old tenant just doesn't
+/// match anything.
 ///
 /// Phase 7: side-table iteration replaced by an in-place sweep of
 /// the five h2 stream-pipeline collections. Empty collections cost
@@ -4127,44 +4115,41 @@ fn drainKvWakeInbox(worker: anytype) !void {
     }
 }
 
-/// Walk events newest-first; install the freshest matching event on
-/// `wakes.pending_wake`, freeing any prior pending key.
+/// Walk events oldest-first; push every matching event into the §9.4
+/// `PendingWakes` ring on this stream. The ring drops oldest +
+/// bumps `lost_oldest` on overflow, so a burst of >K matches is
+/// rate-limited by construction — the handler sees `lost_oldest > 0`
+/// on its next activation and re-reads kv state.
 fn matchEventsToWakes(
     allocator: std.mem.Allocator,
     events: *std.ArrayListUnmanaged(KvWakeEvent),
     wakes: *components_mod.StreamWakes,
     chain_ctx: components_mod.ChainContext,
 ) !void {
-    {
-        // Walk events newest-first so "most-recent-wins" matches the
-        // intuitive notion of "this stream's pending wake is the
-        // latest fired write."
-        var i: usize = events.items.len;
-        while (i > 0) {
-            i -= 1;
-            const ev = events.items[i];
-            if (!std.mem.eql(u8, ev.tenant_id, chain_ctx.tenant_id)) continue;
-            // Prefix match against any registered prefix.
-            var matched: bool = false;
-            for (wakes.kv_prefixes) |pfx| {
-                if (std.mem.startsWith(u8, ev.key, pfx)) {
-                    matched = true;
-                    break;
-                }
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    // Oldest-first so the ring preserves temporal order (§9.4 wakes
+    // surface in the order they happened; the handler iterates).
+    for (events.items) |ev| {
+        if (!std.mem.eql(u8, ev.tenant_id, chain_ctx.tenant_id)) continue;
+        var matched: bool = false;
+        for (wakes.kv_prefixes) |pfx| {
+            if (std.mem.startsWith(u8, ev.key, pfx)) {
+                matched = true;
+                break;
             }
-            if (!matched) continue;
-            // Replace any earlier pending_wake (the cell didn't get
-            // to consume it yet — newest wake wins). The handler's
-            // job is to re-read kv state holistically, so older
-            // wakes are redundant.
-            if (wakes.pending_wake) |*w| {
-                w.deinit(allocator);
-                wakes.pending_wake = null;
-            }
-            const key_dup = try allocator.dupe(u8, ev.key);
-            wakes.pending_wake = .{ .key = key_dup, .op = ev.op };
-            break;
         }
+        if (!matched) continue;
+
+        // `push` takes ownership of the duplicated key on success;
+        // on full-ring it drops the oldest (freeing its key) and
+        // bumps `lost_oldest`.
+        const ring_key = try allocator.dupe(u8, ev.key);
+        wakes.pending_wakes.push(allocator, .{
+            .tag = .kv,
+            .kv_key = ring_key,
+            .kv_op = ev.op,
+            .fired_at_ns = now_ns,
+        });
     }
 }
 
@@ -4173,13 +4158,15 @@ fn matchEventsToWakes(
 /// (re-enter `Dispatcher.runOutcome` with a synthesized `Request`),
 /// divergent in the outcome-application tail.
 ///
-/// Handler-cmds Phase 8 TEA-framing:
-///   - **Msg**:   `(timer-tick or kv-wake, entity in stream_data_out
-///                with non-empty StreamChain.module_path)`.
+/// Handler-cmds Phase 8 TEA-framing (Gap 2.2 reshape):
+///   - **Msg**:   `(wake_batch, entity in stream_data_out with
+///                non-empty StreamChain.module_path AND
+///                StreamWakes.pending_wakes.len > 0)`.
 ///   - **prep**:  read four stream components on the entity; resolve
-///                deployment; build request body = `{ctx}` with
-///                `.timer` or `.kv_wake` activation; for kv_wake, pop
-///                `StreamWakes.pending_wake` into `activation_kv_*`.
+///                deployment; drain `pending_wakes` ring into the
+///                Request's `activation_wakes` slice + `lost_oldest`
+///                snapshot; build request body = `{ctx}` with
+///                `.wake_batch` activation.
 ///   - **run**:   `dispatcher.runOutcome` (chain-tail txn).
 ///   - **apply (Cmd-list)**: switch on outcome:
 ///       • terminal → append body to StreamChunks + markStreamDraining
@@ -4255,23 +4242,27 @@ fn resumeStream(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
-    // kv_wake activation: pop the pending wake off the StreamWakes
-    // component (single outstanding match in v1; wake-accumulator
-    // §9.4 is later) and attach the key/op to the synthesized
-    // request.
-    var kv_wake_taken: ?components_mod.PendingKvWake = null;
-    defer if (kv_wake_taken) |*w| w.deinit(allocator);
-    var activation_kv_key: ?[]const u8 = null;
-    var activation_kv_op: u8 = 0;
-    if (activation == .kv_wake) {
-        if (wakes_st.pending_wake) |_| {
-            const w = wakes_st.pending_wake.?;
-            wakes_st.pending_wake = null;
-            kv_wake_taken = w;
-            activation_kv_key = kv_wake_taken.?.key;
-            activation_kv_op = kv_wake_taken.?.op;
-        }
+    // wake_batch activation: drain the StreamWakes ring into a
+    // temporal-order slice + `lost_oldest` snapshot; resumeStream
+    // owns the slice + each entry's `kv_key` for the dispatch's
+    // lifetime.
+    var batch_owned: []components_mod.WakeEntry = &.{};
+    var batch_lost_oldest: u32 = 0;
+    defer if (batch_owned.len > 0) {
+        for (batch_owned) |*w| w.deinit(allocator);
+        allocator.free(batch_owned);
+    };
+    if (activation == .wake_batch) {
+        const drained = wakes_st.pending_wakes.drainInto(allocator) catch
+            return error.ResumeWakeDrain;
+        batch_owned = drained.wakes;
+        batch_lost_oldest = drained.lost_oldest;
     }
+    // §9.4 write-pressure: snapshot + reset the chunk-queue drop
+    // counter so this activation sees the count of chunks dropped
+    // since the last activation (one-shot signal — handler decides
+    // whether to refetch / resync / throttle / terminate).
+    const dropped_chunks_snapshot = chunks_st.takeDropped();
     const request: Request = .{
         .method = "POST",
         .path = spath,
@@ -4289,8 +4280,9 @@ fn resumeStream(
         .instance_id = inst.id,
         .correlation_id = chain_ctx.correlation_id,
         .activation_source = activation,
-        .activation_kv_key = activation_kv_key,
-        .activation_kv_op = activation_kv_op,
+        .activation_wakes = batch_owned,
+        .activation_lost_oldest = batch_lost_oldest,
+        .activation_write_pressure_dropped = dropped_chunks_snapshot,
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
@@ -4348,10 +4340,7 @@ fn resumeStream(
                 txn_done = true;
                 if (r.body.len > 0) {
                     const owned = try allocator.dupe(u8, r.body);
-                    chunks_st.queue.append(allocator, owned) catch |e| {
-                        allocator.free(owned);
-                        return e;
-                    };
+                    try chunks_st.tryAppend(allocator, owned);
                 }
                 markStreamDraining(server, ent);
                 chain_st.activation_count += 1;
@@ -4372,10 +4361,7 @@ fn resumeStream(
             txn_done = true;
             if (r.body.len > 0) {
                 const owned = try allocator.dupe(u8, r.body);
-                chunks_st.queue.append(allocator, owned) catch |e| {
-                    allocator.free(owned);
-                    return e;
-                };
+                try chunks_st.tryAppend(allocator, owned);
             }
             markStreamDraining(server, ent);
             chain_st.activation_count += 1;
@@ -4424,9 +4410,11 @@ fn resumeStream(
             if (s2.headers) |h| allocator.free(h);
             s2.headers = null;
             // Transfer chunks into the StreamChunks component's
-            // queue. Each chunk pointer is still allocator-owned;
-            // ownership moves into `chunks_st.queue.items`.
-            for (s2.chunks) |c| try chunks_st.queue.append(allocator, c);
+            // queue via the §9.4 cap-aware enqueue. `tryAppend`
+            // takes ownership of each chunk pointer; cap-overflow
+            // frees the chunk + increments `dropped_chunks` (the
+            // next activation surfaces it via write_pressure).
+            for (s2.chunks) |c| try chunks_st.tryAppend(allocator, c);
             if (s2.chunks.len > 0) allocator.free(s2.chunks);
             s2.chunks = &.{};
             // Replace ctx + interval on the component. Old ctx_json
@@ -4541,6 +4529,17 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
+    // §9.4 write-pressure: snapshot + reset the chunk-queue drop
+    // counter so the disconnect activation sees what was lost.
+    // (No socket to flush to anymore, but the handler can still
+    // log / persist an "ended with N dropped frames" marker.)
+    // StreamChunks lives on the entity in `response_out` post-
+    // FIN-routing; `get` here is best-effort (a malformed entity
+    // would simply skip the snapshot).
+    const dropped_chunks_snapshot: u32 = blk: {
+        const sc = server.reg.get(ent, &server.response_out, components_mod.StreamChunks) catch break :blk 0;
+        break :blk sc.takeDropped();
+    };
     const request: Request = .{
         .method = "POST",
         .path = spath,
@@ -4558,6 +4557,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .instance_id = inst.id,
         .correlation_id = chain_ctx.correlation_id,
         .activation_source = .disconnect,
+        .activation_write_pressure_dropped = dropped_chunks_snapshot,
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(

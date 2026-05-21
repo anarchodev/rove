@@ -188,6 +188,7 @@ fn activationName(a: log_mod.ActivationSource) []const u8 {
         .timer => "timer",
         .disconnect => "disconnect",
         .kv_wake => "kv_wake",
+        .wake_batch => "wake_batch",
     };
 }
 
