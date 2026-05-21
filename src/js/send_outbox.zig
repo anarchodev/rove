@@ -34,14 +34,12 @@ const std = @import("std");
 /// insurance against a silent mis-decode of an in-flight `_send/owed/`
 /// row across a deploy.
 ///
-/// V1 → V2 (Gap 2.3 Phase B): the upstream-streaming options
-/// (`stream_response`, `pipe_to_held_response`, `headers_passthrough`,
-/// `max_response_chunk_bytes`, `max_total_response_bytes`) appended
-/// to the encode. `decode` accepts both: V1 rows decode with the
-/// v2 fields at their defaults (false / 0) so an in-flight pre-deploy
-/// row re-fires as a non-streaming send.
-pub const OWED_V: u8 = 2;
-pub const OWED_V1: u8 = 1; // accepted by decode for back-compat
+/// Stayed at V1: the upstream-streaming options briefly added in Gap
+/// 2.3 Phase B were reverted when the catalog reframed streaming as
+/// `http.fetch` (a new, non-durable primitive) rather than an
+/// http.send extension. Durable `_send/owed/` rows don't carry
+/// streaming flags — fetches aren't durable.
+pub const OWED_V: u8 = 1;
 pub const PROOF_V: u8 = 1;
 
 pub const OWED_PREFIX = "_send/owed/";
@@ -90,35 +88,6 @@ pub const OwedSend = struct {
     /// the lightweight durable schedule, §15.5).
     fire_at_ns: i64,
 
-    // ── Gap 2.3 Phase B: upstream-streaming options (V2) ─────
-    /// Per-chunk handler visibility: fires `send_chunk` activations
-    /// while bytes arrive, then `send_end` on close. Mutually
-    /// exclusive with `pipe_to_held_response` — the binding rejects
-    /// both at JS level.
-    stream_response: bool = false,
-    /// Transparent proxy: pipe upstream bytes directly to the
-    /// calling chain's held client (`StreamChunks` queue); no
-    /// per-chunk handler invocation. `send_pipe_done` fires once
-    /// upstream closes. Pipe target entity id is captured in
-    /// Phase E (added then via field append + V3 bump).
-    pipe_to_held_response: bool = false,
-    /// `pipe_to_held_response` only: mirror upstream response
-    /// headers as the held client's response headers. Ignored
-    /// when `pipe_to_held_response == false`.
-    headers_passthrough: bool = false,
-    /// Per-chunk libcurl writeback cap. The runtime splits larger
-    /// libcurl-side writebacks into chunks of this size before
-    /// invoking the activation / appending to StreamChunks. 0 ⇒
-    /// default (64 KB applied at fire site). Only meaningful when
-    /// `stream_response` or `pipe_to_held_response` is true.
-    max_response_chunk_bytes: u32 = 0,
-    /// Hard cap on cumulative response bytes from a streaming /
-    /// piped send. Exceeding cancels the send + fires the terminal
-    /// (`send_end` or `send_pipe_done`) with `ok = false`,
-    /// `reason = "max_total_response_bytes"`. 0 ⇒ default (50 MB
-    /// applied at fire site).
-    max_total_response_bytes: u64 = 0,
-
     /// Owned slices freed; only valid for the result of `decode`
     /// (which dupes). An `OwedSend` built from borrowed slices for
     /// `encode` must NOT be deinit'd.
@@ -146,21 +115,12 @@ pub const OwedSend = struct {
         try putU32(a, &out, self.timeout_ms);
         try putU32(a, &out, self.max_body_bytes);
         try putI64(a, &out, self.fire_at_ns);
-        // V2 (Gap 2.3 Phase B) — appended after the V1 layout so
-        // a V1 cursor reads exactly the same bytes; V2 decode
-        // continues past where V1 stops.
-        try out.append(a, @intFromBool(self.stream_response));
-        try out.append(a, @intFromBool(self.pipe_to_held_response));
-        try out.append(a, @intFromBool(self.headers_passthrough));
-        try putU32(a, &out, self.max_response_chunk_bytes);
-        try putU64(a, &out, self.max_total_response_bytes);
         return out.toOwnedSlice(a);
     }
 
     pub fn decode(a: std.mem.Allocator, bytes: []const u8) DecodeError!OwedSend {
         var c = Cursor{ .b = bytes };
-        const v = try c.u8_();
-        if (v != OWED_V and v != OWED_V1) return error.BadVersion;
+        if (try c.u8_() != OWED_V) return error.BadVersion;
         var r: OwedSend = undefined;
         // Dup each field; on any later failure free what we took.
         const url = try c.bytesDup(a);
@@ -192,16 +152,6 @@ pub const OwedSend = struct {
             .max_body_bytes = try c.u32_(),
             .fire_at_ns = try c.i64_(),
         };
-        // V2 tail: streaming options. V1 rows leave them at the
-        // struct defaults (all false / 0), which means "non-
-        // streaming send" — exactly the pre-Phase-B semantics.
-        if (v == OWED_V) {
-            r.stream_response = (try c.u8_()) != 0;
-            r.pipe_to_held_response = (try c.u8_()) != 0;
-            r.headers_passthrough = (try c.u8_()) != 0;
-            r.max_response_chunk_bytes = try c.u32_();
-            r.max_total_response_bytes = try c.u64_();
-        }
         return r;
     }
 };
@@ -356,80 +306,6 @@ test "OwedSend carries a future fire_at_ns (the durable timer case)" {
     try testing.expectEqual(src.fire_at_ns, got.fire_at_ns);
 }
 
-test "OwedSend V2 streaming fields round-trip" {
-    const a = testing.allocator;
-    const src = OwedSend{
-        .url = "https://x/stream", .method = "GET", .headers_json = "{}",
-        .body = "", .context_json = "null", .on_result_module = "m",
-        .on_result_fn = "", .on_result_args_json = "[]",
-        .timeout_ms = 30_000, .max_body_bytes = 1024,
-        .fire_at_ns = 0,
-        .stream_response = true,
-        .pipe_to_held_response = false,
-        .headers_passthrough = false,
-        .max_response_chunk_bytes = 64 * 1024,
-        .max_total_response_bytes = 100 * 1024 * 1024,
-    };
-    const enc = try src.encode(a);
-    defer a.free(enc);
-    var got = try OwedSend.decode(a, enc);
-    defer got.deinitOwned(a);
-    try testing.expectEqual(true, got.stream_response);
-    try testing.expectEqual(false, got.pipe_to_held_response);
-    try testing.expectEqual(false, got.headers_passthrough);
-    try testing.expectEqual(@as(u32, 64 * 1024), got.max_response_chunk_bytes);
-    try testing.expectEqual(@as(u64, 100 * 1024 * 1024), got.max_total_response_bytes);
-}
-
-test "OwedSend V2 pipe_to + headers_passthrough round-trips" {
-    const a = testing.allocator;
-    const src = OwedSend{
-        .url = "https://x/big.mp4", .method = "GET", .headers_json = "{}",
-        .body = "", .context_json = "null", .on_result_module = "",
-        .on_result_fn = "", .on_result_args_json = "[]",
-        .timeout_ms = 30_000, .max_body_bytes = 1,
-        .fire_at_ns = 0,
-        .stream_response = false,
-        .pipe_to_held_response = true,
-        .headers_passthrough = true,
-        .max_response_chunk_bytes = 0,
-        .max_total_response_bytes = std.math.maxInt(u64),
-    };
-    const enc = try src.encode(a);
-    defer a.free(enc);
-    var got = try OwedSend.decode(a, enc);
-    defer got.deinitOwned(a);
-    try testing.expectEqual(true, got.pipe_to_held_response);
-    try testing.expectEqual(true, got.headers_passthrough);
-    try testing.expectEqual(std.math.maxInt(u64), got.max_total_response_bytes);
-}
-
-test "OwedSend V1 back-compat: decode legacy row, V2 fields default" {
-    const a = testing.allocator;
-    // Build a V1 byte stream by hand — same layout as V1's encode.
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(a);
-    try out.append(a, OWED_V1);
-    inline for (.{
-        "https://x/", "GET", "{}", "", "null", "m", "", "[]",
-    }) |f| try putBytes(a, &out, f);
-    try putU32(a, &out, 30_000); // timeout_ms
-    try putU32(a, &out, 1024); // max_body_bytes
-    try putI64(a, &out, 0); // fire_at_ns
-    // No V2 tail — legacy row stops here.
-
-    var got = try OwedSend.decode(a, out.items);
-    defer got.deinitOwned(a);
-    try testing.expectEqualStrings("https://x/", got.url);
-    try testing.expectEqual(@as(u32, 30_000), got.timeout_ms);
-    // V2 fields fall back to struct defaults — pre-streaming
-    // semantics ("just a regular send").
-    try testing.expectEqual(false, got.stream_response);
-    try testing.expectEqual(false, got.pipe_to_held_response);
-    try testing.expectEqual(false, got.headers_passthrough);
-    try testing.expectEqual(@as(u32, 0), got.max_response_chunk_bytes);
-    try testing.expectEqual(@as(u64, 0), got.max_total_response_bytes);
-}
 
 test "Proof round-trips (ok and failure shapes)" {
     const a = testing.allocator;

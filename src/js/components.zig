@@ -223,13 +223,13 @@ pub const StreamWakes = struct {
 /// Phase A defines the shape; Phase B carries the data through
 /// `_send/owed/<id>` v2; Phase C runs the libcurl writeback; Phase
 /// D wires the dispatch.
-pub const UpstreamSendEvent = struct {
+pub const UpstreamFetchEvent = struct {
     kind: Kind = .chunk,
 
     /// The originating `http.send`-returned id, allocator-owned
     /// when non-empty. Shared across all three variants so the
     /// handler can correlate chunks with its terminal.
-    send_id: []u8 = &.{},
+    fetch_id: []u8 = &.{},
 
     /// Chain ctx threaded forward from the originating `http.send`
     /// (the `on_result_args_json` blob). Allocator-owned JSON.
@@ -252,7 +252,7 @@ pub const UpstreamSendEvent = struct {
     /// headers in wire-format (`Key: Val\r\n` lines).
     /// Allocator-owned when non-null. Null on later chunks so the
     /// same header map isn't re-shipped per chunk.
-    send_headers: ?[]u8 = null,
+    fetch_headers: ?[]u8 = null,
 
     // ── send_end / send_pipe_done variant ────────────────────
     /// Terminal-only: final upstream status code.
@@ -272,12 +272,12 @@ pub const UpstreamSendEvent = struct {
 
     pub const Kind = enum(u8) { chunk, end, pipe_done };
 
-    pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamSendEvent) void {
+    pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
         for (items) |*item| {
-            if (item.send_id.len > 0) allocator.free(item.send_id);
+            if (item.fetch_id.len > 0) allocator.free(item.fetch_id);
             if (item.ctx_json.len > 0) allocator.free(item.ctx_json);
             if (item.bytes.len > 0) allocator.free(item.bytes);
-            if (item.send_headers) |h| allocator.free(h);
+            if (item.fetch_headers) |h| allocator.free(h);
             item.* = .{};
         }
     }
@@ -767,54 +767,54 @@ test "SubscriptionFireDescriptor.deinit frees boot-variant" {
     try testing.expectEqual(@as(usize, 0), items[0].tenant_id.len);
 }
 
-test "UpstreamSendEvent default-init + deinit is benign" {
+test "UpstreamFetchEvent default-init + deinit is benign" {
     const a = testing.allocator;
-    var items = [_]UpstreamSendEvent{ .{}, .{} };
-    UpstreamSendEvent.deinit(a, &items);
-    try testing.expectEqual(@as(usize, 0), items[0].send_id.len);
+    var items = [_]UpstreamFetchEvent{ .{}, .{} };
+    UpstreamFetchEvent.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].fetch_id.len);
     try testing.expectEqual(@as(usize, 0), items[0].bytes.len);
 }
 
-test "UpstreamSendEvent.deinit frees chunk-variant slices" {
+test "UpstreamFetchEvent.deinit frees chunk-variant slices" {
     const a = testing.allocator;
-    var items = [_]UpstreamSendEvent{.{
+    var items = [_]UpstreamFetchEvent{.{
         .kind = .chunk,
-        .send_id = try a.dupe(u8, "send-abc-123"),
+        .fetch_id = try a.dupe(u8, "send-abc-123"),
         .ctx_json = try a.dupe(u8, "{\"n\":3}"),
         .seq = 5,
         .byte_offset = 4096,
         .bytes = try a.dupe(u8, "data: hello\n\n"),
-        .send_headers = try a.dupe(u8, "Content-Type: text/event-stream\r\n"),
+        .fetch_headers = try a.dupe(u8, "Content-Type: text/event-stream\r\n"),
     }};
-    UpstreamSendEvent.deinit(a, &items);
-    try testing.expectEqual(@as(usize, 0), items[0].send_id.len);
+    UpstreamFetchEvent.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].fetch_id.len);
     try testing.expectEqual(@as(usize, 0), items[0].bytes.len);
-    try testing.expectEqual(@as(?[]u8, null), items[0].send_headers);
+    try testing.expectEqual(@as(?[]u8, null), items[0].fetch_headers);
 }
 
-test "UpstreamSendEvent.deinit frees end-variant (no bytes/headers)" {
+test "UpstreamFetchEvent.deinit frees end-variant (no bytes/headers)" {
     const a = testing.allocator;
-    var items = [_]UpstreamSendEvent{.{
+    var items = [_]UpstreamFetchEvent{.{
         .kind = .end,
-        .send_id = try a.dupe(u8, "send-abc-123"),
+        .fetch_id = try a.dupe(u8, "send-abc-123"),
         .ctx_json = try a.dupe(u8, "{\"final\":true}"),
         .terminal_status = 200,
         .terminal_ok = true,
     }};
-    UpstreamSendEvent.deinit(a, &items);
-    try testing.expectEqual(@as(usize, 0), items[0].send_id.len);
+    UpstreamFetchEvent.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].fetch_id.len);
 }
 
-test "UpstreamSendEvent.deinit frees pipe_done-variant" {
+test "UpstreamFetchEvent.deinit frees pipe_done-variant" {
     const a = testing.allocator;
-    var items = [_]UpstreamSendEvent{.{
+    var items = [_]UpstreamFetchEvent{.{
         .kind = .pipe_done,
-        .send_id = try a.dupe(u8, "send-xyz-789"),
+        .fetch_id = try a.dupe(u8, "send-xyz-789"),
         .terminal_status = 200,
         .terminal_ok = true,
         .pipe_bytes_piped = 1_048_576,
         .pipe_dropped_chunks = 3,
     }};
-    UpstreamSendEvent.deinit(a, &items);
-    try testing.expectEqual(@as(usize, 0), items[0].send_id.len);
+    UpstreamFetchEvent.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].fetch_id.len);
 }
