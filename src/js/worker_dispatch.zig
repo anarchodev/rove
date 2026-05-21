@@ -2101,11 +2101,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 continue;
             };
             txn = new_txn;
-            // Batch-scoped LMDB read view: every point read in this
-            // batch reuses one parked MDB_RDONLY txn instead of
-            // begin/abort per `get`. Best effort; torn down by kvexp
-            // on the batch's commit/rollback in finalizeBatch.
-            new_txn.beginReadView();
+            // Batch-scoped LMDB read view is opened lazily by the
+            // first `kv.get` / `kv.prefix` in `KvStore`: pure-write
+            // batches never pay the read-txn begin. See
+            // `TrackedTxn.beginReadView`.
             anchor = scope_inst;
         }
 

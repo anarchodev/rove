@@ -461,6 +461,11 @@ pub const KvStore = struct {
         // savepoint chain, then chain backward, then main_overlay,
         // then LMDB.
         if (self.active_txn) |t| {
+            // Lazy batch-scoped read view: pay the LMDB read-txn
+            // begin once on this batch's first kv.get, amortizing
+            // across every subsequent read. Write-only batches
+            // never hit this and skip the cost entirely.
+            t.beginReadView();
             const leaf = t.activeLeaf();
             const v = leaf.get(self.allocator, key) catch |err| switch (err) {
                 error.OutOfMemory => return Error.OutOfMemory,
@@ -569,6 +574,8 @@ pub const KvStore = struct {
         }
 
         if (self.active_txn) |t| {
+            // Lazy batch-scoped read view (see KvStore.get).
+            t.beginReadView();
             const leaf = t.activeLeaf();
             var pc = leaf.scanPrefix(prefix_bytes) catch return Error.Sqlite;
             defer pc.deinit();
@@ -743,6 +750,13 @@ pub const KvStore = struct {
         /// Open savepoint chain — innermost last. Reads/writes go to
         /// `savepoints.getLastOrNull() orelse top`.
         savepoints: std.ArrayListUnmanaged(*kvexp.Txn) = .empty,
+        /// Set to true once `beginReadView` has opened the kvexp
+        /// batch-scoped read view on `top`. Lets the read sites in
+        /// `KvStore.get` / `KvStore.prefix` open the view lazily —
+        /// write-only batches never pay the LMDB read-txn begin.
+        /// Reset to false in `ensureOpen` so a re-opened TrackedTxn
+        /// starts clean.
+        read_view_opened: bool = false,
 
         pub fn open(self: *TrackedTxn) Error!void {
             return self.ensureOpen();
@@ -765,6 +779,7 @@ pub const KvStore = struct {
             };
             self.store.active_txn = self;
             self.opened = true;
+            self.read_view_opened = false;
         }
 
         /// Release the kvexp dispatch lease and clear the `active_txn`
@@ -826,14 +841,24 @@ pub const KvStore = struct {
 
         /// Open a batch-scoped LMDB read view: point reads then reuse
         /// one parked MDB_RDONLY txn instead of begin/abort per `get`
-        /// (the 31%-CPU `mdb_txn_begin` memset). Best effort — a
-        /// failure only forgoes the optimization (reads fall back to
-        /// one-shot read txns); it must never fail the batch. kvexp
-        /// tears the view down automatically on commit/rollback, so
-        /// there is no matching end call here.
+        /// (the 31%-CPU `mdb_txn_begin` memset). Idempotent — called
+        /// lazily from the first `KvStore.get` / `KvStore.prefix` in
+        /// a batch so write-only batches don't pay for an LMDB read
+        /// txn they'd never consult. Best effort: failure only
+        /// forgoes the optimization (reads fall back to one-shot read
+        /// txns); it must never fail the batch. kvexp tears the view
+        /// down automatically on commit/rollback.
         pub fn beginReadView(self: *TrackedTxn) void {
+            if (self.read_view_opened) return;
             const t = self.top orelse return;
-            t.beginReadView() catch {};
+            t.beginReadView() catch {
+                // Leave `read_view_opened` false: the next reader will
+                // retry. kvexp's only failure modes here are OOM /
+                // already-open (already-open is impossible because we
+                // gate on `read_view_opened`).
+                return;
+            };
+            self.read_view_opened = true;
         }
 
         /// True iff a read in this txn crossed a chain predecessor's
