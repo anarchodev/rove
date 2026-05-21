@@ -189,6 +189,7 @@ fn activationName(a: log_mod.ActivationSource) []const u8 {
         .disconnect => "disconnect",
         .kv_wake => "kv_wake",
         .wake_batch => "wake_batch",
+        .subscription_fire => "subscription_fire",
     };
 }
 
