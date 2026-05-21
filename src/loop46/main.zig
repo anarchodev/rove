@@ -460,12 +460,19 @@ fn workerMain(args: *WorkerCtx) !void {
         try reg.flush();
         try rjs.cleanupResponses(worker);
         try reg.flush();
+        // Gap 2.1 Phase F: throttled cron sweep (worker 0 +
+        // leader) — enqueues due cron fires into the inbox before
+        // serviceSubscriptionFires drains it on this same tick.
+        if (args.worker_idx == 0 and is_leader_now) {
+            rjs.sweepCronSubscriptions(worker);
+        }
+
         // Gap 2.1 Phase D: drain the cross-thread subscription-fire
-        // inbox (from deployment_loader for boot, future cron
-        // sweeper) + dispatch the collection. kv-react fires
-        // already dispatched inside drainRaftPending above; this
-        // call is the catch-all for inbox-driven sources +
-        // re-entrant fires that landed in deferred-create.
+        // inbox (from deployment_loader for boot, cron sweeper for
+        // cron) + dispatch the collection. kv-react fires already
+        // dispatched inside drainRaftPending above; this call is
+        // the catch-all for inbox-driven sources + re-entrant
+        // fires that landed in deferred-create.
         rjs.serviceSubscriptionFires(worker);
         try reg.flush();
 
