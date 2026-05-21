@@ -1,9 +1,16 @@
 # Subscriptions — chain origins without an inbound request
 
-**Status:** Planning. Implements `docs/primitive-gaps.md` §2.1 +
-the `streaming-handlers-plan.md` §5 unfinished design ("chain
-origins that are NOT inbound requests"). No code yet; tasks queued
-under the `gap-2-1-subscriptions` branch.
+**Status:** Phases A–C + E shipped 2026-05-20 on
+`gap-2-1-subscriptions` branch. Phase D (boot firing) stubbed —
+the deployment_loader thread doesn't have a worker context, and the
+clean loader→worker handoff is a separate sub-design. Phase F
+(cron firing) deferred — needs either a Zig duration parser +
+worker-tick sweep, or piggybacking on SendDispatch with an
+internal-target flavor; neither was scoped this session. Phase G
+covers boot/cron smokes when D + F land. Implements
+`docs/primitive-gaps.md` §2.1 + `streaming-handlers-plan.md`
+§5 unfinished design ("chain origins that are NOT inbound
+requests"). See §10 below for the per-phase status detail.
 
 ---
 
@@ -319,6 +326,31 @@ Three smokes (one per kind):
 Update `primitive-gaps.md` §2.1 status to DONE. Update
 `streaming-handlers-plan.md` §5 to reference the implementation
 venue. Memory pointer.
+
+---
+
+## 10. Phase status (2026-05-20)
+
+| Phase | What | Status |
+|---|---|---|
+| A | `SubscriptionEntry` + `Spec` tagged-union on TenantFilesSnapshot | **shipped** |
+| B | `discoverSubscriptions` deploy-time scan of `_subscriptions/<name>/{spec.json,index.mjs}` pairs | **shipped** |
+| C | `.subscription_fire` enum + Request fields + `fireSubscriptionActivation` + JS surface | **shipped** |
+| D | boot firing on snapshot swap | **stub** — loader thread has no worker context; needs handoff design |
+| E | kv-react firing via apply-time hook (`firePendingKvWakes` → deferred-drain queue) | **shipped** |
+| F | cron firing | **deferred** — Zig duration parser + worker-tick sweep, or SendDispatch ride |
+| G | smokes — boot ✗, kv ✓ (`streaming_subscription_kv_smoke.py`), cron ✗ | **partial (kv only)** |
+| H | docs + framing | **partial (this update)** |
+
+**Phase E load-bearing detail:** the kv-react fire site
+(`fireKvReactSubscriptions`, called from `firePendingKvWakes` in
+`drainRaftPending`) cannot fire directly because
+`fireSubscriptionActivation`'s recursive dispatch appends to
+`worker.pending_units` and invalidates the loop's
+pointer-into-items iteration. Fires queue onto
+`worker.pending_subscription_fires` and drain at the END of
+`drainRaftPending`. Caught by the first smoke run as a General
+Protection Exception in `unit.deinit`.
 
 ---
 
