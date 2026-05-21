@@ -320,7 +320,7 @@ Recommended order, smallest-design-debt first:
 | # | Gap | Effort | Customer pull | Blocks | Status |
 |---|---|---|---|---|---|
 | 1 | 2.2 backpressure | S | medium | clean §9.4 story | **DONE 2026-05-20** |
-| 2 | 2.1 chain origins | M | high | crons, inboxes, reconcilers | **partial 2026-05-20** — kv-react shipped; boot stubbed; cron deferred (see `docs/subscriptions-plan.md` §10) |
+| 2 | 2.1 chain origins | M | high | crons, inboxes, reconcilers | **partial 2026-05-20** — kv-react + boot shipped; cron deferred (see `docs/subscriptions-plan.md` §10) |
 | 3 | 2.3 streaming http.send response | L | high | LLM proxy, log tail | pending |
 | 4 | 2.4 streaming inbound body | L | medium | uploads, duplex | pending |
 | 5 | 2.5 held outbound subscription | XL | high (federation) | atproto, WS-origin | pending |

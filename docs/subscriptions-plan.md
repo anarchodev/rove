@@ -1,15 +1,15 @@
 # Subscriptions — chain origins without an inbound request
 
-**Status:** Phases A–C + E shipped 2026-05-20 on
-`gap-2-1-subscriptions` branch. Phase D (boot firing) stubbed —
-the deployment_loader thread doesn't have a worker context, and the
-clean loader→worker handoff is a separate sub-design. Phase F
-(cron firing) deferred — needs either a Zig duration parser +
-worker-tick sweep, or piggybacking on SendDispatch with an
-internal-target flavor; neither was scoped this session. Phase G
-covers boot/cron smokes when D + F land. Implements
-`docs/primitive-gaps.md` §2.1 + `streaming-handlers-plan.md`
-§5 unfinished design ("chain origins that are NOT inbound
+**Status:** Phases A–E shipped 2026-05-20 on
+`gap-2-1-subscriptions` branch. **kv-react + boot both fire
+end-to-end with smokes**; Phase E was also refactored to use a
+rove collection (`subscription_fire_pending`) as the in-worker
+state. Phase F (cron firing) deferred — needs either a Zig
+duration parser + worker-tick sweep, or piggybacking on
+SendDispatch with an internal-target flavor; not yet scoped.
+Phase G's cron smoke waits on F. Implements
+`docs/primitive-gaps.md` §2.1 + `streaming-handlers-plan.md` §5
+unfinished design ("chain origins that are NOT inbound
 requests"). See §10 below for the per-phase status detail.
 
 ---
@@ -336,21 +336,51 @@ venue. Memory pointer.
 | A | `SubscriptionEntry` + `Spec` tagged-union on TenantFilesSnapshot | **shipped** |
 | B | `discoverSubscriptions` deploy-time scan of `_subscriptions/<name>/{spec.json,index.mjs}` pairs | **shipped** |
 | C | `.subscription_fire` enum + Request fields + `fireSubscriptionActivation` + JS surface | **shipped** |
-| D | boot firing on snapshot swap | **stub** — loader thread has no worker context; needs handoff design |
-| E | kv-react firing via apply-time hook (`firePendingKvWakes` → deferred-drain queue) | **shipped** |
+| D | boot firing via NodeState inbox + leadership-gained sweep + writeset-injected marker | **shipped** |
+| E | kv-react firing via apply-time hook (rove collection + tick-end system) | **shipped (+ refactored to collection)** |
 | F | cron firing | **deferred** — Zig duration parser + worker-tick sweep, or SendDispatch ride |
-| G | smokes — boot ✗, kv ✓ (`streaming_subscription_kv_smoke.py`), cron ✗ | **partial (kv only)** |
+| G | smokes — boot ✓, kv ✓, cron ✗ | **partial (boot + kv shipped)** |
 | H | docs + framing | **partial (this update)** |
 
-**Phase E load-bearing detail:** the kv-react fire site
-(`fireKvReactSubscriptions`, called from `firePendingKvWakes` in
-`drainRaftPending`) cannot fire directly because
-`fireSubscriptionActivation`'s recursive dispatch appends to
-`worker.pending_units` and invalidates the loop's
-pointer-into-items iteration. Fires queue onto
-`worker.pending_subscription_fires` and drain at the END of
-`drainRaftPending`. Caught by the first smoke run as a General
-Protection Exception in `unit.deinit`.
+**Phase E load-bearing detail (and where the refactor came in):**
+the kv-react fire site (`fireKvReactSubscriptions`, called from
+`firePendingKvWakes` in `drainRaftPending`) cannot fire directly
+because `fireSubscriptionActivation`'s recursive dispatch appends
+to `worker.pending_units` and invalidates the loop's
+pointer-into-items iteration. The v1 fix queued fires onto a
+flat `worker.pending_subscription_fires` ArrayList drained at
+the end of `drainRaftPending`. The refactor lifted that into a
+proper rove collection (`subscription_fire_pending`) with
+`SubscriptionFireDescriptor` components — state-is-collection-
+membership (rove principle #1), structural deinit (principle #2),
+re-entrancy safety via `reg.destroy`'s deferred semantics, and
+queue depth observable as `collection.len`. Phase D then reused
+this same collection: cross-thread producers (deployment_loader,
+future cron sweeper) push to a NodeState-level inbox; workers
+drain on tick and `reg.create` entities in the collection;
+`dispatchSubscriptionFires` is the same system that processes
+both kv-react and inbox-sourced fires.
+
+**Phase D load-bearing detail:** the boot marker
+(`_boot_fired/<dep_id>`) is INJECTED into the handler's
+writeset BEFORE the handler runs, inside
+`fireSubscriptionActivation`. A separate post-fire marker write
+hits Conflict (kvexp txn snapshot isolation) or Sqlite errors
+(the handler's `TrackedTxn` is parked in `pending_units` with
+released lease but not yet committed). Atomic-with-effects is
+also cleaner: handler exception → marker still written → no
+infinite refire loop; customer redeploys to fix. Caught by the
+first smoke run as `error.Conflict`/`Sqlite` in the marker
+write path. Cold-start race (slots loaded before leader elected)
+covered by the `sweepBootSubscriptions` hook on the false→true
+leadership transition, gated to worker 0 to avoid duplicate
+enqueues.
+
+**JS surface fix for boot:** `request.activation.source.deployment_id`
+surfaces as `BigInt` (not `Number`) — deployment_id is a u64
+derived from sha256 that routinely exceeds 2^53. Caught by the
+first boot smoke run (precision loss rounded
+`3597548766156152628` to `3597548766156153000`).
 
 ---
 
