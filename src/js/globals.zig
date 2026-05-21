@@ -1739,7 +1739,11 @@ pub fn installRequest(
             }
         } else if (request.activation_subscription_boot_deployment_id > 0) {
             _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "boot", 4));
-            _ = c.JS_SetPropertyStr(ctx, source_obj, "deployment_id", c.JS_NewInt64(ctx, @intCast(request.activation_subscription_boot_deployment_id)));
+            // deployment_id is a u64 derived from sha256 — its value
+            // routinely exceeds 2^53 and loses precision when stored
+            // as a JS Number. Surface as BigInt so handlers can
+            // String()-convert without precision loss.
+            _ = c.JS_SetPropertyStr(ctx, source_obj, "deployment_id", c.JS_NewBigInt64(ctx, @bitCast(request.activation_subscription_boot_deployment_id)));
         } else if (request.activation_subscription_cron_fired_at_ns > 0) {
             _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "cron", 4));
             _ = c.JS_SetPropertyStr(ctx, source_obj, "firedAt", c.JS_NewInt64(ctx, request.activation_subscription_cron_fired_at_ns));

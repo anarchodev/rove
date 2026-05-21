@@ -94,6 +94,8 @@ pub const serviceParkedStreams = worker.serviceParkedStreams;
 pub const drainOnLeadershipLoss = worker.drainOnLeadershipLoss;
 pub const cleanupResponses = worker.cleanupResponses;
 pub const flushLogs = worker.flushLogs;
+pub const serviceSubscriptionFires = worker.serviceSubscriptionFires;
+pub const sweepBootSubscriptions = worker.sweepBootSubscriptions;
 
 test {
     _ = dispatcher;

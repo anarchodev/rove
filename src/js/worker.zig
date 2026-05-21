@@ -287,6 +287,84 @@ pub const KvWakeInbox = struct {
 /// shuts down cleanly. Configurable per-tenant lands in Phase 2c.
 pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
 
+/// One pending subscription fire crossing a thread boundary. The
+/// `deployment_loader` thread (boot) and any future cron sweeper
+/// thread push these into the per-worker `SubscriptionFireInbox`;
+/// the worker translates them into `subscription_fire_pending`
+/// collection entities on its tick (Gap 2.1 Phase D wiring).
+///
+/// All slices are allocator-owned; the inbox frees them on
+/// `drainInto` failure or `deinit`. On successful drain ownership
+/// transfers to the worker's `enqueueSubscriptionFire`, which
+/// dupes them onto the `SubscriptionFireDescriptor` component
+/// (modest double-dup, simpler ownership story).
+pub const PendingFireMessage = struct {
+    tenant_id: []u8,
+    subscription_name: []u8,
+    module_path: []u8,
+    source_kind: components_mod.SubscriptionFireDescriptor.SourceKind,
+    cron_fired_at_ns: i64 = 0,
+    /// Allocator-owned when `source_kind == .kv`; empty otherwise.
+    kv_key: []u8 = &.{},
+    kv_op: u8 = 0,
+    boot_deployment_id: u64 = 0,
+
+    pub fn deinit(self: *PendingFireMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
+        allocator.free(self.subscription_name);
+        allocator.free(self.module_path);
+        if (self.kv_key.len > 0) allocator.free(self.kv_key);
+        self.* = undefined;
+    }
+};
+
+/// Thread-safe per-worker inbox of pending subscription fires.
+/// Producer-side: non-worker threads (deployment_loader for boot;
+/// future cron sweeper) `push`. Consumer-side: the owning worker
+/// calls `drainInto` on its tick (single-threaded per worker;
+/// mutex held only across the drain copy).
+///
+/// Cross-thread ownership: `push` takes the message with already-
+/// duped slices (producer responsible for dup). On `drainInto`,
+/// the worker owns + frees each message via
+/// `PendingFireMessage.deinit`. No reference-counting; messages
+/// are move-only across the boundary.
+pub const SubscriptionFireInbox = struct {
+    mutex: std.Thread.Mutex = .{},
+    messages: std.ArrayListUnmanaged(PendingFireMessage) = .empty,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) SubscriptionFireInbox {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *SubscriptionFireInbox) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.messages.items) |*m| m.deinit(self.allocator);
+        self.messages.deinit(self.allocator);
+    }
+
+    /// Enqueue one fire message; ownership of all owned slices
+    /// transfers to the inbox.
+    pub fn push(self: *SubscriptionFireInbox, msg: PendingFireMessage) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.messages.append(self.allocator, msg);
+    }
+
+    /// Move all queued messages into the caller's local list.
+    /// Inbox is empty after the call. Caller takes ownership of
+    /// each message's slices (deinit on drop).
+    pub fn drainInto(self: *SubscriptionFireInbox, out: *std.ArrayListUnmanaged(PendingFireMessage)) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.messages.items.len == 0) return;
+        try out.appendSlice(self.allocator, self.messages.items);
+        self.messages.clearRetainingCapacity();
+    }
+};
+
 /// One cross-tenant target's accumulated writeset within a batch.
 /// `id` is an owned dup of the target instance id.
 const TargetWrite = struct {
@@ -793,6 +871,12 @@ pub const TenantSlot = struct {
     /// Optional/`null` only in unit-test slot literals — a slot with
     /// no raft handle just skips the config mirror.
     raft: ?*kv_mod.RaftNode = null,
+    /// Borrowed back-pointer to the owning NodeState. Set by
+    /// `openTenantSlotNode`. Used by the deployment loader for
+    /// cross-thread enqueues (Gap 2.1 Phase D boot firing →
+    /// `node.enqueueSubscriptionFireForTenant`). Optional only in
+    /// unit-test slot literals.
+    node: ?*NodeState = null,
     /// Owned blob backend for file-blobs (source + bytecode bytes).
     blob_backend: blob_mod.BlobBackend,
     /// Owned blob backend for per-deployment manifest JSON.
@@ -1088,6 +1172,19 @@ pub const NodeState = struct {
     wake_inboxes_mutex: std.Thread.Mutex = .{},
     wake_inboxes: std.ArrayListUnmanaged(*KvWakeInbox) = .empty,
 
+    /// Gap 2.1 Phase D: registry of per-worker subscription-fire
+    /// inboxes. Producers from non-worker threads
+    /// (`deployment_loader` for boot, future cron sweeper) call
+    /// `enqueueSubscriptionFireForTenant` which hash-routes to one
+    /// of the registered workers' inboxes by
+    /// `hash(tenant_id) % N_inboxes`. Same hash-by-tenant stickiness
+    /// the callback execution model uses
+    /// (`project_callback_execution_model`) so a tenant's
+    /// subscription fires always land on the same worker — that
+    /// worker's qjs module cache stays warm.
+    sub_fire_inboxes_mutex: std.Thread.Mutex = .{},
+    sub_fire_inboxes: std.ArrayListUnmanaged(*SubscriptionFireInbox) = .empty,
+
     pub fn init(
         allocator: std.mem.Allocator,
         tenant: *tenant_mod.Tenant,
@@ -1123,6 +1220,86 @@ pub const NodeState = struct {
                 return;
             }
         }
+    }
+
+    /// Gap 2.1 Phase D: register a worker's subscription-fire
+    /// inbox. Same lifecycle as `registerWakeInbox` — worker keeps
+    /// the inbox; this registry borrows the pointer for hash-routed
+    /// fire enqueues.
+    pub fn registerSubFireInbox(self: *NodeState, inbox: *SubscriptionFireInbox) !void {
+        self.sub_fire_inboxes_mutex.lock();
+        defer self.sub_fire_inboxes_mutex.unlock();
+        try self.sub_fire_inboxes.append(self.allocator, inbox);
+    }
+
+    pub fn unregisterSubFireInbox(self: *NodeState, inbox: *SubscriptionFireInbox) void {
+        self.sub_fire_inboxes_mutex.lock();
+        defer self.sub_fire_inboxes_mutex.unlock();
+        var i: usize = 0;
+        while (i < self.sub_fire_inboxes.items.len) : (i += 1) {
+            if (self.sub_fire_inboxes.items[i] == inbox) {
+                _ = self.sub_fire_inboxes.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Gap 2.1 Phase D: hash-route a subscription fire to the
+    /// worker whose inbox is `hash(tenant_id) % N_inboxes`.
+    /// Callable from any thread; producer (loader / sweeper)
+    /// owns the input slices borrowed; this fn dupes onto the
+    /// inbox-side `PendingFireMessage` before pushing.
+    /// Returns `error.NoWorkers` if no inbox is registered yet
+    /// (cold start before any worker spawned — call site logs
+    /// + skips; the deploy will be re-evaluated on the next
+    /// `_deploy/current` apply when workers exist).
+    pub fn enqueueSubscriptionFireForTenant(
+        self: *NodeState,
+        in: SubscriptionFireQueueInput,
+    ) !void {
+        self.sub_fire_inboxes_mutex.lock();
+        const n = self.sub_fire_inboxes.items.len;
+        if (n == 0) {
+            self.sub_fire_inboxes_mutex.unlock();
+            return error.NoWorkers;
+        }
+        const inbox_idx = std.hash.Wyhash.hash(0, in.tenant_id) % n;
+        const inbox = self.sub_fire_inboxes.items[inbox_idx];
+        self.sub_fire_inboxes_mutex.unlock();
+
+        // Build the owned message. Allocator is the node's; the
+        // worker's drain transfers ownership to the per-entity
+        // component on translation.
+        const allocator = self.allocator;
+        const tid = try allocator.dupe(u8, in.tenant_id);
+        errdefer allocator.free(tid);
+        const name = try allocator.dupe(u8, in.subscription_name);
+        errdefer allocator.free(name);
+        const path = try allocator.dupe(u8, in.module_path);
+        errdefer allocator.free(path);
+        var msg: PendingFireMessage = .{
+            .tenant_id = tid,
+            .subscription_name = name,
+            .module_path = path,
+            .source_kind = .cron,
+        };
+        switch (in.source) {
+            .cron => |c| {
+                msg.source_kind = .cron;
+                msg.cron_fired_at_ns = c.fired_at_ns;
+            },
+            .kv => |k| {
+                msg.source_kind = .kv;
+                msg.kv_key = try allocator.dupe(u8, k.key);
+                msg.kv_op = k.op;
+            },
+            .boot => |b| {
+                msg.source_kind = .boot;
+                msg.boot_deployment_id = b.deployment_id;
+            },
+        }
+        errdefer if (msg.kv_key.len > 0) allocator.free(msg.kv_key);
+        try inbox.push(msg);
     }
 
     /// Fan out one kv-write event to every registered worker
@@ -1638,6 +1815,15 @@ pub fn Worker(comptime opts: Options) type {
         /// the current iteration). Replaces the Phase E v1 flat
         /// ArrayList — see `docs/subscriptions-plan.md` §10.
         subscription_fire_pending: SubFireColl,
+        /// Gap 2.1 Phase D: cross-thread inbox of pending fires
+        /// from non-worker producers (`deployment_loader` for
+        /// boot; future cron sweeper). `drainSubFireInbox` (called
+        /// once per worker tick from `serviceSubscriptionFires`)
+        /// pops messages and translates them into entities in
+        /// `subscription_fire_pending`. Registered with NodeState
+        /// at startup so producers reach the right worker via
+        /// `enqueueSubscriptionFireForTenant` hash-routing.
+        sub_fire_inbox: SubscriptionFireInbox = undefined,
         /// Per-tick accumulator for admin-handler side effects
         /// (`platform.root.*` + cross-tenant trampolines). Folded
         /// into the batch's single raft entry by `finalizeBatch`
@@ -1792,6 +1978,7 @@ pub fn Worker(comptime opts: Options) type {
                 .raft_pending_stream = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .subscription_fire_pending = try SubFireColl.init(allocator),
+                .sub_fire_inbox = SubscriptionFireInbox.init(allocator),
                 .dispatcher = try Dispatcher.init(allocator),
                 .node = config.node,
                 .raft = config.raft,
@@ -1839,6 +2026,13 @@ pub fn Worker(comptime opts: Options) type {
             // (`self` is heap-allocated above).
             try config.node.registerWakeInbox(&self.wake_inbox);
             errdefer config.node.unregisterWakeInbox(&self.wake_inbox);
+
+            // Gap 2.1 Phase D: register the subscription-fire inbox
+            // with the node so non-worker producers
+            // (`deployment_loader` for boot, future cron sweeper)
+            // can hash-route fires to this worker.
+            try config.node.registerSubFireInbox(&self.sub_fire_inbox);
+            errdefer config.node.unregisterSubFireInbox(&self.sub_fire_inbox);
 
             // Eagerly open per-worker tenant_logs (request_id minters
             // bake the worker_id into the upper 16 bits; can't share).
@@ -1958,6 +2152,10 @@ pub fn Worker(comptime opts: Options) type {
             // be pushing into it while we walk + free the queue.
             self.node.unregisterWakeInbox(&self.wake_inbox);
             self.wake_inbox.deinit();
+            // Unregister BEFORE deinit so no producer (deployment_loader,
+            // cron sweeper) can push after we start freeing entries.
+            self.node.unregisterSubFireInbox(&self.sub_fire_inbox);
+            self.sub_fire_inbox.deinit();
             self.parked_continuations.deinit();
             self.subscription_fire_pending.deinit();
             self.raft_pending_response.deinit();
@@ -2269,6 +2467,7 @@ fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*Tena
         .instance_id = id_copy,
         .app_kv = inst.kv,
         .raft = node.raft,
+        .node = node,
         .blob_backend = blob_backend,
         .manifest_backend = manifest_backend,
         .prefetched_manifest = prefetched,
@@ -3120,23 +3319,94 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         .{ slot.instance_id, manifest.id, new_snap.bytecodes.count(), new_snap.statics.count(), new_snap.triggers.len, new_snap.subscriptions.len },
     );
 
-    // Gap 2.1 Phase D: fire boot subscriptions on snapshot swap.
-    // Deferred — the deployment_loader thread doesn't have a
-    // worker context (qjs runtime + dispatcher live per-worker),
-    // and the cleanest hook (a NodeState-level pending-fire inbox
-    // drained by worker 0) is a separate sub-design. Boot firing
-    // lands in a follow-up commit; for now the `.boot` Spec is
-    // discovered + recorded on the snapshot but doesn't fire. See
-    // `docs/subscriptions-plan.md` §8 Phase D.
-    var boot_count: u32 = 0;
-    for (new_snap.subscriptions) |s| {
-        if (s.spec == .boot) boot_count += 1;
+    // Gap 2.1 Phase D: enqueue boot subscriptions that haven't
+    // yet fired against THIS deployment_id. Leader-only — boot
+    // is "once per deployment activation across the cluster," not
+    // "once per node." Followers see the `_boot_fired/<dep_id>`
+    // marker via the leader's raft propose and skip on their own
+    // reload.
+    if (slot.raft) |raft| {
+        if (raft.isLeader()) {
+            enqueueBootSubscriptions(slot, new_snap) catch |err|
+                std.log.warn(
+                    "rove-js: tenant {s} boot enqueue: {s}",
+                    .{ slot.instance_id, @errorName(err) },
+                );
+        }
     }
-    if (boot_count > 0) {
-        std.log.warn(
-            "rove-js: tenant {s} has {d} boot subscription(s) — Phase D firing not yet wired",
-            .{ slot.instance_id, boot_count },
+}
+
+/// Gap 2.1 Phase D: on `false→true` leadership transition, walk
+/// every loaded tenant slot and (re-)enqueue any boot
+/// subscriptions whose marker is absent. Covers the cold-start
+/// race where slots loaded BEFORE raft elected a leader, so
+/// `reloadDeployment`'s leader-gated enqueue saw `isLeader() ==
+/// false` and skipped. Gated to worker 0 to avoid duplicate
+/// enqueues across the leader's local workers.
+pub fn sweepBootSubscriptions(worker: anytype) void {
+    var it = worker.node.tenant_files_map.iterator();
+    while (it.next()) |entry| {
+        const slot = entry.value_ptr.*;
+        const snap = slot.pinCurrent() orelse continue;
+        defer snap.release();
+        enqueueBootSubscriptions(slot, snap) catch |err| std.log.warn(
+            "rove-js boot sweep ({s}): {s}",
+            .{ slot.instance_id, @errorName(err) },
         );
+    }
+}
+
+/// Gap 2.1 Phase D: leader-side scan of new snapshot's `.boot`
+/// subscriptions; enqueue each one that hasn't fired yet (no
+/// `_boot_fired/<dep_id>` marker in tenant kv). The actual firing
+/// runs on a worker that drains the cross-thread inbox; that
+/// worker writes the marker post-fire via `writeBootFiredMarker`.
+///
+/// Idempotency contract: marker is written AFTER the activation;
+/// a crash between fire + marker leaves "fired-but-not-marked"
+/// state and the next reload refires. Customers' boot handlers
+/// must be idempotent (treat double-fire as benign).
+fn enqueueBootSubscriptions(slot: *TenantSlot, snap: *TenantFilesSnapshot) !void {
+    const node = slot.node orelse return; // unit-test slot: no node, no enqueue
+    for (snap.subscriptions) |sub| {
+        if (sub.spec != .boot) continue;
+
+        var key_buf: [64]u8 = undefined;
+        const marker_key = try std.fmt.bufPrint(&key_buf, "_boot_fired/{d}", .{snap.deployment_id});
+        const existing = slot.app_kv.get(marker_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => {
+                std.log.warn(
+                    "rove-js boot ({s}/{s}): marker check failed: {s}",
+                    .{ slot.instance_id, sub.name, @errorName(err) },
+                );
+                continue;
+            },
+        };
+        if (existing) |e| {
+            slot.allocator.free(e);
+            continue; // already fired for this deployment
+        }
+
+        std.log.info(
+            "rove-js boot enqueue: tenant={s} subscription={s} deployment={d}",
+            .{ slot.instance_id, sub.name, snap.deployment_id },
+        );
+
+        // Push to the node-wide inbox; hash-routed to one of the
+        // local workers. The worker's tick translates the message
+        // into a `subscription_fire_pending` entity and fires it.
+        node.enqueueSubscriptionFireForTenant(.{
+            .tenant_id = slot.instance_id,
+            .subscription_name = sub.name,
+            .module_path = sub.module_path,
+            .source = .{ .boot = .{ .deployment_id = snap.deployment_id } },
+        }) catch |err| {
+            std.log.warn(
+                "rove-js boot enqueue ({s}/{s}): {s}",
+                .{ slot.instance_id, sub.name, @errorName(err) },
+            );
+        };
     }
 }
 
@@ -5069,6 +5339,32 @@ pub fn fireSubscriptionActivation(
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
 
+    // Gap 2.1 Phase D: inject the `_boot_fired/<dep_id>` marker
+    // into the handler's writeset BEFORE the handler runs. The
+    // marker commits atomically with the handler's effects through
+    // raft, so any subsequent reload (cold start, leader change)
+    // sees the marker and skips the re-fire. Writing the marker
+    // BEFORE the handler also covers the "handler throws" case —
+    // we don't loop on a failing boot; customer redeploys to fix.
+    if (source == .boot) {
+        var key_buf: [64]u8 = undefined;
+        const marker_key = std.fmt.bufPrint(&key_buf, "_boot_fired/{d}", .{source.boot.deployment_id}) catch unreachable;
+        txn.put(marker_key, "fired") catch |err| {
+            std.log.warn(
+                "rove-js boot marker txn.put ({s}/{d}): {s}",
+                .{ tenant_id, source.boot.deployment_id, @errorName(err) },
+            );
+            return;
+        };
+        ws.addPut(marker_key, "fired") catch |err| {
+            std.log.warn(
+                "rove-js boot marker ws.addPut ({s}/{d}): {s}",
+                .{ tenant_id, source.boot.deployment_id, @errorName(err) },
+            );
+            return;
+        };
+    }
+
     // Mint a fresh correlation_id for this chain origin. Format:
     // `sub-{name-prefix}-{request_id-hex}` — name-scoped + unique
     // enough to dedup in the replay UX. Truncated to keep length
@@ -5445,6 +5741,62 @@ pub fn enqueueSubscriptionFire(
     try reg.set(ent, pending, components_mod.SubscriptionFireDescriptor, desc);
 }
 
+/// Gap 2.1 Phase D: drain the worker's cross-thread
+/// `sub_fire_inbox`, translating each `PendingFireMessage` into
+/// an entity in `subscription_fire_pending`. Called once per
+/// worker tick (from `serviceSubscriptionFires`); cheap when the
+/// inbox is empty (one mutex try + length check).
+///
+/// Ownership: messages popped from the inbox carry owned slices.
+/// `enqueueSubscriptionFire` dupes onto the component, so the
+/// caller frees each message via `PendingFireMessage.deinit`
+/// after translation. Double-dup is the cost of decoupling
+/// cross-thread storage from collection-side storage; the dup is
+/// O(few hundred bytes) per fire and irrelevant in the boot/cron
+/// fire-rate regime.
+fn drainSubFireInbox(worker: anytype) void {
+    const allocator = worker.allocator;
+    var local: std.ArrayListUnmanaged(PendingFireMessage) = .empty;
+    defer {
+        for (local.items) |*m| m.deinit(allocator);
+        local.deinit(allocator);
+    }
+    worker.sub_fire_inbox.drainInto(&local) catch |err| {
+        std.log.warn("rove-js sub-fire drain: {s}", .{@errorName(err)});
+        return;
+    };
+    if (local.items.len == 0) return;
+    const server = worker.h2;
+    for (local.items) |*msg| {
+        const source: SubscriptionFireSource = switch (msg.source_kind) {
+            .cron => .{ .cron = .{ .fired_at_ns = msg.cron_fired_at_ns } },
+            .kv => .{ .kv = .{ .key = msg.kv_key, .op = msg.kv_op } },
+            .boot => .{ .boot = .{ .deployment_id = msg.boot_deployment_id } },
+        };
+        enqueueSubscriptionFire(server.reg, &worker.subscription_fire_pending, allocator, .{
+            .tenant_id = msg.tenant_id,
+            .subscription_name = msg.subscription_name,
+            .module_path = msg.module_path,
+            .source = source,
+        }) catch |err| std.log.warn(
+            "rove-js sub-fire drain enqueue (tenant={s}, sub={s}): {s}",
+            .{ msg.tenant_id, msg.subscription_name, @errorName(err) },
+        );
+    }
+}
+
+/// Worker-tick combined pass: translate cross-thread inbox
+/// messages into collection entities, then dispatch the
+/// collection. Called from the workerMain loop on every tick;
+/// covers both worker-thread producers (kv-react, which writes
+/// to the collection directly) and non-worker-thread producers
+/// (boot via deployment_loader, cron via sweeper) routed through
+/// the inbox.
+pub fn serviceSubscriptionFires(worker: anytype) void {
+    drainSubFireInbox(worker);
+    dispatchSubscriptionFires(worker);
+}
+
 /// Worker-tick system: dispatch every entity in
 /// `subscription_fire_pending`. Iterates a stable entity-id snapshot
 /// (copied into a local buffer) so re-entrant `enqueueSubscriptionFire`
@@ -5483,6 +5835,11 @@ pub fn dispatchSubscriptionFires(worker: anytype) void {
             desc.module_path,
             source,
         );
+        // For boot fires, the `_boot_fired/<dep_id>` marker is
+        // injected into the handler's writeset INSIDE
+        // `fireSubscriptionActivation` (Gap 2.1 Phase D) so it
+        // commits atomically with the handler's effects — no
+        // separate post-fire write needed.
         server.reg.destroy(ent) catch |err| std.log.warn(
             "rove-js subscription-fire: destroy failed: {s}",
             .{@errorName(err)},

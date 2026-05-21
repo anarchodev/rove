@@ -435,6 +435,15 @@ fn workerMain(args: *WorkerCtx) !void {
             try rjs.drainOnLeadershipLoss(worker);
             try reg.flush();
         }
+        // Gap 2.1 Phase D: on the `false→true` leadership transition,
+        // sweep all loaded tenant slots for unfired boot subscriptions.
+        // Covers the cold-start race (slots loaded before raft elected
+        // a leader → reloadDeployment's leader gate saw `false` and
+        // skipped enqueue). Worker 0 only to avoid duplicate enqueues
+        // across the leader's local workers.
+        if (args.worker_idx == 0 and !worker.was_leader and is_leader_now) {
+            rjs.sweepBootSubscriptions(worker);
+        }
         worker.was_leader = is_leader_now;
 
         blocked_tenants.clear();
@@ -450,6 +459,14 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.serviceParkedStreams(worker);
         try reg.flush();
         try rjs.cleanupResponses(worker);
+        try reg.flush();
+        // Gap 2.1 Phase D: drain the cross-thread subscription-fire
+        // inbox (from deployment_loader for boot, future cron
+        // sweeper) + dispatch the collection. kv-react fires
+        // already dispatched inside drainRaftPending above; this
+        // call is the catch-all for inbox-driven sources +
+        // re-entrant fires that landed in deferred-create.
+        rjs.serviceSubscriptionFires(worker);
         try reg.flush();
 
         // Schedule callback dispatch: on the raft leader, worker 0
