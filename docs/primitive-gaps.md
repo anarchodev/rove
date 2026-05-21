@@ -402,7 +402,63 @@ Every additive proposal preserves:
 - The **strike posture** (resource-bound, deadline-bound,
   fail-fast on abuse — `connection_holder_security` /
   `streaming-handlers-plan.md` §9.2).
+- The **bounded tape per chain** discipline (see §6 below).
 
 Any future proposal that violates one of these is by definition not
 in this list; it's a §7/§10.1-style locked decision that has to be
 relitigated explicitly.
+
+---
+
+## 6. Bounded tape per chain
+
+Replay determinism is a property of inputs being *recorded*, not of
+inputs being recordable *forever*. Some primitives produce
+unbounded per-chain tape (a streaming upstream fetch's per-chunk
+activations; a held outbound subscription's perpetual frames; a
+runaway handler in a long-lived chain). Without a bound, those
+classes either drown the replay store in cost or force special-
+case "this primitive is non-replayable" carve-outs that erode the
+"deterministic where it can be" stance.
+
+The bound: **per-chain tape budget** (bytes + entry count), shared
+across all activations of one `correlation_id`. Default
+~10 MB / ~50k entries; operator-tunable per tenant. Implementation
+on `NodeState` (cross-worker map keyed by correlation_id; mutex-
+protected) with LRU GC of stale chain entries.
+
+**When the cap fires:**
+- A one-shot `tape_cap_reached` marker on the activation that hit
+  it (records seq + cause).
+- Subsequent activations of the same chain flush log records
+  *without* tape payloads (the log record itself still records:
+  request metadata, status, console, exceptions — just no
+  reproducible-inputs).
+- Replay shell shows the chain as **fully replayable up to seq
+  N**, **summary-only after**. Per-activation handlers past the
+  cap don't re-run during replay — the shell marks them
+  "execution past cap — input unavailable" with a path for the
+  customer to re-fetch from blob (if bytes were content-
+  addressed) or supply a synthetic stub.
+
+**What this unblocks:**
+- Streaming primitives (Gap 2.3, 2.5) stop being special-cased.
+  LLM proxy chains stay under the cap (~30 KB tape per
+  ~3000-chunk fetch); firehose consumers hit the cap quickly and
+  degrade gracefully. Both replay-strategies converge on "same
+  cap, same overflow marker, same summary fallback."
+- The `connection-actor-plan.md` §8 content-addressed-large-bytes
+  pattern remains: chunk bytes go to blob; tape carries the hash.
+  The cap counts hash-bytes (~50 each), not chunk bodies, so blob
+  cost is separate from tape cost — each scales independently.
+
+**Capture mode (deferred to v2).** When concrete storage-cost
+feedback arrives, the catalog grows a per-tenant `tape_mode` knob
+(`always` | `on_exception` | `sampled` | `never`) that decides
+*whether* to persist the scratch tape post-activation, not *how
+much* to record. The cap addresses runaway recording (correctness/
+safety); capture mode addresses long-term storage cost
+(observability/coverage tradeoff). They compose orthogonally —
+cap operates during the activation; capture mode operates at
+activation boundary. v1 ships the cap; v2 adds capture mode when
+the storage bill earns the optionality.
