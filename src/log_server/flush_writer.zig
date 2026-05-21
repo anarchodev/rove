@@ -190,6 +190,9 @@ fn activationName(a: log_mod.ActivationSource) []const u8 {
         .kv_wake => "kv_wake",
         .wake_batch => "wake_batch",
         .subscription_fire => "subscription_fire",
+        .send_chunk => "send_chunk",
+        .send_end => "send_end",
+        .send_pipe_done => "send_pipe_done",
     };
 }
 

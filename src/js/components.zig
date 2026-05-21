@@ -207,6 +207,82 @@ pub const StreamWakes = struct {
     }
 };
 
+/// Gap 2.3 Phase A: a pending upstream-send activation awaiting
+/// handler dispatch on the local worker. Covers all three send-
+/// streaming activation variants (send_chunk, send_end,
+/// send_pipe_done) — discriminated by the `kind` tag. Entities
+/// live in the worker's `send_event_pending` collection (added in
+/// Phase D); the `dispatchSendEvents` system (Phase D/E) reads
+/// the tag + fires the right activation.
+///
+/// The component shape mirrors `WakeEntry` / `SubscriptionFireDescriptor`
+/// — tag enum + flat fields per variant — to keep SoA storage
+/// cheap. Owned slices freed structurally on entity destroy via
+/// rove's component-deinit.
+///
+/// Phase A defines the shape; Phase B carries the data through
+/// `_send/owed/<id>` v2; Phase C runs the libcurl writeback; Phase
+/// D wires the dispatch.
+pub const UpstreamSendEvent = struct {
+    kind: Kind = .chunk,
+
+    /// The originating `http.send`-returned id, allocator-owned
+    /// when non-empty. Shared across all three variants so the
+    /// handler can correlate chunks with its terminal.
+    send_id: []u8 = &.{},
+
+    /// Chain ctx threaded forward from the originating `http.send`
+    /// (the `on_result_args_json` blob). Allocator-owned JSON.
+    /// Empty by default; the handler reads it as `request.ctx`
+    /// just like a `send_callback`.
+    ctx_json: []u8 = &.{},
+
+    // ── send_chunk variant ────────────────────────────────────
+    /// Per-send monotonic chunk index, 0-based. Surfaces as
+    /// `request.activation.seq`.
+    seq: u32 = 0,
+    /// Cumulative bytes received BEFORE this chunk. Surfaces as
+    /// `request.activation.byte_offset`.
+    byte_offset: u64 = 0,
+    /// The chunk payload. Allocator-owned; surfaces as
+    /// `request.activation.bytes` (Uint8Array view, runtime owns
+    /// the buffer; handler must copy if retaining).
+    bytes: []u8 = &.{},
+    /// On `kind == .chunk` AND `seq == 0` only: upstream response
+    /// headers in wire-format (`Key: Val\r\n` lines).
+    /// Allocator-owned when non-null. Null on later chunks so the
+    /// same header map isn't re-shipped per chunk.
+    send_headers: ?[]u8 = null,
+
+    // ── send_end / send_pipe_done variant ────────────────────
+    /// Terminal-only: final upstream status code.
+    terminal_status: u16 = 0,
+    /// Terminal-only: success flag (false on timeout / cancel /
+    /// upstream error).
+    terminal_ok: bool = false,
+    /// `send_pipe_done` only: total bytes actually written to the
+    /// held client (after `StreamChunks` cap drops). Surfaces as
+    /// `request.activation.bytes_piped`.
+    pipe_bytes_piped: u64 = 0,
+    /// `send_pipe_done` only: count of chunks dropped from the
+    /// held client's `StreamChunks` queue. Surfaces as
+    /// `request.activation.dropped_chunks`. Mirrors the §9.4
+    /// write-pressure surface but scoped to the pipe.
+    pipe_dropped_chunks: u32 = 0,
+
+    pub const Kind = enum(u8) { chunk, end, pipe_done };
+
+    pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamSendEvent) void {
+        for (items) |*item| {
+            if (item.send_id.len > 0) allocator.free(item.send_id);
+            if (item.ctx_json.len > 0) allocator.free(item.ctx_json);
+            if (item.bytes.len > 0) allocator.free(item.bytes);
+            if (item.send_headers) |h| allocator.free(h);
+            item.* = .{};
+        }
+    }
+};
+
 /// Gap 2.1 Phase E (refactored): a pending subscription-fire chain
 /// origin awaiting dispatch on the local worker. Entities live in
 /// `Worker.subscription_fire_pending`; the
@@ -689,4 +765,56 @@ test "SubscriptionFireDescriptor.deinit frees boot-variant" {
     }};
     SubscriptionFireDescriptor.deinit(a, &items);
     try testing.expectEqual(@as(usize, 0), items[0].tenant_id.len);
+}
+
+test "UpstreamSendEvent default-init + deinit is benign" {
+    const a = testing.allocator;
+    var items = [_]UpstreamSendEvent{ .{}, .{} };
+    UpstreamSendEvent.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].send_id.len);
+    try testing.expectEqual(@as(usize, 0), items[0].bytes.len);
+}
+
+test "UpstreamSendEvent.deinit frees chunk-variant slices" {
+    const a = testing.allocator;
+    var items = [_]UpstreamSendEvent{.{
+        .kind = .chunk,
+        .send_id = try a.dupe(u8, "send-abc-123"),
+        .ctx_json = try a.dupe(u8, "{\"n\":3}"),
+        .seq = 5,
+        .byte_offset = 4096,
+        .bytes = try a.dupe(u8, "data: hello\n\n"),
+        .send_headers = try a.dupe(u8, "Content-Type: text/event-stream\r\n"),
+    }};
+    UpstreamSendEvent.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].send_id.len);
+    try testing.expectEqual(@as(usize, 0), items[0].bytes.len);
+    try testing.expectEqual(@as(?[]u8, null), items[0].send_headers);
+}
+
+test "UpstreamSendEvent.deinit frees end-variant (no bytes/headers)" {
+    const a = testing.allocator;
+    var items = [_]UpstreamSendEvent{.{
+        .kind = .end,
+        .send_id = try a.dupe(u8, "send-abc-123"),
+        .ctx_json = try a.dupe(u8, "{\"final\":true}"),
+        .terminal_status = 200,
+        .terminal_ok = true,
+    }};
+    UpstreamSendEvent.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].send_id.len);
+}
+
+test "UpstreamSendEvent.deinit frees pipe_done-variant" {
+    const a = testing.allocator;
+    var items = [_]UpstreamSendEvent{.{
+        .kind = .pipe_done,
+        .send_id = try a.dupe(u8, "send-xyz-789"),
+        .terminal_status = 200,
+        .terminal_ok = true,
+        .pipe_bytes_piped = 1_048_576,
+        .pipe_dropped_chunks = 3,
+    }};
+    UpstreamSendEvent.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].send_id.len);
 }
