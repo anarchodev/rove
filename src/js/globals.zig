@@ -56,6 +56,58 @@ pub const TriggerEntry = struct {
     module_path: []u8,
 };
 
+/// One row in a tenant's subscription registry — chain origins that
+/// fire WITHOUT an inbound HTTP request. Built at deploy-load time
+/// from `_subscriptions/<name>/spec.json` + `_subscriptions/<name>
+/// /index.mjs` pairs. Implements `docs/primitive-gaps.md` §2.1 +
+/// `streaming-handlers-plan.md` §5.
+///
+/// Three kinds (see `Spec` below): cron (recurring), kv (apply-time
+/// fan-out from a watched tenant prefix), boot (once per deployment
+/// activation). The handler is a normal TEA `update`; the
+/// difference is the activation source (`subscription_fire`) and
+/// the absence of a held socket — `Response`/`__rove_next`/
+/// `__rove_stream` returns are recorded on the tape but bytes
+/// don't flush anywhere.
+pub const SubscriptionEntry = struct {
+    /// Human-readable name (from the directory under
+    /// `_subscriptions/`). Surfaces as `request.activation.name`
+    /// so handlers can self-identify and customers can debug.
+    /// Allocator-owned.
+    name: []u8,
+    /// Bytecode lookup key into the deployment's bytecode map +
+    /// identity in error messages. Always
+    /// `"_subscriptions/<name>/index.mjs"` (or `.js`).
+    module_path: []u8,
+    /// What triggers this subscription's chain origin.
+    spec: Spec,
+
+    pub const Spec = union(enum) {
+        /// Recurring fire on a crontab schedule. v1 accepts standard
+        /// 5-field crontab; sub-second cadence rejected at deploy.
+        cron: struct { schedule: []u8 },
+        /// Fire on any put/delete under `prefix` by ANY chain on
+        /// this tenant. Mirrors the §4.6 parked-stream wake but as
+        /// a chain origin (no parked stream required).
+        kv: struct { prefix: []u8 },
+        /// Fire once on deployment activation. Idempotent via the
+        /// `_boot_fired/{deployment_id}` marker the runtime writes
+        /// post-fire.
+        boot,
+    };
+
+    pub fn deinit(self: *SubscriptionEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.module_path);
+        switch (self.spec) {
+            .cron => |cron_spec| allocator.free(cron_spec.schedule),
+            .kv => |kv_spec| allocator.free(kv_spec.prefix),
+            .boot => {},
+        }
+        self.* = undefined;
+    }
+};
+
 /// Write op for the `platform.scope(id).kv` cross-tenant accessor
 /// trampoline. Reads (get/prefix) go direct and need no trampoline.
 pub const ScopeKvOp = enum { put, delete };
@@ -1608,6 +1660,7 @@ pub fn installRequest(
         .disconnect => "disconnect",
         .kv_wake => "kv",
         .wake_batch => "wake_batch",
+        .subscription_fire => "subscription_fire",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation_source == .kv_wake) {
@@ -1663,6 +1716,37 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, wp, "dropped_chunks", c.JS_NewInt64(ctx, @intCast(request.activation_write_pressure_dropped)));
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "write_pressure", wp);
     }
+
+    // Gap 2.1 subscription_fire payload. The activation's `name`
+    // is the subscription's directory name; `source` carries the
+    // kind-specific payload (cron firedAt / kv key+op / boot
+    // deployment_id).
+    if (request.activation_source == .subscription_fire) {
+        if (request.activation_subscription_name) |n| {
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "name", c.JS_NewStringLen(ctx, n.ptr, n.len));
+        }
+        const source_obj = c.JS_NewObject(ctx);
+        if (request.activation_subscription_kv_key) |k| {
+            _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "kv", 2));
+            _ = c.JS_SetPropertyStr(ctx, source_obj, "key", c.JS_NewStringLen(ctx, k.ptr, k.len));
+            const op_str: []const u8 = switch (request.activation_subscription_kv_op) {
+                'p' => "put",
+                'd' => "delete",
+                else => "",
+            };
+            if (op_str.len > 0) {
+                _ = c.JS_SetPropertyStr(ctx, source_obj, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
+            }
+        } else if (request.activation_subscription_boot_deployment_id > 0) {
+            _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "boot", 4));
+            _ = c.JS_SetPropertyStr(ctx, source_obj, "deployment_id", c.JS_NewInt64(ctx, @intCast(request.activation_subscription_boot_deployment_id)));
+        } else if (request.activation_subscription_cron_fired_at_ns > 0) {
+            _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "cron", 4));
+            _ = c.JS_SetPropertyStr(ctx, source_obj, "firedAt", c.JS_NewInt64(ctx, request.activation_subscription_cron_fired_at_ns));
+        }
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "source", source_obj);
+    }
+
     _ = c.JS_SetPropertyStr(ctx, req_obj, "activation", activation_obj);
 
     _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);
@@ -1961,4 +2045,38 @@ test "harden: _system unreachable post-installStatic, shims still bound (Phase A
         return e;
     };
     defer result.deinit();
+}
+
+// ── SubscriptionEntry tests (Gap 2.1 Phase A) ───────────────────────
+
+test "SubscriptionEntry.deinit frees cron spec" {
+    const a = std.testing.allocator;
+    var entry: SubscriptionEntry = .{
+        .name = try a.dupe(u8, "cleanup-daily"),
+        .module_path = try a.dupe(u8, "_subscriptions/cleanup-daily/index.mjs"),
+        .spec = .{ .cron = .{ .schedule = try a.dupe(u8, "0 3 * * *") } },
+    };
+    entry.deinit(a);
+    // No assertions — the test exists so the testing allocator's
+    // leak detector fires on a missed branch.
+}
+
+test "SubscriptionEntry.deinit frees kv spec" {
+    const a = std.testing.allocator;
+    var entry: SubscriptionEntry = .{
+        .name = try a.dupe(u8, "process-jobs"),
+        .module_path = try a.dupe(u8, "_subscriptions/process-jobs/index.mjs"),
+        .spec = .{ .kv = .{ .prefix = try a.dupe(u8, "jobs/") } },
+    };
+    entry.deinit(a);
+}
+
+test "SubscriptionEntry.deinit handles boot (no inner alloc)" {
+    const a = std.testing.allocator;
+    var entry: SubscriptionEntry = .{
+        .name = try a.dupe(u8, "migrate-v3"),
+        .module_path = try a.dupe(u8, "_subscriptions/migrate-v3/index.mjs"),
+        .spec = .boot,
+    };
+    entry.deinit(a);
 }

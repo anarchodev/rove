@@ -450,6 +450,237 @@ fn triggerPathToPrefix(path: []const u8) ?[]const u8 {
 /// and the customer-write guard counterpart.
 const isReservedTriggerPrefix = reserved.isReservedTriggerPrefix;
 
+/// Parse a `_subscriptions/<name>/<file>` deployment path into its
+/// name + file-kind. Mirror of `triggerPathToPrefix` for Gap 2.1:
+///
+///   `_subscriptions/cleanup/index.mjs`  → `{name: "cleanup", kind: .handler}`
+///   `_subscriptions/cleanup/index.js`   → `{name: "cleanup", kind: .handler}`
+///   `_subscriptions/cleanup/spec.json`  → `{name: "cleanup", kind: .spec}`
+///   `_subscriptions/cleanup/helper.mjs` → null (non-index helper modules are not subscriptions themselves)
+///   anything else                        → null
+///
+/// Returned `name` slice borrows from `path`; valid as long as the
+/// caller holds `path`. Subscription names must match
+/// `[A-Za-z0-9_-]+` and be 1–64 chars; out-of-range returns null
+/// so a misnamed file is treated as "not a subscription entry."
+fn subscriptionPathParts(path: []const u8) ?struct {
+    name: []const u8,
+    kind: SubscriptionFileKind,
+} {
+    const PREFIX = "_subscriptions/";
+    if (!std.mem.startsWith(u8, path, PREFIX)) return null;
+    const rest = path[PREFIX.len..];
+
+    // Split on the first `/` to get the name segment.
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const name = rest[0..slash];
+    const tail = rest[slash + 1 ..];
+
+    if (name.len == 0 or name.len > 64) return null;
+    for (name) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or
+            (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or
+            ch == '-' or ch == '_';
+        if (!ok) return null;
+    }
+
+    if (std.mem.eql(u8, tail, "index.mjs") or std.mem.eql(u8, tail, "index.js"))
+        return .{ .name = name, .kind = .handler };
+    if (std.mem.eql(u8, tail, "spec.json"))
+        return .{ .name = name, .kind = .spec };
+    return null;
+}
+
+const SubscriptionFileKind = enum { handler, spec };
+
+/// JSON shape of `_subscriptions/<name>/spec.json`. Parsed flat
+/// then dispatched on `kind` to populate the typed
+/// `SubscriptionEntry.Spec`. Unknown kinds + missing required
+/// fields fail the deploy.
+const SubscriptionSpecJson = struct {
+    kind: []const u8,
+    schedule: ?[]const u8 = null, // required for kind=cron
+    prefix: ?[]const u8 = null, // required for kind=kv
+};
+
+/// Build the deployment's subscription registry from the manifest.
+/// Walks once to collect handler + spec.json paths under
+/// `_subscriptions/<name>/`, then pairs them: every spec.json must
+/// have a matching handler (else `error.SubscriptionMissingHandler`);
+/// missing spec.json on a handler is allowed (the handler is a
+/// regular module under that path — the index.mjs convention is
+/// what makes it a *subscription*).
+///
+/// Spec JSON is fetched fresh from the blob store on each reload —
+/// this is deploy-time work; the fetch cost is bounded by the
+/// number of subscriptions per tenant (small) and amortizes against
+/// the per-deploy snapshot rebuild.
+fn discoverSubscriptions(
+    allocator: std.mem.Allocator,
+    manifest: files_mod.manifest_json.Manifest,
+    bs: anytype,
+) ![]globals.SubscriptionEntry {
+    var handler_paths: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer handler_paths.deinit(allocator);
+    var spec_hashes: std.StringHashMapUnmanaged([files_mod.HASH_HEX_LEN]u8) = .empty;
+    defer spec_hashes.deinit(allocator);
+
+    for (manifest.entries) |entry| {
+        const parts = subscriptionPathParts(entry.path) orelse continue;
+        switch (parts.kind) {
+            .handler => {
+                if (entry.kind != .handler) {
+                    std.log.warn(
+                        "rove-js: subscription path `{s}` is not a handler entry — skipping",
+                        .{entry.path},
+                    );
+                    continue;
+                }
+                try handler_paths.put(allocator, parts.name, entry.path);
+            },
+            .spec => {
+                if (entry.kind != .static) {
+                    std.log.warn(
+                        "rove-js: subscription spec `{s}` must be a static file — skipping",
+                        .{entry.path},
+                    );
+                    continue;
+                }
+                try spec_hashes.put(allocator, parts.name, entry.source_hex);
+            },
+        }
+    }
+
+    if (spec_hashes.count() == 0) return &.{};
+
+    var out: std.ArrayList(globals.SubscriptionEntry) = .empty;
+    errdefer {
+        for (out.items) |*e| e.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    var it = spec_hashes.iterator();
+    while (it.next()) |e| {
+        const name = e.key_ptr.*;
+        const hash = e.value_ptr.*;
+
+        const handler_path = handler_paths.get(name) orelse {
+            std.log.err(
+                "rove-js: subscription `{s}` has spec.json but no index.mjs/index.js handler",
+                .{name},
+            );
+            return error.SubscriptionMissingHandler;
+        };
+
+        const spec_bytes = bs.get(&hash, allocator) catch |err| {
+            std.log.err(
+                "rove-js: subscription `{s}` spec.json fetch failed: {s}",
+                .{ name, @errorName(err) },
+            );
+            return error.SubscriptionSpecFetch;
+        };
+        defer allocator.free(spec_bytes);
+
+        const parsed = std.json.parseFromSlice(
+            SubscriptionSpecJson,
+            allocator,
+            spec_bytes,
+            .{ .ignore_unknown_fields = true },
+        ) catch |err| {
+            std.log.err(
+                "rove-js: subscription `{s}` spec.json parse failed: {s}",
+                .{ name, @errorName(err) },
+            );
+            return error.SubscriptionSpecInvalidJson;
+        };
+        defer parsed.deinit();
+
+        const spec_typed = try translateSpec(allocator, name, parsed.value);
+
+        const name_copy = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_copy);
+        const module_path_copy = try allocator.dupe(u8, handler_path);
+        errdefer allocator.free(module_path_copy);
+
+        try out.append(allocator, .{
+            .name = name_copy,
+            .module_path = module_path_copy,
+            .spec = spec_typed,
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Convert the JSON-shape spec into the typed tagged-union. The
+/// returned `Spec` owns any inner allocations (allocator-duped
+/// strings); caller must `deinit` on error paths.
+fn translateSpec(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    raw: SubscriptionSpecJson,
+) !globals.SubscriptionEntry.Spec {
+    if (std.mem.eql(u8, raw.kind, "cron")) {
+        const schedule = raw.schedule orelse {
+            std.log.err("rove-js: subscription `{s}` kind=cron missing `schedule` field", .{name});
+            return error.SubscriptionSpecMissingField;
+        };
+        if (schedule.len == 0) {
+            std.log.err("rove-js: subscription `{s}` kind=cron has empty schedule", .{name});
+            return error.SubscriptionSpecMissingField;
+        }
+        return .{ .cron = .{ .schedule = try allocator.dupe(u8, schedule) } };
+    }
+    if (std.mem.eql(u8, raw.kind, "kv")) {
+        const prefix = raw.prefix orelse {
+            std.log.err("rove-js: subscription `{s}` kind=kv missing `prefix` field", .{name});
+            return error.SubscriptionSpecMissingField;
+        };
+        if (prefix.len == 0) {
+            std.log.err("rove-js: subscription `{s}` kind=kv has empty prefix", .{name});
+            return error.SubscriptionSpecMissingField;
+        }
+        return .{ .kv = .{ .prefix = try allocator.dupe(u8, prefix) } };
+    }
+    if (std.mem.eql(u8, raw.kind, "boot")) {
+        return .boot;
+    }
+    std.log.err("rove-js: subscription `{s}` has unknown kind `{s}`", .{ name, raw.kind });
+    return error.SubscriptionSpecUnknownKind;
+}
+
+test "subscriptionPathParts: handler + spec + rejects" {
+    {
+        const r = subscriptionPathParts("_subscriptions/cleanup/index.mjs").?;
+        try std.testing.expectEqualStrings("cleanup", r.name);
+        try std.testing.expectEqual(SubscriptionFileKind.handler, r.kind);
+    }
+    {
+        const r = subscriptionPathParts("_subscriptions/jobs-q/spec.json").?;
+        try std.testing.expectEqualStrings("jobs-q", r.name);
+        try std.testing.expectEqual(SubscriptionFileKind.spec, r.kind);
+    }
+    {
+        const r = subscriptionPathParts("_subscriptions/foo/index.js").?;
+        try std.testing.expectEqualStrings("foo", r.name);
+        try std.testing.expectEqual(SubscriptionFileKind.handler, r.kind);
+    }
+    // Non-index helper module: not a subscription entry-point.
+    try std.testing.expectEqual(@as(@TypeOf(subscriptionPathParts("")), null), subscriptionPathParts("_subscriptions/foo/helper.mjs"));
+    // Bad name characters.
+    try std.testing.expectEqual(@as(@TypeOf(subscriptionPathParts("")), null), subscriptionPathParts("_subscriptions/has space/index.mjs"));
+    // Not under _subscriptions/.
+    try std.testing.expectEqual(@as(@TypeOf(subscriptionPathParts("")), null), subscriptionPathParts("foo/bar/index.mjs"));
+    // Too-long name.
+    var buf: [200]u8 = undefined;
+    @memset(&buf, 'x');
+    const long_name = buf[0..70];
+    const long_path = try std.fmt.allocPrint(std.testing.allocator, "_subscriptions/{s}/index.mjs", .{long_name});
+    defer std.testing.allocator.free(long_path);
+    try std.testing.expectEqual(@as(@TypeOf(subscriptionPathParts("")), null), subscriptionPathParts(long_path));
+}
+
 /// Reloaded by the background `DeploymentLoader` thread whenever a
 /// release lands (operator path: __admin__'s `publishRelease` RPC;
 /// platform-bootstrap path: `/_system/release`). The proposing
@@ -479,6 +710,12 @@ pub const TenantFilesSnapshot = struct {
     /// Trigger registry. Sorted descending by prefix length so a
     /// forward scan visits innermost (most-specific) triggers first.
     triggers: []TriggerEntry,
+    /// Subscription registry (Gap 2.1) — chain origins that fire
+    /// without an inbound request. Built from
+    /// `_subscriptions/<name>/{spec.json,index.mjs}` manifest pairs.
+    /// Default empty for snapshots that pre-date subscription
+    /// discovery; only the deploy-loader populates it.
+    subscriptions: []globals.SubscriptionEntry = &.{},
     /// Raw manifest bytes for this deployment. Re-released callers
     /// re-decode locally on dep_id match, skipping a fetch.
     manifest_bytes: []u8,
@@ -519,6 +756,16 @@ pub const TenantFilesSnapshot = struct {
             allocator.free(t.module_path);
         }
         allocator.free(self.triggers);
+        for (self.subscriptions) |*s| {
+            // Cast away const for the deinit call; the slice is
+            // allocator-owned at this point (no aliases reach this
+            // path — Phase B's snapshot-build hands ownership to
+            // the snapshot, the swap drops the old, and `deinit`
+            // is the sole site that frees).
+            const mut: *globals.SubscriptionEntry = @constCast(s);
+            mut.deinit(allocator);
+        }
+        if (self.subscriptions.len > 0) allocator.free(self.subscriptions);
         allocator.free(self.manifest_bytes);
         allocator.destroy(self);
     }
@@ -2799,6 +3046,20 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         }
     }.lessThan);
 
+    // Gap 2.1 Phase B: discover subscription chain origins from
+    // `_subscriptions/<name>/{index.mjs,spec.json}` manifest pairs.
+    // Failures abort the deploy (consistent with the trigger
+    // discovery posture above — a misconfigured subscription is a
+    // load-time error, not a silent skip).
+    const subscriptions_slice = try discoverSubscriptions(allocator, manifest, bs);
+    errdefer {
+        for (subscriptions_slice) |*s| {
+            const mut: *globals.SubscriptionEntry = @constCast(s);
+            mut.deinit(allocator);
+        }
+        if (subscriptions_slice.len > 0) allocator.free(subscriptions_slice);
+    }
+
     // Build the new immutable snapshot. Refcount starts at 1 (the
     // slot's reference).
     const new_snap = try allocator.create(TenantFilesSnapshot);
@@ -2810,6 +3071,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         .source_hashes = next_source_hashes,
         .statics = next_statics,
         .triggers = triggers_slice,
+        .subscriptions = subscriptions_slice,
         .manifest_bytes = json_bytes,
         .refcount = .{ .raw = 1 },
     };
@@ -2829,9 +3091,28 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     if (old_snap) |old| old.release();
 
     std.log.info(
-        "rove-js: tenant {s} loaded deployment {d} ({d} handler(s), {d} static(s), {d} trigger(s))",
-        .{ slot.instance_id, manifest.id, new_snap.bytecodes.count(), new_snap.statics.count(), new_snap.triggers.len },
+        "rove-js: tenant {s} loaded deployment {d} ({d} handler(s), {d} static(s), {d} trigger(s), {d} subscription(s))",
+        .{ slot.instance_id, manifest.id, new_snap.bytecodes.count(), new_snap.statics.count(), new_snap.triggers.len, new_snap.subscriptions.len },
     );
+
+    // Gap 2.1 Phase D: fire boot subscriptions on snapshot swap.
+    // Deferred — the deployment_loader thread doesn't have a
+    // worker context (qjs runtime + dispatcher live per-worker),
+    // and the cleanest hook (a NodeState-level pending-fire inbox
+    // drained by worker 0) is a separate sub-design. Boot firing
+    // lands in a follow-up commit; for now the `.boot` Spec is
+    // discovered + recorded on the snapshot but doesn't fire. See
+    // `docs/subscriptions-plan.md` §8 Phase D.
+    var boot_count: u32 = 0;
+    for (new_snap.subscriptions) |s| {
+        if (s.spec == .boot) boot_count += 1;
+    }
+    if (boot_count > 0) {
+        std.log.warn(
+            "rove-js: tenant {s} has {d} boot subscription(s) — Phase D firing not yet wired",
+            .{ slot.instance_id, boot_count },
+        );
+    }
 }
 
 // ── Dispatch system ───────────────────────────────────────────────────
@@ -4672,6 +4953,251 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
             );
             txn_done = true;
             captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
+        },
+    }
+}
+
+/// Source payload for a Gap 2.1 subscription_fire activation.
+/// One variant per `SubscriptionEntry.Spec`. Borrowed slices —
+/// caller (the firing site in Phases D/E/F) owns the bytes for
+/// the duration of `fireSubscriptionActivation`.
+pub const SubscriptionFireSource = union(enum) {
+    cron: struct { fired_at_ns: i64 },
+    kv: struct { key: []const u8, op: u8 },
+    boot: struct { deployment_id: u64 },
+};
+
+/// Gap 2.1 Phase C: fire a subscription handler as a fresh chain
+/// origin. Structural twin of `fireDisconnectActivation` (no held
+/// socket, writes commit asynchronously via `proposeForgetfulWrites`)
+/// but slimmer — no held stream to drain, no chunks to clean up.
+///
+/// **TEA framing:**
+///   - **Msg**: `(subscription_fire, source)` where source is
+///     one of {cron firedAt, kv key+op, boot deployment_id}.
+///   - **prep**: resolveDeployment(tenant_id, module_path); mint
+///     a fresh correlation_id; synthesize Request body `{ctx:{}}`.
+///   - **run**: `dispatcher.runOutcome` (chain-origin txn).
+///   - **apply (Cmd-list)**:
+///       • terminal → propose writes (if any) + log; bytes go
+///         nowhere (no socket to flush).
+///       • continuation / stream → recorded + logged; ignored
+///         (a subscription chain has no held socket so multi-hop
+///         chains aren't expressible in v1; customer composes
+///         multi-step via `http.send({on_result: ...})` which
+///         routes as a `send_callback` activation, not as a held
+///         continuation).
+///
+/// Errors return `void` — the caller is best-effort (cron sweep,
+/// apply-time hook, boot fire). Failures log + skip the activation.
+pub fn fireSubscriptionActivation(
+    worker: anytype,
+    tenant_id: []const u8,
+    subscription_name: []const u8,
+    module_path: []const u8,
+    source: SubscriptionFireSource,
+) void {
+    const allocator = worker.allocator;
+    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
+        std.log.warn(
+            "rove-js subscription-fire: tenant={s} name={s} resolveDeployment failed: {s}; skipping",
+            .{ tenant_id, subscription_name, @errorName(err) },
+        );
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+
+    // Subscription chains start fresh — empty ctx, fresh
+    // correlation_id. (The handler can pass ctx forward via its
+    // own kv state if it wants persistent chain state across
+    // fires; the platform doesn't carry any.)
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{{}}}}", .{}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    var tapes = RequestTapes.init(allocator);
+    defer tapes.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+
+    // Mint a fresh correlation_id for this chain origin. Format:
+    // `sub-{name-prefix}-{request_id-hex}` — name-scoped + unique
+    // enough to dedup in the replay UX. Truncated to keep length
+    // bounded.
+    var corr_buf: [80]u8 = undefined;
+    const name_prefix_len: usize = @min(subscription_name.len, 32);
+    const corr_full = std.fmt.bufPrint(
+        &corr_buf,
+        "sub-{s}-{x:0>16}",
+        .{ subscription_name[0..name_prefix_len], request_id },
+    ) catch corr_buf[0..0];
+
+    // Synthesize the Request with the activation payload populated
+    // per the source variant.
+    var req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .kv_tape = &tapes.kv,
+        .date_tape = &tapes.date,
+        .math_random_tape = &tapes.math_random,
+        .crypto_random_tape = &tapes.crypto_random,
+        .module_tape = &tapes.module,
+        .prng_seed = @bitCast(now_ns),
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = corr_full,
+        .activation_source = .subscription_fire,
+        .activation_subscription_name = subscription_name,
+    };
+    switch (source) {
+        .cron => |cs| req.activation_subscription_cron_fired_at_ns = cs.fired_at_ns,
+        .kv => |kvs| {
+            req.activation_subscription_kv_key = kvs.key;
+            req.activation_subscription_kv_op = kvs.op;
+        },
+        .boot => |bs2| req.activation_subscription_boot_deployment_id = bs2.deployment_id,
+    }
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        req,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    var oc = run_oc;
+    // Subscription chains have no held socket; non-terminal returns
+    // are deinit'd + recorded on the tape with a warning. Customers
+    // compose multi-hop via http.send({on_result:...}) instead.
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .subscription_fire);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                    std.log.warn("rove-js subscription-fire ({s}): propose failed: {s}", .{ subscription_name, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .subscription_fire);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireSubscriptionActivation.commit(terminal)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            // `__rove_next` from a subscription chain has no held
+            // socket to resume into. Recorded but ignored; writes
+            // (if any) still commit. Customers compose multi-step
+            // via http.send({on_result:...}) which routes its
+            // callback as a `send_callback` activation.
+            cval.deinit(allocator);
+            std.log.warn(
+                "rove-js subscription-fire ({s}): __rove_next from subscription origin is a no-op (v1)",
+                .{subscription_name},
+            );
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                    std.log.warn("rove-js subscription-fire ({s}) cont-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+                return;
+            }
+            txn.rollback() catch {};
+            txn_done = true;
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+        },
+        .stream => |*s2| {
+            // `__rove_stream` from a subscription chain — same as
+            // `__rove_next` above: no held socket, recorded but
+            // ignored; writes commit.
+            s2.deinit(allocator);
+            std.log.warn(
+                "rove-js subscription-fire ({s}): __rove_stream from subscription origin is a no-op (v1)",
+                .{subscription_name},
+            );
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                    std.log.warn("rove-js subscription-fire ({s}) stream-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireSubscriptionActivation.commit(stream)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
         },
     }
 }

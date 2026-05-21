@@ -249,6 +249,23 @@ pub const Request = struct {
     /// `request.activation.write_pressure.dropped_chunks`. Always
     /// 0 for non-stream activations.
     activation_write_pressure_dropped: u32 = 0,
+    /// Gap 2.1 subscription_fire payload (catalog §2.1 +
+    /// `docs/subscriptions-plan.md`). Set only when
+    /// `activation_source == .subscription_fire`; surfaces as
+    /// `request.activation.{name, source}`. The discriminator
+    /// `source.kind` is determined by which of the three slots
+    /// below is populated:
+    ///   - `subscription_cron_fired_at_ns > 0` → kind = "cron"
+    ///   - `subscription_kv_key != null`       → kind = "kv"
+    ///   - `subscription_boot_deployment_id > 0` → kind = "boot"
+    /// (Mutually exclusive; only one is set per fire.) Borrowed
+    /// slice — caller (`fireSubscriptionActivation`) owns the
+    /// bytes for the duration of the dispatch.
+    activation_subscription_name: ?[]const u8 = null,
+    activation_subscription_cron_fired_at_ns: i64 = 0,
+    activation_subscription_kv_key: ?[]const u8 = null,
+    activation_subscription_kv_op: u8 = 0,
+    activation_subscription_boot_deployment_id: u64 = 0,
 };
 
 /// One `(name, value)` pair extracted from the handler's

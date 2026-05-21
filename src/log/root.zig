@@ -92,6 +92,15 @@ pub const ActivationSource = enum(u8) {
     /// overflow: { lost_oldest } }`. Supersedes the per-wake
     /// `kv_wake` / `timer` activation sources for held streams.
     wake_batch = 5,
+    /// Subscription chain origin (`docs/primitive-gaps.md` §2.1 +
+    /// `docs/subscriptions-plan.md`). A `_subscriptions/<name>/`
+    /// handler is firing without an inbound HTTP request — driven
+    /// by a cron schedule, an apply-time kv-write match, or a
+    /// once-per-deployment-activation boot. The handler sees
+    /// `request.activation = { kind: "subscription_fire", name,
+    /// source: { kind:"cron"|"kv"|"boot", ... } }`. There's no
+    /// held socket; `Response` is recorded but not transmitted.
+    subscription_fire = 6,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`
