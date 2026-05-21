@@ -313,16 +313,35 @@ pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
 /// correctness/safety knob.
 pub const TAPE_CAP_BYTES_PER_CHAIN: u64 = 10 * 1024 * 1024;
 
-/// LRU eviction trigger for `NodeState.tape_state`. When the map
-/// reaches this many entries, the oldest-touched chain entries
-/// are dropped to bound memory; the chains they tracked may
-/// re-enter at zero used-bytes (rare in practice — chains usually
-/// terminate well before eviction).
+/// LRU eviction trigger for the tape-state map(s). The total
+/// capacity is `TAPE_STATE_LRU_CAP`; each shard caps at
+/// `TAPE_STATE_LRU_CAP / TAPE_STATE_SHARDS` entries. The chains
+/// dropped may re-enter at zero used-bytes (rare in practice —
+/// chains usually terminate well before eviction).
 pub const TAPE_STATE_LRU_CAP: u32 = 10_000;
 
-/// `NodeState.tape_state` value — per-chain tape accounting.
-/// Tiny (~32 bytes); cross-worker but contention is rare because
-/// chains hash-route to a single worker.
+/// Shard count for the per-chain tape-budget tracker. The tape
+/// cap is consulted on the inbound dispatch hot path (4 sites in
+/// `dispatchOnce`), so a single global mutex serialized every
+/// worker through one critical section — measured as a ~4× drop
+/// in 8w/8t sharded-write throughput when the cap was added (see
+/// commit `c547784`'s regression). Picking `correlation_id`'s
+/// hash mod `TAPE_STATE_SHARDS` partitions the contention domain;
+/// uniform-tenant load sees ~1/N residual contention.
+///
+/// Power of 2 so the modulo lowers to a mask. 16 is plenty for
+/// 8 workers; bump if worker counts grow into the hundreds.
+pub const TAPE_STATE_SHARDS: usize = 16;
+const TAPE_STATE_LRU_CAP_PER_SHARD: u32 = TAPE_STATE_LRU_CAP / @as(u32, @intCast(TAPE_STATE_SHARDS));
+
+pub const TapeStateShard = struct {
+    mutex: std.Thread.Mutex = .{},
+    map: std.StringHashMapUnmanaged(ChainTapeState) = .empty,
+};
+
+/// `tape_state_shards[*].map` value — per-chain tape accounting.
+/// Tiny (~32 bytes). Cross-worker; contention is bounded by the
+/// shard fanout (`TAPE_STATE_SHARDS`).
 pub const ChainTapeState = struct {
     bytes_used: u64 = 0,
     /// Set the first time the chain crosses the cap. Once set,
@@ -1312,13 +1331,11 @@ pub const NodeState = struct {
     /// accumulates `bytes_used` across all its activations; hitting
     /// `TAPE_CAP_BYTES_PER_CHAIN` flips `capped = true` and
     /// `captureTapes` returns empty payloads for subsequent
-    /// activations of that chain. Cross-worker because chains
-    /// are hash-routed and a single chain's activations all land
-    /// on the same worker, but the LRU-cap GC walks the map under
-    /// the mutex so cross-worker contention stays cheap (one map
-    /// per node).
-    tape_state_mutex: std.Thread.Mutex = .{},
-    tape_state: std.StringHashMapUnmanaged(ChainTapeState) = .empty,
+    /// activations of that chain. Sharded by `hash(correlation_id)
+    /// & (TAPE_STATE_SHARDS - 1)` because the cap probe + charge
+    /// run on every inbound activation (4 sites in `dispatchOnce`)
+    /// — a single global mutex measured as a ~4× regression.
+    tape_state_shards: [TAPE_STATE_SHARDS]TapeStateShard = [_]TapeStateShard{.{}} ** TAPE_STATE_SHARDS,
 
     /// Gap 2.3 Phase C1: cross-thread queue of pending fetches
     /// awaiting transport. Producer: worker's batch-finalize
@@ -1586,10 +1603,10 @@ pub const NodeState = struct {
             while (cs_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
             self.cron_state.deinit(self.allocator);
         }
-        {
-            var ts_it = self.tape_state.iterator();
+        for (&self.tape_state_shards) |*shard| {
+            var ts_it = shard.map.iterator();
             while (ts_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
-            self.tape_state.deinit(self.allocator);
+            shard.map.deinit(self.allocator);
         }
         {
             // Gap 2.3 Phase C2: any pending fetches the pool
@@ -2989,7 +3006,7 @@ pub fn captureTapes(
 /// `captureTapes` variant that honors the per-chain tape budget
 /// (`docs/primitive-gaps.md` §6). `correlation_id == null` skips
 /// the cap (test paths, anonymous-chain dispatch); a non-null id
-/// consults `NodeState.tape_state` and returns empty payloads
+/// consults `NodeState.tape_state_shards` and returns empty payloads
 /// once the chain has exceeded `TAPE_CAP_BYTES_PER_CHAIN`. One-
 /// shot warning + log marker emitted on the activation that
 /// trips the cap.
@@ -3082,13 +3099,21 @@ pub fn captureTapesForChain(
     return payloads;
 }
 
+fn tapeStateShardFor(node: *NodeState, correlation_id: []const u8) *TapeStateShard {
+    const h = std.hash.Wyhash.hash(0, correlation_id);
+    return &node.tape_state_shards[h & (TAPE_STATE_SHARDS - 1)];
+}
+
 /// `docs/primitive-gaps.md` §6: read-side cap probe. Returns true
 /// iff this chain has already exceeded its budget on a prior
-/// activation. Cheap (one mutex + lookup); no eviction.
+/// activation. Cheap (one mutex + lookup); no eviction. Hot path:
+/// runs on every inbound activation, so the mutex is sharded
+/// (see `TAPE_STATE_SHARDS`).
 fn chainTapeAlreadyCapped(node: *NodeState, correlation_id: []const u8) bool {
-    node.tape_state_mutex.lock();
-    defer node.tape_state_mutex.unlock();
-    const entry = node.tape_state.getPtr(correlation_id) orelse return false;
+    const shard = tapeStateShardFor(node, correlation_id);
+    shard.mutex.lock();
+    defer shard.mutex.unlock();
+    const entry = shard.map.getPtr(correlation_id) orelse return false;
     return entry.capped;
 }
 
@@ -3104,19 +3129,17 @@ fn chainTapeAlreadyCapped(node: *NodeState, correlation_id: []const u8) bool {
 /// chain re-accumulates from zero), which is the same posture as
 /// the §9.4 ring's "we drop oldest under pressure" stance.
 fn chainTapeChargeAndCheck(node: *NodeState, correlation_id: []const u8, bytes: usize) bool {
-    node.tape_state_mutex.lock();
-    defer node.tape_state_mutex.unlock();
+    const shard = tapeStateShardFor(node, correlation_id);
+    shard.mutex.lock();
+    defer shard.mutex.unlock();
 
-    var touch_seq: u64 = undefined;
-    {
-        // Use the map's `count` as a stand-in for monotonic time —
-        // it advances on insertions, and the LRU we'd cull is the
-        // entry with the smallest `last_touch_seq`. Cheap; no
-        // global-counter contention.
-        touch_seq = @intCast(node.tape_state.count() + 1);
-    }
+    // Use the shard map's `count` as a stand-in for monotonic
+    // time — it advances on insertions, and the LRU we'd cull is
+    // the entry with the smallest `last_touch_seq`. Cheap; no
+    // global-counter contention.
+    const touch_seq: u64 = @intCast(shard.map.count() + 1);
 
-    if (node.tape_state.getPtr(correlation_id)) |entry| {
+    if (shard.map.getPtr(correlation_id)) |entry| {
         if (entry.capped) return false; // already past cap; this fn isn't the tripper
         entry.bytes_used += bytes;
         entry.last_touch_seq = touch_seq;
@@ -3131,7 +3154,7 @@ fn chainTapeChargeAndCheck(node: *NodeState, correlation_id: []const u8, bytes: 
     // through to "no tracking" (cap is best-effort observability
     // protection, not correctness).
     const key_copy = node.allocator.dupe(u8, correlation_id) catch return false;
-    node.tape_state.put(node.allocator, key_copy, .{
+    shard.map.put(node.allocator, key_copy, .{
         .bytes_used = bytes,
         .capped = bytes > TAPE_CAP_BYTES_PER_CHAIN,
         .last_touch_seq = touch_seq,
@@ -3140,22 +3163,22 @@ fn chainTapeChargeAndCheck(node: *NodeState, correlation_id: []const u8, bytes: 
         return false;
     };
 
-    // Opportunistic LRU eviction: if the map crossed its cap on
-    // this insert, drop the entry with the smallest last_touch_seq.
-    // O(N) scan but only triggered at the boundary (N = 10k by
-    // default — sub-ms even on the rare insert that triggers it).
-    if (node.tape_state.count() > TAPE_STATE_LRU_CAP) {
-        evictOldestTapeState(node);
+    // Opportunistic LRU eviction: if this shard crossed its slice
+    // of the cap on this insert, drop the entry with the smallest
+    // last_touch_seq within the shard. O(N_shard) scan but only
+    // triggered at the boundary.
+    if (shard.map.count() > TAPE_STATE_LRU_CAP_PER_SHARD) {
+        evictOldestTapeState(node, shard);
     }
 
     return bytes > TAPE_CAP_BYTES_PER_CHAIN; // single huge activation
 }
 
-fn evictOldestTapeState(node: *NodeState) void {
-    // Caller holds `tape_state_mutex`.
+fn evictOldestTapeState(node: *NodeState, shard: *TapeStateShard) void {
+    // Caller holds `shard.mutex`.
     var oldest_key: ?[]const u8 = null;
     var oldest_seq: u64 = std.math.maxInt(u64);
-    var it = node.tape_state.iterator();
+    var it = shard.map.iterator();
     while (it.next()) |kv| {
         if (kv.value_ptr.last_touch_seq < oldest_seq) {
             oldest_seq = kv.value_ptr.last_touch_seq;
@@ -3165,7 +3188,7 @@ fn evictOldestTapeState(node: *NodeState) void {
     if (oldest_key) |k| {
         // fetchRemove transfers ownership of the key buffer to
         // the caller so we can free it after the map drops it.
-        if (node.tape_state.fetchRemove(k)) |removed| {
+        if (shard.map.fetchRemove(k)) |removed| {
             node.allocator.free(removed.key);
         }
     }
