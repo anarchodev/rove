@@ -1617,6 +1617,14 @@ pub fn Worker(comptime opts: Options) type {
         /// alongside (but independently of) the H2 `raft_pending`
         /// entity path. Single-threaded per worker.
         pending_units: std.ArrayListUnmanaged(ParkedUnit) = .empty,
+        /// Gap 2.1 Phase E: kv-react subscription fires staged
+        /// during `drainRaftPending`'s pending_units loop, drained
+        /// AFTER the loop. The deferral is load-bearing — firing a
+        /// subscription re-enters dispatch which calls `parkSendOps`
+        /// / `parkKvWakes` which append to `pending_units`, and the
+        /// pointer-into-items iteration above would touch freed
+        /// memory on the reallocation. Single-threaded per worker.
+        pending_subscription_fires: std.ArrayListUnmanaged(PendingSubscriptionFire) = .empty,
         /// Per-tick accumulator for admin-handler side effects
         /// (`platform.root.*` + cross-tenant trampolines). Folded
         /// into the batch's single raft entry by `finalizeBatch`
@@ -1921,6 +1929,8 @@ pub fn Worker(comptime opts: Options) type {
             self.pending_txns.deinit(allocator);
             for (self.pending_units.items) |*pu| pu.deinit(allocator);
             self.pending_units.deinit(allocator);
+            for (self.pending_subscription_fires.items) |*psf| psf.deinit(allocator);
+            self.pending_subscription_fires.deinit(allocator);
             self.batch_side.reset(allocator);
             self.batch_side.targets.deinit(allocator);
             // Phase 7: side tables (parked_meta, parked_streams_active,
@@ -3450,6 +3460,12 @@ pub fn drainRaftPending(worker: anytype) !void {
         }
         u += 1;
     }
+
+    // Gap 2.1 Phase E: drain any kv-react subscription fires that
+    // `firePendingKvWakes` queued during the pending_units loop.
+    // Deferred to here so the recursive dispatch's effects don't
+    // invalidate the loop's pointer-into-items iteration.
+    drainPendingSubscriptionFires(worker);
 }
 
 /// §6.4 mandatory-timeout sweep for continuation-parked streams
@@ -4967,6 +4983,31 @@ pub const SubscriptionFireSource = union(enum) {
     boot: struct { deployment_id: u64 },
 };
 
+/// A subscription fire staged by `firePendingKvWakes` for drain
+/// AFTER the `drainRaftPending` pending_units loop. The
+/// post-loop drain calls `fireSubscriptionActivation` with the
+/// captured (owned) fields, then frees them. The deferral is
+/// load-bearing — see `Worker.pending_subscription_fires`.
+pub const PendingSubscriptionFire = struct {
+    tenant_id: []u8,
+    subscription_name: []u8,
+    module_path: []u8,
+    /// Variant: kv (carrying owned key + op). Other variants (cron,
+    /// boot) land via different firing sites that don't have the
+    /// iterate-while-modifying constraint, so they don't queue
+    /// through here.
+    kv_key: []u8,
+    kv_op: u8,
+
+    pub fn deinit(self: *PendingSubscriptionFire, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
+        allocator.free(self.subscription_name);
+        allocator.free(self.module_path);
+        allocator.free(self.kv_key);
+        self.* = undefined;
+    }
+};
+
 /// Gap 2.1 Phase C: fire a subscription handler as a fresh chain
 /// origin. Structural twin of `fireDisconnectActivation` (no held
 /// socket, writes commit asynchronously via `proposeForgetfulWrites`)
@@ -5301,6 +5342,99 @@ fn firePendingKvWakes(worker: anytype, unit: *ParkedUnit) void {
     if (unit.kv_wakes.items.len == 0) return;
     for (unit.kv_wakes.items) |w| {
         worker.node.broadcastKvWake(unit.tenant_id, w.key, w.op);
+    }
+    // Gap 2.1 Phase E: kv-react subscription chain origins. Same
+    // post-commit pump as the parked-stream wake broadcast above;
+    // leader-only by construction because this code path only runs
+    // on the worker that committed the original writeset. Reentrant
+    // dispatch into `fireSubscriptionActivation` mirrors the
+    // existing `fireDisconnectActivation` reentrancy out of
+    // `cleanupResponses`.
+    fireKvReactSubscriptions(worker, unit) catch |err|
+        std.log.warn(
+            "rove-js kv-react ({s}): {s}",
+            .{ unit.tenant_id, @errorName(err) },
+        );
+}
+
+/// Gap 2.1 Phase E: for each kv-write event in `unit`, scan the
+/// tenant's subscription registry for `.kv` subscriptions whose
+/// `prefix` matches; QUEUE each match onto
+/// `worker.pending_subscription_fires` for drain AFTER the
+/// `drainRaftPending` pending_units loop completes. Direct firing
+/// here would invalidate the loop's `&worker.pending_units.items[u]`
+/// pointer once the recursive dispatch's `parkSendOps`/`parkKvWakes`
+/// grew the slice. Leader-only by caller convention
+/// (`firePendingKvWakes` only runs on the worker that committed
+/// the write).
+fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
+    const slot = worker.node.tenant_files_map.get(unit.tenant_id) orelse return;
+    const snap = slot.pinCurrent() orelse return;
+    defer snap.release();
+    if (snap.subscriptions.len == 0) return;
+
+    const allocator = worker.allocator;
+    for (snap.subscriptions) |sub| {
+        const prefix = switch (sub.spec) {
+            .kv => |k| k.prefix,
+            else => continue,
+        };
+        for (unit.kv_wakes.items) |w| {
+            if (!std.mem.startsWith(u8, w.key, prefix)) continue;
+            std.log.info(
+                "rove-js kv-react queue: tenant={s} subscription={s} key={s} op={c}",
+                .{ unit.tenant_id, sub.name, w.key, w.op },
+            );
+            const tid_dup = try allocator.dupe(u8, unit.tenant_id);
+            errdefer allocator.free(tid_dup);
+            const name_dup = try allocator.dupe(u8, sub.name);
+            errdefer allocator.free(name_dup);
+            const path_dup = try allocator.dupe(u8, sub.module_path);
+            errdefer allocator.free(path_dup);
+            const key_dup = try allocator.dupe(u8, w.key);
+            errdefer allocator.free(key_dup);
+            try worker.pending_subscription_fires.append(allocator, .{
+                .tenant_id = tid_dup,
+                .subscription_name = name_dup,
+                .module_path = path_dup,
+                .kv_key = key_dup,
+                .kv_op = w.op,
+            });
+        }
+    }
+}
+
+/// Drain `worker.pending_subscription_fires`, firing each. Called
+/// at the END of `drainRaftPending` so the recursive dispatch's
+/// effects (which may grow `worker.pending_units` again) don't
+/// invalidate the pending_units iteration. Idempotent — re-entry
+/// during a fire pushes onto `pending_subscription_fires` again,
+/// which drains on the NEXT `drainRaftPending` tick.
+fn drainPendingSubscriptionFires(worker: anytype) void {
+    const allocator = worker.allocator;
+    // Move + clear in one shot — fireSubscriptionActivation may
+    // re-enter this code path (via its own parkKvWakes →
+    // firePendingKvWakes → fireKvReactSubscriptions, on the next
+    // drainRaftPending tick). Without the swap, a chain of kv-react
+    // → kv-write → kv-react... wakes could re-enter while we
+    // iterate the original list.
+    const items = worker.pending_subscription_fires.items;
+    if (items.len == 0) return;
+    const owned = allocator.dupe(PendingSubscriptionFire, items) catch {
+        std.log.warn("rove-js kv-react drain: alloc failed; deferring fires", .{});
+        return;
+    };
+    worker.pending_subscription_fires.clearRetainingCapacity();
+    defer allocator.free(owned);
+    for (owned) |*fire| {
+        defer fire.deinit(allocator);
+        fireSubscriptionActivation(
+            worker,
+            fire.tenant_id,
+            fire.subscription_name,
+            fire.module_path,
+            .{ .kv = .{ .key = fire.kv_key, .op = fire.kv_op } },
+        );
     }
 }
 
