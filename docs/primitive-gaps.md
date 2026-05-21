@@ -35,7 +35,26 @@ the gap is a parametric case.
 
 ## 2. The gaps
 
-### 2.1 Chain origins without an inbound request
+### 2.1 Chain origins without an inbound request — **DONE 2026-05-20**
+
+**Shipped.** See `docs/subscriptions-plan.md` §10 for the per-phase
+status + load-bearing details. Three chain-origin kinds:
+
+- **kv-react** — apply-time hook fires on the worker that
+  committed the writeset; leader-only by construction.
+- **boot** — `NodeState` cross-thread inbox + leadership-gained
+  sweep; marker injected into handler's writeset for atomicity.
+- **cron** — throttled 1Hz in-memory sweep on worker 0 + leader;
+  `next_fire_at_ns` per `<tenant>|<name>` is NOT raft-replicated
+  (leader change resets the clock by design — missed-tick
+  tolerance over false-fidelity).
+
+All three share one collection (`subscription_fire_pending`) +
+one fire path (`fireSubscriptionActivation` via the worker's own
+dispatcher). The 3 smokes (`streaming_subscription_{boot,kv,cron}_smoke.py`)
+gate each path. 12 streaming smokes + heldsync green.
+
+Original motivation + recommendation below for the record.
 
 **Motivation.** Today every chain begins with an `inbound_request`
 Msg — even cron runs (`http.send({url:self, fire_at_ns})` is an
@@ -320,7 +339,7 @@ Recommended order, smallest-design-debt first:
 | # | Gap | Effort | Customer pull | Blocks | Status |
 |---|---|---|---|---|---|
 | 1 | 2.2 backpressure | S | medium | clean §9.4 story | **DONE 2026-05-20** |
-| 2 | 2.1 chain origins | M | high | crons, inboxes, reconcilers | **partial 2026-05-20** — kv-react + boot shipped; cron deferred (see `docs/subscriptions-plan.md` §10) |
+| 2 | 2.1 chain origins | M | high | crons, inboxes, reconcilers | **DONE 2026-05-20** — kv-react + boot + cron all shipped (see `docs/subscriptions-plan.md` §10) |
 | 3 | 2.3 streaming http.send response | L | high | LLM proxy, log tail | pending |
 | 4 | 2.4 streaming inbound body | L | medium | uploads, duplex | pending |
 | 5 | 2.5 held outbound subscription | XL | high (federation) | atproto, WS-origin | pending |
