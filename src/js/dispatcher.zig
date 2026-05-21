@@ -25,6 +25,7 @@ const globals = @import("globals.zig");
 const limiter_mod = @import("limiter.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const stream_mod = @import("bindings/stream.zig");
+const components_mod = @import("components.zig");
 const c = qjs.c;
 
 pub const DispatchError = error{
@@ -222,11 +223,32 @@ pub const Request = struct {
     /// Set only when `activation_source == .kv_wake`; surfaces as
     /// `request.activation.key` / `request.activation.op` on the JS
     /// side. Borrowed slice — caller (resumeStream) owns the bytes
-    /// for the duration of the dispatch.
+    /// for the duration of the dispatch. Legacy single-slot field
+    /// retained for replay-tape decode; live dispatch uses
+    /// `activation_wakes` (Gap 2.2 Phase D).
     activation_kv_key: ?[]const u8 = null,
     /// `'p'` for put, `'d'` for delete. Only meaningful when
-    /// `activation_source == .kv_wake`.
+    /// `activation_source == .kv_wake`. Legacy — see above.
     activation_kv_op: u8 = 0,
+    /// Wake-batch payload (Gap 2.2 Phase D / streaming-handlers-plan
+    /// §9.4). Set only when `activation_source == .wake_batch`; a
+    /// temporal-order slice drained from the held stream's
+    /// `PendingWakes` ring. Surfaces as `request.activation.wakes`
+    /// on the JS side. Borrowed slice — caller (resumeStream) owns
+    /// the entries + their `kv_key` bytes for the duration of the
+    /// dispatch.
+    activation_wakes: []const components_mod.WakeEntry = &.{},
+    /// Ring-overflow count snapshotted at drain time. Surfaces as
+    /// `request.activation.overflow.lost_oldest`. Always present
+    /// on a `.wake_batch` activation; 0 in the common case.
+    activation_lost_oldest: u32 = 0,
+    /// §9.4 write-pressure: count of chunks dropped from the held
+    /// stream's `StreamChunks` queue since the last surfacing
+    /// (cap-overflow drops). Snapshotted + reset on each activation
+    /// of a streaming chain. Surfaces as
+    /// `request.activation.write_pressure.dropped_chunks`. Always
+    /// 0 for non-stream activations.
+    activation_write_pressure_dropped: u32 = 0,
 };
 
 /// One `(name, value)` pair extracted from the handler's

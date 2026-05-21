@@ -392,32 +392,44 @@ export default function () {
     });
   }
 
-  if (activation.kind === "kv") {
-    // An order under the watched prefix changed. Read the new state and
-    // emit a frame.
-    const order = kv.get(activation.kv.key) ?? { deleted: true, key: activation.kv.key };
-    const seq = (request.ctx.n ?? 0) + 1;
+  if (activation.kind === "wake_batch") {
+    // One or more kv and/or timer events fired; the §9.4
+    // accumulator drained them in temporal order. Emit one frame
+    // per kv update; a timer-only batch becomes a heartbeat.
+    // `activation.overflow.lost_oldest > 0` means the ring filled
+    // while the handler was running — re-snapshot kv state and
+    // resync clients (the §7 "notify, refetch" thesis).
+    const ctx = request.ctx;
+    if (activation.overflow.lost_oldest > 0) {
+      // Lost wakes — refetch the authoritative snapshot.
+      const snapshot = JSON.stringify(kv.list(`orders/${ctx.userId}/`));
+      return __rove_stream({
+        write: [`event: resync\ndata: ${snapshot}\n\n`],
+        waitFor: [
+          { kv:    { prefix: `orders/${ctx.userId}/` } },
+          { timer: { intervalMs: 30_000 } },
+        ],
+        ctx: { ...ctx, n: (ctx.n ?? 0) + 1 },
+      });
+    }
+    const frames = [];
+    let seq = ctx.n ?? 0;
+    for (const w of activation.wakes) {
+      if (w.kind === "kv") {
+        const order = kv.get(w.key) ?? { deleted: true, key: w.key };
+        seq += 1;
+        frames.push(`id: ${seq}\nevent: order_update\ndata: ${JSON.stringify(order)}\n\n`);
+      } else if (w.kind === "timer") {
+        frames.push(":heartbeat\n\n");
+      }
+    }
     return __rove_stream({
-      write: [
-        `id: ${seq}\nevent: order_update\ndata: ${JSON.stringify(order)}\n\n`,
-      ],
+      write: frames,
       waitFor: [
-        { kv:    { prefix: `orders/${request.ctx.userId}/` } },
+        { kv:    { prefix: `orders/${ctx.userId}/` } },
         { timer: { intervalMs: 30_000 } },
       ],
-      ctx: { ...request.ctx, n: seq },
-    });
-  }
-
-  if (activation.kind === "timer") {
-    // Heartbeat — keep the connection alive across LB idle timeouts.
-    return __rove_stream({
-      write: [":heartbeat\n\n"],
-      waitFor: [
-        { kv:    { prefix: `orders/${request.ctx.userId}/` } },
-        { timer: { intervalMs: 30_000 } },
-      ],
-      ctx: request.ctx,
+      ctx: { ...ctx, n: seq },
     });
   }
 

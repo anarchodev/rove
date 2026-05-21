@@ -1594,8 +1594,12 @@ pub fn installRequest(
     // request.activation = { kind, ...payload }
     // — streaming-handlers-plan §2: every handler run is a recorded
     // "request," and the activation source is one field on the
-    // request shape the handler can branch on. The kv_wake variant
-    // (§4.6) carries `{ key, op }`; the others are bare `{ kind }`.
+    // request shape the handler can branch on. The `wake_batch`
+    // variant (§9.4, Gap 2.2 Phase E) carries a temporal-order
+    // `wakes: [{kind:"kv",key,op,firedAt} | {kind:"timer",firedAt}]`
+    // array + an `overflow: { lost_oldest }` counter. The legacy
+    // `kv` and `timer` variants are retained for replay-tape
+    // decode but no longer fire on live dispatch.
     const activation_obj = c.JS_NewObject(ctx);
     const kind: []const u8 = switch (request.activation_source) {
         .inbound => "inbound",
@@ -1603,6 +1607,7 @@ pub fn installRequest(
         .timer => "timer",
         .disconnect => "disconnect",
         .kv_wake => "kv",
+        .wake_batch => "wake_batch",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation_source == .kv_wake) {
@@ -1617,6 +1622,46 @@ pub fn installRequest(
         if (op_str.len > 0) {
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
         }
+    } else if (request.activation_source == .wake_batch) {
+        // wakes: [{kind:"kv",key,op,firedAt}|{kind:"timer",firedAt}, ...]
+        const wakes_arr = c.JS_NewArray(ctx);
+        for (request.activation_wakes, 0..) |w, i| {
+            const entry = c.JS_NewObject(ctx);
+            switch (w.tag) {
+                .kv => {
+                    _ = c.JS_SetPropertyStr(ctx, entry, "kind", c.JS_NewStringLen(ctx, "kv", 2));
+                    _ = c.JS_SetPropertyStr(ctx, entry, "key", c.JS_NewStringLen(ctx, w.kv_key.ptr, w.kv_key.len));
+                    const op_str: []const u8 = switch (w.kv_op) {
+                        'p' => "put",
+                        'd' => "delete",
+                        else => "",
+                    };
+                    if (op_str.len > 0) {
+                        _ = c.JS_SetPropertyStr(ctx, entry, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
+                    }
+                },
+                .timer => {
+                    _ = c.JS_SetPropertyStr(ctx, entry, "kind", c.JS_NewStringLen(ctx, "timer", 5));
+                },
+            }
+            _ = c.JS_SetPropertyStr(ctx, entry, "firedAt", c.JS_NewInt64(ctx, w.fired_at_ns));
+            _ = c.JS_SetPropertyUint32(ctx, wakes_arr, @intCast(i), entry);
+        }
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "wakes", wakes_arr);
+        const overflow = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, overflow, "lost_oldest", c.JS_NewInt64(ctx, @intCast(request.activation_lost_oldest)));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "overflow", overflow);
+    }
+
+    // §9.4 write-pressure surface. Always present on stream-chain
+    // activations (wake_batch + disconnect today); 0 on other
+    // activation kinds. Field shape mirrors `overflow` — a small
+    // object so future counters (e.g. queue-drain stalls) can land
+    // alongside `dropped_chunks` without breaking the schema.
+    {
+        const wp = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, wp, "dropped_chunks", c.JS_NewInt64(ctx, @intCast(request.activation_write_pressure_dropped)));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "write_pressure", wp);
     }
     _ = c.JS_SetPropertyStr(ctx, req_obj, "activation", activation_obj);
 

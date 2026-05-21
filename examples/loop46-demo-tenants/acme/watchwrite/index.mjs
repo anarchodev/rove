@@ -23,12 +23,20 @@ export default function () {
             waitFor: [{ kv: { prefix: "watchwrite/in/" } }],
         });
     }
-    if (a.kind === "kv") {
-        const value = kv.get(a.key) ?? "(absent)";
-        const out_key = "watchwrite/out/" + a.key.slice("watchwrite/in/".length);
-        kv.set(out_key, "processed:" + value);
+    if (a.kind === "wake_batch") {
+        // §9.4: drain every kv entry in the batch in temporal order.
+        // (A burst of writes against the watched prefix accumulates
+        // into one activation; we relay each one.)
+        const frames = [];
+        for (const w of a.wakes) {
+            if (w.kind !== "kv") continue;
+            const value = kv.get(w.key) ?? "(absent)";
+            const out_key = "watchwrite/out/" + w.key.slice("watchwrite/in/".length);
+            kv.set(out_key, "processed:" + value);
+            frames.push(`event: relayed\ndata: ${w.key}->${out_key}\n\n`);
+        }
         return __rove_stream({
-            write: [`event: relayed\ndata: ${a.key}->${out_key}\n\n`],
+            write: frames,
             waitFor: [{ kv: { prefix: "watchwrite/in/" } }],
         });
     }

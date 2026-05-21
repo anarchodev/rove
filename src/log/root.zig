@@ -79,7 +79,19 @@ pub const ActivationSource = enum(u8) {
     /// runs the handler with `request.activation = { kind: "kv",
     /// key, op }`. Prefix-only — predicate filters out of scope
     /// (§4.6 + §11.1).
+    ///
+    /// Legacy single-slot activation source. Superseded by
+    /// `wake_batch` (Gap 2.2). Retained in the enum so replay can
+    /// still decode pre-§9.4 tapes.
     kv_wake = 4,
+    /// Wake-batch activation (streaming-handlers-plan §9.4 +
+    /// `docs/primitive-gaps.md` §2.2). The held stream's
+    /// `PendingWakes` ring drained into a temporal-order batch of
+    /// kv-write + timer entries; the handler sees
+    /// `request.activation = { kind: "wake_batch", wakes: [...],
+    /// overflow: { lost_oldest } }`. Supersedes the per-wake
+    /// `kv_wake` / `timer` activation sources for held streams.
+    wake_batch = 5,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`

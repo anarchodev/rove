@@ -22,9 +22,17 @@ export default function () {
             waitFor: { timer: { intervalMs: 100 } },
         });
     }
-    if (a.kind === "timer") {
+    if (a.kind === "wake_batch") {
+        // Timer-fired heartbeat (this stream registered no kv wakes,
+        // so the batch is timer-only). One frame per fire — multiple
+        // timer entries in one batch happen only if the worker ran
+        // longer than the interval, which we don't expect here.
+        const frames = [];
+        for (const w of a.wakes) {
+            if (w.kind === "timer") frames.push(":hb\n\n");
+        }
         return __rove_stream({
-            write: [":hb\n\n"],
+            write: frames,
             waitFor: { timer: { intervalMs: 100 } },
         });
     }

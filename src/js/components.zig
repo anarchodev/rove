@@ -110,8 +110,68 @@ pub const StreamChain = struct {
 /// by `__rove_stream(...)` returns. Default empty list is the
 /// "no chunks queued" state; nothing distinguishes it from "no
 /// stream attached" — that's the collection's job.
+///
+/// §9.4 write-pressure: a soft byte cap on the queue caps the
+/// runtime's memory exposure to a misbehaving handler that returns
+/// gigabytes of chunks. On enqueue-overflow the runtime drops the
+/// excess (newest-first; the start of the stream is what the
+/// customer chose to send earlier) and increments `dropped_chunks`.
+/// The next activation reads `request.activation.write_pressure
+/// .dropped_chunks`; the runtime resets the counter after surfacing
+/// it (one-shot signal per activation).
 pub const StreamChunks = struct {
     queue: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Running sum of `queue.items[i].len` — kept in lockstep with
+    /// the queue so `tryAppend` is O(1).
+    queue_bytes: usize = 0,
+    /// Cumulative chunks dropped since the last surfacing. Reset
+    /// to 0 after the runtime stamps it onto a Request.
+    dropped_chunks: u32 = 0,
+
+    /// Soft cap on `queue_bytes`. Conservative default; per-tenant
+    /// override hook is cheap to add later. Sized for ~one MTU's
+    /// worth of buffered SSE frames plus headroom — heartbeats /
+    /// kv-update fanout patterns sit far below this; pathological
+    /// returns hit the cap and surface via `dropped_chunks`.
+    pub const QUEUE_BYTES_CAP: usize = 256 * 1024;
+
+    /// Enqueue `chunk` (ownership transferred on success). On
+    /// cap-overflow: free `chunk` and increment `dropped_chunks`
+    /// — §9.4 newest-first drop posture preserves the start of
+    /// stream. Returns the standard ArrayList append error only on
+    /// allocator failure; cap-overflow is silently surfaced via
+    /// the counter, not as an error.
+    pub fn tryAppend(self: *StreamChunks, allocator: std.mem.Allocator, chunk: []u8) std.mem.Allocator.Error!void {
+        if (self.queue_bytes + chunk.len > QUEUE_BYTES_CAP) {
+            allocator.free(chunk);
+            self.dropped_chunks +%= 1;
+            return;
+        }
+        self.queue.append(allocator, chunk) catch |e| {
+            allocator.free(chunk);
+            return e;
+        };
+        self.queue_bytes += chunk.len;
+    }
+
+    /// Pop the oldest queued chunk + decrement `queue_bytes`.
+    /// Caller takes ownership. Returns null when the queue is
+    /// empty (caller decides what that means — drain-then-close
+    /// fires here).
+    pub fn popOldest(self: *StreamChunks) ?[]u8 {
+        if (self.queue.items.len == 0) return null;
+        const chunk = self.queue.orderedRemove(0);
+        self.queue_bytes -= chunk.len;
+        return chunk;
+    }
+
+    /// Snapshot + reset `dropped_chunks`. Called by resume engines
+    /// to stamp the count onto the next activation's Request.
+    pub fn takeDropped(self: *StreamChunks) u32 {
+        const n = self.dropped_chunks;
+        self.dropped_chunks = 0;
+        return n;
+    }
 
     pub fn deinit(allocator: std.mem.Allocator, items: []StreamChunks) void {
         for (items) |*item| {
@@ -122,23 +182,26 @@ pub const StreamChunks = struct {
     }
 };
 
-/// Wake registrations + outstanding match for a held stream. The
+/// Wake registrations + outstanding matches for a held stream. The
 /// `kv_prefixes` slice is rewritten on every `__rove_stream(...)`
-/// return; `pending_wake` is set by `drainKvWakeInbox` when an
-/// apply-thread broadcast matches one of those prefixes.
+/// return; `pending_wakes` is the §9.4 accumulator (ring of
+/// `PENDING_WAKES_CAP`, fan-in of kv + timer events; `lost_oldest`
+/// exposed to the handler as rate-limit backpressure) populated by
+/// `drainKvWakeInbox` (kv matches) and the per-tick timer-due
+/// detection in `serviceParkedStreams` (timer fires).
 /// `next_wake_ns == maxInt(i64)` is the "no timer pending"
 /// sentinel; we never compare against it as an active deadline.
 pub const StreamWakes = struct {
     interval_ms: i64 = 0,
     next_wake_ns: i64 = std.math.maxInt(i64),
     kv_prefixes: [][]u8 = &.{},
-    pending_wake: ?PendingKvWake = null,
+    pending_wakes: PendingWakes = .{},
 
     pub fn deinit(allocator: std.mem.Allocator, items: []StreamWakes) void {
         for (items) |*item| {
             for (item.kv_prefixes) |p| allocator.free(p);
             if (item.kv_prefixes.len > 0) allocator.free(item.kv_prefixes);
-            if (item.pending_wake) |*w| w.deinit(allocator);
+            item.pending_wakes.deinit(allocator);
             item.* = .{};
         }
     }
@@ -165,21 +228,131 @@ pub const StreamDraining = struct {
     pub fn deinit(_: std.mem.Allocator, _: []StreamDraining) void {}
 };
 
-/// One pending kv-write match destined for the next activation of a
-/// streaming chain. Allocator-owned `key`; `op` is `'p'`
-/// (put) or `'d'` (delete). v1 keeps "most recent wins" (Phase 3
-/// posture); the wake-accumulator §9.4 batching is later.
-///
-/// Logically a sub-component of `StreamWakes`; broken out as its
-/// own type so it can have its own deinit without nesting struct
-/// methods.
-pub const PendingKvWake = struct {
-    key: []u8,
-    op: u8,
+/// Ring-buffer capacity for `PendingWakes` (streaming-handlers §9.4 +
+/// §11.4 — K=32 starting target). Per-stream constant for now;
+/// per-tenant / per-stream configurability hooks are cheap to add
+/// later if benches show one stream-class wants a different K.
+pub const PENDING_WAKES_CAP: usize = 32;
 
-    pub fn deinit(self: *PendingKvWake, allocator: std.mem.Allocator) void {
-        allocator.free(self.key);
-        self.* = undefined;
+/// One entry in the per-stream wake accumulator. The tag picks
+/// which payload field is meaningful; `kv_key` is allocator-owned
+/// when `tag == .kv`. Both kv and timer wakes go through the same
+/// ring so the handler sees them in temporal order on each
+/// activation (`streaming-handlers-plan.md` §9.4).
+pub const WakeEntry = struct {
+    tag: Tag = .timer,
+    /// Set when `tag == .kv`; allocator-owned. Empty slice when
+    /// `tag == .timer` (the default leaves `kv_key.len == 0` so a
+    /// drain consumer can branch on `entry.tag` without checking
+    /// for sentinel keys).
+    kv_key: []u8 = &.{},
+    /// Set when `tag == .kv`. `'p'` (put) or `'d'` (delete). Zero
+    /// when `tag == .timer`.
+    kv_op: u8 = 0,
+    /// Set on every entry — monotonic ns the wake matched. For
+    /// timers this is the scheduled fire time; for kv-writes it's
+    /// the apply-thread observe time. Surfaces to the handler as
+    /// `wakes[i].firedAt` so it can order / dedupe across kinds.
+    fired_at_ns: i64 = 0,
+
+    pub const Tag = enum(u8) { kv, timer };
+
+    /// Free owned slices. Safe to call on a default-init entry
+    /// (`kv_key.len == 0` short-circuits).
+    pub fn deinit(self: *WakeEntry, allocator: std.mem.Allocator) void {
+        if (self.tag == .kv and self.kv_key.len > 0) {
+            allocator.free(self.kv_key);
+        }
+        self.* = .{};
+    }
+};
+
+/// The §9.4 per-stream wake accumulator. Bounded ring of
+/// `PENDING_WAKES_CAP` entries; pushed-to on every kv-prefix match
+/// (apply-thread fan-out) and every timer fire while the handler
+/// is running or queued; drained as one batch by `resumeStream`
+/// when the cell is free.
+///
+/// On ring-full, the oldest entry is dropped (its `kv_key` freed)
+/// and `lost_oldest` is incremented — the rate-limit IS the ring,
+/// and `lost_oldest > 0` is the signal the handler reads on the
+/// next activation ("re-snapshot kv state; you missed some
+/// writes"). Wraps on u32 overflow which is fine for a counter
+/// that resets to 0 on every drain.
+///
+/// Default-init is the "empty ring" state — `len == 0`,
+/// `lost_oldest == 0`, all entries inert. Safe to leave on every
+/// `StreamWakes` even when the stream never uses the accumulator
+/// (e.g., timer-only streams pay one extra ~1KB SoA slot).
+pub const PendingWakes = struct {
+    /// Ring storage. Entries between `head` and `head+len` (mod
+    /// CAP) are valid; everything else is the default `.{}`.
+    entries: [PENDING_WAKES_CAP]WakeEntry = [_]WakeEntry{.{}} ** PENDING_WAKES_CAP,
+    /// Index of the oldest valid entry.
+    head: u8 = 0,
+    /// Number of valid entries currently in the ring (0..=CAP).
+    len: u8 = 0,
+    /// Cumulative count of entries dropped to make room since the
+    /// last drain. Reset to 0 by `drainInto`. Wraps on u32
+    /// overflow (saturating not needed — drain frequency caps the
+    /// running total).
+    lost_oldest: u32 = 0,
+
+    /// Push an entry. On full ring, drop the oldest (freeing its
+    /// `kv_key`) + bump `lost_oldest`. Takes ownership of any
+    /// allocator-owned fields on `entry`.
+    pub fn push(self: *PendingWakes, allocator: std.mem.Allocator, entry: WakeEntry) void {
+        if (self.len == PENDING_WAKES_CAP) {
+            self.entries[self.head].deinit(allocator);
+            self.head = @intCast((@as(usize, self.head) + 1) % PENDING_WAKES_CAP);
+            self.lost_oldest +%= 1;
+        } else {
+            self.len += 1;
+        }
+        const tail = @as(usize, self.head) + self.len - 1;
+        self.entries[tail % PENDING_WAKES_CAP] = entry;
+    }
+
+    /// Drain all valid entries into an allocator-owned slice + the
+    /// `lost_oldest` snapshot. Resets the ring to empty + clears
+    /// `lost_oldest`. Caller owns the returned slice and every
+    /// entry's `kv_key`; on success the ring no longer references
+    /// them. Returns an empty slice when `len == 0` (still useful
+    /// for the `lost_oldest` snapshot — a ring that overflowed
+    /// completely and then was drained-but-empty still wants to
+    /// report the loss).
+    pub fn drainInto(
+        self: *PendingWakes,
+        allocator: std.mem.Allocator,
+    ) error{OutOfMemory}!struct { wakes: []WakeEntry, lost_oldest: u32 } {
+        const lost = self.lost_oldest;
+        self.lost_oldest = 0;
+        if (self.len == 0) {
+            return .{ .wakes = &.{}, .lost_oldest = lost };
+        }
+        const out = try allocator.alloc(WakeEntry, self.len);
+        var idx: usize = self.head;
+        for (out) |*slot| {
+            slot.* = self.entries[idx];
+            self.entries[idx] = .{}; // ownership moved; clear retained ref
+            idx = (idx + 1) % PENDING_WAKES_CAP;
+        }
+        self.head = 0;
+        self.len = 0;
+        return .{ .wakes = out, .lost_oldest = lost };
+    }
+
+    /// Free every retained entry. Called by `StreamWakes.deinit`.
+    pub fn deinit(self: *PendingWakes, allocator: std.mem.Allocator) void {
+        var idx: usize = self.head;
+        var rem: u8 = self.len;
+        while (rem > 0) : (rem -= 1) {
+            self.entries[idx].deinit(allocator);
+            idx = (idx + 1) % PENDING_WAKES_CAP;
+        }
+        self.head = 0;
+        self.len = 0;
+        self.lost_oldest = 0;
     }
 };
 
@@ -248,7 +421,65 @@ test "StreamChunks deinit drains + frees every queued chunk" {
     try testing.expectEqual(@as(usize, 0), items[0].queue.items.len);
 }
 
-test "StreamWakes deinit frees kv_prefixes spine + entries + pending_wake key" {
+test "StreamChunks.tryAppend tracks bytes; popOldest reverses (Gap 2.2 Phase H)" {
+    const a = testing.allocator;
+    var sc: StreamChunks = .{};
+    defer StreamChunks.deinit(a, (&sc)[0..1]);
+
+    try sc.tryAppend(a, try a.dupe(u8, "abc"));
+    try sc.tryAppend(a, try a.dupe(u8, "defghij"));
+    try testing.expectEqual(@as(usize, 10), sc.queue_bytes);
+    try testing.expectEqual(@as(usize, 2), sc.queue.items.len);
+
+    const c1 = sc.popOldest().?;
+    defer a.free(c1);
+    try testing.expectEqualStrings("abc", c1);
+    try testing.expectEqual(@as(usize, 7), sc.queue_bytes);
+
+    const c2 = sc.popOldest().?;
+    defer a.free(c2);
+    try testing.expectEqualStrings("defghij", c2);
+    try testing.expectEqual(@as(usize, 0), sc.queue_bytes);
+
+    try testing.expectEqual(@as(?[]u8, null), sc.popOldest());
+}
+
+test "StreamChunks.tryAppend drops + counts on cap overflow" {
+    const a = testing.allocator;
+    var sc: StreamChunks = .{};
+    defer StreamChunks.deinit(a, (&sc)[0..1]);
+
+    // Fill ~most of the cap with one big chunk.
+    const big_len: usize = StreamChunks.QUEUE_BYTES_CAP - 10;
+    const big = try a.alloc(u8, big_len);
+    @memset(big, 'X');
+    try sc.tryAppend(a, big);
+
+    // Small chunk that fits — should succeed.
+    try sc.tryAppend(a, try a.dupe(u8, "fits"));
+    try testing.expectEqual(@as(u32, 0), sc.dropped_chunks);
+
+    // Chunk that would exceed cap — should drop.
+    const overflow = try a.alloc(u8, 100);
+    @memset(overflow, 'Y');
+    try sc.tryAppend(a, overflow);
+    try testing.expectEqual(@as(u32, 1), sc.dropped_chunks);
+    try testing.expectEqual(@as(usize, big_len + 4), sc.queue_bytes);
+    try testing.expectEqual(@as(usize, 2), sc.queue.items.len);
+}
+
+test "StreamChunks.takeDropped snapshots + resets" {
+    const a = testing.allocator;
+    var sc: StreamChunks = .{};
+    defer StreamChunks.deinit(a, (&sc)[0..1]);
+
+    sc.dropped_chunks = 7;
+    try testing.expectEqual(@as(u32, 7), sc.takeDropped());
+    try testing.expectEqual(@as(u32, 0), sc.dropped_chunks);
+    try testing.expectEqual(@as(u32, 0), sc.takeDropped());
+}
+
+test "StreamWakes deinit frees kv_prefixes spine + entries" {
     const a = testing.allocator;
     const prefixes = try a.alloc([]u8, 2);
     prefixes[0] = try a.dupe(u8, "orders/");
@@ -257,9 +488,104 @@ test "StreamWakes deinit frees kv_prefixes spine + entries + pending_wake key" {
         .interval_ms = 200,
         .next_wake_ns = 1_500_000_000,
         .kv_prefixes = prefixes,
-        .pending_wake = .{ .key = try a.dupe(u8, "orders/u/12"), .op = 'p' },
     }};
     StreamWakes.deinit(a, &items);
     try testing.expectEqual(@as(usize, 0), items[0].kv_prefixes.len);
-    try testing.expectEqual(@as(?PendingKvWake, null), items[0].pending_wake);
+}
+
+test "StreamWakes deinit drains the §9.4 PendingWakes ring (Gap 2.2 Phase A)" {
+    const a = testing.allocator;
+    var items = [_]StreamWakes{.{}};
+    items[0].pending_wakes.push(a, .{
+        .tag = .kv,
+        .kv_key = try a.dupe(u8, "orders/u/12"),
+        .kv_op = 'p',
+        .fired_at_ns = 100,
+    });
+    items[0].pending_wakes.push(a, .{
+        .tag = .timer,
+        .fired_at_ns = 200,
+    });
+    StreamWakes.deinit(a, &items);
+    try testing.expectEqual(@as(u8, 0), items[0].pending_wakes.len);
+}
+
+test "PendingWakes push/drain preserves temporal order" {
+    const a = testing.allocator;
+    var ring: PendingWakes = .{};
+    defer ring.deinit(a);
+
+    ring.push(a, .{ .tag = .kv, .kv_key = try a.dupe(u8, "k1"), .kv_op = 'p', .fired_at_ns = 1 });
+    ring.push(a, .{ .tag = .timer, .fired_at_ns = 2 });
+    ring.push(a, .{ .tag = .kv, .kv_key = try a.dupe(u8, "k2"), .kv_op = 'd', .fired_at_ns = 3 });
+
+    const drained = try ring.drainInto(a);
+    defer {
+        for (drained.wakes) |*w| w.deinit(a);
+        a.free(drained.wakes);
+    }
+    try testing.expectEqual(@as(usize, 3), drained.wakes.len);
+    try testing.expectEqual(@as(u32, 0), drained.lost_oldest);
+    try testing.expectEqual(WakeEntry.Tag.kv, drained.wakes[0].tag);
+    try testing.expectEqualStrings("k1", drained.wakes[0].kv_key);
+    try testing.expectEqual(WakeEntry.Tag.timer, drained.wakes[1].tag);
+    try testing.expectEqual(@as(i64, 2), drained.wakes[1].fired_at_ns);
+    try testing.expectEqual(WakeEntry.Tag.kv, drained.wakes[2].tag);
+    try testing.expectEqualStrings("k2", drained.wakes[2].kv_key);
+    try testing.expectEqual(@as(u8, 'd'), drained.wakes[2].kv_op);
+
+    // Ring is empty after drain.
+    try testing.expectEqual(@as(u8, 0), ring.len);
+    try testing.expectEqual(@as(u32, 0), ring.lost_oldest);
+}
+
+test "PendingWakes drops oldest on overflow + counts lost_oldest" {
+    const a = testing.allocator;
+    var ring: PendingWakes = .{};
+    defer ring.deinit(a);
+
+    // Fill ring + push 5 extra; CAP+5 total → oldest 5 dropped.
+    var i: usize = 0;
+    while (i < PENDING_WAKES_CAP + 5) : (i += 1) {
+        const key = try std.fmt.allocPrint(a, "k{d}", .{i});
+        ring.push(a, .{ .tag = .kv, .kv_key = key, .kv_op = 'p', .fired_at_ns = @intCast(i) });
+    }
+    try testing.expectEqual(@as(u8, @intCast(PENDING_WAKES_CAP)), ring.len);
+    try testing.expectEqual(@as(u32, 5), ring.lost_oldest);
+
+    const drained = try ring.drainInto(a);
+    defer {
+        for (drained.wakes) |*w| w.deinit(a);
+        a.free(drained.wakes);
+    }
+    // Oldest surviving entry is k5 (k0..k4 were dropped).
+    try testing.expectEqualStrings("k5", drained.wakes[0].kv_key);
+    try testing.expectEqual(@as(i64, 5), drained.wakes[0].fired_at_ns);
+    // Newest entry is k{CAP+4}.
+    var buf: [16]u8 = undefined;
+    const expected_last = try std.fmt.bufPrint(&buf, "k{d}", .{PENDING_WAKES_CAP + 4});
+    try testing.expectEqualStrings(expected_last, drained.wakes[drained.wakes.len - 1].kv_key);
+    try testing.expectEqual(@as(u32, 5), drained.lost_oldest);
+}
+
+test "PendingWakes drainInto on empty ring returns empty slice + lost_oldest snapshot" {
+    const a = testing.allocator;
+    var ring: PendingWakes = .{};
+    defer ring.deinit(a);
+
+    // Push a single entry, drain it, then drain again on empty.
+    ring.push(a, .{ .tag = .timer, .fired_at_ns = 42 });
+    const first = try ring.drainInto(a);
+    a.free(first.wakes);
+
+    const second = try ring.drainInto(a);
+    try testing.expectEqual(@as(usize, 0), second.wakes.len);
+    try testing.expectEqual(@as(u32, 0), second.lost_oldest);
+}
+
+test "WakeEntry default-init has empty kv_key + deinit is safe" {
+    const a = testing.allocator;
+    var entry: WakeEntry = .{};
+    entry.deinit(a);
+    try testing.expectEqual(@as(usize, 0), entry.kv_key.len);
 }
