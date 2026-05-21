@@ -155,6 +155,12 @@ pub fn jsHttpFetch(
         },
     };
     state.http_fetch_index += 1;
+    // Build the id JS string NOW — `appendPendingFetch` transfers
+    // ownership of `row.id` into the PendingFetch and clears the
+    // carrier's copy, so reading `row.id` afterward yields an
+    // empty slice. `JS_NewStringLen` copies the bytes, so `res`
+    // is independent of `row`'s subsequent fate.
+    const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
     // Gap 2.3 Phase C1: accumulate into the per-DispatchState
     // pending-fetches list. The worker's batch-finalize phase
     // flushes the list to NodeState.fetch_pending; the fetch-pool
@@ -163,16 +169,16 @@ pub fn jsHttpFetch(
     // deinit frees the entries — no orphan fetches.
     appendPendingFetch(state, &row) catch |err| {
         // Allocator failure on the dupe/append; tear down `row`
-        // (still allocator-owned by this fn) and surface as a JS
-        // exception.
+        // (still allocator-owned by this fn) + the id string, and
+        // surface as a JS exception.
+        c.JS_FreeValue(ctx, res);
         row.deinit(state.allocator);
         state.pending_kv_error = err;
         return js_exception;
     };
     // `appendPendingFetch` transferred ownership of every owned
-    // slice on `row` into the PendingFetch — local clears its
-    // fields so the deinit below is a no-op.
-    const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
+    // slice on `row` into the PendingFetch (or, on the null-
+    // accumulator path, left them for this `deinit` to free).
     row.deinit(state.allocator);
     return res;
 }

@@ -32,6 +32,7 @@ const blob_curl = @import("rove-blob").curl;
 const components_mod = @import("components.zig");
 const worker_mod = @import("worker.zig");
 const globals = @import("globals.zig");
+const sched_thread = @import("rove-schedule-server").thread;
 
 const NodeState = worker_mod.NodeState;
 const PendingFetch = globals.PendingFetch;
@@ -182,6 +183,12 @@ pub const FetchPool = struct {
             .headers = headers_list.items,
             .body = pf.body,
             .timeout_ms = pf.timeout_ms,
+            // Test-harness escape hatch: `--dev-webhook-unsafe` flips
+            // the same process-wide flag `http.send`'s fire path
+            // reads, so smokes can `http.fetch` an on-box echo with
+            // a self-signed cert. Production leaves it false →
+            // full TLS verification.
+            .verify_tls = !sched_thread.test_allow_plaintext,
         };
 
         var resp = easy.request(a, req) catch |err| {
@@ -229,8 +236,12 @@ pub const FetchPool = struct {
 
             const id_dup = try a.dupe(u8, pf.id);
             errdefer a.free(id_dup);
+            const tid_dup = try a.dupe(u8, pf.tenant_id);
+            errdefer a.free(tid_dup);
             const ctx_dup = try a.dupe(u8, pf.ctx_json);
             errdefer a.free(ctx_dup);
+            const chunk_mod_dup = try a.dupe(u8, pf.on_chunk_module);
+            errdefer a.free(chunk_mod_dup);
             const bytes_dup = try a.dupe(u8, slice);
             errdefer a.free(bytes_dup);
             const headers_dup: ?[]u8 = if (seq == 0 and headers_blob.len > 0)
@@ -242,7 +253,9 @@ pub const FetchPool = struct {
             const ev: UpstreamFetchEvent = .{
                 .kind = .chunk,
                 .fetch_id = id_dup,
+                .tenant_id = tid_dup,
                 .ctx_json = ctx_dup,
+                .on_chunk_module = chunk_mod_dup,
                 .seq = seq,
                 .byte_offset = @intCast(offset),
                 .bytes = bytes_dup,
@@ -252,7 +265,9 @@ pub const FetchPool = struct {
                 // Ownership of `ev`'s slices stays with us on err.
                 // Free them inline; loop continues to terminal.
                 a.free(id_dup);
+                a.free(tid_dup);
                 a.free(ctx_dup);
+                a.free(chunk_mod_dup);
                 a.free(bytes_dup);
                 if (headers_dup) |h| a.free(h);
                 std.log.warn(
@@ -282,19 +297,27 @@ pub const FetchPool = struct {
         const a = self.allocator;
         const id_dup = try a.dupe(u8, pf.id);
         errdefer a.free(id_dup);
+        const tid_dup = try a.dupe(u8, pf.tenant_id);
+        errdefer a.free(tid_dup);
         const ctx_dup = try a.dupe(u8, pf.ctx_json);
         errdefer a.free(ctx_dup);
+        const done_mod_dup = try a.dupe(u8, pf.on_done_module);
+        errdefer a.free(done_mod_dup);
 
         const ev: UpstreamFetchEvent = .{
             .kind = .end,
             .fetch_id = id_dup,
+            .tenant_id = tid_dup,
             .ctx_json = ctx_dup,
+            .on_done_module = done_mod_dup,
             .terminal_status = status,
             .terminal_ok = ok,
         };
         self.routeEvent(pf.tenant_id, ev) catch |err| {
             a.free(id_dup);
+            a.free(tid_dup);
             a.free(ctx_dup);
+            a.free(done_mod_dup);
             return err;
         };
     }

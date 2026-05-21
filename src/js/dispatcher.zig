@@ -274,6 +274,27 @@ pub const Request = struct {
     activation_subscription_kv_key: ?[]const u8 = null,
     activation_subscription_kv_op: u8 = 0,
     activation_subscription_boot_deployment_id: u64 = 0,
+    /// Gap 2.3 Phase D `http.fetch` activation payload. Set when
+    /// `activation_source` is `.fetch_chunk` / `.fetch_done` /
+    /// `.fetch_pipe_done`. `fetch_id` correlates every activation
+    /// of one fetch; surfaces as `request.activation.fetch_id`.
+    /// Borrowed slices — caller (`fireFetchEventActivation`) owns
+    /// the bytes for the duration of the dispatch.
+    activation_fetch_id: ?[]const u8 = null,
+    /// `.fetch_chunk` only: 0-based chunk index + cumulative bytes
+    /// before this chunk + the chunk payload (surfaces as
+    /// `request.activation.bytes`, a Uint8Array). `fetch_headers`
+    /// is the upstream response headers in `Key: Val\r\n` wire
+    /// format, present on `seq == 0` only.
+    activation_fetch_seq: u32 = 0,
+    activation_fetch_byte_offset: u64 = 0,
+    activation_fetch_bytes: []const u8 = &.{},
+    activation_fetch_headers: ?[]const u8 = null,
+    /// `.fetch_done` / `.fetch_pipe_done` only: upstream final
+    /// status + success flag. `ok == false` on timeout / cancel /
+    /// transport error / upstream non-2xx.
+    activation_fetch_terminal_status: u16 = 0,
+    activation_fetch_terminal_ok: bool = false,
 };
 
 /// One `(name, value)` pair extracted from the handler's

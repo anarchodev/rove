@@ -97,6 +97,7 @@ pub const flushLogs = worker.flushLogs;
 pub const serviceSubscriptionFires = worker.serviceSubscriptionFires;
 pub const sweepBootSubscriptions = worker.sweepBootSubscriptions;
 pub const sweepCronSubscriptions = worker.sweepCronSubscriptions;
+pub const serviceFetchEvents = worker.serviceFetchEvents;
 
 test {
     _ = dispatcher;
