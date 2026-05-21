@@ -1537,6 +1537,15 @@ pub fn Worker(comptime opts: Options) type {
     const StreamRow = H2Type.StreamRow;
     const StreamColl = rove.Collection(StreamRow, .{});
 
+    // Gap 2.1 Phase E (refactored): worker-only collection for
+    // pending subscription-fire chain origins. Entities carry one
+    // component (`SubscriptionFireDescriptor`) — no h2 stream
+    // identity needed because the chain has no held socket. Lives
+    // entirely within the worker; entities never move into or out
+    // of h2 collections.
+    const SubFireRow = rove.Row(&.{components_mod.SubscriptionFireDescriptor});
+    const SubFireColl = rove.Collection(SubFireRow, .{});
+
     return struct {
         const Self = @This();
 
@@ -1617,14 +1626,18 @@ pub fn Worker(comptime opts: Options) type {
         /// alongside (but independently of) the H2 `raft_pending`
         /// entity path. Single-threaded per worker.
         pending_units: std.ArrayListUnmanaged(ParkedUnit) = .empty,
-        /// Gap 2.1 Phase E: kv-react subscription fires staged
-        /// during `drainRaftPending`'s pending_units loop, drained
-        /// AFTER the loop. The deferral is load-bearing — firing a
-        /// subscription re-enters dispatch which calls `parkSendOps`
-        /// / `parkKvWakes` which append to `pending_units`, and the
-        /// pointer-into-items iteration above would touch freed
-        /// memory on the reallocation. Single-threaded per worker.
-        pending_subscription_fires: std.ArrayListUnmanaged(PendingSubscriptionFire) = .empty,
+        /// Gap 2.1 Phase E (refactored): per-worker rove collection
+        /// of pending subscription-fire chain origins. Producers
+        /// (the kv-react site in `firePendingKvWakes`, plus future
+        /// boot/cron sources) `reg.create` an entity here with a
+        /// populated `SubscriptionFireDescriptor`; the
+        /// `dispatchSubscriptionFires` system iterates a stable
+        /// snapshot per tick, calls `fireSubscriptionActivation` for
+        /// each, and `reg.destroy`s (deferred — re-entrant fires
+        /// land in the next tick's snapshot without invalidating
+        /// the current iteration). Replaces the Phase E v1 flat
+        /// ArrayList — see `docs/subscriptions-plan.md` §10.
+        subscription_fire_pending: SubFireColl,
         /// Per-tick accumulator for admin-handler side effects
         /// (`platform.root.*` + cross-tenant trampolines). Folded
         /// into the batch's single raft entry by `finalizeBatch`
@@ -1778,6 +1791,7 @@ pub fn Worker(comptime opts: Options) type {
                 .raft_pending_cont = try StreamColl.init(allocator),
                 .raft_pending_stream = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
+                .subscription_fire_pending = try SubFireColl.init(allocator),
                 .dispatcher = try Dispatcher.init(allocator),
                 .node = config.node,
                 .raft = config.raft,
@@ -1809,6 +1823,7 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.raft_pending_cont.deinit();
             errdefer self.raft_pending_stream.deinit();
             errdefer self.parked_continuations.deinit();
+            errdefer self.subscription_fire_pending.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
@@ -1816,6 +1831,7 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.raft_pending_cont);
             reg.registerCollection(&self.raft_pending_stream);
             reg.registerCollection(&self.parked_continuations);
+            reg.registerCollection(&self.subscription_fire_pending);
 
             // Register the inbox with the node so apply.zig +
             // worker_dispatch.zig can broadcast kv-write events to
@@ -1929,8 +1945,6 @@ pub fn Worker(comptime opts: Options) type {
             self.pending_txns.deinit(allocator);
             for (self.pending_units.items) |*pu| pu.deinit(allocator);
             self.pending_units.deinit(allocator);
-            for (self.pending_subscription_fires.items) |*psf| psf.deinit(allocator);
-            self.pending_subscription_fires.deinit(allocator);
             self.batch_side.reset(allocator);
             self.batch_side.targets.deinit(allocator);
             // Phase 7: side tables (parked_meta, parked_streams_active,
@@ -1945,6 +1959,7 @@ pub fn Worker(comptime opts: Options) type {
             self.node.unregisterWakeInbox(&self.wake_inbox);
             self.wake_inbox.deinit();
             self.parked_continuations.deinit();
+            self.subscription_fire_pending.deinit();
             self.raft_pending_response.deinit();
             self.raft_pending_cont.deinit();
             self.raft_pending_stream.deinit();
@@ -3461,11 +3476,13 @@ pub fn drainRaftPending(worker: anytype) !void {
         u += 1;
     }
 
-    // Gap 2.1 Phase E: drain any kv-react subscription fires that
-    // `firePendingKvWakes` queued during the pending_units loop.
-    // Deferred to here so the recursive dispatch's effects don't
-    // invalidate the loop's pointer-into-items iteration.
-    drainPendingSubscriptionFires(worker);
+    // Gap 2.1 Phase E (refactored): dispatch any subscription
+    // fires that the kv-react site enqueued into the worker's
+    // `subscription_fire_pending` collection during the
+    // pending_units loop. The collection-as-state shape means
+    // re-entrant fires append via the deferred-create queue and
+    // process next tick — no iterate-while-modify trap.
+    dispatchSubscriptionFires(worker);
 }
 
 /// §6.4 mandatory-timeout sweep for continuation-parked streams
@@ -4983,31 +5000,6 @@ pub const SubscriptionFireSource = union(enum) {
     boot: struct { deployment_id: u64 },
 };
 
-/// A subscription fire staged by `firePendingKvWakes` for drain
-/// AFTER the `drainRaftPending` pending_units loop. The
-/// post-loop drain calls `fireSubscriptionActivation` with the
-/// captured (owned) fields, then frees them. The deferral is
-/// load-bearing — see `Worker.pending_subscription_fires`.
-pub const PendingSubscriptionFire = struct {
-    tenant_id: []u8,
-    subscription_name: []u8,
-    module_path: []u8,
-    /// Variant: kv (carrying owned key + op). Other variants (cron,
-    /// boot) land via different firing sites that don't have the
-    /// iterate-while-modifying constraint, so they don't queue
-    /// through here.
-    kv_key: []u8,
-    kv_op: u8,
-
-    pub fn deinit(self: *PendingSubscriptionFire, allocator: std.mem.Allocator) void {
-        allocator.free(self.tenant_id);
-        allocator.free(self.subscription_name);
-        allocator.free(self.module_path);
-        allocator.free(self.kv_key);
-        self.* = undefined;
-    }
-};
-
 /// Gap 2.1 Phase C: fire a subscription handler as a fresh chain
 /// origin. Structural twin of `fireDisconnectActivation` (no held
 /// socket, writes commit asynchronously via `proposeForgetfulWrites`)
@@ -5357,16 +5349,21 @@ fn firePendingKvWakes(worker: anytype, unit: *ParkedUnit) void {
         );
 }
 
-/// Gap 2.1 Phase E: for each kv-write event in `unit`, scan the
-/// tenant's subscription registry for `.kv` subscriptions whose
-/// `prefix` matches; QUEUE each match onto
-/// `worker.pending_subscription_fires` for drain AFTER the
-/// `drainRaftPending` pending_units loop completes. Direct firing
-/// here would invalidate the loop's `&worker.pending_units.items[u]`
-/// pointer once the recursive dispatch's `parkSendOps`/`parkKvWakes`
-/// grew the slice. Leader-only by caller convention
-/// (`firePendingKvWakes` only runs on the worker that committed
-/// the write).
+/// Gap 2.1 Phase E (refactored): for each kv-write event in `unit`,
+/// scan the tenant's subscription registry for `.kv` subscriptions
+/// whose `prefix` matches; `reg.create` an entity in the local
+/// worker's `subscription_fire_pending` collection with a populated
+/// `SubscriptionFireDescriptor`. The `dispatchSubscriptionFires`
+/// system iterates + fires + destroys on each worker tick.
+/// Direct firing here would invalidate the
+/// `drainRaftPending` loop's `&worker.pending_units.items[u]`
+/// pointer because the recursive dispatch's
+/// `parkSendOps`/`parkKvWakes` grow the slice — collection
+/// membership IS the queue (principle #1) and dispatch happens
+/// outside the iterate-then-mutate window.
+///
+/// Leader-only by caller convention (`firePendingKvWakes` only
+/// runs on the worker that committed the write).
 fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
     const slot = worker.node.tenant_files_map.get(unit.tenant_id) orelse return;
     const snap = slot.pinCurrent() orelse return;
@@ -5374,6 +5371,7 @@ fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
     if (snap.subscriptions.len == 0) return;
 
     const allocator = worker.allocator;
+    const server = worker.h2;
     for (snap.subscriptions) |sub| {
         const prefix = switch (sub.spec) {
             .kv => |k| k.prefix,
@@ -5385,55 +5383,109 @@ fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
                 "rove-js kv-react queue: tenant={s} subscription={s} key={s} op={c}",
                 .{ unit.tenant_id, sub.name, w.key, w.op },
             );
-            const tid_dup = try allocator.dupe(u8, unit.tenant_id);
-            errdefer allocator.free(tid_dup);
-            const name_dup = try allocator.dupe(u8, sub.name);
-            errdefer allocator.free(name_dup);
-            const path_dup = try allocator.dupe(u8, sub.module_path);
-            errdefer allocator.free(path_dup);
-            const key_dup = try allocator.dupe(u8, w.key);
-            errdefer allocator.free(key_dup);
-            try worker.pending_subscription_fires.append(allocator, .{
-                .tenant_id = tid_dup,
-                .subscription_name = name_dup,
-                .module_path = path_dup,
-                .kv_key = key_dup,
-                .kv_op = w.op,
+            try enqueueSubscriptionFire(server.reg, &worker.subscription_fire_pending, allocator, .{
+                .tenant_id = unit.tenant_id,
+                .subscription_name = sub.name,
+                .module_path = sub.module_path,
+                .source = .{ .kv = .{ .key = w.key, .op = w.op } },
             });
         }
     }
 }
 
-/// Drain `worker.pending_subscription_fires`, firing each. Called
-/// at the END of `drainRaftPending` so the recursive dispatch's
-/// effects (which may grow `worker.pending_units` again) don't
-/// invalidate the pending_units iteration. Idempotent — re-entry
-/// during a fire pushes onto `pending_subscription_fires` again,
-/// which drains on the NEXT `drainRaftPending` tick.
-fn drainPendingSubscriptionFires(worker: anytype) void {
-    const allocator = worker.allocator;
-    // Move + clear in one shot — fireSubscriptionActivation may
-    // re-enter this code path (via its own parkKvWakes →
-    // firePendingKvWakes → fireKvReactSubscriptions, on the next
-    // drainRaftPending tick). Without the swap, a chain of kv-react
-    // → kv-write → kv-react... wakes could re-enter while we
-    // iterate the original list.
-    const items = worker.pending_subscription_fires.items;
-    if (items.len == 0) return;
-    const owned = allocator.dupe(PendingSubscriptionFire, items) catch {
-        std.log.warn("rove-js kv-react drain: alloc failed; deferring fires", .{});
-        return;
+/// Parameters for `enqueueSubscriptionFire`. Borrowed slices —
+/// the function dups all owned-on-component fields.
+pub const SubscriptionFireQueueInput = struct {
+    tenant_id: []const u8,
+    subscription_name: []const u8,
+    module_path: []const u8,
+    source: SubscriptionFireSource,
+};
+
+/// Create an entity in `subscription_fire_pending` with the input
+/// fields duped onto its `SubscriptionFireDescriptor` component.
+/// Component-side allocator-owned strings free structurally on
+/// destroy via rove's collection-deinit (no manual cleanup).
+pub fn enqueueSubscriptionFire(
+    reg: *rove.Registry,
+    pending: anytype,
+    allocator: std.mem.Allocator,
+    in: SubscriptionFireQueueInput,
+) !void {
+    const tid = try allocator.dupe(u8, in.tenant_id);
+    errdefer allocator.free(tid);
+    const name = try allocator.dupe(u8, in.subscription_name);
+    errdefer allocator.free(name);
+    const path = try allocator.dupe(u8, in.module_path);
+    errdefer allocator.free(path);
+
+    var desc: components_mod.SubscriptionFireDescriptor = .{
+        .tenant_id = tid,
+        .subscription_name = name,
+        .module_path = path,
     };
-    worker.pending_subscription_fires.clearRetainingCapacity();
-    defer allocator.free(owned);
-    for (owned) |*fire| {
-        defer fire.deinit(allocator);
+    switch (in.source) {
+        .cron => |c| {
+            desc.source_kind = .cron;
+            desc.cron_fired_at_ns = c.fired_at_ns;
+        },
+        .kv => |k| {
+            desc.source_kind = .kv;
+            desc.kv_key = try allocator.dupe(u8, k.key);
+            desc.kv_op = k.op;
+        },
+        .boot => |b| {
+            desc.source_kind = .boot;
+            desc.boot_deployment_id = b.deployment_id;
+        },
+    }
+    errdefer if (desc.kv_key.len > 0) allocator.free(desc.kv_key);
+
+    const ent = try reg.create(pending);
+    try reg.set(ent, pending, components_mod.SubscriptionFireDescriptor, desc);
+}
+
+/// Worker-tick system: dispatch every entity in
+/// `subscription_fire_pending`. Iterates a stable entity-id snapshot
+/// (copied into a local buffer) so re-entrant `enqueueSubscriptionFire`
+/// calls during a fire land in the deferred-create queue and
+/// process next tick. `reg.destroy` is deferred too — component
+/// strings free structurally on `reg.flush`.
+///
+/// Per-tick cap (`BATCH`) bounds tail latency on the request hot
+/// path: a misbehaving handler with many fires pending eats at
+/// most `BATCH` activations per tick before yielding back to the
+/// h2 loop. Remaining fires drain on subsequent ticks.
+pub fn dispatchSubscriptionFires(worker: anytype) void {
+    const BATCH: usize = 64;
+    const server = worker.h2;
+    var buf: [BATCH]rove.Entity = undefined;
+    const slice = worker.subscription_fire_pending.entitySlice();
+    const n = @min(slice.len, BATCH);
+    if (n == 0) return;
+    std.mem.copyForwards(rove.Entity, buf[0..n], slice[0..n]);
+
+    for (buf[0..n]) |ent| {
+        const desc = server.reg.get(
+            ent,
+            &worker.subscription_fire_pending,
+            components_mod.SubscriptionFireDescriptor,
+        ) catch continue;
+        const source: SubscriptionFireSource = switch (desc.source_kind) {
+            .cron => .{ .cron = .{ .fired_at_ns = desc.cron_fired_at_ns } },
+            .kv => .{ .kv = .{ .key = desc.kv_key, .op = desc.kv_op } },
+            .boot => .{ .boot = .{ .deployment_id = desc.boot_deployment_id } },
+        };
         fireSubscriptionActivation(
             worker,
-            fire.tenant_id,
-            fire.subscription_name,
-            fire.module_path,
-            .{ .kv = .{ .key = fire.kv_key, .op = fire.kv_op } },
+            desc.tenant_id,
+            desc.subscription_name,
+            desc.module_path,
+            source,
+        );
+        server.reg.destroy(ent) catch |err| std.log.warn(
+            "rove-js subscription-fire: destroy failed: {s}",
+            .{@errorName(err)},
         );
     }
 }
