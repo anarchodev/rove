@@ -101,6 +101,25 @@ pub const ActivationSource = enum(u8) {
     /// source: { kind:"cron"|"kv"|"boot", ... } }`. There's no
     /// held socket; `Response` is recorded but not transmitted.
     subscription_fire = 6,
+    /// Upstream send chunk (`docs/primitive-gaps.md` §2.3 +
+    /// `docs/upstream-streaming-plan.md` §3). A handler opted into
+    /// per-chunk visibility via `http.send({stream_response: true})`
+    /// receives one of these per upstream chunk: `request.activation
+    /// = { kind: "send_chunk", send_id, seq, byte_offset, bytes,
+    /// send_headers? }`. The chain continues until `send_end`.
+    send_chunk = 7,
+    /// Terminal of a `stream_response: true` send. `request.activation
+    /// = { kind: "send_end", send_id, ok, status, trailers }`.
+    /// Counterpart to `send_callback` but for chunked sends: the
+    /// body arrived as chunks, this carries the metadata + status.
+    send_end = 8,
+    /// Terminal of a `pipe_to: "held_response"` send. Handler is
+    /// NOT invoked per chunk; the runtime pipes upstream bytes
+    /// directly into the held client's `StreamChunks`. The
+    /// terminal fires once upstream closes: `request.activation =
+    /// { kind: "send_pipe_done", send_id, ok, status, bytes_piped,
+    /// dropped_chunks }`.
+    send_pipe_done = 9,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`

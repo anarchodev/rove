@@ -1665,6 +1665,12 @@ pub fn installRequest(
         .kv_wake => "kv",
         .wake_batch => "wake_batch",
         .subscription_fire => "subscription_fire",
+        // Gap 2.3 phases D/E wire the payload fields onto
+        // `request.activation`; Phase A surfaces just the kind
+        // string so the enum is exhaustive + the build stays clean.
+        .send_chunk => "send_chunk",
+        .send_end => "send_end",
+        .send_pipe_done => "send_pipe_done",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation_source == .kv_wake) {
