@@ -36,6 +36,7 @@ const writeset = @import("writeset.zig");
 const snapshot = @import("raft_snapshot.zig");
 const callbacks = @import("raft_callbacks.zig");
 const batcher = @import("proposal_batcher.zig");
+const dispatch_metrics_mod = @import("dispatch_metrics.zig");
 
 pub const c = @cImport({
     @cInclude("stddef.h");
@@ -496,6 +497,14 @@ pub const RaftNode = struct {
     /// the leader so deltas never mix pre- and post-snapshot rows.
     snapshot_seq: u64,
 
+    /// Leader-side propose-pipeline observability (see
+    /// `dispatch_metrics.zig`). Observed at every `packBatch` exit
+    /// and snapshot via `proposalBatchSizeSnapshot` / `proposalLingerWaitSnapshot`
+    /// for `/_system/metrics`. Atomic so a follower-side snapshot
+    /// reader can scrape safely while the leader thread is observing.
+    proposal_batch_size: dispatch_metrics_mod.CountHistogram = .{},
+    proposal_linger_wait_us: dispatch_metrics_mod.MicrosHistogram = .{},
+
     /// Monotonic timestamp of the last periodic snapshot attempt. Used by
     /// `maybeSnapshot` to space attempts out.
     last_snapshot_attempt_ns: i64,
@@ -797,6 +806,20 @@ pub const RaftNode = struct {
     /// read this at txn-start time to establish an "after seq" bound.
     pub fn highWatermark(self: *RaftNode) u64 {
         return self.high_watermark.load(.acquire);
+    }
+
+    /// Snapshot the leader-side propose-batch-size histogram for
+    /// `/_system/metrics`. Safe to call from any thread (atomic
+    /// reads), though the underlying counters only advance on the
+    /// raft thread.
+    pub fn proposalBatchSizeSnapshot(self: *RaftNode) dispatch_metrics_mod.CountHistogram.Snapshot {
+        return self.proposal_batch_size.snapshot();
+    }
+
+    /// Snapshot the leader-side linger-wait histogram for
+    /// `/_system/metrics`. See `proposalBatchSizeSnapshot`.
+    pub fn proposalLingerWaitSnapshot(self: *RaftNode) dispatch_metrics_mod.MicrosHistogram.Snapshot {
+        return self.proposal_linger_wait_us.snapshot();
     }
 
     /// willemt's current term. Caller-side snapshot orchestration

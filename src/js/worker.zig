@@ -1337,6 +1337,13 @@ pub const NodeState = struct {
     /// — a single global mutex measured as a ~4× regression.
     tape_state_shards: [TAPE_STATE_SHARDS]TapeStateShard = [_]TapeStateShard{.{}} ** TAPE_STATE_SHARDS,
 
+    /// Worker-side propose-pipeline observability. Observed at
+    /// `finalizeBatch` exit with the number of handler-bound
+    /// requests in this writeset envelope. Combined with the
+    /// leader-side `RaftNode.proposal_batch_size`, answers "how
+    /// many customer requests ride one raft log entry".
+    dispatch_writeset_size: kv_mod.CountHistogram = .{},
+
     /// Gap 2.3 Phase C1: cross-thread queue of pending fetches
     /// awaiting transport. Producer: worker's batch-finalize
     /// phase calls `enqueuePendingFetches` to move handler-built

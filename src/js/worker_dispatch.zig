@@ -677,6 +677,11 @@ fn finalizeBatch(
     // confirms (forward iteration, so chain head commits first).
     try worker.pending_txns.put(allocator, seq, txn);
 
+    // Observe writeset-size for `/_system/metrics`. Pair with
+    // `raft_proposal_batch_size_writesets` (leader-side) to see how
+    // many customer requests ride one raft log entry.
+    worker.node.dispatch_writeset_size.observe(@intCast(successes.items.len));
+
     // Option (b) 4b-ii-B: gate `_send/owed/` arm + `_send/owed/`
     // delete/`_send/proof/` resolve on this batch's commit, keyed by
     // the same `seq` the entities wait on. No-op when the batch wrote
@@ -1119,6 +1124,26 @@ fn handleMetrics(
     // convention (kvexp records nanoseconds internally; we convert).
     try writeKvexpMetrics(w, worker.node.tenant.root.manifestMetricsSnapshot());
 
+    // ── propose-pipeline histograms ──────────────────────────────────
+    //
+    // Two questions the operator wants answered: are we time-capped
+    // or size-capped at each layer? And how many customer requests
+    // ride one raft log entry?
+    //
+    //   dispatch_writeset_size_requests   — handler-bound requests
+    //     per writeset envelope (observed at `finalizeBatch`).
+    //   raft_proposal_batch_size_writesets — writesets per
+    //     `raft_recv_entry` call (observed at `packBatch`).
+    //   raft_proposal_linger_wait_us       — leader linger time
+    //     before each pack.
+    //
+    // Multiplying the medians of the first two gives "customer
+    // requests per raft entry". If the third is bumping the
+    // `--propose-linger-us` value, the linger budget could be raised.
+    try writeCountHistogram(w, "dispatch_writeset_size_requests", worker.node.dispatch_writeset_size.snapshot());
+    try writeCountHistogram(w, "raft_proposal_batch_size_writesets", worker.raft.proposalBatchSizeSnapshot());
+    try writeMicrosHistogram(w, "raft_proposal_linger_wait_us", worker.raft.proposalLingerWaitSnapshot());
+
     // Move the writer's accumulated bytes back into the ArrayList,
     // then transfer ownership to the response body. `toArrayList`
     // does NOT free the writer's buffer — it hands it back to us.
@@ -1233,6 +1258,36 @@ fn writeKvexpHistogram(
     try w.print(name ++ "_bucket{{le=\"+Inf\"}} {d}\n", .{h.count});
     const sum_seconds: f64 = @as(f64, @floatFromInt(h.sum_nanos)) / 1_000_000_000.0;
     try w.print(name ++ "_sum {d}\n", .{sum_seconds});
+    try w.print(name ++ "_count {d}\n", .{h.count});
+}
+
+fn writeCountHistogram(
+    w: *std.Io.Writer,
+    comptime name: []const u8,
+    h: kv_mod.CountHistogram.Snapshot,
+) !void {
+    try w.print("# TYPE " ++ name ++ " histogram\n", .{});
+    const bounds = kv_mod.CountHistogram.bucket_bounds;
+    inline for (bounds, 0..) |b, i| {
+        try w.print(name ++ "_bucket{{le=\"{d}\"}} {d}\n", .{ b, h.buckets[i] });
+    }
+    try w.print(name ++ "_bucket{{le=\"+Inf\"}} {d}\n", .{h.count});
+    try w.print(name ++ "_sum {d}\n", .{h.sum});
+    try w.print(name ++ "_count {d}\n", .{h.count});
+}
+
+fn writeMicrosHistogram(
+    w: *std.Io.Writer,
+    comptime name: []const u8,
+    h: kv_mod.MicrosHistogram.Snapshot,
+) !void {
+    try w.print("# TYPE " ++ name ++ " histogram\n", .{});
+    const bounds = kv_mod.MicrosHistogram.bucket_bounds_us;
+    inline for (bounds, 0..) |us, i| {
+        try w.print(name ++ "_bucket{{le=\"{d}\"}} {d}\n", .{ us, h.buckets[i] });
+    }
+    try w.print(name ++ "_bucket{{le=\"+Inf\"}} {d}\n", .{h.count});
+    try w.print(name ++ "_sum {d}\n", .{h.sum_us});
     try w.print(name ++ "_count {d}\n", .{h.count});
 }
 
