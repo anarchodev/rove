@@ -80,6 +80,7 @@ const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const send_dispatch_mod = @import("send_dispatch.zig");
+const fetch_pool_mod = @import("fetch_pool.zig");
 const send_outbox_mod = @import("send_outbox.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = dispatcher_mod.Request;
@@ -409,6 +410,60 @@ pub const SubscriptionFireInbox = struct {
         if (self.messages.items.len == 0) return;
         try out.appendSlice(self.allocator, self.messages.items);
         self.messages.clearRetainingCapacity();
+    }
+};
+
+/// Gap 2.3 Phase C2: per-worker cross-thread inbox of upstream
+/// fetch events (chunk / end / pipe_done). Producer: the node-
+/// wide `FetchPool` threads that drive libcurl on outbound
+/// `http.fetch` calls — each chunk libcurl writes back becomes
+/// one `UpstreamFetchEvent` here. Consumer: the owning worker
+/// drains on its tick (Phase D), translates each event into a
+/// `fetch_event_pending` collection entity, and dispatches an
+/// `on_chunk` / `on_done` activation against the chain.
+///
+/// Hash-routed by `tenant_id` (same stickiness as
+/// `SubscriptionFireInbox` + the kv-wake inbox) so a chain's
+/// chunks always land on the same worker that holds the chain's
+/// qjs module cache.
+///
+/// Cross-thread ownership: producers build a fully-owned
+/// `UpstreamFetchEvent` (allocator from NodeState, the same
+/// allocator the worker will use to deinit it). `push` moves it
+/// in. `drainInto` moves it out — worker is then responsible
+/// for `UpstreamFetchEvent.deinit` on drop.
+pub const FetchChunkInbox = struct {
+    mutex: std.Thread.Mutex = .{},
+    events: std.ArrayListUnmanaged(components_mod.UpstreamFetchEvent) = .empty,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) FetchChunkInbox {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *FetchChunkInbox) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        components_mod.UpstreamFetchEvent.deinit(self.allocator, self.events.items);
+        self.events.deinit(self.allocator);
+    }
+
+    /// Enqueue one event; ownership of every owned slice
+    /// transfers to the inbox.
+    pub fn push(self: *FetchChunkInbox, ev: components_mod.UpstreamFetchEvent) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.events.append(self.allocator, ev);
+    }
+
+    /// Move all queued events into the caller's local list.
+    /// Inbox is empty after the call. Caller takes ownership.
+    pub fn drainInto(self: *FetchChunkInbox, out: *std.ArrayListUnmanaged(components_mod.UpstreamFetchEvent)) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.events.items.len == 0) return;
+        try out.appendSlice(self.allocator, self.events.items);
+        self.events.clearRetainingCapacity();
     }
 };
 
@@ -1270,11 +1325,32 @@ pub const NodeState = struct {
     /// phase calls `enqueuePendingFetches` to move handler-built
     /// `PendingFetch`es here. Consumer: Phase C2's `fetch_pool`
     /// threads drain + issue libcurl + deliver chunks via
-    /// `fetch_chunk_inbox`. For C1 (no consumer yet), entries sit
-    /// in the queue until NodeState shutdown, where any
-    /// undrained entries are freed with a one-shot warning.
+    /// `fetch_chunk_inbox`.
+    ///
+    /// Phase C2 wires the pool: the cond signal is fired on every
+    /// `enqueuePendingFetches`; pool threads wait on it. On
+    /// shutdown `fetch_pool` joins all threads, after which any
+    /// undrained entries are freed in `NodeState.deinit`.
     fetch_pending_mutex: std.Thread.Mutex = .{},
     fetch_pending: std.ArrayListUnmanaged(globals.PendingFetch) = .empty,
+    fetch_pending_cond: std.Thread.Condition = .{},
+
+    /// Gap 2.3 Phase C2: per-worker `FetchChunkInbox` registry,
+    /// mirror of `sub_fire_inboxes`. The `FetchPool`'s threads
+    /// (running off-worker) hash-route each upstream chunk to a
+    /// worker via `enqueueFetchEventForTenant`. Same
+    /// `hash(tenant_id) % N_inboxes` stickiness as the wake +
+    /// sub-fire registries so a chain's chunks always reach the
+    /// worker that holds the chain's qjs module cache.
+    fetch_chunk_inboxes_mutex: std.Thread.Mutex = .{},
+    fetch_chunk_inboxes: std.ArrayListUnmanaged(*FetchChunkInbox) = .empty,
+
+    /// Gap 2.3 Phase C2: the dedicated outbound-fetch pool. Lazy
+    /// init via `startFetchPool` after NodeState is fully wired
+    /// (so producers see a non-null value before they enqueue).
+    /// Threads drain `fetch_pending`, fire libcurl synchronously,
+    /// chunk the response, and call `enqueueFetchEventForTenant`.
+    fetch_pool: ?*fetch_pool_mod.FetchPool = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1335,15 +1411,20 @@ pub const NodeState = struct {
         }
     }
 
-    /// Gap 2.3 Phase C1: move accumulated fetches into the node
-    /// queue. The handler accumulated these into a caller-owned
-    /// list during its run; the worker calls this at
-    /// batch-finalize time (handler completed without throwing).
-    /// Ownership of every slice transfers from the caller's list
-    /// into `fetch_pending`; the caller MUST clear its source
-    /// list after this returns so its defer doesn't double-free.
-    /// Phase C2 wires the fetch-pool consumer that drains this
-    /// queue + fires libcurl.
+    /// Gap 2.3 Phase C1+C2: move accumulated fetches into the
+    /// node queue + wake the pool. The handler accumulated these
+    /// into a caller-owned list during its run; the worker calls
+    /// this at batch-finalize time (handler completed without
+    /// throwing). Ownership of every slice transfers from the
+    /// caller's list into `fetch_pending`; the caller MUST clear
+    /// its source list after this returns so its defer doesn't
+    /// double-free.
+    ///
+    /// On success we `broadcast` the cond — multiple pool threads
+    /// can pick up the batch in parallel. If `fetch_pool` is
+    /// null (not yet started, or already shut down) the entries
+    /// still land in `fetch_pending`; `NodeState.deinit` frees
+    /// them on shutdown.
     pub fn enqueuePendingFetches(
         self: *NodeState,
         items: []const globals.PendingFetch,
@@ -1353,6 +1434,49 @@ pub const NodeState = struct {
         defer self.fetch_pending_mutex.unlock();
         try self.fetch_pending.ensureUnusedCapacity(self.allocator, items.len);
         for (items) |pf| self.fetch_pending.appendAssumeCapacity(pf);
+        self.fetch_pending_cond.broadcast();
+    }
+
+    /// Gap 2.3 Phase C2: register a worker's fetch-chunk inbox.
+    /// Same lifecycle as `registerSubFireInbox`.
+    pub fn registerFetchChunkInbox(self: *NodeState, inbox: *FetchChunkInbox) !void {
+        self.fetch_chunk_inboxes_mutex.lock();
+        defer self.fetch_chunk_inboxes_mutex.unlock();
+        try self.fetch_chunk_inboxes.append(self.allocator, inbox);
+    }
+
+    pub fn unregisterFetchChunkInbox(self: *NodeState, inbox: *FetchChunkInbox) void {
+        self.fetch_chunk_inboxes_mutex.lock();
+        defer self.fetch_chunk_inboxes_mutex.unlock();
+        var i: usize = 0;
+        while (i < self.fetch_chunk_inboxes.items.len) : (i += 1) {
+            if (self.fetch_chunk_inboxes.items[i] == inbox) {
+                _ = self.fetch_chunk_inboxes.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Gap 2.3 Phase C2: hash-route a fetch event (chunk / end /
+    /// pipe_done) to the worker whose inbox is
+    /// `hash(tenant_id) % N_inboxes`. Caller-side ownership
+    /// transfers in on success; on `error.NoWorkers` the caller
+    /// retains the event and is responsible for `deinit`.
+    pub fn enqueueFetchEventForTenant(
+        self: *NodeState,
+        tenant_id: []const u8,
+        ev: components_mod.UpstreamFetchEvent,
+    ) !void {
+        self.fetch_chunk_inboxes_mutex.lock();
+        const n = self.fetch_chunk_inboxes.items.len;
+        if (n == 0) {
+            self.fetch_chunk_inboxes_mutex.unlock();
+            return error.NoWorkers;
+        }
+        const inbox_idx = std.hash.Wyhash.hash(0, tenant_id) % n;
+        const inbox = self.fetch_chunk_inboxes.items[inbox_idx];
+        self.fetch_chunk_inboxes_mutex.unlock();
+        try inbox.push(ev);
     }
 
     /// Gap 2.1 Phase D: hash-route a subscription fire to the
@@ -1440,12 +1564,23 @@ pub const NodeState = struct {
     }
 
     pub fn deinit(self: *NodeState) void {
+        // Gap 2.3 Phase C2: stop + join the fetch pool BEFORE any
+        // other tear-down so its threads don't observe half-freed
+        // state. Workers already deinit'd their fetch-chunk
+        // inboxes in their own destroy path; we drained those
+        // back the registry below.
+        if (self.fetch_pool) |fp| {
+            fp.shutdown();
+            fp.deinit();
+            self.fetch_pool = null;
+        }
         // Drop the inbox registry first — workers destroy their
         // inboxes in their own deinit, so by the time NodeState
         // tears down, every inbox should already be unregistered.
         // The list itself is owned by NodeState's allocator.
         self.wake_inboxes.deinit(self.allocator);
         self.sub_fire_inboxes.deinit(self.allocator);
+        self.fetch_chunk_inboxes.deinit(self.allocator);
         {
             var cs_it = self.cron_state.iterator();
             while (cs_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
@@ -1457,15 +1592,16 @@ pub const NodeState = struct {
             self.tape_state.deinit(self.allocator);
         }
         {
-            // Gap 2.3 Phase C1: drop any pending fetches the
-            // pool didn't drain (C1 has no pool yet, so this
-            // fires on every shutdown with pending fetches —
-            // expected until C2 lands). One-shot warning + free.
+            // Gap 2.3 Phase C2: any pending fetches the pool
+            // didn't drain at shutdown (the pool drained until
+            // told to stop; entries that arrived after the stop
+            // signal stay queued). Free them with a one-shot
+            // warning if non-empty — not an error, just visible.
             self.fetch_pending_mutex.lock();
             defer self.fetch_pending_mutex.unlock();
             if (self.fetch_pending.items.len > 0) {
                 std.log.warn(
-                    "rove-js: dropping {d} pending http.fetch entries at shutdown (fetch-pool not yet wired — Gap 2.3 Phase C2)",
+                    "rove-js: dropping {d} pending http.fetch entries at shutdown (queued after pool stop)",
                     .{self.fetch_pending.items.len},
                 );
             }
@@ -1527,6 +1663,18 @@ pub const NodeState = struct {
         sd.configure(self_ctx, sendDispatchIsLeaderNode, self_ctx, sendDispatchRecoverFnNode);
         try sd.start();
         self.send_dispatch = sd;
+    }
+
+    /// Gap 2.3 Phase C2: spawn the outbound `http.fetch` pool.
+    /// Idempotent. Called once from `main.zig` after NodeState is
+    /// wired + workers have spawned (so their fetch-chunk inboxes
+    /// are registered before the first chunk hash-routes through).
+    pub fn startFetchPool(self: *NodeState) !void {
+        if (self.fetch_pool != null) return;
+        const fp = try fetch_pool_mod.FetchPool.init(self.allocator, self);
+        errdefer fp.deinit();
+        try fp.start();
+        self.fetch_pool = fp;
     }
 
     /// Lookup-or-lazy-open under `tenant_files_lock`.
@@ -1977,6 +2125,14 @@ pub fn Worker(comptime opts: Options) type {
         /// at startup so producers reach the right worker via
         /// `enqueueSubscriptionFireForTenant` hash-routing.
         sub_fire_inbox: SubscriptionFireInbox = undefined,
+        /// Gap 2.3 Phase C2: cross-thread inbox of upstream
+        /// fetch events. Producer: the node-wide `FetchPool`
+        /// threads. Consumer: this worker's tick (Phase D drains
+        /// + translates into `fetch_event_pending` entities).
+        /// Registered with NodeState at startup so the pool
+        /// reaches the right worker via
+        /// `enqueueFetchEventForTenant` hash-routing.
+        fetch_chunk_inbox: FetchChunkInbox = undefined,
         /// Gap 2.1 Phase F: monotonic-ns of the last
         /// `sweepCronSubscriptions` invocation. Used to throttle
         /// the per-tick cron sweep to at most one pass per
@@ -2139,6 +2295,7 @@ pub fn Worker(comptime opts: Options) type {
                 .subscription_fire_pending = try SubFireColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
                 .sub_fire_inbox = SubscriptionFireInbox.init(allocator),
+                .fetch_chunk_inbox = FetchChunkInbox.init(allocator),
                 .dispatcher = try Dispatcher.init(allocator),
                 .node = config.node,
                 .raft = config.raft,
@@ -2195,6 +2352,13 @@ pub fn Worker(comptime opts: Options) type {
             // can hash-route fires to this worker.
             try config.node.registerSubFireInbox(&self.sub_fire_inbox);
             errdefer config.node.unregisterSubFireInbox(&self.sub_fire_inbox);
+
+            // Gap 2.3 Phase C2: register the fetch-chunk inbox with
+            // the node so the `FetchPool` reaches this worker via
+            // `enqueueFetchEventForTenant` hash-routing. Same
+            // lifecycle as sub_fire_inbox above.
+            try config.node.registerFetchChunkInbox(&self.fetch_chunk_inbox);
+            errdefer config.node.unregisterFetchChunkInbox(&self.fetch_chunk_inbox);
 
             // Eagerly open per-worker tenant_logs (request_id minters
             // bake the worker_id into the upper 16 bits; can't share).
@@ -2319,6 +2483,13 @@ pub fn Worker(comptime opts: Options) type {
             // cron sweeper) can push after we start freeing entries.
             self.node.unregisterSubFireInbox(&self.sub_fire_inbox);
             self.sub_fire_inbox.deinit();
+            // Gap 2.3 Phase C2: same ordering for the fetch-chunk
+            // inbox. NodeState.deinit stops the FetchPool BEFORE
+            // it deinits workers, so the producer side is already
+            // quiesced — but unregister-first keeps the invariant
+            // uniform across all three inboxes.
+            self.node.unregisterFetchChunkInbox(&self.fetch_chunk_inbox);
+            self.fetch_chunk_inbox.deinit();
             self.parked_continuations.deinit();
             self.subscription_fire_pending.deinit();
             self.parked_units.deinit();
