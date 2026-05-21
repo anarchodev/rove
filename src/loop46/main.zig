@@ -1456,6 +1456,13 @@ pub fn main() !void {
     try node_state.startSendDispatch();
     loop46_ctx.send_dispatch = node_state.send_dispatch;
 
+    // Gap 2.3 Phase C2: the outbound http.fetch pool. Separate
+    // saturation domain from `SendDispatch` (transient + best-
+    // effort, not durable + at-least-once). Inbox-registration
+    // happens later when workers spawn; the pool tolerates a
+    // cold-start window where no inboxes exist (warns once + drops).
+    try node_state.startFetchPool();
+
     // streaming-handlers-plan §4.6: hand the apply path a pointer
     // to NodeState so `applyWriteSet` can `broadcastKvWake` across
     // every worker's `KvWakeInbox`. Type-erased through `?*anyopaque`
