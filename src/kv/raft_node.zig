@@ -65,7 +65,12 @@ pub const Transport = struct {
 
     pub const VTable = struct {
         send: *const fn (ptr: *anyopaque, peer_id: u32, frame: []const u8) anyerror!void,
-        tick: *const fn (ptr: *anyopaque, now_ns: i64) anyerror!void,
+        /// `wait_timeout_ns == 0`: non-blocking poll.
+        /// `wait_timeout_ns > 0`: block up to that long for any CQE
+        /// (a real network event or the timeout). Lets the raft
+        /// thread sleep in the kernel between ticks without losing
+        /// heartbeat / proposal-arrival responsiveness.
+        tick: *const fn (ptr: *anyopaque, now_ns: i64, wait_timeout_ns: u64) anyerror!void,
         add_peer: *const fn (ptr: *anyopaque, peer_id: u32, addr: PeerAddr) anyerror!void,
         remove_peer: *const fn (ptr: *anyopaque, peer_id: u32) void,
         is_peer_configured: *const fn (ptr: *anyopaque, peer_id: u32) bool,
@@ -74,8 +79,8 @@ pub const Transport = struct {
     pub fn send(self: Transport, peer_id: u32, frame: []const u8) !void {
         return self.vtable.send(self.ptr, peer_id, frame);
     }
-    pub fn tick(self: Transport, now_ns: i64) !void {
-        return self.vtable.tick(self.ptr, now_ns);
+    pub fn tick(self: Transport, now_ns: i64, wait_timeout_ns: u64) !void {
+        return self.vtable.tick(self.ptr, now_ns, wait_timeout_ns);
     }
     pub fn addPeer(self: Transport, peer_id: u32, addr: PeerAddr) !void {
         return self.vtable.add_peer(self.ptr, peer_id, addr);
@@ -96,9 +101,9 @@ fn raftNetVTable() *const Transport.VTable {
             const net: *raft_net_mod.RaftNet = @ptrCast(@alignCast(ptr));
             return net.send(peer_id, frame);
         }
-        fn tick(ptr: *anyopaque, now_ns: i64) anyerror!void {
+        fn tick(ptr: *anyopaque, now_ns: i64, wait_timeout_ns: u64) anyerror!void {
             const net: *raft_net_mod.RaftNet = @ptrCast(@alignCast(ptr));
-            return net.tick(now_ns, false);
+            return net.tick(now_ns, wait_timeout_ns);
         }
         fn addPeer(ptr: *anyopaque, peer_id: u32, addr: PeerAddr) anyerror!void {
             const net: *raft_net_mod.RaftNet = @ptrCast(@alignCast(ptr));
@@ -235,6 +240,17 @@ pub const Config = struct {
     /// preventing runaway queue growth under bursty load. Must be
     /// > 0 if `propose_linger_ns` is non-zero.
     propose_linger_max_batch: usize = 128,
+    /// Upper bound on how long `RaftNode.tick` will block waiting for
+    /// an io_uring CQE (network event) before returning to drive
+    /// the next periodic step. Lets the raft thread sleep in the
+    /// kernel between ticks rather than spinning. Set to 0 to
+    /// disable blocking (callers like single-threaded tests step
+    /// the node manually). Production loop sets a small value
+    /// (100 µs – 1 ms) so proposal-arrival latency, snapshot ticks,
+    /// and willemt's `raft_periodic` heartbeat checks all stay
+    /// inside an interactive budget. Must be < `heartbeat_ms / 2`
+    /// to keep heartbeats reliably firing.
+    tick_wait_timeout_ns: u64 = 0,
 };
 
 /// Hard cap on worker_count. Matches shift-js's MAX_WORKERS.
@@ -1225,8 +1241,12 @@ pub const RaftNode = struct {
         }
 
         // 3. Pump networking. Inbound RPCs invoked synchronously by
-        //    onPeerMessage update the willemt state machine.
-        try self.transport.tick(now_ns);
+        //    onPeerMessage update the willemt state machine. When
+        //    `tick_wait_timeout_ns > 0`, this is the call that blocks
+        //    the raft thread in the kernel until either a CQE or the
+        //    timeout fires — replacing the legacy unconditional
+        //    sleep with an event-driven wait.
+        try self.transport.tick(now_ns, self.config.tick_wait_timeout_ns);
 
         // 4. Periodic snapshot attempt (leader only, kv-apply mode only).
         if (self.isLeader() and self.config.apply == .kv) {
@@ -1249,12 +1269,11 @@ pub const RaftNode = struct {
             if (self.stopping.load(.acquire)) break;
             if (stop) |s| if (s.load(.acquire)) break;
             try self.tick(@intCast(std.time.nanoTimestamp()));
-            // Yield briefly so an idle cluster doesn't peg a core.
-            // Under load the 1ms floor is acceptable: proposals batch
-            // across ticks, and the raft thread's per-tick fsync is
-            // already amortized over the batch. For higher throughput,
-            // use `propose_linger_ns` to accumulate larger batches.
-            std.Thread.sleep(std.time.ns_per_ms);
+            // With `config.tick_wait_timeout_ns > 0`, `transport.tick`
+            // already blocked in io_uring until a CQE or the timeout
+            // fired — no explicit yield/sleep needed here. With the
+            // default 0, the loop polls; callers stepping a node
+            // manually (tests) use that mode.
         }
 
         // Drain phase: keep ticking so any proposals that were in-flight

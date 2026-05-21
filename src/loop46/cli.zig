@@ -172,6 +172,16 @@ pub const Cli = struct {
     /// higher to reduce wire chatter on bandwidth-constrained
     /// links.
     request_timeout_ms: u32 = 200,
+    /// Upper bound (in µs) on how long the raft thread will block in
+    /// io_uring waiting for the next network event before re-running
+    /// its periodic tick (proposal drain + heartbeat check). With 0
+    /// the raft thread polls without ever sleeping (legacy behavior;
+    /// burns one core but never adds latency). With a sub-millisecond
+    /// value the thread sleeps in the kernel between events, waking
+    /// instantly on any CQE. 100 µs is a good default: well under
+    /// the heartbeat / 2 ceiling, and small enough to feel
+    /// interactive for proposal arrivals on otherwise idle nodes.
+    raft_tick_timeout_us: u32 = 100,
     /// Public origin the dashboard / CLI hits to call files-server.
     /// Required when serving the admin dashboard — the operator runs
     /// `files-server-standalone` as a separate process and points

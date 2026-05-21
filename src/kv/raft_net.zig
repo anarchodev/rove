@@ -61,7 +61,14 @@ const OpType = enum(u8) {
     connect = 2,
     recv = 3,
     send = 4,
+    /// Sentinel for io_uring timeout CQEs submitted by `tick` to
+    /// wake the raft thread on heartbeat / proposal-arrival latency
+    /// bounds. Recognized in `handleCqe` and dropped silently.
+    timeout = 5,
 };
+
+/// User-data for the timeout CQE submitted in `tick(wait_timeout_ns > 0)`.
+const TIMEOUT_UD: u64 = (@as(u64, @intFromEnum(OpType.timeout)) << 56);
 
 fn encodeUd(op: OpType, idx: u32) u64 {
     return (@as(u64, @intFromEnum(op)) << 56) | @as(u64, idx);
@@ -367,7 +374,20 @@ pub const RaftNet = struct {
 
     /// Drive one tick. `now_ns` is a monotonic timestamp used for reconnect
     /// timing. If `wait` is true, blocks until at least one CQE arrives.
-    pub fn tick(self: *RaftNet, now_ns: i64, wait: bool) !void {
+    /// Drive the io_uring ring forward and (optionally) block on it.
+    ///
+    /// `wait_timeout_ns == 0` — non-blocking: submit any queued SQEs,
+    /// drain whatever CQEs are ready, return. The historical mode
+    /// used by tests that want manual stepping.
+    ///
+    /// `wait_timeout_ns > 0` — submit a one-shot timeout SQE for the
+    /// given relative wall-clock duration, then `submit_and_wait(1)`.
+    /// Returns when ANY CQE arrives (network event OR the timeout).
+    /// The timeout CQE is recognized via `OpType.timeout` and
+    /// dropped. This lets the raft thread sleep in the kernel until
+    /// real work shows up while still ensuring an upper bound on
+    /// proposal-arrival latency + heartbeat granularity.
+    pub fn tick(self: *RaftNet, now_ns: i64, wait_timeout_ns: u64) !void {
         // Reconnect any dead outbound peers whose backoff has elapsed.
         for (self.peers, 0..) |*p, i| {
             if (!p.configured) continue;
@@ -377,11 +397,22 @@ pub const RaftNet = struct {
             self.submitConnect(@intCast(i)) catch {};
         }
 
-        _ = self.ring.submit() catch {};
-
-        // Drain completions.
-        if (wait) {
+        if (wait_timeout_ns > 0) {
+            // Best-effort: if the ring is full, skip the timeout
+            // (next tick will retry). The wait below degrades to
+            // non-blocking, equivalent to the historical wait=false
+            // path — correct but adds polling for this iteration.
+            if (self.ring.get_sqe()) |sqe| {
+                const ts: linux.kernel_timespec = .{
+                    .sec = @intCast(wait_timeout_ns / std.time.ns_per_s),
+                    .nsec = @intCast(wait_timeout_ns % std.time.ns_per_s),
+                };
+                sqe.prep_timeout(&ts, 0, 0);
+                sqe.user_data = TIMEOUT_UD;
+            } else |_| {}
             _ = self.ring.submit_and_wait(1) catch {};
+        } else {
+            _ = self.ring.submit() catch {};
         }
 
         var cqe_buf: [64]linux.io_uring_cqe = undefined;
@@ -479,6 +510,9 @@ pub const RaftNet = struct {
             .connect => self.handleConnect(idx, res, now_ns),
             .recv => try self.handleRecv(idx, res, now_ns),
             .send => self.handleSend(idx, res, now_ns),
+            // Timeout CQEs are wake-only — they exist solely to bound
+            // how long `submit_and_wait` blocks. No state to update.
+            .timeout => {},
         }
     }
 
@@ -805,8 +839,8 @@ test "two RaftNets exchange a frame over loopback" {
     const deadline_ns: i128 = std.time.nanoTimestamp() + 2 * std.time.ns_per_s;
     while (std.time.nanoTimestamp() < deadline_ns) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
-        try a.tick(now, false);
-        try b.tick(now, false);
+        try a.tick(now, 0);
+        try b.tick(now, 0);
 
         if (!sent and a.peers[1].state == .connected and b.peers[0].state == .connected) {
             const frame_a_to_b = try raft_rpc.encodeVoteReq(allocator, .{
