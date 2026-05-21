@@ -60,6 +60,10 @@ pub const KvexpMetricsSnapshot = kvexp.MetricsSnapshot;
 pub const KvexpHistogramSnapshot = kvexp.HistogramSnapshot;
 pub const KvexpHistogram = kvexp.Histogram;
 
+const dispatch_metrics = @import("dispatch_metrics.zig");
+pub const CountHistogram = dispatch_metrics.CountHistogram;
+pub const MicrosHistogram = dispatch_metrics.MicrosHistogram;
+
 test {
     _ = kvstore;
     _ = raft_log;
@@ -67,4 +71,5 @@ test {
     _ = raft_net;
     _ = raft_node;
     _ = writeset_mod;
+    _ = dispatch_metrics;
 }

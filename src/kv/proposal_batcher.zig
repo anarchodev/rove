@@ -42,6 +42,7 @@ pub fn drainAndSubmitProposals(self: *RaftNode) !void {
     // Linger gate: hold small batches until either the time cap or
     // the size cap fires. If linger is disabled (the default) this
     // block is a no-op.
+    var observed_linger_us: u64 = 0;
     if (self.config.propose_linger_ns > 0) {
         if (was_empty) {
             self.linger_start_ns = std.time.nanoTimestamp();
@@ -53,6 +54,7 @@ pub fn drainAndSubmitProposals(self: *RaftNode) !void {
         if (!batch_full and !time_up) {
             return;
         }
+        observed_linger_us = @intCast(@divTrunc(@max(waited_ns, 0), std.time.ns_per_us));
     }
 
     const Helper = struct {
@@ -91,6 +93,15 @@ pub fn drainAndSubmitProposals(self: *RaftNode) !void {
         entry.data.len = @intCast(envelope.len);
         var resp = std.mem.zeroes(c.msg_entry_response_t);
         _ = c.raft_recv_entry(self.raft, &entry, &resp);
+
+        // Observe pipeline metrics for `/_system/metrics`. Only the
+        // first pack of this drain pass attributes the linger wait —
+        // splits across BATCH_MAX_ENTRIES boundaries shared the same
+        // window.
+        self.proposal_batch_size.observe(@intCast(batch_slice.len));
+        if (packed_start == 0) {
+            self.proposal_linger_wait_us.observe(observed_linger_us);
+        }
 
         // The queue slots we packed are no longer needed — cbLogOffer
         // has already copied `envelope` into its own allocation for
