@@ -298,6 +298,42 @@ pub const KvWakeInbox = struct {
 /// shuts down cleanly. Configurable per-tenant lands in Phase 2c.
 pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
 
+/// `docs/primitive-gaps.md` §6 — per-chain tape byte cap. Once a
+/// chain (correlation_id) accumulates this many tape bytes across
+/// its activations, subsequent activations flush their log records
+/// without the tape payloads (replay degrades to summary-only past
+/// the cap). 10 MB is generous for normal chains (the LLM-proxy
+/// case stays under 1 MB even for ~3000 chunks); pathological
+/// streams hit the cap and bound the long-term cost.
+///
+/// Operator-tunable per tenant lands in v2 — v1 ships one global
+/// constant. Capture-mode (`tape_mode = on_exception` etc.) is
+/// the v2 storage-cost knob (catalog §6); the cap is the v1
+/// correctness/safety knob.
+pub const TAPE_CAP_BYTES_PER_CHAIN: u64 = 10 * 1024 * 1024;
+
+/// LRU eviction trigger for `NodeState.tape_state`. When the map
+/// reaches this many entries, the oldest-touched chain entries
+/// are dropped to bound memory; the chains they tracked may
+/// re-enter at zero used-bytes (rare in practice — chains usually
+/// terminate well before eviction).
+pub const TAPE_STATE_LRU_CAP: u32 = 10_000;
+
+/// `NodeState.tape_state` value — per-chain tape accounting.
+/// Tiny (~32 bytes); cross-worker but contention is rare because
+/// chains hash-route to a single worker.
+pub const ChainTapeState = struct {
+    bytes_used: u64 = 0,
+    /// Set the first time the chain crosses the cap. Once set,
+    /// `captureTapes` returns empty payloads + emits a one-shot
+    /// log-line warning (the marker on the activation that
+    /// tripped it).
+    capped: bool = false,
+    /// Monotonic counter for LRU eviction — bumped on every
+    /// `captureTapes` touch.
+    last_touch_seq: u64 = 0,
+};
+
 /// One pending subscription fire crossing a thread boundary. The
 /// `deployment_loader` thread (boot) and any future cron sweeper
 /// thread push these into the per-worker `SubscriptionFireInbox`;
@@ -1216,6 +1252,19 @@ pub const NodeState = struct {
     cron_state_mutex: std.Thread.Mutex = .{},
     cron_state: std.StringHashMapUnmanaged(i64) = .empty,
 
+    /// Per-chain tape budget tracker (`docs/primitive-gaps.md` §6).
+    /// Keyed by `correlation_id` (string-owned). Each chain
+    /// accumulates `bytes_used` across all its activations; hitting
+    /// `TAPE_CAP_BYTES_PER_CHAIN` flips `capped = true` and
+    /// `captureTapes` returns empty payloads for subsequent
+    /// activations of that chain. Cross-worker because chains
+    /// are hash-routed and a single chain's activations all land
+    /// on the same worker, but the LRU-cap GC walks the map under
+    /// the mutex so cross-worker contention stays cheap (one map
+    /// per node).
+    tape_state_mutex: std.Thread.Mutex = .{},
+    tape_state: std.StringHashMapUnmanaged(ChainTapeState) = .empty,
+
     pub fn init(
         allocator: std.mem.Allocator,
         tenant: *tenant_mod.Tenant,
@@ -1370,6 +1419,11 @@ pub const NodeState = struct {
             var cs_it = self.cron_state.iterator();
             while (cs_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
             self.cron_state.deinit(self.allocator);
+        }
+        {
+            var ts_it = self.tape_state.iterator();
+            while (ts_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            self.tape_state.deinit(self.allocator);
         }
         if (self.deployment_loader) |l| {
             l.shutdown();
@@ -2711,9 +2765,32 @@ pub fn captureTapes(
     tapes: *RequestTapes,
     request_body: []const u8,
 ) log_mod.TapePayloads {
+    return captureTapesForChain(worker, tapes, request_body, null);
+}
+
+/// `captureTapes` variant that honors the per-chain tape budget
+/// (`docs/primitive-gaps.md` §6). `correlation_id == null` skips
+/// the cap (test paths, anonymous-chain dispatch); a non-null id
+/// consults `NodeState.tape_state` and returns empty payloads
+/// once the chain has exceeded `TAPE_CAP_BYTES_PER_CHAIN`. One-
+/// shot warning + log marker emitted on the activation that
+/// trips the cap.
+pub fn captureTapesForChain(
+    worker: anytype,
+    tapes: *RequestTapes,
+    request_body: []const u8,
+    correlation_id: ?[]const u8,
+) log_mod.TapePayloads {
     const allocator = worker.allocator;
 
     var payloads: log_mod.TapePayloads = .{};
+
+    // §6 cap pre-check: if the chain is already capped, skip
+    // serialize entirely. Saves the CPU + transient bytes for
+    // chains that already hit their budget on a prior activation.
+    if (correlation_id) |cid| {
+        if (chainTapeAlreadyCapped(worker.node, cid)) return payloads;
+    }
 
     const channels = [_]struct {
         tape: *tape_mod.Tape,
@@ -2733,6 +2810,35 @@ pub fn captureTapes(
             continue;
         };
         ch.out.* = bytes;
+    }
+
+    // §6 cap post-serialize: charge this activation's tape bytes
+    // against the chain budget. If we crossed, mark the chain
+    // capped + drop THIS activation's payloads too (so the cap
+    // fires uniformly — no half-recorded activation that
+    // straddles the boundary).
+    if (correlation_id) |cid| {
+        const total =
+            payloads.kv_tape_bytes.len +
+            payloads.date_tape_bytes.len +
+            payloads.math_random_tape_bytes.len +
+            payloads.crypto_random_tape_bytes.len +
+            payloads.module_tree_bytes.len;
+        if (total > 0 and chainTapeChargeAndCheck(worker.node, cid, total)) {
+            std.log.warn(
+                "rove-js tape cap: chain {s} exceeded {d} bytes; subsequent activations record summary-only (catalog §6)",
+                .{ cid, TAPE_CAP_BYTES_PER_CHAIN },
+            );
+            // Drop this activation's payloads to keep the cap
+            // boundary clean — same posture as the §9.4
+            // wake-overflow ring (no half-recorded entries).
+            if (payloads.kv_tape_bytes.len > 0) allocator.free(payloads.kv_tape_bytes);
+            if (payloads.date_tape_bytes.len > 0) allocator.free(payloads.date_tape_bytes);
+            if (payloads.math_random_tape_bytes.len > 0) allocator.free(payloads.math_random_tape_bytes);
+            if (payloads.crypto_random_tape_bytes.len > 0) allocator.free(payloads.crypto_random_tape_bytes);
+            if (payloads.module_tree_bytes.len > 0) allocator.free(payloads.module_tree_bytes);
+            payloads = .{};
+        }
     }
 
     // Request body — captured into the log record so the replay
@@ -2756,6 +2862,95 @@ pub fn captureTapes(
     }
 
     return payloads;
+}
+
+/// `docs/primitive-gaps.md` §6: read-side cap probe. Returns true
+/// iff this chain has already exceeded its budget on a prior
+/// activation. Cheap (one mutex + lookup); no eviction.
+fn chainTapeAlreadyCapped(node: *NodeState, correlation_id: []const u8) bool {
+    node.tape_state_mutex.lock();
+    defer node.tape_state_mutex.unlock();
+    const entry = node.tape_state.getPtr(correlation_id) orelse return false;
+    return entry.capped;
+}
+
+/// `docs/primitive-gaps.md` §6: charge `bytes` to the chain's tape
+/// budget; return true iff this charge crossed the cap (caller is
+/// the activation that tripped it). Subsequent calls on the same
+/// chain see `capped = true` via `chainTapeAlreadyCapped` and
+/// short-circuit.
+///
+/// Also opportunistically evicts the LRU-oldest entry when the
+/// map exceeds `TAPE_STATE_LRU_CAP`. Eviction is best-effort —
+/// dropping a chain entry just resets its tracked bytes (the
+/// chain re-accumulates from zero), which is the same posture as
+/// the §9.4 ring's "we drop oldest under pressure" stance.
+fn chainTapeChargeAndCheck(node: *NodeState, correlation_id: []const u8, bytes: usize) bool {
+    node.tape_state_mutex.lock();
+    defer node.tape_state_mutex.unlock();
+
+    var touch_seq: u64 = undefined;
+    {
+        // Use the map's `count` as a stand-in for monotonic time —
+        // it advances on insertions, and the LRU we'd cull is the
+        // entry with the smallest `last_touch_seq`. Cheap; no
+        // global-counter contention.
+        touch_seq = @intCast(node.tape_state.count() + 1);
+    }
+
+    if (node.tape_state.getPtr(correlation_id)) |entry| {
+        if (entry.capped) return false; // already past cap; this fn isn't the tripper
+        entry.bytes_used += bytes;
+        entry.last_touch_seq = touch_seq;
+        if (entry.bytes_used > TAPE_CAP_BYTES_PER_CHAIN) {
+            entry.capped = true;
+            return true; // we tripped it
+        }
+        return false;
+    }
+
+    // First-sight: insert. May fail under OOM; on failure we fall
+    // through to "no tracking" (cap is best-effort observability
+    // protection, not correctness).
+    const key_copy = node.allocator.dupe(u8, correlation_id) catch return false;
+    node.tape_state.put(node.allocator, key_copy, .{
+        .bytes_used = bytes,
+        .capped = bytes > TAPE_CAP_BYTES_PER_CHAIN,
+        .last_touch_seq = touch_seq,
+    }) catch {
+        node.allocator.free(key_copy);
+        return false;
+    };
+
+    // Opportunistic LRU eviction: if the map crossed its cap on
+    // this insert, drop the entry with the smallest last_touch_seq.
+    // O(N) scan but only triggered at the boundary (N = 10k by
+    // default — sub-ms even on the rare insert that triggers it).
+    if (node.tape_state.count() > TAPE_STATE_LRU_CAP) {
+        evictOldestTapeState(node);
+    }
+
+    return bytes > TAPE_CAP_BYTES_PER_CHAIN; // single huge activation
+}
+
+fn evictOldestTapeState(node: *NodeState) void {
+    // Caller holds `tape_state_mutex`.
+    var oldest_key: ?[]const u8 = null;
+    var oldest_seq: u64 = std.math.maxInt(u64);
+    var it = node.tape_state.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.last_touch_seq < oldest_seq) {
+            oldest_seq = kv.value_ptr.last_touch_seq;
+            oldest_key = kv.key_ptr.*;
+        }
+    }
+    if (oldest_key) |k| {
+        // fetchRemove transfers ownership of the key buffer to
+        // the caller so we can free it after the map drops it.
+        if (node.tape_state.fetchRemove(k)) |removed| {
+            node.allocator.free(removed.key);
+        }
+    }
 }
 
 pub fn captureLog(
