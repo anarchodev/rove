@@ -91,11 +91,20 @@ pub fn writeBatch(
     var json_scratch: std.ArrayList(u8) = .empty;
     defer json_scratch.deinit(allocator);
 
+    // Reusable deflate stream — initialized once, reset between
+    // records, freed at the end. Per-record `deflateInit2_` +
+    // `deflateEnd` was ~35% of leader CPU under sharded write
+    // load (most of it `__memset_avx2` zeroing the ~270 KB state
+    // each call); `deflateReset` reuses that allocation.
+    var deflater: DeflateStream = .{};
+    try deflater.init();
+    defer deflater.deinit();
+
     for (sorted, 0..) |r, i| {
         json_scratch.clearRetainingCapacity();
         encodeRecordJson(allocator, &json_scratch, &r) catch return Error.OutOfMemory;
         const offset = frames.items.len;
-        try compressRawDeflateAppend(allocator, &frames, json_scratch.items);
+        try deflater.appendFrame(allocator, &frames, json_scratch.items);
         const length = frames.items.len - offset;
         idx_records[i] = .{
             .tenant_id = r.tenant_id,
@@ -234,54 +243,75 @@ fn encodeRecordJson(
     try w.writeAll("}");
 }
 
-/// Compress `src` as a raw-deflate stream and append the bytes to
-/// `out`. Each call produces a self-terminating deflate stream
-/// (BFINAL set on the final block); concatenating multiple frames
-/// in `out` is fine because the sidecar's `(offset, length)` per
-/// record bounds each Range GET to exactly one frame.
+/// Reusable raw-deflate stream. The zlib state allocation (~270 KB
+/// for `windowBits=15`) lives for the lifetime of the stream; each
+/// `appendFrame` resets the state and emits a self-terminating
+/// frame. Concatenating multiple frames in one buffer is fine
+/// because the sidecar's `(offset, length)` per record bounds each
+/// Range GET to exactly one frame.
 ///
 /// Uses libz directly — Zig 0.15.x stdlib's `flate.Compress.drain`
 /// has `@panic("TODO")` in the tokenization path and only works on
 /// inputs smaller than the lookahead window. Real log-batch records
 /// (with inline base64 tape bytes) are well above that.
-fn compressRawDeflateAppend(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    src: []const u8,
-) !void {
-    var z: c.z_stream = std.mem.zeroes(c.z_stream);
-    // windowBits = -15 selects raw deflate (no zlib / gzip header
-    // or trailer). Level 1 = fastest deflate compression.
-    if (c.deflateInit2_(
-        &z,
-        1,
-        c.Z_DEFLATED,
-        -15,
-        8,
-        c.Z_DEFAULT_STRATEGY,
-        c.zlibVersion(),
-        @sizeOf(c.z_stream),
-    ) != c.Z_OK) return Error.Io;
-    defer _ = c.deflateEnd(&z);
+const DeflateStream = struct {
+    z: c.z_stream = std.mem.zeroes(c.z_stream),
 
-    z.next_in = @constCast(src.ptr);
-    z.avail_in = @intCast(src.len);
+    /// Init in-place. zlib stores a back-pointer to the `z_stream`
+    /// inside its internal `state`, so the `z_stream` address must
+    /// be stable from `init` through `deinit` — returning by value
+    /// would invalidate that pointer when the caller moves the
+    /// returned struct.
+    fn init(self: *DeflateStream) Error!void {
+        self.z = std.mem.zeroes(c.z_stream);
+        // windowBits = -15 selects raw deflate (no zlib / gzip
+        // header or trailer). Level 1 = fastest compression.
+        if (c.deflateInit2_(
+            &self.z,
+            1,
+            c.Z_DEFLATED,
+            -15,
+            8,
+            c.Z_DEFAULT_STRATEGY,
+            c.zlibVersion(),
+            @sizeOf(c.z_stream),
+        ) != c.Z_OK) return Error.Io;
+    }
 
-    // Worst-case bound: src + 5 bytes per 16 KB block + 6 bytes
-    // overhead. zlib's `deflateBound` computes it for us.
-    const upper_bound: usize = c.deflateBound(&z, @intCast(src.len));
-    const start_len = out.items.len;
-    try out.ensureUnusedCapacity(allocator, upper_bound);
-    out.items.len = start_len + upper_bound;
-    z.next_out = out.items[start_len..].ptr;
-    z.avail_out = @intCast(upper_bound);
+    fn deinit(self: *DeflateStream) void {
+        _ = c.deflateEnd(&self.z);
+    }
 
-    const rc = c.deflate(&z, c.Z_FINISH);
-    if (rc != c.Z_STREAM_END) return Error.Io;
+    fn appendFrame(
+        self: *DeflateStream,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        src: []const u8,
+    ) !void {
+        // `deflateReset` clears stream-position counters and frees
+        // any leftover dynamic-header state from the previous
+        // frame WITHOUT reallocating the ~270 KB internal buffers.
+        if (c.deflateReset(&self.z) != c.Z_OK) return Error.Io;
 
-    const written = upper_bound - z.avail_out;
-    out.items.len = start_len + written;
-}
+        self.z.next_in = @constCast(src.ptr);
+        self.z.avail_in = @intCast(src.len);
+
+        // Worst-case bound: src + 5 bytes per 16 KB block + 6 bytes
+        // overhead. zlib's `deflateBound` computes it for us.
+        const upper_bound: usize = c.deflateBound(&self.z, @intCast(src.len));
+        const start_len = out.items.len;
+        try out.ensureUnusedCapacity(allocator, upper_bound);
+        out.items.len = start_len + upper_bound;
+        self.z.next_out = out.items[start_len..].ptr;
+        self.z.avail_out = @intCast(upper_bound);
+
+        const rc = c.deflate(&self.z, c.Z_FINISH);
+        if (rc != c.Z_STREAM_END) return Error.Io;
+
+        const written = upper_bound - self.z.avail_out;
+        out.items.len = start_len + written;
+    }
+};
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
