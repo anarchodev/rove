@@ -251,6 +251,11 @@ pub const RaftBootConfig = struct {
     request_timeout_ms: u32 = 200,
     propose_linger_ns: u64 = 0,
     propose_linger_max_batch: usize = 128,
+    /// See `raft_node.Config.tick_wait_timeout_ns`. 0 keeps the
+    /// legacy non-blocking poll (callers that step the node
+    /// manually). Production sets a sub-millisecond value so the
+    /// raft thread sleeps in the kernel between CQEs.
+    tick_wait_timeout_ns: u64 = 0,
     needs_snapshot: ?raft_node_mod.NeedsSnapshotFn = null,
     needs_snapshot_ctx: ?*anyopaque = null,
 };
@@ -356,6 +361,7 @@ pub const Cluster = struct {
             .request_timeout_ms = cfg.raft.request_timeout_ms,
             .propose_linger_ns = cfg.raft.propose_linger_ns,
             .propose_linger_max_batch = cfg.raft.propose_linger_max_batch,
+            .tick_wait_timeout_ns = cfg.raft.tick_wait_timeout_ns,
             .needs_snapshot = cfg.raft.needs_snapshot,
             .needs_snapshot_ctx = cfg.raft.needs_snapshot_ctx,
             .apply = .{ .opaque_bytes = .{

@@ -89,11 +89,13 @@ const MaelstromTransport = struct {
         try w.flush();
     }
 
-    fn tick(_: *anyopaque, _: i64) anyerror!void {
+    fn tick(_: *anyopaque, _: i64, _: u64) anyerror!void {
         // No-op. The main loop drives RaftNode.tick directly; our
         // transport's tick has nothing to pump because reads come from
         // stdin (handled in the main loop, not here) and writes happen
-        // synchronously in send().
+        // synchronously in send(). The wait_timeout_ns parameter is
+        // ignored — maelstrom is a single-threaded I/O-multiplexed
+        // adapter, not an io_uring-backed transport.
     }
 
     fn addPeer(_: *anyopaque, _: u32, _: PeerAddr) anyerror!void {

@@ -579,7 +579,10 @@ fn runRaftLoop(args: *RaftThreadArgs) !void {
             }
         }
 
-        std.Thread.sleep(std.time.ns_per_ms);
+        // No sleep / yield here: `args.node.tick(...)` blocked inside
+        // io_uring for up to `config.tick_wait_timeout_ns` (set by
+        // `--raft-tick-timeout-us`, see cli.zig). The thread parks
+        // in the kernel until a CQE or the timeout fires.
     }
     try args.node.drainPending(2 * std.time.ns_per_s);
 }
@@ -1148,6 +1151,7 @@ pub fn main() !void {
             .propose_linger_ns = cli.propose_linger_us * std.time.ns_per_us,
             .election_timeout_ms = cli.election_timeout_ms,
             .request_timeout_ms = cli.request_timeout_ms,
+            .tick_wait_timeout_ns = @as(u64, cli.raft_tick_timeout_us) * std.time.ns_per_us,
         },
     });
     defer cluster.deinit();
