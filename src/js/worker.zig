@@ -2044,6 +2044,16 @@ pub fn Worker(comptime opts: Options) type {
     const ParkedUnitRow = rove.Row(&.{ParkedUnit});
     const ParkedUnitColl = rove.Collection(ParkedUnitRow, .{});
 
+    // Gap 2.3 Phase D: worker-only collection for pending upstream
+    // fetch events (chunk / end). Twin of `SubFireColl` — one
+    // component (`UpstreamFetchEvent`), no h2 stream identity (a
+    // `fetch_chunk` / `fetch_done` activation is a chain activation
+    // with no held socket, exactly like `subscription_fire`).
+    // `drainFetchChunkInbox` translates inbox messages into entities;
+    // `dispatchFetchEvents` fires + destroys them per tick.
+    const FetchEventRow = rove.Row(&.{components_mod.UpstreamFetchEvent});
+    const FetchEventColl = rove.Collection(FetchEventRow, .{});
+
     return struct {
         const Self = @This();
 
@@ -2157,6 +2167,15 @@ pub fn Worker(comptime opts: Options) type {
         /// reaches the right worker via
         /// `enqueueFetchEventForTenant` hash-routing.
         fetch_chunk_inbox: FetchChunkInbox = undefined,
+        /// Gap 2.3 Phase D: per-worker rove collection of pending
+        /// upstream fetch events. `drainFetchChunkInbox` (once per
+        /// tick, from `serviceFetchEvents`) pops `fetch_chunk_inbox`
+        /// messages and `reg.create`s an entity here with a
+        /// populated `UpstreamFetchEvent`; `dispatchFetchEvents`
+        /// iterates a stable snapshot, fires `fireFetchEventActivation`
+        /// for each, and `reg.destroy`s (deferred). Same shape as
+        /// `subscription_fire_pending`.
+        fetch_event_pending: FetchEventColl,
         /// Gap 2.1 Phase F: monotonic-ns of the last
         /// `sweepCronSubscriptions` invocation. Used to throttle
         /// the per-tick cron sweep to at most one pass per
@@ -2318,6 +2337,7 @@ pub fn Worker(comptime opts: Options) type {
                 .parked_continuations = try StreamColl.init(allocator),
                 .subscription_fire_pending = try SubFireColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
+                .fetch_event_pending = try FetchEventColl.init(allocator),
                 .sub_fire_inbox = SubscriptionFireInbox.init(allocator),
                 .fetch_chunk_inbox = FetchChunkInbox.init(allocator),
                 .dispatcher = try Dispatcher.init(allocator),
@@ -2353,6 +2373,7 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.parked_continuations.deinit();
             errdefer self.subscription_fire_pending.deinit();
             errdefer self.parked_units.deinit();
+            errdefer self.fetch_event_pending.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
@@ -2362,6 +2383,7 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.parked_continuations);
             reg.registerCollection(&self.subscription_fire_pending);
             reg.registerCollection(&self.parked_units);
+            reg.registerCollection(&self.fetch_event_pending);
 
             // Register the inbox with the node so apply.zig +
             // worker_dispatch.zig can broadcast kv-write events to
@@ -2517,6 +2539,9 @@ pub fn Worker(comptime opts: Options) type {
             self.parked_continuations.deinit();
             self.subscription_fire_pending.deinit();
             self.parked_units.deinit();
+            // Gap 2.3 Phase D: rove `Collection.deinit` fires each
+            // entity's `UpstreamFetchEvent.deinit` structurally.
+            self.fetch_event_pending.deinit();
             self.raft_pending_response.deinit();
             self.raft_pending_cont.deinit();
             self.raft_pending_stream.deinit();
@@ -6482,6 +6507,321 @@ pub fn dispatchSubscriptionFires(worker: anytype) void {
             "rove-js subscription-fire: destroy failed: {s}",
             .{@errorName(err)},
         );
+    }
+}
+
+// ── Gap 2.3 Phase D — http.fetch chunk/done activations ──────────
+
+/// Worker-tick combined pass for upstream fetch events: drain the
+/// cross-thread `fetch_chunk_inbox` into the `fetch_event_pending`
+/// collection, then dispatch the collection. Called once per
+/// worker tick from the loop46 main tick, right after
+/// `serviceSubscriptionFires`. Cheap when both are empty.
+pub fn serviceFetchEvents(worker: anytype) void {
+    drainFetchChunkInbox(worker);
+    dispatchFetchEvents(worker);
+}
+
+/// Drain the worker's cross-thread `fetch_chunk_inbox`, MOVING
+/// each `UpstreamFetchEvent` onto a fresh `fetch_event_pending`
+/// entity. Unlike `drainSubFireInbox` (which re-dups onto the
+/// component) the inbox message type IS the collection component
+/// type, so the slices move with no re-dup — `ev.*` is cleared
+/// after the move so the local-list defer doesn't double-free.
+fn drainFetchChunkInbox(worker: anytype) void {
+    const allocator = worker.allocator;
+    var local: std.ArrayListUnmanaged(components_mod.UpstreamFetchEvent) = .empty;
+    defer {
+        components_mod.UpstreamFetchEvent.deinit(allocator, local.items);
+        local.deinit(allocator);
+    }
+    worker.fetch_chunk_inbox.drainInto(&local) catch |err| {
+        std.log.warn("rove-js fetch-event drain: {s}", .{@errorName(err)});
+        return;
+    };
+    if (local.items.len == 0) return;
+    const server = worker.h2;
+    for (local.items) |*ev| {
+        const ent = server.reg.create(&worker.fetch_event_pending) catch |err| {
+            std.log.warn("rove-js fetch-event drain create: {s}", .{@errorName(err)});
+            continue; // `ev` still owned by `local`; freed by defer
+        };
+        server.reg.set(
+            ent,
+            &worker.fetch_event_pending,
+            components_mod.UpstreamFetchEvent,
+            ev.*,
+        ) catch |err| {
+            std.log.warn("rove-js fetch-event drain set: {s}", .{@errorName(err)});
+            server.reg.destroy(ent) catch {};
+            continue; // `ev` not moved; freed by defer
+        };
+        // Slices moved into the component — clear the local copy.
+        ev.* = .{};
+    }
+}
+
+/// Worker-tick system: dispatch every entity in
+/// `fetch_event_pending`. Same stable-snapshot + per-tick `BATCH`
+/// cap shape as `dispatchSubscriptionFires` — re-entrant fires
+/// (an `on_chunk` handler that itself calls `http.fetch`) land in
+/// the deferred-create queue and process next tick.
+pub fn dispatchFetchEvents(worker: anytype) void {
+    const BATCH: usize = 64;
+    const server = worker.h2;
+    var buf: [BATCH]rove.Entity = undefined;
+    const slice = worker.fetch_event_pending.entitySlice();
+    const n = @min(slice.len, BATCH);
+    if (n == 0) return;
+    std.mem.copyForwards(rove.Entity, buf[0..n], slice[0..n]);
+
+    for (buf[0..n]) |ent| {
+        const ev = server.reg.get(
+            ent,
+            &worker.fetch_event_pending,
+            components_mod.UpstreamFetchEvent,
+        ) catch continue;
+        fireFetchEventActivation(worker, ev);
+        server.reg.destroy(ent) catch |err| std.log.warn(
+            "rove-js fetch-event: destroy failed: {s}",
+            .{@errorName(err)},
+        );
+    }
+}
+
+/// Dispatch one upstream fetch event (chunk or terminal) as a
+/// chain activation. Structural twin of `fireSubscriptionActivation`
+/// — no held socket, writes commit forgetfully — but the
+/// activation source + payload differ.
+///
+/// **TEA framing:**
+///   - **Msg**: `(fetch_chunk, {seq, bytes, ...})` per chunk, or
+///     `(fetch_done, {ok, status})` once on upstream close.
+///   - **prep**: resolve the `on_chunk` (chunk) / `on_done`
+///     (terminal) module on the event's tenant; correlation_id
+///     `fetch-<id>` so every activation of one fetch shares a
+///     chain identity; body `{ctx: <ctx_json>}`.
+///   - **run**: `dispatcher.runOutcome`.
+///   - **apply**: terminal → propose writes (if any) + log;
+///     continuation / stream → recorded + logged + ignored (a
+///     fetch chain has no held socket, same as subscription_fire).
+///
+/// Errors return `void` — `dispatchFetchEvents` is best-effort. A
+/// `.end` event with an empty `on_done_module` (customer set no
+/// `on_done`) is a silent no-op.
+fn fireFetchEventActivation(
+    worker: anytype,
+    event: *const components_mod.UpstreamFetchEvent,
+) void {
+    const is_terminal = event.kind != .chunk;
+    const module_path = if (is_terminal) event.on_done_module else event.on_chunk_module;
+    // `on_done` is optional; `on_chunk` is required for Pattern A
+    // (the binding rejects an `on_chunk`-less non-pipe fetch).
+    if (module_path.len == 0) {
+        if (!is_terminal) std.log.warn(
+            "rove-js fetch-event: chunk fetch_id={s} has no on_chunk module; dropping",
+            .{event.fetch_id},
+        );
+        return;
+    }
+    const tenant_id = event.tenant_id;
+    const allocator = worker.allocator;
+
+    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
+        std.log.warn(
+            "rove-js fetch-event: tenant={s} module={s} resolveDeployment failed: {s}; skipping",
+            .{ tenant_id, module_path, @errorName(err) },
+        );
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+
+    // Body `{ctx: <ctx_json>}`. `ctx_json` is the chain ctx the
+    // originating `http.fetch` call passed; empty → `{}`.
+    const ctx_src: []const u8 = if (event.ctx_json.len > 0) event.ctx_json else "{}";
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    var tapes = RequestTapes.init(allocator);
+    defer tapes.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+
+    // Correlation: all activations of one fetch share `fetch-<id>`
+    // so the replay UX groups the chunk chain with its terminal.
+    var corr_buf: [80]u8 = undefined;
+    const id_len: usize = @min(event.fetch_id.len, 64);
+    const corr_full = std.fmt.bufPrint(
+        &corr_buf,
+        "fetch-{s}",
+        .{event.fetch_id[0..id_len]},
+    ) catch corr_buf[0..0];
+
+    const act_source: log_mod.ActivationSource = switch (event.kind) {
+        .chunk => .fetch_chunk,
+        .end => .fetch_done,
+        .pipe_done => .fetch_pipe_done,
+    };
+
+    var req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .kv_tape = &tapes.kv,
+        .date_tape = &tapes.date,
+        .math_random_tape = &tapes.math_random,
+        .crypto_random_tape = &tapes.crypto_random,
+        .module_tape = &tapes.module,
+        .prng_seed = @bitCast(now_ns),
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = corr_full,
+        .activation_source = act_source,
+        .activation_fetch_id = event.fetch_id,
+    };
+    if (event.kind == .chunk) {
+        req.activation_fetch_seq = event.seq;
+        req.activation_fetch_byte_offset = event.byte_offset;
+        req.activation_fetch_bytes = event.bytes;
+        req.activation_fetch_headers = event.fetch_headers;
+    } else {
+        req.activation_fetch_terminal_status = event.terminal_status;
+        req.activation_fetch_terminal_ok = event.terminal_ok;
+    }
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        req,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, act_source);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    var oc = run_oc;
+    // Fetch chains have no held socket — terminal commits/proposes;
+    // continuation/stream returns are deinit'd + recorded with a
+    // warning. Identical posture to `fireSubscriptionActivation`.
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, act_source);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                    std.log.warn("rove-js fetch-event ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, act_source);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, act_source);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireFetchEventActivation.commit(terminal)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, act_source);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            cval.deinit(allocator);
+            std.log.warn(
+                "rove-js fetch-event ({s}): __rove_next from a fetch activation is a no-op (v1)",
+                .{module_path},
+            );
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                    std.log.warn("rove-js fetch-event ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, act_source);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, act_source);
+                return;
+            }
+            txn.rollback() catch {};
+            txn_done = true;
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, act_source);
+        },
+        .stream => |*s2| {
+            s2.deinit(allocator);
+            std.log.warn(
+                "rove-js fetch-event ({s}): __rove_stream from a fetch activation is a no-op (v1)",
+                .{module_path},
+            );
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                    std.log.warn("rove-js fetch-event ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, act_source);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, act_source);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireFetchEventActivation.commit(stream)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, act_source);
+        },
     }
 }
 

@@ -26,6 +26,9 @@
         {"path": "overflow_watch/index.mjs", "source": "loop46-demo-tenants/acme/overflow_watch/index.mjs"},
         {"path": "overflow_burst/index.mjs", "source": "loop46-demo-tenants/acme/overflow_burst/index.mjs"},
         {"path": "big_chunks/index.mjs", "source": "loop46-demo-tenants/acme/big_chunks/index.mjs"},
+        {"path": "fetchchunks/index.mjs", "source": "loop46-demo-tenants/acme/fetchchunks/index.mjs"},
+        {"path": "fetchchunk.mjs", "source": "loop46-demo-tenants/acme/fetchchunk.mjs"},
+        {"path": "fetchdone.mjs", "source": "loop46-demo-tenants/acme/fetchdone.mjs"},
         {"path": "_subscriptions/sub-react/index.mjs", "source": "loop46-demo-tenants/acme/_subscriptions/sub-react/index.mjs"},
         {"path": "_subscriptions/sub-react/spec.json", "source": "loop46-demo-tenants/acme/_subscriptions/sub-react/spec.json", "content_type": "application/json"},
         {"path": "_subscriptions/migrate-v1/index.mjs", "source": "loop46-demo-tenants/acme/_subscriptions/migrate-v1/index.mjs"},
@@ -47,7 +50,8 @@
       "_comment": "Target tenant for http_send_smoke. Caller (acme) http.sends to https://wb.{public_suffix}/echo; the worker phase routes in-process to this index.mjs because wb is a registered tenant on the cluster. wb's writes ride envelope-0 atomic with the schedule_complete envelope-9.",
       "id": "wb",
       "files": [
-        {"path": "index.mjs", "source": "loop46-demo-tenants/wb/index.mjs"}
+        {"path": "index.mjs", "source": "loop46-demo-tenants/wb/index.mjs"},
+        {"path": "bulk/index.mjs", "source": "loop46-demo-tenants/wb/bulk/index.mjs"}
       ]
     },
     {

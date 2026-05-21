@@ -376,30 +376,45 @@ both fetch and held-subscription cases.)
   (a transient list — no kv, no raft). Phase C drains it.
 - `http.cancelFetch({id})` binding for cancellation.
 
-### Phase C — Fetch-pool thread + libcurl writeback callback + cross-thread chunk inbox
+### Phase C — Fetch-pool thread + cross-thread chunk inbox — SHIPPED
 
-- New `NodeState.fetch_pool` — M dedicated threads (separate
-  from `SendDispatch`); each owns a libcurl Easy handle from a
-  dedicated `EasyPool` (separate saturation domain).
-- Drain `NodeState.fetch_pending` on the pool; per-fetch
-  thread issues libcurl with `CURLOPT_WRITEFUNCTION` set.
-- The writeback callback re-chunks libcurl deliveries into
-  `max_response_chunk_bytes` units, enqueues each into a
-  per-worker `fetch_chunk_inbox` (hash(tenant) routed; mirrors
-  `SubscriptionFireInbox`).
+C1 (`f69fd57`) — producer: `http.fetch` binding → `PendingFetch`
+carrier → per-`DispatchState` accumulator → flushed to
+`NodeState.fetch_pending` at handler success.
 
-### Phase D — `fetch_chunk` / `fetch_done` activations (Pattern A)
+C2 (`3e71cde`) — consumer: `NodeState.fetch_pool` — 8 dedicated
+threads (separate `EasyPool` from `SendDispatch`, separate
+saturation domain). Each drains `fetch_pending`, fires libcurl,
+re-chunks the response into `max_response_chunk_bytes` units,
+hash-routes one `UpstreamFetchEvent` per chunk + a terminal to a
+per-worker `fetch_chunk_inbox` (mirrors `SubscriptionFireInbox`).
 
-- New per-worker collection `fetch_event_pending` + dispatch
-  system.
-- Worker tick drains the chunk inbox → collection → fires
-  handler (on the `on_chunk` module) with `request.activation
-  = { kind: "fetch_chunk", ... }`.
-- On upstream completion, fire `fetch_done` (on the `on_done`
-  module) with trailing metadata.
-- Smoke: customer GET fires `http.fetch({url, on_chunk})` against
-  an SSE upstream; verifies N chunk activations + one
-  fetch_done.
+**v1 caveat:** the libcurl call is `Easy.request` (buffered) — the
+full upstream body lands in memory before re-chunking, so SSE /
+long-lived streams time out at libcurl's per-call deadline. The
+`CURLOPT_WRITEFUNCTION` streaming upgrade swaps only that one
+call site; the rest of the pipeline is identical.
+
+### Phase D — `fetch_chunk` / `fetch_done` activations (Pattern A) — SHIPPED
+
+- New per-worker rove collection `fetch_event_pending`
+  (`UpstreamFetchEvent` component) + `serviceFetchEvents` =
+  `drainFetchChunkInbox` (inbox → collection, slices MOVE, no
+  re-dup) + `dispatchFetchEvents` (stable-snapshot, `BATCH=64`).
+- `fireFetchEventActivation` — twin of `fireSubscriptionActivation`
+  (no held socket, forgetful writes); resolves `on_chunk` /
+  `on_done` module by kind, correlation_id `fetch-<id>`,
+  `request.activation = { kind, fetch_id, seq, byteOffset, bytes
+  (Uint8Array), headers? }` (chunk) or `{ kind, fetch_id, ok,
+  status }` (terminal).
+- `UpstreamFetchEvent` carries `tenant_id` + `on_chunk_module` +
+  `on_done_module` so each event is self-describing (no fetch_id
+  → module registry).
+- Smoke (`scripts/fetch_chunk_smoke.py`): customer GET fires
+  `http.fetch({url, on_chunk, on_done})` against a 170-byte
+  upstream with a 64-byte chunk cap; verifies 3 `fetch_chunk`
+  activations (seq order, byteOffset, ctx round-trip, headers on
+  seq 0 only) + one `fetch_done` + byte-exact body reconstruction.
 
 ### Phase E — `pipe_to` Pattern B
 

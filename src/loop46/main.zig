@@ -476,6 +476,13 @@ fn workerMain(args: *WorkerCtx) !void {
         rjs.serviceSubscriptionFires(worker);
         try reg.flush();
 
+        // Gap 2.3 Phase D: drain the cross-thread fetch-chunk inbox
+        // (from the node FetchPool's libcurl threads) into the
+        // `fetch_event_pending` collection + dispatch on_chunk /
+        // on_done activations. Cheap when no fetch is in flight.
+        rjs.serviceFetchEvents(worker);
+        try reg.flush();
+
         // Schedule callback dispatch: on the raft leader, worker 0
         // scans every tenant's `_callback/*` rows left by the
         // schedule-server's envelope-9 apply and invokes the

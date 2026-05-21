@@ -226,16 +226,36 @@ pub const StreamWakes = struct {
 pub const UpstreamFetchEvent = struct {
     kind: Kind = .chunk,
 
-    /// The originating `http.send`-returned id, allocator-owned
+    /// The originating `http.fetch`-returned id, allocator-owned
     /// when non-empty. Shared across all three variants so the
     /// handler can correlate chunks with its terminal.
     fetch_id: []u8 = &.{},
 
-    /// Chain ctx threaded forward from the originating `http.send`
-    /// (the `on_result_args_json` blob). Allocator-owned JSON.
+    /// Gap 2.3 Phase D: owning tenant's instance id. The worker
+    /// serves many tenants; this names which one's deployment the
+    /// `on_chunk` / `on_done` module resolves against. Carried
+    /// forward from `PendingFetch.tenant_id` by the `FetchPool`.
+    /// Allocator-owned.
+    tenant_id: []u8 = &.{},
+
+    /// Chain ctx threaded forward from the originating `http.fetch`
+    /// (the `ctx` blob passed to the call). Allocator-owned JSON.
     /// Empty by default; the handler reads it as `request.ctx`
     /// just like a `send_callback`.
     ctx_json: []u8 = &.{},
+
+    /// Gap 2.3 Phase D: module path of the `on_chunk` handler —
+    /// dispatched once per `kind == .chunk` event. Allocator-owned;
+    /// empty for Pattern B (`pipe_to`, no per-chunk handler).
+    /// Carried forward from `PendingFetch.on_chunk_module` by the
+    /// `FetchPool` so each event is self-describing — Phase D needs
+    /// no fetch_id → module registry.
+    on_chunk_module: []u8 = &.{},
+
+    /// Gap 2.3 Phase D: module path of the terminal handler —
+    /// dispatched once on the `.end` / `.pipe_done` event.
+    /// Allocator-owned; empty when the customer set no `on_done`.
+    on_done_module: []u8 = &.{},
 
     // ── send_chunk variant ────────────────────────────────────
     /// Per-send monotonic chunk index, 0-based. Surfaces as
@@ -275,7 +295,10 @@ pub const UpstreamFetchEvent = struct {
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
         for (items) |*item| {
             if (item.fetch_id.len > 0) allocator.free(item.fetch_id);
+            if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
             if (item.ctx_json.len > 0) allocator.free(item.ctx_json);
+            if (item.on_chunk_module.len > 0) allocator.free(item.on_chunk_module);
+            if (item.on_done_module.len > 0) allocator.free(item.on_done_module);
             if (item.bytes.len > 0) allocator.free(item.bytes);
             if (item.fetch_headers) |h| allocator.free(h);
             item.* = .{};

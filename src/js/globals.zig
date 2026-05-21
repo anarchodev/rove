@@ -1843,6 +1843,61 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "source", source_obj);
     }
 
+    // Gap 2.3 Phase D `http.fetch` payload. `fetch_id` correlates
+    // every activation of one fetch. `.fetch_chunk` carries the
+    // chunk payload (`seq` / `byteOffset` / `bytes` Uint8Array,
+    // plus `headers` on seq 0); `.fetch_done` / `.fetch_pipe_done`
+    // carry the terminal `ok` + `status`.
+    if (request.activation_source == .fetch_chunk or
+        request.activation_source == .fetch_done or
+        request.activation_source == .fetch_pipe_done)
+    {
+        if (request.activation_fetch_id) |fid| {
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetch_id", c.JS_NewStringLen(ctx, fid.ptr, fid.len));
+        }
+        if (request.activation_source == .fetch_chunk) {
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_seq)));
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_byte_offset)));
+            // `bytes`: a fresh Uint8Array copy — the handler owns
+            // it outright, no lifetime coupling to the event.
+            _ = c.JS_SetPropertyStr(
+                ctx,
+                activation_obj,
+                "bytes",
+                c.JS_NewUint8ArrayCopy(ctx, request.activation_fetch_bytes.ptr, request.activation_fetch_bytes.len),
+            );
+            // `headers` (seq 0 only): parse the `Key: Val\r\n`
+            // wire blob into a plain object.
+            if (request.activation_fetch_headers) |hblob| {
+                const hdr_obj = c.JS_NewObject(ctx);
+                var line_it = std.mem.splitSequence(u8, hblob, "\r\n");
+                while (line_it.next()) |line| {
+                    if (line.len == 0) continue;
+                    const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                    const name = std.mem.trim(u8, line[0..colon], " ");
+                    const value = std.mem.trim(u8, line[colon + 1 ..], " ");
+                    if (name.len == 0) continue;
+                    // Header names need a NUL-terminated C string
+                    // for JS_SetPropertyStr's key. Stack buffer —
+                    // HTTP header names never approach 256 bytes.
+                    var name_buf: [256]u8 = undefined;
+                    if (name.len >= name_buf.len) continue;
+                    @memcpy(name_buf[0..name.len], name);
+                    name_buf[name.len] = 0;
+                    _ = c.JS_SetPropertyStr(ctx, hdr_obj, &name_buf, c.JS_NewStringLen(ctx, value.ptr, value.len));
+                }
+                _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", hdr_obj);
+            }
+        } else {
+            // `c.JS_NewBool`'s cimport-translated body is itself
+            // non-compilable (translate-c bug — `int != 0` lands
+            // in an i32 field); use the module's prebuilt
+            // bool JSValue constants instead.
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (request.activation_fetch_terminal_ok) js_true else js_false);
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_terminal_status)));
+        }
+    }
+
     _ = c.JS_SetPropertyStr(ctx, req_obj, "activation", activation_obj);
 
     _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);
