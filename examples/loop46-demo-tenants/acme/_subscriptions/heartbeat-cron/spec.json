@@ -1,0 +1,4 @@
+{
+  "kind": "cron",
+  "interval_ms": 1000
+}

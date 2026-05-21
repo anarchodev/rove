@@ -578,8 +578,13 @@ const SubscriptionFileKind = enum { handler, spec };
 /// fields fail the deploy.
 const SubscriptionSpecJson = struct {
     kind: []const u8,
-    schedule: ?[]const u8 = null, // required for kind=cron
-    prefix: ?[]const u8 = null, // required for kind=kv
+    /// Required for kind=cron. Milliseconds between fires. Must be
+    /// >= 1000 (one second). For complex schedules (e.g. "daily at
+    /// 3am"), customers compose via
+    /// `http.send({fire_at_ns: cron.next(...)})`.
+    interval_ms: ?i64 = null,
+    /// Required for kind=kv.
+    prefix: ?[]const u8 = null,
 };
 
 /// Build the deployment's subscription registry from the manifest.
@@ -700,15 +705,18 @@ fn translateSpec(
     raw: SubscriptionSpecJson,
 ) !globals.SubscriptionEntry.Spec {
     if (std.mem.eql(u8, raw.kind, "cron")) {
-        const schedule = raw.schedule orelse {
-            std.log.err("rove-js: subscription `{s}` kind=cron missing `schedule` field", .{name});
+        const interval_ms = raw.interval_ms orelse {
+            std.log.err("rove-js: subscription `{s}` kind=cron missing `interval_ms` field", .{name});
             return error.SubscriptionSpecMissingField;
         };
-        if (schedule.len == 0) {
-            std.log.err("rove-js: subscription `{s}` kind=cron has empty schedule", .{name});
+        if (interval_ms < 1000) {
+            std.log.err(
+                "rove-js: subscription `{s}` kind=cron has sub-second interval_ms={d} (minimum 1000)",
+                .{ name, interval_ms },
+            );
             return error.SubscriptionSpecMissingField;
         }
-        return .{ .cron = .{ .schedule = try allocator.dupe(u8, schedule) } };
+        return .{ .cron = .{ .interval_ms = interval_ms } };
     }
     if (std.mem.eql(u8, raw.kind, "kv")) {
         const prefix = raw.prefix orelse {
@@ -1185,6 +1193,18 @@ pub const NodeState = struct {
     sub_fire_inboxes_mutex: std.Thread.Mutex = .{},
     sub_fire_inboxes: std.ArrayListUnmanaged(*SubscriptionFireInbox) = .empty,
 
+    /// Gap 2.1 Phase F: in-memory `next_fire_at_ns` per cron
+    /// subscription. Keyed by `<tenant_id>|<sub_name>`. NOT raft-
+    /// replicated — leader change resets the cron clock; the next
+    /// fire happens roughly `interval_ms` after leadership is
+    /// gained on the new leader (rebuilt by the sweep's first
+    /// pass). Trade-off: long-interval crons may pause up to an
+    /// interval after failover. Acceptable for v1; customer
+    /// idempotency / missed-tick tolerance per
+    /// `docs/subscriptions-plan.md` §7. Owned by NodeState.
+    cron_state_mutex: std.Thread.Mutex = .{},
+    cron_state: std.StringHashMapUnmanaged(i64) = .empty,
+
     pub fn init(
         allocator: std.mem.Allocator,
         tenant: *tenant_mod.Tenant,
@@ -1334,6 +1354,12 @@ pub const NodeState = struct {
         // tears down, every inbox should already be unregistered.
         // The list itself is owned by NodeState's allocator.
         self.wake_inboxes.deinit(self.allocator);
+        self.sub_fire_inboxes.deinit(self.allocator);
+        {
+            var cs_it = self.cron_state.iterator();
+            while (cs_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            self.cron_state.deinit(self.allocator);
+        }
         if (self.deployment_loader) |l| {
             l.shutdown();
             l.deinit();
@@ -1824,6 +1850,12 @@ pub fn Worker(comptime opts: Options) type {
         /// at startup so producers reach the right worker via
         /// `enqueueSubscriptionFireForTenant` hash-routing.
         sub_fire_inbox: SubscriptionFireInbox = undefined,
+        /// Gap 2.1 Phase F: monotonic-ns of the last
+        /// `sweepCronSubscriptions` invocation. Used to throttle
+        /// the per-tick cron sweep to at most one pass per
+        /// `CRON_SWEEP_INTERVAL_NS`. Worker-local because the
+        /// sweep runs on worker 0 only.
+        last_cron_sweep_ns: i64 = 0,
         /// Per-tick accumulator for admin-handler side effects
         /// (`platform.root.*` + cross-tenant trampolines). Folded
         /// into the batch's single raft entry by `finalizeBatch`
@@ -3352,6 +3384,102 @@ pub fn sweepBootSubscriptions(worker: anytype) void {
         enqueueBootSubscriptions(slot, snap) catch |err| std.log.warn(
             "rove-js boot sweep ({s}): {s}",
             .{ slot.instance_id, @errorName(err) },
+        );
+    }
+}
+
+/// Gap 2.1 Phase F: throttled cron sweep — runs at most once per
+/// `CRON_SWEEP_INTERVAL_NS` from worker 0 when leader. Walks every
+/// loaded tenant slot's cron subscriptions and fires any that are
+/// due (or initializes the next-fire time on first sight).
+/// In-memory state in `NodeState.cron_state` keyed by
+/// `<tenant>|<name>`; not raft-replicated, so leader change resets
+/// the cron clock (next fire = now + interval_ms on the new
+/// leader). For long-interval crons this can pause up to one
+/// interval after failover; customer-side missed-tick tolerance
+/// is the documented contract.
+pub const CRON_SWEEP_INTERVAL_NS: i64 = 1 * std.time.ns_per_s;
+
+pub fn sweepCronSubscriptions(worker: anytype) void {
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    if (now_ns - worker.last_cron_sweep_ns < CRON_SWEEP_INTERVAL_NS) return;
+    worker.last_cron_sweep_ns = now_ns;
+
+    var it = worker.node.tenant_files_map.iterator();
+    while (it.next()) |entry| {
+        const slot = entry.value_ptr.*;
+        const snap = slot.pinCurrent() orelse continue;
+        defer snap.release();
+        if (snap.subscriptions.len == 0) continue;
+        sweepTenantCron(worker.node, slot, snap, now_ns);
+    }
+}
+
+/// Walk one tenant's cron subscriptions; for each that's due,
+/// enqueue a fire and advance the in-memory `next_fire_at_ns`.
+/// First-sight initializes to `now_ns + interval_ms_ns`
+/// (interval-delay before the FIRST fire — keeps cron behavior
+/// natural across deploy + restart).
+fn sweepTenantCron(
+    node: *NodeState,
+    slot: *TenantSlot,
+    snap: *TenantFilesSnapshot,
+    now_ns: i64,
+) void {
+    const allocator = node.allocator;
+    for (snap.subscriptions) |sub| {
+        const interval_ms: i64 = switch (sub.spec) {
+            .cron => |c| c.interval_ms,
+            else => continue,
+        };
+        const interval_ns: i64 = interval_ms * std.time.ns_per_ms;
+
+        // Key = "<tenant>|<sub_name>". Owned by cron_state on
+        // first insert; reused on subsequent lookups.
+        var key_buf: [128]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}|{s}", .{ slot.instance_id, sub.name }) catch continue;
+
+        node.cron_state_mutex.lock();
+        const gop = node.cron_state.getOrPut(allocator, key) catch {
+            node.cron_state_mutex.unlock();
+            continue;
+        };
+        if (!gop.found_existing) {
+            // First sight: initialize the next-fire time and don't
+            // fire this round. The customer sees the first fire
+            // roughly `interval_ms` after this sweep.
+            gop.key_ptr.* = allocator.dupe(u8, key) catch {
+                _ = node.cron_state.remove(key);
+                node.cron_state_mutex.unlock();
+                continue;
+            };
+            gop.value_ptr.* = now_ns + interval_ns;
+            node.cron_state_mutex.unlock();
+            continue;
+        }
+        const next_fire_at_ns = gop.value_ptr.*;
+        if (now_ns < next_fire_at_ns) {
+            node.cron_state_mutex.unlock();
+            continue;
+        }
+        // Advance to next interval. Use cumulative drift
+        // (`next + interval`) when within an interval of now;
+        // otherwise (long pause / failover) reset to `now +
+        // interval` to avoid pile-up.
+        gop.value_ptr.* = if (next_fire_at_ns + interval_ns > now_ns)
+            next_fire_at_ns + interval_ns
+        else
+            now_ns + interval_ns;
+        node.cron_state_mutex.unlock();
+
+        node.enqueueSubscriptionFireForTenant(.{
+            .tenant_id = slot.instance_id,
+            .subscription_name = sub.name,
+            .module_path = sub.module_path,
+            .source = .{ .cron = .{ .fired_at_ns = now_ns } },
+        }) catch |err| std.log.warn(
+            "rove-js cron sweep enqueue ({s}/{s}): {s}",
+            .{ slot.instance_id, sub.name, @errorName(err) },
         );
     }
 }
