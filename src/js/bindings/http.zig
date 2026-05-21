@@ -155,18 +155,73 @@ pub fn jsHttpFetch(
         },
     };
     state.http_fetch_index += 1;
-    // Phase B: drop the carrier; Phase C accumulates into a
-    // per-DispatchState pending-fetches list + drain into
-    // NodeState.fetch_pool. Until then, every call logs the same
-    // warning so customers see the binding is accepted but the
-    // wire is not yet hot.
-    std.log.warn(
-        "http.fetch (Phase B): accepted fetch id={s} url={s} (transport not yet wired; lands in Gap 2.3 Phase C)",
-        .{ row.id, row.url },
-    );
+    // Gap 2.3 Phase C1: accumulate into the per-DispatchState
+    // pending-fetches list. The worker's batch-finalize phase
+    // flushes the list to NodeState.fetch_pending; the fetch-pool
+    // thread (Phase C2) drains that queue and fires libcurl. If
+    // the handler throws / faults before flush, DispatchState's
+    // deinit frees the entries — no orphan fetches.
+    appendPendingFetch(state, &row) catch |err| {
+        // Allocator failure on the dupe/append; tear down `row`
+        // (still allocator-owned by this fn) and surface as a JS
+        // exception.
+        row.deinit(state.allocator);
+        state.pending_kv_error = err;
+        return js_exception;
+    };
+    // `appendPendingFetch` transferred ownership of every owned
+    // slice on `row` into the PendingFetch — local clears its
+    // fields so the deinit below is a no-op.
     const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
     row.deinit(state.allocator);
     return res;
+}
+
+/// Transfer `BuiltFetch`'s owned slices into a `PendingFetch`
+/// appended to `state.pending_fetches.*`. Dups `tenant_id` (which
+/// `BuiltFetch` doesn't carry — it's implicit on the binding
+/// side). On allocator failure, returns OutOfMemory; caller
+/// frees the source `row` (the dups that DID succeed get freed
+/// by the partial-rollback below).
+fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
+    const a = state.allocator;
+    // If the caller didn't provide a fetch accumulator (test
+    // paths, anonymous dispatch), the fetch is dropped — the
+    // binding still returns an id so the customer's code sees
+    // success, but no transport will fire. Same posture as a
+    // missing send-dispatch on http.send (a logged no-op).
+    const out = state.pending_fetches orelse return;
+
+    const tid_dup = try a.dupe(u8, state.instance_id);
+    errdefer a.free(tid_dup);
+
+    try out.ensureUnusedCapacity(a, 1);
+    out.appendAssumeCapacity(.{
+        .tenant_id = tid_dup,
+        .id = row.id,
+        .url = row.url,
+        .method = row.method,
+        .headers_json = row.headers_json,
+        .body = row.body,
+        .timeout_ms = row.timeout_ms,
+        .on_chunk_module = row.on_chunk_module,
+        .on_done_module = row.on_done_module,
+        .ctx_json = row.ctx_json,
+        .pipe_to_held = row.pipe_to_held,
+        .headers_passthrough = row.headers_passthrough,
+        .max_response_chunk_bytes = row.max_response_chunk_bytes,
+        .max_total_response_bytes = row.max_total_response_bytes,
+    });
+    // Ownership transferred — clear the carrier's slices so its
+    // deinit is a no-op.
+    row.id = &.{};
+    row.url = &.{};
+    row.method = &.{};
+    row.headers_json = &.{};
+    row.body = &.{};
+    row.on_chunk_module = &.{};
+    row.on_done_module = &.{};
+    row.ctx_json = &.{};
 }
 
 /// `http.cancelFetch({id})` — cancel a not-yet-completed fetch.

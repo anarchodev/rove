@@ -28,6 +28,7 @@ const config_mirror = @import("config_mirror.zig");
 const dispatcher_mod = @import("dispatcher.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const stream_mod = @import("bindings/stream.zig");
+const globals = @import("globals.zig");
 const router_mod = @import("router.zig");
 const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
@@ -2172,6 +2173,18 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
         std.log.info("rove-js corr: inbound corr={s} request_id={d} tenant={s}", .{ correlation_id, request_id, scope_inst.id });
 
+        // Gap 2.3 Phase C1: per-request accumulator for
+        // `http.fetch` calls. The binding appends into it via
+        // state.pending_fetches; on handler success we flush to
+        // NodeState.fetch_pending (Phase C2 wires the consumer
+        // pool that fires libcurl). On handler error / fault the
+        // defer frees the entries — no orphan fetches.
+        var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+        defer {
+            for (pending_fetches.items) |*pf| pf.deinit(allocator);
+            pending_fetches.deinit(allocator);
+        }
+
         const request: Request = .{
             .method = method,
             .path = path,
@@ -2189,6 +2202,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .correlation_id = correlation_id,
             .activation_source = .inbound,
             .session_id = session_resolved.sid,
+            .pending_fetches = &pending_fetches,
             // Non-null only when the handler-tenant is the admin
             // singleton — gates installation of `platform.root.*`.
             .platform = handler_inst.platform,
@@ -2525,6 +2539,20 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // included for replay; the outbound response is NOT — replay
         // re-produces it deterministically from (body, tapes, source).
         const tape_payloads = worker_mod.captureTapesForChain(worker, &tapes, body, correlation_id);
+
+        // Gap 2.3 Phase C1: flush per-request `http.fetch`
+        // accumulator into the node-wide queue. Ownership of
+        // every PendingFetch transfers; clear the source so the
+        // outer defer is a no-op. On error (rare — only allocator
+        // failure during the move), entries stay in
+        // `pending_fetches` and the outer defer frees them.
+        worker.node.enqueuePendingFetches(pending_fetches.items) catch |perr| {
+            std.log.warn(
+                "rove-js http.fetch flush (tenant={s}): {s}; entries dropped",
+                .{ scope_inst.id, @errorName(perr) },
+            );
+        };
+        pending_fetches.clearRetainingCapacity();
 
         const console_owned = resp.console;
         const exception_owned = resp.exception;

@@ -116,6 +116,62 @@ pub const SubscriptionEntry = struct {
 /// trampoline. Reads (get/prefix) go direct and need no trampoline.
 pub const ScopeKvOp = enum { put, delete };
 
+/// Gap 2.3 Phase C: in-memory carrier for an `http.fetch` request
+/// awaiting transport. Lives on `DispatchState.pending_fetches`
+/// during the handler's run; flushed to `NodeState.fetch_pending`
+/// at end-of-handler; consumed by the `NodeState.fetch_pool`
+/// thread which fires libcurl + delivers chunks via the
+/// per-worker `fetch_chunk_inbox`.
+///
+/// All slices allocator-owned. Mirrors `send_outbox.OwedSend` in
+/// shape (the durable sibling for `http.send`) but unencoded —
+/// fetches are non-durable, never written to kv/raft, so no
+/// wire-format codec needed.
+pub const PendingFetch = struct {
+    /// The tenant that issued this fetch — needed so the fetch
+    /// pool can hash-route chunks to the right worker's inbox.
+    tenant_id: []u8,
+    /// Deterministic fetch id (sha256 of request_id + "FTCH" +
+    /// fetch_index). 64-hex chars.
+    id: []u8,
+    url: []u8,
+    method: []u8,
+    headers_json: []u8,
+    body: []u8,
+    timeout_ms: u32,
+    /// Pattern A: module path for `fetch_chunk` activations.
+    /// Empty string when `pipe_to_held` is set or fire-and-forget
+    /// (terminal-only via `on_done_module`).
+    on_chunk_module: []u8,
+    /// Module path for the terminal activation (`fetch_done` for
+    /// Pattern A; `fetch_pipe_done` for Pattern B). Empty when
+    /// fire-and-forget (terminal recorded on tape but not
+    /// dispatched).
+    on_done_module: []u8,
+    /// Threaded forward to each activation as `request.ctx`. JSON
+    /// string; "null" when omitted.
+    ctx_json: []u8,
+    /// True iff `pipe_to: "held_response"`. Pattern B; mutually
+    /// exclusive with `on_chunk_module` (binding rejects both).
+    pipe_to_held: bool,
+    headers_passthrough: bool,
+    max_response_chunk_bytes: u32,
+    max_total_response_bytes: u64,
+
+    pub fn deinit(self: *PendingFetch, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
+        allocator.free(self.id);
+        allocator.free(self.url);
+        allocator.free(self.method);
+        allocator.free(self.headers_json);
+        allocator.free(self.body);
+        allocator.free(self.on_chunk_module);
+        allocator.free(self.on_done_module);
+        allocator.free(self.ctx_json);
+        self.* = undefined;
+    }
+};
+
 pub const DispatchState = struct {
     allocator: std.mem.Allocator,
     /// Per-request KV store. `kv.get("x")` reads from this handle,
@@ -176,6 +232,15 @@ pub const DispatchState = struct {
     /// namespaces clean — a send-then-fetch and fetch-then-send
     /// produce the same set of ids regardless of order.
     http_fetch_index: u32 = 0,
+    /// Gap 2.3 Phase C1: per-handler accumulator for `http.fetch`
+    /// calls. Caller-owned (pointer to a list the worker_dispatch
+    /// allocates per handler invocation); each binding call
+    /// appends a `PendingFetch`; at end-of-handler the worker
+    /// flushes the list to `NodeState.fetch_pending`. List
+    /// ownership stays with the caller; the caller's defer
+    /// frees any leftovers on error paths (no orphan fetches).
+    /// Null on test paths that don't care.
+    pending_fetches: ?*std.ArrayListUnmanaged(PendingFetch) = null,
     /// Resolved session id (see `Request.session_id`). 64 lowercase hex
     /// chars when set; null in non-browser dispatch paths. Surfaced as
     /// `request.session = {id: ...}` (or `request.session = null`).
@@ -282,6 +347,9 @@ pub const DispatchState = struct {
             c.JS_FreeValue(ctx, e.value_ptr.*);
         }
         self.trigger_module_ns.deinit(self.allocator);
+        // Gap 2.3 Phase C1: `pending_fetches` is caller-owned (a
+        // pointer); cleanup of accumulated entries lives at the
+        // caller's defer. DispatchState only borrows.
         self.* = undefined;
     }
 };

@@ -1265,6 +1265,17 @@ pub const NodeState = struct {
     tape_state_mutex: std.Thread.Mutex = .{},
     tape_state: std.StringHashMapUnmanaged(ChainTapeState) = .empty,
 
+    /// Gap 2.3 Phase C1: cross-thread queue of pending fetches
+    /// awaiting transport. Producer: worker's batch-finalize
+    /// phase calls `enqueuePendingFetches` to move handler-built
+    /// `PendingFetch`es here. Consumer: Phase C2's `fetch_pool`
+    /// threads drain + issue libcurl + deliver chunks via
+    /// `fetch_chunk_inbox`. For C1 (no consumer yet), entries sit
+    /// in the queue until NodeState shutdown, where any
+    /// undrained entries are freed with a one-shot warning.
+    fetch_pending_mutex: std.Thread.Mutex = .{},
+    fetch_pending: std.ArrayListUnmanaged(globals.PendingFetch) = .empty,
+
     pub fn init(
         allocator: std.mem.Allocator,
         tenant: *tenant_mod.Tenant,
@@ -1322,6 +1333,26 @@ pub const NodeState = struct {
                 return;
             }
         }
+    }
+
+    /// Gap 2.3 Phase C1: move accumulated fetches into the node
+    /// queue. The handler accumulated these into a caller-owned
+    /// list during its run; the worker calls this at
+    /// batch-finalize time (handler completed without throwing).
+    /// Ownership of every slice transfers from the caller's list
+    /// into `fetch_pending`; the caller MUST clear its source
+    /// list after this returns so its defer doesn't double-free.
+    /// Phase C2 wires the fetch-pool consumer that drains this
+    /// queue + fires libcurl.
+    pub fn enqueuePendingFetches(
+        self: *NodeState,
+        items: []const globals.PendingFetch,
+    ) !void {
+        if (items.len == 0) return;
+        self.fetch_pending_mutex.lock();
+        defer self.fetch_pending_mutex.unlock();
+        try self.fetch_pending.ensureUnusedCapacity(self.allocator, items.len);
+        for (items) |pf| self.fetch_pending.appendAssumeCapacity(pf);
     }
 
     /// Gap 2.1 Phase D: hash-route a subscription fire to the
@@ -1424,6 +1455,22 @@ pub const NodeState = struct {
             var ts_it = self.tape_state.iterator();
             while (ts_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
             self.tape_state.deinit(self.allocator);
+        }
+        {
+            // Gap 2.3 Phase C1: drop any pending fetches the
+            // pool didn't drain (C1 has no pool yet, so this
+            // fires on every shutdown with pending fetches —
+            // expected until C2 lands). One-shot warning + free.
+            self.fetch_pending_mutex.lock();
+            defer self.fetch_pending_mutex.unlock();
+            if (self.fetch_pending.items.len > 0) {
+                std.log.warn(
+                    "rove-js: dropping {d} pending http.fetch entries at shutdown (fetch-pool not yet wired — Gap 2.3 Phase C2)",
+                    .{self.fetch_pending.items.len},
+                );
+            }
+            for (self.fetch_pending.items) |*pf| pf.deinit(self.allocator);
+            self.fetch_pending.deinit(self.allocator);
         }
         if (self.deployment_loader) |l| {
             l.shutdown();
