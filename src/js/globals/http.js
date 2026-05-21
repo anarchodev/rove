@@ -75,5 +75,86 @@
     cancel(opts) {
       return sys.cancel(opts);
     },
+
+    /**
+     * Fire a transient streaming HTTP request. Unlike {@link http.send},
+     * `http.fetch` is non-durable + best-effort — it does NOT write
+     * a raft row, does NOT retry on worker crash, and fires
+     * immediately (no commit gate). Right for proxying real-time
+     * upstream streams (LLM token streams, large file downloads)
+     * where double-fire is bad (cost / bandwidth) and durable
+     * retry is overkill.
+     *
+     * Two patterns:
+     *
+     *  **Pattern A — per-chunk handler.** Set `on_chunk` to a module
+     *  path; each upstream chunk fires a `fetch_chunk` activation
+     *  there. `fetch_done` terminal fires on completion (against
+     *  `on_done` if set, else against `on_chunk`).
+     *
+     *  **Pattern B — transparent proxy.** Set `pipe_to: "held_response"`;
+     *  the runtime pipes upstream bytes directly into the calling
+     *  chain's held client (`__rove_stream`). `fetch_pipe_done`
+     *  terminal fires when upstream closes. No per-chunk handler.
+     *
+     * `on_chunk` and `pipe_to` are mutually exclusive.
+     *
+     * @param {object} opts
+     * @param {string} opts.url - Upstream URL.
+     * @param {string} [opts.method="GET"] - HTTP method.
+     * @param {Object<string,string>} [opts.headers] - Request headers.
+     * @param {string} [opts.body] - Request body.
+     * @param {number} [opts.timeout_ms=30000] - Per-request timeout.
+     * @param {string} [opts.on_chunk] - Module path for `fetch_chunk`
+     *   activations (Pattern A).
+     * @param {string} [opts.on_done] - Module path for the terminal
+     *   `fetch_done` / `fetch_pipe_done` activation.
+     * @param {"held_response"} [opts.pipe_to] - Pattern B; pipe
+     *   upstream bytes directly to the held client.
+     * @param {boolean} [opts.headers_passthrough=false] - Pattern B;
+     *   mirror upstream response headers onto the held client's
+     *   response headers.
+     * @param {number} [opts.max_response_chunk_bytes=65536] - Per-chunk
+     *   cap; libcurl writebacks larger than this are split into
+     *   multiple `fetch_chunk` activations.
+     * @param {number} [opts.max_total_response_bytes=52428800] - Hard
+     *   cap; exceeding cancels the fetch + fires the terminal with
+     *   `ok: false`.
+     * @param {*} [opts.ctx] - Threaded forward to each activation as
+     *   `request.ctx`.
+     * @returns {string} The fetch id. Pass to {@link http.cancelFetch}.
+     *
+     * @example
+     * // Pattern A — transform LLM tokens, forward to held client.
+     * http.fetch({
+     *   url: "https://api.openai.com/v1/chat/completions",
+     *   method: "POST",
+     *   body: JSON.stringify({ model, messages, stream: true }),
+     *   on_chunk: "transform.mjs",
+     *   on_done:  "finalize.mjs",
+     * });
+     * @example
+     * // Pattern B — transparent file proxy.
+     * http.fetch({
+     *   url: "https://cdn.example.com/big.mp4",
+     *   pipe_to: "held_response",
+     *   headers_passthrough: true,
+     * });
+     */
+    fetch(opts) {
+      return sys.fetch(opts);
+    },
+
+    /**
+     * Cancel an in-flight `http.fetch`. No-op if the fetch already
+     * completed or was never issued. Pattern B (pipe_to) fetches
+     * still fire `fetch_pipe_done` with `ok: false` after cancel.
+     *
+     * @param {{id:string}} opts - The id `http.fetch` returned.
+     * @returns {void}
+     */
+    cancelFetch(opts) {
+      return sys.cancelFetch(opts);
+    },
   };
 })();
