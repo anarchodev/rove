@@ -249,6 +249,14 @@ pub const Request = struct {
     /// `request.activation.write_pressure.dropped_chunks`. Always
     /// 0 for non-stream activations.
     activation_write_pressure_dropped: u32 = 0,
+    /// Gap 2.3 Phase C1: caller-owned accumulator for `http.fetch`
+    /// calls during this activation. Bindings append; the
+    /// dispatcher passes the pointer through to `DispatchState`;
+    /// the worker (caller of `runOutcome`) flushes to
+    /// `NodeState.fetch_pending` at handler-success time + frees
+    /// any leftovers at handler-error time. Null on test paths
+    /// that don't care.
+    pending_fetches: ?*std.ArrayListUnmanaged(globals.PendingFetch) = null,
     /// Gap 2.1 subscription_fire payload (catalog §2.1 +
     /// `docs/subscriptions-plan.md`). Set only when
     /// `activation_source == .subscription_fire`; surfaces as
@@ -461,6 +469,7 @@ pub const Dispatcher = struct {
             .release_publish_ctx = request.release_publish_ctx,
             .scope_kv_write = request.scope_kv_write,
             .scope_kv_ctx = request.scope_kv_ctx,
+            .pending_fetches = request.pending_fetches,
         };
 
         // Reset the per-request arena (one cursor write) and reseed
