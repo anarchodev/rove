@@ -1,8 +1,24 @@
-# Upstream streaming — `http.send` per-chunk visibility + transparent proxy
+# Upstream streaming — `http.fetch` (a new non-durable primitive)
 
-**Status:** Planning. Implements `docs/primitive-gaps.md` §2.3
-("Streaming response bytes from `http.send`"). No code yet; this
-doc is the design before phasing.
+**Status:** Phase A shipped (types + enum variants) under the
+reframe. Implements `docs/primitive-gaps.md` §2.3.
+
+**Reframe note (2026-05-20):** the original framing extended
+`http.send` with streaming options. That's the wrong host —
+`http.send` is durable + at-least-once (raft-replicated
+`_send/owed/<id>` row, retry-on-crash). The streaming use cases
+(LLM proxy, large-file proxy) want **transient + best-effort**:
+double-fire is bad (double-LLM-cost / wasted bandwidth), durable
+persistence of an in-flight token stream is bizarre. So
+streaming becomes a separate primitive: **`http.fetch`** — runs
+on its own thread pool, no `_send/owed/` row, no retry, fires
+immediately. `http.send` stays unchanged for the
+"deliver-this-webhook-reliably" pattern.
+
+Capped tape (catalog §6) handles replay determinism for both
+fetch and held-subscription cases — chunks accumulate against
+the chain's tape budget; pathological streams hit the cap and
+degrade to summary-only. No per-primitive replay carve-out.
 
 ---
 
@@ -30,13 +46,13 @@ minimal additions, per the §2.3 recommendation in
 
 ## 2. Customer surface
 
-### 2.1 Pattern (a) — per-chunk visibility via `stream_response: true`
+### 2.1 Pattern (a) — per-chunk visibility via `on_chunk`
 
 ```js
-http.send({
+http.fetch({
   url: "https://api.example.com/stream",
-  stream_response: true,                  // ← new flag
-  on_result: "transform-chunk.mjs",
+  on_chunk: "transform-chunk.mjs",        // module path; receives fetch_chunk activations
+  on_done:  "finalize.mjs",                // optional; receives fetch_done activation
   ctx: { /* threaded forward */ },
 });
 ```
@@ -48,8 +64,8 @@ The customer's chain receives a sequence of activations on
 export default function () {
   const a = request.activation;
 
-  if (a.kind === "send_chunk") {
-    // a.send_id, a.byte_offset, a.bytes (Uint8Array view; not
+  if (a.kind === "fetch_chunk") {
+    // a.fetch_id, a.byte_offset, a.bytes (Uint8Array view; not
     // retained past return)
     return __rove_stream({
       write: [`event: token\ndata: ${rewrite(a.bytes)}\n\n`],
@@ -57,36 +73,37 @@ export default function () {
     });
   }
 
-  if (a.kind === "send_end") {
-    // a.send_id, a.ok, a.status, a.trailers (headers reachable
-    // earlier via a.send_headers on first chunk)
+  if (a.kind === "fetch_done") {
+    // a.fetch_id, a.ok, a.status, a.trailers (headers reachable
+    // earlier via a.fetch_headers on first chunk)
     return { /* terminal */ };
   }
 }
 ```
 
-Each upstream chunk fires one `send_chunk` activation; the chain
-continues until `send_end`. The handler's return Cmd
+Each upstream chunk fires one `fetch_chunk` activation; the chain
+continues until `fetch_done`. The handler's return Cmd
 (`Response`/`__rove_next`/`__rove_stream`) is honored per chunk
 — customers can interleave outbound writes, fire follow-up
-`http.send`s, etc.
+`http.fetch`s or `http.send`s, etc.
 
 ### 2.2 Pattern (b) — transparent proxy via `pipe_to`
 
 ```js
 const a = request.activation;
 if (a.kind === "inbound") {
-  http.send({
+  http.fetch({
     url: "https://upstream/big.mp4",
-    pipe_to: "held_response",              // ← new option, no on_result
+    pipe_to: "held_response",              // ← bypasses handler; pipes bytes through
     headers_passthrough: true,             // ← optional; mirror upstream headers
+    on_done: "finalize.mjs",               // optional; pipe terminal handler
   });
   return __rove_stream({
     headers: { "Cache-Control": "no-store" },
-    waitFor: { send_pipe_done: "auto" },   // wake when upstream closes
+    waitFor: { fetch_pipe_done: "auto" },  // wake when upstream closes
   });
 }
-if (a.kind === "send_pipe_done") {
+if (a.kind === "fetch_pipe_done") {
   return { status: a.source.ok ? 200 : 502 };
 }
 ```
@@ -96,19 +113,43 @@ The runtime pipes upstream bytes directly into the held client's
 handler is only re-entered when the upstream connection
 terminates (success or failure).
 
-Bytes flow: libcurl writeback → SendDispatch thread → cross-
+Bytes flow: libcurl writeback → fetch-pool thread → cross-
 thread inbox → worker tick → `StreamChunks.tryAppend` on the
 held entity → h2 ships. The `StreamChunks` cap from Gap 2.2 §9.4
 naturally bounds the proxy's buffering; overflow drops newest +
 surfaces via `write_pressure.dropped_chunks` on the eventual
-`send_pipe_done` activation.
+`fetch_pipe_done` activation.
 
-### 2.3 Constraint: `stream_response` vs `pipe_to` are mutually exclusive
+### 2.3 Constraint: `on_chunk` vs `pipe_to` are mutually exclusive
 
-`stream_response: true` routes bytes through the handler.
-`pipe_to: 'held_response'` bypasses the handler. Setting both
-errors at the `http.send` binding (one or the other; combining
-them is incoherent).
+`on_chunk` routes bytes through the handler. `pipe_to:
+'held_response'` bypasses the handler. Setting both errors at
+the `http.fetch` binding (one or the other; combining them is
+incoherent).
+
+### 2.4 Why a separate primitive (not `http.send` extended)
+
+`http.send` is durable: every send writes a `_send/owed/<id>`
+row through raft; if the worker dies before delivery, the next
+leader's recovery scan re-fires. That's right for "deliver this
+webhook reliably" — even at the cost of at-least-once
+double-fires.
+
+For LLM proxy: double-fire = double-LLM-cost (~$0.01-$0.10 per
+duplicate). For large-file proxy: double-fire wastes bandwidth.
+Neither use case wants durable + at-least-once. They want
+transient + best-effort.
+
+`http.fetch` is the transient sibling:
+- No `_send/owed/<id>` row; no raft involvement.
+- No retry on worker crash. (Customer composes retry-with-jitter
+  via `retry.js` on top, same as today.)
+- Fires immediately — no commit gate. The fetch leaves the
+  customer's process within microseconds of the binding call,
+  bypassing the propose-then-fire dance that `http.send` does.
+- Runs on its own thread pool (`NodeState.fetch_pool`), separate
+  from `SendDispatch`. Different saturation domain — a slow
+  upstream LLM won't backpressure scheduled-send delivery.
 
 ---
 
@@ -148,25 +189,25 @@ send_pipe_done — { send_id, ok, status, bytes_piped, dropped_chunks }
 
 ---
 
-## 4. `http.send` option-set additions
+## 4. `http.fetch` option-set
 
 ```jsonc
 {
-  url, method, headers, body, fire_at_ns, timeout_ms,
-  max_body_bytes,                  // ignored when stream_response or pipe_to set
-  on_result,                       // module + fn for send_callback / send_end
-  // NEW:
-  stream_response: false,          // opt into per-chunk activations
-  pipe_to: null,                   // "held_response" | null
-  headers_passthrough: false,      // pipe_to + this = upstream headers → response headers
-  max_response_chunk_bytes: 64*1024,  // per-chunk cap; libcurl writeback chunks past this split
-  max_total_response_bytes: 50*1024*1024,  // overall cap; cancels the send on exceed
+  url, method, headers, body, timeout_ms,
+  on_chunk: "module/path.mjs",          // pattern A; fires fetch_chunk per chunk
+  on_done:  "module/path.mjs",          // both patterns; fires fetch_done / fetch_pipe_done terminal
+  pipe_to:  "held_response" | null,     // pattern B; bypasses handler, pipes upstream → held client
+  headers_passthrough: false,           // pipe_to + this = upstream headers → response headers
+  max_response_chunk_bytes: 64*1024,    // per-chunk cap; libcurl writeback chunks past this split
+  max_total_response_bytes: 50*1024*1024, // overall cap; cancels the fetch on exceed
+  ctx: {...},                           // threaded forward to each activation as request.ctx
 }
 ```
 
-`stream_response` and `pipe_to` are exclusive. Setting `pipe_to`
+`on_chunk` and `pipe_to` are exclusive. Setting `pipe_to`
 without an inbound chain (no held client to write to) errors at
-the binding.
+the binding. Returns a `fetch_id` string the customer can pass
+to `http.cancelFetch({id})`.
 
 ---
 
@@ -308,55 +349,68 @@ activation.
 
 Each phase keeps build + all 13 streaming/heldsync/ctl smokes green.
 
-### Phase A — Wire-format & types
+### Phase A — Wire-format & types — **SHIPPED**
 
-- Add `send_chunk`, `send_end`, `send_pipe_done` enum variants
-  to `ActivationSource`.
-- Define `UpstreamChunk` component (bytes + offset + seq +
-  send_id + chain identity).
-- Tape encoding for chunk payloads (small inline, large
-  content-addressed).
-- Build clean, no behavior change.
+- 3 new `ActivationSource` variants: `fetch_chunk`, `fetch_done`,
+  `fetch_pipe_done`.
+- `UpstreamFetchEvent` component (bytes + offset + seq +
+  fetch_id + fetch_headers + ctx + variant-specific terminal
+  fields).
+- Build clean, no behavior change yet.
 
-### Phase B — `http.send` options + binding validation
+(Tape encoding for chunk payloads stays as Phase G work, paired
+with the §6 tape cap that already covers replay determinism for
+both fetch and held-subscription cases.)
 
-- Accept `stream_response`, `pipe_to`,
-  `max_response_chunk_bytes`, `max_total_response_bytes`,
-  `headers_passthrough` on the binding.
-- Validate exclusivity (`stream_response` vs `pipe_to`).
-- Persist these flags on the `_send/owed/<id>` row (OwedSend
-  v2 — bump the version, keep v1 decode for replay).
+### Phase B — `http.fetch` JS binding — **next**
 
-### Phase C — libcurl writeback callback + cross-thread chunk inbox
+- New `globals.zig` binding: `jsHttpFetch(ctx, opts) -> fetch_id`.
+- Option extraction + validation: `on_chunk` vs `pipe_to`
+  exclusivity, `pipe_to == "held_response"` only, defaults for
+  `max_response_chunk_bytes` / `max_total_response_bytes`.
+- `BuiltFetch` carrier struct (separate from `BuiltSend` —
+  `http.fetch` is non-durable, so no `_send/owed/` write).
+- Returns a `fetch_id` (sha256 of request_id + http_fetch_index,
+  deterministic for replay).
+- Binding queues the fetch into `NodeState.fetch_pending`
+  (a transient list — no kv, no raft). Phase C drains it.
+- `http.cancelFetch({id})` binding for cancellation.
 
-- Swap `CURLOPT_WRITEFUNCTION` for streaming sends.
-- Per-worker `send_chunk_inbox` (mirror of
-  `SubscriptionFireInbox` shape — mutex + ArrayList of owned
-  messages).
-- SendDispatch fires the callback; per chunk, enqueue to the
-  right worker via hash(tenant).
+### Phase C — Fetch-pool thread + libcurl writeback callback + cross-thread chunk inbox
 
-### Phase D — `send_chunk` / `send_end` activations (Pattern A)
+- New `NodeState.fetch_pool` — M dedicated threads (separate
+  from `SendDispatch`); each owns a libcurl Easy handle from a
+  dedicated `EasyPool` (separate saturation domain).
+- Drain `NodeState.fetch_pending` on the pool; per-fetch
+  thread issues libcurl with `CURLOPT_WRITEFUNCTION` set.
+- The writeback callback re-chunks libcurl deliveries into
+  `max_response_chunk_bytes` units, enqueues each into a
+  per-worker `fetch_chunk_inbox` (hash(tenant) routed; mirrors
+  `SubscriptionFireInbox`).
 
-- New per-worker collection `send_chunk_pending` + dispatch
+### Phase D — `fetch_chunk` / `fetch_done` activations (Pattern A)
+
+- New per-worker collection `fetch_event_pending` + dispatch
   system.
 - Worker tick drains the chunk inbox → collection → fires
-  handler with `request.activation = { kind: "send_chunk", ... }`.
-- On upstream completion, fire `send_end` with the trailing
-  metadata.
-- Smoke: a handler subscribes to an upstream SSE; verifies it
-  receives N chunk activations + one send_end.
+  handler (on the `on_chunk` module) with `request.activation
+  = { kind: "fetch_chunk", ... }`.
+- On upstream completion, fire `fetch_done` (on the `on_done`
+  module) with trailing metadata.
+- Smoke: customer GET fires `http.fetch({url, on_chunk})` against
+  an SSE upstream; verifies N chunk activations + one
+  fetch_done.
 
 ### Phase E — `pipe_to` Pattern B
 
-- `http.send` records the calling chain's entity id +
-  correlation_id on the send's bookkeeping.
-- Chunks arrive → worker-side `pipe_chunk_pending` collection
-  (or direct write to `StreamChunks` if the held entity is on
-  the same worker).
-- `send_pipe_done` activation on upstream close.
-- Smoke: customer GET fires `http.send({pipe_to})` and returns
-  `__rove_stream`; the client receives upstream bytes
+- `http.fetch` records the calling chain's entity id +
+  correlation_id on the fetch's bookkeeping when `pipe_to ==
+  "held_response"`.
+- Chunks arrive → worker-side append to `StreamChunks` on the
+  held entity (no per-chunk handler invocation).
+- `fetch_pipe_done` activation on upstream close.
+- Smoke: customer GET fires `http.fetch({url, pipe_to})` and
+  returns `__rove_stream`; the client receives upstream bytes
   byte-for-byte.
 
 ### Phase F — caps + backpressure

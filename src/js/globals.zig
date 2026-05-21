@@ -166,6 +166,16 @@ pub const DispatchState = struct {
     /// to derive the platform-default schedule id (sha256(req_id ||
     /// call_index)) when the customer didn't supply a `handle`.
     http_call_index: u32 = 0,
+    /// 0-based counter of `http.fetch` calls within this handler
+    /// invocation. Parallel to `http_call_index` but for the
+    /// transient streaming-fetch primitive (Gap 2.3,
+    /// `docs/upstream-streaming-plan.md`). Reset per request;
+    /// combined with `request_id` + a `"FTCH"` tag to derive the
+    /// platform-default `fetch_id` deterministically for replay.
+    /// Lives separately from `http_call_index` to keep id
+    /// namespaces clean — a send-then-fetch and fetch-then-send
+    /// produce the same set of ids regardless of order.
+    http_fetch_index: u32 = 0,
     /// Resolved session id (see `Request.session_id`). 64 lowercase hex
     /// chars when set; null in non-browser dispatch paths. Surfaced as
     /// `request.session = {id: ...}` (or `request.session = null`).
@@ -1432,8 +1442,10 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // re-fires it. webhook.send + email.send polyfill on top
     // (see webhook.js + email.js).
     .{ .path = &.{ "_system", "http" }, .fns = &.{
-        .{ .name = "send",   .cfunc = http_b.jsHttpSend,   .argc = 1 },
-        .{ .name = "cancel", .cfunc = http_b.jsHttpCancel, .argc = 1 },
+        .{ .name = "send",        .cfunc = http_b.jsHttpSend,        .argc = 1 },
+        .{ .name = "cancel",      .cfunc = http_b.jsHttpCancel,      .argc = 1 },
+        .{ .name = "fetch",       .cfunc = http_b.jsHttpFetch,       .argc = 1 },
+        .{ .name = "cancelFetch", .cfunc = http_b.jsHttpCancelFetch, .argc = 1 },
     } },
     // platform = { root, instances }. Installed on every context;
     // the C callbacks check `state.platform` and throw for non-admin

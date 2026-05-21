@@ -1,22 +1,42 @@
-//! `http.send` / `http.cancel` JS bindings — the platform's outbound
-//! HTTP primitive (docs/http-send-plan.md §1). Both bindings
-//! accumulate intent onto the dispatcher's per-batch lists; the
-//! actual propose-through-raft happens at end-of-batch in
-//! `worker_dispatch.finalizeBatch`. By the time the customer
-//! handler returns, the row is durably committed cluster-wide
-//! (atomic with the customer's kv writeset via the multi-envelope).
+//! `http.send` / `http.cancel` (durable scheduled HTTP — Option (b);
+//! `docs/http-send-plan.md` §1) AND `http.fetch` /
+//! `http.cancelFetch` (transient streaming HTTP —
+//! `docs/upstream-streaming-plan.md`, Gap 2.3) JS bindings.
 //!
-//! The customer-facing API:
+//! The two outbound primitives have intentionally different
+//! semantics:
+//!
+//!   http.send — durable, at-least-once, commit-gated. Writes a
+//!     `_send/owed/{id}` marker through raft; the leader-local
+//!     SendDispatch fires libcurl post-commit. Recovery boot-scans
+//!     the owed prefix; retry on crash. Right for "deliver this
+//!     webhook reliably."
+//!
+//!   http.fetch — transient, best-effort, fire-immediately. No
+//!     raft involvement; the fetch-pool thread issues libcurl as
+//!     soon as the binding accumulates it; no retry on crash.
+//!     Streaming response delivery via on_chunk (Pattern A) or
+//!     pipe_to (Pattern B). Right for "proxy this LLM token stream"
+//!     where double-fire = double-LLM-cost.
+//!
+//! The customer-facing APIs:
 //!
 //!   const id = http.send({
 //!     handle?, url, method, headers, body, fire_at_ns?,
 //!     on_result?, timeout_ms?, max_body_bytes?,
 //!   });
-//!
 //!   http.cancel({ handle? | id? });
 //!
-//! See the design doc for full semantics. This file is the C-level
-//! glue; argument validation + accumulator append + nothing else.
+//!   const fetch_id = http.fetch({
+//!     url, method?, headers?, body?, timeout_ms?,
+//!     on_chunk?, on_done?, pipe_to?, headers_passthrough?,
+//!     max_response_chunk_bytes?, max_total_response_bytes?, ctx?,
+//!   });
+//!   http.cancelFetch({ id });
+//!
+//! See the design docs for full semantics. This file is the
+//! C-level glue; argument validation + accumulator append + nothing
+//! else.
 
 const std = @import("std");
 const qjs = @import("rove-qjs");
@@ -105,6 +125,235 @@ pub fn jsHttpCancel(
     };
     state.allocator.free(id_owned);
     return js_undefined;
+}
+
+// ── http.fetch / http.cancelFetch — Gap 2.3 ──────────────────────────────
+
+/// `http.fetch(opts) -> fetch_id` — transient streaming HTTP.
+/// Phase B: build + validate + return id; transport (libcurl
+/// writeback + per-chunk activations) lands in Phase C / D / E.
+/// For now, the binding logs a warning at end-of-handler that the
+/// fetch was accepted but not yet wired.
+pub fn jsHttpFetch(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    if (argc < 1 or !c.JS_IsObject(argv[0])) {
+        _ = c.JS_ThrowTypeError(ctx, "http.fetch requires an options object");
+        return js_exception;
+    }
+    const opts = argv[0];
+
+    var row = buildFetchRow(ctx, state, opts) catch |err| switch (err) {
+        error.JsException => return js_exception,
+        else => {
+            state.pending_kv_error = err;
+            return js_exception;
+        },
+    };
+    state.http_fetch_index += 1;
+    // Phase B: drop the carrier; Phase C accumulates into a
+    // per-DispatchState pending-fetches list + drain into
+    // NodeState.fetch_pool. Until then, every call logs the same
+    // warning so customers see the binding is accepted but the
+    // wire is not yet hot.
+    std.log.warn(
+        "http.fetch (Phase B): accepted fetch id={s} url={s} (transport not yet wired; lands in Gap 2.3 Phase C)",
+        .{ row.id, row.url },
+    );
+    const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
+    row.deinit(state.allocator);
+    return res;
+}
+
+/// `http.cancelFetch({id})` — cancel a not-yet-completed fetch.
+/// Phase B: validates the id field; Phase C will look up + cancel
+/// the libcurl handle on the fetch-pool thread.
+pub fn jsHttpCancelFetch(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1 or !c.JS_IsObject(argv[0])) {
+        _ = c.JS_ThrowTypeError(ctx, "http.cancelFetch requires an options object with `id`");
+        return js_exception;
+    }
+    const opts = argv[0];
+    const id_v = c.JS_GetPropertyStr(ctx, opts, "id");
+    defer c.JS_FreeValue(ctx, id_v);
+    if (!c.JS_IsString(id_v)) {
+        _ = c.JS_ThrowTypeError(ctx, "http.cancelFetch: `id` must be a string");
+        return js_exception;
+    }
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx, &len, id_v);
+    if (cstr == null) return js_exception;
+    defer c.JS_FreeCString(ctx, cstr);
+    if (len == 0 or len > schedule_server.ID_MAX_LEN) {
+        _ = c.JS_ThrowRangeError(ctx, "http.cancelFetch: `id` must be 1-256 utf8 bytes");
+        return js_exception;
+    }
+    // Phase B no-op; Phase C wires the actual cancellation onto
+    // the fetch-pool's libcurl handle for this id.
+    std.log.warn(
+        "http.cancelFetch (Phase B): cancel-request accepted for id={s} (transport not yet wired; lands in Gap 2.3 Phase C)",
+        .{cstr[0..len]},
+    );
+    return js_undefined;
+}
+
+/// Local carrier for a just-built fetch — parallel to BuiltSend
+/// but for the transient `http.fetch` path. No raft involvement,
+/// no `_send/owed/` write. `deinit` frees every owned slice.
+const BuiltFetch = struct {
+    id: []u8,
+    url: []u8,
+    method: []u8,
+    headers_json: []u8,
+    body: []u8,
+    timeout_ms: u32,
+    /// `on_chunk` module path. Empty when `pipe_to` is set OR the
+    /// caller opted into fire-and-forget (terminal-only via
+    /// `on_done`).
+    on_chunk_module: []u8,
+    /// `on_done` module path. Empty when fire-and-forget (no
+    /// terminal handler — the runtime still fires the terminal
+    /// activation against `on_chunk` if set, else drops it).
+    on_done_module: []u8,
+    /// Threaded forward to each activation as `request.ctx`. JSON
+    /// string; "null" when omitted.
+    ctx_json: []u8,
+    /// True iff `pipe_to == "held_response"`. Mutually exclusive
+    /// with `on_chunk_module` (binding rejects both).
+    pipe_to_held: bool,
+    headers_passthrough: bool,
+    max_response_chunk_bytes: u32,
+    max_total_response_bytes: u64,
+
+    fn deinit(self: *BuiltFetch, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.url);
+        allocator.free(self.method);
+        allocator.free(self.headers_json);
+        allocator.free(self.body);
+        allocator.free(self.on_chunk_module);
+        allocator.free(self.on_done_module);
+        allocator.free(self.ctx_json);
+        self.* = undefined;
+    }
+};
+
+/// Build + validate the fetch options object → owned `BuiltFetch`.
+/// Exclusivity: `on_chunk` and `pipe_to` may not both be set.
+/// `pipe_to` accepts only `"held_response"` in v1.
+fn buildFetchRow(
+    ctx: ?*c.JSContext,
+    state: *globals.DispatchState,
+    opts: c.JSValue,
+) !BuiltFetch {
+    const a = state.allocator;
+    var fetched: FetchExtracted = .{};
+    errdefer fetched.deinit(a);
+
+    fetched.id = try deriveFetchIdHex(a, state.request_id, state.http_fetch_index);
+    fetched.url = try dupeJsString(ctx, a, opts, "url", null);
+    fetched.method = try dupeJsString(ctx, a, opts, "method", "GET");
+    fetched.body = try dupeJsString(ctx, a, opts, "body", "");
+    fetched.headers_json = try dupeJsObjectAsJson(ctx, a, opts, "headers", "{}");
+    fetched.ctx_json = try dupeJsObjectAsJson(ctx, a, opts, "ctx", "null");
+    fetched.on_chunk_module = try dupeJsString(ctx, a, opts, "on_chunk", "");
+    fetched.on_done_module = try dupeJsString(ctx, a, opts, "on_done", "");
+
+    const pipe_to_held = blk: {
+        const v = c.JS_GetPropertyStr(ctx, opts, "pipe_to");
+        defer c.JS_FreeValue(ctx, v);
+        if (c.JS_IsUndefined(v) or c.JS_IsNull(v)) break :blk false;
+        if (!c.JS_IsString(v)) {
+            _ = c.JS_ThrowTypeError(ctx, "http.fetch: `pipe_to` must be a string or null");
+            return error.JsException;
+        }
+        var len: usize = 0;
+        const cstr = c.JS_ToCStringLen(ctx, &len, v);
+        if (cstr == null) return error.JsException;
+        defer c.JS_FreeCString(ctx, cstr);
+        const s = @as([*]const u8, @ptrCast(cstr))[0..len];
+        if (std.mem.eql(u8, s, "held_response")) break :blk true;
+        _ = c.JS_ThrowRangeError(ctx, "http.fetch: `pipe_to` must be \"held_response\" (only valid value in v1)");
+        return error.JsException;
+    };
+    if (pipe_to_held and fetched.on_chunk_module.?.len > 0) {
+        _ = c.JS_ThrowTypeError(ctx, "http.fetch: `on_chunk` and `pipe_to` are mutually exclusive");
+        return error.JsException;
+    }
+    const headers_passthrough = try getBoolField(ctx, opts, "headers_passthrough", false);
+    const timeout_ms_i32 = try getIntField(ctx, opts, "timeout_ms", 30_000);
+    const max_chunk_i32 = try getIntField(ctx, opts, "max_response_chunk_bytes", 64 * 1024);
+    const max_total_i64 = try getInt64Field(ctx, opts, "max_total_response_bytes", 50 * 1024 * 1024);
+
+    const row: BuiltFetch = .{
+        .id = fetched.id.?,
+        .url = fetched.url.?,
+        .method = fetched.method.?,
+        .headers_json = fetched.headers_json.?,
+        .body = fetched.body.?,
+        .timeout_ms = @intCast(@max(timeout_ms_i32, 1)),
+        .on_chunk_module = fetched.on_chunk_module.?,
+        .on_done_module = fetched.on_done_module.?,
+        .ctx_json = fetched.ctx_json.?,
+        .pipe_to_held = pipe_to_held,
+        .headers_passthrough = headers_passthrough,
+        .max_response_chunk_bytes = @intCast(@max(max_chunk_i32, 1)),
+        .max_total_response_bytes = if (max_total_i64 < 1) 1 else @intCast(max_total_i64),
+    };
+    fetched = .{}; // ownership transferred
+    return row;
+}
+
+const FetchExtracted = struct {
+    id: ?[]u8 = null,
+    url: ?[]u8 = null,
+    method: ?[]u8 = null,
+    headers_json: ?[]u8 = null,
+    body: ?[]u8 = null,
+    ctx_json: ?[]u8 = null,
+    on_chunk_module: ?[]u8 = null,
+    on_done_module: ?[]u8 = null,
+
+    fn deinit(self: *FetchExtracted, a: std.mem.Allocator) void {
+        if (self.id) |s| a.free(s);
+        if (self.url) |s| a.free(s);
+        if (self.method) |s| a.free(s);
+        if (self.headers_json) |s| a.free(s);
+        if (self.body) |s| a.free(s);
+        if (self.ctx_json) |s| a.free(s);
+        if (self.on_chunk_module) |s| a.free(s);
+        if (self.on_done_module) |s| a.free(s);
+    }
+};
+
+/// Hex(sha256(u64-le(request_id) || u32-le("fetch") || u32-le(fetch_index))).
+/// 64 chars; stable per-replay. The "fetch" tag is the literal
+/// string `"FTCH"` (4 ASCII bytes) so the id space doesn't
+/// collide with `http.send`'s `derivedIdHex` (which uses
+/// `(req_id, call_index)` with no tag — its ids are u64+u32).
+fn deriveFetchIdHex(a: std.mem.Allocator, request_id: u64, fetch_index: u32) ![]u8 {
+    var input: [16]u8 = undefined;
+    std.mem.writeInt(u64, input[0..8], request_id, .little);
+    @memcpy(input[8..12], "FTCH");
+    std.mem.writeInt(u32, input[12..16], fetch_index, .little);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&input, &digest, .{});
+    const out = try a.alloc(u8, 64);
+    const hex_chars = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+    return out;
 }
 
 /// Local carrier for a just-built send: the JS-returned `id` plus the
@@ -555,6 +804,27 @@ test "derivedIdHex: stable across calls with same inputs" {
     try testing.expectEqualStrings(id1, id2);
     try testing.expectEqual(@as(usize, 64), id1.len);
     for (id1) |b| try testing.expect((b >= '0' and b <= '9') or (b >= 'a' and b <= 'f'));
+}
+
+test "deriveFetchIdHex: stable; differs by index; disjoint from send-derived" {
+    const a = testing.allocator;
+    const f1 = try deriveFetchIdHex(a, 42, 0);
+    defer a.free(f1);
+    const f2 = try deriveFetchIdHex(a, 42, 0);
+    defer a.free(f2);
+    try testing.expectEqualStrings(f1, f2);
+    try testing.expectEqual(@as(usize, 64), f1.len);
+
+    const f3 = try deriveFetchIdHex(a, 42, 1);
+    defer a.free(f3);
+    try testing.expect(!std.mem.eql(u8, f1, f3));
+
+    // Fetch ids must NOT collide with send ids for the same
+    // (request_id, index) — the "FTCH" tag in the hash input
+    // makes the spaces disjoint.
+    const send_id = try derivedIdHex(a, 42, 0);
+    defer a.free(send_id);
+    try testing.expect(!std.mem.eql(u8, f1, send_id));
 }
 
 test "derivedIdHex: differs across call indices" {
