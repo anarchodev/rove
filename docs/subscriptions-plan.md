@@ -1,16 +1,18 @@
 # Subscriptions — chain origins without an inbound request
 
-**Status:** Phases A–E shipped 2026-05-20 on
-`gap-2-1-subscriptions` branch. **kv-react + boot both fire
-end-to-end with smokes**; Phase E was also refactored to use a
-rove collection (`subscription_fire_pending`) as the in-worker
-state. Phase F (cron firing) deferred — needs either a Zig
-duration parser + worker-tick sweep, or piggybacking on
-SendDispatch with an internal-target flavor; not yet scoped.
-Phase G's cron smoke waits on F. Implements
-`docs/primitive-gaps.md` §2.1 + `streaming-handlers-plan.md` §5
-unfinished design ("chain origins that are NOT inbound
-requests"). See §10 below for the per-phase status detail.
+**Status: DONE 2026-05-20.** Phases A–G shipped end-to-end on
+`gap-2-1-subscriptions` branch. **All three chain-origin kinds
+fire with smokes**: kv-react via the apply-time hook on the
+worker that committed the writeset; boot via a NodeState
+cross-thread inbox + leadership-gained sweep + writeset-injected
+marker; cron via a throttled in-memory sweep with
+`next_fire_at_ns` per `<tenant>|<name>`. Phase E was also
+refactored to use a rove collection (`subscription_fire_pending`)
+as the per-worker state — the same collection serves all three
+kinds. Implements `docs/primitive-gaps.md` §2.1 +
+`streaming-handlers-plan.md` §5 ("chain origins that are NOT
+inbound requests"). See §10 below for the per-phase status +
+load-bearing details.
 
 ---
 
@@ -338,9 +340,9 @@ venue. Memory pointer.
 | C | `.subscription_fire` enum + Request fields + `fireSubscriptionActivation` + JS surface | **shipped** |
 | D | boot firing via NodeState inbox + leadership-gained sweep + writeset-injected marker | **shipped** |
 | E | kv-react firing via apply-time hook (rove collection + tick-end system) | **shipped (+ refactored to collection)** |
-| F | cron firing | **deferred** — Zig duration parser + worker-tick sweep, or SendDispatch ride |
-| G | smokes — boot ✓, kv ✓, cron ✗ | **partial (boot + kv shipped)** |
-| H | docs + framing | **partial (this update)** |
+| F | cron firing via throttled 1Hz in-memory sweep + interval_ms-based spec | **shipped** |
+| G | smokes — boot ✓, kv ✓, cron ✓ | **shipped (all three)** |
+| H | docs + framing | **shipped (this update)** |
 
 **Phase E load-bearing detail (and where the refactor came in):**
 the kv-react fire site (`fireKvReactSubscriptions`, called from
@@ -380,7 +382,38 @@ enqueues.
 surfaces as `BigInt` (not `Number`) — deployment_id is a u64
 derived from sha256 that routinely exceeds 2^53. Caught by the
 first boot smoke run (precision loss rounded
-`3597548766156152628` to `3597548766156153000`).
+`3597548766156152628` to `3597548766156153000`). **Second
+correction:** must be `JS_NewBigUint64` (not `JS_NewBigInt64`) —
+values > 2^63 flip sign as signed i64. Caught when a later
+deploy_id happened to exceed 2^63 and the smoke flaked with a
+negative number on the smoke's gate-marker read.
+
+**Phase F load-bearing detail:** cron's `next_fire_at_ns` lives
+in `NodeState.cron_state` (in-memory HashMap, mutex-guarded).
+**Not raft-replicated by design** — leader change resets the
+cron clock; the new leader's first sweep initializes
+`next_fire_at_ns = now + interval_ms` and the next fire happens
+after one interval. Trade-off accepted: long-interval crons can
+pause up to one interval after failover; customer idempotency /
+missed-tick tolerance covers it (the `[[feedback_compose_from_primitives]]`
+posture). The sweep is throttled to 1Hz on worker 0 +
+leader-gated, so it costs nothing on followers and ~once-per-
+second on the leader's worker 0. Cumulative-drift advance
+(`next + interval` when within an interval of now; fall back to
+`now + interval` after long pauses) keeps cron cadence stable
+across short GC stalls without piling up on long ones.
+
+**Why not raft-replicate the cron state?** Three reasons:
+(1) the SendDispatch piggyback was too HTTP-specific (OwedSend's
+encoding is tied to url/method/body/...; adding a flavor tag
+would require a wire-format version bump and follower handling).
+(2) Raft-replicated `_subscriptions/cron-fire/<name>` would
+race with the sweep+fire+write cycle in ways that need
+in-flight tracking, getting complex fast. (3) In-memory state +
+missed-tick tolerance is the right semantic match — cron is
+"approximate periodic," not "exact replicated schedule." The
+customer composes "exact schedule" via `http.send` self-
+reschedule, which DOES live in raft (the `_send/owed/<id>` row).
 
 ---
 
