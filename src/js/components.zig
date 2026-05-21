@@ -207,6 +207,58 @@ pub const StreamWakes = struct {
     }
 };
 
+/// Gap 2.1 Phase E (refactored): a pending subscription-fire chain
+/// origin awaiting dispatch on the local worker. Entities live in
+/// `Worker.subscription_fire_pending`; the
+/// `dispatchSubscriptionFires` system iterates that collection on
+/// each tick, calls `fireSubscriptionActivation` against the
+/// worker's own dispatcher, and `reg.destroy`s the entity (deferred,
+/// flushed at boundary). Producers from worker threads (kv-react
+/// site in `firePendingKvWakes`) `reg.create` directly; producers
+/// from non-worker threads (deployment_loader for boot, cron
+/// sweeper for cron) push to a thread-safe NodeState inbox that a
+/// worker drains and translates into entities.
+///
+/// Component shape mirrors `WakeEntry` — tag enum + flat fields per
+/// variant — to keep SoA storage cheap (no inline union with
+/// padding). `tenant_id`/`module_path`/etc. are allocator-owned
+/// when populated; default-init leaves all slices empty so a
+/// destroyed-but-recycled entity is benign.
+pub const SubscriptionFireDescriptor = struct {
+    tenant_id: []u8 = &.{},
+    subscription_name: []u8 = &.{},
+    module_path: []u8 = &.{},
+    source_kind: SourceKind = .cron,
+    /// Set when `source_kind == .cron`. Wall-clock ns the cron
+    /// match was detected; surfaces as `request.activation.source.firedAt`.
+    cron_fired_at_ns: i64 = 0,
+    /// Set when `source_kind == .kv`. The key whose write triggered
+    /// the fire; allocator-owned when non-empty.
+    kv_key: []u8 = &.{},
+    /// `'p'` or `'d'`. Meaningful only when `source_kind == .kv`.
+    kv_op: u8 = 0,
+    /// Set when `source_kind == .boot`. The deployment_id whose
+    /// activation triggered the fire (the runtime gates re-fire on
+    /// `_boot_fired/<dep_id>` post-fire).
+    boot_deployment_id: u64 = 0,
+    /// Earned-its-keep field: retry count on transient failures.
+    /// V1 doesn't retry; the field is here so adding retry doesn't
+    /// re-shape the component.
+    retry_count: u8 = 0,
+
+    pub const SourceKind = enum(u8) { cron, kv, boot };
+
+    pub fn deinit(allocator: std.mem.Allocator, items: []SubscriptionFireDescriptor) void {
+        for (items) |*item| {
+            if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
+            if (item.subscription_name.len > 0) allocator.free(item.subscription_name);
+            if (item.module_path.len > 0) allocator.free(item.module_path);
+            if (item.kv_key.len > 0) allocator.free(item.kv_key);
+            item.* = .{};
+        }
+    }
+};
+
 /// Phase 7: replaces the Phase-6 `parked_streams_active` /
 /// `parked_streams_draining` map split — the entity stays in h2's
 /// `stream_data_out` (h2 owns the chunk-shipping pipeline, so we
@@ -588,4 +640,53 @@ test "WakeEntry default-init has empty kv_key + deinit is safe" {
     var entry: WakeEntry = .{};
     entry.deinit(a);
     try testing.expectEqual(@as(usize, 0), entry.kv_key.len);
+}
+
+test "SubscriptionFireDescriptor default-init + deinit is benign" {
+    const a = testing.allocator;
+    var items = [_]SubscriptionFireDescriptor{ .{}, .{} };
+    SubscriptionFireDescriptor.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].tenant_id.len);
+    try testing.expectEqual(@as(usize, 0), items[0].kv_key.len);
+}
+
+test "SubscriptionFireDescriptor.deinit frees kv-variant slices" {
+    const a = testing.allocator;
+    var items = [_]SubscriptionFireDescriptor{.{
+        .tenant_id = try a.dupe(u8, "acme"),
+        .subscription_name = try a.dupe(u8, "process-jobs"),
+        .module_path = try a.dupe(u8, "_subscriptions/process-jobs/index.mjs"),
+        .source_kind = .kv,
+        .kv_key = try a.dupe(u8, "jobs/42"),
+        .kv_op = 'p',
+    }};
+    SubscriptionFireDescriptor.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].tenant_id.len);
+    try testing.expectEqual(@as(usize, 0), items[0].kv_key.len);
+}
+
+test "SubscriptionFireDescriptor.deinit frees cron-variant (no kv_key)" {
+    const a = testing.allocator;
+    var items = [_]SubscriptionFireDescriptor{.{
+        .tenant_id = try a.dupe(u8, "acme"),
+        .subscription_name = try a.dupe(u8, "cleanup"),
+        .module_path = try a.dupe(u8, "_subscriptions/cleanup/index.mjs"),
+        .source_kind = .cron,
+        .cron_fired_at_ns = 1_700_000_000_000_000_000,
+    }};
+    SubscriptionFireDescriptor.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].tenant_id.len);
+}
+
+test "SubscriptionFireDescriptor.deinit frees boot-variant" {
+    const a = testing.allocator;
+    var items = [_]SubscriptionFireDescriptor{.{
+        .tenant_id = try a.dupe(u8, "acme"),
+        .subscription_name = try a.dupe(u8, "migrate-v3"),
+        .module_path = try a.dupe(u8, "_subscriptions/migrate-v3/index.mjs"),
+        .source_kind = .boot,
+        .boot_deployment_id = 12345,
+    }};
+    SubscriptionFireDescriptor.deinit(a, &items);
+    try testing.expectEqual(@as(usize, 0), items[0].tenant_id.len);
 }
