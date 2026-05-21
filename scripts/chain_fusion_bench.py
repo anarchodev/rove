@@ -76,7 +76,19 @@ def main() -> int:
         # (chainbench.{PUBLIC_SUFFIX}, resolves to loopback via
         # nss-myhostname). Default SSRF gate blocks loopback — same
         # flag the http.send / heldsync / webhook smokes pass.
-        worker_extra_args=["--dev-webhook-unsafe"],
+        worker_extra_args=[
+            "--dev-webhook-unsafe",
+            # The default rate-limit bucket (100 capacity / 50 refill per
+            # second) chokes the loopback chain — every chain hop is one
+            # http.send back to chainbench costing one request token, so
+            # 24×64=1536 hops would need 30+ seconds JUST for token refill.
+            # Any rejection bubbles to the schedule-server as a 429 / ok=false,
+            # which kills the chain. Lifting both knobs lets the bench measure
+            # the actual chain throughput instead of a token-bucket starvation
+            # cliff.
+            "--rate-limit-request-capacity", "100000",
+            "--rate-limit-request-refill", "100000",
+        ],
     )
     with cluster as c:
         discover_leader(c)
