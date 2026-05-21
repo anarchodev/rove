@@ -416,17 +416,39 @@ call site; the rest of the pipeline is identical.
   activations (seq order, byteOffset, ctx round-trip, headers on
   seq 0 only) + one `fetch_done` + byte-exact body reconstruction.
 
-### Phase E — `pipe_to` Pattern B
+### Phase E — `pipe_to` Pattern B — SHIPPED
 
-- `http.fetch` records the calling chain's entity id +
-  correlation_id on the fetch's bookkeeping when `pipe_to ==
-  "held_response"`.
-- Chunks arrive → worker-side append to `StreamChunks` on the
-  held entity (no per-chunk handler invocation).
-- `fetch_pipe_done` activation on upstream close.
-- Smoke: customer GET fires `http.fetch({url, pipe_to})` and
-  returns `__rove_stream`; the client receives upstream bytes
-  byte-for-byte.
+- `http.fetch({pipe_to:"held_response"})` stamps the issuing
+  chain's `correlation_id` onto the `PendingFetch`; the
+  `FetchPool` carries it + a `pipe_to_held` flag onto every
+  `UpstreamFetchEvent`. The pipe terminal uses `kind = .pipe_done`.
+- New `PipeState` component on the StreamRow: `awaiting_pipe`
+  (set by a `__rove_stream({waitFor:{fetch_pipe_done}})` return —
+  keeps `serviceParkedStreams` from closing the stream while the
+  upstream still feeds it), `bytes_piped`, `done` + terminal
+  fields.
+- `dispatchFetchEvents` routes `pipe_to_held` events:
+  `.chunk` → `pipeAppendChunk` finds the held stream by
+  `correlation_id` (scans the 5 h2 stream collections +
+  `raft_pending_stream`) and `StreamChunks.tryAppend`s the bytes
+  — **no handler activation, no tape** ([[project_pipe_to_untaped]]);
+  `.pipe_done` → `pipeMarkDone` stamps `PipeState`.
+- `serviceParkedStreams`: once a pipe stream's chunks have
+  shipped and `PipeState.done`, fires the single
+  `fetch_pipe_done` activation (`resumeStream`); `awaiting_pipe`
+  cleared first so it is one-shot.
+- `request.activation` for `fetch_pipe_done`: `{ kind, ok,
+  status, bytes_piped, dropped_chunks }`.
+- Smoke (`scripts/pipe_smoke.py`): customer GET →
+  `http.fetch({url, pipe_to})` + `__rove_stream` → the client
+  receives the upstream's 170 bytes byte-for-byte; `fetch_pipe_done`
+  fires once with `ok=true, status=200, bytes_piped=170,
+  dropped_chunks=0`.
+
+**The pipe path is structurally untaped:** piped bytes never
+enter a handler `runOutcome`, so there is no activation for the
+replay tape to record. The §6 per-chain tape cap is therefore an
+`on_chunk` (Pattern A) concern only.
 
 ### Phase F — caps + backpressure
 

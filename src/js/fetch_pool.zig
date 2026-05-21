@@ -242,6 +242,8 @@ pub const FetchPool = struct {
             errdefer a.free(ctx_dup);
             const chunk_mod_dup = try a.dupe(u8, pf.on_chunk_module);
             errdefer a.free(chunk_mod_dup);
+            const pipe_corr_dup = try a.dupe(u8, pf.pipe_correlation_id);
+            errdefer a.free(pipe_corr_dup);
             const bytes_dup = try a.dupe(u8, slice);
             errdefer a.free(bytes_dup);
             const headers_dup: ?[]u8 = if (seq == 0 and headers_blob.len > 0)
@@ -256,6 +258,8 @@ pub const FetchPool = struct {
                 .tenant_id = tid_dup,
                 .ctx_json = ctx_dup,
                 .on_chunk_module = chunk_mod_dup,
+                .pipe_to_held = pf.pipe_to_held,
+                .pipe_correlation_id = pipe_corr_dup,
                 .seq = seq,
                 .byte_offset = @intCast(offset),
                 .bytes = bytes_dup,
@@ -268,6 +272,7 @@ pub const FetchPool = struct {
                 a.free(tid_dup);
                 a.free(ctx_dup);
                 a.free(chunk_mod_dup);
+                a.free(pipe_corr_dup);
                 a.free(bytes_dup);
                 if (headers_dup) |h| a.free(h);
                 std.log.warn(
@@ -287,7 +292,9 @@ pub const FetchPool = struct {
         try self.pushTerminal(pf, resp.status, resp.status >= 200 and resp.status < 300);
     }
 
-    /// Push a `kind = .end` terminal event for `pf`'s chain.
+    /// Push the terminal event for `pf`'s chain — `kind = .pipe_done`
+    /// for a Pattern B (`pipe_to`) fetch, `kind = .end` for Pattern
+    /// A. The worker branches on `kind` to pick the terminal path.
     fn pushTerminal(
         self: *FetchPool,
         pf: *PendingFetch,
@@ -303,13 +310,17 @@ pub const FetchPool = struct {
         errdefer a.free(ctx_dup);
         const done_mod_dup = try a.dupe(u8, pf.on_done_module);
         errdefer a.free(done_mod_dup);
+        const pipe_corr_dup = try a.dupe(u8, pf.pipe_correlation_id);
+        errdefer a.free(pipe_corr_dup);
 
         const ev: UpstreamFetchEvent = .{
-            .kind = .end,
+            .kind = if (pf.pipe_to_held) .pipe_done else .end,
             .fetch_id = id_dup,
             .tenant_id = tid_dup,
             .ctx_json = ctx_dup,
             .on_done_module = done_mod_dup,
+            .pipe_to_held = pf.pipe_to_held,
+            .pipe_correlation_id = pipe_corr_dup,
             .terminal_status = status,
             .terminal_ok = ok,
         };
@@ -318,6 +329,7 @@ pub const FetchPool = struct {
             a.free(tid_dup);
             a.free(ctx_dup);
             a.free(done_mod_dup);
+            a.free(pipe_corr_dup);
             return err;
         };
     }

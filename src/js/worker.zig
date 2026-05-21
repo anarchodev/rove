@@ -2013,6 +2013,10 @@ pub fn Worker(comptime opts: Options) type {
         components_mod.StreamChunks,
         components_mod.StreamWakes,
         components_mod.StreamDraining,
+        // Gap 2.3 Phase E: pipe-target state. Inert on every
+        // non-pipe stream (default `.{}`); flipped by a
+        // `__rove_stream({waitFor:{fetch_pipe_done}})` return.
+        components_mod.PipeState,
     }).merge(opts.request_row);
 
     const H2Type = h2.H2(.{
@@ -5080,6 +5084,7 @@ pub fn setStreamComponents(
     initial_chunks: []const []const u8,
     kv_prefixes: []const []const u8,
     interval_ms: i64,
+    await_pipe_done: bool,
 ) !void {
     // Each block builds clones for one component then transfers
     // ownership via `reg.set`. The errdefer inside each block fires
@@ -5151,6 +5156,15 @@ pub fn setStreamComponents(
             .interval_ms = interval_ms,
             .next_wake_ns = next_wake_ns,
             .kv_prefixes = spine,
+        });
+    }
+
+    // Gap 2.3 Phase E: a `pipe_to` target stream — flag it so
+    // `serviceParkedStreams` keeps it open until the pipe closes.
+    // Inert (default `.{}`) for every non-pipe stream.
+    if (await_pipe_done) {
+        try server.reg.set(ent, current_coll, components_mod.PipeState, .{
+            .awaiting_pipe = true,
         });
     }
 }
@@ -5227,6 +5241,7 @@ pub fn serviceParkedStreams(worker: anytype) !void {
         const wakes_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamWakes) catch continue;
         const chain_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamChain) catch continue;
         const ctx_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.ChainContext) catch continue;
+        const pipe_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.PipeState) catch continue;
 
         // Drain one chunk per tick — h2 cycles the entity back to
         // `stream_data_out` after each DATA frame ships. Same for
@@ -5247,6 +5262,32 @@ pub fn serviceParkedStreams(worker: anytype) !void {
         // now (END_STREAM); component deinit cleans up on destroy.
         if (draining_comp.is_draining) {
             try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
+            continue;
+        }
+
+        // Gap 2.3 Phase E: a `pipe_to` target stream. Its bytes
+        // arrive from `dispatchFetchEvents` (`pipeAppendChunk`),
+        // not from a handler — so it has no timer / kv wakes and
+        // would otherwise hit the §3.3 "close after initial
+        // chunks" path below. Keep it open until the pipe closes.
+        if (pipe_comp.awaiting_pipe) {
+            if (pipe_comp.done) {
+                // Upstream closed AND every piped chunk has shipped
+                // (popOldest returned null above). Fire the single
+                // `fetch_pipe_done` activation. Clear `awaiting_pipe`
+                // FIRST so it's one-shot — a handler that returns
+                // non-terminal won't re-trigger it.
+                pipe_comp.awaiting_pipe = false;
+                resumeStream(worker, p.ent, p.sid, p.sess, .fetch_pipe_done) catch |err| {
+                    std.log.warn(
+                        "rove-js pipe-resume (fetch_pipe_done): tenant={s} corr={s}: {s}; closing",
+                        .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)", @errorName(err) },
+                    );
+                    server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in) catch {};
+                };
+            }
+            // Not done → idle this tick; the upstream pipe is still
+            // feeding `StreamChunks` from outside any handler run.
             continue;
         }
 
@@ -5432,6 +5473,11 @@ fn resumeStream(
     const chain_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChain) catch return error.ResumeNoChainState;
     const chunks_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChunks) catch return error.ResumeNoChunks;
     const wakes_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamWakes) catch return error.ResumeNoWakes;
+    // Gap 2.3 Phase E: pipe accounting (bytes_piped + terminal
+    // state). Default-init on every non-pipe stream — the fields
+    // it feeds into the Request are inert unless
+    // `activation == .fetch_pipe_done`.
+    const pipe_st = server.reg.get(ent, &server.stream_data_out, components_mod.PipeState) catch return error.ResumeNoPipeState;
 
     const path = chain_st.module_path;
     var dep = try resolveDeployment(worker, allocator, chain_ctx.tenant_id, path);
@@ -5511,6 +5557,13 @@ fn resumeStream(
         .activation_wakes = batch_owned,
         .activation_lost_oldest = batch_lost_oldest,
         .activation_write_pressure_dropped = dropped_chunks_snapshot,
+        // Gap 2.3 Phase E: pipe terminal payload. Meaningful only
+        // when `activation == .fetch_pipe_done`; `pipe_st` is
+        // default (0/false) on every non-pipe stream so these are
+        // inert otherwise.
+        .activation_fetch_terminal_ok = pipe_st.terminal_ok,
+        .activation_fetch_terminal_status = pipe_st.terminal_status,
+        .activation_fetch_bytes_piped = pipe_st.bytes_piped,
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
@@ -6581,12 +6634,128 @@ pub fn dispatchFetchEvents(worker: anytype) void {
             &worker.fetch_event_pending,
             components_mod.UpstreamFetchEvent,
         ) catch continue;
-        fireFetchEventActivation(worker, ev);
+        if (ev.pipe_to_held) {
+            // Pattern B: bytes bypass the handler — routed straight
+            // to the held client's StreamChunks. No activation, so
+            // nothing is taped ([[project_pipe_to_untaped]]).
+            routePipeEvent(worker, ev);
+        } else {
+            // Pattern A: each chunk / the terminal fires a handler
+            // activation (fetch_chunk / fetch_done).
+            fireFetchEventActivation(worker, ev);
+        }
         server.reg.destroy(ent) catch |err| std.log.warn(
             "rove-js fetch-event: destroy failed: {s}",
             .{@errorName(err)},
         );
     }
+}
+
+/// Gap 2.3 Phase E: route one Pattern B (`pipe_to`) fetch event.
+/// `.chunk` → append the bytes to the held client's `StreamChunks`
+/// (found by the issuing chain's correlation_id); `.pipe_done` →
+/// stamp the terminal state on the held stream's `PipeState` so
+/// `serviceParkedStreams` fires the one `fetch_pipe_done`
+/// activation. No handler activation, no tape, on the chunk path.
+fn routePipeEvent(worker: anytype, ev: *components_mod.UpstreamFetchEvent) void {
+    switch (ev.kind) {
+        .chunk => {
+            if (ev.bytes.len == 0) return;
+            // Ownership of the chunk bytes leaves the event — either
+            // `StreamChunks.tryAppend` takes them, or we free them
+            // on the no-stream path. Clear `ev.bytes` so the event's
+            // structural deinit doesn't double-free.
+            const chunk = ev.bytes;
+            const chunk_len = chunk.len;
+            ev.bytes = &.{};
+            if (!pipeAppendChunk(worker, ev.pipe_correlation_id, chunk)) {
+                worker.allocator.free(chunk);
+                std.log.warn(
+                    "rove-js pipe: no held stream for corr={s}; dropped {d}-byte chunk",
+                    .{ ev.pipe_correlation_id, chunk_len },
+                );
+            }
+        },
+        .pipe_done => {
+            if (!pipeMarkDone(worker, ev.pipe_correlation_id, ev.terminal_ok, ev.terminal_status)) {
+                std.log.warn(
+                    "rove-js pipe: no held stream for corr={s}; pipe terminal dropped",
+                    .{ev.pipe_correlation_id},
+                );
+            }
+        },
+        .end => std.log.warn(
+            "rove-js pipe: unexpected .end kind on a pipe_to event (corr={s})",
+            .{ev.pipe_correlation_id},
+        ),
+    }
+}
+
+/// Find the held-stream entity whose `ChainContext.correlation_id`
+/// is `corr_id` and append `chunk` (ownership transferred) to its
+/// `StreamChunks`. Scans every collection a held stream can sit
+/// in — the five h2 stream-pipeline collections plus the worker's
+/// `raft_pending_stream` (a write-batch stream awaiting commit).
+/// Accumulates the bytes actually queued (after the §9.4 cap) onto
+/// `PipeState.bytes_piped`. Returns true iff a stream was found
+/// (chunk consumed); false → caller frees `chunk`.
+fn pipeAppendChunk(worker: anytype, corr_id: []const u8, chunk: []u8) bool {
+    const server = worker.h2;
+    inline for (.{
+        &server.stream_response_in,
+        &server.stream_data_out,
+        &server.stream_data_in,
+        &server.stream_close_in,
+        &server._stream_data_sending,
+        &worker.raft_pending_stream,
+    }) |coll| {
+        const ents = coll.entitySlice();
+        const ctxs = coll.column(components_mod.ChainContext);
+        for (ents, ctxs) |ent, ctx| {
+            const cid = ctx.correlation_id orelse continue;
+            if (!std.mem.eql(u8, cid, corr_id)) continue;
+            const sc = server.reg.get(ent, coll, components_mod.StreamChunks) catch return false;
+            const ps = server.reg.get(ent, coll, components_mod.PipeState) catch return false;
+            const before = sc.queue_bytes;
+            // tryAppend takes ownership; on cap-overflow it frees
+            // `chunk` + bumps `dropped_chunks` (queue_bytes
+            // unchanged → bytes_piped contribution is 0). On OOM it
+            // also frees `chunk` and returns the error.
+            sc.tryAppend(worker.allocator, chunk) catch return true;
+            ps.bytes_piped += sc.queue_bytes - before;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Stamp `done` + the terminal state on the held stream's
+/// `PipeState`. `serviceParkedStreams` then fires the one
+/// `fetch_pipe_done` activation once the piped chunks have shipped.
+/// Returns true iff the held stream was found.
+fn pipeMarkDone(worker: anytype, corr_id: []const u8, ok: bool, status: u16) bool {
+    const server = worker.h2;
+    inline for (.{
+        &server.stream_response_in,
+        &server.stream_data_out,
+        &server.stream_data_in,
+        &server.stream_close_in,
+        &server._stream_data_sending,
+        &worker.raft_pending_stream,
+    }) |coll| {
+        const ents = coll.entitySlice();
+        const ctxs = coll.column(components_mod.ChainContext);
+        for (ents, ctxs) |ent, ctx| {
+            const cid = ctx.correlation_id orelse continue;
+            if (!std.mem.eql(u8, cid, corr_id)) continue;
+            const ps = server.reg.get(ent, coll, components_mod.PipeState) catch return false;
+            ps.done = true;
+            ps.terminal_ok = ok;
+            ps.terminal_status = status;
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Dispatch one upstream fetch event (chunk or terminal) as a

@@ -154,6 +154,11 @@ pub const PendingFetch = struct {
     /// True iff `pipe_to: "held_response"`. Pattern B; mutually
     /// exclusive with `on_chunk_module` (binding rejects both).
     pipe_to_held: bool,
+    /// Gap 2.3 Phase E: correlation_id of the chain that issued
+    /// this fetch. Set only when `pipe_to_held` — names the held
+    /// stream the upstream bytes pipe into (the entity whose
+    /// `ChainContext.correlation_id` matches). Empty otherwise.
+    pipe_correlation_id: []u8,
     headers_passthrough: bool,
     max_response_chunk_bytes: u32,
     max_total_response_bytes: u64,
@@ -168,6 +173,7 @@ pub const PendingFetch = struct {
         allocator.free(self.on_chunk_module);
         allocator.free(self.on_done_module);
         allocator.free(self.ctx_json);
+        allocator.free(self.pipe_correlation_id);
         self.* = undefined;
     }
 };
@@ -289,6 +295,13 @@ pub const DispatchState = struct {
     /// Instance id for limiter lookup. Empty when the dispatcher
     /// runs without a worker (test paths).
     instance_id: []const u8 = "",
+    /// Gap 2.3 Phase E: correlation_id of the chain this handler
+    /// run belongs to. `http.fetch({pipe_to})` stamps it onto the
+    /// `PendingFetch` so the upstream bytes can later be routed to
+    /// the held stream entity carrying the matching
+    /// `ChainContext.correlation_id`. Empty on test paths / when
+    /// the dispatch carries no correlation_id.
+    correlation_id: []const u8 = "",
     /// Trampoline backing `platform.instances.deployStarter(name)`.
     /// Worker provides a concrete fn that can cast `ctx` back to
     /// its specific `*Worker(opts)` type, deploys the embedded
@@ -1895,6 +1908,16 @@ pub fn installRequest(
             // bool JSValue constants instead.
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (request.activation_fetch_terminal_ok) js_true else js_false);
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_terminal_status)));
+            // `fetch_pipe_done` (Pattern B terminal) also carries
+            // the pipe's byte accounting: `bytes_piped` (total
+            // appended to the held client after §9.4 cap drops)
+            // and `dropped_chunks` (cap-overflow drops, reusing
+            // the write-pressure counter the resume already
+            // snapshotted).
+            if (request.activation_source == .fetch_pipe_done) {
+                _ = c.JS_SetPropertyStr(ctx, activation_obj, "bytes_piped", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_bytes_piped)));
+                _ = c.JS_SetPropertyStr(ctx, activation_obj, "dropped_chunks", c.JS_NewInt64(ctx, @intCast(request.activation_write_pressure_dropped)));
+            }
         }
     }
 
