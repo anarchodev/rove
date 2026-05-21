@@ -508,7 +508,7 @@ fn handleShow(
 }
 
 /// Decode one raw-deflate frame (the per-record framing the worker
-/// emits, see `flush_writer.compressRawDeflateAppend`). Uses libz
+/// emits, see `flush_writer.DeflateStream.appendFrame`). Uses libz
 /// directly — keeps both ends of the wire format on the same
 /// implementation (Zig stdlib's `flate.Compress` is incomplete in
 /// 0.15.x; see `feedback`/memory). The full decompressed JSON is
