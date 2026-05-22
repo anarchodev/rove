@@ -166,7 +166,17 @@ patterns become unambiguous.
 
 ---
 
-### 2.3 Streaming response bytes from `http.send`
+### 2.3 Streaming response bytes from `http.send` — **DONE 2026-05-21**
+
+**Shipped as a new primitive, not an `http.send` extension.** The
+durable / at-least-once semantics of `http.send` are wrong for
+streaming (a re-fire on crash = a duplicated LLM bill); the gap was
+reframed to **`http.fetch`** — a transient, best-effort outbound
+sibling. Pattern A (`on_chunk`) + Pattern B (`pipe_to`) + a
+`CURLOPT_WRITEFUNCTION` streaming transport all shipped. See
+`docs/upstream-streaming-plan.md` (all phases SHIPPED) and
+[[project_gap_2_3_http_fetch]]. Original motivation/options below
+kept for the record.
 
 **Motivation.** Today `http.send` delivers a single buffered
 response in the `send_callback` Msg (bounded by `max_body_bytes`).
@@ -340,8 +350,8 @@ Recommended order, smallest-design-debt first:
 |---|---|---|---|---|---|
 | 1 | 2.2 backpressure | S | medium | clean §9.4 story | **DONE 2026-05-20** |
 | 2 | 2.1 chain origins | M | high | crons, inboxes, reconcilers | **DONE 2026-05-20** — kv-react + boot + cron all shipped (see `docs/subscriptions-plan.md` §10) |
-| 3 | 2.3 streaming http.send response | L | high | LLM proxy, log tail | pending |
-| 4 | 2.4 streaming inbound body | L | medium | uploads, duplex | pending |
+| 3 | 2.3 streaming outbound (`http.fetch`) | L | high | LLM proxy, log tail | **DONE 2026-05-21** — reframed to `http.fetch`; see `docs/upstream-streaming-plan.md` |
+| 4 | 2.4 streaming inbound body | L | medium | uploads, duplex | pending — `docs/inbound-streaming-plan.md` |
 | 5 | 2.5 held outbound subscription | XL | high (federation) | atproto, WS-origin | pending |
 
 **Rationale for the order:**
