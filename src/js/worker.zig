@@ -356,16 +356,16 @@ pub const ChainTapeState = struct {
 };
 
 /// One pending subscription fire crossing a thread boundary. The
-/// `deployment_loader` thread (boot) and any future cron sweeper
-/// thread push these into the per-worker `SubscriptionFireInbox`;
-/// the worker translates them into `subscription_fire_pending`
-/// collection entities on its tick (Gap 2.1 Phase D wiring).
+/// `deployment_loader` thread (boot) and the cron sweeper push these
+/// into the per-worker `SubscriptionFireInbox`; the worker's
+/// `drainSubFireInbox` MOVES each onto an `effect.SubscriptionFire`
+/// payload and enqueues via `effect.enqueueMsg`
+/// (effect-reification Phase 2B/2C).
 ///
 /// All slices are allocator-owned; the inbox frees them on
 /// `drainInto` failure or `deinit`. On successful drain ownership
-/// transfers to the worker's `enqueueSubscriptionFire`, which
-/// dupes them onto the `SubscriptionFireDescriptor` component
-/// (modest double-dup, simpler ownership story).
+/// transfers to the `effect.SubscriptionFire` payload (no re-dup —
+/// the source slots zero out on transfer).
 pub const PendingFireMessage = struct {
     tenant_id: []u8,
     subscription_name: []u8,
@@ -2029,14 +2029,13 @@ pub fn Worker(comptime opts: Options) type {
     const StreamRow = H2Type.StreamRow;
     const StreamColl = rove.Collection(StreamRow, .{});
 
-    // Gap 2.1 Phase E (refactored): worker-only collection for
-    // pending subscription-fire chain origins. Entities carry one
-    // component (`SubscriptionFireDescriptor`) — no h2 stream
-    // identity needed because the chain has no held socket. Lives
-    // entirely within the worker; entities never move into or out
-    // of h2 collections.
-    const SubFireRow = rove.Row(&.{components_mod.SubscriptionFireDescriptor});
-    const SubFireColl = rove.Collection(SubFireRow, .{});
+    // Effect-reification Phase 2C: the `subscription_fire_pending`
+    // collection that lived here is gone. Every producer (cron + boot
+    // via `drainSubFireInbox`, kv-react via `fireKvReactSubscriptions`)
+    // now routes through `effect.enqueueMsg` onto `Worker.msg_queue`;
+    // `dispatchSubscriptionFires` drains the queue. The cross-thread
+    // `SubscriptionFireInbox` stays as the boundary for non-worker
+    // producers.
 
     // Worker-only collection for entity-less post-propose parked
     // units (`parkSendOps` / `parkKvWakes` / `proposeForgetfulWrites`).
@@ -2143,31 +2142,17 @@ pub fn Worker(comptime opts: Options) type {
         /// State-as-membership: presence in the collection IS the
         /// "awaiting raft commit" state.
         parked_units: ParkedUnitColl,
-        /// Gap 2.1 Phase E (refactored): per-worker rove collection
-        /// of pending subscription-fire chain origins. Producers
-        /// (the kv-react site in `firePendingKvWakes`, plus future
-        /// boot/cron sources) `reg.create` an entity here with a
-        /// populated `SubscriptionFireDescriptor`; the
-        /// `dispatchSubscriptionFires` system iterates a stable
-        /// snapshot per tick, calls `fireSubscriptionActivation` for
-        /// each, and `reg.destroy`s (deferred — re-entrant fires
-        /// land in the next tick's snapshot without invalidating
-        /// the current iteration). Replaces the Phase E v1 flat
-        /// ArrayList — see `docs/subscriptions-plan.md` §10.
-        ///
-        /// Effect-reification Phase 2B: only the in-thread kv-react
-        /// site still writes here; cron + boot drains route through
-        /// `msg_queue` instead. Phase 2C migrates kv-react and this
-        /// collection goes away.
-        subscription_fire_pending: SubFireColl,
         /// Effect-reification Phase 2 ingress
         /// (`docs/effect-algebra.md` §2.3; `effect-reification-plan.md`
         /// Phase 2). One bounded queue per worker; per-origin
         /// migration PRs route into it via `effect.enqueueMsg`. Phase
-        /// 2B drains the cross-thread `sub_fire_inbox` into this
-        /// queue (cron + boot); Phases 2C–2F migrate the rest. Once
-        /// all five origins are on it, `subscription_fire_pending` +
-        /// `fetch_event_pending` go away.
+        /// 2B routes the cross-thread `sub_fire_inbox` (cron + boot)
+        /// here; Phase 2C routes the in-thread kv-react match path
+        /// (`fireKvReactSubscriptions`) here too. With every
+        /// subscription origin on the queue, the legacy
+        /// `subscription_fire_pending` rove collection was retired
+        /// in 2C. Phases 2D–2F migrate the remaining origins
+        /// (fetch / send-callback / inbound-HTTP).
         msg_queue: effect_mod.MsgQueue = undefined,
         /// Gap 2.1 Phase D: cross-thread inbox of pending fires
         /// from non-worker producers (`deployment_loader` for
@@ -2354,7 +2339,6 @@ pub fn Worker(comptime opts: Options) type {
                 .raft_pending_cont = try StreamColl.init(allocator),
                 .raft_pending_stream = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
-                .subscription_fire_pending = try SubFireColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
                 .fetch_event_pending = try FetchEventColl.init(allocator),
                 .sub_fire_inbox = SubscriptionFireInbox.init(allocator),
@@ -2397,7 +2381,6 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.raft_pending_cont.deinit();
             errdefer self.raft_pending_stream.deinit();
             errdefer self.parked_continuations.deinit();
-            errdefer self.subscription_fire_pending.deinit();
             errdefer self.parked_units.deinit();
             errdefer self.fetch_event_pending.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
@@ -2407,7 +2390,6 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.raft_pending_cont);
             reg.registerCollection(&self.raft_pending_stream);
             reg.registerCollection(&self.parked_continuations);
-            reg.registerCollection(&self.subscription_fire_pending);
             reg.registerCollection(&self.parked_units);
             reg.registerCollection(&self.fetch_event_pending);
 
@@ -2568,7 +2550,6 @@ pub fn Worker(comptime opts: Options) type {
             // `SubscriptionFire`).
             self.msg_queue.deinit();
             self.parked_continuations.deinit();
-            self.subscription_fire_pending.deinit();
             self.parked_units.deinit();
             // Gap 2.3 Phase D: rove `Collection.deinit` fires each
             // entity's `UpstreamFetchEvent.deinit` structurally.
@@ -4052,8 +4033,10 @@ fn enqueueBootSubscriptions(slot: *TenantSlot, snap: *TenantFilesSnapshot) !void
         );
 
         // Push to the node-wide inbox; hash-routed to one of the
-        // local workers. The worker's tick translates the message
-        // into a `subscription_fire_pending` entity and fires it.
+        // local workers. The worker's `drainSubFireInbox` moves the
+        // message onto an `effect.SubscriptionFire` payload (via
+        // `effect.enqueueMsg`) and `dispatchSubscriptionFires` fires
+        // it on the next tick.
         node.enqueueSubscriptionFireForTenant(.{
             .tenant_id = slot.instance_id,
             .subscription_name = sub.name,
@@ -4421,12 +4404,12 @@ pub fn drainRaftPending(worker: anytype) !void {
         }
     }
 
-    // Gap 2.1 Phase E (refactored): dispatch any subscription
-    // fires that the kv-react site enqueued into the worker's
-    // `subscription_fire_pending` collection during the
-    // parked_units loop. The collection-as-state shape means
-    // re-entrant fires append via the deferred-create queue and
-    // process next tick — no iterate-while-modify trap.
+    // Gap 2.1 Phase E (refactored), effect-reification Phase 2C:
+    // dispatch any subscription fires the kv-react site enqueued
+    // onto `worker.msg_queue` during the parked_units loop.
+    // Re-entrant fires append to the queue's tail; the current
+    // tick's BATCH was already capped, so they process next tick
+    // — no iterate-while-modify trap.
     dispatchSubscriptionFires(worker);
 }
 
@@ -6388,18 +6371,17 @@ fn firePendingKvWakes(worker: anytype, unit: *ParkedUnit) void {
 
 /// Gap 2.1 Phase E (refactored): for each kv-write event in `unit`,
 /// scan the tenant's subscription registry for `.kv` subscriptions
-/// whose `prefix` matches; `reg.create` an entity in the local
-/// worker's `subscription_fire_pending` collection with a populated
-/// `SubscriptionFireDescriptor`. The `dispatchSubscriptionFires`
-/// system iterates + fires + destroys on each worker tick.
-/// Direct firing here would invalidate the v1
-/// `drainRaftPending` loop's `&worker.pending_units.items[u]`
-/// pointer because the recursive dispatch's
-/// `parkSendOps`/`parkKvWakes` grew the slice — that's why
-/// `pending_units` was lifted to the `parked_units` rove
-/// collection. Collection membership IS the queue (principle #1)
-/// and dispatch happens outside the iterate-then-mutate window
-/// via `reg.destroy`'s deferred semantics.
+/// whose `prefix` matches; enqueue an `effect.SubscriptionFire` Msg
+/// onto the worker's `msg_queue`. `dispatchSubscriptionFires` drains
+/// each tick.
+///
+/// Effect-reification Phase 2C: routed onto `enqueueMsg`. Prior to
+/// 2C this site `reg.create`'d entities in
+/// `subscription_fire_pending`; the collection is now retired (cron +
+/// boot moved in 2B, kv-react here). Same deferred-dispatch property
+/// holds — re-entrant enqueueMsg calls during a fire append to the
+/// queue's tail; the current tick's batch was already dequeued so
+/// the new entries process next tick.
 ///
 /// Leader-only by caller convention (`firePendingKvWakes` only
 /// runs on the worker that committed the write).
@@ -6410,7 +6392,6 @@ fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
     if (snap.subscriptions.len == 0) return;
 
     const allocator = worker.allocator;
-    const server = worker.h2;
     for (snap.subscriptions) |sub| {
         const prefix = switch (sub.spec) {
             .kv => |k| k.prefix,
@@ -6422,18 +6403,42 @@ fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
                 "rove-js kv-react queue: tenant={s} subscription={s} key={s} op={c}",
                 .{ unit.tenant_id, sub.name, w.key, w.op },
             );
-            try enqueueSubscriptionFire(server.reg, &worker.subscription_fire_pending, allocator, .{
-                .tenant_id = unit.tenant_id,
-                .subscription_name = sub.name,
-                .module_path = sub.module_path,
-                .source = .{ .kv = .{ .key = w.key, .op = w.op } },
-            });
+            // Dup onto the payload; payload owns + frees these
+            // strings via `SubscriptionFire.deinit` after the fire
+            // completes (or on MsgQueue drop-on-shutdown).
+            const tid = try allocator.dupe(u8, unit.tenant_id);
+            errdefer allocator.free(tid);
+            const name = try allocator.dupe(u8, sub.name);
+            errdefer allocator.free(name);
+            const path = try allocator.dupe(u8, sub.module_path);
+            errdefer allocator.free(path);
+            const key_dup = try allocator.dupe(u8, w.key);
+            errdefer allocator.free(key_dup);
+
+            var payload: effect_mod.msg.SubscriptionFire = .{
+                .tenant_id = tid,
+                .subscription_name = name,
+                .module_path = path,
+                .source = .{ .kv = .{ .key = key_dup, .op = w.op } },
+            };
+            effect_mod.enqueueMsg(&worker.msg_queue, .{ .subscription_fire = payload }) catch |err| {
+                payload.deinit(allocator);
+                std.log.warn(
+                    "rove-js kv-react enqueueMsg (tenant={s}, sub={s}): {s}",
+                    .{ unit.tenant_id, sub.name, @errorName(err) },
+                );
+                return err;
+            };
         }
     }
 }
 
-/// Parameters for `enqueueSubscriptionFire`. Borrowed slices —
-/// the function dups all owned-on-component fields.
+/// Cross-thread enqueue parameters used by
+/// `NodeState.enqueueSubscriptionFireForTenant` (cron sweeper, boot
+/// loader). Borrowed slices — the cross-thread enqueue dups onto a
+/// `PendingFireMessage` on the inbox; `drainSubFireInbox` then moves
+/// those owned slices onto an `effect.SubscriptionFire` payload
+/// (Phase 2B/2C: no per-tick dup on the worker side).
 pub const SubscriptionFireQueueInput = struct {
     tenant_id: []const u8,
     subscription_name: []const u8,
@@ -6441,62 +6446,25 @@ pub const SubscriptionFireQueueInput = struct {
     source: SubscriptionFireSource,
 };
 
-/// Create an entity in `subscription_fire_pending` with the input
-/// fields duped onto its `SubscriptionFireDescriptor` component.
-/// Component-side allocator-owned strings free structurally on
-/// destroy via rove's collection-deinit (no manual cleanup).
-pub fn enqueueSubscriptionFire(
-    reg: *rove.Registry,
-    pending: anytype,
-    allocator: std.mem.Allocator,
-    in: SubscriptionFireQueueInput,
-) !void {
-    const tid = try allocator.dupe(u8, in.tenant_id);
-    errdefer allocator.free(tid);
-    const name = try allocator.dupe(u8, in.subscription_name);
-    errdefer allocator.free(name);
-    const path = try allocator.dupe(u8, in.module_path);
-    errdefer allocator.free(path);
-
-    var desc: components_mod.SubscriptionFireDescriptor = .{
-        .tenant_id = tid,
-        .subscription_name = name,
-        .module_path = path,
-    };
-    switch (in.source) {
-        .cron => |c| {
-            desc.source_kind = .cron;
-            desc.cron_fired_at_ns = c.fired_at_ns;
-        },
-        .kv => |k| {
-            desc.source_kind = .kv;
-            desc.kv_key = try allocator.dupe(u8, k.key);
-            desc.kv_op = k.op;
-        },
-        .boot => |b| {
-            desc.source_kind = .boot;
-            desc.boot_deployment_id = b.deployment_id;
-        },
-    }
-    errdefer if (desc.kv_key.len > 0) allocator.free(desc.kv_key);
-
-    const ent = try reg.create(pending);
-    try reg.set(ent, pending, components_mod.SubscriptionFireDescriptor, desc);
-}
+// `enqueueSubscriptionFire` (the prior collection-creation helper) was
+// retired in effect-reification Phase 2C. Every subscription origin
+// now routes through `effect.enqueueMsg`:
+// - cron / boot: cross-thread inbox → `drainSubFireInbox` →
+//   `enqueueMsg` (move-semantics)
+// - kv-react: `fireKvReactSubscriptions` → `enqueueMsg` (dup-on-payload)
 
 /// Gap 2.1 Phase D: drain the worker's cross-thread
-/// `sub_fire_inbox`, translating each `PendingFireMessage` into
-/// an entity in `subscription_fire_pending`. Called once per
-/// worker tick (from `serviceSubscriptionFires`); cheap when the
-/// inbox is empty (one mutex try + length check).
+/// `sub_fire_inbox`, **moving** each `PendingFireMessage`'s owned
+/// slices onto an `effect.SubscriptionFire` payload and enqueueing
+/// via `effect.enqueueMsg`. Called once per worker tick (from
+/// `serviceSubscriptionFires`); cheap when the inbox is empty (one
+/// mutex try + length check).
 ///
 /// Ownership: messages popped from the inbox carry owned slices.
-/// `enqueueSubscriptionFire` dupes onto the component, so the
-/// caller frees each message via `PendingFireMessage.deinit`
-/// after translation. Double-dup is the cost of decoupling
-/// cross-thread storage from collection-side storage; the dup is
-/// O(few hundred bytes) per fire and irrelevant in the boot/cron
-/// fire-rate regime.
+/// Phase 2B moves them onto the new payload (no re-dup); zero'd
+/// source slots make the post-loop `PendingFireMessage.deinit` a
+/// no-op for transferred fields (allocator.free on an empty slice
+/// short-circuits per stdlib).
 fn drainSubFireInbox(worker: anytype) void {
     const allocator = worker.allocator;
     var local: std.ArrayListUnmanaged(PendingFireMessage) = .empty;
@@ -6566,33 +6534,34 @@ pub fn serviceSubscriptionFires(worker: anytype) void {
     dispatchSubscriptionFires(worker);
 }
 
-/// Worker-tick system: dispatch every pending subscription fire from
-/// both the MsgQueue ingress (cron + boot post Phase 2B) and the
-/// `subscription_fire_pending` collection (kv-react still — Phase 2C
-/// migrates it). Per-tick cap (`BATCH`) bounds tail latency on the
-/// request hot path: a misbehaving handler with many fires pending
-/// eats at most `BATCH` activations per tick across BOTH paths.
-///
-/// Collection path: iterates a stable entity-id snapshot copied into
-/// a local buffer so re-entrant `enqueueSubscriptionFire` calls
-/// during a fire land in the deferred-create queue and process next
-/// tick. `reg.destroy` is deferred too — component strings free
-/// structurally on `reg.flush`.
-///
-/// MsgQueue path: dequeue each `SubscriptionFire` variant, fire,
-/// then `deinit` its owned strings.
+/// Worker-tick system: dequeue each `effect.SubscriptionFire` Msg
+/// from `worker.msg_queue` (up to `BATCH` per tick), fire it via
+/// `fireSubscriptionActivation`, then `deinit` its owned strings.
+/// Per-tick cap bounds tail latency on the request hot path: a
+/// misbehaving handler with many fires pending eats at most `BATCH`
+/// activations per tick before yielding back to the h2 loop;
+/// remaining fires drain on subsequent ticks.
 pub fn dispatchSubscriptionFires(worker: anytype) void {
     const BATCH: usize = 64;
     var fired: usize = 0;
 
-    // ── MsgQueue path (cron + boot drained from sub_fire_inbox via
-    //    drainSubFireInbox into `worker.msg_queue` as Phase 2B). ──
+    // Drain `effect.SubscriptionFire` variants from `msg_queue`. All
+    // three subscription origins (cron + boot via `drainSubFireInbox`;
+    // kv-react via `fireKvReactSubscriptions`) feed this single queue
+    // post Phase 2C. The boot-fire `_boot_fired/<dep_id>` marker is
+    // injected into the handler's writeset INSIDE
+    // `fireSubscriptionActivation` (Gap 2.1 Phase D) so it commits
+    // atomically with the handler's effects — no separate post-fire
+    // write needed.
+    //
+    // Re-entrant `enqueueMsg` calls during a fire append to the
+    // queue's tail; the current tick's batch was already capped at
+    // `BATCH` so new entries process next tick (deferred dispatch,
+    // matching the pre-2C collection's `reg.destroy` deferral).
+    //
+    // Phases 2D-2F (fetch / send-callback / inbound-HTTP) add more
+    // variants to this same queue with their own dispatch arms.
     while (fired < BATCH) {
-        // Peek by index to avoid mid-pop deinit if we hit a
-        // non-SubscriptionFire variant we don't dispatch yet.
-        // Phase 2B-only invariant: msg_queue only ever carries
-        // SubscriptionFire (drainSubFireInbox is the lone enqueuer).
-        // Future phases (2C-2F) add per-variant dispatch arms here.
         const msg = worker.msg_queue.dequeue() orelse break;
         switch (msg) {
             .subscription_fire => |sf_const| {
@@ -6622,45 +6591,6 @@ pub fn dispatchSubscriptionFires(worker: anytype) void {
                 );
             },
         }
-    }
-
-    // ── Collection path (kv-react — Phase 2C migrates it). ──
-    const remaining = if (fired >= BATCH) 0 else BATCH - fired;
-    if (remaining == 0) return;
-    const server = worker.h2;
-    var buf: [BATCH]rove.Entity = undefined;
-    const slice = worker.subscription_fire_pending.entitySlice();
-    const n = @min(slice.len, remaining);
-    if (n == 0) return;
-    std.mem.copyForwards(rove.Entity, buf[0..n], slice[0..n]);
-
-    for (buf[0..n]) |ent| {
-        const desc = server.reg.get(
-            ent,
-            &worker.subscription_fire_pending,
-            components_mod.SubscriptionFireDescriptor,
-        ) catch continue;
-        const source: SubscriptionFireSource = switch (desc.source_kind) {
-            .cron => .{ .cron = .{ .fired_at_ns = desc.cron_fired_at_ns } },
-            .kv => .{ .kv = .{ .key = desc.kv_key, .op = desc.kv_op } },
-            .boot => .{ .boot = .{ .deployment_id = desc.boot_deployment_id } },
-        };
-        fireSubscriptionActivation(
-            worker,
-            desc.tenant_id,
-            desc.subscription_name,
-            desc.module_path,
-            source,
-        );
-        // For boot fires, the `_boot_fired/<dep_id>` marker is
-        // injected into the handler's writeset INSIDE
-        // `fireSubscriptionActivation` (Gap 2.1 Phase D) so it
-        // commits atomically with the handler's effects — no
-        // separate post-fire write needed.
-        server.reg.destroy(ent) catch |err| std.log.warn(
-            "rove-js subscription-fire: destroy failed: {s}",
-            .{@errorName(err)},
-        );
     }
 }
 
