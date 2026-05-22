@@ -14,18 +14,23 @@
 //! Workers (any thread) accumulate `PendingFetch`es in a per-request
 //! list, then flush to `NodeState.fetch_pending` at handler success.
 //! `FetchPool` threads (N = `FETCH_POOL_SIZE`) wait on a condition
-//! variable, drain entries, fire libcurl synchronously, split the
-//! response body into `max_response_chunk_bytes` units, and push one
+//! variable, drain entries, and fire libcurl. Each upstream response
+//! is re-chunked into `max_response_chunk_bytes` units, pushed one
 //! `UpstreamFetchEvent` per chunk + one terminal event to the per-
 //! worker `FetchChunkInbox` via hash-routed
 //! `enqueueFetchEventForTenant`.
 //!
-//! v1 uses libcurl's buffered `Easy.request` — body is captured in
-//! memory, then re-chunked. For SSE / LLM-streaming use cases this
-//! breaks at upstream-timeout. Real streaming via
-//! `CURLOPT_WRITEFUNCTION` lands as an incremental follow-up that
-//! swaps the call site here; the rest of the pipeline (events,
-//! inboxes, dispatch) is identical.
+//! ## Streaming transport
+//!
+//! The libcurl call is `Easy.requestStreaming` — a
+//! `CURLOPT_WRITEFUNCTION`-driven transfer that delivers the
+//! response body incrementally as it arrives. `onBody` re-chunks
+//! each writeback and routes a chunk event AS THE BYTES ARRIVE, so
+//! an SSE / LLM-token upstream drives the customer's `on_chunk` /
+//! pipe in real time instead of stalling until the connection
+//! closes (or `timeout_ms` fires). Small responses still produce
+//! the same chunk sequence — they just arrive in fewer writebacks;
+//! the re-chunker normalizes regardless of writeback boundaries.
 
 const std = @import("std");
 const blob_curl = @import("rove-blob").curl;
@@ -152,10 +157,15 @@ pub const FetchPool = struct {
         }
     }
 
-    /// Execute one buffered fetch + push events. Errors here are
-    /// the pool's own (alloc, transport setup); the upstream's
-    /// own !2xx status surfaces as a successful `end` event with
-    /// `terminal_ok = false`.
+    /// Execute one fetch, streaming the upstream response. libcurl
+    /// delivers the body incrementally via `requestStreaming`'s
+    /// sink; `onBody` re-chunks each writeback into
+    /// `max_response_chunk_bytes` units + routes a chunk event per
+    /// unit AS THE BYTES ARRIVE — so an SSE / LLM-token upstream
+    /// drives the customer's `on_chunk` / pipe in real time instead
+    /// of waiting for the connection to close. Errors returned here
+    /// are the pool's own (alloc, transport setup); an upstream
+    /// `!2xx` status surfaces as a terminal with `terminal_ok=false`.
     fn runOne(self: *FetchPool, pf: *PendingFetch) !void {
         const a = self.allocator;
         const pool = self.easy_pool orelse return error.NoEasyPool;
@@ -191,105 +201,37 @@ pub const FetchPool = struct {
             .verify_tls = !sched_thread.test_allow_plaintext,
         };
 
-        var resp = easy.request(a, req) catch |err| {
-            // Transport-level failure: push a single `end` event
-            // with `terminal_ok = false`. The handler's `on_done`
-            // sees the failure shape and can react.
+        var state: StreamState = .{
+            .pool = self,
+            .pf = pf,
+            .allocator = a,
+            // buildFetchRow guarantees ≥ 1; @max is belt-and-braces.
+            .max_chunk = @max(@as(usize, pf.max_response_chunk_bytes), 1),
+            .max_total = pf.max_total_response_bytes,
+        };
+        defer state.deinit();
+
+        const result = easy.requestStreaming(a, req, .{
+            .ctx = @ptrCast(&state),
+            .on_body = onBody,
+            .on_header = onHeader,
+        }) catch |err| {
+            // Pre-perform setup failure (OOM building the request).
+            // No chunks emitted; fire a failure terminal.
             try self.pushTerminal(pf, 0, false);
             return err;
         };
-        defer resp.deinit(a);
 
-        // Re-chunk the body into `max_response_chunk_bytes` pieces.
-        // For the v1 buffered path, this happens after the full
-        // response is in memory — latency-wise equivalent to a
-        // single chunk for the customer. Streaming via writefn
-        // landing as an incremental upgrade keeps the per-chunk
-        // shape identical so customer handlers don't break.
-        const body = resp.body orelse &[_]u8{};
-        const cap = if (pf.max_response_chunk_bytes == 0)
-            @as(usize, std.math.maxInt(usize))
-        else
-            @as(usize, pf.max_response_chunk_bytes);
+        // No flush step — `onBody` emits every writeback as it
+        // arrives, so nothing is left buffered when perform returns.
 
-        // Cap total response bytes (caller-supplied caps protect
-        // against runaway upstream sizes). Truncate silently if
-        // exceeded — the terminal event still fires with the
-        // upstream status.
-        const total = if (pf.max_total_response_bytes != 0 and
-            body.len > pf.max_total_response_bytes)
-            @as(usize, @intCast(pf.max_total_response_bytes))
-        else
-            body.len;
-
-        // Serialize response headers for seq=0's `fetch_headers`
-        // field. Wire format mirrors libcurl's input shape:
-        // `Name: value\r\n` lines, one per header.
-        const headers_blob = try serializeHeaders(a, resp.headers);
-        defer a.free(headers_blob);
-
-        var offset: usize = 0;
-        var seq: u32 = 0;
-        while (offset < total) {
-            const next = @min(offset + cap, total);
-            const slice = body[offset..next];
-
-            const id_dup = try a.dupe(u8, pf.id);
-            errdefer a.free(id_dup);
-            const tid_dup = try a.dupe(u8, pf.tenant_id);
-            errdefer a.free(tid_dup);
-            const ctx_dup = try a.dupe(u8, pf.ctx_json);
-            errdefer a.free(ctx_dup);
-            const chunk_mod_dup = try a.dupe(u8, pf.on_chunk_module);
-            errdefer a.free(chunk_mod_dup);
-            const pipe_corr_dup = try a.dupe(u8, pf.pipe_correlation_id);
-            errdefer a.free(pipe_corr_dup);
-            const bytes_dup = try a.dupe(u8, slice);
-            errdefer a.free(bytes_dup);
-            const headers_dup: ?[]u8 = if (seq == 0 and headers_blob.len > 0)
-                try a.dupe(u8, headers_blob)
-            else
-                null;
-            errdefer if (headers_dup) |h| a.free(h);
-
-            const ev: UpstreamFetchEvent = .{
-                .kind = .chunk,
-                .fetch_id = id_dup,
-                .tenant_id = tid_dup,
-                .ctx_json = ctx_dup,
-                .on_chunk_module = chunk_mod_dup,
-                .pipe_to_held = pf.pipe_to_held,
-                .pipe_correlation_id = pipe_corr_dup,
-                .seq = seq,
-                .byte_offset = @intCast(offset),
-                .bytes = bytes_dup,
-                .fetch_headers = headers_dup,
-            };
-            self.routeEvent(pf.tenant_id, ev) catch |err| {
-                // Ownership of `ev`'s slices stays with us on err.
-                // Free them inline; loop continues to terminal.
-                a.free(id_dup);
-                a.free(tid_dup);
-                a.free(ctx_dup);
-                a.free(chunk_mod_dup);
-                a.free(pipe_corr_dup);
-                a.free(bytes_dup);
-                if (headers_dup) |h| a.free(h);
-                std.log.warn(
-                    "rove-js fetch_pool: route chunk seq={d}: {s}",
-                    .{ seq, @errorName(err) },
-                );
-                return;
-            };
-
-            offset = next;
-            seq += 1;
-        }
-
-        // Terminal event. Reports upstream's actual status; ok =
-        // 2xx-class (lets the handler short-circuit on success/
-        // failure without re-parsing).
-        try self.pushTerminal(pf, resp.status, resp.status >= 200 and resp.status < 300);
+        // Terminal `ok`: the transfer must have completed cleanly
+        // (or stopped exactly at the size cap — a deliberate
+        // truncation, NOT a failure), we hit no internal alloc /
+        // route error, and the upstream returned 2xx.
+        const ok = result.perform_ok and !state.failed and
+            result.status >= 200 and result.status < 300;
+        try self.pushTerminal(pf, result.status, ok);
     }
 
     /// Push the terminal event for `pf`'s chain — `kind = .pipe_done`
@@ -389,27 +331,153 @@ fn parseHeadersJson(
 /// Serialize response headers to `Name: value\r\n` wire format.
 /// Returns an allocator-owned slice; empty (length 0) if no
 /// headers.
-fn serializeHeaders(
-    a: std.mem.Allocator,
-    headers: []const blob_curl.Header,
-) ![]u8 {
-    if (headers.len == 0) return try a.alloc(u8, 0);
-    var total: usize = 0;
-    for (headers) |h| total += h.name.len + 2 + h.value.len + 2;
-    var buf = try a.alloc(u8, total);
-    errdefer a.free(buf);
-    var i: usize = 0;
-    for (headers) |h| {
-        @memcpy(buf[i..][0..h.name.len], h.name);
-        i += h.name.len;
-        buf[i] = ':';
-        buf[i + 1] = ' ';
-        i += 2;
-        @memcpy(buf[i..][0..h.value.len], h.value);
-        i += h.value.len;
-        buf[i] = '\r';
-        buf[i + 1] = '\n';
-        i += 2;
+// ── Streaming sink: re-chunking + per-chunk event emission ─────────
+
+/// Per-fetch state threaded through `requestStreaming`'s sink
+/// callbacks. Lives on `runOne`'s stack — `requestStreaming` is
+/// synchronous, so `onBody` / `onHeader` (which run inside it) see
+/// a live pointer for the whole transfer.
+const StreamState = struct {
+    pool: *FetchPool,
+    pf: *const PendingFetch,
+    allocator: std.mem.Allocator,
+    /// Per-chunk size *ceiling*. NOT a batching target — each
+    /// libcurl writeback is emitted the moment it arrives (a slow
+    /// SSE drip ships each frame immediately, no buffering); a
+    /// writeback larger than `max_chunk` is split into ≤ `max_chunk`
+    /// pieces so one chunk never blows the handler / tape budget.
+    max_chunk: usize,
+    /// Caller's overall response-size cap (`buildFetchRow`
+    /// guarantees ≥ 1). Once `total` reaches it the transfer aborts.
+    max_total: u64,
+    /// Accumulated raw response-header lines (libcurl delivers them
+    /// pre-formatted as `Name: value\r\n`). Shipped on seq 0's
+    /// `fetch_headers`.
+    headers: std.ArrayListUnmanaged(u8) = .empty,
+    seq: u32 = 0,
+    /// Cumulative bytes emitted in prior chunks — the next chunk's
+    /// `byte_offset`.
+    byte_offset: u64 = 0,
+    /// Cumulative bytes accepted from libcurl (for the max_total cap).
+    total: u64 = 0,
+    /// Our own failure (alloc / route) — aborts the transfer and
+    /// makes the terminal `ok = false`.
+    failed: bool = false,
+    /// Hit `max_total` — aborts the transfer, but the terminal
+    /// still reports the upstream status (a deliberate truncation,
+    /// not a failure).
+    capped: bool = false,
+
+    fn deinit(self: *StreamState) void {
+        self.headers.deinit(self.allocator);
     }
-    return buf;
+
+    /// Build + route one chunk event for `bytes` (borrowed —
+    /// dup'd into the event). Headers ride seq 0 only. Returns
+    /// false on alloc / route failure (caller sets `failed`).
+    fn emitChunk(self: *StreamState, bytes: []const u8) bool {
+        const a = self.allocator;
+        const headers_blob: ?[]const u8 = if (self.seq == 0 and self.headers.items.len > 0)
+            self.headers.items
+        else
+            null;
+        const ev = buildChunkEvent(
+            a,
+            self.pf,
+            self.seq,
+            self.byte_offset,
+            bytes,
+            headers_blob,
+        ) catch return false;
+        self.pool.routeEvent(self.pf.tenant_id, ev) catch |err| {
+            // routeEvent didn't take ownership — free the event's
+            // slices via the component deinit + drop.
+            var e = ev;
+            UpstreamFetchEvent.deinit(a, (&e)[0..1]);
+            std.log.warn(
+                "rove-js fetch_pool: route chunk seq={d}: {s}",
+                .{ self.seq, @errorName(err) },
+            );
+            return false;
+        };
+        self.seq += 1;
+        self.byte_offset += bytes.len;
+        return true;
+    }
+};
+
+/// Build a fully-owned `.chunk` `UpstreamFetchEvent`. On any dup
+/// failure the `errdefer` deinits the partially-built event —
+/// each component field is independently freed (empty fields
+/// no-op), so there is no leak and no double-free.
+fn buildChunkEvent(
+    a: std.mem.Allocator,
+    pf: *const PendingFetch,
+    seq: u32,
+    byte_offset: u64,
+    bytes: []const u8,
+    headers_blob: ?[]const u8,
+) !UpstreamFetchEvent {
+    var ev: UpstreamFetchEvent = .{
+        .kind = .chunk,
+        .seq = seq,
+        .byte_offset = byte_offset,
+        .pipe_to_held = pf.pipe_to_held,
+    };
+    errdefer UpstreamFetchEvent.deinit(a, (&ev)[0..1]);
+    ev.fetch_id = try a.dupe(u8, pf.id);
+    ev.tenant_id = try a.dupe(u8, pf.tenant_id);
+    ev.ctx_json = try a.dupe(u8, pf.ctx_json);
+    ev.on_chunk_module = try a.dupe(u8, pf.on_chunk_module);
+    ev.pipe_correlation_id = try a.dupe(u8, pf.pipe_correlation_id);
+    ev.bytes = try a.dupe(u8, bytes);
+    if (headers_blob) |hb| {
+        if (hb.len > 0) ev.fetch_headers = try a.dupe(u8, hb);
+    }
+    return ev;
+}
+
+/// `requestStreaming` body sink — emit each writeback immediately
+/// (split if it exceeds `max_chunk`). Runs on the fetch-pool thread
+/// inside `curl_easy_perform`. No buffering: a writeback that
+/// arrives IS a chunk (or a few, if oversized) the moment it lands.
+fn onBody(chunk: []const u8, ctx: *anyopaque) bool {
+    const s: *StreamState = @ptrCast(@alignCast(ctx));
+    if (s.failed or s.capped) return false;
+    if (chunk.len == 0) return true;
+
+    // Enforce the overall response-size cap. `max_total` is always
+    // ≥ 1 and `total` strictly < `max_total` here (we return early
+    // once `capped`), so `remaining` ≥ 1.
+    var take = chunk;
+    const remaining: usize = @intCast(s.max_total - s.total);
+    if (chunk.len >= remaining) {
+        take = chunk[0..remaining];
+        s.capped = true;
+    }
+    s.total += take.len;
+
+    // Emit `take` now, split into ≤ `max_chunk` pieces.
+    var off: usize = 0;
+    while (off < take.len) {
+        const end = @min(off + s.max_chunk, take.len);
+        if (!s.emitChunk(take[off..end])) {
+            s.failed = true;
+            return false;
+        }
+        off = end;
+    }
+    // A capping writeback was the last one we accept.
+    return !s.capped;
+}
+
+/// `requestStreaming` header sink — accumulate the raw header
+/// block (`Name: value\r\n` lines, plus the status line + blank
+/// terminator; the JS-side parser skips colon-less lines).
+fn onHeader(line: []const u8, ctx: *anyopaque) void {
+    const s: *StreamState = @ptrCast(@alignCast(ctx));
+    if (s.failed) return;
+    s.headers.appendSlice(s.allocator, line) catch {
+        s.failed = true;
+    };
 }

@@ -385,15 +385,21 @@ carrier → per-`DispatchState` accumulator → flushed to
 C2 (`3e71cde`) — consumer: `NodeState.fetch_pool` — 8 dedicated
 threads (separate `EasyPool` from `SendDispatch`, separate
 saturation domain). Each drains `fetch_pending`, fires libcurl,
-re-chunks the response into `max_response_chunk_bytes` units,
+re-chunks the response into `≤ max_response_chunk_bytes` units,
 hash-routes one `UpstreamFetchEvent` per chunk + a terminal to a
 per-worker `fetch_chunk_inbox` (mirrors `SubscriptionFireInbox`).
 
-**v1 caveat:** the libcurl call is `Easy.request` (buffered) — the
-full upstream body lands in memory before re-chunking, so SSE /
-long-lived streams time out at libcurl's per-call deadline. The
-`CURLOPT_WRITEFUNCTION` streaming upgrade swaps only that one
-call site; the rest of the pipeline is identical.
+**Streaming transport (shipped after E):** the libcurl call is
+`Easy.requestStreaming` — a `CURLOPT_WRITEFUNCTION`-driven
+transfer that hands each writeback to `fetch_pool.onBody` as it
+arrives. `onBody` emits a chunk event per writeback immediately
+(splitting only a writeback larger than `max_response_chunk_bytes`)
+— so an SSE / LLM-token upstream drives `on_chunk` / the pipe in
+real time. `max_response_chunk_bytes` is a per-chunk size *ceiling*,
+not a batching threshold — small frames are never buffered waiting
+for it. Verified by `scripts/fetch_streaming_smoke.py`: an
+infinite-drip upstream + a 2 s `timeout_ms` delivers ~17 chunks
+before the timeout (a buffered transport would deliver 0).
 
 ### Phase D — `fetch_chunk` / `fetch_done` activations (Pattern A) — SHIPPED
 

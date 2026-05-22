@@ -322,6 +322,127 @@ pub const Easy = struct {
             .headers = try hdr_list.toOwnedSlice(allocator),
         };
     }
+
+    /// Issue one GET/POST/etc. synchronously, delivering the
+    /// response body to `sink.on_body` incrementally as libcurl
+    /// receives it — instead of buffering the whole body like
+    /// `request`. For SSE / long-lived upstreams where `request`
+    /// would block until the connection closes (or the timeout
+    /// fires), this hands the caller each writeback as it arrives.
+    ///
+    /// `sink.on_header` receives every response-header line raw
+    /// (`Name: value\r\n`, plus the status line + blank
+    /// terminator); `sink.on_body` receives each body writeback
+    /// (arbitrary sizes — the caller re-chunks). `on_body`
+    /// returning false aborts the transfer (libcurl reports
+    /// `CURLE_WRITE_ERROR`, which `perform_ok` treats as a clean
+    /// stop, not a failure — the caller decides via its own ctx
+    /// whether the abort was intentional, e.g. a size cap).
+    ///
+    /// The setup mirrors `request` (kept inline rather than shared
+    /// — `request` is the hot S3/ACME path and is left untouched).
+    pub fn requestStreaming(
+        self: *Easy,
+        allocator: std.mem.Allocator,
+        req: Request,
+        sink: StreamSink,
+    ) Error!StreamResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        c.curl_easy_reset(self.handle);
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_ERRORBUFFER, &self.err_buf);
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 0));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_TCP_KEEPALIVE, @as(c_long, 1));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_USERAGENT, "rove");
+
+        const url_z = try allocator.dupeZ(u8, req.url);
+        defer allocator.free(url_z);
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_URL, url_z.ptr);
+
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_TIMEOUT_MS, @as(c_long, req.timeout_ms));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_long, req.connect_timeout_ms));
+
+        switch (req.http_version) {
+            .auto => {},
+            .h2c_prior_knowledge => {
+                _ = c.curl_easy_setopt(
+                    self.handle,
+                    c.CURLOPT_HTTP_VERSION,
+                    @as(c_long, c.CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE),
+                );
+            },
+        }
+
+        if (!req.verify_tls) {
+            _ = c.curl_easy_setopt(self.handle, c.CURLOPT_SSL_VERIFYPEER, @as(c_long, 0));
+            _ = c.curl_easy_setopt(self.handle, c.CURLOPT_SSL_VERIFYHOST, @as(c_long, 0));
+        }
+
+        switch (req.method) {
+            .GET => _ = c.curl_easy_setopt(self.handle, c.CURLOPT_HTTPGET, @as(c_long, 1)),
+            .HEAD => _ = c.curl_easy_setopt(self.handle, c.CURLOPT_NOBODY, @as(c_long, 1)),
+            .PUT => {
+                _ = c.curl_easy_setopt(self.handle, c.CURLOPT_UPLOAD, @as(c_long, 1));
+                _ = c.curl_easy_setopt(self.handle, c.CURLOPT_INFILESIZE_LARGE, @as(c.curl_off_t, @intCast(req.body.len)));
+            },
+            .POST => {
+                _ = c.curl_easy_setopt(self.handle, c.CURLOPT_POST, @as(c_long, 1));
+                _ = c.curl_easy_setopt(self.handle, c.CURLOPT_POSTFIELDSIZE_LARGE, @as(c.curl_off_t, @intCast(req.body.len)));
+            },
+            .DELETE => _ = c.curl_easy_setopt(self.handle, c.CURLOPT_CUSTOMREQUEST, "DELETE"),
+        }
+
+        var slist: ?*c.curl_slist = null;
+        defer if (slist != null) c.curl_slist_free_all(slist);
+        for (req.headers) |h| {
+            const line = try std.fmt.allocPrintSentinel(allocator, "{s}: {s}", .{ h.name, h.value }, 0);
+            defer allocator.free(line);
+            slist = c.curl_slist_append(slist, line.ptr);
+        }
+        if (req.range) |r| {
+            const line = try std.fmt.allocPrintSentinel(allocator, "Range: {s}", .{r}, 0);
+            defer allocator.free(line);
+            slist = c.curl_slist_append(slist, line.ptr);
+        }
+        if (slist != null) {
+            _ = c.curl_easy_setopt(self.handle, c.CURLOPT_HTTPHEADER, slist);
+        }
+
+        var body_cursor: BodyCursor = .{ .src = req.body };
+        if (req.method == .PUT or req.method == .POST) {
+            _ = c.curl_easy_setopt(self.handle, c.CURLOPT_READFUNCTION, @as(*const fn (*anyopaque, usize, usize, *anyopaque) callconv(.c) usize, &readBody));
+            _ = c.curl_easy_setopt(self.handle, c.CURLOPT_READDATA, @as(*anyopaque, @ptrCast(&body_cursor)));
+        }
+
+        // The streaming difference: WRITEFUNCTION / HEADERFUNCTION
+        // point at trampolines that forward to the caller's `sink`
+        // per writeback instead of buffering.
+        var ud: StreamUserdata = .{ .sink = sink };
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_WRITEFUNCTION, @as(*const fn (*anyopaque, usize, usize, *anyopaque) callconv(.c) usize, &streamWriteCb));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_WRITEDATA, @as(*anyopaque, @ptrCast(&ud)));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_HEADERFUNCTION, @as(*const fn (*anyopaque, usize, usize, *anyopaque) callconv(.c) usize, &streamHeaderCb));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_HEADERDATA, @as(*anyopaque, @ptrCast(&ud)));
+
+        const rc = c.curl_easy_perform(self.handle);
+        // CURLE_WRITE_ERROR == `on_body` returned false → an
+        // intentional abort, not a transport failure.
+        const perform_ok = (rc == c.CURLE_OK or rc == c.CURLE_WRITE_ERROR);
+        if (!perform_ok) {
+            std.log.warn("curl stream: {s} {s} failed: rc={d} msg={s}", .{
+                @tagName(req.method),
+                req.url,
+                rc,
+                std.mem.sliceTo(&self.err_buf, 0),
+            });
+        }
+
+        var status_long: c_long = 0;
+        _ = c.curl_easy_getinfo(self.handle, c.CURLINFO_RESPONSE_CODE, &status_long);
+        return .{
+            .status = @intCast(@max(status_long, 0)),
+            .perform_ok = perform_ok,
+        };
+    }
 };
 
 /// Process-wide pool of libcurl `Easy` handles, reused across every
@@ -492,6 +613,61 @@ fn writeResp(ptr: *anyopaque, size: usize, nmemb: usize, userdata: *anyopaque) c
         ctx.alloc_failed = true;
         return 0;
     };
+    return n;
+}
+
+// ── Streaming response delivery (`requestStreaming`) ───────────────
+
+/// Caller-supplied callbacks for `Easy.requestStreaming`. Both run
+/// on the calling thread, synchronously inside `curl_easy_perform`,
+/// once per libcurl writeback / header line.
+pub const StreamSink = struct {
+    /// Opaque caller context, passed back to both callbacks.
+    ctx: *anyopaque,
+    /// One body writeback. `chunk` is borrowed — valid only for the
+    /// duration of the call (copy to retain). Return false to abort
+    /// the transfer.
+    on_body: *const fn (chunk: []const u8, ctx: *anyopaque) bool,
+    /// One response-header line, raw (`Name: value\r\n`; also the
+    /// `HTTP/1.1 ...` status line and the blank `\r\n` terminator).
+    /// `line` is borrowed — valid only for the duration of the call.
+    on_header: *const fn (line: []const u8, ctx: *anyopaque) void,
+};
+
+/// `requestStreaming` outcome. No body — it was delivered to the
+/// sink incrementally.
+pub const StreamResult = struct {
+    status: u16,
+    /// True if `curl_easy_perform` succeeded OR was aborted by
+    /// `on_body` returning false (an intentional caller-side stop).
+    /// False on a genuine transport failure.
+    perform_ok: bool,
+};
+
+/// Internal `CURLOPT_WRITEDATA` / `CURLOPT_HEADERDATA` payload —
+/// wraps the caller's `StreamSink` so the C trampolines have a
+/// single typed userdata pointer.
+const StreamUserdata = struct {
+    sink: StreamSink,
+};
+
+fn streamWriteCb(ptr: *anyopaque, size: usize, nmemb: usize, userdata: *anyopaque) callconv(.c) usize {
+    const ud: *StreamUserdata = @ptrCast(@alignCast(userdata));
+    const n = size * nmemb;
+    if (n == 0) return 0;
+    const src: [*]const u8 = @ptrCast(ptr);
+    if (!ud.sink.on_body(src[0..n], ud.sink.ctx)) {
+        // Returning < n tells libcurl to abort with CURLE_WRITE_ERROR.
+        return 0;
+    }
+    return n;
+}
+
+fn streamHeaderCb(ptr: *anyopaque, size: usize, nmemb: usize, userdata: *anyopaque) callconv(.c) usize {
+    const ud: *StreamUserdata = @ptrCast(@alignCast(userdata));
+    const n = size * nmemb;
+    const src: [*]const u8 = @ptrCast(ptr);
+    ud.sink.on_header(src[0..n], ud.sink.ctx);
     return n;
 }
 
