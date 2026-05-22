@@ -212,9 +212,10 @@ pub const HistogramSnapshot = struct {
 /// given thread always hits the same shard. Snapshot sums across all
 /// shards.
 ///
-/// Sharded counters here are the ones called per-API-op
-/// (put / delete / get / bytes_put). Less-frequent counters (txn
-/// commit/rollback, lifecycle, durabilize, gauges) live unsharded on
+/// Sharded counters here are the per-op / per-Txn-lifecycle ones —
+/// anything hit at request frequency (put / delete / get / bytes_put,
+/// txn + savepoint commit/rollback, txn begin, chain-depth sum).
+/// Rare counters (lifecycle, durabilize) and gauges live unsharded on
 /// `Metrics` directly — sharding them would just waste memory.
 ///
 /// Note: `active_leases` and `active_snapshots` aren't stored as
@@ -235,9 +236,12 @@ pub const HotShard = extern struct {
     txn_rollback: std.atomic.Value(u64) = .init(0),
     savepoint_commit: std.atomic.Value(u64) = .init(0),
     savepoint_rollback: std.atomic.Value(u64) = .init(0),
+    txn_begin: std.atomic.Value(u64) = .init(0),
+    txn_commit_speculative: std.atomic.Value(u64) = .init(0),
+    chain_depth_sum: std.atomic.Value(u64) = .init(0),
     _pad: [hot_shard_padding]u8 = @splat(0),
 
-    const counter_bytes = 13 * @sizeOf(u64);
+    const counter_bytes = 16 * @sizeOf(u64);
     const total_size = std.mem.alignForward(usize, counter_bytes, std.atomic.cache_line);
     const hot_shard_padding = total_size - counter_bytes;
 };
@@ -295,6 +299,12 @@ pub const Metrics = struct {
     snapshot_open_total: std.atomic.Value(u64) = .init(0),
     snapshot_close_total: std.atomic.Value(u64) = .init(0),
     poison_total: std.atomic.Value(u64) = .init(0),
+
+    /// High-water mark: the deepest per-tenant speculative chain ever
+    /// observed at beginTxn (1 = a lone Txn with no speculation).
+    /// CAS-max updated, so the cache line stays read-mostly once the
+    /// peak stabilizes.
+    chain_depth_max: std.atomic.Value(u64) = .init(0),
 
     // Duration distributions. durabilize is the main one (one fsync
     // boundary per checkpoint); snapshot_open captures every
@@ -358,6 +368,30 @@ pub const Metrics = struct {
         _ = self.currentShard().savepoint_rollback.fetchAdd(1, .monotonic);
     }
 
+    /// Record a beginTxn: count it, fold its chain depth into the sum
+    /// (for a mean), and bump the high-water max. `chain_depth` is the
+    /// chain length *including* the Txn just appended (≥ 1).
+    pub inline fn recordTxnBegin(self: *Metrics, chain_depth: u32) void {
+        const s = self.currentShard();
+        _ = s.txn_begin.fetchAdd(1, .monotonic);
+        _ = s.chain_depth_sum.fetchAdd(chain_depth, .monotonic);
+        var seen = self.chain_depth_max.load(.monotonic);
+        while (chain_depth > seen) {
+            seen = self.chain_depth_max.cmpxchgWeak(
+                seen,
+                chain_depth,
+                .monotonic,
+                .monotonic,
+            ) orelse break;
+        }
+    }
+
+    /// Record a top-level commit whose reads resolved against an
+    /// uncommitted chain predecessor — i.e. it consumed speculation.
+    pub inline fn recordTxnCommitSpeculative(self: *Metrics) void {
+        _ = self.currentShard().txn_commit_speculative.fetchAdd(1, .monotonic);
+    }
+
     fn snapshot(self: *const Metrics) MetricsSnapshot {
         var put_total: u64 = 0;
         var bytes_put_total: u64 = 0;
@@ -372,6 +406,9 @@ pub const Metrics = struct {
         var txn_rollback_total: u64 = 0;
         var savepoint_commit_total: u64 = 0;
         var savepoint_rollback_total: u64 = 0;
+        var txn_begin_total: u64 = 0;
+        var txn_commit_speculative_total: u64 = 0;
+        var chain_depth_sum: u64 = 0;
         for (&self.hot_shards) |*s| {
             put_total += s.put.load(.monotonic);
             bytes_put_total += s.bytes_put.load(.monotonic);
@@ -386,6 +423,9 @@ pub const Metrics = struct {
             txn_rollback_total += s.txn_rollback.load(.monotonic);
             savepoint_commit_total += s.savepoint_commit.load(.monotonic);
             savepoint_rollback_total += s.savepoint_rollback.load(.monotonic);
+            txn_begin_total += s.txn_begin.load(.monotonic);
+            txn_commit_speculative_total += s.txn_commit_speculative.load(.monotonic);
+            chain_depth_sum += s.chain_depth_sum.load(.monotonic);
         }
         const open = self.snapshot_open_total.load(.monotonic);
         const closed = self.snapshot_close_total.load(.monotonic);
@@ -399,6 +439,10 @@ pub const Metrics = struct {
             .txn_rollback_total = txn_rollback_total,
             .savepoint_commit_total = savepoint_commit_total,
             .savepoint_rollback_total = savepoint_rollback_total,
+            .txn_begin_total = txn_begin_total,
+            .txn_commit_speculative_total = txn_commit_speculative_total,
+            .chain_depth_sum = chain_depth_sum,
+            .chain_depth_max = self.chain_depth_max.load(.monotonic),
             .put_total = put_total,
             .delete_total = delete_total,
             .get_total = get_total,
@@ -433,6 +477,10 @@ pub const MetricsSnapshot = struct {
     txn_rollback_total: u64,
     savepoint_commit_total: u64,
     savepoint_rollback_total: u64,
+    txn_begin_total: u64,
+    txn_commit_speculative_total: u64,
+    chain_depth_sum: u64,
+    chain_depth_max: u64,
     put_total: u64,
     delete_total: u64,
     get_total: u64,
@@ -559,6 +607,7 @@ pub const Manifest = struct {
             }
             ts.chain_head = null;
             ts.chain_tail = null;
+            ts.chain_depth = 0;
             ts.releaseRef(self.allocator);
         }
         self.tenants.deinit(self.allocator);
@@ -666,6 +715,7 @@ pub const Manifest = struct {
             }
             ts.chain_head = null;
             ts.chain_tail = null;
+            ts.chain_depth = 0;
             ts.main_overlay.clear();
             ts.draining_overlay.clear();
             ts.draining_active = false;
@@ -1071,6 +1121,10 @@ const TenantState = struct {
     draining_active: bool = false,
     chain_head: ?*Txn = null,
     chain_tail: ?*Txn = null,
+    /// Number of top-level Txns currently linked between chain_head and
+    /// chain_tail. Maintained under `lock` on every chain mutation;
+    /// feeds the chain-depth metrics. Savepoints are not chain members.
+    chain_depth: u32 = 0,
 
     /// Refcount = (1 if still in Manifest.tenants) + (1 per outstanding
     /// StoreLease). dropStore removes the map entry and drops the
@@ -1593,6 +1647,7 @@ pub const Txn = struct {
         defer ts.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
         const is_savepoint = self.parent != null;
+        const was_speculative = !is_savepoint and self.saw_speculation;
         if (self.parent) |parent| {
             // Savepoint commit.
             Overlay.moveInto(&self.overlay, &parent.overlay);
@@ -1628,6 +1683,7 @@ pub const Txn = struct {
                     ts.chain_tail = null;
                 }
             }
+            ts.chain_depth -= 1;
         }
         // Top-level commit frees this Txn; park any batch read view it
         // owns for reuse by the next batch on this tenant. (Savepoint
@@ -1639,6 +1695,7 @@ pub const Txn = struct {
             manifest.metrics.recordSavepointCommit();
         } else {
             manifest.metrics.recordTxnCommit();
+            if (was_speculative) manifest.metrics.recordTxnCommitSpeculative();
         }
     }
 
@@ -1666,12 +1723,15 @@ pub const Txn = struct {
                 ts.chain_head = null;
                 ts.chain_tail = null;
             }
+            var freed: u32 = 0;
             var cur: ?*Txn = self;
             while (cur) |c| {
                 const next = c.chain_next;
                 c.freeSubtreeLocked();
+                freed += 1;
                 cur = next;
             }
+            ts.chain_depth -= freed;
         } else {
             // Savepoint: detach from parent + free subtree.
             self.parent.?.open_child = null;
@@ -1928,6 +1988,8 @@ pub const StoreLease = struct {
             ts.chain_head = txn;
         }
         ts.chain_tail = txn;
+        ts.chain_depth += 1;
+        self.manifest.metrics.recordTxnBegin(ts.chain_depth);
         return txn;
     }
 
@@ -3686,6 +3748,70 @@ test "Metrics: counters and gauges reflect hot-path activity" {
     // Poison increments its counter.
     h.manifest._testPoison();
     try testing.expectEqual(@as(u64, 1), h.manifest.metricsSnapshot().poison_total);
+}
+
+test "Metrics: chain depth + speculation counters" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    // Baseline: nothing begun yet.
+    {
+        const m = h.manifest.metricsSnapshot();
+        try testing.expectEqual(@as(u64, 0), m.txn_begin_total);
+        try testing.expectEqual(@as(u64, 0), m.chain_depth_sum);
+        try testing.expectEqual(@as(u64, 0), m.chain_depth_max);
+        try testing.expectEqual(@as(u64, 0), m.txn_commit_speculative_total);
+    }
+
+    // Three stacked Txns — chain depth climbs 1 → 2 → 3, one sample
+    // per beginTxn.
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    var t2 = try h.quickTxn(1);
+    var t3 = try h.quickTxn(1);
+    // t3 reads a key only the uncommitted t1 wrote → speculation.
+    {
+        const got = (try t3.get(testing.allocator, "a")).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("1", got);
+    }
+    {
+        const m = h.manifest.metricsSnapshot();
+        try testing.expectEqual(@as(u64, 3), m.txn_begin_total);
+        try testing.expectEqual(@as(u64, 1 + 2 + 3), m.chain_depth_sum);
+        try testing.expectEqual(@as(u64, 3), m.chain_depth_max);
+        try testing.expectEqual(@as(u32, 3), h.manifest.tenants.get(1).?.chain_depth);
+    }
+
+    // Commit in chain order. t1 (writer) and t2 (empty fast path) are
+    // speculation-free; only t3 consumed an uncommitted predecessor.
+    try t1.commit();
+    try t2.commit();
+    try t3.commit();
+    {
+        const m = h.manifest.metricsSnapshot();
+        try testing.expectEqual(@as(u64, 3), m.txn_commit_total);
+        try testing.expectEqual(@as(u64, 1), m.txn_commit_speculative_total);
+        // Every Txn left the chain — depth is back to zero.
+        try testing.expectEqual(@as(u32, 0), h.manifest.tenants.get(1).?.chain_depth);
+    }
+
+    // A rollback cascade decrements depth for every Txn it frees.
+    var r1 = try h.quickTxn(1);
+    _ = try h.quickTxn(1); // r2 — freed by the cascade
+    _ = try h.quickTxn(1); // r3 — freed by the cascade
+    try testing.expectEqual(@as(u32, 3), h.manifest.tenants.get(1).?.chain_depth);
+    r1.rollback(); // detaches r1, frees r1 + r2 + r3
+    {
+        const m = h.manifest.metricsSnapshot();
+        try testing.expectEqual(@as(u64, 6), m.txn_begin_total);
+        try testing.expectEqual(@as(u64, 1 + 2 + 3 + 1 + 2 + 3), m.chain_depth_sum);
+        try testing.expectEqual(@as(u32, 0), h.manifest.tenants.get(1).?.chain_depth);
+        // Peak stayed at 3 — the cascade round never went deeper.
+        try testing.expectEqual(@as(u64, 3), m.chain_depth_max);
+    }
 }
 
 test "Metrics: duration histograms record durabilize and snapshot timing" {

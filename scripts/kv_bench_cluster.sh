@@ -138,6 +138,35 @@ extract_rps() {
     awk '/finished in/ { for (i=1;i<=NF;i++) if ($i ~ /req\/s/) print $(i-1); exit }'
 }
 
+# Scrape the leader's kvexp speculation metrics. Echoes five
+# space-separated cumulative counters:
+#   txn_begin  chain_depth_sum  chain_depth_max  txn_commit  txn_commit_speculative
+scrape_spec() {
+    "${CURL[@]}" -H "Authorization: Bearer $TOKEN" \
+        "https://${ADMIN_HOST}:${LEADER_PORT}/_system/metrics" 2>/dev/null \
+    | awk '
+        /^kvexp_txn_begin_total / { b=$2 }
+        /^kvexp_chain_depth_sum / { s=$2 }
+        /^kvexp_chain_depth_max / { m=$2 }
+        /^kvexp_txn_commit_total / { c=$2 }
+        /^kvexp_txn_commit_speculative_total / { sp=$2 }
+        END { printf "%d %d %d %d %d", b, s, m, c, sp }
+    '
+}
+
+# print_spec_row <label> <prev-tuple> <cur-tuple> — per-workload delta:
+# mean chain depth, cumulative high-water peak, speculation hit rate.
+print_spec_row() {
+    awk -v label="$1" -v p="$2" -v c="$3" 'BEGIN {
+        split(p, P); split(c, C);
+        db = C[1]-P[1]; ds = C[2]-P[2]; dc = C[4]-P[4]; dsp = C[5]-P[5];
+        mean = db>0 ? ds/db : 0;
+        rate = dc>0 ? 100*dsp/dc : 0;
+        printf "  %-9s txns_begun=%-8d mean_depth=%-6.2f peak=%-4d spec_commits=%d/%d (%.1f%%)\n", \
+            label, db, mean, C[3], dsp, dc, rate;
+    }'
+}
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo " kv contention benchmark"
@@ -150,6 +179,7 @@ echo ""
 echo "── warmup: spread.rewindjsapp.localhost 1000-key keyspace ──"
 "${H2LOAD[@]}" -n 5000 -c 20 -m 10 \
     "https://spread.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" 2>&1 | grep -E "finished|req/s" || true
+spec_base=$(scrape_spec)
 
 echo ""
 echo "── (1) hot.rewindjsapp.localhost — single tenant, single key 'k' ──"
@@ -157,6 +187,7 @@ hot_out=$("${H2LOAD[@]}" -n "$REQUESTS" -c "$CLIENTS" -m "$STREAMS" \
     "https://hot.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" 2>&1)
 echo "$hot_out" | grep -E "finished in|req/s|status codes"
 hot_rps=$(echo "$hot_out" | extract_rps)
+spec_hot=$(scrape_spec)
 
 echo ""
 echo "── (2) spread.rewindjsapp.localhost — single tenant, 1000 keys, same payload ──"
@@ -164,6 +195,7 @@ spread_out=$("${H2LOAD[@]}" -n "$REQUESTS" -c "$CLIENTS" -m "$STREAMS" \
     "https://spread.rewindjsapp.localhost:${LEADER_PORT}/?fn=handler" 2>&1)
 echo "$spread_out" | grep -E "finished in|req/s|status codes"
 spread_rps=$(echo "$spread_out" | extract_rps)
+spec_spread=$(scrape_spec)
 
 echo ""
 echo "── (3) sharded — $TENANTS tenants in parallel (write0..write$((TENANTS-1)).test) ──"
@@ -185,10 +217,18 @@ for i in $(seq 0 $((TENANTS - 1))); do
     echo "  write${i}.rewindjsapp.localhost: $rps req/s"
 done
 rm -rf "$LOG_DIR"
+spec_shard=$(scrape_spec)
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 printf " hot     (1 tenant, 1 key):    %s req/s\n" "$hot_rps"
 printf " spread  (1 tenant, 1000 k):   %s req/s\n" "$spread_rps"
 printf " sharded ($TENANTS tenants, sum):     %d req/s\n" "$shard_total"
+echo "───────────────────────────────────────────────────────────────"
+echo " speculative overlay chain (leader, kvexp):"
+print_spec_row "hot"     "$spec_base"   "$spec_hot"
+print_spec_row "spread"  "$spec_hot"    "$spec_spread"
+print_spec_row "sharded" "$spec_spread" "$spec_shard"
+echo "   mean_depth: mean chain length sampled at each beginTxn (1 = no speculation)"
+echo "   peak:       cumulative high-water chain_depth_max across the run so far"
 echo "═══════════════════════════════════════════════════════════════"
