@@ -71,11 +71,24 @@ with one step.
 ## 3. Inbound: the coalesce budget + the handler's three-way choice
 
 The runtime accumulates the request body up to a **coalesce
-budget** (today's `REQUEST_BODY_CAP`), then dispatches the chain's
-first `inbound` step. Two outcomes:
+budget**, then dispatches the chain's first `inbound` step.
+
+> **The 64 KiB guarantee.** A request body of **64 KiB or smaller
+> is always delivered in a single `inbound` activation** with
+> `request.body_complete === true`. This is the stable contract a
+> customer designs against: keep bodies under 64 KiB and the
+> three-way choice below never concerns you — you are
+> unconditionally in the one-step world. The runtime's coalesce
+> budget may in practice be higher, but 64 KiB is the floor that
+> will not regress. (64 KiB also matches the outbound per-chunk
+> default, `max_response_chunk_bytes` — one number, both
+> directions.)
+
+Two outcomes:
 
 - **Body fit the budget** → `request.body` is the whole body,
-  `request.body_complete === true`. The overwhelmingly common case.
+  `request.body_complete === true`. The overwhelmingly common case,
+  and *guaranteed* whenever the body is ≤ 64 KiB.
   Nothing below applies; the handler returns a `Response` and the
   one-step chain ends. **Identical to today.**
 - **Body exceeded the budget** → `request.body` is the prefix
@@ -271,11 +284,14 @@ No step changes a shipped buffered handler, a shipped
 
 ## 8. Open questions
 
-- **Per-route coalesce budget.** v1 is one budget (`REQUEST_BODY_CAP`).
-  A handler wanting body chunk #1 with *zero* buffering needs
-  budget 0 (dispatch on headers). Defer the per-route knob; v1's
-  fixed budget means "first budget-worth buffered, rest streamed,"
-  which is fine for uploads and adequate for proxies.
+- **Coalesce budget above the 64 KiB floor.** The 64 KiB
+  single-activation guarantee (§3) is fixed. The *budget* — the
+  point past which a body is dispatched partial — may sit higher;
+  v1 keeps one budget and `REQUEST_BODY_CAP` is the candidate. A
+  handler wanting body chunk #1 with *zero* buffering needs budget
+  0 (dispatch on headers); defer that per-route knob. v1's fixed
+  budget means "first budget-worth buffered, rest streamed," fine
+  for uploads and adequate for proxies.
 - **Duplex.** A chain receiving `inbound_chunk`s *and* emitting
   `write` chunks concurrently is expressible in the model (both are
   just steps). v1 may still restrict to "receive fully, then
