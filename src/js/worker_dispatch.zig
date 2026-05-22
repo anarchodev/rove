@@ -1206,6 +1206,18 @@ fn writeKvexpMetrics(
         \\# HELP kvexp_savepoint_rollback_total savepoint drops.
         \\# TYPE kvexp_savepoint_rollback_total counter
         \\kvexp_savepoint_rollback_total {d}
+        \\# HELP kvexp_txn_begin_total top-level Txns opened via beginTxn.
+        \\# TYPE kvexp_txn_begin_total counter
+        \\kvexp_txn_begin_total {d}
+        \\# HELP kvexp_txn_commit_speculative_total commits whose reads resolved against an uncommitted chain predecessor.
+        \\# TYPE kvexp_txn_commit_speculative_total counter
+        \\kvexp_txn_commit_speculative_total {d}
+        \\# HELP kvexp_chain_depth_sum speculative-chain depth summed across every beginTxn; divide by kvexp_txn_begin_total for the mean.
+        \\# TYPE kvexp_chain_depth_sum counter
+        \\kvexp_chain_depth_sum {d}
+        \\# HELP kvexp_chain_depth_max deepest speculative chain ever observed at a beginTxn.
+        \\# TYPE kvexp_chain_depth_max gauge
+        \\kvexp_chain_depth_max {d}
         \\# HELP kvexp_durabilize_total durabilize() calls (fsync boundaries).
         \\# TYPE kvexp_durabilize_total counter
         \\kvexp_durabilize_total {d}
@@ -1239,6 +1251,10 @@ fn writeKvexpMetrics(
         snap.txn_rollback_total,
         snap.savepoint_commit_total,
         snap.savepoint_rollback_total,
+        snap.txn_begin_total,
+        snap.txn_commit_speculative_total,
+        snap.chain_depth_sum,
+        snap.chain_depth_max,
         snap.durabilize_total,
         snap.durabilize_failed_total,
         snap.snapshot_open_total,
