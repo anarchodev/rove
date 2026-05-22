@@ -80,11 +80,45 @@ pub const WakeBatch = struct {};
 /// Subscription chain origin — cron / kv-react / boot (primitive-gaps
 /// §2.1). Today: `enqueueSubscriptionFireForTenant` (cross-thread) →
 /// `SubscriptionFireInbox` → drained into `subscription_fire_pending`.
-/// Phase 2B (cron + boot) and 2C (kv-react) replace the path with
-/// `enqueueMsg(.{ .subscription_fire = ... })`. The variant payload
-/// will reference / subsume `worker.SubscriptionFireQueueInput` +
-/// `worker.SubscriptionFireSource`.
-pub const SubscriptionFire = struct {};
+/// Phase 2B migrates the cron + boot drain to push these payloads onto
+/// `MsgQueue`; Phase 2C migrates the kv-react direct-enqueue site to
+/// the same path. Owns its strings; `deinit` is called by
+/// `MsgQueue.deinit` (drop-on-shutdown) and by the dispatch path after
+/// the fire completes.
+pub const SubscriptionFire = struct {
+    /// Source-of-fire discriminant + per-source payload. Mirrors
+    /// `worker.SubscriptionFireSource` but lives in the effect module
+    /// so the algebra surface doesn't reach back into the dispatch
+    /// internals.
+    pub const Source = union(enum) {
+        cron: struct { fired_at_ns: i64 },
+        kv: struct {
+            /// Owned by the parent `SubscriptionFire`; freed in `deinit`.
+            key: []u8,
+            op: u8,
+        },
+        boot: struct { deployment_id: u64 },
+    };
+
+    /// Allocator-owned. The producer dupes onto the message; the
+    /// consumer's dispatch path borrows during the fire and the
+    /// message's `deinit` frees after.
+    tenant_id: []u8,
+    subscription_name: []u8,
+    module_path: []u8,
+    source: Source,
+
+    pub fn deinit(self: *SubscriptionFire, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
+        allocator.free(self.subscription_name);
+        allocator.free(self.module_path);
+        switch (self.source) {
+            .kv => |kv_src| if (kv_src.key.len > 0) allocator.free(kv_src.key),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
 
 /// `http.fetch` Pattern A `on_chunk` activation (primitive-gaps §2.3).
 /// Today: `FetchPool` libcurl → `enqueueFetchEventForTenant` →
@@ -128,8 +162,8 @@ pub const Msg = union(ActivationSource) {
 
 test "Msg.kind projects to ActivationSource tag" {
     const testing = std.testing;
-    const m: Msg = .{ .subscription_fire = .{} };
-    try testing.expectEqual(ActivationSource.subscription_fire, m.kind());
+    const m: Msg = .{ .timer = .{} };
+    try testing.expectEqual(ActivationSource.timer, m.kind());
 
     const m2: Msg = .{ .fetch_chunk = .{} };
     try testing.expectEqual(ActivationSource.fetch_chunk, m2.kind());
@@ -143,6 +177,16 @@ test "Msg covers every ActivationSource variant exhaustively" {
     // slice of the §4 six-question contract enforced by the
     // compiler.
     const testing = std.testing;
+    // SubscriptionFire owns strings; build/free explicitly so the
+    // test exercises the real payload shape, not a placeholder.
+    var sf: SubscriptionFire = .{
+        .tenant_id = try testing.allocator.dupe(u8, "t"),
+        .subscription_name = try testing.allocator.dupe(u8, "s"),
+        .module_path = try testing.allocator.dupe(u8, "m"),
+        .source = .{ .cron = .{ .fired_at_ns = 0 } },
+    };
+    defer sf.deinit(testing.allocator);
+
     inline for (@typeInfo(ActivationSource).@"enum".fields) |f| {
         const tag: ActivationSource = @enumFromInt(f.value);
         const m: Msg = switch (tag) {
@@ -152,7 +196,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
             .disconnect => .{ .disconnect = .{} },
             .kv_wake => .{ .kv_wake = .{} },
             .wake_batch => .{ .wake_batch = .{} },
-            .subscription_fire => .{ .subscription_fire = .{} },
+            .subscription_fire => .{ .subscription_fire = sf },
             .fetch_chunk => .{ .fetch_chunk = .{} },
             .fetch_done => .{ .fetch_done = .{} },
             .fetch_pipe_done => .{ .fetch_pipe_done = .{} },

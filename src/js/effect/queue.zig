@@ -69,11 +69,28 @@ pub const MsgQueue = struct {
     }
 
     pub fn deinit(self: *MsgQueue) void {
-        // Phase 2A: variants carry no owned fields, so plain list
-        // deinit suffices. Per-origin migration PRs that add owned
-        // payloads MUST walk the items here calling each variant's
-        // own deinit before the list deinit fires. See file-level
-        // doc on the ownership model.
+        // Variants that own bytes get their deinit called here on
+        // drop-on-shutdown. Variants whose payload is by-value (no
+        // owned fields) fall through the `else` arm. Add new
+        // payload-owning variants to this switch when their
+        // per-origin migration lands; the compiler enforces
+        // exhaustiveness so a forgotten arm is a build break.
+        for (self.items.items) |*m| switch (m.*) {
+            .subscription_fire => |*sf| sf.deinit(self.allocator),
+            // Phase 2A placeholders: empty payloads, no owned bytes.
+            // Phase 2C+ wires kv-react (still .subscription_fire);
+            // 2D-2F fill these in with their own deinit.
+            .inbound,
+            .send_callback,
+            .timer,
+            .disconnect,
+            .kv_wake,
+            .wake_batch,
+            .fetch_chunk,
+            .fetch_done,
+            .fetch_pipe_done,
+            => {},
+        };
         self.items.deinit(self.allocator);
     }
 
@@ -124,15 +141,36 @@ test "MsgQueue: enqueue + dequeue FIFO order" {
     var q = MsgQueue.init(testing.allocator, 4);
     defer q.deinit();
 
-    try enqueueMsg(&q, .{ .subscription_fire = .{} });
+    try enqueueMsg(&q, .{ .timer = .{} });
     try enqueueMsg(&q, .{ .fetch_chunk = .{} });
     try enqueueMsg(&q, .{ .send_callback = .{} });
     try testing.expectEqual(@as(usize, 3), q.len());
 
-    try testing.expectEqual(msg_mod.ActivationSource.subscription_fire, q.dequeue().?.kind());
+    try testing.expectEqual(msg_mod.ActivationSource.timer, q.dequeue().?.kind());
     try testing.expectEqual(msg_mod.ActivationSource.fetch_chunk, q.dequeue().?.kind());
     try testing.expectEqual(msg_mod.ActivationSource.send_callback, q.dequeue().?.kind());
     try testing.expectEqual(@as(?Msg, null), q.dequeue());
+}
+
+test "MsgQueue: SubscriptionFire payload freed on shutdown deinit" {
+    const testing = std.testing;
+    var q = MsgQueue.init(testing.allocator, 4);
+    // No defer q.deinit() — calling it manually below to exercise
+    // the drop-on-shutdown path on a non-empty queue.
+
+    const sf: msg_mod.SubscriptionFire = .{
+        .tenant_id = try testing.allocator.dupe(u8, "acme"),
+        .subscription_name = try testing.allocator.dupe(u8, "cron-sub"),
+        .module_path = try testing.allocator.dupe(u8, "_subscriptions/cron-sub/index.mjs"),
+        .source = .{ .cron = .{ .fired_at_ns = 42 } },
+    };
+    try enqueueMsg(&q, .{ .subscription_fire = sf });
+    try testing.expectEqual(@as(usize, 1), q.len());
+
+    // deinit must free the SubscriptionFire's owned strings — the
+    // testing allocator panics on leak if the variant-deinit arm is
+    // missed.
+    q.deinit();
 }
 
 test "MsgQueue: backpressure — error.Full + overflow_count increments" {
