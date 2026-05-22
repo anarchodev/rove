@@ -152,29 +152,66 @@ closes on itself. This is `unified-effect-gating.md §4` Option A.
 
 ## 4. Current state — the bespoke sites to collapse
 
-From the `effect-algebra.md §5` audit (2026-05-22). **Phase 0
-reconfirms exact `file:line`** — treat these as starting pointers.
+Pointers confirmed against tree at `90e2847` (Phase 0, 2026-05-22).
 
 | Bespoke today | Reified into | Notes |
 |---|---|---|
-| handler Cmd-list (shipped, `project_handler_returns_cmds`) | `effect.Cmd` | already a list; Phase 1 consolidates the element type |
-| `log_mod.ActivationSource` enum (`worker.zig` ~5456, `log/root.zig` 60-94) | `effect.Msg` tag | already enumerates Msg kinds |
-| `ParkedUnit` + `parked_units` + `proposeForgetfulWrites` (`worker.zig` ~6247-6321) | `effect.Continuation` | Option-B mechanism — generalize, don't rebuild |
-| `pending_txns` + `RaftWait` + `drainRaftPending` (H2 path) | `reconcile` (the reference instance) | byte-identical first |
-| `raft_pending_response` / `_cont` / `_stream` (`worker.zig` ~2082-2099) | `Continuation` collections | the "three siblings" |
-| `parked_continuations`, `stream_data_out`, `stream_response_in` | `Continuation` collections | one Row, N collections by resume-disposition |
-| `subscription_fire_pending`, `fetch_event_pending` | one `MsgQueue` | |
-| `SubscriptionFireInbox`, `FetchChunkInbox` (cross-thread) | one `MsgQueue` ingress | |
-| `SendDispatch` + `InflightSet` (`send_dispatch.zig`, `send_inflight.zig`) | `http_out` transport only | park/gate/tape become shared |
-| `FetchPool` (`fetch_pool.zig`) | `http_out` transport only | `http.send` + `http.fetch` unify |
-| `cron_state` plain hashmap (`NodeState`, `worker.zig` ~1317-1327) | a collection | worklist #5 |
+| `BatchSideEffects` writeset accumulator (`worker.zig:508`) — the per-tick handler-emitted ops bundle | `effect.Cmd` (list) | shipped piece of `project_handler_returns_cmds`; Phase 1 consolidates the element type |
+| `log_mod.ActivationSource` enum (`log/root.zig:58`) — 10 variants, used at `worker.zig:3247, 3290, 3333, 5457, 6846` | `effect.Msg` tag | already enumerates Msg kinds |
+| `ParkedUnit` (`worker.zig:132`) + `parked_units` field (`worker.zig:2144`) + `proposeForgetfulWrites` (`worker.zig:6247`) | `effect.Continuation` | Option-B mechanism — generalize, don't rebuild |
+| `pending_txns` (`worker.zig:2135`) + `RaftWait` (`worker.zig:114`) + `drainRaftPending` (`worker.zig:4308`; H2-path subfns at `4124`, `4184`, `4252`) | `reconcile` (the reference instance) | byte-identical first |
+| `raft_pending_response` / `_cont` / `_stream` (`worker.zig:2082` / `2085` / `2088`) | `Continuation` collections | the "three siblings" |
+| `parked_continuations` (`worker.zig:2099`); `stream_data_out` / `stream_response_in` (`h2/root.zig:397` / `396`) | `Continuation` collections | one Row, N collections by resume-disposition |
+| `subscription_fire_pending` (`worker.zig:2156`); `fetch_event_pending` (`worker.zig:2182`) | one `MsgQueue` | |
+| `SubscriptionFireInbox` (`worker.zig:399`); `FetchChunkInbox` (`worker.zig:454`) | one `MsgQueue` ingress | cross-thread |
+| `SendDispatch` (`send_dispatch.zig:405`) + `InflightSet` (`send_inflight.zig:100`) | `http_out` transport only | park/gate/tape become shared |
+| `FetchPool` (`fetch_pool.zig:51`) | `http_out` transport only | `http.send` + `http.fetch` unify |
+| `cron_state` `StringHashMapUnmanaged` (`worker.zig:1326-1327`, guarded by `cron_state_mutex`) | a collection | worklist #5 |
+| `parkSendOps` (`worker.zig:7007`) + `parkKvWakes` (`worker.zig:7057`) — current ParkedUnit registrants | folded into `Continuation.buffered` | the helpers go away with the unification |
 
 What is already done and must be *reused, not rebuilt*: the handler
 returns a Cmd-list (`project_handler_returns_cmds`, shipped 2026-05-20);
-the `ParkedUnit` commit-gated reconciler mechanism (Option B). Phase 0
-must establish **how far the Option-B `ParkedUnit` migration got** —
-which proposers register units vs still fire-and-forget
-(`unified-effect-gating.md §5` idiom table is the checklist).
+the `ParkedUnit` commit-gated reconciler mechanism (Option B).
+
+**Option-B `ParkedUnit` migration state — substantially complete for
+the externally-observable-effect class.** Against
+`unified-effect-gating.md §5`:
+
+- **idiom-1** (`tenant_batch` internal + callback) — MIGRATED. Registrants:
+  anchor path `worker_dispatch.zig:697-709` (`parkSendOps` +
+  `parkKvWakes` after `proposeBatch`); callback path
+  `callback_dispatch.zig:151-155`; cont-resume path
+  `worker.zig:4548, 4574-4577`; disconnect/forgetful path
+  `worker.zig:6247+` (`proposeForgetfulWrites` builds + creates the unit).
+- **idiom-2** (`platform.releases.publish` / admin-kv / `deployStarter`
+  / `platform.scope.kv`) — MIGRATED. Admin-handler trampolines
+  (`worker.zig:2617, 2680, 2739`) fold writes into the dispatch tick's
+  `BatchSideEffects` bundle, which goes through the same idiom-1 gate at
+  `worker_dispatch.zig:651`. The release POST handler
+  (`worker_dispatch.zig:1583`) and admin-kv POST (`worker_dispatch.zig:1726`)
+  park the entity in `raft_pending_response` directly.
+- **idiom-3a** (ACME cert propose) — **NOT MIGRATED.** `src/loop46/acme.zig:210`
+  calls `cfg.raft.propose(seq, env)` directly; no `ParkedUnit`, no entity
+  park. Acceptable today only because the bound effect (cert install)
+  is self-healing on the next ACME pass — re-derived class.
+- **idiom-3b** (`callback_dispatch.zig:288` Seam-A `_send/proof/` propose;
+  `worker.zig:3622` `config_mirror` `mirrorDeployConfig` propose) —
+  NOT MIGRATED. Both deliberate: the proof-propose recovery is the
+  durable `_send/owed` + boot-scan path; `config_mirror` is idempotently
+  re-derived on next deploy load.
+- **`events.emit` / SSE worklist item #7** — **MOOT.** The
+  platform-managed SSE pipe (in-process sse-server thread,
+  `_session/sse-token` mint, `events.emit` global) was retired in
+  streaming-handlers Phase 5 (note at `loop46/main.zig:1325-1340`).
+  `ParkedUnit` carries no `emits` field because the surface no longer
+  exists; customers compose SSE on `__rove_stream` + kv-write wakes.
+  `effect-algebra.md §7` worklist #7 and `unified-effect-gating.md §6`'s
+  systemic SSE-emit fix should both be marked closed-by-retirement.
+
+Remaining fire-and-forget proposers (ACME, proof, config-mirror) sit
+in the re-derivable / self-healing class, not the
+externally-observable-effect class. The Option-B mechanism is in place
+everywhere effects can escape pre-commit.
 
 ## 5. Invariants — hold at every step
 
@@ -214,6 +251,60 @@ interleave. Phase 4 needs 3; Phase 5 needs 3+4.
 - **Done**: §4 table exact; baseline numbers recorded here; smoke set
   green on the starting branch.
 - **Rollback**: n/a (no code change).
+
+#### Phase 0 results — 2026-05-22, tree at `90e2847`
+
+§4 pointers refreshed in place. Migration state: idiom-1 and idiom-2
+fully on Option-B; idiom-3a (ACME) + idiom-3b (proof / config-mirror) intentional
+fire-and-forget in the self-healing class; SSE/`events.emit` retired —
+worklist #7 closed-by-retirement (not by reification).
+
+Gating smokes green on `90e2847` (ReleaseFast, all 3-node clusters
+self-spawned by the smokes):
+
+- `ctl_smoke.py` ✓
+- `leader_failover_smoke.py` ✓ (H2 reference)
+- `heldsync_smoke.py` ✓ (continuation reference)
+- `http_send_smoke.py` ✓
+- `streaming_smoke.py` ✓ + 10 streaming-family smokes: `streaming_kv_wake`,
+  `streaming_overflow`, `streaming_first_hop_writes`,
+  `streaming_disconnect_writes`, `streaming_heartbeat`,
+  `streaming_kv_wake_writes`, `streaming_write_pressure`,
+  `streaming_subscription_cron`, `streaming_subscription_boot`,
+  `streaming_subscription_kv` — all ✓
+- `fetch_chunk_smoke.py` ✓ + `fetch_streaming_smoke.py` ✓ + `pipe_smoke.py` ✓
+- `readonly_speculation_faultinj_smoke.py` ✓ (idiom-0 gate)
+- `cookie_auth_smoke.py` — referenced in §7 but **does not exist in
+  `scripts/`**; doc-stale (substitute: `oidc_smoke.py` covers the
+  auth surface). Update §7 when next editing.
+
+kv-bench baseline (3-node `kv_bench_cluster.sh` over `*.rewindjsapp.localhost`,
+2 runs averaged; ReleaseFast, `WORKERS=8`, 30k req/tenant, c=10, m=10):
+
+| Workload | Run 1 | Run 2 | Phase 0 baseline | Recent peak (reference) |
+|---|---|---|---|---|
+| hot (1 tenant, 1 key) | 45,531 | 46,284 | **~46k req/s** | n/a — write workload, not the ~100k readonly floor |
+| spread (1 tenant, 1000 keys) | 42,742 | 41,004 | **~42k req/s** | n/a |
+| sharded (8 tenants, write workload) | 145,598 | 134,443 | **~140k req/s** | ~162k (`project_perf_push_2026_05_21`) |
+
+Sharded is ~86–90% of the recent peak — within plausible h2load
+variance but on the lower side. Treat **`~140k 8w-sharded` as the
+Phase 0 baseline** for the §6 perf gate; Phase 1+ must stay above
+~135k (10% margin under the lower observed run). Compare to the
+recent peak per `feedback_regression_baseline_current_peak` if a
+single phase drops sharply.
+
+Speculative-chain telemetry sampled at the same runs: mean depth
+3.4–5.1, peak 10, `spec_commits` rate 0% — the chain stays short and
+no apply-time speculation kicked in for these workloads, so the
+baseline measures the dispatch-and-propose path, not the
+speculative-commit path.
+
+The hot/spread numbers (~46k / ~42k) are the *write* path; the
+~100k readonly floor from `project_kv_read_txn_per_op` is a separate
+workload not exercised by `kv_bench_cluster.sh`. Phase 3 (the
+reconciler — the dragon) should add a readonly-path measurement to
+the perf gate before any non-H2 registrant lands.
 
 ### Phase 1 — Reify the vocabulary
 
