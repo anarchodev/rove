@@ -52,7 +52,8 @@
       "id": "wb",
       "files": [
         {"path": "index.mjs", "source": "loop46-demo-tenants/wb/index.mjs"},
-        {"path": "bulk/index.mjs", "source": "loop46-demo-tenants/wb/bulk/index.mjs"}
+        {"path": "bulk/index.mjs", "source": "loop46-demo-tenants/wb/bulk/index.mjs"},
+        {"path": "drip/index.mjs", "source": "loop46-demo-tenants/wb/drip/index.mjs"}
       ]
     },
     {
