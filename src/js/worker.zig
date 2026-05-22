@@ -66,6 +66,7 @@ const continuation_mod = @import("bindings/continuation.zig");
 const Continuation = continuation_mod.Continuation;
 const stream_mod = @import("bindings/stream.zig");
 const components_mod = @import("components.zig");
+const effect_mod = @import("effect/root.zig");
 const globals = @import("globals.zig");
 const apply_mod = @import("apply.zig");
 const raft_propose = @import("raft_propose.zig");
@@ -2153,7 +2154,21 @@ pub fn Worker(comptime opts: Options) type {
         /// land in the next tick's snapshot without invalidating
         /// the current iteration). Replaces the Phase E v1 flat
         /// ArrayList — see `docs/subscriptions-plan.md` §10.
+        ///
+        /// Effect-reification Phase 2B: only the in-thread kv-react
+        /// site still writes here; cron + boot drains route through
+        /// `msg_queue` instead. Phase 2C migrates kv-react and this
+        /// collection goes away.
         subscription_fire_pending: SubFireColl,
+        /// Effect-reification Phase 2 ingress
+        /// (`docs/effect-algebra.md` §2.3; `effect-reification-plan.md`
+        /// Phase 2). One bounded queue per worker; per-origin
+        /// migration PRs route into it via `effect.enqueueMsg`. Phase
+        /// 2B drains the cross-thread `sub_fire_inbox` into this
+        /// queue (cron + boot); Phases 2C–2F migrate the rest. Once
+        /// all five origins are on it, `subscription_fire_pending` +
+        /// `fetch_event_pending` go away.
+        msg_queue: effect_mod.MsgQueue = undefined,
         /// Gap 2.1 Phase D: cross-thread inbox of pending fires
         /// from non-worker producers (`deployment_loader` for
         /// boot; future cron sweeper). `drainSubFireInbox` (called
@@ -2344,6 +2359,13 @@ pub fn Worker(comptime opts: Options) type {
                 .fetch_event_pending = try FetchEventColl.init(allocator),
                 .sub_fire_inbox = SubscriptionFireInbox.init(allocator),
                 .fetch_chunk_inbox = FetchChunkInbox.init(allocator),
+                // Effect-reification Phase 2 ingress. Cap chosen
+                // well above the typical per-tick fire rate (cron
+                // ≤ 1 Hz × N tenants; boot drains once per deploy);
+                // overflow surfaces `error.Full` + bumps
+                // `overflow_count` for the per-origin caller to
+                // log + drop (re-fire on next sweep).
+                .msg_queue = effect_mod.MsgQueue.init(allocator, 4096),
                 .dispatcher = try Dispatcher.init(allocator),
                 .node = config.node,
                 .raft = config.raft,
@@ -2540,6 +2562,11 @@ pub fn Worker(comptime opts: Options) type {
             // uniform across all three inboxes.
             self.node.unregisterFetchChunkInbox(&self.fetch_chunk_inbox);
             self.fetch_chunk_inbox.deinit();
+            // Effect-reification Phase 2: free any in-flight Msgs
+            // still buffered at shutdown. The MsgQueue's variant
+            // deinit-walk frees per-variant owned bytes (today only
+            // `SubscriptionFire`).
+            self.msg_queue.deinit();
             self.parked_continuations.deinit();
             self.subscription_fire_pending.deinit();
             self.parked_units.deinit();
@@ -6473,32 +6500,58 @@ pub fn enqueueSubscriptionFire(
 fn drainSubFireInbox(worker: anytype) void {
     const allocator = worker.allocator;
     var local: std.ArrayListUnmanaged(PendingFireMessage) = .empty;
-    defer {
-        for (local.items) |*m| m.deinit(allocator);
-        local.deinit(allocator);
-    }
+    defer local.deinit(allocator);
     worker.sub_fire_inbox.drainInto(&local) catch |err| {
         std.log.warn("rove-js sub-fire drain: {s}", .{@errorName(err)});
+        for (local.items) |*m| m.deinit(allocator);
         return;
     };
     if (local.items.len == 0) return;
-    const server = worker.h2;
+    // Effect-reification Phase 2B: route cross-thread fires through
+    // the unified MsgQueue ingress. The inbox-side message's owned
+    // strings MOVE onto the `effect.SubscriptionFire` payload — no
+    // re-dup. On `enqueueMsg` success the payload owns them and the
+    // queue's variant-deinit walk frees on shutdown / dispatch; on
+    // failure (queue full) we free locally and warn so the next
+    // sweep can re-fire (subscriptions are at-most-once and
+    // self-healing on the next tick).
     for (local.items) |*msg| {
-        const source: SubscriptionFireSource = switch (msg.source_kind) {
+        const source: effect_mod.msg.SubscriptionFire.Source = switch (msg.source_kind) {
             .cron => .{ .cron = .{ .fired_at_ns = msg.cron_fired_at_ns } },
-            .kv => .{ .kv = .{ .key = msg.kv_key, .op = msg.kv_op } },
+            .kv => blk: {
+                // Move the kv_key bytes onto the new payload (only
+                // .kv source carries an owned key); zero the
+                // source's slice so the post-loop deinit doesn't
+                // double-free.
+                const key = msg.kv_key;
+                msg.kv_key = &.{};
+                break :blk .{ .kv = .{ .key = key, .op = msg.kv_op } };
+            },
             .boot => .{ .boot = .{ .deployment_id = msg.boot_deployment_id } },
         };
-        enqueueSubscriptionFire(server.reg, &worker.subscription_fire_pending, allocator, .{
+        var payload: effect_mod.msg.SubscriptionFire = .{
             .tenant_id = msg.tenant_id,
             .subscription_name = msg.subscription_name,
             .module_path = msg.module_path,
             .source = source,
-        }) catch |err| std.log.warn(
-            "rove-js sub-fire drain enqueue (tenant={s}, sub={s}): {s}",
-            .{ msg.tenant_id, msg.subscription_name, @errorName(err) },
-        );
+        };
+        // Mark the source as consumed BEFORE enqueueMsg so the
+        // local-deinit loop below doesn't double-free.
+        msg.tenant_id = &.{};
+        msg.subscription_name = &.{};
+        msg.module_path = &.{};
+        effect_mod.enqueueMsg(&worker.msg_queue, .{ .subscription_fire = payload }) catch |err| {
+            std.log.warn(
+                "rove-js sub-fire enqueueMsg (tenant={s}, sub={s}): {s}",
+                .{ payload.tenant_id, payload.subscription_name, @errorName(err) },
+            );
+            payload.deinit(allocator);
+        };
     }
+    // Free any inbox-side fields not transferred (the .kv_key bytes
+    // when source_kind != .kv, plus any string slots we zeroed
+    // above — `deinit` short-circuits on empty slices).
+    for (local.items) |*m| m.deinit(allocator);
 }
 
 /// Worker-tick combined pass: translate cross-thread inbox
@@ -6513,23 +6566,71 @@ pub fn serviceSubscriptionFires(worker: anytype) void {
     dispatchSubscriptionFires(worker);
 }
 
-/// Worker-tick system: dispatch every entity in
-/// `subscription_fire_pending`. Iterates a stable entity-id snapshot
-/// (copied into a local buffer) so re-entrant `enqueueSubscriptionFire`
-/// calls during a fire land in the deferred-create queue and
-/// process next tick. `reg.destroy` is deferred too — component
-/// strings free structurally on `reg.flush`.
+/// Worker-tick system: dispatch every pending subscription fire from
+/// both the MsgQueue ingress (cron + boot post Phase 2B) and the
+/// `subscription_fire_pending` collection (kv-react still — Phase 2C
+/// migrates it). Per-tick cap (`BATCH`) bounds tail latency on the
+/// request hot path: a misbehaving handler with many fires pending
+/// eats at most `BATCH` activations per tick across BOTH paths.
 ///
-/// Per-tick cap (`BATCH`) bounds tail latency on the request hot
-/// path: a misbehaving handler with many fires pending eats at
-/// most `BATCH` activations per tick before yielding back to the
-/// h2 loop. Remaining fires drain on subsequent ticks.
+/// Collection path: iterates a stable entity-id snapshot copied into
+/// a local buffer so re-entrant `enqueueSubscriptionFire` calls
+/// during a fire land in the deferred-create queue and process next
+/// tick. `reg.destroy` is deferred too — component strings free
+/// structurally on `reg.flush`.
+///
+/// MsgQueue path: dequeue each `SubscriptionFire` variant, fire,
+/// then `deinit` its owned strings.
 pub fn dispatchSubscriptionFires(worker: anytype) void {
     const BATCH: usize = 64;
+    var fired: usize = 0;
+
+    // ── MsgQueue path (cron + boot drained from sub_fire_inbox via
+    //    drainSubFireInbox into `worker.msg_queue` as Phase 2B). ──
+    while (fired < BATCH) {
+        // Peek by index to avoid mid-pop deinit if we hit a
+        // non-SubscriptionFire variant we don't dispatch yet.
+        // Phase 2B-only invariant: msg_queue only ever carries
+        // SubscriptionFire (drainSubFireInbox is the lone enqueuer).
+        // Future phases (2C-2F) add per-variant dispatch arms here.
+        const msg = worker.msg_queue.dequeue() orelse break;
+        switch (msg) {
+            .subscription_fire => |sf_const| {
+                var sf = sf_const;
+                fireSubscriptionActivation(
+                    worker,
+                    sf.tenant_id,
+                    sf.subscription_name,
+                    sf.module_path,
+                    switch (sf.source) {
+                        .cron => |c| SubscriptionFireSource{ .cron = .{ .fired_at_ns = c.fired_at_ns } },
+                        .kv => |kv| SubscriptionFireSource{ .kv = .{ .key = kv.key, .op = kv.op } },
+                        .boot => |b| SubscriptionFireSource{ .boot = .{ .deployment_id = b.deployment_id } },
+                    },
+                );
+                sf.deinit(worker.allocator);
+                fired += 1;
+            },
+            else => {
+                // Pre-2D: no other variant should be in msg_queue
+                // yet. Log + drop to avoid silent retention on the
+                // queue. When subsequent phases add variants here,
+                // each gets a dedicated dispatch arm.
+                std.log.warn(
+                    "rove-js msg_queue: unexpected variant kind={s} pre-Phase-2D",
+                    .{@tagName(msg.kind())},
+                );
+            },
+        }
+    }
+
+    // ── Collection path (kv-react — Phase 2C migrates it). ──
+    const remaining = if (fired >= BATCH) 0 else BATCH - fired;
+    if (remaining == 0) return;
     const server = worker.h2;
     var buf: [BATCH]rove.Entity = undefined;
     const slice = worker.subscription_fire_pending.entitySlice();
-    const n = @min(slice.len, BATCH);
+    const n = @min(slice.len, remaining);
     if (n == 0) return;
     std.mem.copyForwards(rove.Entity, buf[0..n], slice[0..n]);
 
