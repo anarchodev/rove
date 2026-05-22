@@ -479,3 +479,339 @@ safety); capture mode addresses long-term storage cost
 cap operates during the activation; capture mode operates at
 activation boundary. v1 ships the cap; v2 adds capture mode when
 the storage bill earns the optionality.
+
+---
+
+## 7. Tape-by-reference for streamed bytes
+
+**The gap.** §6 records chunk bytes by sending them to blob and
+keeping the hash in the tape (~50 bytes/chunk). That works for
+Pattern A (`on_chunk`) — the bytes cross a handler activation, so
+there is an activation to hang a tape entry on. Pattern B
+(`pipe_to`) has no activation: upstream bytes are plumbed straight
+to the held client by the transport, the handler JS never sees
+them, and the chain is **structurally untaped** past the `pipe_to`
+Cmd ([[project_pipe_to_untaped]]). A replay reconstructs
+everything except the one thing the chain existed to do.
+
+**The mechanism.** Record a stream as a list of **extents** —
+`{hash, offset, length}` — instead of inline bytes; the tape holds
+the pointer, the bytes live in a content-addressed store, replay
+resolves the extents back. Crucially the recording happens at the
+**transport layer**, so `pipe_to` gets a tape without the handler
+touching a byte. This is §6's pattern lifted from per-activation
+to per-transport. The only real variable is *where the bytes
+already live*:
+
+- **Tier 1 — source is already a CAS (zero-copy).** A `pipe_to`
+  of a static asset out of `file-blobs/` streams bytes that are
+  already content-addressed and immutable. The tape records
+  `{existing-hash, range}` and copies nothing — the CAS doubles
+  as the tape's byte store. Genuinely free; closes the `pipe_to`
+  gap outright for static serves.
+- **Tier 2 — remote source, bytes cross an activation.** Pattern
+  A against a remote upstream. §6 already specs it (copy chunk to
+  blob, tape the hash). Unchanged.
+- **Tier 3 — remote source, no activation, or full-fidelity
+  demand.** The bytes exist nowhere durable; the tape cannot
+  reference them until we *make* them content-addressed
+  (hash-on-ingest). Not free — it relocates bytes from nowhere
+  into CAS. CAS is a defensible home (dedup across replays, the
+  page-encryption story, content-addressed-everything), but this
+  is relocation, not elimination.
+
+### 7.1 LLM stream tapes (Tier 3, opt-in)
+
+Proxying an LLM token stream is the worst Tier-3 case and the most
+valuable one at once. Worst: remote, large, long-lived SSE,
+nothing content-addressed at source. Most valuable: an LLM
+response is **non-reproducible by re-execution** — re-calling the
+API on replay costs money and returns different tokens (even
+providers that expose a `seed` parameter document it as
+best-effort and void it on any model-version change — there is
+no seed we could store and re-run). For a static asset you could
+re-fetch; for an LLM stream the tape is the
+*only* path to a faithful replay. Without it the chain is not
+expensive to replay, it is unreplayable.
+
+That asymmetry is the product argument: LLM-stream tapes are an
+**opt-in, plausibly billed** primitive — Tier 3 adds a CAS write
+to the streaming hot path, a real cost the customer elects for
+replay fidelity available no other way.
+
+**"Write to S3 before calling the handler" — per chunk, not per
+stream.** Buffering the whole response before the first activation
+destroys streaming: first-token latency becomes last-token
+latency, defeating the point of streaming an LLM. The faithful
+shape is **persist-before-observe at chunk grain** — each chunk
+lands in CAS before its `on_chunk` activation (Pattern A) or
+before it is forwarded to the held client (Pattern B).
+
+The hot-path cost is contained by computing the hash **locally**
+the instant the chunk is buffered (the tape records the hash at
+once) while the S3 PUT runs **async** in the background — the
+activation is never gated on the PUT. This mirrors rove's
+durability model: local KV commit is fast, raft replication is
+the async tail. Tape durability is gated on the flush completing,
+the way a write's durability is gated on raft commit.
+
+### 7.2 Caveats
+
+**Self-containment — losing it is not a regression.** The tape
+records each non-deterministic boundary input in its minimal
+reproducible form, and two forms exist:
+
+- *Generative* — a seed the runtime re-runs to recompute the
+  input (arenajs's deterministic PRNG init; a captured clock
+  read is the degenerate case). The bytes are stored nowhere,
+  the tape stays fully self-contained, total storage shrinks.
+- *Referential* — a `{hash, offset, length}` extent the runtime
+  *resolves* against a content-addressed store. The hash
+  addresses the bytes; it does not generate them, so they must
+  persist in CAS.
+
+An extent is referential. A tape carrying extents replays only
+while those blobs survive — self-containment is genuinely lost.
+But it is lost only for inputs that were never generative to
+begin with (an LLM stream, a remote fetch body): there is no
+self-contained option for non-reproducible external bytes. The
+choice is *inline in the tape* vs *in CAS + hash in tape*, and
+the latter is strictly better — dedup, plus retention as an axis
+separate from tape size. This is picking the better of two
+non-self-contained options, not regressing from a self-contained
+one.
+
+The one real obligation is the retention coupling: a blob
+referenced by a live tape must be pinned against GC. `rove-files`
+already does refcount-pinned snapshots (`TenantFilesSnapshot`),
+so this is a refcount edge, not new infrastructure. §6's
+per-chain budget bounds *pointer* bytes; blob retention is the
+separate axis §6 already named.
+
+**Chunk-boundary determinism splits by pattern.** Boundaries are
+network-timing-non-deterministic.
+
+- **Pattern B (`pipe_to`):** the handler never observes
+  boundaries, so a single whole-body `{hash, offset, length}`
+  extent replays faithfully however the network chunked it. The
+  cleanest tape is for the case that has none today.
+- **Pattern A (`on_chunk`):** the handler gets a Msg per chunk,
+  so the activation sequence depends on the boundaries. The tape
+  must also record the **boundary offset list** — still tiny (a
+  list of ints), but more than one extent.
+
+### 7.3 Recommendation, blast radius
+
+**Recommendation.** Adopt tape-by-reference as the recording
+shape for all streamed bytes; it subsumes §6's per-chunk blob
+pattern. Ship **Tier 1 first** (zero-copy extents for CAS-sourced
+`pipe_to` — closes the static-serve gap for no copy cost, pure
+transport-layer change), then **Tier 3 / LLM** behind a per-call
+opt-in flag with the local-hash / async-flush shape above. Tier 2
+needs no new work.
+
+**Blast radius.** Extent tape-entry type (`{hash, offset,
+length}` + optional boundary-offset list for Pattern A);
+transport-layer recording hook in the `pipe_to` path (no
+activation); refcount edge from live tape → blob; per-call opt-in
+flag + local-hash-then-async-flush staging buffer for Tier 3. The
+replay shell's "re-fetch from blob" affordance (§6) generalizes
+to "resolve extent from CAS." No Msg/Cmd surface change; no
+customer JS surface change beyond the Tier-3 flag.
+
+**Composability unlocked:** replayable `pipe_to` proxies,
+replayable static-asset streaming, and full-fidelity LLM-stream
+replay as an opt-in premium — the one streaming case where the
+tape is the sole path to determinism.
+
+---
+
+## 8. Minimal read set — drop writes and own-reads from the tape
+
+Where §7 minimizes the *bytes* of a taped input, §8 minimizes
+*which operations* are taped at all. The goal: the tape carries
+exactly the minimal read set needed to replay the handler.
+
+**Current state.** The `.kv` tape channel records every `kv.get`,
+`kv.set`, `kv.delete`, and `kv.prefix` (`src/tape/root.zig`
+`KvOp`; the `appendKv` call sites in `src/js/globals.zig`).
+Writes carry the written value inline; a `kv.get` of a key the
+same activation just wrote is recorded as a full `.get` entry.
+The tape is a complete linear transcript, not a minimal one —
+inherited from shift-js, where the extra entries fed a
+mutation-history view.
+
+**The principle.** Replay re-runs the handler; the tape only
+needs the inputs re-execution *cannot* reproduce. Two classes on
+the `.kv` channel are reproducible, hence redundant:
+
+- **Writes.** `kv.set` / `kv.delete` are *outputs*. Replay
+  re-issues them by re-running the handler; their values are a
+  pure function of the recorded reads + the pinned bytecode (the
+  `.module` channel's source hash). Nothing about a write is a
+  replay input.
+- **Own-reads.** A `kv.get(k)` where `k` is in the activation's
+  own writeset reads a value the activation itself produced —
+  reproducible the same way the write is, not a foreign input.
+
+What remains is the **minimal read set**: gets and prefix scans
+resolving to state *committed before the activation began*. That,
+plus the date / random / crypto / module channels, is the
+complete non-deterministic frontier.
+
+**Capture side.** The activation already accumulates its writeset
+for the raft envelope-0 (`TrackedTxn` + writeset). Gate the
+`.get` tape append on `key ∉ writeset`; drop the `.set` /
+`.delete` appends entirely. One predicate plus two deletions.
+
+**Replay side — the real cost.** Today replay walks the tape
+linearly: each `kv.get` consumes the next `.get` entry. With
+own-reads dropped, replay must model the writeset overlay
+*symmetrically* — re-run the handler, route its `kv.set` /
+`kv.delete` into a scratch overlay, resolve each `kv.get` against
+the overlay first and fall through to the next tape entry only
+when the key is absent. The smarts move from a dumb linear tape
+into the replay engine. Consistent with the model (replay already
+re-runs the handler), but this is the part that is not free.
+
+**The objection it survives — divergence detection.** Writes on
+the tape today let replay diff "did the handler write the same
+value?" That check is redundant: with the `.module` source hash
+pinned and every *read* channel diffable, a write can only
+diverge if a read diverged (caught) or the bytecode differs
+(caught). A diverging write is always a symptom of an upstream
+input or code mismatch — the real guarantee is complete
+input-channel coverage, not a stored output to compare against.
+
+**Wrinkle — `kv.prefix`.** A prefix scan's result is a merge of
+committed rows and the activation's own in-range writes. Truly
+minimal would record only the committed rows and let replay
+re-merge the overlay; that merge logic is fiddly. v1 minimizes
+`.get` only and keeps `.prefix` recording the full result list —
+follow-up, not v1 scope.
+
+**Blast radius.** Capture: one writeset-membership check on the
+`.get` path, remove `.set` / `.delete` appends. Replay: a
+writeset overlay in the replay engine + get-resolution order.
+Tape size drops — and §6's per-chain budget now counts a
+genuinely minimal set. The `KvOp.set` / `.delete` wire variants
+stay readable for old tapes but stop being written. No customer
+surface change.
+
+---
+
+## 9. Generative channels — record the seed, not the draws
+
+§7.2 split taped inputs into *generative* (a seed the runtime
+re-runs to recompute the input) and *referential* (a pointer
+resolved against a store). `math_random` is generative — but only
+if the PRNG is **bit-identical between the capture engine and the
+replay engine**. That precondition is now met.
+
+**Current state.** `Math.random` is already a rove override
+(`jsMathRandom`, `src/js/globals.zig`), not qjs's stock random.
+It draws from `state.prng` — a rove-owned `std.Random` PRNG
+seeded per request — and records *every draw* to the
+`math_random` channel as raw f64 bits (one `MathRandomEntry` per
+call). The seed and the PRNG already exist; the per-call
+recording is the redundant part.
+
+**The unlock.** The client replay engine runs rove's JS *host*
+compiled to WASM — arenajs plus the `globals.zig` overrides — so
+the same `jsMathRandom` and the same `state.prng` execute on
+replay. This matters precisely because `Math.random` is a rove
+override: a stock-arenajs replay would run a different PRNG and
+not match. `std.Random` PRNGs are pure integer arithmetic, and
+WASM's integer semantics are bit-identical to native; the
+integer→float scaling is strict IEEE-754 binary64, which WASM
+also mandates. So a draw is reproducible from the per-request
+seed alone.
+
+**The change.** Collapse `math_random` from O(draws) entries to
+**one** — the per-request `state.prng` seed. Replay re-seeds
+`state.prng` identically and re-runs; every draw reproduces
+bit-for-bit. §7.2's generative form, precondition satisfied.
+
+**Why it is safe.** Same argument as §8's writes: given pinned
+bytecode (`.module` source hash) and faithful other channels,
+control flow is identical, so `Math.random` is called the same
+number of times in the same order and the seed reproduces the
+exact sequence. A draw can only diverge if control flow diverged
+— which an upstream channel already catches. Per-draw recording
+buys no divergence coverage the seed does not.
+
+**The caveat — engine coupling.** Value-recording was robust
+against engine drift: a recorded value is the value regardless of
+who replays it. Seed-only is not — it assumes the PRNG algorithm
+is identical on both sides. Two things contain this: the PRNG is
+rove's *own* code, not a third-party black box, so rove controls
+whether it ever changes; and capture and replay ship in lockstep
+(server vX, client vX), so same-version is the normal path.
+Cross-version replay needs an engine/PRNG-version pin on the tape
+header (sibling to the `.module` source-hash pin) — replay warns
+or refuses on mismatch. A PRNG-algorithm change becomes a
+tape-format version bump.
+
+**`crypto.*` — same shape, check the security framing.**
+`crypto.getRandomValues` / `randomUUID` can move to seed-only on
+the same reasoning *if* rove's crypto RNG is a rove-controlled
+deterministic PRNG. The recorded seed then regenerates the
+"secure" bytes — but the `crypto_random` channel already stores
+those bytes directly, so the secret-in-tape exposure is unchanged
+and page-encryption-at-rest stays the mitigation. Follow-up,
+gated on confirming the crypto path is rove-owned and
+deterministic; `Math.random` is the v1 case.
+
+**Blast radius.** Capture: one seed entry at request start
+instead of per-draw appends. Replay: seed `state.prng` from the
+tape before running. Tape: `math_random` goes O(draws) → O(1);
+the per-draw `MathRandomEntry` wire variant stays readable for
+old tapes. Engine/PRNG-version field on the tape header.
+`Date.now` is unaffected — a clock read is genuinely external,
+not generative, and stays value-recorded.
+
+---
+
+## 10. The complete minimal tape
+
+§7–§9 converge on a closed result: every taped input is one of
+**four record kinds** — a minimal read set, a timestamp, a random
+seed, or (where bytes live in a content-addressed store) a
+`{address, offset, length}` extent. The five channels collapse
+onto them:
+
+| Channel | Today | Minimal form | Kind | Section |
+|---|---|---|---|---|
+| `kv` | every get/set/delete/prefix | foreign gets/prefixes only | read set | §8 |
+| `date` | every `Date.now` | timestamp value (i64) | timestamp | — |
+| `math_random` | every draw | one per-request seed | seed | §9 |
+| `crypto_random` | every draw, as bytes | one seed (security check pending) | seed | §9 |
+| `module` | specifier → bytecode hash | unchanged — already a hash | CAS extent | §7 |
+
+By the §7.2 mechanism axis: the read set and the timestamp are
+**direct values** — recorded inline, irreducibly; a clock read is
+neither generative nor referential, just a small external number.
+The seed is **generative** (re-run to recompute). The extent is
+**referential** (resolved against a store).
+
+Two consistencies close the loop:
+
+- **`module` was always a CAS reference.** It records a bytecode
+  *hash*, not the bytecode — an address with an implicit
+  whole-blob extent. §7 does not invent the CAS-reference pattern
+  for the tape; it generalizes the one the module channel has
+  used all along.
+- **Read set and CAS extent meet at the size threshold.** A small
+  kv read is recorded inline; a large one is recorded as an
+  extent (`connection-actor-plan.md` §8). Same input — the
+  threshold picks the form. The four kinds are not disjoint;
+  "extent" is what any oversized value-record becomes.
+
+The activation's own triggering Msg is recorded the same way — a
+direct value when small, an extent when large — so it is not a
+fifth kind.
+
+That is the whole tape. A minimal read set, timestamps, seeds,
+and CAS extents are the entire non-deterministic frontier;
+everything else a handler does — every write, every own-read,
+every computed value — is recomputed on replay.
