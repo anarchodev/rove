@@ -1,0 +1,356 @@
+# Effect reification plan
+
+> **Status**: planned, not started — 2026-05-22.
+> **Prerequisite reading**: `docs/effect-algebra.md` (the model this plan
+> reifies) and `docs/unified-effect-gating.md` (the Option-A/B framing —
+> this plan *is* the Option-A convergence).
+> **Hard prerequisite**: the `streaming-model` branch must be merged to
+> main first. Reification is a tree-wide refactor of the dispatch core;
+> running it concurrently with a major feature branch guarantees merge
+> conflict. Phase 0 (read-only inventory) can be done anytime; Phase 1+
+> starts post-merge.
+
+## 1. Goal
+
+Turn the four primitives of `effect-algebra.md` — the Model, the
+Continuation, Msg origins, Cmd runtimes — into four concrete code
+artifacts under `src/js/effect/`. After reification, a named effect
+(`http.send`, streaming, a subscription) is no longer a subsystem with
+its own park/wake/tape/gate code: it is a *declaration* — one `Cmd`
+union variant, one `Msg` union variant, and a transport. The
+six-question contract of `effect-algebra.md §4` becomes
+compiler-enforced: replay, backpressure, durability-gating and
+failure-discard are inherited from the primitives; only Cmd shape and
+Msg shape are declared, as tagged-union variants whose exhaustive
+`switch` the compiler will not let you leave unwired.
+
+## 2. Why now — what it fixes
+
+`effect-algebra.md §6` established that every divergence in the §5 audit
+has one root cause: the four primitives are not factored out, so each
+effect hand-rolls its slice and the copies drift. Reification is the
+single fix. Against the `effect-algebra.md §7` worklist:
+
+- **#1 (fetch-A chunk bytes untaped — a live replay-correctness bug)** —
+  becomes unconstructible: the only path a Msg can reach a handler is
+  `enqueueMsg`, which tapes. Fixed in Phase 2.
+- **#3 (uneven backpressure)** — the bound is a property of the one
+  `MsgQueue`; every origin inherits it. Fixed in Phase 2.
+- **#4 (cross-worker resume is an O(workers×parked) scan)** — the
+  Continuation primitive owns a wake-correlation index. Fixed in Phase 3.
+- **#5 (`cron_state` in a plain hashmap)** — becomes a Continuation /
+  collection naturally. Phase 6.
+- **#2 (streaming chunks ship pre-commit)** and **#7 (`events.emit` not
+  commit-gated)** — forced into the open: Phase 4 creates exactly one
+  Cmd-release point, so each becomes a one-line, documented decision
+  instead of an emergent accident.
+
+This is not cosmetic. #1 is a correctness bug today.
+
+## 3. Target shape
+
+### 3.1 Module layout
+
+```
+src/js/effect/
+  root.zig          re-exports
+  cmd.zig           the Cmd union + interpretCmd
+  msg.zig           the Msg union + MsgQueue + enqueueMsg
+  continuation.zig  the Continuation Row + reconcile (the reconciler)
+```
+
+The Model is **not** reified into this directory — it is already a
+singleton (the kvexp `Cluster`). Reification's only Model-side change:
+`kv_write` becomes an ordinary `Cmd` variant, and durable-intent
+(`http.send`'s `_send/owed` marker) becomes "a Cmd runtime that *emits a
+`kv_write` Cmd*" rather than a binding reaching into the txn directly.
+
+### 3.2 The two unions — the contract as types
+
+```zig
+// effect/cmd.zig
+pub const Cmd = union(enum) {
+    kv_write:   WriteSet,        // the Model-targeted Cmd
+    http_out:   HttpOut,         // send + fetch — durable? + disposition
+    emit:       EmitEvent,
+    respond:    ResponseChunk,   // response / stream output
+    conn_write: FrameOut,
+};
+
+// effect/msg.zig — consolidates today's log_mod.ActivationSource
+pub const Msg = union(enum) {
+    inbound_http:  Request,
+    cron, boot, disconnect,
+    kv_react:      KvReact,
+    send_callback: SendResult,
+    fetch_chunk:   FetchChunk,
+    fetch_done:    FetchDone,
+    inbound_frame: Frame,
+    body_chunk:    BodyChunk,
+};
+```
+
+The point is not the unions — it is that **every `switch` over them is
+exhaustive**. Adding an effect = adding a variant; the compiler then
+refuses to build until the variant is handled in the tape path, the
+interpret path, and the replay path. The contract stops being a doc you
+audit against.
+
+### 3.3 The Continuation + reconciler
+
+Generalizes the already-shipped `ParkedUnit` (`unified-effect-gating.md`
+Option B) into the universal primitive.
+
+```zig
+// effect/continuation.zig
+pub const Continuation = struct {
+    seq:         RaftSeq,      // the commit gate
+    txn:         *TrackedTxn,
+    buffered:    CmdBuffer,    // L4 — released only after seq commits
+    wake:        WakeKey,      // what Msg resumes this; also the index key
+    deadline_ns: i64,
+    pub fn deinit(c: *Continuation) void { ... }  // abandon-safe (L2)
+};
+
+/// One system, run each tick. `resume` is a comptime parameter:
+/// distinct resume behavior is a distinct collection (rove idiom —
+/// state is collection membership), not a stored function pointer.
+fn reconcile(comptime resume: ResumeFn, col: *Collection(Continuation)) void {
+    for (col.live()) |*c| {
+        if (committedSeq() >= c.seq) {
+            c.txn.commit();
+            interpretAll(c.buffered);   // L4 gate opens HERE
+            resume(c, .ok);
+        } else if (faulted(c.seq) or now() >= c.deadline_ns) {
+            c.txn.rollback();
+            c.buffered.discard();       // nothing escaped
+            resume(c, .fault);
+        }
+    }
+}
+```
+
+Because `Continuation.deinit` frees the txn and buffered Cmds, a
+`Collection.deinit` on crash *is* L2 ("safe to abandon") — enforced by
+rove's deinit discipline, not by hope (see memory
+`project_resource_owning_components`).
+
+### 3.4 The activation loop — every effect on one path
+
+```
+drain MsgQueue → for each Msg:
+    c   = continuationFor(msg.wake)        // lookup (indexed) or create
+    ctx = { model_snapshot, msg }
+    (writeset, cmds) = runHandler(c.resume_point, ctx)
+    c.seq      = propose(writeset)         // _send/owed markers ride inside
+    c.buffered = cmds                      // NOT released
+reconcile tick → commit ? interpret(cmds) + resume : discard + rollback
+```
+
+A released Cmd whose transport completes calls `enqueueMsg` — the loop
+closes on itself. This is `unified-effect-gating.md §4` Option A.
+
+## 4. Current state — the bespoke sites to collapse
+
+From the `effect-algebra.md §5` audit (2026-05-22). **Phase 0
+reconfirms exact `file:line`** — treat these as starting pointers.
+
+| Bespoke today | Reified into | Notes |
+|---|---|---|
+| handler Cmd-list (shipped, `project_handler_returns_cmds`) | `effect.Cmd` | already a list; Phase 1 consolidates the element type |
+| `log_mod.ActivationSource` enum (`worker.zig` ~5456, `log/root.zig` 60-94) | `effect.Msg` tag | already enumerates Msg kinds |
+| `ParkedUnit` + `parked_units` + `proposeForgetfulWrites` (`worker.zig` ~6247-6321) | `effect.Continuation` | Option-B mechanism — generalize, don't rebuild |
+| `pending_txns` + `RaftWait` + `drainRaftPending` (H2 path) | `reconcile` (the reference instance) | byte-identical first |
+| `raft_pending_response` / `_cont` / `_stream` (`worker.zig` ~2082-2099) | `Continuation` collections | the "three siblings" |
+| `parked_continuations`, `stream_data_out`, `stream_response_in` | `Continuation` collections | one Row, N collections by resume-disposition |
+| `subscription_fire_pending`, `fetch_event_pending` | one `MsgQueue` | |
+| `SubscriptionFireInbox`, `FetchChunkInbox` (cross-thread) | one `MsgQueue` ingress | |
+| `SendDispatch` + `InflightSet` (`send_dispatch.zig`, `send_inflight.zig`) | `http_out` transport only | park/gate/tape become shared |
+| `FetchPool` (`fetch_pool.zig`) | `http_out` transport only | `http.send` + `http.fetch` unify |
+| `cron_state` plain hashmap (`NodeState`, `worker.zig` ~1317-1327) | a collection | worklist #5 |
+
+What is already done and must be *reused, not rebuilt*: the handler
+returns a Cmd-list (`project_handler_returns_cmds`, shipped 2026-05-20);
+the `ParkedUnit` commit-gated reconciler mechanism (Option B). Phase 0
+must establish **how far the Option-B `ParkedUnit` migration got** —
+which proposers register units vs still fire-and-forget
+(`unified-effect-gating.md §5` idiom table is the checklist).
+
+## 5. Invariants — hold at every step
+
+1. **H2 is the reference.** The H2 request path's behavior stays
+   byte-identical until the generalized reconciler is proven to
+   reproduce it. Generalize with H2 behavior first, prove via smokes,
+   *then* add non-H2 registrants.
+2. **Gate effect *release*, never KV *visibility*.** The reconciler
+   gates externally-observable effects on commit. Local KV reads still
+   see the speculative overlay immediately (kvexp design). Conflating
+   the two was the Stage-5 apply-after-replicate mistake that was
+   reverted — see memory `project_kv_batched_dispatch`. Do not repeat it.
+3. **Determinism.** Every Msg is taped (L3). This is why reification is
+   correctness, not just cleanup.
+4. **No perf regression** vs the current peak (Phase 0 measures it;
+   reference points: ~162k req/s 8-worker sharded per
+   `project_perf_push_2026_05_21`, ~100k readonly floor per
+   `project_kv_read_txn_per_op`). Compare to the *recent peak*, never an
+   old baseline — memory `feedback_regression_baseline_current_peak`.
+5. **Every phase is independently shippable and reversible.** No phase
+   leaves the tree in a non-building or behavior-divergent state.
+
+## 6. Phases
+
+Each phase: **Goal / Steps / Gate / New tests / Done / Rollback.**
+Phases 2 and 3 are independent (Msg ingress vs Continuation) and may
+interleave. Phase 4 needs 3; Phase 5 needs 3+4.
+
+### Phase 0 — Inventory & baseline (read-only)
+
+- **Goal**: remove all unknowns before touching code.
+- **Steps**: fill §4's table with exact `file:line`; establish the
+  Option-B `ParkedUnit` migration state against `unified-effect-gating.md
+  §5`; run the gating smoke set (§7) and record green; run kv-bench (hot
+  single-tenant + 8w sharded) and record the baseline numbers *into this
+  doc*.
+- **Done**: §4 table exact; baseline numbers recorded here; smoke set
+  green on the starting branch.
+- **Rollback**: n/a (no code change).
+
+### Phase 1 — Reify the vocabulary
+
+- **Goal**: `effect.Cmd` and `effect.Msg` are the single source of truth
+  for the two vocabularies. No behavior change.
+- **Steps**: create `effect/cmd.zig`, `effect/msg.zig`; move the handler
+  Cmd-list element type to `effect.Cmd`; fold `ActivationSource` into
+  `effect.Msg`. Mechanical consolidation only.
+- **Gate**: `zig build test` + full smoke set green; behavior
+  byte-identical.
+- **New tests**: none (no behavior change) — but every `switch` over the
+  old enums must now be exhaustive over the union; the compiler enforces
+  the first slice of the contract here.
+- **Done**: both unions live; nothing behavioral changed.
+- **Rollback**: revert the two files (additive).
+
+### Phase 2 — Reify the Msg ingress
+
+- **Goal**: one `MsgQueue`; every Msg taped by construction; one bounded
+  ring gives every origin backpressure.
+- **Steps**: build `MsgQueue` + `enqueueMsg` (tapes unconditionally) +
+  the cross-thread ingress. Migrate origins **one PR each**, lowest
+  traffic first: cron/boot → kv-react → fetch-chunk → send-callback →
+  inbound-HTTP (last; it is the reference). Collapse
+  `SubscriptionFireInbox` + `FetchChunkInbox` into the one ingress.
+- **Gate**: per origin, the matching smokes (subscription smokes, fetch
+  smokes, `http_send` smokes, h2 smokes).
+- **New tests**: a fetch + `on_chunk` **replay-equivalence smoke** — the
+  regression gate proving worklist #1 fixed (a replayed fetch chain
+  produces an identical writeset + Cmd sequence).
+- **Done**: `subscription_fire_pending`, `fetch_event_pending`, and both
+  inboxes gone; every origin routes through `enqueueMsg`.
+- **Rollback**: per-origin PRs revert independently.
+
+### Phase 3 — Reify the Continuation + reconciler (the core)
+
+- **Goal**: one `Continuation` Row + one `reconcile` system replace the
+  ~7 hand-rolled park/wake/resume sites; a wake-correlation index
+  replaces the cross-worker scan.
+- **Steps**: generalize `ParkedUnit` into `effect.Continuation`.
+  Generalize `drainRaftPending` so the **H2 response path is
+  byte-identical** — prove via `leader_failover` + h2 + kv-bench smokes
+  and the perf gate. *Then* migrate non-H2 parked sites one PR each:
+  held-sync cont (`raft_pending_cont` / `parked_continuations`),
+  streaming (`raft_pending_stream` / `stream_*`), the rest. Add the
+  `WakeKey` index.
+- **Gate**: H2-reference PR — `leader_failover`, h2, kv-bench, perf gate.
+  Each site migration — its smoke (`heldsync_smoke` for the cont; the
+  streaming smokes for streaming) + perf gate.
+- **New tests**: a reconciler unit test per resume-disposition;
+  fault-injection on the generalized drain.
+- **Done**: one `Continuation` collection-family, one reconciler; the
+  bespoke parked sites and `pending_txns` gone; resume is O(1).
+- **Rollback**: each site PR reverts to its bespoke predecessor.
+
+### Phase 4 — Reify Cmd interpretation + the commit-gated buffer
+
+- **Goal**: one `interpretCmd`; every Cmd released through one
+  commit-gated path (L4).
+- **Steps**: implement `interpretCmd` (the exhaustive switch); move the
+  effect buffer onto the `Continuation`; the reconciler releases on
+  commit, discards on fault. **Force the open decisions**: worklist #2 —
+  decide and document in `streaming-model.md §2` whether chunk release
+  gates on commit; worklist #7 — `events.emit` becomes a buffered Cmd.
+- **Gate**: the SSE-escaped-effect fault test
+  (`unified-effect-gating.md` task 14), streaming smokes, `http_send`
+  smokes.
+- **Done**: no Cmd escapes except through the reconciler's commit gate.
+- **Rollback**: revert `interpretCmd`; per-Cmd-kind incrementality keeps
+  the blast radius small.
+
+### Phase 5 — Collapse the effects
+
+- **Goal**: each effect is a declaration, not a subsystem.
+- **Steps**: `SendDispatch` → libcurl transport only; `FetchPool` →
+  transport only; `http.send` + `http.fetch` unify into one
+  outbound-HTTP runtime parameterized by `durable?` + disposition. One
+  collapse per PR.
+- **Gate**: per PR, the effect's smokes + perf gate.
+- **Done**: no effect owns park / wake / tape / gate code.
+
+### Phase 6 — Cleanup tail
+
+- **Goal**: `effect-algebra.md §7` worklist empty.
+- **Steps**: delete `src/connection_holder/` dead scaffold; move
+  `cron_state` onto a collection (#5); resolve the boot double-fire
+  UNCLEAR (#6); rewrite `effect-algebra.md §5` audit + §6 to reflect the
+  reified state; update `CLAUDE.md` if dispatch wording drifted.
+- **Done**: audit re-run shows the reified state; worklist clear.
+
+## 7. Test & perf strategy
+
+Per memory `user_freeze_workflow`: reification modifies shipped,
+smoke-tested code — this is **test-first** work. Each phase: confirm the
+gating smoke pins current behavior, refactor, prove green.
+
+**Gating smoke set** (all must stay green every phase):
+`leader_failover_smoke.py`, `heldsync_smoke.py`, the `http_send` smokes,
+the streaming smokes, `ctl_smoke.py`, `cookie_auth_smoke.py`,
+`readonly_speculation_faultinj_smoke.py`.
+
+**Perf gate**: kv-bench hot single-tenant + 8w sharded, every phase that
+touches the dispatch path (3, 4, 5). Abort the phase on regression vs the
+Phase-0 baseline.
+
+## 8. Risks
+
+- **The dragon.** The reconciler generalizes the speculative-apply core
+  every H2 request depends on. Mitigation: H2-reference-first,
+  byte-identical, proven before any non-H2 registrant (Invariant 1).
+- **The Stage-5 precedent.** Apply-after-replicate regressed and was
+  reverted (`project_kv_batched_dispatch`). Reification must gate effect
+  *release*, not KV *visibility* (Invariant 2). If a phase needs to
+  change visibility timing to work, stop — the design is wrong.
+- **Merge collision with `streaming-model`.** Mitigated by the hard
+  prerequisite: do not start Phase 1 until that branch merges.
+
+## 9. Out of scope
+
+- Streaming inbound body (gap 2.4) and connection-actor WebSocket (gap
+  2.5) — NOT BUILT; reification does not build them, it makes them cheap
+  *declarations* once someone does.
+- No customer-observable behavior change, with two deliberate
+  exceptions, both correctness: fetch-A becomes replayable (#1), and the
+  streaming pre-commit semantics become explicit (#2).
+
+## 10. First session (cold start)
+
+You have just cleared context. To start:
+
+1. Read `docs/effect-algebra.md`, then this doc, then
+   `docs/unified-effect-gating.md §4–§5`.
+2. Confirm `streaming-model` is merged to main. If not — **stop**; only
+   Phase 0's read-only inventory may proceed.
+3. Execute **Phase 0**: fill the §4 table with exact `file:line`;
+   determine the Option-B `ParkedUnit` migration state; run the §7 smoke
+   set and kv-bench; record the baseline numbers and the inventory
+   *back into this doc* (§4 and a new "Phase 0 results" subsection).
+4. That inventory is the gate for starting Phase 1. Do not skip it —
+   the §4 pointers are from a 2026-05-22 audit and the tree moves.

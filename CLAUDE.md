@@ -8,7 +8,7 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 
 ## Product direction
 
-`rove` is the engine for **rewind.js**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via `http.send` / `events.emit` (with `webhook.send` / `email.send` / `retry.*` as JS libraries on top), page-level encryption at rest, etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. Sub-plans in `docs/` (`files-server-plan.md`, `logs-plan.md`, `sse-plan.md`, `notifications.md`, `snapshot-plan.md`, `http-send-plan.md`, `phase-5.5-rollout.md`, `sim-test-framework.md`, `fixture-lifecycle.md`, `agent-surface.md`, `observability-plan.md`, `replay-wasm-plan.md`, `dashboard-design-brief.md`, `auth-domain-plan.md`, `builtin-libs-docs-plan.md`, `users-lib-plan.md`, `connection-actor-plan.md`) elaborate specific PLAN sections. PLAN §13 is the live process / surface map.
+`rove` is the engine for **rewind.js**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via `http.send` / `events.emit` (with `webhook.send` / `email.send` / `retry.*` as JS libraries on top), page-level encryption at rest, etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. Sub-plans in `docs/` (`files-server-plan.md`, `logs-plan.md`, `sse-plan.md`, `notifications.md`, `snapshot-plan.md`, `http-send-plan.md`, `phase-5.5-rollout.md`, `sim-test-framework.md`, `fixture-lifecycle.md`, `agent-surface.md`, `observability-plan.md`, `replay-wasm-plan.md`, `dashboard-design-brief.md`, `auth-domain-plan.md`, `builtin-libs-docs-plan.md`, `users-lib-plan.md`, `connection-actor-plan.md`, `effect-algebra.md`) elaborate specific PLAN sections. `docs/effect-algebra.md` is the cross-cutting model — the four-primitive frame every external effect fits, plus the live effect audit. PLAN §13 is the live process / surface map.
 
 ## Build commands
 
@@ -89,23 +89,19 @@ Each JS request gets a fresh JS context via arenajs's dual-arena reset (one curs
 
 ### Data durability model
 
-Local KV writes commit immediately (releasing the lock fast), then a parallel Raft propose handles replication. On fault/timeout, a compensating rollback via undo log fires.
+Local KV writes land in a speculative volatile overlay (kvexp), then a parallel Raft propose handles replication. On quorum the overlay commits (`TrackedTxn.commit()`); on fault/timeout it rolls back (`TrackedTxn.rollback()`). A pre-quorum crash needs no undo log — the overlay is volatile, so it never reached disk.
 
 ### What replicates through raft
 
-Envelopes are typed byte blobs (`src/js/apply.zig`). Current shape (post-Phase-5.5, post-`http.send` cutover 2026-05-09):
+Envelopes are typed byte blobs (`src/js/apply.zig`). Only three types are live (post-Phase-5.5, post-`http.send` Option-(b) re-platform 2026-05-19):
 
 | Type | Target store | Producer |
 |---|---|---|
-| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker rides here too |
+| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker and `http.send`'s `_send/owed/{id}` + `_send/proof/{id}` markers ride here too |
+| `1` multi | per-inner-envelope target | Worker dispatcher — atomically bundles multiple writeset envelopes into one raft entry |
 | `2` root_writeset | `{data_dir}/__root__.db` | `provisionInstance` / admin `createInstance`'s `tenant.createInstance`; admin JS `platform.root.*`; ACME `cert/{host}` (auth-domain-plan §3.2) |
-| `7` multi | per-inner-envelope target | Worker dispatcher (rides envelope 0 + envelope 8/10 atomically) |
-| `8` schedule_upsert | `{data_dir}/schedules.db` (cluster-wide) | Worker dispatcher (`http.send`) |
-| `9` schedule_complete | `schedules.db` + `_callback/{id}` in tenant `app.db` | schedule-server thread (or worker-0 internal-schedule fast path) |
-| `10` schedule_cancel | `schedules.db` | Worker dispatcher (`http.cancel`) |
-| `11` schedule_demote | `schedules.db` | worker-0 internal-schedule phase when no node hosts the target |
 
-Types 1 (log_batch) and 3 (files_writeset) retired in Phase 5.5 (a) / (e) — log batches go S3-direct per `docs/logs-plan.md`; per-tenant deployment manifests live in a `deployments/` BlobBackend per `docs/files-server-plan.md`. Types 4/5/6 (the dedicated webhook envelopes that briefly shipped 2026-05-06) retired 2026-05-09 in commit `cf375bf` — `http.send` (envelopes 8/9/10/11) generalizes them. The decoder rejects retired types loudly so any old raft-log entry surfaces instead of silently mis-applying. See PLAN.md §10.2 for the full evolution table and §13 for the live process map.
+Retired type bytes — the decoder rejects each loudly, so any stale raft-log entry surfaces instead of silently mis-applying: `log_batch` (originally type 1) and `files_writeset` (3) in Phase 5.5 (a) / (e) — log batches go S3-direct per `docs/logs-plan.md`, per-tenant deployment manifests live in a `deployments/` BlobBackend per `docs/files-server-plan.md`; the dedicated webhook envelopes (4/5/6) on 2026-05-09; and `schedule_upsert/complete/cancel/demote` (8/9/10/11) on 2026-05-19 in the `http.send` Option-(b) re-platform — there is no `schedules.db` and no schedule-server thread, `http.send` now writes per-tenant `_send/owed/{id}` + `_send/proof/{id}` markers riding envelope 0, fired and resolved by the per-node leader-local `SendDispatch` (`docs/http-send-plan.md` §15). `multi` was renumbered from type 7 to type 1 to match `kv.cluster.ENVELOPE_TYPE_MULTI`. See `docs/effect-algebra.md` for how envelopes fit the effect model, PLAN.md §10.2 for the full evolution table, and §13 for the live process map.
 
 ### Blob replication (multi-node)
 
