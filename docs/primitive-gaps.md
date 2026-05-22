@@ -351,8 +351,15 @@ Recommended order, smallest-design-debt first:
 | 1 | 2.2 backpressure | S | medium | clean §9.4 story | **DONE 2026-05-20** |
 | 2 | 2.1 chain origins | M | high | crons, inboxes, reconcilers | **DONE 2026-05-20** — kv-react + boot + cron all shipped (see `docs/subscriptions-plan.md` §10) |
 | 3 | 2.3 streaming outbound (`http.fetch`) | L | high | LLM proxy, log tail | **DONE 2026-05-21** — reframed to `http.fetch`; see `docs/upstream-streaming-plan.md` |
-| 4 | 2.4 streaming inbound body | L | medium | uploads, duplex | pending — `docs/inbound-streaming-plan.md` |
-| 5 | 2.5 held outbound subscription | XL | high (federation) | atproto, WS-origin | pending |
+| 4 | 2.4 streaming inbound body | L | medium | uploads, duplex | pending — unified under `docs/streaming-model.md` |
+| 5 | 2.5 held outbound subscription | XL | high (federation) | atproto, WS-origin | pending — unified under `docs/streaming-model.md` |
+
+> **2.3 / 2.4 / 2.5 are one primitive.** The held chain processes a
+> stream of Msgs and emits a stream of Cmds; bytes ride as chunks;
+> "buffered" is the runtime coalescing that stream by default.
+> `docs/streaming-model.md` is the unifying model — 2.3 (shipped) is
+> a case of it, 2.4 / 2.5 are derived from it rather than designed
+> standalone.
 
 **Rationale for the order:**
 
