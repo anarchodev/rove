@@ -34,12 +34,16 @@
 
 pub const cmd = @import("cmd.zig");
 pub const msg = @import("msg.zig");
+pub const queue = @import("queue.zig");
 
 pub const Cmd = cmd.Cmd;
 pub const Msg = msg.Msg;
 pub const ActivationSource = msg.ActivationSource;
+pub const MsgQueue = queue.MsgQueue;
+pub const enqueueMsg = queue.enqueueMsg;
 
 test {
     _ = cmd;
     _ = msg;
+    _ = queue;
 }
