@@ -45,6 +45,7 @@
 const std = @import("std");
 
 pub const dispatcher = @import("dispatcher.zig");
+pub const effect = @import("effect/root.zig");
 pub const globals = @import("globals.zig");
 pub const worker = @import("worker.zig");
 pub const components = @import("components.zig");
@@ -101,6 +102,7 @@ pub const serviceFetchEvents = worker.serviceFetchEvents;
 
 test {
     _ = dispatcher;
+    _ = effect;
     _ = globals;
     _ = worker;
     _ = components;
