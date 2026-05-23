@@ -488,16 +488,38 @@ Revised 2026-05-22 in light of two prior decisions:
   (algebra §7 worklist #2) — the last open architectural item Phase
   4 owns. Code-side `interpretCmd` is deferred to a post-Phase-5
   Phase 4.X.
-- **Phase 4.0 (this PR's eventual shape)**: investigate the actual
-  streaming-pre-commit code paths. The §2 rule —
-  > A chunk reaches the wire only after the activation that
-  > produced it has committed.
-  — is what the model promises. The algebra audit flagged that
-  `proposeForgetfulWrites` + the resume path may violate this in
-  practice (the audit cites `streaming-model.md §7/§9.4` and the
-  resume path's writes-async pattern). The decision either fixes
-  the code or rewrites §2. **No "one rule with an exception" — pick
-  one.**
+- **Phase 4.0 — DECISION (shipped 2026-05-22):** fix the code.
+  Per [[feedback_model_simplicity_safety]]: the §2 rule IS the
+  model; the eager-ship code path in
+  `proposeForgetfulWrites`-from-resume violates it; we fix the
+  code, not the doc. `__rove_stream({eager_ship: true})` opt-in
+  reserved for customer demand. Latency cost (~one raft-cycle
+  per resume hop with writes) accepted.
+
+- **Phase 4.0.b — IMPLEMENTATION (pending):** wire the
+  commit-gating in `resumeStream`'s terminal+writes / cont+writes /
+  stream+writes arms. Approach sketch:
+  - Extend `worker.BufferedSendKvOps` (the ParkedUnit's buffered
+    type from Phase 3.1) with `staged_chunks: ArrayList([]u8)` +
+    `entity: ?rove.Entity` — the resume-hop's pending chunks +
+    the destination entity for transfer on commit.
+  - `proposeForgetfulWrites` gains an optional resume-context
+    parameter (entity + chunks) that gets parked on the unit.
+  - The `parked_units` sweep's commit arm transfers
+    `unit.buffered.staged_chunks` into the entity's
+    `StreamChunks` (h2 picks up from there).
+  - The fault arm discards `staged_chunks` via the existing
+    `BufferedSendKvOps.deinit` walk — no entity-side cleanup
+    needed.
+  - New fault-injection smoke
+    (`streaming_resume_fault_inj_smoke.py`) — patterned on
+    `readonly_speculation_faultinj_smoke.py`: freeze followers,
+    fire a resume hop with writes, verify the customer sees
+    NO chunk (vs today's pre-fix behavior where the chunk
+    leaks). Pair with the existing
+    `streaming_kv_wake_writes_smoke.py` happy-path gate.
+  - Update `worker.zig:5377-5380` comment + the streaming-model.md
+    §2 "implementation status" note when the gating lands.
 - **Phase 4.1 (post-Phase-5)**: implement `interpretCmd` as the
   exhaustive switch over the post-Phase-5 Cmd union (kv_write +
   unified outbound HTTP + respond + conn_write). Move the effect
