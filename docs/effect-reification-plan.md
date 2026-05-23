@@ -409,38 +409,107 @@ reference; then delete the bespoke arm.
 
 #### Phase 3.3 — migrate `raft_pending_cont` + `parked_continuations`
 
-Held-sync continuations. Smaller blast radius than 3.2 (the
-generalized reconciler is already proven). Gate: `heldsync_smoke`.
+**No-op as a separate sub-phase** (re-evaluated after 3.2.b). The
+3.2.b `drainEntityArm` helper already processes `raft_pending_cont`
+identically to the other H2 siblings — the migration goal (one
+Continuation drain for the three H2 sibs) is met. Held-sync
+continuations route into `parked_continuations` on the 3.2.b commit
+arm; resume happens via `resumeBoundContinuation` (a separate
+mechanism not part of the parked-seq drain). No further unification
+work required for Phase 3's "one Continuation runtime" claim.
 
 #### Phase 3.4 — migrate `raft_pending_stream` + `stream_*`
 
-Streaming. Largest existing surface for park/wake/resume. Gate:
-the 10 `streaming_*` smokes + perf gate.
+**Same no-op as 3.3.** `raft_pending_stream` is processed by
+`drainEntityArm` via the 3.2.b collapse. The stream lifecycle
+proper (`stream_data_out` → `stream_response_in` → h2 ship)
+operates after the entity leaves `raft_pending_stream` and is a
+distinct h2-owned state machine, not a parked-seq drain.
 
 #### Phase 3.5 — add the `WakeKey` index; delete the cross-worker scan
 
-`WakeKey` was declared in 3.0 but not indexed. This sub-phase wires
-the index — closes algebra §7 worklist #4 (resume is a scan, not a
-route). Gate: heldsync + connection-actor recipes (if built).
+**Deferred** (decision 2026-05-22). The current scan in
+`resumeBoundContinuation` (`worker.zig:4747`) is **worker-local**,
+not cross-worker — it iterates the worker's own
+`parked_continuations.entitySlice()`. Algebra worklist #4's
+"cross-worker scan" framing was aspirational against
+connection-actor's unbuilt cross-worker case; today's scan is
+bounded by per-worker in-flight held-sync count and not measured
+as hot. The index-maintenance discipline (every site that moves
+entities into / out of `parked_continuations` — including the
+`resumeContinuation` re-park path where `bound_schedule_id`
+changes mid-chain — must keep the index in sync, or stale entries
+silently break resume) is real cost.
 
-- **Rollback**: each sub-phase reverts independently to its
-  bespoke predecessor.
+Trigger conditions for picking 3.5 back up:
+1. Measurement shows the worker-local scan is hot under realistic
+   held-sync load.
+2. Connection-actor's cross-worker case lands and forces an
+   indexed route (its design will dictate the index shape).
+3. A new origin needs O(1) wake routing (e.g., the WebSocket
+   inbound frame path).
+
+The `WakeKey` type declared in Phase 3.0 stays — it's the
+vocabulary the eventual index uses. The `Continuation.wake_key`
+slot is unused at the migrated parked_units site; no harm.
+
+### Phase 3 status — substantially complete (2026-05-22)
+
+The algebra's structural goal — **one Continuation runtime** — is
+met for every active parked-seq path:
+
+- ParkedUnit instantiates `effect.Continuation` (3.1).
+- The three H2 sibling drains share `drainEntityArm` + classify
+  (3.2.a / 3.2.b).
+- `pending_txns` is encapsulated as `effect.SharedTxnPool` with a
+  documented sharing invariant (3.2.c).
+- 3.3 / 3.4 are met-by-coverage (the 3.2.b helper processes their
+  collections uniformly); the rest of the stream lifecycle is
+  h2-owned and not part of Phase 3's scope.
+- 3.5 deferred per above.
+
+Rollback for the substantially-complete set: each sub-phase
+commit reverts independently to its bespoke predecessor (Phase 3.0
+through 3.2.c).
 
 ### Phase 4 — Reify Cmd interpretation + the commit-gated buffer
 
-- **Goal**: one `interpretCmd`; every Cmd released through one
-  commit-gated path (L4).
-- **Steps**: implement `interpretCmd` (the exhaustive switch); move the
-  effect buffer onto the `Continuation`; the reconciler releases on
-  commit, discards on fault. **Force the open decisions**: worklist #2 —
-  decide and document in `streaming-model.md §2` whether chunk release
-  gates on commit; worklist #7 — `events.emit` becomes a buffered Cmd.
-- **Gate**: the SSE-escaped-effect fault test
-  (`unified-effect-gating.md` task 14), streaming smokes, `http_send`
-  smokes.
-- **Done**: no Cmd escapes except through the reconciler's commit gate.
-- **Rollback**: revert `interpretCmd`; per-Cmd-kind incrementality keeps
-  the blast radius small.
+Revised 2026-05-22 in light of two prior decisions:
+
+1. **`events.emit` retired.** Worklist #7 ("`events.emit` becomes a
+   buffered Cmd") is closed-by-retirement, not by reification.
+   `events.emit` doesn't exist as a Cmd variant.
+2. **`http.send` retiring in Phase 5** ([[project_durability_as_js_shim]]).
+   `effect.Cmd.http_out`'s shape is fluid until Phase 5 lands — wiring
+   `interpretCmd` for it now means rewiring it after Phase 5. Phase 5
+   first, then Phase 4's interpretCmd sees a stable surface.
+
+- **Goal (revised)**: force the streaming-pre-commit decision
+  (algebra §7 worklist #2) — the last open architectural item Phase
+  4 owns. Code-side `interpretCmd` is deferred to a post-Phase-5
+  Phase 4.X.
+- **Phase 4.0 (this PR's eventual shape)**: investigate the actual
+  streaming-pre-commit code paths. The §2 rule —
+  > A chunk reaches the wire only after the activation that
+  > produced it has committed.
+  — is what the model promises. The algebra audit flagged that
+  `proposeForgetfulWrites` + the resume path may violate this in
+  practice (the audit cites `streaming-model.md §7/§9.4` and the
+  resume path's writes-async pattern). The decision either fixes
+  the code or rewrites §2. **No "one rule with an exception" — pick
+  one.**
+- **Phase 4.1 (post-Phase-5)**: implement `interpretCmd` as the
+  exhaustive switch over the post-Phase-5 Cmd union (kv_write +
+  unified outbound HTTP + respond + conn_write). Move the effect
+  buffer onto Continuation; the reconciler releases on commit,
+  discards on fault.
+- **Gate**: streaming smokes (for 4.0's pre-commit decision);
+  `http_send` smokes + streaming smokes (for 4.1).
+- **Done**: streaming model says what the code does and vice versa;
+  no Cmd escapes except through the reconciler's commit gate (Phase
+  4.1).
+- **Rollback**: 4.0 is a doc + small code change per arm; 4.1 is
+  per-Cmd-kind incremental.
 
 ### Phase 5 — Retire `http.send`; durability becomes JS-shim composition
 
