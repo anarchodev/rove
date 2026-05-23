@@ -351,23 +351,80 @@ the perf gate before any non-H2 registrant lands.
 ### Phase 3 — Reify the Continuation + reconciler (the core)
 
 - **Goal**: one `Continuation` Row + one `reconcile` system replace the
-  ~7 hand-rolled park/wake/resume sites; a wake-correlation index
+  ~6 hand-rolled park/wake/resume sites (`fetch_event_pending` retired
+  in 2D, `subscription_fire_pending` in 2C); a wake-correlation index
   replaces the cross-worker scan.
-- **Steps**: generalize `ParkedUnit` into `effect.Continuation`.
-  Generalize `drainRaftPending` so the **H2 response path is
-  byte-identical** — prove via `leader_failover` + h2 + kv-bench smokes
-  and the perf gate. *Then* migrate non-H2 parked sites one PR each:
-  held-sync cont (`raft_pending_cont` / `parked_continuations`),
-  streaming (`raft_pending_stream` / `stream_*`), the rest. Add the
-  `WakeKey` index.
-- **Gate**: H2-reference PR — `leader_failover`, h2, kv-bench, perf gate.
-  Each site migration — its smoke (`heldsync_smoke` for the cont; the
-  streaming smokes for streaming) + perf gate.
-- **New tests**: a reconciler unit test per resume-disposition;
-  fault-injection on the generalized drain.
 - **Done**: one `Continuation` collection-family, one reconciler; the
   bespoke parked sites and `pending_txns` gone; resume is O(1).
-- **Rollback**: each site PR reverts to its bespoke predecessor.
+
+Phase 3 is "the dragon" — generalizing the speculative-apply core
+every H2 request rides. Broken into sub-phases so blast radius is
+bounded; **invariant 1** governs: H2 stays byte-identical until the
+generalized reconciler is proven to reproduce it.
+
+#### Phase 3.0 — vocabulary + sub-plan (this PR-shape)
+
+- Declare `effect.Continuation` (the generalized commit-gated unit) +
+  `Disposition` enum + `WakeKey` (the future O(1) wake-route index
+  key, declared but unindexed) + `reconcile` template.
+- Comptime-generic over txn / buffered types — no import of
+  `kv_mod` / `send_dispatch_mod` from the effect module (preserves
+  the leaf shape, dodges the cycle).
+- **No migration.** Pure type declarations, same pattern as Phase 1.
+- Gate: `zig build test` + smokes byte-identical.
+
+#### Phase 3.1 — migrate `parked_units` onto `Continuation`
+
+The easiest existing parked site to generalize because it's already
+commit-gated end to end (parkSendOps + parkKvWakes +
+proposeForgetfulWrites all use it). H2-path-untouched.
+
+- Convert `worker.ParkedUnit` into the concrete instantiation of
+  `effect.Continuation` (or wrap — whichever lets `send_dispatch_mod.
+  OwnedIntent` + `KvWakeOp` stay in `worker.zig`).
+- Extract the `drainRaftPending` parked_units sweep into a
+  `reconcile`-call against the generic.
+- Gate: `heldsync_smoke` + `http_send_smoke` + `streaming_*` +
+  `leader_failover` + perf gate (~135k 8w-sharded floor) +
+  readonly perf measurement (Phase 0 noted this — the dragon's
+  perf gate must include readonly; current kv-bench is write-only).
+- Rollback: revert the migration; ParkedUnit-as-is keeps working.
+
+#### Phase 3.2 — generalize `drainRaftPending` (the H2 reference)
+
+The dragon's spine. The H2 request path's
+`pending_txns + RaftWait + drainRaftPending` triad generalizes into
+the same reconcile primitive, **byte-identical**.
+
+- Map RaftWait → `Continuation.seq + deadline_ns`. pending_txns →
+  `Continuation.txn` (or its instantiation). drainRaftPending's
+  raft_pending_response sweep → reconcile-call.
+- Prove byte-identical via the full smoke set + perf gate.
+- Rollback: revert; the bespoke shape returns.
+
+This is the high-risk PR. Approach: build the generalized
+reconciler alongside the existing drainRaftPending arm (both run);
+prove the generalized one produces identical behavior on the H2
+reference; then delete the bespoke arm.
+
+#### Phase 3.3 — migrate `raft_pending_cont` + `parked_continuations`
+
+Held-sync continuations. Smaller blast radius than 3.2 (the
+generalized reconciler is already proven). Gate: `heldsync_smoke`.
+
+#### Phase 3.4 — migrate `raft_pending_stream` + `stream_*`
+
+Streaming. Largest existing surface for park/wake/resume. Gate:
+the 10 `streaming_*` smokes + perf gate.
+
+#### Phase 3.5 — add the `WakeKey` index; delete the cross-worker scan
+
+`WakeKey` was declared in 3.0 but not indexed. This sub-phase wires
+the index — closes algebra §7 worklist #4 (resume is a scan, not a
+route). Gate: heldsync + connection-actor recipes (if built).
+
+- **Rollback**: each sub-phase reverts independently to its
+  bespoke predecessor.
 
 ### Phase 4 — Reify Cmd interpretation + the commit-gated buffer
 
