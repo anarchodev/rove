@@ -3949,9 +3949,7 @@ fn drainResponsePending(
     worker: anytype,
     server: anytype,
     allocator: std.mem.Allocator,
-    committed: u64,
-    faulted: u64,
-    now_ns: i64,
+    wm: effect_mod.Watermarks,
 ) !void {
     const entities = worker.raft_pending_response.entitySlice();
     const waits = worker.raft_pending_response.column(RaftWait);
@@ -3962,42 +3960,41 @@ fn drainResponsePending(
         const wait = waits[i];
         const resp_body = resp_bodies[i];
 
-        if (committed >= wait.seq) {
-            if (worker.pending_txns.get(wait.seq)) |tracked| {
-                tracked.commit() catch |err| switch (err) {
-                    error.Conflict => continue,
-                    else => panic_mod.invariantViolated(
-                        "drainResponsePending.commit",
+        switch (effect_mod.classify(wait.seq, wait.deadline_ns, wm)) {
+            .pending => continue,
+            .commit => {
+                if (worker.pending_txns.get(wait.seq)) |tracked| {
+                    tracked.commit() catch |err| switch (err) {
+                        error.Conflict => continue,
+                        else => panic_mod.invariantViolated(
+                            "drainResponsePending.commit",
+                            "seq={d} err={s}",
+                            .{ wait.seq, @errorName(err) },
+                        ),
+                    };
+                    _ = worker.pending_txns.remove(wait.seq);
+                    allocator.destroy(tracked);
+                }
+                try server.reg.move(ent, &worker.raft_pending_response, &server.response_in);
+            },
+            .fault => {
+                if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
+                    kv.value.rollback() catch |err| panic_mod.invariantViolated(
+                        "drainResponsePending.rollback",
                         "seq={d} err={s}",
                         .{ wait.seq, @errorName(err) },
-                    ),
-                };
-                _ = worker.pending_txns.remove(wait.seq);
-                allocator.destroy(tracked);
-            }
-            try server.reg.move(ent, &worker.raft_pending_response, &server.response_in);
-            continue;
+                    );
+                    allocator.destroy(kv.value);
+                }
+
+                const old_body_ptr: ?[*]u8 = resp_body.data;
+                const old_body_len: u32 = resp_body.len;
+                try respb.overwrite503InPending(worker, &worker.raft_pending_response, ent, allocator);
+                if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+
+                try server.reg.move(ent, &worker.raft_pending_response, &server.response_in);
+            },
         }
-
-        const is_faulted = faulted > 0 and faulted >= wait.seq;
-        const is_timed_out = now_ns >= wait.deadline_ns;
-        if (!is_faulted and !is_timed_out) continue;
-
-        if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
-            kv.value.rollback() catch |err| panic_mod.invariantViolated(
-                "drainResponsePending.rollback",
-                "seq={d} err={s}",
-                .{ wait.seq, @errorName(err) },
-            );
-            allocator.destroy(kv.value);
-        }
-
-        const old_body_ptr: ?[*]u8 = resp_body.data;
-        const old_body_len: u32 = resp_body.len;
-        try respb.overwrite503InPending(worker, &worker.raft_pending_response, ent, allocator);
-        if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-
-        try server.reg.move(ent, &worker.raft_pending_response, &server.response_in);
     }
 }
 
@@ -4009,9 +4006,7 @@ fn drainContPending(
     worker: anytype,
     server: anytype,
     allocator: std.mem.Allocator,
-    committed: u64,
-    faulted: u64,
-    now_ns: i64,
+    wm: effect_mod.Watermarks,
 ) !void {
     const entities = worker.raft_pending_cont.entitySlice();
     const waits = worker.raft_pending_cont.column(RaftWait);
@@ -4022,50 +4017,49 @@ fn drainContPending(
         const wait = waits[i];
         const resp_body = resp_bodies[i];
 
-        if (committed >= wait.seq) {
-            if (worker.pending_txns.get(wait.seq)) |tracked| {
-                tracked.commit() catch |err| switch (err) {
-                    error.Conflict => continue,
-                    else => panic_mod.invariantViolated(
-                        "drainContPending.commit",
+        switch (effect_mod.classify(wait.seq, wait.deadline_ns, wm)) {
+            .pending => continue,
+            .commit => {
+                if (worker.pending_txns.get(wait.seq)) |tracked| {
+                    tracked.commit() catch |err| switch (err) {
+                        error.Conflict => continue,
+                        else => panic_mod.invariantViolated(
+                            "drainContPending.commit",
+                            "seq={d} err={s}",
+                            .{ wait.seq, @errorName(err) },
+                        ),
+                    };
+                    _ = worker.pending_txns.remove(wait.seq);
+                    allocator.destroy(tracked);
+                }
+                // Phase 5: the entity's collection (raft_pending_cont)
+                // IS the discriminant — straight to parked_continuations,
+                // no `ContDescriptor.cont != null` field check needed.
+                try server.reg.move(ent, &worker.raft_pending_cont, &worker.parked_continuations);
+            },
+            .fault => {
+                if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
+                    kv.value.rollback() catch |err| panic_mod.invariantViolated(
+                        "drainContPending.rollback",
                         "seq={d} err={s}",
                         .{ wait.seq, @errorName(err) },
-                    ),
-                };
-                _ = worker.pending_txns.remove(wait.seq);
-                allocator.destroy(tracked);
-            }
-            // Phase 5: the entity's collection (raft_pending_cont)
-            // IS the discriminant — straight to parked_continuations,
-            // no `ContDescriptor.cont != null` field check needed.
-            try server.reg.move(ent, &worker.raft_pending_cont, &worker.parked_continuations);
-            continue;
+                    );
+                    allocator.destroy(kv.value);
+                }
+
+                // Trampoline: open hop's commit faulted/timed out → cannot
+                // hold. The on-entity ContDescriptor deinits structurally
+                // when cleanupResponses destroys the entity — no manual
+                // cleanup site needed (Phase 7).
+
+                const old_body_ptr: ?[*]u8 = resp_body.data;
+                const old_body_len: u32 = resp_body.len;
+                try respb.overwrite503InPending(worker, &worker.raft_pending_cont, ent, allocator);
+                if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+
+                try server.reg.move(ent, &worker.raft_pending_cont, &server.response_in);
+            },
         }
-
-        const is_faulted = faulted > 0 and faulted >= wait.seq;
-        const is_timed_out = now_ns >= wait.deadline_ns;
-        if (!is_faulted and !is_timed_out) continue;
-
-        if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
-            kv.value.rollback() catch |err| panic_mod.invariantViolated(
-                "drainContPending.rollback",
-                "seq={d} err={s}",
-                .{ wait.seq, @errorName(err) },
-            );
-            allocator.destroy(kv.value);
-        }
-
-        // Trampoline: open hop's commit faulted/timed out → cannot
-        // hold. The on-entity ContDescriptor deinits structurally
-        // when cleanupResponses destroys the entity — no manual
-        // cleanup site needed (Phase 7).
-
-        const old_body_ptr: ?[*]u8 = resp_body.data;
-        const old_body_len: u32 = resp_body.len;
-        try respb.overwrite503InPending(worker, &worker.raft_pending_cont, ent, allocator);
-        if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-
-        try server.reg.move(ent, &worker.raft_pending_cont, &server.response_in);
     }
 }
 
@@ -4077,9 +4071,7 @@ fn drainStreamPending(
     worker: anytype,
     server: anytype,
     allocator: std.mem.Allocator,
-    committed: u64,
-    faulted: u64,
-    now_ns: i64,
+    wm: effect_mod.Watermarks,
 ) !void {
     const entities = worker.raft_pending_stream.entitySlice();
     const waits = worker.raft_pending_stream.column(RaftWait);
@@ -4090,50 +4082,49 @@ fn drainStreamPending(
         const wait = waits[i];
         const resp_body = resp_bodies[i];
 
-        if (committed >= wait.seq) {
-            if (worker.pending_txns.get(wait.seq)) |tracked| {
-                tracked.commit() catch |err| switch (err) {
-                    error.Conflict => continue,
-                    else => panic_mod.invariantViolated(
-                        "drainStreamPending.commit",
+        switch (effect_mod.classify(wait.seq, wait.deadline_ns, wm)) {
+            .pending => continue,
+            .commit => {
+                if (worker.pending_txns.get(wait.seq)) |tracked| {
+                    tracked.commit() catch |err| switch (err) {
+                        error.Conflict => continue,
+                        else => panic_mod.invariantViolated(
+                            "drainStreamPending.commit",
+                            "seq={d} err={s}",
+                            .{ wait.seq, @errorName(err) },
+                        ),
+                    };
+                    _ = worker.pending_txns.remove(wait.seq);
+                    allocator.destroy(tracked);
+                }
+                // Phase 7: stream components were populated in
+                // `streamRecordIfAnyAt` BEFORE the entity entered
+                // raft_pending_stream — they ride the entity here via
+                // merged_request_row. Just move to stream_response_in;
+                // h2 picks the entity up from there.
+                try server.reg.move(ent, &worker.raft_pending_stream, &server.stream_response_in);
+            },
+            .fault => {
+                if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
+                    kv.value.rollback() catch |err| panic_mod.invariantViolated(
+                        "drainStreamPending.rollback",
                         "seq={d} err={s}",
                         .{ wait.seq, @errorName(err) },
-                    ),
-                };
-                _ = worker.pending_txns.remove(wait.seq);
-                allocator.destroy(tracked);
-            }
-            // Phase 7: stream components were populated in
-            // `streamRecordIfAnyAt` BEFORE the entity entered
-            // raft_pending_stream — they ride the entity here via
-            // merged_request_row. Just move to stream_response_in;
-            // h2 picks the entity up from there.
-            try server.reg.move(ent, &worker.raft_pending_stream, &server.stream_response_in);
-            continue;
+                    );
+                    allocator.destroy(kv.value);
+                }
+
+                // Phase 7: stream components on the entity reap structurally
+                // when cleanupResponses destroys it; no side-table cleanup.
+
+                const old_body_ptr: ?[*]u8 = resp_body.data;
+                const old_body_len: u32 = resp_body.len;
+                try respb.overwrite503InPending(worker, &worker.raft_pending_stream, ent, allocator);
+                if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+
+                try server.reg.move(ent, &worker.raft_pending_stream, &server.response_in);
+            },
         }
-
-        const is_faulted = faulted > 0 and faulted >= wait.seq;
-        const is_timed_out = now_ns >= wait.deadline_ns;
-        if (!is_faulted and !is_timed_out) continue;
-
-        if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
-            kv.value.rollback() catch |err| panic_mod.invariantViolated(
-                "drainStreamPending.rollback",
-                "seq={d} err={s}",
-                .{ wait.seq, @errorName(err) },
-            );
-            allocator.destroy(kv.value);
-        }
-
-        // Phase 7: stream components on the entity reap structurally
-        // when cleanupResponses destroys it; no side-table cleanup.
-
-        const old_body_ptr: ?[*]u8 = resp_body.data;
-        const old_body_len: u32 = resp_body.len;
-        try respb.overwrite503InPending(worker, &worker.raft_pending_stream, ent, allocator);
-        if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-
-        try server.reg.move(ent, &worker.raft_pending_stream, &server.response_in);
     }
 }
 
@@ -4141,9 +4132,17 @@ pub fn drainRaftPending(worker: anytype) !void {
     const server = worker.h2;
     const allocator = worker.allocator;
 
-    const committed = worker.raft.committedSeq();
-    const faulted = worker.raft.faultedSeq();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    // Effect-reification Phase 3.2.a: one snapshot per tick, shared
+    // across every parked-seq sweep below. The four arms
+    // (raft_pending_response / _cont / _stream + parked_units) all
+    // classify against this same Watermarks via `effect.classify`,
+    // so commit / fault / timeout decisions are byte-identical
+    // across arms by construction.
+    const wm: effect_mod.Watermarks = .{
+        .committed = worker.raft.committedSeq(),
+        .faulted = worker.raft.faultedSeq(),
+        .now_ns = @intCast(std.time.nanoTimestamp()),
+    };
 
     // Handler-cmds Phase 5: raft_pending is THREE sibling collections.
     // Each entity is parked on the sibling matching its commit
@@ -4154,16 +4153,13 @@ pub fn drainRaftPending(worker: anytype) !void {
     // queue moves. Forward-iter preserves per-tenant chain order
     // (entities enter the siblings in propose-seq order from
     // finalizeBatch).
-    try drainResponsePending(worker, server, allocator, committed, faulted, now_ns);
-    try drainContPending(worker, server, allocator, committed, faulted, now_ns);
-    try drainStreamPending(worker, server, allocator, committed, faulted, now_ns);
+    try drainResponsePending(worker, server, allocator, wm);
+    try drainContPending(worker, server, allocator, wm);
+    try drainStreamPending(worker, server, allocator, wm);
 
     // ── Additive: non-entity parked units (idiom-1 SSE-emit gating,
     //    docs/unified-effect-gating.md). The H2 entity path above is
-    //    untouched — H2 behaviour is byte-identical. Release buffered
-    //    emits at commit; discard on fault/timeout (the effect never
-    //    escaped — same posture as the entity 503 path). Reuses the
-    //    `committed`/`faulted`/`now_ns` watermarks computed above.
+    //    untouched — H2 behaviour is byte-identical.
     //
     // Iterates a snapshot of entity ids so that re-entrant park-*
     // calls (e.g. via firePendingKvWakes → kv-react fire path) that
@@ -4178,51 +4174,52 @@ pub fn drainRaftPending(worker: anytype) !void {
         std.mem.copyForwards(rove.Entity, buf[0..n], slice[0..n]);
         for (buf[0..n]) |ent| {
             const unit = server.reg.get(ent, &worker.parked_units, ParkedUnit) catch continue;
-            if (committed >= unit.seq) {
-                // Phase 4c: forgetful-writes units carry their own
-                // `TrackedTxn` (no entity in raft_pending waiting on
-                // this seq — see `proposeForgetfulWrites`). Commit
-                // it here; the firePending* helpers run alongside,
-                // same post-commit firing order as the entity-backed
-                // path. Null `txn` after commit so ParkedUnit.deinit
-                // doesn't try to rollback on destroy.
-                if (unit.txn) |t| {
-                    t.commit() catch |cerr| panic_mod.invariantViolated(
-                        "drainRaftPending.parked_units.commit",
-                        "seq={d} tenant={s} err={s}",
-                        .{ unit.seq, unit.tenant_id, @errorName(cerr) },
+            switch (effect_mod.classify(unit.seq, unit.deadline_ns, wm)) {
+                .pending => continue,
+                .commit => {
+                    // Phase 4c: forgetful-writes units carry their own
+                    // `TrackedTxn` (no entity in raft_pending waiting on
+                    // this seq — see `proposeForgetfulWrites`). Commit
+                    // it here; the firePending* helpers run alongside,
+                    // same post-commit firing order as the entity-backed
+                    // path. Null `txn` after commit so ParkedUnit.deinit
+                    // doesn't try to rollback on destroy.
+                    if (unit.txn) |t| {
+                        t.commit() catch |cerr| panic_mod.invariantViolated(
+                            "drainRaftPending.parked_units.commit",
+                            "seq={d} tenant={s} err={s}",
+                            .{ unit.seq, unit.tenant_id, @errorName(cerr) },
+                        );
+                        allocator.destroy(t);
+                        unit.txn = null;
+                    }
+                    firePendingSendOps(worker, unit);
+                    firePendingKvWakes(worker, unit);
+                    server.reg.destroy(ent) catch |err| std.log.warn(
+                        "rove-js parked_units commit destroy: {s}",
+                        .{@errorName(err)},
                     );
-                    allocator.destroy(t);
-                    unit.txn = null;
-                }
-                firePendingSendOps(worker, unit);
-                firePendingKvWakes(worker, unit);
-                server.reg.destroy(ent) catch |err| std.log.warn(
-                    "rove-js parked_units commit destroy: {s}",
-                    .{@errorName(err)},
-                );
-                continue;
-            }
-            if ((faulted > 0 and faulted >= unit.seq) or now_ns >= unit.deadline_ns) {
-                // Phase 4c: rollback the attached txn before
-                // discarding. `ParkedUnit.deinit` is the structural
-                // safety net (shutdown path); doing it here keeps
-                // the fault/timeout discard ordering symmetric with
-                // commit's destroy-then-clear pattern.
-                if (unit.txn) |t| {
-                    t.rollback() catch |rerr| std.log.warn(
-                        "rove-js drainRaftPending.parked_units.rollback seq={d} tenant={s}: {s}",
-                        .{ unit.seq, unit.tenant_id, @errorName(rerr) },
+                },
+                .fault => {
+                    // Phase 4c: rollback the attached txn before
+                    // discarding. `ParkedUnit.deinit` is the structural
+                    // safety net (shutdown path); doing it here keeps
+                    // the fault/timeout discard ordering symmetric with
+                    // commit's destroy-then-clear pattern.
+                    if (unit.txn) |t| {
+                        t.rollback() catch |rerr| std.log.warn(
+                            "rove-js drainRaftPending.parked_units.rollback seq={d} tenant={s}: {s}",
+                            .{ unit.seq, unit.tenant_id, @errorName(rerr) },
+                        );
+                        allocator.destroy(t);
+                        unit.txn = null;
+                    }
+                    server.reg.destroy(ent) catch |err| std.log.warn(
+                        "rove-js parked_units fault destroy: {s}",
+                        .{@errorName(err)},
                     );
-                    allocator.destroy(t);
-                    unit.txn = null;
-                }
-                server.reg.destroy(ent) catch |err| std.log.warn(
-                    "rove-js parked_units fault destroy: {s}",
-                    .{@errorName(err)},
-                );
+                },
             }
-            // else: still awaiting commit; leave in collection for next tick.
         }
     }
 

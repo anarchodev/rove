@@ -53,6 +53,9 @@ pub const freeOwnedMsg = queue.freeOwnedMsg;
 pub const Continuation = continuation.Continuation;
 pub const Disposition = continuation.Disposition;
 pub const WakeKey = continuation.WakeKey;
+pub const Watermarks = continuation.Watermarks;
+pub const SweepClass = continuation.SweepClass;
+pub const classify = continuation.classify;
 
 test {
     _ = cmd;
