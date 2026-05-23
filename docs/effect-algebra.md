@@ -282,11 +282,18 @@ plan is the systematic way to clear this list.
    bug; `fireFetchEventActivation` passes empty `TapePayloads`.
    Content-address past a threshold (`primitive-gaps.md` §6, also
    NOT BUILT). Fixed by reification Phase 2D.
-2. **Resolve the streaming pre-commit invariant** — `streaming-model.md`
-   §2 bills "a chunk ships only after its activation commits" as *the one
-   rule*, but §7/§9.4 and the resume path (`proposeForgetfulWrites`) ship
-   chunks pre-commit. Fix the code or rewrite §2; it is not "one rule"
-   with an exception.
+2. **Resolve the streaming pre-commit invariant** — **DECIDED
+   2026-05-22: fix the code.** The §2 rule
+   ("chunk reaches the wire only after the activation that produced
+   it has committed") IS the model. The pre-commit-ship path in
+   `proposeForgetfulWrites` (`worker.zig:5377-5380` + sibling sites)
+   is removed in `effect-reification-plan.md` Phase 4.0.b: resume-hop
+   chunks stage on the entity until the writeset commits, then move
+   into `StreamChunks` for h2 to ship. Per
+   [[feedback_model_simplicity_safety]]: ship one safe semantic;
+   `__rove_stream({eager_ship: true})` reserved for real customer
+   demand. Latency cost ≈ one raft-cycle (~ms) per resume hop with
+   writes — accepted.
 3. **Adopt the streaming backpressure template** across outbound HTTP
    (`fetch_pending`), the `WriteSet`, and kv-react — three unbounded
    queues. (Down from four: `http.send` retires per §6 rule 2.)
