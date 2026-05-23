@@ -346,6 +346,9 @@ fn writeTapePayloads(
     try writeBytesField(allocator, w, "request_body_b64", t.request_body_bytes, false);
     try w.writeAll(",\"request_body_truncated\":");
     try w.writeAll(if (t.request_body_truncated) "true" else "false");
+    try writeBytesField(allocator, w, "activation_bytes_b64", t.activation_bytes, false);
+    try w.writeAll(",\"activation_bytes_truncated\":");
+    try w.writeAll(if (t.activation_bytes_truncated) "true" else "false");
     // Response body is intentionally NOT serialized — replay
     // re-produces it deterministically; storing it would just
     // bloat every S3 batch PUT.
