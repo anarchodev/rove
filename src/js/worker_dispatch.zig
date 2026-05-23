@@ -565,7 +565,7 @@ fn finalizeBatch(
             // on the right raft-pending sibling. Phase 5: the entity's
             // collection encodes its commit destination (no
             // discriminator field check in drainRaftPending).
-            try worker.pending_txns.put(allocator, seq, txn);
+            try worker.pending_txns.park(allocator, seq, txn);
             const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
             for (successes.items) |*s| {
                 const is_stream = s.stream != null;
@@ -682,7 +682,7 @@ fn finalizeBatch(
     // Propose succeeded: park the txn on the worker's pending map
     // keyed by raft seq. drainRaftPending commits it once raft
     // confirms (forward iteration, so chain head commits first).
-    try worker.pending_txns.put(allocator, seq, txn);
+    try worker.pending_txns.park(allocator, seq, txn);
 
     // Observe writeset-size for `/_system/metrics`. Pair with
     // `raft_proposal_batch_size_writesets` (leader-side) to see how
