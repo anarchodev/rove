@@ -52,6 +52,51 @@ const msg_mod = @import("msg.zig");
 /// `fault` = quorum lost, timeout, or leadership loss before commit.
 pub const Disposition = enum { ok, fault };
 
+/// The three watermarks every parked-seq sweep consults each tick.
+/// Computed once per `drainRaftPending` pass and reused across every
+/// arm (the four drain sites — `raft_pending_response` / `_cont` /
+/// `_stream` + `parked_units` — all see the same snapshot).
+pub const Watermarks = struct {
+    /// Highest raft seq that has reached durable commit on this node
+    /// (`RaftNode.committedSeq()`).
+    committed: u64,
+    /// Highest raft seq that has been declared faulted (leader lost
+    /// quorum / leadership). `0` means "no fault" — production
+    /// systems don't write seq 0, so `faulted > 0 and faulted >= seq`
+    /// is the live check.
+    faulted: u64,
+    /// Wall-clock monotonic ns; `>= deadline_ns` means the unit timed
+    /// out waiting for commit and should be discarded.
+    now_ns: i64,
+};
+
+/// Three-way per-unit classification for a parked-seq sweep.
+/// Distinct from `Disposition` (the two-way resume discriminant)
+/// because `.pending` is a real outcome at sweep time — the unit
+/// hasn't committed yet and isn't faulted; leave it in place.
+pub const SweepClass = enum { commit, fault, pending };
+
+/// Per-unit classification — pure function of the unit's `seq` /
+/// `deadline_ns` and the tick's `Watermarks`. Each drain arm calls
+/// this at the top of every iteration; the returned class names
+/// the arm action the caller takes (`.commit` → release buffered
+/// Cmds + move to next state; `.fault` → discard buffered +
+/// downgrade; `.pending` → skip this iteration).
+///
+/// Effect-reification Phase 3.2.a: extracts the previously-duplicated
+/// predicate from `drainResponsePending` / `drainContPending` /
+/// `drainStreamPending` + the `parked_units` sweep. The four sites
+/// computed identical logic in four places; a single classifier
+/// guarantees future divergence is a compile error rather than a
+/// drift bug.
+pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
+    if (w.committed >= seq) return .commit;
+    const is_faulted = w.faulted > 0 and w.faulted >= seq;
+    const is_timed_out = w.now_ns >= deadline_ns;
+    if (is_faulted or is_timed_out) return .fault;
+    return .pending;
+}
+
 /// The Msg / route key a Continuation parks on (Phase 3.5 — the
 /// O(1) wake-correlation index). Today's resume is a cross-worker
 /// scan (`docs/effect-algebra.md` §7 worklist #4). The indexed
@@ -247,6 +292,44 @@ test "Continuation: typed instantiation + deinit walks structurally" {
     try testing.expectEqual(@as(u32, 1), rollbacks_called);
     try testing.expect(items[0].txn == null);
     try testing.expect(items[0].tenant_id.len == 0);
+}
+
+test "classify: commit / fault / timeout / pending outcomes" {
+    const testing = std.testing;
+
+    // committed >= seq → commit (wins even if also timed out).
+    try testing.expectEqual(SweepClass.commit, classify(7, 1, .{
+        .committed = 10, .faulted = 0, .now_ns = 1000,
+    }));
+    try testing.expectEqual(SweepClass.commit, classify(7, 1, .{
+        // Edge: now > deadline AND committed >= seq → commit still
+        // wins. The order matches today's drainRaftPending body.
+        .committed = 7, .faulted = 0, .now_ns = 9999,
+    }));
+
+    // faulted (>= seq, faulted>0) → fault.
+    try testing.expectEqual(SweepClass.fault, classify(7, 1000, .{
+        .committed = 5, .faulted = 8, .now_ns = 0,
+    }));
+    // faulted == seq → fault (boundary).
+    try testing.expectEqual(SweepClass.fault, classify(7, 1000, .{
+        .committed = 5, .faulted = 7, .now_ns = 0,
+    }));
+
+    // timed-out → fault.
+    try testing.expectEqual(SweepClass.fault, classify(7, 100, .{
+        .committed = 5, .faulted = 0, .now_ns = 150,
+    }));
+
+    // Pre-commit, pre-fault, pre-deadline → pending.
+    try testing.expectEqual(SweepClass.pending, classify(7, 100, .{
+        .committed = 5, .faulted = 0, .now_ns = 50,
+    }));
+
+    // faulted == 0 means "no fault declared"; not a fault even if 0 >= seq=0.
+    try testing.expectEqual(SweepClass.pending, classify(7, 100, .{
+        .committed = 5, .faulted = 0, .now_ns = 50,
+    }));
 }
 
 test "Continuation: WakeKey variants construct" {
