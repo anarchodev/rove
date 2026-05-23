@@ -111,25 +111,33 @@ pub fn Continuation(comptime Buffered: type, comptime Txn: type) type {
         /// 3.1+; indexed in 3.5.
         wake_key: ?WakeKey = null,
 
-        /// Abandon-safe (L2). Called by `Collection.deinit` on
-        /// shutdown / entity destroy. Rolls back any owned txn,
-        /// runs the caller-provided `bufferedDeinit` to release
-        /// buffered Cmds, frees the tenant_id slice.
+        /// Rove-compatible component deinit. Called by
+        /// `Collection.deinit` (and `reg.destroy`'s deferred sweep)
+        /// on shutdown / entity destroy. Abandon-safe (L2): rolls
+        /// back any owned txn, frees the buffered effects, frees
+        /// owned strings.
         ///
-        /// The Phase 3.1 ParkedUnit migration will pass a
-        /// `bufferedDeinit` that frees `send_ops` + `kv_wakes`;
-        /// Phase 4 collapses that into the unified `effect.Cmd`
-        /// list's deinit.
-        pub fn deinit(
-            items: []Self,
-            allocator: std.mem.Allocator,
-            comptime bufferedDeinit: fn (*Buffered, std.mem.Allocator) void,
-            comptime rollbackTxn: fn (Txn) void,
-        ) void {
+        /// **Structural requirements on the type parameters**
+        /// (Zig's comptime checks them at instantiation):
+        ///
+        /// - `Buffered` MUST provide `pub fn deinit(*Self,
+        ///   std.mem.Allocator) void`. The buffered-effects type
+        ///   owns its inner lists / strings and frees them here.
+        /// - `Txn` MUST be a pointer type `*T` where `T` has
+        ///   `pub fn rollback(*T) !void`. `kvexp`'s `TrackedTxn`
+        ///   fits; the fault-tolerant `catch {}` on the call swallows
+        ///   any rollback error (kvexp's overlay is volatile — no
+        ///   on-disk divergence to undo).
+        ///
+        /// Phase 3.1 worker.ParkedUnit instantiates with
+        /// `Buffered = worker.BufferedSendKvOps` (the send_ops +
+        /// kv_wakes pair) and `Txn = *kv_mod.KvStore.TrackedTxn`.
+        pub fn deinit(allocator: std.mem.Allocator, items: []Self) void {
             for (items) |*item| {
-                bufferedDeinit(&item.buffered, allocator);
+                item.buffered.deinit(allocator);
                 if (item.txn) |t| {
-                    rollbackTxn(t);
+                    t.rollback() catch {};
+                    allocator.destroy(t);
                     item.txn = null;
                 }
                 if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
@@ -191,30 +199,68 @@ pub fn ReconcileCtx(comptime Cont: type, comptime UserCtx: type) type {
 
 // ── tests ───────────────────────────────────────────────────────
 
-test "Continuation: typed instantiation compiles" {
+test "Continuation: typed instantiation + deinit walks structurally" {
     const testing = std.testing;
 
+    // Buffered must have `deinit(*Self, allocator)` per the
+    // structural contract.
     const FakeBuffered = struct {
-        count: u32 = 0,
+        owned: ?[]u8 = null,
 
-        fn deinit(self: *@This(), _: std.mem.Allocator) void {
-            self.count = 0;
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.owned) |b| allocator.free(b);
+            self.* = .{};
         }
     };
 
+    // Txn (when a pointer) must have `rollback(*T) !void`.
+    var rollbacks_called: u32 = 0;
+    const Rollback = struct {
+        var counter: *u32 = undefined;
+    };
+    Rollback.counter = &rollbacks_called;
+
     const FakeTxn = struct {
-        rolled_back: bool = false,
+        pub fn rollback(_: *@This()) !void {
+            Rollback.counter.* += 1;
+        }
     };
 
     const Cont = Continuation(FakeBuffered, *FakeTxn);
 
-    // Build one + assert default state.
-    var c: Cont = .{};
-    try testing.expectEqual(@as(u64, 0), c.seq);
-    try testing.expect(c.txn == null);
-    try testing.expect(c.wake_key == null);
+    // Build one with owned bytes + a heap-allocated txn; verify
+    // deinit frees both.
+    const txn_ptr = try testing.allocator.create(FakeTxn);
+    txn_ptr.* = .{};
+    const owned = try testing.allocator.dupe(u8, "hello");
 
-    // WakeKey variants type-check.
+    var items = [_]Cont{.{
+        .seq = 7,
+        .deadline_ns = 1000,
+        .tenant_id = try testing.allocator.dupe(u8, "acme"),
+        .buffered = .{ .owned = owned },
+        .txn = txn_ptr,
+        .wake_key = .{ .seq = 7 },
+    }};
+
+    Cont.deinit(testing.allocator, &items);
+    try testing.expectEqual(@as(u32, 1), rollbacks_called);
+    try testing.expect(items[0].txn == null);
+    try testing.expect(items[0].tenant_id.len == 0);
+}
+
+test "Continuation: WakeKey variants construct" {
+    const testing = std.testing;
+
+    const FakeBuffered = struct {
+        pub fn deinit(self: *@This(), _: std.mem.Allocator) void { self.* = .{}; }
+    };
+    const FakeTxn = struct {
+        pub fn rollback(_: *@This()) !void {}
+    };
+    const Cont = Continuation(FakeBuffered, *FakeTxn);
+
+    var c: Cont = .{};
     c.wake_key = .{ .seq = 42 };
     try testing.expectEqual(@as(u64, 42), c.wake_key.?.seq);
 
