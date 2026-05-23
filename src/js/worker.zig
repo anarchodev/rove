@@ -117,6 +117,30 @@ pub const RaftWait = struct {
     deadline_ns: i64 = 0,
 };
 
+/// The buffered effects a `ParkedUnit` carries — commit-gated
+/// `_send/owed/*` arm/resolve intents + kv-wake broadcast intents.
+/// Released by `drainRaftPending` on `committedSeq >= seq` (via
+/// `firePendingSendOps` + `firePendingKvWakes`); discarded on
+/// fault/timeout/leadership-loss (the effect never escaped — the
+/// durable per-tenant `_send/owed/` + new-leader boot-scan recover
+/// any dropped send_ops; the §9.4 "spurious + overflow" thesis
+/// tolerates dropped kv_wakes).
+///
+/// Structural-deinit shape per the `effect.Continuation` contract:
+/// `pub fn deinit(*Self, allocator) void` walks both lists.
+pub const BufferedSendKvOps = struct {
+    send_ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty,
+    kv_wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty,
+
+    pub fn deinit(self: *BufferedSendKvOps, allocator: std.mem.Allocator) void {
+        for (self.send_ops.items) |*o| o.deinit(allocator);
+        self.send_ops.deinit(allocator);
+        for (self.kv_wakes.items) |*w| w.deinit(allocator);
+        self.kv_wakes.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 /// A non-entity post-propose parked unit (divergence workstream,
 /// `docs/unified-effect-gating.md` idiom-1). The H2 path parks ECS
 /// entities in `raft_pending`; the non-H2 `tenant_batch` paths have
@@ -125,69 +149,19 @@ pub const RaftWait = struct {
 /// buffered emits at commit (`committedSeq >= seq`) and discards
 /// them on fault/timeout/leadership-loss (the effect never escaped).
 /// Purely additive — the H2 entity path is untouched.
-/// Component-compatible: default-init produces an "empty" unit
-/// (seq=0, no tenant, no ops, no txn) so rove SoA columns can
-/// zero-init. The slice-based `deinit` is what rove calls on
-/// entity destroy / collection shutdown; safe to invoke on an
-/// empty unit (every field has a benign empty default).
-pub const ParkedUnit = struct {
-    seq: u64 = 0,
-    deadline_ns: i64 = 0,
-    /// Owned copy — must outlive the proposing dispatch across ticks.
-    /// Empty slice when default-init (no tenant yet set).
-    tenant_id: []u8 = &.{},
-    /// Option (b) 4b-ii-B: owned commit-gated send arm/resolve intents
-    /// (`_send/owed/` put → arm, `_send/proof/` put / `_send/owed/`
-    /// delete → resolve). Fired into the leader-local SendDispatch on
-    /// commit (`firePendingSendOps`), discarded with the rest of the
-    /// unit on fault/timeout/leadership-loss — the durable per-tenant
-    /// `_send/owed/` + new-leader boot-scan covers a discard, so no
-    /// silent loss.
-    send_ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty,
-    /// Streaming-handlers-plan §4.6: commit-gated kv-wake intents.
-    /// Captured from the batch's writeset at propose time;
-    /// `drainRaftPending` calls `node.broadcastKvWake` for each
-    /// once `committedSeq >= seq` so the wakes fire AFTER the
-    /// writes are durably visible to local readers (the kv.get
-    /// on the wake-driven handler then returns the new state, not
-    /// stale pre-write state). Discarded on fault/timeout — same
-    /// posture as `send_ops`: no silent loss because the writes
-    /// also didn't escape, and the §9.4 "spurious + overflow"
-    /// thesis tolerates dropped wakes.
-    kv_wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty,
-    /// Phase 4c: entity-less commit-gated `TrackedTxn` pointer
-    /// when this unit represents a "forgetful writes" propose —
-    /// the §4.4 disconnect activation's kv side effects. No entity
-    /// in `raft_pending` waits on this seq, so the entity-loop in
-    /// `drainRaftPending` would never commit it; the parked-units
-    /// sweep does instead. On commit: `tracked.commit() + destroy`;
-    /// on fault: `tracked.rollback() + destroy`. Null on the
-    /// historical entity-backed units (`parkSendOps` from the
-    /// inbound dispatch path) — the entity loop already owns those.
-    txn: ?*kv_mod.KvStore.TrackedTxn = null,
-
-    /// Rove component deinit: invoked by `Collection.deinit` on
-    /// entity destroy / shutdown. Releases every owned field; safe
-    /// on a default-init unit (empty slices / null txn short-
-    /// circuit). The drainRaftPending sweep clears `txn` before
-    /// destroying the entity on a clean commit so the txn isn't
-    /// rolled back here.
-    pub fn deinit(allocator: std.mem.Allocator, items: []ParkedUnit) void {
-        for (items) |*item| {
-            for (item.send_ops.items) |*o| o.deinit(allocator);
-            item.send_ops.deinit(allocator);
-            for (item.kv_wakes.items) |*w| w.deinit(allocator);
-            item.kv_wakes.deinit(allocator);
-            if (item.txn) |t| {
-                t.rollback() catch {};
-                allocator.destroy(t);
-                item.txn = null;
-            }
-            if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
-            item.* = .{};
-        }
-    }
-};
+///
+/// Effect-reification Phase 3.1: `ParkedUnit` is now the first
+/// concrete instantiation of `effect.Continuation`. Same fields
+/// (seq, deadline_ns, tenant_id, txn) and same rove-compatible
+/// `deinit(allocator, items)` signature — the migration is
+/// structural. The pre-3.1 `send_ops` + `kv_wakes` fields live
+/// under `unit.buffered.send_ops` / `unit.buffered.kv_wakes` now;
+/// the inner shape `BufferedSendKvOps` is defined above. The new
+/// `wake_key` slot is present but unused at this site
+/// (entity-less parked units don't need wake routing — the
+/// drainRaftPending sweep walks the collection directly). Phase
+/// 3.2+ uses `wake_key` when the H2 entity path migrates.
+pub const ParkedUnit = effect_mod.Continuation(BufferedSendKvOps, *kv_mod.KvStore.TrackedTxn);
 
 /// Owned (key, op) pair captured from a write batch's writeset at
 /// propose time. Survives until `drainRaftPending` fires the wake
@@ -6158,8 +6132,7 @@ fn proposeForgetfulWrites(
         .seq = seq,
         .deadline_ns = @intCast(std.time.nanoTimestamp() +
             @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .send_ops = unit_send_ops,
-        .kv_wakes = unit_kv_wakes,
+        .buffered = .{ .send_ops = unit_send_ops, .kv_wakes = unit_kv_wakes },
         .txn = txn,
     };
     unit_send_ops = .empty;
@@ -6185,10 +6158,10 @@ fn proposeForgetfulWrites(
 /// `OwnedIntent.fire` tolerates null (a dropped intent is re-derived
 /// by the promotion boot-scan — no silent loss).
 fn firePendingSendOps(worker: anytype, unit: *ParkedUnit) void {
-    if (unit.send_ops.items.len == 0) return;
+    if (unit.buffered.send_ops.items.len == 0) return;
     const sd = worker.node.send_dispatch;
-    std.log.info("rove-js sendpath: firePendingSendOps seq={d} n={d} sd_null={}", .{ unit.seq, unit.send_ops.items.len, sd == null });
-    for (unit.send_ops.items) |*o| o.fire(sd);
+    std.log.info("rove-js sendpath: firePendingSendOps seq={d} n={d} sd_null={}", .{ unit.seq, unit.buffered.send_ops.items.len, sd == null });
+    for (unit.buffered.send_ops.items) |*o| o.fire(sd);
 }
 
 /// streaming-handlers-plan §4.6: fire commit-gated kv-wake intents.
@@ -6199,8 +6172,8 @@ fn firePendingSendOps(worker: anytype, unit: *ParkedUnit) void {
 /// `KvWakeInbox` — `serviceParkedStreams` then picks up matched
 /// cells. No-op on empty.
 fn firePendingKvWakes(worker: anytype, unit: *ParkedUnit) void {
-    if (unit.kv_wakes.items.len == 0) return;
-    for (unit.kv_wakes.items) |w| {
+    if (unit.buffered.kv_wakes.items.len == 0) return;
+    for (unit.buffered.kv_wakes.items) |w| {
         worker.node.broadcastKvWake(unit.tenant_id, w.key, w.op);
     }
     // Gap 2.1 Phase E: kv-react subscription chain origins. Same
@@ -6245,7 +6218,7 @@ fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
             .kv => |k| k.prefix,
             else => continue,
         };
-        for (unit.kv_wakes.items) |w| {
+        for (unit.buffered.kv_wakes.items) |w| {
             if (!std.mem.startsWith(u8, w.key, prefix)) continue;
             std.log.info(
                 "rove-js kv-react queue: tenant={s} subscription={s} key={s} op={c}",
@@ -6853,7 +6826,7 @@ pub fn parkSendOps(
         .seq = seq,
         .deadline_ns = @intCast(std.time.nanoTimestamp() +
             @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .send_ops = ops,
+        .buffered = .{ .send_ops = ops },
     };
     ops = .empty;
     errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
@@ -6909,7 +6882,7 @@ pub fn parkKvWakes(
         .seq = seq,
         .deadline_ns = @intCast(std.time.nanoTimestamp() +
             @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .kv_wakes = wakes,
+        .buffered = .{ .kv_wakes = wakes },
     };
     wakes = .empty;
     errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
