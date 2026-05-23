@@ -654,15 +654,43 @@ Phase-0 baseline.
 
 ## 10. First session (cold start)
 
-You have just cleared context. To start:
+**Current state (2026-05-22):** Phases 0 through 4.0 shipped on the
+`effect-reification` branch (15 commits). See `git log main..effect-
+reification`. Active next piece is **Phase 4.0.b** — implement the
+streaming commit-gate fix decided in 4.0.
+
+If picking up Phase 4.0.b specifically:
+
+1. Read [[feedback_model_simplicity_safety]] (the principle behind
+   the decision).
+2. Read [[project_durability_as_js_shim]] for the parallel decision
+   pattern (default to safe + JS-shim composition).
+3. Read this doc's Phase 4 section (above) — the
+   approach-sketch lives there.
+4. Re-read `worker.zig:5377-5380` — the comment is the smoking gun;
+   it documents the eager-ship behavior being removed.
+5. The new fault-injection smoke is the gate — there's currently NO
+   way to verify the fix without it. Pattern off
+   `scripts/readonly_speculation_faultinj_smoke.py` (the
+   idiom-0 fault gate).
+6. Don't extend `streaming-model.md` §2 — the rule's correct; the
+   implementation-status note retires when 4.0.b lands.
+
+If picking up a different sub-phase entirely:
 
 1. Read `docs/effect-algebra.md`, then this doc, then
    `docs/unified-effect-gating.md §4–§5`.
-2. Confirm `streaming-model` is merged to main. If not — **stop**; only
-   Phase 0's read-only inventory may proceed.
-3. Execute **Phase 0**: fill the §4 table with exact `file:line`;
-   determine the Option-B `ParkedUnit` migration state; run the §7 smoke
-   set and kv-bench; record the baseline numbers and the inventory
-   *back into this doc* (§4 and a new "Phase 0 results" subsection).
-4. That inventory is the gate for starting Phase 1. Do not skip it —
-   the §4 pointers are from a 2026-05-22 audit and the tree moves.
+2. Check `git log main..effect-reification` for the current branch
+   state — every shipped phase has a commit message explaining what
+   landed.
+3. The branch is off `main` at `90e2847` (the Phase 0 baseline tree).
+
+Historic cold-start (Phase 0, archived):
+
+> Execute Phase 0: fill the §4 table with exact `file:line`;
+> determine the Option-B `ParkedUnit` migration state; run the §7
+> smoke set and kv-bench; record the baseline numbers and the
+> inventory back into this doc.
+
+Phase 0 shipped — its results are above. Use the "current state"
+section above for resumption.
