@@ -107,24 +107,40 @@ Continuation? ⊕ Model?`:
 |---|---|---|---|---|
 | KV read | — | — (Model query) | no | synchronous snapshot read, not a Cmd |
 | KV write | — | kv-write | no | the Cmd runtime whose target is the Model |
-| `http.send` / `cancel` | send-callback | http-out ⊕ kv-write (`_send/owed` marker) | yes | "durable-intent" = http-out composed with a marker write |
-| `http.fetch` A (`on_chunk`) | fetch-chunk / fetch-done | http-out | yes | identical to `http.send` minus the marker |
-| `http.fetch` B (`pipe_to`) | **none** | http-out ⊕ connection-write | no | Cmd ⊕ Cmd, no Msg → structurally untaped *by derivation* |
+| outbound HTTP — whole response | http-done | http-out | yes | the single outbound primitive |
+| outbound HTTP — `on_chunk` (Pattern A) | http-chunk / http-done | http-out | yes | streaming response — chunks fire activations |
+| outbound HTTP — `pipe_to` (Pattern B) | **none** | http-out ⊕ connection-write | no | Cmd ⊕ Cmd, no Msg → structurally untaped *by derivation* |
+| `webhook.send` / `email.send` (JS shims) | (the shim's `on_result`) | kv-write ⊕ http-out | yes | durable-intent is a *composition* — kv marker + outbound HTTP + retry-cron + boot-subscription, none of them new primitives |
 | subscriptions (cron/boot/kv-react) | cron / boot / kv-react | — | no | Msg origin alone; boot composes a kv-write marker for idempotency |
 | streaming response (`__rove_stream`) | wake / disconnect | response-write | yes | the Continuation *is* the held stream |
 | connection-actor | inbound frame | connection-write | yes | duplex: a Msg origin and a Cmd runtime on one Continuation |
-| `events.emit` | (consumer's Msg) | events-emit | no | a commit-gated Cmd (gate is a live worklist item — §7) |
 
-Two compositions are worth calling out because they *explain* audit
+Three compositions are worth calling out because they *explain* audit
 findings rather than excusing them:
 
 - **`pipe_to` is the one composition with no Msg origin.** The tape
   records Msg origins (L3); with no origin there is nothing to record.
   "Structurally untaped" is a theorem, not a carve-out.
-- **`http.send` and `http.fetch` are one outbound-HTTP runtime**
-  parameterized by `durable?` and response-disposition
-  (single / streamed / piped). They are two named effects today only
-  because the runtime was not factored.
+- **Outbound HTTP is one runtime, not two named effects.** Earlier
+  drafts split it as `http.send` (durable) vs `http.fetch` (transient).
+  `effect-reification-plan.md` Phase 5 (revised 2026-05-22) deletes
+  the split: there is one outbound HTTP Cmd parameterized by
+  response-disposition (whole / chunk / pipe); durability is *not* a
+  parameter and not a verb-level choice.
+- **`webhook.send` / `email.send` retire as Zig primitives.** They
+  become standard-library JS shims that compose `kv.set("_send/owed/
+  {id}", ...)` (rides envelope-0 atomic with the handler's writes) +
+  the outbound HTTP primitive + a `_subscriptions/send-retry/` cron
+  subscription that re-fires stale markers + a boot subscription on
+  leader-promotion. The original "durable-intent" framing (a baked-in
+  Zig primitive) was a premature optimization: every piece composes
+  from primitives that now exist (kv writes, cron, boot, and the
+  outbound HTTP runtime). The composition is **visible JavaScript in
+  the standard library** — the platform dogfoods its own primitives,
+  and customers can read / fork the retry policy. A paid-tier fast
+  path (pattern-match the shim, dispatch native) is a post-launch
+  optimization that does not change the customer-facing API.
+  See `effect-reification-plan.md` Phase 5 for the migration steps.
 
 ## 4. The contract — six questions every effect answers
 
@@ -160,9 +176,10 @@ Ten effect-shapes scored against §4. `✓` conforms, `✗` diverges.
 |---|---|---|---|
 | KV read | sync call — no Cmd | sync return — no Msg | ephemeral (snapshot-pinned) |
 | KV write | writeset op | none | replicated-mutation (env-0) |
-| `http.send` / `cancel` | `_send/owed/{id}` key in writeset | `send_callback` activation / continuation resume | durable-intent = marker key in env-0 KV |
-| `http.fetch` A | `PendingFetch` in per-request list | `fetch_chunk` / `fetch_done` | ephemeral |
-| `http.fetch` B (`pipe_to`) | same + `pipe_to` | outside the handler (one `fetch_pipe_done`) | ephemeral |
+| outbound HTTP — whole | `PendingFetch` in per-request list | `http_done` (a chain activation) | ephemeral |
+| outbound HTTP — A (`on_chunk`) | same | `http_chunk` / `http_done` | ephemeral |
+| outbound HTTP — B (`pipe_to`) | same + `pipe_to` | outside the handler (one `http_pipe_done`) | ephemeral |
+| `webhook.send` / `email.send` (JS shims) | `_send/owed/{id}` kv write + a `PendingFetch` | the shim's `on_result` (a chain activation triggered by `http_done`) | durable-intent = composition (kv write rides env-0 atomic with handler) |
 | subscriptions | deploy-time spec file — no runtime Cmd | `subscription_fire` activation | ephemeral (boot: marker rides writeset) |
 | streaming out | `__rove_stream({write, waitFor})` | `wake_batch` / `disconnect` | ephemeral entity; per-activation writes replicated |
 | streaming in (body) | — | — | **NOT BUILT** (gap 2.4) |
@@ -175,19 +192,26 @@ Ten effect-shapes scored against §4. `✓` conforms, `✗` diverges.
 |---|---|---|---|---|
 | KV read | taped ✓ | none (in-mem) | at-most-once; no durable effect | read-view on `Txn` (worker-local map) |
 | KV write | taped ✓ | overlay cap ✓; `WriteSet` itself unbounded ✗ | at-most-once client / at-least-once raft | overlay + `WriteSet` + `pending_txns` map + `raft_pending_*` collection |
-| `http.send` | marker taped, no re-fire on replay ✓ | NOT BUILT — only fire-pool=8 ✗ | at-least-once; boot-scan recovery; resolve-once dedup ✓ | `_send/owed`+`proof` in `app.db` ✓ + `InflightSet` (ephemeral) |
-| `http.fetch` A | ✗ chunk bytes NOT taped | `fetch_pending` unbounded ✗; per-fetch caps ✓ | at-most-once; no recovery; cancel NOT BUILT | `fetch_pending` list + `fetch_event_pending` collection |
-| `http.fetch` B | untaped *by design* ✓ (no Msg origin) | `StreamChunks` 256 KB ✓ | at-most-once | `StreamChunks`+`PipeState` on entity ✓ |
+| outbound HTTP — whole / A / B | taped at the http-done / http-chunk Msg ingress (Phase 2D wires the hook; closes worklist #1) | `fetch_pending` unbounded ✗; per-fetch caps ✓ | at-most-once; B untaped *by design* (no Msg origin); whole + A at-most-once with no kernel-level recovery | `fetch_pending` list + `fetch_event_pending` collection (both retire in Phase 2D) + `StreamChunks` / `PipeState` on entity for B |
+| `webhook.send` / `email.send` (JS shims) | marker taped via the ordinary env-0 writeset; the shim's `on_result` activation is taped like every other chain hop ✓ | retry-cron rate ✓ ; first-attempt rides handler dispatch; subsequent attempts ride the cron sweep ✓ | at-least-once at the *attempt* level (M1) via marker-write/clear; **NOT** retry-to-success — that is the shim's policy choice | `_send/owed/{id}` kv (durable, replicated) + the shim's per-attempt scratch state |
 | subscriptions | taped per fire ✓ | cron 1 Hz ✓; kv-react no limit ✗; per-tenant cap maybe NOT BUILT | at-most-once; boot double-fire UNCLEAR | `subscription_fire_pending` collection ✓; `cron_state` plain hashmap ✗ |
 | streaming out | taped per activation ✓ (cap 10 MB / 50k) | wake ring K=32 + `StreamChunks` 256 KB — lossy, surfaced ✓ | at-most-once stream; chunks may ship pre-commit ✗ | stream collections ✓ |
 | conn-actor out | taped per activation ✓ | `StreamChunks` 256 KB ✓ | at-most-once flush; cross-worker resume = linear scan + requeue ✗ | `parked_continuations` collection ✓ |
 
-The model holds: nine of ten effects fill the template consistently.
-The audit caught exactly one breach of the §1 invariant — `http.fetch`
-Pattern A returns chunk bytes to the handler without taping them. That
-the framework finds exactly one violation, and that the violation is a
-*missing instance of a general rule* (L3), is the framework earning its
-keep.
+The model holds: every effect that remains a Zig primitive fills the
+template consistently. The audit caught exactly one breach of the §1
+invariant — Pattern-A outbound HTTP returns chunk bytes to the handler
+without taping them. That the framework finds exactly one violation,
+and that the violation is a *missing instance of a general rule* (L3),
+is the framework earning its keep. (Phase 2D of
+`effect-reification-plan.md` closes it.)
+
+Note: this revision (2026-05-22) collapses `http.send` + `http.fetch`
+into one row — they are one outbound HTTP runtime. `webhook.send` /
+`email.send` are JS-shim *compositions* on top, not primitives. The
+old "durable-intent primitive" row retired because every piece of its
+composition (kv markers, retry cron, boot subscription, outbound HTTP)
+is already a primitive.
 
 ## 6. Toward the minimal set
 
@@ -211,9 +235,14 @@ What the algebra predicts, each collapsing N runtimes to 1:
    owns a wake-correlation index, so resume is O(1), not O(workers ×
    parked)).
 
-2. **One outbound-HTTP runtime.** `http.send` + `http.fetch` A + B = one
-   runtime parameterized by `durable?` and response-disposition. Today:
-   `SendDispatch` and `FetchPool`, two pools, two code paths.
+2. **One outbound-HTTP runtime.** `http.send` retires as a primitive
+   (2026-05-22 decision); the only outbound HTTP runtime is the one
+   that drives `http.fetch` today — `FetchPool` parameterized by
+   response-disposition (whole / `on_chunk` / `pipe_to`). `SendDispatch`
+   + `InflightSet` + `send_outbox` + the apply-time special-casing of
+   `_send/owed` / `_send/proof` markers all *delete* — they composed a
+   durable-intent verb that needn't be a Zig primitive. Durability
+   reconstitutes as a JS-shim composition (rule 4 below).
 
 3. **One Msg-origin runtime, taping built in.** cron / boot / kv-react /
    inbound-HTTP / send-callback / fetch-chunk / frame are instances of
@@ -221,10 +250,18 @@ What the algebra predicts, each collapsing N runtimes to 1:
    the `http.fetch` Pattern A replay bug becomes *unconstructible* — you
    cannot instantiate a Msg origin without the tape hook.
 
-4. **Durability stays in one home.** Already proven by the `schedules.db`
-   retirement. The standing rule: a future durable-intent effect is
-   *always* "a marker key in KV + an ephemeral runtime + boot-scan
-   recovery" — never a new store, never a new envelope type.
+4. **Durability stays in one home — and that home is JS.** Proven by
+   the `schedules.db` retirement (2026-05-19) AND extended by the
+   `http.send` → JS-shim decision (2026-05-22). The standing rule: a
+   durable-intent effect is *always* the JS composition `kv.set("_send/
+   owed/{id}", ...)` (rides envelope-0 atomic with the handler's
+   writes) + outbound HTTP + a retry cron subscription + a boot
+   subscription on leader-promotion. No new store, no new envelope
+   type, no new Zig primitive. The composition is part of the standard
+   library (`webhook.send.js`, `email.send.js`) — the platform
+   dogfoods its own primitives, and customers can read or fork the
+   policy. A paid-tier fast path that pattern-matches the shim is a
+   post-launch optimization, not part of the model.
 
 The shape of the minimal set: **two singletons that must never be
 duplicated (the Model, the Continuation), and two open families whose
@@ -238,20 +275,21 @@ substrate itself must change — rare, and worth stopping for.
 
 Ranked; the first two are correctness, not cleanup. Reifying the four
 primitives (`docs/effect-reification-plan.md`) makes items 1, 3, 4, 5
-structurally impossible and forces 2 and 7 into one decision point —
-that plan is the systematic way to clear this list.
+structurally impossible and forces 2 into one decision point — that
+plan is the systematic way to clear this list.
 
-1. **Tape `http.fetch` Pattern A chunk bytes** — replay-correctness bug;
-   `fireFetchEventActivation` passes empty `TapePayloads`. Content-address
-   past a threshold (`primitive-gaps.md` §6, also NOT BUILT).
+1. **Tape outbound-HTTP Pattern A chunk bytes** — replay-correctness
+   bug; `fireFetchEventActivation` passes empty `TapePayloads`.
+   Content-address past a threshold (`primitive-gaps.md` §6, also
+   NOT BUILT). Fixed by reification Phase 2D.
 2. **Resolve the streaming pre-commit invariant** — `streaming-model.md`
    §2 bills "a chunk ships only after its activation commits" as *the one
    rule*, but §7/§9.4 and the resume path (`proposeForgetfulWrites`) ship
    chunks pre-commit. Fix the code or rewrite §2; it is not "one rule"
    with an exception.
-3. **Adopt the streaming backpressure template** across `http.send`,
-   `http.fetch` (`fetch_pending`), the `WriteSet`, and kv-react —
-   four unbounded queues.
+3. **Adopt the streaming backpressure template** across outbound HTTP
+   (`fetch_pending`), the `WriteSet`, and kv-react — three unbounded
+   queues. (Down from four: `http.send` retires per §6 rule 2.)
 4. **Cross-worker Continuation resume is a scan, not a route** — no
    durable/indexed locator; falls out of refactor #1.
 5. **`cron_state` lives in a plain `StringHashMap`** — right durability
@@ -259,10 +297,21 @@ that plan is the systematic way to clear this list.
    collection.
 6. **Boot subscription double-fire is UNCLEAR** — crash between
    marker-write and propose may re-fire and partially duplicate
-   non-marker writes. Needs a definite answer.
-7. **`events.emit` commit-gating** — one of the Class-B premature-release
-   proposers in `unified-effect-gating.md` (idiom-1). L4 not yet enforced
-   for it.
+   non-marker writes. Needs a definite answer. *Becomes higher-impact*
+   under the durability-as-JS-shim model since boot subscriptions
+   participate in send-recovery; the answer must hold for
+   `webhook.send`/`email.send` reliability.
+7. **Retire `http.send` as a Zig primitive** (2026-05-22 decision).
+   Ship `webhook.send.js` + `email.send.js` durability shims that
+   compose `kv.set("_send/owed/{id}", ...)` + outbound HTTP +
+   retry-cron subscription + boot subscription. Delete
+   `src/js/send_dispatch.zig`, `send_inflight.zig`, `send_outbox.zig`,
+   the apply-time special-cases for `_send/owed` and `_send/proof`,
+   `parkSendOps` / `firePendingSendOps`, and the `send_callback`
+   Msg variant (it merges into the unified `http_done`). The §6 rule 2
+   collapse. **Supersedes** the closed-by-retirement
+   `events.emit` worklist item (previously #7) — that surface is
+   already gone.
 
 Known catalog gaps, *not* incoherence: streaming inbound body (gap 2.4),
 connection-actor inbound / WebSocket (gap 2.5 / §6.3), `http.cancelFetch`
