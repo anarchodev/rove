@@ -1958,7 +1958,16 @@ pub fn Worker(comptime opts: Options) type {
         /// confirms the batch's seq, not before propose. On propose
         /// failure or raft fault, the txn is `rollback`'d instead.
         /// Single-threaded per worker (the dispatch loop owns it).
-        pending_txns: std.AutoHashMapUnmanaged(u64, *kv_mod.KvStore.TrackedTxn) = .empty,
+        ///
+        /// Effect-reification Phase 3.2.c: encapsulated as
+        /// `effect.SharedTxnPool` (was: bare `AutoHashMapUnmanaged`).
+        /// The pool exposes `park` / `commitAndTake` / `rollbackAndTake`
+        /// + `CommitOutcome` / `RollbackOutcome` so producer + consumer
+        /// sites consult ONE typed surface instead of poking at the
+        /// hashmap directly. The architectural fact (multiple
+        /// entities per seq) is documented on the pool — see
+        /// `effect/continuation.zig`'s `SharedTxnPool` doc.
+        pending_txns: effect_mod.SharedTxnPool(*kv_mod.KvStore.TrackedTxn) = .{},
         /// Non-entity post-propose parked units (divergence
         /// workstream idiom-1). Serviced by `drainRaftPending`
         /// alongside (but independently of) the H2 `raft_pending`
@@ -2300,18 +2309,11 @@ pub fn Worker(comptime opts: Options) type {
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
             self.log_buffer.deinit();
-            // Roll back any leftover pending txns. Should be empty
-            // under normal shutdown; non-empty means we're exiting
-            // with proposals still in-flight (process kill, fatal
-            // error, etc.) — best-effort cleanup.
-            var ptn_it = self.pending_txns.iterator();
-            while (ptn_it.next()) |entry| {
-                entry.value_ptr.*.rollback() catch |err| std.log.warn(
-                    "worker.destroy: pending_txn rollback: {s}",
-                    .{@errorName(err)},
-                );
-                allocator.destroy(entry.value_ptr.*);
-            }
+            // Phase 3.2.c: SharedTxnPool.deinit walks any leftover
+            // txns (best-effort rollback) before freeing the
+            // hashmap. Non-empty means we're exiting with
+            // proposals still in flight (process kill / fatal
+            // error); clean shutdown drains to empty first.
             self.pending_txns.deinit(allocator);
             // parked_units is a rove Collection; its deinit fires
             // each entity's `ParkedUnit.deinit` component-style,
@@ -3985,28 +3987,25 @@ fn drainEntityArm(
         switch (effect_mod.classify(wait.seq, wait.deadline_ns, wm)) {
             .pending => continue,
             .commit => {
-                if (worker.pending_txns.get(wait.seq)) |tracked| {
-                    tracked.commit() catch |err| switch (err) {
-                        error.Conflict => continue,
-                        else => panic_mod.invariantViolated(
-                            site_label ++ ".commit",
-                            "seq={d} err={s}",
-                            .{ wait.seq, @errorName(err) },
-                        ),
-                    };
-                    _ = worker.pending_txns.remove(wait.seq);
-                    allocator.destroy(tracked);
+                switch (worker.pending_txns.commitAndTake(allocator, wait.seq)) {
+                    .took, .absent => {},
+                    .conflict => continue,
+                    .failed => |err| panic_mod.invariantViolated(
+                        site_label ++ ".commit",
+                        "seq={d} err={s}",
+                        .{ wait.seq, @errorName(err) },
+                    ),
                 }
                 try server.reg.move(ent, source, on_commit_dest);
             },
             .fault => {
-                if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
-                    kv.value.rollback() catch |err| panic_mod.invariantViolated(
+                switch (worker.pending_txns.rollbackAndTake(allocator, wait.seq)) {
+                    .took, .absent => {},
+                    .failed => |err| panic_mod.invariantViolated(
                         site_label ++ ".rollback",
                         "seq={d} err={s}",
                         .{ wait.seq, @errorName(err) },
-                    );
-                    allocator.destroy(kv.value);
+                    ),
                 }
                 // Per-sibling on-entity cleanup (ContDescriptor /
                 // stream components / etc.) deinits structurally when
@@ -4340,7 +4339,7 @@ fn proposeAndParkContResume(
     // Propose accepted. From here we own the parked-side
     // bookkeeping; if it fails the chain is in a half-state we can't
     // gracefully roll back (the raft entry is committed-pending).
-    try worker.pending_txns.put(allocator, seq, txn);
+    try worker.pending_txns.park(allocator, seq, txn);
     // parkSendOps + parkKvWakes ride the same seq so the wakes /
     // arm-resolve fire AFTER commit. Best-effort: log and continue
     // if parking fails — same posture as the inbound write path.
@@ -6847,16 +6846,11 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
     // each is in its own per-tenant chain (kvexp dispatch lease
     // guarantees one in-flight at a time). Rollback order doesn't
     // matter — different tenants are independent chains and within a
-    // tenant we have exactly one entry.
-    var ptn_it = worker.pending_txns.iterator();
-    while (ptn_it.next()) |entry| {
-        entry.value_ptr.*.rollback() catch |err| std.log.warn(
-            "drainOnLeadershipLoss: rollback seq={d} err={s}",
-            .{ entry.key_ptr.*, @errorName(err) },
-        );
-        allocator.destroy(entry.value_ptr.*);
-    }
-    worker.pending_txns.clearRetainingCapacity();
+    // tenant we have exactly one entry. Phase 3.2.c: SharedTxnPool's
+    // drainAll wraps the rollback-loop + clear (best-effort on
+    // rollback errors, matching the leadership-loss-is-recoverable
+    // posture).
+    worker.pending_txns.drainAll(allocator);
 
     // Discard parked units — their seqs won't commit on this now-
     // follower; the buffered emits MUST NOT fire (the new leader

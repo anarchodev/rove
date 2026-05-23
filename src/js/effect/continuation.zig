@@ -76,6 +76,154 @@ pub const Watermarks = struct {
 /// hasn't committed yet and isn't faulted; leave it in place.
 pub const SweepClass = enum { commit, fault, pending };
 
+/// Outcome of `SharedTxnPool.commitAndTake`. Distinguishes four
+/// real cases the drain arms must handle:
+///
+/// - `.took`     — pool held a txn for this seq; committed +
+///                 destroyed it. Caller proceeds with its
+///                 on-commit action (typically `reg.move`).
+/// - `.absent`   — no txn at this seq. Either a sibling arm
+///                 processed it (per-tenant batching folds N H2
+///                 requests into one writeset → one propose →
+///                 one seq → one txn, so the seq IS shared
+///                 across entities) or a race with the
+///                 fault path. Caller still does its move.
+/// - `.conflict` — `commit()` returned `error.Conflict` (kvexp
+///                 speculative-overlay collision). Txn stays in
+///                 the pool; caller skips this entity (retry).
+/// - `.failed`   — `commit()` returned a non-Conflict error.
+///                 Infallibility violation per
+///                 [[feedback_infallibility_violations]] — caller
+///                 panics. Txn stays in the pool so a post-panic
+///                 core dump shows it.
+pub const CommitOutcome = union(enum) {
+    took,
+    absent,
+    conflict,
+    failed: anyerror,
+};
+
+/// Outcome of `SharedTxnPool.rollbackAndTake`. kvexp's rollback is
+/// fault-tolerant on its speculative overlay, so non-fault errors
+/// are infallibility violations — caller panics on `.failed`.
+pub const RollbackOutcome = union(enum) {
+    took,
+    absent,
+    failed: anyerror,
+};
+
+/// Shared seq-keyed txn pool — the encapsulation of the per-worker
+/// `pending_txns` hashmap. Replaces the pre-3.2.c bare
+/// `std.AutoHashMapUnmanaged(u64, Txn)` field on `Worker`.
+///
+/// **Architectural fact:** multiple entities can share one txn at a
+/// given seq. Per-tenant batching (`tenant_batch.drainTenantBatch`)
+/// folds N H2 requests into one writeset → one propose → one raft
+/// seq → one `TrackedTxn`. The shared pool encodes this: the first
+/// drain arm to process the seq takes the txn (commits or rolls
+/// back + destroys); later arms find `.absent` and just do their
+/// queue move.
+///
+/// The txn ownership stays on the pool (not on per-entity
+/// `Continuation` components) precisely because of this sharing —
+/// moving the pointer onto one entity would force a "designated
+/// owner" discriminator on the others, with no real win. The pool
+/// IS the Continuation primitive's shared-txn home for the
+/// entity-backed paths (the entity-less `proposeForgetfulWrites`
+/// flavor carries its own `txn` on the `Continuation` because that
+/// path has 1:1 unit-to-txn ownership).
+///
+/// Comptime-generic over `Txn` (a pointer type where the pointee
+/// has `pub fn commit(*T) !void` and `pub fn rollback(*T) !void` —
+/// kvexp's `TrackedTxn` fits).
+pub fn SharedTxnPool(comptime Txn: type) type {
+    return struct {
+        const Self = @This();
+
+        txns: std.AutoHashMapUnmanaged(u64, Txn) = .empty,
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            // Best-effort rollback for any leftover txns at shutdown.
+            // Non-empty usually means we're exiting with proposals
+            // still in flight (process kill / fatal error); a clean
+            // shutdown drains the pool to empty before reaching here.
+            var it = self.txns.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.*.rollback() catch |err| std.log.warn(
+                    "SharedTxnPool.deinit: leftover rollback seq={d}: {s}",
+                    .{ entry.key_ptr.*, @errorName(err) },
+                );
+                allocator.destroy(entry.value_ptr.*);
+            }
+            self.txns.deinit(allocator);
+        }
+
+        /// Park a txn at `seq`. Producer side — called by the
+        /// proposing path right after `proposeBatch` returns the seq.
+        pub fn park(self: *Self, allocator: std.mem.Allocator, seq: u64, txn: Txn) !void {
+            try self.txns.put(allocator, seq, txn);
+        }
+
+        /// Commit + take the txn at `seq`. See `CommitOutcome`.
+        /// `.took` destroys the txn; `.conflict` and `.failed` keep
+        /// it in the pool; `.absent` is a no-op.
+        pub fn commitAndTake(self: *Self, allocator: std.mem.Allocator, seq: u64) CommitOutcome {
+            const tracked = self.txns.get(seq) orelse return .absent;
+            tracked.commit() catch |err| switch (err) {
+                error.Conflict => return .conflict,
+                else => return .{ .failed = err },
+            };
+            _ = self.txns.remove(seq);
+            allocator.destroy(tracked);
+            return .took;
+        }
+
+        /// Rollback + take the txn at `seq`. `.took` destroys;
+        /// `.failed` also destroys (the rollback error means the
+        /// txn is in an unknown state; we don't want to leave it
+        /// in the pool to be re-attempted) but signals the caller
+        /// to panic. `.absent` is a no-op.
+        pub fn rollbackAndTake(self: *Self, allocator: std.mem.Allocator, seq: u64) RollbackOutcome {
+            const kv = self.txns.fetchRemove(seq) orelse return .absent;
+            kv.value.rollback() catch |err| {
+                allocator.destroy(kv.value);
+                return .{ .failed = err };
+            };
+            allocator.destroy(kv.value);
+            return .took;
+        }
+
+        /// Roll back + destroy every parked txn, then clear the
+        /// pool retaining capacity. Used by the leadership-loss
+        /// drain (`drainOnLeadershipLoss`): every pending seq won't
+        /// commit on this now-follower, so every txn rolls back;
+        /// the new leader re-proposes anything actually durable.
+        ///
+        /// Rollback errors are logged-not-panicked because the
+        /// caller is mid-leadership-loss handling — a follower-
+        /// side rollback warning is recoverable, a panic isn't.
+        pub fn drainAll(self: *Self, allocator: std.mem.Allocator) void {
+            var it = self.txns.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.*.rollback() catch |err| std.log.warn(
+                    "SharedTxnPool.drainAll: rollback seq={d} err={s}",
+                    .{ entry.key_ptr.*, @errorName(err) },
+                );
+                allocator.destroy(entry.value_ptr.*);
+            }
+            self.txns.clearRetainingCapacity();
+        }
+
+        pub fn isEmpty(self: *const Self) bool {
+            return self.txns.count() == 0;
+        }
+
+        pub fn count(self: *const Self) usize {
+            return self.txns.count();
+        }
+    };
+}
+
 /// Per-unit classification — pure function of the unit's `seq` /
 /// `deadline_ns` and the tick's `Watermarks`. Each drain arm calls
 /// this at the top of every iteration; the returned class names
@@ -292,6 +440,68 @@ test "Continuation: typed instantiation + deinit walks structurally" {
     try testing.expectEqual(@as(u32, 1), rollbacks_called);
     try testing.expect(items[0].txn == null);
     try testing.expect(items[0].tenant_id.len == 0);
+}
+
+test "SharedTxnPool: park + commitAndTake + absent + rollback" {
+    const testing = std.testing;
+
+    const FakeTxn = struct {
+        committed: bool = false,
+        rolled_back: bool = false,
+        fail_commit_with: ?anyerror = null,
+
+        pub fn commit(self: *@This()) !void {
+            if (self.fail_commit_with) |e| return e;
+            self.committed = true;
+        }
+        pub fn rollback(self: *@This()) !void {
+            self.rolled_back = true;
+        }
+    };
+
+    var pool: SharedTxnPool(*FakeTxn) = .{};
+    defer pool.deinit(testing.allocator);
+
+    const t1 = try testing.allocator.create(FakeTxn);
+    t1.* = .{};
+    try pool.park(testing.allocator, 100, t1);
+    try testing.expectEqual(@as(usize, 1), pool.count());
+
+    // commitAndTake on existing seq → .took, destroys t1.
+    const o1 = pool.commitAndTake(testing.allocator, 100);
+    try testing.expect(o1 == .took);
+    try testing.expect(pool.isEmpty());
+
+    // commitAndTake on absent seq → .absent.
+    const o2 = pool.commitAndTake(testing.allocator, 100);
+    try testing.expect(o2 == .absent);
+
+    // .conflict path: park a txn whose commit returns Conflict.
+    const t2 = try testing.allocator.create(FakeTxn);
+    t2.* = .{ .fail_commit_with = error.Conflict };
+    try pool.park(testing.allocator, 200, t2);
+    const o3 = pool.commitAndTake(testing.allocator, 200);
+    try testing.expect(o3 == .conflict);
+    try testing.expectEqual(@as(usize, 1), pool.count()); // still parked
+
+    // .failed path: commit returns a non-Conflict error.
+    t2.fail_commit_with = error.OutOfMemory;
+    const o4 = pool.commitAndTake(testing.allocator, 200);
+    switch (o4) {
+        .failed => |err| try testing.expectEqual(@as(anyerror, error.OutOfMemory), err),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), pool.count()); // still parked on .failed
+
+    // rollbackAndTake → .took, destroys + removes.
+    t2.fail_commit_with = null;
+    const o5 = pool.rollbackAndTake(testing.allocator, 200);
+    try testing.expect(o5 == .took);
+    try testing.expect(pool.isEmpty());
+
+    // rollbackAndTake on absent seq → .absent.
+    const o6 = pool.rollbackAndTake(testing.allocator, 300);
+    try testing.expect(o6 == .absent);
 }
 
 test "classify: commit / fault / timeout / pending outcomes" {
