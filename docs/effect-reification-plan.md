@@ -496,30 +496,50 @@ Revised 2026-05-22 in light of two prior decisions:
   reserved for customer demand. Latency cost (~one raft-cycle
   per resume hop with writes) accepted.
 
-- **Phase 4.0.b — IMPLEMENTATION (pending):** wire the
-  commit-gating in `resumeStream`'s terminal+writes / cont+writes /
-  stream+writes arms. Approach sketch:
-  - Extend `worker.BufferedSendKvOps` (the ParkedUnit's buffered
-    type from Phase 3.1) with `staged_chunks: ArrayList([]u8)` +
-    `entity: ?rove.Entity` — the resume-hop's pending chunks +
-    the destination entity for transfer on commit.
-  - `proposeForgetfulWrites` gains an optional resume-context
-    parameter (entity + chunks) that gets parked on the unit.
-  - The `parked_units` sweep's commit arm transfers
-    `unit.buffered.staged_chunks` into the entity's
-    `StreamChunks` (h2 picks up from there).
-  - The fault arm discards `staged_chunks` via the existing
-    `BufferedSendKvOps.deinit` walk — no entity-side cleanup
-    needed.
-  - New fault-injection smoke
-    (`streaming_resume_fault_inj_smoke.py`) — patterned on
-    `readonly_speculation_faultinj_smoke.py`: freeze followers,
-    fire a resume hop with writes, verify the customer sees
-    NO chunk (vs today's pre-fix behavior where the chunk
-    leaks). Pair with the existing
-    `streaming_kv_wake_writes_smoke.py` happy-path gate.
-  - Update `worker.zig:5377-5380` comment + the streaming-model.md
-    §2 "implementation status" note when the gating lands.
+- **Phase 4.0.b — IMPLEMENTATION (shipped 2026-05-22):** the
+  commit-gate is wired in `resumeStream`'s terminal+writes and
+  stream+writes arms (the cont arm 501's pre-Phase 5, no writes
+  to gate). What landed:
+  - `BufferedSendKvOps` extended with `staged_chunks:
+    std.ArrayListUnmanaged([]u8)` + `stream_entity: ?rove.Entity`
+    + `mark_draining: bool`. Structural deinit walks the chunk
+    list, freeing each on the fault arm.
+  - `proposeForgetfulWrites` takes `stage_opt: ?*StreamResumeStage`
+    — non-null only at the two stream-resume call sites; the
+    9 non-stream callers (disconnect, subscription, fetch-event)
+    pass `null`. The helper takes `stage.chunks` unconditionally
+    (sets it `.empty`) so the caller's defer is a no-op on every
+    path — commit moves chunks into the unit, fault frees them
+    via the helper's errdefer.
+  - `transferStagedChunks` is the commit-arm transfer in
+    `drainRaftPending`'s `parked_units` branch — runs after
+    `firePendingSendOps` + `firePendingKvWakes`, BEFORE entity
+    destroy. `reg.get` on the stream entity discards the chunks
+    if it moved or destroyed in the interim (client-disconnect
+    race); otherwise `tryAppend`'s each chunk into `StreamChunks`
+    and flips `is_draining` if `mark_draining`.
+  - `markStreamDraining` no longer fires eagerly in the
+    terminal+writes arm — `transferStagedChunks` flips it AFTER
+    the body chunk lands in `StreamChunks`, so the customer never
+    sees the terminal frame on a faulted hop.
+  - Internal-state updates (ctx_json / interval / kv_prefixes /
+    activation_count) stay eager. The §2 rule covers chunks
+    reaching the wire, not per-stream runtime state; a fault
+    leaving ctx ahead of durable kv is recoverable by the
+    customer (handlers re-read kv on every activation, §9.4
+    "spurious + overflow" thesis).
+  - `streaming_resume_fault_inj_smoke.py` is the regression
+    gate. Standalone tenant manifest (`examples/streaming-fault-
+    inj-tenant.json` + `examples/loop46-demo-tenants/streaming_
+    fault_inj/index.mjs`). Verified sensitive: a controlled
+    anti-fix that reverts the staging in the stream+writes arm
+    makes the smoke FAIL within the same 5s curl window
+    (`event: tick` leaks 3× during a frozen-quorum window
+    pre-fix; 0× post-fix). `streaming_kv_wake_writes_smoke.py`
+    (happy-path gate) and `zig build test` both green.
+  - `worker.zig` resumeStream doc-comment and
+    `streaming-model.md` §2 implementation-status note both
+    updated to reflect the going-forward contract.
 - **Phase 4.1 (post-Phase-5)**: implement `interpretCmd` as the
   exhaustive switch over the post-Phase-5 Cmd union (kv_write +
   unified outbound HTTP + respond + conn_write). Move the effect
@@ -654,27 +674,17 @@ Phase-0 baseline.
 
 ## 10. First session (cold start)
 
-**Current state (2026-05-22):** Phases 0 through 4.0 shipped on the
-`effect-reification` branch (15 commits). See `git log main..effect-
-reification`. Active next piece is **Phase 4.0.b** — implement the
-streaming commit-gate fix decided in 4.0.
+**Current state (2026-05-22):** Phases 0 through 4.0.b shipped on
+the `effect-reification` branch. See `git log main..effect-
+reification`. Phase 4.1 (the `interpretCmd` unification over the
+post-Phase-5 Cmd union) is deferred until **Phase 5** lands
+(durability-as-JS-shim, [[project_durability_as_js_shim]]) — its
+shape depends on the post-Phase-5 effect surface.
 
-If picking up Phase 4.0.b specifically:
-
-1. Read [[feedback_model_simplicity_safety]] (the principle behind
-   the decision).
-2. Read [[project_durability_as_js_shim]] for the parallel decision
-   pattern (default to safe + JS-shim composition).
-3. Read this doc's Phase 4 section (above) — the
-   approach-sketch lives there.
-4. Re-read `worker.zig:5377-5380` — the comment is the smoking gun;
-   it documents the eager-ship behavior being removed.
-5. The new fault-injection smoke is the gate — there's currently NO
-   way to verify the fix without it. Pattern off
-   `scripts/readonly_speculation_faultinj_smoke.py` (the
-   idiom-0 fault gate).
-6. Don't extend `streaming-model.md` §2 — the rule's correct; the
-   implementation-status note retires when 4.0.b lands.
+Next active piece: **Phase 5** — retire `http.send` as a Zig
+primitive; rebuild `webhook.send.js` / `email.send.js` as JS-shim
+compositions on top of kv + outbound HTTP + cron + boot
+subscriptions. See §6 Phase 5 (above) for the step plan.
 
 If picking up a different sub-phase entirely:
 

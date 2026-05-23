@@ -1,0 +1,11 @@
+{
+  "_comment": "Minimal seed manifest for scripts/streaming_resume_fault_inj_smoke.py — one self-contained tenant: inbound returns __rove_stream with a 1.5s timer wake; the wake_batch hop kv.sets + emits a `tick` chunk (writes + chunk = the §2-rule arm Phase 4.0.b gates). Freezing followers between the inbound and the timer wake forces the propose's raft fault — the chunk must NOT leak to the wire during the commit-wait window (pre-fix it did).",
+  "tenants": [
+    {
+      "id": "streamfi",
+      "files": [
+        {"path": "index.mjs", "source": "loop46-demo-tenants/streaming_fault_inj/index.mjs"}
+      ]
+    }
+  ]
+}

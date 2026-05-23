@@ -66,21 +66,18 @@ the one rule. That is the proof this model is real and not
 cosmetic: there is one rule, and buffering is what it looks like
 with one step.
 
-> **Implementation status (2026-05-22).** First-hop chunks already
-> obey this rule today — entities in `raft_pending_*` enforce it
+> **Implementation status (2026-05-22).** The rule holds end-to-end.
+> First-hop chunks: entities in `raft_pending_*` enforce it
 > structurally (the entity moves to `stream_response_in` only on
-> commit, then h2 ships). **Resume-hop chunks currently ship
-> pre-commit** via `proposeForgetfulWrites`'s eager-fire path
-> (`worker.zig:5377-5380`) — an exception the code chose
-> deliberately, citing the §7 / §9.4 "notify, refetch" recovery
-> story. **That exception is being removed** (algebra §7 worklist
-> #2 decided 2026-05-22 in favor of fixing the code, per
-> [[feedback_model_simplicity_safety]]). The rule stated above
-> IS the going-forward contract; the resume-path code matches it
-> in `effect-reification-plan.md` Phase 4.0.b. Until 4.0.b lands,
-> a raft fault during a resume-hop writeset CAN leak a chunk to
-> the wire whose kv effects don't durably commit; customer-side
-> idempotency is the recovery path in the meantime.
+> commit, then h2 ships). Resume-hop chunks (terminal + writes,
+> stream + writes): `effect-reification-plan.md` Phase 4.0.b stages
+> them on `BufferedSendKvOps.staged_chunks` (`worker.zig`) and
+> transfers them onto the entity's `StreamChunks` in the
+> `parked_units` commit arm via `transferStagedChunks`; the fault
+> arm discards via `BufferedSendKvOps.deinit`. A raft fault during
+> a resume-hop writeset now drops the chunk silently — no customer-
+> observable wire byte until the activation that produced it
+> committed. Gated by `scripts/streaming_resume_fault_inj_smoke.py`.
 
 ---
 

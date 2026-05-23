@@ -118,25 +118,61 @@ pub const RaftWait = struct {
 };
 
 /// The buffered effects a `ParkedUnit` carries — commit-gated
-/// `_send/owed/*` arm/resolve intents + kv-wake broadcast intents.
+/// `_send/owed/*` arm/resolve intents + kv-wake broadcast intents +
+/// (effect-reification Phase 4.0.b) resume-hop stream chunks +
+/// terminal-draining marker staged to apply on commit.
 /// Released by `drainRaftPending` on `committedSeq >= seq` (via
-/// `firePendingSendOps` + `firePendingKvWakes`); discarded on
-/// fault/timeout/leadership-loss (the effect never escaped — the
-/// durable per-tenant `_send/owed/` + new-leader boot-scan recover
-/// any dropped send_ops; the §9.4 "spurious + overflow" thesis
-/// tolerates dropped kv_wakes).
+/// `firePendingSendOps` + `firePendingKvWakes` + the streaming-
+/// commit arm); discarded on fault/timeout/leadership-loss (the
+/// effect never escaped — the durable per-tenant `_send/owed/` +
+/// new-leader boot-scan recover any dropped send_ops; the §9.4
+/// "spurious + overflow" thesis tolerates dropped kv_wakes;
+/// `streaming-model.md` §2's one rule — "a chunk reaches the wire
+/// only after the activation that produced it has committed" —
+/// makes a fault-arm chunk-discard the rule, not the exception).
 ///
 /// Structural-deinit shape per the `effect.Continuation` contract:
-/// `pub fn deinit(*Self, allocator) void` walks both lists.
+/// `pub fn deinit(*Self, allocator) void` walks all three lists.
 pub const BufferedSendKvOps = struct {
     send_ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty,
     kv_wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty,
+
+    /// Phase 4.0.b: resume-hop stream chunks staged to ship on
+    /// commit. Each entry is an allocator-owned byte slice; the
+    /// commit arm `tryAppend`s each into `stream_entity`'s
+    /// `StreamChunks` (transferring ownership). The fault-arm
+    /// discard walks them via this type's deinit. Empty for every
+    /// non-stream `proposeForgetfulWrites` caller (disconnect,
+    /// subscription, fetch-event, admin parks).
+    staged_chunks: std.ArrayListUnmanaged([]u8) = .empty,
+
+    /// Phase 4.0.b: destination entity for `staged_chunks` transfer.
+    /// Non-null only when the parked unit comes from a resumeStream
+    /// arm — the entity is the held stream in `stream_data_out`.
+    /// The commit arm `reg.get`s it via the destination collection;
+    /// if the entity has been moved (e.g., disconnect → response_out)
+    /// or destroyed in the interim, the chunks are freed via
+    /// `BufferedSendKvOps.deinit`. Just a handle (index + generation)
+    /// — no cleanup needed in deinit.
+    stream_entity: ?rove.Entity = null,
+
+    /// Phase 4.0.b: on commit, set the entity's `StreamDraining
+    /// .is_draining = true` after the chunks transfer. The terminal-
+    /// resume arm uses this so the close-on-empty-queue sequence
+    /// starts only after raft commits (pre-fix `markStreamDraining`
+    /// fired immediately in `resumeStream`'s terminal+writes arm,
+    /// which started the close BEFORE the writes durably committed —
+    /// the leak this phase closes). False for the stream+writes
+    /// resume arm (handler continues) and every non-stream caller.
+    mark_draining: bool = false,
 
     pub fn deinit(self: *BufferedSendKvOps, allocator: std.mem.Allocator) void {
         for (self.send_ops.items) |*o| o.deinit(allocator);
         self.send_ops.deinit(allocator);
         for (self.kv_wakes.items) |*w| w.deinit(allocator);
         self.kv_wakes.deinit(allocator);
+        for (self.staged_chunks.items) |c| allocator.free(c);
+        self.staged_chunks.deinit(allocator);
         self.* = .{};
     }
 };
@@ -4138,6 +4174,19 @@ pub fn drainRaftPending(worker: anytype) !void {
                     }
                     firePendingSendOps(worker, unit);
                     firePendingKvWakes(worker, unit);
+                    // Effect-reification Phase 4.0.b: transfer the
+                    // resume-hop's staged chunks onto the destination
+                    // entity's StreamChunks now that the writes are
+                    // durably committed (streaming-model.md §2). If
+                    // the entity moved or was destroyed in the
+                    // interim (e.g., client disconnect race), the
+                    // chunks free via the structural unit-deinit
+                    // below — the customer's view is "no chunk
+                    // shipped + writes durable," which the §2 rule
+                    // permits (the chunk depended on the activation
+                    // that produced it; an entity gone means the
+                    // socket is gone, so there's nowhere to ship to).
+                    transferStagedChunks(worker, unit);
                     server.reg.destroy(ent) catch |err| std.log.warn(
                         "rove-js parked_units commit destroy: {s}",
                         .{@errorName(err)},
@@ -5210,17 +5259,26 @@ fn matchEventsToWakes(
 ///                `.wake_batch` activation.
 ///   - **run**:   `dispatcher.runOutcome` (chain-tail txn).
 ///   - **apply (Cmd-list)**: switch on outcome:
-///       • terminal → append body to StreamChunks + markStreamDraining
-///         (eager-fire writes via proposeForgetfulWrites if any).
+///       • terminal → on read-only: append body to StreamChunks +
+///         markStreamDraining immediately. On wrote: stage body
+///         chunk + mark_draining=true on `BufferedSendKvOps`;
+///         `proposeForgetfulWrites`'s parked unit applies them
+///         from the commit arm (Phase 4.0.b — `streaming-model.md`
+///         §2 rule).
 ///       • stream → update StreamChain.ctx_json + StreamWakes
-///         (kv_prefixes / interval / next_wake) + append new chunks +
-///         increment activation_count. Eager-fire writes.
+///         (kv_prefixes / interval / next_wake) + increment
+///         activation_count (eager — internal state). On read-only:
+///         transfer chunks now. On wrote: stage chunks on the
+///         parked unit; commit arm transfers them onto StreamChunks
+///         after raft commits.
 ///       • continuation → 501 + markStreamDraining (`__rove_next`
 ///         from a stream-resume hop is out of scope).
 ///
-/// Phase 4b lifted the read-only constraint — write-path resumes
-/// `proposeForgetfulWrites` the txn (no entity awaiting commit; the
-/// writes + their `_send/owed/` arms + §4.6 wakes fire on commit).
+/// Phase 4b lifted the read-only constraint; Phase 4.0.b closed the
+/// chunk-leak: write-path resumes `proposeForgetfulWrites` the txn
+/// AND stage their chunks on the parked unit so the chunks reach the
+/// wire only after raft commits. A fault arm discards both the txn
+/// (rollback) and the staged chunks (`BufferedSendKvOps.deinit`).
 fn resumeStream(
     worker: anytype,
     ent: rove.Entity,
@@ -5370,19 +5428,39 @@ fn resumeStream(
                 r.exception = &.{};
                 return;
             }
-            // Phase 4b: terminal + writes. Eager-fire: queue the
-            // body as the last chunk, flag close_pending, and propose
-            // the writes asynchronously via the parked_units sweep
-            // (same path as the §4.4 disconnect activation's writes).
-            // The chunks may ship to the client BEFORE raft commits —
-            // a §7/§9.4 trade-off the plan accepts: handlers refetch
-            // authoritative state on every activation, so a spurious
-            // frame on a raft fault is recoverable.
+            // Effect-reification Phase 4.0.b: terminal + writes —
+            // stage the body chunk + the draining flag on the
+            // parked unit so they apply only after raft commits
+            // (`streaming-model.md` §2 rule). Pre-fix this arm
+            // queued the body into StreamChunks AND fired
+            // `markStreamDraining` immediately, both eagerly — a
+            // raft fault during the commit-wait window would close
+            // the stream and ship the terminal frame whose writes
+            // never durably landed. Post-fix the parked_units
+            // commit arm (via `transferStagedChunks`) is the single
+            // release point.
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id) catch |perr| {
+                var stage: StreamResumeStage = .{
+                    .entity = ent,
+                    .mark_draining = true,
+                };
+                defer {
+                    for (stage.chunks.items) |c| allocator.free(c);
+                    stage.chunks.deinit(allocator);
+                }
+                if (r.body.len > 0) {
+                    const owned = try allocator.dupe(u8, r.body);
+                    errdefer allocator.free(owned);
+                    try stage.chunks.append(allocator, owned);
+                }
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage) catch |perr| {
                     std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
+                    // No commit gate to wait for — close the stream
+                    // now so the customer sees a defined 500 rather
+                    // than a half-open stream. Helper has already
+                    // freed `stage.chunks`; the defer is a no-op.
                     markStreamDraining(server, ent);
                     captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
                     r.console = &.{};
@@ -5391,11 +5469,12 @@ fn resumeStream(
                 };
                 txn_owned = false;
                 txn_done = true;
-                if (r.body.len > 0) {
-                    const owned = try allocator.dupe(u8, r.body);
-                    try chunks_st.tryAppend(allocator, owned);
-                }
-                markStreamDraining(server, ent);
+                // `markStreamDraining` does NOT fire here — the
+                // commit arm flips it via `stage.mark_draining`
+                // strictly after the body lands in StreamChunks.
+                // Until then the stream stays alive; on commit the
+                // serviceParkedStreams tick drains the chunk and
+                // then closes (chunks-empty + is_draining).
                 chain_st.activation_count += 1;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
                 captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
@@ -5436,11 +5515,39 @@ fn resumeStream(
             captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
         },
         .stream => |*s2| {
-            // Phase 4b: stream + writes. Eager-fire as in the
-            // terminal+writes branch.
+            // Effect-reification Phase 4.0.b: stream + writes —
+            // stage `s2.chunks` on the parked unit so they ship
+            // only after raft commits (`streaming-model.md` §2
+            // rule). The internal-state updates further down
+            // (ctx_json / interval / kv_prefixes / activation_count)
+            // stay eager — the §2 rule covers chunks reaching the
+            // wire, not per-stream runtime state; handlers re-read
+            // kv on every activation so a fault leaving ctx
+            // ahead of durable kv is recoverable by the customer.
+            var stage: StreamResumeStage = .{
+                .entity = ent,
+                .mark_draining = false,
+            };
+            defer {
+                for (stage.chunks.items) |c| allocator.free(c);
+                stage.chunks.deinit(allocator);
+            }
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id) catch |perr| {
+                // Move s2.chunks → stage.chunks BEFORE the propose
+                // so a propose failure frees them via the helper.
+                if (s2.chunks.len > 0) {
+                    try stage.chunks.ensureUnusedCapacity(allocator, s2.chunks.len);
+                    for (s2.chunks) |c| stage.chunks.appendAssumeCapacity(c);
+                    allocator.free(s2.chunks);
+                    s2.chunks = &.{};
+                }
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage) catch |perr| {
                     std.log.warn("rove-js stream-resume (stream + writes): propose failed: {s}", .{@errorName(perr)});
+                    // Helper already freed `stage.chunks` (the
+                    // outer defer is now a no-op). Free what's
+                    // left on the outcome struct (headers /
+                    // ctx_json / kv_prefixes — chunks slice is
+                    // already `&.{}`).
                     s2.deinit(allocator);
                     txn_owned = false;
                     txn_done = true;
@@ -5467,6 +5574,10 @@ fn resumeStream(
             // takes ownership of each chunk pointer; cap-overflow
             // frees the chunk + increments `dropped_chunks` (the
             // next activation surfaces it via write_pressure).
+            // Phase 4.0.b: on the `wrote` path, `s2.chunks` is
+            // already `&.{}` (moved into `stage` above); this loop
+            // no-ops there. On the read-only path it ships the
+            // chunks immediately — no raft propose, no commit gate.
             for (s2.chunks) |c| try chunks_st.tryAppend(allocator, c);
             if (s2.chunks.len > 0) allocator.free(s2.chunks);
             s2.chunks = &.{};
@@ -5651,7 +5762,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                 return;
             }
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null) catch |perr| {
                     std.log.warn("rove-js stream-disconnect: propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false; // helper destroyed it
                     txn_done = true;
@@ -5687,7 +5798,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
             // §4.6 wakes) materialize for other observers.
             cval.deinit(allocator);
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null) catch |perr| {
                     std.log.warn("rove-js stream-disconnect (cont return): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -5706,7 +5817,7 @@ fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .stream => |*s2| {
             s2.deinit(allocator);
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null) catch |perr| {
                     std.log.warn("rove-js stream-disconnect (stream return): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -5911,7 +6022,7 @@ pub fn fireSubscriptionActivation(
                 return;
             }
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
                     std.log.warn("rove-js subscription-fire ({s}): propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -5951,7 +6062,7 @@ pub fn fireSubscriptionActivation(
                 .{subscription_name},
             );
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
                     std.log.warn("rove-js subscription-fire ({s}) cont-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -5977,7 +6088,7 @@ pub fn fireSubscriptionActivation(
                 .{subscription_name},
             );
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
                     std.log.warn("rove-js subscription-fire ({s}) stream-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -6000,6 +6111,28 @@ pub fn fireSubscriptionActivation(
     }
 }
 
+/// Effect-reification Phase 4.0.b: a resume-hop's staged chunks +
+/// terminal-draining flag, parked on the unit alongside its txn so
+/// they apply on commit (chunks transfer into the entity's
+/// `StreamChunks` via `tryAppend`; if `mark_draining`, the entity's
+/// `StreamDraining.is_draining` flips to true). Discarded on fault
+/// — the chunks free via `BufferedSendKvOps.deinit`, the draining
+/// flag never sets, the stream stays alive for the next wake.
+///
+/// Ownership discipline: passed to `proposeForgetfulWrites` by
+/// mutable pointer. The helper takes the chunks list (sets
+/// `stage.chunks = .empty`) unconditionally — on success the
+/// chunks move into the unit; on every error path they free
+/// inside the helper's errdefer. Caller's `defer` over
+/// `stage.chunks` is then a no-op (the list is empty), making
+/// build-staged-chunks-then-hand-off symmetric on success and
+/// failure.
+pub const StreamResumeStage = struct {
+    entity: rove.Entity,
+    chunks: std.ArrayListUnmanaged([]u8) = .empty,
+    mark_draining: bool = false,
+};
+
 /// Phase 4c: propose a write batch that nobody is waiting on. The
 /// txn rides a `ParkedUnit.txn` field that the parked_units sweep
 /// in `drainRaftPending` commits at the seq — same gate as the
@@ -6013,16 +6146,47 @@ pub fn fireSubscriptionActivation(
 /// we can't gate the held-response on commit, but we still want
 /// the writes + their side effects to land durably.
 ///
-/// On success the helper consumes the txn pointer (moved into
-/// the ParkedUnit). On failure it rolls back + destroys it, so
-/// the caller's `txn_owned` flag should flip to false either way.
+/// Effect-reification Phase 4.0.b: the optional `stage` parameter
+/// is the new commit-gated streaming-chunks payload. When non-null,
+/// it carries an entity in `stream_data_out` + the chunks that the
+/// `resumeStream` arm would otherwise have appended eagerly. The
+/// parked_units commit arm transfers them onto the entity's
+/// `StreamChunks` (and, if `stage.mark_draining`, sets the
+/// terminal-draining flag) AFTER the txn commits — closing
+/// `streaming-model.md` §2's pre-commit chunk leak. Disconnect,
+/// subscription, and fetch-event callers pass `null`; they're
+/// either entity-less or already disconnect-tolerant.
+///
+/// On success the helper consumes the txn pointer AND the `stage`
+/// chunks (moved into the ParkedUnit). On failure it rolls back +
+/// destroys the txn AND frees any staged chunks; the caller's
+/// `txn_owned` flag flips to false either way, and the helper
+/// resets `stage.chunks` to `.empty` unconditionally so the
+/// caller's `defer` over the list is a no-op on every path.
 fn proposeForgetfulWrites(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
     txn: *kv_mod.KvStore.TrackedTxn,
     tenant_id: []const u8,
+    stage_opt: ?*StreamResumeStage,
 ) !void {
     const allocator = worker.allocator;
+
+    // Take ownership of the staged chunks up-front so every error
+    // path that returns frees them. The caller's `stage.chunks` is
+    // reset to `.empty` immediately, severing the caller's view
+    // of the buffers — the helper now owns them unconditionally
+    // (transfer-to-unit on success or free-via-errdefer on error).
+    var stage_chunks: std.ArrayListUnmanaged([]u8) = if (stage_opt) |s| blk: {
+        const taken = s.chunks;
+        s.chunks = .empty;
+        break :blk taken;
+    } else .empty;
+    errdefer {
+        for (stage_chunks.items) |c| allocator.free(c);
+        stage_chunks.deinit(allocator);
+    }
+
     txn.releaseLease();
     const seq = raft_propose.proposeBatch(worker, writeset, tenant_id) catch |err| {
         txn.rollback() catch {};
@@ -6062,21 +6226,28 @@ fn proposeForgetfulWrites(
     }
 
     // Build the unit, transferring ownership of every owned field
-    // (send_ops, kv_wakes, txn, tenant_id). The staging pattern
-    // mirrors StreamChunks / SubscriptionFireDescriptor: assign
-    // owned slices into the unit, IMMEDIATELY clear the caller-side
-    // locals to invalidate their errdefers, arm the unit-deinit
+    // (send_ops, kv_wakes, staged_chunks, txn, tenant_id). The
+    // staging pattern mirrors StreamChunks / SubscriptionFireDescriptor:
+    // assign owned slices into the unit, IMMEDIATELY clear the caller-
+    // side locals to invalidate their errdefers, arm the unit-deinit
     // errdefer, then `reg.set` (copies bitwise; column takes the
     // pointers) + clear the unit to invalidate its own errdefer.
     var unit: ParkedUnit = .{
         .seq = seq,
         .deadline_ns = @intCast(std.time.nanoTimestamp() +
             @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .buffered = .{ .send_ops = unit_send_ops, .kv_wakes = unit_kv_wakes },
+        .buffered = .{
+            .send_ops = unit_send_ops,
+            .kv_wakes = unit_kv_wakes,
+            .staged_chunks = stage_chunks,
+            .stream_entity = if (stage_opt) |s| s.entity else null,
+            .mark_draining = if (stage_opt) |s| s.mark_draining else false,
+        },
         .txn = txn,
     };
     unit_send_ops = .empty;
     unit_kv_wakes = .empty;
+    stage_chunks = .empty;
     errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
 
     // Allocate tenant_id AFTER arming the unit errdefer so a dupe
@@ -6089,6 +6260,80 @@ fn proposeForgetfulWrites(
     errdefer worker.h2.reg.destroy(ent) catch {};
     try worker.h2.reg.set(ent, &worker.parked_units, ParkedUnit, unit);
     unit = .{}; // ownership transferred to the column
+}
+
+/// Effect-reification Phase 4.0.b: commit-arm transfer of staged
+/// resume-hop chunks onto the destination entity's `StreamChunks`,
+/// plus the optional terminal-draining flag flip. Called by the
+/// parked_units commit branch in `drainRaftPending` — strictly AFTER
+/// the txn commits, so the chunks ride the streaming-model.md §2
+/// rule (a chunk reaches the wire only after the activation that
+/// produced it has committed).
+///
+/// Ownership: `unit.buffered.staged_chunks` items transfer into
+/// the entity's `StreamChunks` via `tryAppend` (which takes
+/// ownership on success or frees + bumps `dropped_chunks` on cap
+/// overflow — §9.4). Whatever this fn leaves behind in
+/// `staged_chunks` is freed by `BufferedSendKvOps.deinit` when the
+/// parked_units entity destroys; on the happy path the list is
+/// `clearRetainingCapacity`'d so the deinit walk does nothing.
+///
+/// Disconnect race: if the entity has been moved out of
+/// `stream_data_out` (e.g., into `response_out` by h2's
+/// `serverStreamClose`) or destroyed, `reg.get` returns an error
+/// and the chunks stay in `staged_chunks` for the structural
+/// deinit to free. Customer view: writes committed, no chunk on
+/// the wire (the socket was gone before commit landed) — the same
+/// "your terminal frame was lost because the client disconnected
+/// first" semantics today's disconnect activation already encodes.
+fn transferStagedChunks(worker: anytype, unit: *ParkedUnit) void {
+    const buf = &unit.buffered;
+    const stream_ent = buf.stream_entity orelse return;
+    if (buf.staged_chunks.items.len == 0 and !buf.mark_draining) return;
+    const allocator = worker.allocator;
+    const server = worker.h2;
+
+    const chunks_ptr = server.reg.get(
+        stream_ent,
+        &server.stream_data_out,
+        components_mod.StreamChunks,
+    ) catch {
+        std.log.info(
+            "rove-js stream-resume commit: entity moved/destroyed before commit; "
+                ++ "discarding {d} staged chunks (tenant={s})",
+            .{ buf.staged_chunks.items.len, unit.tenant_id },
+        );
+        return; // BufferedSendKvOps.deinit will free the staged chunks.
+    };
+    for (buf.staged_chunks.items) |chunk| {
+        chunks_ptr.tryAppend(allocator, chunk) catch |err| {
+            // Allocator failure on a chunk append is rare; the
+            // chunk is freed by tryAppend's error path. Log and
+            // continue so later chunks still ship.
+            std.log.warn(
+                "rove-js stream-resume commit: chunks_st.tryAppend failed: {s}",
+                .{@errorName(err)},
+            );
+        };
+    }
+    // The list now holds slices whose memory has either been
+    // adopted by StreamChunks (happy path or cap-free) or freed
+    // (cap-overflow / append error). Clear without freeing so
+    // the deinit walk doesn't double-free.
+    buf.staged_chunks.clearRetainingCapacity();
+
+    if (buf.mark_draining) {
+        // markStreamDraining-on-commit: same lookup discipline as
+        // the chunk transfer above. A racing destroy is logged
+        // and ignored — the entity going away is the upstream
+        // signal that the customer no longer cares.
+        const drain_ptr = server.reg.get(
+            stream_ent,
+            &server.stream_data_out,
+            components_mod.StreamDraining,
+        ) catch return;
+        drain_ptr.is_draining = true;
+    }
 }
 
 /// Fire commit-gated send arm/resolve intents into the leader-local
@@ -6642,7 +6887,7 @@ fn fireFetchEventActivation(
                 return;
             }
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -6680,7 +6925,7 @@ fn fireFetchEventActivation(
                 .{module_path},
             );
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -6706,7 +6951,7 @@ fn fireFetchEventActivation(
                 .{module_path},
             );
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
