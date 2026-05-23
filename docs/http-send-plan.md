@@ -1,6 +1,39 @@
 # http.send plan — outbound HTTP primitive + customer-JS retry policy
 
-> **2026-05-19 corrigendum (read this first)** — the N-way
+> **2026-05-22 corrigendum (read this FIRST, before the others)** —
+> the dedicated `http.send` primitive is **retiring**. Decision: per
+> [[project_durability_as_js_shim]] (memory, mirrored in
+> `effect-algebra.md` §6 rule 2 + §7 worklist #7 +
+> `effect-reification-plan.md` Phase 5), durability becomes a
+> standard-library JS composition — `webhook.send.js` / `email.send.
+> js` build on `kv.set("_send/owed/{id}", ...)` (rides envelope-0
+> atomic with the handler's writes) + the outbound HTTP primitive +
+> a `_subscriptions/_send_retry/` cron + a boot subscription on
+> leader-promotion. **`SendDispatch`, `InflightSet`, `send_outbox`,
+> `parkSendOps`, `firePendingSendOps`, and apply.zig's
+> `_send/owed` / `_send/proof` special-cases all delete.**
+>
+> What stays: the per-tenant `_send/owed/{id}` marker pattern + the
+> retry semantics + the on-result chain hop — they just live in JS
+> as a composition of existing primitives, not as a baked-in Zig
+> verb. Customer-facing API (`webhook.send`, `email.send`) is
+> unchanged.
+>
+> Why now: the model in `effect-algebra.md` calls outbound HTTP one
+> runtime; the implementation duplication (`SendDispatch` +
+> `FetchPool` parallel pools) was the symptom of having forked it.
+> The streaming case proved the durable-as-primitive framing
+> doesn't compose with chunked responses. Pre-launch is the right
+> time to fix it. The performance cost of JS-shim durability is
+> acceptable at pre-launch volumes; a paid-tier fast path
+> pattern-matches the shim and bypasses to native dispatch later.
+>
+> §§1–14 + §15 below describe the *historical* designs (pre-
+> Option-(b), then Option-(b) shipped). Read them as background;
+> the going-forward shape lives in `effect-reification-plan.md`
+> Phase 5.
+
+> **2026-05-19 corrigendum** — the N-way
 > re-platform (**Option (b)**, §15) is **SHIPPED**. §§1–14 below
 > describe the *historical* pre-Option-(b) design (cluster-wide
 > `schedules.db`, raft envelopes 8/9/10/11, the single leader-pinned
