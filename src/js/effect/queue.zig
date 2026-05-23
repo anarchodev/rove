@@ -43,6 +43,7 @@
 
 const std = @import("std");
 const msg_mod = @import("msg.zig");
+const components_mod = @import("../components.zig");
 
 const Msg = msg_mod.Msg;
 
@@ -77,18 +78,17 @@ pub const MsgQueue = struct {
         // exhaustiveness so a forgotten arm is a build break.
         for (self.items.items) |*m| switch (m.*) {
             .subscription_fire => |*sf| sf.deinit(self.allocator),
+            .fetch_chunk, .fetch_done, .fetch_pipe_done => |*ev| {
+                components_mod.UpstreamFetchEvent.deinitItem(ev, self.allocator);
+            },
             // Phase 2A placeholders: empty payloads, no owned bytes.
-            // Phase 2C+ wires kv-react (still .subscription_fire);
-            // 2D-2F fill these in with their own deinit.
+            // 2E-2F fill these in with their own deinit.
             .inbound,
             .send_callback,
             .timer,
             .disconnect,
             .kv_wake,
             .wake_batch,
-            .fetch_chunk,
-            .fetch_done,
-            .fetch_pipe_done,
             => {},
         };
         self.items.deinit(self.allocator);

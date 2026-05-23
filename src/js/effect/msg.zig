@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const log_mod = @import("rove-log");
+const components_mod = @import("../components.zig");
 
 /// The 10-variant activation tag — wire-stable on the tape. The `Msg`
 /// union's tag IS this enum.
@@ -121,23 +122,25 @@ pub const SubscriptionFire = struct {
 };
 
 /// `http.fetch` Pattern A `on_chunk` activation (primitive-gaps §2.3).
-/// Today: `FetchPool` libcurl → `enqueueFetchEventForTenant` →
-/// `FetchChunkInbox` → drained into `fetch_event_pending`. Phase 2D
-/// migrates this to `enqueueMsg(.{ .fetch_chunk = ... })` AND tapes
-/// the chunk bytes — fixing the algebra §7 worklist #1 untaped-chunk
-/// bug. The variant payload will reference / subsume
-/// `components.UpstreamFetchEvent` (its chunk-bearing variant).
-pub const FetchChunk = struct {};
+/// FetchPool libcurl → `enqueueFetchEventForTenant` → cross-thread
+/// `FetchChunkInbox` → `drainFetchChunkInbox` MOVES the event onto
+/// this variant (no re-dup) → `enqueueMsg` (tapes the chunk bytes
+/// via `TapePayloads.activation_bytes`, closes algebra §7 worklist
+/// #1) → dispatch fires `on_chunk` activation. The payload IS the
+/// existing `UpstreamFetchEvent` ("fat" struct over chunk / done /
+/// pipe_done — the redundant `.kind` field agrees with the Msg
+/// variant tag; Phase 5 cleanup may split the shape per variant).
+pub const FetchChunk = components_mod.UpstreamFetchEvent;
 
-/// Terminal of a Pattern-A `on_chunk` fetch. Today: same path as
-/// `FetchChunk`. Phase 2D migrates alongside it.
-pub const FetchDone = struct {};
+/// Terminal of a Pattern-A `on_chunk` fetch. Same path + payload
+/// type as `FetchChunk`; the Msg variant tag discriminates.
+pub const FetchDone = components_mod.UpstreamFetchEvent;
 
-/// Terminal of a Pattern-B `pipe_to` fetch. Today: same path. Phase 2D
-/// migrates alongside the rest. (`pipe_to` itself has no Msg-into-handler
-/// for the chunks — it bypasses the handler by design, algebra §3 row
-/// "fetch B"; only this terminal is a Msg.)
-pub const FetchPipeDone = struct {};
+/// Terminal of a Pattern-B `pipe_to` fetch. Same payload type.
+/// `pipe_to` chunks have no per-chunk Msg (they bypass the handler
+/// by design, algebra §3 row "outbound HTTP — Pattern B"); only the
+/// terminal is a Msg.
+pub const FetchPipeDone = components_mod.UpstreamFetchEvent;
 
 /// The tagged union over the wire-stable activation tag. The tag IS
 /// `ActivationSource` so `@as(ActivationSource, msg)` is the
@@ -167,6 +170,7 @@ test "Msg.kind projects to ActivationSource tag" {
 
     const m2: Msg = .{ .fetch_chunk = .{} };
     try testing.expectEqual(ActivationSource.fetch_chunk, m2.kind());
+    try testing.expectEqual(components_mod.UpstreamFetchEvent.Kind.chunk, m2.fetch_chunk.kind);
 }
 
 test "Msg covers every ActivationSource variant exhaustively" {

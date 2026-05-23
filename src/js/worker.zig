@@ -438,9 +438,11 @@ pub const SubscriptionFireInbox = struct {
 /// wide `FetchPool` threads that drive libcurl on outbound
 /// `http.fetch` calls — each chunk libcurl writes back becomes
 /// one `UpstreamFetchEvent` here. Consumer: the owning worker
-/// drains on its tick (Phase D), translates each event into a
-/// `fetch_event_pending` collection entity, and dispatches an
-/// `on_chunk` / `on_done` activation against the chain.
+/// drains on its tick (`drainFetchChunkInbox`), MOVES each event
+/// onto the unified `msg_queue` as a `fetch_chunk` / `fetch_done` /
+/// `fetch_pipe_done` Msg variant (effect-reification Phase 2D),
+/// and `dispatchPendingMsgs` fires the matching activation against
+/// the chain.
 ///
 /// Hash-routed by `tenant_id` (same stickiness as
 /// `SubscriptionFireInbox` + the kv-wake inbox) so a chain's
@@ -2048,15 +2050,11 @@ pub fn Worker(comptime opts: Options) type {
     const ParkedUnitRow = rove.Row(&.{ParkedUnit});
     const ParkedUnitColl = rove.Collection(ParkedUnitRow, .{});
 
-    // Gap 2.3 Phase D: worker-only collection for pending upstream
-    // fetch events (chunk / end). Twin of `SubFireColl` — one
-    // component (`UpstreamFetchEvent`), no h2 stream identity (a
-    // `fetch_chunk` / `fetch_done` activation is a chain activation
-    // with no held socket, exactly like `subscription_fire`).
-    // `drainFetchChunkInbox` translates inbox messages into entities;
-    // `dispatchFetchEvents` fires + destroys them per tick.
-    const FetchEventRow = rove.Row(&.{components_mod.UpstreamFetchEvent});
-    const FetchEventColl = rove.Collection(FetchEventRow, .{});
+    // Effect-reification Phase 2D: the `fetch_event_pending`
+    // collection that lived here is gone. Inbox messages drain
+    // directly onto `Worker.msg_queue` (the unified ingress);
+    // `dispatchPendingMsgs` fires them per tick. Twin of the
+    // 2C `subscription_fire_pending` retirement.
 
     return struct {
         const Self = @This();
@@ -2171,15 +2169,6 @@ pub fn Worker(comptime opts: Options) type {
         /// reaches the right worker via
         /// `enqueueFetchEventForTenant` hash-routing.
         fetch_chunk_inbox: FetchChunkInbox = undefined,
-        /// Gap 2.3 Phase D: per-worker rove collection of pending
-        /// upstream fetch events. `drainFetchChunkInbox` (once per
-        /// tick, from `serviceFetchEvents`) pops `fetch_chunk_inbox`
-        /// messages and `reg.create`s an entity here with a
-        /// populated `UpstreamFetchEvent`; `dispatchFetchEvents`
-        /// iterates a stable snapshot, fires `fireFetchEventActivation`
-        /// for each, and `reg.destroy`s (deferred). Same shape as
-        /// `subscription_fire_pending`.
-        fetch_event_pending: FetchEventColl,
         /// Gap 2.1 Phase F: monotonic-ns of the last
         /// `sweepCronSubscriptions` invocation. Used to throttle
         /// the per-tick cron sweep to at most one pass per
@@ -2340,7 +2329,6 @@ pub fn Worker(comptime opts: Options) type {
                 .raft_pending_stream = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
-                .fetch_event_pending = try FetchEventColl.init(allocator),
                 .sub_fire_inbox = SubscriptionFireInbox.init(allocator),
                 .fetch_chunk_inbox = FetchChunkInbox.init(allocator),
                 // Effect-reification Phase 2 ingress. Cap chosen
@@ -2382,7 +2370,6 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.raft_pending_stream.deinit();
             errdefer self.parked_continuations.deinit();
             errdefer self.parked_units.deinit();
-            errdefer self.fetch_event_pending.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
@@ -2391,7 +2378,6 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.raft_pending_stream);
             reg.registerCollection(&self.parked_continuations);
             reg.registerCollection(&self.parked_units);
-            reg.registerCollection(&self.fetch_event_pending);
 
             // Register the inbox with the node so apply.zig +
             // worker_dispatch.zig can broadcast kv-write events to
@@ -2548,12 +2534,12 @@ pub fn Worker(comptime opts: Options) type {
             // still buffered at shutdown. The MsgQueue's variant
             // deinit-walk frees per-variant owned bytes (today only
             // `SubscriptionFire`).
+            // MsgQueue.deinit walks variants (subscription_fire +
+            // fetch_chunk / fetch_done / fetch_pipe_done) to free
+            // in-flight Msg payloads at shutdown.
             self.msg_queue.deinit();
             self.parked_continuations.deinit();
             self.parked_units.deinit();
-            // Gap 2.3 Phase D: rove `Collection.deinit` fires each
-            // entity's `UpstreamFetchEvent.deinit` structurally.
-            self.fetch_event_pending.deinit();
             self.raft_pending_response.deinit();
             self.raft_pending_cont.deinit();
             self.raft_pending_stream.deinit();
@@ -3140,6 +3126,39 @@ pub fn captureTapesForChain(
         }
     }
 
+    return payloads;
+}
+
+/// `captureTapesForChain` + activation-input bytes capture
+/// (effect-reification Phase 2D). Used by activations whose Msg
+/// payload carries bytes the handler reads as
+/// `request.activation.bytes` — today only `fetch_chunk`. The
+/// activation bytes ride `TapePayloads.activation_bytes` (capped at
+/// `REQUEST_BODY_CAP`, mirroring the body capture). L3 (algebra):
+/// closes worklist #1 — every Msg is recorded, including its bytes.
+pub fn captureTapesForChainWithActivation(
+    worker: anytype,
+    tapes: *RequestTapes,
+    request_body: []const u8,
+    correlation_id: ?[]const u8,
+    activation_bytes: []const u8,
+) log_mod.TapePayloads {
+    var payloads = captureTapesForChain(worker, tapes, request_body, correlation_id);
+    if (activation_bytes.len == 0) return payloads;
+    // Honor the cap. If the chain just got capped on the
+    // request-side capture, skip activation bytes too — match the
+    // §6 "uniform boundary" posture (no half-recorded activation).
+    if (correlation_id) |cid| {
+        if (chainTapeAlreadyCapped(worker.node, cid)) return payloads;
+    }
+    const allocator = worker.allocator;
+    const captured_len = @min(activation_bytes.len, REQUEST_BODY_CAP);
+    if (allocator.dupe(u8, activation_bytes[0..captured_len])) |captured| {
+        payloads.activation_bytes = captured;
+        payloads.activation_bytes_truncated = captured_len < activation_bytes.len;
+    } else |err| {
+        std.log.warn("rove-js activation-bytes capture failed: {s}", .{@errorName(err)});
+    }
     return payloads;
 }
 
@@ -6534,33 +6553,26 @@ pub fn serviceSubscriptionFires(worker: anytype) void {
     dispatchSubscriptionFires(worker);
 }
 
-/// Worker-tick system: dequeue each `effect.SubscriptionFire` Msg
-/// from `worker.msg_queue` (up to `BATCH` per tick), fire it via
-/// `fireSubscriptionActivation`, then `deinit` its owned strings.
-/// Per-tick cap bounds tail latency on the request hot path: a
-/// misbehaving handler with many fires pending eats at most `BATCH`
-/// activations per tick before yielding back to the h2 loop;
-/// remaining fires drain on subsequent ticks.
-pub fn dispatchSubscriptionFires(worker: anytype) void {
+/// Worker-tick system: dequeue Msgs from `worker.msg_queue` (up to
+/// `BATCH` per tick) and dispatch each by variant. Per-tick cap
+/// bounds tail latency on the request hot path: a misbehaving
+/// handler with many activations pending eats at most `BATCH` per
+/// tick before yielding back to the h2 loop; remaining drain on
+/// subsequent ticks.
+///
+/// Effect-reification Phase 2D: the unified dispatcher across every
+/// migrated Msg variant — subscription fires (cron / boot / kv-react,
+/// Phase 2B/C) and outbound HTTP events (chunk / done / pipe_done,
+/// Phase 2D). Phases 2E-2F add send-callback / inbound-HTTP arms.
+///
+/// Re-entrant `enqueueMsg` calls during a dispatch append to the
+/// queue's tail; the current tick's batch is capped at `BATCH` so
+/// new entries process next tick (deferred dispatch).
+pub fn dispatchPendingMsgs(worker: anytype) void {
     const BATCH: usize = 64;
     var fired: usize = 0;
+    const allocator = worker.allocator;
 
-    // Drain `effect.SubscriptionFire` variants from `msg_queue`. All
-    // three subscription origins (cron + boot via `drainSubFireInbox`;
-    // kv-react via `fireKvReactSubscriptions`) feed this single queue
-    // post Phase 2C. The boot-fire `_boot_fired/<dep_id>` marker is
-    // injected into the handler's writeset INSIDE
-    // `fireSubscriptionActivation` (Gap 2.1 Phase D) so it commits
-    // atomically with the handler's effects — no separate post-fire
-    // write needed.
-    //
-    // Re-entrant `enqueueMsg` calls during a fire append to the
-    // queue's tail; the current tick's batch was already capped at
-    // `BATCH` so new entries process next tick (deferred dispatch,
-    // matching the pre-2C collection's `reg.destroy` deferral).
-    //
-    // Phases 2D-2F (fetch / send-callback / inbound-HTTP) add more
-    // variants to this same queue with their own dispatch arms.
     while (fired < BATCH) {
         const msg = worker.msg_queue.dequeue() orelse break;
         switch (msg) {
@@ -6577,16 +6589,38 @@ pub fn dispatchSubscriptionFires(worker: anytype) void {
                         .boot => |b| SubscriptionFireSource{ .boot = .{ .deployment_id = b.deployment_id } },
                     },
                 );
-                sf.deinit(worker.allocator);
+                sf.deinit(allocator);
+                fired += 1;
+            },
+            .fetch_chunk, .fetch_done, .fetch_pipe_done => {
+                // Unwrap the active variant (same payload type aliased
+                // three ways — the Msg tag IS the discriminant; the
+                // `.kind` field on the event is redundant and agrees).
+                var ev: components_mod.UpstreamFetchEvent = switch (msg) {
+                    .fetch_chunk => |e| e,
+                    .fetch_done => |e| e,
+                    .fetch_pipe_done => |e| e,
+                    else => unreachable,
+                };
+                if (ev.pipe_to_held) {
+                    // Pattern B: bytes bypass the handler — routed
+                    // straight to the held client's StreamChunks. No
+                    // activation, so nothing is taped (by design;
+                    // see [[project_pipe_to_untaped]]).
+                    routePipeEvent(worker, &ev);
+                } else {
+                    // Pattern A: each chunk / the terminal fires a
+                    // handler activation. Phase 2D wires the chunk-
+                    // bytes tape capture inside
+                    // `fireFetchEventActivation`.
+                    fireFetchEventActivation(worker, &ev);
+                }
+                components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
                 fired += 1;
             },
             else => {
-                // Pre-2D: no other variant should be in msg_queue
-                // yet. Log + drop to avoid silent retention on the
-                // queue. When subsequent phases add variants here,
-                // each gets a dedicated dispatch arm.
                 std.log.warn(
-                    "rove-js msg_queue: unexpected variant kind={s} pre-Phase-2D",
+                    "rove-js msg_queue: unexpected variant kind={s} (no dispatch arm yet)",
                     .{@tagName(msg.kind())},
                 );
             },
@@ -6594,91 +6628,68 @@ pub fn dispatchSubscriptionFires(worker: anytype) void {
     }
 }
 
+/// Backward-compat alias: callers that explicitly named the
+/// subscription-fire dispatcher continue to work. Both this and
+/// `dispatchFetchEvents` route into the same unified
+/// `dispatchPendingMsgs`; the second-to-call sees an empty queue and
+/// is a no-op.
+pub fn dispatchSubscriptionFires(worker: anytype) void {
+    dispatchPendingMsgs(worker);
+}
+
+/// Backward-compat alias — see `dispatchSubscriptionFires`.
+pub fn dispatchFetchEvents(worker: anytype) void {
+    dispatchPendingMsgs(worker);
+}
+
 // ── Gap 2.3 Phase D — http.fetch chunk/done activations ──────────
 
 /// Worker-tick combined pass for upstream fetch events: drain the
-/// cross-thread `fetch_chunk_inbox` into the `fetch_event_pending`
-/// collection, then dispatch the collection. Called once per
+/// cross-thread `fetch_chunk_inbox` onto `worker.msg_queue`, then
+/// let `dispatchPendingMsgs` route each event. Called once per
 /// worker tick from the loop46 main tick, right after
 /// `serviceSubscriptionFires`. Cheap when both are empty.
+///
+/// Effect-reification Phase 2D: drain target is the unified MsgQueue
+/// (was: a dedicated `fetch_event_pending` rove collection — now
+/// deleted). Inbox messages get the matching Msg variant
+/// (`fetch_chunk` / `fetch_done` / `fetch_pipe_done`) selected from
+/// `ev.kind`; slices move with no re-dup (same shape as
+/// `drainSubFireInbox`).
 pub fn serviceFetchEvents(worker: anytype) void {
     drainFetchChunkInbox(worker);
-    dispatchFetchEvents(worker);
+    dispatchPendingMsgs(worker);
 }
 
-/// Drain the worker's cross-thread `fetch_chunk_inbox`, MOVING
-/// each `UpstreamFetchEvent` onto a fresh `fetch_event_pending`
-/// entity. Unlike `drainSubFireInbox` (which re-dups onto the
-/// component) the inbox message type IS the collection component
-/// type, so the slices move with no re-dup — `ev.*` is cleared
-/// after the move so the local-list defer doesn't double-free.
 fn drainFetchChunkInbox(worker: anytype) void {
     const allocator = worker.allocator;
     var local: std.ArrayListUnmanaged(components_mod.UpstreamFetchEvent) = .empty;
-    defer {
-        components_mod.UpstreamFetchEvent.deinit(allocator, local.items);
-        local.deinit(allocator);
-    }
+    defer local.deinit(allocator);
     worker.fetch_chunk_inbox.drainInto(&local) catch |err| {
         std.log.warn("rove-js fetch-event drain: {s}", .{@errorName(err)});
+        for (local.items) |*ev| components_mod.UpstreamFetchEvent.deinitItem(ev, allocator);
         return;
     };
     if (local.items.len == 0) return;
-    const server = worker.h2;
     for (local.items) |*ev| {
-        const ent = server.reg.create(&worker.fetch_event_pending) catch |err| {
-            std.log.warn("rove-js fetch-event drain create: {s}", .{@errorName(err)});
-            continue; // `ev` still owned by `local`; freed by defer
-        };
-        server.reg.set(
-            ent,
-            &worker.fetch_event_pending,
-            components_mod.UpstreamFetchEvent,
-            ev.*,
-        ) catch |err| {
-            std.log.warn("rove-js fetch-event drain set: {s}", .{@errorName(err)});
-            server.reg.destroy(ent) catch {};
-            continue; // `ev` not moved; freed by defer
-        };
-        // Slices moved into the component — clear the local copy.
+        const ev_copy = ev.*;
+        // Mark the source consumed BEFORE enqueueMsg so a failure-
+        // path deinit below doesn't double-free; on success the
+        // payload now lives on the queue.
         ev.* = .{};
-    }
-}
-
-/// Worker-tick system: dispatch every entity in
-/// `fetch_event_pending`. Same stable-snapshot + per-tick `BATCH`
-/// cap shape as `dispatchSubscriptionFires` — re-entrant fires
-/// (an `on_chunk` handler that itself calls `http.fetch`) land in
-/// the deferred-create queue and process next tick.
-pub fn dispatchFetchEvents(worker: anytype) void {
-    const BATCH: usize = 64;
-    const server = worker.h2;
-    var buf: [BATCH]rove.Entity = undefined;
-    const slice = worker.fetch_event_pending.entitySlice();
-    const n = @min(slice.len, BATCH);
-    if (n == 0) return;
-    std.mem.copyForwards(rove.Entity, buf[0..n], slice[0..n]);
-
-    for (buf[0..n]) |ent| {
-        const ev = server.reg.get(
-            ent,
-            &worker.fetch_event_pending,
-            components_mod.UpstreamFetchEvent,
-        ) catch continue;
-        if (ev.pipe_to_held) {
-            // Pattern B: bytes bypass the handler — routed straight
-            // to the held client's StreamChunks. No activation, so
-            // nothing is taped ([[project_pipe_to_untaped]]).
-            routePipeEvent(worker, ev);
-        } else {
-            // Pattern A: each chunk / the terminal fires a handler
-            // activation (fetch_chunk / fetch_done).
-            fireFetchEventActivation(worker, ev);
-        }
-        server.reg.destroy(ent) catch |err| std.log.warn(
-            "rove-js fetch-event: destroy failed: {s}",
-            .{@errorName(err)},
-        );
+        const msg: effect_mod.Msg = switch (ev_copy.kind) {
+            .chunk => .{ .fetch_chunk = ev_copy },
+            .end => .{ .fetch_done = ev_copy },
+            .pipe_done => .{ .fetch_pipe_done = ev_copy },
+        };
+        effect_mod.enqueueMsg(&worker.msg_queue, msg) catch |err| {
+            std.log.warn(
+                "rove-js fetch-event enqueueMsg (kind={s}): {s}",
+                .{ @tagName(ev_copy.kind), @errorName(err) },
+            );
+            var orphan = ev_copy;
+            components_mod.UpstreamFetchEvent.deinitItem(&orphan, allocator);
+        };
     }
 }
 
@@ -6909,6 +6920,12 @@ fn fireFetchEventActivation(
         req.activation_fetch_terminal_ok = event.terminal_ok;
     }
 
+    // Phase 2D: the activation's input bytes (the upstream chunk
+    // payload for `fetch_chunk`) get taped on `TapePayloads.activation_
+    // bytes`. Closes algebra §7 worklist #1 — replay reconstitutes
+    // the same handler invocation from the same captured bytes.
+    const activation_bytes_for_tape: []const u8 = if (event.kind == .chunk) event.bytes else &.{};
+
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
         inst.kv,
@@ -6923,7 +6940,8 @@ fn fireFetchEventActivation(
     ) catch {
         txn.rollback() catch {};
         txn_done = true;
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, act_source);
+        const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, tape_payloads, corr_full, act_source);
         return;
     };
 
@@ -6938,7 +6956,8 @@ fn fireFetchEventActivation(
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, act_source);
+                const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, tape_payloads, corr_full, act_source);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -6948,7 +6967,8 @@ fn fireFetchEventActivation(
                     std.log.warn("rove-js fetch-event ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, act_source);
+                    const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, tape_payloads, corr_full, act_source);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -6956,7 +6976,8 @@ fn fireFetchEventActivation(
                 txn_owned = false;
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, act_source);
+                const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -6968,7 +6989,8 @@ fn fireFetchEventActivation(
             );
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, act_source);
+            const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -6983,17 +7005,20 @@ fn fireFetchEventActivation(
                     std.log.warn("rove-js fetch-event ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, act_source);
+                    const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, act_source);
+                const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source);
                 return;
             }
             txn.rollback() catch {};
             txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, act_source);
+            const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source);
         },
         .stream => |*s2| {
             s2.deinit(allocator);
@@ -7006,12 +7031,14 @@ fn fireFetchEventActivation(
                     std.log.warn("rove-js fetch-event ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, act_source);
+                    const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, act_source);
+                const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -7020,7 +7047,8 @@ fn fireFetchEventActivation(
                 .{@errorName(e)},
             );
             txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, act_source);
+            const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source);
         },
     }
 }

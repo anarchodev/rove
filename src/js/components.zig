@@ -307,17 +307,24 @@ pub const UpstreamFetchEvent = struct {
     pub const Kind = enum(u8) { chunk, end, pipe_done };
 
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
-        for (items) |*item| {
-            if (item.fetch_id.len > 0) allocator.free(item.fetch_id);
-            if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
-            if (item.ctx_json.len > 0) allocator.free(item.ctx_json);
-            if (item.on_chunk_module.len > 0) allocator.free(item.on_chunk_module);
-            if (item.on_done_module.len > 0) allocator.free(item.on_done_module);
-            if (item.pipe_correlation_id.len > 0) allocator.free(item.pipe_correlation_id);
-            if (item.bytes.len > 0) allocator.free(item.bytes);
-            if (item.fetch_headers) |h| allocator.free(h);
-            item.* = .{};
-        }
+        for (items) |*item| deinitItem(item, allocator);
+    }
+
+    /// Single-item variant of `deinit` for callers that hold one
+    /// event by value (e.g. an `effect.Msg.fetch_chunk` variant
+    /// payload after dequeue). Equivalent to `deinit(allocator,
+    /// (item)[0..1])` but spelled where Zig's single-item slicing
+    /// is awkward.
+    pub fn deinitItem(item: *UpstreamFetchEvent, allocator: std.mem.Allocator) void {
+        if (item.fetch_id.len > 0) allocator.free(item.fetch_id);
+        if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
+        if (item.ctx_json.len > 0) allocator.free(item.ctx_json);
+        if (item.on_chunk_module.len > 0) allocator.free(item.on_chunk_module);
+        if (item.on_done_module.len > 0) allocator.free(item.on_done_module);
+        if (item.pipe_correlation_id.len > 0) allocator.free(item.pipe_correlation_id);
+        if (item.bytes.len > 0) allocator.free(item.bytes);
+        if (item.fetch_headers) |h| allocator.free(h);
+        item.* = .{};
     }
 };
 
