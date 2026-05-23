@@ -3945,187 +3945,131 @@ fn enqueueBootSubscriptions(slot: *TenantSlot, snap: *TenantFilesSnapshot) !void
 /// response body is overwritten with 503.
 /// Phase 5: response-bound raft park drain. Entity in
 /// `raft_pending_response` → `response_in` on commit / fault.
+/// Effect-reification Phase 3.2.b: the unified entity-backed
+/// raft-pending drain. The three pre-3.2.b functions
+/// (drainResponsePending / drainContPending / drainStreamPending)
+/// differed ONLY in the source collection, the on-commit
+/// destination, and the panic-label site name; their bodies were
+/// otherwise identical. This helper carries the shared body; the
+/// three named functions become one-line wrappers.
+///
+/// The fault arm's destination is hard-coded to `server.response_in`
+/// (the three arms all routed fault to `response_in` for the 503
+/// downgrade) — that's a per-sibling invariant of the H2 reference
+/// path. The post-fault `overwrite503InPending` + old-body free is
+/// identical across all three arms.
+///
+/// Per the Phase 3 invariant "H2 is the reference, byte-identical":
+/// this collapse is a pure source-level refactor. The compiled code
+/// matches the pre-3.2.b shape because the source/dest pointers are
+/// dispatched via anytype (Zig generates a specialized function per
+/// instantiation, each identical to its pre-3.2.b counterpart).
+fn drainEntityArm(
+    worker: anytype,
+    server: anytype,
+    allocator: std.mem.Allocator,
+    wm: effect_mod.Watermarks,
+    source: anytype,
+    on_commit_dest: anytype,
+    comptime site_label: []const u8,
+) !void {
+    const entities = source.entitySlice();
+    const waits = source.column(RaftWait);
+    const resp_bodies = source.column(h2.RespBody);
+    var i: usize = 0;
+    while (i < entities.len) : (i += 1) {
+        const ent = entities[i];
+        const wait = waits[i];
+        const resp_body = resp_bodies[i];
+
+        switch (effect_mod.classify(wait.seq, wait.deadline_ns, wm)) {
+            .pending => continue,
+            .commit => {
+                if (worker.pending_txns.get(wait.seq)) |tracked| {
+                    tracked.commit() catch |err| switch (err) {
+                        error.Conflict => continue,
+                        else => panic_mod.invariantViolated(
+                            site_label ++ ".commit",
+                            "seq={d} err={s}",
+                            .{ wait.seq, @errorName(err) },
+                        ),
+                    };
+                    _ = worker.pending_txns.remove(wait.seq);
+                    allocator.destroy(tracked);
+                }
+                try server.reg.move(ent, source, on_commit_dest);
+            },
+            .fault => {
+                if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
+                    kv.value.rollback() catch |err| panic_mod.invariantViolated(
+                        site_label ++ ".rollback",
+                        "seq={d} err={s}",
+                        .{ wait.seq, @errorName(err) },
+                    );
+                    allocator.destroy(kv.value);
+                }
+                // Per-sibling on-entity cleanup (ContDescriptor /
+                // stream components / etc.) deinits structurally when
+                // cleanupResponses destroys the entity — no manual
+                // side-table teardown.
+                const old_body_ptr: ?[*]u8 = resp_body.data;
+                const old_body_len: u32 = resp_body.len;
+                try respb.overwrite503InPending(worker, source, ent, allocator);
+                if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+                try server.reg.move(ent, source, &server.response_in);
+            },
+        }
+    }
+}
+
 fn drainResponsePending(
     worker: anytype,
     server: anytype,
     allocator: std.mem.Allocator,
     wm: effect_mod.Watermarks,
 ) !void {
-    const entities = worker.raft_pending_response.entitySlice();
-    const waits = worker.raft_pending_response.column(RaftWait);
-    const resp_bodies = worker.raft_pending_response.column(h2.RespBody);
-    var i: usize = 0;
-    while (i < entities.len) : (i += 1) {
-        const ent = entities[i];
-        const wait = waits[i];
-        const resp_body = resp_bodies[i];
-
-        switch (effect_mod.classify(wait.seq, wait.deadline_ns, wm)) {
-            .pending => continue,
-            .commit => {
-                if (worker.pending_txns.get(wait.seq)) |tracked| {
-                    tracked.commit() catch |err| switch (err) {
-                        error.Conflict => continue,
-                        else => panic_mod.invariantViolated(
-                            "drainResponsePending.commit",
-                            "seq={d} err={s}",
-                            .{ wait.seq, @errorName(err) },
-                        ),
-                    };
-                    _ = worker.pending_txns.remove(wait.seq);
-                    allocator.destroy(tracked);
-                }
-                try server.reg.move(ent, &worker.raft_pending_response, &server.response_in);
-            },
-            .fault => {
-                if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
-                    kv.value.rollback() catch |err| panic_mod.invariantViolated(
-                        "drainResponsePending.rollback",
-                        "seq={d} err={s}",
-                        .{ wait.seq, @errorName(err) },
-                    );
-                    allocator.destroy(kv.value);
-                }
-
-                const old_body_ptr: ?[*]u8 = resp_body.data;
-                const old_body_len: u32 = resp_body.len;
-                try respb.overwrite503InPending(worker, &worker.raft_pending_response, ent, allocator);
-                if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-
-                try server.reg.move(ent, &worker.raft_pending_response, &server.response_in);
-            },
-        }
-    }
+    try drainEntityArm(
+        worker, server, allocator, wm,
+        &worker.raft_pending_response,
+        &server.response_in,
+        "drainResponsePending",
+    );
 }
 
 /// Phase 5: continuation-bound raft park drain. Entity in
 /// `raft_pending_cont` → `parked_continuations` on commit; → 503
-/// `response_in` on fault (with parked_meta cleanup until Phase 7
-/// deletes that side store).
+/// `response_in` on fault.
 fn drainContPending(
     worker: anytype,
     server: anytype,
     allocator: std.mem.Allocator,
     wm: effect_mod.Watermarks,
 ) !void {
-    const entities = worker.raft_pending_cont.entitySlice();
-    const waits = worker.raft_pending_cont.column(RaftWait);
-    const resp_bodies = worker.raft_pending_cont.column(h2.RespBody);
-    var i: usize = 0;
-    while (i < entities.len) : (i += 1) {
-        const ent = entities[i];
-        const wait = waits[i];
-        const resp_body = resp_bodies[i];
-
-        switch (effect_mod.classify(wait.seq, wait.deadline_ns, wm)) {
-            .pending => continue,
-            .commit => {
-                if (worker.pending_txns.get(wait.seq)) |tracked| {
-                    tracked.commit() catch |err| switch (err) {
-                        error.Conflict => continue,
-                        else => panic_mod.invariantViolated(
-                            "drainContPending.commit",
-                            "seq={d} err={s}",
-                            .{ wait.seq, @errorName(err) },
-                        ),
-                    };
-                    _ = worker.pending_txns.remove(wait.seq);
-                    allocator.destroy(tracked);
-                }
-                // Phase 5: the entity's collection (raft_pending_cont)
-                // IS the discriminant — straight to parked_continuations,
-                // no `ContDescriptor.cont != null` field check needed.
-                try server.reg.move(ent, &worker.raft_pending_cont, &worker.parked_continuations);
-            },
-            .fault => {
-                if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
-                    kv.value.rollback() catch |err| panic_mod.invariantViolated(
-                        "drainContPending.rollback",
-                        "seq={d} err={s}",
-                        .{ wait.seq, @errorName(err) },
-                    );
-                    allocator.destroy(kv.value);
-                }
-
-                // Trampoline: open hop's commit faulted/timed out → cannot
-                // hold. The on-entity ContDescriptor deinits structurally
-                // when cleanupResponses destroys the entity — no manual
-                // cleanup site needed (Phase 7).
-
-                const old_body_ptr: ?[*]u8 = resp_body.data;
-                const old_body_len: u32 = resp_body.len;
-                try respb.overwrite503InPending(worker, &worker.raft_pending_cont, ent, allocator);
-                if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-
-                try server.reg.move(ent, &worker.raft_pending_cont, &server.response_in);
-            },
-        }
-    }
+    try drainEntityArm(
+        worker, server, allocator, wm,
+        &worker.raft_pending_cont,
+        &worker.parked_continuations,
+        "drainContPending",
+    );
 }
 
 /// Phase 5: stream-first-hop raft park drain. Entity in
-/// `raft_pending_stream` → `stream_response_in` on commit (after
-/// registerStreamCell consumes pending_stream_meta); → 503
-/// `response_in` on fault.
+/// `raft_pending_stream` → `stream_response_in` on commit (where
+/// stream components were populated in `streamRecordIfAnyAt` before
+/// the entity entered raft_pending_stream — they ride here via
+/// merged_request_row); → 503 `response_in` on fault.
 fn drainStreamPending(
     worker: anytype,
     server: anytype,
     allocator: std.mem.Allocator,
     wm: effect_mod.Watermarks,
 ) !void {
-    const entities = worker.raft_pending_stream.entitySlice();
-    const waits = worker.raft_pending_stream.column(RaftWait);
-    const resp_bodies = worker.raft_pending_stream.column(h2.RespBody);
-    var i: usize = 0;
-    while (i < entities.len) : (i += 1) {
-        const ent = entities[i];
-        const wait = waits[i];
-        const resp_body = resp_bodies[i];
-
-        switch (effect_mod.classify(wait.seq, wait.deadline_ns, wm)) {
-            .pending => continue,
-            .commit => {
-                if (worker.pending_txns.get(wait.seq)) |tracked| {
-                    tracked.commit() catch |err| switch (err) {
-                        error.Conflict => continue,
-                        else => panic_mod.invariantViolated(
-                            "drainStreamPending.commit",
-                            "seq={d} err={s}",
-                            .{ wait.seq, @errorName(err) },
-                        ),
-                    };
-                    _ = worker.pending_txns.remove(wait.seq);
-                    allocator.destroy(tracked);
-                }
-                // Phase 7: stream components were populated in
-                // `streamRecordIfAnyAt` BEFORE the entity entered
-                // raft_pending_stream — they ride the entity here via
-                // merged_request_row. Just move to stream_response_in;
-                // h2 picks the entity up from there.
-                try server.reg.move(ent, &worker.raft_pending_stream, &server.stream_response_in);
-            },
-            .fault => {
-                if (worker.pending_txns.fetchRemove(wait.seq)) |kv| {
-                    kv.value.rollback() catch |err| panic_mod.invariantViolated(
-                        "drainStreamPending.rollback",
-                        "seq={d} err={s}",
-                        .{ wait.seq, @errorName(err) },
-                    );
-                    allocator.destroy(kv.value);
-                }
-
-                // Phase 7: stream components on the entity reap structurally
-                // when cleanupResponses destroys it; no side-table cleanup.
-
-                const old_body_ptr: ?[*]u8 = resp_body.data;
-                const old_body_len: u32 = resp_body.len;
-                try respb.overwrite503InPending(worker, &worker.raft_pending_stream, ent, allocator);
-                if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-
-                try server.reg.move(ent, &worker.raft_pending_stream, &server.response_in);
-            },
-        }
-    }
+    try drainEntityArm(
+        worker, server, allocator, wm,
+        &worker.raft_pending_stream,
+        &server.stream_response_in,
+        "drainStreamPending",
+    );
 }
 
 pub fn drainRaftPending(worker: anytype) !void {
