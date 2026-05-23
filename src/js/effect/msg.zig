@@ -44,10 +44,18 @@ pub const ActivationSource = log_mod.ActivationSource;
 // through its bespoke enqueue helper (the existing types are listed in
 // the doc comment on each placeholder for reference).
 
-/// Inbound HTTP request activation (Phase 2F — the reference path).
-/// Today: entity-staged on `h2.request_out` with no Msg per se; the
-/// 2F migration adds the variant payload referencing the entity / its
-/// request body slice.
+/// Inbound HTTP request activation. **Dispatch stays entity-driven
+/// through `h2.request_out` → `worker_dispatch.dispatchOnce`** — the
+/// reference path the algebra calls out (`docs/effect-algebra.md` §6
+/// rule 1 + `effect-reification-plan.md` invariant 1: H2 stays
+/// byte-identical until Phase 3's reconciler is proven). The variant
+/// exists for completeness of the Msg union over `ActivationSource`
+/// (the compile-time contract — adding an `ActivationSource` entry
+/// without a `Msg` variant is a build break, see `Msg` doc).
+/// Payload is empty by design today: nothing currently enqueues an
+/// `Inbound` Msg. Phase 3 unifies — when h2 entities migrate onto
+/// the reconciler, the `Inbound` payload grows the entity handle
+/// + request metadata needed for replay-from-MsgQueue.
 pub const Inbound = struct {};
 
 /// `http.send` `on_result` callback (Phase 2E). Today: the

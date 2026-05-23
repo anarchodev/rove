@@ -40,7 +40,9 @@ pub const Cmd = cmd.Cmd;
 pub const Msg = msg.Msg;
 pub const ActivationSource = msg.ActivationSource;
 pub const MsgQueue = queue.MsgQueue;
+pub const MsgInbox = queue.MsgInbox;
 pub const enqueueMsg = queue.enqueueMsg;
+pub const freeOwnedMsg = queue.freeOwnedMsg;
 
 test {
     _ = cmd;
