@@ -355,139 +355,11 @@ pub const ChainTapeState = struct {
     last_touch_seq: u64 = 0,
 };
 
-/// One pending subscription fire crossing a thread boundary. The
-/// `deployment_loader` thread (boot) and the cron sweeper push these
-/// into the per-worker `SubscriptionFireInbox`; the worker's
-/// `drainSubFireInbox` MOVES each onto an `effect.SubscriptionFire`
-/// payload and enqueues via `effect.enqueueMsg`
-/// (effect-reification Phase 2B/2C).
-///
-/// All slices are allocator-owned; the inbox frees them on
-/// `drainInto` failure or `deinit`. On successful drain ownership
-/// transfers to the `effect.SubscriptionFire` payload (no re-dup —
-/// the source slots zero out on transfer).
-pub const PendingFireMessage = struct {
-    tenant_id: []u8,
-    subscription_name: []u8,
-    module_path: []u8,
-    source_kind: components_mod.SubscriptionFireDescriptor.SourceKind,
-    cron_fired_at_ns: i64 = 0,
-    /// Allocator-owned when `source_kind == .kv`; empty otherwise.
-    kv_key: []u8 = &.{},
-    kv_op: u8 = 0,
-    boot_deployment_id: u64 = 0,
-
-    pub fn deinit(self: *PendingFireMessage, allocator: std.mem.Allocator) void {
-        allocator.free(self.tenant_id);
-        allocator.free(self.subscription_name);
-        allocator.free(self.module_path);
-        if (self.kv_key.len > 0) allocator.free(self.kv_key);
-        self.* = undefined;
-    }
-};
-
-/// Thread-safe per-worker inbox of pending subscription fires.
-/// Producer-side: non-worker threads (deployment_loader for boot;
-/// future cron sweeper) `push`. Consumer-side: the owning worker
-/// calls `drainInto` on its tick (single-threaded per worker;
-/// mutex held only across the drain copy).
-///
-/// Cross-thread ownership: `push` takes the message with already-
-/// duped slices (producer responsible for dup). On `drainInto`,
-/// the worker owns + frees each message via
-/// `PendingFireMessage.deinit`. No reference-counting; messages
-/// are move-only across the boundary.
-pub const SubscriptionFireInbox = struct {
-    mutex: std.Thread.Mutex = .{},
-    messages: std.ArrayListUnmanaged(PendingFireMessage) = .empty,
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) SubscriptionFireInbox {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *SubscriptionFireInbox) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        for (self.messages.items) |*m| m.deinit(self.allocator);
-        self.messages.deinit(self.allocator);
-    }
-
-    /// Enqueue one fire message; ownership of all owned slices
-    /// transfers to the inbox.
-    pub fn push(self: *SubscriptionFireInbox, msg: PendingFireMessage) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.messages.append(self.allocator, msg);
-    }
-
-    /// Move all queued messages into the caller's local list.
-    /// Inbox is empty after the call. Caller takes ownership of
-    /// each message's slices (deinit on drop).
-    pub fn drainInto(self: *SubscriptionFireInbox, out: *std.ArrayListUnmanaged(PendingFireMessage)) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.messages.items.len == 0) return;
-        try out.appendSlice(self.allocator, self.messages.items);
-        self.messages.clearRetainingCapacity();
-    }
-};
-
-/// Gap 2.3 Phase C2: per-worker cross-thread inbox of upstream
-/// fetch events (chunk / end / pipe_done). Producer: the node-
-/// wide `FetchPool` threads that drive libcurl on outbound
-/// `http.fetch` calls — each chunk libcurl writes back becomes
-/// one `UpstreamFetchEvent` here. Consumer: the owning worker
-/// drains on its tick (`drainFetchChunkInbox`), MOVES each event
-/// onto the unified `msg_queue` as a `fetch_chunk` / `fetch_done` /
-/// `fetch_pipe_done` Msg variant (effect-reification Phase 2D),
-/// and `dispatchPendingMsgs` fires the matching activation against
-/// the chain.
-///
-/// Hash-routed by `tenant_id` (same stickiness as
-/// `SubscriptionFireInbox` + the kv-wake inbox) so a chain's
-/// chunks always land on the same worker that holds the chain's
-/// qjs module cache.
-///
-/// Cross-thread ownership: producers build a fully-owned
-/// `UpstreamFetchEvent` (allocator from NodeState, the same
-/// allocator the worker will use to deinit it). `push` moves it
-/// in. `drainInto` moves it out — worker is then responsible
-/// for `UpstreamFetchEvent.deinit` on drop.
-pub const FetchChunkInbox = struct {
-    mutex: std.Thread.Mutex = .{},
-    events: std.ArrayListUnmanaged(components_mod.UpstreamFetchEvent) = .empty,
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) FetchChunkInbox {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *FetchChunkInbox) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        components_mod.UpstreamFetchEvent.deinit(self.allocator, self.events.items);
-        self.events.deinit(self.allocator);
-    }
-
-    /// Enqueue one event; ownership of every owned slice
-    /// transfers to the inbox.
-    pub fn push(self: *FetchChunkInbox, ev: components_mod.UpstreamFetchEvent) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.events.append(self.allocator, ev);
-    }
-
-    /// Move all queued events into the caller's local list.
-    /// Inbox is empty after the call. Caller takes ownership.
-    pub fn drainInto(self: *FetchChunkInbox, out: *std.ArrayListUnmanaged(components_mod.UpstreamFetchEvent)) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.events.items.len == 0) return;
-        try out.appendSlice(self.allocator, self.events.items);
-        self.events.clearRetainingCapacity();
-    }
-};
+// Effect-reification Phase 2E: SubscriptionFireInbox + FetchChunkInbox
+// + PendingFireMessage retired. The unified `effect.MsgInbox` carries
+// Msgs (variant-typed) across the thread boundary; producers build the
+// Msg variant before push (no inbox-side adapter type needed). See
+// `effect/queue.zig` for the inbox + drain shape.
 
 /// One cross-tenant target's accumulated writeset within a batch.
 /// `id` is an owned dup of the target instance id.
@@ -1304,18 +1176,18 @@ pub const NodeState = struct {
     wake_inboxes_mutex: std.Thread.Mutex = .{},
     wake_inboxes: std.ArrayListUnmanaged(*KvWakeInbox) = .empty,
 
-    /// Gap 2.1 Phase D: registry of per-worker subscription-fire
-    /// inboxes. Producers from non-worker threads
-    /// (`deployment_loader` for boot, future cron sweeper) call
-    /// `enqueueSubscriptionFireForTenant` which hash-routes to one
-    /// of the registered workers' inboxes by
-    /// `hash(tenant_id) % N_inboxes`. Same hash-by-tenant stickiness
-    /// the callback execution model uses
-    /// (`project_callback_execution_model`) so a tenant's
-    /// subscription fires always land on the same worker — that
-    /// worker's qjs module cache stays warm.
-    sub_fire_inboxes_mutex: std.Thread.Mutex = .{},
-    sub_fire_inboxes: std.ArrayListUnmanaged(*SubscriptionFireInbox) = .empty,
+    /// Effect-reification Phase 2E: unified per-worker Msg inbox
+    /// registry. Replaces the pre-2E pair (`sub_fire_inboxes` +
+    /// `fetch_chunk_inboxes`) — one registry, one push path,
+    /// `hash(tenant_id) % N_inboxes` for hash-by-tenant stickiness.
+    /// Producers from non-worker threads (`deployment_loader` for
+    /// boot, the cron sweeper, the `FetchPool` libcurl threads) call
+    /// `enqueueMsgForTenant`; the typed wrappers
+    /// `enqueueSubscriptionFireForTenant` /
+    /// `enqueueFetchEventForTenant` build the matching `effect.Msg`
+    /// variant and route through it.
+    msg_inboxes_mutex: std.Thread.Mutex = .{},
+    msg_inboxes: std.ArrayListUnmanaged(*effect_mod.MsgInbox) = .empty,
 
     /// Gap 2.1 Phase F: in-memory `next_fire_at_ns` per cron
     /// subscription. Keyed by `<tenant_id>|<sub_name>`. NOT raft-
@@ -1362,15 +1234,12 @@ pub const NodeState = struct {
     fetch_pending: std.ArrayListUnmanaged(globals.PendingFetch) = .empty,
     fetch_pending_cond: std.Thread.Condition = .{},
 
-    /// Gap 2.3 Phase C2: per-worker `FetchChunkInbox` registry,
-    /// mirror of `sub_fire_inboxes`. The `FetchPool`'s threads
-    /// (running off-worker) hash-route each upstream chunk to a
-    /// worker via `enqueueFetchEventForTenant`. Same
-    /// `hash(tenant_id) % N_inboxes` stickiness as the wake +
-    /// sub-fire registries so a chain's chunks always reach the
-    /// worker that holds the chain's qjs module cache.
-    fetch_chunk_inboxes_mutex: std.Thread.Mutex = .{},
-    fetch_chunk_inboxes: std.ArrayListUnmanaged(*FetchChunkInbox) = .empty,
+    // Effect-reification Phase 2E: `fetch_chunk_inboxes` collapsed
+    // into the unified `msg_inboxes` registry above. `FetchPool` now
+    // calls `enqueueFetchEventForTenant` which builds the appropriate
+    // `effect.Msg` (`fetch_chunk` / `fetch_done` / `fetch_pipe_done`)
+    // and routes through the same hash-by-tenant registry as
+    // subscriptions and (future) inbound HTTP.
 
     /// Gap 2.3 Phase C2: the dedicated outbound-fetch pool. Lazy
     /// init via `startFetchPool` after NodeState is fully wired
@@ -1420,22 +1289,48 @@ pub const NodeState = struct {
     /// inbox. Same lifecycle as `registerWakeInbox` — worker keeps
     /// the inbox; this registry borrows the pointer for hash-routed
     /// fire enqueues.
-    pub fn registerSubFireInbox(self: *NodeState, inbox: *SubscriptionFireInbox) !void {
-        self.sub_fire_inboxes_mutex.lock();
-        defer self.sub_fire_inboxes_mutex.unlock();
-        try self.sub_fire_inboxes.append(self.allocator, inbox);
+    /// Effect-reification Phase 2E: register a worker's unified Msg
+    /// inbox. The producer-side enqueueXxxForTenant functions
+    /// hash-route to one of these by `hash(tenant_id) % N`.
+    pub fn registerMsgInbox(self: *NodeState, inbox: *effect_mod.MsgInbox) !void {
+        self.msg_inboxes_mutex.lock();
+        defer self.msg_inboxes_mutex.unlock();
+        try self.msg_inboxes.append(self.allocator, inbox);
     }
 
-    pub fn unregisterSubFireInbox(self: *NodeState, inbox: *SubscriptionFireInbox) void {
-        self.sub_fire_inboxes_mutex.lock();
-        defer self.sub_fire_inboxes_mutex.unlock();
+    pub fn unregisterMsgInbox(self: *NodeState, inbox: *effect_mod.MsgInbox) void {
+        self.msg_inboxes_mutex.lock();
+        defer self.msg_inboxes_mutex.unlock();
         var i: usize = 0;
-        while (i < self.sub_fire_inboxes.items.len) : (i += 1) {
-            if (self.sub_fire_inboxes.items[i] == inbox) {
-                _ = self.sub_fire_inboxes.swapRemove(i);
+        while (i < self.msg_inboxes.items.len) : (i += 1) {
+            if (self.msg_inboxes.items[i] == inbox) {
+                _ = self.msg_inboxes.swapRemove(i);
                 return;
             }
         }
+    }
+
+    /// Hash-route `msg` onto the destination worker's `MsgInbox` by
+    /// `hash(tenant_id) % N`. The typed wrappers
+    /// (`enqueueSubscriptionFireForTenant`, `enqueueFetchEventForTenant`)
+    /// build the variant + call this. On success ownership of `msg`'s
+    /// owned bytes transfers to the inbox; on error.NoWorkers the
+    /// caller retains and MUST `effect.freeOwnedMsg` to free.
+    pub fn enqueueMsgForTenant(
+        self: *NodeState,
+        tenant_id: []const u8,
+        msg: effect_mod.Msg,
+    ) !void {
+        self.msg_inboxes_mutex.lock();
+        const n = self.msg_inboxes.items.len;
+        if (n == 0) {
+            self.msg_inboxes_mutex.unlock();
+            return error.NoWorkers;
+        }
+        const inbox_idx = std.hash.Wyhash.hash(0, tenant_id) % n;
+        const inbox = self.msg_inboxes.items[inbox_idx];
+        self.msg_inboxes_mutex.unlock();
+        try inbox.push(msg);
     }
 
     /// Gap 2.3 Phase C1+C2: move accumulated fetches into the
@@ -1464,74 +1359,36 @@ pub const NodeState = struct {
         self.fetch_pending_cond.broadcast();
     }
 
-    /// Gap 2.3 Phase C2: register a worker's fetch-chunk inbox.
-    /// Same lifecycle as `registerSubFireInbox`.
-    pub fn registerFetchChunkInbox(self: *NodeState, inbox: *FetchChunkInbox) !void {
-        self.fetch_chunk_inboxes_mutex.lock();
-        defer self.fetch_chunk_inboxes_mutex.unlock();
-        try self.fetch_chunk_inboxes.append(self.allocator, inbox);
-    }
-
-    pub fn unregisterFetchChunkInbox(self: *NodeState, inbox: *FetchChunkInbox) void {
-        self.fetch_chunk_inboxes_mutex.lock();
-        defer self.fetch_chunk_inboxes_mutex.unlock();
-        var i: usize = 0;
-        while (i < self.fetch_chunk_inboxes.items.len) : (i += 1) {
-            if (self.fetch_chunk_inboxes.items[i] == inbox) {
-                _ = self.fetch_chunk_inboxes.swapRemove(i);
-                return;
-            }
-        }
-    }
-
-    /// Gap 2.3 Phase C2: hash-route a fetch event (chunk / end /
-    /// pipe_done) to the worker whose inbox is
-    /// `hash(tenant_id) % N_inboxes`. Caller-side ownership
+    /// Gap 2.3 Phase C2 + effect-reification Phase 2E: hash-route a
+    /// fetch event (chunk / end / pipe_done) to the destination
+    /// worker's unified `MsgInbox` as the matching `effect.Msg`
+    /// variant. Caller-side ownership of every owned slice in `ev`
     /// transfers in on success; on `error.NoWorkers` the caller
-    /// retains the event and is responsible for `deinit`.
+    /// retains and is responsible for `UpstreamFetchEvent.deinitItem`.
     pub fn enqueueFetchEventForTenant(
         self: *NodeState,
         tenant_id: []const u8,
         ev: components_mod.UpstreamFetchEvent,
     ) !void {
-        self.fetch_chunk_inboxes_mutex.lock();
-        const n = self.fetch_chunk_inboxes.items.len;
-        if (n == 0) {
-            self.fetch_chunk_inboxes_mutex.unlock();
-            return error.NoWorkers;
-        }
-        const inbox_idx = std.hash.Wyhash.hash(0, tenant_id) % n;
-        const inbox = self.fetch_chunk_inboxes.items[inbox_idx];
-        self.fetch_chunk_inboxes_mutex.unlock();
-        try inbox.push(ev);
+        const msg: effect_mod.Msg = switch (ev.kind) {
+            .chunk => .{ .fetch_chunk = ev },
+            .end => .{ .fetch_done = ev },
+            .pipe_done => .{ .fetch_pipe_done = ev },
+        };
+        try self.enqueueMsgForTenant(tenant_id, msg);
     }
 
-    /// Gap 2.1 Phase D: hash-route a subscription fire to the
-    /// worker whose inbox is `hash(tenant_id) % N_inboxes`.
-    /// Callable from any thread; producer (loader / sweeper)
-    /// owns the input slices borrowed; this fn dupes onto the
-    /// inbox-side `PendingFireMessage` before pushing.
+    /// Gap 2.1 Phase D + effect-reification Phase 2E: hash-route a
+    /// subscription fire (cron / kv-react / boot) to the destination
+    /// worker's unified `MsgInbox` as a `SubscriptionFire` variant.
+    /// Producer (loader / sweeper) owns the input slices borrowed;
+    /// this fn dupes onto the payload before pushing.
     /// Returns `error.NoWorkers` if no inbox is registered yet
-    /// (cold start before any worker spawned — call site logs
-    /// + skips; the deploy will be re-evaluated on the next
-    /// `_deploy/current` apply when workers exist).
+    /// (cold start before any worker spawned).
     pub fn enqueueSubscriptionFireForTenant(
         self: *NodeState,
         in: SubscriptionFireQueueInput,
     ) !void {
-        self.sub_fire_inboxes_mutex.lock();
-        const n = self.sub_fire_inboxes.items.len;
-        if (n == 0) {
-            self.sub_fire_inboxes_mutex.unlock();
-            return error.NoWorkers;
-        }
-        const inbox_idx = std.hash.Wyhash.hash(0, in.tenant_id) % n;
-        const inbox = self.sub_fire_inboxes.items[inbox_idx];
-        self.sub_fire_inboxes_mutex.unlock();
-
-        // Build the owned message. Allocator is the node's; the
-        // worker's drain transfers ownership to the per-entity
-        // component on translation.
         const allocator = self.allocator;
         const tid = try allocator.dupe(u8, in.tenant_id);
         errdefer allocator.free(tid);
@@ -1539,29 +1396,27 @@ pub const NodeState = struct {
         errdefer allocator.free(name);
         const path = try allocator.dupe(u8, in.module_path);
         errdefer allocator.free(path);
-        var msg: PendingFireMessage = .{
+
+        const source: effect_mod.msg.SubscriptionFire.Source = switch (in.source) {
+            .cron => |c| .{ .cron = .{ .fired_at_ns = c.fired_at_ns } },
+            .kv => |k| blk: {
+                const key_dup = try allocator.dupe(u8, k.key);
+                break :blk .{ .kv = .{ .key = key_dup, .op = k.op } };
+            },
+            .boot => |b| .{ .boot = .{ .deployment_id = b.deployment_id } },
+        };
+        errdefer switch (source) {
+            .kv => |kv| allocator.free(kv.key),
+            else => {},
+        };
+
+        const payload: effect_mod.msg.SubscriptionFire = .{
             .tenant_id = tid,
             .subscription_name = name,
             .module_path = path,
-            .source_kind = .cron,
+            .source = source,
         };
-        switch (in.source) {
-            .cron => |c| {
-                msg.source_kind = .cron;
-                msg.cron_fired_at_ns = c.fired_at_ns;
-            },
-            .kv => |k| {
-                msg.source_kind = .kv;
-                msg.kv_key = try allocator.dupe(u8, k.key);
-                msg.kv_op = k.op;
-            },
-            .boot => |b| {
-                msg.source_kind = .boot;
-                msg.boot_deployment_id = b.deployment_id;
-            },
-        }
-        errdefer if (msg.kv_key.len > 0) allocator.free(msg.kv_key);
-        try inbox.push(msg);
+        try self.enqueueMsgForTenant(in.tenant_id, .{ .subscription_fire = payload });
     }
 
     /// Fan out one kv-write event to every registered worker
@@ -1606,8 +1461,7 @@ pub const NodeState = struct {
         // tears down, every inbox should already be unregistered.
         // The list itself is owned by NodeState's allocator.
         self.wake_inboxes.deinit(self.allocator);
-        self.sub_fire_inboxes.deinit(self.allocator);
-        self.fetch_chunk_inboxes.deinit(self.allocator);
+        self.msg_inboxes.deinit(self.allocator);
         {
             var cs_it = self.cron_state.iterator();
             while (cs_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
@@ -2142,33 +1996,22 @@ pub fn Worker(comptime opts: Options) type {
         parked_units: ParkedUnitColl,
         /// Effect-reification Phase 2 ingress
         /// (`docs/effect-algebra.md` §2.3; `effect-reification-plan.md`
-        /// Phase 2). One bounded queue per worker; per-origin
-        /// migration PRs route into it via `effect.enqueueMsg`. Phase
-        /// 2B routes the cross-thread `sub_fire_inbox` (cron + boot)
-        /// here; Phase 2C routes the in-thread kv-react match path
-        /// (`fireKvReactSubscriptions`) here too. With every
-        /// subscription origin on the queue, the legacy
-        /// `subscription_fire_pending` rove collection was retired
-        /// in 2C. Phases 2D–2F migrate the remaining origins
-        /// (fetch / send-callback / inbound-HTTP).
+        /// Phase 2). One bounded queue per worker; every migrated
+        /// origin routes into it via `effect.enqueueMsg`. Phase 2B
+        /// routes cron + boot; 2C routes kv-react; 2D routes outbound
+        /// HTTP (fetch chunk / done / pipe_done); 2E (this phase)
+        /// collapses the cross-thread inbox layer (see `msg_inbox`
+        /// below). Inbound-HTTP dispatch stays entity-driven through
+        /// h2 — Phase 3's reconciler scope.
         msg_queue: effect_mod.MsgQueue = undefined,
-        /// Gap 2.1 Phase D: cross-thread inbox of pending fires
-        /// from non-worker producers (`deployment_loader` for
-        /// boot; future cron sweeper). `drainSubFireInbox` (called
-        /// once per worker tick from `serviceSubscriptionFires`)
-        /// pops messages and translates them into entities in
-        /// `subscription_fire_pending`. Registered with NodeState
-        /// at startup so producers reach the right worker via
-        /// `enqueueSubscriptionFireForTenant` hash-routing.
-        sub_fire_inbox: SubscriptionFireInbox = undefined,
-        /// Gap 2.3 Phase C2: cross-thread inbox of upstream
-        /// fetch events. Producer: the node-wide `FetchPool`
-        /// threads. Consumer: this worker's tick (Phase D drains
-        /// + translates into `fetch_event_pending` entities).
-        /// Registered with NodeState at startup so the pool
-        /// reaches the right worker via
-        /// `enqueueFetchEventForTenant` hash-routing.
-        fetch_chunk_inbox: FetchChunkInbox = undefined,
+        /// Effect-reification Phase 2E: unified cross-thread Msg
+        /// inbox. Replaces the pre-2E pair (`sub_fire_inbox` +
+        /// `fetch_chunk_inbox`). Producers from non-worker threads
+        /// (deployment-loader boot, cron sweep, FetchPool libcurl
+        /// threads) `node.enqueueMsgForTenant`-hash-route here;
+        /// `drainMsgInbox` (once per tick from `serviceSubscriptionFires`
+        /// / `serviceFetchEvents`) moves Msgs onto `msg_queue`.
+        msg_inbox: effect_mod.MsgInbox = undefined,
         /// Gap 2.1 Phase F: monotonic-ns of the last
         /// `sweepCronSubscriptions` invocation. Used to throttle
         /// the per-tick cron sweep to at most one pass per
@@ -2329,8 +2172,7 @@ pub fn Worker(comptime opts: Options) type {
                 .raft_pending_stream = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
-                .sub_fire_inbox = SubscriptionFireInbox.init(allocator),
-                .fetch_chunk_inbox = FetchChunkInbox.init(allocator),
+                .msg_inbox = effect_mod.MsgInbox.init(allocator),
                 // Effect-reification Phase 2 ingress. Cap chosen
                 // well above the typical per-tick fire rate (cron
                 // ≤ 1 Hz × N tenants; boot drains once per deploy);
@@ -2386,19 +2228,13 @@ pub fn Worker(comptime opts: Options) type {
             try config.node.registerWakeInbox(&self.wake_inbox);
             errdefer config.node.unregisterWakeInbox(&self.wake_inbox);
 
-            // Gap 2.1 Phase D: register the subscription-fire inbox
-            // with the node so non-worker producers
-            // (`deployment_loader` for boot, future cron sweeper)
-            // can hash-route fires to this worker.
-            try config.node.registerSubFireInbox(&self.sub_fire_inbox);
-            errdefer config.node.unregisterSubFireInbox(&self.sub_fire_inbox);
-
-            // Gap 2.3 Phase C2: register the fetch-chunk inbox with
-            // the node so the `FetchPool` reaches this worker via
-            // `enqueueFetchEventForTenant` hash-routing. Same
-            // lifecycle as sub_fire_inbox above.
-            try config.node.registerFetchChunkInbox(&self.fetch_chunk_inbox);
-            errdefer config.node.unregisterFetchChunkInbox(&self.fetch_chunk_inbox);
+            // Effect-reification Phase 2E: register the unified Msg
+            // inbox with the node so every cross-thread producer
+            // (deployment-loader boot, cron sweeper, FetchPool
+            // libcurl threads) hash-routes here via
+            // `node.enqueueMsgForTenant`.
+            try config.node.registerMsgInbox(&self.msg_inbox);
+            errdefer config.node.unregisterMsgInbox(&self.msg_inbox);
 
             // Eagerly open per-worker tenant_logs (request_id minters
             // bake the worker_id into the upper 16 bits; can't share).
@@ -2519,21 +2355,14 @@ pub fn Worker(comptime opts: Options) type {
             // be pushing into it while we walk + free the queue.
             self.node.unregisterWakeInbox(&self.wake_inbox);
             self.wake_inbox.deinit();
-            // Unregister BEFORE deinit so no producer (deployment_loader,
-            // cron sweeper) can push after we start freeing entries.
-            self.node.unregisterSubFireInbox(&self.sub_fire_inbox);
-            self.sub_fire_inbox.deinit();
-            // Gap 2.3 Phase C2: same ordering for the fetch-chunk
-            // inbox. NodeState.deinit stops the FetchPool BEFORE
-            // it deinits workers, so the producer side is already
-            // quiesced — but unregister-first keeps the invariant
-            // uniform across all three inboxes.
-            self.node.unregisterFetchChunkInbox(&self.fetch_chunk_inbox);
-            self.fetch_chunk_inbox.deinit();
-            // Effect-reification Phase 2: free any in-flight Msgs
-            // still buffered at shutdown. The MsgQueue's variant
-            // deinit-walk frees per-variant owned bytes (today only
-            // `SubscriptionFire`).
+            // Effect-reification Phase 2E: one unified Msg inbox
+            // replaces the pre-2E pair. Unregister BEFORE deinit so
+            // no cross-thread producer (deployment-loader,
+            // cron sweeper, FetchPool) can push after we start
+            // freeing entries. `MsgInbox.deinit` walks the items
+            // variant-aware via `freeOwnedMsg`.
+            self.node.unregisterMsgInbox(&self.msg_inbox);
+            self.msg_inbox.deinit();
             // MsgQueue.deinit walks variants (subscription_fire +
             // fetch_chunk / fetch_done / fetch_pipe_done) to free
             // in-flight Msg payloads at shutdown.
@@ -6479,78 +6308,54 @@ pub const SubscriptionFireQueueInput = struct {
 /// `serviceSubscriptionFires`); cheap when the inbox is empty (one
 /// mutex try + length check).
 ///
-/// Ownership: messages popped from the inbox carry owned slices.
-/// Phase 2B moves them onto the new payload (no re-dup); zero'd
-/// source slots make the post-loop `PendingFireMessage.deinit` a
-/// no-op for transferred fields (allocator.free on an empty slice
-/// short-circuits per stdlib).
-fn drainSubFireInbox(worker: anytype) void {
+/// Effect-reification Phase 2E: drain the worker's unified
+/// cross-thread `msg_inbox`, moving each `effect.Msg` onto the
+/// in-thread `msg_queue`. One drain function for every cross-thread
+/// origin (cron + boot fires, fetch chunk / done / pipe_done events)
+/// — the pre-2E pair (`drainSubFireInbox` + `drainFetchChunkInbox`)
+/// collapsed into this. Producers built Msg variants on the way in
+/// (NodeState.enqueueXxxForTenant); this fn is variant-agnostic.
+///
+/// Ownership: each Msg popped from the inbox carries owned slices.
+/// On `enqueueMsg` success the queue owns them (drains via
+/// `dispatchPendingMsgs`). On `error.Full` we `freeOwnedMsg` and
+/// log — overflow drops are bounded by the cross-thread inbox's
+/// rate and the in-thread queue's cap; the per-origin policy is
+/// at-most-once for cron/boot (re-fire on next sweep) and at-most-
+/// once for fetch (sender already accepted the upstream chunk —
+/// loss surfaces as a fetch_done with mismatched byte counts).
+fn drainMsgInbox(worker: anytype) void {
     const allocator = worker.allocator;
-    var local: std.ArrayListUnmanaged(PendingFireMessage) = .empty;
+    var local: std.ArrayListUnmanaged(effect_mod.Msg) = .empty;
     defer local.deinit(allocator);
-    worker.sub_fire_inbox.drainInto(&local) catch |err| {
-        std.log.warn("rove-js sub-fire drain: {s}", .{@errorName(err)});
-        for (local.items) |*m| m.deinit(allocator);
+    worker.msg_inbox.drainInto(&local) catch |err| {
+        std.log.warn("rove-js msg-inbox drain: {s}", .{@errorName(err)});
+        for (local.items) |*m| effect_mod.freeOwnedMsg(allocator, m);
         return;
     };
     if (local.items.len == 0) return;
-    // Effect-reification Phase 2B: route cross-thread fires through
-    // the unified MsgQueue ingress. The inbox-side message's owned
-    // strings MOVE onto the `effect.SubscriptionFire` payload — no
-    // re-dup. On `enqueueMsg` success the payload owns them and the
-    // queue's variant-deinit walk frees on shutdown / dispatch; on
-    // failure (queue full) we free locally and warn so the next
-    // sweep can re-fire (subscriptions are at-most-once and
-    // self-healing on the next tick).
-    for (local.items) |*msg| {
-        const source: effect_mod.msg.SubscriptionFire.Source = switch (msg.source_kind) {
-            .cron => .{ .cron = .{ .fired_at_ns = msg.cron_fired_at_ns } },
-            .kv => blk: {
-                // Move the kv_key bytes onto the new payload (only
-                // .kv source carries an owned key); zero the
-                // source's slice so the post-loop deinit doesn't
-                // double-free.
-                const key = msg.kv_key;
-                msg.kv_key = &.{};
-                break :blk .{ .kv = .{ .key = key, .op = msg.kv_op } };
-            },
-            .boot => .{ .boot = .{ .deployment_id = msg.boot_deployment_id } },
-        };
-        var payload: effect_mod.msg.SubscriptionFire = .{
-            .tenant_id = msg.tenant_id,
-            .subscription_name = msg.subscription_name,
-            .module_path = msg.module_path,
-            .source = source,
-        };
-        // Mark the source as consumed BEFORE enqueueMsg so the
-        // local-deinit loop below doesn't double-free.
-        msg.tenant_id = &.{};
-        msg.subscription_name = &.{};
-        msg.module_path = &.{};
-        effect_mod.enqueueMsg(&worker.msg_queue, .{ .subscription_fire = payload }) catch |err| {
+    for (local.items) |*m| {
+        effect_mod.enqueueMsg(&worker.msg_queue, m.*) catch |err| {
             std.log.warn(
-                "rove-js sub-fire enqueueMsg (tenant={s}, sub={s}): {s}",
-                .{ payload.tenant_id, payload.subscription_name, @errorName(err) },
+                "rove-js msg-inbox enqueueMsg (kind={s}): {s}",
+                .{ @tagName(m.kind()), @errorName(err) },
             );
-            payload.deinit(allocator);
+            // On overflow the Msg never reached the queue; free its
+            // owned payload to avoid leak.
+            effect_mod.freeOwnedMsg(allocator, m);
         };
     }
-    // Free any inbox-side fields not transferred (the .kv_key bytes
-    // when source_kind != .kv, plus any string slots we zeroed
-    // above — `deinit` short-circuits on empty slices).
-    for (local.items) |*m| m.deinit(allocator);
 }
 
-/// Worker-tick combined pass: translate cross-thread inbox
-/// messages into collection entities, then dispatch the
-/// collection. Called from the workerMain loop on every tick;
-/// covers both worker-thread producers (kv-react, which writes
-/// to the collection directly) and non-worker-thread producers
-/// (boot via deployment_loader, cron via sweeper) routed through
-/// the inbox.
+/// Worker-tick combined pass: drain the cross-thread Msg inbox into
+/// the in-thread queue, then dispatch the queue. Called from the
+/// workerMain loop on every tick; covers cross-thread producers
+/// (boot via deployment_loader, cron via sweeper, FetchPool libcurl
+/// threads) AND in-thread producers (kv-react, which `enqueueMsg`s
+/// directly from `fireKvReactSubscriptions`).
 pub fn serviceSubscriptionFires(worker: anytype) void {
-    drainSubFireInbox(worker);
-    dispatchSubscriptionFires(worker);
+    drainMsgInbox(worker);
+    dispatchPendingMsgs(worker);
 }
 
 /// Worker-tick system: dequeue Msgs from `worker.msg_queue` (up to
@@ -6644,53 +6449,14 @@ pub fn dispatchFetchEvents(worker: anytype) void {
 
 // ── Gap 2.3 Phase D — http.fetch chunk/done activations ──────────
 
-/// Worker-tick combined pass for upstream fetch events: drain the
-/// cross-thread `fetch_chunk_inbox` onto `worker.msg_queue`, then
-/// let `dispatchPendingMsgs` route each event. Called once per
-/// worker tick from the loop46 main tick, right after
-/// `serviceSubscriptionFires`. Cheap when both are empty.
-///
-/// Effect-reification Phase 2D: drain target is the unified MsgQueue
-/// (was: a dedicated `fetch_event_pending` rove collection — now
-/// deleted). Inbox messages get the matching Msg variant
-/// (`fetch_chunk` / `fetch_done` / `fetch_pipe_done`) selected from
-/// `ev.kind`; slices move with no re-dup (same shape as
-/// `drainSubFireInbox`).
+/// Effect-reification Phase 2E: backward-compat alias of
+/// `serviceSubscriptionFires` — both now drain the unified
+/// `msg_inbox` and dispatch the queue. The second-to-call sees an
+/// empty inbox + queue and is a cheap no-op. main.zig + the
+/// parked_units call site keep their existing call shape.
 pub fn serviceFetchEvents(worker: anytype) void {
-    drainFetchChunkInbox(worker);
+    drainMsgInbox(worker);
     dispatchPendingMsgs(worker);
-}
-
-fn drainFetchChunkInbox(worker: anytype) void {
-    const allocator = worker.allocator;
-    var local: std.ArrayListUnmanaged(components_mod.UpstreamFetchEvent) = .empty;
-    defer local.deinit(allocator);
-    worker.fetch_chunk_inbox.drainInto(&local) catch |err| {
-        std.log.warn("rove-js fetch-event drain: {s}", .{@errorName(err)});
-        for (local.items) |*ev| components_mod.UpstreamFetchEvent.deinitItem(ev, allocator);
-        return;
-    };
-    if (local.items.len == 0) return;
-    for (local.items) |*ev| {
-        const ev_copy = ev.*;
-        // Mark the source consumed BEFORE enqueueMsg so a failure-
-        // path deinit below doesn't double-free; on success the
-        // payload now lives on the queue.
-        ev.* = .{};
-        const msg: effect_mod.Msg = switch (ev_copy.kind) {
-            .chunk => .{ .fetch_chunk = ev_copy },
-            .end => .{ .fetch_done = ev_copy },
-            .pipe_done => .{ .fetch_pipe_done = ev_copy },
-        };
-        effect_mod.enqueueMsg(&worker.msg_queue, msg) catch |err| {
-            std.log.warn(
-                "rove-js fetch-event enqueueMsg (kind={s}): {s}",
-                .{ @tagName(ev_copy.kind), @errorName(err) },
-            );
-            var orphan = ev_copy;
-            components_mod.UpstreamFetchEvent.deinitItem(&orphan, allocator);
-        };
-    }
 }
 
 /// Gap 2.3 Phase E: route one Pattern B (`pipe_to`) fetch event.

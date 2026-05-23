@@ -16,8 +16,9 @@
 //! `FetchPool` threads (N = `FETCH_POOL_SIZE`) wait on a condition
 //! variable, drain entries, and fire libcurl. Each upstream response
 //! is re-chunked into `max_response_chunk_bytes` units, pushed one
-//! `UpstreamFetchEvent` per chunk + one terminal event to the per-
-//! worker `FetchChunkInbox` via hash-routed
+//! `UpstreamFetchEvent` per chunk + one terminal event to the
+//! destination worker's unified `effect.MsgInbox`
+//! (effect-reification Phase 2E) via hash-routed
 //! `enqueueFetchEventForTenant`.
 //!
 //! ## Streaming transport
