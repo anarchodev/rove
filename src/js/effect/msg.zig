@@ -61,11 +61,49 @@ pub const ActivationSource = log_mod.ActivationSource;
 /// + request metadata needed for replay-from-MsgQueue.
 pub const Inbound = struct {};
 
-/// `http.send` `on_result` callback (Phase 2E). Today: the
-/// `send_dispatch.Completion` thread → `callback_dispatch.zig` path
-/// builds the receipt JSON and synthesizes a request — 2E refactors
-/// that into a `Msg.send_callback` with the receipt as payload.
-pub const SendCallback = struct {};
+/// Chained-dispatch activation — the customer's handler is being
+/// invoked as a follow-up via `__rove_next` from another handler.
+/// Producers (Phase 5 PR-2): the `webhook.send.js` shim's onresult
+/// handler returns `__rove_next(customer_on_result, {ctx: result})`
+/// from a `fetch_chunk` activation; the fetch's `.continuation`
+/// arm enqueues one of these.
+///
+/// Wire-stable enum tag stays `.send_callback` (originally named
+/// for `http.send`'s on_result; that producer retires in PR-4 but
+/// the activation surface — "your handler runs because a previous
+/// handler chained to you" — outlives it).
+///
+/// Customer-facing shape (`fireChainedActivation` surfaces it):
+/// `request.activation.kind === "send_callback"`, the cont's
+/// `ctx_json` rides as `request.body = {"ctx": <ctx>}` (same shape
+/// as fireSubscriptionActivation's body so the customer's
+/// JSON.parse pattern is uniform across origin kinds).
+pub const SendCallback = struct {
+    /// Owning tenant. Allocator-owned when non-empty; freed by
+    /// `deinit` on drop / drop-on-shutdown.
+    tenant_id: []u8 = &.{},
+    /// Module path of the customer's next-hop handler. Allocator-owned.
+    module_path: []u8 = &.{},
+    /// Cont's `ctx` JSON (the second arg to `__rove_next`).
+    /// Allocator-owned; "null" when omitted.
+    ctx_json: []u8 = &.{},
+    /// Optional named-export selector (the `fn` field on the cont
+    /// descriptor). Null = default export.
+    fn_name: ?[]u8 = null,
+    /// Inherit the originating chain's correlation_id so replay UX
+    /// groups the parent fetch + this chained hop. Null = generate
+    /// a fresh one at dispatch time.
+    correlation_id: ?[]u8 = null,
+
+    pub fn deinit(self: *SendCallback, allocator: std.mem.Allocator) void {
+        if (self.tenant_id.len > 0) allocator.free(self.tenant_id);
+        if (self.module_path.len > 0) allocator.free(self.module_path);
+        if (self.ctx_json.len > 0) allocator.free(self.ctx_json);
+        if (self.fn_name) |fn_n| allocator.free(fn_n);
+        if (self.correlation_id) |c| allocator.free(c);
+        self.* = undefined;
+    }
+};
 
 /// Held-stream timer wake (`streaming-handlers-plan` §4.5). Today:
 /// `serviceParkedStreams` sweep detects timer expiry and resumes the
@@ -183,8 +221,9 @@ test "Msg covers every ActivationSource variant exhaustively" {
     // slice of the §4 six-question contract enforced by the
     // compiler.
     const testing = std.testing;
-    // SubscriptionFire owns strings; build/free explicitly so the
-    // test exercises the real payload shape, not a placeholder.
+    // SubscriptionFire + SendCallback own strings; build/free
+    // explicitly so the test exercises the real payload shape, not
+    // a placeholder.
     var sf: SubscriptionFire = .{
         .tenant_id = try testing.allocator.dupe(u8, "t"),
         .subscription_name = try testing.allocator.dupe(u8, "s"),
@@ -193,11 +232,18 @@ test "Msg covers every ActivationSource variant exhaustively" {
     };
     defer sf.deinit(testing.allocator);
 
+    var sc: SendCallback = .{
+        .tenant_id = try testing.allocator.dupe(u8, "t"),
+        .module_path = try testing.allocator.dupe(u8, "hooks/onDelivered"),
+        .ctx_json = try testing.allocator.dupe(u8, "{\"ok\":true}"),
+    };
+    defer sc.deinit(testing.allocator);
+
     inline for (@typeInfo(ActivationSource).@"enum".fields) |f| {
         const tag: ActivationSource = @enumFromInt(f.value);
         const m: Msg = switch (tag) {
             .inbound => .{ .inbound = .{} },
-            .send_callback => .{ .send_callback = .{} },
+            .send_callback => .{ .send_callback = sc },
             .timer => .{ .timer = .{} },
             .disconnect => .{ .disconnect = .{} },
             .kv_wake => .{ .kv_wake = .{} },
