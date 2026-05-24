@@ -57,12 +57,12 @@ pub fn freeOwnedMsg(allocator: std.mem.Allocator, msg: *Msg) void {
     switch (msg.*) {
         .subscription_fire => |*sf| sf.deinit(allocator),
         .fetch_chunk => |*ev| components_mod.UpstreamFetchEvent.deinitItem(ev, allocator),
+        .send_callback => |*sc| sc.deinit(allocator),
         // No-owned-bytes variants. Phase 2E declares an Inbound
         // payload as a placeholder; dispatch for inbound stays
         // entity-driven through H2 (Phase 3's reconciler scope),
         // so no enqueueMsg path exists for it yet.
         .inbound,
-        .send_callback,
         .timer,
         .disconnect,
         .kv_wake,

@@ -1428,6 +1428,44 @@ pub const NodeState = struct {
         try self.enqueueMsgForTenant(in.tenant_id, .{ .subscription_fire = payload });
     }
 
+    /// Phase 5 PR-2: hash-route a chained dispatch — a `__rove_next`
+    /// returned from a `fetch_chunk` handler — to the destination
+    /// worker's MsgInbox as a `SendCallback` variant. The customer's
+    /// next-hop handler runs there with `request.activation.kind ==
+    /// "send_callback"` and the cont's ctx wrapped as
+    /// `request.body = {"ctx": <ctx>}`. Producer-owned slices are
+    /// dup'd onto the payload; on `error.NoWorkers` the caller
+    /// retains and frees them.
+    pub fn enqueueChainedDispatchForTenant(
+        self: *NodeState,
+        tenant_id: []const u8,
+        module_path: []const u8,
+        ctx_json: []const u8,
+        fn_name: ?[]const u8,
+        correlation_id: ?[]const u8,
+    ) !void {
+        const allocator = self.allocator;
+        const tid = try allocator.dupe(u8, tenant_id);
+        errdefer allocator.free(tid);
+        const mod = try allocator.dupe(u8, module_path);
+        errdefer allocator.free(mod);
+        const ctx = try allocator.dupe(u8, ctx_json);
+        errdefer allocator.free(ctx);
+        const fn_dup: ?[]u8 = if (fn_name) |f| try allocator.dupe(u8, f) else null;
+        errdefer if (fn_dup) |f| allocator.free(f);
+        const corr_dup: ?[]u8 = if (correlation_id) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (corr_dup) |c| allocator.free(c);
+
+        const payload: effect_mod.msg.SendCallback = .{
+            .tenant_id = tid,
+            .module_path = mod,
+            .ctx_json = ctx,
+            .fn_name = fn_dup,
+            .correlation_id = corr_dup,
+        };
+        try self.enqueueMsgForTenant(tenant_id, .{ .send_callback = payload });
+    }
+
     /// Fan out one kv-write event to every registered worker
     /// inbox. Called from `apply.zig` (follower path) and
     /// `worker_dispatch.zig` (leader path) so a write on any node
@@ -6058,6 +6096,244 @@ pub fn fireSubscriptionActivation(
     }
 }
 
+/// Phase 5 PR-2: dispatch a chained handler activation produced by
+/// `__rove_next` from a fetch handler (and post-PR-2c, from the
+/// shim's onresult to invoke the customer's `on_result`). Structural
+/// twin of `fireSubscriptionActivation`:
+///
+///   - **Msg**: `SendCallback{tenant_id, module_path, ctx_json,
+///     fn_name?, correlation_id?}`.
+///   - **prep**: resolve the cont's module on its tenant; build
+///     `body = {"ctx":<ctx>}` (mirrors fireSubscriptionActivation
+///     so customers' `JSON.parse(request.body).ctx` pattern is
+///     uniform); reuse the inherited correlation_id when present
+///     (replay UX groups multi-hop chains) or mint one based on
+///     the request_id.
+///   - **run**: `dispatcher.runOutcome`. `activation_source ==
+///     .send_callback` so `request.activation.kind === "send_callback"`.
+///   - **apply**: terminal → propose forgetfully; continuation /
+///     stream → recorded but no held socket. Same posture as
+///     subscription_fire — fire-and-forget.
+///
+/// No held socket. Writes commit forgetfully via
+/// `proposeForgetfulWrites`. Errors return `void` (best-effort:
+/// loss on crash is recovered by the producer's own retry hook —
+/// PR-2d's retry sweep, when a webhook leaves an `_send/owed/`
+/// marker behind).
+fn fireChainedActivation(
+    worker: anytype,
+    sc: *effect_mod.msg.SendCallback,
+) void {
+    const allocator = worker.allocator;
+    const tenant_id = sc.tenant_id;
+    const module_path = sc.module_path;
+
+    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
+        std.log.warn(
+            "rove-js chained-dispatch: tenant={s} module={s} resolveDeployment failed: {s}; skipping",
+            .{ tenant_id, module_path, @errorName(err) },
+        );
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+
+    const ctx_src: []const u8 = if (sc.ctx_json.len > 0) sc.ctx_json else "null";
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    var tapes = RequestTapes.init(allocator);
+    defer tapes.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+
+    // Inherit correlation_id when the cont carried one (chained from
+    // a fetch handler — preserves the parent fetch's chain identity).
+    // Otherwise mint `chain-<request_id>` so the hop self-identifies
+    // in the replay tape.
+    var corr_buf: [80]u8 = undefined;
+    const corr_full: []const u8 = if (sc.correlation_id) |c|
+        c
+    else
+        std.fmt.bufPrint(&corr_buf, "chain-{x:0>16}", .{request_id}) catch corr_buf[0..0];
+
+    // Build the synthetic query for the named-export case (mirrors
+    // callback_dispatch.zig's `?fn=<name>` shape). Default-export
+    // when fn_name is null/empty.
+    var query_buf: [256]u8 = undefined;
+    const query_opt: ?[]const u8 = if (sc.fn_name) |fnn|
+        if (fnn.len > 0) std.fmt.bufPrint(&query_buf, "fn={s}", .{fnn}) catch null else null
+    else
+        null;
+
+    const req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = query_opt,
+        .kv_tape = &tapes.kv,
+        .date_tape = &tapes.date,
+        .math_random_tape = &tapes.math_random,
+        .crypto_random_tape = &tapes.crypto_random,
+        .module_tape = &tapes.module,
+        .prng_seed = @bitCast(now_ns),
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = corr_full,
+        .activation_source = .send_callback,
+    };
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        req,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .send_callback);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    var oc = run_oc;
+    // Chained-dispatch handler has no held socket. Same posture as
+    // subscription_fire: terminal propose-forgetful or commit;
+    // cont/stream returns are warned + writes still propose.
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .send_callback);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                    std.log.warn("rove-js chained-dispatch ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .send_callback);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireChainedActivation.commit(terminal)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            // Chained-from-chained: enqueue another SendCallback Msg
+            // so the next hop runs on the following tick (bounded
+            // recursion via the dispatch BATCH cap). Inherits the
+            // same correlation_id.
+            defer cval.deinit(allocator);
+            const enqueue_err = worker.node.enqueueChainedDispatchForTenant(
+                tenant_id,
+                cval.path,
+                cval.ctx_json,
+                cval.fn_name,
+                corr_full,
+            );
+            if (enqueue_err) |_| {} else |err| std.log.warn(
+                "rove-js chained-dispatch ({s}): nested enqueue failed: {s}",
+                .{ module_path, @errorName(err) },
+            );
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                    std.log.warn("rove-js chained-dispatch ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .send_callback);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireChainedActivation.commit(cont)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
+        },
+        .stream => |*s2| {
+            // `__rove_stream` from a chained-dispatch handler — no
+            // held socket; same posture as subscription_fire stream.
+            s2.deinit(allocator);
+            std.log.warn(
+                "rove-js chained-dispatch ({s}): __rove_stream is a no-op (no held socket)",
+                .{module_path},
+            );
+            if (wrote) {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                    std.log.warn("rove-js chained-dispatch ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .send_callback);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireChainedActivation.commit(stream)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
+        },
+    }
+}
+
 /// Effect-reification Phase 4.0.b: a resume-hop's staged chunks +
 /// terminal-draining flag, parked on the unit alongside its txn so
 /// they apply on commit (chunks transfer into the entity's
@@ -6513,6 +6789,18 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                 components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
                 fired += 1;
             },
+            .send_callback => |sc_const| {
+                // Phase 5 PR-2: chained dispatch — the customer's
+                // next-hop handler runs because a previous handler
+                // returned `__rove_next(path, {ctx})`. Producer is the
+                // fetch-event `.continuation` arm (PR-2 lift); future
+                // producers (`webhook.send.js` shim's onresult after
+                // PR-2c) compose on this same Msg.
+                var sc = sc_const;
+                fireChainedActivation(worker, &sc);
+                sc.deinit(allocator);
+                fired += 1;
+            },
             else => {
                 std.log.warn(
                     "rove-js msg_queue: unexpected variant kind={s} (no dispatch arm yet)",
@@ -6739,10 +7027,25 @@ fn fireFetchEventActivation(
             r.exception = &.{};
         },
         .continuation => |*cval| {
-            cval.deinit(allocator);
-            std.log.warn(
-                "rove-js fetch-event ({s}): __rove_next from a fetch activation is a no-op (v1)",
-                .{module_path},
+            // Phase 5 PR-2: lift the cont arm to actually dispatch
+            // the named module. The fetch handler returned
+            // `__rove_next(path, {fn, ctx})` — enqueue a SendCallback
+            // Msg so the named handler runs as a fire-and-forget
+            // chain hop on the next worker tick. Inherits the
+            // current chain's correlation_id so replay UX groups
+            // the whole flow (inbound → fetch → chained hop) under
+            // one umbrella.
+            defer cval.deinit(allocator);
+            const enqueue_err = worker.node.enqueueChainedDispatchForTenant(
+                tenant_id,
+                cval.path,
+                cval.ctx_json,
+                cval.fn_name,
+                corr_full,
+            );
+            if (enqueue_err) |_| {} else |err| std.log.warn(
+                "rove-js fetch-event ({s}): chained dispatch enqueue failed: {s}",
+                .{ module_path, @errorName(err) },
             );
             if (wrote) {
                 proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
@@ -6759,7 +7062,11 @@ fn fireFetchEventActivation(
                 captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source);
                 return;
             }
-            txn.rollback() catch {};
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireFetchEventActivation.commit(cont)",
+                "err={s}",
+                .{@errorName(e)},
+            );
             txn_done = true;
             const tape_payloads = captureTapesForChainWithActivation(worker, &tapes, body, corr_full, activation_bytes_for_tape);
             captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source);
