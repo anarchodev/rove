@@ -2237,7 +2237,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
             break :blk std.fmt.bufPrint(&correlation_id_buf, "{x:0>16}", .{request_id}) catch unreachable;
         };
-        std.log.info("rove-js corr: inbound corr={s} request_id={d} tenant={s}", .{ correlation_id, request_id, scope_inst.id });
+        std.log.debug("rove-js corr: inbound corr={s} request_id={d} tenant={s}", .{ correlation_id, request_id, scope_inst.id });
 
         // Gap 2.3 Phase C1: per-request accumulator for
         // `http.fetch` calls. The binding appends into it via
