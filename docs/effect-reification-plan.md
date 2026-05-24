@@ -555,77 +555,203 @@ Revised 2026-05-22 in light of two prior decisions:
 
 ### Phase 5 — Retire `http.send`; durability becomes JS-shim composition
 
-Revised 2026-05-22. Earlier drafts said "collapse SendDispatch + FetchPool
+Revised 2026-05-23. Earlier drafts said "collapse SendDispatch + FetchPool
 into one transport." Per the
 [[project_durability_as_js_shim]] decision, the right move is
 **delete SendDispatch entirely** and rebuild its semantics as a
-composition in the JS standard library. The cost (per-fire JS dispatch
-overhead) is acceptable pre-launch and an obvious paid-tier-fast-path
-target later.
+composition in the JS standard library. The cost (per-fire JS
+dispatch overhead) is acceptable pre-launch and an obvious
+paid-tier-fast-path target later.
 
-- **Goal**: one outbound HTTP runtime in Zig (`FetchPool` renamed);
-  durability is a JS-shim composition (`webhook.send.js` /
-  `email.send.js`) on top of `kv` + the outbound primitive + cron
-  subscriptions + boot subscriptions.
-- **Steps** (one collapse per PR):
-  1. **Ship `webhook.send.js` shim** that composes:
-     - `kv.set("_send/owed/{id}", JSON.stringify({url, body,
-       attempts, next_at_ns}))` — rides envelope-0 atomic with the
-       handler's writeset.
-     - `http.request(url, {on_result: "<shim's onresult module>"})` —
-       first attempt fires immediately, same latency as today's
-       SendDispatch.
-     - `<shim's onresult>` module — clears `_send/owed/{id}` on
-       success; updates `next_at_ns` + `attempts` on retryable
-       failure; deletes the marker on giving-up.
-     - `_subscriptions/_send_retry/` cron subscription (1 Hz default)
-       — scans `_send/owed/` for entries past `next_at_ns`, re-fires.
-     - `_subscriptions/_send_recover/` boot subscription — fires once
-       per deployment activation; same scan logic, picks up orphans
-       across leader changes.
-  2. **Ship `email.send.js`** as a thin wrapper over `webhook.send.js`
-     (or directly equivalent — Resend's API is HTTP).
-  3. **Migrate `email.send` + `webhook.send` JS bindings** to use the
-     shim. Existing customer code (calling `email.send` / `webhook.
-     send`) is unchanged; only the implementation flips.
-  4. **Delete the Zig kernel**: `send_dispatch.zig`, `send_inflight.
-     zig`, `send_outbox.zig`. Delete `parkSendOps` /
-     `firePendingSendOps`. Delete the apply.zig special-case branches
-     for `_send/owed` and `_send/proof` (they become ordinary kv
-     writes). Delete the `send_callback` activation source from
-     `log_mod.ActivationSource` (replay tape compatibility note below).
-  5. **Rename `FetchPool` → `OutboundHttpPool`** (or keep the name;
-     bikeshed-grade). Confirm no `durable?` parameter survives.
-  6. **Replay-tape compatibility** for `.send_callback`: old tapes
-     have an enum value referencing it. Choose: (a) keep the variant
-     in `ActivationSource` as a deprecated never-emitted entry,
-     decoded but unused; or (b) bump the tape format major. (a)
-     is cheaper and probably right pre-launch. Decision rides with
-     this phase's first PR.
-- **Gate**: per PR, the matching smokes:
-  - `http_send_smoke` — exercises `email.send` / `webhook.send`
-    end-to-end. After step 3 it tests the JS shim path; after step 4
-    it confirms `SendDispatch` is gone (no metrics, no envelope-0
-    handling).
-  - `leader_failover_smoke` — verifies cross-failover delivery still
-    works via the boot subscription. (Currently flaky per
-    [[project_leader_failover_smoke_flake]] — fix the smoke as part
-    of this phase or accept the known flake.)
-  - perf gate: kv-bench + `http_send_smoke` end-to-end timing. Pre-
-    launch we accept a slowdown vs native SendDispatch; the
-    Phase-0 baseline is the regression floor for the *outbound HTTP
-    primitive itself*, not for the durable path.
-- **Done**: `src/js/send_dispatch.zig`, `send_inflight.zig`,
-  `send_outbox.zig` deleted. `webhook.send.js` and `email.send.js`
-  ship the durability composition. `http_send_smoke` exercises the
-  JS-shim path. `apply.zig` has no remaining `_send/`-prefix
-  special-casing. The §13 process map shrinks.
-- **Risk**: this is a customer-visible behavioral change in latency
-  characteristics (JS dispatch adds overhead per retry). Pre-launch
-  it is acceptable; post-launch a paid-tier fast path
-  (pattern-matches the shim's `kv.set` + `http.request` sequence and
-  bypasses to native dispatch) restores the latency profile without
-  changing the customer API. Out of scope here; tracked separately.
+This phase is broken into PRs. PR-1 narrows the outbound primitive
+itself (`http.fetch`); PR-2 builds the JS-shim durability on top;
+PR-3+ delete the now-unreferenced Zig kernel.
+
+#### Phase 5 — PR-1: collapse `http.fetch` to single callback + `stream` knob
+
+Locked 2026-05-23 after a design walk-through that twice simplified
+the originally-planned API (an "on_done with body" addition, then a
+straight "merge on_chunk + on_done with a `final` flag"). The
+collapse drops two of the three patterns in today's binding and the
+distinction between Pattern A and the hypothetical "request-response"
+Pattern C. `pipe_to` (Pattern B) was a premature throughput
+optimization for an LLM-proxy workload that doesn't yet exist; it
+re-enters when concrete demand justifies it, per
+[[feedback_compose_from_primitives]].
+
+**Goal**: one outbound verb (`http.fetch`), one callback (`on_chunk`),
+two knobs (`stream: bool`, body cap). Activation always fires at
+least once; `final: true` carries terminal info (status + ok +
+body_truncated). Webhook shim (PR-2) and LLM-proxy code (post-launch)
+both compose on top.
+
+**API after collapse:**
+
+```js
+http.fetch({
+  url, method, headers, body,
+  on_chunk: "module.mjs",                          // the one callback
+  stream: false,                                    // false → first chunk only (default)
+  max_response_chunk_bytes: 256 * 1024,            // cap on the first/each chunk
+  max_total_response_bytes: 50 * 1024 * 1024,     // hard cap when stream=true
+  timeout_ms: 30000,
+  ctx: { … },
+});
+```
+
+**Activation shape (`request.activation`):**
+
+```js
+{
+  kind: "fetch_chunk",
+  fetch_id: "f_…",
+  seq: 0,                            // 0 first/only; 1, 2, … when streaming
+  byte_offset: 0,                    // cumulative bytes before this chunk
+  bytes: Uint8Array,                 // may be empty on transport error / 204
+  fetch_headers: { … },              // seq=0 only — PARSED into key→value
+  final: true,                       // always true when stream=false
+  // present iff final === true:
+  status: 200,                       // upstream HTTP status; 0 on transport error
+  ok: true,                          // libcurl-transport-only signal
+  body_truncated: false,             // true if more body discarded by cap
+  ctx: { … },
+}
+```
+
+**What deletes from the existing surface:**
+
+- `pipe_to: "held_response"` option (Pattern B).
+- `headers_passthrough` option (Pattern B helper).
+- `on_done` option (Pattern A's separate terminal hook).
+- `fetch_pipe_done` `ActivationSource` variant.
+- `PipeState` component (`src/js/components.zig`) — `awaiting_pipe`,
+  `pipe_correlation_id`, `bytes_piped`, `terminal_ok`,
+  `terminal_status`, `pipe_dropped_chunks`.
+- `pipe_to_held`, `pipe_correlation_id` on `PendingFetch` /
+  `UpstreamFetchEvent`.
+- `activation_fetch_terminal_status` /
+  `activation_fetch_terminal_ok` / `activation_fetch_bytes_piped` on
+  `Request` (folded into per-`fetch_chunk` activation's final
+  payload).
+
+**What stays / changes shape:**
+
+- `FetchPool` — keeps its libcurl thread + per-tenant routing;
+  loses pipe accounting; gains a `stream` flag and a first-chunk-cap
+  abort mode (writeback returns 0 after the first chunk lands).
+- `fetch_headers` — today emitted as `Key: Val\r\n…` wire-format;
+  parse server-side into a `{ "content-type": "...", ... }` object
+  (last-wins for repeats) so customers don't re-parse.
+- `on_chunk` activation **always fires at least once** — even for
+  204 / transport error / cap-only failure. `final: true` carries
+  the result; `bytes` is empty when there's no body.
+
+**What stays IDENTICAL:**
+
+- Pattern A streaming behavior under `stream: true` (multiple
+  activations, each carrying `bytes`, final one carrying terminal).
+- libcurl thread, hash-routed chunk inbox, FetchPool tenant scoping.
+- `max_total_response_bytes` hard-cap semantics.
+- Tape per §6 cap (each activation taped; per-chain byte cap
+  bounds long-term cost).
+
+**Migrations:**
+
+- `examples/loop46-demo-tenants/acme/pipe/index.mjs` — uses
+  `pipe_to: "held_response"`. Retire (LLM-proxy use case re-enters
+  when demand materializes). Or migrate to `stream: true` +
+  customer-side `__rove_stream` forwarding (more code; same end
+  behavior; documents the cost of the collapse).
+- `examples/loop46-demo-tenants/acme/fetchchunks/` +
+  `fetchchunk.mjs` + `fetchdone.mjs` — merge `on_chunk` and
+  `on_done` modules into one (the handler branches on
+  `activation.final`).
+
+**Smoke gates:**
+
+- `fetch_chunk_smoke.py` (Pattern A → migrated to single-callback +
+  `final` flag).
+- `fetch_streaming_smoke.py` (Pattern A streaming → migrated to
+  `stream: true`).
+- `fetch_chunk_tape_smoke.py` (replay determinism — same coverage
+  with merged activation).
+- `pipe_smoke.py` — retired (the surface it exercises is gone).
+- NEW: cover `body_truncated: true` (response exceeds
+  `max_response_chunk_bytes` with `stream: false`); cover
+  transport error fires `final: true` with empty bytes; cover
+  parsed headers shape.
+
+**Done when:** `http.fetch` exposes only `{url, method, headers,
+body, on_chunk, stream, max_response_chunk_bytes,
+max_total_response_bytes, timeout_ms, ctx}`; the surface is
+documented in `globals/http.js`; smokes green; `zig build test`
+green; perf parity (kv-bench unaffected — `http.fetch` is off the
+write hot path).
+
+**Rollback:** PR-1 is a single commit; revert restores `pipe_to` +
+`on_done` + `headers_passthrough` byte-identically.
+
+#### Phase 5 — PR-2 (next): `webhook.send.js` shim + subscriptions
+
+Composes durability from `kv.set("_send/owed/{id}", …)` +
+`http.fetch({on_chunk: "__system/webhook_onresult", …})` + a cron
+subscription that re-fires past-due owed entries + a boot
+subscription that recovers orphans across leader changes. Customer
+API (`webhook.send({url, body, on_result, context})`) unchanged;
+only the implementation flips.
+
+Decision pending PR-2 design: where the `_send_retry` cron + 
+`_send_recover` boot subscriptions live (auto-injected at deploy vs.
+customer-supplied vs. native Zig sweep). Held open until PR-1 lands.
+
+#### Phase 5 — PR-3: `email.send.js` retargets onto `webhook.send.js`
+
+Thin migration — `email.send` already calls `webhook.send`; once
+`webhook.send` is the JS-shim composition, `email.send` rides for
+free. May need adjustments for `email_rate` per-instance limiter
+interaction.
+
+#### Phase 5 — PR-4: delete the Zig kernel
+
+`send_dispatch.zig`, `send_inflight.zig`, `send_outbox.zig`,
+`parkSendOps` / `firePendingSendOps` in `worker.zig`, apply.zig's
+`_send/owed` / `_send/proof` special-case branches, the
+`send_callback` `ActivationSource` variant. The `BufferedSendKvOps
+.send_ops` field on `ParkedUnit` collapses to just `kv_wakes` (and
+the Phase 4.0.b stream chunks). §13 process map shrinks; PLAN.md
+§10.2 retires another envelope-type row.
+
+Replay-tape compatibility for the retiring `send_callback`
+ActivationSource variant: keep the variant defined as a deprecated,
+never-emitted entry (option a) so old-tape decoders still match
+without bumping the tape format major. Cheap; right pre-launch.
+
+#### Phase 5 — PR-5: rename `FetchPool` → `OutboundHttpPool`
+
+Bikeshed-grade. Done if a reviewer cares; otherwise leave the name
+and ship.
+
+#### Phase 5 — gating + risk (all PRs)
+
+- `http_send_smoke` — exercises `email.send` / `webhook.send`
+  end-to-end. After PR-3 it tests the JS shim path; after PR-4 it
+  confirms `SendDispatch` is gone (no metrics, no envelope-0
+  handling).
+- `leader_failover_smoke` — verifies cross-failover delivery still
+  works via the boot subscription. (Currently flaky per
+  [[project_leader_failover_smoke_flake]] — fix the smoke as part
+  of PR-2 or accept the known flake.)
+- perf gate: kv-bench + `http_send_smoke` end-to-end timing. Pre-
+  launch we accept a slowdown vs native SendDispatch; the Phase 0
+  baseline is the regression floor for the *outbound HTTP primitive
+  itself*, not for the durable path.
+
+**Risk**: this is a customer-visible behavioral change in latency
+characteristics (JS dispatch adds overhead per retry). Pre-launch
+it is acceptable; post-launch a paid-tier fast path (pattern-matches
+the shim's `kv.set` + `http.fetch` sequence and bypasses to native
+dispatch) restores the latency profile without changing the
+customer API. Out of scope here; tracked separately.
 
 ### Phase 6 — Cleanup tail
 

@@ -102,8 +102,8 @@ def main() -> int:
         if done is None:
             sys.exit("FAIL fetch_done never landed")
         if done.get("ok") is not False:
-            sys.exit(f"FAIL drip fetch_done should be ok=false (timeout): {done!r}")
-        print(f"ok  fetch_done fired ok=false (upstream timed out, as designed)")
+            sys.exit(f"FAIL drip final event should be ok=false (timeout): {done!r}")
+        print(f"ok  final event fired ok=false (upstream timed out, as designed)")
 
         # 5. THE proof: count the fetch_chunk activations that landed
         #    BEFORE the timeout. Streaming → many; buffered → zero.
