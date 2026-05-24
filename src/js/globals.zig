@@ -237,6 +237,13 @@ pub const DispatchState = struct {
     /// frees any leftovers on error paths (no orphan fetches).
     /// Null on test paths that don't care.
     pending_fetches: ?*std.ArrayListUnmanaged(PendingFetch) = null,
+    /// Phase 5 PR-2b: true ⇒ the dispatched module is a `__system/`
+    /// built-in (e.g. the webhook shim's `webhook_onresult.mjs`).
+    /// `isCustomerWriteReserved` is skipped so the shim can write
+    /// `_send/owed/{id}` markers; customer modules see false and
+    /// the reserved-prefix check applies as before. Set by
+    /// `Dispatcher.runOutcome` from `Request.is_system_module`.
+    is_system_module: bool = false,
     /// Resolved session id (see `Request.session_id`). 64 lowercase hex
     /// chars when set; null in non-browser dispatch paths. Surfaced as
     /// `request.session = {id: ...}` (or `request.session = null`).
@@ -453,8 +460,11 @@ fn jsKvSet(
     // Reject writes into platform-reserved namespaces. Platform writers
     // (http.send → `_send/owed/` marker, etc.) bypass jsKvSet and write
     // through state.txn / state.writeset directly, so this guard only
-    // fires when customer JS tries to spoof a platform key.
-    if (reserved.isCustomerWriteReserved(key_str)) {
+    // fires when customer JS tries to spoof a platform key. Phase 5
+    // PR-2b: `__system/` built-in modules (the webhook shim's
+    // onresult handler) are platform-trusted and bypass the check —
+    // they need to write `_send/owed/{id}` markers.
+    if (!state.is_system_module and reserved.isCustomerWriteReserved(key_str)) {
         return throwReservedKey(ctx, key_str);
     }
 
@@ -545,7 +555,8 @@ fn jsKvDelete(
     defer state.allocator.free(key_str);
 
     // Same reserved-namespace guard as jsKvSet — see the comment there.
-    if (reserved.isCustomerWriteReserved(key_str)) {
+    // Phase 5 PR-2b: `__system/` built-ins bypass.
+    if (!state.is_system_module and reserved.isCustomerWriteReserved(key_str)) {
         return throwReservedKey(ctx, key_str);
     }
 

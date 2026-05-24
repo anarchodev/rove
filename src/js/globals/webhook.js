@@ -8,6 +8,14 @@
 // wrapper so customer recipes that already use it keep working
 // while we migrate.
 //
+// Phase 5 PR-3 (planned) will atomically flip this shim to compose
+// on `http.fetch` + kv (the `__system/webhook_onresult` built-in
+// shipped in PR-2b runs the bookkeeping) AND delete the Zig
+// SendDispatch kernel — both in one commit, because apply.zig's
+// `classifyPayload` for `_send/owed/*` would double-fire if the
+// shim wrote markers while SendDispatch is still alive. Until
+// then this shim stays on `http.send`.
+//
 // Differences from the legacy webhook.send:
 //   - No built-in retries (`maxAttempts` is ignored). Customers who
 //     want retries use `retry.send` directly + `retry.shouldRetry`/
