@@ -83,6 +83,7 @@ const deployment_loader_mod = @import("deployment_loader.zig");
 const send_dispatch_mod = @import("send_dispatch.zig");
 const fetch_pool_mod = @import("fetch_pool.zig");
 const send_outbox_mod = @import("send_outbox.zig");
+const builtin_modules_mod = @import("builtin_modules.zig");
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = dispatcher_mod.Request;
 
@@ -1211,6 +1212,15 @@ pub const NodeState = struct {
     cron_state_mutex: std.Thread.Mutex = .{},
     cron_state: std.StringHashMapUnmanaged(i64) = .empty,
 
+    /// Phase 5 PR-2b: built-in `__system/*` module bytecodes,
+    /// compiled once at `init` from sources baked into the binary
+    /// (see `src/js/builtin_modules.zig`). Shared across every
+    /// tenant context — the shim's onresult handler runs against
+    /// these bytecodes, not against per-tenant deployment files.
+    /// `resolveDeployment` falls through to this when `module_path`
+    /// starts with `__system/`.
+    builtin_modules: std.StringHashMapUnmanaged([]u8) = .empty,
+
     /// Per-chain tape budget tracker (`docs/primitive-gaps.md` §6).
     /// Keyed by `correlation_id` (string-owned). Each chain
     /// accumulates `bytes_used` across all its activations; hitting
@@ -1263,12 +1273,20 @@ pub const NodeState = struct {
         tenant: *tenant_mod.Tenant,
         blob_backend_cfg: blob_mod.BackendConfig,
         raft: *kv_mod.RaftNode,
-    ) NodeState {
+    ) !NodeState {
+        // Phase 5 PR-2b: compile every `__system/*` built-in module
+        // at startup. Bake them once; share across tenants via
+        // `resolveDeployment`'s fallback. Failure here is fatal —
+        // a baked module that won't compile is a build-time bug.
+        var builtins = try builtin_modules_mod.init(allocator);
+        errdefer builtin_modules_mod.deinit(&builtins, allocator);
+
         return .{
             .allocator = allocator,
             .tenant = tenant,
             .blob_backend_cfg = blob_backend_cfg,
             .raft = raft,
+            .builtin_modules = builtins,
         };
     }
 
@@ -1509,6 +1527,7 @@ pub const NodeState = struct {
         // The list itself is owned by NodeState's allocator.
         self.wake_inboxes.deinit(self.allocator);
         self.msg_inboxes.deinit(self.allocator);
+        builtin_modules_mod.deinit(&self.builtin_modules, self.allocator);
         {
             var cs_it = self.cron_state.iterator();
             while (cs_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
@@ -4304,6 +4323,15 @@ fn resolveDeployment(
         const js = try std.fmt.allocPrint(allocator, "{s}.js", .{module_path});
         defer allocator.free(js);
         if (tc.snap.bytecodes.get(js)) |b| break :blk b;
+        // Phase 5 PR-2b: `__system/<name>` falls through to the
+        // node-level built-in registry. Bytecode compiled once at
+        // NodeState init from sources baked into the binary; shared
+        // across tenants. The handler runs in the tenant's context,
+        // so it sees the tenant's globals (kv, http, __rove_next).
+        if (builtin_modules_mod.isBuiltinPath(module_path)) {
+            if (worker.node.builtin_modules.get(module_path)) |b| break :blk b;
+            if (worker.node.builtin_modules.get(mjs)) |b| break :blk b;
+        }
         return error.ResumeNoBytecode;
     };
     return .{ .inst = inst, .tc = tc, .bc = bc };
@@ -6199,6 +6227,7 @@ fn fireChainedActivation(
         .instance_id = inst.id,
         .correlation_id = corr_full,
         .activation_source = .send_callback,
+        .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -6940,6 +6969,7 @@ fn fireFetchEventActivation(
         .correlation_id = corr_full,
         .activation_source = act_source,
         .activation_fetch_id = event.fetch_id,
+        .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
     };
     req.activation_fetch_seq = event.seq;
     req.activation_fetch_byte_offset = event.byte_offset;

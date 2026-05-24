@@ -124,6 +124,15 @@ pub const Request = struct {
     /// per-instance bucket key. Empty when the dispatcher runs
     /// outside a worker context (test paths).
     instance_id: []const u8 = "",
+    /// Phase 5 PR-2b: true when the dispatched module belongs to the
+    /// `__system/` namespace (resolved from `NodeState.builtin_modules`,
+    /// not from a tenant's deployment files). Built-in modules are
+    /// platform-trusted code — they bypass the
+    /// `isCustomerWriteReserved` check so the webhook shim can write
+    /// `_send/owed/{id}` markers atomically with the customer's
+    /// writeset. Customer modules see `is_system_module = false`
+    /// and the reserved-prefix check fires as before.
+    is_system_module: bool = false,
     /// Optional non-determinism tapes. When set, the matching source of
     /// handler non-determinism (`kv.*`, `Date.now`, `Math.random`,
     /// `crypto.getRandomValues` / `crypto.randomUUID`) is captured
@@ -504,6 +513,7 @@ pub const Dispatcher = struct {
             .scope_kv_write = request.scope_kv_write,
             .scope_kv_ctx = request.scope_kv_ctx,
             .pending_fetches = request.pending_fetches,
+            .is_system_module = request.is_system_module,
         };
 
         // Reset the per-request arena (one cursor write) and reseed

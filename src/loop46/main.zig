@@ -1442,7 +1442,7 @@ pub fn main() !void {
     else
         null;
 
-    var node_state = rjs.NodeState.init(
+    var node_state = try rjs.NodeState.init(
         allocator,
         node_tenant,
         blob_owned.cfg,

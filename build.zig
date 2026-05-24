@@ -450,6 +450,14 @@ pub fn build(b: *std.Build) void {
         .{ .name = "textcodec_js", .path = "src/js/globals/textcodec.js" },
         .{ .name = "users_js", .path = "src/js/globals/users.js" },
         .{ .name = "activitypub_js", .path = "src/js/globals/activitypub.js" },
+
+        // Built-in handler modules — compiled to bytecode at NodeState
+        // init, resolved via the `__system/` module-path prefix
+        // (`docs/effect-reification-plan.md` Phase 5 PR-2). Not part
+        // of any tenant's deployment files; shared across every
+        // tenant's context. Add an entry here AND in
+        // `src/js/builtin_modules.zig`'s `MODULES` table.
+        .{ .name = "builtin_webhook_onresult_mjs", .path = "src/js/builtin_modules/webhook_onresult.mjs" },
     };
     for (js_runtime_files) |f| {
         js_mod.addAnonymousImport(f.name, .{
