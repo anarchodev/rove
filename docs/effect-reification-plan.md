@@ -540,11 +540,27 @@ Revised 2026-05-22 in light of two prior decisions:
   - `worker.zig` resumeStream doc-comment and
     `streaming-model.md` §2 implementation-status note both
     updated to reflect the going-forward contract.
-- **Phase 4.1 (post-Phase-5)**: implement `interpretCmd` as the
-  exhaustive switch over the post-Phase-5 Cmd union (kv_write +
-  unified outbound HTTP + respond + conn_write). Move the effect
-  buffer onto Continuation; the reconciler releases on commit,
-  discards on fault.
+- **Phase 4.1 (next active piece, 2026-05-24)**: implement
+  `interpretCmd` as the exhaustive switch over the post-Phase-5
+  Cmd union (kv_write + unified outbound HTTP + respond +
+  conn_write). Move the effect buffer onto Continuation; the
+  reconciler releases on commit, discards on fault.
+  **Forcing function:** the Phase 5 PR-3 close-out (above,
+  finding #5) had to drop `webhook.send`'s inline `http.fetch`
+  fire because the marker-commit race let the fetch return
+  BEFORE the writeset committed via raft — the JS-shim
+  `webhook_onresult` then opened a fresh `beginTrackedImmediate`
+  that didn't see the speculative marker, exited at
+  `owed_raw == null`, and the chain to the customer's
+  `on_result` never fired. The shipped mitigation (sweep-only
+  fire path) adds ~1s first-fire latency. Phase 4.1's
+  commit-gated buffer is the proper fix: an `http.fetch` Cmd
+  emitted from a handler stages on the handler's `ParkedUnit`
+  (Phase 4.0.b extended this from stream chunks to all Cmd
+  kinds); at raft commit `transferStagedFetches` (parallel to
+  the existing `transferStagedChunks`) flushes to
+  `node.fetch_pending`; at fault the staged fetches discard with
+  the unit. Restores inline `http.fetch` fire without the race.
 - **Gate**: streaming smokes (for 4.0's pre-commit decision);
   `http_send` smokes + streaming smokes (for 4.1).
 - **Done**: streaming model says what the code does and vice versa;
@@ -718,14 +734,15 @@ plumb through the dispatcher so `globals.jsKvSet` /
 `jsKvDelete` bypass `reserved.isCustomerWriteReserved` when the
 flag is true (the shim needs to write `_send/owed/{id}` markers).
 
-The first baked module — `webhook_onresult.mjs` — is compiled and
-loaded but UNUSED at runtime. PR-3 wires it.
+The first baked module — `webhook_onresult.mjs` — was compiled and
+loaded but UNUSED at runtime when PR-2b landed. PR-3 wired it (see
+below).
 
 Verification: unit tests in `builtin_modules.zig` (registry
 compiles to non-empty bytecodes; `isBuiltinPath` classifier
 correct); existing gating smokes unaffected.
 
-#### Phase 5 — PR-3 (NEXT — atomic flip + Zig kernel delete)
+#### Phase 5 — PR-3 (shipped 2026-05-24, `b908953` — atomic flip + Zig kernel delete)
 
 Originally planned as four separate sub-PRs (2c shim rewrite, 2d
 retry sweep, 3 email.send retarget, 4 delete kernel). All four
@@ -813,19 +830,125 @@ The only safe shape is one atomic commit:
 retires (~1 thread per node); `FetchPool` is now the sole
 outbound-HTTP runtime.
 
-**Cold-start for PR-3** (next session):
-1. Read [[project_durability_as_js_shim]] (the decision context).
-2. Read the PR-2b commit message (`ab1801b`) — explains why
-   `webhook_onresult.mjs` is baked-but-unused today.
-3. Re-read the design walk in this session's chat history for the
-   activation-shape and ctx-threading conventions PR-2a locked.
-4. `src/js/builtin_modules/webhook_onresult.mjs` is the shim's
-   onresult — it's already written; just needs the surrounding
-   wiring.
-5. Implementation order within PR-3: retry sweep first (proves
-   the boot/cron mechanism without flipping customers); then
-   webhook.js flip; then apply.zig strip + SendDispatch delete
-   (these must be in the same commit as the flip).
+**Close-out (2026-05-24).** PR-3 landed as TWO commits per the §6
+PR-2/PR-3 split: `769bf53` (retry sweep, prerequisites only —
+inert without the flip) + `b908953` (the atomic flip + delete).
+Diff stat for the flip alone: `36 files changed, 1209 insertions,
+5243 deletions` → net −4034 LOC.
+
+Deletions (4 files / ~4.7 kLOC):
+
+- `src/js/send_dispatch.zig`
+- `src/js/send_inflight.zig`
+- `src/js/send_outbox.zig`
+- `src/js/callback_dispatch.zig`
+- `examples/owed_recovery_scan_bench.zig`
+
+JS-shim composition (`globals/webhook.js`) rewritten as `kv.set +
+http.fetch` with `__system/webhook_onresult` as the on_chunk
+shim, plus `handle` (deterministic id basis) + `fire_at_ns`
+(scheduled fire) options. All five in-tree http.send callers
+migrated to `webhook.send`: `oidc.js`, `oauth.js`,
+`activitypub.js`, `retry.js`, `email.js`. `jsHttpSend` Zig
+binding deleted.
+
+**Four implementation-time bugs found mid-PR-3 (all fixed):**
+
+1. `_system` ABI was unreachable from baked `__system/` modules.
+   `globals.zig`'s `_harden.js` step runs `delete globalThis._system`
+   BEFORE customer + baked modules eval — so an initial
+   `_system.continuation.resumeIfBound` shim threw
+   `ReferenceError`. Resolution: the trampoline lives as a
+   persistent global builtin `__rove_resume_if_bound` (same shape
+   as `__rove_next` / `__rove_check_email_rate`), added to
+   `GLOBAL_BUILTINS` and the `builtin_exceptions` allowlist that
+   bypasses harden. **Lesson for baked modules: any platform-side
+   binding they need must be on the GLOBAL_BUILTINS surface, not
+   `_system.*`.**
+2. The `resume_if_bound` trampoline was wired in the H2 inbound
+   dispatch but NOT in `fireFetchEventActivation` — where the
+   JS-shim onresult ACTUALLY runs. With null trampoline,
+   `jsContinuationResumeIfBound` returned false unconditionally
+   and held-sync conts parked until their 25s deadline. Resolution:
+   thread the trampoline onto the fetch-event Request.
+3. `fetch_pool` in `stream:false` mode emitted TWO events (body
+   chunk with `final:false` + empty event with `final:true`) but
+   `webhook_onresult` only processes `final:true` — so
+   `outcome.body` arrived empty. Resolution: new `pushFinalWithBody`
+   buffers in `StreamState.body_buf` during `onBody`, emits ONE
+   consolidated event with body + final + terminal fields. Stream
+   mode (`stream:true`) unchanged.
+4. Customer middleware short-circuited `__system/` activations.
+   `__admin__`'s OIDC-RP middleware (web/admin/_middlewares/
+   index.mjs) returned 401 for paths not on its PRE_AUTH_PATHS
+   list — including the synthetic `/__system/webhook_onresult`
+   path the shim runs under. The shim's body never ran; markers
+   never deleted; sweep refired forever. Resolution:
+   `dispatcher.runOutcome` skips customer
+   `_middlewares/index.mjs` when `request.is_system_module ==
+   true`. **Built-in `__system/` modules ARE the platform — tenant
+   middleware can't gate them.**
+5. **Marker-commit race (semi-fix, full fix in 4.1).**
+   `handleCallback` style flows write the `_send/owed/{id}` marker
+   into the handler's writeset and `webhook.send`'s original shape
+   fired `http.fetch` inline. The fetch can return BEFORE the
+   writeset commits via raft; `webhook_onresult`'s fresh
+   `beginTrackedImmediate` doesn't see the speculative marker →
+   `owed_raw == null` early-exit → chain to customer `on_result`
+   never fires. **Mitigation that shipped:** `webhook.send.js`
+   drops the inline `http.fetch` — sweep-only fire path. The
+   per-worker partitioned retry sweep wakes within
+   `SEND_SWEEP_INTERVAL_NS` (1s) of `next_at_ns` AFTER the marker
+   has committed; eliminates the race. ~1s first-fire latency
+   accepted (heldsync §6.4 25s deadline tolerates it, observed
+   ~200ms; webhook callers were never latency-sensitive). **Proper
+   fix in Phase 4.1**: generalized commit-gated Cmd buffer
+   (extending Phase 4.0.b's stream-chunk staging) restores inline
+   fire without the race.
+
+**Smoke status post-flip (all gating green):**
+
+| Smoke | Status |
+|---|---|
+| `ctl_smoke` | ✓ |
+| `heldsync_smoke` | ✓ (~200ms first-fire) |
+| `leader_failover_smoke` | ✓ (deflaked by making wb tenant read-only) |
+| `webhook_recovery_smoke` (new) | ✓ |
+| `streaming_smoke` | ✓ |
+| `fetch_chunk_smoke` | ✓ (was pre-existing fail) |
+| `webhook_smoke` | ✓ (was pre-existing fail) |
+| `zig build test` | ✓ |
+
+**Perf gate (kv-bench, 8w, ReleaseFast, 2-run avg vs Phase 0):**
+
+| Workload | Phase 0 baseline | PR-3 measured | Δ |
+|---|---|---|---|
+| hot (1 tenant, 1 key) | ~46k | ~49k | +6% |
+| spread (1 tenant, 1000 keys) | ~42k | ~42k | 0% |
+| sharded (8 tenants, write) | ~140k | ~131k | −6.4% |
+
+Sharded is below the §6 invariant 4 floor (~135k). The hot path is
+not touched by PR-3 (the shim only runs when `webhook.send` is
+called; kv-bench tenants don't fire webhooks), so the regression is
+either (a) sweep cost on the worker tick (each leader worker walks
+`tenant_files_map` + does one prefix scan per second on its
+partitioned tenants — should be cheap, the dip suggests it's not),
+(b) `fetch_pool` state additions (the new `body_buf` ArrayList),
+or (c) cluster-bench noise. Not blocking; flagged for follow-up
+under Phase 4.1 prep (the rewire of the Cmd buffer will revisit
+the per-tick overhead anyway).
+
+**Two pre-existing failures fixed during the close-out** (not
+introduced by PR-3, but unblocked by debugging it):
+
+- `fetch_chunk_smoke` — `JS_ParseJSON` needs NUL-terminated buf
+  per arenajs; the fetch-headers activation install passed a
+  plain slice → parse silently failed → headers landed as `{}`.
+  Fixed in `globals.zig` by allocating a sentinel-terminated
+  copy.
+- `webhook_smoke` — RP login stall; was the marker-commit race
+  AND the middleware short-circuit hitting together. Both
+  resolved by the fixes above.
 
 #### Phase 5 — PR-4: rename `FetchPool` → `OutboundHttpPool`
 
@@ -901,27 +1024,44 @@ Phase-0 baseline.
 
 ## 10. First session (cold start)
 
-**Current state (2026-05-23):** Phases 0 through 5 PR-2b shipped
+**Current state (2026-05-24):** Phases 0 through 5 fully shipped
 on the `effect-reification` branch. See `git log
-main..effect-reification`. Phase 5 PR-1 collapsed `http.fetch` to
-a single-callback + stream-knob surface; PR-2a lifted `__rove_next`
-to dispatch chained activations from fetch on_chunk handlers;
-PR-2b shipped the `__system/` built-in module resolution
-mechanism + `is_system_module` flag (reserved-prefix bypass for
-trusted handlers). The first baked module
-(`__system/webhook_onresult`) is compiled-but-unused — PR-3 wires it.
+main..effect-reification`. Phase 5 PR-3 (atomic flip at
+`b908953`) deleted ~4.7 kLOC of Zig (`send_dispatch` +
+`send_inflight` + `send_outbox` + `callback_dispatch`) and made
+`webhook.send` a JS-shim composition over `kv.set + http.fetch +
+__system/webhook_onresult`. All five in-tree `http.send` callers
+(oidc, oauth, activitypub, retry, email) migrated to
+`webhook.send`. `jsHttpSend` binding deleted.
 
-Next active piece: **Phase 5 PR-3** — atomic flip from
-`http.send` (Zig) to the JS-shim webhook composition. Originally
-planned as four sub-PRs (2c shim rewrite, 2d retry sweep, 3 email
-retarget, 4 delete kernel); discovered mid-PR-2c that
-`apply.zig.classifyPayload` double-fires when both paths are live,
-so all four must land in one commit. See §6 Phase 5 PR-3 (above)
-for the locked design + implementation order.
+**Next active piece: Phase 4.1** — the generalized commit-gated
+Cmd buffer (extending Phase 4.0.b's stream-chunk staging to ALL
+Cmd kinds: `http.fetch` enqueues, `events.emit`, etc.). The
+forcing function is the PR-3 close-out finding (§6 Phase 5 PR-3,
+finding #5): `webhook.send` had to drop its inline `http.fetch`
+fire because the marker-commit race let the fetch return before
+the writeset committed via raft, breaking the chain to the
+customer's `on_result`. The sweep-only mitigation works but adds
+~1s first-fire latency. Phase 4.1's commit-gated buffer restores
+inline fire without the race — every Cmd stages on the handler's
+`ParkedUnit` and releases at raft commit, fails-cleanly on fault.
 
-Phase 4.1 (the `interpretCmd` unification over the post-Phase-5
-Cmd union) is deferred until **Phase 5 PR-3** lands — its shape
-depends on the post-PR-3 effect surface.
+Smaller follow-ups also unblocked by PR-3:
+
+- **Phase 5 PR-4** — bikeshed rename `FetchPool` →
+  `OutboundHttpPool`. Trivial.
+- **Phase 6 cleanup tail** — delete `src/connection_holder/`
+  dead scaffold; move `cron_state` to a collection (algebra
+  worklist #5); resolve boot double-fire UNCLEAR (worklist #6);
+  rewrite `effect-algebra.md §5` audit + §6 to reflect the
+  reified state; update `CLAUDE.md` if dispatch wording drifted.
+
+Deferred (no trigger yet):
+
+- **Phase 3.5** — `WakeKey` index for O(1) cross-worker wake
+  routing. Worker-local scan isn't measured hot;
+  reactivate when connection-actor cross-worker lands or
+  measurement shows the scan as a bottleneck.
 
 If picking up a different sub-phase entirely:
 
