@@ -691,42 +691,143 @@ write hot path).
 **Rollback:** PR-1 is a single commit; revert restores `pipe_to` +
 `on_done` + `headers_passthrough` byte-identically.
 
-#### Phase 5 — PR-2 (next): `webhook.send.js` shim + subscriptions
+#### Phase 5 — PR-2a (shipped 2026-05-23, `051fec3`): lift `__rove_next` from fetch on_chunk handlers
 
-Composes durability from `kv.set("_send/owed/{id}", …)` +
-`http.fetch({on_chunk: "__system/webhook_onresult", …})` + a cron
-subscription that re-fires past-due owed entries + a boot
-subscription that recovers orphans across leader changes. Customer
-API (`webhook.send({url, body, on_result, context})`) unchanged;
-only the implementation flips.
+`fireFetchEventActivation`'s `.continuation` arm previously
+warn-and-dropped; PR-2a lifts it to enqueue a `SendCallback` Msg
+carrying the cont's `{tenant, path, fn?, ctx, correlation_id}`. The
+dispatch loop fires `fireChainedActivation` (structural twin of
+`fireSubscriptionActivation` — no held socket, propose-forgetful
+on writes). Customer-facing surface: `request.activation.kind ===
+"send_callback"` + `request.body = {"ctx": <cont's ctx>}`.
 
-Decision pending PR-2 design: where the `_send_retry` cron + 
-`_send_recover` boot subscriptions live (auto-injected at deploy vs.
-customer-supplied vs. native Zig sweep). Held open until PR-1 lands.
+Smoke: `scripts/chained_dispatch_smoke.py` plus three demo
+handlers (`chainfetch/`, `chainfetchstep1.mjs`, `chainresult.mjs`).
 
-#### Phase 5 — PR-3: `email.send.js` retargets onto `webhook.send.js`
+#### Phase 5 — PR-2b (shipped 2026-05-23, `1ed9c5c`): `__system/` module resolution
 
-Thin migration — `email.send` already calls `webhook.send`; once
-`webhook.send` is the JS-shim composition, `email.send` rides for
-free. May need adjustments for `email_rate` per-instance limiter
-interaction.
+Built-in handler modules — the `__system/` namespace. Sources
+under `src/js/builtin_modules/*.mjs` are `@embedFile`'d via
+`build.zig`'s `js_runtime_files` table (entries with `builtin_*`
+prefix); compiled once at NodeState init to QJS bytecode via a
+throwaway Runtime+Context (`src/js/builtin_modules.zig`); stored
+in `NodeState.builtin_modules`. `worker.resolveDeployment` gains
+a `__system/`-prefix fall-through after the tenant-side lookups
+miss. `Request.is_system_module` + `DispatchState.is_system_module`
+plumb through the dispatcher so `globals.jsKvSet` /
+`jsKvDelete` bypass `reserved.isCustomerWriteReserved` when the
+flag is true (the shim needs to write `_send/owed/{id}` markers).
 
-#### Phase 5 — PR-4: delete the Zig kernel
+The first baked module — `webhook_onresult.mjs` — is compiled and
+loaded but UNUSED at runtime. PR-3 wires it.
 
-`send_dispatch.zig`, `send_inflight.zig`, `send_outbox.zig`,
-`parkSendOps` / `firePendingSendOps` in `worker.zig`, apply.zig's
-`_send/owed` / `_send/proof` special-case branches, the
-`send_callback` `ActivationSource` variant. The `BufferedSendKvOps
-.send_ops` field on `ParkedUnit` collapses to just `kv_wakes` (and
-the Phase 4.0.b stream chunks). §13 process map shrinks; PLAN.md
-§10.2 retires another envelope-type row.
+Verification: unit tests in `builtin_modules.zig` (registry
+compiles to non-empty bytecodes; `isBuiltinPath` classifier
+correct); existing gating smokes unaffected.
 
-Replay-tape compatibility for the retiring `send_callback`
-ActivationSource variant: keep the variant defined as a deprecated,
-never-emitted entry (option a) so old-tape decoders still match
-without bumping the tape format major. Cheap; right pre-launch.
+#### Phase 5 — PR-3 (NEXT — atomic flip + Zig kernel delete)
 
-#### Phase 5 — PR-5: rename `FetchPool` → `OutboundHttpPool`
+Originally planned as four separate sub-PRs (2c shim rewrite, 2d
+retry sweep, 3 email.send retarget, 4 delete kernel). All four
+**must land together**. Discovered mid-PR-2c: `apply.zig
+.classifyPayload` scans every committed writeset for `_send/owed/*`
+keys and arms a SendDispatch entry per hit. If the shim writes
+markers while SendDispatch is still alive, **every webhook
+double-fires** (Zig SendDispatch arming + the shim's
+`http.fetch`). The retry sweep + boot recovery have the same
+shape — both paths would re-fire past-due entries independently.
+The only safe shape is one atomic commit:
+
+1. **Flip `globals/webhook.js`**: replace the `http.send`-backed
+   body with the JS composition:
+   ```js
+   kv.set("_send/owed/" + id, JSON.stringify({url, body, headers,
+     attempts: 0, next_at_ns: "0", on_result, context}));
+   http.fetch({url, method, body, headers,
+     on_chunk: "__system/webhook_onresult",
+     ctx: {id, on_result, context}});
+   ```
+   `X-Rove-Schedule-Id` + `X-Rove-Schedule-Version` headers stamped
+   client-side (preserves the customer-visible header API).
+   Migrate `examples/.../cbresult.mjs` to read `request.body.ctx
+   .result` (new shape).
+
+2. **Wire the centralized per-worker partitioned retry sweep**
+   (PR-2d's locked design from this session):
+   - Each leader-side worker runs `sweepOwedRetries` on its tick
+     (~1Hz throttled per-worker).
+   - Partition: `hash(tenant_id) % N_workers == worker.global_idx`
+     — matches the existing `enqueueMsgForTenant` routing, so the
+     entire retry chain (sweep → fetch → onresult → kv ops) lives
+     on one worker per tenant. Zero cross-worker coordination;
+     parallel enumeration; the per-tenant work stays sticky.
+   - For each partitioned tenant, walk `_send/owed/` kv prefix;
+     for each entry where `now >= next_at_ns`, construct a
+     PendingFetch + push to FetchPool with `on_chunk =
+     __system/webhook_onresult`. Bumps the `X-Rove-Schedule-
+     Version` header.
+   - Boot variant: on leadership promotion, run the sweep once
+     across all partitioned tenants (independent of throttle) for
+     orphan recovery.
+
+3. **Strip apply.zig's `_send/*` special-case** —
+   `classifyPayload` is no longer reachable from anywhere live;
+   delete the `_send/owed/` arm enqueue + the `_send/proof/`
+   resolve enqueue. Now ordinary kv writes.
+
+4. **Delete the Zig kernel**: `send_dispatch.zig` (~66 KB),
+   `send_inflight.zig` (~25 KB), `send_outbox.zig` (~13 KB).
+   Delete `parkSendOps` / `firePendingSendOps` /
+   `BufferedSendKvOps.send_ops` (collapses the buffered struct to
+   `kv_wakes` + Phase 4.0.b stream chunks). Strip the `SendDispatch`
+   pointer from `NodeState`. Strip `startSendDispatch` from
+   `main.zig` boot sequence.
+
+5. **Retire `.send_callback` ActivationSource? No** — the new
+   chained-dispatch shape (PR-2a) reuses `.send_callback` as the
+   activation kind for `__rove_next` dispatches. The Msg variant
+   stays. Pre-PR-2a `.send_callback` was only emitted by
+   SendDispatch + held-sync resumeContinuation; post-PR-3 the
+   former producer is gone, the latter remains.
+
+6. **Migrate `globals/email.js`**: it already wraps `webhook.send`;
+   no behavioral change beyond the implicit shift to the new path.
+   Verify `email_rate` per-instance limiter still gates.
+
+**Gating**:
+
+- `webhook_smoke.py` migrated — exercises the JS-shim path through
+  `cbfire` / `cbresult`. After PR-3 the smoke validates the new
+  shape; pre-PR-3 it validates the old.
+- `http_send_smoke.py` — `http.send` is going away; this smoke
+  retires alongside the binding (defer the delete decision to PR-3's
+  PR-author).
+- New `webhook_recovery_smoke.py` — kill leader mid-fetch; new
+  leader's boot sweep fires the retry; verifies cross-failover
+  delivery via the new mechanism. Replaces the boot-scan recovery
+  smoke `SendDispatch.recover()` provided.
+- `leader_failover_smoke.py` — known flaky
+  ([[project_leader_failover_smoke_flake]]); fix or accept.
+
+**§13 process map shrink**: the dedicated SendDispatch thread
+retires (~1 thread per node); `FetchPool` is now the sole
+outbound-HTTP runtime.
+
+**Cold-start for PR-3** (next session):
+1. Read [[project_durability_as_js_shim]] (the decision context).
+2. Read the PR-2b commit message (`1ed9c5c`) — explains why
+   `webhook_onresult.mjs` is baked-but-unused today.
+3. Re-read the design walk in this session's chat history for the
+   activation-shape and ctx-threading conventions PR-2a locked.
+4. `src/js/builtin_modules/webhook_onresult.mjs` is the shim's
+   onresult — it's already written; just needs the surrounding
+   wiring.
+5. Implementation order within PR-3: retry sweep first (proves
+   the boot/cron mechanism without flipping customers); then
+   webhook.js flip; then apply.zig strip + SendDispatch delete
+   (these must be in the same commit as the flip).
+
+#### Phase 5 — PR-4: rename `FetchPool` → `OutboundHttpPool`
 
 Bikeshed-grade. Done if a reviewer cares; otherwise leave the name
 and ship.
@@ -800,17 +901,27 @@ Phase-0 baseline.
 
 ## 10. First session (cold start)
 
-**Current state (2026-05-22):** Phases 0 through 4.0.b shipped on
-the `effect-reification` branch. See `git log main..effect-
-reification`. Phase 4.1 (the `interpretCmd` unification over the
-post-Phase-5 Cmd union) is deferred until **Phase 5** lands
-(durability-as-JS-shim, [[project_durability_as_js_shim]]) — its
-shape depends on the post-Phase-5 effect surface.
+**Current state (2026-05-23):** Phases 0 through 5 PR-2b shipped
+on the `effect-reification` branch. See `git log
+main..effect-reification`. Phase 5 PR-1 collapsed `http.fetch` to
+a single-callback + stream-knob surface; PR-2a lifted `__rove_next`
+to dispatch chained activations from fetch on_chunk handlers;
+PR-2b shipped the `__system/` built-in module resolution
+mechanism + `is_system_module` flag (reserved-prefix bypass for
+trusted handlers). The first baked module
+(`__system/webhook_onresult`) is compiled-but-unused — PR-3 wires it.
 
-Next active piece: **Phase 5** — retire `http.send` as a Zig
-primitive; rebuild `webhook.send.js` / `email.send.js` as JS-shim
-compositions on top of kv + outbound HTTP + cron + boot
-subscriptions. See §6 Phase 5 (above) for the step plan.
+Next active piece: **Phase 5 PR-3** — atomic flip from
+`http.send` (Zig) to the JS-shim webhook composition. Originally
+planned as four sub-PRs (2c shim rewrite, 2d retry sweep, 3 email
+retarget, 4 delete kernel); discovered mid-PR-2c that
+`apply.zig.classifyPayload` double-fires when both paths are live,
+so all four must land in one commit. See §6 Phase 5 PR-3 (above)
+for the locked design + implementation order.
+
+Phase 4.1 (the `interpretCmd` unification over the post-Phase-5
+Cmd union) is deferred until **Phase 5 PR-3** lands — its shape
+depends on the post-PR-3 effect surface.
 
 If picking up a different sub-phase entirely:
 
