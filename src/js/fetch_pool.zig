@@ -252,28 +252,28 @@ pub const FetchPool = struct {
             return err;
         };
 
-        // No flush step — `onBody` emits every writeback as it
-        // arrives, so nothing is left buffered when perform returns.
-
         // Terminal `ok`: transport-only — libcurl completed cleanly
         // (perform_ok) AND we hit no internal alloc / route error.
         // Cap-only truncation is NOT a failure (the customer
         // explicitly bounded the response and got what fit). HTTP
         // status interpretation is left to the JS layer.
         const transport_ok = result.perform_ok and !state.failed;
-        // If no body chunks emitted, the final event hasn't fired
-        // yet — fire it now with empty bytes so the customer always
-        // gets a callback.
-        if (state.emitted_seq == 0) {
-            try self.pushFinalEmpty(pf, &state, result.status, transport_ok);
+
+        if (!pf.stream) {
+            // Phase 5 PR-1 contract: ONE event with `final: true` +
+            // the body + terminal fields. `onBody` buffered the
+            // body into `state.body_buf`; emit it now as the sole
+            // event the customer sees.
+            try self.pushFinalWithBody(pf, &state, result.status, transport_ok);
             return;
         }
-        // Body chunks emitted but no final marker yet — promote
-        // the last emitted chunk's successor to a final empty event
-        // OR stamp the last-pending chunk. Simpler: fire one extra
-        // empty final-event carrying the terminal fields. Customers
-        // see `seq = N+1, bytes = empty, final = true` as the
-        // canonical "transfer complete" signal.
+
+        // Stream mode: `onBody` already emitted per-writeback events
+        // with `final: false`. Stamp the terminal as a separate
+        // empty-bytes event with `final: true` so the customer can
+        // distinguish "more frames coming" from "transfer complete".
+        // If the upstream returned 0 bytes (or transport failed
+        // pre-body), this is the only event the customer sees.
         try self.pushFinalEmpty(pf, &state, result.status, transport_ok);
     }
 
@@ -294,6 +294,45 @@ pub const FetchPool = struct {
         // final flag set. Reuses buildChunkEvent for ownership
         // discipline.
         var ev = buildChunkEvent(a, pf, state.emitted_seq, state.byte_offset, &.{}, null) catch |err| return err;
+        ev.final = true;
+        ev.terminal_status = status;
+        ev.terminal_ok = ok;
+        ev.body_truncated = state.capped;
+        self.routeEvent(pf.tenant_id, ev) catch |err| {
+            var e = ev;
+            UpstreamFetchEvent.deinitItem(&e, a);
+            return err;
+        };
+        state.emitted_seq += 1;
+    }
+
+    /// Phase 5 PR-1 contract: in `stream: false` mode, fire ONE
+    /// event carrying the body bytes + `final: true` + terminal
+    /// fields. Replaces the prior two-event split (body event with
+    /// `final: false` THEN empty event with `final: true`) — that
+    /// shape broke webhook_onresult, which only processes the
+    /// `final: true` event and so saw the body as empty.
+    fn pushFinalWithBody(
+        self: *FetchPool,
+        pf: *PendingFetch,
+        state: *StreamState,
+        status: u16,
+        ok: bool,
+    ) !void {
+        const a = self.allocator;
+        var ev = buildChunkEvent(
+            a,
+            pf,
+            state.emitted_seq,
+            state.byte_offset,
+            state.body_buf.items,
+            null,
+        ) catch |err| return err;
+        // Headers ride on seq 0 (no prior events in single-chunk
+        // mode). Parse from the accumulated wire-format buffer.
+        if (state.emitted_seq == 0 and state.headers.items.len > 0) {
+            ev.fetch_headers = parseHeadersWireToJson(a, state.headers.items) catch null;
+        }
         ev.final = true;
         ev.terminal_status = status;
         ev.terminal_ok = ok;
@@ -406,9 +445,18 @@ const StreamState = struct {
     /// terminal still reports the upstream status (a deliberate
     /// truncation, not a failure). Surfaces as `body_truncated`.
     capped: bool = false,
+    /// Phase 5 PR-1 contract: in `stream: false` (single-chunk)
+    /// mode the body is buffered here and emitted as ONE final
+    /// event with `final: true` + the body bytes + terminal
+    /// fields. Lifts the body off the prior "body event + empty
+    /// final event" two-event split that broke webhook_onresult's
+    /// `final-event-carries-the-body` contract. In `stream: true`
+    /// mode this stays empty — events emit per writeback.
+    body_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     fn deinit(self: *StreamState) void {
         self.headers.deinit(self.allocator);
+        self.body_buf.deinit(self.allocator);
     }
 
     /// Build + route one chunk event for `bytes` (borrowed —
@@ -575,17 +623,15 @@ fn onBody(chunk: []const u8, ctx: *anyopaque) bool {
         }
         return !s.capped;
     } else {
-        // Single-chunk mode: defer the emit to `runOne` end —
-        // buffer here via headers (reusing the existing
-        // ArrayList) is wrong shape; simpler is to emit ONE
-        // chunk per writeback (always seq 0 since effective_total_cap
-        // = max_chunk bounds total to ≤ max_chunk in one shot).
-        if (!s.emitChunk(take)) {
+        // Phase 5 PR-1 contract: ONE event for the whole fetch
+        // (final=true, bytes=body, terminal status carried). Buffer
+        // here; `runOne` consolidates after `requestStreaming`
+        // returns. `effective_total_cap = max_chunk` so the buffer
+        // stays bounded by `max_response_chunk_bytes`.
+        s.body_buf.appendSlice(s.allocator, take) catch {
             s.failed = true;
             return false;
-        }
-        // After the first emit, `capped` will trigger on any further
-        // bytes — return based on cap state.
+        };
         return !s.capped;
     }
 }

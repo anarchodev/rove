@@ -33,7 +33,7 @@
 // fetch the *sender's* key — an outbound call). It therefore follows
 // the platform's async-accept pattern verbatim (the
 // `oauth.verifyIdToken → fetchJwks → cacheJwksFromEvent` chain):
-// respond 202 immediately, fetch the key via `http.send`, finish
+// respond 202 immediately, fetch the key via `webhook.send`, finish
 // verification + dispatch in the result module. Nothing connection-
 // stateful leaks into a pure handler.
 
@@ -368,7 +368,7 @@ class ActivityPubActor {
    * HTTP Signature needs the *sender's* public key, an outbound
    * fetch. So this responds **202 Accepted immediately** (which
    * ActivityPub mandates: delivery is fire-and-forget), kicks an
-   * {@link http.send} fetch of the signer's actor, and carries a
+   * {@link webhook.send} fetch of the signer's actor, and carries a
    * frozen request snapshot + the activity through `context`. The
    * `verified_module` then calls
    * {@link ActivityPubActor#completeInbox} to finish.
@@ -415,11 +415,11 @@ class ActivityPubActor {
 
     // keyId is "<actor-url>#main-key" — fetch the actor doc itself.
     const actorUrl = sig.keyId.split("#")[0];
-    http.send({
+    webhook.send({
       url: actorUrl,
       method: "GET",
       headers: { accept: _AP_CT },
-      on_result: { module: this.cfg.verified_module },
+      on_result: this.cfg.verified_module,
       context: {
         ap_kind: "inbox_verify",
         keyId: sig.keyId,
@@ -436,13 +436,13 @@ class ActivityPubActor {
 
   /**
    * Finish inbox processing. Call from your `verified_module` with
-   * the {@link http.send} result event. Caches the signer's key,
+   * the {@link webhook.send} result event. Caches the signer's key,
    * verifies the HTTP Signature + `Digest`, then dispatches the
    * activity: `Follow` → record follower and auto-send `Accept`;
    * `Undo Follow` → drop follower; everything else → acknowledged
    * no-op. Mirrors `oauth.cacheJwksFromEvent` + re-verify.
    *
-   * @param {object} event - The http.send result event
+   * @param {object} event - The webhook.send result event
    *   (`{ok,status,body,context}`).
    * @returns {{ok:boolean, action?:string, error?:string}} Outcome
    *   (for logging / your own bookkeeping). Side effects — follower
@@ -521,7 +521,7 @@ class ActivityPubActor {
 
   /**
    * Publish a `Note`, wrapped in a `Create`, and fan it out to every
-   * follower's inbox via signed, durable {@link http.send} (retried
+   * follower's inbox via signed, durable {@link webhook.send} (retried
    * by the platform; down followers don't block the others). The
    * `Create` is also appended to the outbox.
    *
@@ -598,7 +598,7 @@ class ActivityPubActor {
       "content-type: " + _AP_CT,
     ].join("\n");
     const sigB64 = _b64std(base64url.decode(crypto.oidcSign(key.priv, signingStr)));
-    http.send({
+    webhook.send({
       url: targetInbox,
       method: "POST",
       headers: {

@@ -135,7 +135,7 @@ class OAuthProvider {
   /**
    * Handle the provider redirect: validate `state` (single-use,
    * TTL'd), exchange `code` at the token endpoint via
-   * {@link http.send}, and invoke `on_complete_module` with the
+   * {@link webhook.send}, and invoke `on_complete_module` with the
    * token result (context carries `return_to`). Returns an interim
    * HTML page; sets 4xx on validation failure.
    *
@@ -181,12 +181,12 @@ class OAuthProvider {
     if (this.cfg.client_secret) body_params.set("client_secret", this.cfg.client_secret);
     if (stored.verifier) body_params.set("code_verifier", stored.verifier);
 
-    http.send({
+    webhook.send({
       url: this.cfg.token_url,
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body_params.toString(),
-      on_result: { module: this.cfg.on_complete_module },
+      on_result: this.cfg.on_complete_module,
       context: Object.assign({}, stored.context, {
         return_to: stored.return_to,
       }),
@@ -199,13 +199,13 @@ class OAuthProvider {
 
   /**
    * Redeem a refresh token for new tokens. Fires the token request
-   * via {@link http.send}; the `on_complete_module` receives the
+   * via {@link webhook.send}; the `on_complete_module` receives the
    * result with `context.refresh === true`.
    *
    * @param {string} refresh_token - The stored refresh token.
    * @param {object} [extra_context] - Merged into the result
    *   context.
-   * @returns {string} The {@link http.send} schedule id.
+   * @returns {string} The {@link webhook.send} schedule id.
    * @example
    * oauth.fromConfig("google").refresh(tok, { user_sub });
    */
@@ -216,12 +216,12 @@ class OAuthProvider {
       client_id: this.cfg.client_id,
     });
     if (this.cfg.client_secret) body_params.set("client_secret", this.cfg.client_secret);
-    return http.send({
+    return webhook.send({
       url: this.cfg.token_url,
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body_params.toString(),
-      on_result: { module: this.cfg.on_complete_module },
+      on_result: this.cfg.on_complete_module,
       context: Object.assign({ refresh: true }, extra_context || {}),
     });
   }
@@ -323,7 +323,7 @@ globalThis.oauth = {
    *
    * @param {object} opts - Must carry `jwks_uri`.
    * @param {string} on_result_module - Module to receive the fetch
-   *   event (http-send-plan §8 shape).
+   *   result event.
    * @param {object} [context] - Threaded back on the event (carry
    *   `id_token`, `sid`, `return_to`, …).
    * @example
@@ -331,10 +331,10 @@ globalThis.oauth = {
    *   { id_token, sid: ctx.sid, return_to: ctx.return_to });
    */
   fetchJwks(opts, on_result_module, context) {
-    http.send({
+    webhook.send({
       url: opts.jwks_uri,
       method: "GET",
-      on_result: { module: on_result_module },
+      on_result: on_result_module,
       context: context,
     });
   },
@@ -343,7 +343,7 @@ globalThis.oauth = {
    * Cache a JWKS fetch event's body. Call from the fetch `on_result`
    * module, then re-run {@link oauth.verifyIdToken}.
    *
-   * @param {object} event - The http-send result event
+   * @param {object} event - The webhook.send result event
    *   (`{ok,status,body}`).
    * @param {string} [cache_path] - Same `cache_path` passed to
    *   {@link oauth.verifyIdToken}.

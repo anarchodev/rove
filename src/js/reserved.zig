@@ -42,15 +42,16 @@ const std = @import("std");
 ///   `_magic/`           → magic-link tokens (root.db only, but list-wide)
 ///   `_triggers/`        → trigger module bytecode (manifest, not app.db)
 ///   `_sessions/`        → reserved for future platform session storage
-///   `_send/`            → http.send Option-(b) per-tenant outbox:
-///                         `_send/owed/{id}` (the re-fireable send,
-///                         written into the issuing hop's writeset,
-///                         envelope-0) + `_send/proof/{id}` (outcome
-///                         recorded on callback-commit). Recovery =
-///                         owed-without-proof scan, re-fired N-way on
-///                         the owning tenant's worker. Replaces the
-///                         central schedule store (env-8/9). See
-///                         docs/http-send-plan.md §15.
+///
+/// `_send/` USED to be reserved (the Zig http.send binding wrote to
+/// `_send/owed/{id}` from privileged code; the apply-time
+/// classifier armed SendDispatch on each put). Phase 5 PR-3
+/// retired the Zig kernel — `webhook.send` (the JS-shim in
+/// `globals/webhook.js`) is now customer JS that writes the
+/// marker via ordinary `kv.set`. So the prefix is no longer
+/// platform-only; the only effect a customer faking the key has is
+/// queuing the JS-shim retry sweep to attempt their request — which
+/// is exactly what calling webhook.send does. No spoofing surface.
 ///
 /// `_events/` was reserved for SSE event rows under the legacy worker
 /// pump; the centralized sse-server retired that storage layer
@@ -65,7 +66,6 @@ pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_magic/",
     "_triggers/",
     "_sessions/",
-    "_send/",
 };
 
 /// Customer trigger registration prefix collides with a platform
@@ -108,8 +108,10 @@ test "isReservedTriggerPrefix: exact platform prefix blocked" {
     try std.testing.expect(isReservedTriggerPrefix("_config/"));
     try std.testing.expect(isReservedTriggerPrefix("_log/"));
     try std.testing.expect(isReservedTriggerPrefix("_sessions/"));
-    try std.testing.expect(isReservedTriggerPrefix("_send/"));
     try std.testing.expect(isReservedTriggerPrefix("_triggers/"));
+    // `_send/` is NOT reserved post-Phase-5-PR-3 — webhook.send (JS
+    // shim) writes the marker as ordinary customer-tenant kv.
+    try std.testing.expect(!isReservedTriggerPrefix("_send/"));
 }
 
 test "isReservedTriggerPrefix: _events/ no longer reserved" {

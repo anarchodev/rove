@@ -49,7 +49,7 @@
       ]
     },
     {
-      "_comment": "Target tenant for http_send_smoke. Caller (acme) http.sends to https://wb.{public_suffix}/echo; the worker phase routes in-process to this index.mjs because wb is a registered tenant on the cluster. wb's writes ride envelope-0 atomic with the schedule_complete envelope-9.",
+      "_comment": "Target tenant for the webhook fast-path smoke (post-Phase-5-PR-3: webhook.send is the JS-shim composition that writes _send/owed/{id} via envelope-0 and fires http.fetch). Caller (acme) webhook.sends to https://wb.{public_suffix}/echo.",
       "id": "wb",
       "files": [
         {"path": "index.mjs", "source": "loop46-demo-tenants/wb/index.mjs"},

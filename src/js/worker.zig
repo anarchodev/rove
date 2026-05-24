@@ -80,10 +80,35 @@ const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
-const send_dispatch_mod = @import("send_dispatch.zig");
 const fetch_pool_mod = @import("fetch_pool.zig");
-const send_outbox_mod = @import("send_outbox.zig");
 const builtin_modules_mod = @import("builtin_modules.zig");
+
+/// `_send/owed/` kv prefix — the durable marker key the JS-shim
+/// `webhook.send` writes (Phase 5 PR-3). Inlined here (and in
+/// `worker_dispatch.zig`) after the `send_outbox.zig` module
+/// retired with the SendDispatch kernel; the prefix itself stays
+/// because the marker key shape didn't change — only the producer
+/// (Zig → JS) and the consumer (SendDispatch → `sweepOwedRetries`).
+pub const OWED_PREFIX: []const u8 = "_send/owed/";
+
+/// Phase 5 PR-3: deferred §6.4 held-sync resume entry. The baked
+/// `__system/webhook_onresult` shim calls
+/// `_system.continuation.resumeIfBound`; the trampoline appends
+/// this row + the worker drains it post-dispatch (see
+/// `drainPendingBoundResumes`). All slices owned by the worker
+/// allocator.
+pub const PendingBoundResume = struct {
+    tenant_id: []u8,
+    send_id: []u8,
+    event_json: []u8,
+
+    pub fn deinit(self: *PendingBoundResume, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
+        allocator.free(self.send_id);
+        allocator.free(self.event_json);
+        self.* = undefined;
+    }
+};
 const Dispatcher = dispatcher_mod.Dispatcher;
 const Request = dispatcher_mod.Request;
 
@@ -119,23 +144,27 @@ pub const RaftWait = struct {
 };
 
 /// The buffered effects a `ParkedUnit` carries — commit-gated
-/// `_send/owed/*` arm/resolve intents + kv-wake broadcast intents +
-/// (effect-reification Phase 4.0.b) resume-hop stream chunks +
-/// terminal-draining marker staged to apply on commit.
+/// kv-wake broadcast intents + (effect-reification Phase 4.0.b)
+/// resume-hop stream chunks + terminal-draining marker staged to
+/// apply on commit.
 /// Released by `drainRaftPending` on `committedSeq >= seq` (via
-/// `firePendingSendOps` + `firePendingKvWakes` + the streaming-
-/// commit arm); discarded on fault/timeout/leadership-loss (the
-/// effect never escaped — the durable per-tenant `_send/owed/` +
-/// new-leader boot-scan recover any dropped send_ops; the §9.4
-/// "spurious + overflow" thesis tolerates dropped kv_wakes;
+/// `firePendingKvWakes` + the streaming-commit arm); discarded on
+/// fault/timeout/leadership-loss (the effect never escaped — the
+/// §9.4 "spurious + overflow" thesis tolerates dropped kv_wakes;
 /// `streaming-model.md` §2's one rule — "a chunk reaches the wire
 /// only after the activation that produced it has committed" —
 /// makes a fault-arm chunk-discard the rule, not the exception).
 ///
+/// Phase 5 PR-3: the `send_ops` field retired alongside the Zig
+/// SendDispatch kernel. The JS-shim `webhook.send` writes its
+/// `_send/owed/` marker as an ordinary writeset put; durability
+/// is composed in JS (`globals/webhook.js` + the baked
+/// `__system/webhook_onresult` module) on top of kv.set +
+/// http.fetch + the per-worker partitioned retry sweep.
+///
 /// Structural-deinit shape per the `effect.Continuation` contract:
-/// `pub fn deinit(*Self, allocator) void` walks all three lists.
+/// `pub fn deinit(*Self, allocator) void` walks the remaining lists.
 pub const BufferedSendKvOps = struct {
-    send_ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty,
     kv_wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty,
 
     /// Phase 4.0.b: resume-hop stream chunks staged to ship on
@@ -168,8 +197,6 @@ pub const BufferedSendKvOps = struct {
     mark_draining: bool = false,
 
     pub fn deinit(self: *BufferedSendKvOps, allocator: std.mem.Allocator) void {
-        for (self.send_ops.items) |*o| o.deinit(allocator);
-        self.send_ops.deinit(allocator);
         for (self.kv_wakes.items) |*w| w.deinit(allocator);
         self.kv_wakes.deinit(allocator);
         for (self.staged_chunks.items) |c| allocator.free(c);
@@ -1160,8 +1187,10 @@ pub const NodeState = struct {
     /// boot-scan on raft promotion (4b-iii); the dedicated thread
     /// fires due owed sends (4c). NOT replicated/durable — the
     /// durable truth is the per-tenant `_send/owed/` kv. Allocated in
-    /// `startSendDispatch`; null until then and after `deinit`.
-    send_dispatch: ?*send_dispatch_mod.SendDispatch = null,
+    // Phase 5 PR-3: the per-node `SendDispatch` slot retired with
+    // the kernel. Outbound durability lives in the JS shim now
+    // (`globals/webhook.js`) — see `sweepOwedRetries` for the
+    // leader-side fire mechanism.
 
     /// Process-wide config consumed by TenantFiles.open. Shared
     /// pointers (libcurl Easy, prefetch map) live for the lifetime
@@ -1566,11 +1595,6 @@ pub const NodeState = struct {
             l.deinit();
             self.deployment_loader = null;
         }
-        if (self.send_dispatch) |sd| {
-            sd.shutdown();
-            sd.deinit();
-            self.send_dispatch = null;
-        }
         self.tenant_files_map.deinit(self.allocator);
         if (self.manifest_prefetch) |*map| {
             var it = map.iterator();
@@ -1597,25 +1621,6 @@ pub const NodeState = struct {
         errdefer loader.deinit();
         try loader.start();
         self.deployment_loader = loader;
-    }
-
-    /// Spawn the single leader-local send-dispatch thread. Idempotent.
-    /// Called once from `main.zig` after NodeState is wired, alongside
-    /// `startDeploymentLoader`. The dedicated thread drains arm/resolve
-    /// ops into the in-flight set (4b); leader-gating + boot-scan
-    /// (4b-iii) and firing (4c) land on top. Inert until then.
-    pub fn startSendDispatch(self: *NodeState) !void {
-        if (self.send_dispatch != null) return;
-        const sd = try send_dispatch_mod.SendDispatch.init(self.allocator);
-        errdefer sd.deinit();
-        // FORK-6 leader gating + promotion boot-scan (4b-iii-B).
-        // Still inert: the set is fed (4b-ii) + reconstructed on
-        // promotion, dropped on demotion — but nothing fires until
-        // 4c flips the guard.
-        const self_ctx = @as(?*anyopaque, @ptrCast(self));
-        sd.configure(self_ctx, sendDispatchIsLeaderNode, self_ctx, sendDispatchRecoverFnNode);
-        try sd.start();
-        self.send_dispatch = sd;
     }
 
     /// Gap 2.3 Phase C2: spawn the outbound `http.fetch` pool.
@@ -1700,101 +1705,6 @@ pub const NodeState = struct {
 /// (content-addressed: same id ⇒ same content), and calls
 /// `reloadDeployment` otherwise. Phase 2: readers either see the old
 /// snapshot or the new one, never a half-written mix.
-/// `SendDispatch.LeaderFn` thunk — casts ctx back to `*NodeState`
-/// and reports raft leadership. The leader-local in-flight set is
-/// gated on this (FORK-6): promotion → boot-scan (4b-iii-B),
-/// demotion → drop.
-fn sendDispatchIsLeaderNode(ctx_opaque: ?*anyopaque) bool {
-    const node: *NodeState = @ptrCast(@alignCast(ctx_opaque.?));
-    return node.raft.isLeader();
-}
-
-/// Cap on the promotion boot-scan's instance enumeration. Far above
-/// the ~50k/node architectural ceiling (3(b) / Manifest.max_stores);
-/// `listInstances` allocs proportional to the actual count, not this.
-/// Hitting it is the same escalation trigger as the 3(b) mitigation
-/// ([[project_owed_recovery_strategy]]).
-const RECOVER_MAX_TENANTS: u32 = 1 << 20;
-/// Per-tenant `_send/owed/` scan page. Owed-per-tenant is normally ~0
-/// (sends resolve fast); pagination rarely loops.
-const RECOVER_PAGE: u32 = 1024;
-
-/// `SendDispatch.RecoverFn` thunk (Option (b) 4b-iii-B). On raft
-/// promotion, reconstruct the leader-local in-flight set from the
-/// durable per-tenant `_send/owed/` (3(b) boot-scan): enumerate every
-/// instance from the durable root store, scan each tenant app.db's
-/// `_send/owed/`, skip ids that already have a `_send/proof/`
-/// (proven done), arm the rest. Runs ON the dispatch thread (sole
-/// owner of `sd.set`) — armFromParts dedups vs concurrent live-feed
-/// ops the same iteration's later `drainAll` applies. Best-effort:
-/// any failure drops just that send/tenant (logged); the live feed +
-/// the next promotion still cover it — no silent loss for the set.
-fn sendDispatchRecoverFnNode(ctx_opaque: ?*anyopaque, sd: *send_dispatch_mod.SendDispatch) void {
-    const node: *NodeState = @ptrCast(@alignCast(ctx_opaque.?));
-    const a = node.allocator;
-    var list = node.tenant.listInstances(RECOVER_MAX_TENANTS) catch |err| {
-        std.log.warn("send-dispatch recover: listInstances failed: {s} " ++
-            "(no reconstruct; live feed + next promotion cover)", .{@errorName(err)});
-        return;
-    };
-    defer list.deinit();
-    if (list.ids.len == RECOVER_MAX_TENANTS) std.log.warn(
-        "send-dispatch recover: hit RECOVER_MAX_TENANTS ({d}); some tenants " ++
-            "unscanned — escalate per 3(b) mitigation",
-        .{RECOVER_MAX_TENANTS},
-    );
-
-    var scanned: usize = 0;
-    var armed: usize = 0;
-    for (list.ids) |id| {
-        const inst = (node.tenant.getInstance(id) catch continue) orelse continue;
-        const slot = node.getOrOpenTenantSlot(inst) catch |err| {
-            std.log.warn("send-dispatch recover: slot {s}: {s}", .{ id, @errorName(err) });
-            continue;
-        };
-        scanned += 1;
-        var cursor_buf: [send_outbox_mod.KEY_BUF]u8 = undefined;
-        var cursor: []const u8 = "";
-        while (true) {
-            var rr = slot.app_kv.prefix(send_outbox_mod.OWED_PREFIX, cursor, RECOVER_PAGE) catch |err| {
-                std.log.warn("send-dispatch recover: scan {s}: {s}", .{ id, @errorName(err) });
-                break;
-            };
-            const n = rr.entries.len;
-            for (rr.entries) |e| {
-                if (e.key.len <= send_outbox_mod.OWED_PREFIX.len) continue;
-                const sid = e.key[send_outbox_mod.OWED_PREFIX.len..];
-                var pkbuf: [send_outbox_mod.KEY_BUF]u8 = undefined;
-                const pk = send_outbox_mod.proofKey(&pkbuf, sid);
-                if (slot.app_kv.get(pk)) |pv| {
-                    a.free(pv);
-                    continue; // proven done — not owed
-                } else |gerr| switch (gerr) {
-                    error.NotFound => {},
-                    else => {
-                        std.log.warn("send-dispatch recover: proof {s}: {s}", .{ sid, @errorName(gerr) });
-                        continue;
-                    },
-                }
-                sd.armFromParts(sid, slot.instance_id, e.value);
-                armed += 1;
-            }
-            if (n < RECOVER_PAGE) {
-                rr.deinit();
-                break;
-            }
-            // start-after cursor past the last key (collectPrefix is
-            // exclusive of `cursor`). Owed key ≤ 11+256 ≤ KEY_BUF.
-            const last = rr.entries[n - 1].key;
-            const clen = @min(last.len, cursor_buf.len);
-            @memcpy(cursor_buf[0..clen], last[0..clen]);
-            cursor = cursor_buf[0..clen];
-            rr.deinit();
-        }
-    }
-    std.log.info("send-dispatch recover: armed {d} owed across {d} tenants", .{ armed, scanned });
-}
-
 fn deploymentLoadFnNode(
     ctx_opaque: ?*anyopaque,
     tenant_id: []const u8,
@@ -2102,6 +2012,16 @@ pub fn Worker(comptime opts: Options) type {
         /// 0) because the sweep is partitioned —
         /// `hash(tenant_id) % N_msg_inboxes == self.msg_inbox_idx`.
         last_send_sweep_ns: i64 = 0,
+        /// Phase 5 PR-3: deferred held-sync resumes. The baked
+        /// `__system/webhook_onresult` shim calls
+        /// `_system.continuation.resumeIfBound` on terminal; that
+        /// trampoline appends `(tenant_id, send_id, event_json)`
+        /// here instead of dispatching inline (the shim's batch txn
+        /// is open; nesting `resumeBoundContinuation`'s
+        /// `beginTrackedImmediate` would double-BEGIN). The worker
+        /// tick drains this after `dispatchPendingMsgs` — by then
+        /// the shim's txn is committed.
+        pending_bound_resumes: std.ArrayListUnmanaged(PendingBoundResume) = .empty,
         /// Phase 5 PR-3: this worker's slot index in
         /// `node.msg_inboxes`. Set from `registerMsgInbox`'s
         /// return value at `create`. The per-worker partitioned
@@ -2455,6 +2375,11 @@ pub fn Worker(comptime opts: Options) type {
             // fetch_chunk / fetch_done / fetch_pipe_done) to free
             // in-flight Msg payloads at shutdown.
             self.msg_queue.deinit();
+            // Phase 5 PR-3: any pending bound-resumes left at shutdown
+            // — the leader change drain would have surfaced these, but
+            // be defensive.
+            for (self.pending_bound_resumes.items) |*p| p.deinit(allocator);
+            self.pending_bound_resumes.deinit(allocator);
             self.parked_continuations.deinit();
             self.parked_units.deinit();
             self.raft_pending_response.deinit();
@@ -2672,6 +2597,61 @@ pub fn Worker(comptime opts: Options) type {
                 .delete => try ws.addDelete(key),
             }
             try self.applyTargetWrite(allocator, inst, target_id, &ws);
+        }
+
+        /// Phase 5 PR-3: `_system.continuation.resumeIfBound`
+        /// trampoline. Returns true when a parked continuation on
+        /// this worker is bound to `send_id` and the tenant
+        /// matches — but does NOT dispatch the resume inline. The
+        /// caller (`__system/webhook_onresult`) runs inside a
+        /// batch txn; `resumeBoundContinuation` opens its own
+        /// `beginTrackedImmediate` and nesting them would
+        /// double-BEGIN the same kvexp env. Instead we APPEND
+        /// `(tenant_id, send_id, event_json)` to
+        /// `pending_bound_resumes`; the worker tick drains it
+        /// after dispatch completes (see
+        /// `drainPendingBoundResumes`). Returns true iff we found
+        /// a matching parked cont (so the shim can skip
+        /// `__rove_next` on the customer `on_result` — held-sync
+        /// already received the event via the deferred resume).
+        pub fn resumeIfBoundTrampoline(
+            ctx: *anyopaque,
+            tenant_id: []const u8,
+            send_id: []const u8,
+            event_json: []const u8,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            // Probe: does the worker hold a parked cont bound to
+            // this send-id? `entitySlice` + the column scan
+            // mirrors `resumeBoundContinuation`'s lookup but
+            // read-only — no txn opened, no mutation.
+            const ents = self.parked_continuations.entitySlice();
+            if (ents.len == 0) return false;
+            const descs = self.parked_continuations.column(components_mod.ContDescriptor);
+            const chains = self.parked_continuations.column(components_mod.ChainContext);
+            var matched = false;
+            for (descs, chains) |desc, chain| {
+                const bsid = desc.bound_schedule_id orelse continue;
+                if (!std.mem.eql(u8, chain.tenant_id, tenant_id)) continue;
+                if (!std.mem.eql(u8, bsid, send_id)) continue;
+                matched = true;
+                break;
+            }
+            if (!matched) return false;
+
+            const a = self.allocator;
+            const tid = a.dupe(u8, tenant_id) catch return false;
+            errdefer a.free(tid);
+            const sid_dup = a.dupe(u8, send_id) catch return false;
+            errdefer a.free(sid_dup);
+            const ev = a.dupe(u8, event_json) catch return false;
+            errdefer a.free(ev);
+            self.pending_bound_resumes.append(a, .{
+                .tenant_id = tid,
+                .send_id = sid_dup,
+                .event_json = ev,
+            }) catch return false;
+            return true;
         }
 
     };
@@ -4654,7 +4634,6 @@ pub fn drainRaftPending(worker: anytype) !void {
                         allocator.destroy(t);
                         unit.txn = null;
                     }
-                    firePendingSendOps(worker, unit);
                     firePendingKvWakes(worker, unit);
                     // Effect-reification Phase 4.0.b: transfer the
                     // resume-hop's staged chunks onto the destination
@@ -4880,11 +4859,11 @@ fn proposeAndParkContResume(
     // bookkeeping; if it fails the chain is in a half-state we can't
     // gracefully roll back (the raft entry is committed-pending).
     try worker.pending_txns.park(allocator, seq, txn);
-    // parkSendOps + parkKvWakes ride the same seq so the wakes /
-    // arm-resolve fire AFTER commit. Best-effort: log and continue
-    // if parking fails — same posture as the inbound write path.
-    parkSendOps(worker, seq, tenant_id, writeset) catch |perr|
-        std.log.warn("rove-js cont-resume parkSendOps (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
+    // parkKvWakes rides this seq so the kv-react wakes fire AFTER
+    // commit. Best-effort: log and continue if parking fails —
+    // same posture as the inbound write path. (The send-arm /
+    // resolve commit gate retired with the SendDispatch kernel
+    // in Phase 5 PR-3; `_send/owed/` is now an ordinary kv put.)
     parkKvWakes(worker, seq, tenant_id, writeset) catch |perr|
         std.log.warn("rove-js cont-resume parkKvWakes (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
 
@@ -5195,9 +5174,9 @@ fn resumeContinuation(
                     var only: ?[]const u8 = null;
                     var nputs: usize = 0;
                     for (ws.ops.items) |op| switch (op) {
-                        .put => |p| if (std.mem.startsWith(u8, p.key, send_outbox_mod.OWED_PREFIX)) {
+                        .put => |p| if (std.mem.startsWith(u8, p.key, OWED_PREFIX)) {
                             nputs += 1;
-                            only = p.key[send_outbox_mod.OWED_PREFIX.len..];
+                            only = p.key[OWED_PREFIX.len..];
                         },
                         .delete => {},
                     };
@@ -5320,6 +5299,29 @@ pub fn resumeBoundContinuation(
         return true;
     }
     return false;
+}
+
+/// Phase 5 PR-3: drain `pending_bound_resumes` — the deferred §6.4
+/// held-sync resumes the baked `__system/webhook_onresult` shim
+/// enqueued via `resumeIfBoundTrampoline`. Called from the worker
+/// tick after `dispatchPendingMsgs`; by then the shim's batch txn
+/// is committed, so `resumeBoundContinuation`'s
+/// `beginTrackedImmediate` doesn't nest.
+pub fn drainPendingBoundResumes(worker: anytype) void {
+    if (worker.pending_bound_resumes.items.len == 0) return;
+    const allocator = worker.allocator;
+    // Take ownership of the current batch; new entries arriving
+    // mid-drain stay queued for the next tick (avoids re-entrant
+    // dispatch).
+    var local = worker.pending_bound_resumes;
+    worker.pending_bound_resumes = .empty;
+    defer {
+        for (local.items) |*p| p.deinit(allocator);
+        local.deinit(allocator);
+    }
+    for (local.items) |p| {
+        _ = resumeBoundContinuation(worker, p.tenant_id, p.send_id, p.event_json);
+    }
 }
 
 pub fn sweepParkedContinuations(worker: anytype) !void {
@@ -6820,9 +6822,8 @@ pub const StreamResumeStage = struct {
 /// in `drainRaftPending` commits at the seq — same gate as the
 /// entity-backed path's `pending_txns[seq]`, just routed through
 /// the unit drain so we don't need an entity in `raft_pending`.
-/// On commit, the unit's `_send/owed/*` arms + §4.6 kv-wakes
-/// also fire (the existing `firePendingSendOps` / `firePendingKvWakes`
-/// already iterate at the same point).
+/// On commit, the unit's §4.6 kv-wakes fire (the existing
+/// `firePendingKvWakes` iterates at the same point).
 ///
 /// Used by `fireDisconnectActivation` — the socket is gone, so
 /// we can't gate the held-response on commit, but we still want
@@ -6875,18 +6876,12 @@ fn proposeForgetfulWrites(
         allocator.destroy(txn);
         return err;
     };
-    // Build a ParkedUnit carrying the txn AND the send_ops /
-    // kv_wakes intents extracted from the writeset. drainRaftPending's
-    // parked_units sweep handles all three at commit (or
-    // discards all three on fault/timeout).
-    var unit_send_ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty;
-    errdefer {
-        for (unit_send_ops.items) |*o| o.deinit(allocator);
-        unit_send_ops.deinit(allocator);
-    }
-    send_dispatch_mod.materialize(writeset, tenant_id, allocator, &unit_send_ops) catch |perr|
-        std.log.warn("rove-js forgetful-writes materialize send_ops (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
-
+    // Build a ParkedUnit carrying the txn AND the kv_wakes intents
+    // extracted from the writeset. drainRaftPending's parked_units
+    // sweep handles both at commit (or discards on fault/timeout).
+    // Phase 5 PR-3: the send_ops arm/resolve materialization is
+    // gone — `_send/owed/` is an ordinary kv put now, no commit
+    // gate needed for the dispatch side.
     var unit_kv_wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty;
     errdefer {
         for (unit_kv_wakes.items) |*w| w.deinit(allocator);
@@ -6908,10 +6903,10 @@ fn proposeForgetfulWrites(
     }
 
     // Build the unit, transferring ownership of every owned field
-    // (send_ops, kv_wakes, staged_chunks, txn, tenant_id). The
-    // staging pattern mirrors StreamChunks / SubscriptionFireDescriptor:
-    // assign owned slices into the unit, IMMEDIATELY clear the caller-
-    // side locals to invalidate their errdefers, arm the unit-deinit
+    // (kv_wakes, staged_chunks, txn, tenant_id). The staging pattern
+    // mirrors StreamChunks / SubscriptionFireDescriptor: assign
+    // owned slices into the unit, IMMEDIATELY clear the caller-side
+    // locals to invalidate their errdefers, arm the unit-deinit
     // errdefer, then `reg.set` (copies bitwise; column takes the
     // pointers) + clear the unit to invalidate its own errdefer.
     var unit: ParkedUnit = .{
@@ -6919,7 +6914,6 @@ fn proposeForgetfulWrites(
         .deadline_ns = @intCast(std.time.nanoTimestamp() +
             @as(i128, @intCast(worker.commit_wait_timeout_ns))),
         .buffered = .{
-            .send_ops = unit_send_ops,
             .kv_wakes = unit_kv_wakes,
             .staged_chunks = stage_chunks,
             .stream_entity = if (stage_opt) |s| s.entity else null,
@@ -6927,7 +6921,6 @@ fn proposeForgetfulWrites(
         },
         .txn = txn,
     };
-    unit_send_ops = .empty;
     unit_kv_wakes = .empty;
     stage_chunks = .empty;
     errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
@@ -7016,19 +7009,6 @@ fn transferStagedChunks(worker: anytype, unit: *ParkedUnit) void {
         ) catch return;
         drain_ptr.is_draining = true;
     }
-}
-
-/// Fire commit-gated send arm/resolve intents into the leader-local
-/// SendDispatch. Gated on commit, no-op on an empty set.
-/// `worker.node.send_dispatch` is null until `startSendDispatch`
-/// (and never wired on a non-leader path that matters);
-/// `OwnedIntent.fire` tolerates null (a dropped intent is re-derived
-/// by the promotion boot-scan — no silent loss).
-fn firePendingSendOps(worker: anytype, unit: *ParkedUnit) void {
-    if (unit.buffered.send_ops.items.len == 0) return;
-    const sd = worker.node.send_dispatch;
-    std.log.info("rove-js sendpath: firePendingSendOps seq={d} n={d} sd_null={}", .{ unit.seq, unit.buffered.send_ops.items.len, sd == null });
-    for (unit.buffered.send_ops.items) |*o| o.fire(sd);
 }
 
 /// streaming-handlers-plan §4.6: fire commit-gated kv-wake intents.
@@ -7400,6 +7380,15 @@ fn fireFetchEventActivation(
         .activation_source = act_source,
         .activation_fetch_id = event.fetch_id,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
+        // Phase 5 PR-3: §6.4 held-sync resume hook. The baked
+        // `__system/webhook_onresult` shim calls `__rove_resume_if_bound`
+        // on terminal to wake any parked cont bound to this send-id.
+        // Set on every fetch-event activation (the H2 path sets it
+        // too, in `worker_dispatch.zig`); without this the JS builtin
+        // sees a null trampoline + returns false, leaving the cont
+        // parked until its 25s deadline.
+        .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
+        .resume_if_bound_ctx = @ptrCast(worker),
     };
     req.activation_fetch_seq = event.seq;
     req.activation_fetch_byte_offset = event.byte_offset;
@@ -7564,66 +7553,12 @@ fn fireFetchEventActivation(
     }
 }
 
-/// Register a committed batch's `_send/*` arm/resolve intents as a
-/// post-propose parked unit, keyed by the propose `seq` — the
-/// `parkEmits` idiom for the Option (b) feed. Classifies + dups owned
-/// intents from the live `writeset` (valid here; freed by its owner
-/// after propose). No-op when the batch wrote no `_send/*` keys, so
-/// it's free to call on every write-path / tenant-batch propose.
-/// §6.4 resolution routes by the send-id resume-search (Part-B
-/// matches `bound_schedule_id == send_id`), not a stored locator —
-/// the owning worker is hash(tenant)→worker. On a pre-append error
-/// the partial owned list is freed here (nothing parked, escaped).
-pub fn parkSendOps(
-    worker: anytype,
-    seq: u64,
-    tenant_id: []const u8,
-    writeset: *const kv_mod.WriteSet,
-) !void {
-    const allocator = worker.allocator;
-    var ops: std.ArrayListUnmanaged(send_dispatch_mod.OwnedIntent) = .empty;
-    errdefer {
-        for (ops.items) |*o| o.deinit(allocator);
-        ops.deinit(allocator);
-    }
-    try send_dispatch_mod.materialize(writeset, tenant_id, allocator, &ops);
-    if (ops.items.len == 0) {
-        ops.deinit(allocator);
-        return; // nothing to gate
-    }
-    std.log.info("rove-js sendpath: parkSendOps tenant={s} seq={d} send_ops={d}", .{ tenant_id, seq, ops.items.len });
-    // Transfer ownership of `ops` into the unit; clear local
-    // immediately to invalidate the earlier errdefer.
-    var unit: ParkedUnit = .{
-        .seq = seq,
-        .deadline_ns = @intCast(std.time.nanoTimestamp() +
-            @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .buffered = .{ .send_ops = ops },
-    };
-    ops = .empty;
-    errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
-    unit.tenant_id = try allocator.dupe(u8, tenant_id);
-    const ent = try worker.h2.reg.create(&worker.parked_units);
-    errdefer worker.h2.reg.destroy(ent) catch {};
-    try worker.h2.reg.set(ent, &worker.parked_units, ParkedUnit, unit);
-    unit = .{};
-}
-
-/// Register a tenant-batch dispatch's SSE emits as a post-propose
-/// parked unit (docs/unified-effect-gating.md idiom-1, step 2).
-/// Moves the emit buffer + an owned copy of `tenant_id` into
-/// `worker.parked_units` keyed by the propose `seq`;
-/// `drainRaftPending` releases them at commit / discards on fault.
-/// Empties `*emits` so the caller's defer is a no-op. On a pre-move
-/// error the emits stay with the caller (its defer drops them —
-/// degraded but safe: nothing escaped, no double-free).
 /// streaming-handlers-plan §4.6: register a batch's kv-writes as
 /// commit-gated wake intents. Extracts `(key, op)` from each put /
 /// delete in the writeset (key bytes dup'd so the caller can
 /// release the writeset bytes), parks them on a `ParkedUnit` keyed
 /// by the propose `seq`. `drainRaftPending` fires them at commit
-/// via `firePendingKvWakes` — same shape as `parkSendOps` /
-/// `parkEmits`. No-op when the writeset has no ops.
+/// via `firePendingKvWakes`. No-op when the writeset has no ops.
 pub fn parkKvWakes(
     worker: anytype,
     seq: u64,

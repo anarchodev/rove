@@ -1,22 +1,22 @@
-// Caller side of the http.send fast-path smoke.
-// `fn=fire&args=[targetUrl, tag]` invokes http.send at the given URL
-// with a tagged context the on_result handler echoes back into kv so
-// the smoke can assert end-to-end shape. Returns { id } so the smoke
-// can correlate the receipt.
+// Caller side of the webhook.send (JS-shim) fast-path smoke.
+// `fn=fire&args=[targetUrl, tag]` invokes webhook.send at the given
+// URL with a tagged context the on_result handler echoes back into
+// kv so the smoke can assert end-to-end shape. Returns { id } so the
+// smoke can correlate the receipt.
 export function fire(target_url, tag) {
-    const id = http.send({
+    const id = webhook.send({
         url: target_url,
         method: "POST",
         body: JSON.stringify({ from: "acme", tag: tag }),
         headers: { "content-type": "application/json" },
-        on_result: { module: "httpresult" },
+        on_result: "httpresult",
         context: { tag: tag },
     });
     kv.set("http/last_fire", id);
     return { id: id };
 }
 
-// Same as `fire` but schedules the http.send for `delay_ms`
+// Same as `fire` but schedules the webhook.send for `delay_ms`
 // milliseconds in the future. Used by the leader-failover smoke
 // (production.md #7) — schedules a fire, kills the leader during
 // the delay window, then asserts the new leader picked up the row
@@ -24,12 +24,12 @@ export function fire(target_url, tag) {
 export function fireDelayed(target_url, tag, delay_ms) {
     const now_ms = Date.now();
     const fire_at_ns = BigInt(now_ms) * 1_000_000n + BigInt(delay_ms) * 1_000_000n;
-    const id = http.send({
+    const id = webhook.send({
         url: target_url,
         method: "POST",
         body: JSON.stringify({ from: "acme", tag: tag }),
         headers: { "content-type": "application/json" },
-        on_result: { module: "httpresult" },
+        on_result: "httpresult",
         context: { tag: tag },
         fire_at_ns: fire_at_ns,
     });

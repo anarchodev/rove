@@ -239,6 +239,59 @@ test "BENCH tryExtract per-request hot-path tax (ROVE_BENCH=1)" {
     );
 }
 
+// ── `_system.continuation.resumeIfBound(send_id, event_json)` ──────
+//
+// Phase 5 PR-3: the §6.4 held-sync resume hook from the JS shim.
+// The `__system/webhook_onresult` baked module calls this on
+// terminal — if any parked continuation on this worker has
+// `bound_schedule_id == send_id`, the call dispatches a
+// `resumeContinuation` with `outcome_json = event_json`. Returns
+// `true` when it matched (caller skips its own __rove_next chain);
+// `false` for the ordinary webhook path (no held-sync open hop).
+//
+// Tenant scoping: every parked-continuation entity carries its
+// tenant_id in `ChainContext`; the lookup matches both tenant_id
+// (from DispatchState.instance_id) AND send_id. No cross-tenant
+// resume is possible from a JS-level call.
+
+pub fn jsContinuationResumeIfBound(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    if (argc < 2 or !c.JS_IsString(argv[0]) or !c.JS_IsString(argv[1])) {
+        _ = c.JS_ThrowTypeError(
+            ctx,
+            "_system.continuation.resumeIfBound(send_id, event_json) requires two strings",
+        );
+        return js_exception;
+    }
+    // Read both strings without owning copies — `resumeBoundContinuation`
+    // is called synchronously here and dups internally.
+    var id_len: usize = 0;
+    const id_cstr = c.JS_ToCStringLen(ctx, &id_len, argv[0]);
+    if (id_cstr == null) return js_exception;
+    defer c.JS_FreeCString(ctx, id_cstr);
+    const send_id = @as([*]const u8, @ptrCast(id_cstr))[0..id_len];
+
+    var ev_len: usize = 0;
+    const ev_cstr = c.JS_ToCStringLen(ctx, &ev_len, argv[1]);
+    if (ev_cstr == null) return js_exception;
+    defer c.JS_FreeCString(ctx, ev_cstr);
+    const event_json = @as([*]const u8, @ptrCast(ev_cstr))[0..ev_len];
+
+    // The DispatchState carries a worker trampoline when the dispatch
+    // is hosted by a real worker (production path). On test /
+    // anonymous paths the field is null — the call is a no-op (returns
+    // false), matching the "no parked continuations to match" outcome.
+    const fn_ptr = state.resume_if_bound orelse return globals.js_false;
+    const fn_ctx = state.resume_if_bound_ctx orelse return globals.js_false;
+    const matched = fn_ptr(fn_ctx, state.instance_id, send_id, event_json);
+    return if (matched) globals.js_true else globals.js_false;
+}
+
 test "brand is stable within a process and 32 hex chars" {
     const a = brand();
     const b = brand();

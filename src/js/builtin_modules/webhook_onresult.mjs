@@ -24,7 +24,10 @@
 // (not in any tenant's deployment files); compiled to bytecode
 // once at NodeState init and shared across every tenant.
 
-const MAX_ATTEMPTS = 5;
+// Default cap when the marker omits `max_attempts` (older markers).
+// The customer-facing `webhook.send` sets it explicitly to 5 by
+// default; `retry.send` sets 1 to disable the built-in retry loop.
+const DEFAULT_MAX_ATTEMPTS = 5;
 const BACKOFF_BASE_MS = 1_000;   // 1s, 2s, 4s, 8s, 16s — capped at 60s
 const BACKOFF_CAP_MS = 60_000;
 
@@ -90,8 +93,11 @@ export default function () {
     const transport_failed = !result_ok;
     const upstream_5xx = result_status >= 500;
     const upstream_4xx = result_status >= 400 && result_status < 500;
+    const max_attempts = (typeof owed.max_attempts === "number" && owed.max_attempts >= 1)
+        ? owed.max_attempts
+        : DEFAULT_MAX_ATTEMPTS;
     const should_retry = (transport_failed || upstream_5xx)
-        && (owed.attempts + 1 < MAX_ATTEMPTS);
+        && (owed.attempts + 1 < max_attempts);
 
     if (should_retry) {
         // Update marker; do NOT fire on_result yet (still in flight).
@@ -112,6 +118,37 @@ export default function () {
             : ("upstream_" + result_status);
     } else if (upstream_4xx) {
         result.error = "upstream_" + result_status;
+    }
+
+    // §6.4 held-sync resume hook. If a parked continuation on this
+    // worker is bound to this send-id (the open hop wrote ONE
+    // `_send/owed/` marker and returned `__rove_next`), this call
+    // resumes the parked socket with the outcome event. Returns
+    // true when it matched + dispatched a resume; on a match we
+    // SKIP the customer's `on_result` because held-sync's
+    // `onResult(ctx, outcome)` already received the event. No-op +
+    // returns false for the ordinary (non-held-sync) webhook path.
+    const event_for_heldsync = {
+        id: id,
+        ok: result.ok,
+        status: result.status,
+        body: result.body,
+        headers: result.headers,
+        body_truncated: result.body_truncated,
+        attempts: result.attempts,
+        error: result.error || null,
+        context: context,
+    };
+    // §6.4 held-sync resume hook. `__rove_resume_if_bound` is a
+    // persistent global builtin (wired in `globals.zig`'s
+    // `GLOBAL_BUILTINS`; survives the `_harden.js` deletion of
+    // `_system`). Returns true when a parked continuation on this
+    // worker is bound to this send-id (the open hop wrote ONE
+    // `_send/owed/` marker and returned `__rove_next`). On match we
+    // SKIP the customer's `on_result` — held-sync's `onResult(ctx,
+    // outcome)` already received the event via the deferred resume.
+    if (__rove_resume_if_bound(id, JSON.stringify(event_for_heldsync))) {
+        return { status: 200 };
     }
 
     if (on_result) {

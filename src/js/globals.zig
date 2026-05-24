@@ -123,10 +123,12 @@ pub const ScopeKvOp = enum { put, delete };
 /// thread which fires libcurl + delivers chunks via the
 /// per-worker `fetch_chunk_inbox`.
 ///
-/// All slices allocator-owned. Mirrors `send_outbox.OwedSend` in
-/// shape (the durable sibling for `http.send`) but unencoded —
-/// fetches are non-durable, never written to kv/raft, so no
-/// wire-format codec needed.
+/// All slices allocator-owned. Fetches are non-durable, never
+/// written to kv/raft, so no wire-format codec is needed. The
+/// durable sibling (`webhook.send`) lives entirely in JS shims
+/// (`globals/webhook.js` + the baked `__system/webhook_onresult`
+/// module) layered on top of this primitive — see
+/// `docs/effect-reification-plan.md` Phase 5.
 pub const PendingFetch = struct {
     /// The tenant that issued this fetch — needed so the fetch
     /// pool can hash-route chunks to the right worker's inbox.
@@ -210,23 +212,13 @@ pub const DispatchState = struct {
     /// present (so the normal path still uses qjs's built-in Math.random).
     prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     /// Per-request identifier, pre-minted by the worker. Combined with
-    /// `http_call_index` to derive a deterministic schedule id for
-    /// every `http.send` this handler invocation performs.
+    /// `http_fetch_index` to derive a deterministic fetch id for
+    /// each `http.fetch` call.
     request_id: u64 = 0,
-    /// 0-based counter of `http.send` calls within this handler
-    /// invocation. Resets per request. Combined with `request_id`
-    /// to derive the platform-default schedule id (sha256(req_id ||
-    /// call_index)) when the customer didn't supply a `handle`.
-    http_call_index: u32 = 0,
     /// 0-based counter of `http.fetch` calls within this handler
-    /// invocation. Parallel to `http_call_index` but for the
-    /// transient streaming-fetch primitive (Gap 2.3,
-    /// `docs/upstream-streaming-plan.md`). Reset per request;
-    /// combined with `request_id` + a `"FTCH"` tag to derive the
-    /// platform-default `fetch_id` deterministically for replay.
-    /// Lives separately from `http_call_index` to keep id
-    /// namespaces clean — a send-then-fetch and fetch-then-send
-    /// produce the same set of ids regardless of order.
+    /// invocation. Reset per request; combined with `request_id`
+    /// + a `"FTCH"` tag to derive the platform-default `fetch_id`
+    /// deterministically for replay.
     http_fetch_index: u32 = 0,
     /// Gap 2.3 Phase C1: per-handler accumulator for `http.fetch`
     /// calls. Caller-owned (pointer to a list the worker_dispatch
@@ -349,6 +341,23 @@ pub const DispatchState = struct {
         value: []const u8,
     ) anyerror!void = null,
     scope_kv_ctx: ?*anyopaque = null,
+
+    /// Phase 5 PR-3: trampoline backing
+    /// `_system.continuation.resumeIfBound(send_id, event_json)`.
+    /// Worker provides a concrete fn that casts `ctx` back to its
+    /// `*Worker(opts)` type and calls `worker.resumeBoundContinuation`
+    /// on `(tenant_id = state.instance_id, send_id, event_json)`.
+    /// Returns true when a parked continuation matched and was
+    /// dispatched. Null on test paths / non-worker dispatches; the
+    /// JS callable returns false in that case (no held-sync to
+    /// resume).
+    resume_if_bound: ?*const fn (
+        ctx: *anyopaque,
+        tenant_id: []const u8,
+        send_id: []const u8,
+        event_json: []const u8,
+    ) bool = null,
+    resume_if_bound_ctx: ?*anyopaque = null,
 
     pub fn deinit(self: *DispatchState, ctx: ?*c.JSContext) void {
         var it = self.trigger_module_ns.iterator();
@@ -1516,19 +1525,21 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "ecdsaSign",        .cfunc = crypto_b.jsCryptoEcdsaSign,        .argc = 3 },
         .{ .name = "ecdsaVerify",      .cfunc = crypto_b.jsCryptoEcdsaVerify,      .argc = 4 },
     } },
-    // http.send / http.cancel — the platform's outbound HTTP
-    // primitive (docs/http-send-plan.md). send writes a
-    // `_send/owed/{id}` marker (Option (b)) and returns an id; the
-    // leader-local per-node SendDispatch fires libcurl off that
-    // marker. cancel tombstones the marker so recovery never
-    // re-fires it. webhook.send + email.send polyfill on top
-    // (see webhook.js + email.js).
+    // http.fetch / http.cancelFetch — the platform's outbound HTTP
+    // primitive. Transient + best-effort; durability is composed in
+    // JS by `webhook.send` (effect-reification-plan.md Phase 5 PR-3).
+    // The legacy `http.send` / `http.cancel` bindings retired with
+    // PR-3 alongside the Zig SendDispatch kernel.
     .{ .path = &.{ "_system", "http" }, .fns = &.{
-        .{ .name = "send",        .cfunc = http_b.jsHttpSend,        .argc = 1 },
-        .{ .name = "cancel",      .cfunc = http_b.jsHttpCancel,      .argc = 1 },
         .{ .name = "fetch",       .cfunc = http_b.jsHttpFetch,       .argc = 1 },
         .{ .name = "cancelFetch", .cfunc = http_b.jsHttpCancelFetch, .argc = 1 },
     } },
+    // Phase 5 PR-3: the `_system.continuation.resumeIfBound` shim was
+    // a stillborn — the `_harden.js` step (`delete globalThis._system;`
+    // at the end of `evalShimSources`) runs BEFORE customer + baked
+    // modules eval, so a `_system.*` reference wouldn't be reachable
+    // from `__system/webhook_onresult.mjs`. The trampoline lives as
+    // a persistent global builtin (`__rove_resume_if_bound`) below.
     // platform = { root, instances }. Installed on every context;
     // the C callbacks check `state.platform` and throw for non-admin
     // handlers.
@@ -1584,6 +1595,17 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // worker temporarily 503s `.stream` returns until Phase 2b lands
     // the chunked-write flow + timer-wake re-activation.
     .{ .name = "__rove_stream", .cfunc = stream_b.jsStream, .argc = 1 },
+    // Phase 5 PR-3: deferred-resume hook for the baked
+    // `__system/webhook_onresult` shim. Has to be a persistent
+    // global (survives the `_harden.js` `delete globalThis._system`
+    // step) because customer + baked modules eval AFTER the harden
+    // step — `_system.continuation.resumeIfBound` is gone by then.
+    // Trampoline appends to `pending_bound_resumes` (drained on the
+    // next worker tick after the shim's batch txn commits — see
+    // `drainPendingBoundResumes`). Same posture as `__rove_next`:
+    // bypass the `_harden.js` deletion via the `builtin_exceptions`
+    // list in the globals-lint allowlist.
+    .{ .name = "__rove_resume_if_bound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
 };
 
 // Public shims (docs/builtin-libs-docs-plan.md Phase A). JSDoc-carrying
@@ -1881,12 +1903,26 @@ pub fn installRequest(
         // handler sees a plain map. The FetchPool side handles
         // the wire-format parse + last-wins for repeated headers.
         if (request.activation_fetch_headers) |hjson| {
-            const hdr_val = c.JS_ParseJSON(ctx, hjson.ptr, hjson.len, "<fetch headers>");
-            if (c.JS_IsException(hdr_val)) {
-                _ = c.JS_GetException(ctx); // clear; fall through with empty headers
+            // `JS_ParseJSON` requires a NUL-terminated buffer
+            // (`buf[buf_len] = '\0'` per vendor/arenajs/quickjs.h:1060).
+            // Our slice doesn't carry the trailing NUL — copy into a
+            // sentinel-terminated buffer before parsing. Without this
+            // the parse silently fails (returns an exception that the
+            // IsException branch swallows) and `a.headers` lands as an
+            // empty `{}` — observable as `content-type` going missing
+            // on the seq-0 chunk activation (fetch_chunk_smoke gate).
+            if (state.allocator.allocSentinel(u8, hjson.len, 0)) |buf| {
+                defer state.allocator.free(buf);
+                @memcpy(buf, hjson);
+                const hdr_val = c.JS_ParseJSON(ctx, buf.ptr, hjson.len, "<fetch headers>");
+                if (c.JS_IsException(hdr_val)) {
+                    _ = c.JS_GetException(ctx); // clear; fall through with empty headers
+                    _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", c.JS_NewObject(ctx));
+                } else {
+                    _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", hdr_val);
+                }
+            } else |_| {
                 _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", c.JS_NewObject(ctx));
-            } else {
-                _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", hdr_val);
             }
         }
         // `final` + terminal fields. `JS_NewBool`'s cimport-translated
@@ -2054,7 +2090,14 @@ test "lint(c): every native binding has a globals/ shim (Phase A)" {
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
     // determinism overrides); __rove_check_email_rate is an internal
     // GLOBAL_BUILTIN (called only by globals/email.js).
-    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next", "__rove_stream" };
+    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next", "__rove_stream", "__rove_resume_if_bound" };
+
+    // Documented namespace exceptions: `_system.continuation` is an
+    // internal binding called only by the baked
+    // `__system/webhook_onresult` module (the §6.4 held-sync resume
+    // hook from the JS-shim webhook path — effect-reification-plan.md
+    // Phase 5 PR-3); not a public customer surface, no shim needed.
+    const ns_exceptions = [_][]const u8{"continuation"};
 
     for (STATIC_NAMESPACES) |ns| {
         // The `_system` holder itself + nested paths
@@ -2062,6 +2105,12 @@ test "lint(c): every native binding has a globals/ shim (Phase A)" {
         // shim (globals/platform.js). Pivot on the public segment.
         if (ns.path.len < 2 or !std.mem.eql(u8, ns.path[0], "_system")) continue;
         const public = ns.path[1];
+        var exempt = false;
+        for (ns_exceptions) |e| if (std.mem.eql(u8, e, public)) {
+            exempt = true;
+            break;
+        };
+        if (exempt) continue;
         var found = false;
         for (GLOBALS_FILES) |g| {
             if (std.mem.eql(u8, g.name, public)) {

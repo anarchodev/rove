@@ -1,10 +1,12 @@
 // §6.4 held-synchronous third-party call — resume hop.
 //
-// Invoked by the resume engine when the bound http.send completes (or
-// the §6.4 deadline fires), RPC-style: `onResult(ctx, outcome)`.
+// Invoked by the resume engine when the bound webhook.send completes
+// (or the §6.4 deadline fires), RPC-style: `onResult(ctx, outcome)`.
 // `ctx` is what the open hop passed to __rove_next; `outcome` is the
-// call event: {id, ok, status, body, error, context} on completion,
-// or {ok:false, reason:"deadline"} when the mandatory timeout fired.
+// call event built by the JS-shim `__system/webhook_onresult` module:
+// {id, ok, status, body, headers, body_truncated, attempts, error,
+//  context} on completion, or {ok:false, reason:"deadline"} when the
+// mandatory timeout fired.
 //
 // Returning a value is TERMINAL — flushed to the still-open client
 // socket, completing the one synchronous request. Returning another
@@ -15,11 +17,12 @@ export function onResult(ctx, outcome) {
         // Recipe-1: compose a retry yourself. One re-issue to a
         // known-good target, then re-park (allow_repark=true).
         if (ctx.retry_to && ctx.tries < 1) {
-            http.send({
+            webhook.send({
                 url: ctx.retry_to,
                 method: "POST",
                 body: JSON.stringify({ from: "heldsync-retry", tag: ctx.tag }),
                 headers: { "content-type": "application/json" },
+                max_attempts: 1,
             });
             return __rove_next("heldsync/onresult", {
                 fn: "onResult",

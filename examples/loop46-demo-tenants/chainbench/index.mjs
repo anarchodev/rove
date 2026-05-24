@@ -1,7 +1,7 @@
 // Continuation-chain workload for scripts/chain_fusion_bench.py.
 //
 // Each chain link is a *pure same-tenant immediate self-schedule*:
-// one kv.set (progress) + exactly one http.send back to this tenant's
+// one kv.set (progress) + exactly one webhook.send back to this tenant's
 // own URL with depth-1, NO on_result, NO fire_at_ns, NO entropy
 // (no Date.now / Math.random / crypto) — the shape the internal-
 // schedule fast path (and the fusion predicate) consume.
@@ -21,7 +21,7 @@ export function start(count, depth, url) {
     for (let i = 0; i < n; i++) {
         const cid = "c" + i;
         kv.set("chain/progress/" + cid, String(depth | 0));
-        http.send({
+        webhook.send({
             url: url,
             method: "POST",
             body: JSON.stringify({ id: cid, depth: depth | 0, url: url }),
@@ -40,7 +40,7 @@ export default function () {
     kv.set("chain/progress/" + id, String(depth));
 
     if (depth > 0) {
-        http.send({
+        webhook.send({
             url: step.url,
             method: "POST",
             body: JSON.stringify({ id: id, depth: depth - 1, url: step.url }),
@@ -60,7 +60,7 @@ export default function () {
 }
 
 // GET `/?fn=status`: ONE aggregate read — the only thing the bench
-// polls during the measured window. No entropy, no http.send.
+// polls during the measured window. No entropy, no webhook.send.
 export function status() {
     return JSON.stringify({ count: (kv.get("chain/donecount") | 0) });
 }

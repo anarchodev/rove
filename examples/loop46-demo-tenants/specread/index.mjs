@@ -9,7 +9,7 @@
 //        overlay sits in the chain, uncommitted.
 //
 //   GET /?fn=read&args=["K"]       — kv.get(K); returns {k,v,found}.
-//        A READ-ONLY batch (no writes, no http.send). If its kv.get
+//        A READ-ONLY batch (no writes, no webhook.send). If its kv.get
 //        crosses the frozen write's chain-predecessor overlay, kvexp
 //        sets Txn.saw_speculation. PRE-fix idiom-0: finalizeBatch's
 //        read-only fast path releases the response immediately —
