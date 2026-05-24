@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""End-to-end smoke for the http.send → in-process worker phase →
-schedule_complete → on_result handler pipeline.
+"""End-to-end smoke for the legacy http.send pipeline.
 
-Python port of `scripts/http_send_smoke.sh`. Covers http-send-plan §3.2
-+ slice 5c (acme fires http.send to wb; wb runs in-process; httpresult
-callback fires on acme; writesets ride multi-envelope atomically).
+Phase 5 PR-3: kept for one cycle; convert to webhook.send equivalent
+or delete in a follow-up. The smoke exercises the
+`acme/httpfire?fn=fire` example which migrated to webhook.send (still
+writes `_send/owed/{id}` markers — same observable shape at the apply
+layer). The in-process WB target was the legacy http.send fast-path;
+the JS-shim path now uses libcurl through fetch_pool which doesn't
+yet route in-process traffic — so this smoke is expected to fail on
+the WB hop until in-process routing is added to http.fetch (out of
+scope for PR-3).
 """
 
 from __future__ import annotations

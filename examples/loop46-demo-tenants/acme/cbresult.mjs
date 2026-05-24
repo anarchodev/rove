@@ -1,16 +1,19 @@
-// on_result handler for the cbfire/webhook.send → polyfill →
-// http.send → schedule_complete pipeline. Same shape as a regular
-// HTTP request handler — no args, event JSON arrives in
-// `request.body`. The schedule envelope-9 event shape is
-// {id, ok, status, body, context, error}.
+// on_result handler for the cbfire/webhook.send (JS-shim) pipeline.
+// Post-Phase-5-PR-3 the event arrives wrapped in the chained
+// `__rove_next` envelope the baked `__system/webhook_onresult`
+// module emits: `request.body.ctx.result` is the result event
+// ({id, ok, status, body, headers, attempts, error?}), and
+// `request.body.ctx.context` is the customer's opaque context.
 export default function () {
-    const event = JSON.parse(request.body);
+    const wrap = JSON.parse(request.body);
+    const result = (wrap && wrap.ctx && wrap.ctx.result) || {};
+    const context = (wrap && wrap.ctx && wrap.ctx.context) || null;
     const record = {
-        ok: event.ok,
-        status: event.status,
-        body: event.body,
-        context: event.context,
-        error: event.error || null,
+        ok: result.ok,
+        status: result.status,
+        body: result.body,
+        context: context,
+        error: result.error || null,
     };
-    kv.set("cb/result/" + event.id, JSON.stringify(record));
+    kv.set("cb/result/" + result.id, JSON.stringify(record));
 }

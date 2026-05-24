@@ -79,7 +79,7 @@ class OIDCProvider {
       publish_window_ms: config.publish_window_ms || 24 * 60 * 60 * 1000,
       retire_window_ms: config.retire_window_ms ||
         ((config.id_token_ttl_ms || 15 * 60 * 1000) + 5 * 60 * 1000),
-      rot_handle: "oidc-rot/" + name, // stable → http.send overwrite
+      rot_handle: "oidc-rot/" + name, // stable → webhook.send overwrite
     };
   }
 
@@ -120,7 +120,7 @@ class OIDCProvider {
   // ── keyset (§4.6 state machine: next → current → retiring → drop).
   //    Single kv key ⇒ raft serializes writes last-write-wins; we
   //    only ever SIGN with `current`; the re-arm uses a stable
-  //    http.send handle — together that makes a concurrent
+  //    webhook.send handle — together that makes a concurrent
   //    leadership double-fire dedup-safe with no schedule-version
   //    header (see §4.6 "Grounded correction 2026-05-16"). ──
   _keyset() {
@@ -159,7 +159,7 @@ class OIDCProvider {
   // sets the synthesized request's authority to the routed host), so
   // no explicitly-threaded host / genesis capture is needed.
   _armRotation(fire_at_ms) {
-    http.send({
+    webhook.send({
       handle: this.cfg.rot_handle,
       url: "https://" + request.host + "/_oidc/rotate",
       method: "POST",
@@ -222,10 +222,10 @@ class OIDCProvider {
   // POST /_oidc/rotate — the scheduled fire. Deadline-gated + single
   // kv key (last-write-wins) ⇒ a concurrent leadership double-fire
   // is safe with no header dedupe (§4.6 grounded correction). kv.set
-  // + the http.send re-arm commit atomically (http-send-plan §6).
+  // + the webhook.send re-arm commit atomically (http-send-plan §6).
   /**
    * Scheduled key-rotation tick (§4.6). Reached only via the
-   * in-cluster `http.send` self-fire routed through {@link
+   * in-cluster `webhook.send` self-fire routed through {@link
    * OIDCProvider#handle}; not a customer entry point. Deadline-gated
    * and last-write-wins, so a double-fire is safe.
    *
@@ -289,7 +289,7 @@ class OIDCProvider {
       return this._token();
     }
     // Internal-routed scheduled key-rotation tick (§4.6). Reached
-    // only via the in-cluster http.send self-fire; an external POST
+    // only via the in-cluster webhook.send self-fire; an external POST
     // here is benign — _advance is deadline-gated, so it can't force
     // a premature rotation (worst case: a no-op extra tick).
     if (m === "POST" && path === "/_oidc/rotate") {
@@ -546,12 +546,12 @@ class OIDCProvider {
 //     with a SYNTHESIZED request: no browser response (can't set a
 //     cookie / 302), and crucially NO `request.session`. So the
 //     session anchor (`sid`) is captured on the real browser request
-//     in beginLogin and threaded through state → http.send context →
+//     in beginLogin and threaded through state → webhook.send context →
 //     the completion modules. The RP session binds to the platform's
 //     already-host-only `__Host-rove_sid` via `_rp/sess/{sid}` —
 //     the session.zig "bind the sid to your user in your own kv"
 //     model that web/auth/index.mjs itself uses (no new cookie).
-//   - Token exchange + JWKS verify are TWO async http.send hops; the
+//   - Token exchange + JWKS verify are TWO async webhook.send hops; the
 //     browser sits on a poll page until `_rp/sess/{sid}` lands.
 //
 // Config at `_oidc/rp/{name}` (a normal kv key — operational, like
@@ -724,23 +724,32 @@ class OIDCRelyingParty {
       client_id: this.cfg.client_id,
       code_verifier: st.verifier,
     });
-    // `context` is a TOP-LEVEL http.send field (jsHttpSend reads
-    // opts.context), NOT nested in on_result — matches oauth.js.
-    http.send({
+    // `context` is a TOP-LEVEL webhook.send field (NOT nested in
+    // on_result — matches oauth.js).
+    webhook.send({
       url: this.cfg.issuer + "/token",
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
-      on_result: { module: this.cfg.complete_module },
+      on_result: this.cfg.complete_module,
       context: { sid: st.sid, return_to: st.return_to },
     });
     return this._pollPage(st.return_to);
   }
 
   // The callback event the on_result modules receive (synthesized
-  // request, body = the http-send-plan §8 event).
+  // request body shape post-Phase-5-PR-3: the webhook_onresult shim
+  // chains via `__rove_next(on_result, { ctx: { result, context } })`,
+  // so `request.body` JSON-parses to `{ctx: {result, context}}`. We
+  // flatten back to the legacy `{ok, status, body, context, ...}`
+  // shape so the OIDC RP's `completeToken` / `completeJwks` keep
+  // working unchanged.
   _event() {
-    try { return JSON.parse(request.body || "{}"); } catch (_) { return {}; }
+    let parsed;
+    try { parsed = JSON.parse(request.body || "{}"); } catch (_) { return {}; }
+    const ctx = (parsed && parsed.ctx) || {};
+    const result = ctx.result || {};
+    return Object.assign({}, result, { context: ctx.context });
   }
 
   /**
@@ -784,10 +793,10 @@ class OIDCRelyingParty {
       }
     }
     // Unknown/absent kid → refetch JWKS, finish in completeJwks.
-    http.send({
+    webhook.send({
       url: this.cfg.issuer + "/.well-known/jwks.json",
       method: "GET",
-      on_result: { module: this.cfg.jwks_module },
+      on_result: this.cfg.jwks_module,
       context: { sid: ctx.sid, return_to: ctx.return_to, id_token },
     });
     response.status = 200;

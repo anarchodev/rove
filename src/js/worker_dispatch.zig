@@ -17,7 +17,6 @@ const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
-const send_outbox = @import("send_outbox.zig");
 const log_mod = @import("rove-log");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
@@ -682,13 +681,10 @@ fn finalizeBatch(
     // many customer requests ride one raft log entry.
     worker.node.dispatch_writeset_size.observe(@intCast(successes.items.len));
 
-    // Option (b) 4b-ii-B: gate `_send/owed/` arm + `_send/owed/`
-    // delete/`_send/proof/` resolve on this batch's commit, keyed by
-    // the same `seq` the entities wait on. No-op when the batch wrote
-    // no `_send/*` keys. Discarded with the parked unit on
-    // fault/timeout/leadership-loss → FORK-6 leader-side-at-commit.
-    worker_mod.parkSendOps(worker, seq, anchor_id, writeset) catch |perr|
-        std.log.warn("rove-js parkSendOps (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
+    // Phase 5 PR-3: the `_send/*` commit-gate (parkSendOps) retired
+    // with the SendDispatch kernel. `_send/owed/` is an ordinary
+    // envelope-0 kv put now; the per-worker partitioned retry
+    // sweep (`sweepOwedRetries`) is the fire mechanism.
 
     // streaming-handlers-plan §4.6: park kv-wake intents on the
     // same `seq` so `drainRaftPending` fires them at commit time,
@@ -2317,6 +2313,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 @ptrCast(worker)
             else
                 null,
+            // Phase 5 PR-3: §6.4 held-sync resume hook trampoline.
+            // Available to every dispatch (the JS-shim
+            // `__system/webhook_onresult` calls it on terminal);
+            // returns false when nothing's bound.
+            .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
+            .resume_if_bound_ctx = @ptrCast(worker),
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(
@@ -2484,9 +2486,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             var only: ?[]const u8 = null;
             var n: usize = 0;
             for (writeset.ops.items) |op| switch (op) {
-                .put => |p| if (std.mem.startsWith(u8, p.key, send_outbox.OWED_PREFIX)) {
+                .put => |p| if (std.mem.startsWith(u8, p.key, worker_mod.OWED_PREFIX)) {
                     n += 1;
-                    only = p.key[send_outbox.OWED_PREFIX.len..];
+                    only = p.key[worker_mod.OWED_PREFIX.len..];
                 },
                 .delete => {},
             };

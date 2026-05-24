@@ -563,23 +563,11 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(qjs_bench);
 
-    // owed-recovery-scan-bench: Option (b) 3(b) measurement — cost of
-    // reconstructing the `_send/owed/` recovery set at restart.
-    const owed_bench_mod = b.addModule("owed-recovery-scan-bench", .{
-        .root_source_file = b.path("examples/owed_recovery_scan_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    owed_bench_mod.addImport("rove-kv", kv_mod);
-    owed_bench_mod.addImport("kvexp", kvexp_mod);
-    const owed_bench = b.addExecutable(.{
-        .name = "owed-recovery-scan-bench",
-        .root_module = owed_bench_mod,
-    });
-    b.installArtifact(owed_bench);
-    const owed_bench_run = b.addRunArtifact(owed_bench);
-    b.step("owed-recovery-scan-bench", "Option (b) 3(b): recovery-set scan cost")
-        .dependOn(&owed_bench_run.step);
+    // Phase 5 PR-3: owed-recovery-scan-bench retired alongside the
+    // SendDispatch kernel (the bench measured the boot-scan
+    // SendDispatch.recover() drove). The JS-shim
+    // `sweepOwedRetriesOnPromotion` covers the same shape; see
+    // `scripts/webhook_recovery_smoke.py` for end-to-end coverage.
 
     // files-server-standalone: spawns the rove-files-server thread and
     // idles. Exists so the smoke test can drive it from curl.

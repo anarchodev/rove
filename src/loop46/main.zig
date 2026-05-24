@@ -447,10 +447,10 @@ fn workerMain(args: *WorkerCtx) !void {
         // Phase 5 PR-3: on the `false→true` leadership transition,
         // sweep this worker's partition of loaded tenants for
         // due `_send/owed/` retry markers — the orphan-recovery
-        // primitive that replaces SendDispatch.recover(). Runs on
-        // EVERY worker (not pinned to worker 0) because the sweep
-        // is partitioned by `hash(tenant_id) % N_msg_inboxes`; each
-        // worker covers its own slice exactly once.
+        // primitive. Runs on EVERY worker (not pinned to worker 0)
+        // because the sweep is partitioned by `hash(tenant_id) %
+        // N_msg_inboxes`; each worker covers its own slice exactly
+        // once.
         if (!worker.was_leader and is_leader_now) {
             rjs.sweepOwedRetriesOnPromotion(worker);
         }
@@ -497,6 +497,15 @@ fn workerMain(args: *WorkerCtx) !void {
         rjs.serviceSubscriptionFires(worker);
         try reg.flush();
 
+        // Phase 5 PR-3: drain deferred §6.4 held-sync resumes that
+        // the JS-shim `__system/webhook_onresult` enqueued via
+        // `_system.continuation.resumeIfBound`. Runs after the
+        // shim's batch txn has committed (was inside
+        // dispatchPendingMsgs above), so the resume engine's own
+        // `beginTrackedImmediate` doesn't nest.
+        rjs.drainPendingBoundResumes(worker);
+        try reg.flush();
+
         // Gap 2.3 Phase D: drain the cross-thread fetch-chunk inbox
         // (from the node FetchPool's libcurl threads) into the
         // `fetch_event_pending` collection + dispatch on_chunk /
@@ -504,27 +513,13 @@ fn workerMain(args: *WorkerCtx) !void {
         rjs.serviceFetchEvents(worker);
         try reg.flush();
 
-        // Schedule callback dispatch: on the raft leader, worker 0
-        // scans every tenant's `_callback/*` rows left by the
-        // schedule-server's envelope-9 apply and invokes the
-        // customer's `on_result` handler in its own transaction.
-        // Gated to worker 0 so two threads on the same node don't
-        // race on the same receipt — the inner SQLite txn would
-        // serialize them anyway via SQLITE_BUSY, but pinning avoids
-        // the wasted turnaround.
-        if (args.worker_idx == 0) {
-            // Option (b) 5b-2: the ONLY resolution phase. The retired
-            // schedule subsystem's `dispatchCallbacks` (env-9 `c/`
-            // rows) and `dispatchInternalSchedules` (env-8 is_internal
-            // rows, §3.2 in-process shortcut — deferred post-cutover)
-            // are gone; everything flows `_send/owed/` → SendDispatch
-            // → here. Worker-0 pin + inner leader gate as before.
-            if (worker.node.send_dispatch) |sd| {
-                _ = rjs.dispatchSendCompletions(worker, sd, rjs.CALLBACK_DEFAULT_MAX_PER_TENANT) catch |err| {
-                    std.log.warn("worker {d}: dispatchSendCompletions: {s}", .{ args.worker_idx, @errorName(err) });
-                };
-            }
-        }
+        // Phase 5 PR-3: callback dispatch retired with the
+        // SendDispatch kernel. The webhook on_result chain runs as
+        // an ordinary `__rove_next` dispatch from the baked
+        // `__system/webhook_onresult` shim — the `send_callback`
+        // Msg variant lives on, just produced by the JS shim
+        // now (via `enqueueChainedDispatchForTenant`), not by a
+        // dedicated leader-pinned phase here.
 
         // Log batch flush moved to a background thread spawned in
         // Worker.create — the dispatch loop stays free of S3 RTT.
@@ -1479,29 +1474,24 @@ pub fn main() !void {
     // worker-0-publishes-its-loader atomic dance).
     loop46_ctx.deployment_loader = node_state.deployment_loader;
 
-    // Option (b) FORK-6': the single leader-local send-dispatch
-    // component. Leader is fed worker-side at commit (4b-ii);
-    // FOLLOWERS feed it via the apply path (4b-iv) so `armed` stays
-    // warm for instant failover — hence it IS wired to `loop46_ctx`
-    // (revised from FORK-6's leader-only model). Still inert: nothing
-    // fires until the 4c guard flips.
-    try node_state.startSendDispatch();
-    loop46_ctx.send_dispatch = node_state.send_dispatch;
+    // Phase 5 PR-3: the leader-local SendDispatch kernel retired
+    // with the atomic flip to the JS-shim webhook composition. The
+    // outbound http.fetch pool below is now the sole outbound-HTTP
+    // runtime; durability is composed in JS (`globals/webhook.js` +
+    // `__system/webhook_onresult` + the per-worker partitioned
+    // retry sweep).
 
-    // Gap 2.3 Phase C2: the outbound http.fetch pool. Separate
-    // saturation domain from `SendDispatch` (transient + best-
-    // effort, not durable + at-least-once). Inbox-registration
-    // happens later when workers spawn; the pool tolerates a
-    // cold-start window where no inboxes exist (warns once + drops).
+    // Gap 2.3 Phase C2: the outbound http.fetch pool. Inbox
+    // registration happens later when workers spawn; the pool
+    // tolerates a cold-start window where no inboxes exist (warns
+    // once + drops).
     try node_state.startFetchPool();
 
     // streaming-handlers-plan §4.6: hand the apply path a pointer
     // to NodeState so `applyWriteSet` can `broadcastKvWake` across
     // every worker's `KvWakeInbox`. Type-erased through `?*anyopaque`
     // because apply.zig declares the field outside the module-private
-    // worker.zig — both sides agree on the cast (same module). Wired
-    // here, AFTER `startSendDispatch` (no ordering coupling — just
-    // grouped with the other apply-feed wires).
+    // worker.zig — both sides agree on the cast (same module).
     loop46_ctx.node_state = @ptrCast(&node_state);
 
     _ = try node_state.eagerOpenTenants();

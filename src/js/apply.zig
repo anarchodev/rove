@@ -57,7 +57,6 @@ const std = @import("std");
 const kv = @import("rove-kv");
 const panic_mod = @import("panic.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
-const send_dispatch_mod = @import("send_dispatch.zig");
 const worker_mod = @import("worker.zig");
 
 pub const Error = error{
@@ -97,11 +96,13 @@ pub const EnvelopeType = enum(u8) {
     //   7        old `multi` pre-renumber (now type 1).
     //   8/9/10/11 schedule_{upsert,complete,cancel,demote} — RETIRED
     //            Option (b) 5b-2: the central schedule subsystem is
-    //            dissolved; http.send writes per-tenant
-    //            `_send/owed/`+`_send/proof/` riding envelope 0,
-    //            fired/resolved by the per-node leader-local
-    //            SendDispatch (no schedules.db, no leader-pinned
-    //            schedule-server thread, no env-9 callback rows).
+    //            dissolved; webhook.send (effect-reification-plan.md
+    //            Phase 5 PR-3) composes durability in JS on top of
+    //            kv.set + http.fetch + the per-worker partitioned
+    //            retry sweep — see `globals/webhook.js`. No
+    //            schedules.db, no leader-pinned schedule-server
+    //            thread, no env-9 callback rows, and no Zig-side
+    //            SendDispatch kernel either (PR-3 deleted it).
 };
 
 /// Build a writeset envelope. `id_len` and `id` plus a leading type=0
@@ -246,14 +247,6 @@ pub const Loop46Ctx = struct {
     worker_phase_wake: ?*std.Thread.ResetEvent = null,
     public_suffix: ?[]const u8 = null,
     deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
-    /// Option (b) FORK-6' (4b-iv): the leader-local in-flight set's
-    /// FOLLOWER feed. `applyWriteSet` is `leader_skip=true` → runs
-    /// exactly on followers; it classifies the committed writeset's
-    /// `_send/*` ops and enqueues arm/resolve here so every node
-    /// keeps `armed` warm for instant failover (vs the 0.9–2.2 s/10k
-    /// cold reconstruction). Null until `main.zig` wires it; null ⇒
-    /// no follower feed (leader still fed worker-side via 4b-ii).
-    send_dispatch: ?*send_dispatch_mod.SendDispatch = null,
     /// streaming-handlers-plan §4.6: pointer to the process-wide
     /// `NodeState` so `applyWriteSet` can broadcast kv-write events
     /// to every worker's `KvWakeInbox` after a follower-side apply.
@@ -329,26 +322,13 @@ pub fn applyWriteSet(
     // happen but we tolerate it by silently ignoring).
     const ctx = loop46Ctx(user_ctx);
 
-    // Option (b) FORK-6' (4b-iv): follower feed for the leader-local
-    // in-flight set. This runs on FOLLOWERS (applyWriteSet is
-    // leader_skip=true) — the leader is fed worker-side at commit
-    // (4b-ii). Classify this committed writeset's `_send/*` ops and
-    // enqueue arm/resolve so the follower keeps `armed` warm for
-    // instant failover. Cheap (dupe+mutex+wake on the thread-safe
-    // queue; the SendDispatch thread drains, ungated). Best-effort:
-    // classify/enqueue failure logs and the cold-start boot-scan
-    // safety-net re-derives on a later promotion — no silent loss.
-    if (ctx.send_dispatch) |sd| {
-        var intents: std.ArrayListUnmanaged(send_dispatch_mod.SendIntent) = .empty;
-        defer intents.deinit(ctx.allocator);
-        send_dispatch_mod.classifyPayload(env.payload, ctx.allocator, &intents) catch {};
-        for (intents.items) |it| switch (it) {
-            .arm => |v| sd.enqueueArm(v.id, env.id, v.owed) catch |e|
-                std.log.warn("applyWriteSet: send-dispatch arm {s}/{s}: {s}", .{ env.id, v.id, @errorName(e) }),
-            .resolve => |rid| sd.enqueueResolve(rid) catch |e|
-                std.log.warn("applyWriteSet: send-dispatch resolve {s}/{s}: {s}", .{ env.id, rid, @errorName(e) }),
-        };
-    }
+    // Phase 5 PR-3: the `_send/owed/*` apply-time classifier hook is
+    // GONE. webhook.send (the JS-shim composition) writes the marker
+    // as an ordinary envelope-0 kv put; the per-worker partitioned
+    // sweep (`sweepOwedRetries` — leader-local) picks it up
+    // post-commit. No Zig-side SendDispatch arming, no follower
+    // feed for an in-flight set. Cross-failover recovery comes from
+    // `sweepOwedRetriesOnPromotion` running on the new leader.
 
     if (ctx.deployment_loader) |loader| {
         if (kv.scanWriteSetPutValue(env.payload, "_deploy/current")) |hex_bytes| {

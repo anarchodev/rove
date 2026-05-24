@@ -1,5 +1,7 @@
 // `email.send` — transactional email via Resend, layered on
-// `webhook.send` (→ `http.send`). Per-instance rate-limited.
+// `webhook.send` (which composes durable outbound HTTP from `kv.set`
+// + `http.fetch` + the per-worker retry sweep — see `webhook.js`).
+// Per-instance rate-limited.
 
 /**
  * Transactional email through Resend.
@@ -71,10 +73,10 @@ globalThis.email = {
       },
       body: JSON.stringify(body),
     };
-    if (opts.onResult) env.onResult = opts.onResult;
+    if (opts.onResult) env.on_result = opts.onResult;
     if (opts.context !== undefined) env.context = opts.context;
-    if (opts.maxAttempts) env.maxAttempts = opts.maxAttempts;
-    if (opts.timeout) env.timeout = opts.timeout;
+    if (opts.maxAttempts) env.max_attempts = opts.maxAttempts;
+    if (opts.timeout_ms != null) env.timeout_ms = opts.timeout_ms;
     return webhook.send(env);
   },
 };

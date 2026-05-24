@@ -19,7 +19,6 @@ const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
 const log_mod = @import("rove-log");
-const send_outbox = @import("send_outbox.zig");
 
 const globals = @import("globals.zig");
 const limiter_mod = @import("limiter.zig");
@@ -216,6 +215,20 @@ pub const Request = struct {
         value: []const u8,
     ) anyerror!void = null,
     scope_kv_ctx: ?*anyopaque = null,
+    /// Phase 5 PR-3: trampoline backing
+    /// `_system.continuation.resumeIfBound(send_id, event_json)` —
+    /// the §6.4 held-sync resume hook called by the JS-shim
+    /// `__system/webhook_onresult` module on terminal. The worker
+    /// wires this to `worker.resumeBoundContinuation`. Null on
+    /// test paths / non-worker dispatches; the JS callable returns
+    /// `false` in that case (no held-sync to resume).
+    resume_if_bound: ?*const fn (
+        ctx: *anyopaque,
+        tenant_id: []const u8,
+        send_id: []const u8,
+        event_json: []const u8,
+    ) bool = null,
+    resume_if_bound_ctx: ?*anyopaque = null,
     /// Per-chain identifier; the same string on every activation of
     /// one logical interaction (streaming-handlers-plan §5/§6). Set
     /// by the runtime — inbound mints it (accepts an inbound
@@ -512,6 +525,8 @@ pub const Dispatcher = struct {
             .release_publish_ctx = request.release_publish_ctx,
             .scope_kv_write = request.scope_kv_write,
             .scope_kv_ctx = request.scope_kv_ctx,
+            .resume_if_bound = request.resume_if_bound,
+            .resume_if_bound_ctx = request.resume_if_bound_ctx,
             .pending_fetches = request.pending_fetches,
             .is_system_module = request.is_system_module,
         };
@@ -560,7 +575,18 @@ pub const Dispatcher = struct {
         // value, the dispatcher short-circuits with that value as the
         // body and skips the handler. Return undefined / fall off the
         // end → continue.
+        //
+        // Phase 5 PR-3: `__system/` built-in modules SKIP middleware.
+        // They're the platform's own bookkeeping (e.g. the baked
+        // `__system/webhook_onresult` shim that runs as a fetch_chunk
+        // activation in the issuing tenant). A tenant's middleware
+        // can't gate the platform — e.g. `__admin__`'s OIDC-RP
+        // middleware returns 401 for any path not on its PRE_AUTH
+        // list, which short-circuits the shim before it can delete
+        // the `_send/owed/` marker → sweep re-fires forever. System
+        // modules are trusted; middleware doesn't apply.
         const mw_bytecode_opt: ?[]const u8 = blk: {
+            if (request.is_system_module) break :blk null;
             if (bytecodes) |bcs| {
                 if (bcs.get("_middlewares/index.mjs")) |bc| break :blk bc;
                 if (bcs.get("_middlewares/index.js")) |bc| break :blk bc;
@@ -1866,23 +1892,14 @@ fn runOne(
     }
 }
 
-/// 5b-1 test helper. http.send no longer appends a `ScheduleRow`
-/// (env-8 retired) — its only durable record is `_send/owed/{id}` in
-/// the tenant kv (`runOneOutcome` commits the txn, so `kv.get` sees
-/// it). Decode it; caller asserts the same fields the old tests
-/// asserted on the ScheduleRow (OwedSend is exactly that relocatable
-/// subset) and `deinitOwned`s the result.
-fn expectOwed(kv: *kv_mod.KvStore, id: []const u8) !send_outbox.OwedSend {
-    var kbuf: [send_outbox.KEY_BUF]u8 = undefined;
-    const enc = try kv.get(send_outbox.owedKey(&kbuf, id));
-    defer testing.allocator.free(enc);
-    return send_outbox.OwedSend.decode(testing.allocator, enc);
-}
-
-/// http.cancel tombstones `_send/owed/{id}` — assert it is gone.
-fn expectNoOwed(kv: *kv_mod.KvStore, id: []const u8) !void {
-    var kbuf: [send_outbox.KEY_BUF]u8 = undefined;
-    try testing.expectError(error.NotFound, kv.get(send_outbox.owedKey(&kbuf, id)));
+/// Phase 5 PR-3 test helper. The JS-shim `webhook.send` writes
+/// `_send/owed/{id}` as a JSON object marker (see
+/// `globals/webhook.js`). The caller owns the returned slice +
+/// frees with `testing.allocator.free`.
+fn readOwedMarker(kv: *kv_mod.KvStore, id: []const u8) ![]u8 {
+    var key_buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "_send/owed/{s}", .{id}) catch unreachable;
+    return kv.get(key);
 }
 
 test "dispatch: next(...) return is classified as a continuation" {
@@ -1989,7 +2006,7 @@ test "dispatch: kv.set + kv.get round trip" {
 }
 
 
-test "dispatch: http.send writes _send/owed/{derived id}" {
+test "dispatch: webhook.send writes _send/owed/{id} marker (immediate fire path)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2001,25 +2018,30 @@ test "dispatch: http.send writes _send/owed/{derived id}" {
     defer d.deinit();
 
     var resp = try runOne(&d, kv,
-        \\const id = http.send({ url: "https://api.stripe.com/v1/charges", body: "x" });
+        \\const id = webhook.send({ url: "https://api.stripe.com/v1/charges", body: "x" });
         \\return id;
     , .{ .method = "POST", .path = "/", .request_id = 7 });
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 64), resp.body.len); // derived sha256 hex
-    var owed = try expectOwed(kv, resp.body);
-    defer owed.deinitOwned(testing.allocator);
-    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", owed.url);
-    try testing.expectEqualStrings("POST", owed.method);
-    try testing.expectEqualStrings("x", owed.body);
-    try testing.expectEqual(@as(i64, 0), owed.fire_at_ns);
+    const marker_raw = try readOwedMarker(kv, resp.body);
+    defer testing.allocator.free(marker_raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, marker_raw, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", obj.get("url").?.string);
+    try testing.expectEqualStrings("POST", obj.get("method").?.string);
+    try testing.expectEqualStrings("x", obj.get("body").?.string);
+    try testing.expectEqual(@as(i64, 0), obj.get("attempts").?.integer);
+    // next_at_ns is "0" for immediate-fire (no fire_at_ns supplied).
+    try testing.expectEqualStrings("0", obj.get("next_at_ns").?.string);
 }
 
-test "dispatch: http.send with handle uses handle as id; same handle overwrites _send/owed" {
-    // The handle IS the `_send/owed/{id}` key. Two sends with the
-    // same handle in one hop write the same key — the second
-    // overwrites the first (last-write-wins; resolve-once is
-    // proof-presence + id-dedup, no version counter).
+// Phase 5 PR-3: the original Zig http.send-binding tests deleted
+// here (they exercised the now-retired surface). The JS-shim path
+// is exercised by the marker tests above + the webhook smoke
+// (`scripts/webhook_smoke.py`).
+
+test "dispatch: webhook.send with handle derives a stable id; same handle overwrites the marker" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2030,133 +2052,27 @@ test "dispatch: http.send with handle uses handle as id; same handle overwrites 
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
+    // Same handle → same id → last-write-wins on `_send/owed/{id}`.
     var resp = try runOne(&d, kv,
-        \\http.send({ handle: "reminder-foo", url: "https://x/" });
-        \\http.send({ handle: "reminder-foo", url: "https://x/", fire_at_ns: 1234 });
-        \\return "ok";
+        \\const id1 = webhook.send({ handle: "reminder-foo", url: "https://x/" });
+        \\const id2 = webhook.send({ handle: "reminder-foo", url: "https://y/", fire_at_ns: BigInt(Date.now() + 86400000) * 1000000n });
+        \\return id1 + "|" + id2;
     , .{ .method = "POST", .path = "/", .request_id = 1 });
     defer resp.deinit(testing.allocator);
 
-    var owed = try expectOwed(kv, "reminder-foo"); // handle == id
-    defer owed.deinitOwned(testing.allocator);
-    try testing.expectEqual(@as(i64, 1234), owed.fire_at_ns); // 2nd send won
+    // Same id twice — sha256(handle) is deterministic on input.
+    const sep = std.mem.indexOfScalar(u8, resp.body, '|').?;
+    try testing.expectEqualStrings(resp.body[0..sep], resp.body[sep + 1 ..]);
+
+    const marker_raw = try readOwedMarker(kv, resp.body[0..sep]);
+    defer testing.allocator.free(marker_raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, marker_raw, .{});
+    defer parsed.deinit();
+    // The second write (scheduled fire) won.
+    try testing.expectEqualStrings("https://y/", parsed.value.object.get("url").?.string);
 }
 
-test "dispatch: http.send accepts on_result.fn + on_result.args" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var resp = try runOne(&d, kv,
-        \\return http.send({
-        \\  url: "https://stripe.com/x",
-        \\  on_result: {
-        \\    module: "stripe",
-        \\    fn: "handleCharge",
-        \\    args: [42, "subscription"],
-        \\  },
-        \\});
-    , .{ .method = "POST", .path = "/", .request_id = 7 });
-    defer resp.deinit(testing.allocator);
-
-    var owed = try expectOwed(kv, resp.body);
-    defer owed.deinitOwned(testing.allocator);
-    try testing.expectEqualStrings("stripe", owed.on_result_module);
-    try testing.expectEqualStrings("handleCharge", owed.on_result_fn);
-    try testing.expectEqualStrings("[42,\"subscription\"]", owed.on_result_args_json);
-}
-
-test "dispatch: http.send rejects non-array on_result.args" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var resp = try runOne(&d, kv,
-        \\try {
-        \\  http.send({
-        \\    url: "https://x/",
-        \\    on_result: { module: "m", fn: "f", args: { not: "array" } },
-        \\  });
-        \\  return "ok";
-        \\} catch (e) {
-        \\  return "threw:" + e.message;
-        \\}
-    , .{
-        .method = "POST",
-        .path = "/",
-        .request_id = 1,
-    });
-    defer resp.deinit(testing.allocator);
-    try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
-}
-
-test "dispatch: http.send omitted on_result.fn defaults to empty" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var resp = try runOne(&d, kv,
-        \\return http.send({ url: "https://x/", on_result: { module: "m" } });
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
-    defer resp.deinit(testing.allocator);
-
-    var owed = try expectOwed(kv, resp.body);
-    defer owed.deinitOwned(testing.allocator);
-    try testing.expectEqualStrings("", owed.on_result_fn);
-    try testing.expectEqualStrings("", owed.on_result_args_json);
-}
-
-test "dispatch: http.cancel tombstones _send/owed/{id}" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    // Send (creates `_send/owed/reminder-foo`), then cancel it in a
-    // later hop: the owed marker is gone (the only cancel mechanism
-    // now — env-10 retired).
-    var s1 = try runOne(&d, kv,
-        \\http.send({ handle: "reminder-foo", url: "https://x/" });
-        \\return "ok";
-    , .{ .method = "POST", .path = "/", .request_id = 1, .instance_id = "acme" });
-    s1.deinit(testing.allocator);
-    {
-        var owed = try expectOwed(kv, "reminder-foo");
-        owed.deinitOwned(testing.allocator);
-    }
-
-    var s2 = try runOne(&d, kv,
-        \\http.cancel({ handle: "reminder-foo" });
-        \\return "ok";
-    , .{ .method = "POST", .path = "/", .request_id = 2, .instance_id = "acme" });
-    s2.deinit(testing.allocator);
-    try expectNoOwed(kv, "reminder-foo");
-}
-
-test "dispatch: retry.send fires http.send with _retry context wrapper" {
+test "dispatch: retry.send wraps webhook.send + carries _retry meta" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2178,25 +2094,25 @@ test "dispatch: retry.send fires http.send with _retry context wrapper" {
     , .{ .method = "POST", .path = "/", .request_id = 7 });
     defer resp.deinit(testing.allocator);
 
-    var owed = try expectOwed(kv, resp.body);
-    defer owed.deinitOwned(testing.allocator);
-    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", owed.url);
-    try testing.expectEqualStrings("stripe_done", owed.on_result_module);
-
-    // Context carries _retry meta: attempt=1, max_attempts=3, original/etc.
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, owed.context_json, .{});
+    const marker_raw = try readOwedMarker(kv, resp.body);
+    defer testing.allocator.free(marker_raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, marker_raw, .{});
     defer parsed.deinit();
-    const ctx = parsed.value.object;
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", obj.get("url").?.string);
+    try testing.expectEqualStrings("stripe_done", obj.get("on_result").?.string);
+    // retry.send pins webhook.send's built-in retry to 1 (off).
+    try testing.expectEqual(@as(i64, 1), obj.get("max_attempts").?.integer);
+
+    const ctx = obj.get("context").?.object;
     try testing.expectEqual(@as(i64, 42), ctx.get("charge_id").?.integer);
     const r = ctx.get("_retry").?.object;
     try testing.expectEqual(@as(i64, 1), r.get("attempt").?.integer);
     try testing.expectEqual(@as(i64, 3), r.get("max_attempts").?.integer);
     try testing.expectEqualStrings("stripe_done", r.get("on_result_module").?.string);
-    const orig = r.get("original").?.object;
-    try testing.expectEqualStrings("https://api.stripe.com/v1/charges", orig.get("url").?.string);
 }
 
-test "dispatch: retry.shouldRetry true on failure with attempts left, false otherwise" {
+test "dispatch: retry.shouldRetry / retry.stripContext logic" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2213,116 +2129,14 @@ test "dispatch: retry.shouldRetry true on failure with attempts left, false othe
         \\const failed_with_attempts = retry.shouldRetry({ ok: false, ...base({ _retry: { attempt: 1, max_attempts: 3 } }) });
         \\const failed_exhausted = retry.shouldRetry({ ok: false, ...base({ _retry: { attempt: 3, max_attempts: 3 } }) });
         \\const no_retry_meta = retry.shouldRetry({ ok: false, context: { charge_id: 42 } });
-        \\return [ok, failed_with_attempts, failed_exhausted, no_retry_meta].join(",");
-    , .{
-        .method = "POST",
-        .path = "/",
-        .request_id = 1,
-    });
-    defer resp.deinit(testing.allocator);
-
-    try testing.expectEqualStrings("false,true,false,false", resp.body);
-}
-
-test "dispatch: retry.next fires a new http.send with attempt+1" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var resp = try runOne(&d, kv,
-        \\const event = {
-        \\  ok: false,
-        \\  status: 503,
-        \\  context: {
-        \\    charge_id: 42,
-        \\    _retry: {
-        \\      attempt: 1,
-        \\      max_attempts: 3,
-        \\      on_result_module: "stripe_done",
-        \\      original: { url: "https://stripe.com/x", method: "POST", body: "amount=500" },
-        \\    },
-        \\  },
-        \\};
-        \\return retry.next(event);
+        \\const stripped = JSON.stringify(retry.stripContext({ context: { charge_id: 42, _retry: { attempt: 2 } } }));
+        \\return [ok, failed_with_attempts, failed_exhausted, no_retry_meta].join(",") + "|" + stripped;
     , .{ .method = "POST", .path = "/", .request_id = 1 });
     defer resp.deinit(testing.allocator);
 
-    var owed = try expectOwed(kv, resp.body);
-    defer owed.deinitOwned(testing.allocator);
-    try testing.expectEqualStrings("https://stripe.com/x", owed.url);
-    try testing.expectEqualStrings("amount=500", owed.body);
-    try testing.expectEqualStrings("stripe_done", owed.on_result_module);
-    // fire_at_ns nonzero — default exponential backoff applies on
-    // the first retry. We don't pin the exact value (depends on
-    // Date.now()); just confirm it's in the future.
-    try testing.expect(owed.fire_at_ns > 0);
-
-    // Context carries the bumped attempt + preserved user fields.
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, owed.context_json, .{});
-    defer parsed.deinit();
-    const ctx = parsed.value.object;
-    try testing.expectEqual(@as(i64, 42), ctx.get("charge_id").?.integer);
-    const r = ctx.get("_retry").?.object;
-    try testing.expectEqual(@as(i64, 2), r.get("attempt").?.integer);
-}
-
-test "dispatch: retry.stripContext returns user-domain context only" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var resp = try runOne(&d, kv,
-        \\const ev = { context: { charge_id: 42, _retry: { attempt: 2 } } };
-        \\const stripped = retry.stripContext(ev);
-        \\return JSON.stringify(stripped);
-    , .{
-        .method = "POST",
-        .path = "/",
-        .request_id = 1,
-    });
-    defer resp.deinit(testing.allocator);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-    try testing.expectEqual(@as(i64, 42), obj.get("charge_id").?.integer);
-    try testing.expect(obj.get("_retry") == null);
-}
-
-test "dispatch: http.send rejects empty handle" {
-    var buf: [64]u8 = undefined;
-    const kv = try openTempKv(testing.allocator, &buf);
-    defer {
-        kv.close();
-        cleanupTempKv(&buf);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    var resp = try runOne(&d, kv,
-        \\try {
-        \\  http.send({ handle: "", url: "https://x/" });
-        \\  return "no_throw";
-        \\} catch (e) {
-        \\  return e.name + ":" + e.message.split(":")[0];
-        \\}
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
-    defer resp.deinit(testing.allocator);
-
-    try testing.expectEqualStrings("RangeError:http.send", resp.body);
+    const pipe = std.mem.indexOfScalar(u8, resp.body, '|').?;
+    try testing.expectEqualStrings("false,true,false,false", resp.body[0..pipe]);
+    try testing.expect(std.mem.indexOf(u8, resp.body[pipe..], "_retry") == null);
 }
 
 test "dispatch: request.session.id surfaces resolved sid" {
@@ -3821,7 +3635,7 @@ test "dispatch: request.query exposes raw query string" {
 }
 
 
-test "dispatch: webhook.send (polyfill) writes _send/owed/{id} markers" {
+test "dispatch: webhook.send (JS shim) writes _send/owed/{id} markers" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -3832,9 +3646,9 @@ test "dispatch: webhook.send (polyfill) writes _send/owed/{id} markers" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // The legacy webhook.send is now a JS polyfill on top of
-    // http.send (src/js/globals/webhook.js). Same call shape from
-    // customer code; each writes a `_send/owed/{id}` marker.
+    // Phase 5 PR-3: webhook.send is the JS-shim composition
+    // (`globals/webhook.js`). Each writes a JSON `_send/owed/{id}`
+    // marker the per-worker retry sweep (sweepOwedRetries) reads.
     var resp = try runOne(
         &d,
         kv,
@@ -3854,54 +3668,29 @@ test "dispatch: webhook.send (polyfill) writes _send/owed/{id} markers" {
     );
     defer resp.deinit(testing.allocator);
 
-    const id1 = resp.body[0..64];
-    const id2 = resp.body[65..];
+    const sep = std.mem.indexOfScalar(u8, resp.body, '|').?;
+    const id1 = resp.body[0..sep];
+    const id2 = resp.body[sep + 1 ..];
 
-    var o1 = try expectOwed(kv, id1);
-    defer o1.deinitOwned(testing.allocator);
-    try testing.expectEqualStrings("https://example.test/a", o1.url);
-    try testing.expectEqualStrings("POST", o1.method);
-    try testing.expectEqualStrings("one", o1.body);
-    try testing.expectEqualStrings("cb/a", o1.on_result_module);
-    try testing.expectEqualStrings("{\"x\":1}", o1.context_json);
+    const m1_raw = try readOwedMarker(kv, id1);
+    defer testing.allocator.free(m1_raw);
+    var p1 = try std.json.parseFromSlice(std.json.Value, testing.allocator, m1_raw, .{});
+    defer p1.deinit();
+    const o1 = p1.value.object;
+    try testing.expectEqualStrings("https://example.test/a", o1.get("url").?.string);
+    try testing.expectEqualStrings("POST", o1.get("method").?.string);
+    try testing.expectEqualStrings("one", o1.get("body").?.string);
+    try testing.expectEqualStrings("cb/a", o1.get("on_result").?.string);
+    const ctx_obj = o1.get("context").?.object;
+    try testing.expectEqual(@as(i64, 1), ctx_obj.get("x").?.integer);
 
-    var o2 = try expectOwed(kv, id2);
-    defer o2.deinitOwned(testing.allocator);
-    try testing.expectEqualStrings("https://example.test/b", o2.url);
-    try testing.expectEqualStrings("GET", o2.method);
-}
-
-test "dispatch: webhook.send (polyfill) ids are deterministic under replay" {
-    var buf_a: [64]u8 = undefined;
-    const kv_a = try openTempKv(testing.allocator, &buf_a);
-    defer {
-        kv_a.close();
-        cleanupTempKv(&buf_a);
-    }
-    var buf_b: [64]u8 = undefined;
-    const kv_b = try openTempKv(testing.allocator, &buf_b);
-    defer {
-        kv_b.close();
-        cleanupTempKv(&buf_b);
-    }
-
-    var d = try Dispatcher.init(testing.allocator);
-    defer d.deinit();
-
-    // Same request_id across two runs → same outbox ids returned.
-    var r1 = try runOne(&d, kv_a,
-        \\return webhook.send({ url: "https://x.test/" });
-    , .{ .method = "POST", .path = "/", .request_id = 42 });
-    defer r1.deinit(testing.allocator);
-
-    var r2 = try runOne(&d, kv_b,
-        \\return webhook.send({ url: "https://totally-different.example/" });
-    , .{ .method = "POST", .path = "/", .request_id = 42 });
-    defer r2.deinit(testing.allocator);
-
-    // Ids are derived from (request_id, call_index) only — the url
-    // doesn't factor in — so both handlers produce the same id.
-    try testing.expectEqualStrings(r1.body, r2.body);
+    const m2_raw = try readOwedMarker(kv, id2);
+    defer testing.allocator.free(m2_raw);
+    var p2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, m2_raw, .{});
+    defer p2.deinit();
+    const o2 = p2.value.object;
+    try testing.expectEqualStrings("https://example.test/b", o2.get("url").?.string);
+    try testing.expectEqualStrings("GET", o2.get("method").?.string);
 }
 
 test "dispatch: webhook.send rejects missing url" {
@@ -3930,7 +3719,7 @@ test "dispatch: webhook.send rejects missing url" {
     try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
 }
 
-test "dispatch: email.send wraps webhook.send (polyfill) with Resend shape" {
+test "dispatch: email.send wraps webhook.send (JS shim) with Resend shape" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -3941,8 +3730,7 @@ test "dispatch: email.send wraps webhook.send (polyfill) with Resend shape" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // email.send → webhook.send (JS polyfill) → http.send →
-    // `_send/owed/{id}`.
+    // email.send → webhook.send (JS shim) → kv.set + http.fetch.
     var resp = try runOne(
         &d,
         kv,
@@ -3959,28 +3747,29 @@ test "dispatch: email.send wraps webhook.send (polyfill) with Resend shape" {
         .{ .method = "POST", .path = "/", .request_id = 7 },
     );
     defer resp.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 64), resp.body.len); // id hex
 
-    var row = try expectOwed(kv, resp.body);
-    defer row.deinitOwned(testing.allocator);
+    const marker_raw = try readOwedMarker(kv, resp.body);
+    defer testing.allocator.free(marker_raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, marker_raw, .{});
+    defer parsed.deinit();
+    const row = parsed.value.object;
 
-    try testing.expectEqualStrings("https://api.resend.com/emails", row.url);
-    try testing.expectEqualStrings("POST", row.method);
+    try testing.expectEqualStrings("https://api.resend.com/emails", row.get("url").?.string);
+    try testing.expectEqualStrings("POST", row.get("method").?.string);
 
-    var headers = try std.json.parseFromSlice(std.json.Value, testing.allocator, row.headers_json, .{});
-    defer headers.deinit();
+    const headers_obj = row.get("headers").?.object;
     try testing.expectEqualStrings(
         "Bearer re_test_abc",
-        headers.value.object.get("Authorization").?.string,
+        headers_obj.get("Authorization").?.string,
     );
     try testing.expectEqualStrings(
         "application/json",
-        headers.value.object.get("Content-Type").?.string,
+        headers_obj.get("Content-Type").?.string,
     );
-    try testing.expectEqualStrings("signup/email_result", row.on_result_module);
+    try testing.expectEqualStrings("signup/email_result", row.get("on_result").?.string);
 
     // Body is a JSON string; parse to check shape.
-    var body_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, row.body, .{});
+    var body_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, row.get("body").?.string, .{});
     defer body_parsed.deinit();
     const body_obj = body_parsed.value.object;
     try testing.expectEqualStrings("noreply@loop46.me", body_obj.get("from").?.string);
@@ -5472,9 +5261,12 @@ test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
     );
     defer resp.deinit(testing.allocator);
 
-    var owed = try expectOwed(kv, resp.body);
-    defer owed.deinitOwned(testing.allocator);
-    var body = try std.json.parseFromSlice(std.json.Value, testing.allocator, owed.body, .{});
+    const marker_raw = try readOwedMarker(kv, resp.body);
+    defer testing.allocator.free(marker_raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, marker_raw, .{});
+    defer parsed.deinit();
+    const body_str = parsed.value.object.get("body").?.string;
+    var body = try std.json.parseFromSlice(std.json.Value, testing.allocator, body_str, .{});
     defer body.deinit();
 
     try testing.expectEqual(@as(usize, 2), body.value.object.get("to").?.array.items.len);
