@@ -207,104 +207,89 @@ pub const StreamWakes = struct {
     }
 };
 
-/// Gap 2.3 Phase A: a pending upstream-send activation awaiting
-/// handler dispatch on the local worker. Covers all three send-
-/// streaming activation variants (send_chunk, send_end,
-/// send_pipe_done) — discriminated by the `kind` tag. Entities
-/// live in the worker's `send_event_pending` collection (added in
-/// Phase D); the `dispatchSendEvents` system (Phase D/E) reads
-/// the tag + fires the right activation.
+/// One `http.fetch` upstream event awaiting handler dispatch on a
+/// local worker. Phase 5 PR-1 collapsed today's three-variant shape
+/// (`chunk` / `end` / `pipe_done`) into a single chunk-with-`final`
+/// shape: every event is a chunk; the LAST event in a fetch sets
+/// `final = true` and carries the terminal fields (status / ok /
+/// body_truncated). `on_done` and `pipe_to` retired in the same PR.
 ///
-/// The component shape mirrors `WakeEntry` / `SubscriptionFireDescriptor`
-/// — tag enum + flat fields per variant — to keep SoA storage
-/// cheap. Owned slices freed structurally on entity destroy via
-/// rove's component-deinit.
+/// One activation kind: `fetch_chunk`. For non-streaming fetches
+/// (`stream: false`) exactly one event fires (with `final: true`,
+/// up to `max_response_chunk_bytes` of body). For streaming
+/// (`stream: true`) one event per upstream writeback fires, last
+/// one with `final: true`. Transport errors / cap aborts / empty
+/// responses still fire one `final: true` event (with empty
+/// `bytes`) so the handler always gets a callback.
 ///
-/// Phase A defines the shape; Phase B carries the data through
-/// `_send/owed/<id>` v2; Phase C runs the libcurl writeback; Phase
-/// D wires the dispatch.
+/// `FetchPool` builds these on its libcurl thread; events route
+/// via `enqueueFetchEventForTenant` → the destination worker's
+/// `effect.MsgInbox`. The component shape mirrors `WakeEntry` /
+/// `SubscriptionFireDescriptor` — flat fields, SoA-friendly, owned
+/// slices freed structurally on entity destroy via rove's
+/// component-deinit.
 pub const UpstreamFetchEvent = struct {
-    kind: Kind = .chunk,
-
     /// The originating `http.fetch`-returned id, allocator-owned
-    /// when non-empty. Shared across all three variants so the
-    /// handler can correlate chunks with its terminal.
+    /// when non-empty. Shared across every event for one fetch so
+    /// the handler can correlate.
     fetch_id: []u8 = &.{},
 
-    /// Gap 2.3 Phase D: owning tenant's instance id. The worker
-    /// serves many tenants; this names which one's deployment the
-    /// `on_chunk` / `on_done` module resolves against. Carried
-    /// forward from `PendingFetch.tenant_id` by the `FetchPool`.
-    /// Allocator-owned.
+    /// Owning tenant's instance id. The worker serves many tenants;
+    /// this names which one's deployment the `on_chunk` module
+    /// resolves against. Carried forward from `PendingFetch
+    /// .tenant_id` by the `FetchPool`. Allocator-owned.
     tenant_id: []u8 = &.{},
 
     /// Chain ctx threaded forward from the originating `http.fetch`
     /// (the `ctx` blob passed to the call). Allocator-owned JSON.
-    /// Empty by default; the handler reads it as `request.ctx`
-    /// just like a `send_callback`.
+    /// Empty by default; the handler reads it as `request.ctx`.
     ctx_json: []u8 = &.{},
 
-    /// Gap 2.3 Phase D: module path of the `on_chunk` handler —
-    /// dispatched once per `kind == .chunk` event. Allocator-owned;
-    /// empty for Pattern B (`pipe_to`, no per-chunk handler).
-    /// Carried forward from `PendingFetch.on_chunk_module` by the
-    /// `FetchPool` so each event is self-describing — Phase D needs
-    /// no fetch_id → module registry.
+    /// Module path of the `on_chunk` handler — dispatched once per
+    /// event. Allocator-owned. The binding rejects a fetch with no
+    /// `on_chunk` (no fire-and-forget surface in PR-1; can be
+    /// re-added cleanly as `on_chunk: null` + capture-and-tape if
+    /// concrete demand appears).
     on_chunk_module: []u8 = &.{},
 
-    /// Gap 2.3 Phase D: module path of the terminal handler —
-    /// dispatched once on the `.end` / `.pipe_done` event.
-    /// Allocator-owned; empty when the customer set no `on_done`.
-    on_done_module: []u8 = &.{},
-
-    /// Gap 2.3 Phase E: true when the originating `http.fetch` set
-    /// `pipe_to: "held_response"` (Pattern B). The worker routes a
-    /// `pipe_to_held` event's bytes straight to the held client's
-    /// `StreamChunks` — no handler activation, so the bytes are
-    /// never taped ([[project_pipe_to_untaped]]). `on_chunk_module`
-    /// is empty in this mode (binding rejects on_chunk + pipe_to).
-    pipe_to_held: bool = false,
-
-    /// Gap 2.3 Phase E: correlation_id of the chain that called
-    /// `http.fetch({pipe_to})`. The held stream the bytes pipe into
-    /// is the entity whose `ChainContext.correlation_id` matches.
-    /// Allocator-owned; empty for Pattern A events.
-    pipe_correlation_id: []u8 = &.{},
-
-    // ── send_chunk variant ────────────────────────────────────
-    /// Per-send monotonic chunk index, 0-based. Surfaces as
+    /// 0-based chunk index. `seq == 0` is the first/only event;
+    /// streaming continuations are 1, 2, …. Surfaces as
     /// `request.activation.seq`.
     seq: u32 = 0,
     /// Cumulative bytes received BEFORE this chunk. Surfaces as
-    /// `request.activation.byte_offset`.
+    /// `request.activation.byteOffset`.
     byte_offset: u64 = 0,
     /// The chunk payload. Allocator-owned; surfaces as
     /// `request.activation.bytes` (Uint8Array view, runtime owns
-    /// the buffer; handler must copy if retaining).
+    /// the buffer; handler must copy if retaining). May be empty
+    /// on a transport-error / empty-body final event.
     bytes: []u8 = &.{},
-    /// On `kind == .chunk` AND `seq == 0` only: upstream response
-    /// headers in wire-format (`Key: Val\r\n` lines).
-    /// Allocator-owned when non-null. Null on later chunks so the
-    /// same header map isn't re-shipped per chunk.
+    /// On `seq == 0` only: parsed response-header object as a
+    /// JSON-encoded string `{"name":"value", …}`. Allocator-owned
+    /// when non-null. The binding decodes it back into a JS object
+    /// on `request.activation.headers`.
     fetch_headers: ?[]u8 = null,
 
-    // ── send_end / send_pipe_done variant ────────────────────
-    /// Terminal-only: final upstream status code.
+    /// True on the LAST event for this fetch (one event for non-
+    /// streaming; final streaming event otherwise). The terminal
+    /// fields below are valid only when `final == true`. Surfaces
+    /// as `request.activation.final`.
+    final: bool = false,
+    /// `final` only: upstream HTTP status (0 on transport error).
+    /// Surfaces as `request.activation.status`.
     terminal_status: u16 = 0,
-    /// Terminal-only: success flag (false on timeout / cancel /
-    /// upstream error).
+    /// `final` only: transport-only success flag (libcurl returned
+    /// cleanly AND any cap-based abort was deliberate, not an
+    /// error). `ok: true, status: 503` is "transport worked, server
+    /// said no" — the JS shim decides retry policy. Surfaces as
+    /// `request.activation.ok`.
     terminal_ok: bool = false,
-    /// `send_pipe_done` only: total bytes actually written to the
-    /// held client (after `StreamChunks` cap drops). Surfaces as
-    /// `request.activation.bytes_piped`.
-    pipe_bytes_piped: u64 = 0,
-    /// `send_pipe_done` only: count of chunks dropped from the
-    /// held client's `StreamChunks` queue. Surfaces as
-    /// `request.activation.dropped_chunks`. Mirrors the §9.4
-    /// write-pressure surface but scoped to the pipe.
-    pipe_dropped_chunks: u32 = 0,
-
-    pub const Kind = enum(u8) { chunk, end, pipe_done };
+    /// `final` only: true iff the response body exceeded the cap
+    /// (`max_response_chunk_bytes` when `stream: false`, or
+    /// `max_total_response_bytes` when `stream: true`) and the
+    /// runtime aborted the rest. Surfaces as
+    /// `request.activation.body_truncated`.
+    body_truncated: bool = false,
 
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
         for (items) |*item| deinitItem(item, allocator);
@@ -320,43 +305,10 @@ pub const UpstreamFetchEvent = struct {
         if (item.tenant_id.len > 0) allocator.free(item.tenant_id);
         if (item.ctx_json.len > 0) allocator.free(item.ctx_json);
         if (item.on_chunk_module.len > 0) allocator.free(item.on_chunk_module);
-        if (item.on_done_module.len > 0) allocator.free(item.on_done_module);
-        if (item.pipe_correlation_id.len > 0) allocator.free(item.pipe_correlation_id);
         if (item.bytes.len > 0) allocator.free(item.bytes);
         if (item.fetch_headers) |h| allocator.free(h);
         item.* = .{};
     }
-};
-
-/// Gap 2.3 Phase E: per-held-stream pipe-target state. Present on
-/// every stream entity (the StreamRow carries it), inert by
-/// default — only a stream that returned `__rove_stream` with a
-/// `fetch_pipe_done` `waitFor` flips `awaiting_pipe`.
-///
-/// `awaiting_pipe` keeps `serviceParkedStreams` from closing the
-/// stream after its initial chunks drain — the upstream `http.fetch`
-/// is still feeding `StreamChunks` from outside any handler run.
-/// `bytes_piped` accumulates as the pipe-routing system appends
-/// chunks. `done` + the terminal fields are set when the pipe's
-/// `.end` event arrives; `serviceParkedStreams` then fires the
-/// one `fetch_pipe_done` activation and the stream closes.
-///
-/// No owned slices — `deinit` is a no-op (kept for component
-/// uniformity).
-pub const PipeState = struct {
-    /// Stream is a `pipe_to` target; stay open until `done`.
-    awaiting_pipe: bool = false,
-    /// Cumulative bytes appended to `StreamChunks` from the pipe
-    /// (after §9.4 cap drops). Surfaces as
-    /// `request.activation.bytes_piped` on `fetch_pipe_done`.
-    bytes_piped: u64 = 0,
-    /// Upstream closed — the `.end` pipe event has been applied.
-    done: bool = false,
-    /// Terminal upstream state, valid once `done`.
-    terminal_ok: bool = false,
-    terminal_status: u16 = 0,
-
-    pub fn deinit(_: std.mem.Allocator, _: []PipeState) void {}
 };
 
 /// Gap 2.1 Phase E (refactored): a pending subscription-fire chain
@@ -851,16 +803,16 @@ test "UpstreamFetchEvent default-init + deinit is benign" {
     try testing.expectEqual(@as(usize, 0), items[0].bytes.len);
 }
 
-test "UpstreamFetchEvent.deinit frees chunk-variant slices" {
+test "UpstreamFetchEvent.deinit frees intermediate chunk slices" {
     const a = testing.allocator;
     var items = [_]UpstreamFetchEvent{.{
-        .kind = .chunk,
         .fetch_id = try a.dupe(u8, "send-abc-123"),
         .ctx_json = try a.dupe(u8, "{\"n\":3}"),
         .seq = 5,
         .byte_offset = 4096,
         .bytes = try a.dupe(u8, "data: hello\n\n"),
-        .fetch_headers = try a.dupe(u8, "Content-Type: text/event-stream\r\n"),
+        .fetch_headers = try a.dupe(u8, "{\"content-type\":\"text/event-stream\"}"),
+        .final = false,
     }};
     UpstreamFetchEvent.deinit(a, &items);
     try testing.expectEqual(@as(usize, 0), items[0].fetch_id.len);
@@ -868,28 +820,30 @@ test "UpstreamFetchEvent.deinit frees chunk-variant slices" {
     try testing.expectEqual(@as(?[]u8, null), items[0].fetch_headers);
 }
 
-test "UpstreamFetchEvent.deinit frees end-variant (no bytes/headers)" {
+test "UpstreamFetchEvent.deinit frees final-event slices" {
     const a = testing.allocator;
     var items = [_]UpstreamFetchEvent{.{
-        .kind = .end,
         .fetch_id = try a.dupe(u8, "send-abc-123"),
         .ctx_json = try a.dupe(u8, "{\"final\":true}"),
+        .seq = 1,
+        .byte_offset = 4096,
+        .final = true,
         .terminal_status = 200,
         .terminal_ok = true,
+        .body_truncated = false,
     }};
     UpstreamFetchEvent.deinit(a, &items);
     try testing.expectEqual(@as(usize, 0), items[0].fetch_id.len);
 }
 
-test "UpstreamFetchEvent.deinit frees pipe_done-variant" {
+test "UpstreamFetchEvent.deinit frees transport-error final event (empty bytes)" {
     const a = testing.allocator;
     var items = [_]UpstreamFetchEvent{.{
-        .kind = .pipe_done,
         .fetch_id = try a.dupe(u8, "send-xyz-789"),
-        .terminal_status = 200,
-        .terminal_ok = true,
-        .pipe_bytes_piped = 1_048_576,
-        .pipe_dropped_chunks = 3,
+        .seq = 0,
+        .final = true,
+        .terminal_status = 0,
+        .terminal_ok = false,
     }};
     UpstreamFetchEvent.deinit(a, &items);
     try testing.expectEqual(@as(usize, 0), items[0].fetch_id.len);

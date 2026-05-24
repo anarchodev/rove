@@ -101,24 +101,17 @@ pub const ActivationSource = enum(u8) {
     /// source: { kind:"cron"|"kv"|"boot", ... } }`. There's no
     /// held socket; `Response` is recorded but not transmitted.
     subscription_fire = 6,
-    /// `http.fetch` chunk activation (`docs/primitive-gaps.md` §2.3
-    /// + `docs/upstream-streaming-plan.md` §3). A handler opted
-    /// into per-chunk visibility via `http.fetch({on_chunk: ...})`
-    /// receives one of these per upstream chunk: `request.activation
-    /// = { kind: "fetch_chunk", fetch_id, seq, byte_offset, bytes,
-    /// fetch_headers? }`. The chain continues until `fetch_done`.
+    /// `http.fetch` event (`docs/primitive-gaps.md` §2.3 +
+    /// `docs/effect-reification-plan.md` Phase 5 PR-1). Single
+    /// activation kind covering both non-streaming (one event with
+    /// `final: true`) and streaming (`stream: true`, multiple events,
+    /// last one `final: true`). Activation shape: `{ kind:
+    /// "fetch_chunk", fetch_id, seq, byteOffset, bytes, headers? (seq=0),
+    /// final, status? (final), ok? (final), body_truncated? (final),
+    /// ctx }`. Phase 5 PR-1 collapsed the prior `fetch_done` (8) and
+    /// `fetch_pipe_done` (9) variants into this single tag along with
+    /// dropping `pipe_to` / `on_done`.
     fetch_chunk = 7,
-    /// Terminal of an `on_chunk` fetch. `request.activation =
-    /// { kind: "fetch_done", fetch_id, ok, status, trailers }`.
-    /// The body arrived as chunks; this carries the metadata + status.
-    fetch_done = 8,
-    /// Terminal of a `pipe_to: "held_response"` fetch. Handler is
-    /// NOT invoked per chunk; the runtime pipes upstream bytes
-    /// directly into the held client's `StreamChunks`. The
-    /// terminal fires once upstream closes: `request.activation =
-    /// { kind: "fetch_pipe_done", fetch_id, ok, status, bytes_piped,
-    /// dropped_chunks }`.
-    fetch_pipe_done = 9,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`

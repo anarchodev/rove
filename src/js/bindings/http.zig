@@ -14,10 +14,12 @@
 //!
 //!   http.fetch — transient, best-effort, fire-immediately. No
 //!     raft involvement; the fetch-pool thread issues libcurl as
-//!     soon as the binding accumulates it; no retry on crash.
-//!     Streaming response delivery via on_chunk (Pattern A) or
-//!     pipe_to (Pattern B). Right for "proxy this LLM token stream"
-//!     where double-fire = double-LLM-cost.
+//!     soon as the binding accumulates it; no retry on crash. One
+//!     callback (`on_chunk`); one knob (`stream: bool`) for
+//!     "give me only the first chunk" (default) vs. "deliver
+//!     every chunk as it arrives." Phase 5 PR-1 collapsed today's
+//!     three patterns (on_chunk / pipe_to / fire-and-forget +
+//!     on_done) into this single shape.
 //!
 //! The customer-facing APIs:
 //!
@@ -29,7 +31,8 @@
 //!
 //!   const fetch_id = http.fetch({
 //!     url, method?, headers?, body?, timeout_ms?,
-//!     on_chunk?, on_done?, pipe_to?, headers_passthrough?,
+//!     on_chunk,                                       // required
+//!     stream?,                                        // default false
 //!     max_response_chunk_bytes?, max_total_response_bytes?, ctx?,
 //!   });
 //!   http.cancelFetch({ id });
@@ -201,15 +204,6 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
     const tid_dup = try a.dupe(u8, state.instance_id);
     errdefer a.free(tid_dup);
 
-    // Gap 2.3 Phase E: a pipe_to fetch carries the issuing chain's
-    // correlation_id so the upstream bytes can be routed to the
-    // held stream entity later. Empty for Pattern A.
-    const pipe_corr_dup = if (row.pipe_to_held)
-        try a.dupe(u8, state.correlation_id)
-    else
-        try a.alloc(u8, 0);
-    errdefer a.free(pipe_corr_dup);
-
     try out.ensureUnusedCapacity(a, 1);
     out.appendAssumeCapacity(.{
         .tenant_id = tid_dup,
@@ -220,11 +214,8 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
         .body = row.body,
         .timeout_ms = row.timeout_ms,
         .on_chunk_module = row.on_chunk_module,
-        .on_done_module = row.on_done_module,
         .ctx_json = row.ctx_json,
-        .pipe_to_held = row.pipe_to_held,
-        .pipe_correlation_id = pipe_corr_dup,
-        .headers_passthrough = row.headers_passthrough,
+        .stream = row.stream,
         .max_response_chunk_bytes = row.max_response_chunk_bytes,
         .max_total_response_bytes = row.max_total_response_bytes,
     });
@@ -236,7 +227,6 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
     row.headers_json = &.{};
     row.body = &.{};
     row.on_chunk_module = &.{};
-    row.on_done_module = &.{};
     row.ctx_json = &.{};
 }
 
@@ -287,21 +277,19 @@ const BuiltFetch = struct {
     headers_json: []u8,
     body: []u8,
     timeout_ms: u32,
-    /// `on_chunk` module path. Empty when `pipe_to` is set OR the
-    /// caller opted into fire-and-forget (terminal-only via
-    /// `on_done`).
+    /// `on_chunk` module path. Required by `buildFetchRow` —
+    /// Phase 5 PR-1 dropped `on_done` and `pipe_to` so the
+    /// chunk callback is the only path. Allocator-owned.
     on_chunk_module: []u8,
-    /// `on_done` module path. Empty when fire-and-forget (no
-    /// terminal handler — the runtime still fires the terminal
-    /// activation against `on_chunk` if set, else drops it).
-    on_done_module: []u8,
     /// Threaded forward to each activation as `request.ctx`. JSON
     /// string; "null" when omitted.
     ctx_json: []u8,
-    /// True iff `pipe_to == "held_response"`. Mutually exclusive
-    /// with `on_chunk_module` (binding rejects both).
-    pipe_to_held: bool,
-    headers_passthrough: bool,
+    /// Phase 5 PR-1: `stream: false` (default) → fire exactly one
+    /// `on_chunk` event with `final: true` (up to
+    /// `max_response_chunk_bytes` of body; cap-overflow sets
+    /// `body_truncated`). `stream: true` → fire one event per
+    /// upstream writeback, last carrying `final: true`.
+    stream: bool,
     max_response_chunk_bytes: u32,
     max_total_response_bytes: u64,
 
@@ -312,15 +300,14 @@ const BuiltFetch = struct {
         allocator.free(self.headers_json);
         allocator.free(self.body);
         allocator.free(self.on_chunk_module);
-        allocator.free(self.on_done_module);
         allocator.free(self.ctx_json);
         self.* = undefined;
     }
 };
 
 /// Build + validate the fetch options object → owned `BuiltFetch`.
-/// Exclusivity: `on_chunk` and `pipe_to` may not both be set.
-/// `pipe_to` accepts only `"held_response"` in v1.
+/// `on_chunk` is required. `stream: bool` (default false) selects
+/// single-chunk vs streaming delivery.
 fn buildFetchRow(
     ctx: ?*c.JSContext,
     state: *globals.DispatchState,
@@ -337,32 +324,15 @@ fn buildFetchRow(
     fetched.headers_json = try dupeJsObjectAsJson(ctx, a, opts, "headers", "{}");
     fetched.ctx_json = try dupeJsObjectAsJson(ctx, a, opts, "ctx", "null");
     fetched.on_chunk_module = try dupeJsString(ctx, a, opts, "on_chunk", "");
-    fetched.on_done_module = try dupeJsString(ctx, a, opts, "on_done", "");
 
-    const pipe_to_held = blk: {
-        const v = c.JS_GetPropertyStr(ctx, opts, "pipe_to");
-        defer c.JS_FreeValue(ctx, v);
-        if (c.JS_IsUndefined(v) or c.JS_IsNull(v)) break :blk false;
-        if (!c.JS_IsString(v)) {
-            _ = c.JS_ThrowTypeError(ctx, "http.fetch: `pipe_to` must be a string or null");
-            return error.JsException;
-        }
-        var len: usize = 0;
-        const cstr = c.JS_ToCStringLen(ctx, &len, v);
-        if (cstr == null) return error.JsException;
-        defer c.JS_FreeCString(ctx, cstr);
-        const s = @as([*]const u8, @ptrCast(cstr))[0..len];
-        if (std.mem.eql(u8, s, "held_response")) break :blk true;
-        _ = c.JS_ThrowRangeError(ctx, "http.fetch: `pipe_to` must be \"held_response\" (only valid value in v1)");
-        return error.JsException;
-    };
-    if (pipe_to_held and fetched.on_chunk_module.?.len > 0) {
-        _ = c.JS_ThrowTypeError(ctx, "http.fetch: `on_chunk` and `pipe_to` are mutually exclusive");
+    if (fetched.on_chunk_module.?.len == 0) {
+        _ = c.JS_ThrowTypeError(ctx, "http.fetch: `on_chunk` (module path) is required");
         return error.JsException;
     }
-    const headers_passthrough = try getBoolField(ctx, opts, "headers_passthrough", false);
+
+    const stream = try getBoolField(ctx, opts, "stream", false);
     const timeout_ms_i32 = try getIntField(ctx, opts, "timeout_ms", 30_000);
-    const max_chunk_i32 = try getIntField(ctx, opts, "max_response_chunk_bytes", 64 * 1024);
+    const max_chunk_i32 = try getIntField(ctx, opts, "max_response_chunk_bytes", 256 * 1024);
     const max_total_i64 = try getInt64Field(ctx, opts, "max_total_response_bytes", 50 * 1024 * 1024);
 
     const row: BuiltFetch = .{
@@ -373,10 +343,8 @@ fn buildFetchRow(
         .body = fetched.body.?,
         .timeout_ms = @intCast(@max(timeout_ms_i32, 1)),
         .on_chunk_module = fetched.on_chunk_module.?,
-        .on_done_module = fetched.on_done_module.?,
         .ctx_json = fetched.ctx_json.?,
-        .pipe_to_held = pipe_to_held,
-        .headers_passthrough = headers_passthrough,
+        .stream = stream,
         .max_response_chunk_bytes = @intCast(@max(max_chunk_i32, 1)),
         .max_total_response_bytes = if (max_total_i64 < 1) 1 else @intCast(max_total_i64),
     };
@@ -392,7 +360,6 @@ const FetchExtracted = struct {
     body: ?[]u8 = null,
     ctx_json: ?[]u8 = null,
     on_chunk_module: ?[]u8 = null,
-    on_done_module: ?[]u8 = null,
 
     fn deinit(self: *FetchExtracted, a: std.mem.Allocator) void {
         if (self.id) |s| a.free(s);
@@ -402,7 +369,6 @@ const FetchExtracted = struct {
         if (self.body) |s| a.free(s);
         if (self.ctx_json) |s| a.free(s);
         if (self.on_chunk_module) |s| a.free(s);
-        if (self.on_done_module) |s| a.free(s);
     }
 };
 

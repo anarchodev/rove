@@ -14,9 +14,12 @@
 //!
 //! - 2B: cron / boot   → `SubscriptionFire`
 //! - 2C: kv-react      → `SubscriptionFire` (same variant, kv source)
-//! - 2D: fetch-chunk   → `FetchChunk` + `FetchDone` + `FetchPipeDone`
+//! - 2D: fetch-chunk   → `FetchChunk`
 //!                       (fetch-A bytes get taped here — closes the
-//!                       algebra §7 worklist #1 untaped-chunk bug)
+//!                       algebra §7 worklist #1 untaped-chunk bug;
+//!                       Phase 5 PR-1 collapsed FetchDone / FetchPipeDone
+//!                       into the single FetchChunk variant with a
+//!                       `final` flag carrying terminal info)
 //! - 2E: send-callback → `SendCallback`
 //! - 2F: inbound-HTTP  → `Inbound` (last; reference path)
 //!
@@ -129,26 +132,15 @@ pub const SubscriptionFire = struct {
     }
 };
 
-/// `http.fetch` Pattern A `on_chunk` activation (primitive-gaps §2.3).
-/// FetchPool libcurl → `enqueueFetchEventForTenant` → cross-thread
-/// `FetchChunkInbox` → `drainFetchChunkInbox` MOVES the event onto
-/// this variant (no re-dup) → `enqueueMsg` (tapes the chunk bytes
-/// via `TapePayloads.activation_bytes`, closes algebra §7 worklist
-/// #1) → dispatch fires `on_chunk` activation. The payload IS the
-/// existing `UpstreamFetchEvent` ("fat" struct over chunk / done /
-/// pipe_done — the redundant `.kind` field agrees with the Msg
-/// variant tag; Phase 5 cleanup may split the shape per variant).
+/// `http.fetch` `on_chunk` activation (primitive-gaps §2.3).
+/// FetchPool libcurl → `enqueueFetchEventForTenant` → MsgQueue →
+/// dispatch fires `on_chunk` activation. The chunk bytes get taped
+/// via `TapePayloads.activation_bytes` (closes algebra §7 worklist
+/// #1). Phase 5 PR-1 collapsed the prior `FetchDone` / `FetchPipeDone`
+/// terminal variants into this single tag: `UpstreamFetchEvent.final`
+/// is `true` on the last event for any fetch and carries the
+/// terminal `status` / `ok` / `body_truncated` fields.
 pub const FetchChunk = components_mod.UpstreamFetchEvent;
-
-/// Terminal of a Pattern-A `on_chunk` fetch. Same path + payload
-/// type as `FetchChunk`; the Msg variant tag discriminates.
-pub const FetchDone = components_mod.UpstreamFetchEvent;
-
-/// Terminal of a Pattern-B `pipe_to` fetch. Same payload type.
-/// `pipe_to` chunks have no per-chunk Msg (they bypass the handler
-/// by design, algebra §3 row "outbound HTTP — Pattern B"); only the
-/// terminal is a Msg.
-pub const FetchPipeDone = components_mod.UpstreamFetchEvent;
 
 /// The tagged union over the wire-stable activation tag. The tag IS
 /// `ActivationSource` so `@as(ActivationSource, msg)` is the
@@ -162,8 +154,6 @@ pub const Msg = union(ActivationSource) {
     wake_batch: WakeBatch,
     subscription_fire: SubscriptionFire,
     fetch_chunk: FetchChunk,
-    fetch_done: FetchDone,
-    fetch_pipe_done: FetchPipeDone,
 
     /// Project to the tape's wire-stable activation tag.
     pub fn kind(self: Msg) ActivationSource {
@@ -178,7 +168,11 @@ test "Msg.kind projects to ActivationSource tag" {
 
     const m2: Msg = .{ .fetch_chunk = .{} };
     try testing.expectEqual(ActivationSource.fetch_chunk, m2.kind());
-    try testing.expectEqual(components_mod.UpstreamFetchEvent.Kind.chunk, m2.fetch_chunk.kind);
+    // Phase 5 PR-1: UpstreamFetchEvent's `kind` enum collapsed; the
+    // single-event default is `final=false, seq=0` (a non-terminal
+    // first chunk).
+    try testing.expect(!m2.fetch_chunk.final);
+    try testing.expectEqual(@as(u32, 0), m2.fetch_chunk.seq);
 }
 
 test "Msg covers every ActivationSource variant exhaustively" {
@@ -210,8 +204,6 @@ test "Msg covers every ActivationSource variant exhaustively" {
             .wake_batch => .{ .wake_batch = .{} },
             .subscription_fire => .{ .subscription_fire = sf },
             .fetch_chunk => .{ .fetch_chunk = .{} },
-            .fetch_done => .{ .fetch_done = .{} },
-            .fetch_pipe_done => .{ .fetch_pipe_done = .{} },
         };
         try testing.expectEqual(tag, m.kind());
     }

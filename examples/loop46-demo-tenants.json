@@ -28,8 +28,6 @@
         {"path": "big_chunks/index.mjs", "source": "loop46-demo-tenants/acme/big_chunks/index.mjs"},
         {"path": "fetchchunks/index.mjs", "source": "loop46-demo-tenants/acme/fetchchunks/index.mjs"},
         {"path": "fetchchunk.mjs", "source": "loop46-demo-tenants/acme/fetchchunk.mjs"},
-        {"path": "fetchdone.mjs", "source": "loop46-demo-tenants/acme/fetchdone.mjs"},
-        {"path": "pipe/index.mjs", "source": "loop46-demo-tenants/acme/pipe/index.mjs"},
         {"path": "_subscriptions/sub-react/index.mjs", "source": "loop46-demo-tenants/acme/_subscriptions/sub-react/index.mjs"},
         {"path": "_subscriptions/sub-react/spec.json", "source": "loop46-demo-tenants/acme/_subscriptions/sub-react/spec.json", "content_type": "application/json"},
         {"path": "_subscriptions/migrate-v1/index.mjs", "source": "loop46-demo-tenants/acme/_subscriptions/migrate-v1/index.mjs"},

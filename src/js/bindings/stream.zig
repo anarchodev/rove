@@ -80,12 +80,6 @@ pub const Stream = struct {
     /// Author's `ctx`, JSON-serialized. Threaded forward to the next
     /// activation as `request.ctx`.
     ctx_json: []u8,
-    /// Gap 2.3 Phase E: the return carried `waitFor:{fetch_pipe_done}`
-    /// — this stream is the target of a `http.fetch({pipe_to})`.
-    /// Keeps `serviceParkedStreams` from closing it after the
-    /// initial chunks drain; the upstream pipe feeds it from
-    /// outside any handler run. No owned data — plain bool.
-    await_pipe_done: bool = false,
 
     pub fn deinit(self: *Stream, allocator: std.mem.Allocator) void {
         if (self.headers) |h| allocator.free(h);
@@ -214,7 +208,6 @@ pub fn tryExtract(
     // accumulated into `kv_prefixes`; at most one timer interval is
     // honored (last-wins).
     var interval_ms: ?i64 = null;
-    var await_pipe_done: bool = false;
     var prefixes_list: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer {
         for (prefixes_list.items) |p| allocator.free(p);
@@ -233,12 +226,12 @@ pub fn tryExtract(
                     const elt = c.JS_GetPropertyUint32(ctx, wf, i);
                     defer c.JS_FreeValue(ctx, elt);
                     if (c.JS_IsObject(elt)) {
-                        try parseWaitForCondition(allocator, ctx, elt, &interval_ms, &prefixes_list, &await_pipe_done);
+                        try parseWaitForCondition(allocator, ctx, elt, &interval_ms, &prefixes_list);
                     }
                 }
             }
         } else if (c.JS_IsObject(wf)) {
-            try parseWaitForCondition(allocator, ctx, wf, &interval_ms, &prefixes_list, &await_pipe_done);
+            try parseWaitForCondition(allocator, ctx, wf, &interval_ms, &prefixes_list);
         }
     }
     const kv_prefixes = try prefixes_list.toOwnedSlice(allocator);
@@ -269,7 +262,6 @@ pub fn tryExtract(
         .interval_ms = interval_ms,
         .kv_prefixes = kv_prefixes,
         .ctx_json = ctx_json,
-        .await_pipe_done = await_pipe_done,
     };
 }
 
@@ -285,19 +277,7 @@ fn parseWaitForCondition(
     obj: c.JSValue,
     interval_ms: *?i64,
     prefixes_list: *std.ArrayListUnmanaged([]u8),
-    await_pipe_done: *bool,
 ) error{OutOfMemory}!void {
-    {
-        // Gap 2.3 Phase E: `{ fetch_pipe_done: <anything> }` — the
-        // stream waits for an `http.fetch({pipe_to})` to close.
-        // The value ("auto", true, …) is unused; presence is the
-        // signal.
-        const fp = c.JS_GetPropertyStr(ctx, obj, "fetch_pipe_done");
-        defer c.JS_FreeValue(ctx, fp);
-        if (!c.JS_IsUndefined(fp) and !c.JS_IsNull(fp) and !c.JS_IsException(fp)) {
-            await_pipe_done.* = true;
-        }
-    }
     {
         const tv = c.JS_GetPropertyStr(ctx, obj, "timer");
         defer c.JS_FreeValue(ctx, tv);

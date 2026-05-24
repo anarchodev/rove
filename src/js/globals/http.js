@@ -77,27 +77,32 @@
     },
 
     /**
-     * Fire a transient streaming HTTP request. Unlike {@link http.send},
+     * Fire a transient HTTP request. Unlike {@link http.send},
      * `http.fetch` is non-durable + best-effort — it does NOT write
      * a raft row, does NOT retry on worker crash, and fires
-     * immediately (no commit gate). Right for proxying real-time
-     * upstream streams (LLM token streams, large file downloads)
-     * where double-fire is bad (cost / bandwidth) and durable
-     * retry is overkill.
+     * immediately (no commit gate). One callback (`on_chunk`); one
+     * knob (`stream`) for "first chunk only" (default) vs. "every
+     * chunk as it arrives."
      *
-     * Two patterns:
+     * Every fetch fires `on_chunk` AT LEAST once — even a 204 / a
+     * transport error / a cap-only failure produces one event with
+     * `final: true` and empty `bytes`. The customer always learns
+     * how the request ended.
      *
-     *  **Pattern A — per-chunk handler.** Set `on_chunk` to a module
-     *  path; each upstream chunk fires a `fetch_chunk` activation
-     *  there. `fetch_done` terminal fires on completion (against
-     *  `on_done` if set, else against `on_chunk`).
+     * Two modes:
      *
-     *  **Pattern B — transparent proxy.** Set `pipe_to: "held_response"`;
-     *  the runtime pipes upstream bytes directly into the calling
-     *  chain's held client (`__rove_stream`). `fetch_pipe_done`
-     *  terminal fires when upstream closes. No per-chunk handler.
+     *  **`stream: false` (default).** First writeback is captured
+     *  (up to `max_response_chunk_bytes`); any further bytes set
+     *  `body_truncated: true` and abort the rest of the transfer.
+     *  Exactly one `on_chunk` event fires (with `final: true`). The
+     *  right shape for webhooks, REST APIs, anything one-shot.
      *
-     * `on_chunk` and `pipe_to` are mutually exclusive.
+     *  **`stream: true`.** Each upstream writeback fires its own
+     *  `on_chunk` event AS IT ARRIVES, so an SSE drip / LLM-token
+     *  stream drives the handler in real time. The LAST event
+     *  carries `final: true` + terminal fields.
+     *  `max_total_response_bytes` is the hard cap; exceeding sets
+     *  `body_truncated: true` on the final event.
      *
      * @param {object} opts
      * @param {string} opts.url - Upstream URL.
@@ -105,40 +110,43 @@
      * @param {Object<string,string>} [opts.headers] - Request headers.
      * @param {string} [opts.body] - Request body.
      * @param {number} [opts.timeout_ms=30000] - Per-request timeout.
-     * @param {string} [opts.on_chunk] - Module path for `fetch_chunk`
-     *   activations (Pattern A).
-     * @param {string} [opts.on_done] - Module path for the terminal
-     *   `fetch_done` / `fetch_pipe_done` activation.
-     * @param {"held_response"} [opts.pipe_to] - Pattern B; pipe
-     *   upstream bytes directly to the held client.
-     * @param {boolean} [opts.headers_passthrough=false] - Pattern B;
-     *   mirror upstream response headers onto the held client's
-     *   response headers.
-     * @param {number} [opts.max_response_chunk_bytes=65536] - Per-chunk
-     *   cap; libcurl writebacks larger than this are split into
-     *   multiple `fetch_chunk` activations.
+     * @param {string} opts.on_chunk - Module path for the
+     *   `on_chunk` callback (REQUIRED). The activation shape is
+     *   `{ kind: "fetch_chunk", fetch_id, seq, byteOffset, bytes,
+     *   headers? (seq=0), final, status? (final), ok? (final),
+     *   body_truncated? (final), ctx }`.
+     * @param {boolean} [opts.stream=false] - false → one event
+     *   with `final: true` (default; first chunk only). true →
+     *   one event per upstream writeback, last one carries
+     *   `final: true`.
+     * @param {number} [opts.max_response_chunk_bytes=262144] - Cap
+     *   on the first/each chunk's body size. In single-chunk mode
+     *   ALSO bounds the total body (overflow → `body_truncated`).
      * @param {number} [opts.max_total_response_bytes=52428800] - Hard
-     *   cap; exceeding cancels the fetch + fires the terminal with
-     *   `ok: false`.
+     *   cap for `stream: true`. Exceeding sets `body_truncated:
+     *   true` on the final event.
      * @param {*} [opts.ctx] - Threaded forward to each activation as
      *   `request.ctx`.
      * @returns {string} The fetch id. Pass to {@link http.cancelFetch}.
      *
      * @example
-     * // Pattern A — transform LLM tokens, forward to held client.
+     * // Single-shot webhook with response body capture.
+     * http.fetch({
+     *   url: "https://hooks.example.com/x",
+     *   method: "POST",
+     *   body: JSON.stringify({ event: "order.paid", id }),
+     *   on_chunk: "onresult.mjs",   // sees { final:true, status, ok, bytes, headers }
+     * });
+     *
+     * @example
+     * // Streaming LLM tokens — handler forwards each chunk to its
+     * // held client (the calling chain is a __rove_stream).
      * http.fetch({
      *   url: "https://api.openai.com/v1/chat/completions",
      *   method: "POST",
      *   body: JSON.stringify({ model, messages, stream: true }),
      *   on_chunk: "transform.mjs",
-     *   on_done:  "finalize.mjs",
-     * });
-     * @example
-     * // Pattern B — transparent file proxy.
-     * http.fetch({
-     *   url: "https://cdn.example.com/big.mp4",
-     *   pipe_to: "held_response",
-     *   headers_passthrough: true,
+     *   stream: true,
      * });
      */
     fetch(opts) {
@@ -147,8 +155,9 @@
 
     /**
      * Cancel an in-flight `http.fetch`. No-op if the fetch already
-     * completed or was never issued. Pattern B (pipe_to) fetches
-     * still fire `fetch_pipe_done` with `ok: false` after cancel.
+     * completed or was never issued. The customer still gets one
+     * `on_chunk` event with `final: true, ok: false` after a
+     * successful cancel.
      *
      * @param {{id:string}} opts - The id `http.fetch` returned.
      * @returns {void}

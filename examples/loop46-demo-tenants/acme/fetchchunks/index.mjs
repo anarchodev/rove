@@ -1,12 +1,14 @@
-// Entry handler for the Gap 2.3 http.fetch (Pattern A) smokes.
+// Entry handler for the Gap 2.3 / Phase 5 PR-1 http.fetch smokes.
 //
 //   GET /fetchchunks?url=<upstream>[&timeout_ms=<n>]
 //
-// Issues an http.fetch against the upstream with a small
-// `max_response_chunk_bytes` so the response splits into several
-// `fetch_chunk` activations (routed to `fetchchunk.mjs`); the
-// terminal `fetch_done` routes to `fetchdone.mjs`. `ctx` is
-// threaded forward so the chunk handler can prove ctx round-trip.
+// Issues an http.fetch with stream:true so the response splits
+// into several `fetch_chunk` activations (all routed to the same
+// `fetchchunk.mjs` module — Phase 5 PR-1 collapsed the prior
+// `on_done` separate-terminal hook into a `final: true` flag on
+// the last `on_chunk` activation). A small `max_response_chunk_bytes`
+// forces the upstream body into several chunks; `ctx` is threaded
+// forward so the chunk handler can prove ctx round-trip.
 // `timeout_ms` is optional — the streaming smoke sets it short so
 // an infinite-drip upstream times out promptly. Returns the fetch
 // id as the response body.
@@ -30,7 +32,7 @@ export default function () {
         url: url,
         method: "GET",
         on_chunk: "fetchchunk",
-        on_done: "fetchdone",
+        stream: true,
         max_response_chunk_bytes: 64,
         ctx: { tag: "fetchsmoke" },
     };

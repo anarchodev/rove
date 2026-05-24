@@ -139,27 +139,19 @@ pub const PendingFetch = struct {
     headers_json: []u8,
     body: []u8,
     timeout_ms: u32,
-    /// Pattern A: module path for `fetch_chunk` activations.
-    /// Empty string when `pipe_to_held` is set or fire-and-forget
-    /// (terminal-only via `on_done_module`).
+    /// Module path for `fetch_chunk` activations. Phase 5 PR-1
+    /// made this required — the prior `on_done` separate-terminal
+    /// hook + `pipe_to` direct-route paths retired.
     on_chunk_module: []u8,
-    /// Module path for the terminal activation (`fetch_done` for
-    /// Pattern A; `fetch_pipe_done` for Pattern B). Empty when
-    /// fire-and-forget (terminal recorded on tape but not
-    /// dispatched).
-    on_done_module: []u8,
     /// Threaded forward to each activation as `request.ctx`. JSON
     /// string; "null" when omitted.
     ctx_json: []u8,
-    /// True iff `pipe_to: "held_response"`. Pattern B; mutually
-    /// exclusive with `on_chunk_module` (binding rejects both).
-    pipe_to_held: bool,
-    /// Gap 2.3 Phase E: correlation_id of the chain that issued
-    /// this fetch. Set only when `pipe_to_held` — names the held
-    /// stream the upstream bytes pipe into (the entity whose
-    /// `ChainContext.correlation_id` matches). Empty otherwise.
-    pipe_correlation_id: []u8,
-    headers_passthrough: bool,
+    /// Phase 5 PR-1: `stream: false` (default) emits exactly one
+    /// `fetch_chunk` event (with `final: true`, up to
+    /// `max_response_chunk_bytes` of body; cap-overflow sets
+    /// `body_truncated`). `stream: true` emits one event per
+    /// upstream writeback (last carrying `final: true`).
+    stream: bool,
     max_response_chunk_bytes: u32,
     max_total_response_bytes: u64,
 
@@ -171,9 +163,7 @@ pub const PendingFetch = struct {
         allocator.free(self.headers_json);
         allocator.free(self.body);
         allocator.free(self.on_chunk_module);
-        allocator.free(self.on_done_module);
         allocator.free(self.ctx_json);
-        allocator.free(self.pipe_correlation_id);
         self.* = undefined;
     }
 };
@@ -1758,12 +1748,9 @@ pub fn installRequest(
         .kv_wake => "kv",
         .wake_batch => "wake_batch",
         .subscription_fire => "subscription_fire",
-        // Gap 2.3 phases D/E wire the payload fields onto
-        // `request.activation`; Phase A surfaces just the kind
-        // string so the enum is exhaustive + the build stays clean.
+        // Phase 5 PR-1: single fetch activation kind; `final` flag
+        // distinguishes streaming intermediates from the terminal.
         .fetch_chunk => "fetch_chunk",
-        .fetch_done => "fetch_done",
-        .fetch_pipe_done => "fetch_pipe_done",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation_source == .kv_wake) {
@@ -1856,68 +1843,50 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "source", source_obj);
     }
 
-    // Gap 2.3 Phase D `http.fetch` payload. `fetch_id` correlates
-    // every activation of one fetch. `.fetch_chunk` carries the
-    // chunk payload (`seq` / `byteOffset` / `bytes` Uint8Array,
-    // plus `headers` on seq 0); `.fetch_done` / `.fetch_pipe_done`
-    // carry the terminal `ok` + `status`.
-    if (request.activation_source == .fetch_chunk or
-        request.activation_source == .fetch_done or
-        request.activation_source == .fetch_pipe_done)
-    {
+    // Phase 5 PR-1: single `fetch_chunk` activation kind. Every
+    // event carries `fetch_id` / `seq` / `byteOffset` / `bytes`
+    // (+ `headers` on seq 0). The LAST event for a fetch has
+    // `final: true` and carries the terminal fields (`status`,
+    // `ok`, `body_truncated`); intermediates have `final: false`
+    // and only the per-chunk fields.
+    if (request.activation_source == .fetch_chunk) {
         if (request.activation_fetch_id) |fid| {
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetch_id", c.JS_NewStringLen(ctx, fid.ptr, fid.len));
         }
-        if (request.activation_source == .fetch_chunk) {
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_seq)));
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_byte_offset)));
-            // `bytes`: a fresh Uint8Array copy — the handler owns
-            // it outright, no lifetime coupling to the event.
-            _ = c.JS_SetPropertyStr(
-                ctx,
-                activation_obj,
-                "bytes",
-                c.JS_NewUint8ArrayCopy(ctx, request.activation_fetch_bytes.ptr, request.activation_fetch_bytes.len),
-            );
-            // `headers` (seq 0 only): parse the `Key: Val\r\n`
-            // wire blob into a plain object.
-            if (request.activation_fetch_headers) |hblob| {
-                const hdr_obj = c.JS_NewObject(ctx);
-                var line_it = std.mem.splitSequence(u8, hblob, "\r\n");
-                while (line_it.next()) |line| {
-                    if (line.len == 0) continue;
-                    const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-                    const name = std.mem.trim(u8, line[0..colon], " ");
-                    const value = std.mem.trim(u8, line[colon + 1 ..], " ");
-                    if (name.len == 0) continue;
-                    // Header names need a NUL-terminated C string
-                    // for JS_SetPropertyStr's key. Stack buffer —
-                    // HTTP header names never approach 256 bytes.
-                    var name_buf: [256]u8 = undefined;
-                    if (name.len >= name_buf.len) continue;
-                    @memcpy(name_buf[0..name.len], name);
-                    name_buf[name.len] = 0;
-                    _ = c.JS_SetPropertyStr(ctx, hdr_obj, &name_buf, c.JS_NewStringLen(ctx, value.ptr, value.len));
-                }
-                _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", hdr_obj);
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_seq)));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_byte_offset)));
+        // `bytes`: a fresh Uint8Array copy — the handler owns it
+        // outright, no lifetime coupling to the event. May be empty
+        // on a transport-error / empty-body final event.
+        _ = c.JS_SetPropertyStr(
+            ctx,
+            activation_obj,
+            "bytes",
+            c.JS_NewUint8ArrayCopy(ctx, request.activation_fetch_bytes.ptr, request.activation_fetch_bytes.len),
+        );
+        // `headers` (seq 0 only): the activation carries the
+        // PARSED headers as a JSON-encoded `{"name":"value", ...}`
+        // string — decode back into a JS object here so the
+        // handler sees a plain map. The FetchPool side handles
+        // the wire-format parse + last-wins for repeated headers.
+        if (request.activation_fetch_headers) |hjson| {
+            const hdr_val = c.JS_ParseJSON(ctx, hjson.ptr, hjson.len, "<fetch headers>");
+            if (c.JS_IsException(hdr_val)) {
+                _ = c.JS_GetException(ctx); // clear; fall through with empty headers
+                _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", c.JS_NewObject(ctx));
+            } else {
+                _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", hdr_val);
             }
-        } else {
-            // `c.JS_NewBool`'s cimport-translated body is itself
-            // non-compilable (translate-c bug — `int != 0` lands
-            // in an i32 field); use the module's prebuilt
-            // bool JSValue constants instead.
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (request.activation_fetch_terminal_ok) js_true else js_false);
+        }
+        // `final` + terminal fields. `JS_NewBool`'s cimport-translated
+        // body is itself non-compilable (translate-c bug — `int != 0`
+        // lands in an i32 field); use the module's prebuilt bool
+        // JSValue constants instead.
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "final", if (request.activation_fetch_final) js_true else js_false);
+        if (request.activation_fetch_final) {
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_terminal_status)));
-            // `fetch_pipe_done` (Pattern B terminal) also carries
-            // the pipe's byte accounting: `bytes_piped` (total
-            // appended to the held client after §9.4 cap drops)
-            // and `dropped_chunks` (cap-overflow drops, reusing
-            // the write-pressure counter the resume already
-            // snapshotted).
-            if (request.activation_source == .fetch_pipe_done) {
-                _ = c.JS_SetPropertyStr(ctx, activation_obj, "bytes_piped", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_bytes_piped)));
-                _ = c.JS_SetPropertyStr(ctx, activation_obj, "dropped_chunks", c.JS_NewInt64(ctx, @intCast(request.activation_write_pressure_dropped)));
-            }
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (request.activation_fetch_terminal_ok) js_true else js_false);
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "body_truncated", if (request.activation_fetch_body_truncated) js_true else js_false);
         }
     }
 

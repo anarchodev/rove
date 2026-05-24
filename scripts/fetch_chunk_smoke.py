@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-"""End-to-end smoke for Gap 2.3 Phase D — http.fetch Pattern A
-(per-chunk `on_chunk` activations + a terminal `fetch_done`).
+"""End-to-end smoke for Gap 2.3 / effect-reification Phase 5 PR-1 —
+single-callback `http.fetch` with `stream: true` (per-chunk
+`on_chunk` activations; terminal carried by `final: true` on the
+LAST `on_chunk` event).
 
 The whole pipeline, end to end:
 
   client ──GET /fetchchunks?url=<wb/bulk>──▶ acme entry handler
-     entry: http.fetch({url, on_chunk, on_done, max_response_chunk_bytes:64})
-        → C1 accumulates the PendingFetch, flushes to NodeState.fetch_pending
+     entry: http.fetch({url, on_chunk, stream:true, max_response_chunk_bytes:64})
+        → accumulates the PendingFetch, flushes to NodeState.fetch_pending
         → returns the fetch id immediately (200, body = id)
-     FetchPool (C2): a pool thread drains fetch_pending, libcurl GETs
-        wb/bulk (170-byte body), re-chunks to 64 bytes → 3 chunks,
-        hash-routes 3 UpstreamFetchEvent{.chunk} + 1 {.end} to the
-        acme-owning worker's fetch_chunk_inbox
-     worker tick (D): serviceFetchEvents drains the inbox into the
-        fetch_event_pending collection, dispatchFetchEvents fires
-        fetchchunk.mjs once per chunk + fetchdone.mjs once
+     FetchPool: a pool thread drains fetch_pending, libcurl GETs
+        wb/bulk (170-byte body), re-chunks to 64 bytes → 3 body
+        events + 1 final-empty event (4 total), hash-routes them
+        to the acme-owning worker's msg inbox
+     worker tick: serviceFetchEvents drains the inbox into MsgQueue;
+        dispatchPendingMsgs fires fetchchunk.mjs once per event;
+        the final event has `final: true` + terminal status/ok.
 
-  Each on_chunk activation writes `fetch/chunk/<seq>`; on_done writes
-  `fetch/done`. The smoke reads them back via acme's /readkey and
-  asserts: 3 chunks in seq order, byte-exact reconstruction of the
-  upstream body, headers on seq 0 only, ctx round-trip, and a clean
-  `fetch_done` terminal (ok=true, status=200).
+  Each non-final activation writes `fetch/chunk/<seq>`; the final
+  activation writes `fetch/done`. The smoke reads them back via
+  acme's /readkey and asserts: 3 body chunks in seq order,
+  byte-exact reconstruction of the upstream body, parsed headers
+  on seq 0 only (object, not wire format), ctx round-trip, and a
+  clean terminal (ok=true, status=200, body_truncated=false).
 
 Single-worker scope: one worker per node so the fetch's hash-routed
 chunk events and the entry request land on the same worker.
@@ -117,12 +120,14 @@ def main() -> int:
         if done is None:
             sys.exit("FAIL fetch_done never landed (chain did not complete)")
         if done.get("ok") is not True or done.get("status") != 200:
-            sys.exit(f"FAIL fetch_done bad terminal: {done!r}")
+            sys.exit(f"FAIL fetch terminal bad: {done!r}")
         if done.get("fetch_id") != fetch_id:
             sys.exit(
-                f"FAIL fetch_done.fetch_id={done.get('fetch_id')!r} != issued id {fetch_id!r}"
+                f"FAIL fetch terminal fetch_id={done.get('fetch_id')!r} != issued id {fetch_id!r}"
             )
-        print(f"ok  fetch_done fired: ok={done['ok']} status={done['status']}")
+        if done.get("body_truncated") is True:
+            sys.exit(f"FAIL fetch terminal body_truncated=true (expected false): {done!r}")
+        print(f"ok  final event fired: ok={done['ok']} status={done['status']} body_truncated={done['body_truncated']}")
 
         # 5. Read back every chunk marker. 170 bytes / 64-byte cap =
         #    3 chunks (64, 64, 42).
@@ -177,9 +182,10 @@ def main() -> int:
 
     print()
     print(
-        "fetch-chunk smoke passed (Gap 2.3 Phase D: http.fetch Pattern A — "
-        "FetchPool libcurl → hash-routed chunk inbox → fetch_event_pending "
-        "collection → on_chunk/on_done activations)"
+        "fetch-chunk smoke passed (effect-reification Phase 5 PR-1: "
+        "single-callback http.fetch with stream:true — FetchPool libcurl "
+        "→ MsgQueue → unified on_chunk activations carrying `final` "
+        "+ terminal fields on the last event)"
     )
     return 0
 

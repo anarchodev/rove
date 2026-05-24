@@ -56,9 +56,7 @@ const Msg = msg_mod.Msg;
 pub fn freeOwnedMsg(allocator: std.mem.Allocator, msg: *Msg) void {
     switch (msg.*) {
         .subscription_fire => |*sf| sf.deinit(allocator),
-        .fetch_chunk, .fetch_done, .fetch_pipe_done => |*ev| {
-            components_mod.UpstreamFetchEvent.deinitItem(ev, allocator);
-        },
+        .fetch_chunk => |*ev| components_mod.UpstreamFetchEvent.deinitItem(ev, allocator),
         // No-owned-bytes variants. Phase 2E declares an Inbound
         // payload as a placeholder; dispatch for inbound stays
         // entity-driven through H2 (Phase 3's reconciler scope),

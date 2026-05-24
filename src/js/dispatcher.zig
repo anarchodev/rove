@@ -274,31 +274,39 @@ pub const Request = struct {
     activation_subscription_kv_key: ?[]const u8 = null,
     activation_subscription_kv_op: u8 = 0,
     activation_subscription_boot_deployment_id: u64 = 0,
-    /// Gap 2.3 Phase D `http.fetch` activation payload. Set when
-    /// `activation_source` is `.fetch_chunk` / `.fetch_done` /
-    /// `.fetch_pipe_done`. `fetch_id` correlates every activation
-    /// of one fetch; surfaces as `request.activation.fetch_id`.
-    /// Borrowed slices — caller (`fireFetchEventActivation`) owns
-    /// the bytes for the duration of the dispatch.
+    /// Gap 2.3 / Phase 5 PR-1 `http.fetch` activation payload. Set
+    /// when `activation_source == .fetch_chunk`. `fetch_id`
+    /// correlates every activation of one fetch; surfaces as
+    /// `request.activation.fetch_id`. Borrowed slices — caller
+    /// (`fireFetchEventActivation`) owns the bytes for the duration
+    /// of the dispatch.
     activation_fetch_id: ?[]const u8 = null,
-    /// `.fetch_chunk` only: 0-based chunk index + cumulative bytes
-    /// before this chunk + the chunk payload (surfaces as
-    /// `request.activation.bytes`, a Uint8Array). `fetch_headers`
-    /// is the upstream response headers in `Key: Val\r\n` wire
-    /// format, present on `seq == 0` only.
+    /// 0-based chunk index + cumulative bytes before this chunk +
+    /// the chunk payload (surfaces as `request.activation.bytes`,
+    /// a Uint8Array). `fetch_headers` is the parsed upstream
+    /// response headers (JSON-encoded `{"name":"value", ...}`),
+    /// present on `seq == 0` only.
     activation_fetch_seq: u32 = 0,
     activation_fetch_byte_offset: u64 = 0,
     activation_fetch_bytes: []const u8 = &.{},
     activation_fetch_headers: ?[]const u8 = null,
-    /// `.fetch_done` / `.fetch_pipe_done` only: upstream final
-    /// status + success flag. `ok == false` on timeout / cancel /
-    /// transport error / upstream non-2xx.
+    /// True on the last activation for this fetch. Surfaces as
+    /// `request.activation.final`. When true the terminal fields
+    /// below are valid.
+    activation_fetch_final: bool = false,
+    /// `final` only: upstream HTTP status (0 on transport error).
     activation_fetch_terminal_status: u16 = 0,
+    /// `final` only: transport-only success flag. `ok: true,
+    /// status: 503` is "transport worked, server said no"; `ok:
+    /// false` is libcurl-level failure (timeout / DNS / TLS /
+    /// cancel). The JS layer interprets — not the runtime.
     activation_fetch_terminal_ok: bool = false,
-    /// `.fetch_pipe_done` only: total bytes the pipe wrote into
-    /// the held client's `StreamChunks` (after §9.4 cap drops).
-    /// Surfaces as `request.activation.bytes_piped`.
-    activation_fetch_bytes_piped: u64 = 0,
+    /// `final` only: true if upstream sent more body than the cap
+    /// (`max_response_chunk_bytes` for `stream: false`,
+    /// `max_total_response_bytes` for `stream: true`) and the
+    /// runtime aborted the rest. Surfaces as
+    /// `request.activation.body_truncated`.
+    activation_fetch_body_truncated: bool = false,
 };
 
 /// One `(name, value)` pair extracted from the handler's

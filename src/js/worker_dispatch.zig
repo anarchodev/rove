@@ -180,11 +180,6 @@ pub const StreamFirstHopMeta = struct {
     correlation_id: ?[]u8 = null,
     /// Deployment id the chain is bound to.
     deployment_id: u64 = 0,
-    /// Gap 2.3 Phase E: the `__rove_stream` return carried
-    /// `waitFor:{fetch_pipe_done}` — this stream is an
-    /// `http.fetch({pipe_to})` target. Sets `PipeState.awaiting_pipe`
-    /// so `serviceParkedStreams` keeps it open until the pipe closes.
-    await_pipe_done: bool = false,
 
     pub fn deinit(self: *StreamFirstHopMeta, allocator: std.mem.Allocator) void {
         for (self.chunks) |c| allocator.free(c);
@@ -387,7 +382,6 @@ fn streamParkIfAny(
         meta.chunks,
         meta.kv_prefixes,
         meta.interval_ms,
-        meta.await_pipe_done,
     );
     meta.deinit(worker.allocator);
     // Move into the streaming pipeline. h2's `consumeStreamResponses`
@@ -438,7 +432,6 @@ fn streamRecordIfAnyAt(
         meta_opt.chunks,
         meta_opt.kv_prefixes,
         meta_opt.interval_ms,
-        meta_opt.await_pipe_done,
     );
     meta_opt.deinit(allocator);
 }
@@ -2453,7 +2446,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     .ctx_json = s.ctx_json,
                     .module_path = mp_dup,
                     .kv_prefixes = s.kv_prefixes,
-                    .await_pipe_done = s.await_pipe_done,
                 };
                 s.chunks = &.{};
                 s.ctx_json = &.{};

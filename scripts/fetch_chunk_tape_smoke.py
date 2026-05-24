@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-"""Effect-reification Phase 2D — fetch-A activation-bytes tape capture.
+"""Effect-reification Phase 2D / Phase 5 PR-1 — fetch
+activation-bytes tape capture.
 
 Algebra worklist #1 (`docs/effect-algebra.md` §7): `fireFetchEventActivation`
 historically passed empty `TapePayloads` to `captureLogWithId`, so a
-fetch-Pattern-A handler reading `request.activation.bytes` (the upstream
-chunk) had no record of the input it saw — replay couldn't reconstitute
-the same handler invocation. Phase 2D's tape hook fills
+fetch handler reading `request.activation.bytes` (the upstream chunk)
+had no record of the input it saw — replay couldn't reconstitute the
+same handler invocation. Phase 2D's tape hook fills
 `TapePayloads.activation_bytes` for `fetch_chunk` activations; the
 flush writer emits it as `activation_bytes_b64` on each log record.
 
-This smoke proves the capture end-to-end. Drives the same
-/fetchchunks handler as `fetch_chunk_smoke.py` (3 chunks of the
-170-byte wb/bulk body) and then queries log-server for the captured
-records. Asserts:
+Phase 5 PR-1 collapsed the prior `fetch_done` activation into a
+single `fetch_chunk` activation with `final: true`. The fetch chain
+now produces N body events + 1 final-empty event (all routed to the
+same `on_chunk` module). This smoke updates accordingly:
 
-1. Each `fetch_chunk` log record carries a non-null `activation_bytes_b64`.
-2. The base64-decoded bytes reconstruct the upstream body byte-exactly
-   when concatenated in seq order.
-3. The terminal `fetch_done` record has empty / null `activation_bytes_b64`
-   (no chunk bytes on a terminal — only the chunk variant carries them).
+1. The first N `fetchchunk` records carry the body chunks; each has
+   non-empty `activation_bytes_b64`.
+2. Concat'd in record order they reconstruct the upstream body
+   byte-exactly.
+3. The (N+1)-th `fetchchunk` record is the final-empty event; its
+   `activation_bytes_b64` is empty/null (an empty Uint8Array; the
+   `final: true` flag is what carries terminal info).
 
 This is the precondition for replay-equivalence of fetch chains.
 Full replay-equivalence (run the chain twice and compare writesets)
@@ -116,9 +119,10 @@ def main() -> int:
 
         jwt = mint_jwt(c.services_jwt_secret, {"exp": int(time.time() * 1000) + 5 * 60 * 1000})
 
-        # Poll log-server for the chunk + done records. Each
-        # activation produces one log record with the matching
-        # ActivationSource tag.
+        # Poll log-server for fetch records. Post-PR-1 every fetch
+        # event (body chunks + final-empty) fires `fetchchunk.mjs`
+        # — expect N+1 records (3 body + 1 final-empty for the
+        # 170-byte body @ 64 B/chunk).
         records = []
         deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
@@ -128,12 +132,8 @@ def main() -> int:
             except json.JSONDecodeError:
                 d = {}
             records = d.get("records", [])
-            # The summary endpoint doesn't include `activation`; filter
-            # by path. The fetch chain dispatches `fetchchunk.mjs` per
-            # chunk and `fetchdone.mjs` on terminal.
             chunk_recs = [r for r in records if r.get("path") == "fetchchunk"]
-            done_recs = [r for r in records if r.get("path") == "fetchdone"]
-            if len(chunk_recs) >= 3 and len(done_recs) >= 1:
+            if len(chunk_recs) >= 4:
                 break
             time.sleep(0.5)
         else:
@@ -150,31 +150,34 @@ def main() -> int:
             (r for r in records if r.get("path") == "fetchchunk"),
             key=lambda r: r["request_id"],
         )
-        done_recs = [r for r in records if r.get("path") == "fetchdone"]
-        print(f"ok  surfaced {len(chunk_recs)} fetchchunk + {len(done_recs)} fetchdone records")
+        print(f"ok  surfaced {len(chunk_recs)} fetchchunk records (3 body + 1 final-empty expected)")
 
-        # Fetch the full record for each chunk + the terminal. The
-        # `list` endpoint returns summaries; the `show` endpoint
-        # carries the tape fields.
-        full_chunks = []
-        for r in chunk_recs[:3]:
+        # Fetch the full record for each event. The `list` endpoint
+        # returns summaries; the `show` endpoint carries the tape
+        # fields.
+        full_records = []
+        for r in chunk_recs[:4]:
             show = _ls(jwt, f"{c.log_url()}/v1/{ACME_ID}/show/{r['request_id']}")
             rec = json.loads(show)["record"]
-            full_chunks.append(rec)
+            full_records.append(rec)
 
-        # Phase 2D primary assertion: each fetch_chunk record has
-        # non-null activation_bytes_b64.
+        # Phase 2D primary assertion (PR-1 update): the FIRST N
+        # records are body events with non-empty activation_bytes;
+        # the LAST one is the final-empty event with empty bytes.
+        body_records = full_records[:3]
+        final_record = full_records[3]
+
         captured_blobs = []
-        for i, rec in enumerate(full_chunks):
+        for i, rec in enumerate(body_records):
             tapes = rec.get("tapes", {})
             b64 = tapes.get("activation_bytes_b64")
             if not b64:
                 sys.exit(
-                    f"FAIL fetch_chunk record {i} (request_id={rec['request_id']}) "
+                    f"FAIL body fetch_chunk record {i} (request_id={rec['request_id']}) "
                     f"missing activation_bytes_b64. tapes keys={list(tapes.keys())}"
                 )
             captured_blobs.append(base64.b64decode(b64))
-        print("ok  every fetch_chunk record carries activation_bytes_b64")
+        print("ok  every body fetch_chunk record carries activation_bytes_b64")
 
         # Byte-exact reconstruction: concat in record-order = upstream
         # body. The records are ordered by request_id which monotonic-
@@ -189,22 +192,27 @@ def main() -> int:
         print(f"ok  {len(reconstructed)} bytes reconstructed from "
               f"activation_bytes tape — byte-exact match to upstream body")
 
-        # Terminal record carries no activation_bytes (terminals have
-        # no input chunk; only chunk variants do).
-        for done in done_recs[:1]:
-            show = _ls(jwt, f"{c.log_url()}/v1/{ACME_ID}/show/{done['request_id']}")
-            rec = json.loads(show)["record"]
-            tapes = rec.get("tapes", {})
-            b64 = tapes.get("activation_bytes_b64")
-            if b64:
+        # The final-empty event has empty bytes (the `final: true`
+        # flag carries the terminal info; the bytes Uint8Array is
+        # zero-length).
+        tapes = final_record.get("tapes", {})
+        b64 = tapes.get("activation_bytes_b64")
+        if b64:
+            # base64 of empty bytes is "" or absent; some encoders
+            # emit "" → both null and "" are acceptable.
+            decoded = base64.b64decode(b64)
+            if len(decoded) != 0:
                 sys.exit(
-                    f"FAIL fetch_done record (request_id={rec['request_id']}) "
-                    f"unexpectedly carries activation_bytes_b64={b64!r}"
+                    f"FAIL final-empty fetch_chunk record carries "
+                    f"non-empty activation_bytes (len={len(decoded)})"
                 )
-        print("ok  fetch_done record has null activation_bytes_b64 (correct — no chunk on terminal)")
+        print("ok  final-empty fetch_chunk record has empty activation_bytes "
+              "(correct — final: true carries terminal info, no body)")
 
-        print("\nPhase 2D tape capture smoke passed (algebra §7 worklist #1 closed: "
-              "fetch-A chunk bytes are now taped and replay-reconstructable).")
+        print("\nPhase 2D / Phase 5 PR-1 tape capture smoke passed "
+              "(algebra §7 worklist #1 closed: fetch chunk bytes are "
+              "taped + replay-reconstructable; the unified `fetch_chunk` "
+              "activation tag carries body events + final-empty.)")
         return 0
 
 
