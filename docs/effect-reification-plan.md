@@ -691,7 +691,7 @@ write hot path).
 **Rollback:** PR-1 is a single commit; revert restores `pipe_to` +
 `on_done` + `headers_passthrough` byte-identically.
 
-#### Phase 5 — PR-2a (shipped 2026-05-23, `051fec3`): lift `__rove_next` from fetch on_chunk handlers
+#### Phase 5 — PR-2a (shipped 2026-05-23, `fa5079c`): lift `__rove_next` from fetch on_chunk handlers
 
 `fireFetchEventActivation`'s `.continuation` arm previously
 warn-and-dropped; PR-2a lifts it to enqueue a `SendCallback` Msg
@@ -704,7 +704,7 @@ on writes). Customer-facing surface: `request.activation.kind ===
 Smoke: `scripts/chained_dispatch_smoke.py` plus three demo
 handlers (`chainfetch/`, `chainfetchstep1.mjs`, `chainresult.mjs`).
 
-#### Phase 5 — PR-2b (shipped 2026-05-23, `1ed9c5c`): `__system/` module resolution
+#### Phase 5 — PR-2b (shipped 2026-05-23, `ab1801b`): `__system/` module resolution
 
 Built-in handler modules — the `__system/` namespace. Sources
 under `src/js/builtin_modules/*.mjs` are `@embedFile`'d via
@@ -815,7 +815,7 @@ outbound-HTTP runtime.
 
 **Cold-start for PR-3** (next session):
 1. Read [[project_durability_as_js_shim]] (the decision context).
-2. Read the PR-2b commit message (`1ed9c5c`) — explains why
+2. Read the PR-2b commit message (`ab1801b`) — explains why
    `webhook_onresult.mjs` is baked-but-unused today.
 3. Re-read the design walk in this session's chat history for the
    activation-shape and ctx-threading conventions PR-2a locked.
