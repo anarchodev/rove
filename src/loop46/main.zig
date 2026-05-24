@@ -444,6 +444,16 @@ fn workerMain(args: *WorkerCtx) !void {
         if (args.worker_idx == 0 and !worker.was_leader and is_leader_now) {
             rjs.sweepBootSubscriptions(worker);
         }
+        // Phase 5 PR-3: on the `false→true` leadership transition,
+        // sweep this worker's partition of loaded tenants for
+        // due `_send/owed/` retry markers — the orphan-recovery
+        // primitive that replaces SendDispatch.recover(). Runs on
+        // EVERY worker (not pinned to worker 0) because the sweep
+        // is partitioned by `hash(tenant_id) % N_msg_inboxes`; each
+        // worker covers its own slice exactly once.
+        if (!worker.was_leader and is_leader_now) {
+            rjs.sweepOwedRetriesOnPromotion(worker);
+        }
         worker.was_leader = is_leader_now;
 
         blocked_tenants.clear();
@@ -465,6 +475,17 @@ fn workerMain(args: *WorkerCtx) !void {
         // serviceSubscriptionFires drains it on this same tick.
         if (args.worker_idx == 0 and is_leader_now) {
             rjs.sweepCronSubscriptions(worker);
+        }
+        // Phase 5 PR-3: throttled per-worker partitioned retry sweep
+        // (every worker, leader-only). Walks each worker's slice of
+        // tenants where `hash(tenant_id) % N_msg_inboxes ==
+        // worker.msg_inbox_idx` and pushes due `_send/owed/`
+        // markers as fetches into `node.fetch_pending`. Inert until
+        // the JS webhook shim flip (Phase 5 PR-3 step 2) writes
+        // markers; lives behind the throttle so we pay one prefix
+        // scan per worker per `SEND_SWEEP_INTERVAL_NS`.
+        if (is_leader_now) {
+            rjs.sweepOwedRetries(worker);
         }
 
         // Gap 2.1 Phase D: drain the cross-thread subscription-fire
