@@ -23,6 +23,7 @@ const tenant_mod = @import("rove-tenant");
 const blob_mod = @import("rove-blob");
 const files_server_mod = @import("rove-files-server");
 const config_mirror = @import("config_mirror.zig");
+const effect_mod = @import("effect/root.zig");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const continuation_mod = @import("bindings/continuation.zig");
@@ -483,6 +484,17 @@ fn finalizeBatch(
     txn: *kv_mod.KvStore.TrackedTxn,
     writeset: *const kv_mod.WriteSet,
     successes: *std.ArrayList(SuccessRec),
+    /// Effect-reification Phase 4.1.2: accumulated `http.fetch`
+    /// calls from successful handlers in this batch. On the
+    /// read-only / barrier paths we flush via
+    /// `enqueuePendingFetches`; on the write path we stage as
+    /// `Cmd.http_fetch` entries on the parked unit via
+    /// `parkKvWakes`'s `initial_cmds` parameter — the engine
+    /// submits AFTER raft commit, closing the marker-commit race
+    /// `webhook.send`'s sweep-only path papered over. On
+    /// propose-fail / handler-error → caller's defer frees the
+    /// list.
+    batch_pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
 ) !usize {
     const server = worker.h2;
     const allocator = worker.allocator;
@@ -578,6 +590,36 @@ fn finalizeBatch(
                 captureSuccess(worker, anchor_id, s, s.status_code, .ok);
                 processed += 1;
             }
+            // Effect-reification Phase 4.1.2: the barrier path's
+            // batch had no writes BUT did read speculative state;
+            // the http.fetch'es it issued may have computed on
+            // that state. Stage them on a parked unit so they
+            // fire only after the barrier commits — same
+            // commit-gated posture as the write-path branch
+            // below. `parkKvWakes` with an empty writeset still
+            // creates the unit when `extra_cmds` is non-empty.
+            var barrier_cmds: effect_mod.cmd.BufferedCmds = .{};
+            for (batch_pending_fetches.items) |pf| {
+                barrier_cmds.items.append(allocator, .{ .http_fetch = pf }) catch {
+                    // OOM building the staged list — caller's defer
+                    // frees the remaining pending_fetches.
+                    barrier_cmds.deinit(allocator);
+                    barrier_cmds = .{};
+                    break;
+                };
+            }
+            // Items that successfully moved to barrier_cmds are
+            // now owned by it; clear the source so the caller's
+            // defer doesn't double-free.
+            batch_pending_fetches.clearRetainingCapacity();
+            const empty_ws = kv_mod.WriteSet.init(allocator);
+            var ws_local = empty_ws;
+            defer ws_local.deinit();
+            worker_mod.parkKvWakes(worker, seq, anchor_id, &ws_local, barrier_cmds) catch |perr|
+                std.log.warn("rove-js barrier http_fetch park (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
+            // parkKvWakes consumes barrier_cmds unconditionally
+            // (success or its errdefer). Caller-side copy is now
+            // stale; do not free.
             successes.clearRetainingCapacity();
             return processed;
         }
@@ -602,6 +644,20 @@ fn finalizeBatch(
             .{ anchor_id, @errorName(err) },
         );
         allocator.destroy(txn);
+        // Effect-reification Phase 4.1.2: read-only batches don't
+        // park, so the batch's `http.fetch`es can fire immediately
+        // — there's no marker-commit race because there's no
+        // marker (no writes). Flush via `enqueuePendingFetches`
+        // (the engine.submit fan-out) + clear so the outer defer
+        // is a no-op.
+        if (batch_pending_fetches.items.len > 0) {
+            worker.node.enqueuePendingFetches(batch_pending_fetches.items) catch |perr|
+                std.log.warn(
+                    "rove-js batch http.fetch flush (read-only, tenant={s}): {s}",
+                    .{ anchor_id, @errorName(perr) },
+                );
+            batch_pending_fetches.clearRetainingCapacity();
+        }
         for (successes.items) |*s| {
             // Trampoline: committed read-only continuation → park,
             // not respond. captured as parked (status 0).
@@ -686,16 +742,31 @@ fn finalizeBatch(
     // envelope-0 kv put now; the per-worker partitioned retry
     // sweep (`sweepOwedRetries`) is the fire mechanism.
 
-    // streaming-handlers-plan §4.6: park kv-wake intents on the
-    // same `seq` so `drainRaftPending` fires them at commit time,
-    // not before. The TrackedTxn.commit happens in drainRaftPending
-    // — until then the writes aren't visible to local readers
-    // (kvexp's per-txn overlay), so a pre-commit wake would have
-    // the handler see stale state. parkKvWakes captures owned
-    // (key, op) pairs from the writeset and rides the existing
-    // ParkedUnit; firePendingKvWakes broadcasts them on commit.
-    worker_mod.parkKvWakes(worker, seq, anchor_id, writeset) catch |perr|
+    // streaming-handlers-plan §4.6 + effect-reification Phase 4.1.2:
+    // park the kv-wake fan-out intents (one per writeset op) AND
+    // the batch's accumulated `http.fetch` Cmds on the same seq.
+    // `drainRaftPending`'s parked_units commit arm runs
+    // `interpretCmd` on each — broadcasting the wakes and
+    // submitting each fetch to the FetchEngine, both strictly
+    // AFTER raft commits the writeset.
+    //
+    // The `http_fetch` staging closes the marker-commit race that
+    // forced `webhook.send`'s sweep-only path: the shim's inline
+    // `http.fetch` now rides the same commit gate as the
+    // `_send/owed/{id}` marker, so when `webhook_onresult` fires
+    // it always sees the marker.
+    var write_path_cmds: effect_mod.cmd.BufferedCmds = .{};
+    for (batch_pending_fetches.items) |pf| {
+        write_path_cmds.items.append(allocator, .{ .http_fetch = pf }) catch {
+            write_path_cmds.deinit(allocator);
+            write_path_cmds = .{};
+            break;
+        };
+    }
+    batch_pending_fetches.clearRetainingCapacity();
+    worker_mod.parkKvWakes(worker, seq, anchor_id, writeset, write_path_cmds) catch |perr|
         std.log.warn("rove-js parkKvWakes (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
+    // parkKvWakes consumed write_path_cmds unconditionally.
 
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     for (successes.items) |*s| {
@@ -1935,6 +2006,29 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
+    // Effect-reification Phase 4.1.2 — batch-level `http.fetch`
+    // accumulator. Each handler appends its successful fetches
+    // here (transferred from the per-request `pending_fetches`
+    // after handler success). `finalizeBatch` decides per branch:
+    //
+    //   - read-only / barrier paths: flush via
+    //     `enqueuePendingFetches` immediately (no commit gate to
+    //     wait for; no race possible).
+    //   - write path: pass to `parkKvWakes` as `initial_cmds` so
+    //     each PendingFetch becomes a `Cmd.http_fetch` staged on
+    //     the parked unit; `interpretCmd` submits to the engine
+    //     after raft commits the writeset, closing the
+    //     marker-commit race that forced `webhook.send`'s
+    //     sweep-only fallback.
+    //   - propose-fail / per-handler-error: the per-handler defer
+    //     keeps `pending_fetches` ownership; only SUCCEEDED
+    //     handlers transfer here. On propose failure
+    //     `batch_pending_fetches` frees via the defer below.
+    var batch_pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (batch_pending_fetches.items) |*pf| pf.deinit(allocator);
+        batch_pending_fetches.deinit(allocator);
+    }
 
     // Successful handlers awaiting the shared commit + final move.
     // Owns `console_owned` / `exception_owned` until they transfer
@@ -2319,6 +2413,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // returns false when nothing's bound.
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
             .resume_if_bound_ctx = @ptrCast(worker),
+            .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
+            .cancel_fetch_ctx = @ptrCast(worker),
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(
@@ -2612,19 +2708,34 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // re-produces it deterministically from (body, tapes, source).
         const tape_payloads = worker_mod.captureTapesForChain(worker, &tapes, body, correlation_id);
 
-        // Gap 2.3 Phase C1: flush per-request `http.fetch`
-        // accumulator into the node-wide queue. Ownership of
-        // every PendingFetch transfers; clear the source so the
-        // outer defer is a no-op. On error (rare — only allocator
-        // failure during the move), entries stay in
-        // `pending_fetches` and the outer defer frees them.
-        worker.node.enqueuePendingFetches(pending_fetches.items) catch |perr| {
-            std.log.warn(
-                "rove-js http.fetch flush (tenant={s}): {s}; entries dropped",
-                .{ scope_inst.id, @errorName(perr) },
-            );
-        };
-        pending_fetches.clearRetainingCapacity();
+        // Effect-reification Phase 4.1.2: transfer this handler's
+        // successful `http.fetch` accumulator to the batch-level
+        // list. `finalizeBatch` decides at end-of-batch whether
+        // to flush immediately (read-only paths — no race
+        // possible) or stage on the parked unit as
+        // `Cmd.http_fetch` entries (write path — commit-gated,
+        // closes the marker-commit race that forced
+        // `webhook.send`'s sweep-only path). Per-handler error
+        // semantics preserved: the per-handler `defer` only frees
+        // `pending_fetches` if THIS handler failed before
+        // reaching here; on success ownership transfers via
+        // `clearRetainingCapacity` after the move.
+        transfer: {
+            if (pending_fetches.items.len == 0) break :transfer;
+            batch_pending_fetches.ensureUnusedCapacity(allocator, pending_fetches.items.len) catch |perr| {
+                // OOM growing the batch list: leave the entries on
+                // `pending_fetches` so the per-handler defer frees
+                // them (the customer's chain never fires). Log
+                // once so the dropped fetches are visible.
+                std.log.warn(
+                    "rove-js http.fetch batch-transfer (tenant={s}): ensureUnusedCapacity failed: {s}; {d} fetches dropped",
+                    .{ scope_inst.id, @errorName(perr), pending_fetches.items.len },
+                );
+                break :transfer;
+            };
+            for (pending_fetches.items) |pf| batch_pending_fetches.appendAssumeCapacity(pf);
+            pending_fetches.clearRetainingCapacity();
+        }
 
         const console_owned = resp.console;
         const exception_owned = resp.exception;
@@ -2672,6 +2783,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         txn.?,
         &writeset,
         &successes,
+        &batch_pending_fetches,
     );
     return processed;
 }

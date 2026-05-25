@@ -21,6 +21,7 @@ pub const s3 = @import("s3.zig");
 pub const S3BlobStore = s3.S3BlobStore;
 pub const sigv4 = @import("sigv4.zig");
 pub const curl = @import("curl.zig");
+pub const curl_multi = @import("curl_multi.zig");
 pub const backend = @import("backend.zig");
 pub const BlobBackend = backend.BlobBackend;
 pub const BackendConfig = backend.BackendConfig;
@@ -151,4 +152,5 @@ test {
     _ = @import("s3.zig");
     _ = @import("backend.zig");
     _ = @import("http_blob.zig");
+    _ = @import("curl_multi.zig");
 }

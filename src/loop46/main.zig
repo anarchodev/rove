@@ -1485,7 +1485,7 @@ pub fn main() !void {
     // registration happens later when workers spawn; the pool
     // tolerates a cold-start window where no inboxes exist (warns
     // once + drops).
-    try node_state.startFetchPool();
+    try node_state.startFetchEngine();
 
     // streaming-handlers-plan §4.6: hand the apply path a pointer
     // to NodeState so `applyWriteSet` can `broadcastKvWake` across

@@ -1,0 +1,789 @@
+//! `http.fetch` engine — Phase 2 of `docs/curl-multi-plan.md`.
+//!
+//! Replaces `fetch_pool.zig` (8 worker threads each blocking on one
+//! `curl_easy_perform`) with a single thread driving a `curl_multi`
+//! handle that holds many concurrent transfers. Lifts the
+//! `FETCH_POOL_SIZE = 8` ceiling structurally — the engine runs as
+//! many simultaneous fetches as libcurl + the OS allow.
+//!
+//! ## Architecture
+//!
+//! One `FetchEngine` per node. Workers (any thread) call `submit(pf)`
+//! to enqueue a `PendingFetch`; the engine thread drains the queue,
+//! builds a `curl_multi.Transfer` per fetch, and adds it to the multi
+//! handle. libcurl drives all transfers concurrently. Per-writeback
+//! `on_chunk` callbacks (fired on the engine thread inside
+//! `curl_multi_poll`) re-chunk the response and route
+//! `UpstreamFetchEvent`s to the destination worker via
+//! `NodeState.enqueueFetchEventForTenant` (hash-routed by tenant_id
+//! to the worker that issued the fetch).
+//!
+//! ## Streaming modes (preserves Phase 5 PR-1 contract)
+//!
+//! - `stream: false` (default) — body buffered up to
+//!   `max_response_chunk_bytes`. On completion, ONE event with
+//!   `final: true` + body bytes + terminal status fires. Any further
+//!   bytes set `body_truncated` and abort the transfer.
+//! - `stream: true` — each writeback emits an event with
+//!   `final: false` immediately (split into `max_response_chunk_bytes`
+//!   pieces if oversized). A separate empty-bytes event with
+//!   `final: true` + terminal fields fires after the transfer
+//!   completes, distinguishing "more frames" from "transfer done."
+//!
+//! Both modes always emit at least one `final: true` event — even
+//! on transport error or cap-only abort.
+//!
+//! ## Cross-thread wake-up
+//!
+//! Workers calling `submit` or `cancel` push to a mutex-protected
+//! queue and then call `Multi.wakeup` (wrapping `curl_multi_wakeup`,
+//! libcurl 7.68+). The engine thread's `multi.poll(1000)` returns
+//! immediately on wake; the engine drains the cross-thread queues
+//! at the top of each loop iteration.
+//!
+//! ## Cancellation (`http.cancelFetch`)
+//!
+//! Cooperative: the engine drops the transfer from libcurl and frees
+//! its state. An in-flight chunk that already landed in on_chunk
+//! before the cancel ran is delivered as if the cancel hadn't
+//! happened (the customer's chain ctx is the place to track "we
+//! moved on" — see `curl-multi-plan.md` §5 invariant 3). The
+//! terminal `final: true` event does NOT fire after a cancel — the
+//! customer's chain just stops.
+
+const std = @import("std");
+const blob_curl_multi = @import("rove-blob").curl_multi;
+const components_mod = @import("components.zig");
+const worker_mod = @import("worker.zig");
+const globals = @import("globals.zig");
+const sched_thread = @import("rove-schedule-server").thread;
+
+const NodeState = worker_mod.NodeState;
+const PendingFetch = globals.PendingFetch;
+const UpstreamFetchEvent = components_mod.UpstreamFetchEvent;
+
+/// How long the engine thread blocks in `multi.poll` between wakeups.
+/// Long timeout is fine — `Multi.wakeup` unblocks on submit/cancel,
+/// so this only governs idle latency for libcurl-internal events
+/// (e.g., DNS cache expiry).
+const ENGINE_POLL_TIMEOUT_MS: c_int = 1000;
+
+/// Sanity cap on the in-flight transfer count. Not a throttle (the
+/// engine runs as many as can be packed onto one thread); a guard
+/// against runaway submissions exhausting fd or memory. If reached,
+/// `submit` blocks the calling worker briefly (caller spins). Set
+/// well above any plausible legitimate concurrent load.
+const ENGINE_MAX_INFLIGHT: usize = 10_000;
+
+/// `docs/curl-multi-plan.md` Phase 3 (gap 2.5): per-tenant cap on
+/// simultaneous held subscriptions. Mirrors
+/// `connection-actor-plan.md` §9.2's posture: bounded resource
+/// per tenant so one chatty customer can't exhaust the node's
+/// outbound socket / fd budget. Exceeded submissions emit a
+/// defined `final: true, ok: false` rejection event so the
+/// customer's `on_chunk` handler fires once and can take action.
+const HELD_MAX_PER_TENANT: u32 = 16;
+
+pub const FetchEngine = struct {
+    allocator: std.mem.Allocator,
+    node: *NodeState,
+
+    thread: ?std.Thread = null,
+    multi: ?*blob_curl_multi.Multi = null,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    /// Cross-thread inbound queue. Workers push PendingFetches via
+    /// `submit`; the engine thread drains at the top of each loop.
+    /// Ownership transfers from submitter to engine on push.
+    inbound_mu: std.Thread.Mutex = .{},
+    inbound: std.ArrayListUnmanaged(PendingFetch) = .empty,
+
+    /// Cross-thread cancel queue. Workers push allocator-owned
+    /// fetch-id strings via `cancel`; the engine drains + matches
+    /// against `inflight_by_id`. Cancel-of-unknown-id is a silent
+    /// no-op (the fetch may already have completed or never existed).
+    cancel_mu: std.Thread.Mutex = .{},
+    cancel_ids: std.ArrayListUnmanaged([]u8) = .empty,
+
+    /// Engine-thread-only: in-flight FetchCtxs keyed by `fetch_id`.
+    /// Cancel uses this to map id → ctx; on_done removes via this
+    /// map. Shutdown drains remaining entries to free their ctxs.
+    /// String key borrows into `ctx.pf.id` (lives for the ctx's
+    /// lifetime).
+    inflight_by_id: std.StringHashMapUnmanaged(*FetchCtx) = .empty,
+
+    /// Engine-thread-only: per-tenant count of held subscriptions
+    /// currently in flight. Incremented on `startTransfer` with
+    /// `pf.held == true`; decremented on completion (`onDoneCb`)
+    /// or cancellation. The key is the tenant_id string,
+    /// allocator-owned by this map. Entry is removed when the
+    /// count drops to 0 to keep the map bounded.
+    held_per_tenant: std.StringHashMapUnmanaged(u32) = .empty,
+
+    /// One-shot warning latch for the "no workers registered yet"
+    /// cold-start race. Logged once + dropped thereafter so log
+    /// stays readable.
+    no_inbox_warned: std.atomic.Value(bool) = .init(false),
+
+    pub fn init(allocator: std.mem.Allocator, node: *NodeState) !*FetchEngine {
+        const self = try allocator.create(FetchEngine);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .node = node };
+        return self;
+    }
+
+    /// Spawn the engine thread + create the curl_multi handle.
+    /// Idempotent — second call is a no-op. Call after NodeState is
+    /// wired + workers have spawned (so their fetch-chunk inboxes
+    /// are registered before the first chunk hash-routes through).
+    pub fn start(self: *FetchEngine) !void {
+        if (self.thread != null) return;
+
+        self.stop.store(false, .release);
+        self.no_inbox_warned.store(false, .release);
+
+        const multi = try blob_curl_multi.Multi.init(self.allocator);
+        errdefer multi.deinit();
+        self.multi = multi;
+
+        self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
+    }
+
+    /// Signal the engine thread to stop + join. Drains any
+    /// unprocessed inbound + cancel entries (frees them). Any
+    /// in-flight transfers are removed from libcurl via
+    /// `Multi.deinit`; their FetchCtxs are freed via the
+    /// `inflight_by_id` walk. No on_done callbacks fire on
+    /// shutdown — the customer's handler chain just stops.
+    pub fn shutdown(self: *FetchEngine) void {
+        if (self.thread == null) return;
+        self.stop.store(true, .release);
+        if (self.multi) |m| m.wakeup() catch {};
+        self.thread.?.join();
+        self.thread = null;
+
+        // Free remaining inbound + cancel entries (the engine
+        // exited before draining them).
+        {
+            self.inbound_mu.lock();
+            defer self.inbound_mu.unlock();
+            for (self.inbound.items) |*pf| pf.deinit(self.allocator);
+            self.inbound.deinit(self.allocator);
+            self.inbound = .empty;
+        }
+        {
+            self.cancel_mu.lock();
+            defer self.cancel_mu.unlock();
+            for (self.cancel_ids.items) |id| self.allocator.free(id);
+            self.cancel_ids.deinit(self.allocator);
+            self.cancel_ids = .empty;
+        }
+
+        // Free in-flight FetchCtxs whose transfers Multi.deinit
+        // already cleaned up. The map's keys borrow into
+        // `ctx.pf.id` — free ctxs in a snapshot first to avoid
+        // iterator invalidation.
+        if (self.multi) |m| {
+            var snap: std.ArrayList(*FetchCtx) = .empty;
+            defer snap.deinit(self.allocator);
+            var it = self.inflight_by_id.valueIterator();
+            while (it.next()) |cp| snap.append(self.allocator, cp.*) catch {};
+            for (snap.items) |ctx| ctx.deinit();
+            self.inflight_by_id.deinit(self.allocator);
+            m.deinit();
+            self.multi = null;
+        }
+        // held_per_tenant: own the tenant_id keys.
+        {
+            var kit = self.held_per_tenant.keyIterator();
+            while (kit.next()) |kp| self.allocator.free(kp.*);
+            self.held_per_tenant.deinit(self.allocator);
+        }
+    }
+
+    pub fn deinit(self: *FetchEngine) void {
+        if (self.thread != null) self.shutdown();
+        self.allocator.destroy(self);
+    }
+
+    /// Cross-thread: take ownership of `pf` + enqueue for the engine.
+    /// Returns once the entry is in the queue; the engine thread
+    /// runs it asynchronously. Fails only on `OutOfMemory` (queue
+    /// growth); caller's `pf` ownership is unchanged on error so the
+    /// caller can free.
+    pub fn submit(self: *FetchEngine, pf: PendingFetch) !void {
+        {
+            self.inbound_mu.lock();
+            defer self.inbound_mu.unlock();
+            try self.inbound.append(self.allocator, pf);
+        }
+        if (self.multi) |m| m.wakeup() catch {};
+    }
+
+    /// Cross-thread: request cancellation of an in-flight fetch by
+    /// id. Silently no-ops if the fetch already completed or never
+    /// existed. `id` is borrowed — duped onto the queue.
+    pub fn cancel(self: *FetchEngine, id: []const u8) void {
+        const dup = self.allocator.dupe(u8, id) catch return;
+        {
+            self.cancel_mu.lock();
+            defer self.cancel_mu.unlock();
+            self.cancel_ids.append(self.allocator, dup) catch {
+                self.allocator.free(dup);
+                return;
+            };
+        }
+        if (self.multi) |m| m.wakeup() catch {};
+    }
+
+    // ── Engine thread ─────────────────────────────────────────────────
+
+    fn threadMain(self: *FetchEngine) void {
+        while (!self.stop.load(.acquire)) {
+            self.drainCancels();
+            self.drainInbound();
+            const multi = self.multi orelse return;
+            _ = multi.poll(ENGINE_POLL_TIMEOUT_MS) catch |err| {
+                std.log.warn("rove-js fetch_engine: poll: {s}", .{@errorName(err)});
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            };
+            _ = multi.drainCompleted();
+        }
+    }
+
+    fn drainInbound(self: *FetchEngine) void {
+        var batch: std.ArrayList(PendingFetch) = .empty;
+        defer batch.deinit(self.allocator);
+        {
+            self.inbound_mu.lock();
+            defer self.inbound_mu.unlock();
+            if (self.inbound.items.len == 0) return;
+            std.mem.swap(std.ArrayList(PendingFetch), &batch, blk: {
+                // Promote ArrayListUnmanaged → ArrayList for the
+                // swap (the cross-thread queue stores unmanaged for
+                // explicit-allocator hygiene; the engine-side batch
+                // wants `.empty` semantics either way). Easier: drain
+                // by element below.
+                break :blk &batch; // unreachable; not used
+            });
+            // Drain by element move (no swap helper between the two
+            // types in stdlib 0.15).
+            batch.ensureUnusedCapacity(self.allocator, self.inbound.items.len) catch return;
+            for (self.inbound.items) |pf| batch.appendAssumeCapacity(pf);
+            self.inbound.clearRetainingCapacity();
+        }
+
+        for (batch.items) |pf_const| {
+            var pf = pf_const;
+            self.startTransfer(&pf) catch |err| {
+                if (err == error.HeldCapExceeded) {
+                    // Per-tenant cap rejection: defined `final: true,
+                    // ok: false` event so the customer's `on_chunk`
+                    // handler fires once and can surface the
+                    // condition. NOT logged as a warning — this is
+                    // the customer's responsibility to handle (same
+                    // posture as rate-limit rejection).
+                    emitFailedSetupEvent(self, &pf) catch {};
+                } else {
+                    std.log.warn(
+                        "rove-js fetch_engine: startTransfer tenant={s} id={s}: {s}",
+                        .{ pf.tenant_id, pf.id, @errorName(err) },
+                    );
+                    // Setup failure: same single-final-event posture
+                    // so the customer's handler chain still runs.
+                    emitFailedSetupEvent(self, &pf) catch {};
+                }
+                pf.deinit(self.allocator);
+            };
+        }
+    }
+
+    fn drainCancels(self: *FetchEngine) void {
+        var batch: std.ArrayList([]u8) = .empty;
+        defer batch.deinit(self.allocator);
+        {
+            self.cancel_mu.lock();
+            defer self.cancel_mu.unlock();
+            if (self.cancel_ids.items.len == 0) return;
+            batch.ensureUnusedCapacity(self.allocator, self.cancel_ids.items.len) catch return;
+            for (self.cancel_ids.items) |id| batch.appendAssumeCapacity(id);
+            self.cancel_ids.clearRetainingCapacity();
+        }
+        defer for (batch.items) |id| self.allocator.free(id);
+
+        for (batch.items) |id| {
+            if (self.inflight_by_id.fetchRemove(id)) |kv| {
+                const ctx = kv.value;
+                if (ctx.held) self.bumpHeldCount(ctx.pf.tenant_id, -1);
+                if (self.multi) |m| m.cancel(ctx.transfer);
+                ctx.deinit();
+            }
+        }
+    }
+
+    /// Build the Transfer + FetchCtx + register on multi. Ownership of
+    /// `pf` transfers into the new FetchCtx on success; caller's
+    /// `pf.deinit` is skipped on success (the FetchCtx frees it on
+    /// completion).
+    fn startTransfer(self: *FetchEngine, pf: *PendingFetch) !void {
+        if (self.inflight_by_id.count() >= ENGINE_MAX_INFLIGHT) {
+            return error.TooManyInflight;
+        }
+        // Phase 3 (gap 2.5): per-tenant held-subscription cap. Check
+        // BEFORE allocating any state so the rejection path is
+        // cheap. The defined rejection (a single `final: true,
+        // ok: false` event with `body_truncated = false`) fires
+        // via `drainInbound`'s catch — return a sentinel error
+        // here.
+        if (pf.held) {
+            const cur = if (self.held_per_tenant.get(pf.tenant_id)) |c| c else 0;
+            if (cur >= HELD_MAX_PER_TENANT) return error.HeldCapExceeded;
+        }
+
+        var headers_list: std.ArrayListUnmanaged(blob_curl_multi.Header) = .empty;
+        defer {
+            for (headers_list.items) |h| {
+                self.allocator.free(h.name);
+                self.allocator.free(h.value);
+            }
+            headers_list.deinit(self.allocator);
+        }
+        try parseHeadersJson(self.allocator, pf.headers_json, &headers_list);
+
+        const method = parseMethod(pf.method) orelse return error.UnsupportedMethod;
+        const req: blob_curl_multi.Request = .{
+            .method = method,
+            .url = pf.url,
+            .headers = headers_list.items,
+            .body = pf.body,
+            // Held transfers: `timeout_ms = 0` means "no timeout"
+            // per libcurl (CURLOPT_TIMEOUT_MS=0 is the documented
+            // no-timeout sentinel). The binding already forces
+            // `pf.timeout_ms = 0` for `http.subscribe`; we defend
+            // here too in case a caller routes a held pf through
+            // some other entry point.
+            .timeout_ms = if (pf.held) 0 else pf.timeout_ms,
+            .verify_tls = !sched_thread.test_allow_plaintext,
+        };
+
+        const ctx = try self.allocator.create(FetchCtx);
+        errdefer self.allocator.destroy(ctx);
+        ctx.* = .{
+            .engine = self,
+            .allocator = self.allocator,
+            .pf = pf.*, // take ownership; caller skips deinit on success
+            .stream_mode = pf.stream,
+            .max_chunk = @max(@as(usize, pf.max_response_chunk_bytes), 1),
+            .max_total = pf.max_total_response_bytes,
+            .effective_total_cap = if (pf.stream)
+                pf.max_total_response_bytes
+            else
+                @as(u64, @max(@as(usize, pf.max_response_chunk_bytes), 1)),
+            .held = pf.held,
+            .transfer = undefined, // wired below
+        };
+        // From here on, the FetchCtx owns the pf — clear the
+        // caller's slices so its deinit is a no-op.
+        pf.* = .{
+            .tenant_id = &.{},
+            .id = &.{},
+            .url = &.{},
+            .method = &.{},
+            .headers_json = &.{},
+            .body = &.{},
+            .timeout_ms = 0,
+            .on_chunk_module = &.{},
+            .ctx_json = &.{},
+            .stream = false,
+            .max_response_chunk_bytes = 0,
+            .max_total_response_bytes = 0,
+            .held = false,
+        };
+
+        const transfer = try blob_curl_multi.Transfer.initStreaming(
+            self.allocator,
+            req,
+            &onChunkCb,
+            &onHeaderLineCb,
+            &onDoneCb,
+            @ptrCast(ctx),
+        );
+        errdefer transfer.deinit();
+        ctx.transfer = transfer;
+
+        try self.inflight_by_id.put(self.allocator, ctx.pf.id, ctx);
+        errdefer _ = self.inflight_by_id.remove(ctx.pf.id);
+
+        try self.multi.?.add(transfer);
+
+        if (ctx.held) self.bumpHeldCount(ctx.pf.tenant_id, 1);
+    }
+
+    /// Adjust the per-tenant held count by `delta` (+1 or -1).
+    /// Inserts a tenant-id-owning key on first-sight; drops the
+    /// entry (and frees its key) when the count returns to 0.
+    fn bumpHeldCount(self: *FetchEngine, tenant_id: []const u8, delta: i32) void {
+        const gop = self.held_per_tenant.getOrPut(self.allocator, tenant_id) catch return;
+        if (!gop.found_existing) {
+            // First-sight: dup tenant_id as the map-owned key so
+            // we outlive any single ctx (multiple held xfers per
+            // tenant share this key).
+            const owned_key = self.allocator.dupe(u8, tenant_id) catch {
+                _ = self.held_per_tenant.remove(tenant_id);
+                return;
+            };
+            // Replace the borrowed key with the owned copy by
+            // re-inserting. (StringHashMap doesn't expose key
+            // replacement; remove + put round-trips it.)
+            _ = self.held_per_tenant.remove(tenant_id);
+            self.held_per_tenant.put(self.allocator, owned_key, 0) catch {
+                self.allocator.free(owned_key);
+                return;
+            };
+            // Now re-fetch via the owned key.
+            const v_ptr = self.held_per_tenant.getPtr(owned_key) orelse return;
+            const new_count = @as(i64, @intCast(v_ptr.*)) + delta;
+            if (new_count <= 0) {
+                if (self.held_per_tenant.fetchRemove(owned_key)) |kv| {
+                    self.allocator.free(kv.key);
+                }
+                return;
+            }
+            v_ptr.* = @intCast(new_count);
+            return;
+        }
+        const new_count = @as(i64, @intCast(gop.value_ptr.*)) + delta;
+        if (new_count <= 0) {
+            if (self.held_per_tenant.fetchRemove(gop.key_ptr.*)) |kv| {
+                self.allocator.free(kv.key);
+            }
+        } else {
+            gop.value_ptr.* = @intCast(new_count);
+        }
+    }
+
+    fn routeEvent(self: *FetchEngine, tenant_id: []const u8, ev: UpstreamFetchEvent) !void {
+        self.node.enqueueFetchEventForTenant(tenant_id, ev) catch |err| {
+            if (err == error.NoWorkers and
+                !self.no_inbox_warned.swap(true, .acq_rel))
+            {
+                std.log.warn(
+                    "rove-js fetch_engine: no worker inboxes registered; dropping fetch event tenant={s}",
+                    .{tenant_id},
+                );
+            }
+            return err;
+        };
+    }
+};
+
+// ── Per-transfer streaming state ──────────────────────────────────────
+
+/// Per-transfer state — mirrors `fetch_pool.StreamState` field-for-field,
+/// just heap-allocated (Phase 1's `Transfer` does not own this).
+/// Lifetime: created in `startTransfer`, freed in `onDoneCb`.
+const FetchCtx = struct {
+    engine: *FetchEngine,
+    allocator: std.mem.Allocator,
+    /// Owned. Slices are freed via `pf.deinit` on completion.
+    pf: PendingFetch,
+    /// Borrowed back-pointer to the Transfer (we own the FetchCtx;
+    /// libcurl owns the Transfer via Multi). Used only by
+    /// `FetchEngine.cancel` to dispatch `Multi.cancel`.
+    transfer: *blob_curl_multi.Transfer,
+
+    stream_mode: bool,
+    max_chunk: usize,
+    max_total: u64,
+    effective_total_cap: u64,
+    /// `docs/curl-multi-plan.md` Phase 3: held subscription. When
+    /// true the engine counts this against the per-tenant held cap
+    /// and treats completion as "subscription ended" rather than
+    /// "fetch succeeded."
+    held: bool,
+
+    /// Raw response header block (libcurl-delivered `Name: value\r\n`
+    /// lines + status + blank terminator). Parsed into a JSON object
+    /// on the seq-0 emit.
+    headers: std.ArrayListUnmanaged(u8) = .empty,
+
+    emitted_seq: u32 = 0,
+    byte_offset: u64 = 0,
+    total: u64 = 0,
+
+    failed: bool = false,
+    capped: bool = false,
+
+    /// `stream: false` mode: body buffered here, emitted as one
+    /// `final: true` event in `onDoneCb`. Empty in `stream: true`.
+    body_buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *FetchCtx) void {
+        var pf = self.pf;
+        pf.deinit(self.allocator);
+        self.headers.deinit(self.allocator);
+        self.body_buf.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    /// Build + route one chunk event for `bytes` (borrowed — dup'd
+    /// into the event). Returns false on alloc / route failure
+    /// (caller sets `failed`).
+    fn emitChunk(self: *FetchCtx, bytes: []const u8) bool {
+        var headers_json: ?[]u8 = null;
+        if (self.emitted_seq == 0 and self.headers.items.len > 0) {
+            headers_json = parseHeadersWireToJson(self.allocator, self.headers.items) catch null;
+        }
+        const ev = buildChunkEvent(
+            self.allocator,
+            &self.pf,
+            self.emitted_seq,
+            self.byte_offset,
+            bytes,
+            headers_json,
+        ) catch {
+            if (headers_json) |hj| self.allocator.free(hj);
+            return false;
+        };
+        self.engine.routeEvent(self.pf.tenant_id, ev) catch |err| {
+            var e = ev;
+            UpstreamFetchEvent.deinitItem(&e, self.allocator);
+            std.log.warn(
+                "rove-js fetch_engine: route chunk seq={d}: {s}",
+                .{ self.emitted_seq, @errorName(err) },
+            );
+            return false;
+        };
+        self.emitted_seq += 1;
+        self.byte_offset += bytes.len;
+        return true;
+    }
+};
+
+// ── curl_multi callback bridges ───────────────────────────────────────
+
+/// Per-writeback chunk callback — engine-thread, fires inside
+/// `multi.poll`. Mirrors `fetch_pool.onBody` exactly.
+fn onChunkCb(bytes: []const u8, ctx: ?*anyopaque) bool {
+    const s: *FetchCtx = @ptrCast(@alignCast(ctx.?));
+    if (s.failed or s.capped) return false;
+    if (bytes.len == 0) return true;
+
+    var take = bytes;
+    const remaining: usize = @intCast(s.effective_total_cap - s.total);
+    if (bytes.len >= remaining) {
+        take = bytes[0..remaining];
+        s.capped = true;
+    }
+    s.total += take.len;
+
+    if (s.stream_mode) {
+        // Stream mode: emit per writeback, split into ≤ max_chunk.
+        var off: usize = 0;
+        while (off < take.len) {
+            const end = @min(off + s.max_chunk, take.len);
+            if (!s.emitChunk(take[off..end])) {
+                s.failed = true;
+                return false;
+            }
+            off = end;
+        }
+        return !s.capped;
+    } else {
+        // Single-chunk: buffer; emit ONE final event in onDoneCb.
+        s.body_buf.appendSlice(s.allocator, take) catch {
+            s.failed = true;
+            return false;
+        };
+        return !s.capped;
+    }
+}
+
+/// Per-header-line callback — accumulates the raw block.
+fn onHeaderLineCb(line: []const u8, ctx: ?*anyopaque) void {
+    const s: *FetchCtx = @ptrCast(@alignCast(ctx.?));
+    if (s.failed) return;
+    s.headers.appendSlice(s.allocator, line) catch {
+        s.failed = true;
+    };
+}
+
+/// Transfer completion — fires inside `multi.drainCompleted`. Emit
+/// the terminal event, remove from inflight_by_id, free the ctx.
+fn onDoneCb(transfer: *blob_curl_multi.Transfer, result: blob_curl_multi.Result, ctx: ?*anyopaque) void {
+    const s: *FetchCtx = @ptrCast(@alignCast(ctx.?));
+    _ = transfer;
+
+    // Transport-only: libcurl finished cleanly AND we hit no
+    // alloc/route failure. Cap-only truncation is NOT a failure
+    // (the customer explicitly bounded the response).
+    const transport_ok = result.ok and !s.failed;
+
+    if (!s.stream_mode) {
+        // Phase 5 PR-1: ONE event with `final: true` + the body +
+        // terminal fields.
+        emitFinalWithBody(s, result.status, transport_ok) catch |err|
+            std.log.warn(
+                "rove-js fetch_engine: emit final tenant={s} id={s}: {s}",
+                .{ s.pf.tenant_id, s.pf.id, @errorName(err) },
+            );
+    } else {
+        // Stream mode: per-writeback events already fired with
+        // final=false. A separate empty-bytes event carries the
+        // terminal — distinguishes "more frames" from "complete."
+        emitFinalEmpty(s, result.status, transport_ok) catch |err|
+            std.log.warn(
+                "rove-js fetch_engine: emit final-empty tenant={s} id={s}: {s}",
+                .{ s.pf.tenant_id, s.pf.id, @errorName(err) },
+            );
+    }
+
+    // Engine-thread bookkeeping: remove from inflight + free ctx.
+    // Held subscriptions also decrement the per-tenant cap counter.
+    if (s.held) s.engine.bumpHeldCount(s.pf.tenant_id, -1);
+    _ = s.engine.inflight_by_id.remove(s.pf.id);
+    s.deinit();
+}
+
+/// Setup-failure path: fire a single empty `final: true` event with
+/// ok=false. Mirrors `fetch_pool.pushFinalEmpty` on the catch path.
+/// The pf isn't owned by an engine ctx in this path — borrows from
+/// the caller (drainInbound, which frees pf separately).
+fn emitFailedSetupEvent(engine: *FetchEngine, pf: *PendingFetch) !void {
+    const a = engine.allocator;
+    var ev = try buildChunkEvent(a, pf, 0, 0, &.{}, null);
+    ev.final = true;
+    ev.terminal_status = 0;
+    ev.terminal_ok = false;
+    ev.body_truncated = false;
+    engine.routeEvent(pf.tenant_id, ev) catch |err| {
+        var e = ev;
+        UpstreamFetchEvent.deinitItem(&e, a);
+        return err;
+    };
+}
+
+fn emitFinalEmpty(s: *FetchCtx, status: u16, ok: bool) !void {
+    const a = s.allocator;
+    var ev = try buildChunkEvent(a, &s.pf, s.emitted_seq, s.byte_offset, &.{}, null);
+    ev.final = true;
+    ev.terminal_status = status;
+    ev.terminal_ok = ok;
+    ev.body_truncated = s.capped;
+    s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
+        var e = ev;
+        UpstreamFetchEvent.deinitItem(&e, a);
+        return err;
+    };
+    s.emitted_seq += 1;
+}
+
+fn emitFinalWithBody(s: *FetchCtx, status: u16, ok: bool) !void {
+    const a = s.allocator;
+    var ev = try buildChunkEvent(a, &s.pf, s.emitted_seq, s.byte_offset, s.body_buf.items, null);
+    if (s.emitted_seq == 0 and s.headers.items.len > 0) {
+        ev.fetch_headers = parseHeadersWireToJson(a, s.headers.items) catch null;
+    }
+    ev.final = true;
+    ev.terminal_status = status;
+    ev.terminal_ok = ok;
+    ev.body_truncated = s.capped;
+    s.engine.routeEvent(s.pf.tenant_id, ev) catch |err| {
+        var e = ev;
+        UpstreamFetchEvent.deinitItem(&e, a);
+        return err;
+    };
+    s.emitted_seq += 1;
+}
+
+// ── Shared helpers (ported verbatim from fetch_pool.zig) ──────────────
+
+fn parseMethod(s: []const u8) ?blob_curl_multi.Method {
+    if (std.ascii.eqlIgnoreCase(s, "GET")) return .GET;
+    if (std.ascii.eqlIgnoreCase(s, "POST")) return .POST;
+    if (std.ascii.eqlIgnoreCase(s, "PUT")) return .PUT;
+    if (std.ascii.eqlIgnoreCase(s, "DELETE")) return .DELETE;
+    if (std.ascii.eqlIgnoreCase(s, "HEAD")) return .HEAD;
+    return null;
+}
+
+fn parseHeadersJson(
+    a: std.mem.Allocator,
+    json_src: []const u8,
+    out: *std.ArrayListUnmanaged(blob_curl_multi.Header),
+) !void {
+    if (json_src.len == 0) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, json_src, .{}) catch return;
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return;
+    var it = root.object.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.* != .string) continue;
+        const name = try a.dupe(u8, kv.key_ptr.*);
+        errdefer a.free(name);
+        const value = try a.dupe(u8, kv.value_ptr.*.string);
+        errdefer a.free(value);
+        try out.append(a, .{ .name = name, .value = value });
+    }
+}
+
+fn buildChunkEvent(
+    a: std.mem.Allocator,
+    pf: *const PendingFetch,
+    seq: u32,
+    byte_offset: u64,
+    bytes: []const u8,
+    headers_json: ?[]u8,
+) !UpstreamFetchEvent {
+    var ev: UpstreamFetchEvent = .{
+        .seq = seq,
+        .byte_offset = byte_offset,
+    };
+    errdefer UpstreamFetchEvent.deinit(a, (&ev)[0..1]);
+    if (headers_json) |hj| ev.fetch_headers = hj;
+    ev.fetch_id = try a.dupe(u8, pf.id);
+    ev.tenant_id = try a.dupe(u8, pf.tenant_id);
+    ev.ctx_json = try a.dupe(u8, pf.ctx_json);
+    ev.on_chunk_module = try a.dupe(u8, pf.on_chunk_module);
+    ev.bytes = try a.dupe(u8, bytes);
+    return ev;
+}
+
+fn parseHeadersWireToJson(a: std.mem.Allocator, wire: []const u8) ![]u8 {
+    var obj: std.json.ObjectMap = .init(a);
+    defer {
+        var it = obj.iterator();
+        while (it.next()) |entry| {
+            a.free(@constCast(entry.key_ptr.*));
+            a.free(@constCast(entry.value_ptr.*.string));
+        }
+        obj.deinit();
+    }
+    var line_it = std.mem.splitSequence(u8, wire, "\r\n");
+    while (line_it.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " ");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " ");
+        if (name.len == 0) continue;
+        const lname = try a.alloc(u8, name.len);
+        errdefer a.free(lname);
+        for (name, 0..) |ch, i| lname[i] = std.ascii.toLower(ch);
+        const lval = try a.dupe(u8, value);
+        errdefer a.free(lval);
+        if (try obj.fetchPut(lname, .{ .string = lval })) |prev| {
+            a.free(@constCast(prev.key));
+            a.free(@constCast(prev.value.string));
+        }
+    }
+    const val: std.json.Value = .{ .object = obj };
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(a);
+    {
+        var aw = std.Io.Writer.Allocating.fromArrayList(a, &buf);
+        defer buf = aw.toArrayList();
+        try std.json.Stringify.value(val, .{}, &aw.writer);
+    }
+    return try buf.toOwnedSlice(a);
+}

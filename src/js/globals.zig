@@ -156,6 +156,14 @@ pub const PendingFetch = struct {
     stream: bool,
     max_response_chunk_bytes: u32,
     max_total_response_bytes: u64,
+    /// `docs/curl-multi-plan.md` Phase 3: held outbound subscription
+    /// (gap 2.5). When true, the FetchEngine treats this as a
+    /// long-lived transfer: no timeout, counted against the
+    /// per-tenant held-subscription cap, terminal event always
+    /// signals `ok=false` so the customer's handler interprets
+    /// completion as "subscription ended; reconnect if you want
+    /// it back." Held=false → normal `http.fetch` semantics.
+    held: bool = false,
 
     pub fn deinit(self: *PendingFetch, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);
@@ -358,6 +366,18 @@ pub const DispatchState = struct {
         event_json: []const u8,
     ) bool = null,
     resume_if_bound_ctx: ?*anyopaque = null,
+
+    /// `docs/curl-multi-plan.md` Phase 2: cancel-fetch trampoline.
+    /// The binding (`bindings/http.zig:jsHttpCancelFetch`) calls
+    /// this to ask `FetchEngine.cancel` to drop an in-flight
+    /// transfer by id. Null on test paths / non-worker dispatches;
+    /// the JS callable becomes a no-op in that case (the prior
+    /// behavior before the engine landed).
+    cancel_fetch: ?*const fn (
+        ctx: *anyopaque,
+        id: []const u8,
+    ) void = null,
+    cancel_fetch_ctx: ?*anyopaque = null,
 
     pub fn deinit(self: *DispatchState, ctx: ?*c.JSContext) void {
         var it = self.trigger_module_ns.iterator();
@@ -1531,8 +1551,14 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // The legacy `http.send` / `http.cancel` bindings retired with
     // PR-3 alongside the Zig SendDispatch kernel.
     .{ .path = &.{ "_system", "http" }, .fns = &.{
-        .{ .name = "fetch",       .cfunc = http_b.jsHttpFetch,       .argc = 1 },
-        .{ .name = "cancelFetch", .cfunc = http_b.jsHttpCancelFetch, .argc = 1 },
+        .{ .name = "fetch",              .cfunc = http_b.jsHttpFetch,              .argc = 1 },
+        .{ .name = "cancelFetch",        .cfunc = http_b.jsHttpCancelFetch,        .argc = 1 },
+        // `docs/curl-multi-plan.md` Phase 3 (gap 2.5): held
+        // outbound subscription. Same engine, different
+        // lifecycle: no timeout, per-tenant cap, terminal is
+        // always `ok=false` ("subscription ended").
+        .{ .name = "subscribe",          .cfunc = http_b.jsHttpSubscribe,          .argc = 1 },
+        .{ .name = "cancelSubscription", .cfunc = http_b.jsHttpCancelSubscription, .argc = 1 },
     } },
     // Phase 5 PR-3: the `_system.continuation.resumeIfBound` shim was
     // a stillborn — the `_harden.js` step (`delete globalThis._system;`

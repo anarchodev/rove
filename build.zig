@@ -458,6 +458,15 @@ pub fn build(b: *std.Build) void {
         // tenant's context. Add an entry here AND in
         // `src/js/builtin_modules.zig`'s `MODULES` table.
         .{ .name = "builtin_webhook_onresult_mjs", .path = "src/js/builtin_modules/webhook_onresult.mjs" },
+
+        // Starter content baked into the freshly-created tenant's
+        // first deployment — see `deployStarterContent` in
+        // `src/js/worker.zig`. Edited as plain files under
+        // `src/js/starter/` rather than as Zig multi-line literals
+        // so JS / HTML keep syntax highlighting and aren't gated on
+        // a Zig rebuild for trivial copy edits.
+        .{ .name = "starter_index_mjs", .path = "src/js/starter/index.mjs" },
+        .{ .name = "starter_static_index_html", .path = "src/js/starter/_static/index.html" },
     };
     for (js_runtime_files) |f| {
         js_mod.addAnonymousImport(f.name, .{
