@@ -98,6 +98,57 @@ L4 is the `unified-effect-gating.md` invariant. A Cmd is durable only by
 (corollary of L1). kv-write is the degenerate Cmd runtime whose target
 *is* the Model.
 
+### 2.5 Corollary — inputs are durable, outputs are derivable
+
+L1–L4 plus the determinism property of handler activations (each is a
+pure function of its `(Msg, Model snapshot, bytecode)`) imply a stronger
+storage discipline than any single law states. *Inputs* must be recorded
+durably — L3 covers the Msg, the readset captures the Model snapshot
+(`readset-replication-plan.md` §4), the `.module` channel pins the
+bytecode by hash. *Outputs the handler synthesized* (writeset,
+handler-generated Cmd-runtime bytes, wire-shipped bytes) are then a
+deterministic function of those inputs and therefore need not carry
+independent durability — they are derivable on demand.
+
+The distinction matters because *bytes the handler observed from
+outside the system* (request bodies, fetch response bodies) are
+**inputs**, not outputs — they came from elsewhere, the handler did
+not synthesize them, and re-execution cannot reconstruct them. They
+must be durable in their own right. BlobStore consequently plays two
+roles depending on what's stored:
+
+| Substrate / role | What lives there | Loss semantics |
+|---|---|---|
+| Raft (env-0) — durable inputs | Tape Msg (inline) + readset structural metadata + BodyRef pointers to large input bytes; also cached writesets | Permanent loss = system invariant broken |
+| BlobStore — **input-bytes home** | Request bodies, fetch response bodies, inbound chunks (referenced from readset BodyRefs at `{tenant}/readset-blobs/{batch_id}`) | Permanent loss = lost input; **unrecoverable** — these bytes came from outside, can't be re-derived |
+| BlobStore — **output-bytes cache** | Handler-synthesized bytes (e.g. content-addressed `blob.put` payloads at `{tenant}/blobs/{hash}`) | Transient loss = re-derivable by re-executing the source activation against its readset |
+| Wire | Bytes shipped to a client (`response.write`) | Ephemeral — not retained anywhere |
+
+The two BlobStore roles share a backend and addressing but have
+opposite recovery stories. **Input bytes** have no other home — they
+entered the system from outside and the BlobStore copy is the only
+record. They must be durable *before* any handler observes them
+(`readset-replication-plan.md` §5 callback-gating is exactly this
+gate). **Output bytes** (a `blob.put` payload) are a pure function of
+inputs — recovery re-executes the source activation against the
+recorded readset, finds the matching `blob.put` call, re-issues the
+PUT (idempotent via content-addressing). They may be **transiently
+unavailable** between commit and recovery without breaking any
+invariant.
+
+The writeset rides in the raft entry alongside the readset, but only as
+an *optimization* — followers apply it directly rather than re-execute
+QuickJS. If lost, it's reconstructible by replay. Same shape: cached
+output, source-of-truth elsewhere.
+
+This is what makes §6 rule 4 ("durability stays in one home — and that
+home is JS") actually work for arbitrary-sized handler payloads: a JS
+shim's durability marker need not contain the bytes being made durable,
+only a pointer to the activation that can re-derive them. For input
+bytes the marker pattern doesn't apply at all — they're routed through
+readset-replication's body-buffer-then-blob mechanism, durable by
+construction at the point a handler can observe them.
+
 ## 3. Every effect is a composition
 
 No effect is primitive. Each is `Msg-origin(s) ⊕ Cmd-runtime(s) ⊕
@@ -111,6 +162,8 @@ Continuation? ⊕ Model?`:
 | outbound HTTP — `on_chunk` (Pattern A) | http-chunk / http-done | http-out | yes | streaming response — chunks fire activations |
 | outbound HTTP — `pipe_to` (Pattern B) | **none** | http-out ⊕ connection-write | no | Cmd ⊕ Cmd, no Msg → structurally untaped *by derivation* |
 | `webhook.send` / `email.send` (JS shims) | (the shim's `on_result`) | kv-write ⊕ http-out | yes | durable-intent is a *composition* — kv marker + outbound HTTP + retry-cron + boot-subscription, none of them new primitives |
+| `blob.put` (JS shim) | http_done from PUT | kv-write ⊕ http-out | yes | content-addressed marker `_blob/owed/{hash}` (pointer to source activation, NOT the bytes) + idempotent PUT; recovery re-executes the source activation to re-derive bytes — bytes too large to fit in marker, but inputs are durable so they're derivable; §2.5 |
+| `blob.get` (JS shim) | http_done (or http_chunk if streamed) | http-out | yes | direct `http.fetch(blob_url(hash))` with all three dispositions; local-BlobBackend fast-path is a JS-shim choice, not a primitive distinction; no marker, no durability — failed read = client retries |
 | subscriptions (cron/boot/kv-react) | cron / boot / kv-react | — | no | Msg origin alone; boot composes a kv-write marker for idempotency |
 | streaming response (`__rove_stream`) | wake / disconnect | response-write | yes | the Continuation *is* the held stream |
 | connection-actor | inbound frame | connection-write | yes | duplex: a Msg origin and a Cmd runtime on one Continuation |
@@ -141,6 +194,24 @@ findings rather than excusing them:
   path (pattern-match the shim, dispatch native) is a post-launch
   optimization that does not change the customer-facing API.
   See `effect-reification-plan.md` Phase 5 for the migration steps.
+- **`blob.put` / `blob.get` are JS shims, not Cmd primitives.**
+  Earlier drafts of `effect-reification-plan.md` Phase 7 specced
+  `blob.put` as a Zig `Cmd.blob_put` variant; revised 2026-05-25
+  to the shim form per the same composition discipline as
+  `webhook.send`. The shape: customer-facing `blob.put(hash, bytes)`
+  resolves via a callback Msg (transport is `http.fetch` PUT to the
+  configured BlobBackend's URL); a `_blob/owed/{hash}` marker rides
+  the activation's writeset for durability. The marker cannot carry
+  the bytes (potentially many MB), so recovery uses re-execution —
+  retry-cron / boot-sub finds the marker, re-runs the source
+  activation against its recorded readset (§2.5), extracts the
+  bytes from the matching `blob.put` call by index, and re-issues
+  the PUT (idempotent via content-addressing). `blob.get` is even
+  simpler — a direct `http.fetch(blob_url(hash))` with no marker
+  (failed read = client retries). Full recovery semantics depend on
+  `readset-replication-plan.md` shipping; until then, `blob.put`
+  degrades to at-most-once with transient retry, matching the
+  pre-revision Cmd-primitive's semantics.
 
 ## 4. The contract — six questions every effect answers
 
@@ -180,9 +251,11 @@ Ten effect-shapes scored against §4. `✓` conforms, `✗` diverges.
 | outbound HTTP — A (`on_chunk`) | same | `http_chunk` / `http_done` | ephemeral |
 | outbound HTTP — B (`pipe_to`) | same + `pipe_to` | outside the handler (one `http_pipe_done`) | ephemeral |
 | `webhook.send` / `email.send` (JS shims) | `_send/owed/{id}` kv write + a `PendingFetch` | the shim's `on_result` (a chain activation triggered by `http_done`) | durable-intent = composition (kv write rides env-0 atomic with handler) |
+| `blob.put` (JS shim) | `_blob/owed/{hash}` kv write (pointer to source activation, no bytes) + `PendingFetch` PUT to BlobBackend URL | the shim's `on_result` (a chain activation triggered by `http_done`) | durable-intent = composition; recovery via re-execution per §2.5; requires readset-replication for full semantics |
+| `blob.get` (JS shim) | `PendingFetch` GET against BlobBackend URL | `http_done` (or `http_chunk` if streamed) | ephemeral; no marker (failed read = client retries) |
 | subscriptions | deploy-time spec file — no runtime Cmd | `subscription_fire` activation | ephemeral (boot: marker rides writeset) |
 | streaming out | `__rove_stream({write, waitFor})` | `wake_batch` / `disconnect` | ephemeral entity; per-activation writes replicated |
-| streaming in (body) | — | — | **NOT BUILT** (gap 2.4) |
+| streaming in (body) | — | `inbound_chunk` Msg with `BodyRef` payload (per readset-replication §4.4) | input bytes durable in BlobStore via `{tenant}/readset-blobs/{batch_id}`; callback gated on `durable_offset` advance; **NOT BUILT** (gap 2.4 — design in readset-replication-plan §4 + primitive-gaps §7) |
 | conn-actor out (held-sync §6.4) | `__rove_next` / stream chunks | `send_callback` resume | ephemeral entity |
 | conn-actor in (WS frames) | — | — | **NOT BUILT** (gap 2.5 / §6.3) |
 
@@ -194,6 +267,8 @@ Ten effect-shapes scored against §4. `✓` conforms, `✗` diverges.
 | KV write | taped ✓ | overlay cap ✓; `WriteSet` itself unbounded ✗ | at-most-once client / at-least-once raft | overlay + `WriteSet` + `pending_txns` map + `raft_pending_*` collection |
 | outbound HTTP — whole / A / B | taped at the http-done / http-chunk Msg ingress (Phase 2D wires the hook; closes worklist #1) | `fetch_pending` unbounded ✗; per-fetch caps ✓ | at-most-once; B untaped *by design* (no Msg origin); whole + A at-most-once with no kernel-level recovery | `fetch_pending` list + `fetch_event_pending` collection (both retire in Phase 2D) + `StreamChunks` / `PipeState` on entity for B |
 | `webhook.send` / `email.send` (JS shims) | marker taped via the ordinary env-0 writeset; the shim's `on_result` activation is taped like every other chain hop ✓ | retry-cron rate ✓ ; first-attempt rides handler dispatch; subsequent attempts ride the cron sweep ✓ | at-least-once at the *attempt* level (M1) via marker-write/clear; **NOT** retry-to-success — that is the shim's policy choice | `_send/owed/{id}` kv (durable, replicated) + the shim's per-attempt scratch state |
+| `blob.put` (JS shim) | marker taped via env-0 writeset ✓; PUT request itself rides http-out's taping; `on_result` is taped like any chain hop ✓ | retry-cron rate ✓; bytes ride the activation's QJS arena until first PUT completes (not held across retries — recovery re-derives) | transient-loss-tolerant; **eventually recoverable** from inputs via re-execution per §2.5 — content-addressing makes retry idempotent; readset-replication is the recovery prerequisite | `_blob/owed/{hash}` kv (durable, replicated) carries only `{correlation_id, seq, call_index, dest_key}`; bytes themselves live in BlobStore at `{tenant}/blobs/{hash}` (cache; transiently absent OK) |
+| `blob.get` (JS shim) | http-out taping applies ✓ | http-out's `fetch_pending` cap ✓ | at-most-once read; transient backend miss surfaces as 503 — caller retries; no recovery, no marker | none |
 | subscriptions | taped per fire ✓ | cron 1 Hz ✓; kv-react no limit ✗; per-tenant cap maybe NOT BUILT | at-most-once; boot double-fire UNCLEAR | `subscription_fire_pending` collection ✓; `cron_state` plain hashmap ✗ |
 | streaming out | taped per activation ✓ (cap 10 MB / 50k) | wake ring K=32 + `StreamChunks` 256 KB — lossy, surfaced ✓ | at-most-once stream; chunks may ship pre-commit ✗ | stream collections ✓ |
 | conn-actor out | taped per activation ✓ | `StreamChunks` 256 KB ✓ | at-most-once flush; cross-worker resume = linear scan + requeue ✗ | `parked_continuations` collection ✓ |
@@ -251,17 +326,32 @@ What the algebra predicts, each collapsing N runtimes to 1:
    cannot instantiate a Msg origin without the tape hook.
 
 4. **Durability stays in one home — and that home is JS.** Proven by
-   the `schedules.db` retirement (2026-05-19) AND extended by the
-   `http.send` → JS-shim decision (2026-05-22). The standing rule: a
-   durable-intent effect is *always* the JS composition `kv.set("_send/
-   owed/{id}", ...)` (rides envelope-0 atomic with the handler's
-   writes) + outbound HTTP + a retry cron subscription + a boot
-   subscription on leader-promotion. No new store, no new envelope
-   type, no new Zig primitive. The composition is part of the standard
-   library (`webhook.send.js`, `email.send.js`) — the platform
-   dogfoods its own primitives, and customers can read or fork the
-   policy. A paid-tier fast path that pattern-matches the shim is a
-   post-launch optimization, not part of the model.
+   the `schedules.db` retirement (2026-05-19), extended by the
+   `http.send` → JS-shim decision (2026-05-22), and extended again by
+   the `blob.put` → JS-shim decision (2026-05-25). The standing rule:
+   a durable-intent effect is *always* the JS composition `kv.set(
+   "_<verb>/owed/{key}", ...)` (rides envelope-0 atomic with the
+   handler's writes) + outbound HTTP + a retry cron subscription + a
+   boot subscription on leader-promotion. No new store, no new
+   envelope type, no new Zig primitive. The composition is part of
+   the standard library (`webhook.send.js`, `email.send.js`,
+   `blob.put.js`) — the platform dogfoods its own primitives, and
+   customers can read or fork the policy.
+
+   **The marker holds bytes when it can; otherwise it holds a
+   re-execution pointer.** `webhook.send` / `email.send` markers carry
+   the request body inline because it's small. `blob.put` markers can't
+   — payloads are arbitrary size. Instead the marker holds
+   `{correlation_id, seq, call_index, dest_key}`, and recovery
+   re-executes the source activation against its recorded readset
+   (§2.5) to re-derive the bytes. The pattern accommodates both via the
+   same retry-cron + boot-sub plumbing; only the marker shape differs.
+   This dependency on the readset being durable makes
+   `readset-replication-plan.md` the prerequisite for `blob.put`'s full
+   recovery story.
+
+   A paid-tier fast path that pattern-matches a shim and dispatches
+   native is a post-launch optimization, not part of the model.
 
 The shape of the minimal set: **two singletons that must never be
 duplicated (the Model, the Continuation), and two open families whose
@@ -319,11 +409,33 @@ plan is the systematic way to clear this list.
    collapse. **Supersedes** the closed-by-retirement
    `events.emit` worklist item (previously #7) — that surface is
    already gone.
+8. **Ship `blob.put.js` / `blob.get.js` shims instead of Phase 7's
+   `Cmd.blob_put` primitive** (2026-05-25 decision; revises
+   `effect-reification-plan.md` Phase 7 PR-1). `blob.put.js`
+   composes `kv.set("_blob/owed/{hash}", {correlation_id, seq,
+   call_index, dest_key})` + `http.fetch` PUT to the BlobBackend
+   URL + the existing retry-cron / boot-sub plumbing.
+   `blob.get.js` is a direct `http.fetch(blob_url(hash))` shim with
+   the same response-disposition options as outbound HTTP (whole /
+   on_chunk / pipe_to). Recovery for `blob.put` uses re-execution
+   per §2.5 — the marker doesn't carry bytes (potentially MB), so
+   the cron sweep re-runs the source activation against its readset
+   to re-derive the bytes and re-issue the PUT (idempotent via
+   content-addressing). **Depends on readset-replication landing**
+   for full recovery semantics; without it, `blob.put` degrades to
+   at-most-once-with-transient-retry (matching the pre-revision
+   Cmd-primitive's semantics — same delivery class, simpler engine
+   surface). Phase 7's `compile.queue` Cmd + `compile_done` Msg
+   stay as Zig primitives — compile is CPU-bound in-process work
+   with no underlying primitive to shim over.
 
-Known catalog gaps, *not* incoherence: streaming inbound body (gap 2.4),
-connection-actor inbound / WebSocket (gap 2.5 / §6.3), `http.cancelFetch`
-transport. Also: `src/connection_holder/` is superseded dead code
-carrying a parallel connection model — delete or clearly mark v2-WIP.
+Known catalog gaps, *not* incoherence: streaming inbound body
+(gap 2.4 — design path: `readset-replication-plan.md` §4 + the
+inbound side of `primitive-gaps.md` §7's persist-before-observe
+rule; both designed, neither built), connection-actor inbound /
+WebSocket (gap 2.5 / §6.3), `http.cancelFetch` transport. Also:
+`src/connection_holder/` is superseded dead code carrying a
+parallel connection model — delete or clearly mark v2-WIP.
 
 ## 8. Relation to existing docs
 
@@ -336,9 +448,21 @@ of.
   the open destination this doc calls "one Continuation runtime."
 - **`primitive-gaps.md` §5** — four of the laws stated as per-gap
   disciplines (affine, commit-gated, replayability, bounded tape). §6
-  is the bound on L3's tape.
+  is the bound on L3's tape; §7 is the customer-facing surface
+  (`blob.put` / `blob.get` shims, inbound-body persist-before-observe)
+  for the §2.5 substrate distinction this doc names.
+- **`readset-replication-plan.md`** — the durable-input substrate
+  this doc's §2.5 corollary depends on: every "body" routes through
+  a per-tenant BlobStore buffer with callback-gating on
+  `durable_offset`; the readset in the raft entry makes
+  re-execution (and therefore `blob.put` recovery, §6 rule 4) work
+  without navigating Model history.
 - **`streaming-model.md`** — the response-write Cmd runtime + the
   wake / disconnect Msg origins, as one instantiation.
 - **`connection-actor-plan.md`** — the duplex connection effect:
   connection-write Cmd runtime + frame Msg origin on one Continuation.
+- **`effect-reification-plan.md` Phase 7** — Phase 7's PR-1
+  (`Cmd.blob_put` primitive) is revised by §7 worklist item 8 above
+  to ship as a JS shim instead; Phase 7's compile-worker (PR-2)
+  remains a Zig primitive.
 - **`docs/PLAN.md` §13** — the live process / surface map.

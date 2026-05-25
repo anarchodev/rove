@@ -651,6 +651,102 @@ replayable static-asset streaming, and full-fidelity LLM-stream
 replay as an opt-in premium — the one streaming case where the
 tape is the sole path to determinism.
 
+### 7.4 Customer-facing blob primitives — `blob.put` / `blob.get` as JS shims
+
+The §7 mechanism (bytes in CAS, references in tape) also surfaces as a
+customer-facing API. Originally specced in `effect-reification-plan.md`
+Phase 7 as a Zig `Cmd.blob_put` primitive, revised 2026-05-25 to ship
+as JS shims following the `webhook.send` / `email.send` composition
+discipline (`effect-algebra.md` §6 rule 4).
+
+**Customer code:**
+
+```js
+const hash = await sha256(bytes);             // pure compute, sync
+kv.set("manifest/foo", hash);                 // optional: link from manifest atomically
+const r = await blob.put(hash, bytes);        // → http_done Msg; bytes land in BlobBackend
+const got = await blob.get(hash);             // → http_done Msg; returns bytes
+```
+
+Both verbs resolve via callback Msg (same shape as `http.fetch`). The
+read is async because the BlobBackend is either S3 (network) or a
+shared fs mount (still I/O) — sync access would break the
+request-throughput model regardless of backend choice.
+
+**Implementation — both are JS shims composing existing primitives:**
+
+- **`blob.put.js`**: `kv.set("_blob/owed/{hash}", marker)` (rides
+  envelope-0 atomic with the handler's other writes) +
+  `http.fetch(blob_url(hash), {method: PUT, body: bytes})`. The marker
+  carries `{correlation_id, seq, call_index, dest_key}` — **not the
+  bytes** (potentially MB-scale, can't fit in kv).
+- **`blob.get.js`**: direct `http.fetch(blob_url(hash))` with all
+  outbound-HTTP dispositions (whole / `on_chunk` / `pipe_to`). No
+  marker, no durability — a failed read surfaces a 503; caller
+  retries. Local-BlobBackend fast-path is a shim-internal
+  optimization (skip the http round-trip, read from fs directly);
+  doesn't change the algebra.
+
+**Recovery for `blob.put` uses re-execution** (`effect-algebra.md` §2.5).
+The retry-cron / boot-sub finds stale markers, re-runs the source
+activation against its recorded readset, finds the matching `blob.put`
+call by `call_index`, extracts the bytes, re-issues the PUT (idempotent
+via content-addressing). This works because handler activations are
+deterministic functions of `(Msg, Model snapshot, bytecode)` — every
+byte a `blob.put` is given is a derivable output of inputs the tape
+already preserves.
+
+**Three sharp edges:**
+
+1. **Recovery depends on readset-replication.** Without the readset in
+   raft entries (`readset-replication-plan.md`), re-execution can't
+   resolve foreign reads (foreign fetches, foreign trigger payloads).
+   For v1 (pre-readset-replication), `blob.put.js` ships with
+   at-most-once-with-transient-retry semantics — worker crash mid-PUT =
+   customer must re-issue. Customer-visible delivery class matches
+   Phase 7's pre-revision Cmd-primitive exactly; the cleaner recovery
+   story turns on later.
+2. **The marker is small even for huge blobs.** Structural benefit
+   over a "marker holds the body" pattern (which works for
+   `webhook.send` because bodies are small but doesn't scale to MB
+   payloads). The trade is a more complex retry path (re-execution
+   rather than re-read-from-marker) — same retry-cron + boot-sub
+   plumbing, just a fancier "extract bytes" step.
+3. **Output bytes are a cache; input bytes are durable.** A
+   `blob.put` payload IS a derivable output (`effect-algebra.md` §2.5);
+   transient loss is OK because re-derivation works. An incoming
+   request body or fetch response body is a durable *input*; loss is
+   unrecoverable. Both kinds of bytes share the same BlobBackend and
+   are addressed similarly, but their loss-semantics are opposite.
+   Customer code doesn't distinguish (both look like "bytes at hash H");
+   the engine does, via path namespacing
+   (`{tenant}/blobs/{hash}` for outputs, `{tenant}/readset-blobs/{batch_id}`
+   for input-buffer batches).
+
+**Inbound streaming bodies (gap 2.4) flow through the same substrate
+on the input side.** Bytes go to BlobStore via readset-replication's
+per-tenant buffer; `BodyRef` rides the tape; the activation fires only
+after `durable_offset` advances past the body's range
+(`readset-replication-plan.md` §5). There's no separate "inbound spill
+primitive" — the buffer + callback-gate IS the primitive, on the
+input-side dual of `blob.put`'s output-side composition. Gap 2.4
+becomes "ship readset-replication" rather than designing a new effect.
+
+**The asymmetry that justifies all of this:**
+
+| Direction | Bytes are… | Storage role | Loss semantics |
+|---|---|---|---|
+| Inbound body chunk / fetch response chunk | recorded **input** | Durable home (no other copy) | Unrecoverable; engine must persist-before-observe |
+| Outbound `response.write` chunk | derived **output** | Wire only | Ephemeral; re-derivable |
+| Customer `blob.put` payload | derived **output** | Cache (re-derivable) | Transiently unavailable, recoverable from inputs |
+| `pipe_to` upstream → wire | neither input nor output of handler | Neither (transit) | Structurally untaped per design |
+
+This is the same asymmetry §6 + §7 carry at the tape layer, surfaced
+as a customer-facing API. The rule "only inputs need to be stored
+durably; outputs are derivable" makes the engine cheap (no need to
+durably store handler outputs except as caches) and the recovery story
+unified (re-execute, don't restore-from-redundant-copy).
+
 ---
 
 ## 8. Minimal read set — drop writes and own-reads from the tape
