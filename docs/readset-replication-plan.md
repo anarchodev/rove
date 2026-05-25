@@ -452,26 +452,45 @@ last 100ms of pre-crash requests.
   buffer is the natural scaffolding for §4 propose gating; the
   gating predicate just becomes "batches flushed past the BodyRef
   ranges."
-- **`effect-reification-plan.md` Phase 7 (`blob.put` Cmd)** —
-  orthogonal primitive on the same `BlobBackend` transport. The
-  contrast:
+- **`effect-reification-plan.md` Phase 7 (`blob.put.js` shim)** —
+  customer-facing blob primitives sit alongside this plan's
+  transport-streaming on the same `BlobBackend`. Originally specced
+  as a Zig `Cmd.blob_put` variant; revised 2026-05-25 to ship as a
+  JS shim composing `kv.set("_blob/owed/{hash}", marker) +
+  http.fetch PUT` (see `effect-algebra.md` §6 rule 4 +
+  `primitive-gaps.md` §7.4). The contrast:
 
-    | property         | this plan (transport streaming) | `blob.put` Cmd (Phase 7) |
-    |------------------|---------------------------------|--------------------------|
-    | initiator        | engine (curl_multi / H2 in)     | handler returns the Cmd  |
-    | timing           | out-of-band, pre-commit         | commit-gated (L4)        |
-    | addressing       | `(batch_id, offset, len)`       | content hash (sha256)    |
-    | one PUT covers   | many bodies (batched)           | one blob                 |
-    | semantics        | append-as-bytes-arrive          | PUT-if-not-exists        |
-    | gating signal    | `durable_offset` advance        | raft entry commit        |
-    | reuse / dedupe   | none (bytes are append-only)    | identical bytes dedupe   |
+    | property         | this plan (transport streaming) | `blob.put.js` shim (revised Phase 7 PR-1a/1b; recovery in PR-1c) |
+    |------------------|---------------------------------|-------------------------------------------|
+    | initiator        | engine (curl_multi / H2 in)     | customer JS via `blob.put(hash, bytes)`   |
+    | composition      | dedicated buffer + flusher      | kv-write ⊕ http-out (no new Zig primitive)|
+    | timing           | out-of-band, pre-commit         | marker rides writeset; PUT fires post-commit (L4) |
+    | addressing       | `(batch_id, offset, len)`       | content hash (sha256)                     |
+    | one PUT covers   | many bodies (batched)           | one blob                                  |
+    | semantics        | append-as-bytes-arrive          | PUT-if-not-exists                         |
+    | gating signal    | `durable_offset` advance        | marker presence + commit                  |
+    | recovery         | not applicable (input bytes durable on arrival) | re-execute source activation against this plan's recorded readset to re-derive bytes |
+    | reuse / dedupe   | none (bytes are append-only)    | identical bytes dedupe                    |
+    | loss semantics   | **unrecoverable** if buffer lost pre-flush (system invariant break) | **transient** — bytes are a cache; durable inputs let us re-derive |
 
-  Both runtimes use the same `BlobBackend` (FilesystemBlobStore or
-  S3BlobStore) but at the Cmd level they are distinct because the
-  lifecycles don't overlap: transport-streaming bytes are external
-  observations that must be durable before the handler reads them;
-  `blob.put` bytes are handler-produced and must be durable before
-  the manifest references them.
+  Both use the same `BlobBackend` (FilesystemBlobStore or
+  S3BlobStore) but play opposite roles: the transport-streaming
+  buffer is the **durable home** for input bytes (external
+  observations with no other copy), while `blob.put.js` writes the
+  **derivable cache** for handler-produced bytes (recoverable from
+  inputs via re-execution per `effect-algebra.md` §2.5).
+  Different `BlobBackend` paths — `{tenant}/readset-blobs/{batch_id}`
+  for this plan's buffer, `{tenant}/blobs/{hash}` for content-addressed
+  customer blobs — keep the two namespaces distinct on the storage
+  side.
+
+  **Dependency direction:** `blob.put.js`'s recovery story
+  (re-execute source activation, re-derive bytes from inputs,
+  re-issue PUT) requires this plan's readset to be in the raft
+  entry. Until this plan ships, `blob.put.js` degrades to
+  at-most-once-with-transient-retry (matching the pre-revision
+  Cmd-primitive's delivery class — same semantics, simpler engine
+  surface).
 
 - **`replay-wasm-plan.md`** — readset format here should match what
   the WASM replay engine consumes. Phase 1 of this plan should align
