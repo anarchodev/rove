@@ -35,6 +35,7 @@
 const std = @import("std");
 const kv_mod = @import("rove-kv");
 const rove = @import("rove");
+const h2 = @import("rove-h2");
 const globals_mod = @import("../globals.zig");
 const components_mod = @import("../components.zig");
 
@@ -76,6 +77,32 @@ pub const Cmd = union(enum) {
     /// Phase 4.1's race-fix half.
     http_fetch: globals_mod.PendingFetch,
 
+    /// Phase 4.1.3: H2 response stamping deferred to commit time.
+    /// Carries the h2 response payload (Status / RespHeaders /
+    /// RespBody / H2IoResult) plus the entity reference + the
+    /// source/dest collection enum so `interpretCmd` can stamp the
+    /// components on the entity AND move it to its commit
+    /// destination in one go.
+    ///
+    /// Session + StreamId stay stamped early (at handler-success
+    /// time) because the fault arm of `drainEntityArm` needs them
+    /// to ship a 503 — those identity components don't change
+    /// across the success/fault split, so deferring them would
+    /// force the fault arm to set them too.
+    ///
+    /// Producer: `worker_dispatch.finalizeBatch`'s write +
+    /// barrier paths emit one Cmd.respond per success entity,
+    /// staged on the parked_units unit's BufferedCmds (alongside
+    /// kv_wake_broadcast + http_fetch). The entity itself sits in
+    /// `raft_pending_{response,cont,stream}` with default-value h2
+    /// payload components; `interpretCmd` stamps the real values
+    /// at commit time + moves to dest. Fault arm
+    /// (`drainEntityArm` fault branch) stamps Status=503 +
+    /// canned-body RespBody as today; the entity's RespHeaders
+    /// stays empty on fault (was the handler's leaked headers
+    /// pre-4.1.3 — arguably more correct).
+    respond: RespondOut,
+
     /// Connection-actor frame write — paired with `inbound_frame`
     /// Msg origin on one `Continuation` (the duplex effect, see
     /// `docs/connection-actor-plan.md`). Not built (gap 2.5 closed
@@ -92,6 +119,7 @@ pub const Cmd = union(enum) {
             .stream_chunk => |sc| if (sc.bytes.len > 0) allocator.free(sc.bytes),
             .stream_close => {},
             .http_fetch => |*pf| pf.deinit(allocator),
+            .respond => |*ro| ro.deinit(allocator),
             .conn_write => |*fo| fo.deinit(allocator),
         }
         self.* = undefined;
@@ -127,6 +155,64 @@ pub const StreamChunkOut = struct {
 /// `interpretCmd` can find the `StreamDraining` component.
 pub const StreamCloseSignal = struct {
     stream_entity: rove.Entity,
+};
+
+/// `respond` Cmd payload — Phase 4.1.3's commit-arm entity move
+/// for an H2 response entity. The h2 payload components (Status /
+/// RespHeaders / RespBody / H2IoResult) are already stamped on
+/// the entity at handler-success time (`worker_dispatch.zig` per
+/// success); this Cmd just routes the post-commit `reg.move` from
+/// `raft_pending_X` → the per-success destination through
+/// `interpretCmd` instead of inline in `drainEntityArm`'s commit
+/// arm. The architectural value is the exhaustive-switch
+/// contract: every buffered entity-state-transition kind now has
+/// a typed Cmd variant + interpretCmd arm.
+///
+/// (Earlier 4.1.3 draft also DEFERRED the component stamping into
+/// the Cmd payload. That broke the read-only fast path — which
+/// stamps + moves the entity inline without producing a Cmd, so
+/// h2 ended up shipping with Status=0 default values. Restricting
+/// the Cmd to the move-only shape avoids that footgun; the
+/// payload-deferral can be revisited if commit-time component
+/// stamping becomes valuable for a specific reason.)
+pub const RespondOut = struct {
+    entity: rove.Entity,
+    /// Which raft_pending_X collection the entity is in NOW. The
+    /// interpreter's `reg.move` source.
+    source: SourceColl,
+    /// Where the entity moves on commit. Mirrors today's
+    /// `drainEntityArm` on_commit_dest values.
+    dest: DestColl,
+
+    /// Three raft_pending_* siblings → three source enums (mirrors
+    /// today's `drainResponsePending` / `drainContPending` /
+    /// `drainStreamPending` per-arm wrappers around
+    /// `drainEntityArm`).
+    pub const SourceColl = enum {
+        raft_pending_response,
+        raft_pending_cont,
+        raft_pending_stream,
+    };
+
+    /// Per-source destination, mirroring today's `on_commit_dest`
+    /// values: response → h2.response_in (h2 ships from here);
+    /// cont → worker.parked_continuations (held-sync awaits
+    /// resume); stream → h2.stream_response_in (h2's streaming
+    /// pipeline takes over).
+    pub const DestColl = enum {
+        response_in,
+        parked_continuations,
+        stream_response_in,
+    };
+
+    pub fn deinit(self: *RespondOut, allocator: std.mem.Allocator) void {
+        _ = self;
+        _ = allocator;
+        // Move-only Cmd; no owned payload to free. The h2
+        // components on the entity are freed when the entity
+        // destroys (via the component types' own deinit) — same
+        // ownership chain pre-4.1.3.
+    }
 };
 
 /// Connection-actor write payload. Placeholder shape; the producer
@@ -264,6 +350,29 @@ pub fn interpretCmd(
                 pfm.deinit(allocator);
             };
         },
+        .respond => |ro| {
+            // Resolve source + dest collection pointers from the
+            // enum. Each branch is a single typed pointer; the
+            // chain below uses anytype on `reg.set` / `reg.move`
+            // so we don't need to make the pointer types match.
+            switch (ro.source) {
+                .raft_pending_response => stampAndMoveRespond(
+                    worker,
+                    ro,
+                    &worker.raft_pending_response,
+                ),
+                .raft_pending_cont => stampAndMoveRespond(
+                    worker,
+                    ro,
+                    &worker.raft_pending_cont,
+                ),
+                .raft_pending_stream => stampAndMoveRespond(
+                    worker,
+                    ro,
+                    &worker.raft_pending_stream,
+                ),
+            }
+        },
         .conn_write => |fo| {
             // Producer for this variant is inbound WebSocket
             // server, which is a separate plan. Reaching this arm
@@ -279,6 +388,29 @@ pub fn interpretCmd(
                 .{},
             );
         },
+    }
+}
+
+/// `respond` interpreter shared body. Stamps the four payload
+/// components on the entity in `source_coll`, then moves to the
+/// dest collection chosen per `ro.dest`. Helper exists so each
+/// `source` switch arm can pass a concrete (typed) collection
+/// pointer without `interpretCmd` itself growing nine-way nested
+/// switches.
+fn stampAndMoveRespond(worker: anytype, ro: RespondOut, source_coll: anytype) void {
+    const server = worker.h2;
+    // Move-only: the h2 response components are already stamped
+    // on the entity in `source_coll` (at handler-success time in
+    // `worker_dispatch`). Just route the entity to its commit
+    // destination. The `parked_continuations` collection lives on
+    // `worker`, not `worker.h2`; the others live on h2.
+    switch (ro.dest) {
+        .response_in => server.reg.move(ro.entity, source_coll, &server.response_in) catch |err|
+            std.log.warn("interpretCmd respond: move→response_in: {s}", .{@errorName(err)}),
+        .parked_continuations => server.reg.move(ro.entity, source_coll, &worker.parked_continuations) catch |err|
+            std.log.warn("interpretCmd respond: move→parked_continuations: {s}", .{@errorName(err)}),
+        .stream_response_in => server.reg.move(ro.entity, source_coll, &server.stream_response_in) catch |err|
+            std.log.warn("interpretCmd respond: move→stream_response_in: {s}", .{@errorName(err)}),
     }
 }
 
