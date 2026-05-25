@@ -144,15 +144,6 @@ const Request = dispatcher_mod.Request;
 pub const RaftWait = struct {
     seq: u64 = 0,
     deadline_ns: i64 = 0,
-    /// Phase 4.1.3: set true by `worker_dispatch.finalizeBatch`
-    /// when this entity's h2 response payload is staged as a
-    /// `Cmd.respond` on the parked_units unit. `drainEntityArm`'s
-    /// commit arm reads this and SKIPS the `reg.move`
-    /// (interpretCmd does it). Default false preserves legacy
-    /// paths (/_system/release, /_system/admin_kv, etc.) that
-    /// stamp h2 components inline and expect drainEntityArm to
-    /// move the entity on commit.
-    respond_deferred: bool = false,
 };
 
 /// Effect-reification Phase 4.1: the typed Cmd buffer a `ParkedUnit`

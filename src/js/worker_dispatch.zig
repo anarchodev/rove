@@ -579,7 +579,6 @@ fn finalizeBatch(
                 try server.reg.set(s.ent, &server.request_out, RaftWait, .{
                     .seq = seq,
                     .deadline_ns = deadline_ns,
-                    .respond_deferred = true,
                 });
                 if (is_stream) {
                     try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_stream);
@@ -798,10 +797,9 @@ fn finalizeBatch(
     // commit-arm move (raft_pending_X → response_in /
     // parked_continuations / stream_response_in) through
     // `interpretCmd` instead of `drainEntityArm`'s inline move.
-    // `respond_deferred = true` on the RaftWait below tells
-    // `drainEntityArm` to skip its own move (interpretCmd's
-    // .respond arm does it via the parked_units sweep in the
-    // same tick).
+    // Post-Option-2 every path that parks an entity in
+    // raft_pending_X also emits Cmd.respond, so `drainEntityArm`
+    // unconditionally skips the move on commit.
     for (successes.items) |*s| {
         const is_stream = s.stream != null;
         const is_cont = s.cont != null;
@@ -1745,6 +1743,23 @@ fn handleRelease(
         .deadline_ns = deadline_ns,
     });
     try server.reg.move(ent, &server.request_out, &worker.raft_pending_response);
+    // Phase 4.1.3 Option-2 (full Pattern B): emit a move-only
+    // Cmd.respond on a parked_unit so the commit-arm move routes
+    // through `interpretCmd .respond` (matching every other entity
+    // park path). Pass empty writeset — handleRelease's actual kv
+    // writes (`_deploy/current`) ride on the entity's own txn in
+    // pending_txns; the parked_unit here is move-routing-only.
+    var release_cmds: effect_mod.cmd.BufferedCmds = .{};
+    release_cmds.items.append(allocator, .{ .respond = .{
+        .entity = ent,
+        .source = .raft_pending_response,
+        .dest = .response_in,
+    } }) catch {};
+    const empty_ws = kv_mod.WriteSet.init(allocator);
+    var ws_local = empty_ws;
+    defer ws_local.deinit();
+    worker_mod.parkKvWakes(worker, seq, parsed.value.tenant_id, &ws_local, release_cmds) catch |perr|
+        std.log.warn("release: parkKvWakes (tenant={s}) failed: {s}", .{ parsed.value.tenant_id, @errorName(perr) });
 }
 
 /// Body shape: `{"pairs":[{"key":"<k>","value":"<v>"}, ...]}`. Writes
@@ -1866,6 +1881,22 @@ fn handleAdminKv(
     });
     // Phase 5: admin kv-write is always terminal — response sibling.
     try server.reg.move(ent, &server.request_out, &worker.raft_pending_response);
+    // Phase 4.1.3 Option-2 (full Pattern B): emit Cmd.respond on a
+    // parked_unit so the commit-arm move routes through `interpretCmd
+    // .respond` (matching every other entity park path). Pass empty
+    // writeset — admin-kv's actual writes ride on the entity's own
+    // txn in pending_txns; the parked_unit here is move-routing-only.
+    var admin_cmds: effect_mod.cmd.BufferedCmds = .{};
+    admin_cmds.items.append(allocator, .{ .respond = .{
+        .entity = ent,
+        .source = .raft_pending_response,
+        .dest = .response_in,
+    } }) catch {};
+    const empty_ws = kv_mod.WriteSet.init(allocator);
+    var ws_local = empty_ws;
+    defer ws_local.deinit();
+    worker_mod.parkKvWakes(worker, seq, tenant_mod.ADMIN_INSTANCE_ID, &ws_local, admin_cmds) catch |perr|
+        std.log.warn("admin-kv: parkKvWakes failed: {s}", .{@errorName(perr)});
 }
 
 /// Outcome of `resolveRequest`: either the request was finalized

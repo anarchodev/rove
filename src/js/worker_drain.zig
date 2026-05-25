@@ -116,18 +116,17 @@ fn drainEntityArm(
                         .{ wait.seq, @errorName(err) },
                     ),
                 }
-                // Effect-reification Phase 4.1.3: if the entity's
-                // response is deferred-staged (worker_dispatch's
-                // finalizeBatch paths set `respond_deferred=true`
-                // on the RaftWait), the parked_units arm's
-                // `interpretCmd .respond` does the move in the
-                // same tick (after this drain runs). Legacy paths
-                // (/_system/*, etc.) stamp h2 components inline
-                // and set `respond_deferred=false` (the default),
-                // expecting us to do the move here.
-                if (!wait.respond_deferred) {
-                    try server.reg.move(ent, source, on_commit_dest);
-                }
+                // Effect-reification Phase 4.1.3 Option-2: every
+                // path that parks an entity in raft_pending_X also
+                // emits a Cmd.respond on the parked_units unit
+                // (handler dispatch + barrier + /_system/release +
+                // /_system/admin_kv + cont-resume). The commit-arm
+                // move is the parked_units arm's job via
+                // `interpretCmd .respond`; we skip it here. The
+                // `on_commit_dest` parameter to this fn is now
+                // documentation-only (the actual dest enum lives
+                // on each Cmd.respond's `.dest` field).
+                _ = on_commit_dest;
             },
             .fault => {
                 switch (worker.pending_txns.rollbackAndTake(allocator, wait.seq)) {
@@ -285,6 +284,28 @@ pub fn drainRaftPending(worker: anytype) !void {
                         );
                         allocator.destroy(t);
                         unit.txn = null;
+                    } else if (worker.pending_txns.contains(unit.seq)) {
+                        // Entity-backed unit (no own txn): a sibling
+                        // `drainEntityArm` arm is responsible for
+                        // committing the txn at this seq. If the txn
+                        // is still parked, that arm conflicted
+                        // (kvexp NotChainHead — predecessor not
+                        // committed yet) and skipped its move. Our
+                        // `Cmd.respond` would otherwise move the
+                        // entity before its writes are durable — and
+                        // the orphaned txn would block every later
+                        // forgetful commit in the chain. Defer to
+                        // the next tick; the unit stays in
+                        // `parked_units` for retry.
+                        //
+                        // Effect-reification Phase 4.1.3 Option-2:
+                        // this check restores commit + move atomicity
+                        // that the pre-4.1.3 inline-move arm got for
+                        // free. The `Cmd.respond` Phase 4.1.3 decoupled
+                        // re-introduces a window where commit-and-move
+                        // are split across the entity arm and the unit
+                        // arm; this gate closes that window.
+                        continue;
                     }
                     // Effect-reification Phase 4.1: the unified
                     // commit-arm release. fireKvReactSubscriptions
@@ -523,8 +544,21 @@ fn proposeAndParkContResume(
     // same posture as the inbound write path. Cont-resume hops
     // don't accumulate http.fetch'es (the binding's
     // pending_fetches lives on `DispatchState`, set only by the
-    // inbound H2 dispatch's `Request`); pass empty extra_cmds.
-    worker_mod.parkKvWakes(worker, seq, tenant_id, writeset, .{}) catch |perr|
+    // inbound H2 dispatch's `Request`).
+    //
+    // Phase 4.1.3 Option-2: also emit Cmd.respond so the
+    // commit-arm move (raft_pending_cont → parked_continuations)
+    // routes through `interpretCmd` instead of `drainEntityArm`'s
+    // inline move. Same `source` / `dest` for both switch arms
+    // below (terminal + repark both land in raft_pending_cont
+    // and commit back to parked_continuations).
+    var cont_cmds: effect_mod.cmd.BufferedCmds = .{};
+    cont_cmds.items.append(allocator, .{ .respond = .{
+        .entity = ent,
+        .source = .raft_pending_cont,
+        .dest = .parked_continuations,
+    } }) catch {};
+    worker_mod.parkKvWakes(worker, seq, tenant_id, writeset, cont_cmds) catch |perr|
         std.log.warn("rove-js cont-resume parkKvWakes (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
 
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() +
