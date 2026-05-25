@@ -229,6 +229,11 @@ pub const Request = struct {
         event_json: []const u8,
     ) bool = null,
     resume_if_bound_ctx: ?*anyopaque = null,
+    /// `docs/curl-multi-plan.md` Phase 2: cancel-fetch trampoline.
+    /// Wired by the worker to `FetchEngine.cancel`. Null on test
+    /// paths; the JS `http.cancelFetch` becomes a no-op then.
+    cancel_fetch: ?*const fn (ctx: *anyopaque, id: []const u8) void = null,
+    cancel_fetch_ctx: ?*anyopaque = null,
     /// Per-chain identifier; the same string on every activation of
     /// one logical interaction (streaming-handlers-plan §5/§6). Set
     /// by the runtime — inbound mints it (accepts an inbound
@@ -527,6 +532,8 @@ pub const Dispatcher = struct {
             .scope_kv_ctx = request.scope_kv_ctx,
             .resume_if_bound = request.resume_if_bound,
             .resume_if_bound_ctx = request.resume_if_bound_ctx,
+            .cancel_fetch = request.cancel_fetch,
+            .cancel_fetch_ctx = request.cancel_fetch_ctx,
             .pending_fetches = request.pending_fetches,
             .is_system_module = request.is_system_module,
         };

@@ -127,6 +127,7 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
         .stream = row.stream,
         .max_response_chunk_bytes = row.max_response_chunk_bytes,
         .max_total_response_bytes = row.max_total_response_bytes,
+        .held = row.held,
     });
     // Ownership transferred — clear the carrier's slices so its
     // deinit is a no-op.
@@ -140,12 +141,18 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
 }
 
 /// `http.cancelFetch({id})` — cancel a not-yet-completed fetch.
+/// Forwards to `FetchEngine.cancel` via the `cancel_fetch`
+/// trampoline. Cooperative: a chunk already in-flight at the
+/// engine level may still land in `on_chunk` after the cancel
+/// returns; the customer's chain ctx is the place to track "we
+/// moved on" (see `docs/curl-multi-plan.md` §5 invariant 3).
 pub fn jsHttpCancelFetch(
     ctx: ?*c.JSContext,
     _: c.JSValue,
     argc: c_int,
     argv: [*c]c.JSValue,
 ) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
     if (argc < 1 or !c.JS_IsObject(argv[0])) {
         _ = c.JS_ThrowTypeError(ctx, "http.cancelFetch requires an options object with `id`");
         return js_exception;
@@ -165,13 +172,84 @@ pub fn jsHttpCancelFetch(
         _ = c.JS_ThrowRangeError(ctx, "http.cancelFetch: `id` must be 1-256 utf8 bytes");
         return js_exception;
     }
-    // Phase B no-op; Phase C wires the actual cancellation onto
-    // the fetch-pool's libcurl handle for this id.
-    std.log.warn(
-        "http.cancelFetch (Phase B): cancel-request accepted for id={s} (transport not yet wired; lands in Gap 2.3 Phase C)",
-        .{cstr[0..len]},
-    );
+    if (state.cancel_fetch) |fn_ptr| {
+        const fn_ctx = state.cancel_fetch_ctx orelse return js_undefined;
+        fn_ptr(fn_ctx, @as([*]const u8, @ptrCast(cstr))[0..len]);
+    }
+    // Engine null (test paths / non-worker dispatch) → silent
+    // no-op; matches the pre-engine behavior the JS side already
+    // expected.
     return js_undefined;
+}
+
+// ── http.subscribe / http.cancelSubscription — Phase 3 (gap 2.5) ───────
+
+/// `http.subscribe(opts) -> subscription_id` — held outbound
+/// subscription (`docs/curl-multi-plan.md` Phase 3; closes
+/// `docs/primitive-gaps.md` §2.5).
+///
+/// Same options shape as `http.fetch` minus `timeout_ms` (held
+/// transfers don't time out — they end on cancel or upstream close)
+/// and `stream` (always true: held transfers stream by definition).
+/// The `on_chunk` handler fires per upstream writeback as
+/// `fetch_chunk` activations, terminating with `final: true,
+/// ok: false` when the upstream closes — the customer's handler
+/// interprets that as "subscription ended; reconnect if desired."
+///
+/// Returns the subscription id. Pair with
+/// `http.cancelSubscription({ id })` to stop the transfer; cancel
+/// is cooperative — a chunk already in flight may still land in
+/// `on_chunk` after the cancel returns.
+pub fn jsHttpSubscribe(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    if (argc < 1 or !c.JS_IsObject(argv[0])) {
+        _ = c.JS_ThrowTypeError(ctx, "http.subscribe requires an options object");
+        return js_exception;
+    }
+    const opts = argv[0];
+
+    var row = buildFetchRow(ctx, state, opts) catch |err| switch (err) {
+        error.JsException => return js_exception,
+        else => {
+            state.pending_kv_error = err;
+            return js_exception;
+        },
+    };
+    // Held subscriptions are always streaming + don't time out.
+    // Force the shape so the customer's `timeout_ms` / `stream`
+    // options can't accidentally weaken the contract.
+    row.stream = true;
+    row.timeout_ms = 0;
+    row.held = true;
+
+    state.http_fetch_index += 1;
+    const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
+    appendPendingFetch(state, &row) catch |err| {
+        c.JS_FreeValue(ctx, res);
+        row.deinit(state.allocator);
+        state.pending_kv_error = err;
+        return js_exception;
+    };
+    row.deinit(state.allocator);
+    return res;
+}
+
+/// `http.cancelSubscription({id})` — cancel a held subscription.
+/// Identical wiring to `http.cancelFetch` (the engine cancel path
+/// is the same machinery for both kinds); the separate name is for
+/// customer-facing clarity.
+pub fn jsHttpCancelSubscription(
+    ctx: ?*c.JSContext,
+    self: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    return jsHttpCancelFetch(ctx, self, argc, argv);
 }
 
 /// Local carrier for a just-built fetch. `deinit` frees every owned slice.
@@ -197,6 +275,10 @@ const BuiltFetch = struct {
     stream: bool,
     max_response_chunk_bytes: u32,
     max_total_response_bytes: u64,
+    /// `docs/curl-multi-plan.md` Phase 3: set true by
+    /// `jsHttpSubscribe`; false for `jsHttpFetch`. Threaded into
+    /// the `PendingFetch` the engine reads.
+    held: bool = false,
 
     fn deinit(self: *BuiltFetch, allocator: std.mem.Allocator) void {
         allocator.free(self.id);

@@ -74,13 +74,16 @@ const config_mirror = @import("config_mirror.zig");
 const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
+const worker_log = @import("worker_log.zig");
+const worker_streaming = @import("worker_streaming.zig");
+const worker_drain = @import("worker_drain.zig");
 const panic_mod = @import("panic.zig");
 const penalty_mod = @import("penalty.zig");
 const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
-const fetch_pool_mod = @import("fetch_pool.zig");
+const fetch_engine_mod = @import("fetch_engine.zig");
 const builtin_modules_mod = @import("builtin_modules.zig");
 
 /// `_send/owed/` kv prefix — the durable marker key the JS-shim
@@ -143,67 +146,26 @@ pub const RaftWait = struct {
     deadline_ns: i64 = 0,
 };
 
-/// The buffered effects a `ParkedUnit` carries — commit-gated
-/// kv-wake broadcast intents + (effect-reification Phase 4.0.b)
-/// resume-hop stream chunks + terminal-draining marker staged to
-/// apply on commit.
+/// Effect-reification Phase 4.1: the typed Cmd buffer a `ParkedUnit`
+/// carries — commit-gated `kv_wake_broadcast` Cmds (was
+/// `BufferedSendKvOps.kv_wakes`), `stream_chunk` Cmds (was
+/// `staged_chunks` + `stream_entity`), `stream_close` Cmd (was
+/// `mark_draining`), and `http_fetch` Cmds (the new commit-gated
+/// staging for webhook.send's inline fetch — closes the
+/// marker-commit race the Phase-5-PR-3 close-out documented).
+/// Defined in `effect/cmd.zig`; aliased here for the
+/// `ParkedUnit = Continuation(BufferedSendKvOps, ...)` declaration
+/// below to keep the historical name in worker-internal contexts.
+///
 /// Released by `drainRaftPending` on `committedSeq >= seq` (via
-/// `firePendingKvWakes` + the streaming-commit arm); discarded on
-/// fault/timeout/leadership-loss (the effect never escaped — the
-/// §9.4 "spurious + overflow" thesis tolerates dropped kv_wakes;
-/// `streaming-model.md` §2's one rule — "a chunk reaches the wire
-/// only after the activation that produced it has committed" —
-/// makes a fault-arm chunk-discard the rule, not the exception).
-///
-/// Phase 5 PR-3: the `send_ops` field retired alongside the Zig
-/// SendDispatch kernel. The JS-shim `webhook.send` writes its
-/// `_send/owed/` marker as an ordinary writeset put; durability
-/// is composed in JS (`globals/webhook.js` + the baked
-/// `__system/webhook_onresult` module) on top of kv.set +
-/// http.fetch + the per-worker partitioned retry sweep.
-///
-/// Structural-deinit shape per the `effect.Continuation` contract:
-/// `pub fn deinit(*Self, allocator) void` walks the remaining lists.
-pub const BufferedSendKvOps = struct {
-    kv_wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty,
-
-    /// Phase 4.0.b: resume-hop stream chunks staged to ship on
-    /// commit. Each entry is an allocator-owned byte slice; the
-    /// commit arm `tryAppend`s each into `stream_entity`'s
-    /// `StreamChunks` (transferring ownership). The fault-arm
-    /// discard walks them via this type's deinit. Empty for every
-    /// non-stream `proposeForgetfulWrites` caller (disconnect,
-    /// subscription, fetch-event, admin parks).
-    staged_chunks: std.ArrayListUnmanaged([]u8) = .empty,
-
-    /// Phase 4.0.b: destination entity for `staged_chunks` transfer.
-    /// Non-null only when the parked unit comes from a resumeStream
-    /// arm — the entity is the held stream in `stream_data_out`.
-    /// The commit arm `reg.get`s it via the destination collection;
-    /// if the entity has been moved (e.g., disconnect → response_out)
-    /// or destroyed in the interim, the chunks are freed via
-    /// `BufferedSendKvOps.deinit`. Just a handle (index + generation)
-    /// — no cleanup needed in deinit.
-    stream_entity: ?rove.Entity = null,
-
-    /// Phase 4.0.b: on commit, set the entity's `StreamDraining
-    /// .is_draining = true` after the chunks transfer. The terminal-
-    /// resume arm uses this so the close-on-empty-queue sequence
-    /// starts only after raft commits (pre-fix `markStreamDraining`
-    /// fired immediately in `resumeStream`'s terminal+writes arm,
-    /// which started the close BEFORE the writes durably committed —
-    /// the leak this phase closes). False for the stream+writes
-    /// resume arm (handler continues) and every non-stream caller.
-    mark_draining: bool = false,
-
-    pub fn deinit(self: *BufferedSendKvOps, allocator: std.mem.Allocator) void {
-        for (self.kv_wakes.items) |*w| w.deinit(allocator);
-        self.kv_wakes.deinit(allocator);
-        for (self.staged_chunks.items) |c| allocator.free(c);
-        self.staged_chunks.deinit(allocator);
-        self.* = .{};
-    }
-};
+/// `BufferedCmds.releaseAll` → `interpretCmd` per Cmd); discarded
+/// on fault/timeout/leadership-loss (`BufferedCmds.deinit` walks
+/// each Cmd's per-variant deinit). The §9.4 "spurious + overflow"
+/// thesis tolerates dropped kv_wakes; `streaming-model.md` §2's
+/// "a chunk reaches the wire only after the activation that
+/// produced it has committed" makes a fault-arm chunk-discard the
+/// rule, not the exception.
+pub const BufferedSendKvOps = effect_mod.cmd.BufferedCmds;
 
 /// A non-entity post-propose parked unit (divergence workstream,
 /// `docs/unified-effect-gating.md` idiom-1). The H2 path parks ECS
@@ -228,18 +190,11 @@ pub const BufferedSendKvOps = struct {
 pub const ParkedUnit = effect_mod.Continuation(BufferedSendKvOps, *kv_mod.KvStore.TrackedTxn);
 
 /// Owned (key, op) pair captured from a write batch's writeset at
-/// propose time. Survives until `drainRaftPending` fires the wake
-/// (`node.broadcastKvWake`) or the unit is discarded on
-/// fault/timeout/leadership-loss.
-pub const KvWakeOp = struct {
-    key: []u8,
-    op: u8,
-
-    pub fn deinit(self: *KvWakeOp, allocator: std.mem.Allocator) void {
-        allocator.free(self.key);
-        self.* = undefined;
-    }
-};
+/// propose time. Aliased to `effect.cmd.KvWakeOp` (the
+/// `kv_wake_broadcast` Cmd's payload type) so the propose-side
+/// builders can drop the records into a `BufferedCmds` list
+/// without translation.
+pub const KvWakeOp = effect_mod.cmd.KvWakeOp;
 
 /// DATA side-store value for a continuation-parked stream
 /// (connection-actor §6.1/§6.4). The *lifecycle* discriminant is
@@ -1018,11 +973,11 @@ pub const TenantLog = struct {
     id_minter: log_mod.RequestIdMinter,
 
     pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantLog {
-        return openTenantLog(worker, inst, worker.log_worker_id);
+        return worker_log.openTenantLog(worker, inst, worker.log_worker_id);
     }
 
     pub fn free(allocator: std.mem.Allocator, tl: *TenantLog) void {
-        freeTenantLog(allocator, tl);
+        worker_log.freeTenantLog(allocator, tl);
     }
 };
 
@@ -1268,34 +1223,21 @@ pub const NodeState = struct {
     /// many customer requests ride one raft log entry".
     dispatch_writeset_size: kv_mod.CountHistogram = .{},
 
-    /// Gap 2.3 Phase C1: cross-thread queue of pending fetches
-    /// awaiting transport. Producer: worker's batch-finalize
-    /// phase calls `enqueuePendingFetches` to move handler-built
-    /// `PendingFetch`es here. Consumer: Phase C2's `fetch_pool`
-    /// threads drain + issue libcurl + deliver chunks via
-    /// `fetch_chunk_inbox`.
-    ///
-    /// Phase C2 wires the pool: the cond signal is fired on every
-    /// `enqueuePendingFetches`; pool threads wait on it. On
-    /// shutdown `fetch_pool` joins all threads, after which any
-    /// undrained entries are freed in `NodeState.deinit`.
-    fetch_pending_mutex: std.Thread.Mutex = .{},
-    fetch_pending: std.ArrayListUnmanaged(globals.PendingFetch) = .empty,
-    fetch_pending_cond: std.Thread.Condition = .{},
-
     // Effect-reification Phase 2E: `fetch_chunk_inboxes` collapsed
-    // into the unified `msg_inboxes` registry above. `FetchPool` now
+    // into the unified `msg_inboxes` registry above. `FetchEngine`
     // calls `enqueueFetchEventForTenant` which builds the appropriate
-    // `effect.Msg` (`fetch_chunk` / `fetch_done` / `fetch_pipe_done`)
-    // and routes through the same hash-by-tenant registry as
-    // subscriptions and (future) inbound HTTP.
+    // `effect.Msg` and routes through the same hash-by-tenant
+    // registry as subscriptions and (future) inbound HTTP.
 
-    /// Gap 2.3 Phase C2: the dedicated outbound-fetch pool. Lazy
-    /// init via `startFetchPool` after NodeState is fully wired
-    /// (so producers see a non-null value before they enqueue).
-    /// Threads drain `fetch_pending`, fire libcurl synchronously,
-    /// chunk the response, and call `enqueueFetchEventForTenant`.
-    fetch_pool: ?*fetch_pool_mod.FetchPool = null,
+    /// `docs/curl-multi-plan.md` Phase 2: the outbound-fetch engine.
+    /// One thread + one `curl_multi` handle drives many concurrent
+    /// transfers (replaces the prior 8-thread FetchPool ceiling).
+    /// Lazy init via `startFetchEngine` after NodeState is wired +
+    /// workers spawned. Producers (worker batch-finalize) call
+    /// `enqueuePendingFetches` which routes to `engine.submit`; the
+    /// engine drains its internal queue + fires libcurl + chunks
+    /// the response + calls `enqueueFetchEventForTenant`.
+    fetch_engine: ?*fetch_engine_mod.FetchEngine = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1396,30 +1338,37 @@ pub const NodeState = struct {
         try inbox.push(msg);
     }
 
-    /// Gap 2.3 Phase C1+C2: move accumulated fetches into the
-    /// node queue + wake the pool. The handler accumulated these
-    /// into a caller-owned list during its run; the worker calls
-    /// this at batch-finalize time (handler completed without
-    /// throwing). Ownership of every slice transfers from the
-    /// caller's list into `fetch_pending`; the caller MUST clear
-    /// its source list after this returns so its defer doesn't
-    /// double-free.
+    /// `docs/curl-multi-plan.md` Phase 2: hand each PendingFetch to
+    /// `FetchEngine.submit`. The handler accumulated these into a
+    /// caller-owned list during its run; the worker calls this at
+    /// batch-finalize time (handler completed without throwing).
+    /// Ownership of every slice transfers from the caller's list
+    /// into the engine; the caller MUST clear its source list after
+    /// this returns so its defer doesn't double-free.
     ///
-    /// On success we `broadcast` the cond — multiple pool threads
-    /// can pick up the batch in parallel. If `fetch_pool` is
-    /// null (not yet started, or already shut down) the entries
-    /// still land in `fetch_pending`; `NodeState.deinit` frees
-    /// them on shutdown.
+    /// If `fetch_engine` is null (not yet started, or already shut
+    /// down) the entries are silently dropped — same posture as
+    /// the previous "queued in fetch_pending; freed at deinit"
+    /// (the customer's chain never fires; nothing to recover at
+    /// shutdown). A warning logs once via the engine's own
+    /// no-inbox latch.
     pub fn enqueuePendingFetches(
         self: *NodeState,
         items: []const globals.PendingFetch,
     ) !void {
         if (items.len == 0) return;
-        self.fetch_pending_mutex.lock();
-        defer self.fetch_pending_mutex.unlock();
-        try self.fetch_pending.ensureUnusedCapacity(self.allocator, items.len);
-        for (items) |pf| self.fetch_pending.appendAssumeCapacity(pf);
-        self.fetch_pending_cond.broadcast();
+        const engine = self.fetch_engine orelse {
+            // Engine not running. Free the items the caller passed
+            // (they were going to be freed by the caller's defer on
+            // the empty-after-flush path; we own them now since the
+            // caller clears the list expecting we took ownership).
+            for (items) |pf_const| {
+                var pf = pf_const;
+                pf.deinit(self.allocator);
+            }
+            return;
+        };
+        for (items) |pf| try engine.submit(pf);
     }
 
     /// Gap 2.3 Phase C2 + effect-reification Phase 2E: hash-route a
@@ -1551,10 +1500,10 @@ pub const NodeState = struct {
         // state. Workers already deinit'd their fetch-chunk
         // inboxes in their own destroy path; we drained those
         // back the registry below.
-        if (self.fetch_pool) |fp| {
-            fp.shutdown();
-            fp.deinit();
-            self.fetch_pool = null;
+        if (self.fetch_engine) |fe| {
+            fe.shutdown();
+            fe.deinit();
+            self.fetch_engine = null;
         }
         // Drop the inbox registry first — workers destroy their
         // inboxes in their own deinit, so by the time NodeState
@@ -1573,23 +1522,9 @@ pub const NodeState = struct {
             while (ts_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
             shard.map.deinit(self.allocator);
         }
-        {
-            // Gap 2.3 Phase C2: any pending fetches the pool
-            // didn't drain at shutdown (the pool drained until
-            // told to stop; entries that arrived after the stop
-            // signal stay queued). Free them with a one-shot
-            // warning if non-empty — not an error, just visible.
-            self.fetch_pending_mutex.lock();
-            defer self.fetch_pending_mutex.unlock();
-            if (self.fetch_pending.items.len > 0) {
-                std.log.warn(
-                    "rove-js: dropping {d} pending http.fetch entries at shutdown (queued after pool stop)",
-                    .{self.fetch_pending.items.len},
-                );
-            }
-            for (self.fetch_pending.items) |*pf| pf.deinit(self.allocator);
-            self.fetch_pending.deinit(self.allocator);
-        }
+        // `docs/curl-multi-plan.md` Phase 2: pending-fetches queue
+        // moved into the FetchEngine; its shutdown above already
+        // drained + freed any queued + in-flight entries.
         if (self.deployment_loader) |l| {
             l.shutdown();
             l.deinit();
@@ -1623,16 +1558,17 @@ pub const NodeState = struct {
         self.deployment_loader = loader;
     }
 
-    /// Gap 2.3 Phase C2: spawn the outbound `http.fetch` pool.
+    /// `docs/curl-multi-plan.md` Phase 2: spawn the outbound
+    /// `http.fetch` engine (one thread + one curl_multi handle).
     /// Idempotent. Called once from `main.zig` after NodeState is
     /// wired + workers have spawned (so their fetch-chunk inboxes
     /// are registered before the first chunk hash-routes through).
-    pub fn startFetchPool(self: *NodeState) !void {
-        if (self.fetch_pool != null) return;
-        const fp = try fetch_pool_mod.FetchPool.init(self.allocator, self);
-        errdefer fp.deinit();
-        try fp.start();
-        self.fetch_pool = fp;
+    pub fn startFetchEngine(self: *NodeState) !void {
+        if (self.fetch_engine != null) return;
+        const fe = try fetch_engine_mod.FetchEngine.init(self.allocator, self);
+        errdefer fe.deinit();
+        try fe.start();
+        self.fetch_engine = fe;
     }
 
     /// Lookup-or-lazy-open under `tenant_files_lock`.
@@ -2269,7 +2205,7 @@ pub fn Worker(comptime opts: Options) type {
             // pushBatchKey would short-circuit anyway; the thread
             // would just spin.
             if (self.log_push_curl != null) {
-                self.push_thread = try std.Thread.spawn(.{}, pushLoop, .{self});
+                self.push_thread = try std.Thread.spawn(.{}, worker_log.pushLoop, .{self});
             }
 
             return self;
@@ -2296,7 +2232,7 @@ pub fn Worker(comptime opts: Options) type {
         fn flusherLoop(self: *Self) void {
             const FLUSHER_TICK_NS: u64 = 50 * std.time.ns_per_ms;
             while (!self.flusher_should_stop.load(.acquire)) {
-                _ = flushLogs(self) catch |err| {
+                _ = worker_log.flushLogs(self) catch |err| {
                     std.log.warn("rove-js flusher: flushLogs failed: {s}", .{@errorName(err)});
                 };
                 self.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
@@ -2654,6 +2590,18 @@ pub fn Worker(comptime opts: Options) type {
             return true;
         }
 
+        /// `docs/curl-multi-plan.md` Phase 2: trampoline wired into
+        /// `DispatchState.cancel_fetch`. The JS binding's
+        /// `http.cancelFetch({id})` lands here; we forward to the
+        /// node's `FetchEngine.cancel`. Silently no-ops when the
+        /// engine isn't running (test paths) or the id doesn't
+        /// match an in-flight transfer (already complete).
+        pub fn cancelFetchTrampoline(ctx: *anyopaque, id: []const u8) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const engine = self.node.fetch_engine orelse return;
+            engine.cancel(id);
+        }
+
     };
 }
 
@@ -2805,696 +2753,20 @@ pub fn getOrOpenTenantSlot(
 
 // ── Per-tenant log loading ────────────────────────────────────────────
 //
-// Mirrors the TenantFiles helpers above. Each tenant gets a
-// per-tenant `RequestIdMinter` whose chunked-reservation counter
-// persists into the tenant's app.db at `_log/next_request_seq`.
-// Opened eagerly during `Worker.create`; freed during
-// `Worker.destroy`.
-
-fn openTenantLog(
-    worker: anytype,
-    inst: *const tenant_mod.Instance,
-    worker_id: u16,
-) !*TenantLog {
-    const allocator = worker.allocator;
-
-    const id_copy = try allocator.dupe(u8, inst.id);
-    errdefer allocator.free(id_copy);
-
-    const tl = try allocator.create(TenantLog);
-    errdefer allocator.destroy(tl);
-    tl.* = .{
-        .allocator = allocator,
-        .instance_id = id_copy,
-        .id_minter = undefined,
-    };
-    tl.id_minter = try log_mod.RequestIdMinter.init(
-        allocator,
-        worker_id,
-        .{
-            .seq_kv = inst.kv,
-            .seq_key = "_log/next_request_seq",
-        },
-    );
-    return tl;
-}
-
-fn freeTenantLog(allocator: std.mem.Allocator, tl: *TenantLog) void {
-    tl.id_minter.deinit();
-    allocator.free(tl.instance_id);
-    allocator.destroy(tl);
-}
-
-/// Mirror of `getOrOpenTenantFiles` for the log store. Lazy-opens a
-/// TenantLog for instances created at runtime so pre-minted
-/// request_ids and webhook rows get matching log records.
-pub fn getOrOpenTenantLog(
-    worker: anytype,
-    inst: *const tenant_mod.Instance,
-) !*TenantLog {
-    return worker.tenant_logs.getOrOpen(worker, inst);
-}
-
-/// Append a log record for a request that has finished its dispatch
-/// pass. Best-effort: any internal failure is logged to stderr and
-/// dropped (no propagation back to the caller — the request itself
-/// must not fail because logging failed). Caller passes:
-///
-/// - `instance_id`: tenant id (must already exist in tenant_logs).
-/// - `received_ns`: wall-clock when the worker first saw the request.
-/// - `console` / `exception`: ownership is TRANSFERRED. The function
-///   takes them and stores them on the LogRecord. Caller must not
-///   free them after a successful return.
-///
-/// On any error path inside captureLog, the transferred buffers ARE
-/// freed by this function so the caller doesn't have to do anything
-/// special. (Caller can pass `&.{}` for a borrowed empty slice safely.)
-/// Holder for the four per-request tapes the dispatcher captures. All
-/// fields are owned; `deinit` frees every entry's backing storage. The
-/// worker allocates a `RequestTapes` per dispatch, passes its tape
-/// pointers to the dispatcher via the `Request`, then serializes +
-/// uploads each non-empty tape after `run` returns.
-pub const RequestTapes = struct {
-    kv: tape_mod.Tape,
-    date: tape_mod.Tape,
-    math_random: tape_mod.Tape,
-    crypto_random: tape_mod.Tape,
-    module: tape_mod.Tape,
-
-    pub fn init(allocator: std.mem.Allocator) RequestTapes {
-        return .{
-            .kv = tape_mod.Tape.init(allocator, .kv),
-            .date = tape_mod.Tape.init(allocator, .date),
-            .math_random = tape_mod.Tape.init(allocator, .math_random),
-            .crypto_random = tape_mod.Tape.init(allocator, .crypto_random),
-            .module = tape_mod.Tape.init(allocator, .module),
-        };
-    }
-
-    pub fn deinit(self: *RequestTapes) void {
-        self.kv.deinit();
-        self.date.deinit();
-        self.math_random.deinit();
-        self.crypto_random.deinit();
-        self.module.deinit();
-    }
-};
-
-/// Maximum captured body length (request OR response). Anything
-/// bigger gets truncated to this prefix and the corresponding
-/// `*_truncated` flag set on the log record's tape payloads. Mirrors
-/// PLAN §2.4's body-cap default.
-pub const REQUEST_BODY_CAP: usize = 256 * 1024;
-
-/// Serialize each non-empty tape into the request's `TapePayloads`,
-/// owned by the caller's allocator. The bytes ride inline in the
-/// next ndjson flush — no per-request S3 PUT, no separate blob
-/// store.
-///
-/// Best-effort: on any serialize failure the channel is left empty
-/// and a warning is logged. Tape capture failures must never kill
-/// the request.
-///
-/// Pre-Phase-5.5(a-2) this function ('uploadTapes') issued one
-/// content-addressed S3 PUT per channel per request through a
-/// shared std.http.Client. The fanout — plus a stdlib keep-alive
-/// bug that drops the OVH connection under concurrency — capped
-/// tape capture at single-digit-thousand req/s. Inlining moves
-/// the bytes onto the per-flush PUT path, which carries the whole
-/// batch in a single request.
-pub fn captureTapes(
-    worker: anytype,
-    tapes: *RequestTapes,
-    request_body: []const u8,
-) log_mod.TapePayloads {
-    return captureTapesForChain(worker, tapes, request_body, null);
-}
-
-/// `captureTapes` variant that honors the per-chain tape budget
-/// (`docs/primitive-gaps.md` §6). `correlation_id == null` skips
-/// the cap (test paths, anonymous-chain dispatch); a non-null id
-/// consults `NodeState.tape_state_shards` and returns empty payloads
-/// once the chain has exceeded `TAPE_CAP_BYTES_PER_CHAIN`. One-
-/// shot warning + log marker emitted on the activation that
-/// trips the cap.
-pub fn captureTapesForChain(
-    worker: anytype,
-    tapes: *RequestTapes,
-    request_body: []const u8,
-    correlation_id: ?[]const u8,
-) log_mod.TapePayloads {
-    const allocator = worker.allocator;
-
-    var payloads: log_mod.TapePayloads = .{};
-
-    // §6 cap pre-check: if the chain is already capped, skip
-    // serialize entirely. Saves the CPU + transient bytes for
-    // chains that already hit their budget on a prior activation.
-    if (correlation_id) |cid| {
-        if (chainTapeAlreadyCapped(worker.node, cid)) return payloads;
-    }
-
-    const channels = [_]struct {
-        tape: *tape_mod.Tape,
-        out: *[]const u8,
-    }{
-        .{ .tape = &tapes.kv, .out = &payloads.kv_tape_bytes },
-        .{ .tape = &tapes.date, .out = &payloads.date_tape_bytes },
-        .{ .tape = &tapes.math_random, .out = &payloads.math_random_tape_bytes },
-        .{ .tape = &tapes.crypto_random, .out = &payloads.crypto_random_tape_bytes },
-        .{ .tape = &tapes.module, .out = &payloads.module_tree_bytes },
-    };
-
-    for (channels) |ch| {
-        if (ch.tape.entries.items.len == 0) continue;
-        const bytes = ch.tape.serialize(allocator) catch |err| {
-            std.log.warn("rove-js tape serialize failed: {s}", .{@errorName(err)});
-            continue;
-        };
-        ch.out.* = bytes;
-    }
-
-    // §6 cap post-serialize: charge this activation's tape bytes
-    // against the chain budget. If we crossed, mark the chain
-    // capped + drop THIS activation's payloads too (so the cap
-    // fires uniformly — no half-recorded activation that
-    // straddles the boundary).
-    if (correlation_id) |cid| {
-        const total =
-            payloads.kv_tape_bytes.len +
-            payloads.date_tape_bytes.len +
-            payloads.math_random_tape_bytes.len +
-            payloads.crypto_random_tape_bytes.len +
-            payloads.module_tree_bytes.len;
-        if (total > 0 and chainTapeChargeAndCheck(worker.node, cid, total)) {
-            std.log.warn(
-                "rove-js tape cap: chain {s} exceeded {d} bytes; subsequent activations record summary-only (catalog §6)",
-                .{ cid, TAPE_CAP_BYTES_PER_CHAIN },
-            );
-            // Drop this activation's payloads to keep the cap
-            // boundary clean — same posture as the §9.4
-            // wake-overflow ring (no half-recorded entries).
-            if (payloads.kv_tape_bytes.len > 0) allocator.free(payloads.kv_tape_bytes);
-            if (payloads.date_tape_bytes.len > 0) allocator.free(payloads.date_tape_bytes);
-            if (payloads.math_random_tape_bytes.len > 0) allocator.free(payloads.math_random_tape_bytes);
-            if (payloads.crypto_random_tape_bytes.len > 0) allocator.free(payloads.crypto_random_tape_bytes);
-            if (payloads.module_tree_bytes.len > 0) allocator.free(payloads.module_tree_bytes);
-            payloads = .{};
-        }
-    }
-
-    // Request body — captured into the log record so the replay
-    // shell's `request.body` is non-empty for POST / PUT requests.
-    // Bodies bigger than `REQUEST_BODY_CAP` get truncated to that
-    // prefix; the truncation flag is preserved so the simulator (and
-    // the replay shell) know the captured bytes are a prefix.
-    //
-    // Response body is intentionally NOT captured: deterministic
-    // replay re-produces the response by re-running the handler with
-    // the same request body + tapes, so storing the original would
-    // be pure duplication on every S3 batch PUT.
-    if (request_body.len > 0) {
-        const captured_len = @min(request_body.len, REQUEST_BODY_CAP);
-        if (allocator.dupe(u8, request_body[0..captured_len])) |captured| {
-            payloads.request_body_bytes = captured;
-            payloads.request_body_truncated = captured_len < request_body.len;
-        } else |err| {
-            std.log.warn("rove-js request-body capture failed: {s}", .{@errorName(err)});
-        }
-    }
-
-    return payloads;
-}
-
-/// `captureTapesForChain` + activation-input bytes capture
-/// (effect-reification Phase 2D). Used by activations whose Msg
-/// payload carries bytes the handler reads as
-/// `request.activation.bytes` — today only `fetch_chunk`. The
-/// activation bytes ride `TapePayloads.activation_bytes` (capped at
-/// `REQUEST_BODY_CAP`, mirroring the body capture). L3 (algebra):
-/// closes worklist #1 — every Msg is recorded, including its bytes.
-pub fn captureTapesForChainWithActivation(
-    worker: anytype,
-    tapes: *RequestTapes,
-    request_body: []const u8,
-    correlation_id: ?[]const u8,
-    activation_bytes: []const u8,
-) log_mod.TapePayloads {
-    var payloads = captureTapesForChain(worker, tapes, request_body, correlation_id);
-    if (activation_bytes.len == 0) return payloads;
-    // Honor the cap. If the chain just got capped on the
-    // request-side capture, skip activation bytes too — match the
-    // §6 "uniform boundary" posture (no half-recorded activation).
-    if (correlation_id) |cid| {
-        if (chainTapeAlreadyCapped(worker.node, cid)) return payloads;
-    }
-    const allocator = worker.allocator;
-    const captured_len = @min(activation_bytes.len, REQUEST_BODY_CAP);
-    if (allocator.dupe(u8, activation_bytes[0..captured_len])) |captured| {
-        payloads.activation_bytes = captured;
-        payloads.activation_bytes_truncated = captured_len < activation_bytes.len;
-    } else |err| {
-        std.log.warn("rove-js activation-bytes capture failed: {s}", .{@errorName(err)});
-    }
-    return payloads;
-}
-
-fn tapeStateShardFor(node: *NodeState, correlation_id: []const u8) *TapeStateShard {
-    const h = std.hash.Wyhash.hash(0, correlation_id);
-    return &node.tape_state_shards[h & (TAPE_STATE_SHARDS - 1)];
-}
-
-/// `docs/primitive-gaps.md` §6: read-side cap probe. Returns true
-/// iff this chain has already exceeded its budget on a prior
-/// activation. Cheap (one mutex + lookup); no eviction. Hot path:
-/// runs on every inbound activation, so the mutex is sharded
-/// (see `TAPE_STATE_SHARDS`).
-fn chainTapeAlreadyCapped(node: *NodeState, correlation_id: []const u8) bool {
-    const shard = tapeStateShardFor(node, correlation_id);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
-    const entry = shard.map.getPtr(correlation_id) orelse return false;
-    return entry.capped;
-}
-
-/// `docs/primitive-gaps.md` §6: charge `bytes` to the chain's tape
-/// budget; return true iff this charge crossed the cap (caller is
-/// the activation that tripped it). Subsequent calls on the same
-/// chain see `capped = true` via `chainTapeAlreadyCapped` and
-/// short-circuit.
-///
-/// Also opportunistically evicts the LRU-oldest entry when the
-/// map exceeds `TAPE_STATE_LRU_CAP`. Eviction is best-effort —
-/// dropping a chain entry just resets its tracked bytes (the
-/// chain re-accumulates from zero), which is the same posture as
-/// the §9.4 ring's "we drop oldest under pressure" stance.
-fn chainTapeChargeAndCheck(node: *NodeState, correlation_id: []const u8, bytes: usize) bool {
-    const shard = tapeStateShardFor(node, correlation_id);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
-
-    // Use the shard map's `count` as a stand-in for monotonic
-    // time — it advances on insertions, and the LRU we'd cull is
-    // the entry with the smallest `last_touch_seq`. Cheap; no
-    // global-counter contention.
-    const touch_seq: u64 = @intCast(shard.map.count() + 1);
-
-    if (shard.map.getPtr(correlation_id)) |entry| {
-        if (entry.capped) return false; // already past cap; this fn isn't the tripper
-        entry.bytes_used += bytes;
-        entry.last_touch_seq = touch_seq;
-        if (entry.bytes_used > TAPE_CAP_BYTES_PER_CHAIN) {
-            entry.capped = true;
-            return true; // we tripped it
-        }
-        return false;
-    }
-
-    // First-sight: insert. May fail under OOM; on failure we fall
-    // through to "no tracking" (cap is best-effort observability
-    // protection, not correctness).
-    const key_copy = node.allocator.dupe(u8, correlation_id) catch return false;
-    shard.map.put(node.allocator, key_copy, .{
-        .bytes_used = bytes,
-        .capped = bytes > TAPE_CAP_BYTES_PER_CHAIN,
-        .last_touch_seq = touch_seq,
-    }) catch {
-        node.allocator.free(key_copy);
-        return false;
-    };
-
-    // Opportunistic LRU eviction: if this shard crossed its slice
-    // of the cap on this insert, drop the entry with the smallest
-    // last_touch_seq within the shard. O(N_shard) scan but only
-    // triggered at the boundary.
-    if (shard.map.count() > TAPE_STATE_LRU_CAP_PER_SHARD) {
-        evictOldestTapeState(node, shard);
-    }
-
-    return bytes > TAPE_CAP_BYTES_PER_CHAIN; // single huge activation
-}
-
-fn evictOldestTapeState(node: *NodeState, shard: *TapeStateShard) void {
-    // Caller holds `shard.mutex`.
-    var oldest_key: ?[]const u8 = null;
-    var oldest_seq: u64 = std.math.maxInt(u64);
-    var it = shard.map.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.last_touch_seq < oldest_seq) {
-            oldest_seq = kv.value_ptr.last_touch_seq;
-            oldest_key = kv.key_ptr.*;
-        }
-    }
-    if (oldest_key) |k| {
-        // fetchRemove transfers ownership of the key buffer to
-        // the caller so we can free it after the map drops it.
-        if (shard.map.fetchRemove(k)) |removed| {
-            node.allocator.free(removed.key);
-        }
-    }
-}
-
-pub fn captureLog(
-    worker: anytype,
-    instance_id: []const u8,
-    method: []const u8,
-    path: []const u8,
-    host: []const u8,
-    deployment_id: u64,
-    received_ns: i64,
-    status: u16,
-    outcome: log_mod.Outcome,
-    console_owned: []u8,
-    exception_owned: []u8,
-    tapes: log_mod.TapePayloads,
-    correlation_id: ?[]const u8,
-    activation: log_mod.ActivationSource,
-) void {
-    captureLogWithId(
-        worker,
-        instance_id,
-        null,
-        method,
-        path,
-        host,
-        deployment_id,
-        received_ns,
-        status,
-        outcome,
-        console_owned,
-        exception_owned,
-        tapes,
-        correlation_id,
-        activation,
-    );
-}
-
-/// Same as `captureLog`, but lets the caller supply a pre-minted
-/// `request_id` so the log record shares its id with the webhook rows
-/// a handler may have spawned via `webhook.send`. Pass `null` to mint
-/// fresh.
-///
-/// Takes ownership of `tapes` byte allocations on success. On
-/// failure they're freed alongside `console_owned` / `exception_owned`.
-pub fn captureLogWithId(
-    worker: anytype,
-    instance_id: []const u8,
-    request_id: ?u64,
-    method: []const u8,
-    path: []const u8,
-    host: []const u8,
-    deployment_id: u64,
-    received_ns: i64,
-    status: u16,
-    outcome: log_mod.Outcome,
-    console_owned: []u8,
-    exception_owned: []u8,
-    tapes: log_mod.TapePayloads,
-    correlation_id: ?[]const u8,
-    activation: log_mod.ActivationSource,
-) void {
-    captureLogInner(
-        worker,
-        instance_id,
-        request_id,
-        method,
-        path,
-        host,
-        deployment_id,
-        received_ns,
-        status,
-        outcome,
-        console_owned,
-        exception_owned,
-        tapes,
-        correlation_id,
-        activation,
-    ) catch |err| {
-        std.log.warn("rove-js: log capture failed for {s}: {s}", .{ instance_id, @errorName(err) });
-        // The transferred buffers must still be freed.
-        if (console_owned.len > 0) worker.allocator.free(console_owned);
-        if (exception_owned.len > 0) worker.allocator.free(exception_owned);
-        var t = tapes;
-        t.deinit(worker.allocator);
-    };
-}
-
-fn captureLogInner(
-    worker: anytype,
-    instance_id: []const u8,
-    request_id: ?u64,
-    method: []const u8,
-    path: []const u8,
-    host: []const u8,
-    deployment_id: u64,
-    received_ns: i64,
-    status: u16,
-    outcome: log_mod.Outcome,
-    console_owned: []u8,
-    exception_owned: []u8,
-    tapes: log_mod.TapePayloads,
-    correlation_id: ?[]const u8,
-    activation: log_mod.ActivationSource,
-) !void {
-    const tl = worker.tenant_logs.get(instance_id) orelse return error.NoTenantLog;
-    const allocator = worker.allocator;
-
-    // Dupe the borrowed strings (tenant_id/method/path/host). On
-    // failure the transferred buffers are freed by the outer
-    // captureLog wrapper.
-    const a_tenant = try allocator.dupe(u8, instance_id);
-    errdefer allocator.free(a_tenant);
-    const a_method = try allocator.dupe(u8, method);
-    errdefer allocator.free(a_method);
-    const a_path = try allocator.dupe(u8, path);
-    errdefer allocator.free(a_path);
-    const a_host = try allocator.dupe(u8, host);
-    errdefer allocator.free(a_host);
-    const a_corr: []const u8 = if (correlation_id) |c|
-        if (c.len > 0) try allocator.dupe(u8, c) else ""
-    else
-        "";
-    errdefer if (a_corr.len > 0) allocator.free(a_corr);
-
-    const id = request_id orelse try tl.id_minter.nextRequestId();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-
-    try worker.log_buffer.append(.{
-        .tenant_id = a_tenant,
-        .request_id = id,
-        .deployment_id = deployment_id,
-        .received_ns = received_ns,
-        .duration_ns = now_ns - received_ns,
-        .method = a_method,
-        .path = a_path,
-        .host = a_host,
-        .status = status,
-        .outcome = outcome,
-        .console = console_owned,
-        .exception = exception_owned,
-        .tapes = tapes,
-        .correlation_id = a_corr,
-        .activation = activation,
-    });
-}
-
-/// Periodically drain the worker's node-wide log buffer into a
-/// single embedded-sidecar `.ndjson` object and PUT it to the
-/// configured `BatchStore` (Phase 5.5 a). Runs on the leader only
-/// — followers' buffer is always empty because `dispatchPending`
-/// early-returns 503 on followers. Lossy on PUT failure: records
-/// already left the buffer; per `docs/logs-plan.md` §1 a node-
-/// failure window may drop one batch.
-///
-/// Phase 5.5(a-2) interleaved-per-node flush: every record carries
-/// its `tenant_id`; the indexer demuxes on read. One S3 object per
-/// flush window per node regardless of tenant fan-in.
-pub fn flushLogs(worker: anytype) !void {
-    const allocator = worker.allocator;
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-
-    if (!worker.log_buffer.shouldFlush(now_ns)) return;
-
-    const drained = worker.log_buffer.drainRecords(allocator) catch |err| {
-        std.log.warn(
-            "rove-js flushLogs: drainRecords failed: {s}",
-            .{@errorName(err)},
-        );
-        return;
-    };
-    const records = drained orelse return;
-    defer {
-        for (records) |*r| r.deinit(allocator);
-        allocator.free(records);
-    }
-
-    if (!worker.raft.isLeader()) {
-        std.log.warn(
-            "rove-js flushLogs: dropping {d}-record batch — lost leadership mid-tick",
-            .{records.len},
-        );
-        return;
-    }
-
-    var node_buf: [8]u8 = undefined;
-    const node_id_hex = std.fmt.bufPrint(&node_buf, "{x:0>8}", .{worker.raft.config.node_id}) catch unreachable;
-    const flush_unix_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-
-    const batch_key_opt = log_server_mod.flush_writer.writeBatch(
-        allocator,
-        worker.log_batch_store,
-        node_id_hex,
-        records,
-        flush_unix_ms,
-    ) catch |err| blk: {
-        std.log.warn(
-            "rove-js flushLogs: writeBatch ({d} records) failed: {s}",
-            .{ records.len, @errorName(err) },
-        );
-        break :blk null;
-    };
-    const batch_key = batch_key_opt orelse return;
-    defer allocator.free(batch_key);
-
-    // Push the batch key to log-server so its indexer can GET the
-    // object directly (read-after-write consistent on S3 even when
-    // list-after-write isn't). Fire-and-forget — if it fails, the
-    // indexer's 500ms LIST polling picks the batch up on the next
-    // cycle. The push just collapses the typical worst-case
-    // visibility window from ~seconds to ~tens of ms.
-    pushBatchKey(worker, allocator, batch_key) catch |err| {
-        std.log.warn(
-            "rove-js flushLogs: pushBatchKey({s}) failed: {s}",
-            .{ batch_key, @errorName(err) },
-        );
-    };
-}
-
-/// Tell log-server about a freshly-PUT batch so it indexes the key
-/// directly. Builds `POST {log_public_base}/v1/_internal/batch-pushed`
-/// with `X-Rove-Batch-Key: <key>` + a freshly-minted services JWT.
-/// Fire-and-forget with a tight timeout — never blocks the worker.
-/// Enqueue a freshly-PUT batch key for the push thread to ship to
-/// log-server. Fast path: dupe + mutex-protected append + event set.
-/// The synchronous curl POST that used to live here now happens on
-/// the `pushLoop` thread, batching every key that queued up between
-/// pushes into one request body.
-fn pushBatchKey(
-    worker: anytype,
-    allocator: std.mem.Allocator,
-    batch_key: []const u8,
-) !void {
-    if (worker.log_push_curl == null) return;
-    if (worker.log_public_base) |base| {
-        if (base.len == 0) return;
-    } else return;
-    const key_copy = try allocator.dupe(u8, batch_key);
-    worker.push_queue_mutex.lock();
-    defer worker.push_queue_mutex.unlock();
-    worker.push_queue.append(allocator, key_copy) catch |err| {
-        allocator.free(key_copy);
-        return err;
-    };
-    worker.push_wake.set();
-}
-
-/// Cap on keys per outbound request — keeps the body bounded and
-/// matches the log-server's read-buffer expectations. Above this the
-/// loop sends multiple requests in sequence.
-const PUSH_MAX_KEYS_PER_REQUEST: usize = 1024;
-
-/// Background log-server push loop. Wakes on `push_wake` (set by
-/// `pushBatchKey`) or every `PUSH_TICK_NS` regardless. Drains the
-/// queue into a local slice, packs the keys into a newline-separated
-/// body, and POSTs to `/v1/_internal/batch-pushed`. The S3 batch
-/// itself was already PUT by the flusher; this thread only tells
-/// log-server *that the key exists*, so failures are soft — the
-/// indexer's LIST polling is the catch-up.
-fn pushLoop(worker: anytype) void {
-    const PUSH_TICK_NS: u64 = 50 * std.time.ns_per_ms;
-    const allocator = worker.allocator;
-    while (!worker.push_should_stop.load(.acquire)) {
-        worker.push_wake.timedWait(PUSH_TICK_NS) catch {};
-        worker.push_wake.reset();
-
-        // Drain the queue into a local list under the mutex, then
-        // release it before doing curl I/O. Workers append while we
-        // POST; that's fine — they'll show up on the next tick.
-        var drained: std.ArrayList([]u8) = .empty;
-        worker.push_queue_mutex.lock();
-        std.mem.swap(std.ArrayList([]u8), &drained, &worker.push_queue);
-        worker.push_queue_mutex.unlock();
-        if (drained.items.len == 0) continue;
-
-        var sent: usize = 0;
-        while (sent < drained.items.len) {
-            const end = @min(sent + PUSH_MAX_KEYS_PER_REQUEST, drained.items.len);
-            const chunk = drained.items[sent..end];
-            sendPushChunk(worker, allocator, chunk) catch |err| {
-                std.log.warn(
-                    "rove-js push: send {d} keys failed: {s} (LIST polling will catch up)",
-                    .{ chunk.len, @errorName(err) },
-                );
-            };
-            sent = end;
-        }
-        for (drained.items) |k| allocator.free(k);
-        drained.deinit(allocator);
-    }
-}
-
-/// POST a single chunk of newline-separated batch keys.
-fn sendPushChunk(
-    worker: anytype,
-    allocator: std.mem.Allocator,
-    keys: []const []u8,
-) !void {
-    const easy = worker.log_push_curl orelse return;
-    const log_base = worker.log_public_base orelse return;
-    const secret = worker.services_jwt_secret orelse return;
-
-    const url = try std.fmt.allocPrint(allocator, "{s}/v1/_internal/batch-pushed", .{log_base});
-    defer allocator.free(url);
-
-    // JWT is minted once per chunk (60 s exp). Reusing it across
-    // multiple chunks in the same tick would be cheaper, but the
-    // chunk loop almost always runs just once.
-    const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-    const token = try jwt_mod.mint(allocator, secret, .{ .exp_ms = now_ms + 60 * 1000 });
-    defer allocator.free(token);
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
-    defer allocator.free(auth_value);
-
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(allocator);
-    for (keys, 0..) |k, i| {
-        if (i > 0) try body.append(allocator, '\n');
-        try body.appendSlice(allocator, k);
-    }
-
-    const headers = [_]blob_mod.curl.Header{
-        .{ .name = "Authorization", .value = auth_value },
-        .{ .name = "Content-Type", .value = "text/plain" },
-    };
-    const use_h2c = std.mem.startsWith(u8, url, "http://");
-    var resp = try easy.request(allocator, .{
-        .method = .POST,
-        .url = url,
-        .headers = &headers,
-        .body = body.items,
-        .timeout_ms = 2000,
-        .connect_timeout_ms = 500,
-        .http_version = if (use_h2c) .h2c_prior_knowledge else .auto,
-        .verify_tls = !worker.internal_insecure_tls,
-    });
-    defer resp.deinit(allocator);
-    if (resp.status != 204) {
-        std.log.warn(
-            "rove-js push batch: {s} ({d} keys) → {d}",
-            .{ url, keys.len, resp.status },
-        );
-    }
-}
+// Moved to `worker_log.zig`. Re-exported here so external callers
+// (root.zig's `pub const flushLogs = worker.flushLogs;`,
+// worker_dispatch.zig's `worker_mod.captureLog*` / `RequestTapes` /
+// `captureTapesForChain*`) keep working without touching their import
+// lines. Internal callers in this file use `worker_log.X` directly.
+pub const RequestTapes = worker_log.RequestTapes;
+pub const REQUEST_BODY_CAP = worker_log.REQUEST_BODY_CAP;
+pub const getOrOpenTenantLog = worker_log.getOrOpenTenantLog;
+pub const captureTapes = worker_log.captureTapes;
+pub const captureTapesForChain = worker_log.captureTapesForChain;
+pub const captureTapesForChainWithActivation = worker_log.captureTapesForChainWithActivation;
+pub const captureLog = worker_log.captureLog;
+pub const captureLogWithId = worker_log.captureLogWithId;
+pub const flushLogs = worker_log.flushLogs;
 
 /// Read the tenant's current deployment manifest, fetch every handler
 /// entry's bytecode blob, stage every static entry's metadata, and
@@ -4375,2894 +3647,50 @@ fn retryFetchIdHex(
 
 // ── Dispatch system ───────────────────────────────────────────────────
 //
-// `dispatchOnce` processes a SINGLE tenant's batch per call. The
-// caller (the worker poll loop) calls it in a loop, flushing between
-// iterations so the ECS removes processed entities from `request_out`.
-// Each call:
+// Moved to `worker_drain.zig`: drainRaftPending + the three
+// raft_pending_* siblings via drainEntityArm + parked_units arm,
+// resolveDeployment, resolveParked, the held-cont resume engine
+// (resumeContinuation + resumeBoundContinuation + drainPendingBoundResumes
+// + sweepParkedContinuations + proposeAndParkContResume). Re-exported
+// here so external callers — `root.zig`'s `drainRaftPending` /
+// `drainPendingBoundResumes` / `sweepParkedContinuations`, plus
+// `worker_streaming.zig`'s `resolveDeployment` import — keep working
+// without touching their import lines.
 //
-//   1. Walks `request_out.entitySlice()` once.
-//   2. Short-circuits (not-leader, `/_system/*`, unknown tenant,
-//      missing deployment, router / penalty failures) finalize inline
-//      — `setSimpleResponse` + move to `response_in`.
-//   3. The first handler-bound entity establishes the anchor tenant;
-//      opens `beginTrackedImmediate` + a `WriteSet`. Subsequent
-//      handler entities are run under `SAVEPOINT h → dispatcher.run
-//      → RELEASE h` (or `ROLLBACK TO h` on error) if they match the
-//      anchor, and skipped this pass if they don't.
-//   4. After the walk, commits once and proposes a single merged
-//      writeset (if any writes). All successful entities land in
-//      `raft_pending` with the shared raft seq; read-only batches
-//      skip raft and land in `response_in`.
-//   5. Returns the number of entities moved out of `request_out`.
+// Phase 7 fold (2026-05-24): the `parked_meta` / `parked_streams_*` /
+// `pending_stream_meta` side tables don't exist as fields anywhere;
+// the migration shipped earlier. What remained — stale comments
+// narrating the side-table world — was rewritten in place during
+// the move. No behavior change.
+pub const drainRaftPending = worker_drain.drainRaftPending;
+pub const resolveDeployment = worker_drain.resolveDeployment;
+pub const resumeBoundContinuation = worker_drain.resumeBoundContinuation;
+pub const drainPendingBoundResumes = worker_drain.drainPendingBoundResumes;
+pub const sweepParkedContinuations = worker_drain.sweepParkedContinuations;
+
+// ── Streaming-handlers Phase 2b-ii ────────────────────────────────────
 //
-// This amortizes WAL fsync across multiple handlers per tick — the
-// dominant per-tenant bottleneck identified in the Stage 0 profile.
-// Per-handler isolation is preserved: a JS exception or CPU-budget
-// kill in handler #5 only rolls back its savepoint, the rest commit.
+// Moved to `worker_streaming.zig`. Re-exported here so external
+// callers — `root.zig`'s `serviceParkedStreams` / `serviceSubscriptionFires`
+// and `worker_dispatch.zig`'s `setStreamComponents` — keep working
+// without touching their import lines. Internal callers in this file
+// use `worker_streaming.X` directly.
 //
-// Skipped entities (different tenant than this tick's anchor) stay in
-// `request_out`; the caller's next `dispatchOnce` call picks a fresh
-// anchor from whoever is still there. The `blocked` set keeps a
-// lease-contended anchor from blocking other tenants within a tick.
-
-/// Process one tenant's batch of requests from `request_out`. Returns
-/// the number of entities moved out of `request_out` (to
-/// `response_in` or `raft_pending`). Zero means the
-/// collection has no work the caller can make progress on — either
-/// `request_out` is empty, or all remaining handler entities target
-/// tenants in `blocked`.
-///
-/// The caller MUST flush between calls so the next call sees a
-/// drained `request_out`, and MUST clear `blocked` at the top of
-/// each tick so a tenant that happened to be BUSY this tick gets a
-/// fresh chance next tick.
-///
-/// `blocked` is any value with `.slice()` returning a slice of
-/// `*const tenant_mod.Instance` and a fallible `append(*const
-/// tenant_mod.Instance)` (e.g. `std.BoundedArray`). When the kvexp
-/// dispatch-lease `tryAcquire` is contended (surfaced as
-/// `error.Conflict` from `beginTrackedImmediate`/`ensureOpen` — a
-/// non-blocking try, never a wait), the current anchor candidate is
-/// appended; the linear walk then ignores that tenant's entities for
-/// the rest of this call and the calls that follow within the tick.
-
-/// Iterate `raft_pending`, check each entity's `RaftWait.seq` against
-/// the raft node's committed and faulted watermarks, and run the
-/// deferred TrackedTxn commit/rollback for each batch as it crosses
-/// the watermark.
-///
-/// Per kvexp README §1 (speculative apply): `txn.commit` happens HERE,
-/// after raft confirms the batch's seq, not in `finalizeBatch`. Many
-/// `raft_pending` entries share one TrackedTxn (one batch → one
-/// propose → one seq → many entries); `worker.pending_txns[seq]`
-/// holds the single owning pointer. The first entry for each seq that
-/// crosses the watermark performs the commit; subsequent entries find
-/// the seq missing from the map and just drain.
-///
-/// On fault or timeout we rollback the txn (kvexp `Txn.rollback`
-/// cascades chain successors — fine for our model since the per-
-/// tenant lock means at most one in-flight txn per tenant). The
-/// response body is overwritten with 503.
-/// Phase 5: response-bound raft park drain. Entity in
-/// `raft_pending_response` → `response_in` on commit / fault.
-/// Effect-reification Phase 3.2.b: the unified entity-backed
-/// raft-pending drain. The three pre-3.2.b functions
-/// (drainResponsePending / drainContPending / drainStreamPending)
-/// differed ONLY in the source collection, the on-commit
-/// destination, and the panic-label site name; their bodies were
-/// otherwise identical. This helper carries the shared body; the
-/// three named functions become one-line wrappers.
-///
-/// The fault arm's destination is hard-coded to `server.response_in`
-/// (the three arms all routed fault to `response_in` for the 503
-/// downgrade) — that's a per-sibling invariant of the H2 reference
-/// path. The post-fault `overwrite503InPending` + old-body free is
-/// identical across all three arms.
-///
-/// Per the Phase 3 invariant "H2 is the reference, byte-identical":
-/// this collapse is a pure source-level refactor. The compiled code
-/// matches the pre-3.2.b shape because the source/dest pointers are
-/// dispatched via anytype (Zig generates a specialized function per
-/// instantiation, each identical to its pre-3.2.b counterpart).
-fn drainEntityArm(
-    worker: anytype,
-    server: anytype,
-    allocator: std.mem.Allocator,
-    wm: effect_mod.Watermarks,
-    source: anytype,
-    on_commit_dest: anytype,
-    comptime site_label: []const u8,
-) !void {
-    const entities = source.entitySlice();
-    const waits = source.column(RaftWait);
-    const resp_bodies = source.column(h2.RespBody);
-    var i: usize = 0;
-    while (i < entities.len) : (i += 1) {
-        const ent = entities[i];
-        const wait = waits[i];
-        const resp_body = resp_bodies[i];
-
-        switch (effect_mod.classify(wait.seq, wait.deadline_ns, wm)) {
-            .pending => continue,
-            .commit => {
-                switch (worker.pending_txns.commitAndTake(allocator, wait.seq)) {
-                    .took, .absent => {},
-                    .conflict => continue,
-                    .failed => |err| panic_mod.invariantViolated(
-                        site_label ++ ".commit",
-                        "seq={d} err={s}",
-                        .{ wait.seq, @errorName(err) },
-                    ),
-                }
-                try server.reg.move(ent, source, on_commit_dest);
-            },
-            .fault => {
-                switch (worker.pending_txns.rollbackAndTake(allocator, wait.seq)) {
-                    .took, .absent => {},
-                    .failed => |err| panic_mod.invariantViolated(
-                        site_label ++ ".rollback",
-                        "seq={d} err={s}",
-                        .{ wait.seq, @errorName(err) },
-                    ),
-                }
-                // Per-sibling on-entity cleanup (ContDescriptor /
-                // stream components / etc.) deinits structurally when
-                // cleanupResponses destroys the entity — no manual
-                // side-table teardown.
-                const old_body_ptr: ?[*]u8 = resp_body.data;
-                const old_body_len: u32 = resp_body.len;
-                try respb.overwrite503InPending(worker, source, ent, allocator);
-                if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-                try server.reg.move(ent, source, &server.response_in);
-            },
-        }
-    }
-}
-
-fn drainResponsePending(
-    worker: anytype,
-    server: anytype,
-    allocator: std.mem.Allocator,
-    wm: effect_mod.Watermarks,
-) !void {
-    try drainEntityArm(
-        worker, server, allocator, wm,
-        &worker.raft_pending_response,
-        &server.response_in,
-        "drainResponsePending",
-    );
-}
-
-/// Phase 5: continuation-bound raft park drain. Entity in
-/// `raft_pending_cont` → `parked_continuations` on commit; → 503
-/// `response_in` on fault.
-fn drainContPending(
-    worker: anytype,
-    server: anytype,
-    allocator: std.mem.Allocator,
-    wm: effect_mod.Watermarks,
-) !void {
-    try drainEntityArm(
-        worker, server, allocator, wm,
-        &worker.raft_pending_cont,
-        &worker.parked_continuations,
-        "drainContPending",
-    );
-}
-
-/// Phase 5: stream-first-hop raft park drain. Entity in
-/// `raft_pending_stream` → `stream_response_in` on commit (where
-/// stream components were populated in `streamRecordIfAnyAt` before
-/// the entity entered raft_pending_stream — they ride here via
-/// merged_request_row); → 503 `response_in` on fault.
-fn drainStreamPending(
-    worker: anytype,
-    server: anytype,
-    allocator: std.mem.Allocator,
-    wm: effect_mod.Watermarks,
-) !void {
-    try drainEntityArm(
-        worker, server, allocator, wm,
-        &worker.raft_pending_stream,
-        &server.stream_response_in,
-        "drainStreamPending",
-    );
-}
-
-pub fn drainRaftPending(worker: anytype) !void {
-    const server = worker.h2;
-    const allocator = worker.allocator;
-
-    // Effect-reification Phase 3.2.a: one snapshot per tick, shared
-    // across every parked-seq sweep below. The four arms
-    // (raft_pending_response / _cont / _stream + parked_units) all
-    // classify against this same Watermarks via `effect.classify`,
-    // so commit / fault / timeout decisions are byte-identical
-    // across arms by construction.
-    const wm: effect_mod.Watermarks = .{
-        .committed = worker.raft.committedSeq(),
-        .faulted = worker.raft.faultedSeq(),
-        .now_ns = @intCast(std.time.nanoTimestamp()),
-    };
-
-    // Handler-cmds Phase 5: raft_pending is THREE sibling collections.
-    // Each entity is parked on the sibling matching its commit
-    // destination, so the dispatch in each loop is direct — no
-    // `desc.cont != null` field check, no `pending_stream_meta.contains`
-    // probe. Whichever loop processes a given seq first commits the
-    // shared TrackedTxn; later siblings find the map empty and just
-    // queue moves. Forward-iter preserves per-tenant chain order
-    // (entities enter the siblings in propose-seq order from
-    // finalizeBatch).
-    try drainResponsePending(worker, server, allocator, wm);
-    try drainContPending(worker, server, allocator, wm);
-    try drainStreamPending(worker, server, allocator, wm);
-
-    // ── Additive: non-entity parked units (idiom-1 SSE-emit gating,
-    //    docs/unified-effect-gating.md). The H2 entity path above is
-    //    untouched — H2 behaviour is byte-identical.
-    //
-    // Iterates a snapshot of entity ids so that re-entrant park-*
-    // calls (e.g. via firePendingKvWakes → kv-react fire path) that
-    // create new parked_units entities land in the deferred-create
-    // queue and process next tick — no iterate-while-modify trap
-    // (the v1 flat ArrayList bit us with a GPE here in Phase E;
-    // collection + reg.destroy fixes it by construction).
-    {
-        const slice = worker.parked_units.entitySlice();
-        var buf: [256]rove.Entity = undefined;
-        const n = @min(slice.len, buf.len);
-        std.mem.copyForwards(rove.Entity, buf[0..n], slice[0..n]);
-        for (buf[0..n]) |ent| {
-            const unit = server.reg.get(ent, &worker.parked_units, ParkedUnit) catch continue;
-            switch (effect_mod.classify(unit.seq, unit.deadline_ns, wm)) {
-                .pending => continue,
-                .commit => {
-                    // Phase 4c: forgetful-writes units carry their own
-                    // `TrackedTxn` (no entity in raft_pending waiting on
-                    // this seq — see `proposeForgetfulWrites`). Commit
-                    // it here; the firePending* helpers run alongside,
-                    // same post-commit firing order as the entity-backed
-                    // path. Null `txn` after commit so ParkedUnit.deinit
-                    // doesn't try to rollback on destroy.
-                    if (unit.txn) |t| {
-                        t.commit() catch |cerr| panic_mod.invariantViolated(
-                            "drainRaftPending.parked_units.commit",
-                            "seq={d} tenant={s} err={s}",
-                            .{ unit.seq, unit.tenant_id, @errorName(cerr) },
-                        );
-                        allocator.destroy(t);
-                        unit.txn = null;
-                    }
-                    firePendingKvWakes(worker, unit);
-                    // Effect-reification Phase 4.0.b: transfer the
-                    // resume-hop's staged chunks onto the destination
-                    // entity's StreamChunks now that the writes are
-                    // durably committed (streaming-model.md §2). If
-                    // the entity moved or was destroyed in the
-                    // interim (e.g., client disconnect race), the
-                    // chunks free via the structural unit-deinit
-                    // below — the customer's view is "no chunk
-                    // shipped + writes durable," which the §2 rule
-                    // permits (the chunk depended on the activation
-                    // that produced it; an entity gone means the
-                    // socket is gone, so there's nowhere to ship to).
-                    transferStagedChunks(worker, unit);
-                    server.reg.destroy(ent) catch |err| std.log.warn(
-                        "rove-js parked_units commit destroy: {s}",
-                        .{@errorName(err)},
-                    );
-                },
-                .fault => {
-                    // Phase 4c: rollback the attached txn before
-                    // discarding. `ParkedUnit.deinit` is the structural
-                    // safety net (shutdown path); doing it here keeps
-                    // the fault/timeout discard ordering symmetric with
-                    // commit's destroy-then-clear pattern.
-                    if (unit.txn) |t| {
-                        t.rollback() catch |rerr| std.log.warn(
-                            "rove-js drainRaftPending.parked_units.rollback seq={d} tenant={s}: {s}",
-                            .{ unit.seq, unit.tenant_id, @errorName(rerr) },
-                        );
-                        allocator.destroy(t);
-                        unit.txn = null;
-                    }
-                    server.reg.destroy(ent) catch |err| std.log.warn(
-                        "rove-js parked_units fault destroy: {s}",
-                        .{@errorName(err)},
-                    );
-                },
-            }
-        }
-    }
-
-    // Gap 2.1 Phase E (refactored), effect-reification Phase 2C:
-    // dispatch any subscription fires the kv-react site enqueued
-    // onto `worker.msg_queue` during the parked_units loop.
-    // Re-entrant fires append to the queue's tail; the current
-    // tick's BATCH was already capped, so they process next tick
-    // — no iterate-while-modify trap.
-    dispatchSubscriptionFires(worker);
-}
-
-/// §6.4 mandatory-timeout sweep for continuation-parked streams
-/// (connection-actor 3b-ii). A stream that returned `next(...)` and
-/// has no resume by its deadline gets a real 504 — before any
-/// intermediary gives up. The `reg.move` out of `parked_continuations`
-/// is simultaneously the resolve AND the resolve-once guard: a stream
-/// leaves a collection exactly once, so a racing 3b-iii callback
-/// finds it gone (expected, not an error). O(parked) per tick, gated
-/// by `parked_meta.count() == 0`.
-/// Handler-cmds Phase 8: the deployment + bytecode resolution that
-/// every resume engine shares (the only truly-shared block across
-/// `resumeContinuation` / `resumeStream` / `fireDisconnectActivation`
-/// after Phase 7 deletions). Caller defers `dep.tc.release()` on
-/// success; on error the helper releases internally.
-///
-/// Why only this one helper: the engines' outcome-application logic
-/// is intrinsically divergent (cont reparks + bound_schedule_id +
-/// 6.4 deadline / stream appends chunks to a component queue +
-/// marks draining / disconnect ignores output entirely). Forcing a
-/// unified outcome-switch obscures rather than clarifies, so each
-/// engine keeps its tail. See the doc comment on each engine for
-/// the prep / run / apply phase structure.
-const ChainDeployment = struct {
-    inst: *const tenant_mod.Instance,
-    tc: TenantFiles,
-    bc: []u8,
-};
-
-fn resolveDeployment(
-    worker: anytype,
-    allocator: std.mem.Allocator,
-    tenant_id: []const u8,
-    module_path: []const u8,
-) !ChainDeployment {
-    const slot = worker.node.tenant_files_map.get(tenant_id) orelse return error.ResumeNoTenant;
-    const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
-    var tc = TenantFiles{ .slot = slot, .snap = snap };
-    errdefer tc.release();
-    const inst = (worker.node.tenant.getInstance(tenant_id) catch return error.ResumeNoInstance) orelse
-        return error.ResumeNoInstance;
-    const bc = blk: {
-        if (tc.snap.bytecodes.get(module_path)) |b| break :blk b;
-        const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{module_path});
-        defer allocator.free(mjs);
-        if (tc.snap.bytecodes.get(mjs)) |b| break :blk b;
-        const js = try std.fmt.allocPrint(allocator, "{s}.js", .{module_path});
-        defer allocator.free(js);
-        if (tc.snap.bytecodes.get(js)) |b| break :blk b;
-        // Phase 5 PR-2b: `__system/<name>` falls through to the
-        // node-level built-in registry. Bytecode compiled once at
-        // NodeState init from sources baked into the binary; shared
-        // across tenants. The handler runs in the tenant's context,
-        // so it sees the tenant's globals (kv, http, __rove_next).
-        if (builtin_modules_mod.isBuiltinPath(module_path)) {
-            if (worker.node.builtin_modules.get(module_path)) |b| break :blk b;
-            if (worker.node.builtin_modules.get(mjs)) |b| break :blk b;
-        }
-        return error.ResumeNoBytecode;
-    };
-    return .{ .inst = inst, .tc = tc, .bc = bc };
-}
-
-/// Resolve a parked stream: stamp the response on the
-/// `parked_continuations` collection and move it to `response_in`.
-/// The move is the resolve-ONCE guard — `isInCollection` gates it, so
-/// a racing trigger (3b-iii callback vs deadline) that already moved
-/// it out is a silent no-op (expected, not an error). Body is duped
-/// into an entity-owned buffer (freed by h2's RespBody teardown).
-fn resolveParked(
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    status: u16,
-    body: []const u8,
-) !void {
-    const server = worker.h2;
-    const allocator = worker.allocator;
-    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return; // already resolved
-    const owned = try allocator.dupe(u8, body);
-    var owned_taken = false;
-    errdefer if (!owned_taken) allocator.free(owned);
-    try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = status });
-    try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, .{ .fields = null, .count = 0 });
-    try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = owned.ptr, .len = @intCast(owned.len) });
-    owned_taken = true;
-    try server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid);
-    try server.reg.set(ent, &worker.parked_continuations, h2.Session, sess);
-    server.reg.move(ent, &worker.parked_continuations, &server.response_in) catch |err| {
-        server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
-        allocator.free(owned);
-        return err;
-    };
-}
-
-/// Phase 4: post-handler-write path for a continuation-resume hop.
-/// Takes ownership of `txn` (heap-allocated by the caller); on
-/// success the txn is parked on `pending_txns[seq]` for
-/// `drainRaftPending` to commit; on failure the helper rolls it
-/// back, destroys it, and frees `meta` so the caller can degrade
-/// to a defined 500.
-///
-/// The post-commit move depends on `next`:
-///   • `.terminal` — `parked_meta` is freed, h2 response components
-///     are stamped on the entity, RaftWait is set, entity moves to
-///     `raft_pending`. `drainRaftPending` commits → `response_in`
-///     (the normal flush path, since parked_meta is gone).
-///   • `.repark` — `parked_meta` is UPDATED with the new
-///     continuation + bound_schedule_id; RaftWait is set; entity
-///     moves to `raft_pending`. `drainRaftPending` commits → sees
-///     parked_meta → moves back to `parked_continuations` (the new
-///     park, waiting for the new send / deadline).
-///
-/// Also parks the send / kv-wake commit gates (parkSendOps +
-/// parkKvWakes) on the same seq so any `_send/owed/*` arm /
-/// `_send/proof/*` resolve and any §4.6 wake fan-outs fire
-/// AFTER commit, alongside the entity's state transition.
-const ContResumeNext = union(enum) {
-    /// Terminal flush. `body` is allocator-owned; ownership
-    /// transferred into the entity's RespBody on success.
-    terminal: struct { status: u16, body: []u8 },
-    /// Re-park with a new continuation. `new_cont` is owned
-    /// (transferred into parked_meta). `new_bound_sched_id` is
-    /// allocator-owned if non-null (the lone `_send/owed/{id}`
-    /// this hop wrote — same §6.4 inferred-bind rule as the
-    /// inbound trampoline open hop).
-    repark: struct {
-        new_cont: Continuation,
-        new_bound_sched_id: ?[]u8,
-    },
-};
-
-fn proposeAndParkContResume(
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    writeset: *const kv_mod.WriteSet,
-    txn: *kv_mod.KvStore.TrackedTxn,
-    tenant_id: []const u8,
-    next: ContResumeNext,
-) !void {
-    const allocator = worker.allocator;
-    const server = worker.h2;
-
-    // Release the dispatch lease BEFORE proposing — same posture as
-    // worker_dispatch.zig's write path. The chain orders commits;
-    // the next per-tenant batch's open lease isn't blocked on raft
-    // here.
-    txn.releaseLease();
-
-    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id) catch |err| {
-        // On propose failure: rollback txn, destroy it (caller's
-        // ownership is implicit — we promised to consume it on
-        // success OR free it on failure), free any owned resources in
-        // `next`. Phase 7: ContDescriptor on the entity deinits
-        // structurally when the entity is destroyed; no side-table
-        // free here. Caller's catch path handles the 500 flush + log.
-        txn.rollback() catch {};
-        allocator.destroy(txn);
-        switch (next) {
-            .terminal => {}, // caller still owns `body`; caller's catch frees.
-            .repark => |*r| {
-                if (r.new_bound_sched_id) |b| allocator.free(b);
-                var c = r.new_cont;
-                c.deinit(allocator);
-            },
-        }
-        return err;
-    };
-    // Propose accepted. From here we own the parked-side
-    // bookkeeping; if it fails the chain is in a half-state we can't
-    // gracefully roll back (the raft entry is committed-pending).
-    try worker.pending_txns.park(allocator, seq, txn);
-    // parkKvWakes rides this seq so the kv-react wakes fire AFTER
-    // commit. Best-effort: log and continue if parking fails —
-    // same posture as the inbound write path. (The send-arm /
-    // resolve commit gate retired with the SendDispatch kernel
-    // in Phase 5 PR-3; `_send/owed/` is now an ordinary kv put.)
-    parkKvWakes(worker, seq, tenant_id, writeset) catch |perr|
-        std.log.warn("rove-js cont-resume parkKvWakes (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
-
-    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() +
-        @as(i128, @intCast(worker.commit_wait_timeout_ns)));
-
-    switch (next) {
-        .terminal => |t| {
-            // Phase 7: clear the entity's ContDescriptor so the
-            // drainContPending commit branch's "the collection IS
-            // the destination" routing — wait, no, this is the
-            // cont-resume WRITE path that lands the entity on
-            // `raft_pending_cont`, NOT `raft_pending_response`,
-            // because the resume was driven by an entity in
-            // `parked_continuations`. The commit branch will route
-            // back to `parked_continuations`; then the terminal
-            // resolve happens (resolveParked moves it out). We
-            // need ContDescriptor cleared so a later sweep doesn't
-            // re-interpret this as a held cont — but actually,
-            // the entity moves OUT of parked_continuations before
-            // the next sweep tick (sweep checks isInCollection
-            // first). So we can leave ContDescriptor populated;
-            // it deinits when the entity destroys.
-            try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = t.status });
-            try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, .{ .fields = null, .count = 0 });
-            try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = t.body.ptr, .len = @intCast(t.body.len) });
-            try server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
-            try server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid);
-            try server.reg.set(ent, &worker.parked_continuations, h2.Session, sess);
-            try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
-                .seq = seq,
-                .deadline_ns = deadline_ns,
-            });
-            // Cont-resume that wrote: park on the cont sibling so the
-            // drain routes back to parked_continuations on commit.
-            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
-        },
-        .repark => |r| {
-            // Phase 7: update the entity's ContDescriptor in place —
-            // replace cont, refresh bound_schedule_id, refresh
-            // deadline. drainContPending sees the entity in
-            // raft_pending_cont at commit and routes back to
-            // parked_continuations. Ownership of r.new_cont and
-            // r.new_bound_sched_id transfers directly into the
-            // component (no clone — the side table is gone).
-            const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
-            if (desc.cont) |*old_c| old_c.deinit(allocator);
-            desc.cont = r.new_cont;
-            if (desc.bound_schedule_id) |old_b| allocator.free(old_b);
-            desc.bound_schedule_id = r.new_bound_sched_id;
-            // §6.4 mandatory-timeout refresh: each new hop gets the
-            // standard hold deadline, identical to the inbound
-            // trampoline open hop's parking.
-            const refreshed_deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + CONT_HOLD_DEADLINE_NS;
-            desc.deadline_ns = refreshed_deadline_ns;
-            try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
-                .seq = seq,
-                .deadline_ns = deadline_ns,
-            });
-            // Cont-resume that wrote: park on the cont sibling so the
-            // drain routes back to parked_continuations on commit.
-            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
-        },
-    }
-}
-
-/// The trampoline resume engine (connection-actor 3b-iii post-Phase-4).
-///
-/// Handler-cmds Phase 8 TEA-framing:
-///   - **Msg**:   `(send_callback outcome, parked-cont entity)`.
-///   - **prep**:  read `ContDescriptor + ChainContext` on the entity in
-///                `parked_continuations`; resolveDeployment; build
-///                request body = `{fn?, args:[ctx, outcome]}` or
-///                `{ctx, outcome}` with `.send_callback` activation.
-///   - **run**:   `dispatcher.runOutcome` against the chain-tail txn.
-///   - **apply (Cmd-list)**: switch on outcome ×
-///                {writes? × allow_repark?}:
-///       • terminal + no writes → flush to the held socket immediately.
-///       • terminal + writes → propose, park on raft_pending_cont,
-///         flush on commit (`proposeAndParkContResume(.terminal)`).
-///       • continuation + no writes → re-park (only if `allow_repark`);
-///         speculative commit is durable enough — no raft hop.
-///       • continuation + writes (allow_repark) → propose, park on
-///         raft_pending_cont; drainContPending re-parks on commit
-///         (`proposeAndParkContResume(.repark)` — recipe-1 real-retry).
-///       • continuation + !allow_repark → defined 504 (deadline).
-///       • stream → defined 501 (`cont → stream` is a later phase).
-/// The deadline trigger passes `allow_repark = false`.
-/// `error.Resume*` → caller falls back to a hard 504.
-fn resumeContinuation(
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    outcome_json: []const u8,
-    allow_repark: bool,
-) !void {
-    const allocator = worker.allocator;
-    const server = worker.h2;
-    // Phase 2c: resolve-once guard becomes collection membership +
-    // ContDescriptor presence. Cont state (path / fn_name / ctx_json /
-    // tenant_id / correlation_id) read from the entity's components
-    // instead of `parked_meta`. The slices borrow into the
-    // component's heap allocations; they stay valid across moves
-    // (`merged_request_row` carries the components on every
-    // destination collection) and across in-place mutations
-    // (`proposeAndParkContResume` deinits the old cont before
-    // installing a new one — but only AFTER capturing these locals,
-    // and the function never reuses them after the mutation site).
-    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return; // resolve-once
-    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
-    const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
-    const c = desc.cont orelse return;
-    const tenant_id = chain.tenant_id;
-    const correlation_id = chain.correlation_id;
-    const cont_path = c.path;
-    const cont_fn_name = c.fn_name;
-    const cont_ctx_json = c.ctx_json;
-    const path = cont_path;
-    var dep = try resolveDeployment(worker, allocator, tenant_id, path);
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
-
-    // A continuation is an internal request: named export → RPC
-    // envelope `{fn,args:[ctx,outcome]}`; default export → body
-    // object `{ctx,outcome}`. ctx_json/outcome_json are JSON text
-    // embedded verbatim.
-    const body = if (cont_fn_name) |fnname|
-        try std.fmt.allocPrint(allocator, "{{\"fn\":\"{s}\",\"args\":[{s},{s}]}}", .{ fnname, cont_ctx_json, outcome_json })
-    else
-        try std.fmt.allocPrint(allocator, "{{\"ctx\":{s},\"outcome\":{s}}}", .{ cont_ctx_json, outcome_json });
-    defer allocator.free(body);
-    const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
-    defer allocator.free(spath);
-
-    // Heap-allocate the txn so its pointer can be parked on
-    // `pending_txns[seq]` if this hop wrote (Phase 4). Same stable-
-    // address pattern the inbound dispatch path uses.
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return error.ResumeTxnAlloc;
-    var txn_owned = true; // we destroy unless ownership transfers to pending_txns
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return error.ResumeTxn;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    var tapes = RequestTapes.init(allocator);
-    defer tapes.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
-    const request: Request = .{
-        .method = "POST",
-        .path = spath,
-        .body = body,
-        .query = null,
-        .kv_tape = &tapes.kv,
-        .date_tape = &tapes.date,
-        .math_random_tape = &tapes.math_random,
-        .crypto_random_tape = &tapes.crypto_random,
-        .module_tape = &tapes.module,
-        .prng_seed = @bitCast(now_ns),
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        // Inherit the chain id from the parking request so every
-        // tape row of this chain shares one correlation_id; mark
-        // this activation as a send-callback resume (streaming-
-        // handlers-plan §6).
-        .correlation_id = correlation_id,
-        .activation_source = .send_callback,
-    };
-    std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        request,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        try resolveParked(worker, ent, sid, sess, 500, "continuation handler error\n");
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            // A thrown resume hop is an EXPECTED condition (author
-            // error). It must be a defined 5xx, never a flushed
-            // 200-empty (that masked the recipe-1 effectful-resume
-            // gap) — feedback_infallibility_violations.
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                try resolveParked(worker, ent, sid, sess, 500, "continuation handler error\n");
-                // Phase 1b: record the resume's tape entry before
-                // freeing meta. Activation source = send_callback so
-                // the row shares the chain id with the inbound entry
-                // and the replay UX groups them.
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .send_callback);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                // Phase 4: terminal + writes — propose the writes
-                // through raft, park the entity on `raft_pending`
-                // with the response components staged on it, and
-                // drop the parked_meta entry so `drainRaftPending`
-                // routes the committed entity to `response_in`
-                // (normal flush path, not the repark).
-                const corr_id = correlation_id;
-                const dep_id = tc.snap.deployment_id;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                const body_dup = try allocator.dupe(u8, r.body);
-                errdefer allocator.free(body_dup);
-                const console_owned = r.console;
-                const exception_owned = r.exception;
-                r.console = &.{};
-                r.exception = &.{};
-                proposeAndParkContResume(
-                    worker,
-                    ent,
-                    sid,
-                    sess,
-                    &ws,
-                    txn,
-                    tenant_id,
-                    .{ .terminal = .{
-                        .status = st,
-                        .body = body_dup,
-                    } },
-                ) catch |perr| {
-                    // Propose-fail / pre-park alloc failure: degrade
-                    // to a 500 over the held socket. The txn was
-                    // rolled back + destroyed inside the helper;
-                    // meta was freed.
-                    std.log.warn("rove-js cont-resume: propose failed: {s}", .{@errorName(perr)});
-                    allocator.free(body_dup);
-                    txn_owned = false; // helper destroyed it
-                    txn_done = true;
-                    resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, .send_callback);
-                    return;
-                };
-                // proposeAndParkContResume took ownership of txn (moved
-                // into pending_txns) and body_dup (stamped onto entity).
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, .send_callback);
-                return;
-            }
-            // Clean read-only commit cannot fault (mirrors
-            // finalizeBatch read-only invariant) — panic, never soft.
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeContinuation.commit(read_only)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            try resolveParked(worker, ent, sid, sess, st, r.body);
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .send_callback);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |c2| {
-            var c2m = c2;
-            if (!allow_repark) {
-                // Deadline path: §6.4 mandatory timeout must
-                // terminate, not extend. Reject any new cont with
-                // a defined 504 over the held socket.
-                c2m.deinit(allocator);
-                txn.rollback() catch {};
-                txn_done = true;
-                try resolveParked(worker, ent, sid, sess, 504, "hold deadline exceeded\n");
-                return;
-            }
-            if (wrote) {
-                // Phase 4: continuation + writes — propose, park
-                // on raft_pending, and on commit `drainRaftPending`
-                // sees the (updated) parked_meta entry and re-parks
-                // by moving to `parked_continuations`.  The new
-                // bound_schedule_id (the lone `_send/owed/` this
-                // hop wrote, if exactly one) becomes the wake the
-                // next callback resolves on. Same fail-fast posture
-                // as the terminal+writes branch.
-                const corr_id = correlation_id;
-                const dep_id = tc.snap.deployment_id;
-                // §6.4 binding for the repark: scan the writeset
-                // for the single _send/owed/{id} put. 0 / >1 → null
-                // (deadline-only resume).
-                const new_bound_sched_id: ?[]u8 = blk: {
-                    var only: ?[]const u8 = null;
-                    var nputs: usize = 0;
-                    for (ws.ops.items) |op| switch (op) {
-                        .put => |p| if (std.mem.startsWith(u8, p.key, OWED_PREFIX)) {
-                            nputs += 1;
-                            only = p.key[OWED_PREFIX.len..];
-                        },
-                        .delete => {},
-                    };
-                    if (nputs != 1) break :blk null;
-                    break :blk try allocator.dupe(u8, only.?);
-                };
-                proposeAndParkContResume(
-                    worker,
-                    ent,
-                    sid,
-                    sess,
-                    &ws,
-                    txn,
-                    tenant_id,
-                    .{ .repark = .{
-                        .new_cont = c2m,
-                        .new_bound_sched_id = new_bound_sched_id,
-                    } },
-                ) catch |perr| {
-                    // Helper rolled back + destroyed txn + freed
-                    // c2m + new_bound_sched_id + meta on failure;
-                    // we just log + degrade.
-                    std.log.warn("rove-js cont-resume (repark): propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, .send_callback);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                // Log the repark hop's tape row. status=0 (parked,
-                // same as the inbound trampoline open hop's
-                // captureSuccess shape).
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, .send_callback);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeContinuation.commit(repark_ro)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            // Re-park: swap the descriptor in place on the entity's
-            // ContDescriptor component, refresh the deadline; the
-            // entity stays in `parked_continuations`. Phase 7:
-            // ownership of c2m transfers directly to the component;
-            // bound_schedule_id is untouched on the read-only path
-            // (only the write-batch repark in
-            // `proposeAndParkContResume` rewrites it).
-            const refreshed_deadline_ns: i64 = now_ns + CONT_HOLD_DEADLINE_NS;
-            if (desc.cont) |*old_c| old_c.deinit(allocator);
-            desc.cont = c2m;
-            desc.deadline_ns = refreshed_deadline_ns;
-        },
-        .stream => |*s| {
-            // Phase 2a: a resume hop returning `__rove_stream(...)` is
-            // not yet wired — Phase 2b lands chunked-write resume.
-            // Treat as a defined 501 so the held socket releases
-            // cleanly rather than hanging.
-            s.deinit(allocator);
-            txn.rollback() catch {};
-            txn_done = true;
-            try resolveParked(worker, ent, sid, sess, 501, "streams not yet wired in the resume path (Phase 2b)\n");
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, correlation_id, .send_callback);
-        },
-    }
-}
-
-/// §6.4 mandatory-timeout sweep. A past-deadline parked stream is
-/// resumed with a `timeout` outcome so the handler authors the
-/// response (plan §6.4: "the handler gets the last word on the
-/// body"); `allow_repark = false` forces termination. If the resume
-/// engine itself fails (no deployment / bytecode / txn), fall back to
-/// a hard 504 so the socket never hangs past its deadline.
-/// §6.4 Part B: an `http.send` bound to a parked continuation
-/// completed — resume the held stream with the result as the outcome
-/// (the call's success/failure IS the resume input). Returns true iff
-/// a parked continuation on THIS worker matched (caller then deletes
-/// the `c/` receipt); false → not here (cross-worker is task #8;
-/// caller falls through to the normal callback path). MUST be called
-/// with no tenant batch txn open — `resumeContinuation` opens its own
-/// `beginTrackedImmediate`; nesting it inside the callback batch txn
-/// would double-BEGIN the same kvexp env. `allow_repark = true`: the
-/// hop may re-issue `http.send` + return another continuation
-/// (recipe-1 retry) — unlike the deadline path which must terminate.
-pub fn resumeBoundContinuation(
-    worker: anytype,
-    tenant_id: []const u8,
-    sched_id: []const u8,
-    outcome_json: []const u8,
-) bool {
-    // Phase 2c: bound_schedule_id + tenant_id read from the entity's
-    // components instead of `parked_meta`. The `count() == 0` probe
-    // becomes an empty-collection check — membership in
-    // `parked_continuations` IS the cont-state discriminant
-    // (principle #1).
-    const ents = worker.parked_continuations.entitySlice();
-    if (ents.len == 0) return false;
-    const sids = worker.parked_continuations.column(h2.StreamId);
-    const sesss = worker.parked_continuations.column(h2.Session);
-    const descs = worker.parked_continuations.column(components_mod.ContDescriptor);
-    const chains = worker.parked_continuations.column(components_mod.ChainContext);
-    for (ents, sids, sesss, descs, chains) |ent, sid, sess, desc, chain| {
-        const bsid = desc.bound_schedule_id orelse continue;
-        if (!std.mem.eql(u8, chain.tenant_id, tenant_id)) continue;
-        if (!std.mem.eql(u8, bsid, sched_id)) continue;
-        // Matched. resumeContinuation either flushes+drops (terminal)
-        // or re-parks (keeps the entity) — either way we return
-        // immediately, so iterating the now-possibly-mutated slice is
-        // not a hazard. Infra failure → 502 + drop (the call result
-        // is lost, but the held socket must not hang).
-        resumeContinuation(worker, ent, sid, sess, outcome_json, true) catch |err| {
-            std.log.warn(
-                "rove-js cont-resume: {s}/{s}: {s}; 502",
-                .{ tenant_id, sched_id, @errorName(err) },
-            );
-            resolveParked(worker, ent, sid, sess, 502, "continuation resume failed\n") catch {};
-        };
-        return true;
-    }
-    return false;
-}
-
-/// Phase 5 PR-3: drain `pending_bound_resumes` — the deferred §6.4
-/// held-sync resumes the baked `__system/webhook_onresult` shim
-/// enqueued via `resumeIfBoundTrampoline`. Called from the worker
-/// tick after `dispatchPendingMsgs`; by then the shim's batch txn
-/// is committed, so `resumeBoundContinuation`'s
-/// `beginTrackedImmediate` doesn't nest.
-pub fn drainPendingBoundResumes(worker: anytype) void {
-    if (worker.pending_bound_resumes.items.len == 0) return;
-    const allocator = worker.allocator;
-    // Take ownership of the current batch; new entries arriving
-    // mid-drain stay queued for the next tick (avoids re-entrant
-    // dispatch).
-    var local = worker.pending_bound_resumes;
-    worker.pending_bound_resumes = .empty;
-    defer {
-        for (local.items) |*p| p.deinit(allocator);
-        local.deinit(allocator);
-    }
-    for (local.items) |p| {
-        _ = resumeBoundContinuation(worker, p.tenant_id, p.send_id, p.event_json);
-    }
-}
-
-pub fn sweepParkedContinuations(worker: anytype) !void {
-    // Phase 2a: deadline read switched from `parked_meta` (side table)
-    // to the entity's `ContDescriptor` component. The empty-loop
-    // short-circuit replaces the `parked_meta.count() == 0` probe —
-    // membership in `parked_continuations` IS the cont-state
-    // discriminant (principle #1), no separate count check needed.
-    const ents = worker.parked_continuations.entitySlice();
-    if (ents.len == 0) return;
-    std.log.info("rove-js sendpath: sweepParkedContinuations tick parked={d}", .{ents.len});
-    const allocator = worker.allocator;
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-
-    // Collect expired first — resume/resolve mutate the collection,
-    // so snapshot (ent,sid,sess) while the slice is stable.
-    const Expired = struct { ent: rove.Entity, sid: h2.StreamId, sess: h2.Session };
-    var expired: std.ArrayListUnmanaged(Expired) = .empty;
-    defer expired.deinit(allocator);
-    {
-        const sids = worker.parked_continuations.column(h2.StreamId);
-        const sesss = worker.parked_continuations.column(h2.Session);
-        const descs = worker.parked_continuations.column(components_mod.ContDescriptor);
-        for (ents, sids, sesss, descs) |ent, sid, sess, desc| {
-            if (now_ns >= desc.deadline_ns)
-                try expired.append(allocator, .{ .ent = ent, .sid = sid, .sess = sess });
-        }
-    }
-
-    for (expired.items) |e| {
-        resumeContinuation(worker, e.ent, e.sid, e.sess, "{\"ok\":false,\"reason\":\"deadline\"}", false) catch |err| {
-            std.log.warn(
-                "rove-js continuation: deadline resume failed ({s}); hard 504",
-                .{@errorName(err)},
-            );
-            resolveParked(worker, e.ent, e.sid, e.sess, 504, "hold deadline exceeded\n") catch {};
-        };
-    }
-}
-
-// ── Streaming-handlers Phase 2b-ii: state machine over h2's
-//    stream_data_out / stream_data_in / stream_close_in pipeline ────
-
-/// Phase 7: flag the stream's draining state via the entity's
-/// StreamDraining component. Replaces Phase 6's
-/// `moveStreamCellToDraining` (active/draining-map flip). Tolerant
-/// to "entity not in stream_data_out" because the resumeStream error
-/// branches call this defensively after error logging — if the
-/// component fetch fails, the entity was never a stream anyway.
-fn markStreamDraining(server: anytype, ent: rove.Entity) void {
-    const drain_ptr = server.reg.get(ent, &server.stream_data_out, components_mod.StreamDraining) catch return;
-    drain_ptr.is_draining = true;
-}
-
-/// Handler-cmds Phase 3: populate the four stream-side components on
-/// the entity. After Phase 7, this is the SOLE site that allocates
-/// the stream-chain slices; ownership stays on the components for
-/// the chain's lifetime.
-///
-/// `current_coll` must be the collection the entity is in NOW (the
-/// caller is about to move it into the stream pipeline; the
-/// components ride along via `merged_request_row`). Inputs are
-/// borrowed — every slice gets duped for the component-side owners.
-pub fn setStreamComponents(
-    server: anytype,
-    current_coll: anytype,
-    ent: rove.Entity,
-    allocator: std.mem.Allocator,
-    tenant_id: []const u8,
-    correlation_id: ?[]const u8,
-    deployment_id: u64,
-    module_path: []const u8,
-    ctx_json: []const u8,
-    initial_chunks: []const []const u8,
-    kv_prefixes: []const []const u8,
-    interval_ms: i64,
-) !void {
-    // Each block builds clones for one component then transfers
-    // ownership via `reg.set`. The errdefer inside each block fires
-    // only if a try BEFORE the set fails; once we exit the block,
-    // ownership is the component's. If a LATER block's reg.set
-    // fails, the earlier components stay set on the entity — when
-    // the caller destroys the entity (or it survives into a
-    // collection that doesn't carry the components), the
-    // structural deinit runs and frees them. No double-free, no
-    // leak.
-
-    {
-        const tid = try allocator.dupe(u8, tenant_id);
-        errdefer allocator.free(tid);
-        const corr: ?[]u8 = if (correlation_id) |c| try allocator.dupe(u8, c) else null;
-        errdefer if (corr) |c| allocator.free(c);
-        try server.reg.set(ent, current_coll, components_mod.ChainContext, .{
-            .tenant_id = tid,
-            .correlation_id = corr,
-            .deployment_id = deployment_id,
-        });
-    }
-
-    {
-        const mp = try allocator.dupe(u8, module_path);
-        errdefer allocator.free(mp);
-        const cj = try allocator.dupe(u8, ctx_json);
-        errdefer allocator.free(cj);
-        try server.reg.set(ent, current_coll, components_mod.StreamChain, .{
-            .module_path = mp,
-            .ctx_json = cj,
-            .activation_count = 1,
-        });
-    }
-
-    {
-        // Stage chunks through a temporary StreamChunks so the §9.4
-        // cap check + dropped_chunks counter applies on the first
-        // hop too. The component is then `reg.set` onto the entity
-        // (rove takes ownership of the queue+counters).
-        var staged: components_mod.StreamChunks = .{};
-        errdefer components_mod.StreamChunks.deinit(allocator, (&staged)[0..1]);
-        try staged.queue.ensureUnusedCapacity(allocator, initial_chunks.len);
-        for (initial_chunks) |c| {
-            const cl = try allocator.dupe(u8, c);
-            try staged.tryAppend(allocator, cl);
-        }
-        try server.reg.set(ent, current_coll, components_mod.StreamChunks, staged);
-        staged = .{}; // ownership transferred — errdefer is a no-op
-    }
-
-    {
-        const spine: [][]u8 = if (kv_prefixes.len > 0)
-            try allocator.alloc([]u8, kv_prefixes.len)
-        else
-            &.{};
-        errdefer if (kv_prefixes.len > 0) allocator.free(spine);
-        var built: usize = 0;
-        errdefer for (spine[0..built]) |p| allocator.free(p);
-        for (kv_prefixes, 0..) |p, i| {
-            spine[i] = try allocator.dupe(u8, p);
-            built = i + 1;
-        }
-        const next_wake_ns: i64 = if (interval_ms > 0)
-            @as(i64, @intCast(std.time.nanoTimestamp())) + interval_ms * std.time.ns_per_ms
-        else
-            std.math.maxInt(i64);
-        try server.reg.set(ent, current_coll, components_mod.StreamWakes, .{
-            .interval_ms = interval_ms,
-            .next_wake_ns = next_wake_ns,
-            .kv_prefixes = spine,
-        });
-    }
-
-}
-
-/// Phase 2b-ii: install the chain cell for a `__rove_stream(...)`
-/// first-hop. Caller has already stamped `h2.Status` / `h2.RespHeaders`
-/// / `h2.StreamId` / `h2.Session` on the entity in `request_out` and
-/// is about to move it into `h2.stream_response_in` (the streaming
-/// twin of `response_in`). We own the chain-level state alone:
-/// `chunks` (drained one frame at a time by `serviceParkedStreams`),
-// Phase 7: `registerStreamCell` removed — stream state lives on
-// the entity's components (set by `setStreamComponents` in
-// streamRecordIfAnyAt / streamParkIfAny); no side-table cell.
-// `Collection.deinit` invokes each component's deinit on shutdown,
-// so the per-shutdown manual cleanup site is gone.
-
-/// Phase 2b-ii: per-tick driver for active streaming chains. For each
-/// entity currently in `stream_data_out` (h2's "ready for the next
-/// DATA frame" state):
-///   • chunks pending  → pop one, stamp `RespBody`, move to
-///                       `stream_data_in` (h2 frames + sends it,
-///                       cycles the entity back here).
-///   • chunks drained, timer due → run the next handler activation
-///                                 (`resumeStream`). The handler may
-///                                 enqueue more chunks or terminate.
-///   • chunks drained, `close_pending`
-///                       → move to `stream_close_in` (END_STREAM)
-///                         and free the chain cell.
-///   • chunks drained, no wake yet → idle, wait for the next tick.
-///
-/// O(parked) per call, gated by `count() == 0` so the worker hot
-/// path (no streams) pays nothing.
-pub fn serviceParkedStreams(worker: anytype) !void {
-    // Drain the inbox UNCONDITIONALLY — even when no cells are
-    // parked locally a producer may have just pushed an event that
-    // matches the next inbound stream's prefix. Cheap: empty inbox
-    // is one mutex lock + a length check.
-    try drainKvWakeInbox(worker);
-
-    const server = worker.h2;
-    // Phase 7: empty stream_data_out → nothing to do (was guarded by
-    // the side-table counts).
-    if (server.stream_data_out.entitySlice().len == 0) return;
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-
-    // Snapshot (entity, sid, sess) for every entity in stream_data_out
-    // that holds a stream chain (non-empty StreamChain.module_path).
-    // `move` is queued, so the slice itself stays stable across the
-    // loop body. The snapshot keeps per-iter lookups self-contained
-    // across resume mutations.
-    const Pending = struct { ent: rove.Entity, sid: h2.StreamId, sess: h2.Session };
-    var buf: [256]Pending = undefined;
-    var n: usize = 0;
-    {
-        const ents = server.stream_data_out.entitySlice();
-        const sids = server.stream_data_out.column(h2.StreamId);
-        const sesss = server.stream_data_out.column(h2.Session);
-        const chains = server.stream_data_out.column(components_mod.StreamChain);
-        for (ents, sids, sesss, chains) |ent, sid, sess, chain| {
-            if (chain.module_path.len == 0) continue; // non-stream entity
-            if (n >= buf.len) break;
-            buf[n] = .{ .ent = ent, .sid = sid, .sess = sess };
-            n += 1;
-        }
-    }
-
-    for (buf[0..n]) |p| {
-        // Phase 7: draining state lives on the entity's StreamDraining
-        // component instead of a side-table map split. Reads of
-        // chunks/wakes/chain identity come from the four stream
-        // components.
-        const draining_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamDraining) catch continue;
-        const chunks_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamChunks) catch continue;
-        const wakes_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamWakes) catch continue;
-        const chain_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.StreamChain) catch continue;
-        const ctx_comp = server.reg.get(p.ent, &server.stream_data_out, components_mod.ChainContext) catch continue;
-
-        // Drain one chunk per tick — h2 cycles the entity back to
-        // `stream_data_out` after each DATA frame ships. Same for
-        // both active and draining streams. `popOldest` keeps the
-        // `queue_bytes` byte tracker in lockstep with the queue.
-        if (chunks_comp.popOldest()) |chunk| {
-            // RespBody takes ownership; h2's onDataSourceReadCb frees
-            // the buffer after consuming it (h2/root.zig:818).
-            try server.reg.set(p.ent, &server.stream_data_out, h2.RespBody, .{
-                .data = chunk.ptr,
-                .len = @intCast(chunk.len),
-            });
-            try server.reg.move(p.ent, &server.stream_data_out, &server.stream_data_in);
-            continue;
-        }
-
-        // Chunks drained. If StreamDraining flagged the chain, close
-        // now (END_STREAM); component deinit cleans up on destroy.
-        if (draining_comp.is_draining) {
-            try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
-            continue;
-        }
-
-        // Gap 2.2 Phase D: timer-due → push timer entry to the
-        // §9.4 ring + advance next_wake_ns; the wake-batch
-        // activation below fires from the ring (kv + timer
-        // unified). next_wake_ns is reset relative to now
-        // (drift-on-each-fire, matching the existing pattern in
-        // resumeStream's outcome handler at ~4472).
-        if (wakes_comp.interval_ms > 0 and now_ns >= wakes_comp.next_wake_ns) {
-            wakes_comp.pending_wakes.push(worker.allocator, .{
-                .tag = .timer,
-                .fired_at_ns = now_ns,
-            });
-            wakes_comp.next_wake_ns = now_ns + wakes_comp.interval_ms * std.time.ns_per_ms;
-        }
-
-        // Any wakes in the ring? Fire one wake_batch activation
-        // (drains kv + timer entries in temporal order; surfaces
-        // `lost_oldest` as the §9.4 rate-limit signal).
-        if (wakes_comp.pending_wakes.len > 0) {
-            if (chain_comp.activation_count >= MAX_STREAM_ACTIVATIONS) {
-                std.log.warn(
-                    "rove-js stream: tenant={s} corr={s} hit activation cap; closing",
-                    .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)" },
-                );
-                try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
-                continue;
-            }
-            resumeStream(worker, p.ent, p.sid, p.sess, .wake_batch) catch |err| {
-                std.log.warn(
-                    "rove-js stream-resume (wake_batch): tenant={s} corr={s}: {s}; closing",
-                    .{ ctx_comp.tenant_id, ctx_comp.correlation_id orelse "(none)", @errorName(err) },
-                );
-                server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in) catch {};
-            };
-            continue;
-        }
-
-        // No wake registered (interval_ms == 0 AND no kv match):
-        // the chain was "stream a finite batch + close" (the §3.3
-        // degenerate shape — `acme/stream/index.mjs`). Close now
-        // that the initial chunks have shipped.
-        if (wakes_comp.interval_ms == 0 and wakes_comp.kv_prefixes.len == 0) {
-            try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
-            continue;
-        }
-        // No wake due yet — idle, waiting for either a kv match or
-        // the timer.
-    }
-}
-
-/// Drain the worker's `wake_inbox` of kv-write events. For every
-/// stream entity (in one of the h2 stream-pipeline collections,
-/// not draining) whose `kv_prefixes` includes a prefix of the
-/// event's key, push a `WakeEntry` into the §9.4 `pending_wakes`
-/// ring (oldest-first, ring drops oldest + bumps `lost_oldest`
-/// on overflow — surfaces to the handler as the rate-limit signal).
-/// Events whose tenant_id matches no held stream are simply
-/// dropped — the per-tenant scoping § 4.6 invariant lives at
-/// REGISTRATION time (a cell only registers prefixes for its own
-/// tenant), so a stale event against an old tenant just doesn't
-/// match anything.
-///
-/// Phase 7: side-table iteration replaced by an in-place sweep of
-/// the five h2 stream-pipeline collections. Empty collections cost
-/// one length check each (no allocator pressure).
-fn drainKvWakeInbox(worker: anytype) !void {
-    const allocator = worker.allocator;
-    var events: std.ArrayListUnmanaged(KvWakeEvent) = .empty;
-    defer {
-        for (events.items) |*e| e.deinit(allocator);
-        events.deinit(allocator);
-    }
-    try worker.wake_inbox.drainInto(&events);
-    if (events.items.len == 0) return;
-
-    const server = worker.h2;
-    inline for (.{
-        &server.stream_response_in,
-        &server.stream_data_out,
-        &server.stream_data_in,
-        &server.stream_close_in,
-        &server._stream_data_sending,
-    }) |coll| {
-        const wakes_col = coll.column(components_mod.StreamWakes);
-        const chains_col = coll.column(components_mod.ChainContext);
-        const drain_col = coll.column(components_mod.StreamDraining);
-        for (wakes_col, chains_col, drain_col) |*wakes, chain_ctx, drain| {
-            if (drain.is_draining) continue;
-            if (wakes.kv_prefixes.len == 0) continue;
-            try matchEventsToWakes(allocator, &events, wakes, chain_ctx);
-        }
-    }
-}
-
-/// Walk events oldest-first; push every matching event into the §9.4
-/// `PendingWakes` ring on this stream. The ring drops oldest +
-/// bumps `lost_oldest` on overflow, so a burst of >K matches is
-/// rate-limited by construction — the handler sees `lost_oldest > 0`
-/// on its next activation and re-reads kv state.
-fn matchEventsToWakes(
-    allocator: std.mem.Allocator,
-    events: *std.ArrayListUnmanaged(KvWakeEvent),
-    wakes: *components_mod.StreamWakes,
-    chain_ctx: components_mod.ChainContext,
-) !void {
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    // Oldest-first so the ring preserves temporal order (§9.4 wakes
-    // surface in the order they happened; the handler iterates).
-    for (events.items) |ev| {
-        if (!std.mem.eql(u8, ev.tenant_id, chain_ctx.tenant_id)) continue;
-        var matched: bool = false;
-        for (wakes.kv_prefixes) |pfx| {
-            if (std.mem.startsWith(u8, ev.key, pfx)) {
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) continue;
-
-        // `push` takes ownership of the duplicated key on success;
-        // on full-ring it drops the oldest (freeing its key) and
-        // bumps `lost_oldest`.
-        const ring_key = try allocator.dupe(u8, ev.key);
-        wakes.pending_wakes.push(allocator, .{
-            .tag = .kv,
-            .kv_key = ring_key,
-            .kv_op = ev.op,
-            .fired_at_ns = now_ns,
-        });
-    }
-}
-
-/// Phase 2b-ii: run the next handler activation for a parked stream.
-/// Structural twin of `resumeContinuation` — same dispatch surface
-/// (re-enter `Dispatcher.runOutcome` with a synthesized `Request`),
-/// divergent in the outcome-application tail.
-///
-/// Handler-cmds Phase 8 TEA-framing (Gap 2.2 reshape):
-///   - **Msg**:   `(wake_batch, entity in stream_data_out with
-///                non-empty StreamChain.module_path AND
-///                StreamWakes.pending_wakes.len > 0)`.
-///   - **prep**:  read four stream components on the entity; resolve
-///                deployment; drain `pending_wakes` ring into the
-///                Request's `activation_wakes` slice + `lost_oldest`
-///                snapshot; build request body = `{ctx}` with
-///                `.wake_batch` activation.
-///   - **run**:   `dispatcher.runOutcome` (chain-tail txn).
-///   - **apply (Cmd-list)**: switch on outcome:
-///       • terminal → on read-only: append body to StreamChunks +
-///         markStreamDraining immediately. On wrote: stage body
-///         chunk + mark_draining=true on `BufferedSendKvOps`;
-///         `proposeForgetfulWrites`'s parked unit applies them
-///         from the commit arm (Phase 4.0.b — `streaming-model.md`
-///         §2 rule).
-///       • stream → update StreamChain.ctx_json + StreamWakes
-///         (kv_prefixes / interval / next_wake) + increment
-///         activation_count (eager — internal state). On read-only:
-///         transfer chunks now. On wrote: stage chunks on the
-///         parked unit; commit arm transfers them onto StreamChunks
-///         after raft commits.
-///       • continuation → 501 + markStreamDraining (`__rove_next`
-///         from a stream-resume hop is out of scope).
-///
-/// Phase 4b lifted the read-only constraint; Phase 4.0.b closed the
-/// chunk-leak: write-path resumes `proposeForgetfulWrites` the txn
-/// AND stage their chunks on the parked unit so the chunks reach the
-/// wire only after raft commits. A fault arm discards both the txn
-/// (rollback) and the staged chunks (`BufferedSendKvOps.deinit`).
-fn resumeStream(
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    activation: log_mod.ActivationSource,
-) !void {
-    _ = sid;
-    _ = sess; // Reserved for Phase 3 cross-collection resolves; see
-    // resumeContinuation's signature for the call-site shape we'll
-    // mirror when the activation may not start from `stream_data_out`.
-
-    const allocator = worker.allocator;
-    // Handler-cmds Phase 3: chain identity + chunks + wakes ride on
-    // the entity's components. Phase 7: draining-state is encoded
-    // by `StreamDraining.is_draining` — `resumeStream` only fires
-    // for non-draining entities (the caller filters); the terminal /
-    // cap-hit branches `markStreamDraining(server, ent)` instead of
-    // mutating a `close_pending` field.
-    const server = worker.h2;
-    const chain_ctx = server.reg.get(ent, &server.stream_data_out, components_mod.ChainContext) catch return error.ResumeNoChainCtx;
-    const chain_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChain) catch return error.ResumeNoChainState;
-    const chunks_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamChunks) catch return error.ResumeNoChunks;
-    const wakes_st = server.reg.get(ent, &server.stream_data_out, components_mod.StreamWakes) catch return error.ResumeNoWakes;
-
-    const path = chain_st.module_path;
-    var dep = try resolveDeployment(worker, allocator, chain_ctx.tenant_id, path);
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
-
-    // Synthesized resume body: `{ctx: <ctx_json>}` — same JSON shape
-    // resumeContinuation's deadline path uses, minus the outcome
-    // field (a timer wake has no callee result). Handlers read
-    // `request.activation` (set via the dispatcher's
-    // `activation_source` field, exposed in globals) to branch.
-    const body = try std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json});
-    defer allocator.free(body);
-    const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
-    defer allocator.free(spath);
-
-    // Heap-allocate the txn so its pointer can park on a
-    // parked_units `ParkedUnit.txn` if the hop wrote (Phase 4b).
-    // Same stable-pointer pattern as resumeContinuation (4a) +
-    // fireDisconnectActivation (4c).
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return error.ResumeTxnAlloc;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return error.ResumeTxn;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    var tapes = RequestTapes.init(allocator);
-    defer tapes.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
-    // wake_batch activation: drain the StreamWakes ring into a
-    // temporal-order slice + `lost_oldest` snapshot; resumeStream
-    // owns the slice + each entry's `kv_key` for the dispatch's
-    // lifetime.
-    var batch_owned: []components_mod.WakeEntry = &.{};
-    var batch_lost_oldest: u32 = 0;
-    defer if (batch_owned.len > 0) {
-        for (batch_owned) |*w| w.deinit(allocator);
-        allocator.free(batch_owned);
-    };
-    if (activation == .wake_batch) {
-        const drained = wakes_st.pending_wakes.drainInto(allocator) catch
-            return error.ResumeWakeDrain;
-        batch_owned = drained.wakes;
-        batch_lost_oldest = drained.lost_oldest;
-    }
-    // §9.4 write-pressure: snapshot + reset the chunk-queue drop
-    // counter so this activation sees the count of chunks dropped
-    // since the last activation (one-shot signal — handler decides
-    // whether to refetch / resync / throttle / terminate).
-    const dropped_chunks_snapshot = chunks_st.takeDropped();
-    const request: Request = .{
-        .method = "POST",
-        .path = spath,
-        .body = body,
-        .query = null,
-        .kv_tape = &tapes.kv,
-        .date_tape = &tapes.date,
-        .math_random_tape = &tapes.math_random,
-        .crypto_random_tape = &tapes.crypto_random,
-        .module_tape = &tapes.module,
-        .prng_seed = @bitCast(now_ns),
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = chain_ctx.correlation_id,
-        .activation_source = activation,
-        .activation_wakes = batch_owned,
-        .activation_lost_oldest = batch_lost_oldest,
-        .activation_write_pressure_dropped = dropped_chunks_snapshot,
-    };
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        request,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        markStreamDraining(server, ent);
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    var oc = run_oc;
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                markStreamDraining(server, ent);
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            // Effect-reification Phase 4.0.b: terminal + writes —
-            // stage the body chunk + the draining flag on the
-            // parked unit so they apply only after raft commits
-            // (`streaming-model.md` §2 rule). Pre-fix this arm
-            // queued the body into StreamChunks AND fired
-            // `markStreamDraining` immediately, both eagerly — a
-            // raft fault during the commit-wait window would close
-            // the stream and ship the terminal frame whose writes
-            // never durably landed. Post-fix the parked_units
-            // commit arm (via `transferStagedChunks`) is the single
-            // release point.
-            if (wrote) {
-                var stage: StreamResumeStage = .{
-                    .entity = ent,
-                    .mark_draining = true,
-                };
-                defer {
-                    for (stage.chunks.items) |c| allocator.free(c);
-                    stage.chunks.deinit(allocator);
-                }
-                if (r.body.len > 0) {
-                    const owned = try allocator.dupe(u8, r.body);
-                    errdefer allocator.free(owned);
-                    try stage.chunks.append(allocator, owned);
-                }
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage) catch |perr| {
-                    std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    // No commit gate to wait for — close the stream
-                    // now so the customer sees a defined 500 rather
-                    // than a half-open stream. Helper has already
-                    // freed `stage.chunks`; the defer is a no-op.
-                    markStreamDraining(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                // `markStreamDraining` does NOT fire here — the
-                // commit arm flips it via `stage.mark_draining`
-                // strictly after the body lands in StreamChunks.
-                // Until then the stream stays alive; on commit the
-                // serviceParkedStreams tick drains the chunk and
-                // then closes (chunks-empty + is_draining).
-                chain_st.activation_count += 1;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            // Clean read-only terminal: flush the body as one last
-            // chunk + flag close_pending. Empty body = close
-            // immediately on the next service tick.
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeStream.commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            if (r.body.len > 0) {
-                const owned = try allocator.dupe(u8, r.body);
-                try chunks_st.tryAppend(allocator, owned);
-            }
-            markStreamDraining(server, ent);
-            chain_st.activation_count += 1;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // Stream-resume → __rove_next: would transition the
-            // chain from a stream into a one-shot continuation,
-            // which requires moving the entity out of the stream
-            // pipeline and into parked_continuations. Out of scope
-            // for Phase 4 — close with a defined 501.
-            cval.deinit(allocator);
-            txn.rollback() catch {};
-            txn_done = true;
-            markStreamDraining(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
-        },
-        .stream => |*s2| {
-            // Effect-reification Phase 4.0.b: stream + writes —
-            // stage `s2.chunks` on the parked unit so they ship
-            // only after raft commits (`streaming-model.md` §2
-            // rule). The internal-state updates further down
-            // (ctx_json / interval / kv_prefixes / activation_count)
-            // stay eager — the §2 rule covers chunks reaching the
-            // wire, not per-stream runtime state; handlers re-read
-            // kv on every activation so a fault leaving ctx
-            // ahead of durable kv is recoverable by the customer.
-            var stage: StreamResumeStage = .{
-                .entity = ent,
-                .mark_draining = false,
-            };
-            defer {
-                for (stage.chunks.items) |c| allocator.free(c);
-                stage.chunks.deinit(allocator);
-            }
-            if (wrote) {
-                // Move s2.chunks → stage.chunks BEFORE the propose
-                // so a propose failure frees them via the helper.
-                if (s2.chunks.len > 0) {
-                    try stage.chunks.ensureUnusedCapacity(allocator, s2.chunks.len);
-                    for (s2.chunks) |c| stage.chunks.appendAssumeCapacity(c);
-                    allocator.free(s2.chunks);
-                    s2.chunks = &.{};
-                }
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage) catch |perr| {
-                    std.log.warn("rove-js stream-resume (stream + writes): propose failed: {s}", .{@errorName(perr)});
-                    // Helper already freed `stage.chunks` (the
-                    // outer defer is now a no-op). Free what's
-                    // left on the outcome struct (headers /
-                    // ctx_json / kv_prefixes — chunks slice is
-                    // already `&.{}`).
-                    s2.deinit(allocator);
-                    txn_owned = false;
-                    txn_done = true;
-                    markStreamDraining(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-            } else {
-                txn.commit() catch |e| panic_mod.invariantViolated(
-                    "resumeStream.commit(stream)",
-                    "err={s}",
-                    .{@errorName(e)},
-                );
-                txn_done = true;
-            }
-            // Headers on subsequent hops are ignored (the stream's
-            // initial response headers already shipped); free them.
-            if (s2.headers) |h| allocator.free(h);
-            s2.headers = null;
-            // Transfer chunks into the StreamChunks component's
-            // queue via the §9.4 cap-aware enqueue. `tryAppend`
-            // takes ownership of each chunk pointer; cap-overflow
-            // frees the chunk + increments `dropped_chunks` (the
-            // next activation surfaces it via write_pressure).
-            // Phase 4.0.b: on the `wrote` path, `s2.chunks` is
-            // already `&.{}` (moved into `stage` above); this loop
-            // no-ops there. On the read-only path it ships the
-            // chunks immediately — no raft propose, no commit gate.
-            for (s2.chunks) |c| try chunks_st.tryAppend(allocator, c);
-            if (s2.chunks.len > 0) allocator.free(s2.chunks);
-            s2.chunks = &.{};
-            // Replace ctx + interval on the component. Old ctx_json
-            // is freed; new one is taken from the descriptor
-            // (transfer ownership).
-            if (chain_st.ctx_json.len > 0) allocator.free(chain_st.ctx_json);
-            chain_st.ctx_json = s2.ctx_json;
-            s2.ctx_json = &.{};
-            if (s2.interval_ms) |iv| {
-                wakes_st.interval_ms = iv;
-                wakes_st.next_wake_ns = now_ns + iv * std.time.ns_per_ms;
-            } else {
-                wakes_st.interval_ms = 0;
-                wakes_st.next_wake_ns = std.math.maxInt(i64);
-            }
-            // Replace the StreamWakes' kv-wake registration with
-            // whatever the handler returned. Phase 3 v1 keeps
-            // re-registration simple: free old prefixes, take
-            // ownership of the new ones. The (tenant, prefix)
-            // registry is a derived view recomputed on every match
-            // scan, so there's no separate unregister/re-register
-            // step needed.
-            for (wakes_st.kv_prefixes) |p| allocator.free(p);
-            if (wakes_st.kv_prefixes.len > 0) allocator.free(wakes_st.kv_prefixes);
-            wakes_st.kv_prefixes = s2.kv_prefixes;
-            s2.kv_prefixes = &.{};
-            chain_st.activation_count += 1;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
-        },
-    }
-}
-
-/// Streaming-handlers-plan §4.4: client disconnect on a held stream.
-/// h2's `serverStreamClose` routed the entity to `response_out`
-/// (FIN/RST observed) without our drain-then-close path firing —
-/// `cleanupResponses` notices the populated StreamChain on the
-/// entity and calls this before destroying it.
-///
-/// Handler-cmds Phase 8 TEA-framing:
-///   - **Msg**:   `(client-disconnect, entity in response_out with
-///                non-empty StreamChain.module_path)`.
-///   - **prep**:  read ChainContext + StreamChain; resolveDeployment;
-///                build request body = `{ctx}` with `.disconnect`
-///                activation.
-///   - **run**:   `dispatcher.runOutcome` (the writes commit
-///                asynchronously via `proposeForgetfulWrites` since
-///                there's no entity awaiting commit — Phase 4c).
-///   - **apply (Cmd-list)**: outcome IS moot (socket gone) — we
-///                deinit whatever variant the handler returned and
-///                record the outcome on the tape with the
-///                appropriate status. Writes that fire commit; the
-///                customer's cleanup observable effects (`_send/owed/`,
-///                kv writes, kv-wakes) materialize for other
-///                observers.
-///
-/// Errors return `void` — caller (`cleanupResponses`) is about to
-/// destroy the entity regardless; the worst case is the disconnect
-/// activation gets logged as 500 rather than skipped. Stream
-/// components on the entity deinit structurally when destroy fires
-/// (no manual cleanup site needed since Phase 7).
-fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
-    const allocator = worker.allocator;
-    // Handler-cmds Phase 3: reads come from the entity's components
-    // (the entity is in `response_out` at this point — same
-    // `merged_request_row` covers it). The side-table cell only
-    // confirms the entity HAS a stream (the `.contains` check in
-    // `cleanupResponses` is the gate that drove us here).
-    const server = worker.h2;
-    // Phase 7: entity has a stream chain iff StreamChain.module_path
-    // is non-empty. Component presence replaces the parked_streams_*
-    // map membership check.
-    const chain_st = server.reg.get(ent, &server.response_out, components_mod.StreamChain) catch return;
-    if (chain_st.module_path.len == 0) return;
-    const chain_ctx = server.reg.get(ent, &server.response_out, components_mod.ChainContext) catch return;
-    std.log.info(
-        "rove-js stream-disconnect: tenant={s} corr={s} activations={d}",
-        .{ chain_ctx.tenant_id, chain_ctx.correlation_id orelse "(none)", chain_st.activation_count },
-    );
-
-    const path = chain_st.module_path;
-    var dep = resolveDeployment(worker, allocator, chain_ctx.tenant_id, path) catch |err| {
-        std.log.warn("rove-js stream-disconnect: tenant={s} resolveDeployment failed: {s}; skipping activation", .{ chain_ctx.tenant_id, @errorName(err) });
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
-
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
-    defer allocator.free(body);
-    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
-    defer allocator.free(spath);
-
-    // Heap-allocate the txn so the pointer is stable across an
-    // optional `pending_txns[seq]` parking (Phase 4c — writes on
-    // a disconnect hop). `txn_owned` flips to false once ownership
-    // transfers to the pending map.
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    var tapes = RequestTapes.init(allocator);
-    defer tapes.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
-    // §9.4 write-pressure: snapshot + reset the chunk-queue drop
-    // counter so the disconnect activation sees what was lost.
-    // (No socket to flush to anymore, but the handler can still
-    // log / persist an "ended with N dropped frames" marker.)
-    // StreamChunks lives on the entity in `response_out` post-
-    // FIN-routing; `get` here is best-effort (a malformed entity
-    // would simply skip the snapshot).
-    const dropped_chunks_snapshot: u32 = blk: {
-        const sc = server.reg.get(ent, &server.response_out, components_mod.StreamChunks) catch break :blk 0;
-        break :blk sc.takeDropped();
-    };
-    const request: Request = .{
-        .method = "POST",
-        .path = spath,
-        .body = body,
-        .query = null,
-        .kv_tape = &tapes.kv,
-        .date_tape = &tapes.date,
-        .math_random_tape = &tapes.math_random,
-        .crypto_random_tape = &tapes.crypto_random,
-        .module_tape = &tapes.module,
-        .prng_seed = @bitCast(now_ns),
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = chain_ctx.correlation_id,
-        .activation_source = .disconnect,
-        .activation_write_pressure_dropped = dropped_chunks_snapshot,
-    };
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        request,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    var oc = run_oc;
-    // The handler's return shape is moot — the socket is closed.
-    // We deinit whatever it produced, then record the outcome on
-    // the tape with the appropriate status. If the hop WROTE,
-    // Phase 4c parks the txn on `pending_txns[seq]` so
-    // `drainRaftPending` commits it asynchronously (no entity is
-    // waiting; the kv writes + any `_send/owed/*` / §4.6 wakes
-    // become durable on their own).
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null) catch |perr| {
-                    std.log.warn("rove-js stream-disconnect: propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false; // helper destroyed it
-                    txn_done = true;
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireDisconnectActivation.commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // `__rove_next` from a disconnect hop is futile (no
-            // socket to hold) — drop the descriptor. The hop's
-            // writes (if any) still commit asynchronously so any
-            // observable side effects (kv state, http.send fire,
-            // §4.6 wakes) materialize for other observers.
-            cval.deinit(allocator);
-            if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null) catch |perr| {
-                    std.log.warn("rove-js stream-disconnect (cont return): propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
-                return;
-            }
-            txn.rollback() catch {};
-            txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
-        },
-        .stream => |*s2| {
-            s2.deinit(allocator);
-            if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null) catch |perr| {
-                    std.log.warn("rove-js stream-disconnect (stream return): propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireDisconnectActivation.commit(stream)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
-        },
-    }
-}
-
-/// Source payload for a Gap 2.1 subscription_fire activation.
-/// One variant per `SubscriptionEntry.Spec`. Borrowed slices —
-/// caller (the firing site in Phases D/E/F) owns the bytes for
-/// the duration of `fireSubscriptionActivation`.
-pub const SubscriptionFireSource = union(enum) {
-    cron: struct { fired_at_ns: i64 },
-    kv: struct { key: []const u8, op: u8 },
-    boot: struct { deployment_id: u64 },
-};
-
-/// Gap 2.1 Phase C: fire a subscription handler as a fresh chain
-/// origin. Structural twin of `fireDisconnectActivation` (no held
-/// socket, writes commit asynchronously via `proposeForgetfulWrites`)
-/// but slimmer — no held stream to drain, no chunks to clean up.
-///
-/// **TEA framing:**
-///   - **Msg**: `(subscription_fire, source)` where source is
-///     one of {cron firedAt, kv key+op, boot deployment_id}.
-///   - **prep**: resolveDeployment(tenant_id, module_path); mint
-///     a fresh correlation_id; synthesize Request body `{ctx:{}}`.
-///   - **run**: `dispatcher.runOutcome` (chain-origin txn).
-///   - **apply (Cmd-list)**:
-///       • terminal → propose writes (if any) + log; bytes go
-///         nowhere (no socket to flush).
-///       • continuation / stream → recorded + logged; ignored
-///         (a subscription chain has no held socket so multi-hop
-///         chains aren't expressible in v1; customer composes
-///         multi-step via `http.send({on_result: ...})` which
-///         routes as a `send_callback` activation, not as a held
-///         continuation).
-///
-/// Errors return `void` — the caller is best-effort (cron sweep,
-/// apply-time hook, boot fire). Failures log + skip the activation.
-pub fn fireSubscriptionActivation(
-    worker: anytype,
-    tenant_id: []const u8,
-    subscription_name: []const u8,
-    module_path: []const u8,
-    source: SubscriptionFireSource,
-) void {
-    const allocator = worker.allocator;
-    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
-        std.log.warn(
-            "rove-js subscription-fire: tenant={s} name={s} resolveDeployment failed: {s}; skipping",
-            .{ tenant_id, subscription_name, @errorName(err) },
-        );
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
-
-    // Subscription chains start fresh — empty ctx, fresh
-    // correlation_id. (The handler can pass ctx forward via its
-    // own kv state if it wants persistent chain state across
-    // fires; the platform doesn't carry any.)
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{{}}}}", .{}) catch return;
-    defer allocator.free(body);
-    const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
-    defer allocator.free(spath);
-
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    var tapes = RequestTapes.init(allocator);
-    defer tapes.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
-
-    // Gap 2.1 Phase D: inject the `_boot_fired/<dep_id>` marker
-    // into the handler's writeset BEFORE the handler runs. The
-    // marker commits atomically with the handler's effects through
-    // raft, so any subsequent reload (cold start, leader change)
-    // sees the marker and skips the re-fire. Writing the marker
-    // BEFORE the handler also covers the "handler throws" case —
-    // we don't loop on a failing boot; customer redeploys to fix.
-    if (source == .boot) {
-        var key_buf: [64]u8 = undefined;
-        const marker_key = std.fmt.bufPrint(&key_buf, "_boot_fired/{d}", .{source.boot.deployment_id}) catch unreachable;
-        txn.put(marker_key, "fired") catch |err| {
-            std.log.warn(
-                "rove-js boot marker txn.put ({s}/{d}): {s}",
-                .{ tenant_id, source.boot.deployment_id, @errorName(err) },
-            );
-            return;
-        };
-        ws.addPut(marker_key, "fired") catch |err| {
-            std.log.warn(
-                "rove-js boot marker ws.addPut ({s}/{d}): {s}",
-                .{ tenant_id, source.boot.deployment_id, @errorName(err) },
-            );
-            return;
-        };
-    }
-
-    // Mint a fresh correlation_id for this chain origin. Format:
-    // `sub-{name-prefix}-{request_id-hex}` — name-scoped + unique
-    // enough to dedup in the replay UX. Truncated to keep length
-    // bounded.
-    var corr_buf: [80]u8 = undefined;
-    const name_prefix_len: usize = @min(subscription_name.len, 32);
-    const corr_full = std.fmt.bufPrint(
-        &corr_buf,
-        "sub-{s}-{x:0>16}",
-        .{ subscription_name[0..name_prefix_len], request_id },
-    ) catch corr_buf[0..0];
-
-    // Synthesize the Request with the activation payload populated
-    // per the source variant.
-    var req: Request = .{
-        .method = "POST",
-        .path = spath,
-        .body = body,
-        .query = null,
-        .kv_tape = &tapes.kv,
-        .date_tape = &tapes.date,
-        .math_random_tape = &tapes.math_random,
-        .crypto_random_tape = &tapes.crypto_random,
-        .module_tape = &tapes.module,
-        .prng_seed = @bitCast(now_ns),
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = corr_full,
-        .activation_source = .subscription_fire,
-        .activation_subscription_name = subscription_name,
-    };
-    switch (source) {
-        .cron => |cs| req.activation_subscription_cron_fired_at_ns = cs.fired_at_ns,
-        .kv => |kvs| {
-            req.activation_subscription_kv_key = kvs.key;
-            req.activation_subscription_kv_op = kvs.op;
-        },
-        .boot => |bs2| req.activation_subscription_boot_deployment_id = bs2.deployment_id,
-    }
-
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        req,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .subscription_fire);
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    var oc = run_oc;
-    // Subscription chains have no held socket; non-terminal returns
-    // are deinit'd + recorded on the tape with a warning. Customers
-    // compose multi-hop via http.send({on_result:...}) instead.
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .subscription_fire);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
-                    std.log.warn("rove-js subscription-fire ({s}): propose failed: {s}", .{ subscription_name, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .subscription_fire);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireSubscriptionActivation.commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // `__rove_next` from a subscription chain has no held
-            // socket to resume into. Recorded but ignored; writes
-            // (if any) still commit. Customers compose multi-step
-            // via http.send({on_result:...}) which routes its
-            // callback as a `send_callback` activation.
-            cval.deinit(allocator);
-            std.log.warn(
-                "rove-js subscription-fire ({s}): __rove_next from subscription origin is a no-op (v1)",
-                .{subscription_name},
-            );
-            if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
-                    std.log.warn("rove-js subscription-fire ({s}) cont-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .subscription_fire);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
-                return;
-            }
-            txn.rollback() catch {};
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
-        },
-        .stream => |*s2| {
-            // `__rove_stream` from a subscription chain — same as
-            // `__rove_next` above: no held socket, recorded but
-            // ignored; writes commit.
-            s2.deinit(allocator);
-            std.log.warn(
-                "rove-js subscription-fire ({s}): __rove_stream from subscription origin is a no-op (v1)",
-                .{subscription_name},
-            );
-            if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
-                    std.log.warn("rove-js subscription-fire ({s}) stream-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .subscription_fire);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireSubscriptionActivation.commit(stream)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
-        },
-    }
-}
-
-/// Phase 5 PR-2: dispatch a chained handler activation produced by
-/// `__rove_next` from a fetch handler (and post-PR-2c, from the
-/// shim's onresult to invoke the customer's `on_result`). Structural
-/// twin of `fireSubscriptionActivation`:
-///
-///   - **Msg**: `SendCallback{tenant_id, module_path, ctx_json,
-///     fn_name?, correlation_id?}`.
-///   - **prep**: resolve the cont's module on its tenant; build
-///     `body = {"ctx":<ctx>}` (mirrors fireSubscriptionActivation
-///     so customers' `JSON.parse(request.body).ctx` pattern is
-///     uniform); reuse the inherited correlation_id when present
-///     (replay UX groups multi-hop chains) or mint one based on
-///     the request_id.
-///   - **run**: `dispatcher.runOutcome`. `activation_source ==
-///     .send_callback` so `request.activation.kind === "send_callback"`.
-///   - **apply**: terminal → propose forgetfully; continuation /
-///     stream → recorded but no held socket. Same posture as
-///     subscription_fire — fire-and-forget.
-///
-/// No held socket. Writes commit forgetfully via
-/// `proposeForgetfulWrites`. Errors return `void` (best-effort:
-/// loss on crash is recovered by the producer's own retry hook —
-/// PR-2d's retry sweep, when a webhook leaves an `_send/owed/`
-/// marker behind).
-fn fireChainedActivation(
-    worker: anytype,
-    sc: *effect_mod.msg.SendCallback,
-) void {
-    const allocator = worker.allocator;
-    const tenant_id = sc.tenant_id;
-    const module_path = sc.module_path;
-
-    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
-        std.log.warn(
-            "rove-js chained-dispatch: tenant={s} module={s} resolveDeployment failed: {s}; skipping",
-            .{ tenant_id, module_path, @errorName(err) },
-        );
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
-
-    const ctx_src: []const u8 = if (sc.ctx_json.len > 0) sc.ctx_json else "null";
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
-    defer allocator.free(body);
-    const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
-    defer allocator.free(spath);
-
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    var tapes = RequestTapes.init(allocator);
-    defer tapes.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
-
-    // Inherit correlation_id when the cont carried one (chained from
-    // a fetch handler — preserves the parent fetch's chain identity).
-    // Otherwise mint `chain-<request_id>` so the hop self-identifies
-    // in the replay tape.
-    var corr_buf: [80]u8 = undefined;
-    const corr_full: []const u8 = if (sc.correlation_id) |c|
-        c
-    else
-        std.fmt.bufPrint(&corr_buf, "chain-{x:0>16}", .{request_id}) catch corr_buf[0..0];
-
-    // Build the synthetic query for the named-export case (mirrors
-    // callback_dispatch.zig's `?fn=<name>` shape). Default-export
-    // when fn_name is null/empty.
-    var query_buf: [256]u8 = undefined;
-    const query_opt: ?[]const u8 = if (sc.fn_name) |fnn|
-        if (fnn.len > 0) std.fmt.bufPrint(&query_buf, "fn={s}", .{fnn}) catch null else null
-    else
-        null;
-
-    const req: Request = .{
-        .method = "POST",
-        .path = spath,
-        .body = body,
-        .query = query_opt,
-        .kv_tape = &tapes.kv,
-        .date_tape = &tapes.date,
-        .math_random_tape = &tapes.math_random,
-        .crypto_random_tape = &tapes.crypto_random,
-        .module_tape = &tapes.module,
-        .prng_seed = @bitCast(now_ns),
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = corr_full,
-        .activation_source = .send_callback,
-        .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
-    };
-
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        req,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .send_callback);
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    var oc = run_oc;
-    // Chained-dispatch handler has no held socket. Same posture as
-    // subscription_fire: terminal propose-forgetful or commit;
-    // cont/stream returns are warned + writes still propose.
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .send_callback);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
-                    std.log.warn("rove-js chained-dispatch ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .send_callback);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireChainedActivation.commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // Chained-from-chained: enqueue another SendCallback Msg
-            // so the next hop runs on the following tick (bounded
-            // recursion via the dispatch BATCH cap). Inherits the
-            // same correlation_id.
-            defer cval.deinit(allocator);
-            const enqueue_err = worker.node.enqueueChainedDispatchForTenant(
-                tenant_id,
-                cval.path,
-                cval.ctx_json,
-                cval.fn_name,
-                corr_full,
-            );
-            if (enqueue_err) |_| {} else |err| std.log.warn(
-                "rove-js chained-dispatch ({s}): nested enqueue failed: {s}",
-                .{ module_path, @errorName(err) },
-            );
-            if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
-                    std.log.warn("rove-js chained-dispatch ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .send_callback);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireChainedActivation.commit(cont)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
-        },
-        .stream => |*s2| {
-            // `__rove_stream` from a chained-dispatch handler — no
-            // held socket; same posture as subscription_fire stream.
-            s2.deinit(allocator);
-            std.log.warn(
-                "rove-js chained-dispatch ({s}): __rove_stream is a no-op (no held socket)",
-                .{module_path},
-            );
-            if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
-                    std.log.warn("rove-js chained-dispatch ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .send_callback);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireChainedActivation.commit(stream)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
-        },
-    }
-}
-
-/// Effect-reification Phase 4.0.b: a resume-hop's staged chunks +
-/// terminal-draining flag, parked on the unit alongside its txn so
-/// they apply on commit (chunks transfer into the entity's
-/// `StreamChunks` via `tryAppend`; if `mark_draining`, the entity's
-/// `StreamDraining.is_draining` flips to true). Discarded on fault
-/// — the chunks free via `BufferedSendKvOps.deinit`, the draining
-/// flag never sets, the stream stays alive for the next wake.
-///
-/// Ownership discipline: passed to `proposeForgetfulWrites` by
-/// mutable pointer. The helper takes the chunks list (sets
-/// `stage.chunks = .empty`) unconditionally — on success the
-/// chunks move into the unit; on every error path they free
-/// inside the helper's errdefer. Caller's `defer` over
-/// `stage.chunks` is then a no-op (the list is empty), making
-/// build-staged-chunks-then-hand-off symmetric on success and
-/// failure.
-pub const StreamResumeStage = struct {
-    entity: rove.Entity,
-    chunks: std.ArrayListUnmanaged([]u8) = .empty,
-    mark_draining: bool = false,
-};
-
-/// Phase 4c: propose a write batch that nobody is waiting on. The
-/// txn rides a `ParkedUnit.txn` field that the parked_units sweep
-/// in `drainRaftPending` commits at the seq — same gate as the
-/// entity-backed path's `pending_txns[seq]`, just routed through
-/// the unit drain so we don't need an entity in `raft_pending`.
-/// On commit, the unit's §4.6 kv-wakes fire (the existing
-/// `firePendingKvWakes` iterates at the same point).
-///
-/// Used by `fireDisconnectActivation` — the socket is gone, so
-/// we can't gate the held-response on commit, but we still want
-/// the writes + their side effects to land durably.
-///
-/// Effect-reification Phase 4.0.b: the optional `stage` parameter
-/// is the new commit-gated streaming-chunks payload. When non-null,
-/// it carries an entity in `stream_data_out` + the chunks that the
-/// `resumeStream` arm would otherwise have appended eagerly. The
-/// parked_units commit arm transfers them onto the entity's
-/// `StreamChunks` (and, if `stage.mark_draining`, sets the
-/// terminal-draining flag) AFTER the txn commits — closing
-/// `streaming-model.md` §2's pre-commit chunk leak. Disconnect,
-/// subscription, and fetch-event callers pass `null`; they're
-/// either entity-less or already disconnect-tolerant.
-///
-/// On success the helper consumes the txn pointer AND the `stage`
-/// chunks (moved into the ParkedUnit). On failure it rolls back +
-/// destroys the txn AND frees any staged chunks; the caller's
-/// `txn_owned` flag flips to false either way, and the helper
-/// resets `stage.chunks` to `.empty` unconditionally so the
-/// caller's `defer` over the list is a no-op on every path.
-fn proposeForgetfulWrites(
-    worker: anytype,
-    writeset: *const kv_mod.WriteSet,
-    txn: *kv_mod.KvStore.TrackedTxn,
-    tenant_id: []const u8,
-    stage_opt: ?*StreamResumeStage,
-) !void {
-    const allocator = worker.allocator;
-
-    // Take ownership of the staged chunks up-front so every error
-    // path that returns frees them. The caller's `stage.chunks` is
-    // reset to `.empty` immediately, severing the caller's view
-    // of the buffers — the helper now owns them unconditionally
-    // (transfer-to-unit on success or free-via-errdefer on error).
-    var stage_chunks: std.ArrayListUnmanaged([]u8) = if (stage_opt) |s| blk: {
-        const taken = s.chunks;
-        s.chunks = .empty;
-        break :blk taken;
-    } else .empty;
-    errdefer {
-        for (stage_chunks.items) |c| allocator.free(c);
-        stage_chunks.deinit(allocator);
-    }
-
-    txn.releaseLease();
-    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id) catch |err| {
-        txn.rollback() catch {};
-        allocator.destroy(txn);
-        return err;
-    };
-    // Build a ParkedUnit carrying the txn AND the kv_wakes intents
-    // extracted from the writeset. drainRaftPending's parked_units
-    // sweep handles both at commit (or discards on fault/timeout).
-    // Phase 5 PR-3: the send_ops arm/resolve materialization is
-    // gone — `_send/owed/` is an ordinary kv put now, no commit
-    // gate needed for the dispatch side.
-    var unit_kv_wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty;
-    errdefer {
-        for (unit_kv_wakes.items) |*w| w.deinit(allocator);
-        unit_kv_wakes.deinit(allocator);
-    }
-    if (writeset.ops.items.len > 0) {
-        unit_kv_wakes.ensureUnusedCapacity(allocator, writeset.ops.items.len) catch |perr|
-            std.log.warn("rove-js forgetful-writes kv_wakes ensureCapacity (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
-        for (writeset.ops.items) |op| switch (op) {
-            .put => |p| {
-                const k = allocator.dupe(u8, p.key) catch break;
-                unit_kv_wakes.appendAssumeCapacity(.{ .key = k, .op = 'p' });
-            },
-            .delete => |d| {
-                const k = allocator.dupe(u8, d.key) catch break;
-                unit_kv_wakes.appendAssumeCapacity(.{ .key = k, .op = 'd' });
-            },
-        };
-    }
-
-    // Build the unit, transferring ownership of every owned field
-    // (kv_wakes, staged_chunks, txn, tenant_id). The staging pattern
-    // mirrors StreamChunks / SubscriptionFireDescriptor: assign
-    // owned slices into the unit, IMMEDIATELY clear the caller-side
-    // locals to invalidate their errdefers, arm the unit-deinit
-    // errdefer, then `reg.set` (copies bitwise; column takes the
-    // pointers) + clear the unit to invalidate its own errdefer.
-    var unit: ParkedUnit = .{
-        .seq = seq,
-        .deadline_ns = @intCast(std.time.nanoTimestamp() +
-            @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .buffered = .{
-            .kv_wakes = unit_kv_wakes,
-            .staged_chunks = stage_chunks,
-            .stream_entity = if (stage_opt) |s| s.entity else null,
-            .mark_draining = if (stage_opt) |s| s.mark_draining else false,
-        },
-        .txn = txn,
-    };
-    unit_kv_wakes = .empty;
-    stage_chunks = .empty;
-    errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
-
-    // Allocate tenant_id AFTER arming the unit errdefer so a dupe
-    // failure leaves the unit's `.tenant_id` as default `&.{}`,
-    // and ParkedUnit.deinit's `if (tenant_id.len > 0)` skips
-    // freeing it (no double-free).
-    unit.tenant_id = try allocator.dupe(u8, tenant_id);
-
-    const ent = try worker.h2.reg.create(&worker.parked_units);
-    errdefer worker.h2.reg.destroy(ent) catch {};
-    try worker.h2.reg.set(ent, &worker.parked_units, ParkedUnit, unit);
-    unit = .{}; // ownership transferred to the column
-}
-
-/// Effect-reification Phase 4.0.b: commit-arm transfer of staged
-/// resume-hop chunks onto the destination entity's `StreamChunks`,
-/// plus the optional terminal-draining flag flip. Called by the
-/// parked_units commit branch in `drainRaftPending` — strictly AFTER
-/// the txn commits, so the chunks ride the streaming-model.md §2
-/// rule (a chunk reaches the wire only after the activation that
-/// produced it has committed).
-///
-/// Ownership: `unit.buffered.staged_chunks` items transfer into
-/// the entity's `StreamChunks` via `tryAppend` (which takes
-/// ownership on success or frees + bumps `dropped_chunks` on cap
-/// overflow — §9.4). Whatever this fn leaves behind in
-/// `staged_chunks` is freed by `BufferedSendKvOps.deinit` when the
-/// parked_units entity destroys; on the happy path the list is
-/// `clearRetainingCapacity`'d so the deinit walk does nothing.
-///
-/// Disconnect race: if the entity has been moved out of
-/// `stream_data_out` (e.g., into `response_out` by h2's
-/// `serverStreamClose`) or destroyed, `reg.get` returns an error
-/// and the chunks stay in `staged_chunks` for the structural
-/// deinit to free. Customer view: writes committed, no chunk on
-/// the wire (the socket was gone before commit landed) — the same
-/// "your terminal frame was lost because the client disconnected
-/// first" semantics today's disconnect activation already encodes.
-fn transferStagedChunks(worker: anytype, unit: *ParkedUnit) void {
-    const buf = &unit.buffered;
-    const stream_ent = buf.stream_entity orelse return;
-    if (buf.staged_chunks.items.len == 0 and !buf.mark_draining) return;
-    const allocator = worker.allocator;
-    const server = worker.h2;
-
-    const chunks_ptr = server.reg.get(
-        stream_ent,
-        &server.stream_data_out,
-        components_mod.StreamChunks,
-    ) catch {
-        std.log.info(
-            "rove-js stream-resume commit: entity moved/destroyed before commit; "
-                ++ "discarding {d} staged chunks (tenant={s})",
-            .{ buf.staged_chunks.items.len, unit.tenant_id },
-        );
-        return; // BufferedSendKvOps.deinit will free the staged chunks.
-    };
-    for (buf.staged_chunks.items) |chunk| {
-        chunks_ptr.tryAppend(allocator, chunk) catch |err| {
-            // Allocator failure on a chunk append is rare; the
-            // chunk is freed by tryAppend's error path. Log and
-            // continue so later chunks still ship.
-            std.log.warn(
-                "rove-js stream-resume commit: chunks_st.tryAppend failed: {s}",
-                .{@errorName(err)},
-            );
-        };
-    }
-    // The list now holds slices whose memory has either been
-    // adopted by StreamChunks (happy path or cap-free) or freed
-    // (cap-overflow / append error). Clear without freeing so
-    // the deinit walk doesn't double-free.
-    buf.staged_chunks.clearRetainingCapacity();
-
-    if (buf.mark_draining) {
-        // markStreamDraining-on-commit: same lookup discipline as
-        // the chunk transfer above. A racing destroy is logged
-        // and ignored — the entity going away is the upstream
-        // signal that the customer no longer cares.
-        const drain_ptr = server.reg.get(
-            stream_ent,
-            &server.stream_data_out,
-            components_mod.StreamDraining,
-        ) catch return;
-        drain_ptr.is_draining = true;
-    }
-}
-
-/// streaming-handlers-plan §4.6: fire commit-gated kv-wake intents.
-/// `drainRaftPending` calls us once `committedSeq >= unit.seq`,
-/// guaranteeing the writes are durably visible to local readers
-/// (kvexp's `TrackedTxn.commit` already ran on this node). Each
-/// intent fans out via `node.broadcastKvWake` to every worker's
-/// `KvWakeInbox` — `serviceParkedStreams` then picks up matched
-/// cells. No-op on empty.
-fn firePendingKvWakes(worker: anytype, unit: *ParkedUnit) void {
-    if (unit.buffered.kv_wakes.items.len == 0) return;
-    for (unit.buffered.kv_wakes.items) |w| {
-        worker.node.broadcastKvWake(unit.tenant_id, w.key, w.op);
-    }
-    // Gap 2.1 Phase E: kv-react subscription chain origins. Same
-    // post-commit pump as the parked-stream wake broadcast above;
-    // leader-only by construction because this code path only runs
-    // on the worker that committed the original writeset. Reentrant
-    // dispatch into `fireSubscriptionActivation` mirrors the
-    // existing `fireDisconnectActivation` reentrancy out of
-    // `cleanupResponses`.
-    fireKvReactSubscriptions(worker, unit) catch |err|
-        std.log.warn(
-            "rove-js kv-react ({s}): {s}",
-            .{ unit.tenant_id, @errorName(err) },
-        );
-}
-
-/// Gap 2.1 Phase E (refactored): for each kv-write event in `unit`,
-/// scan the tenant's subscription registry for `.kv` subscriptions
-/// whose `prefix` matches; enqueue an `effect.SubscriptionFire` Msg
-/// onto the worker's `msg_queue`. `dispatchSubscriptionFires` drains
-/// each tick.
-///
-/// Effect-reification Phase 2C: routed onto `enqueueMsg`. Prior to
-/// 2C this site `reg.create`'d entities in
-/// `subscription_fire_pending`; the collection is now retired (cron +
-/// boot moved in 2B, kv-react here). Same deferred-dispatch property
-/// holds — re-entrant enqueueMsg calls during a fire append to the
-/// queue's tail; the current tick's batch was already dequeued so
-/// the new entries process next tick.
-///
-/// Leader-only by caller convention (`firePendingKvWakes` only
-/// runs on the worker that committed the write).
-fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
-    const slot = worker.node.tenant_files_map.get(unit.tenant_id) orelse return;
-    const snap = slot.pinCurrent() orelse return;
-    defer snap.release();
-    if (snap.subscriptions.len == 0) return;
-
-    const allocator = worker.allocator;
-    for (snap.subscriptions) |sub| {
-        const prefix = switch (sub.spec) {
-            .kv => |k| k.prefix,
-            else => continue,
-        };
-        for (unit.buffered.kv_wakes.items) |w| {
-            if (!std.mem.startsWith(u8, w.key, prefix)) continue;
-            std.log.info(
-                "rove-js kv-react queue: tenant={s} subscription={s} key={s} op={c}",
-                .{ unit.tenant_id, sub.name, w.key, w.op },
-            );
-            // Dup onto the payload; payload owns + frees these
-            // strings via `SubscriptionFire.deinit` after the fire
-            // completes (or on MsgQueue drop-on-shutdown).
-            const tid = try allocator.dupe(u8, unit.tenant_id);
-            errdefer allocator.free(tid);
-            const name = try allocator.dupe(u8, sub.name);
-            errdefer allocator.free(name);
-            const path = try allocator.dupe(u8, sub.module_path);
-            errdefer allocator.free(path);
-            const key_dup = try allocator.dupe(u8, w.key);
-            errdefer allocator.free(key_dup);
-
-            var payload: effect_mod.msg.SubscriptionFire = .{
-                .tenant_id = tid,
-                .subscription_name = name,
-                .module_path = path,
-                .source = .{ .kv = .{ .key = key_dup, .op = w.op } },
-            };
-            effect_mod.enqueueMsg(&worker.msg_queue, .{ .subscription_fire = payload }) catch |err| {
-                payload.deinit(allocator);
-                std.log.warn(
-                    "rove-js kv-react enqueueMsg (tenant={s}, sub={s}): {s}",
-                    .{ unit.tenant_id, sub.name, @errorName(err) },
-                );
-                return err;
-            };
-        }
-    }
-}
-
-/// Cross-thread enqueue parameters used by
-/// `NodeState.enqueueSubscriptionFireForTenant` (cron sweeper, boot
-/// loader). Borrowed slices — the cross-thread enqueue dups onto a
-/// `PendingFireMessage` on the inbox; `drainSubFireInbox` then moves
-/// those owned slices onto an `effect.SubscriptionFire` payload
-/// (Phase 2B/2C: no per-tick dup on the worker side).
-pub const SubscriptionFireQueueInput = struct {
-    tenant_id: []const u8,
-    subscription_name: []const u8,
-    module_path: []const u8,
-    source: SubscriptionFireSource,
-};
-
-// `enqueueSubscriptionFire` (the prior collection-creation helper) was
-// retired in effect-reification Phase 2C. Every subscription origin
-// now routes through `effect.enqueueMsg`:
-// - cron / boot: cross-thread inbox → `drainSubFireInbox` →
-//   `enqueueMsg` (move-semantics)
-// - kv-react: `fireKvReactSubscriptions` → `enqueueMsg` (dup-on-payload)
-
-/// Gap 2.1 Phase D: drain the worker's cross-thread
-/// `sub_fire_inbox`, **moving** each `PendingFireMessage`'s owned
-/// slices onto an `effect.SubscriptionFire` payload and enqueueing
-/// via `effect.enqueueMsg`. Called once per worker tick (from
-/// `serviceSubscriptionFires`); cheap when the inbox is empty (one
-/// mutex try + length check).
-///
-/// Effect-reification Phase 2E: drain the worker's unified
-/// cross-thread `msg_inbox`, moving each `effect.Msg` onto the
-/// in-thread `msg_queue`. One drain function for every cross-thread
-/// origin (cron + boot fires, fetch chunk / done / pipe_done events)
-/// — the pre-2E pair (`drainSubFireInbox` + `drainFetchChunkInbox`)
-/// collapsed into this. Producers built Msg variants on the way in
-/// (NodeState.enqueueXxxForTenant); this fn is variant-agnostic.
-///
-/// Ownership: each Msg popped from the inbox carries owned slices.
-/// On `enqueueMsg` success the queue owns them (drains via
-/// `dispatchPendingMsgs`). On `error.Full` we `freeOwnedMsg` and
-/// log — overflow drops are bounded by the cross-thread inbox's
-/// rate and the in-thread queue's cap; the per-origin policy is
-/// at-most-once for cron/boot (re-fire on next sweep) and at-most-
-/// once for fetch (sender already accepted the upstream chunk —
-/// loss surfaces as a fetch_done with mismatched byte counts).
-fn drainMsgInbox(worker: anytype) void {
-    const allocator = worker.allocator;
-    var local: std.ArrayListUnmanaged(effect_mod.Msg) = .empty;
-    defer local.deinit(allocator);
-    worker.msg_inbox.drainInto(&local) catch |err| {
-        std.log.warn("rove-js msg-inbox drain: {s}", .{@errorName(err)});
-        for (local.items) |*m| effect_mod.freeOwnedMsg(allocator, m);
-        return;
-    };
-    if (local.items.len == 0) return;
-    for (local.items) |*m| {
-        effect_mod.enqueueMsg(&worker.msg_queue, m.*) catch |err| {
-            std.log.warn(
-                "rove-js msg-inbox enqueueMsg (kind={s}): {s}",
-                .{ @tagName(m.kind()), @errorName(err) },
-            );
-            // On overflow the Msg never reached the queue; free its
-            // owned payload to avoid leak.
-            effect_mod.freeOwnedMsg(allocator, m);
-        };
-    }
-}
-
-/// Worker-tick combined pass: drain the cross-thread Msg inbox into
-/// the in-thread queue, then dispatch the queue. Called from the
-/// workerMain loop on every tick; covers cross-thread producers
-/// (boot via deployment_loader, cron via sweeper, FetchPool libcurl
-/// threads) AND in-thread producers (kv-react, which `enqueueMsg`s
-/// directly from `fireKvReactSubscriptions`).
-pub fn serviceSubscriptionFires(worker: anytype) void {
-    drainMsgInbox(worker);
-    dispatchPendingMsgs(worker);
-}
-
-/// Worker-tick system: dequeue Msgs from `worker.msg_queue` (up to
-/// `BATCH` per tick) and dispatch each by variant. Per-tick cap
-/// bounds tail latency on the request hot path: a misbehaving
-/// handler with many activations pending eats at most `BATCH` per
-/// tick before yielding back to the h2 loop; remaining drain on
-/// subsequent ticks.
-///
-/// Effect-reification Phase 2D: the unified dispatcher across every
-/// migrated Msg variant — subscription fires (cron / boot / kv-react,
-/// Phase 2B/C) and outbound HTTP events (chunk / done / pipe_done,
-/// Phase 2D). Phases 2E-2F add send-callback / inbound-HTTP arms.
-///
-/// Re-entrant `enqueueMsg` calls during a dispatch append to the
-/// queue's tail; the current tick's batch is capped at `BATCH` so
-/// new entries process next tick (deferred dispatch).
-pub fn dispatchPendingMsgs(worker: anytype) void {
-    const BATCH: usize = 64;
-    var fired: usize = 0;
-    const allocator = worker.allocator;
-
-    while (fired < BATCH) {
-        const msg = worker.msg_queue.dequeue() orelse break;
-        switch (msg) {
-            .subscription_fire => |sf_const| {
-                var sf = sf_const;
-                fireSubscriptionActivation(
-                    worker,
-                    sf.tenant_id,
-                    sf.subscription_name,
-                    sf.module_path,
-                    switch (sf.source) {
-                        .cron => |c| SubscriptionFireSource{ .cron = .{ .fired_at_ns = c.fired_at_ns } },
-                        .kv => |kv| SubscriptionFireSource{ .kv = .{ .key = kv.key, .op = kv.op } },
-                        .boot => |b| SubscriptionFireSource{ .boot = .{ .deployment_id = b.deployment_id } },
-                    },
-                );
-                sf.deinit(allocator);
-                fired += 1;
-            },
-            .fetch_chunk => |ev_const| {
-                // Phase 5 PR-1: single fetch activation kind. Every
-                // event fires `on_chunk` against the handler; `event.final`
-                // distinguishes the terminal event from intermediates.
-                // Tape captures the chunk bytes (closes algebra §7
-                // worklist #1).
-                var ev = ev_const;
-                fireFetchEventActivation(worker, &ev);
-                components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
-                fired += 1;
-            },
-            .send_callback => |sc_const| {
-                // Phase 5 PR-2: chained dispatch — the customer's
-                // next-hop handler runs because a previous handler
-                // returned `__rove_next(path, {ctx})`. Producer is the
-                // fetch-event `.continuation` arm (PR-2 lift); future
-                // producers (`webhook.send.js` shim's onresult after
-                // PR-2c) compose on this same Msg.
-                var sc = sc_const;
-                fireChainedActivation(worker, &sc);
-                sc.deinit(allocator);
-                fired += 1;
-            },
-            else => {
-                std.log.warn(
-                    "rove-js msg_queue: unexpected variant kind={s} (no dispatch arm yet)",
-                    .{@tagName(msg.kind())},
-                );
-            },
-        }
-    }
-}
-
-/// Backward-compat alias: callers that explicitly named the
-/// subscription-fire dispatcher continue to work. Both this and
-/// `dispatchFetchEvents` route into the same unified
-/// `dispatchPendingMsgs`; the second-to-call sees an empty queue and
-/// is a no-op.
-pub fn dispatchSubscriptionFires(worker: anytype) void {
-    dispatchPendingMsgs(worker);
-}
-
-/// Backward-compat alias — see `dispatchSubscriptionFires`.
-pub fn dispatchFetchEvents(worker: anytype) void {
-    dispatchPendingMsgs(worker);
-}
+// The moved file covers more than streaming proper: the original
+// section had absorbed every fire*Activation entry point + the
+// Msg-queue dispatch. See `worker_streaming.zig`'s module doc for the
+// full scope.
+pub const SubscriptionFireSource = worker_streaming.SubscriptionFireSource;
+pub const SubscriptionFireQueueInput = worker_streaming.SubscriptionFireQueueInput;
+pub const StreamResumeStage = worker_streaming.StreamResumeStage;
+pub const setStreamComponents = worker_streaming.setStreamComponents;
+pub const serviceParkedStreams = worker_streaming.serviceParkedStreams;
+pub const fireSubscriptionActivation = worker_streaming.fireSubscriptionActivation;
+pub const proposeForgetfulWrites = worker_streaming.proposeForgetfulWrites;
+pub const serviceSubscriptionFires = worker_streaming.serviceSubscriptionFires;
+pub const dispatchPendingMsgs = worker_streaming.dispatchPendingMsgs;
+pub const dispatchSubscriptionFires = worker_streaming.dispatchSubscriptionFires;
+pub const dispatchFetchEvents = worker_streaming.dispatchFetchEvents;
 
 // ── Gap 2.3 Phase D — http.fetch chunk/done activations ──────────
 
@@ -7272,8 +3700,8 @@ pub fn dispatchFetchEvents(worker: anytype) void {
 /// empty inbox + queue and is a cheap no-op. main.zig + the
 /// parked_units call site keep their existing call shape.
 pub fn serviceFetchEvents(worker: anytype) void {
-    drainMsgInbox(worker);
-    dispatchPendingMsgs(worker);
+    worker_streaming.drainMsgInbox(worker);
+    worker_streaming.dispatchPendingMsgs(worker);
 }
 
 /// Dispatch one upstream fetch event as a chain activation.
@@ -7297,7 +3725,7 @@ pub fn serviceFetchEvents(worker: anytype) void {
 /// Errors return `void` — `dispatchFetchEvents` is best-effort. An
 /// event with an empty `on_chunk_module` (binding-side regression)
 /// is a silent no-op.
-fn fireFetchEventActivation(
+pub fn fireFetchEventActivation(
     worker: anytype,
     event: *const components_mod.UpstreamFetchEvent,
 ) void {
@@ -7389,6 +3817,8 @@ fn fireFetchEventActivation(
         // parked until its 25s deadline.
         .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
         .resume_if_bound_ctx = @ptrCast(worker),
+        .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
+        .cancel_fetch_ctx = @ptrCast(worker),
     };
     req.activation_fetch_seq = event.seq;
     req.activation_fetch_byte_offset = event.byte_offset;
@@ -7444,7 +3874,7 @@ fn fireFetchEventActivation(
                 return;
             }
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -7497,7 +3927,7 @@ fn fireFetchEventActivation(
                 .{ module_path, @errorName(err) },
             );
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -7527,7 +3957,7 @@ fn fireFetchEventActivation(
                 .{module_path},
             );
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -7564,34 +3994,53 @@ pub fn parkKvWakes(
     seq: u64,
     tenant_id: []const u8,
     writeset: *const kv_mod.WriteSet,
+    extra_cmds: effect_mod.cmd.BufferedCmds,
 ) !void {
-    if (writeset.ops.items.len == 0) return;
-    const allocator = worker.allocator;
-    var wakes: std.ArrayListUnmanaged(KvWakeOp) = .empty;
-    errdefer {
-        for (wakes.items) |*w| w.deinit(allocator);
-        wakes.deinit(allocator);
+    // Effect-reification Phase 4.1.2: `extra_cmds` carries the
+    // batch's `http.fetch` Cmds (transferred from the worker
+    // dispatch's `batch_pending_fetches` accumulator). The Cmds
+    // ride alongside the kv_wake_broadcast Cmds on this unit;
+    // `interpretCmd` submits each PendingFetch to the engine on
+    // commit, closing the marker-commit race
+    // `webhook.send`'s sweep-only path papered over. `extra_cmds`
+    // is consumed unconditionally — caller MUST treat its copy as
+    // moved-from after the call (set to `.{}`).
+    if (writeset.ops.items.len == 0 and extra_cmds.items.items.len == 0) {
+        // Nothing to park. Ensure extra_cmds is freed (already
+        // empty if caller never populated it).
+        var ec = extra_cmds;
+        ec.deinit(worker.allocator);
+        return;
     }
-    try wakes.ensureUnusedCapacity(allocator, writeset.ops.items.len);
+    const allocator = worker.allocator;
+    // Take ownership of the extra_cmds as the unit's base; append
+    // kv_wake_broadcast Cmds for the writeset on top.
+    var cmds: effect_mod.cmd.BufferedCmds = extra_cmds;
+    errdefer cmds.deinit(allocator);
+    try cmds.items.ensureUnusedCapacity(allocator, writeset.ops.items.len);
     for (writeset.ops.items) |op| switch (op) {
         .put => |p| {
             const k = try allocator.dupe(u8, p.key);
-            wakes.appendAssumeCapacity(.{ .key = k, .op = 'p' });
+            cmds.items.appendAssumeCapacity(.{
+                .kv_wake_broadcast = .{ .key = k, .op = 'p' },
+            });
         },
         .delete => |d| {
             const k = try allocator.dupe(u8, d.key);
-            wakes.appendAssumeCapacity(.{ .key = k, .op = 'd' });
+            cmds.items.appendAssumeCapacity(.{
+                .kv_wake_broadcast = .{ .key = k, .op = 'd' },
+            });
         },
     };
-    // Transfer ownership of `wakes` into the unit; clear local
+    // Transfer ownership of `cmds` into the unit; clear local
     // immediately to invalidate the earlier errdefer.
     var unit: ParkedUnit = .{
         .seq = seq,
         .deadline_ns = @intCast(std.time.nanoTimestamp() +
             @as(i128, @intCast(worker.commit_wait_timeout_ns))),
-        .buffered = .{ .kv_wakes = wakes },
+        .buffered = cmds,
     };
-    wakes = .empty;
+    cmds = .{};
     errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
     unit.tenant_id = try allocator.dupe(u8, tenant_id);
     const ent = try worker.h2.reg.create(&worker.parked_units);
@@ -7708,7 +4157,7 @@ pub fn cleanupResponses(worker: anytype) !void {
         // StreamChain.module_path is a client-disconnect on a held
         // stream — fire the disconnect activation before destroy.
         if (chain.module_path.len > 0) {
-            fireDisconnectActivation(worker, ent);
+            worker_streaming.fireDisconnectActivation(worker, ent);
         }
         try server.reg.destroy(ent);
     }
@@ -7795,59 +4244,20 @@ pub const ADMIN_SESSION_COOKIE = auth.ADMIN_SESSION_COOKIE;
 
 // ── Starter content ────────────────────────────────────────────────
 //
-// Embedded in the binary so a freshly-created tenant answers 200 on
+// Baked into the binary so a freshly-created tenant answers 200 on
 // `/` the moment signup completes. Intentionally tiny — the point is
 // to prove the deploy pipeline works end-to-end, not to ship a
 // template. The customer replaces these as soon as they push their
 // own code through the files API.
+//
+// Edited as plain files under `src/js/starter/` (registered in
+// build.zig's `js_runtime_files`). Trailing newlines from the source
+// files ride into the manifest — that is part of the content-addressed
+// dep_id and is fine: starter content is byte-identical across every
+// tenant, so the resulting dep_id is too.
 
-const STARTER_INDEX_MJS =
-    \\// This is your Loop46 handler. It runs as a pure function of
-    \\// (request, kv) — no fetch, no setTimeout, no async IO. All
-    \\// outbound effects go through webhook.send / email.send. See
-    \\// the docs at https://loop46.me/docs for the full story.
-    \\//
-    \\// The current request is available on the `request` global
-    \\// (request.method, request.path, request.body, request.query).
-    \\// Return a string (or an object — we'll JSON.stringify it).
-    \\export default function () {
-    \\  const count = parseInt(kv.get("_starter_hits") ?? "0", 10) + 1;
-    \\  kv.set("_starter_hits", String(count));
-    \\  return {
-    \\    message: "Your Loop46 API is live",
-    \\    path: request.path,
-    \\    hits: count,
-    \\  };
-    \\}
-;
-
-const STARTER_STATIC_INDEX_HTML =
-    \\<!doctype html>
-    \\<html lang="en">
-    \\<head>
-    \\<meta charset="utf-8">
-    \\<title>Your Loop46 app</title>
-    \\<meta name="viewport" content="width=device-width,initial-scale=1">
-    \\<style>
-    \\  body { font: 15px system-ui, sans-serif; max-width: 640px; margin: 4rem auto; padding: 0 1rem; color: #222; }
-    \\  h1 { margin-bottom: 0.25rem; }
-    \\  code { background: #f1f1f1; padding: 0.1em 0.3em; border-radius: 3px; }
-    \\  ul { padding-left: 1.25rem; }
-    \\</style>
-    \\</head>
-    \\<body>
-    \\<h1>Your Loop46 app is live 🎉</h1>
-    \\<p>This static page came from <code>_static/index.html</code>. Everything else routes through <code>index.mjs</code>.</p>
-    \\<h2>Next steps</h2>
-    \\<ul>
-    \\  <li>Visit your dashboard at <a href="https://app.loop46.me">app.loop46.me</a> to edit code and browse your KV</li>
-    \\  <li>Edit <code>index.mjs</code> to handle routes</li>
-    \\  <li>Drop static assets under <code>_static/</code> — images, CSS, SPAs, anything</li>
-    \\  <li>Use <code>webhook.send</code> and <code>email.send</code> for outbound effects</li>
-    \\</ul>
-    \\</body>
-    \\</html>
-;
+const STARTER_INDEX_MJS = @embedFile("starter_index_mjs");
+const STARTER_STATIC_INDEX_HTML = @embedFile("starter_static_index_html");
 
 /// Write the initial deployment for a freshly-created instance. Opens
 /// its own short-lived kv + blob-store connections, pushes the two
@@ -8013,8 +4423,8 @@ test "captureLog appends a record to the worker's node-wide buffer" {
     defer fake.tenant_logs.deinit(allocator);
     defer fake.log_buffer.deinit();
 
-    const tl = try openTenantLog(&fake, inst, 7);
-    defer freeTenantLog(allocator, tl);
+    const tl = try worker_log.openTenantLog(&fake, inst, 7);
+    defer worker_log.freeTenantLog(allocator, tl);
     try fake.tenant_logs.put(allocator, tl.instance_id, tl);
 
     // Capture a single log record (the worker would do this from
@@ -8083,8 +4493,8 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
     defer fake.tenant_logs.deinit(allocator);
     defer fake.log_buffer.deinit();
 
-    const tl = try openTenantLog(&fake, inst, 9);
-    defer freeTenantLog(allocator, tl);
+    const tl = try worker_log.openTenantLog(&fake, inst, 9);
+    defer worker_log.freeTenantLog(allocator, tl);
     try fake.tenant_logs.put(allocator, tl.instance_id, tl);
 
     const empty: []u8 = &.{};

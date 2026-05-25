@@ -199,27 +199,44 @@ globalThis.webhook = {
     };
     kv.set("_send/owed/" + id, JSON.stringify(marker));
 
-    // Phase 5 PR-3: sweep-only fire path. Earlier drafts of this shim
-    // called `http.fetch` inline so the customer saw ~10ms latency on
-    // an immediate-fire webhook.send. That introduced a fundamental
-    // race: the marker is in this handler's writeset (not committed
-    // until raft replicates ~10-20ms later) but `http.fetch` enqueues
-    // the request immediately. On a fast upstream the fetch can
-    // complete BEFORE the marker commits — webhook_onresult opens a
-    // fresh `beginTrackedImmediate` that doesn't see the speculative
-    // writeset, sees `owed_raw == null`, and bails. The chain to the
-    // customer's `on_result` never runs.
+    // Phase 4.1.2 (re-enabled inline fire). The earlier sweep-only
+    // path was a workaround for the marker-commit race: the marker
+    // was in the handler's writeset (not committed until raft
+    // replicates ~10-20ms later) but `http.fetch` enqueued
+    // immediately, so a fast upstream could complete BEFORE the
+    // marker committed — `webhook_onresult` would open a fresh
+    // `beginTrackedImmediate`, see `owed_raw == null`, and bail.
     //
-    // The fix is commit-gating. Until Phase 4.1 lands a generalized
-    // commit-gated Cmd buffer (it currently only stages stream
-    // chunks — `effect-reification-plan.md` §6 Phase 4.0.b), the
-    // pragmatic shape is: don't fire from the handler. The
-    // per-worker partitioned retry sweep wakes within
-    // `SEND_SWEEP_INTERVAL_NS` (1s) of `next_at_ns`, after the
-    // marker has committed. Worst-case latency is ~1s on first
-    // fire; acceptable for v1. The held-sync §6.4 path tolerates
-    // this — its 25s mandatory deadline allows for the sweep tick
-    // and the round-trip.
+    // The fix landed in `effect-reification-plan.md` Phase 4.1.2:
+    // the worker now stages every `http.fetch` issued from a
+    // write-path handler as a `Cmd.http_fetch` on the parked
+    // unit's `BufferedCmds`; `drainRaftPending`'s commit arm runs
+    // `interpretCmd` on each, which submits to the engine STRICTLY
+    // AFTER raft commits the writeset. The fetch + the marker
+    // share one commit gate. No more race.
+    //
+    // Scheduled fires (`fire_at_ns > now`) still go sweep-only —
+    // the sweep is the natural home for "fire later" because the
+    // engine has no deferred-submit mechanism. The held-sync §6.4
+    // path stays correct either way (the 25s mandatory deadline
+    // covers both paths).
+    if (!scheduled) {
+      http.fetch({
+        url: opts.url,
+        method: opts.method || "POST",
+        body: opts.body || "",
+        headers: Object.assign({}, opts.headers || {}, {
+          "X-Rove-Schedule-Id": id,
+          "X-Rove-Schedule-Version": "1",
+        }),
+        on_chunk: "__system/webhook_onresult",
+        ctx: {
+          id: id,
+          on_result: on_result,
+          context: opts.context !== undefined ? opts.context : null,
+        },
+      });
+    }
     return id;
   },
 };

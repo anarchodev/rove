@@ -540,34 +540,85 @@ Revised 2026-05-22 in light of two prior decisions:
   - `worker.zig` resumeStream doc-comment and
     `streaming-model.md` §2 implementation-status note both
     updated to reflect the going-forward contract.
-- **Phase 4.1 (next active piece, 2026-05-24)**: implement
-  `interpretCmd` as the exhaustive switch over the post-Phase-5
-  Cmd union (kv_write + unified outbound HTTP + respond +
-  conn_write). Move the effect buffer onto Continuation; the
-  reconciler releases on commit, discards on fault.
-  **Forcing function:** the Phase 5 PR-3 close-out (above,
-  finding #5) had to drop `webhook.send`'s inline `http.fetch`
-  fire because the marker-commit race let the fetch return
-  BEFORE the writeset committed via raft — the JS-shim
-  `webhook_onresult` then opened a fresh `beginTrackedImmediate`
-  that didn't see the speculative marker, exited at
-  `owed_raw == null`, and the chain to the customer's
-  `on_result` never fired. The shipped mitigation (sweep-only
-  fire path) adds ~1s first-fire latency. Phase 4.1's
-  commit-gated buffer is the proper fix: an `http.fetch` Cmd
-  emitted from a handler stages on the handler's `ParkedUnit`
-  (Phase 4.0.b extended this from stream chunks to all Cmd
-  kinds); at raft commit `transferStagedFetches` (parallel to
-  the existing `transferStagedChunks`) flushes to
-  `node.fetch_pending`; at fault the staged fetches discard with
-  the unit. Restores inline `http.fetch` fire without the race.
+- **Phase 4.1.1 — typed Cmd union + interpretCmd switch (SHIPPED
+  2026-05-24).** `effect/cmd.zig` now declares the live Cmd union
+  with payload-bearing variants — `kv_wake_broadcast`,
+  `stream_chunk`, `stream_close`, `http_fetch`, `conn_write` (the
+  last as a panic-branch slot for inbound-WS work that hasn't
+  landed). `effect.interpretCmd` is the exhaustive switch over
+  this union; the Zig compiler refuses to build when a variant
+  lacks a switch arm — the compile-time contract Phase 1 promised
+  is in place. `effect.BufferedCmds.releaseAll` drives
+  `interpretCmd` per Cmd in the parked-units commit arm.
+  Pre-4.1.1 per-kind helpers `firePendingKvWakes` +
+  `transferStagedChunks` deleted; their work collapsed into the
+  switch. `BufferedSendKvOps` is aliased to
+  `effect.cmd.BufferedCmds` for back-compat at the ParkedUnit
+  declaration site; producers (`parkKvWakes`,
+  `proposeForgetfulWrites`) build Cmd records directly.
+  `fireKvReactSubscriptions` reads kv_wake_broadcast Cmds
+  read-only before releaseAll consumes them. Behavior preserved:
+  full smoke set green including the Phase 4.0.b chunk-leak
+  fault-injection gate (`streaming_resume_fault_inj_smoke.py` —
+  proves the commit-vs-fault staging stayed correct across the
+  migration). `kv_write` + `respond` Cmd kinds remain as type
+  slots without runtime routing — those routings are 4.1.2 +
+  4.1.3 below.
+- **Phase 4.1.2 — http_fetch staging (SHIPPED 2026-05-24).** The
+  marker-commit race is closed. Three concrete changes:
+  - `worker_dispatch.zig` — added a batch-level
+    `batch_pending_fetches` accumulator (parallel to `writeset`).
+    The per-handler-success transfer replaces the eager
+    `enqueuePendingFetches` flush at the old line 2621.
+    `finalizeBatch` now decides at end-of-batch:
+    read-only / no-speculation → flush immediately (no marker, no
+    race); read-only-with-speculation (idiom-0 barrier) → stage
+    on a parked unit with empty writeset (commit-gated by the
+    barrier seq); write path → stage as `Cmd.http_fetch` Cmds on
+    the parked unit via `parkKvWakes`'s new `extra_cmds`
+    parameter.
+  - `worker.zig:parkKvWakes` — takes `extra_cmds:
+    effect.cmd.BufferedCmds` (taken-by-value, consumed
+    unconditionally). The unit's BufferedCmds is built from
+    `extra_cmds` as the base + kv_wake_broadcast Cmds appended on
+    top. `worker_drain.zig`'s cont-resume call site passes `.{}`
+    (cont-resume hops don't accumulate http.fetches).
+  - `globals/webhook.js` — re-enabled the inline `http.fetch`
+    for immediate-fire `webhook.send`. The fetch's `on_chunk` is
+    `__system/webhook_onresult`, stamped with `X-Rove-Schedule-Id`
+    + `X-Rove-Schedule-Version: 1` so upstreams dedupe by
+    `(id, version)`. Scheduled `fire_at_ns > now` still goes
+    sweep-only (the engine has no deferred-submit mechanism).
+  - **Gate (all green):** `http_send_smoke` (the customer's
+    `on_result` chain fires — proves `webhook_onresult` ran AFTER
+    the marker committed, the property the race fix establishes);
+    full regression set (`fetch_chunk` / `fetch_streaming` /
+    `streaming` / `streaming_kv_wake` /
+    `streaming_resume_fault_inj` / `heldsync` / `subscription` /
+    `subscription_cap` / `ctl` / `penalty`).
+  - **Customer-visible win:** webhook.send's first-fire latency
+    drops from the ~1 s sweep tick to inline. The
+    `__system/webhook_onresult` shim still owns retry policy
+    (1 s → 2 s → 4 s … cap 60 s, max 5 attempts) — that's
+    unchanged.
+- **Phase 4.1.3 — `respond` Cmd: gate H2 response stamping on
+  commit (deferred).** Touches `drainEntityArm`; the byte-identical
+  invariant says this is its own session with deliberate smoke
+  validation across the full gating set.
+- **Phase 4.1.4 — `conn_write` Cmd: producer-less.** Stays as
+  the panic branch in `interpretCmd` until inbound-WS server
+  lands (separate plan; not gated on this work).
 - **Gate**: streaming smokes (for 4.0's pre-commit decision);
-  `http_send` smokes + streaming smokes (for 4.1).
+  `http_send` smokes + streaming smokes (for 4.1.2);
+  full smoke set + new fault-injection gate (for 4.1.3).
 - **Done**: streaming model says what the code does and vice versa;
-  no Cmd escapes except through the reconciler's commit gate (Phase
-  4.1).
-- **Rollback**: 4.0 is a doc + small code change per arm; 4.1 is
-  per-Cmd-kind incremental.
+  no Cmd escapes except through the reconciler's commit gate;
+  `interpretCmd` exhaustively switches over every producer-bearing
+  Cmd kind. 4.1.1 is the contract; 4.1.2 is the customer-visible
+  win; 4.1.3 unifies the H2 path; 4.1.4 closes the loop with
+  inbound-WS.
+- **Rollback**: 4.0 is a doc + small code change per arm; 4.1.X
+  is per-PR incremental.
 
 ### Phase 5 — Retire `http.send`; durability becomes JS-shim composition
 
