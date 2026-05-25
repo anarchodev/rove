@@ -167,14 +167,17 @@ pub const RaftWait = struct {
 /// rule, not the exception.
 pub const BufferedSendKvOps = effect_mod.cmd.BufferedCmds;
 
-/// A non-entity post-propose parked unit (divergence workstream,
-/// `docs/unified-effect-gating.md` idiom-1). The H2 path parks ECS
-/// entities in `raft_pending`; the non-H2 `tenant_batch` paths have
-/// no entity, so they register one of these instead of releasing
-/// their SSE emits at *accept*. `drainRaftPending` releases the
-/// buffered emits at commit (`committedSeq >= seq`) and discards
-/// them on fault/timeout/leadership-loss (the effect never escaped).
-/// Purely additive — the H2 entity path is untouched.
+/// A post-propose parked unit (divergence workstream,
+/// `docs/unified-effect-gating.md` idiom-1) — the parked-unit half
+/// of the Cmd-buffer commit gate. The H2 entity path parks ECS
+/// entities in `raft_pending_X` and emits a `Cmd.respond` on the
+/// matching unit; non-entity paths (the streaming kv-wake gate in
+/// `worker_streaming.parkKvWakesForStreaming`, the cont-resume +
+/// barrier paths in `worker.parkKvWakes`) just register a unit
+/// directly. `drainRaftPending` releases the buffered Cmds at
+/// commit (`committedSeq >= seq`) through `interpretCmd` and
+/// discards them on fault/timeout/leadership-loss (the effect
+/// never escaped).
 ///
 /// Effect-reification Phase 3.1: `ParkedUnit` is now the first
 /// concrete instantiation of `effect.Continuation`. Same fields
@@ -1881,9 +1884,9 @@ pub fn Worker(comptime opts: Options) type {
         // Phase 7: `pending_stream_meta` removed — stream components
         // are populated in `streamRecordIfAnyAt` (Phase 4a) before
         // the entity moves into `raft_pending_stream`; the meta's
-        // owned slices are freed there too. drainStreamPending just
-        // moves the entity to stream_response_in on commit; no
-        // side-table consume.
+        // owned slices are freed there too. The raft_pending_stream
+        // drainEntityArm just moves the entity to stream_response_in
+        // on commit; no side-table consume.
         /// Per-worker kv-wake inbox (streaming-handlers-plan §4.6).
         /// Producers (apply.zig + leader-side worker_dispatch) push
         /// events here via `worker.node.broadcastKvWake`;

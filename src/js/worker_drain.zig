@@ -67,32 +67,28 @@ const CONT_HOLD_DEADLINE_NS = worker_mod.CONT_HOLD_DEADLINE_NS;
 
 // ── Reconciler ────────────────────────────────────────────────────────
 
-/// Effect-reification Phase 3.2.b: the unified entity-backed
-/// raft-pending drain. The three pre-3.2.b functions
-/// (drainResponsePending / drainContPending / drainStreamPending)
-/// differed ONLY in the source collection, the on-commit
-/// destination, and the panic-label site name; their bodies were
-/// otherwise identical. This helper carries the shared body; the
-/// three named functions become one-line wrappers.
+/// Shared body of the three raft_pending_X sibling drains
+/// (response / cont / stream). The pre-3.2.b world had three near-
+/// identical functions; this fn unifies them, parameterised by the
+/// source collection + a panic-label site name.
 ///
-/// The fault arm's destination is hard-coded to `server.response_in`
-/// (the three arms all routed fault to `response_in` for the 503
-/// downgrade) — that's a per-sibling invariant of the H2 reference
-/// path. The post-fault `overwrite503InPending` + old-body free is
-/// identical across all three arms.
+/// Commit arm: take the deferred TrackedTxn through the watermark;
+/// the entity's commit-time move is the parked_units arm's job via
+/// `interpretCmd .respond` (every path that parks an entity in
+/// raft_pending_X also emits a Cmd.respond on the parked_units
+/// unit — see effect-reification-plan.md Phase 4.1.3 Option-2).
 ///
-/// Per the Phase 3 invariant "H2 is the reference, byte-identical":
-/// this collapse is a pure source-level refactor. The compiled code
-/// matches the pre-3.2.b shape because the source/dest pointers are
-/// dispatched via anytype (Zig generates a specialized function per
-/// instantiation, each identical to its pre-3.2.b counterpart).
+/// Fault arm: rollback the txn, overwrite the response body to 503,
+/// move the entity to `server.response_in` for h2 to ship.
+/// `response_in` is hard-coded for the fault destination — the three
+/// arms all routed fault there for the 503 downgrade, that's a
+/// per-sibling invariant of the H2 reference path.
 fn drainEntityArm(
     worker: anytype,
     server: anytype,
     allocator: std.mem.Allocator,
     wm: effect_mod.Watermarks,
     source: anytype,
-    on_commit_dest: anytype,
     comptime site_label: []const u8,
 ) !void {
     const entities = source.entitySlice();
@@ -116,17 +112,9 @@ fn drainEntityArm(
                         .{ wait.seq, @errorName(err) },
                     ),
                 }
-                // Effect-reification Phase 4.1.3 Option-2: every
-                // path that parks an entity in raft_pending_X also
-                // emits a Cmd.respond on the parked_units unit
-                // (handler dispatch + barrier + /_system/release +
-                // /_system/admin_kv + cont-resume). The commit-arm
-                // move is the parked_units arm's job via
-                // `interpretCmd .respond`; we skip it here. The
-                // `on_commit_dest` parameter to this fn is now
-                // documentation-only (the actual dest enum lives
-                // on each Cmd.respond's `.dest` field).
-                _ = on_commit_dest;
+                // Commit-arm entity move lives on the parked_units
+                // arm via `interpretCmd .respond` (Phase 4.1.3
+                // Option-2). Nothing more to do here.
             },
             .fault => {
                 switch (worker.pending_txns.rollbackAndTake(allocator, wait.seq)) {
@@ -149,58 +137,6 @@ fn drainEntityArm(
             },
         }
     }
-}
-
-/// Phase 5: response-bound raft park drain. Entity in
-/// `raft_pending_response` → `response_in` on commit / fault.
-fn drainResponsePending(
-    worker: anytype,
-    server: anytype,
-    allocator: std.mem.Allocator,
-    wm: effect_mod.Watermarks,
-) !void {
-    try drainEntityArm(
-        worker, server, allocator, wm,
-        &worker.raft_pending_response,
-        &server.response_in,
-        "drainResponsePending",
-    );
-}
-
-/// Phase 5: continuation-bound raft park drain. Entity in
-/// `raft_pending_cont` → `parked_continuations` on commit; → 503
-/// `response_in` on fault.
-fn drainContPending(
-    worker: anytype,
-    server: anytype,
-    allocator: std.mem.Allocator,
-    wm: effect_mod.Watermarks,
-) !void {
-    try drainEntityArm(
-        worker, server, allocator, wm,
-        &worker.raft_pending_cont,
-        &worker.parked_continuations,
-        "drainContPending",
-    );
-}
-
-/// Phase 5: stream-first-hop raft park drain. Entity in
-/// `raft_pending_stream` → `stream_response_in` on commit (where
-/// stream components were populated in `streamRecordIfAnyAt` before
-/// the entity entered raft_pending_stream — they ride here via
-/// merged_request_row); → 503 `response_in` on fault.
-fn drainStreamPending(
-    worker: anytype,
-    server: anytype,
-    allocator: std.mem.Allocator,
-    wm: effect_mod.Watermarks,
-) !void {
-    try drainEntityArm(
-        worker, server, allocator, wm,
-        &worker.raft_pending_stream,
-        &server.stream_response_in,
-        "drainStreamPending",
-    );
 }
 
 /// Iterate `raft_pending`, check each entity's `RaftWait.seq` against
@@ -245,9 +181,9 @@ pub fn drainRaftPending(worker: anytype) !void {
     // queue moves. Forward-iter preserves per-tenant chain order
     // (entities enter the siblings in propose-seq order from
     // finalizeBatch).
-    try drainResponsePending(worker, server, allocator, wm);
-    try drainContPending(worker, server, allocator, wm);
-    try drainStreamPending(worker, server, allocator, wm);
+    try drainEntityArm(worker, server, allocator, wm, &worker.raft_pending_response, "raft_pending_response");
+    try drainEntityArm(worker, server, allocator, wm, &worker.raft_pending_cont, "raft_pending_cont");
+    try drainEntityArm(worker, server, allocator, wm, &worker.raft_pending_stream, "raft_pending_stream");
 
     // ── Additive: non-entity parked units (idiom-1 SSE-emit gating,
     //    docs/unified-effect-gating.md). The H2 entity path above is
@@ -568,13 +504,14 @@ fn proposeAndParkContResume(
         .terminal => |t| {
             // Cont-resume terminal+writes: stamp response components
             // on the entity (still in parked_continuations), then
-            // move to raft_pending_cont. drainContPending routes the
-            // committed entity back to parked_continuations; the
-            // subsequent resume / sweep / resolve site ships the
-            // body. ContDescriptor stays populated and deinits when
-            // the entity destroys — sweep gates on isInCollection
-            // before reading it, so a stale desc on an entity mid-
-            // commit-flow can't fire spuriously.
+            // move to raft_pending_cont. The raft_pending_cont
+            // drainEntityArm routes the committed entity back to
+            // parked_continuations; the subsequent resume / sweep /
+            // resolve site ships the body. ContDescriptor stays
+            // populated and deinits when the entity destroys —
+            // sweep gates on isInCollection before reading it, so a
+            // stale desc on an entity mid-commit-flow can't fire
+            // spuriously.
             try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = t.status });
             try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, .{ .fields = null, .count = 0 });
             try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = t.body.ptr, .len = @intCast(t.body.len) });
@@ -590,7 +527,7 @@ fn proposeAndParkContResume(
         .repark => |r| {
             // Update the entity's ContDescriptor in place — replace
             // cont, refresh bound_schedule_id, refresh deadline.
-            // drainContPending sees the entity in raft_pending_cont
+            // The raft_pending_cont drainEntityArm sees the entity
             // at commit and routes back to parked_continuations.
             // Ownership of r.new_cont and r.new_bound_sched_id
             // transfers directly into the component.
@@ -630,7 +567,7 @@ fn proposeAndParkContResume(
 ///       • continuation + no writes → re-park (only if `allow_repark`);
 ///         speculative commit is durable enough — no raft hop.
 ///       • continuation + writes (allow_repark) → propose, park on
-///         raft_pending_cont; drainContPending re-parks on commit
+///         raft_pending_cont; the drainEntityArm re-parks on commit
 ///         (`proposeAndParkContResume(.repark)` — recipe-1 real-retry).
 ///       • continuation + !allow_repark → defined 504 (deadline).
 ///       • stream → defined 501 (`cont → stream` is a later phase).
@@ -768,10 +705,11 @@ fn resumeContinuation(
             if (wrote) {
                 // Phase 4: terminal + writes — propose the writes
                 // through raft, park the entity on `raft_pending_cont`
-                // with the response components staged on it.
-                // drainContPending routes the committed entity back
-                // to `parked_continuations`, where the subsequent
-                // resume / sweep / resolve site ships the response.
+                // with the response components staged on it. The
+                // raft_pending_cont drainEntityArm routes the
+                // committed entity back to `parked_continuations`,
+                // where the subsequent resume / sweep / resolve
+                // site ships the response.
                 const corr_id = correlation_id;
                 const dep_id = tc.snap.deployment_id;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
@@ -840,8 +778,9 @@ fn resumeContinuation(
             }
             if (wrote) {
                 // Phase 4: continuation + writes — propose, park
-                // on `raft_pending_cont`; on commit `drainContPending`
-                // routes the entity back to `parked_continuations`
+                // on `raft_pending_cont`; on commit the
+                // raft_pending_cont drainEntityArm routes the
+                // entity back to `parked_continuations`
                 // with the in-place-updated ContDescriptor (new
                 // cont, refreshed bound_schedule_id, refreshed
                 // deadline). The new bound_schedule_id (the lone

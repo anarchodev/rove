@@ -355,7 +355,7 @@ export default function () {
       url: `https://${request.headers.host}/_backfill_session_index`,
       method: "POST",
       body: JSON.stringify({ cursor: next_cursor }),
-      onResult: "_backfill_done",   // optional — fires on terminal failure
+      on_result: "_backfill_done",   // optional — fires on terminal failure
     });
   }
   return { processed: page.entries.length, done: !next_cursor };
@@ -405,9 +405,9 @@ const id = webhook.send({
   method: "POST",
   headers: { Authorization: "Bearer " + kv.get("stripe_key") },
   body: JSON.stringify({ ... }),
-  onResult: "stripe/charge_result",      // string path to callback handler
+  on_result: "stripe/charge_result",     // string path to callback handler
   context: { charge_id: "c_abc", user_id: 42 },
-  maxAttempts: 10,
+  max_attempts: 10,
   timeout: 30_000,
   retryOn: [408, 425, 429, 500, 502, 503, 504, "network"],
 });
@@ -461,7 +461,7 @@ No per-tenant `_outbox/{id}`, no `_outbox_inflight/{id}`, no `_dlq/{id}`. Failed
 #### Retry defaults
 
 - Exponential with full jitter (0..delay). Base 1s, cap 5min.
-- Default `maxAttempts: 10` (≈1 hour envelope).
+- Default `max_attempts: 10` (≈1 hour envelope).
 - Retryable: 408, 425, 429, 5xx, network errors, timeouts. Non-retryable: all other 4xx.
 
 #### Delivery guarantees
@@ -512,7 +512,7 @@ email.send({
   to: "user@example.com",
   subject: "Verify your rewind.js account",
   text: "Click: https://app.rewindjs.com/v1/auth?mt=...",
-  onResult: "signup/email_sent",
+  on_result: "signup/email_sent",
   context: { user_id: 42 },
 });
 ```

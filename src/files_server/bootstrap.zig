@@ -141,11 +141,13 @@ fn classify(rel_path: []const u8) DeployClass {
     if (std.mem.eql(u8, rel_path, "codemirror-entry.mjs")) return .ignore;
     // Any other `.mjs` is compiled to handler bytecode. It is NOT
     // HTTP-routed (only `index.mjs` is the path entrypoint) — it is
-    // reached as an `on_result`/callback module via callback_dispatch
-    // (`findCallbackBytecode` looks it up by `{rel_path}` in the
-    // bytecodes map). This is what makes the Fork-B RP completion
-    // modules `_rp/complete.mjs` / `_rp/jwks.mjs` deployable, and
-    // matches the customer upload path (which compiles every `.mjs`).
+    // reached as an `on_result`/chain-activation module via
+    // `__rove_next(rel_path, ...)` (the customer's `on_result` /
+    // subscription / cron module spec resolves to `{rel_path}` in
+    // the bytecodes map). This is what makes the Fork-B RP
+    // completion modules `_rp/complete.mjs` / `_rp/jwks.mjs`
+    // deployable, and matches the customer upload path (which
+    // compiles every `.mjs`).
     if (std.mem.endsWith(u8, rel_path, ".mjs")) return .handler;
     return .ignore;
 }

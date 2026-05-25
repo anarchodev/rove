@@ -275,9 +275,8 @@ self-spawned by the smokes):
   `streaming_subscription_kv` — all ✓
 - `fetch_chunk_smoke.py` ✓ + `fetch_streaming_smoke.py` ✓ + `pipe_smoke.py` ✓
 - `readonly_speculation_faultinj_smoke.py` ✓ (idiom-0 gate)
-- `cookie_auth_smoke.py` — referenced in §7 but **does not exist in
-  `scripts/`**; doc-stale (substitute: `oidc_smoke.py` covers the
-  auth surface). Update §7 when next editing.
+- `oidc_smoke.py` ✓ (auth surface — superseded the retired
+  cookie-auth smoke when the Fork-B OIDC RP migration landed).
 
 kv-bench baseline (3-node `kv_bench_cluster.sh` over `*.rewindjsapp.localhost`,
 2 runs averaged; ReleaseFast, `WORKERS=8`, 30k req/tenant, c=10, m=10):
@@ -543,13 +542,16 @@ Revised 2026-05-22 in light of two prior decisions:
 - **Phase 4.1.1 — typed Cmd union + interpretCmd switch (SHIPPED
   2026-05-24).** `effect/cmd.zig` now declares the live Cmd union
   with payload-bearing variants — `kv_wake_broadcast`,
-  `stream_chunk`, `stream_close`, `http_fetch`, `conn_write` (the
-  last as a panic-branch slot for inbound-WS work that hasn't
-  landed). `effect.interpretCmd` is the exhaustive switch over
-  this union; the Zig compiler refuses to build when a variant
-  lacks a switch arm — the compile-time contract Phase 1 promised
-  is in place. `effect.BufferedCmds.releaseAll` drives
-  `interpretCmd` per Cmd in the parked-units commit arm.
+  `stream_chunk`, `stream_close`, `http_fetch`, `respond`.
+  `effect.interpretCmd` is the exhaustive switch over this union;
+  the Zig compiler refuses to build when a variant lacks a switch
+  arm — the compile-time contract Phase 1 promised is in place.
+  `effect.BufferedCmds.releaseAll` drives `interpretCmd` per Cmd
+  in the parked-units commit arm.
+  (The earlier `conn_write` slot for inbound-WS was removed
+  2026-05-24 after the audit-for-half-done-refactors pass — it
+  had no producer in tree, so the typed slot was parked Option-1
+  scaffolding. Re-add when the inbound-WS server lands.)
   Pre-4.1.1 per-kind helpers `firePendingKvWakes` +
   `transferStagedChunks` deleted; their work collapsed into the
   switch. `BufferedSendKvOps` is aliased to
@@ -605,9 +607,8 @@ Revised 2026-05-22 in light of two prior decisions:
   through `interpretCmd` (SHIPPED 2026-05-24, Option-2
   full-convert).** The exhaustive switch over `Cmd` now covers
   every producer-bearing variant (kv_wake_broadcast +
-  stream_chunk + stream_close + http_fetch + **respond**;
-  conn_write stays the panic-branch slot until inbound-WS
-  lands). Shape:
+  stream_chunk + stream_close + http_fetch + **respond**).
+  Shape:
   - `Cmd.respond` is **move-only** — entity + source enum +
     dest enum. No payload. The h2 components (Status /
     RespHeaders / RespBody / H2IoResult / StreamId / Session)
@@ -655,9 +656,12 @@ Revised 2026-05-22 in light of two prior decisions:
     `penalty` / `streaming` / `streaming_kv_wake` /
     `leader_failover` / `files_server` / `http_send` (the
     pre-existing `wb/last_tag` stale check is unrelated).
-- **Phase 4.1.4 — `conn_write` Cmd: producer-less.** Stays as
-  the panic branch in `interpretCmd` until inbound-WS server
-  lands (separate plan; not gated on this work).
+- **Phase 4.1.4 — `conn_write` Cmd: deferred to inbound-WS.**
+  Add the variant when the inbound-WS producer ships (separate
+  plan). Don't park the typed slot in advance — the
+  `respond_deferred` failure mode the 2026-05-24
+  audit-for-half-done-refactors pass ruled out applies here too:
+  union arms without producers are Option-1 scaffolding.
 - **Gate**: streaming smokes (for 4.0's pre-commit decision);
   `http_send` smokes + streaming smokes (for 4.1.2);
   full smoke set + new fault-injection gate (for 4.1.3).
@@ -665,8 +669,8 @@ Revised 2026-05-22 in light of two prior decisions:
   no Cmd escapes except through the reconciler's commit gate;
   `interpretCmd` exhaustively switches over every producer-bearing
   Cmd kind. 4.1.1 is the contract; 4.1.2 is the customer-visible
-  win; 4.1.3 unifies the H2 path; 4.1.4 closes the loop with
-  inbound-WS.
+  win; 4.1.3 unifies the H2 path; 4.1.4 will close the loop when
+  inbound-WS lands.
 - **Rollback**: 4.0 is a doc + small code change per arm; 4.1.X
   is per-PR incremental.
 
@@ -1087,6 +1091,268 @@ customer API. Out of scope here; tracked separately.
   reified state; update `CLAUDE.md` if dispatch wording drifted.
 - **Done**: audit re-run shows the reified state; worklist clear.
 
+### Phase 7 — Collapse `files-server` into Cmds + in-process compile worker
+
+Structural sibling of Phase 5. Phase 5 retired a Zig *effect*
+(`http.send` durable delivery) as a JS-shim composition over kv +
+outbound HTTP. Phase 7 retires a Zig *external service*
+(`files-server-standalone`) as a JS-shim composition over two new
+primitives (`blob.put` Cmd + an in-process compile worker) + kv +
+the existing admin auth path. PLAN §13's live process map loses
+one row; the `files.{public_suffix}` subdomain folds into admin
+on loop46. Supersedes `docs/files-server-plan.md` §11 (which moved
+in the opposite direction: external HTTP service further detached).
+
+**Algebraic framing.** Files-server today owns four things, none of
+them primitive in the §2 sense: (a) **blob writes** to the shared
+BlobBackend — a Cmd runtime instance; (b) **QuickJS compile** —
+also a Cmd runtime, producing a `compile_done` Msg origin;
+(c) **manifest writes** — ordinary kv writes (envelope 0);
+(d) **deployment-id allocation** — already content-addressed
+(`computeDeploymentId(entries)` in `files_mod.manifest_json`), so
+no allocator is needed. (c) + (d) are already kv; the phase makes
+(a) + (b) first-class primitives so the whole service composes
+in JS.
+
+**Target shape:**
+
+```
+admin tenant JS (e.g. globals/files.js or __system/files/upload.mjs):
+
+  // upload
+  const cb = await compile.queue(source);          // Cmd → compile_done Msg
+  await blob.put(`blobs/${cb.bytecode_hash}`, cb.bytecode);  // Cmd
+  await blob.put(`blobs/${source_hash}`, source);            // Cmd
+
+  // deploy (atomic in handler writeset)
+  const manifest = buildManifest(entries);
+  const dep_id = computeDeploymentId(entries);     // content hash
+  await blob.put(`deployments/${pad20(dep_id)}.json`,
+                  JSON.stringify(manifest));       // Cmd, idempotent
+
+  // release (already exists)
+  kv.set("_deploy/current", JSON.stringify({v:1, target_deployment_id: dep_id}));
+```
+
+The compose-from-primitives discipline ([[feedback_compose_from_primitives]])
+applied to a whole subsystem.
+
+**Two new primitives.**
+
+1. **`blob.put` Cmd** — `effect/cmd.zig` adds a `blob_put` variant
+   carrying `{tenant_id, key, bytes_ref}`. `interpretCmd` routes to
+   `BlobBackend.put` on a per-tenant handle. Same backend the
+   worker already reads from; no new transport. Content-addressed
+   keys are idempotent; the Cmd retries on transport error like
+   any other ephemeral Cmd. Commit-gated by L4 (releases after the
+   handler's writeset commits) — important because the manifest
+   shouldn't reference blobs that committed pre-quorum and were
+   rolled back. The bytes themselves go to S3 either way; the
+   commit gate prevents a dangling manifest pointer if the writeset
+   fault-rollbacks.
+
+2. **`compile.queue` Cmd + `compile_done` Msg origin** — the asymmetric
+   one. Compile is CPU-heavy (~5–20ms per 20KB `.mjs`, bursting on
+   deploy). A dedicated compile thread pool (size = `min(N_cores - N_workers, 4)`,
+   measured) drains a `compile_pending` rove collection; each entry
+   holds `{tenant_id, correlation_id, source_bytes, deps[]}`. Worker
+   completes compile, posts a `compile_done` Msg via the existing
+   NodeState inbox + hash-routing (same shape as cross-thread
+   subscription fires, [[project_gap_2_1_subscriptions]]). The Msg
+   carries `{bytecode_hash, bytecode, error?}`; the chain-activation
+   pattern handles parking + resume (same Continuation shape Phase 3
+   reified).
+
+   Dependency resolution (today's `compileLoad` callback that fetches
+   sibling source) becomes a recursive pattern: the compile worker
+   detects an unresolved import, posts a `compile_done` with
+   `pending_imports: [path…]`, the JS shim issues additional
+   `blob.get + compile.queue` pairs, retries. Or — simpler — the
+   shim resolves *all* deps up front and passes them as a sealed
+   bundle so compile is a pure function of inputs. Pick at PR-2.
+
+**One Msg ingress collapse.** `compile_done` is a new variant in the
+unified Msg ingress (Phase 2 / Phase 3 generalized this). No new
+collection beyond `compile_pending`; resume goes through the
+existing `Continuation` reconciler.
+
+**What deletes.**
+
+- `src/files_server/` — `root.zig` + `thread.zig` + `ssrf.zig`
+  (the latter migrated to `src/ssrf/` per current branch state).
+- `examples/files_server_standalone.zig`.
+- `files-server-standalone` build target + `zig build files-server`
+  step in `build.zig`.
+- `scripts/smoke_lib.py` — `spawn_files_server`, `mint_services_token`
+  helpers; the `services-token` JWT machinery on the loop46 side
+  (`/_system/services-token` route + `LOOP46_SERVICES_JWT_SECRET`
+  env).
+- `--files-public-base` flag + plumbing through `loop46 worker`.
+- `InlineCompiler`'s self-contained per-call shape — replaced by
+  the long-lived compile-thread-pool's QJS runtime + context (one
+  per thread, reused across compiles; cheaper steady-state).
+- The files-server's own raft cluster (per current `files-server-plan.md`
+  §3 it already writes manifests to S3 via PUT-if-not-exists, not
+  through raft — so this is already mostly gone; just delete the
+  remaining wiring).
+
+**What stays / changes shape.**
+
+- `BlobBackend` (`src/blob/`) — unchanged. Becomes the `blob.put`
+  Cmd's runtime.
+- `files_mod.manifest_json.computeDeploymentId` — unchanged.
+  Becomes a JS-callable helper (or just reimplemented in JS — it's
+  a SHA-256 over the entries).
+- `_deploy/current` kv-marker scan + `ReleaseTable` +
+  `applyPendingReleases` — unchanged. Workers still pick up new
+  deployments via the same raft-replicated kv writes.
+- Worker's manifest-load path (`docs/files-server-plan.md` §4) —
+  unchanged. Still reads `deployments/{dep_id}.json` from
+  BlobBackend on release.
+- PLAN §13 process map — loses the `files-server-standalone` row.
+  `loop46` now also owns: blob writes (Cmd), QJS compile worker,
+  `__system/files/*` handler modules.
+- Compile-failure surface — today files-server returns HTTP 4xx
+  from `uploadFile`; under this phase the `compile_done` Msg
+  carries `{error: {kind, message, source_loc?}}`; the `__system/files/upload`
+  handler returns the same 4xx shape to the CLI/dashboard.
+
+**PR breakdown.**
+
+- **PR-1 — `blob.put` Cmd primitive.** Add `Cmd.blob_put` variant;
+  wire `interpretCmd`; per-tenant `BlobBackend` handle cache (mirrors
+  the per-tenant kv handle pattern); JS binding (`__rove_blob_put`).
+  Unit test only; no caller in tree yet. ~150 LOC.
+- **PR-2 — compile worker.** `CompilePool` thread pool;
+  `compile_pending` collection; `Cmd.compile_queue` variant;
+  `CompileDone` Msg variant in the unified ingress; JS binding
+  (`__rove_compile_queue`); thread-safe routing of `compile_done`
+  through `NodeState.inbox` + hash-routing per tenant. Smoke:
+  `compile_smoke.py` — exercises happy-path + syntax-error +
+  missing-import (or sealed-bundle equivalent depending on PR-2's
+  dep model decision). ~400 LOC.
+- **PR-3 — `__system/files/*` handler modules + admin auth wiring.**
+  Built-in modules (Phase 5 PR-2b's `__system/` namespace
+  mechanism): `__system/files/upload.mjs`, `__system/files/deploy.mjs`,
+  `__system/files/blobs.mjs` (PUT/check), `__system/files/source.mjs`
+  (GET by hash), `__system/files/deployments.mjs` (LIST + GET).
+  Routed by admin tenant on loop46; gated by the admin tenant's
+  existing cookie/bearer session auth — no separate services-JWT.
+  ~300 LOC of JS shims + a small Zig wiring delta.
+- **PR-4 — point smokes + CLI + dashboard at the new endpoints.**
+  `scripts/files_server_smoke.py` switches from spawning a
+  standalone to hitting loop46 admin host; `scripts/smoke_lib.py`
+  loses `spawn_files_server` / `mint_services_token`. The
+  `rewind` CLI (when it exists, per [[project_cli_build_split]])
+  uses the same admin endpoints. Demo tenants under
+  `examples/loop46-demo-tenants/` deploy through the new path.
+- **PR-5 — atomic flip + Zig kernel delete.** Per Phase 5 PR-3
+  precedent ([[feedback_no_half_refactors]]): one commit deletes
+  `src/files_server/` + `examples/files_server_standalone.zig` +
+  the build target + the `--files-public-base` plumbing + the
+  services-JWT route. Doc updates: PLAN.md §13 process map;
+  CLAUDE.md "Module dependency graph"; `files-server-plan.md`
+  marked superseded by this phase (§11 in particular).
+
+**Open questions / risks.**
+
+- **Compile CPU isolation.** Putting compile in the same process
+  as request workers risks stealing cycles. Mitigation: dedicated
+  thread pool sized at startup, default `min(N_cores - N_workers, 4)`;
+  optional `SCHED_BATCH` (Linux) on the compile threads to deprioritize
+  vs request workers. Measure with a deploy-storm bench before
+  PR-5 atomic flip. If unacceptable, fallback is to keep compile
+  as a separate process (sidecar) talking over loopback — the
+  compile *Cmd* still works the same way, just routes off-box. The
+  primitive design doesn't change; only the runtime placement.
+- **Auth surface change.** Today's services-JWT model gates
+  any-tenant operations behind a shared secret. The new shape
+  uses the admin tenant's session auth. Implication: deploy
+  operations are scoped to admin-tenant authenticated sessions.
+  This matches the rewind-CLI direction ([[project_cli_build_split]])
+  but breaks any operator tooling that mints a raw services-JWT.
+  Audit `scripts/` and ops docs before PR-5.
+- **Compile-worker resume across restarts.** A node crash mid-compile
+  loses the compile entry (it's on an ephemeral collection).
+  Acceptable — compile is idempotent and the customer just retries.
+  But the upload handler must surface a clean error rather than
+  hanging; PR-3 needs a per-compile timeout that fires `compile_done`
+  with `{error: timeout}` after N seconds.
+- **Multi-node compile routing.** Compile runs on the leader only?
+  Or any node? **Any node** — compile is pure, its output is a
+  content-addressed blob, and `blob.put` is the only durable
+  side-effect (idempotent). A follower can compile; the resulting
+  `blob.put` Cmd routes to the leader at commit time like any
+  other writeset. PR-2 doesn't need leader-pinning.
+- **Memory pressure under deploy storm.** Compile pool of 4 ×
+  full-source-bytes can spike. PR-2 should bound `compile_pending`
+  queue depth and surface backpressure (drop with 503 + Retry-After,
+  same template as gap-2.2 streaming backpressure
+  [[project_gap_2_2_backpressure]]).
+
+**Gating + risk.**
+
+- `files_server_smoke.py` — must pass after each PR. Adapts to
+  new endpoints in PR-4.
+- `ctl_smoke.py` — exercises ctl's deploy path; must pass throughout.
+- NEW: `compile_smoke.py` — happy + syntax-error + dep-resolution
+  + timeout + concurrent-deploy (idempotent).
+- NEW: `deploy_storm_bench.py` — measure compile pool's impact on
+  request-worker throughput under a burst of 50 concurrent deploys.
+  Gate PR-5 on "no measurable regression on the hot kv-bench
+  during the storm" with the configured pool size.
+- Perf gate: kv-bench hot + 8w sharded unchanged (compile is
+  off the request path).
+
+**Done when:** PLAN §13 lists only `loop46` + `log-server-standalone`;
+`files-server-standalone` binary deleted; `__system/files/*` handles
+all compile/upload/deploy/fetch; all smokes green; deploy-storm
+bench shows no request-worker regression. The files-server module
+exists only in `git log`.
+
+**Rollback:** PR-1 through PR-4 are additive — revert in reverse
+order restores byte-identical behavior since the old service is
+still running. PR-5 is the irreversible flip; gate it behind a
+week of PR-4 stability + a successful deploy-storm bench run.
+
+**Relation to other plans.**
+
+- **`readset-replication-plan.md`** — overlaps at `BlobBackend`,
+  diverges at the Cmd shape. Readset replication introduces a
+  *per-tenant streaming-append* runtime (§4.4): bytes accumulate
+  in an in-memory buffer keyed by `(batch_id, offset, len)`,
+  flush advances `durable_offset`, gated callbacks resume.
+  Phase 7's `blob.put` is *content-addressed, immutable,
+  PUT-if-not-exists* (§3 of `files-server-plan.md`): one key
+  per blob, idempotent, no batching, large infrequent objects.
+  Two distinct Cmd runtimes sitting on the same `BlobBackend`
+  transport. If a future need arises for a single
+  `Cmd.blob_put` variant parameterized by addressing scheme
+  (content-hash vs batched-offset), it would unify them — but
+  not in this phase; Phase 7 only introduces the content-hash
+  variant. The readset plan's per-tenant batcher abstraction
+  (which it shares with `logs-plan.md`) is shared infrastructure
+  beneath both runtimes, not part of Phase 7's primitive.
+- **`files-server-plan.md`** — superseded by Phase 7, especially
+  §11 ("Detach plan: files-server as external HTTP service,
+  post-1.0"). §11 moved in the opposite direction (further
+  detachment as an independent operator-deployed binary calling
+  back via `webhook.send`); Phase 7 reverses that with the
+  benefit of post-Phase-5 hindsight: once the JS-shim composition
+  pattern is the platform's standard answer for "Zig subsystem
+  whose work is really a primitive + a composition," the
+  detach-further direction becomes the wrong move. Mark §11
+  superseded in PR-5's doc-update commit.
+- **`logs-plan.md`** — shares the per-tenant batched-append shape
+  with readset-replication, not with Phase 7's deploy blobs. No
+  direct overlap with this phase.
+- **`effect-algebra.md` §2.4** — Phase 7 adds two members to the
+  Cmd-runtimes open family (`blob.put`, `compile.queue`) and one
+  to the Msg-origins open family (`compile_done`). All three obey
+  L3/L4 by construction (they go through the same reified
+  ingress + commit-gated buffer Phase 4.1 generalized). The
+  algebra grows by predicted axes; no substrate change.
+
 ## 7. Test & perf strategy
 
 Per memory `user_freeze_workflow`: reification modifies shipped,
@@ -1094,8 +1360,9 @@ smoke-tested code — this is **test-first** work. Each phase: confirm the
 gating smoke pins current behavior, refactor, prove green.
 
 **Gating smoke set** (all must stay green every phase):
-`leader_failover_smoke.py`, `heldsync_smoke.py`, the `http_send` smokes,
-the streaming smokes, `ctl_smoke.py`, `cookie_auth_smoke.py`,
+`leader_failover_smoke.py`, `heldsync_smoke.py`, `http_send_smoke.py`
+(now the webhook.send JS-shim path), the streaming smokes,
+`ctl_smoke.py`, `oidc_smoke.py`,
 `readonly_speculation_faultinj_smoke.py`.
 
 **Perf gate**: kv-bench hot single-tenant + 8w sharded, every phase that

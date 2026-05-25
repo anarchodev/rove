@@ -25,9 +25,12 @@ globalThis.email = {
    * @param {string} [opts.reply_to] - Reply-To address.
    * @param {string|string[]} [opts.cc] - CC recipient(s).
    * @param {string|string[]} [opts.bcc] - BCC recipient(s).
-   * @param {string} [opts.onResult] - Result handler module in this
+   * @param {string} [opts.on_result] - Result handler module in this
    *   tenant (forwarded to `webhook.send`).
    * @param {*} [opts.context] - Echoed back on the result event.
+   * @param {number} [opts.max_attempts] - Override the built-in
+   *   webhook.send retry budget (default 5).
+   * @param {number} [opts.timeout_ms] - Per-attempt timeout.
    * @returns {string} The schedule id from {@link webhook.send}.
    * @throws {Error} `code:"rate_limited"` when the per-instance
    *   email bucket is exhausted.
@@ -73,9 +76,9 @@ globalThis.email = {
       },
       body: JSON.stringify(body),
     };
-    if (opts.onResult) env.on_result = opts.onResult;
+    if (opts.on_result) env.on_result = opts.on_result;
     if (opts.context !== undefined) env.context = opts.context;
-    if (opts.maxAttempts) env.max_attempts = opts.maxAttempts;
+    if (opts.max_attempts) env.max_attempts = opts.max_attempts;
     if (opts.timeout_ms != null) env.timeout_ms = opts.timeout_ms;
     return webhook.send(env);
   },

@@ -56,7 +56,7 @@ const blob_curl_multi = @import("rove-blob").curl_multi;
 const components_mod = @import("components.zig");
 const worker_mod = @import("worker.zig");
 const globals = @import("globals.zig");
-const sched_thread = @import("rove-schedule-server").thread;
+const ssrf_mod = @import("rove-ssrf");
 
 const NodeState = worker_mod.NodeState;
 const PendingFetch = globals.PendingFetch;
@@ -363,7 +363,7 @@ pub const FetchEngine = struct {
             // here too in case a caller routes a held pf through
             // some other entry point.
             .timeout_ms = if (pf.held) 0 else pf.timeout_ms,
-            .verify_tls = !sched_thread.test_allow_plaintext,
+            .verify_tls = !ssrf_mod.test_allow_plaintext,
         };
 
         const ctx = try self.allocator.create(FetchCtx);

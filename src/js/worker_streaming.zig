@@ -11,9 +11,9 @@
 //!   - Activation firers: `fireDisconnectActivation`,
 //!     `fireSubscriptionActivation`, `fireChainedActivation` —
 //!     synchronous handler invocations from a Msg (no held socket).
-//!     `fireFetchEventActivation` stays in `worker.zig` for now (lives
-//!     under the "Gap 2.3 http.fetch" section there); the four are
-//!     near-duplicate today and collapse together in Phase 4.1.
+//!     `fireFetchEventActivation` stays in `worker.zig` under its
+//!     "Gap 2.3 http.fetch" section; the four are near-duplicate
+//!     today and collapse together in Phase 4.1.
 //!   - Commit-gated buffer: `StreamResumeStage`, `proposeForgetfulWrites`,
 //!     `transferStagedChunks`, `firePendingKvWakes`,
 //!     `fireKvReactSubscriptions` — the parked-unit commit-arm runtime
@@ -1317,9 +1317,10 @@ fn fireChainedActivation(
     else
         std.fmt.bufPrint(&corr_buf, "chain-{x:0>16}", .{request_id}) catch corr_buf[0..0];
 
-    // Build the synthetic query for the named-export case (mirrors
-    // callback_dispatch.zig's `?fn=<name>` shape). Default-export
-    // when fn_name is null/empty.
+    // Build the synthetic query for the named-export case (the
+    // `?fn=<name>` shape inherited from the original Phase-5-retired
+    // callback dispatcher; the chain-activation path now consumes
+    // it). Default-export when fn_name is null/empty.
     var query_buf: [256]u8 = undefined;
     const query_opt: ?[]const u8 = if (sc.fn_name) |fnn|
         if (fnn.len > 0) std.fmt.bufPrint(&query_buf, "fn={s}", .{fnn}) catch null else null
@@ -1712,7 +1713,7 @@ pub fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
                 };
             },
             // Other Cmd kinds (stream_chunk, stream_close,
-            // http_fetch, conn_write) don't trigger kv-react — they
+            // http_fetch, respond) don't trigger kv-react — they
             // ride through interpretCmd in releaseAll.
             else => {},
         };

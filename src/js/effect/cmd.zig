@@ -18,19 +18,18 @@
 //! build until `interpretCmd` handles it. That's the contract the
 //! plan has been promising since Phase 1.
 //!
-//! Not yet shipped (deferred):
-//!
-//!   - `kv_write` as a routed-through-interpretCmd Cmd. Today's
-//!     writeset is the kv_write payload de-facto; routing kv.set/delete
-//!     emissions through interpretCmd touches every binding call site.
-//!     Phase 4.1.2.
-//!   - `respond` Cmd: gate H2 response stamping on commit. Touches the
-//!     drainEntityArm H2 reference path; the invariant 1 byte-identical
-//!     gate makes this a separate phase (4.1.3). The respond_chunk
-//!     variant exists in this file but has no producer today.
-//!   - `conn_write` Cmd: held outbound write half. Producer is inbound
-//!     WebSocket which isn't built (per `docs/curl-multi-plan.md` §6
-//!     Phase 4 deferral). interpretCmd panics if it ever lands here.
+//! Live variants today: `kv_wake_broadcast`, `stream_chunk`,
+//! `stream_close`, `http_fetch`, `respond`. The 4.1.3 Option-2
+//! atomic flip shipped `respond`; every site that parks an entity in
+//! raft_pending_X emits one. `http_fetch` Phase 4.1.2 closes the
+//! marker-commit race — the barrier + write-path branches in
+//! `worker_dispatch.finalizeBatch` stage one Cmd.http_fetch per
+//! PendingFetch issued from a read- or write-path handler, so
+//! `interpretCmd` submits to the FetchEngine strictly after the
+//! batch commits. Future variants (e.g. `kv_write` routing,
+//! `conn_write` for inbound-WS) get added when their producer
+//! ships — adding the union arm before the producer is the
+//! `respond_deferred` failure mode the Phase 4.1 reframe ruled out.
 
 const std = @import("std");
 const kv_mod = @import("rove-kv");
@@ -67,14 +66,14 @@ pub const Cmd = union(enum) {
     /// Phase 4.0.b documented).
     stream_close: StreamCloseSignal,
 
-    /// Phase 4.1 (next): submit an `http.fetch` to the FetchEngine
-    /// on commit. Closes the marker-commit race that forced
-    /// `webhook.send` to drop its inline fetch: stage the
-    /// PendingFetch on the parked unit; on raft commit, interpretCmd
-    /// hands it to the engine; on fault, the PendingFetch frees
-    /// with the unit. Variant declared now (lands the typed slot
-    /// for the buffered-vs-engine routing); producer wiring is
-    /// Phase 4.1's race-fix half.
+    /// Phase 4.1.2: submit an `http.fetch` to the FetchEngine on
+    /// commit. Closes the marker-commit race that forced
+    /// `webhook.send` to drop its inline fetch — the parked unit
+    /// owns the PendingFetch until raft commits the writeset, then
+    /// `interpretCmd` hands it to the engine; on fault, the
+    /// PendingFetch frees with the unit. Producer is
+    /// `worker_dispatch.finalizeBatch` (both barrier + write paths
+    /// stage one per `batch_pending_fetches` item).
     http_fetch: globals_mod.PendingFetch,
 
     /// Phase 4.1.3: H2 response stamping deferred to commit time.
@@ -93,7 +92,7 @@ pub const Cmd = union(enum) {
     /// Producer: `worker_dispatch.finalizeBatch`'s write +
     /// barrier paths emit one Cmd.respond per success entity,
     /// staged on the parked_units unit's BufferedCmds (alongside
-    /// kv_wake_broadcast + http_fetch). The entity itself sits in
+    /// kv_wake_broadcast + stream_chunk). The entity itself sits in
     /// `raft_pending_{response,cont,stream}` with default-value h2
     /// payload components; `interpretCmd` stamps the real values
     /// at commit time + moves to dest. Fault arm
@@ -102,14 +101,6 @@ pub const Cmd = union(enum) {
     /// stays empty on fault (was the handler's leaked headers
     /// pre-4.1.3 — arguably more correct).
     respond: RespondOut,
-
-    /// Connection-actor frame write — paired with `inbound_frame`
-    /// Msg origin on one `Continuation` (the duplex effect, see
-    /// `docs/connection-actor-plan.md`). Not built (gap 2.5 closed
-    /// the read half; the write half lives with inbound-WS server,
-    /// which is a separate plan). interpretCmd panics if it ever
-    /// gets one (proves nothing produces this today).
-    conn_write: FrameOut,
 
     /// Discard-arm: free every owned resource. Called per-Cmd from
     /// `BufferedCmds.deinit` on the fault path.
@@ -120,7 +111,6 @@ pub const Cmd = union(enum) {
             .stream_close => {},
             .http_fetch => |*pf| pf.deinit(allocator),
             .respond => |*ro| ro.deinit(allocator),
-            .conn_write => |*fo| fo.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -180,25 +170,24 @@ pub const RespondOut = struct {
     /// Which raft_pending_X collection the entity is in NOW. The
     /// interpreter's `reg.move` source.
     source: SourceColl,
-    /// Where the entity moves on commit. Mirrors today's
-    /// `drainEntityArm` on_commit_dest values.
+    /// Where the entity moves on commit. One of the three per-
+    /// source destinations enumerated in `DestColl`.
     dest: DestColl,
 
-    /// Three raft_pending_* siblings → three source enums (mirrors
-    /// today's `drainResponsePending` / `drainContPending` /
-    /// `drainStreamPending` per-arm wrappers around
-    /// `drainEntityArm`).
+    /// Three raft_pending_* siblings → three source enums. The
+    /// `drainEntityArm` calls in `drainRaftPending` walk each of
+    /// these collections per tick; this enum is how a Cmd.respond
+    /// names which one the entity is currently in.
     pub const SourceColl = enum {
         raft_pending_response,
         raft_pending_cont,
         raft_pending_stream,
     };
 
-    /// Per-source destination, mirroring today's `on_commit_dest`
-    /// values: response → h2.response_in (h2 ships from here);
-    /// cont → worker.parked_continuations (held-sync awaits
-    /// resume); stream → h2.stream_response_in (h2's streaming
-    /// pipeline takes over).
+    /// Per-source destination: response → h2.response_in (h2 ships
+    /// from here); cont → worker.parked_continuations (held-sync
+    /// awaits resume); stream → h2.stream_response_in (h2's
+    /// streaming pipeline takes over).
     pub const DestColl = enum {
         response_in,
         parked_continuations,
@@ -212,16 +201,6 @@ pub const RespondOut = struct {
         // components on the entity are freed when the entity
         // destroys (via the component types' own deinit) — same
         // ownership chain pre-4.1.3.
-    }
-};
-
-/// Connection-actor write payload. Placeholder shape; the producer
-/// (inbound-WS server) doesn't exist yet.
-pub const FrameOut = struct {
-    bytes: []u8 = &.{},
-    pub fn deinit(self: *FrameOut, allocator: std.mem.Allocator) void {
-        if (self.bytes.len > 0) allocator.free(self.bytes);
-        self.* = undefined;
     }
 };
 
@@ -372,21 +351,6 @@ pub fn interpretCmd(
                     &worker.raft_pending_stream,
                 ),
             }
-        },
-        .conn_write => |fo| {
-            // Producer for this variant is inbound WebSocket
-            // server, which is a separate plan. Reaching this arm
-            // means a producer was added without wiring an
-            // interpreter — exactly the contract failure the
-            // typed-switch is supposed to catch at COMPILE time,
-            // but a runtime panic here is the second line of
-            // defense.
-            var fom = fo;
-            fom.deinit(allocator);
-            std.debug.panic(
-                "interpretCmd: conn_write Cmd reached the interpreter but no inbound-WS producer is built yet — see docs/curl-multi-plan.md §6 Phase 4",
-                .{},
-            );
         },
     }
 }

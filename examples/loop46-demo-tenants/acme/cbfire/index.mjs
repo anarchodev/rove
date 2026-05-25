@@ -4,9 +4,9 @@ export function fire(url, tag) {
         method: "POST",
         body: "ping",
         headers: { "content-type": "text/plain" },
-        onResult: "cbresult",
+        on_result: "cbresult",
         context: { tag: tag },
-        maxAttempts: 2,
+        max_attempts: 2,
     });
     kv.set("cb/last_fire", id);
     return { id: id };

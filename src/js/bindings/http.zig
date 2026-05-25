@@ -37,12 +37,16 @@
 const std = @import("std");
 const qjs = @import("rove-qjs");
 const c = qjs.c;
-const schedule_server = @import("rove-schedule-server");
 
 const globals = @import("../globals.zig");
 
 const js_undefined = globals.js_undefined;
 const js_exception = globals.js_exception;
+
+/// Cap on the customer-supplied fetch id width for `http.cancelFetch`.
+/// 1-256 utf8 bytes; matches the platform-derived id's actual shape
+/// (sha256 hex = 64 chars; randomUUID = 36 chars) with headroom.
+const FETCH_ID_MAX_LEN: usize = 256;
 
 // ── http.fetch / http.cancelFetch — Gap 2.3 ──────────────────────────────
 
@@ -168,7 +172,7 @@ pub fn jsHttpCancelFetch(
     const cstr = c.JS_ToCStringLen(ctx, &len, id_v);
     if (cstr == null) return js_exception;
     defer c.JS_FreeCString(ctx, cstr);
-    if (len == 0 or len > schedule_server.ID_MAX_LEN) {
+    if (len == 0 or len > FETCH_ID_MAX_LEN) {
         _ = c.JS_ThrowRangeError(ctx, "http.cancelFetch: `id` must be 1-256 utf8 bytes");
         return js_exception;
     }

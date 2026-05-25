@@ -255,23 +255,19 @@ pub fn build(b: *std.Build) void {
     // `src/js/sse_dispatch.zig` — reverse direction.
     conn_holder_mod.addImport("rove-blob", blob_mod);
 
-    // ── rove-schedule-server: outbound HTTP via http.send ────────────
+    // ── rove-ssrf: SSRF blocklist + dev-only test overrides ─────────
     //
-    // Storage + wire format + leader-pinned scheduler thread for the
-    // platform's outbound HTTP primitive (docs/http-send-plan.md).
-    // Replaced rove-webhook-server entirely; webhook.send is now a
-    // JS polyfill on top of http.send (src/js/globals/webhook.js).
-    const schedule_server_mod = b.addModule("rove-schedule-server", .{
-        .root_source_file = b.path("src/schedule_server/root.zig"),
+    // What's left after the http.send N-way re-platform + the
+    // 2026-05-24 durability-as-JS-shim flip: the libcurl engine
+    // (`js/fetch_engine.zig`) and webhook.send (JS shim) consult this
+    // module to refuse outbound HTTP to RFC1918 / loopback /
+    // cloud-metadata addresses. No raft, no SQLite, no scheduler
+    // thread — just IP-range checks + two test-only escape flags.
+    const ssrf_mod = b.addModule("rove-ssrf", .{
+        .root_source_file = b.path("src/ssrf/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    schedule_server_mod.link_libc = true;
-    schedule_server_mod.linkSystemLibrary("sqlite3", .{});
-    schedule_server_mod.addImport("rove-kv", kv_mod);
-    // The scheduler thread fires schedules over libcurl
-    // (rove-blob's `curl.Easy`).
-    schedule_server_mod.addImport("rove-blob", blob_mod);
 
     // ── rove-acme: in-tree ACME (RFC 8555) HTTP-01 client + :80
     //    challenge responder (auth-domain-plan.md §3.2). Issues
@@ -375,9 +371,9 @@ pub fn build(b: *std.Build) void {
     const conn_holder_tests = b.addTest(.{ .root_module = conn_holder_mod });
     test_step.dependOn(&b.addRunArtifact(conn_holder_tests).step);
 
-    // rove-schedule-server tests
-    const schedule_server_tests = b.addTest(.{ .root_module = schedule_server_mod });
-    test_step.dependOn(&b.addRunArtifact(schedule_server_tests).step);
+    // rove-ssrf tests
+    const ssrf_tests = b.addTest(.{ .root_module = ssrf_mod });
+    test_step.dependOn(&b.addRunArtifact(ssrf_tests).step);
 
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
@@ -417,7 +413,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-jwt", jwt_mod);
     js_mod.addImport("rove-tape", tape_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
-    js_mod.addImport("rove-schedule-server", schedule_server_mod);
+    js_mod.addImport("rove-ssrf", ssrf_mod);
     // Worker reads the per-deployment manifest at release time so the
     // _config/ → kv mirror (config_mirror.zig) can stage config rows
     // alongside the _deploy/current flip.
@@ -519,7 +515,7 @@ pub fn build(b: *std.Build) void {
     loop46_mod.addImport("rove-qjs", qjs_mod);
     loop46_mod.addImport("rove-tenant", tenant_mod);
     loop46_mod.addImport("rove-h2", h2_mod);
-    loop46_mod.addImport("rove-schedule-server", schedule_server_mod);
+    loop46_mod.addImport("rove-ssrf", ssrf_mod);
     loop46_mod.addImport("rove-acme", acme_mod);
     // The admin + replay tenant bundles + UI files used to be
     // embedded into the loop46 binary so the worker could
