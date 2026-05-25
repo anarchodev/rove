@@ -116,7 +116,18 @@ fn drainEntityArm(
                         .{ wait.seq, @errorName(err) },
                     ),
                 }
-                try server.reg.move(ent, source, on_commit_dest);
+                // Effect-reification Phase 4.1.3: if the entity's
+                // response is deferred-staged (worker_dispatch's
+                // finalizeBatch paths set `respond_deferred=true`
+                // on the RaftWait), the parked_units arm's
+                // `interpretCmd .respond` does the move in the
+                // same tick (after this drain runs). Legacy paths
+                // (/_system/*, etc.) stamp h2 components inline
+                // and set `respond_deferred=false` (the default),
+                // expecting us to do the move here.
+                if (!wait.respond_deferred) {
+                    try server.reg.move(ent, source, on_commit_dest);
+                }
             },
             .fault => {
                 switch (worker.pending_txns.rollbackAndTake(allocator, wait.seq)) {

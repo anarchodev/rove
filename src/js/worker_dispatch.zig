@@ -579,6 +579,7 @@ fn finalizeBatch(
                 try server.reg.set(s.ent, &server.request_out, RaftWait, .{
                     .seq = seq,
                     .deadline_ns = deadline_ns,
+                    .respond_deferred = true,
                 });
                 if (is_stream) {
                     try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_stream);
@@ -598,6 +599,12 @@ fn finalizeBatch(
             // commit-gated posture as the write-path branch
             // below. `parkKvWakes` with an empty writeset still
             // creates the unit when `extra_cmds` is non-empty.
+            //
+            // Phase 4.1.3: also build Cmd.respond per success so
+            // the deferred payload (Status/RespHeaders/RespBody/
+            // H2IoResult) stamps + moves at commit time via
+            // `interpretCmd`. Mirrors the write-path branch's
+            // same loop below.
             var barrier_cmds: effect_mod.cmd.BufferedCmds = .{};
             for (batch_pending_fetches.items) |pf| {
                 barrier_cmds.items.append(allocator, .{ .http_fetch = pf }) catch {
@@ -607,6 +614,27 @@ fn finalizeBatch(
                     barrier_cmds = .{};
                     break;
                 };
+            }
+            for (successes.items) |*s| {
+                const is_stream2 = s.stream != null;
+                const is_cont2 = s.cont != null;
+                const r_src: effect_mod.cmd.RespondOut.SourceColl = if (is_stream2)
+                    .raft_pending_stream
+                else if (is_cont2)
+                    .raft_pending_cont
+                else
+                    .raft_pending_response;
+                const r_dest: effect_mod.cmd.RespondOut.DestColl = if (is_stream2)
+                    .stream_response_in
+                else if (is_cont2)
+                    .parked_continuations
+                else
+                    .response_in;
+                barrier_cmds.items.append(allocator, .{ .respond = .{
+                    .entity = s.ent,
+                    .source = r_src,
+                    .dest = r_dest,
+                } }) catch continue;
             }
             // Items that successfully moved to barrier_cmds are
             // now owned by it; clear the source so the caller's
@@ -764,6 +792,37 @@ fn finalizeBatch(
         };
     }
     batch_pending_fetches.clearRetainingCapacity();
+    // Phase 4.1.3: emit a move-only `Cmd.respond` per success.
+    // The h2 payload components were stamped inline at
+    // handler-success time (above); this Cmd just routes the
+    // commit-arm move (raft_pending_X → response_in /
+    // parked_continuations / stream_response_in) through
+    // `interpretCmd` instead of `drainEntityArm`'s inline move.
+    // `respond_deferred = true` on the RaftWait below tells
+    // `drainEntityArm` to skip its own move (interpretCmd's
+    // .respond arm does it via the parked_units sweep in the
+    // same tick).
+    for (successes.items) |*s| {
+        const is_stream = s.stream != null;
+        const is_cont = s.cont != null;
+        const respond_src: effect_mod.cmd.RespondOut.SourceColl = if (is_stream)
+            .raft_pending_stream
+        else if (is_cont)
+            .raft_pending_cont
+        else
+            .raft_pending_response;
+        const respond_dest: effect_mod.cmd.RespondOut.DestColl = if (is_stream)
+            .stream_response_in
+        else if (is_cont)
+            .parked_continuations
+        else
+            .response_in;
+        write_path_cmds.items.append(allocator, .{ .respond = .{
+            .entity = s.ent,
+            .source = respond_src,
+            .dest = respond_dest,
+        } }) catch continue;
+    }
     worker_mod.parkKvWakes(worker, seq, anchor_id, writeset, write_path_cmds) catch |perr|
         std.log.warn("rove-js parkKvWakes (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
     // parkKvWakes consumed write_path_cmds unconditionally.

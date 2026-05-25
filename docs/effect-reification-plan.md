@@ -601,10 +601,46 @@ Revised 2026-05-22 in light of two prior decisions:
     `__system/webhook_onresult` shim still owns retry policy
     (1 s → 2 s → 4 s … cap 60 s, max 5 attempts) — that's
     unchanged.
-- **Phase 4.1.3 — `respond` Cmd: gate H2 response stamping on
-  commit (deferred).** Touches `drainEntityArm`; the byte-identical
-  invariant says this is its own session with deliberate smoke
-  validation across the full gating set.
+- **Phase 4.1.3 — `respond` Cmd: route H2 entity commit-move
+  through `interpretCmd` (SHIPPED 2026-05-24).** The exhaustive
+  switch over `Cmd` now covers every producer-bearing variant
+  (kv_wake_broadcast + stream_chunk + stream_close + http_fetch +
+  **respond**; conn_write stays the panic-branch slot until
+  inbound-WS lands). Shape:
+  - `Cmd.respond` is **move-only** — entity + source enum +
+    dest enum. No payload. The h2 components (Status /
+    RespHeaders / RespBody / H2IoResult / StreamId / Session)
+    stay stamped at handler-success time, exactly as pre-4.1.3.
+  - `interpretCmd .respond` does the `reg.move(entity, source,
+    dest)` — replaces the inline move in
+    `drainEntityArm`'s commit arm.
+  - `RaftWait.respond_deferred: bool = false` lets
+    `drainEntityArm` distinguish 4.1.3-managed entities (skip
+    move; interpretCmd does it) from legacy `/_system/*`
+    handlers (`/_system/release`, `/_system/admin_kv`, etc.)
+    that stamp inline + park without producing a Cmd.respond
+    (default false; drainEntityArm does the move as before).
+  - Producers: `worker_dispatch.finalizeBatch`'s write +
+    barrier paths (both set `respond_deferred = true` on the
+    success entities' RaftWait + emit one Cmd.respond per
+    success on the parked_units BufferedCmds).
+  - **Honest scope note:** an earlier 4.1.3 draft attempted the
+    "full deferral" — moving h2 component stamping itself into
+    the Cmd payload so the entity sat in raft_pending_X with
+    default-value components until interpretCmd. That broke the
+    read-only fast path (which moves entities to response_in
+    inline without a Cmd, so h2 would have shipped with
+    Status=0). The move-only scope avoids that footgun. A
+    deferred-payload variant can be revisited if commit-time
+    stamping becomes valuable for a specific reason — but
+    "every Cmd variant has a producer" is the contract Phase 4
+    set out to deliver, and the move-only version meets it.
+  - **Gate (all green):** `ctl_smoke` (basic H2),
+    `heldsync_smoke` (cont resume),
+    `streaming_resume_fault_inj_smoke` (chunk-leak gate),
+    `fetch_chunk` / `subscription` / `penalty` / `streaming` /
+    `streaming_kv_wake` / `http_send` (the pre-existing
+    `wb/last_tag` stale check is unrelated).
 - **Phase 4.1.4 — `conn_write` Cmd: producer-less.** Stays as
   the panic branch in `interpretCmd` until inbound-WS server
   lands (separate plan; not gated on this work).
