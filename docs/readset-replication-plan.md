@@ -527,3 +527,14 @@ last 100ms of pre-crash requests.
    backpressure surfaced on the customer's response. Same template
    as gap-2.2 streaming backpressure
    (memory: `project_gap_2_2_backpressure`).
+
+7. **Buffer placement.** Per-worker, owned by the worker's allocator
+   (NOT the per-request QJS arena — which resets between requests —
+   and NOT the QJS base arena, which never resets). The buffer needs
+   its own scope with explicit lifetime: bytes enter on network
+   arrival, drop after the writeset commits the entry referencing
+   the `BodyRef`. Probably a dedicated `BodyBuffer` struct held on
+   the `Worker`, with per-tenant sub-buffers keyed by tenant id +
+   the same hash routing the worker uses for kv affinity. The
+   per-tenant cap in #6 above lives here. Resolved direction
+   2026-05-24; concrete layout decided when Phase 2 starts.

@@ -18,6 +18,7 @@ const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
 const log_mod = @import("rove-log");
+const tape_mod = @import("rove-tape");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
 const blob_mod = @import("rove-blob");
@@ -2363,8 +2364,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // `txn` is open. Run the handler under its own savepoint so a
         // JS exception or CPU-budget kill rolls back only this handler's
         // writes without poisoning the rest of the batch.
-        var tapes = worker_mod.RequestTapes.init(allocator);
-        defer tapes.deinit();
+        var readset = tape_mod.Readset.init(allocator);
+        defer readset.deinit();
 
         // Pre-mint the request id. webhook.send derives its webhook id
         // from this (so replays produce matching ids), and captureLog
@@ -2442,11 +2443,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .body = body,
             .query = route.query,
             .headers = rh,
-            .kv_tape = &tapes.kv,
-            .date_tape = &tapes.date,
-            .math_random_tape = &tapes.math_random,
-            .crypto_random_tape = &tapes.crypto_random,
-            .module_tape = &tapes.module,
+            .readset = &readset,
             .prng_seed = @bitCast(received_ns),
             .request_id = request_id,
             .correlation_id = correlation_id,
@@ -2562,7 +2559,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // replay shell uses to re-run the request up to the same
             // failure mode (e.g. step through the same kv reads to see
             // why the handler hit the CPU budget).
-            const tape_payloads = worker_mod.captureTapesForChain(worker, &tapes, body, correlation_id);
+            const tape_payloads = worker_mod.captureTapesForChain(worker, &readset, body, correlation_id);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, correlation_id, .inbound);
             processed += 1;
             continue;
@@ -2713,7 +2710,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // any tape-consuming expression baked into the throw
             // message (e.g. `Date.now()`) resolves to the same value
             // it did originally.
-            const tape_payloads = worker_mod.captureTapesForChain(worker, &tapes, body, correlation_id);
+            const tape_payloads = worker_mod.captureTapesForChain(worker, &readset, body, correlation_id);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads, correlation_id, .inbound);
             processed += 1;
             continue;
@@ -2731,7 +2728,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // Preserve whatever tapes the handler captured before
             // the kv error — lets replay reach the same failure
             // point with the same prior reads.
-            const tape_payloads = worker_mod.captureTapesForChain(worker, &tapes, body, correlation_id);
+            const tape_payloads = worker_mod.captureTapesForChain(worker, &readset, body, correlation_id);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, correlation_id, .inbound);
             processed += 1;
             continue;
@@ -2796,7 +2793,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // ride inline in the next ndjson flush. Inbound `body` is
         // included for replay; the outbound response is NOT — replay
         // re-produces it deterministically from (body, tapes, source).
-        const tape_payloads = worker_mod.captureTapesForChain(worker, &tapes, body, correlation_id);
+        const tape_payloads = worker_mod.captureTapesForChain(worker, &readset, body, correlation_id);
 
         // Effect-reification Phase 4.1.2: transfer this handler's
         // successful `http.fetch` accumulator to the batch-level

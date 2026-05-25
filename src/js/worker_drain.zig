@@ -42,6 +42,7 @@ const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
+const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 
 const dispatcher_mod = @import("dispatcher.zig");
@@ -60,7 +61,6 @@ const worker_streaming = @import("worker_streaming.zig");
 const ParkedUnit = worker_mod.ParkedUnit;
 const RaftWait = worker_mod.RaftWait;
 const TenantFiles = worker_mod.TenantFiles;
-const RequestTapes = worker_mod.RequestTapes;
 const captureLogWithId = worker_mod.captureLogWithId;
 const OWED_PREFIX = worker_mod.OWED_PREFIX;
 const CONT_HOLD_DEADLINE_NS = worker_mod.CONT_HOLD_DEADLINE_NS;
@@ -633,8 +633,8 @@ fn resumeContinuation(
 
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    var tapes = RequestTapes.init(allocator);
-    defer tapes.deinit();
+    var readset = tape_mod.Readset.init(allocator);
+    defer readset.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
@@ -645,11 +645,7 @@ fn resumeContinuation(
         .path = spath,
         .body = body,
         .query = null,
-        .kv_tape = &tapes.kv,
-        .date_tape = &tapes.date,
-        .math_random_tape = &tapes.math_random,
-        .crypto_random_tape = &tapes.crypto_random,
-        .module_tape = &tapes.module,
+        .readset = &readset,
         .prng_seed = @bitCast(now_ns),
         .request_id = request_id,
         .platform = inst.platform,

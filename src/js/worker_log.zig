@@ -95,37 +95,12 @@ pub fn getOrOpenTenantLog(
 }
 
 // ── Tape capture ──────────────────────────────────────────────────────
-
-/// Holder for the four per-request tapes the dispatcher captures. All
-/// fields are owned; `deinit` frees every entry's backing storage. The
-/// worker allocates a `RequestTapes` per dispatch, passes its tape
-/// pointers to the dispatcher via the `Request`, then serializes +
-/// uploads each non-empty tape after `run` returns.
-pub const RequestTapes = struct {
-    kv: tape_mod.Tape,
-    date: tape_mod.Tape,
-    math_random: tape_mod.Tape,
-    crypto_random: tape_mod.Tape,
-    module: tape_mod.Tape,
-
-    pub fn init(allocator: std.mem.Allocator) RequestTapes {
-        return .{
-            .kv = tape_mod.Tape.init(allocator, .kv),
-            .date = tape_mod.Tape.init(allocator, .date),
-            .math_random = tape_mod.Tape.init(allocator, .math_random),
-            .crypto_random = tape_mod.Tape.init(allocator, .crypto_random),
-            .module = tape_mod.Tape.init(allocator, .module),
-        };
-    }
-
-    pub fn deinit(self: *RequestTapes) void {
-        self.kv.deinit();
-        self.date.deinit();
-        self.math_random.deinit();
-        self.crypto_random.deinit();
-        self.module.deinit();
-    }
-};
+//
+// `tape_mod.Readset` is the per-request structural holder for the five
+// channels (kv / date / math_random / crypto_random / module); the
+// worker allocates one per dispatch, hands its pointer to the
+// dispatcher via `Request.readset`, then serializes + flushes the
+// non-empty channels via `captureTapesForChain*` below.
 
 /// Maximum captured body length (request OR response). Anything
 /// bigger gets truncated to this prefix and the corresponding
@@ -151,10 +126,10 @@ pub const REQUEST_BODY_CAP: usize = 256 * 1024;
 /// batch in a single request.
 pub fn captureTapes(
     worker: anytype,
-    tapes: *RequestTapes,
+    readset: *tape_mod.Readset,
     request_body: []const u8,
 ) log_mod.TapePayloads {
-    return captureTapesForChain(worker, tapes, request_body, null);
+    return captureTapesForChain(worker, readset, request_body, null);
 }
 
 /// `captureTapes` variant that honors the per-chain tape budget
@@ -166,7 +141,7 @@ pub fn captureTapes(
 /// trips the cap.
 pub fn captureTapesForChain(
     worker: anytype,
-    tapes: *RequestTapes,
+    readset: *tape_mod.Readset,
     request_body: []const u8,
     correlation_id: ?[]const u8,
 ) log_mod.TapePayloads {
@@ -185,11 +160,11 @@ pub fn captureTapesForChain(
         tape: *tape_mod.Tape,
         out: *[]const u8,
     }{
-        .{ .tape = &tapes.kv, .out = &payloads.kv_tape_bytes },
-        .{ .tape = &tapes.date, .out = &payloads.date_tape_bytes },
-        .{ .tape = &tapes.math_random, .out = &payloads.math_random_tape_bytes },
-        .{ .tape = &tapes.crypto_random, .out = &payloads.crypto_random_tape_bytes },
-        .{ .tape = &tapes.module, .out = &payloads.module_tree_bytes },
+        .{ .tape = &readset.kv, .out = &payloads.kv_tape_bytes },
+        .{ .tape = &readset.date, .out = &payloads.date_tape_bytes },
+        .{ .tape = &readset.math_random, .out = &payloads.math_random_tape_bytes },
+        .{ .tape = &readset.crypto_random, .out = &payloads.crypto_random_tape_bytes },
+        .{ .tape = &readset.module, .out = &payloads.module_tree_bytes },
     };
 
     for (channels) |ch| {
@@ -262,12 +237,12 @@ pub fn captureTapesForChain(
 /// closes worklist #1 — every Msg is recorded, including its bytes.
 pub fn captureTapesForChainWithActivation(
     worker: anytype,
-    tapes: *RequestTapes,
+    readset: *tape_mod.Readset,
     request_body: []const u8,
     correlation_id: ?[]const u8,
     activation_bytes: []const u8,
 ) log_mod.TapePayloads {
-    var payloads = captureTapesForChain(worker, tapes, request_body, correlation_id);
+    var payloads = captureTapesForChain(worker, readset, request_body, correlation_id);
     if (activation_bytes.len == 0) return payloads;
     // Honor the cap. If the chain just got capped on the
     // request-side capture, skip activation bytes too — match the

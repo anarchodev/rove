@@ -1,8 +1,9 @@
 //! `crypto.*` JS bindings exposed to handler code.
 //!
 //! All randomness draws from `state.prng` (per-request) and is taped
-//! through `state.crypto_random_tape` when set, so replay reproduces
-//! the same byte sequence. Hashes are pure (no tape capture needed).
+//! through `state.readset.crypto_random` when set, so replay
+//! reproduces the same byte sequence. Hashes are pure (no readset
+//! capture needed).
 
 const std = @import("std");
 const qjs = @import("rove-qjs");
@@ -41,7 +42,7 @@ pub fn jsCryptoGetRandomValues(
 
     const bytes = buf_ptr[0..byte_len];
     state.prng.random().bytes(bytes);
-    if (state.crypto_random_tape) |t| t.appendCryptoRandom(bytes) catch {};
+    if (state.readset) |rs| rs.crypto_random.appendCryptoRandom(bytes) catch {};
     // Spec says return the input typed array.
     return c.JS_DupValue(ctx, argv[0]);
 }
@@ -138,7 +139,7 @@ pub fn jsCryptoRandomUuid(
 
     // Capture the raw bytes on the crypto tape so the replay source
     // can reconstruct the same UUID without knowing the formatting.
-    if (state.crypto_random_tape) |t| t.appendCryptoRandom(&raw) catch {};
+    if (state.readset) |rs| rs.crypto_random.appendCryptoRandom(&raw) catch {};
 
     var out: [36]u8 = undefined;
     const hex = "0123456789abcdef";
@@ -189,7 +190,7 @@ pub fn jsCryptoRandomBytes(
     defer state.allocator.free(bytes);
 
     state.prng.random().bytes(bytes);
-    if (state.crypto_random_tape) |t| t.appendCryptoRandom(bytes) catch {};
+    if (state.readset) |rs| rs.crypto_random.appendCryptoRandom(bytes) catch {};
 
     return c.JS_NewUint8ArrayCopy(ctx, bytes.ptr, bytes.len);
 }
