@@ -132,22 +132,16 @@ pub const Request = struct {
     /// writeset. Customer modules see `is_system_module = false`
     /// and the reserved-prefix check fires as before.
     is_system_module: bool = false,
-    /// Optional non-determinism tapes. When set, the matching source of
-    /// handler non-determinism (`kv.*`, `Date.now`, `Math.random`,
-    /// `crypto.getRandomValues` / `crypto.randomUUID`) is captured
-    /// onto the tape so the worker can persist it via `TapeRefs.*_hex`
-    /// and replay can re-drive the handler later. Tapes are owned by
-    /// the caller, which tears them down after flushing the log
-    /// record.
-    kv_tape: ?*tape_mod.Tape = null,
-    date_tape: ?*tape_mod.Tape = null,
-    math_random_tape: ?*tape_mod.Tape = null,
-    crypto_random_tape: ?*tape_mod.Tape = null,
-    /// Module-resolution tape. Captures `(specifier, source_hash_hex)`
-    /// for every `import` the handler resolves so the browser-side
-    /// replay shell can fetch the same source bytes by hash and build
-    /// an importmap mirroring the original deployment's module graph.
-    module_tape: ?*tape_mod.Tape = null,
+    /// Optional captured readset. When set, every source of handler
+    /// non-determinism (`kv.*`, `Date.now`, `Math.random`,
+    /// `crypto.getRandomValues` / `crypto.randomUUID`, and the QJS
+    /// module loader's `(specifier, source_hash)` resolutions) is
+    /// captured onto the matching channel so the worker can persist
+    /// it via `TapeRefs.*_hex` and replay can re-drive the handler
+    /// later. Owned by the caller, which tears it down after
+    /// flushing the log record. See `docs/readset-replication-plan.md`
+    /// and `src/tape/root.zig:Readset`.
+    readset: ?*tape_mod.Readset = null,
     /// PRNG seed for `Math.random` and `crypto.*`. Captured alongside
     /// the log record so replay can reconstruct the same stream
     /// (though the tapes themselves are what replay reads from — the
@@ -509,11 +503,7 @@ pub const Dispatcher = struct {
             .txn = txn,
             .writeset = writeset,
             .console = &console_buf,
-            .kv_tape = request.kv_tape,
-            .date_tape = request.date_tape,
-            .math_random_tape = request.math_random_tape,
-            .crypto_random_tape = request.crypto_random_tape,
-            .module_tape = request.module_tape,
+            .readset = request.readset,
             .prng = std.Random.DefaultPrng.init(request.prng_seed),
             .request_id = request.request_id,
             .session_id = request.session_id,
@@ -561,7 +551,7 @@ pub const Dispatcher = struct {
             .allocator = self.allocator,
             .bytecodes = bytecodes,
             .source_hashes = source_hashes,
-            .module_tape = request.module_tape,
+            .module_tape = if (request.readset) |rs| &rs.module else null,
         };
         c.JS_SetModuleLoaderFunc(
             rt.raw,
@@ -2610,8 +2600,8 @@ test "dispatch: kv tape captures get/set/delete with outcomes" {
     // Seed a key so the handler can observe both .ok and .not_found.
     try kv.put("seeded", "v1");
 
-    var tape = tape_mod.Tape.init(testing.allocator, .kv);
-    defer tape.deinit();
+    var readset = tape_mod.Readset.init(testing.allocator);
+    defer readset.deinit();
 
     var rt = try qjs.Runtime.init();
     defer rt.deinit();
@@ -2643,30 +2633,30 @@ test "dispatch: kv tape captures get/set/delete with outcomes" {
         .method = "POST",
         .path = "/",
         .query = "fn=go",
-        .kv_tape = &tape,
+        .readset = &readset,
     }, &budget);
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 4), tape.entries.items.len);
+    try testing.expectEqual(@as(usize, 4), readset.kv.entries.items.len);
 
-    const e0 = tape.entries.items[0].kv;
+    const e0 = readset.kv.entries.items[0].kv;
     try testing.expectEqual(tape_mod.KvOp.get, e0.op);
     try testing.expectEqualStrings("seeded", e0.key);
     try testing.expectEqualStrings("v1", e0.value);
     try testing.expectEqual(tape_mod.KvOutcome.ok, e0.outcome);
 
-    const e1 = tape.entries.items[1].kv;
+    const e1 = readset.kv.entries.items[1].kv;
     try testing.expectEqual(tape_mod.KvOp.get, e1.op);
     try testing.expectEqualStrings("missing", e1.key);
     try testing.expectEqual(tape_mod.KvOutcome.not_found, e1.outcome);
 
-    const e2 = tape.entries.items[2].kv;
+    const e2 = readset.kv.entries.items[2].kv;
     try testing.expectEqual(tape_mod.KvOp.set, e2.op);
     try testing.expectEqualStrings("new", e2.key);
     try testing.expectEqualStrings("v1!", e2.value);
     try testing.expectEqual(tape_mod.KvOutcome.ok, e2.outcome);
 
-    const e3 = tape.entries.items[3].kv;
+    const e3 = readset.kv.entries.items[3].kv;
     try testing.expectEqual(tape_mod.KvOp.delete, e3.op);
     try testing.expectEqualStrings("seeded", e3.key);
     try testing.expectEqual(tape_mod.KvOutcome.ok, e3.outcome);
@@ -2680,12 +2670,8 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
         cleanupTempKv(&buf);
     }
 
-    var date_tape = tape_mod.Tape.init(testing.allocator, .date);
-    defer date_tape.deinit();
-    var math_tape = tape_mod.Tape.init(testing.allocator, .math_random);
-    defer math_tape.deinit();
-    var crypto_tape = tape_mod.Tape.init(testing.allocator, .crypto_random);
-    defer crypto_tape.deinit();
+    var readset = tape_mod.Readset.init(testing.allocator);
+    defer readset.deinit();
 
     var rt = try qjs.Runtime.init();
     defer rt.deinit();
@@ -2720,28 +2706,24 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
             .method = "GET",
             .path = "/",
             .query = "fn=go",
-            .date_tape = &date_tape,
-            .math_random_tape = &math_tape,
-            .crypto_random_tape = &crypto_tape,
+            .readset = &readset,
             .prng_seed = 42,
         }, &budget);
         resp.deinit(testing.allocator);
     }
 
-    try testing.expectEqual(@as(usize, 1), date_tape.entries.items.len);
-    try testing.expectEqual(@as(usize, 2), math_tape.entries.items.len);
+    try testing.expectEqual(@as(usize, 1), readset.date.entries.items.len);
+    try testing.expectEqual(@as(usize, 2), readset.math_random.entries.items.len);
     // getRandomValues(4 bytes) + randomUUID(16 raw bytes) → two entries
-    try testing.expectEqual(@as(usize, 2), crypto_tape.entries.items.len);
-    try testing.expectEqual(@as(usize, 4), crypto_tape.entries.items[0].crypto_random.bytes.len);
-    try testing.expectEqual(@as(usize, 16), crypto_tape.entries.items[1].crypto_random.bytes.len);
+    try testing.expectEqual(@as(usize, 2), readset.crypto_random.entries.items.len);
+    try testing.expectEqual(@as(usize, 4), readset.crypto_random.entries.items[0].crypto_random.bytes.len);
+    try testing.expectEqual(@as(usize, 16), readset.crypto_random.entries.items[1].crypto_random.bytes.len);
 
-    // Replaying the same seed with a fresh set of tapes should yield
+    // Replaying the same seed with a fresh readset should yield
     // bit-identical math_random and crypto values (date is wall-clock
     // so we skip it here).
-    var math_tape2 = tape_mod.Tape.init(testing.allocator, .math_random);
-    defer math_tape2.deinit();
-    var crypto_tape2 = tape_mod.Tape.init(testing.allocator, .crypto_random);
-    defer crypto_tape2.deinit();
+    var readset2 = tape_mod.Readset.init(testing.allocator);
+    defer readset2.deinit();
 
     {
         var txn2 = try kv.beginTrackedImmediate();
@@ -2753,30 +2735,29 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
             .method = "GET",
             .path = "/",
             .query = "fn=go",
-            .math_random_tape = &math_tape2,
-            .crypto_random_tape = &crypto_tape2,
+            .readset = &readset2,
             .prng_seed = 42,
         }, &budget2);
         resp2.deinit(testing.allocator);
     }
 
     try testing.expectEqual(
-        math_tape.entries.items[0].math_random.bits,
-        math_tape2.entries.items[0].math_random.bits,
+        readset.math_random.entries.items[0].math_random.bits,
+        readset2.math_random.entries.items[0].math_random.bits,
     );
     try testing.expectEqual(
-        math_tape.entries.items[1].math_random.bits,
-        math_tape2.entries.items[1].math_random.bits,
+        readset.math_random.entries.items[1].math_random.bits,
+        readset2.math_random.entries.items[1].math_random.bits,
     );
     try testing.expectEqualSlices(
         u8,
-        crypto_tape.entries.items[0].crypto_random.bytes,
-        crypto_tape2.entries.items[0].crypto_random.bytes,
+        readset.crypto_random.entries.items[0].crypto_random.bytes,
+        readset2.crypto_random.entries.items[0].crypto_random.bytes,
     );
     try testing.expectEqualSlices(
         u8,
-        crypto_tape.entries.items[1].crypto_random.bytes,
-        crypto_tape2.entries.items[1].crypto_random.bytes,
+        readset.crypto_random.entries.items[1].crypto_random.bytes,
+        readset2.crypto_random.entries.items[1].crypto_random.bytes,
     );
 }
 

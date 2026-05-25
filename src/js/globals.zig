@@ -202,20 +202,18 @@ pub const DispatchState = struct {
     /// all cases, so we record the first error and let the dispatcher
     /// surface it.
     pending_kv_error: ?anyerror = null,
-    /// Optional kv tape. When non-null, every `kv.get` / `kv.set` /
-    /// `kv.delete` the handler performs is appended as an entry so a
-    /// later replay can re-drive the same handler without touching a
-    /// live KV store. Production worker sites always set it (search
-    /// `.kv_tape = &tapes.kv`); the null default is for unit tests
-    /// that exercise binding behaviour without a tape buffer.
-    kv_tape: ?*tape_mod.Tape = null,
-    date_tape: ?*tape_mod.Tape = null,
-    math_random_tape: ?*tape_mod.Tape = null,
-    crypto_random_tape: ?*tape_mod.Tape = null,
-    /// Per-request module-resolution tape — see Request.module_tape.
-    /// Read by the QuickJS module loader (dispatcher.module_loader.load)
-    /// to capture each successful import as `(specifier, source_hash)`.
-    module_tape: ?*tape_mod.Tape = null,
+    /// Optional captured readset. When non-null, every binding that
+    /// reads non-deterministic input (`kv.get/set/delete/prefix`,
+    /// `Date.now`, `Math.random`, `crypto.getRandomValues`, the QJS
+    /// module loader) appends to the matching channel so a later
+    /// replay can re-drive the same handler without touching live
+    /// state. Production worker sites always set it
+    /// (search `.readset = &tapes`); the null default is for unit
+    /// tests that exercise binding behaviour without a readset buffer.
+    /// See `docs/readset-replication-plan.md` for the cross-activation
+    /// persistence story; tape channels are defined in
+    /// `src/tape/root.zig:Readset`.
+    readset: ?*tape_mod.Readset = null,
     /// PRNG used by our `Math.random` override so the test path and
     /// production path stay deterministic w.r.t. a given seed. Seeded
     /// by the dispatcher per request. Installed only when a tape is
@@ -459,18 +457,18 @@ fn jsKvGet(
 
     const value = state.kv.get(key_str) catch |err| switch (err) {
         error.NotFound => {
-            if (state.kv_tape) |t| t.appendKv(.get, key_str, "", .not_found) catch {};
+            if (state.readset) |rs| rs.kv.appendKv(.get, key_str, "", .not_found) catch {};
             return js_null;
         },
         else => {
             state.pending_kv_error = err;
-            if (state.kv_tape) |t| t.appendKv(.get, key_str, "", .err) catch {};
+            if (state.readset) |rs| rs.kv.appendKv(.get, key_str, "", .err) catch {};
             return js_null;
         },
     };
     defer state.allocator.free(value);
 
-    if (state.kv_tape) |t| t.appendKv(.get, key_str, value, .ok) catch {};
+    if (state.readset) |rs| rs.kv.appendKv(.get, key_str, value, .ok) catch {};
     return c.JS_NewStringLen(ctx, value.ptr, value.len);
 }
 
@@ -505,13 +503,13 @@ fn jsKvSet(
     if (!td.anyTriggerMatches(state, key_str)) {
         state.txn.put(key_str, val_str) catch |err| {
             state.pending_kv_error = err;
-            if (state.kv_tape) |t| t.appendKv(.set, key_str, val_str, .err) catch {};
+            if (state.readset) |rs| rs.kv.appendKv(.set, key_str, val_str, .err) catch {};
             return js_undefined;
         };
         state.writeset.addPut(key_str, val_str) catch |err| {
             state.pending_kv_error = err;
         };
-        if (state.kv_tape) |t| t.appendKv(.set, key_str, val_str, .ok) catch {};
+        if (state.readset) |rs| rs.kv.appendKv(.set, key_str, val_str, .ok) catch {};
         return js_undefined;
     }
 
@@ -554,13 +552,13 @@ fn jsKvSet(
     state.txn.put(key_str, write_value) catch |err| {
         state.pending_kv_error = err;
         td.rollbackInnerSavepoint(state);
-        if (state.kv_tape) |t| t.appendKv(.set, key_str, write_value, .err) catch {};
+        if (state.readset) |rs| rs.kv.appendKv(.set, key_str, write_value, .err) catch {};
         return js_undefined;
     };
     state.writeset.addPut(key_str, write_value) catch |err| {
         state.pending_kv_error = err;
     };
-    if (state.kv_tape) |t| t.appendKv(.set, key_str, write_value, .ok) catch {};
+    if (state.readset) |rs| rs.kv.appendKv(.set, key_str, write_value, .ok) catch {};
 
     if (td.runAfterChain(state, ctx, key_str, .put, write_value, prev_owned)) |trigger_path| {
         td.rollbackInnerSavepoint(state);
@@ -596,13 +594,13 @@ fn jsKvDelete(
     if (!td.anyTriggerMatches(state, key_str)) {
         state.txn.delete(key_str) catch |err| {
             state.pending_kv_error = err;
-            if (state.kv_tape) |t| t.appendKv(.delete, key_str, "", .err) catch {};
+            if (state.readset) |rs| rs.kv.appendKv(.delete, key_str, "", .err) catch {};
             return js_undefined;
         };
         state.writeset.addDelete(key_str) catch |err| {
             state.pending_kv_error = err;
         };
-        if (state.kv_tape) |t| t.appendKv(.delete, key_str, "", .ok) catch {};
+        if (state.readset) |rs| rs.kv.appendKv(.delete, key_str, "", .ok) catch {};
         return js_undefined;
     }
 
@@ -637,13 +635,13 @@ fn jsKvDelete(
     state.txn.delete(key_str) catch |err| {
         state.pending_kv_error = err;
         td.rollbackInnerSavepoint(state);
-        if (state.kv_tape) |t| t.appendKv(.delete, key_str, "", .err) catch {};
+        if (state.readset) |rs| rs.kv.appendKv(.delete, key_str, "", .err) catch {};
         return js_undefined;
     };
     state.writeset.addDelete(key_str) catch |err| {
         state.pending_kv_error = err;
     };
-    if (state.kv_tape) |t| t.appendKv(.delete, key_str, "", .ok) catch {};
+    if (state.readset) |rs| rs.kv.appendKv(.delete, key_str, "", .ok) catch {};
 
     if (td.runAfterChain(state, ctx, key_str, .delete, null, prev_owned)) |trigger_path| {
         td.rollbackInnerSavepoint(state);
@@ -703,12 +701,12 @@ fn jsKvPrefix(
         // Capture the failure path too — replay needs to surface the
         // same null return, otherwise a defensive `if (page === null)`
         // branch in the handler would diverge.
-        if (state.kv_tape) |t| t.appendKvPrefix(prefix_str, cursor_str, limit, &.{}, .err) catch {};
+        if (state.readset) |rs| rs.kv.appendKvPrefix(prefix_str, cursor_str, limit, &.{}, .err) catch {};
         return js_null;
     };
     defer scan.deinit();
 
-    if (state.kv_tape) |t| {
+    if (state.readset) |rs| {
         // Convert `kv.PrefixScan.entries` (rove-kv's shape) into the
         // tape's `KvPair`s. Both are the same `(key, value)` pair, but
         // they belong to different modules so we materialize the
@@ -725,7 +723,7 @@ fn jsKvPrefix(
         for (scan.entries, 0..) |e, i| {
             pairs[i] = .{ .key = e.key, .value = e.value };
         }
-        t.appendKvPrefix(prefix_str, cursor_str, limit, pairs, .ok) catch {};
+        rs.kv.appendKvPrefix(prefix_str, cursor_str, limit, pairs, .ok) catch {};
     }
 
     const arr = c.JS_NewArray(ctx);
@@ -763,7 +761,7 @@ fn jsDateNow(
     // live path still reads the real clock so logs of real requests
     // show real timestamps.
     const ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-    if (state.date_tape) |t| t.appendDate(ms) catch {};
+    if (state.readset) |rs| rs.date.appendDate(ms) catch {};
     return c.JS_NewInt64(ctx, ms);
 }
 
@@ -778,7 +776,7 @@ fn jsMathRandom(
     // Matches what qjs's built-in Math.random does, just seeded.
     const bits = state.prng.random().int(u64) >> 11;
     const v: f64 = @as(f64, @floatFromInt(bits)) * (1.0 / @as(f64, @floatFromInt(@as(u64, 1) << 53)));
-    if (state.math_random_tape) |t| t.appendMathRandom(v) catch {};
+    if (state.readset) |rs| rs.math_random.appendMathRandom(v) catch {};
     return c.JS_NewFloat64(ctx, v);
 }
 

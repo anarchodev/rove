@@ -350,6 +350,47 @@ pub const Tape = struct {
     }
 };
 
+/// Per-request captured readset — the set of non-deterministic
+/// inputs the handler observed, channeled by source. Structural
+/// holder of the per-channel `Tape`s; the dispatcher hands the
+/// worker one `Readset` per dispatch and the bindings append to
+/// the relevant channel.
+///
+/// Shape mirrors the WASM replay engine's `Module.tapes` 1:1
+/// (`docs/replay-wasm-plan.md` §4) — same five channels, same
+/// names. No translation layer between capture and replay.
+///
+/// `docs/readset-replication-plan.md` Phase 1 lifted this from
+/// `src/js/worker_log.zig:RequestTapes` so the type is owned by
+/// the tape module that defines its wire format. Later phases
+/// will extend with `fetch_responses` + `trigger_payload` so the
+/// raft entry can carry the full readset out-of-band.
+pub const Readset = struct {
+    kv: Tape,
+    date: Tape,
+    math_random: Tape,
+    crypto_random: Tape,
+    module: Tape,
+
+    pub fn init(allocator: std.mem.Allocator) Readset {
+        return .{
+            .kv = Tape.init(allocator, .kv),
+            .date = Tape.init(allocator, .date),
+            .math_random = Tape.init(allocator, .math_random),
+            .crypto_random = Tape.init(allocator, .crypto_random),
+            .module = Tape.init(allocator, .module),
+        };
+    }
+
+    pub fn deinit(self: *Readset) void {
+        self.kv.deinit();
+        self.date.deinit();
+        self.math_random.deinit();
+        self.crypto_random.deinit();
+        self.module.deinit();
+    }
+};
+
 pub fn hashHexBytes(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});

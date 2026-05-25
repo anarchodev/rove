@@ -33,6 +33,7 @@ const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
 const log_mod = @import("rove-log");
+const tape_mod = @import("rove-tape");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const Request = dispatcher_mod.Request;
@@ -46,7 +47,6 @@ const worker_mod = @import("worker.zig");
 const ParkedUnit = worker_mod.ParkedUnit;
 const KvWakeOp = worker_mod.KvWakeOp;
 const KvWakeEvent = worker_mod.KvWakeEvent;
-const RequestTapes = worker_mod.RequestTapes;
 const MAX_STREAM_ACTIVATIONS = worker_mod.MAX_STREAM_ACTIVATIONS;
 const captureLogWithId = worker_mod.captureLogWithId;
 const resolveDeployment = worker_mod.resolveDeployment;
@@ -473,8 +473,8 @@ fn resumeStream(
 
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    var tapes = RequestTapes.init(allocator);
-    defer tapes.deinit();
+    var readset = tape_mod.Readset.init(allocator);
+    defer readset.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
@@ -506,11 +506,7 @@ fn resumeStream(
         .path = spath,
         .body = body,
         .query = null,
-        .kv_tape = &tapes.kv,
-        .date_tape = &tapes.date,
-        .math_random_tape = &tapes.math_random,
-        .crypto_random_tape = &tapes.crypto_random,
-        .module_tape = &tapes.module,
+        .readset = &readset,
         .prng_seed = @bitCast(now_ns),
         .request_id = request_id,
         .platform = inst.platform,
@@ -815,8 +811,8 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
 
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    var tapes = RequestTapes.init(allocator);
-    defer tapes.deinit();
+    var readset = tape_mod.Readset.init(allocator);
+    defer readset.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
@@ -838,11 +834,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .path = spath,
         .body = body,
         .query = null,
-        .kv_tape = &tapes.kv,
-        .date_tape = &tapes.date,
-        .math_random_tape = &tapes.math_random,
-        .crypto_random_tape = &tapes.crypto_random,
-        .module_tape = &tapes.module,
+        .readset = &readset,
         .prng_seed = @bitCast(now_ns),
         .request_id = request_id,
         .platform = inst.platform,
@@ -1040,8 +1032,8 @@ pub fn fireSubscriptionActivation(
 
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    var tapes = RequestTapes.init(allocator);
-    defer tapes.deinit();
+    var readset = tape_mod.Readset.init(allocator);
+    defer readset.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
@@ -1093,11 +1085,7 @@ pub fn fireSubscriptionActivation(
         .path = spath,
         .body = body,
         .query = null,
-        .kv_tape = &tapes.kv,
-        .date_tape = &tapes.date,
-        .math_random_tape = &tapes.math_random,
-        .crypto_random_tape = &tapes.crypto_random,
-        .module_tape = &tapes.module,
+        .readset = &readset,
         .prng_seed = @bitCast(now_ns),
         .request_id = request_id,
         .platform = inst.platform,
@@ -1299,8 +1287,8 @@ fn fireChainedActivation(
 
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    var tapes = RequestTapes.init(allocator);
-    defer tapes.deinit();
+    var readset = tape_mod.Readset.init(allocator);
+    defer readset.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
@@ -1332,11 +1320,7 @@ fn fireChainedActivation(
         .path = spath,
         .body = body,
         .query = query_opt,
-        .kv_tape = &tapes.kv,
-        .date_tape = &tapes.date,
-        .math_random_tape = &tapes.math_random,
-        .crypto_random_tape = &tapes.crypto_random,
-        .module_tape = &tapes.module,
+        .readset = &readset,
         .prng_seed = @bitCast(now_ns),
         .request_id = request_id,
         .platform = inst.platform,
