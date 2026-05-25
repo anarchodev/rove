@@ -214,6 +214,24 @@ pub fn SharedTxnPool(comptime Txn: type) type {
             self.txns.clearRetainingCapacity();
         }
 
+        /// True iff a txn is currently parked at `seq` — i.e. the
+        /// proposing path called `park(seq, txn)` and a subsequent
+        /// `commitAndTake(seq)` returned `.took`/`.failed` (which
+        /// remove it) has NOT yet happened, OR `commitAndTake`
+        /// returned `.conflict` (which keeps it for retry).
+        ///
+        /// Effect-reification Phase 4.1.3: lets the `parked_units`
+        /// commit arm see whether the SIBLING entity-backed arm
+        /// (`drainEntityArm` for the same `seq`) actually committed.
+        /// If the txn is still parked, that arm conflicted
+        /// (NotChainHead — a predecessor hasn't committed yet) and
+        /// the unit's `Cmd.respond` must NOT move the entity. The
+        /// unit defers to the next tick so commit + move stay
+        /// atomic (matching the pre-4.1.3 inline-move behavior).
+        pub fn contains(self: *const Self, seq: u64) bool {
+            return self.txns.contains(seq);
+        }
+
         pub fn isEmpty(self: *const Self) bool {
             return self.txns.count() == 0;
         }
