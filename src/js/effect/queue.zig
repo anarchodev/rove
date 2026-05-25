@@ -2,44 +2,49 @@
 //! (`docs/effect-algebra.md` §2.3; `docs/effect-reification-plan.md`
 //! Phase 2 §3.4).
 //!
-//! Today every Msg origin has its own bespoke staging area: two rove
-//! ECS collections (`subscription_fire_pending`, `fetch_event_pending`)
-//! plus two cross-thread inboxes (`SubscriptionFireInbox`,
-//! `FetchChunkInbox`) plus the implicit h2 `request_out`. The Phase 2
-//! plan §3.4 collapses all of these into **one** ingress so:
+//! The pre-Phase-2 world had each origin staging into its own area:
+//! two rove collections (`subscription_fire_pending`,
+//! `fetch_event_pending`) plus two cross-thread inboxes
+//! (`SubscriptionFireInbox`, `FetchChunkInbox`) plus the implicit h2
+//! `request_out`. Phase 2 collapses them into **one** in-thread
+//! ingress (`MsgQueue`) fed from one cross-thread inbox (`MsgInbox`)
+//! per worker so:
 //!
-//! 1. Backpressure is a property of the primitive (the queue cap).
-//! 2. Taping is a property of the primitive — `enqueueMsg` tapes
-//!    unconditionally so no Msg can reach a handler without recording
-//!    it (algebra L3 — closes worklist #1, the fetch-A untaped-chunk
-//!    bug).
-//! 3. The dispatch loop is one `for (queue.drain()) |msg| ...` instead
-//!    of N per-origin sweeps.
+//! 1. Backpressure is a property of the primitive (the queue cap;
+//!    `error.Full` + `overflow_count` on overflow, surfaced on
+//!    `/_system/metrics` the same way `dropped_chunks` /
+//!    `lost_oldest` already are).
+//! 2. The dispatch loop is one `for (queue.drain()) |msg| ...`
+//!    instead of N per-origin sweeps.
 //!
-//! Phase 2A (this file's current scope): declare the primitive. **No
-//! origin migrates yet.** The tape hook in `enqueueMsg` is a TODO that
-//! each per-origin migration PR (2B–2F) wires in for its payload kind
-//! (cron / boot / kv-react / fetch / send-callback / inbound).
+//! Migrated origins today: `subscription_fire` (kv-react / cron /
+//! boot — `worker_streaming.zig`), `fetch_chunk`, `send_callback`.
+//! `inbound` stays entity-driven through H2 (Phase 3's reconciler
+//! scope) — it has a Msg variant for type-system parity but no
+//! `enqueueMsg` path. `timer` / `disconnect` / `kv_wake` /
+//! `wake_batch` are dispatcher-internal control variants with no
+//! owned bytes (see `freeOwnedMsg` below).
+//!
+//! ## Taping
+//!
+//! Algebra L3 ("every Msg is a recorded input") is satisfied by
+//! per-dispatch-site taping via `captureTapesForChain*` — the
+//! existing inbound-HTTP tape mechanism (kv/date/random/module
+//! channels plus activation_bytes for chunk variants). The
+//! pre-handler hook contemplated in early drafts wasn't needed:
+//! post-handler taping records the same bytes the handler observed
+//! and meets the audit's "taped per fire" check
+//! (`docs/effect-algebra.md` §5).
 //!
 //! ## Ownership model
 //!
-//! Phase 2A holds `Msg` values by-value with no allocator-owned
-//! fields (the variant payloads are empty placeholders today). When a
-//! per-origin migration adds owned fields to its variant payload, that
-//! PR is responsible for adding `deinit` discipline so dropped-on-
-//! overflow messages free their bytes — `MsgQueue.deinit` must walk
-//! the items, the variant must carry an allocator, etc. The pattern
-//! to follow is `ParkedUnit.deinit` in `worker.zig:174` (the existing
-//! commit-gated unit also lives in a rove collection and owns its
-//! send-ops + kv-wakes).
-//!
-//! ## Backpressure
-//!
-//! Phase 2A returns `error.Full` on overflow + increments
-//! `overflow_count`. Per-origin migration may switch to oldest-drop
-//! (the §9.4 wake-ring pattern) for lossy-tolerant origins, or
-//! retain blocking semantics — that choice rides with the origin's
-//! migration PR.
+//! Variants that own allocator-backed bytes (`subscription_fire`,
+//! `fetch_chunk`, `send_callback`) carry their own `deinit` (called
+//! by `freeOwnedMsg` on drop-on-shutdown / overflow-drop). Adding a
+//! new payload-owning variant requires an arm in `freeOwnedMsg`
+//! (compile-time exhaustive) — the testing allocator's leak
+//! detection in `MsgQueue: SubscriptionFire payload freed on
+//! shutdown deinit` catches a missed arm.
 
 const std = @import("std");
 const msg_mod = @import("msg.zig");
@@ -110,16 +115,9 @@ pub const MsgQueue = struct {
     }
 };
 
-/// The single in-thread Msg ingress.
-///
-/// **L3 (algebra):** every Msg is recorded (taped). Phase 2A-2D's
-/// pragmatic decision: each per-origin migration tapes at the
-/// dispatch site via `captureTapesForChain*` (the existing inbound-
-/// HTTP tape mechanism — kv/date/random/module channels plus
-/// activation_bytes for chunk variants in 2D). The pre-handler
-/// hook contemplated in earlier drafts was not needed — post-handler
-/// taping records the same bytes the handler observed and meets the
-/// audit's "taped per fire" check (`docs/effect-algebra.md` §5).
+/// The single in-thread Msg ingress. **L3 (algebra)** is satisfied
+/// by per-dispatch-site taping (`captureTapesForChain*`) — see the
+/// top-of-file Taping section.
 ///
 /// On `error.Full` the caller owns the Msg and must `freeOwnedMsg`
 /// it (variant-aware free).

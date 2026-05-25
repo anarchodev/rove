@@ -60,7 +60,7 @@ const jwt_mod = @import("rove-jwt");
 const files_mod = @import("rove-files");
 const files_server = @import("rove-files-server");
 const log_server = @import("rove-log-server");
-const schedule_server_mod = @import("rove-schedule-server");
+const ssrf_mod = @import("rove-ssrf");
 const qjs = @import("rove-qjs");
 const tenant_mod = @import("rove-tenant");
 const h2_mod = @import("rove-h2");
@@ -991,9 +991,9 @@ pub fn main() !void {
     try std.fs.cwd().makePath(cli.data_dir);
 
     if (cli.dev_webhook_unsafe) {
-        schedule_server_mod.ssrf.test_allow_loopback = true;
-        schedule_server_mod.thread.test_allow_plaintext = true;
-        std.log.warn("*** --dev-webhook-unsafe enabled: http.send may target loopback over http:// — DEV ONLY ***", .{});
+        ssrf_mod.test_allow_loopback = true;
+        ssrf_mod.test_allow_plaintext = true;
+        std.log.warn("*** --dev-webhook-unsafe enabled: outbound HTTP may target loopback over http:// — DEV ONLY ***", .{});
     }
 
     try installSignalHandlers();
@@ -1334,14 +1334,14 @@ pub fn main() !void {
 
     // ── Schedule-server thread: RETIRED (Option (b) 5b-2) ─────────────
     //
-    // The leader-pinned libcurl poll loop over `schedules.db` is gone.
-    // `http.send` now writes per-tenant `_send/owed/{id}` (env-0) and
-    // the per-node `SendDispatch` (leader-gated dedicated EasyPool)
-    // fires + resolves it. `schedule_server.thread` retains only the
-    // reusable transport (`fireOnce`/`checkSsrf`/header-render/method/
-    // `test_allow_plaintext`) the new path calls; no thread is
-    // spawned. `loop46_ctx.schedule_wake` is no longer wired (apply
-    // never wakes a scheduler thread).
+    // The leader-pinned libcurl poll loop over `schedules.db` is
+    // gone, as is the per-node `SendDispatch` that briefly replaced
+    // it (deleted in the 2026-05-24 durability-as-JS-shim flip).
+    // Outbound HTTP now flows through `js/fetch_engine.zig`'s
+    // curl_multi engine; the JS-shim `webhook.send`
+    // (`src/js/globals/webhook.js`) composes durability on top.
+    // All that remains of the original module is `rove-ssrf` (the
+    // blocklist + the two `--dev-webhook-unsafe` test overrides).
     //
     // ── SSE notification thread: RETIRED (streaming-handlers Phase 5)
     //

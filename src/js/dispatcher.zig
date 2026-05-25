@@ -3662,7 +3662,7 @@ test "dispatch: webhook.send (JS shim) writes _send/owed/{id} markers" {
         \\const id1 = webhook.send({
         \\  url: "https://example.test/a",
         \\  body: "one",
-        \\  onResult: "cb/a",
+        \\  on_result: "cb/a",
         \\  context: { x: 1 },
         \\});
         \\const id2 = webhook.send({
@@ -3747,7 +3747,7 @@ test "dispatch: email.send wraps webhook.send (JS shim) with Resend shape" {
         \\  to: "user@example.com",
         \\  subject: "Verify",
         \\  text: "Click me.",
-        \\  onResult: "signup/email_result",
+        \\  on_result: "signup/email_result",
         \\  context: { user_id: 42 },
         \\});
     ,

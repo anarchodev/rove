@@ -117,7 +117,7 @@ pub const RollbackOutcome = union(enum) {
 /// `std.AutoHashMapUnmanaged(u64, Txn)` field on `Worker`.
 ///
 /// **Architectural fact:** multiple entities can share one txn at a
-/// given seq. Per-tenant batching (`tenant_batch.drainTenantBatch`)
+/// given seq. Per-tenant batching in `worker_dispatch.finalizeBatch`
 /// folds N H2 requests into one writeset → one propose → one raft
 /// seq → one `TrackedTxn`. The shared pool encodes this: the first
 /// drain arm to process the seq takes the txn (commits or rolls
@@ -250,11 +250,10 @@ pub fn SharedTxnPool(comptime Txn: type) type {
 /// downgrade; `.pending` → skip this iteration).
 ///
 /// Effect-reification Phase 3.2.a: extracts the previously-duplicated
-/// predicate from `drainResponsePending` / `drainContPending` /
-/// `drainStreamPending` + the `parked_units` sweep. The four sites
-/// computed identical logic in four places; a single classifier
-/// guarantees future divergence is a compile error rather than a
-/// drift bug.
+/// predicate from the three `raft_pending_*` `drainEntityArm` arms +
+/// the `parked_units` sweep. The four sites computed identical
+/// logic in four places; a single classifier guarantees future
+/// divergence is a compile error rather than a drift bug.
 pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
     if (w.committed >= seq) return .commit;
     const is_faulted = w.faulted > 0 and w.faulted >= seq;

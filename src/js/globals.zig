@@ -205,7 +205,9 @@ pub const DispatchState = struct {
     /// Optional kv tape. When non-null, every `kv.get` / `kv.set` /
     /// `kv.delete` the handler performs is appended as an entry so a
     /// later replay can re-drive the same handler without touching a
-    /// live KV store. Null means "don't capture" (tests, legacy paths).
+    /// live KV store. Production worker sites always set it (search
+    /// `.kv_tape = &tapes.kv`); the null default is for unit tests
+    /// that exercise binding behaviour without a tape buffer.
     kv_tape: ?*tape_mod.Tape = null,
     date_tape: ?*tape_mod.Tape = null,
     math_random_tape: ?*tape_mod.Tape = null,
@@ -1611,8 +1613,8 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // Trampoline continuation primitive (connection-actor §6.1/§6.4
     // unified return-as-continuation model). Pure constructor of a
     // branded descriptor; classified on the handler's return path,
-    // not an effect. Internal builtin for now — the public `next`
-    // JS shim over this lands in Phase 3b-iii.
+    // not an effect. Internal-only today; the public `next` JS shim
+    // over this lands in Phase 3b-iii.
     .{ .name = "__rove_next", .cfunc = cont_b.jsNext, .argc = 2 },
     // Iterative streaming primitive (streaming-handlers-plan §3.3).
     // Same shape/posture as `__rove_next`: pure constructor of a

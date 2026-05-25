@@ -132,23 +132,10 @@ globalThis.webhook = {
     if (typeof opts.url !== "string")
       throw new TypeError("webhook.send: `url` must be a string");
 
-    // Tolerate the legacy `onResult` (camelCase, as written by
-    // older email.js / customer code) plus the new snake_case
-    // `on_result`. Modules-only: a plain string, not the legacy
-    // `{module: "..."}` object — webhook_onresult.mjs receives it
-    // verbatim through `__rove_next(on_result, {ctx: {...}})`.
-    let on_result = null;
-    if (typeof opts.on_result === "string") {
-      on_result = opts.on_result;
-    } else if (opts.on_result && typeof opts.on_result === "object" &&
-               typeof opts.on_result.module === "string") {
-      on_result = opts.on_result.module;
-    } else if (typeof opts.onResult === "string") {
-      on_result = opts.onResult;
-    } else if (opts.onResult && typeof opts.onResult === "object" &&
-               typeof opts.onResult.module === "string") {
-      on_result = opts.onResult.module;
-    }
+    // `on_result` is a module path string. Passed verbatim to
+    // `__rove_next(on_result, {ctx: {...}})` inside the
+    // webhook_onresult.mjs shim.
+    const on_result = typeof opts.on_result === "string" ? opts.on_result : null;
 
     // Id derivation: deterministic from handle, else randomUUID
     // (taped → replay-deterministic).

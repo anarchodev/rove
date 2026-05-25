@@ -1,13 +1,18 @@
-//! SSRF blocklist for outbound HTTP delivery (http.send / scheduler).
+//! rove-ssrf — SSRF blocklist + dev-only safety overrides for
+//! outbound HTTP from customer handlers.
+//!
+//! Imported by `js/fetch_engine.zig` (the curl_multi engine that
+//! handles `http.fetch` / `http.subscribe` / the `webhook.send` JS
+//! shim's transport) and by `loop46/main.zig` (to flip the
+//! `--dev-webhook-unsafe` test overrides).
 //!
 //! The rule: if ANY address a hostname resolves to lives inside one
 //! of the blocked CIDRs, refuse to connect. Prevents a malicious (or
 //! misconfigured) customer handler from exfiltrating local services,
 //! cloud metadata, or other tenants through the platform's outbound
-//! credentials.
-//!
-//! Called at least once per delivery attempt. PLAN §2.6 calls for
-//! re-resolution on every retry — DNS rebinding defense.
+//! credentials. Called at least once per delivery attempt;
+//! PLAN §2.6 calls for re-resolution on every retry (DNS rebinding
+//! defense).
 //!
 //! Blocked ranges (IPv4):
 //!   0.0.0.0/8         — "this network"
@@ -50,6 +55,15 @@ pub const Error = error{
 /// still blocked unconditionally. Set via the worker's
 /// `--dev-webhook-unsafe` CLI flag; no config-file path.
 pub var test_allow_loopback: bool = false;
+
+/// **TEST-ONLY** escape hatch that lets the curl engine talk to
+/// `http://` URLs (in addition to `https://`). Paired with
+/// `test_allow_loopback` under loop46's `--dev-webhook-unsafe` flag
+/// so smokes can point at on-box echo servers. **Never set in
+/// production** — plaintext outbound leaks request bodies on any
+/// intermediate hop. Read by `fetch_engine.zig` to flip
+/// `verify_tls` on libcurl.
+pub var test_allow_plaintext: bool = false;
 
 /// Look up every address `host` resolves to on `port`, bail out if
 /// any hits the blocklist. Returns the first safe address (caller

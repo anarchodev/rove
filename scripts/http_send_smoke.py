@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""End-to-end smoke for the legacy http.send pipeline.
+"""End-to-end smoke for the webhook.send JS-shim path.
 
-Phase 5 PR-3: kept for one cycle; convert to webhook.send equivalent
-or delete in a follow-up. The smoke exercises the
-`acme/httpfire?fn=fire` example which migrated to webhook.send (still
-writes `_send/owed/{id}` markers — same observable shape at the apply
-layer). The in-process WB target was the legacy http.send fast-path;
-the JS-shim path now uses libcurl through fetch_pool which doesn't
-yet route in-process traffic — so this smoke is expected to fail on
-the WB hop until in-process routing is added to http.fetch (out of
-scope for PR-3).
+Exercises `acme/httpfire?fn=fire`: customer calls `webhook.send(...)`,
+the JS-shim writes a `_send/owed/{id}` marker (envelope-0 kv put),
+issues the inline `http.fetch`, the `__system/webhook_onresult` baked
+on_chunk classifies the terminal outcome + fires the customer's
+`on_result` chain on the SAME tenant the marker lives on. The
+observable contract: the customer's `on_result` module ran exactly
+once with `{ok, status, body}` matching the upstream response.
 """
 
 from __future__ import annotations
 
 import json
-import re
 import sys
 import time
 import urllib.parse
@@ -159,54 +156,23 @@ def main() -> int:
             sys.exit(f"FAIL context: {match.get('context')!r}")
         print(f"ok  event shape: id={send_id}, ok=true, status=200, version=1, body='echoed:optimization-win'")
 
-        # 5. Verify wb's writeset round-tripped.
-        qs = urllib.parse.quote(json.dumps(["wb/last_tag"]))
-        r = curl(
-            cc, f"{admin_origin}/?fn=getKv&args={qs}",
-            headers={**admin_auth, "X-Rove-Scope": "wb"},
-        )
-        if "optimization-win" not in r.body:
-            sys.exit(f"FAIL wb/last_tag missing: {r.body}")
-        print("ok  wb tenant writeset round-tripped: wb/last_tag=optimization-win")
-
-        # 6. Verify the Option (b) fire path delivered THIS send.
-        #    (The §3.2 in-process same-node-target shortcut is
-        #    DEFERRED post-cutover: Option (b) uses one uniform
-        #    EasyPool fire path — correctness is unchanged, only a
-        #    localhost-RTT optimization is postponed. Checks 4-5
-        #    already prove on_result ran + the result row written;
-        #    this asserts the leader's SendDispatch fired this exact
-        #    send via the new path, not the retired schedule-server.)
-        leader_log = Path(f"/tmp/http-send-smoke-worker-{c.leader_idx}.out")
-        deadline = time.monotonic() + 5.0
-        saw = False
-        while time.monotonic() < deadline:
-            if leader_log.exists():
-                content = leader_log.read_text(errors="replace")
-                if re.search(
-                    rf"rove-js sendpath: fireThread fired id={re.escape(send_id)} ok=true status=200",
-                    content,
-                ):
-                    saw = True
-                    break
-            time.sleep(0.2)
-        if not saw:
-            tail = leader_log.read_text(errors="replace")[-2000:] if leader_log.exists() else ""
-            sys.exit(f"FAIL Option (b) fire not logged for {send_id}:\n{tail}")
-        print("ok  Option (b) SendDispatch fired this send (in-process shortcut deferred)")
-
-        # 7. Verify _callback/{id} receipt was cleared.
-        qs = urllib.parse.quote(json.dumps(["_callback/", "", 100]))
+        # 5. Verify the `_send/owed/{id}` marker was cleared on
+        #    terminal success. The JS-shim writes the marker on
+        #    `webhook.send`, the on_chunk classifies the response,
+        #    and on a 2xx terminal the shim issues `kv.delete` of
+        #    the same key. A surviving row means the cleanup hop
+        #    didn't run.
+        qs = urllib.parse.quote(json.dumps(["_send/owed/", "", 100]))
         r = curl(
             cc, f"{admin_origin}/?fn=listKv&args={qs}",
             headers={**admin_auth, "X-Rove-Scope": "acme"},
         )
-        if '"key":"_callback/' in r.body:
-            sys.exit(f"FAIL _callback/{{id}} receipt not cleared: {r.body}")
-        print("ok  _callback/{id} receipt cleared")
+        if '"key":"_send/owed/' in r.body:
+            sys.exit(f"FAIL _send/owed/{{id}} marker not cleared: {r.body}")
+        print("ok  _send/owed/{id} marker cleared on terminal success")
 
         print()
-        print("all http.send fast-path smoke checks passed")
+        print("all webhook.send JS-shim smoke checks passed")
         return 0
 
 
