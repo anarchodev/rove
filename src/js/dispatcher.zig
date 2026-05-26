@@ -142,12 +142,6 @@ pub const Request = struct {
     /// flushing the log record. See `docs/readset-replication-plan.md`
     /// and `src/tape/root.zig:Readset`.
     readset: ?*tape_mod.Readset = null,
-    /// PRNG seed for `Math.random` and `crypto.*`. Captured alongside
-    /// the log record so replay can reconstruct the same stream
-    /// (though the tapes themselves are what replay reads from — the
-    /// seed is belt-and-suspenders for the "tape was dropped but seed
-    /// survived" scenario).
-    prng_seed: u64 = 0,
     /// Pre-minted per-request identifier. The dispatcher copies it
     /// onto `DispatchState` so `webhook.send` can derive a stable
     /// outbox id (`sha256(request_id || call_index)`) that matches on
@@ -504,7 +498,9 @@ pub const Dispatcher = struct {
             .writeset = writeset,
             .console = &console_buf,
             .readset = request.readset,
-            .prng = std.Random.DefaultPrng.init(request.prng_seed),
+            .prng = std.Random.DefaultPrng.init(
+                if (request.readset) |rs| rs.seed else 0,
+            ),
             .request_id = request.request_id,
             .session_id = request.session_id,
             .platform = request.platform,
@@ -2600,7 +2596,9 @@ test "dispatch: kv tape captures get/set/delete with outcomes" {
     // Seed a key so the handler can observe both .ok and .not_found.
     try kv.put("seeded", "v1");
 
-    var readset = tape_mod.Readset.init(testing.allocator);
+    // Tape-only test: seed value irrelevant (no Math.random/crypto in
+    // the handler), timestamp 0 is fine.
+    var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
     defer readset.deinit();
 
     var rt = try qjs.Runtime.init();
@@ -2670,7 +2668,10 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
         cleanupTempKv(&buf);
     }
 
-    var readset = tape_mod.Readset.init(testing.allocator);
+    // Fixed seed = 42 so the two runs below produce bit-identical
+    // Math.random / crypto streams. timestamp is recorded but not
+    // load-bearing for this test's assertions.
+    var readset = tape_mod.Readset.init(testing.allocator, 0, 42);
     defer readset.deinit();
 
     var rt = try qjs.Runtime.init();
@@ -2707,7 +2708,6 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
             .path = "/",
             .query = "fn=go",
             .readset = &readset,
-            .prng_seed = 42,
         }, &budget);
         resp.deinit(testing.allocator);
     }
@@ -2722,7 +2722,7 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
     // Replaying the same seed with a fresh readset should yield
     // bit-identical math_random and crypto values (date is wall-clock
     // so we skip it here).
-    var readset2 = tape_mod.Readset.init(testing.allocator);
+    var readset2 = tape_mod.Readset.init(testing.allocator, 0, 42);
     defer readset2.deinit();
 
     {
@@ -2736,7 +2736,6 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
             .path = "/",
             .query = "fn=go",
             .readset = &readset2,
-            .prng_seed = 42,
         }, &budget2);
         resp2.deinit(testing.allocator);
     }

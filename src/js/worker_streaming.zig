@@ -473,9 +473,9 @@ fn resumeStream(
 
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    var readset = tape_mod.Readset.init(allocator);
-    defer readset.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
@@ -507,7 +507,6 @@ fn resumeStream(
         .body = body,
         .query = null,
         .readset = &readset,
-        .prng_seed = @bitCast(now_ns),
         .request_id = request_id,
         .platform = inst.platform,
         .limiter = &worker.limiter,
@@ -811,9 +810,9 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
 
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    var readset = tape_mod.Readset.init(allocator);
-    defer readset.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
@@ -835,7 +834,6 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .body = body,
         .query = null,
         .readset = &readset,
-        .prng_seed = @bitCast(now_ns),
         .request_id = request_id,
         .platform = inst.platform,
         .limiter = &worker.limiter,
@@ -1032,9 +1030,9 @@ pub fn fireSubscriptionActivation(
 
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    var readset = tape_mod.Readset.init(allocator);
-    defer readset.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
@@ -1086,7 +1084,6 @@ pub fn fireSubscriptionActivation(
         .body = body,
         .query = null,
         .readset = &readset,
-        .prng_seed = @bitCast(now_ns),
         .request_id = request_id,
         .platform = inst.platform,
         .limiter = &worker.limiter,
@@ -1287,9 +1284,9 @@ fn fireChainedActivation(
 
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
-    var readset = tape_mod.Readset.init(allocator);
-    defer readset.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
@@ -1321,7 +1318,6 @@ fn fireChainedActivation(
         .body = body,
         .query = query_opt,
         .readset = &readset,
-        .prng_seed = @bitCast(now_ns),
         .request_id = request_id,
         .platform = inst.platform,
         .limiter = &worker.limiter,
