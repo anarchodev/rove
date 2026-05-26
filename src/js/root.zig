@@ -84,6 +84,7 @@ pub const DEFAULT_HANDLER_PATH = worker.DEFAULT_HANDLER_PATH;
 pub const BlockedTenants = worker.BlockedTenants;
 pub const dispatchOnce = worker.dispatchOnce;
 pub const drainRaftPending = worker.drainRaftPending;
+pub const drainBodyPending = worker.drainBodyPending;
 pub const drainPendingBoundResumes = worker.drainPendingBoundResumes;
 pub const sweepParkedContinuations = worker.sweepParkedContinuations;
 pub const serviceParkedStreams = worker.serviceParkedStreams;

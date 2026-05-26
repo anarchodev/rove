@@ -58,8 +58,10 @@ const respb = @import("response_builder.zig");
 
 const worker_mod = @import("worker.zig");
 const worker_streaming = @import("worker_streaming.zig");
+const bodies_mod = @import("rove-bodies");
 const ParkedUnit = worker_mod.ParkedUnit;
 const RaftWait = worker_mod.RaftWait;
+const BodyDurabilityWait = worker_mod.BodyDurabilityWait;
 const TenantFiles = worker_mod.TenantFiles;
 const captureLogWithId = worker_mod.captureLogWithId;
 const OWED_PREFIX = worker_mod.OWED_PREFIX;
@@ -983,5 +985,51 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
             );
             resolveParked(worker, e.ent, e.sid, e.sess, 504, "hold deadline exceeded\n") catch {};
         };
+    }
+}
+
+/// `docs/readset-replication-plan.md` Phase 4 park-on-durability
+/// drain.
+///
+/// Walks `worker.body_pending`, checks each parked entity's
+/// `BodyDurabilityWait.body_ref` against the owning tenant's
+/// `TenantBodies.buffer.last_flushed_batch_id`, and moves entities
+/// whose body is now durable back to `request_out` for re-dispatch.
+/// The next `dispatchOnce` tick picks them up; `dispatchPending`'s
+/// body-gate detects the non-sentinel `BodyDurabilityWait`
+/// component and skips the re-append, using the saved `body_ref`
+/// for `readset.trigger_payload`.
+///
+/// Best-effort: a `tenant_bodies` map miss (tenant evicted between
+/// park and drain — shouldn't happen in practice) leaves the
+/// entity parked; the next tick re-checks. A `reg.move` failure
+/// panics (rove invariant — the entity must be in `body_pending`
+/// or the column slice is stale).
+pub fn drainBodyPending(worker: anytype) !void {
+    const server = worker.h2;
+
+    const ents = worker.body_pending.entitySlice();
+    const waits = worker.body_pending.column(BodyDurabilityWait);
+
+    // Snapshot indices first — `reg.move` mutates `body_pending`,
+    // so iterate by index over the snapshotted entitySlice and
+    // skip empty slots after the move.
+    var i: usize = 0;
+    while (i < ents.len) : (i += 1) {
+        const ent = ents[i];
+        const wait = waits[i];
+        // Sentinel: a default-empty `BodyDurabilityWait` means the
+        // entity got into `body_pending` without going through the
+        // park branch (shouldn't happen). Skip + leave for the
+        // next tick; the only way out is `reg.move`.
+        if (wait.body_ref.batch_id == bodies_mod.NO_BATCH) continue;
+
+        const tb = worker.tenant_bodies.get(wait.tenant_id) orelse continue;
+        if (!tb.buffer.isDurable(wait.body_ref)) continue;
+
+        // Durable — release back to `request_out`. The component
+        // stays on the entity so `dispatchPending` detects the
+        // resume + skips re-append (plan §4 park flow).
+        try server.reg.move(ent, &worker.body_pending, &server.request_out);
     }
 }
