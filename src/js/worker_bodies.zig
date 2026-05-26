@@ -85,9 +85,65 @@ pub fn freeTenantBodies(allocator: std.mem.Allocator, tb: *TenantBodies) void {
 /// Lookup-or-lazy-open. Wraps `worker.tenant_bodies.getOrOpen` for
 /// callers that only hold a worker pointer. Mirrors
 /// `getOrOpenTenantLog` for the body-buffer map.
+///
+/// Thread-safe: callers from the worker main thread (append site)
+/// and the log-flusher thread (flush-tick iteration) can both call
+/// this. Acquires `worker.tenant_bodies_mu` around the map lookup
+/// + grow path.
 pub fn getOrOpenTenantBodies(
     worker: anytype,
     inst: *const tenant_mod.Instance,
 ) !*TenantBodies {
+    worker.tenant_bodies_mu.lock();
+    defer worker.tenant_bodies_mu.unlock();
     return worker.tenant_bodies.getOrOpen(worker, inst);
+}
+
+/// Iterate every tenant body buffer and flush any that hit a size
+/// or time threshold. Called from the log-flusher thread on its
+/// periodic tick (50ms cadence — shorter than the default 100ms
+/// time threshold so a buffer with one byte still gets flushed
+/// within ~150ms of arrival).
+///
+/// Snapshots the map's *pointer* values under
+/// `worker.tenant_bodies_mu`, then drops the lock before walking
+/// each buffer. Each buffer has its own internal mutex; flush
+/// releases that mutex around the slow S3 PUT, so concurrent
+/// appends on the worker thread aren't blocked.
+///
+/// Best-effort: PUT failures are logged + skipped (same posture
+/// as `worker_log.flushLogs`). The buffer continues with the next
+/// batch on the next tick.
+pub fn flushBodiesTick(worker: anytype) void {
+    const allocator = worker.allocator;
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+
+    // Snapshot the tenant-body pointers under the map lock. The
+    // pointers are stable for the lifetime of the map entries
+    // (closed only in `freeTenantBodies` on worker shutdown), so
+    // we can drop the map lock before walking them.
+    var snapshot: std.ArrayListUnmanaged(*TenantBodies) = .empty;
+    defer snapshot.deinit(allocator);
+    {
+        worker.tenant_bodies_mu.lock();
+        defer worker.tenant_bodies_mu.unlock();
+        snapshot.ensureTotalCapacity(allocator, worker.tenant_bodies.map.count()) catch return;
+        var it = worker.tenant_bodies.iterator();
+        while (it.next()) |entry| {
+            snapshot.appendAssumeCapacity(entry.value_ptr.*);
+        }
+    }
+
+    for (snapshot.items) |tb| {
+        const should =
+            tb.buffer.shouldFlushBySize() or
+            tb.buffer.shouldFlushByTime(now_ns);
+        if (!should) continue;
+        _ = tb.buffer.flush(tb.backend.blobStore(), now_ns) catch |err| {
+            std.log.warn(
+                "rove-js body-flusher: flush tenant={s}: {s}",
+                .{ tb.instance_id, @errorName(err) },
+            );
+        };
+    }
 }

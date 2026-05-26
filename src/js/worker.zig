@@ -2032,6 +2032,12 @@ pub fn Worker(comptime opts: Options) type {
         /// per-worker matches the natural data ownership. Lazy-opened
         /// on first body via `worker_bodies.getOrOpenTenantBodies`.
         tenant_bodies: TenantMap(TenantBodies),
+        /// Guards `tenant_bodies` map structure: the worker main
+        /// thread inserts via `getOrOpenTenantBodies` (Phase 2c
+        /// append site), and the log-flusher thread iterates via
+        /// `flushBodiesTick`. Each `TenantBodies.buffer` has its
+        /// own internal mutex; this one protects the map itself.
+        tenant_bodies_mu: std.Thread.Mutex = .{},
         /// Per-node in-memory `LogRecord` buffer. Every tenant's
         /// dispatch tick appends here; `flushLogs` drains the whole
         /// buffer into one combined batch per flush window. Replaces
@@ -2276,6 +2282,12 @@ pub fn Worker(comptime opts: Options) type {
                 _ = worker_log.flushLogs(self) catch |err| {
                     std.log.warn("rove-js flusher: flushLogs failed: {s}", .{@errorName(err)});
                 };
+                // Phase 2c: piggyback the per-tenant body-buffer
+                // flush on the same 50ms tick. Walks
+                // `tenant_bodies`, flushes each buffer that hit
+                // a size / time threshold; PUT happens here, off
+                // the worker hot path.
+                worker_bodies.flushBodiesTick(self);
                 self.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
                 self.flusher_wake.reset();
             }
@@ -3866,6 +3878,34 @@ pub fn fireFetchEventActivation(
         req.activation_fetch_terminal_status = event.terminal_status;
         req.activation_fetch_terminal_ok = event.terminal_ok;
         req.activation_fetch_body_truncated = event.body_truncated;
+    }
+
+    // Phase 2c-1: stream the chunk payload into the per-tenant
+    // BodyBuffer so the log-flusher tick can publish it to
+    // `{tenant}/readset-blobs/{batch_id}`. Captures the BodyRef
+    // for slice 2c-2's fetch_responses tape channel.
+    //
+    // The bytes still ride alongside on `activation_fetch_bytes`
+    // (the handler keeps reading them inline for now — callback
+    // gating on durability is Phase 4). Empty chunks (terminal-
+    // only events with no body) are skipped — no point in
+    // appending zero bytes.
+    if (event.bytes.len > 0) {
+        const tb = worker_bodies.getOrOpenTenantBodies(worker, inst) catch |err| blk: {
+            std.log.warn(
+                "rove-js fetch-event: getOrOpenTenantBodies tenant={s}: {s}",
+                .{ tenant_id, @errorName(err) },
+            );
+            break :blk null;
+        };
+        if (tb) |t| {
+            _ = t.buffer.append(event.bytes) catch |err| {
+                std.log.warn(
+                    "rove-js fetch-event: body-buffer append tenant={s} bytes={d}: {s}",
+                    .{ tenant_id, event.bytes.len, @errorName(err) },
+                );
+            };
+        }
     }
 
     // Phase 2D: the activation's input bytes (the upstream chunk
