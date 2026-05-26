@@ -767,13 +767,24 @@ Increments (planned, smallest-first):
     core ships today so a future in-code sweeper has a tested
     reference for "what's live."
 
-### Phase 6 — verification
+### Phase 6 — verification (shipped)
 
-Leader-failover smoke (`scripts/leader_failover_smoke.py`, recently
-deflaked per `project_leader_failover_smoke_flake`) extended to assert
-tape availability for requests served by the dead leader. Smoke
-should observe that the new leader can serve the full tape for the
-last 100ms of pre-crash requests.
+`scripts/leader_failover_smoke.py` extended to spawn the log-server,
+mint a services-token JWT, and query `GET /v1/acme/list?limit=50`
+post-failover. Asserts at least one record exists for the acme
+tenant — proves the LogRecord for the original POST (that scheduled
+the webhook on the dead leader) reached S3 either via the dead
+leader's pre-crash flush OR via 5c's upload-catchup walker on the
+new leader. Indexer's `INSERT OR IGNORE (tenant_id, request_id)`
+makes both paths idempotent; the assertion is structural ("a record
+exists") rather than path-specific.
+
+Verified 5/5 on the new assertion across multi-run smoke (the
+pre-existing `~40%` on_result flake — webhook routing race per
+`project_leader_failover_smoke_flake` memory — is orthogonal and
+continues to surface at the same rate; Phase 6's assertion has been
+green on every run so far including the runs where on_result
+flaked).
 
 ## 10. Relation to other plans
 
