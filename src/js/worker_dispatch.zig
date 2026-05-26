@@ -19,6 +19,7 @@ const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
 const log_mod = @import("rove-log");
 const tape_mod = @import("rove-tape");
+const bodies_mod = @import("rove-bodies");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
 const blob_mod = @import("rove-blob");
@@ -2366,6 +2367,40 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // writes without poisoning the rest of the batch.
         var readset = tape_mod.Readset.init(allocator, received_ns, @bitCast(received_ns));
         defer readset.deinit();
+
+        // Phase 2d: stream the inbound request body into the
+        // per-tenant BodyBuffer; capture the resulting BodyRef
+        // onto `readset.trigger_payload`. The inline
+        // `request_body_bytes` capture still rides alongside
+        // during the Phase 2 → Phase 3 transition (both coexist;
+        // inline drops out when the raft entry adopts the
+        // BodyRef in Phase 3). Bodies-less requests skip the
+        // append + the tape entry — channel is empty on the
+        // wire (zero entries).
+        if (body.len > 0) {
+            const tb = worker_mod.getOrOpenTenantBodies(worker, scope_inst) catch |err| blk: {
+                std.log.warn(
+                    "rove-js inbound: getOrOpenTenantBodies tenant={s}: {s}",
+                    .{ scope_inst.id, @errorName(err) },
+                );
+                break :blk null;
+            };
+            if (tb) |t| {
+                const body_ref = t.buffer.append(body) catch |err| blk: {
+                    std.log.warn(
+                        "rove-js inbound: body-buffer append tenant={s} bytes={d}: {s}",
+                        .{ scope_inst.id, body.len, @errorName(err) },
+                    );
+                    break :blk bodies_mod.BodyRef{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
+                };
+                readset.trigger_payload.appendTriggerPayload(body_ref, "") catch |err| {
+                    std.log.warn(
+                        "rove-js inbound: readset.trigger_payload append tenant={s}: {s}",
+                        .{ scope_inst.id, @errorName(err) },
+                    );
+                };
+            }
+        }
 
         // Pre-mint the request id. webhook.send derives its webhook id
         // from this (so replays produce matching ids), and captureLog

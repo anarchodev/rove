@@ -463,6 +463,15 @@ Increments:
       out when the raft entry adopts the BodyRef in Phase 3.
 - **2d — inbound bodies**: H2 DATA frames append to the buffer;
   engine emits BodyRef for the trigger payload position.
+  Shipped as channel id 6 `trigger_payload` on the tape module:
+  zero-or-one entry per dispatch carrying `(body_ref, headers)`.
+  `headers` is reserved for a follow-up capture; replay reads
+  the inbound method / path / host / wire headers from the log
+  record's dedicated fields today. Wired at the dispatch site
+  in `worker_dispatch.zig` after `Readset.init` —
+  `getOrOpenTenantBodies` + `buffer.append(body)` + the new
+  `appendTriggerPayload(body_ref, "")`. Body-less requests skip
+  the append; the channel serializes as empty.
 
 ### Phase 3 — readset in raft entry
 
