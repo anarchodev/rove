@@ -530,6 +530,40 @@ Builds on the parked-activation primitive already used by
 `effect-reification-plan.md`; the wake source is new but mechanically
 the same shape as existing continuation parking.
 
+Increments shipped:
+
+- **4 — inbound callback gating (simplest viable)**:
+  `dispatchPending` now synchronously flushes the per-tenant
+  `BodyBuffer` right after the inbound body append (slice 2d's
+  site), blocking the worker thread on the S3 PUT until the
+  bytes are durable. On flush failure: 503 + `.fault` log
+  outcome + skip the handler (no readset captured for that
+  request) — matches §6.2 partial-outage posture. Every
+  body-bearing request pays one S3 PUT RTT today; smokes
+  observe ~+30–70 ms per request against a local MinIO. The
+  param-less `Worker` thread does the work — no new
+  thread / wake / collection. Doesn't yet implement parking
+  (the worker just blocks); priority-flush coalescing across
+  a batch is a follow-up.
+
+- **4.x (open)**: fetch-chunk gating
+  (`fireFetchEventActivation`'s symmetric path). The Phase 4
+  invariant says "every body, every chunk" — currently outbound
+  fetch chunks still fire immediately and the buffer flushes
+  asynchronously on the 50ms tick. Untaped chunks survive a
+  leader crash unreplayably, same gap the inbound path just
+  closed.
+- **4.x (open)**: priority-flush coalescing
+  (plan §5.2). Multi-request dispatch batches today pay N
+  flushes for N body-bearing requests. Restructure the
+  dispatch loop to do all appends first, one flush, then run
+  handlers in a second pass — N to 1 PUT per batch.
+- **4.x (open)**: park-on-durability instead of sync block.
+  Today the worker thread waits on the S3 PUT inline; under
+  load that pins the worker. Replace with parking against a
+  per-tenant "durable past X" wake source; the flusher thread
+  fires the wake on PUT-ack.
+
 ### Phase 5 — follower tape upload + GC
 
 Followers (or any node) can serve tape upload duty: walk recent raft

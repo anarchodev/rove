@@ -2406,12 +2406,33 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // BodyRef in Phase 3). Bodies-less requests skip the
         // append + the tape entry — channel is empty on the
         // wire (zero entries).
+        // §5 callback gate: when the request has a body, append it
+        // to the per-tenant BodyBuffer AND wait synchronously for
+        // the bytes to become durable in S3 before running the
+        // handler. The invariant: a handler may not read bytes
+        // that aren't in stable storage
+        // (`docs/readset-replication-plan.md` §5.1).
+        //
+        // Performance: the flush call below is a synchronous S3
+        // PUT on the worker thread — ~5–50 ms typical. Every
+        // body-bearing request pays this cost; coalescing across
+        // multiple body-bearing requests in the same dispatch
+        // batch (plan §5.2 priority flush) is a follow-up
+        // optimization.
+        //
+        // Failure (S3 unavailable, append OOM): return 503
+        // immediately. The handler doesn't run, no readset is
+        // captured, the request is logged with `.fault`. Matches
+        // §6.2 partial-outage posture: fetch-using handlers are
+        // blocked when the backend can't accept new bytes.
+        var body_gate_failed = false;
         if (body.len > 0) {
             const tb = worker_mod.getOrOpenTenantBodies(worker, scope_inst) catch |err| blk: {
                 std.log.warn(
                     "rove-js inbound: getOrOpenTenantBodies tenant={s}: {s}",
                     .{ scope_inst.id, @errorName(err) },
                 );
+                body_gate_failed = true;
                 break :blk null;
             };
             if (tb) |t| {
@@ -2420,8 +2441,27 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         "rove-js inbound: body-buffer append tenant={s} bytes={d}: {s}",
                         .{ scope_inst.id, body.len, @errorName(err) },
                     );
+                    body_gate_failed = true;
                     break :blk bodies_mod.BodyRef{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
                 };
+                if (!body_gate_failed) {
+                    // Synchronous flush — block the worker thread until
+                    // S3 acks the PUT. `flush` releases the buffer mutex
+                    // around the slow PUT (slice 2c-1's lock-release
+                    // pattern), so other workers / the flusher tick
+                    // aren't blocked. After this call returns,
+                    // `body_ref` is durable in S3 by construction
+                    // (the batch it lives in was just published).
+                    const flush_now_ns: i64 = @intCast(std.time.nanoTimestamp());
+                    _ = t.buffer.flush(t.backend.blobStore(), flush_now_ns) catch |err| blk2: {
+                        std.log.warn(
+                            "rove-js inbound: body-buffer flush tenant={s}: {s}",
+                            .{ scope_inst.id, @errorName(err) },
+                        );
+                        body_gate_failed = true;
+                        break :blk2 0;
+                    };
+                }
                 readset.trigger_payload.appendTriggerPayload(body_ref, "") catch |err| {
                     std.log.warn(
                         "rove-js inbound: readset.trigger_payload append tenant={s}: {s}",
@@ -2429,6 +2469,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     );
                 };
             }
+        }
+        if (body_gate_failed) {
+            try respb.setSimpleResponse(server, ent, sid, sess, 503, "body durability gate failed\n", allocator);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .fault, &.{}, &.{}, .{}, null, .inbound);
+            processed += 1;
+            continue;
         }
 
         // Pre-mint the request id. webhook.send derives its webhook id
