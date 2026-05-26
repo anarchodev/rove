@@ -104,7 +104,15 @@ fn hydrateWriteSetEnvelope(
     for (parsed_list.blobs) |rs_blob| {
         const parsed = tape_mod.parseReadset(rs_blob) catch continue;
         const lh = parsed.log_header orelse continue;
-        const record = try buildLogRecord(allocator, env.instance_id, raft_seq, lh, parsed.blobs);
+        const record = try buildLogRecord(
+            allocator,
+            env.instance_id,
+            raft_seq,
+            lh,
+            parsed.seed,
+            parsed.timestamp_ns,
+            parsed.blobs,
+        );
         // On allocation failure inside buildLogRecord, errdefer in
         // the helper already freed the partial record's allocated
         // fields; the append below either succeeds or the outer
@@ -130,6 +138,8 @@ fn buildLogRecord(
     instance_id: []const u8,
     raft_seq: u64,
     lh: log_mod.LogHeader,
+    seed: u64,
+    timestamp_ns: i64,
     channel_blobs: [tape_mod.READSET_CHANNEL_COUNT][]const u8,
 ) !log_mod.LogRecord {
     const tenant_id = try allocator.dupe(u8, instance_id);
@@ -154,15 +164,16 @@ fn buildLogRecord(
     // Channel blobs aliasing into `parsed_list.blobs` aliases into
     // the raft entry bytes. The caller doesn't keep those alive past
     // this fn — dup each into the record.
-    var tapes: log_mod.TapePayloads = .{};
+    var tapes: log_mod.TapePayloads = .{
+        .seed = seed,
+        .timestamp_ns = timestamp_ns,
+    };
     errdefer tapes.deinit(allocator);
     const kv_idx: usize = @intFromEnum(tape_mod.Channel.kv);
-    const date_idx: usize = @intFromEnum(tape_mod.Channel.date);
     const module_idx: usize = @intFromEnum(tape_mod.Channel.module);
     const fetch_idx: usize = @intFromEnum(tape_mod.Channel.fetch_responses);
     const trigger_idx: usize = @intFromEnum(tape_mod.Channel.trigger_payload);
     tapes.kv_tape_bytes = try allocator.dupe(u8, channel_blobs[kv_idx]);
-    tapes.date_tape_bytes = try allocator.dupe(u8, channel_blobs[date_idx]);
     tapes.module_tree_bytes = try allocator.dupe(u8, channel_blobs[module_idx]);
     tapes.fetch_responses_tape_bytes = try allocator.dupe(u8, channel_blobs[fetch_idx]);
     tapes.trigger_payload_tape_bytes = try allocator.dupe(u8, channel_blobs[trigger_idx]);

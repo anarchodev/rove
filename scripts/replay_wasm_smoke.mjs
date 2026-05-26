@@ -39,11 +39,11 @@ const raw = JSON.parse(fs.readFileSync(bundlePath, "utf-8"));
 // The orchestrator writes tape_blobs as base64 strings (since JSON
 // can't hold raw bytes). Decode each channel to a Uint8Array; null
 // when the channel had no entries in the captured record.
-// `docs/primitive-gaps.md` §9: only kv + date + module remain on
-// the wire. `Math.random` + `crypto.*` reseed once from
-// `raw.seed`, no per-draw tape entries.
+// `docs/primitive-gaps.md` §9 + fold-in: only kv + module remain
+// on the wire. `Math.random` + `crypto.*` + `Date.now()` reseed
+// from `raw.seed` + `raw.timestamp_ns`, no per-call tape entries.
 const tape_blobs = {};
-for (const k of ["kv", "date", "module"]) {
+for (const k of ["kv", "module"]) {
     const b64 = raw.tape_blobs?.[k];
     tape_blobs[k] = b64 ? new Uint8Array(Buffer.from(b64, "base64")) : null;
 }
@@ -59,6 +59,7 @@ const arena_init           = Module.cwrap("arena_init",           "number", ["nu
 const arena_run_module     = Module.cwrap("arena_run_module",     "number", ["string","string"]);
 const arena_set_trace_mode = Module.cwrap("arena_set_trace_mode", null,     ["number"]);
 const arena_set_random_seed = Module.cwrap("arena_set_random_seed", null,   ["number","number"]);
+const arena_set_date_now   = Module.cwrap("arena_set_date_now",   null,    ["number","number"]);
 const arena_destroy        = Module.cwrap("arena_destroy",        null,     []);
 
 if (arena_init(8192, 8192) !== 0) fail("arena_init failed");
@@ -76,6 +77,17 @@ const seed_bi = BigInt(raw.seed ?? 0);
 arena_set_random_seed(
     Number(seed_bi & 0xFFFFFFFFn),
     Number((seed_bi >> 32n) & 0xFFFFFFFFn),
+);
+
+// §9 fold-in: pin `Date.now()` and `new Date()` (no args) to the
+// captured request's `timestamp_ns` (converted to ms). Both Date
+// reads inside the replay return the same scalar — matching the
+// original request's behavior.
+const ts_ns = BigInt(raw.timestamp_ns ?? 0);
+const ms_bi = ts_ns / 1_000_000n;
+arena_set_date_now(
+    Number(ms_bi & 0xFFFFFFFFn),
+    Number((ms_bi >> 32n) & 0xFFFFFFFFn),
 );
 
 const module_sources = {};

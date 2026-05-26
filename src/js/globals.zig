@@ -747,32 +747,24 @@ fn jsKvPrefix(
 
 // ── Date.now / Math.random / crypto.* ─────────────────────────────────
 //
-// These are tape-backed non-determinism sources. The MVP shape is:
-//   - Only install overrides when `DispatchState` has a matching tape.
-//     Without a tape the handler uses qjs's built-ins (qjs Math.random
-//     is a stock xoshiro, Date.now is gettimeofday, there's no crypto
-//     global). With a tape we stamp a deterministic value AND record
-//     it so replay can re-issue the same value.
-//   - Phase 4 slice 3 only does capture. Replay mode — reading values
-//     back from a `ReplaySource` — is the next slice.
-//   - `new Date()` with no args is NOT intercepted yet; handlers should
-//     use `Date.now()` for now. Overriding the constructor requires
-//     more qjs plumbing than is worth in this slice.
-
-fn jsDateNow(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    _: c_int,
-    _: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    const state = getState(ctx);
-    // Wall-clock ms. Determinism comes from the tape on replay — the
-    // live path still reads the real clock so logs of real requests
-    // show real timestamps.
-    const ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-    if (state.readset) |rs| rs.date.appendDate(ms) catch {};
-    return c.JS_NewInt64(ctx, ms);
-}
+// `docs/primitive-gaps.md` §9 + fold-in: per-request non-determinism
+// is now collapsed to two scalars in the readset header — `seed`
+// (xorshift64star PRNG) and `timestamp_ns` (Date.now / new Date()).
+// Neither has a per-call tape channel. arenajs's native
+// implementations service them via per-context state set by the
+// dispatcher in `installRequest`:
+//   - `Math.random` / crypto.* → `JS_SetRandomSeed(ctx, seed)`,
+//     reading from `js_random_state_active(ctx)`. crypto.* draws
+//     through `JS_FillRandomBytes`.
+//   - `Date.now()` / `new Date()` (no args) → `JS_SetDateNow(ctx,
+//     start_time_ms)`, reading from `ctx->date_now_pinned`. Every
+//     clock read in one request returns the same value — same
+//     posture as Cloudflare Workers / Lambda SnapStart.
+//
+// Replay reproduces by reseeding both per-context fields with the
+// captured values (`arena_set_random_seed` + `arena_set_date_now`
+// reactor exports for the WASM build, direct API calls for the
+// server build).
 
 // `docs/primitive-gaps.md` §9 — `jsMathRandom` retired. arenajs's
 // native `js_math_random` runs against the per-request
@@ -1594,12 +1586,11 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
 };
 
 const INTRINSIC_EXTENSIONS = [_]NamespaceBindings{
-    .{ .path = &.{"Date"}, .fns = &.{
-        .{ .name = "now", .cfunc = jsDateNow, .argc = 0 },
-    } },
-    // `Math.random` no longer overridden — see §9 comment above.
-    // arenajs's native implementation runs against the per-request
-    // PRNG state, seeded by `installRequest`.
+    // `docs/primitive-gaps.md` §9 + fold-in: neither `Date.now` nor
+    // `Math.random` is overridden here. arenajs's native
+    // implementations run against per-context state (`date_now_pinned`
+    // + `xorshift64star`), both reseeded once per request in
+    // `installRequest` via `JS_SetDateNow` + `JS_SetRandomSeed`.
 };
 
 const GLOBAL_BUILTINS = [_]FnBinding{
@@ -1751,6 +1742,20 @@ pub fn installRequest(
     // `1` internally — xorshift64 requires non-zero state).
     const seed: u64 = if (state.readset) |rs| rs.seed else 0;
     c.JS_SetRandomSeed(ctx, seed);
+
+    // `docs/primitive-gaps.md` §9 fold-in — pin Date.now() to the
+    // request's start time in ms. Every `Date.now()` and `new Date()`
+    // (no args) inside the handler returns this scalar — same
+    // posture as Cloudflare Workers / Lambda SnapStart, and the
+    // single input replay needs to reproduce the clock sequence
+    // (no per-call tape entries). Test paths without a readset
+    // pass `-1` which unpins (arenajs falls through to
+    // gettimeofday).
+    const date_now_ms: i64 = if (state.readset) |rs|
+        @divTrunc(rs.timestamp_ns, std.time.ns_per_ms)
+    else
+        -1;
+    c.JS_SetDateNow(ctx, date_now_ms);
 
     const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);

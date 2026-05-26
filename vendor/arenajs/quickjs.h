@@ -574,6 +574,14 @@ JS_EXTERN void JS_SetRandomSeed(JSContext *ctx, uint64_t seed);
  * recorded request seed. See docs/primitive-gaps.md §9 in rove. */
 JS_EXTERN void JS_FillRandomBytes(JSContext *ctx, void *out, size_t out_len);
 JS_EXTERN void JS_SetTimeOrigin(JSContext *ctx, double time_origin_ms);
+/* Pin Date.now() to a fixed value (UTC ms since epoch). Every
+ * subsequent Date.now() call on this context returns this value;
+ * `new Date()` with no args uses it too. Pass a negative value to
+ * unpin and return to gettimeofday-based reads. Embedders use
+ * this to make the per-request Date.now sequence deterministic —
+ * customer log lines all share one wall-clock instant within a
+ * request. See docs/primitive-gaps.md §9 fold-in in rove. */
+JS_EXTERN void JS_SetDateNow(JSContext *ctx, int64_t date_now_ms);
 JS_EXTERN int JS_AddIntrinsicDOMException(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicAToB(JSContext *ctx);
 

@@ -621,6 +621,12 @@ struct JSContext {
 
     uint64_t random_state;
 
+    /* arena: when >= 0, Date.now() and new Date() (no args) return
+       this fixed value instead of reading the system clock. Set per
+       request via JS_SetDateNow. Default -1 (unpinned). See
+       docs/primitive-gaps.md §9 fold-in in rove. */
+    int64_t date_now_pinned;
+
     /* when the counter reaches zero, JSRutime.interrupt_handler is called */
     int interrupt_counter;
 
@@ -55960,8 +55966,16 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
     return js_new_string8_len(ctx, buf, pos);
 }
 
-/* OS dependent: return the UTC time in ms since 1970. */
-static int64_t date_now(void) {
+/* OS dependent: return the UTC time in ms since 1970.
+   arena: when the context has a pinned value (set via
+   JS_SetDateNow), return that instead — embedders use this to make
+   Date.now() deterministic per request. ctx may be NULL on rare
+   bootstrap paths where the date_now value isn't load-bearing
+   (e.g. helper functions called before context setup); we fall
+   through to gettimeofday in that case. */
+static int64_t date_now(JSContext *ctx) {
+    if (ctx && ctx->date_now_pinned >= 0)
+        return ctx->date_now_pinned;
     return js__gettimeofday_us() / 1000;
 }
 
@@ -55979,7 +55993,7 @@ static JSValue js_date_constructor(JSContext *ctx, JSValueConst new_target,
     }
     n = argc;
     if (n == 0) {
-        val = date_now();
+        val = date_now(ctx);
     } else if (n == 1) {
         JSValue v, dv;
         if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_OBJECT) {
@@ -56523,7 +56537,7 @@ static JSValue js_Date_now(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
     // now()
-    return js_int64(date_now());
+    return js_int64(date_now(ctx));
 }
 
 static JSValue js_date_Symbol_toPrimitive(JSContext *ctx, JSValueConst this_val,
@@ -57259,6 +57273,9 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
 
     /* Math: create as autoinit object */
     js_random_init(ctx);
+    /* arena: Date.now() unpinned by default; embedders call
+       JS_SetDateNow to make per-request Date.now deterministic. */
+    ctx->date_now_pinned = -1;
     if (JS_SetPropertyFunctionList(ctx, ctx->global_obj, js_math_obj, countof(js_math_obj)))
         return -1;
 
@@ -61152,6 +61169,11 @@ int JS_AddPerformance(JSContext *ctx)
 void JS_SetTimeOrigin(JSContext *ctx, double time_origin_ms)
 {
     ctx->time_origin = time_origin_ms;
+}
+
+void JS_SetDateNow(JSContext *ctx, int64_t date_now_ms)
+{
+    ctx->date_now_pinned = date_now_ms;
 }
 
 /* Equality comparisons and sameness */

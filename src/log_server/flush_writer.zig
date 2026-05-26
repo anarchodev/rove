@@ -336,19 +336,20 @@ fn writeTapePayloads(
     t: *const log_mod.TapePayloads,
 ) !void {
     try w.writeByte('{');
-    // `docs/primitive-gaps.md` §9 seed-not-draws: the PRNG seed
+    // `docs/primitive-gaps.md` §9 + fold-in: per-request scalars
     // used at capture time. Replay reseeds the per-context PRNG
-    // with this scalar so `Math.random` + `crypto.*` reproduce the
-    // exact draw sequence — no per-draw tape entries.
+    // with `seed` and pins `Date.now()` to
+    // `@divTrunc(timestamp_ns, ns_per_ms)` so `Math.random` /
+    // `crypto.*` / `Date.now()` / `new Date()` reproduce the
+    // captured sequences — no per-draw or per-call tape entries.
     //
-    // Emitted as a JSON string so the consumer can BigInt() it
-    // without precision loss: production seeds derive from
+    // Both emitted as JSON strings so the consumer can BigInt()
+    // them without precision loss: production values derive from
     // wall-clock ns (~1.7e18) which overflows JS's f64 Number at
     // 2^53. JSON.parse → Number truncates the low bits; reading a
     // string + BigInt() is precise.
-    try w.print("\"seed\":\"{d}\"", .{t.seed});
+    try w.print("\"seed\":\"{d}\",\"timestamp_ns\":\"{d}\"", .{ t.seed, t.timestamp_ns });
     try writeBytesField(allocator, w, "kv_tape_b64", t.kv_tape_bytes, false);
-    try writeBytesField(allocator, w, "date_tape_b64", t.date_tape_bytes, false);
     try writeBytesField(allocator, w, "module_tree_b64", t.module_tree_bytes, false);
     try writeBytesField(allocator, w, "fetch_responses_tape_b64", t.fetch_responses_tape_bytes, false);
     try writeBytesField(allocator, w, "trigger_payload_tape_b64", t.trigger_payload_tape_bytes, false);

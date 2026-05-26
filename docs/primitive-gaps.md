@@ -922,7 +922,7 @@ onto them:
 | Channel | Today | Minimal form | Kind | Section |
 |---|---|---|---|---|
 | `kv` | foreign gets/prefixes only | foreign gets/prefixes only | read set | §8 ✅ |
-| `date` | every `Date.now` | timestamp value (i64) | timestamp | — |
+| `date` | — (deleted) | pinned `timestamp_ns` scalar | timestamp | §9 fold-in ✅ |
 | `math_random` | — (deleted) | one per-request seed | seed | §9 ✅ |
 | `crypto_random` | — (deleted) | one seed | seed | §9 ✅ |
 | `module` | specifier → bytecode hash | unchanged — already a hash | CAS extent | §7 |
@@ -934,10 +934,16 @@ xorshift64star is seeded once per request via
 `crypto.getRandomValues` / `randomUUID` / `randomBytes` draw from
 the same state via `JS_FillRandomBytes`. Replay reseeds with the
 captured request's seed via `arena_set_random_seed` (cwrapped from
-the WASM build) — no per-draw entries, no host callouts. The
-remaining wire channels are `kv` + `date` + `module` +
-`fetch_responses` + `trigger_payload` (5 channels, READSET_VERSION
-3).
+the WASM build) — no per-draw entries, no host callouts.
+
+§9 fold-in (same day): `date` was retired as a tape channel too.
+`Date.now()` and `new Date()` (no args) are pinned per-request via
+arenajs's new `JS_SetDateNow` API — every call within one request
+returns `@divTrunc(readset.timestamp_ns, ns_per_ms)`. Same posture
+as Cloudflare Workers / Lambda SnapStart. Replay pins via the WASM
+reactor's `arena_set_date_now` export. The remaining wire
+channels are `kv` + `module` + `fetch_responses` +
+`trigger_payload` (4 channels, READSET_VERSION 4).
 
 By the §7.2 mechanism axis: the read set and the timestamp are
 **direct values** — recorded inline, irreducibly; a clock read is
