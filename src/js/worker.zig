@@ -2326,15 +2326,20 @@ pub fn Worker(comptime opts: Options) type {
         fn flusherLoop(self: *Self) void {
             const FLUSHER_TICK_NS: u64 = 50 * std.time.ns_per_ms;
             while (!self.flusher_should_stop.load(.acquire)) {
+                // Phase 4 park-on-durability: bodies flush FIRST.
+                // `dispatchPending`'s priority-flush wake is the
+                // dominant `flusher_wake.set()` caller now, and
+                // every parked entity blocks until its body's
+                // batch lands in S3. Running flushLogs ahead of
+                // flushBodiesTick added that PUT's RTT (~30–100 ms)
+                // to every parked dispatch's handler-run latency.
+                // Reordered so bodies PUT unblocks parked
+                // entities while logs continue piggy-backing the
+                // 50 ms tick (slice 4-park-2).
+                worker_bodies.flushBodiesTick(self);
                 _ = worker_log.flushLogs(self) catch |err| {
                     std.log.warn("rove-js flusher: flushLogs failed: {s}", .{@errorName(err)});
                 };
-                // Phase 2c: piggyback the per-tenant body-buffer
-                // flush on the same 50ms tick. Walks
-                // `tenant_bodies`, flushes each buffer that hit
-                // a size / time threshold; PUT happens here, off
-                // the worker hot path.
-                worker_bodies.flushBodiesTick(self);
                 self.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
                 self.flusher_wake.reset();
             }

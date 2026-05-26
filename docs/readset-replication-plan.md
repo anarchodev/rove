@@ -532,19 +532,16 @@ the same shape as existing continuation parking.
 
 Increments shipped:
 
-- **4 — inbound callback gating (simplest viable)**:
-  `dispatchPending` now synchronously flushes the per-tenant
-  `BodyBuffer` right after the inbound body append (slice 2d's
-  site), blocking the worker thread on the S3 PUT until the
-  bytes are durable. On flush failure: 503 + `.fault` log
-  outcome + skip the handler (no readset captured for that
-  request) — matches §6.2 partial-outage posture. Every
-  body-bearing request pays one S3 PUT RTT today; smokes
-  observe ~+30–70 ms per request against a local MinIO. The
-  param-less `Worker` thread does the work — no new
-  thread / wake / collection. Doesn't yet implement parking
-  (the worker just blocks); priority-flush coalescing across
-  a batch is a follow-up.
+- **4 — inbound callback gating (sync-block, superseded by
+  4-park)**: original shape — `dispatchPending` synchronously
+  flushed the per-tenant `BodyBuffer` right after the inbound
+  body append, blocking the worker thread on the S3 PUT until
+  the bytes were durable. On flush failure: 503 + `.fault`
+  log outcome + skip the handler. Replaced by 4-park (below)
+  because the sync block pinned the worker thread on every
+  body-bearing dispatch, blocking concurrent requests on the
+  same worker. Failure handling (503 + `.fault`) carries
+  forward unchanged.
 
 - **4.x (open)**: fetch-chunk gating
   (`fireFetchEventActivation`'s symmetric path). The Phase 4
@@ -553,16 +550,37 @@ Increments shipped:
   asynchronously on the 50ms tick. Untaped chunks survive a
   leader crash unreplayably, same gap the inbound path just
   closed.
+- **4-park (shipped)**: park-on-durability replaces the sync
+  block. New `BodyDurabilityWait` component (sibling to
+  `RaftWait`) and `body_pending` collection on `Worker`. On
+  fresh dispatch with a body: append to BodyBuffer, set the
+  component with the `BodyRef` + tenant id, `reg.move` to
+  `body_pending`, signal `flusher_wake` (priority flush),
+  worker continues with the next entity — no S3 RTT on the
+  worker hot path. `drainBodyPending` (run at the top of every
+  main-loop tick) checks each parked entity's
+  `BodyRef.batch_id` against the tenant buffer's
+  `last_flushed_batch_id` and moves durable ones back to
+  `request_out`. dispatchPending detects the non-sentinel
+  component on resume and uses the saved `body_ref` directly
+  (no re-append → no re-park cycle). Flusher loop reordered
+  to flush bodies before logs so the priority wake unblocks
+  parked entities immediately, not behind a log PUT.
+
+  Per-request latency for an isolated body POST goes UP vs
+  the sync-block predecessor (smokes observe ~80 ms vs
+  ~40 ms) due to thread coordination + flusher cycle
+  overhead. The win is that the **worker thread no longer
+  stalls**: concurrent requests on the same worker are
+  served while a parked request's body is in flight.
+
 - **4.x (open)**: priority-flush coalescing
-  (plan §5.2). Multi-request dispatch batches today pay N
-  flushes for N body-bearing requests. Restructure the
-  dispatch loop to do all appends first, one flush, then run
-  handlers in a second pass — N to 1 PUT per batch.
-- **4.x (open)**: park-on-durability instead of sync block.
-  Today the worker thread waits on the S3 PUT inline; under
-  load that pins the worker. Replace with parking against a
-  per-tenant "durable past X" wake source; the flusher thread
-  fires the wake on PUT-ack.
+  (plan §5.2). Multi-request dispatch batches today still
+  issue N S3 PUTs for N body-bearing tenants. With park, the
+  per-tenant buffer naturally coalesces N appends FOR THE SAME
+  TENANT into one PUT (no per-request flush). Cross-tenant
+  coalescing into a single batch object would require a
+  different blob layout — out of scope for now.
 
 ### Phase 5 — follower tape upload + GC
 
