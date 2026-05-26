@@ -165,6 +165,7 @@ pub fn captureTapesForChain(
         .{ .tape = &readset.math_random, .out = &payloads.math_random_tape_bytes },
         .{ .tape = &readset.crypto_random, .out = &payloads.crypto_random_tape_bytes },
         .{ .tape = &readset.module, .out = &payloads.module_tree_bytes },
+        .{ .tape = &readset.fetch_responses, .out = &payloads.fetch_responses_tape_bytes },
     };
 
     for (channels) |ch| {
@@ -187,7 +188,8 @@ pub fn captureTapesForChain(
             payloads.date_tape_bytes.len +
             payloads.math_random_tape_bytes.len +
             payloads.crypto_random_tape_bytes.len +
-            payloads.module_tree_bytes.len;
+            payloads.module_tree_bytes.len +
+            payloads.fetch_responses_tape_bytes.len;
         if (total > 0 and chainTapeChargeAndCheck(worker.node, cid, total)) {
             std.log.warn(
                 "rove-js tape cap: chain {s} exceeded {d} bytes; subsequent activations record summary-only (catalog §6)",
@@ -201,6 +203,7 @@ pub fn captureTapesForChain(
             if (payloads.math_random_tape_bytes.len > 0) allocator.free(payloads.math_random_tape_bytes);
             if (payloads.crypto_random_tape_bytes.len > 0) allocator.free(payloads.crypto_random_tape_bytes);
             if (payloads.module_tree_bytes.len > 0) allocator.free(payloads.module_tree_bytes);
+            if (payloads.fetch_responses_tape_bytes.len > 0) allocator.free(payloads.fetch_responses_tape_bytes);
             payloads = .{};
         }
     }

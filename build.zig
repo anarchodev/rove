@@ -166,6 +166,10 @@ pub fn build(b: *std.Build) void {
     });
     tape_mod.addImport("rove-log", log_mod);
     tape_mod.addImport("rove-blob", blob_mod);
+    // Readset's `fetch_responses` channel records `BodyRef` values
+    // pointing into the per-tenant readset-blob store
+    // (`docs/readset-replication-plan.md` Phase 2c-2).
+    tape_mod.addImport("rove-bodies", bodies_mod);
     // rove-kv is only used in bundle.zig's tests (to open a fresh
     // LogStore). Production bundle code never touches kv directly.
     tape_mod.addImport("rove-kv", kv_mod);
