@@ -446,7 +446,6 @@ Every additive proposal preserves:
 - The **strike posture** (resource-bound, deadline-bound,
   fail-fast on abuse — `connection_holder_security` /
   `streaming-handlers-plan.md` §9.2).
-- The **bounded tape per chain** discipline (see §6 below).
 
 Any future proposal that violates one of these is by definition not
 in this list; it's a §7/§10.1-style locked decision that has to be
@@ -454,58 +453,42 @@ relitigated explicitly.
 
 ---
 
-## 6. Bounded tape per chain
+## 6. Bounded tape per chain — **CONSIDERED AND REMOVED 2026-05-26**
 
-Replay determinism is a property of inputs being *recorded*, not of
-inputs being recordable *forever*. Some primitives produce
-unbounded per-chain tape (a streaming upstream fetch's per-chunk
-activations; a held outbound subscription's perpetual frames; a
-runaway handler in a long-lived chain). Without a bound, those
-classes either drown the replay store in cost or force special-
-case "this primitive is non-replayable" carve-outs that erode the
-"deterministic where it can be" stance.
+The original framing was: streaming primitives can produce
+unbounded per-`correlation_id` tape (LLM proxies, held outbound
+subscriptions); without a per-chain byte budget those classes
+either drown the replay store in cost or force "non-replayable"
+carve-outs. The mechanism shipped briefly: a sharded
+`NodeState.tape_state_shards` map (correlation_id →
+`{bytes_used, capped, last_touch_seq}`), 10 MB default, sharded
+16-way after a ~4× regression on 8w sharded writes when a single
+global mutex was tried.
 
-The bound: **per-chain tape budget** (bytes + entry count), shared
-across all activations of one `correlation_id`. Default
-~10 MB / ~50k entries; operator-tunable per tenant. Implementation
-on `NodeState` (cross-worker map keyed by correlation_id; mutex-
-protected) with LRU GC of stale chain entries.
+**Why removed.** Per-chain activation throughput is bounded by
+sequential commit latency (~ms per activation, i.e. low hundreds
+to ~1k activations/sec). Aggregate normal traffic across many
+independent chains outpaces any single chain by 2–3 orders of
+magnitude, so the dominant driver of replay-store cost is total
+tenant volume, not pathological chains. The cap was solving a
+narrow worst-case (one chain hours-long enough to accumulate
+hundreds of thousands of small activations) at the price of a
+node-wide map + mutex traffic on the dispatch hot path. The
+benefit was real but small; the storage-cost lever lives one
+level up.
 
-**When the cap fires:**
-- A one-shot `tape_cap_reached` marker on the activation that hit
-  it (records seq + cause).
-- Subsequent activations of the same chain flush log records
-  *without* tape payloads (the log record itself still records:
-  request metadata, status, console, exceptions — just no
-  reproducible-inputs).
-- Replay shell shows the chain as **fully replayable up to seq
-  N**, **summary-only after**. Per-activation handlers past the
-  cap don't re-run during replay — the shell marks them
-  "execution past cap — input unavailable" with a path for the
-  customer to re-fetch from blob (if bytes were content-
-  addressed) or supply a synthetic stub.
+**What replaces it.** Per-tenant retention / sampling
+(originally specced as v2's `tape_mode` knob: `always` |
+`on_exception` | `sampled` | `never`). That knob addresses the
+actual cost driver — *total* tape stored per tenant — and
+composes cleanly with a plan-level retention cap. It is **not
+shipped yet** and is the right place to add cost control when
+storage bills earn the optionality.
 
-**What this unblocks:**
-- Streaming primitives (Gap 2.3, 2.5) stop being special-cased.
-  LLM proxy chains stay under the cap (~30 KB tape per
-  ~3000-chunk fetch); firehose consumers hit the cap quickly and
-  degrade gracefully. Both replay-strategies converge on "same
-  cap, same overflow marker, same summary fallback."
-- The `connection-actor-plan.md` §8 content-addressed-large-bytes
-  pattern remains: chunk bytes go to blob; tape carries the hash.
-  The cap counts hash-bytes (~50 each), not chunk bodies, so blob
-  cost is separate from tape cost — each scales independently.
-
-**Capture mode (deferred to v2).** When concrete storage-cost
-feedback arrives, the catalog grows a per-tenant `tape_mode` knob
-(`always` | `on_exception` | `sampled` | `never`) that decides
-*whether* to persist the scratch tape post-activation, not *how
-much* to record. The cap addresses runaway recording (correctness/
-safety); capture mode addresses long-term storage cost
-(observability/coverage tradeoff). They compose orthogonally —
-cap operates during the activation; capture mode operates at
-activation boundary. v1 ships the cap; v2 adds capture mode when
-the storage bill earns the optionality.
+**What remains.** Content-addressed-large-bytes is still the
+right pattern (`connection-actor-plan.md` §8): chunk bytes go to
+blob, tape carries the hash. This was independent of the cap;
+§7 below builds on it directly.
 
 ---
 
@@ -611,9 +594,10 @@ one.
 The one real obligation is the retention coupling: a blob
 referenced by a live tape must be pinned against GC. `rove-files`
 already does refcount-pinned snapshots (`TenantFilesSnapshot`),
-so this is a refcount edge, not new infrastructure. §6's
-per-chain budget bounds *pointer* bytes; blob retention is the
-separate axis §6 already named.
+so this is a refcount edge, not new infrastructure. Tape size
+(pointer bytes) and blob retention are separate axes — the
+former scales with hash entries, the latter with the bytes those
+hashes name.
 
 **Chunk-boundary determinism splits by pattern.** Boundaries are
 network-timing-non-deterministic.
@@ -642,7 +626,7 @@ length}` + optional boundary-offset list for Pattern A);
 transport-layer recording hook in the `pipe_to` path (no
 activation); refcount edge from live tape → blob; per-call opt-in
 flag + local-hash-then-async-flush staging buffer for Tier 3. The
-replay shell's "re-fetch from blob" affordance (§6) generalizes
+replay shell's "re-fetch from blob" affordance generalizes
 to "resolve extent from CAS." No Msg/Cmd surface change; no
 customer JS surface change beyond the Tier-3 flag.
 
@@ -832,8 +816,8 @@ follow-up, not v1 scope.
 **Blast radius.** Capture: one writeset-membership check on the
 `.get` path, remove `.set` / `.delete` appends. Replay: a
 writeset overlay in the replay engine + get-resolution order.
-Tape size drops — and §6's per-chain budget now counts a
-genuinely minimal set. The `KvOp.set` / `.delete` wire variants
+Tape size drops to a genuinely minimal set, which matters when
+the per-tenant retention/sampling lever (§6) eventually ships. The `KvOp.set` / `.delete` wire variants
 stay readable for old tapes but stop being written. No customer
 surface change.
 

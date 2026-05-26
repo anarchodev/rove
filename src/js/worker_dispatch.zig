@@ -2754,7 +2754,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // replay shell uses to re-run the request up to the same
             // failure mode (e.g. step through the same kv reads to see
             // why the handler hit the CPU budget).
-            const tape_payloads = worker_mod.captureTapesForChain(worker, &readset, body, correlation_id);
+            const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, correlation_id, .inbound, 0);
             processed += 1;
             continue;
@@ -2905,7 +2905,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // any tape-consuming expression baked into the throw
             // message (e.g. `Date.now()`) resolves to the same value
             // it did originally.
-            const tape_payloads = worker_mod.captureTapesForChain(worker, &readset, body, correlation_id);
+            const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads, correlation_id, .inbound, 0);
             processed += 1;
             continue;
@@ -2923,7 +2923,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // Preserve whatever tapes the handler captured before
             // the kv error — lets replay reach the same failure
             // point with the same prior reads.
-            const tape_payloads = worker_mod.captureTapesForChain(worker, &readset, body, correlation_id);
+            const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
             worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, correlation_id, .inbound, 0);
             processed += 1;
             continue;
@@ -2988,7 +2988,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // ride inline in the next ndjson flush. Inbound `body` is
         // included for replay; the outbound response is NOT — replay
         // re-produces it deterministically from (body, tapes, source).
-        const tape_payloads = worker_mod.captureTapesForChain(worker, &readset, body, correlation_id);
+        const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
 
         // Phase 3d: serialize this request's readset and append to
         // the batch's list. finalizeBatch wraps the collected blobs

@@ -32,17 +32,6 @@ const tenant_mod = @import("rove-tenant");
 const worker_mod = @import("worker.zig");
 const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
 const TenantLog = worker_mod.TenantLog;
-const NodeState = worker_mod.NodeState;
-const TapeStateShard = worker_mod.TapeStateShard;
-const TAPE_CAP_BYTES_PER_CHAIN = worker_mod.TAPE_CAP_BYTES_PER_CHAIN;
-const TAPE_STATE_SHARDS = worker_mod.TAPE_STATE_SHARDS;
-
-// Per-shard cap derived from the public node-wide cap. Re-derived here
-// so worker.zig can keep `TAPE_STATE_LRU_CAP_PER_SHARD` private — the
-// derivation is trivial and the per-shard view is a log-capture
-// internal detail.
-const TAPE_STATE_LRU_CAP_PER_SHARD: u32 =
-    worker_mod.TAPE_STATE_LRU_CAP / @as(u32, @intCast(TAPE_STATE_SHARDS));
 
 // ── Tenant-log open/free ──────────────────────────────────────────────
 
@@ -96,7 +85,7 @@ pub fn getOrOpenTenantLog(
 // four channels (kv / module / fetch_responses / trigger_payload);
 // the worker allocates one per dispatch, hands its pointer to the
 // dispatcher via `Request.readset`, then serializes + flushes the
-// non-empty channels via `captureTapesForChain*` below.
+// non-empty channels via `captureTapes*` below.
 // `Math.random` / `crypto.*` / `Date.now` no longer have dedicated
 // channels (§9 + fold-in); the readset's `seed` + `timestamp_ns`
 // scalars are stamped onto arenajs's per-context state by the
@@ -129,35 +118,12 @@ pub fn captureTapes(
     readset: *tape_mod.Readset,
     request_body: []const u8,
 ) log_mod.TapePayloads {
-    return captureTapesForChain(worker, readset, request_body, null);
-}
-
-/// `captureTapes` variant that honors the per-chain tape budget
-/// (`docs/primitive-gaps.md` §6). `correlation_id == null` skips
-/// the cap (test paths, anonymous-chain dispatch); a non-null id
-/// consults `NodeState.tape_state_shards` and returns empty payloads
-/// once the chain has exceeded `TAPE_CAP_BYTES_PER_CHAIN`. One-
-/// shot warning + log marker emitted on the activation that
-/// trips the cap.
-pub fn captureTapesForChain(
-    worker: anytype,
-    readset: *tape_mod.Readset,
-    request_body: []const u8,
-    correlation_id: ?[]const u8,
-) log_mod.TapePayloads {
     const allocator = worker.allocator;
 
     var payloads: log_mod.TapePayloads = .{
         .seed = readset.seed,
         .timestamp_ns = readset.timestamp_ns,
     };
-
-    // §6 cap pre-check: if the chain is already capped, skip
-    // serialize entirely. Saves the CPU + transient bytes for
-    // chains that already hit their budget on a prior activation.
-    if (correlation_id) |cid| {
-        if (chainTapeAlreadyCapped(worker.node, cid)) return payloads;
-    }
 
     const channels = [_]struct {
         tape: *tape_mod.Tape,
@@ -176,39 +142,6 @@ pub fn captureTapesForChain(
             continue;
         };
         ch.out.* = bytes;
-    }
-
-    // §6 cap post-serialize: charge this activation's tape bytes
-    // against the chain budget. If we crossed, mark the chain
-    // capped + drop THIS activation's payloads too (so the cap
-    // fires uniformly — no half-recorded activation that
-    // straddles the boundary).
-    if (correlation_id) |cid| {
-        const total =
-            payloads.kv_tape_bytes.len +
-            payloads.module_tree_bytes.len +
-            payloads.fetch_responses_tape_bytes.len +
-            payloads.trigger_payload_tape_bytes.len;
-        if (total > 0 and chainTapeChargeAndCheck(worker.node, cid, total)) {
-            std.log.warn(
-                "rove-js tape cap: chain {s} exceeded {d} bytes; subsequent activations record summary-only (catalog §6)",
-                .{ cid, TAPE_CAP_BYTES_PER_CHAIN },
-            );
-            // Drop this activation's payloads to keep the cap
-            // boundary clean — same posture as the §9.4
-            // wake-overflow ring (no half-recorded entries).
-            if (payloads.kv_tape_bytes.len > 0) allocator.free(payloads.kv_tape_bytes);
-            if (payloads.module_tree_bytes.len > 0) allocator.free(payloads.module_tree_bytes);
-            if (payloads.fetch_responses_tape_bytes.len > 0) allocator.free(payloads.fetch_responses_tape_bytes);
-            if (payloads.trigger_payload_tape_bytes.len > 0) allocator.free(payloads.trigger_payload_tape_bytes);
-            // Preserve the seed + timestamp — even when tape bytes
-            // are capped, replay still needs them to seed the PRNG
-            // and pin Date.now correctly.
-            payloads = .{
-                .seed = readset.seed,
-                .timestamp_ns = readset.timestamp_ns,
-            };
-        }
     }
 
     // Request body — captured into the log record so the replay
@@ -234,28 +167,21 @@ pub fn captureTapesForChain(
     return payloads;
 }
 
-/// `captureTapesForChain` + activation-input bytes capture
-/// (effect-reification Phase 2D). Used by activations whose Msg
-/// payload carries bytes the handler reads as
-/// `request.activation.bytes` — today only `fetch_chunk`. The
-/// activation bytes ride `TapePayloads.activation_bytes` (capped at
-/// `REQUEST_BODY_CAP`, mirroring the body capture). L3 (algebra):
-/// closes worklist #1 — every Msg is recorded, including its bytes.
-pub fn captureTapesForChainWithActivation(
+/// `captureTapes` + activation-input bytes capture (effect-reification
+/// Phase 2D). Used by activations whose Msg payload carries bytes the
+/// handler reads as `request.activation.bytes` — today only
+/// `fetch_chunk`. The activation bytes ride
+/// `TapePayloads.activation_bytes` (capped at `REQUEST_BODY_CAP`,
+/// mirroring the body capture). L3 (algebra): closes worklist #1 —
+/// every Msg is recorded, including its bytes.
+pub fn captureTapesWithActivation(
     worker: anytype,
     readset: *tape_mod.Readset,
     request_body: []const u8,
-    correlation_id: ?[]const u8,
     activation_bytes: []const u8,
 ) log_mod.TapePayloads {
-    var payloads = captureTapesForChain(worker, readset, request_body, correlation_id);
+    var payloads = captureTapes(worker, readset, request_body);
     if (activation_bytes.len == 0) return payloads;
-    // Honor the cap. If the chain just got capped on the
-    // request-side capture, skip activation bytes too — match the
-    // §6 "uniform boundary" posture (no half-recorded activation).
-    if (correlation_id) |cid| {
-        if (chainTapeAlreadyCapped(worker.node, cid)) return payloads;
-    }
     const allocator = worker.allocator;
     const captured_len = @min(activation_bytes.len, REQUEST_BODY_CAP);
     if (allocator.dupe(u8, activation_bytes[0..captured_len])) |captured| {
@@ -265,101 +191,6 @@ pub fn captureTapesForChainWithActivation(
         std.log.warn("rove-js activation-bytes capture failed: {s}", .{@errorName(err)});
     }
     return payloads;
-}
-
-fn tapeStateShardFor(node: *NodeState, correlation_id: []const u8) *TapeStateShard {
-    const h = std.hash.Wyhash.hash(0, correlation_id);
-    return &node.tape_state_shards[h & (TAPE_STATE_SHARDS - 1)];
-}
-
-/// `docs/primitive-gaps.md` §6: read-side cap probe. Returns true
-/// iff this chain has already exceeded its budget on a prior
-/// activation. Cheap (one mutex + lookup); no eviction. Hot path:
-/// runs on every inbound activation, so the mutex is sharded
-/// (see `TAPE_STATE_SHARDS`).
-fn chainTapeAlreadyCapped(node: *NodeState, correlation_id: []const u8) bool {
-    const shard = tapeStateShardFor(node, correlation_id);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
-    const entry = shard.map.getPtr(correlation_id) orelse return false;
-    return entry.capped;
-}
-
-/// `docs/primitive-gaps.md` §6: charge `bytes` to the chain's tape
-/// budget; return true iff this charge crossed the cap (caller is
-/// the activation that tripped it). Subsequent calls on the same
-/// chain see `capped = true` via `chainTapeAlreadyCapped` and
-/// short-circuit.
-///
-/// Also opportunistically evicts the LRU-oldest entry when the
-/// map exceeds `TAPE_STATE_LRU_CAP`. Eviction is best-effort —
-/// dropping a chain entry just resets its tracked bytes (the
-/// chain re-accumulates from zero), which is the same posture as
-/// the §9.4 ring's "we drop oldest under pressure" stance.
-fn chainTapeChargeAndCheck(node: *NodeState, correlation_id: []const u8, bytes: usize) bool {
-    const shard = tapeStateShardFor(node, correlation_id);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
-
-    // Use the shard map's `count` as a stand-in for monotonic
-    // time — it advances on insertions, and the LRU we'd cull is
-    // the entry with the smallest `last_touch_seq`. Cheap; no
-    // global-counter contention.
-    const touch_seq: u64 = @intCast(shard.map.count() + 1);
-
-    if (shard.map.getPtr(correlation_id)) |entry| {
-        if (entry.capped) return false; // already past cap; this fn isn't the tripper
-        entry.bytes_used += bytes;
-        entry.last_touch_seq = touch_seq;
-        if (entry.bytes_used > TAPE_CAP_BYTES_PER_CHAIN) {
-            entry.capped = true;
-            return true; // we tripped it
-        }
-        return false;
-    }
-
-    // First-sight: insert. May fail under OOM; on failure we fall
-    // through to "no tracking" (cap is best-effort observability
-    // protection, not correctness).
-    const key_copy = node.allocator.dupe(u8, correlation_id) catch return false;
-    shard.map.put(node.allocator, key_copy, .{
-        .bytes_used = bytes,
-        .capped = bytes > TAPE_CAP_BYTES_PER_CHAIN,
-        .last_touch_seq = touch_seq,
-    }) catch {
-        node.allocator.free(key_copy);
-        return false;
-    };
-
-    // Opportunistic LRU eviction: if this shard crossed its slice
-    // of the cap on this insert, drop the entry with the smallest
-    // last_touch_seq within the shard. O(N_shard) scan but only
-    // triggered at the boundary.
-    if (shard.map.count() > TAPE_STATE_LRU_CAP_PER_SHARD) {
-        evictOldestTapeState(node, shard);
-    }
-
-    return bytes > TAPE_CAP_BYTES_PER_CHAIN; // single huge activation
-}
-
-fn evictOldestTapeState(node: *NodeState, shard: *TapeStateShard) void {
-    // Caller holds `shard.mutex`.
-    var oldest_key: ?[]const u8 = null;
-    var oldest_seq: u64 = std.math.maxInt(u64);
-    var it = shard.map.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.last_touch_seq < oldest_seq) {
-            oldest_seq = kv.value_ptr.last_touch_seq;
-            oldest_key = kv.key_ptr.*;
-        }
-    }
-    if (oldest_key) |k| {
-        // fetchRemove transfers ownership of the key buffer to
-        // the caller so we can free it after the map drops it.
-        if (shard.map.fetchRemove(k)) |removed| {
-            node.allocator.free(removed.key);
-        }
-    }
 }
 
 // ── Log record capture ────────────────────────────────────────────────

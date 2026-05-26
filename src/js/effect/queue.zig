@@ -28,7 +28,7 @@
 //! ## Taping
 //!
 //! Algebra L3 ("every Msg is a recorded input") is satisfied by
-//! per-dispatch-site taping via `captureTapesForChain*` — the
+//! per-dispatch-site taping via `captureTapes*` — the
 //! existing inbound-HTTP tape mechanism (kv/date/random/module
 //! channels plus activation_bytes for chunk variants). The
 //! pre-handler hook contemplated in early drafts wasn't needed:
@@ -116,7 +116,7 @@ pub const MsgQueue = struct {
 };
 
 /// The single in-thread Msg ingress. **L3 (algebra)** is satisfied
-/// by per-dispatch-site taping (`captureTapesForChain*`) — see the
+/// by per-dispatch-site taping (`captureTapes*`) — see the
 /// top-of-file Taping section.
 ///
 /// On `error.Full` the caller owns the Msg and must `freeOwnedMsg`
