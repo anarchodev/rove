@@ -706,11 +706,36 @@ Increments (planned, smallest-first):
     hoists `var fw_seq: u64 = 0` outside its `if (wrote)` block so
     the unified post-block captureLog stamps the seq on the wrote
     branch and 0 on the read-only branch.
-- **5c — promotion-time tape upload walk**: on leadership stabilize,
-  the new leader walks raft entries from `last_uploaded_seq + 1`,
-  hydrates each readset's tape + LogHeader into a LogRecord, and
-  pushes through the existing log-server pipeline. Closes the
-  leader-crash unreplayability gap end-to-end.
+- **5c — promotion-time tape upload walk (shipped)**: the leader's
+  first worker (`log_worker_id == 0`) runs an upload-catchup walker
+  from the flusher loop on every tick. The walker iterates raft
+  entries by index from `worker.upload_walker_idx + 1`, hydrates
+  per-request LogRecords from each entry's readset list via
+  `tape_mod.parseReadset` (extracting the `LogHeader` + each
+  channel's tape blob) and appends them to the worker's log_buffer.
+  Entries with `seq <= last_uploaded_seq` short-circuit without
+  hydrating (the leader's local fast path already covered them).
+  Multi-envelope (type-1) and root_writeset (type-2) are walked
+  correctly: type-1 recurses into every inner, type-2 has no
+  per-request LogHeader and is skipped.
+
+  Per-tick cap of `WALKER_BATCH_CAP = 256` entries bounds latency
+  during long catchups (post-promotion fresh leader has its
+  `last_uploaded_seq = 0` and walks every entry to advance). The
+  flusher-loop ordering is `flushLogs → walker` so on a healthy
+  leader the walker sees every entry already covered and
+  no-ops; only the catchup case does real work. Indexer
+  idempotency (PRIMARY KEY (tenant_id, request_id) + INSERT OR
+  IGNORE) absorbs any narrow-window duplicate against a record the
+  original leader had already pushed.
+
+  `request_body_bytes` + `activation_bytes` are NOT yet hydrated
+  — the BodyRefs in the trigger_payload + fetch_responses
+  channels would need a BlobStore fetch round-trip. Slice 5c-1 may
+  add it; for now rebuilt records carry the structural tape
+  channels and the customer log surface shows method / path /
+  status / outcome / correlation_id / activation without inline
+  body bytes.
 - **5d — orphan-blob GC**: periodic sweep over each tenant's
   `readset-blobs/` prefix. Walks recent raft entries, collects
   referenced `(tenant, batch_id)` pairs from BodyRefs across the

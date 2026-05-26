@@ -903,6 +903,32 @@ pub const RaftNode = struct {
         return rl.rowCount();
     }
 
+    /// Read a single raft-log entry by index. Caller owns
+    /// `entry.data` (allocator-freed via the same allocator
+    /// the RaftNode was opened with). Returns null if the
+    /// log isn't persisted on this node OR the index doesn't
+    /// exist.
+    ///
+    /// `docs/readset-replication-plan.md` Phase 5c — the upload
+    /// walker consumes this to re-derive LogRecords from raft
+    /// entries when the original leader crashed pre-flush.
+    pub fn getRaftEntry(self: *RaftNode, index: u64) !?raft_log_mod.Entry {
+        const rl = self.raft_log orelse return null;
+        return rl.get(index) catch |err| switch (err) {
+            error.NotFound => null,
+            else => err,
+        };
+    }
+
+    /// Highest raft-log index present locally. Used by Phase 5c's
+    /// upload walker to bound its scan. Returns 0 when the log
+    /// is empty or not persisted.
+    pub fn raftLogLastIndex(self: *RaftNode) !u64 {
+        const rl = self.raft_log orelse return 0;
+        const last = try rl.last();
+        return last.index;
+    }
+
     /// willemt's view of the highest log index covered by the
     /// most recent snapshot. Useful for tests + the
     /// `send_snapshot` callback (step C) which compares against
