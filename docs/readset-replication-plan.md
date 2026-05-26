@@ -418,6 +418,30 @@ Backend: existing BlobBackend (per-tenant S3 path
 Testable in isolation: tape upload starts using `BodyRef`; no
 replication change yet, no callback gating yet.
 
+Increments:
+
+- **2a — bodies module + single-tenant buffer**: new `rove-bodies`
+  module (`src/bodies/root.zig`) defining `BodyRef`, `BodyBuffer`
+  (append / flush / threshold predicates), and the durability
+  gate predicate `isDurable(ref)`. Resolved §11.6 to "batch is
+  the unit of durability": a `BodyRef` is durable iff its
+  `batch_id ≤ last_flushed_batch_id`, no per-byte global counter
+  required. Resolved §11.7 to "single-tenant buffer
+  encapsulated, multiplex happens one layer up." Unit tests
+  cover append → flush → key shape, threshold triggers, and the
+  durability gate. No wiring to the request hot path yet.
+- **2b — per-worker plumbing**: per-tenant sub-buffers keyed by
+  tenant id + the worker's kv-affinity hash. Wired to
+  `NodeState.blob_backend_cfg` so each tenant opens against the
+  same shared store via
+  `BlobBackend.openPerTenant(cfg, tenant_id, "readset-blobs")`.
+  Lifecycle only — open on first body, close on tenant eviction.
+- **2c — outbound (fetch) bodies**: chunks from curl_multi append
+  to the buffer; engine emits BodyRef. Routes via the existing
+  fetch_chunk activation path.
+- **2d — inbound bodies**: H2 DATA frames append to the buffer;
+  engine emits BodyRef for the trigger payload position.
+
 ### Phase 3 — readset in raft entry
 
 Extend envelope type 0 to carry readset bytes alongside writeset. New

@@ -131,6 +131,22 @@ pub fn build(b: *std.Build) void {
     log_mod.addImport("rove-kv", kv_mod);
     log_mod.addImport("rove-blob", blob_mod);
 
+    // ── rove-bodies: transport-layer body streaming buffer ──
+    //
+    // Per `docs/readset-replication-plan.md` Phase 2: fetch-response
+    // bodies and inbound request bodies stream into a per-tenant
+    // in-memory buffer that periodically flushes to S3 as one object
+    // per batch. The raft entry's readset carries a `BodyRef =
+    // (batch_id, offset, len)` pointer; the bytes never ride in the
+    // entry. Leaf module — depends only on rove-blob for the
+    // BlobStore interface.
+    const bodies_mod = b.addModule("rove-bodies", .{
+        .root_source_file = b.path("src/bodies/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bodies_mod.addImport("rove-blob", blob_mod);
+
     // ── rove-tape: deterministic replay capture + replay bundle ──
     //
     // Phase 4. Per-channel append-only tapes (kv, date, math_random,
@@ -354,6 +370,10 @@ pub fn build(b: *std.Build) void {
     // rove-tape tests
     const tape_tests = b.addTest(.{ .root_module = tape_mod });
     test_step.dependOn(&b.addRunArtifact(tape_tests).step);
+
+    // rove-bodies tests
+    const bodies_tests = b.addTest(.{ .root_module = bodies_mod });
+    test_step.dependOn(&b.addRunArtifact(bodies_tests).step);
 
     // rove-files-server tests
     const files_server_tests = b.addTest(.{ .root_module = files_server_mod });
