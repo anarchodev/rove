@@ -20,7 +20,9 @@ the closure of the unreplayability gap.
 
 from __future__ import annotations
 
+import http.server
 import json
+import multiprocessing
 import subprocess
 import sys
 import time
@@ -40,6 +42,7 @@ WB_HOST = f"wb.{PUBLIC_SUFFIX}"
 DELAY_MS = 4000
 KILL_AFTER_S = 1.0
 WAIT_FOR_RESULT_S = 15.0
+ECHO_PORT = 9237
 # Phase 6: how long to poll the log-server for the original POST's
 # record after failover. Bounds: walker tick (~50ms) + flush
 # interval (~1s) + indexer poll (100ms) + S3 RTT. 10s gives
@@ -57,8 +60,71 @@ def _ls(jwt: str, url: str, *, timeout_s: float = 10.0) -> str:
     return subprocess.run(args, capture_output=True, timeout=timeout_s + 5.0).stdout.decode()
 
 
+def _echo_server_main(port: int) -> None:
+    """Process-local echo server for the webhook target. Pre-existing
+    smoke variant targeted `https://wb.{suffix}:{survivor_port}/`
+    (the wb demo tenant on a hardcoded surviving node). That was
+    flaky because workers RETURN 503 from `dispatchPending` when not
+    leader (wb-handler-read-only doesn't help — the follower-503 in
+    worker_dispatch.zig:2206 fires before reaching the handler). When
+    the new leader happened to also be the hardcoded survivor, the
+    fetch loopbacked to leader → 200 → pass. When the new leader was
+    the OTHER surviving node, the fetch hit a follower → 503 →
+    `webhook_onresult` classifies as `should_retry`, the 1s/2s/4s/8s
+    backoffs blow past the 15s smoke wait, and on_result never fires
+    (the `kv.set("http/result/{id}")` write never happens).
+
+    This echo server is leader-independent — always responds 200 —
+    so the smoke tests the actual http.send failover semantics
+    rather than which surviving node happened to be picked as
+    leader."""
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            n = int(self.headers.get("content-length") or 0)
+            body = self.rfile.read(n)
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("content-length", str(len(body) + 5))
+            self.end_headers()
+            self.wfile.write(b"echo:" + body)
+
+        def log_message(self, fmt, *args):  # noqa: N802
+            return  # silence stderr
+
+    http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+
+
 def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
+
+    # Spin up the leader-independent echo target BEFORE the cluster.
+    # See `_echo_server_main` for why this replaced the prior
+    # wb-tenant + survivor-port URL.
+    echo_proc = multiprocessing.Process(
+        target=_echo_server_main, args=(ECHO_PORT,), daemon=True,
+    )
+    echo_proc.start()
+    deadline = time.monotonic() + 3.0
+    sanity_ok = False
+    while time.monotonic() < deadline:
+        try:
+            r = subprocess.run(
+                ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                 "-X", "POST", "--data", "ping",
+                 f"http://127.0.0.1:{ECHO_PORT}/"],
+                capture_output=True, timeout=2.0,
+            )
+            if r.stdout == b"200":
+                sanity_ok = True
+                break
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(0.1)
+    if not sanity_ok:
+        echo_proc.terminate()
+        sys.exit(f"FAIL python echo target didn't come up on :{ECHO_PORT}")
+    print(f"ok  echo target up on :{ECHO_PORT}")
+
     cluster = Cluster.spawn(
         tag="leader-failover",
         http_base=8470,
@@ -85,20 +151,15 @@ def main() -> int:
         c.spawn_log_server(cors_origin=admin_origin)
         c.mint_services_token()
         print(f"ok  log-server up at {c.log_url()}")
-        # Pick a node we WON'T kill — its port stays alive across the
-        # failover so the delayed http.send the new leader fires can
-        # actually reach wb. Hardcoding `orig_port` (as before) meant
-        # the curl hit the dead port and reported CurlCallFailed.
-        survivor_node = (orig_leader + 1) % 3
-        survivor_port = c.addrs.http_port(survivor_node)
         print(f"ok  initial leader: node {orig_leader} at {c.addrs.http[orig_leader]}")
 
-        cc = c.curl_ctx(ACME_HOST, WB_HOST)
+        cc = c.curl_ctx(ACME_HOST)
 
-        # Fire delayed http.send. Wait for acme's handler first.
-        # Schedule fires the curl from the NEW leader (post-failover) —
-        # target the survivor port so libcurl reaches a live listener.
-        wb_url = f"https://{WB_HOST}:{survivor_port}/"
+        # Fire delayed http.send. The new leader post-failover fires
+        # the curl from its own thread; aim at the leader-independent
+        # echo server so we test failover semantics rather than which
+        # surviving node ends up as leader. (See `_echo_server_main`.)
+        wb_url = f"http://127.0.0.1:{ECHO_PORT}/"
         acme_origin = f"https://{ACME_HOST}:{orig_port}"
 
         deadline = time.monotonic() + 20.0
