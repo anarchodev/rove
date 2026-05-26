@@ -62,6 +62,7 @@
 
 const std = @import("std");
 const bodies_mod = @import("rove-bodies");
+const log_mod = @import("rove-log");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 pub const VERSION: u16 = 1;
@@ -71,7 +72,14 @@ pub const VERSION: u16 = 1;
 /// Distinct from per-tape `MAGIC` so a misrouted bytes/payload trips
 /// the wrong-magic check at the decoder.
 pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
-pub const READSET_VERSION: u16 = 1;
+/// Bumped 1 → 2 by `docs/readset-replication-plan.md` Phase 5a: the
+/// trailing `[u32 log_header_len][log_header_bytes]` section was
+/// added after the 7 channels so any node can rebuild the customer
+/// LogRecord from the raft entry alone. `log_header_len == 0` is
+/// the "no header" sentinel (non-handler producers, paths that
+/// don't yet stamp a header). Pre-launch — no v1 raft logs to
+/// migrate, so the version bump is a hard cutover.
+pub const READSET_VERSION: u16 = 2;
 pub const READSET_CHANNEL_COUNT: usize = 7;
 
 pub const Channel = enum(u16) {
@@ -620,7 +628,8 @@ pub const Readset = struct {
 
     /// Serialize the whole readset to a single blob suitable for the
     /// raft entry's readset section
-    /// (`docs/readset-replication-plan.md` Phase 3). Wire format:
+    /// (`docs/readset-replication-plan.md` Phase 3 + 5a). Wire format
+    /// (READSET_VERSION = 2):
     ///
     /// ```
     /// [u32  magic = READSET_MAGIC ('RREA')]
@@ -629,6 +638,7 @@ pub const Readset = struct {
     /// [u64  seed          big-endian]
     /// for each of the 7 channels in fixed order:
     ///   [u32 blob_len BE][blob_bytes]   // blob is a full Tape.serialize()
+    /// [u32 log_header_len BE][log_header_bytes]   // Phase 5a
     /// ```
     ///
     /// Channels are emitted in the order matching the `Channel` enum
@@ -637,7 +647,17 @@ pub const Readset = struct {
     /// `parseReadset` consumes them. An empty channel still emits a
     /// 12-byte header-only blob so the fixed layout stays alignable
     /// on the wire.
-    pub fn serialize(self: *const Readset, allocator: std.mem.Allocator) ![]u8 {
+    ///
+    /// `log_header == null` writes a 4-byte zero length and no
+    /// payload (the "no header stamped" sentinel). Pass a real
+    /// `LogHeader` from the dispatch site so follower-side tape
+    /// upload (Phase 5c) can reconstruct the customer LogRecord
+    /// without re-executing the handler.
+    pub fn serialize(
+        self: *const Readset,
+        allocator: std.mem.Allocator,
+        log_header: ?log_mod.LogHeader,
+    ) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
@@ -666,6 +686,19 @@ pub const Readset = struct {
             try buf.appendSlice(allocator, blob);
         }
 
+        // Phase 5a — trailing LogHeader section.
+        if (log_header) |lh| {
+            const lh_bytes = try lh.serialize(allocator);
+            defer allocator.free(lh_bytes);
+            var lh_len_be: [4]u8 = undefined;
+            std.mem.writeInt(u32, &lh_len_be, @intCast(lh_bytes.len), .big);
+            try buf.appendSlice(allocator, &lh_len_be);
+            try buf.appendSlice(allocator, lh_bytes);
+        } else {
+            var zero_len: [4]u8 = .{ 0, 0, 0, 0 };
+            try buf.appendSlice(allocator, &zero_len);
+        }
+
         return buf.toOwnedSlice(allocator);
     }
 };
@@ -688,9 +721,15 @@ pub const ParsedReadset = struct {
     /// fixed order (kv, date, math_random, crypto_random, module,
     /// fetch_responses, trigger_payload).
     blobs: [READSET_CHANNEL_COUNT][]const u8,
+    /// `docs/readset-replication-plan.md` Phase 5a — per-request
+    /// LogRecord metadata. `null` when the producer didn't stamp a
+    /// header (non-handler producers, paths that haven't been wired
+    /// in yet). Strings inside borrow into the same input buffer the
+    /// channel blobs do; lifetime is the input bytes' lifetime.
+    log_header: ?log_mod.LogHeader,
 };
 
-pub fn parseReadset(bytes: []const u8) ParseError!ParsedReadset {
+pub fn parseReadset(bytes: []const u8) (ParseError || log_mod.LogHeaderParseError)!ParsedReadset {
     if (bytes.len < 4 + 2 + 8 + 8) return ParseError.Truncated;
     const magic = std.mem.readInt(u32, bytes[0..4], .big);
     if (magic != READSET_MAGIC) return ParseError.BadMagic;
@@ -710,11 +749,23 @@ pub fn parseReadset(bytes: []const u8) ParseError!ParsedReadset {
         blobs[i] = bytes[cur .. cur + blob_len];
         cur += blob_len;
     }
+    // Phase 5a trailing log-header section.
+    if (cur + 4 > bytes.len) return ParseError.Truncated;
+    const lh_len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+    cur += 4;
+    if (cur + lh_len > bytes.len) return ParseError.Truncated;
+    const lh_slice = bytes[cur .. cur + lh_len];
+    cur += lh_len;
     if (cur != bytes.len) return ParseError.Truncated;
+    const lh: ?log_mod.LogHeader = if (lh_len == 0)
+        null
+    else
+        try log_mod.parseLogHeader(lh_slice);
     return .{
         .timestamp_ns = timestamp_ns,
         .seed = seed,
         .blobs = blobs,
+        .log_header = lh,
     };
 }
 
@@ -1368,12 +1419,13 @@ test "readset: serialize + parseReadset roundtrip" {
         "",
     );
 
-    const bytes = try rs.serialize(testing.allocator);
+    const bytes = try rs.serialize(testing.allocator, null);
     defer testing.allocator.free(bytes);
 
     const parsed = try parseReadset(bytes);
     try testing.expectEqual(@as(i64, 1_700_000_000_000_000_000), parsed.timestamp_ns);
     try testing.expectEqual(@as(u64, 0xDEADBEEFCAFEBABE), parsed.seed);
+    try testing.expect(parsed.log_header == null);
 
     // Each blob is a self-contained tape; re-parse to confirm.
     for (parsed.blobs, 0..) |blob, idx| {
@@ -1381,6 +1433,41 @@ test "readset: serialize + parseReadset roundtrip" {
         defer p.deinit();
         try testing.expectEqual(@as(u16, @intCast(idx)), @intFromEnum(p.channel));
     }
+}
+
+test "readset: serialize + parseReadset roundtrip with LogHeader" {
+    var rs = Readset.init(testing.allocator, 42, 0xAB);
+    defer rs.deinit();
+    try rs.kv.appendKv(.get, "k", "v", .ok);
+    const lh: log_mod.LogHeader = .{
+        .request_id = 0xCAFE_BABE_DEAD_BEEF,
+        .deployment_id = 1_700_000_000,
+        .duration_ns = 12345,
+        .status = 200,
+        .outcome = .ok,
+        .activation = .inbound,
+        .method = "POST",
+        .path = "/api/echo",
+        .host = "x.rewindjsapp.localhost",
+        .correlation_id = "corr-aa",
+    };
+    const bytes = try rs.serialize(testing.allocator, lh);
+    defer testing.allocator.free(bytes);
+
+    const parsed = try parseReadset(bytes);
+    try testing.expectEqual(@as(i64, 42), parsed.timestamp_ns);
+    try testing.expect(parsed.log_header != null);
+    const p_lh = parsed.log_header.?;
+    try testing.expectEqual(lh.request_id, p_lh.request_id);
+    try testing.expectEqual(lh.deployment_id, p_lh.deployment_id);
+    try testing.expectEqual(lh.duration_ns, p_lh.duration_ns);
+    try testing.expectEqual(lh.status, p_lh.status);
+    try testing.expectEqual(lh.outcome, p_lh.outcome);
+    try testing.expectEqual(lh.activation, p_lh.activation);
+    try testing.expectEqualStrings(lh.method, p_lh.method);
+    try testing.expectEqualStrings(lh.path, p_lh.path);
+    try testing.expectEqualStrings(lh.host, p_lh.host);
+    try testing.expectEqualStrings(lh.correlation_id, p_lh.correlation_id);
 }
 
 test "readset: parseReadset rejects bad magic + bad version" {
@@ -1395,7 +1482,7 @@ test "readset: parseReadset rejects bad magic + bad version" {
 test "readset: parseReadset rejects truncated input" {
     var rs = Readset.init(testing.allocator, 0, 0);
     defer rs.deinit();
-    const bytes = try rs.serialize(testing.allocator);
+    const bytes = try rs.serialize(testing.allocator, null);
     defer testing.allocator.free(bytes);
     try testing.expectError(
         ParseError.Truncated,
@@ -1416,7 +1503,7 @@ test "readset list: single-entry roundtrip" {
     var rs = Readset.init(testing.allocator, 1234, 0xAA);
     defer rs.deinit();
     try rs.kv.appendKv(.get, "k", "v", .ok);
-    const rs_bytes = try rs.serialize(testing.allocator);
+    const rs_bytes = try rs.serialize(testing.allocator, null);
     defer testing.allocator.free(rs_bytes);
 
     const list = try encodeReadsetList(testing.allocator, &.{rs_bytes});
@@ -1446,11 +1533,11 @@ test "readset list: multi-entry roundtrip" {
     var rs_c = Readset.init(testing.allocator, 3, 0x33);
     defer rs_c.deinit();
 
-    const ba = try rs_a.serialize(testing.allocator);
+    const ba = try rs_a.serialize(testing.allocator, null);
     defer testing.allocator.free(ba);
-    const bb = try rs_b.serialize(testing.allocator);
+    const bb = try rs_b.serialize(testing.allocator, null);
     defer testing.allocator.free(bb);
-    const bc = try rs_c.serialize(testing.allocator);
+    const bc = try rs_c.serialize(testing.allocator, null);
     defer testing.allocator.free(bc);
 
     const list = try encodeReadsetList(testing.allocator, &.{ ba, bb, bc });
@@ -1516,7 +1603,7 @@ test "readset list: rejects truncated entry payload" {
 test "readset list: rejects trailing bytes after final entry" {
     var rs = Readset.init(testing.allocator, 0, 0);
     defer rs.deinit();
-    const rs_bytes = try rs.serialize(testing.allocator);
+    const rs_bytes = try rs.serialize(testing.allocator, null);
     defer testing.allocator.free(rs_bytes);
     const list = try encodeReadsetList(testing.allocator, &.{rs_bytes});
     defer testing.allocator.free(list);

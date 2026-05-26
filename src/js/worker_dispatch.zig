@@ -2984,7 +2984,27 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // in the raft envelope's `rs_bytes` section. Failures here
         // are non-fatal — log and skip THIS request's contribution;
         // siblings still ride.
-        if (readset.serialize(allocator)) |rs_bytes| {
+        //
+        // Phase 5a — stamp a `LogHeader` so any follower can
+        // reconstruct the customer LogRecord from the raft entry
+        // alone. The strings borrow the dispatch-local
+        // `method`/`path`/`host`/`correlation_id` slices, which
+        // outlive `readset.serialize`'s synchronous copy into the
+        // blob bytes.
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        const log_header: log_mod.LogHeader = .{
+            .request_id = request_id,
+            .deployment_id = dep_id,
+            .duration_ns = now_ns - received_ns,
+            .status = status_code,
+            .outcome = .ok,
+            .activation = .inbound,
+            .method = method,
+            .path = path,
+            .host = host,
+            .correlation_id = correlation_id,
+        };
+        if (readset.serialize(allocator, log_header)) |rs_bytes| {
             batch_readset_blobs.append(allocator, rs_bytes) catch |err| {
                 allocator.free(rs_bytes);
                 std.log.warn(

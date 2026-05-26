@@ -231,6 +231,132 @@ pub const LogRecord = struct {
     }
 };
 
+/// Per-request scalar + string metadata needed to reconstruct a
+/// `LogRecord` from a raft entry. Lives on the readset wire format
+/// (`docs/readset-replication-plan.md` Phase 5a) so any node — not
+/// just the leader that originally served the request — can build
+/// the LogRecord and push it to the customer-facing log path on
+/// follower-promotion.
+///
+/// `console` + `exception` bytes are intentionally not carried here:
+/// they're per-handler stdout that the leader can capture but a
+/// follower would have to re-execute to recover. Follower-rebuilt
+/// records leave both empty; customers recover console via tape
+/// replay when needed.
+///
+/// All `[]const u8` fields BORROW into the parent readset wire
+/// buffer. Encoders own + free; decoders alias.
+pub const LogHeader = struct {
+    request_id: u64,
+    deployment_id: u64,
+    /// Wall-clock duration of the request from `received_ns` to log
+    /// capture. Stamped by the leader; followers re-using this header
+    /// inherit the leader's clock-skewed value, which is fine for a
+    /// human-readable log surface.
+    duration_ns: i64,
+    status: u16,
+    outcome: Outcome,
+    activation: ActivationSource,
+    method: []const u8,
+    path: []const u8,
+    host: []const u8,
+    correlation_id: []const u8,
+
+    /// Big-endian wire layout. Scalars first (fixed width), then four
+    /// length-prefixed strings in canonical order:
+    /// ```
+    /// [u64 request_id BE]
+    /// [u64 deployment_id BE]
+    /// [i64 duration_ns BE]
+    /// [u16 status BE]
+    /// [u8  outcome]
+    /// [u8  activation]
+    /// [u32 method_len BE][method_bytes]
+    /// [u32 path_len BE  ][path_bytes  ]
+    /// [u32 host_len BE  ][host_bytes  ]
+    /// [u32 corr_len BE  ][corr_bytes  ]
+    /// ```
+    /// Encoded size is `28 + 16 + sum(len_fields)` (28 scalar bytes +
+    /// 4×u32 length prefixes + the variable string payloads).
+    pub fn serialize(self: *const LogHeader, allocator: std.mem.Allocator) ![]u8 {
+        const fixed: usize = 8 + 8 + 8 + 2 + 1 + 1;
+        const var_bytes = self.method.len + self.path.len + self.host.len + self.correlation_id.len;
+        const len_prefixes: usize = 4 * 4;
+        const total = fixed + len_prefixes + var_bytes;
+        const out = try allocator.alloc(u8, total);
+        var cur: usize = 0;
+        std.mem.writeInt(u64, out[cur..][0..8], self.request_id, .big);
+        cur += 8;
+        std.mem.writeInt(u64, out[cur..][0..8], self.deployment_id, .big);
+        cur += 8;
+        std.mem.writeInt(i64, out[cur..][0..8], self.duration_ns, .big);
+        cur += 8;
+        std.mem.writeInt(u16, out[cur..][0..2], self.status, .big);
+        cur += 2;
+        out[cur] = @intFromEnum(self.outcome);
+        cur += 1;
+        out[cur] = @intFromEnum(self.activation);
+        cur += 1;
+        const strings = [_][]const u8{ self.method, self.path, self.host, self.correlation_id };
+        for (strings) |s| {
+            std.mem.writeInt(u32, out[cur..][0..4], @intCast(s.len), .big);
+            cur += 4;
+            @memcpy(out[cur..][0..s.len], s);
+            cur += s.len;
+        }
+        std.debug.assert(cur == total);
+        return out;
+    }
+};
+
+pub const LogHeaderParseError = error{ Truncated, BadEnum };
+
+/// Parse a serialized `LogHeader` blob; the returned strings BORROW
+/// into `bytes` and remain valid as long as `bytes` does.
+pub fn parseLogHeader(bytes: []const u8) LogHeaderParseError!LogHeader {
+    const fixed: usize = 8 + 8 + 8 + 2 + 1 + 1;
+    if (bytes.len < fixed) return LogHeaderParseError.Truncated;
+    var cur: usize = 0;
+    const request_id = std.mem.readInt(u64, bytes[cur..][0..8], .big);
+    cur += 8;
+    const deployment_id = std.mem.readInt(u64, bytes[cur..][0..8], .big);
+    cur += 8;
+    const duration_ns = std.mem.readInt(i64, bytes[cur..][0..8], .big);
+    cur += 8;
+    const status = std.mem.readInt(u16, bytes[cur..][0..2], .big);
+    cur += 2;
+    const outcome_byte = bytes[cur];
+    cur += 1;
+    const activation_byte = bytes[cur];
+    cur += 1;
+    const outcome = std.meta.intToEnum(Outcome, outcome_byte) catch return LogHeaderParseError.BadEnum;
+    const activation = std.meta.intToEnum(ActivationSource, activation_byte) catch return LogHeaderParseError.BadEnum;
+
+    var strings: [4][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        if (cur + 4 > bytes.len) return LogHeaderParseError.Truncated;
+        const slen = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+        cur += 4;
+        if (cur + slen > bytes.len) return LogHeaderParseError.Truncated;
+        strings[i] = bytes[cur .. cur + slen];
+        cur += slen;
+    }
+    if (cur != bytes.len) return LogHeaderParseError.Truncated;
+    return .{
+        .request_id = request_id,
+        .deployment_id = deployment_id,
+        .duration_ns = duration_ns,
+        .status = status,
+        .outcome = outcome,
+        .activation = activation,
+        .method = strings[0],
+        .path = strings[1],
+        .host = strings[2],
+        .correlation_id = strings[3],
+    };
+}
+
 /// Request-id reservation window size. `nextRequestId` hands out this
 /// many ids in memory before persisting a new high-water mark to the
 /// kv store. Larger = fewer SQLite autocommits per request (which
@@ -616,4 +742,124 @@ test "RequestIdMinter worker_id occupies the upper 16 bits of request_id" {
     const id = try fx.minter.nextRequestId();
     try testing.expectEqual(@as(u64, 0xCAFE), id >> 48);
     try testing.expectEqual(@as(u64, 0), id & 0xFFFFFFFFFFFF);
+}
+
+test "LogHeader: serialize + parseLogHeader roundtrip" {
+    const header: LogHeader = .{
+        .request_id = 0xCAFEBABEDEADBEEF,
+        .deployment_id = 1_700_000_000_000_000_000,
+        .duration_ns = 123_456_789,
+        .status = 201,
+        .outcome = .ok,
+        .activation = .inbound,
+        .method = "POST",
+        .path = "/api/users",
+        .host = "tenant.rewindjsapp.localhost",
+        .correlation_id = "corr-7f1a-9e4b",
+    };
+    const bytes = try header.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    const parsed = try parseLogHeader(bytes);
+    try testing.expectEqual(header.request_id, parsed.request_id);
+    try testing.expectEqual(header.deployment_id, parsed.deployment_id);
+    try testing.expectEqual(header.duration_ns, parsed.duration_ns);
+    try testing.expectEqual(header.status, parsed.status);
+    try testing.expectEqual(header.outcome, parsed.outcome);
+    try testing.expectEqual(header.activation, parsed.activation);
+    try testing.expectEqualStrings(header.method, parsed.method);
+    try testing.expectEqualStrings(header.path, parsed.path);
+    try testing.expectEqualStrings(header.host, parsed.host);
+    try testing.expectEqualStrings(header.correlation_id, parsed.correlation_id);
+}
+
+test "LogHeader: empty strings roundtrip" {
+    const header: LogHeader = .{
+        .request_id = 0,
+        .deployment_id = 0,
+        .duration_ns = 0,
+        .status = 0,
+        .outcome = .ok,
+        .activation = .inbound,
+        .method = "",
+        .path = "",
+        .host = "",
+        .correlation_id = "",
+    };
+    const bytes = try header.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    const parsed = try parseLogHeader(bytes);
+    try testing.expectEqualStrings("", parsed.method);
+    try testing.expectEqualStrings("", parsed.path);
+    try testing.expectEqualStrings("", parsed.host);
+    try testing.expectEqualStrings("", parsed.correlation_id);
+}
+
+test "LogHeader: non-default outcome + activation" {
+    const header: LogHeader = .{
+        .request_id = 1,
+        .deployment_id = 2,
+        .duration_ns = 3,
+        .status = 500,
+        .outcome = .handler_error,
+        .activation = .fetch_chunk,
+        .method = "GET",
+        .path = "/",
+        .host = "",
+        .correlation_id = "",
+    };
+    const bytes = try header.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    const parsed = try parseLogHeader(bytes);
+    try testing.expectEqual(Outcome.handler_error, parsed.outcome);
+    try testing.expectEqual(ActivationSource.fetch_chunk, parsed.activation);
+}
+
+test "LogHeader: parseLogHeader rejects truncated scalar section" {
+    try testing.expectError(LogHeaderParseError.Truncated, parseLogHeader(""));
+    var bytes: [10]u8 = undefined;
+    @memset(&bytes, 0);
+    try testing.expectError(LogHeaderParseError.Truncated, parseLogHeader(&bytes));
+}
+
+test "LogHeader: parseLogHeader rejects bad outcome enum" {
+    const header: LogHeader = .{
+        .request_id = 0,
+        .deployment_id = 0,
+        .duration_ns = 0,
+        .status = 0,
+        .outcome = .ok,
+        .activation = .inbound,
+        .method = "",
+        .path = "",
+        .host = "",
+        .correlation_id = "",
+    };
+    const bytes = try header.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    const mut = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(mut);
+    // Stomp the outcome byte (offset 26) with an out-of-range value.
+    mut[26] = 0xFF;
+    try testing.expectError(LogHeaderParseError.BadEnum, parseLogHeader(mut));
+}
+
+test "LogHeader: parseLogHeader rejects truncated trailing string" {
+    const header: LogHeader = .{
+        .request_id = 0,
+        .deployment_id = 0,
+        .duration_ns = 0,
+        .status = 0,
+        .outcome = .ok,
+        .activation = .inbound,
+        .method = "GET",
+        .path = "/x",
+        .host = "h",
+        .correlation_id = "c",
+    };
+    const bytes = try header.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    try testing.expectError(
+        LogHeaderParseError.Truncated,
+        parseLogHeader(bytes[0 .. bytes.len - 1]),
+    );
 }
