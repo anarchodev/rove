@@ -70,6 +70,28 @@ pub const WriteSet = struct {
         try self.ops.append(self.allocator, .{ .delete = .{ .key = k } });
     }
 
+    /// True iff the writeset has a `put` or `delete` op targeting
+    /// exactly `key`. `docs/primitive-gaps.md` §8 — the capture-side
+    /// "minimal read set" gate uses this to decide whether a kv.get
+    /// is a foreign read (record) or an own-read (skip; replay will
+    /// resolve from its own writeset overlay).
+    ///
+    /// Linear scan; the typical writeset is single-digit ops, and
+    /// the call lives on the capture-time kv.get path which itself
+    /// touches the LMDB read txn. Trading a small linear scan for a
+    /// tape-size reduction; revisit if writesets routinely grow
+    /// past dozens of ops.
+    pub fn containsKey(self: *const WriteSet, key: []const u8) bool {
+        for (self.ops.items) |op| {
+            const op_key = switch (op) {
+                .put => |p| p.key,
+                .delete => |d| d.key,
+            };
+            if (std.mem.eql(u8, op_key, key)) return true;
+        }
+        return false;
+    }
+
     fn copyBytes(self: *WriteSet, src: []const u8) ![]u8 {
         const dst = try self.allocator.alloc(u8, src.len);
         errdefer self.allocator.free(dst);
@@ -311,6 +333,27 @@ test "encode/decode round trip via KvStore" {
     // asserted `kv.maxSeq() == 7` here — that invariant was a SQLite-
     // era impl detail (the kv_seq table). Behavioral assertions on
     // the key state above are what matter.
+}
+
+test "containsKey: matches put + delete ops, misses absent keys" {
+    const allocator = testing.allocator;
+    var ws = WriteSet.init(allocator);
+    defer ws.deinit();
+
+    try testing.expect(!ws.containsKey("k1"));
+
+    try ws.addPut("k1", "v1");
+    try ws.addPut("k2", "v2");
+    try ws.addDelete("k3");
+
+    try testing.expect(ws.containsKey("k1"));
+    try testing.expect(ws.containsKey("k2"));
+    try testing.expect(ws.containsKey("k3"));
+    try testing.expect(!ws.containsKey("k4"));
+    try testing.expect(!ws.containsKey(""));
+    // Prefix match should NOT trigger; exact match only.
+    try testing.expect(!ws.containsKey("k"));
+    try testing.expect(!ws.containsKey("k1x"));
 }
 
 test "decode rejects truncated payload" {

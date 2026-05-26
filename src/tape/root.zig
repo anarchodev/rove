@@ -65,7 +65,18 @@ const bodies_mod = @import("rove-bodies");
 const log_mod = @import("rove-log");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
-pub const VERSION: u16 = 1;
+/// Bumped 1 → 2 by `docs/primitive-gaps.md` §8 (minimal kv read set).
+/// Wire shape is unchanged — same `Entry` encoding per channel — but
+/// the kv channel's SEMANTICS shifted: it now records only foreign
+/// reads (gets/prefixes resolving to state committed before the
+/// activation). `kv.set` / `kv.delete` are outputs, not inputs;
+/// replay re-runs the handler and re-issues them against an in-
+/// engine writeset overlay. A v2 replay engine reading a v1 tape
+/// (or v1 engine reading v2) would see a different number of kv
+/// entries than the handler-call sequence expects → mismatch
+/// detected at the first kv.set call. Pre-launch — no v1 tapes
+/// need to be readable post-bump.
+pub const VERSION: u16 = 2;
 
 /// Magic + version for the whole-Readset wire format used by
 /// `Readset.serialize` (`docs/readset-replication-plan.md` Phase 3).
