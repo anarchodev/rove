@@ -539,7 +539,13 @@ fn finalizeBatch(
         // the borrowed seq only governs poll-start + the fault/timeout
         // downgrade, both bounded by `commit_wait_timeout_ns`.
         if (txn.sawSpeculation()) {
-            const seq = raft_propose.proposeWriteSet(worker, writeset, anchor_id) catch |perr| {
+            // TODO(readset-replication slice 3d): the idiom-0 barrier
+            // propose covers a read-only batch with kv-reads that
+            // crossed an uncommitted speculative overlay. The
+            // dispatch's readset would record those reads — pass
+            // its serialized bytes here once slice 3d wires the
+            // dispatch loop's per-request serialization.
+            const seq = raft_propose.proposeWriteSet(worker, writeset, anchor_id, "") catch |perr| {
                 std.log.warn("rove-js idiom-0 barrier propose (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
                 txn.rollback() catch |rb_err| panic_mod.invariantViolated(
                     "finalizeBatch.rollback(idiom0_barrier_fail)",
@@ -725,10 +731,17 @@ fn finalizeBatch(
     // handler can run in parallel.
     txn.releaseLease();
 
+    // TODO(readset-replication slice 3d): the main batch propose
+    // covers the write-path dispatch — the dominant inbound case.
+    // Slice 3d wires the dispatch loop's per-request readset
+    // serialization through here. Today: empty readset rides the
+    // anchor envelope, replay-via-bytes unavailable for entries
+    // committed before slice 3d lands.
     const seq = raft_propose.proposeBatch(
         worker,
         writeset,
         anchor_id,
+        "",
     ) catch |err| {
         std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
         txn.rollback() catch |rb_err| panic_mod.invariantViolated(
@@ -1699,7 +1712,9 @@ fn handleRelease(
     // park this request on raft commit. The proposeBatcher coalesces
     // any other proposals queued at the next raft tick — multiple
     // parallel release POSTs become a single consensus round.
-    const seq = raft_propose.proposeWriteSet(worker, &ws, parsed.value.tenant_id) catch |err| {
+    // handleRelease is an internal admin endpoint with no
+    // dispatched-handler readset to attach.
+    const seq = raft_propose.proposeWriteSet(worker, &ws, parsed.value.tenant_id, "") catch |err| {
         // Propose failed before raft accepted it (queue full,
         // shutting down, not leader). The local write was a kvexp
         // *speculative* commit (volatile — LMDB only at raft-apply);
@@ -1859,7 +1874,9 @@ fn handleAdminKv(
     // docs/unified-effect-gating.md. (Replaces the prior
     // fire-and-forget propose + immediate commitTxn(drop-undo) +
     // accept-time 204.)
-    const seq = raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID) catch |err| {
+    // System endpoint with no dispatched-handler readset; empty
+    // rs_bytes is the right value here.
+    const seq = raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID, "") catch |err| {
         // Synchronous propose failure (queue full / shutting down /
         // not leader). The local write was a kvexp *speculative*
         // commit (volatile — LMDB only at raft-apply); a propose

@@ -452,7 +452,13 @@ fn proposeAndParkContResume(
     // here.
     txn.releaseLease();
 
-    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id) catch |err| {
+    // TODO(readset-replication slice 3d): pass the cont-resume
+    // dispatch's readset bytes here. Today the chain-resume
+    // envelope has no readset attached, so a leader crash
+    // between flush and propose leaves the resumed activation
+    // unreplayable. Tracked alongside the inbound-dispatch
+    // serialization in §9 Phase 3 / slice 3d.
+    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id, "") catch |err| {
         // On propose failure: rollback txn, destroy it (caller's
         // ownership is implicit — we promised to consume it on
         // success OR free it on failure), free any owned resources in

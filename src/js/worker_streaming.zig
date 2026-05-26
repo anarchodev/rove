@@ -1538,7 +1538,10 @@ pub fn proposeForgetfulWrites(
     }
 
     txn.releaseLease();
-    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id) catch |err| {
+    // TODO(readset-replication slice 3d): pass the stream-resume
+    // dispatch's readset bytes here. See worker_drain.zig for the
+    // matching TODO on the cont-resume path.
+    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id, "") catch |err| {
         txn.rollback() catch {};
         allocator.destroy(txn);
         return err;

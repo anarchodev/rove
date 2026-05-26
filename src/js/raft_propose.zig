@@ -26,6 +26,7 @@ fn proposeEncoded(
     writeset: *const kv_mod.WriteSet,
     comptime kind: apply_mod.EnvelopeType,
     instance_id: []const u8,
+    rs_bytes: []const u8,
     skip_empty: bool,
 ) !u64 {
     if (skip_empty and writeset.ops.items.len == 0) return 0;
@@ -35,7 +36,7 @@ fn proposeEncoded(
     defer allocator.free(ws_bytes);
 
     const envelope = try switch (kind) {
-        .writeset => apply_mod.encodeWriteSetEnvelope(allocator, instance_id, ws_bytes),
+        .writeset => apply_mod.encodeWriteSetEnvelope(allocator, instance_id, ws_bytes, rs_bytes),
         .root_writeset => apply_mod.encodeRootWriteSetEnvelope(allocator, ws_bytes),
         .multi => unreachable,
     };
@@ -49,12 +50,21 @@ fn proposeEncoded(
 /// Per-tenant app.db writeset (envelope type=0). Always proposes,
 /// even for an empty writeset — the seq stamp is still meaningful as
 /// a synchronization point for downstream parking.
+///
+/// `rs_bytes` rides the envelope's readset section
+/// (`docs/readset-replication-plan.md` Phase 3). Pass `""` from
+/// non-handler producers (ACME, config mirror, internal admin
+/// endpoints); pass `tape_mod.Readset.serialize(...)` bytes from
+/// dispatched-handler paths. Slice 3b ships the signature change
+/// with every call site passing `""`; slice 3d wires the actual
+/// readset serialization from `dispatchPending`.
 pub fn proposeWriteSet(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
     instance_id: []const u8,
+    rs_bytes: []const u8,
 ) !u64 {
-    return proposeEncoded(worker, writeset, .writeset, instance_id, false);
+    return proposeEncoded(worker, writeset, .writeset, instance_id, rs_bytes, false);
 }
 
 // (proposeRootWriteSet removed 2026-05-17: Option-A folds
@@ -107,10 +117,17 @@ pub fn proposeMulti(worker: anytype, inner: []const []const u8) !u64 {
     return seq;
 }
 
+/// `rs_bytes` rides the anchor envelope (inner[0]) only. Targets
+/// + root_ws envelopes in the same batch carry empty readsets —
+/// the readset is per-dispatch, not per-envelope, and the batch's
+/// dispatching handler's readset already covers the whole batch.
+/// Pass `""` for non-handler-driven proposes (the propose path is
+/// signature-symmetric across producers).
 pub fn proposeBatch(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
     anchor_id: []const u8,
+    rs_bytes: []const u8,
 ) !u64 {
     const allocator = worker.allocator;
 
@@ -132,7 +149,7 @@ pub fn proposeBatch(
     if (writeset.ops.items.len > 0) {
         const ws_bytes = try writeset.encode(allocator);
         defer allocator.free(ws_bytes);
-        try inner.append(allocator, try apply_mod.encodeWriteSetEnvelope(allocator, anchor_id, ws_bytes));
+        try inner.append(allocator, try apply_mod.encodeWriteSetEnvelope(allocator, anchor_id, ws_bytes, rs_bytes));
     }
     // Option-A (docs/proposer-audit.md Addendum 3): the admin
     // handler's cross-tenant trampoline writes (per target, type-0
@@ -141,11 +158,15 @@ pub fn proposeBatch(
     // request is parked on by finalizeBatch. Replaces the per-site
     // fire-and-forget proposes the caller never gated on. `apply`
     // routes each inner to its per-target store atomically.
+    //
+    // Target + root envelopes carry empty rs_bytes — the readset
+    // lives on the anchor envelope (inner[0]) above; one readset
+    // per dispatch, not per envelope.
     for (worker.batch_side.targets.items) |*t| {
         if (t.ws.ops.items.len == 0) continue;
         const tb = try t.ws.encode(allocator);
         defer allocator.free(tb);
-        try inner.append(allocator, try apply_mod.encodeWriteSetEnvelope(allocator, t.id, tb));
+        try inner.append(allocator, try apply_mod.encodeWriteSetEnvelope(allocator, t.id, tb, ""));
     }
     if (worker.batch_side.root_ws) |*rw| {
         if (rw.ops.items.len > 0) {

@@ -66,6 +66,14 @@ const bodies_mod = @import("rove-bodies");
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 pub const VERSION: u16 = 1;
 
+/// Magic + version for the whole-Readset wire format used by
+/// `Readset.serialize` (`docs/readset-replication-plan.md` Phase 3).
+/// Distinct from per-tape `MAGIC` so a misrouted bytes/payload trips
+/// the wrong-magic check at the decoder.
+pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
+pub const READSET_VERSION: u16 = 1;
+pub const READSET_CHANNEL_COUNT: usize = 7;
+
 pub const Channel = enum(u16) {
     kv = 0,
     date = 1,
@@ -558,7 +566,106 @@ pub const Readset = struct {
         self.fetch_responses.deinit();
         self.trigger_payload.deinit();
     }
+
+    /// Serialize the whole readset to a single blob suitable for the
+    /// raft entry's readset section
+    /// (`docs/readset-replication-plan.md` Phase 3). Wire format:
+    ///
+    /// ```
+    /// [u32  magic = READSET_MAGIC ('RREA')]
+    /// [u16  version = READSET_VERSION]
+    /// [i64  timestamp_ns  big-endian]
+    /// [u64  seed          big-endian]
+    /// for each of the 7 channels in fixed order:
+    ///   [u32 blob_len BE][blob_bytes]   // blob is a full Tape.serialize()
+    /// ```
+    ///
+    /// Channels are emitted in the order matching the `Channel` enum
+    /// (kv=0, date=1, math_random=2, crypto_random=3, module=4,
+    /// fetch_responses=5, trigger_payload=6) — same order
+    /// `parseReadset` consumes them. An empty channel still emits a
+    /// 12-byte header-only blob so the fixed layout stays alignable
+    /// on the wire.
+    pub fn serialize(self: *const Readset, allocator: std.mem.Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        var header: [4 + 2 + 8 + 8]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], READSET_MAGIC, .big);
+        std.mem.writeInt(u16, header[4..6], READSET_VERSION, .big);
+        std.mem.writeInt(i64, header[6..14], self.timestamp_ns, .big);
+        std.mem.writeInt(u64, header[14..22], self.seed, .big);
+        try buf.appendSlice(allocator, &header);
+
+        const channels = [_]*const Tape{
+            &self.kv,
+            &self.date,
+            &self.math_random,
+            &self.crypto_random,
+            &self.module,
+            &self.fetch_responses,
+            &self.trigger_payload,
+        };
+        for (channels) |t| {
+            const blob = try t.serialize(allocator);
+            defer allocator.free(blob);
+            var len_be: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_be, @intCast(blob.len), .big);
+            try buf.appendSlice(allocator, &len_be);
+            try buf.appendSlice(allocator, blob);
+        }
+
+        return buf.toOwnedSlice(allocator);
+    }
 };
+
+/// Decoded readset bytes — header scalars plus per-channel blob
+/// slices that alias the input buffer. Lifetime: valid as long as
+/// the input buffer to `parseReadset` is live. The blob slices can
+/// be fed to `parse(allocator, blob)` to materialize ParsedTape
+/// values (which copy the bytes into their own backing buffer).
+///
+/// `readset-replication-plan.md` Phase 3: Phase 3 only needs to
+/// VALIDATE the readset shape (Phase 5 is where followers actually
+/// use the channels), so the apply path consumes this for shape
+/// validation today and a future slice will materialize tapes for
+/// follower-side tape upload.
+pub const ParsedReadset = struct {
+    timestamp_ns: i64,
+    seed: u64,
+    /// Borrowed slices into the input bytes, one per channel in
+    /// fixed order (kv, date, math_random, crypto_random, module,
+    /// fetch_responses, trigger_payload).
+    blobs: [READSET_CHANNEL_COUNT][]const u8,
+};
+
+pub fn parseReadset(bytes: []const u8) ParseError!ParsedReadset {
+    if (bytes.len < 4 + 2 + 8 + 8) return ParseError.Truncated;
+    const magic = std.mem.readInt(u32, bytes[0..4], .big);
+    if (magic != READSET_MAGIC) return ParseError.BadMagic;
+    const version = std.mem.readInt(u16, bytes[4..6], .big);
+    if (version != READSET_VERSION) return ParseError.UnsupportedVersion;
+    const timestamp_ns = std.mem.readInt(i64, bytes[6..14], .big);
+    const seed = std.mem.readInt(u64, bytes[14..22], .big);
+
+    var blobs: [READSET_CHANNEL_COUNT][]const u8 = undefined;
+    var cur: usize = 22;
+    var i: usize = 0;
+    while (i < READSET_CHANNEL_COUNT) : (i += 1) {
+        if (cur + 4 > bytes.len) return ParseError.Truncated;
+        const blob_len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+        cur += 4;
+        if (cur + blob_len > bytes.len) return ParseError.Truncated;
+        blobs[i] = bytes[cur .. cur + blob_len];
+        cur += blob_len;
+    }
+    if (cur != bytes.len) return ParseError.Truncated;
+    return .{
+        .timestamp_ns = timestamp_ns,
+        .seed = seed,
+        .blobs = blobs,
+    };
+}
 
 pub fn hashHexBytes(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
@@ -1084,6 +1191,65 @@ test "module tape: specifier + hash roundtrip" {
 
     try testing.expectEqualStrings("./handler.js", parsed.entries[0].module.specifier);
     try testing.expectEqualStrings(hash, parsed.entries[0].module.source_hash_hex);
+}
+
+test "readset: serialize + parseReadset roundtrip" {
+    var rs = Readset.init(testing.allocator, 1_700_000_000_000_000_000, 0xDEADBEEFCAFEBABE);
+    defer rs.deinit();
+    try rs.kv.appendKv(.get, "k", "v", .ok);
+    try rs.date.appendDate(1_712_345_678_901);
+    try rs.math_random.appendMathRandom(0.5);
+    try rs.crypto_random.appendCryptoRandom(&.{ 0x01, 0x02, 0x03 });
+    try rs.module.appendModule("./h.js", "a" ** 64);
+    try rs.fetch_responses.appendFetchResponse(
+        "fetch-1",
+        0,
+        0,
+        .{ .batch_id = 5, .offset = 200, .len = 64 },
+        true,
+        200,
+        true,
+        false,
+        "{}",
+    );
+    try rs.trigger_payload.appendTriggerPayload(
+        .{ .batch_id = 3, .offset = 0, .len = 128 },
+        "",
+    );
+
+    const bytes = try rs.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+
+    const parsed = try parseReadset(bytes);
+    try testing.expectEqual(@as(i64, 1_700_000_000_000_000_000), parsed.timestamp_ns);
+    try testing.expectEqual(@as(u64, 0xDEADBEEFCAFEBABE), parsed.seed);
+
+    // Each blob is a self-contained tape; re-parse to confirm.
+    for (parsed.blobs, 0..) |blob, idx| {
+        var p = try parse(testing.allocator, blob);
+        defer p.deinit();
+        try testing.expectEqual(@as(u16, @intCast(idx)), @intFromEnum(p.channel));
+    }
+}
+
+test "readset: parseReadset rejects bad magic + bad version" {
+    var bad = [_]u8{0} ** 32;
+    try testing.expectError(ParseError.BadMagic, parseReadset(&bad));
+
+    std.mem.writeInt(u32, bad[0..4], READSET_MAGIC, .big);
+    std.mem.writeInt(u16, bad[4..6], 99, .big);
+    try testing.expectError(ParseError.UnsupportedVersion, parseReadset(&bad));
+}
+
+test "readset: parseReadset rejects truncated input" {
+    var rs = Readset.init(testing.allocator, 0, 0);
+    defer rs.deinit();
+    const bytes = try rs.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    try testing.expectError(
+        ParseError.Truncated,
+        parseReadset(bytes[0 .. bytes.len - 3]),
+    );
 }
 
 test "trigger_payload tape: BodyRef roundtrip" {

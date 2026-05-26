@@ -483,6 +483,36 @@ or ignored at apply time).
 Bodies never ride in the entry — only `BodyRef` pointers do. Per-entry
 size growth is bounded by §8.1 (typically <2KB).
 
+Increments:
+
+- **3a — wire format**: type-0 envelope's payload becomes
+  `[u32 LE ws_len][ws_bytes][u32 LE rs_len][rs_bytes]`. Atomic flip
+  per `feedback_no_half_refactors` — clean-slate before launch.
+  `tape_mod.Readset` gets `serialize` / `parseReadset` with a
+  fixed 7-channel layout (one length-prefixed blob per channel,
+  always in canonical order) so the apply path can validate the
+  shape without parsing the channels themselves. `applyWriteSet`
+  splits the payload via `decodeWriteSetPayload`, validates
+  `rs_bytes` via `parseReadset` (panics on malformed), uses
+  `ws_bytes` for the existing apply / scan / decode operations.
+- **3b — propose plumbing**: `proposeWriteSet` / `proposeBatch` /
+  `encodeWriteSetEnvelope` take `rs_bytes: []const u8` (required).
+  Every call site updated. Non-handler producers (config-mirror,
+  ACME, the system / release endpoints) pass `""`. The
+  dispatched-handler call sites
+  (worker_dispatch finalizeBatch + worker_drain + worker_streaming)
+  also pass `""` here — wired to real `Readset.serialize(...)` bytes
+  in slice 3d.
+- **3c — follower decode (validate)**: subsumed into 3a. Followers
+  apply `payload.ws_bytes` and validate `payload.rs_bytes` shape;
+  materialization for Phase 5's follower tape upload is a later
+  slice.
+- **3d — leader-side actual serialize**: pending. Wires
+  `Readset.serialize` into `dispatchPending` and routes the bytes
+  through `finalizeBatch` → `proposeBatch`. Drain / streaming /
+  barrier-propose call sites also need their own readset
+  attachment work (TODOs at the call sites).
+
 ### Phase 4 — callback gating
 
 Hold response Msgs (and chunk Msgs, and inbound activation
