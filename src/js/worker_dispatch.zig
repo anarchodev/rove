@@ -2446,21 +2446,46 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // return 503 with `.fault` outcome. Matches §6.2 partial-
         // outage posture: fetch-using handlers are blocked when
         // the backend can't accept new bytes.
+        // Small-body inline fast path: bodies under the threshold
+        // ride inline in the readset's `trigger_payload` entry
+        // (no buffer append, no park, no S3 RTT). The raft entry
+        // itself is the durability substrate — every replica sees
+        // the bytes when the entry replicates. Threshold tuned to
+        // cover typical JSON RPC / OAuth callback / webhook bodies
+        // without unduly inflating the per-entry size.
+        const INBOUND_INLINE_THRESHOLD: usize = 16 * 1024;
+
         const resumed_from_park = body_wait.body_ref.batch_id != bodies_mod.NO_BATCH;
         var body_gate_failed = false;
         if (resumed_from_park) {
-            // Resume — drainBodyPending verified durability before
-            // moving the entity back, so the saved body_ref is
-            // durable in S3 by construction. Skip the append +
-            // flush entirely; record the BodyRef on the readset
-            // so the raft entry carries it.
-            readset.trigger_payload.appendTriggerPayload(body_wait.body_ref, "") catch |err| {
+            // Resume from park — drainBodyPending verified
+            // durability before moving the entity back; the saved
+            // body_ref points into S3. Skip append + flush;
+            // record the BodyRef on the readset.
+            readset.trigger_payload.appendTriggerPayload(body_wait.body_ref, "", "") catch |err| {
                 std.log.warn(
                     "rove-js inbound: readset.trigger_payload append (resume) tenant={s}: {s}",
                     .{ scope_inst.id, @errorName(err) },
                 );
             };
+        } else if (body.len > 0 and body.len <= INBOUND_INLINE_THRESHOLD) {
+            // Inline path — no buffer append, no park. Bytes ride
+            // inline in the readset; the raft entry's fsync IS
+            // durability. Handler runs immediately.
+            const inline_ref: bodies_mod.BodyRef = .{
+                .batch_id = bodies_mod.NO_BATCH,
+                .offset = 0,
+                .len = @intCast(body.len),
+            };
+            readset.trigger_payload.appendTriggerPayload(inline_ref, "", body) catch |err| {
+                std.log.warn(
+                    "rove-js inbound: readset.trigger_payload append (inline) tenant={s} bytes={d}: {s}",
+                    .{ scope_inst.id, body.len, @errorName(err) },
+                );
+            };
         } else if (body.len > 0) {
+            // Large body (> INBOUND_INLINE_THRESHOLD) — buffer +
+            // park flow.
             const tb = worker_mod.getOrOpenTenantBodies(worker, scope_inst) catch |err| blk: {
                 std.log.warn(
                     "rove-js inbound: getOrOpenTenantBodies tenant={s}: {s}",
@@ -2484,7 +2509,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         // append and this check, so the batch
                         // is already durable. Skip the park and
                         // continue with normal dispatch.
-                        readset.trigger_payload.appendTriggerPayload(body_ref, "") catch |err| {
+                        readset.trigger_payload.appendTriggerPayload(body_ref, "", "") catch |err| {
                             std.log.warn(
                                 "rove-js inbound: readset.trigger_payload append (fast-durable) tenant={s}: {s}",
                                 .{ scope_inst.id, @errorName(err) },

@@ -227,11 +227,14 @@ fetch_responses (channel 5):   // readset-replication-plan §2c-2
   [u8  body_truncated]               // 0 if !final
   [u32 len][headers utf-8]           // non-empty on seq=0 only
 
-trigger_payload (channel 6):   // readset-replication-plan §2d
-  [u64 body_ref.batch_id]
+trigger_payload (channel 6):   // readset-replication-plan §2d/§4-inline
+  [u64 body_ref.batch_id]            // NO_BATCH(0) ⇒ inline bytes
   [u64 body_ref.offset]
-  [u32 body_ref.len]
+  [u32 body_ref.len]                 // when inline, == inline_bytes.len
   [u32 len][headers utf-8]           // reserved; empty for now
+  [u32 len][inline_bytes]            // present when batch_id == NO_BATCH
+                                     // (small-body inline path); empty
+                                     // for the BodyRef-to-S3 path
 ```
 
 ### Bridge to `Module.tapes`

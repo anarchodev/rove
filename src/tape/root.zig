@@ -232,20 +232,35 @@ pub const Entry = union(Channel) {
         headers: []const u8,
     };
 
-    /// One inbound request's body pointer. `headers` is reserved
-    /// for future capture (replay currently re-reads the request's
-    /// method / path / host / wire headers from the log record's
-    /// dedicated fields); kept on the entry so the wire layout
-    /// matches the §4.1 readset shape and a later slice can
-    /// populate it without a version bump.
+    /// One inbound request's body — either by-reference into the
+    /// per-tenant readset-blob OR carried inline in the entry
+    /// itself (`docs/readset-replication-plan.md` Phase 4 inline
+    /// small-body path). The two modes are discriminated by
+    /// `body_ref.batch_id`:
+    ///
+    /// - `body_ref.batch_id != bodies_mod.NO_BATCH`: bytes live
+    ///   at `(tenant)/readset-blobs/{batch_id}` at the given
+    ///   offset+len; `inline_bytes` is empty. Used for bodies
+    ///   over the inline threshold (16 KB today); the dispatch
+    ///   loop parks the request until the buffer's batch is
+    ///   durable, then re-dispatches.
+    /// - `body_ref.batch_id == bodies_mod.NO_BATCH`: bytes ride
+    ///   inline as `inline_bytes`. `body_ref.offset == 0`,
+    ///   `body_ref.len == inline_bytes.len`. The handler runs
+    ///   immediately — no buffer append, no park, no S3 RTT —
+    ///   because the raft entry itself IS the durability
+    ///   substrate (every replica sees the bytes when the
+    ///   entry replicates).
+    ///
+    /// `headers` is reserved for future inbound-header capture
+    /// (replay currently re-reads method/path/host/wire headers
+    /// from the log record's dedicated fields); kept on the
+    /// entry so the wire layout matches the §4.1 readset shape
+    /// and a later slice can populate it without a version bump.
     pub const TriggerPayloadEntry = struct {
-        /// Pointer to the request body in the per-tenant
-        /// readset-blob. `body_ref.len == 0` represents an empty
-        /// request body (still emit one entry so the channel's
-        /// presence is unambiguous on replay).
         body_ref: bodies_mod.BodyRef,
-        /// Reserved for future header capture. Empty in slice 2d.
         headers: []const u8,
+        inline_bytes: []const u8,
     };
 };
 
@@ -433,21 +448,32 @@ pub const Tape = struct {
 
     /// Append one inbound trigger payload entry. The channel
     /// carries at most one entry per request; callers append
-    /// nothing when the request had no body. `headers` is reserved
-    /// for future capture — pass `""` in slice 2d.
+    /// nothing when the request had no body. `headers` is
+    /// reserved for future capture — pass `""` for now.
+    ///
+    /// `inline_bytes` carries the request body inline when the
+    /// caller chose the small-body inline path (`body_ref.batch_id
+    /// == bodies_mod.NO_BATCH`); empty for the by-reference path
+    /// (`body_ref.batch_id != NO_BATCH`, bytes live in
+    /// `(tenant)/readset-blobs/{batch_id}`). Both slices are
+    /// dup'd into tape storage.
     pub fn appendTriggerPayload(
         self: *Tape,
         body_ref: bodies_mod.BodyRef,
         headers: []const u8,
+        inline_bytes: []const u8,
     ) !void {
         std.debug.assert(self.channel == .trigger_payload);
         const headers_copy = try self.allocator.dupe(u8, headers);
         errdefer self.allocator.free(headers_copy);
+        const inline_copy = try self.allocator.dupe(u8, inline_bytes);
+        errdefer self.allocator.free(inline_copy);
         try self.entries.append(self.allocator, .{ .trigger_payload = .{
             .body_ref = body_ref,
             .headers = headers_copy,
+            .inline_bytes = inline_copy,
         } });
-        self.owned_bytes += headers_copy.len;
+        self.owned_bytes += headers_copy.len + inline_copy.len;
     }
 
     /// Serialize to a fresh heap buffer the caller owns. Empty tapes
@@ -786,6 +812,7 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
         },
         .trigger_payload => |*t| {
             allocator.free(t.headers);
+            allocator.free(t.inline_bytes);
         },
     }
 }
@@ -895,6 +922,7 @@ fn encodeEntry(
             std.mem.writeInt(u32, &br_len, t.body_ref.len, .big);
             try buf.appendSlice(allocator, &br_len);
             try appendLenPrefixed(allocator, buf, t.headers);
+            try appendLenPrefixed(allocator, buf, t.inline_bytes);
         },
     }
 }
@@ -1015,6 +1043,7 @@ fn decodeEntry(
             const br_len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
             cur += 4;
             const headers = try readLenPrefixed(bytes, &cur);
+            const inline_bytes = try readLenPrefixed(bytes, &cur);
             if (cur != bytes.len) return ParseError.Truncated;
             return .{ .trigger_payload = .{
                 .body_ref = .{
@@ -1023,6 +1052,7 @@ fn decodeEntry(
                     .len = br_len,
                 },
                 .headers = headers,
+                .inline_bytes = inline_bytes,
             } };
         },
     }
@@ -1215,6 +1245,7 @@ test "readset: serialize + parseReadset roundtrip" {
     try rs.trigger_payload.appendTriggerPayload(
         .{ .batch_id = 3, .offset = 0, .len = 128 },
         "",
+        "",
     );
 
     const bytes = try rs.serialize(testing.allocator);
@@ -1252,11 +1283,12 @@ test "readset: parseReadset rejects truncated input" {
     );
 }
 
-test "trigger_payload tape: BodyRef roundtrip" {
+test "trigger_payload tape: BodyRef-only roundtrip (large body)" {
     var tape = Tape.init(testing.allocator, .trigger_payload);
     defer tape.deinit();
     try tape.appendTriggerPayload(
         .{ .batch_id = 3, .offset = 4096, .len = 1024 },
+        "",
         "",
     );
     const bytes = try tape.serialize(testing.allocator);
@@ -1271,6 +1303,28 @@ test "trigger_payload tape: BodyRef roundtrip" {
     try testing.expectEqual(@as(u64, 4096), t.body_ref.offset);
     try testing.expectEqual(@as(u32, 1024), t.body_ref.len);
     try testing.expectEqualStrings("", t.headers);
+    try testing.expectEqualStrings("", t.inline_bytes);
+}
+
+test "trigger_payload tape: inline small-body roundtrip" {
+    var tape = Tape.init(testing.allocator, .trigger_payload);
+    defer tape.deinit();
+    const body = "{\"hello\":\"world\"}";
+    // Inline path: sentinel batch_id, body rides as inline_bytes.
+    try tape.appendTriggerPayload(
+        .{ .batch_id = 0, .offset = 0, .len = @intCast(body.len) },
+        "",
+        body,
+    );
+    const bytes = try tape.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+
+    var parsed = try parse(testing.allocator, bytes);
+    defer parsed.deinit();
+    const t = parsed.entries[0].trigger_payload;
+    try testing.expectEqual(@as(u64, 0), t.body_ref.batch_id);
+    try testing.expectEqualStrings(body, t.inline_bytes);
+    try testing.expectEqual(@as(u32, body.len), t.body_ref.len);
 }
 
 test "fetch_responses tape: chunk + terminal roundtrip" {
