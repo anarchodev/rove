@@ -61,6 +61,7 @@
 //! Per-entry bytes depend on `channel`. See `Entry` for the union.
 
 const std = @import("std");
+const bodies_mod = @import("rove-bodies");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 pub const VERSION: u16 = 1;
@@ -71,6 +72,13 @@ pub const Channel = enum(u16) {
     math_random = 2,
     crypto_random = 3,
     module = 4,
+    /// `docs/readset-replication-plan.md` Phase 2c-2. One entry per
+    /// `http.fetch` chunk activation; each entry records the
+    /// `BodyRef` naming the bytes in the per-tenant readset-blob
+    /// (`{tenant}/readset-blobs/{batch_id}`). Replay resolves the
+    /// bytes via `BlobStore.getRange` rather than reading them
+    /// inline from the log blob.
+    fetch_responses = 5,
 };
 
 /// Outcome of a kv operation as captured on the tape. `NotFound` is
@@ -114,6 +122,7 @@ pub const Entry = union(Channel) {
     math_random: MathRandomEntry,
     crypto_random: CryptoRandomEntry,
     module: ModuleEntry,
+    fetch_responses: FetchResponseEntry,
 
     pub const KvEntry = struct {
         op: KvOp,
@@ -160,6 +169,51 @@ pub const Entry = union(Channel) {
         /// SHA-256 of the bytecode that resolved for this specifier,
         /// hex-encoded. 64 chars.
         source_hash_hex: []const u8,
+    };
+
+    /// One `http.fetch` chunk activation. Captures enough of the
+    /// upstream event for replay to re-trigger the handler with
+    /// the same payload; bytes live out-of-band in the per-tenant
+    /// readset-blob and are addressed via `body_ref`. Headers ride
+    /// inline only on the seq=0 entry (libcurl delivers them
+    /// alongside the first chunk); subsequent entries have
+    /// `headers == ""`. `final` flags the terminal entry; status /
+    /// terminal_ok / body_truncated are meaningful only when
+    /// `final == true`.
+    pub const FetchResponseEntry = struct {
+        /// Correlates every chunk activation of one fetch call.
+        /// Surfaces as `request.activation.fetch_id` on the
+        /// re-fired activation during replay.
+        fetch_id: []const u8,
+        /// 0-based chunk sequence within this fetch.
+        seq: u32,
+        /// Cumulative byte count before this chunk
+        /// (surfaces as `request.activation.byte_offset`).
+        byte_offset: u64,
+        /// Pointer to the chunk payload in the per-tenant
+        /// readset-blob. `body_ref.len == 0` on terminal-only
+        /// events that delivered no body bytes (transport errors,
+        /// stream-mode FINs, etc.).
+        body_ref: bodies_mod.BodyRef,
+        /// True iff this is the last activation for the fetch.
+        final: bool,
+        /// Upstream HTTP status. Meaningful only when `final`;
+        /// 0 otherwise. Stored on every entry so the wire format
+        /// stays fixed-width per non-string field.
+        terminal_status: u16,
+        /// Transport-success flag (final only). Meaningful only
+        /// when `final`. `ok=true, status=503` means "transport
+        /// worked, server said no"; `ok=false` means libcurl-level
+        /// failure (DNS / TLS / timeout / cancel).
+        terminal_ok: bool,
+        /// True iff upstream sent more bytes than the configured
+        /// cap and the runtime truncated the rest. Meaningful only
+        /// when `final`.
+        body_truncated: bool,
+        /// Parsed upstream response headers as a JSON object
+        /// (`{"name":"value",...}`). Non-empty on seq=0 only;
+        /// later chunks reference the seq=0 entry for headers.
+        headers: []const u8,
     };
 };
 
@@ -310,6 +364,41 @@ pub const Tape = struct {
         self.owned_bytes += spec_copy.len + hash_copy.len;
     }
 
+    /// Append one `http.fetch` chunk activation. Dups every
+    /// caller-owned byte slice into tape storage so the caller's
+    /// buffers can go away. `headers` should be the parsed JSON
+    /// (non-empty on seq=0 only); pass `""` for non-header chunks.
+    pub fn appendFetchResponse(
+        self: *Tape,
+        fetch_id: []const u8,
+        seq: u32,
+        byte_offset: u64,
+        body_ref: bodies_mod.BodyRef,
+        final: bool,
+        terminal_status: u16,
+        terminal_ok: bool,
+        body_truncated: bool,
+        headers: []const u8,
+    ) !void {
+        std.debug.assert(self.channel == .fetch_responses);
+        const fid_copy = try self.allocator.dupe(u8, fetch_id);
+        errdefer self.allocator.free(fid_copy);
+        const headers_copy = try self.allocator.dupe(u8, headers);
+        errdefer self.allocator.free(headers_copy);
+        try self.entries.append(self.allocator, .{ .fetch_responses = .{
+            .fetch_id = fid_copy,
+            .seq = seq,
+            .byte_offset = byte_offset,
+            .body_ref = body_ref,
+            .final = final,
+            .terminal_status = terminal_status,
+            .terminal_ok = terminal_ok,
+            .body_truncated = body_truncated,
+            .headers = headers_copy,
+        } });
+        self.owned_bytes += fid_copy.len + headers_copy.len;
+    }
+
     /// Serialize to a fresh heap buffer the caller owns. Empty tapes
     /// still produce a valid (header-only) serialization — replay
     /// must be able to distinguish "channel was empty" from "no tape
@@ -388,6 +477,11 @@ pub const Readset = struct {
     math_random: Tape,
     crypto_random: Tape,
     module: Tape,
+    /// `docs/readset-replication-plan.md` Phase 2c-2: one entry per
+    /// `http.fetch` chunk activation. Captures the `BodyRef` naming
+    /// the bytes in the per-tenant readset-blob; replay resolves
+    /// the bytes via `BlobStore.getRange`.
+    fetch_responses: Tape,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -402,6 +496,7 @@ pub const Readset = struct {
             .math_random = Tape.init(allocator, .math_random),
             .crypto_random = Tape.init(allocator, .crypto_random),
             .module = Tape.init(allocator, .module),
+            .fetch_responses = Tape.init(allocator, .fetch_responses),
         };
     }
 
@@ -411,6 +506,7 @@ pub const Readset = struct {
         self.math_random.deinit();
         self.crypto_random.deinit();
         self.module.deinit();
+        self.fetch_responses.deinit();
     }
 };
 
@@ -527,6 +623,10 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
             allocator.free(m.specifier);
             allocator.free(m.source_hash_hex);
         },
+        .fetch_responses => |*f| {
+            allocator.free(f.fetch_id);
+            allocator.free(f.headers);
+        },
     }
 }
 
@@ -593,6 +693,35 @@ fn encodeEntry(
         .module => |m| {
             try appendLenPrefixed(allocator, buf, m.specifier);
             try appendLenPrefixed(allocator, buf, m.source_hash_hex);
+        },
+        .fetch_responses => |f| {
+            try appendLenPrefixed(allocator, buf, f.fetch_id);
+            var seq_be: [4]u8 = undefined;
+            std.mem.writeInt(u32, &seq_be, f.seq, .big);
+            try buf.appendSlice(allocator, &seq_be);
+            var bo_be: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bo_be, f.byte_offset, .big);
+            try buf.appendSlice(allocator, &bo_be);
+            // BodyRef: batch_id (u64), offset (u64), len (u32).
+            var br_bi: [8]u8 = undefined;
+            std.mem.writeInt(u64, &br_bi, f.body_ref.batch_id, .big);
+            try buf.appendSlice(allocator, &br_bi);
+            var br_off: [8]u8 = undefined;
+            std.mem.writeInt(u64, &br_off, f.body_ref.offset, .big);
+            try buf.appendSlice(allocator, &br_off);
+            var br_len: [4]u8 = undefined;
+            std.mem.writeInt(u32, &br_len, f.body_ref.len, .big);
+            try buf.appendSlice(allocator, &br_len);
+            // Flags + terminal fields. Packed as 1-byte bools so the
+            // wire layout stays bit-stable and the decoder can skip
+            // ahead to `headers` deterministically.
+            try buf.append(allocator, @intFromBool(f.final));
+            var st_be: [2]u8 = undefined;
+            std.mem.writeInt(u16, &st_be, f.terminal_status, .big);
+            try buf.appendSlice(allocator, &st_be);
+            try buf.append(allocator, @intFromBool(f.terminal_ok));
+            try buf.append(allocator, @intFromBool(f.body_truncated));
+            try appendLenPrefixed(allocator, buf, f.headers);
         },
     }
 }
@@ -662,6 +791,47 @@ fn decodeEntry(
             const hash = try readLenPrefixed(bytes, &cur);
             if (cur != bytes.len) return ParseError.Truncated;
             return .{ .module = .{ .specifier = spec, .source_hash_hex = hash } };
+        },
+        .fetch_responses => {
+            const fid = try readLenPrefixed(bytes, &cur);
+            if (cur + 4 + 8 + 8 + 8 + 4 + 1 + 2 + 1 + 1 > bytes.len) {
+                return ParseError.Truncated;
+            }
+            const seq = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+            cur += 4;
+            const byte_offset = std.mem.readInt(u64, bytes[cur..][0..8], .big);
+            cur += 8;
+            const br_batch_id = std.mem.readInt(u64, bytes[cur..][0..8], .big);
+            cur += 8;
+            const br_offset = std.mem.readInt(u64, bytes[cur..][0..8], .big);
+            cur += 8;
+            const br_len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+            cur += 4;
+            const final = bytes[cur] != 0;
+            cur += 1;
+            const status = std.mem.readInt(u16, bytes[cur..][0..2], .big);
+            cur += 2;
+            const ok = bytes[cur] != 0;
+            cur += 1;
+            const trunc = bytes[cur] != 0;
+            cur += 1;
+            const headers = try readLenPrefixed(bytes, &cur);
+            if (cur != bytes.len) return ParseError.Truncated;
+            return .{ .fetch_responses = .{
+                .fetch_id = fid,
+                .seq = seq,
+                .byte_offset = byte_offset,
+                .body_ref = .{
+                    .batch_id = br_batch_id,
+                    .offset = br_offset,
+                    .len = br_len,
+                },
+                .final = final,
+                .terminal_status = status,
+                .terminal_ok = ok,
+                .body_truncated = trunc,
+                .headers = headers,
+            } };
         },
     }
 }
@@ -829,6 +999,79 @@ test "module tape: specifier + hash roundtrip" {
 
     try testing.expectEqualStrings("./handler.js", parsed.entries[0].module.specifier);
     try testing.expectEqualStrings(hash, parsed.entries[0].module.source_hash_hex);
+}
+
+test "fetch_responses tape: chunk + terminal roundtrip" {
+    var tape = Tape.init(testing.allocator, .fetch_responses);
+    defer tape.deinit();
+
+    // Seq-0 entry: headers populated, non-final.
+    try tape.appendFetchResponse(
+        "fetch-abc",
+        0,
+        0,
+        .{ .batch_id = 7, .offset = 100, .len = 256 },
+        false,
+        0,
+        false,
+        false,
+        "{\"content-type\":\"application/json\"}",
+    );
+    // Mid-stream chunk: no headers.
+    try tape.appendFetchResponse(
+        "fetch-abc",
+        1,
+        256,
+        .{ .batch_id = 7, .offset = 356, .len = 128 },
+        false,
+        0,
+        false,
+        false,
+        "",
+    );
+    // Terminal: empty body, status + ok set.
+    try tape.appendFetchResponse(
+        "fetch-abc",
+        2,
+        384,
+        .{ .batch_id = 0, .offset = 0, .len = 0 },
+        true,
+        200,
+        true,
+        false,
+        "",
+    );
+
+    const bytes = try tape.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    var parsed = try parse(testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try testing.expectEqual(Channel.fetch_responses, parsed.channel);
+    try testing.expectEqual(@as(usize, 3), parsed.entries.len);
+
+    const e0 = parsed.entries[0].fetch_responses;
+    try testing.expectEqualStrings("fetch-abc", e0.fetch_id);
+    try testing.expectEqual(@as(u32, 0), e0.seq);
+    try testing.expectEqual(@as(u64, 0), e0.byte_offset);
+    try testing.expectEqual(@as(u64, 7), e0.body_ref.batch_id);
+    try testing.expectEqual(@as(u64, 100), e0.body_ref.offset);
+    try testing.expectEqual(@as(u32, 256), e0.body_ref.len);
+    try testing.expectEqual(false, e0.final);
+    try testing.expectEqualStrings("{\"content-type\":\"application/json\"}", e0.headers);
+
+    const e1 = parsed.entries[1].fetch_responses;
+    try testing.expectEqual(@as(u32, 1), e1.seq);
+    try testing.expectEqual(@as(u64, 256), e1.byte_offset);
+    try testing.expectEqual(@as(u32, 128), e1.body_ref.len);
+    try testing.expectEqualStrings("", e1.headers);
+
+    const e2 = parsed.entries[2].fetch_responses;
+    try testing.expectEqual(true, e2.final);
+    try testing.expectEqual(@as(u16, 200), e2.terminal_status);
+    try testing.expectEqual(true, e2.terminal_ok);
+    try testing.expectEqual(false, e2.body_truncated);
+    try testing.expectEqual(@as(u32, 0), e2.body_ref.len);
 }
 
 test "empty tape is a valid header-only blob" {

@@ -179,7 +179,8 @@ the recorder's encoding rules:
 Per-tape:
   [u32 magic = 0x52544150 'RTAP']
   [u16 version = 1]
-  [u16 channel (0=kv, 1=date, 2=math_random, 3=crypto_random, 4=module)]
+  [u16 channel (0=kv, 1=date, 2=math_random, 3=crypto_random,
+                4=module, 5=fetch_responses)]
   [u32 entry_count]
   for each entry: [u32 len][entry bytes]
 
@@ -212,6 +213,19 @@ crypto_random (channel 3):
 module   (channel 4):
   [u32 len][specifier utf-8]
   [u32 len][source_hash_hex utf-8]   // always 64 chars
+
+fetch_responses (channel 5):   // readset-replication-plan §2c-2
+  [u32 len][fetch_id utf-8]
+  [u32 seq]
+  [u64 byte_offset]
+  [u64 body_ref.batch_id]
+  [u64 body_ref.offset]
+  [u32 body_ref.len]
+  [u8  final]
+  [u16 terminal_status]              // 0 if !final
+  [u8  terminal_ok]                  // 0 if !final
+  [u8  body_truncated]               // 0 if !final
+  [u32 len][headers utf-8]           // non-empty on seq=0 only
 ```
 
 ### Bridge to `Module.tapes`

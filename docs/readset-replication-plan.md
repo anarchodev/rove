@@ -450,9 +450,17 @@ Increments:
       protects the map structure. No tape capture yet — bytes
       flow through S3 but the BodyRef is unused.
     - **2c-2**: tape capture — extend `tape_mod.Readset` with a
-      `fetch_responses` channel that records the BodyRef per
-      fetch chunk; serialize through the log-blob path so the
-      replay engine can resolve fetch bodies via BodyRef GET.
+      `fetch_responses` channel (channel id 5) recording one
+      entry per fetch chunk activation:
+      `(fetch_id, seq, byte_offset, body_ref, final,
+        terminal_status, terminal_ok, body_truncated, headers)`.
+      `TapePayloads.fetch_responses_tape_bytes` carries the
+      serialized blob through the per-batch log object;
+      `flush_writer.writeTapePayloads` emits it as
+      `fetch_responses_tape_b64`. The inline `activation_bytes`
+      capture continues to ride alongside during the Phase 2 →
+      Phase 3 transition (both coexist); the inline bytes drop
+      out when the raft entry adopts the BodyRef in Phase 3.
 - **2d — inbound bodies**: H2 DATA frames append to the buffer;
   engine emits BodyRef for the trigger payload position.
 

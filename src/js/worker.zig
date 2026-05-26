@@ -3880,16 +3880,24 @@ pub fn fireFetchEventActivation(
         req.activation_fetch_body_truncated = event.body_truncated;
     }
 
-    // Phase 2c-1: stream the chunk payload into the per-tenant
+    // Phase 2c: stream the chunk payload into the per-tenant
     // BodyBuffer so the log-flusher tick can publish it to
-    // `{tenant}/readset-blobs/{batch_id}`. Captures the BodyRef
-    // for slice 2c-2's fetch_responses tape channel.
+    // `{tenant}/readset-blobs/{batch_id}`, and capture the
+    // resulting BodyRef onto the readset's `fetch_responses`
+    // tape channel (2c-2).
     //
     // The bytes still ride alongside on `activation_fetch_bytes`
-    // (the handler keeps reading them inline for now — callback
-    // gating on durability is Phase 4). Empty chunks (terminal-
-    // only events with no body) are skipped — no point in
-    // appending zero bytes.
+    // — the handler keeps reading them inline for now — and the
+    // tape's `activation_bytes` still captures them too. Both
+    // coexist during the Phase 2 → Phase 3 transition; the
+    // inline bytes drop out when the raft entry adopts the
+    // BodyRef in Phase 3.
+    //
+    // Terminal-only events (final=true with no body bytes) still
+    // capture a tape entry so the chain has the closing seq +
+    // terminal status / ok / body_truncated for replay; the
+    // body_ref carries `len = 0`.
+    var body_ref: bodies_mod.BodyRef = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
     if (event.bytes.len > 0) {
         const tb = worker_bodies.getOrOpenTenantBodies(worker, inst) catch |err| blk: {
             std.log.warn(
@@ -3899,14 +3907,34 @@ pub fn fireFetchEventActivation(
             break :blk null;
         };
         if (tb) |t| {
-            _ = t.buffer.append(event.bytes) catch |err| {
+            body_ref = t.buffer.append(event.bytes) catch |err| blk: {
                 std.log.warn(
                     "rove-js fetch-event: body-buffer append tenant={s} bytes={d}: {s}",
                     .{ tenant_id, event.bytes.len, @errorName(err) },
                 );
+                break :blk .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
             };
         }
     }
+    readset.fetch_responses.appendFetchResponse(
+        event.fetch_id,
+        event.seq,
+        event.byte_offset,
+        body_ref,
+        event.final,
+        if (event.final) event.terminal_status else 0,
+        if (event.final) event.terminal_ok else false,
+        if (event.final) event.body_truncated else false,
+        event.fetch_headers orelse "",
+    ) catch |err| {
+        // Tape capture failures must never kill the request. Same
+        // posture as `captureTapesForChain`'s per-channel serialize
+        // errors: log + skip.
+        std.log.warn(
+            "rove-js fetch-event: readset.fetch_responses append tenant={s} fetch_id={s}: {s}",
+            .{ tenant_id, event.fetch_id, @errorName(err) },
+        );
+    };
 
     // Phase 2D: the activation's input bytes (the upstream chunk
     // payload) get taped on `TapePayloads.activation_bytes`.
