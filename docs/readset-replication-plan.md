@@ -661,6 +661,44 @@ Followers (or any node) can serve tape upload duty: walk recent raft
 entries, hydrate fetch bodies from blob batches, push to the tape
 S3 path. Orphan-blob GC sweep.
 
+The customer log record carries metadata the readset doesn't —
+request_id, deployment_id, method/path/host, status, outcome,
+activation source, correlation_id. Without those, a follower can
+parse the readset but can't synthesize a LogRecord to push. Slice 5a
+adds a `LogHeader` to the readset wire. Console + exception stdout
+bytes are deliberately excluded — those are handler stdout that a
+follower would have to re-execute the handler to recover; rebuilt
+records leave both empty and the customer recovers console via tape
+replay if they need it.
+
+Increments (planned, smallest-first):
+
+- **5a — LogHeader on Readset wire**: extend the readset blob with
+  a per-request metadata header (request_id, deployment_id,
+  duration_ns, status, outcome, activation, method, path, host,
+  correlation_id) so any node can reconstruct the customer log
+  record from the raft entry alone. Bumps `READSET_VERSION` to 2.
+  Leader stamps the header at serialize time; followers parse +
+  validate at apply time and discard until 5c.
+- **5b — last_uploaded_seq checkpoint + idempotent push**: per-node
+  durable "log records I've already pushed through seq X" mark
+  (kv-write on a small bookkeeping key). The log-server's batch
+  PUT path becomes idempotent on (tenant, request_id) so a
+  follower re-uploading entries the prior leader already pushed
+  is harmless. Pre-requisite for 5c's promotion-time walk.
+- **5c — promotion-time tape upload walk**: on leadership stabilize,
+  the new leader walks raft entries from `last_uploaded_seq + 1`,
+  hydrates each readset's tape + LogHeader into a LogRecord, and
+  pushes through the existing log-server pipeline. Closes the
+  leader-crash unreplayability gap end-to-end.
+- **5d — orphan-blob GC**: periodic sweep over each tenant's
+  `readset-blobs/` prefix. Walks recent raft entries, collects
+  referenced `(tenant, batch_id)` pairs from BodyRefs across the
+  readset's fetch_responses + trigger_payload channels, deletes
+  any batch older than the retention watermark with no incoming
+  references. Same shape as the manifest-pointer GC story for
+  customer files.
+
 ### Phase 6 — verification
 
 Leader-failover smoke (`scripts/leader_failover_smoke.py`, recently

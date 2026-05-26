@@ -1551,8 +1551,13 @@ pub fn proposeForgetfulWrites(
     // readset aggregation). Best-effort: any failure logs and we
     // propose with empty rs_bytes (same as pre-3d-fetch behavior —
     // the chain just doesn't get readset-replicated for this entry).
+    // TODO (slice 5a-1): stamp a real `LogHeader` here; the
+    // stream-resume / fetch-chunk / disconnect / subscription-fire
+    // activations know request_id + duration + status etc. at this
+    // point. For 5a we pass null so the readset blob carries no
+    // header — followers parse it as the "no header" sentinel.
     const rs_blob: []u8 = if (readset_opt) |rs|
-        rs.serialize(allocator) catch |err| blk: {
+        rs.serialize(allocator, null) catch |err| blk: {
             std.log.warn(
                 "rove-js proposeForgetfulWrites: readset.serialize tenant={s}: {s}",
                 .{ tenant_id, @errorName(err) },
