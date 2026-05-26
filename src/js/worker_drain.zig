@@ -444,6 +444,11 @@ fn proposeAndParkContResume(
     txn: *kv_mod.KvStore.TrackedTxn,
     tenant_id: []const u8,
     next: ContResumeNext,
+    /// Slice 3d-fetch: the cont-resume dispatch's readset, serialized
+    /// onto the raft envelope's `rs_bytes` section so the resumed
+    /// activation is replayable on any follower. Pointer (not value)
+    /// because the readset lives in the caller's stack frame.
+    readset: *const tape_mod.Readset,
 ) !void {
     const allocator = worker.allocator;
     const server = worker.h2;
@@ -454,13 +459,19 @@ fn proposeAndParkContResume(
     // here.
     txn.releaseLease();
 
-    // TODO(readset-replication slice 3d): pass the cont-resume
-    // dispatch's readset bytes here. Today the chain-resume
-    // envelope has no readset attached, so a leader crash
-    // between flush and propose leaves the resumed activation
-    // unreplayable. Tracked alongside the inbound-dispatch
-    // serialization in §9 Phase 3 / slice 3d.
-    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id, "") catch |err| {
+    // Slice 3d-fetch: serialize the cont-resume's readset for the
+    // anchor envelope so the resumed activation is replayable on
+    // any follower. Best-effort — serialize failure logs and
+    // propose with empty rs_bytes (same as pre-3d behavior).
+    const rs_bytes: []u8 = readset.serialize(allocator) catch |serr| blk: {
+        std.log.warn(
+            "rove-js cont-resume: readset.serialize tenant={s}: {s}",
+            .{ tenant_id, @errorName(serr) },
+        );
+        break :blk &.{};
+    };
+    defer if (rs_bytes.len > 0) allocator.free(rs_bytes);
+    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes) catch |err| {
         // On propose failure: rollback txn, destroy it (caller's
         // ownership is implicit — we promised to consume it on
         // success OR free it on failure), free any owned resources in
@@ -734,6 +745,7 @@ fn resumeContinuation(
                         .status = st,
                         .body = body_dup,
                     } },
+                    &readset,
                 ) catch |perr| {
                     // Propose-fail / pre-park alloc failure: degrade
                     // to a 500 over the held socket. The txn was
@@ -821,6 +833,7 @@ fn resumeContinuation(
                         .new_cont = c2m,
                         .new_bound_sched_id = new_bound_sched_id,
                     } },
+                    &readset,
                 ) catch |perr| {
                     // Helper rolled back + destroyed txn + freed
                     // c2m + new_bound_sched_id on failure; we just

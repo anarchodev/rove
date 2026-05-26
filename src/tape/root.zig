@@ -189,13 +189,27 @@ pub const Entry = union(Channel) {
 
     /// One `http.fetch` chunk activation. Captures enough of the
     /// upstream event for replay to re-trigger the handler with
-    /// the same payload; bytes live out-of-band in the per-tenant
-    /// readset-blob and are addressed via `body_ref`. Headers ride
-    /// inline only on the seq=0 entry (libcurl delivers them
-    /// alongside the first chunk); subsequent entries have
-    /// `headers == ""`. `final` flags the terminal entry; status /
-    /// terminal_ok / body_truncated are meaningful only when
-    /// `final == true`.
+    /// the same payload. Two modes, discriminated by
+    /// `body_ref.batch_id`:
+    ///
+    /// - `body_ref.batch_id != bodies_mod.NO_BATCH`: chunk bytes
+    ///   live in the per-tenant readset-blob; `inline_bytes` is
+    ///   empty. Used for chunks over the inline threshold.
+    /// - `body_ref.batch_id == bodies_mod.NO_BATCH` AND
+    ///   `inline_bytes.len > 0`: bytes ride inline in the entry
+    ///   (Phase 4-fetch-inline). Used for chunks under the
+    ///   inline threshold — handler runs immediately, raft
+    ///   entry fsync IS the durability substrate, same shape as
+    ///   the inbound `trigger_payload` inline path.
+    /// - `body_ref.batch_id == bodies_mod.NO_BATCH` AND
+    ///   `inline_bytes.len == 0`: a terminal-only event with no
+    ///   body bytes (transport errors, stream-mode FINs, etc.).
+    ///
+    /// Headers ride inline only on the seq=0 entry (libcurl
+    /// delivers them alongside the first chunk); subsequent
+    /// entries have `headers == ""`. `final` flags the terminal
+    /// entry; status / terminal_ok / body_truncated are
+    /// meaningful only when `final == true`.
     pub const FetchResponseEntry = struct {
         /// Correlates every chunk activation of one fetch call.
         /// Surfaces as `request.activation.fetch_id` on the
@@ -206,10 +220,8 @@ pub const Entry = union(Channel) {
         /// Cumulative byte count before this chunk
         /// (surfaces as `request.activation.byte_offset`).
         byte_offset: u64,
-        /// Pointer to the chunk payload in the per-tenant
-        /// readset-blob. `body_ref.len == 0` on terminal-only
-        /// events that delivered no body bytes (transport errors,
-        /// stream-mode FINs, etc.).
+        /// Pointer to the chunk payload. See the doc comment
+        /// above for the discriminator semantics.
         body_ref: bodies_mod.BodyRef,
         /// True iff this is the last activation for the fetch.
         final: bool,
@@ -230,6 +242,11 @@ pub const Entry = union(Channel) {
         /// (`{"name":"value",...}`). Non-empty on seq=0 only;
         /// later chunks reference the seq=0 entry for headers.
         headers: []const u8,
+        /// Chunk payload when the inline fast path is selected
+        /// (`body_ref.batch_id == bodies_mod.NO_BATCH`,
+        /// `body_ref.len == inline_bytes.len`). Empty for the
+        /// BodyRef-to-S3 path and for terminal-only events.
+        inline_bytes: []const u8,
     };
 
     /// One inbound request's body — either by-reference into the
@@ -414,7 +431,11 @@ pub const Tape = struct {
     /// Append one `http.fetch` chunk activation. Dups every
     /// caller-owned byte slice into tape storage so the caller's
     /// buffers can go away. `headers` should be the parsed JSON
-    /// (non-empty on seq=0 only); pass `""` for non-header chunks.
+    /// (non-empty on seq=0 only); pass `""` for non-header
+    /// chunks. `inline_bytes` is the chunk payload when the inline
+    /// fast path is selected (`body_ref.batch_id == NO_BATCH`,
+    /// `body_ref.len == inline_bytes.len`); pass `""` for the
+    /// BodyRef-to-S3 path and terminal-only events.
     pub fn appendFetchResponse(
         self: *Tape,
         fetch_id: []const u8,
@@ -426,12 +447,15 @@ pub const Tape = struct {
         terminal_ok: bool,
         body_truncated: bool,
         headers: []const u8,
+        inline_bytes: []const u8,
     ) !void {
         std.debug.assert(self.channel == .fetch_responses);
         const fid_copy = try self.allocator.dupe(u8, fetch_id);
         errdefer self.allocator.free(fid_copy);
         const headers_copy = try self.allocator.dupe(u8, headers);
         errdefer self.allocator.free(headers_copy);
+        const inline_copy = try self.allocator.dupe(u8, inline_bytes);
+        errdefer self.allocator.free(inline_copy);
         try self.entries.append(self.allocator, .{ .fetch_responses = .{
             .fetch_id = fid_copy,
             .seq = seq,
@@ -442,8 +466,9 @@ pub const Tape = struct {
             .terminal_ok = terminal_ok,
             .body_truncated = body_truncated,
             .headers = headers_copy,
+            .inline_bytes = inline_copy,
         } });
-        self.owned_bytes += fid_copy.len + headers_copy.len;
+        self.owned_bytes += fid_copy.len + headers_copy.len + inline_copy.len;
     }
 
     /// Append one inbound trigger payload entry. The channel
@@ -809,6 +834,7 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
         .fetch_responses => |*f| {
             allocator.free(f.fetch_id);
             allocator.free(f.headers);
+            allocator.free(f.inline_bytes);
         },
         .trigger_payload => |*t| {
             allocator.free(t.headers);
@@ -909,6 +935,7 @@ fn encodeEntry(
             try buf.append(allocator, @intFromBool(f.terminal_ok));
             try buf.append(allocator, @intFromBool(f.body_truncated));
             try appendLenPrefixed(allocator, buf, f.headers);
+            try appendLenPrefixed(allocator, buf, f.inline_bytes);
         },
         .trigger_payload => |t| {
             // BodyRef: batch_id (u64), offset (u64), len (u32).
@@ -1017,6 +1044,7 @@ fn decodeEntry(
             const trunc = bytes[cur] != 0;
             cur += 1;
             const headers = try readLenPrefixed(bytes, &cur);
+            const inline_bytes = try readLenPrefixed(bytes, &cur);
             if (cur != bytes.len) return ParseError.Truncated;
             return .{ .fetch_responses = .{
                 .fetch_id = fid,
@@ -1032,6 +1060,7 @@ fn decodeEntry(
                 .terminal_ok = ok,
                 .body_truncated = trunc,
                 .headers = headers,
+                .inline_bytes = inline_bytes,
             } };
         },
         .trigger_payload => {
@@ -1241,6 +1270,7 @@ test "readset: serialize + parseReadset roundtrip" {
         true,
         false,
         "{}",
+        "",
     );
     try rs.trigger_payload.appendTriggerPayload(
         .{ .batch_id = 3, .offset = 0, .len = 128 },
@@ -1331,7 +1361,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
     var tape = Tape.init(testing.allocator, .fetch_responses);
     defer tape.deinit();
 
-    // Seq-0 entry: headers populated, non-final.
+    // Seq-0 entry: headers populated, non-final, BodyRef path.
     try tape.appendFetchResponse(
         "fetch-abc",
         0,
@@ -1342,8 +1372,9 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         false,
         false,
         "{\"content-type\":\"application/json\"}",
+        "",
     );
-    // Mid-stream chunk: no headers.
+    // Mid-stream chunk: no headers, BodyRef path.
     try tape.appendFetchResponse(
         "fetch-abc",
         1,
@@ -1353,6 +1384,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         0,
         false,
         false,
+        "",
         "",
     );
     // Terminal: empty body, status + ok set.
@@ -1365,6 +1397,7 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
         200,
         true,
         false,
+        "",
         "",
     );
 
@@ -1398,6 +1431,34 @@ test "fetch_responses tape: chunk + terminal roundtrip" {
     try testing.expectEqual(true, e2.terminal_ok);
     try testing.expectEqual(false, e2.body_truncated);
     try testing.expectEqual(@as(u32, 0), e2.body_ref.len);
+}
+
+test "fetch_responses tape: inline small-chunk roundtrip" {
+    var tape = Tape.init(testing.allocator, .fetch_responses);
+    defer tape.deinit();
+    const chunk = "{\"ok\":true,\"data\":[1,2,3]}";
+    try tape.appendFetchResponse(
+        "fetch-xyz",
+        0,
+        0,
+        .{ .batch_id = 0, .offset = 0, .len = @intCast(chunk.len) },
+        true,
+        200,
+        true,
+        false,
+        "{\"content-type\":\"application/json\"}",
+        chunk,
+    );
+    const bytes = try tape.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    var parsed = try parse(testing.allocator, bytes);
+    defer parsed.deinit();
+    const e = parsed.entries[0].fetch_responses;
+    try testing.expectEqual(@as(u64, 0), e.body_ref.batch_id); // sentinel
+    try testing.expectEqual(@as(u32, chunk.len), e.body_ref.len);
+    try testing.expectEqualStrings(chunk, e.inline_bytes);
+    try testing.expectEqual(true, e.final);
+    try testing.expectEqual(@as(u16, 200), e.terminal_status);
 }
 
 test "empty tape is a valid header-only blob" {
