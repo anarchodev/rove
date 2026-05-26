@@ -4165,7 +4165,19 @@ pub fn fireFetchEventActivation(
                 return;
             }
             if (wrote) {
-                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
+                const lh_fetch_term: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = @intCast(@max(@min(r.status, 599), 100)),
+                    .outcome = .ok,
+                    .activation = act_source,
+                    .method = "POST",
+                    .path = module_path,
+                    .host = "",
+                    .correlation_id = corr_full,
+                };
+                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_term) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -4218,7 +4230,19 @@ pub fn fireFetchEventActivation(
                 .{ module_path, @errorName(err) },
             );
             if (wrote) {
-                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
+                const lh_fetch_cont: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = 200,
+                    .outcome = .ok,
+                    .activation = act_source,
+                    .method = "POST",
+                    .path = module_path,
+                    .host = "",
+                    .correlation_id = corr_full,
+                };
+                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_cont) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -4248,7 +4272,19 @@ pub fn fireFetchEventActivation(
                 .{module_path},
             );
             if (wrote) {
-                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
+                const lh_fetch_stream: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = 200,
+                    .outcome = .ok,
+                    .activation = act_source,
+                    .method = "POST",
+                    .path = module_path,
+                    .host = "",
+                    .correlation_id = corr_full,
+                };
+                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_stream) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
