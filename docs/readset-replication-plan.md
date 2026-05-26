@@ -550,6 +550,32 @@ Increments shipped:
   asynchronously on the 50ms tick. Untaped chunks survive a
   leader crash unreplayably, same gap the inbound path just
   closed.
+- **4-inline (shipped, revisits §5.3 rejection)**: small-body
+  inline fast path. Bodies ≤ 16 KB ride inline in the
+  readset's `trigger_payload.inline_bytes` field —
+  no buffer append, no park, no S3 RTT. The raft entry's
+  fsync IS the durability substrate (every replica sees the
+  bytes when the entry replicates), giving a *stronger*
+  guarantee than the BodyRef→S3 path. Discriminator on the
+  entry: `body_ref.batch_id == bodies_mod.NO_BATCH` means
+  "inline; bytes are in `inline_bytes`."
+  Bodies > 16 KB take the 4-park flow unchanged. The
+  threshold is chosen so typical JSON RPC / OAuth callback /
+  webhook payloads (well under 16 KB) skip the gate while
+  large uploads (file/image uploads) still go S3. Smokes:
+  heldsync per-request elapsed went from 0.16 s (park
+  always) to 0.01 s (inline), matching pre-Phase-4 baseline.
+
+  Walks back the 2026-05-24 plan revision that removed the
+  inline path for simplicity. The rationale at the time —
+  "ship one safe semantic" — still applies in that both
+  paths deliver the same property: handler runs against
+  durable bytes. The two implementations differ in WHERE
+  durability lives (raft log vs S3) but the customer-facing
+  guarantee is identical. The latency win is large enough
+  for typical workloads to revisit; the wire complexity is
+  bounded (one extra length-prefixed field on the entry).
+
 - **4-park (shipped)**: park-on-durability replaces the sync
   block. New `BodyDurabilityWait` component (sibling to
   `RaftWait`) and `body_pending` collection on `Worker`. On
