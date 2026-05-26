@@ -587,7 +587,7 @@ fn resumeStream(
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset, lh_term) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset, lh_term) catch |perr| {
                     std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -611,7 +611,7 @@ fn resumeStream(
                 // then closes (chunks-empty + is_draining).
                 chain_st.activation_count += 1;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -666,6 +666,10 @@ fn resumeStream(
                 for (stage.chunks.items) |c| allocator.free(c);
                 stage.chunks.deinit(allocator);
             }
+            // Phase 5b-1: hoist fw_seq so the post-block captureLog
+            // stamps the propose seq in the wrote case and 0 in the
+            // read-only case (no propose ran).
+            var fw_seq: u64 = 0;
             if (wrote) {
                 // Move s2.chunks → stage.chunks BEFORE the propose
                 // so a propose failure frees them via the helper.
@@ -687,7 +691,7 @@ fn resumeStream(
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset, lh_stream) catch |perr| {
+                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js stream-resume (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     // Helper already freed `stage.chunks` (the
                     // outer defer is now a no-op). Free what's
@@ -752,7 +756,7 @@ fn resumeStream(
             wakes_st.kv_prefixes = s2.kv_prefixes;
             s2.kv_prefixes = &.{};
             chain_st.activation_count += 1;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, fw_seq);
         },
     }
 }
@@ -917,7 +921,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc_term) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc_term) catch |perr| {
                     std.log.warn("rove-js stream-disconnect: propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false; // helper destroyed it
                     txn_done = true;
@@ -929,7 +933,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                 txn_owned = false;
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -965,7 +969,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc_cont) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc_cont) catch |perr| {
                     std.log.warn("rove-js stream-disconnect (cont return): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -974,7 +978,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, fw_seq);
                 return;
             }
             txn.rollback() catch {};
@@ -996,7 +1000,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc_stream) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc_stream) catch |perr| {
                     std.log.warn("rove-js stream-disconnect (stream return): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -1005,7 +1009,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, fw_seq);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -1208,7 +1212,7 @@ pub fn fireSubscriptionActivation(
                     .host = "",
                     .correlation_id = corr_full,
                 };
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_sub_term) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_sub_term) catch |perr| {
                     std.log.warn("rove-js subscription-fire ({s}): propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1220,7 +1224,7 @@ pub fn fireSubscriptionActivation(
                 txn_owned = false;
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1260,7 +1264,7 @@ pub fn fireSubscriptionActivation(
                     .host = "",
                     .correlation_id = corr_full,
                 };
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_sub_cont) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_sub_cont) catch |perr| {
                     std.log.warn("rove-js subscription-fire ({s}) cont-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1269,7 +1273,7 @@ pub fn fireSubscriptionActivation(
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, fw_seq);
                 return;
             }
             txn.rollback() catch {};
@@ -1298,7 +1302,7 @@ pub fn fireSubscriptionActivation(
                     .host = "",
                     .correlation_id = corr_full,
                 };
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_sub_stream) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_sub_stream) catch |perr| {
                     std.log.warn("rove-js subscription-fire ({s}) stream-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1307,7 +1311,7 @@ pub fn fireSubscriptionActivation(
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, fw_seq);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -1470,7 +1474,7 @@ fn fireChainedActivation(
                     .host = "",
                     .correlation_id = corr_full,
                 };
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_chain_term) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_chain_term) catch |perr| {
                     std.log.warn("rove-js chained-dispatch ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1482,7 +1486,7 @@ fn fireChainedActivation(
                 txn_owned = false;
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1528,7 +1532,7 @@ fn fireChainedActivation(
                     .host = "",
                     .correlation_id = corr_full,
                 };
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_chain_cont) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_chain_cont) catch |perr| {
                     std.log.warn("rove-js chained-dispatch ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1537,7 +1541,7 @@ fn fireChainedActivation(
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, fw_seq);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -1569,7 +1573,7 @@ fn fireChainedActivation(
                     .host = "",
                     .correlation_id = corr_full,
                 };
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_chain_stream) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_chain_stream) catch |perr| {
                     std.log.warn("rove-js chained-dispatch ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1578,7 +1582,7 @@ fn fireChainedActivation(
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, fw_seq);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -1664,7 +1668,7 @@ pub fn proposeForgetfulWrites(
     /// site genuinely has no header to stamp (no such site today —
     /// every activation here knows request_id + status + activation).
     log_header_opt: ?log_mod.LogHeader,
-) !void {
+) !u64 {
     const allocator = worker.allocator;
 
     // Take ownership of the staged chunks up-front so every error
@@ -1797,6 +1801,7 @@ pub fn proposeForgetfulWrites(
     errdefer worker.h2.reg.destroy(ent) catch {};
     try worker.h2.reg.set(ent, &worker.parked_units, ParkedUnit, unit);
     unit = .{}; // ownership transferred to the column
+    return seq;
 }
 
 /// Gap 2.1 Phase E (refactored), effect-reification Phase 4.1: for
