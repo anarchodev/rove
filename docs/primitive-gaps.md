@@ -751,6 +751,22 @@ unified (re-execute, don't restore-from-redundant-copy).
 
 ## 8. Minimal read set — drop writes and own-reads from the tape
 
+**SHIPPED 2026-05-26.** RTAP wire bumped 1 → 2. Capture-side:
+`globals.zig`'s `jsKvGet` skips the tape append when `state.writeset.containsKey(key)`
+(own-read); `jsKvSet` and `jsKvDelete` no longer append at all
+(writes are outputs, replay re-issues them). Replay-side: the WASM
+host callbacks (`_arena_host_kv_get/set/delete` in
+`web/replay/_static/qjs_arena_wasm.js`) now maintain a
+`Module._kvOverlay` Map per replay session; `kv.set`/`delete`
+write to the overlay, `kv.get` checks the overlay first and falls
+through to the tape only on miss (foreign-read path).
+`cursor.mjs:_installReplay` resets the overlay between replays.
+`kv.prefix` is unchanged — the merge of committed rows + in-range
+overlay writes is fiddly enough that the v1 minimization stops at
+`.get`. Old §8 write-up below.
+
+---
+
 Where §7 minimizes the *bytes* of a taped input, §8 minimizes
 *which operations* are taped at all. The goal: the tape carries
 exactly the minimal read set needed to replay the handler.

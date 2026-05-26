@@ -49,6 +49,12 @@ export class CursorEngine {
         }
         this.M.tapes = replay.tapes;
         this.M.module_sources = replay.module_sources ?? {};
+        // §8: fresh writeset overlay per replay. `_arena_host_kv_set`
+        // / `_kv_delete` write into this Map; `_kv_get` checks it
+        // before falling through to the tape. Resetting between
+        // replays ensures one replay's writes don't leak into the
+        // next.
+        this.M._kvOverlay = new Map();
     }
 
     async scanIndex(replay) {

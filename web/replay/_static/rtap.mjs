@@ -21,7 +21,12 @@
 // verify wire-format compatibility without a rove repo round-trip.
 
 export const RTAP_MAGIC   = 0x52544150;
-export const RTAP_VERSION = 1;
+// Bumped 1 → 2 by `docs/primitive-gaps.md` §8 (minimal kv read
+// set). Wire shape unchanged — semantic shift: kv channel records
+// only foreign reads, replay maintains its own writeset overlay
+// for kv.set / kv.delete. See src/tape/root.zig VERSION doc for
+// the full rationale.
+export const RTAP_VERSION = 2;
 
 export const CHANNEL_KV            = 0;
 export const CHANNEL_DATE          = 1;

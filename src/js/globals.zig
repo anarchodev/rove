@@ -455,20 +455,29 @@ fn jsKvGet(
     const key_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(key_str);
 
+    // `docs/primitive-gaps.md` §8 — minimal read set. A `kv.get(k)`
+    // where `k` is in this activation's own writeset reads a value
+    // the activation itself produced, reproducible by replay re-
+    // running the handler against its own overlay. Only FOREIGN
+    // reads (keys NOT in the writeset) carry replay information,
+    // so only those make it onto the tape. Saves tape size + S3
+    // bytes per request without losing replay determinism.
+    const skip_tape = state.writeset.containsKey(key_str);
+
     const value = state.kv.get(key_str) catch |err| switch (err) {
         error.NotFound => {
-            if (state.readset) |rs| rs.kv.appendKv(.get, key_str, "", .not_found) catch {};
+            if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key_str, "", .not_found) catch {};
             return js_null;
         },
         else => {
             state.pending_kv_error = err;
-            if (state.readset) |rs| rs.kv.appendKv(.get, key_str, "", .err) catch {};
+            if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key_str, "", .err) catch {};
             return js_null;
         },
     };
     defer state.allocator.free(value);
 
-    if (state.readset) |rs| rs.kv.appendKv(.get, key_str, value, .ok) catch {};
+    if (!skip_tape) if (state.readset) |rs| rs.kv.appendKv(.get, key_str, value, .ok) catch {};
     return c.JS_NewStringLen(ctx, value.ptr, value.len);
 }
 
@@ -497,19 +506,23 @@ fn jsKvSet(
         return throwReservedKey(ctx, key_str);
     }
 
+    // `docs/primitive-gaps.md` §8 — kv.set is an OUTPUT, not an
+    // input. Replay re-runs the handler and re-issues the write
+    // (against its writeset overlay); the value is a pure function
+    // of the recorded foreign reads + the pinned bytecode hash.
+    // Nothing about a write is a replay input, so it isn't taped.
+
     // Fast path: no triggers match → write directly, no savepoint, no
     // previousValue lookup, no chain machinery. Same cost as before
     // triggers existed.
     if (!td.anyTriggerMatches(state, key_str)) {
         state.txn.put(key_str, val_str) catch |err| {
             state.pending_kv_error = err;
-            if (state.readset) |rs| rs.kv.appendKv(.set, key_str, val_str, .err) catch {};
             return js_undefined;
         };
         state.writeset.addPut(key_str, val_str) catch |err| {
             state.pending_kv_error = err;
         };
-        if (state.readset) |rs| rs.kv.appendKv(.set, key_str, val_str, .ok) catch {};
         return js_undefined;
     }
 
@@ -552,13 +565,11 @@ fn jsKvSet(
     state.txn.put(key_str, write_value) catch |err| {
         state.pending_kv_error = err;
         td.rollbackInnerSavepoint(state);
-        if (state.readset) |rs| rs.kv.appendKv(.set, key_str, write_value, .err) catch {};
         return js_undefined;
     };
     state.writeset.addPut(key_str, write_value) catch |err| {
         state.pending_kv_error = err;
     };
-    if (state.readset) |rs| rs.kv.appendKv(.set, key_str, write_value, .ok) catch {};
 
     if (td.runAfterChain(state, ctx, key_str, .put, write_value, prev_owned)) |trigger_path| {
         td.rollbackInnerSavepoint(state);
@@ -590,17 +601,17 @@ fn jsKvDelete(
     }
 
     // Fast path mirrors jsKvSet — no triggers means no savepoint, no
-    // previousValue lookup, no chain machinery.
+    // previousValue lookup, no chain machinery. Per §8, kv.delete
+    // (like kv.set) is an OUTPUT and isn't taped — replay re-runs
+    // the handler against its overlay.
     if (!td.anyTriggerMatches(state, key_str)) {
         state.txn.delete(key_str) catch |err| {
             state.pending_kv_error = err;
-            if (state.readset) |rs| rs.kv.appendKv(.delete, key_str, "", .err) catch {};
             return js_undefined;
         };
         state.writeset.addDelete(key_str) catch |err| {
             state.pending_kv_error = err;
         };
-        if (state.readset) |rs| rs.kv.appendKv(.delete, key_str, "", .ok) catch {};
         return js_undefined;
     }
 
@@ -635,13 +646,11 @@ fn jsKvDelete(
     state.txn.delete(key_str) catch |err| {
         state.pending_kv_error = err;
         td.rollbackInnerSavepoint(state);
-        if (state.readset) |rs| rs.kv.appendKv(.delete, key_str, "", .err) catch {};
         return js_undefined;
     };
     state.writeset.addDelete(key_str) catch |err| {
         state.pending_kv_error = err;
     };
-    if (state.readset) |rs| rs.kv.appendKv(.delete, key_str, "", .ok) catch {};
 
     if (td.runAfterChain(state, ctx, key_str, .delete, null, prev_owned)) |trigger_path| {
         td.rollbackInnerSavepoint(state);

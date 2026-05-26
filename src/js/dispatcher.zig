@@ -2585,7 +2585,7 @@ test "dispatch: per-store isolation by passing different kv per run" {
     try testing.expectEqualStrings("alice", r3.body);
 }
 
-test "dispatch: kv tape captures get/set/delete with outcomes" {
+test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2635,7 +2635,13 @@ test "dispatch: kv tape captures get/set/delete with outcomes" {
     }, &budget);
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(usize, 4), readset.kv.entries.items.len);
+    // `docs/primitive-gaps.md` §8: only foreign reads land on the
+    // tape. The handler does two `kv.get`s (both foreign — writeset
+    // is empty at both call sites), one `kv.set` (own-write, no
+    // tape entry), one `kv.delete` (own-write, no tape entry).
+    // Result: 2 tape entries, both `.get`. The kv.set/.delete are
+    // outputs replay re-issues against its writeset overlay.
+    try testing.expectEqual(@as(usize, 2), readset.kv.entries.items.len);
 
     const e0 = readset.kv.entries.items[0].kv;
     try testing.expectEqual(tape_mod.KvOp.get, e0.op);
@@ -2648,16 +2654,65 @@ test "dispatch: kv tape captures get/set/delete with outcomes" {
     try testing.expectEqualStrings("missing", e1.key);
     try testing.expectEqual(tape_mod.KvOutcome.not_found, e1.outcome);
 
-    const e2 = readset.kv.entries.items[2].kv;
-    try testing.expectEqual(tape_mod.KvOp.set, e2.op);
-    try testing.expectEqualStrings("new", e2.key);
-    try testing.expectEqualStrings("v1!", e2.value);
-    try testing.expectEqual(tape_mod.KvOutcome.ok, e2.outcome);
+    // §8 invariant: the writeset still records the writes so the
+    // dispatch path can replicate + apply them. Tape minimization
+    // is purely a capture-side compression.
+    try testing.expectEqual(@as(usize, 2), ws.ops.items.len);
+    try testing.expect(ws.containsKey("new"));
+    try testing.expect(ws.containsKey("seeded"));
+}
 
-    const e3 = readset.kv.entries.items[3].kv;
-    try testing.expectEqual(tape_mod.KvOp.delete, e3.op);
-    try testing.expectEqualStrings("seeded", e3.key);
-    try testing.expectEqual(tape_mod.KvOutcome.ok, e3.outcome);
+test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+    defer readset.deinit();
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    // Handler writes a key, then reads it back. The read is an
+    // OWN-read (the value lives in the activation's own writeset),
+    // reproducible by replay re-running the handler against its
+    // overlay — so no tape entry needed.
+    const bytecode = try ctx.compileToBytecode(
+        \\export function go() {
+        \\    kv.set("own", "hello");
+        \\    const v = kv.get("own");
+        \\    return v;
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator); defer d.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+        .method = "POST",
+        .path = "/",
+        .query = "fn=go",
+        .readset = &readset,
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    // Tape carries ZERO entries: the kv.set is an output (not taped),
+    // the kv.get reads from the writeset (own-read, not taped).
+    try testing.expectEqual(@as(usize, 0), readset.kv.entries.items.len);
+    try testing.expect(ws.containsKey("own"));
 }
 
 test "dispatch: Date/Math/crypto tapes capture non-determinism" {
