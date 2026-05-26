@@ -22,6 +22,7 @@ const std = @import("std");
 const apply_mod = @import("apply.zig");
 const tape_mod = @import("rove-tape");
 const log_mod = @import("rove-log");
+const bodies_mod = @import("rove-bodies");
 
 /// Max raft entries the walker processes per flusher tick. Caps
 /// per-tick latency so a long catch-up (e.g., fresh leader with
@@ -298,6 +299,132 @@ pub fn walkAndUploadCatchup(worker: anytype) !void {
     }
 }
 
+// ── Orphan-blob GC (Phase 5d) ─────────────────────────────────────────
+
+/// One `(tenant_id, batch_id)` BodyRef extracted from a raft entry's
+/// readset list. `tenant_id` is allocator-owned by the caller's
+/// passed-in list (every `append` dups the slice into the allocator
+/// the list uses).
+///
+/// Phase 5d: GC orchestrator scans the live raft log, accumulates
+/// referenced batches via `collectReferencedBatchesIntoList`, then
+/// deletes any `{tenant_id}/readset-blobs/{batch_id}` NOT in the
+/// referenced set (subject to a retention floor — the batch must be
+/// older than the longest tolerable propose-to-apply gap, otherwise
+/// in-flight references would race the sweep). See
+/// `docs/readset-replication-plan.md` §9 Phase 5d for the full
+/// algorithm + the operator-side S3 lifecycle-rule alternative
+/// (preferred pre-launch).
+pub const ReferencedBatch = struct {
+    tenant_id: []const u8,
+    batch_id: u64,
+
+    pub fn deinit(self: *ReferencedBatch, allocator: std.mem.Allocator) void {
+        if (self.tenant_id.len > 0) allocator.free(self.tenant_id);
+        self.* = undefined;
+    }
+};
+
+/// Walk a single raft entry's framed bytes
+/// (`[u64 seq BE][envelope]`) and append every `(tenant_id, batch_id)`
+/// BodyRef the entry's readset list references to `out`. Skips:
+///   - `body_ref.batch_id == bodies_mod.NO_BATCH` (small-body inline
+///     fast path — bytes ride in the readset itself, no blob to GC).
+///   - type-2 root_writeset (no per-tenant id, no readset).
+///   - type-0 with empty `rs_bytes` (non-handler producer).
+///   - Readset blobs that fail to parse (logs as
+///     `error.ParseFailure` — caller can ignore for GC purposes;
+///     deletion is gated on retention anyway).
+///
+/// Recurses into type-1 multi envelopes.
+///
+/// Allocator ownership: tenant_id is dup'd into `out`'s allocator.
+/// Caller frees via `ReferencedBatch.deinit` on each, then frees the
+/// list.
+pub fn collectReferencedBatchesIntoList(
+    allocator: std.mem.Allocator,
+    framed: []const u8,
+    out: *std.ArrayListUnmanaged(ReferencedBatch),
+) !void {
+    if (framed.len < 8) return;
+    const env_bytes = framed[8..];
+    try collectFromEnvelope(allocator, env_bytes, out);
+}
+
+fn collectFromEnvelope(
+    allocator: std.mem.Allocator,
+    env_bytes: []const u8,
+    out: *std.ArrayListUnmanaged(ReferencedBatch),
+) !void {
+    const env = apply_mod.decodeEnvelope(env_bytes) catch return;
+    switch (env.type) {
+        .writeset => try collectFromWriteSetEnvelope(allocator, env, out),
+        .multi => {
+            const inner_slice = apply_mod.decodeMultiInner(allocator, env.payload) catch return;
+            defer allocator.free(inner_slice);
+            for (inner_slice) |inner| {
+                try collectFromEnvelope(allocator, inner, out);
+            }
+        },
+        .root_writeset => {},
+    }
+}
+
+fn collectFromWriteSetEnvelope(
+    allocator: std.mem.Allocator,
+    env: apply_mod.Envelope,
+    out: *std.ArrayListUnmanaged(ReferencedBatch),
+) !void {
+    const payload = apply_mod.decodeWriteSetPayload(env.payload) catch return;
+    if (payload.rs_bytes.len == 0) return;
+
+    var parsed_list = tape_mod.parseReadsetList(allocator, payload.rs_bytes) catch return;
+    defer parsed_list.deinit(allocator);
+
+    for (parsed_list.blobs) |rs_blob| {
+        const parsed = tape_mod.parseReadset(rs_blob) catch continue;
+        const fetch_idx: usize = @intFromEnum(tape_mod.Channel.fetch_responses);
+        const trigger_idx: usize = @intFromEnum(tape_mod.Channel.trigger_payload);
+        try collectBatchesFromChannelBlob(
+            allocator,
+            env.instance_id,
+            parsed.blobs[fetch_idx],
+            out,
+        );
+        try collectBatchesFromChannelBlob(
+            allocator,
+            env.instance_id,
+            parsed.blobs[trigger_idx],
+            out,
+        );
+    }
+}
+
+fn collectBatchesFromChannelBlob(
+    allocator: std.mem.Allocator,
+    instance_id: []const u8,
+    channel_blob: []const u8,
+    out: *std.ArrayListUnmanaged(ReferencedBatch),
+) !void {
+    if (channel_blob.len == 0) return;
+    var parsed = tape_mod.parse(allocator, channel_blob) catch return;
+    defer parsed.deinit();
+    for (parsed.entries) |entry| {
+        const body_ref = switch (entry) {
+            .fetch_responses => |fr| fr.body_ref,
+            .trigger_payload => |tp| tp.body_ref,
+            else => continue,
+        };
+        if (body_ref.batch_id == bodies_mod.NO_BATCH) continue;
+        const tenant_dup = try allocator.dupe(u8, instance_id);
+        errdefer allocator.free(tenant_dup);
+        try out.append(allocator, .{
+            .tenant_id = tenant_dup,
+            .batch_id = body_ref.batch_id,
+        });
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -478,6 +605,199 @@ test "hydrate: readset with null LogHeader → skipped" {
     const records = try hydrateRecordsFromRaftEntry(a, framed);
     defer a.free(records);
     try testing.expectEqual(@as(usize, 0), records.len);
+}
+
+fn buildReadsetWithBodyRefs(
+    allocator: std.mem.Allocator,
+    fetch_batch_ids: []const u64,
+    trigger_batch_id: ?u64,
+    lh: log_mod.LogHeader,
+) ![]u8 {
+    var rs = tape_mod.Readset.init(allocator, 0, 0);
+    defer rs.deinit();
+    for (fetch_batch_ids, 0..) |bid, i| {
+        try rs.fetch_responses.appendFetchResponse(
+            "fetch-id",
+            @intCast(i),
+            0,
+            .{ .batch_id = bid, .offset = 0, .len = 128 },
+            false,
+            0,
+            false,
+            false,
+            "",
+            "",
+        );
+    }
+    if (trigger_batch_id) |bid| {
+        try rs.trigger_payload.appendTriggerPayload(
+            .{ .batch_id = bid, .offset = 0, .len = 256 },
+            "",
+            "",
+        );
+    }
+    return rs.serialize(allocator, lh);
+}
+
+fn defaultLh() log_mod.LogHeader {
+    return .{
+        .request_id = 1,
+        .deployment_id = 1,
+        .duration_ns = 0,
+        .status = 200,
+        .outcome = .ok,
+        .activation = .inbound,
+        .method = "GET",
+        .path = "/",
+        .host = "",
+        .correlation_id = "",
+    };
+}
+
+fn deinitList(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(ReferencedBatch)) void {
+    for (list.items) |*b| b.deinit(a);
+    list.deinit(a);
+}
+
+test "collectReferencedBatches: fetch_responses BodyRefs surfaced" {
+    const a = testing.allocator;
+    const rs = try buildReadsetWithBodyRefs(a, &.{ 5, 7, 9 }, null, defaultLh());
+    defer a.free(rs);
+    const rs_list = try tape_mod.encodeReadsetList(a, &.{rs});
+    defer a.free(rs_list);
+    const env = try apply_mod.encodeWriteSetEnvelope(a, "acme", "", rs_list);
+    defer a.free(env);
+    const framed = try a.alloc(u8, 8 + env.len);
+    defer a.free(framed);
+    std.mem.writeInt(u64, framed[0..8], 1, .big);
+    @memcpy(framed[8..], env);
+
+    var out: std.ArrayListUnmanaged(ReferencedBatch) = .empty;
+    defer deinitList(a, &out);
+    try collectReferencedBatchesIntoList(a, framed, &out);
+
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+    try testing.expectEqualStrings("acme", out.items[0].tenant_id);
+    try testing.expectEqual(@as(u64, 5), out.items[0].batch_id);
+    try testing.expectEqual(@as(u64, 7), out.items[1].batch_id);
+    try testing.expectEqual(@as(u64, 9), out.items[2].batch_id);
+}
+
+test "collectReferencedBatches: trigger_payload BodyRef surfaced" {
+    const a = testing.allocator;
+    const rs = try buildReadsetWithBodyRefs(a, &.{}, 42, defaultLh());
+    defer a.free(rs);
+    const rs_list = try tape_mod.encodeReadsetList(a, &.{rs});
+    defer a.free(rs_list);
+    const env = try apply_mod.encodeWriteSetEnvelope(a, "globex", "", rs_list);
+    defer a.free(env);
+    const framed = try a.alloc(u8, 8 + env.len);
+    defer a.free(framed);
+    std.mem.writeInt(u64, framed[0..8], 2, .big);
+    @memcpy(framed[8..], env);
+
+    var out: std.ArrayListUnmanaged(ReferencedBatch) = .empty;
+    defer deinitList(a, &out);
+    try collectReferencedBatchesIntoList(a, framed, &out);
+
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqualStrings("globex", out.items[0].tenant_id);
+    try testing.expectEqual(@as(u64, 42), out.items[0].batch_id);
+}
+
+test "collectReferencedBatches: NO_BATCH (inline fast path) skipped" {
+    const a = testing.allocator;
+    // body_ref.batch_id == NO_BATCH ⇒ inline path; nothing to GC.
+    const rs = try buildReadsetWithBodyRefs(
+        a,
+        &.{ bodies_mod.NO_BATCH, 17 }, // mix inline + real
+        bodies_mod.NO_BATCH, // inline trigger payload
+        defaultLh(),
+    );
+    defer a.free(rs);
+    const rs_list = try tape_mod.encodeReadsetList(a, &.{rs});
+    defer a.free(rs_list);
+    const env = try apply_mod.encodeWriteSetEnvelope(a, "acme", "", rs_list);
+    defer a.free(env);
+    const framed = try a.alloc(u8, 8 + env.len);
+    defer a.free(framed);
+    std.mem.writeInt(u64, framed[0..8], 3, .big);
+    @memcpy(framed[8..], env);
+
+    var out: std.ArrayListUnmanaged(ReferencedBatch) = .empty;
+    defer deinitList(a, &out);
+    try collectReferencedBatchesIntoList(a, framed, &out);
+
+    // Only the batch_id == 17 entry surfaces.
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(u64, 17), out.items[0].batch_id);
+}
+
+test "collectReferencedBatches: multi envelope walks every inner" {
+    const a = testing.allocator;
+    const rs_a = try buildReadsetWithBodyRefs(a, &.{100}, null, defaultLh());
+    defer a.free(rs_a);
+    const rs_b = try buildReadsetWithBodyRefs(a, &.{}, 200, defaultLh());
+    defer a.free(rs_b);
+
+    const list_a = try tape_mod.encodeReadsetList(a, &.{rs_a});
+    defer a.free(list_a);
+    const list_b = try tape_mod.encodeReadsetList(a, &.{rs_b});
+    defer a.free(list_b);
+
+    const inner_a = try apply_mod.encodeWriteSetEnvelope(a, "ta", "", list_a);
+    defer a.free(inner_a);
+    const inner_b = try apply_mod.encodeWriteSetEnvelope(a, "tb", "", list_b);
+    defer a.free(inner_b);
+
+    const wrapped = try apply_mod.encodeMultiEnvelope(a, &.{ inner_a, inner_b });
+    defer a.free(wrapped);
+    const framed = try a.alloc(u8, 8 + wrapped.len);
+    defer a.free(framed);
+    std.mem.writeInt(u64, framed[0..8], 4, .big);
+    @memcpy(framed[8..], wrapped);
+
+    var out: std.ArrayListUnmanaged(ReferencedBatch) = .empty;
+    defer deinitList(a, &out);
+    try collectReferencedBatchesIntoList(a, framed, &out);
+
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    // Order matches walk order: inner_a then inner_b.
+    try testing.expectEqualStrings("ta", out.items[0].tenant_id);
+    try testing.expectEqual(@as(u64, 100), out.items[0].batch_id);
+    try testing.expectEqualStrings("tb", out.items[1].tenant_id);
+    try testing.expectEqual(@as(u64, 200), out.items[1].batch_id);
+}
+
+test "collectReferencedBatches: empty rs_bytes / root_writeset / malformed → no entries" {
+    const a = testing.allocator;
+    // type-0 with empty rs_bytes.
+    const env_empty = try apply_mod.encodeWriteSetEnvelope(a, "acme", "ws", "");
+    defer a.free(env_empty);
+    const framed_empty = try a.alloc(u8, 8 + env_empty.len);
+    defer a.free(framed_empty);
+    std.mem.writeInt(u64, framed_empty[0..8], 1, .big);
+    @memcpy(framed_empty[8..], env_empty);
+
+    var out: std.ArrayListUnmanaged(ReferencedBatch) = .empty;
+    defer deinitList(a, &out);
+    try collectReferencedBatchesIntoList(a, framed_empty, &out);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+
+    // type-2 root_writeset.
+    const env_root = try apply_mod.encodeRootWriteSetEnvelope(a, "root ws");
+    defer a.free(env_root);
+    const framed_root = try a.alloc(u8, 8 + env_root.len);
+    defer a.free(framed_root);
+    std.mem.writeInt(u64, framed_root[0..8], 2, .big);
+    @memcpy(framed_root[8..], env_root);
+    try collectReferencedBatchesIntoList(a, framed_root, &out);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+
+    // Malformed framed (too short).
+    const short: [4]u8 = .{ 0, 0, 0, 1 };
+    try collectReferencedBatchesIntoList(a, &short, &out);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "hydrate: malformed framed bytes → empty (no panic)" {
