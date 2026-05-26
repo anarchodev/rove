@@ -736,13 +736,36 @@ Increments (planned, smallest-first):
   channels and the customer log surface shows method / path /
   status / outcome / correlation_id / activation without inline
   body bytes.
-- **5d — orphan-blob GC**: periodic sweep over each tenant's
-  `readset-blobs/` prefix. Walks recent raft entries, collects
-  referenced `(tenant, batch_id)` pairs from BodyRefs across the
-  readset's fetch_responses + trigger_payload channels, deletes
-  any batch older than the retention watermark with no incoming
-  references. Same shape as the manifest-pointer GC story for
-  customer files.
+- **5d — orphan-blob GC (algorithmic core shipped; operator-side
+  delete deferred)**:
+  - **5d-base (shipped)**: `collectReferencedBatchesIntoList`
+    in `worker_upload_walker.zig` extracts every
+    `(tenant_id, batch_id)` BodyRef the live raft log
+    references. Walks type-0 / type-1 (recursively) / skips
+    type-2; parses each readset blob's fetch_responses +
+    trigger_payload channels; skips `body_ref.batch_id ==
+    bodies_mod.NO_BATCH` (small-body inline path — no blob
+    exists). 5 unit tests cover fetch / trigger / inline-skip /
+    multi-envelope / empty+malformed.
+  - **5d-deferred — operator-side delete**: the actual S3
+    `LIST` + `DELETE` is NOT wired today. The `BlobStore`
+    vtable would need a `list(prefix, after, max)` op
+    (~150 LOC of `ListObjectsV2` + XML parse + sigv4, mirroring
+    the existing implementation in
+    `src/log_server/batch_store_s3.zig`). Pre-launch, the
+    recommended setup is a **bucket lifecycle expiration rule**
+    on `*/readset-blobs/*` matching the operator's longest
+    expected raft-log retention window (1–7 days for typical
+    deploys). This trades the in-code sweep — and its read-side
+    list cost — for one cron job on the S3 control plane.
+    Trigger conditions for actually shipping in-code GC:
+      * an S3 backend that doesn't support lifecycle rules
+        (rare — AWS / OVH / R2 / B2 / MinIO all do);
+      * a customer needs sub-day GC latency for cost reasons;
+      * tenant-eviction-on-delete needs synchronous cleanup.
+    None of these conditions hold pre-launch. The algorithmic
+    core ships today so a future in-code sweeper has a tested
+    reference for "what's live."
 
 ### Phase 6 — verification
 
