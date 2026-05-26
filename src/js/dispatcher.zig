@@ -498,9 +498,10 @@ pub const Dispatcher = struct {
             .writeset = writeset,
             .console = &console_buf,
             .readset = request.readset,
-            .prng = std.Random.DefaultPrng.init(
-                if (request.readset) |rs| rs.seed else 0,
-            ),
+            // `docs/primitive-gaps.md` §9 — Zig-side PRNG retired.
+            // arenajs's per-request xorshift64star state is the
+            // single PRNG; seeded by `installRequest` from
+            // `state.readset.?.seed`.
             .request_id = request.request_id,
             .session_id = request.session_id,
             .platform = request.platform,
@@ -2715,7 +2716,7 @@ test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
     try testing.expect(ws.containsKey("own"));
 }
 
-test "dispatch: Date/Math/crypto tapes capture non-determinism" {
+test "dispatch: Date tape captures clock reads (§9: Math/crypto are seed-only)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2723,9 +2724,10 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
         cleanupTempKv(&buf);
     }
 
-    // Fixed seed = 42 so the two runs below produce bit-identical
-    // Math.random / crypto streams. timestamp is recorded but not
-    // load-bearing for this test's assertions.
+    // §9: Math.random + crypto.* draw from arenajs's per-request
+    // PRNG (seeded by `installRequest` with `readset.seed`). No
+    // per-draw tape entries — the seed scalar IS the entire
+    // "tape" for random. Date.now still tapes each clock read.
     var readset = tape_mod.Readset.init(testing.allocator, 0, 42);
     defer readset.deinit();
 
@@ -2750,7 +2752,10 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
     );
     defer testing.allocator.free(bytecode);
 
+    // First run captures the actual output for the comparison run.
     var d = try Dispatcher.init(testing.allocator); defer d.deinit();
+    var body_1: []u8 = &.{};
+    defer if (body_1.len > 0) testing.allocator.free(body_1);
     {
         var txn = try kv.beginTrackedImmediate();
         defer txn.rollback() catch {};
@@ -2764,22 +2769,24 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
             .query = "fn=go",
             .readset = &readset,
         }, &budget);
-        resp.deinit(testing.allocator);
+        defer resp.deinit(testing.allocator);
+        body_1 = try testing.allocator.dupe(u8, resp.body);
     }
 
+    // Date is wall-clock — one entry per Date.now() call.
     try testing.expectEqual(@as(usize, 1), readset.date.entries.items.len);
-    try testing.expectEqual(@as(usize, 2), readset.math_random.entries.items.len);
-    // getRandomValues(4 bytes) + randomUUID(16 raw bytes) → two entries
-    try testing.expectEqual(@as(usize, 2), readset.crypto_random.entries.items.len);
-    try testing.expectEqual(@as(usize, 4), readset.crypto_random.entries.items[0].crypto_random.bytes.len);
-    try testing.expectEqual(@as(usize, 16), readset.crypto_random.entries.items[1].crypto_random.bytes.len);
+    // §9: Math.random + crypto.* draw from the per-context PRNG
+    // seeded once at request entry. No dedicated tape channels —
+    // the seed scalar IS the entire input.
 
-    // Replaying the same seed with a fresh readset should yield
-    // bit-identical math_random and crypto values (date is wall-clock
-    // so we skip it here).
+    // Same seed → bit-identical Math.random + crypto.* output across
+    // runs. Date.now drifts so we strip the timestamp prefix before
+    // comparing.
     var readset2 = tape_mod.Readset.init(testing.allocator, 0, 42);
     defer readset2.deinit();
 
+    var body_2: []u8 = &.{};
+    defer if (body_2.len > 0) testing.allocator.free(body_2);
     {
         var txn2 = try kv.beginTrackedImmediate();
         defer txn2.rollback() catch {};
@@ -2792,27 +2799,15 @@ test "dispatch: Date/Math/crypto tapes capture non-determinism" {
             .query = "fn=go",
             .readset = &readset2,
         }, &budget2);
-        resp2.deinit(testing.allocator);
+        defer resp2.deinit(testing.allocator);
+        body_2 = try testing.allocator.dupe(u8, resp2.body);
     }
 
-    try testing.expectEqual(
-        readset.math_random.entries.items[0].math_random.bits,
-        readset2.math_random.entries.items[0].math_random.bits,
-    );
-    try testing.expectEqual(
-        readset.math_random.entries.items[1].math_random.bits,
-        readset2.math_random.entries.items[1].math_random.bits,
-    );
-    try testing.expectEqualSlices(
-        u8,
-        readset.crypto_random.entries.items[0].crypto_random.bytes,
-        readset2.crypto_random.entries.items[0].crypto_random.bytes,
-    );
-    try testing.expectEqualSlices(
-        u8,
-        readset.crypto_random.entries.items[1].crypto_random.bytes,
-        readset2.crypto_random.entries.items[1].crypto_random.bytes,
-    );
+    // Strip the "{timestamp}|" prefix and compare the rest
+    // (r1|r2|id).
+    const idx_1 = std.mem.indexOfScalar(u8, body_1, '|').?;
+    const idx_2 = std.mem.indexOfScalar(u8, body_2, '|').?;
+    try testing.expectEqualStrings(body_1[idx_1..], body_2[idx_2..]);
 }
 
 test "dispatch: tight loop hits budget and returns Interrupted" {

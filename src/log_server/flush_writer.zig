@@ -336,10 +336,19 @@ fn writeTapePayloads(
     t: *const log_mod.TapePayloads,
 ) !void {
     try w.writeByte('{');
-    try writeBytesField(allocator, w, "kv_tape_b64", t.kv_tape_bytes, true);
+    // `docs/primitive-gaps.md` §9 seed-not-draws: the PRNG seed
+    // used at capture time. Replay reseeds the per-context PRNG
+    // with this scalar so `Math.random` + `crypto.*` reproduce the
+    // exact draw sequence — no per-draw tape entries.
+    //
+    // Emitted as a JSON string so the consumer can BigInt() it
+    // without precision loss: production seeds derive from
+    // wall-clock ns (~1.7e18) which overflows JS's f64 Number at
+    // 2^53. JSON.parse → Number truncates the low bits; reading a
+    // string + BigInt() is precise.
+    try w.print("\"seed\":\"{d}\"", .{t.seed});
+    try writeBytesField(allocator, w, "kv_tape_b64", t.kv_tape_bytes, false);
     try writeBytesField(allocator, w, "date_tape_b64", t.date_tape_bytes, false);
-    try writeBytesField(allocator, w, "math_random_tape_b64", t.math_random_tape_bytes, false);
-    try writeBytesField(allocator, w, "crypto_random_tape_b64", t.crypto_random_tape_bytes, false);
     try writeBytesField(allocator, w, "module_tree_b64", t.module_tree_bytes, false);
     try writeBytesField(allocator, w, "fetch_responses_tape_b64", t.fetch_responses_tape_bytes, false);
     try writeBytesField(allocator, w, "trigger_payload_tape_b64", t.trigger_payload_tape_bytes, false);

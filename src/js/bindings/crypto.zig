@@ -1,9 +1,11 @@
 //! `crypto.*` JS bindings exposed to handler code.
 //!
-//! All randomness draws from `state.prng` (per-request) and is taped
-//! through `state.readset.crypto_random` when set, so replay
-//! reproduces the same byte sequence. Hashes are pure (no readset
-//! capture needed).
+//! Randomness draws from arenajs's per-context xorshift64star via
+//! `JS_FillRandomBytes` — seeded once per request from
+//! `readset.seed` in `globals.installRequest` (§9 seed-not-draws).
+//! Replay reproduces the same byte sequence by reseeding the PRNG
+//! with the captured request's seed; no per-draw tape entries.
+//! Hashes are pure (no readset capture needed).
 
 const std = @import("std");
 const qjs = @import("rove-qjs");
@@ -40,9 +42,14 @@ pub fn jsCryptoGetRandomValues(
     const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, argv[0]);
     if (buf_ptr == null) return js_exception;
 
-    const bytes = buf_ptr[0..byte_len];
-    state.prng.random().bytes(bytes);
-    if (state.readset) |rs| rs.crypto_random.appendCryptoRandom(bytes) catch {};
+    // `docs/primitive-gaps.md` §9 — bytes come from arenajs's per-
+    // request xorshift64star state (seeded once per request via
+    // JS_SetRandomSeed). Same PRNG Math.random draws from, so replay
+    // reproduces by re-seeding with the recorded request seed. No
+    // tape entry — the seed scalar on the readset header is the
+    // entire "tape" for random.
+    _ = state;
+    c.JS_FillRandomBytes(ctx, buf_ptr, byte_len);
     // Spec says return the input typed array.
     return c.JS_DupValue(ctx, argv[0]);
 }
@@ -129,17 +136,13 @@ pub fn jsCryptoRandomUuid(
     _: c_int,
     _: [*c]c.JSValue,
 ) callconv(.c) c.JSValue {
-    const state = globals.getState(ctx);
-
     var raw: [16]u8 = undefined;
-    state.prng.random().bytes(&raw);
+    // §9: bytes from arenajs's per-request PRNG, same stream as
+    // Math.random + crypto.*. Replay reproduces by re-seeding.
+    c.JS_FillRandomBytes(ctx, &raw, raw.len);
     // RFC 4122 v4: set the version and variant bits.
     raw[6] = (raw[6] & 0x0f) | 0x40;
     raw[8] = (raw[8] & 0x3f) | 0x80;
-
-    // Capture the raw bytes on the crypto tape so the replay source
-    // can reconstruct the same UUID without knowing the formatting.
-    if (state.readset) |rs| rs.crypto_random.appendCryptoRandom(&raw) catch {};
 
     var out: [36]u8 = undefined;
     const hex = "0123456789abcdef";
@@ -157,9 +160,10 @@ pub fn jsCryptoRandomUuid(
 }
 
 /// `crypto.randomBytes(n) → Uint8Array` — n cryptographically random
-/// bytes drawn from the per-request PRNG. Tape-backed: bytes are
-/// recorded on `crypto_random_tape` so replay produces the same
-/// sequence.
+/// bytes drawn from the per-context PRNG (xorshift64star, seeded
+/// once per request from `readset.seed`). Replay reproduces the
+/// same sequence by reseeding before the handler runs (§9
+/// seed-not-draws — no per-draw tape entries).
 ///
 /// `n` must be a non-negative integer ≤ 65536 (Web Crypto's typical
 /// per-call cap). Throws RangeError otherwise.
@@ -189,8 +193,8 @@ pub fn jsCryptoRandomBytes(
     };
     defer state.allocator.free(bytes);
 
-    state.prng.random().bytes(bytes);
-    if (state.readset) |rs| rs.crypto_random.appendCryptoRandom(bytes) catch {};
+    // §9: same xorshift64star state as Math.random.
+    c.JS_FillRandomBytes(ctx, bytes.ptr, bytes.len);
 
     return c.JS_NewUint8ArrayCopy(ctx, bytes.ptr, bytes.len);
 }

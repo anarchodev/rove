@@ -39,8 +39,11 @@ const raw = JSON.parse(fs.readFileSync(bundlePath, "utf-8"));
 // The orchestrator writes tape_blobs as base64 strings (since JSON
 // can't hold raw bytes). Decode each channel to a Uint8Array; null
 // when the channel had no entries in the captured record.
+// `docs/primitive-gaps.md` §9: only kv + date + module remain on
+// the wire. `Math.random` + `crypto.*` reseed once from
+// `raw.seed`, no per-draw tape entries.
 const tape_blobs = {};
-for (const k of ["kv", "date", "math_random", "crypto_random", "module"]) {
+for (const k of ["kv", "date", "module"]) {
     const b64 = raw.tape_blobs?.[k];
     tape_blobs[k] = b64 ? new Uint8Array(Buffer.from(b64, "base64")) : null;
 }
@@ -55,6 +58,7 @@ const Module = await getArenaJs({
 const arena_init           = Module.cwrap("arena_init",           "number", ["number","number"]);
 const arena_run_module     = Module.cwrap("arena_run_module",     "number", ["string","string"]);
 const arena_set_trace_mode = Module.cwrap("arena_set_trace_mode", null,     ["number"]);
+const arena_set_random_seed = Module.cwrap("arena_set_random_seed", null,   ["number","number"]);
 const arena_destroy        = Module.cwrap("arena_destroy",        null,     []);
 
 if (arena_init(8192, 8192) !== 0) fail("arena_init failed");
@@ -64,6 +68,15 @@ try {
 } catch (err) {
     fail("buildTapesFromBlobs: " + err.message);
 }
+
+// §9 seed-not-draws: reseed the per-context PRNG from the captured
+// request's seed before running the handler. `Math.random` /
+// `crypto.*` then reproduce the original draw sequence.
+const seed_bi = BigInt(raw.seed ?? 0);
+arena_set_random_seed(
+    Number(seed_bi & 0xFFFFFFFFn),
+    Number((seed_bi >> 32n) & 0xFFFFFFFFn),
+);
 
 const module_sources = {};
 for (const m of raw.modules || []) {

@@ -1218,10 +1218,17 @@ async function main() {
     const railWidth = Math.max(200, Math.floor($scrubber?.getBoundingClientRect().width ?? 800));
     const targetSnapshots = Math.min(railWidth, 800);
 
+    // §9 seed-not-draws: the bundle carries the captured request's
+    // PRNG seed (u64 in `bundle.seed`, or 0 if the capture pre-dates
+    // §9). `CursorEngine._installReplay` calls
+    // `arena_set_random_seed(lo, hi)` so `Math.random` / `crypto.*`
+    // draw the same sequence as the original request.
+    const seed = bundle.seed != null ? BigInt(bundle.seed) : 0n;
+
     let mat;
     try {
         mat = await state.engine.materialise(
-            { entry: { name: entryPath, src: entrySrc }, tapes, module_sources: moduleSources },
+            { entry: { name: entryPath, src: entrySrc }, tapes, module_sources: moduleSources, seed },
             { targetSnapshots },
         );
     } catch (err) {

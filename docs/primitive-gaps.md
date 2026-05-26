@@ -921,11 +921,23 @@ onto them:
 
 | Channel | Today | Minimal form | Kind | Section |
 |---|---|---|---|---|
-| `kv` | every get/set/delete/prefix | foreign gets/prefixes only | read set | §8 |
+| `kv` | foreign gets/prefixes only | foreign gets/prefixes only | read set | §8 ✅ |
 | `date` | every `Date.now` | timestamp value (i64) | timestamp | — |
-| `math_random` | every draw | one per-request seed | seed | §9 |
-| `crypto_random` | every draw, as bytes | one seed (security check pending) | seed | §9 |
+| `math_random` | — (deleted) | one per-request seed | seed | §9 ✅ |
+| `crypto_random` | — (deleted) | one seed | seed | §9 ✅ |
 | `module` | specifier → bytecode hash | unchanged — already a hash | CAS extent | §7 |
+
+§9 shipped 2026-05-26: `math_random` + `crypto_random` were
+retired as dedicated tape channels. arenajs's per-context
+xorshift64star is seeded once per request via
+`JS_SetRandomSeed(ctx, readset.seed)` in `globals.installRequest`;
+`crypto.getRandomValues` / `randomUUID` / `randomBytes` draw from
+the same state via `JS_FillRandomBytes`. Replay reseeds with the
+captured request's seed via `arena_set_random_seed` (cwrapped from
+the WASM build) — no per-draw entries, no host callouts. The
+remaining wire channels are `kv` + `date` + `module` +
+`fetch_responses` + `trigger_payload` (5 channels, READSET_VERSION
+3).
 
 By the §7.2 mechanism axis: the read set and the timestamp are
 **direct values** — recorded inline, irreducibly; a clock read is

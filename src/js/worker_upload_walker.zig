@@ -158,15 +158,11 @@ fn buildLogRecord(
     errdefer tapes.deinit(allocator);
     const kv_idx: usize = @intFromEnum(tape_mod.Channel.kv);
     const date_idx: usize = @intFromEnum(tape_mod.Channel.date);
-    const math_idx: usize = @intFromEnum(tape_mod.Channel.math_random);
-    const crypto_idx: usize = @intFromEnum(tape_mod.Channel.crypto_random);
     const module_idx: usize = @intFromEnum(tape_mod.Channel.module);
     const fetch_idx: usize = @intFromEnum(tape_mod.Channel.fetch_responses);
     const trigger_idx: usize = @intFromEnum(tape_mod.Channel.trigger_payload);
     tapes.kv_tape_bytes = try allocator.dupe(u8, channel_blobs[kv_idx]);
     tapes.date_tape_bytes = try allocator.dupe(u8, channel_blobs[date_idx]);
-    tapes.math_random_tape_bytes = try allocator.dupe(u8, channel_blobs[math_idx]);
-    tapes.crypto_random_tape_bytes = try allocator.dupe(u8, channel_blobs[crypto_idx]);
     tapes.module_tree_bytes = try allocator.dupe(u8, channel_blobs[module_idx]);
     tapes.fetch_responses_tape_bytes = try allocator.dupe(u8, channel_blobs[fetch_idx]);
     tapes.trigger_payload_tape_bytes = try allocator.dupe(u8, channel_blobs[trigger_idx]);

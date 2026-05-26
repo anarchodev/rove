@@ -18,12 +18,18 @@
 //! replay could diff each channel separately and surface which source
 //! of non-determinism drifted. We keep that split:
 //!
-//! - `.kv`            — every `kv.get` / `kv.set` / `kv.delete`
+//! - `.kv`            — every foreign `kv.get` / `kv.prefix` resolution
+//!                      (§8 minimal kv read set; writes are outputs)
 //! - `.date`          — every `Date.now` call + `new Date()` with no args
-//! - `.math_random`   — every `Math.random` call
-//! - `.crypto_random` — `crypto.getRandomValues` + `crypto.randomUUID`
 //! - `.module`        — module resolution tree (what deployment id / path
 //!                      resolved to which bytecode hash)
+//!
+//! `Math.random` + `crypto.getRandomValues` + `crypto.randomUUID` no
+//! longer have dedicated channels (`docs/primitive-gaps.md` §9
+//! seed-not-draws): arenajs's per-context xorshift64star PRNG is
+//! seeded once per request from `Readset.seed` and produces the
+//! same sequence on capture and replay. The seed scalar IS the
+//! entire tape for random — O(1) instead of O(draws).
 //!
 //! Each channel is its own `Tape` value — a linear sequence of
 //! `Entry`s — and each tape serializes to its own blob. On flush, the
@@ -65,18 +71,13 @@ const bodies_mod = @import("rove-bodies");
 const log_mod = @import("rove-log");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
-/// Bumped 1 → 2 by `docs/primitive-gaps.md` §8 (minimal kv read set).
-/// Wire shape is unchanged — same `Entry` encoding per channel — but
-/// the kv channel's SEMANTICS shifted: it now records only foreign
-/// reads (gets/prefixes resolving to state committed before the
-/// activation). `kv.set` / `kv.delete` are outputs, not inputs;
-/// replay re-runs the handler and re-issues them against an in-
-/// engine writeset overlay. A v2 replay engine reading a v1 tape
-/// (or v1 engine reading v2) would see a different number of kv
-/// entries than the handler-call sequence expects → mismatch
-/// detected at the first kv.set call. Pre-launch — no v1 tapes
-/// need to be readable post-bump.
-pub const VERSION: u16 = 2;
+/// Bumped 1 → 2 by `docs/primitive-gaps.md` §8 (minimal kv read set);
+/// 2 → 3 by §9 (seed-not-draws). The §9 bump dropped the
+/// `.math_random` and `.crypto_random` channel variants from the
+/// per-tape `Entry` union — a v2 reader against a v3 tape would
+/// trip on the unknown channel byte and fail-loud. Pre-launch —
+/// no v2 tapes need to be readable post-bump.
+pub const VERSION: u16 = 3;
 
 /// Magic + version for the whole-Readset wire format used by
 /// `Readset.serialize` (`docs/readset-replication-plan.md` Phase 3).
@@ -88,31 +89,39 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// added after the 7 channels so any node can rebuild the customer
 /// LogRecord from the raft entry alone. `log_header_len == 0` is
 /// the "no header" sentinel (non-handler producers, paths that
-/// don't yet stamp a header). Pre-launch — no v1 raft logs to
-/// migrate, so the version bump is a hard cutover.
-pub const READSET_VERSION: u16 = 2;
-pub const READSET_CHANNEL_COUNT: usize = 7;
+/// don't yet stamp a header). 2 → 3 by `docs/primitive-gaps.md` §9
+/// (seed-not-draws): the `.math_random` and `.crypto_random`
+/// channels were removed, dropping the channel count 7 → 5. The
+/// header's `seed` scalar is now the entire input for random.
+/// Pre-launch — no v2 raft logs to migrate, hard cutover.
+pub const READSET_VERSION: u16 = 3;
+pub const READSET_CHANNEL_COUNT: usize = 5;
 
+/// Renumbered contiguously by `docs/primitive-gaps.md` §9:
+/// `math_random` (formerly 2) and `crypto_random` (formerly 3) are
+/// removed, and the remaining channels collapse to 0..4 so callers
+/// can use `@intFromEnum(Channel.X)` to index the
+/// `parsed_readset.blobs[5]` array directly. Renumbering rides the
+/// VERSION 2 → 3 bump (per-tape decoder rejects mismatched ids
+/// against the inner-blob channel header).
 pub const Channel = enum(u16) {
     kv = 0,
     date = 1,
-    math_random = 2,
-    crypto_random = 3,
-    module = 4,
+    module = 2,
     /// `docs/readset-replication-plan.md` Phase 2c-2. One entry per
     /// `http.fetch` chunk activation; each entry records the
     /// `BodyRef` naming the bytes in the per-tenant readset-blob
     /// (`{tenant}/readset-blobs/{batch_id}`). Replay resolves the
     /// bytes via `BlobStore.getRange` rather than reading them
     /// inline from the log blob.
-    fetch_responses = 5,
+    fetch_responses = 3,
     /// `docs/readset-replication-plan.md` Phase 2d. Zero or one entry
     /// per inbound dispatch. Captures the request body's `BodyRef`
     /// (the bytes streamed into the per-tenant readset-blob) so
     /// replay can resolve `request.body` via `BlobStore.getRange`
     /// instead of the inline `request_body_bytes` capture.
     /// Zero entries when the request had no body.
-    trigger_payload = 6,
+    trigger_payload = 4,
 };
 
 /// Outcome of a kv operation as captured on the tape. `NotFound` is
@@ -153,8 +162,6 @@ pub const KvPair = struct {
 pub const Entry = union(Channel) {
     kv: KvEntry,
     date: DateEntry,
-    math_random: MathRandomEntry,
-    crypto_random: CryptoRandomEntry,
     module: ModuleEntry,
     fetch_responses: FetchResponseEntry,
     trigger_payload: TriggerPayloadEntry,
@@ -185,17 +192,6 @@ pub const Entry = union(Channel) {
     pub const DateEntry = struct {
         /// Milliseconds since epoch — what `Date.now()` returned.
         ms_epoch: i64,
-    };
-
-    pub const MathRandomEntry = struct {
-        /// The 64-bit float `Math.random` produced. Stored as raw bits
-        /// to avoid any float-formatting ambiguity on the wire.
-        bits: u64,
-    };
-
-    pub const CryptoRandomEntry = struct {
-        /// Raw random bytes that were handed to the handler.
-        bytes: []const u8,
     };
 
     pub const ModuleEntry = struct {
@@ -412,23 +408,6 @@ pub const Tape = struct {
         try self.entries.append(self.allocator, .{ .date = .{ .ms_epoch = ms_epoch } });
     }
 
-    pub fn appendMathRandom(self: *Tape, value: f64) !void {
-        std.debug.assert(self.channel == .math_random);
-        try self.entries.append(self.allocator, .{
-            .math_random = .{ .bits = @bitCast(value) },
-        });
-    }
-
-    pub fn appendCryptoRandom(self: *Tape, bytes: []const u8) !void {
-        std.debug.assert(self.channel == .crypto_random);
-        const copy = try self.allocator.dupe(u8, bytes);
-        errdefer self.allocator.free(copy);
-        try self.entries.append(self.allocator, .{
-            .crypto_random = .{ .bytes = copy },
-        });
-        self.owned_bytes += copy.len;
-    }
-
     pub fn appendModule(
         self: *Tape,
         specifier: []const u8,
@@ -580,23 +559,19 @@ pub const Tape = struct {
 pub const Readset = struct {
     /// Wall-clock nanosecond timestamp captured once at dispatch
     /// entry — the canonical "when this request was received."
-    /// Used to seed `Math.random`/`crypto.*` PRNG (via `.seed`,
-    /// see below) and recorded so replay sees the same start
-    /// instant. Stored alongside the per-call `.date` tape, which
-    /// captures each `Date.now()` separately.
+    /// Stored alongside the per-call `.date` tape, which captures
+    /// each `Date.now()` separately.
     timestamp_ns: i64,
-    /// PRNG seed used to initialize the dispatcher's
-    /// `std.Random.DefaultPrng` for `Math.random` and
-    /// `crypto.getRandomValues` / `crypto.randomUUID`. Production
-    /// callers derive it from `timestamp_ns`; tests pass a fixed
-    /// value for determinism. Belt-and-suspenders for "the tape
-    /// was dropped but the seed survived" — replay primarily reads
-    /// the per-call `.math_random` / `.crypto_random` tapes.
+    /// PRNG seed for arenajs's per-context xorshift64star, set once
+    /// per request via `JS_SetRandomSeed` in `installRequest`.
+    /// `Math.random` + `crypto.getRandomValues` +
+    /// `crypto.randomUUID` all draw from this single state, so the
+    /// scalar IS the entire input for random (§9 seed-not-draws).
+    /// Production callers derive it from `timestamp_ns`; tests pass
+    /// a fixed value for determinism.
     seed: u64,
     kv: Tape,
     date: Tape,
-    math_random: Tape,
-    crypto_random: Tape,
     module: Tape,
     /// `docs/readset-replication-plan.md` Phase 2c-2: one entry per
     /// `http.fetch` chunk activation. Captures the `BodyRef` naming
@@ -619,8 +594,6 @@ pub const Readset = struct {
             .seed = seed,
             .kv = Tape.init(allocator, .kv),
             .date = Tape.init(allocator, .date),
-            .math_random = Tape.init(allocator, .math_random),
-            .crypto_random = Tape.init(allocator, .crypto_random),
             .module = Tape.init(allocator, .module),
             .fetch_responses = Tape.init(allocator, .fetch_responses),
             .trigger_payload = Tape.init(allocator, .trigger_payload),
@@ -630,8 +603,6 @@ pub const Readset = struct {
     pub fn deinit(self: *Readset) void {
         self.kv.deinit();
         self.date.deinit();
-        self.math_random.deinit();
-        self.crypto_random.deinit();
         self.module.deinit();
         self.fetch_responses.deinit();
         self.trigger_payload.deinit();
@@ -640,21 +611,20 @@ pub const Readset = struct {
     /// Serialize the whole readset to a single blob suitable for the
     /// raft entry's readset section
     /// (`docs/readset-replication-plan.md` Phase 3 + 5a). Wire format
-    /// (READSET_VERSION = 2):
+    /// (READSET_VERSION = 3):
     ///
     /// ```
     /// [u32  magic = READSET_MAGIC ('RREA')]
     /// [u16  version = READSET_VERSION]
     /// [i64  timestamp_ns  big-endian]
     /// [u64  seed          big-endian]
-    /// for each of the 7 channels in fixed order:
+    /// for each of the 5 channels in fixed order:
     ///   [u32 blob_len BE][blob_bytes]   // blob is a full Tape.serialize()
     /// [u32 log_header_len BE][log_header_bytes]   // Phase 5a
     /// ```
     ///
-    /// Channels are emitted in the order matching the `Channel` enum
-    /// (kv=0, date=1, math_random=2, crypto_random=3, module=4,
-    /// fetch_responses=5, trigger_payload=6) — same order
+    /// Channels are emitted in fixed order: kv, date, module,
+    /// fetch_responses, trigger_payload — the same order
     /// `parseReadset` consumes them. An empty channel still emits a
     /// 12-byte header-only blob so the fixed layout stays alignable
     /// on the wire.
@@ -682,8 +652,6 @@ pub const Readset = struct {
         const channels = [_]*const Tape{
             &self.kv,
             &self.date,
-            &self.math_random,
-            &self.crypto_random,
             &self.module,
             &self.fetch_responses,
             &self.trigger_payload,
@@ -729,8 +697,8 @@ pub const ParsedReadset = struct {
     timestamp_ns: i64,
     seed: u64,
     /// Borrowed slices into the input bytes, one per channel in
-    /// fixed order (kv, date, math_random, crypto_random, module,
-    /// fetch_responses, trigger_payload).
+    /// fixed order (kv, date, module, fetch_responses,
+    /// trigger_payload).
     blobs: [READSET_CHANNEL_COUNT][]const u8,
     /// `docs/readset-replication-plan.md` Phase 5a — per-request
     /// LogRecord metadata. `null` when the producer didn't stamp a
@@ -977,8 +945,7 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
                 allocator.free(k.results);
             }
         },
-        .date, .math_random => {},
-        .crypto_random => |*c| allocator.free(c.bytes),
+        .date => {},
         .module => |*m| {
             allocator.free(m.specifier);
             allocator.free(m.source_hash_hex);
@@ -1046,14 +1013,6 @@ fn encodeEntry(
             var be: [8]u8 = undefined;
             std.mem.writeInt(i64, &be, d.ms_epoch, .big);
             try buf.appendSlice(allocator, &be);
-        },
-        .math_random => |m| {
-            var be: [8]u8 = undefined;
-            std.mem.writeInt(u64, &be, m.bits, .big);
-            try buf.appendSlice(allocator, &be);
-        },
-        .crypto_random => |c| {
-            try appendLenPrefixed(allocator, buf, c.bytes);
         },
         .module => |m| {
             try appendLenPrefixed(allocator, buf, m.specifier);
@@ -1155,16 +1114,6 @@ fn decodeEntry(
             if (bytes.len != 8) return ParseError.Truncated;
             const ms = std.mem.readInt(i64, bytes[0..8], .big);
             return .{ .date = .{ .ms_epoch = ms } };
-        },
-        .math_random => {
-            if (bytes.len != 8) return ParseError.Truncated;
-            const bits = std.mem.readInt(u64, bytes[0..8], .big);
-            return .{ .math_random = .{ .bits = bits } };
-        },
-        .crypto_random => {
-            const b = try readLenPrefixed(bytes, &cur);
-            if (cur != bytes.len) return ParseError.Truncated;
-            return .{ .crypto_random = .{ .bytes = b } };
         },
         .module => {
             const spec = try readLenPrefixed(bytes, &cur);
@@ -1345,49 +1294,12 @@ test "date tape: roundtrip preserves exact ms" {
     try testing.expectEqual(@as(i64, -1), parsed.entries[2].date.ms_epoch);
 }
 
-test "math_random tape: bit-exact f64 roundtrip" {
-    var tape = Tape.init(testing.allocator, .math_random);
-    defer tape.deinit();
-    // Include a subnormal + NaN-adjacent value to prove we don't go
-    // through any float formatting that might normalize them.
-    try tape.appendMathRandom(0.0);
-    try tape.appendMathRandom(0.123456789012345);
-    try tape.appendMathRandom(std.math.floatMin(f64));
-
-    const bytes = try tape.serialize(testing.allocator);
-    defer testing.allocator.free(bytes);
-    var parsed = try parse(testing.allocator, bytes);
-    defer parsed.deinit();
-
-    try testing.expectEqual(@as(u64, @bitCast(@as(f64, 0.0))), parsed.entries[0].math_random.bits);
-    try testing.expectEqual(
-        @as(u64, @bitCast(@as(f64, 0.123456789012345))),
-        parsed.entries[1].math_random.bits,
-    );
-    try testing.expectEqual(
-        @as(u64, @bitCast(std.math.floatMin(f64))),
-        parsed.entries[2].math_random.bits,
-    );
-}
-
-test "crypto tape: preserves exact bytes" {
-    var tape = Tape.init(testing.allocator, .crypto_random);
-    defer tape.deinit();
-    try tape.appendCryptoRandom(&.{ 0x00, 0xff, 0xde, 0xad, 0xbe, 0xef });
-    try tape.appendCryptoRandom(&.{});
-
-    const bytes = try tape.serialize(testing.allocator);
-    defer testing.allocator.free(bytes);
-    var parsed = try parse(testing.allocator, bytes);
-    defer parsed.deinit();
-
-    try testing.expectEqualSlices(
-        u8,
-        &.{ 0x00, 0xff, 0xde, 0xad, 0xbe, 0xef },
-        parsed.entries[0].crypto_random.bytes,
-    );
-    try testing.expectEqual(@as(usize, 0), parsed.entries[1].crypto_random.bytes.len);
-}
+// `docs/primitive-gaps.md` §9: math_random + crypto_random tape
+// channels removed. `Math.random` + `crypto.*` now draw from
+// arenajs's per-context xorshift64star, seeded once per request
+// from `Readset.seed`. Determinism is verified by the dispatcher
+// test "dispatch: Date tape captures clock reads (§9: Math/crypto
+// are seed-only)" — same seed → bit-identical output sequence.
 
 test "module tape: specifier + hash roundtrip" {
     var tape = Tape.init(testing.allocator, .module);
@@ -1409,8 +1321,6 @@ test "readset: serialize + parseReadset roundtrip" {
     defer rs.deinit();
     try rs.kv.appendKv(.get, "k", "v", .ok);
     try rs.date.appendDate(1_712_345_678_901);
-    try rs.math_random.appendMathRandom(0.5);
-    try rs.crypto_random.appendCryptoRandom(&.{ 0x01, 0x02, 0x03 });
     try rs.module.appendModule("./h.js", "a" ** 64);
     try rs.fetch_responses.appendFetchResponse(
         "fetch-1",
@@ -1438,11 +1348,19 @@ test "readset: serialize + parseReadset roundtrip" {
     try testing.expectEqual(@as(u64, 0xDEADBEEFCAFEBABE), parsed.seed);
     try testing.expect(parsed.log_header == null);
 
-    // Each blob is a self-contained tape; re-parse to confirm.
+    // Each blob is a self-contained tape; re-parse to confirm the
+    // channel id in the inner header matches the wire-order channel.
+    const expected_channels = [_]Channel{
+        .kv,
+        .date,
+        .module,
+        .fetch_responses,
+        .trigger_payload,
+    };
     for (parsed.blobs, 0..) |blob, idx| {
         var p = try parse(testing.allocator, blob);
         defer p.deinit();
-        try testing.expectEqual(@as(u16, @intCast(idx)), @intFromEnum(p.channel));
+        try testing.expectEqual(expected_channels[idx], p.channel);
     }
 }
 
