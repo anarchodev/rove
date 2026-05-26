@@ -558,15 +558,23 @@ Increments shipped:
   from 0.97 s (always-buffer) to 0.17 s (small chunks inline).
   Discriminator: `body_ref.batch_id == NO_BATCH` ⇒ inline.
 
-- **4.x (open)**: fetch-chunk park-on-durability for chunks
-  > 16 KB. The inline path covers the dominant case (JSON RPC
-  / webhook responses); large streaming chunks still go
-  through the BodyBuffer but fire immediately without waiting
-  for S3 PUT. Unreplayability gap on leader crash remains for
-  large outbound chunks. Same shape as slice 4-park-2 but for
-  events instead of entities (UpstreamFetchEvent has no h2
-  entity to move into a collection — needs a separate ParkedFetchEvent
-  list on Worker).
+- **4-fetch-park (shipped)**: park large fetch chunks until
+  durable. New `ParkedFetchEvent` (event + body_ref +
+  tenant_id_view) and `worker.fetch_pending_durability:
+  ArrayListUnmanaged(ParkedFetchEvent)` field. Plain list
+  rather than a rove collection because UpstreamFetchEvents
+  arrive via the msg_inbox with no h2 entity to host a
+  component on.
+  `fireFetchEventActivation` takes ownership of the event
+  (deinit via top-level defer unless park flips the
+  `parked_to_durability` flag). The park branch transfers
+  ownership to the list + sets `flusher_wake`.
+  `drainFetchPendingDurability` walks the list each
+  main-loop tick, calls `fireFetchEventActivation(_, _,
+  saved_body_ref)` for durable entries — the gate detects
+  the saved ref and uses it directly instead of re-appending.
+  Outbound fetch responses now have the same end-to-end
+  durability-before-handler guarantee as inbound POST bodies.
 - **4-inline (shipped, revisits §5.3 rejection)**: small-body
   inline fast path. Bodies ≤ 16 KB ride inline in the
   readset's `trigger_payload.inline_bytes` field —
