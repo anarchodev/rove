@@ -35,6 +35,7 @@ const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 
 const worker_mod = @import("worker.zig");
+const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
 const TenantLog = worker_mod.TenantLog;
 const NodeState = worker_mod.NodeState;
 const TapeStateShard = worker_mod.TapeStateShard;
@@ -393,6 +394,11 @@ pub fn captureLog(
     tapes: log_mod.TapePayloads,
     correlation_id: ?[]const u8,
     activation: log_mod.ActivationSource,
+    /// Phase 5b: the raft seq the envelope carrying this request's
+    /// writeset was proposed at. Pass 0 for paths with no associated
+    /// raft entry (early-error / read-only). The per-worker
+    /// `flushLogs` advances `last_uploaded_seq` by `max(raft_seq)`.
+    raft_seq: u64,
 ) void {
     captureLogWithId(
         worker,
@@ -410,6 +416,7 @@ pub fn captureLog(
         tapes,
         correlation_id,
         activation,
+        raft_seq,
     );
 }
 
@@ -436,6 +443,7 @@ pub fn captureLogWithId(
     tapes: log_mod.TapePayloads,
     correlation_id: ?[]const u8,
     activation: log_mod.ActivationSource,
+    raft_seq: u64,
 ) void {
     captureLogInner(
         worker,
@@ -453,6 +461,7 @@ pub fn captureLogWithId(
         tapes,
         correlation_id,
         activation,
+        raft_seq,
     ) catch |err| {
         std.log.warn("rove-js: log capture failed for {s}: {s}", .{ instance_id, @errorName(err) });
         // The transferred buffers must still be freed.
@@ -479,6 +488,7 @@ fn captureLogInner(
     tapes: log_mod.TapePayloads,
     correlation_id: ?[]const u8,
     activation: log_mod.ActivationSource,
+    raft_seq: u64,
 ) !void {
     const tl = worker.tenant_logs.get(instance_id) orelse return error.NoTenantLog;
     const allocator = worker.allocator;
@@ -519,6 +529,7 @@ fn captureLogInner(
         .tapes = tapes,
         .correlation_id = a_corr,
         .activation = activation,
+        .raft_seq = raft_seq,
     });
 }
 
@@ -594,6 +605,43 @@ pub fn flushLogs(worker: anytype) !void {
             .{ batch_key, @errorName(err) },
         );
     };
+
+    // Phase 5b: advance the per-worker `last_uploaded_seq` checkpoint
+    // by `max(record.raft_seq)` across the drained batch. Records
+    // with raft_seq == 0 (early-error / read-only / not-yet-plumbed
+    // paths) are skipped so they don't reset the watermark. Failure
+    // here is non-fatal — the checkpoint stays at its previous value;
+    // Phase 5c's walker will re-derive + re-push the entries we
+    // would've advanced past, and the indexer's
+    // `INSERT OR IGNORE (tenant_id, request_id)` absorbs the
+    // duplicate.
+    advanceUploadCheckpoint(worker, records) catch |err| {
+        std.log.warn(
+            "rove-js flushLogs: advanceUploadCheckpoint failed: {s}",
+            .{@errorName(err)},
+        );
+    };
+}
+
+/// Per-worker checkpoint advance — `worker.last_uploaded_seq =
+/// max(records[].raft_seq)` if it advanced. Skips 0-seq records.
+fn advanceUploadCheckpoint(
+    worker: anytype,
+    records: []const log_mod.LogRecord,
+) !void {
+    if (worker.data_dir == null) return;
+    var batch_max: u64 = 0;
+    for (records) |r| {
+        if (r.raft_seq > batch_max) batch_max = r.raft_seq;
+    }
+    if (batch_max <= worker.last_uploaded_seq) return;
+    try worker_upload_checkpoint.writeCheckpoint(
+        worker.allocator,
+        worker.data_dir.?,
+        worker.log_worker_id,
+        batch_max,
+    );
+    worker.last_uploaded_seq = batch_max;
 }
 
 /// Enqueue a freshly-PUT batch key for the push thread to ship to

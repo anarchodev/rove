@@ -217,6 +217,14 @@ pub const LogRecord = struct {
     /// haven't been updated to set it explicitly; the inbound case
     /// is by far the dominant one historically.
     activation: ActivationSource = .inbound,
+    /// `docs/readset-replication-plan.md` Phase 5b: the raft seq
+    /// the envelope carrying this request's writeset was proposed at.
+    /// Zero is a sentinel for "no associated raft seq" (early-error
+    /// paths, read-only batches that never proposed, paths not yet
+    /// plumbed). `flushLogs` advances the per-worker
+    /// `last_uploaded_seq` checkpoint by `max(record.raft_seq)` so
+    /// Phase 5c's promotion-time walker knows where to resume.
+    raft_seq: u64 = 0,
 
     pub fn deinit(self: *LogRecord, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);

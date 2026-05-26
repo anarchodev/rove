@@ -76,6 +76,7 @@ const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
 const worker_log = @import("worker_log.zig");
+const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
 const worker_bodies = @import("worker_bodies.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_drain = @import("worker_drain.zig");
@@ -1844,6 +1845,14 @@ pub const WorkerConfig = struct {
     /// otherwise. Required because `flushLogs` shouldn't have to
     /// reason about a missing observability backend.
     log_batch_store: log_server_mod.batch_store.BatchStore,
+    /// `docs/readset-replication-plan.md` Phase 5b — node's data
+    /// directory. The worker reads its per-worker
+    /// `last_uploaded_seq` checkpoint at startup from
+    /// `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`
+    /// and writes after each successful `flushLogs`. Null disables
+    /// the checkpoint (some unit-test fixtures that don't need
+    /// readset-replication persistence).
+    data_dir: ?[]const u8 = null,
 };
 
 pub const dispatchOnce = dispatch.dispatchOnce;
@@ -2157,6 +2166,21 @@ pub fn Worker(comptime opts: Options) type {
         /// `WorkerConfig.log_worker_id` (or the raft node id as a
         /// fallback).
         log_worker_id: u16,
+        /// `docs/readset-replication-plan.md` Phase 5b — node data
+        /// directory borrowed from `WorkerConfig.data_dir`. Used by
+        /// the per-worker `last_uploaded_seq` checkpoint file at
+        /// `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`.
+        /// Null disables the checkpoint (test fixtures).
+        data_dir: ?[]const u8,
+        /// `docs/readset-replication-plan.md` Phase 5b — the highest
+        /// raft seq this worker has covered with a successful
+        /// `flushLogs`. Read at startup from the checkpoint file
+        /// (0 if missing); advanced after each successful flush.
+        /// Phase 5c's promotion-time walker reads this (or the
+        /// MINIMUM across all per-worker checkpoints on the node)
+        /// to know where to resume re-uploading log records derived
+        /// from raft entries.
+        last_uploaded_seq: u64 = 0,
         /// Compile callback used by signup to deploy starter content.
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
         compile_fn: ?files_mod.CompileFn,
@@ -2271,6 +2295,11 @@ pub fn Worker(comptime opts: Options) type {
                 .admin_origin = config.admin_origin,
                 .admin_api_domain = config.admin_api_domain,
                 .log_worker_id = config.log_worker_id orelse @intCast(config.raft.config.node_id),
+                .data_dir = config.data_dir,
+                .last_uploaded_seq = if (config.data_dir) |dd|
+                    worker_upload_checkpoint.readCheckpoint(allocator, dd, config.log_worker_id orelse @intCast(config.raft.config.node_id))
+                else
+                    0,
                 .compile_fn = config.compile_fn,
                 .compile_ctx = config.compile_ctx,
                 .log_batch_store = config.log_batch_store,
@@ -4143,7 +4172,7 @@ pub fn fireFetchEventActivation(
         txn.rollback() catch {};
         txn_done = true;
         const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, tape_payloads, corr_full, act_source);
+        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
         return;
     };
 
@@ -4159,7 +4188,7 @@ pub fn fireFetchEventActivation(
                 txn.rollback() catch {};
                 txn_done = true;
                 const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, tape_payloads, corr_full, act_source);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -4182,7 +4211,7 @@ pub fn fireFetchEventActivation(
                     txn_owned = false;
                     txn_done = true;
                     const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, tape_payloads, corr_full, act_source);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -4191,7 +4220,7 @@ pub fn fireFetchEventActivation(
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
                 const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -4204,7 +4233,7 @@ pub fn fireFetchEventActivation(
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -4247,13 +4276,13 @@ pub fn fireFetchEventActivation(
                     txn_owned = false;
                     txn_done = true;
                     const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
                 const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -4263,7 +4292,7 @@ pub fn fireFetchEventActivation(
             );
             txn_done = true;
             const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
         },
         .stream => |*s2| {
             s2.deinit(allocator);
@@ -4289,13 +4318,13 @@ pub fn fireFetchEventActivation(
                     txn_owned = false;
                     txn_done = true;
                     const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
                 const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -4305,7 +4334,7 @@ pub fn fireFetchEventActivation(
             );
             txn_done = true;
             const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
         },
     }
 }
@@ -4772,6 +4801,7 @@ test "captureLog appends a record to the worker's node-wide buffer" {
         .{},
         "test-correlation-id",
         .inbound,
+        12345,
     );
 
     try testing.expectEqual(@as(usize, 1), fake.log_buffer.buffer.items.len);
@@ -4783,6 +4813,8 @@ test "captureLog appends a record to the worker's node-wide buffer" {
     // Phase 1b: the new tape fields make the round-trip.
     try testing.expectEqualStrings("test-correlation-id", buffered.correlation_id);
     try testing.expectEqual(log_mod.ActivationSource.inbound, buffered.activation);
+    // Phase 5b: raft_seq round-trips through the buffer.
+    try testing.expectEqual(@as(u64, 12345), buffered.raft_seq);
 }
 
 test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
@@ -4840,6 +4872,7 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
         .{},
         "chain-abc-123",
         .send_callback,
+        0,
     );
 
     try testing.expectEqual(@as(usize, 1), fake.log_buffer.buffer.items.len);
