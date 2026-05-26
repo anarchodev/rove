@@ -387,6 +387,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = args.compiler,
         .log_batch_store = args.log_batch_store,
+        .data_dir = args.data_dir,
     });
     defer worker.destroy();
 

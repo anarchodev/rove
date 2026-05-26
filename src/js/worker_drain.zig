@@ -731,7 +731,7 @@ fn resumeContinuation(
                 // source = send_callback so the row shares the chain
                 // id with the inbound entry and the replay UX groups
                 // them.
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .send_callback);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .send_callback, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -788,14 +788,14 @@ fn resumeContinuation(
                     txn_owned = false; // helper destroyed it
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, .send_callback);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, .send_callback, 0);
                     return;
                 };
                 // proposeAndParkContResume took ownership of txn (moved
                 // into pending_txns) and body_dup (stamped onto entity).
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, .send_callback);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, .send_callback, 0);
                 return;
             }
             // Clean read-only commit cannot fault (mirrors
@@ -808,7 +808,7 @@ fn resumeContinuation(
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             try resolveParked(worker, ent, sid, sess, st, r.body);
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .send_callback);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .send_callback, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -892,7 +892,7 @@ fn resumeContinuation(
                     txn_owned = false;
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, .send_callback);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, .send_callback, 0);
                     return;
                 };
                 txn_owned = false;
@@ -900,7 +900,7 @@ fn resumeContinuation(
                 // Log the repark hop's tape row. status=0 (parked,
                 // same as the inbound trampoline open hop's
                 // captureSuccess shape).
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, .send_callback);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, .send_callback, 0);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -930,7 +930,7 @@ fn resumeContinuation(
             txn.rollback() catch {};
             txn_done = true;
             try resolveParked(worker, ent, sid, sess, 501, "streams not yet wired in the resume path (Phase 2b)\n");
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, correlation_id, .send_callback);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
         },
     }
 }

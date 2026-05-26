@@ -532,7 +532,7 @@ fn resumeStream(
         txn.rollback() catch {};
         txn_done = true;
         markStreamDraining(server, ent);
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, 0);
         return;
     };
 
@@ -545,7 +545,7 @@ fn resumeStream(
                 txn.rollback() catch {};
                 txn_done = true;
                 markStreamDraining(server, ent);
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, activation, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -596,7 +596,7 @@ fn resumeStream(
                     // than a half-open stream. Helper has already
                     // freed `stage.chunks`; the defer is a no-op.
                     markStreamDraining(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, activation, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -611,7 +611,7 @@ fn resumeStream(
                 // then closes (chunks-empty + is_draining).
                 chain_st.activation_count += 1;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -632,7 +632,7 @@ fn resumeStream(
             markStreamDraining(server, ent);
             chain_st.activation_count += 1;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -646,7 +646,7 @@ fn resumeStream(
             txn.rollback() catch {};
             txn_done = true;
             markStreamDraining(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, 0);
         },
         .stream => |*s2| {
             // Effect-reification Phase 4.0.b: stream + writes —
@@ -698,7 +698,7 @@ fn resumeStream(
                     txn_owned = false;
                     txn_done = true;
                     markStreamDraining(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, 0);
                     return;
                 };
                 txn_owned = false;
@@ -752,7 +752,7 @@ fn resumeStream(
             wakes_st.kv_prefixes = s2.kv_prefixes;
             s2.kv_prefixes = &.{};
             chain_st.activation_count += 1;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, 0);
         },
     }
 }
@@ -880,7 +880,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     ) catch {
         txn.rollback() catch {};
         txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
         return;
     };
 
@@ -899,7 +899,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -921,7 +921,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                     std.log.warn("rove-js stream-disconnect: propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false; // helper destroyed it
                     txn_done = true;
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -929,7 +929,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                 txn_owned = false;
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -941,7 +941,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
             );
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -969,17 +969,17 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                     std.log.warn("rove-js stream-disconnect (cont return): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
                 return;
             }
             txn.rollback() catch {};
             txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
         },
         .stream => |*s2| {
             s2.deinit(allocator);
@@ -1000,12 +1000,12 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                     std.log.warn("rove-js stream-disconnect (stream return): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -1014,7 +1014,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                 .{@errorName(e)},
             );
             txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
         },
     }
 }
@@ -1175,7 +1175,7 @@ pub fn fireSubscriptionActivation(
     ) catch {
         txn.rollback() catch {};
         txn_done = true;
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
         return;
     };
 
@@ -1190,7 +1190,7 @@ pub fn fireSubscriptionActivation(
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .subscription_fire);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1212,7 +1212,7 @@ pub fn fireSubscriptionActivation(
                     std.log.warn("rove-js subscription-fire ({s}): propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .subscription_fire);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -1220,7 +1220,7 @@ pub fn fireSubscriptionActivation(
                 txn_owned = false;
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1232,7 +1232,7 @@ pub fn fireSubscriptionActivation(
             );
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1264,17 +1264,17 @@ pub fn fireSubscriptionActivation(
                     std.log.warn("rove-js subscription-fire ({s}) cont-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
                 return;
             }
             txn.rollback() catch {};
             txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
         },
         .stream => |*s2| {
             // `__rove_stream` from a subscription chain — same as
@@ -1302,12 +1302,12 @@ pub fn fireSubscriptionActivation(
                     std.log.warn("rove-js subscription-fire ({s}) stream-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -1316,7 +1316,7 @@ pub fn fireSubscriptionActivation(
                 .{@errorName(e)},
             );
             txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
         },
     }
 }
@@ -1437,7 +1437,7 @@ fn fireChainedActivation(
     ) catch {
         txn.rollback() catch {};
         txn_done = true;
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .send_callback);
+        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
         return;
     };
 
@@ -1452,7 +1452,7 @@ fn fireChainedActivation(
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .send_callback);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .send_callback, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1474,7 +1474,7 @@ fn fireChainedActivation(
                     std.log.warn("rove-js chained-dispatch ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .send_callback);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .send_callback, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -1482,7 +1482,7 @@ fn fireChainedActivation(
                 txn_owned = false;
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1494,7 +1494,7 @@ fn fireChainedActivation(
             );
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1532,12 +1532,12 @@ fn fireChainedActivation(
                     std.log.warn("rove-js chained-dispatch ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .send_callback);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -1546,7 +1546,7 @@ fn fireChainedActivation(
                 .{@errorName(e)},
             );
             txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
         },
         .stream => |*s2| {
             // `__rove_stream` from a chained-dispatch handler — no
@@ -1573,12 +1573,12 @@ fn fireChainedActivation(
                     std.log.warn("rove-js chained-dispatch ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .send_callback);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -1587,7 +1587,7 @@ fn fireChainedActivation(
                 .{@errorName(e)},
             );
             txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
         },
     }
 }
