@@ -180,7 +180,7 @@ Per-tape:
   [u32 magic = 0x52544150 'RTAP']
   [u16 version = 1]
   [u16 channel (0=kv, 1=date, 2=math_random, 3=crypto_random,
-                4=module, 5=fetch_responses)]
+                4=module, 5=fetch_responses, 6=trigger_payload)]
   [u32 entry_count]
   for each entry: [u32 len][entry bytes]
 
@@ -226,6 +226,12 @@ fetch_responses (channel 5):   // readset-replication-plan §2c-2
   [u8  terminal_ok]                  // 0 if !final
   [u8  body_truncated]               // 0 if !final
   [u32 len][headers utf-8]           // non-empty on seq=0 only
+
+trigger_payload (channel 6):   // readset-replication-plan §2d
+  [u64 body_ref.batch_id]
+  [u64 body_ref.offset]
+  [u32 body_ref.len]
+  [u32 len][headers utf-8]           // reserved; empty for now
 ```
 
 ### Bridge to `Module.tapes`

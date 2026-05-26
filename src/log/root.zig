@@ -139,6 +139,10 @@ pub const TapePayloads = struct {
     /// per-tenant readset-blob store. Empty when the chain made no
     /// outbound fetches.
     fetch_responses_tape_bytes: []const u8 = &.{},
+    /// `docs/readset-replication-plan.md` Phase 2d. Zero-or-one entry
+    /// carrying the inbound request body's `BodyRef`. Empty when the
+    /// request had no body.
+    trigger_payload_tape_bytes: []const u8 = &.{},
     /// Captured request body (or its 256 KB prefix if the body was
     /// larger). Empty when the request had no body or the worker
     /// chose not to capture (no tenant log open).
@@ -169,6 +173,7 @@ pub const TapePayloads = struct {
         if (self.math_random_tape_bytes.len != 0) allocator.free(self.math_random_tape_bytes);
         if (self.module_tree_bytes.len != 0) allocator.free(self.module_tree_bytes);
         if (self.fetch_responses_tape_bytes.len != 0) allocator.free(self.fetch_responses_tape_bytes);
+        if (self.trigger_payload_tape_bytes.len != 0) allocator.free(self.trigger_payload_tape_bytes);
         if (self.request_body_bytes.len != 0) allocator.free(self.request_body_bytes);
         if (self.activation_bytes.len != 0) allocator.free(self.activation_bytes);
         self.* = .{};

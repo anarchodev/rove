@@ -79,6 +79,13 @@ pub const Channel = enum(u16) {
     /// bytes via `BlobStore.getRange` rather than reading them
     /// inline from the log blob.
     fetch_responses = 5,
+    /// `docs/readset-replication-plan.md` Phase 2d. Zero or one entry
+    /// per inbound dispatch. Captures the request body's `BodyRef`
+    /// (the bytes streamed into the per-tenant readset-blob) so
+    /// replay can resolve `request.body` via `BlobStore.getRange`
+    /// instead of the inline `request_body_bytes` capture.
+    /// Zero entries when the request had no body.
+    trigger_payload = 6,
 };
 
 /// Outcome of a kv operation as captured on the tape. `NotFound` is
@@ -123,6 +130,7 @@ pub const Entry = union(Channel) {
     crypto_random: CryptoRandomEntry,
     module: ModuleEntry,
     fetch_responses: FetchResponseEntry,
+    trigger_payload: TriggerPayloadEntry,
 
     pub const KvEntry = struct {
         op: KvOp,
@@ -213,6 +221,22 @@ pub const Entry = union(Channel) {
         /// Parsed upstream response headers as a JSON object
         /// (`{"name":"value",...}`). Non-empty on seq=0 only;
         /// later chunks reference the seq=0 entry for headers.
+        headers: []const u8,
+    };
+
+    /// One inbound request's body pointer. `headers` is reserved
+    /// for future capture (replay currently re-reads the request's
+    /// method / path / host / wire headers from the log record's
+    /// dedicated fields); kept on the entry so the wire layout
+    /// matches the §4.1 readset shape and a later slice can
+    /// populate it without a version bump.
+    pub const TriggerPayloadEntry = struct {
+        /// Pointer to the request body in the per-tenant
+        /// readset-blob. `body_ref.len == 0` represents an empty
+        /// request body (still emit one entry so the channel's
+        /// presence is unambiguous on replay).
+        body_ref: bodies_mod.BodyRef,
+        /// Reserved for future header capture. Empty in slice 2d.
         headers: []const u8,
     };
 };
@@ -399,6 +423,25 @@ pub const Tape = struct {
         self.owned_bytes += fid_copy.len + headers_copy.len;
     }
 
+    /// Append one inbound trigger payload entry. The channel
+    /// carries at most one entry per request; callers append
+    /// nothing when the request had no body. `headers` is reserved
+    /// for future capture — pass `""` in slice 2d.
+    pub fn appendTriggerPayload(
+        self: *Tape,
+        body_ref: bodies_mod.BodyRef,
+        headers: []const u8,
+    ) !void {
+        std.debug.assert(self.channel == .trigger_payload);
+        const headers_copy = try self.allocator.dupe(u8, headers);
+        errdefer self.allocator.free(headers_copy);
+        try self.entries.append(self.allocator, .{ .trigger_payload = .{
+            .body_ref = body_ref,
+            .headers = headers_copy,
+        } });
+        self.owned_bytes += headers_copy.len;
+    }
+
     /// Serialize to a fresh heap buffer the caller owns. Empty tapes
     /// still produce a valid (header-only) serialization — replay
     /// must be able to distinguish "channel was empty" from "no tape
@@ -482,6 +525,11 @@ pub const Readset = struct {
     /// the bytes in the per-tenant readset-blob; replay resolves
     /// the bytes via `BlobStore.getRange`.
     fetch_responses: Tape,
+    /// `docs/readset-replication-plan.md` Phase 2d: zero-or-one
+    /// entry for the inbound request body's `BodyRef`. Replay
+    /// resolves `request.body` via `BlobStore.getRange` instead of
+    /// the inline `request_body_bytes` capture.
+    trigger_payload: Tape,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -497,6 +545,7 @@ pub const Readset = struct {
             .crypto_random = Tape.init(allocator, .crypto_random),
             .module = Tape.init(allocator, .module),
             .fetch_responses = Tape.init(allocator, .fetch_responses),
+            .trigger_payload = Tape.init(allocator, .trigger_payload),
         };
     }
 
@@ -507,6 +556,7 @@ pub const Readset = struct {
         self.crypto_random.deinit();
         self.module.deinit();
         self.fetch_responses.deinit();
+        self.trigger_payload.deinit();
     }
 };
 
@@ -627,6 +677,9 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
             allocator.free(f.fetch_id);
             allocator.free(f.headers);
         },
+        .trigger_payload => |*t| {
+            allocator.free(t.headers);
+        },
     }
 }
 
@@ -722,6 +775,19 @@ fn encodeEntry(
             try buf.append(allocator, @intFromBool(f.terminal_ok));
             try buf.append(allocator, @intFromBool(f.body_truncated));
             try appendLenPrefixed(allocator, buf, f.headers);
+        },
+        .trigger_payload => |t| {
+            // BodyRef: batch_id (u64), offset (u64), len (u32).
+            var br_bi: [8]u8 = undefined;
+            std.mem.writeInt(u64, &br_bi, t.body_ref.batch_id, .big);
+            try buf.appendSlice(allocator, &br_bi);
+            var br_off: [8]u8 = undefined;
+            std.mem.writeInt(u64, &br_off, t.body_ref.offset, .big);
+            try buf.appendSlice(allocator, &br_off);
+            var br_len: [4]u8 = undefined;
+            std.mem.writeInt(u32, &br_len, t.body_ref.len, .big);
+            try buf.appendSlice(allocator, &br_len);
+            try appendLenPrefixed(allocator, buf, t.headers);
         },
     }
 }
@@ -830,6 +896,25 @@ fn decodeEntry(
                 .terminal_status = status,
                 .terminal_ok = ok,
                 .body_truncated = trunc,
+                .headers = headers,
+            } };
+        },
+        .trigger_payload => {
+            if (cur + 8 + 8 + 4 > bytes.len) return ParseError.Truncated;
+            const br_batch_id = std.mem.readInt(u64, bytes[cur..][0..8], .big);
+            cur += 8;
+            const br_offset = std.mem.readInt(u64, bytes[cur..][0..8], .big);
+            cur += 8;
+            const br_len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+            cur += 4;
+            const headers = try readLenPrefixed(bytes, &cur);
+            if (cur != bytes.len) return ParseError.Truncated;
+            return .{ .trigger_payload = .{
+                .body_ref = .{
+                    .batch_id = br_batch_id,
+                    .offset = br_offset,
+                    .len = br_len,
+                },
                 .headers = headers,
             } };
         },
@@ -999,6 +1084,27 @@ test "module tape: specifier + hash roundtrip" {
 
     try testing.expectEqualStrings("./handler.js", parsed.entries[0].module.specifier);
     try testing.expectEqualStrings(hash, parsed.entries[0].module.source_hash_hex);
+}
+
+test "trigger_payload tape: BodyRef roundtrip" {
+    var tape = Tape.init(testing.allocator, .trigger_payload);
+    defer tape.deinit();
+    try tape.appendTriggerPayload(
+        .{ .batch_id = 3, .offset = 4096, .len = 1024 },
+        "",
+    );
+    const bytes = try tape.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+
+    var parsed = try parse(testing.allocator, bytes);
+    defer parsed.deinit();
+    try testing.expectEqual(Channel.trigger_payload, parsed.channel);
+    try testing.expectEqual(@as(usize, 1), parsed.entries.len);
+    const t = parsed.entries[0].trigger_payload;
+    try testing.expectEqual(@as(u64, 3), t.body_ref.batch_id);
+    try testing.expectEqual(@as(u64, 4096), t.body_ref.offset);
+    try testing.expectEqual(@as(u32, 1024), t.body_ref.len);
+    try testing.expectEqualStrings("", t.headers);
 }
 
 test "fetch_responses tape: chunk + terminal roundtrip" {
