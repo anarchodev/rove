@@ -129,10 +129,17 @@ pub const ActivationSource = enum(u8) {
 /// per-request PUT count to zero — bytes ride the existing per-flush
 /// ndjson PUT — and removes the read-side hash→blob fetch hop.
 pub const TapePayloads = struct {
+    /// `docs/primitive-gaps.md` §9 seed-not-draws. The PRNG seed
+    /// used to initialize arenajs's per-context xorshift64star for
+    /// this request's `Math.random` / `crypto.*` draws. Replay
+    /// seeds the same value via `arena_set_random_seed` before
+    /// running the handler — the scalar IS the entire input for
+    /// random (no per-draw tape entries). Zero is the default for
+    /// non-handler paths that build payloads without a Readset
+    /// (early-error records, paths still being wired).
+    seed: u64 = 0,
     kv_tape_bytes: []const u8 = &.{},
-    crypto_random_tape_bytes: []const u8 = &.{},
     date_tape_bytes: []const u8 = &.{},
-    math_random_tape_bytes: []const u8 = &.{},
     module_tree_bytes: []const u8 = &.{},
     /// `docs/readset-replication-plan.md` Phase 2c-2. Per-`http.fetch`
     /// chunk-activation tape: each entry carries a `BodyRef` into the
@@ -168,9 +175,7 @@ pub const TapePayloads = struct {
 
     pub fn deinit(self: *TapePayloads, allocator: std.mem.Allocator) void {
         if (self.kv_tape_bytes.len != 0) allocator.free(self.kv_tape_bytes);
-        if (self.crypto_random_tape_bytes.len != 0) allocator.free(self.crypto_random_tape_bytes);
         if (self.date_tape_bytes.len != 0) allocator.free(self.date_tape_bytes);
-        if (self.math_random_tape_bytes.len != 0) allocator.free(self.math_random_tape_bytes);
         if (self.module_tree_bytes.len != 0) allocator.free(self.module_tree_bytes);
         if (self.fetch_responses_tape_bytes.len != 0) allocator.free(self.fetch_responses_tape_bytes);
         if (self.trigger_payload_tape_bytes.len != 0) allocator.free(self.trigger_payload_tape_bytes);
@@ -573,9 +578,7 @@ fn estimateRecordBytes(r: *const LogRecord) usize {
     // expansion and just account raw bytes — slightly under-counts
     // but matches the original "approximate" intent.
     n += r.tapes.kv_tape_bytes.len;
-    n += r.tapes.crypto_random_tape_bytes.len;
     n += r.tapes.date_tape_bytes.len;
-    n += r.tapes.math_random_tape_bytes.len;
     n += r.tapes.module_tree_bytes.len;
     n += r.tapes.request_body_bytes.len;
     n += r.tapes.activation_bytes.len;

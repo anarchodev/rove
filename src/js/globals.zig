@@ -214,11 +214,11 @@ pub const DispatchState = struct {
     /// persistence story; tape channels are defined in
     /// `src/tape/root.zig:Readset`.
     readset: ?*tape_mod.Readset = null,
-    /// PRNG used by our `Math.random` override so the test path and
-    /// production path stay deterministic w.r.t. a given seed. Seeded
-    /// by the dispatcher per request. Installed only when a tape is
-    /// present (so the normal path still uses qjs's built-in Math.random).
-    prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
+    // `docs/primitive-gaps.md` §9 — the per-request Zig PRNG was
+    // retired. arenajs's per-request `xorshift64star` state (in
+    // `js_random_state_active(ctx)`) is now the single PRNG. The
+    // dispatcher seeds it once via `JS_SetRandomSeed` in
+    // `installRequest`; Math.random + crypto.* draw from it.
     /// Per-request identifier, pre-minted by the worker. Combined with
     /// `http_fetch_index` to derive a deterministic fetch id for
     /// each `http.fetch` call.
@@ -774,22 +774,13 @@ fn jsDateNow(
     return c.JS_NewInt64(ctx, ms);
 }
 
-fn jsMathRandom(
-    ctx: ?*c.JSContext,
-    _: c.JSValue,
-    _: c_int,
-    _: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    const state = getState(ctx);
-    // Draw a 53-bit mantissa from the PRNG and scale to [0, 1).
-    // Matches what qjs's built-in Math.random does, just seeded.
-    const bits = state.prng.random().int(u64) >> 11;
-    const v: f64 = @as(f64, @floatFromInt(bits)) * (1.0 / @as(f64, @floatFromInt(@as(u64, 1) << 53)));
-    if (state.readset) |rs| rs.math_random.appendMathRandom(v) catch {};
-    return c.JS_NewFloat64(ctx, v);
-}
-
-
+// `docs/primitive-gaps.md` §9 — `jsMathRandom` retired. arenajs's
+// native `js_math_random` runs against the per-request
+// xorshift64star state (seeded once per request via
+// `JS_SetRandomSeed` in `installRequest`). crypto.* draws from the
+// same state via `JS_FillRandomBytes`. Replay reproduces by
+// calling `arena_set_random_seed` with the recorded request seed
+// from the readset header — no per-draw tape entries, no JS port.
 
 // ── console.log ───────────────────────────────────────────────────────
 
@@ -1606,9 +1597,9 @@ const INTRINSIC_EXTENSIONS = [_]NamespaceBindings{
     .{ .path = &.{"Date"}, .fns = &.{
         .{ .name = "now", .cfunc = jsDateNow, .argc = 0 },
     } },
-    .{ .path = &.{"Math"}, .fns = &.{
-        .{ .name = "random", .cfunc = jsMathRandom, .argc = 0 },
-    } },
+    // `Math.random` no longer overridden — see §9 comment above.
+    // arenajs's native implementation runs against the per-request
+    // PRNG state, seeded by `installRequest`.
 };
 
 const GLOBAL_BUILTINS = [_]FnBinding{
@@ -1751,6 +1742,15 @@ pub fn installRequest(
     request: anytype,
 ) void {
     c.JS_SetContextOpaque(ctx, state);
+
+    // `docs/primitive-gaps.md` §9 — seed arenajs's per-request
+    // xorshift64star with this dispatch's seed. Math.random and
+    // crypto.* both draw from this state, so replay reproduces the
+    // entire random stream by re-seeding with the recorded value.
+    // Test paths without a readset get `0` (arenajs maps that to
+    // `1` internally — xorshift64 requires non-zero state).
+    const seed: u64 = if (state.readset) |rs| rs.seed else 0;
+    c.JS_SetRandomSeed(ctx, seed);
 
     const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);

@@ -29,6 +29,12 @@ export class CursorEngine {
         this._run      = Module.cwrap("arena_run_module",     "number", ["string","string"]);
         this._setMode  = Module.cwrap("arena_set_trace_mode", null,     ["number"]);
         this._snapshot = Module.cwrap("arena_snapshot_here",  "number", []);
+        // `docs/primitive-gaps.md` §9: seed the per-context
+        // xorshift64star PRNG from the captured request's
+        // `replay.seed` so `Math.random` / `crypto.*` reproduce the
+        // exact draw sequence. Replay tape no longer carries
+        // per-draw entries — this scalar IS the entire input.
+        this._setSeed  = Module.cwrap("arena_set_random_seed", null,    ["number","number"]);
         this._scanCache = new WeakMap();
         this._matCache  = new WeakMap();
     }
@@ -55,6 +61,14 @@ export class CursorEngine {
         // replays ensures one replay's writes don't leak into the
         // next.
         this.M._kvOverlay = new Map();
+        // §9: seed the per-context PRNG from the captured request's
+        // seed. `arena_set_random_seed(seed_lo, seed_hi)` splits the
+        // 64-bit seed across two u32 args (WASM ABI). Zero is the
+        // default for pre-§9 captures with no seed in the bundle.
+        const seed = BigInt(replay.seed ?? 0n);
+        const lo = Number(seed & 0xFFFFFFFFn);
+        const hi = Number((seed >> 32n) & 0xFFFFFFFFn);
+        this._setSeed(lo, hi);
     }
 
     async scanIndex(replay) {

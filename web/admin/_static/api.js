@@ -519,9 +519,14 @@ export const api = {
     const tapeBlobs = {
       kv: decodeB64(tapesField.kv_tape_b64),
       date: decodeB64(tapesField.date_tape_b64),
-      math_random: decodeB64(tapesField.math_random_tape_b64),
-      crypto_random: decodeB64(tapesField.crypto_random_tape_b64),
     };
+    // `docs/primitive-gaps.md` §9 seed-not-draws: the captured
+    // request's PRNG seed. The replay shell hands this to
+    // `arena_set_random_seed` so `Math.random` + `crypto.*`
+    // reproduce the same sequence as the original request.
+    // `0n` is the default for captures pre-§9 (none exist
+    // post-launch but stays safe pre-launch).
+    const seed = tapesField.seed != null ? BigInt(tapesField.seed) : 0n;
     const bodyBytes = decodeB64(tapesField.request_body_b64);
 
     return {
@@ -555,6 +560,7 @@ export const api = {
       // this so any `import` in any module resolves. Sources fetched
       // by hash; the entry itself is also in here.
       modules: sources,
+      seed,
       tape_blobs: tapeBlobs,
       // True iff the historical manifest was unreachable and the
       // shell got the CURRENT manifest as a fallback. Replay shell

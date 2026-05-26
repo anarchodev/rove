@@ -48097,6 +48097,32 @@ void JS_SetRandomSeed(JSContext *ctx, uint64_t seed)
     *js_random_state_active(ctx) = seed != 0 ? seed : 1;
 }
 
+/* Public accessor for the per-request PRNG. Used by embedders that
+ * need to draw bytes from the same xorshift64star stream Math.random
+ * draws from — e.g. rove's `crypto.getRandomValues` / `randomUUID`
+ * bindings, so the entire non-determinism frontier (Math.random +
+ * crypto.*) collapses to one seedable PRNG state.
+ *
+ * Streams (out_len / 8) full u64 draws, then a partial draw for the
+ * trailing 1..7 bytes if any. The trailing draw discards unused high
+ * bytes — small efficiency cost in exchange for not needing a u8-
+ * granularity PRNG. */
+void JS_FillRandomBytes(JSContext *ctx, void *out, size_t out_len)
+{
+    uint64_t *state = js_random_state_active(ctx);
+    uint8_t *dst = (uint8_t *)out;
+    size_t full = out_len / 8;
+    for (size_t i = 0; i < full; i++) {
+        uint64_t v = xorshift64star(state);
+        memcpy(dst + i * 8, &v, 8);
+    }
+    size_t tail = out_len - full * 8;
+    if (tail) {
+        uint64_t v = xorshift64star(state);
+        memcpy(dst + full * 8, &v, tail);
+    }
+}
+
 static JSValue js_math_random(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {

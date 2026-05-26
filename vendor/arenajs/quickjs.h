@@ -566,6 +566,13 @@ JS_EXTERN int JS_AddPerformance(JSContext *ctx);
    defaults to 0 and ctx->random_state defaults to 0 (Math.random returns 0
    until seeded). Call these to inject wall-clock values post-init/restore. */
 JS_EXTERN void JS_SetRandomSeed(JSContext *ctx, uint64_t seed);
+/* Fill `out_len` bytes at `out` with draws from the per-request PRNG
+ * (the same xorshift64star Math.random draws from). Embedders use
+ * this to back `crypto.getRandomValues` / `randomUUID` / similar so
+ * the whole non-determinism frontier collapses to one seedable
+ * stream — replay reproduces by calling JS_SetRandomSeed with the
+ * recorded request seed. See docs/primitive-gaps.md §9 in rove. */
+JS_EXTERN void JS_FillRandomBytes(JSContext *ctx, void *out, size_t out_len);
 JS_EXTERN void JS_SetTimeOrigin(JSContext *ctx, double time_origin_ms);
 JS_EXTERN int JS_AddIntrinsicDOMException(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicAToB(JSContext *ctx);

@@ -385,15 +385,16 @@ LogRecordSummary & {
   console: string,            // captured console.log output
   exception: string,          // empty on success
   tapes: {                    // all base64 strings, may be null
+    seed: number,               // §9: per-request PRNG seed (u64)
     kv_tape_b64?: string,
     date_tape_b64?: string,
-    math_random_tape_b64?: string,
-    crypto_random_tape_b64?: string,
     module_tree_b64?: string,
     request_body_b64?: string,
     request_body_truncated?: boolean,
     // No response_body field — replay re-produces the response
     // deterministically from (request body + tapes + source).
+    // Math.random / crypto.* draw from the per-context PRNG
+    // seeded by `seed`; no dedicated tape channels (§9).
   },
 }
 ```

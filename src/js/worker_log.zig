@@ -97,11 +97,15 @@ pub fn getOrOpenTenantLog(
 
 // ── Tape capture ──────────────────────────────────────────────────────
 //
-// `tape_mod.Readset` is the per-request structural holder for the five
-// channels (kv / date / math_random / crypto_random / module); the
-// worker allocates one per dispatch, hands its pointer to the
-// dispatcher via `Request.readset`, then serializes + flushes the
-// non-empty channels via `captureTapesForChain*` below.
+// `tape_mod.Readset` is the per-request structural holder for the
+// five channels (kv / date / module / fetch_responses /
+// trigger_payload); the worker allocates one per dispatch, hands
+// its pointer to the dispatcher via `Request.readset`, then
+// serializes + flushes the non-empty channels via
+// `captureTapesForChain*` below. `Math.random` / `crypto.*` no
+// longer have dedicated channels (§9 seed-not-draws); the
+// readset's `seed` scalar is reseeded into arenajs's per-context
+// PRNG by the dispatcher.
 
 /// Maximum captured body length (request OR response). Anything
 /// bigger gets truncated to this prefix and the corresponding
@@ -148,7 +152,7 @@ pub fn captureTapesForChain(
 ) log_mod.TapePayloads {
     const allocator = worker.allocator;
 
-    var payloads: log_mod.TapePayloads = .{};
+    var payloads: log_mod.TapePayloads = .{ .seed = readset.seed };
 
     // §6 cap pre-check: if the chain is already capped, skip
     // serialize entirely. Saves the CPU + transient bytes for
@@ -163,8 +167,6 @@ pub fn captureTapesForChain(
     }{
         .{ .tape = &readset.kv, .out = &payloads.kv_tape_bytes },
         .{ .tape = &readset.date, .out = &payloads.date_tape_bytes },
-        .{ .tape = &readset.math_random, .out = &payloads.math_random_tape_bytes },
-        .{ .tape = &readset.crypto_random, .out = &payloads.crypto_random_tape_bytes },
         .{ .tape = &readset.module, .out = &payloads.module_tree_bytes },
         .{ .tape = &readset.fetch_responses, .out = &payloads.fetch_responses_tape_bytes },
         .{ .tape = &readset.trigger_payload, .out = &payloads.trigger_payload_tape_bytes },
@@ -188,8 +190,6 @@ pub fn captureTapesForChain(
         const total =
             payloads.kv_tape_bytes.len +
             payloads.date_tape_bytes.len +
-            payloads.math_random_tape_bytes.len +
-            payloads.crypto_random_tape_bytes.len +
             payloads.module_tree_bytes.len +
             payloads.fetch_responses_tape_bytes.len +
             payloads.trigger_payload_tape_bytes.len;
@@ -203,12 +203,12 @@ pub fn captureTapesForChain(
             // wake-overflow ring (no half-recorded entries).
             if (payloads.kv_tape_bytes.len > 0) allocator.free(payloads.kv_tape_bytes);
             if (payloads.date_tape_bytes.len > 0) allocator.free(payloads.date_tape_bytes);
-            if (payloads.math_random_tape_bytes.len > 0) allocator.free(payloads.math_random_tape_bytes);
-            if (payloads.crypto_random_tape_bytes.len > 0) allocator.free(payloads.crypto_random_tape_bytes);
             if (payloads.module_tree_bytes.len > 0) allocator.free(payloads.module_tree_bytes);
             if (payloads.fetch_responses_tape_bytes.len > 0) allocator.free(payloads.fetch_responses_tape_bytes);
             if (payloads.trigger_payload_tape_bytes.len > 0) allocator.free(payloads.trigger_payload_tape_bytes);
-            payloads = .{};
+            // Preserve the seed — even when tape bytes are capped,
+            // replay still needs it to seed the PRNG correctly.
+            payloads = .{ .seed = readset.seed };
         }
     }
 
