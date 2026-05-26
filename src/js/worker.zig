@@ -4206,7 +4206,7 @@ pub fn fireFetchEventActivation(
                     .host = "",
                     .correlation_id = corr_full,
                 };
-                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_term) catch |perr| {
+                const fw_seq = worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_term) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -4220,7 +4220,7 @@ pub fn fireFetchEventActivation(
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
                 const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -4271,7 +4271,7 @@ pub fn fireFetchEventActivation(
                     .host = "",
                     .correlation_id = corr_full,
                 };
-                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_cont) catch |perr| {
+                const fw_seq = worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_cont) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -4282,7 +4282,7 @@ pub fn fireFetchEventActivation(
                 txn_owned = false;
                 txn_done = true;
                 const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, fw_seq);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -4313,7 +4313,7 @@ pub fn fireFetchEventActivation(
                     .host = "",
                     .correlation_id = corr_full,
                 };
-                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_stream) catch |perr| {
+                const fw_seq = worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_stream) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -4324,7 +4324,7 @@ pub fn fireFetchEventActivation(
                 txn_owned = false;
                 txn_done = true;
                 const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, fw_seq);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(

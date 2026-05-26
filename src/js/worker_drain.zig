@@ -455,7 +455,7 @@ fn proposeAndParkContResume(
     /// LogRecord. `null` only for paths that genuinely have no
     /// header to stamp — caller convention is to populate it.
     log_header_opt: ?log_mod.LogHeader,
-) !void {
+) !u64 {
     const allocator = worker.allocator;
     const server = worker.h2;
 
@@ -587,6 +587,7 @@ fn proposeAndParkContResume(
             try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
         },
     }
+    return seq;
 }
 
 /// The trampoline resume engine (connection-actor 3b-iii post-Phase-4).
@@ -765,7 +766,7 @@ fn resumeContinuation(
                     .host = "",
                     .correlation_id = corr_id orelse "",
                 };
-                proposeAndParkContResume(
+                const cont_seq = proposeAndParkContResume(
                     worker,
                     ent,
                     sid,
@@ -795,7 +796,7 @@ fn resumeContinuation(
                 // into pending_txns) and body_dup (stamped onto entity).
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, .send_callback, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, .send_callback, cont_seq);
                 return;
             }
             // Clean read-only commit cannot fault (mirrors
@@ -870,7 +871,7 @@ fn resumeContinuation(
                     .host = "",
                     .correlation_id = corr_id orelse "",
                 };
-                proposeAndParkContResume(
+                const repark_seq = proposeAndParkContResume(
                     worker,
                     ent,
                     sid,
@@ -900,7 +901,7 @@ fn resumeContinuation(
                 // Log the repark hop's tape row. status=0 (parked,
                 // same as the inbound trampoline open hop's
                 // captureSuccess shape).
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, .send_callback, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, .send_callback, repark_seq);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(

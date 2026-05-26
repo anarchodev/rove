@@ -681,11 +681,31 @@ Increments (planned, smallest-first):
   Leader stamps the header at serialize time; followers parse +
   validate at apply time and discard until 5c.
 - **5b — last_uploaded_seq checkpoint + idempotent push**: per-node
-  durable "log records I've already pushed through seq X" mark
-  (kv-write on a small bookkeeping key). The log-server's batch
-  PUT path becomes idempotent on (tenant, request_id) so a
-  follower re-uploading entries the prior leader already pushed
-  is harmless. Pre-requisite for 5c's promotion-time walk.
+  durable "log records I've already pushed through seq X" mark.
+  Indexer idempotency is already in place via PRIMARY KEY
+  (tenant_id, request_id) + INSERT OR IGNORE so a Phase-5c walker
+  re-uploading entries the prior leader already pushed is
+  harmless. Pre-requisite for 5c's promotion-time walk.
+
+  - **5b-base (shipped)**: `raft_seq: u64` on LogRecord; captureLog
+    plumbed through; per-worker checkpoint file at
+    `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`
+    (atomic write, empty/missing reads as 0). `flushLogs` advances
+    the checkpoint by `max(raft_seq across drained records)` after
+    each successful flush. Inbound dispatch
+    (worker_dispatch.zig finalizeBatch) is the only path stamping a
+    real seq today; cont-resume / streaming / fetch_chunk pass 0.
+  - **5b-1 (shipped)**: stamp real `raft_seq` on the cont-resume +
+    streaming + fetch_chunk paths. `proposeForgetfulWrites` and
+    `proposeAndParkContResume` now return `!u64` (the propose seq);
+    each call site captures the returned seq (`const fw_seq = ...`
+    / `const cont_seq = ...` / `const repark_seq = ...`) and
+    threads it through to the post-propose success captureLog.
+    Failure-path captureLogs (catch closures) continue to pass 0
+    — the entry never reached raft. The resumeStream `.stream` arm
+    hoists `var fw_seq: u64 = 0` outside its `if (wrote)` block so
+    the unified post-block captureLog stamps the seq on the wrote
+    branch and 0 on the read-only branch.
 - **5c — promotion-time tape upload walk**: on leadership stabilize,
   the new leader walks raft entries from `last_uploaded_seq + 1`,
   hydrates each readset's tape + LogHeader into a LogRecord, and
