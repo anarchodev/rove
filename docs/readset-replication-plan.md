@@ -495,6 +495,13 @@ Increments:
   splits the payload via `decodeWriteSetPayload`, validates
   `rs_bytes` via `parseReadset` (panics on malformed), uses
   `ws_bytes` for the existing apply / scan / decode operations.
+  *Note (3d-multi follow-up):* `rs_bytes` was later promoted from
+  a single `Readset.serialize` blob to a
+  `tape_mod.encodeReadsetList` blob — `[u32 count BE]
+  ([u32 blob_len BE][Readset.serialize bytes]){count}` — so a
+  batched dispatch's multiple successful requests can each ride
+  their own readset. Empty `rs_bytes` remains the "no readsets"
+  sentinel; non-handler producers are unchanged.
 - **3b — propose plumbing**: `proposeWriteSet` / `proposeBatch` /
   `encodeWriteSetEnvelope` take `rs_bytes: []const u8` (required).
   Every call site updated. Non-handler producers (config-mirror,
@@ -508,14 +515,29 @@ Increments:
   materialization for Phase 5's follower tape upload is a later
   slice.
 - **3d — leader-side actual serialize**: `dispatchPending`
-  serializes the FIRST successful request's `Readset` via
-  `Readset.serialize(allocator)`; the bytes ride a new
-  `batch_readset_bytes` local through `finalizeBatch` to both
-  the main `proposeBatch` and the read-only barrier
-  `proposeWriteSet`. Multi-request batches currently drop
-  subsequent readsets — TODO: aggregate. Drain + streaming
+  serializes each successful request's `Readset` via
+  `Readset.serialize(allocator)` and accumulates the blobs into
+  a `batch_readset_blobs` list; at end-of-walk it wraps the list
+  via `tape_mod.encodeReadsetList` and the resulting `rs_bytes`
+  rides `finalizeBatch` to both the main `proposeBatch` and the
+  read-only barrier `proposeWriteSet`. Drain + streaming
   resume paths still pass `""` and TODO their own readset
-  attachment.
+  attachment (closed by 3d-fetch).
+
+- **3d-multi (shipped)**: multi-readset aggregation. The raft
+  envelope's `rs_bytes` payload is now a
+  `tape_mod.encodeReadsetList` blob — `[u32 count BE]
+  ([u32 blob_len BE][Readset.serialize bytes]){count}`. Empty
+  bytes remain the "no readsets" sentinel for non-handler
+  producers (ACME, secondary inner envelopes of a batched
+  propose, root_writeset). Apply-side validation
+  (`applyWriteSet`) walks the list and validates each entry
+  with `tape_mod.parseReadset`. `proposeForgetfulWrites`
+  (single-activation paths in worker_streaming.zig +
+  worker.zig) wraps its one readset as a 1-item list, keeping
+  the wire shape uniform across producers. Closes the slice-3d
+  "first readset only" TODO; multi-request batches now carry
+  every successful request's readset.
 
 ### Phase 4 — callback gating
 

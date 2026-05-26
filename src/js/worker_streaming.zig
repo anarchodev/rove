@@ -1545,14 +1545,27 @@ pub fn proposeForgetfulWrites(
     }
 
     txn.releaseLease();
-    // Serialize the activation's readset for the anchor envelope's
-    // rs_bytes section. Best-effort: serialize failure logs and we
+    // Serialize the activation's readset and wrap as a 1-item readset
+    // list for the anchor envelope's rs_bytes section
+    // (`docs/readset-replication-plan.md` Phase 3d-fetch + multi-
+    // readset aggregation). Best-effort: any failure logs and we
     // propose with empty rs_bytes (same as pre-3d-fetch behavior —
     // the chain just doesn't get readset-replicated for this entry).
-    const rs_bytes: []u8 = if (readset_opt) |rs|
+    const rs_blob: []u8 = if (readset_opt) |rs|
         rs.serialize(allocator) catch |err| blk: {
             std.log.warn(
                 "rove-js proposeForgetfulWrites: readset.serialize tenant={s}: {s}",
+                .{ tenant_id, @errorName(err) },
+            );
+            break :blk &.{};
+        }
+    else
+        &.{};
+    defer if (rs_blob.len > 0) allocator.free(rs_blob);
+    const rs_bytes: []u8 = if (rs_blob.len > 0)
+        tape_mod.encodeReadsetList(allocator, &.{rs_blob}) catch |err| blk: {
+            std.log.warn(
+                "rove-js proposeForgetfulWrites: encodeReadsetList tenant={s}: {s}",
                 .{ tenant_id, @errorName(err) },
             );
             break :blk &.{};

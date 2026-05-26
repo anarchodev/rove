@@ -718,6 +718,96 @@ pub fn parseReadset(bytes: []const u8) ParseError!ParsedReadset {
     };
 }
 
+/// List of `Readset.serialize()` blobs, wire-encoded for the type-0
+/// envelope's `rs_bytes` section
+/// (`docs/readset-replication-plan.md` Phase 3d follow-up — multi-
+/// request batch aggregation). A batched H2 dispatch can run several
+/// successful handlers under one raft entry; each handler owns a
+/// distinct readset, and tape upload on follower-promotion needs to
+/// hydrate one tape per request, not just the first.
+///
+/// Wire format:
+/// ```
+/// (empty bytes)                                — count = 0 sentinel
+/// or
+/// [u32 count BE]
+///   for each i in 0..count:
+///     [u32 blob_len BE]
+///     [blob_bytes]                             — `Readset.serialize` output
+/// ```
+///
+/// Why an empty-bytes sentinel for count=0: non-handler producers
+/// (ACME, secondary inner envelopes of a batched propose,
+/// root_writeset) pass `rs_bytes = ""` already, and the apply path
+/// gates "has readset?" on `len > 0`. Keeping that contract means
+/// no churn in those callers.
+pub const ParsedReadsetList = struct {
+    /// Borrowed slices into the input bytes; each is a
+    /// `Readset.serialize` blob ready to feed back to `parseReadset`.
+    blobs: []const []const u8,
+
+    pub fn deinit(self: *ParsedReadsetList, allocator: std.mem.Allocator) void {
+        if (self.blobs.len > 0) allocator.free(self.blobs);
+        self.* = undefined;
+    }
+};
+
+/// Wrap a sequence of pre-serialized `Readset.serialize()` blobs as a
+/// type-0 envelope's `rs_bytes` payload. Caller owns each input blob;
+/// they are not freed. Empty input returns an empty slice (the
+/// "no readsets" sentinel) without allocating.
+pub fn encodeReadsetList(
+    allocator: std.mem.Allocator,
+    blobs: []const []const u8,
+) ![]u8 {
+    if (blobs.len == 0) return &.{};
+    var total: usize = 4; // count header
+    for (blobs) |b| total += 4 + b.len;
+    const out = try allocator.alloc(u8, total);
+    std.mem.writeInt(u32, out[0..4], @intCast(blobs.len), .big);
+    var cur: usize = 4;
+    for (blobs) |b| {
+        std.mem.writeInt(u32, out[cur..][0..4], @intCast(b.len), .big);
+        cur += 4;
+        @memcpy(out[cur..][0..b.len], b);
+        cur += b.len;
+    }
+    return out;
+}
+
+/// Parse a `rs_bytes` payload as a list of readset blobs. Empty
+/// input returns an empty list (caller still calls `deinit`, which
+/// is a no-op for the empty case). Allocates a `[]const []const u8`
+/// slice; each entry borrows into `bytes`, which must outlive the
+/// returned value.
+pub fn parseReadsetList(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) (ParseError || std.mem.Allocator.Error)!ParsedReadsetList {
+    if (bytes.len == 0) return .{ .blobs = &.{} };
+    if (bytes.len < 4) return ParseError.Truncated;
+    const count = std.mem.readInt(u32, bytes[0..4], .big);
+    if (count == 0) {
+        // Non-empty bytes with count=0 is malformed — the "no readsets"
+        // sentinel is bytes.len == 0, not a 4-byte zero count.
+        return ParseError.Truncated;
+    }
+    var cur: usize = 4;
+    const blobs = try allocator.alloc([]const u8, count);
+    errdefer allocator.free(blobs);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (cur + 4 > bytes.len) return ParseError.Truncated;
+        const blob_len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
+        cur += 4;
+        if (cur + blob_len > bytes.len) return ParseError.Truncated;
+        blobs[i] = bytes[cur .. cur + blob_len];
+        cur += blob_len;
+    }
+    if (cur != bytes.len) return ParseError.Truncated;
+    return .{ .blobs = blobs };
+}
+
 pub fn hashHexBytes(bytes: []const u8) [64]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -1310,6 +1400,134 @@ test "readset: parseReadset rejects truncated input" {
     try testing.expectError(
         ParseError.Truncated,
         parseReadset(bytes[0 .. bytes.len - 3]),
+    );
+}
+
+test "readset list: empty roundtrip (sentinel)" {
+    const bytes = try encodeReadsetList(testing.allocator, &.{});
+    // Empty bytes are the "no readsets" sentinel — no allocation happens.
+    try testing.expectEqual(@as(usize, 0), bytes.len);
+    var parsed = try parseReadsetList(testing.allocator, bytes);
+    defer parsed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), parsed.blobs.len);
+}
+
+test "readset list: single-entry roundtrip" {
+    var rs = Readset.init(testing.allocator, 1234, 0xAA);
+    defer rs.deinit();
+    try rs.kv.appendKv(.get, "k", "v", .ok);
+    const rs_bytes = try rs.serialize(testing.allocator);
+    defer testing.allocator.free(rs_bytes);
+
+    const list = try encodeReadsetList(testing.allocator, &.{rs_bytes});
+    defer testing.allocator.free(list);
+    // 4-byte count + 4-byte length + payload
+    try testing.expectEqual(@as(usize, 8 + rs_bytes.len), list.len);
+
+    var parsed = try parseReadsetList(testing.allocator, list);
+    defer parsed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), parsed.blobs.len);
+    try testing.expectEqualSlices(u8, rs_bytes, parsed.blobs[0]);
+
+    // Each blob in the list is a valid Readset blob.
+    const inner = try parseReadset(parsed.blobs[0]);
+    try testing.expectEqual(@as(i64, 1234), inner.timestamp_ns);
+    try testing.expectEqual(@as(u64, 0xAA), inner.seed);
+}
+
+test "readset list: multi-entry roundtrip" {
+    var rs_a = Readset.init(testing.allocator, 1, 0x11);
+    defer rs_a.deinit();
+    try rs_a.kv.appendKv(.get, "a", "1", .ok);
+    var rs_b = Readset.init(testing.allocator, 2, 0x22);
+    defer rs_b.deinit();
+    try rs_b.kv.appendKv(.get, "b", "2", .ok);
+    try rs_b.date.appendDate(99);
+    var rs_c = Readset.init(testing.allocator, 3, 0x33);
+    defer rs_c.deinit();
+
+    const ba = try rs_a.serialize(testing.allocator);
+    defer testing.allocator.free(ba);
+    const bb = try rs_b.serialize(testing.allocator);
+    defer testing.allocator.free(bb);
+    const bc = try rs_c.serialize(testing.allocator);
+    defer testing.allocator.free(bc);
+
+    const list = try encodeReadsetList(testing.allocator, &.{ ba, bb, bc });
+    defer testing.allocator.free(list);
+
+    var parsed = try parseReadsetList(testing.allocator, list);
+    defer parsed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), parsed.blobs.len);
+    try testing.expectEqualSlices(u8, ba, parsed.blobs[0]);
+    try testing.expectEqualSlices(u8, bb, parsed.blobs[1]);
+    try testing.expectEqualSlices(u8, bc, parsed.blobs[2]);
+
+    // Independent reparse of each surfaces the right scalars + content.
+    const ia = try parseReadset(parsed.blobs[0]);
+    try testing.expectEqual(@as(i64, 1), ia.timestamp_ns);
+    const ib = try parseReadset(parsed.blobs[1]);
+    try testing.expectEqual(@as(u64, 0x22), ib.seed);
+    const ic = try parseReadset(parsed.blobs[2]);
+    try testing.expectEqual(@as(i64, 3), ic.timestamp_ns);
+}
+
+test "readset list: rejects 4-byte zero-count (malformed sentinel)" {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, 0, .big);
+    try testing.expectError(
+        ParseError.Truncated,
+        parseReadsetList(testing.allocator, &bytes),
+    );
+}
+
+test "readset list: rejects truncated count header" {
+    const short: [3]u8 = .{ 0, 0, 1 };
+    try testing.expectError(
+        ParseError.Truncated,
+        parseReadsetList(testing.allocator, &short),
+    );
+}
+
+test "readset list: rejects truncated entry length" {
+    // count = 1, but only 2 bytes of the per-entry length header follow.
+    var bytes: [6]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], 1, .big);
+    bytes[4] = 0;
+    bytes[5] = 0;
+    try testing.expectError(
+        ParseError.Truncated,
+        parseReadsetList(testing.allocator, &bytes),
+    );
+}
+
+test "readset list: rejects truncated entry payload" {
+    // count = 1, declared blob_len = 10, but only 4 bytes of payload follow.
+    var bytes: [12]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], 1, .big);
+    std.mem.writeInt(u32, bytes[4..8], 10, .big);
+    @memset(bytes[8..], 0);
+    try testing.expectError(
+        ParseError.Truncated,
+        parseReadsetList(testing.allocator, &bytes),
+    );
+}
+
+test "readset list: rejects trailing bytes after final entry" {
+    var rs = Readset.init(testing.allocator, 0, 0);
+    defer rs.deinit();
+    const rs_bytes = try rs.serialize(testing.allocator);
+    defer testing.allocator.free(rs_bytes);
+    const list = try encodeReadsetList(testing.allocator, &.{rs_bytes});
+    defer testing.allocator.free(list);
+
+    const padded = try testing.allocator.alloc(u8, list.len + 4);
+    defer testing.allocator.free(padded);
+    @memcpy(padded[0..list.len], list);
+    @memset(padded[list.len..], 0);
+    try testing.expectError(
+        ParseError.Truncated,
+        parseReadsetList(testing.allocator, padded),
     );
 }
 
