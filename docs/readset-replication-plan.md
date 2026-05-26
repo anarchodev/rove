@@ -507,11 +507,15 @@ Increments:
   apply `payload.ws_bytes` and validate `payload.rs_bytes` shape;
   materialization for Phase 5's follower tape upload is a later
   slice.
-- **3d — leader-side actual serialize**: pending. Wires
-  `Readset.serialize` into `dispatchPending` and routes the bytes
-  through `finalizeBatch` → `proposeBatch`. Drain / streaming /
-  barrier-propose call sites also need their own readset
-  attachment work (TODOs at the call sites).
+- **3d — leader-side actual serialize**: `dispatchPending`
+  serializes the FIRST successful request's `Readset` via
+  `Readset.serialize(allocator)`; the bytes ride a new
+  `batch_readset_bytes` local through `finalizeBatch` to both
+  the main `proposeBatch` and the read-only barrier
+  `proposeWriteSet`. Multi-request batches currently drop
+  subsequent readsets — TODO: aggregate. Drain + streaming
+  resume paths still pass `""` and TODO their own readset
+  attachment.
 
 ### Phase 4 — callback gating
 
