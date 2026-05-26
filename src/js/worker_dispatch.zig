@@ -2364,7 +2364,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // `txn` is open. Run the handler under its own savepoint so a
         // JS exception or CPU-budget kill rolls back only this handler's
         // writes without poisoning the rest of the batch.
-        var readset = tape_mod.Readset.init(allocator);
+        var readset = tape_mod.Readset.init(allocator, received_ns, @bitCast(received_ns));
         defer readset.deinit();
 
         // Pre-mint the request id. webhook.send derives its webhook id
@@ -2444,7 +2444,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .query = route.query,
             .headers = rh,
             .readset = &readset,
-            .prng_seed = @bitCast(received_ns),
             .request_id = request_id,
             .correlation_id = correlation_id,
             .activation_source = .inbound,

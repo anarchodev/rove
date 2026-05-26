@@ -393,6 +393,19 @@ generator already captures these fields on the leader; the change is
 making the readset a first-class structural value rather than a
 serialization-side concern. No raft changes.
 
+Increments shipped:
+
+- **1a — structural lift** (commit `7421dcc`): five per-channel `Tape`
+  fields on `DispatchState` / `Request` collapsed to a single
+  `?*tape_mod.Readset` owned by the tape module.
+- **1b — scalar inputs onto Readset**: `timestamp_ns: i64` and
+  `seed: u64` are now Readset fields, captured once at dispatch
+  entry. The standalone `Request.prng_seed` was dropped; the
+  dispatcher sources the PRNG seed from `request.readset.?.seed`
+  with a 0 fallback for the test paths that pass no readset. The
+  `Readset.init(allocator)` signature becomes
+  `init(allocator, timestamp_ns, seed)`.
+
 ### Phase 2 — per-tenant streaming buffer + S3 batched flush
 
 Add the per-tenant buffer + flusher in the worker. Fetch responses

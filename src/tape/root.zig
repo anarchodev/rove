@@ -352,28 +352,51 @@ pub const Tape = struct {
 
 /// Per-request captured readset — the set of non-deterministic
 /// inputs the handler observed, channeled by source. Structural
-/// holder of the per-channel `Tape`s; the dispatcher hands the
-/// worker one `Readset` per dispatch and the bindings append to
-/// the relevant channel.
+/// holder of the per-channel `Tape`s plus the scalar inputs
+/// captured once at dispatch entry (`timestamp_ns`, `seed`); the
+/// dispatcher hands the worker one `Readset` per dispatch and the
+/// bindings append to the relevant channel.
 ///
-/// Shape mirrors the WASM replay engine's `Module.tapes` 1:1
-/// (`docs/replay-wasm-plan.md` §4) — same five channels, same
+/// Channel shape mirrors the WASM replay engine's `Module.tapes`
+/// 1:1 (`docs/replay-wasm-plan.md` §4) — same five channels, same
 /// names. No translation layer between capture and replay.
 ///
 /// `docs/readset-replication-plan.md` Phase 1 lifted this from
-/// `src/js/worker_log.zig:RequestTapes` so the type is owned by
-/// the tape module that defines its wire format. Later phases
-/// will extend with `fetch_responses` + `trigger_payload` so the
-/// raft entry can carry the full readset out-of-band.
+/// `src/js/worker_log.zig:RequestTapes`; this revision adds the
+/// `timestamp_ns` / `seed` scalars from §4.1 so the readset is the
+/// single home for every per-request non-deterministic input the
+/// raft entry will eventually carry. Later phases will extend with
+/// `fetch_responses` + `trigger_payload`.
 pub const Readset = struct {
+    /// Wall-clock nanosecond timestamp captured once at dispatch
+    /// entry — the canonical "when this request was received."
+    /// Used to seed `Math.random`/`crypto.*` PRNG (via `.seed`,
+    /// see below) and recorded so replay sees the same start
+    /// instant. Stored alongside the per-call `.date` tape, which
+    /// captures each `Date.now()` separately.
+    timestamp_ns: i64,
+    /// PRNG seed used to initialize the dispatcher's
+    /// `std.Random.DefaultPrng` for `Math.random` and
+    /// `crypto.getRandomValues` / `crypto.randomUUID`. Production
+    /// callers derive it from `timestamp_ns`; tests pass a fixed
+    /// value for determinism. Belt-and-suspenders for "the tape
+    /// was dropped but the seed survived" — replay primarily reads
+    /// the per-call `.math_random` / `.crypto_random` tapes.
+    seed: u64,
     kv: Tape,
     date: Tape,
     math_random: Tape,
     crypto_random: Tape,
     module: Tape,
 
-    pub fn init(allocator: std.mem.Allocator) Readset {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        timestamp_ns: i64,
+        seed: u64,
+    ) Readset {
         return .{
+            .timestamp_ns = timestamp_ns,
+            .seed = seed,
             .kv = Tape.init(allocator, .kv),
             .date = Tape.init(allocator, .date),
             .math_random = Tape.init(allocator, .math_random),
