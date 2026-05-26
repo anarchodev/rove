@@ -124,10 +124,13 @@ pub const EnvelopeType = enum(u8) {
 pub const WriteSetPayload = struct {
     /// Borrowed slice into the input payload — the writeset bytes.
     ws_bytes: []const u8,
-    /// Borrowed slice into the input payload — the readset bytes
+    /// Borrowed slice into the input payload — the readset list bytes
     /// (empty for non-handler producers). When non-empty, the bytes
-    /// are a `tape_mod.Readset.serialize` blob; `tape_mod.parseReadset`
-    /// validates the shape.
+    /// are a `tape_mod.encodeReadsetList` blob containing one or more
+    /// `Readset.serialize` entries (one per successful request in the
+    /// batched dispatch that produced this envelope);
+    /// `tape_mod.parseReadsetList` validates the outer shape, and
+    /// `tape_mod.parseReadset` validates each per-readset blob.
     rs_bytes: []const u8,
 };
 
@@ -374,22 +377,32 @@ pub fn applyWriteSet(
     };
 
     // Phase 3 (`docs/readset-replication-plan.md`): the type-0
-    // payload now carries `[u32 ws_len][ws][u32 rs_len][rs]`. Extract
-    // the writeset half + validate the readset half's shape. Phase 5
-    // will materialize tapes from `payload.rs_bytes` for follower
-    // tape upload; for now followers just verify the wire shape and
-    // discard.
+    // payload now carries `[u32 ws_len][ws][u32 rs_len][rs]`. The
+    // `rs_bytes` section is a `tape_mod.encodeReadsetList` blob
+    // (one or more readsets — multi-readset aggregation lifted the
+    // "first only" limitation from slice 3d). Extract the writeset
+    // half + validate the readset list shape. Phase 5 will materialize
+    // tapes from each list entry for follower tape upload; for now
+    // followers just verify the wire shape and discard.
     const payload = decodeWriteSetPayload(env.payload) catch |err| panic_mod.invariantViolated(
         "applyWriteSet.decodeWriteSetPayload",
         "tenant={s} err={s}",
         .{ env.id, @errorName(err) },
     );
     if (payload.rs_bytes.len > 0) {
-        _ = tape_mod.parseReadset(payload.rs_bytes) catch |err| panic_mod.invariantViolated(
-            "applyWriteSet.parseReadset",
+        var parsed_list = tape_mod.parseReadsetList(cluster.allocator, payload.rs_bytes) catch |err| panic_mod.invariantViolated(
+            "applyWriteSet.parseReadsetList",
             "tenant={s} rs_len={d} err={s}",
             .{ env.id, payload.rs_bytes.len, @errorName(err) },
         );
+        defer parsed_list.deinit(cluster.allocator);
+        for (parsed_list.blobs, 0..) |blob, i| {
+            _ = tape_mod.parseReadset(blob) catch |err| panic_mod.invariantViolated(
+                "applyWriteSet.parseReadset[i]",
+                "tenant={s} i={d} blob_len={d} err={s}",
+                .{ env.id, i, blob.len, @errorName(err) },
+            );
+        }
     }
 
     kv.applyEncodedWriteSet(store, 0, payload.ws_bytes) catch |err| panic_mod.invariantViolated(
