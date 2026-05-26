@@ -354,61 +354,6 @@ pub const KvWakeInbox = struct {
 /// shuts down cleanly. Configurable per-tenant lands in Phase 2c.
 pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
 
-/// `docs/primitive-gaps.md` §6 — per-chain tape byte cap. Once a
-/// chain (correlation_id) accumulates this many tape bytes across
-/// its activations, subsequent activations flush their log records
-/// without the tape payloads (replay degrades to summary-only past
-/// the cap). 10 MB is generous for normal chains (the LLM-proxy
-/// case stays under 1 MB even for ~3000 chunks); pathological
-/// streams hit the cap and bound the long-term cost.
-///
-/// Operator-tunable per tenant lands in v2 — v1 ships one global
-/// constant. Capture-mode (`tape_mode = on_exception` etc.) is
-/// the v2 storage-cost knob (catalog §6); the cap is the v1
-/// correctness/safety knob.
-pub const TAPE_CAP_BYTES_PER_CHAIN: u64 = 10 * 1024 * 1024;
-
-/// LRU eviction trigger for the tape-state map(s). The total
-/// capacity is `TAPE_STATE_LRU_CAP`; each shard caps at
-/// `TAPE_STATE_LRU_CAP / TAPE_STATE_SHARDS` entries. The chains
-/// dropped may re-enter at zero used-bytes (rare in practice —
-/// chains usually terminate well before eviction).
-pub const TAPE_STATE_LRU_CAP: u32 = 10_000;
-
-/// Shard count for the per-chain tape-budget tracker. The tape
-/// cap is consulted on the inbound dispatch hot path (4 sites in
-/// `dispatchOnce`), so a single global mutex serialized every
-/// worker through one critical section — measured as a ~4× drop
-/// in 8w/8t sharded-write throughput when the cap was added (see
-/// commit `c547784`'s regression). Picking `correlation_id`'s
-/// hash mod `TAPE_STATE_SHARDS` partitions the contention domain;
-/// uniform-tenant load sees ~1/N residual contention.
-///
-/// Power of 2 so the modulo lowers to a mask. 16 is plenty for
-/// 8 workers; bump if worker counts grow into the hundreds.
-pub const TAPE_STATE_SHARDS: usize = 16;
-const TAPE_STATE_LRU_CAP_PER_SHARD: u32 = TAPE_STATE_LRU_CAP / @as(u32, @intCast(TAPE_STATE_SHARDS));
-
-pub const TapeStateShard = struct {
-    mutex: std.Thread.Mutex = .{},
-    map: std.StringHashMapUnmanaged(ChainTapeState) = .empty,
-};
-
-/// `tape_state_shards[*].map` value — per-chain tape accounting.
-/// Tiny (~32 bytes). Cross-worker; contention is bounded by the
-/// shard fanout (`TAPE_STATE_SHARDS`).
-pub const ChainTapeState = struct {
-    bytes_used: u64 = 0,
-    /// Set the first time the chain crosses the cap. Once set,
-    /// `captureTapes` returns empty payloads + emits a one-shot
-    /// log-line warning (the marker on the activation that
-    /// tripped it).
-    capped: bool = false,
-    /// Monotonic counter for LRU eviction — bumped on every
-    /// `captureTapes` touch.
-    last_touch_seq: u64 = 0,
-};
-
 // Effect-reification Phase 2E: SubscriptionFireInbox + FetchChunkInbox
 // + PendingFireMessage retired. The unified `effect.MsgInbox` carries
 // Msgs (variant-typed) across the thread boundary; producers build the
@@ -1292,17 +1237,6 @@ pub const NodeState = struct {
     /// starts with `__system/`.
     builtin_modules: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    /// Per-chain tape budget tracker (`docs/primitive-gaps.md` §6).
-    /// Keyed by `correlation_id` (string-owned). Each chain
-    /// accumulates `bytes_used` across all its activations; hitting
-    /// `TAPE_CAP_BYTES_PER_CHAIN` flips `capped = true` and
-    /// `captureTapes` returns empty payloads for subsequent
-    /// activations of that chain. Sharded by `hash(correlation_id)
-    /// & (TAPE_STATE_SHARDS - 1)` because the cap probe + charge
-    /// run on every inbound activation (4 sites in `dispatchOnce`)
-    /// — a single global mutex measured as a ~4× regression.
-    tape_state_shards: [TAPE_STATE_SHARDS]TapeStateShard = [_]TapeStateShard{.{}} ** TAPE_STATE_SHARDS,
-
     /// Worker-side propose-pipeline observability. Observed at
     /// `finalizeBatch` exit with the number of handler-bound
     /// requests in this writeset envelope. Combined with the
@@ -1603,11 +1537,6 @@ pub const NodeState = struct {
             var cs_it = self.cron_state.iterator();
             while (cs_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
             self.cron_state.deinit(self.allocator);
-        }
-        for (&self.tape_state_shards) |*shard| {
-            var ts_it = shard.map.iterator();
-            while (ts_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
-            shard.map.deinit(self.allocator);
         }
         // `docs/curl-multi-plan.md` Phase 2: pending-fetches queue
         // moved into the FetchEngine; its shutdown above already
@@ -2962,15 +2891,14 @@ pub fn getOrOpenTenantSlot(
 //
 // Moved to `worker_log.zig`. Re-exported here so external callers
 // (root.zig's `pub const flushLogs = worker.flushLogs;`,
-// worker_dispatch.zig's `worker_mod.captureLog*` /
-// `captureTapesForChain*`) keep working without touching their import
-// lines. Internal callers in this file use `worker_log.X` directly.
+// worker_dispatch.zig's `worker_mod.captureLog*` / `captureTapes*`)
+// keep working without touching their import lines. Internal callers
+// in this file use `worker_log.X` directly.
 pub const REQUEST_BODY_CAP = worker_log.REQUEST_BODY_CAP;
 pub const getOrOpenTenantLog = worker_log.getOrOpenTenantLog;
 pub const getOrOpenTenantBodies = worker_bodies.getOrOpenTenantBodies;
 pub const captureTapes = worker_log.captureTapes;
-pub const captureTapesForChain = worker_log.captureTapesForChain;
-pub const captureTapesForChainWithActivation = worker_log.captureTapesForChainWithActivation;
+pub const captureTapesWithActivation = worker_log.captureTapesWithActivation;
 pub const captureLog = worker_log.captureLog;
 pub const captureLogWithId = worker_log.captureLogWithId;
 pub const flushLogs = worker_log.flushLogs;
@@ -4167,7 +4095,7 @@ pub fn fireFetchEventActivation(
         inline_bytes_for_tape,
     ) catch |err| {
         // Tape capture failures must never kill the request. Same
-        // posture as `captureTapesForChain`'s per-channel serialize
+        // posture as `captureTapes`'s per-channel serialize
         // errors: log + skip.
         std.log.warn(
             "rove-js fetch-event: readset.fetch_responses append tenant={s} fetch_id={s}: {s}",
@@ -4195,7 +4123,7 @@ pub fn fireFetchEventActivation(
     ) catch {
         txn.rollback() catch {};
         txn_done = true;
-        const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+        const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
         captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
         return;
     };
@@ -4211,7 +4139,7 @@ pub fn fireFetchEventActivation(
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;
-                const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
                 captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
                 r.console = &.{};
                 r.exception = &.{};
@@ -4234,7 +4162,7 @@ pub fn fireFetchEventActivation(
                     std.log.warn("rove-js fetch-event ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+                    const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
                     captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
                     r.console = &.{};
                     r.exception = &.{};
@@ -4243,7 +4171,7 @@ pub fn fireFetchEventActivation(
                 txn_owned = false;
                 txn_done = true;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
                 captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
@@ -4256,7 +4184,7 @@ pub fn fireFetchEventActivation(
             );
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+            const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
             captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
             r.console = &.{};
             r.exception = &.{};
@@ -4299,13 +4227,13 @@ pub fn fireFetchEventActivation(
                     std.log.warn("rove-js fetch-event ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+                    const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
                     captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
                 captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, fw_seq);
                 return;
             }
@@ -4315,7 +4243,7 @@ pub fn fireFetchEventActivation(
                 .{@errorName(e)},
             );
             txn_done = true;
-            const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+            const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
             captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
         },
         .stream => |*s2| {
@@ -4341,13 +4269,13 @@ pub fn fireFetchEventActivation(
                     std.log.warn("rove-js fetch-event ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
-                    const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+                    const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
                     captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
                 captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, fw_seq);
                 return;
             }
@@ -4357,7 +4285,7 @@ pub fn fireFetchEventActivation(
                 .{@errorName(e)},
             );
             txn_done = true;
-            const tape_payloads = captureTapesForChainWithActivation(worker, &readset, body, corr_full, activation_bytes_for_tape);
+            const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
             captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
         },
     }
