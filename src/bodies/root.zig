@@ -93,10 +93,26 @@ pub const BodyRef = struct {
 /// construction; the buffer builds the per-batch key on flush.
 /// Tests can use a `MemoryBlobStore`-style fixture (see
 /// `BlobStore.VTable`).
+///
+/// ## Concurrency
+///
+/// Thread-safe via an internal mutex. The flush PUT releases the
+/// mutex around the slow S3 call (toOwnedSlice → unlock → PUT →
+/// lock → mark durable) so the worker thread can keep appending
+/// while a previous batch is in flight. The producer (`append`)
+/// and the consumer (`flush`) are typically on different threads:
+/// the worker thread appends in `fireFetchEventActivation`; the
+/// log-flusher thread drives `flush` on the periodic tick.
 pub const BodyBuffer = struct {
     allocator: std.mem.Allocator,
+    /// Guards every mutable field below. Held briefly for
+    /// `append` / threshold checks; released across the slow PUT
+    /// in `flush` so producers aren't blocked on S3 RTT.
+    mutex: std.Thread.Mutex = .{},
     /// In-RAM accumulator for the currently-open batch. Cleared on
-    /// each successful flush.
+    /// each successful flush via `toOwnedSlice` (cheap — the slice
+    /// goes straight to the PUT path; capacity returns on the next
+    /// append).
     current_bytes: std.ArrayList(u8) = .empty,
     /// Id assigned to the currently-open batch. The first batch is
     /// id 1; the next-id starts at 1 and is bumped on every flush.
@@ -144,8 +160,12 @@ pub const BodyBuffer = struct {
     /// `(batch_id, offset, len)` regardless of subsequent appends
     /// to the same batch.
     ///
+    /// Thread-safe — takes the buffer mutex.
+    ///
     /// Errors: OutOfMemory (ArrayList expansion failed).
     pub fn append(self: *BodyBuffer, bytes: []const u8) !BodyRef {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const offset = self.current_bytes.items.len;
         try self.current_bytes.appendSlice(self.allocator, bytes);
         return .{
@@ -156,16 +176,20 @@ pub const BodyBuffer = struct {
     }
 
     /// True iff the current open batch has accumulated at least
-    /// `flush_size_bytes`.
-    pub fn shouldFlushBySize(self: *const BodyBuffer) bool {
+    /// `flush_size_bytes`. Thread-safe — takes the buffer mutex.
+    pub fn shouldFlushBySize(self: *BodyBuffer) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.current_bytes.items.len >= self.flush_size_bytes;
     }
 
     /// True iff at least `flush_interval_ns` has elapsed since the
     /// last flush AND the current batch has at least one byte to
     /// flush. Empty-batch ticks are skipped (no point in PUT-ing
-    /// an empty object).
-    pub fn shouldFlushByTime(self: *const BodyBuffer, now_ns: i64) bool {
+    /// an empty object). Thread-safe.
+    pub fn shouldFlushByTime(self: *BodyBuffer, now_ns: i64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.current_bytes.items.len == 0) return false;
         return (now_ns - self.last_flush_ns) >= self.flush_interval_ns;
     }
@@ -173,14 +197,18 @@ pub const BodyBuffer = struct {
     /// Bytes accumulated in the current open batch. Useful for
     /// metrics + the RAM-cap signal that triggers backpressure
     /// (`docs/readset-replication-plan.md` §11.6 — not implemented
-    /// in this slice).
-    pub fn pendingBytes(self: *const BodyBuffer) usize {
+    /// in this slice). Thread-safe.
+    pub fn pendingBytes(self: *BodyBuffer) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.current_bytes.items.len;
     }
 
     /// Id of the currently-open batch. Pre-flush, this is the
-    /// batch any `append` will write into.
-    pub fn currentBatchId(self: *const BodyBuffer) u64 {
+    /// batch any `append` will write into. Thread-safe.
+    pub fn currentBatchId(self: *BodyBuffer) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.current_batch_id;
     }
 
@@ -197,10 +225,18 @@ pub const BodyBuffer = struct {
 
     /// Publish the current open batch to `store` and open the next
     /// one. Empty current batch is a no-op (returns NO_BATCH).
-    /// On PUT failure, the current batch is preserved — the caller
-    /// can retry. On success, `last_flushed_batch_id` advances,
-    /// `current_batch_id` bumps, and `current_bytes` resets to
-    /// empty (capacity retained for reuse).
+    ///
+    /// Thread-safe with a lock-release pattern around the slow
+    /// PUT: takes the mutex briefly to claim the bytes + mint the
+    /// next batch_id, releases for the network call, re-takes
+    /// briefly to advance `last_flushed_batch_id`. Concurrent
+    /// `append` calls on the producer thread are blocked only
+    /// during the two short critical sections.
+    ///
+    /// On PUT failure the bytes are **lost** (same lossy posture
+    /// as the log-batch flush — `docs/logs-plan.md`). A warning
+    /// is the caller's responsibility; the buffer continues with
+    /// the next batch.
     ///
     /// Returns the batch id that was just published (or NO_BATCH
     /// if nothing was flushed).
@@ -209,27 +245,42 @@ pub const BodyBuffer = struct {
         store: blob_mod.BlobStore,
         now_ns: i64,
     ) !u64 {
-        if (self.current_bytes.items.len == 0) return NO_BATCH;
+        // Claim the current bytes + mint the next batch_id under
+        // the mutex. `toOwnedSlice` transfers the backing buffer;
+        // `current_bytes` resets to empty and re-allocs on the
+        // next append.
+        var flushed_id: u64 = NO_BATCH;
+        var bytes_owned: []u8 = &.{};
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.current_bytes.items.len == 0) return NO_BATCH;
+            flushed_id = self.current_batch_id;
+            bytes_owned = try self.current_bytes.toOwnedSlice(self.allocator);
+            self.current_batch_id += 1;
+        }
+        defer self.allocator.free(bytes_owned);
 
         var key_buf: [21]u8 = undefined;
-        const key = batchKey(self.current_batch_id, &key_buf);
+        const key = batchKey(flushed_id, &key_buf);
 
-        // PUT first. Only commit local state advances if the PUT
-        // succeeded — otherwise the caller retries with the same
-        // bytes still in `current_bytes`.
-        try store.put(key, self.current_bytes.items);
+        // Slow path: PUT outside the lock so concurrent appends
+        // aren't blocked by S3 RTT.
+        try store.put(key, bytes_owned);
 
-        const flushed_id = self.current_batch_id;
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.last_flushed_batch_id = flushed_id;
-        self.current_batch_id += 1;
-        self.current_bytes.clearRetainingCapacity();
         self.last_flush_ns = now_ns;
         return flushed_id;
     }
 
     /// Predicate for the §5.1 callback gate: true iff every byte
     /// referenced by `ref` is durable in stable storage.
-    pub fn isDurable(self: *const BodyBuffer, ref: BodyRef) bool {
+    /// Thread-safe.
+    pub fn isDurable(self: *BodyBuffer, ref: BodyRef) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return ref.batch_id != NO_BATCH and ref.batch_id <= self.last_flushed_batch_id;
     }
 };

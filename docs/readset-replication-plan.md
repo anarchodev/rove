@@ -442,7 +442,17 @@ Increments:
   sites yet — first append in slice 2c.
 - **2c — outbound (fetch) bodies**: chunks from curl_multi append
   to the buffer; engine emits BodyRef. Routes via the existing
-  fetch_chunk activation path.
+  fetch_chunk activation path. Split into:
+    - **2c-1**: data plumbing — append on chunk arrival;
+      log-flusher thread piggybacks per-tenant body flush on its
+      50ms tick; `BodyBuffer` made thread-safe with lock-release
+      pattern around the slow PUT; `worker.tenant_bodies_mu`
+      protects the map structure. No tape capture yet — bytes
+      flow through S3 but the BodyRef is unused.
+    - **2c-2**: tape capture — extend `tape_mod.Readset` with a
+      `fetch_responses` channel that records the BodyRef per
+      fetch chunk; serialize through the log-blob path so the
+      replay engine can resolve fetch bodies via BodyRef GET.
 - **2d — inbound bodies**: H2 DATA frames append to the buffer;
   engine emits BodyRef for the trigger payload position.
 
