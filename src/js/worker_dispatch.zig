@@ -497,6 +497,13 @@ fn finalizeBatch(
     /// propose-fail / handler-error → caller's defer frees the
     /// list.
     batch_pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
+    /// `docs/readset-replication-plan.md` Phase 3d: serialized
+    /// readset bytes from the first successful request in this
+    /// batch. Empty (`""`) when no request in the batch produced
+    /// a readset (e.g. all early-error / no-deployment exits).
+    /// Rides the anchor envelope of the batch propose. Caller
+    /// (dispatchPending) owns the storage.
+    batch_readset_bytes: []const u8,
 ) !usize {
     const server = worker.h2;
     const allocator = worker.allocator;
@@ -539,13 +546,11 @@ fn finalizeBatch(
         // the borrowed seq only governs poll-start + the fault/timeout
         // downgrade, both bounded by `commit_wait_timeout_ns`.
         if (txn.sawSpeculation()) {
-            // TODO(readset-replication slice 3d): the idiom-0 barrier
-            // propose covers a read-only batch with kv-reads that
-            // crossed an uncommitted speculative overlay. The
-            // dispatch's readset would record those reads — pass
-            // its serialized bytes here once slice 3d wires the
-            // dispatch loop's per-request serialization.
-            const seq = raft_propose.proposeWriteSet(worker, writeset, anchor_id, "") catch |perr| {
+            // The idiom-0 barrier propose covers a read-only batch
+            // with kv-reads that crossed an uncommitted speculative
+            // overlay. The first-request readset rides as
+            // `batch_readset_bytes` (slice 3d).
+            const seq = raft_propose.proposeWriteSet(worker, writeset, anchor_id, batch_readset_bytes) catch |perr| {
                 std.log.warn("rove-js idiom-0 barrier propose (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
                 txn.rollback() catch |rb_err| panic_mod.invariantViolated(
                     "finalizeBatch.rollback(idiom0_barrier_fail)",
@@ -731,17 +736,14 @@ fn finalizeBatch(
     // handler can run in parallel.
     txn.releaseLease();
 
-    // TODO(readset-replication slice 3d): the main batch propose
-    // covers the write-path dispatch — the dominant inbound case.
-    // Slice 3d wires the dispatch loop's per-request readset
-    // serialization through here. Today: empty readset rides the
-    // anchor envelope, replay-via-bytes unavailable for entries
-    // committed before slice 3d lands.
+    // The main batch propose carries the first-request readset
+    // (slice 3d). Multi-request batches drop subsequent readsets
+    // for now — TODO: aggregate at finalizeBatch entry.
     const seq = raft_propose.proposeBatch(
         worker,
         writeset,
         anchor_id,
-        "",
+        batch_readset_bytes,
     ) catch |err| {
         std.log.warn("rove-js raft propose (batch, tenant={s}) failed: {s}", .{ anchor_id, @errorName(err) });
         txn.rollback() catch |rb_err| panic_mod.invariantViolated(
@@ -2115,6 +2117,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var writeset = kv_mod.WriteSet.init(allocator);
     defer writeset.deinit();
 
+    // Phase 3d (`docs/readset-replication-plan.md`): the first
+    // successful request's serialized readset rides the batch's
+    // raft entry. Multi-request batches currently lose all but
+    // the first readset's bytes — full multi-readset aggregation
+    // is a follow-up (see §11 open question on per-entry layout
+    // for batched dispatches). The dominant case is a single
+    // request per batch, which is fully covered.
+    var batch_readset_bytes: []u8 = &.{};
+    defer if (batch_readset_bytes.len > 0) allocator.free(batch_readset_bytes);
+
     // Effect-reification Phase 4.1.2 — batch-level `http.fetch`
     // accumulator. Each handler appends its successful fetches
     // here (transferred from the per-request `pending_fetches`
@@ -2846,6 +2858,23 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // re-produces it deterministically from (body, tapes, source).
         const tape_payloads = worker_mod.captureTapesForChain(worker, &readset, body, correlation_id);
 
+        // Phase 3d: also serialize the readset for the raft entry's
+        // rs_bytes section. The first successful request in this
+        // batch establishes the batch's readset; later requests'
+        // readsets are dropped (TODO: aggregate). Failure here is
+        // non-fatal — log and skip; the batch propose just rides
+        // with an empty readset, same as pre-3d.
+        if (batch_readset_bytes.len == 0) {
+            if (readset.serialize(allocator)) |bytes| {
+                batch_readset_bytes = bytes;
+            } else |err| {
+                std.log.warn(
+                    "rove-js readset.serialize tenant={s}: {s}",
+                    .{ scope_inst.id, @errorName(err) },
+                );
+            }
+        }
+
         // Effect-reification Phase 4.1.2: transfer this handler's
         // successful `http.fetch` accumulator to the batch-level
         // list. `finalizeBatch` decides at end-of-batch whether
@@ -2922,6 +2951,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         &writeset,
         &successes,
         &batch_pending_fetches,
+        batch_readset_bytes,
     );
     return processed;
 }
