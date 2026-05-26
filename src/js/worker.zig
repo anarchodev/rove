@@ -148,6 +148,33 @@ pub const RaftWait = struct {
     deadline_ns: i64 = 0,
 };
 
+/// Per-entity park record for `docs/readset-replication-plan.md`
+/// Phase 4 (park-on-durability). When `dispatchPending` parks an
+/// entity waiting for its inbound request body's batch to flush,
+/// it sets this component with the body's `BodyRef` and the owning
+/// tenant id, then `reg.move`s the entity from `request_out` to
+/// `body_pending`.
+///
+/// Sentinel: `body_ref.batch_id == bodies_mod.NO_BATCH` (the
+/// default) means "not parked". `drainBodyPending` releases
+/// entities whose `body_ref.batch_id <= last_flushed_batch_id` on
+/// their tenant's `TenantBodies.buffer` back to `request_out`;
+/// `dispatchPending`'s body-gate detects the non-sentinel component
+/// on resume and uses the saved `body_ref` directly instead of
+/// re-appending (which would mint a new batch and re-park).
+///
+/// `tenant_id` is a borrowed slice into the per-tenant
+/// `tenant_mod.Instance.id` — owned by the NodeState's tenant
+/// registry, lives for the process lifetime.
+pub const BodyDurabilityWait = struct {
+    body_ref: bodies_mod.BodyRef = .{
+        .batch_id = bodies_mod.NO_BATCH,
+        .offset = 0,
+        .len = 0,
+    },
+    tenant_id: []const u8 = "",
+};
+
 /// Effect-reification Phase 4.1: the typed Cmd buffer a `ParkedUnit`
 /// carries — commit-gated `kv_wake_broadcast` Cmds (was
 /// `BufferedSendKvOps.kv_wakes`), `stream_chunk` Cmds (was
@@ -1813,6 +1840,7 @@ pub fn Worker(comptime opts: Options) type {
     // stores.
     const merged_request_row = rove.Row(&.{
         RaftWait,
+        BodyDurabilityWait,
         components_mod.ChainContext,
         components_mod.ContDescriptor,
         components_mod.StreamChain,
@@ -1883,6 +1911,22 @@ pub fn Worker(comptime opts: Options) type {
         /// Stream-first-hop raft park. Commits route to
         /// `stream_response_in` (after registerStreamCell). Same Row.
         raft_pending_stream: StreamColl,
+        /// `docs/readset-replication-plan.md` Phase 4 park-on-
+        /// durability. Entities `dispatchPending` parked after
+        /// appending their inbound body to the per-tenant
+        /// `BodyBuffer`, waiting for the buffer's batch holding
+        /// their body to flush to S3. `drainBodyPending` walks this
+        /// collection on each main-loop tick, checking each entity's
+        /// `BodyDurabilityWait.body_ref.batch_id` against the tenant
+        /// buffer's `last_flushed_batch_id`; matches move back to
+        /// `request_out` for re-dispatch (handler runs against the
+        /// already-durable body).
+        ///
+        /// Same `StreamRow` as `raft_pending_*` / `request_out` so
+        /// `reg.move` preserves every component on transit (the H2
+        /// request headers / body / sid / etc. ride the entity until
+        /// the response is built).
+        body_pending: StreamColl,
         /// Continuation-trampoline parked streams (connection-actor
         /// §6.1/§6.4). A handler that returned `next(...)` parks here
         /// instead of `response_in`; collection membership IS the
@@ -2164,6 +2208,7 @@ pub fn Worker(comptime opts: Options) type {
                 .raft_pending_response = try StreamColl.init(allocator),
                 .raft_pending_cont = try StreamColl.init(allocator),
                 .raft_pending_stream = try StreamColl.init(allocator),
+                .body_pending = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
                 .msg_inbox = effect_mod.MsgInbox.init(allocator),
@@ -2205,6 +2250,7 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.raft_pending_response.deinit();
             errdefer self.raft_pending_cont.deinit();
             errdefer self.raft_pending_stream.deinit();
+            errdefer self.body_pending.deinit();
             errdefer self.parked_continuations.deinit();
             errdefer self.parked_units.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
@@ -2214,6 +2260,7 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.raft_pending_response);
             reg.registerCollection(&self.raft_pending_cont);
             reg.registerCollection(&self.raft_pending_stream);
+            reg.registerCollection(&self.body_pending);
             reg.registerCollection(&self.parked_continuations);
             reg.registerCollection(&self.parked_units);
 
@@ -2375,6 +2422,7 @@ pub fn Worker(comptime opts: Options) type {
             self.raft_pending_response.deinit();
             self.raft_pending_cont.deinit();
             self.raft_pending_stream.deinit();
+            self.body_pending.deinit();
             self.dispatcher.deinit();
             if (self.log_push_curl) |easy| easy.deinit();
             // `manifest_easy` lives on NodeState — main.zig owns it.
@@ -3721,6 +3769,7 @@ fn retryFetchIdHex(
 // narrating the side-table world — was rewritten in place during
 // the move. No behavior change.
 pub const drainRaftPending = worker_drain.drainRaftPending;
+pub const drainBodyPending = worker_drain.drainBodyPending;
 pub const resolveDeployment = worker_drain.resolveDeployment;
 pub const resumeBoundContinuation = worker_drain.resumeBoundContinuation;
 pub const drainPendingBoundResumes = worker_drain.drainPendingBoundResumes;

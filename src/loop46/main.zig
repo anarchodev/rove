@@ -456,6 +456,13 @@ fn workerMain(args: *WorkerCtx) !void {
         }
         worker.was_leader = is_leader_now;
 
+        // Phase 4 park-on-durability: release any body-parked
+        // entities whose readset-blob batch has now flushed.
+        // Released entities go back to `request_out`, picked up by
+        // the dispatchOnce loop below in the same tick.
+        try rjs.drainBodyPending(worker);
+        try reg.flush();
+
         blocked_tenants.clear();
         while (true) {
             const processed = try rjs.dispatchOnce(worker, &blocked_tenants);
