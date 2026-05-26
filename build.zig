@@ -432,6 +432,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-log-server", log_server_mod);
     js_mod.addImport("rove-jwt", jwt_mod);
     js_mod.addImport("rove-tape", tape_mod);
+    js_mod.addImport("rove-bodies", bodies_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
     js_mod.addImport("rove-ssrf", ssrf_mod);
     // Worker reads the per-deployment manifest at release time so the

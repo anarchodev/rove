@@ -436,6 +436,10 @@ Increments:
   same shared store via
   `BlobBackend.openPerTenant(cfg, tenant_id, "readset-blobs")`.
   Lifecycle only — open on first body, close on tenant eviction.
+  Shipped as a `TenantMap(TenantBodies)` field on `Worker` next
+  to `tenant_logs`; lifecycle code lives in
+  `src/js/worker_bodies.zig` mirroring `worker_log.zig`. No call
+  sites yet — first append in slice 2c.
 - **2c — outbound (fetch) bodies**: chunks from curl_multi append
   to the buffer; engine emits BodyRef. Routes via the existing
   fetch_chunk activation path.

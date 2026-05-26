@@ -59,6 +59,7 @@ const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
 const jwt_mod = @import("rove-jwt");
 const tape_mod = @import("rove-tape");
+const bodies_mod = @import("rove-bodies");
 const tenant_mod = @import("rove-tenant");
 
 const dispatcher_mod = @import("dispatcher.zig");
@@ -75,6 +76,7 @@ const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
 const worker_log = @import("worker_log.zig");
+const worker_bodies = @import("worker_bodies.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_drain = @import("worker_drain.zig");
 const panic_mod = @import("panic.zig");
@@ -981,6 +983,32 @@ pub const TenantLog = struct {
 
     pub fn free(allocator: std.mem.Allocator, tl: *TenantLog) void {
         worker_log.freeTenantLog(allocator, tl);
+    }
+};
+
+/// Per-tenant body-buffer state held by the worker
+/// (`docs/readset-replication-plan.md` Phase 2b). Owns the
+/// `readset-blobs` BlobBackend opened against the node's shared
+/// `blob_backend_cfg` plus a single-tenant `bodies_mod.BodyBuffer`
+/// that accepts streaming appends from the H2 / curl_multi paths
+/// and periodically flushes to S3.
+///
+/// Lazy-opened on first body via `getOrOpenTenantBodies` —
+/// tenants that never receive a body pay no per-tenant RAM /
+/// backend-handle cost. Closed in `Worker.destroy` via the
+/// `TenantMap` deinit walk.
+pub const TenantBodies = struct {
+    allocator: std.mem.Allocator,
+    instance_id: []u8,
+    backend: blob_mod.BlobBackend,
+    buffer: bodies_mod.BodyBuffer,
+
+    pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantBodies {
+        return worker_bodies.openTenantBodies(worker, inst);
+    }
+
+    pub fn free(allocator: std.mem.Allocator, tb: *TenantBodies) void {
+        worker_bodies.freeTenantBodies(allocator, tb);
     }
 };
 
@@ -1996,6 +2024,14 @@ pub fn Worker(comptime opts: Options) type {
         /// ids across workers. Same lazy-open lifecycle as
         /// `tenant_files_map` but populated per-worker.
         tenant_logs: TenantMap(TenantLog),
+        /// Per-tenant body-buffer state
+        /// (`docs/readset-replication-plan.md` Phase 2b). Per-worker
+        /// (not NodeState) because bodies arrive on the worker thread
+        /// that owns H2 frame delivery + curl_multi events;
+        /// kv-affinity hashing pins each tenant to one worker, so
+        /// per-worker matches the natural data ownership. Lazy-opened
+        /// on first body via `worker_bodies.getOrOpenTenantBodies`.
+        tenant_bodies: TenantMap(TenantBodies),
         /// Per-node in-memory `LogRecord` buffer. Every tenant's
         /// dispatch tick appends here; `flushLogs` drains the whole
         /// buffer into one combined batch per flush window. Replaces
@@ -2136,6 +2172,7 @@ pub fn Worker(comptime opts: Options) type {
                 .node = config.node,
                 .raft = config.raft,
                 .tenant_logs = .empty,
+                .tenant_bodies = .empty,
                 .log_buffer = log_mod.NodeLogBuffer.init(allocator),
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .limiter = limiter_mod.RateLimiter.init(allocator, config.rate_limit_caps),
@@ -2165,6 +2202,7 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.parked_continuations.deinit();
             errdefer self.parked_units.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
+            errdefer self.tenant_bodies.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
             reg.registerCollection(&self.raft_pending_response);
@@ -2279,6 +2317,7 @@ pub fn Worker(comptime opts: Options) type {
             self.limiter.deinit();
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
+            self.tenant_bodies.deinit(allocator);
             self.log_buffer.deinit();
             // Phase 3.2.c: SharedTxnPool.deinit walks any leftover
             // txns (best-effort rollback) before freeing the
@@ -2763,6 +2802,7 @@ pub fn getOrOpenTenantSlot(
 // lines. Internal callers in this file use `worker_log.X` directly.
 pub const REQUEST_BODY_CAP = worker_log.REQUEST_BODY_CAP;
 pub const getOrOpenTenantLog = worker_log.getOrOpenTenantLog;
+pub const getOrOpenTenantBodies = worker_bodies.getOrOpenTenantBodies;
 pub const captureTapes = worker_log.captureTapes;
 pub const captureTapesForChain = worker_log.captureTapesForChain;
 pub const captureTapesForChainWithActivation = worker_log.captureTapesForChainWithActivation;
