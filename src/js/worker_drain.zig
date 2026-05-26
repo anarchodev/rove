@@ -1046,3 +1046,40 @@ pub fn drainBodyPending(worker: anytype) !void {
         try server.reg.move(ent, &worker.body_pending, &server.request_out);
     }
 }
+
+/// `docs/readset-replication-plan.md` Phase 4-fetch-park drain.
+///
+/// Walks `worker.fetch_pending_durability` (parked outbound-fetch
+/// chunk activations), looks up each entry's tenant `BodyBuffer`,
+/// and re-fires the activation when the saved `body_ref` becomes
+/// durable. Symmetric to `drainBodyPending` but for events
+/// instead of entities — fetch chunks arrive via the msg_inbox
+/// without an h2 entity, so the park list is a plain
+/// `ArrayListUnmanaged(ParkedFetchEvent)` instead of a rove
+/// collection.
+///
+/// Iteration uses a snapshot-then-swap-remove pattern: collect
+/// indices to release first, then `swapRemove` from the back to
+/// keep the list compact without invalidating indices.
+/// `fireFetchEventActivation` takes ownership of the released
+/// event (deinit fires via its top-level `defer` on completion).
+pub fn drainFetchPendingDurability(worker: anytype) !void {
+    const allocator = worker.allocator;
+    var i: usize = 0;
+    while (i < worker.fetch_pending_durability.items.len) {
+        const pe = &worker.fetch_pending_durability.items[i];
+        const tb = worker.tenant_bodies.get(pe.tenant_id_view);
+        const durable = if (tb) |t| t.buffer.isDurable(pe.body_ref) else false;
+        if (!durable) {
+            i += 1;
+            continue;
+        }
+        // Take ownership: swapRemove returns the value, list
+        // shrinks. We pass &released.event to fireFetchEventActivation
+        // which takes ownership of the event bytes.
+        var released = worker.fetch_pending_durability.swapRemove(i);
+        worker_mod.fireFetchEventActivation(worker, &released.event, released.body_ref);
+        _ = allocator; // silence unused (might use for diagnostics later)
+        // Don't advance i — swapRemove placed a new element at this index.
+    }
+}

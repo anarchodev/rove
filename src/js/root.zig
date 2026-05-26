@@ -85,6 +85,7 @@ pub const BlockedTenants = worker.BlockedTenants;
 pub const dispatchOnce = worker.dispatchOnce;
 pub const drainRaftPending = worker.drainRaftPending;
 pub const drainBodyPending = worker.drainBodyPending;
+pub const drainFetchPendingDurability = worker.drainFetchPendingDurability;
 pub const drainPendingBoundResumes = worker.drainPendingBoundResumes;
 pub const sweepParkedContinuations = worker.sweepParkedContinuations;
 pub const serviceParkedStreams = worker.serviceParkedStreams;

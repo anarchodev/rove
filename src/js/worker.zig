@@ -175,6 +175,33 @@ pub const BodyDurabilityWait = struct {
     tenant_id: []const u8 = "",
 };
 
+/// Slice 4-fetch-park: parked outbound-fetch chunk activation.
+/// `UpstreamFetchEvent`s arrive via the msg_inbox and don't have
+/// an h2 entity to attach a `BodyDurabilityWait` component to, so
+/// the park list lives as a plain `ArrayListUnmanaged` on
+/// `Worker.fetch_pending_durability` instead of a rove
+/// `Collection`. `event` is owned by the list (originally arrived
+/// owned by the dispatchPendingMsgs caller; ownership transferred
+/// when `fireFetchEventActivation` flipped its `parked_to_durability`
+/// flag).
+///
+/// `drainFetchPendingDurability` walks the list each main-loop
+/// tick, looks up the owning tenant's `TenantBodies.buffer`, and
+/// checks `buffer.isDurable(body_ref)`. Durable entries are
+/// removed from the list and re-fired via
+/// `fireFetchEventActivation(_, _, body_ref)` with the saved
+/// BodyRef so the gate skips the re-append and proceeds straight
+/// to dispatch.
+pub const ParkedFetchEvent = struct {
+    event: components_mod.UpstreamFetchEvent,
+    body_ref: bodies_mod.BodyRef,
+    /// Borrowed slice into `event.tenant_id` (or the owning
+    /// `tenant_mod.Instance.id` — both are stable for the
+    /// process lifetime). Cached so drain doesn't have to dereference
+    /// `event.tenant_id` again.
+    tenant_id_view: []const u8,
+};
+
 /// Effect-reification Phase 4.1: the typed Cmd buffer a `ParkedUnit`
 /// carries — commit-gated `kv_wake_broadcast` Cmds (was
 /// `BufferedSendKvOps.kv_wakes`), `stream_chunk` Cmds (was
@@ -1927,6 +1954,19 @@ pub fn Worker(comptime opts: Options) type {
         /// request headers / body / sid / etc. ride the entity until
         /// the response is built).
         body_pending: StreamColl,
+        /// Slice 4-fetch-park: parked outbound-fetch chunk events
+        /// (large chunks waiting on durability). Plain
+        /// `ArrayListUnmanaged` rather than a rove `Collection`
+        /// because `UpstreamFetchEvent`s don't have an h2 entity
+        /// to host a wait component.
+        ///
+        /// Producer: `fireFetchEventActivation` on the park
+        /// branch (worker thread, no lock needed — single
+        /// producer per Worker).
+        /// Consumer: `drainFetchPendingDurability` on the same
+        /// worker thread, called from the main poll loop next
+        /// to `drainBodyPending`.
+        fetch_pending_durability: std.ArrayListUnmanaged(ParkedFetchEvent) = .empty,
         /// Continuation-trampoline parked streams (connection-actor
         /// §6.1/§6.4). A handler that returned `next(...)` parks here
         /// instead of `response_in`; collection membership IS the
@@ -2428,6 +2468,13 @@ pub fn Worker(comptime opts: Options) type {
             self.raft_pending_cont.deinit();
             self.raft_pending_stream.deinit();
             self.body_pending.deinit();
+            // Slice 4-fetch-park: drop any still-parked fetch
+            // chunks at shutdown (best-effort, same lossy posture
+            // as the log flusher's final drain). Each entry owns
+            // its UpstreamFetchEvent's bytes.
+            for (self.fetch_pending_durability.items) |*pe|
+                components_mod.UpstreamFetchEvent.deinitItem(&pe.event, allocator);
+            self.fetch_pending_durability.deinit(allocator);
             self.dispatcher.deinit();
             if (self.log_push_curl) |easy| easy.deinit();
             // `manifest_easy` lives on NodeState — main.zig owns it.
@@ -3775,6 +3822,7 @@ fn retryFetchIdHex(
 // the move. No behavior change.
 pub const drainRaftPending = worker_drain.drainRaftPending;
 pub const drainBodyPending = worker_drain.drainBodyPending;
+pub const drainFetchPendingDurability = worker_drain.drainFetchPendingDurability;
 pub const resolveDeployment = worker_drain.resolveDeployment;
 pub const resumeBoundContinuation = worker_drain.resumeBoundContinuation;
 pub const drainPendingBoundResumes = worker_drain.drainPendingBoundResumes;
@@ -3837,10 +3885,28 @@ pub fn serviceFetchEvents(worker: anytype) void {
 /// Errors return `void` — `dispatchFetchEvents` is best-effort. An
 /// event with an empty `on_chunk_module` (binding-side regression)
 /// is a silent no-op.
+/// Slice 4-fetch-park: takes ownership of `event` — internal
+/// defer deinits it on exit unless the gate logic parks it
+/// (slice 4-fetch-park transfers ownership to
+/// `worker.fetch_pending_durability`).
+///
+/// `parked_body_ref` is non-null when called from a parked
+/// resume: it carries the BodyRef minted at the original
+/// append site, and the gate uses it directly instead of
+/// re-appending (which would mint a new batch + re-park).
+/// Fresh-arrival callers pass `null`.
 pub fn fireFetchEventActivation(
     worker: anytype,
-    event: *const components_mod.UpstreamFetchEvent,
+    event: *components_mod.UpstreamFetchEvent,
+    parked_body_ref: ?bodies_mod.BodyRef,
 ) void {
+    // Ownership handling: deinit the event on every exit path
+    // except the park branch (which transfers to
+    // fetch_pending_durability).
+    var parked_to_durability = false;
+    defer if (!parked_to_durability)
+        components_mod.UpstreamFetchEvent.deinitItem(event, worker.allocator);
+
     const module_path = event.on_chunk_module;
     if (module_path.len == 0) {
         std.log.warn(
@@ -3965,9 +4031,17 @@ pub fn fireFetchEventActivation(
     const FETCH_INLINE_THRESHOLD: usize = 16 * 1024;
     var body_ref: bodies_mod.BodyRef = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
     var inline_bytes_for_tape: []const u8 = "";
-    if (event.bytes.len > 0 and event.bytes.len <= FETCH_INLINE_THRESHOLD) {
+    if (parked_body_ref) |saved| {
+        // Slice 4-fetch-park: resume from a previous park. The
+        // body's batch was confirmed durable by
+        // drainFetchPendingDurability before this re-fire; use
+        // the saved ref directly + skip append. Re-appending
+        // would mint a new batch and re-trigger park.
+        body_ref = saved;
+    } else if (event.bytes.len > 0 and event.bytes.len <= FETCH_INLINE_THRESHOLD) {
         // Inline fast path — no buffer append, the chunk bytes
-        // ride on the tape entry directly.
+        // ride on the tape entry directly. Raft entry fsync IS
+        // the durability substrate.
         body_ref = .{
             .batch_id = bodies_mod.NO_BATCH,
             .offset = 0,
@@ -3976,8 +4050,11 @@ pub fn fireFetchEventActivation(
         inline_bytes_for_tape = event.bytes;
     } else if (event.bytes.len > 0) {
         // Larger-than-threshold chunk — BodyRef path. Append to
-        // the per-tenant BodyBuffer; the flusher tick publishes
-        // to S3 asynchronously.
+        // the per-tenant BodyBuffer; if the chunk isn't already
+        // durable (it usually isn't on first append), park the
+        // event in `fetch_pending_durability` until the flusher
+        // tick lands its batch in S3, then re-fire from
+        // drainFetchPendingDurability.
         const tb = worker_bodies.getOrOpenTenantBodies(worker, inst) catch |err| blk: {
             std.log.warn(
                 "rove-js fetch-event: getOrOpenTenantBodies tenant={s}: {s}",
@@ -3993,6 +4070,35 @@ pub fn fireFetchEventActivation(
                 );
                 break :blk .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
             };
+            // Park unless the periodic flusher already landed
+            // this body's batch (rare race — slice 4-park-2's
+            // fast-durable bypass equivalent).
+            if (body_ref.batch_id != bodies_mod.NO_BATCH and !t.buffer.isDurable(body_ref)) {
+                // Transfer ownership of `event` into the park list.
+                // The top-level `defer if (!parked_to_durability)
+                // deinit` skips on this branch.
+                worker.fetch_pending_durability.append(worker.allocator, .{
+                    .event = event.*,
+                    .body_ref = body_ref,
+                    .tenant_id_view = inst.id,
+                }) catch |err| {
+                    std.log.warn(
+                        "rove-js fetch-event: fetch_pending_durability.append tenant={s}: {s}",
+                        .{ tenant_id, @errorName(err) },
+                    );
+                    // Append failed — fall through and run the
+                    // activation against the (not-yet-durable)
+                    // bytes. Same effective behavior as pre-park.
+                    txn.rollback() catch {};
+                    txn_done = true;
+                    return;
+                };
+                parked_to_durability = true;
+                worker.flusher_wake.set();
+                txn.rollback() catch {};
+                txn_done = true;
+                return;
+            }
         }
     }
     readset.fetch_responses.appendFetchResponse(

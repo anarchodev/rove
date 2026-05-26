@@ -1846,9 +1846,13 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                 // distinguishes the terminal event from intermediates.
                 // Tape captures the chunk bytes (closes algebra §7
                 // worklist #1).
+                //
+                // Slice 4-fetch-park: fireFetchEventActivation owns
+                // the event — internal defer deinits it OR transfers
+                // to worker.fetch_pending_durability for the park
+                // branch. No external deinit needed.
                 var ev = ev_const;
-                worker_mod.fireFetchEventActivation(worker, &ev);
-                components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
+                worker_mod.fireFetchEventActivation(worker, &ev, null);
                 fired += 1;
             },
             .send_callback => |sc_const| {
