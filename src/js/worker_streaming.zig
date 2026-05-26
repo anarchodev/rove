@@ -575,7 +575,7 @@ fn resumeStream(
                     errdefer allocator.free(owned);
                     try stage.chunks.append(allocator, owned);
                 }
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset) catch |perr| {
                     std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -663,7 +663,7 @@ fn resumeStream(
                     allocator.free(s2.chunks);
                     s2.chunks = &.{};
                 }
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset) catch |perr| {
                     std.log.warn("rove-js stream-resume (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     // Helper already freed `stage.chunks` (the
                     // outer defer is now a no-op). Free what's
@@ -881,7 +881,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
                 return;
             }
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js stream-disconnect: propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false; // helper destroyed it
                     txn_done = true;
@@ -917,7 +917,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
             // §4.6 wakes) materialize for other observers.
             cval.deinit(allocator);
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js stream-disconnect (cont return): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -936,7 +936,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .stream => |*s2| {
             s2.deinit(allocator);
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js stream-disconnect (stream return): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -1136,7 +1136,7 @@ pub fn fireSubscriptionActivation(
                 return;
             }
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js subscription-fire ({s}): propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1176,7 +1176,7 @@ pub fn fireSubscriptionActivation(
                 .{subscription_name},
             );
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js subscription-fire ({s}) cont-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1202,7 +1202,7 @@ pub fn fireSubscriptionActivation(
                 .{subscription_name},
             );
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js subscription-fire ({s}) stream-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1362,7 +1362,7 @@ fn fireChainedActivation(
                 return;
             }
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js chained-dispatch ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1408,7 +1408,7 @@ fn fireChainedActivation(
                 .{ module_path, @errorName(err) },
             );
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js chained-dispatch ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1437,7 +1437,7 @@ fn fireChainedActivation(
                 .{module_path},
             );
             if (wrote) {
-                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js chained-dispatch ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -1519,6 +1519,13 @@ pub fn proposeForgetfulWrites(
     txn: *kv_mod.KvStore.TrackedTxn,
     tenant_id: []const u8,
     stage_opt: ?*StreamResumeStage,
+    /// Pass `&readset` (slice 1b's per-activation Readset) so this
+    /// activation's readset rides the raft entry as the type-0
+    /// envelope's `rs_bytes` section (slice 3d-fetch). `null` for
+    /// callers without a per-request readset (none today — every
+    /// activation in this file owns one). Serialization failures
+    /// log + pass empty so the propose still goes through.
+    readset_opt: ?*const tape_mod.Readset,
 ) !void {
     const allocator = worker.allocator;
 
@@ -1538,10 +1545,22 @@ pub fn proposeForgetfulWrites(
     }
 
     txn.releaseLease();
-    // TODO(readset-replication slice 3d): pass the stream-resume
-    // dispatch's readset bytes here. See worker_drain.zig for the
-    // matching TODO on the cont-resume path.
-    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id, "") catch |err| {
+    // Serialize the activation's readset for the anchor envelope's
+    // rs_bytes section. Best-effort: serialize failure logs and we
+    // propose with empty rs_bytes (same as pre-3d-fetch behavior —
+    // the chain just doesn't get readset-replicated for this entry).
+    const rs_bytes: []u8 = if (readset_opt) |rs|
+        rs.serialize(allocator) catch |err| blk: {
+            std.log.warn(
+                "rove-js proposeForgetfulWrites: readset.serialize tenant={s}: {s}",
+                .{ tenant_id, @errorName(err) },
+            );
+            break :blk &.{};
+        }
+    else
+        &.{};
+    defer if (rs_bytes.len > 0) allocator.free(rs_bytes);
+    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes) catch |err| {
         txn.rollback() catch {};
         allocator.destroy(txn);
         return err;

@@ -543,13 +543,30 @@ Increments shipped:
   same worker. Failure handling (503 + `.fault`) carries
   forward unchanged.
 
-- **4.x (open)**: fetch-chunk gating
-  (`fireFetchEventActivation`'s symmetric path). The Phase 4
-  invariant says "every body, every chunk" — currently outbound
-  fetch chunks still fire immediately and the buffer flushes
-  asynchronously on the 50ms tick. Untaped chunks survive a
-  leader crash unreplayably, same gap the inbound path just
-  closed.
+- **3d-fetch + 4-fetch-inline (shipped)**: `proposeForgetfulWrites`
+  now takes a `?*const Readset` and serializes it for the
+  anchor envelope's rs_bytes — every fetch-chunk / cont-resume /
+  stream-resume / disconnect / subscription-fire activation
+  contributes its readset to the raft entry. Closes the
+  slice-3b TODO across worker_streaming + worker_drain +
+  worker.zig's fireFetchEventActivation.
+
+  `FetchResponseEntry` gets `inline_bytes` (channel 5 wire
+  format grows one length-prefixed field). Small fetch chunks
+  (≤ 16 KB) ride inline — no `BodyBuffer.append`, no S3 RTT,
+  handler runs immediately. Heldsync per-request elapsed went
+  from 0.97 s (always-buffer) to 0.17 s (small chunks inline).
+  Discriminator: `body_ref.batch_id == NO_BATCH` ⇒ inline.
+
+- **4.x (open)**: fetch-chunk park-on-durability for chunks
+  > 16 KB. The inline path covers the dominant case (JSON RPC
+  / webhook responses); large streaming chunks still go
+  through the BodyBuffer but fire immediately without waiting
+  for S3 PUT. Unreplayability gap on leader crash remains for
+  large outbound chunks. Same shape as slice 4-park-2 but for
+  events instead of entities (UpstreamFetchEvent has no h2
+  entity to move into a collection — needs a separate ParkedFetchEvent
+  list on Worker).
 - **4-inline (shipped, revisits §5.3 rejection)**: small-body
   inline fast path. Bodies ≤ 16 KB ride inline in the
   readset's `trigger_payload.inline_bytes` field —

@@ -3938,14 +3938,21 @@ pub fn fireFetchEventActivation(
         req.activation_fetch_body_truncated = event.body_truncated;
     }
 
-    // Phase 2c: stream the chunk payload into the per-tenant
-    // BodyBuffer so the log-flusher tick can publish it to
-    // `{tenant}/readset-blobs/{batch_id}`, and capture the
-    // resulting BodyRef onto the readset's `fetch_responses`
-    // tape channel (2c-2).
+    // Phase 4-fetch-inline: small fetch chunks ride inline in
+    // the readset's `fetch_responses.inline_bytes` field — no
+    // buffer append, no S3 PUT, handler runs immediately. The
+    // raft entry's fsync IS the durability substrate (every
+    // replica sees the bytes when the entry replicates).
+    // Discriminator: `body_ref.batch_id == NO_BATCH` ⇒ inline.
+    //
+    // Larger chunks still go through the BodyBuffer (slice 2c-1
+    // path); the resulting BodyRef rides the entry instead.
+    // Slice 4-fetch-park will gate those on durability —
+    // currently they fire immediately, leaving the
+    // unreplayability gap §5.1 documents for outbound bodies.
     //
     // The bytes still ride alongside on `activation_fetch_bytes`
-    // — the handler keeps reading them inline for now — and the
+    // for the handler's `request.activation.bytes` view; the
     // tape's `activation_bytes` still captures them too. Both
     // coexist during the Phase 2 → Phase 3 transition; the
     // inline bytes drop out when the raft entry adopts the
@@ -3953,10 +3960,24 @@ pub fn fireFetchEventActivation(
     //
     // Terminal-only events (final=true with no body bytes) still
     // capture a tape entry so the chain has the closing seq +
-    // terminal status / ok / body_truncated for replay; the
-    // body_ref carries `len = 0`.
+    // terminal status / ok / body_truncated for replay; both
+    // body_ref and inline_bytes are empty.
+    const FETCH_INLINE_THRESHOLD: usize = 16 * 1024;
     var body_ref: bodies_mod.BodyRef = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
-    if (event.bytes.len > 0) {
+    var inline_bytes_for_tape: []const u8 = "";
+    if (event.bytes.len > 0 and event.bytes.len <= FETCH_INLINE_THRESHOLD) {
+        // Inline fast path — no buffer append, the chunk bytes
+        // ride on the tape entry directly.
+        body_ref = .{
+            .batch_id = bodies_mod.NO_BATCH,
+            .offset = 0,
+            .len = @intCast(event.bytes.len),
+        };
+        inline_bytes_for_tape = event.bytes;
+    } else if (event.bytes.len > 0) {
+        // Larger-than-threshold chunk — BodyRef path. Append to
+        // the per-tenant BodyBuffer; the flusher tick publishes
+        // to S3 asynchronously.
         const tb = worker_bodies.getOrOpenTenantBodies(worker, inst) catch |err| blk: {
             std.log.warn(
                 "rove-js fetch-event: getOrOpenTenantBodies tenant={s}: {s}",
@@ -3984,6 +4005,7 @@ pub fn fireFetchEventActivation(
         if (event.final) event.terminal_ok else false,
         if (event.final) event.body_truncated else false,
         event.fetch_headers orelse "",
+        inline_bytes_for_tape,
     ) catch |err| {
         // Tape capture failures must never kill the request. Same
         // posture as `captureTapesForChain`'s per-channel serialize
@@ -4037,7 +4059,7 @@ pub fn fireFetchEventActivation(
                 return;
             }
             if (wrote) {
-                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -4090,7 +4112,7 @@ pub fn fireFetchEventActivation(
                 .{ module_path, @errorName(err) },
             );
             if (wrote) {
-                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
@@ -4120,7 +4142,7 @@ pub fn fireFetchEventActivation(
                 .{module_path},
             );
             if (wrote) {
-                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null) catch |perr| {
+                worker_streaming.proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset) catch |perr| {
                     std.log.warn("rove-js fetch-event ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
                     txn_owned = false;
                     txn_done = true;
