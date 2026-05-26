@@ -9,19 +9,29 @@ cursor write (~9 ns) instead of a memcpy of the whole image.
 
 - Upstream: <https://github.com/anarchodev/arenajs>
 - Tag:      `v0.1.0` (2026-05-15)
-- Commit:   `0c464ea` (`arena: seed-not-draws`) — post-v0.1.0 §9 bump
+- Commit:   `145333c` (`arena: pin Date.now per-context`) — post-v0.1.0 §9 + fold-in bump
 - License:  MIT (see `LICENSE`)
 
-### Post-v0.1.0 — seed-not-draws (`docs/primitive-gaps.md` §9)
+### Post-v0.1.0 — seed-not-draws + Date.now pinning
 
-`JS_FillRandomBytes` is now a public quickjs API; the rove server's
-`crypto.*` bindings route through it, so a single per-context
-xorshift64star is the source of all randomness.
-`arena_set_random_seed(lo, hi)` is a new reactor export (WASM-side
-only — the server path calls `JS_SetRandomSeed` directly) used by
-the replay shell + replay-WASM smoke. Replay reseeds the PRNG with
-the captured request's `seed` scalar before running the handler —
-no per-draw tape entries needed.
+Two changes for rove's `docs/primitive-gaps.md` §9:
+
+- **`JS_FillRandomBytes`** is now a public quickjs API; the rove
+  server's `crypto.*` bindings route through it, so a single
+  per-context xorshift64star is the source of all randomness.
+  `arena_set_random_seed(lo, hi)` is a new reactor export
+  (WASM-side only — the server path calls `JS_SetRandomSeed`
+  directly).
+- **`JS_SetDateNow(ctx, ms)`** pins `Date.now()` and `new Date()`
+  (no args) to a fixed UTC-ms scalar for the lifetime of the
+  context. `arena_set_date_now(lo, hi)` is the matching WASM
+  reactor export. The replay-bindings layer's per-call
+  `_arena_host_date_now` callback + Date constructor wrapper are
+  gone — arenajs handles both natively via `date_now_pinned`.
+
+Replay reseeds the PRNG + pins Date.now with the captured
+request's `seed` + `timestamp_ns` scalars before running the
+handler — no per-draw / per-call tape entries needed.
 
 ### v0.1.0 highlights
 

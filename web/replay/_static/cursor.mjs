@@ -35,6 +35,12 @@ export class CursorEngine {
         // exact draw sequence. Replay tape no longer carries
         // per-draw entries — this scalar IS the entire input.
         this._setSeed  = Module.cwrap("arena_set_random_seed", null,    ["number","number"]);
+        // §9 fold-in: pin `Date.now()` and `new Date()` (no args)
+        // to a single ms scalar derived from the request's
+        // `timestamp_ns`. Every clock read inside one replay
+        // returns the same value — same semantics as the original
+        // request's pinned time.
+        this._setNow   = Module.cwrap("arena_set_date_now",    null,    ["number","number"]);
         this._scanCache = new WeakMap();
         this._matCache  = new WeakMap();
     }
@@ -69,6 +75,17 @@ export class CursorEngine {
         const lo = Number(seed & 0xFFFFFFFFn);
         const hi = Number((seed >> 32n) & 0xFFFFFFFFn);
         this._setSeed(lo, hi);
+        // §9 fold-in: pin `Date.now()` to ms-since-epoch derived
+        // from the captured `timestamp_ns`. Split across two u32
+        // args (WASM ABI). `null` (pre-fold-in captures) pins to 0
+        // — the same default arenajs uses when no embedder call is
+        // made, so handlers that don't read the clock are
+        // unaffected.
+        const ts_ns = BigInt(replay.timestamp_ns ?? 0n);
+        const ms_bi = ts_ns / 1_000_000n;  // ns → ms, truncating
+        const ms_lo = Number(ms_bi & 0xFFFFFFFFn);
+        const ms_hi = Number((ms_bi >> 32n) & 0xFFFFFFFFn);
+        this._setNow(ms_lo, ms_hi);
     }
 
     async scanIndex(replay) {

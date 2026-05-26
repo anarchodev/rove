@@ -2716,7 +2716,7 @@ test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
     try testing.expect(ws.containsKey("own"));
 }
 
-test "dispatch: Date tape captures clock reads (§9: Math/crypto are seed-only)" {
+test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2724,11 +2724,17 @@ test "dispatch: Date tape captures clock reads (§9: Math/crypto are seed-only)"
         cleanupTempKv(&buf);
     }
 
-    // §9: Math.random + crypto.* draw from arenajs's per-request
-    // PRNG (seeded by `installRequest` with `readset.seed`). No
-    // per-draw tape entries — the seed scalar IS the entire
-    // "tape" for random. Date.now still tapes each clock read.
-    var readset = tape_mod.Readset.init(testing.allocator, 0, 42);
+    // §9 + fold-in: every non-deterministic source in the handler
+    // is reduced to two scalars in the readset header.
+    //  - `seed` → arenajs's per-context xorshift64star
+    //  - `timestamp_ns` → arenajs's per-context `date_now_pinned`
+    //    (Date.now() and new Date() (no args) return the same
+    //    `@divTrunc(timestamp_ns, ns_per_ms)` for every call in
+    //    one request, same posture as Cloudflare Workers /
+    //    Lambda SnapStart)
+    // No dedicated tape channels for any of them.
+    const fixed_ts: i64 = 1_700_000_000_000_000_000; // arbitrary, in ns
+    var readset = tape_mod.Readset.init(testing.allocator, fixed_ts, 42);
     defer readset.deinit();
 
     var rt = try qjs.Runtime.init();
@@ -2737,13 +2743,15 @@ test "dispatch: Date tape captures clock reads (§9: Math/crypto are seed-only)"
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
         \\export function go() {
-        \\    const t = Date.now();
+        \\    const t1 = Date.now();
+        \\    const t2 = Date.now();
+        \\    const t3 = (new Date()).getTime();
         \\    const r1 = Math.random();
         \\    const r2 = Math.random();
         \\    const buf = new Uint8Array(4);
         \\    crypto.getRandomValues(buf);
         \\    const id = crypto.randomUUID();
-        \\    return String(t) + "|" + r1 + "|" + r2 + "|" + id;
+        \\    return String(t1) + "|" + t2 + "|" + t3 + "|" + r1 + "|" + r2 + "|" + id;
         \\}
     ,
         "h.mjs",
@@ -2752,7 +2760,6 @@ test "dispatch: Date tape captures clock reads (§9: Math/crypto are seed-only)"
     );
     defer testing.allocator.free(bytecode);
 
-    // First run captures the actual output for the comparison run.
     var d = try Dispatcher.init(testing.allocator); defer d.deinit();
     var body_1: []u8 = &.{};
     defer if (body_1.len > 0) testing.allocator.free(body_1);
@@ -2773,16 +2780,29 @@ test "dispatch: Date tape captures clock reads (§9: Math/crypto are seed-only)"
         body_1 = try testing.allocator.dupe(u8, resp.body);
     }
 
-    // Date is wall-clock — one entry per Date.now() call.
-    try testing.expectEqual(@as(usize, 1), readset.date.entries.items.len);
-    // §9: Math.random + crypto.* draw from the per-context PRNG
-    // seeded once at request entry. No dedicated tape channels —
-    // the seed scalar IS the entire input.
+    // Two scalars: ZERO tape entries on any random / date channel
+    // because they no longer exist.
 
-    // Same seed → bit-identical Math.random + crypto.* output across
-    // runs. Date.now drifts so we strip the timestamp prefix before
-    // comparing.
-    var readset2 = tape_mod.Readset.init(testing.allocator, 0, 42);
+    // Date.now is pinned. Both `Date.now()` calls AND
+    // `(new Date()).getTime()` should return the same ms scalar
+    // derived from `timestamp_ns`.
+    const expected_ms = @divTrunc(fixed_ts, std.time.ns_per_ms);
+    var ms_buf: [32]u8 = undefined;
+    const expected_ms_s = try std.fmt.bufPrint(&ms_buf, "{d}", .{expected_ms});
+    // Body is `{t1}|{t2}|{t3}|...`. Each of the three time slots
+    // should be exactly the pinned ms string.
+    var it = std.mem.splitScalar(u8, body_1, '|');
+    const got_t1 = it.next().?;
+    const got_t2 = it.next().?;
+    const got_t3 = it.next().?;
+    try testing.expectEqualStrings(expected_ms_s, got_t1);
+    try testing.expectEqualStrings(expected_ms_s, got_t2);
+    try testing.expectEqualStrings(expected_ms_s, got_t3);
+
+    // Same seed + same timestamp → bit-identical output sequence
+    // (no need to strip a prefix anymore — every field is now
+    // deterministic).
+    var readset2 = tape_mod.Readset.init(testing.allocator, fixed_ts, 42);
     defer readset2.deinit();
 
     var body_2: []u8 = &.{};
@@ -2803,11 +2823,7 @@ test "dispatch: Date tape captures clock reads (§9: Math/crypto are seed-only)"
         body_2 = try testing.allocator.dupe(u8, resp2.body);
     }
 
-    // Strip the "{timestamp}|" prefix and compare the rest
-    // (r1|r2|id).
-    const idx_1 = std.mem.indexOfScalar(u8, body_1, '|').?;
-    const idx_2 = std.mem.indexOfScalar(u8, body_2, '|').?;
-    try testing.expectEqualStrings(body_1[idx_1..], body_2[idx_2..]);
+    try testing.expectEqualStrings(body_1, body_2);
 }
 
 test "dispatch: tight loop hits budget and returns Interrupted" {

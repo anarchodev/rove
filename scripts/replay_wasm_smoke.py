@@ -107,10 +107,12 @@ def main() -> int:
         leader_origin = f"https://{TENANT_HOST}:{c.leader_port()}"
 
         # Drive a few requests through the demo handler. It exercises
-        # every captured tape channel: kv.get + kv.set (kv), Date.now
-        # (date), and one local import (module). `Math.random` +
-        # `crypto.getRandomValues` are also called but draw from the
-        # per-context PRNG seeded once per request (§9); no dedicated
+        # the remaining tape channels: kv.get + kv.set (kv) and one
+        # local import (module). `Math.random` /
+        # `crypto.getRandomValues` / `Date.now` are also called but
+        # draw from per-context state seeded once per request
+        # (§9 + fold-in: `seed` + `timestamp_ns` scalars in the
+        # readset header are the entire input); no dedicated tape
         # channels for them.
         c.wait_for_handler(TENANT_ID, "/?fn=handler", expected_status=200, timeout_s=15.0)
         last_body = ""
@@ -148,7 +150,7 @@ def main() -> int:
         rec = json.loads(show_body)["record"]
         tapes_field = rec.get("tapes", {})
         present = [
-            ch for ch in ("kv_tape_b64", "date_tape_b64", "module_tree_b64")
+            ch for ch in ("kv_tape_b64", "module_tree_b64")
             if tapes_field.get(ch)
         ]
         if "kv_tape_b64" not in present:
@@ -225,16 +227,17 @@ def main() -> int:
                 "body": req_body,
             },
             "modules": modules,
-            # `docs/primitive-gaps.md` §9 seed-not-draws: the
-            # captured request's PRNG seed flows from the log
-            # record into the bundle. The WASM driver calls
-            # `arena_set_random_seed` before running, so
-            # `Math.random` + `crypto.*` reproduce the same
-            # sequence as the original request.
+            # `docs/primitive-gaps.md` §9 + fold-in: two scalars
+            # in the bundle. WASM driver calls
+            # `arena_set_random_seed(seed)` +
+            # `arena_set_date_now(@divTrunc(timestamp_ns, 1e6))`
+            # before running, so `Math.random` / `crypto.*` /
+            # `Date.now()` reproduce the original request's
+            # sequences.
             "seed": tapes_field.get("seed", 0),
+            "timestamp_ns": tapes_field.get("timestamp_ns", 0),
             "tape_blobs": {
                 "kv": get_b64("kv_tape_b64"),
-                "date": get_b64("date_tape_b64"),
                 # `module_tree_b64` is the wire-format tape for the
                 # module channel; the WASM module loader treats it
                 # the same as any other channel even though replay
@@ -256,11 +259,13 @@ def main() -> int:
             sys.exit(f"FAIL want >=3 FUNC_ENTER events (module body + handler + inner call): {baseline}")
         if baseline["name_count"] < 2:
             sys.exit(f"FAIL want >=2 NAME entries (function + file atoms): {baseline}")
-        # §9: math_random + crypto_random no longer have dedicated
-        # channels — the request's `seed` scalar IS the entire
-        # input for `Math.random` / `crypto.*`. Only the kv +
-        # date channels remain on the wire from this handler.
-        expected_channels = {"kv_tape_b64", "date_tape_b64"}
+        # §9 + fold-in: math_random + crypto_random + date no
+        # longer have dedicated channels — the request's `seed`
+        # and `timestamp_ns` scalars are the entire input for
+        # `Math.random` / `crypto.*` / `Date.now()`. Only the kv
+        # channel remains on the wire from this handler (and
+        # module if it had imports — this handler doesn't).
+        expected_channels = {"kv_tape_b64"}
         missing = expected_channels - set(present)
         if missing:
             sys.exit(f"FAIL captured record missing channels: {missing}. Present: {present}")
@@ -477,15 +482,18 @@ def main() -> int:
         throw_rid = throw_rec["request_id"]
         throw_show = json.loads(_ls(jwt, f"{c.log_url()}/v1/{TENANT_ID}/show/{throw_rid}"))["record"]
         throw_tapes = throw_show.get("tapes", {})
-        # The handler throws BEFORE crypto.getRandomValues / kv / etc.
-        # so the throw record only has the date tape (Date.now() is
-        # evaluated as part of the throw message). That date entry
-        # MUST survive: worker_dispatch.zig::dispatchOnce now calls
-        # captureTapes on the handler-throw path so replay re-consumes
-        # the same captured timestamp.
-        if not throw_tapes.get("date_tape_b64"):
-            sys.exit(f"FAIL throw record missing date tape — worker is dropping fault-time tapes: keys={list(throw_tapes.keys())}")
-        print(f"ok  throw record carries date_tape_b64 ({len(throw_tapes['date_tape_b64'])} b64 chars)")
+        # §9 fold-in: Date.now is now pinned per-request via the
+        # readset header's `timestamp_ns` scalar — no date tape
+        # channel anymore. The throw record MUST still carry
+        # `timestamp_ns` so replay reconstructs the same clock
+        # values; worker_dispatch.zig::dispatchOnce calls
+        # captureTapes on the handler-throw path which stamps
+        # `readset.timestamp_ns` onto the TapePayloads regardless
+        # of whether any kv/module bytes survived.
+        ts_str = throw_tapes.get("timestamp_ns")
+        if not ts_str or int(ts_str) == 0:
+            sys.exit(f"FAIL throw record missing timestamp_ns — worker is dropping fault-time scalars: keys={list(throw_tapes.keys())}")
+        print(f"ok  throw record carries timestamp_ns ({ts_str})")
 
         throw_req_body = ""
         if throw_tapes.get("request_body_b64"):
@@ -507,9 +515,9 @@ def main() -> int:
             },
             "modules": modules,
             "seed": throw_tapes.get("seed", 0),
+            "timestamp_ns": throw_tapes.get("timestamp_ns", 0),
             "tape_blobs": {
                 "kv": throw_tapes.get("kv_tape_b64") or None,
-                "date": throw_tapes.get("date_tape_b64") or None,
                 "module": throw_tapes.get("module_tree_b64") or None,
             },
         }

@@ -6,11 +6,6 @@
 //! Opened eagerly during `Worker.create` (via `TenantLog.open` calling
 //! into `openTenantLog`), freed during `Worker.destroy`.
 //!
-//! Tape capture honors the per-chain budget (`docs/primitive-gaps.md`
-//! §6) via the sharded `NodeState.tape_state_shards`. Once a chain
-//! crosses `TAPE_CAP_BYTES_PER_CHAIN`, subsequent activations record
-//! summary-only.
-//!
 //! Periodic `flushLogs` drains the node-wide log buffer into a single
 //! embedded-sidecar `.ndjson` object PUT to the configured
 //! `BatchStore` (Phase 5.5 a — leader only; followers' buffer stays
@@ -98,14 +93,14 @@ pub fn getOrOpenTenantLog(
 // ── Tape capture ──────────────────────────────────────────────────────
 //
 // `tape_mod.Readset` is the per-request structural holder for the
-// five channels (kv / date / module / fetch_responses /
-// trigger_payload); the worker allocates one per dispatch, hands
-// its pointer to the dispatcher via `Request.readset`, then
-// serializes + flushes the non-empty channels via
-// `captureTapesForChain*` below. `Math.random` / `crypto.*` no
-// longer have dedicated channels (§9 seed-not-draws); the
-// readset's `seed` scalar is reseeded into arenajs's per-context
-// PRNG by the dispatcher.
+// four channels (kv / module / fetch_responses / trigger_payload);
+// the worker allocates one per dispatch, hands its pointer to the
+// dispatcher via `Request.readset`, then serializes + flushes the
+// non-empty channels via `captureTapesForChain*` below.
+// `Math.random` / `crypto.*` / `Date.now` no longer have dedicated
+// channels (§9 + fold-in); the readset's `seed` + `timestamp_ns`
+// scalars are stamped onto arenajs's per-context state by the
+// dispatcher (`JS_SetRandomSeed` + `JS_SetDateNow`).
 
 /// Maximum captured body length (request OR response). Anything
 /// bigger gets truncated to this prefix and the corresponding
@@ -152,7 +147,10 @@ pub fn captureTapesForChain(
 ) log_mod.TapePayloads {
     const allocator = worker.allocator;
 
-    var payloads: log_mod.TapePayloads = .{ .seed = readset.seed };
+    var payloads: log_mod.TapePayloads = .{
+        .seed = readset.seed,
+        .timestamp_ns = readset.timestamp_ns,
+    };
 
     // §6 cap pre-check: if the chain is already capped, skip
     // serialize entirely. Saves the CPU + transient bytes for
@@ -166,7 +164,6 @@ pub fn captureTapesForChain(
         out: *[]const u8,
     }{
         .{ .tape = &readset.kv, .out = &payloads.kv_tape_bytes },
-        .{ .tape = &readset.date, .out = &payloads.date_tape_bytes },
         .{ .tape = &readset.module, .out = &payloads.module_tree_bytes },
         .{ .tape = &readset.fetch_responses, .out = &payloads.fetch_responses_tape_bytes },
         .{ .tape = &readset.trigger_payload, .out = &payloads.trigger_payload_tape_bytes },
@@ -189,7 +186,6 @@ pub fn captureTapesForChain(
     if (correlation_id) |cid| {
         const total =
             payloads.kv_tape_bytes.len +
-            payloads.date_tape_bytes.len +
             payloads.module_tree_bytes.len +
             payloads.fetch_responses_tape_bytes.len +
             payloads.trigger_payload_tape_bytes.len;
@@ -202,13 +198,16 @@ pub fn captureTapesForChain(
             // boundary clean — same posture as the §9.4
             // wake-overflow ring (no half-recorded entries).
             if (payloads.kv_tape_bytes.len > 0) allocator.free(payloads.kv_tape_bytes);
-            if (payloads.date_tape_bytes.len > 0) allocator.free(payloads.date_tape_bytes);
             if (payloads.module_tree_bytes.len > 0) allocator.free(payloads.module_tree_bytes);
             if (payloads.fetch_responses_tape_bytes.len > 0) allocator.free(payloads.fetch_responses_tape_bytes);
             if (payloads.trigger_payload_tape_bytes.len > 0) allocator.free(payloads.trigger_payload_tape_bytes);
-            // Preserve the seed — even when tape bytes are capped,
-            // replay still needs it to seed the PRNG correctly.
-            payloads = .{ .seed = readset.seed };
+            // Preserve the seed + timestamp — even when tape bytes
+            // are capped, replay still needs them to seed the PRNG
+            // and pin Date.now correctly.
+            payloads = .{
+                .seed = readset.seed,
+                .timestamp_ns = readset.timestamp_ns,
+            };
         }
     }
 

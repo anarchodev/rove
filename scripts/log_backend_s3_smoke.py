@@ -177,7 +177,7 @@ def main() -> int:
 
             tapes = show.get("tapes") or {}
             tape_payload = None
-            for k in ("kv_tape_b64", "date_tape_b64", "request_body_b64"):
+            for k in ("kv_tape_b64", "module_tree_b64", "request_body_b64"):
                 if tapes.get(k):
                     tape_payload = k
                     break

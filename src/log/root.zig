@@ -138,8 +138,15 @@ pub const TapePayloads = struct {
     /// non-handler paths that build payloads without a Readset
     /// (early-error records, paths still being wired).
     seed: u64 = 0,
+    /// `docs/primitive-gaps.md` §9 fold-in. Wall-clock nanoseconds
+    /// captured at dispatch entry. Replay pins arenajs's per-
+    /// context `Date.now()` to `@divTrunc(timestamp_ns, ns_per_ms)`
+    /// via `arena_set_date_now`, so every `Date.now()` and
+    /// `new Date()` (no args) inside the handler returns the same
+    /// scalar — no per-call tape entries. Zero is the default for
+    /// non-handler paths.
+    timestamp_ns: i64 = 0,
     kv_tape_bytes: []const u8 = &.{},
-    date_tape_bytes: []const u8 = &.{},
     module_tree_bytes: []const u8 = &.{},
     /// `docs/readset-replication-plan.md` Phase 2c-2. Per-`http.fetch`
     /// chunk-activation tape: each entry carries a `BodyRef` into the
@@ -175,7 +182,6 @@ pub const TapePayloads = struct {
 
     pub fn deinit(self: *TapePayloads, allocator: std.mem.Allocator) void {
         if (self.kv_tape_bytes.len != 0) allocator.free(self.kv_tape_bytes);
-        if (self.date_tape_bytes.len != 0) allocator.free(self.date_tape_bytes);
         if (self.module_tree_bytes.len != 0) allocator.free(self.module_tree_bytes);
         if (self.fetch_responses_tape_bytes.len != 0) allocator.free(self.fetch_responses_tape_bytes);
         if (self.trigger_payload_tape_bytes.len != 0) allocator.free(self.trigger_payload_tape_bytes);
@@ -578,7 +584,6 @@ fn estimateRecordBytes(r: *const LogRecord) usize {
     // expansion and just account raw bytes — slightly under-counts
     // but matches the original "approximate" intent.
     n += r.tapes.kv_tape_bytes.len;
-    n += r.tapes.date_tape_bytes.len;
     n += r.tapes.module_tree_bytes.len;
     n += r.tapes.request_body_bytes.len;
     n += r.tapes.activation_bytes.len;

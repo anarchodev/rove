@@ -22,17 +22,16 @@
 
 export const RTAP_MAGIC   = 0x52544150;
 // Bumped 1 → 2 by `docs/primitive-gaps.md` §8 (minimal kv read
-// set), 2 → 3 by §9 (seed-not-draws). §9 dropped the
-// `.math_random` and `.crypto_random` channels: `Math.random` +
-// `crypto.*` now draw from arenajs's per-context xorshift64star,
-// seeded once per request from the readset header's `seed`
-// scalar. The replay shell calls `arena_set_random_seed` before
-// running the handler. Channels renumber contiguously.
-export const RTAP_VERSION = 3;
+// set), 2 → 3 by §9 (seed-not-draws — dropped math_random +
+// crypto_random), 3 → 4 by the §9 fold-in (dropped `.date`
+// channel — `Date.now()` / `new Date()` (no args) are pinned
+// per-request via `arena_set_date_now`). The readset header's
+// `seed` + `timestamp_ns` scalars are the entire input for the
+// random + clock sources.
+export const RTAP_VERSION = 4;
 
 export const CHANNEL_KV     = 0;
-export const CHANNEL_DATE   = 1;
-export const CHANNEL_MODULE = 2;
+export const CHANNEL_MODULE = 1;
 
 export const KV_OP_GET     = 0;
 export const KV_OP_SET     = 1;
@@ -96,8 +95,6 @@ function decodeEntry(channel, bytes) {
             const value = readUtf8();
             return { op, outcome, key, value };
         }
-        case CHANNEL_DATE:
-            return { ms: Number(view.getBigInt64(off)) };
         case CHANNEL_MODULE: {
             const specifier = readUtf8();
             const source_hash_hex = readUtf8();
@@ -150,7 +147,6 @@ function encodeEntry(channel, entry) {
             }
             break;
         }
-        case CHANNEL_DATE:         w.i64(entry.ms); break;
         case CHANNEL_MODULE:
             w.str(entry.specifier);
             w.str(entry.source_hash_hex);
@@ -178,17 +174,17 @@ export function serializeTape(channel, entries) {
 // ── Bridge: parsed blobs → Module.tapes shape ────────────────────────
 //
 // The WASM-side bindings consume Module.tapes with one array per
-// channel name (kv, date, module). Each array entry has the shape
+// channel name (kv, module). Each array entry has the shape
 // decodeEntry returns. Cursors are added lazily by the EM_JS host
-// imports on first access. `Math.random` + `crypto.*` are NOT
-// tape-driven post §9 — they draw from the per-context PRNG
-// seeded once via `arena_set_random_seed`.
+// imports on first access. `Math.random` + `crypto.*` +
+// `Date.now()` are NOT tape-driven post §9 + fold-in — they
+// draw from per-context state seeded once via
+// `arena_set_random_seed` + `arena_set_date_now`.
 
 export function buildTapesFromBlobs(blobs) {
     const out = {};
     const map = {
         kv: CHANNEL_KV,
-        date: CHANNEL_DATE,
         module: CHANNEL_MODULE,
     };
     for (const name of Object.keys(map)) {
