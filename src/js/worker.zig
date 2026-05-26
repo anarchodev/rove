@@ -77,6 +77,7 @@ const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
 const worker_log = @import("worker_log.zig");
 const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
+const worker_upload_walker = @import("worker_upload_walker.zig");
 const worker_bodies = @import("worker_bodies.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_drain = @import("worker_drain.zig");
@@ -2181,6 +2182,14 @@ pub fn Worker(comptime opts: Options) type {
         /// to know where to resume re-uploading log records derived
         /// from raft entries.
         last_uploaded_seq: u64 = 0,
+        /// `docs/readset-replication-plan.md` Phase 5c — last raft
+        /// log index the upload walker has visited. Persists only
+        /// for the worker's lifetime (resets to 0 on restart;
+        /// re-scanning is cheap because entries with
+        /// `seq <= last_uploaded_seq` are skipped without
+        /// hydrating). Only the designated walker worker
+        /// (`log_worker_id == 0`) on the current leader advances it.
+        upload_walker_idx: u64 = 0,
         /// Compile callback used by signup to deploy starter content.
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
         compile_fn: ?files_mod.CompileFn,
@@ -2406,8 +2415,23 @@ pub fn Worker(comptime opts: Options) type {
                 // entities while logs continue piggy-backing the
                 // 50 ms tick (slice 4-park-2).
                 worker_bodies.flushBodiesTick(self);
+                // Phase 5c order: flushLogs FIRST (drains the local
+                // fast path's records + advances `last_uploaded_seq`),
+                // walker SECOND. On a healthy leader the walker then
+                // sees `seq <= last_uploaded_seq` for every entry it
+                // visits and short-circuits without hydrating —
+                // avoiding the per-entry-per-tick double-PUT that
+                // walker-first ordering would create. On promotion
+                // catchup (new leader with `last_uploaded_seq = 0`),
+                // flushLogs has nothing to drain on the first tick
+                // and the walker appends records that the NEXT tick's
+                // flushLogs picks up. Eventual consistency at the
+                // indexer absorbs any narrow-window duplicates.
                 _ = worker_log.flushLogs(self) catch |err| {
                     std.log.warn("rove-js flusher: flushLogs failed: {s}", .{@errorName(err)});
+                };
+                worker_upload_walker.walkAndUploadCatchup(self) catch |err| {
+                    std.log.warn("rove-js flusher: walkAndUploadCatchup failed: {s}", .{@errorName(err)});
                 };
                 self.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
                 self.flusher_wake.reset();
