@@ -43,6 +43,7 @@ const rove = @import("rove");
 const h2 = @import("rove-h2");
 const kv_mod = @import("rove-kv");
 const tape_mod = @import("rove-tape");
+const log_mod = @import("rove-log");
 const tenant_mod = @import("rove-tenant");
 
 const dispatcher_mod = @import("dispatcher.zig");
@@ -449,6 +450,11 @@ fn proposeAndParkContResume(
     /// activation is replayable on any follower. Pointer (not value)
     /// because the readset lives in the caller's stack frame.
     readset: *const tape_mod.Readset,
+    /// Slice 5a-1: per-activation LogHeader stamped into the readset
+    /// blob so any follower (Phase 5c) can rebuild the customer
+    /// LogRecord. `null` only for paths that genuinely have no
+    /// header to stamp — caller convention is to populate it.
+    log_header_opt: ?log_mod.LogHeader,
 ) !void {
     const allocator = worker.allocator;
     const server = worker.h2;
@@ -459,15 +465,14 @@ fn proposeAndParkContResume(
     // here.
     txn.releaseLease();
 
-    // Slice 3d-fetch: serialize the cont-resume's readset and wrap
-    // as a 1-item readset list for the anchor envelope so the
+    // Slice 3d-fetch: serialize the cont-resume's readset (with the
+    // caller-supplied LogHeader stamped into it, slice 5a-1) and
+    // wrap as a 1-item readset list for the anchor envelope so the
     // resumed activation is replayable on any follower (3d-multi
     // promoted the wire to a list, so single-readset producers
     // must wrap). Best-effort — any failure logs and we propose
     // with empty rs_bytes (same as pre-3d behavior).
-    // TODO (slice 5a-1): stamp a real `LogHeader` here; cont-resume
-    // paths know request_id + duration + status etc. at this point.
-    const rs_blob: []u8 = readset.serialize(allocator, null) catch |serr| blk: {
+    const rs_blob: []u8 = readset.serialize(allocator, log_header_opt) catch |serr| blk: {
         std.log.warn(
             "rove-js cont-resume: readset.serialize tenant={s}: {s}",
             .{ tenant_id, @errorName(serr) },
@@ -748,6 +753,18 @@ fn resumeContinuation(
                 const exception_owned = r.exception;
                 r.console = &.{};
                 r.exception = &.{};
+                const lh_terminal: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = dep_id,
+                    .duration_ns = 0,
+                    .status = st,
+                    .outcome = .ok,
+                    .activation = .send_callback,
+                    .method = "POST",
+                    .path = cont_path,
+                    .host = "",
+                    .correlation_id = corr_id orelse "",
+                };
                 proposeAndParkContResume(
                     worker,
                     ent,
@@ -761,6 +778,7 @@ fn resumeContinuation(
                         .body = body_dup,
                     } },
                     &readset,
+                    lh_terminal,
                 ) catch |perr| {
                     // Propose-fail / pre-park alloc failure: degrade
                     // to a 500 over the held socket. The txn was
@@ -836,6 +854,22 @@ fn resumeContinuation(
                     if (nputs != 1) break :blk null;
                     break :blk try allocator.dupe(u8, only.?);
                 };
+                const lh_repark: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = dep_id,
+                    .duration_ns = 0,
+                    // captureLogWithId on this branch records status=0
+                    // (the parked-hop convention — same shape as the
+                    // inbound trampoline open hop). Mirror that here
+                    // so replay surfaces the same value.
+                    .status = 0,
+                    .outcome = .ok,
+                    .activation = .send_callback,
+                    .method = "POST",
+                    .path = cont_path,
+                    .host = "",
+                    .correlation_id = corr_id orelse "",
+                };
                 proposeAndParkContResume(
                     worker,
                     ent,
@@ -849,6 +883,7 @@ fn resumeContinuation(
                         .new_bound_sched_id = new_bound_sched_id,
                     } },
                     &readset,
+                    lh_repark,
                 ) catch |perr| {
                     // Helper rolled back + destroyed txn + freed
                     // c2m + new_bound_sched_id on failure; we just
