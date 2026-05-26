@@ -40,14 +40,29 @@ pub fn openTenantBodies(
     const id_copy = try allocator.dupe(u8, inst.id);
     errdefer allocator.free(id_copy);
 
-    // Per-tenant S3 prefix: `{key_prefix_base}{inst.id}/readset-blobs/`.
+    // Per-tenant S3 prefix:
+    // `{key_prefix_base}{inst.id}/readset-blobs/w{worker_id}/`.
     // Mirrors files-server's "file-blobs" + log-server's "log-blobs"
-    // shape so the per-tenant on-disk / in-bucket layout is uniform.
+    // shape, but appends the per-worker subdir so each worker's
+    // `BodyBuffer` writes into its own namespace. Multiple workers
+    // on the same node share a tenant via the kv-affinity hash, but
+    // each maintains its own monotonic batch_id counter — without
+    // the per-worker subdir, worker A and worker B both mint
+    // batch_id=1 and PUT to the same key, which the backend rejects
+    // with 409 OperationAborted (observed in body_gate_bench against
+    // OVH). Same shape `worker_log.openTenantLog` uses by baking
+    // `log_worker_id` into the upper 16 bits of `request_id`.
+    var subdir_buf: [32]u8 = undefined;
+    const subdir = std.fmt.bufPrint(
+        &subdir_buf,
+        "readset-blobs/w{d}",
+        .{worker.log_worker_id},
+    ) catch unreachable;
     var backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         worker.node.blob_backend_cfg,
         inst.id,
-        "readset-blobs",
+        subdir,
     );
     errdefer backend.deinit();
 
